@@ -236,6 +236,17 @@ const OUTBOX_SOFT_QUEUE_LIMIT_BYTES: usize = 1024 * 1024;
 const PREVIEW_FRAME_RESERVE: usize = 1;
 const READY_FRAME_QUEUE_CAP: usize = 4;
 const PTY_CHANNEL_CAPACITY: usize = 64;
+/// Max bytes of PTY output parsed per PTY per tick.  Parsing happens inside
+/// the tick task while it holds the session mutex, so an unbudgeted drain of
+/// a flooding PTY (`dd if=/dev/random`) starves every input handler, every
+/// other PTY, and new connections — the whole server wedges at 100% CPU.
+/// When the budget runs out the tick finishes its round (snapshots, input,
+/// frame delivery) and resumes immediately; the bounded byte channel then
+/// backs up, the reader thread blocks, the kernel PTY buffer fills, and the
+/// flooding process's write(2) blocks.  That is ordinary terminal flow
+/// control: the producer runs at the speed we can actually parse and render,
+/// instead of the server disappearing under it.
+const PTY_PARSE_BUDGET_PER_TICK: usize = 256 * 1024;
 const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
 
 /// Number of surface frames to send at wire speed after a keyframe request
@@ -4462,15 +4473,21 @@ async fn tick(state: &AppState) -> TickOutcome {
     // Drain bytes from PTY reader channels. This is the only place
     // process() is called, so there is no contention with the readers.
     //
-    // End-to-end flow control: when at least one client is subscribed to
-    // a PTY and its `ready_frames` queue is full, stop draining `byte_rx`
-    // for that PTY.  `byte_rx` then fills to its bounded capacity, which
-    // blocks the reader task's `byte_tx.blocking_send`, which fills the
-    // kernel's PTY master buffer, which blocks the child process's
-    // `write(stdout, ...)`.  Sync-bracketed frames are never silently
-    // dropped; the producer is slowed instead.  PTYs with no subscribers
-    // drain unconditionally so background processes aren't throttled by
-    // nobody-watching.
+    // End-to-end flow control, two brakes on the same chain (`byte_rx`
+    // fills to its bounded capacity → the reader task's
+    // `byte_tx.blocking_send` blocks → the kernel's PTY master buffer
+    // fills → the child process's `write(stdout, ...)` blocks):
+    //
+    // 1. When at least one client is subscribed to a PTY and its
+    //    `ready_frames` queue is full, stop draining that PTY.
+    //    Sync-bracketed frames are never silently dropped; the producer
+    //    is slowed instead.
+    // 2. `PTY_PARSE_BUDGET_PER_TICK`, for output that never emits a sync
+    //    boundary (so brake 1 never engages — `ready_frames` only fills
+    //    on SyncBoundary) and for PTYs with no subscriber at all.
+    //    Without it this loop parses a flooding PTY for as long as the
+    //    reader can refill the channel, holding the session mutex the
+    //    whole time.
     let ptys_with_subscribers: HashSet<u16> = sess
         .clients
         .values()
@@ -4478,13 +4495,19 @@ async fn tick(state: &AppState) -> TickOutcome {
         .collect();
     let mut eof_ptys: Vec<u16> = Vec::with_capacity(ids.len());
     let mut cwd_msgs: Vec<Vec<u8>> = Vec::new();
+    let mut parse_budget_hit = false;
     for &id in &ids {
         let Some(pty) = sess.ptys.get_mut(&id) else {
             continue;
         };
         let has_subscriber = ptys_with_subscribers.contains(&id);
+        let mut budget = PTY_PARSE_BUDGET_PER_TICK;
         loop {
             if has_subscriber && pty.ready_frames.len() >= READY_FRAME_QUEUE_CAP {
+                break;
+            }
+            if budget == 0 {
+                parse_budget_hit = true;
                 break;
             }
             let Ok(input) = pty.byte_rx.try_recv() else {
@@ -4492,6 +4515,7 @@ async fn tick(state: &AppState) -> TickOutcome {
             };
             match input {
                 PtyInput::Data(data) => {
+                    budget = budget.saturating_sub(data.len());
                     let osc7 = pty::respond_to_queries(
                         &pty.handle,
                         &data,
@@ -4505,6 +4529,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     pty.mark_dirty();
                 }
                 PtyInput::SyncBoundary { before } => {
+                    budget = budget.saturating_sub(before.len());
                     if !before.is_empty() {
                         let osc7 = pty::respond_to_queries(
                             &pty.handle,
@@ -4534,6 +4559,15 @@ async fn tick(state: &AppState) -> TickOutcome {
     // events broadcast to every connected client, not just subscribers.
     for msg in cwd_msgs {
         sess.send_to_all(&msg);
+    }
+    if parse_budget_hit {
+        // Leftover output is already queued, so re-tick right after this
+        // round instead of waiting on the reader's notify — the permit for
+        // the bytes we just budgeted away was consumed when this tick woke.
+        // The tick loop releases the session mutex between rounds, and the
+        // mutex is fair, so handlers that queued behind this round run
+        // before the next one.
+        state.delivery_notify.notify_one();
     }
     // Handle EOF outside the borrow loop.
     drop(sess);
