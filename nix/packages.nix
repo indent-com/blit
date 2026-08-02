@@ -61,20 +61,25 @@
       # Crane build
       # ------------------------------------------------------------------
 
-      blit = craneLib.buildPackage (
-        commonArgs
-        // {
-          pname = "blit";
-          inherit cargoArtifacts;
-          cargoExtraArgs = "-p blit-cli";
-          doCheck = false;
-          preBuild = copyWebAppDist;
-          postInstall = ''
-            $out/bin/blit generate $out/share
-          '';
-          meta.mainProgram = "blit";
-        }
-      );
+      mkBlit =
+        pname: featureArgs:
+        craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit pname cargoArtifacts;
+            cargoExtraArgs = "-p blit-cli ${featureArgs}";
+            doCheck = false;
+            preBuild = copyWebAppDist;
+            postInstall = ''
+              $out/bin/blit generate $out/share
+            '';
+            meta.mainProgram = "blit";
+          }
+        );
+      blit = mkBlit "blit" "";
+      # GPL flavor (x264 instead of openh264; see the release-binaries
+      # comment below). Ships in the demo image.
+      blit-gpl = mkBlit "blit-gpl" gplFeatureArgs;
 
       # ------------------------------------------------------------------
       # WASM (still uses wasm-pack, not crane)
@@ -550,7 +555,10 @@
             pkgs.wev
             pkgs.zathura
             pkgs.firefox
-            blit
+            # The GPL flavor (x264 for software H.264, 4:4:4-capable) — the
+            # image already bundles plenty of GPL software, and hosts pulling
+            # a demo container get the better encoder by default.
+            blit-gpl
             demoEntrypoint
             fishConfig
             welcomeFile
@@ -629,7 +637,7 @@
         default = blit;
       }
       // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-        inherit blit-release-musl blit-release-gnu-gpl blit-release-musl-gpl;
+        inherit blit-gpl blit-release-musl blit-release-gnu-gpl blit-release-musl-gpl;
       }
       // tasks;
 

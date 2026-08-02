@@ -249,7 +249,7 @@ Building from source, running tests, dev environment setup, code conventions, an
 
 ## Docker sandbox
 
-The `grab/blit-demo` image runs unprivileged and launches `blit share` on startup. It includes `blit` itself, plus fish, busybox, htop, neovim, git, curl, jq, tree, ncdu, and Wayland GUI apps (firefox, foot, mpv, imv, zathura, wev).
+The `grab/blit-demo` image runs unprivileged and launches `blit share` on startup. It includes `blit` itself (the GPL flavor, so software H.264 uses x264 — same as `BLIT_GPL=1` installs), plus fish, busybox, htop, neovim, git, curl, jq, tree, ncdu, and Wayland GUI apps (firefox, foot, mpv, imv, zathura, wev).
 
 The session starts in `/home/blit/blit`, a writable clone of this repo with its full history. The container clones it on first start and fast-forwards it on later ones, so it reflects `main` as of when you started the container, not as of when the image was built. It needs network access to GitHub; without it you still get a shell, just an empty directory.
 
