@@ -199,16 +199,16 @@ av1-nvenc, h264-nvenc, av1-vaapi, h264-vaapi, h264-software, av1-software
 
 Vulkan Video encoders (`av1-vulkan`, `h264-vulkan`) are available but not in the default list yet as they haven't been tested. Enable via `BLIT_SURFACE_ENCODERS=av1-vulkan,...`.
 
-| Encoder         | Backend             | Notes                                                                                                                                               |
-| --------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `av1-vulkan`    | Vulkan Video (GPU)  | AV1 via VK_KHR_video_encode_av1                                                                                                                     |
-| `h264-vulkan`   | Vulkan Video (GPU)  | H.264 via VK_KHR_video_encode_h264                                                                                                                  |
-| `av1-nvenc`     | NVENC (GPU)         | AV1 via CUDA                                                                                                                                        |
-| `h264-nvenc`    | NVENC (GPU)         | H.264 via CUDA                                                                                                                                      |
-| `av1-vaapi`     | VA-API (GPU)        | AV1 via libva                                                                                                                                       |
-| `h264-vaapi`    | VA-API (GPU)        | H.264 via libva                                                                                                                                     |
-| `h264-software` | openh264/x264 (CPU) | Software H.264; backend is a build-time choice — openh264 by default, x264 in the GPL opt-in build (`blit --license`), absent if built with neither |
-| `av1-software`  | rav1e (CPU)         | Software AV1                                                                                                                                        |
+| Encoder         | Backend             | Notes                                                                                                                                                                                                                    |
+| --------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `av1-vulkan`    | Vulkan Video (GPU)  | AV1 via VK_KHR_video_encode_av1                                                                                                                                                                                          |
+| `h264-vulkan`   | Vulkan Video (GPU)  | H.264 via VK_KHR_video_encode_h264                                                                                                                                                                                       |
+| `av1-nvenc`     | NVENC (GPU)         | AV1 via CUDA                                                                                                                                                                                                             |
+| `h264-nvenc`    | NVENC (GPU)         | H.264 via CUDA                                                                                                                                                                                                           |
+| `av1-vaapi`     | VA-API (GPU)        | AV1 via libva                                                                                                                                                                                                            |
+| `h264-vaapi`    | VA-API (GPU)        | H.264 via libva                                                                                                                                                                                                          |
+| `h264-software` | openh264/x264 (CPU) | Software H.264; backend is a build-time choice — openh264 by default, x264 in the GPL opt-in build (`blit --license`), absent if built with neither. 4:4:4 requires x264 (High 4:4:4 Predictive); openh264 is 4:2:0-only |
+| `av1-software`  | rav1e (CPU)         | Software AV1                                                                                                                                                                                                             |
 
 `BLIT_SURFACE_QUALITY`: `low`, `medium` (default), `high`, `ultra`.
 

@@ -706,9 +706,6 @@ impl SurfaceEncoder {
                 chroma,
             }),
             SurfaceEncoderPreference::H264Software => {
-                if chroma.is_444() {
-                    return Err("h264-software does not support 4:4:4".into());
-                }
                 let (width, height) = ((width + 1) & !1, (height + 1) & !1);
                 Ok(Self {
                     width,
@@ -716,7 +713,7 @@ impl SurfaceEncoder {
                     source_width,
                     source_height,
                     kind: SurfaceEncoderKind::H264Software(Box::new(SoftwareH264Encoder::new(
-                        width, height, quality,
+                        width, height, quality, chroma,
                     )?)),
                     chroma,
                 })
@@ -740,7 +737,7 @@ impl SurfaceEncoder {
     /// for display in debug panels.  Includes chroma subsampling when 4:4:4.
     pub fn encoder_name(&self) -> &'static str {
         match (&self.kind, self.chroma) {
-            (SurfaceEncoderKind::H264Software(enc), _) => enc.name(),
+            (SurfaceEncoderKind::H264Software(enc), chroma) => enc.name(chroma),
             (SurfaceEncoderKind::NvencH264(_), ChromaSubsampling::Cs444) => "h264-nvenc 4:4:4",
             (SurfaceEncoderKind::NvencH264(_), _) => "h264-nvenc",
             (SurfaceEncoderKind::NvencAV1(_), ChromaSubsampling::Cs444) => "av1-nvenc 4:4:4",
@@ -936,7 +933,7 @@ impl SurfaceEncoder {
 
         match &mut self.kind {
             SurfaceEncoderKind::H264Software(encoder) => {
-                encoder.encode(&rgba, self.width, self.height)
+                encoder.encode(&rgba, self.width, self.height, self.chroma)
             }
             // NVENC early-returned above.
             SurfaceEncoderKind::NvencH264(_) | SurfaceEncoderKind::NvencAV1(_) => unreachable!(),
@@ -1339,7 +1336,11 @@ impl SurfaceEncoder {
 
         let mut result = match &mut self.kind {
             SurfaceEncoderKind::H264Software(encoder) => {
-                let yuv = bgra_to_yuv420_padded(bgra, src_w, src_h, enc_w, enc_h);
+                let yuv = if self.chroma.is_444() {
+                    bgra_to_yuv444_padded(bgra, src_w, src_h, enc_w, enc_h)
+                } else {
+                    bgra_to_yuv420_padded(bgra, src_w, src_h, enc_w, enc_h)
+                };
                 encoder.encode_yuv(yuv, self.width, self.height)
             }
             SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => {
@@ -1378,7 +1379,9 @@ impl SurfaceEncoder {
             SurfaceEncoderKind::H264Software(encoder) => {
                 let enc_w = self.width as usize;
                 let enc_h = self.height as usize;
-                if enc_w == src_w && enc_h == src_h {
+                // NV12 chroma is half-res; a 4:4:4 encoder needs full-res
+                // planes, so take the RGBA path (which upsamples) instead.
+                if !self.chroma.is_444() && enc_w == src_w && enc_h == src_h {
                     let yuv = nv12_to_yuv420(data, y_stride, uv_stride, src_w, src_h);
                     encoder.encode_yuv(yuv, self.width, self.height)
                 } else {
@@ -1410,6 +1413,17 @@ impl SurfaceEncoder {
                 enc.encode_nv12(y_data, uv_data, y_stride, uv_stride)
             }
             SurfaceEncoderKind::AV1Software(encoder) => {
+                // NV12 chroma is half-res; a 4:4:4 encoder needs full-res
+                // planes, so take the RGBA path (which upsamples) instead.
+                if self.chroma.is_444() {
+                    let pd = PixelData::Nv12 {
+                        data: std::sync::Arc::new(data.to_vec()),
+                        y_stride,
+                        uv_stride,
+                    };
+                    let rgba = pd.to_rgba(self.source_width, self.source_height);
+                    return self.encode(&rgba);
+                }
                 encoder.encode_nv12(data, y_stride, uv_stride, src_w, src_h)
             }
         };
@@ -1893,10 +1907,16 @@ enum SoftwareH264Encoder {
 impl SoftwareH264Encoder {
     /// x264 is preferred when both backends are present; openh264 is the
     /// runtime fallback.  `BLIT_H264_SOFTWARE=x264|openh264` pins one.
-    fn new(width: u32, height: u32, quality: SurfaceQuality) -> Result<Self, String> {
+    /// Only x264 can encode 4:4:4 (High 4:4:4 Predictive profile).
+    fn new(
+        width: u32,
+        height: u32,
+        quality: SurfaceQuality,
+        chroma: ChromaSubsampling,
+    ) -> Result<Self, String> {
         let pinned = std::env::var("BLIT_H264_SOFTWARE").ok();
         let pinned = pinned.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        Self::new_with_backend(pinned, width, height, quality)
+        Self::new_with_backend(pinned, width, height, quality, chroma)
     }
 
     #[allow(unused_mut)] // mutated only when a backend feature is enabled
@@ -1905,23 +1925,28 @@ impl SoftwareH264Encoder {
         width: u32,
         height: u32,
         quality: SurfaceQuality,
+        chroma: ChromaSubsampling,
     ) -> Result<Self, String> {
         let mut errors: Vec<String> = Vec::new();
         #[cfg(all(target_os = "linux", feature = "x264"))]
         if pinned.is_none_or(|p| p == "x264") {
-            match X264Encoder::new(width, height, quality) {
+            match X264Encoder::new(width, height, quality, chroma) {
                 Ok(enc) => return Ok(Self::X264(enc)),
                 Err(err) => errors.push(format!("x264: {err}")),
             }
         }
         #[cfg(all(target_os = "linux", feature = "openh264"))]
         if pinned.is_none_or(|p| p == "openh264") {
-            match OpenH264Encoder::new(quality) {
-                Ok(enc) => return Ok(Self::OpenH264(Box::new(enc))),
-                Err(err) => errors.push(format!("openh264: {err}")),
+            if chroma.is_444() {
+                errors.push("openh264: 4:4:4 not supported".into());
+            } else {
+                match OpenH264Encoder::new(quality) {
+                    Ok(enc) => return Ok(Self::OpenH264(Box::new(enc))),
+                    Err(err) => errors.push(format!("openh264: {err}")),
+                }
             }
         }
-        let _ = (width, height, quality);
+        let _ = (width, height, quality, chroma);
         if !errors.is_empty() {
             Err(errors.join("; "))
         } else if let Some(p) = pinned {
@@ -1937,10 +1962,17 @@ impl SoftwareH264Encoder {
     }
 
     /// Backend-qualified name for client debug panels.
-    fn name(&self) -> &'static str {
+    fn name(&self, chroma: ChromaSubsampling) -> &'static str {
+        let _ = chroma;
         match self {
             #[cfg(all(target_os = "linux", feature = "x264"))]
-            Self::X264(_) => "h264-software (x264)",
+            Self::X264(_) => {
+                if chroma.is_444() {
+                    "h264-software (x264) 4:4:4"
+                } else {
+                    "h264-software (x264)"
+                }
+            }
             #[cfg(all(target_os = "linux", feature = "openh264"))]
             Self::OpenH264(_) => "h264-software (openh264)",
             #[cfg(not(all(target_os = "linux", any(feature = "x264", feature = "openh264"))))]
@@ -1959,12 +1991,24 @@ impl SoftwareH264Encoder {
         }
     }
 
-    fn encode(&mut self, rgba: &[u8], width: u32, height: u32) -> Option<(Vec<u8>, bool)> {
-        let yuv = rgba_to_yuv420(rgba, width as usize, height as usize);
+    fn encode(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        chroma: ChromaSubsampling,
+    ) -> Option<(Vec<u8>, bool)> {
+        let yuv = if chroma.is_444() {
+            rgba_to_yuv444(rgba, width as usize, height as usize)
+        } else {
+            rgba_to_yuv420(rgba, width as usize, height as usize)
+        };
         self.encode_yuv(yuv, width, height)
     }
 
-    /// Encode from a pre-built I420 buffer (avoids redundant conversion).
+    /// Encode from a pre-built planar YUV buffer (avoids redundant
+    /// conversion).  Layout must match the chroma mode the encoder was
+    /// opened with: I420 (half-res UV) or I444 (full-res UV, x264 only).
     fn encode_yuv(&mut self, yuv: Vec<u8>, width: u32, height: u32) -> Option<(Vec<u8>, bool)> {
         match self {
             #[cfg(all(target_os = "linux", feature = "x264"))]
@@ -1987,6 +2031,7 @@ struct X264Encoder {
     enc: *mut x264_sys::x264_t,
     pts: i64,
     force_keyframe: bool,
+    is_444: bool,
 }
 
 // SAFETY: the x264 handle is not tied to the thread that created it and is
@@ -1996,8 +2041,14 @@ unsafe impl Send for X264Encoder {}
 
 #[cfg(all(target_os = "linux", feature = "x264"))]
 impl X264Encoder {
-    fn new(width: u32, height: u32, quality: SurfaceQuality) -> Result<Self, String> {
+    fn new(
+        width: u32,
+        height: u32,
+        quality: SurfaceQuality,
+        chroma: ChromaSubsampling,
+    ) -> Result<Self, String> {
         use x264_sys::*;
+        let is_444 = chroma.is_444();
         unsafe {
             let mut par: x264_param_t = std::mem::zeroed();
             // Cheap CPU fallback: superfast + zerolatency (no B-frames, no
@@ -2007,7 +2058,7 @@ impl X264Encoder {
             {
                 return Err("x264_param_default_preset failed".into());
             }
-            par.i_csp = X264_CSP_I420 as i32;
+            par.i_csp = if is_444 { X264_CSP_I444 } else { X264_CSP_I420 } as i32;
             par.i_width = width as i32;
             par.i_height = height as i32;
             // Predictable per-surface CPU cost (zerolatency would otherwise
@@ -2020,9 +2071,11 @@ impl X264Encoder {
             par.i_log_level = X264_LOG_NONE;
             par.rc.i_rc_method = X264_RC_ABR as i32;
             par.rc.i_bitrate = (quality.h264_bitrate() / 1000) as i32; // kbit/s
-            // Constrained Baseline — matches the avc1.4200 codec string sent
-            // to clients.
-            if x264_param_apply_profile(&mut par, c"baseline".as_ptr()) < 0 {
+            // Profiles match the codec strings sent to clients: Constrained
+            // Baseline (avc1.4200) for 4:2:0, High 4:4:4 Predictive
+            // (avc1.F400) for 4:4:4 — the only H.264 profile with 4:4:4.
+            let profile = if is_444 { c"high444" } else { c"baseline" };
+            if x264_param_apply_profile(&mut par, profile.as_ptr()) < 0 {
                 return Err("x264_param_apply_profile failed".into());
             }
             let enc = x264_encoder_open(&mut par);
@@ -2033,6 +2086,7 @@ impl X264Encoder {
                 enc,
                 pts: 0,
                 force_keyframe: false,
+                is_444,
             })
         }
     }
@@ -2046,7 +2100,11 @@ impl X264Encoder {
         let w = width as usize;
         let h = height as usize;
         let y_len = w * h;
-        let c_len = (w / 2) * (h / 2);
+        let (c_len, c_stride) = if self.is_444 {
+            (w * h, w)
+        } else {
+            ((w / 2) * (h / 2), w / 2)
+        };
         if yuv.len() < y_len + 2 * c_len {
             eprintln!("[surface-encoder] x264 short YUV buffer {width}x{height}");
             return None;
@@ -2054,7 +2112,11 @@ impl X264Encoder {
         unsafe {
             let mut pic_in: x264_picture_t = std::mem::zeroed();
             x264_picture_init(&mut pic_in);
-            pic_in.img.i_csp = X264_CSP_I420 as i32;
+            pic_in.img.i_csp = if self.is_444 {
+                X264_CSP_I444
+            } else {
+                X264_CSP_I420
+            } as i32;
             pic_in.img.i_plane = 3;
             // x264 reads but never writes the input planes.
             let base = yuv.as_ptr() as *mut u8;
@@ -2062,8 +2124,8 @@ impl X264Encoder {
             pic_in.img.plane[1] = base.add(y_len);
             pic_in.img.plane[2] = base.add(y_len + c_len);
             pic_in.img.i_stride[0] = w as i32;
-            pic_in.img.i_stride[1] = (w / 2) as i32;
-            pic_in.img.i_stride[2] = (w / 2) as i32;
+            pic_in.img.i_stride[1] = c_stride as i32;
+            pic_in.img.i_stride[2] = c_stride as i32;
             pic_in.i_pts = self.pts;
             self.pts += 1;
             pic_in.i_type = if self.force_keyframe {
@@ -2373,32 +2435,77 @@ mod tests {
         // The dispatcher prefers x264, so this exercises the x264 backend.
         // (new_with_backend(None, ..) keeps the ambient BLIT_H264_SOFTWARE
         // of whoever runs the tests from interfering.)
+        let chroma = ChromaSubsampling::Cs420;
         let mut enc =
-            SoftwareH264Encoder::new_with_backend(None, 64, 48, SurfaceQuality::Medium).unwrap();
-        assert_eq!(enc.name(), "h264-software (x264)");
+            SoftwareH264Encoder::new_with_backend(None, 64, 48, SurfaceQuality::Medium, chroma)
+                .unwrap();
+        assert_eq!(enc.name(chroma), "h264-software (x264)");
         let rgba = vec![128u8; 64 * 48 * 4];
-        let (data, key) = enc.encode(&rgba, 64, 48).expect("first frame encodes");
+        let (data, key) = enc
+            .encode(&rgba, 64, 48, chroma)
+            .expect("first frame encodes");
         assert!(key, "first frame is a keyframe");
         assert!(h264_stream_contains_idr(&data));
-        let (_, key2) = enc.encode(&rgba, 64, 48).expect("second frame encodes");
+        let (_, key2) = enc
+            .encode(&rgba, 64, 48, chroma)
+            .expect("second frame encodes");
         assert!(!key2, "steady-state frame is not a keyframe");
         enc.request_keyframe();
-        let (data3, key3) = enc.encode(&rgba, 64, 48).expect("forced keyframe encodes");
+        let (data3, key3) = enc
+            .encode(&rgba, 64, 48, chroma)
+            .expect("forced keyframe encodes");
         assert!(key3, "request_keyframe forces an IDR");
         assert!(h264_stream_contains_idr(&data3));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "x264"))]
+    #[test]
+    fn x264_software_encoder_444_round_trip() {
+        let chroma = ChromaSubsampling::Cs444;
+        let mut enc =
+            SoftwareH264Encoder::new_with_backend(None, 64, 48, SurfaceQuality::Medium, chroma)
+                .unwrap();
+        assert_eq!(enc.name(chroma), "h264-software (x264) 4:4:4");
+        let rgba = vec![128u8; 64 * 48 * 4];
+        let (data, key) = enc
+            .encode(&rgba, 64, 48, chroma)
+            .expect("first frame encodes");
+        assert!(key, "first frame is a keyframe");
+        assert!(h264_stream_contains_idr(&data));
+        let (_, key2) = enc
+            .encode(&rgba, 64, 48, chroma)
+            .expect("second frame encodes");
+        assert!(!key2, "steady-state frame is not a keyframe");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "openh264"))]
+    #[test]
+    fn openh264_rejects_444() {
+        let err = SoftwareH264Encoder::new_with_backend(
+            Some("openh264"),
+            64,
+            48,
+            SurfaceQuality::Medium,
+            ChromaSubsampling::Cs444,
+        )
+        .err()
+        .expect("openh264 must reject 4:4:4");
+        assert!(err.contains("4:4:4"), "unexpected error: {err}");
     }
 
     #[cfg(all(target_os = "linux", feature = "x264", feature = "openh264"))]
     #[test]
     fn h264_software_backend_pin() {
         let q = SurfaceQuality::Medium;
-        let enc = SoftwareH264Encoder::new_with_backend(Some("openh264"), 64, 48, q).unwrap();
-        assert_eq!(enc.name(), "h264-software (openh264)");
-        let enc = SoftwareH264Encoder::new_with_backend(Some("x264"), 64, 48, q).unwrap();
-        assert_eq!(enc.name(), "h264-software (x264)");
-        let enc = SoftwareH264Encoder::new_with_backend(None, 64, 48, q).unwrap();
-        assert_eq!(enc.name(), "h264-software (x264)", "x264 preferred");
-        assert!(SoftwareH264Encoder::new_with_backend(Some("nope"), 64, 48, q).is_err());
+        let chroma = ChromaSubsampling::Cs420;
+        let enc =
+            SoftwareH264Encoder::new_with_backend(Some("openh264"), 64, 48, q, chroma).unwrap();
+        assert_eq!(enc.name(chroma), "h264-software (openh264)");
+        let enc = SoftwareH264Encoder::new_with_backend(Some("x264"), 64, 48, q, chroma).unwrap();
+        assert_eq!(enc.name(chroma), "h264-software (x264)");
+        let enc = SoftwareH264Encoder::new_with_backend(None, 64, 48, q, chroma).unwrap();
+        assert_eq!(enc.name(chroma), "h264-software (x264)", "x264 preferred");
+        assert!(SoftwareH264Encoder::new_with_backend(Some("nope"), 64, 48, q, chroma).is_err());
     }
 
     #[cfg(all(target_os = "linux", feature = "openh264"))]
