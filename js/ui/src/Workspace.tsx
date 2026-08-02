@@ -1347,6 +1347,47 @@ function WorkspaceScreen(props: {
     );
   });
 
+  /**
+   * The session the user parked out of the main view, which then shows
+   * nothing.
+   *
+   * UI-level state, because the core cannot express it: `focusSession(null)`
+   * does not stick — `resolveFocusedSessionId` falls back to the connection's
+   * focus and finally to the first live session, so *some* session is always
+   * focused (which is what keeps focus alive across reconnects). Parking is a
+   * statement about this view, not about which session holds focus.
+   *
+   * Holding the id rather than a flag is what keeps it honest: parking only
+   * applies while that exact session is still the focused one, so anything
+   * that moves focus — a new terminal, a dock card, the session closing —
+   * un-parks by construction, with no clear-it-here call to forget.
+   *
+   * Declared here, above `offScreenSessions`: that memo reads it and Solid
+   * runs a memo body eagerly at setup, so a later `const` is still in its
+   * temporal dead zone when the first render reaches it.
+   */
+  const [parkedSessionId, setParkedSessionId] = createSignal<SessionId | null>(
+    null,
+  );
+  const mainTerminalParked = () => {
+    const fid = wsState().focusedSessionId;
+    return fid != null && fid === parkedSessionId();
+  };
+  // Focus moving elsewhere ends the park outright, rather than leaving the id
+  // set and merely inactive. Holding it would let the park resurrect: the core
+  // always resolves *some* focus, so closing the session that displaced a
+  // parked one hands focus back to it — and it would silently re-park, with
+  // its dock card the only way out.
+  createEffect(() => {
+    const fid = wsState().focusedSessionId;
+    if (untrack(parkedSessionId) != null && fid !== untrack(parkedSessionId)) {
+      setParkedSessionId(null);
+    }
+  });
+  /** The session the non-BSP main view displays: none while parked. */
+  const mainViewSessionId = () =>
+    mainTerminalParked() ? null : wsState().focusedSessionId;
+
   const offScreenSessions = createMemo(() => {
     const al = activeLayout();
     const la = layoutAssignments();
@@ -1363,8 +1404,9 @@ function WorkspaceScreen(props: {
       );
       return sess.filter((s) => s.state !== "closed" && !assigned.has(s.id));
     }
-    // When a surface is focused the terminal it displaced is off-screen.
-    if (focusedSurfaceId() != null) {
+    // When a surface is focused the terminal it displaced is off-screen — as
+    // is the parked one, which is the whole point of parking it.
+    if (focusedSurfaceId() != null || mainTerminalParked()) {
       return sess.filter((s) => s.state !== "closed");
     }
     return sess.filter(
@@ -1882,17 +1924,19 @@ function WorkspaceScreen(props: {
     window.removeEventListener("dragend", paneDragDone);
   });
 
-  /** What the main view's grip drags: its tile or its surface. A bare
-   *  terminal stays undraggable — the dock derives "parked" from "not
-   *  displayed", and the single view always displays the focused session. */
+  /** What the main view's grip drags: its tile, its surface, or its
+   *  terminal. Parking the focused session is focusing nothing — the view
+   *  falls back to EmptyPane and the session joins the dock, which derives
+   *  "parked" from "not displayed". Every pane kind carries the grip: it is
+   *  also what relocates the toolbar, so a grip-less pane would have a close
+   *  button locked in place over whatever it covers. */
   const mainViewDragAssignment = (): string | null => {
     const tile = activeTile();
     if (tile) return tile;
     const sid = focusedSurfaceId();
     const connId = focusedSurfaceConnId();
-    return sid != null && connId != null
-      ? surfaceAssignment(connId, sid)
-      : null;
+    if (sid != null && connId != null) return surfaceAssignment(connId, sid);
+    return mainViewSessionId() ?? null;
   };
 
   /** A grip drag landed on the dock: park the content by taking it off
@@ -1906,6 +1950,10 @@ function WorkspaceScreen(props: {
       const surface = parseSurfaceAssignment(assignment);
       if (surface && surface.surfaceId === focusedSurfaceId()) {
         focusSurfaceById(null);
+        return;
+      }
+      if (assignment === wsState().focusedSessionId) {
+        setParkedSessionId(assignment as SessionId);
       }
       return;
     }
@@ -1981,11 +2029,10 @@ function WorkspaceScreen(props: {
     if (fid) void workspace.closeSession(fid);
   }
 
-  /** True when the main view is holding something the ✕ can close. */
+  /** True when the main view is holding something the ✕ can close. A parked
+   *  view holds nothing, so it gets no toolbar. */
   const mainViewClosable = () =>
-    !!activeTile() ||
-    focusedSurfaceId() != null ||
-    !!wsState().focusedSessionId;
+    !!activeTile() || focusedSurfaceId() != null || !!mainViewSessionId();
 
   // Restore a backgrounded tile: showing it removes it from the dock, which is
   // derived as "open minus displayed".
@@ -2561,6 +2608,9 @@ function WorkspaceScreen(props: {
   }
 
   function focusSessionFromUi(sessionId: SessionId) {
+    // Re-showing the parked session itself: focus does not change, so only an
+    // explicit clear can un-park it.
+    if (sessionId === parkedSessionId()) setParkedSessionId(null);
     focusSurfaceById(null);
     // Stops DISPLAYING the non-BSP tile; the tab stays open and drops into
     // the dock (and stays listed in every other frontend).
@@ -3274,7 +3324,7 @@ function WorkspaceScreen(props: {
                             when={focusedSurfaceId()}
                             fallback={
                               <Show
-                                when={wsState().focusedSessionId}
+                                when={mainViewSessionId()}
                                 fallback={
                                   <EmptyPane
                                     paneId="__workspace_empty__"
@@ -3413,6 +3463,9 @@ function WorkspaceScreen(props: {
                           </Show>
                         }
                       >
+                        {/* No pinned ✕ here: PaneTools floats over the main
+                            view for every pane kind, close included, and it
+                            can be relocated out of the content's way. */}
                         {(tile) => (
                           <div
                             style={{
@@ -3431,53 +3484,26 @@ function WorkspaceScreen(props: {
                               fontSize={fontSize()}
                               onOpenTile={openTile}
                             />
-                            <button
-                              onClick={() => closeFocusedTile()}
-                              title="Close tab"
-                              style={{
-                                position: "absolute",
-                                top: `${chromeScale().gap}px`,
-                                right: `${chromeScale().gap}px`,
-                                "z-index": z.exitedBanner,
-                                ...ui.btn,
-                              }}
-                            >
-                              {"✕"}
-                            </button>
                           </div>
                         )}
                       </Show>
                     }
                   >
-                    {(web) => (
-                      <div
-                        style={{
-                          width: "100%",
-                          height: "100%",
-                          position: "relative",
-                        }}
-                      >
-                        <WebPaneHost
-                          assignment={activeTile()!}
-                          hostId={NAV_NONBSP}
-                          register={webPaneHosts.register}
-                          focused
-                        />
-                        <button
-                          onClick={() => closeFocusedTile()}
-                          title="Close tab"
-                          style={{
-                            position: "absolute",
-                            top: `${chromeScale().gap}px`,
-                            right: `${chromeScale().gap}px`,
-                            "z-index": z.exitedBanner,
-                            ...ui.btn,
-                          }}
-                        >
-                          {"✕"}
-                        </button>
-                      </div>
-                    )}
+                    {/* Same as the tile branch: PaneTools is the close. */}
+                    <div
+                      style={{
+                        width: "100%",
+                        height: "100%",
+                        position: "relative",
+                      }}
+                    >
+                      <WebPaneHost
+                        assignment={activeTile()!}
+                        hostId={NAV_NONBSP}
+                        register={webPaneHosts.register}
+                        focused
+                      />
+                    </div>
                   </Show>
                 }
               >

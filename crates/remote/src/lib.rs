@@ -2662,10 +2662,17 @@ pub fn build_update_msg(
     current: &FrameState,
     previous: &FrameState,
 ) -> Option<Vec<u8>> {
-    let title_changed = current.title != previous.title;
     let same_size = previous.rows == current.rows
         && previous.cols == current.cols
         && previous.cells.len() == current.cells.len();
+    // A baseline of different (or unknown — `previous` defaults to 0x0 after
+    // a baseline reset) dimensions means nothing can be assumed about what
+    // the client's grid holds: it keeps its cells whenever the frame's
+    // dimensions match its own. Such frames are keyframes and must fully
+    // determine client state — clear the grid, resend title and line flags
+    // even when they match the blank baseline.
+    let keyframe = !same_size;
+    let title_changed = keyframe || current.title != previous.title;
 
     // Try scroll-aware ops when dimensions match and content differs.
     let mut ops = Vec::new();
@@ -2694,16 +2701,29 @@ pub fn build_update_msg(
         }
     }
 
-    // Fallback: bare PATCH_CELLS against previous (or a blank frame on resize).
+    // Fallback: bare PATCH_CELLS against previous, or a keyframe. A patch
+    // against a blank basis only rewrites non-blank cells, so a keyframe
+    // leads with a whole-grid FILL_RECT — without it, a client whose grid
+    // already has content at the same dimensions would keep stale glyphs in
+    // every cell the patch skips.
     if op_count == 0 {
+        let blank;
         let basis = if same_size {
             previous
         } else {
-            &FrameState::new(current.rows, current.cols)
+            ops.push(OP_FILL_RECT);
+            ops.extend_from_slice(&0u16.to_le_bytes());
+            ops.extend_from_slice(&0u16.to_le_bytes());
+            ops.extend_from_slice(&current.rows.to_le_bytes());
+            ops.extend_from_slice(&current.cols.to_le_bytes());
+            ops.extend_from_slice(&[0u8; CELL_SIZE]);
+            op_count = 1;
+            blank = FrameState::new(current.rows, current.cols);
+            &blank
         };
         if let Some(patch_op) = build_patch_op(current, basis) {
-            ops = patch_op;
-            op_count = 1;
+            ops.extend_from_slice(&patch_op);
+            op_count += 1;
         }
     }
 
@@ -2731,7 +2751,8 @@ pub fn build_update_msg(
 
     let line_flags_changed =
         current.line_flags != previous.line_flags || current.rows != previous.rows;
-    let has_line_flags = line_flags_changed && !current.line_flags.iter().all(|&f| f == 0);
+    let has_line_flags =
+        keyframe || (line_flags_changed && !current.line_flags.iter().all(|&f| f == 0));
 
     let title_bytes = if title_changed {
         current.title.as_bytes()
