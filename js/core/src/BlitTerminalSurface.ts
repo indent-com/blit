@@ -1186,6 +1186,10 @@ export class BlitTerminalSurface {
 
   private _resizeTimer: ReturnType<typeof setTimeout> | undefined;
   private _lastViewSizeAt = 0;
+  /** Container CSS size, cached in handleResize (post-layout) so doRender
+   *  can center a grid smaller than its pane without a forced reflow. */
+  private _containerW = 0;
+  private _containerH = 0;
   /** Wire rate limit for size changes. Low enough that a drag stays
    *  roughly live, high enough not to flood the server with intermediate
    *  sizes (each one can cost an encoder rebuild for h264-software). */
@@ -1195,6 +1199,11 @@ export class BlitTerminalSurface {
     if (!this.container || !this._resizable) return;
     const w = this.container.clientWidth;
     const h = this.container.clientHeight;
+    // Cached for doRender's centering math: an observer callback runs
+    // after layout, so this read is free here and would force a reflow
+    // in the render loop.
+    this._containerW = w;
+    this._containerH = h;
     const cols = Math.max(1, Math.floor(w / this.cell.w));
     const rows = Math.max(1, Math.floor(h / this.cell.h));
     const sizeChanged = cols !== this._cols || rows !== this._rows;
@@ -1439,6 +1448,23 @@ export class BlitTerminalSurface {
     if (glCanvas) {
       if (glCanvas.style.width !== cssW) glCanvas.style.width = cssW;
       if (glCanvas.style.height !== cssH) glCanvas.style.height = cssH;
+      if (this._resizable) {
+        // The grid is server-owned (the minimum across subscribed clients),
+        // so it can be smaller than this pane; center it rather than pin it
+        // to the top-left corner.  Offsets are floored to whole CSS pixels —
+        // measureSnap/applySnap absorb any fractional device-pixel residue
+        // at dpr > 1 — and are 0 whenever the grid fills the pane.
+        const cssLeft = `${Math.max(0, Math.floor((this._containerW - termCols * cell.w) / 2))}px`;
+        const cssTop = `${Math.max(0, Math.floor((this._containerH - termRows * cell.h) / 2))}px`;
+        if (glCanvas.style.left !== cssLeft || glCanvas.style.top !== cssTop) {
+          glCanvas.style.left = cssLeft;
+          glCanvas.style.top = cssTop;
+          // The box moved: the sub-pixel snap computed against the old
+          // position is stale.  Schedule another frame so measureSnap sees
+          // the new box; it converges because these writes are guarded.
+          this.scheduleRender();
+        }
+      }
     }
 
     const mem = conn.wasmMemory();
