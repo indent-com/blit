@@ -101,6 +101,16 @@ User, Port, and IdentityFile.
 curl -sf https://install.blit.sh | sh
 ```
 
+The default binary is MIT-licensed (software H.264 via openh264). On Linux
+you can opt into a GPL build that uses x264 (GPL-2.0-or-later) for better
+software H.264 instead:
+
+```bash
+curl -sf https://install.blit.sh | BLIT_GPL=1 sh
+```
+
+Every binary prints its exact terms with `blit --license`.
+
 ### Windows (PowerShell)
 
 ```powershell
@@ -113,7 +123,7 @@ This downloads `blit.exe` to `%LOCALAPPDATA%\blit\bin` and adds it to your user 
 
 `blit` hosts PTYs and tracks full parsed terminal state. For each connected browser it computes a binary diff against what that browser last saw and sends only the delta — LZ4-compressed, with scrolling encoded as copy-rect operations. WebGL-rendered in the browser.
 
-On Linux, every blit server includes an experimental headless Wayland compositor shared by all terminals. GUI applications launched inside any terminal (anything that speaks the Wayland protocol — terminal emulators, browsers, editors, media players) automatically connect to it. Surfaces are captured, encoded as H.264 or AV1 video, and streamed to connected browsers in real time. No X server, no display, no GPU required — rendering uses GPU compositing (Vulkan via dlopen) when available, with a CPU software fallback. Encoding uses openh264/rav1e (with optional NVENC or VA-API hardware acceleration on Linux). The compositor is available on Linux only.
+On Linux, every blit server includes an experimental headless Wayland compositor shared by all terminals. GUI applications launched inside any terminal (anything that speaks the Wayland protocol — terminal emulators, browsers, editors, media players) automatically connect to it. Surfaces are captured, encoded as H.264 or AV1 video, and streamed to connected browsers in real time. No X server, no display, no GPU required — rendering uses GPU compositing (Vulkan via dlopen) when available, with a CPU software fallback. Encoding uses openh264 or x264 (a build-time choice, see Install) and rav1e, with optional NVENC or VA-API hardware acceleration on Linux. The compositor is available on Linux only.
 
 Each client is paced independently based on render metrics it reports back: display rate, frame apply time, backlog depth. A phone on 3G doesn't stall a workstation on localhost. The focused terminal gets full frame rate; background terminals throttle down. Keystrokes go straight to the PTY — latency is bounded by link RTT.
 
@@ -160,14 +170,14 @@ BLIT_SURFACE_ENCODERS=av1-software
 BLIT_SURFACE_ENCODERS=av1-nvenc,h264-nvenc,h264-software
 ```
 
-| Value           | Codec | Backend          | Notes                                           |
-| --------------- | ----- | ---------------- | ----------------------------------------------- |
-| `av1-nvenc`     | AV1   | NVIDIA NVENC     | RTX 40+ series; fastest AV1 encode              |
-| `h264-nvenc`    | H.264 | NVIDIA NVENC     | Requires proprietary NVIDIA driver              |
-| `av1-vaapi`     | AV1   | VA-API           | Intel/AMD GPU                                   |
-| `h264-vaapi`    | H.264 | VA-API           | Intel/AMD GPU; max 3840×2160                    |
-| `h264-software` | H.264 | openh264         | Max 3840×2160; lowest CPU but worst compression |
-| `av1-software`  | AV1   | rav1e (software) | No resolution limit; CPU-heavy at high res      |
+| Value           | Codec | Backend          | Notes                                                |
+| --------------- | ----- | ---------------- | ---------------------------------------------------- |
+| `av1-nvenc`     | AV1   | NVIDIA NVENC     | RTX 40+ series; fastest AV1 encode                   |
+| `h264-nvenc`    | H.264 | NVIDIA NVENC     | Requires proprietary NVIDIA driver                   |
+| `av1-vaapi`     | AV1   | VA-API           | Intel/AMD GPU                                        |
+| `h264-vaapi`    | H.264 | VA-API           | Intel/AMD GPU; max 3840×2160                         |
+| `h264-software` | H.264 | openh264 or x264 | Max 3840×2160; build-time choice (x264 = GPL opt-in) |
+| `av1-software`  | AV1   | rav1e (software) | No resolution limit; CPU-heavy at high res           |
 
 The browser automatically detects the codec from each frame and configures
 its WebCodecs decoder accordingly. Clients can also advertise which codecs

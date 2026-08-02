@@ -29,6 +29,13 @@ fn main() {
         return;
     }
 
+    // `--license` works like `--help`: a bare top-level flag, handled before
+    // clap since every other invocation requires a subcommand.
+    if std::env::args().nth(1).as_deref() == Some("--license") {
+        print!("{}", cli::license_text());
+        return;
+    }
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1273,10 +1280,22 @@ async fn cmd_upgrade() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(unix)]
     {
-        let status = std::process::Command::new("sh")
-            .arg(&tmp)
-            .env("BLIT_PREFIX", prefix)
-            .status()?;
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg(&tmp).env("BLIT_PREFIX", prefix);
+        // Upgrades keep the flavor: a GPL binary (x264 compiled in) fetches
+        // the GPL flavor again.  An explicit BLIT_GPL in the environment
+        // wins, so users can switch flavors through `blit upgrade`.
+        if std::env::var_os("BLIT_GPL").is_none() {
+            cmd.env(
+                "BLIT_GPL",
+                if cfg!(all(target_os = "linux", feature = "x264")) {
+                    "1"
+                } else {
+                    "0"
+                },
+            );
+        }
+        let status = cmd.status()?;
         if status.success() {
             transport::stop_proxy().await;
         }

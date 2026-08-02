@@ -11,6 +11,15 @@ homepage.workspace = true
 name = "blit"
 path = "src/main.rs"
 
+[features]
+# Software H.264 encoders compiled into the binary — forwarded to
+# blit-server, and reflected in `blit --license`. Any combination works:
+# none (AV1-only software fallback), one, or both. x264 (GPL-2.0-or-later)
+# is a deliberate opt-in; default builds stay MIT-clean.
+default = ["openh264"]
+x264 = ["blit-server/x264"]
+openh264 = ["blit-server/openh264"]
+
 [dependencies]
 blit-remote = { workspace = true }
 blit-webserver = { workspace = true }

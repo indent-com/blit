@@ -113,7 +113,11 @@ describe("injectIntoHtml", () => {
     );
     const cut = bytes.indexOf(0xe2) + 1; // split an em dash across chunks
     const out = await drain(
-      injectIntoHtml(streamOf(bytes.slice(0, cut), bytes.slice(cut)), target, ""),
+      injectIntoHtml(
+        streamOf(bytes.slice(0, cut), bytes.slice(cut)),
+        target,
+        "",
+      ),
     );
     expect(out).toContain("<head><script>");
     expect(out.replace(/<script>[\s\S]*<\/script>/, "")).toBe(

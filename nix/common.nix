@@ -60,7 +60,10 @@ let
     nativeBuildInputs = [ pkgs.pkg-config ];
     buildInputs = [
       pkgs.libopus # system Opus for audiopus_sys (avoids cmake source build)
-    ];
+    ]
+    # System x264 for x264-sys (H.264 software surface encoder). The
+    # dependency is Linux-only in crates/server/Cargo.toml.
+    ++ pkgs.lib.optional pkgs.stdenv.isLinux pkgs.x264;
     nativeCheckInputs = [ ];
   }
   // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
@@ -144,11 +147,16 @@ let
     nativeBuildInputs = [ pkgs.pkg-config ];
     buildInputs = [
       staticLibopus
-    ];
+    ]
+    # pkgsStatic x264 is built --enable-static --disable-shared.
+    ++ pkgs.lib.optional pkgs.stdenv.isLinux pkgsStaticLLVM.x264;
     # Link musl libc dynamically so dlopen works (GPU acceleration).
     RUSTFLAGS = "-C target-feature=-crt-static";
   }
   // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+    # Make system-deps link libx264.a explicitly rather than defaulting
+    # to dynamic-style -lx264.
+    SYSTEM_DEPS_X264_LINK = "static";
     CARGO_BUILD_TARGET = pkgsStaticLLVM.stdenv.hostPlatform.rust.rustcTargetSpec;
     # Tell the `cc` crate to link libc++ instead of libstdc++ (LLVM toolchain).
     CXXSTDLIB = "c++";
@@ -210,6 +218,16 @@ let
     mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Ddefault_library=static" ];
   });
 
+  # Static libx264 for the glibc release build, same reasoning as libopus:
+  # zig's linker rejects .so files built against a newer glibc than the
+  # target version, so the library must be linked statically.
+  gnuStaticX264 = pkgs.x264.overrideAttrs (old: {
+    configureFlags =
+      map (f: if f == "--enable-shared" then "--enable-static" else f)
+        (old.configureFlags or [ ])
+      ++ [ "--disable-shared" ];
+  });
+
   commonArgsGnu = {
     inherit src version;
     strictDeps = true;
@@ -222,10 +240,13 @@ let
     ];
     buildInputs = [
       gnuStaticLibopus
+      gnuStaticX264
     ];
     BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.lib.getDev pkgs.stdenv.cc.libc}/include";
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     CARGO_BUILD_TARGET = rustTargetGnu;
+    # Make system-deps link libx264.a explicitly (see commonArgsStatic).
+    SYSTEM_DEPS_X264_LINK = "static";
     # Use cmake builder for aws-lc-sys to avoid its false-positive
     # zig-cc memcmp bug check in the cc-crate code path.
     AWS_LC_SYS_CMAKE_BUILDER = "1";

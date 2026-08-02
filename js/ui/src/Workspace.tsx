@@ -463,13 +463,24 @@ function WorkspaceScreen(props: {
   const defaultRemote = useDefaultRemote();
 
   /** Map remote name → connection status (derived from workspace snapshot). */
-  const remoteStatuses = createMemo(() => {
-    const map = new Map<string, import("@blit-sh/core").ConnectionStatus>();
-    for (const conn of allConnections()) {
-      map.set(conn.id, conn.status);
-    }
-    return map;
-  });
+  // Content equality: the snapshot fires on every frame/ping, and a fresh Map
+  // reference each tick would churn everything downstream that reads statuses.
+  const remoteStatuses = createMemo(
+    () => {
+      const map = new Map<string, import("@blit-sh/core").ConnectionStatus>();
+      for (const conn of allConnections()) {
+        map.set(conn.id, conn.status);
+      }
+      return map;
+    },
+    undefined,
+    {
+      equals: (a, b) =>
+        a != null &&
+        a.size === b.size &&
+        [...b].every(([name, status]) => a.get(name) === status),
+    },
+  );
 
   const [palette, setPalette] =
     createSignal<TerminalPalette>(preferredPalette());

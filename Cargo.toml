@@ -35,7 +35,7 @@ blit-lsp = { version = "0.42.0", path = "crates/lsp" }
 blit-alacritty = { version = "0.42.0", path = "crates/alacritty-driver" }
 blit-fonts = { version = "0.42.0", path = "crates/fonts" }
 blit-webserver = { version = "0.42.0", path = "crates/webserver" }
-blit-server = { version = "0.42.0", path = "crates/server" }
+blit-server = { version = "0.42.0", path = "crates/server", default-features = false }
 blit-gateway = { version = "0.42.0", path = "crates/gateway" }
 blit-proxy = { version = "0.42.0", path = "crates/proxy" }
 blit-webrtc-forwarder = { version = "0.42.0", path = "crates/webrtc-forwarder" }

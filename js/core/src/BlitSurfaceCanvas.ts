@@ -326,16 +326,24 @@ export class BlitSurfaceCanvas {
    * When non-null the surface is in resizable mode: the framework binding's
    * ResizeObserver calls setDisplaySize with the container's physical pixel
    * size and a server-side resize is requested.  The canvas backing buffer
-   * always mirrors the decoded frame; CSS (width:100%/height:100% +
-   * object-fit: contain) scales it to fill the container.  Keeping the
-   * canvas at the frame's native size avoids a blurry "jump" mid-drag
-   * where an old, smaller frame would get drawImage-upscaled into a
-   * prematurely enlarged canvas before the new keyframe arrives.
+   * always mirrors the decoded frame; applyLayout() sizes the CSS box so
+   * one canvas pixel is one device pixel — never upscaled — and centers it
+   * in the container.  Keeping the canvas at the frame's native size avoids
+   * a blurry "jump" mid-drag where an old, smaller frame would get
+   * drawImage-upscaled into a prematurely enlarged canvas before the new
+   * keyframe arrives.
    */
   private _displaySize: {
     width: number;
     height: number;
     scale120: number;
+  } | null = null;
+  /** Last layout applied by applyLayout(), to skip redundant style writes. */
+  private _lastLayout: {
+    left: number;
+    top: number;
+    w: number;
+    h: number;
   } | null = null;
   /** True after this view has sent a nonzero surface resize that must be
    *  cleared when the view stops owning foreground/BSP sizing. */
@@ -590,6 +598,7 @@ export class BlitSurfaceCanvas {
     if (width == null) {
       this._displaySize = null;
       this.clearResizeConstraint();
+      this.applyLayout();
       return;
     }
     const w = Math.round(width);
@@ -603,11 +612,74 @@ export class BlitSurfaceCanvas {
     this._displaySize = { width: w, height: h, scale120: s };
     // Canvas backing buffer is intentionally NOT resized here.  It tracks
     // the decoded frame size (set in blitFromStore) so the last sharp
-    // frame stays sharp while CSS (object-fit: contain) scales it to the
-    // new container size.  Resizing the canvas pre-emptively would clear
-    // the backing buffer and force a drawImage upscale of the stale
-    // frame, producing a visible "blurry intermediate" step until the
-    // server's keyframe at the requested size arrives.
+    // frame stays sharp while applyLayout() places it in the new
+    // container.  Resizing the canvas pre-emptively would clear the
+    // backing buffer and force a drawImage upscale of the stale frame,
+    // producing a visible "blurry intermediate" step until the server's
+    // keyframe at the requested size arrives.
+    this.applyLayout();
+  }
+
+  /**
+   * Size and position the canvas's CSS box for the current frame.
+   *
+   * A frame is shown at exactly one device pixel per canvas pixel — never
+   * upscaled.  The mediated surface size is the minimum across subscribed
+   * clients, so a smaller co-viewer shrinks the frames this client
+   * receives; those are shown at their native size, centered.  Only a
+   * frame *larger* than the container (transiently, mid-resize) is scaled
+   * down to fit, aspect-preserved.
+   *
+   * Non-resizable views (thumbnails, the React binding) never learn the
+   * container's device-pixel size, so they keep the fill-and-contain CSS
+   * from attach().
+   */
+  private applyLayout(): void {
+    const canvas = this.canvas;
+    if (!canvas) return;
+    const ds = this._displaySize;
+    if (!ds || !ds.scale120) {
+      if (this._lastLayout) {
+        this._lastLayout = null;
+        Object.assign(canvas.style, {
+          position: "",
+          left: "",
+          top: "",
+          width: "100%",
+          height: "100%",
+        });
+      }
+      return;
+    }
+    const fw = canvas.width;
+    const fh = canvas.height;
+    if (fw === 0 || fh === 0) return;
+    const fit = Math.min(1, ds.width / fw, ds.height / fh);
+    const w = Math.floor(fw * fit);
+    const h = Math.floor(fh * fit);
+    const left = Math.max(0, Math.floor((ds.width - w) / 2));
+    const top = Math.max(0, Math.floor((ds.height - h) / 2));
+    const last = this._lastLayout;
+    if (
+      last &&
+      last.left === left &&
+      last.top === top &&
+      last.w === w &&
+      last.h === h
+    ) {
+      return;
+    }
+    this._lastLayout = { left, top, w, h };
+    // All values are integer device pixels converted to CSS pixels, so the
+    // canvas lands on the device grid and the browser blits 1:1.
+    const scale = ds.scale120 / 120;
+    Object.assign(canvas.style, {
+      position: "absolute",
+      left: `${left / scale}px`,
+      top: `${top / scale}px`,
+      width: `${w / scale}px`,
+      height: `${h / scale}px`,
+    });
   }
 
   /**
@@ -719,6 +791,7 @@ export class BlitSurfaceCanvas {
         if (!prev && this.canvas) {
           this.canvas.width = this.surface.width;
           this.canvas.height = this.surface.height;
+          this.applyLayout();
         }
       }
       // Flush any pending resize now that we have the surface info.
@@ -768,13 +841,14 @@ export class BlitSurfaceCanvas {
     if (!src || !canvas || !ctx) return;
     if (src.width === 0 || src.height === 0) return;
 
-    // Canvas backing buffer mirrors the source frame exactly.  CSS
-    // (width:100%/height:100% + object-fit: contain) scales to the
-    // container and handles letterboxing, so no drawImage upscale.
+    // Canvas backing buffer mirrors the source frame exactly; applyLayout
+    // sizes the CSS box so the blit is 1:1 device pixels (or a proportional
+    // downscale when the frame is transiently larger than the container).
     if (canvas.width !== src.width || canvas.height !== src.height) {
       canvas.width = src.width;
       canvas.height = src.height;
     }
+    this.applyLayout();
     ctx.drawImage(src, 0, 0);
   }
 
@@ -976,10 +1050,12 @@ export class BlitSurfaceCanvas {
     const ch = this.canvas.height;
     if (cw === 0 || ch === 0 || rect.width === 0 || rect.height === 0)
       return null;
-    // The canvas's CSS box fills the container; its intrinsic aspect
-    // (canvas.width/height === src frame) is letterboxed within via
-    // object-fit: contain.  Compute the drawn content region in CSS
-    // coordinates, then map a click into surface coordinates.
+    // In resizable views applyLayout() sizes the CSS box to the drawn
+    // frame exactly, so the letterbox below degenerates to dx = dy ≈ 0;
+    // views still on the fill-and-contain default (thumbnails) letterbox
+    // the intrinsic aspect within the box via object-fit: contain.
+    // Compute the drawn content region in CSS coordinates, then map a
+    // click into surface coordinates.
     const srcAR = cw / ch;
     const dstAR = rect.width / rect.height;
     let dw: number, dh: number, dx: number, dy: number;
