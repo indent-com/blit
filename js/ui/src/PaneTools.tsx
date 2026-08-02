@@ -23,7 +23,7 @@
 import { createSignal, Show, type JSX } from "solid-js";
 import type { Theme, UIScale } from "./theme";
 import { t } from "./i18n";
-import { startPaneTileDrag } from "./ide/tileDrag";
+import { startPaneTileDrag, startPaneTouchDrag } from "./ide/tileDrag";
 
 /** Toolbar corners, in click-to-cycle order from the default. */
 const CORNERS = [
@@ -106,6 +106,11 @@ export function PaneTools(props: {
               onDragStart={(e) =>
                 startPaneTileDrag(e, drag().assignment, drag().paneId)
               }
+              // Touch never reaches `onDragStart`, so a finger could tap this
+              // (cycling the corner) but never move the pane.
+              onPointerDown={(e) =>
+                startPaneTouchDrag(e, drag().assignment, drag().paneId)
+              }
               // A click (no drag happened — the browser suppresses click
               // after a drag) relocates the toolbar itself. Stopped like the
               // ✕'s: the content underneath must not also see it as input.
@@ -118,6 +123,9 @@ export function PaneTools(props: {
                 cursor: "grab",
                 // The ✕ brings the shared edge; doubling it reads as a gap.
                 "border-right": "none",
+                // Required by the touch path: without it the browser pans the
+                // page and never reports the move (see startPaneTouchDrag).
+                "touch-action": "none",
               }}
             >
               {"⠿"}

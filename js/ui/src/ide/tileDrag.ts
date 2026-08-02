@@ -70,6 +70,127 @@ export function isPaneDrag(e: DragEvent): boolean {
  *  paths ("0", "1.0") from enumeratePanes, so this cannot collide. */
 export const MAIN_PANE_SOURCE = "main-view";
 
+/** Travel before a press becomes a drag rather than a tap. Matches
+ *  dragReorder's threshold — the same finger, the same slop. */
+const TOUCH_DRAG_THRESHOLD_PX = 6;
+
+/**
+ * Drag a pane's content with a finger.
+ *
+ * HTML5 drag-and-drop never fires from touch, so on Android the grip could be
+ * tapped (which cycles the toolbar's corner) but not dragged — every pane
+ * move and every park was mouse-only. `dragReorder` hit this first and solved
+ * it for lists; panes need the same, but they cannot borrow that solution:
+ * their drop targets are scattered across BSPContainer, Workspace's main view
+ * and the dock, each already wired to `dragover`/`drop`.
+ *
+ * So rather than a second drop protocol, this synthesises the first: one
+ * `DataTransfer` carried across real `DragEvent`s dispatched at whatever
+ * `elementFromPoint` reports under the finger. Every existing handler runs
+ * unchanged, including the window-level listeners that reveal the dock as a
+ * park target — they cannot tell the difference, which is the point.
+ *
+ * Mouse and pen keep the native path (real drag image, edge autoscroll); this
+ * takes over only for touch. The handle must carry `touch-action: none`, or
+ * the browser pans the page instead of reporting the move.
+ */
+export function startPaneTouchDrag(
+  e: PointerEvent,
+  assignment: string,
+  sourcePaneId: string,
+): void {
+  if (e.pointerType === "mouse") return;
+  const handle = e.currentTarget as HTMLElement | null;
+  if (!handle || typeof DataTransfer !== "function") return;
+
+  const data = new DataTransfer();
+  data.setData(TILE_DND_MIME, assignment);
+  data.setData("text/plain", assignment);
+  data.setData(PANE_SOURCE_DND_MIME, sourcePaneId);
+  data.effectAllowed = "copyMove";
+
+  const startX = e.clientX;
+  const startY = e.clientY;
+  let dragging = false;
+  let over: Element | null = null;
+
+  const fire = (target: EventTarget | null, type: string, ev: PointerEvent) => {
+    target?.dispatchEvent(
+      new DragEvent(type, {
+        dataTransfer: data,
+        bubbles: true,
+        cancelable: true,
+        clientX: ev.clientX,
+        clientY: ev.clientY,
+      }),
+    );
+  };
+
+  const onMove = (ev: PointerEvent) => {
+    if (ev.pointerId !== e.pointerId) return;
+    if (!dragging) {
+      const far =
+        Math.abs(ev.clientX - startX) > TOUCH_DRAG_THRESHOLD_PX ||
+        Math.abs(ev.clientY - startY) > TOUCH_DRAG_THRESHOLD_PX;
+      if (!far) return;
+      dragging = true;
+      handle.setPointerCapture?.(ev.pointerId);
+      fire(handle, "dragstart", ev);
+    }
+    // Capture routes the pointer events here, but hit-testing is ours to do.
+    const el = document.elementFromPoint(ev.clientX, ev.clientY);
+    if (el !== over) {
+      // Enter the new target before leaving the old, as the real sequence
+      // does. The order is not cosmetic: listeners depth-count enter/leave to
+      // decide a drag is in flight, and leaving first drops that count to
+      // zero — which unmounts the dock, the very target being dragged to.
+      if (el) fire(el, "dragenter", ev);
+      if (over) fire(over, "dragleave", ev);
+      over = el;
+    }
+    if (el) fire(el, "dragover", ev);
+  };
+
+  const onUp = (ev: PointerEvent) => {
+    if (ev.pointerId !== e.pointerId) return;
+    stop();
+    if (!dragging) return; // a tap: leave the click alone
+    const el = document.elementFromPoint(ev.clientX, ev.clientY);
+    if (el) fire(el, "drop", ev);
+    fire(handle, "dragend", ev);
+    // The release also produces a click, which on this handle means "move the
+    // toolbar to the next corner" — not what a completed drag asked for. The
+    // native path gets this for free; here it has to be swallowed.
+    const swallow = (click: Event) => {
+      click.stopPropagation();
+      click.preventDefault();
+    };
+    handle.addEventListener("click", swallow, { capture: true, once: true });
+    setTimeout(
+      () => handle.removeEventListener("click", swallow, { capture: true }),
+      0,
+    );
+  };
+
+  const onCancel = (ev: PointerEvent) => {
+    if (ev.pointerId !== e.pointerId) return;
+    stop();
+    if (!dragging) return;
+    if (over) fire(over, "dragleave", ev);
+    fire(handle, "dragend", ev);
+  };
+
+  function stop() {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    window.removeEventListener("pointercancel", onCancel);
+  }
+
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+  window.addEventListener("pointercancel", onCancel);
+}
+
 /** Custom MIME for explorer move drags: a file/dir dragged onto a directory
  *  row moves it there (docs/design/fs-write.md: rename and move are one op). */
 export const FS_MOVE_DND_MIME = "application/x-blit-fs-move";
