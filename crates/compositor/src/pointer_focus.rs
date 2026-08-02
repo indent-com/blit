@@ -48,9 +48,45 @@ pub(crate) fn focus_transition<T: Clone + PartialEq + Debug>(
     })
 }
 
+/// What to do with a button event while a popup grab may be open.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ButtonRouting {
+    /// Send it to the entered surface.
+    Deliver,
+    /// Swallow it: it is the click that broke a popup grab, or that click's
+    /// release.
+    Consume,
+}
+
+/// Route a button, and say what to remember for the next one.
+///
+/// `dismissed_grab` is whether this press just closed a popup chain. Such a
+/// click is spent on closing it — delivered as well, it presses whatever the
+/// menu was covering. Its release has to go too: a client that never saw the
+/// press must not see the release, so the button is remembered until then.
+pub(crate) fn button_routing(
+    pressed: bool,
+    button: u32,
+    dismissed_grab: bool,
+    swallowing: Option<u32>,
+) -> (ButtonRouting, Option<u32>) {
+    if dismissed_grab {
+        return (ButtonRouting::Consume, Some(button));
+    }
+    if pressed {
+        // A fresh press ends any earlier gesture, so a release that never
+        // arrived cannot leave the swallow armed to eat an unrelated one.
+        return (ButtonRouting::Deliver, None);
+    }
+    if swallowing == Some(button) {
+        return (ButtonRouting::Consume, None);
+    }
+    (ButtonRouting::Deliver, swallowing)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FocusTransition, focus_transition};
+    use super::{ButtonRouting, FocusTransition, button_routing, focus_transition};
 
     #[test]
     fn already_inside_is_motion_only() {
@@ -114,6 +150,54 @@ mod tests {
                 entered: Some(1),
             },
             "the surface we left must be entered again, not merely moved over"
+        );
+    }
+
+    const BTN_LEFT: u32 = 0x110;
+    const BTN_RIGHT: u32 = 0x111;
+
+    #[test]
+    fn an_ordinary_click_is_delivered() {
+        assert_eq!(
+            button_routing(true, BTN_LEFT, false, None),
+            (ButtonRouting::Deliver, None)
+        );
+        assert_eq!(
+            button_routing(false, BTN_LEFT, false, None),
+            (ButtonRouting::Deliver, None)
+        );
+    }
+
+    // The bug: the click that closed a menu was also delivered underneath, so
+    // dismissing a context menu pressed the link or button behind it.
+    #[test]
+    fn the_click_that_closes_a_menu_is_spent_on_closing_it() {
+        let (routing, swallow) = button_routing(true, BTN_LEFT, true, None);
+        assert_eq!(routing, ButtonRouting::Consume);
+        assert_eq!(swallow, Some(BTN_LEFT), "its release must go too");
+
+        assert_eq!(
+            button_routing(false, BTN_LEFT, false, swallow),
+            (ButtonRouting::Consume, None),
+            "a client that never saw the press must not see the release"
+        );
+    }
+
+    #[test]
+    fn another_buttons_release_is_untouched_while_armed() {
+        assert_eq!(
+            button_routing(false, BTN_RIGHT, false, Some(BTN_LEFT)),
+            (ButtonRouting::Deliver, Some(BTN_LEFT))
+        );
+    }
+
+    // A release that never arrives (the pointer leaves mid-click) must not
+    // leave the swallow armed to eat an unrelated one later.
+    #[test]
+    fn a_new_press_disarms_a_stale_swallow() {
+        assert_eq!(
+            button_routing(true, BTN_LEFT, false, Some(BTN_LEFT)),
+            (ButtonRouting::Deliver, None)
         );
     }
 }
