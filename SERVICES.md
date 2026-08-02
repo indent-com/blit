@@ -381,15 +381,16 @@ sequenceDiagram
 
 ## Secrets and authentication
 
-| Secret               | Used by            | Purpose                                     |
-| -------------------- | ------------------ | ------------------------------------------- |
-| `GPG_PRIVATE_KEY`    | apt-repo           | Signs APT Release metadata                  |
-| `HOMEBREW_TAP_TOKEN` | update-homebrew    | PAT for cross-repo dispatch to homebrew-tap |
-| `FLY_API_TOKEN`      | deploy-hub         | Fly.io deploy token for blit-hub            |
-| `DOCKERHUB_USERNAME` | publish-demo-image | Docker Hub credentials                      |
-| `DOCKERHUB_TOKEN`    | publish-demo-image | Docker Hub credentials                      |
-| `VERCEL_TOKEN`       | deploy-website     | Vercel API token                            |
-| `VERCEL_ORG_ID`      | deploy-website     | Vercel organization ID                      |
-| `VERCEL_PROJECT_ID`  | deploy-website     | Vercel project ID                           |
+| Secret                 | Used by            | Purpose                                     |
+| ---------------------- | ------------------ | ------------------------------------------- |
+| `GPG_PRIVATE_KEY`      | apt-repo           | Signs APT Release metadata                  |
+| `HOMEBREW_TAP_TOKEN`   | update-homebrew    | PAT for cross-repo dispatch to homebrew-tap |
+| `FLY_API_TOKEN`        | deploy-hub         | Fly.io deploy token for blit-hub            |
+| `DOCKERHUB_USERNAME`   | publish-demo-image | Docker Hub credentials                      |
+| `DOCKERHUB_TOKEN`      | publish-demo-image | Docker Hub credentials                      |
+| `VERCEL_TOKEN`         | deploy-website     | Vercel API token                            |
+| `VERCEL_ORG_ID`        | deploy-website     | Vercel organization ID                      |
+| `VERCEL_PROJECT_ID`    | deploy-website     | Vercel project ID                           |
+| `CARGO_REGISTRY_TOKEN` | publish-crates     | Temporary bootstrap token for new crates    |
 
-`publish-crates` uses no stored secret. It authenticates to crates.io via OIDC trusted publishing — GitHub mints a short-lived ID token (enabled by the `id-token: write` permission on the release workflow) and exchanges it for a crates.io upload token. `publish-npm` works the same way, using `--provenance` to sign the npm package with the workflow's OIDC identity.
+`publish-crates` normally uses no stored secret. It authenticates to crates.io via OIDC trusted publishing — GitHub mints a short-lived ID token (enabled by the `id-token: write` permission on the release workflow) and exchanges it for a crates.io upload token. A crate name must exist before its trusted publisher can be configured, so set `CARGO_REGISTRY_TOKEN` for the first release that creates a crate, configure that crate's trusted publisher for `release.yml`, then remove the secret. `publish-npm` uses OIDC as well, with `--provenance` signing the package for npm.

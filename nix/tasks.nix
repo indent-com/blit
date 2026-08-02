@@ -220,7 +220,114 @@ let
       pkgs.jq
     ];
     text = ''
-      if [ -n "''${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+      usage() {
+        echo "Usage: blit-publish-crates [--plan]"
+      }
+
+      plan_only=false
+      case $# in
+        0) ;;
+        1)
+          if [ "$1" != "--plan" ]; then
+            usage >&2
+            exit 2
+          fi
+          plan_only=true
+          ;;
+        *)
+          usage >&2
+          exit 2
+          ;;
+      esac
+
+      metadata=$(cargo metadata --no-deps --format-version 1)
+
+      mapfile -t crates < <(
+        jq -r '
+          .packages[]
+          | select(.publish == null or (.publish | index("crates-io")))
+          | .name
+        ' <<<"$metadata"
+      )
+      if [ "''${#crates[@]}" -eq 0 ]; then
+        echo "FATAL: workspace has no crates publishable to crates.io" >&2
+        exit 1
+      fi
+
+      declare -A workspace_crates=()
+      while IFS= read -r crate; do
+        workspace_crates["$crate"]=1
+      done < <(jq -r '.packages[].name' <<<"$metadata")
+
+      declare -A publishable_crates=()
+      for crate in "''${crates[@]}"; do
+        publishable_crates["$crate"]=1
+      done
+
+      dependencies() {
+        jq -r --arg crate "$1" '
+          .packages[]
+          | select(.name == $crate)
+          | .dependencies[]
+          | select(.kind != "dev" and .path != null)
+          | .name
+        ' <<<"$metadata"
+      }
+
+      for crate in "''${crates[@]}"; do
+        while IFS= read -r dependency; do
+          if [ -n "''${workspace_crates[$dependency]:-}" ] \
+            && [ -z "''${publishable_crates[$dependency]:-}" ]; then
+            echo "FATAL: publishable crate $crate depends on non-publishable workspace crate $dependency" >&2
+            exit 1
+          fi
+        done < <(dependencies "$crate")
+      done
+
+      declare -A planned=()
+      layers=()
+      planned_count=0
+      while [ "$planned_count" -lt "''${#crates[@]}" ]; do
+        layer=()
+        for crate in "''${crates[@]}"; do
+          [ -n "''${planned[$crate]:-}" ] && continue
+
+          ready=true
+          while IFS= read -r dependency; do
+            if [ -n "''${publishable_crates[$dependency]:-}" ] \
+              && [ -z "''${planned[$dependency]:-}" ]; then
+              ready=false
+              break
+            fi
+          done < <(dependencies "$crate")
+
+          if $ready; then
+            layer+=("$crate")
+          fi
+        done
+
+        if [ "''${#layer[@]}" -eq 0 ]; then
+          echo "FATAL: workspace crate dependency graph contains a cycle" >&2
+          exit 1
+        fi
+
+        layers+=("''${layer[*]}")
+        for crate in "''${layer[@]}"; do
+          planned["$crate"]=1
+          planned_count=$((planned_count + 1))
+        done
+      done
+
+      layer_number=0
+      for layer in "''${layers[@]}"; do
+        layer_number=$((layer_number + 1))
+        echo "layer $layer_number: $layer"
+      done
+
+      $plan_only && exit 0
+
+      if [ -z "''${CARGO_REGISTRY_TOKEN:-}" ] \
+        && [ -n "''${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
         echo "=== Exchanging OIDC token for crates.io publish token ==="
         oidc_response=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
           "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=crates.io")
@@ -245,12 +352,21 @@ let
 
       [ -n "''${CARGO_REGISTRY_TOKEN:-}" ] || { echo "FATAL: no CARGO_REGISTRY_TOKEN and not in GitHub Actions"; exit 1; }
 
-      VERSION=$(cargo metadata --no-deps --format-version 1 \
-        | jq -r '[.packages[].version] | unique | if length == 1 then .[0] else error("workspace versions differ") end')
+      VERSION=$(jq -r '
+        [
+          .packages[]
+          | select(.publish == null or (.publish | index("crates-io")))
+          | .version
+        ]
+        | unique
+        | if length == 1 then .[0] else error("publishable workspace versions differ") end
+      ' <<<"$metadata")
 
       is_published() {
         local code
-        code=$(curl -s -o /dev/null -w '%{http_code}' "https://crates.io/api/v1/crates/$1/$VERSION")
+        code=$(curl -s -o /dev/null -w '%{http_code}' \
+          -A 'blit-release/1 (https://github.com/indent-com/blit)' \
+          "https://crates.io/api/v1/crates/$1/$VERSION")
         [ "$code" = "200" ]
       }
 
@@ -283,27 +399,13 @@ let
         done
       }
 
-      # Layer 1: leaf crates (no workspace deps)
-      publish blit-fonts
-      publish blit-remote
-      publish blit-ssh
-      publish blit-compositor
-      wait_for_layer blit-fonts blit-remote blit-ssh blit-compositor
-
-      # Layer 2: depend only on leaf crates
-      publish blit-webserver
-      publish blit-alacritty
-      publish blit-webrtc-forwarder
-      wait_for_layer blit-webserver blit-alacritty blit-webrtc-forwarder
-
-      # Layer 3: depend on layer 1+2
-      publish blit-server
-      publish blit-proxy
-      publish blit-gateway
-      wait_for_layer blit-server blit-proxy blit-gateway
-
-      # Layer 4: depends on nearly everything
-      publish blit-cli
+      for layer in "''${layers[@]}"; do
+        read -r -a layer_crates <<<"$layer"
+        for crate in "''${layer_crates[@]}"; do
+          publish "$crate"
+        done
+        wait_for_layer "''${layer_crates[@]}"
+      done
     '';
   };
 

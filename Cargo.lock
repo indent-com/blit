@@ -76,30 +76,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "alacritty_terminal"
-version = "0.26.0"
-source = "git+https://github.com/indent-com/alacritty.git?branch=blit%2Femoji-width-fix#a78a26e8449563497903951480a1cbbc623376ce"
-dependencies = [
- "base64",
- "bitflags 2.11.1",
- "home",
- "libc",
- "log",
- "miow",
- "parking_lot",
- "piper",
- "polling",
- "regex-automata",
- "rustix",
- "rustix-openpty",
- "serde",
- "signal-hook",
- "unicode-width",
- "vte",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "aligned"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -739,9 +715,34 @@ dependencies = [
 name = "blit-alacritty"
 version = "0.43.0"
 dependencies = [
- "alacritty_terminal",
+ "blit-alacritty-terminal",
  "blit-remote",
  "regex",
+]
+
+[[package]]
+name = "blit-alacritty-terminal"
+version = "0.26.0-blit.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d27f91ac05f3c641d43ba60179a7307b3a73e5fe6862a3fdb42b92e762405a1a"
+dependencies = [
+ "base64",
+ "bitflags 2.11.1",
+ "home",
+ "libc",
+ "log",
+ "miow",
+ "parking_lot",
+ "piper",
+ "polling",
+ "regex-automata",
+ "rustix",
+ "rustix-openpty",
+ "serde",
+ "signal-hook",
+ "unicode-width",
+ "vte",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

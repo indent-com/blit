@@ -43,9 +43,6 @@ blit-compositor = { version = "0.43.0", path = "crates/compositor" }
 blit-sd-notify = { version = "0.43.0", path = "crates/sd-notify" }
 blit-ssh = { version = "0.43.0", path = "crates/ssh" }
 
-[patch.crates-io]
-alacritty_terminal = { git = "https://github.com/indent-com/alacritty.git", branch = "blit/emoji-width-fix" }
-
 [profile.release]
 opt-level = 3
 lto = true
