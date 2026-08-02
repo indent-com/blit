@@ -31,7 +31,7 @@ import type { Theme, UIScale } from "../theme";
 import { scrollbarStyle } from "../theme";
 import type { IdeSession } from "./session";
 import { setReveal } from "./reveal";
-import { startTileDrag } from "./tileDrag";
+import { fillTileDrag, startTileDrag, startTouchDrag } from "./tileDrag";
 
 function phaseLabel(phase: number): string {
   switch (phase) {
@@ -285,6 +285,17 @@ export function ProblemsPanel(props: {
                     onDragStart={(e) => {
                       const a = diagAssignment(path, d.line, d.col);
                       if (a) startTileDrag(e, a);
+                    }}
+                    // Touch never reaches onDragStart; a hold starts it, so
+                    // the list still scrolls.
+                    onPointerDown={(e) => {
+                      const a = diagAssignment(path, d.line, d.col);
+                      if (a)
+                        startTouchDrag(
+                          e,
+                          (dt) => fillTileDrag(dt, a),
+                          "long-press",
+                        );
                     }}
                   >
                     <span

@@ -24,7 +24,7 @@ import type { Theme, UIScale } from "../theme";
 import { scrollbarStyle } from "../theme";
 import type { IdeSession, IdeCommitRow } from "./session";
 import { layoutGraph, type GraphRow, type GraphLayoutState } from "./git-graph";
-import { startTileDrag } from "./tileDrag";
+import { fillTileDrag, startTileDrag, startTouchDrag } from "./tileDrag";
 import { collectRefPills, RefPills, type RefPill } from "./refPills";
 
 const LANE_W = 6;
@@ -350,6 +350,12 @@ export function LogPanel(props: {
       onDragStart={(e) => {
         const a = commitTile(c.oid);
         if (a) startTileDrag(e, a);
+      }}
+      // Touch never reaches onDragStart. A hold rather than a movement, so
+      // the list still scrolls under the finger.
+      onPointerDown={(e) => {
+        const a = commitTile(c.oid);
+        if (a) startTouchDrag(e, (dt) => fillTileDrag(dt, a), "long-press");
       }}
       style={{
         display: "flex",

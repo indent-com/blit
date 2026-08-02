@@ -106,6 +106,8 @@ import { BlitTile } from "./ide/BlitTile";
 import { tileDisplay } from "./ide/tileDisplay";
 import {
   startTileDrag,
+  startTouchDrag,
+  fillTileDrag,
   isTileDrag,
   isPaneDrag,
   paneDragSource,
@@ -3626,6 +3628,15 @@ function WorkspaceScreen(props: {
                       <div
                         draggable={true}
                         onDragStart={(e) => startTileDrag(e, assignment)}
+                        // Touch never reaches onDragStart; a hold starts it,
+                        // so the dock still scrolls.
+                        onPointerDown={(e) =>
+                          startTouchDrag(
+                            e,
+                            (dt) => fillTileDrag(dt, assignment),
+                            "long-press",
+                          )
+                        }
                         style={{
                           "border-bottom": `1px solid ${theme().subtleBorder}`,
                           display: "flex",
@@ -4515,6 +4526,16 @@ function Thumbnail(props: {
     <div
       draggable={true}
       onDragStart={(e) => startTileDrag(e, props.assignment)}
+      // Touch never reaches onDragStart. A hold, which is the one gesture the
+      // swipe-to-dismiss below does not claim: that starts on movement, this
+      // on stillness, so the card can still be flicked away.
+      onPointerDown={(e) =>
+        startTouchDrag(
+          e,
+          (dt) => fillTileDrag(dt, props.assignment),
+          "long-press",
+        )
+      }
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       onTouchStart={onTouchStart}

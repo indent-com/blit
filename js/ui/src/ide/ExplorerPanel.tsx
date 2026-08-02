@@ -43,9 +43,12 @@ import { isDirLike } from "./session";
 import { absolutePath } from "./paths";
 import {
   addFsMoveDrag,
+  fillFsMoveDrag,
+  fillTileDrag,
   fsMovePayload,
   isFsMoveDrag,
   startTileDrag,
+  startTouchDrag,
 } from "./tileDrag";
 
 function MenuItem(props: {
@@ -781,6 +784,17 @@ export function ExplorerPanel(props: {
                     const a = changeAssignment(c);
                     if (a) startTileDrag(e, a);
                   }}
+                  // Touch never reaches onDragStart; a hold starts it, so the
+                  // changes list still scrolls.
+                  onPointerDown={(e) => {
+                    const a = changeAssignment(c);
+                    if (a)
+                      startTouchDrag(
+                        e,
+                        (dt) => fillTileDrag(dt, a),
+                        "long-press",
+                      );
+                  }}
                   title={c.oldPath ? `${c.oldPath} → ${c.path}` : c.path}
                 >
                   <span
@@ -976,6 +990,32 @@ export function ExplorerPanel(props: {
                                   root: s.root() ?? "",
                                   relPath: row.relPath,
                                 });
+                              }}
+                              // Touch never reaches onDragStart. A hold, so
+                              // the tree still scrolls — and the same two
+                              // payloads, or a file dropped on a directory
+                              // would open instead of moving.
+                              onPointerDown={(e) => {
+                                const s = props.session;
+                                if (!s) return;
+                                if (row.type !== FS_ENTRY_FILE && !isMoveTarget)
+                                  return;
+                                startTouchDrag(
+                                  e,
+                                  (dt) => {
+                                    if (row.type === FS_ENTRY_FILE)
+                                      fillTileDrag(
+                                        dt,
+                                        s.fileAssignment(row.relPath),
+                                      );
+                                    fillFsMoveDrag(dt, {
+                                      connectionId: String(s.connectionId),
+                                      root: s.root() ?? "",
+                                      relPath: row.relPath,
+                                    });
+                                  },
+                                  "long-press",
+                                );
                               }}
                               onDragOver={(e) => {
                                 if (isMoveTarget) acceptMove(e, row.relPath);
