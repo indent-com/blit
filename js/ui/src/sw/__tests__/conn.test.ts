@@ -104,6 +104,28 @@ describe("RelayPool connection liveness", () => {
     await secondOpen;
   });
 
+  // A restarted worker holds no credential; the pool must ask before failing,
+  // for every caller — patching individual call sites is how the WebSocket
+  // path got left out and previewed apps stopped recovering.
+  it("asks for a credential on demand instead of failing an empty pool", async () => {
+    const pool: RelayPool = new RelayPool(async () =>
+      pool.setPassphrase("secret"),
+    );
+    const opening = pool.open("local", "127.0.0.1", 8080);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    authenticate(FakeWebSocket.instances[0]!);
+    await opening;
+  });
+
+  it("still fails legibly when the ask produces nothing", async () => {
+    const pool = new RelayPool(async () => {});
+    await expect(pool.open("local", "127.0.0.1", 8080)).rejects.toThrow(
+      "no passphrase yet",
+    );
+    expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
   it("refreshes the inactivity deadline on server pings", async () => {
     const pool = new RelayPool();
     pool.setPassphrase("secret");

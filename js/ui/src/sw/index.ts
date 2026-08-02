@@ -21,7 +21,7 @@ import { injectIntoHtml } from "./inject";
 // The bundle runs in a worker; the app's tsconfig covers both lib sets, so name the scope explicitly rather than relying on ambient inference.
 declare const self: ServiceWorkerGlobalScope & typeof globalThis;
 
-const pool = new RelayPool();
+const pool = new RelayPool(requestPassphrase);
 /** clientId → target. Persisted, because after the bootstrap redirect the
  *  frame's own URL is `/` and no longer says what it is bound to. */
 const bindings = new Map<string, PreviewTarget>();
@@ -328,7 +328,7 @@ async function relay(
  * all the `NET` family is. The handshake bytes arrive from the shim like any
  * other payload.
  */
-async function pipeWebSocket(
+export async function pipeWebSocket(
   target: PreviewTarget,
   port: MessagePort,
 ): Promise<void> {
