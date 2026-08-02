@@ -17,13 +17,17 @@
 /** Custom MIME so we only accept our own tile drags (not arbitrary text). */
 export const TILE_DND_MIME = "application/x-blit-tile";
 
-/** Mark a drag as carrying a tile assignment. Attach to `onDragStart`. */
-export function startTileDrag(e: DragEvent, assignment: string): void {
-  const dt = e.dataTransfer;
-  if (!dt) return;
+/** Write a tile assignment into a transfer. Shared by the native path and the
+ *  touch bridge, which has a `DataTransfer` but no `DragEvent`. */
+export function fillTileDrag(dt: DataTransfer, assignment: string): void {
   dt.setData(TILE_DND_MIME, assignment);
   dt.setData("text/plain", assignment); // harmless fallback for other targets
   dt.effectAllowed = "copyMove";
+}
+
+/** Mark a drag as carrying a tile assignment. Attach to `onDragStart`. */
+export function startTileDrag(e: DragEvent, assignment: string): void {
+  if (e.dataTransfer) fillTileDrag(e.dataTransfer, assignment);
 }
 
 /** The tile assignment a drag carries, or null if it isn't one of ours. */
@@ -82,29 +86,50 @@ export const MAIN_PANE_SOURCE = "main-view";
 const TOUCH_DRAG_THRESHOLD_PX = 6;
 
 /**
- * Drag a pane's content with a finger.
+ * How a touch drag starts.
  *
- * HTML5 drag-and-drop never fires from touch, so on Android the grip could be
- * tapped (which cycles the toolbar's corner) but not dragged — every pane
- * move and every park was mouse-only. `dragReorder` hit this first and solved
- * it for lists; panes need the same, but they cannot borrow that solution:
- * their drop targets are scattered across BSPContainer, Workspace's main view
- * and the dock, each already wired to `dragover`/`drop`.
+ * `move` suits a dedicated handle: it can carry `touch-action: none` and has
+ * no competing gesture, so any movement means the drag.
+ *
+ * `long-press` suits anything living in a scrollable list — explorer rows,
+ * commits, dock cards. Those must keep scrolling (and, for a dock card,
+ * swiping to dismiss), so a drag cannot begin on movement without stealing
+ * it. Holding still is the one gesture none of them claim.
+ */
+export type TouchDragActivation = "move" | "long-press";
+
+/** Hold before a press on a list row becomes a drag. Long enough not to fire
+ *  during a flick, short enough not to feel broken. */
+const LONG_PRESS_MS = 450;
+/** Movement during the hold that means "this is a scroll, not a drag". */
+const LONG_PRESS_SLOP_PX = 10;
+
+/**
+ * Drag anything with a finger.
+ *
+ * HTML5 drag-and-drop never fires from touch, so every `draggable` in this app
+ * was mouse-only: pane grips, explorer rows, changed files, search hits,
+ * problems, commits, dock cards. `dragReorder` hit this first and solved it
+ * for the remotes and roots lists, but the rest cannot borrow that solution —
+ * their drop targets are scattered across BSPContainer, Workspace's main view,
+ * the dock and the explorer's own directory rows, each already wired to
+ * `dragover`/`drop`.
  *
  * So rather than a second drop protocol, this synthesises the first: one
- * `DataTransfer` carried across real `DragEvent`s dispatched at whatever
- * `elementFromPoint` reports under the finger. Every existing handler runs
- * unchanged, including the window-level listeners that reveal the dock as a
- * park target — they cannot tell the difference, which is the point.
+ * `DataTransfer` — filled by the caller, exactly as its `onDragStart` would —
+ * carried across real `DragEvent`s dispatched at whatever `elementFromPoint`
+ * reports under the finger. Every existing handler runs unchanged, including
+ * the window-level listeners that reveal the dock as a park target. They
+ * cannot tell the difference, which is the point.
  *
  * Mouse and pen keep the native path (real drag image, edge autoscroll); this
- * takes over only for touch. The handle must carry `touch-action: none`, or
- * the browser pans the page instead of reporting the move.
+ * takes over only for touch. See {@link TouchDragActivation} for why a handle
+ * and a list row start differently.
  */
-export function startPaneTouchDrag(
+export function startTouchDrag(
   e: PointerEvent,
-  assignment: string,
-  sourcePaneId: string,
+  fill: (data: DataTransfer) => void,
+  activate: TouchDragActivation = "move",
 ): void {
   // Touch only, and tested positively rather than by excluding mouse: a pen
   // drives native drag-and-drop in Chromium just as a mouse does, so letting
@@ -117,15 +142,32 @@ export function startPaneTouchDrag(
   if (!handle || typeof DataTransfer !== "function") return;
 
   const data = new DataTransfer();
-  data.setData(TILE_DND_MIME, assignment);
-  data.setData("text/plain", assignment);
-  data.setData(PANE_SOURCE_DND_MIME, sourcePaneId);
-  data.effectAllowed = "copyMove";
+  fill(data);
 
   const startX = e.clientX;
   const startY = e.clientY;
   let dragging = false;
   let over: Element | null = null;
+  let holdTimer: ReturnType<typeof setTimeout> | null = null;
+  let last: PointerEvent = e;
+
+  const blockTouch = (ev: Event) => {
+    if (!dragging) return;
+    if (ev.cancelable) ev.preventDefault();
+    ev.stopPropagation();
+  };
+  // A long press is also how Android offers text selection and a context
+  // menu; neither is what the finger asked for once a drag is under way.
+  // `stopPropagation` as well as `preventDefault`, for the same reason
+  // `blockTouch` needs it: preventDefault only suppresses the *browser's*
+  // menu, and an explorer row carries its own `onContextMenu` on the very
+  // element this drag started from — Android fires the event at ~500ms,
+  // inside the drag, so without this the rename/delete menu opens mid-drag.
+  const blockMenu = (ev: Event) => {
+    if (!dragging) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+  };
 
   const fire = (target: EventTarget | null, type: string, ev: PointerEvent) => {
     target?.dispatchEvent(
@@ -139,16 +181,38 @@ export function startPaneTouchDrag(
     );
   };
 
+  const moved = (ev: PointerEvent, by: number) =>
+    Math.abs(ev.clientX - startX) > by || Math.abs(ev.clientY - startY) > by;
+
+  const begin = (ev: PointerEvent) => {
+    dragging = true;
+    handle.setPointerCapture?.(ev.pointerId);
+    // Only now does the page stop scrolling under the finger. A row cannot
+    // carry `touch-action: none` the way a dedicated handle can — that would
+    // cost the list its scrolling — so the block goes on for the drag's
+    // duration instead. Capture-phase and non-passive: passive listeners
+    // cannot preventDefault, and stopping propagation keeps a row's own touch
+    // gestures (the dock card's swipe-to-dismiss) from reading the same move.
+    window.addEventListener("touchmove", blockTouch, {
+      passive: false,
+      capture: true,
+    });
+    window.addEventListener("contextmenu", blockMenu, { capture: true });
+    fire(handle, "dragstart", ev);
+  };
+
   const onMove = (ev: PointerEvent) => {
     if (ev.pointerId !== e.pointerId) return;
+    last = ev;
     if (!dragging) {
-      const far =
-        Math.abs(ev.clientX - startX) > TOUCH_DRAG_THRESHOLD_PX ||
-        Math.abs(ev.clientY - startY) > TOUCH_DRAG_THRESHOLD_PX;
-      if (!far) return;
-      dragging = true;
-      handle.setPointerCapture?.(ev.pointerId);
-      fire(handle, "dragstart", ev);
+      if (activate === "long-press") {
+        // Moving before the hold completes means this was a scroll or a
+        // swipe, which the page is entitled to handle instead.
+        if (moved(ev, LONG_PRESS_SLOP_PX)) stop();
+        return;
+      }
+      if (!moved(ev, TOUCH_DRAG_THRESHOLD_PX)) return;
+      begin(ev);
     }
     // Capture routes the pointer events here, but hit-testing is ours to do.
     const el = document.elementFromPoint(ev.clientX, ev.clientY);
@@ -194,14 +258,45 @@ export function startPaneTouchDrag(
   };
 
   function stop() {
+    if (holdTimer !== null) {
+      clearTimeout(holdTimer);
+      holdTimer = null;
+    }
     window.removeEventListener("pointermove", onMove);
     window.removeEventListener("pointerup", onUp);
     window.removeEventListener("pointercancel", onCancel);
+    window.removeEventListener("touchmove", blockTouch, { capture: true });
+    window.removeEventListener("contextmenu", blockMenu, { capture: true });
   }
 
   window.addEventListener("pointermove", onMove);
   window.addEventListener("pointerup", onUp);
   window.addEventListener("pointercancel", onCancel);
+  if (activate === "long-press") {
+    holdTimer = setTimeout(() => {
+      holdTimer = null;
+      // Still down and still still: the press was a request to drag, not to
+      // scroll past. Everything after this point is the same as a handle's.
+      if (!dragging) begin(last);
+    }, LONG_PRESS_MS);
+  }
+}
+
+/**
+ * Drag a pane's content with a finger — the grip's own entry point.
+ *
+ * A dedicated handle, so it activates on movement rather than on a hold: it
+ * carries `touch-action: none` and its only other gesture is a tap.
+ */
+export function startPaneTouchDrag(
+  e: PointerEvent,
+  assignment: string,
+  sourcePaneId: string,
+): void {
+  startTouchDrag(e, (data) => {
+    fillTileDrag(data, assignment);
+    data.setData(PANE_SOURCE_DND_MIME, sourcePaneId);
+  });
 }
 
 /** Custom MIME for explorer move drags: a file/dir dragged onto a directory
@@ -216,9 +311,14 @@ export interface FsMovePayload {
   relPath: string;
 }
 
+/** Write an explorer path into a transfer (see {@link fillTileDrag}). */
+export function fillFsMoveDrag(dt: DataTransfer, payload: FsMovePayload): void {
+  dt.setData(FS_MOVE_DND_MIME, JSON.stringify(payload));
+}
+
 /** Mark a drag as carrying an explorer path (alongside any tile payload). */
 export function addFsMoveDrag(e: DragEvent, payload: FsMovePayload): void {
-  e.dataTransfer?.setData(FS_MOVE_DND_MIME, JSON.stringify(payload));
+  if (e.dataTransfer) fillFsMoveDrag(e.dataTransfer, payload);
 }
 
 /** The move payload a drop carries, or null (readable only on `drop`). */

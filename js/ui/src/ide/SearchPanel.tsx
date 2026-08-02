@@ -34,7 +34,7 @@ import type { Theme, UIScale } from "../theme";
 import { scrollbarStyle } from "../theme";
 import type { IdeSession } from "./session";
 import { setReveal } from "./reveal";
-import { startTileDrag } from "./tileDrag";
+import { fillTileDrag, startTileDrag, startTouchDrag } from "./tileDrag";
 import {
   searchQuery,
   setSearchQuery,
@@ -649,6 +649,18 @@ export function SearchPanel(props: {
                   first?.jumpCol ?? 0,
                 );
                 if (a) startTileDrag(e, a);
+              }}
+              // Touch never reaches onDragStart; a hold starts it, so the
+              // results list still scrolls.
+              onPointerDown={(e) => {
+                const first = row.spans[0];
+                const a = assignmentFor(
+                  row,
+                  first?.jumpLine ?? row.line,
+                  first?.jumpCol ?? 0,
+                );
+                if (a)
+                  startTouchDrag(e, (dt) => fillTileDrag(dt, a), "long-press");
               }}
               onMouseEnter={() => setSelected(window_().start + i())}
               onClick={() => {
