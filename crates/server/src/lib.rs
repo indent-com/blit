@@ -1961,8 +1961,10 @@ impl Session {
         surface_id: u16,
         max: Option<(u16, u16)>,
     ) -> Option<(u16, u16, u16)> {
-        let mut min_lw: Option<u32> = None;
-        let mut min_lh: Option<u32> = None;
+        // Per axis: the smallest logical extent asked for, plus the exact
+        // physical extent and scale of the client that asked for it.
+        let mut min_w: Option<(u32, u32, u16)> = None;
+        let mut min_h: Option<(u32, u32, u16)> = None;
         let mut max_scale: u16 = 0;
         for c in self.clients.values() {
             // Only count clients that are actually subscribed.  A
@@ -1981,18 +1983,38 @@ impl Session {
             // the same logical size land on the same logical integer.
             let lw = ((pw as u32) * 120 + s_eff / 2) / s_eff;
             let lh = ((ph as u32) * 120 + s_eff / 2) / s_eff;
-            min_lw = Some(min_lw.map_or(lw, |m| m.min(lw)));
-            min_lh = Some(min_lh.map_or(lh, |m| m.min(lh)));
+            if min_w.is_none_or(|(m, _, _)| lw < m) {
+                min_w = Some((lw, pw as u32, s));
+            }
+            if min_h.is_none_or(|(m, _, _)| lh < m) {
+                min_h = Some((lh, ph as u32, s));
+            }
             max_scale = max_scale.max(s);
         }
-        let (lw, lh) = match (min_lw, min_lh) {
-            (Some(w), Some(h)) => (w.max(1), h.max(1)),
+        let (min_w, min_h) = match (min_w, min_h) {
+            (Some(w), Some(h)) => (w, h),
             _ => return None,
         };
         let s = max_scale.max(120) as u32;
-        // Convert back to physical at the chosen (highest) scale.
-        let pw = ((lw * s) / 120).clamp(1, u16::MAX as u32) as u16;
-        let ph = ((lh * s) / 120).clamp(1, u16::MAX as u32) as u16;
+        // Back to physical at the chosen (highest) scale — but take the
+        // constraining client's own physical extent verbatim when it is
+        // already at that scale, because the logical round trip does not
+        // return what it was given: at 2x an odd physical extent comes back
+        // one pixel *larger* (1001 → 501 → 1002). The surface is then a pixel
+        // bigger than the pane that asked for it, `per_client_encode_target`
+        // inscribes the native aspect into the smaller viewport, and the
+        // difference shows up as a letterbox bar on an otherwise exact fit.
+        // Fractional CSS pane widths — what a tiled split produces — make odd
+        // physical extents the common case, not the corner one.
+        let exact = |(lw, pw, cs): (u32, u32, u16)| -> u32 {
+            if (cs as u32).max(120) == s {
+                pw
+            } else {
+                (lw.max(1) * s) / 120
+            }
+        };
+        let pw = exact(min_w).clamp(1, u16::MAX as u32) as u16;
+        let ph = exact(min_h).clamp(1, u16::MAX as u32) as u16;
         let (pw, ph) = if let Some((mw, mh)) = max {
             (pw.min(mw), ph.min(mh))
         } else {
@@ -10492,6 +10514,54 @@ mod tests {
         session.clients.insert(1, c1);
         session.clients.insert(2, c2);
         assert_eq!(session.mediated_size_for_pty(7), Some((24, 100)));
+    }
+
+    /// A lone viewer must get back exactly the size it asked for. The
+    /// logical round trip does not give that: at 2× an odd physical extent
+    /// comes back one pixel *larger* (1001 → 501 → 1002), so the surface was
+    /// a pixel bigger than the pane, `per_client_encode_target` inscribed the
+    /// native aspect into the smaller viewport, and the leftover showed as a
+    /// letterbox bar. Tiled panes have fractional CSS widths, so odd physical
+    /// extents are the common case rather than the corner one.
+    #[test]
+    fn mediated_surface_size_is_exact_for_one_viewer() {
+        for &(w, h) in &[(1001u16, 563u16), (1000, 562), (1003, 999), (777, 1155)] {
+            for &scale in &[120u16, 180, 240, 300] {
+                let mut session = Session::new();
+                let mut c = test_client();
+                c.surface_subscriptions.insert(1);
+                c.surface_view_sizes.insert(1, (w, h, scale));
+                session.clients.insert(1, c);
+                assert_eq!(
+                    session.mediated_size_for_surface(1, None),
+                    Some((w, h, scale.max(120))),
+                    "one viewer at {w}x{h} scale={scale} must get its own size back"
+                );
+            }
+        }
+    }
+
+    /// Mixed scales still go through logical space — there is no single
+    /// physical size to preserve — but the client that set the minimum on an
+    /// axis is the one whose pixels are honoured when it is at the chosen
+    /// scale.
+    #[test]
+    fn mediated_surface_size_keeps_the_constraining_viewer_exact() {
+        let mut session = Session::new();
+        let mut c1 = test_client();
+        let mut c2 = test_client();
+        // c1 is narrower in logical terms and sits at the highest scale, so
+        // its odd physical width must survive verbatim.
+        c1.surface_subscriptions.insert(1);
+        c1.surface_view_sizes.insert(1, (1001, 563, 240));
+        c2.surface_subscriptions.insert(1);
+        c2.surface_view_sizes.insert(1, (2000, 1200, 240));
+        session.clients.insert(1, c1);
+        session.clients.insert(2, c2);
+        assert_eq!(
+            session.mediated_size_for_surface(1, None),
+            Some((1001, 563, 240))
+        );
     }
 
     #[test]

@@ -106,8 +106,19 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
       physicalW?: number,
       physicalH?: number,
     ) => {
-      const w = Math.round(physicalW ?? cssW * (window.devicePixelRatio || 1));
-      const h = Math.round(physicalH ?? cssH * (window.devicePixelRatio || 1));
+      // Even, because the encoder rounds each axis *down* to even on its own
+      // (H.264/HEVC/AV1 NV12 sampling grids). Asking for an odd extent means
+      // the frame comes back a pixel short of the pane on that axis only, so
+      // the aspect no longer matches and `object-fit: contain` letterboxes
+      // the difference. Giving up the odd pixel here costs nothing — it was
+      // never going to carry image — and makes the server's rounding a no-op.
+      const even = (n: number) => Math.max(2, n - (n % 2));
+      const w = even(
+        Math.round(physicalW ?? cssW * (window.devicePixelRatio || 1)),
+      );
+      const h = even(
+        Math.round(physicalH ?? cssH * (window.devicePixelRatio || 1)),
+      );
       if (w <= 0 || h <= 0) return;
       const scale120 =
         cssW > 0 && cssH > 0
