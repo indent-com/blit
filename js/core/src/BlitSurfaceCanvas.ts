@@ -133,9 +133,16 @@ export async function detectCodecSupport(): Promise<number> {
   );
 
   // 4:4:4 probes: actually decode a test frame (isConfigSupported lies).
+  //
+  // AV1_444_TEST_FRAME is a seq_profile 1 bitstream (its sequence header
+  // payload opens 0x20 = 001b), and 8-bit 4:4:4 is Profile 1 ("High") — the
+  // codec string has to say 1, not 2.  Profile 2 ("Professional") is 4:2:2
+  // at 8/10-bit and only reaches 4:4:4 at 12-bit, so declaring 2 handed the
+  // decoder a profile the frame contradicts.  This must stay in step with
+  // `av1_profile_digit()` on the server, which picks what we actually send.
   const decode444Checks: [string, Uint8Array, number][] = [
     ["avc1.F4001f", H264_444_TEST_FRAME, CODEC_SUPPORT_H264_444],
-    ["av01.2.01M.08", AV1_444_TEST_FRAME, CODEC_SUPPORT_AV1_444],
+    ["av01.1.01M.08", AV1_444_TEST_FRAME, CODEC_SUPPORT_AV1_444],
   ];
   await Promise.all(
     decode444Checks.map(async ([codec, frame, bit]) => {

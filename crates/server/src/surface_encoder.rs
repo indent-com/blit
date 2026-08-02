@@ -114,6 +114,26 @@ impl SurfaceEncoderPreference {
         }
     }
 
+    /// Whether this backend can encode 4:4:4 at all, independent of what the
+    /// client announced.  These are structural limits, not probe results:
+    ///
+    /// - `H264Vaapi`: libva has no H.264 4:4:4 encode profile — the enum stops
+    ///   at `VAProfileH264High422`, so there is nothing to pass to
+    ///   `vaCreateConfig`.
+    /// - `H264Software`: openh264 encodes 4:2:0 only.
+    ///
+    /// `AV1Vaapi` is deliberately absent: it asks the driver for
+    /// `VAProfileAV1Profile1`.  Whether a given device advertises an encode
+    /// entrypoint for that profile is a runtime question, so it stays a probe
+    /// and falls back to 4:2:0 when the answer is no.
+    ///
+    /// Checking this up front keeps the encoder chain from running a probe
+    /// that can only ever fail, and from logging it as if the host were at
+    /// fault.
+    pub fn supports_444_by_encoder(self) -> bool {
+        !matches!(self, Self::H264Vaapi | Self::H264Software)
+    }
+
     /// Maximum surface dimensions the encoder can handle.
     /// Returns `None` if there is no practical limit.
     pub fn max_dimensions(self) -> Option<(u16, u16)> {
@@ -199,6 +219,19 @@ impl ChromaSubsampling {
     pub fn is_444(self) -> bool {
         matches!(self, Self::Cs444)
     }
+}
+
+/// AV1 `seq_profile` digit for the WebCodecs codec string, at 8-bit depth.
+///
+/// 8-bit 4:4:4 is Profile 1 ("High"), not Profile 2 ("Professional") —
+/// Profile 2 covers 4:2:2 at 8/10-bit and only reaches 4:4:4 at 12-bit.
+/// This has to agree with what the encoders actually emit: rav1e derives
+/// `seq_profile = 1` for 8-bit 4:4:4, and the VA-API AV1 encoder writes 1
+/// into both its sequence header and `VAEncSequenceParameterBufferAV1`.
+/// Advertising 2 here would hand the client's `VideoDecoder` a profile that
+/// contradicts the bitstream.
+pub fn av1_profile_digit(chroma: ChromaSubsampling) -> u8 {
+    if chroma.is_444() { 1 } else { 0 }
 }
 
 /// Compute the AV1 level index string (e.g. "05") for the given dimensions,
@@ -420,8 +453,12 @@ impl SurfaceEncoder {
                 continue;
             }
 
-            // Try 4:4:4 first for this encoder if the client supports it.
-            if try_444 && pref.supports_444_by_client(codec_support) {
+            // Try 4:4:4 first for this encoder if both the backend and the
+            // client support it.
+            if try_444
+                && pref.supports_444_by_encoder()
+                && pref.supports_444_by_client(codec_support)
+            {
                 match Self::try_one(
                     pref,
                     width,
@@ -743,15 +780,13 @@ impl SurfaceEncoder {
             }
             SurfaceEncoderKind::NvencH264(_) => "avc1.640034".to_string(),
             SurfaceEncoderKind::NvencAV1(_) | SurfaceEncoderKind::AV1Software(_) => {
-                let profile = if self.chroma.is_444() { 2 } else { 0 };
                 let level = av1_level_for(self.source_width, self.source_height);
-                format!("av01.{profile}.{level}M.08")
+                format!("av01.{}.{level}M.08", av1_profile_digit(self.chroma))
             }
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::AV1Vaapi(_) => {
-                let profile = if self.chroma.is_444() { 2 } else { 0 };
                 let level = av1_level_for(self.source_width, self.source_height);
-                format!("av01.{profile}.{level}M.08")
+                format!("av01.{}.{level}M.08", av1_profile_digit(self.chroma))
             }
         }
     }
@@ -2027,6 +2062,30 @@ impl SoftwareAV1Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 8-bit 4:4:4 AV1 is seq_profile 1 ("High"); Profile 2
+    /// ("Professional") only reaches 4:4:4 at 12-bit.  The digit here has to
+    /// match what rav1e and the VA-API AV1 encoder actually write into the
+    /// sequence header, or the client configures `VideoDecoder` with a
+    /// profile the bitstream contradicts.
+    #[test]
+    fn av1_444_advertises_profile_1_not_2() {
+        assert_eq!(av1_profile_digit(ChromaSubsampling::Cs444), 1);
+        assert_eq!(av1_profile_digit(ChromaSubsampling::Cs420), 0);
+    }
+
+    /// 4:4:4 is a structural non-starter for these two, so the encoder chain
+    /// must not spend a probe on them.  `AV1Vaapi` is excluded from this
+    /// list on purpose — it probes for `VAProfileAV1Profile1` at runtime.
+    #[test]
+    fn encoders_without_any_444_path_are_skipped() {
+        assert!(!SurfaceEncoderPreference::H264Vaapi.supports_444_by_encoder());
+        assert!(!SurfaceEncoderPreference::H264Software.supports_444_by_encoder());
+        assert!(SurfaceEncoderPreference::AV1Vaapi.supports_444_by_encoder());
+        assert!(SurfaceEncoderPreference::AV1Software.supports_444_by_encoder());
+        assert!(SurfaceEncoderPreference::NvencH264.supports_444_by_encoder());
+        assert!(SurfaceEncoderPreference::NvencAV1.supports_444_by_encoder());
+    }
 
     /// Build a minimal AV1 OBU with the given type, has_size=1.
     fn make_obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
