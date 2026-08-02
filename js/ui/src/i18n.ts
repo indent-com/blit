@@ -96,7 +96,6 @@ const en: Messages = {
   "help.projectSearch": "Project search (top pane)",
   "help.dockLog": "Commit log panel",
   "help.dockProblems": "Problems panel",
-  "help.workspaceRoots": "Manage workspace roots",
   "help.hoverPointer": "Point at a symbol",
   "help.hover": "Type and docs",
   "help.rename": "Rename symbol",
@@ -191,6 +190,8 @@ const en: Messages = {
   "switcher.runInlineCmd": 'Run "{command}"',
   "switcher.remotes": "Remotes",
   "switcher.manageRemotes": "Manage remote targets",
+  "switcher.roots": "Workspace roots",
+  "switcher.manageRoots": "Manage workspace roots",
 
   "remotes.label": "Remotes",
   "remotes.title": "Remotes",
@@ -386,6 +387,8 @@ const es: Messages = {
   "switcher.runInlineCmd": 'Ejecutar "{command}"',
   "switcher.remotes": "Remotos",
   "switcher.manageRemotes": "Gestionar destinos remotos",
+  "switcher.roots": "Raíces del espacio",
+  "switcher.manageRoots": "Gestionar raíces del espacio",
 
   "statusbar.menuTitle": "Menú",
   "statusbar.terminals": "{count}T",
@@ -541,6 +544,8 @@ const fr: Messages = {
   "switcher.runInlineCmd": "Exécuter « {command} »",
   "switcher.remotes": "Distants",
   "switcher.manageRemotes": "Gérer les cibles distantes",
+  "switcher.roots": "Racines de l'espace",
+  "switcher.manageRoots": "Gérer les racines de l'espace",
 
   "statusbar.menuTitle": "Menu",
   "statusbar.terminals": "{count}T",
@@ -697,6 +702,8 @@ const de: Messages = {
   "switcher.runInlineCmd": "„{command}\u201c ausführen",
   "switcher.remotes": "Remotes",
   "switcher.manageRemotes": "Remote-Ziele verwalten",
+  "switcher.roots": "Arbeitsbereich-Wurzeln",
+  "switcher.manageRoots": "Arbeitsbereich-Wurzeln verwalten",
 
   "statusbar.menuTitle": "Menü",
   "statusbar.terminals": "{count}T",

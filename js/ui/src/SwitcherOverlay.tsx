@@ -105,6 +105,7 @@ type ActionItem = {
     | "change-palette"
     | "change-layout"
     | "change-remotes"
+    | "change-roots"
     | "open-web";
   connectionId?: string;
 };
@@ -465,6 +466,21 @@ function ActionGlyph(props: {
             <path d="M11.5 12l5 5.5" stroke={props.dimFg} />
           </svg>
         );
+      // A house, matching the ⌂ the status bar used for roots.
+      case "change-roots":
+        return (
+          <svg
+            viewBox="0 0 24 24"
+            width="24"
+            height="24"
+            fill="none"
+            stroke-width="1.5"
+            aria-hidden="true"
+          >
+            <path d="M4 11l8-6 8 6" stroke={props.fg} />
+            <path d="M6.5 10v9h11v-9" stroke={props.dimFg} />
+          </svg>
+        );
       default:
         return (
           <svg
@@ -706,6 +722,7 @@ export function SwitcherOverlay(props: {
   onChangeFont?: () => void;
   onChangePalette?: () => void;
   onChangeRemotes?: () => void;
+  onChangeRoots?: () => void;
   initialNewTerminalMode?: boolean;
   remotes?: readonly import("./storage").Remote[];
   remoteStatuses?: ReadonlyMap<
@@ -1484,6 +1501,15 @@ export function SwitcherOverlay(props: {
         action: "change-palette",
       });
     }
+    if (props.onChangeRoots) {
+      actions.push({
+        type: "action",
+        key: "action:change-roots",
+        title: t("switcher.roots"),
+        subtitle: t("switcher.manageRoots"),
+        action: "change-roots",
+      });
+    }
     if (props.onChangeFont) {
       actions.push({
         type: "action",
@@ -1906,6 +1932,10 @@ export function SwitcherOverlay(props: {
     }
     if (item.action === "change-remotes") {
       props.onChangeRemotes?.();
+      return;
+    }
+    if (item.action === "change-roots") {
+      props.onChangeRoots?.();
       return;
     }
     if (item.action === "open-web") {

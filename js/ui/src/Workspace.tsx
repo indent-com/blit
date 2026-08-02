@@ -3834,6 +3834,7 @@ function WorkspaceScreen(props: {
                   ? () => toggleOverlay("remotes")
                   : undefined
               }
+              onChangeRoots={() => toggleOverlay("roots")}
               onOpenWeb={() => toggleOverlay("web")}
               defaultRemote={defaultRemote()}
               remotes={remotes()}
@@ -4155,7 +4156,6 @@ function WorkspaceScreen(props: {
             onPreviewPanel={togglePreviewPanel}
             leftDockOpen={leftDockOpen()}
             onToggleLeftDock={toggleLeftDock}
-            onRoots={() => toggleOverlay("roots")}
             webPane={focusedWebPane()}
             debugStats={
               (debugTick(),
