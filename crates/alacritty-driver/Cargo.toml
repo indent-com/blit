@@ -9,5 +9,5 @@ homepage.workspace = true
 
 [dependencies]
 blit-remote = { workspace = true }
-alacritty_terminal = "=0.26.1-dev"
+alacritty_terminal = "=0.26.0"
 regex = "1"

@@ -10,7 +10,7 @@ let
   cargoLockConfig = {
     lockFile = ../Cargo.lock;
     outputHashes = {
-      "alacritty_terminal-0.26.1-dev" = "sha256-9J0rj7yPmG/+OwhKhJNos0/52BxfA5IDy3ONM4nDSQM=";
+      "alacritty_terminal-0.26.0" = "sha256-UWI9DYXJ5zrItIYEN/20jc6YfyKE9h4wbhhuUBA4f9o=";
     };
   };
 
