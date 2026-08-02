@@ -5,6 +5,7 @@
 //! wl_output, and zwp_linux_dmabuf_v1.  Pixel data is read on every
 //! commit and sent to the server via `CompositorEvent::SurfaceCommit`.
 
+use crate::input_region::{self, RegionOp};
 use crate::pointer_focus::{
     ButtonRouting, button_routing, focus_transition, keyboard_focus_after_popup_close,
 };
@@ -648,10 +649,16 @@ pub(crate) struct Surface {
     pending_frame_callbacks: Vec<WlCallback>,
     pending_presentation_feedbacks: Vec<WpPresentationFeedback>,
     pending_opaque: bool,
+    /// Outer `Some` means `set_input_region` was called and is awaiting a
+    /// commit; the inner `None` is the protocol's nil region.
+    pending_input_region: Option<Option<Vec<RegionOp>>>,
 
     // committed state
     pub buffer_scale: i32,
     pub is_opaque: bool,
+    /// Where this surface accepts pointer input, in surface-local
+    /// coordinates. `None` is the default: all of it.
+    input_region: Option<Vec<RegionOp>>,
 
     // subsurface
     pub parent_surface_id: Option<ObjectId>,
@@ -1099,6 +1106,11 @@ struct TextInputState {
 struct Compositor {
     display_handle: DisplayHandle,
     surfaces: HashMap<ObjectId, Surface>,
+    /// Rectangles accumulated per live `wl_region`, until a surface takes a
+    /// copy via `set_input_region`. The resource is kept so entries from a
+    /// client that disconnected without destroying its regions can be
+    /// reclaimed in `cleanup_dead_surfaces`.
+    regions: HashMap<ObjectId, (WlRegion, Vec<RegionOp>)>,
     toplevel_surface_ids: HashMap<u16, ObjectId>,
     /// Per-toplevel timestamp (`elapsed_ms`) of the last server-driven
     /// `RequestFrame`. Lets `handle_surface_commit` tell whether the server
@@ -1943,7 +1955,16 @@ impl Compositor {
             let lx = x - sx as f64;
             let ly = y - sy as f64;
             if lx >= 0.0 && ly >= 0.0 && lx < lw && ly < lh {
-                return Some((surf.wl_surface.clone(), lx, ly));
+                // A surface can decline input over part or all of itself, and
+                // then the pointer belongs to whatever is behind it. Firefox
+                // relies on this: it puts its rendering in a subsurface
+                // covering the whole window and sets that subsurface's input
+                // region empty, so input falls through to the toplevel where
+                // its widget code is listening.
+                match surf.input_region {
+                    Some(ref ops) if !input_region::contains(ops, lx, ly) => {}
+                    _ => return Some((surf.wl_surface.clone(), lx, ly)),
+                }
             }
         }
         None
@@ -1971,6 +1992,9 @@ impl Compositor {
             surf.buffer_scale = scale;
             surf.viewport_destination = surf.pending_viewport_destination;
             surf.is_opaque = surf.pending_opaque;
+            if let Some(region) = surf.pending_input_region.take() {
+                surf.input_region = region;
+            }
             surf.pending_damage = false;
             if let Some(pos) = surf.pending_subsurface_position.take() {
                 surf.subsurface_position = pos;
@@ -2173,6 +2197,9 @@ impl Compositor {
         self.shm_pools.retain(|_, p| p.resource.is_alive());
         self.dmabuf_params.retain(|_, p| p.resource.is_alive());
         self.positioners.retain(|_, p| p.resource.is_alive());
+        // A client that disconnects without destroying its regions never
+        // sends `wl_region.destroy`, so reclaim its builder entries here.
+        self.regions.retain(|_, (r, _)| r.is_alive());
 
         let dead: Vec<ObjectId> = self
             .surfaces
@@ -3207,6 +3234,8 @@ impl Dispatch<WlCompositor, ()> for Compositor {
                         pending_frame_callbacks: Vec::new(),
                         pending_presentation_feedbacks: Vec::new(),
                         pending_opaque: false,
+                        pending_input_region: None,
+                        input_region: None,
                         buffer_scale: 1,
                         is_opaque: false,
                         parent_surface_id: None,
@@ -3275,7 +3304,22 @@ impl Dispatch<WlSurface, ()> for Compositor {
                     surf.pending_opaque = true;
                 }
             }
-            Request::SetInputRegion { .. } => {}
+            Request::SetInputRegion { region } => {
+                // Double-buffered: takes effect on the next commit. An empty
+                // list is meaningfully different from nil — nil restores the
+                // default of accepting input everywhere, an empty region
+                // declines it everywhere.
+                let ops = region.map(|r| {
+                    state
+                        .regions
+                        .get(&r.id())
+                        .map(|(_, ops)| ops.clone())
+                        .unwrap_or_default()
+                });
+                if let Some(surf) = state.surfaces.get_mut(&sid) {
+                    surf.pending_input_region = Some(ops);
+                }
+            }
             Request::Commit => {
                 let is_cursor = state.surfaces.get(&sid).is_some_and(|s| s.is_cursor);
                 if is_cursor {
@@ -3399,14 +3443,63 @@ impl Dispatch<WpPresentationFeedback, ()> for Compositor {
 // -- wl_region --
 impl Dispatch<WlRegion, ()> for Compositor {
     fn request(
-        _: &mut Self,
+        state: &mut Self,
         _: &Client,
-        _: &WlRegion,
-        _: <WlRegion as Resource>::Request,
+        resource: &WlRegion,
+        request: <WlRegion as Resource>::Request,
         _: &(),
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
+        use wayland_server::protocol::wl_region::Request;
+        let rid = resource.id();
+        match request {
+            Request::Add {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                state
+                    .regions
+                    .entry(rid)
+                    .or_insert_with(|| (resource.clone(), Vec::new()))
+                    .1
+                    .push(RegionOp {
+                        add: true,
+                        x,
+                        y,
+                        w: width,
+                        h: height,
+                    });
+            }
+            Request::Subtract {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                state
+                    .regions
+                    .entry(rid)
+                    .or_insert_with(|| (resource.clone(), Vec::new()))
+                    .1
+                    .push(RegionOp {
+                        add: false,
+                        x,
+                        y,
+                        w: width,
+                        h: height,
+                    });
+            }
+            Request::Destroy => {
+                // Clients destroy the region as soon as they have handed it
+                // to `set_input_region`, so the surface keeps its own copy
+                // and this only drops the builder.
+                state.regions.remove(&rid);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -5745,6 +5838,7 @@ fn run_compositor(
     let mut compositor = Compositor {
         display_handle: dh,
         surfaces: HashMap::new(),
+        regions: HashMap::new(),
         toplevel_surface_ids: HashMap::new(),
         last_request_frame_ms: HashMap::new(),
         next_surface_id: 1,
