@@ -1,6 +1,8 @@
 #[cfg(target_os = "linux")]
 mod imp;
 #[cfg(target_os = "linux")]
+mod pointer_focus;
+#[cfg(target_os = "linux")]
 mod positioner;
 #[cfg(target_os = "linux")]
 mod render;

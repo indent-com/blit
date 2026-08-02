@@ -5,6 +5,7 @@
 //! wl_output, and zwp_linux_dmabuf_v1.  Pixel data is read on every
 //! commit and sent to the server via `CompositorEvent::SurfaceCommit`.
 
+use crate::pointer_focus::focus_transition;
 use crate::positioner::PositionerGeometry;
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -1162,6 +1163,9 @@ struct Compositor {
     focused_surface_id: u16,
     /// The wl_surface ObjectId the pointer is currently over (None = none).
     pointer_entered_id: Option<ObjectId>,
+    /// Where the cursor last was inside `pointer_entered_id`, in surface-local
+    /// coordinates, so a pointer created later can be entered there.
+    pointer_entered_local: (f64, f64),
     /// Set after output scale change; triggers keyboard leave/re-enter
     /// on the next surface commit so clients have time to process the
     /// reconfigure before receiving new input events.
@@ -2309,23 +2313,39 @@ impl Compositor {
                     );
                 }
                 if let Some((proto_id, wl_surface, lx, ly)) = target_wl {
-                    if self.pointer_entered_id.as_ref() != Some(&proto_id) {
+                    // Remember where we are inside the surface, so a pointer
+                    // created *after* this can be entered at the right spot
+                    // rather than waiting for the next motion (`GetPointer`).
+                    self.pointer_entered_local = (lx, ly);
+                    let matching_ptrs = self
+                        .pointers
+                        .iter()
+                        .filter(|p| same_client(*p, &wl_surface))
+                        .count();
+                    if let Some(change) = focus_transition(
+                        self.pointer_entered_id.as_ref(),
+                        &proto_id,
+                        matching_ptrs > 0,
+                    ) {
                         let serial = self.next_serial();
-                        let matching_ptrs = self
-                            .pointers
-                            .iter()
-                            .filter(|p| same_client(*p, &wl_surface))
-                            .count();
-                        eprintln!(
-                            "[pointer-enter] proto={proto_id:?} matching_ptrs={matching_ptrs} total_ptrs={}",
-                            self.pointers.len()
-                        );
+                        if matching_ptrs == 0 {
+                            // The client has mapped a surface but has not
+                            // asked for a pointer yet — Firefox routinely
+                            // takes long enough to start that the cursor is
+                            // already over its pane. Say so, and (below)
+                            // decline to latch: an enter nobody received must
+                            // not count as having entered.
+                            eprintln!(
+                                "[pointer-enter] proto={proto_id:?} has no pointer yet (total_ptrs={}); deferring",
+                                self.pointers.len()
+                            );
+                        }
                         // Leave old surface.
-                        if self.pointer_entered_id.is_some() {
+                        if let Some(ref leaving) = change.leave {
                             let old_wl = self
                                 .surfaces
                                 .values()
-                                .find(|s| Some(s.wl_surface.id()) == self.pointer_entered_id)
+                                .find(|s| s.wl_surface.id() == *leaving)
                                 .map(|s| s.wl_surface.clone());
                             if let Some(old_wl) = old_wl {
                                 for ptr in &self.pointers {
@@ -2341,7 +2361,12 @@ impl Compositor {
                                 ptr.enter(serial, &wl_surface, lx, ly);
                             }
                         }
-                        self.pointer_entered_id = Some(proto_id);
+                        // Whatever `focus_transition` decided — including
+                        // recording nothing when no pointer received the
+                        // enter, so the next motion retries rather than the
+                        // state machine believing the job is done. Its tests
+                        // enumerate the cases; see pointer_focus.rs.
+                        self.pointer_entered_id = change.entered;
                     }
                     for ptr in &self.pointers {
                         if same_client(ptr, &wl_surface) {
@@ -4159,6 +4184,30 @@ impl Dispatch<WlSeat, ()> for Compositor {
             }
             Request::GetPointer { id } => {
                 let ptr = data_init.init(id, ());
+                // If the cursor is already inside one of this client's
+                // surfaces, this pointer has missed its `enter` — the client
+                // asked for it too late. Nothing else will deliver one until
+                // the pointer crosses into a *different* surface, so a user
+                // whose cursor is simply resting over the pane would click
+                // into a void. Send it now, at the position we last saw.
+                let entered = state.pointer_entered_id.as_ref().and_then(|eid| {
+                    state
+                        .surfaces
+                        .values()
+                        .find(|s| s.wl_surface.id() == *eid)
+                        .map(|s| s.wl_surface.clone())
+                });
+                if let Some(wl) = entered
+                    && same_client(&ptr, &wl)
+                {
+                    let serial = state.next_serial();
+                    let (lx, ly) = state.pointer_entered_local;
+                    ptr.enter(serial, &wl, lx, ly);
+                    // Mandatory here: with no motion following, the frame is
+                    // what tells a v5+ client the group is complete.
+                    ptr.frame();
+                    let _ = state.display_handle.flush_clients();
+                }
                 state.pointers.push(ptr);
             }
             Request::GetTouch { id } => {
@@ -5573,6 +5622,7 @@ fn run_compositor(
         pending_recomposite_toplevels: HashSet::new(),
         focused_surface_id: 0,
         pointer_entered_id: None,
+        pointer_entered_local: (0.0, 0.0),
         pending_kb_reenter: false,
         gpu_device,
         verbose,
