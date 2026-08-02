@@ -509,6 +509,28 @@ pub fn parse_remotes_str(contents: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Whether `name` can be an entry name in `blit.remotes` / `blit.roots`.
+///
+/// Every rule is forced by a format the name has to survive intact:
+///
+/// * the file is `name = value`, so an `=` reparses as the start of the
+///   value, and a leading `#` reparses as the disabled marker — an entry
+///   added as enabled would come back disabled;
+/// * the config-socket verbs (`remotes-add <name> <uri>`) are
+///   space-delimited, so any whitespace splits the name in two;
+/// * a newline splits the line itself.
+///
+/// One function rather than a condition per caller. There were four, they had
+/// drifted apart, and the parser's was the strictest — so `blit remote add
+/// 'my remote' ssh:host` reported success, wrote the line, and the next read
+/// dropped it without a word.
+pub fn valid_entry_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('=')
+        && !name.starts_with('#')
+        && !name.contains(char::is_whitespace)
+}
+
 /// Parse `name = value` lines shared by `blit.remotes` and `blit.roots`.
 /// Format: `name = value` for enabled; `# name = value` (optional whitespace
 /// after `#`) for disabled. Blank lines and other `#` lines are ignored.
@@ -531,10 +553,10 @@ fn parse_kv_entries(contents: &str) -> Vec<(String, String, bool)> {
         };
         let name = k.trim().to_string();
         let value = v.trim().to_string();
-        // A name with internal whitespace can't round-trip through the
-        // space-delimited `*-add`/`*-reorder` wire verbs, so never
-        // materialize one (applies to both blit.remotes and blit.roots).
-        if name.is_empty() || name.contains(char::is_whitespace) || value.is_empty() {
+        // Names that cannot round-trip are never materialized. Writers
+        // reject them up front (see `valid_entry_name`); this is the backstop
+        // for a hand-edited file.
+        if !valid_entry_name(&name) || value.is_empty() {
             continue;
         }
         if !map.contains_key(&name) {
@@ -1182,8 +1204,7 @@ pub async fn handle_config_ws(
                             if let Some((raw_name, raw_uri)) = rest.split_once(' ') {
                                 let name = raw_name.trim().replace(['\n', '\r'], "");
                                 let uri = raw_uri.trim().replace(['\n', '\r'], "");
-                                if !name.is_empty()
-                                    && !name.contains('=')
+                                if valid_entry_name(&name)
                                     && !uri.is_empty()
                                     && let Some(r) = remotes
                                 {
@@ -1272,12 +1293,7 @@ pub async fn handle_config_ws(
                             if let Some((raw_name, raw_value)) = rest.split_once(' ') {
                                 let name = raw_name.trim().replace(['\n', '\r'], "");
                                 let value = raw_value.trim().replace(['\n', '\r'], "");
-                                // Reject '=' and a leading '#' (the disabled
-                                // marker): a '#'-prefixed name would serialize
-                                // as an enabled line that reparses as disabled.
-                                if !name.is_empty()
-                                    && !name.contains('=')
-                                    && !name.starts_with('#')
+                                if valid_entry_name(&name)
                                     && !value.is_empty()
                                     && let Some(r) = roots
                                 {
@@ -1682,17 +1698,37 @@ mod tests {
         assert!(reparsed[2].disabled);
     }
 
+    /// The rule every writer and the parser now share. These used to be four
+    /// separate conditions that had drifted — and the tests here asserted the
+    /// condition inline rather than calling anything, so they passed whatever
+    /// the code did.
     #[test]
-    fn remotes_add_rejects_empty_name() {
-        // Simulate the validation in handle_config_ws: empty name is rejected.
-        let name = "";
-        assert!(name.is_empty() || name.contains('='));
+    fn entry_names_must_survive_both_formats() {
+        for ok in ["rabbit", "prod-1", "a", "héllo", "x.y_z:1"] {
+            assert!(valid_entry_name(ok), "{ok:?} should be usable");
+        }
+        for bad in [
+            "",           // nothing to name
+            "foo=bar",    // reparses as name "foo", value "bar"
+            "#foo",       // reparses as a disabled entry
+            "my remote",  // splits the space-delimited add verb
+            "my\tremote", // ditto, and survives split_once(' ')
+            "my\nremote", // splits the line
+            " lead",
+            "trail ",
+        ] {
+            assert!(!valid_entry_name(bad), "{bad:?} should be refused");
+        }
     }
 
+    /// The parser is the backstop for a hand-edited file: a name it would
+    /// refuse must not come back as an entry.
     #[test]
-    fn remotes_add_rejects_name_with_equals() {
-        let name = "foo=bar";
-        assert!(name.contains('='));
+    fn parser_drops_names_it_could_not_write() {
+        let parsed =
+            parse_remotes_full("good = ssh:host\nmy remote = ssh:other\n##bad = ssh:third\n");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "good");
     }
 
     // ── set-default writes blit.target key to blit.conf ──

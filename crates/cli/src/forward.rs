@@ -648,8 +648,12 @@ pub fn resolve_specs(args: &[String], all: bool) -> Result<Vec<Spec>, String> {
 
 /// `blit forward add NAME SPEC` — add or update one entry.
 pub fn cmd_add(name: &str, spec: &str) -> Result<i32, String> {
-    if name.is_empty() || name.contains(char::is_whitespace) {
-        return Err(format!("bad entry name `{name}`"));
+    // Shared with blit.remotes / blit.roots: same file shape, same
+    // space-delimited config verbs, so the same rule.
+    if !blit_webserver::config::valid_entry_name(name) {
+        return Err(format!(
+            "bad entry name `{name}` — no whitespace, `=`, or leading `#`"
+        ));
     }
     // Validate before persisting: an entry that cannot parse is a `--all` that refuses to start, discovered much later.
     let parsed = parse_spec(spec)?;
