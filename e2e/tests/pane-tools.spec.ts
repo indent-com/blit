@@ -38,6 +38,54 @@ async function newTerminal(page: Page) {
   await page.waitForTimeout(300);
 }
 
+/** Close every session, leaving the empty pane. Bounded so a stuck close
+ *  fails the test rather than spinning. */
+async function closeAllTerminals(page: Page) {
+  for (let i = 0; i < 12; i++) {
+    if ((await page.locator("canvas").count()) === 0) break;
+    await page.locator("canvas").first().hover({ force: true });
+    const close = page
+      .getByRole("button", { name: "Close", exact: true })
+      .first();
+    if (!(await close.isVisible().catch(() => false))) break;
+    await close.click();
+    await page.waitForTimeout(400);
+  }
+  // With nothing left to show, blit offers the Remotes dialog; it is modal and
+  // would swallow the clicks that follow.
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+  await expect(
+    page.getByRole("button", { name: "New terminal" }).first(),
+  ).toBeVisible({ timeout: 10_000 });
+}
+
+/**
+ * Park the main view's content by grip-dragging it to the dock.
+ *
+ * The events are dispatched by hand with one shared DataTransfer rather than
+ * via `dragTo`: the grip lives inside a hover-gated `Show`, so the pointer
+ * travelling to the dock un-hovers the main view and unmounts the very element
+ * a mouse-emulated drag is holding. A real drag is immune (the browser owns it
+ * once dragstart fires); Playwright's is not. The production handlers still
+ * run — startPaneTileDrag writes the payload, the dock's onDrop reads it.
+ *
+ * `dragenter` is not decoration: with nothing parked yet the dock is not in
+ * the DOM at all, and it is that window-level event which reveals it as a
+ * drop-to-park target.
+ */
+async function parkViaGrip(page: Page) {
+  const grip = await revealGrip(page);
+  const dt = await page.evaluateHandle(() => new DataTransfer());
+  await grip.dispatchEvent("dragstart", { dataTransfer: dt });
+  await page.locator("body").dispatchEvent("dragenter", { dataTransfer: dt });
+  const dock = page.locator("[data-blit-preview-panel]");
+  await expect(dock).toBeVisible({ timeout: 5_000 });
+  await dock.dispatchEvent("dragover", { dataTransfer: dt });
+  await dock.dispatchEvent("drop", { dataTransfer: dt });
+  await page.waitForTimeout(500);
+}
+
 /** Hover the main view so the toolbar reveals itself, then return its grip.
  *  `force`: the terminal's own scroll surface covers the canvas, so the
  *  hit-target check would refuse a hover that does land in the main view (the
@@ -71,21 +119,7 @@ test.describe("Pane multitool on a main-view terminal", () => {
     await authenticate(page);
     await newTerminal(page);
 
-    const grip = await revealGrip(page);
-    const dock = page.locator("[data-blit-preview-panel]");
-
-    // One DataTransfer carried across the events by hand, rather than
-    // `dragTo`: the grip lives inside a hover-gated `Show`, so the pointer
-    // travelling to the dock un-hovers the main view and unmounts the very
-    // element a mouse-emulated drag is holding. A real drag is immune (the
-    // browser owns it once dragstart fires); Playwright's is not. This still
-    // runs the production handlers — startPaneTileDrag writes the payload,
-    // the dock's onDrop reads it.
-    const dt = await page.evaluateHandle(() => new DataTransfer());
-    await grip.dispatchEvent("dragstart", { dataTransfer: dt });
-    await dock.dispatchEvent("dragover", { dataTransfer: dt });
-    await dock.dispatchEvent("drop", { dataTransfer: dt });
-    await page.waitForTimeout(500);
+    await parkViaGrip(page);
 
     // Parked: the main view shows the empty pane, and the session is now a
     // card in the dock.
@@ -126,5 +160,47 @@ test.describe("Pane multitool on a main-view terminal", () => {
     await expect
       .poll(() => page.locator("canvas").count(), { timeout: 10_000 })
       .toBeLessThan(canvasesBefore);
+  });
+});
+
+test.describe("Parked terminal does not resurrect", () => {
+  // Reported in review of #138: parking held the session id even after focus
+  // moved on, so it only looked un-parked. The core always resolves *some*
+  // focus, so closing the session that displaced a parked one handed focus
+  // back — and it silently re-parked, with its dock card the only way out.
+  test("closing the session that displaced a parked one shows it, not an empty pane", async ({
+    page,
+  }) => {
+    await authenticate(page);
+    // Sessions outlive a page and the server is shared across this file, so
+    // close whatever earlier tests left running. Without that, `A` is not the
+    // session the core's fallback lands on when `B` closes, and the repro
+    // simply does not fire — the bug hides rather than the test failing.
+    await closeAllTerminals(page);
+    await newTerminal(page);
+
+    // Park A.
+    await parkViaGrip(page);
+    await expect(
+      page.getByRole("button", { name: "New terminal" }).first(),
+    ).toBeVisible({ timeout: 10_000 });
+
+    // Open B: A un-parks into the dock and B takes the view.
+    await newTerminal(page);
+    await expect(page.locator("canvas").first()).toBeVisible();
+
+    // Close B. Focus falls back to A, which must be shown — not re-parked.
+    await page.locator("canvas").first().hover({ force: true });
+    await page
+      .getByRole("button", { name: "Close", exact: true })
+      .first()
+      .click();
+    await page.waitForTimeout(1000);
+    await expect(page.locator("canvas").first()).toBeVisible({
+      timeout: 10_000,
+    });
+    await expect(
+      page.getByRole("button", { name: "New terminal" }),
+    ).toHaveCount(0);
   });
 });

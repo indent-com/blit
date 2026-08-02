@@ -1373,6 +1373,17 @@ function WorkspaceScreen(props: {
     const fid = wsState().focusedSessionId;
     return fid != null && fid === parkedSessionId();
   };
+  // Focus moving elsewhere ends the park outright, rather than leaving the id
+  // set and merely inactive. Holding it would let the park resurrect: the core
+  // always resolves *some* focus, so closing the session that displaced a
+  // parked one hands focus back to it — and it would silently re-park, with
+  // its dock card the only way out.
+  createEffect(() => {
+    const fid = wsState().focusedSessionId;
+    if (untrack(parkedSessionId) != null && fid !== untrack(parkedSessionId)) {
+      setParkedSessionId(null);
+    }
+  });
   /** The session the non-BSP main view displays: none while parked. */
   const mainViewSessionId = () =>
     mainTerminalParked() ? null : wsState().focusedSessionId;
