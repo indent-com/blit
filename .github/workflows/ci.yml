@@ -21,6 +21,8 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - run: ./bin/lint
+      - name: Check crates.io publication plan
+        run: ./bin/publish-crates --plan
 
   dev-check:
     runs-on: blacksmith-8vcpu-ubuntu-2404

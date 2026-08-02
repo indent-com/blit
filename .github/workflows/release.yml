@@ -84,6 +84,10 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - run: ./bin/publish-crates
+        env:
+          # Required only to bootstrap crates which do not exist on crates.io yet.
+          # Once their trusted publishers are configured, OIDC is used instead.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-npm:
     needs: [release]
