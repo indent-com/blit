@@ -6,14 +6,19 @@
 
 const fs = require("fs");
 
+// This same file ships in @blit-sh/bin and in @blit-sh/bin-gpl, whose platform
+// packages are named after their own launcher, so read the prefix off our own
+// manifest rather than hardcoding one flavor.
+const SELF = require("./package.json").name;
+
 // Map process.platform/process.arch to the npm package that ships the binary.
 function candidatePackages() {
   const platform = process.platform;
   const arch = process.arch;
-  if (platform === "win32") return [`@blit-sh/bin-win32-${arch}`];
-  if (platform === "darwin") return [`@blit-sh/bin-darwin-${arch}`];
+  if (platform === "win32") return [`${SELF}-win32-${arch}`];
+  if (platform === "darwin") return [`${SELF}-darwin-${arch}`];
   if (platform === "linux") {
-    const base = `@blit-sh/bin-linux-${arch}`;
+    const base = `${SELF}-linux-${arch}`;
     // Prefer the libc variant we detect, but fall back to the other.
     return isMusl() ? [`${base}-musl`, base] : [base, `${base}-musl`];
   }
@@ -59,9 +64,11 @@ function binaryPath() {
   }
   throw new Error(
     [
-      `@blit-sh/bin: no prebuilt binary found for ${process.platform} ${process.arch}.`,
+      `${SELF}: no prebuilt binary found for ${process.platform} ${process.arch}.`,
       tried.length ? `Tried optional packages: ${tried.join(", ")}.` : "",
-      "Supported: linux x64/arm64 (glibc & musl), darwin arm64, win32 x64.",
+      SELF === "@blit-sh/bin-gpl"
+        ? "The GPL flavor is Linux-only: x64/arm64, glibc & musl."
+        : "Supported: linux x64/arm64 (glibc & musl), darwin arm64, win32 x64.",
       "If your platform is supported, ensure optional dependencies were not",
       "skipped (e.g. npm install without --no-optional / --omit=optional).",
     ]

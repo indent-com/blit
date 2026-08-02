@@ -63,6 +63,13 @@ import {
 Linux x64/arm64 (glibc & musl), macOS arm64, Windows x64 — matching the
 binaries the blit release pipeline builds.
 
+## GPL flavor
+
+[`@blit-sh/bin-gpl`](https://www.npmjs.com/package/@blit-sh/bin-gpl) ships the
+same build with x264 (GPL-2.0-or-later) instead of openh264 for software H.264:
+better compression, and 4:4:4 rather than 4:2:0. Linux only, same API, no `blit`
+CLI shim so it installs alongside this package.
+
 ## License
 
 MIT
