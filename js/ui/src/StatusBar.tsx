@@ -98,7 +98,6 @@ export function StatusBar(props: {
   onPreviewPanel: () => void;
   leftDockOpen: boolean;
   onToggleLeftDock: () => void;
-  onRoots: () => void;
   /** Navigation for the focused web pane, or null when none is focused. */
   webPane: {
     handle: WebPaneHandle;
@@ -353,13 +352,6 @@ export function StatusBar(props: {
         title="Toggle IDE dock (Ctrl+Shift+E)"
       >
         {"\u25E7"}
-      </button>
-      <button
-        onClick={props.onRoots}
-        style={{ ...buttonStyle(), opacity: 0.7 }}
-        title="Workspace roots (Ctrl+Shift+K)"
-      >
-        {"\u2302"}
       </button>
       <button
         onClick={props.onPreviewPanel}

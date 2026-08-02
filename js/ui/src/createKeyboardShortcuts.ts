@@ -237,12 +237,8 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
         h.toggleOverlay("web");
         return;
       }
-      // Ctrl+Shift+K: manage workspace roots.
-      if (e.ctrlKey && e.shiftKey && e.key === "K") {
-        e.preventDefault();
-        h.toggleOverlay("roots");
-        return;
-      }
+      // Workspace roots have no shortcut of their own: they are an entry in
+      // the Cmd+K switcher, alongside remotes, palette, and font.
       // Ctrl+Shift+A: reset audio pipeline (recover from stalled audio).
       if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.key === "A") {
         e.preventDefault();

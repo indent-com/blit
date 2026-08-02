@@ -40,7 +40,7 @@ export function HelpOverlay(props: {
         ["Ctrl+Shift+L", t("help.dockLog")],
         ["Ctrl+Shift+P", t("help.dockProblems")],
         ["Ctrl+Shift+B", t("help.previewPanel")],
-        ["Ctrl+Shift+K", t("help.workspaceRoots")],
+        ["Ctrl+Shift+K", t("help.soloPane")],
         ["Ctrl+Shift+O", "Open a URL as a web pane"],
         ["Ctrl+Shift+`", t("help.debugPanel")],
         ["Ctrl+Shift+A", t("help.resetAudio")],

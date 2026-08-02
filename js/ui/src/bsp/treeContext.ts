@@ -59,6 +59,12 @@ export interface BSPTreeCtx {
   ) => void;
   /** Register the visual host for a Workspace-owned persistent web pane. */
   registerWebPaneHost?: WebPaneHostRegistrar;
+  /** The pane currently soloed to fill the workspace, if any. Its siblings
+   *  are hidden rather than unmounted, so nothing is torn down and unsolo is
+   *  free (see `BSPContainer`'s `soloedPaneId`). */
+  soloedPaneId: string | null;
+  /** Solo `paneId`, or unsolo if it already is. */
+  onToggleSolo: (paneId: string) => void;
 }
 
 export const BSPTreeContext = createContext<BSPTreeCtx>();
