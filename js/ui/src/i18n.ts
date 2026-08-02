@@ -31,6 +31,7 @@ const en: Messages = {
   "help.closeTerminal": "Close terminal/surface",
   "help.prevNextTerminal": "Prev / Next terminal",
   "help.prevNextPane": "Prev / Next pane",
+  "help.soloPane": "Solo pane / show all",
   "help.resetAudio": "Reset audio",
   "help.debugPanel": "Debug panel",
   "help.previewPanel": "Preview panel",
@@ -270,6 +271,8 @@ const en: Messages = {
   "bsp.restart": "Restart",
   "bsp.close": "Close",
   "bsp.move": "Drag to move · click for another corner",
+  "bsp.solo": "Solo this pane (Ctrl+Shift+K)",
+  "bsp.unsolo": "Show all panes (Ctrl+Shift+K)",
   "bsp.commandPlaceholder": "[remote>][command]",
   "bsp.commandPlaceholderNoRemotes": "[command]",
 };
@@ -434,6 +437,8 @@ const es: Messages = {
   "bsp.restart": "Reiniciar",
   "bsp.close": "Cerrar",
   "bsp.move": "Arrastrar para mover · clic: otra esquina",
+  "bsp.solo": "Aislar este panel (Ctrl+Shift+K)",
+  "bsp.unsolo": "Mostrar todos los paneles (Ctrl+Shift+K)",
   "bsp.commandPlaceholder": "[remoto>][comando]",
   "bsp.commandPlaceholderNoRemotes": "[comando]",
 };
@@ -591,6 +596,8 @@ const fr: Messages = {
   "bsp.restart": "Redémarrer",
   "bsp.close": "Fermer",
   "bsp.move": "Glisser pour déplacer · clic : autre coin",
+  "bsp.solo": "Isoler ce panneau (Ctrl+Maj+K)",
+  "bsp.unsolo": "Afficher tous les panneaux (Ctrl+Maj+K)",
   "bsp.commandPlaceholder": "[cible>][commande]",
   "bsp.commandPlaceholderNoRemotes": "[commande]",
 };
@@ -749,6 +756,8 @@ const de: Messages = {
   "bsp.restart": "Neustart",
   "bsp.close": "Schließen",
   "bsp.move": "Zum Verschieben ziehen · Klick: andere Ecke",
+  "bsp.solo": "Nur dieses Feld zeigen (Strg+Umschalt+K)",
+  "bsp.unsolo": "Alle Felder zeigen (Strg+Umschalt+K)",
   "bsp.commandPlaceholder": "[Ziel>][Befehl]",
   "bsp.commandPlaceholderNoRemotes": "[Befehl]",
 };
@@ -902,6 +911,8 @@ const ja: Messages = {
   "bsp.restart": "再起動",
   "bsp.close": "閉じる",
   "bsp.move": "ドラッグして移動 · クリックで別の隅へ",
+  "bsp.solo": "このペインだけ表示 (Ctrl+Shift+K)",
+  "bsp.unsolo": "すべてのペインを表示 (Ctrl+Shift+K)",
   "bsp.commandPlaceholder": "[リモート>][コマンド]",
   "bsp.commandPlaceholderNoRemotes": "[コマンド]",
 };
@@ -1054,6 +1065,8 @@ const zh: Messages = {
   "bsp.restart": "重新启动",
   "bsp.close": "关闭",
   "bsp.move": "拖动以移动 · 点击换角",
+  "bsp.solo": "仅显示此窗格 (Ctrl+Shift+K)",
+  "bsp.unsolo": "显示所有窗格 (Ctrl+Shift+K)",
   "bsp.commandPlaceholder": "[远程>][命令]",
   "bsp.commandPlaceholderNoRemotes": "[命令]",
 };

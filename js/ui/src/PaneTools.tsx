@@ -43,6 +43,9 @@ export function PaneTools(props: {
   /** When set, the grip is shown, dragging this assignment out of this pane.
    *  Absent in the non-BSP single view, where there is nowhere to drop. */
   drag?: { assignment: string; paneId: string };
+  /** When set, the solo segment is shown. Absent where there is nothing to
+   *  solo against: the non-BSP single view, and a one-pane layout. */
+  solo?: { active: boolean; onToggle: () => void };
   onClose: () => void;
 }) {
   // Which corner the toolbar sits in. It floats over the pane's content, and
@@ -118,6 +121,29 @@ export function PaneTools(props: {
               }}
             >
               {"⠿"}
+            </button>
+          )}
+        </Show>
+        <Show when={props.solo}>
+          {(solo) => (
+            <button
+              type="button"
+              title={solo().active ? t("bsp.unsolo") : t("bsp.solo")}
+              aria-label={solo().active ? t("bsp.unsolo") : t("bsp.solo")}
+              onClick={(e) => {
+                e.stopPropagation();
+                solo().onToggle();
+              }}
+              style={{
+                ...segment(),
+                cursor: "pointer",
+                // The ✕ brings the shared edge, as with the grip.
+                "border-right": "none",
+              }}
+            >
+              {/* One filled cell versus a grid of them: what you get, not
+                  what you are leaving. */}
+              {solo().active ? "⊞" : "▣"}
             </button>
           )}
         </Show>

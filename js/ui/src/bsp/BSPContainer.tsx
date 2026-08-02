@@ -3,6 +3,7 @@ import {
   createEffect,
   createMemo,
   onCleanup,
+  untrack,
   batch,
   Show,
   For,
@@ -552,6 +553,34 @@ export function BSPContainer(props: {
     })(),
   );
 
+  /**
+   * The soloed pane: rendered filling the workspace, siblings hidden.
+   *
+   * Hidden, not unmounted, and the tree is never rewritten. Both matter.
+   * Replacing `root()` with the soloed subtree would renumber every pane id
+   * (they are positional paths — see `enumeratePanes`) and unmount the
+   * siblings, disposing terminal surfaces and resetting editors; a one-child
+   * split is not even expressible in the DSL. Hiding costs nothing to undo.
+   *
+   * Not persisted, like the PaneTools corner: outliving a hover is the point,
+   * surviving a reload is not.
+   */
+  const [soloedPaneId, setSoloedPaneId] = createSignal<string | null>(null);
+  function toggleSolo(paneId: string) {
+    // Nothing to solo against in a single-pane layout.
+    if (paneIds().length < 2) return;
+    setSoloedPaneId((cur) => (cur === paneId ? null : paneId));
+    focusPane(paneId);
+  }
+  // A pane id only means something against the tree that minted it, so any
+  // change of shape drops the solo rather than soloing whatever now sits at
+  // that path.
+  createEffect(() => {
+    const ids = paneIds();
+    const solo = untrack(soloedPaneId);
+    if (solo && (!ids.includes(solo) || ids.length < 2)) setSoloedPaneId(null);
+  });
+
   // Derive the focused session from the focused pane.
   // Returns null if the pane holds a surface rather than a session.
   const focusedPaneSessionId = createMemo(() => {
@@ -790,6 +819,25 @@ export function BSPContainer(props: {
     onCleanup(() => window.removeEventListener("keydown", handler, true));
   });
 
+  // Ctrl/Cmd+Shift+K: solo the focused pane, or lift the solo. Lives here
+  // rather than in createKeyboardShortcuts because it is meaningless without
+  // a layout — outside BSP there is no container listening, so the chord is
+  // simply free again.
+  createEffect(() => {
+    const fpId = focusedPaneId();
+    const handler = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || !e.shiftKey || e.altKey) return;
+      if (e.key !== "K" && e.key !== "k" && e.code !== "KeyK") return;
+      if (!fpId) return;
+      e.preventDefault();
+      // A focused terminal would otherwise also receive the chord.
+      e.stopPropagation();
+      toggleSolo(fpId);
+    };
+    window.addEventListener("keydown", handler, true);
+    onCleanup(() => window.removeEventListener("keydown", handler, true));
+  });
+
   createEffect(() => {
     const state = layoutState();
     // Always report assignments so that Workspace can derive the focused
@@ -934,6 +982,10 @@ export function BSPContainer(props: {
     get onDropTile() {
       return props.onDropTile;
     },
+    get soloedPaneId() {
+      return soloedPaneId();
+    },
+    onToggleSolo: toggleSolo,
   };
   return (
     <BSPTreeContext.Provider value={ctxValue}>
@@ -968,6 +1020,21 @@ function BSPPane(props: {
     return p.length > 0 ? p.join(".") : "0";
   };
 
+  /**
+   * Index of the child containing the soloed pane, or -1 when this split has
+   * no say. Matching by path prefix is what lets a solo deep in the tree
+   * clear every ancestor's siblings on the way down.
+   */
+  const soloChild = (children: readonly BSPChild[]): number => {
+    const solo = ctx.soloedPaneId;
+    if (!solo) return -1;
+    for (let i = 0; i < children.length; i++) {
+      const prefix = [...path(), i].join(".");
+      if (solo === prefix || solo.startsWith(prefix + ".")) return i;
+    }
+    return -1;
+  };
+
   return (
     <Show
       when={props.node.type === "split" ? (props.node as BSPSplit) : undefined}
@@ -995,37 +1062,51 @@ function BSPPane(props: {
               }}
             >
               <Index each={split().children}>
-                {(child, index) => (
-                  <>
-                    <Show when={index > 0}>
-                      <ResizeHandle
-                        direction={
-                          split().direction as "horizontal" | "vertical"
-                        }
-                        onDrag={(fraction) =>
-                          ctx.onResize(split(), index - 1, index, fraction)
-                        }
-                      />
-                    </Show>
-                    <div
-                      style={{
-                        flex: child().weight,
-                        overflow: "hidden",
-                        position: "relative",
-                        "min-width": 0,
-                        "min-height": 0,
-                      }}
-                    >
-                      <BSPPane
-                        node={child().node}
-                        assignments={props.assignments}
-                        focusedPaneId={props.focusedPaneId}
-                        visible={props.visible}
-                        path={[...(props.path ?? []), index]}
-                      />
-                    </div>
-                  </>
-                )}
+                {(child, index) => {
+                  const solo = () => soloChild(split().children);
+                  const hidden = () => solo() >= 0 && index !== solo();
+                  return (
+                    <>
+                      {/* No handle to drag while one pane fills the split. */}
+                      <Show when={index > 0 && solo() < 0}>
+                        <ResizeHandle
+                          direction={
+                            split().direction as "horizontal" | "vertical"
+                          }
+                          onDrag={(fraction) =>
+                            ctx.onResize(split(), index - 1, index, fraction)
+                          }
+                        />
+                      </Show>
+                      <div
+                        style={{
+                          // The soloed branch takes the whole split; its
+                          // siblings keep their weights for the moment the
+                          // solo is lifted.
+                          flex: solo() >= 0 ? 1 : child().weight,
+                          display: hidden() ? "none" : undefined,
+                          overflow: "hidden",
+                          position: "relative",
+                          "min-width": 0,
+                          "min-height": 0,
+                        }}
+                      >
+                        <BSPPane
+                          node={child().node}
+                          assignments={props.assignments}
+                          focusedPaneId={props.focusedPaneId}
+                          // Not merely cosmetic: `visible` gates
+                          // `resizable`, and a hidden-but-resizable terminal
+                          // measures 0×0. The client sends the *minimum*
+                          // across a session's views, so leaving these true
+                          // would pin the soloed PTY to 1×1.
+                          visible={props.visible && !hidden()}
+                          path={[...(props.path ?? []), index]}
+                        />
+                      </div>
+                    </>
+                  );
+                }}
               </Index>
             </div>
           }
@@ -1327,6 +1408,14 @@ function LeafPane(props: {
           drag={
             props.sessionId
               ? { assignment: props.sessionId, paneId: props.paneId }
+              : undefined
+          }
+          solo={
+            ctx.multiPane
+              ? {
+                  active: ctx.soloedPaneId === props.paneId,
+                  onToggle: () => ctx.onToggleSolo(props.paneId),
+                }
               : undefined
           }
           onClose={() => ctx.onClosePane(props.paneId)}
