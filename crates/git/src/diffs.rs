@@ -246,6 +246,22 @@ fn flatten(
                 let Ok(md) = std::fs::symlink_metadata(&abs) else {
                     continue; // deleted from the worktree
                 };
+                // A gitlink's path is a directory, so the skip below would
+                // drop every submodule from this side and report it deleted.
+                // Its worktree side is the checked-out submodule's HEAD; one
+                // that is not initialized reads as unchanged, like git.
+                if entry.mode.bits() & 0o170000 == 0o160000 {
+                    flat.insert(
+                        path.to_vec(),
+                        Side {
+                            mode: entry.mode.bits(),
+                            oid: submodule_head(&abs).unwrap_or(entry.id),
+                            worktree: false,
+                            ignored: false,
+                        },
+                    );
+                    continue;
+                }
                 if md.is_dir() {
                     continue; // replaced by a directory: not a file anymore
                 }
@@ -354,6 +370,14 @@ fn worktree_mode(md: &std::fs::Metadata, _index_mode: u32) -> u32 {
     }
 }
 
+/// The commit a checked-out submodule's HEAD points at, i.e. the oid its
+/// gitlink would take if it were staged. `None` when the working tree holds
+/// no usable repository there (never initialized, or its gitdir is gone).
+fn submodule_head(abs: &std::path::Path) -> Option<gix::ObjectId> {
+    let sub = gix::open_opts(abs, gix::open::Options::isolated()).ok()?;
+    sub.head_id().ok().map(|id| id.detach())
+}
+
 /// Untracked (and optionally ignored) files via a bounded walk honoring
 /// the exclude stack.
 #[allow(clippy::too_many_arguments)]
@@ -424,7 +448,15 @@ fn collect_untracked(
                 continue;
             }
             if is_dir {
-                stack.push(abs);
+                // A submodule's files belong to the submodule's own repo and
+                // its own status; walking in would report the whole checkout
+                // (`.git` included) as untracked in the superproject.
+                let gitlink = index
+                    .entry_by_path(rel_bytes.as_ref())
+                    .is_some_and(|e| e.mode.bits() & 0o170000 == 0o160000);
+                if !gitlink {
+                    stack.push(abs);
+                }
                 continue;
             }
             if index.entry_by_path(rel_bytes.as_ref()).is_some() {

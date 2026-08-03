@@ -729,6 +729,16 @@ always read from disk. Worktree reads use the torn-read discipline of
 [fs-watch.md](fs-watch.md): per-file coherent, tree-wide best-effort — no
 filesystem offers more.
 
+**Submodules.** A gitlink's path is a directory on disk, so a worktree side
+cannot read it as a file: it takes its oid from the HEAD of the repository
+checked out there — the oid its gitlink would get if it were staged — and
+the `SUBMODULE` dflag says the two sides name commits, not blobs. A
+submodule that is registered but not checked out (a clone that never ran
+`submodule update`, leaving an empty directory) has no HEAD to read and
+reads as unchanged rather than deleted; git says nothing about it either.
+The untracked walk stops at a gitlink for the same reason: what is inside
+belongs to the submodule's own status, not the superproject's.
+
 ### `GIT_PATCH`
 
 Same endpoint spec as `GIT_DIFF` (including MERGE_BASE, with the same
