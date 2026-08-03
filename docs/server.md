@@ -223,6 +223,12 @@ what you set, then back up as the link recovers.
 frame may cost: rav1e speed preset, x264 preset, openh264 complexity, NVENC
 preset P1–P7, VA-API `quality_level`. Vulkan Video has no speed control.
 
+At the `realtime` default every backend runs at its fastest setting. For
+`h264-software` on openh264 that is `Low` complexity, where it was previously
+pinned to `Medium` no matter what the quality setting said — so the default
+software H.264 encode is now cheaper and slightly softer than before.
+`BLIT_SURFACE_SPEED=medium` restores it.
+
 `BLIT_H264_SOFTWARE`: pins the `h264-software` backend to `x264` or
 `openh264` when the binary carries both (dev builds with
 `--features x264`); unset prefers x264.

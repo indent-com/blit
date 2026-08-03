@@ -1169,7 +1169,6 @@ async fn mux_open_channel(
     // `send().await` here is the whole point: when the browser stops
     // draining, this stops reading and the upstream socket applies real
     // backpressure to the blit server.
-    let reader_merge_tx = merge_tx.clone();
     let reader_task = tokio::spawn(async move {
         let mut r = sock_reader;
         while let Some(data) = read_frame(&mut r).await {
@@ -1183,11 +1182,18 @@ async fn mux_open_channel(
         // Upstream EOF — inject S2C_QUIT as a data frame so the browser's
         // BlitConnection can immediately clear its session state, then send
         // the mux-level CLOSED control frame.
+        //
+        // Both go through the data queue, not the control one: they are the
+        // tail of this channel's byte stream, and the writer serves control
+        // first.  Sent out of band they would overtake whatever payload is
+        // still queued behind a backpressured browser, and the browser would
+        // tear the channel down on top of its own last frames.
         let mut quit_frame = Vec::with_capacity(3);
         quit_frame.extend_from_slice(&ch_id.to_le_bytes());
         quit_frame.push(S2C_QUIT);
-        let _ = reader_merge_tx.send(quit_frame);
-        let _ = reader_merge_tx.send(mux_control(MUX_S2C_CLOSED, ch_id));
+        if data_tx.send(quit_frame).await.is_ok() {
+            let _ = data_tx.send(mux_control(MUX_S2C_CLOSED, ch_id)).await;
+        }
     });
 
     eprintln!("mux: channel {ch_id} opened for '{name}'");

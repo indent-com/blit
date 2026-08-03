@@ -579,6 +579,35 @@ function readWireByte(key: string): number {
   return 0;
 }
 
+/** The key `blit.videoBandwidth` replaced. */
+const LEGACY_VIDEO_QUALITY_KEY = "blit.videoQuality";
+
+/**
+ * Carry a pre-split `blit.videoQuality` over to `blit.videoBandwidth`, once.
+ *
+ * The old value's encoding is exactly the new bandwidth axis (0 default,
+ * 1-4 presets, 10-255 quantizer), so this is a rename, not a conversion.
+ * Nothing is carried to the speed axis: the old knob implied a speed rather
+ * than letting anyone choose one, and its implied value is the new default.
+ *
+ * Writing through `writeStorage` republishes it to `blit.conf` like any
+ * other change, so the legacy key can be dropped here rather than read
+ * forever.
+ */
+export function migrateLegacyVideoQuality(): void {
+  const legacy = readLocal(LEGACY_VIDEO_QUALITY_KEY);
+  if (legacy === null) return;
+  try {
+    localStorage.removeItem(LEGACY_VIDEO_QUALITY_KEY);
+  } catch {}
+  // A value on the new key was chosen after the upgrade; it wins.
+  if (readLocal(VIDEO_BANDWIDTH_KEY) !== null) return;
+  const n = parseInt(legacy, 10);
+  if (n >= 1 && n <= 255) writeStorage(VIDEO_BANDWIDTH_KEY, String(n));
+}
+
+migrateLegacyVideoQuality();
+
 /** Preferred surface streaming state.  Defaults to enabled. */
 export function preferredSurfaceStreaming(): boolean {
   const s = readStorage(SURFACE_STREAMING_KEY);

@@ -481,6 +481,13 @@ impl SurfaceSpeed {
     }
 
     /// openh264 complexity mode.
+    ///
+    /// The `realtime` default lands on `Low`, where this backend used to be
+    /// pinned to `Medium` regardless of the quality setting.  That is
+    /// deliberate: every other backend's `realtime` is its fastest setting
+    /// (rav1e 10, NVENC P1, VA-API 7), and openh264 is the cheapest software
+    /// path, where CPU is the scarce resource.  `BLIT_SURFACE_SPEED=medium`
+    /// asks for the old encode, which was not expressible before.
     #[cfg(all(target_os = "linux", feature = "openh264"))]
     fn openh264_complexity(self) -> openh264::encoder::Complexity {
         use openh264::encoder::Complexity;
