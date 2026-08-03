@@ -951,12 +951,14 @@ export class AudioPlayer {
       return;
     this.healthTimer = setInterval(() => this.checkHealth(), 2000);
 
-    // When the tab returns from background, audio is often in a broken
-    // state (context suspended, worklet stalled, decode chain dead).
-    // Preemptively reset the pipeline so the user never has to do it
-    // manually.  The reset is cheap — everything rebuilds on the next
-    // incoming frame with only ~100-200 ms of imperceptible silence.
-    // Quick tab switches (< 3 s) just get an immediate health check.
+    // When the tab returns from background, audio can be in a broken
+    // state (context suspended, worklet stalled, decode chain dead) —
+    // but usually it isn't: browsers exempt audibly-playing tabs from
+    // background throttling, so the pipeline keeps rendering while
+    // hidden, and a preemptive reset would audibly interrupt it.  Reset
+    // only when the worklet stopped rendering while hidden or the
+    // context died; otherwise run an immediate health check, which can
+    // still escalate to a reset on real stalls.
     if (!this.visibilityHandler && typeof document !== "undefined") {
       let hiddenAt = 0;
       this.visibilityHandler = () => {
@@ -964,9 +966,17 @@ export class AudioPlayer {
           hiddenAt = Date.now();
         } else if (document.visibilityState === "visible") {
           if (this._destroyed || this._muted || !this._subscribed) return;
-          const wasHiddenMs = hiddenAt > 0 ? Date.now() - hiddenAt : 0;
+          const now = Date.now();
+          const wasHiddenMs = hiddenAt > 0 ? now - hiddenAt : 0;
           hiddenAt = 0;
-          if (wasHiddenMs > 3_000) {
+          // The worklet reports its position every ~100 ms whenever the
+          // context is running, so a stale report means the pipeline was
+          // not rendering in the background.
+          const workletStale =
+            this.lastWorkletReportAt > 0 &&
+            now - this.lastWorkletReportAt > 3_000;
+          const ctxDead = this.ctx != null && this.ctx.state === "closed";
+          if (wasHiddenMs > 3_000 && (workletStale || ctxDead)) {
             this.resetPipeline();
           } else {
             this.checkHealth();
