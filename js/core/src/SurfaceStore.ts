@@ -68,7 +68,10 @@ interface CanvasEntry {
  *  rather than at arbitrary decoder-output moments. */
 interface SurfacePresenter {
   /** Decoded VideoFrames waiting to be presented.  On each rAF tick only
-   *  the newest is drawn; older frames are closed. */
+   *  the newest is drawn; older frames are closed.  Bounded at
+   *  {@link SurfaceStore.PRESENT_QUEUE_MAX} — each entry pins a decoded
+   *  buffer in the codec's frame pool, so an undrained queue (hidden tab,
+   *  throttled rAF) would otherwise grow until the renderer OOMs. */
   queue: VideoFrame[];
   /** Pending `requestAnimationFrame` handle, or null. */
   rafId: number | null;
@@ -252,6 +255,7 @@ export class SurfaceStore {
   private eventListeners = new Set<SurfaceEventCallback>();
   private _diag = { received: 0, decoded: 0, output: 0, dropped: 0, errors: 0 };
   private _diagTimer: ReturnType<typeof setInterval> | null = null;
+  private _visibilityHandler: (() => void) | null = null;
 
   // Per-surface diagnostics exposed to the debug panel.
   private _surfaceFrameSamples = new Map<number, SurfaceFrameSample[]>();
@@ -263,6 +267,8 @@ export class SurfaceStore {
 
   private static readonly FRAME_SAMPLE_MAX = 500;
   private static readonly OUTPUT_SAMPLE_MAX = 500;
+  /** Max decoded frames a presenter may hold between rAF ticks. */
+  private static readonly PRESENT_QUEUE_MAX = 2;
 
   /** Per-surface presenter: queues decoded frames and paints the freshest
    *  one at the next vsync via rAF.  Older frames in the queue are closed
@@ -350,6 +356,17 @@ export class SurfaceStore {
         d.received = d.decoded = d.output = d.dropped = d.errors = 0;
       }
     }, 5000);
+    if (typeof document !== "undefined") {
+      // Drain presenter queues the moment the tab goes hidden: any pending
+      // rAF will never fire while hidden, and enqueueFrame's hidden path
+      // only covers frames that arrive after this point.
+      this._visibilityHandler = () => {
+        if (document.visibilityState === "hidden") {
+          this.flushAllPresenters();
+        }
+      };
+      document.addEventListener("visibilitychange", this._visibilityHandler);
+    }
   }
 
   onFrame(listener: SurfaceFrameCallback): () => void {
@@ -800,6 +817,10 @@ export class SurfaceStore {
       clearInterval(this._diagTimer);
       this._diagTimer = null;
     }
+    if (this._visibilityHandler !== null) {
+      document.removeEventListener("visibilitychange", this._visibilityHandler);
+      this._visibilityHandler = null;
+    }
     this.reset();
   }
 
@@ -823,6 +844,38 @@ export class SurfaceStore {
     }
 
     p.queue.push(frame);
+
+    // Hidden tabs never fire rAF, but decode output keeps arriving (the
+    // stream stays subscribed and ACKed).  Present immediately instead of
+    // queueing so every frame is closed promptly and the backing canvas
+    // holds the latest frame when the tab is refocused.
+    if (
+      typeof document !== "undefined" &&
+      document.visibilityState === "hidden"
+    ) {
+      if (p.rafId !== null) {
+        cancelAnimationFrame(p.rafId);
+        p.rafId = null;
+      }
+      this.tickPresent(surfaceId);
+      return;
+    }
+
+    // Bound the queue even while visible: a throttled rAF (occluded
+    // window, busy main thread) must not let unclosed frames — each
+    // pinning a decoded buffer in the codec's frame pool — pile up.
+    const excess = p.queue.length - SurfaceStore.PRESENT_QUEUE_MAX;
+    if (excess > 0) {
+      for (let i = 0; i < excess; i++) {
+        try {
+          p.queue[i].close();
+        } catch {
+          /* already closed */
+        }
+      }
+      p.queue.splice(0, excess);
+    }
+
     this.schedulePresent(surfaceId);
   }
 
@@ -900,6 +953,19 @@ export class SurfaceStore {
   private discardAllPresenters(): void {
     for (const sid of Array.from(this.presenters.keys())) {
       this.discardPresenter(sid);
+    }
+  }
+
+  /** Present the newest queued frame (closing older ones) for every
+   *  surface, cancelling pending rAFs.  Called when the tab goes hidden,
+   *  where the rAFs would otherwise never fire. */
+  private flushAllPresenters(): void {
+    for (const [sid, p] of this.presenters) {
+      if (p.rafId !== null) {
+        cancelAnimationFrame(p.rafId);
+        p.rafId = null;
+      }
+      this.tickPresent(sid);
     }
   }
 
