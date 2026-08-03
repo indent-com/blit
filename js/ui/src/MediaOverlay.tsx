@@ -169,19 +169,26 @@ export function MediaOverlay(props: {
     props.onVideoSpeedChange(v);
   };
 
-  const quantizerHint = (): string => {
-    const q = bandwidthSlider();
-    if (q <= 10) return "maximum";
-    if (q <= 40) return "very high";
-    if (q <= 80) return "high";
-    if (q <= 120) return "medium";
-    if (q <= 180) return "low";
+  const bandwidthHint = (): string => {
+    const v = bandwidthSlider();
+    if (v <= 10) return "maximum";
+    if (v <= 40) return "very high";
+    if (v <= 80) return "high";
+    if (v <= 120) return "medium";
+    if (v <= 180) return "low";
     return "lowest";
   };
 
-  /** Server-side normalized effort level, 0 (slowest) – 10 (fastest). */
-  const speedLevel = (): number =>
-    Math.floor(((speedSlider() - 10) * 10) / 245);
+  // Thresholds line up with the presets: the server folds 10–255 onto a
+  // 0–10 effort level, on which slow/medium/fast/realtime sit at 4/6/8/10.
+  const speedHint = (): string => {
+    const v = speedSlider();
+    if (v <= 59) return "slowest";
+    if (v <= 108) return "slow";
+    if (v <= 157) return "medium";
+    if (v <= 206) return "fast";
+    return "fastest";
+  };
 
   return (
     <OverlayBackdrop
@@ -320,7 +327,7 @@ export function MediaOverlay(props: {
                       </span>
                     </div>
                     <span style={sliderHintStyle()}>
-                      AV1 quantizer {bandwidthSlider()} ({quantizerHint()})
+                      {bandwidthSlider()} ({bandwidthHint()})
                     </span>
                   </div>
                 </Show>
@@ -394,7 +401,7 @@ export function MediaOverlay(props: {
                       </span>
                     </div>
                     <span style={sliderHintStyle()}>
-                      encoder effort {speedSlider()} (level {speedLevel()}/10)
+                      {speedSlider()} ({speedHint()})
                     </span>
                   </div>
                 </Show>
