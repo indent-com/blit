@@ -59,7 +59,7 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 | `0x25` | `CLIPBOARD_SET`        | `[mime_len:2][mime:N][data_len:4][data:M]`                                                                                                                           |
 | `0x26` | `SURFACE_LIST`         | _(empty)_ — request list of compositor surfaces                                                                                                                      |
 | `0x27` | `SURFACE_CAPTURE`      | `[surface_id:2][format:1][quality:1]` — screenshot (0=PNG, 1=AVIF)                                                                                                   |
-| `0x28` | `SURFACE_SUBSCRIBE`    | `[surface_id:2][codec:1][quality:1]`                                                                                                                                 |
+| `0x28` | `SURFACE_SUBSCRIBE`    | `[surface_id:2][codec:1][bandwidth:1][speed:1]`                                                                                                                      |
 | `0x29` | `SURFACE_UNSUBSCRIBE`  | `[surface_id:2]`                                                                                                                                                     |
 | `0x2A` | `SURFACE_ACK`          | `[surface_id:2]` — acknowledge receipt of video frame                                                                                                                |
 | `0x2B` | `SURFACE_CLOSE`        | `[surface_id:2]` — request close of Wayland surface                                                                                                                  |
@@ -95,12 +95,13 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 
 `RESIZE` is batched: after the opcode, the payload contains one or more `[pty_id:2][rows:2][cols:2]` triplets. Requires the `RESIZE_BATCH` feature bit in `S2C_HELLO`.
 
-`SURFACE_SUBSCRIBE` has two optional trailing bytes for per-surface codec/quality control:
+`SURFACE_SUBSCRIBE` has three optional trailing bytes for per-surface codec, bandwidth and speed control:
 
 - `codec` (byte 3): `CODEC_SUPPORT_*` bitmask restricting which codecs the server may use for this surface. `0` = use the connection-level default (from `C2S_CLIENT_FEATURES`).
-- `quality` (byte 4): desired compression quality. `0` = server default (from `BLIT_SURFACE_QUALITY`), `1` = low, `2` = medium, `3` = high, `4` = lossless.
+- `bandwidth` (byte 4): how many bits the surface may spend. `0` = server default (from `BLIT_SURFACE_BANDWIDTH`), `1` = low, `2` = medium, `3` = high, `4` = ultra, `5`–`9` reserved, `10`–`255` = the AV1 quantizer to use verbatim.
+- `speed` (byte 5): how much encoder time a frame may cost, independent of bandwidth. `0` = server default (from `BLIT_SURFACE_SPEED`), `1` = slow, `2` = medium, `3` = fast, `4` = realtime, `5`–`9` reserved, `10`–`255` = custom (`10` slowest, `255` fastest).
 
-Both bytes are optional — a 3-byte message uses connection/server defaults. Re-subscribing to an already-subscribed surface with different values updates the preferences and forces encoder recreation.
+All three bytes are optional — a 3-byte message uses connection/server defaults. Re-subscribing to an already-subscribed surface with different values updates the preferences and forces encoder recreation.
 
 ## Server → Client (S2C)
 

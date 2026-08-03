@@ -46,7 +46,7 @@ pub use surface_encoder::ChromaSubsampling;
 use surface_encoder::SurfaceEncoder;
 pub use surface_encoder::SurfaceEncoderPreference;
 pub use surface_encoder::SurfaceH264EncoderPreference;
-pub use surface_encoder::SurfaceQuality;
+pub use surface_encoder::{SurfaceBandwidth, SurfaceEncoding, SurfaceSpeed};
 
 type PtyFds = Arc<std::sync::RwLock<HashMap<u16, PtyWriteTarget>>>;
 pub struct Config {
@@ -55,7 +55,7 @@ pub struct Config {
     pub scrollback: usize,
     pub ipc_path: String,
     pub surface_encoders: Vec<SurfaceEncoderPreference>,
-    pub surface_quality: SurfaceQuality,
+    pub surface_encoding: SurfaceEncoding,
     pub chroma: ChromaSubsampling,
     pub vaapi_device: String,
     #[cfg(unix)]
@@ -643,7 +643,7 @@ struct SurfaceSubState {
     /// surface (the encoder has been moved into the task).
     encode_in_flight: bool,
     /// Set if the in-flight encoder was invalidated by a codec /
-    /// quality change (resubscribe) while encoding — the completion
+    /// bandwidth / speed change (resubscribe) while encoding — the completion
     /// handler must drop the stale encoder instead of reinserting it.
     encoder_invalidated: bool,
     /// Pixel generation that was last encoded; used to skip re-
@@ -661,8 +661,10 @@ struct SurfaceSubState {
     /// (bitmask of CODEC_SUPPORT_*).  0 = defer to client-wide
     /// `surface_codec_support`.
     codec_override: u8,
-    /// Per-surface quality override.  `None` = use server default.
-    quality_override: Option<SurfaceQuality>,
+    /// Per-surface bandwidth override.  `None` = use server default.
+    bandwidth_override: Option<SurfaceBandwidth>,
+    /// Per-surface speed override.  `None` = use server default.
+    speed_override: Option<SurfaceSpeed>,
     /// Last per-client downscale target dims registered with the
     /// compositor.  Used to send `ClearDownscaleTarget` for the old
     /// dims when the encoder is recreated at a new size, so stale
@@ -3075,7 +3077,7 @@ async fn tick(state: &AppState) -> TickOutcome {
     struct EncoderCreateParams {
         preferences: Vec<SurfaceEncoderPreference>,
         vaapi_device: String,
-        quality: SurfaceQuality,
+        encoding: SurfaceEncoding,
         verbose: bool,
         codec_support: u8,
         chroma: ChromaSubsampling,
@@ -3517,11 +3519,15 @@ async fn tick(state: &AppState) -> TickOutcome {
                         .map(|s| s.codec_override)
                         .filter(|&c| c != 0)
                         .unwrap_or(client.surface_codec_support);
-                    let quality = client
-                        .surface_subs
-                        .get(&sid)
-                        .and_then(|s| s.quality_override)
-                        .unwrap_or(state.config.surface_quality);
+                    let sub = client.surface_subs.get(&sid);
+                    let encoding = SurfaceEncoding {
+                        bandwidth: sub
+                            .and_then(|s| s.bandwidth_override)
+                            .unwrap_or(state.config.surface_encoding.bandwidth),
+                        speed: sub
+                            .and_then(|s| s.speed_override)
+                            .unwrap_or(state.config.surface_encoding.speed),
+                    };
 
                     // Vulkan Video encodes at the compositor's native size
                     // and is broadcast verbatim — only valid when this
@@ -3557,8 +3563,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                             continue;
                         }
                         let qp = match pref {
-                            SurfaceEncoderPreference::VulkanVideoAV1 => quality.av1_qp_for_vulkan(),
-                            _ => quality.h264_qp(),
+                            SurfaceEncoderPreference::VulkanVideoAV1 => {
+                                encoding.bandwidth.av1_qp_for_vulkan()
+                            }
+                            _ => encoding.bandwidth.h264_qp(),
                         };
                         let enc_name: &'static str = match (pref, state.config.chroma) {
                             (
@@ -3636,7 +3644,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         params: EncoderCreateParams {
                             preferences: state.config.surface_encoders.clone(),
                             vaapi_device: state.config.vaapi_device.clone(),
-                            quality,
+                            encoding,
                             verbose: state.config.verbose,
                             codec_support,
                             chroma: state.config.chroma,
@@ -4079,7 +4087,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             job.target_w,
                             job.target_h,
                             &params.vaapi_device,
-                            params.quality,
+                            params.encoding,
                             params.verbose,
                             params.codec_support,
                             params.chroma,
@@ -4313,8 +4321,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                     state.creation_in_flight = false;
                     let invalidated = std::mem::replace(&mut state.encoder_invalidated, false);
                     if invalidated {
-                        // Preferences changed mid-creation (codec/quality
-                        // resubscribe).  Drop the encoder we just built;
+                        // Preferences changed mid-creation (codec /
+                        // bandwidth / speed resubscribe).  Drop the encoder we just built;
                         // the next tick will dispatch a fresh creation
                         // with the new prefs.
                         continue;
@@ -8670,31 +8678,34 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 let surface_id = u16::from_le_bytes([data[1], data[2]]);
                 // Extended fields (backward-compatible: absent = 0 = defaults).
                 let codec_support = if data.len() >= 4 { data[3] } else { 0 };
-                let quality_wire = if data.len() >= 5 { data[4] } else { 0 };
+                let bandwidth_wire = if data.len() >= 5 { data[4] } else { 0 };
+                let speed_wire = if data.len() >= 6 { data[5] } else { 0 };
                 if state.config.verbose {
                     eprintln!(
-                        "C2S_SURFACE_SUBSCRIBE: cid={client_id} surface={surface_id} codec={codec_support:#04x} quality={quality_wire}"
+                        "C2S_SURFACE_SUBSCRIBE: cid={client_id} surface={surface_id} codec={codec_support:#04x} bandwidth={bandwidth_wire} speed={speed_wire}"
                     );
                 }
                 let mut destroy_vulkan_enc_sid = None;
                 let mut first_subscribe = false;
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     let was_subscribed = !c.surface_subscriptions.insert(surface_id);
-                    let new_quality = SurfaceQuality::from_wire(quality_wire);
+                    let new_bandwidth = SurfaceBandwidth::from_wire(bandwidth_wire);
+                    let new_speed = SurfaceSpeed::from_wire(speed_wire);
 
                     let state = c.surface_subs.entry(surface_id).or_default();
-                    let old_codec = state.codec_override;
-                    let old_quality = state.quality_override;
+                    let prefs_changed = codec_support != state.codec_override
+                        || new_bandwidth != state.bandwidth_override
+                        || new_speed != state.speed_override;
 
-                    // A no-op resubscribe (same codec/quality, already
-                    // subscribed) should not disturb the steady encode
-                    // stream — resetting needs_keyframe/burst on every
-                    // repeated subscribe makes keyframes churn and skews
-                    // pacing.
-                    let meaningful_change =
-                        !was_subscribed || codec_support != old_codec || new_quality != old_quality;
+                    // A no-op resubscribe (same codec/bandwidth/speed,
+                    // already subscribed) should not disturb the steady
+                    // encode stream — resetting needs_keyframe/burst on
+                    // every repeated subscribe makes keyframes churn and
+                    // skews pacing.
+                    let meaningful_change = !was_subscribed || prefs_changed;
                     state.codec_override = codec_support;
-                    state.quality_override = new_quality;
+                    state.bandwidth_override = new_bandwidth;
+                    state.speed_override = new_speed;
                     let task_in_flight = state.encode_in_flight || state.creation_in_flight;
                     if meaningful_change {
                         // Reset burst window so the first frames after a
@@ -8710,8 +8721,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     // resubscribe.  If an encode OR creation is in flight,
                     // flag the completion handler to discard its encoder
                     // instead of installing the stale one.
-                    if was_subscribed && (codec_support != old_codec || new_quality != old_quality)
-                    {
+                    if was_subscribed && prefs_changed {
                         state.encoder = None;
                         if task_in_flight {
                             state.encoder_invalidated = true;
@@ -8722,7 +8732,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     }
                     first_subscribe = !was_subscribed;
                     if was_subscribed
-                        && (codec_support != old_codec || new_quality != old_quality)
+                        && prefs_changed
                         && c.vulkan_video_surfaces.remove(&surface_id).is_some()
                     {
                         destroy_vulkan_enc_sid = Some(surface_id);

@@ -460,10 +460,12 @@ interface SurfaceSub {
   surfaceId: number;
   /** Number of live mounts currently referencing this sub. */
   refCount: number;
-  /** Quality override set via {@link BlitConnection.sendSurfaceResubscribe}. */
-  qualityOverride: number | null;
-  /** Last quality value sent on the wire, for dedup. */
-  lastSentQuality: number | null;
+  /** Bandwidth override set via {@link BlitConnection.sendSurfaceResubscribe}. */
+  bandwidthOverride: number | null;
+  /** Speed override set via {@link BlitConnection.sendSurfaceResubscribe}. */
+  speedOverride: number | null;
+  /** Last bandwidth/speed pair sent on the wire, for dedup. */
+  lastSent: { bandwidth: number; speed: number } | null;
   /** When the last mount has gone away we schedule a deferred wire
    *  UNSUBSCRIBE instead of firing it immediately.  Moving a surface
    *  between two UI locations (e.g. side-panel preview → BSP) causes
@@ -655,8 +657,10 @@ export class BlitConnection {
   private generation = 0;
   private lastError: string | null = null;
 
-  /** Default video quality for new surface subscriptions (0 = server default). */
-  defaultSurfaceQuality = 0;
+  /** Default video bandwidth for new surface subscriptions (0 = server default). */
+  defaultSurfaceBandwidth = 0;
+  /** Default encoder speed for new surface subscriptions (0 = server default). */
+  defaultSurfaceSpeed = 0;
   /** Default audio bitrate in kbps for audio subscriptions (0 = server default). */
   defaultAudioBitrateKbps = 0;
   /** When false, surface subscribe messages are suppressed (ref-counts
@@ -712,7 +716,7 @@ export class BlitConnection {
       }
       const sub = this.surfaceSubs.get(surfaceId);
       if (sub) {
-        sub.lastSentQuality = null;
+        sub.lastSent = null;
         this.maybeSendSurfaceSubscribe(sub);
       }
     });
@@ -2816,8 +2820,9 @@ export class BlitConnection {
   //     subscribe unscaled; otherwise pick the largest requested target
   //     (smaller subscribers can downscale from the larger stream
   //     client-side, but the reverse would be lossy).
-  //   * quality: per-surface override (set by sendSurfaceResubscribe)
-  //     falling back to defaultSurfaceQuality.
+  //   * bandwidth / speed: per-surface overrides (set by
+  //     sendSurfaceResubscribe) falling back to defaultSurfaceBandwidth
+  //     and defaultSurfaceSpeed.
   // Keyed by sub_id (client-allocated u32).  Each `BlitSurfaceCanvas`
   // (or equivalent caller) allocates its own sub_id and owns the
   // subscribe/unsubscribe lifecycle for that id.
@@ -2832,7 +2837,7 @@ export class BlitConnection {
   private static readonly SUB_UNSUB_GRACE_MS = 250;
 
   /** Cancel any pending deferred unsubscribe timers and reset
-   *  `lastSentQuality` so the next refresh fires a wire subscribe.
+   *  `lastSent` so the next refresh fires a wire subscribe.
    *  Called on reconnect / S2C_HELLO: the refCounts (one per live
    *  mount) are authoritative and must survive a reconnect — wiping
    *  the map would leave the existing mounts with no way to reclaim
@@ -2843,7 +2848,7 @@ export class BlitConnection {
         clearTimeout(sub.pendingUnsub);
         sub.pendingUnsub = null;
       }
-      sub.lastSentQuality = null;
+      sub.lastSent = null;
     }
   }
 
@@ -2862,12 +2867,19 @@ export class BlitConnection {
   private maybeSendSurfaceSubscribe(sub: SurfaceSub): void {
     if (this.transport.status !== "connected") return;
     if (!this.surfaceStreamingEnabled) return;
-    const quality = sub.qualityOverride ?? this.defaultSurfaceQuality;
-    if (sub.lastSentQuality === quality) return;
-    sub.lastSentQuality = quality;
+    const bandwidth = sub.bandwidthOverride ?? this.defaultSurfaceBandwidth;
+    const speed = sub.speedOverride ?? this.defaultSurfaceSpeed;
+    if (
+      sub.lastSent !== null &&
+      sub.lastSent.bandwidth === bandwidth &&
+      sub.lastSent.speed === speed
+    ) {
+      return;
+    }
+    sub.lastSent = { bandwidth, speed };
     this._logger.info(`surface sub ${this.id}:${sub.surfaceId}`);
     this.transport.send(
-      buildSurfaceSubscribeMessage(sub.surfaceId, 0, quality),
+      buildSurfaceSubscribeMessage(sub.surfaceId, 0, bandwidth, speed),
     );
   }
 
@@ -2880,8 +2892,9 @@ export class BlitConnection {
       sub = {
         surfaceId,
         refCount: 1,
-        qualityOverride: null,
-        lastSentQuality: null,
+        bandwidthOverride: null,
+        speedOverride: null,
+        lastSent: null,
         pendingUnsub: null,
       };
       this.surfaceSubs.set(surfaceId, sub);
@@ -2904,7 +2917,7 @@ export class BlitConnection {
   refreshSurfaceSubscribe(surfaceId: number): void {
     const sub = this.surfaceSubs.get(surfaceId);
     if (!sub) return;
-    sub.lastSentQuality = null;
+    sub.lastSent = null;
     this.maybeSendSurfaceSubscribe(sub);
   }
 
@@ -2916,7 +2929,7 @@ export class BlitConnection {
     if (this.transport.status !== "connected") return;
     if (!this.surfaceStreamingEnabled) return;
     for (const sub of this.surfaceSubs.values()) {
-      sub.lastSentQuality = null;
+      sub.lastSent = null;
       this.maybeSendSurfaceSubscribe(sub);
     }
   }
@@ -2943,14 +2956,20 @@ export class BlitConnection {
     }, BlitConnection.SUB_UNSUB_GRACE_MS);
   }
 
-  /** Set a per-surface quality override and re-send the subscribe.
-   *  The server treats a second SURFACE_SUBSCRIBE at the same sid
-   *  as a quality/codec update.  No-op when the sid is unknown. */
-  sendSurfaceResubscribe(surfaceId: number, quality: number): void {
+  /** Set per-surface bandwidth and speed overrides and re-send the
+   *  subscribe.  The server treats a second SURFACE_SUBSCRIBE at the
+   *  same sid as a codec/bandwidth/speed update.  No-op when the sid is
+   *  unknown. */
+  sendSurfaceResubscribe(
+    surfaceId: number,
+    bandwidth: number,
+    speed: number,
+  ): void {
     const sub = this.surfaceSubs.get(surfaceId);
     if (!sub) return;
-    sub.qualityOverride = quality;
-    sub.lastSentQuality = null;
+    sub.bandwidthOverride = bandwidth;
+    sub.speedOverride = speed;
+    sub.lastSent = null;
     this.maybeSendSurfaceSubscribe(sub);
   }
 
@@ -2965,13 +2984,13 @@ export class BlitConnection {
     if (this.transport.status !== "connected") return;
     if (enabled) {
       for (const sub of this.surfaceSubs.values()) {
-        sub.lastSentQuality = null;
+        sub.lastSent = null;
         this.maybeSendSurfaceSubscribe(sub);
       }
     } else {
       for (const sub of this.surfaceSubs.values()) {
         this.transport.send(buildSurfaceUnsubscribeMessage(sub.surfaceId));
-        sub.lastSentQuality = null;
+        sub.lastSent = null;
       }
     }
   }
@@ -4212,7 +4231,7 @@ export class BlitConnection {
       // per live mount) must be preserved: each mount is still there
       // and will call `refreshSurfaceSubscribe` when the store's
       // generation ticks forward, which is how the wire subscribe gets
-      // re-sent on reconnect.  Just reset `lastSentQuality` so the
+      // re-sent on reconnect.  Just reset `lastSent` so the
       // refresh actually fires.
       this.resetSurfaceSubsForReconnect();
       return;

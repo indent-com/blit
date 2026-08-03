@@ -80,13 +80,56 @@ const NV_ENC_CODEC_AV1_GUID: NvGuid = NvGuid(
     [0x86, 0x2D, 0x5D, 0x15, 0xCD, 0x16, 0xD2, 0x54],
 );
 
-// Preset GUIDs
-const NV_ENC_PRESET_P1_GUID: NvGuid = NvGuid(
-    0xFC0A8D3E,
-    0x45F8,
-    0x4CF8,
-    [0x80, 0xC7, 0x29, 0x88, 0x71, 0x59, 0x0E, 0xBF],
-);
+// Preset GUIDs P1 (fastest) … P7 (slowest), from nvEncodeAPI.h.
+const NV_ENC_PRESET_GUIDS: [NvGuid; 7] = [
+    NvGuid(
+        0xFC0A8D3E,
+        0x45F8,
+        0x4CF8,
+        [0x80, 0xC7, 0x29, 0x88, 0x71, 0x59, 0x0E, 0xBF],
+    ),
+    NvGuid(
+        0xF581CFB8,
+        0x88D6,
+        0x4381,
+        [0x93, 0xF0, 0xDF, 0x13, 0xF9, 0xC2, 0x7D, 0xAB],
+    ),
+    NvGuid(
+        0x36850110,
+        0x3A07,
+        0x441F,
+        [0x94, 0xD5, 0x36, 0x70, 0x63, 0x1F, 0x91, 0xF6],
+    ),
+    NvGuid(
+        0x90A7B826,
+        0xDF06,
+        0x4862,
+        [0xB9, 0xD2, 0xCD, 0x6D, 0x73, 0xA0, 0x86, 0x81],
+    ),
+    NvGuid(
+        0x21C6E6B4,
+        0x297A,
+        0x4CBA,
+        [0x99, 0x8F, 0xB6, 0xCB, 0xDE, 0x72, 0xAD, 0xE3],
+    ),
+    NvGuid(
+        0x8E75C279,
+        0x6299,
+        0x4AB6,
+        [0x83, 0x02, 0x0B, 0x21, 0x5A, 0x33, 0x5C, 0xF5],
+    ),
+    NvGuid(
+        0x84848C12,
+        0x6F71,
+        0x4C13,
+        [0x93, 0x1B, 0x53, 0xE2, 0x83, 0xF5, 0x79, 0x74],
+    ),
+];
+
+/// `preset` is 1 (P1, fastest) … 7 (P7, slowest); out-of-range clamps to P1.
+fn preset_guid(preset: u8) -> NvGuid {
+    NV_ENC_PRESET_GUIDS[(preset.clamp(1, 7) - 1) as usize]
+}
 
 // H.264 profile GUID — High 4:4:4 Predictive (from nvEncodeAPI.h)
 const NV_ENC_H264_PROFILE_HIGH_444_GUID: NvGuid = NvGuid(
@@ -281,11 +324,13 @@ impl NvencDirectEncoder {
     ///
     /// `codec` should be `"h264"` or `"av1"`.
     /// `qp` is the constant QP value (0–51 for H.264, 0–255 for AV1).
+    /// `preset` is the NVENC preset index, 1 (P1, fastest) … 7 (P7, slowest).
     pub fn try_new(
         codec: &str,
         width: u32,
         height: u32,
         qp: u32,
+        preset: u8,
         verbose: bool,
         chroma: crate::surface_encoder::ChromaSubsampling,
     ) -> Result<Self, String> {
@@ -397,7 +442,7 @@ impl NvencDirectEncoder {
             (fns.nvEncGetEncodePresetConfigEx)(
                 encoder,
                 codec_guid,
-                NV_ENC_PRESET_P1_GUID,
+                preset_guid(preset),
                 NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
                 preset_buf.as_mut_ptr() as *mut c_void,
             )
@@ -434,7 +479,7 @@ impl NvencDirectEncoder {
         let mut init_buf = vec![0u8; NVENC_INITIALIZE_PARAMS_SIZE];
         w32(&mut init_buf, 0, NV_ENC_INITIALIZE_PARAMS_VER);
         wguid(&mut init_buf, 4, codec_guid); // encodeGUID @ 4
-        wguid(&mut init_buf, 20, NV_ENC_PRESET_P1_GUID); // presetGUID @ 20
+        wguid(&mut init_buf, 20, preset_guid(preset)); // presetGUID @ 20
         w32(&mut init_buf, 36, width); // encodeWidth @ 36
         w32(&mut init_buf, 40, height); // encodeHeight @ 40
         w32(&mut init_buf, 44, width); // darWidth @ 44

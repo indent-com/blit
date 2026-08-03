@@ -855,10 +855,16 @@ async fn async_main() {
                     .unwrap_or(1_000_000),
                 ipc_path,
                 surface_encoders: blit_server::SurfaceEncoderPreference::defaults(),
-                surface_quality: std::env::var("BLIT_SURFACE_QUALITY")
-                    .ok()
-                    .and_then(|v| blit_server::SurfaceQuality::parse(&v))
-                    .unwrap_or_default(),
+                surface_encoding: blit_server::SurfaceEncoding {
+                    bandwidth: std::env::var("BLIT_SURFACE_BANDWIDTH")
+                        .ok()
+                        .and_then(|v| blit_server::SurfaceBandwidth::parse(&v))
+                        .unwrap_or_default(),
+                    speed: std::env::var("BLIT_SURFACE_SPEED")
+                        .ok()
+                        .and_then(|v| blit_server::SurfaceSpeed::parse(&v))
+                        .unwrap_or_default(),
+                },
                 chroma: blit_server::ChromaSubsampling::from_env(),
                 vaapi_device: std::env::var("BLIT_VAAPI_DEVICE")
                     .unwrap_or_else(|_| "/dev/dri/renderD128".into()),

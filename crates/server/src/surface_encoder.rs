@@ -266,41 +266,76 @@ pub fn av1_level_for(width: u32, height: u32) -> &'static str {
     "16"
 }
 
-/// Video quality preset.  Higher quality uses more CPU / bandwidth.
+/// The two independent axes of video encoding: how many bits a surface may
+/// spend, and how much CPU/GPU time the encoder may spend producing them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SurfaceEncoding {
+    pub bandwidth: SurfaceBandwidth,
+    pub speed: SurfaceSpeed,
+}
+
+/// Video bandwidth preset.  Higher bandwidth means a sharper picture for more
+/// bits; it says nothing about how long the encoder may take.
 ///
-/// - **Low**: speed 10, quantizer 180 — minimal CPU, visibly lossy
-/// - **Medium** (default): speed 10, quantizer 120 — good balance
-/// - **High**: speed 8, quantizer 80 — sharp, noticeable CPU use
-/// - **Ultra**: speed 6, quantizer 1 — near-lossless, heavy CPU
+/// - **Low**: quantizer 180 — visibly lossy
+/// - **Medium** (default): quantizer 120 — good balance
+/// - **High**: quantizer 80 — sharp
+/// - **Ultra**: quantizer 1 — maximum fidelity, very expensive
 /// - **Custom**: caller-specified AV1 quantizer (10–255)
 ///
-/// Set via `BLIT_SURFACE_QUALITY=low|medium|high|ultra`.
+/// Set via `BLIT_SURFACE_BANDWIDTH=low|medium|high|ultra|<10–255>`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum SurfaceQuality {
+pub enum SurfaceBandwidth {
     Low,
     #[default]
     Medium,
     High,
     Ultra,
-    /// Caller-specified AV1 quantizer (10–255).  H.264 QP, encoder speed,
-    /// and software-encoder bitrate are derived proportionally.
+    /// Caller-specified AV1 quantizer (10–255).  H.264 QP and
+    /// software-encoder bitrate are derived proportionally.
     Custom {
         quantizer: u8,
     },
 }
 
-impl SurfaceQuality {
+/// Encoder speed preset.  Faster means less CPU/GPU time per frame and worse
+/// compression at the same bandwidth; it does not change the bit budget.
+///
+/// - **Slow**: most compression per bit, heavy CPU
+/// - **Medium**
+/// - **Fast**
+/// - **Realtime** (default): the cheapest encode every backend offers
+/// - **Custom**: caller-specified 10–255 (10 = slowest, 255 = fastest)
+///
+/// Set via `BLIT_SURFACE_SPEED=slow|medium|fast|realtime|<10–255>`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SurfaceSpeed {
+    Slow,
+    Medium,
+    Fast,
+    #[default]
+    Realtime,
+    /// Caller-specified speed (10 = slowest, 255 = fastest).
+    Custom {
+        speed: u8,
+    },
+}
+
+impl SurfaceBandwidth {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
-            "ultra" | "lossless" => Some(Self::Ultra),
-            _ => None,
+            "ultra" => Some(Self::Ultra),
+            _ => match value.parse::<u8>() {
+                Ok(q @ 10..=255) => Some(Self::Custom { quantizer: q }),
+                _ => None,
+            },
         }
     }
 
-    /// Decode from the wire `quality` byte in C2S_SURFACE_SUBSCRIBE.
+    /// Decode from the wire `bandwidth` byte in C2S_SURFACE_SUBSCRIBE.
     ///
     /// - 0 → `None` (server default)
     /// - 1–4 → named presets
@@ -317,26 +352,7 @@ impl SurfaceQuality {
         }
     }
 
-    /// rav1e speed preset (0 = slowest/best, 10 = fastest/worst).
-    fn av1_speed(self) -> u8 {
-        match self {
-            Self::Low => 10,
-            Self::Medium => 10,
-            Self::High => 8,
-            Self::Ultra => 6,
-            Self::Custom { quantizer } => {
-                if quantizer <= 40 {
-                    6
-                } else if quantizer <= 80 {
-                    8
-                } else {
-                    10
-                }
-            }
-        }
-    }
-
-    /// AV1 quantizer (0 = lossless, 255 = worst).
+    /// AV1 quantizer (0 = best, 255 = worst).
     /// Also used as VA-API `base_qindex` and NVENC AV1 QP.
     fn av1_quantizer(self) -> usize {
         match self {
@@ -401,6 +417,91 @@ impl SurfaceQuality {
     }
 }
 
+impl SurfaceSpeed {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "slow" => Some(Self::Slow),
+            "medium" => Some(Self::Medium),
+            "fast" => Some(Self::Fast),
+            "realtime" => Some(Self::Realtime),
+            _ => match value.parse::<u8>() {
+                Ok(s @ 10..=255) => Some(Self::Custom { speed: s }),
+                _ => None,
+            },
+        }
+    }
+
+    /// Decode from the wire `speed` byte in C2S_SURFACE_SUBSCRIBE.
+    ///
+    /// - 0 → `None` (server default)
+    /// - 1–4 → named presets
+    /// - 10–255 → `Custom { speed: value }`
+    /// - 5–9 → reserved, treated as server default
+    pub fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Slow),
+            2 => Some(Self::Medium),
+            3 => Some(Self::Fast),
+            4 => Some(Self::Realtime),
+            v @ 10..=255 => Some(Self::Custom { speed: v }),
+            _ => None,
+        }
+    }
+
+    /// Normalized effort level, 0 = slowest/best compression, 10 = fastest.
+    /// Every backend's speed control is derived from this one number.
+    pub fn level(self) -> u8 {
+        match self {
+            Self::Slow => 4,
+            Self::Medium => 6,
+            Self::Fast => 8,
+            Self::Realtime => 10,
+            Self::Custom { speed } => (speed.saturating_sub(10) as u32 * 10 / 245) as u8,
+        }
+    }
+
+    /// rav1e speed preset (0 = slowest/best, 10 = fastest/worst).
+    fn av1_speed(self) -> u8 {
+        self.level()
+    }
+
+    /// x264 preset name.  `ultrafast` is deliberately not on the ladder: it
+    /// drops deblocking and CABAC, which costs more picture than the CPU it
+    /// saves on top of `superfast` + `zerolatency`.
+    #[cfg(all(target_os = "linux", feature = "x264"))]
+    fn x264_preset(self) -> &'static std::ffi::CStr {
+        match self.level() {
+            9..=10 => c"superfast",
+            7..=8 => c"veryfast",
+            5..=6 => c"faster",
+            3..=4 => c"fast",
+            _ => c"medium",
+        }
+    }
+
+    /// openh264 complexity mode.
+    #[cfg(all(target_os = "linux", feature = "openh264"))]
+    fn openh264_complexity(self) -> openh264::encoder::Complexity {
+        use openh264::encoder::Complexity;
+        match self.level() {
+            8..=10 => Complexity::Low,
+            4..=7 => Complexity::Medium,
+            _ => Complexity::High,
+        }
+    }
+
+    /// NVENC preset index: 1 = P1 (fastest) … 7 = P7 (slowest).
+    pub fn nvenc_preset(self) -> u8 {
+        7 - (self.level() as u32 * 6 / 10) as u8
+    }
+
+    /// VA-API `quality_level`: 7 = fastest, 1 = slowest.  AMD's radeonsi maps
+    /// this onto AMF presets (3–7 = speed, 1–2 = quality, 0 = balanced).
+    pub fn vaapi_quality_level(self) -> u32 {
+        1 + self.level() as u32 * 6 / 10
+    }
+}
+
 pub struct SurfaceEncoder {
     /// Dimensions the encoder actually operates at (may be padded to even for H.264).
     width: u32,
@@ -434,7 +535,7 @@ impl SurfaceEncoder {
         width: u32,
         height: u32,
         vaapi_device: &str,
-        quality: SurfaceQuality,
+        encoding: SurfaceEncoding,
         verbose: bool,
         codec_support: u8,
         chroma: ChromaSubsampling,
@@ -475,7 +576,7 @@ impl SurfaceEncoder {
                     source_width,
                     source_height,
                     vaapi_device,
-                    quality,
+                    encoding,
                     verbose,
                     ChromaSubsampling::Cs444,
                 ) {
@@ -509,7 +610,7 @@ impl SurfaceEncoder {
                 source_width,
                 source_height,
                 vaapi_device,
-                quality,
+                encoding,
                 verbose,
                 ChromaSubsampling::Cs420,
             ) {
@@ -543,7 +644,7 @@ impl SurfaceEncoder {
         source_width: u32,
         source_height: u32,
         vaapi_device: &str,
-        quality: SurfaceQuality,
+        encoding: SurfaceEncoding,
         verbose: bool,
         chroma: ChromaSubsampling,
     ) -> Result<Self, String> {
@@ -568,7 +669,7 @@ impl SurfaceEncoder {
             source_width,
             source_height,
             vaapi_device,
-            quality,
+            encoding,
             verbose,
             chroma,
         );
@@ -585,7 +686,7 @@ impl SurfaceEncoder {
         source_width: u32,
         source_height: u32,
         vaapi_device: &str,
-        quality: SurfaceQuality,
+        encoding: SurfaceEncoding,
         verbose: bool,
         chroma: ChromaSubsampling,
     ) -> Result<Self, String> {
@@ -597,7 +698,7 @@ impl SurfaceEncoder {
             }
             SurfaceEncoderPreference::NvencH264 => {
                 let (width, height) = ((width + 1) & !1, (height + 1) & !1);
-                let qp = quality.h264_qp() as u32;
+                let qp = encoding.bandwidth.h264_qp() as u32;
                 Ok(Self {
                     width,
                     height,
@@ -605,7 +706,13 @@ impl SurfaceEncoder {
                     source_height,
                     kind: SurfaceEncoderKind::NvencH264(Box::new(
                         crate::nvenc_encode::NvencDirectEncoder::try_new(
-                            "h264", width, height, qp, verbose, chroma,
+                            "h264",
+                            width,
+                            height,
+                            qp,
+                            encoding.speed.nvenc_preset(),
+                            verbose,
+                            chroma,
                         )?,
                     )),
                     chroma,
@@ -616,7 +723,7 @@ impl SurfaceEncoder {
                 // at minimum.  Round up to a multiple of 2 (matching H.264)
                 // so chroma planes stay aligned.
                 let (width, height) = ((width + 1) & !1, (height + 1) & !1);
-                let qp = quality.nvenc_av1_qp();
+                let qp = encoding.bandwidth.nvenc_av1_qp();
                 Ok(Self {
                     width,
                     height,
@@ -624,7 +731,13 @@ impl SurfaceEncoder {
                     source_height,
                     kind: SurfaceEncoderKind::NvencAV1(Box::new(
                         crate::nvenc_encode::NvencDirectEncoder::try_new(
-                            "av1", width, height, qp, verbose, chroma,
+                            "av1",
+                            width,
+                            height,
+                            qp,
+                            encoding.speed.nvenc_preset(),
+                            verbose,
+                            chroma,
                         )?,
                     )),
                     chroma,
@@ -643,7 +756,8 @@ impl SurfaceEncoder {
                             width,
                             height,
                             vaapi_device,
-                            quality.h264_qp(),
+                            encoding.bandwidth.h264_qp(),
+                            encoding.speed.vaapi_quality_level(),
                             verbose,
                             chroma,
                         )?,
@@ -695,7 +809,8 @@ impl SurfaceEncoder {
                             source_width,
                             source_height,
                             vaapi_device,
-                            quality.av1_quantizer() as u8,
+                            encoding.bandwidth.av1_quantizer() as u8,
+                            encoding.speed.vaapi_quality_level(),
                             verbose,
                             chroma,
                         )?,
@@ -711,7 +826,7 @@ impl SurfaceEncoder {
                 source_width,
                 source_height,
                 kind: SurfaceEncoderKind::AV1Software(Box::new(SoftwareAV1Encoder::new(
-                    width, height, quality, chroma,
+                    width, height, encoding, chroma,
                 )?)),
                 chroma,
             }),
@@ -723,7 +838,7 @@ impl SurfaceEncoder {
                     source_width,
                     source_height,
                     kind: SurfaceEncoderKind::H264Software(Box::new(SoftwareH264Encoder::new(
-                        width, height, quality, chroma,
+                        width, height, encoding, chroma,
                     )?)),
                     chroma,
                 })
@@ -1921,12 +2036,12 @@ impl SoftwareH264Encoder {
     fn new(
         width: u32,
         height: u32,
-        quality: SurfaceQuality,
+        encoding: SurfaceEncoding,
         chroma: ChromaSubsampling,
     ) -> Result<Self, String> {
         let pinned = std::env::var("BLIT_H264_SOFTWARE").ok();
         let pinned = pinned.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        Self::new_with_backend(pinned, width, height, quality, chroma)
+        Self::new_with_backend(pinned, width, height, encoding, chroma)
     }
 
     #[allow(unused_mut)] // mutated only when a backend feature is enabled
@@ -1934,13 +2049,13 @@ impl SoftwareH264Encoder {
         pinned: Option<&str>,
         width: u32,
         height: u32,
-        quality: SurfaceQuality,
+        encoding: SurfaceEncoding,
         chroma: ChromaSubsampling,
     ) -> Result<Self, String> {
         let mut errors: Vec<String> = Vec::new();
         #[cfg(all(target_os = "linux", feature = "x264"))]
         if pinned.is_none_or(|p| p == "x264") {
-            match X264Encoder::new(width, height, quality, chroma) {
+            match X264Encoder::new(width, height, encoding, chroma) {
                 Ok(enc) => return Ok(Self::X264(enc)),
                 Err(err) => errors.push(format!("x264: {err}")),
             }
@@ -1950,13 +2065,13 @@ impl SoftwareH264Encoder {
             if chroma.is_444() {
                 errors.push("openh264: 4:4:4 not supported".into());
             } else {
-                match OpenH264Encoder::new(quality) {
+                match OpenH264Encoder::new(encoding) {
                     Ok(enc) => return Ok(Self::OpenH264(Box::new(enc))),
                     Err(err) => errors.push(format!("openh264: {err}")),
                 }
             }
         }
-        let _ = (width, height, quality, chroma);
+        let _ = (width, height, encoding, chroma);
         if !errors.is_empty() {
             Err(errors.join("; "))
         } else if let Some(p) = pinned {
@@ -2054,18 +2169,16 @@ impl X264Encoder {
     fn new(
         width: u32,
         height: u32,
-        quality: SurfaceQuality,
+        encoding: SurfaceEncoding,
         chroma: ChromaSubsampling,
     ) -> Result<Self, String> {
         use x264_sys::*;
         let is_444 = chroma.is_444();
         unsafe {
             let mut par: x264_param_t = std::mem::zeroed();
-            // Cheap CPU fallback: superfast + zerolatency (no B-frames, no
-            // lookahead, one frame in, one frame out).
-            if x264_param_default_preset(&mut par, c"superfast".as_ptr(), c"zerolatency".as_ptr())
-                < 0
-            {
+            // zerolatency: no B-frames, no lookahead, one frame in, one out.
+            let preset = encoding.speed.x264_preset();
+            if x264_param_default_preset(&mut par, preset.as_ptr(), c"zerolatency".as_ptr()) < 0 {
                 return Err("x264_param_default_preset failed".into());
             }
             par.i_csp = if is_444 { X264_CSP_I444 } else { X264_CSP_I420 } as i32;
@@ -2080,7 +2193,7 @@ impl X264Encoder {
             par.i_keyint_max = 60;
             par.i_log_level = X264_LOG_NONE;
             par.rc.i_rc_method = X264_RC_ABR as i32;
-            par.rc.i_bitrate = (quality.h264_bitrate() / 1000) as i32; // kbit/s
+            par.rc.i_bitrate = (encoding.bandwidth.h264_bitrate() / 1000) as i32; // kbit/s
             // Profiles match the codec strings sent to clients: Constrained
             // Baseline (avc1.4200) for 4:2:0, High 4:4:4 Predictive
             // (avc1.F400) for 4:4:4 — the only H.264 profile with 4:4:4.
@@ -2187,11 +2300,12 @@ struct OpenH264Encoder {
 
 #[cfg(all(target_os = "linux", feature = "openh264"))]
 impl OpenH264Encoder {
-    fn new(quality: SurfaceQuality) -> Result<Self, String> {
+    fn new(encoding: SurfaceEncoding) -> Result<Self, String> {
         use openh264::encoder::{BitRate, Encoder, EncoderConfig, RateControlMode};
         let config = EncoderConfig::new()
-            .bitrate(BitRate::from_bps(quality.h264_bitrate()))
-            .rate_control_mode(RateControlMode::Bitrate);
+            .bitrate(BitRate::from_bps(encoding.bandwidth.h264_bitrate()))
+            .rate_control_mode(RateControlMode::Bitrate)
+            .complexity(encoding.speed.openh264_complexity());
         let encoder = Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
             .map_err(|err| format!("failed to create encoder: {err:?}"))?;
         Ok(Self { encoder })
@@ -2236,7 +2350,7 @@ impl SoftwareAV1Encoder {
     fn new(
         width: u32,
         height: u32,
-        quality: SurfaceQuality,
+        encoding: SurfaceEncoding,
         chroma: ChromaSubsampling,
     ) -> Result<Self, String> {
         use rav1e::prelude::*;
@@ -2246,7 +2360,7 @@ impl SoftwareAV1Encoder {
         } else {
             ChromaSampling::Cs420
         };
-        let mut speed = SpeedSettings::from_preset(quality.av1_speed());
+        let mut speed = SpeedSettings::from_preset(encoding.speed.av1_speed());
         speed.rdo_lookahead_frames = 1;
         let enc = EncoderConfig {
             width: width as usize,
@@ -2257,8 +2371,8 @@ impl SoftwareAV1Encoder {
             low_latency: true,
             min_key_frame_interval: 0,
             max_key_frame_interval: 60,
-            quantizer: quality.av1_quantizer(),
-            min_quantizer: quality.av1_min_quantizer(),
+            quantizer: encoding.bandwidth.av1_quantizer(),
+            min_quantizer: encoding.bandwidth.av1_min_quantizer(),
             bitrate: 0,
             ..Default::default()
         };
@@ -2356,6 +2470,87 @@ impl SoftwareAV1Encoder {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bandwidth_and_speed_parse_independently() {
+        assert_eq!(
+            SurfaceBandwidth::parse("ultra"),
+            Some(SurfaceBandwidth::Ultra)
+        );
+        assert_eq!(
+            SurfaceBandwidth::parse("200"),
+            Some(SurfaceBandwidth::Custom { quantizer: 200 })
+        );
+        // "lossless" is gone, and a preset name from the other axis is not
+        // silently accepted.
+        assert_eq!(SurfaceBandwidth::parse("lossless"), None);
+        assert_eq!(SurfaceBandwidth::parse("realtime"), None);
+        assert_eq!(SurfaceBandwidth::parse("9"), None);
+
+        assert_eq!(
+            SurfaceSpeed::parse("realtime"),
+            Some(SurfaceSpeed::Realtime)
+        );
+        assert_eq!(
+            SurfaceSpeed::parse("200"),
+            Some(SurfaceSpeed::Custom { speed: 200 })
+        );
+        assert_eq!(SurfaceSpeed::parse("ultra"), None);
+    }
+
+    #[test]
+    fn wire_bytes_decode_to_presets_and_custom_ranges() {
+        assert_eq!(SurfaceBandwidth::from_wire(0), None);
+        assert_eq!(
+            SurfaceBandwidth::from_wire(2),
+            Some(SurfaceBandwidth::Medium)
+        );
+        assert_eq!(SurfaceBandwidth::from_wire(7), None);
+        assert_eq!(
+            SurfaceBandwidth::from_wire(255),
+            Some(SurfaceBandwidth::Custom { quantizer: 255 })
+        );
+
+        assert_eq!(SurfaceSpeed::from_wire(0), None);
+        assert_eq!(SurfaceSpeed::from_wire(3), Some(SurfaceSpeed::Fast));
+        assert_eq!(SurfaceSpeed::from_wire(7), None);
+        assert_eq!(
+            SurfaceSpeed::from_wire(10),
+            Some(SurfaceSpeed::Custom { speed: 10 })
+        );
+    }
+
+    #[test]
+    fn bandwidth_derivations_are_monotonic() {
+        let ladder = [
+            SurfaceBandwidth::Low,
+            SurfaceBandwidth::Medium,
+            SurfaceBandwidth::High,
+            SurfaceBandwidth::Ultra,
+        ];
+        for pair in ladder.windows(2) {
+            assert!(pair[0].av1_quantizer() > pair[1].av1_quantizer());
+            assert!(pair[0].av1_min_quantizer() > pair[1].av1_min_quantizer());
+            assert!(pair[0].h264_qp() > pair[1].h264_qp());
+        }
+    }
+
+    #[test]
+    fn speed_level_is_monotonic_and_maps_onto_every_backend() {
+        assert_eq!(SurfaceSpeed::Slow.level(), 4);
+        assert_eq!(SurfaceSpeed::Realtime.level(), 10);
+        assert_eq!(SurfaceSpeed::Custom { speed: 10 }.level(), 0);
+        assert_eq!(SurfaceSpeed::Custom { speed: 255 }.level(), 10);
+
+        // Fastest end reproduces the values the server hard-coded before the
+        // speed knob existed: rav1e speed 10, NVENC P1, VA-API quality 7.
+        assert_eq!(SurfaceSpeed::Realtime.av1_speed(), 10);
+        assert_eq!(SurfaceSpeed::Realtime.nvenc_preset(), 1);
+        assert_eq!(SurfaceSpeed::Realtime.vaapi_quality_level(), 7);
+
+        assert_eq!(SurfaceSpeed::Custom { speed: 10 }.nvenc_preset(), 7);
+        assert_eq!(SurfaceSpeed::Custom { speed: 10 }.vaapi_quality_level(), 1);
+    }
+
     /// 8-bit 4:4:4 AV1 is seq_profile 1 ("High"); Profile 2
     /// ("Professional") only reaches 4:4:4 at 12-bit.  The digit here has to
     /// match what rav1e and the VA-API AV1 encoder actually write into the
@@ -2451,7 +2646,7 @@ mod tests {
         // of whoever runs the tests from interfering.)
         let chroma = ChromaSubsampling::Cs420;
         let mut enc =
-            SoftwareH264Encoder::new_with_backend(None, 64, 48, SurfaceQuality::Medium, chroma)
+            SoftwareH264Encoder::new_with_backend(None, 64, 48, SurfaceEncoding::default(), chroma)
                 .unwrap();
         assert_eq!(enc.name(chroma), "h264-software (x264)");
         let rgba = vec![128u8; 64 * 48 * 4];
@@ -2477,7 +2672,7 @@ mod tests {
     fn x264_software_encoder_444_round_trip() {
         let chroma = ChromaSubsampling::Cs444;
         let mut enc =
-            SoftwareH264Encoder::new_with_backend(None, 64, 48, SurfaceQuality::Medium, chroma)
+            SoftwareH264Encoder::new_with_backend(None, 64, 48, SurfaceEncoding::default(), chroma)
                 .unwrap();
         assert_eq!(enc.name(chroma), "h264-software (x264) 4:4:4");
         let rgba = vec![128u8; 64 * 48 * 4];
@@ -2499,7 +2694,7 @@ mod tests {
             Some("openh264"),
             64,
             48,
-            SurfaceQuality::Medium,
+            SurfaceEncoding::default(),
             ChromaSubsampling::Cs444,
         )
         .err()
@@ -2510,7 +2705,7 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "x264", feature = "openh264"))]
     #[test]
     fn h264_software_backend_pin() {
-        let q = SurfaceQuality::Medium;
+        let q = SurfaceEncoding::default();
         let chroma = ChromaSubsampling::Cs420;
         let enc =
             SoftwareH264Encoder::new_with_backend(Some("openh264"), 64, 48, q, chroma).unwrap();
@@ -2525,7 +2720,7 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "openh264"))]
     #[test]
     fn openh264_software_encoder_round_trip() {
-        let mut enc = OpenH264Encoder::new(SurfaceQuality::Medium).unwrap();
+        let mut enc = OpenH264Encoder::new(SurfaceEncoding::default()).unwrap();
         let yuv = vec![128u8; 64 * 48 * 3 / 2];
         let (data, key) = enc
             .encode_yuv(yuv.clone(), 64, 48)

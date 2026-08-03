@@ -4,19 +4,20 @@
 
 ## Configuration
 
-| Variable                | Default                                            | Purpose                                                                                |
-| ----------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `BLIT_SOCK`             | see path cascade in [transports.md](transports.md) | Unix socket listen path                                                                |
-| `SHELL`                 | `$SHELL` or `/bin/sh`                              | Shell spawned for new PTYs                                                             |
-| `BLIT_SHELL_FLAGS`      | `li` (Unix) / `` (Windows)                         | Shell invocation flags                                                                 |
-| `BLIT_SCROLLBACK`       | `1000000`                                          | Scrollback buffer rows per PTY                                                         |
-| `BLIT_VAAPI_DEVICE`     | `/dev/dri/renderD128`                              | VA-API render node for encoding                                                        |
-| `BLIT_CUDA_DEVICE`      | `0`                                                | CUDA device ordinal (NVENC)                                                            |
-| `BLIT_FD_CHANNEL`       | unset                                              | fd-channel file descriptor                                                             |
-| `BLIT_EXPORT_SOCK`      | unset                                              | `1` exports the socket path as `BLIT_SOCK` in spawned terminals (also `--export-sock`) |
-| `BLIT_INJECT_PATH`      | unset                                              | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)     |
-| `BLIT_SURFACE_ENCODERS` | see encoder table                                  | Comma-separated encoder priority                                                       |
-| `BLIT_SURFACE_QUALITY`  | `medium`                                           | Video quality preset                                                                   |
+| Variable                 | Default                                            | Purpose                                                                                |
+| ------------------------ | -------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `BLIT_SOCK`              | see path cascade in [transports.md](transports.md) | Unix socket listen path                                                                |
+| `SHELL`                  | `$SHELL` or `/bin/sh`                              | Shell spawned for new PTYs                                                             |
+| `BLIT_SHELL_FLAGS`       | `li` (Unix) / `` (Windows)                         | Shell invocation flags                                                                 |
+| `BLIT_SCROLLBACK`        | `1000000`                                          | Scrollback buffer rows per PTY                                                         |
+| `BLIT_VAAPI_DEVICE`      | `/dev/dri/renderD128`                              | VA-API render node for encoding                                                        |
+| `BLIT_CUDA_DEVICE`       | `0`                                                | CUDA device ordinal (NVENC)                                                            |
+| `BLIT_FD_CHANNEL`        | unset                                              | fd-channel file descriptor                                                             |
+| `BLIT_EXPORT_SOCK`       | unset                                              | `1` exports the socket path as `BLIT_SOCK` in spawned terminals (also `--export-sock`) |
+| `BLIT_INJECT_PATH`       | unset                                              | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)     |
+| `BLIT_SURFACE_ENCODERS`  | see encoder table                                  | Comma-separated encoder priority                                                       |
+| `BLIT_SURFACE_BANDWIDTH` | `medium`                                           | Video bandwidth preset                                                                 |
+| `BLIT_SURFACE_SPEED`     | `realtime`                                         | Encoder speed preset                                                                   |
 
 ## PTY lifecycle
 
@@ -210,7 +211,13 @@ Vulkan Video encoders (`av1-vulkan`, `h264-vulkan`) are available but not in the
 | `h264-software` | openh264/x264 (CPU) | Software H.264; backend is a build-time choice — openh264 by default, x264 in the GPL opt-in build (`blit --license`), absent if built with neither. 4:4:4 requires x264 (High 4:4:4 Predictive); openh264 is 4:2:0-only |
 | `av1-software`  | rav1e (CPU)         | Software AV1                                                                                                                                                                                                             |
 
-`BLIT_SURFACE_QUALITY`: `low`, `medium` (default), `high`, `ultra`.
+`BLIT_SURFACE_BANDWIDTH`: `low`, `medium` (default), `high`, `ultra`, or a raw
+AV1 quantizer `10`–`255`. Controls how many bits a surface may spend.
+
+`BLIT_SURFACE_SPEED`: `slow`, `medium`, `fast`, `realtime` (default), or a raw
+`10`–`255` (10 = slowest, 255 = fastest). Controls how much encoder time a
+frame may cost: rav1e speed preset, x264 preset, openh264 complexity, NVENC
+preset P1–P7, VA-API `quality_level`. Vulkan Video has no speed control.
 
 `BLIT_H264_SOFTWARE`: pins the `h264-software` backend to `x264` or
 `openh264` when the binary carries both (dev builds with

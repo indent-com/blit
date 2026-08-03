@@ -209,7 +209,8 @@ export const TEXT_GAMMA_KEY = "blit.textGamma";
 export const TARGET_KEY = "blit.target";
 export const AUDIO_BITRATE_KEY = "blit.audioBitrate";
 export const AUDIO_MUTED_KEY = "blit.audioMuted";
-export const VIDEO_QUALITY_KEY = "blit.videoQuality";
+export const VIDEO_BANDWIDTH_KEY = "blit.videoBandwidth";
+export const VIDEO_SPEED_KEY = "blit.videoSpeed";
 export const SURFACE_STREAMING_KEY = "blit.surfaceStreaming";
 // Panel widths are UI-local (not synced to blit.conf), so they stay out of
 // PERSISTED_KEYS below and round-trip through localStorage only.
@@ -233,7 +234,8 @@ const PERSISTED_KEYS = new Set([
   TARGET_KEY,
   AUDIO_BITRATE_KEY,
   AUDIO_MUTED_KEY,
-  VIDEO_QUALITY_KEY,
+  VIDEO_BANDWIDTH_KEY,
+  VIDEO_SPEED_KEY,
   SURFACE_STREAMING_KEY,
 ]);
 
@@ -556,10 +558,20 @@ export function preferredAudioBitrate(): number {
   return 0;
 }
 
-/** Preferred video quality.  0 = server default, 1–4 = presets,
+/** Preferred video bandwidth.  0 = server default, 1–4 = presets,
  *  10–255 = custom AV1 quantizer. */
-export function preferredVideoQuality(): number {
-  const s = readStorage(VIDEO_QUALITY_KEY);
+export function preferredVideoBandwidth(): number {
+  return readWireByte(VIDEO_BANDWIDTH_KEY);
+}
+
+/** Preferred encoder speed.  0 = server default, 1–4 = presets,
+ *  10–255 = custom (10 = slowest, 255 = fastest). */
+export function preferredVideoSpeed(): number {
+  return readWireByte(VIDEO_SPEED_KEY);
+}
+
+function readWireByte(key: string): number {
+  const s = readStorage(key);
   if (s) {
     const n = parseInt(s, 10);
     if (n >= 0 && n <= 255) return n;

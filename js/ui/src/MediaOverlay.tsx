@@ -13,7 +13,7 @@ const AUDIO_PRESETS: { label: string; kbps: number }[] = [
   { label: "256 kbps", kbps: 256 },
 ];
 
-const VIDEO_PRESETS: { label: string; value: number }[] = [
+const BANDWIDTH_PRESETS: { label: string; value: number }[] = [
   { label: "Default", value: 0 },
   { label: "Low", value: 1 },
   { label: "Medium", value: 2 },
@@ -21,20 +21,31 @@ const VIDEO_PRESETS: { label: string; value: number }[] = [
   { label: "Ultra", value: 4 },
 ];
 
+const SPEED_PRESETS: { label: string; value: number }[] = [
+  { label: "Default", value: 0 },
+  { label: "Slow", value: 1 },
+  { label: "Medium", value: 2 },
+  { label: "Fast", value: 3 },
+  { label: "Realtime", value: 4 },
+];
+
 /** Default slider positions when switching to custom for the first time. */
 const CUSTOM_DEFAULT_QUANTIZER = 80;
+const CUSTOM_DEFAULT_SPEED = 128;
 const CUSTOM_DEFAULT_AUDIO_KBPS = 128;
 
 export function MediaOverlay(props: {
   palette: TerminalPalette;
   fontSize: number;
   audioBitrate: number;
-  videoQuality: number;
+  videoBandwidth: number;
+  videoSpeed: number;
   audioMuted: boolean;
   audioAvailable: boolean;
   surfaceStreaming: boolean;
   onAudioBitrateChange: (kbps: number) => void;
-  onVideoQualityChange: (quality: number) => void;
+  onVideoBandwidthChange: (bandwidth: number) => void;
+  onVideoSpeedChange: (speed: number) => void;
   onSurfaceStreamingChange: (enabled: boolean) => void;
   onToggleAudio: () => void;
   onResetAudio: () => void;
@@ -55,10 +66,16 @@ export function MediaOverlay(props: {
   );
 
   // ---- Video custom state ----
-  const isCustomVideo = () => props.videoQuality >= 10;
+  // Wire values 10–255 are the custom range on both axes; 0–4 are presets.
+  const isCustomBandwidth = () => props.videoBandwidth >= 10;
+  const isCustomSpeed = () => props.videoSpeed >= 10;
 
-  const [videoSlider, setVideoSlider] = createSignal(
-    isCustomVideo() ? props.videoQuality : CUSTOM_DEFAULT_QUANTIZER,
+  const [bandwidthSlider, setBandwidthSlider] = createSignal(
+    isCustomBandwidth() ? props.videoBandwidth : CUSTOM_DEFAULT_QUANTIZER,
+  );
+
+  const [speedSlider, setSpeedSlider] = createSignal(
+    isCustomSpeed() ? props.videoSpeed : CUSTOM_DEFAULT_SPEED,
   );
 
   // ---- Shared styles ----
@@ -126,27 +143,45 @@ export function MediaOverlay(props: {
   };
 
   // ---- Video handlers ----
-  const activateCustomVideo = () => {
-    const q = isCustomVideo() ? videoSlider() : CUSTOM_DEFAULT_QUANTIZER;
-    setVideoSlider(q);
-    props.onVideoQualityChange(q);
+  const activateCustomBandwidth = () => {
+    const q = isCustomBandwidth()
+      ? bandwidthSlider()
+      : CUSTOM_DEFAULT_QUANTIZER;
+    setBandwidthSlider(q);
+    props.onVideoBandwidthChange(q);
   };
 
-  const handleVideoSlider = (e: Event) => {
+  const handleBandwidthSlider = (e: Event) => {
     const v = parseInt((e.target as HTMLInputElement).value, 10);
-    setVideoSlider(v);
-    props.onVideoQualityChange(v);
+    setBandwidthSlider(v);
+    props.onVideoBandwidthChange(v);
+  };
+
+  const activateCustomSpeed = () => {
+    const v = isCustomSpeed() ? speedSlider() : CUSTOM_DEFAULT_SPEED;
+    setSpeedSlider(v);
+    props.onVideoSpeedChange(v);
+  };
+
+  const handleSpeedSlider = (e: Event) => {
+    const v = parseInt((e.target as HTMLInputElement).value, 10);
+    setSpeedSlider(v);
+    props.onVideoSpeedChange(v);
   };
 
   const quantizerHint = (): string => {
-    const q = videoSlider();
-    if (q <= 10) return "near-lossless";
+    const q = bandwidthSlider();
+    if (q <= 10) return "maximum";
     if (q <= 40) return "very high";
     if (q <= 80) return "high";
     if (q <= 120) return "medium";
     if (q <= 180) return "low";
     return "lowest";
   };
+
+  /** Server-side normalized effort level, 0 (slowest) – 10 (fastest). */
+  const speedLevel = (): number =>
+    Math.floor(((speedSlider() - 10) * 10) / 245);
 
   return (
     <OverlayBackdrop
@@ -203,82 +238,167 @@ export function MediaOverlay(props: {
               </div>
             </div>
 
-            {/* Video quality — dimmed when streaming is off */}
+            {/* Bandwidth and speed — dimmed when streaming is off */}
             <div
               style={{
                 display: "flex",
                 "flex-direction": "column",
-                gap: `${scale().tightGap}px`,
+                gap: `${scale().gap}px`,
                 opacity: props.surfaceStreaming ? 1 : 0.35,
                 "pointer-events": props.surfaceStreaming ? "auto" : "none",
                 transition: "opacity 0.15s ease",
               }}
             >
-              <span style={labelStyle()}>Quality</span>
               <div
                 style={{
                   display: "flex",
-                  "flex-wrap": "wrap",
+                  "flex-direction": "column",
                   gap: `${scale().tightGap}px`,
                 }}
               >
-                <For each={VIDEO_PRESETS}>
-                  {(preset) => (
-                    <button
-                      onClick={() => props.onVideoQualityChange(preset.value)}
-                      style={chipStyle(
-                        props.videoQuality === preset.value && !isCustomVideo(),
-                      )}
-                    >
-                      {preset.label}
-                    </button>
-                  )}
-                </For>
-                <button
-                  onClick={activateCustomVideo}
-                  style={chipStyle(isCustomVideo())}
-                >
-                  Custom
-                </button>
-              </div>
-              <Show when={isCustomVideo()}>
+                <span style={labelStyle()}>Bandwidth</span>
                 <div
                   style={{
                     display: "flex",
-                    "flex-direction": "column",
+                    "flex-wrap": "wrap",
                     gap: `${scale().tightGap}px`,
                   }}
                 >
-                  <div style={sliderRowStyle()}>
-                    <span
-                      style={{
-                        ...sliderLabelStyle(),
-                        "min-width": "3em",
-                        "text-align": "right",
-                      }}
-                    >
-                      Best
-                    </span>
-                    <input
-                      type="range"
-                      min="10"
-                      max="255"
-                      step="1"
-                      value={videoSlider()}
-                      onInput={handleVideoSlider}
-                      style={sliderStyle()}
-                    />
-                    <span
-                      style={{ ...sliderLabelStyle(), "min-width": "4.5em" }}
-                    >
-                      Smallest
+                  <For each={BANDWIDTH_PRESETS}>
+                    {(preset) => (
+                      <button
+                        onClick={() =>
+                          props.onVideoBandwidthChange(preset.value)
+                        }
+                        style={chipStyle(
+                          props.videoBandwidth === preset.value &&
+                            !isCustomBandwidth(),
+                        )}
+                      >
+                        {preset.label}
+                      </button>
+                    )}
+                  </For>
+                  <button
+                    onClick={activateCustomBandwidth}
+                    style={chipStyle(isCustomBandwidth())}
+                  >
+                    Custom
+                  </button>
+                </div>
+                <Show when={isCustomBandwidth()}>
+                  <div
+                    style={{
+                      display: "flex",
+                      "flex-direction": "column",
+                      gap: `${scale().tightGap}px`,
+                    }}
+                  >
+                    <div style={sliderRowStyle()}>
+                      <span
+                        style={{
+                          ...sliderLabelStyle(),
+                          "min-width": "3em",
+                          "text-align": "right",
+                        }}
+                      >
+                        Best
+                      </span>
+                      <input
+                        type="range"
+                        min="10"
+                        max="255"
+                        step="1"
+                        value={bandwidthSlider()}
+                        onInput={handleBandwidthSlider}
+                        style={sliderStyle()}
+                      />
+                      <span
+                        style={{ ...sliderLabelStyle(), "min-width": "4.5em" }}
+                      >
+                        Smallest
+                      </span>
+                    </div>
+                    <span style={sliderHintStyle()}>
+                      AV1 quantizer {bandwidthSlider()} ({quantizerHint()})
                     </span>
                   </div>
-                  <span style={sliderHintStyle()}>
-                    AV1 quantizer {videoSlider()} ({quantizerHint()})
-                  </span>
+                </Show>
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  "flex-direction": "column",
+                  gap: `${scale().tightGap}px`,
+                }}
+              >
+                <span style={labelStyle()}>Speed</span>
+                <div
+                  style={{
+                    display: "flex",
+                    "flex-wrap": "wrap",
+                    gap: `${scale().tightGap}px`,
+                  }}
+                >
+                  <For each={SPEED_PRESETS}>
+                    {(preset) => (
+                      <button
+                        onClick={() => props.onVideoSpeedChange(preset.value)}
+                        style={chipStyle(
+                          props.videoSpeed === preset.value && !isCustomSpeed(),
+                        )}
+                      >
+                        {preset.label}
+                      </button>
+                    )}
+                  </For>
+                  <button
+                    onClick={activateCustomSpeed}
+                    style={chipStyle(isCustomSpeed())}
+                  >
+                    Custom
+                  </button>
                 </div>
-              </Show>
+                <Show when={isCustomSpeed()}>
+                  <div
+                    style={{
+                      display: "flex",
+                      "flex-direction": "column",
+                      gap: `${scale().tightGap}px`,
+                    }}
+                  >
+                    <div style={sliderRowStyle()}>
+                      <span
+                        style={{
+                          ...sliderLabelStyle(),
+                          "min-width": "3em",
+                          "text-align": "right",
+                        }}
+                      >
+                        Slowest
+                      </span>
+                      <input
+                        type="range"
+                        min="10"
+                        max="255"
+                        step="1"
+                        value={speedSlider()}
+                        onInput={handleSpeedSlider}
+                        style={sliderStyle()}
+                      />
+                      <span
+                        style={{ ...sliderLabelStyle(), "min-width": "4.5em" }}
+                      >
+                        Fastest
+                      </span>
+                    </div>
+                    <span style={sliderHintStyle()}>
+                      encoder effort {speedSlider()} (level {speedLevel()}/10)
+                    </span>
+                  </div>
+                </Show>
+              </div>
             </div>
           </div>
 
