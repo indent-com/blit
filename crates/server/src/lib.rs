@@ -3494,6 +3494,20 @@ async fn tick(state: &AppState) -> TickOutcome {
                 .collect()
         })
         .unwrap_or_default();
+    // Compositor-encoded bitstreams live on their own generation stream,
+    // one per `(surface, client)`.  Snapshotted here so the encode loop can
+    // ask "does this client already have this frame?" without reaching back
+    // into `sess.compositor` while it holds a client borrow.
+    let encoded_snapshot: HashMap<(u16, u64), u64> = sess
+        .compositor
+        .as_ref()
+        .map(|cs| {
+            cs.last_encoded
+                .iter()
+                .map(|(&key, e)| (key, e.generation))
+                .collect()
+        })
+        .unwrap_or_default();
     if pixel_snapshot.is_empty() {
         sess.ticks_pixel_snapshot_empty = sess.ticks_pixel_snapshot_empty.saturating_add(1);
     } else {
@@ -3789,15 +3803,31 @@ async fn tick(state: &AppState) -> TickOutcome {
                     .unwrap_or((native_w, native_h, native_gen, native_ts));
 
                 // Has anything changed since the frame this client already
-                // has?  Answered before the controller runs, because a
-                // still surface must not be judged on `frame_bytes` — that
-                // EWMA describes motion that has already stopped.
+                // has?  Answered before the controller runs, because a still
+                // surface must not be judged on `frame_bytes` — that EWMA
+                // describes motion that has already stopped.
+                //
+                // A client on a compositor-resident encoder is served from
+                // the bitstream stream, not the pixel snapshot, and the two
+                // carry independent generations; ask the one it is actually
+                // fed from.
+                let has_vulkan_enc = client.vulkan_video_surfaces.contains_key(&sid);
+                let latest_gen = if has_vulkan_enc {
+                    match encoded_snapshot.get(&(sid, work.cid)) {
+                        Some(&g) => g,
+                        // The session exists but has not produced anything
+                        // yet; there is nothing to hold still.
+                        None => u64::MAX,
+                    }
+                } else {
+                    px_gen
+                };
                 let unchanged = !work.needs_keyframe
                     && client
                         .surface_subs
                         .get(&sid)
                         .and_then(|s| s.last_encoded_gen)
-                        == Some(px_gen);
+                        == Some(latest_gen);
 
                 // Adaptive bandwidth: one step per surface per tick, after
                 // the pacing gate so an idle surface neither steps nor is
@@ -3823,7 +3853,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // meaningful because sessions are owned per `(surface,
                 // client)`: one viewer's backoff no longer degrades
                 // everyone else's stream.
-                if step.quantizer.is_some() && client.vulkan_video_surfaces.contains_key(&sid) {
+                if step.quantizer.is_some() && has_vulkan_enc {
                     // Through `resolve_bandwidth`, not the raw step: the
                     // controller floors at `ADAPTIVE_MAX_QUANTIZER`, so a
                     // ceiling set cheaper than that would otherwise be
@@ -3832,6 +3862,30 @@ async fn tick(state: &AppState) -> TickOutcome {
                         .av1_quantizer()
                         .min(255) as u8;
                     pending_vulkan_qp_updates.push((sid as u32, work.cid, q));
+                }
+
+                // The picture has not changed.  Normally that means there is
+                // nothing to send — but the frame the client is looking at
+                // was encoded at whatever quantizer the controller had
+                // backed off to, and it is about to stay on screen.  If the
+                // step above bought an improvement, spend it; otherwise
+                // there is nothing to gain.
+                let still_refresh = unchanged && step.quantizer.is_some();
+                if unchanged {
+                    if !still_refresh {
+                        client.skip_same_gen_count = client.skip_same_gen_count.saturating_add(1);
+                        continue;
+                    }
+                    if has_vulkan_enc {
+                        // Nothing to re-send here: the bitstream in hand is
+                        // the one the client already has.  The qp update
+                        // above is staged, and the keyframe request forces
+                        // the recomposite that makes the compositor encode
+                        // at it.  Delivery happens next tick, on the new
+                        // generation.
+                        pending_vulkan_keyframe_requests.push((sid as u32, work.cid));
+                        continue;
+                    }
                 }
 
                 // Fast path: this client owns a compositor-resident
@@ -3934,18 +3988,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                     continue;
                 }
 
-                // The picture has not changed.  Normally that means there is
-                // nothing to send — but the frame the client is looking at
-                // was encoded at whatever quantizer the controller had
-                // backed off to, and it is about to stay on screen. If the
-                // step above bought an improvement, re-send the same frame
-                // at the better rate; otherwise there is nothing to gain.
-                let still_refresh = unchanged && step.quantizer.is_some();
-                if unchanged && !still_refresh {
-                    client.skip_same_gen_count = client.skip_same_gen_count.saturating_add(1);
-                    continue;
-                }
-
                 let pixels: blit_compositor::PixelData = {
                     let cs = sess.compositor.as_ref().unwrap();
                     match cs.last_pixels.get(&(sid, px_w, px_h)) {
@@ -3986,7 +4028,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                     continue;
                 }
 
-                let has_vulkan_enc = client.vulkan_video_surfaces.contains_key(&sid);
                 let needs_new_encoder = if has_vulkan_enc {
                     false
                 } else {
@@ -11892,6 +11933,38 @@ mod tests {
             true,
         );
         assert_eq!(step.quantizer, None, "held until the queue drains");
+    }
+
+    #[test]
+    fn a_vulkan_still_is_judged_on_its_own_generation_stream() {
+        // A client on a compositor-resident encoder is fed bitstreams, not
+        // the pixel snapshot, and the two carry independent generations.
+        // Comparing against the wrong one leaves `unchanged` permanently
+        // false, so the picture it is left staring at is never refined.
+        let mut encoded: HashMap<(u16, u64), u64> = HashMap::new();
+        encoded.insert((5, 77), 42);
+
+        let latest = |has_vulkan: bool, px_gen: u64| -> u64 {
+            if has_vulkan {
+                encoded.get(&(5, 77)).copied().unwrap_or(u64::MAX)
+            } else {
+                px_gen
+            }
+        };
+
+        // The pixel stream has moved on past the bitstream this client holds;
+        // that says nothing about whether its picture changed.
+        assert_eq!(latest(true, 99), 42);
+        assert_eq!(latest(false, 99), 99);
+        // A session with nothing produced yet must never read as "still":
+        // there is no picture on screen to refine.
+        assert_eq!(
+            HashMap::<(u16, u64), u64>::new()
+                .get(&(5, 77))
+                .copied()
+                .unwrap_or(u64::MAX),
+            u64::MAX,
+        );
     }
 
     #[test]

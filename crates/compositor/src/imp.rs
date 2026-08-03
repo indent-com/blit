@@ -10,7 +10,7 @@ use crate::pointer_focus::{
     ButtonRouting, button_routing, focus_transition, keyboard_focus_after_popup_close,
 };
 use crate::positioner::PositionerGeometry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1207,7 +1207,14 @@ struct Compositor {
     /// commit's GPU submit hasn't completed yet, so the work is
     /// deferred here and drained in the main loop after
     /// `try_retire_pending` clears `pending_submit`.
-    pending_recomposite_toplevels: HashSet<u16>,
+    /// Toplevels awaiting a deferred recomposite, and whether the request
+    /// was for the encoders only.  An encoder-only recomposite re-runs the
+    /// GPU pipeline over unchanged content — the pixels are identical to
+    /// what the server already has, so publishing them again would only
+    /// burn a generation and make every other viewer re-encode the frame it
+    /// is already showing.  A content request (`false`) wins over an
+    /// encoder-only one for the same toplevel.
+    pending_recomposite_toplevels: HashMap<u16, bool>,
     focused_surface_id: u16,
     /// The wl_surface ObjectId the pointer is currently over (None = none).
     pointer_entered_id: Option<ObjectId>,
@@ -1719,7 +1726,7 @@ impl Compositor {
             }
         };
 
-        self.composite_toplevel_into_pending(&root_id, toplevel_sid);
+        self.composite_toplevel_into_pending(&root_id, toplevel_sid, false);
 
         // Compositing is done — the VulkanRenderer holds its own dup'd
         // fd reference to the DMA-BUF via the persistent texture cache.
@@ -1802,7 +1809,12 @@ impl Compositor {
     /// from the most-recent surface state — without it, an idle wayland
     /// client never produces pixels at the new target size and the
     /// per-client encoder skips forever, wedging the surface).
-    fn composite_toplevel_into_pending(&mut self, root_id: &ObjectId, toplevel_sid: u16) {
+    fn composite_toplevel_into_pending(
+        &mut self,
+        root_id: &ObjectId,
+        toplevel_sid: u16,
+        encoder_only: bool,
+    ) {
         // Composite at the output scale so HiDPI clients are rendered
         // at full resolution.  Use the browser's requested size as the
         // target so the frame fits the canvas without letterboxing.
@@ -1851,6 +1863,13 @@ impl Compositor {
 
         for (result_sid, w, h, pixels) in composited {
             if pixels.is_empty() {
+                continue;
+            }
+            // The bitstreams this render produced are already collected.
+            // The pixels are identical to what the server last saw, so
+            // publishing them would only burn a generation and make every
+            // other viewer re-encode the frame it is already showing.
+            if encoder_only {
                 continue;
             }
             let kind = match &pixels {
@@ -2938,7 +2957,8 @@ impl Compositor {
                 // submit's fence is still pending would early-return
                 // and skip the new submit entirely.
                 if installed && self.toplevel_surface_ids.contains_key(&(surface_id as u16)) {
-                    self.pending_recomposite_toplevels.insert(surface_id as u16);
+                    self.pending_recomposite_toplevels
+                        .insert(surface_id as u16, false);
                 }
             }
             CompositorCommand::RegisterDownscaleTarget {
@@ -2952,7 +2972,8 @@ impl Compositor {
                 // See the SetExternalOutputBuffers handler above for
                 // why we re-composite here.
                 if self.toplevel_surface_ids.contains_key(&(surface_id as u16)) {
-                    self.pending_recomposite_toplevels.insert(surface_id as u16);
+                    self.pending_recomposite_toplevels
+                        .insert(surface_id as u16, false);
                 }
             }
             CompositorCommand::ClearDownscaleTarget {
@@ -3024,6 +3045,19 @@ impl Compositor {
             } => {
                 if let Some(ref mut vk) = self.vulkan_renderer {
                     vk.request_encoder_keyframe(surface_id, client_id);
+                }
+                // The latch is consumed by the next encode, and encodes only
+                // happen when this toplevel is composited.  A surface whose
+                // app has stopped painting would never composite again, so
+                // the keyframe — and any quantizer change staged with it —
+                // would wait forever.  Queue a recomposite; the drain runs it
+                // once the GPU pipeline is idle.  Encoder-only: the content
+                // is unchanged, so republishing the pixels would just make
+                // every other viewer re-encode the frame it already has.
+                if self.toplevel_surface_ids.contains_key(&(surface_id as u16)) {
+                    self.pending_recomposite_toplevels
+                        .entry(surface_id as u16)
+                        .or_insert(true);
                 }
             }
             CompositorCommand::DestroyVulkanEncoder {
@@ -5939,7 +5973,7 @@ fn run_compositor(
         pending_commits: HashMap::new(),
         pending_encoded: Vec::new(),
         pending_native_sizes: HashMap::new(),
-        pending_recomposite_toplevels: HashSet::new(),
+        pending_recomposite_toplevels: HashMap::new(),
         focused_surface_id: 0,
         pointer_entered_id: None,
         pointer_entered_local: (0.0, 0.0),
@@ -6097,11 +6131,12 @@ fn run_compositor(
             .as_ref()
             .is_some_and(|vk| !vk.has_pending());
         if can_recomposite
-            && let Some(&sid) = compositor.pending_recomposite_toplevels.iter().next()
+            && let Some((&sid, &encoder_only)) =
+                compositor.pending_recomposite_toplevels.iter().next()
         {
             compositor.pending_recomposite_toplevels.remove(&sid);
             if let Some(root_id) = compositor.toplevel_surface_ids.get(&sid).cloned() {
-                compositor.composite_toplevel_into_pending(&root_id, sid);
+                compositor.composite_toplevel_into_pending(&root_id, sid, encoder_only);
                 // Wake the loop so the retire path runs again
                 // promptly — without an explicit wakeup the loop
                 // would idle on its 1s dispatch timeout instead of

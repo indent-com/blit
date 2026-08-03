@@ -225,8 +225,13 @@ has been unchanged for 400 ms the server re-sends it as a keyframe at a
 better quantizer, halving the remaining distance to the ceiling each step
 until it gets there. Motion or transport backpressure abandons the sequence
 immediately — it is only ever spending bits the link is not otherwise using.
-Vulkan Video is the exception: its encoder only runs when the compositor
-composites, which an unchanged surface does not trigger.
+
+Vulkan Video refines too. Its encoder only runs when the compositor
+composites, which an unchanged surface does not trigger, so a keyframe
+request queues an encoder-only recomposite: the GPU pipeline re-runs and the
+new bitstream is published, but the identical pixels are not. Republishing
+them would burn a generation and make every other viewer of the surface
+re-encode the frame it is already showing.
 
 `BLIT_SURFACE_SPEED`: `slow`, `medium`, `fast`, `realtime` (default), or a raw
 `10`–`255` (10 = slowest, 255 = fastest). Controls how much encoder time a
