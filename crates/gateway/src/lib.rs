@@ -403,6 +403,11 @@ type AppState = Arc<Config>;
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
+/// Upstream data frames the mux writer may hold for one browser before the
+/// upstream readers stall.  Deep enough to absorb a jittery WebSocket write,
+/// shallow enough that the blit server feels the backpressure.
+const MUX_DATA_QUEUE_FRAMES: usize = 8;
+
 async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await.ok()?;
@@ -940,10 +945,16 @@ async fn handle_mux_ws(mut ws: WebSocket, state: AppState, auth_peer: String) {
 
     let (ws_tx, mut ws_rx) = ws.split();
 
-    // All upstream reader tasks feed frames into this channel; the writer
-    // task drains it into ws_tx.  Each frame is already prefixed with the
-    // 2-byte channel ID.
+    // Mux control frames (OPENED / CLOSED / errors) go on their own
+    // unbounded channel so they are never delayed behind bulk data.
     let (merge_tx, merge_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    // Upstream data frames go on a BOUNDED channel: a browser that cannot
+    // keep up must stop the upstream reader, which fills the upstream
+    // socket and lets the blit server see its own writes block.  With an
+    // unbounded queue here the server's outbox always looks empty, its
+    // only congestion signal never fires, and the backlog grows in this
+    // process instead.
+    let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MUX_DATA_QUEUE_FRAMES);
 
     let mut channels: HashMap<u16, MuxChannelState> = HashMap::new();
     let shutdown = state.shutdown.clone();
@@ -964,7 +975,14 @@ async fn handle_mux_ws(mut ws: WebSocket, state: AppState, auth_peer: String) {
     let mut writer_task = tokio::spawn(async move {
         let mut ws_tx = ws_tx;
         let mut merge_rx = merge_rx;
-        while let Some(data) = merge_rx.recv().await {
+        let mut data_rx = data_rx;
+        loop {
+            let data = tokio::select! {
+                biased;
+                ctrl = merge_rx.recv() => ctrl,
+                data = data_rx.recv() => data,
+            };
+            let Some(data) = data else { break };
             if ws_tx.send(Message::Binary(data.into())).await.is_err() {
                 break;
             }
@@ -1027,9 +1045,10 @@ async fn handle_mux_ws(mut ws: WebSocket, state: AppState, auth_peer: String) {
 
                                     let open_state = state.clone();
                                     let open_merge_tx = merge_tx.clone();
+                                    let open_data_tx = data_tx.clone();
                                     let abort = open_tasks.spawn(async move {
                                         let ch = mux_open_channel(
-                                            open_ch, name, open_state, open_merge_tx,
+                                            open_ch, name, open_state, open_merge_tx, open_data_tx,
                                         ).await;
                                         (open_ch, ch)
                                     });
@@ -1101,6 +1120,7 @@ async fn mux_open_channel(
     name: String,
     state: AppState,
     merge_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> Option<MuxChannelState> {
     let connector = match state.connector_for(&name) {
         Some(c) => c,
@@ -1145,26 +1165,35 @@ async fn mux_open_channel(
     let _ = merge_tx.send(mux_control(MUX_S2C_OPENED, ch_id));
 
     // Reader task: reads length-prefixed frames from the upstream socket,
-    // prepends the channel ID, and feeds them into the merge queue.
-    let reader_merge_tx = merge_tx.clone();
+    // prepends the channel ID, and feeds them into the bounded data queue.
+    // `send().await` here is the whole point: when the browser stops
+    // draining, this stops reading and the upstream socket applies real
+    // backpressure to the blit server.
     let reader_task = tokio::spawn(async move {
         let mut r = sock_reader;
         while let Some(data) = read_frame(&mut r).await {
             let mut frame = Vec::with_capacity(2 + data.len());
             frame.extend_from_slice(&ch_id.to_le_bytes());
             frame.extend_from_slice(&data);
-            if reader_merge_tx.send(frame).is_err() {
+            if data_tx.send(frame).await.is_err() {
                 break;
             }
         }
         // Upstream EOF — inject S2C_QUIT as a data frame so the browser's
         // BlitConnection can immediately clear its session state, then send
         // the mux-level CLOSED control frame.
+        //
+        // Both go through the data queue, not the control one: they are the
+        // tail of this channel's byte stream, and the writer serves control
+        // first.  Sent out of band they would overtake whatever payload is
+        // still queued behind a backpressured browser, and the browser would
+        // tear the channel down on top of its own last frames.
         let mut quit_frame = Vec::with_capacity(3);
         quit_frame.extend_from_slice(&ch_id.to_le_bytes());
         quit_frame.push(S2C_QUIT);
-        let _ = reader_merge_tx.send(quit_frame);
-        let _ = reader_merge_tx.send(mux_control(MUX_S2C_CLOSED, ch_id));
+        if data_tx.send(quit_frame).await.is_ok() {
+            let _ = data_tx.send(mux_control(MUX_S2C_CLOSED, ch_id)).await;
+        }
     });
 
     eprintln!("mux: channel {ch_id} opened for '{name}'");
@@ -1595,6 +1624,7 @@ async fn handle_mux_wt(
     eprintln!("mux-wt client authenticated");
 
     let (merge_tx, merge_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MUX_DATA_QUEUE_FRAMES);
     let mut channels: HashMap<u16, MuxChannelState> = HashMap::new();
     let shutdown = state.shutdown.clone();
 
@@ -1632,7 +1662,14 @@ async fn handle_mux_wt(
     let mut writer_task = tokio::spawn(async move {
         let mut send = send;
         let mut merge_rx = merge_rx;
-        while let Some(data) = merge_rx.recv().await {
+        let mut data_rx = data_rx;
+        loop {
+            let data = tokio::select! {
+                biased;
+                ctrl = merge_rx.recv() => ctrl,
+                data = data_rx.recv() => data,
+            };
+            let Some(data) = data else { break };
             let mut frame = Vec::with_capacity(4 + data.len());
             frame.extend_from_slice(&(data.len() as u32).to_le_bytes());
             frame.extend_from_slice(&data);
@@ -1687,9 +1724,10 @@ async fn handle_mux_wt(
 
                             let open_state = state.clone();
                             let open_merge_tx = merge_tx.clone();
+                            let open_data_tx = data_tx.clone();
                             let abort = open_tasks.spawn(async move {
                                 let ch = mux_open_channel(
-                                    open_ch, name, open_state, open_merge_tx,
+                                    open_ch, name, open_state, open_merge_tx, open_data_tx,
                                 ).await;
                                 (open_ch, ch)
                             });

@@ -452,6 +452,23 @@ impl VulkanVideoEncoder {
         self.force_idr = true;
     }
 
+    /// Retarget the constant quantizer from the next frame onwards.
+    ///
+    /// Both codecs read `self.qp` per frame — H.264 through the slice's
+    /// `constant_qp`, AV1 through `base_q_idx` — so no session rebuild is
+    /// needed.  H.264's PPS keeps its original `pic_init_qp_minus26`, which
+    /// is harmless because every slice carries an explicit QP.
+    #[allow(dead_code)]
+    pub(crate) fn set_qp(&mut self, qp: u8) {
+        self.qp = qp;
+    }
+
+    /// The quantizer currently in effect.
+    #[allow(dead_code)]
+    pub(crate) fn qp(&self) -> u8 {
+        self.qp
+    }
+
     /// Codec flag matching `SURFACE_FRAME_CODEC_*` constants.
     /// H.264 = 0x00, AV1 = 0x02.
     pub(crate) fn codec_flag(&self) -> u8 {

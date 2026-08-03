@@ -304,13 +304,21 @@ export const CODEC_SUPPORT_AV1 = 1 << 1;
 export const CODEC_SUPPORT_H264_444 = 1 << 2;
 export const CODEC_SUPPORT_AV1_444 = 1 << 3;
 
-/** Quality values for C2S_SURFACE_SUBSCRIBE. 0 = server default.
+/** Bandwidth values for C2S_SURFACE_SUBSCRIBE. 0 = server default.
  *  10–255 = custom AV1 quantizer (wire value IS the quantizer). */
-export const SURFACE_QUALITY_DEFAULT = 0;
-export const SURFACE_QUALITY_LOW = 1;
-export const SURFACE_QUALITY_MEDIUM = 2;
-export const SURFACE_QUALITY_HIGH = 3;
-export const SURFACE_QUALITY_ULTRA = 4;
+export const SURFACE_BANDWIDTH_DEFAULT = 0;
+export const SURFACE_BANDWIDTH_LOW = 1;
+export const SURFACE_BANDWIDTH_MEDIUM = 2;
+export const SURFACE_BANDWIDTH_HIGH = 3;
+export const SURFACE_BANDWIDTH_ULTRA = 4;
+
+/** Encoder speed values for C2S_SURFACE_SUBSCRIBE. 0 = server default.
+ *  10–255 = custom (10 = slowest/best compression, 255 = fastest). */
+export const SURFACE_SPEED_DEFAULT = 0;
+export const SURFACE_SPEED_SLOW = 1;
+export const SURFACE_SPEED_MEDIUM = 2;
+export const SURFACE_SPEED_FAST = 3;
+export const SURFACE_SPEED_REALTIME = 4;
 
 export const PROTOCOL_VERSION = 1;
 export const FEATURE_CREATE_NONCE = 1 << 0;

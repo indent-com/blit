@@ -466,27 +466,32 @@ export function buildSurfaceCloseMessage(surfaceId: number): Uint8Array {
 }
 
 /**
- * Build a surface subscribe message with optional codec/quality overrides.
+ * Build a surface subscribe message with optional codec, bandwidth and
+ * speed overrides.
  *
  * @param codecSupport - CODEC_SUPPORT_* bitmask (0 = use connection default from sendClientFeatures)
- * @param quality - SURFACE_QUALITY_* constant (0 = use server default)
+ * @param bandwidth - SURFACE_BANDWIDTH_* constant (0 = use server default)
+ * @param speed - SURFACE_SPEED_* constant (0 = use server default)
  */
 export function buildSurfaceSubscribeMessage(
   surfaceId: number,
   codecSupport?: number,
-  quality?: number,
+  bandwidth?: number,
+  speed?: number,
 ): Uint8Array {
   const cs = (codecSupport ?? 0) & 0xff;
-  const q = (quality ?? 0) & 0xff;
-  const hasExtended = cs !== 0 || q !== 0;
-  const len = hasExtended ? 5 : 3;
+  const bw = (bandwidth ?? 0) & 0xff;
+  const sp = (speed ?? 0) & 0xff;
+  const hasExtended = cs !== 0 || bw !== 0 || sp !== 0;
+  const len = hasExtended ? 6 : 3;
   const msg = new Uint8Array(len);
   msg[0] = C2S_SURFACE_SUBSCRIBE;
   msg[1] = surfaceId & 0xff;
   msg[2] = (surfaceId >> 8) & 0xff;
   if (hasExtended) {
     msg[3] = cs;
-    msg[4] = q;
+    msg[4] = bw;
+    msg[5] = sp;
   }
   return msg;
 }

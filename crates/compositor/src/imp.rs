@@ -10,7 +10,7 @@ use crate::pointer_focus::{
     ButtonRouting, button_routing, focus_transition, keyboard_focus_after_popup_close,
 };
 use crate::positioner::PositionerGeometry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -154,14 +154,23 @@ pub enum PixelData {
         va_display: usize,
         _fd: Arc<OwnedFd>,
     },
-    /// Pre-encoded bitstream from Vulkan Video encoder.
-    /// The compositor did render → NV12 compute → video encode in one shot.
-    Encoded {
-        data: Arc<Vec<u8>>,
-        is_keyframe: bool,
-        /// Codec flag matching SURFACE_FRAME_CODEC_* constants.
-        codec_flag: u8,
-    },
+}
+
+/// A bitstream a compositor-resident encoder produced for exactly one
+/// client.
+///
+/// Unlike `PixelData`, this is never shared between subscribers: Vulkan
+/// Video owns one encoder per `(surface_id, client_id)`, so each viewer
+/// gets its own GOP and its own quantizer.
+pub struct EncodedFrame {
+    pub surface_id: u16,
+    pub client_id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub data: Arc<Vec<u8>>,
+    pub is_keyframe: bool,
+    /// Codec flag matching `SURFACE_FRAME_CODEC_*` constants.
+    pub codec_flag: u8,
 }
 
 /// A DMA-BUF fd exported from a VA-API surface for use as a GPU
@@ -433,14 +442,13 @@ impl PixelData {
                 }
                 rgba
             }
-            PixelData::VaSurface { .. } | PixelData::Encoded { .. } => Vec::new(),
+            PixelData::VaSurface { .. } => Vec::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         match self {
             PixelData::Bgra(v) | PixelData::Rgba(v) => v.is_empty(),
-            PixelData::Encoded { data, .. } => data.is_empty(),
             PixelData::Nv12 { data, .. } => data.is_empty(),
             PixelData::DmaBuf { .. }
             | PixelData::VaSurface { .. }
@@ -491,6 +499,18 @@ pub enum CompositorEvent {
         /// stamp surface frames with the source's presentation timing
         /// rather than the (jittery) encode-delivery wall clock.
         timestamp_ms: u32,
+    },
+    /// A compositor-resident encoder produced a bitstream for one client.
+    /// Carries its own timestamp for the same reason `SurfaceCommit` does.
+    SurfaceEncoded {
+        frame: EncodedFrame,
+        timestamp_ms: u32,
+    },
+    /// No Vulkan Video encoder could be created for this `(surface,
+    /// client)` pair, so the server must encode for that client itself.
+    VulkanEncoderUnavailable {
+        surface_id: u16,
+        client_id: u64,
     },
     SurfaceTitle {
         surface_id: u16,
@@ -614,21 +634,31 @@ pub enum CompositorCommand {
     SetRefreshRate {
         mhz: u32,
     },
-    /// Set up a Vulkan Video encoder for a surface.
+    /// Set up a Vulkan Video encoder for one `(surface, client)` pair.
     SetVulkanEncoder {
         surface_id: u32,
+        client_id: u64,
         codec: u8,
         qp: u8,
         width: u32,
         height: u32,
     },
-    /// Request a keyframe from the Vulkan Video encoder for a surface.
+    /// Retarget one client's encoder quantizer without rebuilding it.
+    SetVulkanEncoderQp {
+        surface_id: u32,
+        client_id: u64,
+        qp: u8,
+    },
+    /// Request a keyframe from one client's Vulkan Video encoder.
     RequestVulkanKeyframe {
         surface_id: u32,
+        client_id: u64,
     },
-    /// Destroy the Vulkan Video encoder for a surface.
+    /// Destroy Vulkan Video encoders for a surface: one client's when
+    /// `client_id` is `Some`, every client's when it is `None`.
     DestroyVulkanEncoder {
         surface_id: u32,
+        client_id: Option<u64>,
     },
     Shutdown,
 }
@@ -1156,6 +1186,10 @@ struct Compositor {
     /// one `SurfaceCommit` per target.  Value is `(log_w, log_h, pixels)`
     /// where the logicals are derived from the per-target physical size.
     pending_commits: HashMap<(u16, u32, u32), (u32, u32, PixelData)>,
+    /// Bitstreams from compositor-resident encoders awaiting the next
+    /// flush.  Kept apart from `pending_commits` because these are owned
+    /// by one client each and must never be coalesced by target size.
+    pending_encoded: Vec<EncodedFrame>,
     /// Latest composited (native) size per surface, used to gate
     /// `SurfaceResized` events.  The renderer emits one frame per
     /// per-client encoder target (downscaled), but `SurfaceResized`
@@ -1173,7 +1207,14 @@ struct Compositor {
     /// commit's GPU submit hasn't completed yet, so the work is
     /// deferred here and drained in the main loop after
     /// `try_retire_pending` clears `pending_submit`.
-    pending_recomposite_toplevels: HashSet<u16>,
+    /// Toplevels awaiting a deferred recomposite, and whether the request
+    /// was for the encoders only.  An encoder-only recomposite re-runs the
+    /// GPU pipeline over unchanged content — the pixels are identical to
+    /// what the server already has, so publishing them again would only
+    /// burn a generation and make every other viewer re-encode the frame it
+    /// is already showing.  A content request (`false`) wins over an
+    /// encoder-only one for the same toplevel.
+    pending_recomposite_toplevels: HashMap<u16, bool>,
     focused_surface_id: u16,
     /// The wl_surface ObjectId the pointer is currently over (None = none).
     pointer_entered_id: Option<ObjectId>,
@@ -1518,6 +1559,15 @@ impl Compositor {
                 timestamp_ms: now_ms,
             });
         }
+        // Emitted after the commits so a client that owns a compositor
+        // encoder sees its bitstream no earlier than the raw frame it was
+        // built from.
+        for frame in self.pending_encoded.drain(..) {
+            let _ = self.event_tx.send(CompositorEvent::SurfaceEncoded {
+                frame,
+                timestamp_ms: now_ms,
+            });
+        }
         (self.event_notify)();
     }
 
@@ -1676,7 +1726,7 @@ impl Compositor {
             }
         };
 
-        self.composite_toplevel_into_pending(&root_id, toplevel_sid);
+        self.composite_toplevel_into_pending(&root_id, toplevel_sid, false);
 
         // Compositing is done — the VulkanRenderer holds its own dup'd
         // fd reference to the DMA-BUF via the persistent texture cache.
@@ -1759,7 +1809,12 @@ impl Compositor {
     /// from the most-recent surface state — without it, an idle wayland
     /// client never produces pixels at the new target size and the
     /// per-client encoder skips forever, wedging the surface).
-    fn composite_toplevel_into_pending(&mut self, root_id: &ObjectId, toplevel_sid: u16) {
+    fn composite_toplevel_into_pending(
+        &mut self,
+        root_id: &ObjectId,
+        toplevel_sid: u16,
+        encoder_only: bool,
+    ) {
         // Composite at the output scale so HiDPI clients are rendered
         // at full resolution.  Use the browser's requested size as the
         // target so the frame fits the canvas without letterboxing.
@@ -1770,14 +1825,16 @@ impl Compositor {
             (pw, ph)
         });
         let composited = if let Some(ref mut vk) = self.vulkan_renderer {
-            vk.render_tree_sized(
+            let composited = vk.render_tree_sized(
                 root_id,
                 &self.surfaces,
                 &self.surface_meta,
                 s120,
                 target_phys,
                 toplevel_sid,
-            )
+            );
+            self.pending_encoded.extend(vk.take_encoded_frames());
+            composited
         } else {
             Vec::new()
         };
@@ -1808,13 +1865,19 @@ impl Compositor {
             if pixels.is_empty() {
                 continue;
             }
+            // The bitstreams this render produced are already collected.
+            // The pixels are identical to what the server last saw, so
+            // publishing them would only burn a generation and make every
+            // other viewer re-encode the frame it is already showing.
+            if encoder_only {
+                continue;
+            }
             let kind = match &pixels {
                 PixelData::Bgra(_) => "bgra",
                 PixelData::Rgba(_) => "rgba",
                 PixelData::Nv12 { .. } => "nv12",
                 PixelData::VaSurface { .. } => "va-surface",
                 PixelData::Nv12DmaBuf { .. } => "nv12-dmabuf",
-                PixelData::Encoded { .. } => "vulkan-encoded",
                 PixelData::DmaBuf { fd, .. } => {
                     use std::os::fd::AsRawFd;
                     let raw = fd.as_raw_fd();
@@ -2806,20 +2869,27 @@ impl Compositor {
                         // returns 0..1 results — pick the first (or
                         // None if the render failed to produce
                         // anything).
-                        vk.render_tree_sized(
-                            root_id,
-                            &self.surfaces,
-                            &self.surface_meta,
-                            cap_s120,
-                            None,
-                            surface_id,
-                        )
-                        .into_iter()
-                        .next()
-                        .map(|(_sid, w, h, pixels)| {
-                            let rgba = pixels.to_rgba(w, h);
-                            (w, h, rgba)
-                        })
+                        let captured = vk
+                            .render_tree_sized(
+                                root_id,
+                                &self.surfaces,
+                                &self.surface_meta,
+                                cap_s120,
+                                None,
+                                surface_id,
+                            )
+                            .into_iter()
+                            .next()
+                            .map(|(_sid, w, h, pixels)| {
+                                let rgba = pixels.to_rgba(w, h);
+                                (w, h, rgba)
+                            });
+                        // Capture registers no external targets, so this is
+                        // normally empty; drain anyway so a stray bitstream
+                        // can't leak into the next flush.
+                        let stray = vk.take_encoded_frames();
+                        debug_assert!(stray.is_empty());
+                        captured
                     } else {
                         None
                     }
@@ -2887,7 +2957,8 @@ impl Compositor {
                 // submit's fence is still pending would early-return
                 // and skip the new submit entirely.
                 if installed && self.toplevel_surface_ids.contains_key(&(surface_id as u16)) {
-                    self.pending_recomposite_toplevels.insert(surface_id as u16);
+                    self.pending_recomposite_toplevels
+                        .insert(surface_id as u16, false);
                 }
             }
             CompositorCommand::RegisterDownscaleTarget {
@@ -2901,7 +2972,8 @@ impl Compositor {
                 // See the SetExternalOutputBuffers handler above for
                 // why we re-composite here.
                 if self.toplevel_surface_ids.contains_key(&(surface_id as u16)) {
-                    self.pending_recomposite_toplevels.insert(surface_id as u16);
+                    self.pending_recomposite_toplevels
+                        .insert(surface_id as u16, false);
                 }
             }
             CompositorCommand::ClearDownscaleTarget {
@@ -2939,23 +3011,61 @@ impl Compositor {
             }
             CompositorCommand::SetVulkanEncoder {
                 surface_id,
+                client_id,
                 codec,
                 qp,
                 width,
                 height,
             } => {
-                if let Some(ref mut vk) = self.vulkan_renderer {
-                    vk.create_vulkan_encoder(surface_id, codec, qp, width, height);
+                let created = self.vulkan_renderer.as_mut().is_some_and(|vk| {
+                    vk.create_vulkan_encoder(surface_id, client_id, codec, qp, width, height)
+                });
+                if !created {
+                    let _ = self
+                        .event_tx
+                        .send(CompositorEvent::VulkanEncoderUnavailable {
+                            surface_id: surface_id as u16,
+                            client_id,
+                        });
+                    (self.event_notify)();
                 }
             }
-            CompositorCommand::RequestVulkanKeyframe { surface_id } => {
+            CompositorCommand::SetVulkanEncoderQp {
+                surface_id,
+                client_id,
+                qp,
+            } => {
                 if let Some(ref mut vk) = self.vulkan_renderer {
-                    vk.request_encoder_keyframe(surface_id);
+                    vk.set_vulkan_encoder_qp(surface_id, client_id, qp);
                 }
             }
-            CompositorCommand::DestroyVulkanEncoder { surface_id } => {
+            CompositorCommand::RequestVulkanKeyframe {
+                surface_id,
+                client_id,
+            } => {
                 if let Some(ref mut vk) = self.vulkan_renderer {
-                    vk.destroy_vulkan_encoder(surface_id);
+                    vk.request_encoder_keyframe(surface_id, client_id);
+                }
+                // The latch is consumed by the next encode, and encodes only
+                // happen when this toplevel is composited.  A surface whose
+                // app has stopped painting would never composite again, so
+                // the keyframe — and any quantizer change staged with it —
+                // would wait forever.  Queue a recomposite; the drain runs it
+                // once the GPU pipeline is idle.  Encoder-only: the content
+                // is unchanged, so republishing the pixels would just make
+                // every other viewer re-encode the frame it already has.
+                if self.toplevel_surface_ids.contains_key(&(surface_id as u16)) {
+                    self.pending_recomposite_toplevels
+                        .entry(surface_id as u16)
+                        .or_insert(true);
+                }
+            }
+            CompositorCommand::DestroyVulkanEncoder {
+                surface_id,
+                client_id,
+            } => {
+                if let Some(ref mut vk) = self.vulkan_renderer {
+                    vk.destroy_vulkan_encoder(surface_id, client_id);
                 }
             }
             CompositorCommand::Shutdown => {
@@ -5861,8 +5971,9 @@ fn run_compositor(
         event_notify,
         loop_signal: loop_signal.clone(),
         pending_commits: HashMap::new(),
+        pending_encoded: Vec::new(),
         pending_native_sizes: HashMap::new(),
-        pending_recomposite_toplevels: HashSet::new(),
+        pending_recomposite_toplevels: HashMap::new(),
         focused_surface_id: 0,
         pointer_entered_id: None,
         pointer_entered_local: (0.0, 0.0),
@@ -6020,11 +6131,12 @@ fn run_compositor(
             .as_ref()
             .is_some_and(|vk| !vk.has_pending());
         if can_recomposite
-            && let Some(&sid) = compositor.pending_recomposite_toplevels.iter().next()
+            && let Some((&sid, &encoder_only)) =
+                compositor.pending_recomposite_toplevels.iter().next()
         {
             compositor.pending_recomposite_toplevels.remove(&sid);
             if let Some(root_id) = compositor.toplevel_surface_ids.get(&sid).cloned() {
-                compositor.composite_toplevel_into_pending(&root_id, sid);
+                compositor.composite_toplevel_into_pending(&root_id, sid, encoder_only);
                 // Wake the loop so the retire path runs again
                 // promptly — without an explicit wakeup the loop
                 // would idle on its 1s dispatch timeout instead of
@@ -6033,7 +6145,10 @@ fn run_compositor(
             }
         }
 
-        if !compositor.pending_commits.is_empty() || !compositor.pending_native_sizes.is_empty() {
+        if !compositor.pending_commits.is_empty()
+            || !compositor.pending_encoded.is_empty()
+            || !compositor.pending_native_sizes.is_empty()
+        {
             compositor.flush_pending_commits();
         }
 

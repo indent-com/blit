@@ -41,7 +41,8 @@ import {
   TEXT_GAMMA_KEY,
   AUDIO_BITRATE_KEY,
   AUDIO_MUTED_KEY,
-  VIDEO_QUALITY_KEY,
+  VIDEO_BANDWIDTH_KEY,
+  VIDEO_SPEED_KEY,
   SURFACE_STREAMING_KEY,
   LEFT_DOCK_WIDTH_KEY,
   PREVIEW_PANEL_WIDTH_KEY,
@@ -54,7 +55,8 @@ import {
   preferredTextGamma,
   preferredAudioBitrate,
   preferredAudioMuted,
-  preferredVideoQuality,
+  preferredVideoBandwidth,
+  preferredVideoSpeed,
   preferredSurfaceStreaming,
   preferredLeftDockWidth,
   preferredPreviewPanelWidth,
@@ -495,7 +497,10 @@ function WorkspaceScreen(props: {
   const [debugPanel, setDebugPanel] = createSignal(false);
   const [audioMuted, setAudioMuted] = createSignal(preferredAudioMuted());
   const [audioBitrate, setAudioBitrate] = createSignal(preferredAudioBitrate());
-  const [videoQuality, setVideoQuality] = createSignal(preferredVideoQuality());
+  const [videoBandwidth, setVideoBandwidth] = createSignal(
+    preferredVideoBandwidth(),
+  );
+  const [videoSpeed, setVideoSpeed] = createSignal(preferredVideoSpeed());
   const [surfaceStreaming, setSurfaceStreaming] = createSignal(
     preferredSurfaceStreaming(),
   );
@@ -2100,7 +2105,8 @@ function WorkspaceScreen(props: {
   const remoteTextGamma = useConfigValue(TEXT_GAMMA_KEY);
   const remoteAudioBitrate = useConfigValue(AUDIO_BITRATE_KEY);
   const remoteAudioMuted = useConfigValue(AUDIO_MUTED_KEY);
-  const remoteVideoQuality = useConfigValue(VIDEO_QUALITY_KEY);
+  const remoteVideoBandwidth = useConfigValue(VIDEO_BANDWIDTH_KEY);
+  const remoteVideoSpeed = useConfigValue(VIDEO_SPEED_KEY);
   const remoteSurfaceStreaming = useConfigValue(SURFACE_STREAMING_KEY);
 
   createEffect(() => {
@@ -2143,10 +2149,17 @@ function WorkspaceScreen(props: {
   });
 
   createEffect(() => {
-    const s = remoteVideoQuality();
+    const s = remoteVideoBandwidth();
     if (!s) return;
     const n = parseInt(s, 10);
-    if (n >= 0 && n <= 4) setVideoQuality(n);
+    if (n >= 0 && n <= 255) setVideoBandwidth(n);
+  });
+
+  createEffect(() => {
+    const s = remoteVideoSpeed();
+    if (!s) return;
+    const n = parseInt(s, 10);
+    if (n >= 0 && n <= 255) setVideoSpeed(n);
   });
 
   createEffect(() => {
@@ -2157,13 +2170,15 @@ function WorkspaceScreen(props: {
 
   // Sync media preferences to all connections so new subscribes use them.
   createEffect(() => {
-    const q = videoQuality();
+    const bandwidth = videoBandwidth();
+    const speed = videoSpeed();
     const b = audioBitrate();
     const streaming = surfaceStreaming();
     for (const snap of allConnections()) {
       const conn = workspace.getConnection(snap.id);
       if (conn) {
-        conn.defaultSurfaceQuality = q;
+        conn.defaultSurfaceBandwidth = bandwidth;
+        conn.defaultSurfaceSpeed = speed;
         conn.defaultAudioBitrateKbps = b;
         conn.surfaceStreamingEnabled = streaming;
       }
@@ -2532,16 +2547,29 @@ function WorkspaceScreen(props: {
     }
   }
 
-  function changeVideoQuality(quality: number) {
-    setVideoQuality(quality);
-    writeStorage(VIDEO_QUALITY_KEY, String(quality));
-    // Re-subscribe all active surface subscriptions with the new quality.
+  function changeVideoBandwidth(bandwidth: number) {
+    setVideoBandwidth(bandwidth);
+    writeStorage(VIDEO_BANDWIDTH_KEY, String(bandwidth));
+    applyVideoEncoding();
+  }
+
+  function changeVideoSpeed(speed: number) {
+    setVideoSpeed(speed);
+    writeStorage(VIDEO_SPEED_KEY, String(speed));
+    applyVideoEncoding();
+  }
+
+  /** Push the current bandwidth/speed pair to every live subscription. */
+  function applyVideoEncoding() {
+    const bandwidth = videoBandwidth();
+    const speed = videoSpeed();
     for (const snap of allConnections()) {
       const conn = workspace.getConnection(snap.id);
       if (!conn) continue;
-      conn.defaultSurfaceQuality = quality;
+      conn.defaultSurfaceBandwidth = bandwidth;
+      conn.defaultSurfaceSpeed = speed;
       for (const surface of conn.surfaceStore.getSurfaces().values()) {
-        conn.sendSurfaceResubscribe(surface.surfaceId, quality);
+        conn.sendSurfaceResubscribe(surface.surfaceId, bandwidth, speed);
       }
     }
   }
@@ -4097,12 +4125,14 @@ function WorkspaceScreen(props: {
               palette={palette()}
               fontSize={fontSize()}
               audioBitrate={audioBitrate()}
-              videoQuality={videoQuality()}
+              videoBandwidth={videoBandwidth()}
+              videoSpeed={videoSpeed()}
               audioMuted={audioMuted()}
               audioAvailable={allConnections().some((c) => c.supportsAudio)}
               surfaceStreaming={surfaceStreaming()}
               onAudioBitrateChange={changeAudioBitrate}
-              onVideoQualityChange={changeVideoQuality}
+              onVideoBandwidthChange={changeVideoBandwidth}
+              onVideoSpeedChange={changeVideoSpeed}
               onSurfaceStreamingChange={changeSurfaceStreaming}
               onToggleAudio={toggleAudio}
               onResetAudio={resetAudio}

@@ -69,9 +69,6 @@ const VAEncMiscParameterTypeQualityLevel: u32 = 6;
 // the client's actual pacing rate.  The frame-rate hint helps the driver
 // pace internal stages; the actual submission rate doesn't have to match.
 const REALTIME_FPS: u32 = 60;
-/// AMD radeonsi maps quality_level to AMF preset: 0=balanced, 1-2=quality,
-/// 3-7=speed.  7 is the fastest preset.
-const REALTIME_QUALITY_LEVEL: u32 = 7;
 
 #[repr(C)]
 struct VAEncMiscParameterFrameRate {
@@ -1057,6 +1054,7 @@ pub struct VaapiDirectEncoder {
     force_idr: bool,
     cur_ref_idx: usize,
     qp: u8,
+    quality_level: u32,
     _verbose: bool,
     pub(crate) _drm_fd: OwnedFd,
     /// Optional VA-API VPP context for zero-copy DMA-BUF import.
@@ -1074,6 +1072,7 @@ impl VaapiDirectEncoder {
         height: u32,
         vaapi_device: &str,
         qp: u8,
+        quality_level: u32,
         verbose: bool,
         chroma: crate::surface_encoder::ChromaSubsampling,
     ) -> Result<Self, String> {
@@ -1254,6 +1253,7 @@ impl VaapiDirectEncoder {
             force_idr: false,
             cur_ref_idx: 0,
             qp,
+            quality_level,
             _verbose: verbose,
             vpp: unsafe {
                 VppContext::try_new(
@@ -1274,6 +1274,14 @@ impl VaapiDirectEncoder {
 
     pub fn request_keyframe(&mut self) {
         self.force_idr = true;
+    }
+
+    /// Change the constant QP applied from the next submitted frame on.
+    /// No parameter sets have to be re-sent: `pic_init_qp` stays 26 and the
+    /// per-frame slice carries `slice_qp_delta = qp - 26`, which covers the
+    /// whole legal 0–51 range.
+    pub fn set_qp(&mut self, qp: u8) {
+        self.qp = qp.min(51);
     }
 
     pub fn gbm_buffers(&self) -> &[GbmExportedBuffer] {
@@ -1469,16 +1477,16 @@ impl VaapiDirectEncoder {
 
         let mut buffers: Vec<VABufferID> = vec![sps_buf, pps_buf, slice_buf];
 
-        // Realtime tuning misc parameters.  AMD's VA-API backend defaults to
-        // its slowest preset; QualityLevel flips it to "speed" for much lower
-        // encode latency.  FrameRate hints the driver's internal pacing.
+        // AMD's VA-API backend defaults to its slowest preset; QualityLevel
+        // carries the client's speed choice (7 = fastest).  FrameRate hints
+        // the driver's internal pacing.
         if let Some(b) = create_misc_param_buffer(
             self.va,
             self.display,
             self.context,
             VAEncMiscParameterTypeQualityLevel,
             VAEncMiscParameterBufferQualityLevel {
-                quality_level: REALTIME_QUALITY_LEVEL,
+                quality_level: self.quality_level,
                 va_reserved: [0; 4],
             },
         ) {
@@ -2190,6 +2198,7 @@ pub struct VaapiAv1Encoder {
     force_idr: bool,
     cur_ref_idx: usize,
     base_qindex: u8,
+    quality_level: u32,
     chroma: crate::surface_encoder::ChromaSubsampling,
     _verbose: bool,
     pub(crate) _drm_fd: OwnedFd,
@@ -2211,6 +2220,7 @@ impl VaapiAv1Encoder {
         source_height: u32,
         vaapi_device: &str,
         base_qindex: u8,
+        quality_level: u32,
         verbose: bool,
         chroma: crate::surface_encoder::ChromaSubsampling,
     ) -> Result<Self, String> {
@@ -2401,6 +2411,7 @@ impl VaapiAv1Encoder {
             force_idr: false,
             cur_ref_idx: 0,
             base_qindex,
+            quality_level,
             chroma,
             _verbose: verbose,
             _drm_fd: drm_fd,
@@ -2441,6 +2452,13 @@ impl VaapiAv1Encoder {
 
     pub fn request_keyframe(&mut self) {
         self.force_idr = true;
+    }
+
+    /// Change `base_q_idx` from the next submitted frame on.  The frame
+    /// header OBU (and the loop-filter strengths derived from the qindex)
+    /// is rebuilt every frame, so nothing stale survives the change.
+    pub fn set_base_qindex(&mut self, base_qindex: u8) {
+        self.base_qindex = base_qindex;
     }
 
     /// Get or create a cached derived image for the input surface.
@@ -2786,6 +2804,18 @@ impl VaapiAv1Encoder {
         buffer_ids.extend(self.create_av1_packed_buffers(&frame_obu)?);
         buffer_ids.push(self.create_buffer(VAEncPictureParameterBufferType, &pic_param)?);
         buffer_ids.push(self.create_buffer(VAEncSliceParameterBufferType, &tile_group)?);
+        if let Some(b) = create_misc_param_buffer(
+            self.va,
+            self.display,
+            self.context,
+            VAEncMiscParameterTypeQualityLevel,
+            VAEncMiscParameterBufferQualityLevel {
+                quality_level: self.quality_level,
+                va_reserved: [0; 4],
+            },
+        ) {
+            buffer_ids.push(b);
+        }
 
         let st = unsafe { (self.va.vaBeginPicture)(self.display, self.context, input_surface) };
         if st != VA_STATUS_SUCCESS {

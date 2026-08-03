@@ -63,11 +63,18 @@ mod stub {
             va_display: usize,
             _fd: Arc<OwnedFd>,
         },
-        Encoded {
-            data: Arc<Vec<u8>>,
-            is_keyframe: bool,
-            codec_flag: u8,
-        },
+    }
+
+    /// A bitstream a compositor-resident encoder produced for exactly one
+    /// client.  Owned per `(surface_id, client_id)`, never shared.
+    pub struct EncodedFrame {
+        pub surface_id: u16,
+        pub client_id: u64,
+        pub width: u32,
+        pub height: u32,
+        pub data: Arc<Vec<u8>>,
+        pub is_keyframe: bool,
+        pub codec_flag: u8,
     }
 
     impl PixelData {
@@ -92,7 +99,6 @@ mod stub {
                 PixelData::DmaBuf { .. }
                 | PixelData::VaSurface { .. }
                 | PixelData::Nv12DmaBuf { .. } => false,
-                PixelData::Encoded { data, .. } => data.is_empty(),
             }
         }
 
@@ -136,6 +142,14 @@ mod stub {
             height: u32,
             pixels: PixelData,
             timestamp_ms: u32,
+        },
+        SurfaceEncoded {
+            frame: EncodedFrame,
+            timestamp_ms: u32,
+        },
+        VulkanEncoderUnavailable {
+            surface_id: u16,
+            client_id: u64,
         },
         SurfaceTitle {
             surface_id: u16,
@@ -249,21 +263,31 @@ mod stub {
         SetRefreshRate {
             mhz: u32,
         },
-        /// Set up a Vulkan Video encoder for a surface.
+        /// Set up a Vulkan Video encoder for one `(surface, client)` pair.
         SetVulkanEncoder {
             surface_id: u32,
+            client_id: u64,
             codec: u8,
             qp: u8,
             width: u32,
             height: u32,
         },
-        /// Request a keyframe from the Vulkan Video encoder for a surface.
+        /// Retarget one client's encoder quantizer without rebuilding it.
+        SetVulkanEncoderQp {
+            surface_id: u32,
+            client_id: u64,
+            qp: u8,
+        },
+        /// Request a keyframe from one client's Vulkan Video encoder.
         RequestVulkanKeyframe {
             surface_id: u32,
+            client_id: u64,
         },
-        /// Destroy the Vulkan Video encoder for a surface.
+        /// Destroy Vulkan Video encoders for a surface: one client's when
+        /// `client_id` is `Some`, every client's when it is `None`.
         DestroyVulkanEncoder {
             surface_id: u32,
+            client_id: Option<u64>,
         },
         Shutdown,
     }

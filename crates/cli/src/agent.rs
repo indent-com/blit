@@ -974,7 +974,7 @@ pub async fn cmd_record(
             mask
         };
         if codec_support != 0 {
-            conn.send(&msg_surface_subscribe_ext(id, codec_support, 0))
+            conn.send(&msg_surface_subscribe_ext(id, codec_support, 0, 0))
                 .await?;
         } else {
             conn.send(&msg_surface_subscribe(id)).await?;

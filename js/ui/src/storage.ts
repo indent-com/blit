@@ -209,7 +209,8 @@ export const TEXT_GAMMA_KEY = "blit.textGamma";
 export const TARGET_KEY = "blit.target";
 export const AUDIO_BITRATE_KEY = "blit.audioBitrate";
 export const AUDIO_MUTED_KEY = "blit.audioMuted";
-export const VIDEO_QUALITY_KEY = "blit.videoQuality";
+export const VIDEO_BANDWIDTH_KEY = "blit.videoBandwidth";
+export const VIDEO_SPEED_KEY = "blit.videoSpeed";
 export const SURFACE_STREAMING_KEY = "blit.surfaceStreaming";
 // Panel widths are UI-local (not synced to blit.conf), so they stay out of
 // PERSISTED_KEYS below and round-trip through localStorage only.
@@ -233,7 +234,8 @@ const PERSISTED_KEYS = new Set([
   TARGET_KEY,
   AUDIO_BITRATE_KEY,
   AUDIO_MUTED_KEY,
-  VIDEO_QUALITY_KEY,
+  VIDEO_BANDWIDTH_KEY,
+  VIDEO_SPEED_KEY,
   SURFACE_STREAMING_KEY,
 ]);
 
@@ -556,16 +558,55 @@ export function preferredAudioBitrate(): number {
   return 0;
 }
 
-/** Preferred video quality.  0 = server default, 1–4 = presets,
+/** Preferred video bandwidth.  0 = server default, 1–4 = presets,
  *  10–255 = custom AV1 quantizer. */
-export function preferredVideoQuality(): number {
-  const s = readStorage(VIDEO_QUALITY_KEY);
+export function preferredVideoBandwidth(): number {
+  return readWireByte(VIDEO_BANDWIDTH_KEY);
+}
+
+/** Preferred encoder speed.  0 = server default, 1–4 = presets,
+ *  10–255 = custom (10 = slowest, 255 = fastest). */
+export function preferredVideoSpeed(): number {
+  return readWireByte(VIDEO_SPEED_KEY);
+}
+
+function readWireByte(key: string): number {
+  const s = readStorage(key);
   if (s) {
     const n = parseInt(s, 10);
     if (n >= 0 && n <= 255) return n;
   }
   return 0;
 }
+
+/** The key `blit.videoBandwidth` replaced. */
+const LEGACY_VIDEO_QUALITY_KEY = "blit.videoQuality";
+
+/**
+ * Carry a pre-split `blit.videoQuality` over to `blit.videoBandwidth`, once.
+ *
+ * The old value's encoding is exactly the new bandwidth axis (0 default,
+ * 1-4 presets, 10-255 quantizer), so this is a rename, not a conversion.
+ * Nothing is carried to the speed axis: the old knob implied a speed rather
+ * than letting anyone choose one, and its implied value is the new default.
+ *
+ * Writing through `writeStorage` republishes it to `blit.conf` like any
+ * other change, so the legacy key can be dropped here rather than read
+ * forever.
+ */
+export function migrateLegacyVideoQuality(): void {
+  const legacy = readLocal(LEGACY_VIDEO_QUALITY_KEY);
+  if (legacy === null) return;
+  try {
+    localStorage.removeItem(LEGACY_VIDEO_QUALITY_KEY);
+  } catch {}
+  // A value on the new key was chosen after the upgrade; it wins.
+  if (readLocal(VIDEO_BANDWIDTH_KEY) !== null) return;
+  const n = parseInt(legacy, 10);
+  if (n >= 1 && n <= 255) writeStorage(VIDEO_BANDWIDTH_KEY, String(n));
+}
+
+migrateLegacyVideoQuality();
 
 /** Preferred surface streaming state.  Defaults to enabled. */
 export function preferredSurfaceStreaming(): boolean {

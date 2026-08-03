@@ -140,17 +140,22 @@ pub const C2S_SURFACE_CAPTURE: u8 = 0x27;
 pub const CAPTURE_FORMAT_PNG: u8 = 0;
 pub const CAPTURE_FORMAT_AVIF: u8 = 1;
 /// Subscribe to surface frame updates:
-/// [0x28][surface_id:2]                                        — legacy (server defaults)
-/// [0x28][surface_id:2][codec:1][quality:1]                    — extended
-/// [0x28][surface_id:2][codec:1][quality:1][width:2][height:2] — scaled
+/// [0x28][surface_id:2]                                              — legacy (server defaults)
+/// [0x28][surface_id:2][codec:1][bandwidth:1][speed:1]                — extended
+/// [0x28][surface_id:2][codec:1][bandwidth:1][speed:1][w:2][h:2]      — scaled
 ///
 /// codec: CODEC_SUPPORT_* bitmask restricting which codecs the server may use
 ///        for this surface.  0 = use connection-level default (from C2S_CLIENT_FEATURES).
 ///
-/// quality: desired compression quality for this surface.
+/// bandwidth: how many bits this surface may spend.
 ///   0 = server default, 1 = low, 2 = medium, 3 = high, 4 = ultra.
 ///   10–255 = custom AV1 quantizer (wire value IS the quantizer).
-///   See `SURFACE_QUALITY_*` constants.
+///   See `SURFACE_BANDWIDTH_*` constants.
+///
+/// speed: how much encoder time a frame may cost.  Independent of bandwidth.
+///   0 = server default, 1 = slow, 2 = medium, 3 = fast, 4 = realtime.
+///   10–255 = custom (10 = slowest, 255 = fastest).
+///   See `SURFACE_SPEED_*` constants.
 ///
 /// width, height: optional fixed target size (in pixels) for this subscription.
 ///   When both are nonzero, the server encodes this surface at exactly
@@ -161,17 +166,26 @@ pub const CAPTURE_FORMAT_AVIF: u8 = 1;
 ///   viewers).  Both 0 (or fields absent) means the client participates in
 ///   mediation via C2S_SURFACE_RESIZE like today.
 ///
-/// Re-subscribing to an already-subscribed surface updates the codec/quality
-/// preferences and/or scaled size and forces encoder recreation.
+/// Re-subscribing to an already-subscribed surface updates the codec /
+/// bandwidth / speed preferences and/or scaled size and forces encoder
+/// recreation.
 pub const C2S_SURFACE_SUBSCRIBE: u8 = 0x28;
 
-/// Quality values for the `quality` byte in C2S_SURFACE_SUBSCRIBE.
-/// 0 means "use server default" (from BLIT_SURFACE_QUALITY env var).
-pub const SURFACE_QUALITY_DEFAULT: u8 = 0;
-pub const SURFACE_QUALITY_LOW: u8 = 1;
-pub const SURFACE_QUALITY_MEDIUM: u8 = 2;
-pub const SURFACE_QUALITY_HIGH: u8 = 3;
-pub const SURFACE_QUALITY_ULTRA: u8 = 4;
+/// Values for the `bandwidth` byte in C2S_SURFACE_SUBSCRIBE.
+/// 0 means "use server default" (from the BLIT_SURFACE_BANDWIDTH env var).
+pub const SURFACE_BANDWIDTH_DEFAULT: u8 = 0;
+pub const SURFACE_BANDWIDTH_LOW: u8 = 1;
+pub const SURFACE_BANDWIDTH_MEDIUM: u8 = 2;
+pub const SURFACE_BANDWIDTH_HIGH: u8 = 3;
+pub const SURFACE_BANDWIDTH_ULTRA: u8 = 4;
+
+/// Values for the `speed` byte in C2S_SURFACE_SUBSCRIBE.
+/// 0 means "use server default" (from the BLIT_SURFACE_SPEED env var).
+pub const SURFACE_SPEED_DEFAULT: u8 = 0;
+pub const SURFACE_SPEED_SLOW: u8 = 1;
+pub const SURFACE_SPEED_MEDIUM: u8 = 2;
+pub const SURFACE_SPEED_FAST: u8 = 3;
+pub const SURFACE_SPEED_REALTIME: u8 = 4;
 /// Unsubscribe from surface frame updates: [0x29][surface_id:2]
 pub const C2S_SURFACE_UNSUBSCRIBE: u8 = 0x29;
 /// Acknowledge receipt of a surface video frame: [0x2A][surface_id:2]
@@ -2520,16 +2534,24 @@ pub fn msg_surface_subscribe(surface_id: u16) -> Vec<u8> {
     msg
 }
 
-/// Extended surface subscribe with per-surface codec and quality overrides.
+/// Extended surface subscribe with per-surface codec, bandwidth and speed
+/// overrides.
 ///
 /// `codec_support`: CODEC_SUPPORT_* bitmask (0 = use connection default).
-/// `quality`: SURFACE_QUALITY_* constant (0 = use server default).
-pub fn msg_surface_subscribe_ext(surface_id: u16, codec_support: u8, quality: u8) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(5);
+/// `bandwidth`: SURFACE_BANDWIDTH_* constant (0 = use server default).
+/// `speed`: SURFACE_SPEED_* constant (0 = use server default).
+pub fn msg_surface_subscribe_ext(
+    surface_id: u16,
+    codec_support: u8,
+    bandwidth: u8,
+    speed: u8,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(6);
     msg.push(C2S_SURFACE_SUBSCRIBE);
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.push(codec_support);
-    msg.push(quality);
+    msg.push(bandwidth);
+    msg.push(speed);
     msg
 }
 
@@ -2544,15 +2566,17 @@ pub fn msg_surface_subscribe_ext(surface_id: u16, codec_support: u8, quality: u8
 pub fn msg_surface_subscribe_scaled(
     surface_id: u16,
     codec_support: u8,
-    quality: u8,
+    bandwidth: u8,
+    speed: u8,
     width: u16,
     height: u16,
 ) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(9);
+    let mut msg = Vec::with_capacity(10);
     msg.push(C2S_SURFACE_SUBSCRIBE);
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.push(codec_support);
-    msg.push(quality);
+    msg.push(bandwidth);
+    msg.push(speed);
     msg.extend_from_slice(&width.to_le_bytes());
     msg.extend_from_slice(&height.to_le_bytes());
     msg

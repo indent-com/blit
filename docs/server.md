@@ -4,19 +4,20 @@
 
 ## Configuration
 
-| Variable                | Default                                            | Purpose                                                                                |
-| ----------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `BLIT_SOCK`             | see path cascade in [transports.md](transports.md) | Unix socket listen path                                                                |
-| `SHELL`                 | `$SHELL` or `/bin/sh`                              | Shell spawned for new PTYs                                                             |
-| `BLIT_SHELL_FLAGS`      | `li` (Unix) / `` (Windows)                         | Shell invocation flags                                                                 |
-| `BLIT_SCROLLBACK`       | `1000000`                                          | Scrollback buffer rows per PTY                                                         |
-| `BLIT_VAAPI_DEVICE`     | `/dev/dri/renderD128`                              | VA-API render node for encoding                                                        |
-| `BLIT_CUDA_DEVICE`      | `0`                                                | CUDA device ordinal (NVENC)                                                            |
-| `BLIT_FD_CHANNEL`       | unset                                              | fd-channel file descriptor                                                             |
-| `BLIT_EXPORT_SOCK`      | unset                                              | `1` exports the socket path as `BLIT_SOCK` in spawned terminals (also `--export-sock`) |
-| `BLIT_INJECT_PATH`      | unset                                              | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)     |
-| `BLIT_SURFACE_ENCODERS` | see encoder table                                  | Comma-separated encoder priority                                                       |
-| `BLIT_SURFACE_QUALITY`  | `medium`                                           | Video quality preset                                                                   |
+| Variable                 | Default                                            | Purpose                                                                                |
+| ------------------------ | -------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `BLIT_SOCK`              | see path cascade in [transports.md](transports.md) | Unix socket listen path                                                                |
+| `SHELL`                  | `$SHELL` or `/bin/sh`                              | Shell spawned for new PTYs                                                             |
+| `BLIT_SHELL_FLAGS`       | `li` (Unix) / `` (Windows)                         | Shell invocation flags                                                                 |
+| `BLIT_SCROLLBACK`        | `1000000`                                          | Scrollback buffer rows per PTY                                                         |
+| `BLIT_VAAPI_DEVICE`      | `/dev/dri/renderD128`                              | VA-API render node for encoding                                                        |
+| `BLIT_CUDA_DEVICE`       | `0`                                                | CUDA device ordinal (NVENC)                                                            |
+| `BLIT_FD_CHANNEL`        | unset                                              | fd-channel file descriptor                                                             |
+| `BLIT_EXPORT_SOCK`       | unset                                              | `1` exports the socket path as `BLIT_SOCK` in spawned terminals (also `--export-sock`) |
+| `BLIT_INJECT_PATH`       | unset                                              | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)     |
+| `BLIT_SURFACE_ENCODERS`  | see encoder table                                  | Comma-separated encoder priority                                                       |
+| `BLIT_SURFACE_BANDWIDTH` | `medium`                                           | Ceiling on video bandwidth (adaptation only goes cheaper)                              |
+| `BLIT_SURFACE_SPEED`     | `realtime`                                         | Encoder speed preset                                                                   |
 
 ## PTY lifecycle
 
@@ -138,8 +139,8 @@ All PTYs forked after the compositor starts inherit `WAYLAND_DISPLAY` pointing a
 ### Surface lifecycle
 
 1. The app creates an `xdg_toplevel` surface; the compositor assigns it a `surface_id`.
-2. The compositor sends `SurfaceCommit` events carrying a `PixelData` value. With Vulkan Video this is a pre-encoded bitstream (`PixelData::Encoded`); otherwise it is NV12 DMA-BUF data or BGRA pixels for server-side encoding.
-3. The server either forwards the pre-encoded bitstream directly (Vulkan Video) or encodes the pixel data via the configured encoder chain (VA-API / NVENC / software).
+2. The compositor sends `SurfaceCommit` events carrying a `PixelData` value — NV12 DMA-BUF data or BGRA pixels for server-side encoding. When a client has a Vulkan Video session it also sends that client a `SurfaceEncoded` event carrying a finished bitstream.
+3. The server either forwards a client's own pre-encoded bitstream directly (Vulkan Video) or encodes the pixel data via the configured encoder chain (VA-API / NVENC / software).
 4. `S2C_SURFACE_CREATED` is broadcast to subscribed clients, followed by `S2C_SURFACE_FRAME` as the app renders.
 5. Input events from clients (`C2S_SURFACE_INPUT`, `C2S_SURFACE_POINTER`, `C2S_SURFACE_POINTER_AXIS`) are translated to Wayland keyboard/pointer events via the compositor.
 6. When the app closes the surface, `S2C_SURFACE_DESTROYED` is broadcast.
@@ -159,8 +160,8 @@ sequenceDiagram
     C->>C: GPU composite (Vulkan)
     C->>C: compute BGRA→NV12
     alt Vulkan Video
-        C->>C: GPU encode (H.264/AV1)
-        C->>S: SurfaceCommit (Encoded bitstream)
+        C->>C: GPU encode (H.264/AV1), once per subscribing client
+        C->>S: SurfaceEncoded (bitstream, client_id)
     else VA-API / NVENC / Software
         C->>S: SurfaceCommit (NV12 DMA-BUF)
         S->>S: encode
@@ -179,7 +180,9 @@ The compositor uses a Vulkan renderer (`VulkanRenderer`) loaded at runtime via `
 The render pipeline has three tiers, chosen at runtime based on hardware capabilities:
 
 **Tier 1 — Vulkan Video (fully on-GPU, preferred):**
-When `VK_KHR_video_encode_queue` + `VK_KHR_video_encode_h264` / `VK_KHR_video_encode_av1` are available, the compositor does the entire pipeline in Vulkan: render BGRA → compute shader BGRA→NV12 → Vulkan Video hardware encode → bitstream readback. Returns `PixelData::Encoded` — the server sends the bitstream directly to clients with zero encoding work. No VA-API, no DMA-BUF export/import, no cross-API sync. Supported on AMD (radv, RDNA2+) and Intel (anv).
+When `VK_KHR_video_encode_queue` + `VK_KHR_video_encode_h264` / `VK_KHR_video_encode_av1` are available, the compositor does the entire pipeline in Vulkan: render BGRA → compute shader BGRA→NV12 → Vulkan Video hardware encode → bitstream readback. The server sends the bitstream straight to its owner with zero encoding work. No VA-API, no DMA-BUF export/import, no cross-API sync. Supported on AMD (radv, RDNA2+) and Intel (anv).
+
+Sessions are owned per `(surface_id, client_id)`, not per surface. Each subscriber gets its own GOP, its own keyframe cadence, and its own quantizer, so adaptive bandwidth applies here exactly as it does to a server-side encoder, and one viewer with a small viewport no longer costs every other viewer the hardware path. The cost is one encode per viewer per composited frame on the compositor thread, plus roughly 8-10 MB of GPU memory per 1080p session; there is no cap on live sessions, but the compositor reports any refusal (including the driver running out of them) so that client falls back to a server-side encoder.
 
 **Tier 2 — Vulkan compute + VA-API encode (zero-copy NV12):**
 VA-API allocates NV12 surfaces and exports them as DMA-BUFs. The compositor imports these into Vulkan as multi-plane `G8_B8R8_2PLANE_420_UNORM` images (handles tiled surfaces on AMD via `VK_EXT_image_drm_format_modifier`). A compute shader converts BGRA→NV12 via `imageStore` on per-plane views. The VA-API encoder reads the surface directly — zero CPU involvement. Returns `PixelData::Nv12DmaBuf` with an `Arc<OwnedFd>` shared between compositor and encoder for fd-based surface lookup.
@@ -210,7 +213,36 @@ Vulkan Video encoders (`av1-vulkan`, `h264-vulkan`) are available but not in the
 | `h264-software` | openh264/x264 (CPU) | Software H.264; backend is a build-time choice — openh264 by default, x264 in the GPL opt-in build (`blit --license`), absent if built with neither. 4:4:4 requires x264 (High 4:4:4 Predictive); openh264 is 4:2:0-only |
 | `av1-software`  | rav1e (CPU)         | Software AV1                                                                                                                                                                                                             |
 
-`BLIT_SURFACE_QUALITY`: `low`, `medium` (default), `high`, `ultra`.
+`BLIT_SURFACE_BANDWIDTH`: `low`, `medium` (default), `high`, `ultra`, or a raw
+AV1 quantizer `10`–`255`. A **ceiling**, not a fixed rate: it is the most a
+surface may spend. Adaptation is always on and only ever moves cheaper than
+what you set, then back up as the link recovers.
+
+A surface that stops changing is refined back to the ceiling. The frame the
+client is left looking at was encoded at whatever the controller had backed
+off to during motion, and it is about to stay on screen, so once the picture
+has been unchanged for 400 ms the server re-sends it as a keyframe at a
+better quantizer, halving the remaining distance to the ceiling each step
+until it gets there. Motion or transport backpressure abandons the sequence
+immediately — it is only ever spending bits the link is not otherwise using.
+
+Vulkan Video refines too. Its encoder only runs when the compositor
+composites, which an unchanged surface does not trigger, so a keyframe
+request queues an encoder-only recomposite: the GPU pipeline re-runs and the
+new bitstream is published, but the identical pixels are not. Republishing
+them would burn a generation and make every other viewer of the surface
+re-encode the frame it is already showing.
+
+`BLIT_SURFACE_SPEED`: `slow`, `medium`, `fast`, `realtime` (default), or a raw
+`10`–`255` (10 = slowest, 255 = fastest). Controls how much encoder time a
+frame may cost: rav1e speed preset, x264 preset, openh264 complexity, NVENC
+preset P1–P7, VA-API `quality_level`. Vulkan Video has no speed control.
+
+At the `realtime` default every backend runs at its fastest setting. For
+`h264-software` on openh264 that is `Low` complexity, where it was previously
+pinned to `Medium` no matter what the quality setting said — so the default
+software H.264 encode is now cheaper and slightly softer than before.
+`BLIT_SURFACE_SPEED=medium` restores it.
 
 `BLIT_H264_SOFTWARE`: pins the `h264-software` backend to `x264` or
 `openh264` when the binary carries both (dev builds with
