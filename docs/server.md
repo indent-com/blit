@@ -218,6 +218,16 @@ AV1 quantizer `10`–`255`. A **ceiling**, not a fixed rate: it is the most a
 surface may spend. Adaptation is always on and only ever moves cheaper than
 what you set, then back up as the link recovers.
 
+A surface that stops changing is refined back to the ceiling. The frame the
+client is left looking at was encoded at whatever the controller had backed
+off to during motion, and it is about to stay on screen, so once the picture
+has been unchanged for 400 ms the server re-sends it as a keyframe at a
+better quantizer, halving the remaining distance to the ceiling each step
+until it gets there. Motion or transport backpressure abandons the sequence
+immediately — it is only ever spending bits the link is not otherwise using.
+Vulkan Video is the exception: its encoder only runs when the compositor
+composites, which an unchanged surface does not trigger.
+
 `BLIT_SURFACE_SPEED`: `slow`, `medium`, `fast`, `realtime` (default), or a raw
 `10`–`255` (10 = slowest, 255 = fastest). Controls how much encoder time a
 frame may cost: rav1e speed preset, x264 preset, openh264 complexity, NVENC

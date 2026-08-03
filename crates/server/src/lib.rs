@@ -1113,6 +1113,26 @@ const ADAPTIVE_REBUILD_STEP: u8 = 24;
 /// A write that blocks for a tenth of the interval means the socket, not the
 /// encoder, is setting the pace.
 const WRITE_BLOCKED_CONGESTED_US: u64 = 25_000;
+/// Gap between refinement steps on a surface that has stopped changing.
+/// Longer than `ADAPTIVE_STEP_INTERVAL` because each step costs a keyframe
+/// and there is no deadline to meet — nothing is moving.
+const STILL_REFRESH_INTERVAL: Duration = Duration::from_millis(400);
+/// Smallest quantizer improvement worth spending a keyframe on.
+const STILL_REFINE_MIN_STEP: u8 = 16;
+
+/// Next quantizer when refining a frozen picture back toward the ceiling.
+///
+/// Halves the remaining distance, with a floor on the step size so a wide
+/// gap does not cost a long tail of barely-better keyframes.  The last step
+/// always lands exactly on the ceiling.
+fn refine_toward_ceiling(current: u8, ceiling: u8) -> u8 {
+    let gap = current.saturating_sub(ceiling);
+    if gap == 0 {
+        return ceiling;
+    }
+    let step = gap.div_ceil(2).max(STILL_REFINE_MIN_STEP);
+    current.saturating_sub(step).max(ceiling)
+}
 
 /// One surface's view of the link, as the controller sees it.
 #[derive(Clone, Copy, Debug)]
@@ -1206,11 +1226,18 @@ struct AdaptiveStep {
     quantizer: Option<u8>,
 }
 
+///
+/// `unchanged` says the surface is showing a frame the client already has.
+/// In that mode the controller stops rate-controlling — the budget it would
+/// judge against describes motion that has stopped — and instead walks the
+/// quantizer back toward the ceiling so a picture that is going to sit on
+/// screen ends up as good as the configuration allows.
 fn step_adaptive_bandwidth(
     client: &mut ClientState,
     default: SurfaceBandwidth,
     surface_id: u16,
     now: Instant,
+    unchanged: bool,
 ) -> AdaptiveStep {
     let blocked_us = client.write_blocked_us.load(Ordering::Relaxed);
     let congested = outbox_backpressured(client)
@@ -1230,23 +1257,43 @@ fn step_adaptive_bandwidth(
     let Some(sub) = client.surface_subs.get_mut(&surface_id) else {
         return held;
     };
+    let interval = if unchanged {
+        STILL_REFRESH_INTERVAL
+    } else {
+        ADAPTIVE_STEP_INTERVAL
+    };
     if sub
         .rate_stepped_at
-        .is_some_and(|at| now.duration_since(at) < ADAPTIVE_STEP_INTERVAL)
+        .is_some_and(|at| now.duration_since(at) < interval)
     {
         return held;
     }
     let current = sub.adaptive_quantizer.unwrap_or(ceiling_q).max(ceiling_q);
-    let next = next_quantizer(RateSample {
-        ceiling: ceiling_q,
-        current,
-        budget_bytes,
-        observed_bytes: sub.frame_bytes,
-        congested,
-    });
+    let next = if unchanged {
+        // A frozen picture is exactly when the link is idle and the bits
+        // are affordable — unless the backlog says otherwise, in which
+        // case leave it alone rather than pile a keyframe onto a queue.
+        if congested {
+            current
+        } else {
+            refine_toward_ceiling(current, ceiling_q)
+        }
+    } else {
+        next_quantizer(RateSample {
+            ceiling: ceiling_q,
+            current,
+            budget_bytes,
+            observed_bytes: sub.frame_bytes,
+            congested,
+        })
+    };
     sub.rate_stepped_at = Some(now);
     client.write_blocked_us_seen = blocked_us;
-    if next == current && sub.adaptive_quantizer.is_some() {
+    if next == current {
+        // Nothing moved.  Reporting a step anyway would be harmless for a
+        // live surface (a redundant set to the rate already in effect) but
+        // a still one reads it as "the picture improved" and spends a
+        // keyframe on it, every interval, forever.
         return held;
     }
     sub.adaptive_quantizer = if next > ceiling_q { Some(next) } else { None };
@@ -3702,6 +3749,56 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                 }
 
+                let view = client.surface_view_sizes.get(&sid).copied();
+                let (target_w, target_h) = Session::per_client_encode_target(
+                    view,
+                    native_w,
+                    native_h,
+                    &state.config.surface_encoders,
+                );
+                let (enc_w, enc_h) = (target_w, target_h);
+                if state.config.verbose {
+                    static EDB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = EDB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 30 || n.is_multiple_of(500) {
+                        eprintln!(
+                            "[encode-target #{n}] cid={} sid={sid} view={view:?} native={native_w}x{native_h} target={target_w}x{target_h}",
+                            work.cid,
+                        );
+                    }
+                }
+
+                // The compositor produces one snapshot per (sid,
+                // target) once the per-client encoder has registered
+                // either an external buffer (VAAPI GBM) or a downscale
+                // target (NVENC, software).  Find it.  On the very
+                // first tick after encoder install the snapshot may not
+                // exist yet; we use native as the source for the
+                // Vulkan-Video / generation gate below, but the pixels
+                // lookup further down requires an exact (sid, w, h)
+                // match — feeding mis-sized pixels to a target-sized
+                // encoder garbles content (the encoder reads at
+                // `source_dimensions` stride into a different-sized
+                // buffer, which wraps rows).
+                let target_snapshot = pixel_snapshot
+                    .iter()
+                    .find(|&&(s, w, h, _, _)| s == sid && (w, h) == (target_w, target_h))
+                    .copied();
+                let (px_w, px_h, px_gen, px_timestamp_ms) = target_snapshot
+                    .map(|(_, w, h, g, t)| (w, h, g, t))
+                    .unwrap_or((native_w, native_h, native_gen, native_ts));
+
+                // Has anything changed since the frame this client already
+                // has?  Answered before the controller runs, because a
+                // still surface must not be judged on `frame_bytes` — that
+                // EWMA describes motion that has already stopped.
+                let unchanged = !work.needs_keyframe
+                    && client
+                        .surface_subs
+                        .get(&sid)
+                        .and_then(|s| s.last_encoded_gen)
+                        == Some(px_gen);
+
                 // Adaptive bandwidth: one step per surface per tick, after
                 // the pacing gate so an idle surface neither steps nor is
                 // judged on a stale frame size.  A `true` return means the
@@ -3712,6 +3809,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     state.config.surface_encoding.bandwidth,
                     sid,
                     now,
+                    unchanged,
                 );
                 if step.rebuild {
                     let sub = client.surface_subs.entry(sid).or_default();
@@ -3734,25 +3832,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                         .av1_quantizer()
                         .min(255) as u8;
                     pending_vulkan_qp_updates.push((sid as u32, work.cid, q));
-                }
-
-                let view = client.surface_view_sizes.get(&sid).copied();
-                let (target_w, target_h) = Session::per_client_encode_target(
-                    view,
-                    native_w,
-                    native_h,
-                    &state.config.surface_encoders,
-                );
-                let (enc_w, enc_h) = (target_w, target_h);
-                if state.config.verbose {
-                    static EDB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let n = EDB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n < 30 || n.is_multiple_of(500) {
-                        eprintln!(
-                            "[encode-target #{n}] cid={} sid={sid} view={view:?} native={native_w}x{native_h} target={target_w}x{target_h}",
-                            work.cid,
-                        );
-                    }
                 }
 
                 // Fast path: this client owns a compositor-resident
@@ -3855,35 +3934,14 @@ async fn tick(state: &AppState) -> TickOutcome {
                     continue;
                 }
 
-                // The compositor produces one snapshot per (sid,
-                // target) once the per-client encoder has registered
-                // either an external buffer (VAAPI GBM) or a downscale
-                // target (NVENC, software).  Find it.  On the very
-                // first tick after encoder install the snapshot may not
-                // exist yet; we use native as the source for the
-                // Vulkan-Video / generation gate below, but the pixels
-                // lookup further down requires an exact (sid, w, h)
-                // match — feeding mis-sized pixels to a target-sized
-                // encoder garbles content (the encoder reads at
-                // `source_dimensions` stride into a different-sized
-                // buffer, which wraps rows).
-                let target_snapshot = pixel_snapshot
-                    .iter()
-                    .find(|&&(s, w, h, _, _)| s == sid && (w, h) == (target_w, target_h))
-                    .copied();
-                let (px_w, px_h, px_gen, px_timestamp_ms) = target_snapshot
-                    .map(|(_, w, h, g, t)| (w, h, g, t))
-                    .unwrap_or((native_w, native_h, native_gen, native_ts));
-
-                // Skip encoding if the pixel data hasn't changed since the
-                // last encode for this surface, unless a keyframe is needed.
-                if !work.needs_keyframe
-                    && let Some(last_gen) = client
-                        .surface_subs
-                        .get(&sid)
-                        .and_then(|s| s.last_encoded_gen)
-                    && last_gen == px_gen
-                {
+                // The picture has not changed.  Normally that means there is
+                // nothing to send — but the frame the client is looking at
+                // was encoded at whatever quantizer the controller had
+                // backed off to, and it is about to stay on screen. If the
+                // step above bought an improvement, re-send the same frame
+                // at the better rate; otherwise there is nothing to gain.
+                let still_refresh = unchanged && step.quantizer.is_some();
+                if unchanged && !still_refresh {
                     client.skip_same_gen_count = client.skip_same_gen_count.saturating_add(1);
                     continue;
                 }
@@ -4142,7 +4200,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                     .and_then(|s| s.encoder.take())
                     .unwrap();
                 client.surface_subs.entry(sid).or_default().encode_in_flight = true;
-                let needs_kf = work.needs_keyframe || needs_new_encoder;
+                // A refresh has to be an IDR: a P-frame against an identical
+                // reference codes as skip blocks and refines nothing, however
+                // much finer the quantizer is.
+                let needs_kf = work.needs_keyframe || needs_new_encoder || still_refresh;
                 encoded_client_surfaces.insert((work.cid, sid));
                 encode_dispatched_surfaces.insert(sid);
                 encode_jobs.push(EncodeJob {
@@ -11727,8 +11788,13 @@ mod tests {
         let sub = client.surface_subs.entry(4).or_default();
         sub.frame_bytes = 60_000.0;
         assert!(sub.encoder.is_none());
-        let step =
-            step_adaptive_bandwidth(&mut client, SurfaceBandwidth::Medium, 4, Instant::now());
+        let step = step_adaptive_bandwidth(
+            &mut client,
+            SurfaceBandwidth::Medium,
+            4,
+            Instant::now(),
+            false,
+        );
         let q = step
             .quantizer
             .expect("over budget by 20x must move the rate");
@@ -11738,6 +11804,124 @@ mod tests {
         );
         // Nothing to rebuild: the compositor retargets in place.
         assert!(!step.rebuild);
+    }
+
+    #[test]
+    fn a_frozen_picture_is_refined_back_to_the_ceiling() {
+        // Whatever the controller backed off to during motion is what the
+        // client is left staring at once the screen stops.  Walk it back.
+        let ceiling = SurfaceBandwidth::Medium.av1_quantizer() as u8;
+        let mut q = ADAPTIVE_MAX_QUANTIZER;
+        let mut steps = 0;
+        while q > ceiling {
+            let next = refine_toward_ceiling(q, ceiling);
+            assert!(next < q, "must improve, {q} -> {next}");
+            assert!(next >= ceiling, "must not overshoot the ceiling: {next}");
+            q = next;
+            steps += 1;
+            assert!(
+                steps < 12,
+                "converging too slowly, every step is a keyframe"
+            );
+        }
+        assert_eq!(q, ceiling);
+        // At the ceiling there is nothing left to buy.
+        assert_eq!(refine_toward_ceiling(ceiling, ceiling), ceiling);
+    }
+
+    #[test]
+    fn a_still_surface_ignores_a_stale_frame_size() {
+        // `frame_bytes` still describes the motion that just stopped.  Judged
+        // against it, a surface that had been over budget would keep getting
+        // worse while nothing at all is being sent.
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.goodput_bps = 10_000.0;
+        client.display_fps = 30.0;
+        let ceiling = SurfaceBandwidth::Medium.av1_quantizer() as u8;
+        let sub = client.surface_subs.entry(9).or_default();
+        sub.frame_bytes = 60_000.0;
+        sub.adaptive_quantizer = Some(150);
+
+        let moving = step_adaptive_bandwidth(
+            &mut client,
+            SurfaceBandwidth::Medium,
+            9,
+            Instant::now(),
+            false,
+        );
+        assert_eq!(
+            moving.quantizer,
+            Some(150 + ADAPTIVE_STEP),
+            "over budget while moving: get cheaper",
+        );
+
+        client.surface_subs.entry(9).or_default().adaptive_quantizer = Some(150);
+        client.surface_subs.entry(9).or_default().rate_stepped_at = None;
+        let still = step_adaptive_bandwidth(
+            &mut client,
+            SurfaceBandwidth::Medium,
+            9,
+            Instant::now(),
+            true,
+        );
+        let q = still.quantizer.expect("a frozen picture must be refined");
+        assert!(
+            q < 150 && q >= ceiling,
+            "same stale bytes, opposite direction: {q}"
+        );
+    }
+
+    #[test]
+    fn a_still_surface_does_not_refine_into_a_backlog() {
+        // A keyframe is the most expensive thing we can send.  Piling one
+        // onto a queue that is already forming makes recovery slower.
+        let (mut client, _rx) = test_client_with_capacity(2);
+        client.surface_subs.entry(9).or_default().adaptive_quantizer = Some(ADAPTIVE_MAX_QUANTIZER);
+        for _ in 0..8 {
+            let _ = send_outbox(&client, vec![0u8; 64]);
+        }
+        assert!(
+            outbox_backpressured(&client),
+            "fixture must be backpressured"
+        );
+        let step = step_adaptive_bandwidth(
+            &mut client,
+            SurfaceBandwidth::Medium,
+            9,
+            Instant::now(),
+            true,
+        );
+        assert_eq!(step.quantizer, None, "held until the queue drains");
+    }
+
+    #[test]
+    fn a_refined_still_stops_refining_once_it_is_clean() {
+        // The refresh costs a keyframe per step.  Once the picture is at the
+        // ceiling there is nothing left to buy, and a controller that keeps
+        // reporting a step would spend one every interval forever.
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.surface_subs.entry(11).or_default();
+        let mut sent = 0;
+        for _ in 0..40 {
+            client.surface_subs.entry(11).or_default().rate_stepped_at = None;
+            let step = step_adaptive_bandwidth(
+                &mut client,
+                SurfaceBandwidth::Medium,
+                11,
+                Instant::now(),
+                true,
+            );
+            if step.quantizer.is_none() {
+                break;
+            }
+            sent += 1;
+        }
+        assert!(sent < 40, "never settled: {sent} keyframes and counting");
+        // And it settled at the ceiling, not short of it.
+        assert_eq!(
+            resolve_bandwidth(&client, SurfaceBandwidth::Medium, 11).av1_quantizer(),
+            SurfaceBandwidth::Medium.av1_quantizer(),
+        );
     }
 
     #[test]
