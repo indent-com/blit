@@ -169,6 +169,8 @@ export function MediaOverlay(props: {
     props.onVideoSpeedChange(v);
   };
 
+  // The server treats the setting as a ceiling and spends less when the
+  // link cannot carry it, so every label here reads as "at most".
   const bandwidthHint = (): string => {
     const v = bandwidthSlider();
     if (v <= 10) return "maximum";
@@ -263,7 +265,7 @@ export function MediaOverlay(props: {
                   gap: `${scale().tightGap}px`,
                 }}
               >
-                <span style={labelStyle()}>Bandwidth</span>
+                <span style={labelStyle()}>Max bandwidth</span>
                 <div
                   style={{
                     display: "flex",
@@ -327,7 +329,7 @@ export function MediaOverlay(props: {
                       </span>
                     </div>
                     <span style={sliderHintStyle()}>
-                      {bandwidthSlider()} ({bandwidthHint()})
+                      at most {bandwidthSlider()} ({bandwidthHint()})
                     </span>
                   </div>
                 </Show>

@@ -16,7 +16,7 @@
 | `BLIT_EXPORT_SOCK`       | unset                                              | `1` exports the socket path as `BLIT_SOCK` in spawned terminals (also `--export-sock`) |
 | `BLIT_INJECT_PATH`       | unset                                              | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)     |
 | `BLIT_SURFACE_ENCODERS`  | see encoder table                                  | Comma-separated encoder priority                                                       |
-| `BLIT_SURFACE_BANDWIDTH` | `medium`                                           | Video bandwidth preset                                                                 |
+| `BLIT_SURFACE_BANDWIDTH` | `medium`                                           | Ceiling on video bandwidth (adaptation only goes cheaper)                              |
 | `BLIT_SURFACE_SPEED`     | `realtime`                                         | Encoder speed preset                                                                   |
 
 ## PTY lifecycle
@@ -139,8 +139,8 @@ All PTYs forked after the compositor starts inherit `WAYLAND_DISPLAY` pointing a
 ### Surface lifecycle
 
 1. The app creates an `xdg_toplevel` surface; the compositor assigns it a `surface_id`.
-2. The compositor sends `SurfaceCommit` events carrying a `PixelData` value. With Vulkan Video this is a pre-encoded bitstream (`PixelData::Encoded`); otherwise it is NV12 DMA-BUF data or BGRA pixels for server-side encoding.
-3. The server either forwards the pre-encoded bitstream directly (Vulkan Video) or encodes the pixel data via the configured encoder chain (VA-API / NVENC / software).
+2. The compositor sends `SurfaceCommit` events carrying a `PixelData` value — NV12 DMA-BUF data or BGRA pixels for server-side encoding. When a client has a Vulkan Video session it also sends that client a `SurfaceEncoded` event carrying a finished bitstream.
+3. The server either forwards a client's own pre-encoded bitstream directly (Vulkan Video) or encodes the pixel data via the configured encoder chain (VA-API / NVENC / software).
 4. `S2C_SURFACE_CREATED` is broadcast to subscribed clients, followed by `S2C_SURFACE_FRAME` as the app renders.
 5. Input events from clients (`C2S_SURFACE_INPUT`, `C2S_SURFACE_POINTER`, `C2S_SURFACE_POINTER_AXIS`) are translated to Wayland keyboard/pointer events via the compositor.
 6. When the app closes the surface, `S2C_SURFACE_DESTROYED` is broadcast.
@@ -160,8 +160,8 @@ sequenceDiagram
     C->>C: GPU composite (Vulkan)
     C->>C: compute BGRA→NV12
     alt Vulkan Video
-        C->>C: GPU encode (H.264/AV1)
-        C->>S: SurfaceCommit (Encoded bitstream)
+        C->>C: GPU encode (H.264/AV1), once per subscribing client
+        C->>S: SurfaceEncoded (bitstream, client_id)
     else VA-API / NVENC / Software
         C->>S: SurfaceCommit (NV12 DMA-BUF)
         S->>S: encode
@@ -180,7 +180,9 @@ The compositor uses a Vulkan renderer (`VulkanRenderer`) loaded at runtime via `
 The render pipeline has three tiers, chosen at runtime based on hardware capabilities:
 
 **Tier 1 — Vulkan Video (fully on-GPU, preferred):**
-When `VK_KHR_video_encode_queue` + `VK_KHR_video_encode_h264` / `VK_KHR_video_encode_av1` are available, the compositor does the entire pipeline in Vulkan: render BGRA → compute shader BGRA→NV12 → Vulkan Video hardware encode → bitstream readback. Returns `PixelData::Encoded` — the server sends the bitstream directly to clients with zero encoding work. No VA-API, no DMA-BUF export/import, no cross-API sync. Supported on AMD (radv, RDNA2+) and Intel (anv).
+When `VK_KHR_video_encode_queue` + `VK_KHR_video_encode_h264` / `VK_KHR_video_encode_av1` are available, the compositor does the entire pipeline in Vulkan: render BGRA → compute shader BGRA→NV12 → Vulkan Video hardware encode → bitstream readback. The server sends the bitstream straight to its owner with zero encoding work. No VA-API, no DMA-BUF export/import, no cross-API sync. Supported on AMD (radv, RDNA2+) and Intel (anv).
+
+Sessions are owned per `(surface_id, client_id)`, not per surface. Each subscriber gets its own GOP, its own keyframe cadence, and its own quantizer, so adaptive bandwidth applies here exactly as it does to a server-side encoder, and one viewer with a small viewport no longer costs every other viewer the hardware path. The cost is one encode per viewer per composited frame on the compositor thread, plus roughly 8-10 MB of GPU memory per 1080p session; live sessions are capped and the compositor reports a refusal so that client falls back to a server-side encoder.
 
 **Tier 2 — Vulkan compute + VA-API encode (zero-copy NV12):**
 VA-API allocates NV12 surfaces and exports them as DMA-BUFs. The compositor imports these into Vulkan as multi-plane `G8_B8R8_2PLANE_420_UNORM` images (handles tiled surfaces on AMD via `VK_EXT_image_drm_format_modifier`). A compute shader converts BGRA→NV12 via `imageStore` on per-plane views. The VA-API encoder reads the surface directly — zero CPU involvement. Returns `PixelData::Nv12DmaBuf` with an `Arc<OwnedFd>` shared between compositor and encoder for fd-based surface lookup.
@@ -212,7 +214,9 @@ Vulkan Video encoders (`av1-vulkan`, `h264-vulkan`) are available but not in the
 | `av1-software`  | rav1e (CPU)         | Software AV1                                                                                                                                                                                                             |
 
 `BLIT_SURFACE_BANDWIDTH`: `low`, `medium` (default), `high`, `ultra`, or a raw
-AV1 quantizer `10`–`255`. Controls how many bits a surface may spend.
+AV1 quantizer `10`–`255`. A **ceiling**, not a fixed rate: it is the most a
+surface may spend. Adaptation is always on and only ever moves cheaper than
+what you set, then back up as the link recovers.
 
 `BLIT_SURFACE_SPEED`: `slow`, `medium`, `fast`, `realtime` (default), or a raw
 `10`–`255` (10 = slowest, 255 = fastest). Controls how much encoder time a

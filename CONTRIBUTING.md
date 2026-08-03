@@ -287,7 +287,7 @@ Wayland app → compositor thread → CompositorEvent::SurfaceCommit
 - **AV1 (rav1e)** — software, handles odd dimensions
 - **H.264 software (openh264 and/or x264)** — software fallback, max 3840x2160. Both are cargo features of `blit-server` (and `blit-cli`); default is `openh264` (MIT-friendly), release `-gpl` artifacts use `x264` (GPL-2.0-or-later, better compression). Build with neither and the software fallback is AV1-only.
 
-`BLIT_SURFACE_ENCODERS` is a comma-separated priority list. The server tries each in order and uses the first that succeeds. Default: `av1-nvenc,h264-nvenc,av1-vaapi,h264-vaapi,h264-software,av1-software`. `BLIT_SURFACE_BANDWIDTH` (low/medium/high/ultra, or a raw AV1 quantizer 10-255) controls the bit budget, and `BLIT_SURFACE_SPEED` (slow/medium/fast/realtime, or a raw 10-255) controls how much encoder time a frame may cost. `BLIT_VAAPI_DEVICE` selects the VA-API render node (default `/dev/dri/renderD128`). `BLIT_CUDA_DEVICE` selects the CUDA device ordinal for NVENC (default `0`).
+`BLIT_SURFACE_ENCODERS` is a comma-separated priority list. The server tries each in order and uses the first that succeeds. Default: `av1-nvenc,h264-nvenc,av1-vaapi,h264-vaapi,h264-software,av1-software`. `BLIT_SURFACE_BANDWIDTH` (low/medium/high/ultra, or a raw AV1 quantizer 10-255) is the ceiling on the bit budget — adaptation is always on and only moves cheaper than what you set, and `BLIT_SURFACE_SPEED` (slow/medium/fast/realtime, or a raw 10-255) controls how much encoder time a frame may cost. `BLIT_VAAPI_DEVICE` selects the VA-API render node (default `/dev/dri/renderD128`). `BLIT_CUDA_DEVICE` selects the CUDA device ordinal for NVENC (default `0`).
 
 ### Testing surfaces without a browser
 

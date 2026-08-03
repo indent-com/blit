@@ -19,8 +19,16 @@ use std::sync::Arc;
 use ash::vk;
 use wayland_server::backend::ObjectId;
 
-use super::imp::{ExternalOutputBuffer, PixelData, Surface};
+use super::imp::{EncodedFrame, ExternalOutputBuffer, PixelData, Surface};
 use super::render::{GpuLayer, SurfaceMeta, collect_gpu_layers, to_physical};
+
+/// Ceiling on live Vulkan Video sessions across every surface and client.
+///
+/// One session holds a DPB pair (~6 MB at 1080p) plus a 2 MiB pinned
+/// bitstream buffer, and drivers cap concurrent encode sessions at a small
+/// number.  Ownership is per `(surface, client)`, so the count now scales
+/// with viewers; past this we decline and the server falls back.
+const MAX_VULKAN_ENCODERS: usize = 8;
 
 // ===================================================================
 // VulkanRenderer
@@ -42,8 +50,14 @@ pub(crate) struct VulkanRenderer {
     video_encode_queue_family: Option<u32>,
     video_encode_command_pool: Option<vk::CommandPool>,
     video_fns: Option<crate::vulkan_encode::VideoFns>,
-    /// Per-surface Vulkan Video H.264 encoders.
-    vulkan_encoders: HashMap<u32, crate::vulkan_encode::VulkanVideoEncoder>,
+    /// Vulkan Video encoders, one per `(surface_id, client_id)`.  Each
+    /// subscriber owns its own session so its GOP, keyframe cadence and
+    /// quantizer are independent of every other viewer's.
+    vulkan_encoders: HashMap<(u32, u64), crate::vulkan_encode::VulkanVideoEncoder>,
+    /// Bitstreams produced by `vulkan_encoders` during the last render,
+    /// awaiting collection by the compositor.  Kept out of the render
+    /// return value because that function has a dozen early exits.
+    pending_encoded_frames: Vec<EncodedFrame>,
     /// Whether the device supports VK_KHR_video_encode_queue + H.264 extensions.
     has_video_encode: bool,
     /// Whether the device supports VK_KHR_video_encode_av1 extension.
@@ -869,6 +883,7 @@ impl VulkanRenderer {
             video_encode_command_pool,
             video_fns,
             vulkan_encoders: HashMap::new(),
+            pending_encoded_frames: Vec::new(),
             has_video_encode,
             has_video_encode_av1,
             has_dmabuf,
@@ -978,30 +993,48 @@ impl VulkanRenderer {
     // Vulkan Video encoder management
     // ---------------------------------------------------------------
 
-    /// Create a Vulkan Video encoder for the given surface.
+    /// Create a Vulkan Video encoder for one `(surface, client)` pair.
     /// `codec`: 0x01 = H.264, 0x02 = AV1.
+    ///
+    /// Returns `false` when no encoder could be created, so the caller can
+    /// tell the server to fall back to a server-side encoder instead of
+    /// leaving that client waiting for a bitstream that will never arrive.
     pub(crate) fn create_vulkan_encoder(
         &mut self,
         surface_id: u32,
+        client_id: u64,
         codec: u8,
         qp: u8,
         w: u32,
         h: u32,
-    ) {
+    ) -> bool {
         if !self.has_video_encode {
             eprintln!("[vulkan-render] cannot create vulkan encoder: video encode not available");
-            return;
+            return false;
         }
         let enc_qf = match self.video_encode_queue_family {
             Some(qf) => qf,
-            None => return,
+            None => return false,
         };
 
         // Remove existing encoder if any.
-        if let Some(mut old) = self.vulkan_encoders.remove(&surface_id)
+        if let Some(mut old) = self.vulkan_encoders.remove(&(surface_id, client_id))
             && let Some(ref vfns) = self.video_fns
         {
             unsafe { old.destroy(&self.device, vfns) };
+        }
+
+        // Each session costs a DPB pair plus a pinned bitstream buffer, and
+        // drivers cap concurrent video sessions well below what a busy
+        // session could ask for now that every viewer owns one.  Refuse
+        // past the cap rather than discovering the driver's limit as an
+        // opaque allocation failure.
+        if self.vulkan_encoders.len() >= MAX_VULKAN_ENCODERS {
+            eprintln!(
+                "[vulkan-render] refusing vulkan encoder for surface {surface_id} client \
+                 {client_id}: {MAX_VULKAN_ENCODERS} sessions already live",
+            );
+            return false;
         }
 
         let codec_name = match codec {
@@ -1026,7 +1059,7 @@ impl VulkanRenderer {
                 eprintln!(
                     "[vulkan-render] AV1 encode not available, cannot create encoder for surface {surface_id}",
                 );
-                return;
+                return false;
             }
             _ => unsafe {
                 crate::vulkan_encode::VulkanVideoEncoder::try_new_h264(
@@ -1044,32 +1077,72 @@ impl VulkanRenderer {
         match encoder {
             Some(enc) => {
                 eprintln!(
-                    "[vulkan-render] created vulkan {codec_name} encoder for surface {surface_id} {w}x{h} qp={qp}",
+                    "[vulkan-render] created vulkan {codec_name} encoder for surface {surface_id} client {client_id} {w}x{h} qp={qp}",
                 );
-                self.vulkan_encoders.insert(surface_id, enc);
+                self.vulkan_encoders.insert((surface_id, client_id), enc);
+                true
             }
             None => {
                 eprintln!(
-                    "[vulkan-render] failed to create vulkan {codec_name} encoder for surface {surface_id}",
+                    "[vulkan-render] failed to create vulkan {codec_name} encoder for surface {surface_id} client {client_id}",
                 );
+                false
             }
         }
     }
 
-    /// Request the next frame for this surface's encoder to be a keyframe.
-    pub(crate) fn request_encoder_keyframe(&mut self, surface_id: u32) {
-        if let Some(enc) = self.vulkan_encoders.get_mut(&surface_id) {
+    /// Retarget one client's encoder quantizer without rebuilding it.
+    /// Returns `false` when that client has no encoder on this surface.
+    pub(crate) fn set_vulkan_encoder_qp(
+        &mut self,
+        surface_id: u32,
+        client_id: u64,
+        qp: u8,
+    ) -> bool {
+        match self.vulkan_encoders.get_mut(&(surface_id, client_id)) {
+            Some(enc) => {
+                enc.set_qp(qp);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Request the next frame for one client's encoder to be a keyframe.
+    pub(crate) fn request_encoder_keyframe(&mut self, surface_id: u32, client_id: u64) {
+        if let Some(enc) = self.vulkan_encoders.get_mut(&(surface_id, client_id)) {
             enc.request_idr();
         }
     }
 
-    /// Destroy the vulkan encoder for a surface.
-    pub(crate) fn destroy_vulkan_encoder(&mut self, surface_id: u32) {
-        if let Some(mut enc) = self.vulkan_encoders.remove(&surface_id)
-            && let Some(ref vfns) = self.video_fns
-        {
-            unsafe { enc.destroy(&self.device, vfns) };
+    /// Destroy vulkan encoders for a surface: one client's when `client_id`
+    /// is `Some`, every client's when it is `None` (the surface itself went
+    /// away or was resized out from under all of them).
+    pub(crate) fn destroy_vulkan_encoder(&mut self, surface_id: u32, client_id: Option<u64>) {
+        let keys: Vec<(u32, u64)> = self
+            .vulkan_encoders
+            .keys()
+            .filter(|&&(sid, cid)| sid == surface_id && client_id.is_none_or(|c| c == cid))
+            .copied()
+            .collect();
+        for key in keys {
+            if let Some(mut enc) = self.vulkan_encoders.remove(&key)
+                && let Some(ref vfns) = self.video_fns
+            {
+                unsafe { enc.destroy(&self.device, vfns) };
+            }
         }
+        // Never hand a bitstream to a client whose encoder has just gone
+        // away; the server would credit it against a subscription that no
+        // longer exists.
+        self.pending_encoded_frames.retain(|f| {
+            !(f.surface_id as u32 == surface_id && client_id.is_none_or(|c| c == f.client_id))
+        });
+    }
+
+    /// Take the bitstreams produced since the last call.
+    pub(crate) fn take_encoded_frames(&mut self) -> Vec<EncodedFrame> {
+        std::mem::take(&mut self.pending_encoded_frames)
     }
 
     // ---------------------------------------------------------------
@@ -4792,40 +4865,59 @@ impl VulkanRenderer {
             };
 
             // Vulkan Video encode (compositor-resident, only at native
-            // size) — only valid when this target matches native and
-            // there's a registered encoder for the surface.
-            if (tw, th) == (phys_w, phys_h) && self.vulkan_encoders.contains_key(&sid) {
-                let nv12_image_and_view =
-                    self.nv12_outputs.get(&(sid, tw, th)).and_then(|(v, _)| {
-                        if v.is_empty() {
-                            return None;
+            // size).  One encoder per subscribing client, so this runs
+            // once per client that owns a session on this surface and
+            // yields one bitstream each.  The NV12 image is only read —
+            // `encode` neither transitions nor consumes it — so every
+            // encoder can share the frame the compute pass just wrote.
+            if (tw, th) == (phys_w, phys_h) {
+                let mut encoder_cids: Vec<u64> = self
+                    .vulkan_encoders
+                    .keys()
+                    .filter(|&&(esid, _)| esid == sid)
+                    .map(|&(_, cid)| cid)
+                    .collect();
+                encoder_cids.sort_unstable();
+                if !encoder_cids.is_empty() {
+                    let nv12_image_and_view =
+                        self.nv12_outputs.get(&(sid, tw, th)).and_then(|(v, _)| {
+                            if v.is_empty() {
+                                return None;
+                            }
+                            match &v[nv12_idx].kind {
+                                Nv12OutputKind::Image {
+                                    image, encode_view, ..
+                                } => encode_view.map(|ev| (*image, ev)),
+                                _ => None,
+                            }
+                        });
+                    if let Some((nv12_img, ev)) = nv12_image_and_view {
+                        for cid in encoder_cids {
+                            let encoder = self.vulkan_encoders.get_mut(&(sid, cid)).unwrap();
+                            let codec_flag = encoder.codec_flag();
+                            let encoded = unsafe {
+                                encoder.encode(
+                                    &self.device,
+                                    self.video_fns.as_ref().unwrap(),
+                                    self.video_encode_queue.unwrap(),
+                                    self.video_encode_command_pool.unwrap(),
+                                    nv12_img,
+                                    ev,
+                                    false,
+                                )
+                            };
+                            if let Some((bitstream, is_keyframe)) = encoded {
+                                self.pending_encoded_frames.push(EncodedFrame {
+                                    surface_id: toplevel_sid,
+                                    client_id: cid,
+                                    width: tw,
+                                    height: th,
+                                    data: Arc::new(bitstream),
+                                    is_keyframe,
+                                    codec_flag,
+                                });
+                            }
                         }
-                        match &v[nv12_idx].kind {
-                            Nv12OutputKind::Image {
-                                image, encode_view, ..
-                            } => encode_view.map(|ev| (*image, ev)),
-                            _ => None,
-                        }
-                    });
-                if let Some((nv12_img, ev)) = nv12_image_and_view {
-                    let encoder = self.vulkan_encoders.get_mut(&sid).unwrap();
-                    let encoded = unsafe {
-                        encoder.encode(
-                            &self.device,
-                            self.video_fns.as_ref().unwrap(),
-                            self.video_encode_queue.unwrap(),
-                            self.video_encode_command_pool.unwrap(),
-                            nv12_img,
-                            ev,
-                            false,
-                        )
-                    };
-                    if let Some((bitstream, is_keyframe)) = encoded {
-                        pixel_data = PixelData::Encoded {
-                            data: Arc::new(bitstream),
-                            is_keyframe,
-                            codec_flag: encoder.codec_flag(),
-                        };
                     }
                 }
             }

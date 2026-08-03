@@ -45,6 +45,7 @@ const NV_ENC_CREATE_INPUT_BUFFER_VER: u32 = nvencapi_struct_version(1);
 const NV_ENC_CREATE_BITSTREAM_BUFFER_VER: u32 = nvencapi_struct_version(1);
 const NV_ENC_PIC_PARAMS_VER: u32 = nvencapi_struct_version(6) | (1 << 31);
 const NV_ENC_LOCK_BITSTREAM_VER: u32 = nvencapi_struct_version(1) | (1 << 31);
+const NV_ENC_RECONFIGURE_PARAMS_VER: u32 = nvencapi_struct_version(1) | (1 << 31);
 
 // Buffer formats (from nv-codec-headers 12.1)
 const NV_ENC_BUFFER_FORMAT_NV12: u32 = 0x00000001;
@@ -210,7 +211,7 @@ struct NvEncFunctionList {
     nvEncRegisterResource: unsafe extern "C" fn(encoder: *mut c_void, params: *mut c_void) -> u32,
     nvEncUnregisterResource:
         unsafe extern "C" fn(encoder: *mut c_void, resource: *mut c_void) -> u32,
-    nvEncReconfigureEncoder: *const c_void,
+    nvEncReconfigureEncoder: unsafe extern "C" fn(encoder: *mut c_void, params: *mut c_void) -> u32,
     _reserved1: *const c_void,
     nvEncCreateMVBuffer: *const c_void,
     nvEncDestroyMVBuffer: *const c_void,
@@ -251,6 +252,11 @@ const NVENC_OPEN_ENCODE_SESSION_EX_SIZE: usize = 1552;
 const NVENC_CONFIG_SIZE: usize = 3584;
 const NVENC_PRESET_CONFIG_SIZE: usize = 5128;
 const NVENC_INITIALIZE_PARAMS_SIZE: usize = 1808;
+// NV_ENC_RECONFIGURE_PARAMS: u32 version, 4 bytes of alignment padding, an
+// embedded NV_ENC_INITIALIZE_PARAMS, then the resetEncoder/forceIDR bitfield.
+const NVENC_RECONFIGURE_PARAMS_SIZE: usize = 1824;
+const NVENC_RECONFIGURE_INIT_PARAMS_OFFSET: usize = 8;
+const NVENC_RECONFIGURE_FLAGS_OFFSET: usize = 1816;
 const NVENC_CREATE_INPUT_BUFFER_SIZE: usize = 776;
 const NVENC_CREATE_BITSTREAM_BUFFER_SIZE: usize = 776;
 const NVENC_PIC_PARAMS_SIZE: usize = 3360;
@@ -271,6 +277,14 @@ fn wguid(buf: &mut [u8], off: usize, g: NvGuid) {
     buf[off + 6..off + 8].copy_from_slice(&g.2.to_ne_bytes());
     buf[off + 8..off + 16].copy_from_slice(&g.3);
 }
+/// Write `NV_ENC_RC_PARAMS::constQP` (qpInterP / qpInterB / qpIntra) inside
+/// an `NV_ENC_CONFIG` buffer.
+fn write_const_qp(config_buf: &mut [u8], qp: u32) {
+    w32(config_buf, 48, qp); // constQP.qpInterP
+    w32(config_buf, 52, qp); // constQP.qpInterB
+    w32(config_buf, 56, qp); // constQP.qpIntra
+}
+
 fn r32(buf: &[u8], off: usize) -> u32 {
     u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap())
 }
@@ -314,6 +328,13 @@ pub struct NvencDirectEncoder {
     /// without SPS/PPS (the default unless repeatSPSPPS is set, which
     /// requires fragile struct-offset manipulation).
     h264_sps_pps: Vec<u8>,
+    /// `NV_ENC_INITIALIZE_PARAMS` and `NV_ENC_CONFIG` as initialized.
+    /// Retained because `nvEncReconfigureEncoder` wants a complete
+    /// `NV_ENC_INITIALIZE_PARAMS` again, and the driver forbids changing
+    /// anything but rate control across a reconfigure — so the way to
+    /// change only the QP is to re-submit these bytes with the QP edited.
+    init_params: Vec<u8>,
+    encode_config: Vec<u8>,
 }
 
 // NVENC encoder handle and CUDA context are thread-safe with proper push/pop.
@@ -460,12 +481,12 @@ impl NvencDirectEncoder {
         w32(&mut config_buf, 24, 1); // frame_interval_p (no B-frames)
         // rcParams starts at config offset 40 (after version=0, profileGUID=4,
         // gopLength=20, frameIntervalP=24, monoChromeEncoding=28,
-        // frameFieldMode=32, mvPrecision=36).
-        // rcParams.rateControlMode @ 40, rcParams.constQP @ 44 (3 × u32)
-        w32(&mut config_buf, 40, NV_ENC_PARAMS_RC_CONSTQP);
-        w32(&mut config_buf, 44, qp); // qp_inter_p
-        w32(&mut config_buf, 48, qp); // qp_inter_b
-        w32(&mut config_buf, 52, qp); // qp_intra
+        // frameFieldMode=32, mvPrecision=36).  NV_ENC_RC_PARAMS itself opens
+        // with its own u32 version, which the preset config already filled —
+        // so rateControlMode is at 44 and constQP (qpInterP/qpInterB/qpIntra)
+        // at 48/52/56.
+        w32(&mut config_buf, 44, NV_ENC_PARAMS_RC_CONSTQP);
+        write_const_qp(&mut config_buf, qp);
 
         // Set 4:4:4 profile when requested.  For H.264 this is the High 4:4:4
         // Predictive profile; for AV1 the SDK auto-selects the right profile
@@ -686,11 +707,57 @@ impl NvencDirectEncoder {
             nv12_pitch,
             verbose,
             h264_sps_pps: Vec::new(),
+            init_params: init_buf,
+            encode_config: config_buf,
         })
     }
 
     pub fn request_keyframe(&mut self) {
         self.force_idr = true;
+    }
+
+    /// Move the constant QP without tearing the session down.
+    ///
+    /// `resetEncoder` stays 0: resetting rate-control state also forces an
+    /// IDR when `enablePTD` is set (it is), and a keyframe is the last thing
+    /// wanted when the reason for the change is congestion.  Returns false
+    /// if the driver rejects the reconfigure, leaving the encoder at its
+    /// current QP so the caller can decide whether a rebuild is worth it.
+    pub fn set_qp(&mut self, qp: u32) -> bool {
+        let cuda = match gpu_libs::cuda() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        write_const_qp(&mut self.encode_config, qp);
+        let mut params = vec![0u8; NVENC_RECONFIGURE_PARAMS_SIZE];
+        w32(&mut params, 0, NV_ENC_RECONFIGURE_PARAMS_VER);
+        params[NVENC_RECONFIGURE_INIT_PARAMS_OFFSET
+            ..NVENC_RECONFIGURE_INIT_PARAMS_OFFSET + NVENC_INITIALIZE_PARAMS_SIZE]
+            .copy_from_slice(&self.init_params);
+        // The retained init params carry a pointer to the config buffer; it
+        // is still valid (a Vec's allocation does not move with the struct)
+        // but re-point it anyway rather than depend on that.
+        wptr(
+            &mut params,
+            NVENC_RECONFIGURE_INIT_PARAMS_OFFSET + 88,
+            self.encode_config.as_mut_ptr() as *mut c_void,
+        );
+        w32(&mut params, NVENC_RECONFIGURE_FLAGS_OFFSET, 0);
+
+        unsafe { (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx) };
+        let status = unsafe {
+            (self.fns.nvEncReconfigureEncoder)(self.encoder, params.as_mut_ptr() as *mut c_void)
+        };
+        let mut dummy: gpu_libs::CUcontext = std::ptr::null_mut();
+        unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+
+        if status != NV_ENC_SUCCESS {
+            if self.verbose {
+                eprintln!("[nvenc] nvEncReconfigureEncoder(qp={qp}) failed: {status}");
+            }
+            return false;
+        }
+        true
     }
 
     /// Check whether the NVENC-reported picture type indicates a keyframe.

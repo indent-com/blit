@@ -353,8 +353,9 @@ impl SurfaceBandwidth {
     }
 
     /// AV1 quantizer (0 = best, 255 = worst).
-    /// Also used as VA-API `base_qindex` and NVENC AV1 QP.
-    fn av1_quantizer(self) -> usize {
+    /// Also used as VA-API `base_qindex` and NVENC AV1 QP, and as the
+    /// canonical scale the adaptive controller walks.
+    pub fn av1_quantizer(self) -> usize {
         match self {
             Self::Low => 180,
             Self::Medium => 120,
@@ -513,6 +514,10 @@ pub struct SurfaceEncoder {
     /// Negotiated chroma subsampling (may differ from requested if backend
     /// does not support 4:4:4).
     chroma: ChromaSubsampling,
+    /// Encoding this encoder is currently running at.  The bandwidth half
+    /// moves at runtime (see `set_bandwidth`); speed is fixed for the
+    /// encoder's lifetime because no backend can change it in place.
+    encoding: SurfaceEncoding,
 }
 
 enum SurfaceEncoderKind {
@@ -716,6 +721,7 @@ impl SurfaceEncoder {
                         )?,
                     )),
                     chroma,
+                    encoding,
                 })
             }
             SurfaceEncoderPreference::NvencAV1 => {
@@ -741,6 +747,7 @@ impl SurfaceEncoder {
                         )?,
                     )),
                     chroma,
+                    encoding,
                 })
             }
             #[cfg(target_os = "linux")]
@@ -763,6 +770,7 @@ impl SurfaceEncoder {
                         )?,
                     )),
                     chroma,
+                    encoding,
                 })
             }
             #[cfg(not(target_os = "linux"))]
@@ -816,6 +824,7 @@ impl SurfaceEncoder {
                         )?,
                     )),
                     chroma,
+                    encoding,
                 })
             }
             #[cfg(not(target_os = "linux"))]
@@ -829,6 +838,7 @@ impl SurfaceEncoder {
                     width, height, encoding, chroma,
                 )?)),
                 chroma,
+                encoding,
             }),
             SurfaceEncoderPreference::H264Software => {
                 let (width, height) = ((width + 1) & !1, (height + 1) & !1);
@@ -841,6 +851,7 @@ impl SurfaceEncoder {
                         width, height, encoding, chroma,
                     )?)),
                     chroma,
+                    encoding,
                 })
             }
         }
@@ -924,6 +935,46 @@ impl SurfaceEncoder {
             SurfaceEncoderKind::AV1Vaapi(_) => SURFACE_FRAME_CODEC_AV1,
             SurfaceEncoderKind::AV1Software(_) => SURFACE_FRAME_CODEC_AV1,
         }
+    }
+
+    /// The encoding this encoder is running at.
+    pub fn encoding(&self) -> SurfaceEncoding {
+        self.encoding
+    }
+
+    /// Move the bandwidth this encoder targets without rebuilding it.
+    ///
+    /// Returns `false` when the backend cannot change rate in place, in
+    /// which case the caller has to drop the encoder and build a new one —
+    /// which costs a keyframe, so it is worth doing only for large steps.
+    /// A rebuild is never required for a *smaller* step on these backends.
+    #[must_use]
+    pub fn set_bandwidth(&mut self, bandwidth: SurfaceBandwidth) -> bool {
+        if self.encoding.bandwidth == bandwidth {
+            return true;
+        }
+        let applied = match &mut self.kind {
+            #[cfg(target_os = "linux")]
+            SurfaceEncoderKind::H264Vaapi(enc) => {
+                enc.set_qp(bandwidth.h264_qp());
+                true
+            }
+            #[cfg(target_os = "linux")]
+            SurfaceEncoderKind::AV1Vaapi(enc) => {
+                enc.set_base_qindex(bandwidth.av1_quantizer().min(255) as u8);
+                true
+            }
+            SurfaceEncoderKind::NvencH264(enc) => enc.set_qp(bandwidth.h264_qp() as u32),
+            SurfaceEncoderKind::NvencAV1(enc) => enc.set_qp(bandwidth.nvenc_av1_qp()),
+            SurfaceEncoderKind::H264Software(enc) => enc.set_bandwidth(bandwidth),
+            // rav1e freezes quantizer/min_quantizer into the Context at
+            // creation and exposes no setter.
+            SurfaceEncoderKind::AV1Software(_) => false,
+        };
+        if applied {
+            self.encoding.bandwidth = bandwidth;
+        }
+        applied
     }
 
     pub fn request_keyframe(&mut self) {
@@ -1172,9 +1223,6 @@ impl SurfaceEncoder {
             #[cfg(not(target_os = "linux"))]
             PixelData::Nv12DmaBuf { .. } => None,
             PixelData::VaSurface { .. } => None,
-            // Vulkan Video pre-encoded — should be handled before reaching
-            // SurfaceEncoder.  If it gets here, we can't re-encode.
-            PixelData::Encoded { .. } => None,
         }
     }
 
@@ -2116,6 +2164,21 @@ impl SoftwareH264Encoder {
         }
     }
 
+    /// Retarget the bitrate in place.  x264 accepts a live reconfigure;
+    /// openh264's safe API takes its bitrate only at construction, so that
+    /// backend reports failure and the caller decides whether to rebuild.
+    fn set_bandwidth(&mut self, bandwidth: SurfaceBandwidth) -> bool {
+        let _ = bandwidth;
+        match self {
+            #[cfg(all(target_os = "linux", feature = "x264"))]
+            Self::X264(enc) => enc.set_bitrate_kbps((bandwidth.h264_bitrate() / 1000) as i32),
+            #[cfg(all(target_os = "linux", feature = "openh264"))]
+            Self::OpenH264(_) => false,
+            #[cfg(not(all(target_os = "linux", any(feature = "x264", feature = "openh264"))))]
+            _ => false,
+        }
+    }
+
     fn encode(
         &mut self,
         rgba: &[u8],
@@ -2216,6 +2279,22 @@ impl X264Encoder {
 
     fn request_keyframe(&mut self) {
         self.force_keyframe = true;
+    }
+
+    /// Move the ABR target bitrate on the live encoder.  Takes effect on the
+    /// next frame with no keyframe; `i_rc_method` is untouched (x264 refuses
+    /// to change it).  VBV stays disabled, so the "reconfiguring VBV
+    /// generates invalid HRD" caveat in x264.h does not apply here.
+    fn set_bitrate_kbps(&mut self, kbps: i32) -> bool {
+        use x264_sys::*;
+        unsafe {
+            // Read back the encoder's *current* params: x264_encoder_open
+            // consumed and rewrote the ones passed at construction.
+            let mut par: x264_param_t = std::mem::zeroed();
+            x264_encoder_parameters(self.enc, &mut par);
+            par.rc.i_bitrate = kbps.max(1);
+            x264_encoder_reconfig(self.enc, &mut par) == 0
+        }
     }
 
     fn encode_yuv(&mut self, yuv: &[u8], width: u32, height: u32) -> Option<(Vec<u8>, bool)> {

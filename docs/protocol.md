@@ -98,7 +98,7 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 `SURFACE_SUBSCRIBE` has three optional trailing bytes for per-surface codec, bandwidth and speed control:
 
 - `codec` (byte 3): `CODEC_SUPPORT_*` bitmask restricting which codecs the server may use for this surface. `0` = use the connection-level default (from `C2S_CLIENT_FEATURES`).
-- `bandwidth` (byte 4): how many bits the surface may spend. `0` = server default (from `BLIT_SURFACE_BANDWIDTH`), `1` = low, `2` = medium, `3` = high, `4` = ultra, `5`–`9` reserved, `10`–`255` = the AV1 quantizer to use verbatim.
+- `bandwidth` (byte 4): the **most** bits the surface may spend. `0` = server default (from `BLIT_SURFACE_BANDWIDTH`), `1` = low, `2` = medium, `3` = high, `4` = ultra, `5`–`9` reserved, `10`–`255` = an AV1 quantizer used as the floor. The server adapts below this ceiling on its own — there is no `auto` value to ask for and no way to switch adaptation off. What you pick is the best quality the encoder is allowed to produce; congestion moves it cheaper and recovery moves it back.
 - `speed` (byte 5): how much encoder time a frame may cost, independent of bandwidth. `0` = server default (from `BLIT_SURFACE_SPEED`), `1` = slow, `2` = medium, `3` = fast, `4` = realtime, `5`–`9` reserved, `10`–`255` = custom (`10` slowest, `255` fastest).
 
 All three bytes are optional — a 3-byte message uses connection/server defaults. Re-subscribing to an already-subscribed surface with different values updates the preferences and forces encoder recreation.

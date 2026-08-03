@@ -1276,6 +1276,14 @@ impl VaapiDirectEncoder {
         self.force_idr = true;
     }
 
+    /// Change the constant QP applied from the next submitted frame on.
+    /// No parameter sets have to be re-sent: `pic_init_qp` stays 26 and the
+    /// per-frame slice carries `slice_qp_delta = qp - 26`, which covers the
+    /// whole legal 0–51 range.
+    pub fn set_qp(&mut self, qp: u8) {
+        self.qp = qp.min(51);
+    }
+
     pub fn gbm_buffers(&self) -> &[GbmExportedBuffer] {
         match &self.vpp {
             Some(vpp) => &vpp.gbm_buffers,
@@ -2444,6 +2452,13 @@ impl VaapiAv1Encoder {
 
     pub fn request_keyframe(&mut self) {
         self.force_idr = true;
+    }
+
+    /// Change `base_q_idx` from the next submitted frame on.  The frame
+    /// header OBU (and the loop-filter strengths derived from the qindex)
+    /// is rebuilt every frame, so nothing stale survives the change.
+    pub fn set_base_qindex(&mut self, base_qindex: u8) {
+        self.base_qindex = base_qindex;
     }
 
     /// Get or create a cached derived image for the input surface.
