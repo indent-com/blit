@@ -22,14 +22,6 @@ use wayland_server::backend::ObjectId;
 use super::imp::{EncodedFrame, ExternalOutputBuffer, PixelData, Surface};
 use super::render::{GpuLayer, SurfaceMeta, collect_gpu_layers, to_physical};
 
-/// Ceiling on live Vulkan Video sessions across every surface and client.
-///
-/// One session holds a DPB pair (~6 MB at 1080p) plus a 2 MiB pinned
-/// bitstream buffer, and drivers cap concurrent encode sessions at a small
-/// number.  Ownership is per `(surface, client)`, so the count now scales
-/// with viewers; past this we decline and the server falls back.
-const MAX_VULKAN_ENCODERS: usize = 8;
-
 // ===================================================================
 // VulkanRenderer
 // ===================================================================
@@ -996,9 +988,10 @@ impl VulkanRenderer {
     /// Create a Vulkan Video encoder for one `(surface, client)` pair.
     /// `codec`: 0x01 = H.264, 0x02 = AV1.
     ///
-    /// Returns `false` when no encoder could be created, so the caller can
-    /// tell the server to fall back to a server-side encoder instead of
-    /// leaving that client waiting for a bitstream that will never arrive.
+    /// Returns `false` when no encoder could be created — including when the
+    /// driver runs out of concurrent video sessions — so the caller can tell
+    /// the server to fall back to a server-side encoder instead of leaving
+    /// that client waiting for a bitstream that will never arrive.
     pub(crate) fn create_vulkan_encoder(
         &mut self,
         surface_id: u32,
@@ -1022,19 +1015,6 @@ impl VulkanRenderer {
             && let Some(ref vfns) = self.video_fns
         {
             unsafe { old.destroy(&self.device, vfns) };
-        }
-
-        // Each session costs a DPB pair plus a pinned bitstream buffer, and
-        // drivers cap concurrent video sessions well below what a busy
-        // session could ask for now that every viewer owns one.  Refuse
-        // past the cap rather than discovering the driver's limit as an
-        // opaque allocation failure.
-        if self.vulkan_encoders.len() >= MAX_VULKAN_ENCODERS {
-            eprintln!(
-                "[vulkan-render] refusing vulkan encoder for surface {surface_id} client \
-                 {client_id}: {MAX_VULKAN_ENCODERS} sessions already live",
-            );
-            return false;
         }
 
         let codec_name = match codec {
