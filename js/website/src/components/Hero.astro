@@ -55,15 +55,17 @@ const PROOF = [
           <div class="divide-y divide-[var(--border)]">
             {
               INSTALL_ROWS.map(({ platform, prompt, command }) => (
-                <div class="flex min-w-0 items-center gap-2 px-4 py-3.5">
-                  <span class="w-[6.5rem] shrink-0 font-mono text-[9px] font-bold uppercase tracking-wider text-[var(--dim)]">
+                <div class="px-4 py-3.5">
+                  <div class="font-mono text-[9px] font-bold uppercase tracking-wider text-[var(--dim)]">
                     {platform}
-                  </span>
-                  <span class="select-none text-[var(--green)]">{prompt}</span>
-                  <code class="min-w-0 flex-1 truncate font-mono text-[12px] text-[var(--code-fg)]">
-                    {command}
-                  </code>
-                  <CopyButton text={command} client:load />
+                  </div>
+                  <div class="mt-1.5 flex min-w-0 items-start gap-2">
+                    <span class="select-none text-[var(--green)]">{prompt}</span>
+                    <code class="min-w-0 flex-1 break-all font-mono text-[12px] leading-relaxed text-[var(--code-fg)] sm:break-normal">
+                      {command}
+                    </code>
+                    <CopyButton text={command} client:load />
+                  </div>
                 </div>
               ))
             }
@@ -88,9 +90,10 @@ const PROOF = [
         </div>
 
         <div class="mt-7 max-w-xl rounded-lg border border-dashed border-[var(--border-strong)] px-3.5 py-3">
-          <div class="flex min-w-0 items-center gap-2">
-            <span class="shrink-0 rounded bg-[var(--surface)] px-1.5 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[var(--dim)]">No install</span>
-            <code class="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--fg)]">{DOCKER_CMD}</code>
+          <div class="font-mono text-[9px] font-bold uppercase tracking-wider text-[var(--dim)]">No install · Docker demo</div>
+          <div class="mt-1.5 flex min-w-0 items-start gap-2">
+            <span class="select-none text-[var(--green)]">$</span>
+            <code class="min-w-0 flex-1 break-all font-mono text-[11px] leading-relaxed text-[var(--fg)] sm:break-normal">{DOCKER_CMD}</code>
             <CopyButton text={DOCKER_CMD} client:load />
           </div>
         </div>

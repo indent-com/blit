@@ -20,15 +20,18 @@ const DOCKER_CMD = "docker run --rm --shm-size=1g grab/blit-demo";
     </p>
 
     <div class="mx-auto mt-8 max-w-2xl overflow-hidden rounded-xl border border-[var(--border-strong)] bg-[var(--bg-elevated)] text-left shadow-xl">
-      <div class="flex items-center gap-2 px-4 py-3.5">
+      <div class="flex items-start gap-2 px-4 py-3.5">
         <span class="shrink-0 select-none text-[var(--green)]">$</span>
-        <code class="min-w-0 flex-1 truncate font-mono text-[13px] text-[var(--code-fg)]">{INSTALL_CMD}</code>
+        <code class="min-w-0 flex-1 break-all font-mono text-[13px] leading-relaxed text-[var(--code-fg)] sm:break-normal">{INSTALL_CMD}</code>
         <CopyButton text={INSTALL_CMD} client:load />
       </div>
-      <div class="flex items-center gap-2 border-t border-[var(--border)] bg-[var(--surface)] px-4 py-3">
-        <span class="shrink-0 rounded bg-[var(--bg)] px-1.5 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider text-[var(--dim)]">Docker demo</span>
-        <code class="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--fg)]">{DOCKER_CMD}</code>
-        <CopyButton text={DOCKER_CMD} client:load />
+      <div class="border-t border-[var(--border)] bg-[var(--surface)] px-4 py-3">
+        <div class="font-mono text-[9px] font-bold uppercase tracking-wider text-[var(--dim)]">Docker demo</div>
+        <div class="mt-1.5 flex min-w-0 items-start gap-2">
+          <span class="shrink-0 select-none text-[var(--green)]">$</span>
+          <code class="min-w-0 flex-1 break-all font-mono text-[11px] leading-relaxed text-[var(--fg)] sm:break-normal">{DOCKER_CMD}</code>
+          <CopyButton text={DOCKER_CMD} client:load />
+        </div>
       </div>
     </div>
 
