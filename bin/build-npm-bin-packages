@@ -341,9 +341,15 @@ exact terms.
 MD
 fi
 
-# Emit a publish order manifest: platform packages first, launchers last.
+# Emit a publish order manifest: within a flavor, platform packages before the launcher that
+# depends on them; and the whole MIT set before the GPL one. publish-npm-bin-packages walks this
+# file under `set -e`, so a failure on a GPL package must not be able to hold back the MIT
+# release — @blit-sh/bin is what the world installs.
 {
-  for name in "${pkg_names[@]}"; do echo "$name"; done
+  for name in ${mit_names[@]+"${mit_names[@]}"}; do echo "$name"; done
   echo "@blit-sh/bin"
-  if [ ${#gpl_names[@]} -gt 0 ]; then echo "@blit-sh/bin-gpl"; fi
+  if [ ${#gpl_names[@]} -gt 0 ]; then
+    for name in "${gpl_names[@]}"; do echo "$name"; done
+    echo "@blit-sh/bin-gpl"
+  fi
 } > "$out_dir/.publish-order"
