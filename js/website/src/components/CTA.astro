@@ -1,44 +1,44 @@
 ---
 import CopyButton from "./CopyButton.tsx";
 
-// --shm-size because the image ships firefox, whose tabs crash on Docker's
-// 64 MB /dev/shm default. Harmless for everything else in there.
+const INSTALL_CMD = "curl -sf https://install.blit.sh | sh";
 const DOCKER_CMD = "docker run --rm --shm-size=1g grab/blit-demo";
 ---
 
 <section class="relative isolate overflow-hidden border-b border-[var(--border)] bg-[var(--bg)]">
-  <div
-    aria-hidden="true"
-    class="absolute inset-0 -z-10 hero-bg pointer-events-none"
-  >
-  </div>
-  <div
-    aria-hidden="true"
-    class="absolute inset-x-0 -top-32 -z-10 mx-auto h-64 max-w-3xl opacity-50 blur-3xl pointer-events-none"
-    style="background: radial-gradient(40rem 16rem at 50% 50%, var(--accent-glow), transparent 70%);"
-  >
-  </div>
+  <div aria-hidden="true" class="pointer-events-none absolute inset-0 -z-10 hero-bg"></div>
+  <div aria-hidden="true" class="pointer-events-none absolute inset-x-0 -top-32 -z-10 mx-auto h-64 max-w-3xl opacity-50 blur-3xl" style="background: radial-gradient(40rem 16rem at 50% 50%, var(--accent-glow), transparent 70%);"></div>
 
   <div class="mx-auto max-w-4xl px-6 py-20 text-center max-sm:px-4 max-sm:py-14">
-    <h2
-      class="font-sans text-[clamp(2rem,4vw,3rem)] font-bold leading-tight tracking-[-0.025em] text-[var(--bright)]"
-    >
-      Try it without installing.
+    <div class="font-mono text-[11px] font-bold uppercase tracking-[0.18em] text-[var(--accent)]">The shortest path to the product</div>
+    <h2 class="mt-4 font-sans text-[clamp(2rem,4.5vw,3.4rem)] font-bold leading-[1.08] tracking-[-0.035em] text-[var(--bright)]">
+      Put this machine in a tab.
     </h2>
     <p class="mx-auto mt-4 max-w-xl text-[15px] leading-relaxed text-[var(--dim)]">
-      The demo image runs unprivileged and starts a shareable terminal,
-      with foot, mpv, neovim, and a few Wayland toys preloaded. Spin it up
-      to feel the latency.
+      Install one binary, run <code class="text-[var(--fg)]">blit open</code>,
+      and keep working. No account, config file, daemon setup, or required dependency.
     </p>
 
-    <div
-      class="mx-auto mt-8 inline-flex max-w-full items-center gap-2 rounded-xl border border-[var(--border-strong)] bg-[var(--bg-elevated)] px-4 py-3 shadow-lg"
-    >
-      <span class="shrink-0 select-none text-[var(--green)]">$</span>
-      <code class="flex-1 truncate font-mono text-[14px] text-[var(--code-fg)]"
-        >{DOCKER_CMD}</code
-      >
-      <CopyButton text={DOCKER_CMD} client:load />
+    <div class="mx-auto mt-8 max-w-2xl overflow-hidden rounded-xl border border-[var(--border-strong)] bg-[var(--bg-elevated)] text-left shadow-xl">
+      <div class="flex items-start gap-2 px-4 py-3.5">
+        <span class="shrink-0 select-none text-[var(--green)]">$</span>
+        <code class="min-w-0 flex-1 break-all font-mono text-[13px] leading-relaxed text-[var(--code-fg)] sm:break-normal">{INSTALL_CMD}</code>
+        <CopyButton text={INSTALL_CMD} client:load />
+      </div>
+      <div class="border-t border-[var(--border)] bg-[var(--surface)] px-4 py-3">
+        <div class="font-mono text-[9px] font-bold uppercase tracking-wider text-[var(--dim)]">Docker demo</div>
+        <div class="mt-1.5 flex min-w-0 items-start gap-2">
+          <span class="shrink-0 select-none text-[var(--green)]">$</span>
+          <code class="min-w-0 flex-1 break-all font-mono text-[11px] leading-relaxed text-[var(--fg)] sm:break-normal">{DOCKER_CMD}</code>
+          <CopyButton text={DOCKER_CMD} client:load />
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-6 flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-[12px] text-[var(--dim)]">
+      <span>Linux · macOS · Windows</span>
+      <span>MIT-licensed default build</span>
+      <a href="https://github.com/indent-com/blit" target="_blank" rel="noopener noreferrer" class="font-semibold text-[var(--accent)] no-underline hover:underline">Read the source →</a>
     </div>
   </div>
 </section>

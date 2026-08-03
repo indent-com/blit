@@ -1,32 +1,22 @@
 ---
 import CopyButton from "./CopyButton.tsx";
 import HeroWorkspace from "./HeroWorkspace.tsx";
-import JoinForm from "./JoinForm.tsx";
 
 const INSTALL_CMD = "curl -sf https://install.blit.sh | sh";
 const INSTALL_PS = "irm https://install.blit.sh/install.ps1 | iex";
-// --shm-size because the image ships firefox, whose tabs crash on Docker's
-// 64 MB /dev/shm default. Harmless for everything else in there.
+const OPEN_CMD = "blit open";
 const DOCKER_CMD = "docker run --rm --shm-size=1g grab/blit-demo";
 
-/**
- * The proof strip. One shape for every cell — a single-token value over a
- * label — because the odd one out is what broke it: `4 transports` put a
- * second word on the 26px value line, so at narrow widths it wrapped, that
- * cell stood two lines tall while its neighbours stood one, and the labels
- * stopped sharing a baseline. Kept as data so the next stat inherits the
- * shape instead of a copy of the classes.
- *
- * Transports are the five in docs/transports.md.
- */
-const STATS = [
-  { value: "1", label: "Single binary" },
-  { value: "0", label: "Required deps" },
-  {
-    value: "5",
-    label: "Transports · WS · WebTransport · WebRTC · Unix · SSH",
-  },
-  { value: "MIT", label: "Open source · Linux · macOS · Windows" },
+const INSTALL_ROWS = [
+  { platform: "Linux / macOS", prompt: "$", command: INSTALL_CMD },
+  { platform: "Windows", prompt: ">", command: INSTALL_PS },
+];
+
+const PROOF = [
+  { value: "1", label: "binary" },
+  { value: "0", label: "required dependencies" },
+  { value: "3", label: "desktop platforms" },
+  { value: "MIT", label: "open-source core" },
 ];
 ---
 
@@ -34,145 +24,100 @@ const STATS = [
   id="install"
   class="relative isolate overflow-hidden border-b border-[var(--border)] hero-bg"
 >
-  <div
-    aria-hidden="true"
-    class="absolute inset-0 -z-10 grid-bg pointer-events-none"
-  >
-  </div>
+  <div aria-hidden="true" class="pointer-events-none absolute inset-0 -z-10 grid-bg"></div>
 
-  <div
-    class="relative mx-auto max-w-6xl px-6 pt-16 pb-20 max-sm:px-4 max-sm:pt-12 max-sm:pb-14"
-  >
-    <div
-      class="grid grid-cols-1 gap-12 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)] lg:gap-10 lg:items-center"
-    >
-      <!-- LEFT: copy + install -->
+  <div class="relative mx-auto max-w-6xl px-6 pb-16 pt-14 max-sm:px-4 max-sm:pb-12 max-sm:pt-10 lg:pb-20 lg:pt-18">
+    <div class="grid grid-cols-1 items-center gap-12 lg:grid-cols-[minmax(0,0.92fr)_minmax(0,1.08fr)] lg:gap-10">
       <div class="flex flex-col">
-        <h1
-          class="font-sans text-[clamp(2.5rem,5.6vw,4.2rem)] font-bold leading-[1.04] tracking-[-0.025em] text-[var(--bright)]"
-        >
-          Your dev box,<br />in a <span class="grad-text">browser tab</span>.
+        <div class="mb-5 flex flex-wrap items-center gap-2">
+          <span class="rounded-full border border-[var(--accent)]/35 bg-[var(--accent-soft)] px-3 py-1 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-[var(--accent)]">
+            Open-source remote workspace
+          </span>
+          <span class="font-mono text-[10px] text-[var(--dim)]">Linux · macOS · Windows</span>
+        </div>
+
+        <h1 class="font-sans text-[clamp(2.7rem,5.8vw,4.6rem)] font-bold leading-[0.99] tracking-[-0.045em] text-[var(--bright)]">
+          Your whole dev machine.
+          <span class="grad-text">One browser tab.</span>
         </h1>
 
-        <p class="mt-5 max-w-xl text-[16px] leading-relaxed text-[var(--dim)]">
-          Terminals, files, commit log, diffs, editor — streamed live from any
-          machine you can reach. Share it with a link. Let your agents drive
-          it. <span class="text-[var(--fg)]"
-            >One binary. No required dependencies.</span
-          >
+        <p class="mt-6 max-w-xl text-[17px] leading-[1.7] text-[var(--dim)]">
+          blit turns any machine into a fast browser workspace—with persistent
+          terminals, files, Git, code intelligence, port forwarding, and even
+          GUI apps. Share it with a link. Drive it with an agent.
         </p>
 
-        <!-- Install card -->
-        <div class="mt-8 max-w-xl">
-          <div
-            class="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] shadow-[0_1px_0_0_var(--border)]"
-          >
-            <div
-              class="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2"
-            >
-              <span
-                class="font-mono text-[10px] font-bold uppercase tracking-[0.12em] text-[var(--dim)]"
-                >Install in 3 seconds</span
-              >
-              <a
-                href="https://github.com/indent-com/blit#install"
-                target="_blank"
-                rel="noopener noreferrer"
-                class="text-[11px] text-[var(--accent)] no-underline hover:underline"
-                >Other ways →</a
-              >
-            </div>
-            <div class="flex flex-col gap-px bg-[var(--border)]">
-              {
-                [
-                  { label: "Unix", prompt: "$", cmd: INSTALL_CMD },
-                  { label: "Windows", prompt: ">", cmd: INSTALL_PS },
-                  { label: "Docker", prompt: "$", cmd: DOCKER_CMD },
-                ].map((row) => (
-                  <div class="flex items-center gap-2 bg-[var(--bg-elevated)] px-4 py-2.5">
-                    <span class="w-16 shrink-0 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]">
-                      {row.label}
-                    </span>
-                    <span class="shrink-0 select-none text-[var(--green)]">
-                      {row.prompt}
-                    </span>
-                    <code class="flex-1 min-w-0 truncate font-mono text-[13px] text-[var(--code-fg)]">
-                      {row.cmd}
-                    </code>
-                    <CopyButton text={row.cmd} client:load />
+        <div class="mt-8 max-w-xl overflow-hidden rounded-xl border border-[var(--border-strong)] bg-[var(--bg-elevated)] shadow-[0_12px_32px_-22px_var(--accent-glow)]">
+          <div class="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2.5">
+            <span class="font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-[var(--dim)]">Install and open</span>
+            <span class="font-mono text-[10px] text-[var(--green)]">about 3 seconds</span>
+          </div>
+          <div class="divide-y divide-[var(--border)]">
+            {
+              INSTALL_ROWS.map(({ platform, prompt, command }) => (
+                <div class="px-4 py-3.5">
+                  <div class="font-mono text-[9px] font-bold uppercase tracking-wider text-[var(--dim)]">
+                    {platform}
                   </div>
-                ))
-              }
-            </div>
+                  <div class="mt-1.5 flex min-w-0 items-start gap-2">
+                    <span class="select-none text-[var(--green)]">{prompt}</span>
+                    <code class="min-w-0 flex-1 break-all font-mono text-[12px] leading-relaxed text-[var(--code-fg)] sm:break-normal">
+                      {command}
+                    </code>
+                    <CopyButton text={command} client:load />
+                  </div>
+                </div>
+              ))
+            }
+          </div>
+          <div class="flex items-center gap-3 border-t border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 text-[11px] text-[var(--dim)]">
+            <span class="min-w-0 flex-1">
+              Both install one binary. Then run
+              <code class="font-bold text-[var(--fg)]">{OPEN_CMD}</code>.
+            </span>
+            <CopyButton text={OPEN_CMD} client:load />
           </div>
         </div>
 
-        <!-- Secondary CTAs -->
-        <div class="mt-5 flex flex-wrap items-center gap-3">
-          <a
-            href="https://github.com/indent-com/blit"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="inline-flex items-center gap-2 rounded-md border border-[var(--border-strong)] bg-[var(--surface)] px-3.5 py-2 text-[13px] font-medium text-[var(--fg)] no-underline transition-colors hover:border-[var(--accent)]"
-          >
-            <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"
-              ><path
-                d="M8 .2A8 8 0 0 0 5.5 15.8c.4.1.5-.2.5-.4v-1.5c-2.2.5-2.7-1-2.7-1-.4-.9-.9-1.2-.9-1.2-.7-.5.1-.5.1-.5.8 0 1.2.8 1.2.8.7 1.2 1.9.9 2.4.7.1-.5.3-.9.5-1.1-1.8-.2-3.6-.9-3.6-3.9 0-.9.3-1.6.8-2.1-.1-.2-.4-1 .1-2.1 0 0 .7-.2 2.2.8a7.7 7.7 0 0 1 4 0c1.5-1 2.2-.8 2.2-.8.4 1.1.2 1.9.1 2.1.5.5.8 1.2.8 2.1 0 3-1.8 3.7-3.6 3.9.3.2.5.7.5 1.5v2.2c0 .2.1.5.6.4A8 8 0 0 0 8 .2Z"
-              ></path></svg
-            >
-            Star on GitHub
+        <div class="mt-5 flex flex-wrap items-center gap-4">
+          <a href="#product" class="inline-flex items-center gap-2 rounded-lg bg-[var(--bright)] px-4 py-2.5 text-[13px] font-semibold text-[var(--bg)] no-underline transition-transform hover:-translate-y-0.5">
+            See everything blit does
+            <span aria-hidden="true">↓</span>
           </a>
-          <a
-            href="#agents"
-            class="inline-flex items-center gap-1.5 px-1 text-[13px] font-medium text-[var(--accent)] no-underline hover:underline"
-          >
-            Read the agent skill
-            <span aria-hidden="true">→</span>
+          <a href="https://github.com/indent-com/blit" target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-2 text-[13px] font-semibold text-[var(--fg)] no-underline hover:text-[var(--accent)]">
+            View on GitHub <span aria-hidden="true">↗</span>
           </a>
         </div>
 
-        <!-- Join existing terminal -->
-        <div class="mt-7">
-          <div
-            class="mb-2 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]"
-          >
-            Or join an existing terminal
+        <div class="mt-7 max-w-xl rounded-lg border border-dashed border-[var(--border-strong)] px-3.5 py-3">
+          <div class="font-mono text-[9px] font-bold uppercase tracking-wider text-[var(--dim)]">No install · Docker demo</div>
+          <div class="mt-1.5 flex min-w-0 items-start gap-2">
+            <span class="select-none text-[var(--green)]">$</span>
+            <code class="min-w-0 flex-1 break-all font-mono text-[11px] leading-relaxed text-[var(--fg)] sm:break-normal">{DOCKER_CMD}</code>
+            <CopyButton text={DOCKER_CMD} client:load />
           </div>
-          <JoinForm client:load />
         </div>
       </div>
 
-      <!-- RIGHT: the product, replaying a real session through the real
-           renderer. Not a mock — see HeroWorkspace.tsx. -->
       <div class="relative">
-        <div
-          aria-hidden="true"
-          class="pointer-events-none absolute -inset-6 -z-10 rounded-[28px] opacity-70 blur-2xl"
-          style="background: radial-gradient(40rem 18rem at 60% 40%, var(--accent-glow), transparent 70%);"
-        >
+        <div aria-hidden="true" class="pointer-events-none absolute -inset-6 -z-10 rounded-[28px] opacity-70 blur-2xl" style="background: radial-gradient(40rem 18rem at 60% 40%, var(--accent-glow), transparent 70%);"></div>
+        <div class="mb-3 flex items-center justify-between px-1 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--dim)]">
+          <span>The actual blit workspace</span>
+          <span class="flex items-center gap-1.5 text-[var(--green)]"><span class="h-1.5 w-1.5 rounded-full bg-[var(--green)]"></span> Real recorded session</span>
         </div>
         <HeroWorkspace client:only="solid-js" />
       </div>
     </div>
 
-    <!-- Proof strip -->
-    <div
-      class="mt-16 grid grid-cols-2 gap-y-6 border-y border-[var(--border)] py-6 sm:grid-cols-4 sm:gap-x-8"
-    >
+    <dl class="mt-14 grid grid-cols-2 overflow-hidden rounded-xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--bg-elevated)_82%,transparent)] backdrop-blur sm:grid-cols-4">
       {
-        STATS.map((stat) => (
-          <div>
-            <div
-              class="whitespace-nowrap font-mono text-[26px] font-bold leading-none text-[var(--bright)]"
-            >
-              {stat.value}
-            </div>
-            <div class="mt-2 font-mono text-[10px] font-bold uppercase tracking-wider text-[var(--dim)]">
-              {stat.label}
-            </div>
+        PROOF.map(({ value, label }, i) => (
+          <div class:list={["px-5 py-4", i % 2 === 0 && "max-sm:border-r max-sm:border-[var(--border)]", i < 2 && "max-sm:border-b max-sm:border-[var(--border)]", i < PROOF.length - 1 && "sm:border-r sm:border-[var(--border)]"]}>
+            <dt class="font-mono text-[20px] font-bold leading-none text-[var(--bright)]">{value}</dt>
+            <dd class="mt-1.5 font-mono text-[9px] font-bold uppercase tracking-[0.14em] text-[var(--dim)]">{label}</dd>
           </div>
         ))
       }
-    </div>
+    </dl>
   </div>
 </section>
