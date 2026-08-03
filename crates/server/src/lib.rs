@@ -701,6 +701,12 @@ struct SurfaceSubState {
     adaptive_quantizer: Option<u8>,
     /// When the controller last moved `adaptive_quantizer`, for hysteresis.
     rate_stepped_at: Option<Instant>,
+    /// The compositor refused this client a Vulkan Video session for this
+    /// surface.  Latched so selection stops offering it — otherwise the
+    /// next tick re-selects, is refused again, and the surface never
+    /// reaches a server-side encoder.  Cleared when the surface is
+    /// invalidated (resize / destroy), which is a fair time to retry.
+    vulkan_refused: bool,
     /// Last per-client downscale target dims registered with the
     /// compositor.  Used to send `ClearDownscaleTarget` for the old
     /// dims when the encoder is recreated at a new size, so stale
@@ -1841,6 +1847,18 @@ fn record_surface_ack(client: &mut ClientState, surface_id: u16) {
             client.goodput_window_start = now;
         }
     }
+}
+
+/// Forget every unacked frame for `surface_id`.
+///
+/// A surface that has gone away (unsubscribed, destroyed, resized) will
+/// never be acked, and Wayland reuses surface ids: a later frame on the
+/// recycled id would match a minutes-old entry, report an absurd RTT, and
+/// drag the goodput estimate — and so the adaptive controller — down.
+fn forget_surface_inflight(client: &mut ClientState, surface_id: u16) {
+    client
+        .surface_inflight_frames
+        .retain(|f| f.surface_id != surface_id);
 }
 
 fn reset_inflight(client: &mut ClientState) {
@@ -3336,6 +3354,7 @@ async fn tick(state: &AppState) -> TickOutcome {
         for c in sess.clients.values_mut() {
             c.surface_subs.remove(&sid);
             had_vulkan |= c.vulkan_video_surfaces.remove(&sid).is_some();
+            forget_surface_inflight(c, sid);
         }
         // The compositor's sessions are sized against the old composite,
         // so drop every client's encoder for this surface.  Selection will
@@ -3352,14 +3371,25 @@ async fn tick(state: &AppState) -> TickOutcome {
     }
 
     // A client the compositor could not give a session to falls back to a
-    // server-side encoder.  Selection will not retry Vulkan for it until
-    // something else invalidates the surface, which is what we want: the
-    // cap or the driver refusal will still be in force next tick.
+    // server-side encoder.  The refusal has to be latched: selection only
+    // asks whether the client's target matches native, which it still
+    // does, so without the latch the next tick re-selects Vulkan, is
+    // refused again, and the surface never reaches an encoder at all.
     for (sid, cid) in vulkan_unavailable {
         if let Some(c) = sess.clients.get_mut(&cid)
             && c.vulkan_video_surfaces.remove(&sid).is_some()
         {
-            c.surface_subs.remove(&sid);
+            // Keep the rest of the subscription: it carries this client's
+            // bandwidth/speed/codec overrides, which a refusal is no
+            // reason to reset.  Clearing the encoder is enough to make the
+            // next tick build a server-side one.
+            let sub = c.surface_subs.entry(sid).or_default();
+            sub.vulkan_refused = true;
+            sub.encoder = None;
+            if sub.encode_in_flight || sub.creation_in_flight {
+                sub.encoder_invalidated = true;
+            }
+            forget_surface_inflight(c, sid);
             c.surface_needs_keyframe = true;
             eprintln!(
                 "[vulkan-video] cid={cid} sid={sid}: compositor declined a session, \
@@ -3695,9 +3725,14 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // meaningful because sessions are owned per `(surface,
                 // client)`: one viewer's backoff no longer degrades
                 // everyone else's stream.
-                if let Some(q) = step.quantizer
-                    && client.vulkan_video_surfaces.contains_key(&sid)
-                {
+                if step.quantizer.is_some() && client.vulkan_video_surfaces.contains_key(&sid) {
+                    // Through `resolve_bandwidth`, not the raw step: the
+                    // controller floors at `ADAPTIVE_MAX_QUANTIZER`, so a
+                    // ceiling set cheaper than that would otherwise be
+                    // overshot into spending more bits than allowed.
+                    let q = resolve_bandwidth(client, state.config.surface_encoding.bandwidth, sid)
+                        .av1_quantizer()
+                        .min(255) as u8;
                     pending_vulkan_qp_updates.push((sid as u32, work.cid, q));
                 }
 
@@ -3962,7 +3997,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // the wrong resolution and we'd have no way to scale
                     // it.  Other subscribers are unaffected either way:
                     // each owns its own session.
-                    let vulkan_eligible = (target_w, target_h) == (px_w, px_h);
+                    let vulkan_eligible = (target_w, target_h) == (px_w, px_h)
+                        && !client
+                            .surface_subs
+                            .get(&sid)
+                            .is_some_and(|s| s.vulkan_refused);
 
                     for &pref in &state.config.surface_encoders {
                         if !pref.is_vulkan_video() {
@@ -9209,8 +9248,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         .and_then(|s| s.last_registered_target);
                     c.surface_subscriptions.remove(&surface_id);
                     c.surface_subs.remove(&surface_id);
-                    c.surface_inflight_frames
-                        .retain(|f| f.surface_id != surface_id);
+                    forget_surface_inflight(c, surface_id);
                     removed_vulkan = c.vulkan_video_surfaces.remove(&surface_id).is_some();
                     c.surface_view_sizes.remove(&surface_id);
                 }
@@ -11700,6 +11738,32 @@ mod tests {
         );
         // Nothing to rebuild: the compositor retargets in place.
         assert!(!step.rebuild);
+    }
+
+    #[test]
+    fn a_ceiling_cheaper_than_the_controller_floor_is_still_the_ceiling() {
+        // The controller floors at ADAPTIVE_MAX_QUANTIZER, so a surface
+        // configured cheaper than that (quantizer 255 = minimum bandwidth)
+        // must not be pulled back up to 200 and spend more than allowed.
+        let (mut client, _rx) = test_client_with_capacity(64);
+        let sub = client.surface_subs.entry(6).or_default();
+        sub.bandwidth_override = Some(SurfaceBandwidth::Custom { quantizer: 255 });
+        sub.adaptive_quantizer = Some(ADAPTIVE_MAX_QUANTIZER);
+        let resolved = resolve_bandwidth(&client, SurfaceBandwidth::Medium, 6);
+        assert_eq!(resolved.av1_quantizer(), 255);
+    }
+
+    #[test]
+    fn a_gone_surface_leaves_no_frames_to_be_acked_later() {
+        // Surface ids are recycled, so a stale entry would be matched by a
+        // frame minutes later and report a garbage RTT.
+        let (mut client, _rx) = test_client_with_capacity(64);
+        let now = Instant::now();
+        record_surface_frame_sent(&mut client, 1, 1_000, false, now);
+        record_surface_frame_sent(&mut client, 2, 1_000, false, now);
+        forget_surface_inflight(&mut client, 1);
+        assert_eq!(client.surface_inflight_frames.len(), 1);
+        assert_eq!(client.surface_inflight_frames[0].surface_id, 2);
     }
 
     #[test]
