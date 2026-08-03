@@ -3,12 +3,26 @@
 # platform (@blit-sh/bin-<os>-<cpu>[-musl]) plus the @blit-sh/bin launcher that
 # depends on them as optionalDependencies.
 #
+# The GPL flavor (blit-gpl_* tarballs, x264 instead of openh264, Linux only)
+# gets its own parallel set under @blit-sh/bin-gpl, licensed GPL-2.0-or-later.
+# Both sets share the launcher sources in npm/bin; resolve.js reads its own
+# package name to know which platform packages to look for.
+#
 # Usage: build-npm-bin-packages <artifacts-dir> <out-dir> [version]
 #
-#   artifacts-dir   directory scanned (recursively) for blit_*.tar.gz and
-#                   blit_*_windows_*.zip release artifacts
+#   artifacts-dir   directory scanned (recursively) for blit_*.tar.gz,
+#                   blit-gpl_*.tar.gz and blit_*_windows_*.zip release artifacts
 #   out-dir         where generated packages are written
 #   version         optional override; otherwise inferred from filenames
+#
+# The first publish of a NEW package name has to happen by hand: npm only lets
+# you configure trusted publishing (OIDC) on a package that already exists, so
+# the release job cannot create one. Bootstrap it locally, then add the trusted
+# publisher on npmjs.com and let the pipeline take over:
+#
+#   gh release download vX.Y.Z -D artifacts -p 'blit*.tar.gz' -p 'blit_*_windows_*.zip'
+#   bin/build-npm-bin-packages artifacts dist/npm-bin X.Y.Z
+#   npm publish dist/npm-bin/@blit-sh/<new-package> --access public
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,6 +40,7 @@ AUTHOR="Indent <oss@indent.com> (https://indent.com)"
 REPO_URL="git+https://github.com/indent-com/blit.git"
 BUGS_URL="https://github.com/indent-com/blit/issues"
 LICENSE="MIT"
+GPL_LICENSE="GPL-2.0-or-later"
 
 extract_zip() {
   # extract_zip <zip> <dest-dir>
@@ -52,8 +67,13 @@ set_version() {
 }
 [ -n "$version_override" ] && version="$version_override"
 
-# Track generated platform package names for the launcher manifest.
+# Track generated platform package names for the launcher manifests. The flavor
+# is read back off the name, so one list covers both.
 pkg_names=()
+
+# Set by the artifact loop before each write_platform_pkg call.
+pkg_license="$LICENSE"
+pkg_launcher="@blit-sh/bin"
 
 # write_platform_pkg <pkgName> <nodeOs> <nodeCpu> <libc|''> <binFile> <srcBinary> <descSuffix>
 write_platform_pkg() {
@@ -75,7 +95,7 @@ write_platform_pkg() {
   "version": "$version",
   "description": "blit binary for $desc",
   "homepage": "$HOMEPAGE",
-  "license": "$LICENSE",
+  "license": "$pkg_license",
   "author": "$AUTHOR",
   "repository": { "type": "git", "url": "$REPO_URL" },
   "bugs": { "url": "$BUGS_URL" },
@@ -92,8 +112,8 @@ JSON
 
 Prebuilt \`blit\` binary for $desc.
 
-This is a platform-specific dependency of [\`@blit-sh/bin\`](https://www.npmjs.com/package/@blit-sh/bin);
-install \`@blit-sh/bin\` instead. See <https://blit.sh>.
+This is a platform-specific dependency of [\`$pkg_launcher\`](https://www.npmjs.com/package/$pkg_launcher);
+install \`$pkg_launcher\` instead. See <https://blit.sh>.
 MD
 
   pkg_names+=("$name")
@@ -113,8 +133,16 @@ split_os_arch() {
 
 process_tarball() {
   local f="$1" base os arch v rest
-  base="$(basename "$f" .tar.gz)"           # blit_<ver>_<os>_<arch>
-  rest="${base#blit_}"                       # <ver>_<os>_<arch>
+  base="$(basename "$f" .tar.gz)"           # blit[-gpl]_<ver>_<os>_<arch>
+  case "$base" in
+    blit-gpl_*)
+      rest="${base#blit-gpl_}"
+      pkg_launcher="@blit-sh/bin-gpl"; pkg_license="$GPL_LICENSE" ;;
+    blit_*)
+      rest="${base#blit_}"
+      pkg_launcher="@blit-sh/bin"; pkg_license="$LICENSE" ;;
+    *) echo "error: unrecognized artifact name '$base'" >&2; exit 1 ;;
+  esac
   v="${rest%%_*}"; rest="${rest#*_}"          # ver, then <os>_<arch>
   split_os_arch "$rest"; os="$split_os"; arch="$split_arch"
   set_version "$v"
@@ -131,13 +159,18 @@ process_tarball() {
     *) echo "error: unknown arch '$arch' in $f" >&2; exit 1 ;;
   esac
 
+  local desc_suffix=""
+  [ "$pkg_launcher" = "@blit-sh/bin-gpl" ] && desc_suffix=", GPL flavor"
   case "$os" in
     linux)
-      write_platform_pkg "@blit-sh/bin-linux-$cpu" linux "$cpu" glibc blit "$bin" "Linux $arch (glibc)" ;;
+      write_platform_pkg "$pkg_launcher-linux-$cpu" linux "$cpu" glibc blit "$bin" \
+        "Linux $arch (glibc)$desc_suffix" ;;
     linux-musl)
-      write_platform_pkg "@blit-sh/bin-linux-$cpu-musl" linux "$cpu" musl blit "$bin" "Linux $arch (musl)" ;;
+      write_platform_pkg "$pkg_launcher-linux-$cpu-musl" linux "$cpu" musl blit "$bin" \
+        "Linux $arch (musl)$desc_suffix" ;;
     darwin)
-      write_platform_pkg "@blit-sh/bin-darwin-$cpu" darwin "$cpu" "" blit "$bin" "macOS $arch" ;;
+      write_platform_pkg "$pkg_launcher-darwin-$cpu" darwin "$cpu" "" blit "$bin" \
+        "macOS $arch$desc_suffix" ;;
     *) echo "error: unknown os '$os' in $f" >&2; exit 1 ;;
   esac
   rm -rf "$tmp"
@@ -146,6 +179,7 @@ process_tarball() {
 process_zip() {
   local f="$1" base rest v arch
   base="$(basename "$f" .zip)"               # blit_<ver>_windows_<arch>
+  pkg_launcher="@blit-sh/bin"; pkg_license="$LICENSE"
   rest="${base#blit_}"                       # <ver>_windows_<arch>
   v="${rest%%_*}"; rest="${rest#*_}"          # ver, then windows_<arch>
   split_os_arch "$rest"; arch="$split_arch"  # split_os == "windows"
@@ -169,11 +203,12 @@ process_zip() {
 
 echo "scanning $in_dir for release artifacts..."
 shopt -s nullglob globstar
-for f in "$in_dir"/**/*.tar.gz; do
+for f in "$in_dir"/**/blit_*.tar.gz "$in_dir"/**/blit-gpl_*.tar.gz; do
   [ -f "$f" ] || continue
   process_tarball "$f"
 done
-for f in "$in_dir"/**/*_windows_*.zip; do
+# Windows has no GPL build, so the plain prefix is the whole set here.
+for f in "$in_dir"/**/blit_*_windows_*.zip; do
   [ -f "$f" ] || continue
   process_zip "$f"
 done
@@ -190,35 +225,58 @@ fi
 # De-duplicate package names (glob fallbacks may match twice).
 mapfile -t pkg_names < <(printf '%s\n' "${pkg_names[@]}" | sort -u)
 
-# --- Launcher package (@blit-sh/bin) ---
-launcher_src="$repo_root/npm/bin"
-launcher_out="$out_dir/@blit-sh/bin"
-rm -rf "$launcher_out"
-mkdir -p "$launcher_out/bin"
-for f in index.js index.mjs index.d.ts resolve.js resolve.d.ts README.md; do
-  cp "$launcher_src/$f" "$launcher_out/$f"
-done
-cp "$launcher_src/bin/blit.js" "$launcher_out/bin/blit.js"
-
-# Build optionalDependencies JSON object pinned to this version.
-opt_deps=""
+# Split the platform packages by flavor; each launcher depends on its own set.
+mit_names=(); gpl_names=()
 for name in "${pkg_names[@]}"; do
-  [ -n "$opt_deps" ] && opt_deps+=","
-  opt_deps+="\n    \"$name\": \"$version\""
+  case "$name" in
+    @blit-sh/bin-gpl-*) gpl_names+=("$name") ;;
+    *) mit_names+=("$name") ;;
+  esac
 done
 
-cat > "$launcher_out/package.json" <<JSON
+# write_launcher <pkgName> <license> <description> <withCliShim:0|1> <platformPkg...>
+# Both launchers ship the same sources from npm/bin; resolve.js keys off the
+# package name it finds in its own manifest. The GPL one omits the CLI shim so
+# it can be installed alongside @blit-sh/bin without two packages fighting over
+# the `blit` bin name — spawn its default export instead, or install the CLI
+# with `curl -sf https://install.blit.sh | BLIT_GPL=1 sh`.
+write_launcher() {
+  local name="$1" license="$2" description="$3" with_shim="$4"; shift 4
+  local deps=("$@")
+  local src="$repo_root/npm/bin"
+  local dir="$out_dir/$name"
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  local f
+  for f in index.js index.mjs index.d.ts resolve.js resolve.d.ts; do
+    cp "$src/$f" "$dir/$f"
+  done
+
+  local bin_field="" shim_file=""
+  if [ "$with_shim" = "1" ]; then
+    mkdir -p "$dir/bin"
+    cp "$src/bin/blit.js" "$dir/bin/blit.js"
+    bin_field='\n  "bin": { "blit": "bin/blit.js" },'
+    shim_file='"bin/blit.js", '
+  fi
+
+  local opt_deps="" dep
+  for dep in "${deps[@]}"; do
+    [ -n "$opt_deps" ] && opt_deps+=","
+    opt_deps+="\n    \"$dep\": \"$version\""
+  done
+
+  cat > "$dir/package.json" <<JSON
 {
-  "name": "@blit-sh/bin",
+  "name": "$name",
   "version": "$version",
-  "description": "Installs the prebuilt blit binary for your platform; default export is the binary path.",
+  "description": "$description",
   "keywords": ["blit", "terminal", "multiplexer", "wayland", "cli"],
   "homepage": "$HOMEPAGE",
-  "license": "$LICENSE",
+  "license": "$license",
   "author": "$AUTHOR",
   "repository": { "type": "git", "url": "$REPO_URL", "directory": "npm/bin" },
-  "bugs": { "url": "$BUGS_URL" },
-  "bin": { "blit": "bin/blit.js" },
+  "bugs": { "url": "$BUGS_URL" },$(printf "$bin_field")
   "type": "commonjs",
   "main": "index.js",
   "module": "index.mjs",
@@ -235,21 +293,57 @@ cat > "$launcher_out/package.json" <<JSON
     },
     "./package.json": "./package.json"
   },
-  "files": ["bin/blit.js", "index.js", "index.mjs", "index.d.ts", "resolve.js", "resolve.d.ts", "README.md"],
+  "files": [${shim_file}"index.js", "index.mjs", "index.d.ts", "resolve.js", "resolve.d.ts", "README.md"],
   "optionalDependencies": {$(printf "$opt_deps")
   },
   "engines": { "node": ">=18" }
 }
 JSON
-echo "  generated @blit-sh/bin launcher (optionalDependencies: ${pkg_names[*]})"
+  echo "  generated $name launcher (optionalDependencies: ${deps[*]})"
+}
 
-# Emit a publish order manifest: platform packages first, launcher last.
+write_launcher "@blit-sh/bin" "$LICENSE" \
+  "Installs the prebuilt blit binary for your platform; default export is the binary path." \
+  1 ${mit_names[@]+"${mit_names[@]}"}
+cp "$repo_root/npm/bin/README.md" "$out_dir/@blit-sh/bin/README.md"
+
+if [ ${#gpl_names[@]} -gt 0 ]; then
+  write_launcher "@blit-sh/bin-gpl" "$GPL_LICENSE" \
+    "Installs the prebuilt GPL (x264) blit binary for your Linux platform; default export is the binary path." \
+    0 "${gpl_names[@]}"
+  cat > "$out_dir/@blit-sh/bin-gpl/README.md" <<MD
+# @blit-sh/bin-gpl
+
+The GPL flavor of the [blit](https://blit.sh) binary, distributed via npm. It is
+the same build as [\`@blit-sh/bin\`](https://www.npmjs.com/package/@blit-sh/bin)
+except that software H.264 encodes with x264 (GPL-2.0-or-later) instead of
+openh264: better compression, and 4:4:4 rather than 4:2:0. Linux only — x64 and
+arm64, glibc and musl.
+
+Installing it pulls in exactly one prebuilt package for your platform
+(\`@blit-sh/bin-gpl-linux-<cpu>[-musl]\`) through optional dependencies.
+
+The default export is the absolute path to the executable:
+
+\`\`\`js
+const blit = require("@blit-sh/bin-gpl");
+require("child_process").spawn(blit, ["open"], { stdio: "inherit" });
+\`\`\`
+
+There is no \`blit\` CLI shim here, so this package can be installed next to
+\`@blit-sh/bin\`. For the GPL binary on your PATH use
+\`curl -sf https://install.blit.sh | BLIT_GPL=1 sh\`.
+
+This binary includes libx264 and is therefore covered by GPL-2.0-or-later.
+Complete corresponding source: <https://github.com/indent-com/blit>
+(x264: <https://code.videolan.org/videolan/x264>). \`blit --license\` prints the
+exact terms.
+MD
+fi
+
+# Emit a publish order manifest: platform packages first, launchers last.
 {
   for name in "${pkg_names[@]}"; do echo "$name"; done
   echo "@blit-sh/bin"
+  if [ ${#gpl_names[@]} -gt 0 ]; then echo "@blit-sh/bin-gpl"; fi
 } > "$out_dir/.publish-order"
-
-echo ""
-echo "version: $version"
-echo "packages written to: $out_dir"
-ls -1 "$out_dir"
