@@ -4689,3 +4689,169 @@ fn text_patch_truncates_at_a_file_boundary() {
     // One file alone over the budget is the case that has nowhere to cut.
     assert_eq!(page(64, "").0, GIT_STATUS_TOO_LARGE);
 }
+
+/// A gitlink's path is a directory on disk, and the worktree side skipped
+/// every directory: a clean superproject reported each of its submodules
+/// deleted, and the untracked walk claimed the submodule's own checkout —
+/// `.git` included — as new files. Git reports neither. A gitlink now reads
+/// the checked-out submodule's HEAD, an uninitialized one stays clean, and a
+/// moved one is a single M entry carrying the SUBMODULE flag.
+#[test]
+fn submodule_reads_its_checked_out_head() {
+    fn worktree_diff(dir: &Path, old: GitEndpoint) -> Vec<(u8, String, u8, GitOid)> {
+        let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+        let req = GitDiffRequest {
+            nonce: 1,
+            repo_id: 0,
+            flags: GIT_DIFF_UNTRACKED,
+            rename: 0,
+            old,
+            new: GitEndpoint {
+                kind: GIT_ENDPOINT_WORKTREE,
+                oid: GIT_OID_NONE,
+            },
+            path: "",
+            after: "",
+        };
+        let (_, status, _, records) =
+            parse_git_diff_resp(&handle.diff(&req, &Cancel::default())).unwrap();
+        assert_eq!(status, GIT_STATUS_OK);
+        let mut got: Vec<(u8, String, u8, GitOid)> = git_diff_records(&records)
+            .filter_map(|r| match r {
+                GitDiffRecord::Entry {
+                    st,
+                    new_path,
+                    dflags,
+                    new_oid,
+                    ..
+                } => Some((st, new_path.to_string(), dflags, new_oid)),
+                _ => None,
+            })
+            .collect();
+        got.sort_by(|a, b| a.1.cmp(&b.1));
+        got
+    }
+    let names = |got: &[(u8, String, u8, GitOid)]| -> Vec<String> {
+        got.iter()
+            .map(|(st, path, ..)| format!("{} {path}", *st as char))
+            .collect()
+    };
+
+    let root = temp_dir();
+    let sub = root.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    git(&sub, &["init", "-b", "main"]);
+    std::fs::write(sub.join("s.txt"), "one\n").unwrap();
+    git(&sub, &["add", "."]);
+    git(&sub, &["commit", "-m", "s1"]);
+
+    let sup = root.join("super");
+    std::fs::create_dir_all(&sup).unwrap();
+    git(&sup, &["init", "-b", "main"]);
+    std::fs::write(sup.join("top.txt"), "top\n").unwrap();
+    git(&sup, &["add", "."]);
+    git(&sup, &["commit", "-m", "c1"]);
+    let file_urls = ["-c", "protocol.file.allow=always"];
+    let add = [
+        &file_urls[..],
+        &["submodule", "add", sub.to_str().unwrap(), "deps/mod"],
+    ]
+    .concat();
+    git(&sup, &add);
+    git(&sup, &["commit", "-m", "add submodule"]);
+
+    // Clean checkout: git reports nothing, from either old side.
+    assert_eq!(git_out(&sup, &["status", "--porcelain"]), "");
+    let head = rev(&sup, "HEAD");
+    assert_eq!(
+        names(&worktree_diff(
+            &sup,
+            GitEndpoint {
+                kind: GIT_ENDPOINT_COMMIT,
+                oid: head,
+            },
+        )),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        names(&worktree_diff(
+            &sup,
+            GitEndpoint {
+                kind: GIT_ENDPOINT_INDEX,
+                oid: GIT_OID_NONE,
+            },
+        )),
+        Vec::<String>::new()
+    );
+
+    // Same for the STATUS records a review UI lists its files from.
+    let status_letters = |dir: &Path| -> Vec<(String, u8, u8)> {
+        let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+        let msg = wait_first_state(
+            &handle,
+            StateOptions {
+                status: true,
+                untracked: true,
+                ..Default::default()
+            },
+        );
+        let mut mirror = GitStateMirror::new();
+        mirror.apply_state(&msg).complete().unwrap();
+        let mut out: Vec<(String, u8, u8)> = mirror
+            .status
+            .into_iter()
+            .map(|s| (s.path, s.staged, s.unstaged))
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(status_letters(&sup), Vec::new());
+
+    // A clone that never ran `submodule update` has an empty directory
+    // there, and no repository to read a HEAD from: still clean.
+    let clone = [&file_urls[..], &["clone", sup.to_str().unwrap(), "clone"]].concat();
+    git(&root, &clone);
+    let cloned = root.join("clone");
+    assert_eq!(git_out(&cloned, &["status", "--porcelain"]), "");
+    assert!(
+        std::fs::read_dir(cloned.join("deps/mod"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert_eq!(
+        names(&worktree_diff(
+            &cloned,
+            GitEndpoint {
+                kind: GIT_ENDPOINT_COMMIT,
+                oid: rev(&cloned, "HEAD"),
+            },
+        )),
+        Vec::<String>::new()
+    );
+
+    // Moving the submodule's HEAD is one M entry flagged SUBMODULE, whose
+    // new oid is the commit now checked out there.
+    std::fs::write(sup.join("deps/mod/s.txt"), "two\n").unwrap();
+    git(&sup.join("deps/mod"), &["commit", "-am", "s2"]);
+    let moved = rev(&sup.join("deps/mod"), "HEAD");
+    assert_eq!(
+        git_out(&sup, &["status", "--porcelain"]),
+        " M deps/mod",
+        "git's own view"
+    );
+    let got = worktree_diff(
+        &sup,
+        GitEndpoint {
+            kind: GIT_ENDPOINT_COMMIT,
+            oid: head,
+        },
+    );
+    assert_eq!(names(&got), vec!["M deps/mod".to_string()]);
+    assert_ne!(got[0].2 & GIT_DIFF_ENTRY_SUBMODULE, 0, "SUBMODULE flag");
+    assert_eq!(got[0].3, moved, "new side is the submodule's HEAD");
+    assert_eq!(
+        status_letters(&sup),
+        vec![("deps/mod".to_string(), b' ', b'M')]
+    );
+}
