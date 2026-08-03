@@ -1,0 +1,323 @@
+---
+const capabilityLinks = [
+  { number: "01", label: "Workspace", href: "#workspace" },
+  { number: "02", label: "Remotes", href: "#remotes" },
+  { number: "03", label: "Share", href: "#share" },
+  { number: "04", label: "Agents", href: "#agents" },
+  { number: "05", label: "GUI apps", href: "#gui" },
+  { number: "06", label: "Embed", href: "#embed" },
+];
+
+const workspaceFeatures = [
+  ["TERMINALS", "Persistent PTYs and scrollback"],
+  ["FILES", "Live tree, grep, create, move, sync"],
+  ["GIT", "Status, history, branches, staged + unstaged diffs"],
+  ["LSP", "Completion, diagnostics, definitions, rename"],
+];
+
+const agentCommands = [
+  ["terminal", "start · show · send · wait"],
+  ["fs", "cat · find · grep · write · sync"],
+  ["git", "status · log · diff · show"],
+  ["lsp", "def · refs · hover · diag · rename"],
+  ["surface", "capture · click · type · key"],
+  ["kv", "get · put · watch · compare-and-swap"],
+];
+---
+
+<section id="product" class="border-b border-[var(--border)] bg-[var(--bg)]">
+  <div class="mx-auto max-w-6xl px-6 py-20 max-sm:px-4 max-sm:py-14">
+    <div class="max-w-3xl">
+      <div
+        class="font-mono text-[11px] font-bold uppercase tracking-[0.18em] text-[var(--accent)]"
+      >
+        Six jobs. One binary.
+      </div>
+      <h2
+        class="mt-3 font-sans text-[clamp(2rem,4vw,3.1rem)] font-bold leading-[1.08] tracking-[-0.03em] text-[var(--bright)]"
+      >
+        Everything between <code class="font-mono text-[0.83em]">ssh</code> and
+        a cloud IDE—without moving your work to the cloud.
+      </h2>
+      <p class="mt-5 max-w-2xl text-[16px] leading-relaxed text-[var(--dim)]">
+        Run blit on a machine and it becomes a browser workspace, a persistent
+        terminal server, a secure share link, and a computer API. Use only the
+        parts you need; they all see the same live state.
+      </p>
+    </div>
+
+    <nav
+      aria-label="Product capabilities"
+      class="mt-10 grid grid-cols-2 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] sm:grid-cols-3 lg:grid-cols-6"
+    >
+      {
+        capabilityLinks.map(({ number, label, href }, i) => (
+          <a
+            href={href}
+            class:list={[
+              "group flex min-w-0 items-center gap-3 px-4 py-3.5 no-underline transition-colors hover:bg-[var(--surface)]",
+              i < capabilityLinks.length - 1 && "lg:border-r lg:border-[var(--border)]",
+              i < 3 && "max-lg:border-b max-lg:border-[var(--border)]",
+              i % 2 === 0 && "max-sm:border-r max-sm:border-[var(--border)]",
+            ]}
+          >
+            <span class="font-mono text-[10px] font-bold text-[var(--accent)]">{number}</span>
+            <span class="truncate text-[13px] font-semibold text-[var(--fg)]">{label}</span>
+          </a>
+        ))
+      }
+    </nav>
+
+    <div class="mt-20 flex flex-col gap-24 max-sm:mt-14 max-sm:gap-16">
+      <article
+        id="workspace"
+        class="scroll-mt-20 grid grid-cols-1 items-center gap-10 lg:grid-cols-[minmax(0,0.88fr)_minmax(0,1.12fr)] lg:gap-16"
+      >
+        <div>
+          <div class="flex items-center gap-3">
+            <span class="font-mono text-[12px] font-bold text-[var(--accent)]">01 / 06</span>
+            <span class="h-px w-10 bg-[var(--border-strong)]"></span>
+            <span class="font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-[var(--dim)]">Workspace</span>
+          </div>
+          <h3 class="mt-4 text-[clamp(1.65rem,3vw,2.35rem)] font-bold leading-tight tracking-[-0.025em] text-[var(--bright)]">
+            Open the machine, not just another shell.
+          </h3>
+          <p class="mt-4 text-[15px] leading-relaxed text-[var(--dim)]">
+            <code class="text-[var(--fg)]">blit open</code> puts terminals,
+            files, editors, search, diffs, and the commit graph in one tiled
+            tab. The heavy work stays beside your code; the browser remains a
+            fast, disposable client.
+          </p>
+          <ul class="mt-6 flex flex-col gap-3 text-[13.5px] text-[var(--fg)]">
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>Processes and scrollback survive a closed tab or dropped connection.</span></li>
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>Language servers run on the box, with completion, diagnostics, navigation, and cross-file rename.</span></li>
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>Your tile layout lives in the URL, so the exact workspace reopens anywhere.</span></li>
+          </ul>
+        </div>
+
+        <div class="overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl">
+          <div class="border-b border-[var(--border)] bg-[var(--surface)] px-5 py-3 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-[var(--dim)]">
+            One connection carries all of this
+          </div>
+          <dl class="divide-y divide-[var(--border)]">
+            {
+              workspaceFeatures.map(([label, body]) => (
+                <div class="grid grid-cols-[7rem_minmax(0,1fr)] gap-4 px-5 py-4 max-sm:grid-cols-1 max-sm:gap-1">
+                  <dt class="font-mono text-[10px] font-bold tracking-[0.16em] text-[var(--accent)]">{label}</dt>
+                  <dd class="text-[13px] leading-relaxed text-[var(--fg)]">{body}</dd>
+                </div>
+              ))
+            }
+          </dl>
+          <div class="border-t border-[var(--border)] bg-[var(--surface)] px-5 py-3 font-mono text-[11px] text-[var(--dim)]">
+            Entry point: <code class="font-bold text-[var(--fg)]">blit open</code>
+          </div>
+        </div>
+      </article>
+
+      <article
+        id="remotes"
+        class="scroll-mt-20 grid grid-cols-1 items-center gap-10 lg:grid-cols-[minmax(0,1.12fr)_minmax(0,0.88fr)] lg:gap-16"
+      >
+        <div class="order-2 overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--code-bg)] shadow-xl lg:order-1" data-theme="dark">
+          <div class="border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-[var(--dim)]">Commands, exactly as used</div>
+          <pre class="m-0 overflow-x-auto px-5 py-5 font-mono text-[12.5px] leading-[1.9] text-[var(--code-fg)]"><code><span class="select-none text-[var(--green)]">$</span> blit remote add prod ssh:alice@prod.co
+<span class="select-none text-[var(--green)]">$</span> blit remote set-default prod
+
+<span class="select-none text-[var(--green)]">$</span> blit open
+<span class="select-none text-[var(--green)]">$</span> blit --on prod terminal list
+
+<span class="select-none text-[var(--green)]">$</span> blit forward 8080:localhost:3000
+<span class="select-none text-[var(--green)]">$</span> blit forward udp/5353:resolver.internal:53</code></pre>
+          <div class="grid grid-cols-3 border-t border-[var(--border)] bg-[var(--surface)] text-center font-mono text-[10px] uppercase tracking-wider text-[var(--dim)]">
+            <div class="border-r border-[var(--border)] px-2 py-3"><span class="block text-[13px] font-bold text-[var(--bright)]">SSH</span>auto-install</div>
+            <div class="border-r border-[var(--border)] px-2 py-3"><span class="block text-[13px] font-bold text-[var(--bright)]">TCP + UDP</span>forwarding</div>
+            <div class="px-2 py-3"><span class="block text-[13px] font-bold text-[var(--bright)]">0</span>reconnect ritual</div>
+          </div>
+        </div>
+        <div class="order-1 lg:order-2">
+          <div class="flex items-center gap-3">
+            <span class="font-mono text-[12px] font-bold text-[var(--accent)]">02 / 06</span>
+            <span class="h-px w-10 bg-[var(--border-strong)]"></span>
+            <span class="font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-[var(--dim)]">Remotes</span>
+          </div>
+          <h3 class="mt-4 text-[clamp(1.65rem,3vw,2.35rem)] font-bold leading-tight tracking-[-0.025em] text-[var(--bright)]">
+            Every machine feels local.
+          </h3>
+          <p class="mt-4 text-[15px] leading-relaxed text-[var(--dim)]">
+            Name an SSH host once. blit installs itself there on first contact,
+            keeps the connection warm, and shows every remote beside your
+            local machine. No separate fleet of browser terminals to manage.
+          </p>
+          <ul class="mt-6 flex flex-col gap-3 text-[13.5px] text-[var(--fg)]">
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>Jump between local, production, a home server, and a dev container from one tab.</span></li>
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>Forward TCP or UDP ports to anything the remote can reach.</span></li>
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>Pre-warmed connections remove the SSH handshake from every new tab.</span></li>
+          </ul>
+        </div>
+      </article>
+
+      <article
+        id="share"
+        class="scroll-mt-20 grid grid-cols-1 items-center gap-10 lg:grid-cols-[minmax(0,0.88fr)_minmax(0,1.12fr)] lg:gap-16"
+      >
+        <div>
+          <div class="flex items-center gap-3">
+            <span class="font-mono text-[12px] font-bold text-[var(--accent)]">03 / 06</span>
+            <span class="h-px w-10 bg-[var(--border-strong)]"></span>
+            <span class="font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-[var(--dim)]">Share</span>
+          </div>
+          <h3 class="mt-4 text-[clamp(1.65rem,3vw,2.35rem)] font-bold leading-tight tracking-[-0.025em] text-[var(--bright)]">
+            Send the live workspace, not a screen share.
+          </h3>
+          <p class="mt-4 text-[15px] leading-relaxed text-[var(--dim)]">
+            <code class="text-[var(--fg)]">blit share</code> creates one link
+            with control and another that is read-only. Your teammate opens
+            the same terminals, files, and editor in their browser—no account,
+            SSH key, VPN, or local setup.
+          </p>
+          <ul class="mt-6 flex flex-col gap-3 text-[13.5px] text-[var(--fg)]">
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>WebRTC connects peer to peer when it can, with relay fallback when it cannot.</span></li>
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>Each viewer is paced independently, so a slow phone never stalls your desktop.</span></li>
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>The signaling hub never receives the share secret.</span></li>
+          </ul>
+        </div>
+        <div class="overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--code-bg)] shadow-xl" data-theme="dark">
+          <div class="border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-[var(--dim)]">The CLI prints both links</div>
+          <pre class="m-0 overflow-x-auto px-5 py-5 font-mono text-[12.5px] leading-[1.9] text-[var(--code-fg)]"><code><span class="select-none text-[var(--green)]">$</span> blit share
+Terminals at <span class="text-[var(--accent)] underline">https://blit.sh/s#psk=rf6e…</span>
+Read-only:   <span class="text-[var(--accent)] underline">https://blit.sh/s#psk=EMPs…</span></code></pre>
+          <div class="grid grid-cols-3 border-t border-[var(--border)] bg-[var(--surface)] text-center font-mono text-[9px] font-bold uppercase tracking-wider text-[var(--dim)]">
+            <span class="px-2 py-3">no account</span><span class="border-x border-[var(--border)] px-2 py-3">no inbound port</span><span class="px-2 py-3">no install</span>
+          </div>
+        </div>
+      </article>
+
+      <article
+        id="agents"
+        class="scroll-mt-20 grid grid-cols-1 items-center gap-10 lg:grid-cols-[minmax(0,1.12fr)_minmax(0,0.88fr)] lg:gap-16"
+      >
+        <div class="order-2 overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--code-bg)] shadow-xl lg:order-1" data-theme="dark">
+          <div class="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2.5">
+            <span class="font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-[var(--dim)]">One CLI surface</span>
+            <a href="https://install.blit.sh/SKILL.md" class="font-mono text-[10px] text-[var(--accent)] no-underline hover:underline">SKILL.md →</a>
+          </div>
+          <div class="grid grid-cols-1 sm:grid-cols-2">
+            {
+              agentCommands.map(([command, verbs], i) => (
+                <div class:list={["px-4 py-3.5", i % 2 === 0 && "sm:border-r sm:border-[var(--border)]", i < 4 && "border-b border-[var(--border)]"]}>
+                  <code class="text-[12px] font-bold text-[var(--green)]">blit {command}</code>
+                  <div class="mt-1.5 font-mono text-[10px] leading-relaxed text-[var(--dim)]">{verbs}</div>
+                </div>
+              ))
+            }
+          </div>
+          <pre class="m-0 border-t border-[var(--border)] px-4 py-4 font-mono text-[12px] leading-relaxed text-[var(--code-fg)]"><code><span class="select-none text-[var(--green)]">$</span> blit terminal start -t build make -j8
+<span class="text-[var(--hl-num)]">1</span>
+<span class="select-none text-[var(--green)]">$</span> blit terminal wait 1 --pattern <span class="text-[var(--hl-str)]">'BUILD OK'</span>
+<span class="select-none text-[var(--green)]">$</span> blit terminal show 1 | tail -2</code></pre>
+        </div>
+        <div class="order-1 lg:order-2">
+          <div class="flex items-center gap-3">
+            <span class="font-mono text-[12px] font-bold text-[var(--accent)]">04 / 06</span>
+            <span class="h-px w-10 bg-[var(--border-strong)]"></span>
+            <span class="font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-[var(--dim)]">Agents</span>
+          </div>
+          <h3 class="mt-4 text-[clamp(1.65rem,3vw,2.35rem)] font-bold leading-tight tracking-[-0.025em] text-[var(--bright)]">
+            Give agents handles, not pixels.
+          </h3>
+          <p class="mt-4 text-[15px] leading-relaxed text-[var(--dim)]">
+            Agents can start a process, wait for output, read the parsed screen,
+            edit files, inspect Git, ask a real language server, and control GUI
+            windows. They operate the same workspace you can watch and take over.
+          </p>
+          <ul class="mt-6 flex flex-col gap-3 text-[13.5px] text-[var(--fg)]">
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>No ANSI scraping, expect scripts, or brittle terminal coordinates.</span></li>
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>Every command works locally, over SSH, or through a share link.</span></li>
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>One compact skill file teaches an agent the entire interface.</span></li>
+          </ul>
+        </div>
+      </article>
+
+      <article
+        id="gui"
+        class="scroll-mt-20 grid grid-cols-1 items-center gap-10 lg:grid-cols-[minmax(0,0.88fr)_minmax(0,1.12fr)] lg:gap-16"
+      >
+        <div>
+          <div class="flex items-center gap-3">
+            <span class="font-mono text-[12px] font-bold text-[var(--accent)]">05 / 06</span>
+            <span class="h-px w-10 bg-[var(--border-strong)]"></span>
+            <span class="font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-[var(--dim)]">GUI apps · experimental</span>
+          </div>
+          <h3 class="mt-4 text-[clamp(1.65rem,3vw,2.35rem)] font-bold leading-tight tracking-[-0.025em] text-[var(--bright)]">
+            A display server for servers without displays.
+          </h3>
+          <p class="mt-4 text-[15px] leading-relaxed text-[var(--dim)]">
+            On Linux, every terminal gets a built-in headless Wayland
+            compositor. Launch a browser, editor, media player, or your own app;
+            blit streams its surfaces to the browser and exposes them to the CLI.
+          </p>
+          <ul class="mt-6 flex flex-col gap-3 text-[13.5px] text-[var(--fg)]">
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>Capture, click, type, send keys, and move clipboard data programmatically.</span></li>
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>H.264 or AV1 with NVENC / VA-API acceleration and software fallback.</span></li>
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>No X server, physical display, or GPU required.</span></li>
+          </ul>
+        </div>
+        <div class="overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--code-bg)] shadow-xl" data-theme="dark">
+          <div class="border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-[var(--dim)]">Surface commands</div>
+          <pre class="m-0 overflow-x-auto px-5 py-5 font-mono text-[12.5px] leading-[1.9] text-[var(--code-fg)]"><code><span class="select-none text-[var(--green)]">$</span> blit terminal start foot
+<span class="text-[var(--hl-num)]">1</span>
+<span class="select-none text-[var(--green)]">$</span> blit surface list
+<span class="select-none text-[var(--green)]">$</span> blit surface capture 1
+<span class="select-none text-[var(--green)]">$</span> blit surface click 1 100 50
+<span class="select-none text-[var(--green)]">$</span> blit surface type 1 <span class="text-[var(--hl-str)]">"hello&#123;Return&#125;"</span></code></pre>
+          <div class="border-t border-[var(--border)] bg-[var(--surface)] px-4 py-3 text-[11px] text-[var(--dim)]">
+            The browser renders the encoded surface; the CLI addresses it by ID.
+          </div>
+        </div>
+      </article>
+
+      <article
+        id="embed"
+        class="scroll-mt-20 grid grid-cols-1 items-center gap-10 lg:grid-cols-[minmax(0,1.12fr)_minmax(0,0.88fr)] lg:gap-16"
+      >
+        <div class="order-2 overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--code-bg)] shadow-xl lg:order-1" data-theme="dark">
+          <div class="border-b border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-[var(--dim)]">Your product, blit underneath</div>
+          <pre class="m-0 overflow-x-auto px-5 py-5 font-mono text-[12px] leading-[1.85] text-[var(--code-fg)]"><code><span class="text-[var(--hl-kw)]">import</span> &#123; BlitTerminal, BlitWorkspaceProvider &#125;
+  <span class="text-[var(--hl-kw)]">from</span> <span class="text-[var(--hl-str)]">"@blit-sh/react"</span>;
+<span class="text-[var(--hl-kw)]">import</span> &#123; BlitWorkspace &#125;
+  <span class="text-[var(--hl-kw)]">from</span> <span class="text-[var(--hl-str)]">"@blit-sh/core"</span>;
+
+<span class="text-[var(--hl-cm)]">// WebSocket, WebTransport, WebRTC,
+// Unix socket—or implement your own transport.</span></code></pre>
+          <div class="grid grid-cols-3 border-t border-[var(--border)] bg-[var(--surface)] text-center font-mono text-[10px] font-bold text-[var(--fg)]">
+            <div class="border-r border-[var(--border)] px-2 py-3">React</div>
+            <div class="border-r border-[var(--border)] px-2 py-3">Solid</div>
+            <div class="px-2 py-3">Core API</div>
+          </div>
+        </div>
+        <div class="order-1 lg:order-2">
+          <div class="flex items-center gap-3">
+            <span class="font-mono text-[12px] font-bold text-[var(--accent)]">06 / 06</span>
+            <span class="h-px w-10 bg-[var(--border-strong)]"></span>
+            <span class="font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-[var(--dim)]">Embed</span>
+          </div>
+          <h3 class="mt-4 text-[clamp(1.65rem,3vw,2.35rem)] font-bold leading-tight tracking-[-0.025em] text-[var(--bright)]">
+            Ship the terminal without building the terminal stack.
+          </h3>
+          <p class="mt-4 text-[15px] leading-relaxed text-[var(--dim)]">
+            MIT-licensed React and Solid packages expose the same workspace,
+            terminal, surface, and transport primitives used by blit.sh. Put a
+            production terminal—or a full remote workspace—inside your app.
+          </p>
+          <ul class="mt-6 flex flex-col gap-3 text-[13.5px] text-[var(--fg)]">
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>Use the UI components or build your own against the headless core.</span></li>
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>Bring WebSocket, QUIC, WebRTC, Unix sockets, or your own reliable byte stream.</span></li>
+            <li class="flex gap-3"><span class="text-[var(--green)]">✓</span><span>Run the core in Node, Bun, or Deno for server-side automation.</span></li>
+          </ul>
+          <a href="https://github.com/indent-com/blit/blob/main/EMBEDDING.md" target="_blank" rel="noopener noreferrer" class="mt-6 inline-flex text-[13px] font-semibold text-[var(--accent)] no-underline hover:underline">Read the embedding guide →</a>
+        </div>
+      </article>
+    </div>
+  </div>
+</section>

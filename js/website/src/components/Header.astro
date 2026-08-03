@@ -31,9 +31,9 @@ import ThemeToggle from "./ThemeToggle.tsx";
     </a>
     <nav class="flex items-center gap-1 text-[13px] sm:gap-3">
       <a
-        href="#install"
+        href="#product"
         class="hidden rounded-md px-2.5 py-1.5 text-[var(--dim)] no-underline transition-colors hover:bg-[var(--surface)] hover:text-[var(--fg)] sm:inline-flex"
-        >Install</a
+        >What it does</a
       >
       <a
         href="#how"
@@ -41,19 +41,9 @@ import ThemeToggle from "./ThemeToggle.tsx";
         >How it works</a
       >
       <a
-        href="#workspace"
+        href="#compare"
         class="hidden rounded-md px-2.5 py-1.5 text-[var(--dim)] no-underline transition-colors hover:bg-[var(--surface)] hover:text-[var(--fg)] sm:inline-flex"
-        >Workspace</a
-      >
-      <a
-        href="#agents"
-        class="hidden rounded-md px-2.5 py-1.5 text-[var(--dim)] no-underline transition-colors hover:bg-[var(--surface)] hover:text-[var(--fg)] sm:inline-flex"
-        >Agents</a
-      >
-      <a
-        href="#share"
-        class="hidden rounded-md px-2.5 py-1.5 text-[var(--dim)] no-underline transition-colors hover:bg-[var(--surface)] hover:text-[var(--fg)] md:inline-flex"
-        >Share</a
+        >Compare</a
       >
       <a
         href="https://github.com/indent-com/blit"
@@ -74,6 +64,11 @@ import ThemeToggle from "./ThemeToggle.tsx";
         <span>GitHub</span>
       </a>
       <ThemeToggle client:load />
+      <a
+        href="#install"
+        class="hidden rounded-md bg-[var(--bright)] px-3 py-1.5 font-semibold text-[var(--bg)] no-underline transition-transform hover:-translate-y-px md:inline-flex"
+        >Install</a
+      >
     </nav>
   </div>
 </header>

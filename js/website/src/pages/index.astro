@@ -2,9 +2,7 @@
 import Layout from "../layouts/Layout.astro";
 import Header from "../components/Header.astro";
 import Hero from "../components/Hero.astro";
-import IdeSection from "../components/IdeSection.astro";
-import ShareSection from "../components/ShareSection.astro";
-import AgentsSection from "../components/AgentsSection.astro";
+import ProductTour from "../components/ProductTour.astro";
 import HowItWorks from "../components/HowItWorks.astro";
 import Comparison from "../components/Comparison.astro";
 import KnownLimitationsSection from "../components/KnownLimitationsSection.astro";
@@ -12,20 +10,12 @@ import CTA from "../components/CTA.astro";
 import Footer from "../components/Footer.astro";
 ---
 
-<!--
-  The arc: the workspace is the claim (hero replays a real session through
-  the real renderer), then the three acts — what the workspace is, how you
-  hand it to a person, how you hand it to an agent — then the internals,
-  the comparison, and the honest edges.
--->
 <Layout>
   <div class="flex min-h-screen flex-col bg-[var(--bg)]">
     <Header />
     <main class="flex-1">
       <Hero />
-      <div id="workspace"><IdeSection /></div>
-      <ShareSection />
-      <AgentsSection />
+      <ProductTour />
       <div id="how"><HowItWorks /></div>
       <div id="compare"><Comparison /></div>
       <KnownLimitationsSection />
