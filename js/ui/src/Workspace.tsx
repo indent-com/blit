@@ -648,7 +648,13 @@ function WorkspaceScreen(props: {
       }
     }
     const term = focusedSession();
-    return term ? { kind: "terminal", session: term } : null;
+    // An exited terminal has no live cwd to anchor on — a follow-terminal
+    // open against its dead pty can only fail ("source terminal has no
+    // working directory"). Treat it as rootless: the last live anchor
+    // sticks, or the dock shows no root at all (first open).
+    return term && term.state !== "exited"
+      ? { kind: "terminal", session: term }
+      : null;
   };
 
   // A stable identity for an anchor, so we only re-emit when the focused pane

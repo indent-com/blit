@@ -731,19 +731,17 @@ pub fn parse_git_open(msg: &[u8]) -> Option<GitOpenRequest<'_>> {
 
 /// Rebase a pty-relative `C2S_GIT_OPEN` onto a resolved `cwd`: join
 /// `cwd`/`path` and clear `src_pty_id`, producing the plain path-based open
-/// the handler consumes. `cwd` `None` (source pty gone) keeps `path`
-/// verbatim.
-pub fn git_open_rebase(msg: &[u8], cwd: Option<&str>) -> Option<Vec<u8>> {
+/// the handler consumes. A caller that cannot resolve the source pty's cwd
+/// must refuse the request rather than forward the pty-relative path.
+pub fn git_open_rebase(msg: &[u8], cwd: &str) -> Option<Vec<u8>> {
     let req = parse_git_open(msg)?;
     if req.src_pty_id == GIT_OPEN_NO_CONTEXT {
         return None;
     }
-    let joined = cwd.map(|dir| {
-        std::path::Path::new(dir)
-            .join(req.path)
-            .to_string_lossy()
-            .into_owned()
-    });
+    let joined = std::path::Path::new(cwd)
+        .join(req.path)
+        .to_string_lossy()
+        .into_owned();
     Some(msg_git_open(&GitOpenRequest {
         nonce: req.nonce,
         flags: req.flags,
@@ -752,7 +750,7 @@ pub fn git_open_rebase(msg: &[u8], cwd: Option<&str>) -> Option<Vec<u8>> {
         src_pty_id: GIT_OPEN_NO_CONTEXT,
         parent_repo_id: req.parent_repo_id,
         ref_prefixes: req.ref_prefixes,
-        path: joined.as_deref().unwrap_or(req.path),
+        path: &joined,
     }))
 }
 
@@ -3352,13 +3350,13 @@ mod tests {
         assert_eq!(req.path, "sub");
         // Rebase joins cwd + path and clears the pty context, leaving the
         // plain path-based open the handler consumes.
-        let reb = git_open_rebase(&m, Some("/w")).unwrap();
+        let reb = git_open_rebase(&m, "/w").unwrap();
         let rebased = parse_git_open(&reb).unwrap();
         assert_eq!(rebased.src_pty_id, GIT_OPEN_NO_CONTEXT);
         assert_eq!(rebased.path, "/w/sub");
         // A context-free open is not a rebase candidate.
         let plain = msg_git_open(&GitOpenRequest::new(1, GIT_OPEN_WATCH, "sub"));
-        assert_eq!(git_open_rebase(&plain, Some("/w")), None);
+        assert_eq!(git_open_rebase(&plain, "/w"), None);
     }
 
     #[test]

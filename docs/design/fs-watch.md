@@ -109,8 +109,10 @@ forward them unmodified. All integers little-endian; 16 MiB frame limit and
 bit 2 `CROSS_FILESYSTEM` (descend into mount points), bit 3 `SINGLE` (the
 root is a single file, § Single-file sync), bit 4 `FROM_PTY` (resolve the
 sync's base directory from a pty's live cwd; [ide.md](../ide.md)
-Decision 3), bits 5–8 `EXCLUDE_GIT` / `GITIGNORE` / `EXCLUDE` / `DOTIGNORE`
-(§ Ignoring).
+Decision 3 — a source pty with no resolvable cwd, unknown or exited, refuses
+the sync with `not found` rather than degrading to a path-only open; git and
+lsp `FROM_PTY` opens refuse the same way), bits 5–8 `EXCLUDE_GIT` /
+`GITIGNORE` / `EXCLUDE` / `DOTIGNORE` (§ Ignoring).
 Symlinks are reported, never followed. `latency_ms` is the batching/settle window (0 → server default
 20 ms, clamped to 1–1000). `inline_max` caps per-file inline content (0 →
 server default 16 MiB); larger files sync metadata + hash only, bytes on

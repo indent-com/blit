@@ -666,10 +666,12 @@ pub fn fs_sync_src_pty(msg: &[u8]) -> Option<u16> {
 
 /// Rebase a `FROM_PTY` `C2S_FS_SYNC` onto a resolved `cwd`: join `cwd`/`path`
 /// and clear `FROM_PTY`, producing a plain path-based sync the handler
-/// consumes unchanged. `cwd` `None` (source pty gone) keeps `path` verbatim.
+/// consumes unchanged. A caller that cannot resolve the source pty's cwd must
+/// refuse the request rather than forward it — the pty-relative path (the
+/// dock's follow-terminal root is `""`) would otherwise be read as absolute.
 /// Any exclude field rides along — the filter is the client's, not the
 /// pty's, and dropping it here would silently widen the sync.
-pub fn fs_sync_rebase(msg: &[u8], cwd: Option<&str>) -> Option<Vec<u8>> {
+pub fn fs_sync_rebase(msg: &[u8], cwd: &str) -> Option<Vec<u8>> {
     fs_sync_src_pty(msg)?;
     let nonce = u16::from_le_bytes([msg[1], msg[2]]);
     let flags = fs_sync_flags(msg)? & !FS_SYNC_FROM_PTY;
@@ -678,15 +680,12 @@ pub fn fs_sync_rebase(msg: &[u8], cwd: Option<&str>) -> Option<Vec<u8>> {
     let path_len = u16::from_le_bytes([msg[11], msg[12]]) as usize;
     let path = std::str::from_utf8(msg.get(FS_SYNC_HEADER..FS_SYNC_HEADER + path_len)?).ok()?;
     let exclude = fs_sync_exclude(msg)?;
-    let joined = cwd.map(|dir| {
-        std::path::Path::new(dir)
-            .join(path)
-            .to_string_lossy()
-            .into_owned()
-    });
-    let eff = joined.as_deref().unwrap_or(path);
+    let eff = std::path::Path::new(cwd)
+        .join(path)
+        .to_string_lossy()
+        .into_owned();
     Some(msg_fs_sync_full(
-        nonce, flags, latency_ms, inline_max, eff, exclude, None,
+        nonce, flags, latency_ms, inline_max, &eff, exclude, None,
     ))
 }
 
@@ -1784,17 +1783,13 @@ mod tests {
             None
         );
         // Rebase joins cwd + path and clears FROM_PTY.
-        let reb = fs_sync_rebase(&m, Some("/home/u")).unwrap();
+        let reb = fs_sync_rebase(&m, "/home/u").unwrap();
         assert_eq!(fs_sync_flags(&reb).unwrap() & FS_SYNC_FROM_PTY, 0);
         let plen = u16::from_le_bytes([reb[11], reb[12]]) as usize;
         assert_eq!(
             std::str::from_utf8(&reb[13..13 + plen]).unwrap(),
             "/home/u/sub"
         );
-        // No cwd (source pty gone) keeps path verbatim.
-        let reb0 = fs_sync_rebase(&m, None).unwrap();
-        let plen0 = u16::from_le_bytes([reb0[11], reb0[12]]) as usize;
-        assert_eq!(std::str::from_utf8(&reb0[13..13 + plen0]).unwrap(), "sub");
     }
 
     /// The two optional trailers coexist in one message, and each is
@@ -1820,7 +1815,7 @@ mod tests {
         let both = msg_fs_sync_full(1, FS_SYNC_RECURSIVE, 0, 0, "sub", "target", Some(42));
         assert_eq!(fs_sync_exclude(&both), Some("target"));
         assert_eq!(fs_sync_src_pty(&both), Some(42), "reached past the field");
-        let reb = fs_sync_rebase(&both, Some("/home/u")).unwrap();
+        let reb = fs_sync_rebase(&both, "/home/u").unwrap();
         assert_eq!(fs_sync_flags(&reb).unwrap() & FS_SYNC_FROM_PTY, 0);
         assert_ne!(fs_sync_flags(&reb).unwrap() & FS_SYNC_EXCLUDE, 0);
         assert_eq!(fs_sync_exclude(&reb), Some("target"), "filter survives");
