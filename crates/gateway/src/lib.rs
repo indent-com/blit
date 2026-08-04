@@ -1275,7 +1275,17 @@ fn build_quinn_server_config(
         .with_single_cert(certs, key)?;
     tls.alpn_protocols = vec![wt::ALPN.as_bytes().to_vec()];
     let quic_config: wt::quinn::crypto::rustls::QuicServerConfig = tls.try_into().unwrap();
-    Ok(wt::quinn::ServerConfig::with_crypto(Arc::new(quic_config)))
+    let mut server_config = wt::quinn::ServerConfig::with_crypto(Arc::new(quic_config));
+
+    // Transport-level keepalive: browsers throttle JS timers in background
+    // tabs beyond quinn's 30s default idle timeout, so the application-level
+    // pings alone can't keep an idle session alive.  Server-initiated QUIC
+    // PINGs reset the idle timers on both ends independently of the page.
+    let mut transport = wt::quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    transport.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into()?));
+    server_config.transport_config(Arc::new(transport));
+    Ok(server_config)
 }
 
 fn bind_v6only_udp(addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
