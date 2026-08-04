@@ -1339,7 +1339,10 @@ async fn run_webtransport_loop(state: AppState, addr: &str, has_explicit_cert: b
         let v4_addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
         let v6_addr: std::net::SocketAddr = ([0, 0, 0, 0, 0, 0, 0, 0], port).into();
 
-        let mut server4 = match wt::quinn::Endpoint::server(config.clone(), v4_addr) {
+        let mut server4 = match std::net::UdpSocket::bind(v4_addr)
+            .map_err(|e| e.to_string())
+            .and_then(|sock| blit_quic::server_endpoint(config.clone(), sock))
+        {
             Ok(ep) => {
                 eprintln!("webtransport: listening on {v4_addr} (IPv4/QUIC)");
                 wt::Server::new(ep)
@@ -1350,12 +1353,7 @@ async fn run_webtransport_loop(state: AppState, addr: &str, has_explicit_cert: b
             }
         };
         let mut server6 = match bind_v6only_udp(v6_addr) {
-            Ok(sock) => match wt::quinn::Endpoint::new(
-                wt::quinn::EndpointConfig::default(),
-                Some(config),
-                sock,
-                wt::quinn::default_runtime().unwrap(),
-            ) {
+            Ok(sock) => match blit_quic::server_endpoint(config, sock) {
                 Ok(ep) => {
                     eprintln!("webtransport: listening on [{v6_addr}] (IPv6/QUIC)");
                     wt::Server::new(ep)

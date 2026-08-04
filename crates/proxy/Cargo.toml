@@ -21,6 +21,7 @@ bytes = "1"
 url = "2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs"] }
 serde_json = "1"
+blit-quic = { workspace = true }
 blit-webrtc-forwarder = { workspace = true }
 blit-ssh = { workspace = true }
 

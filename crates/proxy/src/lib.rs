@@ -802,15 +802,8 @@ async fn connect_wt(
         .map_err(|e| format!("wt: url: {e}"))?;
 
     // Build the client with appropriate certificate verification.
-    let client: wt::Client = if let Some(hash) = cert_hash {
-        wt::ClientBuilder::new()
-            .with_server_certificate_hashes(vec![hash.clone()])
-            .map_err(|e| format!("wt: client build: {e}"))?
-    } else {
-        wt::ClientBuilder::new()
-            .with_system_roots()
-            .map_err(|e| format!("wt: client build: {e}"))?
-    };
+    let client: wt::Client = blit_quic::client(cert_hash.as_deref(), None)
+        .map_err(|e| format!("wt: client build: {e}"))?;
 
     let session = client
         .connect(url)

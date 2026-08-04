@@ -56,8 +56,10 @@ pub async fn run_with(env: crate::config::Env, name: String, port: u16) -> Resul
     let bundle = crate::certs::parse_bundle(&pem)?;
 
     let udp_addr = udp_bind_addr(port).await;
-    let endpoint = wt::quinn::Endpoint::server(crate::certs::quic_config(&bundle)?, udp_addr)
+    let udp_sock = std::net::UdpSocket::bind(udp_addr)
         .map_err(|e| format!("QUIC bind {udp_addr}: {e}"))?;
+    let endpoint = blit_quic::server_endpoint(crate::certs::quic_config(&bundle)?, udp_sock)
+        .map_err(|e| format!("QUIC endpoint {udp_addr}: {e}"))?;
     let tcp = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .map_err(|e| format!("TCP bind {port}: {e}"))?;

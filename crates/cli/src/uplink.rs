@@ -328,108 +328,15 @@ async fn bridge(mut send: wt::SendStream, mut recv: wt::RecvStream) {
 
 /// Build a WebTransport client with the liveness settings from
 /// docs/uplink.md (10s keepalive, 30s idle timeout) and either
-/// system-root or pinned TLS verification.  `wt::ClientBuilder` doesn't expose the quinn transport
-/// config, so this mirrors its setup by hand.
+/// system-root or pinned TLS verification.
 fn build_client(cert_hash: Option<&[u8]>) -> Result<wt::Client, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| format!("TLS config: {e}"))?;
-
-    let mut crypto = match cert_hash {
-        Some(hash) => builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedCert {
-                hash: hash.to_vec(),
-                provider,
-            }))
-            .with_no_client_auth(),
-        None => {
-            let mut roots = rustls::RootCertStore::empty();
-            for cert in rustls_native_certs::load_native_certs().certs {
-                let _ = roots.add(cert);
-            }
-            builder.with_root_certificates(roots).with_no_client_auth()
-        }
-    };
-    crypto.alpn_protocols = vec![wt::ALPN.as_bytes().to_vec()];
-
-    let quic_crypto = wt::quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
-        .map_err(|e| format!("QUIC TLS config: {e}"))?;
-    let mut config = wt::quinn::ClientConfig::new(Arc::new(quic_crypto));
-
     let mut transport = wt::quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(10)));
     transport.max_idle_timeout(Some(
         wt::quinn::IdleTimeout::try_from(Duration::from_secs(30))
             .expect("30s fits in an idle timeout"),
     ));
-    config.transport_config(Arc::new(transport));
-
-    let endpoint = wt::quinn::Endpoint::client("[::]:0".parse().unwrap())
-        .or_else(|_| wt::quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()))
-        .map_err(|e| format!("UDP socket: {e}"))?;
-    Ok(wt::Client::new(endpoint, config))
-}
-
-/// Pins the relay's end-entity certificate to a SHA-256 hash from the pool
-/// (the gateway's `serverCertificateHashes` flow, client side).  Chain and
-/// expiry are deliberately not checked — the hash is the trust anchor.
-#[derive(Debug)]
-struct PinnedCert {
-    hash: Vec<u8>,
-    provider: Arc<rustls::crypto::CryptoProvider>,
-}
-
-impl rustls::client::danger::ServerCertVerifier for PinnedCert {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let digest = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
-        if digest.as_ref() == self.hash.as_slice() {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::ApplicationVerificationFailure,
-            ))
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::PeerIncompatible(
-            rustls::PeerIncompatible::Tls12NotOffered,
-        ))
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
+    blit_quic::client(cert_hash, Some(Arc::new(transport)))
 }
 
 fn jittered(base: Duration) -> Duration {

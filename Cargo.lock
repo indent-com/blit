@@ -763,6 +763,7 @@ dependencies = [
  "axum",
  "blit-gateway",
  "blit-proxy",
+ "blit-quic",
  "blit-remote",
  "blit-server",
  "blit-ssh",
@@ -776,9 +777,7 @@ dependencies = [
  "rand 0.10.1",
  "regex",
  "reqwest",
- "ring",
  "rustls",
- "rustls-native-certs",
  "serde_json",
  "tokio",
  "url",
@@ -819,6 +818,7 @@ version = "0.44.0"
 dependencies = [
  "axum",
  "blit-proxy",
+ "blit-quic",
  "blit-sd-notify",
  "blit-ssh",
  "blit-webrtc-forwarder",
@@ -867,6 +867,7 @@ dependencies = [
 name = "blit-proxy"
 version = "0.44.0"
 dependencies = [
+ "blit-quic",
  "blit-ssh",
  "blit-webrtc-forwarder",
  "bytes",
@@ -878,6 +879,16 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "url",
+ "web-transport-quinn",
+]
+
+[[package]]
+name = "blit-quic"
+version = "0.44.0"
+dependencies = [
+ "ring",
+ "rustls",
+ "rustls-native-certs",
  "web-transport-quinn",
 ]
 
@@ -944,6 +955,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
+ "blit-quic",
  "clap",
  "ed25519-dalek 2.2.0",
  "futures-util",

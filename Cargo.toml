@@ -16,6 +16,7 @@ members = [
     "crates/webrtc-forwarder",
     "crates/compositor",
     "crates/proxy",
+    "crates/quic",
     "crates/sd-notify",
     "crates/ssh",
 ]
@@ -38,6 +39,7 @@ blit-webserver = { version = "0.44.0", path = "crates/webserver" }
 blit-server = { version = "0.44.0", path = "crates/server", default-features = false }
 blit-gateway = { version = "0.44.0", path = "crates/gateway" }
 blit-proxy = { version = "0.44.0", path = "crates/proxy" }
+blit-quic = { version = "0.44.0", path = "crates/quic" }
 blit-webrtc-forwarder = { version = "0.44.0", path = "crates/webrtc-forwarder" }
 blit-compositor = { version = "0.44.0", path = "crates/compositor" }
 blit-sd-notify = { version = "0.44.0", path = "crates/sd-notify" }
