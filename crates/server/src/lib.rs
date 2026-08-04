@@ -6879,6 +6879,10 @@ fn git_nonce(data: &[u8]) -> Option<u16> {
     (data.len() >= 3).then(|| u16::from_le_bytes([data[1], data[2]]))
 }
 
+/// Refusal detail for a `FROM_PTY` fs/git/lsp open whose source pty has no
+/// resolvable cwd — the pty is unknown, or its process has exited.
+const NO_SOURCE_CWD: &str = "source terminal has no working directory";
+
 async fn handle_git_message(
     data: &[u8],
     repos: &mut GitRepos,
@@ -8303,7 +8307,20 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         let sess = state.session.lock().await;
                         sess.ptys.get(&src).and_then(|p| pty::pty_cwd(&p.handle))
                     };
-                    blit_remote::fs::fs_sync_rebase(&data, cwd.as_deref())
+                    // No resolvable cwd — the pty is gone or its process has
+                    // exited. Refuse rather than rebase: the pty-relative
+                    // path (usually "") would be read as an absolute root.
+                    let Some(cwd) = cwd else {
+                        let nonce = u16::from_le_bytes([data[1], data[2]]);
+                        let _ = fs_out.send(blit_remote::fs::msg_fs_synced(
+                            nonce,
+                            blit_remote::fs::FS_SYNC_ID_INVALID,
+                            blit_remote::fs::FS_STATUS_NOT_FOUND,
+                            NO_SOURCE_CWD,
+                        ));
+                        continue;
+                    };
+                    blit_remote::fs::fs_sync_rebase(&data, &cwd)
                         .map(std::borrow::Cow::Owned)
                         .unwrap_or(std::borrow::Cow::Borrowed(&data[..]))
                 } else {
@@ -8357,7 +8374,23 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         let sess = state.session.lock().await;
                         sess.ptys.get(&src).and_then(|p| pty::pty_cwd(&p.handle))
                     };
-                    blit_remote::git::git_open_rebase(&data, cwd.as_deref())
+                    // No resolvable cwd (pty gone / process exited) — refuse;
+                    // see the fs sibling above.
+                    let Some(cwd) = cwd else {
+                        if let Some(nonce) = git_nonce(&data) {
+                            let _ = fs_out.send(blit_remote::git::msg_git_repo(
+                                nonce,
+                                blit_remote::git::GIT_REPO_ID_INVALID,
+                                blit_remote::git::GIT_STATUS_NOT_FOUND,
+                                0,
+                                0,
+                                NO_SOURCE_CWD,
+                                "",
+                            ));
+                        }
+                        continue;
+                    };
+                    blit_remote::git::git_open_rebase(&data, &cwd)
                         .map(std::borrow::Cow::Owned)
                         .unwrap_or(std::borrow::Cow::Borrowed(&data[..]))
                 } else {
@@ -8389,7 +8422,21 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         let sess = state.session.lock().await;
                         sess.ptys.get(&src).and_then(|p| pty::pty_cwd(&p.handle))
                     };
-                    blit_remote::lsp::lsp_open_rebase(&data, cwd.as_deref())
+                    // No resolvable cwd (pty gone / process exited) — refuse;
+                    // see the fs sibling above.
+                    let Some(cwd) = cwd else {
+                        let nonce = u16::from_le_bytes([data[1], data[2]]);
+                        let _ = fs_out.send(blit_remote::lsp::msg_lsp_opened(
+                            nonce,
+                            blit_remote::lsp::LSP_ID_INVALID,
+                            blit_remote::lsp::LSP_STATUS_NOT_FOUND,
+                            0,
+                            "",
+                            NO_SOURCE_CWD,
+                        ));
+                        continue;
+                    };
+                    blit_remote::lsp::lsp_open_rebase(&data, &cwd)
                         .map(std::borrow::Cow::Owned)
                         .unwrap_or(std::borrow::Cow::Borrowed(&data[..]))
                 } else {
@@ -10054,7 +10101,7 @@ mod tests {
             "",
             1,
         );
-        let rebased = blit_remote::fs::fs_sync_rebase(&sync, Some(&cwd)).expect("fs rebase");
+        let rebased = blit_remote::fs::fs_sync_rebase(&sync, &cwd).expect("fs rebase");
         assert_eq!(
             blit_remote::fs::fs_sync_flags(&rebased).unwrap() & blit_remote::fs::FS_SYNC_FROM_PTY,
             0
@@ -10077,7 +10124,7 @@ mod tests {
                 src_pty_id: 1,
                 ..blit_remote::git::GitOpenRequest::new(2, blit_remote::git::GIT_OPEN_WATCH, "")
             });
-            let greb = blit_remote::git::git_open_rebase(&gopen, Some(&cwd)).expect("git rebase");
+            let greb = blit_remote::git::git_open_rebase(&gopen, &cwd).expect("git rebase");
             let rebased = blit_remote::git::parse_git_open(&greb).unwrap();
             assert_eq!(
                 rebased.src_pty_id,

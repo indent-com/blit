@@ -444,22 +444,20 @@ pub fn lsp_open_src_pty(msg: &[u8]) -> Option<u16> {
 
 /// Rebase a `FROM_PTY` `C2S_LSP_OPEN` onto a resolved `cwd` (join `cwd`/`path`,
 /// clear `FROM_PTY`), producing a plain path-based open the handler consumes
-/// unchanged. `cwd` `None` (source pty gone) keeps `path` verbatim.
-pub fn lsp_open_rebase(msg: &[u8], cwd: Option<&str>) -> Option<Vec<u8>> {
+/// unchanged. A caller that cannot resolve the source pty's cwd must refuse
+/// the request rather than forward the pty-relative path.
+pub fn lsp_open_rebase(msg: &[u8], cwd: &str) -> Option<Vec<u8>> {
     lsp_open_src_pty(msg)?;
     let (nonce, flags, diag_ms, path) = parse_lsp_open(msg)?;
-    let joined = cwd.map(|dir| {
-        std::path::Path::new(dir)
-            .join(path)
-            .to_string_lossy()
-            .into_owned()
-    });
-    let eff = joined.as_deref().unwrap_or(path);
+    let eff = std::path::Path::new(cwd)
+        .join(path)
+        .to_string_lossy()
+        .into_owned();
     Some(msg_lsp_open(
         nonce,
         flags & !LSP_OPEN_FROM_PTY,
         diag_ms,
-        eff,
+        &eff,
     ))
 }
 
@@ -1660,7 +1658,7 @@ mod tests {
         assert_eq!(flags & LSP_OPEN_FROM_PTY, LSP_OPEN_FROM_PTY);
         assert_eq!(path, "sub");
         // Rebase joins cwd + path and clears FROM_PTY.
-        let reb = lsp_open_rebase(&m, Some("/w")).unwrap();
+        let reb = lsp_open_rebase(&m, "/w").unwrap();
         let (_, rf, _, rp) = parse_lsp_open(&reb).unwrap();
         assert_eq!(rf & LSP_OPEN_FROM_PTY, 0);
         assert_eq!(rp, "/w/sub");
