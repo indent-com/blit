@@ -29,6 +29,11 @@ const GATHER_TIMEOUT: Duration = Duration::from_secs(4);
 /// blocking indefinitely.
 const PEER_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// In-flight bytes a DuplexStream bridge will hold before the writer blocks.
+/// Sized for a few max-size mux frames, not for buffering a stream: it is the
+/// point where a slow reader starts pushing back, so bigger is not better.
+const BRIDGE_BUF: usize = 256 * 1024;
+
 #[derive(Deserialize)]
 struct ServerMessage {
     #[serde(rename = "type")]
@@ -382,7 +387,7 @@ impl MuxSession {
 
         // Create a DuplexStream pair — the app half goes to the caller,
         // the driver half is pumped by background tasks.
-        let (app_half, driver_half) = tokio::io::duplex(256 * 1024);
+        let (app_half, driver_half) = tokio::io::duplex(BRIDGE_BUF);
         let (mut drv_read, mut drv_write) = tokio::io::split(driver_half);
 
         // Send OPEN control message.
@@ -949,7 +954,7 @@ async fn drive(
                         Event::ChannelOpen(cid, label) => {
                             verbose!("DataChannel opened: {label} (id {cid:?})");
                             if let Some(reply_tx) = pending_open.remove(&cid) {
-                                let (app_half, driver_half) = tokio::io::duplex(256 * 1024 * 1024);
+                                let (app_half, driver_half) = tokio::io::duplex(BRIDGE_BUF);
                                 // write_tx: drive task → app half (DataChannel → app).
                                 let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
                                 // app_tx: reader task → drive task (app → DataChannel).
