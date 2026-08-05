@@ -31,6 +31,14 @@ const AUTH_MAX_UNAUTHENTICATED: usize = 32;
 const AUTH_MAX_FAILURES: u32 = 5;
 const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const AUTH_LOCKOUT: Duration = Duration::from_secs(60);
+/// Most peers tracked for failed-auth history at once.
+///
+/// `prune` already drops peers whose window has passed, so the live set is
+/// "distinct peers that failed inside the last `AUTH_FAILURE_WINDOW`" — which
+/// is attacker-chosen, because the key is the remote address. A source with a
+/// large address range (any IPv6 allocation) gets a fresh key per attempt and
+/// grows this map for five minutes at a time.
+const AUTH_MAX_TRACKED_PEERS: usize = 4096;
 
 /// Shared authentication throttle for WebSocket/WebTransport passphrase checks.
 ///
@@ -45,6 +53,7 @@ pub struct AuthThrottle {
     max_failures: u32,
     failure_window: Duration,
     lockout: Duration,
+    max_tracked_peers: usize,
 }
 
 struct AuthThrottleInner {
@@ -92,6 +101,22 @@ impl AuthThrottle {
         failure_window: Duration,
         lockout: Duration,
     ) -> Self {
+        Self::with_limits_and_capacity(
+            max_unauthenticated,
+            max_failures,
+            failure_window,
+            lockout,
+            AUTH_MAX_TRACKED_PEERS,
+        )
+    }
+
+    fn with_limits_and_capacity(
+        max_unauthenticated: usize,
+        max_failures: u32,
+        failure_window: Duration,
+        lockout: Duration,
+        max_tracked_peers: usize,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(AuthThrottleInner {
                 active_unauthenticated: 0,
@@ -101,6 +126,7 @@ impl AuthThrottle {
             max_failures: max_failures.max(1),
             failure_window,
             lockout,
+            max_tracked_peers: max_tracked_peers.max(1),
         }
     }
 
@@ -152,6 +178,9 @@ impl AuthThrottle {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
         inner.prune(now, self.failure_window);
+        if !inner.peers.contains_key(peer) {
+            inner.make_room(self.max_tracked_peers, now, self.failure_window);
+        }
         let state = inner
             .peers
             .entry(peer.to_string())
@@ -207,6 +236,45 @@ impl AuthThrottleInner {
             }
             state.failures > 0 && now.duration_since(state.first_failure) <= failure_window
         });
+    }
+
+    /// Make room for one more tracked peer.
+    ///
+    /// Called only after `prune`, so everything still here is live and
+    /// something useful has to go. Peers serving an active lockout are
+    /// evicted last: they are the entries doing real work, and dropping one
+    /// hands a locked-out peer a way back in.
+    ///
+    /// Deadline alone is the wrong key for that — the default lockout (60s)
+    /// is *shorter* than the failure window (5 min), so a locked peer expires
+    /// sooner than a peer that failed once and would be evicted first. Order
+    /// on locked-ness first, then soonest expiry within each group.
+    ///
+    /// A peer can still in principle evict its own lockout by pushing enough
+    /// other lockouts through, but that costs `AUTH_MAX_TRACKED_PEERS` ×
+    /// `max_failures` handshakes against a global limit of
+    /// `AUTH_MAX_UNAUTHENTICATED` concurrent attempts, each with its own
+    /// timeout. The concurrency cap is the brake there, not this map.
+    fn make_room(&mut self, cap: usize, now: Instant, failure_window: Duration) {
+        while self.peers.len() >= cap {
+            let victim = self
+                .peers
+                .iter()
+                .min_by_key(|(_, state)| {
+                    let locked = state.locked_until.filter(|until| *until > now);
+                    (
+                        locked.is_some(),
+                        locked.unwrap_or(state.first_failure + failure_window),
+                    )
+                })
+                .map(|(peer, _)| peer.clone());
+            match victim {
+                Some(peer) => {
+                    self.peers.remove(&peer);
+                }
+                None => break,
+            }
+        }
     }
 }
 
@@ -1782,6 +1850,62 @@ mod tests {
         throttle.begin("bad").unwrap().record_failure();
         assert!(throttle.begin("bad").is_none(), "bad peer is locked out");
         assert!(throttle.begin("other").is_some(), "lockout is per peer");
+    }
+
+    /// The peer key is the remote address, so it is attacker-chosen: a source
+    /// with a large address range gets a fresh key per attempt and used to
+    /// grow this map for a whole failure window.
+    #[test]
+    fn auth_throttle_bounds_the_peer_table() {
+        let cap = 8;
+        let throttle = AuthThrottle::with_limits_and_capacity(
+            1024,
+            2,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+            cap,
+        );
+        for i in 0..cap * 20 {
+            throttle
+                .begin(format!("peer-{i}"))
+                .expect("distinct peers are not locked")
+                .record_failure();
+        }
+        let tracked = throttle.inner.lock().unwrap().peers.len();
+        assert!(tracked <= cap, "peer table grew to {tracked}, cap {cap}");
+    }
+
+    /// A peer serving an active lockout outranks peers that merely failed
+    /// once, or flooding the table would be a way to clear your own lockout.
+    ///
+    /// Uses the real shape of the defaults — lockout *shorter* than the
+    /// failure window — because that is what makes this non-obvious: ordering
+    /// on expiry alone evicts the locked peer first, since it expires sooner
+    /// than a peer that failed once five minutes ago.
+    #[test]
+    fn auth_throttle_evicts_single_failures_before_active_lockouts() {
+        let cap = 4;
+        let throttle = AuthThrottle::with_limits_and_capacity(
+            1024,
+            2,
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+            cap,
+        );
+        throttle.begin("bad").unwrap().record_failure();
+        throttle.begin("bad").unwrap().record_failure();
+        assert!(throttle.begin("bad").is_none(), "locked out to begin with");
+
+        for i in 0..cap * 20 {
+            throttle
+                .begin(format!("filler-{i}"))
+                .expect("filler peers are not locked")
+                .record_failure();
+        }
+        assert!(
+            throttle.begin("bad").is_none(),
+            "flooding the table must not clear an active lockout"
+        );
     }
 
     /// An abandoned handshake — a page navigation, a suspended tab, a client
