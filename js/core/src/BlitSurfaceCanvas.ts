@@ -14,6 +14,7 @@ import {
   SURFACE_POINTER_UP,
   SURFACE_POINTER_MOVE,
 } from "./protocol";
+import { devicePixelBox, drawHalved, halve, halvings } from "./downscale";
 
 /** Cached codec support bitmask.  Computed once, reused for all resize messages. */
 let _codecSupport: number | null = null;
@@ -362,6 +363,24 @@ export class BlitSurfaceCanvas {
     height: number;
     scale120: number;
   } | null = null;
+  /**
+   * The container's size in device pixels, tracked for every view.
+   *
+   * A resizable view gets its size through setDisplaySize and sits at 1:1, so
+   * this is only consulted for the views that never learn a size — dock
+   * thumbnails and the React binding — which otherwise hand a full-resolution
+   * frame to a card-sized box and get a point-sampled minification back.
+   * Presentation only: it is never sent to the server, so a thumbnail cannot
+   * shrink the surface for the co-viewers watching it full size.
+   */
+  private _presentBox: { width: number; height: number } | null = null;
+  private _presentObserver: ResizeObserver | null = null;
+  /** Halvings applied by the last blit, so the observer can tell a resize that
+   *  crosses an octave from one that changes nothing on screen. */
+  private _presentHalvings = 0;
+  /** Source frame size of the last blit, so the observer can recompute the
+   *  reduction without going back to the store. */
+  private _lastFrameSize: { width: number; height: number } | null = null;
   /** Last layout applied by applyLayout(), to skip redundant style writes. */
   private _lastLayout: {
     left: number;
@@ -535,8 +554,37 @@ export class BlitSurfaceCanvas {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
 
+    this.observePresentBox(container);
     this.subscribe();
     this.attachEvents();
+  }
+
+  /**
+   * Watch the container so blitFromStore knows how far the browser is about
+   * to shrink the canvas.  See {@link _presentBox}.
+   */
+  private observePresentBox(container: HTMLElement): void {
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      const box = entry && devicePixelBox(entry);
+      if (!box) return;
+      this._presentBox = box;
+      // Redraw only when the box crosses an octave.  The reduction is
+      // quantised, so most of a dock-grip drag lands on the same chain and
+      // there is nothing new to show.
+      const src = this._lastFrameSize;
+      if (!src || this._displaySize) return;
+      if (
+        halvings(src.width, src.height, box.width, box.height) ===
+        this._presentHalvings
+      )
+        return;
+      const store = this.getConn()?.surfaceStore ?? this._store;
+      if (store) this.blitFromStore(store);
+    });
+    observer.observe(container);
+    this._presentObserver = observer;
   }
 
   dispose(): void {
@@ -546,6 +594,8 @@ export class BlitSurfaceCanvas {
       this._retryUnsub();
       this._retryUnsub = undefined;
     }
+    this._presentObserver?.disconnect();
+    this._presentObserver = null;
     this.releaseAllKeys();
     this.releaseAllButtons();
     this.endScrollSequence();
@@ -670,9 +720,10 @@ export class BlitSurfaceCanvas {
    * frame *larger* than the container (transiently, mid-resize) is scaled
    * down to fit, aspect-preserved.
    *
-   * Non-resizable views (thumbnails, the React binding) never learn the
-   * container's device-pixel size, so they keep the fill-and-contain CSS
-   * from attach().
+   * Non-resizable views (thumbnails, the React binding) keep the
+   * fill-and-contain CSS from attach() and let the box drive the size.  They
+   * do track the container (see {@link _presentBox}) but only to pick a
+   * halving chain in blitFromStore, never to place the canvas.
    */
   private applyLayout(): void {
     const canvas = this.canvas;
@@ -880,16 +931,27 @@ export class BlitSurfaceCanvas {
     const ctx = this.ctx;
     if (!src || !canvas || !ctx) return;
     if (src.width === 0 || src.height === 0) return;
+    this._lastFrameSize = { width: src.width, height: src.height };
 
-    // Canvas backing buffer mirrors the source frame exactly; applyLayout
-    // sizes the CSS box so the blit is 1:1 device pixels (or a proportional
-    // downscale when the frame is transiently larger than the container).
-    if (canvas.width !== src.width || canvas.height !== src.height) {
-      canvas.width = src.width;
-      canvas.height = src.height;
+    // A view that sizes its own box is already 1:1 and has nothing to
+    // prefilter: the backing buffer mirrors the source frame exactly and
+    // applyLayout sizes the CSS box to match (or, transiently mid-resize,
+    // scales a too-large frame down proportionally).
+    //
+    // A view that is *handed* a box — a dock thumbnail — is about to be
+    // minified by the compositor instead, so bring the frame down to roughly
+    // the box in whole halves first and leave CSS a scale it can filter.
+    const box = this._displaySize ? null : this._presentBox;
+    const n = box ? halvings(src.width, src.height, box.width, box.height) : 0;
+    this._presentHalvings = n;
+    const w = halve(src.width, n);
+    const h = halve(src.height, n);
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
     }
     this.applyLayout();
-    ctx.drawImage(src, 0, 0);
+    drawHalved(ctx, src, src.width, src.height, n);
   }
 
   private resubscribe(): void {
