@@ -25,13 +25,17 @@ is launched again after a blit server restart.
 
 An extension is an **in-process logical blit client**. It exchanges ordinary
 blit packets with the same packet dispatcher as a network client, but does
-not open a socket and does not use transport framing. Its complete host ABI
-is a packet send operation and a blocking packet receive operation. It gets
-the same initial `HELLO` / `LIST` / `READY` sequence and can use every blit
-protocol family exposed to ordinary clients by that server.
+not open a socket and does not use transport framing. Its host ABI is packet
+send, blocking packet receive, and a direct clock read. It gets the same
+initial `HELLO` / `LIST` / `READY` sequence and can use every blit protocol
+family exposed to ordinary clients by that server.
 
 This RFC also adds native **channels**: named connection points carrying
 reliable bidirectional messages without terminal semantics.
+
+A named persistent extension may advertise a discoverable command tree. The
+CLI exposes it under an unambiguous `@name` namespace and carries each command
+invocation over a normal channel.
 
 It also adds a native **process** family for spawning non-PTY child processes,
 streaming their stdout and stderr, writing stdin, and controlling their
@@ -73,6 +77,8 @@ PTYs.
 - Optionally persist desired extension state across blit server restarts.
 - Give an extension the same protocol surface as an equivalent remote client.
 - Add server-native bidirectional channels.
+- Let named persistent extensions contribute discoverable, namespaced CLI
+  commands.
 - Let clients spawn and control non-PTY server processes with flow-controlled
   stdin, stdout, and stderr streams.
 - Keep the Wasm host ABI very small and versioned.
@@ -99,6 +105,9 @@ PTYs.
   window, timeout, or disconnection outcome.
 - **No requirement that channel payloads use JSON.** Payloads are opaque
   bytes with descriptive metadata.
+- **No client-side extension code.** Extension commands execute on the selected
+  server. Their descriptors provide discovery and help, not a local executable
+  or client-side argument validator.
 
 ## Architecture
 
@@ -186,9 +195,9 @@ separate work and must not create a Wasm-only path.
 
 An **extension** is the stable supervised object created by
 `EXT_RUN`. It has a 64-bit randomly allocated `extension_id`, a module hash,
-arguments, restart policy, desired state, and optional durable name. A
-transient ID is process-local; a persistent extension retains its ID and name
-across server restarts.
+arguments, restart policy, desired state, definition revision, and optional
+durable name. A transient ID is process-local; a persistent extension retains
+its ID, revision, and name across server restarts.
 
 An **attempt** is one Wasmi instantiation of that extension. Attempts are
 numbered monotonically from one. A running attempt has its own 32-bit
@@ -230,7 +239,7 @@ The initial SDK targets `wasm32-unknown-unknown`. A module:
 
 - exports linear memory as `memory`;
 - exports `blit_main: () -> i32`;
-- imports `send` and `recv` from module `blit_v1`.
+- imports `send`, `recv`, and `clock` from module `blit_v1`.
 
 Returning from `blit_main` ends the attempt. Its `i32` is the attempt exit
 code. A trap, invalid host call, or rejected packet ends the attempt with a
@@ -242,6 +251,7 @@ policy.
 ```text
 blit_v1.send(ptr: i32, len: i32) -> i32
 blit_v1.recv(ptr: i32, capacity: i32) -> i32
+blit_v1.clock(kind: i32) -> i64
 ```
 
 `send` validates the range in exported memory and copies one complete blit
@@ -265,6 +275,13 @@ negative capacity, integer overflow, or an invalid destination range traps the
 attempt. The SDK keeps a reusable buffer and retries with `N` bytes only when
 needed. `recv` never returns a negative value.
 
+`clock(0)` returns signed nanoseconds since the Unix epoch. `clock(1)` returns
+nanoseconds from a monotonic clock with an unspecified origin. Realtime may
+jump when the host clock is adjusted; monotonic values are suitable only for
+differences and must not be persisted across server restarts. Any other kind
+traps the attempt. A clock read is a direct synchronous host call: it does not
+construct or dispatch a packet.
+
 `send` may block until its whole packet fits in the endpoint's inbound mailbox.
 This preserves ordering and backpressure without busy polling.
 
@@ -272,12 +289,44 @@ Each in-process mailbox has a 16 MiB byte capacity, equal to the maximum Blit
 logical-message size. Packets are never split, and every valid packet therefore
 fits in an empty mailbox. There is no separate oversized-packet case.
 
-No separate argument, logging, timer, or process imports are needed. After the
-normal `HELLO` / `LIST` / `READY` handshake, the host sends `EXT_INFO(INIT)`
-containing extension, attempt, and task IDs plus arguments. Guest logs and
-structured output are `EXT_EVENT` packets. Timers,
-child processes, and other facilities can be ordinary protocol operations when
-required.
+No separate argument, logging, or process imports are needed. Guest logs and
+structured output are `EXT_EVENT` packets. Child processes and other Blit
+facilities remain ordinary protocol operations.
+
+### Bootstrap identity and arguments
+
+Before the attempt becomes externally reachable, its endpoint enqueues the
+normal `HELLO` / `LIST` / `READY` burst followed immediately by exactly one
+`EXT_INFO(INIT)`. No channel acceptance, command invocation, or other routed
+packet may precede `INIT`.
+
+`INIT` supplies the `extension_id`, definition revision, attempt, process-local
+task ID, module hash, invocation name when present, attachment and persistence
+flags, and the exact UTF-8 argument vector from `EXT_RUN`. No synthetic module
+path or `argv[0]` is inserted. For a transient extension, revision is always 1
+and the ID lasts for this server process. For a persistent extension, ID and
+revision survive server restarts. Attempt increases on every Wasmi
+instantiation; task ID is meaningful only in the current server process.
+
+The `blit-guest` entry-point wrapper consumes the handshake and `INIT` before
+calling user code, then exposes them as an immutable context:
+
+```rust
+let context = blit.context();
+let id = context.extension_id;
+let version = (context.definition_revision, context.module_hash);
+let args: &[String] = &context.args;
+let started = blit.monotonic_now();
+let wall_time = blit.realtime_now();
+let elapsed = blit.monotonic_now() - started;
+```
+
+The context also exposes `attempt`, `task_id`, `name: Option<String>`,
+`detached`, and `persistent`. Protocol features come from the preceding
+`HELLO`, just as they do for a network client. Identity and arguments therefore
+require no extra host calls. The clock wrappers return a typed wall-clock time
+and an opaque monotonic instant whose subtraction yields a duration; neither
+requires a dispatcher round trip.
 
 ### Optional WASI
 
@@ -286,7 +335,11 @@ stdin/stdout/stderr, clocks, and randomness. It is not another API for blit
 operations. The initial `wasm32-unknown-unknown` SDK needs no WASI imports; a
 later `wasm32-wasip1` target may link
 [`wasmi_wasi`](https://docs.rs/wasmi_wasi/latest/wasmi_wasi/) for those
-facilities. Version 1 defines no WASI filesystem preopens or sockets.
+facilities. A WASI-enabled SDK backs its clocks with `blit_v1.clock`, so the
+core and WASI targets observe the same host clocks. Version 1 defines no WASI
+filesystem preopens or sockets. If the adapter exposes WASI arguments, it uses
+the same `INIT` vector without inventing a server-side path; the SDK context is
+the canonical source on both targets.
 
 Standard WASI does not define arbitrary child-process spawning. Its CLI
 proposal covers environment variables, arguments, stdio, and the current
@@ -298,11 +351,12 @@ packets, just like any other client.
 
 ### Rust SDK
 
-`blit-guest` wraps the two imports and re-exports the protocol codec surface:
+`blit-guest` wraps the three imports and re-exports the protocol codec surface:
 
 ```rust
 #[blit::main]
-fn main(mut blit: blit::Client, args: Vec<String>) -> Result<(), Error> {
+fn main(mut blit: blit::Client) -> Result<(), Error> {
+    let args = &blit.context().args;
     let request = blit_remote::msg_create2(/* ... */);
     blit.send(&request)?;
     let created = blit.recv_matching(/* ... */)?;
@@ -425,22 +479,28 @@ uploader returning. An LRU may evict other translated modules and raw objects.
 
 ### Miss and race behavior
 
-`EXT_RUN` is the cache probe. A hit creates the extension without
-another request. A miss returns `NEED_OBJECT` and records a bounded pending
-extension. The miss is encoded as
-`EXT_STATUS(status = OK, phase = NEED_OBJECT)`; `NEED_OBJECT` is a run
-phase, not a status code. The client uploads chunks and does not resend
+`EXT_RUN` is the cache probe. For creation, a hit creates the extension. A miss
+returns `NEED_OBJECT` and records a bounded pending extension. The miss is
+encoded as `EXT_STATUS(status = OK, phase = NEED_OBJECT)`; `NEED_OBJECT` is a
+run phase, not a status code. The client uploads chunks and does not resend
 `EXT_RUN` after a successful final chunk; the server creates and starts the
 pending extension automatically.
+
+An update hit commits the replacement. An update miss also returns
+`NEED_OBJECT`, but records no pending update and changes neither the definition
+nor its current attempt. The client uploads the object, refreshes the current
+ID and revision, and retries `EXT_RUN(UPDATE)` with a fresh nonce. This prevents
+a slow upload from later overwriting a concurrent update.
 
 Uploads are single-flight per object hash. If several clients miss the same
 object, the first accepted uploader supplies it and every compatible pending
 extension starts after verification. A client whose `EXT_PUT` races after the
 object has committed receives `ALREADY_HAVE` and stops sending. While another
 upload is still in progress, a second `BEGIN` receives `CONFLICT`; its pending
-run waits for the owner rather than uploading duplicate bytes. If the owner
-fails or expires, waiting runs receive a fresh `NEED_OBJECT` update and may
-compete to become the next uploader. That update is
+creation waits for the owner rather than uploading duplicate bytes. An update
+client simply retries its probe. If the owner fails or expires, waiting creates
+receive a fresh `NEED_OBJECT` update and may compete to become the next
+uploader. That update is
 `EXT_INFO(STATUS, phase = NEED_OBJECT)`, keyed by `extension_id`, rather than a
 second reply to the original run nonce. Pending extensions and partial uploads
 expire.
@@ -456,20 +516,30 @@ UTF-8. Unless otherwise stated, `detail` is UTF-8 and consumes the remainder.
 
 ### Client to server
 
-| Opcode | Name          | Layout                                                                                            |
-| ------ | ------------- | ------------------------------------------------------------------------------------------------- |
-| `0x90` | `EXT_RUN`     | `[nonce:2][flags:1][restart:1][hash:32][name_len:2][name:N][argc:2] repeated{[len:4][arg:M]}`     |
-| `0x91` | `EXT_PUT`     | `[nonce:2][flags:1][hash:32][offset:8][total_size:8][data:N]`                                     |
-| `0x92` | `EXT_CONTROL` | `[nonce:2][extension_id:8][action:1]`                                                             |
-| `0x93` | `EXT_EVENT`   | `[extension_id:8][attempt:8][task_id:4][kind:1][data:N]` — only from the matching running attempt |
+| Opcode | Name          | Layout                                                                                                                                                 |
+| ------ | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `0x90` | `EXT_RUN`     | `[nonce:2][flags:1][restart:1][expected_extension_id:8][expected_definition_revision:8][hash:32][name_len:2][name:N][argc:2] repeated{[len:4][arg:M]}` |
+| `0x91` | `EXT_PUT`     | `[nonce:2][flags:1][hash:32][offset:8][total_size:8][data:N]`                                                                                          |
+| `0x92` | `EXT_CONTROL` | `[nonce:2][extension_id:8][action:1]`                                                                                                                  |
+| `0x93` | `EXT_EVENT`   | `[extension_id:8][attempt:8][task_id:4][kind:1][data:N]` — only from the matching running attempt                                                      |
+| `0x94` | `EXT_COMMAND` | `[kind:1][nonce:2][body...]`                                                                                                                           |
 
-`EXT_RUN.flags`: bit 0 `DETACH`, bit 1 `PERSIST`. `restart` is the
+`EXT_RUN.flags`: bit 0 `DETACH`, bit 1 `PERSIST`, bit 2 `UPDATE`. `restart` is the
 restart-policy value from [§ Lifecycle model](#lifecycle-model). `PERSIST`
 requires `DETACH` and a non-empty, unique `name`. Without `PERSIST`, `name` may
 be empty and is descriptive only. Unknown flags or restart values are
 `INVALID`.
 Argument count is capped at 1024, each argument at 64 KiB, and their combined
 UTF-8 bytes at 1 MiB. NUL has no special meaning.
+
+For a new extension, `UPDATE` is clear and `expected_extension_id` must be
+zero, as must `expected_definition_revision`. Creating a persistent extension
+whose name already exists is `CONFLICT`. For an update, `DETACH`, `PERSIST`,
+and `UPDATE` are all set; the supplied name, non-zero expected ID, and non-zero
+expected revision must identify the current persistent definition. The hash,
+arguments, and restart value describe its complete replacement definition.
+Update behavior is specified in
+[§ Instances and module versions](#instances-and-module-versions).
 
 `EXT_PUT.flags`: bit 0 `BEGIN`, bit 1 `FINAL`. The first chunk has
 `BEGIN`, offset zero, and begins a new upload. `total_size` is present on every
@@ -479,6 +549,8 @@ cumulatively acknowledged. `FINAL` requires `offset + data.len() ==
 total_size`, then triggers hash verification, validation, atomic cache
 insertion, and pending-run start. A one-packet object sets both flags. The
 maximum module size is 16 MiB; clients should use 1 MiB chunks.
+An upload may also follow an update miss without a pending create; in that case
+successful insertion only primes the CAS for the client's next update probe.
 
 `EXT_CONTROL.action`:
 
@@ -502,45 +574,99 @@ through `LIST`; wire control continues to use unambiguous 64-bit IDs.
 3 for a UTF-8 log record. These are convenience event streams, not terminals.
 Structured application communication should use channels.
 
+Client `EXT_COMMAND.kind` values:
+
+| Kind | Name       | Body                                              |
+| ---- | ---------- | ------------------------------------------------- |
+| 1    | `REGISTER` | `[listener_id:4][descriptor_len:4][descriptor:N]` |
+| 2    | `DISCOVER` | `[directory_revision:8][cursor:8]`                |
+
+`REGISTER` is valid only from the running endpoint of a named persistent
+extension, and `listener_id` must name a live channel listener owned by that
+same endpoint. One extension has at most one advertised command listener; a
+new registration atomically replaces the prior one. A zero-length descriptor
+with `listener_id = 0` unregisters it. Registration receives
+`EXT_INFO(COMMAND_REGISTERED)`.
+
+Any logical client may send `DISCOVER`. A first request uses revision and
+cursor zero. A continuation repeats the returned non-zero revision and cursor.
+It receives one page in `EXT_INFO(COMMANDS)`; `next_cursor = 0` means the list
+is complete. A directory mutation between pages returns `CONFLICT`, and the
+client restarts at zero. The revision is process-local and exists only to make
+pagination and client caching coherent.
+
 ### Server to client
 
-| Opcode | Name             | Layout                                                                                                                            |
-| ------ | ---------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `0x90` | `EXT_STATUS`     | `[nonce:2][status:1][phase:1][flags:1][restart:1][extension_id:8][attempt:8][task_id:4][next_start_unix_ms:8][hash:32][detail:N]` |
-| `0x91` | `EXT_PUT_STATUS` | `[nonce:2][status:1][hash:32][received:8][detail:N]`                                                                              |
-| `0x92` | `EXT_INFO`       | `[kind:1][body...]`                                                                                                               |
-| `0x93` | `EXT_EVENT`      | `[extension_id:8][attempt:8][task_id:4][sequence:8][kind:1][data:N]`                                                              |
-| `0x94` | `EXT_EXIT`       | `[extension_id:8][attempt:8][task_id:4][reason:1][code:4][next_start_unix_ms:8][detail:N]`                                        |
+| Opcode | Name             | Layout                                                                                                                                                   |
+| ------ | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0x90` | `EXT_STATUS`     | `[nonce:2][status:1][phase:1][flags:1][restart:1][extension_id:8][definition_revision:8][attempt:8][task_id:4][next_start_unix_ms:8][hash:32][detail:N]` |
+| `0x91` | `EXT_PUT_STATUS` | `[nonce:2][status:1][hash:32][received:8][detail:N]`                                                                                                     |
+| `0x92` | `EXT_INFO`       | `[kind:1][body...]`                                                                                                                                      |
+| `0x93` | `EXT_EVENT`      | `[extension_id:8][definition_revision:8][attempt:8][task_id:4][sequence:8][kind:1][data:N]`                                                              |
+| `0x94` | `EXT_EXIT`       | `[extension_id:8][definition_revision:8][attempt:8][task_id:4][reason:1][code:4][next_start_unix_ms:8][detail:N]`                                        |
 
 Server `EXT_INFO.kind` values:
 
-| Kind | Name     | Body                                                                                                           |
-| ---- | -------- | -------------------------------------------------------------------------------------------------------------- |
-| 1    | `INIT`   | `[extension_id:8][attempt:8][task_id:4][flags:1][argc:2] repeated{[len:4][arg:N]}`                             |
-| 2    | `LIST`   | `[nonce:2][status:1][count:2] repeated{extension_record}`                                                      |
-| 3    | `STATUS` | `[extension_id:8][phase:1][flags:1][restart:1][attempt:8][task_id:4][next_start_unix_ms:8][hash:32][detail:N]` |
+| Kind | Name                 | Body                                                                                                                                   |
+| ---- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | `INIT`               | `[extension_id:8][definition_revision:8][attempt:8][task_id:4][flags:1][hash:32][name_len:2][name:N][argc:2] repeated{[len:4][arg:M]}` |
+| 2    | `LIST`               | `[nonce:2][status:1][count:2] repeated{extension_record}`                                                                              |
+| 3    | `STATUS`             | `[extension_id:8][definition_revision:8][phase:1][flags:1][restart:1][attempt:8][task_id:4][next_start_unix_ms:8][hash:32][detail:N]`  |
+| 4    | `COMMAND_REGISTERED` | `[nonce:2][status:1][extension_id:8][definition_revision:8][detail:N]`                                                                 |
+| 5    | `COMMANDS`           | `[nonce:2][status:1][directory_revision:8][next_cursor:8][count:2] repeated{command_record}`                                           |
+
+`EXT_INFO(INIT).flags` and the flags stored in status and list records use bit
+0 `DETACH` and bit 1 `PERSIST`; all other bits are zero. `UPDATE` describes an
+`EXT_RUN` operation and is never part of an attempt's identity.
 
 An `extension_record` is:
 
 ```text
-[extension_id:8][phase:1][flags:1][restart:1][attempt:8][task_id:4]
+[extension_id:8][definition_revision:8][phase:1][flags:1][restart:1]
+[attempt:8][task_id:4]
 [next_start_unix_ms:8][hash:32][name_len:2][name:N]
 ```
+
+A `command_record` is:
+
+```text
+[extension_id:8][definition_revision:8][hash:32][name_len:2][name:N]
+[listener_name_len:2][listener_name:M][descriptor_len:4][descriptor:D]
+```
+
+Only a live, successfully registered listener appears in `COMMANDS`. Its
+namespace is the extension's unique durable `name`; the descriptor cannot
+override it. Closing the listener, ending the attempt, disabling or removing
+the extension, or dropping its endpoint removes the record and increments the
+directory revision. The next attempt must register again. The server does not
+retain a stale descriptor or queue invocations during restart or backoff.
 
 `EXT_INFO(INIT)` is injected only into the extension's in-process endpoint
 after `READY`; a network client never receives it merely by attaching.
 
-`EXT_RUN` receives exactly one nonce-correlated `EXT_STATUS`, which
-allocates and returns `extension_id` even on a cache miss. That reply releases the
-16-bit nonce. Later validation, queue, attempt, backoff, and stop transitions
-are uncorrelated `EXT_INFO(STATUS)` events keyed by `extension_id`; attached
-clients follow the ID and do not keep the original run nonce reserved. Each
+`EXT_RUN` receives exactly one nonce-correlated `EXT_STATUS`. A create allocates
+and returns a new `extension_id` even on a cache miss; an update returns the
+existing ID and current definition revision. The phase in a cache-miss reply
+describes the pending create or update operation, not a replacement lifecycle
+for an attempt which is still running. That reply releases the 16-bit nonce.
+For `UPDATE`, the correlated reply's hash is the requested hash and its attempt
+and task fields are zero: old-attempt exit and new-attempt start are reported by
+their subsequent ID-keyed events. A cache-miss reply carries the current
+revision and creates no later status event; a committed cache hit carries the
+new revision.
+Later validation, definition commit, queue, attempt, backoff, and stop
+transitions are uncorrelated `EXT_INFO(STATUS)` events keyed by `extension_id`;
+attached clients follow the ID and do not keep the original run nonce reserved. Each
 non-`LIST` `EXT_CONTROL` likewise receives exactly one `EXT_STATUS`
 snapshot with its own request nonce, after which later changes are ID-keyed
 events. `EXT_PUT` nonces live for one chunk acknowledgement, and the `LIST`
 nonce lives through its single `EXT_INFO(LIST)` reply. On a given endpoint,
 the correlated reply is enqueued before any `EXT_INFO` or `EXT_EXIT`
 caused by that request.
+
+Each `EXT_COMMAND` nonce likewise lives through exactly one
+`COMMAND_REGISTERED` or `COMMANDS` reply. Later directory changes are not
+pushed; discovery is an explicit snapshot operation.
 
 Run phases:
 
@@ -554,9 +680,11 @@ Run phases:
 | 6     | `STOPPED`     | No attempt is running or scheduled                       |
 | 7     | `BLOCKED`     | Permanent condition requires object or operator work     |
 
-Exit reasons distinguish returned, trapped, cancelled, slow consumer, protocol
-violation, host failure, and server shutdown. `code` is the `blit_main` return
-only for `RETURNED`; it is zero for other reasons.
+Exit reasons distinguish returned, trapped, cancelled, updated, slow consumer,
+protocol violation, host failure, and server shutdown. `UPDATED` means a newer
+definition replaced this attempt; it is not an attempt failure and does not
+apply restart backoff. `code` is the `blit_main` return only for `RETURNED`; it
+is zero for other reasons.
 `next_start_unix_ms` is non-zero only when the supervisor has scheduled another
 attempt.
 
@@ -564,7 +692,7 @@ Common family status values are reused: `OK`, `NOT_FOUND`, `TOO_LARGE`,
 `INVALID`, `CANCELLED`, `OTHER`, and `CONFLICT`.
 `EXT_PUT_STATUS` additionally defines value 12 as `ALREADY_HAVE`. It means
 the verified object is already committed; `received` is its stored total size,
-the pending run proceeds, and the client must stop uploading. `OK` reports the
+pending creations proceed, and the client must stop uploading. `OK` reports the
 cumulative accepted `received` bytes. `CONFLICT` means another uploader owns
 the still-uncommitted single flight and does not claim the object exists yet;
 it reports `received = 0`.
@@ -608,7 +736,7 @@ Persistent definitions are durable desired state, separate from the Wasmi
 instance. The server transactionally stores:
 
 - stable extension ID and unique name;
-- object hash, arguments, and restart policy;
+- definition revision, object hash, arguments, and restart policy;
 - enabled/desired-running state;
 - attempt counter, consecutive-failure count, and next eligible start time.
 
@@ -637,6 +765,86 @@ Arguments are stored verbatim. They should not contain secrets unless the
 extension store gains an explicit encrypted-secret mechanism; references through
 a separate secret facility are preferable. Retained stdout/stderr events are
 not durable in the first version.
+
+## Instances and module versions
+
+Three identifiers answer different questions:
+
+| Identifier                | Identifies                                        | Lifetime                 |
+| ------------------------- | ------------------------------------------------- | ------------------------ |
+| module hash               | exact Wasm bytes                                  | immutable CAS object     |
+| `extension_id`            | one supervised installation and its configuration | stable for the extension |
+| `(extension_id, attempt)` | one Wasmi instance                                | one execution attempt    |
+
+Every non-`UPDATE` `EXT_RUN` creates a distinct extension and ID, even when
+the hash, arguments, and descriptive name are identical. The same module
+object can therefore back any number of isolated extensions without another
+upload. Each extension has at most one running attempt; v1 has no replica-count
+setting. Operators create replicas as separate extensions, for example
+`worker-1`, `worker-2`, and `worker-3`, and manage them independently.
+
+```bash
+blit run --on prod --restart always --persist --name worker-1 worker.wasm queue-a
+blit run --on prod --restart always --persist --name worker-2 worker.wasm queue-b
+blit ext list --on prod
+blit ext restart --on prod worker-1
+```
+
+Transient names are descriptive and need not be unique, so transient instances
+are controlled by ID. Persistent names are unique durable handles and are the
+normal operator-facing identity. Extensions which derive channel names or KV
+prefixes per instance should include their `extension_id`; replicas must not
+assume that a shared module hash implies shared identity.
+
+Blit assigns no semantic version to a module and reads no version manifest.
+The full module hash is its exact version identity. Different hashes coexist in
+the CAS, and `blit ext list` and `blit ext status` show the full current hash and
+`definition_revision`. Revision starts at 1, survives server restarts, and
+increments whenever a persistent extension's hash, arguments, or restart
+policy changes. Attempts report the revision they execute, so events and exits
+remain attributable when an update overlaps observation of the old attempt.
+
+To run two versions concurrently, create two persistent extensions with
+different names, such as `builder` and `builder-canary`. To replace one durable
+extension in place, use:
+
+```bash
+blit ext update --on prod builder ./builder-v2.wasm arg1 arg2
+```
+
+This sends `EXT_RUN(UPDATE)` with the name, ID, and definition revision observed
+by the CLI. The expected ID prevents an update from crossing a
+remove-and-recreate race, and the expected revision prevents concurrent updates
+from silently overwriting one another. An absent name is `NOT_FOUND`; an ID or
+revision mismatch is `CONFLICT`. The server rechecks both in the same
+transaction which commits the new definition, including after a cache miss.
+The client and server handle an update as follows:
+
+1. The client probes with `EXT_RUN(UPDATE)`. On `NEED_OBJECT`, it uploads and
+   validates the replacement while the current attempt continues, refreshes
+   the extension record, and retries the update.
+2. The server atomically checks the expected ID and revision, stores the new
+   hash, arguments, and restart policy, and
+   increments the definition revision. Enabled and desired-running state are
+   preserved.
+3. If an attempt is running and the definition changed, it exits with
+   `UPDATED`; the supervisor clears failure backoff and immediately starts the
+   new revision. A disabled or stopped extension merely records the new
+   definition.
+
+Submitting the exact current hash, arguments, and restart policy is an
+idempotent success: it neither increments revision nor restarts an attempt. A
+failed upload or validation leaves the old definition and attempt unchanged.
+The old attempt's channels, processes, command listener, and endpoint close
+normally before the new attempt becomes reachable. Its command advertisement
+is removed as part of the definition commit, before the old attempt is asked to
+exit. Command calls are never retried across that boundary.
+
+V1 keeps no definition history and performs no automatic rollback. Rollback is
+an ordinary update naming older Wasm bytes; it avoids upload only if that hash
+is still in the CAS. Durable names cannot be renamed in place, because that
+would break command namespaces and operator references; create the new name and
+remove the old extension instead.
 
 ## Native channel family
 
@@ -703,6 +911,147 @@ window and maximum payload: 4 MiB. Metadata is capped at 64 KiB.
 There is no implicit broadcast and no retained channel data. Higher-level RPC
 uses request IDs inside the opaque payload and cancellation by a normal
 message or channel close.
+
+## Extension-provided CLI commands
+
+A running named persistent extension may contribute a command tree under its
+durable name. The `@` prefix keeps remote extension commands separate from
+Blit's built-in grammar. Transient extensions cannot advertise commands because
+their descriptive names are neither unique nor durable:
+
+```bash
+blit ext commands --on prod
+blit --on prod @builder --help
+blit --on prod @builder build --release app
+```
+
+Connection and Blit-wide options must precede `@builder`. Every token after the
+namespace is the command argument vector and is delivered verbatim, including
+tokens beginning with `-`; no `--` separator is required. The sole exception is
+a final `--help` following an advertised command path, which the CLI renders
+from the descriptor without opening an invocation channel. A persistent extension
+named `builder-canary` independently contributes `@builder-canary`, so
+concurrent versions do not contend for one CLI namespace.
+
+The control and data paths are deliberately separate:
+
+```mermaid
+sequenceDiagram
+    participant E as "Wasmi extension"
+    participant S as "Blit server"
+    participant C as "CLI client"
+    E->>S: "CHANNEL LISTEN (fresh listener name)"
+    E->>S: "EXT_COMMAND REGISTER (listener + descriptor)"
+    C->>S: "EXT_COMMAND DISCOVER"
+    S-->>C: "@name records at directory revision"
+    C->>S: "CHANNEL CONNECT (selected listener)"
+    S-->>E: "CHANNEL ACCEPTED"
+    C->>E: "INVOKE argv"
+    E-->>C: "STDOUT / STDERR / RESULT / EXIT"
+```
+
+Registration is live advertisement, not an install manifest. The extension
+first listens on a fresh name, conventionally
+`blit.cli.<extension_id>.<attempt>`, then registers that listener and its
+descriptor through `EXT_COMMAND`. The server derives `@name`, extension ID,
+definition revision, and module hash from the authenticated endpoint; the
+descriptor cannot claim them. An unrelated endpoint may still squat on a raw
+channel name, but it cannot register that listener as another extension's CLI
+surface.
+
+The descriptor is UTF-8 JSON, capped at 64 KiB like channel metadata, with this
+initial shape:
+
+```json
+{
+  "protocol": "blit.cli.v1",
+  "summary": "Build and publish this workspace",
+  "commands": [
+    {
+      "path": ["build"],
+      "summary": "Build one target",
+      "usage": "build [--release] TARGET",
+      "options": [
+        {
+          "names": ["-r", "--release"],
+          "takes_value": false,
+          "help": "Build optimized artifacts"
+        }
+      ]
+    }
+  ]
+}
+```
+
+`protocol`, `summary`, and `commands` are required. A command `path` is an
+array of literal subcommand tokens; an empty path describes the namespace
+root. `summary`, `usage`, `options`, and option `help` are presentation data.
+Unknown fields are ignored so the descriptor can grow compatibly. The CLI
+sanitizes control characters and never evaluates descriptor text or installs
+shell code. It uses the descriptor for listing, help, and static shell
+completion, but not for client-side argument validation: the extension remains
+the authority on its arguments and errors.
+
+The server rejects invalid UTF-8, invalid JSON, a protocol value other than
+`blit.cli.v1`, or missing required fields with `INVALID`. It validates only the
+discovery envelope and ownership; it does not interpret application options or
+execute descriptor content.
+
+`blit ext commands` discovers and prints the live directory. Root help
+(`blit --help`) remains local and does not unexpectedly contact a server;
+explicit `@name --help`, `blit ext commands`, and shell completion query the
+selected server. A client may cache discovery by `(boot_generation,
+directory_revision)`. A server restart or revision change invalidates that
+cache. V1 completion covers advertised namespaces, command paths, and option
+names only; dynamic, extension-executed completion is future work.
+
+After discovery, the CLI connects to the advertised listener. Each accepted
+channel carries one invocation using `blit.cli.v1`. Every channel `DATA`
+payload begins with a one-byte kind.
+
+Client-to-extension payloads are:
+
+| Kind | Name        | Body                                               |
+| ---- | ----------- | -------------------------------------------------- |
+| 1    | `INVOKE`    | `[flags:1][argc:2] repeated{[len:4][UTF-8 arg:N]}` |
+| 2    | `STDIN`     | `[data:N]`                                         |
+| 3    | `STDIN_EOF` | empty                                              |
+| 4    | `CANCEL`    | empty                                              |
+
+`INVOKE` must be the first payload. Its arguments are exactly the tokens after
+`@name`; flag bit 0 means stdin will be streamed and all other bits are
+reserved. Without that flag, stdin is closed from the start. With it, the CLI
+sends zero or more `STDIN` messages followed by one `STDIN_EOF`.
+
+Extension-to-client payloads are:
+
+| Kind | Name     | Body                                           |
+| ---- | -------- | ---------------------------------------------- |
+| 1    | `STDOUT` | `[data:N]`                                     |
+| 2    | `STDERR` | `[data:N]`                                     |
+| 3    | `LOG`    | `[level:1][UTF-8 message:N]`                   |
+| 4    | `RESULT` | `[content_type_len:2][content_type:N][data:M]` |
+| 5    | `EXIT`   | `[code:4][UTF-8 detail:N]`                     |
+
+Output is not a PTY stream: the channel has no terminal state, resize, or input
+mode and performs no escape-sequence interpretation. The CLI may copy `STDOUT`
+and `STDERR` bytes to its own corresponding streams. `LOG.level` values 0
+through 4 mean trace, debug, info, warning, and error. An invocation may emit
+any number of stream or log messages and at most one structured result, then
+exactly one `EXIT`; no payload follows `EXIT`. The signed `i32` code has the
+same native-CLI truncation caveat as `blit run`. `--json` exposes these frames
+as structured CLI events rather than changing what the extension sends.
+
+An unknown `blit.cli.v1` payload kind or malformed body closes that invocation
+channel as a protocol error; compatibility for a future command protocol uses
+a new descriptor `protocol` value.
+
+Normal channel windows provide backpressure in both directions. Closing the
+client side is cancellation even if `CANCEL` could not be delivered. If the
+extension attempt or listener disappears, the invocation fails and is never
+automatically retried against a restarted attempt. One attempt may accept many
+invocation channels, but it still has one Wasmi thread; its SDK event loop must
+multiplex them or deliberately serialize work.
 
 ## Process family
 
@@ -913,13 +1262,27 @@ after `RUNNING`. The management surface is:
 blit ext list
 blit ext status NAME_OR_ID
 blit ext attach NAME_OR_ID
+blit ext update [UPDATE_OPTIONS] NAME FILE [ARGS...]
 blit ext restart NAME_OR_ID
 blit ext enable NAME_OR_ID
 blit ext disable NAME_OR_ID
 blit ext remove NAME_OR_ID
+blit ext commands
 ```
 
 `blit extension` is an alias for `blit ext`.
+
+`list` reports the ID, durable or descriptive name, definition revision, full
+module hash, desired state, phase, attempt, and restart policy. Persistent
+names are accepted wherever `NAME_OR_ID` appears; ambiguous transient names
+must be addressed by ID. `update` is restricted to persistent names and uses
+the replacement semantics in
+[§ Instances and module versions](#instances-and-module-versions). Its options
+and connection flags precede `NAME`, while every token after `FILE` is a new
+stored extension argument. It preserves the current restart policy unless an
+update option explicitly replaces it. `commands` lists the live `@name`
+surfaces described in
+[§ Extension-provided CLI commands](#extension-provided-cli-commands).
 
 The local pathname is never sent as module identity. It may appear in local
 diagnostics. Servers and peers see the invocation name when one was supplied
@@ -930,15 +1293,18 @@ and the full content hash.
 Clients check feature bits 11, 12, and 13 before sending these families. Older
 clients ignore their S2C opcodes. Older servers do not advertise them, and
 `blit run` reports an upgrade requirement rather than attempting an upload.
+`blit ext commands` and `@name` dispatch require both extension bit 11 and
+channel bit 12.
 
 Kind-multiplexed envelopes have an explicit skip rule. Clients ignore an
 unknown S2C kind under `EXT_INFO` or `0x95` as one complete packet. Servers
-likewise ignore one complete packet with an unknown C2S kind under `0x95`; it is
-not a connection-level protocol violation and changes no handle state. A new
-C2S request kind which requires a reply must have a new feature bit or other
-explicit negotiation, so a client never waits on a server which can only skip
-it. A malformed payload for a known kind remains `INVALID` or a family-local
-protocol violation as specified by that family.
+likewise ignore one complete packet with an unknown C2S kind under
+`EXT_COMMAND` or `0x95`; it is not a connection-level protocol violation and
+changes no handle state. A new C2S request kind which requires a reply must
+have a new feature bit or other explicit negotiation, so a client never waits
+on a server which can only skip it. A malformed payload for a known kind
+remains `INVALID` or a family-local protocol violation as specified by that
+family.
 
 Gateways, mux, proxy, WebRTC, WebSocket, and WebTransport forward the new
 packets unchanged. Only the upstream blit server interprets them. The Wasm host
@@ -955,7 +1321,8 @@ gateway-global allocation or rewriting.
 Bindings for terminals, FS, Git, LSP, KV, network relay, and every
 future family duplicate the wire protocol and make Wasm support lag normal
 clients. They also encourage runtime-specific validation and cleanup.
-Packets give exact parity through two imports.
+Packets give exact parity through the two packet imports; the only additional
+version-1 import is the direct clock read.
 
 ### WASI or WASIX subprocess spawning
 
@@ -1004,26 +1371,37 @@ extension thread at all.
 2. **Packet endpoint refactor.** Extract logical client creation, packet
    dispatch, bounded outbox, identity propagation, and common disconnect.
 3. **Native channels.** Implement the `0x95` channel registry, flow control,
-   identity, cleanup, codecs, and CLI protocol tests.
+   identity, cleanup, and codecs.
 4. **Processes.** Implement the `0xC0` through `0xC5` process family,
    per-stream flow control, concurrent pipe draining, process-tree cleanup,
    codecs, and protocol tests from a network client.
 5. **Module objects.** Implement BLAKE3 run probe, chunk upload, validation,
    persistent CAS, pending-run single-flight, and cache eviction.
-6. **Supervisor.** Add stable extension/attempt identity, restart policy,
-   backoff, durable desired state, startup restoration, and crash-safe control.
+6. **Supervisor.** Add stable extension/attempt identity, definition revisions,
+   atomic update, restart policy, backoff, durable desired state, startup
+   restoration, and crash-safe control.
 7. **Wasmi host.** Add one named thread per running extension attempt, bounded
    endpoint queues, Wasmi containment, fuel-based cancellation yielding,
-   attempt lifecycle, and event retention.
-8. **Rust SDK and CLI.** Add `blit-guest`, a Rust example extension, `blit run`,
-   process wrappers, and extension control commands.
+   direct clocks, bootstrap context, attempt lifecycle, and event retention.
+8. **Command directory.** Implement `EXT_COMMAND` registration and discovery,
+   descriptor validation, live-listener ownership, revisioned pagination, and
+   the `blit.cli.v1` channel protocol.
+9. **Rust SDK and CLI.** Add `blit-guest`, a Rust example extension, `blit run`,
+   process and command-provider wrappers, extension control and update commands,
+   `@name` dispatch, help, listing, and static completion.
 
 Each phase has a vertical protocol test with at least two logical clients.
 The extension phases additionally verify cache hit (no upload), cache miss,
 nonce release before later ID-keyed status changes, hash mismatch, invalid
 imports, runaway-loop cancellation, cleanup after a trap, restart policy,
-backoff persistence, crash-safe disable, and restoration after a fresh server
-process. Multiplexed-family tests send unknown kinds in both directions.
+backoff persistence, crash-safe disable, restoration after a fresh server
+process, INIT ordering and contents, direct realtime and monotonic clocks,
+multiple extensions using one hash, persistent-name conflict, and update
+cache-hit, cache-miss, no-op, expected-ID and expected-revision races, revision,
+cleanup, and rollback cases. Multiplexed-family tests send unknown kinds in both directions.
+Command tests cover registration ownership, descriptor parsing, revisioned
+pagination, disappearance and re-registration across attempts, invocation
+framing, output ordering, backpressure, cancellation, and the no-retry rule.
 Process tests additionally cover binary output, independent stdout/stderr
 ordering, backpressure, stdin EOF, missing `cwd_kind = 2` context, merged-stderr
 window negotiation, spawn failure, signals where supported, and
