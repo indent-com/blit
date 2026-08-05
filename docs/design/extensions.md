@@ -84,8 +84,8 @@ PTYs.
   stdin, stdout, and stderr streams.
 - Keep the Wasm host ABI very small and versioned.
 - Give each running extension attempt its own named OS thread.
-- Bound extension-owned threads, guest memory, supervisor records, and packet
-  queues at server scope.
+- Bound extension-owned threads, guest memory, supervisor records, object
+  storage, and packet queues at server scope.
 - Make extension disconnect cleanup identical to client disconnect cleanup.
 - Preserve the existing protocol rule: new feature bits and opcodes; no
   reinterpretation of old messages.
@@ -626,7 +626,43 @@ Insertion is atomic:
 5. fsync when configured, rename into the object path, then acknowledge.
 
 An existing valid object makes upload idempotently successful. Corrupt cache
-entries are quarantined or ignored and are never executed.
+entries are never executed. They are either deleted or placed in a diagnostic
+quarantine which counts against the same disk budget and is evicted before any
+valid object.
+
+The raw-object CAS is automatically bounded by the disk budget defined below.
+At `EXT_PUT(BEGIN)`, the server reserves `total_size` against that budget,
+counting quarantine entries and active temporary uploads as well as committed
+objects. It first evicts quarantine entries, then committed unpinned objects in
+least-recently-used order. If the reservation still cannot fit because pinned
+objects and other reservations consume the budget, it returns
+`EXT_PUT_STATUS(BUDGET, received = 0)` and accepts no bytes. A failed or expired
+upload releases its reservation; final commit converts the reservation into
+the immutable object's charge.
+
+Every persistent definition pins its raw object whether it is enabled or
+disabled. An active transient supervisor pins its raw object from successful
+object resolution through terminal cleanup, including while `QUEUED`,
+`RUNNING`, or `BACKOFF`; a pending creation pins it as soon as its upload
+commits. For an update, the replacement object becomes durable first. CAS
+eviction is serialized with the definition commit; once the committed
+definition names the replacement, the new object is pinned and the old object
+becomes eligible only if nothing else references it. Pins are derived from
+committed definitions plus the live supervisor registry rather than duplicated
+transactionally across the definition database and filesystem CAS. `REMOVE`
+likewise makes an otherwise-unreferenced object eligible for eviction. A
+finished transient extension leaves only an unpinned cache entry. Definitions,
+supervisor records, and translated modules are not raw-CAS eviction candidates.
+
+A successful object probe or attempt use marks the object most recently used.
+The server persists LRU metadata, but correctness does not depend on persisting
+every recent touch: after a crash it rebuilds the complete pin set from durable
+definitions before deleting anything. Lost access-time updates can therefore
+choose a less useful unpinned victim and cause a later re-upload, but cannot
+break a persistent definition. Before serving requests at startup, GC deletes
+quarantine entries and evicts unpinned objects in LRU order until usage is
+within budget or only pinned objects remain. GC also runs when reserving space
+and may run in the background; it never evicts a pinned object.
 
 Wasmi's translated `Module` is cached in memory by:
 
@@ -634,14 +670,11 @@ Wasmi's translated `Module` is cached in memory by:
 (object_hash, blit_host_abi_version, wasmi_engine_configuration)
 ```
 
-Running attempts pin their raw and translated objects. An enabled persistent
-extension also pins its raw object, so a restart never depends on the original
-uploader returning. Unpinned translated modules are evicted in LRU order under
-the aggregate translated-module memory ceiling defined below; the ceiling
-includes pinned modules. Translation waits for capacity after eviction, and a
-single module whose translated form exceeds the ceiling is `BLOCKED`. Raw
-object eviction is likewise LRU but may never evict an object pinned by a
-definition or running attempt.
+Running attempts pin their translated modules. Unpinned translated modules are
+evicted in LRU order under the aggregate translated-module memory ceiling
+defined below; the ceiling includes pinned modules. Translation waits for
+capacity after eviction, and a single module whose translated form exceeds the
+ceiling is `BLOCKED`.
 
 ### Miss and race behavior
 
@@ -1417,21 +1450,22 @@ resource settings. The server applies installation-wide capacity and
 containment policy uniformly to every extension. These settings, like the
 feature gates below, are sampled once at server startup. Initial defaults are:
 
-| Resource                                          |   Default | Server setting                |
-| ------------------------------------------------- | --------: | ----------------------------- |
-| Concurrent running attempts and extension threads |        16 | `BLIT_EXT_MAX_RUNNING`        |
-| Persistent definitions, enabled or disabled       |       128 | `BLIT_EXT_MAX_PERSISTENT`     |
-| Active transient extension supervisors            |       128 | `BLIT_EXT_MAX_TRANSIENT`      |
-| Concurrent module validations and translations    |         2 | `BLIT_EXT_MAX_VALIDATING`     |
-| Aggregate translated modules, pinned and cached   |   128 MiB | `BLIT_EXT_MODULE_CACHE_MAX`   |
-| Aggregate Wasm linear memory per attempt          |    64 MiB | `BLIT_EXT_MEMORY_MAX`         |
-| Tables per attempt                                |         4 | `BLIT_EXT_TABLES_MAX`         |
-| Aggregate table elements per attempt              |    65,536 | `BLIT_EXT_TABLE_ELEMENTS_MAX` |
-| Wasm instances per attempt                        |         1 | fixed by the module model     |
-| Wasmi value-stack height per attempt              |   131,072 | `BLIT_EXT_VALUE_STACK_MAX`    |
-| Wasmi call depth per attempt                      |     1,024 | `BLIT_EXT_CALL_DEPTH_MAX`     |
-| Native stack per extension thread                 |     2 MiB | `BLIT_EXT_STACK_SIZE`         |
-| Fuel per driver slice                             | 1,000,000 | `BLIT_EXT_FUEL_SLICE`         |
+| Resource                                           |   Default | Server setting                |
+| -------------------------------------------------- | --------: | ----------------------------- |
+| Concurrent running attempts and extension threads  |        16 | `BLIT_EXT_MAX_RUNNING`        |
+| Persistent definitions, enabled or disabled        |       128 | `BLIT_EXT_MAX_PERSISTENT`     |
+| Active transient extension supervisors             |       128 | `BLIT_EXT_MAX_TRANSIENT`      |
+| Raw module objects on disk, including reservations |     2 GiB | `BLIT_EXT_OBJECT_CACHE_MAX`   |
+| Concurrent module validations and translations     |         2 | `BLIT_EXT_MAX_VALIDATING`     |
+| Aggregate translated modules, pinned and cached    |   128 MiB | `BLIT_EXT_MODULE_CACHE_MAX`   |
+| Aggregate Wasm linear memory per attempt           |    64 MiB | `BLIT_EXT_MEMORY_MAX`         |
+| Tables per attempt                                 |         4 | `BLIT_EXT_TABLES_MAX`         |
+| Aggregate table elements per attempt               |    65,536 | `BLIT_EXT_TABLE_ELEMENTS_MAX` |
+| Wasm instances per attempt                         |         1 | fixed by the module model     |
+| Wasmi value-stack height per attempt               |   131,072 | `BLIT_EXT_VALUE_STACK_MAX`    |
+| Wasmi call depth per attempt                       |     1,024 | `BLIT_EXT_CALL_DEPTH_MAX`     |
+| Native stack per extension thread                  |     2 MiB | `BLIT_EXT_STACK_SIZE`         |
+| Fuel per driver slice                              | 1,000,000 | `BLIT_EXT_FUEL_SLICE`         |
 
 A pending persistent creation reserves a definition slot before the server
 reports `NEED_OBJECT`; failed or expired creation releases it, and `REMOVE`
@@ -1446,6 +1480,11 @@ If startup finds more stored persistent definitions than the configured cap,
 it loads all of them so they remain visible and manageable, deletes nothing,
 and refuses new persistent creations with `BUDGET` until the stored count is
 below the cap.
+
+If startup GC finds that pinned raw objects alone exceed the configured disk
+budget, it retains every pinned object and refuses new upload reservations with
+`BUDGET` until usage falls below the budget. Lowering the budget never deletes
+an object referenced by a persistent definition.
 
 Running-attempt permits are server-global and fairly queued. A desired-running
 extension for which no permit is available remains in `QUEUED`, with no thread
@@ -1690,6 +1729,7 @@ extension thread at all.
    deployment gating, codecs, and protocol tests from a network client.
 5. **Module objects.** Implement BLAKE3 run probe, chunk upload, validation,
    persistent CAS, pending-run single-flight, bounded concurrent translation,
+   disk reservations, crash-safe pin reconstruction and LRU metadata,
    translated-memory accounting, and mandatory LRU eviction.
 6. **Supervisor.** Add stable extension/attempt identity, definition revisions,
    atomic update, complete exit classification, global admission and running
@@ -1712,9 +1752,11 @@ nonce release before later ID-keyed status changes, hash mismatch, invalid
 imports, runaway-loop cancellation, cleanup after a trap, restart policy,
 every exit reason's failure/backoff classification, admission-cap rejection,
 fair running-cap queuing, over-cap persistent-store startup, validation
-semaphore fairness, translated-module eviction and pinning, memory/table/stack
-ceilings, crash-safe disable, restoration under capacity after a fresh server
-process, INIT ordering and contents, direct realtime and monotonic clocks,
+semaphore fairness, raw-object budget admission, automatic LRU order, disabled
+definition pinning, post-crash pin reconstruction, translated-module eviction
+and pinning, memory/table/stack ceilings, crash-safe disable, restoration under
+capacity after a fresh server process, INIT ordering and contents, direct
+realtime and monotonic clocks,
 entropy fill/error bounds and a `getrandom`/`rand` guest smoke test,
 multiple extensions using one hash, persistent-name conflict, and update
 cache-hit, cache-miss, no-op, expected-ID and expected-revision races, revision,
@@ -1733,11 +1775,3 @@ Process tests additionally cover binary output, independent stdout/stderr
 ordering, backpressure, stdin EOF, missing `cwd_kind = 2` context, merged-stderr
 window negotiation, spawn failure, signals where supported, and
 process-tree cleanup on endpoint loss.
-
-## Open questions
-
-- Should persistent object eviction be automatic by default or operator-only
-  until access-time accounting is proven reliable across crashes?
-
-This question does not change the central boundary: extensions are logical
-clients, and their host ABI exchanges ordinary blit packets.
