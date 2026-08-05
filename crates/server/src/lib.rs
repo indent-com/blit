@@ -1082,6 +1082,30 @@ fn surface_send_interval(client: &ClientState) -> Duration {
     Duration::from_secs_f64(1.0 / surface_pacing_fps(client).max(1.0) as f64)
 }
 
+/// What an encode result leaves in the sub's `last_encoded_gen`.
+///
+/// That field is the "already shown to this client" mark the encode loop's
+/// `unchanged` gate reads, so only a generation that actually produced a
+/// bitstream may advance it.  `encode_pixels` returns `None` as ordinary
+/// control flow — rav1e asking for more data before it emits anything, a
+/// DMA-BUF that could not be mapped, a zero-size x264 output — and marking
+/// one of those as encoded makes the gate skip that generation forever.
+/// While the surface keeps painting, the next generation covers for it.
+/// When the surface goes still on exactly that frame — a video reaching its
+/// last frame, an app settling after its final repaint — nothing covers for
+/// it, and the client is left holding the frame before it.
+fn encoded_generation(
+    previous: Option<u64>,
+    generation: u64,
+    produced_output: bool,
+) -> Option<u64> {
+    if produced_output {
+        Some(generation)
+    } else {
+        previous
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Adaptive bandwidth
 //
@@ -4530,7 +4554,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                     // Record the generation we just encoded so we don't
                     // re-encode identical pixel data on subsequent ticks.
-                    state.last_encoded_gen = Some(result.generation);
+                    state.last_encoded_gen = encoded_generation(
+                        state.last_encoded_gen,
+                        result.generation,
+                        result.nal_data.is_some(),
+                    );
                 }
 
                 let Some((nal_data, is_keyframe)) = result.nal_data else {
@@ -12125,6 +12153,36 @@ mod tests {
             true,
         );
         assert_eq!(step.quantizer, None, "held until the queue drains");
+    }
+
+    #[test]
+    fn a_generation_that_encoded_to_nothing_is_not_marked_sent() {
+        // `unchanged` reads `last_encoded_gen` as "the client already has
+        // this".  An encode that produced no bitstream sent nothing, so
+        // claiming its generation strands that frame: the gate skips it on
+        // every later tick, and only new pixels ever dislodge it.
+        assert_eq!(encoded_generation(Some(4), 5, true), Some(5));
+        assert_eq!(
+            encoded_generation(Some(4), 5, false),
+            Some(4),
+            "an empty encode must leave the mark where it was",
+        );
+        // The first generation on a fresh sub is the one that matters most:
+        // there is no earlier frame on screen to fall back to.
+        assert_eq!(encoded_generation(None, 5, false), None);
+
+        // The failure this guards, played out.  A surface paints, its last
+        // encode comes back empty, and then it goes still — a video reaching
+        // its final frame.  The generation must stay re-encodable.
+        let unchanged = |mark: Option<u64>, latest: u64| mark == Some(latest);
+        let mut mark = Some(11u64);
+        mark = encoded_generation(mark, 12, false);
+        assert!(
+            !unchanged(mark, 12),
+            "the last frame must still be owed to the client",
+        );
+        mark = encoded_generation(mark, 12, true);
+        assert!(unchanged(mark, 12), "and settle once it is actually sent");
     }
 
     #[test]
