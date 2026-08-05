@@ -5,18 +5,14 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::mpsc;
 
-use crate::transport::{Transport, read_message, write_frame};
+use crate::relay::{self, Conn, DEFAULT_BIND, Event, OnOpen, Window, bracket};
+use crate::transport::Transport;
 use blit_remote::net::{
-    FEATURE_NET, NET_MAX_CHUNK, NET_MAX_DGRAM, NET_MAX_SOCKETS, NET_WINDOW_BYTES, NetOpen,
-    S2C_NET_ACK, S2C_NET_CLOSED, S2C_NET_DATA, S2C_NET_DGRAM, S2C_NET_OPENED, msg_net_ack_c2s,
-    msg_net_close, msg_net_data_c2s, msg_net_dgram_c2s, msg_net_open, net_closed_text,
-    net_status_text, parse_net_ack_s2c, parse_net_closed, parse_net_data_s2c, parse_net_dgram_s2c,
-    parse_net_opened,
+    NET_MAX_DGRAM, NET_STATUS_OK, NetOpen, msg_net_dgram_c2s, msg_net_open, net_closed_text,
+    net_status_text,
 };
-use blit_remote::{S2C_HELLO, S2C_QUIT, S2C_READY};
 
 // --------------------------------------------------------------------------- Specs ---------------------------------------------------------------------------
 
@@ -58,18 +54,6 @@ impl std::fmt::Display for Spec {
         )
     }
 }
-
-/// Bracket an IPv6 literal so the result re-parses as one field, not as several colon-separated ones.
-fn bracket(addr: &str) -> String {
-    if addr.contains(':') {
-        format!("[{addr}]")
-    } else {
-        addr.to_string()
-    }
-}
-
-/// Loopback, and deliberately not `0.0.0.0`.
-pub const DEFAULT_BIND: &str = "127.0.0.1";
 
 /// Parse `[kind/][bind_address:]local_port:host:host_port`.
 pub fn parse_spec(s: &str) -> Result<Spec, String> {
@@ -165,150 +149,6 @@ impl TlsOpts {
     }
 }
 
-// --------------------------------------------------------------------------- Shared connection state ---------------------------------------------------------------------------
-
-/// What the reader task delivers to one relayed socket.
-enum Event {
-    Opened {
-        status: u8,
-        alpn: String,
-        detail: String,
-    },
-    Data(Vec<u8>),
-    Ack(u64),
-    Closed {
-        reason: u8,
-        detail: String,
-    },
-}
-
-struct Socket {
-    events: mpsc::UnboundedSender<Event>,
-}
-
-/// Client-allocated stream ids plus the demultiplexing table (docs/design/net.md § Stream ids are client-allocated).
-struct Conn {
-    out: mpsc::UnboundedSender<Vec<u8>>,
-    sockets: Mutex<HashMap<u16, Socket>>,
-    next_id: Mutex<u16>,
-}
-
-impl Conn {
-    /// Reserve an id and register a receiver for it.
-    async fn open(&self, events: mpsc::UnboundedSender<Event>) -> Option<u16> {
-        let mut sockets = self.sockets.lock().await;
-        if sockets.len() >= NET_MAX_SOCKETS {
-            return None;
-        }
-        let mut next = self.next_id.lock().await;
-        // Ids must not be reused while live; scan for the first free one.
-        for _ in 0..=u16::MAX {
-            let id = *next;
-            *next = next.wrapping_add(1);
-            if let std::collections::hash_map::Entry::Vacant(slot) = sockets.entry(id) {
-                slot.insert(Socket { events });
-                return Some(id);
-            }
-        }
-        None
-    }
-
-    async fn close(&self, id: u16) {
-        self.sockets.lock().await.remove(&id);
-    }
-
-    fn send(&self, msg: Vec<u8>) {
-        let _ = self.out.send(msg);
-    }
-}
-
-/// Fan S2C messages out to the socket that owns each id.
-async fn reader_task(
-    mut reader: Box<dyn AsyncRead + Unpin + Send>,
-    mut pending: Vec<u8>,
-    conn: Arc<Conn>,
-) {
-    while let Some(msg) = read_message(&mut reader, &mut pending).await {
-        if msg.is_empty() {
-            continue;
-        }
-        let (id, event) = match msg[0] {
-            S2C_NET_OPENED => match parse_net_opened(&msg) {
-                Some((id, status, alpn, detail)) => (
-                    id,
-                    Event::Opened {
-                        status,
-                        alpn,
-                        detail,
-                    },
-                ),
-                None => continue,
-            },
-            S2C_NET_DATA => match parse_net_data_s2c(&msg) {
-                Some((id, data)) => (id, Event::Data(data.to_vec())),
-                None => continue,
-            },
-            S2C_NET_DGRAM => match parse_net_dgram_s2c(&msg) {
-                Some((id, data)) => (id, Event::Data(data.to_vec())),
-                None => continue,
-            },
-            S2C_NET_ACK => match parse_net_ack_s2c(&msg) {
-                Some((id, bytes)) => (id, Event::Ack(bytes)),
-                None => continue,
-            },
-            S2C_NET_CLOSED => match parse_net_closed(&msg) {
-                Some((id, reason, detail)) => (id, Event::Closed { reason, detail }),
-                None => continue,
-            },
-            S2C_QUIT => {
-                eprintln!("blit: server is shutting down");
-                break;
-            }
-            _ => continue,
-        };
-        let sockets = conn.sockets.lock().await;
-        if let Some(sock) = sockets.get(&id) {
-            let _ = sock.events.send(event);
-        }
-    }
-}
-
-/// Handshake and refuse early if the server has no relay — an old server drops the opcode silently and every forward would hang on connect.
-async fn require_net(
-    reader: &mut (impl AsyncRead + Unpin),
-    pending: &mut Vec<u8>,
-) -> Result<(), String> {
-    let mut features = 0u32;
-    loop {
-        let data = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            read_message(reader, pending),
-        )
-        .await
-        .map_err(|_| "timeout waiting for server".to_string())?
-        .ok_or_else(|| "server closed connection".to_string())?;
-        if data.is_empty() {
-            continue;
-        }
-        match data[0] {
-            S2C_HELLO if data.len() >= 7 => {
-                features = u32::from_le_bytes([data[3], data[4], data[5], data[6]]);
-            }
-            S2C_QUIT => return Err("server is shutting down".into()),
-            S2C_READY => {
-                if features & FEATURE_NET == 0 {
-                    return Err(
-                        "server does not support port forwarding (upgrade blit on the remote)"
-                            .into(),
-                    );
-                }
-                return Ok(());
-            }
-            _ => {}
-        }
-    }
-}
-
 // --------------------------------------------------------------------------- Entry point ---------------------------------------------------------------------------
 
 /// Bind every listener, then serve.
@@ -344,24 +184,7 @@ pub async fn cmd_forward(
         }
     }
 
-    let (mut reader, mut writer) = transport.split();
-    let mut pending = Vec::new();
-    require_net(&mut reader, &mut pending).await?;
-
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let conn = Arc::new(Conn {
-        out: out_tx,
-        sockets: Mutex::new(HashMap::new()),
-        next_id: Mutex::new(1),
-    });
-
-    tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if !write_frame(&mut writer, &msg).await {
-                break;
-            }
-        }
-    });
+    let (conn, reader) = relay::establish(transport).await?;
 
     for (spec, listener) in tcp {
         let local = listener
@@ -382,7 +205,7 @@ pub async fn cmd_forward(
     }
 
     // The reader owns the rest of the process's life: when the connection drops, every forward goes with it.
-    reader_task(reader, pending, conn).await;
+    reader.await;
     Ok(0)
 }
 
@@ -430,108 +253,25 @@ async fn relay_tcp(
     tls: TlsOpts,
     announced: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
-    let (events_tx, mut events) = mpsc::unbounded_channel::<Event>();
-    let Some(id) = conn.open(events_tx).await else {
-        return Err("too many forwarded sockets".into());
-    };
-    let _ = local.set_nodelay(true);
-
-    // Open and pipeline: the first bytes of the local client's request may ride in the same batch as the open, so nothing waits a round trip for an id the client already chose.
-    let mut open = NetOpen::tcp(id, &spec.host, spec.host_port);
+    let mut open = NetOpen::tcp(0, &spec.host, spec.host_port);
     if spec.kind == Kind::Tls {
         open.flags = tls.flags();
         open.alpn = tls.alpn.clone();
     }
-    conn.send(msg_net_open(&open));
-
-    let (mut local_read, mut local_write) = local.into_split();
-    // The server acks bytes it has written to the target; that is the client's credit signal for the direction it drives.
-    let (ack_tx, mut ack_rx) = watch::channel(0u64);
-
-    let up_conn = conn.clone();
-    let up = tokio::spawn(async move {
-        let mut buf = vec![0u8; NET_MAX_CHUNK];
-        let mut sent: u64 = 0;
-        loop {
-            while sent.saturating_sub(*ack_rx.borrow_and_update()) >= NET_WINDOW_BYTES {
-                if ack_rx.changed().await.is_err() {
-                    return;
-                }
-            }
-            match local_read.read(&mut buf).await {
-                Ok(0) | Err(_) => {
-                    // Local client is done writing: half-close, so a target that reads to EOF sees one.
-                    up_conn.send(msg_net_close(id, blit_remote::net::NET_CLOSE_WRITE));
-                    return;
-                }
-                Ok(n) => {
-                    sent += n as u64;
-                    up_conn.send(msg_net_data_c2s(id, &buf[..n]));
-                }
-            }
-        }
-    });
-
-    let mut opened = false;
-    let mut received: u64 = 0;
-    let result = loop {
-        let Some(event) = events.recv().await else {
-            break Ok(());
-        };
-        match event {
-            Event::Opened {
-                status,
-                alpn,
-                detail,
-            } => {
-                if status != blit_remote::net::NET_STATUS_OK {
-                    let detail = if detail.is_empty() {
-                        net_status_text(status).to_string()
-                    } else {
-                        format!("{}: {detail}", net_status_text(status))
-                    };
-                    break Err(format!("{}:{}: {detail}", spec.host, spec.host_port));
-                }
-                if spec.kind == Kind::Tls
-                    && !announced.swap(true, std::sync::atomic::Ordering::Relaxed)
-                {
-                    let how = if alpn.is_empty() {
-                        "no alpn".to_string()
-                    } else {
-                        format!("alpn={alpn}")
-                    };
-                    eprintln!(
-                        "blit: tls to {}:{} established ({how})",
-                        spec.host, spec.host_port
-                    );
-                }
-                opened = true;
-            }
-            Event::Data(data) => {
-                if local_write.write_all(&data).await.is_err() {
-                    break Ok(());
-                }
-                received += data.len() as u64;
-                conn.send(msg_net_ack_c2s(id, received));
-            }
-            Event::Ack(bytes) => {
-                let _ = ack_tx.send(bytes);
-            }
-            Event::Closed { reason, detail } => {
-                if !detail.is_empty() {
-                    eprintln!("blit: stream {id} {}: {detail}", net_closed_text(reason));
-                }
-                let _ = local_write.shutdown().await;
-                break Ok(());
-            }
-        }
-    };
-    up.abort();
-    if opened {
-        conn.send(msg_net_close(id, 0));
-    }
-    conn.close(id).await;
-    result
+    // A forward pipelines: the pump reads the local client from the start and lets
+    // the open's answer arrive in its own time, so a connect costs no round trip.
+    relay::relay(
+        local,
+        conn,
+        open,
+        // A handful of static forwards stay well inside the share the server hands
+        // out; `blit socks`, whose socket count is its client's business, does not.
+        Window::Full,
+        OnOpen::Report {
+            announce_alpn: (spec.kind == Kind::Tls).then_some(announced),
+        },
+    )
+    .await
 }
 
 // --------------------------------------------------------------------------- UDP ---------------------------------------------------------------------------
@@ -592,7 +332,7 @@ async fn start_udp_flow(
         while let Some(event) = events.recv().await {
             match event {
                 Event::Opened { status, detail, .. } => {
-                    if status != blit_remote::net::NET_STATUS_OK {
+                    if status != NET_STATUS_OK {
                         let detail = if detail.is_empty() {
                             net_status_text(status).to_string()
                         } else {

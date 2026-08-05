@@ -173,7 +173,7 @@ DEV_INSTANCE=1 ./bin/dev   # second stack on 10005-10007
 
 ## Project structure
 
-Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is split into six and `blit-webrtc-forwarder` uses a multi-file module tree.
+Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is split into several files and `blit-webrtc-forwarder` uses a multi-file module tree.
 
 | File                                     | Role                                                                                                                  |
 | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
@@ -194,6 +194,9 @@ Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is spli
 | `crates/cli/src/cli.rs`                  | Clap struct definitions                                                                                               |
 | `crates/cli/src/interactive.rs`          | Browser mode                                                                                                          |
 | `crates/cli/src/transport.rs`            | Transport abstraction (Unix/TCP/SSH/WebRTC)                                                                           |
+| `crates/cli/src/relay.rs`                | Client half of the `NET_*` relay: stream ids, demultiplexing, the byte pump shared by `forward` and `socks`           |
+| `crates/cli/src/forward.rs`              | `blit forward`: spec grammar, TCP/UDP/TLS listeners, `blit.forwards`                                                  |
+| `crates/cli/src/socks.rs`                | `blit socks`: SOCKS5 CONNECT proxy over the relay                                                                     |
 | `crates/cli/src/learn.md`                | CLI reference text printed by `blit learn`                                                                            |
 | `crates/browser/src/lib.rs`              | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas                                                    |
 | `crates/alacritty-driver/src/lib.rs`     | Terminal parsing wrapper around `alacritty_terminal`                                                                  |

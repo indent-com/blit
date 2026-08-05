@@ -219,9 +219,32 @@ pub enum Command {
         insecure: bool,
     },
 
+    /// Proxy TCP connections into the server's network over SOCKS5
+    ///
+    /// `ssh -D`: a local SOCKS5 listener whose target comes from each request,
+    /// so one port reaches everything the server reaches and no target has to be
+    /// known in advance. The listen address is `[bind_address:]port`, bind
+    /// defaults to 127.0.0.1, and a port of 0 picks a free one.
+    ///
+    /// Names are resolved on the server, so the proxy reaches hosts this machine
+    /// cannot look up. CONNECT only — BIND and UDP ASSOCIATE are not supported —
+    /// and no authentication method beyond no-auth.
+    ///
+    /// The proxy ends with the process, like a forward.
+    ///
+    /// Examples:
+    ///   blit socks 1080
+    ///   blit socks 127.0.0.1:1080
+    ///   blit --on prod socks 1080          # through a named remote
+    ///   curl -x socks5h://localhost:1080 http://api.internal/
+    Socks {
+        /// Where to listen: [bind_address:]port
+        #[arg(value_name = "[BIND:]PORT")]
+        listen: String,
+    },
+
     /// Print the full CLI reference (usage guide for scripts and LLM agents)
     Learn,
-
     /// Run the blit terminal multiplexer server
     Server {
         /// IPC socket/pipe path (or set BLIT_SOCK)
