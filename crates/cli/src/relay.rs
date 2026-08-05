@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use crate::transport::{read_message, write_frame};
 use blit_remote::net::{
@@ -57,7 +57,12 @@ pub enum Event {
 
 struct Socket {
     events: mpsc::UnboundedSender<Event>,
+    finished: oneshot::Receiver<()>,
 }
+
+/// Held by the task that owns a stream for as long as that task runs, so a
+/// teardown can wait for the cleanup each stream owes its local socket.
+pub struct Live(#[allow(dead_code)] oneshot::Sender<()>);
 
 /// Client-allocated stream ids plus the demultiplexing table (docs/design/net.md § Stream ids are client-allocated).
 pub struct Conn {
@@ -71,7 +76,7 @@ impl Conn {
     ///
     /// Public because a UDP flow drives itself: it has no window, no half-close,
     /// and one id per local source, so [`relay`] does not fit it.
-    pub async fn open(&self, events: mpsc::UnboundedSender<Event>) -> Option<u16> {
+    pub async fn open(&self, events: mpsc::UnboundedSender<Event>) -> Option<(u16, Live)> {
         let mut sockets = self.sockets.lock().await;
         if sockets.len() >= NET_MAX_SOCKETS {
             return None;
@@ -82,8 +87,9 @@ impl Conn {
             let id = *next;
             *next = next.wrapping_add(1);
             if let std::collections::hash_map::Entry::Vacant(slot) = sockets.entry(id) {
-                slot.insert(Socket { events });
-                return Some(id);
+                let (live, finished) = oneshot::channel();
+                slot.insert(Socket { events, finished });
+                return Some((id, Live(live)));
             }
         }
         None
@@ -95,6 +101,24 @@ impl Conn {
 
     pub fn send(&self, msg: Vec<u8>) {
         let _ = self.out.send(msg);
+    }
+
+    /// End every live stream, and wait for the tasks driving them.
+    ///
+    /// The connection dying is a truncation of every stream on it, but nothing
+    /// on the wire says so: the reader just stops. Dropping the event senders is
+    /// how that reaches each stream's own loop, and waiting for the `Live`
+    /// handles is what keeps the caller from exiting the process before those
+    /// loops have reset their local sockets — an exit closes them with a FIN,
+    /// which is the truncation-as-success the reset exists to prevent.
+    async fn tear_down(&self) {
+        let sockets = std::mem::take(&mut *self.sockets.lock().await);
+        // Every sender has to go before the first wait, or one slow stream holds
+        // back the notification the others are still waiting for.
+        let finished: Vec<_> = sockets.into_values().map(|sock| sock.finished).collect();
+        for wait in finished {
+            let _ = wait.await;
+        }
     }
 }
 
@@ -178,6 +202,7 @@ async fn reader_task(
             let _ = sock.events.send(event);
         }
     }
+    conn.tear_down().await;
 }
 
 /// Handshake and refuse early if the server has no relay — an old server drops the opcode silently and every forward would hang on connect.
@@ -269,7 +294,7 @@ pub async fn relay(
     on_open: OnOpen,
 ) -> Result<(), String> {
     let (events_tx, mut events) = mpsc::unbounded_channel::<Event>();
-    let Some(id) = conn.open(events_tx).await else {
+    let Some((id, _live)) = conn.open(events_tx).await else {
         // The cap is the connection's, not the socket's, so this is worth naming
         // rather than reporting as a connect failure against the target.
         if let OnOpen::Answer(reply) = &on_open {
@@ -434,8 +459,37 @@ mod tests {
     struct Pump {
         client: Option<tokio::net::TcpStream>,
         out: mpsc::UnboundedReceiver<Vec<u8>>,
-        events: mpsc::UnboundedSender<Event>,
+        events: Option<mpsc::UnboundedSender<Event>>,
+        /// The transport's other end and the real `reader_task` on this one, as
+        /// an unspawned future — `cmd_forward` awaits it inline, and spawning it
+        /// here would add a scheduler yield production does not have.
+        #[allow(clippy::type_complexity)]
+        transport: Option<(
+            tokio::io::DuplexStream,
+            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        )>,
         _conn: Arc<Conn>,
+    }
+
+    /// Read a local socket to its end, whatever that end turns out to be.
+    async fn local_end(mut client: tokio::net::TcpStream) -> (Vec<u8>, io::Result<()>) {
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), client.read(&mut buf))
+                .await
+            {
+                Ok(Ok(0)) => return (seen, Ok(())),
+                Ok(Ok(n)) => seen.extend_from_slice(&buf[..n]),
+                Ok(Err(e)) => return (seen, Err(e)),
+                Err(_) => {
+                    return (
+                        seen,
+                        Err(io::Error::new(io::ErrorKind::TimedOut, "still open")),
+                    );
+                }
+            }
+        }
     }
 
     impl Pump {
@@ -446,6 +500,8 @@ mod tests {
                 sockets: Mutex::new(HashMap::new()),
                 next_id: Mutex::new(1),
             });
+            let (server_side, our_side) = tokio::io::duplex(1024);
+            let reader = Box::pin(reader_task(Box::new(our_side), Vec::new(), conn.clone()));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let client = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -471,7 +527,8 @@ mod tests {
             Pump {
                 client: Some(client),
                 out,
-                events,
+                events: Some(events),
+                transport: Some((server_side, reader)),
                 _conn: conn,
             }
         }
@@ -487,41 +544,34 @@ mod tests {
             });
         }
 
+        /// One S2C event, as the reader would have fanned it out.
+        fn send(&self, event: Event) {
+            self.events.as_ref().unwrap().send(event).unwrap();
+        }
+
         fn accepted(&self, window: Option<u64>) {
-            self.events
-                .send(Event::Opened {
-                    status: NET_STATUS_OK,
-                    alpn: String::new(),
-                    detail: String::new(),
-                    window,
-                })
-                .unwrap();
+            self.send(Event::Opened {
+                status: NET_STATUS_OK,
+                alpn: String::new(),
+                detail: String::new(),
+                window,
+            });
         }
 
         /// What the local client sees on its own socket: the relayed bytes, and
         /// then either a clean end or the error a reset produces.
         async fn local_end(&mut self) -> (Vec<u8>, io::Result<()>) {
-            let mut client = self.client.take().unwrap();
-            let mut seen = Vec::new();
-            let mut buf = [0u8; 1024];
-            loop {
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    client.read(&mut buf),
-                )
-                .await
-                {
-                    Ok(Ok(0)) => return (seen, Ok(())),
-                    Ok(Ok(n)) => seen.extend_from_slice(&buf[..n]),
-                    Ok(Err(e)) => return (seen, Err(e)),
-                    Err(_) => {
-                        return (
-                            seen,
-                            Err(io::Error::new(io::ErrorKind::TimedOut, "still open")),
-                        );
-                    }
-                }
-            }
+            local_end(self.client.take().unwrap()).await
+        }
+
+        /// The transport dying, driven through the real reader: drop the far
+        /// end and await the task, exactly as `cmd_forward` does. The fixture's
+        /// own event sender goes first, so the connection holds the only one.
+        async fn connection_lost(&mut self) {
+            self.events = None;
+            let (far_end, reader) = self.transport.take().unwrap();
+            drop(far_end);
+            reader.await;
         }
 
         /// Bytes the pump sends until it goes quiet, which is the only way to ask
@@ -571,7 +621,7 @@ mod tests {
         fills(sent, granted);
 
         // And credit means more, not a fresh window: the counter is cumulative.
-        pump.events.send(Event::Ack(granted / 2)).unwrap();
+        pump.send(Event::Ack(granted / 2));
         sent += pump.drain().await;
         fills(sent, granted + granted / 2);
     }
@@ -611,7 +661,9 @@ mod tests {
     /// A stream cut short must not look finished. Every reason but the target's
     /// own EOF means the local client did not get everything, and a FIN is
     /// indistinguishable from a complete transfer for anything that reads to the
-    /// close.
+    /// close. `SHUTDOWN` is in the list because it is in the wire spec, not
+    /// because this repo's server sends it — a real shutdown is `S2C_QUIT`,
+    /// which `a_connection_that_goes_away_resets_every_local_socket` covers.
     #[tokio::test]
     async fn an_abnormal_close_resets_the_local_socket() {
         for reason in [
@@ -622,15 +674,11 @@ mod tests {
         ] {
             let mut pump = Pump::start(Unreported::Ceiling).await;
             pump.accepted(Some(NET_WINDOW_BYTES));
-            pump.events
-                .send(Event::Data(b"half a response".to_vec()))
-                .unwrap();
-            pump.events
-                .send(Event::Closed {
-                    reason,
-                    detail: String::new(),
-                })
-                .unwrap();
+            pump.send(Event::Data(b"half a response".to_vec()));
+            pump.send(Event::Closed {
+                reason,
+                detail: String::new(),
+            });
             let (_, end) = pump.local_end().await;
             let err = end.expect_err("a cut stream ended the local socket cleanly");
             assert_eq!(
@@ -641,21 +689,43 @@ mod tests {
         }
     }
 
+    /// The connection going away truncates every stream on it, and says so on
+    /// none of them: the reader just stops. It has to reach the local sockets
+    /// all the same, and before the caller exits the process — which is why
+    /// `tear_down` waits rather than only dropping the senders.
+    #[tokio::test]
+    async fn a_connection_that_goes_away_resets_every_local_socket() {
+        let mut pump = Pump::start(Unreported::Ceiling).await;
+        pump.accepted(Some(NET_WINDOW_BYTES));
+        pump.send(Event::Data(b"half a response".to_vec()));
+        pump.drain().await;
+
+        pump.connection_lost().await;
+        // Asserted without awaiting anything else: the parting close is only
+        // here if `tear_down` waited for the task, which is the difference
+        // between resetting the socket and racing the process's exit.
+        let parting = pump
+            .out
+            .try_recv()
+            .expect("tear_down returned before the stream's task had finished");
+        assert_eq!(parting[0], blit_remote::net::C2S_NET_CLOSE);
+
+        let (_, end) = pump.local_end().await;
+        let err = end.expect_err("a lost connection ended the local socket cleanly");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "{err}");
+    }
+
     /// And the clean case stays clean: a target that closed on its own is an
     /// ordinary end of stream, and every byte of it must arrive.
     #[tokio::test]
     async fn a_target_eof_ends_the_local_socket_cleanly() {
         let mut pump = Pump::start(Unreported::Ceiling).await;
         pump.accepted(Some(NET_WINDOW_BYTES));
-        pump.events
-            .send(Event::Data(b"a whole response".to_vec()))
-            .unwrap();
-        pump.events
-            .send(Event::Closed {
-                reason: NET_CLOSED_EOF,
-                detail: String::new(),
-            })
-            .unwrap();
+        pump.send(Event::Data(b"a whole response".to_vec()));
+        pump.send(Event::Closed {
+            reason: NET_CLOSED_EOF,
+            detail: String::new(),
+        });
         let (seen, end) = pump.local_end().await;
         end.expect("a target EOF must not reset the local socket");
         assert_eq!(seen, b"a whole response");
