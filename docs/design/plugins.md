@@ -112,15 +112,14 @@ be processes attached to PTYs.
 
 ## Architecture
 
-```text
-network client --frames--> [transport decoder] --packet--+
-                                                          +--> [logical client endpoint]
-Wasmi plugin --host send/recv-----------------------------+     identity / authority / outbox
-                                                                       |
-                                                                       v
-                                                       [shared packet dispatcher]
-                                                           /                 \
-                                           terminal/fs/git/lsp/...   channel/state/topic/process
+```mermaid
+flowchart LR
+    Network["Network client"] -->|frames| Decoder["Transport decoder"]
+    Decoder -->|packet| Endpoint["Logical client endpoint<br/>identity · authority · outbox"]
+    Plugin["Wasmi plugin"] -->|host send / recv| Endpoint
+    Endpoint --> Dispatcher["Shared packet dispatcher"]
+    Dispatcher --> Existing["Terminal / FS / Git / LSP / …"]
+    Dispatcher --> Fabric["Channel / state / topic / process fabric"]
 ```
 
 The current connection loop combines transport reading, client lifecycle,
