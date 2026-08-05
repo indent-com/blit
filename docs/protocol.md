@@ -179,7 +179,7 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 | 10  | `NET`           | Server supports the `NET_*` network-relay family               |
 | 11  | `EXTENSION`     | Proposed: Wasmi extension lifecycle, events, and commands      |
 | 12  | `CHANNEL`       | Proposed: server supports bidirectional named channels         |
-| 13  | `RESERVED`      | Unallocated; servers leave this bit clear                       |
+| 13  | `RESERVED`      | Unallocated; servers leave this bit clear                      |
 | 14  | `CREATE_STATUS` | Proposed: `CREATE2(WANT_STATUS)` receives explicit failure     |
 
 The proposed bits 11 and 12 are independently omitted when `BLIT_EXT=0` or
@@ -196,21 +196,21 @@ unless their wire definition explicitly declares a message-local table.
 Existing message-local tables such as `FS_SYNCED` and `NET_OPENED` are
 grandfathered and do not share all of these numeric meanings.
 
-| Value | Name            | Meaning                                                       |
-| ----: | --------------- | ------------------------------------------------------------- |
-| 0     | `OK`            | Request completed successfully                                |
-| 1     | `UNKNOWN_ID`    | Requested identifier or handle is absent or already closed    |
-| 2     | `NOT_FOUND`     | Path, object, symbol, or backend does not exist                |
-| 3     | `WRONG_TYPE`    | Existing object cannot satisfy this operation                  |
-| 4     | `PERMISSION`    | Operation is disabled or denied                               |
-| 5     | `TOO_LARGE`     | Input or result exceeds a size ceiling                         |
-| 6     | `BUDGET`        | A resource budget is exhausted without pagination/truncation   |
-| 7     | `INVALID`       | Request encoding, flags, or field combination is invalid       |
-| 8     | `CANCELLED`     | Operation ended through its cancellation mechanism             |
-| 9     | `OTHER`         | Unclassified backend failure; detail should diagnose it        |
-| 10    | `WARMING`       | LSP backend is not ready; retry later                          |
-| 11    | `CONFLICT`      | A revision, lock, or compare-and-swap precondition failed      |
-| 12    | `NO_MERGE_BASE` | Valid Git histories have no common ancestor                    |
+| Value | Name            | Meaning                                                      |
+| ----: | --------------- | ------------------------------------------------------------ |
+|     0 | `OK`            | Request completed successfully                               |
+|     1 | `UNKNOWN_ID`    | Requested identifier or handle is absent or already closed   |
+|     2 | `NOT_FOUND`     | Path, object, symbol, or backend does not exist              |
+|     3 | `WRONG_TYPE`    | Existing object cannot satisfy this operation                |
+|     4 | `PERMISSION`    | Operation is disabled or denied                              |
+|     5 | `TOO_LARGE`     | Input or result exceeds a size ceiling                       |
+|     6 | `BUDGET`        | A resource budget is exhausted without pagination/truncation |
+|     7 | `INVALID`       | Request encoding, flags, or field combination is invalid     |
+|     8 | `CANCELLED`     | Operation ended through its cancellation mechanism           |
+|     9 | `OTHER`         | Unclassified backend failure; detail should diagnose it      |
+|    10 | `WARMING`       | LSP backend is not ready; retry later                        |
+|    11 | `CONFLICT`      | A revision, lock, or compare-and-swap precondition failed    |
+|    12 | `NO_MERGE_BASE` | Valid Git histories have no common ancestor                  |
 
 Values 0–127 are centrally allocated common statuses; 13–127 are currently
 reserved. New family-local allocations use 128–255 and must be defined by the
