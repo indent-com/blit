@@ -4,16 +4,17 @@ use blit_remote::{AXIS_SOURCE_WHEEL, PointerAxisEvent};
 use blit_remote::{
     C2S_CLIENT_FEATURES, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_LIST,
     C2S_SURFACE_POINTER, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CODEC_SUPPORT_AV1,
-    CODEC_SUPPORT_H264, CREATE2_WANT_STATUS, EXIT_STATUS_UNKNOWN, FEATURE_CREATE_STATUS,
-    S2C_CLIPBOARD_CONTENT, S2C_CLIPBOARD_LIST, S2C_EXITED, S2C_HELLO, S2C_LIST, S2C_PING, S2C_QUIT,
-    S2C_READY, S2C_SURFACE_CAPTURE, S2C_SURFACE_FRAME,
+    CODEC_SUPPORT_H264, CREATE2_WANT_STATUS, EXIT_REASON_NORMAL, EXIT_STATUS_UNKNOWN,
+    FEATURE_CREATE_STATUS, FEATURE_PTY_DEADLINE, S2C_CLIPBOARD_CONTENT, S2C_CLIPBOARD_LIST,
+    S2C_EXITED, S2C_HELLO, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SURFACE_CAPTURE,
+    S2C_SURFACE_FRAME,
     S2C_SURFACE_LIST, S2C_TERM_CWD, S2C_TEXT, S2C_TITLE, S2C_UPDATE, SURFACE_FRAME_CODEC_AV1,
     SURFACE_FRAME_CODEC_MASK, SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState, msg_ack,
-    msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_close, msg_create2,
+    msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_close, msg_create2_full, msg_deadline,
     msg_input, msg_kill, msg_mouse, msg_quit, msg_read, msg_resize, msg_restart, msg_subscribe,
     msg_surface_close, msg_surface_focus, msg_surface_input, msg_surface_pointer_axis2,
     msg_surface_resize, msg_surface_subscribe, msg_surface_subscribe_ext, msg_surface_text,
-    msg_term_cwd, parse_server_msg, parse_term_cwd_reply, status_text,
+    exit_reason_text, msg_term_cwd, parse_server_msg, parse_term_cwd_reply, status_text,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -94,6 +95,7 @@ impl AgentConn {
                     if let Some(ServerMsg::Exited {
                         pty_id,
                         exit_status,
+                        ..
                     }) = parse_server_msg(&data)
                     {
                         exited.insert(pty_id, exit_status);
@@ -220,15 +222,39 @@ pub async fn cmd_list(transport: Transport) -> Result<(), String> {
     Ok(())
 }
 
+/// Seconds to the wire's milliseconds, saturating rather than wrapping: an
+/// absurdly large `--deadline` should mean "effectively never", not a few
+/// seconds from now.
+fn deadline_ms(seconds: u64) -> u32 {
+    seconds.saturating_mul(1000).min(u32::MAX as u64) as u32
+}
+
+pub async fn cmd_deadline(transport: Transport, id: u16, seconds: u64) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+    if conn.features & FEATURE_PTY_DEADLINE == 0 {
+        return Err("server does not support deadlines".to_string());
+    }
+    if !conn.has_pty(id) {
+        return Err(format!("pty {id} not found"));
+    }
+    conn.send(&msg_deadline(id, deadline_ms(seconds))).await?;
+    conn.finish().await;
+    Ok(())
+}
+
 pub async fn cmd_start(
     transport: Transport,
     tag: Option<String>,
     command: Vec<String>,
     rows: u16,
     cols: u16,
+    deadline: Option<u64>,
 ) -> Result<u16, String> {
     let mut conn = AgentConn::connect(transport).await?;
 
+    if deadline.is_some() && conn.features & FEATURE_PTY_DEADLINE == 0 {
+        return Err("server does not support deadlines".to_string());
+    }
     let nonce: u16 = 1;
     let tag_str = tag.as_deref().unwrap_or("");
     let cmd_str = command.join("\0");
@@ -240,7 +266,16 @@ pub async fn cmd_start(
     } else {
         0
     };
-    let msg = msg_create2(nonce, rows, cols, tag_str, &cmd_str, features);
+    let msg = msg_create2_full(
+        nonce,
+        rows,
+        cols,
+        tag_str,
+        &cmd_str,
+        features,
+        None,
+        deadline.map(deadline_ms),
+    );
     conn.send(&msg).await?;
 
     loop {
@@ -583,6 +618,18 @@ fn format_exit_status(status: i32) -> String {
     }
 }
 
+/// Same, but name a server-attributed cause.  A deadline kill lands as
+/// `signal(9)`, which reads exactly like someone running `kill -9` by hand;
+/// the reason byte is the only thing that tells them apart.
+fn format_exit(status: i32, reason: u8) -> String {
+    let base = format_exit_status(status);
+    if reason == EXIT_REASON_NORMAL {
+        base
+    } else {
+        format!("{base} — {}", exit_reason_text(reason))
+    }
+}
+
 pub(crate) fn exit_code_from_status(status: i32) -> i32 {
     if status == EXIT_STATUS_UNKNOWN {
         1
@@ -650,11 +697,12 @@ pub async fn cmd_wait(
                     if let Some(ServerMsg::Exited {
                         pty_id,
                         exit_status,
+                        reason,
                     }) = parse_server_msg(&data)
                         && pty_id == id
                     {
                         let code = exit_code_from_status(exit_status);
-                        println!("{}", format_exit_status(exit_status));
+                        println!("{}", format_exit(exit_status, reason));
                         return Ok(code);
                     }
                 }
@@ -683,11 +731,12 @@ pub async fn cmd_wait(
             if let Some(ServerMsg::Exited {
                 pty_id,
                 exit_status,
+                reason,
             }) = parse_server_msg(&data)
                 && pty_id == id
             {
                 let code = exit_code_from_status(exit_status);
-                println!("{}", format_exit_status(exit_status));
+                println!("{}", format_exit(exit_status, reason));
                 return Ok(code);
             }
         }
@@ -1593,6 +1642,7 @@ mod tests {
     use super::*;
     use blit_remote::{
         CellStyle, FEATURE_CREATE_NONCE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState,
+        msg_create2,
         S2C_CLOSED, S2C_CREATED_N, build_update_msg, msg_hello,
     };
 

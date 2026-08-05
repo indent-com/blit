@@ -9,8 +9,8 @@ use blit_remote::{
     C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2, C2S_SURFACE_RESIZE,
     C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD,
     C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_CWD,
-    CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS, FEATURE_COMPOSITOR, FEATURE_COPY_RANGE,
-    FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState,
+    CREATE2_HAS_SRC_PTY, C2S_DEADLINE, CREATE2_HAS_DEADLINE, CREATE2_WANT_STATUS, FEATURE_COMPOSITOR, FEATURE_COPY_RANGE,
+    FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState,
     KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT,
     S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE,
     STATUS_BUDGET, STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264,
@@ -389,6 +389,15 @@ struct Pty {
     title_pending: bool,
     /// Last used visible rows value broadcast for this PTY.
     last_used_rows_sent: u16,
+    /// When the server should stop this terminal, if a client armed a
+    /// deadline.  Absent means unbounded, which stays the default — a
+    /// multiplexer whose sessions expire on their own would be useless.
+    deadline: Option<Instant>,
+    /// Set once the deadline has fired and SIGTERM has gone out; when it
+    /// passes, the group gets SIGKILL.
+    stop_deadline: Option<Instant>,
+    /// Attributed cause, moved onto `S2C_EXITED` by `cleanup_pty_internal`.
+    exit_reason: u8,
     /// The subprocess has exited but the terminal state is retained for reading.
     exited: bool,
     /// Exit status: WEXITSTATUS if normal exit, negative signal number if signalled,
@@ -3202,6 +3211,19 @@ fn oversize_list_field(tag: &str, command: Option<&str>) -> Option<&'static str>
 /// Diagnostic for a `STATUS_BUDGET` creation refusal.  `allocate_pty_id`
 /// returns `None` for two different exhaustions and the operator fix differs,
 /// so name which one was hit.
+/// The timer state a `C2S_DEADLINE` puts a terminal into: `(deadline,
+/// stop_deadline, exit_reason)`.
+///
+/// Split out from the handler so the stand-down rule is pinned by a test
+/// rather than by three assignments that are easy to get half-right: the
+/// pending SIGKILL has to be cancelled whether the message re-arms or clears,
+/// or a refresh that lands inside the grace kills the terminal it was sent to
+/// save.
+fn armed_deadline(now: Instant, ms: u32) -> (Option<Instant>, Option<Instant>, u8) {
+    let deadline = (ms > 0).then(|| now + Duration::from_millis(ms as u64));
+    (deadline, None, blit_remote::EXIT_REASON_NORMAL)
+}
+
 fn pty_budget_detail(live: usize, max_ptys: usize) -> String {
     if max_ptys > 0 && live >= max_ptys {
         format!("terminal cap reached ({max_ptys}); raise --max-ptys or close a terminal")
@@ -3227,11 +3249,61 @@ const SUPERVISOR_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 /// a runaway command needs supervising, so lifecycle work gets its own loop.
 async fn supervisor_loop(state: AppState) {
     loop {
+        // Wake at whichever comes first: something asked us to recompute, an
+        // armed deadline is due, or the backstop sweep comes round.
+        let next = {
+            let sess = state.session.lock().await;
+            earliest_armed_deadline(&sess)
+        };
+        let sweep = Instant::now() + SUPERVISOR_SWEEP_INTERVAL;
+        let wake = next.map_or(sweep, |d| d.min(sweep));
         tokio::select! {
             _ = state.supervisor_notify.notified() => {}
-            _ = tokio::time::sleep(SUPERVISOR_SWEEP_INTERVAL) => {}
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {}
         }
         supervise(&state).await;
+    }
+}
+
+/// The soonest instant the supervisor has work to do, or `None` when nothing
+/// is armed.
+fn earliest_armed_deadline(sess: &Session) -> Option<Instant> {
+    sess.ptys
+        .values()
+        .filter(|pty| !pty.exited)
+        .filter_map(|pty| pty.deadline.into_iter().chain(pty.stop_deadline).min())
+        .min()
+}
+
+/// Signal numbers for the stop sequence.  Spelled out rather than taken from
+/// `libc` because this code is shared with Windows, where `kill_pty` treats
+/// the number as an opaque "not SIGINT" and terminates the job.
+const SIGKILL: i32 = 9;
+const SIGTERM: i32 = 15;
+
+/// Act on terminals whose deadline has come due.
+///
+/// Expiry is a two-step stop: SIGTERM to the group, then SIGKILL once the
+/// grace elapses, so a command that handles SIGTERM gets to unwind. The
+/// attribution is recorded now and travels to `S2C_EXITED` later, because the
+/// terminal does not finish exiting until the child actually dies.
+async fn enforce_deadlines(state: &AppState) {
+    let now = Instant::now();
+    let mut sess = state.session.lock().await;
+    for pty in sess.ptys.values_mut() {
+        if pty.exited {
+            continue;
+        }
+        if pty.stop_deadline.is_some_and(|d| now >= d) {
+            pty.stop_deadline = None;
+            pty::kill_pty(&pty.handle, SIGKILL, true);
+        } else if pty.deadline.is_some_and(|d| now >= d) {
+            pty.deadline = None;
+            pty.exit_reason = blit_remote::EXIT_REASON_DEADLINE;
+            pty.stop_deadline =
+                Some(now + Duration::from_millis(blit_remote::DEADLINE_STOP_GRACE_MS as u64));
+            pty::kill_pty(&pty.handle, SIGTERM, true);
+        }
     }
 }
 
@@ -3243,6 +3315,7 @@ async fn supervisor_loop(state: AppState) {
 /// holding the slave open kept a dead terminal marked `running` forever, and
 /// `blit terminal wait` blocked until its own client-side timeout.
 async fn supervise(state: &AppState) {
+    enforce_deadlines(state).await;
     let exited: Vec<u16> = {
         let sess = state.session.lock().await;
         sess.ptys
@@ -3267,10 +3340,12 @@ async fn cleanup_pty_internal(pty_id: u16, state: &AppState) {
             return;
         }
         pty.exited = true;
+        pty.deadline = None;
+        pty.stop_deadline = None;
         pty::close_pty(&pty.handle);
         pty.exit_status = pty::collect_exit_status(&pty.handle);
         pty.mark_dirty();
-        let msg = blit_remote::msg_exited(pty_id, pty.exit_status);
+        let msg = blit_remote::msg_exited_reason(pty_id, pty.exit_status, pty.exit_reason);
         sess.send_to_all(&msg);
     }
 }
@@ -8657,6 +8732,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | FEATURE_COMPOSITOR
                 | FEATURE_CREATE_STATUS
                 | FEATURE_KILL_MODE
+                | FEATURE_PTY_DEADLINE
                 | blit_remote::fs::FEATURE_FS
                 | blit_remote::git::FEATURE_GIT;
             // BLIT_LSP=0 disables the family: the bit is simply not
@@ -9637,6 +9713,31 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     None
                 };
                 let dir = explicit_dir.or(src_dir);
+                // Before the command, which has no length prefix and runs to
+                // the end of the message.
+                let deadline_ms = if features & CREATE2_HAS_DEADLINE != 0 {
+                    if data.len() < cursor + 4 {
+                        refuse_create(
+                            &sess,
+                            client_id,
+                            want_status,
+                            nonce,
+                            STATUS_INVALID,
+                            "truncated deadline",
+                        );
+                        continue;
+                    }
+                    let ms = u32::from_le_bytes([
+                        data[cursor],
+                        data[cursor + 1],
+                        data[cursor + 2],
+                        data[cursor + 3],
+                    ]);
+                    cursor += 4;
+                    (ms > 0).then_some(ms)
+                } else {
+                    None
+                };
                 let create_payload = if features & CREATE2_HAS_COMMAND != 0 {
                     data.get(cursor..).and_then(|b| std::str::from_utf8(b).ok())
                 } else {
@@ -9706,6 +9807,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     pulse_server.as_deref(),
                     pipewire_remote.as_deref(),
                 ) {
+                    let mut pty = pty;
+                    // Armed before the terminal is reachable by anyone, so a
+                    // client that dies immediately after creating it cannot
+                    // leave an unbounded command behind.
+                    pty.deadline =
+                        deadline_ms.map(|ms| Instant::now() + Duration::from_millis(ms as u64));
+                    let armed = pty.deadline.is_some();
                     let tag_bytes = pty.tag.as_bytes();
                     let mut nonce_msg = Vec::with_capacity(5 + tag_bytes.len());
                     nonce_msg.push(S2C_CREATED_N);
@@ -9728,6 +9836,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         if cid != client_id {
                             let _ = send_outbox(c, broadcast_msg.clone());
                         }
+                    }
+                    if armed {
+                        state.supervisor_notify.notify_one();
                     }
                     need_nudge = true;
                 } else {
@@ -10398,6 +10509,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         pty.driver.reset_modes();
                         pty.exited = false;
                         pty.exit_status = blit_remote::EXIT_STATUS_UNKNOWN;
+                        // A restart is a new command, not a continuation of
+                        // the one the deadline was armed for.  Carrying the
+                        // old attribution over would blame this exit on a
+                        // deadline that already fired.
+                        pty.deadline = None;
+                        pty.stop_deadline = None;
+                        pty.exit_reason = blit_remote::EXIT_REASON_NORMAL;
                         // The fresh shell hasn't reported OSC 7 yet; keeping
                         // the dead shell's cwd would shadow the kernel
                         // fallback in C2S_TERM_CWD with stale data.
@@ -10540,6 +10658,22 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     if let Some(client) = sess.clients.get(&client_id) {
                         let _ = send_outbox(client, msg);
                     }
+                }
+            }
+            C2S_DEADLINE if data.len() >= 7 => {
+                let pid = u16::from_le_bytes([data[1], data[2]]);
+                let ms = u32::from_le_bytes([data[3], data[4], data[5], data[6]]);
+                if let Some(pty) = sess.ptys.get_mut(&pid)
+                    && !pty.exited
+                {
+                    // Measured from now, so re-sending refreshes — that is
+                    // what makes this a dead-man switch rather than a
+                    // one-shot timeout.
+                    let (deadline, stop, reason) = armed_deadline(Instant::now(), ms);
+                    pty.deadline = deadline;
+                    pty.stop_deadline = stop;
+                    pty.exit_reason = reason;
+                    state.supervisor_notify.notify_one();
                 }
             }
             C2S_KILL if data.len() >= 7 => {
@@ -14649,6 +14783,27 @@ mod tests {
         // The length prefix holds this exactly; only one more byte truncates.
         let exact = "x".repeat(u16::MAX as usize);
         assert_eq!(oversize_list_field(&exact, Some(&exact)), None);
+    }
+
+    #[test]
+    fn arming_a_deadline_stands_down_a_pending_kill() {
+        let now = Instant::now();
+        // The case that matters: a refresh arriving inside the
+        // SIGTERM→SIGKILL grace. It must cancel the pending kill, or the
+        // terminal dies anyway a few seconds after the client said keep it.
+        let (deadline, stop, reason) = armed_deadline(now, 30_000);
+        assert_eq!(deadline, Some(now + Duration::from_secs(30)));
+        assert_eq!(stop, None);
+        assert_eq!(reason, blit_remote::EXIT_REASON_NORMAL);
+    }
+
+    #[test]
+    fn clearing_a_deadline_disarms_everything() {
+        let now = Instant::now();
+        let (deadline, stop, reason) = armed_deadline(now, 0);
+        assert_eq!(deadline, None);
+        assert_eq!(stop, None);
+        assert_eq!(reason, blit_remote::EXIT_REASON_NORMAL);
     }
 
     #[test]

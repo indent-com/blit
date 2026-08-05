@@ -73,8 +73,10 @@ async fn async_main() {
                     cols,
                     wait,
                     timeout,
+                    deadline,
                 } => {
-                    let start_result = agent::cmd_start(transport, tag, command, rows, cols).await;
+                    let start_result =
+                        agent::cmd_start(transport, tag, command, rows, cols, deadline).await;
                     if wait {
                         let pty_id = match start_result {
                             Ok(id) => id,
@@ -154,6 +156,9 @@ async fn async_main() {
                     }
                 },
                 TerminalCommand::Restart { id } => agent::cmd_restart(transport, id).await,
+                TerminalCommand::Deadline { id, seconds } => {
+                    agent::cmd_deadline(transport, id, seconds).await
+                }
                 TerminalCommand::Kill { id, signal } => {
                     agent::cmd_kill(transport, id, &signal).await
                 }

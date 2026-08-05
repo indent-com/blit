@@ -51,6 +51,7 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 | `0x1A` | `KILL`                  | `[pty_id:2][signal:4][flags:1]` — send signal to a PTY's process group; `flags` optional                                                                             |
 | `0x1B` | `COPY_RANGE`            | `[nonce:2][pty_id:2][start_tail:4][start_col:2][end_tail:4][end_col:2][flags:1]`                                                                                     |
 | `0x1C` | `TERM_CWD`              | `[nonce:2][pty_id:2]` — request a PTY's live working directory (see [Working directory tracking](#working-directory-tracking))                                       |
+| `0x1D` | `DEADLINE`              | `[pty_id:2][ms:4]` — arm or refresh a server-enforced deadline; `ms = 0` clears it                                                                                   |
 | `0x20` | `SURFACE_INPUT`         | `[surface_id:2][keycode:4][pressed:1]`                                                                                                                               |
 | `0x21` | `SURFACE_POINTER`       | `[surface_id:2][type:1][button:1][x:2][y:2]`                                                                                                                         |
 | `0x22` | `SURFACE_POINTER_AXIS`  | `[surface_id:2][axis:1][value:4]` — legacy scroll, superseded by `0x32`                                                                                              |
@@ -86,6 +87,8 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 - Bit 0 (`HAS_SRC_PTY`): followed by `[src_pty_id:2]` — create the new PTY in the same working directory as `src_pty_id`.
 - Bit 1 (`HAS_COMMAND`): remaining bytes after tag (and `src_pty_id` if present) are the UTF-8 command string (no length prefix) — spawn this command instead of the default shell.
 - Bit 2 (`HAS_CWD`): followed by `[cwd_len:2][cwd:N]` (before any command bytes) — spawn in this working directory.
+- Bit 3 (`WANT_STATUS`): valid only when `HELLO` advertises `CREATE_STATUS`; requests one correlated `CREATED_N` or `CREATE_FAILED` outcome. It adds no trailing field.
+- Bit 4 (`HAS_DEADLINE`): followed by `[ms:4]`, after any cwd and before any command bytes — arm a deadline at creation. Valid only when `HELLO` advertises `PTY_DEADLINE`.
 
 `READ` requests text from a PTY's scrollback + viewport:
 
@@ -120,7 +123,7 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 | `0x05` | `SEARCH_RESULTS`    | `[request_id:2][results…]`                                                                                         |
 | `0x06` | `CREATED_N`         | `[nonce:2][pty_id:2][tag:N]`                                                                                       |
 | `0x07` | `HELLO`             | `[version:2][features:4][boot_generation:8][server_version_len:2][server_version:N]`                               |
-| `0x08` | `EXITED`            | `[pty_id:2][exit_status:4]`                                                                                        |
+| `0x08` | `EXITED`            | `[pty_id:2][exit_status:4][reason:1]` — `reason` appended; older servers omit it                                   |
 | `0x09` | `READY`             | (no payload)                                                                                                       |
 | `0x0A` | `TEXT`              | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]`                                                             |
 | `0x0B` | `PING`              | _(empty)_ — server keepalive                                                                                       |
@@ -169,6 +172,7 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 | 10  | `NET`           | Server supports the `NET_*` network-relay family               |
 | 14  | `CREATE_STATUS` | `CREATE2(WANT_STATUS)` receives an explicit failure            |
 | 15  | `KILL_MODE`     | `KILL`/`CLOSE` reach the process group; `KILL` takes `flags`   |
+| 16  | `PTY_DEADLINE`  | `C2S_DEADLINE`, `CREATE2(HAS_DEADLINE)`, and `EXITED.reason`   |
 
 Bits 11 through 13 are held for the extension, channel, and process families
 under review in [#167](https://github.com/indent-com/blit/pull/167) and
@@ -223,6 +227,24 @@ that does not exist yet.
 The PTY cap is `--max-ptys` / `BLIT_MAX_PTYS`, unlimited by default. It counts
 exited-but-retained terminals as well as live ones, since both hold an id and
 a scrollback.
+
+A terminal has no deadline unless a client arms one — detaching and coming
+back is the point of a multiplexer, so sessions do not expire on their own.
+`C2S_DEADLINE` and `CREATE2(HAS_DEADLINE)` opt in, and the server enforces it
+whether or not anyone is still connected, which is the difference from every
+client-side timeout. `ms` counts from when the server receives the message, so
+re-sending refreshes: repeat it on an interval and it becomes a dead-man
+switch, killing the terminal roughly one period after the orchestrator stops
+checking in. `ms = 0` clears the deadline and stands down an in-flight stop.
+
+On expiry the server sends SIGTERM to the process group, waits 5 s, then sends
+SIGKILL, and the resulting `EXITED` carries `reason = 1` (`DEADLINE`). The
+`reason` byte exists because a deadline kill is otherwise indistinguishable
+from a user's `kill -9`: `0` normal, `1` deadline, `2` lease, `3` gc,
+`4` unit-stop. Values 2 and 4 are reserved for
+[design/units.md](design/units.md) and are not sent today. The byte is
+appended and length-gated, like the trailing fields on `HELLO`, so a 7-byte
+`EXITED` from an older server reads as `NORMAL`.
 
 `KILL` and `CLOSE` signal the child's process group on Unix and terminate its
 job object on Windows. `KILL`'s trailing `flags` byte is optional and armed by

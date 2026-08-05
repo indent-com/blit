@@ -157,6 +157,14 @@ pub const CREATE2_HAS_CWD: u8 = 1 << 2;
 /// nonce-bearing client waits forever (docs/protocol.md, "Common status
 /// registry").
 pub const CREATE2_WANT_STATUS: u8 = 1 << 3;
+/// Arm a server-enforced deadline at creation time: followed by `[ms:4]`,
+/// placed after any cwd and *before* the command bytes, since `HAS_COMMAND`
+/// runs to the end of the message and nothing can follow it.
+///
+/// Arming at create closes the window between spawning a terminal and
+/// protecting it — a client that sends `C2S_DEADLINE` as a second message
+/// leaves the terminal unbounded if it dies in between.
+pub const CREATE2_HAS_DEADLINE: u8 = 1 << 4;
 /// Read text from a PTY's scrollback + viewport: [0x19][nonce:2][pty_id:2][offset:4][limit:4][flags:1]
 /// offset: number of lines to skip from the top (oldest = 0), or from the end if READ_TAIL is set
 /// limit: max lines to return (0 = all)
@@ -185,6 +193,21 @@ pub const C2S_KILL: u8 = 0x1A;
 pub const KILL_LEADER_ONLY: u8 = 1 << 0;
 /// Request a PTY's live working directory: [0x1C][nonce:2][pty_id:2]
 pub const C2S_TERM_CWD: u8 = 0x1C;
+/// Arm, refresh, or clear a terminal's deadline: [0x1D][pty_id:2][ms:4].
+///
+/// `ms` counts from when the server receives the message, so re-sending it
+/// refreshes — that is what makes it usable as a dead-man switch: re-arm
+/// every 30s and the terminal dies ~30s after the orchestrator does.
+/// `ms = 0` clears the deadline entirely.
+///
+/// On expiry the server signals the process group with SIGTERM, waits
+/// [`DEADLINE_STOP_GRACE_MS`], then SIGKILLs it, and the resulting
+/// `S2C_EXITED` carries [`EXIT_REASON_DEADLINE`].
+pub const C2S_DEADLINE: u8 = 0x1D;
+/// Grace between the deadline's SIGTERM and its SIGKILL.  systemd's 90s is
+/// wrong for the workload this exists for — an agent that has already
+/// abandoned the terminal is not coming back to flush anything.
+pub const DEADLINE_STOP_GRACE_MS: u32 = 5_000;
 
 /// Keyboard input for a Wayland surface: [0x20][surface_id:2][data:N]
 /// data contains evdev keycodes encoded as [keycode:4][pressed:1] sequences.
@@ -308,11 +331,40 @@ pub const S2C_CREATED_N: u8 = 0x06;
 pub const S2C_HELLO: u8 = 0x07;
 /// The PTY's subprocess has exited but the terminal state is retained.
 /// Clients can still read/scroll the last frame. Send C2S_CLOSE to dismiss.
-/// Wire: [0x08][pty_id:2][exit_status:4]
+/// Wire: [0x08][pty_id:2][exit_status:4][reason:1]
 /// exit_status: WEXITSTATUS if normal exit, negative signal number if signalled,
 ///              EXIT_STATUS_UNKNOWN if not yet collected.
+/// reason: why the terminal ended (see EXIT_REASON_*).  Appended after the
+///         fact and length-gated, like the trailing fields on S2C_HELLO, so a
+///         7-byte message from an older server parses as EXIT_REASON_NORMAL.
 pub const S2C_EXITED: u8 = 0x08;
 pub const EXIT_STATUS_UNKNOWN: i32 = i32::MIN;
+
+/// Why a terminal ended.  Without this a deadline kill arrives as `-9`,
+/// indistinguishable from a user's `blit terminal kill -9`.
+///
+/// The numbering keeps slots for the lifecycle causes designed alongside
+/// this one in docs/design/units.md, so those can land without renumbering
+/// a shipped wire value.
+pub const EXIT_REASON_NORMAL: u8 = 0;
+pub const EXIT_REASON_DEADLINE: u8 = 1;
+/// Reserved: lease expiry (docs/design/units.md).
+pub const EXIT_REASON_LEASE: u8 = 2;
+/// The server evicted an exited terminal to stay under its retention bound.
+pub const EXIT_REASON_GC: u8 = 3;
+/// Reserved: unit stop (docs/design/units.md).
+pub const EXIT_REASON_UNIT_STOP: u8 = 4;
+
+pub fn exit_reason_text(reason: u8) -> &'static str {
+    match reason {
+        EXIT_REASON_NORMAL => "exited",
+        EXIT_REASON_DEADLINE => "killed by deadline",
+        EXIT_REASON_LEASE => "killed by lease expiry",
+        EXIT_REASON_GC => "evicted",
+        EXIT_REASON_UNIT_STOP => "stopped by unit",
+        _ => "unknown reason",
+    }
+}
 /// Sent after the initial burst (HELLO, LIST, TITLE*, EXITED*) is complete.
 /// Clients can use this to know when the initial state has been fully transmitted.
 pub const S2C_READY: u8 = 0x09;
@@ -568,6 +620,9 @@ pub const FEATURE_CREATE_STATUS: u32 = 1 << 14;
 /// object (Windows) rather than the session leader alone, and `C2S_KILL`
 /// accepts a trailing [`KILL_LEADER_ONLY`] flag byte to opt back out.
 pub const FEATURE_KILL_MODE: u32 = 1 << 15;
+/// Server-enforced terminal deadlines: `C2S_DEADLINE`,
+/// `CREATE2(HAS_DEADLINE)`, and the `reason` byte on `S2C_EXITED`.
+pub const FEATURE_PTY_DEADLINE: u32 = 1 << 16;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {
@@ -1923,6 +1978,8 @@ pub enum ServerMsg<'a> {
     Exited {
         pty_id: u16,
         exit_status: i32,
+        /// `EXIT_REASON_NORMAL` from servers that predate the field.
+        reason: u8,
     },
     List {
         entries: Vec<PtyListEntry<'a>>,
@@ -2108,6 +2165,8 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             Some(ServerMsg::Exited {
                 pty_id: u16::from_le_bytes([data[1], data[2]]),
                 exit_status: i32::from_le_bytes([data[3], data[4], data[5], data[6]]),
+                // Appended field: a server that predates it sends 7 bytes.
+                reason: data.get(7).copied().unwrap_or(EXIT_REASON_NORMAL),
             })
         }
         S2C_LIST => {
@@ -2516,6 +2575,24 @@ pub fn msg_create2_with_cwd(
     features: u8,
     cwd: Option<&str>,
 ) -> Vec<u8> {
+    msg_create2_full(nonce, rows, cols, tag, command, features, cwd, None)
+}
+
+/// `C2S_CREATE2` with every optional field.
+///
+/// Field order is load-bearing: the command has no length prefix and runs to
+/// the end of the message, so everything else has to precede it.
+#[allow(clippy::too_many_arguments)]
+pub fn msg_create2_full(
+    nonce: u16,
+    rows: u16,
+    cols: u16,
+    tag: &str,
+    command: &str,
+    features: u8,
+    cwd: Option<&str>,
+    deadline_ms: Option<u32>,
+) -> Vec<u8> {
     let tag_bytes = tag.as_bytes();
     let cmd_bytes = command.as_bytes();
     let cwd_bytes = cwd.unwrap_or_default().as_bytes();
@@ -2524,10 +2601,19 @@ pub fn msg_create2_with_cwd(
     let has_cwd = cwd_len > 0;
     let feat = features
         | if has_cmd { CREATE2_HAS_COMMAND } else { 0 }
-        | if has_cwd { CREATE2_HAS_CWD } else { 0 };
+        | if has_cwd { CREATE2_HAS_CWD } else { 0 }
+        | if deadline_ms.is_some() {
+            CREATE2_HAS_DEADLINE
+        } else {
+            0
+        };
     let tag_len = tag_bytes.len().min(u16::MAX as usize);
-    let mut msg =
-        Vec::with_capacity(10 + tag_len + if has_cwd { 2 + cwd_len } else { 0 } + cmd_bytes.len());
+    let mut msg = Vec::with_capacity(
+        10 + tag_len
+            + if has_cwd { 2 + cwd_len } else { 0 }
+            + if deadline_ms.is_some() { 4 } else { 0 }
+            + cmd_bytes.len(),
+    );
     msg.push(C2S_CREATE2);
     msg.extend_from_slice(&nonce.to_le_bytes());
     msg.extend_from_slice(&rows.to_le_bytes());
@@ -2538,6 +2624,9 @@ pub fn msg_create2_with_cwd(
     if has_cwd {
         msg.extend_from_slice(&(cwd_len as u16).to_le_bytes());
         msg.extend_from_slice(&cwd_bytes[..cwd_len]);
+    }
+    if let Some(ms) = deadline_ms {
+        msg.extend_from_slice(&ms.to_le_bytes());
     }
     if has_cmd {
         msg.extend_from_slice(cmd_bytes);
@@ -2802,10 +2891,24 @@ pub fn msg_create_failed(nonce: u16, status: u8, detail: &str) -> Vec<u8> {
 }
 
 pub fn msg_exited(pty_id: u16, exit_status: i32) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(7);
+    msg_exited_reason(pty_id, exit_status, EXIT_REASON_NORMAL)
+}
+
+pub fn msg_exited_reason(pty_id: u16, exit_status: i32, reason: u8) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(8);
     msg.push(S2C_EXITED);
     msg.extend_from_slice(&pty_id.to_le_bytes());
     msg.extend_from_slice(&exit_status.to_le_bytes());
+    msg.push(reason);
+    msg
+}
+
+/// Arm, refresh (`ms > 0`) or clear (`ms = 0`) a terminal's deadline.
+pub fn msg_deadline(pty_id: u16, ms: u32) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(7);
+    msg.push(C2S_DEADLINE);
+    msg.extend_from_slice(&pty_id.to_le_bytes());
+    msg.extend_from_slice(&ms.to_le_bytes());
     msg
 }
 
@@ -4664,6 +4767,73 @@ mod tests {
         assert_eq!(plain.len(), flagged.len());
         assert_eq!(flagged[7], plain[7] | CREATE2_WANT_STATUS);
         assert_eq!(plain[8..], flagged[8..]);
+    }
+
+    #[test]
+    fn create2_puts_the_deadline_before_the_command() {
+        // The command has no length prefix and runs to the end of the
+        // message, so a trailing deadline would be swallowed into it and the
+        // command would gain four bytes of garbage.
+        let msg = msg_create2_full(1, 24, 80, "tg", "echo hi", 0, Some("/tmp"), Some(5_000));
+        assert_eq!(msg[7] & CREATE2_HAS_DEADLINE, CREATE2_HAS_DEADLINE);
+        let tag_len = u16::from_le_bytes([msg[8], msg[9]]) as usize;
+        let mut cursor = 10 + tag_len;
+        assert_eq!(&msg[10..cursor], b"tg");
+        let cwd_len = u16::from_le_bytes([msg[cursor], msg[cursor + 1]]) as usize;
+        cursor += 2;
+        assert_eq!(&msg[cursor..cursor + cwd_len], b"/tmp");
+        cursor += cwd_len;
+        let ms = u32::from_le_bytes([
+            msg[cursor],
+            msg[cursor + 1],
+            msg[cursor + 2],
+            msg[cursor + 3],
+        ]);
+        assert_eq!(ms, 5_000);
+        cursor += 4;
+        assert_eq!(&msg[cursor..], b"echo hi");
+    }
+
+    #[test]
+    fn create2_omits_the_deadline_field_when_unarmed() {
+        let armed = msg_create2_full(1, 24, 80, "", "sh", 0, None, Some(1));
+        let plain = msg_create2_full(1, 24, 80, "", "sh", 0, None, None);
+        assert_eq!(plain[7] & CREATE2_HAS_DEADLINE, 0);
+        assert_eq!(armed.len(), plain.len() + 4);
+    }
+
+    #[test]
+    fn exited_reason_roundtrips() {
+        let wire = msg_exited_reason(3, -15, EXIT_REASON_DEADLINE);
+        assert_eq!(wire.len(), 8);
+        match parse_server_msg(&wire).unwrap() {
+            ServerMsg::Exited {
+                pty_id,
+                exit_status,
+                reason,
+            } => {
+                assert_eq!((pty_id, exit_status), (3, -15));
+                assert_eq!(reason, EXIT_REASON_DEADLINE);
+            }
+            _ => panic!("expected Exited"),
+        }
+    }
+
+    #[test]
+    fn exited_without_a_reason_byte_reads_as_normal() {
+        // What a server predating the field sends.  It must not parse as a
+        // deadline kill, and it must not fail to parse.
+        let legacy = vec![S2C_EXITED, 3, 0, 0, 0, 0, 0];
+        match parse_server_msg(&legacy).unwrap() {
+            ServerMsg::Exited { reason, .. } => assert_eq!(reason, EXIT_REASON_NORMAL),
+            _ => panic!("expected Exited"),
+        }
+    }
+
+    #[test]
+    fn exit_reason_text_distinguishes_unallocated() {
+        assert_eq!(exit_reason_text(EXIT_REASON_DEADLINE), "killed by deadline");
+        assert_eq!(exit_reason_text(200), "unknown reason");
     }
 
     #[test]
