@@ -998,6 +998,7 @@ version = "0.44.0"
 dependencies = [
  "argon2 0.5.3",
  "axum",
+ "blake3",
  "blit-fonts",
  "brotli",
  "futures-util",
