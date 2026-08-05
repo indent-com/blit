@@ -949,6 +949,28 @@ impl VulkanRenderer {
         Some(code)
     }
 
+    /// Memory type for staging buffers the CPU reads back from
+    /// (retire_pending's memcpy).  HOST_VISIBLE|HOST_COHERENT alone
+    /// lands in write-combined memory on discrete GPUs (it's the
+    /// lowest-index match), and CPU reads from write-combined memory
+    /// bypass the cache — the readback memcpy runs ~10-100x slower
+    /// and can pin a core.  Prefer HOST_CACHED; fall back for devices
+    /// that don't expose a cached host-visible type.
+    fn find_readback_memory_type(&self, type_bits: u32) -> Option<u32> {
+        self.find_memory_type(
+            type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE
+                | vk::MemoryPropertyFlags::HOST_COHERENT
+                | vk::MemoryPropertyFlags::HOST_CACHED,
+        )
+        .or_else(|| {
+            self.find_memory_type(
+                type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+        })
+    }
+
     fn find_memory_type(&self, type_bits: u32, properties: vk::MemoryPropertyFlags) -> Option<u32> {
         let mem_props = unsafe {
             self.instance
@@ -1424,10 +1446,7 @@ impl VulkanRenderer {
             }
         };
         let buf_reqs = unsafe { self.device.get_buffer_memory_requirements(staging_buf) };
-        let buf_mem_type = self.find_memory_type(
-            buf_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        );
+        let buf_mem_type = self.find_readback_memory_type(buf_reqs.memory_type_bits);
         let Some(buf_mem_type) = buf_mem_type else {
             unsafe {
                 self.device.destroy_buffer(staging_buf, None);
@@ -2808,10 +2827,7 @@ impl VulkanRenderer {
                 .ok()?
         };
         let buf_reqs = unsafe { self.device.get_buffer_memory_requirements(staging_buf) };
-        let buf_mem_type = self.find_memory_type(
-            buf_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        );
+        let buf_mem_type = self.find_readback_memory_type(buf_reqs.memory_type_bits);
         if buf_mem_type.is_none() {
             eprintln!(
                 "[create_output_image] no HOST_VISIBLE memory for staging (bits={:#x})",
