@@ -1764,7 +1764,46 @@ impl Compositor {
             }
         };
 
-        self.composite_toplevel_into_pending(&root_id, toplevel_sid, false);
+        // Compositing while a previous submit's fence is still unsignalled
+        // does not queue behind it — `render_tree_sized` early-returns and
+        // the tree is gone.  Mid-stream that is invisible, because the next
+        // commit composites the same surface state anyway.  On an app's
+        // *last* commit nothing follows it: the pixels the user is waiting
+        // for are never composited, so no SurfaceCommit is emitted, no
+        // pixel generation is bumped, and the server's `unchanged` gate
+        // then holds the client on the frame before it, indefinitely.
+        // Pressing Ctrl+L in a browser surface is the everyday shape of it
+        // — a short burst of commits whose last one lands in the fence
+        // window and the address-bar highlight never arrives.
+        //
+        // So defer instead of dropping, exactly as the external-buffer and
+        // downscale-target handlers already do for this same hazard.  The
+        // event loop retires the in-flight submit on its 1 ms poll and
+        // drains this queue once the GPU is idle.
+        if self
+            .vulkan_renderer
+            .as_ref()
+            .is_some_and(|vk| vk.would_defer_submit())
+        {
+            // Always `false`, overwriting any queued encoder-only entry:
+            // that variant skips publishing pixels on purpose, which is
+            // the one thing this commit exists to do.
+            self.pending_recomposite_toplevels
+                .insert(toplevel_sid, false);
+            // Log sparsely: this fires whenever a commit lands in the fence
+            // window, which on a busy surface is often.  Every one of these
+            // used to be a discarded tree.
+            static DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 5 || n.is_multiple_of(500) {
+                eprintln!(
+                    "[commit-defer #{n}] sid={toplevel_sid}: submit in flight, \
+                     queued for recomposite instead of dropping the tree",
+                );
+            }
+        } else {
+            self.composite_toplevel_into_pending(&root_id, toplevel_sid, false);
+        }
 
         // Compositing is done — the VulkanRenderer holds its own dup'd
         // fd reference to the DMA-BUF via the persistent texture cache.
