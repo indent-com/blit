@@ -3783,6 +3783,32 @@ impl VulkanRenderer {
         self.pending_submit.is_some()
     }
 
+    /// True when `render_tree_sized` would drop the tree instead of
+    /// submitting it: a previous submit is still in flight and its fence
+    /// has not signalled, so the early return at the top of that function
+    /// would fire.
+    ///
+    /// Callers that composite in response to an event which will not
+    /// repeat — a `wl_surface.commit` — must consult this and defer rather
+    /// than call and lose the tree.  `has_pending` is not a substitute: it
+    /// is true for the whole life of a submit, including after its fence
+    /// has signalled, when compositing proceeds normally.
+    pub fn would_defer_submit(&self) -> bool {
+        let Some(pending) = self.pending_submit.as_ref() else {
+            return false;
+        };
+        let raw = unsafe {
+            (self.device.fp_v1_0().wait_for_fences)(
+                self.device.handle(),
+                1,
+                [pending.fence].as_ptr(),
+                vk::TRUE,
+                0,
+            )
+        };
+        raw != vk::Result::SUCCESS
+    }
+
     /// Non-blocking check: if the previous GPU submission has completed,
     /// read back its results and return them.  Called from the compositor's
     /// main event loop so completed frames are flushed to the server
