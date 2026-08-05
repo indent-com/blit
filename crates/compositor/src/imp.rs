@@ -1308,6 +1308,35 @@ struct Compositor {
     cursor_rgba: HashMap<ObjectId, (u32, u32, Vec<u8>)>,
 }
 
+/// Scan for a free surface id starting at `from`, wrapping past `u16::MAX`
+/// and skipping 0 (reserved as "no surface"). `None` when every non-zero id
+/// is taken.
+///
+/// Split out of `Compositor::allocate_surface_id` so exhaustion is testable
+/// without standing up a compositor — it is otherwise 65535 live toplevels
+/// away and was silently wrong.
+fn scan_free_surface_id(from: u16, taken: impl Fn(u16) -> bool) -> Option<u16> {
+    // Normalising `from` also closes a latent hang: the old loop compared
+    // against a `start` of 0 that the skip-zero step could never produce
+    // again, so a 0 seed would have spun forever.
+    let start = if from == 0 { 1 } else { from };
+    let mut id = start;
+    loop {
+        if !taken(id) {
+            return Some(id);
+        }
+        id = next_surface_id_after(id);
+        if id == start {
+            return None;
+        }
+    }
+}
+
+/// The id to try after `id`, wrapping past `u16::MAX` back to 1.
+fn next_surface_id_after(id: u16) -> u16 {
+    if id == u16::MAX { 1 } else { id + 1 }
+}
+
 impl Compositor {
     fn next_serial(&mut self) -> u32 {
         self.serial = self.serial.wrapping_add(1);
@@ -1489,26 +1518,19 @@ impl Compositor {
         }
     }
 
-    fn allocate_surface_id(&mut self) -> u16 {
-        let mut id = self.next_surface_id;
-        let start = id;
-        loop {
-            if !self.toplevel_surface_ids.contains_key(&id) {
-                break;
-            }
-            id = id.wrapping_add(1);
-            if id == 0 {
-                id = 1;
-            }
-            if id == start {
-                break;
-            }
-        }
-        self.next_surface_id = id.wrapping_add(1);
-        if self.next_surface_id == 0 {
-            self.next_surface_id = 1;
-        }
-        id
+    /// Allocate a wire-visible id for a new toplevel, or `None` when every
+    /// non-zero `u16` is taken.
+    ///
+    /// The scan used to `break` on exhaustion the same way it breaks on
+    /// success, so it returned the occupied id it started from. Two live
+    /// toplevels then shared one: the `toplevel_surface_ids` insert dropped
+    /// the older mapping, encoder and size state keyed by the id aliased,
+    /// and destroying either surface unregistered both.
+    fn allocate_surface_id(&mut self) -> Option<u16> {
+        let taken = &self.toplevel_surface_ids;
+        let id = scan_free_surface_id(self.next_surface_id, |c| taken.contains_key(&c))?;
+        self.next_surface_id = next_surface_id_after(id);
+        Some(id)
     }
 
     fn flush_pending_commits(&mut self) {
@@ -3842,7 +3864,14 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for Compositor {
                         wl_surface_id: data.wl_surface_id.clone(),
                     },
                 );
-                let surface_id = state.allocate_surface_id();
+                let Some(surface_id) = state.allocate_surface_id() else {
+                    // Refusing one toplevel is recoverable; handing out an
+                    // id another live surface already holds is not.
+                    eprintln!("blit-compositor: surface id space exhausted, refusing toplevel");
+                    toplevel.close();
+                    let _ = state.display_handle.flush_clients();
+                    return;
+                };
                 if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
                     surf.xdg_toplevel = Some(toplevel.clone());
                     surf.surface_id = surface_id;
@@ -6224,5 +6253,45 @@ fn run_compositor(
 
     if verbose {
         eprintln!("[compositor] event loop exited");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_surface_id_after, scan_free_surface_id};
+    use std::collections::HashSet;
+
+    #[test]
+    fn scan_skips_zero_and_wraps() {
+        assert_eq!(next_surface_id_after(1), 2);
+        assert_eq!(next_surface_id_after(u16::MAX), 1, "0 is never handed out");
+
+        // Seeded past the end of a small taken set, the scan wraps around
+        // to the first free id rather than giving up.
+        let taken: HashSet<u16> = (1..=10).collect();
+        assert_eq!(scan_free_surface_id(5, |id| taken.contains(&id)), Some(11));
+        assert_eq!(
+            scan_free_surface_id(u16::MAX, |id| taken.contains(&id)),
+            Some(u16::MAX)
+        );
+    }
+
+    /// The whole point of the Option: a full space must refuse, not alias.
+    /// The old scan broke out of the loop on exhaustion exactly as it did on
+    /// success and returned the occupied id it started from, so two live
+    /// toplevels shared one and destroying either unregistered both.
+    #[test]
+    fn scan_refuses_when_every_id_is_taken() {
+        assert_eq!(scan_free_surface_id(1, |_| true), None);
+        assert_eq!(scan_free_surface_id(40_000, |_| true), None);
+        assert_eq!(scan_free_surface_id(u16::MAX, |_| true), None);
+    }
+
+    /// A 0 seed cannot occur today (the counter is initialised to 1 and kept
+    /// non-zero) but the old loop would have hung on it forever.
+    #[test]
+    fn scan_tolerates_a_zero_seed() {
+        assert_eq!(scan_free_surface_id(0, |_| false), Some(1));
+        assert_eq!(scan_free_surface_id(0, |_| true), None);
     }
 }

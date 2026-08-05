@@ -165,6 +165,9 @@ unsafe impl Send for VulkanVideoEncoder {}
 /// Bitstream buffer size (2 MiB -- generous for a single frame).
 const BITSTREAM_CAPACITY: u64 = 2 * 1024 * 1024;
 
+/// Largest H.264 quantization parameter the spec defines for 8-bit luma.
+const H264_MAX_QP: u8 = 51;
+
 impl VulkanVideoEncoder {
     /// Create a Vulkan Video H.264 encoder.
     ///
@@ -325,7 +328,12 @@ impl VulkanVideoEncoder {
         pps.num_ref_idx_l0_default_active_minus1 = 0;
         pps.weighted_bipred_idc =
             StdVideoH264WeightedBipredIdc_STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_DEFAULT;
-        pps.pic_init_qp_minus26 = qp as i8 - 26;
+        // H.264 QP is 0..=51 (8-bit luma, so QpBdOffsetY is 0) and the field
+        // is an i8 carrying qp-26. The server clamps before it reaches us, so
+        // this is unreachable today — but nothing in between enforced it, and
+        // past 127 the subtraction overflows the i8 rather than merely
+        // producing a stream no decoder accepts.
+        pps.pic_init_qp_minus26 = qp.min(H264_MAX_QP) as i8 - 26;
 
         let add_info = vk::VideoEncodeH264SessionParametersAddInfoKHR::default()
             .std_sp_ss(std::slice::from_ref(&sps))
