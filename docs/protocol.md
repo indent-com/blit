@@ -162,7 +162,7 @@ All three bytes are optional — a 3-byte message uses connection/server default
 | 8   | `LSP`          | Server supports the `LSP_*` language intelligence family       |
 | 9   | `KV`           | Server supports the `KV_*` key-value family                    |
 | 10  | `NET`          | Server supports the `NET_*` network-relay family               |
-| 11  | `EXTENSION`    | Proposed: server supports Wasmi extension lifecycle and events |
+| 11  | `EXTENSION`    | Proposed: Wasmi extension lifecycle, events, and commands      |
 | 12  | `CHANNEL`      | Proposed: server supports bidirectional named channels         |
 | 13  | `PROCESS`      | Proposed: server supports non-PTY child processes              |
 
@@ -183,10 +183,11 @@ Two complementary paths report a PTY's working directory:
 Clients that predate `TERM_CWD_EVENT` are unaffected: consistent with the version-stability rule above (new message types are added under new opcodes), both reference clients drop unrecognized S2C opcodes — `js/core`'s `BlitConnection.handleMessage` dispatch falls through to a no-op `default`, and the CLI's message matches end in a catch-all `_ => {}`.
 
 An opcode which multiplexes a one-byte inner kind also needs a family-defined
-skip rule. The proposed extension and native-channel families specify that clients
-ignore unknown S2C kinds, servers ignore unknown C2S kinds without changing
-handle state, and any new request kind which requires a reply is separately
-feature-negotiated; see [design/extensions.md](design/extensions.md#protocol-compatibility).
+skip rule. The proposed extension-command and native-channel families specify
+that clients ignore unknown S2C kinds, servers ignore unknown C2S kinds without
+changing handle state, and any new request kind which requires a reply is
+separately feature-negotiated; see
+[design/extensions.md](design/extensions.md#protocol-compatibility).
 
 `S2C_SURFACE_FRAME` flags byte: bit 0 is the keyframe flag; bits 1–2 encode the codec — H.264 (0), AV1 (1), PNG (2). Remaining bits are reserved. `timestamp` is a monotonic millisecond counter captured at compositor-commit time (not wire-send time), so clients can drive video presentation and A/V sync off encode-time instead of network-delivery jitter.
 
