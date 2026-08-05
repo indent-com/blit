@@ -262,6 +262,25 @@ export const C2S_QUIT = 0x0f;
 export const C2S_SURFACE_INPUT = 0x20;
 export const C2S_SURFACE_POINTER = 0x21;
 export const C2S_SURFACE_POINTER_AXIS = 0x22;
+/**
+ * Scroll with both axes, a device source and discrete detents:
+ * [0x32][surface_id:2][flags:1][dx_x100:4][dy_x100:4][v120_x:2][v120_y:2]
+ *
+ * Deltas are in the composited frame's pixel space, like
+ * {@link C2S_SURFACE_POINTER}; the server converts to surface-logical
+ * pixels. `v120` counts wheel detents in 120ths.
+ */
+export const C2S_SURFACE_POINTER_AXIS2 = 0x32;
+
+/** `wl_pointer.axis_source` values, carried in the AXIS2 flags byte. */
+export const AXIS_SOURCE_WHEEL = 0;
+export const AXIS_SOURCE_FINGER = 1;
+export const AXIS_SOURCE_CONTINUOUS = 2;
+/** Set when the source bits mean anything. */
+export const AXIS_FLAG_SOURCE_KNOWN = 1 << 2;
+/** Set when this event ends a scroll sequence. */
+export const AXIS_FLAG_STOP = 1 << 3;
+
 export const C2S_SURFACE_RESIZE = 0x23;
 export const C2S_SURFACE_FOCUS = 0x24;
 export const C2S_CLIPBOARD_SET = 0x25;

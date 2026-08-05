@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use blit_remote::{AXIS_SOURCE_WHEEL, PointerAxisEvent};
 use blit_remote::{
     C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_LIST, C2S_SURFACE_POINTER,
     CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CODEC_SUPPORT_AV1, CODEC_SUPPORT_H264,
@@ -9,7 +10,7 @@ use blit_remote::{
     SURFACE_FRAME_CODEC_MASK, SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState, msg_ack,
     msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_close, msg_create2,
     msg_input, msg_kill, msg_mouse, msg_quit, msg_read, msg_resize, msg_restart, msg_subscribe,
-    msg_surface_close, msg_surface_focus, msg_surface_input, msg_surface_pointer_axis,
+    msg_surface_close, msg_surface_focus, msg_surface_input, msg_surface_pointer_axis2,
     msg_surface_resize, msg_surface_subscribe, msg_surface_subscribe_ext, msg_surface_text,
     msg_term_cwd, parse_server_msg, parse_term_cwd_reply,
 };
@@ -1120,28 +1121,47 @@ pub async fn cmd_click(
     Ok(())
 }
 
-/// Scroll a surface. `axis` 0 is vertical, 1 horizontal; the wire carries
-/// hundredths, so a "line" is roughly 10 units of wheel travel.
+/// Scroll a surface by `amount` wheel detents, positive = down/right.
+///
+/// One detent is one notch of a physical wheel — what an app treats as a
+/// scroll step. Fractions are allowed and reach clients that understand
+/// high-resolution scrolling; the rest see the accumulated whole notches.
 pub async fn cmd_scroll(
     transport: Transport,
     id: u16,
     amount: f64,
     horizontal: bool,
 ) -> Result<(), String> {
-    let mut conn = AgentConn::connect(transport).await?;
-    let value = (amount * 100.0).round();
-    if !value.is_finite() || value.abs() > f64::from(i32::MAX) {
+    if !amount.is_finite() {
+        return Err("scroll amount must be a number".into());
+    }
+    let v120 = (amount * 120.0).round();
+    if v120.abs() > f64::from(i16::MAX) {
         return Err("scroll amount out of range".into());
     }
-    conn.send(&msg_surface_pointer_axis(
-        id,
-        u8::from(horizontal),
-        value as i32,
-    ))
+    // Smooth distance alongside the detent count: apps that scroll by
+    // pixels need it, and value120 alone would move nothing there.
+    let distance = amount * WHEEL_DETENT_PX;
+    let mut conn = AgentConn::connect(transport).await?;
+    conn.send(&msg_surface_pointer_axis2(&PointerAxisEvent {
+        surface_id: id,
+        dx: if horizontal { distance } else { 0.0 },
+        dy: if horizontal { 0.0 } else { distance },
+        v120_x: if horizontal { v120 as i16 } else { 0 },
+        v120_y: if horizontal { 0 } else { v120 as i16 },
+        source: Some(AXIS_SOURCE_WHEEL),
+        // A wheel has no "finger lifted" moment, and the protocol tells
+        // clients not to expect a stop from one.
+        stop: false,
+    }))
     .await?;
     conn.finish().await;
     Ok(())
 }
+
+/// Pixels a wheel detent travels, matching the browser convention the
+/// surface canvas uses.
+const WHEEL_DETENT_PX: f64 = 120.0;
 
 /// Give a surface keyboard and pointer focus.
 pub async fn cmd_focus_surface(transport: Transport, id: u16) -> Result<(), String> {

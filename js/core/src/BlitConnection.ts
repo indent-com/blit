@@ -70,6 +70,8 @@ import {
   buildSurfaceTextMessage,
   buildSurfacePointerMessage,
   buildSurfaceAxisMessage,
+  buildSurfaceAxis2Message,
+  type SurfaceAxisEvent,
   buildSurfaceResizeMessage,
   buildSurfaceFocusMessage,
   buildSurfaceCloseMessage,
@@ -2787,6 +2789,11 @@ export class BlitConnection {
   sendSurfaceAxis(surfaceId: number, axis: number, valueX100: number): void {
     if (this.transport.status !== "connected") return;
     this.transport.send(buildSurfaceAxisMessage(surfaceId, axis, valueX100));
+  }
+
+  sendSurfaceAxis2(surfaceId: number, ev: SurfaceAxisEvent): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(buildSurfaceAxis2Message(surfaceId, ev));
   }
 
   sendSurfaceResize(

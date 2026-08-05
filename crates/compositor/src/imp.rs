@@ -551,10 +551,26 @@ pub enum CompositorCommand {
         button: u32,
         pressed: bool,
     },
+    /// A scroll event.
+    ///
+    /// `dx`/`dy` are smooth distance in the composited frame's pixel
+    /// space, the same space `PointerMotion` uses; they are converted to
+    /// surface-logical pixels on the way out. `v120_*` is discrete wheel
+    /// travel in 120ths of a detent.
+    ///
+    /// `source` is `None` when the sender did not classify the device, in
+    /// which case no `wl_pointer.axis_source` is emitted. That is not the
+    /// same as harmless: the enum's zero value is `wheel`, so an
+    /// unclassified scroll still reads as a notched wheel to most
+    /// toolkits.
     PointerAxis {
         surface_id: u16,
-        axis: u8,
-        value: f64,
+        dx: f64,
+        dy: f64,
+        v120_x: i16,
+        v120_y: i16,
+        source: Option<u8>,
+        stop: bool,
     },
     SurfaceResize {
         surface_id: u16,
@@ -2690,26 +2706,93 @@ impl Compositor {
                 let _ = self.display_handle.flush_clients();
             }
             CompositorCommand::PointerAxis {
-                surface_id: _,
-                axis,
-                value,
+                surface_id,
+                dx,
+                dy,
+                v120_x,
+                v120_y,
+                source,
+                stop,
             } => {
                 let time = elapsed_ms();
-                let wl_axis = if axis == 0 {
-                    wl_pointer::Axis::VerticalScroll
-                } else {
-                    wl_pointer::Axis::HorizontalScroll
-                };
+                // Scroll distance arrives in the composited frame's pixel
+                // space, like pointer motion; wl_pointer.axis wants
+                // surface-logical pixels. Same conversion PointerMotion
+                // does, so a wheel and a drag move content by equal amounts
+                // on a scaled surface.
+                let (sx, sy) = self.last_reported_size.get(&surface_id).map_or(
+                    (1.0, 1.0),
+                    |&(cw, ch, lw, lh)| {
+                        (
+                            if cw > 0 {
+                                f64::from(lw) / f64::from(cw)
+                            } else {
+                                1.0
+                            },
+                            if ch > 0 {
+                                f64::from(lh) / f64::from(ch)
+                            } else {
+                                1.0
+                            },
+                        )
+                    },
+                );
+                let (dx, dy) = (dx * sx, dy * sy);
+                if !stop && dx == 0.0 && dy == 0.0 && v120_x == 0 && v120_y == 0 {
+                    return;
+                }
                 let focused_wl = self
                     .surfaces
                     .values()
                     .find(|s| Some(s.wl_surface.id()) == self.pointer_entered_id)
                     .map(|s| s.wl_surface.clone());
+                let Some(wl) = focused_wl else {
+                    return;
+                };
+                use wl_pointer::Axis;
                 for ptr in &self.pointers {
-                    if let Some(ref wl) = focused_wl
-                        && same_client(ptr, wl)
+                    if !same_client(ptr, &wl) {
+                        continue;
+                    }
+                    let v = ptr.version();
+                    // axis_source first: it applies to every axis event in
+                    // this frame, and tells the client whether to expect
+                    // detents or a smooth stream. Without it a trackpad's
+                    // pixel deltas read as wheel clicks and toolkits scale
+                    // them up by a lines-per-click factor.
+                    if v >= 5
+                        && let Some(src) = source.and_then(|s| axis_source_from_wire(s, v))
                     {
-                        ptr.axis(time, wl_axis, value);
+                        ptr.axis_source(src);
+                    }
+                    for (axis, delta, v120) in [
+                        (Axis::VerticalScroll, dy, v120_y),
+                        (Axis::HorizontalScroll, dx, v120_x),
+                    ] {
+                        if stop {
+                            if v >= 5 {
+                                ptr.axis_stop(time, axis);
+                            }
+                            continue;
+                        }
+                        if delta == 0.0 && v120 == 0 {
+                            continue;
+                        }
+                        // value120 replaces axis_discrete at v8; neither may
+                        // carry zero, and each must be followed by exactly
+                        // one axis event on the same axis in this frame.
+                        // Sub-detent travel has no axis_discrete spelling,
+                        // so pre-v8 clients get it as smooth motion only.
+                        if v120 != 0 {
+                            if v >= 8 {
+                                ptr.axis_value120(axis, i32::from(v120));
+                            } else if v >= 5 && v120.abs() >= 120 {
+                                ptr.axis_discrete(axis, i32::from(v120 / 120));
+                            }
+                        }
+                        ptr.axis(time, axis, delta);
+                    }
+                    if v >= 5 {
                         ptr.frame();
                     }
                 }
@@ -3288,6 +3371,24 @@ fn elapsed_ms() -> u32 {
     (sec as u32)
         .wrapping_mul(1000)
         .wrapping_add(nsec as u32 / 1_000_000)
+}
+
+/// Map a scroll source onto `wl_pointer.axis_source`, for a pointer bound
+/// at `version`.
+///
+/// The numbers are Wayland's own `axis_source` enum. Anything this build
+/// does not recognise, or that the client's version predates, yields
+/// `None`: an unclassified scroll is recoverable, one labelled wrong is
+/// not, and an out-of-range enum value is a protocol error that would kill
+/// the client.
+fn axis_source_from_wire(source: u8, version: u32) -> Option<wl_pointer::AxisSource> {
+    match source {
+        0 => Some(wl_pointer::AxisSource::Wheel),
+        1 => Some(wl_pointer::AxisSource::Finger),
+        2 => Some(wl_pointer::AxisSource::Continuous),
+        3 if version >= 6 => Some(wl_pointer::AxisSource::WheelTilt),
+        _ => None,
+    }
 }
 
 /// Returns true when two Wayland resources belong to the same still-connected client.

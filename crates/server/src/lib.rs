@@ -6,17 +6,17 @@ use blit_remote::{
     C2S_CREATE2, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_KILL, C2S_MOUSE, C2S_PING, C2S_QUIT,
     C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE, C2S_SURFACE_ACK,
     C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT, C2S_SURFACE_LIST,
-    C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE,
-    C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
-    CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_CWD, CREATE2_HAS_SRC_PTY,
-    FEATURE_COMPOSITOR, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_RESIZE_BATCH,
-    FEATURE_RESTART, FrameState, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N,
-    S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE,
-    S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME,
-    build_update_msg, msg_hello, msg_s2c_clipboard_content, msg_s2c_clipboard_list,
-    msg_s2c_used_rows, msg_surface_app_id, msg_surface_created, msg_surface_destroyed,
-    msg_surface_encoder, msg_surface_frame, msg_surface_resized, msg_surface_title,
-    msg_term_cwd_reply,
+    C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2, C2S_SURFACE_RESIZE,
+    C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD,
+    C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_CWD,
+    CREATE2_HAS_SRC_PTY, FEATURE_COMPOSITOR, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE,
+    FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState, READ_ANSI, READ_TAIL, S2C_CLOSED,
+    S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS,
+    S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, SURFACE_FRAME_CODEC_H264,
+    SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN, build_update_msg, msg_hello,
+    msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_used_rows, msg_surface_app_id,
+    msg_surface_created, msg_surface_destroyed, msg_surface_encoder, msg_surface_frame,
+    msg_surface_resized, msg_surface_title, msg_term_cwd_reply, parse_surface_pointer_axis2,
 };
 #[cfg(target_os = "linux")]
 use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO};
@@ -9254,15 +9254,44 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 state.delivery_notify.notify_one();
             }
             C2S_SURFACE_POINTER_AXIS if data.len() >= 8 => {
+                // Legacy single-axis scroll. No source, so the compositor
+                // emits no axis_source and the client is left to guess —
+                // the behaviour this opcode always had.
                 let surface_id = u16::from_le_bytes([data[1], data[2]]);
                 let axis = data[3];
-                let value_x100 = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-                let value = value_x100 as f64 / 100.0;
+                let value =
+                    f64::from(i32::from_le_bytes([data[4], data[5], data[6], data[7]])) / 100.0;
+                let (dx, dy) = if axis == 0 {
+                    (0.0, value)
+                } else {
+                    (value, 0.0)
+                };
                 if let Some(cs) = sess.compositor.as_mut() {
                     let _ = cs.handle.command_tx.send(CompositorCommand::PointerAxis {
                         surface_id,
-                        axis,
-                        value,
+                        dx,
+                        dy,
+                        v120_x: 0,
+                        v120_y: 0,
+                        source: None,
+                        stop: false,
+                    });
+                    cs.handle.wake();
+                }
+                state.delivery_notify.notify_one();
+            }
+            C2S_SURFACE_POINTER_AXIS2 if data.len() >= SURFACE_POINTER_AXIS2_LEN => {
+                if let Some(ev) = parse_surface_pointer_axis2(&data)
+                    && let Some(cs) = sess.compositor.as_mut()
+                {
+                    let _ = cs.handle.command_tx.send(CompositorCommand::PointerAxis {
+                        surface_id: ev.surface_id,
+                        dx: ev.dx,
+                        dy: ev.dy,
+                        v120_x: ev.v120_x,
+                        v120_y: ev.v120_y,
+                        source: ev.source,
+                        stop: ev.stop,
                     });
                     cs.handle.wake();
                 }

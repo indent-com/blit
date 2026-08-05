@@ -14,6 +14,7 @@ import {
   buildUnsubscribeMessage,
   buildSearchMessage,
   buildCreate2Message,
+  buildSurfaceAxis2Message,
 } from "../protocol";
 import {
   C2S_ACK,
@@ -30,6 +31,11 @@ import {
   CREATE2_HAS_SRC_PTY,
   CREATE2_HAS_COMMAND,
   CREATE2_HAS_CWD,
+  C2S_SURFACE_POINTER_AXIS2,
+  AXIS_SOURCE_FINGER,
+  AXIS_SOURCE_WHEEL,
+  AXIS_FLAG_SOURCE_KNOWN,
+  AXIS_FLAG_STOP,
 } from "../types";
 
 const textDecoder = new TextDecoder();
@@ -259,5 +265,108 @@ describe("protocol message builders", () => {
       expect(msg[7]).toBe(0); // no command feature
       expect(msg.length).toBe(10);
     });
+  });
+});
+
+/** The Rust side parses these bytes by fixed offset, so the layout is the
+ *  contract — see `parse_surface_pointer_axis2` in crates/remote. */
+describe("buildSurfaceAxis2Message", () => {
+  const read = (msg: Uint8Array) => {
+    const v = new DataView(msg.buffer, msg.byteOffset, msg.byteLength);
+    return {
+      opcode: msg[0],
+      surfaceId: v.getUint16(1, true),
+      flags: msg[3],
+      dxX100: v.getInt32(4, true),
+      dyX100: v.getInt32(8, true),
+      v120x: v.getInt16(12, true),
+      v120y: v.getInt16(14, true),
+    };
+  };
+
+  it("lays the fields out where the server reads them", () => {
+    const msg = buildSurfaceAxis2Message(0x1234, {
+      dx: -1.5,
+      dy: 2.25,
+      v120x: 0,
+      v120y: -240,
+      source: AXIS_SOURCE_FINGER,
+      stop: false,
+    });
+    expect(msg).toHaveLength(16);
+    expect(read(msg)).toEqual({
+      opcode: C2S_SURFACE_POINTER_AXIS2,
+      surfaceId: 0x1234,
+      flags: AXIS_SOURCE_FINGER | AXIS_FLAG_SOURCE_KNOWN,
+      dxX100: -150,
+      dyX100: 225,
+      v120x: 0,
+      v120y: -240,
+    });
+  });
+
+  /** A wheel source is 0, so only the "known" bit separates it from an
+   *  unclassified scroll — get this wrong and every trackpad gesture is
+   *  labelled a wheel. */
+  it("distinguishes a wheel from an unclassified source", () => {
+    const wheel = buildSurfaceAxis2Message(1, {
+      dx: 0,
+      dy: 1,
+      v120x: 0,
+      v120y: 0,
+      source: AXIS_SOURCE_WHEEL,
+      stop: false,
+    });
+    const unknown = buildSurfaceAxis2Message(1, {
+      dx: 0,
+      dy: 1,
+      v120x: 0,
+      v120y: 0,
+      source: null,
+      stop: false,
+    });
+    expect(read(wheel).flags).toBe(AXIS_FLAG_SOURCE_KNOWN);
+    expect(read(unknown).flags).toBe(0);
+  });
+
+  it("marks a stop", () => {
+    const msg = buildSurfaceAxis2Message(1, {
+      dx: 0,
+      dy: 0,
+      v120x: 0,
+      v120y: 0,
+      source: AXIS_SOURCE_FINGER,
+      stop: true,
+    });
+    expect(read(msg).flags).toBe(
+      AXIS_SOURCE_FINGER | AXIS_FLAG_SOURCE_KNOWN | AXIS_FLAG_STOP,
+    );
+  });
+
+  /** A runaway delta must not wrap into a scroll the other direction. */
+  it("clamps rather than wraps out-of-range values", () => {
+    const msg = buildSurfaceAxis2Message(1, {
+      dx: 0,
+      dy: 1e12,
+      v120x: 0,
+      v120y: 1e6,
+      source: AXIS_SOURCE_WHEEL,
+      stop: false,
+    });
+    expect(read(msg).dyX100).toBe(2147483647);
+    expect(read(msg).v120y).toBe(32767);
+  });
+
+  it("survives a non-finite delta", () => {
+    const msg = buildSurfaceAxis2Message(1, {
+      dx: NaN,
+      dy: Infinity,
+      v120x: 0,
+      v120y: 0,
+      source: null,
+      stop: false,
+    });
+    expect(read(msg).dxX100).toBe(0);
+    expect(read(msg).dyX100).toBe(0);
   });
 });

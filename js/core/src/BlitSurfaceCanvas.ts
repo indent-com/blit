@@ -4,6 +4,8 @@ import {
   CODEC_SUPPORT_AV1,
   CODEC_SUPPORT_H264_444,
   CODEC_SUPPORT_AV1_444,
+  AXIS_SOURCE_FINGER,
+  AXIS_SOURCE_WHEEL,
 } from "./types";
 import type { BlitWorkspace } from "./BlitWorkspace";
 import type { BlitConnection } from "./BlitConnection";
@@ -281,6 +283,28 @@ export interface BlitSurfaceCanvasOptions {
   surfaceId: number;
 }
 
+// -- Scroll ----------------------------------------------------------------
+
+const WHEEL_MODE_LINE = 1;
+const WHEEL_MODE_PAGE = 2;
+/** CSS pixels per line when a browser reports a wheel in line mode
+ *  (Firefox does, for notched mice). Matches the default line box. */
+const WHEEL_LINE_PX = 16;
+/** Lines a wheel notch conventionally travels, so line-mode deltas can be
+ *  turned back into `axis_value120` detents. */
+const WHEEL_LINES_PER_DETENT = 3;
+/** CSS pixels per detent for browsers that report notched wheels in pixel
+ *  mode (Chrome and Edge on Windows and Linux). */
+const WHEEL_DETENT_PX = 120;
+/**
+ * Idle gap that ends a scroll sequence.
+ *
+ * Long enough to bridge the frame cadence of a macOS momentum tail so one
+ * flick stays one gesture, short enough that the app settles promptly
+ * once the tail decays.
+ */
+const SCROLL_STOP_MS = 140;
+
 /**
  * Framework-agnostic surface canvas. Manages a `<canvas>` element that renders
  * decoded video frames from a Wayland-like surface, and forwards
@@ -400,6 +424,21 @@ export class BlitSurfaceCanvas {
   } | null = null;
   private _pendingPasteFlush: ((text: string | null) => void) | null = null;
 
+  // scroll batching; see queueScroll()
+  private scrollAccum: {
+    dx: number;
+    dy: number;
+    v120x: number;
+    v120y: number;
+  } | null = null;
+  private scrollFlushHandle: number | null = null;
+  private scrollStopTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Whether the in-flight sequence came from a smooth device. Latched,
+   *  so a momentum tail cannot be reclassified as a wheel mid-gesture. */
+  private scrollSmoothLatch = false;
+  /** Whether a stop still owes the client. */
+  private scrollSequenceOpen = false;
+
   // bound event handlers
   private boundMouseDown: ((e: MouseEvent) => void) | null = null;
   private boundMouseUp: ((e: MouseEvent) => void) | null = null;
@@ -509,6 +548,7 @@ export class BlitSurfaceCanvas {
     }
     this.releaseAllKeys();
     this.releaseAllButtons();
+    this.endScrollSequence();
     this.setDisplaySize(null);
     this.serverUnsubscribe();
     this.detachEvents();
@@ -1040,22 +1080,34 @@ export class BlitSurfaceCanvas {
     conn.sendSurfacePointer(this._surfaceId, type, button, point.x, point.y);
   }
 
-  private surfacePointFromClient(
-    clientX: number,
-    clientY: number,
-  ): { x: number; y: number } | null {
+  /**
+   * Where the frame is actually drawn, in CSS pixels, plus the scale that
+   * takes CSS pixels to surface coordinates.
+   *
+   * In resizable views applyLayout() sizes the CSS box to the drawn frame
+   * exactly, so the letterbox degenerates to dx = dy ≈ 0; views still on
+   * the fill-and-contain default (thumbnails) letterbox the intrinsic
+   * aspect within the box via object-fit: contain.
+   *
+   * Pointer positions and scroll distances both go through this, so a
+   * wheel and a drag move content by the same amount on a letterboxed or
+   * downscaled surface.
+   */
+  private drawnGeometry(): {
+    dx: number;
+    dy: number;
+    dw: number;
+    dh: number;
+    sx: number;
+    sy: number;
+    rect: DOMRect;
+  } | null {
     if (!this.canvas || !this.surface) return null;
     const rect = this.canvas.getBoundingClientRect();
     const cw = this.canvas.width;
     const ch = this.canvas.height;
     if (cw === 0 || ch === 0 || rect.width === 0 || rect.height === 0)
       return null;
-    // In resizable views applyLayout() sizes the CSS box to the drawn
-    // frame exactly, so the letterbox below degenerates to dx = dy ≈ 0;
-    // views still on the fill-and-contain default (thumbnails) letterbox
-    // the intrinsic aspect within the box via object-fit: contain.
-    // Compute the drawn content region in CSS coordinates, then map a
-    // click into surface coordinates.
     const srcAR = cw / ch;
     const dstAR = rect.width / rect.height;
     let dw: number, dh: number, dx: number, dy: number;
@@ -1070,11 +1122,27 @@ export class BlitSurfaceCanvas {
       dx = (rect.width - dw) / 2;
       dy = 0;
     }
-    const px = clientX - rect.left - dx;
-    const py = clientY - rect.top - dy;
+    if (dw === 0 || dh === 0) return null;
     return {
-      x: Math.round((px / dw) * this.surface.width),
-      y: Math.round((py / dh) * this.surface.height),
+      dx,
+      dy,
+      dw,
+      dh,
+      sx: this.surface.width / dw,
+      sy: this.surface.height / dh,
+      rect,
+    };
+  }
+
+  private surfacePointFromClient(
+    clientX: number,
+    clientY: number,
+  ): { x: number; y: number } | null {
+    const g = this.drawnGeometry();
+    if (!g) return null;
+    return {
+      x: Math.round((clientX - g.rect.left - g.dx) * g.sx),
+      y: Math.round((clientY - g.rect.top - g.dy) * g.sy),
     };
   }
 
@@ -1163,12 +1231,18 @@ export class BlitSurfaceCanvas {
     if (active.mode === "drag") {
       this.sendPointerAt(clientX, clientY, SURFACE_POINTER_MOVE, 0);
     } else if (active.mode === "scroll") {
-      const conn = this.getConn();
-      if (!conn || !this.surface || !this._displaySize) return;
-      const axis = Math.abs(dx) > Math.abs(dy) ? 1 : 0;
-      const value = axis === 0 ? -dy : -dx;
-      if (value !== 0) {
-        conn.sendSurfaceAxis(this._surfaceId, axis, Math.round(value * 100));
+      const g = this.drawnGeometry();
+      if (!g) return;
+      // A finger dragging the content up scrolls down, hence the sign.
+      // This genuinely is a finger, so it is never a wheel.
+      if (dx !== 0 || dy !== 0) {
+        this.queueScroll({
+          dx: -dx * g.sx,
+          dy: -dy * g.sy,
+          v120x: 0,
+          v120y: 0,
+          smooth: true,
+        });
       }
     }
   }
@@ -1184,6 +1258,10 @@ export class BlitSurfaceCanvas {
     } else if (active.mode === "pending") {
       this.sendPointerAt(clientX, clientY, SURFACE_POINTER_DOWN, 0);
       this.sendPointerAt(clientX, clientY, SURFACE_POINTER_UP, 0);
+    } else if (active.mode === "scroll") {
+      // The finger left the glass, so the gesture is over now — no need
+      // to wait out the idle timeout the way a wheel has to.
+      this.endScrollSequence();
     }
     this.activeTouch = null;
   }
@@ -1285,17 +1363,170 @@ export class BlitSurfaceCanvas {
     if (active.longPressTimer) clearTimeout(active.longPressTimer);
     if (active.mode === "drag") {
       this.sendPointerAt(active.lastX, active.lastY, SURFACE_POINTER_UP, 0);
+    } else if (active.mode === "scroll") {
+      this.endScrollSequence();
     }
     this.activeTouch = null;
   }
 
+  /**
+   * True when this event looks like it came from a smooth device rather
+   * than a notched wheel.
+   *
+   * macOS is the reason this matters: it applies its own acceleration
+   * curve and appends a momentum tail, and browsers report the result as
+   * ordinary pixel-mode wheel events. Forwarding those unlabelled makes
+   * the Wayland client read them as wheel detents — `axis_source`'s
+   * default value is `wheel` — and scale them up by a lines-per-click
+   * factor on top of the acceleration macOS already applied. That
+   * double-multiply is what makes Mac scrolling feel violent on the
+   * Linux side.
+   */
+  private wheelLooksSmooth(e: WheelEvent): boolean {
+    // Line and page modes only ever describe a notched wheel.
+    if (e.deltaMode !== 0) return false;
+    if (!Number.isInteger(e.deltaX) || !Number.isInteger(e.deltaY)) return true;
+    // A real wheel moves one axis at a time.
+    if (e.deltaX !== 0 && e.deltaY !== 0) return true;
+    const mag = Math.abs(e.deltaX || e.deltaY);
+    return mag === 0 || mag % WHEEL_DETENT_PX !== 0;
+  }
+
   private handleWheel(e: WheelEvent): void {
-    const conn = this.getConn();
-    if (!conn || !this.surface || !this._displaySize) return;
+    // No display size means a thumbnail rather than a live view, and
+    // those take no other input either. Claiming the wheel there would
+    // scroll an app the user is only previewing, and the preventDefault
+    // below would stop the page scrolling under the cursor.
+    if (!this.getConn() || !this.surface || !this._displaySize) return;
+    // Ctrl+wheel is how browsers report a pinch-zoom gesture, including
+    // macOS trackpad pinches. It is a zoom request, not a scroll; sending
+    // it on would scroll the surface while the user pinches.
+    if (e.ctrlKey) return;
+    const g = this.drawnGeometry();
+    if (!g) return;
     e.preventDefault();
-    const axis = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? 1 : 0;
-    const value = axis === 0 ? e.deltaY : e.deltaX;
-    conn.sendSurfaceAxis(this._surfaceId, axis, Math.round(value * 100));
+
+    // Once a sequence shows any sign of being smooth it stays smooth: a
+    // trackpad flick's momentum tail can emit whole-number deltas that
+    // would otherwise be misread as detents mid-gesture. The latch has to
+    // win before the detent maths below, not just when labelling the
+    // source, or a finger-sourced event ends up carrying wheel notches.
+    const smooth = this.wheelLooksSmooth(e) || this.scrollSmoothLatch;
+    let { deltaX, deltaY } = e;
+    let v120x = 0;
+    let v120y = 0;
+
+    if (e.deltaMode === WHEEL_MODE_LINE) {
+      v120x = (deltaX / WHEEL_LINES_PER_DETENT) * 120;
+      v120y = (deltaY / WHEEL_LINES_PER_DETENT) * 120;
+      deltaX *= WHEEL_LINE_PX;
+      deltaY *= WHEEL_LINE_PX;
+    } else if (e.deltaMode === WHEEL_MODE_PAGE) {
+      v120x = deltaX * 120;
+      v120y = deltaY * 120;
+      deltaX *= g.dw;
+      deltaY *= g.dh;
+    } else if (!smooth) {
+      // Pixel-mode wheel: browsers that report notches this way use
+      // 120px per detent.
+      v120x = (deltaX / WHEEL_DETENT_PX) * 120;
+      v120y = (deltaY / WHEEL_DETENT_PX) * 120;
+    }
+
+    this.queueScroll({
+      dx: deltaX * g.sx,
+      dy: deltaY * g.sy,
+      v120x,
+      v120y,
+      smooth,
+    });
+  }
+
+  /**
+   * Add to the pending scroll and arrange for it to be sent.
+   *
+   * Deltas are batched to one message per animation frame. macOS momentum
+   * alone emits events at 60–120Hz for a second or more after the fingers
+   * lift; one message each turns into one `wl_pointer.frame` each, and
+   * network jitter then delivers them in bursts that read as stutter no
+   * matter how correct the magnitudes are.
+   */
+  private queueScroll(part: {
+    dx: number;
+    dy: number;
+    v120x: number;
+    v120y: number;
+    smooth: boolean;
+  }): void {
+    this.scrollSmoothLatch = part.smooth;
+    this.scrollSequenceOpen = true;
+    const a = (this.scrollAccum ??= { dx: 0, dy: 0, v120x: 0, v120y: 0 });
+    a.dx += part.dx;
+    a.dy += part.dy;
+    a.v120x += part.v120x;
+    a.v120y += part.v120y;
+
+    if (this.scrollFlushHandle === null) {
+      this.scrollFlushHandle = requestAnimationFrame(() => {
+        this.scrollFlushHandle = null;
+        this.flushScroll();
+      });
+    }
+    if (this.scrollStopTimer !== null) clearTimeout(this.scrollStopTimer);
+    this.scrollStopTimer = setTimeout(
+      () => this.endScrollSequence(),
+      SCROLL_STOP_MS,
+    );
+  }
+
+  private flushScroll(): void {
+    const a = this.scrollAccum;
+    this.scrollAccum = null;
+    if (!a) return;
+    const conn = this.getConn();
+    if (!conn || !this.surface) return;
+    if (a.dx === 0 && a.dy === 0 && a.v120x === 0 && a.v120y === 0) return;
+    conn.sendSurfaceAxis2(this._surfaceId, {
+      dx: a.dx,
+      dy: a.dy,
+      v120x: a.v120x,
+      v120y: a.v120y,
+      source: this.scrollSmoothLatch ? AXIS_SOURCE_FINGER : AXIS_SOURCE_WHEEL,
+      stop: false,
+    });
+  }
+
+  /**
+   * Tell the client the gesture is over.
+   *
+   * Without this the app never learns a scroll ended, so toolkits that
+   * gate kinetic scrolling on a stop event either keep flinging or never
+   * settle. Claiming a `finger` source obliges us to send it.
+   */
+  private endScrollSequence(): void {
+    if (this.scrollStopTimer !== null) {
+      clearTimeout(this.scrollStopTimer);
+      this.scrollStopTimer = null;
+    }
+    if (this.scrollFlushHandle !== null) {
+      cancelAnimationFrame(this.scrollFlushHandle);
+      this.scrollFlushHandle = null;
+      this.flushScroll();
+    }
+    const wasSmooth = this.scrollSmoothLatch;
+    this.scrollSmoothLatch = false;
+    if (!this.scrollSequenceOpen) return;
+    this.scrollSequenceOpen = false;
+    const conn = this.getConn();
+    if (!conn || !this.surface) return;
+    conn.sendSurfaceAxis2(this._surfaceId, {
+      dx: 0,
+      dy: 0,
+      v120x: 0,
+      v120y: 0,
+      source: wasSmooth ? AXIS_SOURCE_FINGER : AXIS_SOURCE_WHEEL,
+      stop: true,
+    });
   }
 
   // Fallback clipboard-read path for browsers/contexts where

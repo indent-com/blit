@@ -890,13 +890,14 @@ pub enum SurfaceCommand {
 
     /// Scroll a surface
     ///
-    /// AMOUNT is in wheel units; positive scrolls down (or right with
-    /// --horizontal). Fractions are allowed — the wire carries hundredths.
+    /// AMOUNT is in wheel detents — one notch of a physical wheel, which
+    /// is what an app treats as a scroll step. Positive scrolls down (or
+    /// right with --horizontal). Fractions are allowed.
     Scroll {
         /// Surface ID
         id: u16,
 
-        /// Wheel units; positive = down/right
+        /// Wheel detents; positive = down/right
         amount: f64,
 
         /// Scroll horizontally instead of vertically

@@ -121,6 +121,11 @@ pub const C2S_SURFACE_POINTER: u8 = 0x21;
 /// Pointer axis/scroll for a Wayland surface: [0x22][surface_id:2][axis:1][value_x100:4_signed]
 /// axis: 0=vertical, 1=horizontal
 /// value_x100: scroll amount * 100 (signed, positive = down/right)
+///
+/// Superseded by [`C2S_SURFACE_POINTER_AXIS2`], which carries the device
+/// source and discrete-detent count the Wayland protocol wants.  Kept for
+/// older clients; the server maps it onto the same path with an unknown
+/// source, so no `wl_pointer.axis_source` is emitted.
 pub const C2S_SURFACE_POINTER_AXIS: u8 = 0x22;
 /// Resize a Wayland surface: [0x23][surface_id:2][width:2][height:2][scale_120:2]
 /// scale_120: device pixel ratio in 1/120th units (120 = 1×, 240 = 2×).
@@ -333,6 +338,44 @@ pub const S2C_CLIPBOARD_LIST: u8 = 0x2C;
 pub const C2S_AUDIO_SUBSCRIBE: u8 = 0x30;
 /// Unsubscribe from audio: [0x31]
 pub const C2S_AUDIO_UNSUBSCRIBE: u8 = 0x31;
+
+// -- Pointer axis v2 ----------------------------------------------------
+
+/// Pointer axis/scroll for a Wayland surface, both axes in one event:
+/// [0x32][surface_id:2][flags:1][dx_x100:4_signed][dy_x100:4_signed][v120_x:2_signed][v120_y:2_signed]
+///
+/// `dx`/`dy` are the smooth scroll distance × 100, positive = right/down,
+/// in the composited frame's pixel space — the same coordinate space
+/// `C2S_SURFACE_POINTER` uses, which the compositor converts to
+/// surface-logical pixels on the way in. `wl_pointer.axis` requires
+/// exactly that: "a coordinate space identical to those of motion events".
+/// Keeping both in frame space means the client never has to guess the
+/// scale the compositor settled on.
+///
+/// `v120_x`/`v120_y` are discrete wheel travel in 120ths of a detent, the
+/// `wl_pointer.axis_value120` convention: 120 = one notch. Zero for
+/// devices without detents.
+///
+/// flags bits 0-1: source, matching `wl_pointer.axis_source` — 0 = wheel,
+/// 1 = finger, 2 = continuous, 3 = wheel tilt.
+/// flags bit 2: source is known. When clear, the other source bits are
+/// ignored and no `axis_source` is emitted (what [`C2S_SURFACE_POINTER_AXIS`]
+/// does).
+/// flags bit 3: stop — the scroll sequence ended. Sent with zero deltas;
+/// becomes `wl_pointer.axis_stop`.
+pub const C2S_SURFACE_POINTER_AXIS2: u8 = 0x32;
+
+/// `wl_pointer.axis_source` values, as carried in the low bits of the
+/// [`C2S_SURFACE_POINTER_AXIS2`] flags byte.
+pub const AXIS_SOURCE_WHEEL: u8 = 0;
+pub const AXIS_SOURCE_FINGER: u8 = 1;
+pub const AXIS_SOURCE_CONTINUOUS: u8 = 2;
+pub const AXIS_SOURCE_WHEEL_TILT: u8 = 3;
+
+/// Set when the source bits are meaningful.
+pub const AXIS_FLAG_SOURCE_KNOWN: u8 = 1 << 2;
+/// Set when this event ends a scroll sequence.
+pub const AXIS_FLAG_STOP: u8 = 1 << 3;
 /// An encoded audio frame (Opus) from the compositor's mixed output:
 /// [0x30][timestamp:4][flags:1][data:N]
 /// timestamp: sample offset in 48 kHz ticks from an arbitrary epoch.
@@ -2491,6 +2534,74 @@ pub fn msg_surface_pointer_axis(surface_id: u16, axis: u8, value_x100: i32) -> V
     msg
 }
 
+/// A scroll event as it travels the wire and reaches the compositor.
+///
+/// Distances are in surface-logical pixels; `v120_*` counts detents in
+/// 120ths. `source` is `None` when the sender did not classify the device,
+/// in which case no `wl_pointer.axis_source` is emitted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointerAxisEvent {
+    pub surface_id: u16,
+    pub dx: f64,
+    pub dy: f64,
+    pub v120_x: i16,
+    pub v120_y: i16,
+    pub source: Option<u8>,
+    pub stop: bool,
+}
+
+/// Wire size of a [`C2S_SURFACE_POINTER_AXIS2`] message.
+pub const SURFACE_POINTER_AXIS2_LEN: usize = 16;
+
+pub fn msg_surface_pointer_axis2(ev: &PointerAxisEvent) -> Vec<u8> {
+    let mut flags = match ev.source {
+        Some(src) => (src & 0b11) | AXIS_FLAG_SOURCE_KNOWN,
+        None => 0,
+    };
+    if ev.stop {
+        flags |= AXIS_FLAG_STOP;
+    }
+    let mut msg = Vec::with_capacity(SURFACE_POINTER_AXIS2_LEN);
+    msg.push(C2S_SURFACE_POINTER_AXIS2);
+    msg.extend_from_slice(&ev.surface_id.to_le_bytes());
+    msg.push(flags);
+    msg.extend_from_slice(&scroll_to_x100(ev.dx).to_le_bytes());
+    msg.extend_from_slice(&scroll_to_x100(ev.dy).to_le_bytes());
+    msg.extend_from_slice(&ev.v120_x.to_le_bytes());
+    msg.extend_from_slice(&ev.v120_y.to_le_bytes());
+    msg
+}
+
+/// Saturating conversion to the wire's hundredths, so a NaN or absurd
+/// delta from a misbehaving client cannot wrap into a scroll the other
+/// direction.
+fn scroll_to_x100(v: f64) -> i32 {
+    if v.is_nan() {
+        return 0;
+    }
+    (v * 100.0)
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+/// Parse a [`C2S_SURFACE_POINTER_AXIS2`] payload. `data` includes the
+/// opcode byte. Returns `None` if the message is truncated.
+pub fn parse_surface_pointer_axis2(data: &[u8]) -> Option<PointerAxisEvent> {
+    if data.len() < SURFACE_POINTER_AXIS2_LEN {
+        return None;
+    }
+    let flags = data[3];
+    Some(PointerAxisEvent {
+        surface_id: u16::from_le_bytes([data[1], data[2]]),
+        dx: f64::from(i32::from_le_bytes([data[4], data[5], data[6], data[7]])) / 100.0,
+        dy: f64::from(i32::from_le_bytes([data[8], data[9], data[10], data[11]])) / 100.0,
+        v120_x: i16::from_le_bytes([data[12], data[13]]),
+        v120_y: i16::from_le_bytes([data[14], data[15]]),
+        source: (flags & AXIS_FLAG_SOURCE_KNOWN != 0).then_some(flags & 0b11),
+        stop: flags & AXIS_FLAG_STOP != 0,
+    })
+}
+
 /// `scale_120` is the device-pixel-ratio in 1/120th units, matching
 /// Wayland's `fractional_scale_v1` convention: 120 = 1×, 180 = 1.5×,
 /// 240 = 2×.  A value of 0 means "unspecified" (server defaults to 1×).
@@ -3206,6 +3317,93 @@ fn push_wrapped_word(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_axis2_round_trips() {
+        let ev = PointerAxisEvent {
+            surface_id: 9,
+            dx: -12.34,
+            dy: 56.78,
+            v120_x: 0,
+            v120_y: -240,
+            source: Some(AXIS_SOURCE_WHEEL),
+            stop: false,
+        };
+        let msg = msg_surface_pointer_axis2(&ev);
+        assert_eq!(msg.len(), SURFACE_POINTER_AXIS2_LEN);
+        assert_eq!(msg[0], C2S_SURFACE_POINTER_AXIS2);
+        assert_eq!(parse_surface_pointer_axis2(&msg), Some(ev));
+    }
+
+    /// A wheel source is 0, so it only survives the round trip because the
+    /// "source known" bit is separate — the bug this bit exists to prevent.
+    #[test]
+    fn pointer_axis2_distinguishes_wheel_from_unknown_source() {
+        let mk = |source| PointerAxisEvent {
+            surface_id: 1,
+            dx: 0.0,
+            dy: 1.0,
+            v120_x: 0,
+            v120_y: 0,
+            source,
+            stop: false,
+        };
+        let wheel =
+            parse_surface_pointer_axis2(&msg_surface_pointer_axis2(&mk(Some(AXIS_SOURCE_WHEEL))))
+                .unwrap();
+        let unknown = parse_surface_pointer_axis2(&msg_surface_pointer_axis2(&mk(None))).unwrap();
+        assert_eq!(wheel.source, Some(AXIS_SOURCE_WHEEL));
+        assert_eq!(unknown.source, None);
+    }
+
+    #[test]
+    fn pointer_axis2_carries_a_stop_with_no_deltas() {
+        let ev = PointerAxisEvent {
+            surface_id: 3,
+            dx: 0.0,
+            dy: 0.0,
+            v120_x: 0,
+            v120_y: 0,
+            source: Some(AXIS_SOURCE_FINGER),
+            stop: true,
+        };
+        let parsed = parse_surface_pointer_axis2(&msg_surface_pointer_axis2(&ev)).unwrap();
+        assert!(parsed.stop);
+        assert_eq!(parsed.source, Some(AXIS_SOURCE_FINGER));
+    }
+
+    #[test]
+    fn pointer_axis2_rejects_a_truncated_message() {
+        let msg = msg_surface_pointer_axis2(&PointerAxisEvent {
+            surface_id: 1,
+            dx: 1.0,
+            dy: 1.0,
+            v120_x: 0,
+            v120_y: 0,
+            source: None,
+            stop: false,
+        });
+        assert!(parse_surface_pointer_axis2(&msg[..msg.len() - 1]).is_none());
+    }
+
+    /// A NaN or overflowing delta must not wrap into a scroll the other
+    /// direction.
+    #[test]
+    fn pointer_axis2_saturates_absurd_deltas() {
+        let mk = |dy| PointerAxisEvent {
+            surface_id: 1,
+            dx: 0.0,
+            dy,
+            v120_x: 0,
+            v120_y: 0,
+            source: None,
+            stop: false,
+        };
+        let huge = parse_surface_pointer_axis2(&msg_surface_pointer_axis2(&mk(1e18))).unwrap();
+        assert!(huge.dy > 0.0, "positive delta stayed positive");
+        let nan = parse_surface_pointer_axis2(&msg_surface_pointer_axis2(&mk(f64::NAN))).unwrap();
+        assert_eq!(nan.dy, 0.0);
+    }
 
     /// `[opcode][surface_id:2][keycode:4][pressed:1]`, as the server decodes
     /// it and `buildSurfaceInputMessage` writes it.

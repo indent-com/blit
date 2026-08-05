@@ -22,6 +22,9 @@ import {
   C2S_SURFACE_INPUT,
   C2S_SURFACE_POINTER,
   C2S_SURFACE_POINTER_AXIS,
+  C2S_SURFACE_POINTER_AXIS2,
+  AXIS_FLAG_SOURCE_KNOWN,
+  AXIS_FLAG_STOP,
   C2S_SURFACE_RESIZE,
   C2S_SURFACE_FOCUS,
   C2S_SURFACE_SUBSCRIBE,
@@ -421,6 +424,54 @@ export function buildSurfaceAxisMessage(
   msg[3] = axis;
   const v = new DataView(msg.buffer);
   v.setInt32(4, valueX100, true);
+  return msg;
+}
+
+/** One scroll event: both axes, the device that produced it, and whether
+ *  the gesture has ended. */
+export interface SurfaceAxisEvent {
+  /** Horizontal distance in composited-frame pixels, positive = right. */
+  dx: number;
+  /** Vertical distance in composited-frame pixels, positive = down. */
+  dy: number;
+  /** Horizontal wheel travel in 120ths of a detent. */
+  v120x: number;
+  /** Vertical wheel travel in 120ths of a detent. */
+  v120y: number;
+  /** An AXIS_SOURCE_* value, or null when the device is unclassified. */
+  source: number | null;
+  /** True when this ends the scroll sequence; deltas are ignored. */
+  stop: boolean;
+}
+
+/** Clamp to the wire's signed range so a runaway delta cannot wrap into a
+ *  scroll the other direction. */
+function clampI32(v: number): number {
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(-2147483648, Math.min(2147483647, Math.round(v)));
+}
+
+function clampI16(v: number): number {
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(-32768, Math.min(32767, Math.round(v)));
+}
+
+export function buildSurfaceAxis2Message(
+  surfaceId: number,
+  ev: SurfaceAxisEvent,
+): Uint8Array {
+  const msg = new Uint8Array(16);
+  msg[0] = C2S_SURFACE_POINTER_AXIS2;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  msg[3] =
+    (ev.source === null ? 0 : (ev.source & 0b11) | AXIS_FLAG_SOURCE_KNOWN) |
+    (ev.stop ? AXIS_FLAG_STOP : 0);
+  const v = new DataView(msg.buffer);
+  v.setInt32(4, clampI32(ev.dx * 100), true);
+  v.setInt32(8, clampI32(ev.dy * 100), true);
+  v.setInt16(12, clampI16(ev.v120x), true);
+  v.setInt16(14, clampI16(ev.v120y), true);
   return msg;
 }
 
