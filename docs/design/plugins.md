@@ -113,22 +113,14 @@ be processes attached to PTYs.
 ## Architecture
 
 ```text
-                         ┌──────────────────────────────┐
-network client ─frames─> │ transport decoder           │
-                         └──────────────┬───────────────┘
-                                        │ packet
-Wasmi plugin ─host send/receive─────┤
-                                        ▼
-                         ┌──────────────────────────────┐
-                         │ logical client endpoint      │
-                         │ identity, authority, outbox  │
-                         └──────────────┬───────────────┘
-                                        ▼
-                         ┌──────────────────────────────┐
-                         │ shared packet dispatcher     │
-                         └───────┬──────────┬───────────┘
-                                 │          │
-             terminal/fs/git/lsp/...  channel/state/topic/process fabric
+network client --frames--> [transport decoder] --packet--+
+                                                          +--> [logical client endpoint]
+Wasmi plugin --host send/recv-----------------------------+     identity / authority / outbox
+                                                                       |
+                                                                       v
+                                                       [shared packet dispatcher]
+                                                           /                 \
+                                           terminal/fs/git/lsp/...   channel/state/topic/process
 ```
 
 The current connection loop combines transport reading, client lifecycle,
@@ -208,6 +200,14 @@ their opcode.
 
 This authorization should apply to network clients as well. Plugins make
 the need visible but do not justify a Wasm-only policy layer.
+
+Central authorization is a prerequisite for enabling plugins, not a later
+hardening pass. The endpoint refactor must check `Principal` and
+`CapabilitySet` before every family handler for both network and in-process
+origins. Existing administrative operations are included: for example,
+`C2S_QUIT` must require an explicit server-shutdown capability instead of
+remaining available to any connected network client. The default remote-client
+policy does not grant administrative capabilities.
 
 ## Lifecycle model
 
@@ -310,10 +310,10 @@ queued, no second packet is admitted. Thus the normal queued-byte limit stays
 
 No separate argument, logging, timer, process, or capability-discovery imports
 are needed. After the normal `HELLO` / `LIST` / `READY` handshake, the host
-sends a `PLUGIN_INIT` packet containing plugin, attempt, task identity, and
-arguments. Guest logs and structured output are `PLUGIN_EVENT` packets.
-Timers, child processes, and other facilities can be ordinary protocol
-operations when required.
+sends `PLUGIN_INFO(INIT)` containing plugin, attempt, task identity, and
+arguments. Guest logs and structured output are `PLUGIN_EVENT` packets. Timers,
+child processes, and other facilities can be ordinary protocol operations when
+required.
 
 ### Optional WASI
 
@@ -470,7 +470,7 @@ variables.
 `PLUGIN_RUN` is the cache probe. A hit creates the plugin without
 another request. A miss returns `NEED_OBJECT` and records a bounded pending
 plugin. The miss is encoded as
-`PLUGIN_RUN_STATUS(status = OK, phase = NEED_OBJECT)`; `NEED_OBJECT` is a run
+`PLUGIN_STATUS(status = OK, phase = NEED_OBJECT)`; `NEED_OBJECT` is a run
 phase, not a status code. The client uploads chunks and does not resend
 `PLUGIN_RUN` after a successful final chunk; the server creates and starts the
 pending plugin automatically.
@@ -482,7 +482,9 @@ object has committed receives `ALREADY_HAVE` and stops sending. While another
 upload is still in progress, a second `BEGIN` receives `CONFLICT`; its pending
 run waits for the owner rather than uploading duplicate bytes. If the owner
 fails or expires, waiting runs receive a fresh `NEED_OBJECT` update and may
-compete to become the next uploader. Pending plugins and partial uploads
+compete to become the next uploader. That update is
+`PLUGIN_INFO(STATUS, phase = NEED_OBJECT)`, keyed by `plugin_id`, rather than a
+second reply to the original run nonce. Pending plugins and partial uploads
 expire.
 
 ## Plugin wire family
@@ -534,10 +536,9 @@ default module limit is 16 MiB; clients should use 1 MiB chunks.
 | 8     | `REMOVE`  | Durably remove a disabled persistent definition and retained events |
 | 9     | `LIST`    | List visible plugins; requires `plugin_id = 0`                      |
 
-Every control other than `LIST` receives a `PLUGIN_RUN_STATUS` carrying
-the request nonce. `LIST` receives the control-family list reply below. A CLI
-name is resolved through `LIST`; wire control continues to use unambiguous
-64-bit IDs.
+Every control other than `LIST` receives one `PLUGIN_STATUS` carrying the
+request nonce. `LIST` receives `PLUGIN_INFO(LIST)` below. A CLI name is resolved
+through `LIST`; wire control continues to use unambiguous 64-bit IDs.
 
 `PLUGIN_EVENT.kind` reserves 1 for stdout bytes, 2 for stderr bytes, and
 3 for a UTF-8 log record. These are convenience event streams, not terminals.
@@ -547,18 +548,19 @@ Structured application communication should use channels, state, or topics.
 
 | Opcode | Name                | Layout                                                                                                                         |
 | ------ | ------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `0x90` | `PLUGIN_RUN_STATUS` | `[nonce:2][status:1][phase:1][flags:1][restart:1][plugin_id:8][attempt:8][task_id:4][next_start_unix_ms:8][hash:32][detail:N]` |
+| `0x90` | `PLUGIN_STATUS`     | `[nonce:2][status:1][phase:1][flags:1][restart:1][plugin_id:8][attempt:8][task_id:4][next_start_unix_ms:8][hash:32][detail:N]` |
 | `0x91` | `PLUGIN_PUT_STATUS` | `[nonce:2][status:1][hash:32][received:8][detail:N]`                                                                           |
-| `0x92` | `PLUGIN_CONTROL`    | `[kind:1][body...]`                                                                                                            |
+| `0x92` | `PLUGIN_INFO`       | `[kind:1][body...]`                                                                                                            |
 | `0x93` | `PLUGIN_EVENT`      | `[plugin_id:8][attempt:8][task_id:4][sequence:8][kind:1][data:N]`                                                              |
 | `0x94` | `PLUGIN_EXIT`       | `[plugin_id:8][attempt:8][task_id:4][reason:1][code:4][next_start_unix_ms:8][detail:N]`                                        |
 
-Server `PLUGIN_CONTROL.kind` values:
+Server `PLUGIN_INFO.kind` values:
 
-| Kind | Name   | Body                                                                            |
-| ---- | ------ | ------------------------------------------------------------------------------- |
-| 1    | `INIT` | `[plugin_id:8][attempt:8][task_id:4][flags:1][argc:2] repeated{[len:4][arg:N]}` |
-| 2    | `LIST` | `[nonce:2][status:1][count:2] repeated{plugin_record}`                          |
+| Kind | Name     | Body                                                                                                        |
+| ---- | -------- | ----------------------------------------------------------------------------------------------------------- |
+| 1    | `INIT`   | `[plugin_id:8][attempt:8][task_id:4][flags:1][argc:2] repeated{[len:4][arg:N]}`                             |
+| 2    | `LIST`   | `[nonce:2][status:1][count:2] repeated{plugin_record}`                                                      |
+| 3    | `STATUS` | `[plugin_id:8][phase:1][flags:1][restart:1][attempt:8][task_id:4][next_start_unix_ms:8][hash:32][detail:N]` |
 
 A `plugin_record` is:
 
@@ -567,8 +569,20 @@ A `plugin_record` is:
 [next_start_unix_ms:8][hash:32][name_len:2][name:N]
 ```
 
-`INIT` is injected only into the plugin's in-process endpoint after
-`READY`; a network client never receives it merely by attaching.
+`PLUGIN_INFO(INIT)` is injected only into the plugin's in-process endpoint
+after `READY`; a network client never receives it merely by attaching.
+
+`PLUGIN_RUN` receives exactly one nonce-correlated `PLUGIN_STATUS`, which
+allocates and returns `plugin_id` even on a cache miss. That reply releases the
+16-bit nonce. Later validation, queue, attempt, backoff, and stop transitions
+are uncorrelated `PLUGIN_INFO(STATUS)` events keyed by `plugin_id`; attached
+clients follow the ID and do not keep the original run nonce reserved. Each
+non-`LIST` `PLUGIN_CONTROL` likewise receives exactly one `PLUGIN_STATUS`
+snapshot with its own request nonce, after which later changes are ID-keyed
+events. `PLUGIN_PUT` nonces live for one chunk acknowledgement, and the `LIST`
+nonce lives through its single `PLUGIN_INFO(LIST)` reply. On a given endpoint,
+the correlated reply is enqueued before any `PLUGIN_INFO` or `PLUGIN_EXIT`
+caused by that request.
 
 Run phases:
 
@@ -604,16 +618,16 @@ or sending `CANCEL` stops the supervisor, suppresses any pending restart, and
 cancels its current attempt. Ctrl-C in `blit run` sends `CANCEL`, waits a
 short grace period for `PLUGIN_EXIT`, and then closes.
 
-With `DETACH`, `PLUGIN_RUN_STATUS(RUNNING)` is sufficient for the command
-to return successfully. The plugin remains server-owned until its policy
-stops it, it is explicitly cancelled, or the server exits. Its event log is a
-bounded byte ring across attempts, so a later `ATTACH` receives a retained
-suffix followed by live events. Detached attempts still end at their
-configured deadline. The version-1 default is a five-minute wall-clock
-deadline for attached attempts and no wall-clock deadline for detached or
-persistent attempts. A manifest or server policy may impose a finite detached
-deadline; detaching never removes fuel, memory, process, mailbox, capability,
-or cancellation limits.
+With `DETACH`, phase `RUNNING` in either the correlated `PLUGIN_STATUS` or a
+later `PLUGIN_INFO(STATUS)` is sufficient for the command to return
+successfully. The plugin remains server-owned until its policy stops it, it is
+explicitly cancelled, or the server exits. Its event log is a bounded byte
+ring across attempts, so a later `ATTACH` receives a retained suffix followed
+by live events. Detached attempts still end at their configured deadline. The
+version-1 default is a five-minute wall-clock deadline for attached attempts
+and no wall-clock deadline for detached or persistent attempts. A manifest or
+server policy may impose a finite detached deadline; detaching never removes
+fuel, memory, process, mailbox, capability, or cancellation limits.
 
 Every attempt has a 32-bit process-local `task_id`. Task IDs are not durable;
 `plugin_id` and `attempt` are the stable coordinates followed by clients.
@@ -688,6 +702,16 @@ Names are UTF-8, non-empty, at most 255 bytes, contain no control or NUL
 characters, and are process-global. They are compared byte-for-byte without
 Unicode normalization; clients should therefore use ASCII reverse DNS names
 such as `com.example.builder`. Metadata and payloads are opaque bytes.
+
+`LISTEN` authorization is checked against the exact name or a policy-approved
+namespace before consulting or claiming the registry. This applies equally to
+network clients and plugins: possession of a broad client connection, or a
+manifest request for `channel.listen`, does not grant every process-global
+name. An unauthorized listen receives `PERMISSION`; a second authorized
+listener for an occupied name receives `CONFLICT`. `CONNECT` has its own
+per-name policy check. First-listener ownership is routing state, never proof of
+identity; peers authenticate the server-supplied `peer` identity instead of the
+channel name.
 
 ### Bidirectional channels (`0x95`)
 
@@ -770,6 +794,11 @@ watchers before its `STATE_DONE` acknowledgement under the registry's mutation
 order. State lifetime is tied to its creating endpoint in the first version;
 durable state remains KV's job.
 
+Version 1 has no separate one-shot read operation. A reader opens with `WATCH`,
+receives the initial `STATE_VALUE`, and then sends `CLOSE`. An open with neither
+`WATCH` nor `WRITE` is `INVALID`; `CREATE` does not make an otherwise inert
+handle valid.
+
 `TOPIC_SUBSCRIBE.flags`: bit 0 `LIVE_ONLY`. Topics are created implicitly by
 their first authorized publisher or subscriber. Each topic retains a bounded
 event suffix by count and bytes. `after_sequence` requests replay after a
@@ -815,7 +844,10 @@ paths on Windows. Stream payloads are unrestricted bytes.
 `PROCESS_SPAWN` executes `argv[0]` directly. It never invokes a shell;
 clients which want shell parsing must explicitly run a policy-allowed shell
 with an argument such as `-c`. `argc` must be non-zero. Argument count and
-combined bytes use the same caps as plugin arguments.
+combined bytes use the same caps as plugin arguments. `envc` is capped at 256,
+each environment key at 255 bytes, each value at 64 KiB, and combined key and
+value bytes at 1 MiB. Duplicate keys are `INVALID`; server policy may lower any
+of these caps.
 
 Spawn flags are bit 0 `MERGE_STDERR` and bit 1 `CLEAR_ENV`. By default the
 child receives a small policy-defined baseline such as `PATH`, locale, and a
@@ -828,10 +860,16 @@ replace baseline entries after policy validation.
 `cwd`, and 2 for the current directory of `src_pty_id`. Fields unused by the
 selected kind must be empty or zero. Resolving a terminal directory happens
 atomically during spawn and does not attach the new process to that terminal.
+For `cwd_kind = 2`, an unknown terminal or one without a current directory,
+including an exited terminal, refuses the spawn with
+`PROCESS_STARTED(status = NOT_FOUND)` and zero windows. The server must not
+fall back to its default directory or interpret the empty relative path as an
+absolute root.
 
 `PROCESS_ACK.stream` is 1 for stdout and 2 for stderr. It acknowledges total
 payload bytes delivered to the application, not merely received by a socket.
-When stderr is merged, the server sends it as stdout and rejects stderr ACKs.
+When stderr is merged, `PROCESS_STARTED.stderr_window` is zero, the server sends
+merged bytes only as `PROCESS_STDOUT`, and it rejects stderr ACKs.
 
 Control actions are:
 
@@ -968,6 +1006,14 @@ The in-process endpoint's principal records its invoking principal, module
 hash, plugin ID, attempt, task ID, and detached/persistent ownership.
 Channels expose a safe form of this identity to peers.
 
+Network endpoints use the same `Principal` and `CapabilitySet` types and the
+same authorization calls. Policy may scope capabilities by operation and
+resource—for example channel-name pattern, filesystem root, durable plugin
+name, module hash, or executable path. Denials use the family reply when one
+exists and otherwise follow the family's documented denial behavior without
+executing the operation. Authorization failure must never fall through to a
+privileged handler.
+
 ## Resource limits and failure isolation
 
 Defaults are policy, not ABI, but the first implementation should enforce:
@@ -987,6 +1033,7 @@ Defaults are policy, not ABI, but the first implementation should enforce:
 | Persistent definitions         | 128               |
 | Open endpoint resources        | 64                |
 | Concurrent child processes     | 8 per endpoint    |
+| Process environment            | 256 entries/1 MiB |
 | Mailbox byte window, each      | 4 MiB             |
 | Mailbox absolute bound, each   | 16 MiB            |
 | Process stream window          | 1 MiB each        |
@@ -1033,6 +1080,12 @@ The CLI:
 5. streams attached stdout/stderr/log events without allocating a PTY;
 6. exits with the module code for `RETURNED`, or non-zero for other reasons.
 
+`PLUGIN_EXIT` and `--json` preserve the full signed `i32` module code. The CLI
+passes a returned code to the native process-exit API, whose observable range
+is platform-specific; Unix shells see only the low eight bits (`0` through
+`255`). Callers which need the full value must consume the structured event
+rather than the CLI process status.
+
 `--restart` accepts `never` (the default), `on-failure`, or `always`.
 `--persist` requires `--name`, implies `--detach`, and stores desired state for
 future blit server processes. `--json` emits supervisor, attempt, and event
@@ -1061,6 +1114,15 @@ diagnostics. Servers and peers see the manifest name and content hash.
 Clients check feature bits 11, 12, and 13 before sending these families. Older
 clients ignore their S2C opcodes. Older servers do not advertise them, and
 `blit run` reports an upgrade requirement rather than attempting an upload.
+
+Kind-multiplexed envelopes have an explicit skip rule. Clients ignore an
+unknown S2C kind under `PLUGIN_INFO`, `0x95`, or `0x96` as one complete packet.
+Servers likewise ignore one complete packet with an unknown C2S kind under
+`0x95` or `0x96`; it is not a connection-level protocol violation and changes
+no handle state. A new C2S request kind which requires a reply must have a new
+feature bit or other explicit negotiation, so a client never waits on a server
+which can only skip it. A malformed payload for a known kind remains `INVALID`
+or a family-local protocol violation as specified by that family.
 
 Gateways, mux, proxy, WebRTC, WebSocket, and WebTransport forward the new
 packets unchanged. Only the upstream blit server interprets them. The Wasm host
@@ -1132,32 +1194,40 @@ two modes implicitly.
    Tokio workers and currently unnamed explicit threads, and test sanitizing,
    compaction, and stable ID suffixes.
 2. **Packet endpoint refactor.** Extract logical client creation, packet
-   dispatch, bounded outbox, authorization hooks, and common disconnect.
-3. **Native channels.** Implement the `0x95` channel registry, flow control,
+   dispatch, bounded outbox, identity propagation, and common disconnect.
+3. **Principals and authorization.** Introduce the shared `Principal` and
+   `CapabilitySet` for network and in-process endpoints; gate every dispatch
+   path before handler entry; add operation- and resource-scoped policy; and
+   protect existing administrative packets including `C2S_QUIT`. Ship denial,
+   network/plugin parity, name-squatting, and privilege-escalation tests before
+   enabling module execution.
+4. **Native channels.** Implement the `0x95` channel registry, flow control,
    identity, cleanup, codecs, and CLI protocol tests.
-4. **State and topics.** Implement `0x96`, snapshot-before-live ordering,
+5. **State and topics.** Implement `0x96`, snapshot-before-live ordering,
    revision CAS, bounded retention, coalescing, and gap tests.
-5. **Processes.** Implement the `0xC0` through `0xC5` process family,
+6. **Processes.** Implement the `0xC0` through `0xC5` process family,
    per-stream flow control, concurrent pipe draining, process-tree cleanup,
    policy enforcement, codecs, and protocol tests from a network client.
-6. **Plugin objects.** Implement BLAKE3 run probe, chunk upload,
+7. **Plugin objects.** Implement BLAKE3 run probe, chunk upload,
    validation, persistent CAS, pending-run single-flight, and cache limits.
-7. **Supervisor.** Add stable plugin/attempt identity, restart policy,
+8. **Supervisor.** Add stable plugin/attempt identity, restart policy,
    backoff, durable desired state, startup restoration, and crash-safe control.
-8. **Wasmi host.** Add one named thread per running plugin attempt, bounded
+9. **Wasmi host.** Add one named thread per running plugin attempt, bounded
    endpoint queues, store/fuel limits, cancellation, attempt lifecycle, and
    event retention.
-9. **Rust SDK and CLI.** Add `blit-guest`, a Rust example plugin, `blit run`,
-   process wrappers, and plugin control commands.
+10. **Rust SDK and CLI.** Add `blit-guest`, a Rust example plugin, `blit run`,
+    process wrappers, and plugin control commands.
 
 Each phase has a vertical protocol test with at least two logical clients.
 The plugin phases additionally verify cache hit (no upload), cache miss,
-hash mismatch, invalid imports, fuel exhaustion, cancellation, cleanup after a
-trap, restart policy, backoff persistence, crash-safe disable, and restoration
-after a fresh server process. Process tests additionally cover binary output,
-independent stdout/stderr ordering, backpressure, stdin EOF, spawn failure,
-signals where supported, output limits, and process-tree cleanup on endpoint
-loss.
+nonce release before later ID-keyed status changes, hash mismatch, invalid
+imports, fuel exhaustion, cancellation, cleanup after a trap, restart policy,
+backoff persistence, crash-safe disable, and restoration after a fresh server
+process. Multiplexed-family tests send unknown kinds in both directions.
+Process tests additionally cover binary output, independent stdout/stderr
+ordering, backpressure, stdin EOF, missing `cwd_kind = 2` context, merged-stderr
+window negotiation, spawn failure, signals where supported, output limits, and
+process-tree cleanup on endpoint loss.
 
 ## Open questions
 
