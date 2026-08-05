@@ -649,11 +649,32 @@ impl FrameState {
     /// Replace the frame's hyperlink state wholesale. `cell_links` is accepted
     /// only at exactly one entry per cell; anything else is treated as "no
     /// links" rather than silently mapping links onto the wrong cells.
+    ///
+    /// A URI longer than [`MAX_LINK_URI`] is dropped, along with the cells
+    /// referencing it. This is the single chokepoint every producer passes
+    /// through — the PTY collector, the wire decoder, and any caller building a
+    /// `FrameState` by hand — so enforcing the cap here is what makes it an
+    /// invariant of the type rather than a convention each producer repeats.
     pub fn set_links(&mut self, cell_links: Vec<u16>, link_uris: BTreeMap<u16, String>) {
         let total = self.rows as usize * self.cols as usize;
         if link_uris.is_empty() || cell_links.len() != total {
             self.clear_links();
             return;
+        }
+        let (mut cell_links, mut link_uris) = (cell_links, link_uris);
+        // Checked over the URI table (a handful of entries) rather than the
+        // cell grid, so the overwhelmingly common clean case costs nothing.
+        if link_uris.values().any(|uri| uri.len() > MAX_LINK_URI) {
+            link_uris.retain(|_, uri| uri.len() <= MAX_LINK_URI);
+            if link_uris.is_empty() {
+                self.clear_links();
+                return;
+            }
+            for slot in cell_links.iter_mut() {
+                if *slot != 0 && !link_uris.contains_key(slot) {
+                    *slot = 0;
+                }
+            }
         }
         self.cell_links = cell_links;
         self.link_uris = link_uris;
@@ -3123,14 +3144,25 @@ fn append_links_section(out: &mut Vec<u8>, current: &FrameState, changed: bool) 
         out.extend_from_slice(&LINKS_UNCHANGED.to_le_bytes());
         return;
     }
-    let uri_count = current.link_uris.len().min(MAX_LINK_ID as usize);
+    // Skip an over-long URI rather than clamping it: a truncated URI is a
+    // *different* URI, and a cut landing mid-codepoint would additionally make
+    // the receiver's behaviour depend on where the bytes happened to split.
+    // `set_links` already refuses them, so this is belt-and-braces on a field
+    // whose whole purpose is to say where a click goes. Runs naming a skipped
+    // id are ignored by the decoder, which drops runs with an unknown id.
+    let emitted: Vec<(&u16, &String)> = current
+        .link_uris
+        .iter()
+        .filter(|(_, uri)| uri.len() <= MAX_LINK_URI)
+        .take(MAX_LINK_ID as usize)
+        .collect();
+    let uri_count = emitted.len();
     out.extend_from_slice(&(uri_count as u16).to_le_bytes());
-    for (&id, uri) in current.link_uris.iter().take(uri_count) {
+    for (&id, uri) in emitted {
         let bytes = uri.as_bytes();
-        let len = bytes.len().min(MAX_LINK_URI);
         out.extend_from_slice(&id.to_le_bytes());
-        out.extend_from_slice(&(len as u16).to_le_bytes());
-        out.extend_from_slice(&bytes[..len]);
+        out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(bytes);
     }
     if uri_count == 0 {
         out.extend_from_slice(&0u16.to_le_bytes());
@@ -3742,6 +3774,72 @@ mod tests {
         assert_eq!(
             frame.link_segments(1, 1),
             vec![(0, 2, 3), (1, 0, 3), (2, 0, 3)]
+        );
+    }
+
+    /// `set_links` is public, so a producer other than the PTY collector can
+    /// hand it an over-long URI. It must be dropped rather than delivered
+    /// truncated — a truncated URI points somewhere else.
+    #[test]
+    fn set_links_drops_an_overlong_uri_and_unlinks_its_cells() {
+        let mut frame = FrameState::new(1, 8);
+        frame.write_text(0, 0, "abcdefgh", CellStyle::default());
+        let long = format!("https://e.example/{}", "a".repeat(MAX_LINK_URI));
+        let mut uris = BTreeMap::new();
+        uris.insert(1u16, long);
+        uris.insert(2u16, "https://ok.example".to_string());
+        let mut cell_links = vec![0u16; 8];
+        cell_links[0..4].fill(1); // the over-long one
+        cell_links[4..8].fill(2); // a fine one alongside it
+        frame.set_links(cell_links, uris);
+
+        assert_eq!(frame.cell_link(0, 0), None, "over-long link must be gone");
+        assert_eq!(frame.cell_link(0, 3), None);
+        assert_eq!(frame.cell_link(0, 4), Some("https://ok.example"));
+        assert_eq!(frame.link_uris().len(), 1);
+        // The dropped id must not linger in the cell map either.
+        assert!(frame.cell_links()[0..4].iter().all(|&id| id == 0));
+    }
+
+    #[test]
+    fn set_links_with_only_an_overlong_uri_clears() {
+        let mut frame = FrameState::new(1, 4);
+        let mut uris = BTreeMap::new();
+        uris.insert(1u16, "x".repeat(MAX_LINK_URI + 1));
+        frame.set_links(vec![1u16; 4], uris);
+        assert!(!frame.has_links());
+    }
+
+    /// Even if a `FrameState` somehow carried one, the encoder must not put a
+    /// truncated URI on the wire.
+    #[test]
+    fn encoder_skips_rather_than_truncates_an_overlong_uri() {
+        let mut frame = FrameState::new(1, 8);
+        frame.write_text(0, 0, "abcdefgh", CellStyle::default());
+        // Bypass `set_links` to construct the state it would have refused.
+        let long = "z".repeat(MAX_LINK_URI + 1);
+        let mut uris = BTreeMap::new();
+        uris.insert(1u16, long.clone());
+        frame.set_links(vec![1u16; 8], uris.clone());
+        frame.cell_links = vec![1u16; 8];
+        frame.link_uris = uris;
+
+        let mut payload = Vec::new();
+        append_links_section(&mut payload, &frame, true);
+        // uri_count == 0, run_count == 0: nothing of the URI is transmitted.
+        assert_eq!(payload, vec![0, 0, 0, 0]);
+
+        let msg = build_update_msg(1, &frame, &FrameState::default()).unwrap();
+        let mut term = TerminalState::new(1, 8);
+        feed(&mut term, &msg);
+        assert_eq!(term.frame().cell_link(0, 0), None);
+        // And no prefix of it leaked into the frame.
+        assert!(
+            !term
+                .frame()
+                .link_uris()
+                .values()
+                .any(|u| long.starts_with(u.as_str()))
         );
     }
 
