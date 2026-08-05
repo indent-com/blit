@@ -258,6 +258,13 @@ rare.
 `send` may also block when the endpoint's inbound byte window is full.
 This preserves ordering and backpressure without busy polling.
 
+The default mailbox byte window is 4 MiB, but message boundaries are never
+split and a legal packet must always be able to make progress. An empty
+mailbox therefore admits one whole packet up to the 16 MiB logical-message
+cap even when that packet exceeds the window. While that oversized packet is
+queued, no second packet is admitted. Thus the normal queued-byte limit stays
+4 MiB and the absolute queued-byte bound for either mailbox is 16 MiB.
+
 No separate argument, logging, timer, process, or capability-discovery imports
 are needed. After the normal `HELLO` / `LIST` / `READY` handshake, the host
 sends a `PLUGIN_INIT` packet containing plugin, attempt, task identity, and
@@ -631,7 +638,7 @@ Client-to-server kinds:
 | 1    | `LISTEN`  | `[flags:1][name_len:2][name:N][metadata_len:4][metadata:M]` |
 | 2    | `CONNECT` | `[flags:1][name_len:2][name:N][metadata_len:4][metadata:M]` |
 | 3    | `DATA`    | `[payload:N]`                                               |
-| 4    | `ACK`     | `[bytes:8]` cumulative received payload bytes               |
+| 4    | `ACK`     | `[bytes:8]` cumulative consumed payload bytes               |
 | 5    | `CLOSE`   | `[reason:1]`                                                |
 
 Server-to-client kinds:
@@ -912,7 +919,8 @@ Defaults are policy, not ABI, but the first implementation should enforce:
 | Persistent definitions         | 128               |
 | Open endpoint resources        | 64                |
 | Concurrent child processes     | 8 per endpoint    |
-| Inbound/outbound mailbox each  | 4 MiB             |
+| Mailbox byte window, each       | 4 MiB             |
+| Mailbox absolute bound, each    | 16 MiB            |
 | Process stream window          | 1 MiB each        |
 | Process aggregate output       | 64 MiB            |
 | Retained plugin events         | 1 MiB             |
