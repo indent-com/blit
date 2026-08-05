@@ -2325,6 +2325,37 @@ impl Compositor {
         }
     }
 
+    /// Re-send a toplevel's current configure, restating the size and states
+    /// it already has.  Used to answer requests we decline, so a client that
+    /// optimistically applied the new state locally snaps back to what we
+    /// actually show.
+    fn reassert_toplevel_configure(&mut self, wl_surface_id: &ObjectId) {
+        let Some(surf) = self.surfaces.get(wl_surface_id) else {
+            return;
+        };
+        let (w, h) = self
+            .surface_sizes
+            .get(&surf.surface_id)
+            .copied()
+            .unwrap_or((self.output_width, self.output_height));
+        if let Some(ref tl) = surf.xdg_toplevel {
+            tl.configure(
+                w,
+                h,
+                xdg_toplevel_states(&[
+                    xdg_toplevel::State::Activated,
+                    xdg_toplevel::State::Maximized,
+                ]),
+            );
+        }
+        if let Some(ref xs) = surf.xdg_surface {
+            let serial = self.serial.wrapping_add(1);
+            self.serial = serial;
+            xs.configure(serial);
+        }
+        let _ = self.display_handle.flush_clients();
+    }
+
     fn fire_frame_callbacks_for_toplevel(&mut self, toplevel_sid: u16) {
         let Some(root_id) = self.toplevel_surface_ids.get(&toplevel_sid).cloned() else {
             return;
@@ -4074,6 +4105,28 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                         surf.surface_id = 0;
                     }
                 }
+            }
+            Request::SetMinimized => {
+                // There is no minimized state here: a toplevel is a pane in
+                // the workspace, always on screen.  xdg-shell promises no
+                // configure in reply to this one, but staying silent strands
+                // Chromium-based clients (every Electron app) -- they mark
+                // themselves minimized the moment they send it and stop
+                // drawing until a configure carrying `activated` says
+                // otherwise.  With no reply the pane freezes for good, so
+                // say no out loud.
+                state.reassert_toplevel_configure(&data.wl_surface_id);
+            }
+            Request::SetMaximized
+            | Request::UnsetMaximized
+            | Request::SetFullscreen { .. }
+            | Request::UnsetFullscreen => {
+                // A pane is permanently activated and maximized, so none of
+                // these change anything.  Declining is our call to make;
+                // declining silently is not -- xdg-shell says each of them
+                // "will respond by emitting a configure event", and clients
+                // hold their own state pending until one arrives.
+                state.reassert_toplevel_configure(&data.wl_surface_id);
             }
             _ => {}
         }
