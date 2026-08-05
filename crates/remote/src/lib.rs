@@ -962,18 +962,14 @@ impl TerminalState {
         self.frame.get_cell(row, col)
     }
 
-    /// Maximum decompressed frame size (50 MiB). Prevents LZ4 decompression
-    /// bombs where a tiny compressed payload claims a multi-GiB output size.
-    const MAX_DECOMPRESSED_SIZE: usize = 50 * 1024 * 1024;
-
     /// Read the LZ4 prepended uncompressed size without allocating, and reject
-    /// payloads that claim to decompress beyond `MAX_DECOMPRESSED_SIZE`.
+    /// payloads that claim to decompress beyond [`MAX_DECOMPRESSED`].
     fn safe_decompress(data: &[u8]) -> Result<Vec<u8>, ()> {
         if data.len() < 4 {
             return Err(());
         }
         let claimed = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        if claimed > Self::MAX_DECOMPRESSED_SIZE {
+        if claimed > MAX_DECOMPRESSED {
             return Err(());
         }
         decompress_size_prepended(data).map_err(|_| ())
@@ -3981,6 +3977,22 @@ mod tests {
         let mut t = TerminalState::new(4, 10);
         assert!(!t.feed_compressed(b"garbage"));
         assert!(!t.feed_compressed(&[]));
+    }
+
+    /// The LZ4 size prefix is attacker-controlled: four bytes claiming a
+    /// multi-GiB output must be refused before anything is allocated. The
+    /// fs, git and lsp families each pin this; the terminal path is the one
+    /// that fed a decompressor without a test holding its ceiling in place.
+    #[test]
+    fn terminal_state_oversized_declared_length_is_rejected() {
+        let mut t = TerminalState::new(4, 10);
+        let mut forged = (MAX_DECOMPRESSED as u32 + 1).to_le_bytes().to_vec();
+        forged.extend_from_slice(b"whatever");
+        assert!(!t.feed_compressed(&forged));
+
+        let mut forged = u32::MAX.to_le_bytes().to_vec();
+        forged.extend_from_slice(b"whatever");
+        assert!(!t.feed_compressed(&forged));
     }
 
     #[test]
