@@ -501,20 +501,22 @@ the existing scheduler and `S2C_FRAGMENT` fairness.
 
 ## Limits and defaults
 
-| Knob                        | Default | Env                    |
-| --------------------------- | ------- | ---------------------- |
-| Settle / batching window    | 20 ms   | `BLIT_FS_LATENCY_MS`   |
-| Inline content limit        | 16 MiB  | `BLIT_FS_INLINE_MAX`   |
-| Blob store (process-wide)   | 256 MiB | `BLIT_FS_BLOB_MAX`     |
-| Snapshot retention / client | 32 MiB  | `BLIT_FS_RETAIN_MAX`\* |
-| Syncs per connection        | 128     | `BLIT_FS_MAX_SYNCS`    |
-| Indexed entries per root    | 1 M     | `BLIT_FS_MAX_ENTRIES`  |
-| Exclude patterns per sync   | 4096    | —                      |
-| Unacked bytes per sync      | 1 MiB   | `BLIT_FS_WINDOW`       |
+| Knob                      | Default | Env                   |
+| ------------------------- | ------- | --------------------- |
+| Settle / batching window  | 20 ms   | `BLIT_FS_LATENCY_MS`  |
+| Inline content limit      | 16 MiB  | `BLIT_FS_INLINE_MAX`  |
+| Blob store (process-wide) | 256 MiB | `BLIT_FS_BLOB_MAX`    |
+| Syncs per connection      | 128     | `BLIT_FS_MAX_SYNCS`   |
+| Indexed entries per root  | 1 M     | `BLIT_FS_MAX_ENTRIES` |
+| Exclude patterns per sync | 4096    | —                     |
+| Unacked bytes per sync    | 1 MiB   | `BLIT_FS_WINDOW`      |
 
-\* Not needed in the implemented architecture: a sync engine holds at most
-two whole-index references (its shadow and the latest published snapshot),
-so per-client retention is bounded by design and this knob does not exist.
+An earlier draft budgeted snapshot retention per client (`BLIT_FS_RETAIN_MAX`,
+32 MiB). The implemented architecture does not need it — a sync engine holds
+at most two whole-index references, its shadow and the latest published
+snapshot — so per-client retention is bounded by design and no such knob
+exists. It is called out here because the row used to sit in this table with
+an env var name beside it, which reads as configurable.
 
 Watch-descriptor exhaustion fails `FS_SYNC` at arm time with status `3`
 (`FS_STATUS_RESOURCE_LIMIT`), as do permission and not-found failures with
@@ -547,9 +549,15 @@ consume — and thin clients matter more than server frugality.
 
 The server already hands clients a shell, so syncing adds surface for
 denial-of-service, not privilege. The mandatory mitigations are the budget
-table above, request validation (unknown flags, NULs, oversized paths
-rejected), prompt teardown on disconnect, and never logging escaped path
-bytes as trusted text.
+table above, request validation (unknown flags and NULs rejected), prompt
+teardown on disconnect, and never logging escaped path bytes as trusted text.
+
+Path _length_ is not validated: neither `validate_root` nor
+`resolve_wire_path` bounds it. What the codec guarantees is that an
+over-length path cannot corrupt the message around it — `push_str` clips to
+what the `u16` prefix can describe rather than wrapping it, which would have
+desynced every field after it. An earlier version of this section claimed
+oversized paths were rejected; they are not, they are clipped on encode.
 
 ## Implementation
 

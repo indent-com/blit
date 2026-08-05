@@ -3169,9 +3169,14 @@ pub async fn run(config: Config) {
 /// frames.  Also used as the maximum tick-loop sleep so the loop never
 /// blocks longer than this.
 ///
-/// When any client has an active surface subscription, use 8 ms (~120 Hz)
-/// so video players get consistent frame callbacks matching the display
-/// rate.  Without active surfaces, 33 ms (30 Hz) is sufficient.
+/// When any client has an active surface subscription, use 62.5 ms (16 Hz)
+/// so video players keep getting frame callbacks.  Without active surfaces,
+/// 250 ms (4 Hz) is enough to keep apps from stalling entirely.
+///
+/// This is a floor on liveness, not the frame rate: a subscribed surface is
+/// paced by `frame_window` and the adaptive controller, which run far above
+/// 16 Hz.  The blanket round only exists so an app nobody is watching still
+/// makes progress.
 const BLANKET_FRAME_INTERVAL_IDLE: Duration = Duration::from_millis(250);
 const BLANKET_FRAME_INTERVAL_SURFACE: Duration = Duration::from_micros(62_500);
 
