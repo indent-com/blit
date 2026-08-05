@@ -126,7 +126,7 @@ same limit), refusing over-cap requests with `RESOURCE_LIMIT`.
 `@blit-sh/core` exposes `indexFiles(root)` beside `searchFiles`. The UI
 (`js/ui/src/ide/fileIndex.ts`) caches one list per (connection, root),
 serves every keystroke from it synchronously, and refreshes it in the
-background when a lookup finds it older than 15 s — stale-while-
+background when a lookup finds it older than 60 s — stale-while-
 revalidate, so a fresh file appears on the next switcher open without
 ever blocking one. The index is the _only_ `@` path: until the list
 lands (or against a pre-`FS_INDEX` server, ever) `@` simply shows

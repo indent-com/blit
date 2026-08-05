@@ -881,8 +881,14 @@ async fn async_main() {
                         .ok()
                         .map(|v| v == "1")
                         .unwrap_or(false),
-                max_connections: 0,
-                max_ptys: 0,
+                // Both default to 0 (unlimited), which is the right default:
+                // a client that can open a PTY can already spend the machine's
+                // resources from inside it, so these are an operator sanity
+                // bound against runaway automation, not a security control.
+                // They were hardcoded to 0 with no way to set them, which made
+                // the enforcement in blit-server dead code.
+                max_connections: env_usize("BLIT_MAX_CONNECTIONS"),
+                max_ptys: env_usize("BLIT_MAX_PTYS"),
                 ping_interval: std::time::Duration::from_secs(10),
                 skip_compositor: std::env::var("BLIT_SKIP_COMPOSITOR")
                     .ok()
@@ -1078,6 +1084,15 @@ async fn async_main() {
             blit_proxy::run(false);
         }
     }
+}
+
+/// Read a `usize` limit from the environment. Unset, unparseable or 0 all
+/// mean "no limit", which is what the server's `> 0` guards already expect.
+fn env_usize(key: &str) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 fn cmd_hash_passphrase(value: Option<String>) -> Result<(), String> {

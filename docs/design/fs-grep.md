@@ -58,7 +58,7 @@ Two filters remain, both about _matchability_ rather than relevance:
 
 - **Binary files are skipped** — a NUL byte in the first 8 KiB. Matching
   a compiled artifact yields unreadable lines and burns budget.
-- **Very large files are skipped** past `FS_GREP_MAX_FILE` (4 MiB), the
+- **Very large files are skipped** past `FS_GREP_MAX_FILE` (64 MiB), the
   same posture the editor takes on its own buffers.
 
 Neither sets `TRUNCATED`. They are _scope_ rules, exactly like pruning

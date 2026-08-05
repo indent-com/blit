@@ -18,6 +18,18 @@
 | `BLIT_SURFACE_ENCODERS`  | see encoder table                                  | Comma-separated encoder priority                                                       |
 | `BLIT_SURFACE_BANDWIDTH` | `medium`                                           | Ceiling on video bandwidth (adaptation only goes cheaper)                              |
 | `BLIT_SURFACE_SPEED`     | `realtime`                                         | Encoder speed preset                                                                   |
+| `BLIT_MAX_CONNECTIONS`   | `0` (unlimited)                                    | Reject client connections past this count                                              |
+| `BLIT_MAX_PTYS`          | `0` (unlimited)                                    | Refuse `CREATE` past this many PTYs across all clients                                 |
+
+`BLIT_MAX_CONNECTIONS` and `BLIT_MAX_PTYS` are an operator sanity bound against
+runaway automation, not a security control — a client that can open one PTY can
+already spend the machine's resources from inside it. Leave them unset unless
+you want a specific ceiling.
+
+A `CREATE` refused by `BLIT_MAX_PTYS` gets no reply, because the protocol has
+no "create refused" message; the client sees a timeout and the server logs the
+refusal. Setting a cap you actually reach is therefore not a graceful
+experience yet.
 
 ## PTY lifecycle
 
@@ -26,7 +38,10 @@
 PTYs are created by `C2S_CREATE` or `C2S_CREATE2`. The server:
 
 1. Allocates a PTY pair via `openpty`.
-2. Forks. The child sets the slave fd as controlling terminal (`TIOCSCTTY`), drops privileges, sets the working directory, and `exec`s the shell (or custom command from `HAS_COMMAND`).
+2. Forks. The child sets the slave fd as controlling terminal (`TIOCSCTTY`), closes inherited descriptors except stdio, sets the working directory, and `exec`s the shell (or custom command from `HAS_COMMAND`).
+
+   The child runs as the **same user as the server** — there is no `setuid`, `setgid`, `chroot`, or seccomp anywhere in the tree. Closing descriptors keeps one terminal from reaching another's PTY master or the IPC listener; it is hygiene between sibling terminals, not a boundary between a client and the machine. A blit connection is equivalent to an interactive login shell as the server's user; confinement, if you need it, belongs outside the server (see the `fd-channel` integration point in [transports.md](transports.md)).
+
 3. The master fd is registered with the tokio reactor for async I/O.
 4. PTY output is fed through the `blit-alacritty` terminal parser.
 5. `S2C_CREATED` (or `S2C_CREATED_N` with nonce) is sent to the creating client.
