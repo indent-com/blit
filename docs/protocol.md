@@ -168,7 +168,7 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 | 9   | `KV`           | Server supports the `KV_*` key-value family                    |
 | 10  | `NET`          | Server supports the `NET_*` network-relay family               |
 | 11  | `PLUGIN`       | Proposed: server supports Wasmi plugin lifecycle and events    |
-| 12  | `CHANNEL`      | Proposed: server supports channels, state, and topics          |
+| 12  | `CHANNEL`      | Proposed: server supports bidirectional named channels         |
 | 13  | `PROCESS`      | Proposed: server supports non-PTY child processes              |
 
 `S2C_LIST` entry layout: `[pty_id:2][tag_len:2][tag:N][cmd_len:2][cmd:M]` per
