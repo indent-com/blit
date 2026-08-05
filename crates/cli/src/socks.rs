@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::relay::{self, Conn, DEFAULT_BIND, OnOpen, Window};
+use crate::relay::{self, Conn, DEFAULT_BIND, OnOpen};
 use crate::transport::Transport;
 use blit_remote::net::{
     NET_MAX_HOST, NET_STATUS_NOT_FOUND, NET_STATUS_OK, NET_STATUS_PERMISSION, NET_STATUS_REFUSED,
@@ -358,14 +358,10 @@ async fn proxy(mut local: tokio::net::TcpStream, conn: Arc<Conn>) -> Result<(), 
             return Err(why);
         }
     };
-    // A proxy runs as many streams as its client opens — a browser will hold
-    // dozens — so it takes the smallest window the server ever grants rather than
-    // the one a handful of static forwards can assume.
     relay::relay(
         local,
         conn,
         NetOpen::tcp(0, &request.host, request.port),
-        Window::Floor,
         OnOpen::Answer(connect_reply),
     )
     .await

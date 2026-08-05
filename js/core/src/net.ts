@@ -13,7 +13,7 @@ export const C2S_NET_CLOSE = 0x83;
 /** One datagram, UDP only: [0x84][stream_id:2][payload:N] */
 export const C2S_NET_DGRAM = 0x84;
 
-/** Open result: [0x80][stream_id:2][status:1][alpn_len:1][alpn:N][detail_len:2][detail:N] */
+/** Open result: [0x80][stream_id:2][status:1][alpn_len:1][alpn:N][detail_len:2][detail:N] + optional [window:8] */
 export const S2C_NET_OPENED = 0x80;
 /** Stream payload, TCP only: [0x81][stream_id:2][data:N] */
 export const S2C_NET_DATA = 0x81;
@@ -104,8 +104,15 @@ export function netClosedText(reason: number): string {
 
 /** Maximum `NET_DATA`/`NET_DGRAM` payload. */
 export const NET_MAX_CHUNK = 64 * 1024;
-/** Per-stream unacked-byte window. */
+/** Largest per-stream unacked-byte window, and the one a stream gets when it is the only one open. */
 export const NET_WINDOW_BYTES = 1024 * 1024;
+/**
+ * Smallest per-stream unacked-byte window the server ever grants.
+ *
+ * The real window is a share of the connection's aggregate, reported on the
+ * accept; until it arrives this much is safe at any concurrency.
+ */
+export const NET_WINDOW_MIN = 2 * NET_MAX_CHUNK;
 /** Maximum concurrent sockets per connection. */
 export const NET_MAX_SOCKETS = 256;
 
@@ -237,6 +244,8 @@ export interface NetOpenedMessage {
   status: number;
   alpn: string;
   detail: string;
+  /** The send window the server granted, absent from a server that does not report one. */
+  window?: number;
 }
 
 export function parseNetOpenedMessage(
@@ -254,7 +263,16 @@ export function parseNetOpenedMessage(
   const detail = textDecoder.decode(
     bytes.subarray(rest + 2, rest + 2 + detailLen),
   );
-  return { streamId, status, alpn, detail };
+  const tail = rest + 2 + detailLen;
+  const parsed: NetOpenedMessage = { streamId, status, alpn, detail };
+  // Absent rather than guessed: a server that predates the field sends nothing
+  // here, and a partial tail is no more of a number than no tail at all.
+  if (bytes.length >= tail + 8) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    parsed.window =
+      view.getUint32(tail, true) + view.getUint32(tail + 4, true) * 0x100000000;
+  }
+  return parsed;
 }
 
 export interface NetClosedMessage {
@@ -332,6 +350,12 @@ interface StreamState {
   acked: number;
   /** Bytes handed to the server. */
   sent: number;
+  /**
+   * How much may be unacked. The server grants a share of the connection's
+   * aggregate and closes a stream that exceeds it, so this starts at the
+   * smallest share it ever grants and rises to whatever the accept reports.
+   */
+  window: number;
   /** Woken when credit frees up. */
   creditWaiters: Array<() => void>;
   /** Payload waiting to be read, and the reader waiting for it. */
@@ -379,6 +403,7 @@ export class NetStreams {
       settled: false,
       acked: 0,
       sent: 0,
+      window: NET_WINDOW_MIN,
       creditWaiters: [],
       inbox: [],
       inboxWaiters: [],
@@ -410,10 +435,10 @@ export class NetStreams {
       async write(data: Uint8Array): Promise<void> {
         for (let offset = 0; offset < data.length; offset += NET_MAX_CHUNK) {
           const chunk = data.subarray(offset, offset + NET_MAX_CHUNK);
-          // Respect the window: the server acks bytes it has written to the target, and outrunning that just buries the connection.
+          // Respect the window: the server acks bytes it has written to the target, and outrunning that does not throttle the stream, it closes it.
           while (
             !state.ended &&
-            state.sent - state.acked + chunk.length > NET_WINDOW_BYTES
+            state.sent - state.acked + chunk.length > state.window
           ) {
             await new Promise<void>((resolve) =>
               state.creditWaiters.push(resolve),
@@ -465,6 +490,11 @@ export class NetStreams {
         if (!state || state.settled) return true;
         state.settled = true;
         if (parsed.status === NET_STATUS_OK) {
+          // A server that reports nothing is older than the field; it enforces
+          // the same shrinking window without naming it, so the old ceiling is
+          // the only figure available.
+          state.window = parsed.window ?? NET_WINDOW_BYTES;
+          this.wake(state.creditWaiters);
           state.resolveOpened(parsed.alpn);
         } else {
           const detail = parsed.detail

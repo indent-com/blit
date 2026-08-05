@@ -15,6 +15,7 @@ import {
   NET_STATUS_OK,
   NET_STATUS_PERMISSION,
   NET_WINDOW_BYTES,
+  NET_WINDOW_MIN,
   NetStreams,
   buildNetAckMessage,
   buildNetCloseMessage,
@@ -34,10 +35,17 @@ const dec = new TextDecoder();
 
 /** Server-side builders, so the tests exercise the real wire rather than the
  *  client's own encoder in both directions. */
-function opened(streamId: number, status: number, alpn = "", detail = "") {
+function opened(
+  streamId: number,
+  status: number,
+  alpn = "",
+  detail = "",
+  window?: number,
+) {
   const a = enc.encode(alpn);
   const d = enc.encode(detail);
-  const msg = new Uint8Array(7 + a.length + d.length);
+  const tail = window === undefined ? 0 : 8;
+  const msg = new Uint8Array(7 + a.length + d.length + tail);
   msg[0] = 0x80;
   msg[1] = streamId & 0xff;
   msg[2] = streamId >> 8;
@@ -47,6 +55,12 @@ function opened(streamId: number, status: number, alpn = "", detail = "") {
   msg[5 + a.length] = d.length & 0xff;
   msg[6 + a.length] = d.length >> 8;
   msg.set(d, 7 + a.length);
+  if (window !== undefined) {
+    const at = 7 + a.length + d.length;
+    const view = new DataView(msg.buffer);
+    view.setUint32(at, window % 0x100000000, true);
+    view.setUint32(at + 4, Math.floor(window / 0x100000000), true);
+  }
   return msg;
 }
 
@@ -180,6 +194,15 @@ describe("net wire", () => {
       detail: "",
     });
     expect(
+      parseNetOpenedMessage(opened(8, NET_STATUS_OK, "h2", "", 174_762)),
+    ).toEqual({
+      streamId: 8,
+      status: NET_STATUS_OK,
+      alpn: "h2",
+      detail: "",
+      window: 174_762,
+    });
+    expect(
       parseNetOpenedMessage(opened(8, NET_STATUS_PERMISSION, "", "nope")),
     ).toEqual({
       streamId: 8,
@@ -200,6 +223,16 @@ describe("net wire", () => {
       expect(parseNetOpenedMessage(full.subarray(0, cut))).toBeNull();
     }
     expect(parseNetOpenedMessage(full)).not.toBeNull();
+
+    // A window that did not survive intact is no window, not a smaller one.
+    const withWindow = opened(1, NET_STATUS_OK, "h2", "why", NET_WINDOW_BYTES);
+    for (let cut = 1; cut < 8; cut++) {
+      expect(
+        parseNetOpenedMessage(withWindow.subarray(0, withWindow.length - cut))
+          ?.window,
+      ).toBeUndefined();
+    }
+    expect(parseNetOpenedMessage(withWindow)?.window).toBe(NET_WINDOW_BYTES);
   });
 
   it("recognizes its own opcode block only", () => {
@@ -281,7 +314,9 @@ describe("NetStreams", () => {
   it("blocks writes at the window and resumes on an ack", async () => {
     const { sent, streams } = harness();
     const stream = streams.open("h", 80);
-    streams.handleMessage(opened(stream.streamId, NET_STATUS_OK));
+    streams.handleMessage(
+      opened(stream.streamId, NET_STATUS_OK, "", "", NET_WINDOW_BYTES),
+    );
 
     // One full window, in chunk-sized pieces.
     const big = new Uint8Array(NET_WINDOW_BYTES);
@@ -300,6 +335,64 @@ describe("NetStreams", () => {
     streams.handleMessage(s2cAck(stream.streamId, NET_WINDOW_BYTES));
     await pending;
     expect(resolved).toBe(true);
+  });
+
+  /** The window is a share of the connection's aggregate that only the server
+   *  can compute, so a client that assumes the ceiling gets its stream closed
+   *  for BUDGET the moment several are open at once. */
+  it("sends only the floor until the accept reports its window", async () => {
+    const { sent, streams } = harness();
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const bytesSent = () =>
+      sent
+        .filter((m) => m[0] === C2S_NET_DATA)
+        .reduce((n, m) => n + m.length - 3, 0);
+    const stream = streams.open("h", 80);
+    let done = false;
+    const write = stream.write(new Uint8Array(NET_WINDOW_BYTES)).then(() => {
+      done = true;
+    });
+    await tick();
+    expect(bytesSent()).toBe(NET_WINDOW_MIN);
+    expect(done).toBe(false);
+
+    // A fifth concurrent socket's share: more than the floor, less than the
+    // ceiling the client used to assume. Chunked, so what goes out is every
+    // whole chunk that fits.
+    const granted = 838_860;
+    streams.handleMessage(
+      opened(stream.streamId, NET_STATUS_OK, "", "", granted),
+    );
+    await tick();
+    const inflight = Math.floor(granted / NET_MAX_CHUNK) * NET_MAX_CHUNK;
+    expect(bytesSent()).toBe(inflight);
+    expect(done).toBe(false);
+
+    streams.handleMessage(s2cAck(stream.streamId, inflight));
+    await write;
+    expect(bytesSent()).toBe(NET_WINDOW_BYTES);
+  });
+
+  it("falls back to the ceiling when the server reports no window", async () => {
+    const { sent, streams } = harness();
+    const stream = streams.open("h", 80);
+    streams.handleMessage(opened(stream.streamId, NET_STATUS_OK));
+    await stream.write(new Uint8Array(NET_WINDOW_BYTES));
+    const bytes = sent
+      .filter((m) => m[0] === C2S_NET_DATA)
+      .reduce((n, m) => n + m.length - 3, 0);
+    expect(bytes).toBe(NET_WINDOW_BYTES);
+  });
+
+  it("falls back to the ceiling when the server reports no window", async () => {
+    const { sent, streams } = harness();
+    const stream = streams.open("h", 80);
+    streams.handleMessage(opened(stream.streamId, NET_STATUS_OK));
+    await stream.write(new Uint8Array(NET_WINDOW_BYTES));
+    const bytes = sent
+      .filter((m) => m[0] === C2S_NET_DATA)
+      .reduce((n, m) => n + m.length - 3, 0);
+    expect(bytes).toBe(NET_WINDOW_BYTES);
   });
 
   it("does not reuse a live id, and reuses a retired one", () => {

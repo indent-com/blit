@@ -16,10 +16,11 @@ use tokio::sync::{Mutex, mpsc, watch};
 
 use crate::transport::{read_message, write_frame};
 use blit_remote::net::{
-    FEATURE_NET, NET_CLOSE_WRITE, NET_MAX_CHUNK, NET_MAX_SOCKETS, NET_STATUS_OK, NetOpen,
-    S2C_NET_ACK, S2C_NET_CLOSED, S2C_NET_DATA, S2C_NET_DGRAM, S2C_NET_OPENED, msg_net_ack_c2s,
-    msg_net_close, msg_net_data_c2s, msg_net_open, net_closed_text, net_status_text,
-    parse_net_ack_s2c, parse_net_closed, parse_net_data_s2c, parse_net_dgram_s2c, parse_net_opened,
+    FEATURE_NET, NET_CLOSE_WRITE, NET_MAX_CHUNK, NET_MAX_SOCKETS, NET_STATUS_OK, NET_WINDOW_BYTES,
+    NET_WINDOW_MIN, NetOpen, S2C_NET_ACK, S2C_NET_CLOSED, S2C_NET_DATA, S2C_NET_DGRAM,
+    S2C_NET_OPENED, msg_net_ack_c2s, msg_net_close, msg_net_data_c2s, msg_net_open,
+    net_closed_text, net_status_text, parse_net_ack_s2c, parse_net_closed, parse_net_data_s2c,
+    parse_net_dgram_s2c, parse_net_opened, parse_net_opened_window,
 };
 use blit_remote::{S2C_HELLO, S2C_QUIT, S2C_READY};
 
@@ -43,6 +44,8 @@ pub enum Event {
         status: u8,
         alpn: String,
         detail: String,
+        /// The send window the server granted, absent from a server that does not report one.
+        window: Option<u64>,
     },
     Data(Vec<u8>),
     Ack(u64),
@@ -143,6 +146,7 @@ async fn reader_task(
                         status,
                         alpn,
                         detail,
+                        window: parse_net_opened_window(&msg),
                     },
                 ),
                 None => continue,
@@ -214,31 +218,6 @@ async fn require_net(
 
 // --------------------------------------------------------------------------- The pump ---------------------------------------------------------------------------
 
-/// The client→server window a relayed stream may fill before it waits for an ack.
-///
-/// The server hands each stream `NET_WINDOW_AGGREGATE / open_sockets` clamped to
-/// `[2 * NET_MAX_CHUNK, NET_WINDOW_BYTES]`, decided at open and **never told to the
-/// client** (crates/server/src/net.rs § `per_stream_window`). Overrunning it is not
-/// throttled, it is fatal — `NET_CLOSED` BUDGET. So a command whose sockets are few
-/// can assume the ceiling, and one whose sockets are many has to assume the floor.
-#[derive(Clone, Copy)]
-pub enum Window {
-    /// `NET_WINDOW_BYTES`, the share of a connection carrying at most four sockets.
-    Full,
-    /// `2 * NET_MAX_CHUNK`, the smallest share the server ever hands out, and so
-    /// the only figure that is safe at any concurrency.
-    Floor,
-}
-
-impl Window {
-    fn bytes(self) -> u64 {
-        match self {
-            Window::Full => blit_remote::net::NET_WINDOW_BYTES,
-            Window::Floor => NET_MAX_CHUNK as u64 * 2,
-        }
-    }
-}
-
 /// What the local client is owed when the server answers the open.
 pub enum OnOpen {
     /// Nothing: a forward relays the target's own protocol, so the local client
@@ -260,7 +239,6 @@ pub async fn relay(
     local: tokio::net::TcpStream,
     conn: Arc<Conn>,
     mut open: NetOpen,
-    window: Window,
     on_open: OnOpen,
 ) -> Result<(), String> {
     let (events_tx, mut events) = mpsc::unbounded_channel::<Event>();
@@ -284,23 +262,40 @@ pub async fn relay(
     let (mut local_read, mut local_write) = local.into_split();
     // The server acks bytes it has written to the target; that is the client's credit signal for the direction it drives.
     let (ack_tx, mut ack_rx) = watch::channel(0u64);
+    // How much may be in flight. The server grants each stream a share of the
+    // connection's aggregate — below 1 MiB from the fifth concurrent socket on,
+    // and overrunning it does not throttle the stream, it kills it — and it
+    // reports the figure on the accept. Until that arrives, and from a server
+    // too old to report one, assume the smallest share the server ever grants:
+    // one round trip of pipelining at the floor costs nothing, and guessing the
+    // ceiling truncates every stream past the fourth.
+    let (window_tx, mut window_rx) = watch::channel(NET_WINDOW_MIN);
 
     // Read the local side from the start even when a reply is owed: pipelining the
     // request behind the open is what keeps a forward's connect to one round trip,
     // and a SOCKS client sends nothing before its reply, so there is nothing to
     // leak past it.
     let up_conn = conn.clone();
-    let up_window = window.bytes();
     let up = tokio::spawn(async move {
         let mut buf = vec![0u8; NET_MAX_CHUNK];
         let mut sent: u64 = 0;
         loop {
-            while sent.saturating_sub(*ack_rx.borrow_and_update()) >= up_window {
-                if ack_rx.changed().await.is_err() {
-                    return;
+            // Read only what there is credit for. Waiting for a whole chunk's
+            // worth would leave the local socket unread while credit sits
+            // unused, and reading a whole chunk first would put a chunk more
+            // than the window in flight — which is not throttled, it is closed.
+            let room = loop {
+                let inflight = sent.saturating_sub(*ack_rx.borrow_and_update());
+                let window = *window_rx.borrow_and_update();
+                if window > inflight {
+                    break ((window - inflight) as usize).min(NET_MAX_CHUNK);
                 }
-            }
-            match local_read.read(&mut buf).await {
+                tokio::select! {
+                    changed = ack_rx.changed() => if changed.is_err() { return },
+                    changed = window_rx.changed() => if changed.is_err() { return },
+                }
+            };
+            match local_read.read(&mut buf[..room]).await {
                 Ok(0) | Err(_) => {
                     // Local client is done writing: half-close, so a target that reads to EOF sees one.
                     up_conn.send(msg_net_close(id, NET_CLOSE_WRITE));
@@ -325,6 +320,7 @@ pub async fn relay(
                 status,
                 alpn,
                 detail,
+                window,
             } => {
                 if let OnOpen::Answer(reply) = &on_open
                     && local_write.write_all(&reply(status)).await.is_err()
@@ -339,6 +335,11 @@ pub async fn relay(
                     };
                     break Err(format!("{target}: {detail}"));
                 }
+                // A server that reports nothing is older than the grant; it
+                // enforces the same shrinking window without naming it, so the
+                // old ceiling is the only figure available and the hazard it
+                // carries stays that server's.
+                let _ = window_tx.send(window.unwrap_or(NET_WINDOW_BYTES));
                 if let OnOpen::Report {
                     announce_alpn: Some(announced),
                 } = &on_open
@@ -384,16 +385,139 @@ pub async fn relay(
 mod tests {
     use super::*;
 
-    /// The floor is what the server guarantees at any concurrency; the full window
-    /// is only safe while a connection carries few sockets. A `blit socks` client
-    /// that assumed the full window would be killed with BUDGET by a busy browser.
-    #[test]
-    fn floor_window_is_the_servers_smallest_share() {
-        assert_eq!(Window::Floor.bytes(), NET_MAX_CHUNK as u64 * 2);
-        assert_eq!(Window::Full.bytes(), blit_remote::net::NET_WINDOW_BYTES);
-        assert!(Window::Floor.bytes() < Window::Full.bytes());
-        // A stream must hold at least one maximum chunk or it cannot progress.
-        assert!(Window::Floor.bytes() >= NET_MAX_CHUNK as u64);
+    /// Drive one `relay` against a scripted server side: a local TCP client to
+    /// write into, the C2S messages the pump produced, and the events channel
+    /// the reader task would normally feed.
+    struct Pump {
+        client: Option<tokio::net::TcpStream>,
+        out: mpsc::UnboundedReceiver<Vec<u8>>,
+        events: mpsc::UnboundedSender<Event>,
+        _conn: Arc<Conn>,
+    }
+
+    impl Pump {
+        async fn start() -> Pump {
+            let (out_tx, mut out) = mpsc::unbounded_channel();
+            let conn = Arc::new(Conn {
+                out: out_tx,
+                sockets: Mutex::new(HashMap::new()),
+                next_id: Mutex::new(1),
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (local, _) = listener.accept().await.unwrap();
+            let pumped = conn.clone();
+            tokio::spawn(async move {
+                let _ = relay(
+                    local,
+                    pumped,
+                    NetOpen::tcp(0, "target.internal", 80),
+                    OnOpen::Report {
+                        announce_alpn: None,
+                    },
+                )
+                .await;
+            });
+            // The open goes out before anything else, and its id is the one the
+            // events channel is keyed on.
+            let open = out.recv().await.unwrap();
+            let id = blit_remote::net::parse_net_open(&open).unwrap().stream_id;
+            let events = conn.sockets.lock().await.get(&id).unwrap().events.clone();
+            Pump {
+                client: Some(client),
+                out,
+                events,
+                _conn: conn,
+            }
+        }
+
+        /// Write more than any window on offer, as a local client that never
+        /// reads its own socket does, and hold it open — an EOF would end the
+        /// pump for reasons unrelated to pacing.
+        fn flood(&mut self) {
+            let mut client = self.client.take().unwrap();
+            tokio::spawn(async move {
+                let _ = client.write_all(&vec![b'u'; 4 * 1024 * 1024]).await;
+                std::future::pending::<()>().await;
+            });
+        }
+
+        fn accepted(&self, window: Option<u64>) {
+            self.events
+                .send(Event::Opened {
+                    status: NET_STATUS_OK,
+                    alpn: String::new(),
+                    detail: String::new(),
+                    window,
+                })
+                .unwrap();
+        }
+
+        /// Bytes the pump sends until it goes quiet, which is the only way to ask
+        /// "has it stopped at the window" of a pump that never errors.
+        async fn drain(&mut self) -> u64 {
+            let mut bytes = 0;
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), self.out.recv()).await
+            {
+                if let Some((_, data)) = blit_remote::net::parse_net_data_c2s(&msg) {
+                    bytes += data.len() as u64;
+                }
+            }
+            bytes
+        }
+    }
+
+    /// Sending stopped inside the window, and stopped because of it: a client
+    /// that used only half of what it was granted would pass an upper bound
+    /// alone while costing throughput.
+    #[track_caller]
+    fn fills(sent: u64, window: u64) {
+        assert!(sent <= window, "sent {sent} into a {window}-byte window");
+        assert!(
+            sent + NET_MAX_CHUNK as u64 > window,
+            "stopped at {sent} with a {window}-byte window open"
+        );
+    }
+
+    /// The client used to assume `NET_WINDOW_BYTES` for every stream, and the
+    /// server kills a stream that exceeds the smaller share it actually
+    /// granted — silently, since the local writer's send succeeded.
+    #[tokio::test]
+    async fn upload_stays_inside_the_window_it_was_granted() {
+        let mut pump = Pump::start().await;
+        pump.flood();
+
+        // Before the accept lands the client cannot know its share, so it
+        // pipelines only what the server always grants.
+        let mut sent = pump.drain().await;
+        fills(sent, NET_WINDOW_MIN);
+
+        // A fifth concurrent socket's share, the case that used to truncate.
+        let granted = 838_860u64;
+        pump.accepted(Some(granted));
+        sent += pump.drain().await;
+        fills(sent, granted);
+
+        // And credit means more, not a fresh window: the counter is cumulative.
+        pump.events.send(Event::Ack(granted / 2)).unwrap();
+        sent += pump.drain().await;
+        fills(sent, granted + granted / 2);
+    }
+
+    /// A server too old to report a window enforces one all the same, so the
+    /// client has nothing better than the old ceiling — but it must not stay
+    /// at the floor either, which would cost throughput on every forward.
+    #[tokio::test]
+    async fn an_unreported_window_falls_back_to_the_ceiling() {
+        let mut pump = Pump::start().await;
+        pump.flood();
+        let mut sent = pump.drain().await;
+        fills(sent, NET_WINDOW_MIN);
+        pump.accepted(None);
+        sent += pump.drain().await;
+        fills(sent, NET_WINDOW_BYTES);
     }
 
     #[test]
