@@ -3164,18 +3164,7 @@ fn text_patch_matches_git_diff() {
     };
     let theirs = git_out(
         &dir,
-        &[
-            "-c",
-            "diff.noprefix=false",
-            "-c",
-            "diff.mnemonicPrefix=false",
-            "diff",
-            "-M50%",
-            "--no-color",
-            "-U3",
-            "HEAD~1",
-            "HEAD",
-        ],
+        &["diff", "-M50%", "--no-color", "-U3", "HEAD~1", "HEAD"],
     );
 
     /// Collapse the documented deviations so the comparison is about the
@@ -4791,19 +4780,7 @@ fn worktree_patch_reads_unstaged_content_from_disk() {
 
     // The tracked half against git itself, oids aside: hunk headers included,
     // since a wrong new side gets those wrong too.
-    let theirs = git_out(
-        &dir,
-        &[
-            "-c",
-            "diff.noprefix=false",
-            "-c",
-            "diff.mnemonicPrefix=false",
-            "diff",
-            "--no-color",
-            "-U3",
-            "HEAD",
-        ],
-    );
+    let theirs = git_out(&dir, &["diff", "--no-color", "-U3", "HEAD"]);
     let mut in_untracked = false;
     let tracked: Vec<String> = ours
         .lines()

@@ -1,4 +1,4 @@
-# RFC: Wasmi extensions, native channels, and processes
+# RFC: Wasmi extensions and native channels
 
 - **Status:** Proposed
 - **Date:** 2026-08-05
@@ -41,10 +41,6 @@ A named persistent extension may advertise a discoverable command tree. The
 CLI exposes it under an unambiguous `@name` namespace and carries each command
 invocation over a normal channel.
 
-It also adds a native **process** family for spawning non-PTY child processes,
-streaming their stdout and stderr, writing stdin, and controlling their
-lifecycle. Process operations are blit packets rather than Wasm host imports.
-
 These are blit packet families, not Wasm-specific host functions. Browser,
 CLI, native, and Wasmi clients all see the same semantics. RPC, streamed
 results, notifications, and actor mailboxes are libraries over channels.
@@ -85,8 +81,6 @@ PTYs.
 - Add server-native bidirectional channels.
 - Let named persistent extensions contribute discoverable, namespaced CLI
   commands.
-- Let clients spawn and control non-PTY server processes with flow-controlled
-  stdin, stdout, and stderr streams.
 - Keep the Wasm host ABI very small and versioned.
 - Give each running extension attempt its own named OS thread.
 - Bound extension-owned threads, guest memory, supervisor records, object
@@ -100,7 +94,8 @@ PTYs.
 - **No conventional guest operating-system environment.** Version 1 targets
   `wasm32-unknown-unknown` and exposes only `blit_v1`. It provides no filesystem
   preopens, sockets, standard streams, or second runtime ABI. Arguments arrive
-  in `INIT`; output, channels, and subprocesses are packet operations.
+  in `INIT`; output and channels are packet operations. Pipe-oriented process
+  execution is deferred to a separate client-protocol RFC.
 - **No Component Model requirement.** The first Rust SDK targets a small core
   Wasm ABI. A future component adapter may wrap the same packet endpoint.
 - **No live-instance checkpointing.** Persistent extensions start a fresh
@@ -108,8 +103,8 @@ PTYs.
   channels, and in-flight requests are not snapshotted.
 - **No server-native state or pubsub.** Retained shared data remains KV's job;
   live protocols and fan-out are libraries over channels.
-- **No new durable message broker.** Channel and process streams have explicit
-  windows. The connection handler retains its existing production-side
+- **No new durable message broker.** Channel streams have explicit windows.
+  The connection handler retains its existing production-side
   backpressure behavior; extension-only transport buffers have explicit byte
   ceilings and a slow-consumer timeout.
 - **No requirement that channel payloads use JSON.** Payloads are opaque
@@ -118,12 +113,9 @@ PTYs.
   server. Their descriptors provide discovery and help, not a local executable
   or client-side argument validator.
 
-The three advertised families are independently negotiable and may land in
-separate implementation PRs. Channels and processes are useful to ordinary
-clients without Wasm; processes have no dependency on channels. Only
-extension-provided CLI commands require both the extension and channel
-families. They remain in one RFC so the end-to-end extension contract is
-reviewed in one place.
+The extension and channel families are independently negotiable and may land
+in separate implementation PRs. Channels are useful to ordinary clients
+without Wasm. Extension-provided CLI commands require both families.
 
 ## Example extensions
 
@@ -138,12 +130,13 @@ blit --on prod @ship plan main
 blit --on prod @ship deploy --environment eu-prod --revision 8c4f2d1
 ```
 
-`ship` stays warm as a persistent extension. It inspects Git, runs tests and
-deployment tools through `PROCESS_*`, streams a structured plan and live output
-over the invocation channel, and records idempotency keys and the release ledger
-in KV. Disconnecting cancels only the command; the supervised release policy can
-decide whether the underlying operation should stop or continue. This is a
-small, inspectable deployment service distributed as one Wasm object.
+`ship` stays warm as a persistent extension. It inspects Git, coordinates
+existing deployment PTYs and services through ordinary Blit packets, streams a
+structured plan and live output over the invocation channel, and records
+idempotency keys and the release ledger in KV. Disconnecting cancels only the
+command; the supervised release policy can decide whether the underlying
+operation should stop or continue. This is a small, inspectable deployment
+service distributed as one Wasm object.
 
 ### `@workspace`: one query surface over Git, FS, and LSP
 
@@ -183,7 +176,7 @@ blit ext run --on ci --restart always --persist --name test-web testgrid.wasm we
 ```
 
 The module uploads once, but each extension gets its own ID, arguments, thread,
-endpoint, processes, and restart history. Shards claim work through KV and send
+endpoint, and restart history. Shards claim work through KV and send
 live results to an aggregator over channels. An operator can restart one shard,
 update a canary to a new hash, or compare revisions without disturbing the
 others. This is the concrete reason module identity and extension identity must
@@ -229,7 +222,7 @@ blit --on prod @incident capture api --since 10m
 ```
 
 The extension snapshots relevant Git identity, terminal cwd and screen state,
-output from diagnostic processes it launches, server-visible task metadata, and
+output from diagnostic PTYs and services, server-visible task metadata, and
 selected files, then streams a content-typed result. The same command can
 simultaneously feed a browser over a second channel. Since the descriptor is
 only presentation metadata, a newer definition can add richer collection logic
@@ -243,7 +236,7 @@ flowchart LR
     Extension["Wasmi extension thread"] -->|complete packets| Adapter["Bounded host adapter"]
     Adapter -->|private in-memory duplex| Handler
     Handler --> Existing["Terminal / FS / Git / LSP / …"]
-    Handler --> Fabric["Channel / process fabric"]
+    Handler --> Fabric["Native channel fabric"]
 ```
 
 The current `handle_client` connection loop is already generic over an async
@@ -279,35 +272,29 @@ The read loop selects on the attempt cancellation token and exits through the
 normal connection cleanup path. The supervisor awaits that cleanup before a
 replacement attempt starts. It must not abort `handle_client`, which could
 detach its writer task and leave connection-scoped filesystem syncs, Git
-repositories, LSP attachments, KV subscriptions, relayed sockets, processes,
-or channels alive past the attempt.
+repositories, LSP attachments, KV subscriptions, relayed sockets, or channels
+alive past the attempt.
 
 `handle_client` cleanup itself must close or abort **and then await** its writer
 task before returning. Awaiting only the read loop is insufficient: the writer
 may still own queued packet envelopes and their byte or object guards. During
-endpoint teardown, channel and process cleanup drops queued terminal frames
-rather than awaiting their delivery; the closing writer then drops those frames
+endpoint teardown, channel cleanup drops queued final channel frames rather
+than awaiting their delivery; the closing writer then drops those frames
 and releases their guards. This ordering avoids a cleanup cycle while making a
 returned handler a real barrier: no old writer, outbox allocation, family
 reservation, or connection job survives into a replacement attempt.
 
-Some existing request handlers also launch one-shot blocking work which today
-may outlive a disconnected network handler after its reply sender is dropped.
-Version 1 routes every server blocking job, regardless of connection origin,
-through one wrapper which registers completion in a process-wide shutdown
-registry; direct unregistered `spawn_blocking` from a packet handler is not
-allowed. Network-origin jobs keep their current disconnect behavior: their
-connection handler need not await them after the reply sender is dropped, and
-they do not consume extension admission permits. Extension-origin jobs
-additionally enter the connection job tracker: cooperative jobs receive the
+Some existing request handlers also launch one-shot blocking work which may
+outlive a disconnected network handler after its reply sender is dropped.
+Extension origin adds a connection job tracker: cooperative jobs receive the
 attempt cancellation token, every spawned job registers its completion, and a
 non-cancellable blocking library call is allowed to finish but remains joined.
 `handle_client` cleanup does not complete, and the supervisor does not start a
-replacement attempt, until that extension set is empty. This prevents a
+replacement attempt, until that tracked set is empty. This prevents a
 crash-looping extension from accumulating searches or opens across attempts
-without changing observable network-disconnect behavior. The shutdown
-coordinator waits on the process-wide registry for both origins, so an orphaned
-network job cannot hide from the global grace deadline.
+without changing observable network-disconnect behavior. A server-wide audit
+and bounded shutdown policy for pre-existing network-origin blocking work is
+separate hardening, not part of this RFC.
 
 The tracker is an admission boundary as well as a join set. The reader first
 classifies the bounded opcode/kind envelope. Its narrow bypass lane contains
@@ -331,9 +318,9 @@ the reader observes and classifies packets in connection order, but an admitted
 native job may complete after a later independent request. A family with a
 client-assigned object ID must reserve a bounded provisional generation during
 registration so two pending creates cannot claim the same ID. It must then
-either define pre-success operations on that generation or require clients to
-await creation; the process family below chooses the latter. An implementation
-must not silently rely on synchronous dispatch order for such a dependency.
+define the ordering of operations against that pending generation. An
+implementation must not silently rely on synchronous dispatch order for such a
+dependency.
 
 The defaults allow 32 active and 32 pending records per extension endpoint,
 128 active and 128 pending records server-wide, and 16 MiB/64 MiB of combined
@@ -393,7 +380,7 @@ Closing the duplex wakes a blocked host call and runs ordinary connection
 cleanup. A best-effort `EXT_EXIT` may reach followers, but cleanup never
 depends on fitting it into the failed endpoint.
 
-Channel and process data have their own credit windows. Each supervisor appends
+Channel data has its own credit windows. Each supervisor appends
 `EXT_EVENT`, uncorrelated `EXT_INFO(STATUS)`, and `EXT_EXIT` records to one
 bounded retained-output log in generation order. Every following logical
 connection has a cursor into that log. One scheduler per logical connection
@@ -453,8 +440,8 @@ process-local, non-zero `task_id` and logical client endpoint. Task allocation
 does not reuse an ID while it is live; zero is reserved for every non-`RUNNING`
 snapshot. Destroying an attempt
 therefore closes its connection-scoped subscriptions, filesystem/Git/LSP
-handles, relays, native-channel listeners and connections, and `PROCESS_*`
-children before the supervisor considers another attempt. An `EXT_RUN` without
+handles, relays, and native-channel listeners and connections before the
+supervisor considers another attempt. An `EXT_RUN` without
 `DETACH` also creates an attached child supervisor owned by that logical
 connection. Endpoint cleanup recursively cancels and fully cleans those child
 supervisors before it completes. This ownership relation is a tree because it
@@ -667,9 +654,9 @@ reservation in place. Thus a second maximum `Vec` cannot appear behind an
 in-flight one, at most one additional frame exists per direction, and the full
 32 MiB handoff storage is charged to the transport bounds below.
 
-No separate argument, logging, or process imports are needed. Guest logs and
-structured output are `EXT_EVENT` packets. Child processes and other Blit
-facilities remain ordinary protocol operations.
+No separate argument or logging imports are needed. Guest logs and structured
+output are `EXT_EVENT` packets. Existing Blit facilities remain ordinary
+protocol operations.
 
 ### Bootstrap identity and arguments
 
@@ -794,8 +781,8 @@ The SDK also performs protocol housekeeping. In particular, typed terminal
 subscriptions send `C2S_ACK` only after each logical `S2C_UPDATE` has been
 applied or deliberately discarded. A guest using the raw packet API must do
 the same; otherwise the terminal frame window eventually stops producing
-updates. Channel and process wrappers likewise advance their family ACKs only
-after application consumption.
+updates. Channel wrappers likewise advance their family ACKs only after
+application consumption.
 
 ### Dedicated execution thread
 
@@ -1161,7 +1148,7 @@ through `LIST`; wire control continues to use unambiguous 64-bit IDs.
 uses `ENABLE` to restore the saved desired-running state. `REMOVE` requires the
 definition to be disabled **and quiescent**: phase `STOPPED` or non-running
 `BLOCKED`, with no attempt, endpoint, writer, ownership subtree, tracked job,
-process/channel guard, or thread left. `DISABLE` is asynchronous after its
+family guard, or thread left. `DISABLE` is asynchronous after its
 correlated reply, and the operator waits for that quiescent status before
 removal. A premature `REMOVE` returns `CONFLICT` and changes nothing. Once
 quiescent, one durable transaction deletes the definition, releases its object
@@ -1179,8 +1166,8 @@ reply, and returns without awaiting teardown. The supervisor then performs
 cancellation, replacement, and cleanup asynchronously. This preserves the
 one-reply ordering rule and prevents a handler from waiting for its own
 connection to exit. No replacement attempt becomes reachable until the old
-handler, writer, jobs, ownership subtree, process/channel guards, and thread
-have crossed the cleanup barrier.
+handler, writer, jobs, ownership subtree, family guards, and thread have
+crossed the cleanup barrier.
 
 `EXT_EVENT` is accepted only from the live in-process endpoint whose immutable
 attempt generation matches the extension. Dispatch is enabled only after that
@@ -1703,7 +1690,7 @@ The client and server handle an update as follows:
 Submitting the exact current hash, arguments, and restart policy is an
 idempotent success: it neither increments revision nor restarts an attempt. A
 failed upload or validation leaves the old definition and attempt unchanged.
-The old attempt's channels, processes, command listener, and endpoint close
+The old attempt's channels, command listener, and endpoint close
 normally before the new attempt becomes reachable. Its command advertisement
 is removed as part of the definition commit, before the old attempt is asked to
 exit. Command calls are never retried across that boundary.
@@ -2054,257 +2041,15 @@ automatically retried against a restarted attempt. One attempt may accept many
 invocation channels, but it still has one Wasmi thread; its SDK event loop must
 multiplex them or deliberately serialize work.
 
-## Process family
+## Deferred process execution
 
-Feature bit **13** (`FEATURE_PROCESS`) advertises non-PTY child-process
-execution. The family occupies the free direction-local `0xC0` through
-`0xC5` block. Git reserves `0xB5` through `0xBF`, so this RFC does not consume
-that space.
-
-This is a normal blit family. A Wasmi extension reaches it through `blit_v1.send`
-and `blit_v1.recv`; a network client sends the same packets over its existing
-transport. The server implementation is shared. When `FEATURE_PROCESS` is
-advertised, every logical client may use it.
-
-Process IDs are client-allocated 32-bit integers scoped to one logical
-endpoint. A pending generation holds its ID until its own failed
-`PROCESS_STARTED` is emitted or it becomes started; a started generation holds
-it through its final `PROCESS_EXIT`. A conflicting spawn acquires no generation
-and cannot infer the existing one's lifetime from its `CONFLICT` reply.
-Integers are little-endian. Arguments and
-environment values are arbitrary bytes without NUL; environment keys also
-cannot contain `=`. That byte-preserving form applies on Unix. On Windows,
-program paths, arguments, environment keys and values, and explicit cwd must be
-valid UTF-8; the server converts them to the native wide-character process API
-and returns `INVALID` for non-UTF-8 input. Stream payloads are unrestricted
-bytes on every platform.
-
-Admission of a decodable `PROCESS_SPAWN` atomically installs a bounded pending
-generation for its process ID before the request waits for a tracked-job
-permit. A duplicate spawn therefore receives `CONFLICT` even while the first
-is pending. The client **must wait for `PROCESS_STARTED(status = OK)` before
-sending `PROCESS_STDIN`, `PROCESS_OUTPUT_ACK`, or `PROCESS_CONTROL` for that
-generation**. Before that success reply, stream packets are ignored and a
-control receives `UNKNOWN_ID`; process control is not a pending-spawn
-cancellation mechanism. A network client can abandon the operation by closing
-its endpoint, and an extension can cancel its attempt or close its endpoint.
-Failure, cancellation, or endpoint cleanup removes the pending generation and
-makes the ID reusable only after its correlated spawn outcome has been emitted
-or the endpoint is gone.
-
-### Client to server
-
-| Opcode | Name                 | Layout                                                                                                                                                                     |
-| ------ | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `0xC0` | `PROCESS_SPAWN`      | `[nonce:2][process_id:4][flags:1][cwd_kind:1][src_pty_id:2][cwd_len:4][cwd:N][argc:2] repeated{[len:4][arg:M]}[envc:2] repeated{[key_len:2][key:K][value_len:4][value:V]}` |
-| `0xC1` | `PROCESS_STDIN`      | `[process_id:4][offset:8][data:N]`                                                                                                                                         |
-| `0xC2` | `PROCESS_OUTPUT_ACK` | `[process_id:4][stream:1][bytes:8]`                                                                                                                                        |
-| `0xC3` | `PROCESS_CONTROL`    | `[nonce:2][process_id:4][action:1][value:4]`                                                                                                                               |
-
-`PROCESS_SPAWN` executes `argv[0]` directly. It never invokes a shell;
-clients which want shell parsing must explicitly run a shell with an argument
-such as `-c`. A process ID already live or terminally draining receives
-`PROCESS_STARTED(status = CONFLICT)` with zero windows and leaves that process
-unchanged. `argc` must be non-zero. Argument count, per-argument bytes, and
-combined bytes use the same caps as extension arguments. `envc` is capped at 256,
-each environment key at 255 bytes, each value at 64 KiB, and combined key and
-value bytes at 1 MiB. On Unix, duplicate keys are compared as exact bytes. On
-Windows they are compared with the native environment's case-insensitive key
-semantics after UTF-8 conversion, so spellings such as `Path` and `PATH` are
-duplicates. Duplicate keys are `INVALID`.
-
-Spawn flags are bit 0 `MERGE_STDERR` and bit 1 `CLEAR_ENV`; any other bit is
-`INVALID`. Process replies reuse the common status values, including
-`PERMISSION`. Process-count or stream-window reservation failure returns
-`PROCESS_STARTED(status = BUDGET)` before creating a child. By default the child receives a small server-defined baseline
-such as `PATH`, locale, and a temporary directory, plus the explicit
-environment entries. `CLEAR_ENV` removes that baseline. The server never
-implicitly forwards credentials, file descriptors, or `BLIT_*` variables.
-Explicit environment entries replace baseline entries.
-
-`cwd_kind` is 0 for the server's default directory, 1 for the explicit
-`cwd`, and 2 for the current directory of `src_pty_id`. For kind 1, `cwd` is
-non-empty, contains no NUL, and is at most 4 KiB; on Unix it is otherwise raw
-path bytes, while Windows applies the UTF-8 rule above. Fields unused by the
-selected kind must be empty or zero. Values 3 through 255 and any invalid
-unused-field combination return `PROCESS_STARTED(status = INVALID)` with zero
-windows. Resolving a terminal directory happens
-atomically during spawn and does not attach the new process to that terminal.
-For `cwd_kind = 2`, an unknown terminal or one without a current directory,
-including an exited terminal, refuses the spawn with
-`PROCESS_STARTED(status = NOT_FOUND)` and zero windows. The server must not
-fall back to its default directory or interpret the empty relative path as an
-absolute root.
-
-`PROCESS_OUTPUT_ACK.stream` is 1 for stdout and 2 for stderr. It acknowledges total
-payload bytes delivered to the application, not merely received by a socket.
-When stderr is merged, `PROCESS_STARTED.stderr_window` is zero, the server sends
-merged bytes only as `PROCESS_STDOUT`, and a stderr ACK is a protocol violation
-for that process. Stream values other than 1 or 2 are the same violation.
-
-Control actions are:
-
-| Value | Name          | Meaning                                                    |
-| ----- | ------------- | ---------------------------------------------------------- |
-| 1     | `CLOSE_STDIN` | Deliver EOF after all accepted stdin bytes                 |
-| 2     | `TERMINATE`   | Request platform-supported graceful tree termination       |
-| 3     | `KILL`        | Force termination of the process tree                      |
-| 4     | `SIGNAL`      | Send the platform signal in `value`, or report unsupported |
-
-`value` must be zero except for `SIGNAL`. On Unix, `TERMINATE` sends `SIGTERM`
-to the tracked process group; on Windows it sends `CTRL_BREAK` only when the
-child was successfully placed in an eligible process group with a usable
-console-control path. If that Windows path is unavailable, `TERMINATE` returns
-`PROCESS_CONTROLLED(status = OTHER)` with detail and leaves the process
-running—there is no generic graceful job-object operation. An accepted
-`TERMINATE` waits the configured grace and then uses the forceful operation.
-`KILL` is the portable forceful action: `SIGKILL` to the Unix group or
-`TerminateJobObject` on Windows. Signal numbers for `SIGNAL` are deliberately
-platform-specific.
-The initial family has no detach operation. Action value 0 and values 5 through 255 are
-reserved; an unknown action receives `PROCESS_CONTROLLED(status = INVALID)` and
-does not affect the process. New actions require explicit feature negotiation.
-For `SIGNAL`, a malformed or invalid native signal number returns `INVALID`;
-a valid signal operation which the platform cannot provide returns `OTHER`
-with an explanatory detail.
-
-### Server to client
-
-| Opcode | Name                 | Layout                                                                                          |
-| ------ | -------------------- | ----------------------------------------------------------------------------------------------- |
-| `0xC0` | `PROCESS_STARTED`    | `[nonce:2][status:1][process_id:4][stdin_window:8][stdout_window:8][stderr_window:8][detail:N]` |
-| `0xC1` | `PROCESS_STDOUT`     | `[process_id:4][offset:8][data:N]`                                                              |
-| `0xC2` | `PROCESS_STDERR`     | `[process_id:4][offset:8][data:N]`                                                              |
-| `0xC3` | `PROCESS_STDIN_ACK`  | `[process_id:4][bytes:8]` — cumulative consumed stdin bytes                                     |
-| `0xC4` | `PROCESS_EXIT`       | `[process_id:4][reason:1][code:u32][detail:N]`                                                  |
-| `0xC5` | `PROCESS_CONTROLLED` | `[nonce:2][status:1][process_id:4][detail:N]`                                                   |
-
-`PROCESS_STARTED` is the single reply to `PROCESS_SPAWN`. On failure,
-`status != OK`, the windows are zero, no `PROCESS_EXIT` follows, and the ID is
-released after that reply **unless** the status is `CONFLICT`. A conflicting
-request owns no generation: the pre-existing pending generation releases the
-ID after its own failed `PROCESS_STARTED` or promotes to a started generation,
-which releases it only after `PROCESS_EXIT`.
-Every `PROCESS_CONTROL` receives one
-`PROCESS_CONTROLLED`; accepted control is serialized with process exit so the
-reply precedes an exit caused by that action.
-Every process-family `detail` is UTF-8 capped at 4 KiB.
-
-Stdout and stderr each preserve byte order but have no relative ordering with
-one another. They are raw bytes, not UTF-8 and not line-framed. Offsets begin
-at zero. On the normal connected path, the server reads both OS pipes
-concurrently. Direct-child exit is also the automatic cleanup point for the
-rest of its non-detachable process tree: the server closes stdin, sends
-`SIGTERM` to a remaining Unix process group (or force-terminates a remaining
-Windows job, which has no generic graceful operation), and drains output during
-the configured grace. It then force-kills anything still tracked and closes
-its pipe readers instead of waiting forever for inherited FDs. After the direct
-child is reaped and every already-accepted output frame is delivered or dropped
-with the endpoint, it emits the single terminal `PROCESS_EXIT`; no stream data
-follows it. The reason and code preserve the direct child's outcome, with a
-detail when residual descendants had to be terminated; failure of Blit's wait,
-pipe, or tree-cleanup machinery instead reports `HOST_FAILURE`. Exit reasons
-are:
-
-| Value | Name                 | Meaning                                               |
-| ----- | -------------------- | ----------------------------------------------------- |
-| 0     | `RETURNED`           | The child returned normally                           |
-| 1     | `SIGNALLED`          | The child died from a platform signal                 |
-| 2     | `KILLED`             | Blit force-killed the child or its process tree       |
-| 3     | `PROTOCOL_VIOLATION` | Invalid stream sequencing forced process termination  |
-| 4     | `HOST_FAILURE`       | Spawn, wait, or pipe handling failed after start      |
-
-Values 5 through 255 are reserved. An unknown reason still terminates the
-process record and is preserved for diagnostics.
-`PROCESS_EXIT.code` is a little-endian `u32`. It is the native exit status for
-`RETURNED`, the platform signal number for `SIGNALLED`, and zero for every
-other reason.
-
-### Flow control and ownership
-
-The three stream windows are independent cumulative byte windows. The client
-may send stdin through `acked_stdin + stdin_window`; the server may send each
-output stream through its client ACK plus that stream's negotiated window.
-The default window is 1 MiB for each active stream and one stream-data packet
-may carry at most 256 KiB; a merged or closed stderr stream has a zero window.
-The first `PROCESS_STDIN.offset` is zero, and every later value must equal the
-total stdin payload bytes previously accepted from that endpoint; it does not
-advance merely because a malformed packet was received.
-The server advances `PROCESS_STDIN_ACK` only after the bytes have been accepted
-by the child's stdin pipe. Stream data is non-empty, and at most 1,024
-unacknowledged packets may exist on each stream; reaching the byte window or
-packet cap applies backpressure to a conforming sender. Receiving a 1,025th
-unacknowledged packet, even when byte credit remains, is a protocol violation
-for that process. Every ACK is monotonic and no greater than the bytes actually
-sent. Offsets, ACKs, and window arithmetic use checked `u64` operations and
-never wrap.
-An incorrect offset, invalid ACK, or window overrun is a protocol
-violation for that process. Normal backpressure stops reading or writing the
-corresponding OS pipe and lets the child block; it never creates an unbounded
-server queue.
-
-The no-reply stream operations are deterministic around teardown.
-`PROCESS_STDIN` or `PROCESS_OUTPUT_ACK` for an absent, failed, exited, or
-terminally draining process ID is ignored. On a live process, stdin after an
-accepted `CLOSE_STDIN`, an ACK for an inactive merged-stderr stream, an invalid
-stream number, or any other wrong-state stream operation terminates that
-process and emits `PROCESS_EXIT(PROTOCOL_VIOLATION)`. While the process record
-is live, a repeated `PROCESS_CONTROL(CLOSE_STDIN)` still receives its
-correlated idempotent `OK`; controls on an absent or final process receive
-`UNKNOWN_ID`. Waiting for successful `PROCESS_STARTED`, connection ordering,
-and the no-reuse-before-final-reply rule together keep ignored stale operations
-from crossing into a later process generation.
-
-Every child belongs to its creating logical endpoint and, for an extension, to
-the current attempt. Endpoint close, attempt cancellation, a trap, or accepted
-`TERMINATE`/`KILL` closes stdin, gracefully terminates the tracked process group
-or Windows job when requested, waits the configured grace where applicable,
-and force-kills what that primitive still contains. After the kill point,
-cleanup cancels pipe-reader tasks and closes Blit's pipe ends without waiting
-for EOF, so an escaped descendant which inherited an output FD cannot stall a
-control, endpoint teardown, or extension replacement. The server always
-reaps the direct child. Normal direct-child exit applies the same residual-tree
-and pipe-reader cleanup automatically, because version 1 has no detach mode; a
-background descendant cannot keep a process record or its reservations alive.
-A descendant which
-deliberately escapes a POSIX process group is outside this guarantee unless the
-deployment supplies a cgroup or equivalent containment. A restarted extension
-attempt gets no handles to the previous attempt's children. Persistent
-extensions must therefore assume that an interrupted subprocess side effect
-can be repeated after restart.
-
-Children run with the blit server's OS identity. Wasm isolation does not
-sandbox a native child; deployments which need that separation must sandbox
-the blit server or its process runner externally.
-
-Programs requiring a controlling terminal continue to use the terminal
-family. `PROCESS_*` is intentionally pipe-based; adding PTY flags here would
-create two subtly different terminal APIs.
-
-### SDK surface
-
-The guest SDK presents Rust-shaped convenience without changing the host ABI:
-
-```rust
-let mut child = blit
-    .process()
-    .command("rg")
-    .arg("needle")
-    .cwd("/workspace")
-    .spawn()?;
-
-while let Some(event) = child.recv()? {
-    match event {
-        ProcessEvent::Stdout(bytes) => consume(bytes)?,
-        ProcessEvent::Stderr(bytes) => report(bytes)?,
-        ProcessEvent::Exit(status) => return status.into_result(),
-    }
-}
-```
-
-The SDK multiplexes process events with every other server packet and sends
-ACKs only after the application consumes data. It does not attempt to make
-`std::process::Command` work transparently on a core Wasm target.
+Pipe-oriented non-PTY child processes are a useful client facility, but they
+are independent of Wasmi extensions and native channels. They belong in a
+separate RFC. This proposal adds no subprocess host imports and does not
+reserve a process packet family. An extension can use existing
+`CREATE2(HAS_COMMAND)` PTYs when terminal semantics are appropriate; if the
+separate process family is implemented and advertised later, packet parity will
+make it available without changing the guest ABI.
 
 ## Server capacity and failure isolation
 
@@ -2355,7 +2100,6 @@ feature gates below, are sampled once at server startup. Initial defaults are:
 | Wasmi call depth per attempt                       |                           1,024 | `BLIT_EXT_CALL_DEPTH_MAX`     |
 | Native stack per extension thread                  |                           2 MiB | `BLIT_EXT_STACK_SIZE`         |
 | Fuel per driver slice                              |                       1,000,000 | `BLIT_EXT_FUEL_SLICE`         |
-| Graceful server shutdown barrier                    |                            10 s | `BLIT_EXT_SHUTDOWN_GRACE`     |
 
 `BLIT_EXT_MAX_RUNNING` is validated in the range 1 through 4. The terminal
 record reserve is computed at startup from `BLIT_EXT_MAX_TRANSIENT` and the
@@ -2363,8 +2107,8 @@ fixed maximum encodings of the compact final status/exit records; 1.1 MiB is
 the rounded planning value when the transient cap is 128, not a fixed reserve
 after that cap changes.
 
-Channels and processes likewise have uniform server policy and no client
-resource-tuning fields:
+Channels likewise have uniform server policy and no client resource-tuning
+fields:
 
 | Resource                                      | Default | Server setting                       |
 | --------------------------------------------- | ------: | ------------------------------------ |
@@ -2373,30 +2117,23 @@ resource-tuning fields:
 | Connected channel handles per logical endpoint |     64 | `BLIT_CHANNEL_MAX_PER_CLIENT`        |
 | Connected channel pairs server-wide           |     128 | `BLIT_CHANNEL_MAX_CONNECTED`         |
 | Reserved channel windows server-wide          | 256 MiB | `BLIT_CHANNEL_BUFFER_MAX`            |
-| Child processes per logical endpoint          |      16 | `BLIT_PROCESS_MAX_PER_CLIENT`        |
-| Child processes server-wide                   |      64 | `BLIT_PROCESS_MAX_RUNNING`           |
-| Reserved process-stream windows server-wide   | 192 MiB | `BLIT_PROCESS_BUFFER_MAX`            |
-| Grace before force-killing a process group/job |     2 s | `BLIT_PROCESS_KILL_GRACE`            |
 
 A successful channel pair reserves both 1 MiB direction windows against the
-channel byte budget before either handle becomes visible. A process spawn
-reserves its active 1 MiB stdin/stdout/stderr windows before creating the child;
-merged stderr reserves no separate stderr window. Admission which cannot
-reserve a handle, count, or full window fails with `BUDGET` and creates nothing,
-so dispatch never has to reject data already promised by an advertised window.
-Storage remains lazy inside the reservation.
+channel byte budget before either handle becomes visible. Admission which
+cannot reserve a handle, count, or full window fails with `BUDGET` and creates
+nothing, so dispatch never has to reject data already promised by an advertised
+window. Storage remains lazy inside the reservation.
 
-Closing a handle or reaping a process does not immediately release its count or
-byte reservation. The object enters a draining terminal state until every
-already-emitted channel/process frame, including its final `CLOSED` or
-`PROCESS_EXIT`, has either been completely written by the endpoint writer or
-dropped with that endpoint. Only then are its admission slot and reservation
-released. In-flight payload therefore remains charged while it sits in the
-network connection's intentionally unbounded generic outbox; a stalled writer
-cannot repeatedly close objects and recycle the same budget into unbounded
-family data. The per-window 1,024-message limits bound framing and queue-node
-overhead, which remains implementation-dependent allocator overhead rather
-than part of the payload-byte budget.
+Closing a handle does not immediately release its count or byte reservation.
+The object enters a draining terminal state until every already-emitted channel
+frame, including its final `CLOSED`, has either been completely written by the
+endpoint writer or dropped with that endpoint. Only then are its admission slot
+and reservation released. In-flight payload therefore remains charged while it
+sits in the network connection's intentionally unbounded generic outbox; a
+stalled writer cannot repeatedly close objects and recycle the same budget into
+unbounded family data. The per-window 1,024-message limits bound framing and
+queue-node overhead, which remains implementation-dependent allocator overhead
+rather than part of the payload-byte budget.
 
 Transient supervisors and pending persistent creations retain their arguments
 in memory and reserve the exact encoded bytes from the argument-store budget
@@ -2419,17 +2156,12 @@ resident only while those global reservations fit.
 
 The default count caps additionally bound stored channel metadata to about
 80 MiB (64 MiB of listener metadata, 16 MiB across connected pairs, and under
-64 KiB of bounded peer labels). The
-channel and process window reservations add at most 448 MiB of server buffers;
-kernel pipe storage and native child memory are separate. The process count
-bounds only roots tracked by Blit: descendant count, address space, and a
-child's ability to escape a process group require OS jobs, cgroups, rlimits, or
-equivalent deployment containment. Wasmi does not sandbox native children.
-Together with the four-running-attempt extension example below, the
-server-visible buffer and metadata plan is about 2.09 GiB at simultaneous full
-admission, before the explicitly unaccounted engine, allocator, kernel, and
-child-process costs. A smaller host-derived running default produces a smaller
-number.
+64 KiB of bounded peer labels). Channel window reservations add at most 256 MiB
+of server buffers. Together with the four-running-attempt extension example
+below, the server-visible buffer and metadata plan is about 1.90 GiB at
+simultaneous full admission, before the explicitly unaccounted engine,
+allocator, and kernel costs. A smaller host-derived running default produces a
+smaller number.
 
 The 128 MiB linear-memory default leaves room for the SDK to retain a complete
 64 MiB logical response while receiving its current 16 MiB fragment and still
@@ -2453,13 +2185,13 @@ allocations made inside a native backend after it consumes the bounded request
 remain backend costs rather than retained-request bytes. Their lifetime is
 bounded by job permits, the validation semaphore, and running permits, but
 Wasmi exposes no exact aggregate-RSS limiter. Startup diagnostics
-must compute and report the extension subtotal, channel/process
+must compute and report the extension subtotal, channel
 reservation-and-metadata subtotal, combined plan, and unaccounted-runtime
 caveat from the host's actual sampled defaults and configured overrides. The
-1,609 MiB, 528 MiB, and roughly 2.09 GiB figures are the four-attempt/default-
+1,609 MiB, 336 MiB, and roughly 1.90 GiB figures are the four-attempt/default-
 other-settings example, not constants. Changing the transient cap also
 recomputes and reports the compact terminal-record reserve. Diagnostics must
-not present only per-attempt numbers or claim a hard process-memory envelope.
+not present only per-attempt numbers or claim a hard resident-memory envelope.
 
 The output store is allocated on demand. Production first allocates the next
 sequence, then evicts whole oldest records from that supervisor to its 4 MiB
@@ -2582,30 +2314,13 @@ boundary. Host callbacks must therefore validate fallible input and return
 errors without panicking; changing the process-wide panic strategy is separate
 work.
 
-Server shutdown is coordinated, not a fixed sleep after detached connection
-tasks. `C2S_QUIT`, SIGTERM, and ordinary server teardown trigger one broadcast
-cancellation token observed by every logical endpoint, supervisor, and process
-registry. The coordinator first stops new extension/process/channel admission
-and restart scheduling, preserves persistent enabled/desired state without
-recording failure, then cancels all attempts and endpoints, terminates their
-process groups/jobs, and awaits the registered handler, writer, tracked-job,
-family-guard, and extension-thread barriers. `SERVER_SHUTDOWN` lifecycle output
-is best effort because a closing or slow follower may not receive it.
-
-The coordinator waits up to the configured ten-second server grace for every
-endpoint barrier and the process-wide blocking-job registry. If all complete,
-shutdown is clean and ordinary runtime drop has no blocking work left to join.
-If any extension- or network-origin blocking job or other non-cooperative
-`STOPPING` work remains, it logs the exact known connection,
-extension/attempt, and job identities after the persistent-state transactions
-above are durable, flushes the diagnostic sink, and takes an explicit non-zero
-`std::process::exit` path. It must **not** return through the ordinary CLI
-runtime drop: Tokio waits indefinitely for a running `spawn_blocking` task when
-that runtime is dropped, which would defeat the grace bound. Forced process
-termination intentionally skips Rust destructors and ends every native thread;
-the process never detaches the work or continues a new server generation. This
-is the only safe bounded shutdown behavior for an unkillable in-process
-syscall.
+`C2S_QUIT`, SIGTERM, and ordinary server teardown stop new extension/channel
+admission and restart scheduling, preserve persistent enabled/desired state
+without recording failure, then cancel attempts and logical endpoints through
+their normal cleanup paths. `SERVER_SHUTDOWN` lifecycle output is best effort
+because a closing or slow follower may not receive it. A non-cooperative native
+job remains subject to the existing server shutdown behavior; a server-wide
+blocking-job registry and hard shutdown deadline are separate hardening.
 
 The server must validate all extension packets exactly as it validates
 network packets. In-process origin is not trusted origin.
@@ -2616,11 +2331,9 @@ Wasmi is a memory- and fault-containment boundary, not a least-authority
 sandbox. A running extension has the authority of a normal Blit endpoint: it
 may send any valid C2S packet. Feature-gated families are available when
 advertised, while ungated administrative packets such as `C2S_QUIT` remain
-available. Children created by `PROCESS_SPAWN` run as the server OS user. That
-execution authority is not new: an ordinary endpoint can already use
-`CREATE2(HAS_COMMAND)` to execute an arbitrary command in a PTY. `PROCESS_*`
-adds pipe-oriented semantics, and persistent extensions make such activity
-durably restartable; neither adds privilege separation.
+available. An ordinary endpoint can already use `CREATE2(HAS_COMMAND)` to
+execute an arbitrary command in a PTY; persistence makes that existing endpoint
+authority durably restartable. Wasmi does not add privilege separation.
 
 Anyone allowed to connect to Blit or install an extension must therefore be
 trusted with the server's existing endpoint authority. Deployments needing a
@@ -2664,28 +2377,25 @@ the existing `BLIT_LSP=0` precedent:
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `BLIT_EXT=0`     | omit feature bit 11, refuse `EXT_*`, and do not restore or start persistent attempts; definitions and CAS objects remain untouched |
 | `BLIT_CHANNEL=0` | omit feature bit 12 and refuse new channel listeners and connections                                                               |
-| `BLIT_PROCESS=0` | omit feature bit 13 and refuse process spawn/control; this does not disable command execution through PTYs                         |
 
 The switches are sampled once at startup. Network and in-process endpoints
 receive the same resulting `HELLO` feature mask. Every decodable disabled-family
 request which normally has a reply still receives exactly one matching response
-with `PERMISSION`: failed channel opens have zero window, failed process spawns
-echo the client-allocated process ID with zero windows, and extension replies
+with `PERMISSION`: failed channel opens have zero window, and extension replies
 use the normal response envelope for the requested kind. A refused `EXT_RUN`
 echoes the requested hash with phase, IDs, revision, attempt, task, replay,
 last-running attempt, output sequence, and time all zero; `EXT_PUT_STATUS` echoes the hash with
-`received = 0`; `EXT_CONTROL` echoes
-the requested extension ID when decodable; and `LIST` or `COMMANDS` returns
-zero records and zero cursor. `PROCESS_CONTROLLED` likewise echoes a decodable
-requested process ID. Beyond the correlation nonce, status, and fields
+`received = 0`; `EXT_CONTROL` echoes the requested extension ID when decodable;
+and `LIST` or `COMMANDS` returns zero records and zero cursor. Beyond the
+correlation nonce, status, and fields
 explicitly echoed here, every fixed reply field is zero. No handle or pending
 operation is created. Fire-and-forget packets in a disabled family are dropped.
 
 The family switches and every capacity setting in both tables also have
 explicit `blit server` flags using kebab-case names; for example
-`--no-extensions`, `--no-channels`, `--no-processes`, `--ext-max-running`,
-`--channel-max-connected`, and `--process-max-running`. A command-line value
-overrides its environment equivalent.
+`--no-extensions`, `--no-channels`, `--ext-max-running`, and
+`--channel-max-connected`. A command-line value overrides its environment
+equivalent.
 `BLIT_EXT=0` is a hard disable and therefore cannot be used to manage the
 catalog; omit only the persistent-execution opt-in when recovery access is
 needed.
@@ -2797,7 +2507,7 @@ and the full content hash.
 
 ## Protocol compatibility
 
-Clients check feature bits 11, 12, and 13 before sending these families. Older
+Clients check feature bits 11 and 12 before sending these families. Older
 clients ignore their S2C opcodes. Older servers do not advertise them, and
 `blit ext run` reports that extension support is unavailable—whether because
 the server build predates it or the operator disabled it—rather than attempting
@@ -2840,8 +2550,8 @@ reads.
 
 Adding a runtime-specific `proc_spawn` or `exec` import would couple extensions
 to that runtime, expose process execution only to Wasm guests, and still require
-blit-specific lifecycle glue. The process packet family provides the same
-streaming operation to all clients without adding another Wasm import.
+blit-specific lifecycle glue. A separate client-protocol RFC can provide the
+same operation to all clients without adding another Wasm import.
 
 ### Kernel loopback socket
 
@@ -2874,7 +2584,7 @@ consumer.
 
 Wasmi is a pure-Rust interpreter, requires no JIT or executable-memory policy,
 cross-compiles with Blit's existing toolchain, and is adequate for extensions
-expected to spend most of their time on packet and process I/O. A representative
+expected to spend most of their time on packet and channel I/O. A representative
 arm64 macOS release measurement with validation, fuel, limits, linking, and the
 small host surface added about 0.9 MiB to a stripped executable when WAT
 support was disabled.
@@ -2911,45 +2621,37 @@ extension thread at all.
 
 ## Implementation plan
 
-1. **Thread naming.** Add the platform-aware shared naming helper, name blit's
-   Tokio workers and currently unnamed explicit threads, and test sanitizing,
-   compaction, and stable ID suffixes.
+1. **Extension thread naming.** Add the platform-aware naming helper for
+   extension-attempt threads and test sanitizing, compaction, and stable ID
+   suffixes.
 2. **In-process connection profile.** Run the existing generic connection
    handler over `tokio::io::duplex`, add extension origin/bootstrap metadata,
    independent direct-frame and fragment-chunk policy, cancellation through
    normal cleanup, complete framed-packet in-process writes, an origin-aware
    tracked outbox sender, extension-only byte/message egress accounting and
-   timeout, a process-wide blocking-job shutdown registry, an extension
-   connection job tracker with async endpoint/global pending and
+   timeout, an extension connection job tracker with async endpoint/global pending and
    active admission plus a non-job dispatch lane, checked/reserved shared
    initial-list construction, negotiated `CREATE_FAILED` handling in both
    shipped clients, bounded fragment validation/reassembly in those clients,
-   writer-task join barriers, a broadcast shutdown coordinator,
-   explicit forced-process exit after the shutdown grace, startup-sampled
-   feature gates, and disabled-family refusal without changing network outbox
-   semantics.
+   writer-task join barriers, startup-sampled feature gates, and disabled-family
+   refusal without changing network outbox semantics.
 3. **Native channels.** Implement the `0x95` channel registry, flow control,
    peer/metadata exchange, listener tokens, reserved-bit validation, atomic
    count/window admission, writer-drain accounting, listener and handle cleanup,
    and codecs.
-4. **Processes.** Implement the `0xC0` through `0xC5` process family,
-   per-stream flow control, atomic count/window admission, concurrent pipe
-   draining, cancellable pipe readers, writer-drain accounting, platform string
-   validation, tracked group/job cleanup, deployment gating, codecs, and
-   protocol tests from a network client.
-5. **Module objects.** Implement BLAKE3 run probe, chunk upload, validation,
+4. **Module objects.** Implement BLAKE3 run probe, chunk upload, validation,
    persistent CAS, pending-run single-flight, active-upload count/time bounds,
    allocation-quantum-rounded byte/entry reservations, persistent-reference
    durability barriers, transaction-scoped cache-hit pins, bounded concurrent
    translation, crash-safe pin reconstruction and LRU metadata, and mandatory
    raw-object LRU eviction.
-6. **Supervisor.** Add stable extension/attempt identity, definition revisions,
+5. **Supervisor.** Add stable extension/attempt identity, definition revisions,
    atomic update, complete exit classification, global admission and running
    caps, fair queuing, restart policy, backoff, durable desired state, startup
    restoration, a per-connection round-robin output scheduler, common output
    sequencing with replay completion, `STOPPING` diagnostics, retained-argument
    accounting, complete remove/update barriers, and crash-safe control.
-7. **Wasmi host.** Add one named background-priority thread and fresh
+6. **Wasmi host.** Add one named background-priority thread and fresh
    strictly configured eager Engine/Module per running extension attempt,
    bounded adapter buffers,
    explicit memory/table/value-stack/call-depth/native-stack containment,
@@ -2957,13 +2659,13 @@ extension thread at all.
    packet-or-deadline waits, timer dispatch, and entropy, atomically ordered
    bootstrap/RUNNING latch, attempt lifecycle, and
    retained-output log/replay.
-8. **Command directory.** Implement `EXT_COMMAND` registration and discovery,
+7. **Command directory.** Implement `EXT_COMMAND` registration and discovery,
    descriptor validation, generation-fenced live-listener ownership,
    server-global command/snapshot budgets, token-checked invocation, and the
    `blit.cli.v1` channel protocol.
-9. **Rust SDK and CLI.** Add `blit-guest`, a Rust example extension,
+8. **Rust SDK and CLI.** Add `blit-guest`, a Rust example extension,
    `blit ext run` and its `blit run` alias,
-   process and command-provider wrappers, extension control and update commands,
+   channel and command-provider wrappers, extension control and update commands,
    `@name` dispatch, help, listing, and static completion.
 
 Each phase has a vertical protocol test with at least two logical clients.
@@ -2971,7 +2673,8 @@ The extension phases additionally verify cache hit (no upload), cache miss,
 nonce release before later ID-keyed status changes, hash mismatch, invalid
 imports, rejection of a start section, a 64-bit or additional memory, and a second table,
 runaway-loop cancellation, cleanup after a trap, ordinary PTY survival across
-attempt cleanup, connection-scoped handle and child cleanup before replacement,
+attempt cleanup, connection-scoped handle and attached-child-extension cleanup
+before replacement,
 restart policy,
 every exit reason's failure/backoff classification, admission-cap rejection,
 fair running-cap queuing, over-cap persistent-store startup, validation
@@ -3019,10 +2722,8 @@ snapshot-to-live gap, a maximum-size generic initial `LIST` paced before
 at the exact boundary plus over-cap preflight without allocation, correlated
 `CREATE2(WANT_STATUS)` refusal and legacy success-only refusal, pre-`INIT`
 send rejection, delayed
-translation with large initial state, `C2S_QUIT` and SIGTERM
-shutdown with running attempts/children, and subprocess tests proving stuck
-extension- and network-origin blocking jobs take the forced-exit path instead of hanging in Tokio runtime
-drop; terminal replay expiry for network and
+translation with large initial state, `C2S_QUIT` and SIGTERM shutdown with
+running attempts and attached child extensions; terminal replay expiry for network and
 extension followers, normal cleanup, and unchanged network
 fragmentation/backpressure behavior. Retained-output tests cover repeated attach,
 replay completion after total eviction with no later event, snapshot/replay
@@ -3042,22 +2743,6 @@ parsing, name ordering, page record/byte bounds, global snapshot byte/count
 admission, snapshot mutation isolation and expiry, disappearance and re-registration across
 attempts, reserved invocation flags, output ordering, backpressure,
 cancellation, result content-type validation, and the no-retry rule.
-Process tests additionally cover binary output, independent stdout/stderr
-ordering, backpressure, stdin EOF, missing `cwd_kind = 2` context, merged-stderr
-window negotiation, explicit-cwd bounds, Windows case-insensitive duplicate env
-keys, pending-ID conflicts, ignored/rejected per-ID operations before successful
-`PROCESS_STARTED`, absent/final/wrong-state no-reply operations, packet-count and payload bounds, checked ACK arithmetic,
-stdin offset progression, the 1,025th-packet violation, Windows UTF-8 rejection,
-spawn failure, exit-reason/code encodings, signals
-where supported, tracked group/job cleanup on endpoint loss, and repeated
-spawn/exit against a stalled writer without budget reuse. A direct child which
-exits after spawning a background descendant that retains stdout verifies
-automatic residual-tree termination, bounded pipe closure, the root's preserved
-exit code, and reservation release. Where supported, a
-descendant which escapes while retaining a pipe FD verifies that explicit kill
-and endpoint teardown still close readers, reap the direct child, and release
-all guards.
-
 CLI tests cover positional dash-prefixed arguments, the `blit run` alias,
 `BLOCKED` exit behavior before and after detach, and selector parsing for bare
 numeric names plus explicit `id:` and `name:` forms. They also pin retained
