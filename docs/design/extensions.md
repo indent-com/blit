@@ -109,6 +109,113 @@ PTYs.
   server. Their descriptors provide discovery and help, not a local executable
   or client-side argument validator.
 
+## Example extensions
+
+These examples are intentionally more ambitious than “run a cron script.” They
+use only the small host ABI and ordinary Blit packet families; none requires a
+new Wasm-specific import.
+
+### `@ship`: a server-resident release conductor
+
+```bash
+blit --on prod @ship plan main
+blit --on prod @ship deploy --environment eu-prod --revision 8c4f2d1
+```
+
+`ship` stays warm as a persistent extension. It inspects Git, runs tests and
+deployment tools through `PROCESS_*`, streams a structured plan and live output
+over the invocation channel, and records idempotency keys and the release ledger
+in KV. Disconnecting cancels only the command; the supervised release policy can
+decide whether the underlying operation should stop or continue. This is a
+small, inspectable deployment service distributed as one Wasm object.
+
+### `@workspace`: one query surface over Git, FS, and LSP
+
+```bash
+blit --on dev @workspace changed-symbols origin/main
+blit --on dev @workspace impact crates/remote/src/git.rs
+blit --on dev @workspace references ClientEndpoint
+```
+
+The extension keeps repository and language-server views warm, joins them with
+filesystem search, and exposes higher-level questions as commands. The answer
+can contain human-readable progress on stdout and a machine-readable JSON
+`RESULT`. A browser UI can ask the same questions over channels without going
+through the CLI grammar.
+
+### `@session`: a terminal concierge which is not itself a terminal
+
+```bash
+blit --on lab @session start api -- cargo run -p api
+blit --on lab @session wait api --for "listening on" --timeout 30s
+blit --on lab @session send api "reload"
+```
+
+`session` creates and observes real Blit PTYs when a program needs terminal
+semantics, but its own control plane is typed channel messages. It can name
+sessions, wait on output conditions, report cwd and exit state, and coordinate
+several terminals without forcing automation clients to parse an interactive
+terminal protocol. Lightweight session metadata survives attempts in KV; PTY
+handles do not.
+
+### `testgrid`: many isolated instances from one hash
+
+```bash
+blit run --on ci --restart always --persist --name test-unit testgrid.wasm unit
+blit run --on ci --restart always --persist --name test-integration testgrid.wasm integration
+blit run --on ci --restart always --persist --name test-web testgrid.wasm web
+```
+
+The module uploads once, but each extension gets its own ID, arguments, thread,
+endpoint, processes, and restart history. Shards claim work through KV and send
+live results to an aggregator over channels. An operator can restart one shard,
+update a canary to a new hash, or compare revisions without disturbing the
+others. This is the concrete reason module identity and extension identity must
+be separate.
+
+### `@switchboard`: application pubsub without a core topic service
+
+```bash
+blit --on prod @switchboard routes
+blit --json --on prod @switchboard tap build.finished
+```
+
+Producers and consumers open channels to `switchboard`; payload-defined subjects,
+filters, request IDs, and delivery acknowledgements are an SDK-level protocol.
+The extension fans live messages out, while durable cursors or retained values
+go to KV. A second implementation can choose different wildcard, replay, or
+dead-letter semantics without adding opcodes or committing Blit to one pubsub
+model.
+
+### `@fleet`: extensions managing extensions
+
+```bash
+blit --on prod @fleet diff builder builder-canary
+blit --on prod @fleet promote builder-canary --to builder
+blit --on prod @fleet restart --revision-mismatch
+```
+
+Because an extension is a full logical client, `fleet` can list and control
+other extensions. Promotion reads the canary's exact hash and arguments, then
+performs a revision-checked cache-hit update of the durable `builder` record.
+It can roll through a set of named instances, stop on health failure, and emit
+one progress stream to the operator. The server still owns atomic definition
+updates and lifecycle cleanup; the rollout strategy remains replaceable guest
+code.
+
+### `@incident`: a reproducible diagnostics bundle
+
+```bash
+blit --on prod @incident capture api --since 10m
+```
+
+The extension snapshots relevant Git identity, terminal cwd and screen state,
+output from diagnostic processes it launches, server-visible task metadata, and
+selected files, then streams a content-typed result. The same command can
+simultaneously feed a browser over a second channel. Since the descriptor is
+only presentation metadata, a newer definition can add richer collection logic
+without requiring a new CLI release.
+
 ## Architecture
 
 ```mermaid
