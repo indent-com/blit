@@ -163,8 +163,7 @@ Paths are root-relative lossy UTF-8 of the on-disk names, matching
 `FS_SEARCH`/`FS_INDEX` — these feed result lists that reopen through
 absolute-path joins, never through `resolve_wire_path`.
 
-`status` uses the
-[common status registry](../protocol.md#common-status-registry): `0 OK`,
+`status` is the unified table ([git.md](git.md) "Statuses"): `0 OK`,
 `2 NOT_FOUND` (root missing), `3 WRONG_TYPE` (root is not a directory),
 `4 PERMISSION` (unreadable root, caught by an explicit `read_dir` probe
 rather than swallowed into an authoritative-looking empty `OK`, as

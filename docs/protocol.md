@@ -179,12 +179,11 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 | 10  | `NET`           | Server supports the `NET_*` network-relay family               |
 | 11  | `EXTENSION`     | Proposed: Wasmi extension lifecycle, events, and commands      |
 | 12  | `CHANNEL`       | Proposed: server supports bidirectional named channels         |
-| 13  | `PROCESS`       | Proposed: server supports non-PTY child processes              |
+| 13  | `RESERVED`      | Unallocated; servers leave this bit clear                       |
 | 14  | `CREATE_STATUS` | Proposed: `CREATE2(WANT_STATUS)` receives explicit failure     |
 
-The proposed bits 11–13 are independently omitted when `BLIT_EXT=0`,
-`BLIT_CHANNEL=0`, or `BLIT_PROCESS=0`; disabled-family requests are refused as
-specified in
+The proposed bits 11 and 12 are independently omitted when `BLIT_EXT=0` or
+`BLIT_CHANNEL=0`; disabled-family requests are refused as specified in
 [design/extensions.md](design/extensions.md#security-posture-and-deployment-controls).
 Bit 14 is not extension-specific and is not controlled by those gates. It is
 advertised only after the server implements the negotiated creation outcome
@@ -393,7 +392,7 @@ exceed the 16 MiB frame limit.
 The extension RFC tightens fragmentation as follows. These rules are **not yet
 enforced by every shipped Rust and TypeScript client**; implementing them in
 both reference clients and the shared writer is a prerequisite to advertising
-the proposed feature bits 11–13, and belongs to phase 2 of
+the proposed feature bits 11 and 12, and belongs to phase 2 of
 [design/extensions.md](design/extensions.md#implementation-plan):
 
 - flag bits 1 through 7 are zero and every chunk is non-empty; a reserved flag

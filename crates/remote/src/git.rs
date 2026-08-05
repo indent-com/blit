@@ -116,9 +116,8 @@ pub const S2C_GIT_REFLOG: u8 = 0xB3;
 /// Fetch response: [0xB4][nonce:2][status:1][flags:1][records:LZ4]
 pub const S2C_GIT_FETCH: u8 = 0xB4;
 
-// Common status registry: every `status` byte in the family
-// (docs/protocol.md "Common status registry"). `FS_SYNCED` has a distinct,
-// grandfathered message-local table and must not be decoded with these values.
+// Unified status table: every `status` byte in the family (docs/git.md
+// "Statuses"). Codes 0-4 coincide with `FS_SYNCED`'s where semantics overlap.
 pub const GIT_STATUS_OK: u8 = 0;
 /// `repo_id` unknown or already closed.
 pub const GIT_STATUS_UNKNOWN_ID: u8 = 1;
@@ -2934,7 +2933,7 @@ impl<'a> Iterator for GitReflogRecordIter<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitFetchRecord<'a> {
     /// FETCH_REF 0x01: [kind:1][flags:1][status:1][old:32][new:32][name_len:2][name:N][detail_len:2][detail:N]
-    /// One per ref the remote answered for. `status` uses the common registry,
+    /// One per ref the remote answered for. `status` is the unified table,
     /// so "did I actually get these commits" is answerable from the reply
     /// rather than needing a `resolve` per commit afterwards — a remote can
     /// refuse one refspec of several and still exit zero.

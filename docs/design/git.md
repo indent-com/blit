@@ -168,15 +168,33 @@ block is available to a future family.
 
 ### Statuses
 
-Every `status` byte in this family uses the
-[common status registry](../protocol.md#common-status-registry). Git uses
-`OK` through `OTHER`, `CONFLICT`, and `NO_MERGE_BASE`; it currently defines no
-family-local status. `NO_MERGE_BASE` distinguishes a valid merge-base query
-over disjoint histories from an invalid request.
+One table for every `status` byte in the family:
 
-`FS_SYNCED` has a grandfathered message-local table with different values and
-must not be decoded as a common status. `FS_DONE`, LSP, KV, and Git use the
-common registry where their named statuses overlap.
+```text
+0 OK
+1 UNKNOWN_ID   repo_id unknown or already closed
+2 NOT_FOUND    path or object does not exist
+3 WRONG_TYPE   object is not what the request requires
+               (not a repository / commit / tree / blob)
+4 PERMISSION   permission denied
+5 TOO_LARGE    over max_len or a size cap; size fields still carry truth
+6 BUDGET       a budget was exhausted with no way to paginate or truncate
+7 INVALID      malformed request (unknown flags, bad endpoint combination)
+8 CANCELLED    ended by GIT_CANCEL
+9 OTHER        an unclassified backend failure, diagnostic in the
+              message's detail field where it has one
+11 CONFLICT    a precondition failed (a lock was held, or the repository
+              moved under a request)
+12 NO_MERGE_BASE
+              a MERGE_BASE endpoint over histories with no common
+              ancestor: the request is well-formed, the repository has
+              no such base
+```
+
+Codes 0–4 coincide with `FS_SYNCED`'s where the semantics overlap, so a
+client's error mapping is one table, not one per message. `10` is lsp's
+`WARMING`; `11` is the code [fs-write.md](fs-write.md) already assigned,
+reused rather than given a synonym.
 
 `OTHER` means _only_ "unclassified backend failure" — anything with a
 classifiable cause (an invalid path, a wrong object type) returns the

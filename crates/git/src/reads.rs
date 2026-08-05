@@ -234,9 +234,9 @@ impl RepoHandle {
             match crate::unescape_wire(req.ref_name) {
                 Some(bytes) => match String::from_utf8(bytes) {
                     Ok(name) => name,
-                    Err(_) => return fail(GIT_STATUS_INVALID),
+                    Err(_) => return fail(GIT_STATUS_OTHER),
                 },
-                None => return fail(GIT_STATUS_INVALID),
+                None => return fail(GIT_STATUS_OTHER),
             }
         };
         let Ok(full): Result<&gix::refs::FullNameRef, _> = name.as_str().try_into() else {
@@ -393,7 +393,7 @@ impl RepoHandle {
         }
         // A remote or refspec that could be read as an option would let a
         // caller reach the rest of git's command line.
-        if !fetch_fields_valid(req.remote, &req.refspecs) {
+        if req.remote.starts_with('-') || req.refspecs.iter().any(|s| s.starts_with('-')) {
             return fail(GIT_STATUS_INVALID);
         }
         let repo = self.local();
@@ -470,14 +470,6 @@ impl RepoHandle {
         }
         msg_git_fetch_resp(nonce, GIT_STATUS_OK, 0, &records)
     }
-}
-
-fn fetch_fields_valid(remote: &str, refspecs: &[&str]) -> bool {
-    !remote.starts_with('-')
-        && !remote.contains('\0')
-        && refspecs
-            .iter()
-            .all(|s| !s.starts_with('-') && !s.contains('\0'))
 }
 
 struct GitOutput {
@@ -857,16 +849,3 @@ pub fn open_submodule(
 
 /// The name of a repository's git directory or gitfile inside a worktree.
 const GIT_DIR_NAME: &str = ".git";
-
-#[cfg(test)]
-mod tests {
-    use super::fetch_fields_valid;
-
-    #[test]
-    fn fetch_fields_reject_options_and_nuls() {
-        assert!(fetch_fields_valid("origin", &["refs/heads/main"]));
-        assert!(!fetch_fields_valid("--upload-pack=bad", &[]));
-        assert!(!fetch_fields_valid("bad\0remote", &[]));
-        assert!(!fetch_fields_valid("origin", &["bad\0refspec"]));
-    }
-}

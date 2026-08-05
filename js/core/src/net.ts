@@ -69,10 +69,8 @@ export function netStatusText(status: number): string {
       return "budget exhausted";
     case NET_STATUS_INVALID:
       return "invalid request";
-    case NET_STATUS_OTHER:
-      return "backend error";
     default:
-      return `unknown status ${status}`;
+      return "error";
   }
 }
 

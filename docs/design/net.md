@@ -178,10 +178,10 @@ also exactly one per `NET_OPEN`, so a client's state machine is
 
 ### Statuses
 
-`NET_OPENED.status` is a grandfathered message-local table. It reuses the
-[common status registry](../protocol.md#common-status-registry) where semantics
-overlap — `0`, `1`, `2`, `4`, `6`, `7`, `9` match — and assigns local meanings
-to the already-shipped values `3` and `5`:
+`NET_OPENED.status` reuses [git.md](git.md)'s table where the semantics
+overlap — `0`, `1`, `2`, `4`, `6`, `7`, `9` are that table verbatim — and
+takes `3` and `5`, whose git meanings (`WRONG_TYPE`, `TOO_LARGE`) are
+meaningless for a byte relay:
 
 ```text
 0 OK

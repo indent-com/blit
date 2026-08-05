@@ -59,8 +59,7 @@ practice — an unreadable root walks nothing and returns zero paths —
 except `3 RESOURCE_LIMIT` when the in-flight walk cap (§ Budgets)
 refuses the request (the table has no `INVALID`, so a duplicate
 in-flight nonce answers the same). Documented as-is rather than blessed:
-a new message would use the
-[common status registry](../protocol.md#common-status-registry).
+a new message would use the unified table below.
 
 ### `FS_INDEX`
 
@@ -88,9 +87,8 @@ and a tree whose _filtered_ walk comes back empty — a parent
 blanks every non-repo subtree — retries without ignore rules, so `@`
 never goes silently blind on a real tree.
 
-`FS_INDEX.status` uses the
-[common status registry](../protocol.md#common-status-registry), not
-`FS_SYNCED`'s grandfathered `0`–`4`:
+`FS_INDEX.status` is the unified git/lsp table
+([git.md](git.md) "Statuses"), not `FS_SYNCED`'s grandfathered `0`–`4`:
 `0 OK`, `2 NOT_FOUND` (root missing), `3 WRONG_TYPE` (root is not a
 directory), `4 PERMISSION`, `6 BUDGET` (in-flight cap), `7 INVALID`
 (reserved flags set, duplicate nonce), `9 OTHER`. One response per nonce
