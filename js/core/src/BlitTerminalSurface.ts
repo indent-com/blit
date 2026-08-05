@@ -9,6 +9,7 @@ import type { GlRenderer } from "./gl-renderer";
 import { keyToBytes, ctrlCharToByte, encoder } from "./keyboard";
 import { MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE } from "./protocol";
 import { assessUrl, openUrlSafely, type UrlAssessment } from "./urlSecurity";
+import { devicePixelBox, drawHalved, halve, halvings } from "./downscale";
 
 /** One screen row's slice of a hyperlink's extent, inclusive of both columns. */
 interface LinkSegment {
@@ -655,7 +656,7 @@ export class BlitTerminalSurface {
     if (!this.glCanvas) return;
 
     // Both branches leave width/height to doRender, which sizes the element to
-    // exactly the backing store's device pixels every frame.
+    // the grid's natural device pixels every frame.
     if (this._resizable) {
       Object.assign(this.glCanvas.style, {
         display: "block",
@@ -911,10 +912,13 @@ export class BlitTerminalSurface {
     this.teardownResizeObserver();
     if (resolved) {
       this.remeasureCells(true);
-      this.setupResizeObserver();
     } else if (this.terminal) {
       this.syncTerminalSize(this.terminal);
     }
+    // Both modes observe — a resizable pane to drive the grid, a passive one
+    // to learn how far its canvas is about to be minified — and
+    // setupResizeObserver picks the branch off _resizable.
+    this.setupResizeObserver();
     this.contentDirty = true;
     this.scheduleRender();
   }
@@ -1222,7 +1226,31 @@ export class BlitTerminalSurface {
   // --- Resize observer ---
 
   private setupResizeObserver(): void {
-    if (!this.container || !this._resizable) return;
+    if (!this.container) return;
+
+    if (!this._resizable) {
+      // A passive view must not register a container size with the server:
+      // the grid is the minimum across a session's views, so a thumbnail
+      // would pin the live pane to a card.  It still needs the box for
+      // presentation — doRender composites the shared canvas down to roughly
+      // this size, leaving CSS a scale it can actually filter — so observe,
+      // but stop short of handleResize.
+      this.resizeObserver = new ResizeObserver((entries) => {
+        const entry = entries[entries.length - 1];
+        const box = entry && devicePixelBox(entry);
+        if (!box) return;
+        if (
+          this._presentBox?.width === box.width &&
+          this._presentBox.height === box.height
+        ) {
+          return;
+        }
+        this._presentBox = box;
+        this.scheduleRender();
+      });
+      this.resizeObserver.observe(this.container);
+      return;
+    }
 
     if (!this.viewId && this._blitConn) {
       this.viewId = this._blitConn.allocViewId();
@@ -1264,6 +1292,10 @@ export class BlitTerminalSurface {
    *  can center a grid smaller than its pane without a forced reflow. */
   private _containerW = 0;
   private _containerH = 0;
+  /** Container size in device pixels, tracked only for a non-resizable view.
+   *  Presentation only — it never reaches handleResize, so a thumbnail can't
+   *  drag the session's grid down to its own box. */
+  private _presentBox: { width: number; height: number } | null = null;
   /** Wire rate limit for size changes. Low enough that a drag stays
    *  roughly live, high enough not to flood the server with intermediate
    *  sizes (each one can cost an encoder rebuild for h264-software). */
@@ -1508,11 +1540,14 @@ export class BlitTerminalSurface {
     const pw = termCols * cell.pw;
     const ph = termRows * cell.ph;
 
-    // Size the element to exactly the backing store's device pixels. In
-    // resizable panes that is the whole story; non-resizable ones additionally
-    // clamp with max-width/max-height (see applyCanvasLayout) so an oversized
-    // grid still scales down to fit, but one that already fits is left at 1:1
-    // instead of being magnified.
+    // Size the element to the grid's natural device pixels. In resizable
+    // panes that is also the backing store, so the blit is 1:1 and that is the
+    // whole story; non-resizable ones additionally clamp with
+    // max-width/max-height (see applyCanvasLayout) so an oversized grid still
+    // scales down to fit, but one that already fits is left at 1:1 instead of
+    // being magnified. When the clamp bites, the composite below has already
+    // halved the backing store towards the box, so the residual CSS scale is
+    // always under 2:1.
     const cssW = `${termCols * cell.w}px`;
     // Non-resizable surfaces leave the height to the canvas's intrinsic aspect
     // ratio, so that clamping the width scales the grid instead of squashing
@@ -1617,12 +1652,21 @@ export class BlitTerminalSurface {
     const shared = conn.getSharedRenderer();
     const displayCanvas = this.glCanvas;
     if (shared && displayCanvas) {
-      if (displayCanvas.width !== pw) {
-        displayCanvas.width = pw;
+      // A grid too big for its box — a dock thumbnail, a preview card — is
+      // minified by the browser, which takes a single bilinear tap and drops
+      // most of every glyph.  Composite it down in whole halves first so what
+      // is left for CSS to scale is under 2:1.  A resizable pane is already
+      // 1:1, so n is 0 and this is the plain copy it always was.
+      const box = this._resizable ? null : this._presentBox;
+      const n = box ? halvings(pw, ph, box.width, box.height) : 0;
+      const dw = halve(pw, n);
+      const dh = halve(ph, n);
+      if (displayCanvas.width !== dw) {
+        displayCanvas.width = dw;
         this.displayCtx = null;
       }
-      if (displayCanvas.height !== ph) {
-        displayCanvas.height = ph;
+      if (displayCanvas.height !== dh) {
+        displayCanvas.height = dh;
         this.displayCtx = null;
       }
       if (!this.displayCtx) {
@@ -1631,12 +1675,17 @@ export class BlitTerminalSurface {
       }
       const ctx = this.displayCtx;
       if (ctx) {
-        ctx.drawImage(shared.canvas, 0, 0, pw, ph, 0, 0, pw, ph);
+        drawHalved(ctx, shared.canvas, pw, ph, n);
+        // The overlays lay themselves out in full-resolution grid pixels, so
+        // scale the context to match rather than teaching each one about the
+        // reduction.  setTransform is absolute: nothing accumulates.
+        if (n) ctx.setTransform(dw / pw, 0, 0, dh / ph, 0, 0);
         this.drawSelectionOverlay(ctx, cell);
         this.drawUrlOverlay(ctx, cell);
         this.drawOverflowText(ctx, t, cell);
         this.drawPredictedEcho(ctx, t, cell);
         this.drawScrollbar(ctx, t, cell);
+        if (n) ctx.resetTransform();
       }
     }
 

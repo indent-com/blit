@@ -27,10 +27,18 @@ function mockCanvasContext(): void {
 describe("BlitTerminalSurface sizing", () => {
   const observe = vi.fn();
   const disconnect = vi.fn();
+  let callbacks: ResizeObserverCallback[] = [];
+
+  /** Deliver a container size to every live observer. */
+  function resizeTo(width: number, height: number): void {
+    const entry = { contentRect: { width, height } } as ResizeObserverEntry;
+    for (const cb of callbacks) cb([entry], null as never);
+  }
 
   beforeEach(() => {
     observe.mockClear();
     disconnect.mockClear();
+    callbacks = [];
     mockCanvasContext();
     vi.stubGlobal(
       "requestAnimationFrame",
@@ -40,6 +48,9 @@ describe("BlitTerminalSurface sizing", () => {
     vi.stubGlobal(
       "ResizeObserver",
       class {
+        constructor(cb: ResizeObserverCallback) {
+          callbacks.push(cb);
+        }
         observe = observe;
         disconnect = disconnect;
       },
@@ -138,7 +149,18 @@ describe("BlitTerminalSurface sizing", () => {
         objectPosition: "center",
       },
     });
-    expect(observe).not.toHaveBeenCalled();
+    // A passive surface does observe its container — it needs the box to pick
+    // how far to box-filter the canvas down before the browser minifies it —
+    // but the measurement stays local: no view id is allocated, so nothing it
+    // sees can reach the server and drag the session's grid down to a card.
+    expect(observe).toHaveBeenCalledTimes(2);
+    resizeTo(200, 100);
+    expect(writable.surface["_presentBox"]).toEqual({
+      width: 200,
+      height: 100,
+    });
+    expect(writable.surface["viewId"]).toBeFalsy();
+    expect(readOnly.surface["viewId"]).toBeFalsy();
 
     writable.surface.dispose();
     readOnly.surface.dispose();
@@ -166,7 +188,7 @@ describe("BlitTerminalSurface sizing", () => {
     expect(terminal.set_font_family).toHaveBeenCalled();
     expect(terminal.set_font_size).toHaveBeenCalled();
     expect(terminal.invalidate_render_cache).toHaveBeenCalled();
-    expect(observe).not.toHaveBeenCalled();
+    expect(surface["viewId"]).toBeFalsy();
 
     surface.dispose();
   });
@@ -186,17 +208,23 @@ describe("BlitTerminalSurface sizing", () => {
       invalidate_render_cache: vi.fn(),
     };
 
+    // Each mode swaps the observer rather than dropping it: the passive one
+    // from attach() is torn down and a sizing one takes its place.
     surface.setResizable(true);
     expect(canvas.style.position).toBe("absolute");
     expect(canvas.style.objectFit).toBe("");
-    expect(observe).toHaveBeenCalledOnce();
+    expect(observe).toHaveBeenCalledTimes(2);
+    expect(disconnect).toHaveBeenCalledOnce();
 
+    // And back the other way — a pane demoted to a thumbnail still needs a box
+    // to downscale against, so it must not be left unobserved.
     surface.setResizable(false);
     expect(canvas.style.position).toBe("");
     expect(canvas.style.objectFit).toBe("contain");
     expect(surface.rows).toBe(40);
     expect(surface.cols).toBe(120);
-    expect(disconnect).toHaveBeenCalledOnce();
+    expect(disconnect).toHaveBeenCalledTimes(2);
+    expect(observe).toHaveBeenCalledTimes(3);
     surface.dispose();
   });
 
