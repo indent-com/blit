@@ -29,6 +29,37 @@ pub mod net;
 /// cannot force a giant allocation.
 pub const MAX_DECOMPRESSED: usize = 64 * 1024 * 1024;
 
+/// Longest string a `u16` length prefix can describe.
+pub(crate) const MAX_STR: usize = u16::MAX as usize;
+
+/// Write a `u16`-length-prefixed UTF-8 string, clipping rather than wrapping
+/// the prefix.
+///
+/// `len as u16` on an overlong string writes a length the reader believes, so
+/// every following field of the message is read at the wrong offset — one
+/// oversized value corrupts the whole response rather than just itself. The
+/// inputs are paths, ref names, symbol names and match text, none of which any
+/// protocol rule bounds, and the escaping some of them go through expands a
+/// non-UTF-8 byte roughly sixfold, so ~11 KB of raw bytes can pass 64 KiB. A
+/// visibly shortened value costs one unhelpful row; a wrapped prefix costs the
+/// whole message.
+pub(crate) fn push_str(buf: &mut Vec<u8>, s: &str) {
+    let b = s.as_bytes();
+    let b = if b.len() > MAX_STR {
+        // Back off to a char boundary so the field stays valid UTF-8, which
+        // the decoders require.
+        let mut end = MAX_STR;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &b[..end]
+    } else {
+        b
+    };
+    buf.extend_from_slice(&(b.len() as u16).to_le_bytes());
+    buf.extend_from_slice(b);
+}
+
 pub const CELL_SIZE: usize = 12;
 const TITLE_PRESENT: u16 = 1 << 15;
 const OPS_PRESENT: u16 = 1 << 14;
@@ -974,18 +1005,14 @@ impl TerminalState {
         self.frame.get_cell(row, col)
     }
 
-    /// Maximum decompressed frame size (50 MiB). Prevents LZ4 decompression
-    /// bombs where a tiny compressed payload claims a multi-GiB output size.
-    const MAX_DECOMPRESSED_SIZE: usize = 50 * 1024 * 1024;
-
     /// Read the LZ4 prepended uncompressed size without allocating, and reject
-    /// payloads that claim to decompress beyond `MAX_DECOMPRESSED_SIZE`.
+    /// payloads that claim to decompress beyond [`MAX_DECOMPRESSED`].
     fn safe_decompress(data: &[u8]) -> Result<Vec<u8>, ()> {
         if data.len() < 4 {
             return Err(());
         }
         let claimed = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        if claimed > Self::MAX_DECOMPRESSED_SIZE {
+        if claimed > MAX_DECOMPRESSED {
             return Err(());
         }
         decompress_size_prepended(data).map_err(|_| ())
@@ -4148,6 +4175,22 @@ mod tests {
         let mut t = TerminalState::new(4, 10);
         assert!(!t.feed_compressed(b"garbage"));
         assert!(!t.feed_compressed(&[]));
+    }
+
+    /// The LZ4 size prefix is attacker-controlled: four bytes claiming a
+    /// multi-GiB output must be refused before anything is allocated. The
+    /// fs, git and lsp families each pin this; the terminal path is the one
+    /// that fed a decompressor without a test holding its ceiling in place.
+    #[test]
+    fn terminal_state_oversized_declared_length_is_rejected() {
+        let mut t = TerminalState::new(4, 10);
+        let mut forged = (MAX_DECOMPRESSED as u32 + 1).to_le_bytes().to_vec();
+        forged.extend_from_slice(b"whatever");
+        assert!(!t.feed_compressed(&forged));
+
+        let mut forged = u32::MAX.to_le_bytes().to_vec();
+        forged.extend_from_slice(b"whatever");
+        assert!(!t.feed_compressed(&forged));
     }
 
     #[test]
