@@ -162,6 +162,42 @@ repositories, LSP attachments, KV subscriptions, relayed sockets, and native
 channels. Dropping the endpoint invokes the same cleanup path
 regardless of its adapter.
 
+### Nonblocking dispatch and slow consumers
+
+`dispatch_packet` must never wait for capacity in any endpoint outbox. Every
+delivery uses a nonblocking `try_enqueue`; transport writers and plugin threads
+drain their own queues independently. Family-specific reduction happens
+first: state updates replace an older pending update for the same watch, and a
+topic subscription which skips retained events records a `TOPIC_GAP`. Channel
+and process data additionally obey their credit windows.
+
+If a packet still cannot be enqueued within the endpoint's aggregate byte
+bound, the endpoint is a slow consumer and is closed. Closing is an
+out-of-band state transition: it sets cancellation, closes both in-process
+queues or the network transport, and runs normal endpoint resource cleanup. A
+best-effort family-specific closed or lifecycle packet carrying
+`SLOW_CONSUMER` may be sent when space exists, but correctness never depends
+on fitting that final packet. Solicited replies such as `STATE_DONE` and
+`TOPIC_DONE`, lifecycle packets such as `PLUGIN_EXIT`, and protocol errors
+follow this same rule rather than waiting for space. For a plugin's own
+endpoint, this closes the attempt with the `SLOW_CONSUMER` exit reason;
+connected channel and process peers observe their normal closed event.
+
+`PLUGIN_EVENT` fan-out performs one independent `try_enqueue` per attached
+client after recording the event in the bounded retained ring when retention
+is enabled. One slow follower therefore closes only that follower and never
+stalls the plugin or other followers. If that follower is the owner of a
+non-detached plugin, the ordinary owner-disconnect rule then cancels the
+plugin; detached plugins keep running.
+
+This policy also breaks the apparent full-duplex deadlock. A plugin blocked in
+`blit_v1.send` is not calling `recv`, but the endpoint task continues draining
+the plugin-to-endpoint queue. If dispatch of one of those packets needs to send
+back to a full plugin outbox—including through a channel connected to the same
+plugin—`try_enqueue` closes the endpoint instead of blocking. Closing wakes
+the blocked `send` with `-1` and cancels the attempt. No dispatcher, registry
+lock, or peer endpoint waits for that plugin to call `recv`.
+
 ### Packet parity, not unrestricted authority
 
 A plugin may form any valid C2S packet. The dispatcher still decides
@@ -194,11 +230,11 @@ produced them.
 
 Restart policies are:
 
-| Value | CLI           | Meaning                                                    |
-| ----- | ------------- | ---------------------------------------------------------- |
-| 0     | `never`       | One attempt only                                           |
-| 1     | `on-failure`  | Restart non-zero returns, traps, and enforced limit exits  |
-| 2     | `always`      | Restart every returned or failed attempt                   |
+| Value | CLI          | Meaning                                                   |
+| ----- | ------------ | --------------------------------------------------------- |
+| 0     | `never`      | One attempt only                                          |
+| 1     | `on-failure` | Restart non-zero returns, traps, and enforced limit exits |
+| 2     | `always`     | Restart every returned or failed attempt                  |
 
 Explicit stop, disable, removal, authorization failure, invalid/corrupt
 module state, and server shutdown are not attempt failures. `on-failure`
@@ -238,8 +274,12 @@ blit_v1.recv(ptr: i32, capacity: i32) -> i32
 ```
 
 `send` validates the range in exported memory and copies one complete blit
-packet. It returns `0` when accepted or a negative ABI error. It never accepts
-transport framing: the first copied byte is the blit opcode.
+packet. It returns `0` when accepted, `-1` when the endpoint is closed or
+closes while the call is pending, or `-2` for a zero-length or over-cap
+packet. It never accepts transport framing: the first copied byte is the blit
+opcode. A negative length, invalid pointer, integer overflow, or an
+out-of-bounds linear-memory range is guest ABI misuse and traps the attempt
+rather than returning an error code.
 
 `recv` operates on the next complete server packet:
 
@@ -251,9 +291,12 @@ transport framing: the first copied byte is the blit opcode.
   a packet arrives or cancellation wins, that same thread copies into guest
   memory and returns from the host call.
 
-The 16 MiB blit logical-message cap keeps the negative required length within
-`i32`. The SDK normally maintains a reusable buffer, so the resize case is
-rare.
+`recv` has no negative ABI-error values: every negative return is exclusively
+the required packet length, from `-1` through `-(16 MiB)`. A negative capacity,
+integer overflow, or an out-of-bounds destination traps the attempt. Once the
+endpoint closes, repeated valid `recv` calls return zero. The 16 MiB blit
+logical-message cap keeps the required length within `i32`; the SDK normally
+maintains a reusable buffer, so the resize case is rare.
 
 `send` may also block when the endpoint's inbound byte window is full.
 This preserves ordering and backpressure without busy polling.
@@ -426,15 +469,21 @@ variables.
 
 `PLUGIN_RUN` is the cache probe. A hit creates the plugin without
 another request. A miss returns `NEED_OBJECT` and records a bounded pending
-plugin. The
-client uploads chunks and does not resend `PLUGIN_RUN` after a successful
-final chunk; the server creates and starts the pending plugin
-automatically.
+plugin. The miss is encoded as
+`PLUGIN_RUN_STATUS(status = OK, phase = NEED_OBJECT)`; `NEED_OBJECT` is a run
+phase, not a status code. The client uploads chunks and does not resend
+`PLUGIN_RUN` after a successful final chunk; the server creates and starts the
+pending plugin automatically.
 
 Uploads are single-flight per object hash. If several clients miss the same
 object, the first accepted uploader supplies it and every compatible pending
-plugin starts after verification. Other uploaders receive `ALREADY_HAVE`
-and stop sending. Pending plugins and partial uploads expire.
+plugin starts after verification. A client whose `PLUGIN_PUT` races after the
+object has committed receives `ALREADY_HAVE` and stops sending. While another
+upload is still in progress, a second `BEGIN` receives `CONFLICT`; its pending
+run waits for the owner rather than uploading duplicate bytes. If the owner
+fails or expires, waiting runs receive a fresh `NEED_OBJECT` update and may
+compete to become the next uploader. Pending plugins and partial uploads
+expire.
 
 ## Plugin wire family
 
@@ -447,11 +496,11 @@ UTF-8. Unless otherwise stated, `detail` is UTF-8 and consumes the remainder.
 
 ### Client to server
 
-| Opcode | Name                 | Layout                                                                                             |
-| ------ | -------------------- | -------------------------------------------------------------------------------------------------- |
-| `0x90` | `PLUGIN_RUN`     | `[nonce:2][flags:1][restart:1][hash:32][name_len:2][name:N][argc:2] repeated{[len:4][arg:M]}`      |
-| `0x91` | `PLUGIN_PUT`     | `[nonce:2][flags:1][hash:32][offset:8][data:N]`                                                    |
-| `0x92` | `PLUGIN_CONTROL` | `[nonce:2][plugin_id:8][action:1]`                                                              |
+| Opcode | Name             | Layout                                                                                         |
+| ------ | ---------------- | ---------------------------------------------------------------------------------------------- |
+| `0x90` | `PLUGIN_RUN`     | `[nonce:2][flags:1][restart:1][hash:32][name_len:2][name:N][argc:2] repeated{[len:4][arg:M]}`  |
+| `0x91` | `PLUGIN_PUT`     | `[nonce:2][flags:1][hash:32][offset:8][total_size:8][data:N]`                                  |
+| `0x92` | `PLUGIN_CONTROL` | `[nonce:2][plugin_id:8][action:1]`                                                             |
 | `0x93` | `PLUGIN_EVENT`   | `[plugin_id:8][attempt:8][task_id:4][kind:1][data:N]` — only from the matching running attempt |
 
 `PLUGIN_RUN.flags`: bit 0 `DETACH`, bit 1 `PERSIST`. `restart` is the
@@ -463,24 +512,27 @@ Argument count is capped at 1024, each argument at 64 KiB, and their combined
 UTF-8 bytes at 1 MiB. NUL has no special meaning.
 
 `PLUGIN_PUT.flags`: bit 0 `BEGIN`, bit 1 `FINAL`. The first chunk has
-`BEGIN`, offset zero, and begins a new upload. Chunks are contiguous and
-cumulatively acknowledged. `FINAL` triggers hash verification, validation,
-atomic cache insertion, and pending-run start. A one-packet object sets both
-bits. The default module limit is 16 MiB; clients should use 1 MiB chunks.
+`BEGIN`, offset zero, and begins a new upload. `total_size` is present on every
+chunk to keep decoding fixed; it must be non-zero, match the first chunk, and
+fit the module cap before any data is accepted. Chunks are contiguous and
+cumulatively acknowledged. `FINAL` requires `offset + data.len() ==
+total_size`, then triggers hash verification, validation, atomic cache
+insertion, and pending-run start. A one-packet object sets both flags. The
+default module limit is 16 MiB; clients should use 1 MiB chunks.
 
 `PLUGIN_CONTROL.action`:
 
-| Value | Name      | Meaning                                                            |
-| ----- | --------- | ------------------------------------------------------------------ |
-| 1     | `CANCEL`  | Stop the plugin, suppress restarts, then cancel its attempt     |
+| Value | Name      | Meaning                                                             |
+| ----- | --------- | ------------------------------------------------------------------- |
+| 1     | `CANCEL`  | Stop the plugin, suppress restarts, then cancel its attempt         |
 | 2     | `ATTACH`  | Subscribe this connection to retained and future events             |
 | 3     | `DETACH`  | Stop this connection following without changing desired state       |
-| 4     | `STATUS`  | Request the current supervisor and attempt lifecycle record          |
-| 5     | `RESTART` | End the current attempt and schedule a new one immediately           |
-| 6     | `ENABLE`  | Set a retained persistent plugin to desired-running              |
-| 7     | `DISABLE` | Durably clear desired-running before cancelling the current attempt  |
-| 8     | `REMOVE`  | Durably remove a disabled persistent definition and retained events  |
-| 9     | `LIST`    | List visible plugins; requires `plugin_id = 0`                |
+| 4     | `STATUS`  | Request the current supervisor and attempt lifecycle record         |
+| 5     | `RESTART` | End the current attempt and schedule a new one immediately          |
+| 6     | `ENABLE`  | Set a retained persistent plugin to desired-running                 |
+| 7     | `DISABLE` | Durably clear desired-running before cancelling the current attempt |
+| 8     | `REMOVE`  | Durably remove a disabled persistent definition and retained events |
+| 9     | `LIST`    | List visible plugins; requires `plugin_id = 0`                      |
 
 Every control other than `LIST` receives a `PLUGIN_RUN_STATUS` carrying
 the request nonce. `LIST` receives the control-family list reply below. A CLI
@@ -493,20 +545,20 @@ Structured application communication should use channels, state, or topics.
 
 ### Server to client
 
-| Opcode | Name                    | Layout                                                                                           |
-| ------ | ----------------------- | ------------------------------------------------------------------------------------------------ |
+| Opcode | Name                | Layout                                                                                                                         |
+| ------ | ------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | `0x90` | `PLUGIN_RUN_STATUS` | `[nonce:2][status:1][phase:1][flags:1][restart:1][plugin_id:8][attempt:8][task_id:4][next_start_unix_ms:8][hash:32][detail:N]` |
-| `0x91` | `PLUGIN_PUT_STATUS` | `[nonce:2][status:1][hash:32][received:8][detail:N]`                                        |
-| `0x92` | `PLUGIN_CONTROL`    | `[kind:1][body...]`                                                                                |
-| `0x93` | `PLUGIN_EVENT`      | `[plugin_id:8][attempt:8][task_id:4][sequence:8][kind:1][data:N]`                      |
-| `0x94` | `PLUGIN_EXIT`       | `[plugin_id:8][attempt:8][task_id:4][reason:1][code:4][next_start_unix_ms:8][detail:N]` |
+| `0x91` | `PLUGIN_PUT_STATUS` | `[nonce:2][status:1][hash:32][received:8][detail:N]`                                                                           |
+| `0x92` | `PLUGIN_CONTROL`    | `[kind:1][body...]`                                                                                                            |
+| `0x93` | `PLUGIN_EVENT`      | `[plugin_id:8][attempt:8][task_id:4][sequence:8][kind:1][data:N]`                                                              |
+| `0x94` | `PLUGIN_EXIT`       | `[plugin_id:8][attempt:8][task_id:4][reason:1][code:4][next_start_unix_ms:8][detail:N]`                                        |
 
 Server `PLUGIN_CONTROL.kind` values:
 
-| Kind | Name   | Body                                                                                                  |
-| ---- | ------ | ----------------------------------------------------------------------------------------------------- |
-| 1    | `INIT` | `[plugin_id:8][attempt:8][task_id:4][flags:1][argc:2] repeated{[len:4][arg:N]}`                  |
-| 2    | `LIST` | `[nonce:2][status:1][count:2] repeated{plugin_record}`                                            |
+| Kind | Name   | Body                                                                            |
+| ---- | ------ | ------------------------------------------------------------------------------- |
+| 1    | `INIT` | `[plugin_id:8][attempt:8][task_id:4][flags:1][argc:2] repeated{[len:4][arg:N]}` |
+| 2    | `LIST` | `[nonce:2][status:1][count:2] repeated{plugin_record}`                          |
 
 A `plugin_record` is:
 
@@ -524,20 +576,26 @@ Run phases:
 | ----- | ------------- | -------------------------------------------------------- |
 | 1     | `NEED_OBJECT` | Object absent; one uploader should send it               |
 | 2     | `VALIDATING`  | Bytes complete; hash/import/manifest validation          |
-| 3     | `QUEUED`      | Valid attempt waiting for an execution slot               |
+| 3     | `QUEUED`      | Valid attempt waiting for an execution slot              |
 | 4     | `RUNNING`     | `task_id` is live and its logical client exists          |
 | 5     | `BACKOFF`     | Supervisor will start another attempt at the stated time |
 | 6     | `STOPPED`     | No attempt is running or scheduled                       |
 | 7     | `BLOCKED`     | Permanent condition requires policy/object/operator work |
 
 Exit reasons distinguish returned, trapped, cancelled, fuel exhausted,
-deadline exceeded, memory limit, protocol violation, host failure, and server
-shutdown. `code` is the `blit_main` return only for `RETURNED`; it is zero for
-other reasons. `next_start_unix_ms` is non-zero only when the supervisor has
-scheduled another attempt.
+deadline exceeded, memory limit, slow consumer, protocol violation, host
+failure, and server shutdown. `code` is the `blit_main` return only for
+`RETURNED`; it is zero for other reasons. `next_start_unix_ms` is non-zero only
+when the supervisor has scheduled another attempt.
 
 Common family status values are reused: `OK`, `NOT_FOUND`, `PERMISSION`,
 `TOO_LARGE`, `BUDGET`, `INVALID`, `CANCELLED`, `OTHER`, and `CONFLICT`.
+`PLUGIN_PUT_STATUS` additionally defines value 12 as `ALREADY_HAVE`. It means
+the verified object is already committed; `received` is its stored total size,
+the pending run proceeds, and the client must stop uploading. `OK` reports the
+cumulative accepted `received` bytes. `CONFLICT` means another uploader owns
+the still-uncommitted single flight and does not claim the object exists yet;
+it reports `received = 0`.
 
 ### Attached lifecycle
 
@@ -551,7 +609,11 @@ to return successfully. The plugin remains server-owned until its policy
 stops it, it is explicitly cancelled, or the server exits. Its event log is a
 bounded byte ring across attempts, so a later `ATTACH` receives a retained
 suffix followed by live events. Detached attempts still end at their
-configured deadline unless policy explicitly permits an unlimited lifetime.
+configured deadline. The version-1 default is a five-minute wall-clock
+deadline for attached attempts and no wall-clock deadline for detached or
+persistent attempts. A manifest or server policy may impose a finite detached
+deadline; detaching never removes fuel, memory, process, mailbox, capability,
+or cancellation limits.
 
 Every attempt has a 32-bit process-local `task_id`. Task IDs are not durable;
 `plugin_id` and `attempt` are the stable coordinates followed by clients.
@@ -678,25 +740,25 @@ Every message begins `[0x96][kind:1][handle_id:4]`.
 
 Client-to-server kinds:
 
-| Kind | Name              | Body                                                       |
-| ---- | ----------------- | ---------------------------------------------------------- |
+| Kind | Name              | Body                                                         |
+| ---- | ----------------- | ------------------------------------------------------------ |
 | 1    | `STATE_OPEN`      | `[nonce:2][flags:1][name_len:2][name:N][meta_len:4][meta:M]` |
-| 2    | `STATE_SET`       | `[nonce:2][expected_revision:8][value:N]`                  |
-| 3    | `TOPIC_SUBSCRIBE` | `[nonce:2][flags:1][after_sequence:8][name_len:2][name:N]` |
-| 4    | `TOPIC_PUBLISH`   | `[nonce:2][name_len:2][name:N][payload:M]`                 |
-| 5    | `CLOSE`           | empty                                                      |
+| 2    | `STATE_SET`       | `[nonce:2][expected_revision:8][value:N]`                    |
+| 3    | `TOPIC_SUBSCRIBE` | `[nonce:2][flags:1][after_sequence:8][name_len:2][name:N]`   |
+| 4    | `TOPIC_PUBLISH`   | `[nonce:2][name_len:2][name:N][payload:M]`                   |
+| 5    | `CLOSE`           | empty                                                        |
 
 Server-to-client kinds:
 
-| Kind | Name          | Body                                                       |
-| ---- | ------------- | ---------------------------------------------------------- |
+| Kind | Name          | Body                                                        |
+| ---- | ------------- | ----------------------------------------------------------- |
 | 1    | `OPENED`      | `[nonce:2][status:1][metadata_len:4][metadata:M][detail:N]` |
-| 2    | `STATE_VALUE` | `[revision:8][value:N]`                                    |
-| 3    | `TOPIC_EVENT` | `[sequence:8][payload:N]`                                  |
-| 4    | `TOPIC_GAP`   | `[requested_after:8][oldest_available:8][next_sequence:8]` |
-| 5    | `CLOSED`      | `[reason:1][detail:N]`                                     |
-| 6    | `STATE_DONE`  | `[nonce:2][status:1][revision:8][detail:N]`                |
-| 7    | `TOPIC_DONE`  | `[nonce:2][status:1][sequence:8][detail:N]`                |
+| 2    | `STATE_VALUE` | `[revision:8][value:N]`                                     |
+| 3    | `TOPIC_EVENT` | `[sequence:8][payload:N]`                                   |
+| 4    | `TOPIC_GAP`   | `[requested_after:8][oldest_available:8][next_sequence:8]`  |
+| 5    | `CLOSED`      | `[reason:1][detail:N]`                                      |
+| 6    | `STATE_DONE`  | `[nonce:2][status:1][revision:8][detail:N]`                 |
+| 7    | `TOPIC_DONE`  | `[nonce:2][status:1][sequence:8][detail:N]`                 |
 
 `STATE_OPEN.flags`: bit 0 `CREATE`, bit 1 `WATCH`, bit 2 `WRITE`. Create fails
 with `CONFLICT` when the name already exists. A successful watch enqueues one
@@ -743,12 +805,12 @@ paths on Windows. Stream payloads are unrestricted bytes.
 
 ### Client to server
 
-| Opcode | Name              | Layout |
-| ------ | ----------------- | ------ |
+| Opcode | Name              | Layout                                                                                                                                                                     |
+| ------ | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `0xC0` | `PROCESS_SPAWN`   | `[nonce:2][process_id:4][flags:1][cwd_kind:1][src_pty_id:2][cwd_len:4][cwd:N][argc:2] repeated{[len:4][arg:M]}[envc:2] repeated{[key_len:2][key:K][value_len:4][value:V]}` |
-| `0xC1` | `PROCESS_STDIN`   | `[process_id:4][offset:8][data:N]` |
-| `0xC2` | `PROCESS_ACK`     | `[process_id:4][stream:1][bytes:8]` |
-| `0xC3` | `PROCESS_CONTROL` | `[nonce:2][process_id:4][action:1][value:4]` |
+| `0xC1` | `PROCESS_STDIN`   | `[process_id:4][offset:8][data:N]`                                                                                                                                         |
+| `0xC2` | `PROCESS_ACK`     | `[process_id:4][stream:1][bytes:8]`                                                                                                                                        |
+| `0xC3` | `PROCESS_CONTROL` | `[nonce:2][process_id:4][action:1][value:4]`                                                                                                                               |
 
 `PROCESS_SPAWN` executes `argv[0]` directly. It never invokes a shell;
 clients which want shell parsing must explicitly run a policy-allowed shell
@@ -773,11 +835,11 @@ When stderr is merged, the server sends it as stdout and rejects stderr ACKs.
 
 Control actions are:
 
-| Value | Name          | Meaning |
-| ----- | ------------- | ------- |
-| 1     | `CLOSE_STDIN` | Deliver EOF after all accepted stdin bytes |
-| 2     | `TERMINATE`   | Request portable graceful termination of the process tree |
-| 3     | `KILL`        | Force termination of the process tree |
+| Value | Name          | Meaning                                                    |
+| ----- | ------------- | ---------------------------------------------------------- |
+| 1     | `CLOSE_STDIN` | Deliver EOF after all accepted stdin bytes                 |
+| 2     | `TERMINATE`   | Request portable graceful termination of the process tree  |
+| 3     | `KILL`        | Force termination of the process tree                      |
 | 4     | `SIGNAL`      | Send the platform signal in `value`, or report unsupported |
 
 `value` must be zero except for `SIGNAL`. `TERMINATE` and `KILL` are the
@@ -786,14 +848,14 @@ The initial family has no detach operation.
 
 ### Server to client
 
-| Opcode | Name              | Layout |
-| ------ | ----------------- | ------ |
-| `0xC0` | `PROCESS_STARTED` | `[nonce:2][status:1][process_id:4][stdin_window:8][stdout_window:8][stderr_window:8][detail:N]` |
-| `0xC1` | `PROCESS_STDOUT`  | `[process_id:4][offset:8][data:N]` |
-| `0xC2` | `PROCESS_STDERR`  | `[process_id:4][offset:8][data:N]` |
-| `0xC3` | `PROCESS_ACK`     | `[process_id:4][bytes:8]` — cumulative consumed stdin bytes |
-| `0xC4` | `PROCESS_EXIT`    | `[process_id:4][reason:1][code:4][detail:N]` |
-| `0xC5` | `PROCESS_CONTROLLED` | `[nonce:2][status:1][process_id:4][detail:N]` |
+| Opcode | Name                 | Layout                                                                                          |
+| ------ | -------------------- | ----------------------------------------------------------------------------------------------- |
+| `0xC0` | `PROCESS_STARTED`    | `[nonce:2][status:1][process_id:4][stdin_window:8][stdout_window:8][stderr_window:8][detail:N]` |
+| `0xC1` | `PROCESS_STDOUT`     | `[process_id:4][offset:8][data:N]`                                                              |
+| `0xC2` | `PROCESS_STDERR`     | `[process_id:4][offset:8][data:N]`                                                              |
+| `0xC3` | `PROCESS_ACK`        | `[process_id:4][bytes:8]` — cumulative consumed stdin bytes                                     |
+| `0xC4` | `PROCESS_EXIT`       | `[process_id:4][reason:1][code:4][detail:N]`                                                    |
+| `0xC5` | `PROCESS_CONTROLLED` | `[nonce:2][status:1][process_id:4][detail:N]`                                                   |
 
 `PROCESS_STARTED` is the single reply to `PROCESS_SPAWN`. On failure,
 `status != OK`, the windows are zero, no `PROCESS_EXIT` follows, and the ID is
@@ -886,9 +948,14 @@ invoking principal authority
 
 An absent manifest requests the conservative baseline: handshake, plugin
 events, outbound channel connections, and live topic subscription. Server
-operators can define defaults and per-name/hash policy. A CLI grant flag may
-further reduce or, with external authorization, request expansion; it cannot
-override server policy.
+operators can define defaults and per-name/hash policy.
+
+Version 1 has no per-invocation capability-grant or resource-limit fields in
+`PLUGIN_RUN`, and therefore no `--grant` or limit-override CLI flags. Effective
+authority and limits come only from the authenticated invoking principal, the
+module manifest, and server policy. A future per-run delegation needs a new
+feature-gated `PLUGIN_RUN2` or an explicitly negotiated TLV extension; it must
+not reinterpret trailing version-1 bytes.
 
 `process.spawn` is not in that baseline. Server policy may constrain it by
 module hash or durable name, executable path, argument shape, working-directory
@@ -914,13 +981,14 @@ Defaults are policy, not ABI, but the first implementation should enforce:
 | Fuel per driver slice          | 1 million         |
 | Total fuel                     | 100 million       |
 | Attached deadline              | 5 minutes         |
+| Detached/persistent deadline   | Unlimited         |
 | Concurrent plugin threads      | 16                |
 | Native stack per plugin thread | 2 MiB             |
 | Persistent definitions         | 128               |
 | Open endpoint resources        | 64                |
 | Concurrent child processes     | 8 per endpoint    |
-| Mailbox byte window, each       | 4 MiB             |
-| Mailbox absolute bound, each    | 16 MiB            |
+| Mailbox byte window, each      | 4 MiB             |
+| Mailbox absolute bound, each   | 16 MiB            |
 | Process stream window          | 1 MiB each        |
 | Process aggregate output       | 64 MiB            |
 | Retained plugin events         | 1 MiB             |
