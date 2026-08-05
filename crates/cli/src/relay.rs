@@ -218,6 +218,32 @@ async fn require_net(
 
 // --------------------------------------------------------------------------- The pump ---------------------------------------------------------------------------
 
+/// What a stream assumes when its server does not report the window it granted.
+///
+/// Every stream starts at [`NET_WINDOW_MIN`] and adopts the reported figure on the
+/// accept, so this decides only what an older server's silence means. It has to
+/// stay a per-command choice: the shrinking window and its BUDGET close predate
+/// the report, so against such a server a command that opens many sockets is one
+/// overrun away from a killed stream, while one that opens a couple would pay for
+/// that caution on every byte.
+#[derive(Clone, Copy)]
+pub enum Unreported {
+    /// `NET_WINDOW_BYTES`, the share of a connection carrying at most four sockets.
+    Ceiling,
+    /// `NET_WINDOW_MIN`, the smallest share the server ever hands out, and so the
+    /// only figure safe at any concurrency.
+    Floor,
+}
+
+impl Unreported {
+    fn bytes(self) -> u64 {
+        match self {
+            Unreported::Ceiling => NET_WINDOW_BYTES,
+            Unreported::Floor => NET_WINDOW_MIN,
+        }
+    }
+}
+
 /// What the local client is owed when the server answers the open.
 pub enum OnOpen {
     /// Nothing: a forward relays the target's own protocol, so the local client
@@ -239,6 +265,7 @@ pub async fn relay(
     local: tokio::net::TcpStream,
     conn: Arc<Conn>,
     mut open: NetOpen,
+    unreported: Unreported,
     on_open: OnOpen,
 ) -> Result<(), String> {
     let (events_tx, mut events) = mpsc::unbounded_channel::<Event>();
@@ -335,11 +362,10 @@ pub async fn relay(
                     };
                     break Err(format!("{target}: {detail}"));
                 }
-                // A server that reports nothing is older than the grant; it
-                // enforces the same shrinking window without naming it, so the
-                // old ceiling is the only figure available and the hazard it
-                // carries stays that server's.
-                let _ = window_tx.send(window.unwrap_or(NET_WINDOW_BYTES));
+                // A server that reports nothing is older than the grant, but it
+                // enforces the same shrinking window all the same, so what its
+                // silence may be read as is the caller's call (`Unreported`).
+                let _ = window_tx.send(window.unwrap_or(unreported.bytes()));
                 if let OnOpen::Report {
                     announce_alpn: Some(announced),
                 } = &on_open
@@ -396,7 +422,7 @@ mod tests {
     }
 
     impl Pump {
-        async fn start() -> Pump {
+        async fn start(unreported: Unreported) -> Pump {
             let (out_tx, mut out) = mpsc::unbounded_channel();
             let conn = Arc::new(Conn {
                 out: out_tx,
@@ -413,6 +439,7 @@ mod tests {
                     local,
                     pumped,
                     NetOpen::tcp(0, "target.internal", 80),
+                    unreported,
                     OnOpen::Report {
                         announce_alpn: None,
                     },
@@ -486,7 +513,7 @@ mod tests {
     /// granted — silently, since the local writer's send succeeded.
     #[tokio::test]
     async fn upload_stays_inside_the_window_it_was_granted() {
-        let mut pump = Pump::start().await;
+        let mut pump = Pump::start(Unreported::Ceiling).await;
         pump.flood();
 
         // Before the accept lands the client cannot know its share, so it
@@ -506,18 +533,36 @@ mod tests {
         fills(sent, granted + granted / 2);
     }
 
-    /// A server too old to report a window enforces one all the same, so the
-    /// client has nothing better than the old ceiling — but it must not stay
-    /// at the floor either, which would cost throughput on every forward.
+    /// A reported window overrides the caller's guess in both directions: a
+    /// proxy that would have assumed the floor uses the whole grant.
     #[tokio::test]
-    async fn an_unreported_window_falls_back_to_the_ceiling() {
-        let mut pump = Pump::start().await;
+    async fn a_reported_window_overrides_a_floor_guess() {
+        let mut pump = Pump::start(Unreported::Floor).await;
         pump.flood();
         let mut sent = pump.drain().await;
         fills(sent, NET_WINDOW_MIN);
-        pump.accepted(None);
+        pump.accepted(Some(NET_WINDOW_BYTES));
         sent += pump.drain().await;
         fills(sent, NET_WINDOW_BYTES);
+    }
+
+    /// A server too old to report a window enforces one all the same, and what
+    /// its silence means is the caller's call: a forward would rather have the
+    /// throughput, a proxy holding dozens of sockets would rather not be closed.
+    #[tokio::test]
+    async fn an_unreported_window_is_the_callers_guess() {
+        for (unreported, expected) in [
+            (Unreported::Ceiling, NET_WINDOW_BYTES),
+            (Unreported::Floor, NET_WINDOW_MIN),
+        ] {
+            let mut pump = Pump::start(unreported).await;
+            pump.flood();
+            let mut sent = pump.drain().await;
+            fills(sent, NET_WINDOW_MIN);
+            pump.accepted(None);
+            sent += pump.drain().await;
+            fills(sent, expected);
+        }
     }
 
     #[test]

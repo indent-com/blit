@@ -491,9 +491,11 @@ export class NetStreams {
         state.settled = true;
         if (parsed.status === NET_STATUS_OK) {
           // A server that reports nothing is older than the field; it enforces
-          // the same shrinking window without naming it, so the old ceiling is
-          // the only figure available.
-          state.window = parsed.window ?? NET_WINDOW_BYTES;
+          // the same shrinking window without naming it, and this client's
+          // socket count is the page's business — a service worker holds dozens
+          // — so its silence has to be read as the smallest share it grants.
+          // The alternative is a stream closed for BUDGET mid-upload.
+          state.window = parsed.window ?? NET_WINDOW_MIN;
           this.wake(state.creditWaiters);
           state.resolveOpened(parsed.alpn);
         } else {

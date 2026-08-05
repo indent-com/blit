@@ -389,11 +389,17 @@ Two rules follow, and both matter:
   sending to do before the window is known. The floor is the smallest
   share the server ever grants, so it cannot overrun at any concurrency,
   and it costs one round trip of ramp-up on a bulk transfer.
-- **No tail means the old ceiling.** A server that predates the field
-  enforces the same shrinking window without naming it; 1 MiB is then the
-  only figure available, and the hazard it carries is that server's.
-  The tail is additive rather than a new message: every shipped parser
-  stops at `detail`, so an old client reads the message unchanged.
+- **No tail is still a choice, and it is the client's.** A server that
+  predates the field enforces the same shrinking window without naming
+  it, so silence leaves the same guess as before — and the right guess
+  depends on how many sockets the client holds. A handful of static
+  forwards read it as the 1 MiB ceiling and keep their throughput; a
+  proxy or a service worker, whose socket count is its own client's
+  business, reads it as the floor, because a stream closed mid-upload
+  costs more than the ramp. Either way the guess is discarded the moment
+  a server reports. The tail is additive rather than a new message: every
+  shipped parser stops at `detail`, so an old client reads the message
+  unchanged.
 
 Its aggregate is **16 MiB, not the 4 MiB above**, and the asymmetry is
 forced rather than chosen. Outbound, the server produces and can park a
@@ -831,11 +837,13 @@ and reported on the accept ([§ Pacing](#pacing)). Overrunning it is
 
 It bites a proxy harder than a forward: a proxy's socket count is its
 client's business — one browser tab is dozens — so it sits in the range
-where the share is well under the 1 MiB ceiling. Both commands follow the
-same rule all the same, because they run the same pump: start at the
-floor, raise to the granted figure when the accept arrives. Nothing about
-the window is `socks`-specific, which is why there is no per-command
-window setting.
+where the share is well under the 1 MiB ceiling. Against a server that
+reports its grant, both commands need no more than the shared pump's rule
+(start at the floor, raise to the granted figure on the accept). Against
+one too old to report, the difference reappears and the two commands part
+ways: `blit forward` reads silence as the ceiling, `blit socks` as the
+floor (`relay::Unreported`), because for a proxy that guess is the
+difference between a slower stream and a closed one.
 
 `NET_MAX_SOCKETS` (256) is a real ceiling for a proxy in a way it is
 not for a forward. Past it the proxy answers `0x01` rather than hanging.
