@@ -2648,7 +2648,7 @@ impl<'a> Iterator for GitIndexRecordIter<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// 0x90 block: discover, blame, reflog, fetch
+// 0xB1-0xB4 block: discover, blame, reflog, fetch
 // ---------------------------------------------------------------------------
 
 macro_rules! records_resp {
@@ -3960,7 +3960,7 @@ mod tests {
         assert_eq!(decoded, records);
     }
 
-    /// The 0x90 block round-trips, and `CURSOR` decodes in every family
+    /// The 0xB1-0xB4 block round-trips, and `CURSOR` decodes in every family
     /// that can be truncated — the whole point of the record is that one
     /// branch works everywhere.
     #[test]
