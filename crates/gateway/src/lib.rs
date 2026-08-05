@@ -408,6 +408,30 @@ const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 /// shallow enough that the blit server feels the backpressure.
 const MUX_DATA_QUEUE_FRAMES: usize = 8;
 
+/// Largest `/config` message. That endpoint speaks short text control lines
+/// (`set k v`, `remotes-add …`), so 64 KiB is already generous; the point is
+/// not to inherit a 64 MiB default on the one path that reads before it
+/// authenticates.
+const CONFIG_MAX_MESSAGE_SIZE: usize = 64 * 1024;
+
+/// Client mux frames the WebTransport reader may hold before it stops
+/// draining the QUIC stream.  Matches `MUX_DATA_QUEUE_FRAMES` in the other
+/// direction; the WebSocket path needs no equivalent because its select loop
+/// reads the socket directly.
+const MUX_CLIENT_QUEUE_FRAMES: usize = 8;
+
+/// Mux control frames (OPENED / CLOSED / errors) queued for one browser.
+/// Every one is a handful of bytes and they are only produced in response to
+/// client actions, so this is generous — it exists because a client can spam
+/// `MUX_C2S_CLOSE`, each of which used to push an ack onto an unbounded queue.
+const MUX_CONTROL_QUEUE_FRAMES: usize = 256;
+
+/// Frames queued for one upstream socket before the channel is considered
+/// stuck.  Client input is keystrokes, ACKs and resizes — tiny and drained at
+/// upstream speed — so a backlog this deep means the upstream is not moving,
+/// not that it is slow.
+const MUX_WRITER_QUEUE_FRAMES: usize = 64;
+
 async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await.ok()?;
@@ -747,29 +771,38 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
         .unwrap_or(false);
     if is_ws && path.ends_with("/config") {
         match WebSocketUpgrade::from_request(request, &state).await {
-            Ok(ws) => ws.on_upgrade(move |socket| async move {
-                let transform = state
-                    .webrtc_enabled
-                    .then_some(mark_share_remotes_proxiable as fn(&str) -> String);
-                let mut extra_init = Vec::new();
-                if let Some(hash) = state.wt_cert_hash.read().unwrap().as_ref() {
-                    extra_init.push(format!("wt={hash}"));
-                }
-                blit_webserver::config::handle_config_ws(
-                    socket,
-                    &state.passphrase,
-                    &state.config_state,
-                    Some(&state.remotes),
-                    transform,
-                    Some(&state.roots),
-                    &extra_init,
-                    blit_webserver::config::AuthContext {
-                        throttle: &state.auth_throttle,
-                        peer: &auth_peer,
-                    },
-                )
-                .await;
-            }),
+            // `/config` carries short text control lines and nothing else, but
+            // it inherited axum's 64 MiB default — four times what the two
+            // upgrades below allow, on the one endpoint that reads from the
+            // socket *before* authenticating. Tungstenite reassembles
+            // fragmented frames into a growing buffer before rejecting one, so
+            // an unauthenticated peer could park 64 MiB per connection.
+            Ok(ws) => {
+                ws.max_message_size(CONFIG_MAX_MESSAGE_SIZE)
+                    .on_upgrade(move |socket| async move {
+                        let transform = state
+                            .webrtc_enabled
+                            .then_some(mark_share_remotes_proxiable as fn(&str) -> String);
+                        let mut extra_init = Vec::new();
+                        if let Some(hash) = state.wt_cert_hash.read().unwrap().as_ref() {
+                            extra_init.push(format!("wt={hash}"));
+                        }
+                        blit_webserver::config::handle_config_ws(
+                            socket,
+                            &state.passphrase,
+                            &state.config_state,
+                            Some(&state.remotes),
+                            transform,
+                            Some(&state.roots),
+                            &extra_init,
+                            blit_webserver::config::AuthContext {
+                                throttle: &state.auth_throttle,
+                                peer: &auth_peer,
+                            },
+                        )
+                        .await;
+                    })
+            }
             Err(e) => e.into_response(),
         }
     } else if is_ws && is_mux_path(&path) {
@@ -909,7 +942,7 @@ async fn handle_ws(
 /// State for a single multiplexed channel inside a mux session.
 struct MuxChannelState {
     /// Send payloads to be written upstream.
-    writer_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    writer_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     /// Upstream writer task handle.
     writer_task: JoinHandle<()>,
     /// Upstream reader task handle.
@@ -947,7 +980,7 @@ async fn handle_mux_ws(mut ws: WebSocket, state: AppState, auth_peer: String) {
 
     // Mux control frames (OPENED / CLOSED / errors) go on their own
     // unbounded channel so they are never delayed behind bulk data.
-    let (merge_tx, merge_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (merge_tx, merge_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MUX_CONTROL_QUEUE_FRAMES);
     // Upstream data frames go on a BOUNDED channel: a browser that cannot
     // keep up must stop the upstream reader, which fills the upstream
     // socket and lets the blit server see its own writes block.  With an
@@ -1064,13 +1097,27 @@ async fn handle_mux_ws(mut ws: WebSocket, state: AppState, auth_peer: String) {
                                     if let Some(ch) = channels.remove(&close_ch) {
                                         ch.shutdown();
                                     }
-                                    let _ = merge_tx.send(mux_control(MUX_S2C_CLOSED, close_ch));
+                                    let _ = merge_tx.try_send(mux_control(MUX_S2C_CLOSED, close_ch));
                                 }
                                 _ => {} // Unknown control opcode — ignore.
                             }
                         } else if let Some(ch) = channels.get(&ch_id) {
                             // Data frame — forward payload to upstream writer.
-                            let _ = ch.writer_tx.send(payload.to_vec());
+                            //
+                            // `try_send`, not `send().await`: awaiting here
+                            // would let one stuck upstream head-of-line-block
+                            // every other channel on this session, plus the
+                            // close and shutdown arms. A full queue means that
+                            // upstream is not draining, so drop the channel and
+                            // let the client's per-channel reconnect handle it
+                            // — the stream is ordered, so skipping a frame and
+                            // carrying on would silently corrupt it.
+                            if ch.writer_tx.try_send(payload.to_vec()).is_err() {
+                                if let Some(ch) = channels.remove(&ch_id) {
+                                    ch.shutdown();
+                                }
+                                let _ = merge_tx.try_send(mux_control(MUX_S2C_CLOSED, ch_id));
+                            }
                         }
                     }
                     Message::Close(_) => break,
@@ -1088,7 +1135,7 @@ async fn handle_mux_ws(mut ws: WebSocket, state: AppState, auth_peer: String) {
                     let mut quit_frame = Vec::with_capacity(3);
                     quit_frame.extend_from_slice(&ch_id.to_le_bytes());
                     quit_frame.push(S2C_QUIT);
-                    let _ = merge_tx.send(quit_frame);
+                    let _ = merge_tx.try_send(quit_frame);
                 }
                 break;
             }
@@ -1119,14 +1166,16 @@ async fn mux_open_channel(
     ch_id: u16,
     name: String,
     state: AppState,
-    merge_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    merge_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> Option<MuxChannelState> {
     let connector = match state.connector_for(&name) {
         Some(c) => c,
         None => {
             eprintln!("mux: unknown destination '{name}'");
-            let _ = merge_tx.send(mux_error(ch_id, &format!("unknown destination '{name}'")));
+            let _ = merge_tx
+                .send(mux_error(ch_id, &format!("unknown destination '{name}'")))
+                .await;
             return None;
         }
     };
@@ -1138,19 +1187,19 @@ async fn mux_open_channel(
         Ok(Ok(rw)) => rw,
         Ok(Err(e)) => {
             eprintln!("mux: cannot connect to '{name}': {e}");
-            let _ = merge_tx.send(mux_error(ch_id, &e));
+            let _ = merge_tx.send(mux_error(ch_id, &e)).await;
             return None;
         }
         Err(_) => {
             let msg = format!("connection to '{name}' timed out");
             eprintln!("mux: {msg}");
-            let _ = merge_tx.send(mux_error(ch_id, &msg));
+            let _ = merge_tx.send(mux_error(ch_id, &msg)).await;
             return None;
         }
     };
 
     // Writer task: drains payloads from the browser into the upstream socket.
-    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MUX_WRITER_QUEUE_FRAMES);
     let writer_task = tokio::spawn(async move {
         let mut w = sock_writer;
         while let Some(payload) = writer_rx.recv().await {
@@ -1162,7 +1211,7 @@ async fn mux_open_channel(
 
     // Send OPENED *before* starting the reader so the browser receives it
     // before any data frames from the upstream.
-    let _ = merge_tx.send(mux_control(MUX_S2C_OPENED, ch_id));
+    let _ = merge_tx.send(mux_control(MUX_S2C_OPENED, ch_id)).await;
 
     // Reader task: reads length-prefixed frames from the upstream socket,
     // prepends the channel ID, and feeds them into the bounded data queue.
@@ -1633,7 +1682,7 @@ async fn handle_mux_wt(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("mux-wt client authenticated");
 
-    let (merge_tx, merge_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (merge_tx, merge_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MUX_CONTROL_QUEUE_FRAMES);
     let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MUX_DATA_QUEUE_FRAMES);
     let mut channels: HashMap<u16, MuxChannelState> = HashMap::new();
     let shutdown = state.shutdown.clone();
@@ -1644,7 +1693,19 @@ async fn handle_mux_wt(
     let mut pending_opens: HashMap<u16, tokio::task::AbortHandle> = HashMap::new();
 
     // Reader task: reads length-prefixed mux frames from the WT stream.
-    let (client_frame_tx, mut client_frame_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    //
+    // Bounded, and awaited rather than dropped: blocking here stops
+    // `read_exact` and lets QUIC flow control push back on the client, which
+    // is the whole point. The frames are a reliable ordered stream, so
+    // dropping one is not an option. `len` is only checked against
+    // MAX_FRAME_SIZE, and `vec![0u8; len]` is allocated from the length header
+    // before the body arrives, so an unbounded queue here is 16 MiB per
+    // queued frame of attacker-chosen depth.
+    //
+    // The WebSocket mux needs no equivalent: its select loop polls the socket
+    // directly, so it is backpressured by construction.
+    let (client_frame_tx, mut client_frame_rx) =
+        tokio::sync::mpsc::channel::<Vec<u8>>(MUX_CLIENT_QUEUE_FRAMES);
     let reader_task = tokio::spawn(async move {
         let mut len_buf = [0u8; 4];
         loop {
@@ -1659,7 +1720,7 @@ async fn handle_mux_wt(
             if len > 0 && recv.read_exact(&mut buf).await.is_err() {
                 break;
             }
-            if client_frame_tx.send(buf).is_err() {
+            if client_frame_tx.send(buf).await.is_err() {
                 break;
             }
         }
@@ -1752,12 +1813,19 @@ async fn handle_mux_wt(
                             if let Some(ch) = channels.remove(&close_ch) {
                                 ch.shutdown();
                             }
-                            let _ = merge_tx.send(mux_control(MUX_S2C_CLOSED, close_ch));
+                            let _ = merge_tx.try_send(mux_control(MUX_S2C_CLOSED, close_ch));
                         }
                         _ => {}
                     }
                 } else if let Some(ch) = channels.get(&ch_id) {
-                    let _ = ch.writer_tx.send(payload.to_vec());
+                    // See the WebSocket path: a full queue means this upstream
+                    // is stuck, and awaiting would block every other channel.
+                    if ch.writer_tx.try_send(payload.to_vec()).is_err() {
+                        if let Some(ch) = channels.remove(&ch_id) {
+                            ch.shutdown();
+                        }
+                        let _ = merge_tx.try_send(mux_control(MUX_S2C_CLOSED, ch_id));
+                    }
                 }
             }
 
@@ -1771,7 +1839,7 @@ async fn handle_mux_wt(
                     let mut quit_frame = Vec::with_capacity(3);
                     quit_frame.extend_from_slice(&ch_id.to_le_bytes());
                     quit_frame.push(S2C_QUIT);
-                    let _ = merge_tx.send(quit_frame);
+                    let _ = merge_tx.try_send(quit_frame);
                 }
                 break;
             }

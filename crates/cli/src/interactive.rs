@@ -14,6 +14,14 @@ use crate::transport::{self, Transport, make_frame, read_frame, write_frame};
 /// Blit protocol: server is shutting down (single byte, no payload).
 const S2C_QUIT: u8 = 0x0C;
 
+/// Largest blit frame, matching `transport::MAX_FRAME_SIZE` and the gateway.
+const WS_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// Largest `/config` message. That socket carries short text control lines;
+/// without this it inherits axum's 64 MiB default, on the endpoint that reads
+/// before it has checked the token.
+const CONFIG_MAX_MESSAGE_SIZE: usize = 64 * 1024;
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = (a.len() ^ b.len()) as u8;
     for i in 0..a.len().min(b.len()) {
@@ -256,6 +264,7 @@ pub async fn run_browser(port: Option<u16>, hub: &str) {
                       request: axum::extract::Request| async move {
                     match WebSocketUpgrade::from_request(request, &state).await {
                         Ok(ws) => ws
+                            .max_message_size(CONFIG_MAX_MESSAGE_SIZE)
                             .on_upgrade(move |socket| async move {
                                 blit_webserver::config::handle_config_ws(
                                     socket,
@@ -369,13 +378,17 @@ async fn browser_root_handler(
 
     if is_ws && (path == "/mux" || path.ends_with("/mux")) {
         match WebSocketUpgrade::from_request(request, &state).await {
-            Ok(ws) => ws.on_upgrade(move |socket| browser_handle_mux_ws(socket, state)),
+            Ok(ws) => ws
+                .max_message_size(WS_MAX_MESSAGE_SIZE + 2) // +2 for channel ID prefix
+                .on_upgrade(move |socket| browser_handle_mux_ws(socket, state)),
             Err(e) => e.into_response(),
         }
     } else if is_ws {
         let dest_name = resolve_destination_name(&path);
         match WebSocketUpgrade::from_request(request, &state).await {
-            Ok(ws) => ws.on_upgrade(move |socket| browser_handle_ws(socket, state, dest_name)),
+            Ok(ws) => ws
+                .max_message_size(WS_MAX_MESSAGE_SIZE)
+                .on_upgrade(move |socket| browser_handle_ws(socket, state, dest_name)),
             Err(e) => e.into_response(),
         }
     } else {
