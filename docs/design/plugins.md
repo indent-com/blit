@@ -273,15 +273,12 @@ negative capacity, integer overflow, or an invalid destination range traps the
 attempt. The SDK keeps a reusable buffer and retries with `N` bytes only when
 needed. `recv` never returns a negative value.
 
-`send` may also block when the endpoint's inbound byte window is full.
+`send` may block until its whole packet fits in the endpoint's inbound mailbox.
 This preserves ordering and backpressure without busy polling.
 
-The default mailbox byte window is 4 MiB, but message boundaries are never
-split and a legal packet must always be able to make progress. An empty
-mailbox therefore admits one whole packet up to the 16 MiB logical-message
-cap even when that packet exceeds the window. While that oversized packet is
-queued, no second packet is admitted. Thus the normal queued-byte bound stays
-4 MiB and the absolute queued-byte bound for either mailbox is 16 MiB.
+Each in-process mailbox has a 16 MiB byte capacity, equal to the maximum Blit
+logical-message size. Packets are never split, and every valid packet therefore
+fits in an empty mailbox. There is no separate oversized-packet case.
 
 No separate argument, logging, timer, or process imports are needed. After the
 normal `HELLO` / `LIST` / `READY` handshake, the host
