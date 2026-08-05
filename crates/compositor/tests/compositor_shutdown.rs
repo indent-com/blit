@@ -1,11 +1,11 @@
-//! Stopping the compositor has to finish before the caller moves on.
+//! Stopping the compositor must not take the process down with it.
 //!
-//! Teardown ends in `vkDestroyInstance`, and the Vulkan loader `dlclose()`s
-//! its layer libraries on the way out.  Left to run on a detached thread
-//! while the process is exiting, that unmaps code from under whatever the
-//! main thread is still executing and the process dies with a SIGSEGV that
-//! has no stack to read.  `stop()` joins, which keeps the unloading inside
-//! the caller's lifetime.
+//! Renderer teardown used to end in `vkDestroyInstance`, where the Vulkan
+//! loader `dlclose()`s its layer and ICD libraries -- libraries that have
+//! registered thread-local destructors on every thread that touched them.
+//! Unmapping them left those destructors dangling, so a thread exiting
+//! afterwards jumped into freed memory.  The instance is now leaked on
+//! purpose instead.
 //!
 //! If this regresses, the symptom is the whole test binary exiting with
 //! signal 11 rather than a failed assertion.

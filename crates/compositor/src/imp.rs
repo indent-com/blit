@@ -5836,13 +5836,6 @@ impl CompositorHandle {
 
     /// Stop the compositor and wait for it to finish tearing down.
     ///
-    /// The wait is the point.  Teardown ends in `vkDestroyInstance`, and the
-    /// Vulkan loader `dlclose()`s its layer libraries on the way out; letting
-    /// that run on a detached thread while the process is exiting unmaps code
-    /// out from under whatever the main thread is still executing, which
-    /// lands as a SIGSEGV with no stack.  Joining keeps the unloading inside
-    /// the caller's lifetime, where it is safe.
-    ///
     /// Simply dropping the handle leaves the compositor running instead --
     /// there is no orderly stop without calling this.
     pub fn stop(self) {
