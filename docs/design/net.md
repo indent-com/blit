@@ -219,6 +219,16 @@ A client-initiated full close (`NET_CLOSE` without `WRITE`) is still
 answered with `NET_CLOSED`, so the id-reuse rule has one signal to wait
 on regardless of who ended it.
 
+**Only `EOF` ends the local socket cleanly.** A relay carries an opaque
+byte stream, so a client that FINs its local socket has said "that was
+all of it" — and for anything whose body is delimited by the close,
+which is HTTP/1.0, `nc`, and much of what a forward gets used for, a
+truncated transfer then reads as a complete one. Every other reason,
+and a connection that disappears without sending a `NET_CLOSED` at all,
+resets the local socket instead (`SO_LINGER` 0), so the local peer gets
+`ECONNRESET` and can tell. `@blit-sh/core` does the same in its own
+idiom: EOF closes the stream, every other reason errors it.
+
 `detail` on a UDP `NET_CLOSED` carries the flow's **drop counts**, both
 directions. Drops are the one thing about a relayed UDP flow a user
 cannot infer from the outside — "DNS is flaky through the tunnel" and
@@ -641,7 +651,8 @@ string has to work in a config file where a global flag has nowhere to
 live. One grammar, one parser, both places.
 
 **TCP:** a local listener, one stream per accepted connection, copy
-both ways, half-close mapped to half-close. That is `ssh -L` over
+both ways, half-close mapped to half-close and an abnormal close mapped
+to a reset. That is `ssh -L` over
 **any** blit transport, including the WebRTC and uplink paths where
 there is no SSH connection to hang a tunnel on
 ([../transports.md](../transports.md), [../uplink.md](../uplink.md)).

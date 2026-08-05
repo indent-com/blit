@@ -16,9 +16,9 @@ use tokio::sync::{Mutex, mpsc, watch};
 
 use crate::transport::{read_message, write_frame};
 use blit_remote::net::{
-    FEATURE_NET, NET_CLOSE_WRITE, NET_MAX_CHUNK, NET_MAX_SOCKETS, NET_STATUS_OK, NET_WINDOW_BYTES,
-    NET_WINDOW_MIN, NetOpen, S2C_NET_ACK, S2C_NET_CLOSED, S2C_NET_DATA, S2C_NET_DGRAM,
-    S2C_NET_OPENED, msg_net_ack_c2s, msg_net_close, msg_net_data_c2s, msg_net_open,
+    FEATURE_NET, NET_CLOSE_WRITE, NET_CLOSED_EOF, NET_MAX_CHUNK, NET_MAX_SOCKETS, NET_STATUS_OK,
+    NET_WINDOW_BYTES, NET_WINDOW_MIN, NetOpen, S2C_NET_ACK, S2C_NET_CLOSED, S2C_NET_DATA,
+    S2C_NET_DGRAM, S2C_NET_OPENED, msg_net_ack_c2s, msg_net_close, msg_net_data_c2s, msg_net_open,
     net_closed_text, net_status_text, parse_net_ack_s2c, parse_net_closed, parse_net_data_s2c,
     parse_net_dgram_s2c, parse_net_opened, parse_net_opened_window,
 };
@@ -338,8 +338,14 @@ pub async fn relay(
 
     let mut opened = false;
     let mut received: u64 = 0;
+    // A FIN says "that was all of it", which a local client reading to the
+    // close cannot tell apart from a complete transfer. Every end but the
+    // target's own EOF has to reset instead.
+    let mut truncated = false;
     let result = loop {
         let Some(event) = events.recv().await else {
+            // The connection went away mid-stream without a NET_CLOSED.
+            truncated = true;
             break Ok(());
         };
         match event {
@@ -394,12 +400,22 @@ pub async fn relay(
                 if !detail.is_empty() {
                     eprintln!("blit: stream {id} {}: {detail}", net_closed_text(reason));
                 }
-                let _ = local_write.shutdown().await;
+                if reason == NET_CLOSED_EOF {
+                    let _ = local_write.shutdown().await;
+                } else {
+                    truncated = true;
+                }
                 break Ok(());
             }
         }
     };
     up.abort();
+    if truncated {
+        // A zero linger makes the close an RST, and `forget` suppresses the FIN
+        // that dropping the half would otherwise send ahead of it.
+        let _ = local_write.as_ref().set_zero_linger();
+        local_write.forget();
+    }
     if opened {
         conn.send(msg_net_close(id, 0));
     }
@@ -410,6 +426,7 @@ pub async fn relay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
 
     /// Drive one `relay` against a scripted server side: a local TCP client to
     /// write into, the C2S messages the pump produced, and the events channel
@@ -479,6 +496,32 @@ mod tests {
                     window,
                 })
                 .unwrap();
+        }
+
+        /// What the local client sees on its own socket: the relayed bytes, and
+        /// then either a clean end or the error a reset produces.
+        async fn local_end(&mut self) -> (Vec<u8>, io::Result<()>) {
+            let mut client = self.client.take().unwrap();
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    client.read(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok(0)) => return (seen, Ok(())),
+                    Ok(Ok(n)) => seen.extend_from_slice(&buf[..n]),
+                    Ok(Err(e)) => return (seen, Err(e)),
+                    Err(_) => {
+                        return (
+                            seen,
+                            Err(io::Error::new(io::ErrorKind::TimedOut, "still open")),
+                        );
+                    }
+                }
+            }
         }
 
         /// Bytes the pump sends until it goes quiet, which is the only way to ask
@@ -563,6 +606,59 @@ mod tests {
             sent += pump.drain().await;
             fills(sent, expected);
         }
+    }
+
+    /// A stream cut short must not look finished. Every reason but the target's
+    /// own EOF means the local client did not get everything, and a FIN is
+    /// indistinguishable from a complete transfer for anything that reads to the
+    /// close.
+    #[tokio::test]
+    async fn an_abnormal_close_resets_the_local_socket() {
+        for reason in [
+            blit_remote::net::NET_CLOSED_RESET,
+            blit_remote::net::NET_CLOSED_BUDGET,
+            blit_remote::net::NET_CLOSED_POLICY,
+            blit_remote::net::NET_CLOSED_SHUTDOWN,
+        ] {
+            let mut pump = Pump::start(Unreported::Ceiling).await;
+            pump.accepted(Some(NET_WINDOW_BYTES));
+            pump.events
+                .send(Event::Data(b"half a response".to_vec()))
+                .unwrap();
+            pump.events
+                .send(Event::Closed {
+                    reason,
+                    detail: String::new(),
+                })
+                .unwrap();
+            let (_, end) = pump.local_end().await;
+            let err = end.expect_err("a cut stream ended the local socket cleanly");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::ConnectionReset,
+                "reason {reason}: {err}"
+            );
+        }
+    }
+
+    /// And the clean case stays clean: a target that closed on its own is an
+    /// ordinary end of stream, and every byte of it must arrive.
+    #[tokio::test]
+    async fn a_target_eof_ends_the_local_socket_cleanly() {
+        let mut pump = Pump::start(Unreported::Ceiling).await;
+        pump.accepted(Some(NET_WINDOW_BYTES));
+        pump.events
+            .send(Event::Data(b"a whole response".to_vec()))
+            .unwrap();
+        pump.events
+            .send(Event::Closed {
+                reason: NET_CLOSED_EOF,
+                detail: String::new(),
+            })
+            .unwrap();
+        let (seen, end) = pump.local_end().await;
+        end.expect("a target EOF must not reset the local socket");
+        assert_eq!(seen, b"a whole response");
     }
 
     #[test]
