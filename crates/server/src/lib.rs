@@ -673,6 +673,18 @@ struct SurfaceSubState {
     /// bandwidth / speed change (resubscribe) while encoding — the completion
     /// handler must drop the stale encoder instead of reinserting it.
     encoder_invalidated: bool,
+    /// This client holds a decodable keyframe for this surface, so a delta
+    /// frame is safe to send.  Cleared whenever the reference chain breaks
+    /// or becomes unknown: encoder rebuilt or lost, surface resized,
+    /// resubscribe with changed preferences, a send that failed, a Vulkan
+    /// session withdrawn.  `false` — the default — means the next frame
+    /// this surface sends must be a keyframe, which is right for a
+    /// subscription that has never been sent one: it cannot decode a delta.
+    ///
+    /// Per surface, not per client.  A client watching several surfaces has
+    /// an independent reference chain for each, and one surface's keyframe
+    /// says nothing about another's.
+    has_keyframe: bool,
     /// Pixel generation that was last encoded; used to skip re-
     /// encoding identical pixel data on subsequent ticks.
     last_encoded_gen: Option<u64>,
@@ -821,7 +833,6 @@ struct ClientState {
     /// `entry(sid).or_default()` on first touch and dropped wholesale
     /// on UNSUBSCRIBE / SurfaceDestroyed.
     surface_subs: HashMap<u16, SurfaceSubState>,
-    surface_needs_keyframe: bool,
     /// Surfaces that use Vulkan Video encoding in the compositor rather than
     /// a local SurfaceEncoder.  Maps surface_id → (encoder_name, codec_flag).
     vulkan_video_surfaces: HashMap<u16, (&'static str, u8)>,
@@ -1080,6 +1091,19 @@ fn surface_pacing_fps(client: &ClientState) -> f32 {
 
 fn surface_send_interval(client: &ClientState) -> Duration {
     Duration::from_secs_f64(1.0 / surface_pacing_fps(client).max(1.0) as f64)
+}
+
+/// Whether the next frame sent to `client` for `sid` must be a keyframe.
+///
+/// Per surface: a client watching several surfaces keeps an independent
+/// decoder reference chain for each, so one surface's keyframe says nothing
+/// about another's.  A surface with no sub state yet has been sent nothing
+/// and cannot decode a delta, so it owes one.
+fn owes_keyframe(client: &ClientState, sid: u16) -> bool {
+    !client
+        .surface_subs
+        .get(&sid)
+        .is_some_and(|s| s.has_keyframe)
 }
 
 /// What an encode result leaves in the sub's `last_encoded_gen`.
@@ -3500,11 +3524,11 @@ async fn tick(state: &AppState) -> TickOutcome {
             let sub = c.surface_subs.entry(sid).or_default();
             sub.vulkan_refused = true;
             sub.encoder = None;
+            sub.has_keyframe = false;
             if sub.encode_in_flight || sub.creation_in_flight {
                 sub.encoder_invalidated = true;
             }
             forget_surface_inflight(c, sid);
-            c.surface_needs_keyframe = true;
             eprintln!(
                 "[vulkan-video] cid={cid} sid={sid}: compositor declined a session, \
                  falling back to a server-side encoder",
@@ -3525,13 +3549,12 @@ async fn tick(state: &AppState) -> TickOutcome {
             if !c.surface_subscriptions.contains(&sid) {
                 continue;
             }
-            if let Some(s) = c.surface_subs.get_mut(&sid) {
-                s.burst_remaining = SURFACE_BURST_FRAMES;
-                s.next_send_at = None;
-                s.nal_none_streak = 0;
-                s.nal_none_latched_at = None;
-            }
-            c.surface_needs_keyframe = true;
+            let s = c.surface_subs.entry(sid).or_default();
+            s.burst_remaining = SURFACE_BURST_FRAMES;
+            s.next_send_at = None;
+            s.nal_none_streak = 0;
+            s.nal_none_latched_at = None;
+            s.has_keyframe = false;
         }
     }
 
@@ -3673,13 +3696,14 @@ async fn tick(state: &AppState) -> TickOutcome {
     // parallel with the in-flight encode (pipeline overlap).
     let mut encode_dispatched_surfaces: HashSet<u16> = HashSet::new();
 
-    // Collect (cid, subs, needs_kf) for clients that are due, then build
-    // encode jobs in a second pass to avoid overlapping borrows.  `subs`
-    // is the set of surface ids this client subscribes to.
+    // Collect (cid, subs) for clients that are due, then build encode jobs
+    // in a second pass to avoid overlapping borrows.  `subs` is the set of
+    // surface ids this client subscribes to.  Whether a keyframe is owed is
+    // read per surface inside that second pass, from the sub's own
+    // `has_keyframe` — it is not a property of the client.
     struct ClientWork {
         cid: u64,
         subs: HashSet<u16>,
-        needs_keyframe: bool,
     }
     let mut client_work: Vec<ClientWork> = Vec::new();
 
@@ -3717,11 +3741,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 continue;
             }
             let subs: HashSet<u16> = client.surface_subscriptions.iter().copied().collect();
-            client_work.push(ClientWork {
-                cid,
-                subs,
-                needs_keyframe: client.surface_needs_keyframe,
-            });
+            client_work.push(ClientWork { cid, subs });
             // Don't advance the deadline here — wait until we know an
             // encode job was actually collected (see below).  Advancing
             // eagerly wastes time slots when the encode is skipped due
@@ -3889,7 +3909,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                 } else {
                     px_gen
                 };
-                let unchanged = !work.needs_keyframe
+                let owes_keyframe = owes_keyframe(client, sid);
+                let unchanged = !owes_keyframe
                     && client
                         .surface_subs
                         .get(&sid)
@@ -3984,7 +4005,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         });
                     let client = sess.clients.get_mut(&work.cid).unwrap();
                     if let Some((ew, eh, data, is_keyframe, codec_flag, frame_gen, ts)) = encoded {
-                        if !work.needs_keyframe
+                        if !owes_keyframe
                             && client
                                 .surface_subs
                                 .get(&sid)
@@ -4016,7 +4037,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         let bytes = msg.len();
                         match send_outbox(client, msg) {
                             Err(_e) => {
-                                client.surface_needs_keyframe = true;
+                                client.surface_subs.entry(sid).or_default().has_keyframe = false;
                             }
                             Ok(()) => {
                                 record_surface_frame_sent(client, sid, bytes, is_keyframe, now);
@@ -4029,12 +4050,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                                     );
                                 }
                                 client.frames_sent = client.frames_sent.wrapping_add(1);
-                                if client.surface_needs_keyframe && is_keyframe {
-                                    client.surface_needs_keyframe = false;
+                                let s = client.surface_subs.entry(sid).or_default();
+                                if is_keyframe {
+                                    s.has_keyframe = true;
                                 }
-                                if let Some(s) = client.surface_subs.get_mut(&sid) {
-                                    s.burst_remaining = s.burst_remaining.saturating_sub(1);
-                                }
+                                s.burst_remaining = s.burst_remaining.saturating_sub(1);
                             }
                         }
                         encoded_client_surfaces.insert((work.cid, sid));
@@ -4044,7 +4064,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         continue;
                     }
                     // The session exists but has not produced a frame yet.
-                    if work.needs_keyframe {
+                    if owes_keyframe {
                         pending_vulkan_keyframe_requests.push((sid as u32, work.cid));
                     }
                     client.skip_vulkan_await_count =
@@ -4317,7 +4337,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // A refresh has to be an IDR: a P-frame against an identical
                 // reference codes as skip blocks and refines nothing, however
                 // much finer the quantizer is.
-                let needs_kf = work.needs_keyframe || needs_new_encoder || still_refresh;
+                let needs_kf = owes_keyframe || needs_new_encoder || still_refresh;
                 encoded_client_surfaces.insert((work.cid, sid));
                 encode_dispatched_surfaces.insert(sid);
                 encode_jobs.push(EncodeJob {
@@ -4343,7 +4363,7 @@ async fn tick(state: &AppState) -> TickOutcome {
             if let Some(c) = sess.clients.get_mut(&cid)
                 && c.vulkan_video_surfaces.remove(&sid).is_some()
             {
-                c.surface_needs_keyframe = true;
+                c.surface_subs.entry(sid).or_default().has_keyframe = false;
             }
             if let Some(cs) = sess.compositor.as_mut() {
                 cs.last_encoded.remove(&(sid, cid));
@@ -4526,15 +4546,14 @@ async fn tick(state: &AppState) -> TickOutcome {
             // future encode jobs and frame delivery stops for it.
             for (cid, sid) in failed {
                 if let Some(client) = sess.clients.get_mut(&cid) {
-                    if let Some(s) = client.surface_subs.get_mut(&sid) {
-                        s.encode_in_flight = false;
-                    }
                     // The encoder was moved into the spawn_blocking closure
                     // and is now lost.  A fresh encoder will be created on
                     // the next tick when the sub's encoder is None.  Force
                     // a keyframe so the new encoder starts with a clean
                     // reference chain.
-                    client.surface_needs_keyframe = true;
+                    let s = client.surface_subs.entry(sid).or_default();
+                    s.encode_in_flight = false;
+                    s.has_keyframe = false;
                 }
             }
 
@@ -4569,7 +4588,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         if streak == 10 {
                             state.encoder = None;
                             state.nal_none_latched_at = Some(now);
-                            client.surface_needs_keyframe = true;
+                            state.has_keyframe = false;
                             eprintln!(
                                 "[encode] nal_data=None x{streak} sid={} cid={} {}x{} — dropping encoder, backing off retry",
                                 result.sid, result.cid, result.target_w, result.target_h,
@@ -4638,7 +4657,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                     Err(_e) => {
                         // Receiver dropped (client disconnected during encode).
                         // Request keyframe so the next encoder starts clean.
-                        client.surface_needs_keyframe = true;
+                        client
+                            .surface_subs
+                            .entry(result.sid)
+                            .or_default()
+                            .has_keyframe = false;
                     }
                     Ok(()) => {
                         // Track surface frames in their own inflight queue
@@ -4685,12 +4708,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                         }
                         client.frames_sent = client.frames_sent.wrapping_add(1);
                         local_frames_sent += 1;
-                        if client.surface_needs_keyframe && is_keyframe {
-                            client.surface_needs_keyframe = false;
+                        let s = client.surface_subs.entry(result.sid).or_default();
+                        if is_keyframe {
+                            s.has_keyframe = true;
                         }
-                        if let Some(s) = client.surface_subs.get_mut(&result.sid) {
-                            s.burst_remaining = s.burst_remaining.saturating_sub(1);
-                        }
+                        s.burst_remaining = s.burst_remaining.saturating_sub(1);
                     }
                 }
             }
@@ -8204,7 +8226,6 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 goodput_window_bytes: 0,
                 goodput_window_start: Instant::now(),
                 surface_subs: HashMap::new(),
-                surface_needs_keyframe: true,
                 surface_inflight_frames: VecDeque::new(),
                 vulkan_video_surfaces: HashMap::new(),
                 surface_view_sizes: HashMap::new(),
@@ -9364,13 +9385,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     // wire speed.  Without this, the client waits up to
                     // one send interval (~1/fps) after the encoder is
                     // recreated before seeing the first new frame.
-                    if let Some(s) = c.surface_subs.get_mut(&surface_id) {
-                        s.nal_none_streak = 0;
-                        s.nal_none_latched_at = None;
-                        s.burst_remaining = SURFACE_BURST_FRAMES;
-                        s.next_send_at = None;
-                    }
-                    c.surface_needs_keyframe = true;
+                    let s = c.surface_subs.entry(surface_id).or_default();
+                    s.nal_none_streak = 0;
+                    s.nal_none_latched_at = None;
+                    s.burst_remaining = SURFACE_BURST_FRAMES;
+                    s.next_send_at = None;
+                    s.has_keyframe = false;
                 }
                 sess.resize_surfaces_to_mediated_sizes(
                     std::iter::once(surface_id),
@@ -9462,7 +9482,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         }
                     }
                     if meaningful_change {
-                        c.surface_needs_keyframe = true;
+                        state.has_keyframe = false;
                     }
                     first_subscribe = !was_subscribed;
                     if was_subscribed
@@ -10315,7 +10335,6 @@ mod tests {
             goodput_window_bytes: 0,
             goodput_window_start: Instant::now(),
             surface_subs: HashMap::new(),
-            surface_needs_keyframe: true,
             surface_inflight_frames: VecDeque::new(),
             vulkan_video_surfaces: HashMap::new(),
             surface_view_sizes: HashMap::new(),
@@ -12153,6 +12172,60 @@ mod tests {
             true,
         );
         assert_eq!(step.quantizer, None, "held until the queue drains");
+    }
+
+    #[test]
+    fn a_surface_that_was_sent_nothing_owes_a_keyframe() {
+        // A subscription with no state yet, and one whose state exists but
+        // has never carried a keyframe, are the same thing to a decoder:
+        // there is no reference frame, so a delta is undecodable.
+        let (mut client, _rx) = test_client_with_capacity(64);
+        assert!(owes_keyframe(&client, 3), "no sub state at all");
+        client.surface_subs.entry(3).or_default();
+        assert!(owes_keyframe(&client, 3), "sub state, no keyframe yet");
+        client.surface_subs.entry(3).or_default().has_keyframe = true;
+        assert!(!owes_keyframe(&client, 3));
+    }
+
+    #[test]
+    fn one_surfaces_keyframe_does_not_settle_anothers_debt() {
+        // The flag used to live on the client, so the first surface to
+        // deliver a keyframe cleared it for every other surface still
+        // waiting on one — those surfaces then got deltas against a
+        // reference their decoder never received.
+        let (mut client, _rx) = test_client_with_capacity(64);
+        for sid in [1u16, 2] {
+            client.surface_subs.entry(sid).or_default();
+        }
+        assert!(owes_keyframe(&client, 1) && owes_keyframe(&client, 2));
+
+        // Surface 1 gets its keyframe.  Surface 2 is untouched by that.
+        client.surface_subs.entry(1).or_default().has_keyframe = true;
+        assert!(!owes_keyframe(&client, 1));
+        assert!(
+            owes_keyframe(&client, 2),
+            "surface 2 never received a keyframe of its own",
+        );
+
+        // And the reverse: breaking surface 2's chain leaves surface 1's
+        // intact, so one surface resizing does not cost every other surface
+        // an unnecessary keyframe.
+        client.surface_subs.entry(2).or_default().has_keyframe = true;
+        client.surface_subs.entry(2).or_default().has_keyframe = false;
+        assert!(!owes_keyframe(&client, 1), "surface 1 still has its own");
+        assert!(owes_keyframe(&client, 2));
+    }
+
+    #[test]
+    fn dropping_a_subscription_drops_its_keyframe_standing() {
+        // `surface_subs` entries are removed wholesale on UNSUBSCRIBE and
+        // SurfaceDestroyed.  A later resubscribe reuses the id against a
+        // fresh encoder, so it must not inherit the old chain's standing.
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.surface_subs.entry(8).or_default().has_keyframe = true;
+        assert!(!owes_keyframe(&client, 8));
+        client.surface_subs.remove(&8);
+        assert!(owes_keyframe(&client, 8), "a reused id starts over");
     }
 
     #[test]
