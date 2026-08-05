@@ -423,6 +423,14 @@ an ordinary client, it is available to an extension; this includes existing
 administrative operations. Changing the access model for all blit clients is
 separate work and must not create a Wasm-only path.
 
+The extension's logical endpoint also receives the same initial state burst,
+correlated replies, and unsolicited S2C messages as an ordinary connected
+client, with the same subscription, ownership, fan-out, and ordering rules.
+In particular, `S2C_EXITED` reaches an extension which would receive it over a
+socket, as do live `S2C_TITLE`, `S2C_USED_ROWS`, and `S2C_TERM_CWD_EVENT`
+broadcasts. An extension supervisor can therefore react to child exit and
+other subscribed state changes without polling.
+
 ## Lifecycle model
 
 An **extension** is the stable supervised object created by
