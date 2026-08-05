@@ -100,12 +100,22 @@ fn verify_argon2(provided: &str, stored: &str) -> bool {
     }
 }
 
+/// Compare two byte strings without letting the time taken reveal how much
+/// of `b` was matched, or how long `b` is.
+///
+/// Comparing the inputs directly cannot do this: a byte loop has to bail
+/// when the lengths differ, and that early return is an oracle for the
+/// length of the stored secret. Hash both sides to a fixed 32 bytes first,
+/// so the comparison is the same work on every call regardless of input.
+///
+/// Hashing `a` costs time proportional to its length, but the caller
+/// supplied `a` and already knows it. Hashing `b` is the same cost on every
+/// attempt, so it reveals nothing across guesses.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    let a = blake3::hash(a);
+    let b = blake3::hash(b);
     let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
+    for (x, y) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
         diff |= x ^ y;
     }
     diff == 0
@@ -169,5 +179,24 @@ mod tests {
         assert!(!constant_time_eq(b"short", b"longer"));
         assert!(constant_time_eq(b"", b""));
         assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    /// Length mismatches must go down the same path as content mismatches.
+    /// The comparison is over fixed-width digests precisely so a wrong-length
+    /// guess is not distinguishable from a wrong-content one — the earlier
+    /// version returned before looking at a single byte.
+    #[test]
+    fn a_wrong_length_guess_is_just_a_wrong_guess() {
+        let secret = b"correct horse battery staple";
+        for guess in [
+            b"".as_slice(),
+            b"c",
+            b"correct horse battery stapl",
+            b"correct horse battery staple!",
+            b"correct horse battery staple with a great deal more text after it",
+        ] {
+            assert!(!constant_time_eq(guess, secret), "{guess:?} must not match");
+        }
+        assert!(constant_time_eq(secret, secret));
     }
 }
