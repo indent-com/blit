@@ -73,9 +73,9 @@ pub const KV_UPDATE_SNAPSHOT_END: u8 = 1 << 0;
 /// (docs/design/kv.md § Budgets); the subscription was dropped.
 pub const KV_CLOSED_RESOURCE_LIMIT: u8 = 4;
 
-// KV_DONE / KV_OPENED / KV_VALUE status — the unified git/lsp status table
-// (docs/git.md "Statuses") plus fs-write's `11 CONFLICT`. Same numeric
-// values as `FS_DONE_*` / `GIT_STATUS_*` where they overlap.
+// KV_DONE / KV_OPENED / KV_VALUE status — the common registry
+// (docs/protocol.md "Common status registry"). Same numeric values as
+// `FS_DONE_*` / `GIT_STATUS_*` where they overlap.
 pub const KV_STATUS_OK: u8 = 0;
 pub const KV_STATUS_NOT_FOUND: u8 = 2;
 pub const KV_STATUS_PERMISSION: u8 = 4;
@@ -96,8 +96,9 @@ pub fn kv_status_text(status: u8) -> &'static str {
         KV_STATUS_TOO_LARGE => "too large",
         KV_STATUS_BUDGET => "budget exhausted",
         KV_STATUS_INVALID => "invalid request",
+        KV_STATUS_OTHER => "backend error",
         KV_STATUS_CONFLICT => "conflict",
-        _ => "error",
+        _ => "unknown status",
     }
 }
 
@@ -599,6 +600,12 @@ impl KvMirror {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_text_distinguishes_other_from_unknown() {
+        assert_eq!(kv_status_text(KV_STATUS_OTHER), "backend error");
+        assert_eq!(kv_status_text(200), "unknown status");
+    }
 
     #[test]
     fn kv_open_roundtrip_and_bytes() {

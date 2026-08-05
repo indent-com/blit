@@ -1258,7 +1258,7 @@ impl RepoHandle {
         }
         let filter = match crate::unescape_wire(req.path) {
             Some(bytes) => bytes,
-            None => return fail(GIT_STATUS_OTHER),
+            None => return fail(GIT_STATUS_INVALID),
         };
         let (old_ep, new_ep, base) = match resolve_endpoints(
             &repo,
@@ -1328,7 +1328,7 @@ impl RepoHandle {
         changes.sort_by_key(sort_key);
         let after = match crate::unescape_wire(req.after) {
             Some(bytes) => bytes,
-            None => return fail(GIT_STATUS_OTHER),
+            None => return fail(GIT_STATUS_INVALID),
         };
 
         let mut records = Vec::new();
@@ -1442,7 +1442,7 @@ impl RepoHandle {
         }
         let filter = match crate::unescape_wire(req.path) {
             Some(bytes) => bytes,
-            None => return fail(GIT_STATUS_OTHER),
+            None => return fail(GIT_STATUS_INVALID),
         };
         let index = match repo.index_or_empty() {
             Ok(index) => index,
@@ -1523,7 +1523,7 @@ impl RepoHandle {
         }
         let filter = match crate::unescape_wire(req.path) {
             Some(bytes) => bytes,
-            None => return fail(GIT_STATUS_OTHER),
+            None => return fail(GIT_STATUS_INVALID),
         };
         let (old_ep, new_ep, base) = match resolve_endpoints(
             &repo,
@@ -1587,7 +1587,7 @@ impl RepoHandle {
         changes.sort_by_key(sort_key);
         let after = match crate::unescape_wire(req.after) {
             Some(bytes) => bytes,
-            None => return fail(GIT_STATUS_OTHER),
+            None => return fail(GIT_STATUS_INVALID),
         };
         // Resuming: skip whole files already delivered. The file named by
         // `after` is re-entered at `after_pos` rows so a file larger than

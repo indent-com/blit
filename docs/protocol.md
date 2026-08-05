@@ -24,6 +24,12 @@ Maximum frame size: **16 MiB**.
 
 Every message begins with a **1-byte opcode**. All multi-byte fields are little-endian. Fields are tightly packed with no padding or alignment. PTY identifiers are 2-byte unsigned integers.
 
+Any per-request reply guarantee is conditional on the logical connection
+remaining live through that reply. A transport failure or a documented fatal
+framing, protocol, or endpoint-resource violation closes the connection and
+cancels its outstanding requests without synthesizing replies. Clients resolve
+every pending operation as a connection error in that case.
+
 ## Client → Server (C2S)
 
 | Opcode | Name                    | Layout                                                                                                                                                                                                                                           |
@@ -251,6 +257,14 @@ under review in [#167](https://github.com/indent-com/blit/pull/167) and
 [#173](https://github.com/indent-com/blit/pull/173); nothing advertises them
 today. Bit 14 is always advertised.
 
+The proposed bits 11–13 are independently omitted when `BLIT_EXT=0`,
+`BLIT_CHANNEL=0`, or `BLIT_PROCESS=0`; disabled-family requests are refused as
+specified in
+[design/extensions.md](design/extensions.md#security-posture-and-deployment-controls).
+Bit 14 is not extension-specific and is not controlled by those gates. It is
+advertised only after the server implements the negotiated creation outcome
+below; the implementation plan updates both shipped clients before enabling it.
+
 ### Common status registry
 
 New request/reply families should use this registry for a one-byte `status`
@@ -278,11 +292,6 @@ Values 0–127 are centrally allocated common statuses; 13–127 are currently
 reserved. New family-local allocations use 128–255 and must be defined by the
 packet which carries them. Existing message-local tables retain their shipped
 values. Consumers render unknown values distinctly from `OTHER`.
-
-The proposed bits 11–13 are independently omitted when `BLIT_EXT=0`,
-`BLIT_CHANNEL=0`, or `BLIT_PROCESS=0`; disabled-family requests are refused as
-specified in
-[design/extensions.md](design/extensions.md#security-posture-and-deployment-controls).
 
 `S2C_LIST` entry layout: `[pty_id:2][tag_len:2][tag:N][cmd_len:2][cmd:M]` per
 PTY. The trailing command field is a backward-compatible extension; old
@@ -876,21 +885,47 @@ Mode bits are tracked by `ModeTracker` in `blit-alacritty`, which intercepts CSI
 ## Fragmentation
 
 `S2C_FRAGMENT` (`0x2B`) splits any bulk server message into chunks so small
-frames (audio, keepalives) never sit behind a multi-megabyte write:
+frames such as audio need not sit behind a multi-megabyte write:
 
 ```
 [0x2B][flags:1][chunk:N]
 ```
 
 Flag bit 0 (`FRAGMENT_FLAG_LAST`) marks the final chunk. Chunks carry the
-original message's bytes verbatim (its opcode arrives in the first chunk);
-the receiver concatenates chunks into one logical message and dispatches it
-normally. Fragments of different messages never interleave — one pending
-reassembly buffer suffices — and only `S2C_AUDIO_FRAME` may appear between
-fragments. The server chunks any payload over 4 KiB; logical messages may
+original message's bytes verbatim; its opcode arrives in the first chunk. The
+receiver concatenates chunks into one logical message and dispatches it
+normally. Fragments of different messages do not interleave, and the protocol
+permits only `S2C_AUDIO_FRAME` between fragments. Chunk size is transport
+policy: the network writer currently fragments payloads over 4 KiB to protect
+audio latency, while a proposed in-process writer may use larger chunks.
+Receivers must not depend on a particular chunk size. Logical messages may
 exceed the 16 MiB frame limit. What they may not exceed is `MAX_DECOMPRESSED`
 (64 MiB): a receiver aborts a reassembly that grows past it, so that is the real
 ceiling on a logical message, and the one `S2C_LIST` is bounded against.
+
+### Proposed bounded reassembly
+
+The extension RFC tightens fragmentation as follows. These rules are **not yet
+enforced by every shipped Rust and TypeScript client**; implementing them in
+both reference clients and the shared writer is a prerequisite to advertising
+the proposed feature bits 11–13, and belongs to phase 2 of
+[design/extensions.md](design/extensions.md#implementation-plan):
+
+- flag bits 1 through 7 are zero and every chunk is non-empty; a reserved flag
+  or empty chunk aborts the connection;
+- each fragment remains an ordinary frame, so `chunk` is at most 16 MiB minus
+  the two-byte fragment opcode and flags;
+- while reassembly is pending, any non-fragment frame other than
+  `S2C_AUDIO_FRAME` aborts the connection without dispatching that frame;
+- the maximum reconstructed logical message is 64 MiB and one message uses at
+  most 16,384 fragments.
+
+The updated sender must not emit a larger logical message or more fragments.
+The updated receiver must check cumulative length and count before extending
+its buffer, abort an over-bound sequence without dispatching it, and release
+pending storage on every connection exit. The proposed logical-message ceiling
+is numerically the same as `MAX_DECOMPRESSED` below, but bounds fragment
+reassembly rather than the allocation declared inside an LZ4 payload.
 
 ## Compressed payloads
 
