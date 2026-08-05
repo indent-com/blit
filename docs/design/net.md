@@ -219,6 +219,24 @@ A client-initiated full close (`NET_CLOSE` without `WRITE`) is still
 answered with `NET_CLOSED`, so the id-reuse rule has one signal to wait
 on regardless of who ended it.
 
+**Only `EOF` ends the local socket cleanly.** A relay carries an opaque
+byte stream, so a client that FINs its local socket has said "that was
+all of it" — and for anything whose body is delimited by the close,
+which is HTTP/1.0, `nc`, and much of what a forward gets used for, a
+truncated transfer then reads as a complete one. Every other reason
+resets the local socket instead (`SO_LINGER` 0), so the local peer gets
+`ECONNRESET` and can tell. `@blit-sh/core` does the same in its own
+idiom: EOF closes the stream, every other reason errors it.
+
+**The connection going away is the same truncation, said on no stream
+at all.** `S2C_QUIT` and a dead transport both end the reader, and every
+stream riding it was cut. So a client's teardown has to reach each local
+socket — reset, not FIN — and it has to finish before the process exits,
+or the kernel closes those sockets first and with a FIN. That is a
+constraint on the client's shutdown order, not on the wire: the reader
+ends every stream it was demultiplexing for and waits for them, and only
+then does the process go.
+
 `detail` on a UDP `NET_CLOSED` carries the flow's **drop counts**, both
 directions. Drops are the one thing about a relayed UDP flow a user
 cannot infer from the outside — "DNS is flaky through the tunnel" and
@@ -653,7 +671,8 @@ string has to work in a config file where a global flag has nowhere to
 live. One grammar, one parser, both places.
 
 **TCP:** a local listener, one stream per accepted connection, copy
-both ways, half-close mapped to half-close. That is `ssh -L` over
+both ways, half-close mapped to half-close and an abnormal close mapped
+to a reset. That is `ssh -L` over
 **any** blit transport, including the WebRTC and uplink paths where
 there is no SSH connection to hang a tunnel on
 ([../transports.md](../transports.md), [../uplink.md](../uplink.md)).

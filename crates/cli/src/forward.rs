@@ -317,7 +317,7 @@ async fn start_udp_flow(
     conn: Arc<Conn>,
 ) -> Option<mpsc::UnboundedSender<Vec<u8>>> {
     let (events_tx, mut events) = mpsc::unbounded_channel::<Event>();
-    let id = conn.open(events_tx).await?;
+    let (id, live) = conn.open(events_tx).await?;
     conn.send(msg_net_open(&NetOpen::udp(id, &spec.host, spec.host_port)));
 
     let (local_tx, mut local_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -330,6 +330,7 @@ async fn start_udp_flow(
 
     let target = format!("{}:{}", spec.host, spec.host_port);
     tokio::spawn(async move {
+        let _live = live;
         while let Some(event) = events.recv().await {
             match event {
                 Event::Opened { status, detail, .. } => {
