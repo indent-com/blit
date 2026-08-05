@@ -704,6 +704,18 @@ struct SurfaceSubState {
     bandwidth_override: Option<SurfaceBandwidth>,
     /// Per-surface speed override.  `None` = use server default.
     speed_override: Option<SurfaceSpeed>,
+    /// Fixed encode size this client asked for on C2S_SURFACE_SUBSCRIBE.
+    ///
+    /// `Some` opts the subscription out of surface-size mediation entirely:
+    /// the compositor surface keeps whatever size the *mediated* viewers
+    /// want, and this client is served a server-side downscale of it.  That
+    /// is the whole point — a side-panel thumbnail can ask for a card-sized
+    /// stream without dragging the Wayland window down to a card for
+    /// everyone watching it full size.
+    ///
+    /// `None` — the default — means the client participates in mediation via
+    /// C2S_SURFACE_RESIZE like any other viewer.
+    scaled_target: Option<(u16, u16)>,
     /// EWMA of this surface's encoded frame size in bytes.  Per surface
     /// (unlike `avg_surface_frame_bytes`) so a client watching two
     /// surfaces can split its bandwidth budget between them.  0 = no
@@ -2448,6 +2460,17 @@ impl Session {
             if !c.surface_subscriptions.contains(&surface_id) {
                 continue;
             }
+            // A scaled subscriber asked to be served a downscale of whatever
+            // the surface happens to be, so it gets no say in how big that
+            // is.  Counting it would defeat the point: a card-sized
+            // thumbnail would win the minimum and shrink the Wayland window
+            // for the viewers watching it full size.
+            if c.surface_subs
+                .get(&surface_id)
+                .is_some_and(|s| s.scaled_target.is_some())
+            {
+                continue;
+            }
             let Some(&(pw, ph, s)) = c.surface_view_sizes.get(&surface_id) else {
                 continue;
             };
@@ -3490,7 +3513,18 @@ async fn tick(state: &AppState) -> TickOutcome {
     for sid in invalidate_client_encoders {
         let mut had_vulkan = false;
         for c in sess.clients.values_mut() {
-            c.surface_subs.remove(&sid);
+            // Everything about the encode is rebuilt against the new
+            // composite, so the entry goes.  A scaled subscriber's requested
+            // size is not part of that: it describes the client's own
+            // viewport, which this event says nothing about.  Dropping it
+            // here would silently revert a thumbnail to full-size encoding
+            // for as long as it took to resubscribe — and a surface it never
+            // interacts with may never give it a reason to.
+            let still_subscribed = c.surface_subscriptions.contains(&sid);
+            let previous = c.surface_subs.remove(&sid);
+            if still_subscribed && let Some(target) = previous.and_then(|s| s.scaled_target) {
+                c.surface_subs.entry(sid).or_default().scaled_target = Some(target);
+            }
             had_vulkan |= c.vulkan_video_surfaces.remove(&sid).is_some();
             forget_surface_inflight(c, sid);
         }
@@ -3850,7 +3884,16 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                 }
 
-                let view = client.surface_view_sizes.get(&sid).copied();
+                // A scaled subscription names its own encode box and ignores
+                // the mediated view size.  Scale 120 because the size is
+                // already in the pixels the client wants out of the encoder;
+                // per_client_encode_target only reads the scale to nothing.
+                let view = client
+                    .surface_subs
+                    .get(&sid)
+                    .and_then(|s| s.scaled_target)
+                    .map(|(w, h)| (w, h, 120))
+                    .or_else(|| client.surface_view_sizes.get(&sid).copied());
                 let (target_w, target_h) = Session::per_client_encode_target(
                     view,
                     native_w,
@@ -9425,13 +9468,27 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 let codec_support = if data.len() >= 4 { data[3] } else { 0 };
                 let bandwidth_wire = if data.len() >= 5 { data[4] } else { 0 };
                 let speed_wire = if data.len() >= 6 { data[5] } else { 0 };
+                // Scaled form: a fixed encode size for this client alone.
+                // Absent or zero on either axis means mediated, which is what
+                // every pre-scaled client sends.
+                let scaled_target = if data.len() >= 10 {
+                    let w = u16::from_le_bytes([data[6], data[7]]);
+                    let h = u16::from_le_bytes([data[8], data[9]]);
+                    (w > 0 && h > 0).then_some((w, h))
+                } else {
+                    None
+                };
                 if state.config.verbose {
                     eprintln!(
-                        "C2S_SURFACE_SUBSCRIBE: cid={client_id} surface={surface_id} codec={codec_support:#04x} bandwidth={bandwidth_wire} speed={speed_wire}"
+                        "C2S_SURFACE_SUBSCRIBE: cid={client_id} surface={surface_id} codec={codec_support:#04x} bandwidth={bandwidth_wire} speed={speed_wire} scaled={scaled_target:?}"
                     );
                 }
                 let mut destroy_vulkan_enc_sid = None;
                 let mut first_subscribe = false;
+                // Joining or leaving the scaled set changes who mediation
+                // counts, so the surface has to be re-mediated even though
+                // this client was already subscribed.
+                let mut mediation_membership_changed = false;
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     let congested = outbox_backpressured(c);
                     let was_subscribed = !c.surface_subscriptions.insert(surface_id);
@@ -9439,9 +9496,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     let new_speed = SurfaceSpeed::from_wire(speed_wire);
 
                     let state = c.surface_subs.entry(surface_id).or_default();
+                    // A changed scaled target means a different encode size,
+                    // so it invalidates the encoder exactly like the other
+                    // three preferences do.
                     let prefs_changed = codec_support != state.codec_override
                         || new_bandwidth != state.bandwidth_override
-                        || new_speed != state.speed_override;
+                        || new_speed != state.speed_override
+                        || scaled_target != state.scaled_target;
 
                     // A no-op resubscribe (same codec/bandwidth/speed,
                     // already subscribed) should not disturb the steady
@@ -9449,9 +9510,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     // every repeated subscribe makes keyframes churn and
                     // skews pacing.
                     let meaningful_change = !was_subscribed || prefs_changed;
+                    mediation_membership_changed =
+                        state.scaled_target.is_some() != scaled_target.is_some();
                     state.codec_override = codec_support;
                     state.bandwidth_override = new_bandwidth;
                     state.speed_override = new_speed;
+                    state.scaled_target = scaled_target;
                     let task_in_flight = state.encode_in_flight || state.creation_in_flight;
                     if meaningful_change {
                         // Reset burst window so the first frames after a
@@ -9504,7 +9568,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     );
                     cs.handle.wake();
                 }
-                if first_subscribe {
+                if first_subscribe || mediation_membership_changed {
                     sess.resize_surfaces_to_mediated_sizes(
                         std::iter::once(surface_id),
                         &state.config.surface_encoders,
@@ -11480,6 +11544,59 @@ mod tests {
         assert_eq!(
             session.mediated_size_for_surface(1, None),
             Some((1920, 1080, 120))
+        );
+    }
+
+    /// The whole point of a scaled subscription: a card-sized thumbnail must
+    /// not drag the Wayland window down to a card for the viewer watching it
+    /// full size.  It is subscribed and it has a view size, so both existing
+    /// guards let it through — only the scaled target excludes it.
+    #[test]
+    fn mediated_surface_size_ignores_scaled_subscriber() {
+        let mut session = Session::new();
+        let mut full = test_client();
+        let mut thumb = test_client();
+        full.surface_subscriptions.insert(1);
+        full.surface_view_sizes.insert(1, (1920, 1080, 120));
+        thumb.surface_subscriptions.insert(1);
+        thumb.surface_view_sizes.insert(1, (314, 176, 120));
+        thumb.surface_subs.entry(1).or_default().scaled_target = Some((314, 176));
+        session.clients.insert(1, full);
+        session.clients.insert(2, thumb);
+        assert_eq!(
+            session.mediated_size_for_surface(1, None),
+            Some((1920, 1080, 120))
+        );
+    }
+
+    /// With no mediated viewer left there is nothing to mediate, so the
+    /// surface keeps its last configured size rather than collapsing to the
+    /// thumbnail's box.  `resize_surfaces_to_mediated_sizes` sends no resize
+    /// for `None`, which is what leaves the compositor alone.
+    #[test]
+    fn mediated_surface_size_none_when_every_subscriber_is_scaled() {
+        let mut session = Session::new();
+        let mut thumb = test_client();
+        thumb.surface_subscriptions.insert(1);
+        thumb.surface_view_sizes.insert(1, (314, 176, 120));
+        thumb.surface_subs.entry(1).or_default().scaled_target = Some((314, 176));
+        session.clients.insert(1, thumb);
+        assert_eq!(session.mediated_size_for_surface(1, None), None);
+    }
+
+    /// A scaled target is just a view box, so it inherits the same clamps —
+    /// native aspect preserved, never upscaled past native.
+    #[test]
+    fn per_client_encode_target_honours_a_scaled_target() {
+        // 314-wide box against a 16:9 native ⇒ width-bound, even-rounded.
+        assert_eq!(
+            Session::per_client_encode_target(Some((314, 176, 120)), 1920, 1080, &[]),
+            (314, 176)
+        );
+        // A thumbnail asking for more than native still gets native.
+        assert_eq!(
+            Session::per_client_encode_target(Some((4000, 4000, 120)), 640, 480, &[]),
+            (640, 480)
         );
     }
 

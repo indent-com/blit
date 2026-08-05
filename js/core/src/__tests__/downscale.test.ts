@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeAll } from "vitest";
-import { drawHalved, halve, halvings } from "../downscale";
+import { drawHalved, halve, halvings, octaveCeil } from "../downscale";
 
 type Call = unknown[];
 
@@ -81,6 +81,23 @@ describe("halve", () => {
     expect(halve(1920, 3)).toBe(240);
     expect(halve(1080, 3)).toBe(135);
     expect(halve(3, 6)).toBe(1);
+  });
+});
+
+describe("octaveCeil", () => {
+  it("rounds up to the next octave so small moves ask for the same size", () => {
+    // A dock drag across these widths re-asks the server once, not 200 times.
+    expect(octaveCeil(314)).toBe(512);
+    expect(octaveCeil(500)).toBe(512);
+    expect(octaveCeil(512)).toBe(512);
+    expect(octaveCeil(513)).toBe(1024);
+  });
+
+  it("floors at 64 and passes through nothing", () => {
+    // A card narrower than 64px still needs a stream a codec will accept.
+    expect(octaveCeil(10)).toBe(64);
+    expect(octaveCeil(0)).toBe(0);
+    expect(octaveCeil(-5)).toBe(0);
   });
 });
 

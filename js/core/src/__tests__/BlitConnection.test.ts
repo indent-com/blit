@@ -33,6 +33,7 @@ import {
   FRAGMENT_FLAG_LAST,
   S2C_FRAGMENT,
   S2C_PING,
+  C2S_SURFACE_SUBSCRIBE,
 } from "../types";
 import { FS_MAX_DECOMPRESSED } from "../fs";
 
@@ -1007,5 +1008,95 @@ describe("BlitConnection fragment reassembly", () => {
     // keep growing.
     transport.push(fragment(false, new Uint8Array([0x00])));
     expect(bytes()).toBe(0);
+  });
+});
+
+describe("BlitConnection surface subscriptions", () => {
+  let transport: MockTransport;
+  let conn: BlitConnection;
+
+  beforeEach(() => {
+    ({ conn, transport } = createConnection());
+  });
+
+  /** The size on the last SUBSCRIBE sent, or null if it was mediated. */
+  function lastTarget(): { width: number; height: number } | null {
+    const subs = transport.sent.filter((m) => m[0] === C2S_SURFACE_SUBSCRIBE);
+    const msg = subs[subs.length - 1];
+    if (!msg) throw new Error("no surface subscribe was sent");
+    if (msg.length < 10) return null;
+    const v = new DataView(msg.buffer, msg.byteOffset, msg.byteLength);
+    return { width: v.getUint16(6, true), height: v.getUint16(8, true) };
+  }
+
+  const countSubscribes = () =>
+    transport.sent.filter((m) => m[0] === C2S_SURFACE_SUBSCRIBE).length;
+
+  it("asks for the size a lone scaled view wants", () => {
+    conn.sendSurfaceSubscribe(1, conn.allocSurfaceViewId(), {
+      width: 368,
+      height: 523,
+    });
+    expect(lastTarget()).toEqual({ width: 368, height: 523 });
+  });
+
+  it("lets an unscaled view win over a scaled one", () => {
+    // The full-size pane needs pixels no downscale can reconstruct, and the
+    // thumbnail can always shrink what it is given.
+    const thumb = conn.allocSurfaceViewId();
+    const pane = conn.allocSurfaceViewId();
+    conn.sendSurfaceSubscribe(1, thumb, { width: 368, height: 523 });
+    conn.sendSurfaceSubscribe(1, pane, null);
+    expect(lastTarget()).toBeNull();
+  });
+
+  it("takes the largest request when every view is scaled", () => {
+    conn.sendSurfaceSubscribe(1, conn.allocSurfaceViewId(), {
+      width: 368,
+      height: 200,
+    });
+    conn.sendSurfaceSubscribe(1, conn.allocSurfaceViewId(), {
+      width: 180,
+      height: 523,
+    });
+    // Per axis — neither view is starved of the resolution it asked for.
+    expect(lastTarget()).toEqual({ width: 368, height: 523 });
+  });
+
+  it("shrinks back to the thumbnail when the full-size view unmounts", () => {
+    const thumb = conn.allocSurfaceViewId();
+    const pane = conn.allocSurfaceViewId();
+    conn.sendSurfaceSubscribe(1, thumb, { width: 368, height: 523 });
+    conn.sendSurfaceSubscribe(1, pane, null);
+    expect(lastTarget()).toBeNull();
+    // A bare refcount could not do this: it knows one view left, not which.
+    conn.sendSurfaceUnsubscribe(1, pane);
+    expect(lastTarget()).toEqual({ width: 368, height: 523 });
+  });
+
+  it("re-derives when a view changes its own request", () => {
+    const view = conn.allocSurfaceViewId();
+    conn.sendSurfaceSubscribe(1, view, { width: 368, height: 523 });
+    conn.setSurfaceViewTarget(1, view, { width: 184, height: 262 });
+    expect(lastTarget()).toEqual({ width: 184, height: 262 });
+  });
+
+  it("does not resend when the derived request is unchanged", () => {
+    // Every resubscribe costs the server an encoder rebuild and this client
+    // a keyframe, so an unchanged derivation must stay off the wire.
+    const view = conn.allocSurfaceViewId();
+    conn.sendSurfaceSubscribe(1, view, { width: 368, height: 523 });
+    const before = countSubscribes();
+    conn.setSurfaceViewTarget(1, view, { width: 368, height: 523 });
+    expect(countSubscribes()).toBe(before);
+  });
+
+  it("keeps surfaces independent", () => {
+    conn.sendSurfaceSubscribe(1, conn.allocSurfaceViewId(), null);
+    conn.sendSurfaceSubscribe(2, conn.allocSurfaceViewId(), {
+      width: 320,
+      height: 180,
+    });
+    expect(lastTarget()).toEqual({ width: 320, height: 180 });
   });
 });
