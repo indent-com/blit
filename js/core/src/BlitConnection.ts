@@ -143,6 +143,7 @@ import {
   parseFsDoneMessage,
   parseFsFileMessage,
   encodeFsDelta,
+  FS_MAX_DECOMPRESSED,
   FsConflictError,
   FsOpenError,
   type FsFileIndex,
@@ -3088,6 +3089,17 @@ export class BlitConnection {
       if (bytes.length < 2) return;
       const flags = bytes[1];
       const chunk = bytes.subarray(2);
+      // A complete message can never exceed the protocol-wide decompressed
+      // ceiling, so a fragment stream that grows past it is a buggy or
+      // hostile peer — drop the partial rather than reassemble without
+      // bound. Without this a peer that never sets FRAGMENT_FLAG_LAST grows
+      // the buffer until the tab dies, and each chunk is a subarray that
+      // pins the whole frame it arrived in. The Rust reader has always had
+      // this guard; the browser did not.
+      if (this.fragmentBytes + chunk.length > FS_MAX_DECOMPRESSED) {
+        this.resetFragmentReassembly();
+        return;
+      }
       this.fragmentChunks.push(chunk);
       this.fragmentBytes += chunk.length;
       if (flags & FRAGMENT_FLAG_LAST) {
