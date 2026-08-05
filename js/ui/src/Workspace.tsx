@@ -389,6 +389,20 @@ function WorkspaceScreen(props: {
       .join(","),
   );
 
+  // Connections that completed the handshake.  Same joined-string trick as
+  // above so consumers only re-run when readiness actually flips, not on
+  // every snapshot.
+  const readyConnIdsKey = createMemo(() =>
+    wsState()
+      .connections.filter((c) => c.ready)
+      .map((c) => c.id)
+      .sort()
+      .join(","),
+  );
+  const readyConnIds = createMemo(
+    () => new Set(readyConnIdsKey().split(",").filter(Boolean)),
+  );
+
   // Aggregate surfaces from all connections.
   // When surface streaming is disabled the list is emptied, which cascades
   // through every derived view (focused surface, BSP panes, preview panel,
@@ -1304,9 +1318,14 @@ function WorkspaceScreen(props: {
     onCleanup(() => window.removeEventListener("hashchange", onHashChange));
   });
 
-  // Clear focused surface if it was destroyed.  Use a short grace period
-  // to avoid flickering during reconnect cycles where the surface list is
-  // temporarily empty before being re-populated.
+  // Clear focused surface if it was destroyed.  A grace period avoids
+  // flickering during reconnect cycles where the surface list is temporarily
+  // empty before being re-populated — but it only applies while the owning
+  // connection is absent or mid-handshake.  Once the connection is ready its
+  // surface list is authoritative, so a missing surface means it really is
+  // gone and we clear immediately.  Mirrors reconcileAssignments'
+  // `readyConnectionIds` gate, which is why BSP panes empty on the ack while
+  // the main view used to sit on a dead surface for the full grace period.
   let clearFocusedTimer: ReturnType<typeof setTimeout> | null = null;
   createEffect(() => {
     const fid = focusedSurfaceId();
@@ -1322,7 +1341,16 @@ function WorkspaceScreen(props: {
       (s) =>
         s.surfaceId === fid && (fConnId == null || s.connectionId === fConnId),
     );
-    if (!exists) {
+    // Unknown connection id: we can't tell a destroy from a reconnect blip,
+    // so keep the grace period.
+    const connReady = fConnId != null && readyConnIds().has(fConnId);
+    if (!exists && connReady) {
+      if (clearFocusedTimer) {
+        clearTimeout(clearFocusedTimer);
+        clearFocusedTimer = null;
+      }
+      focusSurfaceById(null);
+    } else if (!exists) {
       if (!clearFocusedTimer) {
         clearFocusedTimer = setTimeout(() => {
           clearFocusedTimer = null;
