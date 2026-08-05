@@ -518,23 +518,37 @@ export function buildSurfaceCloseMessage(surfaceId: number): Uint8Array {
 
 /**
  * Build a surface subscribe message with optional codec, bandwidth and
- * speed overrides.
+ * speed overrides, and an optional fixed encode size.
  *
  * @param codecSupport - CODEC_SUPPORT_* bitmask (0 = use connection default from sendClientFeatures)
  * @param bandwidth - SURFACE_BANDWIDTH_* constant (0 = use server default)
  * @param speed - SURFACE_SPEED_* constant (0 = use server default)
+ * @param width - fixed encode width in pixels (0 = participate in mediation)
+ * @param height - fixed encode height in pixels (0 = participate in mediation)
+ *
+ * Asking for a size opts this subscription out of surface-size mediation:
+ * the server encodes a downscale of the surface for this client alone
+ * instead of pulling the compositor surface down to fit it.  Contract —
+ * see the C2S_SURFACE_SUBSCRIBE arm in crates/server.
  */
 export function buildSurfaceSubscribeMessage(
   surfaceId: number,
   codecSupport?: number,
   bandwidth?: number,
   speed?: number,
+  width?: number,
+  height?: number,
 ): Uint8Array {
   const cs = (codecSupport ?? 0) & 0xff;
   const bw = (bandwidth ?? 0) & 0xff;
   const sp = (speed ?? 0) & 0xff;
-  const hasExtended = cs !== 0 || bw !== 0 || sp !== 0;
-  const len = hasExtended ? 6 : 3;
+  const w = (width ?? 0) & 0xffff;
+  const h = (height ?? 0) & 0xffff;
+  // The size lives at bytes 6..10, so asking for one forces the long form
+  // even when all three preference bytes are at their defaults.
+  const hasScaled = w !== 0 && h !== 0;
+  const hasExtended = hasScaled || cs !== 0 || bw !== 0 || sp !== 0;
+  const len = hasScaled ? 10 : hasExtended ? 6 : 3;
   const msg = new Uint8Array(len);
   msg[0] = C2S_SURFACE_SUBSCRIBE;
   msg[1] = surfaceId & 0xff;
@@ -543,6 +557,12 @@ export function buildSurfaceSubscribeMessage(
     msg[3] = cs;
     msg[4] = bw;
     msg[5] = sp;
+  }
+  if (hasScaled) {
+    msg[6] = w & 0xff;
+    msg[7] = (w >> 8) & 0xff;
+    msg[8] = h & 0xff;
+    msg[9] = (h >> 8) & 0xff;
   }
   return msg;
 }

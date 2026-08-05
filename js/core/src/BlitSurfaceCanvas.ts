@@ -14,7 +14,13 @@ import {
   SURFACE_POINTER_UP,
   SURFACE_POINTER_MOVE,
 } from "./protocol";
-import { devicePixelBox, drawHalved, halve, halvings } from "./downscale";
+import {
+  devicePixelBox,
+  drawHalved,
+  halve,
+  halvings,
+  octaveCeil,
+} from "./downscale";
 
 /** Cached codec support bitmask.  Computed once, reused for all resize messages. */
 let _codecSupport: number | null = null;
@@ -375,6 +381,9 @@ export class BlitSurfaceCanvas {
    */
   private _presentBox: { width: number; height: number } | null = null;
   private _presentObserver: ResizeObserver | null = null;
+  /** This view's surface-subscription token.  Allocated lazily and kept
+   *  across resubscribes so the connection tracks one entry per view. */
+  private _surfaceViewId: string | null = null;
   /** Halvings applied by the last blit, so the observer can tell a resize that
    *  crosses an octave from one that changes nothing on screen. */
   private _presentHalvings = 0;
@@ -570,6 +579,10 @@ export class BlitSurfaceCanvas {
       const box = entry && devicePixelBox(entry);
       if (!box) return;
       this._presentBox = box;
+      // Ask the server for a stream sized to the new box.  Quantised, so a
+      // drag re-asks only on an octave boundary — each change costs an
+      // encoder rebuild and a keyframe.
+      this.refreshScaledTarget();
       // Redraw only when the box crosses an octave.  The reduction is
       // quantised, so most of a dock-grip drag lands on the same chain and
       // there is nothing new to show.
@@ -844,7 +857,11 @@ export class BlitSurfaceCanvas {
     // unavailable (non-secure context) drives the server encoder for
     // nothing and can crash it.
     if (conn && store.canDecodeVideo) {
-      conn.sendSurfaceSubscribe(this._surfaceId);
+      conn.sendSurfaceSubscribe(
+        this._surfaceId,
+        this.surfaceViewId(conn),
+        this.scaledTarget(),
+      );
       this._subscribedGeneration = store.generation;
       this._subscribedSurface = {
         connectionId: this._connectionId,
@@ -966,9 +983,62 @@ export class BlitSurfaceCanvas {
     if (!sub) return;
     const conn =
       (this._workspace as any).getConnection(sub.connectionId) ?? null;
-    conn?.sendSurfaceUnsubscribe(sub.surfaceId);
+    if (conn && this._surfaceViewId) {
+      conn.sendSurfaceUnsubscribe(sub.surfaceId, this._surfaceViewId);
+    }
     this._subscribedSurface = null;
     this._subscribedGeneration = -1;
+  }
+
+  /** This view's subscription token, allocated on first use and kept for
+   *  the life of the canvas so a resubscribe reclaims the same slot. */
+  private surfaceViewId(conn: BlitConnection): string {
+    if (!this._surfaceViewId) {
+      this._surfaceViewId = conn.allocSurfaceViewId();
+    }
+    return this._surfaceViewId;
+  }
+
+  /**
+   * The fixed encode size to ask the server for, or null to watch the
+   * surface at its mediated size.
+   *
+   * Only a view that is handed a box asks for one: a resizable view already
+   * drives the surface's size through setDisplaySize, and asking it to
+   * bypass mediation would leave nobody sizing the surface at all.
+   *
+   * The request is this view's own box, octave-rounded — deliberately not
+   * anything derived from the surface's current size.  A resubscribe costs
+   * the server an encoder rebuild and this client a keyframe, and the
+   * surface's size moves whenever any *other* viewer resizes its pane; a
+   * request that tracked it would re-ask every time somebody else dragged
+   * a split.  The box only moves when this card does.
+   *
+   * Overshooting to the next octave is the cheap side of that trade: the
+   * server inscribes the surface's aspect inside whatever box it is given
+   * and never upscales past native, and the ≤2:1 residual is exactly what
+   * {@link drawHalved} and a single CSS tap already handle.
+   */
+  private scaledTarget(): { width: number; height: number } | null {
+    if (this._displaySize) return null;
+    const box = this._presentBox;
+    if (!box) return null;
+    const width = octaveCeil(box.width);
+    const height = octaveCeil(box.height);
+    return width > 0 && height > 0 ? { width, height } : null;
+  }
+
+  /** Re-derive the scaled request after the box or the surface changed. */
+  private refreshScaledTarget(): void {
+    const sub = this._subscribedSurface;
+    if (!sub || !this._surfaceViewId) return;
+    const conn =
+      (this._workspace as any).getConnection(sub.connectionId) ?? null;
+    conn?.setSurfaceViewTarget(
+      sub.surfaceId,
+      this._surfaceViewId,
+      this.scaledTarget(),
+    );
   }
 
   // -----------------------------------------------------------------------

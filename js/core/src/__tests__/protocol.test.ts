@@ -15,6 +15,7 @@ import {
   buildSearchMessage,
   buildCreate2Message,
   buildSurfaceAxis2Message,
+  buildSurfaceSubscribeMessage,
 } from "../protocol";
 import {
   C2S_ACK,
@@ -32,6 +33,7 @@ import {
   CREATE2_HAS_COMMAND,
   CREATE2_HAS_CWD,
   C2S_SURFACE_POINTER_AXIS2,
+  C2S_SURFACE_SUBSCRIBE,
   AXIS_SOURCE_FINGER,
   AXIS_SOURCE_WHEEL,
   AXIS_FLAG_SOURCE_KNOWN,
@@ -368,5 +370,63 @@ describe("buildSurfaceAxis2Message", () => {
     });
     expect(read(msg).dxX100).toBe(0);
     expect(read(msg).dyX100).toBe(0);
+  });
+});
+
+/** The Rust side parses these bytes by fixed offset, so the layout is the
+ *  contract — see the `C2S_SURFACE_SUBSCRIBE` arm in crates/server, which
+ *  reads the size from bytes 6..10 and only when at least 10 arrived. */
+describe("buildSurfaceSubscribeMessage", () => {
+  const read = (msg: Uint8Array) => {
+    const v = new DataView(msg.buffer, msg.byteOffset, msg.byteLength);
+    return {
+      opcode: msg[0],
+      surfaceId: v.getUint16(1, true),
+      codec: msg[3],
+      bandwidth: msg[4],
+      speed: msg[5],
+      width: v.getUint16(6, true),
+      height: v.getUint16(8, true),
+    };
+  };
+
+  it("stays at the 3-byte form when nothing is overridden", () => {
+    const msg = buildSurfaceSubscribeMessage(7);
+    expect(msg).toHaveLength(3);
+    expect(msg[0]).toBe(C2S_SURFACE_SUBSCRIBE);
+  });
+
+  it("uses the 6-byte form for preferences alone", () => {
+    expect(buildSurfaceSubscribeMessage(7, 0, 2, 3)).toHaveLength(6);
+  });
+
+  it("lays the scaled size out where the server reads it", () => {
+    const msg = buildSurfaceSubscribeMessage(0x1234, 0x0f, 2, 3, 1472, 2092);
+    expect(msg).toHaveLength(10);
+    expect(read(msg)).toEqual({
+      opcode: C2S_SURFACE_SUBSCRIBE,
+      surfaceId: 0x1234,
+      codec: 0x0f,
+      bandwidth: 2,
+      speed: 3,
+      width: 1472,
+      height: 2092,
+    });
+  });
+
+  it("reaches the long form for a size even at default preferences", () => {
+    // The size lives past the preference bytes, so shortening the message
+    // would drop it — a thumbnail asking for a stream at server defaults
+    // would silently get a full-size one.
+    const msg = buildSurfaceSubscribeMessage(1, 0, 0, 0, 320, 180);
+    expect(msg).toHaveLength(10);
+    expect(read(msg)).toMatchObject({ width: 320, height: 180 });
+  });
+
+  it("treats a half-specified size as no size at all", () => {
+    // The server requires both axes nonzero; emitting one would be read as
+    // mediated anyway, so don't pay for the longer message.
+    expect(buildSurfaceSubscribeMessage(1, 0, 0, 0, 320, 0)).toHaveLength(3);
+    expect(buildSurfaceSubscribeMessage(1, 0, 0, 0, 0, 180)).toHaveLength(3);
   });
 });

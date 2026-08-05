@@ -45,6 +45,20 @@ export function halve(extent: number, n: number): number {
 }
 
 /**
+ * Round an extent up to the next power of two, floored at 64.
+ *
+ * For asking someone else — a server encoder — for a size, where the cost of
+ * changing your mind is far higher than the cost of overshooting. Snapping to
+ * octaves means a drag re-asks a couple of times instead of on every pixel,
+ * and the ≤2:1 overshoot lands exactly where {@link drawHalved} and a single
+ * CSS tap clean it up for free.
+ */
+export function octaveCeil(extent: number): number {
+  if (!(extent > 0)) return 0;
+  return Math.max(64, 2 ** Math.ceil(Math.log2(extent)));
+}
+
+/**
  * A ResizeObserver entry's content box in the device pixels the compositor
  * will rasterise it at.  Returns null for a zero-sized (detached,
  * display:none) box.
