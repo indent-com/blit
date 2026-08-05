@@ -28,7 +28,7 @@ blit packets with the same packet dispatcher as a network client, but does
 not open a socket and does not use transport framing. Its complete host ABI
 is a packet send operation and a blocking packet receive operation. It gets
 the same initial `HELLO` / `LIST` / `READY` sequence and can use every blit
-protocol family allowed by its delegated client authority.
+protocol family exposed to ordinary clients by that server.
 
 This RFC also adds native, non-terminal communication:
 
@@ -50,10 +50,9 @@ primitives.
 
 Blit already exposes terminals, compositor surfaces, filesystem sync, Git,
 LSP, KV, and network relay through one version-stable protocol. Recreating
-those capabilities as a large WASI-like host API would produce two public
+those operations as a large WASI-like host API would produce two public
 interfaces and two dispatch implementations. They would inevitably differ
-in validation, authorization, cancellation, resource ownership, and new
-feature coverage.
+in validation, cancellation, resource ownership, and new feature coverage.
 
 Putting a real or loopback socket between the server and an embedded runtime
 would avoid that duplication but preserve overhead and failure modes which
@@ -77,24 +76,22 @@ be processes attached to PTYs.
 - Upload a module only when the selected server lacks its BLAKE3 object.
 - Supervise failed or completed attempts under an explicit restart policy.
 - Optionally persist desired plugin state across blit server restarts.
-- Give a plugin access to the same protocol surface as an equivalent
-  remote client, subject to delegated authority.
+- Give a plugin the same protocol surface as an equivalent remote client.
 - Add server-native bidirectional channels, retained state, and event topics.
-- Let authorized clients spawn and control non-PTY server processes with
-  bounded stdin, stdout, and stderr streams.
+- Let clients spawn and control non-PTY server processes with flow-controlled
+  stdin, stdout, and stderr streams.
 - Keep the Wasm host ABI very small and versioned.
 - Give each running plugin attempt its own named OS thread.
-- Bound CPU, memory, open resources, message queues, and output.
+- Keep untrusted guest execution and slow consumers from exhausting the server.
 - Make plugin disconnect cleanup identical to client disconnect cleanup.
 - Preserve the existing protocol rule: new feature bits and opcodes; no
   reinterpretation of old messages.
 
 ## Non-goals
 
-- **No ambient WASI authority.** Standard WASI facilities may optionally
-  provide the plugin's own arguments, stdio, clocks, randomness, and explicitly
-  preopened files. They do not bypass blit capabilities. In particular,
-  subprocess spawning uses the blit process family, not a private WASI
+- **No parallel WASI API for blit operations.** Standard WASI facilities may
+  optionally provide the plugin's own arguments, stdio, clocks, and randomness.
+  Subprocess spawning uses the blit process family, not a private WASI
   extension.
 - **No Component Model requirement.** The first Rust SDK targets a small core
   Wasm ABI. A future component adapter may wrap the same packet endpoint.
@@ -103,8 +100,6 @@ be processes attached to PTYs.
   channels, and in-flight requests are not snapshotted.
 - **No distributed pubsub.** Names and subscriptions belong to one blit
   server process. Gateways relay packets but do not merge registries.
-- **No promise that a hash is authorized.** Content addressing answers
-  possession and integrity, not execution permission.
 - **No unbounded reliable queues.** Reliability always has an explicit byte
   window, timeout, or disconnection outcome.
 - **No requirement that channel payloads use JSON.** Payloads are opaque
@@ -115,7 +110,7 @@ be processes attached to PTYs.
 ```mermaid
 flowchart LR
     Network["Network client"] -->|frames| Decoder["Transport decoder"]
-    Decoder -->|packet| Endpoint["Logical client endpoint<br/>identity · authority · outbox"]
+    Decoder -->|packet| Endpoint["Logical client endpoint<br/>identity · outbox"]
     Plugin["Wasmi plugin"] -->|host send / recv| Endpoint
     Endpoint --> Dispatcher["Shared packet dispatcher"]
     Dispatcher --> Existing["Terminal / FS / Git / LSP / …"]
@@ -129,8 +124,6 @@ packet endpoint:
 ```rust
 struct ClientEndpoint {
     client_id: u64,
-    principal: Principal,
-    capabilities: CapabilitySet,
     outbox: BoundedOutbox,
     cancellation: CancellationToken,
 }
@@ -189,32 +182,21 @@ plugin—`try_enqueue` closes the endpoint instead of blocking. Closing wakes
 the blocked `send` with `-1` and cancels the attempt. No dispatcher, registry
 lock, or peer endpoint waits for that plugin to call `recv`.
 
-### Packet parity, not unrestricted authority
+### Packet parity
 
-A plugin may form any valid C2S packet. The dispatcher still decides
-whether its endpoint is authorized to perform the operation. In particular,
-administrative packets such as server shutdown must require an explicit
-capability rather than becoming available merely because a module can encode
-their opcode.
-
-This authorization should apply to network clients as well. Plugins make
-the need visible but do not justify a Wasm-only policy layer.
-
-Central authorization is a prerequisite for enabling plugins, not a later
-hardening pass. The endpoint refactor must check `Principal` and
-`CapabilitySet` before every family handler for both network and in-process
-origins. Existing administrative operations are included: for example,
-`C2S_QUIT` must require an explicit server-shutdown capability instead of
-remaining available to any connected network client. The default remote-client
-policy does not grant administrative capabilities.
+A plugin may form any valid C2S packet. The dispatcher validates and handles it
+exactly as if it came from a network endpoint. If an operation is available to
+an ordinary client, it is available to a plugin; this includes existing
+administrative operations. Changing the access model for all blit clients is
+separate work and must not create a Wasm-only path.
 
 ## Lifecycle model
 
 A **plugin** is the stable supervised object created by
-`PLUGIN_RUN`. It has a 64-bit randomly allocated `plugin_id`, a module
-hash, arguments, effective capabilities, resource limits, restart policy,
-desired state, and optional durable name. A transient ID is process-local; a
-persistent plugin retains its ID and name across server restarts.
+`PLUGIN_RUN`. It has a 64-bit randomly allocated `plugin_id`, a module hash,
+arguments, restart policy, desired state, and optional durable name. A
+transient ID is process-local; a persistent plugin retains its ID and name
+across server restarts.
 
 An **attempt** is one Wasmi instantiation of that plugin. Attempts are
 numbered monotonically from one. A running attempt has its own 32-bit
@@ -229,17 +211,16 @@ produced them.
 
 Restart policies are:
 
-| Value | CLI          | Meaning                                                   |
-| ----- | ------------ | --------------------------------------------------------- |
-| 0     | `never`      | One attempt only                                          |
-| 1     | `on-failure` | Restart non-zero returns, traps, and enforced limit exits |
-| 2     | `always`     | Restart every returned or failed attempt                  |
+| Value | CLI          | Meaning                                            |
+| ----- | ------------ | -------------------------------------------------- |
+| 0     | `never`      | One attempt only                                   |
+| 1     | `on-failure` | Restart non-zero returns, traps, and host failures |
+| 2     | `always`     | Restart every returned or failed attempt           |
 
-Explicit stop, disable, removal, authorization failure, invalid/corrupt
-module state, and server shutdown are not attempt failures. `on-failure`
-treats a zero return as successful and transitions to stopped. Resource-limit
-exits are failures but retain their backoff; they do not receive larger limits
-on retry.
+Explicit stop, disable, removal, invalid/corrupt module state, and server
+shutdown are not attempt failures. `on-failure` treats a zero return as
+successful and transitions to stopped. Execution failures retain their
+backoff; retrying does not change the invocation.
 
 `PERSIST` stores the plugin definition and desired state. It implies
 `DETACH` and requires a unique durable name. Persistence does not itself alter
@@ -260,9 +241,9 @@ The initial SDK targets `wasm32-unknown-unknown`. A module:
 - imports `send` and `recv` from module `blit_v1`.
 
 Returning from `blit_main` ends the attempt. Its `i32` is the attempt exit
-code. A trap, invalid host call, resource-limit breach, or rejected packet
-ends the attempt with a structured failure reason. The supervisor then
-applies the plugin's restart policy.
+code. A trap, invalid host call, or rejected packet ends the attempt with a
+structured failure reason. The supervisor then applies the plugin's restart
+policy.
 
 ### Host ABI
 
@@ -303,11 +284,11 @@ The default mailbox byte window is 4 MiB, but message boundaries are never
 split and a legal packet must always be able to make progress. An empty
 mailbox therefore admits one whole packet up to the 16 MiB logical-message
 cap even when that packet exceeds the window. While that oversized packet is
-queued, no second packet is admitted. Thus the normal queued-byte limit stays
+queued, no second packet is admitted. Thus the normal queued-byte bound stays
 4 MiB and the absolute queued-byte bound for either mailbox is 16 MiB.
 
-No separate argument, logging, timer, process, or capability-discovery imports
-are needed. After the normal `HELLO` / `LIST` / `READY` handshake, the host
+No separate argument, logging, timer, or process imports are needed. After the
+normal `HELLO` / `LIST` / `READY` handshake, the host
 sends `PLUGIN_INFO(INIT)` containing plugin, attempt, task identity, and
 arguments. Guest logs and structured output are `PLUGIN_EVENT` packets. Timers,
 child processes, and other facilities can be ordinary protocol operations when
@@ -315,21 +296,20 @@ required.
 
 ### Optional WASI
 
-WASI is useful for conventional guest self-environment: arguments, the
-guest's stdin/stdout/stderr, clocks, randomness, and explicitly preopened
-directories. It is not the blit capability boundary. The initial
-`wasm32-unknown-unknown` SDK needs no WASI imports; a later
-`wasm32-wasip1` target may link
-[`wasmi_wasi`](https://docs.rs/wasmi_wasi/latest/wasmi_wasi/), with each
-facility populated from the plugin definition and server policy.
+WASI is useful for conventional guest self-environment: arguments, the guest's
+stdin/stdout/stderr, clocks, and randomness. It is not another API for blit
+operations. The initial `wasm32-unknown-unknown` SDK needs no WASI imports; a
+later `wasm32-wasip1` target may link
+[`wasmi_wasi`](https://docs.rs/wasmi_wasi/latest/wasmi_wasi/) for those
+facilities. Version 1 defines no WASI filesystem preopens or sockets.
 
 Standard WASI does not define arbitrary child-process spawning. Its CLI
 proposal covers environment variables, arguments, stdio, and the current
 process's exit, not `spawn` or `exec`; see the
 [WASI proposal list](https://wasi.dev/releases). A private `proc_spawn`
-import would be possible, but would duplicate blit's authorization,
-lifecycle, and streaming protocol. Plugins therefore launch child processes
-through `PROCESS_*` packets, just like any other authorized client.
+import would be possible, but would duplicate blit's lifecycle and streaming
+protocol. Plugins therefore launch child processes through `PROCESS_*`
+packets, just like any other client.
 
 ### Rust SDK
 
@@ -376,22 +356,21 @@ thread communicate through two bounded in-process queues:
    under its byte-window backpressure;
 3. `blit_v1.recv` blocks the plugin thread on the endpoint-to-plugin queue
    until a packet arrives or cancellation closes it;
-4. fuel exhaustion returns control to the thread driver, which checks total
-   fuel, deadline, and cancellation before replenishing the next slice;
-5. completion, trap, limit, or cancellation destroys the attempt endpoint,
-   reports `PLUGIN_EXIT`, and ends the thread; the async supervisor then stops,
-   waits in backoff, or creates a fresh thread for the next attempt.
+4. fuel exhaustion returns control to the thread driver, which checks
+   cancellation before replenishing the next slice;
+5. completion, trap, or cancellation destroys the attempt endpoint, reports
+   `PLUGIN_EXIT`, and ends the thread; the async supervisor then stops, waits in
+   backoff, or creates a fresh thread for the next attempt.
 
 An empty receive parks the dedicated thread without consuming CPU; restart
-backoff uses the async supervisor and consumes no plugin thread. The deliberate
-memory and scheduling cost is bounded by the concurrent-plugin limit. A
-thread-spawn failure reports a structured resource failure and never panics
-the server.
+backoff uses the async supervisor and consumes no plugin thread. The server
+reserves the thread and Wasmi resources before marking an attempt running. A
+reservation or thread-spawn failure reports a structured host failure and never
+panics the server.
 
 ### Thread names
 
-Plugin thread names are diagnostic, not identity or authorization. The full
-logical name is:
+Plugin thread names are diagnostic, not identity. The full logical name is:
 
 ```text
 blit-plugin:<label>#<short-plugin-id>
@@ -405,7 +384,7 @@ transient instances of the same module.
 
 A shared helper compacts that logical name for each platform while retaining
 the component prefix and ID suffix. For example, a Linux-sized name might be
-`blit-p:bui-7f2a`, while a platform with a larger limit can expose
+`blit-p:bui-7f2a`, while a platform allowing longer names can expose
 `blit-plugin:builder#7f2a`. Failure to set a descriptive OS name falls back to
 `blit-plugin` and does not prevent execution. The full logical name remains
 available in server diagnostics and logs.
@@ -426,8 +405,8 @@ A module object ID is the full 32-byte BLAKE3 digest of the exact Wasm
 module bytes. It is rendered as 64 lowercase hexadecimal digits in paths and
 human output. Truncation is not permitted for storage or wire identity.
 
-Arguments, effective capabilities, limits, and attachment mode are invocation
-properties. They do not affect the module object hash.
+Arguments and attachment mode are invocation properties. They do not affect
+the module object hash.
 
 ### Cache
 
@@ -456,11 +435,8 @@ Wasmi's translated `Module` is cached in memory by:
 ```
 
 Running attempts pin their raw and translated objects. An enabled persistent
-plugin also pins its raw object, so a restart never depends on the
-original uploader returning. A byte-budgeted LRU may evict other translated
-modules and raw objects. The initial defaults are 256 MiB of persistent raw
-objects and 128 MiB of translated modules, configurable by environment
-variables.
+plugin also pins its raw object, so a restart never depends on the original
+uploader returning. An LRU may evict other translated modules and raw objects.
 
 ### Miss and race behavior
 
@@ -504,9 +480,9 @@ UTF-8. Unless otherwise stated, `detail` is UTF-8 and consumes the remainder.
 
 `PLUGIN_RUN.flags`: bit 0 `DETACH`, bit 1 `PERSIST`. `restart` is the
 restart-policy value from [§ Lifecycle model](#lifecycle-model). `PERSIST`
-requires `DETACH`, a non-empty `name`, and permission to create durable
-plugins. Without `PERSIST`, `name` may be empty and is descriptive only.
-Unknown flags or restart values are `INVALID`.
+requires `DETACH` and a non-empty, unique `name`. Without `PERSIST`, `name` may
+be empty and is descriptive only. Unknown flags or restart values are
+`INVALID`.
 Argument count is capped at 1024, each argument at 64 KiB, and their combined
 UTF-8 bytes at 1 MiB. NUL has no special meaning.
 
@@ -517,7 +493,7 @@ fit the module cap before any data is accepted. Chunks are contiguous and
 cumulatively acknowledged. `FINAL` requires `offset + data.len() ==
 total_size`, then triggers hash verification, validation, atomic cache
 insertion, and pending-run start. A one-packet object sets both flags. The
-default module limit is 16 MiB; clients should use 1 MiB chunks.
+maximum module size is 16 MiB; clients should use 1 MiB chunks.
 
 `PLUGIN_CONTROL.action`:
 
@@ -591,16 +567,16 @@ Run phases:
 | 4     | `RUNNING`     | `task_id` is live and its logical client exists          |
 | 5     | `BACKOFF`     | Supervisor will start another attempt at the stated time |
 | 6     | `STOPPED`     | No attempt is running or scheduled                       |
-| 7     | `BLOCKED`     | Permanent condition requires policy/object/operator work |
+| 7     | `BLOCKED`     | Permanent condition requires object or operator work     |
 
-Exit reasons distinguish returned, trapped, cancelled, fuel exhausted,
-deadline exceeded, memory limit, slow consumer, protocol violation, host
-failure, and server shutdown. `code` is the `blit_main` return only for
-`RETURNED`; it is zero for other reasons. `next_start_unix_ms` is non-zero only
-when the supervisor has scheduled another attempt.
+Exit reasons distinguish returned, trapped, cancelled, slow consumer, protocol
+violation, host failure, and server shutdown. `code` is the `blit_main` return
+only for `RETURNED`; it is zero for other reasons.
+`next_start_unix_ms` is non-zero only when the supervisor has scheduled another
+attempt.
 
-Common family status values are reused: `OK`, `NOT_FOUND`, `PERMISSION`,
-`TOO_LARGE`, `BUDGET`, `INVALID`, `CANCELLED`, `OTHER`, and `CONFLICT`.
+Common family status values are reused: `OK`, `NOT_FOUND`, `TOO_LARGE`,
+`INVALID`, `CANCELLED`, `OTHER`, and `CONFLICT`.
 `PLUGIN_PUT_STATUS` additionally defines value 12 as `ALREADY_HAVE`. It means
 the verified object is already committed; `received` is its stored total size,
 the pending run proceeds, and the client must stop uploading. `OK` reports the
@@ -617,14 +593,11 @@ short grace period for `PLUGIN_EXIT`, and then closes.
 
 With `DETACH`, phase `RUNNING` in either the correlated `PLUGIN_STATUS` or a
 later `PLUGIN_INFO(STATUS)` is sufficient for the command to return
-successfully. The plugin remains server-owned until its policy stops it, it is
-explicitly cancelled, or the server exits. Its event log is a bounded byte
-ring across attempts, so a later `ATTACH` receives a retained suffix followed
-by live events. Detached attempts still end at their configured deadline. The
-version-1 default is a five-minute wall-clock deadline for attached attempts
-and no wall-clock deadline for detached or persistent attempts. Server policy
-may impose a finite detached deadline; detaching never removes fuel, memory,
-process, mailbox, capability, or cancellation limits.
+successfully. The plugin remains server-owned until its restart policy stops
+it, it is explicitly cancelled, or the server exits. Its event log is a bounded
+byte ring across attempts, so a later `ATTACH` receives a retained suffix
+followed by live events. Plugin attempts have no wall-clock deadline; attached
+and detached execution differ only in ownership and event following.
 
 Every attempt has a 32-bit process-local `task_id`. Task IDs are not durable;
 `plugin_id` and `attempt` are the stable coordinates followed by clients.
@@ -640,9 +613,9 @@ wall-clock start time, so restarting blit cannot be used to bypass crash-loop
 backoff.
 
 Failures which cannot improve by retrying transition to `BLOCKED` rather than
-looping: missing or corrupt pinned object, unsupported host ABI, revoked
-authority, or a deterministic instantiation/import error. An object repair,
-policy reload, definition update, or explicit `ENABLE` causes revalidation.
+looping: missing or corrupt pinned object, unsupported host ABI, or a
+deterministic instantiation/import error. An object repair, definition update,
+or explicit `ENABLE` causes revalidation.
 
 ### Persistence across server restarts
 
@@ -650,8 +623,7 @@ Persistent definitions are durable desired state, separate from the Wasmi
 instance. The server transactionally stores:
 
 - stable plugin ID and unique name;
-- object hash, arguments, and effective capability ceiling;
-- resource limits and restart policy;
+- object hash, arguments, and restart policy;
 - enabled/desired-running state;
 - attempt counter, consecutive-failure count, and next eligible start time.
 
@@ -661,9 +633,7 @@ not an evictable cache. The raw Wasm object remains in the separate
 content-addressed cache but is pinned by every enabled definition.
 
 The module object is made durable before the definition can commit. On server
-startup, definitions are loaded and policy is re-evaluated before any attempt
-starts. Authority may narrow after a restart but never silently widens beyond
-the stored ceiling. Definitions which no longer pass policy become `BLOCKED`.
+startup, definitions are loaded and validated before any attempt starts.
 
 `DISABLE` and `REMOVE` commit their durable state before cancelling an
 attempt, so a crash cannot resurrect something the operator just stopped.
@@ -679,9 +649,9 @@ KV. Blit does not checkpoint Wasm memory or try to infer whether a side effect
 committed.
 
 Arguments are stored verbatim. They should not contain secrets unless the
-plugin store gains an explicit encrypted-secret mechanism; secret
-references through a separately authorized facility are preferable. Retained
-stdout/stderr events are not durable in the first version.
+plugin store gains an explicit encrypted-secret mechanism; references through
+a separate secret facility are preferable. Retained stdout/stderr events are
+not durable in the first version.
 
 ## Native channel family
 
@@ -699,14 +669,11 @@ characters, and are process-global. They are compared byte-for-byte without
 Unicode normalization; clients should therefore use ASCII reverse DNS names
 such as `com.example.builder`. Metadata and payloads are opaque bytes.
 
-`LISTEN` authorization is checked against the exact name or a policy-approved
-namespace before consulting or claiming the registry. This applies equally to
-network clients and plugins: possession of a broad client connection does not
-grant every process-global name. An unauthorized listen receives `PERMISSION`;
-a second authorized listener for an occupied name receives `CONFLICT`.
-`CONNECT` has its own per-name policy check. First-listener ownership is routing
-state, never proof of identity; peers authenticate the server-supplied `peer`
-identity instead of the channel name.
+Version 1 has no namespace reservation or per-name access rules. Any endpoint
+may `LISTEN` or `CONNECT`; the first listener owns the name until it closes, and
+a second listener receives `CONFLICT`. First-listener ownership is routing
+state, never proof of identity. Peers use the server-supplied `peer` identity
+rather than trusting the channel name.
 
 ### Bidirectional channels (`0x95`)
 
@@ -738,9 +705,9 @@ A listener owns a name until closed. `CONNECT` either fails once with
 full-duplex message pair. Blit preserves each `DATA` message boundary and
 orders messages per direction.
 
-`peer` is the authenticated logical-client identity suitable for display and
-policy, not a self-asserted string from metadata. Passing more identity claims
-requires explicit server support.
+`peer` is a server-assigned logical-client identity suitable for display, not a
+self-asserted string from metadata. Passing more identity claims requires
+explicit server support.
 
 Flow control is a cumulative byte window per direction, using payload bytes.
 `OPENED` / `ACCEPTED` grants window `W`. An `ACK(C)` means the receiver has
@@ -795,7 +762,7 @@ receives the initial `STATE_VALUE`, and then sends `CLOSE`. An open with neither
 handle valid.
 
 `TOPIC_SUBSCRIBE.flags`: bit 0 `LIVE_ONLY`. Topics are created implicitly by
-their first authorized publisher or subscriber. Each topic retains a bounded
+their first publisher or subscriber. Each topic retains a bounded
 event suffix by count and bytes. `after_sequence` requests replay after a
 known event; unavailable history produces `TOPIC_GAP` before the available
 suffix. `LIVE_ONLY` ignores retained events. Topics use monotonically
@@ -818,7 +785,8 @@ that space.
 
 This is a normal blit family. A Wasmi plugin reaches it through `blit_v1.send`
 and `blit_v1.recv`; a network client sends the same packets over its existing
-transport. The server implementation is shared.
+transport. The server implementation is shared. When `FEATURE_PROCESS` is
+advertised, every logical client may use it.
 
 Process IDs are client-allocated 32-bit integers scoped to one logical
 endpoint. An ID cannot be reused until a failed `PROCESS_STARTED` or final
@@ -837,21 +805,20 @@ paths on Windows. Stream payloads are unrestricted bytes.
 | `0xC3` | `PROCESS_CONTROL` | `[nonce:2][process_id:4][action:1][value:4]`                                                                                                                               |
 
 `PROCESS_SPAWN` executes `argv[0]` directly. It never invokes a shell;
-clients which want shell parsing must explicitly run a policy-allowed shell
-with an argument such as `-c`. `argc` must be non-zero. Argument count and
+clients which want shell parsing must explicitly run a shell with an argument
+such as `-c`. `argc` must be non-zero. Argument count and
 combined bytes use the same caps as plugin arguments. `envc` is capped at 256,
 each environment key at 255 bytes, each value at 64 KiB, and combined key and
-value bytes at 1 MiB. Duplicate keys are `INVALID`; server policy may lower any
-of these caps.
+value bytes at 1 MiB. Duplicate keys are `INVALID`.
 
 Spawn flags are bit 0 `MERGE_STDERR` and bit 1 `CLEAR_ENV`. By default the
-child receives a small policy-defined baseline such as `PATH`, locale, and a
+child receives a small server-defined baseline such as `PATH`, locale, and a
 temporary directory, plus the explicit environment entries. `CLEAR_ENV`
-removes that baseline. The server never implicitly forwards credentials,
-file descriptors, or `BLIT_*` variables. Explicit environment entries
-replace baseline entries after policy validation.
+removes that baseline. The server never implicitly forwards credentials, file
+descriptors, or `BLIT_*` variables. Explicit environment entries replace
+baseline entries.
 
-`cwd_kind` is 0 for the server policy's default directory, 1 for the explicit
+`cwd_kind` is 0 for the server's default directory, 1 for the explicit
 `cwd`, and 2 for the current directory of `src_pty_id`. Fields unused by the
 selected kind must be empty or zero. Resolving a terminal directory happens
 atomically during spawn and does not attach the new process to that terminal.
@@ -901,9 +868,8 @@ one another. They are raw bytes, not UTF-8 and not line-framed. Offsets begin
 at zero. The server reads both OS pipes concurrently, delivers all accepted
 output, observes both EOFs and the child wait result, and only then emits the
 single terminal `PROCESS_EXIT`; no stream data follows it. Exit reasons
-distinguish returned, signalled, killed, deadline exceeded, output limit,
-spawn policy revocation, and host failure. `code` is meaningful only for a
-normal return or a platform signal.
+distinguish returned, signalled, killed, protocol violation, and host failure.
+`code` is meaningful only for a normal return or a platform signal.
 
 ### Flow control and ownership
 
@@ -913,16 +879,19 @@ output stream through its client ACK plus that stream's negotiated window.
 An incorrect offset, decreasing ACK, or window overrun is a protocol
 violation for that process. Normal backpressure stops reading or writing the
 corresponding OS pipe and lets the child block; it never creates an unbounded
-server queue. Per-process and per-endpoint output limits remain independently
-enforced.
+server queue.
 
 Every child belongs to its creating logical endpoint and, for a plugin, to
-the current attempt. Endpoint close, attempt cancellation, trap, or enforced
-limit closes stdin, gracefully terminates the process group or Windows job,
-waits a short policy-defined grace period, and force-kills the remainder.
+the current attempt. Endpoint close, attempt cancellation, or trap closes
+stdin, gracefully terminates the process group or Windows job, waits a short
+server-defined grace period, and force-kills the remainder.
 The server reaps every child. A restarted plugin attempt gets no handles to
 the previous attempt's children. Persistent plugins must therefore assume
 that an interrupted subprocess side effect can be repeated after restart.
+
+Children run with the blit server's OS identity. Wasm isolation does not
+sandbox a native child; deployments which need that separation must sandbox
+the blit server or its process runner externally.
 
 Programs requiring a controlling terminal continue to use the terminal
 family. `PROCESS_*` is intentionally pipe-based; adding PTY flags here would
@@ -953,91 +922,22 @@ The SDK multiplexes process events with every other server packet and sends
 ACKs only after the application consumes data. It does not attempt to make
 `std::process::Command` work transparently on a core Wasm target.
 
-## Capabilities and policy
+## Failure isolation
 
-Version 1 has no blit-specific module manifest. A Wasm object identifies its
-host ABI through imports such as `blit_v1`; its content hash is its only
-embedded policy identity. Names, arguments, restart policy, and persistence are
-invocation properties carried by `PLUGIN_RUN`.
+There are no per-plugin resource settings, execution budgets, or wall-clock
+deadlines. `PLUGIN_RUN` carries no execution-tuning fields.
 
-Effective authority is the intersection of the authenticated invoking
-principal's authority and server policy for the exact module hash or an
-operator-controlled durable plugin name. An unknown hash receives only the
-conservative baseline: handshake, plugin events, outbound channel connections,
-and live topic subscription. Exact-hash policy is the safest grant. Name-based
-policy applies only after authorization to bind that durable name, so choosing
-a string cannot acquire its policy.
-
-Resource limits likewise come from server defaults and hash/name policy.
-Version 1 has no per-invocation grant or limit fields in `PLUGIN_RUN`, and no
-`--grant` or limit-override CLI flags. A future per-run delegation needs a new
-feature-gated `PLUGIN_RUN2` or an explicitly negotiated TLV extension; it must
-not reinterpret trailing version-1 bytes.
-
-A plugin does not predeclare the operations it intends to use. Unauthorized
-packets receive the normal family `PERMISSION` result. `HELLO` advertises family
-availability, not the endpoint's authorization; a future capability-query
-packet should be common to network clients and plugins rather than module
-metadata.
-
-`process.spawn` is not in that baseline. Server policy may constrain it by
-module hash or durable name, executable path, argument shape, working-directory
-roots, environment keys, child count, runtime, and aggregate output. Children
-run with the blit server's OS identity unless the deployment selects an
-external sandbox or credential-changing runner. Wasm isolation alone does not
-sandbox the native child.
-
-The in-process endpoint's principal records its invoking principal, module
-hash, plugin ID, attempt, task ID, and detached/persistent ownership.
-Channels expose a safe form of this identity to peers.
-
-Network endpoints use the same `Principal` and `CapabilitySet` types and the
-same authorization calls. Policy may scope capabilities by operation and
-resource—for example channel-name pattern, filesystem root, durable plugin
-name, module hash, or executable path. Denials use the family reply when one
-exists and otherwise follow the family's documented denial behavior without
-executing the operation. Authorization failure must never fall through to a
-privileged handler.
-
-## Resource limits and failure isolation
-
-Defaults are policy, not ABI, but the first implementation should enforce:
-
-| Resource                       | Suggested default |
-| ------------------------------ | ----------------- |
-| Raw module                     | 16 MiB            |
-| Linear memory                  | 64 MiB            |
-| Tables                         | 4                 |
-| Instances                      | 1                 |
-| Fuel per driver slice          | 1 million         |
-| Total fuel                     | 100 million       |
-| Attached deadline              | 5 minutes         |
-| Detached/persistent deadline   | Unlimited         |
-| Concurrent plugin threads      | 16                |
-| Native stack per plugin thread | 2 MiB             |
-| Persistent definitions         | 128               |
-| Open endpoint resources        | 64                |
-| Concurrent child processes     | 8 per endpoint    |
-| Process environment            | 256 entries/1 MiB |
-| Mailbox byte window, each      | 4 MiB             |
-| Mailbox absolute bound, each   | 16 MiB            |
-| Process stream window          | 1 MiB each        |
-| Process aggregate output       | 64 MiB            |
-| Retained plugin events         | 1 MiB             |
-| One channel message            | 4 MiB             |
-| One state value                | 4 MiB             |
-| One topic event                | 1 MiB             |
-
-Wasmi store limits enforce memory/table/instance growth. Fuel limits pure
-computation. Host calls charge additional fuel proportional to copied bytes.
-Wall-clock deadlines include time awaiting server operations unless policy
-says otherwise.
+Fixed packet sizes, byte windows, and bounded outboxes are protocol and
+dispatcher invariants described with their respective families. Wasmi must
+also be configured so guest memory, tables, and instances cannot exhaust the
+server. Fuel metering supplies yield points for cancellation, not a total
+execution budget. These containment details are not plugin-visible or
+configurable per invocation.
 
 Cancellation marks the endpoint first, wakes a blocked receive, and refuses
-new sends. A running fuel slice reaches cancellation at its next yield; the
-slice bound is therefore also cancellation-latency policy. Host panics are
-caught at the plugin thread boundary and reported as `HOST_FAILURE`; they must
-not unwind into server code.
+new sends. A running fuel slice reaches cancellation at its next yield. Host
+panics are caught at the plugin thread boundary and reported as `HOST_FAILURE`;
+they must not unwind into server code.
 
 The server must validate all plugin packets exactly as it validates
 network packets. In-process origin is not trusted origin.
@@ -1124,7 +1024,7 @@ gateway-global allocation or rewriting.
 
 Bindings for terminals, FS, Git, LSP, KV, network relay, and every
 future family duplicate the wire protocol and make Wasm support lag normal
-clients. They also encourage runtime-specific authorization and cleanup.
+clients. They also encourage runtime-specific validation and cleanup.
 Packets give exact parity through two imports.
 
 ### WASI or WASIX subprocess spawning
@@ -1132,7 +1032,7 @@ Packets give exact parity through two imports.
 Standard WASI currently describes the guest's CLI environment and exit, not
 portable child-process creation. Adopting a runtime-specific `proc_spawn`
 extension would couple plugins to that runtime, expose process execution only
-to Wasm guests, and still require blit-specific policy and lifecycle glue.
+to Wasm guests, and still require blit-specific lifecycle glue.
 The process packet family provides the same streaming operation to all clients
 without adding another Wasm import. Optional WASI remains useful for the
 plugin's own constrained environment.
@@ -1163,9 +1063,8 @@ JSON voluntarily; core client operations remain binary blit packets.
 A shared pool uses fewer native stacks for mostly idle plugins, but makes
 thread-level profiling, crash attribution, debugger inspection, and resource
 ownership less direct. Dedicated named threads are intentionally simpler to
-operate. The concurrent-plugin cap bounds their native memory cost, and
-blocked receives park without consuming CPU; restart backoff owns no plugin
-thread at all.
+operate. Blocked receives park without consuming CPU; restart backoff owns no
+plugin thread at all.
 
 ### State represented as a one-message topic
 
@@ -1181,44 +1080,36 @@ two modes implicitly.
    compaction, and stable ID suffixes.
 2. **Packet endpoint refactor.** Extract logical client creation, packet
    dispatch, bounded outbox, identity propagation, and common disconnect.
-3. **Principals and authorization.** Introduce the shared `Principal` and
-   `CapabilitySet` for network and in-process endpoints; gate every dispatch
-   path before handler entry; add operation- and resource-scoped policy; and
-   protect existing administrative packets including `C2S_QUIT`. Ship denial,
-   network/plugin parity, name-squatting, and privilege-escalation tests before
-   enabling module execution.
-4. **Native channels.** Implement the `0x95` channel registry, flow control,
+3. **Native channels.** Implement the `0x95` channel registry, flow control,
    identity, cleanup, codecs, and CLI protocol tests.
-5. **State and topics.** Implement `0x96`, snapshot-before-live ordering,
+4. **State and topics.** Implement `0x96`, snapshot-before-live ordering,
    revision CAS, bounded retention, coalescing, and gap tests.
-6. **Processes.** Implement the `0xC0` through `0xC5` process family,
+5. **Processes.** Implement the `0xC0` through `0xC5` process family,
    per-stream flow control, concurrent pipe draining, process-tree cleanup,
-   policy enforcement, codecs, and protocol tests from a network client.
-7. **Plugin objects.** Implement BLAKE3 run probe, chunk upload,
-   validation, persistent CAS, pending-run single-flight, and cache limits.
-8. **Supervisor.** Add stable plugin/attempt identity, restart policy,
+   codecs, and protocol tests from a network client.
+6. **Plugin objects.** Implement BLAKE3 run probe, chunk upload, validation,
+   persistent CAS, pending-run single-flight, and cache eviction.
+7. **Supervisor.** Add stable plugin/attempt identity, restart policy,
    backoff, durable desired state, startup restoration, and crash-safe control.
-9. **Wasmi host.** Add one named thread per running plugin attempt, bounded
-   endpoint queues, store/fuel limits, cancellation, attempt lifecycle, and
-   event retention.
-10. **Rust SDK and CLI.** Add `blit-guest`, a Rust example plugin, `blit run`,
-    process wrappers, and plugin control commands.
+8. **Wasmi host.** Add one named thread per running plugin attempt, bounded
+   endpoint queues, Wasmi containment, fuel-based cancellation yielding,
+   attempt lifecycle, and event retention.
+9. **Rust SDK and CLI.** Add `blit-guest`, a Rust example plugin, `blit run`,
+   process wrappers, and plugin control commands.
 
 Each phase has a vertical protocol test with at least two logical clients.
 The plugin phases additionally verify cache hit (no upload), cache miss,
 nonce release before later ID-keyed status changes, hash mismatch, invalid
-imports, fuel exhaustion, cancellation, cleanup after a trap, restart policy,
+imports, runaway-loop cancellation, cleanup after a trap, restart policy,
 backoff persistence, crash-safe disable, and restoration after a fresh server
 process. Multiplexed-family tests send unknown kinds in both directions.
 Process tests additionally cover binary output, independent stdout/stderr
 ordering, backpressure, stdin EOF, missing `cwd_kind = 2` context, merged-stderr
-window negotiation, spawn failure, signals where supported, output limits, and
+window negotiation, spawn failure, signals where supported, and
 process-tree cleanup on endpoint loss.
 
 ## Open questions
 
-- What initial capability vocabulary is useful without pretending that broad
-  labels such as `fs` are sufficient long-term policy?
 - Should topic retention default to zero or a small byte suffix?
 - Should persistent object eviction be automatic by default or operator-only
   until access-time accounting is proven reliable across crashes?
