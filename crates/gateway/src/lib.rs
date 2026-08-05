@@ -978,15 +978,19 @@ async fn handle_mux_ws(mut ws: WebSocket, state: AppState, auth_peer: String) {
 
     let (ws_tx, mut ws_rx) = ws.split();
 
-    // Mux control frames (OPENED / CLOSED / errors) go on their own
-    // unbounded channel so they are never delayed behind bulk data.
+    // Mux control frames (OPENED / CLOSED / errors) keep their own channel so
+    // they are not queued behind bulk data — the writer task polls this one
+    // first.  Bounded like the data channel, but the two senders treat a full
+    // queue differently: `mux_open_channel` awaits, because OPENED has to
+    // reach the browser before the channel's first data frame, while the
+    // select loop uses `try_send` and lets a close ack or shutdown QUIT go,
+    // because blocking there would stall every other channel on the session.
     let (merge_tx, merge_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MUX_CONTROL_QUEUE_FRAMES);
-    // Upstream data frames go on a BOUNDED channel: a browser that cannot
-    // keep up must stop the upstream reader, which fills the upstream
-    // socket and lets the blit server see its own writes block.  With an
-    // unbounded queue here the server's outbox always looks empty, its
-    // only congestion signal never fires, and the backlog grows in this
-    // process instead.
+    // Upstream data frames: a browser that cannot keep up must stop the
+    // upstream reader, which fills the upstream socket and lets the blit
+    // server see its own writes block.  With an unbounded queue here the
+    // server's outbox always looks empty, its only congestion signal never
+    // fires, and the backlog grows in this process instead.
     let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MUX_DATA_QUEUE_FRAMES);
 
     let mut channels: HashMap<u16, MuxChannelState> = HashMap::new();
@@ -1682,6 +1686,8 @@ async fn handle_mux_wt(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("mux-wt client authenticated");
 
+    // Control and data channels, same split and same full-queue handling as
+    // the WebSocket mux handler above.
     let (merge_tx, merge_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MUX_CONTROL_QUEUE_FRAMES);
     let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MUX_DATA_QUEUE_FRAMES);
     let mut channels: HashMap<u16, MuxChannelState> = HashMap::new();
