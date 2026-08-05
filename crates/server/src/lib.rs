@@ -12,10 +12,11 @@ use blit_remote::{
     FEATURE_COMPOSITOR, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_RESIZE_BATCH,
     FEATURE_RESTART, FrameState, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N,
     S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE,
-    S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, SURFACE_FRAME_FLAG_KEYFRAME, build_update_msg,
-    msg_hello, msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_used_rows,
-    msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
-    msg_surface_frame, msg_surface_resized, msg_surface_title, msg_term_cwd_reply,
+    S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME,
+    build_update_msg, msg_hello, msg_s2c_clipboard_content, msg_s2c_clipboard_list,
+    msg_s2c_used_rows, msg_surface_app_id, msg_surface_created, msg_surface_destroyed,
+    msg_surface_encoder, msg_surface_frame, msg_surface_resized, msg_surface_title,
+    msg_term_cwd_reply,
 };
 #[cfg(target_os = "linux")]
 use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO};
@@ -1148,6 +1149,11 @@ struct RateSample {
     /// The transport told us it could not keep up (blocked write or a
     /// backed-up outbox) since the last step.
     congested: bool,
+    /// Nothing on the path is straining: writes aren't blocking, the
+    /// browser isn't backlogged, acks aren't piling up.  Goodput measured
+    /// in this state describes our own send rate, not link capacity, so a
+    /// budget derived from it is not evidence of anything.
+    app_limited: bool,
 }
 
 /// Next quantizer for a surface, clamped to `[ceiling, ADAPTIVE_MAX_QUANTIZER]`.
@@ -1162,6 +1168,19 @@ fn next_quantizer(sample: RateSample) -> u8 {
         // Back off hard: the queue is already forming, and the frames that
         // caused it are still in flight.
         return clamp(sample.current as i32 + (sample.current as i32 / 8).max(12));
+    }
+    // An unstrained link never justifies getting worse, whatever the budget
+    // comparison below would say: on an app-limited link goodput converges
+    // to whatever we are currently sending, so "over budget" is
+    // self-fulfilling — smaller frames drag the measurement down, which
+    // shrinks the budget, which asks for smaller frames again, all the way
+    // to the floor (a lone spinner animation used to ride this spiral to
+    // quantizer 200).  Spend the idle link on walking back to the
+    // configured quality instead; if that turns out to be more than the
+    // path can carry, the pressure signals return and the backoff above
+    // answers them.
+    if sample.app_limited {
+        return clamp(sample.current as i32 - ADAPTIVE_STEP as i32);
     }
     // No usable budget yet (no goodput estimate, or no frame measured):
     // hold position rather than guess.
@@ -1242,6 +1261,20 @@ fn step_adaptive_bandwidth(
     let blocked_us = client.write_blocked_us.load(Ordering::Relaxed);
     let congested = outbox_backpressured(client)
         || blocked_us.saturating_sub(client.write_blocked_us_seen) > WRITE_BLOCKED_CONGESTED_US;
+    // Pressure evidence, from strongest to weakest: the writer blocking on
+    // the socket, the browser reporting an apply backlog (>4 is where
+    // pacing starts backing off too), and this surface's unacked frames
+    // piling up well past what send-rate × RTT parks in flight.  With none
+    // of these present the link is app-limited and the budget below says
+    // nothing about capacity.
+    let surface_inflight = client
+        .surface_inflight_frames
+        .iter()
+        .filter(|f| f.surface_id == surface_id)
+        .count();
+    let app_limited = !congested
+        && client.browser_backlog_frames <= 4
+        && surface_inflight < SURFACE_INFLIGHT_MAX / 2;
     let budget_bytes = surface_budget_bytes(client, surface_id);
     let ceiling = client
         .surface_subs
@@ -1285,6 +1318,7 @@ fn step_adaptive_bandwidth(
             budget_bytes,
             observed_bytes: sub.frame_bytes,
             congested,
+            app_limited,
         })
     };
     sub.rate_stepped_at = Some(now);
@@ -3858,9 +3892,15 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // controller floors at `ADAPTIVE_MAX_QUANTIZER`, so a
                     // ceiling set cheaper than that would otherwise be
                     // overshot into spending more bits than allowed.
-                    let q = resolve_bandwidth(client, state.config.surface_encoding.bandwidth, sid)
-                        .av1_quantizer()
-                        .min(255) as u8;
+                    // Mapped to the session's own QP scale — an H.264
+                    // session takes 0–51, and feeding it the controller's
+                    // 0–255 walk would pin it at its worst quality.
+                    let bw =
+                        resolve_bandwidth(client, state.config.surface_encoding.bandwidth, sid);
+                    let q = match client.vulkan_video_surfaces.get(&sid) {
+                        Some(&(_, flag)) if flag == SURFACE_FRAME_CODEC_H264 => bw.h264_qp(),
+                        _ => bw.av1_qp_for_vulkan(),
+                    };
                     pending_vulkan_qp_updates.push((sid as u32, work.cid, q));
                 }
 
@@ -11790,7 +11830,27 @@ mod tests {
             budget_bytes: budget,
             observed_bytes: observed,
             congested: false,
+            app_limited: false,
         }
+    }
+
+    #[test]
+    fn an_app_limited_link_recovers_instead_of_degrading() {
+        // Over budget on paper, but nothing on the path is straining.  The
+        // budget is self-measured from our own traffic, so acting on it
+        // would be the spinner death spiral: walk back toward the ceiling
+        // instead.
+        let mut s = sample(180, 1_000.0, 30_000.0);
+        s.app_limited = true;
+        assert_eq!(next_quantizer(s), 180 - ADAPTIVE_STEP);
+        // Already at the ceiling: nothing to buy, hold.
+        s.current = 120;
+        assert_eq!(next_quantizer(s), 120);
+        // Congestion outranks app-limited (they are mutually exclusive in
+        // the caller, but the sample must not be trusted to be coherent).
+        s.current = 180;
+        s.congested = true;
+        assert!(next_quantizer(s) > 180);
     }
 
     #[test]
@@ -11873,6 +11933,10 @@ mod tests {
         let (mut client, _rx) = test_client_with_capacity(64);
         client.goodput_bps = 10_000.0;
         client.display_fps = 30.0;
+        // Degrading needs pressure evidence, not just a budget verdict: the
+        // browser reporting a backlog is what says the link truly can't
+        // carry these frames.
+        client.browser_backlog_frames = 20;
         let sub = client.surface_subs.entry(4).or_default();
         sub.frame_bytes = 60_000.0;
         assert!(sub.encoder.is_none());
@@ -11892,6 +11956,46 @@ mod tests {
         );
         // Nothing to rebuild: the compositor retargets in place.
         assert!(!step.rebuild);
+    }
+
+    #[test]
+    fn a_lone_animation_on_a_quiet_link_is_not_walked_to_the_floor() {
+        // The spinner case: tiny frames, forever changing, link otherwise
+        // idle.  Goodput has collapsed to the spinner's own send rate, so
+        // every frame reads as "over budget" — but nothing is congested,
+        // nothing is backlogged, nothing is in flight.  The controller
+        // must walk back toward the ceiling, not away from it.
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.goodput_bps = 50_000.0;
+        client.display_fps = 60.0;
+        let ceiling = SurfaceBandwidth::Medium.av1_quantizer() as u8;
+        let sub = client.surface_subs.entry(7).or_default();
+        sub.frame_bytes = 1_700.0;
+        sub.adaptive_quantizer = Some(ADAPTIVE_MAX_QUANTIZER);
+
+        let mut q = ADAPTIVE_MAX_QUANTIZER;
+        for _ in 0..40 {
+            client.surface_subs.entry(7).or_default().rate_stepped_at = None;
+            let step = step_adaptive_bandwidth(
+                &mut client,
+                SurfaceBandwidth::Medium,
+                7,
+                Instant::now(),
+                false,
+            );
+            match step.quantizer {
+                Some(next) => {
+                    assert!(next < q, "must only improve, {q} -> {next}");
+                    q = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(q, ceiling, "must recover all the way to the ceiling");
+        assert_eq!(
+            resolve_bandwidth(&client, SurfaceBandwidth::Medium, 7).av1_quantizer(),
+            ceiling as usize,
+        );
     }
 
     #[test]
@@ -11925,6 +12029,9 @@ mod tests {
         let (mut client, _rx) = test_client_with_capacity(64);
         client.goodput_bps = 10_000.0;
         client.display_fps = 30.0;
+        // Backlogged, so the moving half of the contrast is genuinely
+        // strained (an unstrained link would recover instead).
+        client.browser_backlog_frames = 20;
         let ceiling = SurfaceBandwidth::Medium.av1_quantizer() as u8;
         let sub = client.surface_subs.entry(9).or_default();
         sub.frame_bytes = 60_000.0;
