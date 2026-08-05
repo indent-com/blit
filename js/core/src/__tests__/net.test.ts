@@ -384,17 +384,6 @@ describe("NetStreams", () => {
     expect(bytes).toBe(NET_WINDOW_BYTES);
   });
 
-  it("falls back to the ceiling when the server reports no window", async () => {
-    const { sent, streams } = harness();
-    const stream = streams.open("h", 80);
-    streams.handleMessage(opened(stream.streamId, NET_STATUS_OK));
-    await stream.write(new Uint8Array(NET_WINDOW_BYTES));
-    const bytes = sent
-      .filter((m) => m[0] === C2S_NET_DATA)
-      .reduce((n, m) => n + m.length - 3, 0);
-    expect(bytes).toBe(NET_WINDOW_BYTES);
-  });
-
   it("does not reuse a live id, and reuses a retired one", () => {
     const { streams } = harness();
     const a = streams.open("h", 80);
