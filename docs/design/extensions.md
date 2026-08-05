@@ -461,11 +461,11 @@ produced them.
 
 Restart policies are:
 
-| Value | CLI          | Meaning                                            |
-| ----- | ------------ | -------------------------------------------------- |
+| Value | CLI          | Meaning                                              |
+| ----- | ------------ | ---------------------------------------------------- |
 | 0     | `never`      | No automatic restart after an attempt return/failure |
-| 1     | `on-failure` | Restart every attempt classified as a failure      |
-| 2     | `always`     | Restart successful returns and classified failures |
+| 1     | `on-failure` | Restart every attempt classified as a failure        |
+| 2     | `always`     | Restart successful returns and classified failures   |
 
 Restart policy governs automatic restarts after an attempt ends. For restart
 policy purposes, restoring still-desired persistent state after a server stop
@@ -831,13 +831,13 @@ connection bridge that dedicated thread to `handle_client`:
    the same time so the server writer cannot wait for a guest which has
    returned;
 10. a trap or cancellation may instead abort both directions and discard a
-   pending handoff; after either kind of completion the thread reports its
-   outcome and exits, the supervisor publishes `STOPPING` with `task_id = 0`,
-   and it awaits `handle_client` through normal connection cleanup while
-   joining the reported extension-thread result;
+    pending handoff; after either kind of completion the thread reports its
+    outcome and exits, the supervisor publishes `STOPPING` with `task_id = 0`,
+    and it awaits `handle_client` through normal connection cleanup while
+    joining the reported extension-thread result;
 11. only after the handler, writer, jobs, guards, and OS thread are gone does it
-   report `EXT_EXIT`, release the running permit, and stop, wait in backoff, or
-   queue the next attempt.
+    report `EXT_EXIT`, release the running permit, and stop, wait in backoff, or
+    queue the next attempt.
 
 Thus `event(); return` cannot publish `EXT_EXIT` ahead of an event whose
 `send` succeeded: normal half-close drains the accepted C2S handoff and the
@@ -1084,7 +1084,7 @@ is capped at 4 KiB.
 | `0x90` | `EXT_RUN`     | `[nonce:2][flags:1][restart:1][expected_extension_id:8][expected_definition_revision:8][hash:32][name_len:2][name:N][argc:2] repeated{[len:4][arg:M]}` |
 | `0x91` | `EXT_PUT`     | `[nonce:2][flags:1][hash:32][offset:8][total_size:8][data:N]`                                                                                          |
 | `0x92` | `EXT_CONTROL` | `[nonce:2][extension_id:8][action:1]`                                                                                                                  |
-| `0x93` | `EXT_EVENT`   | `[kind:1][data:N]` — accepted from the current attempt endpoint under the drain rule below                                                              |
+| `0x93` | `EXT_EVENT`   | `[kind:1][data:N]` — accepted from the current attempt endpoint under the drain rule below                                                             |
 | `0x94` | `EXT_COMMAND` | `[kind:1][nonce:2][body...]`                                                                                                                           |
 
 `EXT_RUN.flags`: bit 0 `DETACH`, bit 1 `PERSIST`, bit 2 `UPDATE`. `restart` is the
@@ -1125,17 +1125,17 @@ successful insertion only primes the CAS for the client's next update probe.
 
 `EXT_CONTROL.action`:
 
-| Value | Name      | Meaning                                                             |
-| ----- | --------- | ------------------------------------------------------------------- |
-| 1     | `CANCEL`  | Clear desired-running, suppress restarts, then cancel its attempt   |
-| 2     | `ATTACH`  | Subscribe this connection to retained and future events             |
-| 3     | `UNFOLLOW` | Stop this connection following without changing lifecycle state    |
-| 4     | `STATUS`  | Request the current supervisor and attempt lifecycle record         |
-| 5     | `RESTART` | Set desired-running, bypass backoff, and replace the current attempt |
-| 6     | `ENABLE`  | Durably enable a persistent definition; start it if desired-running |
-| 7     | `DISABLE` | Durably disable a persistent definition, then cancel its attempt    |
-| 8     | `REMOVE`  | Durably remove a disabled persistent definition and retained output |
-| 9     | `LIST`    | List visible extensions; requires `extension_id = 0`                |
+| Value | Name       | Meaning                                                              |
+| ----- | ---------- | -------------------------------------------------------------------- |
+| 1     | `CANCEL`   | Clear desired-running, suppress restarts, then cancel its attempt    |
+| 2     | `ATTACH`   | Subscribe this connection to retained and future events              |
+| 3     | `UNFOLLOW` | Stop this connection following without changing lifecycle state      |
+| 4     | `STATUS`   | Request the current supervisor and attempt lifecycle record          |
+| 5     | `RESTART`  | Set desired-running, bypass backoff, and replace the current attempt |
+| 6     | `ENABLE`   | Durably enable a persistent definition; start it if desired-running  |
+| 7     | `DISABLE`  | Durably disable a persistent definition, then cancel its attempt     |
+| 8     | `REMOVE`   | Durably remove a disabled persistent definition and retained output  |
+| 9     | `LIST`     | List visible extensions; requires `extension_id = 0`                 |
 
 Value 0 and values 10 through 255 are reserved. An unknown action receives the normal
 `EXT_STATUS(status = INVALID)` reply and changes no state. Extending the action
@@ -1250,24 +1250,24 @@ in progress.
 
 ### Server to client
 
-| Opcode | Name             | Layout                                                                                                                                                   |
-| ------ | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Opcode | Name             | Layout                                                                                                                                                                                                                      |
+| ------ | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `0x90` | `EXT_STATUS`     | `[nonce:2][status:1][phase:1][flags:1][restart:1][extension_id:8][definition_revision:8][attempt:8][last_running_attempt:8][task_id:4][replay_from_sequence:8][output_sequence:8][next_start_unix_ms:8][hash:32][detail:N]` |
-| `0x91` | `EXT_PUT_STATUS` | `[nonce:2][status:1][hash:32][received:8][detail:N]`                                                                                                     |
-| `0x92` | `EXT_INFO`       | `[kind:1][body...]`                                                                                                                                      |
-| `0x93` | `EXT_EVENT`      | `[extension_id:8][definition_revision:8][attempt:8][task_id:4][output_sequence:8][kind:1][data:N]`                                                       |
-| `0x94` | `EXT_EXIT`       | `[extension_id:8][definition_revision:8][attempt:8][task_id:4][output_sequence:8][reason:1][code:i32][next_start_unix_ms:8][detail:N]`                  |
+| `0x91` | `EXT_PUT_STATUS` | `[nonce:2][status:1][hash:32][received:8][detail:N]`                                                                                                                                                                        |
+| `0x92` | `EXT_INFO`       | `[kind:1][body...]`                                                                                                                                                                                                         |
+| `0x93` | `EXT_EVENT`      | `[extension_id:8][definition_revision:8][attempt:8][task_id:4][output_sequence:8][kind:1][data:N]`                                                                                                                          |
+| `0x94` | `EXT_EXIT`       | `[extension_id:8][definition_revision:8][attempt:8][task_id:4][output_sequence:8][reason:1][code:i32][next_start_unix_ms:8][detail:N]`                                                                                      |
 
 Server `EXT_INFO.kind` values:
 
-| Kind | Name                 | Body                                                                                                                                   |
-| ---- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| 1    | `INIT`               | `[extension_id:8][definition_revision:8][attempt:8][task_id:4][flags:1][hash:32][name_len:2][name:N][argc:2] repeated{[len:4][arg:M]}` |
-| 2    | `LIST`               | `[nonce:2][status:1][count:2] repeated{extension_record}`                                                                              |
+| Kind | Name                 | Body                                                                                                                                                                             |
+| ---- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | `INIT`               | `[extension_id:8][definition_revision:8][attempt:8][task_id:4][flags:1][hash:32][name_len:2][name:N][argc:2] repeated{[len:4][arg:M]}`                                           |
+| 2    | `LIST`               | `[nonce:2][status:1][count:2] repeated{extension_record}`                                                                                                                        |
 | 3    | `STATUS`             | `[extension_id:8][definition_revision:8][phase:1][flags:1][restart:1][attempt:8][last_running_attempt:8][task_id:4][output_sequence:8][next_start_unix_ms:8][hash:32][detail:N]` |
-| 4    | `COMMAND_REGISTERED` | `[nonce:2][status:1][extension_id:8][definition_revision:8][detail:N]`                                                                 |
-| 5    | `COMMANDS`           | `[nonce:2][status:1][directory_revision:8][next_cursor:8][count:2] repeated{command_record}`                                           |
-| 6    | `REPLAY_DONE`        | `[extension_id:8][through_sequence:8]`                                                                                                |
+| 4    | `COMMAND_REGISTERED` | `[nonce:2][status:1][extension_id:8][definition_revision:8][detail:N]`                                                                                                           |
+| 5    | `COMMANDS`           | `[nonce:2][status:1][directory_revision:8][next_cursor:8][count:2] repeated{command_record}`                                                                                     |
+| 6    | `REPLAY_DONE`        | `[extension_id:8][through_sequence:8]`                                                                                                                                           |
 
 `EXT_INFO(INIT).flags` and the flags stored in status and list records use bit
 0 `DETACH`, bit 1 `PERSIST`, bit 2 `ENABLED`, and bit 3 `DESIRED_RUNNING`;
@@ -1357,7 +1357,7 @@ following never reserves it.
 | -------------------------------- | ------------------------------ | ------------------------------------------------------------------------ |
 | `EXT_RUN`                        | `EXT_STATUS`                   | `EXT_INFO(STATUS)`, `EXT_EVENT`, and `EXT_EXIT`, keyed by `extension_id` |
 | one `EXT_PUT` chunk              | `EXT_PUT_STATUS`               | pending creations progress through ID-keyed lifecycle messages           |
-| `EXT_CONTROL` except `LIST`      | `EXT_STATUS` snapshot          | later lifecycle records and `REPLAY_DONE` are ID-keyed                    |
+| `EXT_CONTROL` except `LIST`      | `EXT_STATUS` snapshot          | later lifecycle records and `REPLAY_DONE` are ID-keyed                   |
 | `EXT_CONTROL(LIST)`              | `EXT_INFO(LIST)`               | none                                                                     |
 | `EXT_COMMAND(REGISTER)`          | `EXT_INFO(COMMAND_REGISTERED)` | directory changes are not pushed                                         |
 | one `EXT_COMMAND(DISCOVER)` page | `EXT_INFO(COMMANDS)`           | every continuation is a new request with its own nonce                   |
@@ -1419,16 +1419,16 @@ Run phases:
 Zero means no lifecycle phase and is used whenever no lifecycle record is
 available, including a refusal before allocating or resolving an extension.
 
-| Value | Name          | Meaning                                                  |
-| ----- | ------------- | -------------------------------------------------------- |
-| 1     | `NEED_OBJECT` | Object absent; one uploader should send it               |
+| Value | Name          | Meaning                                                            |
+| ----- | ------------- | ------------------------------------------------------------------ |
+| 1     | `NEED_OBJECT` | Object absent; one uploader should send it                         |
 | 2     | `VALIDATING`  | Validation, instantiation, or private bootstrap before publication |
-| 3     | `QUEUED`      | Valid attempt waiting for an execution slot              |
-| 4     | `RUNNING`     | `task_id` is live and its logical client exists          |
-| 5     | `BACKOFF`     | Supervisor will start another attempt at the stated time |
-| 6     | `STOPPED`     | No attempt is running or scheduled                       |
-| 7     | `BLOCKED`     | Permanent condition requires object or operator work     |
-| 8     | `STOPPING`    | Guest ended; connection-owned cleanup has not completed  |
+| 3     | `QUEUED`      | Valid attempt waiting for an execution slot                        |
+| 4     | `RUNNING`     | `task_id` is live and its logical client exists                    |
+| 5     | `BACKOFF`     | Supervisor will start another attempt at the stated time           |
+| 6     | `STOPPED`     | No attempt is running or scheduled                                 |
+| 7     | `BLOCKED`     | Permanent condition requires object or operator work               |
+| 8     | `STOPPING`    | Guest ended; connection-owned cleanup has not completed            |
 
 Values 9 through 255 are reserved. A client preserves and renders an unknown
 S2C phase without treating it as `RUNNING`; new phase semantics require explicit
@@ -1455,16 +1455,16 @@ reusing a sequence.
 
 `EXT_EXIT.reason` values are:
 
-| Value | Name                 | Meaning                                           |
-| ----- | -------------------- | ------------------------------------------------- |
-| 0     | `RETURNED`           | `blit_main` returned                              |
-| 1     | `TRAPPED`            | Wasm execution trapped                            |
-| 2     | `CANCELLED`          | The owner or supervisor cancelled the attempt     |
-| 3     | `UPDATED`            | A replacement definition superseded this attempt  |
-| 4     | `SLOW_CONSUMER`      | The extension did not drain its endpoint          |
-| 5     | `PROTOCOL_VIOLATION` | The extension sent an invalid packet sequence     |
-| 6     | `HOST_FAILURE`       | The runtime or a host operation failed            |
-| 7     | `SERVER_SHUTDOWN`    | The server is shutting down                       |
+| Value | Name                 | Meaning                                            |
+| ----- | -------------------- | -------------------------------------------------- |
+| 0     | `RETURNED`           | `blit_main` returned                               |
+| 1     | `TRAPPED`            | Wasm execution trapped                             |
+| 2     | `CANCELLED`          | The owner or supervisor cancelled the attempt      |
+| 3     | `UPDATED`            | A replacement definition superseded this attempt   |
+| 4     | `SLOW_CONSUMER`      | The extension did not drain its endpoint           |
+| 5     | `PROTOCOL_VIOLATION` | The extension sent an invalid packet sequence      |
+| 6     | `HOST_FAILURE`       | The runtime or a host operation failed             |
+| 7     | `SERVER_SHUTDOWN`    | The server is shutting down                        |
 | 8     | `RESOURCE_LIMIT`     | Extension-origin host-work admission was exhausted |
 
 Values 9 through 255 are reserved. A client preserves an unknown value in
@@ -1620,11 +1620,11 @@ durable in the first version.
 
 Three identifiers answer different questions:
 
-| Identifier                | Identifies                                        | Lifetime                 |
-| ------------------------- | ------------------------------------------------- | ------------------------ |
-| module hash               | exact Wasm bytes                                  | immutable CAS object     |
+| Identifier                | Identifies                                     | Lifetime                 |
+| ------------------------- | ---------------------------------------------- | ------------------------ |
+| module hash               | exact Wasm bytes                               | immutable CAS object     |
 | `extension_id`            | one supervised extension and its configuration | stable for the extension |
-| `(extension_id, attempt)` | one Wasmi instance                                | one execution attempt    |
+| `(extension_id, attempt)` | one Wasmi instance                             | one execution attempt    |
 
 Every non-`UPDATE` `EXT_RUN` creates a distinct extension and ID, even when
 the hash, arguments, and descriptive name are identical. The same module
@@ -1751,13 +1751,13 @@ Every message begins `[0x95][kind:1][channel_id:4]`.
 
 Client-to-server kinds:
 
-| Kind | Name      | Body                                                        |
-| ---- | --------- | ----------------------------------------------------------- |
-| 1    | `LISTEN`  | `[flags:1][name_len:2][name:N][metadata_len:4][metadata:M]` |
+| Kind | Name      | Body                                                                     |
+| ---- | --------- | ------------------------------------------------------------------------ |
+| 1    | `LISTEN`  | `[flags:1][name_len:2][name:N][metadata_len:4][metadata:M]`              |
 | 2    | `CONNECT` | `[flags:1][name_len:2][name:N][metadata_len:4][metadata:M][optional...]` |
-| 3    | `DATA`    | `[payload:N]`                                               |
-| 4    | `ACK`     | `[bytes:8]` cumulative consumed payload bytes               |
-| 5    | `CLOSE`   | `[reason:1]`                                                |
+| 3    | `DATA`    | `[payload:N]`                                                            |
+| 4    | `ACK`     | `[bytes:8]` cumulative consumed payload bytes                            |
+| 5    | `CLOSE`   | `[reason:1]`                                                             |
 
 `LISTEN.flags` has no version-1 bits and must be zero. `CONNECT.flags` bit 0 is
 `EXPECT_LISTENER_TOKEN` and appends `[listener_token:16]` after metadata; bits 1
@@ -1780,23 +1780,23 @@ endpoint's handle slots and one server-wide pair slot.
 
 Server-to-client kinds:
 
-| Kind | Name       | Body                                                                                 |
-| ---- | ---------- | ------------------------------------------------------------------------------------ |
-| 1    | `OPENED`   | `[status:1][window:8][peer_len:2][peer:N][metadata_len:4][meta:M][detail:D]`          |
-| 2    | `ACCEPTED` | `[listener_id:4][window:8][peer_len:2][peer:N][metadata_len:4][meta:M]`               |
-| 3    | `DATA`     | `[payload:N]`                                                                        |
-| 4    | `ACK`      | `[bytes:8]` cumulative consumed payload bytes                                        |
-| 5    | `CLOSED`   | `[reason:1][detail:N]`                                                               |
+| Kind | Name       | Body                                                                         |
+| ---- | ---------- | ---------------------------------------------------------------------------- |
+| 1    | `OPENED`   | `[status:1][window:8][peer_len:2][peer:N][metadata_len:4][meta:M][detail:D]` |
+| 2    | `ACCEPTED` | `[listener_id:4][window:8][peer_len:2][peer:N][metadata_len:4][meta:M]`      |
+| 3    | `DATA`     | `[payload:N]`                                                                |
+| 4    | `ACK`      | `[bytes:8]` cumulative consumed payload bytes                                |
+| 5    | `CLOSED`   | `[reason:1][detail:N]`                                                       |
 
 Channel close reasons are:
 
-| Value | Name                 | Meaning                                               |
-| ----- | -------------------- | ----------------------------------------------------- |
-| 0     | `NORMAL`             | An endpoint explicitly completed the channel          |
-| 1     | `CANCELLED`          | An endpoint explicitly cancelled the channel          |
-| 2     | `PEER_GONE`          | The peer disappeared without a channel close          |
-| 3     | `PROTOCOL_VIOLATION` | A malformed body, ACK, or window overrun closed it     |
-| 4     | `SERVER_SHUTDOWN`    | The server is shutting down                            |
+| Value | Name                 | Meaning                                            |
+| ----- | -------------------- | -------------------------------------------------- |
+| 0     | `NORMAL`             | An endpoint explicitly completed the channel       |
+| 1     | `CANCELLED`          | An endpoint explicitly cancelled the channel       |
+| 2     | `PEER_GONE`          | The peer disappeared without a channel close       |
+| 3     | `PROTOCOL_VIOLATION` | A malformed body, ACK, or window overrun closed it |
+| 4     | `SERVER_SHUTDOWN`    | The server is shutting down                        |
 
 A client may put only `NORMAL` or `CANCELLED` in `CLOSE`; any other value is a
 protocol violation for that handle. The server forwards that reason to both
@@ -2058,48 +2058,48 @@ resource settings. The server applies installation-wide capacity and
 containment policy uniformly to every extension. These settings, like the
 feature gates below, are sampled once at server startup. Initial defaults are:
 
-| Resource                                           |                         Default | Server setting                |
-| -------------------------------------------------- | ------------------------------: | ----------------------------- |
-| Concurrent running attempts and extension threads  | `min(4, max(1, logical CPUs-1))` | `BLIT_EXT_MAX_RUNNING`        |
-| Persistent definitions, enabled or disabled        |                             128 | `BLIT_EXT_MAX_PERSISTENT`     |
-| Active transient extension supervisors             |                             128 | `BLIT_EXT_MAX_TRANSIENT`      |
-| Followed extensions per logical endpoint            |                             128 | `BLIT_EXT_FOLLOW_MAX_PER_CLIENT` |
-| Follower cursors server-wide                        |                           4,096 | `BLIT_EXT_FOLLOW_MAX`         |
-| Retained argument bytes across supervisors          |                         256 MiB | `BLIT_EXT_ARGUMENT_STORE_MAX` |
-| Raw module object/upload                            |                          64 MiB | `BLIT_EXT_MODULE_MAX`         |
-| Raw module objects on disk, including reservations |                           2 GiB | `BLIT_EXT_OBJECT_CACHE_MAX`   |
-| Raw CAS entries, including temp/quarantine          |                           4,096 | `BLIT_EXT_OBJECT_CACHE_MAX_ENTRIES` |
-| Active uploads per logical endpoint                 |                               4 | `BLIT_EXT_UPLOAD_MAX_PER_CLIENT` |
-| Active uploads server-wide                          |                              32 | `BLIT_EXT_UPLOAD_MAX_ACTIVE`  |
-| Active-upload idle timeout                          |                           5 min | `BLIT_EXT_UPLOAD_TIMEOUT`     |
-| Pending-creation absolute timeout                   |                           5 min | `BLIT_EXT_PENDING_TIMEOUT`    |
-| Concurrent module validations and translations     |                               2 | `BLIT_EXT_MAX_VALIDATING`     |
-| Wasm linear memory per attempt                     |                         128 MiB | `BLIT_EXT_MEMORY_MAX`         |
-| In-process duplex capacity, each direction          |                    16 MiB + 4 B | fixed by packet cap           |
-| Host-adapter packet handoffs, both directions       |                          32 MiB | fixed by packet cap           |
-| Queued extension egress ceiling                     |                          64 MiB | `BLIT_EXT_OUTBOX_MAX`         |
-| Queued messages per extension endpoint              |                           4,096 | `BLIT_EXT_OUTBOX_MESSAGES_MAX` |
-| Full-output no-progress timeout                     |                            30 s | `BLIT_EXT_OUTBOX_TIMEOUT`     |
-| Active tracked jobs per extension endpoint           |                              32 | `BLIT_EXT_JOB_MAX_PER_CLIENT` |
-| Active tracked jobs server-wide                      |                             128 | `BLIT_EXT_JOB_MAX`            |
-| Pending tracked jobs per extension endpoint          |                              32 | `BLIT_EXT_JOB_PENDING_MAX_PER_CLIENT` |
-| Pending tracked jobs server-wide                     |                             128 | `BLIT_EXT_JOB_PENDING_MAX`    |
-| Pending + active request bytes per extension endpoint |                         16 MiB | `BLIT_EXT_JOB_BYTES_MAX_PER_CLIENT` |
-| Pending + active request bytes server-wide           |                         64 MiB | `BLIT_EXT_JOB_BYTES_MAX`      |
-| Retained output across all supervisors              |                          64 MiB | `BLIT_EXT_OUTPUT_RETAIN_MAX`  |
-| Retained output per supervisor                      |                           4 MiB | fixed per-supervisor ceiling  |
-| Terminal transient replay lease                     |                            30 s | `BLIT_EXT_TERMINAL_RETAIN`    |
-| Final-record reserve for all transient supervisors  |              ~1.1 MiB at 128 | derived from configured transient/detail caps |
-| One `EXT_EVENT` payload                             |                           1 MiB | fixed by the event family     |
-| Command records and discovery snapshots             |                          64 MiB | `BLIT_EXT_COMMAND_STORE_MAX`  |
-| Active command-discovery snapshots server-wide      |                             256 | `BLIT_EXT_COMMAND_SNAPSHOT_MAX` |
-| Tables per attempt                                 |                               1 | fixed by the module model     |
-| Aggregate table elements per attempt               |                          65,536 | `BLIT_EXT_TABLE_ELEMENTS_MAX` |
-| Wasm instances per attempt                         |                               1 | fixed by the module model     |
-| Wasmi value-stack bytes per attempt                |                         128 KiB | `BLIT_EXT_VALUE_STACK_MAX`    |
-| Wasmi call depth per attempt                       |                           1,024 | `BLIT_EXT_CALL_DEPTH_MAX`     |
-| Native stack per extension thread                  |                           2 MiB | `BLIT_EXT_STACK_SIZE`         |
-| Fuel per driver slice                              |                       1,000,000 | `BLIT_EXT_FUEL_SLICE`         |
+| Resource                                              |                          Default | Server setting                                |
+| ----------------------------------------------------- | -------------------------------: | --------------------------------------------- |
+| Concurrent running attempts and extension threads     | `min(4, max(1, logical CPUs-1))` | `BLIT_EXT_MAX_RUNNING`                        |
+| Persistent definitions, enabled or disabled           |                              128 | `BLIT_EXT_MAX_PERSISTENT`                     |
+| Active transient extension supervisors                |                              128 | `BLIT_EXT_MAX_TRANSIENT`                      |
+| Followed extensions per logical endpoint              |                              128 | `BLIT_EXT_FOLLOW_MAX_PER_CLIENT`              |
+| Follower cursors server-wide                          |                            4,096 | `BLIT_EXT_FOLLOW_MAX`                         |
+| Retained argument bytes across supervisors            |                          256 MiB | `BLIT_EXT_ARGUMENT_STORE_MAX`                 |
+| Raw module object/upload                              |                           64 MiB | `BLIT_EXT_MODULE_MAX`                         |
+| Raw module objects on disk, including reservations    |                            2 GiB | `BLIT_EXT_OBJECT_CACHE_MAX`                   |
+| Raw CAS entries, including temp/quarantine            |                            4,096 | `BLIT_EXT_OBJECT_CACHE_MAX_ENTRIES`           |
+| Active uploads per logical endpoint                   |                                4 | `BLIT_EXT_UPLOAD_MAX_PER_CLIENT`              |
+| Active uploads server-wide                            |                               32 | `BLIT_EXT_UPLOAD_MAX_ACTIVE`                  |
+| Active-upload idle timeout                            |                            5 min | `BLIT_EXT_UPLOAD_TIMEOUT`                     |
+| Pending-creation absolute timeout                     |                            5 min | `BLIT_EXT_PENDING_TIMEOUT`                    |
+| Concurrent module validations and translations        |                                2 | `BLIT_EXT_MAX_VALIDATING`                     |
+| Wasm linear memory per attempt                        |                          128 MiB | `BLIT_EXT_MEMORY_MAX`                         |
+| In-process duplex capacity, each direction            |                     16 MiB + 4 B | fixed by packet cap                           |
+| Host-adapter packet handoffs, both directions         |                           32 MiB | fixed by packet cap                           |
+| Queued extension egress ceiling                       |                           64 MiB | `BLIT_EXT_OUTBOX_MAX`                         |
+| Queued messages per extension endpoint                |                            4,096 | `BLIT_EXT_OUTBOX_MESSAGES_MAX`                |
+| Full-output no-progress timeout                       |                             30 s | `BLIT_EXT_OUTBOX_TIMEOUT`                     |
+| Active tracked jobs per extension endpoint            |                               32 | `BLIT_EXT_JOB_MAX_PER_CLIENT`                 |
+| Active tracked jobs server-wide                       |                              128 | `BLIT_EXT_JOB_MAX`                            |
+| Pending tracked jobs per extension endpoint           |                               32 | `BLIT_EXT_JOB_PENDING_MAX_PER_CLIENT`         |
+| Pending tracked jobs server-wide                      |                              128 | `BLIT_EXT_JOB_PENDING_MAX`                    |
+| Pending + active request bytes per extension endpoint |                           16 MiB | `BLIT_EXT_JOB_BYTES_MAX_PER_CLIENT`           |
+| Pending + active request bytes server-wide            |                           64 MiB | `BLIT_EXT_JOB_BYTES_MAX`                      |
+| Retained output across all supervisors                |                           64 MiB | `BLIT_EXT_OUTPUT_RETAIN_MAX`                  |
+| Retained output per supervisor                        |                            4 MiB | fixed per-supervisor ceiling                  |
+| Terminal transient replay lease                       |                             30 s | `BLIT_EXT_TERMINAL_RETAIN`                    |
+| Final-record reserve for all transient supervisors    |                  ~1.1 MiB at 128 | derived from configured transient/detail caps |
+| One `EXT_EVENT` payload                               |                            1 MiB | fixed by the event family                     |
+| Command records and discovery snapshots               |                           64 MiB | `BLIT_EXT_COMMAND_STORE_MAX`                  |
+| Active command-discovery snapshots server-wide        |                              256 | `BLIT_EXT_COMMAND_SNAPSHOT_MAX`               |
+| Tables per attempt                                    |                                1 | fixed by the module model                     |
+| Aggregate table elements per attempt                  |                           65,536 | `BLIT_EXT_TABLE_ELEMENTS_MAX`                 |
+| Wasm instances per attempt                            |                                1 | fixed by the module model                     |
+| Wasmi value-stack bytes per attempt                   |                          128 KiB | `BLIT_EXT_VALUE_STACK_MAX`                    |
+| Wasmi call depth per attempt                          |                            1,024 | `BLIT_EXT_CALL_DEPTH_MAX`                     |
+| Native stack per extension thread                     |                            2 MiB | `BLIT_EXT_STACK_SIZE`                         |
+| Fuel per driver slice                                 |                        1,000,000 | `BLIT_EXT_FUEL_SLICE`                         |
 
 `BLIT_EXT_MAX_RUNNING` is validated in the range 1 through 4. The terminal
 record reserve is computed at startup from `BLIT_EXT_MAX_TRANSIENT` and the
@@ -2110,13 +2110,13 @@ after that cap changes.
 Channels likewise have uniform server policy and no client resource-tuning
 fields:
 
-| Resource                                      | Default | Server setting                       |
-| --------------------------------------------- | ------: | ------------------------------------ |
-| Channel listeners per logical endpoint        |      64 | `BLIT_CHANNEL_MAX_LISTEN_PER_CLIENT` |
-| Channel listeners server-wide                 |   1,024 | `BLIT_CHANNEL_MAX_LISTENERS`         |
-| Connected channel handles per logical endpoint |     64 | `BLIT_CHANNEL_MAX_PER_CLIENT`        |
-| Connected channel pairs server-wide           |     128 | `BLIT_CHANNEL_MAX_CONNECTED`         |
-| Reserved channel windows server-wide          | 256 MiB | `BLIT_CHANNEL_BUFFER_MAX`            |
+| Resource                                       | Default | Server setting                       |
+| ---------------------------------------------- | ------: | ------------------------------------ |
+| Channel listeners per logical endpoint         |      64 | `BLIT_CHANNEL_MAX_LISTEN_PER_CLIENT` |
+| Channel listeners server-wide                  |   1,024 | `BLIT_CHANNEL_MAX_LISTENERS`         |
+| Connected channel handles per logical endpoint |      64 | `BLIT_CHANNEL_MAX_PER_CLIENT`        |
+| Connected channel pairs server-wide            |     128 | `BLIT_CHANNEL_MAX_CONNECTED`         |
+| Reserved channel windows server-wide           | 256 MiB | `BLIT_CHANNEL_BUFFER_MAX`            |
 
 A successful channel pair reserves both 1 MiB direction windows against the
 channel byte budget before either handle becomes visible. Admission which
