@@ -9,6 +9,10 @@
 
 use std::collections::BTreeMap;
 
+// Paths, globs and match text are bounded by no protocol rule, so `push_str`
+// clips rather than wrapping the `u16` prefix.
+use crate::push_str;
+
 /// Start (or replace) a sync: [0x40][nonce:2][flags:2][latency_ms:2][inline_max:4][path_len:2][path:N]
 /// then, when `FS_SYNC_EXCLUDE` is set, [exclude_len:2][exclude:M]; then,
 /// when `FS_SYNC_FROM_PTY` is set, [src_pty_id:2].
@@ -371,9 +375,7 @@ pub fn append_fs_record(buf: &mut Vec<u8>, record: &FsRecord<'_>) {
         } => {
             buf.push(FS_RECORD_UPSERT);
             buf.push(*entry_flags);
-            let pb = path.as_bytes();
-            buf.extend_from_slice(&(pb.len() as u16).to_le_bytes());
-            buf.extend_from_slice(pb);
+            push_str(buf, path);
             buf.extend_from_slice(&size.to_le_bytes());
             buf.extend_from_slice(&mtime_ns.to_le_bytes());
             buf.extend_from_slice(&mode.to_le_bytes());
@@ -394,18 +396,12 @@ pub fn append_fs_record(buf: &mut Vec<u8>, record: &FsRecord<'_>) {
         }
         FsRecord::Delete { path } => {
             buf.push(FS_RECORD_DELETE);
-            let pb = path.as_bytes();
-            buf.extend_from_slice(&(pb.len() as u16).to_le_bytes());
-            buf.extend_from_slice(pb);
+            push_str(buf, path);
         }
         FsRecord::Move { from, to } => {
             buf.push(FS_RECORD_MOVE);
-            let fb = from.as_bytes();
-            buf.extend_from_slice(&(fb.len() as u16).to_le_bytes());
-            buf.extend_from_slice(fb);
-            let tb = to.as_bytes();
-            buf.extend_from_slice(&(tb.len() as u16).to_le_bytes());
-            buf.extend_from_slice(tb);
+            push_str(buf, from);
+            push_str(buf, to);
         }
     }
     let len = (buf.len() - start - 4) as u32;
@@ -598,11 +594,9 @@ pub fn msg_fs_sync_full(
     msg.extend_from_slice(&flags.to_le_bytes());
     msg.extend_from_slice(&latency_ms.to_le_bytes());
     msg.extend_from_slice(&inline_max.to_le_bytes());
-    msg.extend_from_slice(&(pb.len() as u16).to_le_bytes());
-    msg.extend_from_slice(pb);
+    push_str(&mut msg, path);
     if !eb.is_empty() {
-        msg.extend_from_slice(&(eb.len() as u16).to_le_bytes());
-        msg.extend_from_slice(eb);
+        push_str(&mut msg, exclude);
     }
     if let Some(src) = src_pty_id {
         msg.extend_from_slice(&src.to_le_bytes());
@@ -710,8 +704,7 @@ pub fn msg_fs_fetch(nonce: u16, sync_id: u16, path: &str) -> Vec<u8> {
     msg.push(C2S_FS_FETCH);
     msg.extend_from_slice(&nonce.to_le_bytes());
     msg.extend_from_slice(&sync_id.to_le_bytes());
-    msg.extend_from_slice(&(pb.len() as u16).to_le_bytes());
-    msg.extend_from_slice(pb);
+    push_str(&mut msg, path);
     msg
 }
 
@@ -723,10 +716,8 @@ pub fn msg_fs_search(nonce: u16, limit: u16, root: &str, query: &str) -> Vec<u8>
     m.push(C2S_FS_SEARCH);
     m.extend_from_slice(&nonce.to_le_bytes());
     m.extend_from_slice(&limit.to_le_bytes());
-    m.extend_from_slice(&(rb.len() as u16).to_le_bytes());
-    m.extend_from_slice(rb);
-    m.extend_from_slice(&(qb.len() as u16).to_le_bytes());
-    m.extend_from_slice(qb);
+    push_str(&mut m, root);
+    push_str(&mut m, query);
     m
 }
 
@@ -759,11 +750,13 @@ pub fn msg_fs_search_result(nonce: u16, status: u8, paths: &[String]) -> Vec<u8>
     m.push(S2C_FS_SEARCH);
     m.extend_from_slice(&nonce.to_le_bytes());
     m.push(status);
-    m.extend_from_slice(&(paths.len() as u16).to_le_bytes());
-    for p in paths {
-        let pb = p.as_bytes();
-        m.extend_from_slice(&(pb.len() as u16).to_le_bytes());
-        m.extend_from_slice(pb);
+    // Declare only as many results as the u16 count can describe, and emit
+    // exactly that many: a wrapped count leaves the reader consuming the
+    // wrong number of entries and desyncing on whatever follows.
+    let count = paths.len().min(u16::MAX as usize);
+    m.extend_from_slice(&(count as u16).to_le_bytes());
+    for p in &paths[..count] {
+        push_str(&mut m, p);
     }
     m
 }
@@ -800,8 +793,7 @@ pub fn msg_fs_index(nonce: u16, root: &str) -> Vec<u8> {
     m.push(C2S_FS_INDEX);
     m.extend_from_slice(&nonce.to_le_bytes());
     m.push(0); // flags, reserved
-    m.extend_from_slice(&(rb.len() as u16).to_le_bytes());
-    m.extend_from_slice(rb);
+    push_str(&mut m, root);
     m
 }
 
@@ -827,9 +819,7 @@ pub fn parse_fs_index(data: &[u8]) -> Option<(u16, u8, String)> {
 pub fn msg_fs_index_result(nonce: u16, status: u8, flags: u8, paths: &[String]) -> Vec<u8> {
     let mut raw = Vec::with_capacity(paths.iter().map(|p| 2 + p.len()).sum::<usize>());
     for p in paths {
-        let pb = p.as_bytes();
-        raw.extend_from_slice(&(pb.len() as u16).to_le_bytes());
-        raw.extend_from_slice(pb);
+        push_str(&mut raw, p);
     }
     let compressed = lz4_flex::compress_prepend_size(&raw);
     let mut m = Vec::with_capacity(9 + compressed.len());
@@ -889,8 +879,7 @@ pub fn msg_fs_synced(nonce: u16, sync_id: u16, status: u8, detail: &str) -> Vec<
     msg.extend_from_slice(&nonce.to_le_bytes());
     msg.extend_from_slice(&sync_id.to_le_bytes());
     msg.push(status);
-    msg.extend_from_slice(&(db.len() as u16).to_le_bytes());
-    msg.extend_from_slice(db);
+    push_str(&mut msg, detail);
     msg
 }
 
@@ -1017,8 +1006,7 @@ pub fn msg_fs_write(w: &FsWrite) -> Vec<u8> {
     msg.extend_from_slice(&w.base.to_le_bytes());
     msg.extend_from_slice(&w.mode.to_le_bytes());
     msg.push(w.content_kind);
-    msg.extend_from_slice(&(pb.len() as u16).to_le_bytes());
-    msg.extend_from_slice(pb);
+    push_str(&mut msg, &w.path);
     msg.extend_from_slice(&compressed);
     msg
 }
@@ -1079,10 +1067,8 @@ pub fn msg_fs_op(o: &FsOp) -> Vec<u8> {
     msg.push(o.flags);
     msg.extend_from_slice(&o.base.to_le_bytes());
     msg.extend_from_slice(&o.mode.to_le_bytes());
-    msg.extend_from_slice(&(ab.len() as u16).to_le_bytes());
-    msg.extend_from_slice(ab);
-    msg.extend_from_slice(&(bb.len() as u16).to_le_bytes());
-    msg.extend_from_slice(bb);
+    push_str(&mut msg, &o.a);
+    push_str(&mut msg, &o.b);
     msg
 }
 
@@ -1392,10 +1378,8 @@ pub fn msg_fs_grep(
     m.push(flags);
     m.extend_from_slice(&max_matches.to_le_bytes());
     m.extend_from_slice(&max_per_file.to_le_bytes());
-    m.extend_from_slice(&(rb.len() as u16).to_le_bytes());
-    m.extend_from_slice(rb);
-    m.extend_from_slice(&(qb.len() as u16).to_le_bytes());
-    m.extend_from_slice(qb);
+    push_str(&mut m, root);
+    push_str(&mut m, query);
     m
 }
 
@@ -1433,9 +1417,7 @@ pub fn append_fs_grep_record(buf: &mut Vec<u8>, record: &FsGrepRecord) {
             buf.push(FS_GREP_RECORD_FILE);
             buf.push(*flags);
             buf.extend_from_slice(&n.to_le_bytes());
-            let pb = path.as_bytes();
-            buf.extend_from_slice(&(pb.len() as u16).to_le_bytes());
-            buf.extend_from_slice(pb);
+            push_str(buf, path);
         }
         FsGrepRecord::Match {
             line,
@@ -1530,8 +1512,7 @@ pub fn msg_fs_grep_result(
     m.extend_from_slice(&nonce.to_le_bytes());
     m.push(status);
     m.push(flags);
-    m.extend_from_slice(&(db.len() as u16).to_le_bytes());
-    m.extend_from_slice(db);
+    push_str(&mut m, detail);
     m.extend_from_slice(&compressed);
     m
 }
@@ -1557,6 +1538,49 @@ pub fn parse_fs_grep_result(data: &[u8]) -> Option<(u16, u8, u8, String, Vec<u8>
 
 #[cfg(test)]
 mod tests {
+    /// A path longer than its `u16` prefix must be shortened, not wrapped.
+    /// Paths come off a real filesystem and no protocol rule bounds them; a
+    /// wrapped `len as u16` declares a length the reader believes and every
+    /// field after it in the message is read at the wrong offset.
+    #[test]
+    fn overlong_paths_are_clipped_not_wrapped() {
+        // [0x47][nonce:2][flags:1][root_len:2][root:N]
+        let long = "a".repeat(u16::MAX as usize + 1);
+        let m = msg_fs_index(1, &long);
+        let declared = u16::from_le_bytes([m[4], m[5]]) as usize;
+        assert_eq!(declared, u16::MAX as usize);
+        assert_eq!(m.len(), 6 + declared, "prefix must match the bytes");
+        let (nonce, _, root) = parse_fs_index(&m).expect("still parses");
+        assert_eq!(nonce, 1);
+        assert_eq!(root.len(), declared);
+    }
+
+    /// Clipping lands on a char boundary, so an oversized non-ASCII path
+    /// stays decodable as UTF-8 rather than arriving mangled.
+    #[test]
+    fn clipping_respects_char_boundaries() {
+        let wide = "é".repeat(u16::MAX as usize);
+        let m = msg_fs_index(1, &wide);
+        let declared = u16::from_le_bytes([m[4], m[5]]) as usize;
+        assert!(declared <= u16::MAX as usize);
+        assert_eq!(m.len(), 6 + declared);
+        std::str::from_utf8(&m[6..]).expect("clipped path is still UTF-8");
+    }
+
+    /// The `S2C_FS_SEARCH` count is a `u16`. More results than it can
+    /// describe must be dropped, not wrapped — a wrapped count leaves the
+    /// reader consuming the wrong number of entries and desyncing.
+    #[test]
+    fn search_result_count_saturates_instead_of_wrapping() {
+        let paths: Vec<String> = (0..=u16::MAX as usize + 1).map(|i| i.to_string()).collect();
+        let m = msg_fs_search_result(7, FS_STATUS_OK, &paths);
+        let declared = u16::from_le_bytes([m[4], m[5]]) as usize;
+        assert_eq!(declared, u16::MAX as usize);
+        let (nonce, status, out) = parse_fs_search_result(&m).expect("still parses");
+        assert_eq!((nonce, status), (7, FS_STATUS_OK));
+        assert_eq!(out.len(), declared, "emitted entries match the count");
+    }
+
     #[test]
     fn fs_grep_request_roundtrip() {
         // Pinned bytes; the TypeScript mirror asserts the same hex.

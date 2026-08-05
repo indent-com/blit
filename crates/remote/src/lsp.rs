@@ -289,11 +289,10 @@ fn decompress_guarded(data: &[u8]) -> Option<Vec<u8>> {
 // Field codec helpers
 // ---------------------------------------------------------------------------
 
-fn push_str(buf: &mut Vec<u8>, s: &str) {
-    let b = s.as_bytes();
-    buf.extend_from_slice(&(b.len() as u16).to_le_bytes());
-    buf.extend_from_slice(b);
-}
+// Symbol names, paths and completion labels come from a language server over
+// which no protocol rule holds, so `push_str` clips rather than wrapping the
+// prefix.
+use crate::push_str;
 
 /// A u32-length-prefixed byte string (diagnostic messages, markup, edit
 /// text).

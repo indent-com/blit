@@ -498,33 +498,9 @@ fn decompress_guarded(data: &[u8]) -> Option<Vec<u8>> {
 // Field codec helpers
 // ---------------------------------------------------------------------------
 
-/// Longest string this codec's `u16` length prefix can describe.
-const MAX_STR: usize = u16::MAX as usize;
-
-fn push_str(buf: &mut Vec<u8>, s: &str) {
-    // Clip rather than cast. Most fields here are names and paths of
-    // ordinary length, but a repository is an attacker-supplied input: a
-    // tree entry or ref name has no hard length cap, and the escaping these
-    // strings go through expands a non-UTF-8 byte roughly sixfold, so ~11 KB
-    // of raw bytes can pass 64 KiB. `len as u16` then wrote a wrapped length
-    // and every following field of the response was read at the wrong
-    // offset. A visibly shortened name costs one unhelpful row; a wrapped
-    // prefix costs the whole response.
-    let b = s.as_bytes();
-    let b = if b.len() > MAX_STR {
-        // Back off to a char boundary so the field stays valid UTF-8, which
-        // the decoder requires.
-        let mut end = MAX_STR;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        &b[..end]
-    } else {
-        b
-    };
-    buf.extend_from_slice(&(b.len() as u16).to_le_bytes());
-    buf.extend_from_slice(b);
-}
+// A repository is attacker-supplied input: a tree entry or ref name has no
+// hard length cap, so `push_str` clips rather than wrapping the prefix.
+use crate::push_str;
 
 /// A u32-length-prefixed byte string (patch row text, commit messages).
 fn push_bytes(buf: &mut Vec<u8>, b: &[u8]) {
@@ -3311,6 +3287,7 @@ impl GitStateMirror {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MAX_STR;
 
     /// A field longer than its `u16` prefix must be shortened, not wrapped.
     /// A repository is attacker-supplied: escaping expands a non-UTF-8 byte

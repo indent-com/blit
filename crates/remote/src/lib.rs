@@ -29,6 +29,37 @@ pub mod net;
 /// cannot force a giant allocation.
 pub const MAX_DECOMPRESSED: usize = 64 * 1024 * 1024;
 
+/// Longest string a `u16` length prefix can describe.
+pub(crate) const MAX_STR: usize = u16::MAX as usize;
+
+/// Write a `u16`-length-prefixed UTF-8 string, clipping rather than wrapping
+/// the prefix.
+///
+/// `len as u16` on an overlong string writes a length the reader believes, so
+/// every following field of the message is read at the wrong offset — one
+/// oversized value corrupts the whole response rather than just itself. The
+/// inputs are paths, ref names, symbol names and match text, none of which any
+/// protocol rule bounds, and the escaping some of them go through expands a
+/// non-UTF-8 byte roughly sixfold, so ~11 KB of raw bytes can pass 64 KiB. A
+/// visibly shortened value costs one unhelpful row; a wrapped prefix costs the
+/// whole message.
+pub(crate) fn push_str(buf: &mut Vec<u8>, s: &str) {
+    let b = s.as_bytes();
+    let b = if b.len() > MAX_STR {
+        // Back off to a char boundary so the field stays valid UTF-8, which
+        // the decoders require.
+        let mut end = MAX_STR;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &b[..end]
+    } else {
+        b
+    };
+    buf.extend_from_slice(&(b.len() as u16).to_le_bytes());
+    buf.extend_from_slice(b);
+}
+
 pub const CELL_SIZE: usize = 12;
 const TITLE_PRESENT: u16 = 1 << 15;
 const OPS_PRESENT: u16 = 1 << 14;
