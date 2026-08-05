@@ -376,6 +376,12 @@ impl MuxSession {
         }
 
         // Register a receiver for incoming data on this stream.
+        //
+        // Unbounded, and where the mux backlog actually lands: the demux task
+        // drains the channel duplex without blocking and forwards here, so a
+        // slow virtual stream accumulates at this queue rather than at
+        // `ChannelState::write_tx`. See the note there for why bounding
+        // either one in isolation does not help.
         let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         self.inner
             .reg_tx
@@ -901,6 +907,11 @@ async fn drive(
     // Separate channel for per-channel pump tasks to send app data back to
     // the drive loop, so we don't need to hold a cmd_tx clone (which would
     // prevent cmd_rx from ever returning None on Session drop).
+    //
+    // Unbounded on the egress side, for the mirror-image reason: the
+    // per-channel reader drains the app's duplex whether or not
+    // `pending_send` is parked on a congested uplink, so a slow peer grows
+    // this queue. Same fix, same reason it is not a local one.
     let (app_data_tx, mut app_data_rx) = mpsc::unbounded_channel::<(ChannelId, Vec<u8>)>();
 
     // Channels waiting for ChannelOpen confirmation.
@@ -917,6 +928,35 @@ async fn drive(
     struct ChannelState {
         abort: tokio::task::AbortHandle,
         /// Sender for data arriving from the remote (DataChannel → app half).
+        ///
+        /// Unbounded, and deliberately still unbounded — read this before
+        /// "fixing" it, because the obvious fixes are all wrong here.
+        ///
+        /// A slow app-side reader grows this without limit: the duplex it
+        /// feeds is 256 KiB, so past that `write_all` parks and the queue
+        /// takes the overflow at full wire rate.
+        ///
+        /// - Awaiting the send deadlocks the session. This arm runs inside
+        ///   the `poll_output` drain, which is also what transmits ICE
+        ///   checks, DTLS retransmits and SCTP SACKs, and what services
+        ///   every other channel. Blocking it stalls all of them; if the
+        ///   stalled reader's progress depends on this same loop — which it
+        ///   does for mux — it never resumes.
+        /// - Dropping corrupts the stream. Channels are reliable and ordered
+        ///   and the payload is length-prefixed, so a lost frame desynchronises
+        ///   the framing permanently, and for mux it takes every virtual
+        ///   stream with it, not just the slow one.
+        /// - Bounding *this* queue does not bound the mux path anyway. The
+        ///   demux task never blocks; it forwards into the per-stream
+        ///   `data_tx` below, so the backlog just moves there.
+        ///
+        /// str0m 0.19 exposes no receive backpressure — `buffered_amount`
+        /// and `set_buffered_amount_low_threshold` are send-side only, and
+        /// while sctp-proto does implement a receive window keyed on unread
+        /// bytes, str0m drains every readable stream on each poll so it never
+        /// engages. The real fix is credit-based flow control on the mux
+        /// control stream, the same shape already used in net.md and kv.md,
+        /// which stops the producer instead of buffering the consumer.
         write_tx: mpsc::UnboundedSender<Vec<u8>>,
     }
     let mut channel_tasks: std::collections::HashMap<ChannelId, ChannelState> =
