@@ -5639,12 +5639,48 @@ struct FetchGateInner {
     queue: std::collections::VecDeque<QueuedFetch>,
 }
 
+/// Read a `usize` budget from the environment once.
+///
+/// These sit on per-message paths, so the read is cached; a value set after
+/// the first request is ignored.
+fn env_budget(name: &'static str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 /// `FS_FETCH`es dispatched to engines concurrently, per connection.
-const FS_FETCH_INFLIGHT: usize = 8;
+///
+/// Each can read and compress a file up to the decompression ceiling, so
+/// this bounds real memory rather than just concurrency — left where it was.
+fn fs_fetch_inflight() -> usize {
+    static V: std::sync::LazyLock<usize> =
+        std::sync::LazyLock::new(|| env_budget("BLIT_FS_FETCH_INFLIGHT", 8));
+    *V
+}
+
 /// Fetches parked behind the in-flight cap; past this the request answers
 /// `FS_FILE_OTHER` — the family's catch-all — rather than buffering
 /// unboundedly.
-const FS_FETCH_QUEUE_MAX: usize = 256;
+fn fs_fetch_queue_max() -> usize {
+    static V: std::sync::LazyLock<usize> =
+        std::sync::LazyLock::new(|| env_budget("BLIT_FS_FETCH_QUEUE", 256));
+    *V
+}
+
+/// Concurrent `FS_INDEX` / `FS_GREP` / `FS_SEARCH` walks, per connection.
+///
+/// Was a bare `2` at three call sites. Two concurrent greps is below what a
+/// single IDE session asks for — the client carries retry-on-BUDGET code
+/// specifically to absorb it — and a walk is a thread whose cost is already
+/// bounded by the per-walk file, byte and entry budgets. Raising this spends
+/// threads, not unbounded memory.
+fn fs_walk_inflight() -> usize {
+    static V: std::sync::LazyLock<usize> =
+        std::sync::LazyLock::new(|| env_budget("BLIT_FS_WALK_INFLIGHT", 8));
+    *V
+}
 
 /// Release one fetch slot and dispatch queued fetches while slots remain.
 /// A queued fetch whose sync died answers `FS_FILE_OTHER` here, keeping
@@ -5652,7 +5688,7 @@ const FS_FETCH_QUEUE_MAX: usize = 256;
 fn fetch_finish(gate: &std::sync::Arc<FetchGate>, out: &mpsc::UnboundedSender<Vec<u8>>) {
     let mut inner = gate.inner.lock().unwrap();
     inner.inflight = inner.inflight.saturating_sub(1);
-    while inner.inflight < FS_FETCH_INFLIGHT {
+    while inner.inflight < fs_fetch_inflight() {
         let Some(q) = inner.queue.pop_front() else {
             break;
         };
@@ -5762,7 +5798,7 @@ impl FsSyncs {
         if set.contains(&nonce) {
             return Err(FS_DONE_INVALID);
         }
-        if set.len() >= 2 {
+        if set.len() >= fs_walk_inflight() {
             return Err(FS_DONE_BUDGET);
         }
         set.insert(nonce);
@@ -5780,7 +5816,7 @@ impl FsSyncs {
         if set.contains(&nonce) {
             return Err(FS_DONE_INVALID);
         }
-        if set.len() >= 2 {
+        if set.len() >= fs_walk_inflight() {
             return Err(FS_DONE_BUDGET);
         }
         set.insert(nonce);
@@ -5796,7 +5832,7 @@ impl FsSyncs {
     /// cap answer `Err` and the caller maps it to `RESOURCE_LIMIT`.
     fn reserve_search(&self, nonce: u16) -> Option<std::sync::Arc<blit_fssync::InflightGuard>> {
         let mut set = self.inflight_searches.lock().unwrap();
-        if set.contains(&nonce) || set.len() >= 2 {
+        if set.contains(&nonce) || set.len() >= fs_walk_inflight() {
             return None;
         }
         set.insert(nonce);
@@ -6662,7 +6698,7 @@ async fn handle_fs_message(
                     // in the sync sink), and a queued fetch whose sync died
                     // is answered there, keeping one reply per nonce.
                     let mut gate = syncs.fetches.inner.lock().unwrap();
-                    if gate.inflight < FS_FETCH_INFLIGHT {
+                    if gate.inflight < fs_fetch_inflight() {
                         gate.inflight += 1;
                         drop(gate);
                         // A false return means the engine already exited on
@@ -6677,7 +6713,7 @@ async fn handle_fs_message(
                             let _ = out.send(msg_fs_file(nonce, FS_FILE_OTHER, &[]));
                             fetch_finish(&syncs.fetches, out);
                         }
-                    } else if gate.queue.len() >= FS_FETCH_QUEUE_MAX {
+                    } else if gate.queue.len() >= fs_fetch_queue_max() {
                         drop(gate);
                         let _ = out.send(msg_fs_file(nonce, FS_FILE_OTHER, &[]));
                     } else {
@@ -10797,7 +10833,7 @@ mod tests {
         assert_eq!(msg[5], FS_STATUS_OK);
         let sync_id = u16::from_le_bytes([msg[3], msg[4]]);
 
-        let burst = (FS_FETCH_INFLIGHT + 5) as u16;
+        let burst = (fs_fetch_inflight() + 5) as u16;
         for nonce in 0..burst {
             handle_fs_message(
                 &msg_fs_fetch(nonce, sync_id, "a.txt"),
@@ -10840,10 +10876,17 @@ mod tests {
         let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let mut syncs = FsSyncs::default();
 
-        // Two slots; a third reservation — or a duplicate nonce — refuses.
-        let g1 = syncs.reserve_search(1).unwrap();
-        let g2 = syncs.reserve_search(2).unwrap();
-        assert!(syncs.reserve_search(3).is_none());
+        // Fill every slot; one more — or a duplicate nonce — refuses.
+        // Driven off the knob so raising the default does not rewrite this.
+        let cap = fs_walk_inflight();
+        let guards: Vec<_> = (0..cap)
+            .map(|i| {
+                syncs
+                    .reserve_search(i as u16 + 1)
+                    .expect("slot below the cap")
+            })
+            .collect();
+        assert!(syncs.reserve_search(cap as u16 + 1).is_none());
         assert!(syncs.reserve_search(1).is_none());
 
         // At the cap the request answers RESOURCE_LIMIT without walking.
@@ -10855,8 +10898,7 @@ mod tests {
         );
 
         // Dropping the guards frees the slots and the search runs.
-        drop(g1);
-        drop(g2);
+        drop(guards);
         handle_fs_message(&msg_fs_search(9, 10, &root, "alp"), &mut syncs, &out, false).await;
         let (nonce, status, paths) = parse_fs_search_result(&recv_blocking(&mut rx)).unwrap();
         assert_eq!((nonce, status), (9, FS_STATUS_OK));
