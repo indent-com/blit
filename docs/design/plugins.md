@@ -262,20 +262,16 @@ rather than returning an error code.
 
 `recv` operates on the next complete server packet:
 
-- a positive result is the packet length copied into `[ptr, ptr + capacity)`;
-- zero means the logical endpoint closed;
-- a negative result `-N` means the next packet needs `N` bytes and remains at
-  the head of the mailbox;
-- when no packet is available, `recv` parks the dedicated plugin thread; after
-  a packet arrives or cancellation wins, that same thread copies into guest
-  memory and returns from the host call.
+- zero means the logical endpoint is closed;
+- a positive result `N <= capacity` means an `N`-byte packet was copied and
+  removed from the mailbox;
+- a positive result `N > capacity` means the packet needs `N` bytes; nothing was
+  copied and the packet remains queued.
 
-`recv` has no negative ABI-error values: every negative return is exclusively
-the required packet length, from `-1` through `-(16 MiB)`. A negative capacity,
-integer overflow, or an out-of-bounds destination traps the attempt. Once the
-endpoint closes, repeated valid `recv` calls return zero. The 16 MiB blit
-logical-message cap keeps the required length within `i32`; the SDK normally
-maintains a reusable buffer, so the resize case is rare.
+When no packet is available, `recv` parks the dedicated plugin thread. A
+negative capacity, integer overflow, or an invalid destination range traps the
+attempt. The SDK keeps a reusable buffer and retries with `N` bytes only when
+needed. `recv` never returns a negative value.
 
 `send` may also block when the endpoint's inbound byte window is full.
 This preserves ordering and backpressure without busy polling.
