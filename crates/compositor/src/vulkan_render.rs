@@ -2816,9 +2816,14 @@ impl VulkanRenderer {
                 .ok()?
         };
 
-        let staging_size = (w * h * 4) as usize;
+        // Widen before multiplying: `w` and `h` are u32 and the product
+        // wraps past 2^30 pixels. 32768x32768 lands on exactly 2^32, which
+        // truncates to a zero-sized buffer while the copy below is still
+        // issued with the full extent. `create_downscale_output` gets this
+        // right; this path did not.
+        let staging_size = u64::from(w) * u64::from(h) * 4;
         let buf_info = vk::BufferCreateInfo::default()
-            .size(staging_size as u64)
+            .size(staging_size)
             .usage(vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let staging_buf = unsafe {
@@ -3837,7 +3842,11 @@ impl VulkanRenderer {
                     pending.phys_w, pending.phys_h, img.width, img.height,
                 );
             } else {
-                let size = (pending.phys_w * pending.phys_h * 4) as usize;
+                // Widen before multiplying, matching the allocation in
+                // `create_output_image`. Both used to wrap the same way, so
+                // the read stayed in bounds by coincidence rather than by
+                // construction.
+                let size = pending.phys_w as usize * pending.phys_h as usize * 4;
                 let bgra = unsafe { std::slice::from_raw_parts(img.staging_ptr, size) }.to_vec();
                 results.push((
                     pending.phys_w,
