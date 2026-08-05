@@ -158,6 +158,11 @@ pub(crate) struct VulkanVideoEncoder {
     idr_num: u32,
     force_idr: bool,
     qp: u8,
+    /// Set when a fence wait timed out. The submission owning that fence is
+    /// still running somewhere on the GPU and may still write to
+    /// `bitstream_buffer`, so this encoder can never be used again — see
+    /// [`encode_fence_timeout_ns`].
+    poisoned: bool,
 }
 
 unsafe impl Send for VulkanVideoEncoder {}
@@ -167,6 +172,31 @@ const BITSTREAM_CAPACITY: u64 = 2 * 1024 * 1024;
 
 /// Largest H.264 quantization parameter the spec defines for 8-bit luma.
 const H264_MAX_QP: u8 = 51;
+
+/// How long to wait for an encode submission to complete before giving up.
+///
+/// This wait used to be `u64::MAX`, on the compositor thread: a driver or GPU
+/// that never signalled the fence wedged the whole compositor, and every
+/// surface with it, permanently and with no diagnostic.
+///
+/// Ten seconds is far beyond any real encode — the server's own encode
+/// timeout is 5s — so reaching it means the device is not coming back.
+/// `BLIT_ENCODE_FENCE_TIMEOUT_MS` overrides it; `0` restores the old
+/// wait-forever behaviour for anyone debugging a driver.
+fn encode_fence_timeout_ns() -> u64 {
+    static V: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        let ms = std::env::var("BLIT_ENCODE_FENCE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10_000);
+        if ms == 0 {
+            u64::MAX
+        } else {
+            ms.saturating_mul(1_000_000)
+        }
+    });
+    *V
+}
 
 impl VulkanVideoEncoder {
     /// Create a Vulkan Video H.264 encoder.
@@ -451,6 +481,7 @@ impl VulkanVideoEncoder {
             idr_num: 0,
             force_idr: false,
             qp,
+            poisoned: false,
         })
     }
 
@@ -503,6 +534,13 @@ impl VulkanVideoEncoder {
         nv12_image_view: vk::ImageView,
         force_keyframe: bool,
     ) -> Option<(Vec<u8>, bool)> {
+        // A previous submission never completed and still owns the bitstream
+        // buffer. Refuse immediately rather than submit alongside it; the
+        // server drops an encoder that returns nothing repeatedly and builds
+        // a fresh one, which is the only way out of this state.
+        if self.poisoned {
+            return None;
+        }
         match self.codec {
             VulkanVideoCodec::H264 => unsafe {
                 self.encode_h264(
@@ -799,8 +837,20 @@ impl VulkanVideoEncoder {
             return None;
         }
 
-        // Wait for completion.
-        let _ = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
+        // Wait for completion. A timeout means the submission is still live
+        // on the device, so the fence, the command buffer and the bitstream
+        // buffer it writes into are all still in use: freeing or reading any
+        // of them here would be a use-after-free the validation layers cannot
+        // save us from. Leak them and poison the encoder instead — one fence
+        // and one command buffer, once, against wedging the compositor.
+        if unsafe { device.wait_for_fences(&[fence], true, encode_fence_timeout_ns()) }.is_err() {
+            eprintln!(
+                "[vulkan-encode] fence wait timed out after {} ms; abandoning encoder",
+                encode_fence_timeout_ns() / 1_000_000
+            );
+            self.poisoned = true;
+            return None;
+        }
         unsafe { device.destroy_fence(fence, None) };
 
         // Read query result (encoded size).
@@ -1190,6 +1240,7 @@ impl VulkanVideoEncoder {
             idr_num: 0,
             force_idr: false,
             qp,
+            poisoned: false,
         })
     }
 
@@ -1588,8 +1639,20 @@ impl VulkanVideoEncoder {
             return None;
         }
 
-        // Wait for completion.
-        let _ = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
+        // Wait for completion. A timeout means the submission is still live
+        // on the device, so the fence, the command buffer and the bitstream
+        // buffer it writes into are all still in use: freeing or reading any
+        // of them here would be a use-after-free the validation layers cannot
+        // save us from. Leak them and poison the encoder instead — one fence
+        // and one command buffer, once, against wedging the compositor.
+        if unsafe { device.wait_for_fences(&[fence], true, encode_fence_timeout_ns()) }.is_err() {
+            eprintln!(
+                "[vulkan-encode] fence wait timed out after {} ms; abandoning encoder",
+                encode_fence_timeout_ns() / 1_000_000
+            );
+            self.poisoned = true;
+            return None;
+        }
         unsafe { device.destroy_fence(fence, None) };
 
         // Read query result.
