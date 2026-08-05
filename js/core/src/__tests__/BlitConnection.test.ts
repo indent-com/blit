@@ -31,7 +31,11 @@ import {
   FEATURE_CREATE_NONCE,
   FEATURE_RESIZE_BATCH,
   FEATURE_RESTART,
+  FRAGMENT_FLAG_LAST,
+  S2C_FRAGMENT,
+  S2C_PING,
 } from "../types";
+import { FS_MAX_DECOMPRESSED } from "../fs";
 
 class FakeTerminal {
   constructor(_r: number, _c: number, _pw: number, _ph: number) {}
@@ -1043,5 +1047,47 @@ describe("BlitConnection git", () => {
       conn.openRepo("", { watch: true, fromSessionId: "test:404" }),
     ).rejects.toThrow(/source terminal/i);
     expect(transport.sent.slice(before)).toHaveLength(0);
+  });
+});
+
+describe("BlitConnection fragment reassembly", () => {
+  const fragment = (last: boolean, payload: Uint8Array) => {
+    const m = new Uint8Array(2 + payload.length);
+    m[0] = S2C_FRAGMENT;
+    m[1] = last ? FRAGMENT_FLAG_LAST : 0;
+    m.set(payload, 2);
+    return m;
+  };
+
+  it("reassembles a fragmented message and clears the buffer", () => {
+    const { conn, transport } = createConnection();
+    transport.push(fragment(false, new Uint8Array([S2C_PING])));
+    expect((conn as unknown as { fragmentBytes: number }).fragmentBytes).toBe(
+      1,
+    );
+    transport.push(fragment(true, new Uint8Array([0x00])));
+    expect((conn as unknown as { fragmentBytes: number }).fragmentBytes).toBe(
+      0,
+    );
+  });
+
+  // Without a ceiling, a peer that never sets FRAGMENT_FLAG_LAST grows the
+  // buffer until the tab dies — and each chunk is a subarray pinning the
+  // whole frame it arrived in, so the retained bytes are worse than the
+  // payload alone. The Rust reader has always refused past this same bound.
+  it("drops an unterminated fragment stream at the decompression ceiling", () => {
+    const { conn, transport } = createConnection();
+    const bytes = () =>
+      (conn as unknown as { fragmentBytes: number }).fragmentBytes;
+
+    const chunk = new Uint8Array(8 * 1024 * 1024);
+    const parts = FS_MAX_DECOMPRESSED / chunk.length;
+    for (let i = 0; i < parts; i++) transport.push(fragment(false, chunk));
+    expect(bytes()).toBe(FS_MAX_DECOMPRESSED);
+
+    // One byte more than the ceiling can hold: drop the partial rather than
+    // keep growing.
+    transport.push(fragment(false, new Uint8Array([0x00])));
+    expect(bytes()).toBe(0);
   });
 });
