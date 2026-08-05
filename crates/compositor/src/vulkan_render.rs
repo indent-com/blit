@@ -13,6 +13,7 @@
 #![allow(non_upper_case_globals, clippy::too_many_arguments)]
 
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
@@ -27,8 +28,10 @@ use super::render::{GpuLayer, SurfaceMeta, collect_gpu_layers, to_physical};
 // ===================================================================
 
 pub(crate) struct VulkanRenderer {
+    /// Held only to keep libvulkan loaded, and deliberately never dropped --
+    /// dropping it would `dlclose()` the library.  See the `Drop` impl.
     #[expect(dead_code)]
-    entry: ash::Entry,
+    entry: ManuallyDrop<ash::Entry>,
     instance: ash::Instance,
     device: ash::Device,
     physical_device: vk::PhysicalDevice,
@@ -863,7 +866,7 @@ impl VulkanRenderer {
         };
 
         Some(Self {
-            entry,
+            entry: ManuallyDrop::new(entry),
             instance,
             device,
             physical_device,
@@ -5034,7 +5037,23 @@ impl Drop for VulkanRenderer {
             self.device.destroy_sampler(self.sampler, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
+            // Everything above frees GPU resources and is safe at any time.
+            //
+            // `destroy_instance` is not, and is deliberately skipped: the
+            // loader `dlclose()`s its layer and ICD libraries inside it, and
+            // those libraries have registered thread-local destructors on
+            // every thread that touched them.  Unmapping them leaves those
+            // destructors dangling, so the next thread to exit -- or the main
+            // thread reaching `__call_tls_dtors` on its way into `exit()` --
+            // jumps into freed memory and dies with a SIGSEGV whose stack has
+            // no frames to read.  `entry` is `ManuallyDrop` for the same
+            // reason: dropping it would `dlclose()` libvulkan itself.
+            //
+            // The cost is one leaked VkInstance per renderer, which the
+            // kernel reclaims at process exit.  There is no hook that would
+            // let us do this only when it is safe -- TLS destructors run
+            // before `atexit` handlers, so by the time any guard of ours
+            // could fire, the damage is done.
         }
     }
 }

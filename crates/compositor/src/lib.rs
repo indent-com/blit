@@ -315,17 +315,23 @@ mod stub {
         pub event_rx: mpsc::Receiver<CompositorEvent>,
         pub command_tx: mpsc::Sender<CompositorCommand>,
         pub socket_name: String,
-        pub thread: std::thread::JoinHandle<()>,
-        pub shutdown: Arc<AtomicBool>,
         /// Whether the compositor's Vulkan renderer supports Vulkan Video encode.
         pub vulkan_video_encode: bool,
         /// Whether the compositor's Vulkan renderer supports Vulkan Video AV1 encode.
         pub vulkan_video_encode_av1: bool,
+        thread: std::thread::JoinHandle<()>,
+        #[allow(dead_code)]
+        shutdown: Arc<AtomicBool>,
     }
 
     impl CompositorHandle {
         /// Wake the compositor event loop immediately.
         pub fn wake(&self) {}
+
+        /// Stop the compositor and wait for it to finish tearing down.
+        pub fn stop(self) {
+            let _ = self.thread.join();
+        }
     }
 
     pub fn spawn_compositor(
