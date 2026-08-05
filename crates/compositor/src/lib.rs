@@ -193,8 +193,12 @@ mod stub {
         },
         PointerAxis {
             surface_id: u16,
-            axis: u8,
-            value: f64,
+            dx: f64,
+            dy: f64,
+            v120_x: i16,
+            v120_y: i16,
+            source: Option<u8>,
+            stop: bool,
         },
         SurfaceResize {
             surface_id: u16,

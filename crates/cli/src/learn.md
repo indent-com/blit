@@ -292,8 +292,8 @@ blit surface key 1 Return                           # key press
 blit surface key 1 ctrl+shift+c                     # modifier combo
 blit surface type 1 "hello{Return}"                 # type text ({braces} for special keys)
 blit surface text 1 "café — naïve"                  # commit literal UTF-8 (non-ASCII works)
-blit surface scroll 1 3                             # scroll down 3 wheel units
-blit surface scroll 1 -2 --horizontal               # scroll left
+blit surface scroll 1 3                             # scroll down 3 wheel notches
+blit surface scroll 1 -2 --horizontal               # scroll left 2 notches
 blit surface focus 1                                # give it keyboard/pointer focus
 blit surface record 1 --output video.h264           # record until Ctrl+C
 blit surface record 1 --duration 10 --output v.h264 # record 10 seconds
