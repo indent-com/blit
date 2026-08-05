@@ -401,19 +401,28 @@ Two rules follow, and both matter:
   shipped parser stops at `detail`, so an old client reads the message
   unchanged.
 
-Its aggregate is **16 MiB, not the 4 MiB above**, and the asymmetry is
+Its aggregate is **~40 MiB, not the 4 MiB above**, and the asymmetry is
 forced rather than chosen. Outbound, the server produces and can park a
 reader until credit frees, so 4 MiB holds and a stream merely waits.
 Inbound the _client_ produces, and refusal is the only lever available on
-the dispatch loop — so the ceiling has to be one a compliant client stays
-under. A stream cannot make progress holding less than one maximum chunk,
-and `NET_MAX_SOCKETS` × `NET_MAX_CHUNK` is 16 MiB. That covers every
-window this server grants up to **64 concurrent streams** on one
-connection; past that the grants sum past the aggregate, so a client that
-honors every window it was told can still be closed. That is the one case
-the reported window does not yet promise, and the fix is for the grant to
-account for what is already outstanding rather than for this figure to
-grow.
+the dispatch loop — so the ceiling cannot be a figure a compliant client
+can reach. Now that the windows are reported, "compliant" is exact: a live
+set of _m_ streams holds at most `per_stream_window(1) + … +
+per_stream_window(m)`, because the _j_-th oldest of them had every earlier
+one open when it opened. At `NET_MAX_SOCKETS` that sum is 39.9 MiB, so
+that is the aggregate, derived from the grant formula rather than written
+down beside it. Closing a stream that stayed inside the window it was
+handed would make the report a lie, and 16 MiB (one chunk per socket) did
+exactly that above 64 concurrent streams, since the per-stream floor is
+two chunks and not one.
+
+It is a ceiling on bytes a client has sent that its target has not yet
+taken, so reaching it needs 256 stalled targets on one connection at once;
+anything that drains keeps the figure near zero. The alternative —
+charging each grant against a smaller budget and refusing an open that
+cannot be afforded a floor — bounds memory lower, but caps usable streams
+well below `NET_MAX_SOCKETS` and reserves for idle streams holding
+nothing.
 
 The window is not what bounds server memory, because a client may
 honestly ack every byte the instant it arrives and still not drain its
@@ -590,7 +599,9 @@ be able to open sockets from the host instead.
 - **256 concurrent sockets** per blit connection, streams and flows
   together; further opens get `BUDGET`. Per-stream buffering is bounded
   by the window and per-flow buffering by the queue, so the socket cap
-  bounds total relay memory.
+  bounds total relay memory — 40 MiB inbound in the worst case
+  ([§ Pacing](#pacing)), which needs every one of those sockets stalled
+  at its target at the same time.
 - **10 s connect timeout, 10 s TLS handshake timeout.** Both are
   failures with a status, not hangs. A UDP open has neither — there is
   nothing to wait for.
@@ -606,8 +617,9 @@ be able to open sockets from the host instead.
   slower way to lose datagrams, a constant nobody can pick correctly for
   both DNS and a packet capture, and — since this relay cannot reflect
   (§ Target policy) — no security the allowlist does not already give.
-- **Pre-handshake pipelined data** is capped at the initial window and
-  discarded on a failed open.
+- **Pre-handshake pipelined data** is capped at the initial window —
+  `NET_WINDOW_MIN`, since the accept that reports the real one has not
+  arrived — and discarded on a failed open.
 
 TLS uses the versions already pinned in-tree — `rustls` 0.23 with
 `ring`, `tokio-rustls` 0.26, `rustls-native-certs` 0.8 (see `cli`,
