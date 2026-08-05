@@ -12,7 +12,7 @@ pub const C2S_NET_CLOSE: u8 = 0x83;
 /// One datagram, UDP only: [0x84][stream_id:2][payload:N]
 pub const C2S_NET_DGRAM: u8 = 0x84;
 
-/// Open result, one per `NET_OPEN`: [0x80][stream_id:2][status:1][alpn_len:1][alpn:N][detail_len:2][detail:N]
+/// Open result, one per `NET_OPEN`: [0x80][stream_id:2][status:1][alpn_len:1][alpn:N][detail_len:2][detail:N] + optional [window:8] The window tail is present on an accepted TCP stream and reports the client's send window for it ([`parse_net_opened_window`]); a server that predates it sends nothing there.
 pub const S2C_NET_OPENED: u8 = 0x80;
 /// Stream payload, TCP only: [0x81][stream_id:2][data:N]
 pub const S2C_NET_DATA: u8 = 0x81;
@@ -110,8 +110,12 @@ pub const NET_MAX_HOST: usize = 255;
 pub const NET_MAX_CHUNK: usize = 64 * 1024;
 /// Maximum UDP payload — UDP's own limit, which fits inside [`NET_MAX_CHUNK`].
 pub const NET_MAX_DGRAM: usize = 65507;
-/// Default per-stream unacked-byte window.
+/// Largest per-stream unacked-byte window, and the one a stream gets when it is the only one open.
 pub const NET_WINDOW_BYTES: u64 = 1024 * 1024;
+/// Smallest per-stream unacked-byte window the server ever grants: one chunk in flight while another is being written.
+///
+/// A client that has not been told its window ([`parse_net_opened_window`]) can send this much without ever overrunning, whatever the concurrency.
+pub const NET_WINDOW_MIN: u64 = 2 * NET_MAX_CHUNK as u64;
 /// Default aggregate unacked-byte window across all of a connection's streams, so N streams cannot each claim a full window.
 pub const NET_WINDOW_AGGREGATE: u64 = 4 * 1024 * 1024;
 /// Maximum concurrent sockets per blit connection, streams and flows together.
@@ -383,8 +387,29 @@ pub fn msg_net_opened(stream_id: u16, status: u8, alpn: &str, detail: &str) -> V
     msg
 }
 
-/// Parse an `S2C_NET_OPENED` → `(stream_id, status, alpn, detail)`.
+/// An accepted TCP stream, reporting the send window granted to it.
+///
+/// The window is a share of the connection's aggregate, so it depends on how many sockets were open when this one opened and the client cannot compute it. Sending it is what makes the window a contract rather than a guess: a client that stays inside it is never closed for `BUDGET`.
+pub fn msg_net_opened_tcp(stream_id: u16, alpn: &str, window: u64) -> Vec<u8> {
+    let mut msg = msg_net_opened(stream_id, NET_STATUS_OK, alpn, "");
+    msg.extend_from_slice(&window.to_le_bytes());
+    msg
+}
+
+/// Parse an `S2C_NET_OPENED` → `(stream_id, status, alpn, detail)`. Any window tail is skipped; read it with [`parse_net_opened_window`].
 pub fn parse_net_opened(msg: &[u8]) -> Option<(u16, u8, String, String)> {
+    let (stream_id, status, alpn, detail, _) = parse_opened(msg)?;
+    Some((stream_id, status, alpn, detail))
+}
+
+/// The window an `S2C_NET_OPENED` granted, or `None` from a server that does not report one.
+pub fn parse_net_opened_window(msg: &[u8]) -> Option<u64> {
+    let (_, _, _, _, tail) = parse_opened(msg)?;
+    Some(u64::from_le_bytes(tail.get(..8)?.try_into().unwrap()))
+}
+
+/// Everything an `S2C_NET_OPENED` carries, plus whatever follows the fields this version knows.
+fn parse_opened(msg: &[u8]) -> Option<(u16, u8, String, String, &[u8])> {
     if msg.len() < 7 || msg[0] != S2C_NET_OPENED {
         return None;
     }
@@ -402,7 +427,7 @@ pub fn parse_net_opened(msg: &[u8]) -> Option<(u16, u8, String, String)> {
     let detail = std::str::from_utf8(rest.get(2..2 + detail_len)?)
         .ok()?
         .to_string();
-    Some((stream_id, status, alpn, detail))
+    Some((stream_id, status, alpn, detail, &rest[2 + detail_len..]))
 }
 
 pub fn msg_net_closed(stream_id: u16, reason: u8, detail: &str) -> Vec<u8> {
@@ -617,6 +642,31 @@ mod tests {
                 "unknown issuer".to_string()
             )
         );
+    }
+
+    #[test]
+    fn opened_window_roundtrip() {
+        let msg = msg_net_opened_tcp(8, "h2", 174_762);
+        assert_eq!(parse_net_opened_window(&msg), Some(174_762));
+        // The tail is additive: a client that only knows the four fields reads the same message unchanged.
+        assert_eq!(
+            parse_net_opened(&msg).unwrap(),
+            (8, NET_STATUS_OK, "h2".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn a_window_is_absent_rather_than_guessed() {
+        // A server that predates the tail, and a message whose tail did not survive: both mean "not reported", never a made-up figure.
+        assert_eq!(
+            parse_net_opened_window(&msg_net_opened(8, NET_STATUS_OK, "h2", "")),
+            None
+        );
+        let msg = msg_net_opened_tcp(8, "", NET_WINDOW_BYTES);
+        for cut in 0..8 {
+            assert_eq!(parse_net_opened_window(&msg[..msg.len() - 8 + cut]), None);
+        }
+        assert_eq!(parse_net_opened_window(&msg), Some(NET_WINDOW_BYTES));
     }
 
     #[test]

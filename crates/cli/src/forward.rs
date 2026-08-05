@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::relay::{self, Conn, DEFAULT_BIND, Event, OnOpen, Window, bracket};
+use crate::relay::{self, Conn, DEFAULT_BIND, Event, OnOpen, Unreported, bracket};
 use crate::transport::Transport;
 use blit_remote::net::{
     NET_MAX_DGRAM, NET_STATUS_OK, NetOpen, msg_net_dgram_c2s, msg_net_open, net_closed_text,
@@ -264,9 +264,10 @@ async fn relay_tcp(
         local,
         conn,
         open,
-        // A handful of static forwards stay well inside the share the server hands
-        // out; `blit socks`, whose socket count is its client's business, does not.
-        Window::Full,
+        // Only reached against a server too old to report a window: a handful of
+        // static forwards sit inside the ceiling, and pinning them to the floor
+        // for that case would cost throughput on every byte.
+        Unreported::Ceiling,
         OnOpen::Report {
             announce_alpn: (spec.kind == Kind::Tls).then_some(announced),
         },

@@ -15,9 +15,9 @@ use blit_remote::net::{
     NET_CLOSED_BUDGET, NET_CLOSED_EOF, NET_CLOSED_RESET, NET_CLOSED_TIMEOUT, NET_DGRAM_QUEUE,
     NET_MAX_CHUNK, NET_MAX_DGRAM, NET_MAX_SOCKETS, NET_STATUS_BUDGET, NET_STATUS_INVALID,
     NET_STATUS_NOT_FOUND, NET_STATUS_OK, NET_STATUS_PERMISSION, NET_STATUS_REFUSED, NET_STATUS_TLS,
-    NET_WINDOW_AGGREGATE, NET_WINDOW_BYTES, NetOpen, msg_net_ack_s2c, msg_net_closed,
-    msg_net_data_s2c, msg_net_dgram_s2c, msg_net_opened, parse_net_ack_c2s, parse_net_close,
-    parse_net_data_c2s, parse_net_dgram_c2s, parse_net_open,
+    NET_WINDOW_AGGREGATE, NET_WINDOW_BYTES, NET_WINDOW_MIN, NetOpen, msg_net_ack_s2c,
+    msg_net_closed, msg_net_data_s2c, msg_net_dgram_s2c, msg_net_opened, msg_net_opened_tcp,
+    parse_net_ack_c2s, parse_net_close, parse_net_data_c2s, parse_net_dgram_c2s, parse_net_open,
 };
 
 /// Connect and TLS-handshake timeout.
@@ -950,11 +950,10 @@ async fn run_tcp(open: NetOpen, ctx: StreamCtx, policy: Policy, tcp: TcpCtx) {
         )
     };
 
-    emit(
-        &out,
-        &counters,
-        msg_net_opened(id, NET_STATUS_OK, &alpn, ""),
-    );
+    // The window rides the accept: the client is pipelining data behind its
+    // open already, and until this arrives it can only assume the smallest
+    // share the server ever grants (docs/design/net.md § Pacing).
+    emit(&out, &counters, msg_net_opened_tcp(id, &alpn, window));
     if verbose {
         let how = if open.is_tls() {
             if alpn.is_empty() {
@@ -1381,11 +1380,17 @@ impl InboundWindow {
 /// 4 MiB because the server produces there and can park a reader until credit
 /// frees; here the client produces, and the only lever on the dispatch loop is
 /// refusal — waiting would stall every other stream and the terminal with
-/// them. A stream must be able to hold at least one maximum chunk or it cannot
-/// make progress at all, and `NET_MAX_SOCKETS` of those is this figure, so any
-/// smaller aggregate would close the streams of a client that honored every
-/// per-stream window it was given. Bounded and stated (docs/design/net.md
-/// § Pacing) beats a number that reads tidier and cannot hold.
+/// them. So the ceiling has to be one a compliant client stays under: a stream
+/// cannot make progress holding less than one maximum chunk, and
+/// `NET_MAX_SOCKETS` of those is this figure.
+///
+/// It covers every window this server grants (`per_stream_window`) up to 64
+/// concurrent streams on one connection. Past that the grants can sum past it,
+/// so a client that honors every window it was told can still be closed —
+/// closing that gap wants the grant to account for what is already
+/// outstanding, not a bigger figure here.
+/// Bounded and stated (docs/design/net.md § Pacing) beats a number that reads
+/// tidier and cannot hold.
 const INBOUND_AGGREGATE_BYTES: u64 = NET_MAX_SOCKETS as u64 * NET_MAX_CHUNK as u64;
 
 /// One stream's share of its connection's outstanding-bytes total.
@@ -1434,10 +1439,10 @@ impl Drop for CreditCharge {
     }
 }
 
-/// Per-stream credit, allocated from the aggregate so N streams cannot each claim a full window.
+/// Per-stream credit, allocated from the aggregate so N streams cannot each claim a full window. Reported to the client on the accept, since only the server knows how many sockets were open at this one's open time.
 fn per_stream_window(open_sockets: usize) -> u64 {
     let share = NET_WINDOW_AGGREGATE / (open_sockets.max(1) as u64);
-    share.clamp(NET_MAX_CHUNK as u64 * 2, NET_WINDOW_BYTES)
+    share.clamp(NET_WINDOW_MIN, NET_WINDOW_BYTES)
 }
 
 fn udp_idle_timeout() -> Duration {
@@ -2143,6 +2148,57 @@ mod tests {
         assert_eq!(per_stream_window(1), NET_WINDOW_BYTES);
         assert!(per_stream_window(64) < NET_WINDOW_BYTES);
         // Never below two chunks, or a stream could not make progress.
-        assert!(per_stream_window(10_000) >= NET_MAX_CHUNK as u64 * 2);
+        assert!(per_stream_window(10_000) >= NET_WINDOW_MIN);
+    }
+
+    /// The window the server reports is a promise, and this is how far the
+    /// promise reaches: a client that fills every window it was granted on
+    /// every stream stays inside the connection's inbound aggregate up to 64
+    /// concurrent streams. Past that the grants sum past the aggregate and a
+    /// compliant client can still be closed (see `INBOUND_AGGREGATE_BYTES`).
+    #[test]
+    fn granted_windows_fit_inside_the_inbound_aggregate() {
+        let summed = |sockets: usize| -> u64 { (1..=sockets).map(per_stream_window).sum() };
+        for sockets in [1usize, 4, 5, 24, 64] {
+            assert!(
+                summed(sockets) <= INBOUND_AGGREGATE_BYTES,
+                "{sockets} sockets granted {} against a {INBOUND_AGGREGATE_BYTES}-byte aggregate",
+                summed(sockets)
+            );
+        }
+        // Stated rather than left to be discovered: the gap starts at 65.
+        assert!(summed(65) > INBOUND_AGGREGATE_BYTES);
+    }
+
+    /// The value the client needs and cannot compute: which window this stream
+    /// got, given how many were already open.
+    #[tokio::test]
+    async fn accept_reports_the_window_it_granted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sockets = NetSockets::default();
+        let p = policy(&[]);
+        // Five streams: the fifth is the first whose share is below the 1 MiB
+        // a client used to assume.
+        for id in 1..=5u16 {
+            let open = blit_remote::net::msg_net_open(&NetOpen::tcp(id, "127.0.0.1", addr.port()));
+            handle_net_message(&open, &mut sockets, &tx, &p, false).await;
+            let reported = loop {
+                let msg = rx.recv().await.unwrap();
+                if let Some(window) = blit_remote::net::parse_net_opened_window(&msg) {
+                    break window;
+                }
+            };
+            assert_eq!(reported, per_stream_window(id as usize));
+        }
+        assert!(per_stream_window(5) < NET_WINDOW_BYTES);
     }
 }

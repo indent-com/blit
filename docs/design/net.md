@@ -92,18 +92,18 @@ worth having outside a browser — plaintext locally, TLS to the target.
 take the free `0x80` block in both directions (0x40 fs, 0x50 git, 0x60
 lsp, 0x70 kv). Gateway, proxy, and mux forward them unmodified.
 
-| Dir | Opcode | Name         | Layout                                                                |
-| --- | ------ | ------------ | --------------------------------------------------------------------- |
-| C2S | `0x80` | `NET_OPEN`   | `[stream_id:2][flags:1][port:2][host_len:2][host:N]` + TLS block      |
-| C2S | `0x81` | `NET_DATA`   | `[stream_id:2][data:N]` — TCP only                                    |
-| C2S | `0x82` | `NET_ACK`    | `[stream_id:2][bytes:8]` — cumulative, TCP only                       |
-| C2S | `0x83` | `NET_CLOSE`  | `[stream_id:2][flags:1]`                                              |
-| C2S | `0x84` | `NET_DGRAM`  | `[stream_id:2][payload:N]` — one datagram, UDP only                   |
-| S2C | `0x80` | `NET_OPENED` | `[stream_id:2][status:1][alpn_len:1][alpn:N][detail_len:2][detail:N]` |
-| S2C | `0x81` | `NET_DATA`   | `[stream_id:2][data:N]` — TCP only                                    |
-| S2C | `0x82` | `NET_ACK`    | `[stream_id:2][bytes:8]` — cumulative, TCP only                       |
-| S2C | `0x83` | `NET_CLOSED` | `[stream_id:2][reason:1][detail_len:2][detail:N]`                     |
-| S2C | `0x84` | `NET_DGRAM`  | `[stream_id:2][payload:N]` — one datagram, UDP only                   |
+| Dir | Opcode | Name         | Layout                                                                                                     |
+| --- | ------ | ------------ | ---------------------------------------------------------------------------------------------------------- |
+| C2S | `0x80` | `NET_OPEN`   | `[stream_id:2][flags:1][port:2][host_len:2][host:N]` + TLS block                                           |
+| C2S | `0x81` | `NET_DATA`   | `[stream_id:2][data:N]` — TCP only                                                                         |
+| C2S | `0x82` | `NET_ACK`    | `[stream_id:2][bytes:8]` — cumulative, TCP only                                                            |
+| C2S | `0x83` | `NET_CLOSE`  | `[stream_id:2][flags:1]`                                                                                   |
+| C2S | `0x84` | `NET_DGRAM`  | `[stream_id:2][payload:N]` — one datagram, UDP only                                                        |
+| S2C | `0x80` | `NET_OPENED` | `[stream_id:2][status:1][alpn_len:1][alpn:N][detail_len:2][detail:N]` + `[window:8]` on an accepted stream |
+| S2C | `0x81` | `NET_DATA`   | `[stream_id:2][data:N]` — TCP only                                                                         |
+| S2C | `0x82` | `NET_ACK`    | `[stream_id:2][bytes:8]` — cumulative, TCP only                                                            |
+| S2C | `0x83` | `NET_CLOSED` | `[stream_id:2][reason:1][detail_len:2][detail:N]`                                                          |
+| S2C | `0x84` | `NET_DGRAM`  | `[stream_id:2][payload:N]` — one datagram, UDP only                                                        |
 
 All integers little-endian. `host` is UTF-8, non-empty, ≤ 255 bytes: a
 DNS name or a literal address, **resolved on the server** — reaching
@@ -331,8 +331,9 @@ byte-window credit**, the
 [fs-watch.md](fs-watch.md) § Pacing scheme with bytes as the unit
 rather than update ids: `NET_ACK.bytes` acknowledges every byte of that
 stream's data delivered to the application so far, and the sender stops
-producing when unacknowledged bytes reach the window (default 1 MiB per
-stream). The counter is 64-bit — 32 bits wraps at 4 GiB, which a
+producing when unacknowledged bytes reach the window (at most 1 MiB per
+stream, and less under concurrency — the server grants it and reports it
+on the accept). The counter is 64-bit — 32 bits wraps at 4 GiB, which a
 long-lived relayed stream reaches, and wraparound reasoning in flow
 control is a bug generator with no upside at 6 spare bytes.
 
@@ -371,16 +372,48 @@ reason `4` BUDGET. Refused rather than awaited: the check runs on the
 dispatch loop, and waiting there for a target to drain is the head-of-line
 stall this family exists to avoid.
 
+Which makes the client's window **the server's to report, not the
+client's to guess**. `NET_OPENED` for an accepted stream carries
+`[window:8]` after `detail`: the bytes that stream may hold unacked. The
+share depends on how many sockets were open at that stream's open time,
+so the client cannot compute it — mirroring the server's arithmetic from
+its own socket count is a race, and one it loses silently, since the
+penalty is not a stall but a closed stream. A client that guessed the
+1 MiB ceiling delivered a fraction of 11 of 24 concurrent uploads while
+every local write reported success.
+
+Two rules follow, and both matter:
+
+- **Until the accept arrives, assume the floor** (two chunks). Data is
+  pipelined behind the open by design, so there is a window's worth of
+  sending to do before the window is known. The floor is the smallest
+  share the server ever grants, so it cannot overrun at any concurrency,
+  and it costs one round trip of ramp-up on a bulk transfer.
+- **No tail is still a choice, and it is the client's.** A server that
+  predates the field enforces the same shrinking window without naming
+  it, so silence leaves the same guess as before — and the right guess
+  depends on how many sockets the client holds. A handful of static
+  forwards read it as the 1 MiB ceiling and keep their throughput; a
+  proxy or a service worker, whose socket count is its own client's
+  business, reads it as the floor, because a stream closed mid-upload
+  costs more than the ramp. Either way the guess is discarded the moment
+  a server reports. The tail is additive rather than a new message: every
+  shipped parser stops at `detail`, so an old client reads the message
+  unchanged.
+
 Its aggregate is **16 MiB, not the 4 MiB above**, and the asymmetry is
 forced rather than chosen. Outbound, the server produces and can park a
 reader until credit frees, so 4 MiB holds and a stream merely waits.
 Inbound the _client_ produces, and refusal is the only lever available on
-the dispatch loop — so the ceiling has to be one every compliant client
-stays under. A stream cannot make progress holding less than one maximum
-chunk, and `NET_MAX_SOCKETS` × `NET_MAX_CHUNK` is 16 MiB; anything lower
-would close the streams of a client that honored every per-stream window
-it was given. Bounded and stated beats a figure that matches the other
-direction and cannot hold.
+the dispatch loop — so the ceiling has to be one a compliant client stays
+under. A stream cannot make progress holding less than one maximum chunk,
+and `NET_MAX_SOCKETS` × `NET_MAX_CHUNK` is 16 MiB. That covers every
+window this server grants up to **64 concurrent streams** on one
+connection; past that the grants sum past the aggregate, so a client that
+honors every window it was told can still be closed. That is the one case
+the reported window does not yet promise, and the fix is for the grant to
+account for what is already outstanding rather than for this figure to
+grow.
 
 The window is not what bounds server memory, because a client may
 honestly ack every byte the instant it arrives and still not drain its
@@ -794,21 +827,23 @@ The pump still reads the local socket from the first moment, so nothing
 special happens for a client that sends early: there is nothing to
 send.
 
-### Concurrency makes the window the floor, not the ceiling
+### Concurrency makes the window the server's to report
 
 A stream's client→server window is
 `NET_WINDOW_AGGREGATE / open_sockets` clamped to
-`[2 * NET_MAX_CHUNK, NET_WINDOW_BYTES]`, fixed at open and **never
-reported to the client** ([§ Pacing](#pacing)). Overrunning it is
+`[NET_WINDOW_MIN, NET_WINDOW_BYTES]`, fixed at that stream's open time
+and reported on the accept ([§ Pacing](#pacing)). Overrunning it is
 `NET_CLOSED` BUDGET, not backpressure.
 
-A handful of static forwards sit inside the 1 MiB ceiling, so
-`blit forward` assumes it. A proxy's socket count is its client's
-business — one browser tab is dozens — so `blit socks` assumes the
-128 KiB floor instead, the smallest share the server ever hands out and
-therefore the only figure safe at any concurrency. The cost is a
-per-stream in-flight ceiling; the alternative is a stream killed
-mid-transfer once the connection gets busy.
+It bites a proxy harder than a forward: a proxy's socket count is its
+client's business — one browser tab is dozens — so it sits in the range
+where the share is well under the 1 MiB ceiling. Against a server that
+reports its grant, both commands need no more than the shared pump's rule
+(start at the floor, raise to the granted figure on the accept). Against
+one too old to report, the difference reappears and the two commands part
+ways: `blit forward` reads silence as the ceiling, `blit socks` as the
+floor (`relay::Unreported`), because for a proxy that guess is the
+difference between a slower stream and a closed one.
 
 `NET_MAX_SOCKETS` (256) is a real ceiling for a proxy in a way it is
 not for a forward. Past it the proxy answers `0x01` rather than hanging.
