@@ -309,7 +309,7 @@ the `GitStateMirror` reference reducer: `crates/remote/src/git.rs` and
 `BlitConnection`/`BlitWorkspace`). Bounded responses carry a `CURSOR`
 record naming where they stopped, so every enumeration is resumable;
 discovery, blame, reflog and fetch occupy a second opcode block at
-`0x90`.
+`0xB1` through `0xB4` (`GIT_BASE` begins that block at `0xB0`).
 
 ## Language intelligence
 
