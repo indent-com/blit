@@ -1143,6 +1143,7 @@ calls:
 | Knob                            | Default        | Env                           |
 | ------------------------------- | -------------- | ----------------------------- |
 | Open repos per connection       | 16             | `BLIT_GIT_MAX_REPOS`          |
+| Requests in flight per conn     | 16             | `BLIT_GIT_MAX_INFLIGHT`       |
 | Log subscriptions per repo      | 64             | `BLIT_GIT_MAX_LOG_SUBS`       |
 | Ref settle window               | 50 ms          | `BLIT_GIT_REFS_LATENCY_MS`    |
 | Status settle window            | 500 ms         | `BLIT_GIT_STATUS_LATENCY_MS`  |

@@ -102,14 +102,14 @@ never through `resolve_wire_path`.
 
 ## Budgets
 
-| Knob                     | Default   | Env                 |
-| ------------------------ | --------- | ------------------- |
-| Files per walk           | 400 000   | `BLIT_FS_INDEX_MAX` |
-| Yielded entries per walk | 4 × files | —                   |
-| Raw path bytes per list  | 48 MiB    | —                   |
-| Index walks in flight    | 2         | —                   |
-| Search walks in flight   | 2         | —                   |
-| Protocol count cap       | 1 000 000 | —                   |
+| Knob                     | Default   | Env                     |
+| ------------------------ | --------- | ----------------------- |
+| Files per walk           | 400 000   | `BLIT_FS_INDEX_MAX`     |
+| Yielded entries per walk | 4 × files | —                       |
+| Raw path bytes per list  | 48 MiB    | —                       |
+| Index walks in flight    | 8         | `BLIT_FS_WALK_INFLIGHT` |
+| Search walks in flight   | 8         | `BLIT_FS_WALK_INFLIGHT` |
+| Protocol count cap       | 1 000 000 | —                       |
 
 The byte budget keeps the declared decompressed size well under the
 protocol-wide 64 MiB receiver cap; any budget tripping sets
@@ -120,6 +120,12 @@ clamps to the protocol count cap so a raised budget can't emit an
 unparseable count. The in-flight caps bound walk threads per connection;
 `FS_SEARCH` predates them but is capped the same way (its own nonce set,
 same limit), refusing over-cap requests with `RESOURCE_LIMIT`.
+
+That cap was a bare `2` at three call sites, below what a single IDE session
+asks for — the client carries retry-on-`BUDGET` code to absorb it. It is now
+`BLIT_FS_WALK_INFLIGHT`, default 8. What it spends is threads: each walk's
+file, byte and entry cost is bounded by the budgets above, so raising it does
+not raise the ceiling on any one walk.
 
 ## Client behavior
 

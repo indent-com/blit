@@ -176,15 +176,15 @@ response per nonce in every outcome.
 There is deliberately no match budget. The only thing allowed to stop a
 search early is running out of wire:
 
-| Knob                  | Value     | Sets `TRUNCATED`                         |
-| --------------------- | --------- | ---------------------------------------- |
-| Records per response  | 48 MiB    | yes                                      |
-| Matches per file      | 65 535    | yes                                      |
-| Files opened per walk | 1 000 000 | yes                                      |
-| Largest file read     | 64 MiB    | no — out of scope                        |
-| Binary sniff          | 8 KiB     | no — out of scope                        |
-| Longest line returned | 512 B     | no — the line is clipped, not the result |
-| Greps in flight       | 2         | answers `BUDGET`                         |
+| Knob                  | Value     | Sets `TRUNCATED`                           |
+| --------------------- | --------- | ------------------------------------------ |
+| Records per response  | 48 MiB    | yes                                        |
+| Matches per file      | 65 535    | yes                                        |
+| Files opened per walk | 1 000 000 | yes                                        |
+| Largest file read     | 64 MiB    | no — out of scope                          |
+| Binary sniff          | 8 KiB     | no — out of scope                          |
+| Longest line returned | 512 B     | no — the line is clipped, not the result   |
+| Greps in flight       | 8         | answers `BUDGET` (`BLIT_FS_WALK_INFLIGHT`) |
 
 48 MiB of records is the protocol's LZ4 decompression cap (64 MiB) with
 the headroom `FS_INDEX` already leaves. At realistic line lengths that is
