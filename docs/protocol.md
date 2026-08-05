@@ -59,7 +59,7 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 | `0x25` | `CLIPBOARD_SET`         | `[mime_len:2][mime:N][data_len:4][data:M]`                                                                                                                           |
 | `0x26` | `SURFACE_LIST`          | _(empty)_ — request list of compositor surfaces                                                                                                                      |
 | `0x27` | `SURFACE_CAPTURE`       | `[surface_id:2][format:1][quality:1]` — screenshot (0=PNG, 1=AVIF)                                                                                                   |
-| `0x28` | `SURFACE_SUBSCRIBE`     | `[surface_id:2][codec:1][bandwidth:1][speed:1]`                                                                                                                      |
+| `0x28` | `SURFACE_SUBSCRIBE`     | `[surface_id:2][codec:1][bandwidth:1][speed:1][width:2][height:2]`                                                                                                   |
 | `0x29` | `SURFACE_UNSUBSCRIBE`   | `[surface_id:2]`                                                                                                                                                     |
 | `0x2A` | `SURFACE_ACK`           | `[surface_id:2]` — acknowledge receipt of video frame                                                                                                                |
 | `0x2B` | `SURFACE_CLOSE`         | `[surface_id:2]` — request close of Wayland surface                                                                                                                  |
@@ -96,13 +96,17 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 
 `RESIZE` is batched: after the opcode, the payload contains one or more `[pty_id:2][rows:2][cols:2]` triplets. Requires the `RESIZE_BATCH` feature bit in `S2C_HELLO`.
 
-`SURFACE_SUBSCRIBE` has three optional trailing bytes for per-surface codec, bandwidth and speed control:
+`SURFACE_SUBSCRIBE` has optional trailing bytes for per-surface codec, bandwidth and speed control, and for a fixed encode size:
 
 - `codec` (byte 3): `CODEC_SUPPORT_*` bitmask restricting which codecs the server may use for this surface. `0` = use the connection-level default (from `C2S_CLIENT_FEATURES`).
 - `bandwidth` (byte 4): the **most** bits the surface may spend. `0` = server default (from `BLIT_SURFACE_BANDWIDTH`), `1` = low, `2` = medium, `3` = high, `4` = ultra, `5`–`9` reserved, `10`–`255` = an AV1 quantizer used as the floor. The server adapts below this ceiling on its own — there is no `auto` value to ask for and no way to switch adaptation off. What you pick is the best quality the encoder is allowed to produce; congestion moves it cheaper and recovery moves it back.
 - `speed` (byte 5): how much encoder time a frame may cost, independent of bandwidth. `0` = server default (from `BLIT_SURFACE_SPEED`), `1` = slow, `2` = medium, `3` = fast, `4` = realtime, `5`–`9` reserved, `10`–`255` = custom (`10` slowest, `255` fastest).
 
-All three bytes are optional — a 3-byte message uses connection/server defaults. Re-subscribing to an already-subscribed surface with different values updates the preferences and forces encoder recreation.
+- `width` / `height` (bytes 6–9, LE u16): a fixed encode size in pixels for this client alone. Both nonzero makes the subscription **scaled**: the server encodes a downscale of the surface for this client and excludes it from surface-size mediation, so it never pulls the compositor surface smaller for anyone else. Both zero — or absent — means the client participates in mediation via `SURFACE_RESIZE` like any other viewer. The size is a bounding box, not an aspect: the server inscribes the surface's own aspect ratio inside it and never upscales past native.
+
+  A viewer that is _handed_ a box rather than sizing one — a side-panel thumbnail — is what this is for. Without it such a viewer has only two options, and both are wrong: report its box and shrink the window for every other viewer, or report nothing and decode full-resolution video into a card.
+
+All the trailing bytes are optional — a 3-byte message uses connection/server defaults — but they are positional, so asking for a size means sending the preference bytes too (as zeros, if you have no preference). Re-subscribing to an already-subscribed surface with different values updates the preferences and/or the scaled size, and forces encoder recreation.
 
 ## Server → Client (S2C)
 
@@ -180,7 +184,7 @@ Clients that predate `TERM_CWD_EVENT` are unaffected: consistent with the versio
 
 `S2C_SURFACE_FRAME` flags byte: bit 0 is the keyframe flag; bits 1–2 encode the codec — H.264 (0), AV1 (1), PNG (2). Remaining bits are reserved. `timestamp` is a monotonic millisecond counter captured at compositor-commit time (not wire-send time), so clients can drive video presentation and A/V sync off encode-time instead of network-delivery jitter.
 
-Each `(client, surface)` pair runs at most one server-side encoder, at the compositor's native pixel size. Multiple mounts on the same client share the stream via refcounting; `S2C_SURFACE_FRAME` is broadcast to every subscribed client.
+Each `(client, surface)` pair runs at most one server-side encoder, sized from that client's view size — or from its scaled subscribe, which overrides it. Multiple mounts on the same client share one subscription, and the size sent on the wire is derived across them: any mount wanting the surface unscaled wins outright, otherwise the largest requested size does. (Shrinking a stream further is cheap; the reverse is lossy.) `S2C_SURFACE_FRAME` is broadcast to every subscribed client.
 
 `S2C_AUDIO_FRAME` carries Opus-encoded audio from the compositor's mixed output. `timestamp` is a sample offset in 48 kHz ticks. `flags` bits 1-2 encode the codec (0 = Opus). Audio is per-compositor (one mixed stream from all apps), not per-surface. Only sent when the `AUDIO` feature bit is set in `S2C_HELLO`.
 
@@ -241,7 +245,7 @@ After `S2C_READY`, the client can start sending commands. `S2C_UPDATE` frames ar
 
 ```
 Byte 0 (flags0): fg_type[2] | bg_type[2] | bold | dim | italic | underline
-Byte 1 (flags1): inverse | wide | wide_continuation | content_len[3] | (reserved)
+Byte 1 (flags1): inverse | wide | wide_continuation | content_len[3] | link
 Bytes 2–4:       fg color (r, g, b) or palette index
 Bytes 5–7:       bg color (r, g, b) or palette index
 Bytes 8–11:      UTF-8 content (up to 4 bytes)
@@ -250,6 +254,25 @@ Bytes 8–11:      UTF-8 content (up to 4 bytes)
 Color type encoding: 0 = default terminal color, 1 = indexed (256-color palette), 2 = RGB true color.
 
 When `content_len == 7`, the cell's text exceeds 4 bytes. Bytes 8–11 hold an FNV-1a hash used for diff comparison; the actual UTF-8 string is transmitted in the `STRINGS_PRESENT` section, keyed by cell index.
+
+`link` (bit 6) marks a cell covered by an OSC 8 hyperlink. The target lives in the hyperlink section below; the bit exists so the renderer can style a link without a side-table lookup, and so a cell gaining or losing a link is visible to the byte-wise cell diff.
+
+**Hyperlink section** — trailing, after the scrollback count:
+
+```
+[u16 uri_count]                                     0xFFFF = unchanged, section ends
+  uri_count × [u16 link_id][u16 uri_len][uri utf8]
+[u16 run_count]
+  run_count × [u32 start_cell][u16 run_len][u16 link_id]
+```
+
+Like the scrollback count it follows, this section is a backward-compatible extension: a client that predates it stops reading after the scrollback count, and its absence reads as "no hyperlinks" on a new client talking to an old server. No capability negotiation is involved.
+
+`link_id` is frame-local and `0` means "no link", so `0xFFFF` is free to serve as the `unchanged` sentinel — which is what an idle frame costs: two bytes. When the state does change the table is sent in full rather than diffed, because `OP_COPY_RECT` / `OP_FILL_RECT` relocate cells and replaying those transforms against a parallel id array is a correctness trap for a section that is nearly always empty. Keyframes always send the table explicitly rather than claiming "unchanged".
+
+URIs are deduplicated by target, capped at 4096 bytes, and dropped rather than truncated when longer — a truncated URI is a _different_ URI. The cell→id map is run-length encoded because a hyperlink always spans contiguous cells.
+
+The server relays targets verbatim and applies no scheme filtering: OSC 8 deliberately decouples a link's text from its target, and only the client is positioned to show the user that discrepancy. `@blit-sh/core`'s `assessUrl()` classifies every target as `allow` / `confirm` / `deny` before it can be opened — rejecting script-executing schemes and any URI containing invisible or text-reordering codepoints, and escaping every target for display so a preview cannot misrepresent itself.
 
 **Mode bits** (16-bit field in frame header):
 

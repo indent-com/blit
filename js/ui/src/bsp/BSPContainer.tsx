@@ -16,7 +16,11 @@ import {
   createBlitSessions,
   createBlitWorkspaceState,
 } from "@blit-sh/solid";
-import type { SessionId, TerminalPalette } from "@blit-sh/core";
+import type {
+  BlitTerminalSurface,
+  SessionId,
+  TerminalPalette,
+} from "@blit-sh/core";
 import type { BSPNode, BSPChild, BSPSplit, BSPLeaf } from "@blit-sh/core/bsp";
 import { leafCount, serializeDSL } from "@blit-sh/core/bsp";
 import type { BSPAssignments, BSPLayout } from "./layout";
@@ -162,6 +166,9 @@ export function BSPContainer(props: {
   onClearPaneAssignment?: (fn: (paneId: string) => void) => void;
   onFocusedPaneChange?: (paneId: string | null) => void;
   onRender?: (renderMs?: number) => void;
+  /** Receives each terminal pane's surface as it mounts, so hyperlink hover
+   *  and activation work in every split. */
+  onTerminalSurface?: (surface: BlitTerminalSurface | null) => void;
   /** Open an IDE tile from within a tile (commit view → editor). */
   onOpenTile?: (assignment: string) => void;
   /** Register visual hosts for Workspace-owned persistent web panes. */
@@ -973,6 +980,9 @@ export function BSPContainer(props: {
     get onRender() {
       return props.onRender;
     },
+    get onTerminalSurface() {
+      return props.onTerminalSurface;
+    },
     get registerWebPaneHost() {
       return props.registerWebPaneHost;
     },
@@ -1508,6 +1518,7 @@ function LeafPane(props: {
                   style={{ width: "100%", height: "100%" }}
                   showCursor={props.isFocused}
                   onRender={ctx.onRender}
+                  surfaceRef={(s) => ctx.onTerminalSurface?.(s)}
                 />
               </div>
               <Show when={session()?.state === "exited"}>

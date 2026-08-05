@@ -501,15 +501,17 @@ the existing scheduler and `S2C_FRAGMENT` fairness.
 
 ## Limits and defaults
 
-| Knob                      | Default | Env                   |
-| ------------------------- | ------- | --------------------- |
-| Settle / batching window  | 20 ms   | `BLIT_FS_LATENCY_MS`  |
-| Inline content limit      | 16 MiB  | `BLIT_FS_INLINE_MAX`  |
-| Blob store (process-wide) | 256 MiB | `BLIT_FS_BLOB_MAX`    |
-| Syncs per connection      | 128     | `BLIT_FS_MAX_SYNCS`   |
-| Indexed entries per root  | 1 M     | `BLIT_FS_MAX_ENTRIES` |
-| Exclude patterns per sync | 4096    | —                     |
-| Unacked bytes per sync    | 1 MiB   | `BLIT_FS_WINDOW`      |
+| Knob                      | Default | Env                      |
+| ------------------------- | ------- | ------------------------ |
+| Settle / batching window  | 20 ms   | `BLIT_FS_LATENCY_MS`     |
+| Inline content limit      | 16 MiB  | `BLIT_FS_INLINE_MAX`     |
+| Blob store (process-wide) | 256 MiB | `BLIT_FS_BLOB_MAX`       |
+| Syncs per connection      | 128     | `BLIT_FS_MAX_SYNCS`      |
+| Indexed entries per root  | 1 M     | `BLIT_FS_MAX_ENTRIES`    |
+| Exclude patterns per sync | 4096    | —                        |
+| Unacked bytes per sync    | 1 MiB   | `BLIT_FS_WINDOW`         |
+| Fetches in flight / conn  | 8       | `BLIT_FS_FETCH_INFLIGHT` |
+| Fetches queued / conn     | 256     | `BLIT_FS_FETCH_QUEUE`    |
 
 An earlier draft budgeted snapshot retention per client (`BLIT_FS_RETAIN_MAX`,
 32 MiB). The implemented architecture does not need it — a sync engine holds

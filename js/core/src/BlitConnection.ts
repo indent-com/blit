@@ -454,21 +454,36 @@ function toPublicSession(s: InternalSession): BlitSession {
   return s;
 }
 
+/** A fixed encode size one view wants for a surface, in pixels. */
+export interface SurfaceTarget {
+  width: number;
+  height: number;
+}
+
 /** Per-surface subscription state.  One entry per visible surface on
- *  this connection.  `refCount` tracks how many mounts (e.g. BSP view
- *  plus side-panel preview) share the stream: the wire UNSUBSCRIBE
- *  fires only when the last mount goes away.  Without ref-counting,
- *  unmounting one of two mounts tears down the stream for both. */
+ *  this connection.  `views` tracks the live mounts (e.g. BSP view plus
+ *  side-panel preview) sharing the stream: the wire UNSUBSCRIBE fires
+ *  only when the last one goes away.  Without that, unmounting one of
+ *  two mounts tears down the stream for both. */
 interface SurfaceSub {
   surfaceId: number;
-  /** Number of live mounts currently referencing this sub. */
-  refCount: number;
+  /** Live mounts, keyed by the token allocSurfaceViewId() handed out.
+   *  The value is the fixed encode size that view wants, or null when it
+   *  wants the mediated surface at full size.  Held per view rather than
+   *  collapsed to a count because the effective request is derived from
+   *  all of them — and on unmount we have to know which one left. */
+  views: Map<string, SurfaceTarget | null>;
   /** Bandwidth override set via {@link BlitConnection.sendSurfaceResubscribe}. */
   bandwidthOverride: number | null;
   /** Speed override set via {@link BlitConnection.sendSurfaceResubscribe}. */
   speedOverride: number | null;
-  /** Last bandwidth/speed pair sent on the wire, for dedup. */
-  lastSent: { bandwidth: number; speed: number } | null;
+  /** Last subscribe sent on the wire, for dedup. */
+  lastSent: {
+    bandwidth: number;
+    speed: number;
+    width: number;
+    height: number;
+  } | null;
   /** When the last mount has gone away we schedule a deferred wire
    *  UNSUBSCRIBE instead of firing it immediately.  Moving a surface
    *  between two UI locations (e.g. side-panel preview → BSP) causes
@@ -2777,11 +2792,39 @@ export class BlitConnection {
   //   * bandwidth / speed: per-surface overrides (set by
   //     sendSurfaceResubscribe) falling back to defaultSurfaceBandwidth
   //     and defaultSurfaceSpeed.
-  // Keyed by sub_id (client-allocated u32).  Each `BlitSurfaceCanvas`
-  // (or equivalent caller) allocates its own sub_id and owns the
-  // subscribe/unsubscribe lifecycle for that id.
+  // Each `BlitSurfaceCanvas` (or equivalent caller) allocates its own
+  // token via allocSurfaceViewId() and owns the subscribe/unsubscribe
+  // lifecycle for it.
   /** Active surface subscriptions keyed by surface id. */
   private surfaceSubs = new Map<number, SurfaceSub>();
+  private surfaceViewIdCounter = 0;
+
+  /** Allocate a token identifying one view's subscription to a surface.
+   *  Mirrors {@link allocViewId} for PTYs. */
+  allocSurfaceViewId(): string {
+    return `s${++this.surfaceViewIdCounter}`;
+  }
+
+  /**
+   * The subscribe this connection should be asking for, given every live
+   * view of the surface.
+   *
+   * A view that wants the surface unscaled wins outright: it needs pixels
+   * nobody can reconstruct from a downscale, and the thumbnail sharing the
+   * stream can always shrink what it is given.  Otherwise the largest
+   * request wins, for the same reason in miniature — downscaling further is
+   * cheap, upscaling is lossy.
+   */
+  private effectiveSurfaceTarget(sub: SurfaceSub): SurfaceTarget | null {
+    let width = 0;
+    let height = 0;
+    for (const target of sub.views.values()) {
+      if (!target) return null;
+      width = Math.max(width, target.width);
+      height = Math.max(height, target.height);
+    }
+    return width > 0 && height > 0 ? { width, height } : null;
+  }
 
   /** Grace window before a refCount=0 subscription's wire UNSUB fires.
    *  Chosen to comfortably cover typical Solid re-render ordering where
@@ -2823,44 +2866,87 @@ export class BlitConnection {
     if (!this.surfaceStreamingEnabled) return;
     const bandwidth = sub.bandwidthOverride ?? this.defaultSurfaceBandwidth;
     const speed = sub.speedOverride ?? this.defaultSurfaceSpeed;
+    const target = this.effectiveSurfaceTarget(sub);
+    const width = target?.width ?? 0;
+    const height = target?.height ?? 0;
     if (
       sub.lastSent !== null &&
       sub.lastSent.bandwidth === bandwidth &&
-      sub.lastSent.speed === speed
+      sub.lastSent.speed === speed &&
+      sub.lastSent.width === width &&
+      sub.lastSent.height === height
     ) {
       return;
     }
-    sub.lastSent = { bandwidth, speed };
-    this._logger.info(`surface sub ${this.id}:${sub.surfaceId}`);
+    sub.lastSent = { bandwidth, speed, width, height };
+    this._logger.info(
+      `surface sub ${this.id}:${sub.surfaceId}${target ? ` @${width}x${height}` : ""}`,
+    );
     this.transport.send(
-      buildSurfaceSubscribeMessage(sub.surfaceId, 0, bandwidth, speed),
+      buildSurfaceSubscribeMessage(
+        sub.surfaceId,
+        0,
+        bandwidth,
+        speed,
+        width,
+        height,
+      ),
     );
   }
 
-  /** Subscribe to frames for a surface.  A single subscription exists
-   *  per (connection, surface); additional views of the same surface
-   *  share it.  Callers should ref-count mounts above this layer. */
-  sendSurfaceSubscribe(surfaceId: number): void {
+  /**
+   * Subscribe one view to a surface's frames.  A single wire subscription
+   * exists per (connection, surface); additional views share it and the
+   * effective request is derived across them.
+   *
+   * `viewId` comes from {@link allocSurfaceViewId} and identifies this view
+   * for the lifetime of its mount.  `target` asks the server to encode a
+   * fixed-size downscale for this client instead of sizing the surface to
+   * fit — pass null to watch the surface at its mediated size.
+   */
+  sendSurfaceSubscribe(
+    surfaceId: number,
+    viewId: string,
+    target: SurfaceTarget | null = null,
+  ): void {
     let sub = this.surfaceSubs.get(surfaceId);
     if (!sub) {
       sub = {
         surfaceId,
-        refCount: 1,
+        views: new Map(),
         bandwidthOverride: null,
         speedOverride: null,
         lastSent: null,
         pendingUnsub: null,
       };
       this.surfaceSubs.set(surfaceId, sub);
-    } else {
-      sub.refCount += 1;
+    } else if (sub.pendingUnsub !== null) {
       // Cancel any pending deferred UNSUB — the new mount wants the
       // live stream and the server's encoder is still valid.
-      if (sub.pendingUnsub !== null) {
-        clearTimeout(sub.pendingUnsub);
-        sub.pendingUnsub = null;
-      }
+      clearTimeout(sub.pendingUnsub);
+      sub.pendingUnsub = null;
     }
+    sub.views.set(viewId, target);
+    this.maybeSendSurfaceSubscribe(sub);
+  }
+
+  /** Update the fixed encode size one view wants, re-deriving the wire
+   *  request.  No-op for a view that is not subscribed. */
+  setSurfaceViewTarget(
+    surfaceId: number,
+    viewId: string,
+    target: SurfaceTarget | null,
+  ): void {
+    const sub = this.surfaceSubs.get(surfaceId);
+    if (!sub || !sub.views.has(viewId)) return;
+    const previous = sub.views.get(viewId);
+    if (
+      previous?.width === target?.width &&
+      previous?.height === target?.height
+    ) {
+      return;
+    }
+    sub.views.set(viewId, target);
     this.maybeSendSurfaceSubscribe(sub);
   }
 
@@ -2888,11 +2974,16 @@ export class BlitConnection {
     }
   }
 
-  sendSurfaceUnsubscribe(surfaceId: number): void {
+  sendSurfaceUnsubscribe(surfaceId: number, viewId: string): void {
     const sub = this.surfaceSubs.get(surfaceId);
     if (!sub) return;
-    sub.refCount -= 1;
-    if (sub.refCount > 0) return;
+    if (!sub.views.delete(viewId)) return;
+    if (sub.views.size > 0) {
+      // Somebody else is still watching, but the view that left may have
+      // been the one holding the stream at full size.
+      this.maybeSendSurfaceSubscribe(sub);
+      return;
+    }
     // Defer the wire UNSUB so a remount within the grace window
     // (typical when moving a surface between UI locations, e.g.
     // BSP ↔ side-panel preview) finds the server-side encoder still
@@ -2900,7 +2991,7 @@ export class BlitConnection {
     if (sub.pendingUnsub !== null) clearTimeout(sub.pendingUnsub);
     sub.pendingUnsub = setTimeout(() => {
       const cur = this.surfaceSubs.get(surfaceId);
-      if (!cur || cur.refCount > 0 || cur.pendingUnsub === null) return;
+      if (!cur || cur.views.size > 0 || cur.pendingUnsub === null) return;
       cur.pendingUnsub = null;
       if (this.transport.status === "connected") {
         this._logger.info(`surface unsub ${this.id}:${surfaceId}`);

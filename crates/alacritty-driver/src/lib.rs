@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use std::sync::{Arc, Mutex};
 
@@ -9,7 +9,7 @@ use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::NamedColor;
-use blit_remote::FrameState;
+use blit_remote::{CELL_FLAG1_LINK, FrameState, MAX_LINK_ID, MAX_LINK_URI};
 
 const CELL_SIZE: usize = blit_remote::CELL_SIZE;
 
@@ -911,8 +911,10 @@ impl TerminalDriver {
         mode: u16,
     ) -> FrameState {
         let grid = self.term.grid();
-        let mut cells = vec![0u8; rows * cols * CELL_SIZE];
+        let total_cells = rows * cols;
+        let mut cells = vec![0u8; total_cells * CELL_SIZE];
         let mut overflow = BTreeMap::new();
+        let mut links = LinkCollector::default();
 
         let total = grid.total_lines();
         let screen = grid.screen_lines();
@@ -942,11 +944,17 @@ impl TerminalDriver {
             for col_idx in 0..cols {
                 let cell = &grid_row[Column(col_idx)];
                 let flat = row_start + col_idx;
+                // `hyperlink()` only touches the Arc'd `extra` allocation, which
+                // is None for every cell that carries no link or zero-width mark.
+                let linked = cell
+                    .hyperlink()
+                    .is_some_and(|h| links.record(flat, total_cells, h.uri()));
                 encode_cell(
                     cell,
                     &mut cells[flat * CELL_SIZE..][..CELL_SIZE],
                     flat,
                     &mut overflow,
+                    linked,
                 );
             }
 
@@ -969,6 +977,7 @@ impl TerminalDriver {
             cells,
         );
         *frame.overflow_mut() = overflow;
+        frame.set_links(links.cell_links, links.uris);
 
         // Set line wrap flags
         for row in 0..rows {
@@ -994,6 +1003,55 @@ impl TerminalDriver {
     }
 }
 
+// ── Hyperlinks ──────────────────────────────────────────────────────────
+
+/// Interns OSC 8 URIs into small per-frame ids while a frame is encoded.
+///
+/// Deduplication is by URI rather than by alacritty's hyperlink id: two spans
+/// pointing at the same target are indistinguishable to the user, and spans
+/// that omit the optional `id=` parameter get a fresh synthetic id from
+/// alacritty for every span, which would otherwise blow up the table.
+#[derive(Default)]
+struct LinkCollector {
+    /// Flat cell index -> link id. Allocated on the first link seen, so a
+    /// frame with no hyperlinks (the overwhelming majority) allocates nothing.
+    cell_links: Vec<u16>,
+    uris: BTreeMap<u16, String>,
+    by_uri: HashMap<String, u16>,
+    last_id: u16,
+}
+
+impl LinkCollector {
+    /// Records a hyperlink on a cell. Returns whether the cell should carry
+    /// the `CELL_FLAG1_LINK` bit — false when the URI was rejected, so the
+    /// rendered cell never claims a link the table cannot resolve.
+    fn record(&mut self, flat: usize, total: usize, uri: &str) -> bool {
+        if uri.is_empty() || uri.len() > MAX_LINK_URI {
+            return false;
+        }
+        let id = match self.by_uri.get(uri) {
+            Some(&id) => id,
+            None => {
+                if self.last_id >= MAX_LINK_ID {
+                    return false;
+                }
+                self.last_id += 1;
+                self.by_uri.insert(uri.to_owned(), self.last_id);
+                self.uris.insert(self.last_id, uri.to_owned());
+                self.last_id
+            }
+        };
+        if self.cell_links.is_empty() {
+            self.cell_links = vec![0u16; total];
+        }
+        match self.cell_links.get_mut(flat) {
+            Some(slot) => *slot = id,
+            None => return false,
+        }
+        true
+    }
+}
+
 // ── Cell encoding ───────────────────────────────────────────────────────
 
 /// Encode a cell into the 12-byte blit wire format.
@@ -1004,6 +1062,7 @@ fn encode_cell(
     buf: &mut [u8],
     flat_index: usize,
     overflow: &mut BTreeMap<usize, String>,
+    linked: bool,
 ) {
     use alacritty_terminal::vte::ansi::Color;
 
@@ -1087,6 +1146,9 @@ fn encode_cell(
     if flags.contains(CellFlags::WIDE_CHAR_SPACER) {
         f1 |= 1 << 2;
     }
+    if linked {
+        f1 |= CELL_FLAG1_LINK;
+    }
 
     // Encode character content — fast path for ASCII (most common).
     let c = cell.c;
@@ -1168,6 +1230,132 @@ mod tests {
         driver.process(b"\x1b]0;My Title\x07");
         assert!(driver.take_title_dirty());
         assert_eq!(driver.title(), "My Title");
+    }
+
+    #[test]
+    fn osc8_hyperlink_spans_marked_cells() {
+        let mut driver = TerminalDriver::new(24, 80, 1000);
+        driver.process(b"\x1b]8;;https://blit.sh\x1b\\click\x1b]8;;\x1b\\ plain");
+        let frame = driver.snapshot(true, true);
+
+        assert_eq!(frame.cell_link(0, 0), Some("https://blit.sh"));
+        assert_eq!(frame.cell_link(0, 4), Some("https://blit.sh"));
+        // The closing OSC 8 ends the span; the space and "plain" carry no link.
+        assert_eq!(frame.cell_link(0, 5), None);
+        assert_eq!(frame.cell_link(0, 6), None);
+
+        // The per-cell flag agrees with the side table.
+        let f1 = frame.cells()[1];
+        assert_ne!(f1 & CELL_FLAG1_LINK, 0);
+        let unlinked_f1 = frame.cells()[6 * CELL_SIZE + 1];
+        assert_eq!(unlinked_f1 & CELL_FLAG1_LINK, 0);
+    }
+
+    #[test]
+    fn osc8_dedups_identical_uris_across_spans() {
+        let mut driver = TerminalDriver::new(24, 80, 1000);
+        // Two spans, same target, no explicit id= — alacritty assigns each a
+        // distinct synthetic id, but they must collapse to one table entry.
+        driver.process(b"\x1b]8;;https://a.example\x1b\\one\x1b]8;;\x1b\\ ");
+        driver.process(b"\x1b]8;;https://a.example\x1b\\two\x1b]8;;\x1b\\");
+        let frame = driver.snapshot(true, true);
+
+        assert_eq!(frame.link_uris().len(), 1);
+        assert_eq!(frame.cell_link(0, 0), Some("https://a.example"));
+        assert_eq!(frame.cell_link(0, 4), Some("https://a.example"));
+    }
+
+    #[test]
+    fn osc8_wide_char_continuation_inherits_link() {
+        let mut driver = TerminalDriver::new(24, 80, 1000);
+        driver.process("\x1b]8;;https://cjk.example\x1b\\日\x1b]8;;\x1b\\".as_bytes());
+        let frame = driver.snapshot(true, true);
+
+        // Clicking either column of a double-width glyph follows the link.
+        assert_eq!(frame.cell_link(0, 0), Some("https://cjk.example"));
+        assert_eq!(frame.cell_link(0, 1), Some("https://cjk.example"));
+    }
+
+    #[test]
+    fn osc8_overlong_uri_is_dropped_not_truncated() {
+        let mut driver = TerminalDriver::new(24, 80, 1000);
+        let mut seq = Vec::from(&b"\x1b]8;;https://e.example/"[..]);
+        seq.extend(std::iter::repeat_n(b'a', MAX_LINK_URI));
+        seq.extend_from_slice(b"\x1b\\x\x1b]8;;\x1b\\");
+        driver.process(&seq);
+        let frame = driver.snapshot(true, true);
+
+        // A truncated URI is a different URI, so the link is refused outright.
+        assert_eq!(frame.cell_link(0, 0), None);
+        assert!(frame.link_uris().is_empty());
+        assert_eq!(frame.cells()[1] & CELL_FLAG1_LINK, 0);
+    }
+
+    /// The whole server->client chain for a hyperlink: PTY bytes through the
+    /// emulator, into a frame, over the wire encoder, and back out of the
+    /// decoder the browser actually runs.
+    #[test]
+    fn osc8_survives_the_full_encode_decode_chain() {
+        use blit_remote::{TerminalState, build_update_msg};
+
+        let mut driver = TerminalDriver::new(24, 80, 1000);
+        driver.process(b"see \x1b]8;;https://blit.sh/docs\x1b\\the docs\x1b]8;;\x1b\\ now");
+        let frame = driver.snapshot(true, true);
+
+        let msg = build_update_msg(1, &frame, &FrameState::default()).unwrap();
+        // Strip [opcode][pty_id:2] the way the client's dispatch does.
+        let mut term = TerminalState::new(24, 80);
+        assert!(term.feed_compressed(&msg[3..]));
+
+        assert_eq!(term.frame().cell_link(0, 0), None); // "see "
+        assert_eq!(term.frame().cell_link(0, 4), Some("https://blit.sh/docs"));
+        assert_eq!(term.frame().cell_link(0, 11), Some("https://blit.sh/docs"));
+        assert_eq!(term.frame().cell_link(0, 12), None); // " now"
+
+        // The visible text is unchanged by the link markup.
+        assert_eq!(term.get_text(0, 0, 0, 15).trim_end(), "see the docs now");
+    }
+
+    /// OSC 8 exists to let the displayed text differ from the target, which is
+    /// exactly the property that has to reach the client intact for the
+    /// frontend's classifier to have anything to judge.
+    #[test]
+    fn osc8_carries_a_target_unrelated_to_the_visible_text() {
+        use blit_remote::{TerminalState, build_update_msg};
+
+        let mut driver = TerminalDriver::new(24, 80, 1000);
+        driver.process(b"\x1b]8;;javascript:alert(1)\x1b\\https://your-bank.example\x1b]8;;\x1b\\");
+        let frame = driver.snapshot(true, true);
+        let msg = build_update_msg(1, &frame, &FrameState::default()).unwrap();
+        let mut term = TerminalState::new(24, 80);
+        assert!(term.feed_compressed(&msg[3..]));
+
+        assert_eq!(term.get_text(0, 0, 0, 24), "https://your-bank.example");
+        // The server does not filter — it reports faithfully, and the client
+        // classifier decides. Anything else would hide the deception from the
+        // only layer positioned to warn the user about it.
+        assert_eq!(term.frame().cell_link(0, 0), Some("javascript:alert(1)"));
+    }
+
+    /// A link whose text is longer than the terminal is wide wraps onto the
+    /// next row. It is still one link, and must report as one contiguous span.
+    #[test]
+    fn osc8_link_wrapping_a_row_reports_one_span() {
+        let mut driver = TerminalDriver::new(24, 10, 1000);
+        // 14 characters of link text on a 10-column terminal.
+        driver.process(b"\x1b]8;;https://wrap.example\x1b\\aaaaaaaaaaaaaa\x1b]8;;\x1b\\");
+        let frame = driver.snapshot(true, true);
+
+        assert!(frame.is_wrapped(0), "row 0 should be marked as wrapping");
+        assert_eq!(frame.cell_link(0, 0), Some("https://wrap.example"));
+        assert_eq!(frame.cell_link(1, 3), Some("https://wrap.example"));
+
+        // Row 0 in full, then the first four cells of row 1 — one link.
+        let expected = vec![(0, 0, 9), (1, 0, 3)];
+        assert_eq!(frame.link_segments(0, 0), expected);
+        assert_eq!(frame.link_segments(0, 9), expected);
+        assert_eq!(frame.link_segments(1, 0), expected);
+        assert_eq!(frame.link_segments(1, 3), expected);
     }
 
     #[test]

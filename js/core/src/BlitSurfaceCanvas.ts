@@ -14,6 +14,13 @@ import {
   SURFACE_POINTER_UP,
   SURFACE_POINTER_MOVE,
 } from "./protocol";
+import {
+  devicePixelBox,
+  drawHalved,
+  halve,
+  halvings,
+  octaveCeil,
+} from "./downscale";
 
 /** Cached codec support bitmask.  Computed once, reused for all resize messages. */
 let _codecSupport: number | null = null;
@@ -362,6 +369,27 @@ export class BlitSurfaceCanvas {
     height: number;
     scale120: number;
   } | null = null;
+  /**
+   * The container's size in device pixels, tracked for every view.
+   *
+   * A resizable view gets its size through setDisplaySize and sits at 1:1, so
+   * this is only consulted for the views that never learn a size — dock
+   * thumbnails and the React binding — which otherwise hand a full-resolution
+   * frame to a card-sized box and get a point-sampled minification back.
+   * Presentation only: it is never sent to the server, so a thumbnail cannot
+   * shrink the surface for the co-viewers watching it full size.
+   */
+  private _presentBox: { width: number; height: number } | null = null;
+  private _presentObserver: ResizeObserver | null = null;
+  /** This view's surface-subscription token.  Allocated lazily and kept
+   *  across resubscribes so the connection tracks one entry per view. */
+  private _surfaceViewId: string | null = null;
+  /** Halvings applied by the last blit, so the observer can tell a resize that
+   *  crosses an octave from one that changes nothing on screen. */
+  private _presentHalvings = 0;
+  /** Source frame size of the last blit, so the observer can recompute the
+   *  reduction without going back to the store. */
+  private _lastFrameSize: { width: number; height: number } | null = null;
   /** Last layout applied by applyLayout(), to skip redundant style writes. */
   private _lastLayout: {
     left: number;
@@ -535,8 +563,41 @@ export class BlitSurfaceCanvas {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
 
+    this.observePresentBox(container);
     this.subscribe();
     this.attachEvents();
+  }
+
+  /**
+   * Watch the container so blitFromStore knows how far the browser is about
+   * to shrink the canvas.  See {@link _presentBox}.
+   */
+  private observePresentBox(container: HTMLElement): void {
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      const box = entry && devicePixelBox(entry);
+      if (!box) return;
+      this._presentBox = box;
+      // Ask the server for a stream sized to the new box.  Quantised, so a
+      // drag re-asks only on an octave boundary — each change costs an
+      // encoder rebuild and a keyframe.
+      this.refreshScaledTarget();
+      // Redraw only when the box crosses an octave.  The reduction is
+      // quantised, so most of a dock-grip drag lands on the same chain and
+      // there is nothing new to show.
+      const src = this._lastFrameSize;
+      if (!src || this._displaySize) return;
+      if (
+        halvings(src.width, src.height, box.width, box.height) ===
+        this._presentHalvings
+      )
+        return;
+      const store = this.getConn()?.surfaceStore ?? this._store;
+      if (store) this.blitFromStore(store);
+    });
+    observer.observe(container);
+    this._presentObserver = observer;
   }
 
   dispose(): void {
@@ -546,6 +607,8 @@ export class BlitSurfaceCanvas {
       this._retryUnsub();
       this._retryUnsub = undefined;
     }
+    this._presentObserver?.disconnect();
+    this._presentObserver = null;
     this.releaseAllKeys();
     this.releaseAllButtons();
     this.endScrollSequence();
@@ -670,9 +733,10 @@ export class BlitSurfaceCanvas {
    * frame *larger* than the container (transiently, mid-resize) is scaled
    * down to fit, aspect-preserved.
    *
-   * Non-resizable views (thumbnails, the React binding) never learn the
-   * container's device-pixel size, so they keep the fill-and-contain CSS
-   * from attach().
+   * Non-resizable views (thumbnails, the React binding) keep the
+   * fill-and-contain CSS from attach() and let the box drive the size.  They
+   * do track the container (see {@link _presentBox}) but only to pick a
+   * halving chain in blitFromStore, never to place the canvas.
    */
   private applyLayout(): void {
     const canvas = this.canvas;
@@ -793,7 +857,11 @@ export class BlitSurfaceCanvas {
     // unavailable (non-secure context) drives the server encoder for
     // nothing and can crash it.
     if (conn && store.canDecodeVideo) {
-      conn.sendSurfaceSubscribe(this._surfaceId);
+      conn.sendSurfaceSubscribe(
+        this._surfaceId,
+        this.surfaceViewId(conn),
+        this.scaledTarget(),
+      );
       this._subscribedGeneration = store.generation;
       this._subscribedSurface = {
         connectionId: this._connectionId,
@@ -880,16 +948,27 @@ export class BlitSurfaceCanvas {
     const ctx = this.ctx;
     if (!src || !canvas || !ctx) return;
     if (src.width === 0 || src.height === 0) return;
+    this._lastFrameSize = { width: src.width, height: src.height };
 
-    // Canvas backing buffer mirrors the source frame exactly; applyLayout
-    // sizes the CSS box so the blit is 1:1 device pixels (or a proportional
-    // downscale when the frame is transiently larger than the container).
-    if (canvas.width !== src.width || canvas.height !== src.height) {
-      canvas.width = src.width;
-      canvas.height = src.height;
+    // A view that sizes its own box is already 1:1 and has nothing to
+    // prefilter: the backing buffer mirrors the source frame exactly and
+    // applyLayout sizes the CSS box to match (or, transiently mid-resize,
+    // scales a too-large frame down proportionally).
+    //
+    // A view that is *handed* a box — a dock thumbnail — is about to be
+    // minified by the compositor instead, so bring the frame down to roughly
+    // the box in whole halves first and leave CSS a scale it can filter.
+    const box = this._displaySize ? null : this._presentBox;
+    const n = box ? halvings(src.width, src.height, box.width, box.height) : 0;
+    this._presentHalvings = n;
+    const w = halve(src.width, n);
+    const h = halve(src.height, n);
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
     }
     this.applyLayout();
-    ctx.drawImage(src, 0, 0);
+    drawHalved(ctx, src, src.width, src.height, n);
   }
 
   private resubscribe(): void {
@@ -904,9 +983,62 @@ export class BlitSurfaceCanvas {
     if (!sub) return;
     const conn =
       (this._workspace as any).getConnection(sub.connectionId) ?? null;
-    conn?.sendSurfaceUnsubscribe(sub.surfaceId);
+    if (conn && this._surfaceViewId) {
+      conn.sendSurfaceUnsubscribe(sub.surfaceId, this._surfaceViewId);
+    }
     this._subscribedSurface = null;
     this._subscribedGeneration = -1;
+  }
+
+  /** This view's subscription token, allocated on first use and kept for
+   *  the life of the canvas so a resubscribe reclaims the same slot. */
+  private surfaceViewId(conn: BlitConnection): string {
+    if (!this._surfaceViewId) {
+      this._surfaceViewId = conn.allocSurfaceViewId();
+    }
+    return this._surfaceViewId;
+  }
+
+  /**
+   * The fixed encode size to ask the server for, or null to watch the
+   * surface at its mediated size.
+   *
+   * Only a view that is handed a box asks for one: a resizable view already
+   * drives the surface's size through setDisplaySize, and asking it to
+   * bypass mediation would leave nobody sizing the surface at all.
+   *
+   * The request is this view's own box, octave-rounded — deliberately not
+   * anything derived from the surface's current size.  A resubscribe costs
+   * the server an encoder rebuild and this client a keyframe, and the
+   * surface's size moves whenever any *other* viewer resizes its pane; a
+   * request that tracked it would re-ask every time somebody else dragged
+   * a split.  The box only moves when this card does.
+   *
+   * Overshooting to the next octave is the cheap side of that trade: the
+   * server inscribes the surface's aspect inside whatever box it is given
+   * and never upscales past native, and the ≤2:1 residual is exactly what
+   * {@link drawHalved} and a single CSS tap already handle.
+   */
+  private scaledTarget(): { width: number; height: number } | null {
+    if (this._displaySize) return null;
+    const box = this._presentBox;
+    if (!box) return null;
+    const width = octaveCeil(box.width);
+    const height = octaveCeil(box.height);
+    return width > 0 && height > 0 ? { width, height } : null;
+  }
+
+  /** Re-derive the scaled request after the box or the surface changed. */
+  private refreshScaledTarget(): void {
+    const sub = this._subscribedSurface;
+    if (!sub || !this._surfaceViewId) return;
+    const conn =
+      (this._workspace as any).getConnection(sub.connectionId) ?? null;
+    conn?.setSurfaceViewTarget(
+      sub.surfaceId,
+      this._surfaceViewId,
+      this.scaledTarget(),
+    );
   }
 
   // -----------------------------------------------------------------------

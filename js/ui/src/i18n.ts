@@ -259,6 +259,40 @@ const en: Messages = {
 
   "overlay.close": "Esc",
 
+  "link.label": "Link",
+  "link.confirmTitle": "Open this link?",
+  "link.blockedTitle": "Link blocked",
+  "link.destination": "Destination",
+  "link.linkText": "Link text",
+  "link.open": "Open link",
+  "link.cancel": "Cancel",
+  "link.dismiss": "Close",
+  "link.mismatch":
+    "The text on screen does not match where this link goes. The destination below is where you would actually be taken.",
+  "link.escapedNote":
+    "Characters shown as <U+XXXX> are invisible in the original link.",
+  "link.statusPrefix": "Link:",
+  // One per UrlReason from @blit-sh/core, so the explanation is translated
+  // rather than passing the core module's English `detail` straight through.
+  "link.reason.empty": "This link has no destination.",
+  "link.reason.too-long": "This link is too long to show you in full.",
+  "link.reason.hidden-characters":
+    "This link contains invisible or text-reordering characters, so what it displays cannot be trusted to match where it goes.",
+  "link.reason.no-scheme":
+    "This link has no scheme, so there is no way to tell what opening it would do.",
+  "link.reason.dangerous-scheme":
+    "This link uses a scheme that can run code or inject content into this page.",
+  "link.reason.remote-file":
+    "This link points at a file on another machine, which can leak your credentials.",
+  "link.reason.local-file":
+    "This link opens a file on this machine, which may be an executable.",
+  "link.reason.custom-scheme":
+    "This link is handled by another application on this machine.",
+  "link.reason.embedded-credentials":
+    "This link carries a username in front of the real destination, a common way to disguise where a link goes.",
+  "link.reason.deceptive-host":
+    "This link's host uses characters that can look like a different name.",
+
   "workspace.newTerminal": "New terminal",
   "workspace.menu": "Menu",
   "workspace.help": "Help",
