@@ -237,7 +237,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 9   | `KV`                 | Server supports the `KV_*` key-value family                     |
 | 10  | `NET`                | Server supports the `NET_*` network-relay family                |
 | 11  | `PLUGIN`             | Proposed: server supports Wasmi plugin lifecycle and events     |
-| 12  | `CHANNEL`            | Proposed: server supports channels, state, and topics           |
+| 12  | `CHANNEL`            | Proposed: server supports bidirectional named channels          |
 | 13  | `PROCESS`            | Proposed: server supports non-PTY child processes               |
 | 14  | `CREATE_STATUS`      | `CREATE2(WANT_STATUS)` receives an explicit failure             |
 | 15  | `KILL_MODE`          | `KILL`/`CLOSE` reach the process group; `KILL` takes `flags`    |
