@@ -19,6 +19,9 @@ export type {
 export { measureCell, cssFontFamily } from "./measure";
 export type { CellMetrics } from "./measure";
 
+export { assessUrl, escapeUrlForDisplay, openUrlSafely } from "./urlSecurity";
+export type { UrlAssessment, UrlVerdict, UrlReason } from "./urlSecurity";
+
 export { WebSocketTransport } from "./transports/websocket";
 export { WebTransportTransport } from "./transports/webtransport";
 export { createShareTransport } from "./transports/webrtc-share";
@@ -131,6 +134,7 @@ export { BlitTerminalSurface } from "./BlitTerminalSurface";
 export type {
   BlitTerminalSurfaceOptions,
   BlitTerminalSurfaceHandle,
+  LinkHover,
 } from "./BlitTerminalSurface";
 
 export {

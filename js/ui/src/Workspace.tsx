@@ -29,6 +29,8 @@ import type {
   SessionId,
   TerminalPalette,
   ConnectionId,
+  LinkHover,
+  UrlAssessment,
 } from "@blit-sh/core";
 import type { ConnectionSpec } from "./App";
 import { createMetrics } from "./createMetrics";
@@ -141,6 +143,7 @@ import { SwitcherOverlay } from "./SwitcherOverlay";
 import { PaletteOverlay } from "./PaletteOverlay";
 import { FontOverlay } from "./FontOverlay";
 import { HelpOverlay } from "./HelpOverlay";
+import { LinkOverlay } from "./LinkOverlay";
 import { RemotesOverlay } from "./RemotesOverlay";
 import { shellCapabilities } from "./shellCapabilities";
 import { RootsOverlay } from "./RootsOverlay";
@@ -202,6 +205,7 @@ export type Overlay =
   | "roots"
   | "media"
   | "web"
+  | "link"
   | null;
 
 function getHmrWorkspace(wasm: BlitWasmModule): BlitWorkspace {
@@ -782,6 +786,15 @@ function WorkspaceScreen(props: {
   const [isMobileTouch, setIsMobileTouch] = createSignal(false);
   const [terminalSurface, setTerminalSurface] =
     createSignal<BlitTerminalSurface | null>(null);
+
+  // --- Terminal hyperlinks ---
+  // `hoveredLink` drives the status-bar preview; `pendingLink` is the target
+  // awaiting a decision in the confirmation overlay.
+  const [hoveredLink, setHoveredLink] = createSignal<LinkHover | null>(null);
+  const [pendingLink, setPendingLink] = createSignal<{
+    assessment: UrlAssessment;
+    text: string;
+  } | null>(null);
 
   onMount(() => {
     const isTouch = () =>
@@ -2479,10 +2492,42 @@ function WorkspaceScreen(props: {
     fontOverlayOrigin = null;
     setOpenInNewTerminalMode(false);
     setNewTerminalTargetPaneId(null);
+    // Dismissing the link dialog by any route — button, backdrop, Escape —
+    // means "do not open". Clearing here keeps that true for all of them.
+    setPendingLink(null);
     setOverlay(null);
     const el = previousFocus;
     previousFocus = null;
     if (el instanceof HTMLElement) setTimeout(() => el.focus(), 0);
+  }
+
+  /**
+   * Bind hyperlink hover and activation to a terminal surface as it mounts.
+   *
+   * Applied to *every* surface, not just the focused one: hovering follows the
+   * pointer, so a link in an unfocused split must still preview and open. The
+   * WeakSet guards against re-binding a surface that a re-render hands back,
+   * and unbinding is left to surface disposal — the listeners live on the
+   * surface itself, so they die with it.
+   */
+  const linkBoundSurfaces = new WeakSet<BlitTerminalSurface>();
+  function bindTerminalLinks(surface: BlitTerminalSurface | null) {
+    if (!surface || linkBoundSurfaces.has(surface)) return;
+    linkBoundSurfaces.add(surface);
+
+    surface.onLinkHover(setHoveredLink);
+    // Replaces core's blocking window.confirm with the in-app dialog. The
+    // verdict still decides: `allow` opens, anything else asks, and the
+    // overlay offers no way to proceed on `deny`.
+    surface.setLinkActivateHandler((assessment) => {
+      if (assessment.verdict === "allow") {
+        window.open(assessment.raw, "_blank", "noopener,noreferrer");
+        return;
+      }
+      setPendingLink({ assessment, text: hoveredLink()?.text ?? "" });
+      previousFocus = document.activeElement as HTMLElement | null;
+      setOverlay("link");
+    });
   }
 
   function restoreOverlayPreview(target: Overlay) {
@@ -3448,7 +3493,10 @@ function WorkspaceScreen(props: {
                                       fontFamily={resolvedFontWithFallback()}
                                       fontSize={fontSize()}
                                       palette={palette()}
-                                      surfaceRef={setTerminalSurface}
+                                      surfaceRef={(s) => {
+                                        setTerminalSurface(s);
+                                        bindTerminalLinks(s);
+                                      }}
                                     />
                                     <Show
                                       when={
@@ -3644,6 +3692,7 @@ function WorkspaceScreen(props: {
                     onSwitcher={() => toggleOverlay("expose")}
                     onHelp={() => toggleOverlay("help")}
                     onRender={countFrame}
+                    onTerminalSurface={bindTerminalLinks}
                   />
                 )}
               </Show>
@@ -4047,6 +4096,22 @@ function WorkspaceScreen(props: {
             />
           )}
         </Show>
+        <Show when={overlay() === "link" && pendingLink()}>
+          {(pending) => (
+            <LinkOverlay
+              palette={palette()}
+              fontSize={fontSize()}
+              assessment={pending().assessment}
+              linkText={pending().text}
+              onOpen={() => {
+                const url = pending().assessment.raw;
+                closeOverlay();
+                window.open(url, "_blank", "noopener,noreferrer");
+              }}
+              onClose={closeOverlay}
+            />
+          )}
+        </Show>
         <Show when={overlay() === "remotes" && shellCapabilities().remotes}>
           {(_) => (
             <RemotesOverlay
@@ -4194,6 +4259,7 @@ function WorkspaceScreen(props: {
             surfaceCount={surfaces().length}
             tileCount={paneKindCount(isTileAssignment)}
             webCount={paneKindCount(isWebAssignment)}
+            hoveredLink={hoveredLink()}
             focusedSession={
               focusedSurfaceId() != null || bspFocusedSurface() != null
                 ? null
