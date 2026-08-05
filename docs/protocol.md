@@ -166,6 +166,11 @@ All three bytes are optional — a 3-byte message uses connection/server default
 | 12  | `CHANNEL`      | Proposed: server supports bidirectional named channels         |
 | 13  | `PROCESS`      | Proposed: server supports non-PTY child processes              |
 
+The proposed bits 11–13 are independently omitted when `BLIT_EXT=0`,
+`BLIT_CHANNEL=0`, or `BLIT_PROCESS=0`; disabled-family requests are refused as
+specified in
+[design/extensions.md](design/extensions.md#security-posture-and-deployment-controls).
+
 `S2C_LIST` entry layout: `[pty_id:2][tag_len:2][tag:N][cmd_len:2][cmd:M]` per
 PTY. The trailing command field is a backward-compatible extension; old
 entries without it parse as an empty command.
