@@ -136,7 +136,7 @@ fn open_reports_repo() {
     let (_h2, info2) = open(sub.to_str().unwrap()).expect("open subdir");
     assert_eq!(info2.workdir, info.workdir);
     // A non-repo directory is WRONG_TYPE; a missing path NOT_FOUND; an
-    // empty/NUL path OTHER (docs/git.md status table).
+    // empty/NUL path INVALID (docs/protocol.md common status registry).
     let plain = temp_dir();
     assert_eq!(
         open(plain.to_str().unwrap()).err().unwrap().0,
@@ -147,8 +147,8 @@ fn open_reports_repo() {
         open(missing.to_str().unwrap()).err().unwrap().0,
         GIT_STATUS_NOT_FOUND
     );
-    assert_eq!(open("").err().unwrap().0, GIT_STATUS_OTHER);
-    assert_eq!(open("bad\0path").err().unwrap().0, GIT_STATUS_OTHER);
+    assert_eq!(open("").err().unwrap().0, GIT_STATUS_INVALID);
+    assert_eq!(open("bad\0path").err().unwrap().0, GIT_STATUS_INVALID);
 }
 
 #[test]
@@ -570,6 +570,9 @@ fn tree_blob_and_base() {
     let (_, status, bases) = parse_git_base_resp(&resp).unwrap();
     assert_eq!(status, GIT_STATUS_OK);
     assert_eq!(bases, vec![parent]);
+    let resp = handle.base(5, &[head], &cancel);
+    let (_, status, _) = parse_git_base_resp(&resp).unwrap();
+    assert_eq!(status, GIT_STATUS_INVALID);
 }
 
 #[test]
@@ -1544,6 +1547,17 @@ fn log_follow_directory_and_unknown_flags() {
         ..follow_dir
     };
     let page = parse_git_commits(&handle.log(&bad_flags, &cancel)).unwrap();
+    assert_eq!(page.status, GIT_STATUS_INVALID);
+    let follow_without_path = GitLogRequest {
+        nonce: 3,
+        repo_id: 0,
+        flags: GIT_LOG_FOLLOW,
+        limit: 0,
+        path: "",
+        tips: vec![],
+        hides: vec![],
+    };
+    let page = parse_git_commits(&handle.log(&follow_without_path, &cancel)).unwrap();
     assert_eq!(page.status, GIT_STATUS_INVALID);
 }
 
@@ -2946,6 +2960,8 @@ fn text_patch_matches_git_diff() {
         &[
             "-c",
             "diff.noprefix=false",
+            "-c",
+            "diff.mnemonicPrefix=false",
             "diff",
             "-M50%",
             "--no-color",
@@ -4573,6 +4589,8 @@ fn worktree_patch_reads_unstaged_content_from_disk() {
         &[
             "-c",
             "diff.noprefix=false",
+            "-c",
+            "diff.mnemonicPrefix=false",
             "diff",
             "--no-color",
             "-U3",
