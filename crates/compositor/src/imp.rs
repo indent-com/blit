@@ -5820,18 +5820,35 @@ pub struct CompositorHandle {
     pub event_rx: mpsc::Receiver<CompositorEvent>,
     pub command_tx: mpsc::Sender<CompositorCommand>,
     pub socket_name: String,
-    pub thread: std::thread::JoinHandle<()>,
-    pub shutdown: Arc<AtomicBool>,
     /// Whether the compositor's Vulkan renderer supports Vulkan Video encode.
     pub vulkan_video_encode: bool,
     /// Whether the compositor's Vulkan renderer supports Vulkan Video AV1 encode.
     pub vulkan_video_encode_av1: bool,
+    thread: std::thread::JoinHandle<()>,
+    shutdown: Arc<AtomicBool>,
     loop_signal: LoopSignal,
 }
 
 impl CompositorHandle {
     pub fn wake(&self) {
         self.loop_signal.wakeup();
+    }
+
+    /// Stop the compositor and wait for it to finish tearing down.
+    ///
+    /// The wait is the point.  Teardown ends in `vkDestroyInstance`, and the
+    /// Vulkan loader `dlclose()`s its layer libraries on the way out; letting
+    /// that run on a detached thread while the process is exiting unmaps code
+    /// out from under whatever the main thread is still executing, which
+    /// lands as a SIGSEGV with no stack.  Joining keeps the unloading inside
+    /// the caller's lifetime, where it is safe.
+    ///
+    /// Simply dropping the handle leaves the compositor running instead --
+    /// there is no orderly stop without calling this.
+    pub fn stop(self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.loop_signal.wakeup();
+        let _ = self.thread.join();
     }
 }
 

@@ -124,11 +124,17 @@ struct Fixture {
     _surface: wl_surface::WlSurface,
     _xdg_surface: xdg_surface::XdgSurface,
     _conn: Connection,
-    // Leave the compositor thread running and let process exit reap it, the
-    // way the server does.  Tripping `handle.shutdown` instead unwinds
-    // `run_compositor` and segfaults in renderer teardown -- a path nothing
-    // in the tree actually takes.
-    _handle: CompositorHandle,
+    // Taken in `Drop` so each test stops its compositor rather than leaving
+    // the thread behind.
+    handle: Option<CompositorHandle>,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.stop();
+        }
+    }
 }
 
 impl Fixture {
@@ -160,7 +166,7 @@ impl Fixture {
             _surface: surface,
             _xdg_surface: xdg_surface,
             _conn: conn,
-            _handle: handle,
+            handle: Some(handle),
         };
         assert!(
             fixture.states_since(0).contains(&State::Activated),
