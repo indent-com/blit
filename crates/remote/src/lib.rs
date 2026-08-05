@@ -45,6 +45,26 @@ pub const ROW_FLAG_WRAPPED: u8 = 1 << 0;
 /// `FrameState::overflow` keyed by cell index.
 const CONTENT_OVERFLOW: u8 = 7;
 
+/// Cell flags1 bit 6: this cell carries an OSC 8 hyperlink.  The link's
+/// identity lives in `FrameState::cell_links`; the bit exists so that (a) the
+/// render hot loop can style a link without a side-table lookup and (b) a cell
+/// gaining or losing a link is visible to the byte-wise cell diff.
+pub const CELL_FLAG1_LINK: u8 = 1 << 6;
+
+/// Sentinel `uri_count` meaning "hyperlink state is unchanged from the previous
+/// frame — keep what you have".  Distinguishes "no links" (count 0, clear the
+/// table) from "nothing to say" without spending bytes on an unchanged table.
+const LINKS_UNCHANGED: u16 = u16::MAX;
+
+/// Upper bound on distinct hyperlink URIs tracked per frame.  Ids are u16 and
+/// 0 means "no link", so 0xFFFF is reserved as the `LINKS_UNCHANGED` sentinel.
+pub const MAX_LINK_ID: u16 = u16::MAX - 1;
+
+/// Longest OSC 8 URI accepted from the PTY.  Anything longer is dropped rather
+/// than truncated — a truncated URI is a *different* URI, and silently
+/// rewriting a link target is worse than showing no link at all.
+pub const MAX_LINK_URI: usize = 4096;
+
 const ENABLE_SCROLL_OPS: bool = true;
 const MODE_ECHO: u16 = 1 << 9;
 const MODE_ICANON: u16 = 1 << 10;
@@ -438,6 +458,12 @@ pub struct FrameState {
     line_flags: Vec<u8>,
     /// Total scrollback lines available for this PTY.
     scrollback_lines: u32,
+    /// OSC 8 hyperlink id per cell, parallel to `cells` (one entry per cell).
+    /// 0 means "no link". Empty when the frame has no hyperlinks at all, so
+    /// the overwhelmingly common link-free case costs no allocation.
+    cell_links: Vec<u16>,
+    /// Hyperlink id -> URI. Ids are frame-local and assigned by the producer.
+    link_uris: BTreeMap<u16, String>,
 }
 
 impl FrameState {
@@ -454,6 +480,8 @@ impl FrameState {
             overflow: BTreeMap::new(),
             line_flags: vec![0; rows as usize],
             scrollback_lines: 0,
+            cell_links: Vec::new(),
+            link_uris: BTreeMap::new(),
         }
     }
 
@@ -515,6 +543,125 @@ impl FrameState {
 
     pub fn overflow_mut(&mut self) -> &mut BTreeMap<usize, String> {
         &mut self.overflow
+    }
+
+    pub fn cell_links(&self) -> &[u16] {
+        &self.cell_links
+    }
+
+    pub fn link_uris(&self) -> &BTreeMap<u16, String> {
+        &self.link_uris
+    }
+
+    pub fn has_links(&self) -> bool {
+        !self.link_uris.is_empty()
+    }
+
+    /// The OSC 8 URI attached to a cell, if any.
+    ///
+    /// A wide character's continuation cell resolves to the same link as the
+    /// character itself, so clicking either half of a CJK glyph follows the
+    /// link rather than only its left column.
+    pub fn cell_link(&self, row: u16, col: u16) -> Option<&str> {
+        if row >= self.rows || col >= self.cols || self.cell_links.is_empty() {
+            return None;
+        }
+        let mut flat = row as usize * self.cols as usize + col as usize;
+        if self.cells[flat * CELL_SIZE + 1] & 4 != 0 && col > 0 {
+            flat -= 1; // wide continuation: inherit the lead cell's link
+        }
+        let id = *self.cell_links.get(flat)?;
+        if id == 0 {
+            return None;
+        }
+        self.link_uris.get(&id).map(String::as_str)
+    }
+
+    /// Raw link id at a cell, resolving wide-character continuations the same
+    /// way `cell_link` does. Used to compare identity without materialising the
+    /// URI string for every cell walked.
+    fn link_id_at(&self, row: u16, col: u16) -> u16 {
+        if row >= self.rows || col >= self.cols || self.cell_links.is_empty() {
+            return 0;
+        }
+        let mut flat = row as usize * self.cols as usize + col as usize;
+        if self.cells[flat * CELL_SIZE + 1] & 4 != 0 && col > 0 {
+            flat -= 1;
+        }
+        self.cell_links.get(flat).copied().unwrap_or(0)
+    }
+
+    /// The full extent of the hyperlink covering `(row, col)`, as one
+    /// `(row, start_col, end_col)` segment per screen row it occupies.
+    ///
+    /// A hyperlink is a property of the *logical* line, so one that runs past
+    /// the right edge continues on the next screen row and must be highlighted
+    /// as a single link rather than two. Rows are joined only across a wrap
+    /// (`ROW_FLAG_WRAPPED`) and only when the span actually touches both the
+    /// last column of one row and the first of the next — two unrelated links
+    /// that happen to share a target stay separate.
+    pub fn link_segments(&self, row: u16, col: u16) -> Vec<(u16, u16, u16)> {
+        let id = self.link_id_at(row, col);
+        if id == 0 || self.cols == 0 {
+            return Vec::new();
+        }
+        let last_col = self.cols - 1;
+
+        // Walk back to the first row/column of the span.
+        let (mut start_row, mut start_col) = (row, col);
+        loop {
+            while start_col > 0 && self.link_id_at(start_row, start_col - 1) == id {
+                start_col -= 1;
+            }
+            if start_col != 0 || start_row == 0 {
+                break;
+            }
+            let prev = start_row - 1;
+            if !self.is_wrapped(prev) || self.link_id_at(prev, last_col) != id {
+                break;
+            }
+            start_row = prev;
+            start_col = last_col;
+        }
+
+        // Walk forward to the last row/column, emitting a segment per row.
+        let mut segments = Vec::new();
+        let (mut cur_row, mut seg_start) = (start_row, start_col);
+        loop {
+            let mut end_col = seg_start;
+            while end_col < last_col && self.link_id_at(cur_row, end_col + 1) == id {
+                end_col += 1;
+            }
+            segments.push((cur_row, seg_start, end_col));
+            if end_col != last_col
+                || cur_row + 1 >= self.rows
+                || !self.is_wrapped(cur_row)
+                || self.link_id_at(cur_row + 1, 0) != id
+            {
+                break;
+            }
+            cur_row += 1;
+            seg_start = 0;
+        }
+        segments
+    }
+
+    /// Replace the frame's hyperlink state wholesale. `cell_links` is accepted
+    /// only at exactly one entry per cell; anything else is treated as "no
+    /// links" rather than silently mapping links onto the wrong cells.
+    pub fn set_links(&mut self, cell_links: Vec<u16>, link_uris: BTreeMap<u16, String>) {
+        let total = self.rows as usize * self.cols as usize;
+        if link_uris.is_empty() || cell_links.len() != total {
+            self.clear_links();
+            return;
+        }
+        self.cell_links = cell_links;
+        self.link_uris = link_uris;
+    }
+
+    pub fn clear_links(&mut self) {
+        self.cell_links.clear();
+        self.link_uris.clear();
     }
 
     pub fn line_flags(&self) -> &[u8] {
@@ -579,6 +726,9 @@ impl FrameState {
         self.cols = cols;
         self.cells = vec![0; rows as usize * cols as usize * CELL_SIZE];
         self.overflow.clear();
+        // Link ids are indexed by flat cell position, so they are meaningless
+        // once the grid is reshaped. The next frame re-sends them.
+        self.clear_links();
         self.line_flags = vec![0; rows as usize];
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
@@ -774,6 +924,7 @@ impl FrameState {
         }
         let mut result = String::new();
         let mut cur_style = CellStyle::default();
+        let mut cur_link: Option<&str> = None;
         for row in 0..self.rows {
             let mut line = String::new();
             let mut col = 0u16;
@@ -783,8 +934,22 @@ impl FrameState {
                     push_sgr(&mut line, &style);
                     cur_style = style;
                 }
+                // Re-emit OSC 8 so a dump of the screen stays as clickable as
+                // the screen itself. Only transitions are written, matching how
+                // the sequence arrived.
+                let link = self.cell_link(row, col);
+                if link != cur_link {
+                    push_osc8(&mut line, link);
+                    cur_link = link;
+                }
                 line.push_str(self.cell_content(row, col));
                 col += 1;
+            }
+            // Close the span before trimming: trailing blanks inside a link
+            // would otherwise carry the closing sequence away with them.
+            if cur_link.is_some() {
+                push_osc8(&mut line, None);
+                cur_link = None;
             }
             let trimmed = line.trim_end();
             result.push_str(trimmed);
@@ -1073,6 +1238,9 @@ impl TerminalState {
                 payload[after_line_flags + 2],
                 payload[after_line_flags + 3],
             ]);
+            // Trailing OSC 8 hyperlink section. A server that predates it
+            // simply ends the payload here, which reads as "no links".
+            self.apply_links_section(&payload[after_line_flags + 4..]);
         }
 
         self.frame.cursor_row = new_cursor_row.min(self.frame.rows.saturating_sub(1));
@@ -1085,6 +1253,74 @@ impl TerminalState {
             || new_cursor_row != old_cursor_row
             || new_cursor_col != old_cursor_col
             || new_mode != old_mode
+    }
+
+    /// Decode the trailing hyperlink section. Any malformed or truncated
+    /// section clears links rather than leaving a half-applied mapping —
+    /// showing no link is always safe, showing the *wrong* link is not.
+    fn apply_links_section(&mut self, data: &[u8]) {
+        if data.len() < 2 {
+            self.frame.clear_links();
+            return;
+        }
+        let uri_count = u16::from_le_bytes([data[0], data[1]]);
+        if uri_count == LINKS_UNCHANGED {
+            return;
+        }
+        let mut off = 2usize;
+        let mut link_uris = BTreeMap::new();
+        for _ in 0..uri_count {
+            if off + 4 > data.len() {
+                self.frame.clear_links();
+                return;
+            }
+            let id = u16::from_le_bytes([data[off], data[off + 1]]);
+            let len = u16::from_le_bytes([data[off + 2], data[off + 3]]) as usize;
+            off += 4;
+            if off + len > data.len() || len > MAX_LINK_URI {
+                self.frame.clear_links();
+                return;
+            }
+            // A URI that is not valid UTF-8, or that carries an id of 0 (the
+            // "no link" sentinel), is dropped instead of being coerced.
+            if id != 0
+                && let Ok(uri) = std::str::from_utf8(&data[off..off + len])
+            {
+                link_uris.insert(id, uri.to_owned());
+            }
+            off += len;
+        }
+        if off + 2 > data.len() {
+            self.frame.clear_links();
+            return;
+        }
+        let run_count = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
+        off += 2;
+
+        let total = self.frame.rows as usize * self.frame.cols as usize;
+        let mut cell_links = vec![0u16; total];
+        for _ in 0..run_count {
+            if off + 8 > data.len() {
+                self.frame.clear_links();
+                return;
+            }
+            let start = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                as usize;
+            let len = u16::from_le_bytes([data[off + 4], data[off + 5]]) as usize;
+            let id = u16::from_le_bytes([data[off + 6], data[off + 7]]);
+            off += 8;
+            // Ignore runs that fall outside the grid or name an unknown id
+            // rather than rejecting the whole frame.
+            if id == 0 || !link_uris.contains_key(&id) {
+                continue;
+            }
+            let end = start.saturating_add(len).min(total);
+            if start >= total {
+                continue;
+            }
+            cell_links[start..end].fill(id);
+        }
+        self.frame.set_links(cell_links, link_uris);
     }
 
     fn apply_legacy_patch_payload(&mut self, payload: &[u8]) -> Option<(bool, usize)> {
@@ -2636,6 +2872,24 @@ pub fn msg_c2s_clipboard_set(mime_type: &str, data: &[u8]) -> Vec<u8> {
     msg
 }
 
+/// Write an OSC 8 open (`Some`) or close (`None`) sequence, ST-terminated.
+///
+/// The URI is emitted verbatim except for the two bytes that would break out of
+/// the sequence itself: a control byte inside the URI would terminate the OSC
+/// early and let the remainder be interpreted as terminal input by whatever
+/// consumes this dump.
+fn push_osc8(out: &mut String, uri: Option<&str>) {
+    out.push_str("\x1b]8;;");
+    if let Some(uri) = uri {
+        for ch in uri.chars() {
+            if ch != '\x1b' && ch != '\x07' {
+                out.push(ch);
+            }
+        }
+    }
+    out.push_str("\x1b\\");
+}
+
 fn push_sgr(out: &mut String, style: &CellStyle) {
     use std::fmt::Write;
     out.push_str("\x1b[0");
@@ -2751,9 +3005,17 @@ pub fn build_update_msg(
         }
     }
 
+    // Hyperlink identity lives outside the 12-byte cell, so retargeting a span
+    // at a new URI leaves every cell byte-identical. That must still produce a
+    // frame, or the client keeps following the old link.
+    let links_changed = keyframe
+        || current.link_uris != previous.link_uris
+        || current.cell_links != previous.cell_links;
+
     if op_count == 0 {
         // No cell changes — still emit a frame if cursor/mode/title changed.
         if !title_changed
+            && !links_changed
             && current.cursor_row == previous.cursor_row
             && current.cursor_col == previous.cursor_col
             && current.mode == previous.mode
@@ -2826,6 +3088,9 @@ pub fn build_update_msg(
     }
     // Trailing scrollback count — old clients ignore extra bytes.
     payload.extend_from_slice(&current.scrollback_lines.to_le_bytes());
+    // Trailing OSC 8 hyperlink section — likewise ignored by old clients, and
+    // its absence reads as "no links" on new clients talking to an old server.
+    append_links_section(&mut payload, current, links_changed);
 
     let compressed = compress_prepend_size(&payload);
     let mut msg = Vec::with_capacity(3 + compressed.len());
@@ -2833,6 +3098,70 @@ pub fn build_update_msg(
     msg.extend_from_slice(&pty_id.to_le_bytes());
     msg.extend_from_slice(&compressed);
     Some(msg)
+}
+
+/// Serialize the OSC 8 hyperlink section:
+///
+/// ```text
+/// [u16 uri_count]                                  0xFFFF = unchanged, stop
+///   uri_count x [u16 link_id][u16 uri_len][uri utf8]
+/// [u16 run_count]
+///   run_count x [u32 start_cell][u16 run_len][u16 link_id]
+/// ```
+///
+/// The cell->id mapping is run-length encoded because a hyperlink always spans
+/// a contiguous span of cells, and it is sent in full rather than diffed: cell
+/// ops (`OP_COPY_RECT` / `OP_FILL_RECT`) relocate cells, and replaying those
+/// transforms against a parallel id array is a correctness trap for a section
+/// that is nearly always empty. When the state is unchanged the whole section
+/// costs two bytes.
+/// `changed` is computed by the caller and is always true for a keyframe, so a
+/// client resyncing from an unknown baseline is told the link state outright
+/// instead of being asked to keep whatever it happened to be holding.
+fn append_links_section(out: &mut Vec<u8>, current: &FrameState, changed: bool) {
+    if !changed {
+        out.extend_from_slice(&LINKS_UNCHANGED.to_le_bytes());
+        return;
+    }
+    let uri_count = current.link_uris.len().min(MAX_LINK_ID as usize);
+    out.extend_from_slice(&(uri_count as u16).to_le_bytes());
+    for (&id, uri) in current.link_uris.iter().take(uri_count) {
+        let bytes = uri.as_bytes();
+        let len = bytes.len().min(MAX_LINK_URI);
+        out.extend_from_slice(&id.to_le_bytes());
+        out.extend_from_slice(&(len as u16).to_le_bytes());
+        out.extend_from_slice(&bytes[..len]);
+    }
+    if uri_count == 0 {
+        out.extend_from_slice(&0u16.to_le_bytes());
+        return;
+    }
+
+    // Run-length encode the cell -> id map, skipping id 0 (unlinked) runs.
+    let mut runs: Vec<(u32, u16, u16)> = Vec::new();
+    let mut i = 0usize;
+    while i < current.cell_links.len() {
+        let id = current.cell_links[i];
+        if id == 0 {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < current.cell_links.len()
+            && current.cell_links[i] == id
+            && i - start < u16::MAX as usize
+        {
+            i += 1;
+        }
+        runs.push((start as u32, (i - start) as u16, id));
+    }
+    let run_count = runs.len().min(u16::MAX as usize);
+    out.extend_from_slice(&(run_count as u16).to_le_bytes());
+    for &(start, len, id) in runs.iter().take(run_count) {
+        out.extend_from_slice(&start.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&id.to_le_bytes());
+    }
 }
 
 /// Serialize overflow strings: [u16 count] [for each: u32 cell_index, u16 len, utf8 bytes]
@@ -3324,6 +3653,220 @@ mod tests {
         assert!(term.feed_compressed(payload));
         assert_eq!(term.title(), "two");
         assert_eq!(term.get_all_text(), "hello\nworld");
+    }
+
+    /// Build a frame whose cells 0..len on row 0 all point at `uri`.
+    fn frame_with_link(rows: u16, cols: u16, text: &str, uri: &str) -> FrameState {
+        let mut frame = FrameState::new(rows, cols);
+        frame.write_text(0, 0, text, CellStyle::default());
+        let mut cell_links = vec![0u16; rows as usize * cols as usize];
+        for slot in cell_links.iter_mut().take(text.len()) {
+            *slot = 1;
+        }
+        let mut uris = BTreeMap::new();
+        uris.insert(1u16, uri.to_string());
+        frame.set_links(cell_links, uris);
+        frame
+    }
+
+    fn feed(term: &mut TerminalState, msg: &[u8]) {
+        let ServerMsg::Update { payload, .. } = parse_server_msg(msg).unwrap() else {
+            panic!("expected update");
+        };
+        term.feed_compressed(payload);
+    }
+
+    #[test]
+    fn link_segments_cover_a_single_row_span() {
+        let frame = frame_with_link(2, 16, "click", "https://blit.sh");
+        assert_eq!(frame.link_segments(0, 2), vec![(0, 0, 4)]);
+        // Anywhere inside the span resolves to the same extent.
+        assert_eq!(frame.link_segments(0, 0), frame.link_segments(0, 4));
+        assert!(frame.link_segments(0, 5).is_empty());
+        assert!(frame.link_segments(1, 0).is_empty());
+    }
+
+    #[test]
+    fn link_segments_join_across_a_wrapped_row() {
+        // A link occupying the last 3 cells of row 0 and the first 2 of row 1,
+        // with row 0 marked as wrapping into row 1.
+        let mut frame = FrameState::new(3, 8);
+        frame.write_text(0, 0, "aaaaabbb", CellStyle::default());
+        frame.write_text(1, 0, "bbcccccc", CellStyle::default());
+        frame.set_wrapped(0, true);
+        let mut cell_links = vec![0u16; 24];
+        cell_links[5..8].fill(1); // row 0, cols 5-7
+        cell_links[8..10].fill(1); // row 1, cols 0-1
+        let mut uris = BTreeMap::new();
+        uris.insert(1u16, "https://wrapped.example".to_string());
+        frame.set_links(cell_links, uris);
+
+        let expected = vec![(0, 5, 7), (1, 0, 1)];
+        // Reachable from either half, and from either end.
+        assert_eq!(frame.link_segments(0, 5), expected);
+        assert_eq!(frame.link_segments(0, 7), expected);
+        assert_eq!(frame.link_segments(1, 0), expected);
+        assert_eq!(frame.link_segments(1, 1), expected);
+    }
+
+    #[test]
+    fn link_segments_do_not_join_unwrapped_rows() {
+        // Same layout, but row 0 does not wrap: two separate links that happen
+        // to share a target must not merge into one highlight.
+        let mut frame = FrameState::new(3, 8);
+        frame.write_text(0, 0, "aaaaabbb", CellStyle::default());
+        frame.write_text(1, 0, "bbcccccc", CellStyle::default());
+        let mut cell_links = vec![0u16; 24];
+        cell_links[5..8].fill(1);
+        cell_links[8..10].fill(1);
+        let mut uris = BTreeMap::new();
+        uris.insert(1u16, "https://same.example".to_string());
+        frame.set_links(cell_links, uris);
+
+        assert_eq!(frame.link_segments(0, 6), vec![(0, 5, 7)]);
+        assert_eq!(frame.link_segments(1, 0), vec![(1, 0, 1)]);
+    }
+
+    #[test]
+    fn link_segments_span_three_rows() {
+        let mut frame = FrameState::new(4, 4);
+        frame.set_wrapped(0, true);
+        frame.set_wrapped(1, true);
+        let mut cell_links = vec![0u16; 16];
+        cell_links[2..14].fill(1); // row 0 col 2 .. row 3 col 1
+        let mut uris = BTreeMap::new();
+        uris.insert(1u16, "https://long.example".to_string());
+        frame.set_links(cell_links, uris);
+
+        // Row 2 does not wrap, so the span stops at the end of row 2.
+        assert_eq!(
+            frame.link_segments(1, 1),
+            vec![(0, 2, 3), (1, 0, 3), (2, 0, 3)]
+        );
+    }
+
+    #[test]
+    fn links_round_trip_over_the_wire() {
+        let frame = frame_with_link(2, 16, "click", "https://blit.sh/docs");
+
+        let mut term = TerminalState::new(2, 16);
+        feed(
+            &mut term,
+            &build_update_msg(3, &frame, &FrameState::default()).unwrap(),
+        );
+
+        assert_eq!(term.frame().cell_link(0, 0), Some("https://blit.sh/docs"));
+        assert_eq!(term.frame().cell_link(0, 4), Some("https://blit.sh/docs"));
+        assert_eq!(term.frame().cell_link(0, 5), None);
+        assert_eq!(term.frame().cell_link(1, 0), None);
+    }
+
+    #[test]
+    fn links_can_be_cleared_and_retargeted() {
+        let first = frame_with_link(1, 16, "click", "https://one.example");
+        let mut term = TerminalState::new(1, 16);
+        feed(
+            &mut term,
+            &build_update_msg(3, &first, &FrameState::default()).unwrap(),
+        );
+        assert_eq!(term.frame().cell_link(0, 0), Some("https://one.example"));
+
+        // Retarget the same glyphs at a different URI. The cell bytes are
+        // byte-identical, so this only survives if the link section is diffed
+        // independently of the cell grid.
+        let second = frame_with_link(1, 16, "click", "https://two.example");
+        assert_eq!(second.cells(), first.cells());
+        feed(&mut term, &build_update_msg(3, &second, &first).unwrap());
+        assert_eq!(term.frame().cell_link(0, 0), Some("https://two.example"));
+
+        // Dropping the link clears it client-side.
+        let mut third = second.clone();
+        third.clear_links();
+        feed(&mut term, &build_update_msg(3, &third, &second).unwrap());
+        assert_eq!(term.frame().cell_link(0, 0), None);
+    }
+
+    #[test]
+    fn unchanged_links_cost_two_bytes_and_survive() {
+        let frame = frame_with_link(1, 16, "click", "https://blit.sh");
+        let mut term = TerminalState::new(1, 16);
+        feed(
+            &mut term,
+            &build_update_msg(3, &frame, &FrameState::default()).unwrap(),
+        );
+
+        // A frame that only moves the cursor must not resend the link table,
+        // but the client must still hold on to it.
+        let mut moved = frame.clone();
+        moved.set_cursor(0, 7);
+        let delta = build_update_msg(3, &moved, &frame).unwrap();
+        feed(&mut term, &delta);
+        assert_eq!(term.frame().cell_link(0, 0), Some("https://blit.sh"));
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&LINKS_UNCHANGED.to_le_bytes());
+        assert_eq!(payload.len(), 2);
+    }
+
+    #[test]
+    fn frame_without_links_section_reads_as_no_links() {
+        // Simulates an old server: a payload that stops right after the
+        // trailing scrollback count must not leave stale links behind.
+        let frame = frame_with_link(1, 8, "click", "https://blit.sh");
+        let mut term = TerminalState::new(1, 8);
+        feed(
+            &mut term,
+            &build_update_msg(3, &frame, &FrameState::default()).unwrap(),
+        );
+        assert!(term.frame().has_links());
+
+        let mut plain = FrameState::new(1, 8);
+        plain.write_text(0, 0, "click", CellStyle::default());
+        feed(
+            &mut term,
+            &build_update_msg(3, &plain, &FrameState::default()).unwrap(),
+        );
+        assert!(!term.frame().has_links());
+        assert_eq!(term.frame().cell_link(0, 0), None);
+    }
+
+    #[test]
+    fn malformed_link_section_clears_rather_than_half_applies() {
+        let mut term = TerminalState::new(1, 8);
+        // uri_count claims one entry, but the payload ends mid-header.
+        term.apply_links_section(&[1, 0, 9, 0]);
+        assert!(!term.frame().has_links());
+
+        // A run naming an id absent from the table is skipped, not applied.
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u16.to_le_bytes()); // uri_count
+        data.extend_from_slice(&1u16.to_le_bytes()); // id 1
+        data.extend_from_slice(&3u16.to_le_bytes()); // len
+        data.extend_from_slice(b"a:b");
+        data.extend_from_slice(&1u16.to_le_bytes()); // run_count
+        data.extend_from_slice(&0u32.to_le_bytes()); // start
+        data.extend_from_slice(&2u16.to_le_bytes()); // len
+        data.extend_from_slice(&7u16.to_le_bytes()); // unknown id
+        term.apply_links_section(&data);
+        assert_eq!(term.frame().cell_link(0, 0), None);
+    }
+
+    #[test]
+    fn link_run_past_the_grid_is_clamped() {
+        let mut term = TerminalState::new(1, 4);
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&15u16.to_le_bytes());
+        data.extend_from_slice(b"https://ok.test");
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&9999u16.to_le_bytes()); // run overruns the grid
+        data.extend_from_slice(&1u16.to_le_bytes());
+        term.apply_links_section(&data);
+
+        assert_eq!(term.frame().cell_link(0, 3), Some("https://ok.test"));
+        assert_eq!(term.frame().cell_link(0, 4), None); // out of bounds
     }
 
     #[test]

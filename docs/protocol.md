@@ -229,7 +229,7 @@ After `S2C_READY`, the client can start sending commands. `S2C_UPDATE` frames ar
 
 ```
 Byte 0 (flags0): fg_type[2] | bg_type[2] | bold | dim | italic | underline
-Byte 1 (flags1): inverse | wide | wide_continuation | content_len[3] | (reserved)
+Byte 1 (flags1): inverse | wide | wide_continuation | content_len[3] | link
 Bytes 2–4:       fg color (r, g, b) or palette index
 Bytes 5–7:       bg color (r, g, b) or palette index
 Bytes 8–11:      UTF-8 content (up to 4 bytes)
@@ -238,6 +238,25 @@ Bytes 8–11:      UTF-8 content (up to 4 bytes)
 Color type encoding: 0 = default terminal color, 1 = indexed (256-color palette), 2 = RGB true color.
 
 When `content_len == 7`, the cell's text exceeds 4 bytes. Bytes 8–11 hold an FNV-1a hash used for diff comparison; the actual UTF-8 string is transmitted in the `STRINGS_PRESENT` section, keyed by cell index.
+
+`link` (bit 6) marks a cell covered by an OSC 8 hyperlink. The target lives in the hyperlink section below; the bit exists so the renderer can style a link without a side-table lookup, and so a cell gaining or losing a link is visible to the byte-wise cell diff.
+
+**Hyperlink section** — trailing, after the scrollback count:
+
+```
+[u16 uri_count]                                     0xFFFF = unchanged, section ends
+  uri_count × [u16 link_id][u16 uri_len][uri utf8]
+[u16 run_count]
+  run_count × [u32 start_cell][u16 run_len][u16 link_id]
+```
+
+Like the scrollback count it follows, this section is a backward-compatible extension: a client that predates it stops reading after the scrollback count, and its absence reads as "no hyperlinks" on a new client talking to an old server. No capability negotiation is involved.
+
+`link_id` is frame-local and `0` means "no link", so `0xFFFF` is free to serve as the `unchanged` sentinel — which is what an idle frame costs: two bytes. When the state does change the table is sent in full rather than diffed, because `OP_COPY_RECT` / `OP_FILL_RECT` relocate cells and replaying those transforms against a parallel id array is a correctness trap for a section that is nearly always empty. Keyframes always send the table explicitly rather than claiming "unchanged".
+
+URIs are deduplicated by target, capped at 4096 bytes, and dropped rather than truncated when longer — a truncated URI is a _different_ URI. The cell→id map is run-length encoded because a hyperlink always spans contiguous cells.
+
+The server relays targets verbatim and applies no scheme filtering: OSC 8 deliberately decouples a link's text from its target, and only the client is positioned to show the user that discrepancy. `@blit-sh/core`'s `assessUrl()` classifies every target as `allow` / `confirm` / `deny` before it can be opened — rejecting script-executing schemes and any URI containing invisible or text-reordering codepoints, and escaping every target for display so a preview cannot misrepresent itself.
 
 **Mode bits** (16-bit field in frame header):
 

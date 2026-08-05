@@ -953,6 +953,37 @@ impl Terminal {
         self.inner.is_wrapped(row)
     }
 
+    /// The OSC 8 hyperlink target at a cell, or `undefined` when the cell
+    /// carries none. The URI is returned exactly as the application sent it —
+    /// validation and display escaping are the caller's job, because only the
+    /// caller knows whether it is about to render the string or navigate to it.
+    pub fn link_at(&self, row: u16, col: u16) -> Option<String> {
+        self.inner.frame().cell_link(row, col).map(str::to_owned)
+    }
+
+    /// Whether the frame carries any OSC 8 hyperlinks at all. Lets the client
+    /// skip per-cell link probing entirely on the common link-free frame.
+    pub fn has_links(&self) -> bool {
+        self.inner.frame().has_links()
+    }
+
+    /// The full extent of the hyperlink covering `(row, col)`, flattened as
+    /// `[row, start_col, end_col, ...]` triples — one per screen row the link
+    /// occupies. Empty when there is no link there.
+    ///
+    /// A link that runs off the right edge continues on the next row, so this
+    /// returns several triples for a wrapped link and the caller draws one
+    /// continuous highlight across all of them.
+    pub fn link_segments(&self, row: u16, col: u16) -> Vec<u16> {
+        let mut out = Vec::new();
+        for (r, start, end) in self.inner.frame().link_segments(row, col) {
+            out.push(r);
+            out.push(start);
+            out.push(end);
+        }
+        out
+    }
+
     pub fn row_col_map(&self, row: u16) -> Vec<u16> {
         let frame = self.inner.frame();
         let cols = frame.cols();
