@@ -257,8 +257,7 @@ The initial SDK targets `wasm32-unknown-unknown`. A module:
 
 - exports linear memory as `memory`;
 - exports `blit_main: () -> i32`;
-- imports `send` and `recv` from module `blit_v1`;
-- optionally contains a `blit.manifest.v1` custom section.
+- imports `send` and `recv` from module `blit_v1`.
 
 Returning from `blit_main` ends the attempt. Its `i32` is the attempt exit
 code. A trap, invalid host call, resource-limit breach, or rejected packet
@@ -398,11 +397,11 @@ logical name is:
 blit-plugin:<label>#<short-plugin-id>
 ```
 
-`label` is chosen from the explicit invocation or durable name, then the
-manifest name, then the module hash prefix. User-controlled labels are
-converted to printable ASCII, separators are collapsed, and path components,
-control characters, and secrets are never included. The stable plugin ID
-suffix distinguishes concurrent transient instances of the same module.
+`label` is chosen from the explicit invocation or durable name, then the module
+hash prefix. User-controlled labels are converted to printable ASCII,
+separators are collapsed, and path components, control characters, and secrets
+are never included. The stable plugin ID suffix distinguishes concurrent
+transient instances of the same module.
 
 A shared helper compacts that logical name for each platform while retaining
 the component prefix and ID suffix. For example, a Linux-sized name might be
@@ -427,7 +426,7 @@ A module object ID is the full 32-byte BLAKE3 digest of the exact Wasm
 module bytes. It is rendered as 64 lowercase hexadecimal digits in paths and
 human output. Truncation is not permitted for storage or wire identity.
 
-Arguments, delegated capabilities, limits, and attachment mode are invocation
+Arguments, effective capabilities, limits, and attachment mode are invocation
 properties. They do not affect the module object hash.
 
 ### Cache
@@ -445,8 +444,7 @@ Insertion is atomic:
 2. enforce the declared and actual size caps;
 3. hash the received bytes and compare all 32 bytes;
 4. validate the module and its allowed imports;
-5. parse and validate the optional manifest;
-6. fsync when configured, rename into the object path, then acknowledge.
+5. fsync when configured, rename into the object path, then acknowledge.
 
 An existing valid object makes upload idempotently successful. Corrupt cache
 entries are quarantined or ignored and are never executed.
@@ -588,7 +586,7 @@ Run phases:
 | Value | Name          | Meaning                                                  |
 | ----- | ------------- | -------------------------------------------------------- |
 | 1     | `NEED_OBJECT` | Object absent; one uploader should send it               |
-| 2     | `VALIDATING`  | Bytes complete; hash/import/manifest validation          |
+| 2     | `VALIDATING`  | Bytes complete; hash and import validation               |
 | 3     | `QUEUED`      | Valid attempt waiting for an execution slot              |
 | 4     | `RUNNING`     | `task_id` is live and its logical client exists          |
 | 5     | `BACKOFF`     | Supervisor will start another attempt at the stated time |
@@ -624,9 +622,9 @@ explicitly cancelled, or the server exits. Its event log is a bounded byte
 ring across attempts, so a later `ATTACH` receives a retained suffix followed
 by live events. Detached attempts still end at their configured deadline. The
 version-1 default is a five-minute wall-clock deadline for attached attempts
-and no wall-clock deadline for detached or persistent attempts. A manifest or
-server policy may impose a finite detached deadline; detaching never removes
-fuel, memory, process, mailbox, capability, or cancellation limits.
+and no wall-clock deadline for detached or persistent attempts. Server policy
+may impose a finite detached deadline; detaching never removes fuel, memory,
+process, mailbox, capability, or cancellation limits.
 
 Every attempt has a 32-bit process-local `task_id`. Task IDs are not durable;
 `plugin_id` and `attempt` are the stable coordinates followed by clients.
@@ -642,10 +640,9 @@ wall-clock start time, so restarting blit cannot be used to bypass crash-loop
 backoff.
 
 Failures which cannot improve by retrying transition to `BLOCKED` rather than
-looping: missing or corrupt pinned object, unsupported host ABI, invalid
-manifest, revoked authority, or a deterministic instantiation/import error.
-An object repair, policy reload, definition update, or explicit `ENABLE`
-causes revalidation.
+looping: missing or corrupt pinned object, unsupported host ABI, revoked
+authority, or a deterministic instantiation/import error. An object repair,
+policy reload, definition update, or explicit `ENABLE` causes revalidation.
 
 ### Persistence across server restarts
 
@@ -653,7 +650,7 @@ Persistent definitions are durable desired state, separate from the Wasmi
 instance. The server transactionally stores:
 
 - stable plugin ID and unique name;
-- object hash, arguments, manifest digest, and effective capability ceiling;
+- object hash, arguments, and effective capability ceiling;
 - resource limits and restart policy;
 - enabled/desired-running state;
 - attempt counter, consecutive-failure count, and next eligible start time.
@@ -704,13 +701,12 @@ such as `com.example.builder`. Metadata and payloads are opaque bytes.
 
 `LISTEN` authorization is checked against the exact name or a policy-approved
 namespace before consulting or claiming the registry. This applies equally to
-network clients and plugins: possession of a broad client connection, or a
-manifest request for `channel.listen`, does not grant every process-global
-name. An unauthorized listen receives `PERMISSION`; a second authorized
-listener for an occupied name receives `CONFLICT`. `CONNECT` has its own
-per-name policy check. First-listener ownership is routing state, never proof of
-identity; peers authenticate the server-supplied `peer` identity instead of the
-channel name.
+network clients and plugins: possession of a broad client connection does not
+grant every process-global name. An unauthorized listen receives `PERMISSION`;
+a second authorized listener for an occupied name receives `CONFLICT`.
+`CONNECT` has its own per-name policy check. First-listener ownership is routing
+state, never proof of identity; peers authenticate the server-supplied `peer`
+identity instead of the channel name.
 
 ### Bidirectional channels (`0x95`)
 
@@ -957,42 +953,32 @@ The SDK multiplexes process events with every other server packet and sends
 ACKs only after the application consumes data. It does not attempt to make
 `std::process::Command` work transparently on a core Wasm target.
 
-## Manifest and capabilities
+## Capabilities and policy
 
-The optional `blit.manifest.v1` custom section contains UTF-8 JSON capped at
-64 KiB:
+Version 1 has no blit-specific module manifest. A Wasm object identifies its
+host ABI through imports such as `blit_v1`; its content hash is its only
+embedded policy identity. Names, arguments, restart policy, and persistence are
+invocation properties carried by `PLUGIN_RUN`.
 
-```json
-{
-  "abi": 1,
-  "name": "com.example.builder",
-  "capabilities": ["terminal", "fs", "git", "channel.listen", "process.spawn"],
-  "limits": {
-    "memory_bytes": 67108864,
-    "fuel": 100000000,
-    "deadline_ms": 300000
-  }
-}
-```
+Effective authority is the intersection of the authenticated invoking
+principal's authority and server policy for the exact module hash or an
+operator-controlled durable plugin name. An unknown hash receives only the
+conservative baseline: handshake, plugin events, outbound channel connections,
+and live topic subscription. Exact-hash policy is the safest grant. Name-based
+policy applies only after authorization to bind that durable name, so choosing
+a string cannot acquire its policy.
 
-The manifest requests; it never grants. Effective authority is:
-
-```text
-invoking principal authority
-    ∩ module requests
-    ∩ server plugin policy
-```
-
-An absent manifest requests the conservative baseline: handshake, plugin
-events, outbound channel connections, and live topic subscription. Server
-operators can define defaults and per-name/hash policy.
-
-Version 1 has no per-invocation capability-grant or resource-limit fields in
-`PLUGIN_RUN`, and therefore no `--grant` or limit-override CLI flags. Effective
-authority and limits come only from the authenticated invoking principal, the
-module manifest, and server policy. A future per-run delegation needs a new
+Resource limits likewise come from server defaults and hash/name policy.
+Version 1 has no per-invocation grant or limit fields in `PLUGIN_RUN`, and no
+`--grant` or limit-override CLI flags. A future per-run delegation needs a new
 feature-gated `PLUGIN_RUN2` or an explicitly negotiated TLV extension; it must
 not reinterpret trailing version-1 bytes.
+
+A plugin does not predeclare the operations it intends to use. Unauthorized
+packets receive the normal family `PERMISSION` result. `HELLO` advertises family
+availability, not the endpoint's authorization; a future capability-query
+packet should be common to network clients and plugins rather than module
+metadata.
 
 `process.spawn` is not in that baseline. Server policy may constrain it by
 module hash or durable name, executable path, argument shape, working-directory
@@ -1106,7 +1092,8 @@ blit plugin remove NAME_OR_ID
 ```
 
 The local pathname is never sent as module identity. It may appear in local
-diagnostics. Servers and peers see the manifest name and content hash.
+diagnostics. Servers and peers see the invocation name when one was supplied
+and the full content hash.
 
 ## Protocol compatibility
 
