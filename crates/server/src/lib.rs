@@ -2189,6 +2189,10 @@ impl Session {
 
     fn allocate_pty_id(&mut self, max_ptys: usize) -> Option<u16> {
         if max_ptys > 0 && self.ptys.len() >= max_ptys {
+            // The callers drop the CREATE with no reply — the protocol has no
+            // "create refused" message — so the client learns about this as a
+            // timeout. Say it here at least, or the cap looks like a hang.
+            eprintln!("blit-server: refusing CREATE, BLIT_MAX_PTYS ({max_ptys}) reached");
             return None;
         }
         let start = self.next_pty_id;

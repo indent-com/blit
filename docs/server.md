@@ -18,6 +18,18 @@
 | `BLIT_SURFACE_ENCODERS`  | see encoder table                                  | Comma-separated encoder priority                                                       |
 | `BLIT_SURFACE_BANDWIDTH` | `medium`                                           | Ceiling on video bandwidth (adaptation only goes cheaper)                              |
 | `BLIT_SURFACE_SPEED`     | `realtime`                                         | Encoder speed preset                                                                   |
+| `BLIT_MAX_CONNECTIONS`   | `0` (unlimited)                                    | Reject client connections past this count                                              |
+| `BLIT_MAX_PTYS`          | `0` (unlimited)                                    | Refuse `CREATE` past this many PTYs across all clients                                 |
+
+`BLIT_MAX_CONNECTIONS` and `BLIT_MAX_PTYS` are an operator sanity bound against
+runaway automation, not a security control — a client that can open one PTY can
+already spend the machine's resources from inside it. Leave them unset unless
+you want a specific ceiling.
+
+A `CREATE` refused by `BLIT_MAX_PTYS` gets no reply, because the protocol has
+no "create refused" message; the client sees a timeout and the server logs the
+refusal. Setting a cap you actually reach is therefore not a graceful
+experience yet.
 
 ## PTY lifecycle
 
