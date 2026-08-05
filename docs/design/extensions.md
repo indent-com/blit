@@ -1,4 +1,4 @@
-# RFC: Wasmi plugins, native channels, and processes
+# RFC: Wasmi extensions, native channels, and processes
 
 - **Status:** Proposed
 - **Date:** 2026-08-05
@@ -7,10 +7,10 @@
 
 ## Summary
 
-Blit should execute Rust plugins compiled to WebAssembly inside the server:
+Blit should execute Rust extensions compiled to WebAssembly inside the server:
 
 ```bash
-blit run --on prod plugin.wasm arg1 arg2
+blit run --on prod extension.wasm arg1 arg2
 ```
 
 The client addresses the module by its full BLAKE3 digest. The server starts
@@ -18,12 +18,12 @@ it immediately when that digest is cached and asks for the module bytes only
 on a cache miss. Uploaded modules are verified, validated, and stored in an
 immutable persistent content-addressed cache.
 
-A plugin may have a restart policy. The server supervises successive
+An extension may have a restart policy. The server supervises successive
 Wasm attempts with bounded exponential backoff. With `--persist`, the desired
-plugin definition is durable and an attempt which was meant to be running
+extension definition is durable and an attempt which was meant to be running
 is launched again after a blit server restart.
 
-A plugin is an **in-process logical blit client**. It exchanges ordinary
+An extension is an **in-process logical blit client**. It exchanges ordinary
 blit packets with the same packet dispatcher as a network client, but does
 not open a socket and does not use transport framing. Its complete host ABI
 is a packet send operation and a blocking packet receive operation. It gets
@@ -59,9 +59,9 @@ requires bounded bytes; using those bytes as a normal blit packet gives exact
 client parity and reuses all existing codecs. The server can dispatch the
 packet directly.
 
-Terminals are not a suitable coordination primitive for plugins. Their byte
+Terminals are not a suitable coordination primitive for extensions. Their byte
 stream has presentation state, escape sequences, process semantics, and no
-message boundaries. Plugins need named discovery, bidirectional messages,
+message boundaries. Extensions need named discovery, bidirectional messages,
 cancellation, and backpressure without pretending to be processes attached to
 PTYs.
 
@@ -70,27 +70,27 @@ PTYs.
 - Run Rust-produced core Wasm modules using Wasmi in the blit server.
 - Upload a module only when the selected server lacks its BLAKE3 object.
 - Supervise failed or completed attempts under an explicit restart policy.
-- Optionally persist desired plugin state across blit server restarts.
-- Give a plugin the same protocol surface as an equivalent remote client.
+- Optionally persist desired extension state across blit server restarts.
+- Give an extension the same protocol surface as an equivalent remote client.
 - Add server-native bidirectional channels.
 - Let clients spawn and control non-PTY server processes with flow-controlled
   stdin, stdout, and stderr streams.
 - Keep the Wasm host ABI very small and versioned.
-- Give each running plugin attempt its own named OS thread.
+- Give each running extension attempt its own named OS thread.
 - Keep untrusted guest execution and slow consumers from exhausting the server.
-- Make plugin disconnect cleanup identical to client disconnect cleanup.
+- Make extension disconnect cleanup identical to client disconnect cleanup.
 - Preserve the existing protocol rule: new feature bits and opcodes; no
   reinterpretation of old messages.
 
 ## Non-goals
 
 - **No parallel WASI API for blit operations.** Standard WASI facilities may
-  optionally provide the plugin's own arguments, stdio, clocks, and randomness.
+  optionally provide the extension's own arguments, stdio, clocks, and randomness.
   Subprocess spawning uses the blit process family, not a private WASI
   extension.
 - **No Component Model requirement.** The first Rust SDK targets a small core
   Wasm ABI. A future component adapter may wrap the same packet endpoint.
-- **No live-instance checkpointing.** Persistent plugins start a fresh
+- **No live-instance checkpointing.** Persistent extensions start a fresh
   Wasmi instance after a server restart. Linear memory, stacks, open handles,
   channels, and in-flight requests are not snapshotted.
 - **No server-native state or pubsub.** Retained shared data remains KV's job;
@@ -106,7 +106,7 @@ PTYs.
 flowchart LR
     Network["Network client"] -->|frames| Decoder["Transport decoder"]
     Decoder -->|packet| Endpoint["Logical client endpoint<br/>identity · outbox"]
-    Plugin["Wasmi plugin"] -->|host send / recv| Endpoint
+    Extension["Wasmi extension"] -->|host send / recv| Endpoint
     Endpoint --> Dispatcher["Shared packet dispatcher"]
     Dispatcher --> Existing["Terminal / FS / Git / LSP / …"]
     Dispatcher --> Fabric["Channel / process fabric"]
@@ -131,9 +131,9 @@ async fn dispatch_packet(
 ```
 
 A network connection reads one framed message and calls `dispatch_packet`.
-A plugin's `blit_send` copies one message from linear memory into a
+An extension's `blit_send` copies one message from linear memory into a
 bounded in-process queue whose consumer calls the same function. Neither
-path dispatches while holding a transport, plugin, or global registry
+path dispatches while holding a transport, extension, or global registry
 lock.
 
 Every endpoint owns connection-scoped family state: filesystem syncs, Git
@@ -144,7 +144,7 @@ regardless of its adapter.
 ### Nonblocking dispatch and slow consumers
 
 `dispatch_packet` must never wait for capacity in any endpoint outbox. Every
-delivery uses a nonblocking `try_enqueue`; transport writers and plugin threads
+delivery uses a nonblocking `try_enqueue`; transport writers and extension threads
 drain their own queues independently. Channel and process data additionally
 obey their credit windows.
 
@@ -154,43 +154,43 @@ out-of-band state transition: it sets cancellation, closes both in-process
 queues or the network transport, and runs normal endpoint resource cleanup. A
 best-effort family-specific closed or lifecycle packet carrying
 `SLOW_CONSUMER` may be sent when space exists, but correctness never depends
-on fitting that final packet. Lifecycle packets such as `PLUGIN_EXIT` and
+on fitting that final packet. Lifecycle packets such as `EXT_EXIT` and
 protocol errors follow this same rule rather than waiting for space. For a
-plugin's own endpoint, this closes the attempt with the `SLOW_CONSUMER` exit
+extension's own endpoint, this closes the attempt with the `SLOW_CONSUMER` exit
 reason; connected channel and process peers observe their normal closed event.
 
-`PLUGIN_EVENT` fan-out performs one independent `try_enqueue` per attached
+`EXT_EVENT` fan-out performs one independent `try_enqueue` per attached
 client after recording the event in the bounded retained ring when retention
 is enabled. One slow follower therefore closes only that follower and never
-stalls the plugin or other followers. If that follower is the owner of a
-non-detached plugin, the ordinary owner-disconnect rule then cancels the
-plugin; detached plugins keep running.
+stalls the extension or other followers. If that follower is the owner of a
+non-detached extension, the ordinary owner-disconnect rule then cancels the
+extension; detached extensions keep running.
 
-This policy also breaks the apparent full-duplex deadlock. A plugin blocked in
+This policy also breaks the apparent full-duplex deadlock. An extension blocked in
 `blit_v1.send` is not calling `recv`, but the endpoint task continues draining
-the plugin-to-endpoint queue. If dispatch of one of those packets needs to send
-back to a full plugin outbox—including through a channel connected to the same
-plugin—`try_enqueue` closes the endpoint instead of blocking. Closing wakes
+the extension-to-endpoint queue. If dispatch of one of those packets needs to send
+back to a full extension outbox—including through a channel connected to the same
+extension—`try_enqueue` closes the endpoint instead of blocking. Closing wakes
 the blocked `send` with `-1` and cancels the attempt. No dispatcher, registry
-lock, or peer endpoint waits for that plugin to call `recv`.
+lock, or peer endpoint waits for that extension to call `recv`.
 
 ### Packet parity
 
-A plugin may form any valid C2S packet. The dispatcher validates and handles it
+An extension may form any valid C2S packet. The dispatcher validates and handles it
 exactly as if it came from a network endpoint. If an operation is available to
-an ordinary client, it is available to a plugin; this includes existing
+an ordinary client, it is available to an extension; this includes existing
 administrative operations. Changing the access model for all blit clients is
 separate work and must not create a Wasm-only path.
 
 ## Lifecycle model
 
-A **plugin** is the stable supervised object created by
-`PLUGIN_RUN`. It has a 64-bit randomly allocated `plugin_id`, a module hash,
+An **extension** is the stable supervised object created by
+`EXT_RUN`. It has a 64-bit randomly allocated `extension_id`, a module hash,
 arguments, restart policy, desired state, and optional durable name. A
-transient ID is process-local; a persistent plugin retains its ID and name
+transient ID is process-local; a persistent extension retains its ID and name
 across server restarts.
 
-An **attempt** is one Wasmi instantiation of that plugin. Attempts are
+An **attempt** is one Wasmi instantiation of that extension. Attempts are
 numbered monotonically from one. A running attempt has its own 32-bit
 process-local `task_id` and logical client endpoint. Destroying an attempt
 therefore closes all of its terminals, subscriptions, relays, listeners, and
@@ -198,7 +198,7 @@ channels before the supervisor considers another attempt.
 
 The distinction prevents a crash from changing the object clients follow:
 attachments, status, retained event output, and control target the stable
-`plugin_id`; events additionally identify the attempt and task which
+`extension_id`; events additionally identify the attempt and task which
 produced them.
 
 Restart policies are:
@@ -214,11 +214,11 @@ shutdown are not attempt failures. `on-failure` treats a zero return as
 successful and transitions to stopped. Execution failures retain their
 backoff; retrying does not change the invocation.
 
-`PERSIST` stores the plugin definition and desired state. It implies
+`PERSIST` stores the extension definition and desired state. It implies
 `DETACH` and requires a unique durable name. Persistence does not itself alter
 the restart policy: the common cross-server daemon form is
 `--restart always --persist --name NAME`. If the server shuts down while a
-persistent plugin is desired-running, the shutdown ends its current
+persistent extension is desired-running, the shutdown ends its current
 attempt without incrementing failure counters and a fresh attempt is launched
 after the next server has initialized its registries.
 
@@ -234,7 +234,7 @@ The initial SDK targets `wasm32-unknown-unknown`. A module:
 
 Returning from `blit_main` ends the attempt. Its `i32` is the attempt exit
 code. A trap, invalid host call, or rejected packet ends the attempt with a
-structured failure reason. The supervisor then applies the plugin's restart
+structured failure reason. The supervisor then applies the extension's restart
 policy.
 
 ### Host ABI
@@ -260,7 +260,7 @@ rather than returning an error code.
 - a positive result `N > capacity` means the packet needs `N` bytes; nothing was
   copied and the packet remains queued.
 
-When no packet is available, `recv` parks the dedicated plugin thread. A
+When no packet is available, `recv` parks the dedicated extension thread. A
 negative capacity, integer overflow, or an invalid destination range traps the
 attempt. The SDK keeps a reusable buffer and retries with `N` bytes only when
 needed. `recv` never returns a negative value.
@@ -273,9 +273,9 @@ logical-message size. Packets are never split, and every valid packet therefore
 fits in an empty mailbox. There is no separate oversized-packet case.
 
 No separate argument, logging, timer, or process imports are needed. After the
-normal `HELLO` / `LIST` / `READY` handshake, the host
-sends `PLUGIN_INFO(INIT)` containing plugin, attempt, task identity, and
-arguments. Guest logs and structured output are `PLUGIN_EVENT` packets. Timers,
+normal `HELLO` / `LIST` / `READY` handshake, the host sends `EXT_INFO(INIT)`
+containing extension, attempt, and task IDs plus arguments. Guest logs and
+structured output are `EXT_EVENT` packets. Timers,
 child processes, and other facilities can be ordinary protocol operations when
 required.
 
@@ -293,7 +293,7 @@ proposal covers environment variables, arguments, stdio, and the current
 process's exit, not `spawn` or `exec`; see the
 [WASI proposal list](https://wasi.dev/releases). A private `proc_spawn`
 import would be possible, but would duplicate blit's lifecycle and streaming
-protocol. Plugins therefore launch child processes through `PROCESS_*`
+protocol. Extensions therefore launch child processes through `PROCESS_*`
 packets, just like any other client.
 
 ### Rust SDK
@@ -320,58 +320,58 @@ peer.send(postcard::to_allocvec(&request)?)?;
 let reply = postcard::from_bytes(&peer.recv()?)?;
 ```
 
-The low-level API remains available so a plugin is never blocked on the SDK
+The low-level API remains available so an extension is never blocked on the SDK
 having wrapped a newly added blit opcode.
 
 ### Dedicated execution thread
 
-Each running plugin attempt owns exactly one OS thread, never shared with
-another plugin. The async supervisor creates a fresh thread for each attempt;
-autorestarts therefore get a new OS thread with the same plugin-derived name.
-A plugin in `QUEUED`, `BACKOFF`, or terminal `STOPPED`, or one which is
+Each running extension attempt owns exactly one OS thread, never shared with
+another extension. The async supervisor creates a fresh thread for each attempt;
+autorestarts therefore get a new OS thread with the same extension-derived name.
+An extension in `QUEUED`, `BACKOFF`, or terminal `STOPPED`, or one which is
 disabled or removed, owns no thread. At most one attempt and thread exist for
-a plugin at a time.
+an extension at a time.
 
 Wasmi execution never occurs on a server async executor thread and never
-occurs under a server lock. The async logical endpoint and synchronous plugin
+occurs under a server lock. The async logical endpoint and synchronous extension
 thread communicate through two bounded in-process queues:
 
-1. the plugin thread instantiates the attempt and calls `blit_main`;
-2. `blit_v1.send` copies a packet into the plugin-to-endpoint queue, blocking
+1. the extension thread instantiates the attempt and calls `blit_main`;
+2. `blit_v1.send` copies a packet into the extension-to-endpoint queue, blocking
    under its byte-window backpressure;
-3. `blit_v1.recv` blocks the plugin thread on the endpoint-to-plugin queue
+3. `blit_v1.recv` blocks the extension thread on the endpoint-to-extension queue
    until a packet arrives or cancellation closes it;
 4. fuel exhaustion returns control to the thread driver, which checks
    cancellation before replenishing the next slice;
 5. completion, trap, or cancellation destroys the attempt endpoint, reports
-   `PLUGIN_EXIT`, and ends the thread; the async supervisor then stops, waits in
+   `EXT_EXIT`, and ends the thread; the async supervisor then stops, waits in
    backoff, or creates a fresh thread for the next attempt.
 
 An empty receive parks the dedicated thread without consuming CPU; restart
-backoff uses the async supervisor and consumes no plugin thread. The server
+backoff uses the async supervisor and consumes no extension thread. The server
 reserves the thread and Wasmi resources before marking an attempt running. A
 reservation or thread-spawn failure reports a structured host failure and never
 panics the server.
 
 ### Thread names
 
-Plugin thread names are diagnostic, not identity. The full logical name is:
+Extension thread names are diagnostic, not identity. The full logical name is:
 
 ```text
-blit-plugin:<label>#<short-plugin-id>
+blit-ext:<label>#<short-extension-id>
 ```
 
 `label` is chosen from the explicit invocation or durable name, then the module
 hash prefix. User-controlled labels are converted to printable ASCII,
 separators are collapsed, and path components, control characters, and secrets
-are never included. The stable plugin ID suffix distinguishes concurrent
+are never included. The stable extension ID suffix distinguishes concurrent
 transient instances of the same module.
 
 A shared helper compacts that logical name for each platform while retaining
 the component prefix and ID suffix. For example, a Linux-sized name might be
-`blit-p:bui-7f2a`, while a platform allowing longer names can expose
-`blit-plugin:builder#7f2a`. Failure to set a descriptive OS name falls back to
-`blit-plugin` and does not prevent execution. The full logical name remains
+`blit-e:bui-7f2a`, while a platform allowing longer names can expose
+`blit-ext:builder#7f2a`. Failure to set a descriptive OS name falls back to
+`blit-ext` and does not prevent execution. The full logical name remains
 available in server diagnostics and logs.
 
 The same helper and `blit-<component>[-<role>][-<short-id>]` convention should
@@ -420,34 +420,34 @@ Wasmi's translated `Module` is cached in memory by:
 ```
 
 Running attempts pin their raw and translated objects. An enabled persistent
-plugin also pins its raw object, so a restart never depends on the original
+extension also pins its raw object, so a restart never depends on the original
 uploader returning. An LRU may evict other translated modules and raw objects.
 
 ### Miss and race behavior
 
-`PLUGIN_RUN` is the cache probe. A hit creates the plugin without
+`EXT_RUN` is the cache probe. A hit creates the extension without
 another request. A miss returns `NEED_OBJECT` and records a bounded pending
-plugin. The miss is encoded as
-`PLUGIN_STATUS(status = OK, phase = NEED_OBJECT)`; `NEED_OBJECT` is a run
+extension. The miss is encoded as
+`EXT_STATUS(status = OK, phase = NEED_OBJECT)`; `NEED_OBJECT` is a run
 phase, not a status code. The client uploads chunks and does not resend
-`PLUGIN_RUN` after a successful final chunk; the server creates and starts the
-pending plugin automatically.
+`EXT_RUN` after a successful final chunk; the server creates and starts the
+pending extension automatically.
 
 Uploads are single-flight per object hash. If several clients miss the same
 object, the first accepted uploader supplies it and every compatible pending
-plugin starts after verification. A client whose `PLUGIN_PUT` races after the
+extension starts after verification. A client whose `EXT_PUT` races after the
 object has committed receives `ALREADY_HAVE` and stops sending. While another
 upload is still in progress, a second `BEGIN` receives `CONFLICT`; its pending
 run waits for the owner rather than uploading duplicate bytes. If the owner
 fails or expires, waiting runs receive a fresh `NEED_OBJECT` update and may
 compete to become the next uploader. That update is
-`PLUGIN_INFO(STATUS, phase = NEED_OBJECT)`, keyed by `plugin_id`, rather than a
-second reply to the original run nonce. Pending plugins and partial uploads
+`EXT_INFO(STATUS, phase = NEED_OBJECT)`, keyed by `extension_id`, rather than a
+second reply to the original run nonce. Pending extensions and partial uploads
 expire.
 
-## Plugin wire family
+## Extension wire family
 
-Feature bit **11** (`FEATURE_PLUGIN`) advertises this family. It occupies
+Feature bit **11** (`FEATURE_EXTENSION`) advertises this family. It occupies
 the free direction-local `0x90` through `0x94` block before Git's `0xA0`
 block.
 
@@ -456,14 +456,14 @@ UTF-8. Unless otherwise stated, `detail` is UTF-8 and consumes the remainder.
 
 ### Client to server
 
-| Opcode | Name             | Layout                                                                                         |
-| ------ | ---------------- | ---------------------------------------------------------------------------------------------- |
-| `0x90` | `PLUGIN_RUN`     | `[nonce:2][flags:1][restart:1][hash:32][name_len:2][name:N][argc:2] repeated{[len:4][arg:M]}`  |
-| `0x91` | `PLUGIN_PUT`     | `[nonce:2][flags:1][hash:32][offset:8][total_size:8][data:N]`                                  |
-| `0x92` | `PLUGIN_CONTROL` | `[nonce:2][plugin_id:8][action:1]`                                                             |
-| `0x93` | `PLUGIN_EVENT`   | `[plugin_id:8][attempt:8][task_id:4][kind:1][data:N]` — only from the matching running attempt |
+| Opcode | Name          | Layout                                                                                            |
+| ------ | ------------- | ------------------------------------------------------------------------------------------------- |
+| `0x90` | `EXT_RUN`     | `[nonce:2][flags:1][restart:1][hash:32][name_len:2][name:N][argc:2] repeated{[len:4][arg:M]}`     |
+| `0x91` | `EXT_PUT`     | `[nonce:2][flags:1][hash:32][offset:8][total_size:8][data:N]`                                     |
+| `0x92` | `EXT_CONTROL` | `[nonce:2][extension_id:8][action:1]`                                                             |
+| `0x93` | `EXT_EVENT`   | `[extension_id:8][attempt:8][task_id:4][kind:1][data:N]` — only from the matching running attempt |
 
-`PLUGIN_RUN.flags`: bit 0 `DETACH`, bit 1 `PERSIST`. `restart` is the
+`EXT_RUN.flags`: bit 0 `DETACH`, bit 1 `PERSIST`. `restart` is the
 restart-policy value from [§ Lifecycle model](#lifecycle-model). `PERSIST`
 requires `DETACH` and a non-empty, unique `name`. Without `PERSIST`, `name` may
 be empty and is descriptive only. Unknown flags or restart values are
@@ -471,7 +471,7 @@ be empty and is descriptive only. Unknown flags or restart values are
 Argument count is capped at 1024, each argument at 64 KiB, and their combined
 UTF-8 bytes at 1 MiB. NUL has no special meaning.
 
-`PLUGIN_PUT.flags`: bit 0 `BEGIN`, bit 1 `FINAL`. The first chunk has
+`EXT_PUT.flags`: bit 0 `BEGIN`, bit 1 `FINAL`. The first chunk has
 `BEGIN`, offset zero, and begins a new upload. `total_size` is present on every
 chunk to keep decoding fixed; it must be non-zero, match the first chunk, and
 fit the module cap before any data is accepted. Chunks are contiguous and
@@ -480,66 +480,66 @@ total_size`, then triggers hash verification, validation, atomic cache
 insertion, and pending-run start. A one-packet object sets both flags. The
 maximum module size is 16 MiB; clients should use 1 MiB chunks.
 
-`PLUGIN_CONTROL.action`:
+`EXT_CONTROL.action`:
 
 | Value | Name      | Meaning                                                             |
 | ----- | --------- | ------------------------------------------------------------------- |
-| 1     | `CANCEL`  | Stop the plugin, suppress restarts, then cancel its attempt         |
+| 1     | `CANCEL`  | Stop the extension, suppress restarts, then cancel its attempt      |
 | 2     | `ATTACH`  | Subscribe this connection to retained and future events             |
 | 3     | `DETACH`  | Stop this connection following without changing desired state       |
 | 4     | `STATUS`  | Request the current supervisor and attempt lifecycle record         |
 | 5     | `RESTART` | End the current attempt and schedule a new one immediately          |
-| 6     | `ENABLE`  | Set a retained persistent plugin to desired-running                 |
+| 6     | `ENABLE`  | Set a retained persistent extension to desired-running              |
 | 7     | `DISABLE` | Durably clear desired-running before cancelling the current attempt |
 | 8     | `REMOVE`  | Durably remove a disabled persistent definition and retained events |
-| 9     | `LIST`    | List visible plugins; requires `plugin_id = 0`                      |
+| 9     | `LIST`    | List visible extensions; requires `extension_id = 0`                |
 
-Every control other than `LIST` receives one `PLUGIN_STATUS` carrying the
-request nonce. `LIST` receives `PLUGIN_INFO(LIST)` below. A CLI name is resolved
+Every control other than `LIST` receives one `EXT_STATUS` carrying the
+request nonce. `LIST` receives `EXT_INFO(LIST)` below. A CLI name is resolved
 through `LIST`; wire control continues to use unambiguous 64-bit IDs.
 
-`PLUGIN_EVENT.kind` reserves 1 for stdout bytes, 2 for stderr bytes, and
+`EXT_EVENT.kind` reserves 1 for stdout bytes, 2 for stderr bytes, and
 3 for a UTF-8 log record. These are convenience event streams, not terminals.
 Structured application communication should use channels.
 
 ### Server to client
 
-| Opcode | Name                | Layout                                                                                                                         |
-| ------ | ------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `0x90` | `PLUGIN_STATUS`     | `[nonce:2][status:1][phase:1][flags:1][restart:1][plugin_id:8][attempt:8][task_id:4][next_start_unix_ms:8][hash:32][detail:N]` |
-| `0x91` | `PLUGIN_PUT_STATUS` | `[nonce:2][status:1][hash:32][received:8][detail:N]`                                                                           |
-| `0x92` | `PLUGIN_INFO`       | `[kind:1][body...]`                                                                                                            |
-| `0x93` | `PLUGIN_EVENT`      | `[plugin_id:8][attempt:8][task_id:4][sequence:8][kind:1][data:N]`                                                              |
-| `0x94` | `PLUGIN_EXIT`       | `[plugin_id:8][attempt:8][task_id:4][reason:1][code:4][next_start_unix_ms:8][detail:N]`                                        |
+| Opcode | Name             | Layout                                                                                                                            |
+| ------ | ---------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `0x90` | `EXT_STATUS`     | `[nonce:2][status:1][phase:1][flags:1][restart:1][extension_id:8][attempt:8][task_id:4][next_start_unix_ms:8][hash:32][detail:N]` |
+| `0x91` | `EXT_PUT_STATUS` | `[nonce:2][status:1][hash:32][received:8][detail:N]`                                                                              |
+| `0x92` | `EXT_INFO`       | `[kind:1][body...]`                                                                                                               |
+| `0x93` | `EXT_EVENT`      | `[extension_id:8][attempt:8][task_id:4][sequence:8][kind:1][data:N]`                                                              |
+| `0x94` | `EXT_EXIT`       | `[extension_id:8][attempt:8][task_id:4][reason:1][code:4][next_start_unix_ms:8][detail:N]`                                        |
 
-Server `PLUGIN_INFO.kind` values:
+Server `EXT_INFO.kind` values:
 
-| Kind | Name     | Body                                                                                                        |
-| ---- | -------- | ----------------------------------------------------------------------------------------------------------- |
-| 1    | `INIT`   | `[plugin_id:8][attempt:8][task_id:4][flags:1][argc:2] repeated{[len:4][arg:N]}`                             |
-| 2    | `LIST`   | `[nonce:2][status:1][count:2] repeated{plugin_record}`                                                      |
-| 3    | `STATUS` | `[plugin_id:8][phase:1][flags:1][restart:1][attempt:8][task_id:4][next_start_unix_ms:8][hash:32][detail:N]` |
+| Kind | Name     | Body                                                                                                           |
+| ---- | -------- | -------------------------------------------------------------------------------------------------------------- |
+| 1    | `INIT`   | `[extension_id:8][attempt:8][task_id:4][flags:1][argc:2] repeated{[len:4][arg:N]}`                             |
+| 2    | `LIST`   | `[nonce:2][status:1][count:2] repeated{extension_record}`                                                      |
+| 3    | `STATUS` | `[extension_id:8][phase:1][flags:1][restart:1][attempt:8][task_id:4][next_start_unix_ms:8][hash:32][detail:N]` |
 
-A `plugin_record` is:
+An `extension_record` is:
 
 ```text
-[plugin_id:8][phase:1][flags:1][restart:1][attempt:8][task_id:4]
+[extension_id:8][phase:1][flags:1][restart:1][attempt:8][task_id:4]
 [next_start_unix_ms:8][hash:32][name_len:2][name:N]
 ```
 
-`PLUGIN_INFO(INIT)` is injected only into the plugin's in-process endpoint
+`EXT_INFO(INIT)` is injected only into the extension's in-process endpoint
 after `READY`; a network client never receives it merely by attaching.
 
-`PLUGIN_RUN` receives exactly one nonce-correlated `PLUGIN_STATUS`, which
-allocates and returns `plugin_id` even on a cache miss. That reply releases the
+`EXT_RUN` receives exactly one nonce-correlated `EXT_STATUS`, which
+allocates and returns `extension_id` even on a cache miss. That reply releases the
 16-bit nonce. Later validation, queue, attempt, backoff, and stop transitions
-are uncorrelated `PLUGIN_INFO(STATUS)` events keyed by `plugin_id`; attached
+are uncorrelated `EXT_INFO(STATUS)` events keyed by `extension_id`; attached
 clients follow the ID and do not keep the original run nonce reserved. Each
-non-`LIST` `PLUGIN_CONTROL` likewise receives exactly one `PLUGIN_STATUS`
+non-`LIST` `EXT_CONTROL` likewise receives exactly one `EXT_STATUS`
 snapshot with its own request nonce, after which later changes are ID-keyed
-events. `PLUGIN_PUT` nonces live for one chunk acknowledgement, and the `LIST`
-nonce lives through its single `PLUGIN_INFO(LIST)` reply. On a given endpoint,
-the correlated reply is enqueued before any `PLUGIN_INFO` or `PLUGIN_EXIT`
+events. `EXT_PUT` nonces live for one chunk acknowledgement, and the `LIST`
+nonce lives through its single `EXT_INFO(LIST)` reply. On a given endpoint,
+the correlated reply is enqueued before any `EXT_INFO` or `EXT_EXIT`
 caused by that request.
 
 Run phases:
@@ -562,7 +562,7 @@ attempt.
 
 Common family status values are reused: `OK`, `NOT_FOUND`, `TOO_LARGE`,
 `INVALID`, `CANCELLED`, `OTHER`, and `CONFLICT`.
-`PLUGIN_PUT_STATUS` additionally defines value 12 as `ALREADY_HAVE`. It means
+`EXT_PUT_STATUS` additionally defines value 12 as `ALREADY_HAVE`. It means
 the verified object is already committed; `received` is its stored total size,
 the pending run proceeds, and the client must stop uploading. `OK` reports the
 cumulative accepted `received` bytes. `CONFLICT` means another uploader owns
@@ -571,21 +571,21 @@ it reports `received = 0`.
 
 ### Attached lifecycle
 
-Without `DETACH`, the initiating connection owns the plugin. Disconnecting
+Without `DETACH`, the initiating connection owns the extension. Disconnecting
 or sending `CANCEL` stops the supervisor, suppresses any pending restart, and
 cancels its current attempt. Ctrl-C in `blit run` sends `CANCEL`, waits a
-short grace period for `PLUGIN_EXIT`, and then closes.
+short grace period for `EXT_EXIT`, and then closes.
 
-With `DETACH`, phase `RUNNING` in either the correlated `PLUGIN_STATUS` or a
-later `PLUGIN_INFO(STATUS)` is sufficient for the command to return
-successfully. The plugin remains server-owned until its restart policy stops
+With `DETACH`, phase `RUNNING` in either the correlated `EXT_STATUS` or a
+later `EXT_INFO(STATUS)` is sufficient for the command to return
+successfully. The extension remains server-owned until its restart policy stops
 it, it is explicitly cancelled, or the server exits. Its event log is a bounded
 byte ring across attempts, so a later `ATTACH` receives a retained suffix
-followed by live events. Plugin attempts have no wall-clock deadline; attached
+followed by live events. Extension attempts have no wall-clock deadline; attached
 and detached execution differ only in ownership and event following.
 
 Every attempt has a 32-bit process-local `task_id`. Task IDs are not durable;
-`plugin_id` and `attempt` are the stable coordinates followed by clients.
+`extension_id` and `attempt` are the stable coordinates followed by clients.
 
 ### Restart backoff
 
@@ -607,13 +607,13 @@ or explicit `ENABLE` causes revalidation.
 Persistent definitions are durable desired state, separate from the Wasmi
 instance. The server transactionally stores:
 
-- stable plugin ID and unique name;
+- stable extension ID and unique name;
 - object hash, arguments, and restart policy;
 - enabled/desired-running state;
 - attempt counter, consecutive-failure count, and next eligible start time.
 
-Definitions live in `$BLIT_PLUGIN_PATH`, otherwise the platform state
-directory followed by `blit/plugins.redb`. This is authoritative state,
+Definitions live in `$BLIT_EXTENSION_PATH`, otherwise the platform state
+directory followed by `blit/extensions.redb`. This is authoritative state,
 not an evictable cache. The raw Wasm object remains in the separate
 content-addressed cache but is pinned by every enabled definition.
 
@@ -627,14 +627,14 @@ failure. Abrupt server death is treated the same at the next boot because an
 attempt has no durable successful exit record.
 
 Cross-restart execution is consequently **at least once**, not exactly once.
-The server can die after a plugin performs an external side effect but before
-it durably records the attempt's exit. Persistent plugins must make side
+The server can die after an extension performs an external side effect but before
+it durably records the attempt's exit. Persistent extensions must make side
 effects idempotent or store their own progress transactionally, for example in
 KV. Blit does not checkpoint Wasm memory or try to infer whether a side effect
 committed.
 
 Arguments are stored verbatim. They should not contain secrets unless the
-plugin store gains an explicit encrypted-secret mechanism; references through
+extension store gains an explicit encrypted-secret mechanism; references through
 a separate secret facility are preferable. Retained stdout/stderr events are
 not durable in the first version.
 
@@ -711,7 +711,7 @@ execution. The family occupies the free direction-local `0xC0` through
 `0xC5` block. Git reserves `0xB5` through `0xBF`, so this RFC does not consume
 that space.
 
-This is a normal blit family. A Wasmi plugin reaches it through `blit_v1.send`
+This is a normal blit family. A Wasmi extension reaches it through `blit_v1.send`
 and `blit_v1.recv`; a network client sends the same packets over its existing
 transport. The server implementation is shared. When `FEATURE_PROCESS` is
 advertised, every logical client may use it.
@@ -735,7 +735,7 @@ paths on Windows. Stream payloads are unrestricted bytes.
 `PROCESS_SPAWN` executes `argv[0]` directly. It never invokes a shell;
 clients which want shell parsing must explicitly run a shell with an argument
 such as `-c`. `argc` must be non-zero. Argument count and
-combined bytes use the same caps as plugin arguments. `envc` is capped at 256,
+combined bytes use the same caps as extension arguments. `envc` is capped at 256,
 each environment key at 255 bytes, each value at 64 KiB, and combined key and
 value bytes at 1 MiB. Duplicate keys are `INVALID`.
 
@@ -809,12 +809,12 @@ violation for that process. Normal backpressure stops reading or writing the
 corresponding OS pipe and lets the child block; it never creates an unbounded
 server queue.
 
-Every child belongs to its creating logical endpoint and, for a plugin, to
+Every child belongs to its creating logical endpoint and, for an extension, to
 the current attempt. Endpoint close, attempt cancellation, or trap closes
 stdin, gracefully terminates the process group or Windows job, waits a short
 server-defined grace period, and force-kills the remainder.
-The server reaps every child. A restarted plugin attempt gets no handles to
-the previous attempt's children. Persistent plugins must therefore assume
+The server reaps every child. A restarted extension attempt gets no handles to
+the previous attempt's children. Persistent extensions must therefore assume
 that an interrupted subprocess side effect can be repeated after restart.
 
 Children run with the blit server's OS identity. Wasm isolation does not
@@ -852,34 +852,34 @@ ACKs only after the application consumes data. It does not attempt to make
 
 ## Failure isolation
 
-There are no per-plugin resource settings, execution budgets, or wall-clock
-deadlines. `PLUGIN_RUN` carries no execution-tuning fields.
+There are no per-extension resource settings, execution budgets, or wall-clock
+deadlines. `EXT_RUN` carries no execution-tuning fields.
 
 Fixed packet sizes, byte windows, and bounded outboxes are protocol and
 dispatcher invariants described with their respective families. Wasmi must
 also be configured so guest memory, tables, and instances cannot exhaust the
 server. Fuel metering supplies yield points for cancellation, not a total
-execution budget. These containment details are not plugin-visible or
+execution budget. These containment details are not extension-visible or
 configurable per invocation.
 
 Cancellation marks the endpoint first, wakes a blocked receive, and refuses
 new sends. A running fuel slice reaches cancellation at its next yield. Host
-panics are caught at the plugin thread boundary and reported as `HOST_FAILURE`;
+panics are caught at the extension thread boundary and reported as `HOST_FAILURE`;
 they must not unwind into server code.
 
-The server must validate all plugin packets exactly as it validates
+The server must validate all extension packets exactly as it validates
 network packets. In-process origin is not trusted origin.
 
 ## CLI behavior
 
 ```bash
-blit run --on prod plugin.wasm arg1 arg2
-blit run --on prod --restart on-failure plugin.wasm arg1
-blit run --on prod --restart always --persist --name builder plugin.wasm arg1
+blit run --on prod extension.wasm arg1 arg2
+blit run --on prod --restart on-failure extension.wasm arg1
+blit run --on prod --restart always --persist --name builder extension.wasm arg1
 ```
 
 The command grammar is `blit run [RUN_OPTIONS] FILE [ARGS...]`. Every token
-after `FILE` is passed verbatim as a plugin argument, including tokens
+after `FILE` is passed verbatim as an extension argument, including tokens
 beginning with `-`; no `--` separator is required. Blit run options such as
 `--detach`, `--restart`, `--persist`, `--name`, and connection options such as
 `--on` must therefore appear before `FILE`.
@@ -888,12 +888,12 @@ The CLI:
 
 1. reads the file under a configurable local size cap;
 2. computes its full BLAKE3 digest;
-3. sends `PLUGIN_RUN`;
+3. sends `EXT_RUN`;
 4. on `NEED_OBJECT`, uploads acknowledged chunks;
 5. streams attached stdout/stderr/log events without allocating a PTY;
 6. exits with the module code for `RETURNED`, or non-zero for other reasons.
 
-`PLUGIN_EXIT` and `--json` preserve the full signed `i32` module code. The CLI
+`EXT_EXIT` and `--json` preserve the full signed `i32` module code. The CLI
 passes a returned code to the native process-exit API, whose observable range
 is platform-specific; Unix shells see only the low eight bits (`0` through
 `255`). Callers which need the full value must consume the structured event
@@ -910,14 +910,16 @@ reaches `STOPPED`, is cancelled, or the connection fails. `--detach` returns
 after `RUNNING`. The management surface is:
 
 ```bash
-blit plugin list
-blit plugin status NAME_OR_ID
-blit plugin attach NAME_OR_ID
-blit plugin restart NAME_OR_ID
-blit plugin enable NAME_OR_ID
-blit plugin disable NAME_OR_ID
-blit plugin remove NAME_OR_ID
+blit ext list
+blit ext status NAME_OR_ID
+blit ext attach NAME_OR_ID
+blit ext restart NAME_OR_ID
+blit ext enable NAME_OR_ID
+blit ext disable NAME_OR_ID
+blit ext remove NAME_OR_ID
 ```
+
+`blit extension` is an alias for `blit ext`.
 
 The local pathname is never sent as module identity. It may appear in local
 diagnostics. Servers and peers see the invocation name when one was supplied
@@ -930,7 +932,7 @@ clients ignore their S2C opcodes. Older servers do not advertise them, and
 `blit run` reports an upgrade requirement rather than attempting an upload.
 
 Kind-multiplexed envelopes have an explicit skip rule. Clients ignore an
-unknown S2C kind under `PLUGIN_INFO` or `0x95` as one complete packet. Servers
+unknown S2C kind under `EXT_INFO` or `0x95` as one complete packet. Servers
 likewise ignore one complete packet with an unknown C2S kind under `0x95`; it is
 not a connection-level protocol violation and changes no handle state. A new
 C2S request kind which requires a reply must have a new feature bit or other
@@ -959,24 +961,24 @@ Packets give exact parity through two imports.
 
 Standard WASI currently describes the guest's CLI environment and exit, not
 portable child-process creation. Adopting a runtime-specific `proc_spawn`
-extension would couple plugins to that runtime, expose process execution only
+extension would couple extensions to that runtime, expose process execution only
 to Wasm guests, and still require blit-specific lifecycle glue.
 The process packet family provides the same streaming operation to all clients
 without adding another Wasm import. Optional WASI remains useful for the
-plugin's own constrained environment.
+extension's own constrained environment.
 
 ### Loopback or in-memory fake socket
 
 A duplex stream could feed the existing connection handler and is a useful
 prototype, but it preserves framing, handshake transport machinery, and
 writer tasks solely to move data within one process. Extracting packet
-dispatch is the intended architecture. The plugin still receives the
+dispatch is the intended architecture. The extension still receives the
 normal logical handshake from its endpoint.
 
 ### Typed internal API exposed directly to Wasm
 
 The server should have typed internal handlers, but exposing their Rust shape
-as the guest ABI couples plugins to server implementation details and still
+as the guest ABI couples extensions to server implementation details and still
 requires a serialization schema. The stable packet protocol is already that
 schema. Rust SDK types can wrap it without becoming host ABI.
 
@@ -986,13 +988,13 @@ JSON is convenient for debugging but expensive for bulk bytes, ambiguous for
 integer widths, and a second protocol. Channel application payloads may use
 JSON voluntarily; core client operations remain binary blit packets.
 
-### Shared plugin worker pool
+### Shared extension worker pool
 
-A shared pool uses fewer native stacks for mostly idle plugins, but makes
+A shared pool uses fewer native stacks for mostly idle extensions, but makes
 thread-level profiling, crash attribution, debugger inspection, and resource
 ownership less direct. Dedicated named threads are intentionally simpler to
 operate. Blocked receives park without consuming CPU; restart backoff owns no
-plugin thread at all.
+extension thread at all.
 
 ## Implementation plan
 
@@ -1006,18 +1008,18 @@ plugin thread at all.
 4. **Processes.** Implement the `0xC0` through `0xC5` process family,
    per-stream flow control, concurrent pipe draining, process-tree cleanup,
    codecs, and protocol tests from a network client.
-5. **Plugin objects.** Implement BLAKE3 run probe, chunk upload, validation,
+5. **Module objects.** Implement BLAKE3 run probe, chunk upload, validation,
    persistent CAS, pending-run single-flight, and cache eviction.
-6. **Supervisor.** Add stable plugin/attempt identity, restart policy,
+6. **Supervisor.** Add stable extension/attempt identity, restart policy,
    backoff, durable desired state, startup restoration, and crash-safe control.
-7. **Wasmi host.** Add one named thread per running plugin attempt, bounded
+7. **Wasmi host.** Add one named thread per running extension attempt, bounded
    endpoint queues, Wasmi containment, fuel-based cancellation yielding,
    attempt lifecycle, and event retention.
-8. **Rust SDK and CLI.** Add `blit-guest`, a Rust example plugin, `blit run`,
-   process wrappers, and plugin control commands.
+8. **Rust SDK and CLI.** Add `blit-guest`, a Rust example extension, `blit run`,
+   process wrappers, and extension control commands.
 
 Each phase has a vertical protocol test with at least two logical clients.
-The plugin phases additionally verify cache hit (no upload), cache miss,
+The extension phases additionally verify cache hit (no upload), cache miss,
 nonce release before later ID-keyed status changes, hash mismatch, invalid
 imports, runaway-loop cancellation, cleanup after a trap, restart policy,
 backoff persistence, crash-safe disable, and restoration after a fresh server
@@ -1032,5 +1034,5 @@ process-tree cleanup on endpoint loss.
 - Should persistent object eviction be automatic by default or operator-only
   until access-time accounting is proven reliable across crashes?
 
-None of these questions changes the central boundary: plugins are logical
+None of these questions changes the central boundary: extensions are logical
 clients, and their host ABI exchanges ordinary blit packets.
