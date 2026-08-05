@@ -1380,18 +1380,39 @@ impl InboundWindow {
 /// 4 MiB because the server produces there and can park a reader until credit
 /// frees; here the client produces, and the only lever on the dispatch loop is
 /// refusal — waiting would stall every other stream and the terminal with
-/// them. So the ceiling has to be one a compliant client stays under: a stream
-/// cannot make progress holding less than one maximum chunk, and
-/// `NET_MAX_SOCKETS` of those is this figure.
+/// them. So the ceiling cannot be a figure a client honouring every window it
+/// was granted can reach: the server reports those windows
+/// (`msg_net_opened_tcp`), and closing such a stream would make the report a
+/// lie.
 ///
-/// It covers every window this server grants (`per_stream_window`) up to 64
-/// concurrent streams on one connection. Past that the grants can sum past it,
-/// so a client that honors every window it was told can still be closed —
-/// closing that gap wants the grant to account for what is already
-/// outstanding, not a bigger figure here.
-/// Bounded and stated (docs/design/net.md § Pacing) beats a number that reads
-/// tidier and cannot hold.
-const INBOUND_AGGREGATE_BYTES: u64 = NET_MAX_SOCKETS as u64 * NET_MAX_CHUNK as u64;
+/// That fixes the number rather than leaving it to taste. A live set of `m`
+/// streams holds at most `per_stream_window(1) + … + per_stream_window(m)`,
+/// because the j-th oldest of them had every earlier one open when it opened
+/// and so was granted no more than `per_stream_window(j)`. At
+/// `NET_MAX_SOCKETS` that sum is this constant — 39.9 MiB, against the 16 MiB
+/// (one chunk per socket) it replaces, the difference being that the
+/// per-stream floor is two chunks and not one.
+///
+/// It bounds bytes a client has sent that its *target* has not yet taken, so
+/// reaching it needs 256 stalled targets at once; a target that drains keeps
+/// the figure near zero. The alternative — charging grants against a smaller
+/// budget and refusing an open that cannot be afforded a floor — bounds
+/// memory lower but caps usable streams well below `NET_MAX_SOCKETS` and holds
+/// a reservation for idle streams with nothing queued. Bounded and stated
+/// (docs/design/net.md § Pacing) beats a number that reads tidier and cannot
+/// hold.
+const INBOUND_AGGREGATE_BYTES: u64 = every_grant_at_once();
+
+/// The most a connection's live streams can have been granted between them.
+const fn every_grant_at_once() -> u64 {
+    let mut total = 0;
+    let mut open = 1;
+    while open <= NET_MAX_SOCKETS {
+        total += per_stream_window(open);
+        open += 1;
+    }
+    total
+}
 
 /// One stream's share of its connection's outstanding-bytes total.
 ///
@@ -1440,9 +1461,25 @@ impl Drop for CreditCharge {
 }
 
 /// Per-stream credit, allocated from the aggregate so N streams cannot each claim a full window. Reported to the client on the accept, since only the server knows how many sockets were open at this one's open time.
-fn per_stream_window(open_sockets: usize) -> u64 {
-    let share = NET_WINDOW_AGGREGATE / (open_sockets.max(1) as u64);
-    share.clamp(NET_WINDOW_MIN, NET_WINDOW_BYTES)
+///
+/// `const` so `INBOUND_AGGREGATE_BYTES` can be derived from it: the aggregate has
+/// to cover every window this can grant, and a hand-copied figure is one edit
+/// away from not.
+const fn per_stream_window(open_sockets: usize) -> u64 {
+    let share = NET_WINDOW_AGGREGATE
+        / if open_sockets == 0 {
+            1
+        } else {
+            open_sockets as u64
+        };
+    // `clamp` is not const.
+    if share < NET_WINDOW_MIN {
+        NET_WINDOW_MIN
+    } else if share > NET_WINDOW_BYTES {
+        NET_WINDOW_BYTES
+    } else {
+        share
+    }
 }
 
 fn udp_idle_timeout() -> Duration {
@@ -1903,9 +1940,9 @@ mod tests {
         assert_eq!(status, NET_STATUS_OK, "reuse refused: {detail}");
     }
 
-    /// Per-stream limits do not bound a connection: they floor at two chunks,
-    /// so enough streams and their limits sum past any single figure — 256
-    /// sockets came to roughly 40 MiB. The shared counter is what holds.
+    /// A stream's own limit does not bound a connection: every stream here is
+    /// given the full 1 MiB, which is more than the server grants at this
+    /// concurrency, and the shared counter is what refuses.
     #[test]
     fn inbound_windows_share_a_connection_wide_ceiling() {
         let total = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1939,8 +1976,11 @@ mod tests {
             }
         }
         assert!(refused, "the ceiling must actually refuse");
-        assert_eq!(admitted, INBOUND_AGGREGATE_BYTES);
-        assert_eq!(total.load(Ordering::Relaxed), INBOUND_AGGREGATE_BYTES);
+        // Chunk-sized admissions cannot land exactly on the ceiling, so the
+        // last chunk that fits is the last one taken.
+        assert!(admitted <= INBOUND_AGGREGATE_BYTES);
+        assert!(admitted + NET_MAX_CHUNK as u64 > INBOUND_AGGREGATE_BYTES);
+        assert_eq!(total.load(Ordering::Relaxed), admitted);
 
         // A refusal must not have charged anything: a stream credited for
         // bytes it never queued leaks its window a chunk at a time.
@@ -1948,10 +1988,7 @@ mod tests {
             .iter()
             .map(|s| s.queued.load(Ordering::Relaxed))
             .sum();
-        assert_eq!(
-            sum, INBOUND_AGGREGATE_BYTES,
-            "per-stream must match the total"
-        );
+        assert_eq!(sum, admitted, "per-stream must match the total");
 
         // And a client honouring its per-stream window is never refused below
         // the ceiling: every stream can still hold one full chunk.
@@ -1966,6 +2003,39 @@ mod tests {
         for (i, s) in each.iter().enumerate() {
             assert!(s.admit(NET_MAX_CHUNK), "stream {i} denied its first chunk");
         }
+    }
+
+    /// The promise, on the enforcement side: a client that fills every window
+    /// it was granted, on as many streams as the server allows at once, is
+    /// never refused. This pairing is the whole reason
+    /// `INBOUND_AGGREGATE_BYTES` is derived from `per_stream_window`.
+    #[test]
+    fn filling_every_granted_window_is_never_refused() {
+        let total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Grants as a live set of `NET_MAX_SOCKETS` streams would hold them:
+        // the j-th oldest was granted `per_stream_window(j)`.
+        let streams: Vec<InboundWindow> = (1..=NET_MAX_SOCKETS)
+            .map(|open| InboundWindow {
+                queued: std::sync::atomic::AtomicU64::new(0),
+                limit: per_stream_window(open),
+                total: total.clone(),
+            })
+            .collect();
+        for (i, s) in streams.iter().enumerate() {
+            let mut held = 0u64;
+            while held + NET_MAX_CHUNK as u64 <= s.limit {
+                assert!(
+                    s.admit(NET_MAX_CHUNK),
+                    "stream {i} refused inside its window"
+                );
+                held += NET_MAX_CHUNK as u64;
+            }
+            let tail = (s.limit - held) as usize;
+            if tail > 0 {
+                assert!(s.admit(tail), "stream {i} refused the tail of its window");
+            }
+        }
+        assert_eq!(total.load(Ordering::Relaxed), INBOUND_AGGREGATE_BYTES);
     }
 
     /// The client→target direction is bounded too. The queue feeding the
@@ -2151,23 +2221,29 @@ mod tests {
         assert!(per_stream_window(10_000) >= NET_WINDOW_MIN);
     }
 
-    /// The window the server reports is a promise, and this is how far the
-    /// promise reaches: a client that fills every window it was granted on
-    /// every stream stays inside the connection's inbound aggregate up to 64
-    /// concurrent streams. Past that the grants sum past the aggregate and a
-    /// compliant client can still be closed (see `INBOUND_AGGREGATE_BYTES`).
+    /// The window the server reports is a promise, and this is what keeps it: a
+    /// client that fills every window it was granted, on as many streams as it
+    /// is allowed, never reaches the connection's inbound aggregate. The bound
+    /// is the sum over a live set, because the j-th oldest live stream saw at
+    /// least j sockets open when it opened (see `INBOUND_AGGREGATE_BYTES`).
     #[test]
     fn granted_windows_fit_inside_the_inbound_aggregate() {
         let summed = |sockets: usize| -> u64 { (1..=sockets).map(per_stream_window).sum() };
-        for sockets in [1usize, 4, 5, 24, 64] {
+        for sockets in [1usize, 4, 5, 24, 64, 65, 128, NET_MAX_SOCKETS] {
             assert!(
                 summed(sockets) <= INBOUND_AGGREGATE_BYTES,
                 "{sockets} sockets granted {} against a {INBOUND_AGGREGATE_BYTES}-byte aggregate",
                 summed(sockets)
             );
         }
-        // Stated rather than left to be discovered: the gap starts at 65.
-        assert!(summed(65) > INBOUND_AGGREGATE_BYTES);
+        // Exactly covered, not generously: the aggregate is that sum, so it
+        // cannot drift from the grant formula, and the figure is worth stating.
+        assert_eq!(summed(NET_MAX_SOCKETS), INBOUND_AGGREGATE_BYTES);
+        // Worth stating, since it is the memory a connection may hold: ~40 MiB.
+        assert!((39 << 20..40 << 20).contains(&INBOUND_AGGREGATE_BYTES));
+        // A stream still cannot hold more than its own window, so the aggregate
+        // is not a way around one.
+        assert!(INBOUND_AGGREGATE_BYTES > NET_MAX_SOCKETS as u64 * NET_MAX_CHUNK as u64);
     }
 
     /// The value the client needs and cannot compute: which window this stream
