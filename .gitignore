@@ -3,6 +3,7 @@
 .env.local
 .vite/
 /.blit-dev.sock
+/.claude/
 /.direnv/
 /.moo/
 /crates/alacritty_terminal/
