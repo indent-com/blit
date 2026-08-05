@@ -30,12 +30,8 @@ is a packet send operation and a blocking packet receive operation. It gets
 the same initial `HELLO` / `LIST` / `READY` sequence and can use every blit
 protocol family exposed to ordinary clients by that server.
 
-This RFC also adds native, non-terminal communication:
-
-- **channels** are named connection points carrying reliable bidirectional
-  messages;
-- **state** is a named, retained latest value with a server revision;
-- **topics** are named ordered event streams with explicit gap reporting.
+This RFC also adds native **channels**: named connection points carrying
+reliable bidirectional messages without terminal semantics.
 
 It also adds a native **process** family for spawning non-PTY child processes,
 streaming their stdout and stderr, writing stdin, and controlling their
@@ -43,8 +39,7 @@ lifecycle. Process operations are blit packets rather than Wasm host imports.
 
 These are blit packet families, not Wasm-specific host functions. Browser,
 CLI, native, and Wasmi clients all see the same semantics. RPC, streamed
-results, watchable APIs, and actor mailboxes are libraries over these
-primitives.
+results, notifications, and actor mailboxes are libraries over channels.
 
 ## Motivation
 
@@ -67,8 +62,8 @@ packet directly.
 Terminals are not a suitable coordination primitive for plugins. Their byte
 stream has presentation state, escape sequences, process semantics, and no
 message boundaries. Plugins need named discovery, bidirectional messages,
-retained state, fan-out, cancellation, and backpressure without pretending to
-be processes attached to PTYs.
+cancellation, and backpressure without pretending to be processes attached to
+PTYs.
 
 ## Goals
 
@@ -77,7 +72,7 @@ be processes attached to PTYs.
 - Supervise failed or completed attempts under an explicit restart policy.
 - Optionally persist desired plugin state across blit server restarts.
 - Give a plugin the same protocol surface as an equivalent remote client.
-- Add server-native bidirectional channels, retained state, and event topics.
+- Add server-native bidirectional channels.
 - Let clients spawn and control non-PTY server processes with flow-controlled
   stdin, stdout, and stderr streams.
 - Keep the Wasm host ABI very small and versioned.
@@ -98,8 +93,8 @@ be processes attached to PTYs.
 - **No live-instance checkpointing.** Persistent plugins start a fresh
   Wasmi instance after a server restart. Linear memory, stacks, open handles,
   channels, and in-flight requests are not snapshotted.
-- **No distributed pubsub.** Names and subscriptions belong to one blit
-  server process. Gateways relay packets but do not merge registries.
+- **No server-native state or pubsub.** Retained shared data remains KV's job;
+  live protocols and fan-out are libraries over channels.
 - **No unbounded reliable queues.** Reliability always has an explicit byte
   window, timeout, or disconnection outcome.
 - **No requirement that channel payloads use JSON.** Payloads are opaque
@@ -114,7 +109,7 @@ flowchart LR
     Plugin["Wasmi plugin"] -->|host send / recv| Endpoint
     Endpoint --> Dispatcher["Shared packet dispatcher"]
     Dispatcher --> Existing["Terminal / FS / Git / LSP / …"]
-    Dispatcher --> Fabric["Channel / state / topic / process fabric"]
+    Dispatcher --> Fabric["Channel / process fabric"]
 ```
 
 The current connection loop combines transport reading, client lifecycle,
@@ -150,10 +145,8 @@ regardless of its adapter.
 
 `dispatch_packet` must never wait for capacity in any endpoint outbox. Every
 delivery uses a nonblocking `try_enqueue`; transport writers and plugin threads
-drain their own queues independently. Family-specific reduction happens
-first: state updates replace an older pending update for the same watch, and a
-topic subscription which skips retained events records a `TOPIC_GAP`. Channel
-and process data additionally obey their credit windows.
+drain their own queues independently. Channel and process data additionally
+obey their credit windows.
 
 If a packet still cannot be enqueued within the endpoint's aggregate byte
 bound, the endpoint is a slow consumer and is closed. Closing is an
@@ -161,11 +154,10 @@ out-of-band state transition: it sets cancellation, closes both in-process
 queues or the network transport, and runs normal endpoint resource cleanup. A
 best-effort family-specific closed or lifecycle packet carrying
 `SLOW_CONSUMER` may be sent when space exists, but correctness never depends
-on fitting that final packet. Solicited replies such as `STATE_DONE` and
-`TOPIC_DONE`, lifecycle packets such as `PLUGIN_EXIT`, and protocol errors
-follow this same rule rather than waiting for space. For a plugin's own
-endpoint, this closes the attempt with the `SLOW_CONSUMER` exit reason;
-connected channel and process peers observe their normal closed event.
+on fitting that final packet. Lifecycle packets such as `PLUGIN_EXIT` and
+protocol errors follow this same rule rather than waiting for space. For a
+plugin's own endpoint, this closes the attempt with the `SLOW_CONSUMER` exit
+reason; connected channel and process peers observe their normal closed event.
 
 `PLUGIN_EVENT` fan-out performs one independent `try_enqueue` per attached
 client after recording the event in the bounded retained ring when retention
@@ -508,7 +500,7 @@ through `LIST`; wire control continues to use unambiguous 64-bit IDs.
 
 `PLUGIN_EVENT.kind` reserves 1 for stdout bytes, 2 for stderr bytes, and
 3 for a UTF-8 log record. These are convenience event streams, not terminals.
-Structured application communication should use channels, state, or topics.
+Structured application communication should use channels.
 
 ### Server to client
 
@@ -648,12 +640,11 @@ not durable in the first version.
 
 ## Native channel family
 
-Feature bit **12** (`FEATURE_CHANNEL`) advertises channels, state, and topics.
-The family uses the `0x95` and `0x96` opcodes with a one-byte
-sub-operation. This avoids spending a scarce top-level opcode on every
-coordination operation while retaining direction-specific decoding.
+Feature bit **12** (`FEATURE_CHANNEL`) advertises channels. The family uses the
+direction-local `0x95` opcode with a one-byte sub-operation. `0x96` remains
+free.
 
-Channel and subscription IDs are 32-bit and scoped to one logical client.
+Channel IDs are 32-bit and scoped to one logical client.
 Client-created IDs have bit 0 clear; server-created accepted-channel IDs have
 bit 0 set. An ID is not reused until its `CLOSED` event has been observed.
 
@@ -712,62 +703,6 @@ window and maximum payload: 4 MiB. Metadata is capped at 64 KiB.
 There is no implicit broadcast and no retained channel data. Higher-level RPC
 uses request IDs inside the opaque payload and cancellation by a normal
 message or channel close.
-
-### State and topics (`0x96`)
-
-Every message begins `[0x96][kind:1][handle_id:4]`.
-
-Client-to-server kinds:
-
-| Kind | Name              | Body                                                         |
-| ---- | ----------------- | ------------------------------------------------------------ |
-| 1    | `STATE_OPEN`      | `[nonce:2][flags:1][name_len:2][name:N][meta_len:4][meta:M]` |
-| 2    | `STATE_SET`       | `[nonce:2][expected_revision:8][value:N]`                    |
-| 3    | `TOPIC_SUBSCRIBE` | `[nonce:2][flags:1][after_sequence:8][name_len:2][name:N]`   |
-| 4    | `TOPIC_PUBLISH`   | `[nonce:2][name_len:2][name:N][payload:M]`                   |
-| 5    | `CLOSE`           | empty                                                        |
-
-Server-to-client kinds:
-
-| Kind | Name          | Body                                                        |
-| ---- | ------------- | ----------------------------------------------------------- |
-| 1    | `OPENED`      | `[nonce:2][status:1][metadata_len:4][metadata:M][detail:N]` |
-| 2    | `STATE_VALUE` | `[revision:8][value:N]`                                     |
-| 3    | `TOPIC_EVENT` | `[sequence:8][payload:N]`                                   |
-| 4    | `TOPIC_GAP`   | `[requested_after:8][oldest_available:8][next_sequence:8]`  |
-| 5    | `CLOSED`      | `[reason:1][detail:N]`                                      |
-| 6    | `STATE_DONE`  | `[nonce:2][status:1][revision:8][detail:N]`                 |
-| 7    | `TOPIC_DONE`  | `[nonce:2][status:1][sequence:8][detail:N]`                 |
-
-`STATE_OPEN.flags`: bit 0 `CREATE`, bit 1 `WATCH`, bit 2 `WRITE`. Create fails
-with `CONFLICT` when the name already exists. A successful watch enqueues one
-`STATE_VALUE` snapshot before any later update. State is whole-value
-replacement; the server increments its revision on every accepted set.
-`expected_revision = u64::MAX` means unconditional, otherwise mismatch is
-`CONFLICT`. Every set receives `STATE_DONE`; an accepted update is enqueued to
-watchers before its `STATE_DONE` acknowledgement under the registry's mutation
-order. State lifetime is tied to its creating endpoint in the first version;
-durable state remains KV's job.
-
-Version 1 has no separate one-shot read operation. A reader opens with `WATCH`,
-receives the initial `STATE_VALUE`, and then sends `CLOSE`. An open with neither
-`WATCH` nor `WRITE` is `INVALID`; `CREATE` does not make an otherwise inert
-handle valid.
-
-`TOPIC_SUBSCRIBE.flags`: bit 0 `LIVE_ONLY`. Topics are created implicitly by
-their first publisher or subscriber. Each topic retains a bounded
-event suffix by count and bytes. `after_sequence` requests replay after a
-known event; unavailable history produces `TOPIC_GAP` before the available
-suffix. `LIVE_ONLY` ignores retained events. Topics use monotonically
-increasing process-local 64-bit sequences. Every publish receives
-`TOPIC_DONE`, whose sequence names the accepted event. `TOPIC_PUBLISH` is a
-stateless operation and therefore uses envelope `handle_id = 0`; subscriptions
-use their client-allocated handle.
-
-State watchers coalesce slow updates to the newest value and retain its
-revision. Topic subscribers never silently coalesce: they receive every
-retained event or a `TOPIC_GAP`. Topic publishers are never made reliable by
-unbounded subscriber queues.
 
 ## Process family
 
@@ -995,13 +930,13 @@ clients ignore their S2C opcodes. Older servers do not advertise them, and
 `blit run` reports an upgrade requirement rather than attempting an upload.
 
 Kind-multiplexed envelopes have an explicit skip rule. Clients ignore an
-unknown S2C kind under `PLUGIN_INFO`, `0x95`, or `0x96` as one complete packet.
-Servers likewise ignore one complete packet with an unknown C2S kind under
-`0x95` or `0x96`; it is not a connection-level protocol violation and changes
-no handle state. A new C2S request kind which requires a reply must have a new
-feature bit or other explicit negotiation, so a client never waits on a server
-which can only skip it. A malformed payload for a known kind remains `INVALID`
-or a family-local protocol violation as specified by that family.
+unknown S2C kind under `PLUGIN_INFO` or `0x95` as one complete packet. Servers
+likewise ignore one complete packet with an unknown C2S kind under `0x95`; it is
+not a connection-level protocol violation and changes no handle state. A new
+C2S request kind which requires a reply must have a new feature bit or other
+explicit negotiation, so a client never waits on a server which can only skip
+it. A malformed payload for a known kind remains `INVALID` or a family-local
+protocol violation as specified by that family.
 
 Gateways, mux, proxy, WebRTC, WebSocket, and WebTransport forward the new
 packets unchanged. Only the upstream blit server interprets them. The Wasm host
@@ -1059,13 +994,6 @@ ownership less direct. Dedicated named threads are intentionally simpler to
 operate. Blocked receives park without consuming CPU; restart backoff owns no
 plugin thread at all.
 
-### State represented as a one-message topic
-
-State and events have different loss semantics. State should coalesce to the
-latest revision; an event stream should either deliver retained events or
-report a gap. One primitive cannot choose both correctly without recreating
-two modes implicitly.
-
 ## Implementation plan
 
 1. **Thread naming.** Add the platform-aware shared naming helper, name blit's
@@ -1075,19 +1003,17 @@ two modes implicitly.
    dispatch, bounded outbox, identity propagation, and common disconnect.
 3. **Native channels.** Implement the `0x95` channel registry, flow control,
    identity, cleanup, codecs, and CLI protocol tests.
-4. **State and topics.** Implement `0x96`, snapshot-before-live ordering,
-   revision CAS, bounded retention, coalescing, and gap tests.
-5. **Processes.** Implement the `0xC0` through `0xC5` process family,
+4. **Processes.** Implement the `0xC0` through `0xC5` process family,
    per-stream flow control, concurrent pipe draining, process-tree cleanup,
    codecs, and protocol tests from a network client.
-6. **Plugin objects.** Implement BLAKE3 run probe, chunk upload, validation,
+5. **Plugin objects.** Implement BLAKE3 run probe, chunk upload, validation,
    persistent CAS, pending-run single-flight, and cache eviction.
-7. **Supervisor.** Add stable plugin/attempt identity, restart policy,
+6. **Supervisor.** Add stable plugin/attempt identity, restart policy,
    backoff, durable desired state, startup restoration, and crash-safe control.
-8. **Wasmi host.** Add one named thread per running plugin attempt, bounded
+7. **Wasmi host.** Add one named thread per running plugin attempt, bounded
    endpoint queues, Wasmi containment, fuel-based cancellation yielding,
    attempt lifecycle, and event retention.
-9. **Rust SDK and CLI.** Add `blit-guest`, a Rust example plugin, `blit run`,
+8. **Rust SDK and CLI.** Add `blit-guest`, a Rust example plugin, `blit run`,
    process wrappers, and plugin control commands.
 
 Each phase has a vertical protocol test with at least two logical clients.
@@ -1103,11 +1029,8 @@ process-tree cleanup on endpoint loss.
 
 ## Open questions
 
-- Should topic retention default to zero or a small byte suffix?
 - Should persistent object eviction be automatic by default or operator-only
   until access-time accounting is proven reliable across crashes?
-- Should state names disappear immediately with their owner or have a short
-  tombstone period so watchers can distinguish deletion from a missed update?
 
 None of these questions changes the central boundary: plugins are logical
 clients, and their host ABI exchanges ordinary blit packets.
