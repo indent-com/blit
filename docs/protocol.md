@@ -48,7 +48,7 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 | `0x17` | `CREATE_N`              | `[nonce:2][rows:2][cols:2][tag_len:2][tag:N]`                                                                                                                        |
 | `0x18` | `CREATE2`               | `[nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][optional…]`                                                                                                 |
 | `0x19` | `READ`                  | `[nonce:2][pty_id:2][offset:4][limit:4][flags:1]`                                                                                                                    |
-| `0x1A` | `KILL`                  | `[pty_id:2][signal:4]` — send signal to PTY session leader                                                                                                           |
+| `0x1A` | `KILL`                  | `[pty_id:2][signal:4][flags:1]` — send signal to a PTY's process group; `flags` optional                                                                             |
 | `0x1B` | `COPY_RANGE`            | `[nonce:2][pty_id:2][start_tail:4][start_col:2][end_tail:4][end_col:2][flags:1]`                                                                                     |
 | `0x1C` | `TERM_CWD`              | `[nonce:2][pty_id:2]` — request a PTY's live working directory (see [Working directory tracking](#working-directory-tracking))                                       |
 | `0x20` | `SURFACE_INPUT`         | `[surface_id:2][keycode:4][pressed:1]`                                                                                                                               |
@@ -168,6 +168,7 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 | 9   | `KV`            | Server supports the `KV_*` key-value family                    |
 | 10  | `NET`           | Server supports the `NET_*` network-relay family               |
 | 14  | `CREATE_STATUS` | `CREATE2(WANT_STATUS)` receives an explicit failure            |
+| 15  | `KILL_MODE`     | `KILL`/`CLOSE` reach the process group; `KILL` takes `flags`   |
 
 Bits 11 through 13 are held for the extension, channel, and process families
 under review in [#167](https://github.com/indent-com/blit/pull/167) and
@@ -222,6 +223,19 @@ that does not exist yet.
 The PTY cap is `--max-ptys` / `BLIT_MAX_PTYS`, unlimited by default. It counts
 exited-but-retained terminals as well as live ones, since both hold an id and
 a scrollback.
+
+`KILL` and `CLOSE` signal the child's process group on Unix and terminate its
+job object on Windows. `KILL`'s trailing `flags` byte is optional and armed by
+a message length of 8; bit 0 (`LEADER_ONLY`) restores the older behaviour of
+signalling the session leader alone, which is what a caller emulating a
+keystroke wants. A 7-byte `KILL` gets the group, so a client needs no change
+to stop leaking a killed shell's children. Group delivery reaches the leader's
+own group and, through `TIOCGPGRP`, the terminal's foreground group; a
+backgrounded job sits in neither and survives. Containing that needs a cgroup,
+not a signal. On Windows the job carries
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so dropping the handle takes any
+survivor with it; if the job cannot be created the PTY still runs and
+degrades to a leader-only kill.
 
 This is opt-in rather than a reinterpretation of `CREATED_N`; a legacy client
 cannot mistake an error for PTY zero. `CREATE`, `CREATE_AT`, `CREATE_N`, and

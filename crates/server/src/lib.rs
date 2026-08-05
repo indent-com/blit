@@ -10,8 +10,8 @@ use blit_remote::{
     C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD,
     C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_CWD,
     CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS, FEATURE_COMPOSITOR, FEATURE_COPY_RANGE,
-    FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState,
-    READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT,
+    FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState,
+    KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT,
     S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE,
     STATUS_BUDGET, STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264,
     SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN, build_update_msg, msg_hello,
@@ -8582,6 +8582,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | FEATURE_COPY_RANGE
                 | FEATURE_COMPOSITOR
                 | FEATURE_CREATE_STATUS
+                | FEATURE_KILL_MODE
                 | blit_remote::fs::FEATURE_FS
                 | blit_remote::git::FEATURE_GIT;
             // BLIT_LSP=0 disables the family: the bit is simply not
@@ -10470,10 +10471,16 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             C2S_KILL if data.len() >= 7 => {
                 let pid = u16::from_le_bytes([data[1], data[2]]);
                 let signal = i32::from_le_bytes([data[3], data[4], data[5], data[6]]);
+                // The flags byte is optional; a 7-byte message means the
+                // default, which is now the whole group.
+                let leader_only = data.len() >= 8 && data[7] & KILL_LEADER_ONLY != 0;
+                // `exited` gates this because a group kill on a reaped pid
+                // would land on whatever recycled it — a wider blast radius
+                // than the leader-only kill this replaces.
                 if let Some(pty) = sess.ptys.get(&pid)
                     && !pty.exited
                 {
-                    pty::kill_pty(&pty.handle, signal);
+                    pty::kill_pty(&pty.handle, signal, !leader_only);
                 }
             }
             C2S_CLOSE if data.len() >= 3 => {

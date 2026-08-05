@@ -172,9 +172,17 @@ pub const READ_TAIL: u8 = 1 << 1;
 /// flags: reserved (0 for now).
 /// Server responds with S2C_TEXT using the same nonce.
 pub const C2S_COPY_RANGE: u8 = 0x1B;
-/// Send a signal to a PTY's session leader: [0x1A][pty_id:2][signal:4]
+/// Send a signal to a PTY: [0x1A][pty_id:2][signal:4][flags:1]
 /// signal is a raw libc signal number (e.g. SIGTERM=15, SIGKILL=9).
+///
+/// `flags` is optional and armed by `data.len() >= 8`; a 7-byte message keeps
+/// the default.  That default is now the process group, not the session
+/// leader alone — killing a shell used to leave its children running.
 pub const C2S_KILL: u8 = 0x1A;
+/// Signal only the session leader, the pre-`FEATURE_KILL_MODE` behaviour.
+/// Right when emulating a keystroke for the foreground program, wrong when
+/// you mean "stop this terminal and everything in it".
+pub const KILL_LEADER_ONLY: u8 = 1 << 0;
 /// Request a PTY's live working directory: [0x1C][nonce:2][pty_id:2]
 pub const C2S_TERM_CWD: u8 = 0x1C;
 
@@ -556,6 +564,10 @@ pub const FEATURE_AUDIO: u32 = 1 << 5;
 /// exactly one of `S2C_CREATED_N` or [`S2C_CREATE_FAILED`].  Not gated by any
 /// family kill switch.
 pub const FEATURE_CREATE_STATUS: u32 = 1 << 14;
+/// `C2S_KILL` and `C2S_CLOSE` reach the child's process group (Unix) or job
+/// object (Windows) rather than the session leader alone, and `C2S_KILL`
+/// accepts a trailing [`KILL_LEADER_ONLY`] flag byte to opt back out.
+pub const FEATURE_KILL_MODE: u32 = 1 << 15;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {
@@ -2601,6 +2613,16 @@ pub fn msg_kill(pty_id: u16, signal: i32) -> Vec<u8> {
     msg.push(C2S_KILL);
     msg.extend_from_slice(&pty_id.to_le_bytes());
     msg.extend_from_slice(&signal.to_le_bytes());
+    msg
+}
+
+/// `C2S_KILL` with an explicit mode.  Only send this to a server advertising
+/// [`FEATURE_KILL_MODE`] — an older one ignores the trailing byte and signals
+/// the leader alone, which is the opposite of what `leader_only = false`
+/// asks for.
+pub fn msg_kill_mode(pty_id: u16, signal: i32, leader_only: bool) -> Vec<u8> {
+    let mut msg = msg_kill(pty_id, signal);
+    msg.push(if leader_only { KILL_LEADER_ONLY } else { 0 });
     msg
 }
 

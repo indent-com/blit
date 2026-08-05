@@ -261,15 +261,42 @@ pub fn resize_pty_os(handle: &PtyHandle, rows: u16, cols: u16) {
     }
 }
 
-pub fn kill_pty(handle: &PtyHandle, signal: i32) {
+/// Signal a PTY's child.
+///
+/// `group` sends to process groups rather than to the session leader alone.
+/// Every blit child is a `setsid()` session leader (see `spawn_pty`), so its
+/// pgid equals its pid and `kill(-pid)` is valid with no extra bookkeeping.
+/// That reaches the leader's own group; a shell puts each job in a *separate*
+/// group, so the foreground job is signalled through `TIOCGPGRP` the same way
+/// `resize_pty_os` delivers `SIGWINCH`.  Backgrounded jobs in neither group
+/// still survive — bounding those needs a cgroup, not a signal.
+///
+/// Leader-only remains available because `SIGINT`-to-the-leader is what a
+/// caller wants when emulating a keystroke, not a tree-wide interrupt.
+pub fn kill_pty(handle: &PtyHandle, signal: i32, group: bool) {
     unsafe {
-        libc::kill(handle.child_pid, signal);
+        if !group {
+            libc::kill(handle.child_pid, signal);
+            return;
+        }
+        let mut fg_pgid: libc::pid_t = 0;
+        libc::ioctl(handle.master_fd, libc::TIOCGPGRP, &mut fg_pgid);
+        if fg_pgid > 0 && fg_pgid != handle.child_pid {
+            libc::kill(-fg_pgid, signal);
+        }
+        libc::kill(-handle.child_pid, signal);
     }
 }
 
+/// Hang up a PTY: `SIGHUP` the child's group, then drop the master.
+///
+/// Closing the master alone makes the kernel hang up the terminal, but only
+/// processes still attached to it notice.  A grandchild that redirected away
+/// from the tty keeps running and keeps the slave open, which is why the
+/// signal goes to the group first.
 pub fn close_pty(handle: &PtyHandle) {
+    kill_pty(handle, libc::SIGHUP, true);
     unsafe {
-        libc::kill(handle.child_pid, libc::SIGHUP);
         libc::close(handle.master_fd);
     }
 }
@@ -803,6 +830,99 @@ mod tests {
             child_pid: pid,
         };
         assert_eq!(collect_exit_status(&handle), 42);
+    }
+
+    /// Fork a session leader that forks a child of its own, both parked in
+    /// `pause()`.  Returns (leader, grandchild).  Mirrors the shape that
+    /// matters in practice: a shell with a running command under it.
+    fn fork_leader_with_child() -> (libc::pid_t, libc::pid_t) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+        let leader = unsafe { libc::fork() };
+        assert!(leader >= 0, "fork failed");
+        if leader == 0 {
+            unsafe {
+                libc::close(fds[0]);
+                libc::setsid();
+                let grandchild = libc::fork();
+                if grandchild == 0 {
+                    loop {
+                        libc::pause();
+                    }
+                }
+                // Hand the grandchild's pid back and park.
+                let bytes = (grandchild as i32).to_le_bytes();
+                libc::write(fds[1], bytes.as_ptr().cast(), 4);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        unsafe { libc::close(fds[1]) };
+        let mut buf = [0u8; 4];
+        let n = unsafe { libc::read(fds[0], buf.as_mut_ptr().cast(), 4) };
+        assert_eq!(n, 4, "did not receive grandchild pid");
+        unsafe { libc::close(fds[0]) };
+        (leader, i32::from_le_bytes(buf))
+    }
+
+    fn is_alive(pid: libc::pid_t) -> bool {
+        // Signal 0 probes without delivering.  A zombie still answers, so
+        // reap first at the call sites that care.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Poll until `pid` is unreachable.  The grandchild is not this process's
+    /// child, so `waitid` answers ECHILD for it — once its parent dies it is
+    /// reparented and reaped by the subreaper, and probing is the only thing
+    /// left that works.
+    fn wait_until_gone(pid: libc::pid_t) {
+        for _ in 0..500 {
+            if !is_alive(pid) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("pid {pid} still alive after 5s");
+    }
+
+    /// The bug this replaced: `kill(pid, sig)` reached the session leader and
+    /// nothing else, so killing a shell left its children running.
+    #[test]
+    fn leader_only_kill_spares_the_child() {
+        let (leader, grandchild) = fork_leader_with_child();
+        let handle = PtyHandle {
+            master_fd: -1,
+            child_pid: leader,
+        };
+
+        super::kill_pty(&handle, libc::SIGKILL, false);
+        wait_until_zombie(leader);
+        assert!(
+            is_alive(grandchild),
+            "leader-only kill should not reach the child"
+        );
+
+        unsafe {
+            libc::kill(grandchild, libc::SIGKILL);
+            libc::waitpid(leader, std::ptr::null_mut(), 0);
+        }
+    }
+
+    #[test]
+    fn group_kill_reaches_the_child() {
+        let (leader, grandchild) = fork_leader_with_child();
+        let handle = PtyHandle {
+            master_fd: -1,
+            child_pid: leader,
+        };
+
+        super::kill_pty(&handle, libc::SIGKILL, true);
+        wait_until_zombie(leader);
+        unsafe {
+            libc::waitpid(leader, std::ptr::null_mut(), 0);
+        }
+        wait_until_gone(grandchild);
     }
 
     fn child_env_map(env: Vec<std::ffi::CString>) -> HashMap<String, String> {
