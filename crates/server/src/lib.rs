@@ -9,10 +9,11 @@ use blit_remote::{
     C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2, C2S_SURFACE_RESIZE,
     C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD,
     C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_CWD,
-    CREATE2_HAS_SRC_PTY, FEATURE_COMPOSITOR, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE,
-    FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState, READ_ANSI, READ_TAIL, S2C_CLOSED,
-    S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS,
-    S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, SURFACE_FRAME_CODEC_H264,
+    CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS, FEATURE_COMPOSITOR, FEATURE_COPY_RANGE,
+    FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState,
+    READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT,
+    S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE,
+    STATUS_BUDGET, STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264,
     SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN, build_update_msg, msg_hello,
     msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_used_rows, msg_surface_app_id,
     msg_surface_created, msg_surface_destroyed, msg_surface_encoder, msg_surface_frame,
@@ -50,6 +51,7 @@ pub use surface_encoder::SurfaceH264EncoderPreference;
 pub use surface_encoder::{SurfaceBandwidth, SurfaceEncoding, SurfaceSpeed};
 
 type PtyFds = Arc<std::sync::RwLock<HashMap<u16, PtyWriteTarget>>>;
+
 pub struct Config {
     pub shell: String,
     pub shell_flags: String,
@@ -64,7 +66,9 @@ pub struct Config {
     pub verbose: bool,
     /// Maximum number of concurrent client connections (0 = unlimited).
     pub max_connections: usize,
-    /// Maximum number of PTYs across all clients (0 = unlimited).
+    /// Maximum number of PTYs across all clients (0 = unlimited).  Counts
+    /// exited-but-retained terminals too, since those still hold an id and a
+    /// scrollback.
     pub max_ptys: usize,
     /// Application-level ping interval.  The server sends S2C_PING to every
     /// client at this cadence so that transports without native keepalive
@@ -2377,9 +2381,10 @@ impl Session {
 
     fn allocate_pty_id(&mut self, max_ptys: usize) -> Option<u16> {
         if max_ptys > 0 && self.ptys.len() >= max_ptys {
-            // The callers drop the CREATE with no reply — the protocol has no
-            // "create refused" message — so the client learns about this as a
-            // timeout. Say it here at least, or the cap looks like a hang.
+            // A `CREATE2(WANT_STATUS)` caller now gets `S2C_CREATE_FAILED`
+            // with `BUDGET`, but the older create opcodes still drop the
+            // request with no reply, so keep saying it here — for those the
+            // cap otherwise still looks like a hang.
             eprintln!("blit-server: refusing CREATE, BLIT_MAX_PTYS ({max_ptys}) reached");
             return None;
         }
@@ -3150,6 +3155,53 @@ fn resolve_term_cwd(osc7: Option<&str>, kernel: impl FnOnce() -> Option<String>)
     match osc7 {
         Some(cwd) => Some(cwd.to_owned()),
         None => kernel(),
+    }
+}
+
+/// Answer a refused `C2S_CREATE2` that asked for a correlated outcome.
+///
+/// `CREATE`, `CREATE_AT`, `CREATE_N`, and `CREATE2` without
+/// [`CREATE2_WANT_STATUS`] keep their success-only contract, so this is a
+/// no-op for them — a server must not send `S2C_CREATE_FAILED` to a client
+/// that did not ask for it (docs/protocol.md, "Common status registry").
+fn refuse_create(
+    sess: &Session,
+    client_id: u64,
+    want_status: bool,
+    nonce: u16,
+    status: u8,
+    detail: &str,
+) {
+    if !want_status {
+        return;
+    }
+    if let Some(c) = sess.clients.get(&client_id) {
+        let _ = send_outbox(c, blit_remote::msg_create_failed(nonce, status, detail));
+    }
+}
+
+/// Name the field that would not survive `S2C_LIST`'s `u16` length prefixes,
+/// or `None` when the record is representable.  `pty_list_msg` casts both
+/// lengths with `as u16`, so an oversize value does not fail loudly — it
+/// silently truncates and desynchronizes the frame for every client.
+fn oversize_list_field(tag: &str, command: Option<&str>) -> Option<&'static str> {
+    if tag.len() > u16::MAX as usize {
+        return Some("tag");
+    }
+    if command.is_some_and(|c| c.len() > u16::MAX as usize) {
+        return Some("command");
+    }
+    None
+}
+
+/// Diagnostic for a `STATUS_BUDGET` creation refusal.  `allocate_pty_id`
+/// returns `None` for two different exhaustions and the operator fix differs,
+/// so name which one was hit.
+fn pty_budget_detail(live: usize, max_ptys: usize) -> String {
+    if max_ptys > 0 && live >= max_ptys {
+        format!("terminal cap reached ({max_ptys}); raise --max-ptys or close a terminal")
+    } else {
+        "terminal id space exhausted".to_string()
     }
 }
 
@@ -8529,6 +8581,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | FEATURE_RESIZE_BATCH
                 | FEATURE_COPY_RANGE
                 | FEATURE_COMPOSITOR
+                | FEATURE_CREATE_STATUS
                 | blit_remote::fs::FEATURE_FS
                 | blit_remote::git::FEATURE_GIT;
             // BLIT_LSP=0 disables the family: the bit is simply not
@@ -9434,7 +9487,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 }
             }
             C2S_CREATE2 => {
-                if data.len() < 10 {
+                // The one-outcome contract arms as soon as the nonce and the
+                // feature byte are decodable (docs/protocol.md, "Common status
+                // registry").  A frame shorter than that cannot be correlated
+                // to anything, so it stays a silent drop.
+                if data.len() < 8 {
                     continue;
                 }
                 let nonce = u16::from_le_bytes([data[1], data[2]]);
@@ -9444,6 +9501,18 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     u16::from_le_bytes([data[5], data[6]]),
                 );
                 let features = data[7];
+                let want_status = features & CREATE2_WANT_STATUS != 0;
+                if data.len() < 10 {
+                    refuse_create(
+                        &sess,
+                        client_id,
+                        want_status,
+                        nonce,
+                        STATUS_INVALID,
+                        "truncated tag length",
+                    );
+                    continue;
+                }
                 let tag_len = u16::from_le_bytes([data[8], data[9]]) as usize;
                 let tag = if data.len() >= 10 + tag_len {
                     std::str::from_utf8(&data[10..10 + tag_len]).unwrap_or_default()
@@ -9460,11 +9529,27 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 };
                 let explicit_dir = if features & CREATE2_HAS_CWD != 0 {
                     if data.len() < cursor + 2 {
+                        refuse_create(
+                            &sess,
+                            client_id,
+                            want_status,
+                            nonce,
+                            STATUS_INVALID,
+                            "truncated cwd length",
+                        );
                         continue;
                     }
                     let cwd_len = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
                     cursor += 2;
                     if data.len() < cursor + cwd_len {
+                        refuse_create(
+                            &sess,
+                            client_id,
+                            want_status,
+                            nonce,
+                            STATUS_INVALID,
+                            "truncated cwd",
+                        );
                         continue;
                     }
                     let cwd = std::str::from_utf8(&data[cursor..cursor + cwd_len]).ok();
@@ -9490,7 +9575,29 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     .filter(|p| p.contains('\0'))
                     .map(|p| p.split('\0').filter(|a| !a.is_empty()).collect::<Vec<_>>())
                     .filter(|a| !a.is_empty());
+                // A tag or command that cannot round-trip S2C_LIST's u16
+                // length fields would truncate into a corrupt catalog frame
+                // for every client, so refuse the mutation instead.
+                if let Some(what) = oversize_list_field(tag, command) {
+                    refuse_create(
+                        &sess,
+                        client_id,
+                        want_status,
+                        nonce,
+                        STATUS_TOO_LARGE,
+                        &format!("{what} exceeds 65535 bytes"),
+                    );
+                    continue;
+                }
                 let Some(id) = sess.allocate_pty_id(config.max_ptys) else {
+                    refuse_create(
+                        &sess,
+                        client_id,
+                        want_status,
+                        nonce,
+                        STATUS_BUDGET,
+                        &pty_budget_detail(sess.ptys.len(), config.max_ptys),
+                    );
                     continue;
                 };
                 let socket_name = sess
@@ -9548,6 +9655,17 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         }
                     }
                     need_nudge = true;
+                } else {
+                    // The id was handed out by allocate_pty_id but nothing
+                    // was inserted, so it is free again on the next probe.
+                    refuse_create(
+                        &sess,
+                        client_id,
+                        want_status,
+                        nonce,
+                        STATUS_OTHER,
+                        "failed to spawn terminal",
+                    );
                 }
             }
             C2S_SURFACE_INPUT if data.len() >= 8 => {
@@ -14427,6 +14545,36 @@ mod tests {
         assert_eq!(sess.allocate_pty_id(0), Some(u16::MAX));
         // Next allocation wraps to 1.
         assert_eq!(sess.allocate_pty_id(0), Some(1));
+    }
+
+    // ── create refusal ──
+
+    #[test]
+    fn oversize_list_field_names_the_offender() {
+        let big = "x".repeat(u16::MAX as usize + 1);
+        assert_eq!(oversize_list_field("tag", None), None);
+        assert_eq!(oversize_list_field("tag", Some("cmd")), None);
+        assert_eq!(oversize_list_field(&big, None), Some("tag"));
+        assert_eq!(oversize_list_field("tag", Some(&big)), Some("command"));
+    }
+
+    #[test]
+    fn oversize_list_field_allows_exactly_u16_max() {
+        // The length prefix holds this exactly; only one more byte truncates.
+        let exact = "x".repeat(u16::MAX as usize);
+        assert_eq!(oversize_list_field(&exact, Some(&exact)), None);
+    }
+
+    #[test]
+    fn pty_budget_detail_separates_the_two_exhaustions() {
+        // The operator fix differs — raise the cap, versus wait for ids to
+        // free up — so the detail has to tell them apart.
+        assert!(pty_budget_detail(256, 256).contains("cap reached (256)"));
+        assert!(pty_budget_detail(300, 256).contains("cap reached"));
+        // Uncapped, or under the cap: the only way to get here is a full
+        // id space.
+        assert!(pty_budget_detail(65535, 0).contains("id space"));
+        assert!(pty_budget_detail(10, 256).contains("id space"));
     }
 
     // ── try_send_update ──

@@ -4,15 +4,16 @@ use blit_remote::{AXIS_SOURCE_WHEEL, PointerAxisEvent};
 use blit_remote::{
     C2S_CLIENT_FEATURES, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_LIST,
     C2S_SURFACE_POINTER, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CODEC_SUPPORT_AV1,
-    CODEC_SUPPORT_H264, EXIT_STATUS_UNKNOWN, S2C_CLIPBOARD_CONTENT, S2C_CLIPBOARD_LIST, S2C_EXITED,
-    S2C_HELLO, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SURFACE_CAPTURE, S2C_SURFACE_FRAME,
+    CODEC_SUPPORT_H264, CREATE2_WANT_STATUS, EXIT_STATUS_UNKNOWN, FEATURE_CREATE_STATUS,
+    S2C_CLIPBOARD_CONTENT, S2C_CLIPBOARD_LIST, S2C_EXITED, S2C_HELLO, S2C_LIST, S2C_PING, S2C_QUIT,
+    S2C_READY, S2C_SURFACE_CAPTURE, S2C_SURFACE_FRAME,
     S2C_SURFACE_LIST, S2C_TERM_CWD, S2C_TEXT, S2C_TITLE, S2C_UPDATE, SURFACE_FRAME_CODEC_AV1,
     SURFACE_FRAME_CODEC_MASK, SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState, msg_ack,
     msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_close, msg_create2,
     msg_input, msg_kill, msg_mouse, msg_quit, msg_read, msg_resize, msg_restart, msg_subscribe,
     msg_surface_close, msg_surface_focus, msg_surface_input, msg_surface_pointer_axis2,
     msg_surface_resize, msg_surface_subscribe, msg_surface_subscribe_ext, msg_surface_text,
-    msg_term_cwd, parse_server_msg, parse_term_cwd_reply,
+    msg_term_cwd, parse_server_msg, parse_term_cwd_reply, status_text,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -231,7 +232,15 @@ pub async fn cmd_start(
     let nonce: u16 = 1;
     let tag_str = tag.as_deref().unwrap_or("");
     let cmd_str = command.join("\0");
-    let msg = msg_create2(nonce, rows, cols, tag_str, &cmd_str, 0);
+    // Only ask for a correlated outcome from a server that advertised it —
+    // an older one would drop the flag byte's meaning and still answer
+    // nothing on refusal (docs/protocol.md, "Common status registry").
+    let features = if conn.features & FEATURE_CREATE_STATUS != 0 {
+        CREATE2_WANT_STATUS
+    } else {
+        0
+    };
+    let msg = msg_create2(nonce, rows, cols, tag_str, &cmd_str, features);
     conn.send(&msg).await?;
 
     loop {
@@ -239,13 +248,28 @@ pub async fn cmd_start(
         if data.is_empty() {
             continue;
         }
-        if let Some(ServerMsg::CreatedN {
-            nonce: n, pty_id, ..
-        }) = parse_server_msg(&data)
-            && n == nonce
-        {
-            println!("{pty_id}");
-            return Ok(pty_id);
+        match parse_server_msg(&data) {
+            Some(ServerMsg::CreatedN {
+                nonce: n, pty_id, ..
+            }) if n == nonce => {
+                println!("{pty_id}");
+                return Ok(pty_id);
+            }
+            Some(ServerMsg::CreateFailed {
+                nonce: n,
+                status,
+                detail,
+            }) if n == nonce => {
+                return Err(if detail.is_empty() {
+                    format!("server refused to create terminal: {}", status_text(status))
+                } else {
+                    format!(
+                        "server refused to create terminal: {} ({detail})",
+                        status_text(status)
+                    )
+                });
+            }
+            _ => {}
         }
     }
 }

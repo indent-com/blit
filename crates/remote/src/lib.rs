@@ -150,6 +150,13 @@ pub const C2S_CREATE2: u8 = 0x18;
 pub const CREATE2_HAS_SRC_PTY: u8 = 1 << 0;
 pub const CREATE2_HAS_COMMAND: u8 = 1 << 1;
 pub const CREATE2_HAS_CWD: u8 = 1 << 2;
+/// Request exactly one correlated creation outcome: `S2C_CREATED_N` on
+/// success, [`S2C_CREATE_FAILED`] on refusal.  Adds no trailing field.
+/// Only set this when `S2C_HELLO` advertised [`FEATURE_CREATE_STATUS`] —
+/// without the flag a refused create sends nothing at all and a
+/// nonce-bearing client waits forever (docs/protocol.md, "Common status
+/// registry").
+pub const CREATE2_WANT_STATUS: u8 = 1 << 3;
 /// Read text from a PTY's scrollback + viewport: [0x19][nonce:2][pty_id:2][offset:4][limit:4][flags:1]
 /// offset: number of lines to skip from the top (oldest = 0), or from the end if READ_TAIL is set
 /// limit: max lines to return (0 = all)
@@ -333,6 +340,16 @@ pub const S2C_TERM_CWD_EVENT: u8 = 0x0F;
 /// and it sits well under the u16 length the family's `cwd_len:2`
 /// framing already imposes.  Oversize OSC 7 reports are dropped.
 pub const TERM_CWD_MAX: usize = 4096;
+/// Correlated creation refusal: [0x10][nonce:2][status:1][detail:N].
+/// `status` comes from the common registry below; `detail` is diagnostic
+/// UTF-8 capped at [`CREATE_FAILED_DETAIL_MAX`].  Sent only in answer to a
+/// `C2S_CREATE2` that set [`CREATE2_WANT_STATUS`] — never for a plain
+/// `CREATE`, `CREATE_AT`, `CREATE_N`, or unflagged `CREATE2`, which keep
+/// their success-only contract.
+pub const S2C_CREATE_FAILED: u8 = 0x10;
+/// Cap on `S2C_CREATE_FAILED`'s `detail`.  Matches the 1 KiB the other
+/// diagnostic-detail families use; the text is for humans, not parsing.
+pub const CREATE_FAILED_DETAIL_MAX: usize = 1024;
 /// Text response: [0x0A][nonce:2][pty_id:2][total_lines:4][offset:4][text:N]
 /// nonce: echoed from C2S_READ request
 /// total_lines: total available lines (scrollback + viewport rows)
@@ -480,12 +497,65 @@ pub const CODEC_SUPPORT_AV1: u8 = 1 << 1;
 pub const CODEC_SUPPORT_H264_444: u8 = 1 << 2;
 pub const CODEC_SUPPORT_AV1_444: u8 = 1 << 3;
 
+// ---------------------------------------------------------------------------
+// Common status registry (docs/protocol.md, "Common status registry")
+//
+// A one-byte `status` shared by families that do not declare a message-local
+// table.  The `KV_STATUS_*` / `NET_STATUS_*` / `FS_*` tables are grandfathered
+// and keep their shipped values; new families use these.  Values 0-127 are
+// centrally allocated (13-127 reserved), 128-255 are family-local and must be
+// defined by the packet carrying them.
+// ---------------------------------------------------------------------------
+
+pub const STATUS_OK: u8 = 0;
+pub const STATUS_UNKNOWN_ID: u8 = 1;
+pub const STATUS_NOT_FOUND: u8 = 2;
+pub const STATUS_WRONG_TYPE: u8 = 3;
+pub const STATUS_PERMISSION: u8 = 4;
+pub const STATUS_TOO_LARGE: u8 = 5;
+pub const STATUS_BUDGET: u8 = 6;
+pub const STATUS_INVALID: u8 = 7;
+pub const STATUS_CANCELLED: u8 = 8;
+pub const STATUS_OTHER: u8 = 9;
+pub const STATUS_WARMING: u8 = 10;
+pub const STATUS_CONFLICT: u8 = 11;
+pub const STATUS_NO_MERGE_BASE: u8 = 12;
+
+/// Render a common-registry status for humans.  An unallocated value reads
+/// distinctly from [`STATUS_OTHER`] so a newer server's status is not
+/// mistaken for a generic backend failure.
+pub fn status_text(status: u8) -> &'static str {
+    match status {
+        STATUS_OK => "ok",
+        STATUS_UNKNOWN_ID => "unknown id",
+        STATUS_NOT_FOUND => "not found",
+        STATUS_WRONG_TYPE => "wrong type",
+        STATUS_PERMISSION => "permission denied",
+        STATUS_TOO_LARGE => "too large",
+        STATUS_BUDGET => "budget exhausted",
+        STATUS_INVALID => "invalid request",
+        STATUS_CANCELLED => "cancelled",
+        STATUS_OTHER => "backend error",
+        STATUS_WARMING => "warming up",
+        STATUS_CONFLICT => "conflict",
+        STATUS_NO_MERGE_BASE => "no merge base",
+        _ => "unknown status",
+    }
+}
+
 pub const FEATURE_CREATE_NONCE: u32 = 1 << 0;
 pub const FEATURE_RESTART: u32 = 1 << 1;
 pub const FEATURE_RESIZE_BATCH: u32 = 1 << 2;
 pub const FEATURE_COPY_RANGE: u32 = 1 << 3;
 pub const FEATURE_COMPOSITOR: u32 = 1 << 4;
 pub const FEATURE_AUDIO: u32 = 1 << 5;
+/// Bits 6-13 are allocated to the per-family modules (`fs`, `git`, `lsp`,
+/// `kv`, `net`) and to the proposed extension/channel/process families.
+///
+/// The server answers a `C2S_CREATE2` carrying [`CREATE2_WANT_STATUS`] with
+/// exactly one of `S2C_CREATED_N` or [`S2C_CREATE_FAILED`].  Not gated by any
+/// family kill switch.
+pub const FEATURE_CREATE_STATUS: u32 = 1 << 14;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {
@@ -1827,6 +1897,14 @@ pub enum ServerMsg<'a> {
         pty_id: u16,
         tag: &'a str,
     },
+    /// The other half of a `CREATE2(WANT_STATUS)` outcome.  `status` is a
+    /// common-registry value; render it with [`status_text`] when `detail`
+    /// is empty.
+    CreateFailed {
+        nonce: u16,
+        status: u8,
+        detail: &'a str,
+    },
     Closed {
         pty_id: u16,
     },
@@ -1990,6 +2068,18 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             let pty_id = u16::from_le_bytes([data[3], data[4]]);
             let tag = std::str::from_utf8(data.get(5..).unwrap_or_default()).unwrap_or_default();
             Some(ServerMsg::CreatedN { nonce, pty_id, tag })
+        }
+        S2C_CREATE_FAILED => {
+            if data.len() < 4 {
+                return None;
+            }
+            let nonce = u16::from_le_bytes([data[1], data[2]]);
+            let detail = std::str::from_utf8(data.get(4..).unwrap_or_default()).unwrap_or_default();
+            Some(ServerMsg::CreateFailed {
+                nonce,
+                status: data[3],
+                detail,
+            })
         }
         S2C_CLOSED => {
             if data.len() < 3 {
@@ -2669,6 +2759,23 @@ pub fn msg_copy_range(
     msg.extend_from_slice(&end_tail.to_le_bytes());
     msg.extend_from_slice(&end_col.to_le_bytes());
     msg.push(flags);
+    msg
+}
+
+/// Build an `S2C_CREATE_FAILED`.  `detail` is truncated to
+/// [`CREATE_FAILED_DETAIL_MAX`] on a UTF-8 boundary so the message stays
+/// decodable as text.
+pub fn msg_create_failed(nonce: u16, status: u8, detail: &str) -> Vec<u8> {
+    let mut end = detail.len().min(CREATE_FAILED_DETAIL_MAX);
+    while end > 0 && !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    let detail = &detail.as_bytes()[..end];
+    let mut msg = Vec::with_capacity(4 + detail.len());
+    msg.push(S2C_CREATE_FAILED);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.push(status);
+    msg.extend_from_slice(detail);
     msg
 }
 
@@ -4475,6 +4582,66 @@ mod tests {
             }
             _ => panic!("expected CreatedN"),
         }
+    }
+
+    #[test]
+    fn create_failed_roundtrip() {
+        let wire = msg_create_failed(42, STATUS_BUDGET, "terminal cap reached (256)");
+        assert_eq!(wire[0], S2C_CREATE_FAILED);
+        match parse_server_msg(&wire).unwrap() {
+            ServerMsg::CreateFailed {
+                nonce,
+                status,
+                detail,
+            } => {
+                assert_eq!(nonce, 42);
+                assert_eq!(status, STATUS_BUDGET);
+                assert_eq!(detail, "terminal cap reached (256)");
+            }
+            _ => panic!("expected CreateFailed"),
+        }
+    }
+
+    #[test]
+    fn create_failed_accepts_empty_detail() {
+        let wire = msg_create_failed(7, STATUS_OTHER, "");
+        assert_eq!(wire.len(), 4);
+        match parse_server_msg(&wire).unwrap() {
+            ServerMsg::CreateFailed { detail, .. } => assert_eq!(detail, ""),
+            _ => panic!("expected CreateFailed"),
+        }
+    }
+
+    #[test]
+    fn create_failed_truncates_detail_on_a_char_boundary() {
+        // Splitting mid-codepoint would make `detail` undecodable and the
+        // whole message useless to the client it is meant to inform.
+        let detail = "é".repeat(CREATE_FAILED_DETAIL_MAX);
+        let wire = msg_create_failed(1, STATUS_INVALID, &detail);
+        match parse_server_msg(&wire).unwrap() {
+            ServerMsg::CreateFailed { detail, .. } => {
+                assert!(detail.len() <= CREATE_FAILED_DETAIL_MAX);
+                assert!(detail.chars().all(|c| c == 'é'));
+            }
+            _ => panic!("expected CreateFailed"),
+        }
+    }
+
+    #[test]
+    fn status_text_distinguishes_unallocated_from_other() {
+        assert_eq!(status_text(STATUS_OTHER), "backend error");
+        assert_eq!(status_text(200), "unknown status");
+    }
+
+    #[test]
+    fn create2_want_status_does_not_disturb_the_payload() {
+        // WANT_STATUS adds no trailing field, so a flagged and an unflagged
+        // create must differ in exactly one byte.
+        let plain = msg_create2(3, 24, 80, "tag", "echo hi", 0);
+        let flagged = msg_create2(3, 24, 80, "tag", "echo hi", CREATE2_WANT_STATUS);
+        assert_eq!(plain.len(), flagged.len());
+        assert_eq!(flagged[7], plain[7] | CREATE2_WANT_STATUS);
+        assert_eq!(plain[8..], flagged[8..]);
     }
 
     #[test]

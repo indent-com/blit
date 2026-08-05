@@ -847,6 +847,7 @@ async fn async_main() {
             fd_channel,
             export_sock,
             inject_path,
+            max_ptys,
             allow_forward,
             allow_forward_insecure,
             verbose,
@@ -910,7 +911,9 @@ async fn async_main() {
                 // They were hardcoded to 0 with no way to set them, which made
                 // the enforcement in blit-server dead code.
                 max_connections: env_usize("BLIT_MAX_CONNECTIONS"),
-                max_ptys: env_usize("BLIT_MAX_PTYS"),
+                // The flag takes precedence over the env var; absent both, the
+                // env default of 0 stands.
+                max_ptys: max_ptys.unwrap_or_else(|| env_usize("BLIT_MAX_PTYS")),
                 ping_interval: std::time::Duration::from_secs(10),
                 skip_compositor: std::env::var("BLIT_SKIP_COMPOSITOR")
                     .ok()

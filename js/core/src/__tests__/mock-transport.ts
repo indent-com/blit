@@ -6,6 +6,7 @@ import type {
 import {
   S2C_CREATED,
   S2C_CREATED_N,
+  S2C_CREATE_FAILED,
   S2C_CLOSED,
   S2C_EXITED,
   S2C_HELLO,
@@ -108,6 +109,18 @@ export class MockTransport implements BlitTransport {
     msg[3] = ptyId & 0xff;
     msg[4] = (ptyId >> 8) & 0xff;
     msg.set(tagBytes, 5);
+    this.push(msg);
+  }
+
+  /** Wire: [0x10][nonce:2][status:1][detail:N]. */
+  pushCreateFailed(nonce: number, status: number, detail = "") {
+    const detailBytes = new TextEncoder().encode(detail);
+    const msg = new Uint8Array(4 + detailBytes.length);
+    msg[0] = S2C_CREATE_FAILED;
+    msg[1] = nonce & 0xff;
+    msg[2] = (nonce >> 8) & 0xff;
+    msg[3] = status;
+    msg.set(detailBytes, 4);
     this.push(msg);
   }
 

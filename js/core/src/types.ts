@@ -235,6 +235,12 @@ export const C2S_TERM_CWD = 0x1c;
 export const CREATE2_HAS_SRC_PTY = 1 << 0;
 export const CREATE2_HAS_COMMAND = 1 << 1;
 export const CREATE2_HAS_CWD = 1 << 2;
+/** Ask for exactly one correlated outcome — `S2C_CREATED_N` on success or
+ *  {@link S2C_CREATE_FAILED} on refusal.  Adds no trailing field.  Only set
+ *  it when HELLO advertised {@link FEATURE_CREATE_STATUS}: an older server
+ *  ignores the bit and answers a refusal with nothing at all, leaving the
+ *  create pending forever. */
+export const CREATE2_WANT_STATUS = 1 << 3;
 
 /** Wire protocol constants: server-to-client message types. */
 export const S2C_UPDATE = 0x00;
@@ -256,6 +262,11 @@ export const S2C_TEXT = 0x0a;
 export const S2C_PING = 0x0b;
 export const S2C_QUIT = 0x0c;
 export const S2C_USED_ROWS = 0x0d;
+/** Correlated creation refusal: [nonce:2][status:1][detail:N].  `status` is
+ *  from the common registry below, `detail` is diagnostic UTF-8 and may be
+ *  empty.  Only sent for a `C2S_CREATE2` that set
+ *  {@link CREATE2_WANT_STATUS}. */
+export const S2C_CREATE_FAILED = 0x10;
 export const C2S_PING = 0x08;
 export const C2S_QUIT = 0x0f;
 
@@ -346,6 +357,69 @@ export const FEATURE_RESIZE_BATCH = 1 << 2;
 export const FEATURE_COPY_RANGE = 1 << 3;
 export const FEATURE_COMPOSITOR = 1 << 4;
 export const FEATURE_AUDIO = 1 << 5;
+/** The server answers a `C2S_CREATE2` carrying {@link CREATE2_WANT_STATUS}
+ *  with exactly one of `S2C_CREATED_N` or {@link S2C_CREATE_FAILED}.
+ *
+ *  Bits 6–13 belong to the per-family modules, which declare them beside
+ *  their own wire constants (`fs.ts`, `git.ts`, `lsp.ts`, `kv.ts`, `net.ts`). */
+export const FEATURE_CREATE_STATUS = 1 << 14;
+
+// -- Common status registry (docs/protocol.md) ------------------------------
+//
+// The one-byte `status` shared by families that do not declare a
+// message-local table.  `FS_*` / `KV_STATUS_*` / `NET_STATUS_*` are
+// grandfathered and keep their shipped values.  0–127 are centrally
+// allocated (13–127 reserved), 128–255 are family-local.
+
+export const STATUS_OK = 0;
+export const STATUS_UNKNOWN_ID = 1;
+export const STATUS_NOT_FOUND = 2;
+export const STATUS_WRONG_TYPE = 3;
+export const STATUS_PERMISSION = 4;
+export const STATUS_TOO_LARGE = 5;
+export const STATUS_BUDGET = 6;
+export const STATUS_INVALID = 7;
+export const STATUS_CANCELLED = 8;
+export const STATUS_OTHER = 9;
+export const STATUS_WARMING = 10;
+export const STATUS_CONFLICT = 11;
+export const STATUS_NO_MERGE_BASE = 12;
+
+/** Human-readable common-registry status.  An unallocated value reads
+ *  distinctly from {@link STATUS_OTHER} so a newer server's status is not
+ *  mistaken for a generic backend failure. */
+export function statusText(status: number): string {
+  switch (status) {
+    case STATUS_OK:
+      return "ok";
+    case STATUS_UNKNOWN_ID:
+      return "unknown id";
+    case STATUS_NOT_FOUND:
+      return "not found";
+    case STATUS_WRONG_TYPE:
+      return "wrong type";
+    case STATUS_PERMISSION:
+      return "permission denied";
+    case STATUS_TOO_LARGE:
+      return "too large";
+    case STATUS_BUDGET:
+      return "budget exhausted";
+    case STATUS_INVALID:
+      return "invalid request";
+    case STATUS_CANCELLED:
+      return "cancelled";
+    case STATUS_OTHER:
+      return "backend error";
+    case STATUS_WARMING:
+      return "warming up";
+    case STATUS_CONFLICT:
+      return "conflict";
+    case STATUS_NO_MERGE_BASE:
+      return "no merge base";
+    default:
+      return `unknown status ${status}`;
+  }
+}
 
 // -- Audio forwarding --
 export const C2S_AUDIO_SUBSCRIBE = 0x30;

@@ -38,6 +38,7 @@ import {
   CREATE2_HAS_SRC_PTY,
   CREATE2_HAS_COMMAND,
   CREATE2_HAS_CWD,
+  CREATE2_WANT_STATUS,
 } from "./types";
 
 const textEncoder = new TextEncoder();
@@ -192,7 +193,14 @@ export function buildCreate2Message(
   nonce: number,
   rows: number,
   cols: number,
-  options?: { tag?: string; command?: string; srcPtyId?: number; cwd?: string },
+  options?: {
+    tag?: string;
+    command?: string;
+    srcPtyId?: number;
+    cwd?: string;
+    /** Only pass this when the server advertised `FEATURE_CREATE_STATUS`. */
+    wantStatus?: boolean;
+  },
 ): Uint8Array {
   const tagBytes = options?.tag
     ? textEncoder.encode(options.tag)
@@ -210,6 +218,7 @@ export function buildCreate2Message(
   if (hasSrc) features |= CREATE2_HAS_SRC_PTY;
   if (hasCwd) features |= CREATE2_HAS_CWD;
   if (hasCmd) features |= CREATE2_HAS_COMMAND;
+  if (options?.wantStatus) features |= CREATE2_WANT_STATUS;
   const cmdBytes = hasCmd ? textEncoder.encode(cmdText) : new Uint8Array(0);
   const msg = new Uint8Array(
     10 +

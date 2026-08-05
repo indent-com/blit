@@ -274,6 +274,13 @@ pub enum Command {
         #[arg(long)]
         inject_path: bool,
 
+        /// Maximum number of terminals the server holds at once, counting
+        /// exited ones still retained for reading. Overrides BLIT_MAX_PTYS;
+        /// unlimited by default. A create refused past the cap answers
+        /// CREATE2(WANT_STATUS) with a budget status instead of hanging.
+        #[arg(long, value_name = "N")]
+        max_ptys: Option<usize>,
+
         /// Restrict what the TCP/UDP relay may reach: host[:ports], where
         /// host is a name, a *.suffix glob, an address, a CIDR block, or *,
         /// and ports is a comma-separated list of n or n-m. Repeatable (or

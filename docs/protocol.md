@@ -154,21 +154,82 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 
 `S2C_HELLO` is the first message sent on every new connection. `version` is the server's protocol version. `boot_generation` is an opaque little-endian identifier generated once per server process; clients can compare it across reconnects to detect a server restart. `server_version` is the server's release string (its crate version, e.g. `0.40.1`) — informational only: feature negotiation always goes through the feature bits, never a version comparison. Both trailing fields were appended without a protocol bump, so legacy servers omit them and clients must treat a short `HELLO` as valid. `features` is a 4-byte bitmask:
 
-| Bit | Name           | Meaning                                                        |
-| --- | -------------- | -------------------------------------------------------------- |
-| 0   | `CREATE_NONCE` | Server supports `CREATE2` / `CREATED_N` with nonce correlation |
-| 1   | `RESTART`      | Server supports `C2S_RESTART` to respawn exited PTYs           |
-| 2   | `RESIZE_BATCH` | Server accepts batched resize entries in a single `C2S_RESIZE` |
-| 3   | `COPY_RANGE`   | Server supports range-based text copy                          |
-| 4   | `COMPOSITOR`   | Server supports headless Wayland compositor                    |
-| 5   | `AUDIO`        | Server supports audio forwarding (PipeWire capture + Opus)     |
-| 6   | `FS`           | Server supports the `FS_*` filesystem sync family              |
-| 7   | `GIT`          | Server supports the `GIT_*` git introspection family           |
-| 8   | `LSP`          | Server supports the `LSP_*` language intelligence family       |
+| Bit | Name            | Meaning                                                        |
+| --- | --------------- | -------------------------------------------------------------- |
+| 0   | `CREATE_NONCE`  | Server supports `CREATE2` / `CREATED_N` with nonce correlation |
+| 1   | `RESTART`       | Server supports `C2S_RESTART` to respawn exited PTYs           |
+| 2   | `RESIZE_BATCH`  | Server accepts batched resize entries in a single `C2S_RESIZE` |
+| 3   | `COPY_RANGE`    | Server supports range-based text copy                          |
+| 4   | `COMPOSITOR`    | Server supports headless Wayland compositor                    |
+| 5   | `AUDIO`         | Server supports audio forwarding (PipeWire capture + Opus)     |
+| 6   | `FS`            | Server supports the `FS_*` filesystem sync family              |
+| 7   | `GIT`           | Server supports the `GIT_*` git introspection family           |
+| 8   | `LSP`           | Server supports the `LSP_*` language intelligence family       |
+| 9   | `KV`            | Server supports the `KV_*` key-value family                    |
+| 10  | `NET`           | Server supports the `NET_*` network-relay family               |
+| 14  | `CREATE_STATUS` | `CREATE2(WANT_STATUS)` receives an explicit failure            |
+
+Bits 11 through 13 are held for the extension, channel, and process families
+under review in [#167](https://github.com/indent-com/blit/pull/167) and
+[#173](https://github.com/indent-com/blit/pull/173); nothing advertises them
+today. Bit 14 is always advertised.
+
+### Common status registry
+
+New request/reply families should use this registry for a one-byte `status`
+unless their wire definition explicitly declares a message-local table.
+Existing message-local tables such as `FS_SYNCED` and `NET_OPENED` are
+grandfathered and do not share all of these numeric meanings.
+
+| Value | Name            | Meaning                                                      |
+| ----: | --------------- | ------------------------------------------------------------ |
+|     0 | `OK`            | Request completed successfully                               |
+|     1 | `UNKNOWN_ID`    | Requested identifier or handle is absent or already closed   |
+|     2 | `NOT_FOUND`     | Path, object, symbol, or backend does not exist              |
+|     3 | `WRONG_TYPE`    | Existing object cannot satisfy this operation                |
+|     4 | `PERMISSION`    | Operation is disabled or denied                              |
+|     5 | `TOO_LARGE`     | Input or result exceeds a size ceiling                       |
+|     6 | `BUDGET`        | A resource budget is exhausted without pagination/truncation |
+|     7 | `INVALID`       | Request encoding, flags, or field combination is invalid     |
+|     8 | `CANCELLED`     | Operation ended through its cancellation mechanism           |
+|     9 | `OTHER`         | Unclassified backend failure; detail should diagnose it      |
+|    10 | `WARMING`       | LSP backend is not ready; retry later                        |
+|    11 | `CONFLICT`      | A revision, lock, or compare-and-swap precondition failed    |
+|    12 | `NO_MERGE_BASE` | Valid Git histories have no common ancestor                  |
+
+Values 0–127 are centrally allocated common statuses; 13–127 are currently
+reserved. New family-local allocations use 128–255 and must be defined by the
+packet which carries them. Existing message-local tables retain their shipped
+values. Consumers render unknown values distinctly from `OTHER`.
 
 `S2C_LIST` entry layout: `[pty_id:2][tag_len:2][tag:N][cmd_len:2][cmd:M]` per
 PTY. The trailing command field is a backward-compatible extension; old
 entries without it parse as an empty command.
+
+When `HELLO` advertises `CREATE_STATUS`, shipped clients set
+`CREATE2.WANT_STATUS`. Once that request's nonce and feature byte are
+decodable, it receives exactly one outcome: `CREATED_N` on success or
+`CREATE_FAILED` on refusal. `CREATE_FAILED.status` uses the common registry and
+`detail` is diagnostic UTF-8, truncated to 1 KiB on a character boundary. In
+particular, a projected `LIST` overflow and PTY-ID or configured PTY-cap
+exhaustion return `BUDGET`, an unrepresentable tag or command returns
+`TOO_LARGE`, malformed fields return `INVALID`, and spawn failure returns
+`OTHER`. A tag or command that cannot round-trip `S2C_LIST`'s `u16` length
+prefixes is refused rather than silently truncated into a corrupt catalog
+frame; bounding the _aggregate_ `LIST` size needs a logical-message ceiling
+that does not exist yet.
+
+The PTY cap is `--max-ptys` / `BLIT_MAX_PTYS`, unlimited by default. It counts
+exited-but-retained terminals as well as live ones, since both hold an id and
+a scrollback.
+
+This is opt-in rather than a reinterpretation of `CREATED_N`; a legacy client
+cannot mistake an error for PTY zero. `CREATE`, `CREATE_AT`, `CREATE_N`, and
+`CREATE2` without negotiated `WANT_STATUS` retain their existing success-only
+contract: the server refuses an inadmissible mutation without sending
+`CREATED` or `CREATED_N`. A client must not set `WANT_STATUS` unless the server
+advertised bit 14. A server must not send `CREATE_FAILED` for a request which
+did not set it.
 
 `S2C_EXITED` exit status: `WEXITSTATUS` for normal exits (0, 1, …); negative signal number for signal deaths (-9 = SIGKILL); `i32::MIN` when status is unknown.
 

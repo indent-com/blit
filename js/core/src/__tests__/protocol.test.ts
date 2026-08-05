@@ -40,6 +40,7 @@ import {
   AXIS_SOURCE_WHEEL,
   AXIS_FLAG_SOURCE_KNOWN,
   AXIS_FLAG_STOP,
+  CREATE2_WANT_STATUS,
 } from "../types";
 
 const textDecoder = new TextDecoder();
@@ -268,6 +269,23 @@ describe("protocol message builders", () => {
       const msg = buildCreate2Message(0, 24, 80, { command: "  " });
       expect(msg[7]).toBe(0); // no command feature
       expect(msg.length).toBe(10);
+    });
+
+    it("wantStatus sets the flag without a trailing field", () => {
+      const msg = buildCreate2Message(0, 24, 80, { wantStatus: true });
+      expect(msg[7]).toBe(CREATE2_WANT_STATUS);
+      expect(msg.length).toBe(10);
+    });
+
+    it("wantStatus combines with the other feature bits", () => {
+      const msg = buildCreate2Message(0, 24, 80, {
+        command: "vim",
+        cwd: "/tmp",
+        wantStatus: true,
+      });
+      expect(msg[7]).toBe(
+        CREATE2_HAS_CWD | CREATE2_HAS_COMMAND | CREATE2_WANT_STATUS,
+      );
     });
   });
 });
