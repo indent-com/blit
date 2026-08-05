@@ -29,6 +29,15 @@ pub mod net;
 /// cannot force a giant allocation.
 pub const MAX_DECOMPRESSED: usize = 64 * 1024 * 1024;
 
+/// Most cells (`rows * cols`) a single frame may describe.
+///
+/// 500 rows x 1000 cols = 500,000 cells x 12 bytes = 6 MB — generous for any
+/// real terminal, while keeping a frame claiming `rows=65535, cols=65535`
+/// from asking for 48 GiB. Public because it binds at both ends: a receiver
+/// rejects a frame above it, so a server that sizes a grid past it produces
+/// frames no client will render.
+pub const MAX_CELL_COUNT: usize = 500_000;
+
 /// Longest string a `u16` length prefix can describe.
 pub(crate) const MAX_STR: usize = u16::MAX as usize;
 
@@ -1234,12 +1243,6 @@ impl TerminalState {
         changed
     }
 
-    /// Maximum total cell count allowed in a single frame (rows * cols).
-    /// 500 rows x 1000 cols = 500,000 cells x 12 bytes = 6 MB — generous for
-    /// any real terminal while preventing 48 GiB allocations from malicious
-    /// frames claiming rows=65535, cols=65535.
-    const MAX_CELL_COUNT: usize = 500_000;
-
     fn apply_payload(&mut self, payload: &[u8]) -> bool {
         if payload.len() < 12 {
             return false;
@@ -1249,7 +1252,7 @@ impl TerminalState {
         let new_cols = u16::from_le_bytes([payload[2], payload[3]]);
 
         // Reject absurd dimensions that would cause multi-GiB allocations.
-        if (new_rows as usize) * (new_cols as usize) > Self::MAX_CELL_COUNT {
+        if (new_rows as usize) * (new_cols as usize) > MAX_CELL_COUNT {
             return false;
         }
         let new_cursor_row = u16::from_le_bytes([payload[4], payload[5]]);

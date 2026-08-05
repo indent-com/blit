@@ -2017,6 +2017,47 @@ fn is_unset_view_size(rows: u16, cols: u16) -> bool {
     rows == 0 && cols == 0
 }
 
+/// Highest display refresh rate a client may declare, in Hz.
+///
+/// Past any shipping panel, and the pacing maths only ever wants an upper
+/// bound here — a client that lies high makes the server work harder for
+/// itself and raises the compositor's advertised rate for everyone.
+const MAX_DISPLAY_FPS: u16 = 480;
+
+/// Longest `C2S_SEARCH` query accepted, in bytes.
+///
+/// The query is a regex, compiled once per PTY on every search while the
+/// session lock is held, so its cost is multiplied by the terminal count.
+/// The regex engines bound their own compiled size — alacritty sets an NFA
+/// size limit and `regex` defaults to 10 MB — but nothing bounded the input,
+/// and a frame can carry 16 MiB of it.
+const MAX_SEARCH_QUERY: usize = 1024;
+
+/// Largest view dimension a client may ask for, per axis.
+///
+/// An 8K display at a 4px font is ~540 rows and ~3840 columns, so this is
+/// past any real viewport. It exists because `C2S_RESIZE` carries two raw
+/// `u16`s and only rejected zero: a single client asking for 65535x65535
+/// became the mediated size — the minimum across clients, which is its own
+/// when it is the only one — and the terminal grid was allocated at that.
+const MAX_VIEW_DIM: u16 = 4096;
+
+/// Clamp a client-supplied view size to something a frame can describe.
+///
+/// Both bounds matter: the per-axis cap keeps a single absurd dimension out,
+/// and the cell budget is the wire's own limit — a grid past
+/// [`blit_remote::MAX_CELL_COUNT`] produces frames every receiver rejects, so
+/// sizing one is strictly worse than clamping.
+fn clamp_view_size(rows: u16, cols: u16) -> (u16, u16) {
+    let rows = rows.min(MAX_VIEW_DIM);
+    let mut cols = cols.min(MAX_VIEW_DIM);
+    let budget = blit_remote::MAX_CELL_COUNT / (rows as usize).max(1);
+    if (cols as usize) > budget {
+        cols = budget.max(1) as u16;
+    }
+    (rows, cols)
+}
+
 fn subscribe_client_to(client: &mut ClientState, pty_id: u16) {
     if client.subscriptions.insert(pty_id) {
         client.last_sent.remove(&pty_id);
@@ -8622,7 +8663,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         }
 
         if data[0] == C2S_DISPLAY_RATE && data.len() >= 3 {
-            let fps = u16::from_le_bytes([data[1], data[2]]) as f32;
+            // Clamped, not just checked for zero. This is a client-declared
+            // number that drives frame pacing for this connection and, via
+            // the max across clients, the compositor's advertised refresh
+            // rate — so 65535 was reachable straight off the wire.
+            let fps = u16::from_le_bytes([data[1], data[2]]).min(MAX_DISPLAY_FPS) as f32;
             if fps > 0.0 {
                 let mut sess = state.session.lock().await;
                 if let Some(c) = sess.clients.get_mut(&client_id) {
@@ -8717,6 +8762,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         if data[0] == C2S_SEARCH && data.len() >= 3 {
             let request_id = u16::from_le_bytes([data[1], data[2]]);
             let query = std::str::from_utf8(&data[3..]).unwrap_or("").trim();
+            // Refuse rather than truncate: a clipped regex is a different
+            // regex, and answering it as if it were the one asked for is
+            // worse than answering nothing.
+            let query = if query.len() > MAX_SEARCH_QUERY {
+                ""
+            } else {
+                query
+            };
             let mut sess = state.session.lock().await;
             let lead = sess.clients.get(&client_id).and_then(|c| c.lead);
             let mut ranked: Vec<SearchResultRow> = if query.is_empty() {
@@ -8895,7 +8948,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         } else if rows == 0 || cols == 0 {
                             continue;
                         } else {
-                            c.view_sizes.insert(pid, (rows, cols));
+                            c.view_sizes.insert(pid, clamp_view_size(rows, cols));
                             touched.push(pid);
                         }
                     }
@@ -13883,6 +13936,57 @@ mod tests {
         let msg = build_search_results_msg(0, &results);
         let scroll = u32::from_le_bytes([msg[13], msg[14], msg[15], msg[16]]);
         assert_eq!(scroll, u32::MAX);
+    }
+
+    // ── client-supplied view sizes ──
+
+    /// An ordinary viewport passes through untouched — the clamp must not
+    /// quietly reshape real terminals.
+    #[test]
+    fn clamp_view_size_leaves_real_viewports_alone() {
+        for (rows, cols) in [(24, 80), (60, 200), (1, 1), (540, 900)] {
+            assert_eq!(clamp_view_size(rows, cols), (rows, cols), "{rows}x{cols}");
+        }
+    }
+
+    /// `C2S_RESIZE` carries two raw u16s and only rejected zero, so one
+    /// client could name a grid of 4.29 billion cells and — being the
+    /// minimum across clients when it is the only one — have the terminal
+    /// allocated at that size.
+    #[test]
+    fn clamp_view_size_bounds_a_hostile_resize() {
+        let (rows, cols) = clamp_view_size(u16::MAX, u16::MAX);
+        assert!(
+            rows <= MAX_VIEW_DIM && cols <= MAX_VIEW_DIM,
+            "{rows}x{cols}"
+        );
+        assert!(
+            rows as usize * cols as usize <= blit_remote::MAX_CELL_COUNT,
+            "{rows}x{cols} is past what a frame can describe"
+        );
+    }
+
+    /// The cell budget binds before the per-axis cap: 4096x4096 is under both
+    /// dimension limits but 16.7M cells, which no receiver would accept.
+    #[test]
+    fn clamp_view_size_respects_the_frame_cell_budget() {
+        let (rows, cols) = clamp_view_size(MAX_VIEW_DIM, MAX_VIEW_DIM);
+        assert_eq!(rows, MAX_VIEW_DIM);
+        assert!(
+            rows as usize * cols as usize <= blit_remote::MAX_CELL_COUNT,
+            "{rows}x{cols}"
+        );
+        assert!(cols >= 1, "never clamps a dimension to zero");
+    }
+
+    /// A tall, narrow ask keeps its width rather than being squared off.
+    #[test]
+    fn clamp_view_size_never_yields_a_zero_dimension() {
+        for rows in [1u16, 2, 1000, MAX_VIEW_DIM] {
+            let (r, c) = clamp_view_size(rows, u16::MAX);
+            assert!(r >= 1 && c >= 1, "{rows} -> {r}x{c}");
+            assert!(r as usize * c as usize <= blit_remote::MAX_CELL_COUNT);
+        }
     }
 
     // ── allocate_pty_id ──
