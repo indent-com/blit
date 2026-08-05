@@ -50,7 +50,7 @@ results, notifications, and actor mailboxes are libraries over channels.
 
 Blit already exposes terminals, compositor surfaces, filesystem sync, Git,
 LSP, KV, and network relay through one version-stable protocol. Recreating
-those operations as a large WASI-like host API would produce two public
+those operations as a large runtime-specific host API would produce two public
 interfaces and two dispatch implementations. They would inevitably differ
 in validation, cancellation, resource ownership, and new feature coverage.
 
@@ -92,10 +92,10 @@ PTYs.
 
 ## Non-goals
 
-- **No parallel WASI API for blit operations.** Standard WASI facilities may
-  optionally provide the extension's own arguments, stdio, clocks, and randomness.
-  Subprocess spawning uses the blit process family, not a private WASI
-  extension.
+- **No conventional guest operating-system environment.** Version 1 targets
+  `wasm32-unknown-unknown` and exposes only `blit_v1`. It provides no filesystem
+  preopens, sockets, standard streams, or second runtime ABI. Arguments arrive
+  in `INIT`; output, channels, and subprocesses are packet operations.
 - **No Component Model requirement.** The first Rust SDK targets a small core
   Wasm ABI. A future component adapter may wrap the same packet endpoint.
 - **No live-instance checkpointing.** Persistent extensions start a fresh
@@ -480,27 +480,6 @@ require no extra host calls. The clock wrappers return a typed wall-clock time
 and an opaque monotonic instant whose subtraction yields a duration; neither
 requires a dispatcher round trip.
 
-### Optional WASI
-
-WASI is useful for conventional guest self-environment: arguments, the guest's
-stdin/stdout/stderr, clocks, and randomness. It is not another API for blit
-operations. The initial `wasm32-unknown-unknown` SDK needs no WASI imports. For
-a later `wasm32-wasip1` target, the server embedding may add
-[`wasmi_wasi`](https://docs.rs/wasmi_wasi/latest/wasmi_wasi/); its WASI clock
-and `random_get` implementations use the same underlying host clock and CSPRNG
-helpers as `blit_v1.clock` and `blit_v1.random`. Version 1 defines no WASI
-filesystem preopens or sockets. If the adapter exposes WASI arguments, it uses
-the same `INIT` vector without inventing a server-side path; the SDK context is
-the canonical source on both targets.
-
-Standard WASI does not define arbitrary child-process spawning. Its CLI
-proposal covers environment variables, arguments, stdio, and the current
-process's exit, not `spawn` or `exec`; see the
-[WASI proposal list](https://wasi.dev/releases). A private `proc_spawn`
-import would be possible, but would duplicate blit's lifecycle and streaming
-protocol. Extensions therefore launch child processes through `PROCESS_*`
-packets, just like any other client.
-
 ### Rust SDK
 
 `blit-guest` wraps the four imports and re-exports the protocol codec surface:
@@ -520,11 +499,11 @@ fn main(mut blit: blit::Client) -> Result<(), Error> {
 For `wasm32-unknown-unknown`, the SDK selects and supplies the supported
 `getrandom` custom-backend symbol using `blit_v1.random`; it pins and documents
 compatible `getrandom` major versions so dependencies such as `rand` and
-`uuid` need neither JavaScript nor WASI. Rust's standard `HashMap` and `HashSet`
-remain non-randomized on this target; installing a `getrandom` backend does not
-change their internal hasher. The SDK therefore also provides explicitly
-entropy-keyed `blit::collections::HashMap` and `HashSet` aliases for maps whose
-keys may be attacker-controlled.
+`uuid` need no JavaScript shim or secondary runtime adapter. Rust's standard
+`HashMap` and `HashSet` remain non-randomized on this target; installing a
+`getrandom` backend does not change their internal hasher. The SDK therefore
+also provides explicitly entropy-keyed `blit::collections::HashMap` and
+`HashSet` aliases for maps whose keys may be attacker-controlled.
 
 Higher-level typed wrappers are libraries over packets. They are not host
 bindings and can evolve independently:
@@ -1666,7 +1645,7 @@ gateway-global allocation or rewriting.
 
 ## Rejected alternatives
 
-### Per-feature Wasm/WASI bindings
+### Per-feature Wasm host bindings
 
 Bindings for terminals, FS, Git, LSP, KV, network relay, and every
 future family duplicate the wire protocol and make Wasm support lag normal
@@ -1674,15 +1653,12 @@ clients. They also encourage runtime-specific validation and cleanup.
 Packets give exact parity through the two packet imports; the only additional
 version-1 imports are direct clock and entropy reads.
 
-### WASI or WASIX subprocess spawning
+### Runtime-specific subprocess host imports
 
-Standard WASI currently describes the guest's CLI environment and exit, not
-portable child-process creation. Adopting a runtime-specific `proc_spawn`
-extension would couple extensions to that runtime, expose process execution only
-to Wasm guests, and still require blit-specific lifecycle glue.
-The process packet family provides the same streaming operation to all clients
-without adding another Wasm import. Optional WASI remains useful for the
-extension's own constrained environment.
+Adding a runtime-specific `proc_spawn` or `exec` import would couple extensions
+to that runtime, expose process execution only to Wasm guests, and still require
+blit-specific lifecycle glue. The process packet family provides the same
+streaming operation to all clients without adding another Wasm import.
 
 ### Loopback or in-memory fake socket
 
