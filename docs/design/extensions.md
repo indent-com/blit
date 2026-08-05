@@ -2052,12 +2052,12 @@ multiplex them or deliberately serialize work.
 ## Deferred process execution
 
 Pipe-oriented non-PTY child processes are a useful client facility, but they
-are independent of Wasmi extensions and native channels. They belong in a
-separate RFC. This proposal adds no subprocess host imports and does not
-reserve a process packet family. An extension can use existing
-`CREATE2(HAS_COMMAND)` PTYs when terminal semantics are appropriate; if the
-separate process family is implemented and advertised later, packet parity will
-make it available without changing the guest ABI.
+are independent of Wasmi extensions and native channels. They are specified by
+the [native process RFC](processes.md). This proposal adds no subprocess host
+imports and does not reserve a process packet family. An extension can use
+existing `CREATE2(HAS_COMMAND)` PTYs when terminal semantics are appropriate;
+if the separate process family is implemented and advertised later, packet
+parity will make it available without changing the guest ABI.
 
 ## Server capacity and failure isolation
 
@@ -2558,8 +2558,8 @@ reads.
 
 Adding a runtime-specific `proc_spawn` or `exec` import would couple extensions
 to that runtime, expose process execution only to Wasm guests, and still require
-blit-specific lifecycle glue. A separate client-protocol RFC can provide the
-same operation to all clients without adding another Wasm import.
+blit-specific lifecycle glue. The [native process RFC](processes.md) provides
+the same operation to all clients without adding another Wasm import.
 
 ### Kernel loopback socket
 
