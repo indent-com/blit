@@ -8,6 +8,41 @@ import { measureCell, cssFontFamily, type CellMetrics } from "./measure";
 import type { GlRenderer } from "./gl-renderer";
 import { keyToBytes, ctrlCharToByte, encoder } from "./keyboard";
 import { MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE } from "./protocol";
+import { assessUrl, openUrlSafely, type UrlAssessment } from "./urlSecurity";
+
+/** One screen row's slice of a hyperlink's extent, inclusive of both columns. */
+interface LinkSegment {
+  row: number;
+  startCol: number;
+  endCol: number;
+}
+
+/** A hyperlink under the pointer, from OSC 8 or from regex detection. */
+interface UrlHit {
+  url: string;
+  /**
+   * Every row the link covers. A link that runs past the right edge continues
+   * on the next row, so this has more than one entry for a wrapped link and
+   * the highlight is drawn across all of them.
+   */
+  segments: LinkSegment[];
+  /** True when the application declared this link via OSC 8. */
+  explicit: boolean;
+}
+
+/** What the pointer is currently over, handed to `onLinkHover` listeners. */
+export interface LinkHover {
+  assessment: UrlAssessment;
+  /**
+   * True for an OSC 8 link, where the application chose the target
+   * independently of the text on screen. A regex-detected link is its own
+   * text, so there is nothing for it to misrepresent; an explicit one is the
+   * case where showing the user the real target actually matters.
+   */
+  explicit: boolean;
+  /** The on-screen text of the link, for comparison against the target. */
+  text: string;
+}
 
 // The ^V control byte.  Sent for a plain Ctrl+V (quoted-insert in shells, and
 // the paste-trigger TUIs like Claude Code use to read the clipboard).
@@ -251,11 +286,12 @@ export class BlitTerminalSurface {
   private selEnd: SelPos | null = null;
   private _selectionListeners = new Set<(hasSelection: boolean) => void>();
   private hoveredUrl: {
-    row: number;
-    startCol: number;
-    endCol: number;
+    segments: LinkSegment[];
     url: string;
+    assessment: UrlAssessment;
   } | null = null;
+  private _linkHoverListeners = new Set<(h: LinkHover | null) => void>();
+  private _linkActivate: ((a: UrlAssessment) => void) | null = null;
 
   private predicted = "";
   private predictedFromRow = 0;
@@ -455,6 +491,44 @@ export class BlitTerminalSurface {
   onSelectionChange(listener: (hasSelection: boolean) => void): () => void {
     this._selectionListeners.add(listener);
     return () => this._selectionListeners.delete(listener);
+  }
+
+  /**
+   * Subscribe to hyperlink hover. The listener receives a classified
+   * assessment, or null when the pointer leaves a link.
+   *
+   * Render `assessment.display` — never `assessment.raw`. The raw target can
+   * contain codepoints that reorder or conceal the text around them, which is
+   * precisely what a preview exists to defeat.
+   */
+  onLinkHover(listener: (h: LinkHover | null) => void): () => void {
+    this._linkHoverListeners.add(listener);
+    return () => this._linkHoverListeners.delete(listener);
+  }
+
+  /**
+   * Replace the built-in link activation policy with a custom one, typically
+   * to swap the blocking `window.confirm` for an in-app dialog.
+   *
+   * The handler receives an already-classified assessment and is responsible
+   * for honouring its verdict: a `deny` must not be opened, and a `confirm`
+   * must not be opened without asking. Pass null to restore the default.
+   */
+  setLinkActivateHandler(handler: ((a: UrlAssessment) => void) | null): void {
+    this._linkActivate = handler;
+  }
+
+  private emitLinkHover(h: LinkHover | null): void {
+    for (const l of this._linkHoverListeners) l(h);
+  }
+
+  private activateLink(hit: UrlHit): void {
+    const assessment = assessUrl(hit.url);
+    if (this._linkActivate) {
+      this._linkActivate(assessment);
+      return;
+    }
+    openUrlSafely(hit.url);
   }
 
   /** Clear any active selection. */
@@ -1644,14 +1718,28 @@ export class BlitTerminalSurface {
   ): void {
     const hurl = this.hoveredUrl;
     if (!hurl) return;
+    const verdict = hurl.assessment.verdict;
     const [fgR, fgG, fgB] = this._palette?.fg ?? [204, 204, 204];
-    ctx.strokeStyle = `rgba(${fgR},${fgG},${fgB},0.6)`;
     ctx.lineWidth = Math.max(1, Math.round(cell.ph * 0.06));
-    const y = hurl.row * cell.ph + cell.ph - ctx.lineWidth;
+    // A blocked link is dashed and red rather than underlined, so a target
+    // Blit will refuse never looks like one it is offering to open.
+    if (verdict === "deny") {
+      ctx.strokeStyle = "rgba(220,80,80,0.8)";
+      ctx.setLineDash([cell.pw * 0.3, cell.pw * 0.3]);
+    } else {
+      ctx.strokeStyle = `rgba(${fgR},${fgG},${fgB},0.6)`;
+      ctx.setLineDash([]);
+    }
     ctx.beginPath();
-    ctx.moveTo(hurl.startCol * cell.pw, y);
-    ctx.lineTo((hurl.endCol + 1) * cell.pw, y);
+    // One underline per row the link occupies — a wrapped link is one link,
+    // and highlighting only the hovered row would misreport its extent.
+    for (const seg of hurl.segments) {
+      const y = seg.row * cell.ph + cell.ph - ctx.lineWidth;
+      ctx.moveTo(seg.startCol * cell.pw, y);
+      ctx.lineTo((seg.endCol + 1) * cell.pw, y);
+    }
     ctx.stroke();
+    ctx.setLineDash([]);
   }
 
   private drawOverflowText(
@@ -2626,7 +2714,29 @@ export class BlitTerminalSurface {
       void this.copySelection();
     };
 
-    const urlAt = (row: number, col: number) => {
+    const urlAt = (row: number, col: number): UrlHit | null => {
+      // An explicit OSC 8 hyperlink wins over regex detection: the application
+      // said where the text points, and the visible text may be nothing like
+      // the target. `has_links()` keeps the common link-free frame on the
+      // cheap path — no per-cell probing across the WASM boundary.
+      const t = this.terminal;
+      if (t?.has_links()) {
+        const url = t.link_at(row, col);
+        if (url !== undefined && url !== null) {
+          // Flat [row, startCol, endCol] triples, one per row the link spans.
+          const flat = t.link_segments(row, col);
+          const segments: LinkSegment[] = [];
+          for (let i = 0; i + 2 < flat.length; i += 3) {
+            segments.push({
+              row: flat[i],
+              startCol: flat[i + 1],
+              endCol: flat[i + 2],
+            });
+          }
+          return { url, segments, explicit: true };
+        }
+      }
+
       const text = getRowText(row);
       const colMap = getRowColMap(row);
       URL_RE.lastIndex = 0;
@@ -2637,7 +2747,11 @@ export class BlitTerminalSurface {
         const endIdx = m.index + raw.length - 1;
         const endCol = colMap ? (colMap[endIdx] ?? endIdx) : endIdx;
         if (col >= startCol && col <= endCol)
-          return { url: raw, startCol, endCol };
+          return {
+            url: raw,
+            segments: [{ row, startCol, endCol }],
+            explicit: false,
+          };
       }
       return null;
     };
@@ -2798,7 +2912,7 @@ export class BlitTerminalSurface {
         const hit = urlAt(cell.row, cell.col);
         if (hit) {
           e.preventDefault();
-          window.open(hit.url, "_blank", "noopener");
+          this.activateLink(hit);
           return;
         }
       }
@@ -2828,20 +2942,75 @@ export class BlitTerminalSurface {
       const url = hit?.url ?? null;
       if (url !== lastHoverUrl) {
         lastHoverUrl = url;
-        this.setCursor(target, hit ? "pointer" : "text");
-        this.hoveredUrl = hit
-          ? {
-              row: cell.row,
-              startCol: hit.startCol,
-              endCol: hit.endCol,
-              url: hit.url,
-            }
-          : null;
+        // A link we would refuse to open must not present itself as clickable.
+        const assessment = hit ? assessUrl(hit.url) : null;
+        this.setCursor(
+          target,
+          assessment && assessment.verdict !== "deny" ? "pointer" : "text",
+        );
+        this.hoveredUrl =
+          hit && assessment
+            ? { segments: hit.segments, url: hit.url, assessment }
+            : null;
+        this.emitLinkHover(
+          hit && assessment
+            ? {
+                assessment,
+                explicit: hit.explicit,
+                // Joined across wrapped rows so the text matches what the user
+                // reads, not just the row the pointer happens to be on.
+                text: hit.segments
+                  .map((s) => getRowText(s.row).slice(s.startCol, s.endCol + 1))
+                  .join(""),
+              }
+            : null,
+        );
         this.scheduleRender();
       }
     };
 
+    /**
+     * Forget the hovered link.
+     *
+     * `handleHoverMove` only fires while the pointer is over the surface, so
+     * every way of stopping being over a link *without* crossing another cell
+     * first — leaving the element, the window losing focus, the pane being
+     * torn down — has to say so explicitly. Otherwise the status-bar preview
+     * outlives the thing it describes and sits on top of the focused pane's
+     * identity indefinitely.
+     *
+     * `lastHoverUrl` is reset too, or re-entering the same link would compare
+     * equal and never re-emit. That in turn is why the cursor is reset here:
+     * coming back onto a *non*-link cell computes `null !== null`, takes the
+     * unchanged path, and would otherwise keep the pointer cursor.
+     *
+     * `redraw` is false during teardown, where there is no surface left to
+     * draw into — `dispose()` detaches before it sets `disposed`, so
+     * `scheduleRender` would still queue a frame.
+     */
+    const clearHover = (redraw: boolean) => {
+      lastHoverUrl = null;
+      if (!this.hoveredUrl) return;
+      this.hoveredUrl = null;
+      this.emitLinkHover(null);
+      if (redraw) {
+        this.setCursor(target, "text");
+        this.scheduleRender();
+      }
+    };
+
+    /**
+     * Also bound to `scroll`: content moving under a stationary pointer fires
+     * no `mousemove`, so the preview would keep naming a link that has since
+     * scrolled elsewhere. A click re-runs the hit test and so stays correct,
+     * but a preview that disagrees with what the click would open is exactly
+     * the confusion the preview exists to prevent. Dropping it is the honest
+     * answer — the next pointer move re-establishes it.
+     */
+    const handleHoverInvalidated = () => clearHover(true);
+
     const handleBlur = () => {
+      clearHover(true);
       if (mouseDownButton >= 0) {
         if (this._sessionId !== null && this.status === "connected") {
           this._workspace?.sendMouse(
@@ -3070,6 +3239,10 @@ export class BlitTerminalSurface {
     target.addEventListener("mousedown", handleMouseDown);
     window.addEventListener("mousemove", handleMouseMove);
     target.addEventListener("mousemove", handleHoverMove);
+    target.addEventListener("mouseleave", handleHoverInvalidated);
+    target.addEventListener("scroll", handleHoverInvalidated, {
+      passive: true,
+    });
     window.addEventListener("mouseup", handleMouseUp);
     window.addEventListener("blur", handleBlur);
     target.addEventListener("wheel", handleCanvasWheel, { passive: false });
@@ -3084,11 +3257,16 @@ export class BlitTerminalSurface {
       target.removeEventListener("mousedown", handleMouseDown);
       window.removeEventListener("mousemove", handleMouseMove);
       target.removeEventListener("mousemove", handleHoverMove);
+      target.removeEventListener("mouseleave", handleHoverInvalidated);
+      target.removeEventListener("scroll", handleHoverInvalidated);
       window.removeEventListener("mouseup", handleMouseUp);
       window.removeEventListener("blur", handleBlur);
       target.removeEventListener("wheel", handleCanvasWheel);
       target.removeEventListener("contextmenu", handleContextMenu);
       target.removeEventListener("click", handleClick);
+      // After the listeners, so nothing can re-establish it, but while the
+      // hover listeners are still subscribed so the host clears its preview.
+      clearHover(false);
       if (this.scrollFadeTimer) clearTimeout(this.scrollFadeTimer);
       stopAutoScroll();
     };

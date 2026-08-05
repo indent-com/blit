@@ -9,6 +9,7 @@ import type {
   ConnectionStatus,
   TerminalPalette,
   SurfaceFrameSample,
+  LinkHover,
 } from "@blit-sh/core";
 import { formatBw } from "./createMetrics";
 import type { Metrics, RenderSample, NetSample } from "./createMetrics";
@@ -80,6 +81,9 @@ export function StatusBar(props: {
    *  answer). */
   focusedCwd?: string | null;
   focusedSurface: BlitSurface | null;
+  /** Hyperlink under the pointer in the focused terminal, if any. Shown in
+   *  place of the identity for as long as the pointer rests on it. */
+  hoveredLink?: LinkHover | null;
   connectionLabels?: Map<string, string>;
   connections: readonly BlitConnectionSnapshot[];
   gatewayStatus: "connecting" | "connected" | "unavailable";
@@ -192,117 +196,131 @@ export function StatusBar(props: {
           "white-space": "nowrap",
         }}
       >
+        {/* A hovered link takes over the elastic middle region, the same way a
+            browser's status bubble pre-empts the page it sits on. It is
+            transient, so nothing underneath needs to be preserved. */}
         <Show
-          when={props.webPane}
+          when={props.hoveredLink}
           fallback={
             <Show
-              when={activeEditor()}
-              keyed
+              when={props.webPane}
               fallback={
                 <Show
-                  when={props.focusedSession}
+                  when={activeEditor()}
+                  keyed
                   fallback={
-                    <Show when={props.focusedSurface}>
-                      {(surface) => {
+                    <Show
+                      when={props.focusedSession}
+                      fallback={
+                        <Show when={props.focusedSurface}>
+                          {(surface) => {
+                            const label = () =>
+                              props.connectionLabels?.get(
+                                surface().connectionId,
+                              ) ?? null;
+                            const prefix = () =>
+                              surfacePrefix(surface(), label());
+                            return (
+                              <>
+                                <span style={{ opacity: 0.5 }}>{prefix()}</span>
+                                {" \u203A "}
+                                {surfaceName(surface())}
+                              </>
+                            );
+                          }}
+                        </Show>
+                      }
+                    >
+                      {(session) => {
                         const label = () =>
-                          props.connectionLabels?.get(surface().connectionId) ??
+                          props.connectionLabels?.get(session().connectionId) ??
                           null;
-                        const prefix = () => surfacePrefix(surface(), label());
+                        const prefix = () => sessionPrefix(session(), label());
                         return (
                           <>
                             <span style={{ opacity: 0.5 }}>{prefix()}</span>
                             {" \u203A "}
-                            {surfaceName(surface())}
+                            <span style={{ "flex-shrink": 0 }}>
+                              {sessionName(session())}
+                            </span>
+                            {/* The cwd is the first thing to give up when the bar
+                        runs out of room, and it truncates from the left:
+                        the tail of a path identifies it, the leading
+                        /Users/... does not. */}
+                            <Show when={props.focusedCwd}>
+                              {(cwd) => (
+                                <span
+                                  title={cwd()}
+                                  style={{
+                                    "min-width": 0,
+                                    overflow: "hidden",
+                                    "white-space": "nowrap",
+                                    direction: "rtl",
+                                    "text-overflow": "ellipsis",
+                                    opacity: 0.5,
+                                  }}
+                                >
+                                  {/* Isolated so the RTL truncation above cannot
+                              reorder the path's own punctuation. */}
+                                  <bdi>{cwd()}</bdi>
+                                </span>
+                              )}
+                            </Show>
                           </>
                         );
                       }}
                     </Show>
                   }
                 >
-                  {(session) => {
+                  {(ed) => {
                     const label = () =>
-                      props.connectionLabels?.get(session().connectionId) ??
-                      null;
-                    const prefix = () => sessionPrefix(session(), label());
-                    return (
-                      <>
-                        <span style={{ opacity: 0.5 }}>{prefix()}</span>
-                        {" \u203A "}
-                        <span style={{ "flex-shrink": 0 }}>
-                          {sessionName(session())}
-                        </span>
-                        {/* The cwd is the first thing to give up when the bar
-                        runs out of room, and it truncates from the left:
-                        the tail of a path identifies it, the leading
-                        /Users/... does not. */}
-                        <Show when={props.focusedCwd}>
-                          {(cwd) => (
-                            <span
-                              title={cwd()}
-                              style={{
-                                "min-width": 0,
-                                overflow: "hidden",
-                                "white-space": "nowrap",
-                                direction: "rtl",
-                                "text-overflow": "ellipsis",
-                                opacity: 0.5,
-                              }}
-                            >
-                              {/* Isolated so the RTL truncation above cannot
-                              reorder the path's own punctuation. */}
-                              <bdi>{cwd()}</bdi>
-                            </span>
-                          )}
-                        </Show>
-                      </>
+                      props.connectionLabels?.get(ed.connectionId) ?? null;
+                    return ed.kind === "diff" ? (
+                      <DiffIdentity
+                        d={ed}
+                        label={label()}
+                        theme={theme()}
+                        scale={scale()}
+                        fontFamily={props.fontFamily}
+                        fontSize={props.fontSize}
+                      />
+                    ) : ed.kind === "commit" ? (
+                      <CommitIdentity c={ed} label={label()} theme={theme()} />
+                    ) : ed.kind === "preview" ? (
+                      <PreviewIdentity
+                        p={ed}
+                        label={label()}
+                        theme={theme()}
+                        fontFamily={props.fontFamily}
+                        fontSize={props.fontSize}
+                      />
+                    ) : (
+                      <EditorIdentity
+                        ed={ed}
+                        label={label()}
+                        theme={theme()}
+                        scale={scale()}
+                        fontFamily={props.fontFamily}
+                        fontSize={props.fontSize}
+                      />
                     );
                   }}
                 </Show>
               }
             >
-              {(ed) => {
-                const label = () =>
-                  props.connectionLabels?.get(ed.connectionId) ?? null;
-                return ed.kind === "diff" ? (
-                  <DiffIdentity
-                    d={ed}
-                    label={label()}
-                    theme={theme()}
-                    scale={scale()}
-                    fontFamily={props.fontFamily}
-                    fontSize={props.fontSize}
-                  />
-                ) : ed.kind === "commit" ? (
-                  <CommitIdentity c={ed} label={label()} theme={theme()} />
-                ) : ed.kind === "preview" ? (
-                  <PreviewIdentity
-                    p={ed}
-                    label={label()}
-                    theme={theme()}
-                    fontFamily={props.fontFamily}
-                    fontSize={props.fontSize}
-                  />
-                ) : (
-                  <EditorIdentity
-                    ed={ed}
-                    label={label()}
-                    theme={theme()}
-                    scale={scale()}
-                    fontFamily={props.fontFamily}
-                    fontSize={props.fontSize}
-                  />
-                );
-              }}
+              {(web) => (
+                <WebPaneNav
+                  handle={web().handle}
+                  url={web().url}
+                  onRetarget={web().retarget}
+                  fontSize={props.fontSize}
+                />
+              )}
             </Show>
           }
         >
-          {(web) => (
-            <WebPaneNav
-              handle={web().handle}
-              url={web().url}
-              onRetarget={web().retarget}
-              fontSize={props.fontSize}
-            />
+          {(hover) => (
+            <LinkPreview hover={hover()} theme={theme()} scale={scale()} />
           )}
         </Show>
       </span>
@@ -497,6 +515,66 @@ export function StatusBar(props: {
 
 /** Focused diff's identity: filename + the view switcher (or a plain
  *  comparison label when the tile cannot switch views). */
+/**
+ * Where a hovered hyperlink actually goes.
+ *
+ * Renders `assessment.display`, never `assessment.raw` — the display form has
+ * had invisible and text-reordering codepoints escaped to `<U+XXXX>`, and this
+ * preview exists precisely to defeat a target that misrepresents itself.
+ *
+ * Two rules make the rendering itself trustworthy:
+ *
+ * - `direction: ltr` + `unicode-bidi: bidi-override` pins visual order to byte
+ *   order. Escaping removes bidi *controls*, but RTL letters in a path would
+ *   still be reordered by the bidi algorithm; overriding it means the host you
+ *   read is the host you would visit.
+ * - Overflow is truncated from the right, keeping the scheme and host — the
+ *   parts that decide whether following the link is safe — always visible.
+ */
+function LinkPreview(props: {
+  hover: LinkHover;
+  theme: Theme;
+  scale: UIScale;
+}) {
+  const verdict = () => props.hover.assessment.verdict;
+  const color = () =>
+    verdict() === "deny"
+      ? props.theme.errorText
+      : verdict() === "confirm"
+        ? props.theme.warning
+        : props.theme.dimFg;
+
+  return (
+    <>
+      <span
+        style={{
+          color: color(),
+          "font-size": `${props.scale.sm}px`,
+          "flex-shrink": 0,
+        }}
+      >
+        {verdict() === "deny" ? "✕" : "↗"}
+      </span>
+      <span
+        title={props.hover.assessment.display}
+        style={{
+          color: color(),
+          "font-size": `${props.scale.sm}px`,
+          "font-family": "monospace",
+          "min-width": 0,
+          overflow: "hidden",
+          "text-overflow": "ellipsis",
+          "white-space": "nowrap",
+          direction: "ltr",
+          "unicode-bidi": "bidi-override",
+        }}
+      >
+        {props.hover.assessment.display}
+      </span>
+    </>
+  );
+}
+
 function DiffIdentity(props: {
   d: DiffController;
   label: string | null;

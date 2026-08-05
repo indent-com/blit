@@ -12,7 +12,7 @@ import type { WebPaneHostRegistrar } from "../WebPaneHost";
  */
 
 import { createContext, useContext } from "solid-js";
-import type { TerminalPalette } from "@blit-sh/core";
+import type { BlitTerminalSurface, TerminalPalette } from "@blit-sh/core";
 import type { BSPSplit } from "@blit-sh/core/bsp";
 
 /** Props that stay constant through the BSPPane recursion tree.  Hoisted
@@ -45,6 +45,11 @@ export interface BSPTreeCtx {
   fontSize: number;
   tabMemory: Record<string, number>;
   onRender?: (renderMs?: number) => void;
+  /** Called with each terminal pane's surface as it mounts (and null as it
+   *  unmounts), so the workspace can attach hyperlink hover and activation to
+   *  every split rather than only the focused one — hovering follows the
+   *  pointer, not focus. */
+  onTerminalSurface?: (surface: BlitTerminalSurface | null) => void;
   /** Whether a session's connection is read-only (an `.ro` share): its
    *  terminals render without input affordances instead of silently
    *  swallowing keystrokes the server will refuse. */
