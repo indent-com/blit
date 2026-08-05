@@ -55,14 +55,30 @@ pub enum Event {
     },
 }
 
+/// How long a teardown gives a stream to finish on its own before leaving the
+/// rest to the socket options. Long enough for a task that can run to run.
+const TEAR_DOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 struct Socket {
     events: mpsc::UnboundedSender<Event>,
+    /// Never sent on: dropping it is the signal, so it fires on any path that
+    /// forgets this entry, teardown included.
+    #[allow(dead_code)]
+    cut: oneshot::Sender<()>,
     finished: oneshot::Receiver<()>,
 }
 
-/// Held by the task that owns a stream for as long as that task runs, so a
-/// teardown can wait for the cleanup each stream owes its local socket.
-pub struct Live(#[allow(dead_code)] oneshot::Sender<()>);
+/// The task side of a registered stream, held for as long as that task runs.
+///
+/// `cut` fires when the connection ends the stream, and is what a task parked
+/// in a write to a local peer that has stopped reading selects on — dropping
+/// the event sender does not cancel a write. Dropping the whole thing is how a
+/// teardown learns the task is done.
+pub struct Live {
+    cut: oneshot::Receiver<()>,
+    #[allow(dead_code)]
+    finished: oneshot::Sender<()>,
+}
 
 /// Client-allocated stream ids plus the demultiplexing table (docs/design/net.md § Stream ids are client-allocated).
 pub struct Conn {
@@ -87,9 +103,20 @@ impl Conn {
             let id = *next;
             *next = next.wrapping_add(1);
             if let std::collections::hash_map::Entry::Vacant(slot) = sockets.entry(id) {
-                let (live, finished) = oneshot::channel();
-                slot.insert(Socket { events, finished });
-                return Some((id, Live(live)));
+                let (finished, done) = oneshot::channel();
+                let (cut, cut_rx) = oneshot::channel();
+                slot.insert(Socket {
+                    events,
+                    cut,
+                    finished: done,
+                });
+                return Some((
+                    id,
+                    Live {
+                        cut: cut_rx,
+                        finished,
+                    },
+                ));
             }
         }
         None
@@ -116,9 +143,16 @@ impl Conn {
         // Every sender has to go before the first wait, or one slow stream holds
         // back the notification the others are still waiting for.
         let finished: Vec<_> = sockets.into_values().map(|sock| sock.finished).collect();
-        for wait in finished {
-            let _ = wait.await;
-        }
+        // Bounded, because dropping a sender does not cancel a write: a stream
+        // whose local peer stopped reading is parked in one, and shutdown must
+        // not wait on a peer that may never read again. Those sockets still get
+        // their reset from the zero linger, which the exit cannot undo.
+        let _ = tokio::time::timeout(TEAR_DOWN_GRACE, async move {
+            for wait in finished {
+                let _ = wait.await;
+            }
+        })
+        .await;
     }
 }
 
@@ -294,7 +328,7 @@ pub async fn relay(
     on_open: OnOpen,
 ) -> Result<(), String> {
     let (events_tx, mut events) = mpsc::unbounded_channel::<Event>();
-    let Some((id, _live)) = conn.open(events_tx).await else {
+    let Some((id, mut live)) = conn.open(events_tx).await else {
         // The cap is the connection's, not the socket's, so this is worth naming
         // rather than reporting as a connect failure against the target.
         if let OnOpen::Answer(reply) = &on_open {
@@ -412,7 +446,17 @@ pub async fn relay(
                 opened = true;
             }
             Event::Data(data) => {
-                if local_write.write_all(&data).await.is_err() {
+                let wrote = tokio::select! {
+                    written = local_write.write_all(&data) => written.is_ok(),
+                    // The connection ended while this write was parked, which it
+                    // is whenever the local peer has stopped reading. Nothing is
+                    // going to drain it, and the stream is cut either way.
+                    _ = &mut live.cut => {
+                        truncated = true;
+                        false
+                    }
+                };
+                if !wrote {
                     break Ok(());
                 }
                 received += data.len() as u64;
@@ -574,6 +618,15 @@ mod tests {
             reader.await;
         }
 
+        /// Let the relay task run until it has nothing left to do, which for a
+        /// stalled peer means parked inside its write.
+        async fn settle(&mut self) {
+            while tokio::time::timeout(std::time::Duration::from_millis(50), self.out.recv())
+                .await
+                .is_ok()
+            {}
+        }
+
         /// Bytes the pump sends until it goes quiet, which is the only way to ask
         /// "has it stopped at the window" of a pump that never errors.
         async fn drain(&mut self) -> u64 {
@@ -712,6 +765,27 @@ mod tests {
 
         let (_, end) = pump.local_end().await;
         let err = end.expect_err("a lost connection ended the local socket cleanly");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "{err}");
+    }
+
+    /// A local peer that has stopped reading parks the relay inside a write,
+    /// which dropping its event sender does not cancel. The teardown must still
+    /// end, and that stream must still be reset rather than left to the FIN a
+    /// process exit would send.
+    #[tokio::test]
+    async fn a_stalled_local_peer_does_not_hold_up_the_teardown() {
+        let mut pump = Pump::start(Unreported::Ceiling).await;
+        pump.accepted(Some(NET_WINDOW_BYTES));
+        // More than any socket buffer will take from a client that never reads.
+        pump.send(Event::Data(vec![b'd'; 8 * 1024 * 1024]));
+        pump.settle().await;
+
+        tokio::time::timeout(TEAR_DOWN_GRACE / 2, pump.connection_lost())
+            .await
+            .expect("teardown waited on a peer that had stopped reading");
+
+        let (_, end) = pump.local_end().await;
+        let err = end.expect_err("a stalled peer's stream ended cleanly");
         assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "{err}");
     }
 
