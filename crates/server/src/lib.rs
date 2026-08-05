@@ -3,21 +3,23 @@ use blit_compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
 use blit_remote::{
     C2S_ACK, C2S_CLIENT_FEATURES, C2S_CLIENT_METRICS, C2S_CLIPBOARD_GET, C2S_CLIPBOARD_LIST,
     C2S_CLIPBOARD_SET, C2S_CLOSE, C2S_COPY_RANGE, C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N,
-    C2S_CREATE2, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_KILL, C2S_MOUSE, C2S_PING, C2S_QUIT,
-    C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE, C2S_SURFACE_ACK,
-    C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT, C2S_SURFACE_LIST,
-    C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2, C2S_SURFACE_RESIZE,
-    C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD,
-    C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_CWD,
-    CREATE2_HAS_SRC_PTY, C2S_DEADLINE, CREATE2_HAS_DEADLINE, CREATE2_WANT_STATUS, FEATURE_COMPOSITOR, FEATURE_COPY_RANGE,
-    FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState,
-    KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT,
-    S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE,
-    STATUS_BUDGET, STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264,
-    SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN, build_update_msg, msg_hello,
-    msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_used_rows, msg_surface_app_id,
-    msg_surface_created, msg_surface_destroyed, msg_surface_encoder, msg_surface_frame,
-    msg_surface_resized, msg_surface_title, msg_term_cwd_reply, parse_surface_pointer_axis2,
+    C2S_CREATE2, C2S_DEADLINE, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_KILL, C2S_MOUSE,
+    C2S_PING, C2S_QUIT, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE,
+    C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT,
+    C2S_SURFACE_LIST, C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2,
+    C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE,
+    C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND,
+    CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE, CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS,
+    FEATURE_COMPOSITOR, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS,
+    FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState,
+    KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST,
+    S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST,
+    S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE,
+    SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN,
+    build_update_msg, msg_hello, msg_s2c_clipboard_content, msg_s2c_clipboard_list,
+    msg_s2c_used_rows, msg_surface_app_id, msg_surface_created, msg_surface_destroyed,
+    msg_surface_encoder, msg_surface_frame, msg_surface_resized, msg_surface_title,
+    msg_term_cwd_reply, parse_surface_pointer_axis2,
 };
 #[cfg(target_os = "linux")]
 use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO};
@@ -51,6 +53,46 @@ pub use surface_encoder::SurfaceH264EncoderPreference;
 pub use surface_encoder::{SurfaceBandwidth, SurfaceEncoding, SurfaceSpeed};
 
 type PtyFds = Arc<std::sync::RwLock<HashMap<u16, PtyWriteTarget>>>;
+
+/// How many exited-but-retained terminals to keep, oldest evicted first.
+/// `BLIT_MAX_EXITED` overrides; 0 disables the bound.
+///
+/// A terminal's output stays readable after its command exits, and consumers
+/// legitimately read it back long afterwards, so this is generous — it exists
+/// to stop an orchestrator that never sends `C2S_CLOSE` from growing the map
+/// without limit, not to reclaim memory promptly.
+pub const DEFAULT_MAX_EXITED: usize = 1024;
+
+/// Evict exited terminals this long after they exit.  `BLIT_EXITED_LINGER`
+/// overrides, in seconds.
+///
+/// Off by default, deliberately: a time bound throws away output someone may
+/// still want, and "how long is a result interesting" is a policy question
+/// the server has no way to answer. The count bound alone keeps the map
+/// bounded without ever discarding anything an active consumer is likely to
+/// come back for.
+pub const DEFAULT_EXITED_LINGER: Duration = Duration::ZERO;
+
+fn max_exited() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("BLIT_MAX_EXITED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MAX_EXITED)
+    })
+}
+
+fn exited_linger() -> Duration {
+    static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("BLIT_EXITED_LINGER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_EXITED_LINGER)
+    })
+}
 
 pub struct Config {
     pub shell: String,
@@ -400,6 +442,8 @@ struct Pty {
     exit_reason: u8,
     /// The subprocess has exited but the terminal state is retained for reading.
     exited: bool,
+    /// When it exited, for the retention bound.  `None` while live.
+    exited_at: Option<Instant>,
     /// Exit status: WEXITSTATUS if normal exit, negative signal number if signalled,
     /// EXIT_STATUS_UNKNOWN if not yet collected.
     exit_status: i32,
@@ -2388,8 +2432,15 @@ impl Session {
             .map(|ap| ap.pipewire_remote_path())
     }
 
+    fn live_ptys(&self) -> usize {
+        self.ptys.values().filter(|pty| !pty.exited).count()
+    }
+
     fn allocate_pty_id(&mut self, max_ptys: usize) -> Option<u16> {
-        if max_ptys > 0 && self.ptys.len() >= max_ptys {
+        // Live terminals only.  Counting exited-but-retained ones would let a
+        // client that runs 256 short commands hit a cap of 256 with nothing
+        // actually running; those are bounded separately, by retention.
+        if max_ptys > 0 && self.live_ptys() >= max_ptys {
             // A `CREATE2(WANT_STATUS)` caller now gets `S2C_CREATE_FAILED`
             // with `BUDGET`, but the older create opcodes still drop the
             // request with no reply, so keep saying it here — for those the
@@ -3275,6 +3326,69 @@ fn earliest_armed_deadline(sess: &Session) -> Option<Instant> {
         .min()
 }
 
+/// Terminals to evict to stay inside the retention bounds, oldest first.
+///
+/// Pure so the policy is testable without a real PTY: it only needs when
+/// each exited terminal exited.
+fn slots_to_evict(
+    mut exited: Vec<(u16, Instant)>,
+    now: Instant,
+    max_exited: usize,
+    linger: Duration,
+) -> Vec<u16> {
+    exited.sort_by_key(|&(_, at)| at);
+    let mut doomed: Vec<u16> = Vec::new();
+    if !linger.is_zero() {
+        let expired = exited
+            .iter()
+            .filter(|&&(_, at)| now.duration_since(at) >= linger);
+        doomed.extend(expired.map(|&(id, _)| id));
+    }
+    if max_exited > 0 && exited.len() > max_exited {
+        let over = exited.len() - max_exited;
+        doomed.extend(exited.iter().take(over).map(|&(id, _)| id));
+    }
+    doomed.sort_unstable();
+    doomed.dedup();
+    doomed
+}
+
+/// Drop exited terminals that have fallen outside the retention bounds.
+///
+/// `cleanup_pty_internal` marks a terminal exited and keeps its entry so the
+/// output stays readable; nothing but an explicit `C2S_CLOSE` ever removed
+/// one, so a client that creates a terminal per task and never closes it grew
+/// the map until the id space ran out. Eviction takes the same path a
+/// `C2S_CLOSE` would and broadcasts the same `S2C_CLOSED`, so clients need no
+/// new message to understand it.
+///
+/// Only ever touches terminals whose command has already exited.
+async fn evict_exited(state: &AppState) {
+    let now = Instant::now();
+    let mut sess = state.session.lock().await;
+    let exited: Vec<(u16, Instant)> = sess
+        .ptys
+        .iter()
+        .filter_map(|(&id, pty)| pty.exited_at.map(|at| (id, at)))
+        .collect();
+    let doomed = slots_to_evict(exited, now, max_exited(), exited_linger());
+    for id in doomed {
+        let Some(pty) = sess.ptys.remove(&id) else {
+            continue;
+        };
+        // Already exited by construction, so the fd and the child are gone;
+        // this is only dropping the retained terminal state.
+        drop(pty);
+        state.pty_fds.write().unwrap().remove(&id);
+        for client in sess.clients.values_mut() {
+            unsubscribe_client_from(client, id);
+        }
+        let mut msg = vec![S2C_CLOSED];
+        msg.extend_from_slice(&id.to_le_bytes());
+        sess.send_to_all(&msg);
+    }
+}
+
 /// Signal numbers for the stop sequence.  Spelled out rather than taken from
 /// `libc` because this code is shared with Windows, where `kill_pty` treats
 /// the number as an opaque "not SIGINT" and terminates the job.
@@ -3330,6 +3444,7 @@ async fn supervise(state: &AppState) {
     // The backstop still runs, now targeted at owned pids only, so a child
     // whose SIGCHLD we missed cannot linger as a zombie.
     pty::reap_zombies();
+    evict_exited(state).await;
 }
 
 async fn cleanup_pty_internal(pty_id: u16, state: &AppState) {
@@ -3340,6 +3455,7 @@ async fn cleanup_pty_internal(pty_id: u16, state: &AppState) {
             return;
         }
         pty.exited = true;
+        pty.exited_at = Some(Instant::now());
         pty.deadline = None;
         pty.stop_deadline = None;
         pty::close_pty(&pty.handle);
@@ -9772,7 +9888,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         want_status,
                         nonce,
                         STATUS_BUDGET,
-                        &pty_budget_detail(sess.ptys.len(), config.max_ptys),
+                        // The live count, matching what the cap actually
+                        // tests — `ptys.len()` counts retained-exited slots
+                        // too, so an id-space exhaustion under the cap would
+                        // report itself as a cap the operator cannot raise
+                        // their way out of.
+                        &pty_budget_detail(sess.live_ptys(), config.max_ptys),
                     );
                     continue;
                 };
@@ -10508,6 +10629,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         pty.byte_rx = byte_rx;
                         pty.driver.reset_modes();
                         pty.exited = false;
+                        pty.exited_at = None;
                         pty.exit_status = blit_remote::EXIT_STATUS_UNKNOWN;
                         // A restart is a new command, not a continuation of
                         // the one the deadline was armed for.  Carrying the
@@ -14785,6 +14907,82 @@ mod tests {
         assert_eq!(oversize_list_field(&exact, Some(&exact)), None);
     }
 
+    // ── retention ──
+
+    fn at(base: Instant, secs: u64) -> Instant {
+        base + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn eviction_keeps_the_newest_when_over_the_count_bound() {
+        let base = Instant::now();
+        let exited = vec![(1, at(base, 0)), (2, at(base, 10)), (3, at(base, 20))];
+        // Room for two: the oldest goes.
+        assert_eq!(
+            slots_to_evict(exited.clone(), at(base, 30), 2, Duration::ZERO),
+            vec![1]
+        );
+        assert_eq!(
+            slots_to_evict(exited.clone(), at(base, 30), 1, Duration::ZERO),
+            vec![1, 2]
+        );
+        // Under the bound, nothing goes.
+        assert!(slots_to_evict(exited, at(base, 30), 8, Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn eviction_count_bound_is_off_at_zero() {
+        let base = Instant::now();
+        let exited = vec![(1, at(base, 0)), (2, at(base, 1))];
+        assert!(slots_to_evict(exited, at(base, 999), 0, Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn eviction_linger_is_off_by_default() {
+        // The default has to leave old output alone — someone reading a
+        // result back an hour later is a supported thing to do.
+        let base = Instant::now();
+        let exited = vec![(1, at(base, 0))];
+        assert!(
+            slots_to_evict(
+                exited,
+                at(base, 100_000),
+                DEFAULT_MAX_EXITED,
+                DEFAULT_EXITED_LINGER
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn eviction_applies_the_linger_bound_when_set() {
+        let base = Instant::now();
+        let exited = vec![(1, at(base, 0)), (2, at(base, 50)), (3, at(base, 90))];
+        // At t=100 with a 60s linger only 1 is old enough: 2 has been gone
+        // 50s and 3 only 10s.
+        assert_eq!(
+            slots_to_evict(exited.clone(), at(base, 100), 0, Duration::from_secs(60)),
+            vec![1]
+        );
+        // Push `now` out far enough and 2 crosses the line too.
+        assert_eq!(
+            slots_to_evict(exited, at(base, 120), 0, Duration::from_secs(60)),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn eviction_does_not_repeat_an_id_caught_by_both_bounds() {
+        let base = Instant::now();
+        let exited = vec![(1, at(base, 0)), (2, at(base, 1)), (3, at(base, 2))];
+        // 1 is both the oldest over the count bound and past the linger.
+        let doomed = slots_to_evict(exited, at(base, 100), 2, Duration::from_secs(50));
+        let mut unique = doomed.clone();
+        unique.dedup();
+        assert_eq!(doomed, unique);
+        assert_eq!(doomed, vec![1, 2, 3]);
+    }
+
     #[test]
     fn arming_a_deadline_stands_down_a_pending_kill() {
         let now = Instant::now();
@@ -14816,6 +15014,12 @@ mod tests {
         // id space.
         assert!(pty_budget_detail(65535, 0).contains("id space"));
         assert!(pty_budget_detail(10, 256).contains("id space"));
+        // The caller must pass the live count, not `ptys.len()`.  With
+        // retention holding tens of thousands of exited slots the id space
+        // can run out while the live cap is nowhere near — reporting that as
+        // "cap reached" sends the operator to raise a limit that is not the
+        // one they hit.
+        assert!(pty_budget_detail(3, 256).contains("id space"));
     }
 
     // ── try_send_update ──

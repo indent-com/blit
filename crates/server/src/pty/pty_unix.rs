@@ -696,6 +696,7 @@ pub fn spawn_pty(
         stop_deadline: None,
         exit_reason: blit_remote::EXIT_REASON_NORMAL,
         exited: false,
+        exited_at: None,
         exit_status: blit_remote::EXIT_STATUS_UNKNOWN,
         command: command.map(|s| s.to_owned()),
         cwd: dir.map(|s| s.to_owned()),

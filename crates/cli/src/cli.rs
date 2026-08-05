@@ -274,9 +274,9 @@ pub enum Command {
         #[arg(long)]
         inject_path: bool,
 
-        /// Maximum number of terminals the server holds at once, counting
-        /// exited ones still retained for reading. Overrides BLIT_MAX_PTYS;
-        /// unlimited by default. A create refused past the cap answers
+        /// Maximum number of live terminals. Overrides BLIT_MAX_PTYS;
+        /// unlimited by default. Exited terminals are bounded separately by
+        /// BLIT_MAX_EXITED. A create refused past the cap answers
         /// CREATE2(WANT_STATUS) with a budget status instead of hanging.
         #[arg(long, value_name = "N")]
         max_ptys: Option<usize>,

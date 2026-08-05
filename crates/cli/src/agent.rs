@@ -9,12 +9,13 @@ use blit_remote::{
     S2C_EXITED, S2C_HELLO, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SURFACE_CAPTURE,
     S2C_SURFACE_FRAME,
     S2C_SURFACE_LIST, S2C_TERM_CWD, S2C_TEXT, S2C_TITLE, S2C_UPDATE, SURFACE_FRAME_CODEC_AV1,
-    SURFACE_FRAME_CODEC_MASK, SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState, msg_ack,
-    msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_close, msg_create2_full, msg_deadline,
-    msg_input, msg_kill, msg_mouse, msg_quit, msg_read, msg_resize, msg_restart, msg_subscribe,
-    msg_surface_close, msg_surface_focus, msg_surface_input, msg_surface_pointer_axis2,
-    msg_surface_resize, msg_surface_subscribe, msg_surface_subscribe_ext, msg_surface_text,
-    exit_reason_text, msg_term_cwd, parse_server_msg, parse_term_cwd_reply, status_text,
+    SURFACE_FRAME_CODEC_MASK, SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState,
+    exit_reason_text, msg_ack, msg_c2s_clipboard_get, msg_c2s_clipboard_list,
+    msg_c2s_clipboard_set, msg_close, msg_create2_full, msg_deadline, msg_input, msg_kill,
+    msg_mouse, msg_quit, msg_read, msg_resize, msg_restart, msg_subscribe, msg_surface_close,
+    msg_surface_focus, msg_surface_input, msg_surface_pointer_axis2, msg_surface_resize,
+    msg_surface_subscribe, msg_surface_subscribe_ext, msg_surface_text, msg_term_cwd,
+    parse_server_msg, parse_term_cwd_reply, status_text,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -1642,8 +1643,7 @@ mod tests {
     use super::*;
     use blit_remote::{
         CellStyle, FEATURE_CREATE_NONCE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState,
-        msg_create2,
-        S2C_CLOSED, S2C_CREATED_N, build_update_msg, msg_hello,
+        S2C_CLOSED, S2C_CREATED_N, build_update_msg, msg_create2, msg_hello,
     };
 
     // ── Escape parsing unit tests ────────────────────────────────────────

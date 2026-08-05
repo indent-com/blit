@@ -225,8 +225,17 @@ frame; bounding the _aggregate_ `LIST` size needs a logical-message ceiling
 that does not exist yet.
 
 The PTY cap is `--max-ptys` / `BLIT_MAX_PTYS`, unlimited by default. It counts
-exited-but-retained terminals as well as live ones, since both hold an id and
-a scrollback.
+_live_ terminals only — a client that runs a hundred short
+commands is not holding a hundred terminals, and counting the exited ones
+would refuse it work with nothing actually running.
+
+Exited terminals are bounded separately. Their output stays readable after the
+command ends, and nothing but an explicit `CLOSE` used to remove one, so the
+server keeps at most `BLIT_MAX_EXITED` of them (default 1024) and evicts the
+oldest first. Eviction takes the same path a `CLOSE` would and broadcasts the
+same `CLOSED`, so no client change is needed to follow it. `BLIT_EXITED_LINGER`
+adds a time bound in seconds; it is off by default, because how long a result
+stays interesting is not something the server can know.
 
 A terminal has no deadline unless a client arms one — detaching and coming
 back is the point of a multiplexer, so sessions do not expire on their own.
@@ -241,8 +250,10 @@ On expiry the server sends SIGTERM to the process group, waits 5 s, then sends
 SIGKILL, and the resulting `EXITED` carries `reason = 1` (`DEADLINE`). The
 `reason` byte exists because a deadline kill is otherwise indistinguishable
 from a user's `kill -9`: `0` normal, `1` deadline, `2` lease, `3` gc,
-`4` unit-stop. Values 2 and 4 are reserved for
-[design/units.md](design/units.md) and are not sent today. The byte is
+`4` unit-stop. Only `0` and `1` are sent today — `2` and `4` are reserved for
+[design/units.md](design/units.md), and `3` is unused because retention
+eviction only ever touches a terminal that has already sent its `EXITED`, and
+signals itself with `CLOSED`. The byte is
 appended and length-gated, like the trailing fields on `HELLO`, so a 7-byte
 `EXITED` from an older server reads as `NORMAL`.
 
