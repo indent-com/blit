@@ -1024,11 +1024,26 @@ async fn run_listener(
     share_registry: Arc<ShareRegistry>,
     sock_path: &str,
 ) {
+    use std::os::unix::fs::PermissionsExt;
+
     let _ = std::fs::remove_file(sock_path);
+    // Anyone who reaches this socket can name an upstream target or ask the
+    // daemon to exit; there is no handshake credential. Restrict it to the
+    // owner the way blit-server already does for its own socket, setting the
+    // umask before bind so it is never briefly world-accessible. This matters
+    // most in the fallback case: with XDG_RUNTIME_DIR unset the path is under
+    // /tmp, where a default 022 umask left the socket mode 0755 — connectable
+    // by every local user.
+    let old_umask = unsafe { libc::umask(0o077) };
     let listener = tokio::net::UnixListener::bind(sock_path).unwrap_or_else(|e| {
+        unsafe { libc::umask(old_umask) };
         eprintln!("blit-proxy: cannot bind to {sock_path}: {e}");
         std::process::exit(1);
     });
+    unsafe { libc::umask(old_umask) };
+    if let Err(e) = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o700)) {
+        eprintln!("blit-proxy: warning: cannot set socket permissions: {e}");
+    }
     log!("blit-proxy: listening on {sock_path}");
     loop {
         match listener.accept().await {
