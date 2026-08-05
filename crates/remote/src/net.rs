@@ -72,7 +72,8 @@ pub fn net_status_text(status: u8) -> &'static str {
         NET_STATUS_TLS => "TLS failed",
         NET_STATUS_BUDGET => "budget exhausted",
         NET_STATUS_INVALID => "invalid request",
-        _ => "error",
+        NET_STATUS_OTHER => "backend error",
+        _ => "unknown status",
     }
 }
 
@@ -438,6 +439,12 @@ pub fn is_c2s_net(opcode: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_text_distinguishes_other_from_unknown() {
+        assert_eq!(net_status_text(NET_STATUS_OTHER), "backend error");
+        assert_eq!(net_status_text(200), "unknown status");
+    }
 
     #[test]
     fn open_roundtrip_plain() {
