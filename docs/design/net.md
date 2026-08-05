@@ -67,7 +67,10 @@ worth having outside a browser — plaintext locally, TLS to the target.
   nothing wants it yet.
 - **No reverse tunnel.** Exposing a client-side port on the server
   (`ssh -R`) is a separate RFC; the wire below leaves the direction bit
-  unspoken rather than reserving space for it.
+  unspoken rather than reserving space for it. Dynamic forwarding
+  (`ssh -D`) is not in that category and needs no wire at all: the
+  target already arrives on every open, so it is one more local
+  frontend ([§ Client: `blit socks`](#client-blit-socks)).
 - **No h2 client in the server.** The wire negotiates ALPN and reports
   what it got; if a client asks for `h2` it owns HPACK and framing
   ([§ ALPN and h2](#alpn-and-h2)).
@@ -701,6 +704,115 @@ opening listening sockets on the machine are different authorities, and
 bundling them means a user who wanted a UI gets ports bound they never
 asked for.
 
+## Client: `blit socks`
+
+`ssh -D`. A local SOCKS5 listener (RFC 1928) that opens one stream per
+accepted connection, with the target taken from the CONNECT request
+instead of from a spec:
+
+```bash
+blit socks 1080
+blit socks 0.0.0.0:1080
+blit --on prod socks 1080
+curl -x socks5h://localhost:1080 http://api.internal/
+```
+
+**No wire, no server, no new opcode.** `NET_OPEN` already carries its
+own `host`/`port` and the server pins nothing per connection
+([§ Target policy](#target-policy)), so a dynamic proxy is the same
+primitive `blit forward` uses with a different string per stream. That
+is worth stating because it is the reason this is a small feature: had
+the wire negotiated a target at open time, or resolved names on the
+client, `ssh -D` would have needed its own protocol.
+
+**A separate verb, not a `socks/` spec kind.** A forward's grammar is
+`port:host:hostport` and a SOCKS listener has no target to put in the
+last two fields, so a fourth kind would be a spec with two fields that
+must be empty. `blit.forwards` entries stay meaningful for the same
+reason ([§ A named list](#a-named-list-blitforwards)) — nothing to
+remember here but a port.
+
+**Names are not resolved locally.** `ATYP=DOMAINNAME` becomes the
+`host` string verbatim, so `socks5h://` (curl) or "proxy DNS" (a
+browser) reaches names that only the server can look up. A client that
+resolves for itself and sends `ATYP=IPV4` still works and still gets
+the server's route, but loses that. The distinction is the whole reason
+to point a browser at this rather than at a forward.
+
+**CONNECT only.** BIND and UDP ASSOCIATE both ask the proxy to open a
+listener or an unconnected socket on the client's behalf; the first is
+the reverse tunnel this RFC declines (§ Non-goals) and the second wants
+one relay flow per `(client, target)` pair against the same
+`NET_MAX_SOCKETS` budget, for a command almost nothing sends. Both are
+answered with their own reply code rather than dropped.
+
+**No authentication.** Only the no-auth method is offered. The listener
+binds loopback for the same reason a forward's does, and a passphrase
+in front of a loopback socket is a passphrase stored in whatever
+pointed the client at it — see § Many forwards, one connection, whose
+argument is sharper here: a forward grants one target, a proxy grants
+everything the server can reach. An operator who cares wants
+`--allow-forward` set, not a password on the proxy.
+
+### Statuses become reply codes
+
+SOCKS distinguishes the same failures the wire does
+([§ Statuses](#statuses)), so the mapping is direct and a client sees
+the real reason rather than a blanket failure:
+
+| `NET_OPENED.status` | SOCKS `REP`               |
+| ------------------- | ------------------------- |
+| `OK`                | `0x00` succeeded          |
+| `NOT_FOUND`         | `0x04` host unreachable   |
+| `REFUSED`           | `0x05` connection refused |
+| `PERMISSION`        | `0x02` not allowed        |
+| everything else     | `0x01` general failure    |
+
+Keeping `NOT_FOUND` apart from `REFUSED` on the wire is what makes this
+possible; a relay that flattened them would flatten `curl`'s diagnosis
+too. `BUDGET` — including the client-side case where the proxy is out
+of stream ids — has no SOCKS code and becomes `0x01`; SOCKS has no way
+to say "the proxy, not the target".
+
+`BND.ADDR`/`BND.PORT` are all-zero IPv4. The real value is the address
+the _server_ used to reach the target, which `NET_OPENED` does not
+carry and no CONNECT client reads.
+
+### One round trip that a forward does not pay
+
+A forward pipelines: it sends `NET_OPEN` and starts relaying, so the
+local client's first bytes ride in the same batch
+([§ Stream ids are client-allocated](#stream-ids-are-client-allocated)).
+SOCKS cannot, because its client sends nothing until the CONNECT is
+answered and the answer carries the status. So the proxy waits for
+`NET_OPENED`, replies, and only then relays. This is inherent to SOCKS,
+not to this wire, and the alternative — answering `0x00` optimistically
+and closing on failure — throws away the status mapping above to save
+one RTT.
+
+The pump still reads the local socket from the first moment, so nothing
+special happens for a client that sends early: there is nothing to
+send.
+
+### Concurrency makes the window the floor, not the ceiling
+
+A stream's client→server window is
+`NET_WINDOW_AGGREGATE / open_sockets` clamped to
+`[2 * NET_MAX_CHUNK, NET_WINDOW_BYTES]`, fixed at open and **never
+reported to the client** ([§ Pacing](#pacing)). Overrunning it is
+`NET_CLOSED` BUDGET, not backpressure.
+
+A handful of static forwards sit inside the 1 MiB ceiling, so
+`blit forward` assumes it. A proxy's socket count is its client's
+business — one browser tab is dozens — so `blit socks` assumes the
+128 KiB floor instead, the smallest share the server ever hands out and
+therefore the only figure safe at any concurrency. The cost is a
+per-stream in-flight ceiling; the alternative is a stream killed
+mid-transfer once the connection gets busy.
+
+`NET_MAX_SOCKETS` (256) is a real ceiling for a proxy in a way it is
+not for a forward. Past it the proxy answers `0x01` rather than hanging.
+
 ## Client: service worker
 
 Phase 2. A `fetch` handler on the gateway's own origin, translating
@@ -978,6 +1090,7 @@ Worth stating plainly, because each one is a support question:
 | 5   | `udp/` specs (per-source flows) + e2e over `dig`                  | 3, 4    |
 | 6   | `blit.forwards` + `blit forward add`/`list`/`rm`/`--all`          | 3       |
 | 7   | TLS termination with ALPN, `INSECURE` gating, `tls/` specs        | 3       |
+| 7a  | `blit socks`: SOCKS5 CONNECT over the same opens, no wire change  | 3       |
 | 8   | `@blit-sh/core` client: stream API over `BlitConnection`          | 1       |
 | 9   | Gateway: `/x/` 503, non-single-file worker entry + route          | —       |
 | 10  | Service worker: HTTP/1.1 over relayed streams, pooling, rewriting | 8, 9    |

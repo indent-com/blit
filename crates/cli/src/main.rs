@@ -9,6 +9,8 @@ mod grep;
 mod interactive;
 mod kv;
 mod lsp;
+mod relay;
+mod socks;
 mod transport;
 mod uplink;
 
@@ -1037,6 +1039,26 @@ async fn async_main() {
                     }
                     Err(e) => Err(e),
                 },
+            };
+            match result {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Socks { listen } => {
+            // Parse before connecting, so a bad listen address costs nothing.
+            let result: Result<i32, String> = match socks::parse_listen(&listen) {
+                Ok(listen) => {
+                    let conn = &cli.connect;
+                    match transport::connect(&conn.on, &conn.hub).await {
+                        Ok(transport) => socks::cmd_socks(transport, listen).await,
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
             };
             match result {
                 Ok(code) => std::process::exit(code),

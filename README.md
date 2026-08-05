@@ -54,6 +54,16 @@ blit forward add web 8080:localhost:3000         # remember it
 blit forward --all                               # start every saved forward
 ```
 
+Or proxy everything the server can reach through one port — `ssh -D`:
+
+```bash
+blit socks 1080                                  # SOCKS5 on 127.0.0.1:1080
+curl -x socks5h://localhost:1080 http://api.internal/
+```
+
+Names are resolved on the server, so `socks5h://` (or a browser set to proxy
+DNS) reaches hosts your machine cannot look up.
+
 Listeners bind to loopback unless you name a bind address. The relay reaches
 whatever the server reaches; restrict it with
 `blit server --allow-forward 'host[:ports]'`. Saved forwards live in

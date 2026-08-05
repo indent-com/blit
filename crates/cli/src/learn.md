@@ -257,6 +257,37 @@ retransmission and head-of-line blocking they did not ask for. Fine for
 DNS-shaped request/response traffic; poor for anything running its own
 congestion control, such as QUIC.
 
+## SOCKS5 proxy
+
+Proxy TCP into the server's network with a single local port — `ssh -D`. The
+target comes from each request instead of a spec, so nothing has to be known in
+advance. The listen address is `[bind_address:]port`.
+
+```bash
+blit socks 1080                                  # SOCKS5 on 127.0.0.1:1080
+blit socks 0.0.0.0:1080                          # reachable from the network
+blit socks 0                                     # pick a port, print it
+blit --on prod socks 1080                        # through a named remote
+curl -x socks5h://localhost:1080 http://api.internal/
+```
+
+Use a client that sends **names**, not addresses: `socks5h://` in curl,
+`network.proxy.socks_remote_dns` in Firefox, `--proxy-server="socks5://…"` in
+Chrome. Names are resolved on the server, so the proxy reaches hosts this
+machine cannot look up — which is most of the reason to use it over a forward.
+A client that resolves locally still works but loses that.
+
+CONNECT only: BIND and UDP ASSOCIATE are answered `0x07` (command not
+supported). No authentication beyond the no-auth method. Failures keep their
+reason — a name that does not resolve is `0x04`, a refused connection is
+`0x05`, a target denied by `--allow-forward` is `0x02` — so a client reports
+what actually happened.
+
+Binds **127.0.0.1** unless a bind address is given, and the default matters
+more here than for a forward: a forward hands out one target, a proxy hands out
+everything the server can reach. The same `blit server --allow-forward` patterns
+and `BLIT_NET=0` govern it. The proxy ends with the process.
+
 ## Clipboard
 
 ```bash
