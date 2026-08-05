@@ -80,9 +80,7 @@ export const S2C_LSP_STOPPED = 0x66;
 /** `S2C_HELLO` feature bit: server supports the `LSP_*` message family. */
 export const FEATURE_LSP = 1 << 8;
 
-// Unified status table (docs/design/lsp.md "Statuses"): the docs/design/git.md
-// codes 0-9 with the same numbers and semantics where they overlap, plus
-// WARMING.
+// Common status registry (docs/protocol.md), including LSP's WARMING value.
 export const LSP_STATUS_OK = 0;
 /** `lsp_id` unknown or already closed. */
 export const LSP_STATUS_UNKNOWN_ID = 1;
@@ -126,10 +124,12 @@ export function lspStatusText(status: number): string {
       return "invalid request";
     case LSP_STATUS_CANCELLED:
       return "cancelled";
+    case LSP_STATUS_OTHER:
+      return "backend error";
     case LSP_STATUS_WARMING:
       return "warming up";
     default:
-      return "error";
+      return `unknown status ${status}`;
   }
 }
 

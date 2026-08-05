@@ -59,7 +59,7 @@ impl RepoHandle {
         } else {
             match crate::unescape_wire(req.path) {
                 Some(bytes) => Some(bytes),
-                None => return fail(GIT_STATUS_OTHER),
+                None => return fail(GIT_STATUS_INVALID),
             }
         };
         match walk_log(
@@ -96,7 +96,7 @@ impl RepoHandle {
         // own order, which the cursor makes normative.
         let after = match crate::unescape_wire(req.after) {
             Some(bytes) => bytes,
-            None => return fail(GIT_STATUS_OTHER),
+            None => return fail(GIT_STATUS_INVALID),
         };
         let mut records = Vec::new();
         let mut flags = 0u8;
@@ -215,7 +215,7 @@ impl RepoHandle {
         let repo = self.local();
         let fail = |status: u8| msg_git_base_resp(nonce, status, &[]);
         if oids.len() < 2 {
-            return fail(GIT_STATUS_OTHER);
+            return fail(GIT_STATUS_INVALID);
         }
         let ids: Vec<gix::ObjectId> = oids.iter().map(|o| oid_from_wire(&repo, o)).collect();
         for id in &ids {
@@ -566,7 +566,7 @@ pub(crate) fn walk_log(
 
     let follow = flags & GIT_LOG_FOLLOW != 0;
     if follow && path_filter.is_none() {
-        return Err(GIT_STATUS_OTHER);
+        return Err(GIT_STATUS_INVALID);
     }
     // FOLLOW tracks a single file (docs/git.md): a directory path is
     // WRONG_TYPE. Check against the resolved tips.
@@ -967,7 +967,7 @@ pub(crate) fn resolve_tree<'r>(
     if path.is_empty() {
         return Ok(tree);
     }
-    let bytes = crate::unescape_wire(path).ok_or(GIT_STATUS_OTHER)?;
+    let bytes = crate::unescape_wire(path).ok_or(GIT_STATUS_INVALID)?;
     let entry = tree
         .lookup_entry_by_path(gix::path::from_byte_slice(&bytes))
         .map_err(|_| GIT_STATUS_OTHER)?
@@ -991,7 +991,7 @@ pub(crate) fn resolve_tree_entry(
     let id = oid_from_wire(repo, oid);
     let object = repo.find_object(id).map_err(|_| GIT_STATUS_NOT_FOUND)?;
     let tree = object.peel_to_tree().map_err(|_| GIT_STATUS_WRONG_TYPE)?;
-    let bytes = crate::unescape_wire(path).ok_or(GIT_STATUS_OTHER)?;
+    let bytes = crate::unescape_wire(path).ok_or(GIT_STATUS_INVALID)?;
     let entry = tree
         .lookup_entry_by_path(gix::path::from_byte_slice(&bytes))
         .map_err(|_| GIT_STATUS_OTHER)?

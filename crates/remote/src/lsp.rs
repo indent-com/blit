@@ -75,9 +75,8 @@ pub const S2C_LSP_SERVERS: u8 = 0x65;
 /// Stop outcome: [0x66][nonce:2][status:1]
 pub const S2C_LSP_STOPPED: u8 = 0x66;
 
-// Unified status table (docs/design/lsp.md "Statuses"): the git.md codes
-// 0-9 with the same numbers and semantics where they overlap, plus
-// WARMING.
+// Common status registry (docs/protocol.md "Common status registry"),
+// including the LSP-specific common `WARMING` allocation.
 pub const LSP_STATUS_OK: u8 = 0;
 /// `lsp_id` unknown or already closed.
 pub const LSP_STATUS_UNKNOWN_ID: u8 = 1;
@@ -112,8 +111,9 @@ pub fn lsp_status_text(status: u8) -> &'static str {
         LSP_STATUS_BUDGET => "budget exhausted",
         LSP_STATUS_INVALID => "invalid request",
         LSP_STATUS_CANCELLED => "cancelled",
+        LSP_STATUS_OTHER => "backend error",
         LSP_STATUS_WARMING => "warming up",
-        _ => "error",
+        _ => "unknown status",
     }
 }
 
@@ -1639,6 +1639,12 @@ impl LspDiagMirror {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_text_distinguishes_other_from_unknown() {
+        assert_eq!(lsp_status_text(LSP_STATUS_OTHER), "backend error");
+        assert_eq!(lsp_status_text(200), "unknown status");
+    }
 
     #[test]
     fn lsp_open_from_pty_roundtrip_and_rebase() {
