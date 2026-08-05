@@ -236,6 +236,9 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 8   | `LSP`                | Server supports the `LSP_*` language intelligence family        |
 | 9   | `KV`                 | Server supports the `KV_*` key-value family                     |
 | 10  | `NET`                | Server supports the `NET_*` network-relay family                |
+| 11  | `PLUGIN`             | Proposed: server supports Wasmi plugin lifecycle and events     |
+| 12  | `CHANNEL`            | Proposed: server supports channels, state, and topics           |
+| 13  | `PROCESS`            | Proposed: server supports non-PTY child processes               |
 | 14  | `CREATE_STATUS`      | `CREATE2(WANT_STATUS)` receives an explicit failure             |
 | 15  | `KILL_MODE`          | `KILL`/`CLOSE` reach the process group; `KILL` takes `flags`    |
 | 16  | `PTY_DEADLINE`       | `C2S_DEADLINE`, `CREATE2(HAS_DEADLINE)`, and `EXITED.reason`    |
@@ -243,7 +246,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 18  | `SURFACE_TOUCH`      | Server accepts direct contacts and exposes `wl_seat.touch`      |
 | 19  | `SURFACE_TEXT_INPUT` | Server forwards committed `zwp_text_input_v3` state             |
 
-Bits 11 through 13 are held for the extension, channel, and process families
+Bits 11 through 13 are proposed for the plugin, channel, and process families
 under review in [#167](https://github.com/indent-com/blit/pull/167) and
 [#173](https://github.com/indent-com/blit/pull/173); nothing advertises them
 today. Bit 14 is always advertised.
@@ -399,6 +402,12 @@ Two complementary paths report a PTY's working directory:
 - **Poll** (`C2S_TERM_CWD` `0x1C` → `S2C_TERM_CWD` `0x0E`): request/reply correlated by nonce. The reply prefers the PTY's stored OSC 7 value — it is fresher (the interactive shell's prompt-time cwd, not whichever pid the kernel happens to track) and costs no syscall. When the shell has never reported (no OSC 7 integration), the server falls back to asking the kernel about the PTY child (`/proc/<pid>/cwd` on Linux, `proc_pidinfo` on macOS). The poll therefore remains the fallback for shells without OSC 7; clients with OSC 7-integrated shells see pushes arrive ahead of any poll.
 
 Clients that predate `TERM_CWD_EVENT` are unaffected: consistent with the version-stability rule above (new message types are added under new opcodes), both reference clients drop unrecognized S2C opcodes — `js/core`'s `BlitConnection.handleMessage` dispatch falls through to a no-op `default`, and the CLI's message matches end in a catch-all `_ => {}`.
+
+An opcode which multiplexes a one-byte inner kind also needs a family-defined
+skip rule. The proposed plugin and native-channel families specify that clients
+ignore unknown S2C kinds, servers ignore unknown C2S kinds without changing
+handle state, and any new request kind which requires a reply is separately
+feature-negotiated; see [design/plugins.md](design/plugins.md#protocol-compatibility).
 
 `S2C_SURFACE_FRAME` flags byte: bit 0 is the keyframe flag; bits 1–2 encode the codec — H.264 (0), AV1 (1), PNG (2). Bit 3 means a `[timestamp_sub_us:2]` field appears between the base header and encoded data. The base `timestamp` is a wrapping monotonic millisecond counter captured at compositor-commit time (not wire-send time); `timestamp_sub_us` is its 0–999 µs fractional part. The server only sends the extended layout when `C2S_CLIENT_FEATURES.client_features` bit 0 is set. Bits 4–7 remain reserved.
 
