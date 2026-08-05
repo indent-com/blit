@@ -690,7 +690,7 @@ attempt.
 
 Common family status values are reused: `OK`, `NOT_FOUND`, `TOO_LARGE`,
 `INVALID`, `CANCELLED`, `OTHER`, and `CONFLICT`.
-`EXT_PUT_STATUS` additionally defines value 12 as `ALREADY_HAVE`. It means
+`EXT_PUT_STATUS` additionally defines value 13 as `ALREADY_HAVE`. It means
 the verified object is already committed; `received` is its stored total size,
 pending creations proceed, and the client must stop uploading. `OK` reports the
 cumulative accepted `received` bytes. `CONFLICT` means another uploader owns
