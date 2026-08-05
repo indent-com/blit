@@ -321,14 +321,83 @@ pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
     blit_remote::EXIT_STATUS_UNKNOWN
 }
 
+/// Has this child exited?  Non-blocking, and it parks the status so the
+/// `cleanup_pty_internal` that follows still reports the real exit code.
+///
+/// This is what decouples exit detection from EOF on the master fd.  A
+/// grandchild that keeps the slave open means the master never reaches EOF,
+/// so a child could exit with the terminal stuck in `running` forever; the
+/// supervisor polls this instead, woken by SIGCHLD.
+pub fn poll_child_exited(handle: &PtyHandle) -> bool {
+    let mut reaped = reaped_statuses().lock().unwrap();
+    if reaped.contains_key(&handle.child_pid) {
+        return true;
+    }
+    // Same lock order as reap_zombies and collect_exit_status: reaped first,
+    // then pty_pids, so a concurrent reaper cannot take the status between
+    // the check and the park.
+    let owned = pty_pids().lock().unwrap();
+    if !owned.contains(&handle.child_pid) {
+        // Already collected — the caller has its status.
+        return false;
+    }
+    let mut wstatus: libc::c_int = 0;
+    let pid = unsafe { libc::waitpid(handle.child_pid, &mut wstatus, libc::WNOHANG) };
+    if pid > 0 {
+        reaped.insert(pid, status_from_wstatus(wstatus));
+        return true;
+    }
+    false
+}
+
+/// Drop a pid from the owned set without collecting a status, for the close
+/// path that kills a live child and never asks what it exited with.  Without
+/// this the pid stays owned forever and the backstop parks a status nobody
+/// drains.
+pub fn forget_pty_pid(handle: &PtyHandle) {
+    let mut reaped = reaped_statuses().lock().unwrap();
+    pty_pids().lock().unwrap().remove(&handle.child_pid);
+    reaped.remove(&handle.child_pid);
+}
+
+/// Is reaping unowned children this process's job?
+///
+/// Only as PID 1.  A PTY grandchild that outlives its parent reparents to
+/// init, and if that is us, nobody else will ever wait for it.  Elsewhere an
+/// unowned child of this process belongs to a subsystem that reaps it itself,
+/// and taking its status is the theft this reaper used to commit.
+///
+/// A nested `PR_SET_CHILD_SUBREAPER` ancestor would also collect orphans, but
+/// blit never sets that on itself and nothing in the tree arranges it, so the
+/// PID check is the whole realistic surface.
+fn adopts_orphans() -> bool {
+    unsafe { libc::getpid() == 1 }
+}
+
 pub fn reap_zombies() {
-    // Backstop reaper. Reap every exited child so none becomes a
-    // zombie, but only *park* statuses for PTY-owned pids: a foreign
-    // child (e.g. a blit-lsp language server, reaped by its own engine
-    // on every path) must not leave a stale entry that a later PTY
-    // child recycling its pid would collect.
+    // Backstop reaper, targeted at pids this module owns.
+    //
+    // It used to drain `waitpid(-1)` unconditionally and discard anything
+    // foreign, which reaped other subsystems' children out from under them:
+    // the audio pipeline's own `try_wait` would find the status already
+    // taken, and a language server's engine likewise.  The supervisor reaps
+    // PTY children promptly off SIGCHLD; this stays as a slow sweep so a
+    // missed wakeup cannot leave one a zombie.
     let mut reaped = reaped_statuses().lock().unwrap();
     let owned = pty_pids().lock().unwrap();
+    for &pid in owned.iter() {
+        let mut wstatus: libc::c_int = 0;
+        if unsafe { libc::waitpid(pid, &mut wstatus, libc::WNOHANG) } > 0 {
+            reaped.insert(pid, status_from_wstatus(wstatus));
+        }
+    }
+    if !adopts_orphans() {
+        return;
+    }
+    // Running as init (a container entrypoint, say).  Escaped grandchildren
+    // reparent here and nothing else will ever collect them, so drain what is
+    // left.  This is the old unconditional behaviour, now scoped to the one
+    // case where it is correct rather than merely harmful-and-tolerated.
     loop {
         let mut wstatus: libc::c_int = 0;
         let pid = unsafe { libc::waitpid(-1, &mut wstatus, libc::WNOHANG) };
@@ -919,6 +988,48 @@ mod tests {
 
         super::kill_pty(&handle, libc::SIGKILL, true);
         wait_until_zombie(leader);
+        unsafe {
+            libc::waitpid(leader, std::ptr::null_mut(), 0);
+        }
+        wait_until_gone(grandchild);
+    }
+
+    /// Exit detection must not depend on the master fd reaching EOF: a
+    /// grandchild holding the slave open keeps a dead terminal marked
+    /// running forever.  `poll_child_exited` answers from the child itself.
+    #[test]
+    fn poll_child_exited_reports_a_dead_child() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::_exit(7) };
+        }
+        super::register_pty_pid(pid);
+        let handle = PtyHandle {
+            master_fd: -1,
+            child_pid: pid,
+        };
+
+        wait_until_zombie(pid);
+        assert!(super::poll_child_exited(&handle));
+        // And the status it parked is still the one the caller gets.
+        assert_eq!(collect_exit_status(&handle), 7);
+    }
+
+    #[test]
+    fn poll_child_exited_is_false_while_the_child_runs() {
+        let (leader, grandchild) = fork_leader_with_child();
+        super::register_pty_pid(leader);
+        let handle = PtyHandle {
+            master_fd: -1,
+            child_pid: leader,
+        };
+
+        assert!(!super::poll_child_exited(&handle));
+
+        super::kill_pty(&handle, libc::SIGKILL, true);
+        wait_until_zombie(leader);
+        assert!(super::poll_child_exited(&handle));
         unsafe {
             libc::waitpid(leader, std::ptr::null_mut(), 0);
         }

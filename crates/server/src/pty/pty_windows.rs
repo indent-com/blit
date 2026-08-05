@@ -116,7 +116,11 @@ pub fn close_pty(handle: &PtyHandle) {
 pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
     const STILL_ACTIVE: u32 = 259;
     unsafe {
-        WaitForSingleObject(handle.process, 1000);
+        // Bounded, not blocking: this runs under the session mutex, and the
+        // supervisor only calls it once `poll_child_exited` has already said
+        // the process is done.  The wait is a safety net for the EOF path,
+        // which can beat the kernel to the exit code by a hair.
+        WaitForSingleObject(handle.process, 50);
         let mut exit_code: u32 = 0;
         if GetExitCodeProcess(handle.process, &mut exit_code) != 0 && exit_code != STILL_ACTIVE {
             exit_code as i32
@@ -125,6 +129,17 @@ pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
         }
     }
 }
+
+/// See the Unix twin.  Windows has no SIGCHLD, so the supervisor polls this
+/// on its own cadence instead of being woken.
+pub fn poll_child_exited(handle: &PtyHandle) -> bool {
+    const WAIT_OBJECT_0: u32 = 0;
+    unsafe { WaitForSingleObject(handle.process, 0) == WAIT_OBJECT_0 }
+}
+
+/// No owned-pid table on Windows — the process handle is the ownership —
+/// so there is nothing to forget.
+pub fn forget_pty_pid(_handle: &PtyHandle) {}
 
 pub fn reap_zombies() {}
 

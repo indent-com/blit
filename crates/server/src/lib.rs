@@ -2801,6 +2801,11 @@ struct AppStateInner {
     delivery_notify: Arc<Notify>,
     /// Signalled when a client sends C2S_QUIT to initiate server shutdown.
     shutdown_notify: Arc<Notify>,
+    /// Wakes the supervisor loop.  Separate from `delivery_notify` because
+    /// the two have opposite duty cycles: delivery only runs while a client
+    /// is attached, and lifecycle work is exactly what has to keep running
+    /// when none is.
+    supervisor_notify: Arc<Notify>,
     /// Tracks the number of currently connected clients for enforcing
     /// `config.max_connections`.
     active_connections: std::sync::atomic::AtomicUsize,
@@ -3205,6 +3210,55 @@ fn pty_budget_detail(live: usize, max_ptys: usize) -> String {
     }
 }
 
+/// How often the supervisor sweeps when nothing has woken it.
+///
+/// On Unix this is a pure backstop — SIGCHLD wakes it the moment a child
+/// dies, and the sweep only covers a missed signal (they coalesce, so two
+/// children dying together deliver one).  Windows has no SIGCHLD and this is
+/// the actual detection latency.
+const SUPERVISOR_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Reactive lifecycle loop, deliberately not part of the delivery tick.
+///
+/// The tick only schedules itself while a client is attached —
+/// `blanket_frame_interval` returns `None` on an empty client map and every
+/// other deadline it computes is client-gated — so a server with nobody
+/// watching parks on `delivery_notify` indefinitely.  That is precisely when
+/// a runaway command needs supervising, so lifecycle work gets its own loop.
+async fn supervisor_loop(state: AppState) {
+    loop {
+        tokio::select! {
+            _ = state.supervisor_notify.notified() => {}
+            _ = tokio::time::sleep(SUPERVISOR_SWEEP_INTERVAL) => {}
+        }
+        supervise(&state).await;
+    }
+}
+
+/// One supervisor pass: notice children that have exited and run the exit
+/// path for them.
+///
+/// Exit used to be detected only by EOF on the master fd, which reports "the
+/// last fd on the slave closed", not "the child exited".  A grandchild
+/// holding the slave open kept a dead terminal marked `running` forever, and
+/// `blit terminal wait` blocked until its own client-side timeout.
+async fn supervise(state: &AppState) {
+    let exited: Vec<u16> = {
+        let sess = state.session.lock().await;
+        sess.ptys
+            .iter()
+            .filter(|(_, pty)| !pty.exited && pty::poll_child_exited(&pty.handle))
+            .map(|(&id, _)| id)
+            .collect()
+    };
+    for id in exited {
+        cleanup_pty_internal(id, state).await;
+    }
+    // The backstop still runs, now targeted at owned pids only, so a child
+    // whose SIGCHLD we missed cannot linger as a zombie.
+    pty::reap_zombies();
+}
+
 async fn cleanup_pty_internal(pty_id: u16, state: &AppState) {
     state.pty_fds.write().unwrap().remove(&pty_id);
     let mut sess = state.session.lock().await;
@@ -3309,6 +3363,7 @@ pub async fn run(config: Config) {
         pty_fds: Arc::new(std::sync::RwLock::new(HashMap::new())),
         delivery_notify: Arc::new(Notify::new()),
         shutdown_notify: Arc::new(Notify::new()),
+        supervisor_notify: Arc::new(Notify::new()),
         active_connections: std::sync::atomic::AtomicUsize::new(0),
     });
 
@@ -3342,12 +3397,31 @@ pub async fn run(config: Config) {
         }
     });
 
-    tokio::spawn(async {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            pty::reap_zombies();
-        }
+    let supervisor_state = state.clone();
+    tokio::spawn(async move {
+        supervisor_loop(supervisor_state).await;
     });
+
+    // SIGCHLD is what makes exit detection prompt without polling.  The
+    // handler does nothing but wake the supervisor: reaping from a signal
+    // context would race the session mutex, and the supervisor already knows
+    // which pids it owns.
+    #[cfg(unix)]
+    {
+        let sigchld_state = state.clone();
+        tokio::spawn(async move {
+            let Ok(mut sigchld) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+            else {
+                eprintln!("[supervisor] SIGCHLD unavailable; falling back to the poll");
+                return;
+            };
+            loop {
+                sigchld.recv().await;
+                sigchld_state.supervisor_notify.notify_one();
+            }
+        });
+    }
 
     // Warm the KV store off the serving paths (docs/design/kv.md
     // § Storage): the load+hash of the whole database happens now, in the
@@ -10490,6 +10564,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         state.pty_fds.write().unwrap().remove(&pid);
                         drop(pty.reader_handle);
                         pty::close_pty(&pty.handle);
+                        // Nobody will ask this child's exit status, so drop
+                        // it from the owned set — otherwise the pid stays
+                        // registered forever and the backstop parks a status
+                        // that is never drained.
+                        pty::forget_pty_pid(&pty.handle);
                     }
                     for client in sess.clients.values_mut() {
                         unsubscribe_client_from(client, pid);
