@@ -160,6 +160,11 @@ All three bytes are optional — a 3-byte message uses connection/server default
 | 6   | `FS`           | Server supports the `FS_*` filesystem sync family              |
 | 7   | `GIT`          | Server supports the `GIT_*` git introspection family           |
 | 8   | `LSP`          | Server supports the `LSP_*` language intelligence family       |
+| 9   | `KV`           | Server supports the `KV_*` key-value family                    |
+| 10  | `NET`          | Server supports the `NET_*` network-relay family               |
+| 11  | `PLUGIN`       | Proposed: server supports Wasmi plugin lifecycle and events    |
+| 12  | `CHANNEL`      | Proposed: server supports channels, state, and topics          |
+| 13  | `PROCESS`      | Proposed: server supports non-PTY child processes              |
 
 `S2C_LIST` entry layout: `[pty_id:2][tag_len:2][tag:N][cmd_len:2][cmd:M]` per
 PTY. The trailing command field is a backward-compatible extension; old
@@ -176,6 +181,12 @@ Two complementary paths report a PTY's working directory:
 - **Poll** (`C2S_TERM_CWD` `0x1C` → `S2C_TERM_CWD` `0x0E`): request/reply correlated by nonce. The reply prefers the PTY's stored OSC 7 value — it is fresher (the interactive shell's prompt-time cwd, not whichever pid the kernel happens to track) and costs no syscall. When the shell has never reported (no OSC 7 integration), the server falls back to asking the kernel about the PTY child (`/proc/<pid>/cwd` on Linux, `proc_pidinfo` on macOS). The poll therefore remains the fallback for shells without OSC 7; clients with OSC 7-integrated shells see pushes arrive ahead of any poll.
 
 Clients that predate `TERM_CWD_EVENT` are unaffected: consistent with the version-stability rule above (new message types are added under new opcodes), both reference clients drop unrecognized S2C opcodes — `js/core`'s `BlitConnection.handleMessage` dispatch falls through to a no-op `default`, and the CLI's message matches end in a catch-all `_ => {}`.
+
+An opcode which multiplexes a one-byte inner kind also needs a family-defined
+skip rule. The proposed plugin and native-channel families specify that clients
+ignore unknown S2C kinds, servers ignore unknown C2S kinds without changing
+handle state, and any new request kind which requires a reply is separately
+feature-negotiated; see [design/plugins.md](design/plugins.md#protocol-compatibility).
 
 `S2C_SURFACE_FRAME` flags byte: bit 0 is the keyframe flag; bits 1–2 encode the codec — H.264 (0), AV1 (1), PNG (2). Remaining bits are reserved. `timestamp` is a monotonic millisecond counter captured at compositor-commit time (not wire-send time), so clients can drive video presentation and A/V sync off encode-time instead of network-delivery jitter.
 
