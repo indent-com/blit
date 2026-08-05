@@ -130,6 +130,46 @@ test.describe("OSC 8 hyperlinks", () => {
     expect(dy, "status bar should preview the OSC 8 target").not.toBeNull();
   });
 
+  test("the preview clears when the pointer leaves the terminal", async ({
+    page,
+  }) => {
+    const surface = await authenticateAndCreateTerminal(page);
+    await printToTerminal(
+      page,
+      osc8("https://blit.sh/docs", "the docs") + "\n",
+    );
+
+    const box = (await surface.boundingBox())!;
+    const dy = await findLinkRow(page, box, "https://blit.sh/docs");
+    expect(dy).not.toBeNull();
+
+    // Straight down out of the bottom edge onto the status bar — the pointer
+    // never crosses a non-link cell, so nothing but `mouseleave` can notice.
+    await page.mouse.move(box.x + 20, box.y + box.height + 20);
+    await page.waitForTimeout(300);
+    expect(
+      await hoveredTarget(page),
+      "the preview must not outlive the pointer being over the link",
+    ).toBeNull();
+  });
+
+  test("the preview clears when the window loses focus", async ({ page }) => {
+    const surface = await authenticateAndCreateTerminal(page);
+    await printToTerminal(
+      page,
+      osc8("https://blit.sh/docs", "the docs") + "\n",
+    );
+
+    const box = (await surface.boundingBox())!;
+    const dy = await findLinkRow(page, box, "https://blit.sh/docs");
+    expect(dy).not.toBeNull();
+
+    // Alt-Tab away with the pointer still resting on the link.
+    await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+    await page.waitForTimeout(300);
+    expect(await hoveredTarget(page)).toBeNull();
+  });
+
   test("a script-scheme target is blocked with no way to open it", async ({
     page,
   }) => {

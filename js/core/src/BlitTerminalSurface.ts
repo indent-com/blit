@@ -2969,7 +2969,48 @@ export class BlitTerminalSurface {
       }
     };
 
+    /**
+     * Forget the hovered link.
+     *
+     * `handleHoverMove` only fires while the pointer is over the surface, so
+     * every way of stopping being over a link *without* crossing another cell
+     * first — leaving the element, the window losing focus, the pane being
+     * torn down — has to say so explicitly. Otherwise the status-bar preview
+     * outlives the thing it describes and sits on top of the focused pane's
+     * identity indefinitely.
+     *
+     * `lastHoverUrl` is reset too, or re-entering the same link would compare
+     * equal and never re-emit. That in turn is why the cursor is reset here:
+     * coming back onto a *non*-link cell computes `null !== null`, takes the
+     * unchanged path, and would otherwise keep the pointer cursor.
+     *
+     * `redraw` is false during teardown, where there is no surface left to
+     * draw into — `dispose()` detaches before it sets `disposed`, so
+     * `scheduleRender` would still queue a frame.
+     */
+    const clearHover = (redraw: boolean) => {
+      lastHoverUrl = null;
+      if (!this.hoveredUrl) return;
+      this.hoveredUrl = null;
+      this.emitLinkHover(null);
+      if (redraw) {
+        this.setCursor(target, "text");
+        this.scheduleRender();
+      }
+    };
+
+    /**
+     * Also bound to `scroll`: content moving under a stationary pointer fires
+     * no `mousemove`, so the preview would keep naming a link that has since
+     * scrolled elsewhere. A click re-runs the hit test and so stays correct,
+     * but a preview that disagrees with what the click would open is exactly
+     * the confusion the preview exists to prevent. Dropping it is the honest
+     * answer — the next pointer move re-establishes it.
+     */
+    const handleHoverInvalidated = () => clearHover(true);
+
     const handleBlur = () => {
+      clearHover(true);
       if (mouseDownButton >= 0) {
         if (this._sessionId !== null && this.status === "connected") {
           this._workspace?.sendMouse(
@@ -3198,6 +3239,10 @@ export class BlitTerminalSurface {
     target.addEventListener("mousedown", handleMouseDown);
     window.addEventListener("mousemove", handleMouseMove);
     target.addEventListener("mousemove", handleHoverMove);
+    target.addEventListener("mouseleave", handleHoverInvalidated);
+    target.addEventListener("scroll", handleHoverInvalidated, {
+      passive: true,
+    });
     window.addEventListener("mouseup", handleMouseUp);
     window.addEventListener("blur", handleBlur);
     target.addEventListener("wheel", handleCanvasWheel, { passive: false });
@@ -3212,11 +3257,16 @@ export class BlitTerminalSurface {
       target.removeEventListener("mousedown", handleMouseDown);
       window.removeEventListener("mousemove", handleMouseMove);
       target.removeEventListener("mousemove", handleHoverMove);
+      target.removeEventListener("mouseleave", handleHoverInvalidated);
+      target.removeEventListener("scroll", handleHoverInvalidated);
       window.removeEventListener("mouseup", handleMouseUp);
       window.removeEventListener("blur", handleBlur);
       target.removeEventListener("wheel", handleCanvasWheel);
       target.removeEventListener("contextmenu", handleContextMenu);
       target.removeEventListener("click", handleClick);
+      // After the listeners, so nothing can re-establish it, but while the
+      // hover listeners are still subscribed so the host clears its preview.
+      clearHover(false);
       if (this.scrollFadeTimer) clearTimeout(this.scrollFadeTimer);
       stopAutoScroll();
     };
