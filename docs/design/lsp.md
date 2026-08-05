@@ -119,8 +119,8 @@ which is what they get when the family is on and the id is unknown.
 
 ### Statuses
 
-The [common status registry](../protocol.md#common-status-registry), including
-the LSP-specific common status allocated by this design:
+The [git.md](git.md) status table (codes 0–9, same numbers, same
+semantics where they overlap) plus one addition:
 
 ```text
 10 WARMING   the backing server has not finished initialize/indexing;

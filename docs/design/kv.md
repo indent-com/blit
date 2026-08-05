@@ -41,9 +41,8 @@ gateway config onto the server that owns the paths
 
 The design reuses the family standards wholesale: BLAKE3-128
 content-hash CAS with the zero-hash absent sentinel
-([fs-write.md](fs-write.md) § Conflict model), the
-[common status registry](../protocol.md#common-status-registry), nonce
-request/response with one reply per nonce,
+([fs-write.md](fs-write.md) § Conflict model), the unified status table
+([git.md](git.md)), nonce request/response with one reply per nonce,
 `inline_max` + fetch for large values ([fs-watch.md](fs-watch.md)), and
 echo attribution by hash, not token. A reader who knows the fs family
 already knows this one.
@@ -91,8 +90,8 @@ new value hash (zero for a delete). The client never hashes; it chains
 CAS off returned hashes (`lastWrittenHash` discipline, including the
 echo-suppression rule below).
 
-**Statuses** use the
-[common status registry](../protocol.md#common-status-registry). `KV_PUT` can answer
+**Statuses** are the unified table ([git.md](git.md)) plus lsp's `10
+WARMING` convention and fs-write's `11 CONFLICT`. `KV_PUT` can answer
 `OK`, `CONFLICT`, `TOO_LARGE`, `BUDGET`, `PERMISSION`, `INVALID`.
 `KV_FETCH` of an absent key is `NOT_FOUND`.
 

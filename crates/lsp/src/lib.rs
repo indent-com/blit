@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use blit_remote::lsp::{
-    LSP_STATUS_BUDGET, LSP_STATUS_INVALID, LSP_STATUS_NOT_FOUND, LSP_STATUS_OK, LSP_STATUS_OTHER,
-    LspServersRecord, append_lsp_servers_record, msg_lsp_servers_resp, msg_lsp_stopped,
+    LSP_STATUS_BUDGET, LSP_STATUS_NOT_FOUND, LSP_STATUS_OK, LSP_STATUS_OTHER, LspServersRecord,
+    append_lsp_servers_record, msg_lsp_servers_resp, msg_lsp_stopped,
 };
 
 mod attach;
@@ -215,7 +215,7 @@ pub(crate) fn reacquire(
 /// so a client "learns what to install" at open time.
 pub fn prepare(path: &str) -> Result<(Prepared, String, String), (u8, String)> {
     if path.is_empty() || path.contains('\0') {
-        return Err((LSP_STATUS_INVALID, "invalid path".into()));
+        return Err((LSP_STATUS_OTHER, "invalid path".into()));
     }
     let start = Path::new(path);
     if !start.exists() {
