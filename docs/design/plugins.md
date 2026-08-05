@@ -26,7 +26,7 @@ is launched again after a blit server restart.
 A plugin is an **in-process logical blit client**. It exchanges ordinary
 blit packets with the same packet dispatcher as a network client, but does
 not open a socket and does not use transport framing. Its complete host ABI
-is a packet send operation and a resumable packet receive operation. It gets
+is a packet send operation and a blocking packet receive operation. It gets
 the same initial `HELLO` / `LIST` / `READY` sequence and can use every blit
 protocol family allowed by its delegated client authority.
 
@@ -83,7 +83,7 @@ be processes attached to PTYs.
 - Let authorized clients spawn and control non-PTY server processes with
   bounded stdin, stdout, and stderr streams.
 - Keep the Wasm host ABI very small and versioned.
-- Suspend idle plugins without occupying an OS thread.
+- Give each running plugin attempt its own named OS thread.
 - Bound CPU, memory, open resources, message queues, and output.
 - Make plugin disconnect cleanup identical to client disconnect cleanup.
 - Preserve the existing protocol rule: new feature bits and opcodes; no
@@ -247,14 +247,15 @@ transport framing: the first copied byte is the blit opcode.
 - zero means the logical endpoint closed;
 - a negative result `-N` means the next packet needs `N` bytes and remains at
   the head of the mailbox;
-- when no packet is available, the host suspends the Wasm call. It writes and
-  resumes the call only when a packet arrives or cancellation wins.
+- when no packet is available, `recv` parks the dedicated plugin thread; after
+  a packet arrives or cancellation wins, that same thread copies into guest
+  memory and returns from the host call.
 
 The 16 MiB blit logical-message cap keeps the negative required length within
 `i32`. The SDK normally maintains a reusable buffer, so the resize case is
 rare.
 
-`send` may also suspend when the endpoint's inbound byte window is full.
+`send` may also block when the endpoint's inbound byte window is full.
 This preserves ordering and backpressure without busy polling.
 
 No separate argument, logging, timer, process, or capability-discovery imports
@@ -309,23 +310,65 @@ let reply = postcard::from_bytes(&peer.recv()?)?;
 The low-level API remains available so a plugin is never blocked on the SDK
 having wrapped a newly added blit opcode.
 
-### Scheduling
+### Dedicated execution thread
+
+Each running plugin attempt owns exactly one OS thread, never shared with
+another plugin. The async supervisor creates a fresh thread for each attempt;
+autorestarts therefore get a new OS thread with the same plugin-derived name.
+A plugin in `QUEUED`, `BACKOFF`, or terminal `STOPPED`, or one which is
+disabled or removed, owns no thread. At most one attempt and thread exist for
+a plugin at a time.
 
 Wasmi execution never occurs on a server async executor thread and never
-occurs under a server lock. Each attempt is driven as a resumable task:
+occurs under a server lock. The async logical endpoint and synchronous plugin
+thread communicate through two bounded in-process queues:
 
-1. give the store one fuel slice;
-2. run or resume `blit_main`;
-3. on empty `recv`, retain the resumable host-trap continuation and await the
-   endpoint mailbox;
-4. on fuel exhaustion, retain the resumable out-of-fuel continuation and
-   requeue it fairly;
-5. on completion, trap, deadline, or cancellation, destroy the endpoint and
-   report `PLUGIN_EXIT`.
+1. the plugin thread instantiates the attempt and calls `blit_main`;
+2. `blit_v1.send` copies a packet into the plugin-to-endpoint queue, blocking
+   under its byte-window backpressure;
+3. `blit_v1.recv` blocks the plugin thread on the endpoint-to-plugin queue
+   until a packet arrives or cancellation closes it;
+4. fuel exhaustion returns control to the thread driver, which checks total
+   fuel, deadline, and cancellation before replenishing the next slice;
+5. completion, trap, limit, or cancellation destroys the attempt endpoint,
+   reports `PLUGIN_EXIT`, and ends the thread; the async supervisor then stops,
+   waits in backoff, or creates a fresh thread for the next attempt.
 
-Wasmi exposes both resumable host traps and resumable out-of-fuel calls. This
-lets idle tasks consume no dedicated thread and lets compute-heavy tasks yield
-without relying solely on a distant total-fuel limit.
+An empty receive parks the dedicated thread without consuming CPU; restart
+backoff uses the async supervisor and consumes no plugin thread. The deliberate
+memory and scheduling cost is bounded by the concurrent-plugin limit. A
+thread-spawn failure reports a structured resource failure and never panics
+the server.
+
+### Thread names
+
+Plugin thread names are diagnostic, not identity or authorization. The full
+logical name is:
+
+```text
+blit-plugin:<label>#<short-plugin-id>
+```
+
+`label` is chosen from the explicit invocation or durable name, then the
+manifest name, then the module hash prefix. User-controlled labels are
+converted to printable ASCII, separators are collapsed, and path components,
+control characters, and secrets are never included. The stable plugin ID
+suffix distinguishes concurrent transient instances of the same module.
+
+A shared helper compacts that logical name for each platform while retaining
+the component prefix and ID suffix. For example, a Linux-sized name might be
+`blit-p:bui-7f2a`, while a platform with a larger limit can expose
+`blit-plugin:builder#7f2a`. Failure to set a descriptive OS name falls back to
+`blit-plugin` and does not prevent execution. The full logical name remains
+available in server diagnostics and logs.
+
+The same helper and `blit-<component>[-<role>][-<short-id>]` convention should
+be used throughout blit. Long-lived explicit threads must be created with
+`std::thread::Builder::name`; Tokio runtimes should use `thread_name` or
+`thread_name_fn`. Existing named threads can retain compatible names, while
+unnamed runtime workers and ad-hoc filesystem, Git, LSP, CLI-input, and child
+reaper threads should be migrated as a mechanical follow-up. Thread names
+must remain observational: protocol behavior never depends on them.
 
 ## Content-addressed execution
 
@@ -474,7 +517,7 @@ Run phases:
 | ----- | ------------- | -------------------------------------------------------- |
 | 1     | `NEED_OBJECT` | Object absent; one uploader should send it               |
 | 2     | `VALIDATING`  | Bytes complete; hash/import/manifest validation          |
-| 3     | `QUEUED`      | Valid attempt waiting for a scheduler slot               |
+| 3     | `QUEUED`      | Valid attempt waiting for an execution slot               |
 | 4     | `RUNNING`     | `task_id` is live and its logical client exists          |
 | 5     | `BACKOFF`     | Supervisor will start another attempt at the stated time |
 | 6     | `STOPPED`     | No attempt is running or scheduled                       |
@@ -855,37 +898,38 @@ Channels expose a safe form of this identity to peers.
 
 Defaults are policy, not ABI, but the first implementation should enforce:
 
-| Resource                      | Suggested default |
-| ----------------------------- | ----------------- |
-| Raw module                    | 16 MiB            |
-| Linear memory                 | 64 MiB            |
-| Tables                        | 4                 |
-| Instances                     | 1                 |
-| Fuel per scheduler turn       | 1 million         |
-| Total fuel                    | 100 million       |
-| Attached deadline             | 5 minutes         |
-| Concurrent attempts           | 16                |
-| Persistent definitions        | 128               |
-| Open endpoint resources       | 64                |
-| Concurrent child processes    | 8 per endpoint    |
-| Inbound/outbound mailbox each | 4 MiB             |
-| Process stream window         | 1 MiB each        |
-| Process aggregate output      | 64 MiB            |
-| Retained plugin events        | 1 MiB             |
-| One channel message           | 4 MiB             |
-| One state value               | 4 MiB             |
-| One topic event               | 1 MiB             |
+| Resource                       | Suggested default |
+| ------------------------------ | ----------------- |
+| Raw module                     | 16 MiB            |
+| Linear memory                  | 64 MiB            |
+| Tables                         | 4                 |
+| Instances                      | 1                 |
+| Fuel per driver slice          | 1 million         |
+| Total fuel                     | 100 million       |
+| Attached deadline              | 5 minutes         |
+| Concurrent plugin threads      | 16                |
+| Native stack per plugin thread | 2 MiB             |
+| Persistent definitions         | 128               |
+| Open endpoint resources        | 64                |
+| Concurrent child processes     | 8 per endpoint    |
+| Inbound/outbound mailbox each  | 4 MiB             |
+| Process stream window          | 1 MiB each        |
+| Process aggregate output       | 64 MiB            |
+| Retained plugin events         | 1 MiB             |
+| One channel message            | 4 MiB             |
+| One state value                | 4 MiB             |
+| One topic event                | 1 MiB             |
 
 Wasmi store limits enforce memory/table/instance growth. Fuel limits pure
 computation. Host calls charge additional fuel proportional to copied bytes.
 Wall-clock deadlines include time awaiting server operations unless policy
 says otherwise.
 
-Cancellation marks the endpoint first, wakes a suspended receive, and refuses
+Cancellation marks the endpoint first, wakes a blocked receive, and refuses
 new sends. A running fuel slice reaches cancellation at its next yield; the
 slice bound is therefore also cancellation-latency policy. Host panics are
-caught at the task boundary and reported as `HOST_FAILURE`; they must not
-unwind into server code.
+caught at the plugin thread boundary and reported as `HOST_FAILURE`; they must
+not unwind into server code.
 
 The server must validate all plugin packets exactly as it validates
 network packets. In-process origin is not trusted origin.
@@ -990,11 +1034,14 @@ JSON is convenient for debugging but expensive for bulk bytes, ambiguous for
 integer widths, and a second protocol. Channel application payloads may use
 JSON voluntarily; core client operations remain binary blit packets.
 
-### Thread per plugin
+### Shared plugin worker pool
 
-Long-lived plugins will often wait on channels. Blocking one OS thread per
-idle plugin scales poorly. Resumable host traps make the task mailbox a
-scheduler wakeup instead.
+A shared pool uses fewer native stacks for mostly idle plugins, but makes
+thread-level profiling, crash attribution, debugger inspection, and resource
+ownership less direct. Dedicated named threads are intentionally simpler to
+operate. The concurrent-plugin cap bounds their native memory cost, and
+blocked receives park without consuming CPU; restart backoff owns no plugin
+thread at all.
 
 ### State represented as a one-message topic
 
@@ -1005,23 +1052,28 @@ two modes implicitly.
 
 ## Implementation plan
 
-1. **Packet endpoint refactor.** Extract logical client creation, packet
+1. **Thread naming.** Add the platform-aware shared naming helper, name blit's
+   Tokio workers and currently unnamed explicit threads, and test sanitizing,
+   compaction, and stable ID suffixes.
+2. **Packet endpoint refactor.** Extract logical client creation, packet
    dispatch, bounded outbox, authorization hooks, and common disconnect.
-2. **Native channels.** Implement the `0x95` channel registry, flow control,
+3. **Native channels.** Implement the `0x95` channel registry, flow control,
    identity, cleanup, codecs, and CLI protocol tests.
-3. **State and topics.** Implement `0x96`, snapshot-before-live ordering,
+4. **State and topics.** Implement `0x96`, snapshot-before-live ordering,
    revision CAS, bounded retention, coalescing, and gap tests.
-4. **Processes.** Implement the `0xC0` through `0xC5` process family,
+5. **Processes.** Implement the `0xC0` through `0xC5` process family,
    per-stream flow control, concurrent pipe draining, process-tree cleanup,
    policy enforcement, codecs, and protocol tests from a network client.
-5. **Plugin objects.** Implement BLAKE3 run probe, chunk upload,
+6. **Plugin objects.** Implement BLAKE3 run probe, chunk upload,
    validation, persistent CAS, pending-run single-flight, and cache limits.
-6. **Supervisor.** Add stable plugin/attempt identity, restart policy,
+7. **Supervisor.** Add stable plugin/attempt identity, restart policy,
    backoff, durable desired state, startup restoration, and crash-safe control.
-7. **Wasmi host.** Add `blit_v1`, store/fuel limits, resumable receive and
-   fuel scheduling, attempt lifecycle, and event retention.
-8. **Rust SDK and CLI.** Add `blit-guest`, a Rust example plugin, `blit run`,
+8. **Wasmi host.** Add one named thread per running plugin attempt, bounded
+   endpoint queues, store/fuel limits, cancellation, attempt lifecycle, and
+   event retention.
+9. **Rust SDK and CLI.** Add `blit-guest`, a Rust example plugin, `blit run`,
    process wrappers, and plugin control commands.
+
 Each phase has a vertical protocol test with at least two logical clients.
 The plugin phases additionally verify cache hit (no upload), cache miss,
 hash mismatch, invalid imports, fuel exhaustion, cancellation, cleanup after a
