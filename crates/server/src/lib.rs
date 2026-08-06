@@ -592,6 +592,15 @@ struct SharedCompositor {
     /// when the Wayland client sets `xdg_geometry` (e.g. excluding a
     /// title bar), so we compare against the actually-requested values.
     last_configured_size: HashMap<u16, (u16, u16, u16)>,
+    /// Instant of the last resize actually handed to the compositor, per
+    /// surface.  Opens that surface's settle window; see
+    /// `SURFACE_RESIZE_SETTLE`.
+    last_resize_at: HashMap<u16, Instant>,
+    /// The most recent size requested for a surface while its settle window
+    /// was still open.  Dispatched by `flush_due_resizes` once the window
+    /// closes; overwritten (not queued) by every further request, so a drag
+    /// costs one configure per window rather than one per frame.
+    pending_resize: HashMap<u16, (u16, u16, u16)>,
     /// Authoritative compositor native (physical) size per surface, set from
     /// `CompositorEvent::SurfaceResized`.  Used by the per-client encode
     /// target computation as the `(native_w, native_h)` clamp.
@@ -627,6 +636,118 @@ struct SharedCompositor {
     /// cooldown so we don't spin on persistent failures.
     #[cfg(target_os = "linux")]
     last_audio_restart: Option<Instant>,
+}
+
+/// How long a surface's resize settle window stays open.  The first resize
+/// of a window is dispatched immediately — a lone resize, and the start of a
+/// drag, react at RTT rather than waiting out a timer — and everything that
+/// arrives while the window is open is coalesced into a single configure at
+/// the end of it.
+///
+/// This bounds compositor configure cycles (and the encoder recreation, hence
+/// keyframe, that a size change forces) to one per surface per window, no
+/// matter how fast sizes arrive.  It has to live here rather than only in the
+/// client: the mediated size is a minimum across *all* subscribers, so a
+/// second viewer resizing can churn a surface no single client is dragging,
+/// and non-browser clients reach `C2S_SURFACE_RESIZE` with no debounce at all.
+const SURFACE_RESIZE_SETTLE: Duration = Duration::from_millis(100);
+
+/// What to do with a requested surface size.  Split out from
+/// `Session::resize_surface` so the policy is testable without a live
+/// compositor.
+#[derive(Debug, PartialEq, Eq)]
+enum ResizeAction {
+    /// Already the size we last asked for — nothing to send.
+    Ignore,
+    /// Inside the settle window: keep it and let `tick` send it later.
+    Hold,
+    /// Send it now and open a new settle window.
+    Dispatch,
+}
+
+fn resize_action(
+    last_configured: Option<(u16, u16, u16)>,
+    last_resize_at: Option<Instant>,
+    now: Instant,
+    requested: (u16, u16, u16),
+) -> ResizeAction {
+    // Compare against the last *requested* dimensions, not the composited
+    // output dimensions (`info.width`/`info.height`).  The composited output
+    // may be smaller when the Wayland client sets xdg_geometry (e.g. Chromium
+    // excludes the title bar), so comparing against it would make every
+    // resize look like a change, flooding the compositor with redundant
+    // configures and re-creating the encoder (keyframe) on every tick during
+    // a drag-resize.
+    if last_configured == Some(requested) {
+        return ResizeAction::Ignore;
+    }
+    match last_resize_at {
+        Some(t) if now.duration_since(t) < SURFACE_RESIZE_SETTLE => ResizeAction::Hold,
+        _ => ResizeAction::Dispatch,
+    }
+}
+
+impl SharedCompositor {
+    /// Hand a resize to the compositor and open a fresh settle window.
+    fn dispatch_resize(
+        &mut self,
+        surface_id: u16,
+        width: u16,
+        height: u16,
+        scale_120: u16,
+        now: Instant,
+    ) {
+        self.pending_resize.remove(&surface_id);
+        self.last_configured_size
+            .insert(surface_id, (width, height, scale_120));
+        self.last_resize_at.insert(surface_id, now);
+        let _ = self
+            .handle
+            .command_tx
+            .send(CompositorCommand::SurfaceResize {
+                surface_id,
+                width,
+                height,
+                scale_120,
+            });
+        // Commands are only drained at the top of the compositor's event
+        // loop, which is otherwise parked in `dispatch()` for up to a
+        // second.  Every other command site wakes it; this one did not, so
+        // a configure sat in the queue until something unrelated ran the
+        // loop — a Wayland event, the next blanket `RequestFrame`, or a
+        // pointer/key event from the very surface being resized.  That last
+        // one is why a resize looked like it only took effect once you
+        // interacted with the window.
+        self.handle.wake();
+    }
+
+    /// Dispatch every held-back resize whose settle window has closed.
+    /// Returns the earliest instant at which a still-held resize comes due,
+    /// so the delivery loop can park until exactly then.
+    fn flush_due_resizes(&mut self, now: Instant) -> Option<Instant> {
+        if self.pending_resize.is_empty() {
+            return None;
+        }
+        let mut next: Option<Instant> = None;
+        let sids: Vec<u16> = self.pending_resize.keys().copied().collect();
+        for sid in sids {
+            let due_at = self
+                .last_resize_at
+                .get(&sid)
+                .map(|&t| t + SURFACE_RESIZE_SETTLE);
+            match due_at {
+                Some(due) if due > now => {
+                    next = Some(next.map_or(due, |n: Instant| n.min(due)));
+                }
+                _ => {
+                    if let Some(&(w, h, s)) = self.pending_resize.get(&sid) {
+                        self.dispatch_resize(sid, w, h, s, now);
+                    }
+                }
+            }
+        }
+        next
+    }
 }
 
 fn encode_rgba_to_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
@@ -2572,6 +2693,8 @@ impl Session {
                 pixel_generation: 0,
                 last_blanket_frame_request: Instant::now(),
                 last_configured_size: HashMap::new(),
+                last_resize_at: HashMap::new(),
+                pending_resize: HashMap::new(),
                 native_sizes: HashMap::new(),
                 #[cfg(target_os = "linux")]
                 audio_pipeline,
@@ -2910,50 +3033,52 @@ impl Session {
         Some((pw.max(1), ph.max(1), s as u16))
     }
 
+    /// Ask the compositor for a new surface size, subject to the settle
+    /// window in `SURFACE_RESIZE_SETTLE`.  Returns true if the compositor was
+    /// told right away; a false return may still mean the size was recorded
+    /// and will be dispatched by `flush_due_resizes`.
     fn resize_surface(&mut self, surface_id: u16, width: u16, height: u16, scale_120: u16) -> bool {
+        let now = Instant::now();
         let cs = match self.compositor.as_mut() {
             Some(cs) => cs,
             None => return false,
         };
-        // Dedup against the last *requested* dimensions, not the composited
-        // output dimensions (`info.width`/`info.height`).  The composited
-        // output may be smaller when the Wayland client sets xdg_geometry
-        // (e.g. Chromium excludes the title bar), so comparing against it
-        // would cause every resize to look like a change, flooding the
-        // compositor with redundant configures and re-creating the encoder
-        // (keyframe) on every tick during a drag-resize.
-        if let Some(&(lw, lh, ls)) = cs.last_configured_size.get(&surface_id)
-            && lw == width
-            && lh == height
-            && ls == scale_120
-        {
-            return false;
+        match resize_action(
+            cs.last_configured_size.get(&surface_id).copied(),
+            cs.last_resize_at.get(&surface_id).copied(),
+            now,
+            (width, height, scale_120),
+        ) {
+            ResizeAction::Ignore => {
+                // A drag that ends back where it started leaves nothing to
+                // do.  Drop the held size rather than replaying it later,
+                // which would configure the surface to a stale intermediate.
+                cs.pending_resize.remove(&surface_id);
+                false
+            }
+            ResizeAction::Hold => {
+                // Keep only the latest size; the delivery loop dispatches it
+                // when the window closes.
+                cs.pending_resize
+                    .insert(surface_id, (width, height, scale_120));
+                false
+            }
+            ResizeAction::Dispatch => {
+                cs.dispatch_resize(surface_id, width, height, scale_120, now);
+                true
+            }
         }
-        cs.last_configured_size
-            .insert(surface_id, (width, height, scale_120));
-        let _ = cs.handle.command_tx.send(CompositorCommand::SurfaceResize {
-            surface_id,
-            width,
-            height,
-            scale_120,
-        });
-        // Commands are only drained at the top of the compositor's event
-        // loop, which is otherwise parked in `dispatch()` for up to a
-        // second.  Every other command site wakes it; this one did not, so
-        // a configure sat in the queue until something unrelated ran the
-        // loop — a Wayland event, the next blanket `RequestFrame`, or a
-        // pointer/key event from the very surface being resized.  That last
-        // one is why a resize looked like it only took effect once you
-        // interacted with the window.
-        cs.handle.wake();
-        true
     }
 
+    /// Returns true if any surface is left holding a resize for its settle
+    /// window.  Those are dispatched only by `tick`, so a caller outside the
+    /// delivery loop must nudge it — mirrors `resize_ptys_to_mediated_sizes`.
     fn resize_surfaces_to_mediated_sizes<I>(
         &mut self,
         surface_ids: I,
         encoder_preferences: &[SurfaceEncoderPreference],
-    ) where
+    ) -> bool
+    where
         I: IntoIterator<Item = u16>,
     {
         let mut seen = HashSet::new();
@@ -2981,6 +3106,9 @@ impl Session {
                 self.resize_surface(sid, w, h, scale_120);
             }
         }
+        self.compositor
+            .as_ref()
+            .is_some_and(|cs| !cs.pending_resize.is_empty())
     }
 
     fn pty_list_msg(&self) -> Vec<u8> {
@@ -4047,6 +4175,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                     last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
                     last_encoded_remove_for_sid(&mut cs.last_encoded, surface_id);
                     cs.last_configured_size.remove(&surface_id);
+                    cs.last_resize_at.remove(&surface_id);
+                    cs.pending_resize.remove(&surface_id);
                     cs.native_sizes.remove(&surface_id);
                     invalidate_client_encoders.push(surface_id);
                     broadcast.push(msg_surface_destroyed(surface_id));
@@ -6536,6 +6666,15 @@ async fn tick(state: &AppState) -> TickOutcome {
                 }
             }
         }
+    }
+
+    // Dispatch resizes whose settle window closed, and park until the next
+    // one comes due.  Done last so sizes armed earlier in this same tick —
+    // `receilinged_surfaces` after an encoder is created — are accounted for.
+    if let Some(cs) = sess.compositor.as_mut()
+        && let Some(due) = cs.flush_due_resizes(now)
+    {
+        next_deadline = Some(next_deadline.map_or(due, |d: Instant| d.min(due)));
     }
 
     // Guarantee the tick loop wakes up at least every blanket interval
@@ -10476,10 +10615,16 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     s.next_send_at = None;
                     s.has_keyframe = false;
                 }
-                sess.resize_surfaces_to_mediated_sizes(
+                if sess.resize_surfaces_to_mediated_sizes(
                     std::iter::once(surface_id),
                     &state.config.surface_encoders,
-                );
+                ) {
+                    // The resize is held for the settle window, and only
+                    // `tick` dispatches it.  On an otherwise idle session
+                    // nothing else would run one, so the last size of a drag
+                    // would sit undelivered until unrelated traffic arrived.
+                    nudge_delivery(&state);
+                }
             }
             C2S_SURFACE_FOCUS if data.len() >= 3 => {
                 let surface_id = u16::from_le_bytes([data[1], data[2]]);
@@ -10673,10 +10818,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     );
                     cs.handle.wake();
                 }
-                sess.resize_surfaces_to_mediated_sizes(
+                if sess.resize_surfaces_to_mediated_sizes(
                     std::iter::once(surface_id),
                     &state.config.surface_encoders,
-                );
+                ) {
+                    // As above: losing a subscriber raises the mediated size,
+                    // and that resize can land inside an open settle window.
+                    nudge_delivery(&state);
+                }
             }
             #[cfg(target_os = "linux")]
             C2S_AUDIO_SUBSCRIBE if data.len() >= 3 => {
@@ -11221,7 +11370,10 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         if sess.resize_ptys_to_mediated_sizes(affected_ptys) {
             need_nudge = true;
         }
-        sess.resize_surfaces_to_mediated_sizes(affected_surfaces, &state.config.surface_encoders);
+        if sess.resize_surfaces_to_mediated_sizes(affected_surfaces, &state.config.surface_encoders)
+        {
+            need_nudge = true;
+        }
         // Release any keys this client was holding when it disconnected.
         // Without this, modifier keys (Shift, Ctrl, etc.) stay stuck and
         // regular keys auto-repeat forever in the compositor.
@@ -12490,6 +12642,114 @@ mod tests {
         session.clients.insert(1, c1);
         session.clients.insert(2, c2);
         assert_eq!(session.mediated_size_for_pty(7), Some((24, 100)));
+    }
+
+    /// The first resize of a surface goes out immediately. Waiting out the
+    /// settle window first would add its full latency to every isolated
+    /// resize — a pane opening, a one-shot `blit surface capture --width`,
+    /// the first frame of a drag — for no coalescing benefit, since there is
+    /// nothing yet to coalesce with.
+    #[test]
+    fn first_surface_resize_dispatches_immediately() {
+        assert_eq!(
+            resize_action(None, None, Instant::now(), (800, 600, 120)),
+            ResizeAction::Dispatch
+        );
+    }
+
+    /// Everything arriving while the window is open is held, so a drag costs
+    /// one configure (and one encoder rebuild, hence one keyframe) per
+    /// window instead of one per frame.
+    #[test]
+    fn surface_resize_inside_the_settle_window_is_held() {
+        let t0 = Instant::now();
+        assert_eq!(
+            resize_action(
+                Some((800, 600, 120)),
+                Some(t0),
+                t0 + SURFACE_RESIZE_SETTLE / 2,
+                (801, 600, 120),
+            ),
+            ResizeAction::Hold
+        );
+    }
+
+    /// Once the window closes the next resize dispatches on arrival, so a
+    /// sustained drag tracks at one configure per window rather than
+    /// freezing until the user lets go.
+    #[test]
+    fn surface_resize_after_the_settle_window_dispatches() {
+        let t0 = Instant::now();
+        assert_eq!(
+            resize_action(
+                Some((800, 600, 120)),
+                Some(t0),
+                t0 + SURFACE_RESIZE_SETTLE,
+                (801, 600, 120),
+            ),
+            ResizeAction::Dispatch
+        );
+    }
+
+    /// The same thing against a live compositor rather than the policy
+    /// function: the leading resize reaches it on arrival, a burst behind it
+    /// collapses to a single held size rather than a queue, and closing the
+    /// window delivers that one size.
+    ///
+    /// Multi-threaded because `ensure_compositor` starts the audio pipeline,
+    /// which spawns blocking work.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn surface_resize_burst_collapses_to_one_configure() {
+        let mut session = Session::new();
+        session.ensure_compositor(false, Arc::new(|| {}), "");
+
+        // Leading edge: out at once, nothing held.
+        assert!(session.resize_surface(1, 800, 600, 120));
+        let cs = session.compositor.as_mut().unwrap();
+        assert_eq!(cs.last_configured_size.get(&1), Some(&(800, 600, 120)));
+        assert!(cs.pending_resize.is_empty());
+
+        // A drag's worth of sizes behind it, all inside the window.
+        for w in 801..=850 {
+            assert!(!session.resize_surface(1, w, 600, 120));
+        }
+        let cs = session.compositor.as_mut().unwrap();
+        assert_eq!(cs.pending_resize.get(&1), Some(&(850, 600, 120)));
+        assert_eq!(
+            cs.last_configured_size.get(&1),
+            Some(&(800, 600, 120)),
+            "the compositor must still be on the leading-edge size"
+        );
+
+        // Still inside the window: nothing goes out, and the caller is told
+        // when to come back.
+        let opened_at = cs.last_resize_at[&1];
+        let due = cs.flush_due_resizes(opened_at);
+        assert_eq!(due, Some(opened_at + SURFACE_RESIZE_SETTLE));
+        assert_eq!(cs.last_configured_size.get(&1), Some(&(800, 600, 120)));
+
+        // Window closed: the last size of the drag goes out, once.
+        assert_eq!(
+            cs.flush_due_resizes(opened_at + SURFACE_RESIZE_SETTLE),
+            None
+        );
+        assert_eq!(cs.last_configured_size.get(&1), Some(&(850, 600, 120)));
+        assert!(cs.pending_resize.is_empty());
+    }
+
+    /// Asking for the size the compositor was last given is a no-op whether
+    /// or not the window is open — and it must beat the window check, so a
+    /// drag that returns to its starting size clears the held intermediate
+    /// instead of configuring to it after the fact.
+    #[test]
+    fn surface_resize_to_the_current_size_is_ignored() {
+        let t0 = Instant::now();
+        for now in [t0 + SURFACE_RESIZE_SETTLE / 2, t0 + SURFACE_RESIZE_SETTLE] {
+            assert_eq!(
+                resize_action(Some((800, 600, 120)), Some(t0), now, (800, 600, 120)),
+                ResizeAction::Ignore
+            );
+        }
     }
 
     /// A lone viewer must get back exactly the size it asked for. The
