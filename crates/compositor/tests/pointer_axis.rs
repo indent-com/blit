@@ -344,6 +344,37 @@ fn a_wheel_carries_detents_alongside_the_smooth_delta() {
     );
 }
 
+/// Every wheel event a browser reports that isn't provably notched now
+/// travels as `continuous`, which makes this the source most scrolls take.
+/// It has to arrive as itself: `wheel` would hand a toolkit detents to
+/// scale up by its lines-per-click factor, and `finger` is what licenses
+/// the invented momentum the labelling exists to avoid.
+#[test]
+fn a_smooth_stream_of_unknown_origin_stays_continuous() {
+    let mut f = Fixture::new();
+    let events = f.scroll(CompositorCommand::PointerAxis {
+        surface_id: f.surface_id,
+        dx: 0.0,
+        dy: 40.0,
+        v120_x: 0,
+        v120_y: 0,
+        source: Some(2), // continuous
+        stop: false,
+    });
+    assert_eq!(
+        events,
+        vec![
+            Ptr::Source(2),
+            Ptr::Axis {
+                axis: VERTICAL,
+                value: 40.0
+            },
+            Ptr::Frame,
+        ],
+        "a continuous source must reach the client as continuous"
+    );
+}
+
 #[test]
 fn a_diagonal_gesture_stays_in_one_frame() {
     let mut f = Fixture::new();
