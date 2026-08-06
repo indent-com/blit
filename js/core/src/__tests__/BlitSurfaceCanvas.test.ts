@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BlitSurfaceCanvas } from "../BlitSurfaceCanvas";
 import type { BlitWorkspace } from "../BlitWorkspace";
 import type { SurfaceAxisEvent } from "../protocol";
+import { SURFACE_POINTER_DOWN, SURFACE_POINTER_UP } from "../protocol";
 import { AXIS_SOURCE_FINGER, AXIS_SOURCE_WHEEL } from "../types";
 
 /** Minimal workspace stub: no connection, so the canvas never subscribes
@@ -93,8 +94,16 @@ function attachScrolling(
   const [fw, fh] = opts.frame ?? [800, 600];
   const [cw, ch] = opts.css ?? [800, 600];
   const sent: SurfaceAxisEvent[] = [];
+  const pointers: { type: number; button: number; x: number; y: number }[] = [];
   const conn = {
     sendSurfaceAxis2: (_id: number, ev: SurfaceAxisEvent) => sent.push(ev),
+    sendSurfacePointer: (
+      _id: number,
+      type: number,
+      button: number,
+      x: number,
+      y: number,
+    ) => pointers.push({ type, button, x, y }),
     // Only the surface geometry matters here; everything else the canvas
     // reaches for during attach() answers with an inert unsubscribe, so
     // this stub does not need updating when the store grows a method.
@@ -142,7 +151,7 @@ function attachScrolling(
     // inside the idle window so the gesture is still open.
     vi.advanceTimersByTime(FRAME_MS);
   };
-  return { surface, canvas, sent, wheel };
+  return { surface, canvas, sent, pointers, wheel };
 }
 
 /** One animation frame, as the fake clock models requestAnimationFrame. */
@@ -303,6 +312,112 @@ describe("BlitSurfaceCanvas scroll", () => {
     vi.advanceTimersByTime(500);
     vi.advanceTimersByTime(500);
     expect(sent.filter((e) => e.stop)).toHaveLength(1);
+    surface.dispose();
+  });
+});
+
+/** jsdom implements neither Touch nor TouchEvent, and the handlers only ever
+ *  reach for the identifier, the client point and the two touch lists. */
+function touchEvent(
+  type: string,
+  points: { identifier: number; clientX: number; clientY: number }[],
+  opts: { ongoing?: boolean } = {},
+): Event {
+  const list = {
+    length: points.length,
+    item: (i: number) => points[i] ?? null,
+  } as unknown as TouchList;
+  const empty = { length: 0, item: () => null } as unknown as TouchList;
+  const ev = new Event(type, { bubbles: true, cancelable: true });
+  // `touches` is what is still down, `changedTouches` what the event is
+  // about — a lift reports the finger only in the latter.
+  Object.defineProperty(ev, "touches", {
+    value: opts.ongoing === false ? empty : list,
+  });
+  Object.defineProperty(ev, "changedTouches", { value: list });
+  return ev;
+}
+
+/** jsdom has no PointerEvent either; a MouseEvent carries the same fields. */
+function pointerEvent(type: string, x: number, y: number): Event {
+  const ev = new MouseEvent(type, {
+    bubbles: true,
+    cancelable: true,
+    clientX: x,
+    clientY: y,
+  });
+  Object.defineProperty(ev, "pointerId", { value: 1 });
+  Object.defineProperty(ev, "pointerType", { value: "touch" });
+  return ev;
+}
+
+describe("BlitSurfaceCanvas touch", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({
+      toFake: [
+        "setTimeout",
+        "clearTimeout",
+        "requestAnimationFrame",
+        "cancelAnimationFrame",
+      ],
+    });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const FINGER = { identifier: 1, clientX: 40, clientY: 40 };
+
+  /**
+   * iPadOS dispatches `pointerdown` ahead of `touchstart`, so the pointer
+   * path claims the gesture and the touch handlers fall straight through
+   * their guards.  They have to cancel the touch on the way out regardless:
+   * an uncancelled `touchstart` is what licenses the browser to replay the
+   * tap as compatibility mouse events, and those reach the same canvas's
+   * mousedown/mouseup listeners as a second press and release — which the
+   * app on the far end reads as a double click.
+   */
+  it("cancels a touch the pointer path has already claimed", () => {
+    const { surface, canvas } = attachScrolling();
+
+    canvas.dispatchEvent(pointerEvent("pointerdown", 40, 40));
+    const start = touchEvent("touchstart", [FINGER]);
+    canvas.dispatchEvent(start);
+    expect(start.defaultPrevented).toBe(true);
+
+    canvas.dispatchEvent(pointerEvent("pointerup", 40, 40));
+    const end = touchEvent("touchend", [FINGER], { ongoing: false });
+    canvas.dispatchEvent(end);
+    expect(end.defaultPrevented).toBe(true);
+
+    surface.dispose();
+  });
+
+  it("sends one press and one release for a tap", () => {
+    const { surface, canvas, pointers } = attachScrolling();
+
+    canvas.dispatchEvent(pointerEvent("pointerdown", 40, 40));
+    canvas.dispatchEvent(touchEvent("touchstart", [FINGER]));
+    canvas.dispatchEvent(pointerEvent("pointerup", 40, 40));
+    canvas.dispatchEvent(touchEvent("touchend", [FINGER], { ongoing: false }));
+
+    expect(pointers.map((p) => p.type)).toEqual([
+      SURFACE_POINTER_DOWN,
+      SURFACE_POINTER_UP,
+    ]);
+    surface.dispose();
+  });
+
+  it("still drives a tap when only touch events arrive", () => {
+    const { surface, canvas, pointers } = attachScrolling();
+
+    canvas.dispatchEvent(touchEvent("touchstart", [FINGER]));
+    canvas.dispatchEvent(touchEvent("touchend", [FINGER], { ongoing: false }));
+
+    expect(pointers.map((p) => p.type)).toEqual([
+      SURFACE_POINTER_DOWN,
+      SURFACE_POINTER_UP,
+    ]);
     surface.dispose();
   });
 });

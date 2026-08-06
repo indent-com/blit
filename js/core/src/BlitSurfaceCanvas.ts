@@ -1569,32 +1569,44 @@ export class BlitSurfaceCanvas {
 
   private handleTouchStart(e: TouchEvent): void {
     if (!this.canvas || !this.surface || !this._displaySize) return;
+    // Cancel the touch default before anything else can bail out, including
+    // when the pointer-event path already owns this gesture.  Cancelling
+    // `touchstart` is what stops the browser from replaying the tap as
+    // compatibility mouse events, and on iPadOS `pointerdown` lands first
+    // and claims the gesture, so the guard below used to skip this and let
+    // a synthetic mousedown/mouseup through to handleMouse() — a second
+    // click on top of the one the gesture itself sends.  The canvas carries
+    // `touch-action: none` and owns every gesture on it, so there is no
+    // default here worth keeping.
+    e.preventDefault();
     if (this.activeTouch?.pointerId != null) return;
     if (e.touches.length !== 1) {
       this.handleTouchCancel(e);
       return;
     }
-    e.preventDefault();
     const touch = e.touches.item(0);
     if (!touch) return;
     this.startTouchGesture(touch.identifier, touch.clientX, touch.clientY);
   }
 
   private handleTouchMove(e: TouchEvent): void {
+    e.preventDefault();
     const active = this.activeTouch;
     if (!active || active.pointerId != null) return;
     const touch = this.findActiveTouch(e.touches);
     if (!touch) return;
-    e.preventDefault();
     this.moveTouchGesture(touch.clientX, touch.clientY);
   }
 
   private handleTouchEnd(e: TouchEvent): void {
+    // Same reasoning as handleTouchStart: the pointer path has usually
+    // already ended the gesture and nulled activeTouch by the time this
+    // runs, so cancel the default first or the guards below skip it.
+    e.preventDefault();
     const active = this.activeTouch;
     if (!active) return;
     const touch = this.findActiveTouch(e.changedTouches);
     if (!touch) return;
-    e.preventDefault();
     if (active.longPressTimer) clearTimeout(active.longPressTimer);
 
     if (active.mode === "drag") {
