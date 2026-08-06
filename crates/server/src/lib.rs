@@ -4414,6 +4414,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // expensive encoder teardown+creation cycles for sizes
                     // that may never actually be encoded (because a newer
                     // SurfaceCommit arrives before the next encode tick).
+                    // Compositor-resident Vulkan sessions are the
+                    // exception — nothing recreates those on demand, so
+                    // the `resized_surface_ids` pass below tears them
+                    // down explicitly.
                     broadcast.push(msg_surface_resized(surface_id, width, height));
                     resized_surface_ids.push(surface_id);
                 }
@@ -4556,16 +4560,39 @@ async fn tick(state: &AppState) -> TickOutcome {
     // the per-surface time gate (up to ~1/fps), and force a keyframe
     // so decoders recover cleanly after the dimension change.
     for sid in resized_surface_ids {
+        let mut had_vulkan = false;
         for c in sess.clients.values_mut() {
             if !c.surface_subscriptions.contains(&sid) {
                 continue;
             }
+            // A compositor-resident session is bound to the size it was
+            // built at and nothing recreates it on demand: the delivery
+            // path skips on `vulkan_await` while the compositor, whose
+            // encode image now sits at a size no composite is produced
+            // at, never emits another bitstream — the surface freezes.
+            // Drop the tracking so the next tick re-selects at the new
+            // native size.  Deliberately not `vulkan_refused`: nothing
+            // was declined, and latching would bar the rebuild.
+            had_vulkan |= c.vulkan_video_surfaces.remove(&sid).is_some();
             let s = c.surface_subs.entry(sid).or_default();
             s.burst_remaining = SURFACE_BURST_FRAMES;
             s.next_send_at = None;
             s.nal_none_streak = 0;
             s.nal_none_latched_at = None;
             s.has_keyframe = false;
+        }
+        if had_vulkan && let Some(cs) = sess.compositor.as_ref() {
+            let _ = cs.handle.command_tx.send(
+                blit_compositor::CompositorCommand::DestroyVulkanEncoder {
+                    surface_id: sid as u32,
+                    client_id: None,
+                },
+            );
+            cs.handle.wake();
+            eprintln!(
+                "[vulkan-video] teardown sid={sid}: surface resized; \
+                 sessions rebuild at the new size",
+            );
         }
     }
 

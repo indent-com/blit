@@ -692,6 +692,13 @@ impl VulkanVideoEncoder {
         self.qp
     }
 
+    /// Pre-alignment source dimensions the session was built for.  A
+    /// bitstream from this session always decodes at this size, whatever
+    /// image it was fed.
+    pub(crate) fn source_dimensions(&self) -> (u32, u32) {
+        (self.src_width, self.src_height)
+    }
+
     /// Codec flag matching `SURFACE_FRAME_CODEC_*` constants.
     /// H.264 = 0x00, AV1 = 0x02.
     pub(crate) fn codec_flag(&self) -> u8 {

@@ -6251,6 +6251,25 @@ impl VulkanRenderer {
                             _ => None,
                         }
                     });
+            if nv12_image_and_view.is_none() {
+                // Encoders exist but no encode image sits at the composite
+                // size — the surface resized under the sessions (their
+                // image is keyed at the size they were built for).  Skipped
+                // silently, this is a permanent freeze: no bitstream ever
+                // reaches the server, and no failure is counted, so the
+                // giveup path never fires either.  Count it.
+                for &cid in &encoder_cids {
+                    let n = self.vulkan_encode_failures.entry((sid, cid)).or_insert(0);
+                    *n += 1;
+                    if *n == VULKAN_ENCODE_FAILURE_LIMIT {
+                        eprintln!(
+                            "[vulkan-render] surface {sid} client {cid}: no encode image at \
+                             {phys_w}x{phys_h}; giving up on Vulkan Video",
+                        );
+                        self.vulkan_encode_giveups.push((sid, cid));
+                    }
+                }
+            }
             if let Some((nv12_img, ev)) = nv12_image_and_view {
                 let waited = unsafe {
                     self.device.wait_for_fences(
@@ -6269,6 +6288,28 @@ impl VulkanRenderer {
                 for cid in encoder_cids {
                     let encoder = self.vulkan_encoders.get_mut(&(sid, cid)).unwrap();
                     let codec_flag = encoder.codec_flag();
+                    // A session outlived the size it was built at (the
+                    // surface resized under it).  Encoding anyway would
+                    // read an image shaped differently from the coded
+                    // extent and emit a bitstream whose frames decode at
+                    // the old size while the wire header claims the new
+                    // one.  The server tears the session down on
+                    // SurfaceResized; count the skip as a failure so the
+                    // giveup path still unwedges us if that never lands.
+                    if encoder.source_dimensions() != (phys_w, phys_h) {
+                        let n = self.vulkan_encode_failures.entry((sid, cid)).or_insert(0);
+                        *n += 1;
+                        if *n == VULKAN_ENCODE_FAILURE_LIMIT {
+                            eprintln!(
+                                "[vulkan-render] surface {sid} client {cid}: session size {}x{} \
+                                 vs composite {phys_w}x{phys_h}; giving up on Vulkan Video",
+                                encoder.source_dimensions().0,
+                                encoder.source_dimensions().1,
+                            );
+                            self.vulkan_encode_giveups.push((sid, cid));
+                        }
+                        continue;
+                    }
                     let encoded = unsafe {
                         encoder.encode(
                             &self.device,

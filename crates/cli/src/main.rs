@@ -355,6 +355,7 @@ async fn async_main() {
                     duration,
                     codec,
                     size,
+                    resize_after,
                     timing,
                 } => {
                     agent::cmd_record(
@@ -366,6 +367,7 @@ async fn async_main() {
                         agent::RecordSource::Surface {
                             codecs: codec,
                             size,
+                            resize_after,
                         },
                         timing,
                     )
