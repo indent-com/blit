@@ -392,6 +392,12 @@ export class SurfaceStore {
   private static readonly OFFSET_DROP_MAX_MS = 5;
   /** Fallback display refresh interval before any rAF delta is measured. */
   private static readonly DEFAULT_REFRESH_MS = 1000 / 60;
+  /** Bounds on an rAF delta that counts as a refresh period: 1000 Hz to
+   *  10 Hz.  Outside this it is a stalled or backgrounded tick, not a
+   *  display rate — see {@link noteRafInterval} for why both ends are
+   *  this permissive. */
+  private static readonly RAF_DELTA_MIN_MS = 1;
+  private static readonly RAF_DELTA_MAX_MS = 100;
 
   /** EWMA of observed rAF intervals — the display's refresh period.  Used
    *  to round each frame's due time to the nearest refresh instead of
@@ -482,7 +488,16 @@ export class SurfaceStore {
         console.log(
           `[blit-video] recv=${d.received} decoded=${d.decoded} output=${d.output} presented=${d.presented} dropped=${d.dropped} errors=${d.errors} listeners=${this.frameListeners.size}`,
         );
-        d.received = d.decoded = d.output = d.dropped = d.errors = 0;
+        // Every counter here is per-window; one that misses this reset
+        // accumulates for the process lifetime and silently dwarfs the
+        // others, which is exactly what `presented` did.
+        d.received =
+          d.decoded =
+          d.output =
+          d.presented =
+          d.dropped =
+          d.errors =
+            0;
       }
     }, 5000);
     if (typeof document !== "undefined") {
@@ -1187,20 +1202,38 @@ export class SurfaceStore {
     });
   }
 
-  /** Track the display's refresh period from rAF deltas.  Ignores deltas
-   *  outside 4–40 ms so a throttled or backgrounded tick doesn't poison
-   *  the estimate for 240 Hz–25 Hz displays alike. */
+  /** Track the display's refresh period from rAF deltas.  Accepts anything
+   *  from {@link RAF_DELTA_MIN_MS} to {@link RAF_DELTA_MAX_MS} — 1000 Hz
+   *  down to 10 Hz — and ignores the rest as a stalled or backgrounded
+   *  tick rather than a refresh rate. */
   private noteRafInterval(): void {
     const now = performance.now();
     if (this.lastRafMs !== null) {
       const dt = now - this.lastRafMs;
-      // Floor admits up to ~666 Hz: the server accepts a reported display
-      // rate up to MAX_DISPLAY_FPS (480) and paces surfaces at it, so a
-      // 4 ms floor (250 Hz) would reject every delta on a 360/480 Hz panel
-      // and leave this pinned at the 60 Hz default — which then puts half a
-      // 60 Hz refresh of lookahead on the due-time comparison, several
-      // refreshes early at that rate.
-      if (dt >= 1.5 && dt <= 40) this.refreshMs += (dt - this.refreshMs) * 0.1;
+      // The band is wide on purpose, at both ends.
+      //
+      // Low: the server accepts a reported display rate up to
+      // MAX_DISPLAY_FPS (480) and paces surfaces at it, so anything above
+      // that is already beyond what the pipeline produces — but rejecting
+      // fast deltas is the expensive mistake.  A 4 ms floor (250 Hz) threw
+      // away every sample on a 360/480 Hz panel and left this pinned at the
+      // 60 Hz default, which then puts half a *60 Hz* refresh of lookahead
+      // on the due-time comparison — several refreshes early at that rate.
+      //
+      // High: a 10 Hz tick is a real cadence on a loaded machine or an
+      // occluded window, and the rounding window should match whatever the
+      // page is actually painting at.  The cost of admitting it is that a
+      // transient stall drags the estimate up and presents slightly early
+      // until it recovers — one 100 ms sample moves a 60 Hz estimate to
+      // ~25 ms, about 4 ms of extra lookahead, gone within ten frames at
+      // the 0.1 EWMA weight.  Cheaper than mistaking a slow display for a
+      // fast one.
+      if (
+        dt >= SurfaceStore.RAF_DELTA_MIN_MS &&
+        dt <= SurfaceStore.RAF_DELTA_MAX_MS
+      ) {
+        this.refreshMs += (dt - this.refreshMs) * 0.1;
+      }
     }
     this.lastRafMs = now;
   }

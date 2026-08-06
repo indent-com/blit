@@ -110,6 +110,25 @@ describe("SurfaceStore presenter", () => {
     expect(rafCb).toBeNull();
   });
 
+  it("resets every diagnostic counter each logging window", () => {
+    // These are per-window rates.  One counter left out of the reset
+    // accumulates for the process lifetime and silently dwarfs the rest —
+    // which `presented` did, breaking the presented-vs-output comparison
+    // it was added to provide.
+    vi.useFakeTimers();
+    const s = new SurfaceStore();
+    const diag = (s as any)._diag;
+    for (const k of Object.keys(diag)) diag[k] = 7;
+
+    vi.advanceTimersByTime(5_000);
+
+    for (const [k, v] of Object.entries((s as any)._diag)) {
+      expect(v, `counter "${k}" was not reset`).toBe(0);
+    }
+    s.destroy();
+    vi.useRealTimers();
+  });
+
   it("never engages scheduling for frames without a usable PTS", () => {
     // fakeFrame() has no timestamp.  Scheduling on NaN would mean nothing
     // ever comes due and the surface freezes, so it must stay newest-wins.
@@ -472,15 +491,33 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
     expect(cap).toBeLessThanOrEqual(26);
   });
 
-  it("measures refresh intervals faster than 250 Hz", () => {
-    // The rAF-delta filter must accept a 480 Hz panel, which the server
-    // will happily pace a surface at (MAX_DISPLAY_FPS = 480).
-    const fast = 1000 / 480;
-    for (let i = 0; i < 40; i++) {
-      clock += fast;
-      (store as any).noteRafInterval();
+  it("measures refresh intervals across the whole accepted band", () => {
+    // 1000 Hz to 10 Hz all count as real cadences.  The fast end matters
+    // most: the server will pace a surface at MAX_DISPLAY_FPS (480), and
+    // rejecting those deltas pins the estimate at the 60 Hz default, which
+    // then puts half a 60 Hz refresh of lookahead on every due-time
+    // comparison — several refreshes early at that rate.
+    for (const hz of [1000, 480, 360, 144, 60, 30, 10]) {
+      const s = new SurfaceStore();
+      const interval = 1000 / hz;
+      for (let i = 0; i < 60; i++) {
+        clock += interval;
+        (s as any).noteRafInterval();
+      }
+      expect((s as any).refreshMs).toBeCloseTo(interval, 0);
+      s.destroy();
     }
-    expect((store as any).refreshMs).toBeLessThan(5);
+  });
+
+  it("ignores rAF deltas outside the band", () => {
+    const s = new SurfaceStore();
+    const before = (s as any).refreshMs;
+    for (const dt of [0.4, 250, 5000]) {
+      clock += dt;
+      (s as any).noteRafInterval();
+    }
+    expect((s as any).refreshMs).toBe(before);
+    s.destroy();
   });
 
   it("ignores duplicate PTS when learning the frame interval", () => {
