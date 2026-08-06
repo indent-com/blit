@@ -132,6 +132,15 @@ pub(crate) struct VulkanRenderer {
     /// `(surface_id, target_w, target_h)` to mirror `external_outputs`.
     /// The `usize` is the round-robin index.
     nv12_outputs: HashMap<(u32, u32, u32), (Vec<Nv12Output>, usize)>,
+    /// NV12 buffers exported as OPAQUE_FD for the NVENC zero-copy path.
+    ///
+    /// Deliberately not `nv12_outputs`. That map is also where the
+    /// compositor parks the encode image it owns for Vulkan Video, keyed
+    /// the same `(surface, w, h)` way, and `create_nv12_outputs` destroys
+    /// whatever is at the key before inserting — so sharing it let an
+    /// NVENC target evict a live Vulkan Video encoder mid-stream and
+    /// starve its client.
+    nv12_opaque_outputs: HashMap<(u32, u32, u32), (Vec<Nv12Output>, usize)>,
 
     /// Keys in `nv12_outputs` the compositor allocated itself to feed a
     /// Vulkan Video encoder, as opposed to importing from VA-API, mapped to
@@ -1065,6 +1074,7 @@ impl VulkanRenderer {
             supported_dmabuf_modifiers,
             external_outputs: HashMap::new(),
             nv12_outputs: HashMap::new(),
+            nv12_opaque_outputs: HashMap::new(),
             owned_encode_nv12: HashMap::new(),
             vulkan_encode_failures: HashMap::new(),
             vulkan_encode_giveups: Vec::new(),
@@ -1403,6 +1413,11 @@ impl VulkanRenderer {
                         Some(nv12) => {
                             self.nv12_outputs.insert(key, (vec![nv12], 0));
                             self.owned_encode_nv12.insert(key, want);
+                            // This surface now encodes on the compositor's
+                            // own GPU, so any NVENC zero-copy target left
+                            // over from before is computing into a buffer
+                            // nothing reads.
+                            self.destroy_nv12_outputs_in(Nv12Export::OpaqueFd, surface_id, w, h);
                         }
                         None => {
                             eprintln!(
@@ -1681,6 +1696,9 @@ impl VulkanRenderer {
         native: (u32, u32),
         want_nv12_opaque: bool,
     ) {
+        // A Vulkan Video encoder on this surface encodes from its own image,
+        // so nothing would ever read the NV12 buffer we were asked for.
+        let want_nv12_opaque = want_nv12_opaque && !self.vulkan_video_owns(surface_id);
         let key = (surface_id, target_w, target_h);
         // Recorded before the early return: the same target size can be
         // asked for again against a *different* native — a surface that
@@ -2332,7 +2350,29 @@ impl VulkanRenderer {
         }
     }
 
+    /// Destroy only the outputs belonging to `export`'s map.
+    fn destroy_nv12_outputs_in(
+        &mut self,
+        export: Nv12Export,
+        surface_id: u32,
+        target_w: u32,
+        target_h: u32,
+    ) {
+        if let Some((nv12s, _)) = self
+            .nv12_dest_mut(export)
+            .remove(&(surface_id, target_w, target_h))
+        {
+            self.destroy_nv12_vec(nv12s);
+        }
+    }
+
     fn destroy_nv12_outputs_for_target(&mut self, surface_id: u32, target_w: u32, target_h: u32) {
+        if let Some((nv12s, _)) = self
+            .nv12_opaque_outputs
+            .remove(&(surface_id, target_w, target_h))
+        {
+            self.destroy_nv12_vec(nv12s);
+        }
         if let Some((nv12s, _)) = self.nv12_outputs.remove(&(surface_id, target_w, target_h)) {
             self.destroy_nv12_vec(nv12s);
         }
@@ -2347,6 +2387,7 @@ impl VulkanRenderer {
         let keys: Vec<(u32, u32, u32)> = self
             .nv12_outputs
             .keys()
+            .chain(self.nv12_opaque_outputs.keys())
             .filter(|k| k.0 == surface_id)
             .copied()
             .collect();
@@ -2354,22 +2395,56 @@ impl VulkanRenderer {
             if let Some((nv12s, _)) = self.nv12_outputs.remove(&k) {
                 self.destroy_nv12_vec(nv12s);
             }
+            if let Some((nv12s, _)) = self.nv12_opaque_outputs.remove(&k) {
+                self.destroy_nv12_vec(nv12s);
+            }
             self.owned_encode_nv12.remove(&k);
         }
     }
 
     fn destroy_all_nv12_outputs(&mut self) {
-        let all: Vec<Vec<Nv12Output>> = self.nv12_outputs.drain().map(|(_, (v, _))| v).collect();
+        let all: Vec<Vec<Nv12Output>> = self
+            .nv12_outputs
+            .drain()
+            .chain(self.nv12_opaque_outputs.drain())
+            .map(|(_, (v, _))| v)
+            .collect();
         for nv12s in all {
             self.destroy_nv12_vec(nv12s);
         }
         self.owned_encode_nv12.clear();
     }
 
+    /// Whether a compositor-resident Vulkan Video encoder is serving this
+    /// surface.  When one is, it encodes from its own image and the frames
+    /// never reach NVENC, so an NV12 `OPAQUE_FD` target would run the
+    /// compute pass and hold three buffers for a reader that does not exist.
+    fn vulkan_video_owns(&self, surface_id: u32) -> bool {
+        self.vulkan_encoders
+            .keys()
+            .any(|&(sid, _)| sid == surface_id)
+    }
+
+    /// Which map an NV12 output belongs in.  `OPAQUE_FD` buffers are kept
+    /// apart from `nv12_outputs` so an NVENC target and the compositor's own
+    /// Vulkan Video encode image can share a `(surface, w, h)` without one
+    /// destroying the other.
+    fn nv12_dest_mut(
+        &mut self,
+        export: Nv12Export,
+    ) -> &mut HashMap<(u32, u32, u32), (Vec<Nv12Output>, usize)> {
+        match export {
+            Nv12Export::OpaqueFd => &mut self.nv12_opaque_outputs,
+            Nv12Export::None | Nv12Export::DmaBuf => &mut self.nv12_outputs,
+        }
+    }
+
     /// Whether this target converts to NV12 in an `OPAQUE_FD` buffer — i.e.
     /// takes the NVENC zero-copy path rather than the BGRA staging one.
     fn nv12_opaque_slot(&self, surface_id: u32, target_w: u32, target_h: u32) -> Option<usize> {
-        let (v, idx) = self.nv12_outputs.get(&(surface_id, target_w, target_h))?;
+        let (v, idx) = self
+            .nv12_opaque_outputs
+            .get(&(surface_id, target_w, target_h))?;
         if v.is_empty() {
             return None;
         }
@@ -2397,7 +2472,10 @@ impl VulkanRenderer {
         }
         let handle_type = export.handle_type();
         use std::os::fd::FromRawFd;
-        self.destroy_nv12_outputs_for_target(surface_id, target_w, target_h);
+        // Only clears this export's own map — an OPAQUE_FD target must not
+        // evict the compositor's Vulkan Video encode image, or a VA-API
+        // import, parked at the same key.
+        self.destroy_nv12_outputs_in(export, surface_id, target_w, target_h);
 
         type GetMemoryFdKHR = unsafe extern "system" fn(
             vk::Device,
@@ -2551,17 +2629,20 @@ impl VulkanRenderer {
                 eprintln!("[vulkan-render] failed to create NV12 buffer {w}x{h}");
                 return;
             };
-            self.nv12_outputs
+            self.nv12_dest_mut(export)
                 .entry((surface_id, target_w, target_h))
                 .or_insert_with(|| (Vec::new(), 0))
                 .0
                 .push(nv12);
         }
-        if let Some(entry) = self.nv12_outputs.get_mut(&(surface_id, target_w, target_h)) {
+        if let Some(entry) = self
+            .nv12_dest_mut(export)
+            .get_mut(&(surface_id, target_w, target_h))
+        {
             entry.1 = 0;
         }
         let count = self
-            .nv12_outputs
+            .nv12_dest_mut(export)
             .get(&(surface_id, target_w, target_h))
             .map_or(0, |(v, _)| v.len());
         eprintln!(
@@ -5568,7 +5649,7 @@ impl VulkanRenderer {
             // full-surface copies this whole path exists to remove — so
             // skipping them is the point, not an optimisation on top.
             if let Some((nv12_vec, nv12_idx)) = self
-                .nv12_outputs
+                .nv12_opaque_outputs
                 .get(&(sid, tw, th))
                 .filter(|(v, _)| !v.is_empty())
                 .map(|(v, i)| (v, *i % v.len()))
@@ -5983,7 +6064,7 @@ impl VulkanRenderer {
                 }
                 continue;
             };
-            let nv12 = &self.nv12_outputs[&(sid, tw, th)].0[idx];
+            let nv12 = &self.nv12_opaque_outputs[&(sid, tw, th)].0[idx];
             let Nv12OutputKind::Buffer {
                 stride, uv_offset, ..
             } = nv12.kind
@@ -6008,7 +6089,7 @@ impl VulkanRenderer {
                     sync_fd: Some(sync),
                 },
             ));
-            if let Some(entry) = self.nv12_outputs.get_mut(&(sid, tw, th)) {
+            if let Some(entry) = self.nv12_opaque_outputs.get_mut(&(sid, tw, th)) {
                 let n = entry.0.len().max(1);
                 entry.1 = (entry.1 + 1) % n;
             }
