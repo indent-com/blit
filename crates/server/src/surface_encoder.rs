@@ -1368,6 +1368,11 @@ impl SurfaceEncoder {
 
     /// Encode from a DMA-BUF fd — tries zero-copy GPU import first,
     /// falls back to CPU mmap readback if no GPU path is available.
+    ///
+    /// Only the VA-API arm's import actually succeeds. The NVENC one always
+    /// fails and takes the fallback; see `NvencDirectEncoder::encode_dmabuf_fd`
+    /// for why. Since the fallback is silent, a working picture here says
+    /// nothing about whether the GPU import ran.
     #[cfg(target_os = "linux")]
     fn encode_dmabuf(
         &mut self,

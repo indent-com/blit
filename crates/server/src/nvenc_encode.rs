@@ -1058,12 +1058,36 @@ impl NvencDirectEncoder {
         }
     }
 
-    /// Zero-copy encode from a DMA-BUF fd.  Imports the fd directly into
-    /// CUDA device memory via `cuImportExternalMemory`, registers it with
-    /// NVENC, and encodes — no CPU-side copies at all.
+    /// Encode from a DMA-BUF fd, importing it into CUDA device memory via
+    /// `cuImportExternalMemory` and registering that with NVENC.
     ///
-    /// Returns `None` if the CUDA driver doesn't support external memory
-    /// import (pre-10.0) or if the import fails for this particular fd.
+    /// **This does not work today, and has never run.** Nothing hands NVENC a
+    /// `PixelData::DmaBuf` — the server only takes the external-buffer branch
+    /// for VA-API — so it has no live caller; and if it had one, the import
+    /// would fail. It asks for `CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD`,
+    /// which CUDA documents as a handle obtained from Vulkan via
+    /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT` — an NVIDIA-internal
+    /// object, not a `dma_buf`. Every fd this codebase can produce (GBM BOs,
+    /// `vkGetMemoryFdKHR` with `DMA_BUF_EXT`) is a `dma_buf`.
+    ///
+    /// Measured on nvidia-x11 595.84 / RTX 4090, using the exact descriptor
+    /// layout below against a real GBM BO from `/dev/dri/renderD128`: every
+    /// handle type from 1 to 32 returns `CUDA_ERROR_INVALID_VALUE`. The blob
+    /// carries one dma_buf string —
+    /// `CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMABUF_FD not supported on platform`.
+    ///
+    /// Making the path real means exporting the compositor's NV12 buffer as
+    /// `OPAQUE_FD` instead of `DMA_BUF_EXT`, plus an exported `VkSemaphore`
+    /// waited on with `cuWaitExternalSemaphoresAsync`: an `OPAQUE_FD`
+    /// allocation carries no implicit `dma_buf` fencing, so CUDA would
+    /// otherwise race the Vulkan blit. Kept rather than deleted because the
+    /// registration and encode half is still the shape that work needs.
+    ///
+    /// Returns `None` if the CUDA driver lacks external-memory import
+    /// (pre-10.0) or if the import fails for this fd — today, always the
+    /// latter. Callers fall back to a CPU copy, which is why the failure is
+    /// invisible apart from the one-shot `[nvenc-dmabuf]
+    /// cuImportExternalMemory failed` line.
     #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     pub fn encode_dmabuf_fd(
