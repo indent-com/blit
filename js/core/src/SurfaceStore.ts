@@ -100,8 +100,6 @@ interface SurfacePresenter {
    *  {@link clockOffsetMs}.  Rises fast and decays slowly, so the playout
    *  margin covers recent worst-case jitter instead of the average. */
   jitterMs: number;
-  /** `performance.now()` of the previous arrival, for gap detection. */
-  lastArrivalMs: number | null;
   /** PTS (ms) of the previous arrival, for rewind/wrap detection. */
   lastPtsMs: number | null;
   /** Consecutive arrivals that looked like part of one continuous stream. */
@@ -934,7 +932,6 @@ export class SurfaceStore {
         initialized: false,
         clockOffsetMs: null,
         jitterMs: 0,
-        lastArrivalMs: null,
         lastPtsMs: null,
         steadyRun: 0,
         frameIntervalMs: SurfaceStore.DEFAULT_REFRESH_MS,
@@ -1009,25 +1006,34 @@ export class SurfaceStore {
       p.jitterMs = 0;
       p.steadyRun = 0;
       p.smoothing = false;
-      p.lastArrivalMs = nowMs;
       p.lastPtsMs = null;
       return;
     }
 
-    // A backwards or far-future PTS means the server's monotonic ms
-    // counter wrapped (u32, ~49 days) or the stream was torn down and
-    // restarted.  Either way the old baseline is meaningless.
+    // Reset on a break in *capture* time, never on a break in arrival time.
+    //
+    // Both look like "a gap" locally, but they mean opposite things and
+    // want opposite handling.  A source that went idle stops advancing PTS:
+    // the next frame answers someone's input and must paint immediately,
+    // not wait behind a margin fitted to the stream that ended.  A stalled
+    // transport keeps producing frames the whole time — they just arrive
+    // late, in a burst, with their PTS spacing intact.
+    //
+    // Judging by arrival could not tell those apart, so any stall longer
+    // than the threshold disengaged scheduling.  On a reliable ordered
+    // channel that is every lost packet, and recovery costs at least one
+    // RTT — so on a high-latency link the scheduler switched itself off
+    // permanently.  PTS spacing survives head-of-line blocking, which makes
+    // this correct at any RTT without needing to know the RTT.
+    //
+    // A backwards or far-future PTS also covers the server's monotonic ms
+    // counter wrapping (u32, ~49 days) and the stream being torn down and
+    // restarted; in both the old baseline is meaningless.
     const ptsBroke =
       p.lastPtsMs !== null &&
       (ptsMs < p.lastPtsMs || ptsMs - p.lastPtsMs > SurfaceStore.STREAM_GAP_MS);
-    // A long arrival gap means the surface went idle.  The next frame is
-    // someone interacting again; paint it now, don't hold it behind a
-    // playout margin fitted to the stream that just ended.
-    const arrivalGap =
-      p.lastArrivalMs !== null &&
-      nowMs - p.lastArrivalMs > SurfaceStore.STREAM_GAP_MS;
 
-    if (ptsBroke || arrivalGap) {
+    if (ptsBroke) {
       p.clockOffsetMs = null;
       p.jitterMs = 0;
       p.steadyRun = 0;
@@ -1070,7 +1076,6 @@ export class SurfaceStore {
       }
     }
 
-    p.lastArrivalMs = nowMs;
     p.lastPtsMs = ptsMs;
     p.steadyRun++;
     if (p.steadyRun >= SurfaceStore.SMOOTHING_ENGAGE_FRAMES) p.smoothing = true;

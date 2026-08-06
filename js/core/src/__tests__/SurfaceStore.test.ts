@@ -285,6 +285,35 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
     expect(presented.indexOf(a)).toBeLessThan(presented.indexOf(b));
   });
 
+  it("stays engaged through a transport stall that keeps PTS continuous", () => {
+    // Video rides a reliable, ordered channel, so one lost packet
+    // head-of-line blocks everything behind it for at least an RTT.  The
+    // source never stopped — those frames were captured on schedule and
+    // arrive late in a burst, PTS spacing intact.  Judging the gap by
+    // arrival time would disengage scheduling on every loss, which on a
+    // 1 s link means permanently.
+    runStream(20);
+    drain();
+    expect(presenter(store, 1)!.smoothing).toBe(true);
+
+    // A full second of head-of-line blocking, then the backlog lands at
+    // once — capture times still one frame apart.
+    clock += 1000;
+    for (let i = 0; i < 60; i++) {
+      const pts = streamPts;
+      streamPts += REFRESH;
+      enqueue(store, 1, ptsFrame(pts));
+    }
+
+    const p = presenter(store, 1)!;
+    expect(p.smoothing).toBe(true);
+    // The backlog is a second stale; hold only what the cap allows rather
+    // than replaying it.
+    expect(p.queue.length).toBeLessThanOrEqual(
+      (store as any).smoothedQueueCap(p),
+    );
+  });
+
   it("reverts to immediate presentation after an idle gap", () => {
     runStream(20);
     drain();
