@@ -238,6 +238,8 @@ const en: Messages = {
   "statusbar.previewPanel": "Preview panel (Ctrl+Shift+B)",
   "statusbar.fontTitle": "Font",
   "statusbar.loadingFont": "Loading font…",
+  "statusbar.showKeyboard": "Show keyboard",
+  "statusbar.hideKeyboard": "Hide keyboard",
 
   "font.label": "Font",
   "font.title": "Font",
@@ -438,6 +440,8 @@ const es: Messages = {
   "statusbar.previewPanel": "Panel de vista previa (Ctrl+Shift+B)",
   "statusbar.fontTitle": "Fuente",
   "statusbar.loadingFont": "Cargando fuente…",
+  "statusbar.showKeyboard": "Mostrar teclado",
+  "statusbar.hideKeyboard": "Ocultar teclado",
 
   "font.label": "Fuente",
   "font.title": "Fuente",
@@ -597,6 +601,8 @@ const fr: Messages = {
   "statusbar.previewPanel": "Panneau d'aperçu (Ctrl+Shift+B)",
   "statusbar.fontTitle": "Police",
   "statusbar.loadingFont": "Chargement de la police…",
+  "statusbar.showKeyboard": "Afficher le clavier",
+  "statusbar.hideKeyboard": "Masquer le clavier",
 
   "font.label": "Police",
   "font.title": "Police",
@@ -757,6 +763,8 @@ const de: Messages = {
   "statusbar.previewPanel": "Vorschau-Bereich (Ctrl+Shift+B)",
   "statusbar.fontTitle": "Schrift",
   "statusbar.loadingFont": "Schrift wird geladen…",
+  "statusbar.showKeyboard": "Tastatur einblenden",
+  "statusbar.hideKeyboard": "Tastatur ausblenden",
 
   "font.label": "Schrift",
   "font.title": "Schrift",
@@ -912,6 +920,8 @@ const ja: Messages = {
   "statusbar.previewPanel": "プレビューパネル (Ctrl+Shift+B)",
   "statusbar.fontTitle": "フォント",
   "statusbar.loadingFont": "フォントを読み込み中…",
+  "statusbar.showKeyboard": "キーボードを表示",
+  "statusbar.hideKeyboard": "キーボードを非表示",
 
   "font.label": "フォント",
   "font.title": "フォント",
@@ -1067,6 +1077,8 @@ const zh: Messages = {
   "statusbar.previewPanel": "预览面板 (Ctrl+Shift+B)",
   "statusbar.fontTitle": "字体",
   "statusbar.loadingFont": "正在加载字体…",
+  "statusbar.showKeyboard": "显示键盘",
+  "statusbar.hideKeyboard": "隐藏键盘",
 
   "font.label": "字体",
   "font.title": "字体",
