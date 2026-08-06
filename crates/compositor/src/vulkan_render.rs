@@ -127,6 +127,19 @@ pub(crate) struct VulkanRenderer {
     /// encoder consumes target-sized BGRA without a CPU resize step.
     downscale_outputs: HashMap<(u32, u32, u32), DownscaleOutput>,
 
+    /// The native composite size each target above was sized against, keyed
+    /// the same way.  The blits stretch the whole native frame across the
+    /// whole target, so a target is only fillable while the composite still
+    /// has the shape it was inscribed into: after a resize the composite
+    /// moves first and the stale target would take a squashed picture.
+    ///
+    /// Recorded rather than re-derived because the inscription is the
+    /// server's arithmetic, not ours — it rounds each axis down to even, so
+    /// the target's aspect is never exactly the native one and no
+    /// comparison of the two ratios can separate "rounded" from "stale"
+    /// without a fudge factor.  Comparing what it was built for is exact.
+    target_natives: HashMap<(u32, u32, u32), (u32, u32)>,
+
     /// Persistent texture cache keyed by Wayland surface ObjectId.
     /// Textures are created at surface commit time and reused across
     /// frames until the surface commits a new buffer or is destroyed.
@@ -905,6 +918,7 @@ impl VulkanRenderer {
             external_outputs: HashMap::new(),
             nv12_outputs: HashMap::new(),
             downscale_outputs: HashMap::new(),
+            target_natives: HashMap::new(),
             surface_textures: HashMap::new(),
             pending_destroy_textures: Vec::new(),
             pending_destroy_external_outputs: Vec::new(),
@@ -1227,17 +1241,23 @@ impl VulkanRenderer {
     // External output buffers (VA-API zero-copy)
     // ---------------------------------------------------------------
 
+    /// `native` is the composite size `(target_w, target_h)` was inscribed
+    /// into, so the render loop can tell a target that still fits the
+    /// composite from one left behind by a resize.  See {@link target_natives}.
     pub(crate) fn set_external_output_buffers(
         &mut self,
         surface_id: u32,
         target_w: u32,
         target_h: u32,
+        native: (u32, u32),
         buffers: Vec<ExternalOutputBuffer>,
     ) {
         if buffers.is_empty() {
             self.destroy_external_outputs_for_target(surface_id, target_w, target_h);
             return;
         }
+        self.target_natives
+            .insert((surface_id, target_w, target_h), native);
         if !self.has_dmabuf {
             return;
         }
@@ -1363,13 +1383,22 @@ impl VulkanRenderer {
     /// for `surface_id`.  Used by per-client encoders that don't import
     /// GBM buffers (NVENC, software).  Re-registering an identical
     /// target is a no-op so callers can register idempotently.
+    ///
+    /// `native` is the composite size the target was inscribed into.  See
+    /// {@link target_natives}.
     pub(crate) fn register_downscale_target(
         &mut self,
         surface_id: u32,
         target_w: u32,
         target_h: u32,
+        native: (u32, u32),
     ) {
         let key = (surface_id, target_w, target_h);
+        // Recorded before the early return: the same target size can be
+        // asked for again against a *different* native — a surface that
+        // shrinks and grows back lands on sizes it has held before — and
+        // the buffer is reusable while the stale native it carries is not.
+        self.target_natives.insert(key, native);
         if self.downscale_outputs.contains_key(&key) {
             return;
         }
@@ -1383,6 +1412,24 @@ impl VulkanRenderer {
         eprintln!(
             "[vulkan-render] registered downscale target sid {surface_id} {target_w}x{target_h}",
         );
+    }
+
+    /// Record that an already-registered target is the right inscription of
+    /// `native`, without touching its buffers.  No-op for a target that is
+    /// not registered: a restamp can race the teardown of the encoder it
+    /// belongs to, and stamping buffers that are gone would only leave an
+    /// entry for `render_tree_sized` to prune.
+    pub(crate) fn restamp_target(
+        &mut self,
+        surface_id: u32,
+        target_w: u32,
+        target_h: u32,
+        native: (u32, u32),
+    ) {
+        let key = (surface_id, target_w, target_h);
+        if self.external_outputs.contains_key(&key) || self.downscale_outputs.contains_key(&key) {
+            self.target_natives.insert(key, native);
+        }
     }
 
     /// Tear down a single downscale target, if registered.
@@ -3885,10 +3932,19 @@ impl VulkanRenderer {
     /// Non-blocking check: if the previous GPU submission has completed,
     /// read back its results and return them.  Called from the compositor's
     /// main event loop so completed frames are flushed to the server
-    /// without waiting for the next Wayland surface commit.  Returns one
-    /// entry for the native composite plus one per registered downscale
-    /// target (server-allocated BGRA at the per-client encoder size).
-    pub fn try_retire_pending(&mut self) -> Vec<(u16, u32, u32, PixelData)> {
+    /// without waiting for the next Wayland surface commit.  Returns the
+    /// size the submission composited at as `(sid, w, h)`, plus one entry
+    /// for the native composite and one per registered downscale target
+    /// (server-allocated BGRA at the per-client encoder size).
+    ///
+    /// The native size is reported separately rather than inferred from the
+    /// results: every per-target entry is a downscale of the same composite,
+    /// and a target registered before a shrink out-areas the real native, so
+    /// picking the largest result answers with the stale size.
+    #[allow(clippy::type_complexity)]
+    pub fn try_retire_pending(
+        &mut self,
+    ) -> (Option<(u16, u32, u32)>, Vec<(u16, u32, u32, PixelData)>) {
         // The compositor calls this every iteration of its event loop
         // (once per Wayland event). We deliberately do NOT drain
         // deferred external submits here: that happens at submit time
@@ -3897,7 +3953,7 @@ impl VulkanRenderer {
         // self-allocated pending_submit needs per-iteration polling
         // because its staging readback is what produces a frame.
         let Some(pending) = self.pending_submit.take() else {
-            return Vec::new();
+            return (None, Vec::new());
         };
         let raw = unsafe {
             (self.device.fp_v1_0().wait_for_fences)(
@@ -3910,16 +3966,20 @@ impl VulkanRenderer {
         };
         if raw != vk::Result::SUCCESS {
             self.pending_submit = Some(pending);
-            return Vec::new();
+            return (None, Vec::new());
         }
         let toplevel_sid = pending.toplevel_sid;
+        let native = (toplevel_sid, pending.phys_w, pending.phys_h);
         let results = self.retire_pending(pending);
         // Free per-frame temporary textures now that the GPU is done.
         self.free_frame_textures();
-        results
-            .into_iter()
-            .map(|(w, h, p)| (toplevel_sid, w, h, p))
-            .collect()
+        (
+            Some(native),
+            results
+                .into_iter()
+                .map(|(w, h, p)| (toplevel_sid, w, h, p))
+                .collect(),
+        )
     }
 
     /// Produce the native BGRA + per-downscale-target BGRA results from
@@ -4203,6 +4263,46 @@ impl VulkanRenderer {
         // registered.
         let sid = toplevel_sid as u32;
 
+        // Forget what a target was sized against once the target itself is
+        // gone.  Done here rather than in each teardown path because this is
+        // the only reader, so it cannot drift out of step with the two maps
+        // it shadows.
+        {
+            let external = &self.external_outputs;
+            let downscale = &self.downscale_outputs;
+            self.target_natives
+                .retain(|k, _| external.contains_key(k) || downscale.contains_key(k));
+        }
+
+        // A per-client target is an aspect-preserving inscription of the
+        // native composite, and the blits below stretch the whole native
+        // frame across the whole target with no letterbox.  So a target
+        // sized against a different composite than the one we are about to
+        // produce cannot be filled without squashing the picture — a
+        // 1200x1000 composite squeezed into the 1200x674 target that the
+        // pre-resize 1600x900 aspect asked for.
+        //
+        // Drop those instead: the server re-registers at the right size as
+        // soon as it sees the new native, and a frame that arrives a beat
+        // late beats one that arrives wrong.
+        let fits_composite = |natives: &HashMap<(u32, u32, u32), (u32, u32)>, tw, th| {
+            // A target with no recorded native predates this bookkeeping or
+            // was registered by a path that does not resize; leave it alone.
+            natives
+                .get(&(sid, tw, th))
+                .is_none_or(|&n| n == (phys_w, phys_h))
+        };
+        let skipped_target = |tw: u32, th: u32, was: Option<&(u32, u32)>| {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 || n.is_multiple_of(200) {
+                eprintln!(
+                    "[vulkan-render] sid {sid}: skipping {tw}x{th} target, sized for \
+                     {was:?} but the composite is now {phys_w}x{phys_h}",
+                );
+            }
+        };
+
         // Collect every (target_w, target_h, ext_idx) we will blit to
         // this frame, paired with the resolved external buffer slot.
         // Distinct target sizes share the same native render and one
@@ -4225,6 +4325,10 @@ impl VulkanRenderer {
                 if ext_vec.is_empty() {
                     return None;
                 }
+                if !fits_composite(&self.target_natives, key.1, key.2) {
+                    skipped_target(key.1, key.2, self.target_natives.get(&key));
+                    return None;
+                }
                 let idx = ext_idx % ext_vec.len();
                 Some((key.1, key.2, idx))
             })
@@ -4244,6 +4348,13 @@ impl VulkanRenderer {
         downscale_target_keys.sort_unstable();
         let downscale_targets: Vec<(u32, u32)> = downscale_target_keys
             .iter()
+            .filter(|&&key| {
+                let ok = fits_composite(&self.target_natives, key.1, key.2);
+                if !ok {
+                    skipped_target(key.1, key.2, self.target_natives.get(&key));
+                }
+                ok
+            })
             .map(|&(_, w, h)| (w, h))
             .collect();
 

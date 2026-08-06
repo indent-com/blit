@@ -615,10 +615,17 @@ pub enum CompositorCommand {
     /// (LINEAR) into each registered target so every viewer gets a
     /// zero-copy stream at its own physical viewport.  Pass an empty
     /// `buffers` to clear a target.
+    ///
+    /// `native_w`/`native_h` are the composite size `(target_w, target_h)`
+    /// was inscribed into.  The renderer stops filling the target once the
+    /// composite moves off that size, so a resize cannot deliver a frame
+    /// squashed into the previous aspect.
     SetExternalOutputBuffers {
         surface_id: u32,
         target_w: u32,
         target_h: u32,
+        native_w: u32,
+        native_h: u32,
         buffers: Vec<ExternalOutputBuffer>,
     },
     /// Allocate a server-side BGRA "downscale target" for a per-client
@@ -629,11 +636,32 @@ pub enum CompositorCommand {
     /// frame is delivered as `PixelData::Bgra` sized at
     /// `(target_w, target_h)` so the per-client encoder consumes
     /// already-downscaled pixels.  Sending the same `(surface_id,
-    /// target_w, target_h)` again is a no-op.
+    /// target_w, target_h)` again reuses the buffer but re-stamps the
+    /// native size, so a surface that returns to a size it held before
+    /// does not inherit that visit's stale stamp.
+    ///
+    /// `native_w`/`native_h`: see `SetExternalOutputBuffers`.
     RegisterDownscaleTarget {
         surface_id: u32,
         target_w: u32,
         target_h: u32,
+        native_w: u32,
+        native_h: u32,
+    },
+    /// Re-stamp an already-registered target with the composite size it is
+    /// now the right inscription of, without touching its buffers.
+    ///
+    /// Sent when the native moved but the target came out at the same
+    /// numbers as before, so no encoder was rebuilt and neither
+    /// registration command would otherwise be sent.  The buffers are still
+    /// correct — only the compositor's record of what they were sized
+    /// against is behind.  No-op when the target is not registered.
+    RestampTarget {
+        surface_id: u32,
+        target_w: u32,
+        target_h: u32,
+        native_w: u32,
+        native_h: u32,
     },
     /// Tear down the BGRA downscale target previously registered for
     /// `(surface_id, target_w, target_h)`.  No-op when none exists.
@@ -1913,6 +1941,25 @@ impl Compositor {
         }
     }
 
+    /// The size this toplevel's native composite will come out at, as
+    /// `(phys_w, phys_h, log_w, log_h)`, or `None` while nobody has sized
+    /// it (the composite then falls back to the layer bounding box, which
+    /// is only known once the layers are collected).
+    ///
+    /// This follows the *requested* size, so it changes the instant a
+    /// `SurfaceResize` is handled — before the Wayland client has acked
+    /// the configure, let alone painted.  That is deliberate: the render
+    /// target is `surface_sizes` either way, so this is what the very next
+    /// composite will produce, and the server needs it to size encoders
+    /// against the right aspect rather than the previous one.
+    fn native_composite_size(&self, toplevel_sid: u16) -> Option<(u32, u32, u32, u32)> {
+        let &(lw, lh) = self.surface_sizes.get(&toplevel_sid)?;
+        let s120 = (self.output_scale_120 as u32).max(120);
+        let pw = super::render::to_physical(lw as u32, s120);
+        let ph = super::render::to_physical(lh as u32, s120);
+        Some((pw, ph, (pw * 120).div_ceil(s120), (ph * 120).div_ceil(s120)))
+    }
+
     /// Run the GPU compositor for `toplevel_sid` and store the produced
     /// frames into `pending_commits` / `pending_native_sizes` so they're
     /// drained by the next `flush_pending_commits` tick.  Drives both the
@@ -1932,11 +1979,8 @@ impl Compositor {
         // at full resolution.  Use the browser's requested size as the
         // target so the frame fits the canvas without letterboxing.
         let s120 = self.output_scale_120;
-        let target_phys = self.surface_sizes.get(&toplevel_sid).map(|&(lw, lh)| {
-            let pw = super::render::to_physical(lw as u32, s120 as u32);
-            let ph = super::render::to_physical(lh as u32, s120 as u32);
-            (pw, ph)
-        });
+        let native = self.native_composite_size(toplevel_sid);
+        let target_phys = native.map(|(pw, ph, _, _)| (pw, ph));
         let composited = if let Some(ref mut vk) = self.vulkan_renderer {
             let composited = vk.render_tree_sized(
                 root_id,
@@ -1959,9 +2003,7 @@ impl Compositor {
         // fall back to the largest result's dims (multi-target frames
         // are downscaled from one shared native composite).
         let s120_u32 = (s120 as u32).max(120);
-        if let Some((nw, nh)) = target_phys {
-            let nlog_w = (nw * 120).div_ceil(s120_u32);
-            let nlog_h = (nh * 120).div_ceil(s120_u32);
+        if let Some((nw, nh, nlog_w, nlog_h)) = native {
             self.pending_native_sizes
                 .insert(toplevel_sid, (nw, nh, nlog_w, nlog_h));
         } else if let Some((sid, nw, nh, _)) = composited
@@ -3082,6 +3124,33 @@ impl Compositor {
                     }
                     self.fire_frame_callbacks_for_toplevel(surface_id);
                 }
+
+                // The composite target moved the moment `surface_sizes`
+                // (and possibly the output scale) changed above, so report
+                // the new native size now instead of waiting for the client
+                // to paint.  The server sizes each viewer's encoder by
+                // inscribing this aspect into that viewer's box: reporting
+                // it a round trip late meant the first encoder built after
+                // every resize was inscribed into the *previous* aspect,
+                // and the composite got squeezed into it (a 1200x1000 pane
+                // encoded at 1200x674).  A second encoder then replaced it
+                // — one wasted rebuild, one wasted keyframe, and a visibly
+                // squashed picture in between.
+                //
+                // An output-scale change rescales every toplevel's
+                // composite, not just this one, so re-report them all.
+                let affected: Vec<u16> = if output_changed {
+                    self.surface_sizes.keys().copied().collect()
+                } else {
+                    vec![surface_id]
+                };
+                for sid in affected {
+                    if let Some(dims) = self.native_composite_size(sid) {
+                        self.pending_native_sizes.insert(sid, dims);
+                    }
+                }
+                self.flush_pending_commits();
+
                 let _ = self.display_handle.flush_clients();
             }
             CompositorCommand::SurfaceFocus { surface_id } => {
@@ -3200,11 +3269,19 @@ impl Compositor {
                 surface_id,
                 target_w,
                 target_h,
+                native_w,
+                native_h,
                 buffers,
             } => {
                 let installed = !buffers.is_empty();
                 if let Some(ref mut vk) = self.vulkan_renderer {
-                    vk.set_external_output_buffers(surface_id, target_w, target_h, buffers);
+                    vk.set_external_output_buffers(
+                        surface_id,
+                        target_w,
+                        target_h,
+                        (native_w, native_h),
+                        buffers,
+                    );
                 }
                 // Populate the freshly-installed external buffer pool
                 // from the most-recent committed surface state.  An
@@ -3225,15 +3302,33 @@ impl Compositor {
                 surface_id,
                 target_w,
                 target_h,
+                native_w,
+                native_h,
             } => {
                 if let Some(ref mut vk) = self.vulkan_renderer {
-                    vk.register_downscale_target(surface_id, target_w, target_h);
+                    vk.register_downscale_target(
+                        surface_id,
+                        target_w,
+                        target_h,
+                        (native_w, native_h),
+                    );
                 }
                 // See the SetExternalOutputBuffers handler above for
                 // why we re-composite here.
                 if self.toplevel_surface_ids.contains_key(&(surface_id as u16)) {
                     self.pending_recomposite_toplevels
                         .insert(surface_id as u16, false);
+                }
+            }
+            CompositorCommand::RestampTarget {
+                surface_id,
+                target_w,
+                target_h,
+                native_w,
+                native_h,
+            } => {
+                if let Some(ref mut vk) = self.vulkan_renderer {
+                    vk.restamp_target(surface_id, target_w, target_h, (native_w, native_h));
                 }
             }
             CompositorCommand::ClearDownscaleTarget {
@@ -6456,15 +6551,25 @@ fn run_compositor(
         // can yield multiple results (one per per-client downscale target
         // plus the native composite).
         if let Some(ref mut vk) = compositor.vulkan_renderer {
-            let retired = vk.try_retire_pending();
+            let (native, retired) = vk.try_retire_pending();
             if !retired.is_empty() {
                 let s120_u32 = (compositor.output_scale_120 as u32).max(120);
-                // The largest result is the compositor's native
-                // composite — drive SurfaceResized off it when no fresh
-                // handle_surface_commit has populated pending_native_sizes.
-                if let Some(&(sid, nw, nh, _)) = retired
-                    .iter()
-                    .max_by_key(|&&(_, w, h, _)| (w as u64) * (h as u64))
+                // Drive SurfaceResized off the size this submission actually
+                // composited at, when no fresh handle_surface_commit has
+                // populated pending_native_sizes.  Not off the largest
+                // result: those include the per-client downscale targets,
+                // and one registered before a shrink out-areas the real
+                // native, so the reported size would flap between the new
+                // size and the stale target — which then feeds the wrong
+                // aspect back into every viewer's encode target.
+                //
+                // Only for a surface nobody has sized, though.  A sized one
+                // has an authoritative answer in `surface_sizes`, and this
+                // submission may have been in flight when a resize landed:
+                // reporting what it composited at would walk the size
+                // backwards to the pane the user has already left.
+                if let Some((sid, nw, nh)) = native
+                    && compositor.native_composite_size(sid).is_none()
                 {
                     let log_w = (nw * 120).div_ceil(s120_u32);
                     let log_h = (nh * 120).div_ceil(s120_u32);
