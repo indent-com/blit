@@ -897,6 +897,9 @@ async fn drive(
     // Whether the Session handle is still alive (cmd_rx not yet closed).
     // Once false we stop polling cmd_rx but keep running until all channels close.
     let mut session_alive = true;
+    // Shared across all inbound paths: they all feed one DTLS engine, and a
+    // retransmitted flight can arrive on a different path than the original.
+    let mut dtls_dedupe = crate::dtls_dedupe::DtlsFlightDedupe::new();
 
     // Reusable sleep future — avoids allocating/dropping a TimerEntry on every
     // loop iteration, which was responsible for ~15% of steady-state CPU
@@ -1089,12 +1092,14 @@ async fn drive(
         tokio::select! {
             result = tokio_udp4.recv_from(&mut buf4) => {
                 let (n, source) = result?;
-                if let Ok(receive) = Receive::new(
-                    str0m::net::Protocol::Udp,
-                    source,
-                    host_addr4,
-                    &buf4[..n],
-                ) {
+                if dtls_dedupe.accept(&buf4[..n])
+                    && let Ok(receive) = Receive::new(
+                        str0m::net::Protocol::Udp,
+                        source,
+                        host_addr4,
+                        &buf4[..n],
+                    )
+                {
                     rtc.handle_input(Input::Receive(Instant::now(), receive))?;
                 }
             }
@@ -1107,6 +1112,7 @@ async fn drive(
             } => {
                 let (n, source) = result?;
                 if let Some(h6) = host_addr6
+                    && dtls_dedupe.accept(&buf6[..n])
                     && let Ok(receive) = Receive::new(
                         str0m::net::Protocol::Udp,
                         source,
@@ -1129,6 +1135,7 @@ async fn drive(
             } => {
                 if let Some((peer_addr, data)) = turn_data
                     && let Some(ra) = relay_addr
+                    && dtls_dedupe.accept(&data)
                     && let Ok(receive) = Receive::new(
                         str0m::net::Protocol::Udp,
                         peer_addr,
