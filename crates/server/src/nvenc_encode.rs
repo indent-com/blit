@@ -261,6 +261,10 @@ const NVENC_CREATE_INPUT_BUFFER_SIZE: usize = 776;
 const NVENC_CREATE_BITSTREAM_BUFFER_SIZE: usize = 776;
 const NVENC_PIC_PARAMS_SIZE: usize = 3360;
 const NVENC_LOCK_BITSTREAM_SIZE: usize = 1552;
+/// `NV_ENC_CONFIG.encodeCodecConfig.h264Config.chromaFormatIDC`, as a byte
+/// offset from the start of NV_ENC_CONFIG (encodeCodecConfig itself sits at
+/// 168).  1 = yuv420, 3 = yuv444.
+const NVENC_H264_CHROMA_FORMAT_IDC_OFFSET: usize = 360;
 
 fn w32(buf: &mut [u8], off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_ne_bytes());
@@ -340,6 +344,52 @@ pub struct NvencDirectEncoder {
 // NVENC encoder handle and CUDA context are thread-safe with proper push/pop.
 unsafe impl Send for NvencDirectEncoder {}
 
+/// Unwinds what `try_new` has acquired when it bails out partway.
+///
+/// `try_new` has a dozen early-error paths after `cuCtxCreate_v2`, and
+/// every one of them used to return without releasing the context — so
+/// each rejected configuration leaked one.  That is not a slow drip:
+/// the server retries encoder creation per surface, per client, per
+/// tick, so a host that refuses the first configuration tried (4:4:4,
+/// say) burns through device memory until *every* encoder fails to
+/// initialize and the whole pipeline silently falls back to CPU
+/// encoding.
+///
+/// Destroying the context is enough to reclaim the pitched device
+/// allocations and pinned host memory made after it, since those belong
+/// to it; the encode session is torn down explicitly first because it
+/// is owned by NVENC rather than by the context.
+struct NvencInitGuard<'a> {
+    cuda: &'a gpu_libs::CudaFns,
+    fns: Option<&'a NvEncFunctionList>,
+    ctx: gpu_libs::CUcontext,
+    encoder: *mut c_void,
+}
+
+impl NvencInitGuard<'_> {
+    /// Hand ownership of the context and session to the encoder being
+    /// returned, so they outlive this guard.
+    fn disarm(mut self) {
+        self.ctx = ptr::null_mut();
+        self.encoder = ptr::null_mut();
+    }
+}
+
+impl Drop for NvencInitGuard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(fns) = self.fns
+                && !self.encoder.is_null()
+            {
+                (fns.nvEncDestroyEncoder)(self.encoder);
+            }
+            if !self.ctx.is_null() {
+                (self.cuda.cuCtxDestroy_v2)(self.ctx);
+            }
+        }
+    }
+}
+
 impl NvencDirectEncoder {
     /// Try to create an NVENC encoder for the given codec and dimensions.
     ///
@@ -380,6 +430,14 @@ impl NvencDirectEncoder {
         if status != 0 {
             return Err(format!("cuCtxCreate failed: {status}"));
         }
+        // From here on every `return Err` must release the context; the
+        // guard does it so new early-exits cannot reintroduce the leak.
+        let mut guard = NvencInitGuard {
+            cuda,
+            fns: None,
+            ctx,
+            encoder: ptr::null_mut(),
+        };
 
         // Get NVENC function table (initialized once, reused across all instances)
         static NVENC_FN_LIST: std::sync::OnceLock<Result<NvEncFunctionList, String>> =
@@ -405,6 +463,7 @@ impl NvencDirectEncoder {
         let fns: &'static NvEncFunctionList =
             // SAFETY: OnceLock guarantees the value lives for 'static.
             unsafe { &*(fns as *const NvEncFunctionList) };
+        guard.fns = Some(fns);
 
         // Open encode session
         let mut open_buf = vec![0u8; NVENC_OPEN_ENCODE_SESSION_EX_SIZE];
@@ -421,6 +480,7 @@ impl NvencDirectEncoder {
         if nv_status != NV_ENC_SUCCESS {
             return Err(format!("nvEncOpenEncodeSessionEx failed: {nv_status}"));
         }
+        guard.encoder = encoder;
 
         let (codec_guid, codec_flag) = match codec {
             "h264" => (
@@ -446,7 +506,7 @@ impl NvencDirectEncoder {
                 )
             };
             if nv_status != NV_ENC_SUCCESS || caps_val == 0 {
-                unsafe { (fns.nvEncDestroyEncoder)(encoder) };
+                // Session and context are released by the guard.
                 return Err(format!(
                     "NVENC {codec} does not support 4:4:4 encoding on this GPU"
                 ));
@@ -494,6 +554,12 @@ impl NvencDirectEncoder {
         if chroma.is_444() && codec == "h264" {
             // profileGUID @ offset 4 in NV_ENC_CONFIG
             wguid(&mut config_buf, 4, NV_ENC_H264_PROFILE_HIGH_444_GUID);
+            // The profile GUID alone is not enough: NV_ENC_CONFIG_H264
+            // carries its own chromaFormatIDC, which the preset left at 1
+            // (yuv420).  A High 4:4:4 profile against a 4:2:0 codec config
+            // is contradictory, and nvEncInitializeEncoder rejects the pair
+            // with NV_ENC_ERR_INVALID_PARAM.
+            w32(&mut config_buf, NVENC_H264_CHROMA_FORMAT_IDC_OFFSET, 3);
         }
 
         // Initialize encoder
@@ -683,6 +749,10 @@ impl NvencDirectEncoder {
                 "[nvenc-direct] initialized {codec} encoder for {width}x{height} pitch={cuda_pitch} nv12_pitch={nv12_pitch} (CUDA upload)"
             );
         }
+
+        // Construction succeeded — the encoder below owns the context and
+        // session now, and frees them in its own Drop.
+        guard.disarm();
 
         Ok(Self {
             encoder,
