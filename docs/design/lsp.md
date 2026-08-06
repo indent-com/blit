@@ -482,6 +482,21 @@ remains partial on open-doc-only servers is cold coverage — a file
 never touched in the daemon's lifetime carries no diagnostics, and the
 absence of a `DIAG_FILE` record means unknown, not clean.
 
+A settled disk write to a file a backend handles is also announced as
+`textDocument/didSave`, and the client capability advertises it. This is
+load-bearing rather than ceremonial: the servers that diagnose a whole
+project do it from an **external checker** (rust-analyzer's flycheck,
+gopls' `cargo`/`go build` equivalent) which reruns only on save.
+`didChangeWatchedFiles` refreshes their VFS but publishes nothing, and
+those servers are deliberately not admitted to the open set (above), so
+without `didSave` their diagnostics would freeze at whatever the startup
+check produced and never move again for the life of the backend — the
+save→errors→fix loop, silently dead. Disk is blit's document truth, so a
+settled write is exactly the event `didSave` names. Servers debounce or
+coalesce bursts of saves as they see fit; blit's settle window already
+batches, and a client holding an `LSP_BUFFER` overlay flushes it before
+writing so the checker never races the bytes.
+
 Whole-project coverage for these servers has no clean LSP answer, and
 that is inherent, not a blit gap. The 3.17 `workspace/diagnostic` pull
 would fill cold files without opening them, and the engine can adopt it
@@ -500,7 +515,9 @@ one open-doc-only server that _can_ go whole-project — its
 `lsp.<id>.settings` pass-through — at the documented cost. Servers that
 already diagnose the whole project by construction (rust-analyzer and
 gopls via check-on-save) need none of this; `blit lsp diag` is complete
-for them once ready.
+for them once ready — provided the save that drives check-on-save
+actually reaches them, which is why the engine sends `didSave`
+(§ Document truth).
 
 Intelligence therefore reflects **saved state** for every document
 without an overlay — exactly what agents (who write disk) and every

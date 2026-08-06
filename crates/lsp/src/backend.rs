@@ -598,7 +598,7 @@ impl Engine {
                     "applyEdit": true,
                 },
                 "textDocument": {
-                    "synchronization": { "didSave": false },
+                    "synchronization": { "didSave": true },
                     "publishDiagnostics": { "tagSupport": { "valueSet": [1, 2] } },
                     "definition": { "linkSupport": true },
                     "references": {},
@@ -1326,8 +1326,19 @@ impl Engine {
         self.dirty_deadline = None;
         let dirty: Vec<(PathBuf, bool)> = self.dirty.drain().collect();
         let mut events = Vec::with_capacity(dirty.len());
+        let mut saved = Vec::new();
         for (path, created) in dirty {
             let exists = path.exists();
+            // A settled disk write to a file this backend handles is a
+            // save — disk is blit's document truth (docs/design/lsp.md
+            // "Document truth"). Check-on-save servers rerun their
+            // external checker (rust-analyzer's flycheck, gopls) only on
+            // didSave: didChangeWatchedFiles refreshes their VFS but
+            // publishes nothing, so without this their diagnostics stay
+            // frozen at whatever the startup check produced.
+            if exists && self.handles_extension(&path) {
+                saved.push(path.clone());
+            }
             // LSP FileChangeType: 1 Created, 2 Changed, 3 Deleted. A
             // gone path is Deleted regardless of the create hint (it was
             // created and removed within the window).
@@ -1400,6 +1411,14 @@ impl Engine {
             "workspace/didChangeWatchedFiles",
             json!({ "changes": events }),
         ));
+        // After the content sync above, so a server that rereads on save
+        // sees the new bytes rather than racing them.
+        for path in saved {
+            self.write(rpc::notification(
+                "textDocument/didSave",
+                json!({ "textDocument": { "uri": text::path_to_uri(&path) } }),
+            ));
+        }
     }
 
     // -- buffer overlays (docs/design/lsp.md "LSP_BUFFER") ----------------

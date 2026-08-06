@@ -27,3 +27,29 @@ export function absolutePath(root: string | null, rel: string): string {
   const native = windows ? rel.replace(/\//g, sep) : rel;
   return base === "/" ? `/${native}` : `${base}${sep}${native}`;
 }
+
+/**
+ * The path an LSP message names a file by, mirroring the server's own
+ * `wire_path` (`crates/lsp/src/text.rs`): workspace-root-relative under the
+ * root, absolute otherwise. Absolute is a real case, not a fallback — a
+ * definition lands in the stdlib or a registry checkout — and the server's
+ * `resolve_wire` takes an absolute path as-is, so the two ends agree.
+ *
+ * The separator boundary is load-bearing. `/a/bc` is not a child of `/a/b`,
+ * and slicing by the root's length alone would turn it into `c` and address a
+ * different file. Returning the bare filename when the prefix does not match
+ * (the shape this replaced) was worse still: for any path not spelled as a
+ * literal prefix of the canonical root — a symlinked checkout, a `..`, a
+ * trailing slash — it silently pointed diagnostics *and* the buffer overlay
+ * at whatever happened to sit at the workspace root.
+ */
+export function lspWirePath(root: string | null, path: string): string {
+  if (!root) return path;
+  const base = root.length > 1 ? root.replace(/[/\\]+$/, "") : root;
+  if (path === base) return "";
+  for (const sep of ["/", "\\"]) {
+    const prefix = /[/\\]$/.test(base) ? base : `${base}${sep}`;
+    if (path.startsWith(prefix)) return path.slice(prefix.length);
+  }
+  return path;
+}

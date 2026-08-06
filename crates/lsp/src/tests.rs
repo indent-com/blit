@@ -1441,6 +1441,89 @@ fn first_empty_overlay_write_still_syncs() {
     assert_eq!((version, text.as_str()), (2, ""));
 }
 
+/// A settled disk write to a handled file is a save. Check-on-save
+/// servers (rust-analyzer's flycheck, gopls) rerun their external checker
+/// only on didSave — `didChangeWatchedFiles` refreshes their VFS but
+/// publishes nothing — so without this their diagnostics stay frozen at
+/// whatever the startup check produced, for the life of the backend.
+#[test]
+fn disk_write_notifies_did_save() {
+    let root = tmp_root("didsave");
+    std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+    let (doc_tx, doc_rx) = std::sync::mpsc::channel();
+    let backend = testutil::pipe_backend(
+        test_spec(),
+        root.clone(),
+        test_budgets(),
+        doc_recording_server(doc_tx),
+    );
+    let (sink, _rx) = collector();
+    let _att = attach(&root, &backend, 0, sink);
+    wait_ready(&backend);
+    std::fs::write(root.join("a.rs"), "v2\n").unwrap();
+    backend.send(crate::backend::Cmd::Dirty(vec![(root.join("a.rs"), false)]));
+    let uri = wait_doc(&doc_rx, |m, p| {
+        (m == "textDocument/didSave")
+            .then(|| p["textDocument"]["uri"].as_str().unwrap().to_string())
+    });
+    assert!(uri.ends_with("/a.rs"), "unexpected didSave uri: {uri}");
+}
+
+/// The editor's case: an overlaid document still gets didSave when its
+/// bytes land on disk. The overlay suppresses content sync (the buffer is
+/// the byte source), but the external checker reads disk, and Ctrl+S is
+/// precisely when it should rerun.
+#[test]
+fn overlaid_doc_still_notifies_did_save() {
+    let root = tmp_root("didsave-overlay");
+    std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+    let (doc_tx, doc_rx) = std::sync::mpsc::channel();
+    let backend = testutil::pipe_backend(
+        test_spec(),
+        root.clone(),
+        test_budgets(),
+        doc_recording_server(doc_tx),
+    );
+    let (sink, _rx) = collector();
+    let att = attach(&root, &backend, 0, sink);
+    wait_ready(&backend);
+    att.buffer("a.rs", Some(b"v2\n".to_vec()));
+    wait_doc(&doc_rx, |m, _| (m == "textDocument/didOpen").then_some(()));
+    std::fs::write(root.join("a.rs"), "v2\n").unwrap();
+    backend.send(crate::backend::Cmd::Dirty(vec![(root.join("a.rs"), false)]));
+    wait_doc(&doc_rx, |m, _| (m == "textDocument/didSave").then_some(()));
+}
+
+/// A deleted file is not a save — it is a didClose. Sending didSave for a
+/// path that no longer exists would ask the checker to read missing bytes.
+#[test]
+fn deleted_file_does_not_notify_did_save() {
+    let root = tmp_root("didsave-delete");
+    std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+    std::fs::write(root.join("b.rs"), "v1\n").unwrap();
+    let (doc_tx, doc_rx) = std::sync::mpsc::channel();
+    let backend = testutil::pipe_backend(
+        test_spec(),
+        root.clone(),
+        test_budgets(),
+        doc_recording_server(doc_tx),
+    );
+    let (sink, _rx) = collector();
+    let _att = attach(&root, &backend, 0, sink);
+    wait_ready(&backend);
+    std::fs::remove_file(root.join("a.rs")).unwrap();
+    backend.send(crate::backend::Cmd::Dirty(vec![(root.join("a.rs"), false)]));
+    // b.rs's save is the barrier: it is queued after a.rs's flush, so
+    // once it arrives, any didSave for a.rs would already have been seen.
+    std::fs::write(root.join("b.rs"), "v2\n").unwrap();
+    backend.send(crate::backend::Cmd::Dirty(vec![(root.join("b.rs"), false)]));
+    let uri = wait_doc(&doc_rx, |m, p| {
+        (m == "textDocument/didSave")
+            .then(|| p["textDocument"]["uri"].as_str().unwrap().to_string())
+    });
+    assert!(uri.ends_with("/b.rs"), "didSave for a deleted file: {uri}");
+}
+
 #[test]
 fn detach_releases_overlays_to_disk() {
     let root = tmp_root("overlay-detach");

@@ -114,6 +114,7 @@ import { cmTheme, cmPhrases } from "./cm-theme";
 import { detectIndent, lspSnippetToCm } from "./snippet";
 import { blitSearchPanel } from "./cmSearchPanel";
 import { loadLangForFile } from "./languages";
+import { lspWirePath } from "./paths";
 import { isConnReady, connGeneration } from "./reactive";
 import { consumeReveal, setReveal, revealVersion } from "./reveal";
 import { symbolKindTag } from "./symbolKinds";
@@ -366,13 +367,7 @@ export function BlitEditor(props: {
   const [lspHandle, setLspHandle] = createSignal<LspHandle | null>(null);
   const [lspVersion, setLspVersion] = createSignal(0);
 
-  const lspRel = () => {
-    const root = lspHandle()?.root ?? "";
-    if (root && props.path.startsWith(root)) {
-      return props.path.slice(root.length).replace(/^\/+/, "");
-    }
-    return fileName;
-  };
+  const lspRel = () => lspWirePath(lspHandle()?.root ?? null, props.path);
 
   // ── LSP navigation: go-to-definition (F12 / ⌘-click), find-references
   //    (⇧F12). Positions are 0-based line + UTF-8 byte column, like diagnostics.
@@ -1256,6 +1251,11 @@ export function BlitEditor(props: {
     const h = handle();
     if (!h || !view) return;
     const bytes = encoder.encode(view.state.doc.toString());
+    // Beat the 150 ms overlay debounce: a save issued right after a
+    // keystroke would otherwise land on disk while the server still
+    // holds the previous buffer, and the didSave that the write triggers
+    // would diagnose the older text.
+    flushLspBuffer();
     try {
       const res = await h.writeFile(fileKey(), bytes, {
         ifHash: lastHash,
@@ -1287,6 +1287,7 @@ export function BlitEditor(props: {
     const h = handle();
     if (!h || !view) return;
     const bytes = encoder.encode(view.state.doc.toString());
+    flushLspBuffer();
     try {
       const res = await h.writeFile(fileKey(), bytes, { force: true });
       lastHash = res.hash;
