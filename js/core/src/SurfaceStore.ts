@@ -65,19 +65,55 @@ interface CanvasEntry {
 
 /** Per-surface presenter state.  Queues decoded frames so presentation
  *  happens at vsync boundaries (one `requestAnimationFrame` per surface)
- *  rather than at arbitrary decoder-output moments. */
+ *  rather than at arbitrary decoder-output moments.
+ *
+ *  Once a surface has been producing frames continuously for a moment the
+ *  presenter switches from "draw whatever arrived, newest wins" to
+ *  scheduling each frame against its capture-time PTS
+ *  (`S2C_SURFACE_FRAME.timestamp`, stamped at compositor-commit time — see
+ *  docs/protocol.md).  That is the only clock in the pipeline taken before
+ *  encode and transport, so replaying against it cancels the jitter both
+ *  add.  Without it, a frame that took 4 ms longer to encode is drawn 4 ms
+ *  late, and at 60 fps into a 60 Hz display that is the difference between
+ *  one frame per refresh and an endless 2-0-1-2-0 cadence. */
 interface SurfacePresenter {
-  /** Decoded VideoFrames waiting to be presented.  On each rAF tick only
-   *  the newest is drawn; older frames are closed.  Bounded at
-   *  {@link SurfaceStore.PRESENT_QUEUE_MAX} — each entry pins a decoded
-   *  buffer in the codec's frame pool, so an undrained queue (hidden tab,
-   *  throttled rAF) would otherwise grow until the renderer OOMs. */
+  /** Decoded VideoFrames waiting to be presented.  Bounded at
+   *  {@link SurfaceStore.PRESENT_QUEUE_MAX} (or
+   *  {@link SurfaceStore.PRESENT_QUEUE_MAX_SMOOTHED} once scheduling is
+   *  engaged) — each entry pins a decoded buffer in the codec's frame
+   *  pool, so an undrained queue (hidden tab, throttled rAF) would
+   *  otherwise grow until the renderer OOMs. */
   queue: VideoFrame[];
   /** Pending `requestAnimationFrame` handle, or null. */
   rafId: number | null;
   /** True after the first frame has been presented.  The first frame
    *  paints synchronously to minimise time-to-first-pixel. */
   initialized: boolean;
+  /** Local-clock (`performance.now()`) estimate of where this stream's PTS
+   *  origin sits: the smallest `arrival - pts` seen, i.e. the fastest path
+   *  the link has demonstrated.  A late frame raises {@link jitterMs}, not
+   *  this, so the baseline tracks the floor rather than drifting up to the
+   *  mean.  Leaks upward by {@link SurfaceStore.OFFSET_LEAK_MS} per frame
+   *  so genuine clock drift between server and browser is still followed. */
+  clockOffsetMs: number | null;
+  /** Peak-tracking EWMA of how late frames land relative to
+   *  {@link clockOffsetMs}.  Rises fast and decays slowly, so the playout
+   *  margin covers recent worst-case jitter instead of the average. */
+  jitterMs: number;
+  /** `performance.now()` of the previous arrival, for gap detection. */
+  lastArrivalMs: number | null;
+  /** PTS (ms) of the previous arrival, for rewind/wrap detection. */
+  lastPtsMs: number | null;
+  /** Consecutive arrivals that looked like part of one continuous stream. */
+  steadyRun: number;
+  /** EWMA of the stream's own frame interval, from PTS deltas (ms).  The
+   *  source runs at whatever rate the server paces this surface — the
+   *  client's display rate, up to 480 Hz — so the number of frames the
+   *  playout margin spans is not a constant. */
+  frameIntervalMs: number;
+  /** True while presentation is scheduled off PTS.  False for sparse or
+   *  interactive repaints, which present as soon as they decode. */
+  smoothing: boolean;
 }
 
 function codecFromFlags(flags: number): SurfaceCodec {
@@ -253,7 +289,14 @@ export class SurfaceStore {
     (surfaceId: number, shape: string) => void
   >();
   private eventListeners = new Set<SurfaceEventCallback>();
-  private _diag = { received: 0, decoded: 0, output: 0, dropped: 0, errors: 0 };
+  private _diag = {
+    received: 0,
+    decoded: 0,
+    output: 0,
+    presented: 0,
+    dropped: 0,
+    errors: 0,
+  };
   private _diagTimer: ReturnType<typeof setInterval> | null = null;
   private _visibilityHandler: (() => void) | null = null;
 
@@ -267,13 +310,65 @@ export class SurfaceStore {
 
   private static readonly FRAME_SAMPLE_MAX = 500;
   private static readonly OUTPUT_SAMPLE_MAX = 500;
-  /** Max decoded frames a presenter may hold between rAF ticks. */
+  /** Max decoded frames a presenter may hold between rAF ticks while
+   *  presenting newest-wins (no scheduling, so depth is pure overflow
+   *  slack). */
   private static readonly PRESENT_QUEUE_MAX = 2;
+  /** Fastest frame interval the pipeline can legitimately produce.  The
+   *  server clamps a client's reported display rate to `MAX_DISPLAY_FPS`
+   *  (480) and paces surfaces at it, so nothing real arrives faster.
+   *  Flooring the learned interval here — rather than capping depth — is
+   *  what keeps a degenerate PTS stream from inflating the queue. */
+  private static readonly MIN_FRAME_INTERVAL_MS = 1000 / 480;
+  /** Ceiling on held frames once PTS scheduling is engaged.
+   *
+   *  Deliberately sized so it never binds: the margin can reach
+   *  {@link PRESENT_DELAY_MAX_MS} and frames arrive no faster than
+   *  {@link MIN_FRAME_INTERVAL_MS}, so the most any real stream can need is
+   *  `50 / 2.08 = 24`, plus the two of slack {@link smoothedQueueCap} adds.
+   *  Anything that would exceed this is a broken frame interval, and that
+   *  is already handled by the floor above — so a stream is never made to
+   *  drop frames just because it runs at a high rate. */
+  private static readonly PRESENT_QUEUE_MAX_SMOOTHED =
+    Math.ceil(50 / (1000 / 480)) + 2;
+  /** Consecutive continuous arrivals before PTS scheduling engages.  Long
+   *  enough that a couple of repaints from a click don't trip it, short
+   *  enough that it is running well inside the first second of playback. */
+  private static readonly SMOOTHING_ENGAGE_FRAMES = 8;
+  /** An arrival or PTS gap longer than this ends the current stream
+   *  episode: the surface went idle, so the next frame is a fresh
+   *  interaction and must paint immediately rather than wait out a
+   *  playout margin computed for the previous episode. */
+  private static readonly STREAM_GAP_MS = 250;
+  /** Safety factor applied to tracked jitter to get the playout margin. */
+  private static readonly JITTER_MARGIN = 1.5;
+  /** Hard ceiling on latency the presenter is allowed to add.  Smoothing
+   *  past this trades away more interactivity than juddering costs. */
+  private static readonly PRESENT_DELAY_MAX_MS = 50;
+  /** Peak-tracking EWMA weights for {@link SurfacePresenter.jitterMs}. */
+  private static readonly JITTER_RISE = 0.5;
+  private static readonly JITTER_FALL = 0.02;
+  /** Upward leak on the PTS→local baseline, per frame (ms).  At 60 fps
+   *  this allows ~3 ms/s of tracked drift — far more than two decent
+   *  clocks diverge, far less than jitter would push it. */
+  private static readonly OFFSET_LEAK_MS = 0.05;
+  /** Max downward step of that baseline per frame (ms).  A real path
+   *  improvement is still tracked in a handful of frames; a single
+   *  fast-arriving burst frame is not mistaken for one. */
+  private static readonly OFFSET_DROP_MAX_MS = 5;
+  /** Fallback display refresh interval before any rAF delta is measured. */
+  private static readonly DEFAULT_REFRESH_MS = 1000 / 60;
 
-  /** Per-surface presenter: queues decoded frames and paints the freshest
-   *  one at the next vsync via rAF.  Older frames in the queue are closed
-   *  without drawing — equivalent to the original "drawImage on each decode
-   *  + coalesce via rAF" flow, consolidated into one layer. */
+  /** EWMA of observed rAF intervals — the display's refresh period.  Used
+   *  to round each frame's due time to the nearest refresh instead of
+   *  systematically deferring anything due a hair after this tick. */
+  private refreshMs = SurfaceStore.DEFAULT_REFRESH_MS;
+  private lastRafMs: number | null = null;
+
+  /** Per-surface presenter: queues decoded frames and paints them at vsync
+   *  via rAF — newest-wins while the surface is idle or interactive,
+   *  scheduled against capture-time PTS once it is streaming continuously.
+   *  See {@link SurfacePresenter}. */
   private presenters = new Map<number, SurfacePresenter>();
 
   /**
@@ -351,7 +446,7 @@ export class SurfaceStore {
       const d = this._diag;
       if (d.received > 0) {
         console.log(
-          `[blit-video] recv=${d.received} decoded=${d.decoded} output=${d.output} dropped=${d.dropped} errors=${d.errors} listeners=${this.frameListeners.size}`,
+          `[blit-video] recv=${d.received} decoded=${d.decoded} output=${d.output} presented=${d.presented} dropped=${d.dropped} errors=${d.errors} listeners=${this.frameListeners.size}`,
         );
         d.received = d.decoded = d.output = d.dropped = d.errors = 0;
       }
@@ -833,9 +928,22 @@ export class SurfaceStore {
   private enqueueFrame(surfaceId: number, frame: VideoFrame): void {
     let p = this.presenters.get(surfaceId);
     if (!p) {
-      p = { queue: [], rafId: null, initialized: false };
+      p = {
+        queue: [],
+        rafId: null,
+        initialized: false,
+        clockOffsetMs: null,
+        jitterMs: 0,
+        lastArrivalMs: null,
+        lastPtsMs: null,
+        steadyRun: 0,
+        frameIntervalMs: SurfaceStore.DEFAULT_REFRESH_MS,
+        smoothing: false,
+      };
       this.presenters.set(surfaceId, p);
     }
+
+    this.trackArrival(p, frame);
 
     if (!p.initialized) {
       p.initialized = true;
@@ -857,14 +965,19 @@ export class SurfaceStore {
         cancelAnimationFrame(p.rafId);
         p.rafId = null;
       }
-      this.tickPresent(surfaceId);
+      this.flushPresenter(surfaceId);
       return;
     }
 
     // Bound the queue even while visible: a throttled rAF (occluded
     // window, busy main thread) must not let unclosed frames — each
     // pinning a decoded buffer in the codec's frame pool — pile up.
-    const excess = p.queue.length - SurfaceStore.PRESENT_QUEUE_MAX;
+    // Trimming from the front is also the right call when scheduling: the
+    // frames at the front are the most overdue.
+    const cap = p.smoothing
+      ? this.smoothedQueueCap(p)
+      : SurfaceStore.PRESENT_QUEUE_MAX;
+    const excess = p.queue.length - cap;
     if (excess > 0) {
       for (let i = 0; i < excess; i++) {
         try {
@@ -874,9 +987,126 @@ export class SurfaceStore {
         }
       }
       p.queue.splice(0, excess);
+      this._diag.dropped += excess;
     }
 
     this.schedulePresent(surfaceId);
+  }
+
+  /** Fold one arrival into the presenter's clock model and decide whether
+   *  this surface is streaming continuously enough to schedule off PTS. */
+  private trackArrival(p: SurfacePresenter, frame: VideoFrame): void {
+    const nowMs = performance.now();
+    // VideoFrame.timestamp is µs; the wire carries u32 ms (see
+    // handleSurfaceFrame), so this divides back to whole ms.
+    const ptsMs = frame.timestamp / 1000;
+
+    // No usable PTS — stay on newest-wins.  Scheduling against a NaN due
+    // time would mean no frame ever compares as due and the surface would
+    // freeze outright, which is far worse than the judder being fixed here.
+    if (!Number.isFinite(ptsMs)) {
+      p.clockOffsetMs = null;
+      p.jitterMs = 0;
+      p.steadyRun = 0;
+      p.smoothing = false;
+      p.lastArrivalMs = nowMs;
+      p.lastPtsMs = null;
+      return;
+    }
+
+    // A backwards or far-future PTS means the server's monotonic ms
+    // counter wrapped (u32, ~49 days) or the stream was torn down and
+    // restarted.  Either way the old baseline is meaningless.
+    const ptsBroke =
+      p.lastPtsMs !== null &&
+      (ptsMs < p.lastPtsMs || ptsMs - p.lastPtsMs > SurfaceStore.STREAM_GAP_MS);
+    // A long arrival gap means the surface went idle.  The next frame is
+    // someone interacting again; paint it now, don't hold it behind a
+    // playout margin fitted to the stream that just ended.
+    const arrivalGap =
+      p.lastArrivalMs !== null &&
+      nowMs - p.lastArrivalMs > SurfaceStore.STREAM_GAP_MS;
+
+    if (ptsBroke || arrivalGap) {
+      p.clockOffsetMs = null;
+      p.jitterMs = 0;
+      p.steadyRun = 0;
+      p.smoothing = false;
+    }
+
+    const offset = nowMs - ptsMs;
+    if (p.clockOffsetMs === null) {
+      p.clockOffsetMs = offset;
+    } else {
+      // Track the floor, leaking up slowly so real clock drift is followed
+      // without jitter dragging the baseline along with it.
+      //
+      // Clamp how far one sample may pull the floor *down*.  When the
+      // encoder emits two frames back to back, the second was captured a
+      // frame later but shipped immediately behind the first, so its
+      // transit really is shorter — a plain minimum would take that
+      // one-off as "the path is now this fast" and collapse the margin the
+      // buffer is built on.  Bounding the step keeps a genuine improvement
+      // trackable within a few frames while a burst only nudges it.
+      p.clockOffsetMs = Math.max(
+        Math.min(offset, p.clockOffsetMs + SurfaceStore.OFFSET_LEAK_MS),
+        p.clockOffsetMs - SurfaceStore.OFFSET_DROP_MAX_MS,
+      );
+    }
+
+    const lateness = Math.max(0, offset - p.clockOffsetMs);
+    const w =
+      lateness > p.jitterMs
+        ? SurfaceStore.JITTER_RISE
+        : SurfaceStore.JITTER_FALL;
+    p.jitterMs += (lateness - p.jitterMs) * w;
+
+    if (p.lastPtsMs !== null) {
+      const ptsDelta = ptsMs - p.lastPtsMs;
+      // Guard against the duplicate PTS a stalled encoder can emit, which
+      // would drag the interval to zero and blow the derived queue cap up.
+      if (ptsDelta > 0 && ptsDelta <= SurfaceStore.STREAM_GAP_MS) {
+        p.frameIntervalMs += (ptsDelta - p.frameIntervalMs) * 0.1;
+      }
+    }
+
+    p.lastArrivalMs = nowMs;
+    p.lastPtsMs = ptsMs;
+    p.steadyRun++;
+    if (p.steadyRun >= SurfaceStore.SMOOTHING_ENGAGE_FRAMES) p.smoothing = true;
+  }
+
+  /** Playout margin: how far behind the fastest observed path frames are
+   *  held so a late one still lands on its intended refresh. */
+  private playoutDelayMs(p: SurfacePresenter): number {
+    return Math.min(
+      p.jitterMs * SurfaceStore.JITTER_MARGIN,
+      SurfaceStore.PRESENT_DELAY_MAX_MS,
+    );
+  }
+
+  /** How many frames the presenter may hold while scheduling.
+   *
+   *  A margin of `d` ms over a stream running at one frame every `i` ms
+   *  has `d / i` frames legitimately in hand at any moment.  A fixed cap
+   *  would fight the margin exactly where it is needed most: at 240 Hz a
+   *  50 ms margin spans 12 frames, so a cap of 4 would trim eight
+   *  not-yet-due frames per interval — dropping most of the stream in the
+   *  name of bounding it.
+   *
+   *  The interval is floored rather than the depth ceilinged, so the outer
+   *  bound is unreachable for any real frame rate and no stream is made to
+   *  drop frames merely for being fast. */
+  private smoothedQueueCap(p: SurfacePresenter): number {
+    const interval = Math.max(
+      SurfaceStore.MIN_FRAME_INTERVAL_MS,
+      p.frameIntervalMs,
+    );
+    const span = Math.ceil(this.playoutDelayMs(p) / interval);
+    return Math.min(
+      Math.max(span + 2, SurfaceStore.PRESENT_QUEUE_MAX),
+      SurfaceStore.PRESENT_QUEUE_MAX_SMOOTHED,
+    );
   }
 
   private schedulePresent(surfaceId: number): void {
@@ -884,30 +1114,108 @@ export class SurfaceStore {
     if (!p || p.rafId !== null) return;
     p.rafId = requestAnimationFrame(() => {
       p.rafId = null;
+      this.noteRafInterval();
       this.tickPresent(surfaceId);
     });
   }
 
-  /** vsync tick: present the newest queued frame, drop any older ones. */
+  /** Track the display's refresh period from rAF deltas.  Ignores deltas
+   *  outside 4–40 ms so a throttled or backgrounded tick doesn't poison
+   *  the estimate for 240 Hz–25 Hz displays alike. */
+  private noteRafInterval(): void {
+    const now = performance.now();
+    if (this.lastRafMs !== null) {
+      const dt = now - this.lastRafMs;
+      // Floor admits up to ~666 Hz: the server accepts a reported display
+      // rate up to MAX_DISPLAY_FPS (480) and paces surfaces at it, so a
+      // 4 ms floor (250 Hz) would reject every delta on a 360/480 Hz panel
+      // and leave this pinned at the 60 Hz default — which then puts half a
+      // 60 Hz refresh of lookahead on the due-time comparison, several
+      // refreshes early at that rate.
+      if (dt >= 1.5 && dt <= 40) this.refreshMs += (dt - this.refreshMs) * 0.1;
+    }
+    this.lastRafMs = now;
+  }
+
+  /** vsync tick.
+   *
+   *  Newest-wins until the surface proves it is streaming: that keeps
+   *  time-to-pixel minimal for the interactive case, where a repaint is a
+   *  response to input and any hold is felt as lag.
+   *
+   *  Once streaming, each frame is drawn on the refresh its capture-time
+   *  PTS maps to.  Frames not yet due stay queued — that is what makes a
+   *  30 fps source hold each frame for exactly two refreshes on a 60 Hz
+   *  display instead of racing through the queue and then starving. */
   private tickPresent(surfaceId: number): void {
     const p = this.presenters.get(surfaceId);
     if (!p || p.queue.length === 0) return;
-    const last = p.queue.length - 1;
-    for (let i = 0; i < last; i++) {
+
+    if (!p.smoothing || p.clockOffsetMs === null) {
+      this.presentIndex(surfaceId, p, p.queue.length - 1);
+      return;
+    }
+
+    // rAF fires just before the next composite, so what is drawn now lands
+    // one refresh from here.  Rounding by half a refresh picks the nearest
+    // vsync rather than always the later one.
+    const deadline = performance.now() + this.refreshMs / 2;
+    const due = p.clockOffsetMs + this.playoutDelayMs(p);
+
+    let idx = -1;
+    for (let i = 0; i < p.queue.length; i++) {
+      if (p.queue[i].timestamp / 1000 + due <= deadline) idx = i;
+      else break;
+    }
+
+    if (idx < 0) {
+      // Nothing due yet — hold the last drawn frame for another refresh and
+      // keep the loop alive, or the queue would sit here until the next
+      // arrival happened to re-arm it.
+      this.schedulePresent(surfaceId);
+      return;
+    }
+
+    this.presentIndex(surfaceId, p, idx);
+    if (p.queue.length > 0) this.schedulePresent(surfaceId);
+  }
+
+  /** Present `queue[idx]`, closing everything older, and keep the rest. */
+  private presentIndex(
+    surfaceId: number,
+    p: SurfacePresenter,
+    idx: number,
+  ): void {
+    for (let i = 0; i < idx; i++) {
       try {
         p.queue[i].close();
       } catch {
         /* already closed */
       }
     }
-    const chosen = p.queue[last];
-    p.queue.length = 0;
+    if (idx > 0) this._diag.dropped += idx;
+    const chosen = p.queue[idx];
+    p.queue.splice(0, idx + 1);
     this.presentFrame(surfaceId, chosen);
+  }
+
+  /** Drain everything now, newest wins — for paths where rAF will not run
+   *  again soon (hidden tab) or the queue must not outlive the surface. */
+  private flushPresenter(surfaceId: number): void {
+    const p = this.presenters.get(surfaceId);
+    if (!p || p.queue.length === 0) return;
+    this.presentIndex(surfaceId, p, p.queue.length - 1);
   }
 
   /** Draw a frame to the backing canvas and notify listeners.  Closes the
    *  frame on the way out. */
   private presentFrame(surfaceId: number, frame: VideoFrame): void {
+    // Counted here rather than at the call sites: this is the one place a
+    // frame actually reaches the canvas, so `presented` stays comparable
+    // against `output` no matter which path drew it.  A healthy stream has
+    // presented ≈ output; a gap between them is the judder this scheduler
+    // exists to remove.
+    this._diag.presented++;
     try {
       const ce = this.canvases.get(surfaceId);
       if (ce) {
@@ -958,14 +1266,26 @@ export class SurfaceStore {
 
   /** Present the newest queued frame (closing older ones) for every
    *  surface, cancelling pending rAFs.  Called when the tab goes hidden,
-   *  where the rAFs would otherwise never fire. */
+   *  where the rAFs would otherwise never fire.
+   *
+   *  Uses {@link flushPresenter}, not {@link tickPresent}: a scheduling
+   *  tick with nothing yet due re-arms rAF, and while hidden that callback
+   *  never runs — the queue would sit there holding decoder buffers until
+   *  the tab came back. */
   private flushAllPresenters(): void {
     for (const [sid, p] of this.presenters) {
       if (p.rafId !== null) {
         cancelAnimationFrame(p.rafId);
         p.rafId = null;
       }
-      this.tickPresent(sid);
+      // The stream is about to go unobserved; the clock model fitted to it
+      // will be stale on return.  Reset so the first visible frame paints
+      // immediately instead of waiting out a margin from before the gap.
+      p.steadyRun = 0;
+      p.smoothing = false;
+      p.clockOffsetMs = null;
+      p.jitterMs = 0;
+      this.flushPresenter(sid);
     }
   }
 

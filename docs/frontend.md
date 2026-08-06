@@ -160,6 +160,23 @@ GUI app surfaces (see [server.md § Headless Wayland compositor](server.md#headl
 - Decoded `VideoFrame`s are rendered to a canvas by `BlitSurfaceView` (React/Solid component).
 - Mouse and keyboard events from the surface canvas are forwarded as `C2S_SURFACE_INPUT` / `C2S_SURFACE_POINTER` messages.
 
+### Presentation scheduling
+
+`SurfaceStore` does not draw a frame the moment it decodes. Each surface has a presenter that paints at vsync (`requestAnimationFrame`) in one of two modes:
+
+- **Newest-wins** while the surface is idle or interactive: paint the freshest frame, close the rest. Minimum time-to-pixel, because a repaint there is a response to input and any hold reads as lag.
+- **PTS-scheduled** once the surface has delivered `SMOOTHING_ENGAGE_FRAMES` (8) consecutive frames without a gap: each frame is painted on the refresh its capture-time PTS maps to, and frames not yet due stay queued.
+
+The PTS is `S2C_SURFACE_FRAME.timestamp`, stamped at compositor-commit time — the only clock in the pipeline taken before encode and transport, so replaying against it cancels the jitter both add. Encode runs fire-and-forget off the server's tick loop, so per-frame encode latency varies; without scheduling that variance lands directly on screen as an uneven 2-0-1-2 cadence at a nominally perfect frame rate.
+
+The presenter estimates the PTS→local-clock baseline as the minimum observed `arrival − pts` (the fastest path seen), leaking upward slowly to follow genuine clock drift and clamped on the way down so one fast-arriving burst frame is not mistaken for a faster link. Added latency is the tracked jitter times `JITTER_MARGIN`, hard-capped at `PRESENT_DELAY_MAX_MS` (50 ms) — so a LAN link, where jitter is near zero, buffers almost nothing.
+
+An arrival or PTS gap over `STREAM_GAP_MS` (250 ms), a backwards PTS (the server's u32 ms counter wrapping), or the tab going hidden all reset the presenter to newest-wins. A frame without a finite PTS never engages scheduling.
+
+The queue depth is derived, not fixed: the frames a margin legitimately spans is `margin / frame_interval`, and the frame interval is learned from PTS deltas rather than assumed. That matters because the server paces a surface at the client's display rate — up to `MAX_DISPLAY_FPS` (480) — so at 240 Hz a 50 ms margin holds 12 frames, not 3. Learning the interval from PTS also means the depth follows the rate the encoder _actually_ sustains, not the rate that was requested.
+
+**Limits.** Jitter beyond `PRESENT_DELAY_MAX_MS` is not absorbed: frames later than the margin are already overdue and paint immediately, so a link whose jitter spread exceeds ~33 ms (50 ÷ `JITTER_MARGIN`) still judders on those frames — it degrades toward newest-wins rather than breaking. The margin is real added latency, though it is proportional to measured jitter, so a distant-but-stable link pays almost nothing. Depth is bounded, but sized so the bound never binds for a real stream: the margin tops out at 50 ms and frames arrive no faster than `MIN_FRAME_INTERVAL_MS` (480 fps, the server's own `MAX_DISPLAY_FPS` ceiling), so 24 frames plus slack covers every rate the pipeline can produce. A degenerate PTS stream is caught by flooring the _interval_, not by clipping depth — so no stream is ever made to drop frames merely for being fast. Depth also follows the rate the encoder actually sustains, since the interval is learned from PTS: a 4K surface encoding at 30 fps holds two frames regardless of the panel's refresh rate. And a link that stalls for over 250 ms repeatedly will keep resetting to newest-wins and rebuilding the margin over the following 8 frames.
+
 ## Font serving
 
 The gateway and CLI serve system fonts to the browser as `@font-face` CSS with base64-encoded font data via the `/font/<name>` route. `blit-fonts` discovers fonts by scanning standard directories (`~/Library/Fonts`, `/usr/share/fonts`, `/System/Library/Fonts`, etc.), falling back to `fc-list`/`fc-match` on Linux. It parses TTF/OTF `name` tables for family/style metadata, `post` tables for monospace detection, and `hmtx` tables for uniform advance width verification.
