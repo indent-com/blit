@@ -418,7 +418,11 @@ export function StatusBar(props: {
             ...buttonStyle(),
             opacity: props.keyboardOpen ? 1 : 0.5,
           }}
-          title={props.keyboardOpen ? "Hide keyboard" : "Show keyboard"}
+          title={
+            props.keyboardOpen
+              ? t("statusbar.hideKeyboard")
+              : t("statusbar.showKeyboard")
+          }
         >
           <svg
             width="16"
