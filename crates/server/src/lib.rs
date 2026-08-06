@@ -3159,6 +3159,7 @@ impl Session {
         &mut self,
         surface_ids: I,
         encoder_preferences: &[SurfaceEncoderPreference],
+        verbose: bool,
     ) -> bool
     where
         I: IntoIterator<Item = u16>,
@@ -3171,21 +3172,41 @@ impl Session {
             if let Some((w, h, scale_120)) =
                 self.mediated_size_for_surface(sid, encoder_preferences)
             {
-                static RDB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let n = RDB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 30 || n.is_multiple_of(200) {
+                let dispatched = self.resize_surface(sid, w, h, scale_120);
+                if verbose {
+                    // The subscribers' own view sizes are the inputs to the
+                    // mediation and exist only at runtime, so when a surface
+                    // comes out an unexpected size in a shared session this is
+                    // the line that says which viewer pinned it there.
+                    //
+                    // Report which of the three outcomes it was, not just
+                    // whether a configure went out: `resize_surface` returns
+                    // false for a settle-window hold as well as for a no-op,
+                    // and during a drag those mean opposite things — one is
+                    // parked for `tick` to send, the other is nothing at all.
+                    let outcome = if dispatched {
+                        "dispatched"
+                    } else if self
+                        .compositor
+                        .as_ref()
+                        .is_some_and(|cs| cs.pending_resize.contains_key(&sid))
+                    {
+                        "held"
+                    } else {
+                        "unchanged"
+                    };
+                    let views = self
+                        .clients
+                        .values()
+                        .filter(|c| c.surface_subscriptions.contains(&sid))
+                        .filter_map(|c| c.surface_view_sizes.get(&sid))
+                        .map(|&(w, h, s)| format!("{w}x{h}@{s}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     eprintln!(
-                        "[mediate-resize #{n}] sid={sid} -> {w}x{h} scale={scale_120} (clients: {})",
-                        self.clients
-                            .values()
-                            .filter(|c| c.surface_subscriptions.contains(&sid))
-                            .filter_map(|c| c.surface_view_sizes.get(&sid))
-                            .map(|&(w, h, s)| format!("{w}x{h}@{s}"))
-                            .collect::<Vec<_>>()
-                            .join(", "),
+                        "mediate-resize: sid={sid} -> {w}x{h} scale={scale_120} {outcome} (views: {views})"
                     );
                 }
-                self.resize_surface(sid, w, h, scale_120);
             }
         }
         self.compositor
@@ -6154,6 +6175,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 sess.resize_surfaces_to_mediated_sizes(
                     receilinged_surfaces,
                     &state2.config.surface_encoders,
+                    state2.config.verbose,
                 );
             }
             drop(sess);
@@ -10741,6 +10763,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 if sess.resize_surfaces_to_mediated_sizes(
                     std::iter::once(surface_id),
                     &state.config.surface_encoders,
+                    state.config.verbose,
                 ) {
                     // The resize is held for the settle window, and only
                     // `tick` dispatches it.  On an otherwise idle session
@@ -10894,6 +10917,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     sess.resize_surfaces_to_mediated_sizes(
                         std::iter::once(surface_id),
                         &state.config.surface_encoders,
+                        state.config.verbose,
                     );
                 }
                 state.delivery_notify.notify_one();
@@ -10944,6 +10968,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 if sess.resize_surfaces_to_mediated_sizes(
                     std::iter::once(surface_id),
                     &state.config.surface_encoders,
+                    state.config.verbose,
                 ) {
                     // As above: losing a subscriber raises the mediated size,
                     // and that resize can land inside an open settle window.
@@ -11509,8 +11534,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         if sess.resize_ptys_to_mediated_sizes(affected_ptys) {
             need_nudge = true;
         }
-        if sess.resize_surfaces_to_mediated_sizes(affected_surfaces, &state.config.surface_encoders)
-        {
+        if sess.resize_surfaces_to_mediated_sizes(
+            affected_surfaces,
+            &state.config.surface_encoders,
+            state.config.verbose,
+        ) {
             need_nudge = true;
         }
         // Release any keys this client was holding when it disconnected.
