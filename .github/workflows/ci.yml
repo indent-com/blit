@@ -81,6 +81,8 @@ jobs:
 
   build-packages:
     uses: ./.github/workflows/_build-packages.yml
+    with:
+      macos: false
 
   build-windows:
     uses: ./.github/workflows/_build-windows.yml
