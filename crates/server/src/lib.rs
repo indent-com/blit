@@ -748,7 +748,12 @@ struct SurfaceSubState {
     /// Sizes the next attempt to the ceiling *every* backend in the chain
     /// clears, so a surface no wide-format encoder can carry still gets a
     /// picture instead of retrying the same oversized request forever.
-    /// Cleared as soon as a creation succeeds.
+    ///
+    /// Cleared on a prefs-changed resubscribe, deliberately *not* on the
+    /// smaller creation that follows the refusal: that creation can be won by
+    /// a backend whose own ceiling is wider than the size just refused, and
+    /// clearing here would size the surface straight back up into it.  See
+    /// the creation completion handler.
     encoder_cap_degraded: bool,
 }
 
