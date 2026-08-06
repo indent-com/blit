@@ -22,8 +22,26 @@ pub type SurfaceH264EncoderPreference = SurfaceEncoderPreference;
 
 /// H.264 dimension cap: 3840x2160 horizontal or 2160x3840 vertical.
 /// Shared by all H.264 backends; also bounds software-encode CPU cost.
+///
+/// Not an H.264 limit — the levels reach 8192x4320 — but the ceiling
+/// browser hardware decoders clear reliably.
 const H264_MAX_WIDTH: u16 = 3840;
 const H264_MAX_HEIGHT: u16 = 2160;
+
+/// Hardware AV1 cap: the 8192x4352 frame size AV1 levels 5.x and up admit,
+/// which is also where the NVENC and VA-API AV1 engines stop.  High enough
+/// that 5K and 6K panels encode at their native resolution instead of being
+/// upscaled from 4K by the browser.
+const AV1_HW_MAX_WIDTH: u16 = 8192;
+const AV1_HW_MAX_HEIGHT: u16 = 4352;
+
+/// Software AV1 (rav1e) cap.  rav1e imposes no dimension limit of its own,
+/// but it is CPU-bound: past 4K even speed preset 10 falls far enough behind
+/// that the stream stops being interactive.  Held at the H.264 ceiling so the
+/// software fallback degrades into a lower frame rate rather than into a
+/// surface that never finishes a frame.
+const AV1_SW_MAX_WIDTH: u16 = 3840;
+const AV1_SW_MAX_HEIGHT: u16 = 2160;
 
 impl SurfaceEncoderPreference {
     pub fn parse(value: &str) -> Option<Self> {
@@ -142,29 +160,48 @@ impl SurfaceEncoderPreference {
         }
     }
 
-    /// Maximum surface dimensions the encoder can handle.
-    /// Returns `None` if there is no practical limit.
-    pub fn max_dimensions(self) -> Option<(u16, u16)> {
+    /// Maximum surface dimensions this encoder can carry.
+    ///
+    /// Every backend has a real ceiling, and they differ by more than 2x, so
+    /// callers have to say which one they mean rather than folding the whole
+    /// chain into one number: see [`Self::widest_for_list`] (how large a
+    /// surface may be *composited*, given that some subscriber can carry it)
+    /// and [`Self::tightest_for_list`] (how large it may be *encoded* when we
+    /// don't yet know which backend will win the chain).
+    pub fn max_dimensions(self) -> (u16, u16) {
         match self {
             Self::H264Software | Self::H264Vaapi | Self::NvencH264 | Self::VulkanVideoH264 => {
-                Some((H264_MAX_WIDTH, H264_MAX_HEIGHT))
+                (H264_MAX_WIDTH, H264_MAX_HEIGHT)
             }
-            Self::AV1Vaapi | Self::NvencAV1 | Self::AV1Software | Self::VulkanVideoAV1 => None,
+            Self::AV1Vaapi | Self::NvencAV1 | Self::VulkanVideoAV1 => {
+                (AV1_HW_MAX_WIDTH, AV1_HW_MAX_HEIGHT)
+            }
+            Self::AV1Software => (AV1_SW_MAX_WIDTH, AV1_SW_MAX_HEIGHT),
         }
     }
 
-    /// Tightest max dimensions across a list of preferences.
-    pub fn max_dimensions_for_list(prefs: &[Self]) -> Option<(u16, u16)> {
-        let mut result: Option<(u16, u16)> = None;
-        for p in prefs {
-            if let Some((w, h)) = p.max_dimensions() {
-                result = Some(match result {
-                    Some((rw, rh)) => (rw.min(w), rh.min(h)),
-                    None => (w, h),
-                });
-            }
-        }
-        result
+    /// Whether this encoder can carry a `width`x`height` frame.
+    pub fn fits(self, width: u32, height: u32) -> bool {
+        let (max_w, max_h) = self.max_dimensions();
+        width <= max_w as u32 && height <= max_h as u32
+    }
+
+    /// Tightest cap across a list of preferences — the size that is safe no
+    /// matter which one wins the fallback chain.  `None` for an empty list.
+    pub fn tightest_for_list(prefs: &[Self]) -> Option<(u16, u16)> {
+        prefs
+            .iter()
+            .map(|p| p.max_dimensions())
+            .reduce(|(aw, ah), (bw, bh)| (aw.min(bw), ah.min(bh)))
+    }
+
+    /// Loosest cap across a list of preferences — the size the most capable
+    /// of them could carry.  `None` for an empty list.
+    pub fn widest_for_list(prefs: &[Self]) -> Option<(u16, u16)> {
+        prefs
+            .iter()
+            .map(|p| p.max_dimensions())
+            .reduce(|(aw, ah), (bw, bh)| (aw.max(bw), ah.max(bh)))
     }
 
     /// Whether this encoder runs in the compositor via Vulkan Video.
@@ -898,6 +935,22 @@ impl SurfaceEncoder {
         }
     }
 
+    /// Which preference actually won the fallback chain.  Sizing consults it
+    /// so a viewer that landed on AV1 is not held to the H.264 ceiling — and
+    /// one that landed on H.264 is.
+    pub fn preference(&self) -> SurfaceEncoderPreference {
+        match &self.kind {
+            SurfaceEncoderKind::H264Software(_) => SurfaceEncoderPreference::H264Software,
+            SurfaceEncoderKind::NvencH264(_) => SurfaceEncoderPreference::NvencH264,
+            SurfaceEncoderKind::NvencAV1(_) => SurfaceEncoderPreference::NvencAV1,
+            #[cfg(target_os = "linux")]
+            SurfaceEncoderKind::H264Vaapi(_) => SurfaceEncoderPreference::H264Vaapi,
+            #[cfg(target_os = "linux")]
+            SurfaceEncoderKind::AV1Vaapi(_) => SurfaceEncoderPreference::AV1Vaapi,
+            SurfaceEncoderKind::AV1Software(_) => SurfaceEncoderPreference::AV1Software,
+        }
+    }
+
     /// WebCodecs codec string for the active encoder.  Sent to the client
     /// so it can configure `VideoDecoder` with the correct profile/level.
     pub fn webcodecs_codec_string(&self) -> String {
@@ -1615,7 +1668,7 @@ impl SurfaceEncoder {
 fn validate_surface_dimensions(
     width: u32,
     height: u32,
-    _preference: SurfaceEncoderPreference,
+    preference: SurfaceEncoderPreference,
 ) -> Result<(), String> {
     if width == 0 || height == 0 {
         return Err("surface encoder requires non-zero dimensions".into());
@@ -1624,6 +1677,19 @@ fn validate_surface_dimensions(
     // and AV1/rav1e handles odd dimensions natively.
     let _ = expected_rgba_len(width, height)
         .ok_or_else(|| format!("surface encoder dimensions overflow for {width}x{height}"))?;
+    // Refuse a frame this backend cannot carry so the chain moves on to one
+    // that can.  Without this an H.264 encoder would happily accept a 5K
+    // frame and emit a bitstream above what the client's decoder advertised,
+    // which fails in the browser rather than here.  This runs before
+    // `record_unavailable`, so a size rejection never poisons the
+    // family-unavailable cache — the same backend is retried at a size that
+    // fits.
+    if !preference.fits(width, height) {
+        let (max_w, max_h) = preference.max_dimensions();
+        return Err(format!(
+            "{width}x{height} exceeds the {max_w}x{max_h} ceiling for {preference:?}"
+        ));
+    }
     Ok(())
 }
 
@@ -2555,6 +2621,60 @@ impl SoftwareAV1Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoder_ceilings_differ_by_family() {
+        // The two folds have to disagree for the split to mean anything.
+        let prefs = SurfaceEncoderPreference::defaults();
+        assert_eq!(
+            SurfaceEncoderPreference::tightest_for_list(&prefs),
+            Some((H264_MAX_WIDTH, H264_MAX_HEIGHT))
+        );
+        assert_eq!(
+            SurfaceEncoderPreference::widest_for_list(&prefs),
+            Some((AV1_HW_MAX_WIDTH, AV1_HW_MAX_HEIGHT))
+        );
+        assert_eq!(SurfaceEncoderPreference::tightest_for_list(&[]), None);
+        assert_eq!(SurfaceEncoderPreference::widest_for_list(&[]), None);
+    }
+
+    #[test]
+    fn hardware_av1_carries_5k_and_h264_does_not() {
+        assert!(SurfaceEncoderPreference::AV1Vaapi.fits(5120, 2880));
+        assert!(SurfaceEncoderPreference::NvencAV1.fits(5120, 2880));
+        assert!(!SurfaceEncoderPreference::H264Vaapi.fits(5120, 2880));
+        // Software AV1 has no dimension limit of its own but is CPU-bound,
+        // so it is held at the H.264 ceiling deliberately.
+        assert!(!SurfaceEncoderPreference::AV1Software.fits(5120, 2880));
+        assert!(SurfaceEncoderPreference::AV1Software.fits(3840, 2160));
+    }
+
+    /// A backend that cannot carry the frame must be refused here, so the
+    /// chain moves on to one that can instead of emitting a bitstream the
+    /// client's decoder will reject.
+    #[test]
+    fn oversized_frames_are_refused_per_backend() {
+        assert!(
+            validate_surface_dimensions(5120, 2880, SurfaceEncoderPreference::H264Software)
+                .is_err()
+        );
+        assert!(
+            validate_surface_dimensions(5120, 2880, SurfaceEncoderPreference::AV1Vaapi).is_ok()
+        );
+        assert!(
+            validate_surface_dimensions(3840, 2160, SurfaceEncoderPreference::H264Software).is_ok()
+        );
+        // Still rejects the pre-existing cases.
+        assert!(validate_surface_dimensions(0, 100, SurfaceEncoderPreference::AV1Vaapi).is_err());
+    }
+
+    /// 5K at 60 fps needs a level above the 4K one, and the string is what
+    /// the client hands to `VideoDecoder`.
+    #[test]
+    fn av1_level_climbs_past_4k() {
+        assert_eq!(av1_level_for(3840, 2160), "13");
+        assert_eq!(av1_level_for(5120, 2880), "16");
+    }
 
     #[test]
     fn bandwidth_and_speed_parse_independently() {

@@ -739,6 +739,83 @@ struct SurfaceSubState {
     /// = no target registered yet (or the encoder was an external
     /// GBM path that uses `external_outputs` instead).
     last_registered_target: Option<(u32, u32)>,
+    /// Which preference won the fallback chain for this surface, once one
+    /// has.  Sizing prefers it over guessing: before an encoder exists we
+    /// size for the most capable backend the client could decode, and this
+    /// replaces that guess with the answer.  `None` = no encoder built yet.
+    selected_encoder: Option<SurfaceEncoderPreference>,
+    /// Latched when a creation attempt was refused for being too large.
+    /// Sizes the next attempt to the ceiling *every* backend in the chain
+    /// clears, so a surface no wide-format encoder can carry still gets a
+    /// picture instead of retrying the same oversized request forever.
+    ///
+    /// Cleared on a prefs-changed resubscribe, deliberately *not* on the
+    /// smaller creation that follows the refusal: that creation can be won by
+    /// a backend whose own ceiling is wider than the size just refused, and
+    /// clearing here would size the surface straight back up into it.  See
+    /// the creation completion handler.
+    encoder_cap_degraded: bool,
+}
+
+/// The codec bitmask in force for one (client, surface) pair: the
+/// per-surface override from `C2S_SURFACE_SUBSCRIBE` when set, else the
+/// client-wide value.  0 means "accept anything".
+fn surface_codec_support(client: &ClientState, surface_id: u16) -> u8 {
+    client
+        .surface_subs
+        .get(&surface_id)
+        .map(|s| s.codec_override)
+        .filter(|&c| c != 0)
+        .unwrap_or(client.surface_codec_support)
+}
+
+/// How large a frame this client may be served for `surface_id`.
+///
+/// The encoder ceiling is not a property of the chain as a whole — H.264
+/// stops at 3840x2160 and hardware AV1 goes to 8192x4352 — so taking the
+/// tightest cap across every configured preference would hold an AV1 viewer
+/// to H.264's limit purely because H.264 is in the list as a fallback.
+/// Instead:
+///
+///   - Once the chain has resolved, the winner's own ceiling is the truth.
+///   - Before that, size for the most capable backend the client can decode
+///     and let `SurfaceEncoder::new` skip the ones that can't carry it.
+///   - If that request was refused for size, fall back to the ceiling every
+///     eligible backend clears.  This is the one case that costs a round
+///     trip, and it converges after exactly one.
+///
+/// The result is then intersected with what the client said its decoder can
+/// handle, because a ceiling the encoder clears is worthless if the browser
+/// refuses the bitstream.
+///
+/// `None` (empty or fully-ineligible preference list) means no cap.
+fn surface_encode_cap(
+    prefs: &[SurfaceEncoderPreference],
+    client: &ClientState,
+    surface_id: u16,
+) -> Option<(u16, u16)> {
+    let codec_support = surface_codec_support(client, surface_id);
+    let sub = client.surface_subs.get(&surface_id);
+    let eligible: Vec<_> = prefs
+        .iter()
+        .copied()
+        .filter(|p| p.supported_by_client(codec_support))
+        .collect();
+    let (cw, ch) = if sub.is_some_and(|s| s.encoder_cap_degraded) {
+        SurfaceEncoderPreference::tightest_for_list(&eligible)
+    } else if let Some(pref) = sub.and_then(|s| s.selected_encoder) {
+        Some(pref.max_dimensions())
+    } else {
+        SurfaceEncoderPreference::widest_for_list(&eligible)
+    }?;
+    let (dw, dh) = match client.surface_max_decode {
+        // Undeclared: hold at the H.264 ceiling.  Every client predating the
+        // field lands here, and none of them was being served more than that
+        // before, so this is the status quo rather than a new restriction.
+        (0, 0) => SurfaceEncoderPreference::H264Software.max_dimensions(),
+        declared => declared,
+    };
+    Some((cw.min(dw), ch.min(dh)))
 }
 
 struct ClientState {
@@ -860,6 +937,16 @@ struct ClientState {
     /// Intersection of codec support across all surfaces for this client.
     /// Used to pick an encoder the client can decode.  0 = accept anything.
     surface_codec_support: u8,
+    /// Largest frame this client's video decoder reported it can handle,
+    /// from `C2S_CLIENT_FEATURES`.  `(0, 0)` = not declared, which covers
+    /// every client predating the field; those are held to the H.264
+    /// ceiling, the most they could have been served anyway.
+    ///
+    /// Separate from `surface_codec_support` because the two answer
+    /// different questions: the bitmask says *which* codecs decode, this
+    /// says *how large* they decode.  A browser that reports AV1 support
+    /// from a 1080p probe has said nothing about 5K.
+    surface_max_decode: (u16, u16),
     /// Evdev keycodes currently held down by this client on compositor
     /// surfaces.  On disconnect we send synthetic key-up events for each
     /// so modifiers don't stay stuck and keys don't auto-repeat forever.
@@ -2422,8 +2509,11 @@ impl Session {
     ///      letterboxed by the browser.
     ///   2. Cap at `(native_w, native_h)` so we never upscale —
     ///      asking for a larger encoder just wastes bandwidth.
-    ///   3. Cap at the encoder family's hard maxima (e.g. H.264
-    ///      3840×2160), preserving aspect across the cap.
+    ///   3. Cap at `max` — this viewer's encoder ceiling, from
+    ///      `surface_encode_cap` — preserving aspect across the cap.
+    ///      This is per-viewer, not per-surface: on a 5K surface an AV1
+    ///      viewer encodes at 5120×2880 while an H.264 viewer watching
+    ///      the same surface gets a 3840×2160 downscale of it.
     ///   4. Floor at 2×2 (and even) so the encoder doesn't reject the
     ///      dimensions and chroma subsampling has a valid grid.
     ///
@@ -2436,7 +2526,7 @@ impl Session {
         view_size: Option<(u16, u16, u16)>,
         native_w: u32,
         native_h: u32,
-        encoder_preferences: &[SurfaceEncoderPreference],
+        max: Option<(u16, u16)>,
     ) -> (u32, u32) {
         // Largest box no larger than `(box_w, box_h)` that has the
         // same aspect ratio as `(native_w, native_h)`.
@@ -2461,7 +2551,6 @@ impl Session {
             }
         };
 
-        let max = SurfaceEncoderPreference::max_dimensions_for_list(encoder_preferences);
         let (w, h) = view_size
             .map(|(w, h, _)| (w as u32, h as u32))
             .filter(|&(w, h)| w > 0 && h > 0)
@@ -2482,16 +2571,29 @@ impl Session {
         (w, h)
     }
 
+    /// The size the compositor should render this surface at, given every
+    /// client watching it.
+    ///
+    /// `prefs` is the configured encoder chain; the ceiling applied here is
+    /// the *loosest* one any subscriber could actually be served, because a
+    /// codec limit is a transport constraint rather than a rendering one.
+    /// Composite for the viewer with the most capable decoder and let the
+    /// rest take a downscale (`per_client_encode_target`) — the alternative,
+    /// clamping to the tightest, would drag a 5K AV1 viewer down to 4K
+    /// because some other tab in the session only speaks H.264.  When every
+    /// subscriber is H.264-only the result is the old 3840×2160, so nothing
+    /// composites larger than it can be sent.
     fn mediated_size_for_surface(
         &self,
         surface_id: u16,
-        max: Option<(u16, u16)>,
+        prefs: &[SurfaceEncoderPreference],
     ) -> Option<(u16, u16, u16)> {
         // Per axis: the smallest logical extent asked for, plus the exact
         // physical extent and scale of the client that asked for it.
         let mut min_w: Option<(u32, u32, u16)> = None;
         let mut min_h: Option<(u32, u32, u16)> = None;
         let mut max_scale: u16 = 0;
+        let mut max: Option<(u16, u16)> = None;
         for c in self.clients.values() {
             // Only count clients that are actually subscribed.  A
             // stale view_size left behind by a client that
@@ -2527,6 +2629,17 @@ impl Session {
                 min_h = Some((lh, ph as u32, s));
             }
             max_scale = max_scale.max(s);
+            // Widen the ceiling to whatever this viewer can be served.  Read
+            // from the same clients that get a say in the size — a scaled
+            // subscriber already skipped above, and letting a thumbnail's
+            // ceiling raise the composite would be as wrong as letting its
+            // size lower it.
+            if let Some((cw, ch)) = surface_encode_cap(prefs, c, surface_id) {
+                max = Some(match max {
+                    Some((mw, mh)) => (mw.max(cw), mh.max(ch)),
+                    None => (cw, ch),
+                });
+            }
         }
         let (min_w, min_h) = match (min_w, min_h) {
             (Some(w), Some(h)) => (w, h),
@@ -2597,13 +2710,14 @@ impl Session {
     ) where
         I: IntoIterator<Item = u16>,
     {
-        let max = SurfaceEncoderPreference::max_dimensions_for_list(encoder_preferences);
         let mut seen = HashSet::new();
         for sid in surface_ids {
             if !seen.insert(sid) {
                 continue;
             }
-            if let Some((w, h, scale_120)) = self.mediated_size_for_surface(sid, max) {
+            if let Some((w, h, scale_120)) =
+                self.mediated_size_for_surface(sid, encoder_preferences)
+            {
                 static RDB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let n = RDB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n < 30 || n.is_multiple_of(200) {
@@ -3737,6 +3851,12 @@ async fn tick(state: &AppState) -> TickOutcome {
         /// spin on retries.
         encoder: Option<SurfaceEncoder>,
         fresh: Option<FreshEncoder>,
+        /// Creation failed with at least one eligible backend skipped for
+        /// being unable to carry a frame this large.  Asking for less will
+        /// reach those backends, so the completion handler degrades the cap
+        /// and lets the next tick retry immediately instead of spending the
+        /// failure backoff on a request that is merely too big.
+        oversized: bool,
     }
     /// Metadata shipped with an encode result when the encoder was
     /// created this tick (deferred to spawn_blocking).  `Some` = the
@@ -3939,7 +4059,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     view,
                     native_w,
                     native_h,
-                    &state.config.surface_encoders,
+                    surface_encode_cap(&state.config.surface_encoders, client, sid),
                 );
                 let (enc_w, enc_h) = (target_w, target_h);
                 if state.config.verbose {
@@ -4247,12 +4367,7 @@ async fn tick(state: &AppState) -> TickOutcome {
 
                 // --- Try Vulkan Video first ---
                 if needs_new_encoder {
-                    let codec_support = client
-                        .surface_subs
-                        .get(&sid)
-                        .map(|s| s.codec_override)
-                        .filter(|&c| c != 0)
-                        .unwrap_or(client.surface_codec_support);
+                    let codec_support = surface_codec_support(client, sid);
                     let encoding = SurfaceEncoding {
                         bandwidth: resolve_bandwidth(
                             client,
@@ -4847,11 +4962,19 @@ async fn tick(state: &AppState) -> TickOutcome {
                                         job.cid, job.sid, job.target_w, job.target_h,
                                     );
                                 }
+                                // Did the size rule anything out?  If so the
+                                // retry should be smaller, not merely later.
+                                let oversized = params
+                                    .preferences
+                                    .iter()
+                                    .filter(|p| p.supported_by_client(params.codec_support))
+                                    .any(|p| !p.fits(job.target_w, job.target_h));
                                 return CreateResult {
                                     cid: job.cid,
                                     sid: job.sid,
                                     encoder: None,
                                     fresh: None,
+                                    oversized,
                                 };
                             }
                         };
@@ -4919,6 +5042,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             sid: job.sid,
                             encoder: Some(encoder),
                             fresh: Some(fresh),
+                            oversized: false,
                         }
                     })
                 })
@@ -4956,14 +5080,33 @@ async fn tick(state: &AppState) -> TickOutcome {
                 }
             }
 
+            // Surfaces whose ceiling moved as a result of these creations —
+            // either a backend resolved to something other than what sizing
+            // assumed, or a request was refused for size.  Re-mediated after
+            // the loop, because the composite was sized against a guess: left
+            // alone it renders every frame at a resolution no subscriber can
+            // actually be sent.
+            let mut receilinged_surfaces: Vec<u16> = Vec::new();
+
             for result in results {
                 let Some(encoder) = result.encoder else {
                     if let Some(client) = sess.clients.get_mut(&result.cid)
                         && let Some(s) = client.surface_subs.get_mut(&result.sid)
                     {
                         s.creation_in_flight = false;
-                        s.nal_none_streak = 10;
-                        s.nal_none_latched_at = Some(now);
+                        if result.oversized {
+                            // Not a broken host — just a frame bigger than any
+                            // backend that could have taken it.  Narrow the
+                            // ceiling and let the next tick retry at once;
+                            // spending the backoff here would stall the first
+                            // picture by seconds on every AV1-less host with a
+                            // >4K display.
+                            s.encoder_cap_degraded = true;
+                            receilinged_surfaces.push(result.sid);
+                        } else {
+                            s.nal_none_streak = 10;
+                            s.nal_none_latched_at = Some(now);
+                        }
                     }
                     continue;
                 };
@@ -5074,6 +5217,24 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // with the new prefs.
                         continue;
                     }
+                    // Sizing has been guessing which backend would win; now it
+                    // knows.  A surface that came up on AV1 can grow past the
+                    // H.264 ceiling, and one that came up on H.264 stops
+                    // being composited as if it might not — but only after a
+                    // re-mediation, so note it when the answer is new.
+                    //
+                    // `encoder_cap_degraded` is deliberately *not* cleared
+                    // here.  It latches only when a request was refused for
+                    // size, and clearing it on the smaller creation that
+                    // followed would let the next winner's wider ceiling
+                    // raise the surface straight back into the size that was
+                    // just refused.  A resubscribe clears it; that is the
+                    // point at which retrying is a fresh question.
+                    let winner = Some(encoder.preference());
+                    if state.selected_encoder != winner {
+                        state.selected_encoder = winner;
+                        receilinged_surfaces.push(result.sid);
+                    }
                     state.encoder = Some(encoder);
                     state.nal_none_streak = 0;
                     state.nal_none_latched_at = None;
@@ -5082,6 +5243,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                         let _ = send_outbox(client, enc_msg);
                     }
                 }
+            }
+            if !receilinged_surfaces.is_empty() {
+                sess.resize_surfaces_to_mediated_sizes(
+                    receilinged_surfaces,
+                    &state2.config.surface_encoders,
+                );
             }
             drop(sess);
             state2.delivery_notify.notify_one();
@@ -8350,6 +8517,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 vulkan_video_surfaces: HashMap::new(),
                 surface_view_sizes: HashMap::new(),
                 surface_codec_support: 0,
+                surface_max_decode: (0, 0),
                 pressed_surface_keys: HashSet::new(),
             },
         );
@@ -9614,6 +9782,15 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     state.bandwidth_override = new_bandwidth;
                     state.speed_override = new_speed;
                     state.scaled_target = scaled_target;
+                    if prefs_changed {
+                        // The encoder is about to be rebuilt and may not come
+                        // back as the same backend — a client that just gained
+                        // AV1 support has a different chain now.  Drop what we
+                        // learned so sizing re-derives it instead of holding
+                        // the surface to the old winner's ceiling.
+                        state.selected_encoder = None;
+                        state.encoder_cap_degraded = false;
+                    }
                     let task_in_flight = state.encode_in_flight || state.creation_in_flight;
                     if meaningful_change {
                         // Reset burst window so the first frames after a
@@ -9806,11 +9983,24 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 state.delivery_notify.notify_one();
             }
             C2S_CLIENT_FEATURES if data.len() >= 2 => {
-                // Byte 0: codec_support bitmask.  Future bytes are ignored
-                // if unknown, defaulting to 0 when absent.
+                // Byte 0: codec_support bitmask.  Bytes 1..5, when present:
+                // the largest frame the client's decoder handles, as two
+                // little-endian u16s.  Absent (older clients) leaves it at
+                // (0, 0), which `surface_encode_cap` reads as "undeclared"
+                // and holds to the H.264 ceiling.  Further bytes are still
+                // ignored if unknown.
                 let codec_support = data[1];
+                let max_decode = if data.len() >= 6 {
+                    (
+                        u16::from_le_bytes([data[2], data[3]]),
+                        u16::from_le_bytes([data[4], data[5]]),
+                    )
+                } else {
+                    (0, 0)
+                };
                 if let Some(c) = sess.clients.get_mut(&client_id) {
                     c.surface_codec_support = codec_support;
+                    c.surface_max_decode = max_decode;
                 }
             }
             C2S_CLIPBOARD_SET if data.len() >= 5 => {
@@ -10501,6 +10691,7 @@ mod tests {
             vulkan_video_surfaces: HashMap::new(),
             surface_view_sizes: HashMap::new(),
             surface_codec_support: 0,
+            surface_max_decode: (0, 0),
             pressed_surface_keys: HashSet::new(),
         };
         (client, rx)
@@ -11501,7 +11692,7 @@ mod tests {
                 c.surface_view_sizes.insert(1, (w, h, scale));
                 session.clients.insert(1, c);
                 assert_eq!(
-                    session.mediated_size_for_surface(1, None),
+                    session.mediated_size_for_surface(1, &[]),
                     Some((w, h, scale.max(120))),
                     "one viewer at {w}x{h} scale={scale} must get its own size back"
                 );
@@ -11527,7 +11718,7 @@ mod tests {
         session.clients.insert(1, c1);
         session.clients.insert(2, c2);
         assert_eq!(
-            session.mediated_size_for_surface(1, None),
+            session.mediated_size_for_surface(1, &[]),
             Some((1001, 563, 240))
         );
     }
@@ -11547,7 +11738,7 @@ mod tests {
         session.clients.insert(1, c1);
         session.clients.insert(2, c2);
         assert_eq!(
-            session.mediated_size_for_surface(1, None),
+            session.mediated_size_for_surface(1, &[]),
             Some((1920, 1080, 240))
         );
     }
@@ -11571,7 +11762,7 @@ mod tests {
         // Compositor must render at 800×600 logical (preserved across DPRs).
         // Highest scale wins (240) ⇒ 1600×1200 physical at scale 240.
         assert_eq!(
-            session.mediated_size_for_surface(1, None),
+            session.mediated_size_for_surface(1, &[]),
             Some((1600, 1200, 240))
         );
     }
@@ -11579,7 +11770,7 @@ mod tests {
     #[test]
     fn mediated_surface_size_none_when_no_clients() {
         let session = Session::new();
-        assert_eq!(session.mediated_size_for_surface(1, None), None);
+        assert_eq!(session.mediated_size_for_surface(1, &[]), None);
     }
 
     #[test]
@@ -11590,7 +11781,7 @@ mod tests {
         c1.surface_subscriptions.insert(3);
         session.clients.insert(1, c1);
         assert_eq!(
-            session.mediated_size_for_surface(3, None),
+            session.mediated_size_for_surface(3, &[]),
             Some((800, 600, 120))
         );
     }
@@ -11605,14 +11796,14 @@ mod tests {
         c1.surface_subscriptions.insert(2);
         session.clients.insert(1, c1);
         assert_eq!(
-            session.mediated_size_for_surface(1, None),
+            session.mediated_size_for_surface(1, &[]),
             Some((1920, 1080, 240))
         );
         assert_eq!(
-            session.mediated_size_for_surface(2, None),
+            session.mediated_size_for_surface(2, &[]),
             Some((640, 480, 120))
         );
-        assert_eq!(session.mediated_size_for_surface(3, None), None);
+        assert_eq!(session.mediated_size_for_surface(3, &[]), None);
     }
 
     #[test]
@@ -11623,12 +11814,184 @@ mod tests {
         c1.surface_subscriptions.insert(1);
         session.clients.insert(1, c1);
         assert_eq!(
-            session.mediated_size_for_surface(1, None),
+            session.mediated_size_for_surface(1, &[]),
             Some((5000, 3000, 240))
         );
         assert_eq!(
-            session.mediated_size_for_surface(1, Some((3840, 2160))),
+            session.mediated_size_for_surface(1, &[SurfaceEncoderPreference::H264Software]),
             Some((3840, 2160, 240))
+        );
+    }
+
+    /// The default chain carries H.264 as a fallback, and folding it into a
+    /// single ceiling used to hold every surface to 3840×2160 no matter what
+    /// the viewer could actually decode.  An AV1 client on a 5K panel gets
+    /// composited at 5K.
+    #[test]
+    fn mediated_surface_size_is_not_held_to_h264_by_a_fallback_in_the_chain() {
+        let mut session = Session::new();
+        let mut c1 = test_client();
+        c1.surface_view_sizes.insert(1, (5120, 2880, 240));
+        c1.surface_subscriptions.insert(1);
+        c1.surface_codec_support = blit_remote::CODEC_SUPPORT_AV1 | blit_remote::CODEC_SUPPORT_H264;
+        c1.surface_max_decode = (8192, 4352);
+        session.clients.insert(1, c1);
+        assert_eq!(
+            session.mediated_size_for_surface(1, &SurfaceEncoderPreference::defaults()),
+            Some((5120, 2880, 240))
+        );
+    }
+
+    /// …but a client that only speaks H.264 still composites at 3840×2160,
+    /// so nothing renders larger than it can possibly be sent.
+    #[test]
+    fn mediated_surface_size_stays_at_h264_ceiling_for_an_h264_only_client() {
+        let mut session = Session::new();
+        let mut c1 = test_client();
+        c1.surface_view_sizes.insert(1, (5120, 2880, 240));
+        c1.surface_subscriptions.insert(1);
+        c1.surface_codec_support = blit_remote::CODEC_SUPPORT_H264;
+        session.clients.insert(1, c1);
+        assert_eq!(
+            session.mediated_size_for_surface(1, &SurfaceEncoderPreference::defaults()),
+            Some((3840, 2160, 240))
+        );
+    }
+
+    /// Two viewers of one surface, one AV1 and one H.264-only, both asking
+    /// for 5K.  The composite serves the more capable of them; the H.264
+    /// viewer takes a downscale rather than dragging the surface to 4K.
+    #[test]
+    fn mediated_surface_size_composites_for_the_most_capable_subscriber() {
+        let mut session = Session::new();
+        let prefs = SurfaceEncoderPreference::defaults();
+        let mut av1 = test_client();
+        av1.surface_view_sizes.insert(1, (5120, 2880, 240));
+        av1.surface_subscriptions.insert(1);
+        av1.surface_codec_support = blit_remote::CODEC_SUPPORT_AV1;
+        av1.surface_max_decode = (8192, 4352);
+        let mut h264 = test_client();
+        h264.surface_view_sizes.insert(1, (5120, 2880, 240));
+        h264.surface_subscriptions.insert(1);
+        h264.surface_codec_support = blit_remote::CODEC_SUPPORT_H264;
+        h264.surface_max_decode = (3840, 2160);
+        session.clients.insert(1, av1);
+        session.clients.insert(2, h264);
+        assert_eq!(
+            session.mediated_size_for_surface(1, &prefs),
+            Some((5120, 2880, 240))
+        );
+        // And the H.264 viewer is served an aspect-preserving downscale of
+        // that composite, not a stream its decoder would reject.
+        let h264 = &session.clients[&2];
+        assert_eq!(
+            Session::per_client_encode_target(
+                Some((5120, 2880, 240)),
+                5120,
+                2880,
+                surface_encode_cap(&prefs, h264, 1),
+            ),
+            (3840, 2160)
+        );
+    }
+
+    /// A client subscribed to `surface_id` with the given codec support and
+    /// declared decode ceiling.
+    fn decoder_client(codec_support: u8, max_decode: (u16, u16)) -> ClientState {
+        let mut c = test_client();
+        c.surface_subscriptions.insert(1);
+        c.surface_codec_support = codec_support;
+        c.surface_max_decode = max_decode;
+        c
+    }
+
+    #[test]
+    fn surface_encode_cap_prefers_the_widest_eligible_backend_before_selection() {
+        let prefs = SurfaceEncoderPreference::defaults();
+        // Nothing selected yet: size for the best backend the client could
+        // land on, and let `SurfaceEncoder::new` skip the ones that can't
+        // carry it.
+        assert_eq!(
+            surface_encode_cap(
+                &prefs,
+                &decoder_client(blit_remote::CODEC_SUPPORT_AV1, (8192, 4352)),
+                1
+            ),
+            Some(SurfaceEncoderPreference::NvencAV1.max_dimensions())
+        );
+        assert_eq!(
+            surface_encode_cap(
+                &prefs,
+                &decoder_client(blit_remote::CODEC_SUPPORT_H264, (8192, 4352)),
+                1
+            ),
+            Some((3840, 2160))
+        );
+        // An empty chain means no cap at all.
+        assert_eq!(surface_encode_cap(&[], &decoder_client(0, (0, 0)), 1), None);
+    }
+
+    #[test]
+    fn surface_encode_cap_follows_the_backend_that_actually_won() {
+        let prefs = SurfaceEncoderPreference::defaults();
+        let mut c = decoder_client(blit_remote::CODEC_SUPPORT_AV1, (8192, 4352));
+        c.surface_subs.entry(1).or_default().selected_encoder =
+            Some(SurfaceEncoderPreference::H264Vaapi);
+        // The chain fell back to H.264 despite the client speaking AV1, so
+        // the surface is sized for H.264 rather than for the AV1 it didn't
+        // get.
+        assert_eq!(surface_encode_cap(&prefs, &c, 1), Some((3840, 2160)));
+        c.surface_subs.entry(1).or_default().selected_encoder =
+            Some(SurfaceEncoderPreference::AV1Vaapi);
+        assert_eq!(
+            surface_encode_cap(&prefs, &c, 1),
+            Some(SurfaceEncoderPreference::AV1Vaapi.max_dimensions())
+        );
+    }
+
+    /// After a creation refused for size, the retry must be sized to what
+    /// every eligible backend clears — otherwise the surface asks for the
+    /// same impossible frame forever and never shows a picture.
+    #[test]
+    fn surface_encode_cap_degrades_to_the_tightest_after_an_oversized_refusal() {
+        let prefs = SurfaceEncoderPreference::defaults();
+        let mut c = decoder_client(blit_remote::CODEC_SUPPORT_AV1, (8192, 4352));
+        {
+            let sub = c.surface_subs.entry(1).or_default();
+            // Degraded is set alongside a stale winner to pin the
+            // precedence: the degrade wins, so a backend that has started
+            // failing can't strand the surface at a size nothing accepts.
+            sub.selected_encoder = Some(SurfaceEncoderPreference::AV1Vaapi);
+            sub.encoder_cap_degraded = true;
+        }
+        assert_eq!(
+            surface_encode_cap(&prefs, &c, 1),
+            Some(SurfaceEncoderPreference::AV1Software.max_dimensions())
+        );
+    }
+
+    /// The decoder ceiling is a hard intersection: advertising AV1 says
+    /// nothing about how large a frame the browser will actually accept, so
+    /// a client that never declared one stays at 4K however capable the
+    /// encoder is.
+    #[test]
+    fn surface_encode_cap_never_exceeds_the_declared_decoder_ceiling() {
+        let prefs = SurfaceEncoderPreference::defaults();
+        let av1 = blit_remote::CODEC_SUPPORT_AV1;
+        assert_eq!(
+            surface_encode_cap(&prefs, &decoder_client(av1, (0, 0)), 1),
+            Some((3840, 2160)),
+            "undeclared decode ceiling must not unlock >4K"
+        );
+        assert_eq!(
+            surface_encode_cap(&prefs, &decoder_client(av1, (5120, 2880)), 1),
+            Some((5120, 2880)),
+            "a declared ceiling below the encoder's wins"
+        );
+        assert_eq!(
+            surface_encode_cap(&prefs, &decoder_client(av1, (16384, 8704)), 1),
+            Some(SurfaceEncoderPreference::NvencAV1.max_dimensions()),
+            "a declared ceiling above the encoder's does not raise it"
         );
     }
 
@@ -11646,7 +12009,7 @@ mod tests {
         session.clients.insert(1, c1);
         session.clients.insert(2, c2);
         assert_eq!(
-            session.mediated_size_for_surface(1, None),
+            session.mediated_size_for_surface(1, &[]),
             Some((1920, 1080, 120))
         );
     }
@@ -11668,7 +12031,7 @@ mod tests {
         session.clients.insert(1, full);
         session.clients.insert(2, thumb);
         assert_eq!(
-            session.mediated_size_for_surface(1, None),
+            session.mediated_size_for_surface(1, &[]),
             Some((1920, 1080, 120))
         );
     }
@@ -11685,7 +12048,7 @@ mod tests {
         thumb.surface_view_sizes.insert(1, (314, 176, 120));
         thumb.surface_subs.entry(1).or_default().scaled_target = Some((314, 176));
         session.clients.insert(1, thumb);
-        assert_eq!(session.mediated_size_for_surface(1, None), None);
+        assert_eq!(session.mediated_size_for_surface(1, &[]), None);
     }
 
     /// A scaled target is just a view box, so it inherits the same clamps —
@@ -11694,12 +12057,12 @@ mod tests {
     fn per_client_encode_target_honours_a_scaled_target() {
         // 314-wide box against a 16:9 native ⇒ width-bound, even-rounded.
         assert_eq!(
-            Session::per_client_encode_target(Some((314, 176, 120)), 1920, 1080, &[]),
+            Session::per_client_encode_target(Some((314, 176, 120)), 1920, 1080, None),
             (314, 176)
         );
         // A thumbnail asking for more than native still gets native.
         assert_eq!(
-            Session::per_client_encode_target(Some((4000, 4000, 120)), 640, 480, &[]),
+            Session::per_client_encode_target(Some((4000, 4000, 120)), 640, 480, None),
             (640, 480)
         );
     }
@@ -11708,7 +12071,7 @@ mod tests {
     fn per_client_encode_target_uses_view_size() {
         // 1280×720 viewport, 1920×1080 native (both 16:9) ⇒ 1280×720.
         assert_eq!(
-            Session::per_client_encode_target(Some((1280, 720, 120)), 1920, 1080, &[]),
+            Session::per_client_encode_target(Some((1280, 720, 120)), 1920, 1080, None),
             (1280, 720)
         );
     }
@@ -11718,7 +12081,7 @@ mod tests {
         // Viewport 4000×3000 but native is only 1920×1080 — encoding bigger
         // would just upscale, so the encoder runs at native.
         assert_eq!(
-            Session::per_client_encode_target(Some((4000, 3000, 240)), 1920, 1080, &[]),
+            Session::per_client_encode_target(Some((4000, 3000, 240)), 1920, 1080, None),
             (1920, 1080)
         );
     }
@@ -11732,7 +12095,7 @@ mod tests {
                 Some((8000, 4500, 240)),
                 8000,
                 4500,
-                &[SurfaceEncoderPreference::H264Software],
+                Some((3840, 2160))
             ),
             (3840, 2160)
         );
@@ -11742,12 +12105,12 @@ mod tests {
     fn per_client_encode_target_falls_back_to_native_without_view_size() {
         // Client hasn't sent C2S_SURFACE_RESIZE yet — encode at native.
         assert_eq!(
-            Session::per_client_encode_target(None, 800, 600, &[]),
+            Session::per_client_encode_target(None, 800, 600, None),
             (800, 600)
         );
         // Zero-dim viewport (cleared by client) ⇒ also fall back.
         assert_eq!(
-            Session::per_client_encode_target(Some((0, 0, 120)), 800, 600, &[]),
+            Session::per_client_encode_target(Some((0, 0, 120)), 800, 600, None),
             (800, 600)
         );
     }
@@ -11758,7 +12121,7 @@ mod tests {
         // Width-bound at 1000 keeps height at 1000*1080/1920 = 562 →
         // round even = 562 (already even).
         assert_eq!(
-            Session::per_client_encode_target(Some((1000, 1000, 120)), 1920, 1080, &[]),
+            Session::per_client_encode_target(Some((1000, 1000, 120)), 1920, 1080, None),
             (1000, 562)
         );
     }
@@ -11769,7 +12132,7 @@ mod tests {
         // Width-bound at 500 keeps height at 500*1080/1920 = 281,
         // rounded even = 280.
         assert_eq!(
-            Session::per_client_encode_target(Some((500, 1000, 120)), 1920, 1080, &[]),
+            Session::per_client_encode_target(Some((500, 1000, 120)), 1920, 1080, None),
             (500, 280)
         );
     }
@@ -11780,7 +12143,7 @@ mod tests {
         // Height-bound at 500 keeps width at 500*1080/1920 = 281,
         // rounded even = 280.
         assert_eq!(
-            Session::per_client_encode_target(Some((1000, 500, 120)), 1080, 1920, &[]),
+            Session::per_client_encode_target(Some((1000, 500, 120)), 1080, 1920, None),
             (280, 500)
         );
     }
@@ -11790,7 +12153,7 @@ mod tests {
         // Native 101×51 — odd dimensions.  Same-shape viewport rounds
         // down to even.
         assert_eq!(
-            Session::per_client_encode_target(Some((101, 51, 120)), 101, 51, &[]),
+            Session::per_client_encode_target(Some((101, 51, 120)), 101, 51, None),
             (100, 50)
         );
     }
@@ -11801,7 +12164,7 @@ mod tests {
         // → floor to 2.  Encoders reject 0-dim and most reject 1-dim
         // because chroma subsampling needs at least a 2×2 grid.
         assert_eq!(
-            Session::per_client_encode_target(Some((1, 1, 120)), 100, 1000, &[]),
+            Session::per_client_encode_target(Some((1, 1, 120)), 100, 1000, None),
             (2, 2)
         );
     }
@@ -11869,7 +12232,7 @@ mod tests {
         session.clients.insert(1, c1);
         session.clients.insert(2, c2);
         assert_eq!(
-            session.mediated_size_for_surface(1, None),
+            session.mediated_size_for_surface(1, &[]),
             Some((640, 360, 120))
         );
     }

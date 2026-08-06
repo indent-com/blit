@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use blit_remote::{AXIS_SOURCE_WHEEL, PointerAxisEvent};
 use blit_remote::{
-    C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_LIST, C2S_SURFACE_POINTER,
-    CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CODEC_SUPPORT_AV1, CODEC_SUPPORT_H264,
-    EXIT_STATUS_UNKNOWN, S2C_CLIPBOARD_CONTENT, S2C_CLIPBOARD_LIST, S2C_EXITED, S2C_HELLO,
-    S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SURFACE_CAPTURE, S2C_SURFACE_FRAME,
+    C2S_CLIENT_FEATURES, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_LIST,
+    C2S_SURFACE_POINTER, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CODEC_SUPPORT_AV1,
+    CODEC_SUPPORT_H264, EXIT_STATUS_UNKNOWN, S2C_CLIPBOARD_CONTENT, S2C_CLIPBOARD_LIST, S2C_EXITED,
+    S2C_HELLO, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SURFACE_CAPTURE, S2C_SURFACE_FRAME,
     S2C_SURFACE_LIST, S2C_TERM_CWD, S2C_TEXT, S2C_TITLE, S2C_UPDATE, SURFACE_FRAME_CODEC_AV1,
     SURFACE_FRAME_CODEC_MASK, SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState, msg_ack,
     msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_close, msg_create2,
@@ -909,17 +909,56 @@ pub async fn cmd_capture(
 /// Terminals: writes a simple binary format:
 ///   magic:   "BLITREC\n" (8 bytes)
 ///   records: [ timestamp_us: u64 LE | len: u32 LE | data: [u8; len] ]*
+/// What `cmd_record` is recording.  The codec and size options only mean
+/// anything for a surface, so they ride along with that variant instead of
+/// being passed as arguments a terminal recording has to supply and ignore.
+pub enum RecordSource {
+    Pty,
+    Surface {
+        codecs: Vec<String>,
+        /// `WIDTHxHEIGHT` in physical pixels, if the caller wants the
+        /// surface served at a specific size.
+        size: Option<String>,
+    },
+}
+
+/// Parse a `WIDTHxHEIGHT` argument into physical pixel dimensions.
+fn parse_record_size(size: Option<&str>) -> Result<Option<(u16, u16)>, String> {
+    let Some(s) = size else { return Ok(None) };
+    let (w, h) = s
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("bad --size {s:?} (expected WIDTHxHEIGHT, e.g. 5120x2880)"))?;
+    let parse = |v: &str, axis| {
+        v.trim()
+            .parse::<u16>()
+            .map_err(|_| format!("bad --size {axis} {v:?}"))
+            .and_then(|n| {
+                if n > 0 {
+                    Ok(n)
+                } else {
+                    Err(format!("--size {axis} must be nonzero"))
+                }
+            })
+    };
+    Ok(Some((parse(w, "width")?, parse(h, "height")?)))
+}
+
 pub async fn cmd_record(
     transport: Transport,
     id: u16,
     output: Option<String>,
     max_frames: u32,
     max_duration: f64,
-    is_surface: bool,
-    codecs: Vec<String>,
+    source: RecordSource,
 ) -> Result<(), String> {
     use std::io::Write;
     use std::time::{Duration, Instant};
+
+    let is_surface = matches!(source, RecordSource::Surface { .. });
+    let (codecs, size) = match source {
+        RecordSource::Pty => (Vec::new(), None),
+        RecordSource::Surface { codecs, size } => (codecs, parse_record_size(size.as_deref())?),
+    };
 
     let mut conn = AgentConn::connect(transport).await?;
     let start = Instant::now();
@@ -974,6 +1013,17 @@ pub async fn cmd_record(
             }
             mask
         };
+        if let Some((w, h)) = size {
+            // Announce the decode ceiling before asking for the size, so the
+            // server has it when it decides how large to composite.  A
+            // recorder writes the bitstream straight to a file, so its only
+            // real ceiling is what it asked for.
+            let mut features = vec![C2S_CLIENT_FEATURES, codec_support];
+            features.extend_from_slice(&w.to_le_bytes());
+            features.extend_from_slice(&h.to_le_bytes());
+            conn.send(&features).await?;
+            conn.send(&msg_surface_resize(id, w, h, 120)).await?;
+        }
         if codec_support != 0 {
             conn.send(&msg_surface_subscribe_ext(id, codec_support, 0, 0))
                 .await?;

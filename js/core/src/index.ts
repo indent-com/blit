@@ -141,6 +141,7 @@ export {
   BlitSurfaceCanvas,
   detectCodecSupport,
   getCodecSupport,
+  getMaxDecodeSize,
 } from "./BlitSurfaceCanvas";
 export type { BlitSurfaceCanvasOptions } from "./BlitSurfaceCanvas";
 

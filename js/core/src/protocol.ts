@@ -599,10 +599,29 @@ export function buildClipboardMessage(
   return msg;
 }
 
-export function buildClientFeaturesMessage(codecSupport: number): Uint8Array {
-  const msg = new Uint8Array(2);
+/**
+ * Build a C2S_CLIENT_FEATURES message.
+ *
+ * `maxDecodeW`/`maxDecodeH` are the largest frame this browser's video
+ * decoder was confirmed to handle, as little-endian u16s.  `0` means "not
+ * determined"; the server then holds the client to the H.264 ceiling rather
+ * than assume a decoder that advertises AV1 will take a 5K frame.  Servers
+ * predating the field ignore the extra bytes.
+ */
+export function buildClientFeaturesMessage(
+  codecSupport: number,
+  maxDecodeW: number = 0,
+  maxDecodeH: number = 0,
+): Uint8Array {
+  const msg = new Uint8Array(6);
   msg[0] = C2S_CLIENT_FEATURES;
   msg[1] = codecSupport & 0xff;
+  const w = maxDecodeW & 0xffff;
+  const h = maxDecodeH & 0xffff;
+  msg[2] = w & 0xff;
+  msg[3] = (w >> 8) & 0xff;
+  msg[4] = h & 0xff;
+  msg[5] = (h >> 8) & 0xff;
   return msg;
 }
 

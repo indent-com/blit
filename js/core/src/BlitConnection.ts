@@ -86,7 +86,7 @@ import {
 import { AudioPlayer } from "./AudioPlayer";
 import { SurfaceStore } from "./SurfaceStore";
 import { TerminalStore, type BlitWasmModule } from "./TerminalStore";
-import { detectCodecSupport } from "./BlitSurfaceCanvas";
+import { detectCodecSupport, getMaxDecodeSize } from "./BlitSurfaceCanvas";
 import {
   FEATURE_FS,
   FS_CLOSED_CLIENT_REQUEST,
@@ -3073,14 +3073,16 @@ export class BlitConnection {
   }
 
   /**
-   * Advertise client capabilities to the server.  Currently carries the
-   * video codec support bitmask so the server picks a compatible encoder.
-   * Called automatically when the connection is established and codec
-   * probing completes.
+   * Advertise client capabilities to the server: which video codecs this
+   * browser decodes, so the server picks a compatible encoder, and the
+   * largest frame it decodes, so the server knows whether it may composite
+   * a surface above the H.264 ceiling for us.  Called automatically when
+   * the connection is established and codec probing completes.
    */
   sendClientFeatures(codecSupport: number): void {
     if (this.transport.status !== "connected") return;
-    this.transport.send(buildClientFeaturesMessage(codecSupport));
+    const [maxW, maxH] = getMaxDecodeSize();
+    this.transport.send(buildClientFeaturesMessage(codecSupport, maxW, maxH));
   }
 
   isReady(): boolean {

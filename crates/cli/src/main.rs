@@ -289,7 +289,15 @@ async fn async_main() {
                     frames,
                     duration,
                 } => {
-                    agent::cmd_record(transport, id, output, frames, duration, false, vec![]).await
+                    agent::cmd_record(
+                        transport,
+                        id,
+                        output,
+                        frames,
+                        duration,
+                        agent::RecordSource::Pty,
+                    )
+                    .await
                 }
             };
             if let Err(e) = result {
@@ -340,7 +348,21 @@ async fn async_main() {
                     frames,
                     duration,
                     codec,
-                } => agent::cmd_record(transport, id, output, frames, duration, true, codec).await,
+                    size,
+                } => {
+                    agent::cmd_record(
+                        transport,
+                        id,
+                        output,
+                        frames,
+                        duration,
+                        agent::RecordSource::Surface {
+                            codecs: codec,
+                            size,
+                        },
+                    )
+                    .await
+                }
             };
             if let Err(e) = result {
                 eprintln!("blit: {e}");
