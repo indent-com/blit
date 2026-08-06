@@ -4804,6 +4804,13 @@ async fn tick(state: &AppState) -> TickOutcome {
         }
         let mut pending_vulkan_encoder_setups: Vec<VulkanEncoderSetup> = Vec::new();
         let mut pending_vulkan_keyframe_requests: Vec<(u32, u64)> = Vec::new();
+        // Downscale targets registered by a server-side encoder this tick is
+        // replacing with a Vulkan Video session: `(surface, target_w,
+        // target_h)`.  Cleared with the setup commands below — leaving one
+        // registered keeps the compositor blitting into it every frame, and
+        // that concurrent consumer corrupts the Vulkan session's bitstreams
+        // (tile data no decoder accepts), besides being pure waste.
+        let mut pending_vulkan_clear_targets: Vec<(u32, u32, u32)> = Vec::new();
         let mut pending_vulkan_qp_updates: Vec<(u32, u64, u8)> = Vec::new();
 
         for work in &client_work {
@@ -5339,11 +5346,27 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // 4090 supports (the Raphael iGPU does not — its caps
                         // query refuses, the session is declined, and the
                         // fallback chain takes over).  AV1 through Vulkan is
-                        // still 4:2:0-only here, so it steps aside rather than
-                        // silently downgrading a client that asked for 4:4:4.
-                        if want_444 && pref == SurfaceEncoderPreference::VulkanVideoAV1 {
+                        // still 4:2:0-only here, so for a client that asked
+                        // for 4:4:4 it steps aside — but only when a
+                        // server-side encoder would actually deliver 4:4:4.
+                        // When the chain downstream would answer with 4:2:0
+                        // anyway (NVENC AV1 on the RTX 4090 has no 4:4:4),
+                        // yielding buys the client no chroma and costs the
+                        // compositor-resident encode.
+                        if want_444
+                            && pref == SurfaceEncoderPreference::VulkanVideoAV1
+                            && surface_encoder::server_chain_would_serve_444(
+                                &state.config.surface_encoders,
+                                codec_support,
+                                px_w,
+                                px_h,
+                            )
+                        {
                             continue;
                         }
+                        // What this session will actually encode: av1-vulkan
+                        // stays 4:2:0 even when the client could take 4:4:4.
+                        let is_444 = want_444 && pref != SurfaceEncoderPreference::VulkanVideoAV1;
                         let qp = match pref {
                             SurfaceEncoderPreference::VulkanVideoAV1 => {
                                 encoding.bandwidth.av1_qp_for_vulkan()
@@ -5355,7 +5378,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // the chroma actually being encoded — promising High
                         // 4:4:4 Predictive for a High 4:2:0 stream (or the
                         // reverse) misconfigures it.
-                        let enc_name: &'static str = match (pref, want_444) {
+                        let enc_name: &'static str = match (pref, is_444) {
                             (SurfaceEncoderPreference::VulkanVideoH264, true) => {
                                 "h264-vulkan 4:4:4"
                             }
@@ -5371,25 +5394,36 @@ async fn tick(state: &AppState) -> TickOutcome {
                             qp,
                             width: px_w,
                             height: px_h,
-                            is_444: want_444,
+                            is_444,
                         });
                         pending_vulkan_keyframe_requests.push((sid as u32, work.cid));
                         if let Some(s) = client.surface_subs.get_mut(&sid) {
                             s.encoder = None;
+                            // A server-side creation still in flight would
+                            // land after this selection and clobber the
+                            // compositor's ownership — mark it stale, the
+                            // same way the decline path does.
+                            if s.encode_in_flight || s.creation_in_flight {
+                                s.encoder_invalidated = true;
+                            }
+                            // And clear any downscale target an interim
+                            // server-side encoder registered (see
+                            // `pending_vulkan_clear_targets`).
+                            if let Some((tw, th)) = s.last_registered_target.take() {
+                                pending_vulkan_clear_targets.push((sid as u32, tw, th));
+                            }
                         }
                         client
                             .vulkan_video_surfaces
                             .insert(sid, (enc_name, pref.codec_flag()));
                         let codec_str = match pref {
                             // High 4:4:4 Predictive, else High 4:2:0.
-                            SurfaceEncoderPreference::VulkanVideoH264 => if want_444 {
-                                "avc1.F4001f"
-                            } else {
-                                "avc1.640034"
+                            SurfaceEncoderPreference::VulkanVideoH264 => {
+                                if is_444 { "avc1.F4001f" } else { "avc1.640034" }.to_string()
                             }
-                            .to_string(),
                             SurfaceEncoderPreference::VulkanVideoAV1 => {
-                                // 4:2:0 only on this path — see the skip above.
+                                // 4:2:0 only on this path — `is_444` is
+                                // forced off for av1-vulkan above.
                                 let profile =
                                     surface_encoder::av1_profile_digit(ChromaSubsampling::Cs420);
                                 let level = surface_encoder::av1_level_for(px_w, px_h);
@@ -5418,7 +5452,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // refusal comes back asynchronously as
                     // `VulkanEncoderUnavailable`, which latches
                     // `vulkan_refused` so a later tick retries the tier
-                    // below with this encoder skipped.
+                    // below with this encoder skipped.  (An NVENC encoder
+                    // running against the same surface also corrupts the
+                    // Vulkan session's bitstreams into tile data no decoder
+                    // accepts, so this skip is a correctness matter, not
+                    // just waste.)
                     if vulkan_selected {
                         continue;
                     }
@@ -5521,6 +5559,25 @@ async fn tick(state: &AppState) -> TickOutcome {
                      switching that client to a server-side encoder",
                 );
             }
+        }
+
+        // Clear downscale targets orphaned by this tick's Vulkan takeovers,
+        // before the session setups so the compositor stops filling them
+        // ahead of the first Vulkan encode.
+        if !pending_vulkan_clear_targets.is_empty()
+            && let Some(cs) = sess.compositor.as_mut()
+        {
+            for (surface_id, tw, th) in pending_vulkan_clear_targets {
+                let _ = cs.handle.command_tx.send(
+                    blit_compositor::CompositorCommand::ClearDownscaleTarget {
+                        surface_id,
+                        target_w: tw,
+                        target_h: th,
+                    },
+                );
+                cs.last_pixels.remove(&(surface_id as u16, tw, th));
+            }
+            cs.handle.wake();
         }
 
         // Send Vulkan Video encoder commands to compositor.
@@ -6048,6 +6105,26 @@ async fn tick(state: &AppState) -> TickOutcome {
             let mut receilinged_surfaces: Vec<u16> = Vec::new();
 
             for result in results {
+                // The compositor took this (surface, client) over while the
+                // encoder was being built: a Vulkan Video session now owns
+                // delivery, and installing this one would run two encoders
+                // against one decoder — the enc_msg below would reconfigure
+                // the client back to the server-side codec, and the target
+                // registration would redirect the composite the Vulkan
+                // session encodes from.  Drop the freshly built encoder.
+                if sess
+                    .clients
+                    .get(&result.cid)
+                    .is_some_and(|c| c.vulkan_video_surfaces.contains_key(&result.sid))
+                {
+                    if let Some(client) = sess.clients.get_mut(&result.cid)
+                        && let Some(s) = client.surface_subs.get_mut(&result.sid)
+                    {
+                        s.creation_in_flight = false;
+                        s.encoder_invalidated = false;
+                    }
+                    continue;
+                }
                 let Some(encoder) = result.encoder else {
                     if let Some(client) = sess.clients.get_mut(&result.cid)
                         && let Some(s) = client.surface_subs.get_mut(&result.sid)

@@ -86,19 +86,19 @@ impl SurfaceEncoderPreference {
         vec![
             // Vulkan Video encodes on the compositor's own device with no
             // server-side encode at all, so it leads.  It is skipped unless
-            // the surface is at native size and the client would have been
-            // served 4:2:0 anyway, and a session that cannot be created — or
-            // that stops producing bitstreams — falls through to the entries
-            // below, so listing it first costs nothing when it does not apply.
+            // the surface is at native size, and a session that cannot be
+            // created — or that stops producing bitstreams — falls through
+            // to the entries below, so listing it first costs nothing when
+            // it does not apply.
             //
-            // H.264 leads the Vulkan tier, against the AV1-first ordering used
-            // below it, because `av1-vulkan` cannot yet emit a sequence header
-            // and so declines every session.  Refusals are latched per encoder
-            // rather than per tier, so a declining `av1-vulkan` no longer
-            // disqualifies H.264 — but putting it first would still cost every
-            // new subscription a decline round-trip, during which the client is
-            // served by a server-side encoder and then switched.  Move it ahead
-            // of `h264-vulkan` once it produces a decodable stream.
+            // H.264 leads the Vulkan tier, against the AV1-first ordering
+            // used below it, because its 4:4:4 path can serve a
+            // 4:4:4-capable client at full chroma where `av1-vulkan` is
+            // 4:2:0-only.  For such clients `av1-vulkan` steps aside only
+            // when a server-side encoder would actually deliver 4:4:4 (see
+            // [`server_chain_would_serve_444`]); otherwise it takes the
+            // session at the same 4:2:0 the fallback chain would have
+            // produced, saving the server-side encode.
             Self::VulkanVideoH264,
             Self::VulkanVideoAV1,
             Self::NvencAV1,
@@ -262,6 +262,75 @@ impl SurfaceEncoderPreference {
             }
         }
     }
+}
+
+/// Predict whether the server-side fallback chain ([`SurfaceEncoder::new`])
+/// would serve this client 4:4:4, without creating an encoder.
+///
+/// The Vulkan-tier selection uses this to decide whether `av1-vulkan`
+/// (4:2:0-only) should step aside for a 4:4:4-capable client: yielding is
+/// only worth it when the chain would actually deliver 4:4:4.  On a GPU
+/// whose NVENC cannot encode AV1 4:4:4 (the RTX 4090), the chain answers
+/// with `av1-nvenc` 4:2:0 — the same chroma `av1-vulkan` would have encoded
+/// on the compositor's device without any server-side encode.
+///
+/// Mirrors the chain's walk: the first encoder that would be created wins,
+/// and each tries 4:4:4 before falling back to 4:2:0.  NVENC's answer is
+/// exact (a cached caps query).  VA-API availability is only knowable by
+/// probing a device, so a VA-API candidate that might serve 4:4:4 counts as
+/// serving it: overestimating keeps `av1-vulkan` stepping aside (the status
+/// quo), underestimating would trade away chroma the client asked for.
+pub fn server_chain_would_serve_444(
+    preferences: &[SurfaceEncoderPreference],
+    codec_support: u8,
+    width: u32,
+    height: u32,
+) -> bool {
+    for &pref in preferences {
+        if pref.is_vulkan_video()
+            || !pref.supported_by_client(codec_support)
+            || !pref.fits(width, height)
+        {
+            continue;
+        }
+        let eligible_444 =
+            pref.supports_444_by_encoder() && pref.supports_444_by_client(codec_support);
+        match pref {
+            SurfaceEncoderPreference::NvencH264 | SurfaceEncoderPreference::NvencAV1 => {
+                let codec = if pref == SurfaceEncoderPreference::NvencAV1 {
+                    "av1"
+                } else {
+                    "h264"
+                };
+                // No NVENC on this box: the chain moves past it, so do we.
+                let Ok(caps) = crate::nvenc_encode::caps(codec, false) else {
+                    continue;
+                };
+                // A frame outside the engine's range refuses both chromas.
+                if caps.refuse(width, height).is_some() {
+                    continue;
+                }
+                return eligible_444 && caps.yuv444;
+            }
+            SurfaceEncoderPreference::H264Vaapi | SurfaceEncoderPreference::AV1Vaapi => {
+                // Whether a device exists — and, for AV1, whether it encodes
+                // 4:4:4 — is a probe.  A candidate that might serve 4:4:4
+                // counts as serving it; a 4:2:0-only candidate that might
+                // not exist at all cannot conclude the walk either way.
+                if eligible_444 {
+                    return true;
+                }
+            }
+            SurfaceEncoderPreference::H264Software | SurfaceEncoderPreference::AV1Software => {
+                // Software encoders always instantiate.
+                return eligible_444;
+            }
+            // Unreachable: filtered by `is_vulkan_video` above.
+            SurfaceEncoderPreference::VulkanVideoH264
+            | SurfaceEncoderPreference::VulkanVideoAV1 => {}
+        }
+    }
+    false
 }
 
 /// Chroma subsampling mode.
@@ -2819,6 +2888,63 @@ mod tests {
         );
         assert_eq!(SurfaceEncoderPreference::tightest_for_list(&[]), None);
         assert_eq!(SurfaceEncoderPreference::widest_for_list(&[]), None);
+    }
+
+    /// The 4:4:4 prediction the Vulkan tier consults before `av1-vulkan`
+    /// steps aside.  Only the NVENC arms depend on host hardware (a cached
+    /// caps query), so these cases stick to the structurally-decided
+    /// backends.
+    #[test]
+    fn server_chain_444_prediction_follows_the_walk() {
+        use SurfaceEncoderPreference as P;
+        let all =
+            CODEC_SUPPORT_H264 | CODEC_SUPPORT_AV1 | CODEC_SUPPORT_H264_444 | CODEC_SUPPORT_AV1_444;
+        let no_444 = CODEC_SUPPORT_H264 | CODEC_SUPPORT_AV1;
+
+        // Software AV1 always instantiates and encodes 4:4:4 — but only for
+        // a client that announced the AV1 4:4:4 bit.
+        assert!(server_chain_would_serve_444(
+            &[P::AV1Software],
+            all,
+            800,
+            600
+        ));
+        assert!(!server_chain_would_serve_444(
+            &[P::AV1Software],
+            no_444,
+            800,
+            600
+        ));
+
+        // H.264 VA-API is structurally 4:2:0-only, and whether the device
+        // exists at all is a probe — it cannot conclude the walk, so an
+        // empty remainder answers "no 4:4:4".
+        assert!(!server_chain_would_serve_444(
+            &[P::H264Vaapi],
+            all,
+            800,
+            600
+        ));
+
+        // AV1 VA-API's 4:4:4 support is a probe: it counts as serving.
+        assert!(server_chain_would_serve_444(&[P::AV1Vaapi], all, 800, 600));
+
+        // Vulkan entries are the caller's own tier, not the server chain.
+        assert!(!server_chain_would_serve_444(
+            &[P::VulkanVideoH264, P::VulkanVideoAV1],
+            all,
+            800,
+            600
+        ));
+
+        // A frame past a backend's ceiling skips it: software AV1 stops at
+        // the H.264 ceiling, so a 5K frame falls through to nothing.
+        assert!(!server_chain_would_serve_444(
+            &[P::AV1Software],
+            all,
+            5120,
+            2880
+        ));
     }
 
     #[test]
