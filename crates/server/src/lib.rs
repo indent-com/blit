@@ -496,10 +496,11 @@ struct LastPixels {
     timestamp_ms: u32,
     /// Pixel-cache only: an on-demand BGRA readback published while an
     /// NV12 zero-copy stream owns this key.  The encode tick must not
-    /// feed it to an encoder — its color conversion is full-range while
-    /// NVENC's ARGB path is limited-range, so one such frame in an NV12
-    /// stream lifts blacks to gray for a frame.  Raw-paint consumers
-    /// (initial paint, capture) use it freely.
+    /// feed it to an encoder — the stream already carries this frame,
+    /// and re-encoding it through NVENC's ARGB conversion (whose
+    /// rounding differs from the zero-copy shader's) shifts the picture
+    /// for one frame.  Raw-paint consumers (initial paint, capture) use
+    /// it freely.
     encoder_skip: bool,
 }
 

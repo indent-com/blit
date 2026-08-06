@@ -808,8 +808,22 @@ fn build_h264_sps_nal(width_in_mbs: u16, height_in_mbs: u16, width: u32, height:
         w.write_bit(0);
     }
 
-    // vui_parameters_present_flag
-    w.write_bit(0);
+    // vui_parameters_present_flag — carries video_full_range_flag=1: blit's
+    // pixels are full-range BT.601 end to end, and a decoder told nothing
+    // assumes limited, which would lift every black to gray.
+    w.write_bit(1);
+    w.write_bit(0); // aspect_ratio_info_present_flag
+    w.write_bit(0); // overscan_info_present_flag
+    w.write_bit(1); // video_signal_type_present_flag
+    w.write_bits(5, 3); // video_format: unspecified
+    w.write_bit(1); // video_full_range_flag
+    w.write_bit(0); // colour_description_present_flag
+    w.write_bit(0); // chroma_loc_info_present_flag
+    w.write_bit(0); // timing_info_present_flag
+    w.write_bit(0); // nal_hrd_parameters_present_flag
+    w.write_bit(0); // vcl_hrd_parameters_present_flag
+    w.write_bit(0); // pic_struct_present_flag
+    w.write_bit(0); // bitstream_restriction_flag
 
     let rbsp = w.finish();
 
@@ -933,11 +947,11 @@ unsafe fn bgra_to_nv12_fast(
             let g11 = unsafe { *src_row1.add(off + 5) } as i32;
             let r11 = unsafe { *src_row1.add(off + 6) } as i32;
 
-            // BT.601 limited-range Y for each pixel.
-            let y00 = ((66 * r00 + 129 * g00 + 25 * b00 + 128) >> 8) + 16;
-            let y01 = ((66 * r01 + 129 * g01 + 25 * b01 + 128) >> 8) + 16;
-            let y10 = ((66 * r10 + 129 * g10 + 25 * b10 + 128) >> 8) + 16;
-            let y11 = ((66 * r11 + 129 * g11 + 25 * b11 + 128) >> 8) + 16;
+            // BT.601 full-range Y for each pixel.
+            let y00 = (77 * r00 + 150 * g00 + 29 * b00 + 128) >> 8;
+            let y01 = (77 * r01 + 150 * g01 + 29 * b01 + 128) >> 8;
+            let y10 = (77 * r10 + 150 * g10 + 29 * b10 + 128) >> 8;
+            let y11 = (77 * r11 + 150 * g11 + 29 * b11 + 128) >> 8;
             unsafe {
                 *dst_y0.add(cx * 2) = y00.clamp(0, 255) as u8;
                 *dst_y0.add(cx * 2 + 1) = y01.clamp(0, 255) as u8;
@@ -951,8 +965,8 @@ unsafe fn bgra_to_nv12_fast(
             let avg_r = (r00 + r01 + r10 + r11) >> 2;
             let avg_g = (g00 + g01 + g10 + g11) >> 2;
             let avg_b = (b00 + b01 + b10 + b11) >> 2;
-            let u = ((-38 * avg_r - 74 * avg_g + 112 * avg_b + 128) >> 8) + 128;
-            let v = ((112 * avg_r - 94 * avg_g - 18 * avg_b + 128) >> 8) + 128;
+            let u = ((-43 * avg_r - 85 * avg_g + 128 * avg_b + 128) >> 8) + 128;
+            let v = ((128 * avg_r - 107 * avg_g - 21 * avg_b + 128) >> 8) + 128;
             unsafe {
                 *dst_uv.add(cx * 2) = u.clamp(0, 255) as u8;
                 *dst_uv.add(cx * 2 + 1) = v.clamp(0, 255) as u8;
@@ -985,7 +999,7 @@ unsafe fn bgra_to_nv12_padded(
             let r = src[i + 2] as i32;
             let g = src[i + 1] as i32;
             let b = src[i] as i32;
-            let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            let y = (77 * r + 150 * g + 29 * b + 128) >> 8;
             unsafe { *dst_row.add(col) = y.clamp(0, 255) as u8 };
         }
     }
@@ -1012,8 +1026,8 @@ unsafe fn bgra_to_nv12_padded(
             let avg_r = r_sum >> 2;
             let avg_g = g_sum >> 2;
             let avg_b = b_sum >> 2;
-            let u = ((-38 * avg_r - 74 * avg_g + 112 * avg_b + 128) >> 8) + 128;
-            let v = ((112 * avg_r - 94 * avg_g - 18 * avg_b + 128) >> 8) + 128;
+            let u = ((-43 * avg_r - 85 * avg_g + 128 * avg_b + 128) >> 8) + 128;
+            let v = ((128 * avg_r - 107 * avg_g - 21 * avg_b + 128) >> 8) + 128;
             unsafe {
                 *dst_row.add(cx * 2) = u.clamp(0, 255) as u8;
                 *dst_row.add(cx * 2 + 1) = v.clamp(0, 255) as u8;
@@ -2681,9 +2695,9 @@ impl VaapiAv1Encoder {
                     let r = bgra[i + 2] as i32;
                     let g = bgra[i + 1] as i32;
                     let b = bgra[i] as i32;
-                    let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-                    let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                    let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                    let y = (77 * r + 150 * g + 29 * b + 128) >> 8;
+                    let u = ((-43 * r - 85 * g + 128 * b + 128) >> 8) + 128;
+                    let v = ((128 * r - 107 * g - 21 * b + 128) >> 8) + 128;
                     *y_dst.add(col) = y.clamp(0, 255) as u8;
                     *u_dst.add(col) = u.clamp(0, 255) as u8;
                     *v_dst.add(col) = v.clamp(0, 255) as u8;
@@ -2722,7 +2736,7 @@ impl VaapiAv1Encoder {
                     let r = bgra[i + 2] as i32;
                     let g = bgra[i + 1] as i32;
                     let b = bgra[i] as i32;
-                    let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+                    let y = (77 * r + 150 * g + 29 * b + 128) >> 8;
                     *dst_row.add(col) = y.clamp(0, 255) as u8;
                 }
             }
@@ -2743,8 +2757,8 @@ impl VaapiAv1Encoder {
                             let r = bgra[i + 2] as i32;
                             let g = bgra[i + 1] as i32;
                             let b = bgra[i] as i32;
-                            u_sum += ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                            v_sum += ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                            u_sum += ((-43 * r - 85 * g + 128 * b + 128) >> 8) + 128;
+                            v_sum += ((128 * r - 107 * g - 21 * b + 128) >> 8) + 128;
                         }
                     }
                     *dst_row.add(cx * 2) = (u_sum / 4).clamp(0, 255) as u8;
@@ -3054,7 +3068,7 @@ fn pack_av1_sequence_header(
         ret.write_bool(false); // monochrome
     }
     ret.write_bool(false); // no color description
-    ret.write_bool(false); // no color range
+    ret.write_bool(true); // color_range: full swing (blit is full-range end to end)
     if !is_444 {
         ret.write(0, 2); // chroma sample position
     }
@@ -3393,7 +3407,7 @@ mod tests {
             assert_eq!(r.bit(), 0, "mono_chrome");
         }
         assert_eq!(r.bit(), 0, "color_description_present_flag");
-        assert_eq!(r.bit(), 0, "color_range");
+        assert_eq!(r.bit(), 1, "color_range (full swing)");
         if seq_profile == 0 {
             assert_eq!(r.bits(2), 0, "chroma_sample_position");
         }

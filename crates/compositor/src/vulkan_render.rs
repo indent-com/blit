@@ -5061,13 +5061,14 @@ impl VulkanRenderer {
                 // capture` asks on demand, and the staging buffer is
                 // filled every frame regardless, so the pixels are already
                 // sitting there — only the copy that publishes them is
-                // skipped. That one BGRA frame must NOT reach the encoder,
-                // though: the zero-copy shader converts full-range
-                // (black = Y 0) while NVENC's own ARGB conversion is
-                // limited-range (black = Y 16), so one BGRA frame spliced
-                // into an NV12 stream lifts every black to gray for a
-                // frame.  Mark it encoder_skip so the server feeds it to
-                // the pixel cache but not to any encoder.
+                // skipped. That one BGRA frame must still not reach the
+                // encoder: it would go through NVENC's own ARGB
+                // conversion, whose rounding (and possibly matrix)
+                // differs from the zero-copy shader's, so splicing it
+                // into the NV12 stream shifts the picture for one frame —
+                // and the re-encode of an identical frame is waste
+                // besides.  Mark it encoder_skip so the server feeds it
+                // to the pixel cache but not to any encoder.
                 let wanted_now = std::mem::take(&mut self.publish_native_bgra_once);
                 let zero_copy_live = self
                     .nv12_opaque_slot(pending.surface_id, pending.phys_w, pending.phys_h)

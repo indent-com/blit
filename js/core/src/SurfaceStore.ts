@@ -6,6 +6,20 @@ import {
 } from "./types";
 
 /**
+ * Every Blit encoder produces full-range BT.601 (sRGB primaries/transfer).
+ * Most streams also say so in-band (H.264 VUI, AV1 color_config); this
+ * config hint covers the ones whose encoder cannot write it (openh264)
+ * and matches the rest.  Without it a decoder assumes limited range and
+ * lifts every black to gray.
+ */
+const FULL_RANGE_BT601: VideoColorSpaceInit = {
+  primaries: "bt709",
+  transfer: "iec61966-2-1",
+  matrix: "smpte170m",
+  fullRange: true,
+};
+
+/**
  * Frame-ready callback.  Listeners receive only the surface ID; they should
  * call {@link SurfaceStore.getCanvas} to obtain the shared backing canvas
  * that already contains the latest rendered frame.
@@ -758,6 +772,7 @@ export class SurfaceStore {
                 codec: cs,
                 optimizeForLatency: true,
                 description,
+                colorSpace: FULL_RANGE_BT601,
               });
             }
           }
@@ -1495,6 +1510,7 @@ export class SurfaceStore {
           decoder.configure({
             codec: cs,
             optimizeForLatency: true,
+            colorSpace: FULL_RANGE_BT601,
           });
         } catch (e) {
           console.warn(

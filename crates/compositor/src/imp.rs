@@ -542,10 +542,10 @@ pub enum CompositorEvent {
         timestamp_ms: u32,
         /// This frame is for the pixel cache only — an on-demand BGRA
         /// readback published while an NV12 zero-copy stream owns the
-        /// same key.  Encoders must not consume it: its RGB→YUV
-        /// conversion is full-range while NVENC's ARGB path is
-        /// limited-range, so encoding it splices one wrong-black-level
-        /// frame into the stream.
+        /// same key.  Encoders must not consume it: it would re-encode
+        /// a frame the stream already has, through NVENC's own ARGB
+        /// conversion whose rounding differs from the zero-copy
+        /// shader's — a visible one-frame shift for pure waste.
         encoder_skip: bool,
     },
     /// A compositor-resident encoder produced a bitstream for one client.
@@ -3882,12 +3882,14 @@ fn same_client<R1: Resource, R2: Resource>(a: &R1, b: &R2) -> bool {
 }
 
 fn yuv420_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
-    let y = (y as i32 - 16).max(0);
+    // BT.601 full-range inverse, matching the full-range forward
+    // conversion everywhere in blit (shaders and CPU paths).
+    let y = y as i32;
     let u = u as i32 - 128;
     let v = v as i32 - 128;
-    let r = ((298 * y + 409 * v + 128) >> 8).clamp(0, 255) as u8;
-    let g = ((298 * y - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8;
-    let b = ((298 * y + 516 * u + 128) >> 8).clamp(0, 255) as u8;
+    let r = ((256 * y + 359 * v + 128) >> 8).clamp(0, 255) as u8;
+    let g = ((256 * y - 88 * u - 183 * v + 128) >> 8).clamp(0, 255) as u8;
+    let b = ((256 * y + 454 * u + 128) >> 8).clamp(0, 255) as u8;
     [r, g, b]
 }
 

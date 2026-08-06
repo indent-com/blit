@@ -427,6 +427,16 @@ impl VulkanVideoEncoder {
         if needs_crop {
             sps_flags.set_frame_cropping_flag(1);
         }
+        // VUI with video_full_range_flag=1: blit's pixels are full-range
+        // BT.601 end to end, and a decoder told nothing assumes limited —
+        // which would display every black lifted to gray.
+        sps_flags.set_vui_parameters_present_flag(1);
+        let mut vui_flags: StdVideoH264SpsVuiFlags = unsafe { std::mem::zeroed() };
+        vui_flags.set_video_signal_type_present_flag(1);
+        vui_flags.set_video_full_range_flag(1);
+        let mut vui: StdVideoH264SequenceParameterSetVui = unsafe { std::mem::zeroed() };
+        vui.flags = vui_flags;
+        vui.video_format = 5; // unspecified
 
         // Crop offsets are expressed in CropUnitX/CropUnitY, which depend on
         // the chroma format: 2x2 for 4:2:0, but 1x1 for 4:4:4 (and for
@@ -472,6 +482,9 @@ impl VulkanVideoEncoder {
         sps.pic_height_in_map_units_minus1 = height_in_mbs - 1;
         sps.frame_crop_right_offset = crop_right;
         sps.frame_crop_bottom_offset = crop_bottom;
+        // `vui` is a local: the driver copies it during session-parameters
+        // creation and the serializer below reads it before this returns.
+        sps.pSequenceParameterSetVui = &vui;
 
         let mut pps_flags: StdVideoH264PpsFlags = unsafe { std::mem::zeroed() };
         pps_flags.set_entropy_coding_mode_flag(1); // CABAC
@@ -1283,7 +1296,9 @@ impl VulkanVideoEncoder {
         // 5. Session parameters (AV1 sequence header)
         // ---------------------------------------------------------------
         let color_config = StdVideoAV1ColorConfig {
-            flags: 0,
+            // Bit 1 = color_range (bit 0 is mono_chrome): full swing.
+            // blit's pixels are full-range BT.601 end to end.
+            flags: 1 << 1,
             bit_depth: 8,
             subsampling_x: 1,
             subsampling_y: 1,
@@ -2148,7 +2163,27 @@ fn h264_parameter_sets(
         w.ue(0);
         w.ue(sps.frame_crop_bottom_offset);
     }
-    w.u(1, 0); // vui_parameters_present_flag
+    let has_vui =
+        sps.flags.vui_parameters_present_flag() != 0 && !sps.pSequenceParameterSetVui.is_null();
+    w.u(1, has_vui as u32); // vui_parameters_present_flag
+    if has_vui {
+        let vui = unsafe { &*sps.pSequenceParameterSetVui };
+        w.u(1, vui.flags.aspect_ratio_info_present_flag());
+        w.u(1, vui.flags.overscan_info_present_flag());
+        let signal = vui.flags.video_signal_type_present_flag();
+        w.u(1, signal);
+        if signal != 0 {
+            w.u(3, vui.video_format as u32);
+            w.u(1, vui.flags.video_full_range_flag());
+            w.u(1, vui.flags.color_description_present_flag());
+        }
+        w.u(1, vui.flags.chroma_loc_info_present_flag());
+        w.u(1, vui.flags.timing_info_present_flag());
+        w.u(1, vui.flags.nal_hrd_parameters_present_flag());
+        w.u(1, vui.flags.vcl_hrd_parameters_present_flag());
+        w.u(1, 0); // pic_struct_present_flag
+        w.u(1, vui.flags.bitstream_restriction_flag());
+    }
     let mut out = w.into_nal(3, 7);
 
     let mut w = H264BitWriter::new();
@@ -2255,7 +2290,7 @@ fn av1_sequence_header_obu(
     w.put(1, 0); // high_bitdepth
     w.put(1, 0); // mono_chrome
     w.put(1, 0); // color_description_present_flag
-    w.put(1, 0); // color_range: studio swing
+    w.put(1, 1); // color_range: full swing (blit is full-range end to end)
     w.put(2, 0); // chroma_sample_position: unknown
     w.put(1, 0); // separate_uv_delta_q
     w.put(1, 0); // film_grain_params_present
