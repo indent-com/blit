@@ -1126,23 +1126,22 @@ pub async fn cmd_record(
             }
             mask
         };
-        // Announce the decode ceiling before asking for any size, so the
+        // Announce the decode ceiling before asking for the size, so the
         // server has it when it decides how large to composite.  A recorder
         // writes the bitstream straight to a file, so its only real ceiling
-        // is the largest size it will ever ask for.
-        let ceiling = match (size, resize_after) {
-            (Some((w, h)), Some((_, rw, rh))) => Some((w.max(rw), h.max(rh))),
-            (Some(wh), None) => Some(wh),
-            (None, Some((_, rw, rh))) => Some((rw, rh)),
-            (None, None) => None,
-        };
-        if let Some((w, h)) = ceiling {
-            let mut features = vec![C2S_CLIENT_FEATURES, codec_support];
-            features.extend_from_slice(&w.to_le_bytes());
-            features.extend_from_slice(&h.to_le_bytes());
-            conn.send(&features).await?;
-        }
+        // is the largest size it will ever ask for.  Announced only
+        // alongside --size: the ceiling also caps the stream, so a recorder
+        // that follows the native size must not send one — a ceiling below
+        // native drops the target under it, and a Vulkan-only server (which
+        // encodes at native or not at all) then serves nothing.  A
+        // mid-stream resize announces its own just before it asks; by then
+        // the resize makes the ceiling and the mediated size agree.
         if let Some((w, h)) = size {
+            let (rw, rh) = resize_after.map_or((0, 0), |(_, rw, rh)| (rw, rh));
+            let mut features = vec![C2S_CLIENT_FEATURES, codec_support];
+            features.extend_from_slice(&w.max(rw).to_le_bytes());
+            features.extend_from_slice(&h.max(rh).to_le_bytes());
+            conn.send(&features).await?;
             conn.send(&msg_surface_resize(id, w, h, 120)).await?;
         }
         if codec_support != 0 {
@@ -1238,6 +1237,15 @@ pub async fn cmd_record(
                 {
                     resize_sent = true;
                     eprintln!("\n  resizing to {w}x{h} at {elapsed:.1}s");
+                    if size.is_none() {
+                        // No ceiling was announced at subscribe (it would
+                        // have capped the native-size phase); raise it now
+                        // so the server will serve the requested size.
+                        let mut features = vec![C2S_CLIENT_FEATURES, codec_support];
+                        features.extend_from_slice(&w.to_le_bytes());
+                        features.extend_from_slice(&h.to_le_bytes());
+                        conn.send(&features).await?;
+                    }
                     conn.send(&msg_surface_resize(id, w, h, 120)).await?;
                 }
 

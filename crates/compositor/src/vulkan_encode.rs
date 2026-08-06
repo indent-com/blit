@@ -793,6 +793,13 @@ impl VulkanVideoEncoder {
         let is_idr = self.force_idr || force_keyframe || self.frame_num == 0;
         if is_idr {
             self.force_idr = false;
+            // An IDR restarts the GOP and the spec pins its frame_num at 0.
+            // Resetting only after the encode sent a mid-stream IDR out with
+            // the stale value, and every P frame after it then read as a
+            // frame_num gap — decoders inferred phantom references until
+            // their DPB accounting overflowed max_num_ref_frames on every
+            // frame.
+            self.frame_num = 0;
         }
 
         // Allocate command buffer.
@@ -1111,9 +1118,9 @@ impl VulkanVideoEncoder {
             slices.to_vec()
         };
 
-        // Update state.
+        // Update state.  frame_num was already reset for an IDR before the
+        // encode — the slice has to carry the 0.
         if is_idr {
-            self.frame_num = 0;
             self.idr_num = self.idr_num.wrapping_add(1);
         }
         self.frame_num = self.frame_num.wrapping_add(1);
