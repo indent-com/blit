@@ -885,7 +885,7 @@ async fn async_main() {
                             .ok()
                             .and_then(|s| s.parse().ok())
                     })
-                    .unwrap_or(1_000_000),
+                    .unwrap_or(10_000),
                 ipc_path,
                 surface_encoders: blit_server::SurfaceEncoderPreference::defaults(),
                 surface_encoding: blit_server::SurfaceEncoding {
