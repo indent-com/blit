@@ -4369,6 +4369,18 @@ impl VulkanRenderer {
         let downscale_targets: Vec<(u32, u32)> = downscale_target_keys
             .iter()
             .filter(|&&key| {
+                // A target at exactly the composite size would blit the
+                // native frame onto itself and stage a second,
+                // byte-identical readback.  The native staging copy
+                // below already publishes those pixels under the same
+                // (sid, w, h) key the encoder looks up, so the blit and
+                // its `to_vec()` in `retire_pending` are pure waste.
+                // Any encoder sized to the whole surface — the common
+                // case whenever the client needs no downscale — lands
+                // here on every frame.
+                if (key.1, key.2) == (phys_w, phys_h) {
+                    return false;
+                }
                 let ok = fits_composite(&self.target_natives, key.1, key.2);
                 if !ok {
                     skipped_target(key.1, key.2, self.target_natives.get(&key));
