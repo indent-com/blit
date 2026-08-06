@@ -104,6 +104,49 @@ pub type CUdeviceptr = u64;
 /// Opaque handle for imported external memory (CUDA 10.0+).
 pub type CUexternalMemory = *mut c_void;
 
+/// Opaque handle for an imported external semaphore (CUDA 10.0+).
+pub type CUexternalSemaphore = *mut c_void;
+
+/// Byte offsets into `CUDA_EXTERNAL_MEMORY_HANDLE_DESC` (cuda.h).
+///
+/// The `handle` union is sized by its largest member —
+/// `struct { void *handle; const void *name; } win32`, 16 bytes — so it
+/// spans 8..24 and `size` lands at 24, not at 16.  Getting this wrong
+/// passes size=0, which `cuImportExternalMemory` rejects with
+/// `CUDA_ERROR_INVALID_VALUE` for *every* handle type, making a plain
+/// descriptor bug look like a driver limitation.  See the note on
+/// `NvencDirectEncoder::encode_dmabuf_fd`.
+pub mod cu_ext_mem_desc {
+    /// `CUexternalMemoryHandleType type`
+    pub const TYPE: usize = 0;
+    /// `union { int fd; ... } handle` — `fd` is the first member.
+    pub const FD: usize = 8;
+    /// `unsigned long long size`
+    pub const SIZE: usize = 24;
+    /// `unsigned int flags`
+    pub const FLAGS: usize = 32;
+    /// Comfortably covers the ~104-byte struct including `reserved[16]`.
+    pub const BYTES: usize = 128;
+}
+
+/// Byte offsets into `CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC` (cuda.h).
+///
+/// Same union as above, but the struct has no `size`, so `flags` sits at 24.
+pub mod cu_ext_sem_desc {
+    /// `CUexternalSemaphoreHandleType type`
+    pub const TYPE: usize = 0;
+    /// `union { int fd; ... } handle`
+    pub const FD: usize = 8;
+    /// `unsigned int flags`
+    pub const FLAGS: usize = 24;
+    pub const BYTES: usize = 128;
+}
+
+/// `CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD`, and the identically-valued
+/// `CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD`: both enums start at 1
+/// with the opaque-fd variant.
+pub const CU_EXTERNAL_HANDLE_TYPE_OPAQUE_FD: u32 = 1;
+
 pub struct CudaFns {
     pub cuInit: unsafe extern "C" fn(flags: c_uint) -> CUresult,
     pub cuDeviceGet: unsafe extern "C" fn(device: *mut CUdevice, ordinal: c_int) -> CUresult,
@@ -141,6 +184,34 @@ pub struct CudaFns {
         ) -> CUresult,
     >,
     pub cuDestroyExternalMemory: Option<unsafe extern "C" fn(extMem: CUexternalMemory) -> CUresult>,
+    // External semaphore import (CUDA 10.0+).  An OPAQUE_FD allocation is
+    // not a dma_buf and so carries no implicit fencing: without waiting on
+    // the Vulkan semaphore that guards the BGRA→NV12 compute dispatch, CUDA
+    // reads race the compositor's writes.  The symptom is intermittent
+    // tearing and stale frames, worst at high frame rates — i.e. exactly the
+    // kind of failure that looks like "works" in a short test.
+    pub cuImportExternalSemaphore: Option<
+        unsafe extern "C" fn(
+            extSem_out: *mut CUexternalSemaphore,
+            semHandleDesc: *const c_void,
+        ) -> CUresult,
+    >,
+    pub cuWaitExternalSemaphoresAsync: Option<
+        unsafe extern "C" fn(
+            extSemArray: *const CUexternalSemaphore,
+            paramsArray: *const c_void,
+            numExtSems: c_uint,
+            stream: *mut c_void,
+        ) -> CUresult,
+    >,
+    pub cuDestroyExternalSemaphore:
+        Option<unsafe extern "C" fn(extSem: CUexternalSemaphore) -> CUresult>,
+    /// Used to pick the CUDA device matching the Vulkan `deviceUUID`.  On a
+    /// multi-GPU host (this one has an AMD iGPU alongside the 4090) importing
+    /// into a context on the wrong device fails, and blit has a history of
+    /// landing on the iGPU.
+    pub cuDeviceGetUuid_v2:
+        Option<unsafe extern "C" fn(uuid: *mut [u8; 16], dev: CUdevice) -> CUresult>,
     _lib: DynLib,
 }
 
@@ -166,6 +237,10 @@ impl CudaFns {
                 cuImportExternalMemory: lib.sym("cuImportExternalMemory").ok(),
                 cuExternalMemoryGetMappedBuffer: lib.sym("cuExternalMemoryGetMappedBuffer").ok(),
                 cuDestroyExternalMemory: lib.sym("cuDestroyExternalMemory").ok(),
+                cuImportExternalSemaphore: lib.sym("cuImportExternalSemaphore").ok(),
+                cuWaitExternalSemaphoresAsync: lib.sym("cuWaitExternalSemaphoresAsync").ok(),
+                cuDestroyExternalSemaphore: lib.sym("cuDestroyExternalSemaphore").ok(),
+                cuDeviceGetUuid_v2: lib.sym("cuDeviceGetUuid_v2").ok(),
                 _lib: lib,
             })
         }
@@ -447,4 +522,96 @@ pub fn gbm() -> Result<&'static GbmFns, &'static str> {
     GBM.get_or_init(GbmFns::load)
         .as_ref()
         .map_err(|e| e.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `CUDA_EXTERNAL_MEMORY_HANDLE_DESC`, transcribed from cuda.h.  We build
+    /// this descriptor as raw bytes at the call site (we have no CUDA headers
+    /// to bind against), so nothing but this mirror checks our arithmetic.
+    ///
+    /// The offsets were wrong for as long as the external-memory path existed:
+    /// `size` was written at 16, inside the `handle` union's tail, and the
+    /// driver read size=0 and refused every import with
+    /// `CUDA_ERROR_INVALID_VALUE` — for every handle type, which is what made
+    /// it read as "this driver will not import a dma_buf" rather than "this
+    /// descriptor is malformed".  Let the compiler compute the offsets.
+    #[repr(C)]
+    struct CudaExternalMemoryHandleDesc {
+        typ: u32,
+        handle: CudaExternalMemoryHandleUnion,
+        size: u64,
+        flags: u32,
+        reserved: [u32; 16],
+    }
+
+    #[repr(C)]
+    union CudaExternalMemoryHandleUnion {
+        fd: c_int,
+        win32: CudaWin32Handle,
+        nv_sci_buf_object: *const c_void,
+    }
+
+    /// The member that sizes the union: two pointers, so 16 bytes — not the
+    /// 8 the old comment assumed.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CudaWin32Handle {
+        handle: *mut c_void,
+        name: *const c_void,
+    }
+
+    #[repr(C)]
+    struct CudaExternalSemaphoreHandleDesc {
+        typ: u32,
+        handle: CudaExternalMemoryHandleUnion,
+        flags: u32,
+        reserved: [u32; 16],
+    }
+
+    #[test]
+    fn ext_mem_desc_offsets_match_cuda_layout() {
+        assert_eq!(
+            std::mem::offset_of!(CudaExternalMemoryHandleDesc, typ),
+            cu_ext_mem_desc::TYPE
+        );
+        assert_eq!(
+            std::mem::offset_of!(CudaExternalMemoryHandleDesc, handle),
+            cu_ext_mem_desc::FD,
+            "handle.fd is the union's first member, so it shares its offset"
+        );
+        assert_eq!(
+            std::mem::offset_of!(CudaExternalMemoryHandleDesc, size),
+            cu_ext_mem_desc::SIZE,
+            "size follows the 16-byte handle union; writing it at 16 passes size=0"
+        );
+        assert_eq!(
+            std::mem::offset_of!(CudaExternalMemoryHandleDesc, flags),
+            cu_ext_mem_desc::FLAGS
+        );
+        assert!(
+            std::mem::size_of::<CudaExternalMemoryHandleDesc>() <= cu_ext_mem_desc::BYTES,
+            "the byte buffer we pass must cover the whole struct"
+        );
+    }
+
+    #[test]
+    fn ext_sem_desc_offsets_match_cuda_layout() {
+        assert_eq!(
+            std::mem::offset_of!(CudaExternalSemaphoreHandleDesc, typ),
+            cu_ext_sem_desc::TYPE
+        );
+        assert_eq!(
+            std::mem::offset_of!(CudaExternalSemaphoreHandleDesc, handle),
+            cu_ext_sem_desc::FD
+        );
+        assert_eq!(
+            std::mem::offset_of!(CudaExternalSemaphoreHandleDesc, flags),
+            cu_ext_sem_desc::FLAGS,
+            "this struct has no `size`, so flags sits directly after the union"
+        );
+        assert!(std::mem::size_of::<CudaExternalSemaphoreHandleDesc>() <= cu_ext_sem_desc::BYTES);
+    }
 }

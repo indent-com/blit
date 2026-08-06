@@ -1064,24 +1064,48 @@ impl NvencDirectEncoder {
     /// **This does not work today, and has never run.** Nothing hands NVENC a
     /// `PixelData::DmaBuf` — the server only takes the external-buffer branch
     /// for VA-API — so it has no live caller; and if it had one, the import
-    /// would fail. It asks for `CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD`,
-    /// which CUDA documents as a handle obtained from Vulkan via
+    /// would still fail, because what it is handed is a `dma_buf`. It asks for
+    /// `CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD`, which CUDA documents as a
+    /// handle obtained from Vulkan via
     /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT` — an NVIDIA-internal
     /// object, not a `dma_buf`. Every fd this codebase can produce (GBM BOs,
     /// `vkGetMemoryFdKHR` with `DMA_BUF_EXT`) is a `dma_buf`.
     ///
-    /// Measured on nvidia-x11 595.84 / RTX 4090, using the exact descriptor
-    /// layout below against a real GBM BO from `/dev/dri/renderD128`: every
-    /// handle type from 1 to 32 returns `CUDA_ERROR_INVALID_VALUE`. The blob
-    /// carries one dma_buf string —
-    /// `CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMABUF_FD not supported on platform`.
+    /// An earlier round of this comment reported that handle types 1 through
+    /// 32 all return `CUDA_ERROR_INVALID_VALUE` against a real GBM BO, and
+    /// read that as the driver refusing `dma_buf`. That measurement was
+    /// confounded: it used this function's descriptor layout, which had
+    /// `size` at offset 16 and so passed size=0 (see the layout note below).
+    /// Every handle type fails that way, `dma_buf` or not, so the sweep could
+    /// not distinguish the two.
+    ///
+    /// Re-measured on nvidia-x11 595.84 / RTX 4090 with the corrected layout,
+    /// and with the positive control the earlier note called for — a
+    /// `VkBuffer` exported once as `OPAQUE_FD` and once as `DMA_BUF_EXT`, fed
+    /// to the same import:
+    ///   - `OPAQUE_FD` imports, maps through
+    ///     `cuExternalMemoryGetMappedBuffer`, and round-trips a byte pattern
+    ///     written through the device pointer. The approach is sound.
+    ///   - `DMA_BUF_EXT` fails with `CUDA_ERROR_UNKNOWN` — a different error
+    ///     than a malformed descriptor draws, i.e. the driver gets as far as
+    ///     considering the object and refuses it. Consistent with the blob's
+    ///     one dma_buf string,
+    ///     `CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMABUF_FD not supported on
+    ///     platform`.
+    ///
+    /// So the conclusion stands — this function cannot be fixed by pointing
+    /// it at a different handle type — but the reason is the handle *kind*,
+    /// not a descriptor the driver never accepted.
     ///
     /// Making the path real means exporting the compositor's NV12 buffer as
     /// `OPAQUE_FD` instead of `DMA_BUF_EXT`, plus an exported `VkSemaphore`
     /// waited on with `cuWaitExternalSemaphoresAsync`: an `OPAQUE_FD`
     /// allocation carries no implicit `dma_buf` fencing, so CUDA would
-    /// otherwise race the Vulkan blit. Kept rather than deleted because the
-    /// registration and encode half is still the shape that work needs.
+    /// otherwise race the Vulkan blit. Both halves of that are now known to
+    /// work on this host — `vkGetSemaphoreFdKHR(OPAQUE_FD)` exports and
+    /// `cuImportExternalSemaphore` accepts it. Kept rather than deleted
+    /// because the registration and encode half is still the shape that work
+    /// needs.
     ///
     /// Returns `None` if the CUDA driver lacks external-memory import
     /// (pre-10.0) or if the import fails for this fd — today, always the
@@ -1140,21 +1164,35 @@ impl NvencDirectEncoder {
         // CUDA_EXTERNAL_MEMORY_HANDLE_DESC (CUDA 10.0+)
         // Layout (from cuda.h):
         //   enum CUexternalMemoryHandleType type;  // offset 0, 4 bytes
-        //   union { int fd; ... } handle;           // offset 8 (aligned), 8 bytes
-        //     (for CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD, handle.fd at offset 8)
-        //   unsigned long long size;                // offset 16
-        //   unsigned int flags;                     // offset 24
-        //   unsigned int reserved[16];              // offset 28
-        // Total size: ~96 bytes, we use 128 to be safe.
+        //   union {                                 // offset 8 (8-byte aligned)
+        //       int fd;
+        //       struct { void *handle; const void *name; } win32;   // 16 bytes
+        //       const void *nvSciBufObject;
+        //   } handle;                               // occupies 8..24
+        //   unsigned long long size;                // offset 24
+        //   unsigned int flags;                     // offset 32
+        //   unsigned int reserved[16];              // offset 36
+        // Total size: ~104 bytes, we use 128 to be safe.
+        //
+        // The union is sized by its *largest* member — the 16-byte win32
+        // struct — not by `fd`.  This was long written as size@16/flags@24,
+        // which put `size` in the union's tail and read `size` out of what
+        // we meant as `flags`: every import got size=0 and was rejected
+        // with CUDA_ERROR_INVALID_VALUE, for every handle type.  That is
+        // what made this path look like a driver limitation rather than a
+        // bug here.  Verified on nvidia-x11 595.84 / RTX 4090: with the
+        // offsets below a Vulkan OPAQUE_FD allocation imports, maps via
+        // cuExternalMemoryGetMappedBuffer, and a byte pattern written
+        // through the resulting device pointer reads back intact.
         const CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: u32 = 1;
         let mut handle_desc = [0u8; 128];
         // type @ 0
         handle_desc[0..4].copy_from_slice(&CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD.to_ne_bytes());
-        // handle.fd @ 8 (store as i32 in the union)
+        // handle.fd @ 8 (first member of the union)
         handle_desc[8..12].copy_from_slice(&dup_fd.to_ne_bytes());
-        // size @ 16
-        handle_desc[16..24].copy_from_slice(&buf_size.to_ne_bytes());
-        // flags @ 24 = 0
+        // size @ 24 (after the 16-byte union)
+        handle_desc[24..32].copy_from_slice(&buf_size.to_ne_bytes());
+        // flags @ 32 = 0
 
         let mut ext_mem: gpu_libs::CUexternalMemory = ptr::null_mut();
         let status = unsafe { cu_import(&mut ext_mem, handle_desc.as_ptr() as *const _) };
