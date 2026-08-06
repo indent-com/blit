@@ -571,15 +571,16 @@ fairness.
 
 Two implementation traps, named now:
 
-- **Reaping.** The daemon's 5-second `waitpid(-1)` backstop reaps any
-  child, which _races_ a supervisor doing its own `wait()` — exit
-  statuses get stolen (`ECHILD`). The engine `wait()`s (and kills, on
-  timeout) its own child on every path so it usually wins; the backstop
-  was made **selective**, reaping every child to avoid zombies but only
-  _parking_ statuses for PTY-owned pids (`register_pty_pid` in
-  `blit-server`). An LSP child therefore leaves no parked status to
-  collide with a later PTY child that recycles its pid. Windows needs
-  kill-on-drop job objects — the one platform shim.
+- **Reaping.** The engine owns its child outright: it `wait()`s, and
+  kills on timeout, on every path. That used to be a race — the daemon's
+  5-second backstop drained `waitpid(-1)` and would steal the status from
+  under a supervisor doing its own `wait()` (`ECHILD`). The backstop no
+  longer touches what it does not own: it sweeps PTY-owned pids only
+  (`register_pty_pid` in `blit-server`), so there is no race left to win.
+  The corollary is that a subsystem which does not wait its own children
+  now leaks zombies rather than being quietly mopped up, which makes the
+  engine's every-path `wait()` load-bearing rather than belt-and-braces.
+  Windows needs kill-on-drop job objects — the one platform shim.
 - **Non-blocking child I/O.** Stdin writes go through a dedicated writer
   thread fed by a channel, so a language server that stops draining
   stdin blocks only that thread — the engine loop keeps expiring
