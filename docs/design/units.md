@@ -128,7 +128,10 @@ runaway grandchild holding the slave open yields no EOF and no
 lands with it.
 
 **Wire:** append an optional `[flags:1]` to `C2S_KILL`. The arm is
-`data.len() >= 7`, so old clients inherit the new default unaffected.
+`data.len() >= 8` — 7 is the existing message length, so arming there
+would read a flag byte that is not present — and old clients inherit the
+new default unaffected. **Shipped in #204** as `KILL_LEADER_ONLY`
+(bit 0), advertised by `FEATURE_KILL_MODE` (HELLO bit 15).
 
 ### The supervisor loop
 
@@ -210,7 +213,9 @@ session gets a `grace_ms` deadline **in the lease cause only**. A
 reclaim clears that cause and nothing else.
 
 `C2S_LEASE [0x1E][op:1][grace_ms:4][lease_id:8]` →
-`S2C_LEASE [0x10][status:1][lease_id:8][epoch:4]`. One byte of
+`S2C_LEASE [0x11][status:1][lease_id:8][epoch:4]`. S2C `0x10` was free
+when this was written and is not any more — #204 shipped
+`S2C_CREATE_FAILED` there — so the reply moves to `0x11`. One byte of
 operation, not a flag set, because the three are mutually exclusive:
 
 | `op` | Name      | `lease_id` in | Effect                                                                                                                   |
@@ -264,11 +269,19 @@ one.
 and returning is the point of a multiplexer. Deadlines and leases are
 the opt-in tools.
 
-**`max_ptys`** gets a real default plus `BLIT_MAX_PTYS`, counting live
-sessions only, and the silent `continue` goes:
-`S2C_CREATE_FAILED [0x11][nonce:2][reason:1]` answers a nonce-bearing
-client instead of hanging it forever. Standalone bug, worth fixing
-regardless.
+**`max_ptys`** counts live sessions only, and the silent `continue`
+goes. Standalone bug, worth fixing regardless.
+
+**Shipped in #204**, with two changes from what this section proposed.
+The refusal is `S2C_CREATE_FAILED [0x10][nonce:2][status:1][detail:N]` —
+`0x10` rather than `0x11`, and the common status registry rather than a
+message-local `reason` byte, both to match what #167's `protocol.md` had
+already allocated. And it is opt-in per request: a client sets
+`CREATE2_WANT_STATUS` (bit 3) after seeing `FEATURE_CREATE_STATUS`
+(HELLO bit 14), so a legacy client cannot mistake a refusal for PTY
+zero. `max_ptys` kept its `0` default, since #188 had landed the env var
+in the meantime and argued that unlimited is right — a client that can
+open a terminal can already spend the machine from inside it.
 
 **Unit sessions do not count against `max_ptys`.** The cap bounds
 client-driven creation, which is where the leak is; unit sessions are
@@ -644,8 +657,11 @@ requires the forked child to `setpgid(0, 0)` explicitly.
 
 ### Wire and CLI
 
-New family in the `0x90` block, gated on `FEATURE_UNITS`, bit 11
-(bits 0-10 are taken, 11-31 free).
+New family in the `0x90` block, gated on `FEATURE_UNITS`, bit 17.
+Bits 0-10 were already taken when this was written; since then 11-13
+have been reserved for the extension, channel, and process families
+(#167, #173) and 14-16 shipped with #204 — `CREATE_STATUS`,
+`KILL_MODE`, `PTY_DEADLINE`. 17-31 are free.
 
 | Dir | Opcode | Name           | Layout                                              |
 | --- | ------ | -------------- | --------------------------------------------------- |
@@ -989,18 +1005,26 @@ rules, both following existing precedent:
 
 ## Delivery
 
-One axis per PR.
+One axis per PR. **1-3 shipped as #204**, tracked as
+[#181](https://github.com/indent-com/blit/issues/181) rather than
+gated on this RFC — the argument that they are independently valuable
+held up, and the unit layer below is unchanged by how they landed.
 
-1. **Group kill.** `KillMode` as an appended flag byte on `C2S_KILL`;
-   `C2S_CLOSE`'s SIGHUP to the group; the Windows Job Object so the
-   new default is honorable everywhere. Pure semantics, no new state.
-2. **Supervisor loop, deadlines, leases.** The reactive loop, the
-   SIGCHLD handler replacing the `waitpid(-1)` drain, `C2S_DEADLINE`,
-   `CREATE2_HAS_DEADLINE`, `C2S_LEASE`/`S2C_LEASE`, the `S2C_EXITED`
-   reason byte, and the timed half of the `C2S_CLOSE` escalation.
-3. **GC.** `exited_at`, count and time bounds, a real `max_ptys`
-   default with `BLIT_MAX_PTYS`, `S2C_CREATE_FAILED`. Fixes the
-   silent-hang bug on its own.
+1. **Group kill.** ✅ #204. `KillMode` as an appended flag byte on
+   `C2S_KILL`; `C2S_CLOSE`'s SIGHUP to the group; the Windows Job
+   Object so the new default is honorable everywhere. Pure semantics,
+   no new state.
+2. **Supervisor loop, deadlines, leases.** Partly #204: the reactive
+   loop, the SIGCHLD handler replacing the `waitpid(-1)` drain,
+   `C2S_DEADLINE`, `CREATE2_HAS_DEADLINE` (bit 4), and the
+   `S2C_EXITED` reason byte all shipped. **Still open:**
+   `C2S_LEASE`/`S2C_LEASE`, and the timed half of the `C2S_CLOSE`
+   escalation — that one needs `CLOSE` to hold the entry in a
+   "closing" state, which tangles with the retention path below and
+   was out of scope for #181.
+3. **GC.** ✅ #204. `exited_at`, count and time bounds
+   (`BLIT_MAX_EXITED`, default 1024; `BLIT_EXITED_LINGER`, off),
+   `max_ptys` counting live sessions only, `S2C_CREATE_FAILED`.
 4. **Unit core.** Registry and generations, the strict parser, the
    state machine, autostart, restart policy, `Requires=`/`After=`,
    `Type=simple`/`oneshot`/`notify`, start and stop timeouts, helper

@@ -596,7 +596,11 @@ export function BSPContainer(props: {
     props.onFocusBySession?.(focusBySession);
   });
 
-  function moveToPane(value: string, targetPaneId: string, fromPaneId?: string) {
+  function moveToPane(
+    value: string,
+    targetPaneId: string,
+    fromPaneId?: string,
+  ) {
     // Guard against a stale pane id (e.g. a caller still holding a pane path
     // from a previous layout): writing the tile to a non-existent pane would
     // silently render nothing. Fall back to the focused pane, then the first.
