@@ -860,12 +860,22 @@ export class BlitSurfaceCanvas {
       return;
     }
     const { w, h, scale120 } = this._pendingResize;
-    // Only forget the request once it is actually on the wire.  The
-    // transport can be mid-reconnect, in which case the send is a no-op —
-    // clearing first left nothing to retry, and the binding's own
+    // Only forget the request once the connection has it on the wire.
+    // The transport can be mid-reconnect, in which case the offer is a
+    // no-op — clearing first left nothing to retry, and the binding's own
     // last-sent dedup means the same size is never offered again, so the
     // surface stayed at the pre-resize size indefinitely.
-    if (!conn.sendSurfaceResize(this._surfaceId, w, h, scale120)) return;
+    if (
+      !conn.offerSurfaceViewSize(
+        this._surfaceId,
+        this.surfaceViewId(conn),
+        w,
+        h,
+        scale120,
+      )
+    ) {
+      return;
+    }
     this._pendingResize = null;
     this._resizeConstraintActive = true;
   }
@@ -874,7 +884,12 @@ export class BlitSurfaceCanvas {
     this._pendingResize = null;
     if (!this._resizeConstraintActive) return;
     this._resizeConstraintActive = false;
-    this.getConn()?.sendSurfaceResize(this._surfaceId, 0, 0, 0);
+    if (this._surfaceViewId) {
+      this.getConn()?.withdrawSurfaceViewSize(
+        this._surfaceId,
+        this._surfaceViewId,
+      );
+    }
   }
 
   /**

@@ -2781,7 +2781,7 @@ export class BlitConnection {
    *  as the size the server knows about, so silently swallowing one on a
    *  disconnected transport leaves the surface stuck at the previous size
    *  until the pane happens to change size again. */
-  sendSurfaceResize(
+  private sendSurfaceResize(
     surfaceId: number,
     width: number,
     height: number,
@@ -2791,6 +2791,99 @@ export class BlitConnection {
     this.transport.send(
       buildSurfaceResizeMessage(surfaceId, width, height, scale120),
     );
+    return true;
+  }
+
+  // Per-view resize constraints.  The wire message is one size per
+  // (client, surface) — it carries no view id, and 0×0 means "unset".
+  // Two live views of the same surface therefore share one slot, and
+  // during a handoff (BSP pane ⇄ workspace foreground view) the old
+  // view's teardown used to fire the unset *after* the new view had
+  // already sent its size, wiping it; the survivor's own dedup then
+  // kept it from ever re-offering, so the surface stayed unsized until
+  // its box happened to change.  Mediate here instead, exactly like
+  // {@link effectiveSurfaceTarget} does for subscribe targets: views
+  // offer and withdraw their sizes, the most recent offer wins, and the
+  // unset only goes out when no sized view remains.
+  private surfaceViewSizes = new Map<
+    number,
+    {
+      /** Insertion-ordered; the most recent offer is the effective size. */
+      views: Map<string, { width: number; height: number; scale120: number }>;
+      /** Last size actually sent on the wire, null when nothing (or the
+       *  unset) is what the server currently knows. */
+      lastSent: { width: number; height: number; scale120: number } | null;
+    }
+  >();
+
+  /** Offer one view's size for a surface.  Returns whether the server now
+   *  knows the effective size (sent, or already current) — false means the
+   *  transport was down and the caller should retry. */
+  offerSurfaceViewSize(
+    surfaceId: number,
+    viewId: string,
+    width: number,
+    height: number,
+    scale120: number = 0,
+  ): boolean {
+    let entry = this.surfaceViewSizes.get(surfaceId);
+    if (!entry) {
+      entry = { views: new Map(), lastSent: null };
+      this.surfaceViewSizes.set(surfaceId, entry);
+    }
+    // Re-insert so a repeat offer moves to the end: latest writer wins.
+    entry.views.delete(viewId);
+    entry.views.set(viewId, { width, height, scale120 });
+    return this.flushSurfaceViewSize(surfaceId, entry);
+  }
+
+  /** Withdraw one view's size.  Re-sends the surviving latest offer if the
+   *  withdrawn view's was the one on the wire, or the unset when it was the
+   *  last sized view. */
+  withdrawSurfaceViewSize(surfaceId: number, viewId: string): void {
+    const entry = this.surfaceViewSizes.get(surfaceId);
+    if (!entry || !entry.views.delete(viewId)) return;
+    if (entry.views.size === 0) {
+      if (entry.lastSent !== null && this.sendSurfaceResize(surfaceId, 0, 0, 0)) {
+        entry.lastSent = null;
+      }
+      // Keep the entry only while it still says something the map's
+      // absence wouldn't: a lastSent the reconnect path must clear.
+      if (entry.lastSent === null) this.surfaceViewSizes.delete(surfaceId);
+      return;
+    }
+    this.flushSurfaceViewSize(surfaceId, entry);
+  }
+
+  private flushSurfaceViewSize(
+    surfaceId: number,
+    entry: NonNullable<
+      ReturnType<BlitConnection["surfaceViewSizes"]["get"]>
+    >,
+  ): boolean {
+    let effective: { width: number; height: number; scale120: number } | null =
+      null;
+    for (const size of entry.views.values()) effective = size;
+    if (!effective) return true;
+    if (
+      entry.lastSent !== null &&
+      entry.lastSent.width === effective.width &&
+      entry.lastSent.height === effective.height &&
+      entry.lastSent.scale120 === effective.scale120
+    ) {
+      return true;
+    }
+    if (
+      !this.sendSurfaceResize(
+        surfaceId,
+        effective.width,
+        effective.height,
+        effective.scale120,
+      )
+    ) {
+      return false;
+    }
+    entry.lastSent = { ...effective };
     return true;
   }
 
@@ -2871,6 +2964,12 @@ export class BlitConnection {
       }
       sub.lastSent = null;
     }
+    // The new server session knows no view sizes; without this the
+    // canvases' resendDisplaySize would dedup against a size only the
+    // old session ever heard.
+    for (const entry of this.surfaceViewSizes.values()) {
+      entry.lastSent = null;
+    }
   }
 
   /** Called from `dispose()` — the connection is going away permanently.
@@ -2883,6 +2982,7 @@ export class BlitConnection {
       }
     }
     this.surfaceSubs.clear();
+    this.surfaceViewSizes.clear();
   }
 
   private maybeSendSurfaceSubscribe(sub: SurfaceSub): void {

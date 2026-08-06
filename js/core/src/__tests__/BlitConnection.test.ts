@@ -36,6 +36,7 @@ import {
   S2C_FRAGMENT,
   S2C_PING,
   C2S_SURFACE_SUBSCRIBE,
+  C2S_SURFACE_RESIZE,
   STATUS_BUDGET,
   STATUS_OTHER,
 } from "../types";
@@ -1149,5 +1150,78 @@ describe("BlitConnection surface subscriptions", () => {
       height: 180,
     });
     expect(lastTarget()).toEqual({ width: 320, height: 180 });
+  });
+});
+
+describe("BlitConnection surface view sizes", () => {
+  let transport: MockTransport;
+  let conn: BlitConnection;
+
+  beforeEach(() => {
+    ({ conn, transport } = createConnection());
+  });
+
+  /** Every C2S_SURFACE_RESIZE on the wire, decoded to (w, h, scale120). */
+  function resizes(): { w: number; h: number; s: number }[] {
+    return transport.sent
+      .filter((m) => m[0] === C2S_SURFACE_RESIZE)
+      .map((m) => {
+        const v = new DataView(m.buffer, m.byteOffset, m.byteLength);
+        return {
+          w: v.getUint16(3, true),
+          h: v.getUint16(5, true),
+          s: v.getUint16(7, true),
+        };
+      });
+  }
+
+  it("puts a lone view's size on the wire", () => {
+    conn.offerSurfaceViewSize(1, "a", 800, 600, 120);
+    expect(resizes()).toEqual([{ w: 800, h: 600, s: 120 }]);
+  });
+
+  it("does not resend an unchanged size", () => {
+    conn.offerSurfaceViewSize(1, "a", 800, 600, 120);
+    conn.offerSurfaceViewSize(1, "a", 800, 600, 120);
+    expect(resizes()).toHaveLength(1);
+  });
+
+  it("survives a view handoff without unsizing the surface", () => {
+    // The wire carries one size per (client, surface) and 0×0 means
+    // "unset".  A pane moving between two UI locations mounts the new
+    // view before the old one is disposed; the old view's withdrawal
+    // must not wipe the size the new view just sent — that left the
+    // server with no sizing client and the surface stuck until the
+    // pane's box happened to change.
+    conn.offerSurfaceViewSize(1, "old", 800, 600, 120);
+    conn.offerSurfaceViewSize(1, "new", 800, 600, 120);
+    conn.withdrawSurfaceViewSize(1, "old");
+    expect(resizes()).toEqual([{ w: 800, h: 600, s: 120 }]);
+  });
+
+  it("re-sends the surviving offer when the winner withdraws", () => {
+    conn.offerSurfaceViewSize(1, "a", 800, 600, 120);
+    conn.offerSurfaceViewSize(1, "b", 1024, 768, 120);
+    conn.withdrawSurfaceViewSize(1, "b");
+    expect(resizes()).toEqual([
+      { w: 800, h: 600, s: 120 },
+      { w: 1024, h: 768, s: 120 },
+      { w: 800, h: 600, s: 120 },
+    ]);
+  });
+
+  it("unsets only when the last sized view withdraws", () => {
+    conn.offerSurfaceViewSize(1, "a", 800, 600, 120);
+    conn.withdrawSurfaceViewSize(1, "a");
+    expect(resizes()).toEqual([
+      { w: 800, h: 600, s: 120 },
+      { w: 0, h: 0, s: 0 },
+    ]);
+  });
+
+  it("ignores a withdrawal from a view that never offered", () => {
+    conn.offerSurfaceViewSize(1, "a", 800, 600, 120);
+    conn.withdrawSurfaceViewSize(1, "ghost");
+    expect(resizes()).toHaveLength(1);
   });
 });

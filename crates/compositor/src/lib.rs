@@ -257,6 +257,15 @@ mod stub {
         RequestFrame {
             surface_id: u16,
         },
+        /// Re-composite a toplevel from its current committed state and
+        /// republish the pixels, without waiting for the client to commit.
+        /// An idle Wayland app volunteers nothing, so when the server's
+        /// pixel cache for a surface is empty (every prior viewer left and
+        /// took the cache entry with them), a fresh subscriber would wait
+        /// forever for pixels that only a composite can produce.
+        Recomposite {
+            surface_id: u16,
+        },
         SetExternalOutputBuffers {
             surface_id: u32,
             target_w: u32,

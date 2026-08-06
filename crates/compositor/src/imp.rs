@@ -637,6 +637,15 @@ pub enum CompositorCommand {
     RequestFrame {
         surface_id: u16,
     },
+    /// Re-composite a toplevel from its current committed state and
+    /// republish the pixels, without waiting for the client to commit.
+    /// An idle Wayland app volunteers nothing, so when the server's
+    /// pixel cache for a surface is empty (every prior viewer left and
+    /// took the cache entry with them), a fresh subscriber would wait
+    /// forever for pixels that only a composite can produce.
+    Recomposite {
+        surface_id: u16,
+    },
     ReleaseKeys {
         keycodes: Vec<u32>,
     },
@@ -3472,6 +3481,15 @@ impl Compositor {
                 if installed && self.toplevel_surface_ids.contains_key(&(surface_id as u16)) {
                     self.pending_recomposite_toplevels
                         .insert(surface_id as u16, false);
+                }
+            }
+            CompositorCommand::Recomposite { surface_id } => {
+                // Full recomposite (not encoder-only): the point is to
+                // republish pixels the server no longer has.  `insert`
+                // rather than `or_insert` so it upgrades a queued
+                // encoder-only pass.
+                if self.toplevel_surface_ids.contains_key(&surface_id) {
+                    self.pending_recomposite_toplevels.insert(surface_id, false);
                 }
             }
             CompositorCommand::RegisterDownscaleTarget {
@@ -6896,6 +6914,15 @@ fn run_compositor(
         {
             compositor.pending_recomposite_toplevels.remove(&sid);
             if let Some(root_id) = compositor.toplevel_surface_ids.get(&sid).cloned() {
+                // A full (pixel-publishing) recomposite exists to refill the
+                // server's pixel cache, so the native BGRA must actually be
+                // published — an NV12 OPAQUE_FD slot left by a departed
+                // client would otherwise suppress the readback and the
+                // recomposite would publish nothing at all.  Same on-demand
+                // ask the capture path makes.
+                if !encoder_only && let Some(ref mut vk) = compositor.vulkan_renderer {
+                    vk.request_native_bgra();
+                }
                 compositor.composite_toplevel_into_pending(&root_id, sid, encoder_only);
                 // Wake the loop so the retire path runs again
                 // promptly — without an explicit wakeup the loop

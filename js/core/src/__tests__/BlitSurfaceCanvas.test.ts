@@ -494,7 +494,8 @@ function attachTargeting() {
       target: { width: number; height: number } | null,
     ) => targets.push(target),
     sendSurfaceUnsubscribe: () => {},
-    sendSurfaceResize: () => true,
+    offerSurfaceViewSize: () => true,
+    withdrawSurfaceViewSize: () => {},
     allocSurfaceViewId: () => "s1",
   };
   const workspace = {

@@ -992,6 +992,11 @@ struct SurfaceSubState {
     /// clearing here would size the surface straight back up into it.  See
     /// the creation completion handler.
     encoder_cap_degraded: bool,
+    /// When we last asked the compositor to recomposite because the pixel
+    /// cache had no entry at this subscription's encode target.  Throttles
+    /// the request — the dispatch loop retries at frame rate, and one
+    /// recomposite is enough to refill the cache.
+    recomposite_requested_at: Option<Instant>,
 }
 
 /// The codec bitmask in force for one (client, surface) pair: the
@@ -5123,17 +5128,44 @@ async fn tick(state: &AppState) -> TickOutcome {
                     continue;
                 }
 
-                let pixels: blit_compositor::PixelData = {
+                let cached: Option<blit_compositor::PixelData> = {
                     let cs = sess.compositor.as_ref().unwrap();
-                    match cs.last_pixels.get(&(sid, px_w, px_h)) {
-                        Some(lp) => lp.pixels.clone(),
-                        None => {
-                            let client = sess.clients.get_mut(&work.cid).unwrap();
-                            client.skip_last_pixels_mismatch_count =
-                                client.skip_last_pixels_mismatch_count.saturating_add(1);
-                            continue;
+                    cs.last_pixels
+                        .get(&(sid, px_w, px_h))
+                        .map(|lp| lp.pixels.clone())
+                };
+                let Some(pixels) = cached else {
+                    // Nothing will fill this entry on its own: an idle
+                    // Wayland app repaints only when a configure changes its
+                    // size, and the composite that would publish
+                    // `(sid, px_w, px_h)` only runs on a commit or a target
+                    // install.  A reloading browser lands exactly here — its
+                    // old connection's teardown cleared the surface's target
+                    // and cache entry, and the resubscribe mediates to the
+                    // unchanged size, so no configure ever comes.  Ask for a
+                    // recomposite of the current committed state; throttled,
+                    // because this loop retries at frame rate and one is
+                    // enough.
+                    let now_inst = Instant::now();
+                    let client = sess.clients.get_mut(&work.cid).unwrap();
+                    client.skip_last_pixels_mismatch_count =
+                        client.skip_last_pixels_mismatch_count.saturating_add(1);
+                    let recomposite_due = client.surface_subs.get_mut(&sid).is_some_and(|sub| {
+                        let due = sub
+                            .recomposite_requested_at
+                            .is_none_or(|at| now_inst.duration_since(at).as_millis() >= 250);
+                        if due {
+                            sub.recomposite_requested_at = Some(now_inst);
                         }
+                        due
+                    });
+                    if recomposite_due && let Some(cs) = sess.compositor.as_ref() {
+                        let _ = cs.handle.command_tx.send(
+                            blit_compositor::CompositorCommand::Recomposite { surface_id: sid },
+                        );
+                        cs.handle.wake();
                     }
+                    continue;
                 };
                 let client = sess.clients.get_mut(&work.cid).unwrap();
 
@@ -10919,6 +10951,27 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         &state.config.surface_encoders,
                         state.config.verbose,
                     );
+                }
+                // A first subscriber with an empty pixel cache would wait
+                // forever: the delivery loop can't build an encoder without
+                // pixels, so it never registers a target, so the
+                // register-implies-recomposite safety net never fires — and
+                // an idle Wayland app volunteers no commit of its own.  This
+                // is exactly the state a page reload leaves behind when the
+                // departing client's teardown cleared the surface's last
+                // target and cache entry, and the resubscribe mediates to
+                // the same size (resize → Ignore → no configure → no
+                // repaint).  Ask the compositor to recomposite from the
+                // current committed state so the cache refills.
+                if first_subscribe
+                    && let Some(cs) = sess.compositor.as_mut()
+                    && !cs.last_pixels.keys().any(|k| k.0 == surface_id)
+                {
+                    let _ = cs
+                        .handle
+                        .command_tx
+                        .send(blit_compositor::CompositorCommand::Recomposite { surface_id });
+                    cs.handle.wake();
                 }
                 state.delivery_notify.notify_one();
             }
