@@ -5420,7 +5420,22 @@ impl Dispatch<WpViewport, ObjectId> for Compositor {
                     };
                 }
             }
-            Request::Destroy => {}
+            Request::Destroy => {
+                // The crop and scale belong to the wl_surface, not to this
+                // object, and the spec removes both when it goes — applied
+                // on the next commit like any other surface state.
+                //
+                // Destroying the viewport is the other spec-sanctioned way
+                // back to the whole buffer, alongside `set_source(-1, …)`.
+                // Ignoring it here would leave the last crop in force and
+                // the window squashed by its ratio for as long as the
+                // surface lives, which is the same failure this commit is
+                // fixing — just reached by the other door.
+                if let Some(surf) = state.surfaces.get_mut(surface_obj_id) {
+                    surf.pending_viewport_source = None;
+                    surf.pending_viewport_destination = None;
+                }
+            }
             _ => {}
         }
     }
