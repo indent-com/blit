@@ -1434,6 +1434,13 @@ export class BlitSurfaceCanvas {
   }
 
   private handleMouse(e: MouseEvent, type: number): void {
+    // Back and forward navigate the page — out of the session entirely —
+    // and middle click starts an autoscroll, all while the same press is
+    // on its way to the app. Claim them; the surface still gets the
+    // button. Left and right keep their defaults: the canvas wants the
+    // focus that a left press brings, and `contextmenu` is cancelled
+    // separately so a right press is already harmless.
+    if (e.button === 1 || e.button >= 3) e.preventDefault();
     this.sendPointerAt(e.clientX, e.clientY, type, e.button);
   }
 

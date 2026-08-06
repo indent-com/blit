@@ -902,7 +902,7 @@ pub enum SurfaceCommand {
         /// Y coordinate (pixels)
         y: u16,
 
-        /// Mouse button: left, right, or middle [default: left]
+        /// Mouse button: left, right, middle, back, or forward [default: left]
         #[arg(long, default_value = "left")]
         button: String,
     },

@@ -5961,6 +5961,48 @@ impl Compositor {
         }
         let _ = self.display_handle.flush_clients();
     }
+
+    /// Hand the current primary selection to one device, or clear it there.
+    ///
+    /// The clipboard gets away without an equivalent: a `wl_data_device`
+    /// selection is read out to the browser as text, and comes back as an
+    /// external offer when the user pastes, so the round trip substitutes
+    /// for compositor-side plumbing. Primary has no such detour — the web
+    /// platform exposes no PRIMARY — so unless the compositor hands the
+    /// selection over itself, a middle click lands on nothing.
+    fn offer_primary_to(&self, pd: &ZwpPrimarySelectionDeviceV1) {
+        let Some(ref src) = self.primary_source else {
+            pd.selection(None);
+            return;
+        };
+        let Some(client) = pd.client() else {
+            return;
+        };
+        let Ok(offer) = client
+            .create_resource::<ZwpPrimarySelectionOfferV1, PrimaryOfferData, Compositor>(
+                &self.display_handle,
+                pd.version(),
+                PrimaryOfferData { external: false },
+            )
+        else {
+            return;
+        };
+        pd.data_offer(&offer);
+        if let Some(data) = src.data::<PrimarySourceData>() {
+            for mime in data.mime_types.lock().unwrap().iter() {
+                offer.offer(mime.clone());
+            }
+        }
+        pd.selection(Some(&offer));
+    }
+
+    /// Push the current primary selection to every connected device.
+    fn offer_primary_selection(&mut self) {
+        for pd in &self.primary_devices {
+            self.offer_primary_to(pd);
+        }
+        let _ = self.display_handle.flush_clients();
+    }
 }
 
 // -- zwp_primary_selection --
@@ -6000,6 +6042,10 @@ impl Dispatch<ZwpPrimarySelectionDeviceManagerV1, ()> for Compositor {
             }
             Request::GetDevice { id, seat: _ } => {
                 let pd = data_init.init(id, ());
+                // A client that binds after the selection was made would
+                // otherwise never hear about it, and the usual prompt —
+                // keyboard focus — is not one this compositor re-offers on.
+                state.offer_primary_to(&pd);
                 state.primary_devices.push(pd);
             }
             Request::Destroy => {}
@@ -6040,6 +6086,9 @@ impl Dispatch<ZwpPrimarySelectionSourceV1, PrimarySourceData> for Compositor {
             .is_some_and(|s| s.id() == resource.id())
         {
             state.primary_source = None;
+            // The offers pointing at it are now unbacked; withdraw them
+            // rather than leave clients pasting from a dead source.
+            state.offer_primary_selection();
         }
     }
 }
@@ -6057,7 +6106,15 @@ impl Dispatch<ZwpPrimarySelectionDeviceV1, ()> for Compositor {
         use zwp_primary_selection_device_v1::Request;
         match request {
             Request::SetSelection { source, serial: _ } => {
+                // The displaced owner is told it lost the selection, so it
+                // can drop whatever it was holding to serve it.
+                if let Some(prev) = state.primary_source.take()
+                    && source.as_ref().is_none_or(|s| s.id() != prev.id())
+                {
+                    prev.cancelled();
+                }
                 state.primary_source = source;
+                state.offer_primary_selection();
             }
             Request::Destroy => {}
             _ => {}
