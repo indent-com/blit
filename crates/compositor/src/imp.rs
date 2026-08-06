@@ -745,6 +745,11 @@ pub(crate) struct Surface {
     xdg_toplevel: Option<XdgToplevel>,
     xdg_popup: Option<XdgPopup>,
     pub xdg_geometry: Option<(i32, i32, i32, i32)>,
+    /// Whether the client asked for fullscreen and we granted it.  It changes
+    /// nothing about how the pane is drawn -- it already fills its output --
+    /// but the client is told, because a client that asks and hears otherwise
+    /// backs its own fullscreen out again.
+    xdg_fullscreen: bool,
 
     title: String,
     app_id: String,
@@ -2543,14 +2548,7 @@ impl Compositor {
             .copied()
             .unwrap_or((self.output_width, self.output_height));
         if let Some(ref tl) = surf.xdg_toplevel {
-            tl.configure(
-                w,
-                h,
-                xdg_toplevel_states(&[
-                    xdg_toplevel::State::Activated,
-                    xdg_toplevel::State::Maximized,
-                ]),
-            );
+            tl.configure(w, h, pane_states(surf.xdg_fullscreen));
         }
         if let Some(ref xs) = surf.xdg_surface {
             let serial = self.serial.wrapping_add(1);
@@ -3078,11 +3076,6 @@ impl Compositor {
                     }
                 }
 
-                let states = xdg_toplevel_states(&[
-                    xdg_toplevel::State::Activated,
-                    xdg_toplevel::State::Maximized,
-                ]);
-
                 if output_changed {
                     // When output scale or dimensions changed, every
                     // toplevel needs a new configure so it re-renders at
@@ -3091,7 +3084,7 @@ impl Compositor {
                         let (lw, lh) = self.surface_sizes.get(&sid).copied().unwrap_or((w, h));
                         if let Some(surf) = self.surfaces.get(root_id) {
                             if let Some(ref tl) = surf.xdg_toplevel {
-                                tl.configure(lw, lh, states.clone());
+                                tl.configure(lw, lh, pane_states(surf.xdg_fullscreen));
                             }
                             if let Some(ref xs) = surf.xdg_surface {
                                 let serial = self.serial.wrapping_add(1);
@@ -3120,7 +3113,7 @@ impl Compositor {
                         && let Some(surf) = self.surfaces.get(root_id)
                     {
                         if let Some(ref tl) = surf.xdg_toplevel {
-                            tl.configure(w, h, states);
+                            tl.configure(w, h, pane_states(surf.xdg_fullscreen));
                         }
                         if let Some(ref xs) = surf.xdg_surface {
                             let serial = self.serial.wrapping_add(1);
@@ -3702,11 +3695,34 @@ fn yuv420_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
     [r, g, b]
 }
 
+/// The states a pane's configure carries.  It is always activated and always
+/// maximized; `fullscreen` is added for a toplevel that asked to be, which
+/// costs nothing because a pane already fills its output.
+fn pane_states(fullscreen: bool) -> Vec<u8> {
+    let mut states = vec![
+        xdg_toplevel::State::Activated,
+        xdg_toplevel::State::Maximized,
+    ];
+    if fullscreen {
+        states.push(xdg_toplevel::State::Fullscreen);
+    }
+    xdg_toplevel_states(&states)
+}
+
 /// Encode xdg_toplevel states as the raw byte array expected by the protocol.
 fn xdg_toplevel_states(states: &[xdg_toplevel::State]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(states.len() * 4);
     for state in states {
         bytes.extend_from_slice(&(*state as u32).to_ne_bytes());
+    }
+    bytes
+}
+
+/// Encode xdg_toplevel wm_capabilities the same way -- native-endian u32s.
+fn xdg_wm_capabilities(caps: &[xdg_toplevel::WmCapabilities]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(caps.len() * 4);
+    for cap in caps {
+        bytes.extend_from_slice(&(*cap as u32).to_ne_bytes());
     }
     bytes
 }
@@ -3781,6 +3797,7 @@ impl Dispatch<WlCompositor, ()> for Compositor {
                         xdg_toplevel: None,
                         xdg_popup: None,
                         xdg_geometry: None,
+                        xdg_fullscreen: false,
                         title: String::new(),
                         app_id: String::new(),
                         pending_viewport_destination: None,
@@ -4254,6 +4271,17 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for Compositor {
                     .toplevel_surface_ids
                     .insert(surface_id, data.wl_surface_id.clone());
 
+                // Say up front which of the state requests are worth making,
+                // so a client can leave the rest out of its titlebar instead
+                // of drawing buttons that do nothing.  Fullscreen is the only
+                // one we honour; a pane cannot be minimized or unmaximized.
+                // This has to precede the first xdg_surface.configure.
+                if toplevel.version() >= 5 {
+                    toplevel.wm_capabilities(xdg_wm_capabilities(&[
+                        xdg_toplevel::WmCapabilities::Fullscreen,
+                    ]));
+                }
+
                 // Use a per-surface size if one was already configured
                 // (e.g. the browser sent C2S_SURFACE_RESIZE before the
                 // toplevel was created), otherwise fall back to the global
@@ -4263,11 +4291,7 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for Compositor {
                     .get(&surface_id)
                     .copied()
                     .unwrap_or((state.output_width, state.output_height));
-                let states = xdg_toplevel_states(&[
-                    xdg_toplevel::State::Activated,
-                    xdg_toplevel::State::Maximized,
-                ]);
-                toplevel.configure(cw, ch, states);
+                toplevel.configure(cw, ch, pane_states(false));
                 let serial = state.next_serial();
                 resource.configure(serial);
 
@@ -4490,6 +4514,9 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                 if let Some(surf) = state.surfaces.get_mut(wl_surface_id) {
                     let sid = surf.surface_id;
                     surf.xdg_toplevel = None;
+                    // The wl_surface outlives its toplevel and can be given a
+                    // new one; that one starts out not fullscreen.
+                    surf.xdg_fullscreen = false;
                     if sid > 0 {
                         state.toplevel_surface_ids.remove(&sid);
                         state.last_reported_size.remove(&sid);
@@ -4516,15 +4543,28 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                 // say no out loud.
                 state.reassert_toplevel_configure(&data.wl_surface_id);
             }
-            Request::SetMaximized
-            | Request::UnsetMaximized
-            | Request::SetFullscreen { .. }
-            | Request::UnsetFullscreen => {
-                // A pane is permanently activated and maximized, so none of
-                // these change anything.  Declining is our call to make;
-                // declining silently is not -- xdg-shell says each of them
-                // "will respond by emitting a configure event", and clients
-                // hold their own state pending until one arrives.
+            Request::SetMaximized | Request::UnsetMaximized => {
+                // A pane is permanently maximized, so neither of these
+                // changes anything.  Declining is our call to make; declining
+                // silently is not -- xdg-shell says each of them "will respond
+                // by emitting a configure event", and clients hold their own
+                // state pending until one arrives.
+                state.reassert_toplevel_configure(&data.wl_surface_id);
+            }
+            req @ (Request::SetFullscreen { .. } | Request::UnsetFullscreen) => {
+                // Granted, both ways.  Nothing about the pane changes -- it
+                // has no decorations and already fills its output, so it is
+                // fullscreen in all but name -- but the client is told what it
+                // asked for, because refusing costs a feature.  Chromium
+                // hands a video to the compositor and waits: a configure
+                // without `fullscreen` reads as a refusal, and it drops the
+                // page straight back out of fullscreen.  There is nothing to
+                // gain by saying no to a window that is already the whole
+                // screen.  We ignore the output argument; there is one.
+                let fullscreen = matches!(req, Request::SetFullscreen { .. });
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                    surf.xdg_fullscreen = fullscreen;
+                }
                 state.reassert_toplevel_configure(&data.wl_surface_id);
             }
             _ => {}
