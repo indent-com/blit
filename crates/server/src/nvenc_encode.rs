@@ -10,6 +10,7 @@
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
 use crate::gpu_libs;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
 
@@ -18,7 +19,12 @@ use std::ptr;
 // ---------------------------------------------------------------------------
 
 const NV_ENC_SUCCESS: u32 = 0;
-const NV_ENC_ERR_NEED_MORE_INPUT: u32 = 10;
+/// `NVENCSTATUS` ordinal, counted from nvEncodeAPI.h — 10 is
+/// `NV_ENC_ERR_OUT_OF_MEMORY`, which this was set to.  The encode paths
+/// treat this status as "no output for this frame yet", so an encoder that
+/// ran out of memory reported nothing at all, while a genuine request for
+/// more input was raised as a hard failure.
+const NV_ENC_ERR_NEED_MORE_INPUT: u32 = 17;
 
 // API version whose struct layouts we target.  Must match a version the
 // driver is backward-compatible with.  We use 12.1 — matching the widely
@@ -52,10 +58,17 @@ const NV_ENC_BUFFER_FORMAT_NV12: u32 = 0x00000001;
 const NV_ENC_BUFFER_FORMAT_ARGB: u32 = 0x01000000; // B8G8R8A8 in memory (DRM ARGB8888)
 const NV_ENC_BUFFER_FORMAT_ABGR: u32 = 0x10000000; // R8G8B8A8 in memory (DRM ABGR8888)
 
-// Encoder capability query
+// Encoder capability query.  The values are ordinals into `NV_ENC_CAPS`
+// (nvEncodeAPI.h) — count the enum, don't guess: `SUPPORT_YUV444_ENCODE`
+// was long spelled 15 here, which is `SEPARATE_COLOUR_PLANE`.  It happened
+// to answer the same way on the GPUs we had, so nothing caught it.
 const NV_ENC_CAPS_PARAM_VER: u32 = nvencapi_struct_version(1);
 const NV_ENC_CAPS_PARAM_SIZE: usize = 256;
-const NV_ENC_CAPS_SUPPORT_YUV444_ENCODE: u32 = 15;
+const NV_ENC_CAPS_WIDTH_MAX: u32 = 16;
+const NV_ENC_CAPS_HEIGHT_MAX: u32 = 17;
+const NV_ENC_CAPS_SUPPORT_YUV444_ENCODE: u32 = 33;
+const NV_ENC_CAPS_WIDTH_MIN: u32 = 45;
+const NV_ENC_CAPS_HEIGHT_MIN: u32 = 46;
 
 // Resource types for nvEncRegisterResource
 const NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR: u32 = 0x01;
@@ -424,6 +437,219 @@ impl Drop for NvencInitGuard<'_> {
     }
 }
 
+/// What this host's NVENC engine will accept for one codec.
+///
+/// Every field is a property of the device and the driver, which is what
+/// makes it worth answering once and keeping — unlike the failure to build
+/// one particular encoder, which usually says something about the frame.
+/// Keeping those apart is the point: a 256x54 dock thumbnail is under
+/// `min_height` for AV1, and reading its refusal as "this host has no NVENC"
+/// took hardware encoding away from every viewer until the server restarted.
+#[derive(Clone, Copy, Debug)]
+pub struct NvencCaps {
+    pub min_width: u32,
+    pub min_height: u32,
+    pub max_width: u32,
+    pub max_height: u32,
+    pub yuv444: bool,
+}
+
+impl NvencCaps {
+    /// Why this engine will not take a `width`x`height` frame — `None` if it
+    /// will.  The caller is expected to fall down the encoder chain rather
+    /// than write the backend off: this is a verdict on the frame.
+    fn refuse(&self, width: u32, height: u32) -> Option<String> {
+        (width < self.min_width
+            || height < self.min_height
+            || width > self.max_width
+            || height > self.max_height)
+            .then(|| {
+                format!(
+                    "{width}x{height} is outside NVENC's {}x{}–{}x{} range",
+                    self.min_width, self.min_height, self.max_width, self.max_height,
+                )
+            })
+    }
+}
+
+/// Read one `NV_ENC_CAPS` ordinal.  Failures report as `None`, which the
+/// caller turns into a conservative answer rather than a hard error — a
+/// driver that cannot answer a caps query can still encode.
+fn encode_cap(
+    fns: &NvEncFunctionList,
+    encoder: *mut c_void,
+    codec_guid: NvGuid,
+    cap: u32,
+) -> Option<u32> {
+    let mut caps_param = vec![0u8; NV_ENC_CAPS_PARAM_SIZE];
+    w32(&mut caps_param, 0, NV_ENC_CAPS_PARAM_VER);
+    w32(&mut caps_param, 4, cap);
+    let mut value: i32 = 0;
+    // SAFETY: `encoder` is an open session, and `caps_param` is a
+    // NV_ENC_CAPS_PARAM of the declared version.
+    let status = unsafe {
+        (fns.nvEncGetEncodeCaps)(
+            encoder,
+            codec_guid,
+            caps_param.as_mut_ptr() as *mut c_void,
+            &mut value,
+        )
+    };
+    (status == NV_ENC_SUCCESS && value > 0).then_some(value as u32)
+}
+
+/// Codec GUID and wire codec flag for a codec name.
+fn nvenc_codec(codec: &str) -> Result<(NvGuid, u8), String> {
+    match codec {
+        "h264" => Ok((
+            NV_ENC_CODEC_H264_GUID,
+            blit_remote::SURFACE_FRAME_CODEC_H264,
+        )),
+        "av1" => Ok((NV_ENC_CODEC_AV1_GUID, blit_remote::SURFACE_FRAME_CODEC_AV1)),
+        _ => Err(format!("unsupported NVENC codec: {codec}")),
+    }
+}
+
+/// What this host's NVENC will take for `codec`, asked once per process.
+///
+/// The query needs a session of its own, so it costs one open/close the first
+/// time and nothing after that.  Both the answer *and* the reason there isn't
+/// one are cached: "no CUDA on this box" is as durable a fact as the maximum
+/// frame size, and re-running `cuInit` on every surface resize is what the
+/// cache is for.
+pub fn caps(codec: &str, verbose: bool) -> Result<NvencCaps, String> {
+    static CAPS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Result<NvencCaps, String>>>> =
+        std::sync::OnceLock::new();
+    let cache = CAPS.get_or_init(Default::default);
+    if let Ok(map) = cache.lock()
+        && let Some(hit) = map.get(codec)
+    {
+        return hit.clone();
+    }
+
+    let answer = (|| {
+        let (codec_guid, _) = nvenc_codec(codec)?;
+        let cuda = gpu_libs::cuda().map_err(|e| format!("CUDA: {e}"))?;
+        let (fns, ctx, encoder) = open_session(cuda)?;
+        // Releases both when this scope ends — the session existed only to
+        // answer the query.
+        let guard = NvencInitGuard {
+            cuda,
+            fns: Some(fns),
+            ctx,
+            encoder,
+        };
+        let caps = NvencCaps {
+            // A driver that will not name a minimum is saying it has none.
+            min_width: encode_cap(fns, encoder, codec_guid, NV_ENC_CAPS_WIDTH_MIN).unwrap_or(1),
+            min_height: encode_cap(fns, encoder, codec_guid, NV_ENC_CAPS_HEIGHT_MIN).unwrap_or(1),
+            // …and one that will not name a maximum gets the largest frame
+            // any AV1 or H.264 level admits, so the chain's own ceilings
+            // stay the binding constraint rather than this fallback.
+            max_width: encode_cap(fns, encoder, codec_guid, NV_ENC_CAPS_WIDTH_MAX)
+                .unwrap_or(u16::MAX as u32),
+            max_height: encode_cap(fns, encoder, codec_guid, NV_ENC_CAPS_HEIGHT_MAX)
+                .unwrap_or(u16::MAX as u32),
+            yuv444: encode_cap(fns, encoder, codec_guid, NV_ENC_CAPS_SUPPORT_YUV444_ENCODE)
+                .is_some(),
+        };
+        drop(guard);
+        Ok(caps)
+    })();
+
+    if verbose {
+        match &answer {
+            Ok(c) => eprintln!(
+                "[nvenc] {codec}: {}x{}–{}x{}, 4:4:4 {}",
+                c.min_width,
+                c.min_height,
+                c.max_width,
+                c.max_height,
+                if c.yuv444 { "yes" } else { "no" },
+            ),
+            Err(e) => eprintln!("[nvenc] {codec}: unavailable — {e}"),
+        }
+    }
+    if let Ok(mut map) = cache.lock() {
+        map.insert(codec.to_string(), answer.clone());
+    }
+    answer
+}
+
+/// Open a CUDA context and an NVENC session on it.  Both belong to the
+/// caller, who must hand them to an [`NvencInitGuard`] or an encoder.
+fn open_session(
+    cuda: &'static gpu_libs::CudaFns,
+) -> Result<(&'static NvEncFunctionList, gpu_libs::CUcontext, *mut c_void), String> {
+    let nvenc_fns = gpu_libs::nvenc().map_err(|e| format!("NVENC: {e}"))?;
+
+    let mut status = unsafe { (cuda.cuInit)(0) };
+    if status != 0 {
+        return Err(format!("cuInit failed: {status}"));
+    }
+
+    let cuda_device_idx: i32 = std::env::var("BLIT_CUDA_DEVICE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let mut device: gpu_libs::CUdevice = 0;
+    status = unsafe { (cuda.cuDeviceGet)(&mut device, cuda_device_idx) };
+    if status != 0 {
+        return Err(format!("cuDeviceGet({cuda_device_idx}) failed: {status}"));
+    }
+
+    let mut ctx: gpu_libs::CUcontext = ptr::null_mut();
+    status = unsafe { (cuda.cuCtxCreate_v2)(&mut ctx, 0, device) };
+    if status != 0 {
+        return Err(format!("cuCtxCreate failed: {status}"));
+    }
+
+    // NVENC function table — initialized once, reused across all sessions.
+    static NVENC_FN_LIST: std::sync::OnceLock<Result<NvEncFunctionList, String>> =
+        std::sync::OnceLock::new();
+    let result = NVENC_FN_LIST.get_or_init(|| {
+        let fn_list_ver = nvencapi_struct_version(2);
+        let mut fl = std::mem::MaybeUninit::<NvEncFunctionList>::zeroed();
+        // SAFETY: version is the first field (offset 0) in the repr(C) struct.
+        unsafe { (*fl.as_mut_ptr()).version = fn_list_ver };
+        let nv_status = unsafe { (nvenc_fns.NvEncodeAPICreateInstance)(fl.as_mut_ptr().cast()) };
+        // SAFETY: NvEncodeAPICreateInstance fills all function pointers.
+        let fl = unsafe { fl.assume_init() };
+        if nv_status != NV_ENC_SUCCESS {
+            return Err(format!("NvEncodeAPICreateInstance failed: {nv_status}"));
+        }
+        Ok(fl)
+    });
+    let fns = match result {
+        Ok(fl) => fl,
+        Err(e) => {
+            unsafe { (cuda.cuCtxDestroy_v2)(ctx) };
+            return Err(e.clone());
+        }
+    };
+    let fns: &'static NvEncFunctionList =
+        // SAFETY: OnceLock guarantees the value lives for 'static.
+        unsafe { &*(fns as *const NvEncFunctionList) };
+
+    let mut open_buf = vec![0u8; NVENC_OPEN_ENCODE_SESSION_EX_SIZE];
+    w32(&mut open_buf, 0, NV_ENC_OPEN_ENCODE_SESSION_EX_VER); // version @ 0
+    w32(&mut open_buf, 4, 1); // deviceType = CUDA @ 4
+    wptr(&mut open_buf, 8, ctx); // device @ 8
+    // _reserved ptr @ 16 = NULL
+    w32(&mut open_buf, 24, NVENCAPI_VERSION); // apiVersion @ 24
+
+    let mut encoder: *mut c_void = ptr::null_mut();
+    let nv_status = unsafe {
+        (fns.nvEncOpenEncodeSessionEx)(open_buf.as_mut_ptr() as *mut c_void, &mut encoder)
+    };
+    if nv_status != NV_ENC_SUCCESS {
+        unsafe { (cuda.cuCtxDestroy_v2)(ctx) };
+        return Err(format!("nvEncOpenEncodeSessionEx failed: {nv_status}"));
+    }
+    Ok((fns, ctx, encoder))
+}
+
 impl NvencDirectEncoder {
     /// Try to create an NVENC encoder for the given codec and dimensions.
     ///
@@ -439,113 +665,35 @@ impl NvencDirectEncoder {
         verbose: bool,
         chroma: crate::surface_encoder::ChromaSubsampling,
     ) -> Result<Self, String> {
+        let (codec_guid, codec_flag) = nvenc_codec(codec)?;
+
+        // Ask the device what it takes before building anything.  Both
+        // answers below are settled here rather than by watching an
+        // `nvEncInitializeEncoder` fail: a frame outside the engine's range
+        // — a 256x54 dock thumbnail, say — comes back as a plain refusal
+        // that costs no session and says nothing about the host.
+        let caps = caps(codec, verbose)?;
+        if chroma.is_444() && !caps.yuv444 {
+            return Err(format!(
+                "NVENC {codec} does not support 4:4:4 encoding on this GPU"
+            ));
+        }
+        if let Some(refusal) = caps.refuse(width, height) {
+            return Err(refusal);
+        }
+
         let cuda = gpu_libs::cuda().map_err(|e| format!("CUDA: {e}"))?;
-        let nvenc_fns = gpu_libs::nvenc().map_err(|e| format!("NVENC: {e}"))?;
-
-        // Initialize CUDA
-        let mut status = unsafe { (cuda.cuInit)(0) };
-        if status != 0 {
-            return Err(format!("cuInit failed: {status}"));
-        }
-
-        let cuda_device_idx: i32 = std::env::var("BLIT_CUDA_DEVICE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        let mut device: gpu_libs::CUdevice = 0;
-        status = unsafe { (cuda.cuDeviceGet)(&mut device, cuda_device_idx) };
-        if status != 0 {
-            return Err(format!("cuDeviceGet({cuda_device_idx}) failed: {status}"));
-        }
-
-        let mut ctx: gpu_libs::CUcontext = ptr::null_mut();
-        status = unsafe { (cuda.cuCtxCreate_v2)(&mut ctx, 0, device) };
-        if status != 0 {
-            return Err(format!("cuCtxCreate failed: {status}"));
-        }
-        // From here on every `return Err` must release the context; the
-        // guard does it so new early-exits cannot reintroduce the leak.
-        let mut guard = NvencInitGuard {
+        let (fns, ctx, encoder) = open_session(cuda)?;
+        // From here on every `return Err` must release the context and the
+        // session; the guard does it so new early-exits cannot reintroduce
+        // the leak.
+        let guard = NvencInitGuard {
             cuda,
-            fns: None,
+            fns: Some(fns),
             ctx,
-            encoder: ptr::null_mut(),
+            encoder,
         };
-
-        // Get NVENC function table (initialized once, reused across all instances)
-        static NVENC_FN_LIST: std::sync::OnceLock<Result<NvEncFunctionList, String>> =
-            std::sync::OnceLock::new();
-        let result = NVENC_FN_LIST.get_or_init(|| {
-            let fn_list_ver = nvencapi_struct_version(2);
-            let mut fl = std::mem::MaybeUninit::<NvEncFunctionList>::zeroed();
-            // SAFETY: version is the first field (offset 0) in the repr(C) struct.
-            unsafe { (*fl.as_mut_ptr()).version = fn_list_ver };
-            let nv_status =
-                unsafe { (nvenc_fns.NvEncodeAPICreateInstance)(fl.as_mut_ptr().cast()) };
-            // SAFETY: NvEncodeAPICreateInstance fills all function pointers.
-            let fl = unsafe { fl.assume_init() };
-            if nv_status != NV_ENC_SUCCESS {
-                return Err(format!("NvEncodeAPICreateInstance failed: {nv_status}"));
-            }
-            Ok(fl)
-        });
-        let fns = match result {
-            Ok(fl) => fl,
-            Err(e) => return Err(e.clone()),
-        };
-        let fns: &'static NvEncFunctionList =
-            // SAFETY: OnceLock guarantees the value lives for 'static.
-            unsafe { &*(fns as *const NvEncFunctionList) };
-        guard.fns = Some(fns);
-
-        // Open encode session
-        let mut open_buf = vec![0u8; NVENC_OPEN_ENCODE_SESSION_EX_SIZE];
-        w32(&mut open_buf, 0, NV_ENC_OPEN_ENCODE_SESSION_EX_VER); // version @ 0
-        w32(&mut open_buf, 4, 1); // deviceType = CUDA @ 4
-        wptr(&mut open_buf, 8, ctx); // device @ 8
-        // _reserved ptr @ 16 = NULL
-        w32(&mut open_buf, 24, NVENCAPI_VERSION); // apiVersion @ 24
-
-        let mut encoder: *mut c_void = ptr::null_mut();
-        let nv_status = unsafe {
-            (fns.nvEncOpenEncodeSessionEx)(open_buf.as_mut_ptr() as *mut c_void, &mut encoder)
-        };
-        if nv_status != NV_ENC_SUCCESS {
-            return Err(format!("nvEncOpenEncodeSessionEx failed: {nv_status}"));
-        }
-        guard.encoder = encoder;
-
-        let (codec_guid, codec_flag) = match codec {
-            "h264" => (
-                NV_ENC_CODEC_H264_GUID,
-                blit_remote::SURFACE_FRAME_CODEC_H264,
-            ),
-            "av1" => (NV_ENC_CODEC_AV1_GUID, blit_remote::SURFACE_FRAME_CODEC_AV1),
-            _ => return Err(format!("unsupported NVENC codec: {codec}")),
-        };
-
-        // Check 4:4:4 capability if requested.
-        if chroma.is_444() {
-            let mut caps_param = vec![0u8; NV_ENC_CAPS_PARAM_SIZE];
-            w32(&mut caps_param, 0, NV_ENC_CAPS_PARAM_VER);
-            w32(&mut caps_param, 4, NV_ENC_CAPS_SUPPORT_YUV444_ENCODE);
-            let mut caps_val: i32 = 0;
-            let nv_status = unsafe {
-                (fns.nvEncGetEncodeCaps)(
-                    encoder,
-                    codec_guid,
-                    caps_param.as_mut_ptr() as *mut c_void,
-                    &mut caps_val,
-                )
-            };
-            if nv_status != NV_ENC_SUCCESS || caps_val == 0 {
-                // Session and context are released by the guard.
-                return Err(format!(
-                    "NVENC {codec} does not support 4:4:4 encoding on this GPU"
-                ));
-            }
-        }
+        let mut status;
 
         // Get preset config — uses exact SDK struct sizes to avoid version
         // mismatch (the driver validates struct size via the version tag).
@@ -1718,5 +1866,55 @@ impl Drop for NvencDirectEncoder {
                 (cuda.cuCtxDestroy_v2)(self.cuda_ctx);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps() -> NvencCaps {
+        // What an Ada-generation AV1 engine reports.
+        NvencCaps {
+            min_width: 160,
+            min_height: 128,
+            max_width: 8192,
+            max_height: 8192,
+            yuv444: false,
+        }
+    }
+
+    /// The dock renders panes at 256x54.  That is a statement about the
+    /// frame, and the caller has to be able to read it as one — writing it
+    /// off as "this host has no NVENC" is what took hardware AV1 away from
+    /// every viewer on the machine.
+    #[test]
+    fn a_frame_under_the_engine_minimum_is_refused_not_the_engine() {
+        assert!(caps().refuse(256, 54).is_some(), "under min_height");
+        assert!(caps().refuse(64, 480).is_some(), "under min_width");
+        assert!(caps().refuse(9000, 480).is_some(), "over max_width");
+        assert!(caps().refuse(1920, 9000).is_some(), "over max_height");
+        assert!(caps().refuse(1920, 1080).is_none());
+        // Exactly on the bounds is inside them.
+        assert!(caps().refuse(160, 128).is_none());
+        assert!(caps().refuse(8192, 8192).is_none());
+    }
+
+    /// The probe frame every backend is measured against has to clear the
+    /// minimums, or the thing meant to tell a host's fault from a frame's
+    /// would report every host as broken.
+    #[test]
+    fn the_probe_frame_clears_the_engine_minimum() {
+        let (w, h) = crate::surface_encoder::PROBE_SIZE;
+        assert!(caps().refuse(w, h).is_none());
+    }
+
+    /// The refusal names the range, because it is read in logs beside the
+    /// size that was asked for.
+    #[test]
+    fn a_refusal_says_what_the_range_is() {
+        let msg = caps().refuse(256, 54).unwrap();
+        assert!(msg.contains("256x54"), "{msg}");
+        assert!(msg.contains("160x128"), "{msg}");
     }
 }

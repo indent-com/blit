@@ -707,7 +707,8 @@ impl SurfaceEncoder {
         // probes — cuInit on systems without CUDA, libva driver open on
         // systems without H.264/AV1 encode — adding multi-second latency
         // to each resize before the actual encoder is created.
-        if let Some(err) = cached_unavailable(pref, chroma) {
+        let known = family_status(pref, chroma);
+        if let Some(FamilyStatus::Missing(err)) = known {
             return Err(err);
         }
 
@@ -722,8 +723,50 @@ impl SurfaceEncoder {
             verbose,
             chroma,
         );
-        if let Err(err) = &result {
-            record_unavailable(pref, chroma, err);
+        // `Missing` returned above, so a family that is known here is one
+        // that has already built an encoder — and by elimination anything
+        // that goes wrong now is about the frame, not the host.  Nothing
+        // more to learn either way.
+        if known.is_some() {
+            return result;
+        }
+        match &result {
+            Ok(_) => record_family(pref, chroma, FamilyStatus::Works),
+            Err(err) => {
+                // First word from this family, and it's bad news — so ask it
+                // for a frame with nothing unusual about it before believing
+                // the worst.  Only a failure that survives that is a fact
+                // about the host; anything else belongs to the frame that
+                // provoked it — a dock thumbnail under NVENC's minimum
+                // encode height, VA-API AV1 declining to pad a 256x54 strip
+                // out to 512x512 — and writing it down here would take the
+                // encoder away from every other viewer on the machine.
+                let (pw, ph) = PROBE_SIZE;
+                let probe = Self::try_one_inner(
+                    pref,
+                    pw,
+                    ph,
+                    pw,
+                    ph,
+                    vaapi_device,
+                    encoding,
+                    false,
+                    chroma,
+                );
+                match probe {
+                    Ok(_) => record_family(pref, chroma, FamilyStatus::Works),
+                    Err(probe_err) => {
+                        // Report the probe's reason, not this frame's: it is
+                        // the one that will be replayed at every later size.
+                        if verbose && probe_err != *err {
+                            eprintln!(
+                                "[surface-encoder] {pref:?} unusable on this host: {probe_err}"
+                            );
+                        }
+                        record_family(pref, chroma, FamilyStatus::Missing(probe_err));
+                    }
+                }
+            }
         }
         result
     }
@@ -1680,10 +1723,9 @@ fn validate_surface_dimensions(
     // Refuse a frame this backend cannot carry so the chain moves on to one
     // that can.  Without this an H.264 encoder would happily accept a 5K
     // frame and emit a bitstream above what the client's decoder advertised,
-    // which fails in the browser rather than here.  This runs before
-    // `record_unavailable`, so a size rejection never poisons the
-    // family-unavailable cache — the same backend is retried at a size that
-    // fits.
+    // which fails in the browser rather than here.  This runs ahead of
+    // [`FamilyStatus`], so a size rejection is never mistaken for the host
+    // lacking the backend — the same one is retried at a size that fits.
     if !preference.fits(width, height) {
         let (max_w, max_h) = preference.max_dimensions();
         return Err(format!(
@@ -1693,40 +1735,70 @@ fn validate_surface_dimensions(
     Ok(())
 }
 
-// Host-wide cache of encoder-family unavailability.  Populated the first
-// time a given `(preference, chroma)` try_one fails after passing the
-// per-call dimension validation — i.e. the error is systemic (missing
-// driver, codec not supported by the device) and will recur on every
-// future attempt.  Hits return the cached error string immediately,
-// skipping the probe cost (cuInit, libva driver open) entirely.
-//
-// Never evicts: drivers don't appear at runtime in practice, and the
-// cost of being wrong is only that a user must restart after plugging
-// in GPU support they didn't have.
-static ENCODER_UNAVAILABLE: std::sync::OnceLock<
+/// A frame with nothing unusual about it, used to tell a host's verdict
+/// apart from a frame's.  Comfortably above every hardware minimum we know
+/// of — NVENC's AV1 engine wants 128 rows — small enough that building one
+/// costs nothing, and even on both axes so no backend has to pad it.
+pub(crate) const PROBE_SIZE: (u32, u32) = (640, 480);
+
+/// What the *host* has to say about an encoder family, as distinct from
+/// what it has to say about one frame.
+///
+/// Only two things get written here, and neither can depend on the frame: a
+/// construction that succeeded, and one that failed and was reproduced at
+/// [`PROBE_SIZE`].  A failure the probe does not reproduce is a verdict on
+/// the frame and is deliberately *not* recorded — a 256x54 dock thumbnail
+/// is under NVENC's minimum encode height, and filing that under "this host
+/// has no NVENC" took hardware encoding away from every viewer, at every
+/// size, until the server was restarted.  The tell was a 3200x2160 request
+/// being refused with a cached message about a 48x54 one.
+///
+/// Never evicts: drivers don't appear at runtime in practice, and the cost
+/// of being wrong is only that a user must restart after plugging in GPU
+/// support they didn't have.
+#[derive(Clone)]
+enum FamilyStatus {
+    /// Built an encoder at least once.  Nothing further is ever probed —
+    /// every later failure is about the frame, by elimination.
+    Works,
+    /// Could not build one even at `PROBE_SIZE`.  Later attempts fail fast
+    /// with this message instead of re-running `cuInit` or reopening the
+    /// libva driver, which is what this cache exists to avoid.
+    Missing(String),
+}
+
+static ENCODER_FAMILY: std::sync::OnceLock<
     std::sync::Mutex<
-        std::collections::HashMap<(SurfaceEncoderPreference, ChromaSubsampling), String>,
+        std::collections::HashMap<(SurfaceEncoderPreference, ChromaSubsampling), FamilyStatus>,
     >,
 > = std::sync::OnceLock::new();
 
-fn encoder_unavailable_map() -> &'static std::sync::Mutex<
-    std::collections::HashMap<(SurfaceEncoderPreference, ChromaSubsampling), String>,
+fn family_map() -> &'static std::sync::Mutex<
+    std::collections::HashMap<(SurfaceEncoderPreference, ChromaSubsampling), FamilyStatus>,
 > {
-    ENCODER_UNAVAILABLE.get_or_init(Default::default)
+    ENCODER_FAMILY.get_or_init(Default::default)
 }
 
-fn cached_unavailable(pref: SurfaceEncoderPreference, chroma: ChromaSubsampling) -> Option<String> {
-    encoder_unavailable_map()
-        .lock()
-        .ok()?
-        .get(&(pref, chroma))
-        .cloned()
+fn family_status(
+    pref: SurfaceEncoderPreference,
+    chroma: ChromaSubsampling,
+) -> Option<FamilyStatus> {
+    family_map().lock().ok()?.get(&(pref, chroma)).cloned()
 }
 
-fn record_unavailable(pref: SurfaceEncoderPreference, chroma: ChromaSubsampling, err: &str) {
-    if let Ok(mut map) = encoder_unavailable_map().lock() {
-        map.entry((pref, chroma)).or_insert_with(|| err.to_string());
+fn record_family(pref: SurfaceEncoderPreference, chroma: ChromaSubsampling, status: FamilyStatus) {
+    if let Ok(mut map) = family_map().lock() {
+        map.entry((pref, chroma)).or_insert(status);
     }
+}
+
+/// Whether this host has already proven it cannot run `pref` at all.
+///
+/// Sizing consults this to tell "no backend here can carry a frame this
+/// large" from "the one that could just failed" — the first calls for a
+/// smaller surface, the second for another try at the same size.
+pub fn known_unavailable(pref: SurfaceEncoderPreference, chroma: ChromaSubsampling) -> bool {
+    matches!(family_status(pref, chroma), Some(FamilyStatus::Missing(_)))
 }
 
 fn expected_rgba_len(width: u32, height: u32) -> Option<usize> {
@@ -2952,5 +3024,47 @@ mod tests {
         let mut data = make_obu(2, &[0x00; 200]);
         data.extend(make_obu(1, &[0xFF; 4]));
         assert!(av1_stream_contains_keyframe(&data));
+    }
+
+    /// A backend that cannot build an encoder even at [`PROBE_SIZE`] is a
+    /// fact about the host, and the chain is entitled to stop asking.
+    /// Vulkan Video stands in for one: it refuses at every size because the
+    /// compositor owns it, so no GPU is needed to see the latch close.
+    #[test]
+    fn a_backend_that_fails_the_probe_too_is_written_off() {
+        let pref = SurfaceEncoderPreference::VulkanVideoH264;
+        assert!(!known_unavailable(pref, ChromaSubsampling::Cs420));
+        let err = SurfaceEncoder::try_one(
+            pref,
+            256,
+            54,
+            256,
+            54,
+            "",
+            SurfaceEncoding::default(),
+            false,
+            ChromaSubsampling::Cs420,
+        )
+        .err()
+        .expect("Vulkan Video is never built through this path");
+        assert!(err.contains("compositor"), "{err}");
+        assert!(known_unavailable(pref, ChromaSubsampling::Cs420));
+    }
+
+    /// `known_unavailable` answers for the host, so only a probe failure
+    /// sets it — a family that has built an encoder stays usable no matter
+    /// how many individual frames it goes on to refuse.
+    #[test]
+    fn only_a_missing_family_reads_as_unavailable() {
+        let pref = SurfaceEncoderPreference::VulkanVideoAV1;
+        let chroma = ChromaSubsampling::Cs444;
+        record_family(pref, chroma, FamilyStatus::Works);
+        assert!(!known_unavailable(pref, chroma));
+        // First writer wins: a later failure cannot demote a family that
+        // has already proven itself.
+        record_family(pref, chroma, FamilyStatus::Missing("nope".into()));
+        assert!(!known_unavailable(pref, chroma));
+        // …and an untouched key is not a claim either way.
+        assert!(!known_unavailable(pref, ChromaSubsampling::Cs420));
     }
 }
