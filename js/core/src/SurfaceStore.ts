@@ -91,15 +91,23 @@ interface SurfacePresenter {
   initialized: boolean;
   /** Local-clock (`performance.now()`) estimate of where this stream's PTS
    *  origin sits: the smallest `arrival - pts` seen, i.e. the fastest path
-   *  the link has demonstrated.  A late frame raises {@link jitterMs}, not
+   *  the link has demonstrated.  A late frame feeds {@link lateness}, not
    *  this, so the baseline tracks the floor rather than drifting up to the
    *  mean.  Leaks upward by {@link SurfaceStore.OFFSET_LEAK_MS} per frame
    *  so genuine clock drift between server and browser is still followed. */
   clockOffsetMs: number | null;
-  /** Peak-tracking EWMA of how late frames land relative to
-   *  {@link clockOffsetMs}.  Rises fast and decays slowly, so the playout
-   *  margin covers recent worst-case jitter instead of the average. */
-  jitterMs: number;
+  /** Recent lateness samples (ms) relative to {@link clockOffsetMs}, held
+   *  for roughly {@link SurfaceStore.LATENESS_WINDOW_MS} of stream.  The
+   *  margin is a quantile of this rather than a peak-tracking average: a
+   *  peak tracker spends the whole latency budget reacting to outliers it
+   *  cannot cover anyway, then takes ~55 frames to come back down.  A
+   *  quantile sizes to the jitter that actually recurs and lets the tail
+   *  fall through to skip-to-newest, which is the right handling for an
+   *  outlier regardless. */
+  lateness: number[];
+  /** Current playout margin (ms), slewed toward the quantile rather than
+   *  set to it — see {@link SurfaceStore.MARGIN_GROW_MS}. */
+  marginMs: number;
   /** PTS (ms) of the previous arrival, for rewind/wrap detection. */
   lastPtsMs: number | null;
   /** Consecutive arrivals that looked like part of one continuous stream. */
@@ -112,6 +120,15 @@ interface SurfacePresenter {
   /** True while presentation is scheduled off PTS.  False for sparse or
    *  interactive repaints, which present as soon as they decode. */
   smoothing: boolean;
+}
+
+/** Nearest-rank quantile of `samples`, which is left unmodified.  `q` is in
+ *  [0, 1]; an empty set is 0. */
+function quantile(samples: readonly number[], q: number): number {
+  const n = samples.length;
+  if (n === 0) return 0;
+  const sorted = Array.from(samples).sort((a, b) => a - b);
+  return sorted[Math.min(n - 1, Math.max(0, Math.ceil(q * n) - 1))];
 }
 
 function codecFromFlags(flags: number): SurfaceCodec {
@@ -338,14 +355,33 @@ export class SurfaceStore {
    *  interaction and must paint immediately rather than wait out a
    *  playout margin computed for the previous episode. */
   private static readonly STREAM_GAP_MS = 250;
-  /** Safety factor applied to tracked jitter to get the playout margin. */
-  private static readonly JITTER_MARGIN = 1.5;
   /** Hard ceiling on latency the presenter is allowed to add.  Smoothing
    *  past this trades away more interactivity than juddering costs. */
   private static readonly PRESENT_DELAY_MAX_MS = 50;
-  /** Peak-tracking EWMA weights for {@link SurfacePresenter.jitterMs}. */
-  private static readonly JITTER_RISE = 0.5;
-  private static readonly JITTER_FALL = 0.02;
+  /** How much stream the lateness distribution covers.  Expressed in time
+   *  rather than frames so the horizon is the same at 24 and 240 fps —
+   *  too short and the margin chases noise, too long and it responds
+   *  sluggishly to a link that genuinely changed (a Wi-Fi roam). */
+  private static readonly LATENESS_WINDOW_MS = 2000;
+  private static readonly LATENESS_WINDOW_MIN = 60;
+  private static readonly LATENESS_WINDOW_MAX = 480;
+  /** Quantile of observed lateness the margin covers.  The remaining tail
+   *  is deliberately not buffered for: those frames arrive overdue and are
+   *  skipped to the newest due one, which costs nothing and is what should
+   *  happen to a rare outlier. */
+  private static readonly LATENESS_QUANTILE = 0.95;
+  /** Maximum margin movement per frame, growing and shrinking (ms).
+   *
+   *  A margin change *is* a latency change — every future due time shifts
+   *  with it — so stepping the margin injects exactly the timing
+   *  discontinuity this scheduler exists to remove.  Slewing turns it into
+   *  a sub-perceptual speed-up or slow-down instead: 2 ms against a 16.7 ms
+   *  frame is a 12% rate nudge while it moves, and the margin can still
+   *  cross its whole range in well under a second.  Shrinking is slower
+   *  than growing because being under-buffered judders and being
+   *  over-buffered only costs a little latency. */
+  private static readonly MARGIN_GROW_MS = 2;
+  private static readonly MARGIN_SHRINK_MS = 0.25;
   /** Upward leak on the PTS→local baseline, per frame (ms).  At 60 fps
    *  this allows ~3 ms/s of tracked drift — far more than two decent
    *  clocks diverge, far less than jitter would push it. */
@@ -931,7 +967,8 @@ export class SurfaceStore {
         rafId: null,
         initialized: false,
         clockOffsetMs: null,
-        jitterMs: 0,
+        lateness: [],
+        marginMs: 0,
         lastPtsMs: null,
         steadyRun: 0,
         frameIntervalMs: SurfaceStore.DEFAULT_REFRESH_MS,
@@ -1003,7 +1040,8 @@ export class SurfaceStore {
     // freeze outright, which is far worse than the judder being fixed here.
     if (!Number.isFinite(ptsMs)) {
       p.clockOffsetMs = null;
-      p.jitterMs = 0;
+      p.lateness.length = 0;
+      p.marginMs = 0;
       p.steadyRun = 0;
       p.smoothing = false;
       p.lastPtsMs = null;
@@ -1035,7 +1073,8 @@ export class SurfaceStore {
 
     if (ptsBroke) {
       p.clockOffsetMs = null;
-      p.jitterMs = 0;
+      p.lateness.length = 0;
+      p.marginMs = 0;
       p.steadyRun = 0;
       p.smoothing = false;
     }
@@ -1060,13 +1099,6 @@ export class SurfaceStore {
       );
     }
 
-    const lateness = Math.max(0, offset - p.clockOffsetMs);
-    const w =
-      lateness > p.jitterMs
-        ? SurfaceStore.JITTER_RISE
-        : SurfaceStore.JITTER_FALL;
-    p.jitterMs += (lateness - p.jitterMs) * w;
-
     if (p.lastPtsMs !== null) {
       const ptsDelta = ptsMs - p.lastPtsMs;
       // Guard against the duplicate PTS a stalled encoder can emit, which
@@ -1076,18 +1108,49 @@ export class SurfaceStore {
       }
     }
 
+    p.lateness.push(Math.max(0, offset - p.clockOffsetMs));
+    this.updateMargin(p);
+
     p.lastPtsMs = ptsMs;
     p.steadyRun++;
     if (p.steadyRun >= SurfaceStore.SMOOTHING_ENGAGE_FRAMES) p.smoothing = true;
   }
 
+  /** Trim the lateness window to ~{@link LATENESS_WINDOW_MS} of stream and
+   *  slew the margin toward that window's {@link LATENESS_QUANTILE}. */
+  private updateMargin(p: SurfacePresenter): void {
+    const interval = Math.max(
+      SurfaceStore.MIN_FRAME_INTERVAL_MS,
+      p.frameIntervalMs,
+    );
+    const window = Math.min(
+      SurfaceStore.LATENESS_WINDOW_MAX,
+      Math.max(
+        SurfaceStore.LATENESS_WINDOW_MIN,
+        Math.round(SurfaceStore.LATENESS_WINDOW_MS / interval),
+      ),
+    );
+    // One element off the front per frame, on an array of at most a few
+    // hundred numbers — a memmove of a couple of KB, well below the cost
+    // of decoding the frame it accompanies.
+    if (p.lateness.length > window) {
+      p.lateness.splice(0, p.lateness.length - window);
+    }
+
+    const target = Math.min(
+      quantile(p.lateness, SurfaceStore.LATENESS_QUANTILE),
+      SurfaceStore.PRESENT_DELAY_MAX_MS,
+    );
+    p.marginMs =
+      target > p.marginMs
+        ? Math.min(target, p.marginMs + SurfaceStore.MARGIN_GROW_MS)
+        : Math.max(target, p.marginMs - SurfaceStore.MARGIN_SHRINK_MS);
+  }
+
   /** Playout margin: how far behind the fastest observed path frames are
    *  held so a late one still lands on its intended refresh. */
   private playoutDelayMs(p: SurfacePresenter): number {
-    return Math.min(
-      p.jitterMs * SurfaceStore.JITTER_MARGIN,
-      SurfaceStore.PRESENT_DELAY_MAX_MS,
-    );
+    return p.marginMs;
   }
 
   /** How many frames the presenter may hold while scheduling.
@@ -1289,7 +1352,8 @@ export class SurfaceStore {
       p.steadyRun = 0;
       p.smoothing = false;
       p.clockOffsetMs = null;
-      p.jitterMs = 0;
+      p.lateness.length = 0;
+      p.marginMs = 0;
       this.flushPresenter(sid);
     }
   }

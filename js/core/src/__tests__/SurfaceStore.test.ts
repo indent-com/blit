@@ -133,6 +133,9 @@ function ptsFrame(ptsMs: number) {
   return { ...fakeFrame(), timestamp: ptsMs * 1000 };
 }
 
+/** Mirrors `SurfaceStore.MARGIN_GROW_MS`, which is private. */
+const SurfaceStore_MARGIN_GROW = 2;
+
 /**
  * Presentation scheduling.
  *
@@ -241,7 +244,10 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
   });
 
   it("holds an on-time frame behind the margin rather than drawing it early", () => {
-    runStream(24, (i) => (i % 2 ? 8 : 0));
+    // Jitter has to exceed half a refresh for this to be observable at all:
+    // a margin below that is inside the nearest-vsync rounding window, so
+    // the frame is legitimately due on the very tick it arrives.
+    runStream(30, (i) => (i % 2 ? 25 : 0));
     drain();
     presented = [];
 
@@ -382,20 +388,78 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
     expect(cap).toBeGreaterThanOrEqual(needed);
   });
 
+  it("does not let one outlier pin the margin", () => {
+    // The peak-tracking estimator this replaced took a single late frame
+    // from 0 to half its value in one sample, clipped the margin at the
+    // ceiling, then decayed at 0.98/frame — ~55 frames, nearly a second at
+    // 60 Hz, of maximum latency bought by one outlier it could not cover
+    // anyway.  A quantile treats it as the <5% tail it is.
+    runStream(60); // clean stream: margin settles near zero
+    const p = presenter(store, 1)!;
+    const before = (store as any).playoutDelayMs(p);
+    expect(before).toBeLessThan(5);
+
+    // One frame arrives 200 ms late.
+    const pts = streamPts;
+    streamPts += REFRESH;
+    clock = pts + LATENCY + 200;
+    enqueue(store, 1, ptsFrame(pts));
+
+    expect((store as any).playoutDelayMs(p)).toBeLessThan(
+      before + SurfaceStore_MARGIN_GROW * 2,
+    );
+
+    // And a few clean frames later it is still not chasing the outlier.
+    runStream(10);
+    expect((store as any).playoutDelayMs(p)).toBeLessThan(10);
+  });
+
+  it("sizes the margin to jitter that actually recurs", () => {
+    // Two thirds of frames land 12 ms late — well inside the quantile, so
+    // the margin must grow to cover them rather than average them away.
+    runStream(120, (i) => (i % 3 === 0 ? 0 : 12));
+    const p = presenter(store, 1)!;
+    const margin = (store as any).playoutDelayMs(p);
+    expect(margin).toBeGreaterThanOrEqual(10);
+    expect(margin).toBeLessThanOrEqual(50);
+  });
+
+  it("slews the margin instead of stepping it", () => {
+    // Every margin change shifts all future due times, so a step is itself
+    // a timing discontinuity.  Movement must stay bounded per frame.
+    runStream(60);
+    const p = presenter(store, 1)!;
+
+    let prev = (store as any).playoutDelayMs(p);
+    let maxJump = 0;
+    // Jitter jumps abruptly to 40 ms; the target moves at once, the margin
+    // must not.
+    for (let i = 0; i < 40; i++) {
+      const pts = streamPts;
+      streamPts += REFRESH;
+      clock = pts + LATENCY + 40;
+      enqueue(store, 1, ptsFrame(pts));
+      const now = (store as any).playoutDelayMs(p);
+      maxJump = Math.max(maxJump, Math.abs(now - prev));
+      prev = now;
+      if (rafCb) tick();
+    }
+    expect(maxJump).toBeLessThanOrEqual(SurfaceStore_MARGIN_GROW + 1e-6);
+    // ...but it does get there.
+    expect(prev).toBeGreaterThan(30);
+  });
+
   it("never lets the depth bound clip the margin at any real frame rate", () => {
     // The bound exists for broken PTS streams, not fast ones.  Across every
     // rate the server can pace a surface at — up to MAX_DISPLAY_FPS — the
     // derived cap must always cover the full margin, so no stream is ever
     // made to drop frames just for being fast.
-    const p = presenter(store, 1) ?? {
-      jitterMs: 1e6, // force the margin to its ceiling
-      frameIntervalMs: 0,
-    };
     for (const fps of [24, 30, 60, 90, 120, 144, 240, 360, 480]) {
-      const probe = { ...p, jitterMs: 1e6, frameIntervalMs: 1000 / fps };
+      // marginMs at its ceiling — the worst case the cap has to cover.
+      const probe = { marginMs: 50, frameIntervalMs: 1000 / fps };
       const margin = (store as any).playoutDelayMs(probe);
       const cap = (store as any).smoothedQueueCap(probe);
-      expect(margin).toBe(50); // pinned at PRESENT_DELAY_MAX_MS
+      expect(margin).toBe(50); // PRESENT_DELAY_MAX_MS
       expect(cap).toBeGreaterThanOrEqual(Math.ceil(margin / (1000 / fps)));
     }
   });
@@ -403,7 +467,7 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
   it("bounds the queue when the frame interval is degenerate", () => {
     // A PTS stream claiming impossible rates must not inflate the queue —
     // the interval floor, not the depth cap, is what stops it.
-    const probe = { jitterMs: 1e6, frameIntervalMs: 0 };
+    const probe = { marginMs: 50, frameIntervalMs: 0 };
     const cap = (store as any).smoothedQueueCap(probe);
     expect(cap).toBeLessThanOrEqual(26);
   });
