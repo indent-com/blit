@@ -321,7 +321,9 @@ image form of one clipboard therefore has to choose, and `@blit-sh/core`
 sends the text — the picture of a spreadsheet range is rarely what pasting it
 is meant to produce. The payload is bounded by the 16 MiB frame ceiling like
 any other message, and is not fragmented; the reference client refuses to send
-an image above 8 MiB rather than have the frame refused.
+an image above 8 MiB rather than have the frame refused, and cancels the paste
+outright instead of letting the keystroke land on a selection it did not
+update.
 
 ### Scroll
 

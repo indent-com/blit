@@ -1927,8 +1927,11 @@ export class BlitSurfaceCanvas {
 
     // Claim the pending paste up front.  Reading an image blob is
     // asynchronous, and a `readText()` resolving in the meantime must not
-    // paste the text representation out from under the image.
+    // paste the text representation out from under the image.  `abandon` is
+    // the chord's own cleanup, captured before it can be cleared: an image we
+    // decline to forward has to stand the chord down, not press V behind it.
     const flush = this._pendingPasteFlush;
+    const abandon = this._pendingPasteAbandon;
     this._pendingPasteFlush = null;
 
     const image = clipboardImage(e.clipboardData);
@@ -1937,29 +1940,34 @@ export class BlitSurfaceCanvas {
       void image
         .arrayBuffer()
         .then((buf) => {
-          let payload: ClipboardPayload | null = null;
           if (buf.byteLength > MAX_CLIPBOARD_BYTES) {
             console.warn(
               `blit: clipboard image is ${buf.byteLength} bytes, over the ` +
                 `${MAX_CLIPBOARD_BYTES}-byte paste limit — not pasted`,
             );
-          } else {
-            payload = {
-              mime: image.type || "image/png",
-              data: new Uint8Array(buf),
-            };
+            abandon?.();
+            return;
           }
+          const payload = {
+            mime: image.type || "image/png",
+            data: new Uint8Array(buf),
+          };
           if (flush) flush(payload);
-          else if (payload) conn.sendClipboard(payload.mime, payload.data);
+          else conn.sendClipboard(payload.mime, payload.data);
         })
-        .catch(() => {
-          if (flush) flush(null);
-        });
+        // Same for a blob we could not read: we know an image was there, so
+        // pressing V would paste something the user did not copy.
+        .catch(() => abandon?.());
       return;
     }
 
     const text = e.clipboardData?.getData("text/plain") ?? "";
     if (flush) {
+      // An empty clipboard still presses V, and that is not the stale paste
+      // the image paths above refuse.  Nothing was withheld here, so the
+      // selection the app goes on to read is whichever *Wayland* client owns
+      // it — copy in one surface and paste into another, with the browser
+      // never in the middle.  Standing the chord down would break that.
       flush(text ? textPayload(text) : null);
     } else if (text) {
       const payload = textPayload(text);

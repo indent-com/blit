@@ -137,8 +137,15 @@ An image only wins when the clipboard has no plain text: rich sources put
 several representations on one clipboard, and the text is what pasting a
 spreadsheet range is expected to produce. The wire carries one representation
 per copy, so this is a choice, not a preference order the app gets to make.
-Payloads over 8 MiB are dropped with a console warning — the frame ceiling is
-16 MiB and an over-length message is refused, not truncated.
+
+An image over 8 MiB — or a blob that will not read — takes the safety net's
+path rather than the flush's: warn, stand the chord down, no V. The frame
+ceiling is 16 MiB and an over-length message is refused rather than truncated,
+so the bytes are not going anywhere; pressing V anyway would paste whatever the
+selection held _before_, which is not what was copied. An empty clipboard is
+the one case that still presses V without sending, and deliberately: nothing
+was withheld, so the selection the app reads is whichever Wayland client owns
+it — copy in one surface, paste into another, browser never in the middle.
 
 Every listener on the event's path (canvas, hidden textarea, and the
 document-level capture listener that catches what the canvas misses) runs the

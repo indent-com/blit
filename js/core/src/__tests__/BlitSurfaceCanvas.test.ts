@@ -720,10 +720,29 @@ describe("BlitSurfaceCanvas paste", () => {
     await settle();
 
     // Nothing on the wire — an over-length CLIPBOARD_SET is refused by the
-    // server, not truncated — but the keypress still reaches the app.
+    // server, not truncated — and no V either.  Pressing it would paste
+    // whatever the selection held before, which is not what was copied.
     expect(clipboard).toHaveLength(0);
-    expect(keys).toEqual([{ keycode: EVDEV_V, pressed: true }]);
+    expect(keys).toEqual([]);
     expect(warn).toHaveBeenCalled();
+    dispose();
+  });
+
+  it("gives up rather than press V when the image cannot be read", async () => {
+    const { clipboard, keys, pressCtrlV, firePaste, dispose } = attachPasting();
+    const file = new File([new Uint8Array([1])], "clip.png", {
+      type: "image/png",
+    });
+    // A blob the browser can name but not hand over.
+    Object.defineProperty(file, "arrayBuffer", {
+      value: () => Promise.reject(new Error("unreadable")),
+    });
+    pressCtrlV();
+    firePaste({ files: [file] });
+    await settle();
+
+    expect(clipboard).toHaveLength(0);
+    expect(keys).toEqual([]);
     dispose();
   });
 
