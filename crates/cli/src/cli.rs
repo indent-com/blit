@@ -982,7 +982,9 @@ pub enum SurfaceCommand {
         duration: f64,
 
         /// Codec(s) to announce as supported (comma-separated or repeated).
-        /// Accepted values: h264, av1.
+        /// Accepted values: h264, av1, h264-444, av1-444 — the `-444`
+        /// variants also announce 4:4:4 chroma, which is what makes the
+        /// server pick a 4:4:4 encoder.
         /// Default: all codecs.
         #[arg(short, long, value_delimiter = ',')]
         codec: Vec<String>,

@@ -286,6 +286,7 @@ mod stub {
             qp: u8,
             width: u32,
             height: u32,
+            is_444: bool,
         },
         /// Retarget one client's encoder quantizer without rebuilding it.
         SetVulkanEncoderQp {

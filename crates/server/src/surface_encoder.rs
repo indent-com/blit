@@ -71,7 +71,8 @@ impl SurfaceEncoderPreference {
         Ok(result)
     }
 
-    /// Sensible default: hardware before software, NVENC preferred.
+    /// Sensible default: compositor-resident before server-side, hardware
+    /// before software.
     ///
     /// Override at runtime with `BLIT_SURFACE_ENCODERS=h264-nvenc,h264-software`
     /// (comma-separated list).
@@ -83,10 +84,23 @@ impl SurfaceEncoderPreference {
             return list;
         }
         vec![
-            // Vulkan Video encoders are not yet stable — enable via
-            // BLIT_SURFACE_ENCODERS=av1-vulkan,h264-vulkan,...
-            // Self::VulkanVideoAV1,
-            // Self::VulkanVideoH264,
+            // Vulkan Video encodes on the compositor's own device with no
+            // server-side encode at all, so it leads.  It is skipped unless
+            // the surface is at native size and the client would have been
+            // served 4:2:0 anyway, and a session that cannot be created — or
+            // that stops producing bitstreams — falls through to the entries
+            // below, so listing it first costs nothing when it does not apply.
+            //
+            // H.264 leads the Vulkan tier, against the AV1-first ordering used
+            // below it, because `av1-vulkan` cannot yet emit a sequence header
+            // and so declines every session.  Refusals are latched per encoder
+            // rather than per tier, so a declining `av1-vulkan` no longer
+            // disqualifies H.264 — but putting it first would still cost every
+            // new subscription a decline round-trip, during which the client is
+            // served by a server-side encoder and then switched.  Move it ahead
+            // of `h264-vulkan` once it produces a decodable stream.
+            Self::VulkanVideoH264,
+            Self::VulkanVideoAV1,
             Self::NvencAV1,
             Self::NvencH264,
             Self::AV1Vaapi,
@@ -94,6 +108,17 @@ impl SurfaceEncoderPreference {
             Self::H264Software,
             Self::AV1Software,
         ]
+    }
+
+    /// A distinct bit per Vulkan Video encoder, for latching which ones the
+    /// compositor has already refused on a surface.  `0` for the server-side
+    /// encoders, which are not refused this way.
+    pub fn vulkan_refusal_bit(self) -> u8 {
+        match self {
+            Self::VulkanVideoH264 => 1 << 0,
+            Self::VulkanVideoAV1 => 1 << 1,
+            _ => 0,
+        }
     }
 
     /// Returns true if the given codec_support bitmask allows this encoder.
@@ -155,6 +180,15 @@ impl SurfaceEncoderPreference {
     pub fn supports_444_by_encoder(self) -> bool {
         match self {
             Self::H264Vaapi => false,
+            // Vulkan Video H.264 encodes High 4:4:4 Predictive from a
+            // two-plane `G8_B8R8_2PLANE_444_UNORM` source — but only where the
+            // driver advertises that profile, which is a runtime question this
+            // structural check cannot answer (the RTX 4090 says yes, the
+            // Raphael iGPU says no).  The compositor's capability query is the
+            // real gate; a refusal there falls through to a server-side
+            // encoder.  AV1 through Vulkan has no 4:4:4 path at all.
+            Self::VulkanVideoH264 => true,
+            Self::VulkanVideoAV1 => false,
             Self::H264Software => cfg!(all(target_os = "linux", feature = "x264")),
             _ => true,
         }

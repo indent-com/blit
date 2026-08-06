@@ -796,12 +796,17 @@ struct SurfaceSubState {
     adaptive_quantizer: Option<u8>,
     /// When the controller last moved `adaptive_quantizer`, for hysteresis.
     rate_stepped_at: Option<Instant>,
-    /// The compositor refused this client a Vulkan Video session for this
-    /// surface.  Latched so selection stops offering it — otherwise the
-    /// next tick re-selects, is refused again, and the surface never
-    /// reaches a server-side encoder.  Cleared when the surface is
-    /// invalidated (resize / destroy), which is a fair time to retry.
-    vulkan_refused: bool,
+    /// Bit per Vulkan Video encoder the compositor has refused this client on
+    /// this surface (see [`SurfaceEncoderPreference::vulkan_refusal_bit`]).
+    /// Latched so selection stops offering that one — otherwise the next tick
+    /// re-selects it, is refused again, and the surface never reaches a
+    /// server-side encoder.  Cleared when the surface is invalidated
+    /// (resize / destroy), which is a fair time to retry.
+    ///
+    /// Per encoder rather than one flag for the tier: with `av1-vulkan` ahead
+    /// of `h264-vulkan` in the default list, a single flag let an AV1 refusal
+    /// disqualify H.264 too, losing a path that works.
+    vulkan_refused: u8,
     /// Last per-client downscale target dims registered with the
     /// compositor.  Used to send `ClearDownscaleTarget` for the old
     /// dims when the encoder is recreated at a new size, so stale
@@ -4244,14 +4249,22 @@ async fn tick(state: &AppState) -> TickOutcome {
     // refused again, and the surface never reaches an encoder at all.
     for (sid, cid) in vulkan_unavailable {
         if let Some(c) = sess.clients.get_mut(&cid)
-            && c.vulkan_video_surfaces.remove(&sid).is_some()
+            && let Some((_, codec_flag)) = c.vulkan_video_surfaces.remove(&sid)
         {
+            // Latch only the encoder that was actually refused.  The entry we
+            // just removed says which one was in flight; anything else in the
+            // Vulkan tier is still worth trying on the next tick.
+            let refused = if codec_flag == SurfaceEncoderPreference::VulkanVideoAV1.codec_flag() {
+                SurfaceEncoderPreference::VulkanVideoAV1
+            } else {
+                SurfaceEncoderPreference::VulkanVideoH264
+            };
             // Keep the rest of the subscription: it carries this client's
             // bandwidth/speed/codec overrides, which a refusal is no
             // reason to reset.  Clearing the encoder is enough to make the
             // next tick build a server-side one.
             let sub = c.surface_subs.entry(sid).or_default();
-            sub.vulkan_refused = true;
+            sub.vulkan_refused |= refused.vulkan_refusal_bit();
             sub.encoder = None;
             sub.has_keyframe = false;
             if sub.encode_in_flight || sub.creation_in_flight {
@@ -4527,6 +4540,7 @@ async fn tick(state: &AppState) -> TickOutcome {
             qp: u8,
             width: u32,
             height: u32,
+            is_444: bool,
         }
         let mut pending_vulkan_encoder_setups: Vec<VulkanEncoderSetup> = Vec::new();
         let mut pending_vulkan_keyframe_requests: Vec<(u32, u64)> = Vec::new();
@@ -4979,17 +4993,23 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // the wrong resolution and we'd have no way to scale
                     // it.  Other subscribers are unaffected either way:
                     // each owns its own session.
-                    let vulkan_eligible = (target_w, target_h) == (px_w, px_h)
-                        && !client
-                            .surface_subs
-                            .get(&sid)
-                            .is_some_and(|s| s.vulkan_refused);
+                    let vulkan_eligible = (target_w, target_h) == (px_w, px_h);
+                    let refused_bits = client
+                        .surface_subs
+                        .get(&sid)
+                        .map_or(0, |s| s.vulkan_refused);
 
                     for &pref in &state.config.surface_encoders {
                         if !pref.is_vulkan_video() {
                             continue;
                         }
                         if !vulkan_eligible {
+                            continue;
+                        }
+                        // Refusals are per encoder: one the compositor has
+                        // already turned down is skipped, but the rest of the
+                        // tier still gets its turn.
+                        if refused_bits & pref.vulkan_refusal_bit() != 0 {
                             continue;
                         }
                         if !pref.supported_by_client(codec_support) {
@@ -5004,10 +5024,20 @@ async fn tick(state: &AppState) -> TickOutcome {
                         if !available {
                             continue;
                         }
-                        // Vulkan Video 4:4:4 requires a YUV444 compute pipeline
-                        // and 3-plane DPB surfaces that are not yet implemented.
-                        // Skip so the fallback chain tries NVENC/VA-API/software.
-                        if state.config.chroma.is_444() {
+                        // Would this client actually be served 4:4:4?  Both
+                        // the server's configuration and the client's own
+                        // announcement have to say so.
+                        let want_444 = state.config.chroma.is_444()
+                            && pref.supports_444_by_client(codec_support);
+
+                        // H.264 carries 4:4:4 as High 4:4:4 Predictive, which
+                        // the compositor asks the driver for and which the
+                        // 4090 supports (the Raphael iGPU does not — its caps
+                        // query refuses, the session is declined, and the
+                        // fallback chain takes over).  AV1 through Vulkan is
+                        // still 4:2:0-only here, so it steps aside rather than
+                        // silently downgrading a client that asked for 4:4:4.
+                        if want_444 && pref == SurfaceEncoderPreference::VulkanVideoAV1 {
                             continue;
                         }
                         let qp = match pref {
@@ -5016,18 +5046,17 @@ async fn tick(state: &AppState) -> TickOutcome {
                             }
                             _ => encoding.bandwidth.h264_qp(),
                         };
-                        let enc_name: &'static str = match (pref, state.config.chroma) {
-                            (
-                                SurfaceEncoderPreference::VulkanVideoH264,
-                                ChromaSubsampling::Cs444,
-                            ) => "h264-vulkan 4:4:4",
-                            (SurfaceEncoderPreference::VulkanVideoH264, _) => "h264-vulkan",
-                            (
-                                SurfaceEncoderPreference::VulkanVideoAV1,
-                                ChromaSubsampling::Cs444,
-                            ) => "av1-vulkan 4:4:4",
+                        // The name and codec string are what the client
+                        // configures its decoder from, so they have to state
+                        // the chroma actually being encoded — promising High
+                        // 4:4:4 Predictive for a High 4:2:0 stream (or the
+                        // reverse) misconfigures it.
+                        let enc_name: &'static str = match (pref, want_444) {
+                            (SurfaceEncoderPreference::VulkanVideoH264, true) => {
+                                "h264-vulkan 4:4:4"
+                            }
+                            (SurfaceEncoderPreference::VulkanVideoH264, false) => "h264-vulkan",
                             (SurfaceEncoderPreference::VulkanVideoAV1, _) => "av1-vulkan",
-                            (_, ChromaSubsampling::Cs444) => "vulkan 4:4:4",
                             _ => "vulkan",
                         };
                         // Queue commands to send after the client loop.
@@ -5038,6 +5067,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             qp,
                             width: px_w,
                             height: px_h,
+                            is_444: want_444,
                         });
                         pending_vulkan_keyframe_requests.push((sid as u32, work.cid));
                         if let Some(s) = client.surface_subs.get_mut(&sid) {
@@ -5047,16 +5077,17 @@ async fn tick(state: &AppState) -> TickOutcome {
                             .vulkan_video_surfaces
                             .insert(sid, (enc_name, pref.codec_flag()));
                         let codec_str = match pref {
-                            SurfaceEncoderPreference::VulkanVideoH264 => {
-                                if state.config.chroma.is_444() {
-                                    "avc1.F4001f".to_string()
-                                } else {
-                                    "avc1.640034".to_string()
-                                }
+                            // High 4:4:4 Predictive, else High 4:2:0.
+                            SurfaceEncoderPreference::VulkanVideoH264 => if want_444 {
+                                "avc1.F4001f"
+                            } else {
+                                "avc1.640034"
                             }
+                            .to_string(),
                             SurfaceEncoderPreference::VulkanVideoAV1 => {
+                                // 4:2:0 only on this path — see the skip above.
                                 let profile =
-                                    surface_encoder::av1_profile_digit(state.config.chroma);
+                                    surface_encoder::av1_profile_digit(ChromaSubsampling::Cs420);
                                 let level = surface_encoder::av1_level_for(px_w, px_h);
                                 format!("av01.{profile}.{level}M.08")
                             }
@@ -5197,6 +5228,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         qp: setup.qp,
                         width: setup.width,
                         height: setup.height,
+                        is_444: setup.is_444,
                     },
                 );
             }
@@ -12771,11 +12803,16 @@ mod tests {
 
         // Same frame once hardware AV1 is gone.  Only AV1Software is left
         // for an AV1 client, and it stops at 4K — so the surface has to
-        // come down before anything can encode it.
+        // come down before anything can encode it.  `av1-vulkan` counts as
+        // hardware AV1 and carries the same 8K ceiling, so leaving it in
+        // would mean a backend still fits and the frame is not a size
+        // problem.
         let no_hw_av1 = |p| {
             !matches!(
                 p,
-                SurfaceEncoderPreference::NvencAV1 | SurfaceEncoderPreference::AV1Vaapi
+                SurfaceEncoderPreference::NvencAV1
+                    | SurfaceEncoderPreference::AV1Vaapi
+                    | SurfaceEncoderPreference::VulkanVideoAV1
             )
         };
         assert!(refused_for_size(&prefs, av1, 5120, 2880, no_hw_av1));

@@ -4,17 +4,18 @@ use blit_remote::{AXIS_SOURCE_WHEEL, PointerAxisEvent};
 use blit_remote::{
     C2S_CLIENT_FEATURES, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_LIST,
     C2S_SURFACE_POINTER, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CODEC_SUPPORT_AV1,
-    CODEC_SUPPORT_H264, CREATE2_WANT_STATUS, EXIT_REASON_NORMAL, EXIT_STATUS_UNKNOWN,
-    FEATURE_CREATE_STATUS, FEATURE_PTY_DEADLINE, S2C_CLIPBOARD_CONTENT, S2C_CLIPBOARD_LIST,
-    S2C_EXITED, S2C_HELLO, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SURFACE_CAPTURE,
-    S2C_SURFACE_FRAME, S2C_SURFACE_LIST, S2C_TERM_CWD, S2C_TEXT, S2C_TITLE, S2C_UPDATE,
-    SURFACE_FRAME_CODEC_AV1, SURFACE_FRAME_CODEC_MASK, SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg,
-    TerminalState, exit_reason_text, msg_ack, msg_c2s_clipboard_get, msg_c2s_clipboard_list,
-    msg_c2s_clipboard_set, msg_close, msg_create2_full, msg_deadline, msg_input, msg_kill,
-    msg_mouse, msg_quit, msg_read, msg_resize, msg_restart, msg_subscribe, msg_surface_close,
-    msg_surface_focus, msg_surface_input, msg_surface_pointer_axis2, msg_surface_resize,
-    msg_surface_subscribe, msg_surface_subscribe_ext, msg_surface_text, msg_term_cwd,
-    parse_server_msg, parse_term_cwd_reply, status_text,
+    CODEC_SUPPORT_AV1_444, CODEC_SUPPORT_H264, CODEC_SUPPORT_H264_444, CREATE2_WANT_STATUS,
+    EXIT_REASON_NORMAL, EXIT_STATUS_UNKNOWN, FEATURE_CREATE_STATUS, FEATURE_PTY_DEADLINE,
+    S2C_CLIPBOARD_CONTENT, S2C_CLIPBOARD_LIST, S2C_EXITED, S2C_HELLO, S2C_LIST, S2C_PING, S2C_QUIT,
+    S2C_READY, S2C_SURFACE_CAPTURE, S2C_SURFACE_FRAME, S2C_SURFACE_LIST, S2C_TERM_CWD, S2C_TEXT,
+    S2C_TITLE, S2C_UPDATE, SURFACE_FRAME_CODEC_AV1, SURFACE_FRAME_CODEC_MASK,
+    SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState, exit_reason_text, msg_ack,
+    msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_close,
+    msg_create2_full, msg_deadline, msg_input, msg_kill, msg_mouse, msg_quit, msg_read, msg_resize,
+    msg_restart, msg_subscribe, msg_surface_close, msg_surface_focus, msg_surface_input,
+    msg_surface_pointer_axis2, msg_surface_resize, msg_surface_subscribe,
+    msg_surface_subscribe_ext, msg_surface_text, msg_term_cwd, parse_server_msg,
+    parse_term_cwd_reply, status_text,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -1082,7 +1083,16 @@ pub async fn cmd_record(
                 match c.to_lowercase().as_str() {
                     "h264" => mask |= CODEC_SUPPORT_H264,
                     "av1" => mask |= CODEC_SUPPORT_AV1,
-                    other => return Err(format!("unknown codec: {other} (expected h264, av1)")),
+                    // A 4:4:4 recorder announces the base codec too — the
+                    // server reads them as separate bits and would otherwise
+                    // see a client that can decode 4:4:4 but not 4:2:0.
+                    "h264-444" => mask |= CODEC_SUPPORT_H264 | CODEC_SUPPORT_H264_444,
+                    "av1-444" => mask |= CODEC_SUPPORT_AV1 | CODEC_SUPPORT_AV1_444,
+                    other => {
+                        return Err(format!(
+                            "unknown codec: {other} (expected h264, av1, h264-444, av1-444)"
+                        ));
+                    }
                 }
             }
             mask
