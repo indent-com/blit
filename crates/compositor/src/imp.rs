@@ -148,6 +148,36 @@ pub enum PixelData {
         /// DMA-BUF fencing handles synchronisation (linear buffers).
         sync_fd: Option<Arc<OwnedFd>>,
     },
+    /// NV12 in a single Vulkan allocation exported as `OPAQUE_FD` — the
+    /// NVENC zero-copy path.
+    ///
+    /// Deliberately not `Nv12DmaBuf`, which it otherwise resembles. This fd
+    /// is *not* a `dma_buf`: CUDA refuses those (`CUDA_ERROR_UNKNOWN`) and
+    /// only accepts an `OPAQUE_FD` handle. Two consequences follow, and both
+    /// are why the variants stay apart. `Nv12DmaBuf`'s consumer resolves fds
+    /// by inode against the VA-API surfaces it exported, which this fd will
+    /// never match; and an `OPAQUE_FD` allocation carries none of the
+    /// implicit fencing a `dma_buf` does, so `sync_fd` here is load-bearing
+    /// rather than an optimisation.
+    Nv12OpaqueFd {
+        fd: Arc<OwnedFd>,
+        /// Process-unique id for the allocation behind `fd`. The consumer
+        /// caches its CUDA import and NVENC registration against this
+        /// rather than against the fd number, which the kernel recycles
+        /// once a buffer is closed — a stale hit there would point NVENC at
+        /// freed VRAM.
+        buf_id: u64,
+        stride: u32,
+        uv_offset: u32,
+        width: u32,
+        height: u32,
+        /// sync_file exported from the fence guarding the BGRA→NV12 compute
+        /// dispatch. The consumer MUST poll this before reading: nothing
+        /// else orders CUDA's reads against the compositor's writes, and an
+        /// unsynchronised read tears intermittently — worst at high frame
+        /// rates, i.e. exactly where a short test looks fine.
+        sync_fd: Option<Arc<OwnedFd>>,
+    },
     /// VA-API surface ready for VPP/encode — zero-copy path.
     VaSurface {
         surface_id: u32,
@@ -222,6 +252,16 @@ impl PixelData {
         let w = width as usize;
         let h = height as usize;
         match self {
+            // No CPU readback: the allocation behind an OPAQUE_FD is
+            // DEVICE_LOCAL VRAM and the fd is an NVIDIA-internal handle,
+            // not a dma_buf — there is nothing to mmap. Callers that need
+            // pixels on the CPU (thumbnails, the software downscale) must
+            // not be handed this variant in the first place; the server
+            // only routes it to an NVENC encoder, which reads it on the
+            // GPU. Returning empty rather than panicking keeps a
+            // mis-route to a black frame instead of a crash, and
+            // `is_empty()` below reports it honestly.
+            PixelData::Nv12OpaqueFd { .. } => Vec::new(),
             PixelData::Rgba(data) => data.as_ref().clone(),
             PixelData::Bgra(data) => {
                 let mut rgba = Vec::with_capacity(w * h * 4);
@@ -452,7 +492,8 @@ impl PixelData {
             PixelData::Nv12 { data, .. } => data.is_empty(),
             PixelData::DmaBuf { .. }
             | PixelData::VaSurface { .. }
-            | PixelData::Nv12DmaBuf { .. } => false,
+            | PixelData::Nv12DmaBuf { .. }
+            | PixelData::Nv12OpaqueFd { .. } => false,
         }
     }
 
@@ -641,12 +682,23 @@ pub enum CompositorCommand {
     /// does not inherit that visit's stale stamp.
     ///
     /// `native_w`/`native_h`: see `SetExternalOutputBuffers`.
+    ///
+    /// `want_nv12_opaque` asks for the NVENC zero-copy shape instead: the
+    /// renderer still blits the composite into the target-sized BGRA image,
+    /// but then runs the BGRA→NV12 compute pass into a Vulkan buffer
+    /// exported as `OPAQUE_FD` and delivers `PixelData::Nv12OpaqueFd`,
+    /// skipping the staging copy and the `Vec` that follows it. Only NVENC
+    /// can consume that — CUDA is the only importer of an `OPAQUE_FD`
+    /// handle — so anything else must leave this false and take the BGRA
+    /// path. Best-effort: if the export fails the renderer registers the
+    /// ordinary BGRA target, so the caller still gets frames.
     RegisterDownscaleTarget {
         surface_id: u32,
         target_w: u32,
         target_h: u32,
         native_w: u32,
         native_h: u32,
+        want_nv12_opaque: bool,
     },
     /// Re-stamp an already-registered target with the composite size it is
     /// now the right inscription of, without touching its buffers.
@@ -2097,6 +2149,7 @@ impl Compositor {
                 PixelData::Nv12 { .. } => "nv12",
                 PixelData::VaSurface { .. } => "va-surface",
                 PixelData::Nv12DmaBuf { .. } => "nv12-dmabuf",
+                PixelData::Nv12OpaqueFd { .. } => "nv12-opaque-fd",
                 PixelData::DmaBuf { fd, .. } => {
                     use std::os::fd::AsRawFd;
                     let raw = fd.as_raw_fd();
@@ -3266,21 +3319,42 @@ impl Compositor {
                         // returns 0..1 results — pick the first (or
                         // None if the render failed to produce
                         // anything).
-                        let captured = vk
-                            .render_tree_sized(
-                                root_id,
-                                &self.surfaces,
-                                &self.surface_meta,
-                                cap_s120,
-                                None,
-                                surface_id,
-                            )
-                            .into_iter()
-                            .next()
-                            .map(|(_sid, w, h, pixels)| {
+                        // Capture is the on-demand CPU-pixel consumer: ask
+                        // for the native BGRA, which the NVENC zero-copy
+                        // path otherwise leaves unpublished.
+                        vk.request_native_bgra();
+                        let readable = |v: Vec<(u16, u32, u32, PixelData)>| {
+                            // Take the first result we can actually read. A
+                            // zero-copy NV12 handle may be in here too, and
+                            // `to_rgba` is empty for it by construction —
+                            // it is GPU-only memory.
+                            v.into_iter().find_map(|(_sid, w, h, pixels)| {
                                 let rgba = pixels.to_rgba(w, h);
-                                (w, h, rgba)
-                            });
+                                (!rgba.is_empty()).then_some((w, h, rgba))
+                            })
+                        };
+                        let mut captured = readable(vk.render_tree_sized(
+                            root_id,
+                            &self.surfaces,
+                            &self.surface_meta,
+                            cap_s120,
+                            None,
+                            surface_id,
+                        ));
+                        // That render publishes the *previous* submit's
+                        // readback, which normally satisfies capture. When
+                        // there was no submit in flight — or the zero-copy
+                        // path left the last one unpublished — wait for the
+                        // one we just queued instead of reporting no buffer.
+                        if captured.is_none() {
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_millis(300);
+                            while captured.is_none() && std::time::Instant::now() < deadline {
+                                std::thread::sleep(std::time::Duration::from_millis(2));
+                                let (_native, results) = vk.try_retire_pending();
+                                captured = readable(results);
+                            }
+                        }
                         // Capture registers no external targets, so this is
                         // normally empty; drain anyway so a stray bitstream
                         // can't leak into the next flush.
@@ -3372,6 +3446,7 @@ impl Compositor {
                 target_h,
                 native_w,
                 native_h,
+                want_nv12_opaque,
             } => {
                 if let Some(ref mut vk) = self.vulkan_renderer {
                     vk.register_downscale_target(
@@ -3379,6 +3454,7 @@ impl Compositor {
                         target_w,
                         target_h,
                         (native_w, native_h),
+                        want_nv12_opaque,
                     );
                 }
                 // See the SetExternalOutputBuffers handler above for

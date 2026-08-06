@@ -1128,6 +1128,35 @@ impl SurfaceEncoder {
         }
     }
 
+    /// Whether this encoder can consume `PixelData::Nv12OpaqueFd`, i.e.
+    /// take NV12 straight out of a Vulkan `OPAQUE_FD` allocation with no CPU
+    /// copy.  Only NVENC can: CUDA is the sole importer of that handle type.
+    ///
+    /// `BLIT_NVENC_ZEROCOPY=0` forces this off, so both the zero-copy and
+    /// the BGRA-downscale arm can be measured against one binary.
+    #[cfg(target_os = "linux")]
+    pub fn wants_nv12_opaque_fd(&self) -> bool {
+        if !matches!(
+            self.kind,
+            SurfaceEncoderKind::NvencH264(_) | SurfaceEncoderKind::NvencAV1(_)
+        ) {
+            return false;
+        }
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            let on = std::env::var("BLIT_NVENC_ZEROCOPY").as_deref() != Ok("0");
+            if !on {
+                eprintln!("[surface-encoder] BLIT_NVENC_ZEROCOPY=0: NVENC takes the BGRA path");
+            }
+            on
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn wants_nv12_opaque_fd(&self) -> bool {
+        false
+    }
+
     /// Get GBM-allocated LINEAR BGRA buffers for zero-copy compositor→encoder.
     #[cfg(target_os = "linux")]
     pub fn gbm_buffers(&self) -> &[crate::vaapi_encode::GbmExportedBuffer] {
@@ -1307,6 +1336,49 @@ impl SurfaceEncoder {
                 }),
             #[cfg(not(target_os = "linux"))]
             PixelData::DmaBuf { .. } => None,
+            // NVENC zero-copy. No fallback arm on purpose: the buffer is
+            // DEVICE_LOCAL VRAM behind a handle nothing can mmap, so there
+            // is nothing to read back. The server only routes this variant
+            // to an NVENC encoder (see the three-way choice in lib.rs), and
+            // a failure here has to surface as a dropped frame rather than
+            // as a silent CPU path — the silence is what made the old
+            // DMA-BUF attempt look alive for so long.
+            #[cfg(target_os = "linux")]
+            PixelData::Nv12OpaqueFd {
+                fd,
+                buf_id,
+                stride,
+                uv_offset,
+                width,
+                height,
+                sync_fd,
+            } => {
+                use std::os::fd::AsRawFd;
+                match &mut self.kind {
+                    SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => enc
+                        .encode_nv12_opaque_fd(
+                            fd.as_raw_fd(),
+                            *buf_id,
+                            *stride,
+                            *uv_offset,
+                            *width,
+                            *height,
+                            sync_fd.as_ref().map(|s| s.as_raw_fd()),
+                        ),
+                    _ => {
+                        static LOGGED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            eprintln!(
+                                "[surface-encoder] Nv12OpaqueFd routed to a non-NVENC encoder; dropping",
+                            );
+                        }
+                        None
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            PixelData::Nv12OpaqueFd { .. } => None,
             #[cfg(target_os = "linux")]
             PixelData::Nv12DmaBuf {
                 fd,

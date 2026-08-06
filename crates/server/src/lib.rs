@@ -681,6 +681,29 @@ fn encode_capture(pixels: &[u8], width: u32, height: u32, format: u8, quality: u
     }
 }
 
+/// Whether a target may be published as a GPU-only NV12 `OPAQUE_FD`
+/// buffer.
+///
+/// The compositor publishes one representation per `(surface, w, h)`, so
+/// this is a property of every subscriber at that size rather than of the
+/// one being registered. Only NVENC can import an `OPAQUE_FD` handle; a
+/// software or VA-API encoder sharing the size would be handed memory it
+/// cannot map and would encode black. One dissenter puts everyone at that
+/// size back on BGRA.
+///
+/// `others` yields each *other* subscriber's `(target, can_take_nv12)`.
+/// A subscriber at a different size is irrelevant — it reads its own key.
+fn nv12_opaque_safe_for_target(
+    this_wants: bool,
+    target: (u32, u32),
+    others: impl Iterator<Item = (Option<(u32, u32)>, bool)>,
+) -> bool {
+    this_wants
+        && others
+            .into_iter()
+            .all(|(their_target, they_want)| their_target != Some(target) || they_want)
+}
+
 async fn request_surface_capture_with_timeout(
     command_tx: std::sync::mpsc::Sender<CompositorCommand>,
     surface_id: u16,
@@ -715,6 +738,14 @@ struct SurfaceSubState {
     /// while the encoder is temporarily owned by the spawn_blocking
     /// task (see `encode_in_flight`) or before the first encode.
     encoder: Option<SurfaceEncoder>,
+    /// Whether this subscriber's encoder can read a GPU-only NV12
+    /// `OPAQUE_FD` buffer (i.e. is NVENC).
+    ///
+    /// Recorded rather than asked of `encoder` on demand, because that
+    /// field is `None` while an encode task owns it — and a subscriber
+    /// missed during that window would be read as "can take NV12" and
+    /// handed a buffer it cannot map.
+    wants_nv12_opaque: bool,
     /// Next tick this surface may send a frame (pacing deadline).
     next_send_at: Option<Instant>,
     /// Frames remaining in the post-subscribe burst window that
@@ -2461,6 +2492,57 @@ struct TickOutcome {
 }
 
 impl Session {
+    /// Re-decide a downscale target whose subscriber set just changed.
+    ///
+    /// Re-registers it for whoever is left — which re-evaluates whether the
+    /// NV12 `OPAQUE_FD` shape is safe, so an NVENC reader gets the zero-copy
+    /// path back once a subscriber that needed CPU pixels has gone — or
+    /// clears it when nobody is left.
+    ///
+    /// Clearing unconditionally would be wrong on both counts: it pulls the
+    /// buffer out from under clients still registered at that size, and it
+    /// leaves survivors on BGRA until something unrelated re-registers them.
+    fn resettle_downscale_target(&mut self, surface_id: u16, tw: u32, th: u32) {
+        let survivors: Vec<(bool, (u32, u32))> = self
+            .clients
+            .values()
+            .filter_map(|c| {
+                let s = c.surface_subs.get(&surface_id)?;
+                (s.last_registered_target == Some((tw, th))).then(|| {
+                    (
+                        s.wants_nv12_opaque,
+                        s.last_registered_native.unwrap_or((tw, th)),
+                    )
+                })
+            })
+            .collect();
+        let Some(cs) = self.compositor.as_mut() else {
+            return;
+        };
+        if let Some(&(_, (native_w, native_h))) = survivors.first() {
+            let _ = cs.handle.command_tx.send(
+                blit_compositor::CompositorCommand::RegisterDownscaleTarget {
+                    surface_id: surface_id as u32,
+                    target_w: tw,
+                    target_h: th,
+                    native_w,
+                    native_h,
+                    want_nv12_opaque: survivors.iter().all(|(w, _)| *w),
+                },
+            );
+        } else {
+            let _ = cs.handle.command_tx.send(
+                blit_compositor::CompositorCommand::ClearDownscaleTarget {
+                    surface_id: surface_id as u32,
+                    target_w: tw,
+                    target_h: th,
+                },
+            );
+            cs.last_pixels.remove(&(surface_id, tw, th));
+        }
+        cs.handle.wake();
+    }
+
     fn new() -> Self {
         Self {
             ptys: HashMap::new(),
@@ -5817,6 +5899,30 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // moved on.
                         cs.last_pixels.remove(&(result.sid, pw, ph));
                     }
+                    // Whether the NV12 OPAQUE_FD shape is safe for this
+                    // target, which is a property of *every* subscriber at
+                    // it, not just this one. The buffer is GPU-only memory
+                    // published under a single (sid, w, h) key, so one
+                    // software or VA-API encoder sharing the size is enough
+                    // to rule it out for all of them — it would be handed a
+                    // handle it cannot map and would show black.
+                    //
+                    // Computed before the compositor borrow below, which
+                    // takes `sess` mutably.
+                    let encoder_wants_nv12_opaque = encoder.wants_nv12_opaque_fd();
+                    let want_nv12_opaque = nv12_opaque_safe_for_target(
+                        encoder_wants_nv12_opaque,
+                        (tw, th),
+                        sess.clients
+                            .iter()
+                            .filter(|(cid, _)| **cid != result.cid)
+                            .map(|(_, c)| {
+                                c.surface_subs
+                                    .get(&result.sid)
+                                    .map(|s| (s.last_registered_target, s.wants_nv12_opaque))
+                                    .unwrap_or((None, true))
+                            }),
+                    );
                     if let Some(bufs) = external_bufs
                         && !bufs.is_empty()
                         && let Some(cs) = sess.compositor.as_mut()
@@ -5834,10 +5940,20 @@ async fn tick(state: &AppState) -> TickOutcome {
                         cs.handle.wake();
                     } else if let Some(cs) = sess.compositor.as_mut() {
                         // No GBM externals — register a server-allocated
-                        // BGRA downscale target so the compositor can
-                        // GPU-blit the native composite into target-sized
-                        // BGRA for this encoder.  Idempotent in the
-                        // renderer.
+                        // downscale target so the compositor can GPU-blit
+                        // the native composite into target-sized pixels for
+                        // this encoder.  Idempotent in the renderer.
+                        //
+                        // NVENC additionally asks for the NV12 OPAQUE_FD
+                        // shape, which converts on the GPU and hands over a
+                        // handle CUDA can import — skipping the readback
+                        // into staging and the Vec that used to carry it.
+                        // Every other backend needs pixels on the CPU and
+                        // takes the BGRA path. The renderer falls back to
+                        // BGRA on its own if the export fails, so this
+                        // stays a request rather than a commitment, and it
+                        // reconciles a `false` here by dropping an NV12
+                        // target it had already built.
                         let _ = cs.handle.command_tx.send(
                             blit_compositor::CompositorCommand::RegisterDownscaleTarget {
                                 surface_id: result.sid as u32,
@@ -5845,6 +5961,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 target_h: th,
                                 native_w: result.native_w,
                                 native_h: result.native_h,
+                                want_nv12_opaque,
                             },
                         );
                         cs.handle.wake();
@@ -5853,6 +5970,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                         let s = client.surface_subs.entry(result.sid).or_default();
                         s.last_registered_target = Some((tw, th));
                         s.last_registered_native = Some((result.native_w, result.native_h));
+                        // This encoder's own capability, not the resolved
+                        // decision above: a later subscriber asks whether
+                        // *we* could take NV12, and must not inherit a
+                        // "no" we only arrived at because of a third party
+                        // that has since gone away.
+                        s.wants_nv12_opaque = encoder_wants_nv12_opaque;
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -10647,18 +10770,18 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 }
                 // Drop the per-client downscale target this client had
                 // registered so the compositor stops blitting into a
-                // BGRA buffer no encoder will ever read.
-                if let Some((tw, th)) = clear_target
-                    && let Some(cs) = sess.compositor.as_mut()
-                {
-                    let _ = cs.handle.command_tx.send(
-                        blit_compositor::CompositorCommand::ClearDownscaleTarget {
-                            surface_id: surface_id as u32,
-                            target_w: tw,
-                            target_h: th,
-                        },
-                    );
-                    cs.last_pixels.remove(&(surface_id, tw, th));
+                // BGRA buffer no encoder will ever read — unless someone
+                // else is registered at the same size, in which case the
+                // target is still theirs.
+                //
+                // Whoever is left also decides afresh whether it can take
+                // NV12: a subscriber needing CPU pixels forces the whole
+                // size onto BGRA, and when it leaves the remaining NVENC
+                // readers should get the zero-copy path back rather than
+                // stay on BGRA until something else happens to
+                // re-register.
+                if let Some((tw, th)) = clear_target {
+                    sess.resettle_downscale_target(surface_id, tw, th);
                 }
                 // Destroy this client's Vulkan Video encoder.  Ownership is
                 // per `(surface, client)`, so no refcount sweep over the
@@ -11210,6 +11333,22 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             cs.audio_broadcast.unsubscribe(client_id);
         }
         let client = sess.clients.remove(&client_id);
+        // Downscale targets this client had registered. A disconnect is the
+        // usual way a subscriber leaves — clients rarely send an explicit
+        // unsubscribe first — so without re-deciding here, a target that
+        // went to BGRA for a departed CPU-pixel reader would stay there.
+        let departed_targets: Vec<(u16, (u32, u32))> = client
+            .as_ref()
+            .map(|c| {
+                c.surface_subs
+                    .iter()
+                    .filter_map(|(sid, s)| s.last_registered_target.map(|t| (*sid, t)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (sid, (tw, th)) in departed_targets {
+            sess.resettle_downscale_target(sid, tw, th);
+        }
         let affected_ptys = client
             .as_ref()
             .map(|c| c.view_sizes.keys().copied().collect::<Vec<_>>())
@@ -11272,6 +11411,68 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+
+    /// The NV12 OPAQUE_FD buffer is GPU-only memory published under a
+    /// single (surface, w, h) key, so it is only safe when *every*
+    /// subscriber at that size can import it. These pin the rule that
+    /// stops a software encoder being handed a handle it cannot map —
+    /// which reaches the viewer as a black picture, not as an error.
+    mod nv12_opaque_target {
+        use super::super::nv12_opaque_safe_for_target;
+
+        const T: (u32, u32) = (1280, 720);
+
+        #[test]
+        fn sole_nvenc_subscriber_gets_it() {
+            assert!(nv12_opaque_safe_for_target(true, T, std::iter::empty()));
+        }
+
+        #[test]
+        fn a_non_nvenc_encoder_at_the_same_size_rules_it_out() {
+            assert!(!nv12_opaque_safe_for_target(
+                true,
+                T,
+                [(Some(T), false)].into_iter()
+            ));
+        }
+
+        #[test]
+        fn all_nvenc_subscribers_keep_it() {
+            assert!(nv12_opaque_safe_for_target(
+                true,
+                T,
+                [(Some(T), true), (Some(T), true)].into_iter()
+            ));
+        }
+
+        #[test]
+        fn a_dissenter_at_another_size_is_irrelevant() {
+            // It reads its own (sid, w, h) key, which still carries BGRA.
+            assert!(nv12_opaque_safe_for_target(
+                true,
+                T,
+                [(Some((640, 360)), false), (None, false)].into_iter()
+            ));
+        }
+
+        #[test]
+        fn one_dissenter_among_many_is_enough() {
+            assert!(!nv12_opaque_safe_for_target(
+                true,
+                T,
+                [(Some(T), true), (Some(T), false), (Some(T), true)].into_iter()
+            ));
+        }
+
+        #[test]
+        fn a_non_nvenc_encoder_never_asks_for_it() {
+            assert!(!nv12_opaque_safe_for_target(
+                false,
+                T,
+                [(Some(T), true)].into_iter()
+            ));
+        }
+    }
     use super::*;
 
     /// The index walk (docs/design/fs-search.md) prunes `.git`, honors

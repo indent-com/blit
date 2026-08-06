@@ -58,6 +58,15 @@ mod stub {
             height: u32,
             sync_fd: Option<Arc<OwnedFd>>,
         },
+        Nv12OpaqueFd {
+            fd: Arc<OwnedFd>,
+            buf_id: u64,
+            stride: u32,
+            uv_offset: u32,
+            width: u32,
+            height: u32,
+            sync_fd: Option<Arc<OwnedFd>>,
+        },
         VaSurface {
             surface_id: u32,
             va_display: usize,
@@ -98,7 +107,8 @@ mod stub {
                 PixelData::Nv12 { data, .. } => data.is_empty(),
                 PixelData::DmaBuf { .. }
                 | PixelData::VaSurface { .. }
-                | PixelData::Nv12DmaBuf { .. } => false,
+                | PixelData::Nv12DmaBuf { .. }
+                | PixelData::Nv12OpaqueFd { .. } => false,
             }
         }
 
@@ -261,6 +271,7 @@ mod stub {
             target_h: u32,
             native_w: u32,
             native_h: u32,
+            want_nv12_opaque: bool,
         },
         RestampTarget {
             surface_id: u32,
