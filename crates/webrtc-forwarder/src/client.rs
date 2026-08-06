@@ -948,7 +948,7 @@ async fn drive(
         ///   stream with it, not just the slow one.
         /// - Bounding *this* queue does not bound the mux path anyway. The
         ///   demux task never blocks; it forwards into the per-stream
-        ///   `data_tx` below, so the backlog just moves there.
+        ///   `data_tx` in `open_stream`, so the backlog just moves there.
         ///
         /// str0m 0.19 exposes no receive backpressure — `buffered_amount`
         /// and `set_buffered_amount_low_threshold` are send-side only, and
