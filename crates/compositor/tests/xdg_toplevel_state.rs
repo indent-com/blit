@@ -1,11 +1,15 @@
-//! A toplevel that asks to change state must get an answer.
+//! A toplevel that asks to change state must get an answer, and the answer
+//! has to be the one the client can live with.
 //!
-//! Panes are permanently activated and maximized, so every one of these
-//! requests is declined -- but silence is not a way to decline.  xdg-shell
-//! requires a configure in reply to the maximize/fullscreen pair, and
-//! Chromium-based clients (every Electron app) flip themselves to minimized
-//! the instant they send set_minimized, then stop drawing until a configure
-//! carrying `activated` tells them otherwise.
+//! Panes are permanently activated and maximized, so minimize and maximize
+//! are declined -- but silence is not a way to decline.  xdg-shell requires a
+//! configure in reply to the maximize/fullscreen pair, and Chromium-based
+//! clients (every Electron app) flip themselves to minimized the instant they
+//! send set_minimized, then stop drawing until a configure carrying
+//! `activated` tells them otherwise.
+//!
+//! Fullscreen is the one that is granted: a pane already fills its output, and
+//! a client told otherwise undoes the fullscreen it just entered.
 
 #![cfg(target_os = "linux")]
 
@@ -229,16 +233,14 @@ fn set_minimized_is_declined_with_an_activated_configure() {
 }
 
 #[test]
-fn maximize_and_fullscreen_requests_are_always_answered() {
+fn maximize_requests_are_answered_without_changing_anything() {
     let mut fixture = Fixture::new();
 
     // xdg-shell: each of these "will respond by emitting a configure event".
     type Send = fn(&xdg_toplevel::XdgToplevel);
-    let requests: [(&str, Send); 4] = [
+    let requests: [(&str, Send); 2] = [
         ("set_maximized", |tl| tl.set_maximized()),
         ("unset_maximized", |tl| tl.unset_maximized()),
-        ("set_fullscreen", |tl| tl.set_fullscreen(None)),
-        ("unset_fullscreen", |tl| tl.unset_fullscreen()),
     ];
     for (name, send) in requests {
         let mark = fixture.request(send);
@@ -247,15 +249,46 @@ fn maximize_and_fullscreen_requests_are_always_answered() {
             !states.is_empty(),
             "{name} drew no configure at all; the client waits forever"
         );
-        // The pane never actually changes shape, so the answer is always the
-        // same: still activated, still maximized, never fullscreen.
+        // A pane is maximized whether or not it asked to be.
         assert!(
             states.contains(&State::Activated) && states.contains(&State::Maximized),
             "{name} answered with {states:?}, expected activated + maximized"
         );
-        assert!(
-            !states.contains(&State::Fullscreen),
-            "{name} answered with fullscreen, which panes never enter"
-        );
     }
+}
+
+#[test]
+fn fullscreen_is_granted_and_given_back() {
+    let mut fixture = Fixture::new();
+
+    // Chromium asks the compositor to fullscreen the window when a page takes
+    // a video fullscreen, then reads the answer.  A configure without
+    // `fullscreen` is a refusal, and it takes the page back out again.
+    let mark = fixture.request(|tl| tl.set_fullscreen(None));
+    let states = fixture.states_since(mark);
+    assert!(
+        states.contains(&State::Fullscreen),
+        "set_fullscreen answered with {states:?}, which a client reads as a \
+         refusal -- it will undo its own fullscreen"
+    );
+    assert!(
+        states.contains(&State::Activated),
+        "set_fullscreen answered with {states:?}, expected activated too"
+    );
+
+    let mark = fixture.request(|tl| tl.unset_fullscreen());
+    let states = fixture.states_since(mark);
+    assert!(
+        !states.is_empty(),
+        "unset_fullscreen drew no configure at all; the client waits forever"
+    );
+    assert!(
+        !states.contains(&State::Fullscreen),
+        "unset_fullscreen left the client fullscreen: {states:?}"
+    );
+    // Leaving fullscreen lands back on what a pane always is.
+    assert!(
+        states.contains(&State::Activated) && states.contains(&State::Maximized),
+        "unset_fullscreen answered with {states:?}, expected activated + maximized"
+    );
 }
