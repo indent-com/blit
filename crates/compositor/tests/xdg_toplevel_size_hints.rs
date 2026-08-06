@@ -5,6 +5,10 @@
 //! it the protocol errors xdg-shell specifies for a nonsense pair.  Both
 //! halves are double-buffered, so the pair is judged at commit, not as each
 //! arrives.
+//!
+//! The hints also decide how large the composite comes out.  A client that
+//! will not draw itself below some width draws past a narrower pane, and
+//! compositing at the pane's width would cut off whatever it drew there.
 
 #![cfg(target_os = "linux")]
 
@@ -14,7 +18,7 @@ use std::sync::Arc;
 use wayland_client::protocol::{wl_compositor, wl_registry, wl_surface};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noop};
 
-use blit_compositor::{CompositorHandle, spawn_compositor};
+use blit_compositor::{CompositorCommand, CompositorEvent, CompositorHandle, spawn_compositor};
 
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
@@ -170,6 +174,56 @@ impl Fixture {
         }
     }
 
+    /// The surface id the compositor gave our toplevel.
+    fn surface_id(&mut self) -> u16 {
+        let handle = self.handle.as_ref().expect("compositor running");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match handle
+                .event_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+            {
+                Ok(CompositorEvent::SurfaceCreated { surface_id, .. }) => return surface_id,
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        panic!("compositor never announced the surface");
+    }
+
+    /// Resize the pane and report the composited size the compositor settles
+    /// on -- the size it will actually render into, which is what the server
+    /// hands to the encoder and the viewer.
+    fn resize_pane(&mut self, surface_id: u16, width: u16, height: u16) -> (u16, u16) {
+        let handle = self.handle.as_ref().expect("compositor running");
+        handle
+            .command_tx
+            .send(CompositorCommand::SurfaceResize {
+                surface_id,
+                width,
+                height,
+                scale_120: 120,
+            })
+            .expect("send resize");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last = None;
+        while std::time::Instant::now() < deadline {
+            match handle
+                .event_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+            {
+                Ok(CompositorEvent::SurfaceResized { width, height, .. }) => {
+                    last = Some((width, height));
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        last.expect("compositor never reported the new composited size")
+    }
+
     /// The size in the most recent configure, provoking one first.
     fn latest_configured_size(&mut self) -> (i32, i32) {
         // set_maximized is declined with a restatement of the current
@@ -284,6 +338,36 @@ fn a_negative_minimum_is_refused() {
         fixture.round(),
         Some(INVALID_SIZE),
         "a negative minimum is an invalid_size error"
+    );
+}
+
+#[test]
+fn a_pane_narrower_than_the_client_composites_at_the_clients_width() {
+    let mut fixture = Fixture::new();
+    let sid = fixture.surface_id();
+
+    fixture.toplevel.set_min_size(500, 400);
+    assert_eq!(fixture.commit(), None, "a plain minimum is not an error");
+
+    // The viewer's pane is narrower than the client will ever draw itself.
+    // Compositing at the pane's width would render the client's wider surface
+    // into a narrower target at a 1:1 offset -- i.e. cut its right-hand side
+    // off.  Chromium's real floor is 500 logical pixels, so this is the
+    // everyday case for a narrow pane, not a corner.
+    assert_eq!(
+        fixture.resize_pane(sid, 300, 700),
+        (500, 700),
+        "composited at the pane's width, which crops everything the client \
+         drew past it; the viewer scales an oversized frame down by itself"
+    );
+
+    // Only the constrained axis moves.  700 is above no minimum, so it stays.
+    fixture.toplevel.set_min_size(0, 0);
+    assert_eq!(fixture.commit(), None);
+    assert_eq!(
+        fixture.resize_pane(sid, 300, 700),
+        (300, 700),
+        "withdrawing the minimum should hand the pane back its own size"
     );
 }
 

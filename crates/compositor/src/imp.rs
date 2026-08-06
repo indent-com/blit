@@ -1979,8 +1979,24 @@ impl Compositor {
     /// target is `surface_sizes` either way, so this is what the very next
     /// composite will produce, and the server needs it to size encoders
     /// against the right aspect rather than the previous one.
+    ///
+    /// The client's own size range applies on the way out.  A client that
+    /// declared a minimum draws itself at that minimum no matter what we
+    /// asked for -- Chromium's is 500 logical pixels wide -- so compositing
+    /// a narrower pane at the pane's width cuts the right-hand side off the
+    /// window.  Compositing at the size it really drew hands the viewer an
+    /// oversized frame instead, which the browser already scales down to fit
+    /// its pane.  Whole window, smaller, rather than part of one.
     fn native_composite_size(&self, toplevel_sid: u16) -> Option<(u32, u32, u32, u32)> {
         let &(lw, lh) = self.surface_sizes.get(&toplevel_sid)?;
+        let (lw, lh) = match self
+            .toplevel_surface_ids
+            .get(&toplevel_sid)
+            .and_then(|root_id| self.surfaces.get(root_id))
+        {
+            Some(surf) => constrain_to_hints(surf, lw, lh),
+            None => (lw, lh),
+        };
         let s120 = (self.output_scale_120 as u32).max(120);
         let pw = super::render::to_physical(lw as u32, s120);
         let ph = super::render::to_physical(lh as u32, s120);
