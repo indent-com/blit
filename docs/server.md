@@ -204,7 +204,7 @@ When `VK_KHR_video_encode_queue` + `VK_KHR_video_encode_h264` / `VK_KHR_video_en
 
 Chroma is a runtime property, not a build-time one. H.264 4:2:0 uses High with a `G8_B8R8_2PLANE_420_UNORM` source; 4:4:4 uses High 4:4:4 Predictive with `G8_B8R8_2PLANE_444_UNORM` — both two-plane, differing only in whether chroma is subsampled, so they share a descriptor layout and differ only in which compute shader fills the planes (`bgra_to_nv12_image` vs `bgra_to_nv24_image`).
 
-Whether 4:4:4 is *usable* is a per-device question answered at session-creation time, and there are two distinct ways it can come back no:
+Whether 4:4:4 is _usable_ is a per-device question answered at session-creation time, and there are two distinct ways it can come back no:
 
 - The capability query refuses the profile outright. AMD Raphael (radv) answers `ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR`.
 - The profile is advertised but the driver cannot serialize its parameter sets. The NVIDIA proprietary driver (595.84) advertises H.264 High 4:4:4 Predictive, accepts the SPS/PPS pair, serializes the SPS, then fails the PPS with `ERROR_OUT_OF_HOST_MEMORY` — the same PPS that serializes at 4:2:0. A stream without parameter sets is undecodable, so the session is refused rather than shipped.
@@ -235,8 +235,8 @@ The Vulkan tier leads because it encodes on the compositor's own device with no 
 
 | Encoder         | Backend             | Notes                                                                                                                                                                                                                    |
 | --------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `h264-vulkan`   | Vulkan Video (GPU)  | H.264 via VK_KHR_video_encode_h264. 4:2:0 only. Default first choice                                                                                                                                                      |
-| `av1-vulkan`    | Vulkan Video (GPU)  | AV1 via VK_KHR_video_encode_av1. 4:2:0 only. Not wired up — see above                                                                                                                                                     |
+| `h264-vulkan`   | Vulkan Video (GPU)  | H.264 via VK_KHR_video_encode_h264. 4:2:0, or 4:4:4 where the driver serializes it. Default first choice                                                                                                                 |
+| `av1-vulkan`    | Vulkan Video (GPU)  | AV1 via VK_KHR_video_encode_av1, 4:2:0. In the default list but declines until it can emit a sequence header — see above                                                                                                 |
 | `av1-nvenc`     | NVENC (GPU)         | AV1 via CUDA                                                                                                                                                                                                             |
 | `h264-nvenc`    | NVENC (GPU)         | H.264 via CUDA                                                                                                                                                                                                           |
 | `av1-vaapi`     | VA-API (GPU)        | AV1 via libva                                                                                                                                                                                                            |
