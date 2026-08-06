@@ -889,6 +889,38 @@ fn surface_encode_cap(
     Some((cw.min(dw), ch.min(dh)))
 }
 
+/// Whether a failed encoder creation should narrow this surface's ceiling
+/// rather than simply be tried again.
+///
+/// True only when nothing is left that could have carried the frame: every
+/// backend the client can decode and this host can run is too small for it.
+/// Then a smaller surface is the only way to a picture, and the caller
+/// latches `encoder_cap_degraded`.
+///
+/// The distinction matters because that latch does not clear until the
+/// client resubscribes.  If a backend fits the frame and works on this host,
+/// its failure was a momentary one — an allocation, a busy engine — and
+/// another attempt at the same size is the right answer; treating it as a
+/// size problem would pin the viewer to 2160p for the rest of the session.
+///
+/// `available` reports whether a backend has ever built an encoder here; it
+/// is a parameter so this stays a decision about the arguments rather than
+/// about process-global state.
+fn refused_for_size(
+    prefs: &[SurfaceEncoderPreference],
+    codec_support: u8,
+    width: u32,
+    height: u32,
+    available: impl Fn(SurfaceEncoderPreference) -> bool,
+) -> bool {
+    !prefs
+        .iter()
+        .copied()
+        .filter(|p| p.supported_by_client(codec_support))
+        .filter(|p| available(*p))
+        .any(|p| p.fits(width, height))
+}
+
 struct ClientState {
     tx: mpsc::UnboundedSender<Vec<u8>>,
     outbox_queued_frames: Arc<AtomicUsize>,
@@ -5502,13 +5534,21 @@ async fn tick(state: &AppState) -> TickOutcome {
                                         job.cid, job.sid, job.target_w, job.target_h,
                                     );
                                 }
-                                // Did the size rule anything out?  If so the
-                                // retry should be smaller, not merely later.
-                                let oversized = params
-                                    .preferences
-                                    .iter()
-                                    .filter(|p| p.supported_by_client(params.codec_support))
-                                    .any(|p| !p.fits(job.target_w, job.target_h));
+                                // Families are eliminated at 4:2:0, the chroma
+                                // every attempt falls back to, so one missing
+                                // there is missing outright.
+                                let oversized = refused_for_size(
+                                    &params.preferences,
+                                    params.codec_support,
+                                    job.target_w,
+                                    job.target_h,
+                                    |p| {
+                                        !surface_encoder::known_unavailable(
+                                            p,
+                                            surface_encoder::ChromaSubsampling::Cs420,
+                                        )
+                                    },
+                                );
                                 return CreateResult {
                                     cid: job.cid,
                                     sid: job.sid,
@@ -12671,6 +12711,42 @@ mod tests {
             surface_encode_cap(&prefs, &c, 1),
             Some(SurfaceEncoderPreference::AV1Software.max_dimensions())
         );
+    }
+
+    /// Narrowing the ceiling is for frames nothing can carry.  A backend
+    /// that fits and works gets another attempt at the same size instead —
+    /// the degrade latches until the client resubscribes, so spending it on
+    /// a momentary failure costs the viewer 5K for the rest of the session.
+    #[test]
+    fn only_a_frame_no_working_backend_fits_is_refused_for_size() {
+        let prefs = SurfaceEncoderPreference::defaults();
+        let av1 = blit_remote::CODEC_SUPPORT_AV1;
+        let all_work = |_| true;
+
+        // 5K on a host where hardware AV1 works: NvencAV1 could have taken
+        // it, so this failure was not about the size.
+        assert!(!refused_for_size(&prefs, av1, 5120, 2880, all_work));
+
+        // Same frame once hardware AV1 is gone.  Only AV1Software is left
+        // for an AV1 client, and it stops at 4K — so the surface has to
+        // come down before anything can encode it.
+        let no_hw_av1 = |p| {
+            !matches!(
+                p,
+                SurfaceEncoderPreference::NvencAV1 | SurfaceEncoderPreference::AV1Vaapi
+            )
+        };
+        assert!(refused_for_size(&prefs, av1, 5120, 2880, no_hw_av1));
+
+        // A frame everything clears is never a size problem, however much
+        // of the chain is missing.
+        assert!(!refused_for_size(&prefs, av1, 1920, 1080, no_hw_av1));
+
+        // An H.264-only client is held to 3840x2160 by its own decoder, not
+        // by which backends happen to be present.
+        let h264 = blit_remote::CODEC_SUPPORT_H264;
+        assert!(refused_for_size(&prefs, h264, 5120, 2880, all_work));
+        assert!(!refused_for_size(&prefs, h264, 3840, 2160, all_work));
     }
 
     /// The decoder ceiling is a hard intersection: advertising AV1 says
