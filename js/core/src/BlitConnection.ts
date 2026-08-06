@@ -2776,16 +2776,22 @@ export class BlitConnection {
     this.transport.send(buildSurfaceAxis2Message(surfaceId, ev));
   }
 
+  /** Returns whether the message went out.  Unlike the input sends, a
+   *  dropped resize is not water under the bridge: the caller records it
+   *  as the size the server knows about, so silently swallowing one on a
+   *  disconnected transport leaves the surface stuck at the previous size
+   *  until the pane happens to change size again. */
   sendSurfaceResize(
     surfaceId: number,
     width: number,
     height: number,
     scale120: number = 0,
-  ): void {
-    if (this.transport.status !== "connected") return;
+  ): boolean {
+    if (this.transport.status !== "connected") return false;
     this.transport.send(
       buildSurfaceResizeMessage(surfaceId, width, height, scale120),
     );
+    return true;
   }
 
   sendSurfaceFocus(surfaceId: number): void {

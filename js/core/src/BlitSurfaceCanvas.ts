@@ -782,8 +782,13 @@ export class BlitSurfaceCanvas {
       return;
     }
     const { w, h, scale120 } = this._pendingResize;
+    // Only forget the request once it is actually on the wire.  The
+    // transport can be mid-reconnect, in which case the send is a no-op —
+    // clearing first left nothing to retry, and the binding's own
+    // last-sent dedup means the same size is never offered again, so the
+    // surface stayed at the pre-resize size indefinitely.
+    if (!conn.sendSurfaceResize(this._surfaceId, w, h, scale120)) return;
     this._pendingResize = null;
-    conn.sendSurfaceResize(this._surfaceId, w, h, scale120);
     this._resizeConstraintActive = true;
   }
 
@@ -1000,6 +1005,11 @@ export class BlitSurfaceCanvas {
             // already own a ref from the initial subscribe() call.
             c.refreshSurfaceSubscribe(this._surfaceId);
             this._subscribedGeneration = store.generation;
+            // The reconnect is a new client to the server, which keeps
+            // view sizes per client — so this view no longer counts in the
+            // surface's size mediation until it says so again.  The
+            // ResizeObserver won't: the container never changed size.
+            this.resendDisplaySize();
           }
         }
         // Size the canvas backing buffer to the surface when info first

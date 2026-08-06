@@ -251,12 +251,23 @@ mod stub {
             surface_id: u32,
             target_w: u32,
             target_h: u32,
+            native_w: u32,
+            native_h: u32,
             buffers: Vec<ExternalOutputBuffer>,
         },
         RegisterDownscaleTarget {
             surface_id: u32,
             target_w: u32,
             target_h: u32,
+            native_w: u32,
+            native_h: u32,
+        },
+        RestampTarget {
+            surface_id: u32,
+            target_w: u32,
+            target_h: u32,
+            native_w: u32,
+            native_h: u32,
         },
         ClearDownscaleTarget {
             surface_id: u32,

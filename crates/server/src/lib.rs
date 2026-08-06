@@ -800,6 +800,16 @@ struct SurfaceSubState {
     /// = no target registered yet (or the encoder was an external
     /// GBM path that uses `external_outputs` instead).
     last_registered_target: Option<(u32, u32)>,
+    /// The compositor native size `last_registered_target` was inscribed
+    /// into, as the compositor has it stamped.  The compositor refuses to
+    /// fill a target whose stamp no longer matches what it is compositing,
+    /// so this has to be refreshed whenever the native moves — including
+    /// when the target itself lands on the same numbers as before and the
+    /// encoder is therefore not rebuilt.  Without that, a surface nudged a
+    /// pixel by *another* viewer's resize would leave this one's target
+    /// stamped for a size that will never come back, and it would stop
+    /// receiving frames entirely.
+    last_registered_native: Option<(u32, u32)>,
     /// Which preference won the fallback chain for this surface, once one
     /// has.  Sizing prefers it over guessing: before an encoder exists we
     /// size for the most capable backend the client could decode, and this
@@ -2769,6 +2779,15 @@ impl Session {
             height,
             scale_120,
         });
+        // Commands are only drained at the top of the compositor's event
+        // loop, which is otherwise parked in `dispatch()` for up to a
+        // second.  Every other command site wakes it; this one did not, so
+        // a configure sat in the queue until something unrelated ran the
+        // loop — a Wayland event, the next blanket `RequestFrame`, or a
+        // pointer/key event from the very surface being resized.  That last
+        // one is why a resize looked like it only took effect once you
+        // interacted with the window.
+        cs.handle.wake();
         true
     }
 
@@ -4209,11 +4228,22 @@ async fn tick(state: &AppState) -> TickOutcome {
         /// downscales per-client into these dimensions.
         target_w: u32,
         target_h: u32,
+        /// The compositor native size `(target_w, target_h)` was inscribed
+        /// into.  Handed back to the compositor with the target so it can
+        /// tell, without re-deriving our arithmetic, whether the composite
+        /// has since moved and the target can no longer be filled without
+        /// squashing the picture.
+        native_w: u32,
+        native_h: u32,
         params: EncoderCreateParams,
     }
     struct CreateResult {
         cid: u64,
         sid: u16,
+        /// The compositor native size the target was inscribed into, carried
+        /// through so the registration below can stamp it on the target.
+        native_w: u32,
+        native_h: u32,
         /// None when `SurfaceEncoder::new` failed; the completion
         /// handler logs and latches a backoff so the tick loop doesn't
         /// spin on retries.
@@ -4430,6 +4460,46 @@ async fn tick(state: &AppState) -> TickOutcome {
                     surface_encode_cap(&state.config.surface_encoders, client, sid),
                 );
                 let (enc_w, enc_h) = (target_w, target_h);
+
+                // The target the compositor holds is stamped with the native
+                // it was inscribed into, and it refuses to fill one whose
+                // stamp has gone stale — otherwise the composite moves
+                // first and the frame comes out squashed into the previous
+                // aspect.  When the native moves the target usually moves
+                // with it and the rebuild below re-stamps; but the
+                // inscription can land on the same numbers as before (a
+                // one-pixel native change, say, from another viewer nudging
+                // the mediated size), and then nothing would ever refresh
+                // the stamp and this client would stop receiving frames.
+                // The buffers are still the right ones — only the record of
+                // what they were sized against is behind.
+                let restamp = client.surface_subs.get(&sid).and_then(|s| {
+                    let registered = s.last_registered_target?;
+                    (registered == (target_w, target_h)
+                        && s.last_registered_native != Some((native_w, native_h)))
+                    .then_some(registered)
+                });
+                if let Some((tw, th)) = restamp {
+                    client
+                        .surface_subs
+                        .entry(sid)
+                        .or_default()
+                        .last_registered_native = Some((native_w, native_h));
+                    if let Some(cs) = sess.compositor.as_ref() {
+                        let _ = cs.handle.command_tx.send(
+                            blit_compositor::CompositorCommand::RestampTarget {
+                                surface_id: sid as u32,
+                                target_w: tw,
+                                target_h: th,
+                                native_w,
+                                native_h,
+                            },
+                        );
+                        cs.handle.wake();
+                    }
+                }
+                let client = sess.clients.get_mut(&work.cid).unwrap();
+
                 if state.config.verbose {
                     static EDB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let n = EDB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4867,6 +4937,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                         sid,
                         target_w: enc_w,
                         target_h: enc_h,
+                        native_w,
+                        native_h,
                         params: EncoderCreateParams {
                             preferences: state.config.surface_encoders.clone(),
                             vaapi_device: state.config.vaapi_device.clone(),
@@ -5340,6 +5412,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 return CreateResult {
                                     cid: job.cid,
                                     sid: job.sid,
+                                    native_w: job.native_w,
+                                    native_h: job.native_h,
                                     encoder: None,
                                     fresh: None,
                                     oversized,
@@ -5408,6 +5482,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                         CreateResult {
                             cid: job.cid,
                             sid: job.sid,
+                            native_w: job.native_w,
+                            native_h: job.native_h,
                             encoder: Some(encoder),
                             fresh: Some(fresh),
                             oversized: false,
@@ -5544,6 +5620,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 surface_id: result.sid as u32,
                                 target_w: tw,
                                 target_h: th,
+                                native_w: result.native_w,
+                                native_h: result.native_h,
                                 buffers: bufs,
                             },
                         );
@@ -5559,16 +5637,16 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 surface_id: result.sid as u32,
                                 target_w: tw,
                                 target_h: th,
+                                native_w: result.native_w,
+                                native_h: result.native_h,
                             },
                         );
                         cs.handle.wake();
                     }
                     if let Some(client) = sess.clients.get_mut(&result.cid) {
-                        client
-                            .surface_subs
-                            .entry(result.sid)
-                            .or_default()
-                            .last_registered_target = Some((tw, th));
+                        let s = client.surface_subs.entry(result.sid).or_default();
+                        s.last_registered_target = Some((tw, th));
+                        s.last_registered_native = Some((result.native_w, result.native_h));
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
