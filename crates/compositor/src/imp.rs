@@ -1285,6 +1285,11 @@ struct Compositor {
     // -- Relative pointer --
     relative_pointers: Vec<ZwpRelativePointerV1>,
 
+    /// Per-client multiplier for the smooth `wl_pointer.axis` value, keyed
+    /// by client so the `/proc` lookup behind it happens once rather than
+    /// once per scroll frame.  See [`Compositor::smooth_axis_scale`].
+    axis_scale: HashMap<wayland_server::backend::ClientId, f64>,
+
     // -- Text input --
     /// Active zwp_text_input_v3 objects.  When the compositor receives
     /// composed text from the browser it delivers it via `commit_string`
@@ -2351,6 +2356,40 @@ impl Compositor {
         }
     }
 
+    /// What to multiply a smooth `wl_pointer.axis` distance by before
+    /// sending it to this pointer's client.
+    ///
+    /// The protocol calls the axis value a distance "in a coordinate space
+    /// identical to those of motion events" — surface-local pixels — and
+    /// that is what blit sends, as does Mutter. Chromium reads it as
+    /// detents anyway: `wayland_pointer.cc` divides by a hardcoded
+    /// `kAxisValueScale = 10` and multiplies by `kWheelDelta = 120`, for
+    /// every source including `finger`, then hands the result to Blink as
+    /// precise pixels. A pixel-valued axis therefore scrolls Chromium and
+    /// Electron windows exactly twelve times too far.
+    ///
+    /// So spell the same distance for them in the detent units Weston
+    /// established and Mutter still emits (`DEFAULT_AXIS_STEP_DISTANCE`,
+    /// ten per detent). Everyone else — GTK, which treats the value as
+    /// `GDK_SCROLL_UNIT_SURFACE` pixels, and winit, which hands it to
+    /// Alacritty as a `PixelDelta` — keeps pixels. `axis_value120` is
+    /// unaffected: its unit is unambiguous and every toolkit agrees on it.
+    fn smooth_axis_scale(&mut self, ptr: &WlPointer) -> f64 {
+        let Some(client) = ptr.client() else {
+            return 1.0;
+        };
+        let id = client.id();
+        if let Some(&scale) = self.axis_scale.get(&id) {
+            return scale;
+        }
+        let scale = match client.get_credentials(&self.display_handle) {
+            Ok(creds) if pid_is_chromium(creds.pid) => AXIS_UNITS_PER_DETENT / PX_PER_DETENT,
+            _ => 1.0,
+        };
+        self.axis_scale.insert(id, scale);
+        scale
+    }
+
     /// Remove surfaces whose underlying `WlSurface` is no longer alive.
     /// This handles the case where a Wayland client process exits or crashes
     /// without explicitly destroying its surfaces — `dispatch_clients()`
@@ -2371,6 +2410,15 @@ impl Compositor {
         // A client that disconnects without destroying its regions never
         // sends `wl_region.destroy`, so reclaim its builder entries here.
         self.regions.retain(|_, (r, _)| r.is_alive());
+        // The axis-scale cache is keyed by client rather than by resource,
+        // so nothing above reclaims it, and a long session launches a lot
+        // of apps.
+        let live: std::collections::HashSet<_> = self
+            .pointers
+            .iter()
+            .filter_map(|p| p.client().map(|c| c.id()))
+            .collect();
+        self.axis_scale.retain(|id, _| live.contains(id));
 
         let dead: Vec<ObjectId> = self
             .surfaces
@@ -2842,11 +2890,17 @@ impl Compositor {
                     return;
                 };
                 use wl_pointer::Axis;
-                for ptr in &self.pointers {
-                    if !same_client(ptr, &wl) {
-                        continue;
-                    }
+                // Cloned out of `self.pointers` so the per-client axis
+                // scale below can take `&mut self` for its cache.
+                let targets: Vec<WlPointer> = self
+                    .pointers
+                    .iter()
+                    .filter(|p| same_client(*p, &wl))
+                    .cloned()
+                    .collect();
+                for ptr in &targets {
                     let v = ptr.version();
+                    let scale = self.smooth_axis_scale(ptr);
                     // axis_source first: it applies to every axis event in
                     // this frame, and tells the client whether to expect
                     // detents or a smooth stream. Without it a trackpad's
@@ -2882,7 +2936,7 @@ impl Compositor {
                                 ptr.axis_discrete(axis, i32::from(v120 / 120));
                             }
                         }
-                        ptr.axis(time, axis, delta);
+                        ptr.axis(time, axis, delta * scale);
                     }
                     if v >= 5 {
                         ptr.frame();
@@ -3481,6 +3535,52 @@ fn axis_source_from_wire(source: u8, version: u32) -> Option<wl_pointer::AxisSou
         3 if version >= 6 => Some(wl_pointer::AxisSource::WheelTilt),
         _ => None,
     }
+}
+
+/// Pixels blit calls one wheel detent, matching `WHEEL_DETENT_PX` in the
+/// browser client and the unit `blit surface scroll` takes.
+const PX_PER_DETENT: f64 = 120.0;
+
+/// Smooth `wl_pointer.axis` units per detent in the convention Weston
+/// established and Mutter still emits.
+const AXIS_UNITS_PER_DETENT: f64 = 10.0;
+
+/// Files every Chromium build ships beside its executable. The process
+/// name is no use here — Electron apps rename the binary — but the
+/// runtime payload next to it is always there.
+const CHROMIUM_SIBLINGS: [&str; 3] = [
+    "chrome_crashpad_handler",
+    "v8_context_snapshot.bin",
+    "icudtl.dat",
+];
+
+/// Whether the process behind a Wayland connection is Chromium or an
+/// Electron app, and so needs its scroll distance in detent units.
+/// See [`Compositor::smooth_axis_scale`].
+fn pid_is_chromium(pid: i32) -> bool {
+    let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    if dir_is_chromium(dir) {
+        return true;
+    }
+    // A sandboxed client — flatpak, snap — named its executable in its own
+    // mount namespace, where that path means nothing to us. Re-root it.
+    dir_is_chromium(
+        &std::path::Path::new("/proc")
+            .join(pid.to_string())
+            .join("root")
+            .join(dir.strip_prefix("/").unwrap_or(dir)),
+    )
+}
+
+/// Split out from [`pid_is_chromium`] so the marker list is testable
+/// without a live process.
+fn dir_is_chromium(dir: &std::path::Path) -> bool {
+    CHROMIUM_SIBLINGS.iter().any(|f| dir.join(f).exists())
 }
 
 /// Returns true when two Wayland resources belong to the same still-connected client.
@@ -6256,6 +6356,7 @@ fn run_compositor(
         primary_source: None,
         external_primary: None,
         relative_pointers: Vec::new(),
+        axis_scale: HashMap::new(),
         text_inputs: Vec::new(),
         text_input_serial: 0,
         next_activation_token: 1,
@@ -6448,8 +6549,60 @@ fn run_compositor(
 
 #[cfg(test)]
 mod tests {
-    use super::{next_surface_id_after, scan_free_surface_id};
+    use super::{dir_is_chromium, next_surface_id_after, scan_free_surface_id};
     use std::collections::HashSet;
+
+    /// A scratch directory that removes itself, so the marker test can
+    /// stage an executable's neighbours without a temp-file dependency.
+    struct ScratchDir(std::path::PathBuf);
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("blit-axis-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            Self(dir)
+        }
+        fn with(self, file: &str) -> Self {
+            std::fs::write(self.0.join(file), b"").expect("write marker");
+            self
+        }
+    }
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Chromium and Electron both need the smooth axis in detent units, and
+    /// both are recognisable only by the runtime payload beside the binary:
+    /// an Electron app renames the executable to whatever it likes.
+    #[test]
+    fn chromium_is_recognised_by_its_runtime_payload() {
+        assert!(dir_is_chromium(
+            &ScratchDir::new("crashpad")
+                .with("chrome_crashpad_handler")
+                .0
+        ));
+        assert!(dir_is_chromium(
+            &ScratchDir::new("snapshot")
+                .with("v8_context_snapshot.bin")
+                .0
+        ));
+        assert!(dir_is_chromium(
+            &ScratchDir::new("icu").with("icudtl.dat").0
+        ));
+    }
+
+    /// Everything else keeps pixels, which is what the protocol specifies.
+    #[test]
+    fn an_ordinary_binary_is_not_chromium() {
+        assert!(!dir_is_chromium(
+            &ScratchDir::new("plain").with("alacritty").0
+        ));
+        assert!(!dir_is_chromium(std::path::Path::new(
+            "/nonexistent/blit/axis/scale"
+        )));
+    }
 
     #[test]
     fn scan_skips_zero_and_wraps() {

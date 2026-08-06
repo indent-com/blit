@@ -271,6 +271,32 @@ describe("BlitSurfaceCanvas scroll", () => {
     surface.dispose();
   });
 
+  /** Chromium regresses a fling velocity from the frames preceding an
+   *  `axis_stop` unless more than its `kFlingStartTimeoutMs` of 200ms has
+   *  passed since the last of them. macOS has already appended a momentum
+   *  tail by then, so the stop has to land outside that window or the app
+   *  serves a second helping. */
+  it("holds the stop past the window a toolkit would fling from", () => {
+    const { surface, sent, wheel } = attachScrolling();
+    wheel({ deltaY: 8.5, deltaMode: 0 });
+    vi.advanceTimersByTime(200);
+    expect(sent.filter((e) => e.stop)).toHaveLength(0);
+    vi.advanceTimersByTime(100);
+    expect(sent.filter((e) => e.stop)).toHaveLength(1);
+    surface.dispose();
+  });
+
+  /** The protocol leaves a `wheel` sequence unterminated, and a wheel has
+   *  no finger-lift to report; a stop only invites invented momentum. */
+  it("leaves a notched wheel sequence unterminated", () => {
+    const { surface, sent, wheel } = attachScrolling();
+    wheel({ deltaY: 120, deltaMode: 0 });
+    expect(sent[0].source).toBe(AXIS_SOURCE_WHEEL);
+    vi.advanceTimersByTime(500);
+    expect(sent.filter((e) => e.stop)).toHaveLength(0);
+    surface.dispose();
+  });
+
   it("sends one stop per gesture, not one per idle tick", () => {
     const { surface, sent, wheel } = attachScrolling();
     wheel({ deltaY: 8.5, deltaMode: 0 });
