@@ -1,11 +1,15 @@
-//! A toplevel that asks to change state must get an answer.
+//! A toplevel that asks to change state must get an answer, and the answer
+//! has to be the one the client can live with.
 //!
-//! Panes are permanently activated and maximized, so every one of these
-//! requests is declined -- but silence is not a way to decline.  xdg-shell
-//! requires a configure in reply to the maximize/fullscreen pair, and
-//! Chromium-based clients (every Electron app) flip themselves to minimized
-//! the instant they send set_minimized, then stop drawing until a configure
-//! carrying `activated` tells them otherwise.
+//! Panes are permanently activated and maximized, so minimize and maximize
+//! are declined -- but silence is not a way to decline.  xdg-shell requires a
+//! configure in reply to the maximize/fullscreen pair, and Chromium-based
+//! clients (every Electron app) flip themselves to minimized the instant they
+//! send set_minimized, then stop drawing until a configure carrying
+//! `activated` tells them otherwise.
+//!
+//! Fullscreen is the one that is granted: a pane already fills its output, and
+//! a client told otherwise undoes the fullscreen it just entered.
 
 #![cfg(target_os = "linux")]
 
@@ -27,6 +31,11 @@ struct App {
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     /// Every configure the server sent, as (width, height, states).
     configures: Vec<(i32, i32, Vec<u32>)>,
+    /// The capabilities the server advertised, if it did.
+    capabilities: Option<Vec<u32>>,
+    /// How many configures had arrived by the time they showed up -- the
+    /// protocol requires them before the first one.
+    configures_before_capabilities: usize,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for App {
@@ -50,8 +59,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
                     Some(registry.bind::<wl_compositor::WlCompositor, _, _>(name, 4, qh, ()));
             }
             "xdg_wm_base" => {
+                // Bind high, like Chromium does: wm_capabilities is a v5
+                // event, and a v1 binding would never see it.
                 state.wm_base =
-                    Some(registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 1, qh, ()));
+                    Some(registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 5, qh, ()));
             }
             _ => {}
         }
@@ -97,17 +108,22 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for App {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let xdg_toplevel::Event::Configure {
-            width,
-            height,
-            states,
-        } = event
-        {
-            let states = states
-                .chunks_exact(4)
+        let words = |raw: Vec<u8>| -> Vec<u32> {
+            raw.chunks_exact(4)
                 .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            state.configures.push((width, height, states));
+                .collect()
+        };
+        match event {
+            xdg_toplevel::Event::Configure {
+                width,
+                height,
+                states,
+            } => state.configures.push((width, height, words(states))),
+            xdg_toplevel::Event::WmCapabilities { capabilities } => {
+                state.configures_before_capabilities = state.configures.len();
+                state.capabilities = Some(words(capabilities));
+            }
+            _ => {}
         }
     }
 }
@@ -229,16 +245,14 @@ fn set_minimized_is_declined_with_an_activated_configure() {
 }
 
 #[test]
-fn maximize_and_fullscreen_requests_are_always_answered() {
+fn maximize_requests_are_answered_without_changing_anything() {
     let mut fixture = Fixture::new();
 
     // xdg-shell: each of these "will respond by emitting a configure event".
     type Send = fn(&xdg_toplevel::XdgToplevel);
-    let requests: [(&str, Send); 4] = [
+    let requests: [(&str, Send); 2] = [
         ("set_maximized", |tl| tl.set_maximized()),
         ("unset_maximized", |tl| tl.unset_maximized()),
-        ("set_fullscreen", |tl| tl.set_fullscreen(None)),
-        ("unset_fullscreen", |tl| tl.unset_fullscreen()),
     ];
     for (name, send) in requests {
         let mark = fixture.request(send);
@@ -247,15 +261,90 @@ fn maximize_and_fullscreen_requests_are_always_answered() {
             !states.is_empty(),
             "{name} drew no configure at all; the client waits forever"
         );
-        // The pane never actually changes shape, so the answer is always the
-        // same: still activated, still maximized, never fullscreen.
+        // A pane is maximized whether or not it asked to be.
         assert!(
             states.contains(&State::Activated) && states.contains(&State::Maximized),
             "{name} answered with {states:?}, expected activated + maximized"
         );
+    }
+}
+
+/// xdg_toplevel.wm_capabilities values, which are their own enum -- not the
+/// state numbers above.
+const CAP_WINDOW_MENU: u32 = 1;
+const CAP_MAXIMIZE: u32 = 2;
+const CAP_FULLSCREEN: u32 = 3;
+const CAP_MINIMIZE: u32 = 4;
+
+#[test]
+fn only_the_capabilities_we_honour_are_advertised() {
+    let fixture = Fixture::new();
+    let caps = fixture.app.capabilities.clone().expect(
+        "xdg-shell v5 requires wm_capabilities; a client that never \
+                 hears it assumes every request works",
+    );
+
+    // The one request that does something.  Without it advertised, a client
+    // hides its fullscreen button and the user cannot ask at all.
+    assert!(
+        caps.contains(&CAP_FULLSCREEN),
+        "fullscreen missing from {caps:?}; clients will hide the button"
+    );
+    // The rest are declined, so the buttons that trigger them should not be
+    // drawn.  Minimize especially: it is the one that used to strand a pane.
+    for (name, cap) in [
+        ("minimize", CAP_MINIMIZE),
+        ("maximize", CAP_MAXIMIZE),
+        ("window_menu", CAP_WINDOW_MENU),
+    ] {
         assert!(
-            !states.contains(&State::Fullscreen),
-            "{name} answered with fullscreen, which panes never enter"
+            !caps.contains(&cap),
+            "{name} advertised in {caps:?} but the request is declined"
         );
     }
+
+    // "Compositors must send this event once before the first
+    // xdg_surface.configure event."
+    assert_eq!(
+        fixture.app.configures_before_capabilities, 0,
+        "wm_capabilities arrived after {} configure(s); clients latch \
+         capabilities when the first configure is acked",
+        fixture.app.configures_before_capabilities
+    );
+}
+
+#[test]
+fn fullscreen_is_granted_and_given_back() {
+    let mut fixture = Fixture::new();
+
+    // Chromium asks the compositor to fullscreen the window when a page takes
+    // a video fullscreen, then reads the answer.  A configure without
+    // `fullscreen` is a refusal, and it takes the page back out again.
+    let mark = fixture.request(|tl| tl.set_fullscreen(None));
+    let states = fixture.states_since(mark);
+    assert!(
+        states.contains(&State::Fullscreen),
+        "set_fullscreen answered with {states:?}, which a client reads as a \
+         refusal -- it will undo its own fullscreen"
+    );
+    assert!(
+        states.contains(&State::Activated),
+        "set_fullscreen answered with {states:?}, expected activated too"
+    );
+
+    let mark = fixture.request(|tl| tl.unset_fullscreen());
+    let states = fixture.states_since(mark);
+    assert!(
+        !states.is_empty(),
+        "unset_fullscreen drew no configure at all; the client waits forever"
+    );
+    assert!(
+        !states.contains(&State::Fullscreen),
+        "unset_fullscreen left the client fullscreen: {states:?}"
+    );
+    // Leaving fullscreen lands back on what a pane always is.
+    assert!(
+        states.contains(&State::Activated) && states.contains(&State::Maximized),
+        "unset_fullscreen answered with {states:?}, expected activated + maximized"
+    );
 }

@@ -746,6 +746,20 @@ pub(crate) struct Surface {
     xdg_toplevel: Option<XdgToplevel>,
     xdg_popup: Option<XdgPopup>,
     pub xdg_geometry: Option<(i32, i32, i32, i32)>,
+    /// Whether the client asked for fullscreen and we granted it.  It changes
+    /// nothing about how the pane is drawn -- it already fills its output --
+    /// but the client is told, because a client that asks and hears otherwise
+    /// backs its own fullscreen out again.
+    xdg_fullscreen: bool,
+    /// The size range the client says it can render, from
+    /// `xdg_toplevel.set_min_size` / `set_max_size`, in window geometry
+    /// coordinates.  Zero in a dimension means unset.  Double-buffered, so
+    /// each pair is staged until commit -- a client is allowed to send a min
+    /// and a max that only agree once both have landed.
+    pending_min_size: (i32, i32),
+    pending_max_size: (i32, i32),
+    min_size: (i32, i32),
+    max_size: (i32, i32),
 
     title: String,
     app_id: String,
@@ -1966,8 +1980,24 @@ impl Compositor {
     /// target is `surface_sizes` either way, so this is what the very next
     /// composite will produce, and the server needs it to size encoders
     /// against the right aspect rather than the previous one.
+    ///
+    /// The client's own size range applies on the way out.  A client that
+    /// declared a minimum draws itself at that minimum no matter what we
+    /// asked for -- Chromium's is 500 logical pixels wide -- so compositing
+    /// a narrower pane at the pane's width cuts the right-hand side off the
+    /// window.  Compositing at the size it really drew hands the viewer an
+    /// oversized frame instead, which the browser already scales down to fit
+    /// its pane.  Whole window, smaller, rather than part of one.
     fn native_composite_size(&self, toplevel_sid: u16) -> Option<(u32, u32, u32, u32)> {
         let &(lw, lh) = self.surface_sizes.get(&toplevel_sid)?;
+        let (lw, lh) = match self
+            .toplevel_surface_ids
+            .get(&toplevel_sid)
+            .and_then(|root_id| self.surfaces.get(root_id))
+        {
+            Some(surf) => constrain_to_hints(surf, lw, lh),
+            None => (lw, lh),
+        };
         let s120 = (self.output_scale_120 as u32).max(120);
         let pw = super::render::to_physical(lw as u32, s120);
         let ph = super::render::to_physical(lh as u32, s120);
@@ -2227,10 +2257,30 @@ impl Compositor {
     /// and handles vendor-specific tiled layouts (NVIDIA, AMD) natively
     /// — CPU mmap of such buffers would produce garbage or block.
     fn apply_pending_state(&mut self, surface_id: &ObjectId) {
+        // The size hints are checked against each other here rather than as
+        // they arrive: both halves are double-buffered, so a client may raise
+        // its minimum past the old maximum as long as the new maximum lands in
+        // the same commit.  Only once they are applied together is a minimum
+        // above a maximum actually contradictory.
+        if let Some(surf) = self.surfaces.get(surface_id) {
+            let ((min_w, min_h), (max_w, max_h)) = (surf.pending_min_size, surf.pending_max_size);
+            // Zero is "no opinion", so it never conflicts.
+            if (max_w > 0 && min_w > max_w) || (max_h > 0 && min_h > max_h) {
+                if let Some(tl) = surf.xdg_toplevel.clone() {
+                    tl.post_error(
+                        xdg_toplevel::Error::InvalidSize,
+                        format!("minimum size {min_w}x{min_h} exceeds maximum {max_w}x{max_h}"),
+                    );
+                }
+                return;
+            }
+        }
         let (buffer, scale, is_cursor) = {
             let Some(surf) = self.surfaces.get_mut(surface_id) else {
                 return;
             };
+            surf.min_size = surf.pending_min_size;
+            surf.max_size = surf.pending_max_size;
             let buffer = surf.pending_buffer.take();
             let scale = surf.pending_buffer_scale;
             surf.buffer_scale = scale;
@@ -2563,15 +2613,9 @@ impl Compositor {
             .get(&surf.surface_id)
             .copied()
             .unwrap_or((self.output_width, self.output_height));
+        let (w, h) = constrain_to_hints(surf, w, h);
         if let Some(ref tl) = surf.xdg_toplevel {
-            tl.configure(
-                w,
-                h,
-                xdg_toplevel_states(&[
-                    xdg_toplevel::State::Activated,
-                    xdg_toplevel::State::Maximized,
-                ]),
-            );
+            tl.configure(w, h, pane_states(surf.xdg_fullscreen));
         }
         if let Some(ref xs) = surf.xdg_surface {
             let serial = self.serial.wrapping_add(1);
@@ -3099,11 +3143,6 @@ impl Compositor {
                     }
                 }
 
-                let states = xdg_toplevel_states(&[
-                    xdg_toplevel::State::Activated,
-                    xdg_toplevel::State::Maximized,
-                ]);
-
                 if output_changed {
                     // When output scale or dimensions changed, every
                     // toplevel needs a new configure so it re-renders at
@@ -3111,8 +3150,9 @@ impl Compositor {
                     for (&sid, root_id) in &self.toplevel_surface_ids {
                         let (lw, lh) = self.surface_sizes.get(&sid).copied().unwrap_or((w, h));
                         if let Some(surf) = self.surfaces.get(root_id) {
+                            let (lw, lh) = constrain_to_hints(surf, lw, lh);
                             if let Some(ref tl) = surf.xdg_toplevel {
-                                tl.configure(lw, lh, states.clone());
+                                tl.configure(lw, lh, pane_states(surf.xdg_fullscreen));
                             }
                             if let Some(ref xs) = surf.xdg_surface {
                                 let serial = self.serial.wrapping_add(1);
@@ -3140,8 +3180,9 @@ impl Compositor {
                     if let Some(root_id) = self.toplevel_surface_ids.get(&surface_id)
                         && let Some(surf) = self.surfaces.get(root_id)
                     {
+                        let (cw, ch) = constrain_to_hints(surf, w, h);
                         if let Some(ref tl) = surf.xdg_toplevel {
-                            tl.configure(w, h, states);
+                            tl.configure(cw, ch, pane_states(surf.xdg_fullscreen));
                         }
                         if let Some(ref xs) = surf.xdg_surface {
                             let serial = self.serial.wrapping_add(1);
@@ -3726,11 +3767,55 @@ fn yuv420_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
     [r, g, b]
 }
 
+/// The states a pane's configure carries.  It is always activated and always
+/// maximized; `fullscreen` is added for a toplevel that asked to be, which
+/// costs nothing because a pane already fills its output.
+fn pane_states(fullscreen: bool) -> Vec<u8> {
+    let mut states = vec![
+        xdg_toplevel::State::Activated,
+        xdg_toplevel::State::Maximized,
+    ];
+    if fullscreen {
+        states.push(xdg_toplevel::State::Fullscreen);
+    }
+    xdg_toplevel_states(&states)
+}
+
+/// Fit a size we are about to quote in a configure into the range the client
+/// said it can draw.  Zero in a dimension means it has no opinion there.
+///
+/// This changes the number we ask for, not the pane: the pane's size is the
+/// viewer's layout and no client hint can move it.  What it buys is that we
+/// stop asking for a size the client is only going to refuse -- xdg-shell lets
+/// a compositor ignore these hints, but a configure the client will not honour
+/// is a round trip that ends in a surface the wrong size either way.
+fn constrain_to_hints(surf: &Surface, w: i32, h: i32) -> (i32, i32) {
+    let fit = |v: i32, min: i32, max: i32| {
+        let v = if min > 0 { v.max(min) } else { v };
+        // Max is applied last, but they cannot disagree: a minimum above a
+        // maximum is refused at commit.
+        if max > 0 { v.min(max) } else { v }
+    };
+    (
+        fit(w, surf.min_size.0, surf.max_size.0),
+        fit(h, surf.min_size.1, surf.max_size.1),
+    )
+}
+
 /// Encode xdg_toplevel states as the raw byte array expected by the protocol.
 fn xdg_toplevel_states(states: &[xdg_toplevel::State]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(states.len() * 4);
     for state in states {
         bytes.extend_from_slice(&(*state as u32).to_ne_bytes());
+    }
+    bytes
+}
+
+/// Encode xdg_toplevel wm_capabilities the same way -- native-endian u32s.
+fn xdg_wm_capabilities(caps: &[xdg_toplevel::WmCapabilities]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(caps.len() * 4);
+    for cap in caps {
+        bytes.extend_from_slice(&(*cap as u32).to_ne_bytes());
     }
     bytes
 }
@@ -3805,6 +3890,11 @@ impl Dispatch<WlCompositor, ()> for Compositor {
                         xdg_toplevel: None,
                         xdg_popup: None,
                         xdg_geometry: None,
+                        xdg_fullscreen: false,
+                        pending_min_size: (0, 0),
+                        pending_max_size: (0, 0),
+                        min_size: (0, 0),
+                        max_size: (0, 0),
                         title: String::new(),
                         app_id: String::new(),
                         pending_viewport_destination: None,
@@ -4278,6 +4368,17 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for Compositor {
                     .toplevel_surface_ids
                     .insert(surface_id, data.wl_surface_id.clone());
 
+                // Say up front which of the state requests are worth making,
+                // so a client can leave the rest out of its titlebar instead
+                // of drawing buttons that do nothing.  Fullscreen is the only
+                // one we honour; a pane cannot be minimized or unmaximized.
+                // This has to precede the first xdg_surface.configure.
+                if toplevel.version() >= 5 {
+                    toplevel.wm_capabilities(xdg_wm_capabilities(&[
+                        xdg_toplevel::WmCapabilities::Fullscreen,
+                    ]));
+                }
+
                 // Use a per-surface size if one was already configured
                 // (e.g. the browser sent C2S_SURFACE_RESIZE before the
                 // toplevel was created), otherwise fall back to the global
@@ -4287,11 +4388,7 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for Compositor {
                     .get(&surface_id)
                     .copied()
                     .unwrap_or((state.output_width, state.output_height));
-                let states = xdg_toplevel_states(&[
-                    xdg_toplevel::State::Activated,
-                    xdg_toplevel::State::Maximized,
-                ]);
-                toplevel.configure(cw, ch, states);
+                toplevel.configure(cw, ch, pane_states(false));
                 let serial = state.next_serial();
                 resource.configure(serial);
 
@@ -4465,7 +4562,7 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
     fn request(
         state: &mut Self,
         _: &Client,
-        _: &XdgToplevel,
+        toplevel: &XdgToplevel,
         request: <XdgToplevel as Resource>::Request,
         data: &XdgToplevelData,
         _: &DisplayHandle,
@@ -4514,6 +4611,9 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                 if let Some(surf) = state.surfaces.get_mut(wl_surface_id) {
                     let sid = surf.surface_id;
                     surf.xdg_toplevel = None;
+                    // The wl_surface outlives its toplevel and can be given a
+                    // new one; that one starts out not fullscreen.
+                    surf.xdg_fullscreen = false;
                     if sid > 0 {
                         state.toplevel_surface_ids.remove(&sid);
                         state.last_reported_size.remove(&sid);
@@ -4540,16 +4640,52 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                 // say no out loud.
                 state.reassert_toplevel_configure(&data.wl_surface_id);
             }
-            Request::SetMaximized
-            | Request::UnsetMaximized
-            | Request::SetFullscreen { .. }
-            | Request::UnsetFullscreen => {
-                // A pane is permanently activated and maximized, so none of
-                // these change anything.  Declining is our call to make;
-                // declining silently is not -- xdg-shell says each of them
-                // "will respond by emitting a configure event", and clients
-                // hold their own state pending until one arrives.
+            Request::SetMaximized | Request::UnsetMaximized => {
+                // A pane is permanently maximized, so neither of these
+                // changes anything.  Declining is our call to make; declining
+                // silently is not -- xdg-shell says each of them "will respond
+                // by emitting a configure event", and clients hold their own
+                // state pending until one arrives.
                 state.reassert_toplevel_configure(&data.wl_surface_id);
+            }
+            req @ (Request::SetFullscreen { .. } | Request::UnsetFullscreen) => {
+                // Granted, both ways.  Nothing about the pane changes -- it
+                // has no decorations and already fills its output, so it is
+                // fullscreen in all but name -- but the client is told what it
+                // asked for, because refusing costs a feature.  Chromium
+                // hands a video to the compositor and waits: a configure
+                // without `fullscreen` reads as a refusal, and it drops the
+                // page straight back out of fullscreen.  There is nothing to
+                // gain by saying no to a window that is already the whole
+                // screen.  We ignore the output argument; there is one.
+                let fullscreen = matches!(req, Request::SetFullscreen { .. });
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                    surf.xdg_fullscreen = fullscreen;
+                }
+                state.reassert_toplevel_configure(&data.wl_surface_id);
+            }
+            Request::SetMinSize { width, height } | Request::SetMaxSize { width, height } => {
+                // How small and how large the client says it can draw itself.
+                // Zero means "no opinion" for that dimension.
+                if width < 0 || height < 0 {
+                    toplevel.post_error(
+                        xdg_toplevel::Error::InvalidSize,
+                        format!("size hint must not be negative, got {width}x{height}"),
+                    );
+                    return;
+                }
+                let is_min = matches!(request, Request::SetMinSize { .. });
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                    if is_min {
+                        surf.pending_min_size = (width, height);
+                    } else {
+                        surf.pending_max_size = (width, height);
+                    }
+                }
+                // Double-buffered: nothing takes effect until commit, which is
+                // also where the pair is checked against each other.  A client
+                // is entitled to send a min above the old max as long as the
+                // new max arrives before the same commit.
             }
             _ => {}
         }
