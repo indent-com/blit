@@ -710,11 +710,9 @@ impl Engine {
             let _ = tx.send(rpc::frame(&rpc::notification("exit", Value::Null)));
         }
         if let Some(mut child) = self.child.take() {
-            let pid = child.id();
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
-                // The daemon's global reaper may win the race and steal
-                // the status; any error here means the child is gone.
+                // An `Err` means the child is already gone.
                 match child.try_wait() {
                     Ok(Some(_)) | Err(_) => break,
                     Ok(None) if Instant::now() >= deadline => {
@@ -725,7 +723,6 @@ impl Engine {
                     Ok(None) => std::thread::sleep(Duration::from_millis(50)),
                 }
             }
-            reap_backstop_status(pid);
         }
         // A query whose sender read `gone == false` before the store
         // above can enqueue after the first drain; answer it here, the
@@ -762,13 +759,11 @@ impl Engine {
         }
         self.io_tx = None;
         if let Some(mut child) = self.child.take() {
-            let pid = child.id();
             // Never leak a still-running child: escalate to kill.
             if matches!(child.try_wait(), Ok(None)) {
                 let _ = child.kill();
             }
             let _ = child.wait();
-            reap_backstop_status(pid);
         }
         // Every in-flight request dies with the session.
         let pending = std::mem::take(&mut self.pending);
@@ -1984,14 +1979,6 @@ fn encode_query(job: EncodeJob) {
     }
     respond(&q, LSP_STATUS_OK, flags, "", &buf);
 }
-
-/// Reap our own child so the daemon's global `waitpid(-1)` backstop
-/// does not have to. We `wait()` before this on every path; the
-/// backstop only parks statuses for PTY-owned pids (see
-/// `blit-server` `reap_zombies`), so an LSP child leaves nothing behind
-/// to collide with a later recycled pid (docs/design/lsp.md § Server
-/// implementation). This hook stays for symmetry and future backends.
-fn reap_backstop_status(_pid: u32) {}
 
 fn respond(q: &PendingQuery, status: u8, flags: u8, detail: &str, records: &[u8]) {
     debug_assert!(status == LSP_STATUS_OK || records.is_empty());
