@@ -9003,6 +9003,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 } else {
                     (24, 80)
                 };
+                // Straight off the wire and straight into the grid allocation.
+                let (rows, cols) = clamp_view_size(rows, cols);
                 let tag_len = if data.len() >= 7 {
                     u16::from_le_bytes([data[5], data[6]]) as usize
                 } else {
@@ -9095,6 +9097,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 } else {
                     (24, 80)
                 };
+                // Straight off the wire and straight into the grid allocation.
+                let (rows, cols) = clamp_view_size(rows, cols);
                 let tag_len = if data.len() >= 9 {
                     u16::from_le_bytes([data[7], data[8]]) as usize
                 } else {
@@ -9193,6 +9197,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 } else {
                     (24, 80)
                 };
+                // Straight off the wire and straight into the grid allocation.
+                let (rows, cols) = clamp_view_size(rows, cols);
                 let tag_len = if data.len() >= 7 {
                     u16::from_le_bytes([data[5], data[6]]) as usize
                 } else {
@@ -9264,8 +9270,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     continue;
                 }
                 let nonce = u16::from_le_bytes([data[1], data[2]]);
-                let rows = u16::from_le_bytes([data[3], data[4]]);
-                let cols = u16::from_le_bytes([data[5], data[6]]);
+                // Straight off the wire and straight into the grid allocation.
+                let (rows, cols) = clamp_view_size(
+                    u16::from_le_bytes([data[3], data[4]]),
+                    u16::from_le_bytes([data[5], data[6]]),
+                );
                 let features = data[7];
                 let tag_len = u16::from_le_bytes([data[8], data[9]]) as usize;
                 let tag = if data.len() >= 10 + tag_len {
