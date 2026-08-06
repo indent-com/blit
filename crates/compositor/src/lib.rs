@@ -261,6 +261,7 @@ mod stub {
             target_h: u32,
             native_w: u32,
             native_h: u32,
+            want_nv12_opaque: bool,
         },
         RestampTarget {
             surface_id: u32,

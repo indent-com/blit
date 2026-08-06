@@ -347,6 +347,14 @@ fn rptr(buf: &[u8], off: usize) -> *mut c_void {
 // NvencDirectEncoder
 // ---------------------------------------------------------------------------
 
+/// A compositor NV12 buffer imported into CUDA and registered with NVENC.
+/// Held for the encoder's lifetime so the per-frame path is map/encode/unmap
+/// only; see `NvencDirectEncoder::nv12_imports`.
+struct Nv12Import {
+    ext_mem: gpu_libs::CUexternalMemory,
+    registered: *mut c_void,
+}
+
 pub struct NvencDirectEncoder {
     encoder: *mut c_void,
     input_buffer: *mut c_void, // fallback NV_ENC input buffer (unused with CUDA path)
@@ -379,6 +387,15 @@ pub struct NvencDirectEncoder {
     /// without SPS/PPS (the default unless repeatSPSPPS is set, which
     /// requires fragile struct-offset manipulation).
     h264_sps_pps: Vec<u8>,
+    /// Imported NV12 buffers for the zero-copy path, keyed by the
+    /// compositor's `buf_id`.
+    ///
+    /// Importing and registering costs far more than the encode does, and
+    /// the compositor round-robins a small fixed set of buffers, so doing
+    /// it per frame would spend most of the win back. Keyed on `buf_id`
+    /// rather than the fd number because the kernel recycles fd numbers as
+    /// buffers are freed, and a stale hit would hand NVENC freed VRAM.
+    nv12_imports: HashMap<u64, Nv12Import>,
     /// `NV_ENC_INITIALIZE_PARAMS` and `NV_ENC_CONFIG` as initialized.
     /// Retained because `nvEncReconfigureEncoder` wants a complete
     /// `NV_ENC_INITIALIZE_PARAMS` again, and the driver forbids changing
@@ -959,6 +976,7 @@ impl NvencDirectEncoder {
             nv12_pitch,
             verbose,
             h264_sps_pps: Vec::new(),
+            nv12_imports: HashMap::new(),
             init_params: init_buf,
             encode_config: config_buf,
         })
@@ -1369,6 +1387,295 @@ impl NvencDirectEncoder {
         }
 
         result
+    }
+
+    /// Zero-copy encode of an NV12 buffer the compositor exported as
+    /// `OPAQUE_FD` — the pixels never leave the GPU.
+    ///
+    /// This is the path `encode_dmabuf_fd` was documented as being and
+    /// never was. The difference is the handle type: CUDA imports an
+    /// `OPAQUE_FD` (verified on nvidia-x11 595.84 / RTX 4090, including a
+    /// byte-pattern round trip through the mapped pointer) and refuses a
+    /// `dma_buf`.
+    ///
+    /// `sync_fd` is not optional in practice. An `OPAQUE_FD` allocation
+    /// carries none of the implicit fencing a `dma_buf` does, so without
+    /// waiting for the compositor's BGRA→NV12 compute pass we would encode
+    /// a partially-written buffer — intermittently, and worst under load.
+    ///
+    /// Returns `None` on any failure. Unlike the BGRA path there is no CPU
+    /// fallback available here: the allocation is DEVICE_LOCAL VRAM behind
+    /// a handle nothing can mmap, so a caller that wants one must arrange
+    /// not to be given this variant at all.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_nv12_opaque_fd(
+        &mut self,
+        fd: std::os::fd::RawFd,
+        buf_id: u64,
+        stride: u32,
+        uv_offset: u32,
+        width: u32,
+        height: u32,
+        sync_fd: Option<std::os::fd::RawFd>,
+    ) -> Option<(Vec<u8>, bool)> {
+        // NVENC's NV12 layout has no independent UV offset: the chroma
+        // plane is assumed to start at exactly stride*height. The compute
+        // shader already writes that layout, so a mismatch means the two
+        // sides have drifted apart and the encode would sample chroma from
+        // the wrong place — better to refuse than to emit wrong colour.
+        if uv_offset != stride * height {
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[nvenc-zerocopy] uv_offset {uv_offset} != stride*height {}; refusing",
+                    stride * height,
+                );
+            }
+            return None;
+        }
+
+        // Wait for the compute pass before touching the buffer.
+        if let Some(sync) = sync_fd {
+            let mut pfd = libc::pollfd {
+                fd: sync,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // 10 ms: at 60 fps the whole frame budget is ~16 ms, and the
+            // compute pass has normally long since finished by the time
+            // the encoder thread gets here — this is a guard, not a
+            // scheduling point. Timing out means we fall through and
+            // encode anyway, which is the same race we would have had
+            // without the fence; it is preferable to stalling delivery.
+            let n = unsafe { libc::poll(&mut pfd, 1, 10) };
+            if n <= 0 {
+                static LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("[nvenc-zerocopy] sync_fd poll timed out; frame may tear");
+                }
+            }
+        }
+
+        let cuda = gpu_libs::cuda().ok()?;
+        unsafe { (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx) };
+
+        // The session was created at self.width/self.height (even-rounded
+        // and clamped to the caps). Encoding at the source dimensions
+        // instead — as encode_dmabuf_fd does — hands NVENC dimensions the
+        // session was not configured for.
+        let enc_w = self.width;
+        let enc_h = self.height;
+
+        // The session's dimensions are even-rounded, so they can exceed the
+        // compositor's by a pixel; anything more means the two disagree
+        // about the frame, and encoding would read past the buffer's rows.
+        if width < enc_w || height < enc_h {
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[nvenc-zerocopy] NV12 buffer {width}x{height} smaller than session {enc_w}x{enc_h}; refusing",
+                );
+            }
+            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
+            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+            return None;
+        }
+
+        let registered = match self.nv12_import(cuda, fd, buf_id, stride, height, enc_w, enc_h) {
+            Some(r) => r,
+            None => {
+                let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
+                unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+                return None;
+            }
+        };
+
+        // Map, encode, unmap. The registration is cached; the mapping is
+        // per-frame, as NVENC requires.
+        let mut map_buf = vec![0u8; NVENC_MAP_INPUT_RESOURCE_SIZE];
+        w32(&mut map_buf, 0, NV_ENC_MAP_INPUT_RESOURCE_VER);
+        wptr(&mut map_buf, 16, registered);
+        let nv_status = unsafe {
+            (self.fns.nvEncMapInputResource)(self.encoder, map_buf.as_mut_ptr() as *mut c_void)
+        };
+        if nv_status != NV_ENC_SUCCESS {
+            eprintln!("[nvenc-zerocopy] nvEncMapInputResource failed: {nv_status}");
+            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
+            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+            return None;
+        }
+        let mapped_resource = rptr(&map_buf, 24);
+
+        let mut pic_buf = vec![0u8; NVENC_PIC_PARAMS_SIZE];
+        w32(&mut pic_buf, 0, NV_ENC_PIC_PARAMS_VER);
+        w32(&mut pic_buf, 4, enc_w);
+        w32(&mut pic_buf, 8, enc_h);
+        w32(&mut pic_buf, 12, stride);
+        w32(&mut pic_buf, 20, self.frame_idx);
+        w64(&mut pic_buf, 24, self.frame_idx as u64);
+        wptr(&mut pic_buf, 40, mapped_resource);
+        wptr(&mut pic_buf, 48, self.output_buffer);
+        w32(&mut pic_buf, 64, NV_ENC_BUFFER_FORMAT_NV12);
+        w32(&mut pic_buf, 68, 1); // NV_ENC_PIC_STRUCT_FRAME
+        if self.force_idr {
+            // OUTPUT_SPSPPS (0x4) so AV1 keyframes carry the sequence
+            // header OBU and H.264 IDRs carry SPS/PPS — decoders joining
+            // mid-stream cannot decode a forced keyframe without it.
+            w32(&mut pic_buf, 16, NV_ENC_PIC_FLAGS_FORCEIDR | 0x4);
+            w32(&mut pic_buf, 72, NV_ENC_PIC_TYPE_IDR);
+        }
+        self.frame_idx += 1;
+
+        let nv_status = unsafe {
+            (self.fns.nvEncEncodePicture)(self.encoder, pic_buf.as_mut_ptr() as *mut c_void)
+        };
+        let result = if nv_status == NV_ENC_SUCCESS {
+            self.force_idr = false;
+            let mut lock_buf = vec![0u8; NVENC_LOCK_BITSTREAM_SIZE];
+            w32(&mut lock_buf, 0, NV_ENC_LOCK_BITSTREAM_VER);
+            wptr(&mut lock_buf, 8, self.output_buffer);
+            let lock_status = unsafe {
+                (self.fns.nvEncLockBitstream)(self.encoder, lock_buf.as_mut_ptr() as *mut c_void)
+            };
+            if lock_status == NV_ENC_SUCCESS {
+                let size = r32(&lock_buf, 36) as usize;
+                let buf_ptr = rptr(&lock_buf, 56) as *const u8;
+                let nal_data = if !buf_ptr.is_null() && size > 0 {
+                    unsafe { std::slice::from_raw_parts(buf_ptr, size) }.to_vec()
+                } else {
+                    Vec::new()
+                };
+                let is_idr = self.is_keyframe_pic_type(r32(&lock_buf, 64));
+                unsafe { (self.fns.nvEncUnlockBitstream)(self.encoder, self.output_buffer) };
+                if nal_data.is_empty() {
+                    None
+                } else {
+                    let mut nal_data = nal_data;
+                    self.ensure_h264_sps_pps(&mut nal_data, is_idr);
+                    Some((nal_data, is_idr))
+                }
+            } else {
+                None
+            }
+        } else {
+            if nv_status != NV_ENC_ERR_NEED_MORE_INPUT {
+                eprintln!("[nvenc-zerocopy] nvEncEncodePicture failed: {nv_status}");
+            }
+            None
+        };
+
+        unsafe { (self.fns.nvEncUnmapInputResource)(self.encoder, mapped_resource) };
+        let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
+        unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+
+        if result.is_some() {
+            static LOGGED_OK: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED_OK.swap(true, std::sync::atomic::Ordering::Relaxed) && self.verbose {
+                eprintln!("[nvenc-zerocopy] zero-copy encode ok {enc_w}x{enc_h} stride={stride}");
+            }
+        }
+        result
+    }
+
+    /// Import + register an NV12 `OPAQUE_FD` buffer, or return the cached
+    /// registration for one we have already imported.  Caller must hold the
+    /// CUDA context.  Returns the NVENC registered-resource handle.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    fn nv12_import(
+        &mut self,
+        cuda: &gpu_libs::CudaFns,
+        fd: std::os::fd::RawFd,
+        buf_id: u64,
+        stride: u32,
+        height: u32,
+        enc_w: u32,
+        enc_h: u32,
+    ) -> Option<*mut c_void> {
+        if let Some(prev) = self.nv12_imports.get(&buf_id) {
+            return Some(prev.registered);
+        }
+        let cu_import = cuda.cuImportExternalMemory?;
+        let cu_get_buf = cuda.cuExternalMemoryGetMappedBuffer?;
+        let cu_destroy = cuda.cuDestroyExternalMemory?;
+
+        let buf_size = (stride as u64) * (height as u64) * 3 / 2;
+
+        // CUDA takes ownership of the fd on success, so hand it a dup —
+        // the compositor still owns the original and reuses it every frame.
+        let dup_fd = unsafe { libc::dup(fd) };
+        if dup_fd < 0 {
+            return None;
+        }
+
+        // See gpu_libs::cu_ext_mem_desc for why these offsets are what they
+        // are; getting `size` wrong fails every import with INVALID_VALUE.
+        let mut desc = [0u8; gpu_libs::cu_ext_mem_desc::BYTES];
+        let d = &mut desc;
+        d[gpu_libs::cu_ext_mem_desc::TYPE..][..4]
+            .copy_from_slice(&gpu_libs::CU_EXTERNAL_HANDLE_TYPE_OPAQUE_FD.to_ne_bytes());
+        d[gpu_libs::cu_ext_mem_desc::FD..][..4].copy_from_slice(&dup_fd.to_ne_bytes());
+        d[gpu_libs::cu_ext_mem_desc::SIZE..][..8].copy_from_slice(&buf_size.to_ne_bytes());
+
+        let mut ext_mem: gpu_libs::CUexternalMemory = ptr::null_mut();
+        let status = unsafe { cu_import(&mut ext_mem, desc.as_ptr() as *const _) };
+        if status != 0 {
+            unsafe { libc::close(dup_fd) };
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[nvenc-zerocopy] cuImportExternalMemory failed: {status}");
+            }
+            return None;
+        }
+        // fd ownership transferred to CUDA — do not close dup_fd.
+
+        let mut buf_desc = [0u8; 128];
+        buf_desc[8..16].copy_from_slice(&buf_size.to_ne_bytes()); // size @ 8
+        let mut devptr: gpu_libs::CUdeviceptr = 0;
+        let status = unsafe { cu_get_buf(&mut devptr, ext_mem, buf_desc.as_ptr() as *const _) };
+        if status != 0 {
+            unsafe { cu_destroy(ext_mem) };
+            eprintln!("[nvenc-zerocopy] cuExternalMemoryGetMappedBuffer failed: {status}");
+            return None;
+        }
+
+        let mut reg_buf = vec![0u8; NVENC_REGISTER_RESOURCE_SIZE];
+        w32(&mut reg_buf, 0, NV_ENC_REGISTER_RESOURCE_VER);
+        w32(&mut reg_buf, 4, NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR);
+        w32(&mut reg_buf, 8, enc_w);
+        w32(&mut reg_buf, 12, enc_h);
+        w32(&mut reg_buf, 16, stride);
+        wptr(&mut reg_buf, 24, devptr as *mut c_void);
+        w32(&mut reg_buf, 40, NV_ENC_BUFFER_FORMAT_NV12);
+        let nv_status = unsafe {
+            (self.fns.nvEncRegisterResource)(self.encoder, reg_buf.as_mut_ptr() as *mut c_void)
+        };
+        if nv_status != NV_ENC_SUCCESS {
+            unsafe { cu_destroy(ext_mem) };
+            eprintln!("[nvenc-zerocopy] nvEncRegisterResource failed: {nv_status}");
+            return None;
+        }
+        let registered = rptr(&reg_buf, 32);
+
+        if self.verbose {
+            eprintln!(
+                "[nvenc-zerocopy] imported NV12 buf_id={buf_id} {enc_w}x{enc_h} stride={stride} size={buf_size}",
+            );
+        }
+        self.nv12_imports.insert(
+            buf_id,
+            Nv12Import {
+                ext_mem,
+                registered,
+            },
+        );
+        Some(registered)
     }
 
     pub fn codec_flag(&self) -> u8 {
@@ -1908,6 +2215,17 @@ impl Drop for NvencDirectEncoder {
             }
             if !self.cuda_registered_nv12.is_null() {
                 (self.fns.nvEncUnregisterResource)(self.encoder, self.cuda_registered_nv12);
+            }
+            // Zero-copy imports: unregister before the encoder goes, and
+            // release the CUDA side (which also closes the dup'd fd it took
+            // ownership of at import).
+            for (_, imp) in self.nv12_imports.drain() {
+                (self.fns.nvEncUnregisterResource)(self.encoder, imp.registered);
+                if let Ok(cuda) = gpu_libs::cuda()
+                    && let Some(destroy) = cuda.cuDestroyExternalMemory
+                {
+                    destroy(imp.ext_mem);
+                }
             }
             (self.fns.nvEncDestroyInputBuffer)(self.encoder, self.input_buffer);
             (self.fns.nvEncDestroyBitstreamBuffer)(self.encoder, self.output_buffer);

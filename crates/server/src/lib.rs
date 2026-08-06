@@ -5834,10 +5834,19 @@ async fn tick(state: &AppState) -> TickOutcome {
                         cs.handle.wake();
                     } else if let Some(cs) = sess.compositor.as_mut() {
                         // No GBM externals — register a server-allocated
-                        // BGRA downscale target so the compositor can
-                        // GPU-blit the native composite into target-sized
-                        // BGRA for this encoder.  Idempotent in the
-                        // renderer.
+                        // downscale target so the compositor can GPU-blit
+                        // the native composite into target-sized pixels for
+                        // this encoder.  Idempotent in the renderer.
+                        //
+                        // NVENC additionally asks for the NV12 OPAQUE_FD
+                        // shape, which converts on the GPU and hands over a
+                        // handle CUDA can import — skipping the readback
+                        // into staging and the Vec that used to carry it.
+                        // Every other backend needs pixels on the CPU and
+                        // takes the BGRA path. The renderer falls back to
+                        // BGRA on its own if the export fails, so this
+                        // stays a request rather than a commitment.
+                        let want_nv12_opaque = encoder.wants_nv12_opaque_fd();
                         let _ = cs.handle.command_tx.send(
                             blit_compositor::CompositorCommand::RegisterDownscaleTarget {
                                 surface_id: result.sid as u32,
@@ -5845,6 +5854,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 target_h: th,
                                 native_w: result.native_w,
                                 native_h: result.native_h,
+                                want_nv12_opaque,
                             },
                         );
                         cs.handle.wake();

@@ -65,6 +65,14 @@ pub(crate) struct VulkanRenderer {
     has_video_encode_av1: bool,
     /// Whether the device supports DMA-BUF import/export extensions.
     has_dmabuf: bool,
+    /// Set by an on-demand consumer (capture) to make the next retire
+    /// publish the native BGRA even when an NV12 OPAQUE_FD target would
+    /// otherwise claim that key.  The staging copy happens every frame
+    /// regardless; what this re-enables is the `to_vec` that publishes it,
+    /// which is one of the two per-frame full-surface copies the
+    /// zero-copy path exists to avoid paying when nobody wants CPU pixels.
+    publish_native_bgra_once: bool,
+    has_external_memory_fd: bool,
 
     // Render pipeline
     render_pass: vk::RenderPass,
@@ -200,11 +208,51 @@ struct ExternalOutput {
 }
 
 /// NV12 output for zero-copy encode.
+/// Source of `Nv12Output::buf_id`.  Global rather than per-renderer so
+/// ids stay unique across renderer teardown and recreation.
+static NEXT_NV12_BUF_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_nv12_buf_id() -> u64 {
+    NEXT_NV12_BUF_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How an NV12 output's memory is exported, and therefore who can read it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Nv12Export {
+    /// Not exported at all — compositor-owned memory read on this same
+    /// device by Vulkan Video. No fd, no importer, no handle type.
+    None,
+    /// `dma_buf` — VA-API imports these, and they carry implicit fencing.
+    DmaBuf,
+    /// An NVIDIA-internal handle. The only importer is CUDA (NVENC):
+    /// `cuImportExternalMemory` accepts `OPAQUE_FD` and refuses `dma_buf`.
+    /// Carries no implicit fencing, so a consumer must be handed a sync_fd.
+    OpaqueFd,
+}
+
+impl Nv12Export {
+    /// Only meaningful for the exported variants; `create_nv12_outputs` is
+    /// never called for `None`, whose memory stays on this device.
+    fn handle_type(self) -> vk::ExternalMemoryHandleTypeFlags {
+        match self {
+            Nv12Export::None => vk::ExternalMemoryHandleTypeFlags::empty(),
+            Nv12Export::DmaBuf => vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+            Nv12Export::OpaqueFd => vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD,
+        }
+    }
+}
+
 struct Nv12Output {
-    /// The DMA-BUF this plane set was imported from, kept alive for as long
-    /// as the image is.  `None` for the compositor's own encode image, which
-    /// owns device-local memory and is never handed to another API.
+    /// The DMA-BUF this plane set was imported from, or the OPAQUE_FD it was
+    /// exported as, kept alive for as long as the image is.  `None` for the
+    /// compositor's own encode image, which owns device-local memory and is
+    /// never handed to another API.
     fd: Option<Arc<OwnedFd>>,
+    /// Process-unique id for this allocation.  Consumers cache GPU-side
+    /// registrations against it: an fd number alone is not safe to key on,
+    /// since closing a buffer frees its number for the next one to reuse,
+    /// and a stale cache hit would point NVENC at freed VRAM.
+    buf_id: u64,
     descriptor_set: vk::DescriptorSet,
     /// NV12 surface dimensions (encoder-padded, may be larger than source).
     width: u32,
@@ -213,6 +261,9 @@ struct Nv12Output {
     /// subsampled NV12.  Decides which compute shader fills the planes.
     is_444: bool,
     kind: Nv12OutputKind,
+    /// Which export `fd` came from — decides which `PixelData` variant this
+    /// becomes, and whether the consumer needs an explicit sync_fd.
+    export: Nv12Export,
 }
 
 enum Nv12OutputKind {
@@ -474,9 +525,22 @@ impl VulkanRenderer {
         if !has_dmabuf {
             eprintln!("[vulkan-render] DMA-BUF extensions not available, SHM-only mode");
         }
+        // Exporting memory as OPAQUE_FD needs only these two — no dma_buf,
+        // no DRM modifiers.  Probed apart from `has_dmabuf` because the
+        // NVENC zero-copy path must survive on a host with no dma_buf
+        // support at all, which is precisely where it earns its keep.
+        let external_memory_fd_extensions: &[&std::ffi::CStr] = &[
+            ash::khr::external_memory::NAME,
+            ash::khr::external_memory_fd::NAME,
+        ];
+        let has_external_memory_fd = external_memory_fd_extensions
+            .iter()
+            .all(|e| ext_names_all.contains(e));
         let mut device_extensions: Vec<*const std::ffi::c_char> = Vec::new();
         if has_dmabuf {
             device_extensions.extend(dmabuf_extensions.iter().map(|e| e.as_ptr()));
+        } else if has_external_memory_fd {
+            device_extensions.extend(external_memory_fd_extensions.iter().map(|e| e.as_ptr()));
         }
         if has_external_fence_fd {
             device_extensions.push(ash::khr::external_fence::NAME.as_ptr());
@@ -977,6 +1041,8 @@ impl VulkanRenderer {
             has_video_encode,
             has_video_encode_av1,
             has_dmabuf,
+            publish_native_bgra_once: false,
+            has_external_memory_fd,
             render_pass,
             pipeline_layout,
             pipeline,
@@ -1176,6 +1242,14 @@ impl VulkanRenderer {
     /// Whether the device supports DMA-BUF import/export extensions.
     pub(crate) fn has_dmabuf(&self) -> bool {
         self.has_dmabuf
+    }
+
+    /// Ask the next retire to publish the native BGRA even if an NV12
+    /// OPAQUE_FD target would otherwise claim that key.  For consumers that
+    /// need CPU pixels and can say so — `surface capture` — rather than
+    /// keeping the readback published every frame on the chance one comes.
+    pub(crate) fn request_native_bgra(&mut self) {
+        self.publish_native_bgra_once = true;
     }
 
     // ---------------------------------------------------------------
@@ -1532,6 +1606,8 @@ impl VulkanRenderer {
                     target_h,
                     buffers[0].width,
                     buffers[0].height,
+                    // VA-API is the consumer here; it imports dma_bufs.
+                    Nv12Export::DmaBuf,
                 );
             }
         }
@@ -1603,6 +1679,7 @@ impl VulkanRenderer {
         target_w: u32,
         target_h: u32,
         native: (u32, u32),
+        want_nv12_opaque: bool,
     ) {
         let key = (surface_id, target_w, target_h);
         // Recorded before the early return: the same target size can be
@@ -1620,6 +1697,31 @@ impl VulkanRenderer {
             return;
         };
         self.downscale_outputs.insert(key, out);
+
+        // The BGRA image above is still the compute pass's source, so it is
+        // allocated either way; what the NV12 buffer removes is everything
+        // downstream of it — the image→staging copy and the `to_vec()` that
+        // publishes it. Best-effort: a failure here leaves the plain BGRA
+        // target registered and the caller simply keeps its old path.
+        if want_nv12_opaque {
+            self.create_nv12_outputs(
+                surface_id,
+                target_w,
+                target_h,
+                target_w,
+                target_h,
+                Nv12Export::OpaqueFd,
+            );
+            let ok = self
+                .nv12_outputs
+                .get(&key)
+                .is_some_and(|(v, _)| !v.is_empty());
+            eprintln!(
+                "[vulkan-render] registered downscale target sid {surface_id} {target_w}x{target_h} (nv12 opaque-fd: {})",
+                if ok { "yes" } else { "FAILED, using BGRA" },
+            );
+            return;
+        }
         eprintln!(
             "[vulkan-render] registered downscale target sid {surface_id} {target_w}x{target_h}",
         );
@@ -1725,7 +1827,18 @@ impl VulkanRenderer {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+            // STORAGE + MUTABLE_FORMAT so the BGRA→NV12 compute shader can
+            // read this image through an R8G8B8A8 storage view, matching
+            // the native output image. Without them that view is invalid,
+            // `dispatch_nv12_compute` bails before writing anything, and
+            // the encoder gets a buffer nobody filled — which reaches the
+            // viewer as a black picture, not as an error.
+            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
+            .usage(
+                vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::STORAGE,
+            )
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let image = unsafe {
@@ -2227,6 +2340,17 @@ impl VulkanRenderer {
         self.owned_encode_nv12.clear();
     }
 
+    /// Whether this target converts to NV12 in an `OPAQUE_FD` buffer — i.e.
+    /// takes the NVENC zero-copy path rather than the BGRA staging one.
+    fn nv12_opaque_slot(&self, surface_id: u32, target_w: u32, target_h: u32) -> Option<usize> {
+        let (v, idx) = self.nv12_outputs.get(&(surface_id, target_w, target_h))?;
+        if v.is_empty() {
+            return None;
+        }
+        let i = idx % v.len();
+        (v[i].export == Nv12Export::OpaqueFd).then_some(i)
+    }
+
     /// Allocate NV12 output planes for the BGRA→NV12 compute path.
     fn create_nv12_outputs(
         &mut self,
@@ -2235,10 +2359,17 @@ impl VulkanRenderer {
         target_h: u32,
         w: u32,
         h: u32,
+        export: Nv12Export,
     ) {
-        if !self.has_dmabuf {
-            return;
+        // DMA-BUF export needs the dma_buf extensions; OPAQUE_FD does not,
+        // and must not be gated on them — an NVIDIA-only host is exactly
+        // where the OPAQUE_FD path is the whole point.
+        match export {
+            Nv12Export::DmaBuf if !self.has_dmabuf => return,
+            Nv12Export::OpaqueFd if !self.has_external_memory_fd => return,
+            _ => {}
         }
+        let handle_type = export.handle_type();
         use std::os::fd::FromRawFd;
         self.destroy_nv12_outputs_for_target(surface_id, target_w, target_h);
 
@@ -2262,8 +2393,8 @@ impl VulkanRenderer {
 
         for _ in 0..3 {
             let Some(nv12) = (|| -> Option<Nv12Output> {
-                let mut ext_info = vk::ExternalMemoryBufferCreateInfo::default()
-                    .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+                let mut ext_info =
+                    vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
                 let buf_info = vk::BufferCreateInfo::default()
                     .size(buf_size)
                     .usage(
@@ -2273,44 +2404,66 @@ impl VulkanRenderer {
                     .push_next(&mut ext_info);
                 let buffer = unsafe { self.device.create_buffer(&buf_info, None).ok()? };
                 let reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
-                // Prefer HOST_VISIBLE so CPU encoders (x264 etc) can
-                // mmap the exported DMA-BUF for their fallback read path.
-                // DEVICE_LOCAL-only memory on discrete AMD is not
+                // DMA-BUF prefers HOST_VISIBLE so CPU encoders (x264 etc)
+                // can mmap the exported buffer for their fallback read
+                // path.  DEVICE_LOCAL-only memory on discrete AMD is not
                 // CPU-mappable, which silently fails the encoder's mmap
                 // and turns thumbnails black.  DEVICE_LOCAL|HOST_VISIBLE
                 // (unified memory / iGPU) is preferred when available.
-                let mem_type = self
-                    .find_memory_type(
-                        reqs.memory_type_bits,
-                        vk::MemoryPropertyFlags::HOST_VISIBLE
-                            | vk::MemoryPropertyFlags::HOST_COHERENT
-                            | vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                    )
-                    .or_else(|| {
-                        self.find_memory_type(
-                            reqs.memory_type_bits,
-                            vk::MemoryPropertyFlags::HOST_VISIBLE
-                                | vk::MemoryPropertyFlags::HOST_COHERENT,
-                        )
-                    })
-                    .or_else(|| {
-                        self.find_memory_type(
+                //
+                // OPAQUE_FD inverts that: its only consumer is CUDA, which
+                // reads on the GPU, and nothing can mmap the handle anyway.
+                // Asking for HOST_VISIBLE there would land the NV12 buffer
+                // in a slower heap for no reader's benefit.
+                let mem_type = match export {
+                    Nv12Export::OpaqueFd => self
+                        .find_memory_type(
                             reqs.memory_type_bits,
                             vk::MemoryPropertyFlags::DEVICE_LOCAL,
                         )
-                    })
-                    .or_else(|| {
-                        self.find_memory_type(
+                        .or_else(|| {
+                            self.find_memory_type(
+                                reqs.memory_type_bits,
+                                vk::MemoryPropertyFlags::empty(),
+                            )
+                        }),
+                    // `None` cannot reach here — that variant's memory comes
+                    // from `create_nv12_encode_image`, not this function —
+                    // but prefer the mappable heap over panicking if that
+                    // ever changes.
+                    Nv12Export::None | Nv12Export::DmaBuf => self
+                        .find_memory_type(
                             reqs.memory_type_bits,
-                            vk::MemoryPropertyFlags::empty(),
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT
+                                | vk::MemoryPropertyFlags::DEVICE_LOCAL,
                         )
-                    })?;
-                let mut export = vk::ExportMemoryAllocateInfo::default()
-                    .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+                        .or_else(|| {
+                            self.find_memory_type(
+                                reqs.memory_type_bits,
+                                vk::MemoryPropertyFlags::HOST_VISIBLE
+                                    | vk::MemoryPropertyFlags::HOST_COHERENT,
+                            )
+                        })
+                        .or_else(|| {
+                            self.find_memory_type(
+                                reqs.memory_type_bits,
+                                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                            )
+                        })
+                        .or_else(|| {
+                            self.find_memory_type(
+                                reqs.memory_type_bits,
+                                vk::MemoryPropertyFlags::empty(),
+                            )
+                        }),
+                }?;
+                let mut export_info =
+                    vk::ExportMemoryAllocateInfo::default().handle_types(handle_type);
                 let alloc = vk::MemoryAllocateInfo::default()
                     .allocation_size(reqs.size)
                     .memory_type_index(mem_type)
-                    .push_next(&mut export);
+                    .push_next(&mut export_info);
                 let memory = unsafe { self.device.allocate_memory(&alloc, None).ok()? };
                 if unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }.is_err() {
                     unsafe {
@@ -2321,7 +2474,7 @@ impl VulkanRenderer {
                 }
                 let fd_info = vk::MemoryGetFdInfoKHR::default()
                     .memory(memory)
-                    .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+                    .handle_type(handle_type);
                 let mut raw_fd: i32 = -1;
                 if unsafe { get_fd_fp(self.device.handle(), &fd_info, &mut raw_fd) }
                     != vk::Result::SUCCESS
@@ -2354,6 +2507,7 @@ impl VulkanRenderer {
 
                 Some(Nv12Output {
                     fd: Some(fd),
+                    buf_id: next_nv12_buf_id(),
                     descriptor_set,
                     width: w,
                     height: h,
@@ -2365,6 +2519,7 @@ impl VulkanRenderer {
                         stride,
                         uv_offset,
                     },
+                    export,
                 })
             })() else {
                 eprintln!("[vulkan-render] failed to create NV12 buffer {w}x{h}");
@@ -2526,10 +2681,13 @@ impl VulkanRenderer {
 
         Some(Nv12Output {
             fd: Some(fd),
+            buf_id: next_nv12_buf_id(),
             descriptor_set,
             width: w,
             height: h,
             is_444: false,
+            // Imported from a VA-API-exported dma_buf.
+            export: Nv12Export::DmaBuf,
             kind: Nv12OutputKind::Buffer {
                 buffer,
                 memory,
@@ -2753,11 +2911,14 @@ impl VulkanRenderer {
 
         Some(Nv12Output {
             fd: Some(fd),
+            buf_id: next_nv12_buf_id(),
             descriptor_set,
             width: w,
             height: h,
             // VA-API exports NV12 planes; 4:4:4 is the compositor-owned path.
             is_444: false,
+            // Tiled NV12 imported from a VA-API-exported dma_buf.
+            export: Nv12Export::DmaBuf,
             kind: Nv12OutputKind::Image {
                 image,
                 y_memory,
@@ -2975,10 +3136,14 @@ impl VulkanRenderer {
 
         Some(Nv12Output {
             fd: None,
+            buf_id: next_nv12_buf_id(),
             descriptor_set,
             width: w,
             height: h,
             is_444,
+            // Compositor-owned memory read by Vulkan Video on this same
+            // device — never exported, so no importer and no handle type.
+            export: Nv12Export::None,
             kind: Nv12OutputKind::Image {
                 image,
                 y_memory: memory,
@@ -3037,7 +3202,21 @@ impl VulkanRenderer {
             )
         } {
             Ok(v) => v,
-            Err(_) => return,
+            Err(e) => {
+                // Silence here is expensive: we return before even zeroing
+                // the NV12 buffer, so the encoder reads whatever was in it
+                // and the viewer gets a black picture with nothing logged
+                // to say why.
+                static LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[vulkan-render] NV12 compute: BGRA storage view failed ({e}); \
+                         source image needs STORAGE usage + MUTABLE_FORMAT",
+                    );
+                }
+                return;
+            }
         };
 
         // Update binding 0 (BGRA input) for this frame.
@@ -4454,13 +4633,36 @@ impl VulkanRenderer {
                 // `create_output_image`. Both used to wrap the same way, so
                 // the read stayed in bounds by coincidence rather than by
                 // construction.
-                let size = pending.phys_w as usize * pending.phys_h as usize * 4;
-                let bgra = unsafe { std::slice::from_raw_parts(img.staging_ptr, size) }.to_vec();
-                results.push((
-                    pending.phys_w,
-                    pending.phys_h,
-                    PixelData::Bgra(Arc::new(bgra)),
-                ));
+                // An NV12 OPAQUE_FD target at the composite size has
+                // already published this frame under the same key, from
+                // the GPU, without a readback. Publishing BGRA on top
+                // would overwrite it a tick later and put NVENC straight
+                // back on the copy this path exists to remove — and the
+                // `to_vec()` right below is one of the two copies.
+                //
+                // Unless something wants CPU pixels right now. `surface
+                // capture` asks on demand, and the staging buffer is
+                // filled every frame regardless, so the pixels are already
+                // sitting there — only the copy that publishes them is
+                // skipped. One BGRA frame reaching the encoder instead of
+                // NV12 needs no coordination: it encodes either.
+                let wanted_now = std::mem::take(&mut self.publish_native_bgra_once);
+                if !wanted_now
+                    && self
+                        .nv12_opaque_slot(pending.surface_id, pending.phys_w, pending.phys_h)
+                        .is_some()
+                {
+                    // fall through to cleanup
+                } else {
+                    let size = pending.phys_w as usize * pending.phys_h as usize * 4;
+                    let bgra =
+                        unsafe { std::slice::from_raw_parts(img.staging_ptr, size) }.to_vec();
+                    results.push((
+                        pending.phys_w,
+                        pending.phys_h,
+                        PixelData::Bgra(Arc::new(bgra)),
+                    ));
+                }
             }
         } else {
             eprintln!(
@@ -4807,7 +5009,16 @@ impl VulkanRenderer {
                 // Any encoder sized to the whole surface — the common
                 // case whenever the client needs no downscale — lands
                 // here on every frame.
-                if (key.1, key.2) == (phys_w, phys_h) {
+                //
+                // Unless it converts to NV12: then the target is not a
+                // second copy of the native pixels but the only thing the
+                // encoder can read, and skipping it is what would leave
+                // NVENC on the staging readback. `retire_pending` drops
+                // the BGRA publish for this key in that case, so the two
+                // do not both claim it.
+                if (key.1, key.2) == (phys_w, phys_h)
+                    && self.nv12_opaque_slot(sid, key.1, key.2).is_none()
+                {
                     return false;
                 }
                 let ok = fits_composite(&self.target_natives, key.1, key.2);
@@ -5297,7 +5508,9 @@ impl VulkanRenderer {
                 );
             }
 
-            // Transition to TRANSFER_SRC_OPTIMAL for the buffer copy.
+            // Transition to TRANSFER_SRC_OPTIMAL — for the buffer copy, or
+            // as the layout `dispatch_nv12_compute` expects to move to
+            // GENERAL from.
             let to_src = vk::ImageMemoryBarrier::default()
                 .image(ds_image)
                 .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -5321,6 +5534,22 @@ impl VulkanRenderer {
                     &[],
                     &[to_src],
                 );
+            }
+
+            // NVENC zero-copy: convert straight into the OPAQUE_FD NV12
+            // buffer and stop.  The staging copy below, and the `to_vec()`
+            // in `retire_pending` that reads it, are the two per-frame
+            // full-surface copies this whole path exists to remove — so
+            // skipping them is the point, not an optimisation on top.
+            if let Some((nv12_vec, nv12_idx)) = self
+                .nv12_outputs
+                .get(&(sid, tw, th))
+                .filter(|(v, _)| !v.is_empty())
+                .map(|(v, i)| (v, *i % v.len()))
+                && nv12_vec[nv12_idx].export == Nv12Export::OpaqueFd
+            {
+                self.dispatch_nv12_compute(cb, ds_image, nv12_vec, nv12_idx, tw, th, true);
+                continue;
             }
 
             let region = vk::BufferImageCopy {
@@ -5459,15 +5688,23 @@ impl VulkanRenderer {
         // export is needed we submit two signal targets: an
         // export-only fence (consumed by sync_fd) and a separate
         // tracking fence we use to retire `cb` and per-frame textures.
+        //
+        // Every OPAQUE_FD target needs it too, and unconditionally: a
+        // dma_buf carries implicit fencing that orders a later importer
+        // against our writes, and an OPAQUE_FD allocation carries none. If
+        // the export fails there we must not publish the buffer at all —
+        // see the emit below.
         let needs_sync_fd_export = self.external_fence_fd_fn.is_some()
-            && external_targets.iter().any(|&(tw, th, _)| {
+            && (external_targets.iter().any(|&(tw, th, _)| {
                 self.nv12_outputs
                     .get(&(sid, tw, th))
                     .is_some_and(|(v, idx)| {
                         !v.is_empty()
                             && matches!(v[idx % v.len()].kind, Nv12OutputKind::Image { .. })
                     })
-            });
+            }) || downscale_targets
+                .iter()
+                .any(|&(tw, th)| self.nv12_opaque_slot(sid, tw, th).is_some()));
 
         let tracking_fence = unsafe {
             match self
@@ -5634,6 +5871,15 @@ impl VulkanRenderer {
             }
         }
 
+        // Split the targets by who publishes them.  An OPAQUE_FD target
+        // wrote NV12 and never touched its staging buffer, so leaving it in
+        // `downscale_targets` would have `retire_pending` read that stale
+        // staging and publish a `Bgra` frame over the top of the NV12 one.
+        type Targets = Vec<(u32, u32)>;
+        let (nv12_opaque_targets, staging_targets): (Targets, Targets) = downscale_targets
+            .iter()
+            .partition(|&&(tw, th)| self.nv12_opaque_slot(sid, tw, th).is_some());
+
         let submit_info = PendingSubmit {
             fence,
             cb,
@@ -5642,7 +5888,7 @@ impl VulkanRenderer {
             phys_w,
             phys_h,
             surface_id: sid,
-            downscale_targets: downscale_targets.clone(),
+            downscale_targets: staging_targets,
             toplevel_sid,
         };
 
@@ -5685,6 +5931,62 @@ impl VulkanRenderer {
             } else {
                 None
             };
+
+        // NVENC zero-copy targets.  Published immediately, like the
+        // external ones and for the same reason: the consumer synchronises
+        // itself against `sync_fd` rather than us blocking here.
+        //
+        // Without a sync_fd we publish nothing. There is no implicit
+        // fencing behind an OPAQUE_FD allocation, so handing it over
+        // unsynchronised would let NVENC read a buffer the compute pass is
+        // still writing — which shows up as intermittent tearing under
+        // load rather than as an obvious failure. Dropping the frame
+        // instead leaves the encoder with nothing to send for this tick,
+        // which is visible and safe.
+        for &(tw, th) in &nv12_opaque_targets {
+            let Some(idx) = self.nv12_opaque_slot(sid, tw, th) else {
+                continue;
+            };
+            let Some(sync) = shared_sync_fd.clone() else {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[vulkan-render] NV12 opaque-fd target {tw}x{th} has no sync_fd; dropping frames rather than racing the encoder",
+                    );
+                }
+                continue;
+            };
+            let nv12 = &self.nv12_outputs[&(sid, tw, th)].0[idx];
+            let Nv12OutputKind::Buffer {
+                stride, uv_offset, ..
+            } = nv12.kind
+            else {
+                continue;
+            };
+            // An OPAQUE_FD slot always carries its exported fd; the `None`
+            // case is the compositor's own Vulkan Video image, which
+            // `nv12_opaque_slot` does not select.
+            let Some(fd) = nv12.fd.clone() else { continue };
+            results.push((
+                toplevel_sid,
+                tw,
+                th,
+                PixelData::Nv12OpaqueFd {
+                    fd,
+                    buf_id: nv12.buf_id,
+                    stride,
+                    uv_offset,
+                    width: nv12.width,
+                    height: nv12.height,
+                    sync_fd: Some(sync),
+                },
+            ));
+            if let Some(entry) = self.nv12_outputs.get_mut(&(sid, tw, th)) {
+                let n = entry.0.len().max(1);
+                entry.1 = (entry.1 + 1) % n;
+            }
+        }
 
         // Build immediate per-target results.  Each external target
         // emits its own SurfaceCommit so the matching per-client
