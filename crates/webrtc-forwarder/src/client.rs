@@ -1070,6 +1070,11 @@ async fn drive(
                                 return Ok(());
                             }
                         }
+                        Event::Connected => {
+                            // DTLS is up: from here an epoch-0 ChangeCipherSpec
+                            // can only be a retransmission.
+                            dtls_dedupe.dtls_connected();
+                        }
                         Event::IceConnectionStateChange(state) => {
                             verbose!("ICE state: {state:?}");
                             if matches!(state, str0m::IceConnectionState::Disconnected) {

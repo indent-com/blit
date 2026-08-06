@@ -807,6 +807,11 @@ pub async fn handle_peer(
                                 channels_empty_since.get_or_insert_with(Instant::now);
                             }
                         }
+                        Event::Connected => {
+                            // DTLS is up: from here an epoch-0 ChangeCipherSpec
+                            // can only be a retransmission.
+                            dtls_dedupe.dtls_connected();
+                        }
                         Event::IceConnectionStateChange(state) => {
                             verbose!("ICE state: {state:?}");
                             if matches!(state, str0m::IceConnectionState::Disconnected) {

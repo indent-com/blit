@@ -27,15 +27,28 @@
 //!
 //! # What we do
 //!
-//! WebRTC never renegotiates DTLS, so a session sees exactly one genuine
-//! ChangeCipherSpec per direction.  We let the first one through and drop any
-//! later datagram that leads with an epoch-0 CCS, which is by definition a
-//! retransmission of a flight we have already processed in full (the datagram
-//! carries the duplicate `Finished` with it, and UDP delivers a datagram whole
-//! or not at all, so nothing else is lost with it).
+//! WebRTC never renegotiates DTLS, so once the handshake is up an epoch-0
+//! ChangeCipherSpec can only be a retransmission of a flight already processed
+//! in full.  After str0m reports `Event::Connected` we drop any datagram that
+//! leads with one.  The duplicate `Finished` coalesced behind it goes too, but
+//! UDP delivers a datagram whole or not at all, so nothing is lost that we did
+//! not already have.
 //!
-//! Gating on "handshake complete" instead would be too late: the retransmission
-//! typically arrives *before* the DataChannel opens.
+//! The gate is str0m's own `Event::Connected` ("we got ICE connection and
+//! established DTLS") rather than anything derived from the packets themselves.
+//! That matters for more than tidiness: this filter runs on raw socket bytes,
+//! *before* `Receive::new` parses them and before str0m does ICE source
+//! validation or checks a MAC.  Nothing an unvalidated datagram contains may
+//! influence what we do with a later one, or an off-path packet that merely led
+//! with `0x14` could make us discard the genuine handshake flight and stall the
+//! session — a failure mode that did not exist before this filter.  Hence
+//! [`DtlsFlightDedupe::accept`] takes `&self`: inbound bytes cannot mutate it.
+//!
+//! Before `Connected` every CCS is passed through untouched, so no handshake —
+//! including one recovering from loss — can be blocked.  This is also why the
+//! gate is not "we have seen a CCS already": the retransmission arrives before
+//! the DataChannel opens but *after* DTLS completes, so `Connected` is both
+//! early enough to catch it and late enough to be safe.
 //!
 //! Remove this once `dimpl` discards stale epoch-0 ChangeCipherSpec records the
 //! way it already discards stale epoch-0 handshake records.
@@ -46,13 +59,14 @@ const DTLS_CHANGE_CIPHER_SPEC: u8 = 20;
 /// Bytes in a DTLS record header: type(1) version(2) epoch(2) sequence(6) length(2).
 const DTLS_RECORD_HEADER: usize = 13;
 
-/// Per-session filter for duplicate DTLS ChangeCipherSpec flights.
+/// Per-session filter for retransmitted DTLS ChangeCipherSpec flights.
 ///
-/// One instance per `Rtc`, shared by every inbound path (host sockets and the
-/// TURN relay all feed the same DTLS engine, so the state must be shared).
+/// One instance per `Rtc`, shared by every inbound path — host sockets and the
+/// TURN relay all feed the same DTLS engine, and a retransmission can arrive on
+/// a different path than the original.
 #[derive(Default)]
 pub struct DtlsFlightDedupe {
-    seen_change_cipher_spec: bool,
+    dtls_connected: bool,
 }
 
 impl DtlsFlightDedupe {
@@ -60,11 +74,24 @@ impl DtlsFlightDedupe {
         Self::default()
     }
 
+    /// Record that str0m emitted `Event::Connected`, i.e. DTLS is established.
+    ///
+    /// Until this is called the filter passes everything through.
+    pub fn dtls_connected(&mut self) {
+        self.dtls_connected = true;
+    }
+
     /// Returns `true` if `datagram` should be handed to str0m.
     ///
-    /// Only ever rejects a repeated epoch-0 ChangeCipherSpec; everything else —
-    /// STUN, RTP, and every other DTLS record — passes through untouched.
-    pub fn accept(&mut self, datagram: &[u8]) -> bool {
+    /// Takes `&self` on purpose — see the module docs.  A datagram str0m has
+    /// not validated must not be able to change how a later one is treated.
+    ///
+    /// Only ever rejects an epoch-0 ChangeCipherSpec seen after DTLS is up;
+    /// STUN, RTP and every other DTLS record pass through untouched.
+    pub fn accept(&self, datagram: &[u8]) -> bool {
+        if !self.dtls_connected {
+            return true;
+        }
         if datagram.len() < DTLS_RECORD_HEADER || datagram[0] != DTLS_CHANGE_CIPHER_SPEC {
             return true;
         }
@@ -74,12 +101,8 @@ impl DtlsFlightDedupe {
         if epoch != 0 {
             return true;
         }
-        if self.seen_change_cipher_spec {
-            verbose!("dropping retransmitted DTLS ChangeCipherSpec flight");
-            return false;
-        }
-        self.seen_change_cipher_spec = true;
-        true
+        verbose!("dropping retransmitted DTLS ChangeCipherSpec flight");
+        false
     }
 }
 
@@ -104,18 +127,50 @@ mod tests {
         v
     }
 
-    #[test]
-    fn first_flight_passes_and_retransmissions_are_dropped() {
+    fn connected() -> DtlsFlightDedupe {
         let mut d = DtlsFlightDedupe::new();
-        assert!(d.accept(&final_flight(10, 0)), "first flight must pass");
-        assert!(!d.accept(&final_flight(11, 1)), "retransmission must drop");
+        d.dtls_connected();
+        d
+    }
+
+    #[test]
+    fn retransmissions_are_dropped_once_connected() {
+        let d = connected();
+        assert!(!d.accept(&final_flight(11, 1)));
         assert!(!d.accept(&final_flight(12, 2)), "and stay dropped");
+    }
+
+    /// The whole handshake must be untouched before `Event::Connected`, so that
+    /// no flight — original or loss-recovery resend — can ever be blocked.
+    #[test]
+    fn nothing_is_dropped_before_connected() {
+        let d = DtlsFlightDedupe::new();
+        assert!(d.accept(&final_flight(10, 0)));
+        assert!(d.accept(&final_flight(11, 1)));
+        assert!(d.accept(&record(DTLS_CHANGE_CIPHER_SPEC, 0, 12, &[1])));
+    }
+
+    /// An off-path or corrupt datagram that merely leads with 0x14 must not be
+    /// able to make us drop the genuine flight that follows.
+    #[test]
+    fn unvalidated_ccs_cannot_arm_the_filter() {
+        let mut d = DtlsFlightDedupe::new();
+        assert!(
+            d.accept(&record(DTLS_CHANGE_CIPHER_SPEC, 0, 0, &[1])),
+            "spoof"
+        );
+        assert!(
+            d.accept(&final_flight(10, 0)),
+            "genuine flight must still reach str0m"
+        );
+        // Only str0m saying DTLS is up changes behaviour.
+        d.dtls_connected();
+        assert!(!d.accept(&final_flight(11, 1)));
     }
 
     #[test]
     fn application_data_always_passes() {
-        let mut d = DtlsFlightDedupe::new();
-        assert!(d.accept(&final_flight(10, 0)));
+        let d = connected();
         for seq in 0..64 {
             assert!(d.accept(&record(23, 1, seq, &[0u8; 64])));
         }
@@ -123,7 +178,7 @@ mod tests {
 
     #[test]
     fn handshake_and_alert_records_pass() {
-        let mut d = DtlsFlightDedupe::new();
+        let d = connected();
         assert!(d.accept(&record(22, 0, 0, &[0u8; 70])));
         assert!(
             d.accept(&record(22, 0, 1, &[0u8; 70])),
@@ -134,7 +189,7 @@ mod tests {
 
     #[test]
     fn non_dtls_traffic_passes() {
-        let mut d = DtlsFlightDedupe::new();
+        let d = connected();
         // STUN binding request.
         assert!(d.accept(&[0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42]));
         // RTP.
@@ -147,8 +202,7 @@ mod tests {
     /// A CCS at a non-zero epoch is not the handshake flight; leave it alone.
     #[test]
     fn encrypted_epoch_ccs_passes() {
-        let mut d = DtlsFlightDedupe::new();
-        assert!(d.accept(&record(DTLS_CHANGE_CIPHER_SPEC, 0, 10, &[1])));
+        let d = connected();
         assert!(d.accept(&record(DTLS_CHANGE_CIPHER_SPEC, 1, 11, &[1])));
     }
 }
