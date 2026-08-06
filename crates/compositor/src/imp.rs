@@ -756,6 +756,19 @@ pub(crate) struct Surface {
     /// (e.g. Chromium) that render at physical resolution with `buffer_scale=1`
     /// and rely on the viewport to declare the logical surface size.
     pub viewport_destination: Option<(i32, i32)>,
+    pending_viewport_source: Option<(f64, f64, f64, f64)>,
+    /// Committed viewport source rectangle (`wp_viewport.set_source`), in
+    /// surface-local coordinates — that is, buffer pixels divided by
+    /// `buffer_scale`, after `buffer_transform`.
+    ///
+    /// This is the part of the buffer that is actually the window; the rest
+    /// is whatever the client last drew there.  Chromium sets it on every
+    /// shrink so it can keep an oversized buffer instead of reallocating
+    /// one per resize step, and only clears it when it does eventually
+    /// reallocate — which can be seconds later, or never while the window
+    /// keeps moving.  Sampling the whole buffer into the destination in the
+    /// meantime squashes the picture by exactly the ratio it cropped away.
+    pub viewport_source: Option<(f64, f64, f64, f64)>,
 
     is_cursor: bool,
     cursor_hotspot: (i32, i32),
@@ -2161,15 +2174,7 @@ impl Compositor {
 
         // Check this surface's bounds (logical coordinates).
         if let Some(sm) = self.surface_meta.get(surface_id) {
-            let s = sm.scale.max(1) as f64;
-            let (w, h) = (sm.width, sm.height);
-            // Prefer viewport destination for logical size (fractional-scale
-            // clients set buffer_scale=1 and declare logical size via viewport).
-            let (lw, lh) = surf
-                .viewport_destination
-                .filter(|&(dw, dh)| dw > 0 && dh > 0)
-                .map(|(dw, dh)| (dw as f64, dh as f64))
-                .unwrap_or((w as f64 / s, h as f64 / s));
+            let (lw, lh) = super::render::surface_logical_size(surf, sm);
             let lx = x - sx as f64;
             let ly = y - sy as f64;
             if lx >= 0.0 && ly >= 0.0 && lx < lw && ly < lh {
@@ -2209,6 +2214,7 @@ impl Compositor {
             let scale = surf.pending_buffer_scale;
             surf.buffer_scale = scale;
             surf.viewport_destination = surf.pending_viewport_destination;
+            surf.viewport_source = surf.pending_viewport_source;
             surf.is_opaque = surf.pending_opaque;
             if let Some(region) = surf.pending_input_region.take() {
                 surf.input_region = region;
@@ -3779,6 +3785,8 @@ impl Dispatch<WlCompositor, ()> for Compositor {
                         app_id: String::new(),
                         pending_viewport_destination: None,
                         viewport_destination: None,
+                        pending_viewport_source: None,
+                        viewport_source: None,
                         is_cursor: false,
                         cursor_hotspot: (0, 0),
                     },
@@ -4357,12 +4365,8 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for Compositor {
                         // Fall back to the client's actual logical surface
                         // size when window geometry is unavailable.
                         let sm = state.surface_meta.get(&root_wl_id)?;
-                        let s = (sm.scale).max(1);
-                        let (lw, lh) = surf
-                            .viewport_destination
-                            .filter(|&(dw, dh)| dw > 0 && dh > 0)
-                            .unwrap_or((sm.width as i32 / s, sm.height as i32 / s));
-                        Some((0, 0, lw, lh))
+                        let (lw, lh) = super::render::surface_logical_size(surf, sm);
+                        Some((0, 0, lw as i32, lh as i32))
                     })
                     .unwrap_or((0, 0, state.output_width, state.output_height));
 
@@ -4580,12 +4584,8 @@ impl Dispatch<XdgPopup, XdgPopupData> for Compositor {
                                 return Some((gx, gy, gw, gh));
                             }
                             let sm = state.surface_meta.get(&root_id)?;
-                            let s = (sm.scale).max(1);
-                            let (lw, lh) = surf
-                                .viewport_destination
-                                .filter(|&(dw, dh)| dw > 0 && dh > 0)
-                                .unwrap_or((sm.width as i32 / s, sm.height as i32 / s));
-                            Some((0, 0, lw, lh))
+                            let (lw, lh) = super::render::surface_logical_size(surf, sm);
+                            Some((0, 0, lw as i32, lh as i32))
                         })
                         .unwrap_or((0, 0, state.output_width, state.output_height));
                     let (px, py, pw, ph) = state
@@ -5401,10 +5401,41 @@ impl Dispatch<WpViewport, ObjectId> for Compositor {
                     }
                 }
             }
-            Request::SetSource { .. } => {
-                // Source crop — not needed for headless compositor.
+            Request::SetSource {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                if let Some(surf) = state.surfaces.get_mut(surface_obj_id) {
+                    // All four at -1 unsets the crop; the protocol lets a
+                    // client re-declare the whole buffer that way.  Anything
+                    // else with a non-positive extent is not a rectangle we
+                    // can sample, so treat it as unset rather than dividing
+                    // by it later.
+                    surf.pending_viewport_source = if width > 0.0 && height > 0.0 {
+                        Some((x, y, width, height))
+                    } else {
+                        None
+                    };
+                }
             }
-            Request::Destroy => {}
+            Request::Destroy => {
+                // The crop and scale belong to the wl_surface, not to this
+                // object, and the spec removes both when it goes — applied
+                // on the next commit like any other surface state.
+                //
+                // Destroying the viewport is the other spec-sanctioned way
+                // back to the whole buffer, alongside `set_source(-1, …)`.
+                // Ignoring it here would leave the last crop in force and
+                // the window squashed by its ratio for as long as the
+                // surface lives, which is the same failure this commit is
+                // fixing — just reached by the other door.
+                if let Some(surf) = state.surfaces.get_mut(surface_obj_id) {
+                    surf.pending_viewport_source = None;
+                    surf.pending_viewport_destination = None;
+                }
+            }
             _ => {}
         }
     }
