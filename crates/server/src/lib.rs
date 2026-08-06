@@ -3,20 +3,23 @@ use blit_compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
 use blit_remote::{
     C2S_ACK, C2S_CLIENT_FEATURES, C2S_CLIENT_METRICS, C2S_CLIPBOARD_GET, C2S_CLIPBOARD_LIST,
     C2S_CLIPBOARD_SET, C2S_CLOSE, C2S_COPY_RANGE, C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N,
-    C2S_CREATE2, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_KILL, C2S_MOUSE, C2S_PING, C2S_QUIT,
-    C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE, C2S_SURFACE_ACK,
-    C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT, C2S_SURFACE_LIST,
-    C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2, C2S_SURFACE_RESIZE,
-    C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD,
-    C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_CWD,
-    CREATE2_HAS_SRC_PTY, FEATURE_COMPOSITOR, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE,
-    FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState, READ_ANSI, READ_TAIL, S2C_CLOSED,
-    S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS,
-    S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, SURFACE_FRAME_CODEC_H264,
-    SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN, build_update_msg, msg_hello,
-    msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_used_rows, msg_surface_app_id,
-    msg_surface_created, msg_surface_destroyed, msg_surface_encoder, msg_surface_frame,
-    msg_surface_resized, msg_surface_title, msg_term_cwd_reply, parse_surface_pointer_axis2,
+    C2S_CREATE2, C2S_DEADLINE, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_KILL, C2S_MOUSE,
+    C2S_PING, C2S_QUIT, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE,
+    C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT,
+    C2S_SURFACE_LIST, C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2,
+    C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE,
+    C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND,
+    CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE, CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS,
+    FEATURE_COMPOSITOR, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS,
+    FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState,
+    KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST,
+    S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST,
+    S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE,
+    SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN,
+    build_update_msg, msg_hello, msg_s2c_clipboard_content, msg_s2c_clipboard_list,
+    msg_s2c_used_rows, msg_surface_app_id, msg_surface_created, msg_surface_destroyed,
+    msg_surface_encoder, msg_surface_frame, msg_surface_resized, msg_surface_title,
+    msg_term_cwd_reply, parse_surface_pointer_axis2,
 };
 #[cfg(target_os = "linux")]
 use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO};
@@ -50,6 +53,47 @@ pub use surface_encoder::SurfaceH264EncoderPreference;
 pub use surface_encoder::{SurfaceBandwidth, SurfaceEncoding, SurfaceSpeed};
 
 type PtyFds = Arc<std::sync::RwLock<HashMap<u16, PtyWriteTarget>>>;
+
+/// How many exited-but-retained terminals to keep, oldest evicted first.
+/// `BLIT_MAX_EXITED` overrides; 0 disables the bound.
+///
+/// A terminal's output stays readable after its command exits, and consumers
+/// legitimately read it back long afterwards, so this is generous — it exists
+/// to stop an orchestrator that never sends `C2S_CLOSE` from growing the map
+/// without limit, not to reclaim memory promptly.
+pub const DEFAULT_MAX_EXITED: usize = 1024;
+
+/// Evict exited terminals this long after they exit.  `BLIT_EXITED_LINGER`
+/// overrides, in seconds.
+///
+/// Off by default, deliberately: a time bound throws away output someone may
+/// still want, and "how long is a result interesting" is a policy question
+/// the server has no way to answer. The count bound alone keeps the map
+/// bounded without ever discarding anything an active consumer is likely to
+/// come back for.
+pub const DEFAULT_EXITED_LINGER: Duration = Duration::ZERO;
+
+fn max_exited() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("BLIT_MAX_EXITED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MAX_EXITED)
+    })
+}
+
+fn exited_linger() -> Duration {
+    static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("BLIT_EXITED_LINGER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_EXITED_LINGER)
+    })
+}
+
 pub struct Config {
     pub shell: String,
     pub shell_flags: String,
@@ -64,7 +108,9 @@ pub struct Config {
     pub verbose: bool,
     /// Maximum number of concurrent client connections (0 = unlimited).
     pub max_connections: usize,
-    /// Maximum number of PTYs across all clients (0 = unlimited).
+    /// Maximum number of PTYs across all clients (0 = unlimited).  Counts
+    /// exited-but-retained terminals too, since those still hold an id and a
+    /// scrollback.
     pub max_ptys: usize,
     /// Application-level ping interval.  The server sends S2C_PING to every
     /// client at this cadence so that transports without native keepalive
@@ -385,8 +431,23 @@ struct Pty {
     title_pending: bool,
     /// Last used visible rows value broadcast for this PTY.
     last_used_rows_sent: u16,
+    /// When the server should stop this terminal, if a client armed a
+    /// deadline.  Absent means unbounded, which stays the default — a
+    /// multiplexer whose sessions expire on their own would be useless.
+    deadline: Option<Instant>,
+    /// Set once the deadline has fired and SIGTERM has gone out; when it
+    /// passes, the group gets SIGKILL.
+    stop_deadline: Option<Instant>,
+    /// Attributed cause, moved onto `S2C_EXITED` by `cleanup_pty_internal`.
+    exit_reason: u8,
     /// The subprocess has exited but the terminal state is retained for reading.
     exited: bool,
+    /// When it exited, for the retention bound.  `None` while live.
+    exited_at: Option<Instant>,
+    /// Bumped every time this slot gets a fresh child, so work queued against
+    /// one generation cannot land on the next.  `C2S_RESTART` reuses the id
+    /// and the driver in place, which makes the id alone useless as identity.
+    generation: u64,
     /// Exit status: WEXITSTATUS if normal exit, negative signal number if signalled,
     /// EXIT_STATUS_UNKNOWN if not yet collected.
     exit_status: i32,
@@ -2375,11 +2436,19 @@ impl Session {
             .map(|ap| ap.pipewire_remote_path())
     }
 
+    fn live_ptys(&self) -> usize {
+        self.ptys.values().filter(|pty| !pty.exited).count()
+    }
+
     fn allocate_pty_id(&mut self, max_ptys: usize) -> Option<u16> {
-        if max_ptys > 0 && self.ptys.len() >= max_ptys {
-            // The callers drop the CREATE with no reply — the protocol has no
-            // "create refused" message — so the client learns about this as a
-            // timeout. Say it here at least, or the cap looks like a hang.
+        // Live terminals only.  Counting exited-but-retained ones would let a
+        // client that runs 256 short commands hit a cap of 256 with nothing
+        // actually running; those are bounded separately, by retention.
+        if max_ptys > 0 && self.live_ptys() >= max_ptys {
+            // A `CREATE2(WANT_STATUS)` caller now gets `S2C_CREATE_FAILED`
+            // with `BUDGET`, but the older create opcodes still drop the
+            // request with no reply, so keep saying it here — for those the
+            // cap otherwise still looks like a hang.
             eprintln!("blit-server: refusing CREATE, BLIT_MAX_PTYS ({max_ptys}) reached");
             return None;
         }
@@ -2796,6 +2865,11 @@ struct AppStateInner {
     delivery_notify: Arc<Notify>,
     /// Signalled when a client sends C2S_QUIT to initiate server shutdown.
     shutdown_notify: Arc<Notify>,
+    /// Wakes the supervisor loop.  Separate from `delivery_notify` because
+    /// the two have opposite duty cycles: delivery only runs while a client
+    /// is attached, and lifecycle work is exactly what has to keep running
+    /// when none is.
+    supervisor_notify: Arc<Notify>,
     /// Tracks the number of currently connected clients for enforcing
     /// `config.max_connections`.
     active_connections: std::sync::atomic::AtomicUsize,
@@ -3153,18 +3227,258 @@ fn resolve_term_cwd(osc7: Option<&str>, kernel: impl FnOnce() -> Option<String>)
     }
 }
 
-async fn cleanup_pty_internal(pty_id: u16, state: &AppState) {
-    state.pty_fds.write().unwrap().remove(&pty_id);
+/// Answer a refused `C2S_CREATE2` that asked for a correlated outcome.
+///
+/// `CREATE`, `CREATE_AT`, `CREATE_N`, and `CREATE2` without
+/// [`CREATE2_WANT_STATUS`] keep their success-only contract, so this is a
+/// no-op for them — a server must not send `S2C_CREATE_FAILED` to a client
+/// that did not ask for it (docs/protocol.md, "Common status registry").
+fn refuse_create(
+    sess: &Session,
+    client_id: u64,
+    want_status: bool,
+    nonce: u16,
+    status: u8,
+    detail: &str,
+) {
+    if !want_status {
+        return;
+    }
+    if let Some(c) = sess.clients.get(&client_id) {
+        let _ = send_outbox(c, blit_remote::msg_create_failed(nonce, status, detail));
+    }
+}
+
+/// Name the field that would not survive `S2C_LIST`'s `u16` length prefixes,
+/// or `None` when the record is representable.  `pty_list_msg` casts both
+/// lengths with `as u16`, so an oversize value does not fail loudly — it
+/// silently truncates and desynchronizes the frame for every client.
+fn oversize_list_field(tag: &str, command: Option<&str>) -> Option<&'static str> {
+    if tag.len() > u16::MAX as usize {
+        return Some("tag");
+    }
+    if command.is_some_and(|c| c.len() > u16::MAX as usize) {
+        return Some("command");
+    }
+    None
+}
+
+/// Diagnostic for a `STATUS_BUDGET` creation refusal.  `allocate_pty_id`
+/// returns `None` for two different exhaustions and the operator fix differs,
+/// so name which one was hit.
+/// The timer state a `C2S_DEADLINE` puts a terminal into: `(deadline,
+/// stop_deadline, exit_reason)`.
+///
+/// Split out from the handler so the stand-down rule is pinned by a test
+/// rather than by three assignments that are easy to get half-right: the
+/// pending SIGKILL has to be cancelled whether the message re-arms or clears,
+/// or a refresh that lands inside the grace kills the terminal it was sent to
+/// save.
+fn armed_deadline(now: Instant, ms: u32) -> (Option<Instant>, Option<Instant>, u8) {
+    let deadline = (ms > 0).then(|| now + Duration::from_millis(ms as u64));
+    (deadline, None, blit_remote::EXIT_REASON_NORMAL)
+}
+
+fn pty_budget_detail(live: usize, max_ptys: usize) -> String {
+    if max_ptys > 0 && live >= max_ptys {
+        format!("terminal cap reached ({max_ptys}); raise --max-ptys or close a terminal")
+    } else {
+        "terminal id space exhausted".to_string()
+    }
+}
+
+/// How often the supervisor sweeps when nothing has woken it.
+///
+/// On Unix this is a pure backstop — SIGCHLD wakes it the moment a child
+/// dies, and the sweep only covers a missed signal (they coalesce, so two
+/// children dying together deliver one).  Windows has no SIGCHLD and this is
+/// the actual detection latency.
+const SUPERVISOR_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Reactive lifecycle loop, deliberately not part of the delivery tick.
+///
+/// The tick only schedules itself while a client is attached —
+/// `blanket_frame_interval` returns `None` on an empty client map and every
+/// other deadline it computes is client-gated — so a server with nobody
+/// watching parks on `delivery_notify` indefinitely.  That is precisely when
+/// a runaway command needs supervising, so lifecycle work gets its own loop.
+async fn supervisor_loop(state: AppState) {
+    loop {
+        // Wake at whichever comes first: something asked us to recompute, an
+        // armed deadline is due, or the backstop sweep comes round.
+        let next = {
+            let sess = state.session.lock().await;
+            earliest_armed_deadline(&sess)
+        };
+        let sweep = Instant::now() + SUPERVISOR_SWEEP_INTERVAL;
+        let wake = next.map_or(sweep, |d| d.min(sweep));
+        tokio::select! {
+            _ = state.supervisor_notify.notified() => {}
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {}
+        }
+        supervise(&state).await;
+    }
+}
+
+/// The soonest instant the supervisor has work to do, or `None` when nothing
+/// is armed.
+fn earliest_armed_deadline(sess: &Session) -> Option<Instant> {
+    sess.ptys
+        .values()
+        .filter(|pty| !pty.exited)
+        .filter_map(|pty| pty.deadline.into_iter().chain(pty.stop_deadline).min())
+        .min()
+}
+
+/// Terminals to evict to stay inside the retention bounds, oldest first.
+///
+/// Pure so the policy is testable without a real PTY: it only needs when
+/// each exited terminal exited.
+fn slots_to_evict(
+    mut exited: Vec<(u16, Instant)>,
+    now: Instant,
+    max_exited: usize,
+    linger: Duration,
+) -> Vec<u16> {
+    exited.sort_by_key(|&(_, at)| at);
+    let mut doomed: Vec<u16> = Vec::new();
+    if !linger.is_zero() {
+        let expired = exited
+            .iter()
+            .filter(|&&(_, at)| now.duration_since(at) >= linger);
+        doomed.extend(expired.map(|&(id, _)| id));
+    }
+    if max_exited > 0 && exited.len() > max_exited {
+        let over = exited.len() - max_exited;
+        doomed.extend(exited.iter().take(over).map(|&(id, _)| id));
+    }
+    doomed.sort_unstable();
+    doomed.dedup();
+    doomed
+}
+
+/// Drop exited terminals that have fallen outside the retention bounds.
+///
+/// `cleanup_pty_internal` marks a terminal exited and keeps its entry so the
+/// output stays readable; nothing but an explicit `C2S_CLOSE` ever removed
+/// one, so a client that creates a terminal per task and never closes it grew
+/// the map until the id space ran out. Eviction takes the same path a
+/// `C2S_CLOSE` would and broadcasts the same `S2C_CLOSED`, so clients need no
+/// new message to understand it.
+///
+/// Only ever touches terminals whose command has already exited.
+async fn evict_exited(state: &AppState) {
+    let now = Instant::now();
+    let mut sess = state.session.lock().await;
+    let exited: Vec<(u16, Instant)> = sess
+        .ptys
+        .iter()
+        .filter_map(|(&id, pty)| pty.exited_at.map(|at| (id, at)))
+        .collect();
+    let doomed = slots_to_evict(exited, now, max_exited(), exited_linger());
+    for id in doomed {
+        let Some(pty) = sess.ptys.remove(&id) else {
+            continue;
+        };
+        // Already exited by construction, so the fd and the child are gone;
+        // this is only dropping the retained terminal state.
+        drop(pty);
+        state.pty_fds.write().unwrap().remove(&id);
+        for client in sess.clients.values_mut() {
+            unsubscribe_client_from(client, id);
+        }
+        let mut msg = vec![S2C_CLOSED];
+        msg.extend_from_slice(&id.to_le_bytes());
+        sess.send_to_all(&msg);
+    }
+}
+
+/// Signal numbers for the stop sequence.  Spelled out rather than taken from
+/// `libc` because this code is shared with Windows, where `kill_pty` treats
+/// the number as an opaque "not SIGINT" and terminates the job.
+const SIGKILL: i32 = 9;
+const SIGTERM: i32 = 15;
+
+/// Act on terminals whose deadline has come due.
+///
+/// Expiry is a two-step stop: SIGTERM to the group, then SIGKILL once the
+/// grace elapses, so a command that handles SIGTERM gets to unwind. The
+/// attribution is recorded now and travels to `S2C_EXITED` later, because the
+/// terminal does not finish exiting until the child actually dies.
+async fn enforce_deadlines(state: &AppState) {
+    let now = Instant::now();
+    let mut sess = state.session.lock().await;
+    for pty in sess.ptys.values_mut() {
+        if pty.exited {
+            continue;
+        }
+        if pty.stop_deadline.is_some_and(|d| now >= d) {
+            pty.stop_deadline = None;
+            pty::kill_pty(&pty.handle, SIGKILL, true);
+        } else if pty.deadline.is_some_and(|d| now >= d) {
+            pty.deadline = None;
+            pty.exit_reason = blit_remote::EXIT_REASON_DEADLINE;
+            pty.stop_deadline =
+                Some(now + Duration::from_millis(blit_remote::DEADLINE_STOP_GRACE_MS as u64));
+            pty::kill_pty(&pty.handle, SIGTERM, true);
+        }
+    }
+}
+
+/// One supervisor pass: notice children that have exited and run the exit
+/// path for them.
+///
+/// Exit used to be detected only by EOF on the master fd, which reports "the
+/// last fd on the slave closed", not "the child exited".  A grandchild
+/// holding the slave open kept a dead terminal marked `running` forever, and
+/// `blit terminal wait` blocked until its own client-side timeout.
+async fn supervise(state: &AppState) {
+    enforce_deadlines(state).await;
+    let exited: Vec<(u16, u64)> = {
+        let sess = state.session.lock().await;
+        sess.ptys
+            .iter()
+            .filter(|(_, pty)| !pty.exited && pty::poll_child_exited(&pty.handle))
+            .map(|(&id, pty)| (id, pty.generation))
+            .collect()
+    };
+    for (id, generation) in exited {
+        cleanup_pty_internal(id, Some(generation), state).await;
+    }
+    // The backstop still runs, now targeted at owned pids only, so a child
+    // whose SIGCHLD we missed cannot linger as a zombie.
+    pty::reap_zombies();
+    evict_exited(state).await;
+}
+
+/// Run a terminal's exit path.
+///
+/// `generation` is the child this cleanup was decided for.  The EOF path in
+/// the delivery tick defers by 50ms, and the supervisor now reaches the same
+/// terminal within a millisecond of SIGCHLD, so a client that sees
+/// `S2C_EXITED` and immediately restarts can have a fresh child running by the
+/// time the deferred call lands.  Without the check that call would drop the
+/// new child's fd, hang it up, and broadcast a second `S2C_EXITED` with an
+/// unknown status — the one place the exactly-once contract actually breaks.
+/// `None` means "whatever is there now", for callers that just looked.
+async fn cleanup_pty_internal(pty_id: u16, generation: Option<u64>, state: &AppState) {
     let mut sess = state.session.lock().await;
     if let Some(pty) = sess.ptys.get_mut(&pty_id) {
+        if generation.is_some_and(|g| g != pty.generation) {
+            return;
+        }
         if pty.exited {
             return;
         }
+        state.pty_fds.write().unwrap().remove(&pty_id);
         pty.exited = true;
+        pty.exited_at = Some(Instant::now());
+        pty.deadline = None;
+        pty.stop_deadline = None;
         pty::close_pty(&pty.handle);
         pty.exit_status = pty::collect_exit_status(&pty.handle);
         pty.mark_dirty();
-        let msg = blit_remote::msg_exited(pty_id, pty.exit_status);
+        let msg = blit_remote::msg_exited_reason(pty_id, pty.exit_status, pty.exit_reason);
         sess.send_to_all(&msg);
     }
 }
@@ -3257,6 +3571,7 @@ pub async fn run(config: Config) {
         pty_fds: Arc::new(std::sync::RwLock::new(HashMap::new())),
         delivery_notify: Arc::new(Notify::new()),
         shutdown_notify: Arc::new(Notify::new()),
+        supervisor_notify: Arc::new(Notify::new()),
         active_connections: std::sync::atomic::AtomicUsize::new(0),
     });
 
@@ -3290,12 +3605,31 @@ pub async fn run(config: Config) {
         }
     });
 
-    tokio::spawn(async {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            pty::reap_zombies();
-        }
+    let supervisor_state = state.clone();
+    tokio::spawn(async move {
+        supervisor_loop(supervisor_state).await;
     });
+
+    // SIGCHLD is what makes exit detection prompt without polling.  The
+    // handler does nothing but wake the supervisor: reaping from a signal
+    // context would race the session mutex, and the supervisor already knows
+    // which pids it owns.
+    #[cfg(unix)]
+    {
+        let sigchld_state = state.clone();
+        tokio::spawn(async move {
+            let Ok(mut sigchld) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+            else {
+                eprintln!("[supervisor] SIGCHLD unavailable; falling back to the poll");
+                return;
+            };
+            loop {
+                sigchld.recv().await;
+                sigchld_state.supervisor_notify.notify_one();
+            }
+        });
+    }
 
     // Warm the KV store off the serving paths (docs/design/kv.md
     // § Storage): the load+hash of the whole database happens now, in the
@@ -5438,7 +5772,7 @@ async fn tick(state: &AppState) -> TickOutcome {
         .values()
         .flat_map(|c| c.subscriptions.iter().copied())
         .collect();
-    let mut eof_ptys: Vec<u16> = Vec::with_capacity(ids.len());
+    let mut eof_ptys: Vec<(u16, u64)> = Vec::with_capacity(ids.len());
     let mut cwd_msgs: Vec<Vec<u8>> = Vec::new();
     let mut parse_budget_hit = false;
     for &id in &ids {
@@ -5495,7 +5829,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                 }
                 PtyInput::Eof => {
-                    eof_ptys.push(id);
+                    eof_ptys.push((id, pty.generation));
                 }
             }
         }
@@ -5516,9 +5850,9 @@ async fn tick(state: &AppState) -> TickOutcome {
     }
     // Handle EOF outside the borrow loop.
     drop(sess);
-    for id in eof_ptys {
+    for (id, generation) in eof_ptys {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        cleanup_pty_internal(id, state).await;
+        cleanup_pty_internal(id, Some(generation), state).await;
     }
     let mut sess = state.session.lock().await;
 
@@ -8529,6 +8863,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | FEATURE_RESIZE_BATCH
                 | FEATURE_COPY_RANGE
                 | FEATURE_COMPOSITOR
+                | FEATURE_CREATE_STATUS
+                | FEATURE_KILL_MODE
+                | FEATURE_PTY_DEADLINE
                 | blit_remote::fs::FEATURE_FS
                 | blit_remote::git::FEATURE_GIT;
             // BLIT_LSP=0 disables the family: the bit is simply not
@@ -8617,7 +8954,16 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 initial_msgs.push(msg);
             }
             if pty.exited {
-                initial_msgs.push(blit_remote::msg_exited(id, pty.exit_status));
+                // Carry the attribution, not just the status.  Arming a
+                // deadline, disconnecting, and reconnecting to collect is the
+                // case the reason byte exists for; replaying a bare
+                // `signal(15)` here would put back exactly the ambiguity it
+                // was added to remove.
+                initial_msgs.push(blit_remote::msg_exited_reason(
+                    id,
+                    pty.exit_status,
+                    pty.exit_reason,
+                ));
             }
         }
         initial_msgs.push(vec![S2C_READY]);
@@ -9434,7 +9780,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 }
             }
             C2S_CREATE2 => {
-                if data.len() < 10 {
+                // The one-outcome contract arms as soon as the nonce and the
+                // feature byte are decodable (docs/protocol.md, "Common status
+                // registry").  A frame shorter than that cannot be correlated
+                // to anything, so it stays a silent drop.
+                if data.len() < 8 {
                     continue;
                 }
                 let nonce = u16::from_le_bytes([data[1], data[2]]);
@@ -9444,6 +9794,18 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     u16::from_le_bytes([data[5], data[6]]),
                 );
                 let features = data[7];
+                let want_status = features & CREATE2_WANT_STATUS != 0;
+                if data.len() < 10 {
+                    refuse_create(
+                        &sess,
+                        client_id,
+                        want_status,
+                        nonce,
+                        STATUS_INVALID,
+                        "truncated tag length",
+                    );
+                    continue;
+                }
                 let tag_len = u16::from_le_bytes([data[8], data[9]]) as usize;
                 let tag = if data.len() >= 10 + tag_len {
                     std::str::from_utf8(&data[10..10 + tag_len]).unwrap_or_default()
@@ -9460,11 +9822,27 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 };
                 let explicit_dir = if features & CREATE2_HAS_CWD != 0 {
                     if data.len() < cursor + 2 {
+                        refuse_create(
+                            &sess,
+                            client_id,
+                            want_status,
+                            nonce,
+                            STATUS_INVALID,
+                            "truncated cwd length",
+                        );
                         continue;
                     }
                     let cwd_len = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
                     cursor += 2;
                     if data.len() < cursor + cwd_len {
+                        refuse_create(
+                            &sess,
+                            client_id,
+                            want_status,
+                            nonce,
+                            STATUS_INVALID,
+                            "truncated cwd",
+                        );
                         continue;
                     }
                     let cwd = std::str::from_utf8(&data[cursor..cursor + cwd_len]).ok();
@@ -9477,6 +9855,31 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     None
                 };
                 let dir = explicit_dir.or(src_dir);
+                // Before the command, which has no length prefix and runs to
+                // the end of the message.
+                let deadline_ms = if features & CREATE2_HAS_DEADLINE != 0 {
+                    if data.len() < cursor + 4 {
+                        refuse_create(
+                            &sess,
+                            client_id,
+                            want_status,
+                            nonce,
+                            STATUS_INVALID,
+                            "truncated deadline",
+                        );
+                        continue;
+                    }
+                    let ms = u32::from_le_bytes([
+                        data[cursor],
+                        data[cursor + 1],
+                        data[cursor + 2],
+                        data[cursor + 3],
+                    ]);
+                    cursor += 4;
+                    (ms > 0).then_some(ms)
+                } else {
+                    None
+                };
                 let create_payload = if features & CREATE2_HAS_COMMAND != 0 {
                     data.get(cursor..).and_then(|b| std::str::from_utf8(b).ok())
                 } else {
@@ -9490,7 +9893,34 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     .filter(|p| p.contains('\0'))
                     .map(|p| p.split('\0').filter(|a| !a.is_empty()).collect::<Vec<_>>())
                     .filter(|a| !a.is_empty());
+                // A tag or command that cannot round-trip S2C_LIST's u16
+                // length fields would truncate into a corrupt catalog frame
+                // for every client, so refuse the mutation instead.
+                if let Some(what) = oversize_list_field(tag, command) {
+                    refuse_create(
+                        &sess,
+                        client_id,
+                        want_status,
+                        nonce,
+                        STATUS_TOO_LARGE,
+                        &format!("{what} exceeds 65535 bytes"),
+                    );
+                    continue;
+                }
                 let Some(id) = sess.allocate_pty_id(config.max_ptys) else {
+                    refuse_create(
+                        &sess,
+                        client_id,
+                        want_status,
+                        nonce,
+                        STATUS_BUDGET,
+                        // The live count, matching what the cap actually
+                        // tests — `ptys.len()` counts retained-exited slots
+                        // too, so an id-space exhaustion under the cap would
+                        // report itself as a cap the operator cannot raise
+                        // their way out of.
+                        &pty_budget_detail(sess.live_ptys(), config.max_ptys),
+                    );
                     continue;
                 };
                 let socket_name = sess
@@ -9524,6 +9954,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     pulse_server.as_deref(),
                     pipewire_remote.as_deref(),
                 ) {
+                    let mut pty = pty;
+                    // Armed before the terminal is reachable by anyone, so a
+                    // client that dies immediately after creating it cannot
+                    // leave an unbounded command behind.
+                    pty.deadline =
+                        deadline_ms.map(|ms| Instant::now() + Duration::from_millis(ms as u64));
+                    let armed = pty.deadline.is_some();
                     let tag_bytes = pty.tag.as_bytes();
                     let mut nonce_msg = Vec::with_capacity(5 + tag_bytes.len());
                     nonce_msg.push(S2C_CREATED_N);
@@ -9547,7 +9984,21 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             let _ = send_outbox(c, broadcast_msg.clone());
                         }
                     }
+                    if armed {
+                        state.supervisor_notify.notify_one();
+                    }
                     need_nudge = true;
+                } else {
+                    // The id was handed out by allocate_pty_id but nothing
+                    // was inserted, so it is free again on the next probe.
+                    refuse_create(
+                        &sess,
+                        client_id,
+                        want_status,
+                        nonce,
+                        STATUS_OTHER,
+                        "failed to spawn terminal",
+                    );
                 }
             }
             C2S_SURFACE_INPUT if data.len() >= 8 => {
@@ -10204,7 +10655,18 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         pty.byte_rx = byte_rx;
                         pty.driver.reset_modes();
                         pty.exited = false;
+                        pty.exited_at = None;
+                        // New child in the same slot: anything queued against
+                        // the old one must not land on this one.
+                        pty.generation = pty.generation.wrapping_add(1);
                         pty.exit_status = blit_remote::EXIT_STATUS_UNKNOWN;
+                        // A restart is a new command, not a continuation of
+                        // the one the deadline was armed for.  Carrying the
+                        // old attribution over would blame this exit on a
+                        // deadline that already fired.
+                        pty.deadline = None;
+                        pty.stop_deadline = None;
+                        pty.exit_reason = blit_remote::EXIT_REASON_NORMAL;
                         // The fresh shell hasn't reported OSC 7 yet; keeping
                         // the dead shell's cwd would shadow the kernel
                         // fallback in C2S_TERM_CWD with stale data.
@@ -10349,13 +10811,35 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     }
                 }
             }
+            C2S_DEADLINE if data.len() >= 7 => {
+                let pid = u16::from_le_bytes([data[1], data[2]]);
+                let ms = u32::from_le_bytes([data[3], data[4], data[5], data[6]]);
+                if let Some(pty) = sess.ptys.get_mut(&pid)
+                    && !pty.exited
+                {
+                    // Measured from now, so re-sending refreshes — that is
+                    // what makes this a dead-man switch rather than a
+                    // one-shot timeout.
+                    let (deadline, stop, reason) = armed_deadline(Instant::now(), ms);
+                    pty.deadline = deadline;
+                    pty.stop_deadline = stop;
+                    pty.exit_reason = reason;
+                    state.supervisor_notify.notify_one();
+                }
+            }
             C2S_KILL if data.len() >= 7 => {
                 let pid = u16::from_le_bytes([data[1], data[2]]);
                 let signal = i32::from_le_bytes([data[3], data[4], data[5], data[6]]);
+                // The flags byte is optional; a 7-byte message means the
+                // default, which is now the whole group.
+                let leader_only = data.len() >= 8 && data[7] & KILL_LEADER_ONLY != 0;
+                // `exited` gates this because a group kill on a reaped pid
+                // would land on whatever recycled it — a wider blast radius
+                // than the leader-only kill this replaces.
                 if let Some(pty) = sess.ptys.get(&pid)
                     && !pty.exited
                 {
-                    pty::kill_pty(&pty.handle, signal);
+                    pty::kill_pty(&pty.handle, signal, !leader_only);
                 }
             }
             C2S_CLOSE if data.len() >= 3 => {
@@ -10365,6 +10849,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         state.pty_fds.write().unwrap().remove(&pid);
                         drop(pty.reader_handle);
                         pty::close_pty(&pty.handle);
+                        // The SIGHUP only asks the child to die, and nobody
+                        // will ever collect its status — but it still has to
+                        // be waited or it stays a zombie for the life of the
+                        // server.  Hand it to the reaper to finish.
+                        pty::abandon_pty_pid(&pty.handle);
                     }
                     for client in sess.clients.values_mut() {
                         unsubscribe_client_from(client, pid);
@@ -14427,6 +14916,139 @@ mod tests {
         assert_eq!(sess.allocate_pty_id(0), Some(u16::MAX));
         // Next allocation wraps to 1.
         assert_eq!(sess.allocate_pty_id(0), Some(1));
+    }
+
+    // ── create refusal ──
+
+    #[test]
+    fn oversize_list_field_names_the_offender() {
+        let big = "x".repeat(u16::MAX as usize + 1);
+        assert_eq!(oversize_list_field("tag", None), None);
+        assert_eq!(oversize_list_field("tag", Some("cmd")), None);
+        assert_eq!(oversize_list_field(&big, None), Some("tag"));
+        assert_eq!(oversize_list_field("tag", Some(&big)), Some("command"));
+    }
+
+    #[test]
+    fn oversize_list_field_allows_exactly_u16_max() {
+        // The length prefix holds this exactly; only one more byte truncates.
+        let exact = "x".repeat(u16::MAX as usize);
+        assert_eq!(oversize_list_field(&exact, Some(&exact)), None);
+    }
+
+    // ── retention ──
+
+    fn at(base: Instant, secs: u64) -> Instant {
+        base + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn eviction_keeps_the_newest_when_over_the_count_bound() {
+        let base = Instant::now();
+        let exited = vec![(1, at(base, 0)), (2, at(base, 10)), (3, at(base, 20))];
+        // Room for two: the oldest goes.
+        assert_eq!(
+            slots_to_evict(exited.clone(), at(base, 30), 2, Duration::ZERO),
+            vec![1]
+        );
+        assert_eq!(
+            slots_to_evict(exited.clone(), at(base, 30), 1, Duration::ZERO),
+            vec![1, 2]
+        );
+        // Under the bound, nothing goes.
+        assert!(slots_to_evict(exited, at(base, 30), 8, Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn eviction_count_bound_is_off_at_zero() {
+        let base = Instant::now();
+        let exited = vec![(1, at(base, 0)), (2, at(base, 1))];
+        assert!(slots_to_evict(exited, at(base, 999), 0, Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn eviction_linger_is_off_by_default() {
+        // The default has to leave old output alone — someone reading a
+        // result back an hour later is a supported thing to do.
+        let base = Instant::now();
+        let exited = vec![(1, at(base, 0))];
+        assert!(
+            slots_to_evict(
+                exited,
+                at(base, 100_000),
+                DEFAULT_MAX_EXITED,
+                DEFAULT_EXITED_LINGER
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn eviction_applies_the_linger_bound_when_set() {
+        let base = Instant::now();
+        let exited = vec![(1, at(base, 0)), (2, at(base, 50)), (3, at(base, 90))];
+        // At t=100 with a 60s linger only 1 is old enough: 2 has been gone
+        // 50s and 3 only 10s.
+        assert_eq!(
+            slots_to_evict(exited.clone(), at(base, 100), 0, Duration::from_secs(60)),
+            vec![1]
+        );
+        // Push `now` out far enough and 2 crosses the line too.
+        assert_eq!(
+            slots_to_evict(exited, at(base, 120), 0, Duration::from_secs(60)),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn eviction_does_not_repeat_an_id_caught_by_both_bounds() {
+        let base = Instant::now();
+        let exited = vec![(1, at(base, 0)), (2, at(base, 1)), (3, at(base, 2))];
+        // 1 is both the oldest over the count bound and past the linger.
+        let doomed = slots_to_evict(exited, at(base, 100), 2, Duration::from_secs(50));
+        let mut unique = doomed.clone();
+        unique.dedup();
+        assert_eq!(doomed, unique);
+        assert_eq!(doomed, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn arming_a_deadline_stands_down_a_pending_kill() {
+        let now = Instant::now();
+        // The case that matters: a refresh arriving inside the
+        // SIGTERM→SIGKILL grace. It must cancel the pending kill, or the
+        // terminal dies anyway a few seconds after the client said keep it.
+        let (deadline, stop, reason) = armed_deadline(now, 30_000);
+        assert_eq!(deadline, Some(now + Duration::from_secs(30)));
+        assert_eq!(stop, None);
+        assert_eq!(reason, blit_remote::EXIT_REASON_NORMAL);
+    }
+
+    #[test]
+    fn clearing_a_deadline_disarms_everything() {
+        let now = Instant::now();
+        let (deadline, stop, reason) = armed_deadline(now, 0);
+        assert_eq!(deadline, None);
+        assert_eq!(stop, None);
+        assert_eq!(reason, blit_remote::EXIT_REASON_NORMAL);
+    }
+
+    #[test]
+    fn pty_budget_detail_separates_the_two_exhaustions() {
+        // The operator fix differs — raise the cap, versus wait for ids to
+        // free up — so the detail has to tell them apart.
+        assert!(pty_budget_detail(256, 256).contains("cap reached (256)"));
+        assert!(pty_budget_detail(300, 256).contains("cap reached"));
+        // Uncapped, or under the cap: the only way to get here is a full
+        // id space.
+        assert!(pty_budget_detail(65535, 0).contains("id space"));
+        assert!(pty_budget_detail(10, 256).contains("id space"));
+        // The caller must pass the live count, not `ptys.len()`.  With
+        // retention holding tens of thousands of exited slots the id space
+        // can run out while the live cap is nowhere near — reporting that as
+        // "cap reached" sends the operator to raise a limit that is not the
+        // one they hit.
+        assert!(pty_budget_detail(3, 256).contains("id space"));
     }
 
     // ── try_send_update ──

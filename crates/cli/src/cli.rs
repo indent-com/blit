@@ -274,6 +274,13 @@ pub enum Command {
         #[arg(long)]
         inject_path: bool,
 
+        /// Maximum number of live terminals. Overrides BLIT_MAX_PTYS;
+        /// unlimited by default. Exited terminals are bounded separately by
+        /// BLIT_MAX_EXITED. A create refused past the cap answers
+        /// CREATE2(WANT_STATUS) with a budget status instead of hanging.
+        #[arg(long, value_name = "N")]
+        max_ptys: Option<usize>,
+
         /// Restrict what the TCP/UDP relay may reach: host[:ports], where
         /// host is a name, a *.suffix glob, an address, a CIDR block, or *,
         /// and ports is a comma-separated list of n or n-m. Repeatable (or
@@ -383,6 +390,14 @@ pub enum TerminalCommand {
         /// Maximum seconds to wait (only with --wait)
         #[arg(long)]
         timeout: Option<u64>,
+
+        /// Seconds after which the server stops this terminal on its own,
+        /// armed at creation. Unlike --timeout, which only bounds how long
+        /// this command waits, the deadline outlives the client: the
+        /// terminal dies even if this process is killed. Re-send it with
+        /// `blit terminal deadline` to use it as a dead-man switch.
+        #[arg(long, value_name = "SECONDS")]
+        deadline: Option<u64>,
     },
 
     /// Print the current visible text of a terminal
@@ -752,7 +767,20 @@ pub enum TerminalCommand {
         id: u16,
     },
 
-    /// Send a signal to a terminal's leader process
+    /// Arm, refresh, or clear a terminal's server-enforced deadline
+    ///
+    /// The countdown restarts from now on every call, so repeating it on an
+    /// interval makes it a dead-man switch: the terminal outlives the client
+    /// by at most one period. 0 clears it.
+    Deadline {
+        /// Terminal ID
+        id: u16,
+
+        /// Seconds from now, or 0 to clear
+        seconds: u64,
+    },
+
+    /// Send a signal to a terminal's process group
     Kill {
         /// Terminal ID
         id: u16,

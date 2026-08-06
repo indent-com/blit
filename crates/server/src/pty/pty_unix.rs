@@ -261,15 +261,42 @@ pub fn resize_pty_os(handle: &PtyHandle, rows: u16, cols: u16) {
     }
 }
 
-pub fn kill_pty(handle: &PtyHandle, signal: i32) {
+/// Signal a PTY's child.
+///
+/// `group` sends to process groups rather than to the session leader alone.
+/// Every blit child is a `setsid()` session leader (see `spawn_pty`), so its
+/// pgid equals its pid and `kill(-pid)` is valid with no extra bookkeeping.
+/// That reaches the leader's own group; a shell puts each job in a *separate*
+/// group, so the foreground job is signalled through `TIOCGPGRP` the same way
+/// `resize_pty_os` delivers `SIGWINCH`.  Backgrounded jobs in neither group
+/// still survive — bounding those needs a cgroup, not a signal.
+///
+/// Leader-only remains available because `SIGINT`-to-the-leader is what a
+/// caller wants when emulating a keystroke, not a tree-wide interrupt.
+pub fn kill_pty(handle: &PtyHandle, signal: i32, group: bool) {
     unsafe {
-        libc::kill(handle.child_pid, signal);
+        if !group {
+            libc::kill(handle.child_pid, signal);
+            return;
+        }
+        let mut fg_pgid: libc::pid_t = 0;
+        libc::ioctl(handle.master_fd, libc::TIOCGPGRP, &mut fg_pgid);
+        if fg_pgid > 0 && fg_pgid != handle.child_pid {
+            libc::kill(-fg_pgid, signal);
+        }
+        libc::kill(-handle.child_pid, signal);
     }
 }
 
+/// Hang up a PTY: `SIGHUP` the child's group, then drop the master.
+///
+/// Closing the master alone makes the kernel hang up the terminal, but only
+/// processes still attached to it notice.  A grandchild that redirected away
+/// from the tty keeps running and keeps the slave open, which is why the
+/// signal goes to the group first.
 pub fn close_pty(handle: &PtyHandle) {
+    kill_pty(handle, libc::SIGHUP, true);
     unsafe {
-        libc::kill(handle.child_pid, libc::SIGHUP);
         libc::close(handle.master_fd);
     }
 }
@@ -294,14 +321,96 @@ pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
     blit_remote::EXIT_STATUS_UNKNOWN
 }
 
+/// Has this child exited?  Non-blocking, and it parks the status so the
+/// `cleanup_pty_internal` that follows still reports the real exit code.
+///
+/// This is what decouples exit detection from EOF on the master fd.  A
+/// grandchild that keeps the slave open means the master never reaches EOF,
+/// so a child could exit with the terminal stuck in `running` forever; the
+/// supervisor polls this instead, woken by SIGCHLD.
+pub fn poll_child_exited(handle: &PtyHandle) -> bool {
+    let mut reaped = reaped_statuses().lock().unwrap();
+    if reaped.contains_key(&handle.child_pid) {
+        return true;
+    }
+    // Same lock order as reap_zombies and collect_exit_status: reaped first,
+    // then pty_pids, so a concurrent reaper cannot take the status between
+    // the check and the park.
+    let owned = pty_pids().lock().unwrap();
+    if !owned.contains(&handle.child_pid) {
+        // Already collected — the caller has its status.
+        return false;
+    }
+    let mut wstatus: libc::c_int = 0;
+    let pid = unsafe { libc::waitpid(handle.child_pid, &mut wstatus, libc::WNOHANG) };
+    if pid > 0 {
+        reaped.insert(pid, status_from_wstatus(wstatus));
+        return true;
+    }
+    false
+}
+
+/// Give up on a child's exit status without giving up on reaping it.
+///
+/// `C2S_CLOSE` hangs a live child up and never reports what it exited with,
+/// so nothing will ever call `collect_exit_status` for it.  It still has to be
+/// waited: the `SIGHUP` only asks it to die, and an unwaited child is a
+/// zombie for the life of the server.  Moving the pid here keeps
+/// `reap_zombies` sweeping it — discarding the status rather than parking it —
+/// until the wait succeeds and the registration goes away for good.
+pub fn abandon_pty_pid(handle: &PtyHandle) {
+    let mut reaped = reaped_statuses().lock().unwrap();
+    pty_pids().lock().unwrap().remove(&handle.child_pid);
+    reaped.remove(&handle.child_pid);
+    abandoned_pids().lock().unwrap().insert(handle.child_pid);
+}
+
+/// Is reaping unowned children this process's job?
+///
+/// Only as PID 1.  A PTY grandchild that outlives its parent reparents to
+/// init, and if that is us, nobody else will ever wait for it.  Elsewhere an
+/// unowned child of this process belongs to a subsystem that reaps it itself,
+/// and taking its status is the theft this reaper used to commit.
+///
+/// A nested `PR_SET_CHILD_SUBREAPER` ancestor would also collect orphans, but
+/// blit never sets that on itself and nothing in the tree arranges it, so the
+/// PID check is the whole realistic surface.
+fn adopts_orphans() -> bool {
+    unsafe { libc::getpid() == 1 }
+}
+
 pub fn reap_zombies() {
-    // Backstop reaper. Reap every exited child so none becomes a
-    // zombie, but only *park* statuses for PTY-owned pids: a foreign
-    // child (e.g. a blit-lsp language server, reaped by its own engine
-    // on every path) must not leave a stale entry that a later PTY
-    // child recycling its pid would collect.
+    // Backstop reaper, targeted at pids this module owns.
+    //
+    // It used to drain `waitpid(-1)` unconditionally and discard anything
+    // foreign, which reaped other subsystems' children out from under them:
+    // the audio pipeline's own `try_wait` would find the status already
+    // taken, and a language server's engine likewise.  The supervisor reaps
+    // PTY children promptly off SIGCHLD; this stays as a slow sweep so a
+    // missed wakeup cannot leave one a zombie.
     let mut reaped = reaped_statuses().lock().unwrap();
     let owned = pty_pids().lock().unwrap();
+    for &pid in owned.iter() {
+        let mut wstatus: libc::c_int = 0;
+        if unsafe { libc::waitpid(pid, &mut wstatus, libc::WNOHANG) } > 0 {
+            reaped.insert(pid, status_from_wstatus(wstatus));
+        }
+    }
+    // Children hung up by `C2S_CLOSE`.  Nobody wants their status, but they
+    // still have to be waited or they stay zombies — a server cycling
+    // terminals would march to RLIMIT_NPROC.  Drop each registration only
+    // once the wait succeeds, so a child still winding down is retried.
+    abandoned_pids()
+        .lock()
+        .unwrap()
+        .retain(|&pid| unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } <= 0);
+    if !adopts_orphans() {
+        return;
+    }
+    // Running as init (a container entrypoint, say).  Escaped grandchildren
+    // reparent here and nothing else will ever collect them, so drain what is
+    // left.  This is the old unconditional behaviour, now scoped to the one
+    // case where it is correct rather than merely harmful-and-tolerated.
     loop {
         let mut wstatus: libc::c_int = 0;
         let pid = unsafe { libc::waitpid(-1, &mut wstatus, libc::WNOHANG) };
@@ -319,6 +428,13 @@ pub fn reap_zombies() {
 fn reaped_statuses() -> &'static Mutex<HashMap<libc::pid_t, i32>> {
     static REAPED: OnceLock<Mutex<HashMap<libc::pid_t, i32>>> = OnceLock::new();
     REAPED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Pids hung up by `C2S_CLOSE`, whose status nobody will collect but which
+/// still need waiting.  Emptied by `reap_zombies` as each one dies.
+fn abandoned_pids() -> &'static Mutex<std::collections::HashSet<libc::pid_t>> {
+    static PIDS: OnceLock<Mutex<std::collections::HashSet<libc::pid_t>>> = OnceLock::new();
+    PIDS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
 /// Live PTY child pids, so the backstop parks statuses only for
@@ -596,7 +712,12 @@ pub fn spawn_pty(
         last_title_send: std::time::Instant::now(),
         title_pending: false,
         last_used_rows_sent: 0,
+        deadline: None,
+        stop_deadline: None,
+        exit_reason: blit_remote::EXIT_REASON_NORMAL,
         exited: false,
+        exited_at: None,
+        generation: 0,
         exit_status: blit_remote::EXIT_STATUS_UNKNOWN,
         command: command.map(|s| s.to_owned()),
         cwd: dir.map(|s| s.to_owned()),
@@ -803,6 +924,168 @@ mod tests {
             child_pid: pid,
         };
         assert_eq!(collect_exit_status(&handle), 42);
+    }
+
+    /// Fork a session leader that forks a child of its own, both parked in
+    /// `pause()`.  Returns (leader, grandchild).  Mirrors the shape that
+    /// matters in practice: a shell with a running command under it.
+    fn fork_leader_with_child() -> (libc::pid_t, libc::pid_t) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+        let leader = unsafe { libc::fork() };
+        assert!(leader >= 0, "fork failed");
+        if leader == 0 {
+            unsafe {
+                libc::close(fds[0]);
+                libc::setsid();
+                let grandchild = libc::fork();
+                if grandchild == 0 {
+                    loop {
+                        libc::pause();
+                    }
+                }
+                // Hand the grandchild's pid back and park.
+                let bytes = (grandchild as i32).to_le_bytes();
+                libc::write(fds[1], bytes.as_ptr().cast(), 4);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        unsafe { libc::close(fds[1]) };
+        let mut buf = [0u8; 4];
+        let n = unsafe { libc::read(fds[0], buf.as_mut_ptr().cast(), 4) };
+        assert_eq!(n, 4, "did not receive grandchild pid");
+        unsafe { libc::close(fds[0]) };
+        (leader, i32::from_le_bytes(buf))
+    }
+
+    fn is_alive(pid: libc::pid_t) -> bool {
+        // Signal 0 probes without delivering.  A zombie still answers, so
+        // reap first at the call sites that care.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Poll until `pid` is unreachable.  The grandchild is not this process's
+    /// child, so `waitid` answers ECHILD for it — once its parent dies it is
+    /// reparented and reaped by the subreaper, and probing is the only thing
+    /// left that works.
+    fn wait_until_gone(pid: libc::pid_t) {
+        for _ in 0..500 {
+            if !is_alive(pid) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("pid {pid} still alive after 5s");
+    }
+
+    /// The bug this replaced: `kill(pid, sig)` reached the session leader and
+    /// nothing else, so killing a shell left its children running.
+    #[test]
+    fn leader_only_kill_spares_the_child() {
+        let (leader, grandchild) = fork_leader_with_child();
+        let handle = PtyHandle {
+            master_fd: -1,
+            child_pid: leader,
+        };
+
+        super::kill_pty(&handle, libc::SIGKILL, false);
+        wait_until_zombie(leader);
+        assert!(
+            is_alive(grandchild),
+            "leader-only kill should not reach the child"
+        );
+
+        unsafe {
+            libc::kill(grandchild, libc::SIGKILL);
+            libc::waitpid(leader, std::ptr::null_mut(), 0);
+        }
+    }
+
+    #[test]
+    fn group_kill_reaches_the_child() {
+        let (leader, grandchild) = fork_leader_with_child();
+        let handle = PtyHandle {
+            master_fd: -1,
+            child_pid: leader,
+        };
+
+        super::kill_pty(&handle, libc::SIGKILL, true);
+        wait_until_zombie(leader);
+        unsafe {
+            libc::waitpid(leader, std::ptr::null_mut(), 0);
+        }
+        wait_until_gone(grandchild);
+    }
+
+    /// Exit detection must not depend on the master fd reaching EOF: a
+    /// grandchild holding the slave open keeps a dead terminal marked
+    /// running forever.  `poll_child_exited` answers from the child itself.
+    #[test]
+    fn poll_child_exited_reports_a_dead_child() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::_exit(7) };
+        }
+        super::register_pty_pid(pid);
+        let handle = PtyHandle {
+            master_fd: -1,
+            child_pid: pid,
+        };
+
+        wait_until_zombie(pid);
+        assert!(super::poll_child_exited(&handle));
+        // And the status it parked is still the one the caller gets.
+        assert_eq!(collect_exit_status(&handle), 7);
+    }
+
+    #[test]
+    fn poll_child_exited_is_false_while_the_child_runs() {
+        let (leader, grandchild) = fork_leader_with_child();
+        super::register_pty_pid(leader);
+        let handle = PtyHandle {
+            master_fd: -1,
+            child_pid: leader,
+        };
+
+        assert!(!super::poll_child_exited(&handle));
+
+        super::kill_pty(&handle, libc::SIGKILL, true);
+        wait_until_zombie(leader);
+        assert!(super::poll_child_exited(&handle));
+        unsafe {
+            libc::waitpid(leader, std::ptr::null_mut(), 0);
+        }
+        wait_until_gone(grandchild);
+    }
+
+    /// `C2S_CLOSE` hangs a live child up and never asks its status.  It still
+    /// has to be waited, or every close leaves a zombie for the life of the
+    /// server and a terminal-cycling client marches to RLIMIT_NPROC.
+    #[test]
+    fn abandoned_children_are_still_reaped() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        super::register_pty_pid(pid);
+        let handle = PtyHandle {
+            master_fd: -1,
+            child_pid: pid,
+        };
+
+        // The close path: no status will ever be collected for this child.
+        super::abandon_pty_pid(&handle);
+        wait_until_zombie(pid);
+        reap_zombies();
+
+        // Reaped, so no longer waitable — a still-zombie child would return
+        // its pid here instead of -1.
+        let ret = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(ret, -1, "child was left unreaped");
     }
 
     fn child_env_map(env: Vec<std::ffi::CString>) -> HashMap<String, String> {

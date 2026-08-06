@@ -48,9 +48,10 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 | `0x17` | `CREATE_N`              | `[nonce:2][rows:2][cols:2][tag_len:2][tag:N]`                                                                                                                        |
 | `0x18` | `CREATE2`               | `[nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][optional…]`                                                                                                 |
 | `0x19` | `READ`                  | `[nonce:2][pty_id:2][offset:4][limit:4][flags:1]`                                                                                                                    |
-| `0x1A` | `KILL`                  | `[pty_id:2][signal:4]` — send signal to PTY session leader                                                                                                           |
+| `0x1A` | `KILL`                  | `[pty_id:2][signal:4][flags:1]` — send signal to a PTY's process group; `flags` optional                                                                             |
 | `0x1B` | `COPY_RANGE`            | `[nonce:2][pty_id:2][start_tail:4][start_col:2][end_tail:4][end_col:2][flags:1]`                                                                                     |
 | `0x1C` | `TERM_CWD`              | `[nonce:2][pty_id:2]` — request a PTY's live working directory (see [Working directory tracking](#working-directory-tracking))                                       |
+| `0x1D` | `DEADLINE`              | `[pty_id:2][ms:4]` — arm or refresh a server-enforced deadline; `ms = 0` clears it                                                                                   |
 | `0x20` | `SURFACE_INPUT`         | `[surface_id:2][keycode:4][pressed:1]`                                                                                                                               |
 | `0x21` | `SURFACE_POINTER`       | `[surface_id:2][type:1][button:1][x:2][y:2]`                                                                                                                         |
 | `0x22` | `SURFACE_POINTER_AXIS`  | `[surface_id:2][axis:1][value:4]` — legacy scroll, superseded by `0x32`                                                                                              |
@@ -86,6 +87,8 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 - Bit 0 (`HAS_SRC_PTY`): followed by `[src_pty_id:2]` — create the new PTY in the same working directory as `src_pty_id`.
 - Bit 1 (`HAS_COMMAND`): remaining bytes after tag (and `src_pty_id` if present) are the UTF-8 command string (no length prefix) — spawn this command instead of the default shell.
 - Bit 2 (`HAS_CWD`): followed by `[cwd_len:2][cwd:N]` (before any command bytes) — spawn in this working directory.
+- Bit 3 (`WANT_STATUS`): valid only when `HELLO` advertises `CREATE_STATUS`; requests one correlated `CREATED_N` or `CREATE_FAILED` outcome. It adds no trailing field.
+- Bit 4 (`HAS_DEADLINE`): followed by `[ms:4]`, after any cwd and before any command bytes — arm a deadline at creation. Valid only when `HELLO` advertises `PTY_DEADLINE`.
 
 `READ` requests text from a PTY's scrollback + viewport:
 
@@ -120,7 +123,7 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 | `0x05` | `SEARCH_RESULTS`    | `[request_id:2][results…]`                                                                                         |
 | `0x06` | `CREATED_N`         | `[nonce:2][pty_id:2][tag:N]`                                                                                       |
 | `0x07` | `HELLO`             | `[version:2][features:4][boot_generation:8][server_version_len:2][server_version:N]`                               |
-| `0x08` | `EXITED`            | `[pty_id:2][exit_status:4]`                                                                                        |
+| `0x08` | `EXITED`            | `[pty_id:2][exit_status:4][reason:1]` — `reason` appended; older servers omit it                                   |
 | `0x09` | `READY`             | (no payload)                                                                                                       |
 | `0x0A` | `TEXT`              | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]`                                                             |
 | `0x0B` | `PING`              | _(empty)_ — server keepalive                                                                                       |
@@ -128,6 +131,7 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 | `0x0D` | `USED_ROWS`         | `[pty_id:2][used_rows:2]`                                                                                          |
 | `0x0E` | `TERM_CWD`          | `[nonce:2][cwd_len:2][cwd:N]` — reply to `C2S_TERM_CWD`; empty = unknown                                           |
 | `0x0F` | `TERM_CWD_EVENT`    | `[pty_id:2][cwd:N]` — unsolicited push when the OSC 7-reported cwd changes                                         |
+| `0x10` | `CREATE_FAILED`     | `[nonce:2][status:1][detail:N]` — refusal of a `CREATE2(WANT_STATUS)`                                              |
 | `0x20` | `SURFACE_CREATED`   | `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`                              |
 | `0x21` | `SURFACE_DESTROYED` | `[surface_id:2]`                                                                                                   |
 | `0x22` | `SURFACE_FRAME`     | `[surface_id:2][timestamp:4][flags:1][w:2][h:2][data:N]`                                                           |
@@ -154,21 +158,126 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 
 `S2C_HELLO` is the first message sent on every new connection. `version` is the server's protocol version. `boot_generation` is an opaque little-endian identifier generated once per server process; clients can compare it across reconnects to detect a server restart. `server_version` is the server's release string (its crate version, e.g. `0.40.1`) — informational only: feature negotiation always goes through the feature bits, never a version comparison. Both trailing fields were appended without a protocol bump, so legacy servers omit them and clients must treat a short `HELLO` as valid. `features` is a 4-byte bitmask:
 
-| Bit | Name           | Meaning                                                        |
-| --- | -------------- | -------------------------------------------------------------- |
-| 0   | `CREATE_NONCE` | Server supports `CREATE2` / `CREATED_N` with nonce correlation |
-| 1   | `RESTART`      | Server supports `C2S_RESTART` to respawn exited PTYs           |
-| 2   | `RESIZE_BATCH` | Server accepts batched resize entries in a single `C2S_RESIZE` |
-| 3   | `COPY_RANGE`   | Server supports range-based text copy                          |
-| 4   | `COMPOSITOR`   | Server supports headless Wayland compositor                    |
-| 5   | `AUDIO`        | Server supports audio forwarding (PipeWire capture + Opus)     |
-| 6   | `FS`           | Server supports the `FS_*` filesystem sync family              |
-| 7   | `GIT`          | Server supports the `GIT_*` git introspection family           |
-| 8   | `LSP`          | Server supports the `LSP_*` language intelligence family       |
+| Bit | Name            | Meaning                                                        |
+| --- | --------------- | -------------------------------------------------------------- |
+| 0   | `CREATE_NONCE`  | Server supports `CREATE2` / `CREATED_N` with nonce correlation |
+| 1   | `RESTART`       | Server supports `C2S_RESTART` to respawn exited PTYs           |
+| 2   | `RESIZE_BATCH`  | Server accepts batched resize entries in a single `C2S_RESIZE` |
+| 3   | `COPY_RANGE`    | Server supports range-based text copy                          |
+| 4   | `COMPOSITOR`    | Server supports headless Wayland compositor                    |
+| 5   | `AUDIO`         | Server supports audio forwarding (PipeWire capture + Opus)     |
+| 6   | `FS`            | Server supports the `FS_*` filesystem sync family              |
+| 7   | `GIT`           | Server supports the `GIT_*` git introspection family           |
+| 8   | `LSP`           | Server supports the `LSP_*` language intelligence family       |
+| 9   | `KV`            | Server supports the `KV_*` key-value family                    |
+| 10  | `NET`           | Server supports the `NET_*` network-relay family               |
+| 14  | `CREATE_STATUS` | `CREATE2(WANT_STATUS)` receives an explicit failure            |
+| 15  | `KILL_MODE`     | `KILL`/`CLOSE` reach the process group; `KILL` takes `flags`   |
+| 16  | `PTY_DEADLINE`  | `C2S_DEADLINE`, `CREATE2(HAS_DEADLINE)`, and `EXITED.reason`   |
+
+Bits 11 through 13 are held for the extension, channel, and process families
+under review in [#167](https://github.com/indent-com/blit/pull/167) and
+[#173](https://github.com/indent-com/blit/pull/173); nothing advertises them
+today. Bit 14 is always advertised.
+
+### Common status registry
+
+New request/reply families should use this registry for a one-byte `status`
+unless their wire definition explicitly declares a message-local table.
+Existing message-local tables such as `FS_SYNCED` and `NET_OPENED` are
+grandfathered and do not share all of these numeric meanings.
+
+| Value | Name            | Meaning                                                      |
+| ----: | --------------- | ------------------------------------------------------------ |
+|     0 | `OK`            | Request completed successfully                               |
+|     1 | `UNKNOWN_ID`    | Requested identifier or handle is absent or already closed   |
+|     2 | `NOT_FOUND`     | Path, object, symbol, or backend does not exist              |
+|     3 | `WRONG_TYPE`    | Existing object cannot satisfy this operation                |
+|     4 | `PERMISSION`    | Operation is disabled or denied                              |
+|     5 | `TOO_LARGE`     | Input or result exceeds a size ceiling                       |
+|     6 | `BUDGET`        | A resource budget is exhausted without pagination/truncation |
+|     7 | `INVALID`       | Request encoding, flags, or field combination is invalid     |
+|     8 | `CANCELLED`     | Operation ended through its cancellation mechanism           |
+|     9 | `OTHER`         | Unclassified backend failure; detail should diagnose it      |
+|    10 | `WARMING`       | LSP backend is not ready; retry later                        |
+|    11 | `CONFLICT`      | A revision, lock, or compare-and-swap precondition failed    |
+|    12 | `NO_MERGE_BASE` | Valid Git histories have no common ancestor                  |
+
+Values 0–127 are centrally allocated common statuses; 13–127 are currently
+reserved. New family-local allocations use 128–255 and must be defined by the
+packet which carries them. Existing message-local tables retain their shipped
+values. Consumers render unknown values distinctly from `OTHER`.
 
 `S2C_LIST` entry layout: `[pty_id:2][tag_len:2][tag:N][cmd_len:2][cmd:M]` per
 PTY. The trailing command field is a backward-compatible extension; old
 entries without it parse as an empty command.
+
+When `HELLO` advertises `CREATE_STATUS`, shipped clients set
+`CREATE2.WANT_STATUS`. Once that request's nonce and feature byte are
+decodable, it receives exactly one outcome: `CREATED_N` on success or
+`CREATE_FAILED` on refusal. `CREATE_FAILED.status` uses the common registry and
+`detail` is diagnostic UTF-8, truncated to 1 KiB on a character boundary. In
+particular, a projected `LIST` overflow and PTY-ID or configured PTY-cap
+exhaustion return `BUDGET`, an unrepresentable tag or command returns
+`TOO_LARGE`, malformed fields return `INVALID`, and spawn failure returns
+`OTHER`. A tag or command that cannot round-trip `S2C_LIST`'s `u16` length
+prefixes is refused rather than silently truncated into a corrupt catalog
+frame; bounding the _aggregate_ `LIST` size needs a logical-message ceiling
+that does not exist yet.
+
+The PTY cap is `--max-ptys` / `BLIT_MAX_PTYS`, unlimited by default. It counts
+_live_ terminals only — a client that runs a hundred short
+commands is not holding a hundred terminals, and counting the exited ones
+would refuse it work with nothing actually running.
+
+Exited terminals are bounded separately. Their output stays readable after the
+command ends, and nothing but an explicit `CLOSE` used to remove one, so the
+server keeps at most `BLIT_MAX_EXITED` of them (default 1024) and evicts the
+oldest first. Eviction takes the same path a `CLOSE` would and broadcasts the
+same `CLOSED`, so no client change is needed to follow it. `BLIT_EXITED_LINGER`
+adds a time bound in seconds; it is off by default, because how long a result
+stays interesting is not something the server can know.
+
+A terminal has no deadline unless a client arms one — detaching and coming
+back is the point of a multiplexer, so sessions do not expire on their own.
+`C2S_DEADLINE` and `CREATE2(HAS_DEADLINE)` opt in, and the server enforces it
+whether or not anyone is still connected, which is the difference from every
+client-side timeout. `ms` counts from when the server receives the message, so
+re-sending refreshes: repeat it on an interval and it becomes a dead-man
+switch, killing the terminal roughly one period after the orchestrator stops
+checking in. `ms = 0` clears the deadline and stands down an in-flight stop.
+
+On expiry the server sends SIGTERM to the process group, waits 5 s, then sends
+SIGKILL, and the resulting `EXITED` carries `reason = 1` (`DEADLINE`). The
+`reason` byte exists because a deadline kill is otherwise indistinguishable
+from a user's `kill -9`: `0` normal, `1` deadline, `2` lease, `3` gc,
+`4` unit-stop. Only `0` and `1` are sent today — `2` and `4` are reserved for
+[design/units.md](design/units.md), and `3` is unused because retention
+eviction only ever touches a terminal that has already sent its `EXITED`, and
+signals itself with `CLOSED`. The byte is
+appended and length-gated, like the trailing fields on `HELLO`, so a 7-byte
+`EXITED` from an older server reads as `NORMAL`.
+
+`KILL` and `CLOSE` signal the child's process group on Unix and terminate its
+job object on Windows. `KILL`'s trailing `flags` byte is optional and armed by
+a message length of 8; bit 0 (`LEADER_ONLY`) restores the older behaviour of
+signalling the session leader alone, which is what a caller emulating a
+keystroke wants. A 7-byte `KILL` gets the group, so a client needs no change
+to stop leaking a killed shell's children. Group delivery reaches the leader's
+own group and, through `TIOCGPGRP`, the terminal's foreground group; a
+backgrounded job sits in neither and survives. Containing that needs a cgroup,
+not a signal. On Windows the job carries
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so dropping the handle takes any
+survivor with it; if the job cannot be created the PTY still runs and
+degrades to a leader-only kill.
+
+This is opt-in rather than a reinterpretation of `CREATED_N`; a legacy client
+cannot mistake an error for PTY zero. `CREATE`, `CREATE_AT`, `CREATE_N`, and
+`CREATE2` without negotiated `WANT_STATUS` retain their existing success-only
+contract: the server refuses an inadmissible mutation without sending
+`CREATED` or `CREATED_N`. A client must not set `WANT_STATUS` unless the server
+advertised bit 14. A server must not send `CREATE_FAILED` for a request which
+did not set it.
 
 `S2C_EXITED` exit status: `WEXITSTATUS` for normal exits (0, 1, …); negative signal number for signal deaths (-9 = SIGKILL); `i32::MIN` when status is unknown.
 

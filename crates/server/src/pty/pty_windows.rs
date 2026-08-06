@@ -5,11 +5,16 @@ use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
 };
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject,
+};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+    CREATE_SUSPENDED, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTUPINFOEXW,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread, STARTUPINFOEXW,
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
@@ -25,6 +30,13 @@ pub struct PtyHandle {
     pub(crate) process: HANDLE,
     pub(crate) input: HANDLE,
     pub(crate) output: HANDLE,
+    /// Job object owning the child and everything it spawns, so a kill
+    /// reaches the tree instead of orphaning it.  Windows has no process
+    /// group to signal, and `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` gives the
+    /// containment `SIGHUP`-to-the-group gives on Unix: dropping this handle
+    /// takes the tree with it.  Null when the job could not be created — the
+    /// PTY still works, it just degrades to a leader-only kill.
+    pub(crate) job: HANDLE,
 }
 
 unsafe impl Send for PtyHandle {}
@@ -67,38 +79,145 @@ pub fn resize_pty_os(handle: &PtyHandle, rows: u16, cols: u16) {
     }
 }
 
-pub fn kill_pty(handle: &PtyHandle, signal: i32) {
+/// Signal a PTY's child.  See the Unix twin for what `group` means; here it
+/// selects `TerminateJobObject` over `TerminateProcess`, which is the whole
+/// difference between killing the tree and orphaning it.
+///
+/// `SIGINT` stays a `^C` written into the ConPTY regardless: that is a
+/// console-input event the foreground program handles, and there is no
+/// job-wide equivalent.
+pub fn kill_pty(handle: &PtyHandle, signal: i32, group: bool) {
     match signal {
         2 => pty_write_all(PtyWriteTarget(handle.input), b"\x03"),
         _ => unsafe {
-            windows_sys::Win32::System::Threading::TerminateProcess(handle.process, 1);
+            if group && !handle.job.is_null() {
+                TerminateJobObject(handle.job, 1);
+            } else {
+                windows_sys::Win32::System::Threading::TerminateProcess(handle.process, 1);
+            }
         },
     }
 }
 
+/// Tear down the console, the pipes and the job.
+///
+/// Deliberately leaves `process` open: the caller reads the exit code through
+/// it immediately afterwards, and `GetExitCodeProcess` on a closed handle
+/// returns nothing useful — or, once the handle value is recycled, somebody
+/// else's exit code.  `collect_exit_status` closes it, and `abandon_pty_pid`
+/// covers the path that never asks for a status.
 pub fn close_pty(handle: &PtyHandle) {
     unsafe {
         ClosePseudoConsole(handle.conpty);
         CloseHandle(handle.input);
         CloseHandle(handle.output);
-        CloseHandle(handle.process);
-    }
-}
-
-pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
-    const STILL_ACTIVE: u32 = 259;
-    unsafe {
-        WaitForSingleObject(handle.process, 1000);
-        let mut exit_code: u32 = 0;
-        if GetExitCodeProcess(handle.process, &mut exit_code) != 0 && exit_code != STILL_ACTIVE {
-            exit_code as i32
-        } else {
-            blit_remote::EXIT_STATUS_UNKNOWN
+        // Last handle to the job, so KILL_ON_JOB_CLOSE fires here and takes
+        // any surviving descendant with it.
+        if !handle.job.is_null() {
+            CloseHandle(handle.job);
         }
     }
 }
 
+/// Read the child's exit code and release the process handle.
+///
+/// Mirrors the Unix twin's contract: calling this is what says "this child is
+/// finished with", so it is also where the last reference goes away.
+pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        // Bounded, not blocking: this runs under the session mutex, and the
+        // supervisor only calls it once `poll_child_exited` has already said
+        // the process is done.  The wait is a safety net for the EOF path,
+        // which can beat the kernel to the exit code by a hair.
+        WaitForSingleObject(handle.process, 50);
+        let mut exit_code: u32 = 0;
+        let status = if GetExitCodeProcess(handle.process, &mut exit_code) != 0
+            && exit_code != STILL_ACTIVE
+        {
+            exit_code as i32
+        } else {
+            blit_remote::EXIT_STATUS_UNKNOWN
+        };
+        CloseHandle(handle.process);
+        status
+    }
+}
+
+/// See the Unix twin.  Windows has no SIGCHLD, so the supervisor polls this
+/// on its own cadence instead of being woken.
+pub fn poll_child_exited(handle: &PtyHandle) -> bool {
+    const WAIT_OBJECT_0: u32 = 0;
+    unsafe { WaitForSingleObject(handle.process, 0) == WAIT_OBJECT_0 }
+}
+
+/// Give up on a child's exit status.  No zombies here — the process object
+/// goes away once the last handle closes — so this is just that close, the
+/// counterpart to the Unix wait.
+pub fn abandon_pty_pid(handle: &PtyHandle) {
+    unsafe {
+        CloseHandle(handle.process);
+    }
+}
+
 pub fn reap_zombies() {}
+
+/// Create an anonymous job object that kills its members when the last handle
+/// to it closes.  Returns null on failure; callers degrade to a leader-only
+/// kill rather than refusing to spawn, since a PTY without tree containment
+/// is still a working PTY.
+///
+/// Nested jobs are fine on Windows 8+, so this works even when the server
+/// itself was launched inside a job by a service manager or CI runner.
+fn create_kill_on_close_job() -> HANDLE {
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return std::ptr::null_mut();
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if ok == 0 {
+            CloseHandle(job);
+            return std::ptr::null_mut();
+        }
+        job
+    }
+}
+
+/// Put a `CREATE_SUSPENDED` child into `job` and let it run.  Returns the job
+/// actually in force — null when there is none, so the caller stores that and
+/// `kill_pty` falls back to terminating the leader.
+///
+/// The child must be created suspended: assigning it after it has started
+/// races against anything it spawns in the meantime, and those grandchildren
+/// would land outside the job.
+///
+/// A failed assignment has to null the handle, not just log: an empty job
+/// still looks live to `kill_pty`, which would then route every kill —
+/// including the deadline's SIGKILL equivalent — to `TerminateJobObject` on a
+/// job containing nothing, leaving a terminal that cannot be killed at all.
+fn adopt_into_job(job: HANDLE, pi: &PROCESS_INFORMATION) -> HANDLE {
+    unsafe {
+        let mut job = job;
+        if !job.is_null() && AssignProcessToJobObject(job, pi.hProcess) == 0 {
+            let err = GetLastError();
+            eprintln!(
+                "blit-server: job assignment failed (error {err}); kill will not reach the process tree"
+            );
+            CloseHandle(job);
+            job = std::ptr::null_mut();
+        }
+        ResumeThread(pi.hThread);
+        job
+    }
+}
 
 /// Answer terminal queries found in `data`; returns the last OSC 7
 /// working-directory report seen in the chunk, if any (docs/protocol.md,
@@ -282,6 +401,7 @@ pub fn spawn_pty(
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     si.lpAttributeList = attr_list;
 
+    let job = create_kill_on_close_job();
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let ok = unsafe {
         CreateProcessW(
@@ -290,7 +410,7 @@ pub fn spawn_pty(
             std::ptr::null(),
             std::ptr::null(),
             0,
-            EXTENDED_STARTUPINFO_PRESENT,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
             std::ptr::null(),
             dir_wide
                 .as_ref()
@@ -313,9 +433,14 @@ pub fn spawn_pty(
             ClosePseudoConsole(conpty);
             CloseHandle(input_write);
             CloseHandle(output_read);
+            if !job.is_null() {
+                CloseHandle(job);
+            }
         }
         return None;
     }
+
+    let job = adopt_into_job(job, &pi);
 
     unsafe {
         CloseHandle(pi.hThread);
@@ -326,6 +451,7 @@ pub fn spawn_pty(
         process: pi.hProcess,
         input: input_write,
         output: output_read,
+        job,
     };
 
     state
@@ -355,7 +481,12 @@ pub fn spawn_pty(
         last_title_send: std::time::Instant::now(),
         title_pending: false,
         last_used_rows_sent: 0,
+        deadline: None,
+        stop_deadline: None,
+        exit_reason: blit_remote::EXIT_REASON_NORMAL,
         exited: false,
+        exited_at: None,
+        generation: 0,
         exit_status: blit_remote::EXIT_STATUS_UNKNOWN,
         command: command.map(|s| s.to_owned()),
         cwd: dir.map(|s| s.to_owned()),
@@ -438,6 +569,7 @@ pub fn respawn_child(
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     si.lpAttributeList = attr_list;
 
+    let job = create_kill_on_close_job();
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let ok = unsafe {
         CreateProcessW(
@@ -446,7 +578,7 @@ pub fn respawn_child(
             std::ptr::null(),
             std::ptr::null(),
             0,
-            EXTENDED_STARTUPINFO_PRESENT,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
             std::ptr::null(),
             std::ptr::null(),
             &si.StartupInfo,
@@ -464,9 +596,14 @@ pub fn respawn_child(
             ClosePseudoConsole(conpty);
             CloseHandle(input_write);
             CloseHandle(output_read);
+            if !job.is_null() {
+                CloseHandle(job);
+            }
         }
         return None;
     }
+
+    let job = adopt_into_job(job, &pi);
 
     unsafe {
         CloseHandle(pi.hThread);
@@ -477,6 +614,7 @@ pub fn respawn_child(
         process: pi.hProcess,
         input: input_write,
         output: output_read,
+        job,
     };
 
     state

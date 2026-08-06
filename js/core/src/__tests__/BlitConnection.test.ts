@@ -27,13 +27,17 @@ import {
   C2S_CREATE2,
   CREATE2_HAS_COMMAND,
   CREATE2_HAS_CWD,
+  CREATE2_WANT_STATUS,
   FEATURE_CREATE_NONCE,
+  FEATURE_CREATE_STATUS,
   FEATURE_RESIZE_BATCH,
   FEATURE_RESTART,
   FRAGMENT_FLAG_LAST,
   S2C_FRAGMENT,
   S2C_PING,
   C2S_SURFACE_SUBSCRIBE,
+  STATUS_BUDGET,
+  STATUS_OTHER,
 } from "../types";
 import { FS_MAX_DECOMPRESSED } from "../fs";
 
@@ -328,6 +332,53 @@ describe("BlitConnection", () => {
     const promise = conn.createSession({ rows: 24, cols: 80 });
     transport.setStatus("disconnected");
     await expect(promise).rejects.toThrow(/disconnected/);
+  });
+
+  it("createSession omits WANT_STATUS when the server does not advertise it", () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE);
+    conn.createSession({ rows: 24, cols: 80 });
+    const msg = transport.sent.find((m) => m[0] === C2S_CREATE2)!;
+    expect(msg[7] & CREATE2_WANT_STATUS).toBe(0);
+  });
+
+  it("createSession sets WANT_STATUS when the server advertises it", () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE | FEATURE_CREATE_STATUS);
+    conn.createSession({ rows: 24, cols: 80 });
+    const msg = transport.sent.find((m) => m[0] === C2S_CREATE2)!;
+    expect(msg[7] & CREATE2_WANT_STATUS).toBe(CREATE2_WANT_STATUS);
+  });
+
+  it("S2C_CREATE_FAILED rejects only the matching nonce", async () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE | FEATURE_CREATE_STATUS);
+    const first = conn.createSession({ rows: 24, cols: 80, tag: "a" });
+    const second = conn.createSession({ rows: 24, cols: 80, tag: "b" });
+    const [msgA, msgB] = transport.sent.filter((m) => m[0] === C2S_CREATE2);
+    transport.pushCreateFailed(
+      msgA[1] | (msgA[2] << 8),
+      STATUS_BUDGET,
+      "pty cap reached",
+    );
+    await expect(first).rejects.toThrow(
+      "Create failed: budget exhausted: pty cap reached",
+    );
+    transport.pushCreatedN(msgB[1] | (msgB[2] << 8), 9, "b");
+    await expect(second).resolves.toMatchObject({ ptyId: 9, tag: "b" });
+  });
+
+  it("S2C_CREATE_FAILED with an empty detail omits the trailing text", async () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE | FEATURE_CREATE_STATUS);
+    const promise = conn.createSession({ rows: 24, cols: 80 });
+    const msg = transport.sent.find((m) => m[0] === C2S_CREATE2)!;
+    transport.pushCreateFailed(msg[1] | (msg[2] << 8), STATUS_OTHER);
+    await expect(promise).rejects.toThrow(/^Create failed: backend error$/);
+  });
+
+  it("S2C_CREATE_FAILED renders an unallocated status distinctly from OTHER", async () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE | FEATURE_CREATE_STATUS);
+    const promise = conn.createSession({ rows: 24, cols: 80 });
+    const msg = transport.sent.find((m) => m[0] === C2S_CREATE2)!;
+    transport.pushCreateFailed(msg[1] | (msg[2] << 8), 200);
+    await expect(promise).rejects.toThrow("Create failed: unknown status 200");
   });
 
   // --- copyRange ---

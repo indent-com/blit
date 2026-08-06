@@ -15,14 +15,18 @@ import {
   FEATURE_COMPOSITOR,
   FEATURE_COPY_RANGE,
   FEATURE_CREATE_NONCE,
+  FEATURE_CREATE_STATUS,
+  FEATURE_KILL_MODE,
   FEATURE_RESIZE_BATCH,
   FEATURE_RESTART,
+  statusText,
   S2C_AUDIO_FRAME,
   PROTOCOL_VERSION,
   S2C_CLIPBOARD_CONTENT,
   S2C_CLOSED,
   S2C_CREATED,
   S2C_CREATED_N,
+  S2C_CREATE_FAILED,
   S2C_EXITED,
   S2C_HELLO,
   S2C_LIST,
@@ -916,6 +920,7 @@ export class BlitConnection {
           command: options.command,
           srcPtyId,
           cwd: options.cwd,
+          wantStatus: (this.features & FEATURE_CREATE_STATUS) !== 0,
         }),
       );
     });
@@ -991,7 +996,14 @@ export class BlitConnection {
     this.transport.send(buildRestartMessage(session.ptyId));
   }
 
-  killSession(sessionId: SessionId, signal = 15): void {
+  /**
+   * Signals a terminal. Reaches the child's process group by default, which
+   * is what a "kill this terminal" affordance means and what the kernel does
+   * for a real `^C`. `leaderOnly` addresses the session leader alone; it is
+   * dropped against a server without {@link FEATURE_KILL_MODE}, which is
+   * leader-only regardless.
+   */
+  killSession(sessionId: SessionId, signal = 15, leaderOnly = false): void {
     const session = this.sessionsById.get(sessionId);
     if (
       !session ||
@@ -1000,7 +1012,13 @@ export class BlitConnection {
     ) {
       return;
     }
-    this.transport.send(buildKillMessage(session.ptyId, signal));
+    this.transport.send(
+      buildKillMessage(
+        session.ptyId,
+        signal,
+        leaderOnly && (this.features & FEATURE_KILL_MODE) !== 0,
+      ),
+    );
   }
 
   focusSession(sessionId: SessionId | null): void {
@@ -3261,6 +3279,20 @@ export class BlitConnection {
           pending.resolve(toPublicSession(session));
         }
 
+        return;
+      }
+      case S2C_CREATE_FAILED: {
+        if (bytes.length < 4) return;
+        const nonce = bytes[1] | (bytes[2] << 8);
+        const pending = this.pendingCreates.get(nonce);
+        if (!pending) return;
+        this.pendingCreates.delete(nonce);
+        const detail = textDecoder.decode(bytes.subarray(4));
+        pending.reject(
+          connectionError(
+            `Create failed: ${statusText(bytes[3])}${detail ? `: ${detail}` : ""}`,
+          ),
+        );
         return;
       }
       case S2C_CLOSED: {
