@@ -154,8 +154,15 @@ unsafe fn get_encoded_session_parameters<T: vk::ExtendsVideoEncodeSessionParamet
         )
     };
     if res != vk::Result::SUCCESS || size == 0 {
-        eprintln!("[vulkan-encode] parameter-set size query failed: {res:?} size={size}");
-        return None;
+        // NVIDIA's driver (595.84) fails the pData=NULL *size query* for a
+        // High 4:4:4 Predictive PPS with ERROR_OUT_OF_HOST_MEMORY and
+        // size=0, but its *writer* works: retry against a caller-sized
+        // buffer before declaring the parameter sets unobtainable.
+        eprintln!(
+            "[vulkan-encode] parameter-set size query failed: {res:?} size={size}; \
+             retrying with a fixed-size buffer",
+        );
+        size = 4096;
     }
 
     let mut buf = vec![0u8; size];
@@ -361,7 +368,9 @@ impl VulkanVideoEncoder {
         };
 
         eprintln!(
-            "[vulkan-encode] H.264 caps: max_coded={max_coded_w}x{max_coded_h}, max_dpb={max_dpb}, max_level={max_level_idc}, level={level_idc}",
+            "[vulkan-encode] H.264 caps: max_coded={max_coded_w}x{max_coded_h}, max_dpb={max_dpb}, max_level={max_level_idc}, level={level_idc}, flags={:#x}, std_syntax={:#x}",
+            h264_caps.flags.as_raw(),
+            h264_caps.std_syntax_flags.as_raw(),
         );
 
         // ---------------------------------------------------------------
@@ -467,6 +476,14 @@ impl VulkanVideoEncoder {
         let mut pps_flags: StdVideoH264PpsFlags = unsafe { std::mem::zeroed() };
         pps_flags.set_entropy_coding_mode_flag(1); // CABAC
         pps_flags.set_deblocking_filter_control_present_flag(1);
+        if is_444 {
+            // NVENC encodes High 4:4:4 Predictive with 8x8 transforms; a PPS
+            // claiming transform_8x8_mode_flag=0 asks the driver's writer to
+            // describe a stream the hardware won't produce, and it fails the
+            // PPS serialization (ERROR_OUT_OF_HOST_MEMORY, size=0) instead of
+            // overriding — the "NVIDIA can't serialize its 4:4:4 PPS" wall.
+            pps_flags.set_transform_8x8_mode_flag(1);
+        }
 
         let mut pps: StdVideoH264PictureParameterSet = unsafe { std::mem::zeroed() };
         pps.flags = pps_flags;
@@ -527,33 +544,22 @@ impl VulkanVideoEncoder {
         let params_bytes = unsafe {
             get_encoded_session_parameters(device, video_fns, session_params, &mut h264_get)
         };
-        let Some(params_bytes) = params_bytes else {
-            // Known to happen for 4:4:4 on the NVIDIA proprietary driver
-            // (595.84): it advertises H.264 High 4:4:4 Predictive encode
-            // caps, accepts the SPS/PPS pair at
-            // vkCreateVideoSessionParametersKHR, serializes the SPS fine (14
-            // bytes) — and then fails the PPS with ERROR_OUT_OF_HOST_MEMORY.
-            // The same PPS serializes at 4:2:0, so this is the driver's
-            // serializer rather than our struct.  Refusing here is what makes
-            // the server fall back to a server-side 4:4:4 encoder instead of
-            // shipping a stream with no parameter sets.
+        let params_bytes = params_bytes.unwrap_or_else(|| {
+            // The NVIDIA proprietary driver (595.84) advertises H.264 High
+            // 4:4:4 Predictive encode caps and accepts the SPS/PPS pair at
+            // vkCreateVideoSessionParametersKHR, but its own serializer
+            // fails the 4:4:4 PPS with ERROR_OUT_OF_HOST_MEMORY — in both
+            // the size-query and buffered forms.  The encode session itself
+            // works, so serialize the parameter sets ourselves from the very
+            // structs the driver just accepted, the same way the AV1 path
+            // writes its sequence header (where no get API exists at all).
             eprintln!(
-                "[vulkan-encode] could not retrieve H.264 {} parameter sets; refusing the session",
+                "[vulkan-encode] driver could not serialize H.264 {} parameter sets; \
+                 serializing them app-side",
                 if is_444 { "4:4:4" } else { "4:2:0" },
             );
-            for &m in &session_memory {
-                unsafe { device.free_memory(m, None) };
-            }
-            unsafe {
-                (video_fns.destroy_video_session_parameters)(
-                    device.handle(),
-                    session_params,
-                    ptr::null(),
-                );
-                (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
-            }
-            return None;
-        };
+            h264_parameter_sets(&sps, &pps, is_444)
+        });
         eprintln!(
             "[vulkan-encode] H.264 parameter sets: {} bytes",
             params_bytes.len(),
@@ -589,6 +595,7 @@ impl VulkanVideoEncoder {
                 physical_device,
                 video_fns,
                 BITSTREAM_CAPACITY,
+                &profile,
                 &dpb_slots,
                 &session_memory,
                 session_params,
@@ -599,11 +606,22 @@ impl VulkanVideoEncoder {
         // ---------------------------------------------------------------
         // 8. Query pool (encode feedback)
         // ---------------------------------------------------------------
-        let mut h264_profile_for_qp = vk::VideoEncodeH264ProfileInfoKHR::default()
-            .std_profile_idc(StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH);
+        // The query pool must be created against the same profile as the
+        // session — a 4:4:4 session paired with a hardcoded High/4:2:0 pool
+        // is a spec violation the driver merely tolerates.
+        let mut h264_profile_for_qp =
+            vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(if is_444 {
+                StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE
+            } else {
+                StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
+            });
         let mut video_profile_for_query = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
-            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+            .chroma_subsampling(if is_444 {
+                vk::VideoChromaSubsamplingFlagsKHR::TYPE_444
+            } else {
+                vk::VideoChromaSubsamplingFlagsKHR::TYPE_420
+            })
             .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
             .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
             .push_next(&mut h264_profile_for_qp);
@@ -1000,7 +1018,8 @@ impl VulkanVideoEncoder {
         unsafe { (video_fns.cmd_end_video_coding)(cb, &end_coding) };
 
         // End command buffer.
-        if unsafe { device.end_command_buffer(cb) }.is_err() {
+        if let Err(e) = unsafe { device.end_command_buffer(cb) } {
+            eprintln!("[vulkan-encode] vkEndCommandBuffer failed: {e:?}");
             unsafe { device.free_command_buffers(encode_cmd_pool, &[cb]) };
             return None;
         }
@@ -1009,7 +1028,8 @@ impl VulkanVideoEncoder {
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
         let fence_info = vk::FenceCreateInfo::default();
         let fence = unsafe { device.create_fence(&fence_info, None).ok()? };
-        if unsafe { device.queue_submit(encode_queue, &[submit], fence) }.is_err() {
+        if let Err(e) = unsafe { device.queue_submit(encode_queue, &[submit], fence) } {
+            eprintln!("[vulkan-encode] vkQueueSubmit failed: {e:?}");
             unsafe {
                 device.destroy_fence(fence, None);
                 device.free_command_buffers(encode_cmd_pool, &[cb]);
@@ -1377,6 +1397,7 @@ impl VulkanVideoEncoder {
                 physical_device,
                 video_fns,
                 BITSTREAM_CAPACITY,
+                &profile,
                 &dpb_slots,
                 &session_memory,
                 session_params,
@@ -1821,7 +1842,8 @@ impl VulkanVideoEncoder {
         unsafe { (video_fns.cmd_end_video_coding)(cb, &end_coding) };
 
         // End command buffer.
-        if unsafe { device.end_command_buffer(cb) }.is_err() {
+        if let Err(e) = unsafe { device.end_command_buffer(cb) } {
+            eprintln!("[vulkan-encode] vkEndCommandBuffer failed: {e:?}");
             unsafe { device.free_command_buffers(encode_cmd_pool, &[cb]) };
             return None;
         }
@@ -1830,7 +1852,8 @@ impl VulkanVideoEncoder {
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
         let fence_info = vk::FenceCreateInfo::default();
         let fence = unsafe { device.create_fence(&fence_info, None).ok()? };
-        if unsafe { device.queue_submit(encode_queue, &[submit], fence) }.is_err() {
+        if let Err(e) = unsafe { device.queue_submit(encode_queue, &[submit], fence) } {
+            eprintln!("[vulkan-encode] vkQueueSubmit failed: {e:?}");
             unsafe {
                 device.destroy_fence(fence, None);
                 device.free_command_buffers(encode_cmd_pool, &[cb]);
@@ -1999,6 +2022,151 @@ fn compute_level_idc(width: u32, height: u32) -> StdVideoH264LevelIdc {
         // Level 5.2: 4096x2304
         StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_2
     }
+}
+
+/// H.264 Exp-Golomb bit writer for hand-serializing parameter sets.
+///
+/// Used when the driver's own serializer refuses: NVIDIA (595.84) fails
+/// `vkGetEncodedVideoSessionParametersKHR` for a High 4:4:4 Predictive PPS
+/// with `ERROR_OUT_OF_HOST_MEMORY` in both the size-query and write forms,
+/// while the encode session itself works — the same shape as AV1, where no
+/// serializer exists at all and the application writes the header itself.
+struct H264BitWriter {
+    bytes: Vec<u8>,
+    used: u8,
+}
+
+impl H264BitWriter {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            used: 0,
+        }
+    }
+
+    fn u(&mut self, n: u32, v: u32) {
+        for i in (0..n).rev() {
+            if self.used == 0 {
+                self.bytes.push(0);
+            }
+            let bit = ((v >> i) & 1) as u8;
+            *self.bytes.last_mut().unwrap() |= bit << (7 - self.used);
+            self.used = (self.used + 1) & 7;
+        }
+    }
+
+    /// ue(v): Exp-Golomb.
+    fn ue(&mut self, v: u32) {
+        let cw = v + 1;
+        let bits = 32 - cw.leading_zeros();
+        self.u(bits - 1, 0);
+        self.u(bits, cw);
+    }
+
+    /// se(v): signed Exp-Golomb.
+    fn se(&mut self, v: i32) {
+        let mapped = if v <= 0 {
+            (-2 * v) as u32
+        } else {
+            (2 * v - 1) as u32
+        };
+        self.ue(mapped);
+    }
+
+    /// rbsp_trailing_bits + emulation prevention + Annex B start code and
+    /// NAL header.
+    fn into_nal(mut self, nal_ref_idc: u8, nal_unit_type: u8) -> Vec<u8> {
+        self.u(1, 1); // rbsp_stop_one_bit
+        while self.used != 0 {
+            self.u(1, 0);
+        }
+        let mut out = vec![0, 0, 0, 1, (nal_ref_idc << 5) | nal_unit_type];
+        let mut zeros = 0u32;
+        for &b in &self.bytes {
+            if zeros >= 2 && b <= 3 {
+                out.push(3);
+                zeros = 0;
+            }
+            out.push(b);
+            zeros = if b == 0 { zeros + 1 } else { 0 };
+        }
+        out
+    }
+}
+
+/// Numeric `level_idc` for a `StdVideoH264LevelIdc` enum value (which counts
+/// levels in order, not by their H.264 numbering).
+fn h264_level_idc_value(level: StdVideoH264LevelIdc) -> u32 {
+    const LEVELS: [u32; 19] = [
+        10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40, 41, 42, 50, 51, 52, 60, 61, 62,
+    ];
+    LEVELS.get(level as usize).copied().unwrap_or(51)
+}
+
+/// Serialize the SPS + PPS `try_new_h264` handed the driver, as Annex B
+/// NALs.  Field for field the same values as the `StdVideoH264*ParameterSet`
+/// structs — keep them in lockstep, exactly like the AV1 sequence header.
+fn h264_parameter_sets(
+    sps: &StdVideoH264SequenceParameterSet,
+    pps: &StdVideoH264PictureParameterSet,
+    is_444: bool,
+) -> Vec<u8> {
+    let mut w = H264BitWriter::new();
+    w.u(8, sps.profile_idc);
+    w.u(8, 0); // constraint_set*_flag + reserved_zero_2bits
+    w.u(8, h264_level_idc_value(sps.level_idc));
+    w.ue(sps.seq_parameter_set_id as u32);
+    // profile_idc 100/244 branch (both High-family profiles we emit).
+    w.ue(sps.chroma_format_idc);
+    if sps.chroma_format_idc == StdVideoH264ChromaFormatIdc_STD_VIDEO_H264_CHROMA_FORMAT_IDC_444 {
+        w.u(1, 0); // separate_colour_plane_flag
+    }
+    w.ue(sps.bit_depth_luma_minus8 as u32);
+    w.ue(sps.bit_depth_chroma_minus8 as u32);
+    w.u(1, 0); // qpprime_y_zero_transform_bypass_flag
+    w.u(1, 0); // seq_scaling_matrix_present_flag
+    w.ue(sps.log2_max_frame_num_minus4 as u32);
+    w.ue(sps.pic_order_cnt_type); // 2: nothing further
+    w.ue(sps.max_num_ref_frames as u32);
+    w.u(1, 0); // gaps_in_frame_num_value_allowed_flag
+    w.ue(sps.pic_width_in_mbs_minus1);
+    w.ue(sps.pic_height_in_map_units_minus1);
+    w.u(1, 1); // frame_mbs_only_flag
+    w.u(1, 1); // direct_8x8_inference_flag
+    let cropping = sps.frame_crop_right_offset != 0 || sps.frame_crop_bottom_offset != 0;
+    w.u(1, cropping as u32);
+    if cropping {
+        w.ue(0);
+        w.ue(sps.frame_crop_right_offset);
+        w.ue(0);
+        w.ue(sps.frame_crop_bottom_offset);
+    }
+    w.u(1, 0); // vui_parameters_present_flag
+    let mut out = w.into_nal(3, 7);
+
+    let mut w = H264BitWriter::new();
+    w.ue(pps.pic_parameter_set_id as u32);
+    w.ue(pps.seq_parameter_set_id as u32);
+    w.u(1, 1); // entropy_coding_mode_flag (CABAC)
+    w.u(1, 0); // bottom_field_pic_order_in_frame_present_flag
+    w.ue(0); // num_slice_groups_minus1
+    w.ue(pps.num_ref_idx_l0_default_active_minus1 as u32);
+    w.ue(pps.num_ref_idx_l1_default_active_minus1 as u32);
+    w.u(1, 0); // weighted_pred_flag
+    w.u(2, 0); // weighted_bipred_idc (DEFAULT)
+    w.se(pps.pic_init_qp_minus26 as i32);
+    w.se(0); // pic_init_qs_minus26
+    w.se(0); // chroma_qp_index_offset
+    w.u(1, 1); // deblocking_filter_control_present_flag
+    w.u(1, 0); // constrained_intra_pred_flag
+    w.u(1, 0); // redundant_pic_cnt_present_flag
+    // High-profile tail — present so transform_8x8_mode_flag can state what
+    // the hardware does at 4:4:4 (see the PPS flags in `try_new_h264`).
+    w.u(1, is_444 as u32); // transform_8x8_mode_flag
+    w.u(1, 0); // pic_scaling_matrix_present_flag
+    w.se(0); // second_chroma_qp_index_offset
+    out.extend_from_slice(&w.into_nal(3, 8));
+    out
 }
 
 /// Serialize the `sequence_header_obu()` matching the
@@ -2349,15 +2517,24 @@ unsafe fn allocate_bitstream_buffer(
     physical_device: vk::PhysicalDevice,
     video_fns: &VideoFns,
     capacity: u64,
+    profile: &vk::VideoProfileInfoKHR,
     dpb_slots: &[DpbSlot; 2],
     session_memory: &[vk::DeviceMemory],
     session_params: vk::VideoSessionParametersKHR,
     video_session: vk::VideoSessionKHR,
 ) -> Option<(vk::Buffer, vk::DeviceMemory, *mut u8)> {
+    // A VIDEO_ENCODE_DST buffer must name the profiles it will be used
+    // with (VUID-VkBufferCreateInfo-usage-04814).  NVIDIA tolerates the
+    // omission for High 4:2:0 sessions but enforces it for High 4:4:4
+    // Predictive: the encode records fine and then vkEndCommandBuffer
+    // fails with ERROR_INITIALIZATION_FAILED.
+    let profiles = [*profile];
+    let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
     let buf_info = vk::BufferCreateInfo::default()
         .size(capacity)
         .usage(vk::BufferUsageFlags::VIDEO_ENCODE_DST_KHR)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .push_next(&mut profile_list);
     let bitstream_buffer = match unsafe { device.create_buffer(&buf_info, None) } {
         Ok(b) => b,
         Err(e) => {

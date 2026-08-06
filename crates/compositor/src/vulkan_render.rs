@@ -306,8 +306,16 @@ enum Nv12OutputKind {
         y_view: vk::ImageView,
         uv_memory: vk::DeviceMemory,
         uv_view: vk::ImageView,
-        /// Full-image COLOR view for Vulkan Video encode source.
+        /// Full-image COLOR view for Vulkan Video encode source.  Belongs
+        /// to `encode_image` when that is present, to `image` otherwise.
         encode_view: Option<vk::ImageView>,
+        /// A separate `VIDEO_ENCODE_SRC` image the storage image is copied
+        /// into after each convert.  `STORAGE | VIDEO_ENCODE_SRC` on a
+        /// single image is not a supported combination (VUID 02251) — the
+        /// NVIDIA driver happens to tolerate it at 4:2:0 but rejects the
+        /// encode outright at 4:4:4 — so the compute shader writes a plain
+        /// storage image and the encode session reads this one.
+        encode_image: Option<(vk::Image, vk::DeviceMemory)>,
     },
 }
 
@@ -2347,9 +2355,14 @@ impl VulkanRenderer {
                     uv_memory,
                     uv_view,
                     encode_view,
+                    encode_image,
                 } => {
                     if let Some(ev) = encode_view {
                         self.device.destroy_image_view(ev, None);
+                    }
+                    if let Some((ei, em)) = encode_image {
+                        self.device.destroy_image(ei, None);
+                        self.device.free_memory(em, None);
                     }
                     self.device.destroy_image_view(y_view, None);
                     self.device.destroy_image_view(uv_view, None);
@@ -3078,6 +3091,7 @@ impl VulkanRenderer {
                 uv_memory,
                 uv_view,
                 encode_view,
+                encode_image: None,
             },
         })
     }
@@ -3116,7 +3130,11 @@ impl VulkanRenderer {
         } else {
             vk::Format::G8_B8R8_2PLANE_420_UNORM
         };
-        let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR;
+        // The compute shader writes a storage image; the session reads a
+        // separate `VIDEO_ENCODE_SRC` image the storage image is copied
+        // into per frame (see `Nv12OutputKind::Image::encode_image` for why
+        // one image cannot legally wear both usages).
+        let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
 
         // Both profile chains have to outlive the create call below, so both
         // leaf structs are materialised here and only the matching one is
@@ -3156,6 +3174,12 @@ impl VulkanRenderer {
         let mut format_list =
             vk::ImageFormatListCreateInfo::default().view_formats(&format_list_entries);
 
+        // Storage image: no video usage, so no profile list — MUTABLE +
+        // the plane format list is what the compute shader needs, and
+        // EXTENDED_USAGE is what makes STORAGE legal here at all: the
+        // multiplanar 4:4:4 format itself has no STORAGE feature, only its
+        // R8/R8G8 plane view formats do, and EXTENDED_USAGE tells the
+        // implementation to validate usage against those.
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(nv12_format)
@@ -3169,10 +3193,9 @@ impl VulkanRenderer {
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage)
-            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
+            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .push_next(&mut profile_list)
             .push_next(&mut format_list);
 
         let image = match unsafe { self.device.create_image(&image_info, None) } {
@@ -3210,11 +3233,63 @@ impl VulkanRenderer {
             return None;
         }
 
-        let plane_view = |aspect, format| unsafe {
+        // The encode-side image: `VIDEO_ENCODE_SRC` (against the session's
+        // profile) + `TRANSFER_DST` for the per-frame copy, nothing else.
+        let encode_image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(nv12_format)
+            .extent(vk::Extent3D {
+                width: w,
+                height: h,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut profile_list);
+        let encode_image = match unsafe { self.device.create_image(&encode_image_info, None) } {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("[vulkan-render] encode-src image create failed {w}x{h}: {e:?}");
+                unsafe {
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_image(image, None);
+                }
+                return None;
+            }
+        };
+        let enc_reqs = unsafe { self.device.get_image_memory_requirements(encode_image) };
+        let enc_memory = self
+            .find_memory_type(
+                enc_reqs.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .and_then(|mt| {
+                let alloc = vk::MemoryAllocateInfo::default()
+                    .allocation_size(enc_reqs.size)
+                    .memory_type_index(mt);
+                unsafe { self.device.allocate_memory(&alloc, None) }.ok()
+            })
+            .filter(|&m| unsafe { self.device.bind_image_memory(encode_image, m, 0) }.is_ok());
+        let Some(enc_memory) = enc_memory else {
+            eprintln!("[vulkan-render] encode-src image memory alloc/bind failed");
+            unsafe {
+                self.device.destroy_image(encode_image, None);
+                self.device.free_memory(memory, None);
+                self.device.destroy_image(image, None);
+            }
+            return None;
+        };
+
+        let plane_view = |target, aspect, format| unsafe {
             self.device
                 .create_image_view(
                     &vk::ImageViewCreateInfo::default()
-                        .image(image)
+                        .image(target)
                         .view_type(vk::ImageViewType::TYPE_2D)
                         .format(format)
                         .subresource_range(vk::ImageSubresourceRange {
@@ -3232,20 +3307,25 @@ impl VulkanRenderer {
             for v in views {
                 self.device.destroy_image_view(*v, None);
             }
+            self.device.destroy_image(encode_image, None);
+            self.device.free_memory(enc_memory, None);
             self.device.free_memory(memory, None);
             self.device.destroy_image(image, None);
         };
 
-        let Some(y_view) = plane_view(vk::ImageAspectFlags::PLANE_0, vk::Format::R8_UNORM) else {
+        let Some(y_view) = plane_view(image, vk::ImageAspectFlags::PLANE_0, vk::Format::R8_UNORM)
+        else {
             cleanup(&[]);
             return None;
         };
-        let Some(uv_view) = plane_view(vk::ImageAspectFlags::PLANE_1, vk::Format::R8G8_UNORM)
+        let Some(uv_view) =
+            plane_view(image, vk::ImageAspectFlags::PLANE_1, vk::Format::R8G8_UNORM)
         else {
             cleanup(&[y_view]);
             return None;
         };
-        let Some(encode_view) = plane_view(vk::ImageAspectFlags::COLOR, nv12_format) else {
+        let Some(encode_view) = plane_view(encode_image, vk::ImageAspectFlags::COLOR, nv12_format)
+        else {
             cleanup(&[y_view, uv_view]);
             return None;
         };
@@ -3303,6 +3383,7 @@ impl VulkanRenderer {
                 uv_memory: vk::DeviceMemory::null(),
                 uv_view,
                 encode_view: Some(encode_view),
+                encode_image: Some((encode_image, enc_memory)),
             },
         })
     }
@@ -3483,7 +3564,12 @@ impl VulkanRenderer {
         let nv12 = &nv12_vec[nv12_idx];
         let enc_w = nv12.width;
         let enc_h = nv12.height;
-        let Nv12OutputKind::Image { image, .. } = &nv12.kind else {
+        let Nv12OutputKind::Image {
+            image,
+            encode_image,
+            ..
+        } = &nv12.kind
+        else {
             return;
         };
 
@@ -3601,6 +3687,111 @@ impl VulkanRenderer {
             );
             self.device
                 .cmd_dispatch(cb, enc_w.div_ceil(16), enc_h.div_ceil(16), 1);
+
+            // Copy the converted planes into the encode-only image (see
+            // `Nv12OutputKind::Image::encode_image`).  Everything stays in
+            // GENERAL: the storage writes need it, vkCmdCopyImage accepts
+            // it, and the encode path takes GENERAL as a source layout.
+            if let Some((enc_img, _)) = encode_image {
+                let planes = vk::ImageAspectFlags::PLANE_0 | vk::ImageAspectFlags::PLANE_1;
+                let range = |aspect| vk::ImageSubresourceRange {
+                    aspect_mask: aspect,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let src_barrier = vk::ImageMemoryBarrier::default()
+                    .image(*image)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .subresource_range(range(planes));
+                // Fully overwritten every frame, so the previous contents
+                // are discardable: UNDEFINED → GENERAL.
+                let dst_barrier = vk::ImageMemoryBarrier::default()
+                    .image(*enc_img)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .subresource_range(range(planes));
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[src_barrier, dst_barrier],
+                );
+                let layers = |aspect| vk::ImageSubresourceLayers {
+                    aspect_mask: aspect,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                // Plane extents are in each plane's own texel grid: full
+                // size for Y (and both planes at 4:4:4), halved for the
+                // 4:2:0 chroma plane.
+                let (cw, ch) = if nv12.is_444 {
+                    (enc_w, enc_h)
+                } else {
+                    (enc_w / 2, enc_h / 2)
+                };
+                let regions = [
+                    vk::ImageCopy {
+                        src_subresource: layers(vk::ImageAspectFlags::PLANE_0),
+                        src_offset: vk::Offset3D::default(),
+                        dst_subresource: layers(vk::ImageAspectFlags::PLANE_0),
+                        dst_offset: vk::Offset3D::default(),
+                        extent: vk::Extent3D {
+                            width: enc_w,
+                            height: enc_h,
+                            depth: 1,
+                        },
+                    },
+                    vk::ImageCopy {
+                        src_subresource: layers(vk::ImageAspectFlags::PLANE_1),
+                        src_offset: vk::Offset3D::default(),
+                        dst_subresource: layers(vk::ImageAspectFlags::PLANE_1),
+                        dst_offset: vk::Offset3D::default(),
+                        extent: vk::Extent3D {
+                            width: cw,
+                            height: ch,
+                            depth: 1,
+                        },
+                    },
+                ];
+                self.device.cmd_copy_image(
+                    cb,
+                    *image,
+                    vk::ImageLayout::GENERAL,
+                    *enc_img,
+                    vk::ImageLayout::GENERAL,
+                    &regions,
+                );
+                // Make the copy visible to the encode consumption that
+                // follows this submission (same fence-ordered handoff the
+                // storage image relied on before the split).
+                let avail = vk::ImageMemoryBarrier::default()
+                    .image(*enc_img)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+                    .subresource_range(range(planes));
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[avail],
+                );
+            }
         }
 
         unsafe { self.device.destroy_image_view(bgra_view, None) };
@@ -6046,8 +6237,17 @@ impl VulkanRenderer {
                         let n = v.get(idx % v.len().max(1))?;
                         match &n.kind {
                             Nv12OutputKind::Image {
-                                image, encode_view, ..
-                            } => encode_view.map(|ev| (*image, ev)),
+                                image,
+                                encode_view,
+                                encode_image,
+                                ..
+                            } => {
+                                // The session reads the encode-only image
+                                // when the storage/encode split is in
+                                // effect; imported images carry both roles.
+                                let img = encode_image.map_or(*image, |(ei, _)| ei);
+                                encode_view.map(|ev| (img, ev))
+                            }
                             _ => None,
                         }
                     });
