@@ -2463,7 +2463,7 @@ impl Compositor {
 
             // Upload the surface's pixel data as a persistent GPU texture.
             if let Some(ref mut vk) = self.vulkan_renderer {
-                vk.upload_surface(surface_id, &pixels, w, h);
+                vk.upload_surface(surface_id, Some(&buf.id()), &pixels, w, h);
             }
 
             // Store per-surface metadata for layout, hit-testing, etc.
@@ -5132,6 +5132,19 @@ impl Dispatch<WlBuffer, DmaBufBufferData> for Compositor {
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _: wayland_server::backend::ClientId,
+        buffer: &WlBuffer,
+        _: &DmaBufBufferData,
+    ) {
+        // Evict the buffer's cached Vulkan import so the per-buffer
+        // texture cache stays bounded by the client's live buffer pool.
+        if let Some(ref mut vk) = state.vulkan_renderer {
+            vk.remove_buffer(&buffer.id());
+        }
     }
 }
 
