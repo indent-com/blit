@@ -760,3 +760,48 @@ describe("SurfaceStore vs newest-wins control", () => {
     expect(scheduled.maxGap).toBeLessThanOrEqual(control.maxGap + 1e-6);
   });
 });
+
+describe("SurfaceStore surface dimensions", () => {
+  // Pointer coordinates are scaled by surface.width/height, which must be
+  // the native composite size from SurfaceResized.  Frames arrive at the
+  // per-client *encode* size — smaller whenever the view is downscaled —
+  // and must not clobber the native size, or every pointer position lands
+  // short of the cursor by stream/native.
+
+  /** Decoder entry stub: enough to get handleSurfaceFrame past the entry
+   *  checks and into the dimension update; the unconfigured state makes
+   *  the decode path bail before touching WebCodecs APIs. */
+  function stubDecoder(store: SurfaceStore, sid: number): void {
+    (store as any).decoders.set(sid, {
+      codec: "av1",
+      decoder: { state: "unconfigured" },
+      pendingKeyframe: false,
+      keyframeRequested: false,
+    });
+  }
+
+  const KEY_AV1 = (1 << 0) | (1 << 1); // SURFACE_FRAME_FLAG_KEYFRAME | CODEC_AV1
+
+  it("keeps the native size when downscaled frames arrive", () => {
+    const store = new SurfaceStore();
+    store.handleSurfaceCreated(1, 0, 0, 0, "t", "a");
+    store.handleSurfaceResized(1, 1920, 1080);
+    stubDecoder(store, 1);
+    store.handleSurfaceFrame(1, 0, KEY_AV1, 960, 540, new Uint8Array(0));
+    const surface = store.getSurfaces().get(1)!;
+    expect(surface.width).toBe(1920);
+    expect(surface.height).toBe(1080);
+    store.destroy();
+  });
+
+  it("seeds a still-0×0 surface from the first frame's dimensions", () => {
+    const store = new SurfaceStore();
+    store.handleSurfaceCreated(1, 0, 0, 0, "t", "a");
+    stubDecoder(store, 1);
+    store.handleSurfaceFrame(1, 0, KEY_AV1, 960, 540, new Uint8Array(0));
+    const surface = store.getSurfaces().get(1)!;
+    expect(surface.width).toBe(960);
+    expect(surface.height).toBe(540);
+    store.destroy();
+  });
+});

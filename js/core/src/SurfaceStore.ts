@@ -704,19 +704,25 @@ export class SurfaceStore {
     entry.keyframeRequested = false;
 
     const surface = this.surfaces.get(surfaceId);
-    if (surface && (surface.width !== width || surface.height !== height)) {
-      const wasEmpty = surface.width === 0 || surface.height === 0;
+    // Frame dimensions are the *stream* size, which the server downscales
+    // per client (per_client_encode_target), while surface.width/height
+    // must stay the *native* composite size from SurfaceResized — pointer
+    // coordinates are scaled by surface.width, so overwriting it with a
+    // downscaled stream size makes every pointer position land short of
+    // the cursor.  Frame dims only seed a surface still at the 0×0 the
+    // compositor reports in SurfaceCreated before the first buffer commit.
+    if (
+      surface &&
+      (surface.width === 0 || surface.height === 0) &&
+      width > 0 &&
+      height > 0
+    ) {
       // Mutate in place so downstream <For> children keep their object
       // identity (no remount → no decoder race).  Subscribers read the
       // fresh fields on the next emitChange-driven recomputation.
       surface.width = width;
       surface.height = height;
-      // Emit a change when the surface gets its first real dimensions
-      // (the compositor sends SurfaceCreated with 0×0 before the first
-      // buffer commit).  Subsequent per-frame dimension tweaks are silent.
-      if (wasEmpty && width > 0 && height > 0) {
-        this.emitChange();
-      }
+      this.emitChange();
     }
 
     this.ensureCanvas(surfaceId, width, height);
