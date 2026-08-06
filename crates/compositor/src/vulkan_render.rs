@@ -184,12 +184,26 @@ pub(crate) struct VulkanRenderer {
     /// Persistent texture cache keyed by Wayland surface ObjectId.
     /// Textures are created at surface commit time and reused across
     /// frames until the surface commits a new buffer or is destroyed.
-    surface_textures: HashMap<ObjectId, CachedSurfaceTexture>,
+    /// DMA-BUF entries are shared with `buffer_textures` (same `Arc`).
+    surface_textures: HashMap<ObjectId, Arc<CachedSurfaceTexture>>,
+
+    /// Zero-copy DMA-BUF imports keyed by wl_buffer ObjectId.  The
+    /// imported VkImage references the client's buffer memory, so one
+    /// import per wl_buffer is enough: clients rotate through a small
+    /// buffer pool, and without this the import (VkImage + memory +
+    /// view + descriptor set, several ms of driver CPU) reran on every
+    /// commit.  Keyed by wl_buffer identity, never the dmabuf fd — the
+    /// kernel recycles fd numbers, and a stale hit would hand the GPU
+    /// freed memory.  Evicted when the client destroys the wl_buffer.
+    buffer_textures: HashMap<ObjectId, Arc<CachedSurfaceTexture>>,
 
     /// Textures replaced by a surface commit but still potentially
     /// referenced by in-flight GPU work.  Freed when the pending
     /// submission completes (retire_pending / free_frame_textures).
-    pending_destroy_textures: Vec<CachedSurfaceTexture>,
+    /// An entry destroys its Vulkan objects only when it holds the last
+    /// `Arc` — otherwise the remaining holder (`surface_textures` /
+    /// `buffer_textures`) re-pushes it on its own eviction.
+    pending_destroy_textures: Vec<Arc<CachedSurfaceTexture>>,
 
     /// External / NV12 / downscale targets removed while a Vulkan submit
     /// may still reference them.  Freed once all tracked submits retire.
@@ -1081,6 +1095,7 @@ impl VulkanRenderer {
             downscale_outputs: HashMap::new(),
             target_natives: HashMap::new(),
             surface_textures: HashMap::new(),
+            buffer_textures: HashMap::new(),
             pending_destroy_textures: Vec::new(),
             pending_destroy_external_outputs: Vec::new(),
             pending_destroy_nv12_outputs: Vec::new(),
@@ -3818,10 +3833,50 @@ impl VulkanRenderer {
     pub(crate) fn upload_surface(
         &mut self,
         surface_id: &ObjectId,
+        buffer_id: Option<&ObjectId>,
         pixels: &PixelData,
         width: u32,
         height: u32,
     ) {
+        // Zero-copy DMA-BUF fast path: the wl_buffer was imported on an
+        // earlier commit and its VkImage samples the client's live buffer
+        // memory, so there is nothing to re-import — just point the
+        // surface at the cached texture.
+        if matches!(pixels, PixelData::DmaBuf { .. })
+            && self.has_dmabuf
+            && let Some(bid) = buffer_id
+        {
+            static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if let Some(tex) = self.buffer_textures.get(bid).cloned() {
+                let h = HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if h.is_multiple_of(5000) {
+                    eprintln!(
+                        "[dmabuf-cache] hits={h} misses={} cached={}",
+                        MISSES.load(std::sync::atomic::Ordering::Relaxed),
+                        self.buffer_textures.len(),
+                    );
+                }
+                let same = self
+                    .surface_textures
+                    .get(surface_id)
+                    .is_some_and(|cur| Arc::ptr_eq(cur, &tex));
+                if !same && let Some(old) = self.surface_textures.insert(surface_id.clone(), tex) {
+                    self.pending_destroy_textures.push(old);
+                }
+                return;
+            }
+            // Every miss is a full driver import — worth a line while rare,
+            // and a sampled one if a client defeats the cache entirely.
+            let m = MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if m < 10 || m.is_multiple_of(1000) {
+                eprintln!(
+                    "[dmabuf-cache] miss #{m} bid={bid:?} hits={} cached={}",
+                    HITS.load(std::sync::atomic::Ordering::Relaxed),
+                    self.buffer_textures.len(),
+                );
+            }
+        }
         let cached = match pixels {
             PixelData::DmaBuf {
                 fd,
@@ -3881,6 +3936,16 @@ impl VulkanRenderer {
         };
 
         if let Some(tex) = cached {
+            let tex = Arc::new(tex);
+            // A fresh zero-copy import also enters the per-buffer cache so
+            // the client's next commit of this wl_buffer skips the import.
+            if matches!(pixels, PixelData::DmaBuf { .. })
+                && self.has_dmabuf
+                && let Some(bid) = buffer_id
+                && let Some(old) = self.buffer_textures.insert(bid.clone(), tex.clone())
+            {
+                self.pending_destroy_textures.push(old);
+            }
             if let Some(old) = self.surface_textures.insert(surface_id.clone(), tex) {
                 self.pending_destroy_textures.push(old);
             }
@@ -3907,6 +3972,16 @@ impl VulkanRenderer {
     /// Remove a surface's cached texture.  Called when the surface is destroyed.
     pub(crate) fn remove_surface(&mut self, surface_id: &ObjectId) {
         if let Some(old) = self.surface_textures.remove(surface_id) {
+            self.pending_destroy_textures.push(old);
+        }
+    }
+
+    /// Drop a destroyed wl_buffer's cached import.  A surface still
+    /// pointing at it keeps its shared reference — last-good-frame
+    /// semantics, the import holds its own reference to the DMA-BUF —
+    /// and the Vulkan objects are freed once that reference goes too.
+    pub(crate) fn remove_buffer(&mut self, buffer_id: &ObjectId) {
+        if let Some(old) = self.buffer_textures.remove(buffer_id) {
             self.pending_destroy_textures.push(old);
         }
     }
@@ -4093,7 +4168,10 @@ impl VulkanRenderer {
             descriptor_set,
             initial_layout: vk::ImageLayout::PREINITIALIZED,
         };
-        if let Some(old) = self.surface_textures.insert(surface_id.clone(), tex) {
+        if let Some(old) = self
+            .surface_textures
+            .insert(surface_id.clone(), Arc::new(tex))
+        {
             self.pending_destroy_textures.push(old);
         }
         true
@@ -4237,6 +4315,12 @@ impl VulkanRenderer {
 
     fn drain_pending_destroy_textures(&mut self) {
         for tex in self.pending_destroy_textures.drain(..) {
+            // Still shared with a live cache slot (or another pending
+            // entry): drop this reference only.  Whoever holds the last
+            // one destroys the Vulkan objects when it is evicted itself.
+            let Ok(tex) = Arc::try_unwrap(tex) else {
+                continue;
+            };
             unsafe {
                 self.device
                     .free_descriptor_sets(self.descriptor_pool, &[tex.descriptor_set])
@@ -6309,17 +6393,22 @@ impl Drop for VulkanRenderer {
                 self.device.destroy_image(t.image, None);
                 self.device.free_memory(t.memory, None);
             }
-            // Destroy persistent surface textures.
-            for (_, tex) in self.surface_textures.drain() {
-                self.device
-                    .free_descriptor_sets(self.descriptor_pool, &[tex.descriptor_set])
-                    .ok();
-                self.device.destroy_image_view(tex.view, None);
-                self.device.destroy_image(tex.image, None);
-                self.device.free_memory(tex.memory, None);
-            }
-            // Destroy pending-destroy textures.
-            for tex in self.pending_destroy_textures.drain(..) {
+            // Destroy persistent surface/buffer textures and any already
+            // pending destruction.  All holders of a shared texture are in
+            // this list, so a single pass destroys each exactly once: a
+            // failed `try_unwrap` drops one clone and a later entry — the
+            // last clone — succeeds.
+            let all_textures: Vec<Arc<CachedSurfaceTexture>> = self
+                .surface_textures
+                .drain()
+                .map(|(_, tex)| tex)
+                .chain(self.buffer_textures.drain().map(|(_, tex)| tex))
+                .chain(self.pending_destroy_textures.drain(..))
+                .collect();
+            for tex in all_textures {
+                let Ok(tex) = Arc::try_unwrap(tex) else {
+                    continue;
+                };
                 self.device
                     .free_descriptor_sets(self.descriptor_pool, &[tex.descriptor_set])
                     .ok();
