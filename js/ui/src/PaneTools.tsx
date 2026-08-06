@@ -26,7 +26,12 @@ import { t } from "./i18n";
 import { startPaneTileDrag } from "./ide/tileDrag";
 
 /** Toolbar corners, in click-to-cycle order from the default. */
-const CORNERS = ["top-right", "bottom-right", "bottom-left", "top-left"] as const;
+const CORNERS = [
+  "top-right",
+  "bottom-right",
+  "bottom-left",
+  "top-left",
+] as const;
 
 export function PaneTools(props: {
   theme: Theme;

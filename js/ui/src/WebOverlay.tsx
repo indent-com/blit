@@ -159,7 +159,9 @@ export function WebOverlay(props: WebOverlayProps): JSX.Element {
   /** What the plain row offers, as it would load. */
   const plainDraft = () => {
     const { url } = split(draft());
-    return url ? webLocationLabel(plainLocation(parsePlainLocation(url) ?? url)) : "";
+    return url
+      ? webLocationLabel(plainLocation(parsePlainLocation(url) ?? url))
+      : "";
   };
 
   /** Cycle servers with Tab — the list follows, so picking a remote shows what

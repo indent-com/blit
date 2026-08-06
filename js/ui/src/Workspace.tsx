@@ -1890,7 +1890,9 @@ function WorkspaceScreen(props: {
     if (tile) return tile;
     const sid = focusedSurfaceId();
     const connId = focusedSurfaceConnId();
-    return sid != null && connId != null ? surfaceAssignment(connId, sid) : null;
+    return sid != null && connId != null
+      ? surfaceAssignment(connId, sid)
+      : null;
   };
 
   /** A grip drag landed on the dock: park the content by taking it off
@@ -4214,7 +4216,10 @@ function PreviewPanel(props: {
     const onMove = (me: PointerEvent) => {
       const delta = startX - me.clientX;
       props.onResize(
-        Math.min(maxWidth, Math.max(MIN_PREVIEW_PANEL_WIDTH, startWidth + delta)),
+        Math.min(
+          maxWidth,
+          Math.max(MIN_PREVIEW_PANEL_WIDTH, startWidth + delta),
+        ),
       );
     };
 
