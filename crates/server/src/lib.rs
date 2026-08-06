@@ -3448,6 +3448,18 @@ async fn supervise(state: &AppState) {
     // The backstop still runs, now targeted at owned pids only, so a child
     // whose SIGCHLD we missed cannot linger as a zombie.
     pty::reap_zombies();
+    // The audio pipeline's children are nobody else's to collect on this
+    // cadence: the health check that reaps them as a side effect lives in
+    // the delivery tick, which is asleep whenever no client is attached.
+    #[cfg(target_os = "linux")]
+    {
+        let mut sess = state.session.lock().await;
+        if let Some(cs) = sess.compositor.as_mut()
+            && let Some(ap) = cs.audio_pipeline.as_mut()
+        {
+            ap.reap_children();
+        }
+    }
     evict_exited(state).await;
 }
 

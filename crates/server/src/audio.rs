@@ -473,6 +473,10 @@ impl AudioPipeline {
         let dbus_address = dbus_address.trim();
         if dbus_address.is_empty() {
             let _ = dbus_child.kill();
+            // Every other bail-out below waits what it kills; this one did
+            // not, so a dbus-daemon that started and then said nothing was
+            // left a zombie for the life of the server.
+            let _ = dbus_child.wait();
             return Err("dbus-daemon exited without printing an address".into());
         }
 
@@ -704,6 +708,27 @@ impl AudioPipeline {
             first_heal_at: None,
             heals: 0,
         })
+    }
+
+    /// Collect any sub-process that has exited, and nothing else.
+    ///
+    /// `is_alive` already reaps as a side effect of its `try_wait` calls,
+    /// but it lives in the delivery tick, which only runs while a client is
+    /// attached — and it heals as well as observes, which is not something to
+    /// do on a timer nobody asked for.  A server sitting idle with a dead
+    /// PipeWire would keep the corpse until someone connected.
+    ///
+    /// That used to be covered by the reaper draining `waitpid(-1)` for the
+    /// whole process; once that narrowed to PTY-owned pids, these had nobody.
+    /// So the supervisor calls this instead: same `try_wait`, no restart, no
+    /// state change beyond releasing a zombie.
+    pub fn reap_children(&mut self) {
+        let _ = self.dbus_child.try_wait();
+        let _ = self.pipewire_child.try_wait();
+        let _ = self.pipewire_pulse_child.try_wait();
+        if let Some(ref mut wp) = self.wireplumber_child {
+            let _ = wp.try_wait();
+        }
     }
 
     /// Returns true if the pipeline is still producing (or can resume
