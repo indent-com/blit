@@ -1321,26 +1321,6 @@ impl VulkanRenderer {
             _ => "h264",
         };
 
-        // AV1 gets as far as a working session — the capability query, the
-        // session, the DPB and the encode itself all succeed on an RTX 4090
-        // now that the structure-type constants are right, and it emits frame
-        // OBUs.  What is missing is the sequence header: unlike H.264 there is
-        // no `VkVideoEncodeAV1SessionParametersGetInfoKHR` in the spec, so the
-        // driver never hands one back and the application has to serialize
-        // `sequence_header_obu()` itself from the same
-        // StdVideoAV1SequenceHeader it passed to session-parameter creation.
-        //
-        // Without it every frame belongs to a stream no decoder accepts, which
-        // is strictly worse than handing this client to a server-side encoder.
-        // Decline, and let the fallback do its job.
-        if codec == 0x02 {
-            eprintln!(
-                "[vulkan-render] av1-vulkan needs a sequence-header serializer before it can \
-                 produce a decodable stream; declining surface {surface_id}",
-            );
-            return false;
-        }
-
         // Build the session first: its capability query is the real test of
         // whether this device can encode the requested chroma, and it costs
         // nothing to discover that before allocating an image for it.

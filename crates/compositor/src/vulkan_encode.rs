@@ -200,6 +200,12 @@ pub(crate) enum VulkanVideoCodec {
 pub(crate) struct VulkanVideoEncoder {
     width: u32,
     height: u32,
+    /// Pre-alignment source dimensions.  `width`/`height` are the coded
+    /// extent (superblock/macroblock aligned); the bitstream declares these
+    /// so decoders crop the alignment padding — H.264 via SPS cropping,
+    /// AV1 via the sequence header's max frame size.
+    src_width: u32,
+    src_height: u32,
     codec: VulkanVideoCodec,
     video_session: vk::VideoSessionKHR,
     session_params: vk::VideoSessionParametersKHR,
@@ -215,6 +221,11 @@ pub(crate) struct VulkanVideoEncoder {
     idr_num: u32,
     force_idr: bool,
     qp: u8,
+    /// AV1 only: the order hint each decoder-side reference slot holds,
+    /// mirrored here so frame headers can state them (`ref_order_hint`).
+    /// A keyframe refreshes every slot; a delta refreshes only the slot it
+    /// reconstructs into.
+    ref_order_hints: [u8; 8],
     /// Encoded SPS/PPS, prepended to every IDR so the stream carries its own
     /// parameter sets.  Vulkan Video does not emit them with the slice data.
     params_bytes: Vec<u8>,
@@ -617,6 +628,9 @@ impl VulkanVideoEncoder {
         Some(Self {
             width,
             height,
+            src_width: width,
+            src_height: height,
+            ref_order_hints: [0; 8],
             codec: VulkanVideoCodec::H264,
             video_session,
             session_params,
@@ -1088,9 +1102,13 @@ impl VulkanVideoEncoder {
         height: u32,
         qp: u8,
     ) -> Option<Self> {
-        // 64-pixel superblock alignment for AV1.
-        let coded_w = width.div_ceil(64) * 64;
-        let coded_h = height.div_ceil(64) * 64;
+        // The source size is used as the coded extent directly, like the
+        // H.264 path: the driver pads to whole superblocks internally, and
+        // its frame headers then declare the true size — AV1 has no
+        // SPS-style cropping to paper over an aligned extent, and a decoder
+        // promised an aligned frame renders the padding rows.
+        let coded_w = width;
+        let coded_h = height;
 
         // ---------------------------------------------------------------
         // 1. Video profile
@@ -1242,16 +1260,30 @@ impl VulkanVideoEncoder {
             bit_depth: 8,
             subsampling_x: 1,
             subsampling_y: 1,
-            color_primaries: 2,          // BT.709
-            transfer_characteristics: 2, // BT.709
-            matrix_coefficients: 2,      // BT.709
+            _reserved1: 0,
+            color_primaries: 2,          // CP_UNSPECIFIED
+            transfer_characteristics: 2, // TC_UNSPECIFIED
+            matrix_coefficients: 2,      // MC_UNSPECIFIED
             chroma_sample_position: 0,   // Unknown
-            _reserved: 0,
         };
 
         let mut seq_flags = StdVideoAV1SequenceHeaderFlags::new();
         seq_flags.set_enable_order_hint(true);
+        // NVIDIA's encoder codes per-superblock cdef_idx symbols in the tile
+        // data unconditionally.  With CDEF declared off, decoders don't
+        // expect those symbols and fail the whole tile ("Failed to decode
+        // tile data" in libaom) — so declare it on and let the driver write
+        // the frame-level CDEF parameters it actually used (it overrides
+        // frame-header fields like loop_filter_level regardless of what the
+        // std picture info says).
+        seq_flags.set_enable_cdef(true);
 
+        // The sequence header must declare the coded extent: the driver's
+        // tile payload covers whole superblocks of it, and a decoder that
+        // was promised a smaller frame errors out mid-tile (dav1d rejects
+        // every frame).  The source size is carried as AV1 `render_size`
+        // instead — the per-frame display hint AV1 uses where H.264 has SPS
+        // cropping.
         let w_bits = 32u32.saturating_sub(coded_w.leading_zeros()).max(1);
         let h_bits = 32u32.saturating_sub(coded_h.leading_zeros()).max(1);
 
@@ -1401,6 +1433,9 @@ impl VulkanVideoEncoder {
         Some(Self {
             width: coded_w,
             height: coded_h,
+            src_width: width,
+            src_height: height,
+            ref_order_hints: [0; 8],
             codec: VulkanVideoCodec::AV1,
             video_session,
             session_params,
@@ -1416,11 +1451,11 @@ impl VulkanVideoEncoder {
             idr_num: 0,
             force_idr: false,
             qp,
-            // AV1 carries its sequence header in the temporal unit rather
-            // than as a separate parameter set, and this path is not
-            // reachable yet (see `create_nv12_encode_image`), so nothing is
-            // prepended here.
-            params_bytes: Vec::new(),
+            // The driver emits frame OBUs only; the sequence header is ours
+            // to serialize (from the same values `seq_header` was built
+            // with) and gets prepended to every keyframe, mirroring how
+            // H.264 prepends its SPS/PPS.
+            params_bytes: av1_sequence_header_obu(level, w_bits, h_bits, coded_w, coded_h),
             poisoned: false,
         })
     }
@@ -1460,7 +1495,15 @@ impl VulkanVideoEncoder {
         // Reset query pool.
         unsafe { device.cmd_reset_query_pool(cb, self.query_pool, 0, 1) };
 
-        let order_hint = (self.frame_num & 0x7F) as u8; // 7-bit order hint
+        // 7-bit order hint.  A keyframe restarts the GOP at 0 — `frame_num`
+        // is only reset *after* this encode, so without the `is_key` arm a
+        // forced keyframe would carry the stale hint and its deltas would
+        // then count backwards from it.
+        let order_hint = if is_key {
+            0
+        } else {
+            (self.frame_num & 0x7F) as u8
+        };
 
         // --- DPB setup ---
         let setup_dpb_idx = self.cur_dpb_idx;
@@ -1477,6 +1520,7 @@ impl VulkanVideoEncoder {
             },
             order_hint,
             _reserved: [0; 3],
+            p_extension_header: ptr::null(),
         };
 
         let setup_dpb_info = VideoEncodeAV1DpbSlotInfoKHR {
@@ -1522,6 +1566,7 @@ impl VulkanVideoEncoder {
                 frame_type: STD_VIDEO_AV1_FRAME_TYPE_INTER,
                 order_hint: ((self.frame_num.wrapping_sub(1)) & 0x7F) as u8,
                 _reserved: [0; 3],
+                p_extension_header: ptr::null(),
             };
             ref_dpb_info = VideoEncodeAV1DpbSlotInfoKHR {
                 s_type: vk::StructureType::from_raw(
@@ -1576,57 +1621,15 @@ impl VulkanVideoEncoder {
         // ---------------------------------------------------------------
         // Fill AV1 encode picture info
         // ---------------------------------------------------------------
-        // Single tile covering the full frame.
-        let mi_cols = self.width.div_ceil(4) as u16; // 4-pixel MI units
-        let mi_rows = self.height.div_ceil(4) as u16;
-        let sb_cols = self.width.div_ceil(64) as u16; // 64-pixel superblocks
-        let sb_rows = self.height.div_ceil(64) as u16;
-        let mi_col_starts = [0u16, mi_cols];
-        let mi_row_starts = [0u16, mi_rows];
-        let width_in_sbs_minus_1 = [sb_cols.saturating_sub(1)];
-        let height_in_sbs_minus_1 = [sb_rows.saturating_sub(1)];
-
-        let tile_info = StdVideoAV1TileInfo {
-            flags: 0, // uniform_tile_spacing_flag = 0
-            tile_cols: 1,
-            tile_rows: 1,
-            context_update_tile_id: 0,
-            tile_size_bytes_minus_1: 3, // 4 bytes per tile size
-            _reserved: [0; 7],
-            p_mi_col_starts: mi_col_starts.as_ptr(),
-            p_mi_row_starts: mi_row_starts.as_ptr(),
-            p_width_in_sbs_minus_1: width_in_sbs_minus_1.as_ptr(),
-            p_height_in_sbs_minus_1: height_in_sbs_minus_1.as_ptr(),
-        };
-
-        let quantization = StdVideoAV1Quantization {
-            flags: 0,
-            base_q_idx: self.qp,
-            delta_q_y_dc: 0,
-            delta_q_u_dc: 0,
-            delta_q_u_ac: 0,
-            delta_q_v_dc: 0,
-            delta_q_v_ac: 0,
-            qm_y: 0,
-            qm_u: 0,
-            qm_v: 0,
-            _reserved: [0; 3],
-        };
-
-        let loop_filter: StdVideoAV1LoopFilter = unsafe { std::mem::zeroed() };
-        let cdef: StdVideoAV1CDEF = unsafe { std::mem::zeroed() };
-        let loop_restoration = StdVideoAV1LoopRestoration {
-            frame_restoration_type: [
-                STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_NONE,
-                STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_NONE,
-                STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_NONE,
-            ],
-            loop_restoration_size: [0; 3],
-        };
-
         let mut pic_flags = StdVideoEncodeAV1PictureInfoFlags::new();
         pic_flags.set_error_resilient_mode(is_key);
         pic_flags.set_force_integer_mv(is_key);
+        pic_flags.set_show_frame(true);
+        // Frame size is the coded extent; tell decoders the display size
+        // via render_size, AV1's stand-in for H.264 SPS cropping.
+        if (self.src_width, self.src_height) != (self.width, self.height) {
+            pic_flags.set_render_and_frame_size_different(true);
+        }
 
         let mut ref_frame_idx = [-1i8; 7];
         if !is_key {
@@ -1634,6 +1637,22 @@ impl VulkanVideoEncoder {
             ref_frame_idx[0] = ref_dpb_idx as i8;
         }
 
+        // What each decoder-side reference slot's order hint will be when
+        // this frame is decoded — the driver writes these into the frame
+        // header, and a decoder cross-checks them against its own slots.
+        let ref_order_hint = if is_key {
+            [0u8; 8]
+        } else {
+            self.ref_order_hints
+        };
+
+        // Tile layout, quantization, loop filter, CDEF and loop restoration
+        // are all left to the driver (null pointers), exactly like NVIDIA's
+        // reference encoder does by default: these describe what the
+        // hardware *will do*, and hand-built values it does not honor end
+        // up in frame headers that contradict the tile data — decoders
+        // fail the whole tile.  Same reasoning for `tx_mode` and
+        // `interpolation_filter`: zero-initialized, driver's choice.
         let std_pic_info = StdVideoEncodeAV1PictureInfo {
             flags: pic_flags,
             frame_type: if is_key {
@@ -1651,26 +1670,25 @@ impl VulkanVideoEncoder {
                 1u8 << (setup_dpb_idx as u8)
             },
             coded_denom: 0,
-            render_width_minus_1: (self.width - 1) as u16,
-            render_height_minus_1: (self.height - 1) as u16,
-            interpolation_filter: 4, // SWITCHABLE
-            tx_mode: 2,              // TX_MODE_SELECT
+            render_width_minus_1: (self.src_width - 1) as u16,
+            render_height_minus_1: (self.src_height - 1) as u16,
+            interpolation_filter: 0, // EIGHTTAP — driver overrides as needed
+            tx_mode: 0,
             delta_q_res: 0,
             delta_lf_res: 0,
-            _reserved1: [0; 2],
-            ref_order_hint: [0; 8],
+            ref_order_hint,
             ref_frame_idx,
-            _reserved2: 0,
+            _reserved1: [0; 3],
             delta_frame_id_minus_1: [0; 7],
-            p_tile_info: &tile_info,
-            p_quantization: &quantization,
+            p_tile_info: ptr::null(),
+            p_quantization: ptr::null(),
             p_segmentation: ptr::null(),
-            p_loop_filter: &loop_filter,
-            p_cdef: &cdef,
-            p_loop_restoration: &loop_restoration,
+            p_loop_filter: ptr::null(),
+            p_cdef: ptr::null(),
+            p_loop_restoration: ptr::null(),
             p_global_motion: ptr::null(),
-            min_base_qindex: self.qp as u32,
-            max_base_qindex: self.qp as u32,
+            p_extension_header: ptr::null(),
+            p_buffer_removal_times: ptr::null(),
         };
 
         let mut reference_name_slot_indices = [-1i32; 7];
@@ -1746,6 +1764,7 @@ impl VulkanVideoEncoder {
                 frame_type: STD_VIDEO_AV1_FRAME_TYPE_INTER,
                 order_hint: ((self.frame_num.wrapping_sub(1)) & 0x7F) as u8,
                 _reserved: [0; 3],
+                p_extension_header: ptr::null(),
             };
             let ref_dpb_info2 = VideoEncodeAV1DpbSlotInfoKHR {
                 s_type: vk::StructureType::from_raw(
@@ -1861,13 +1880,29 @@ impl VulkanVideoEncoder {
             return None;
         }
 
-        let bitstream =
-            unsafe { std::slice::from_raw_parts(self.bitstream_ptr, encoded_size).to_vec() };
+        // Copy the bitstream out.  The driver emits bare frame OBUs (see
+        // `params_bytes` in `try_new_av1`), but the low-overhead bitstream
+        // format wants each temporal unit to open with a temporal-delimiter
+        // OBU — parsers use it to split units, and dav1d refuses a stream
+        // without one.  A keyframe additionally gets the sequence header, so
+        // each is a self-contained entry point.
+        const TEMPORAL_DELIMITER: [u8; 2] = [0x12, 0x00];
+        let slices = unsafe { std::slice::from_raw_parts(self.bitstream_ptr, encoded_size) };
+        let mut bitstream = Vec::with_capacity(2 + self.params_bytes.len() + encoded_size);
+        bitstream.extend_from_slice(&TEMPORAL_DELIMITER);
+        if is_key {
+            bitstream.extend_from_slice(&self.params_bytes);
+        }
+        bitstream.extend_from_slice(slices);
 
         // Update state.
         if is_key {
             self.frame_num = 0;
             self.idr_num = self.idr_num.wrapping_add(1);
+            // refresh_frame_flags was 0xFF: every slot now holds this frame.
+            self.ref_order_hints = [order_hint; 8];
+        } else {
+            self.ref_order_hints[setup_dpb_idx & 7] = order_hint;
         }
         self.frame_num = self.frame_num.wrapping_add(1);
         self.cur_dpb_idx = 1 - self.cur_dpb_idx;
@@ -1964,6 +1999,112 @@ fn compute_level_idc(width: u32, height: u32) -> StdVideoH264LevelIdc {
         // Level 5.2: 4096x2304
         StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_2
     }
+}
+
+/// Serialize the `sequence_header_obu()` matching the
+/// `StdVideoAV1SequenceHeader` that `try_new_av1` hands the driver.
+///
+/// Vulkan has no AV1 counterpart to
+/// `VkVideoEncodeH264SessionParametersGetInfoKHR` — the spec expects the
+/// application to serialize the sequence header itself from the same
+/// values it passed to session-parameter creation.  Every field below
+/// mirrors that struct; if `try_new_av1` changes what it tells the driver,
+/// this must change with it or every frame belongs to a stream no decoder
+/// accepts.
+///
+/// `seq_level_idx` is the `StdVideoAV1Level` value, which is numerically
+/// the bitstream's `seq_level_idx` (2.0 = 0 … 6.0 = 16).
+fn av1_sequence_header_obu(
+    seq_level_idx: u32,
+    frame_width_bits: u32,
+    frame_height_bits: u32,
+    coded_w: u32,
+    coded_h: u32,
+) -> Vec<u8> {
+    // Big-endian bit packer, AV1 f(n) semantics.
+    struct BitWriter {
+        bytes: Vec<u8>,
+        used: u8,
+    }
+    impl BitWriter {
+        fn put(&mut self, n: u32, v: u32) {
+            for i in (0..n).rev() {
+                if self.used == 0 {
+                    self.bytes.push(0);
+                }
+                let bit = ((v >> i) & 1) as u8;
+                *self.bytes.last_mut().unwrap() |= bit << (7 - self.used);
+                self.used = (self.used + 1) & 7;
+            }
+        }
+    }
+    let mut w = BitWriter {
+        bytes: Vec::new(),
+        used: 0,
+    };
+    w.put(3, 0); // seq_profile: Main (4:2:0 8-bit)
+    w.put(1, 0); // still_picture
+    w.put(1, 0); // reduced_still_picture_header
+    w.put(1, 0); // timing_info_present_flag (p_timing_info is null)
+    w.put(1, 0); // initial_display_delay_present_flag
+    w.put(5, 0); // operating_points_cnt_minus_1
+    w.put(12, 0); // operating_point_idc[0]: all temporal/spatial layers
+    w.put(5, seq_level_idx);
+    if seq_level_idx > 7 {
+        w.put(1, 0); // seq_tier[0]: Main tier
+    }
+    w.put(4, frame_width_bits - 1);
+    w.put(4, frame_height_bits - 1);
+    w.put(frame_width_bits, coded_w - 1);
+    w.put(frame_height_bits, coded_h - 1);
+    w.put(1, 0); // frame_id_numbers_present_flag
+    w.put(1, 0); // use_128x128_superblock
+    w.put(1, 0); // enable_filter_intra
+    w.put(1, 0); // enable_intra_edge_filter
+    w.put(1, 0); // enable_interintra_compound
+    w.put(1, 0); // enable_masked_compound
+    w.put(1, 0); // enable_warped_motion
+    w.put(1, 0); // enable_dual_filter
+    w.put(1, 1); // enable_order_hint
+    w.put(1, 0); // enable_jnt_comp
+    w.put(1, 0); // enable_ref_frame_mvs
+    w.put(1, 1); // seq_choose_screen_content_tools (force = SELECT)
+    w.put(1, 1); // seq_choose_integer_mv (force = SELECT)
+    w.put(3, 6); // order_hint_bits_minus_1: 7-bit order hint
+    w.put(1, 0); // enable_superres
+    w.put(1, 1); // enable_cdef — the hardware codes cdef_idx symbols
+    w.put(1, 0); // enable_restoration
+    // color_config(): 8-bit 4:2:0, no colour description (the std struct's
+    // primaries/transfer/matrix are all 2 = unspecified, so nothing is lost
+    // by omitting them).
+    w.put(1, 0); // high_bitdepth
+    w.put(1, 0); // mono_chrome
+    w.put(1, 0); // color_description_present_flag
+    w.put(1, 0); // color_range: studio swing
+    w.put(2, 0); // chroma_sample_position: unknown
+    w.put(1, 0); // separate_uv_delta_q
+    w.put(1, 0); // film_grain_params_present
+    w.put(1, 1); // trailing_one_bit (zero-padded to a byte by the packer)
+    let payload = w.bytes;
+
+    // obu_header: type OBU_SEQUENCE_HEADER, obu_has_size_field, then the
+    // payload size as leb128.
+    let mut obu = Vec::with_capacity(payload.len() + 2);
+    obu.push(0x0A);
+    let mut size = payload.len();
+    loop {
+        let mut byte = (size & 0x7F) as u8;
+        size >>= 7;
+        if size != 0 {
+            byte |= 0x80;
+        }
+        obu.push(byte);
+        if size == 0 {
+            break;
+        }
+    }
+    obu.extend_from_slice(&payload);
+    obu
 }
 
 /// Compute the AV1 level for a given coded resolution.
@@ -2535,8 +2676,17 @@ impl StdVideoAV1SequenceHeaderFlags {
     }
 
     fn set_enable_order_hint(&mut self, v: bool) {
+        // Bit 9 — count the bitfield in vulkan_video_codec_av1std.h
+        // (still_picture is bit 0).  Bit 7 is enable_warped_motion.
         if v {
-            self.bits |= 1 << 7;
+            self.bits |= 1 << 9;
+        }
+    }
+
+    fn set_enable_cdef(&mut self, v: bool) {
+        // Bit 14, same counting rule as above.
+        if v {
+            self.bits |= 1 << 14;
         }
     }
 }
@@ -2548,11 +2698,12 @@ struct StdVideoAV1ColorConfig {
     bit_depth: u8,
     subsampling_x: u8,
     subsampling_y: u8,
-    color_primaries: u8,
-    transfer_characteristics: u8,
-    matrix_coefficients: u8,
-    chroma_sample_position: u8,
-    _reserved: u8,
+    _reserved1: u8,
+    // The four colour fields are C enums — 4 bytes each, not u8.
+    color_primaries: u32,
+    transfer_characteristics: u32,
+    matrix_coefficients: u32,
+    chroma_sample_position: u32,
 }
 
 #[repr(C)]
@@ -2602,23 +2753,34 @@ impl StdVideoEncodeAV1PictureInfoFlags {
         Self { bits: 0 }
     }
 
+    // Bit positions come from counting the bitfield in
+    // vulkan_video_codec_av1std_encode.h — do not guess: a wrong bit here
+    // lands in a *different* flag the driver happily encodes (bit 3 is
+    // render_and_frame_size_different, not force_integer_mv).
+
     fn set_error_resilient_mode(&mut self, v: bool) {
         if v {
             self.bits |= 1 << 0;
         }
     }
 
-    fn set_disable_cdf_update(&mut self, _v: bool) {
-        // bit 1
-    }
-
-    fn set_use_ref_frame_mvs(&mut self, _v: bool) {
-        // bit 5
-    }
-
     fn set_force_integer_mv(&mut self, v: bool) {
         if v {
+            self.bits |= 1 << 6;
+        }
+    }
+
+    fn set_render_and_frame_size_different(&mut self, v: bool) {
+        if v {
             self.bits |= 1 << 3;
+        }
+    }
+
+    fn set_show_frame(&mut self, v: bool) {
+        // Without this the driver writes `show_frame = 0` into every frame
+        // header: decoders decode the stream and present nothing.
+        if v {
+            self.bits |= 1 << 27;
         }
     }
 }
@@ -2641,10 +2803,12 @@ struct StdVideoEncodeAV1PictureInfo {
     tx_mode: u32,
     delta_q_res: u8,
     delta_lf_res: u8,
-    _reserved1: [u8; 2],
+    // No padding before these arrays — vulkan_video_codec_av1std_encode.h
+    // packs ref_order_hint directly after delta_lf_res, with reserved1[3]
+    // after ref_frame_idx bringing delta_frame_id_minus_1 to alignment.
     ref_order_hint: [u8; 8], // STD_VIDEO_AV1_NUM_REF_FRAMES
     ref_frame_idx: [i8; 7],  // STD_VIDEO_AV1_REFS_PER_FRAME
-    _reserved2: u8,
+    _reserved1: [u8; 3],
     delta_frame_id_minus_1: [u32; 7],
     p_tile_info: *const StdVideoAV1TileInfo,
     p_quantization: *const StdVideoAV1Quantization,
@@ -2653,8 +2817,8 @@ struct StdVideoEncodeAV1PictureInfo {
     p_cdef: *const StdVideoAV1CDEF,
     p_loop_restoration: *const StdVideoAV1LoopRestoration,
     p_global_motion: *const std::ffi::c_void,
-    min_base_qindex: u32,
-    max_base_qindex: u32,
+    p_extension_header: *const std::ffi::c_void,
+    p_buffer_removal_times: *const u32,
 }
 
 #[repr(C)]
@@ -2698,7 +2862,6 @@ struct StdVideoAV1LoopFilter {
     loop_filter_ref_deltas: [i8; 8],
     update_mode_delta: u8,
     loop_filter_mode_deltas: [i8; 2],
-    _reserved: [u8; 4],
 }
 
 #[repr(C)]
@@ -2715,7 +2878,8 @@ struct StdVideoAV1CDEF {
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct StdVideoAV1LoopRestoration {
-    frame_restoration_type: [u16; 3], // MAX_MB_PLANE
+    // StdVideoAV1FrameRestorationType is a C enum — 4 bytes per entry.
+    frame_restoration_type: [u32; 3], // STD_VIDEO_AV1_MAX_NUM_PLANES
     loop_restoration_size: [u16; 3],
 }
 
@@ -2734,7 +2898,25 @@ struct StdVideoEncodeAV1ReferenceInfo {
     frame_type: u32, // StdVideoAV1FrameType
     order_hint: u8,
     _reserved: [u8; 3],
+    p_extension_header: *const std::ffi::c_void,
 }
+
+// Layout guards for the hand-rolled std-header mirrors above.  Sizes are
+// from vulkan_video_codec_av1std*.h compiled on x86_64 — a mismatch here
+// means fields have drifted, which the driver reports as
+// ERROR_INVALID_VIDEO_STD_PARAMETERS_KHR at best and reads as garbage
+// pointers at worst.
+const _: () = {
+    assert!(std::mem::size_of::<StdVideoAV1ColorConfig>() == 24);
+    assert!(std::mem::size_of::<StdVideoAV1TimingInfo>() == 16);
+    assert!(std::mem::size_of::<StdVideoAV1SequenceHeader>() == 40);
+    assert!(std::mem::size_of::<StdVideoAV1TileInfo>() == 48);
+    assert!(std::mem::size_of::<StdVideoAV1Quantization>() == 16);
+    assert!(std::mem::size_of::<StdVideoAV1LoopFilter>() == 24);
+    assert!(std::mem::size_of::<StdVideoAV1LoopRestoration>() == 20);
+    assert!(std::mem::size_of::<StdVideoEncodeAV1PictureInfo>() == 152);
+    assert!(std::mem::size_of::<StdVideoEncodeAV1ReferenceInfo>() == 24);
+};
 
 // --- Vulkan structs ---
 
@@ -2860,4 +3042,4 @@ const VK_VIDEO_ENCODE_AV1_RATE_CONTROL_GROUP_INTRA_KHR: u32 = 0;
 const VK_VIDEO_ENCODE_AV1_RATE_CONTROL_GROUP_PREDICTIVE_KHR: u32 = 1;
 
 /// `STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_NONE`.
-const STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_NONE: u16 = 0;
+const STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_NONE: u32 = 0;

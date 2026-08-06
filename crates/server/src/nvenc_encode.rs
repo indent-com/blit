@@ -475,7 +475,7 @@ impl NvencCaps {
     /// Why this engine will not take a `width`x`height` frame — `None` if it
     /// will.  The caller is expected to fall down the encoder chain rather
     /// than write the backend off: this is a verdict on the frame.
-    fn refuse(&self, width: u32, height: u32) -> Option<String> {
+    pub(crate) fn refuse(&self, width: u32, height: u32) -> Option<String> {
         (width < self.min_width
             || height < self.min_height
             || width > self.max_width
