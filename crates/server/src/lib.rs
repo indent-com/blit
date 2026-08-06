@@ -1031,11 +1031,37 @@ struct SurfaceInFlightFrame {
     surface_id: u16,
 }
 
+/// Floor on the unacked-surface-frame cap.  Also the whole cap on any
+/// ordinary link: at 20 ms RTT and 60 Hz the window is about four frames,
+/// so 64 is already enormous headroom.
+const SURFACE_INFLIGHT_MIN: usize = 64;
+
+/// Ceiling regardless of bandwidth-delay product, so a client reporting a
+/// nonsense display rate or a wildly inflated RTT cannot grow the queue
+/// without bound.  Each entry is a few dozen bytes, so even this is
+/// kilobytes, not megabytes.
+const SURFACE_INFLIGHT_HARD_MAX: usize = 512;
+
 /// Cap on unacked surface frames tracked per client.  A frame can go
 /// unacked forever (client teardown mid-flight, a transport that drops
 /// it), and every orphan permanently offsets the queue — so the oldest
 /// entries are evicted rather than trusted.
-const SURFACE_INFLIGHT_MAX: usize = 64;
+///
+/// Derived from the bandwidth-delay product rather than fixed, because a
+/// constant is two different things at two different latencies.  At 1 s RTT
+/// and 60 Hz the link legitimately holds 60 frames, so a flat cap of 64 sat
+/// right on top of the steady state: `surface_frame_window` returned 71,
+/// above the cap, which made `inflight > window` unreachable and silenced
+/// the rate controller entirely — and at 90 Hz the deque evicted live
+/// entries continuously, so `record_surface_ack` matched each ACK to a
+/// newer frame than the one it belonged to and understated delivery time.
+/// Twice the window keeps the backoff comparison reachable while still
+/// bounding orphans.
+fn surface_inflight_cap(client: &ClientState) -> usize {
+    surface_frame_window(client)
+        .saturating_mul(2)
+        .clamp(SURFACE_INFLIGHT_MIN, SURFACE_INFLIGHT_HARD_MAX)
+}
 
 /// Frames to keep in flight: enough to cover one RTT at the client's reported
 /// display rate. High-latency links need many frames in flight to avoid
@@ -1241,16 +1267,75 @@ fn preview_send_interval(client: &ClientState) -> Duration {
     Duration::from_secs_f64(1.0 / preview_fps(client) as f64)
 }
 
-/// Surface frame rate: delegates to `browser_pacing_fps` so video backs off
-/// when the client reports it can't keep up (backlog / ack-ahead growth).
-/// Continuing at display_fps when the browser is behind just piles up video
-/// it will drop to catch up, which the user perceives as droppy playback.
-fn surface_pacing_fps(client: &ClientState) -> f32 {
-    browser_pacing_fps(client)
+/// Unacked frames one surface may hold before pacing backs off: what a
+/// healthy link should have in flight at the client's display rate, RTT
+/// included.  Deriving it from RTT rather than a constant keeps a distant
+/// but perfectly healthy link from being mistaken for a struggling one —
+/// at 100 ms RTT and 60 Hz, six frames in flight is correct, not congested.
+///
+/// `surface_inflight_cap` is derived from this, at twice the window, so the
+/// `inflight > window` comparison stays reachable at any bandwidth-delay
+/// product — a flat cap silenced the backoff entirely once the window grew
+/// past it (1 s RTT at 60 Hz wants 71 against a cap of 64).  The hard
+/// ceiling can still bind for an absurd RTT/rate pair, and there
+/// `surface_window_open`'s outbox backpressure remains the backstop.
+fn surface_frame_window(client: &ClientState) -> usize {
+    frame_window(effective_rtt_ms(client), client.display_fps.max(1.0))
 }
 
-fn surface_send_interval(client: &ClientState) -> Duration {
-    Duration::from_secs_f64(1.0 / surface_pacing_fps(client).max(1.0) as f64)
+fn surface_inflight_for(client: &ClientState, surface_id: u16) -> usize {
+    client
+        .surface_inflight_frames
+        .iter()
+        .filter(|f| f.surface_id == surface_id)
+        .count()
+}
+
+/// Surface frame rate.
+///
+/// Deliberately *not* `browser_pacing_fps`.  That function's inputs are
+/// terminal metrics: `browser_backlog_frames` carries the client's
+/// `pendingAppliedFrames`, which counts applied-but-unpainted *terminal*
+/// frames and is cleared when a terminal paints
+/// (`TerminalStore.noteFrameRendered`).  Pacing video off it meant a burst
+/// of shell output throttled an unrelated video surface — steeply, since
+/// the terminal schedule quarters the rate by a backlog of 8 — and because
+/// the client only reports every 250 ms, the cut outlived the burst that
+/// caused it.
+///
+/// Surfaces carry their own signal instead: frames sent but not yet acked
+/// for *this* surface.  The browser acks a surface frame as soon as it
+/// hands the chunk to its decoder, so a queue deeper than the link should
+/// hold is real congestion — the network or the decoder input — rather
+/// than a busy paint loop somewhere else in the page.
+fn surface_pacing_fps(client: &ClientState, surface_id: u16) -> f32 {
+    let fps = client.display_fps.max(1.0);
+    let window = surface_frame_window(client);
+    let inflight = surface_inflight_for(client, surface_id);
+    if inflight > window {
+        // Proportional, not stepped: the terminal path's steep schedule
+        // exists to break apply-time death spirals, which do not apply
+        // here — an overdeep surface queue drains on its own once the rate
+        // eases, and `surface_window_open`'s outbox backpressure is still
+        // the hard backstop for a client that has genuinely stopped.
+        (fps * window as f32 / inflight as f32).max(1.0)
+    } else {
+        fps
+    }
+}
+
+fn surface_send_interval(client: &ClientState, surface_id: u16) -> Duration {
+    Duration::from_secs_f64(1.0 / surface_pacing_fps(client, surface_id).max(1.0) as f64)
+}
+
+/// Slowest surface pacing across this client, for the metrics line.
+fn slowest_surface_pacing_fps(client: &ClientState) -> f32 {
+    client
+        .surface_subs
+        .keys()
+        .map(|&sid| surface_pacing_fps(client, sid))
+        .fold(f32::INFINITY, f32::min)
+        .min(client.display_fps.max(1.0))
 }
 
 /// Whether the next frame sent to `client` for `sid` must be a keyframe.
@@ -1409,7 +1494,7 @@ fn next_quantizer(sample: RateSample) -> u8 {
 /// splits by how many bytes each is actually producing, so a big active
 /// window is not starved by a small idle one.
 fn surface_budget_bytes(client: &ClientState, surface_id: u16) -> f32 {
-    let fps = surface_pacing_fps(client).max(1.0);
+    let fps = surface_pacing_fps(client, surface_id).max(1.0);
     let total: f32 = client.surface_subs.values().map(|s| s.frame_bytes).sum();
     let own = client
         .surface_subs
@@ -1480,9 +1565,18 @@ fn step_adaptive_bandwidth(
         .iter()
         .filter(|f| f.surface_id == surface_id)
         .count();
+    // Deliberately SURFACE_INFLIGHT_MIN, not the derived cap.  This is the
+    // quality controller, not the pacer: it asks "is the link app-limited,
+    // so the measured budget says nothing about capacity".  Wiring it to
+    // `surface_inflight_cap(client) / 2` — which equals surface_frame_window
+    // whenever the cap is unclamped — makes the boundary move with RTT, so
+    // at 1 s / 60 Hz it lands at 71 against a steady-state inflight of ~60
+    // and flips app_limited on a link that is simply deep, not idle.  The
+    // threshold here must stay a constant; it happens to be the same 32 the
+    // flat cap used to give.
     let app_limited = !congested
         && client.browser_backlog_frames <= 4
-        && surface_inflight < SURFACE_INFLIGHT_MAX / 2;
+        && surface_inflight < SURFACE_INFLIGHT_MIN / 2;
     let budget_bytes = surface_budget_bytes(client, surface_id);
     let ceiling = client
         .surface_subs
@@ -1576,7 +1670,7 @@ fn maybe_log_pacing_metrics(sess: &mut Session, client_id: u64, verbose: bool) {
     let log_elapsed = c.last_log.elapsed().as_secs_f32().max(1.0e-3);
     let paced_fps = pacing_fps(c);
     let display_need_bps_v = display_need_bps(c);
-    let surface_fps = surface_pacing_fps(c);
+    let surface_fps = slowest_surface_pacing_fps(c);
     let frames_sent = c.frames_sent;
     let acks_recv = c.acks_recv;
     let rtt_ms = c.rtt_ms;
@@ -2074,7 +2168,10 @@ fn record_surface_frame_sent(
     is_keyframe: bool,
     now: Instant,
 ) {
-    while client.surface_inflight_frames.len() >= SURFACE_INFLIGHT_MAX {
+    // Computed before the mutable borrow below; the cap tracks the link's
+    // bandwidth-delay product, so it is not a constant.
+    let cap = surface_inflight_cap(client);
+    while client.surface_inflight_frames.len() >= cap {
         client.surface_inflight_frames.pop_front();
     }
     client
@@ -4399,7 +4496,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // Safety clamp: the deadline should never be more
                         // than 2× the send interval ahead.  If it is, snap
                         // back to now so encoding doesn't stall permanently.
-                        let interval = surface_send_interval(client);
+                        let interval = surface_send_interval(client, sid);
                         if deadline > now + interval + interval {
                             client.surface_subs.entry(sid).or_default().next_send_at = Some(now);
                         } else {
@@ -5001,9 +5098,12 @@ async fn tick(state: &AppState) -> TickOutcome {
         // deadline so the next tick retries without burning a time slot.
         for work in &client_work {
             if let Some(client) = sess.clients.get_mut(&work.cid) {
-                let interval = surface_send_interval(client);
                 for &sid in &work.subs {
                     if encoded_client_surfaces.contains(&(work.cid, sid)) {
+                        // Per surface: pacing now reads that surface's own
+                        // inflight depth, so one congested surface no longer
+                        // sets the cadence for its neighbours.
+                        let interval = surface_send_interval(client, sid);
                         let deadline = client
                             .surface_subs
                             .entry(sid)
@@ -13102,6 +13202,189 @@ mod tests {
         );
     }
 
+    // ── surface pacing is independent of terminal backlog ──
+
+    #[test]
+    fn surface_pacing_ignores_terminal_backlog() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 60.0;
+        client.surface_subs.entry(1).or_default();
+
+        let clean = surface_pacing_fps(&client, 1);
+
+        // A burst of shell output backs the terminal's paint loop up.  That
+        // is what `browser_pacing_fps` reads, and it must not reach video.
+        client.browser_backlog_frames = 20;
+        client.browser_ack_ahead_frames = 20;
+        assert!(
+            browser_pacing_fps(&client) < clean,
+            "precondition: terminal pacing should back off here"
+        );
+        assert_eq!(surface_pacing_fps(&client, 1), clean);
+    }
+
+    #[test]
+    fn surface_pacing_backs_off_on_its_own_inflight_depth() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 60.0;
+        client.rtt_ms = 1.0;
+        client.min_rtt_ms = 1.0;
+        client.surface_subs.entry(1).or_default();
+
+        let clean = surface_pacing_fps(&client, 1);
+        let now = Instant::now();
+        let window = surface_frame_window(&client);
+        for _ in 0..(window * 4) {
+            record_surface_frame_sent(&mut client, 1, 1_000, false, now);
+        }
+        assert!(
+            surface_pacing_fps(&client, 1) < clean,
+            "a surface queue well past the link's window should slow it down"
+        );
+    }
+
+    #[test]
+    fn surface_pacing_tolerates_a_high_rtt_link() {
+        // 100 ms RTT at 60 Hz legitimately keeps ~6 frames in flight.  A
+        // constant threshold would read that as congestion and halve the
+        // rate on a link that is behaving perfectly.
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 60.0;
+        client.rtt_ms = 100.0;
+        client.min_rtt_ms = 100.0;
+        client.surface_subs.entry(1).or_default();
+
+        let now = Instant::now();
+        for _ in 0..6 {
+            record_surface_frame_sent(&mut client, 1, 1_000, false, now);
+        }
+        assert_eq!(surface_pacing_fps(&client, 1), 60.0);
+    }
+
+    #[test]
+    fn surface_pacing_is_per_surface() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 60.0;
+        client.rtt_ms = 1.0;
+        client.min_rtt_ms = 1.0;
+        client.surface_subs.entry(1).or_default();
+        client.surface_subs.entry(2).or_default();
+
+        let now = Instant::now();
+        let window = surface_frame_window(&client);
+        for _ in 0..(window * 4) {
+            record_surface_frame_sent(&mut client, 1, 1_000, false, now);
+        }
+        // Surface 1 is backed up; surface 2 keeps its full rate.
+        assert!(surface_pacing_fps(&client, 1) < 60.0);
+        assert_eq!(surface_pacing_fps(&client, 2), 60.0);
+    }
+
+    #[test]
+    fn surface_pacing_never_reaches_zero() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 60.0;
+        client.surface_subs.entry(1).or_default();
+        let now = Instant::now();
+        for _ in 0..surface_inflight_cap(&client) {
+            record_surface_frame_sent(&mut client, 1, 1_000, false, now);
+        }
+        assert!(surface_pacing_fps(&client, 1) >= 1.0);
+    }
+
+    #[test]
+    fn surface_inflight_cap_stays_above_the_window() {
+        // The backoff compares `inflight > window`, so the tracking queue
+        // has to be able to hold more than the window or the comparison is
+        // unreachable and the controller is silently inert.  This is what
+        // a flat cap of 64 got wrong at 1 s RTT.
+        for (rtt, fps) in [
+            (1.0f32, 60.0f32),
+            (100.0, 60.0),
+            (500.0, 60.0),
+            (500.0, 240.0),
+            (1000.0, 60.0),
+            (1000.0, 120.0),
+        ] {
+            let (mut client, _rx) = test_client_with_capacity(64);
+            client.rtt_ms = rtt;
+            client.min_rtt_ms = rtt;
+            client.display_fps = fps;
+            let window = surface_frame_window(&client);
+            let cap = surface_inflight_cap(&client);
+            assert!(
+                cap > window,
+                "rtt={rtt} fps={fps}: cap {cap} must exceed window {window}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_limited_threshold_does_not_move_with_rtt() {
+        // Regression: deriving this from surface_inflight_cap made it track
+        // surface_frame_window, so a deep-but-healthy link read as
+        // app-limited and the quality controller walked the quantizer back
+        // toward the ceiling on a link that was merely far away.  The
+        // quality controller and the pacer answer different questions and
+        // must not share a threshold.
+        let deep = {
+            let (mut c, _rx) = test_client_with_capacity(64);
+            c.rtt_ms = 1000.0;
+            c.min_rtt_ms = 1000.0;
+            c.display_fps = 60.0;
+            c
+        };
+        let near = {
+            let (mut c, _rx) = test_client_with_capacity(64);
+            c.rtt_ms = 1.0;
+            c.min_rtt_ms = 1.0;
+            c.display_fps = 60.0;
+            c
+        };
+        // The window legitimately differs by an order of magnitude...
+        assert!(surface_frame_window(&deep) > surface_frame_window(&near) * 4);
+        // ...but the app-limited boundary must not.
+        assert_eq!(SURFACE_INFLIGHT_MIN / 2, 32);
+    }
+
+    #[test]
+    fn surface_inflight_cap_is_bounded() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.rtt_ms = 60_000.0;
+        client.min_rtt_ms = 60_000.0;
+        client.display_fps = 480.0;
+        assert_eq!(surface_inflight_cap(&client), SURFACE_INFLIGHT_HARD_MAX);
+    }
+
+    #[test]
+    fn surface_backoff_engages_at_one_second_rtt() {
+        // Regression for the reported case: a plain 60 Hz client on a 1 s
+        // link.  The window is 71 there; with the old flat cap of 64 the
+        // queue could never reach it and the rate never backed off.
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.rtt_ms = 1000.0;
+        client.min_rtt_ms = 1000.0;
+        client.display_fps = 60.0;
+        client.surface_subs.entry(1).or_default();
+
+        let now = Instant::now();
+        let window = surface_frame_window(&client);
+        // Steady state for this link is ~60 frames: still full rate.
+        for _ in 0..60 {
+            record_surface_frame_sent(&mut client, 1, 1_000, false, now);
+        }
+        assert_eq!(surface_pacing_fps(&client, 1), 60.0);
+
+        // Past what the link should hold: the rate must come down.
+        for _ in 0..(window * 2) {
+            record_surface_frame_sent(&mut client, 1, 1_000, false, now);
+        }
+        assert!(
+            surface_pacing_fps(&client, 1) < 60.0,
+            "backoff must be reachable at 1 s RTT"
+        );
+    }
+
     #[test]
     fn surface_acks_are_matched_to_their_own_surface() {
         let (mut client, _rx) = test_client_with_capacity(64);
@@ -13483,10 +13766,11 @@ mod tests {
     fn surface_inflight_queue_is_bounded() {
         let (mut client, _rx) = test_client_with_capacity(64);
         let now = Instant::now();
-        for _ in 0..(SURFACE_INFLIGHT_MAX * 2) {
+        let cap = surface_inflight_cap(&client);
+        for _ in 0..(cap * 2) {
             record_surface_frame_sent(&mut client, 7, 1_000, false, now);
         }
-        assert_eq!(client.surface_inflight_frames.len(), SURFACE_INFLIGHT_MAX);
+        assert_eq!(client.surface_inflight_frames.len(), cap);
     }
 
     #[test]

@@ -113,6 +113,10 @@ The client reports:
 The server spaces frame sends to match the client's actual render rate. When backlog grows (client falling behind), the server backs off.
 The final transport gate is byte-aware: queued bytes and queued message count both feed outbox backpressure, so a couple of tiny terminal diffs do not stall a large surface/video frame. Bulk writes are chunked so audio can interleave while large terminal or video payloads are draining.
 
+Those client metrics are **terminal** metrics: `backlog` is the browser's count of applied-but-unpainted terminal frames, cleared when a terminal actually paints. Surfaces are paced separately (`surface_pacing_fps`), off their own unacked-frame depth measured against what the link should hold at the client's display rate and RTT. Video therefore keeps its cadence through a burst of shell output, and a surface that is genuinely congested slows down without dragging its neighbours with it.
+
+The queue that depth is measured from (`surface_inflight_cap`) is sized from the bandwidth-delay product, at twice the window, rather than being a constant. A flat cap is two different things at two different latencies: at 1 s RTT and 60 Hz the link legitimately holds ~60 frames, so a cap of 64 sat on top of the steady state — the window came out at 71, above the cap, making `inflight > window` unreachable and silencing the rate controller entirely. Past 90 Hz on that link the deque also evicted live entries continuously, so `record_surface_ack` matched each ACK to a newer frame than the one it belonged to and understated delivery time.
+
 ### Preview budgeting
 
 Background PTYs (subscribed but not focused) share leftover bandwidth after the focused PTY's needs are met. Preview frame rate is capped to avoid starving the focused terminal.
