@@ -4,7 +4,11 @@ import { BlitSurfaceCanvas } from "../BlitSurfaceCanvas";
 import type { BlitWorkspace } from "../BlitWorkspace";
 import type { SurfaceAxisEvent } from "../protocol";
 import { SURFACE_POINTER_DOWN, SURFACE_POINTER_UP } from "../protocol";
-import { AXIS_SOURCE_FINGER, AXIS_SOURCE_WHEEL } from "../types";
+import {
+  AXIS_SOURCE_CONTINUOUS,
+  AXIS_SOURCE_FINGER,
+  AXIS_SOURCE_WHEEL,
+} from "../types";
 
 /** Minimal workspace stub: no connection, so the canvas never subscribes
  *  and layout can be exercised in isolation. */
@@ -174,13 +178,32 @@ describe("BlitSurfaceCanvas scroll", () => {
     vi.useRealTimers();
   });
 
-  it("labels a trackpad's sub-pixel stream as a finger, with no detents", () => {
+  it("labels a trackpad's sub-pixel stream as continuous, with no detents", () => {
     const { surface, sent, wheel } = attachScrolling();
     wheel({ deltaY: 12.5, deltaMode: 0 });
     expect(sent).toHaveLength(1);
-    expect(sent[0].source).toBe(AXIS_SOURCE_FINGER);
+    expect(sent[0].source).toBe(AXIS_SOURCE_CONTINUOUS);
     expect(sent[0].dy).toBeCloseTo(12.5);
     expect(sent[0].v120y).toBe(0);
+    surface.dispose();
+  });
+
+  /**
+   * The bug this all exists for. macOS hands the browser a notched wheel
+   * as plain pixel deltas — around a third of a 120px detent, varied by
+   * its own scroll acceleration — so no arithmetic here can tell it from
+   * a trackpad. Calling the ones we cannot prove `finger` used to be the
+   * safe-looking guess; it is the opposite, because `finger` is what
+   * licenses a toolkit to fling. Every notch of a real wheel glided.
+   */
+  it("never labels a wheel event a finger, whatever its deltas look like", () => {
+    const { surface, sent, wheel } = attachScrolling();
+    // One notch, then two, the way macOS acceleration reports a spin.
+    for (const deltaY of [40, 40, 80, 120, 40]) wheel({ deltaY, deltaMode: 0 });
+    vi.advanceTimersByTime(500);
+    expect(sent).not.toHaveLength(0);
+    expect(sent.map((e) => e.source)).not.toContain(AXIS_SOURCE_FINGER);
+    expect(sent.filter((e) => e.stop)).toHaveLength(0);
     surface.dispose();
   });
 
@@ -209,7 +232,7 @@ describe("BlitSurfaceCanvas scroll", () => {
     // reclassify the stream as a notched wheel.
     wheel({ deltaY: 120, deltaMode: 0 });
     expect(sent).toHaveLength(2);
-    expect(sent[1].source).toBe(AXIS_SOURCE_FINGER);
+    expect(sent[1].source).toBe(AXIS_SOURCE_CONTINUOUS);
     expect(sent[1].v120y).toBe(0);
     surface.dispose();
   });
@@ -255,18 +278,6 @@ describe("BlitSurfaceCanvas scroll", () => {
     surface.dispose();
   });
 
-  it("ends the sequence with a stop once the wheel goes idle", () => {
-    const { surface, sent, wheel } = attachScrolling();
-    wheel({ deltaY: 8.5, deltaMode: 0 });
-    expect(sent.filter((e) => e.stop)).toHaveLength(0);
-    vi.advanceTimersByTime(500);
-    const stops = sent.filter((e) => e.stop);
-    expect(stops).toHaveLength(1);
-    expect(stops[0].source).toBe(AXIS_SOURCE_FINGER);
-    expect(stops[0].dy).toBe(0);
-    surface.dispose();
-  });
-
   /** A thumbnail takes no other input, and must not swallow the page's
    *  scroll to send a gesture to an app the user is only previewing. */
   it("leaves the wheel alone in a view with no display size", () => {
@@ -277,21 +288,6 @@ describe("BlitSurfaceCanvas scroll", () => {
     vi.advanceTimersByTime(FRAME_MS);
     expect(sent).toHaveLength(0);
     expect(e.defaultPrevented).toBe(false);
-    surface.dispose();
-  });
-
-  /** Chromium regresses a fling velocity from the frames preceding an
-   *  `axis_stop` unless more than its `kFlingStartTimeoutMs` of 200ms has
-   *  passed since the last of them. macOS has already appended a momentum
-   *  tail by then, so the stop has to land outside that window or the app
-   *  serves a second helping. */
-  it("holds the stop past the window a toolkit would fling from", () => {
-    const { surface, sent, wheel } = attachScrolling();
-    wheel({ deltaY: 8.5, deltaMode: 0 });
-    vi.advanceTimersByTime(200);
-    expect(sent.filter((e) => e.stop)).toHaveLength(0);
-    vi.advanceTimersByTime(100);
-    expect(sent.filter((e) => e.stop)).toHaveLength(1);
     surface.dispose();
   });
 
@@ -306,12 +302,16 @@ describe("BlitSurfaceCanvas scroll", () => {
     surface.dispose();
   });
 
-  it("sends one stop per gesture, not one per idle tick", () => {
+  /** Going idle closes the sequence, so the next one is classified from
+   *  scratch rather than inheriting a tail's verdict. */
+  it("classifies the next sequence afresh once the last one went idle", () => {
     const { surface, sent, wheel } = attachScrolling();
-    wheel({ deltaY: 8.5, deltaMode: 0 });
+    wheel({ deltaY: 3.5, deltaMode: 0 });
+    expect(sent[0].source).toBe(AXIS_SOURCE_CONTINUOUS);
     vi.advanceTimersByTime(500);
-    vi.advanceTimersByTime(500);
-    expect(sent.filter((e) => e.stop)).toHaveLength(1);
+    wheel({ deltaY: 120, deltaMode: 0 });
+    expect(sent[1].source).toBe(AXIS_SOURCE_WHEEL);
+    expect(sent[1].v120y).toBe(120);
     surface.dispose();
   });
 });
@@ -405,6 +405,34 @@ describe("BlitSurfaceCanvas touch", () => {
       SURFACE_POINTER_DOWN,
       SURFACE_POINTER_UP,
     ]);
+    surface.dispose();
+  });
+
+  /**
+   * The one device that has earned a fling. A finger really does lift, at
+   * a moment worth reporting, and a flick on glass that doesn't coast
+   * feels broken — so this is the only path that claims `finger` and the
+   * only one that sends the `axis_stop` a toolkit flings from.
+   */
+  it("ends a touch drag with a finger stop, exactly one", () => {
+    const { surface, canvas, sent } = attachScrolling();
+    const moved = { identifier: 1, clientX: 40, clientY: 100 };
+
+    canvas.dispatchEvent(touchEvent("touchstart", [FINGER]));
+    canvas.dispatchEvent(touchEvent("touchmove", [moved]));
+    vi.advanceTimersByTime(FRAME_MS);
+    canvas.dispatchEvent(touchEvent("touchend", [moved], { ongoing: false }));
+
+    // Dragging the content down scrolls up, and a finger carries no detents.
+    expect(sent[0].source).toBe(AXIS_SOURCE_FINGER);
+    expect(sent[0].dy).toBeCloseTo(-60);
+    expect(sent[0].v120y).toBe(0);
+    const stops = sent.filter((e) => e.stop);
+    expect(stops).toHaveLength(1);
+    expect(stops[0].source).toBe(AXIS_SOURCE_FINGER);
+    // The idle timer must not follow up with a second one.
+    vi.advanceTimersByTime(1000);
+    expect(sent.filter((e) => e.stop)).toHaveLength(1);
     surface.dispose();
   });
 

@@ -4,6 +4,7 @@ import {
   CODEC_SUPPORT_AV1,
   CODEC_SUPPORT_H264_444,
   CODEC_SUPPORT_AV1_444,
+  AXIS_SOURCE_CONTINUOUS,
   AXIS_SOURCE_FINGER,
   AXIS_SOURCE_WHEEL,
 } from "./types";
@@ -401,24 +402,20 @@ const WHEEL_LINE_PX = 16;
  *  turned back into `axis_value120` detents. */
 const WHEEL_LINES_PER_DETENT = 3;
 /** CSS pixels per detent for browsers that report notched wheels in pixel
- *  mode (Chrome and Edge on Windows and Linux). */
+ *  mode on a whole-detent grid (Chrome and Edge on Windows and Linux).
+ *  macOS reports a notch as a fraction of this and lets its own scroll
+ *  acceleration vary it, so a wheel there is not recognisable by size. */
 const WHEEL_DETENT_PX = 120;
 /**
  * Idle gap that ends a scroll sequence.
  *
  * Long enough to bridge the frame cadence of a macOS momentum tail so one
- * flick stays one gesture, short enough that the app settles promptly
- * once the tail decays.
+ * flick stays one gesture: the source is latched for the length of a
+ * sequence, and a tail split in two could have its second half reread as
+ * a notched wheel. Short enough that the next scroll starts fresh.
  *
- * Also deliberately past Chromium's `kFlingStartTimeoutMs` of 200ms: it
- * turns `axis_stop` into a fling whose velocity it regresses from the
- * last few frames, unless the gap since the last of them exceeds that.
- * macOS has already appended its own momentum by the time we see these
- * events, so a fling on top of it is a second helping — the page sails
- * past where the tail left it, and stopping with fingers still down
- * flings at the speed you were going before you stopped. Touch drags
- * still want kinetic scrolling and are unaffected: they end their
- * sequence on `touchend` rather than waiting out this timer.
+ * A touch drag doesn't wait for it — `touchend` ends that sequence at the
+ * moment the finger leaves the glass.
  */
 const SCROLL_STOP_MS = 280;
 
@@ -571,9 +568,10 @@ export class BlitSurfaceCanvas {
   } | null = null;
   private scrollFlushHandle: number | null = null;
   private scrollStopTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Whether the in-flight sequence came from a smooth device. Latched,
-   *  so a momentum tail cannot be reclassified as a wheel mid-gesture. */
-  private scrollSmoothLatch = false;
+  /** `axis_source` of the in-flight sequence, null between sequences.
+   *  Latched by {@link latchScrollSource} so a momentum tail cannot be
+   *  reclassified as a wheel mid-gesture. */
+  private scrollSource: number | null = null;
   /** Whether a stop still owes the client. */
   private scrollSequenceOpen = false;
 
@@ -1521,7 +1519,7 @@ export class BlitSurfaceCanvas {
           dy: -dy * g.sy,
           v120x: 0,
           v120y: 0,
-          smooth: true,
+          source: AXIS_SOURCE_FINGER,
         });
       }
     }
@@ -1644,6 +1642,13 @@ export class BlitSurfaceCanvas {
       // user sees if their finger drifted slightly during the tap.
       this.sendPointerAt(touch.clientX, touch.clientY, SURFACE_POINTER_DOWN, 0);
       this.sendPointerAt(touch.clientX, touch.clientY, SURFACE_POINTER_UP, 0);
+    } else if (active.mode === "scroll") {
+      // As in endTouchGesture(): the finger left the glass, so say so now
+      // rather than letting the idle timer say it 280ms late. A flick is
+      // supposed to coast, and Chromium reads no velocity into a stop
+      // that arrives more than 200ms after the frames it would regress
+      // one from — a late stop lands the gesture dead.
+      this.endScrollSequence();
     }
     this.activeTouch = null;
   }
@@ -1662,26 +1667,58 @@ export class BlitSurfaceCanvas {
   }
 
   /**
-   * True when this event looks like it came from a smooth device rather
-   * than a notched wheel.
+   * The `wl_pointer.axis_source` a wheel event deserves.
    *
-   * macOS is the reason this matters: it applies its own acceleration
-   * curve and appends a momentum tail, and browsers report the result as
-   * ordinary pixel-mode wheel events. Forwarding those unlabelled makes
-   * the Wayland client read them as wheel detents — `axis_source`'s
-   * default value is `wheel` — and scale them up by a lines-per-click
-   * factor on top of the acceleration macOS already applied. That
-   * double-multiply is what makes Mac scrolling feel violent on the
-   * Linux side.
+   * Two answers, and neither is `finger`. A DOM wheel event never proves
+   * a finger is on anything: macOS delivers a trackpad and a notched
+   * wheel through the same pixel deltas, having already applied its own
+   * acceleration curve to both. `finger` is the one source that invites
+   * a toolkit to append momentum of its own — it obliges us to send an
+   * `axis_stop`, and Chromium turns that into a fling — so claiming it
+   * off a guess is how one notch of a real wheel ends up gliding.
+   * `continuous` describes the same smooth stream without licensing that
+   * second helping. Real fingers arrive through the touch handlers,
+   * which don't have to guess.
+   *
+   * That leaves only the unmistakable wheels to spot: a `deltaMode`
+   * coarser than pixels, or a whole number of 120px detents. Everything
+   * else takes the harmless path, which costs a misread trackpad
+   * nothing and a misread wheel only its detents.
    */
-  private wheelLooksSmooth(e: WheelEvent): boolean {
+  private wheelAxisSource(e: WheelEvent): number {
     // Line and page modes only ever describe a notched wheel.
-    if (e.deltaMode !== 0) return false;
-    if (!Number.isInteger(e.deltaX) || !Number.isInteger(e.deltaY)) return true;
+    if (e.deltaMode !== 0) return AXIS_SOURCE_WHEEL;
+    if (!Number.isInteger(e.deltaX) || !Number.isInteger(e.deltaY))
+      return AXIS_SOURCE_CONTINUOUS;
     // A real wheel moves one axis at a time.
-    if (e.deltaX !== 0 && e.deltaY !== 0) return true;
+    if (e.deltaX !== 0 && e.deltaY !== 0) return AXIS_SOURCE_CONTINUOUS;
     const mag = Math.abs(e.deltaX || e.deltaY);
-    return mag === 0 || mag % WHEEL_DETENT_PX !== 0;
+    return mag !== 0 && mag % WHEEL_DETENT_PX === 0
+      ? AXIS_SOURCE_WHEEL
+      : AXIS_SOURCE_CONTINUOUS;
+  }
+
+  /**
+   * Fold a source into the open sequence and answer with what the
+   * sequence now is.
+   *
+   * A sequence only ever gets smoother. A trackpad's momentum tail can
+   * land on a round 120px mid-flick, and calling that a wheel would hand
+   * the client a detent it scales up by its own lines-per-click factor.
+   * A finger overrides either, since the touch handlers know what they
+   * are holding rather than inferring it from arithmetic.
+   */
+  private latchScrollSource(source: number): number {
+    const open = this.scrollSource;
+    if (
+      open === null ||
+      open === AXIS_SOURCE_WHEEL ||
+      source === AXIS_SOURCE_FINGER
+    ) {
+      this.scrollSource = source;
+      return source;
+    }
+    return open;
   }
 
   private handleWheel(e: WheelEvent): void {
@@ -1698,27 +1735,29 @@ export class BlitSurfaceCanvas {
     if (!g) return;
     e.preventDefault();
 
-    // Once a sequence shows any sign of being smooth it stays smooth: a
-    // trackpad flick's momentum tail can emit whole-number deltas that
-    // would otherwise be misread as detents mid-gesture. The latch has to
-    // win before the detent maths below, not just when labelling the
-    // source, or a finger-sourced event ends up carrying wheel notches.
-    const smooth = this.wheelLooksSmooth(e) || this.scrollSmoothLatch;
+    // The latch has to win before the detent maths below, not just when
+    // labelling the source, or a smooth event ends up carrying notches.
+    const source = this.latchScrollSource(this.wheelAxisSource(e));
+    const notched = source === AXIS_SOURCE_WHEEL;
     let { deltaX, deltaY } = e;
     let v120x = 0;
     let v120y = 0;
 
     if (e.deltaMode === WHEEL_MODE_LINE) {
-      v120x = (deltaX / WHEEL_LINES_PER_DETENT) * 120;
-      v120y = (deltaY / WHEEL_LINES_PER_DETENT) * 120;
+      if (notched) {
+        v120x = (deltaX / WHEEL_LINES_PER_DETENT) * 120;
+        v120y = (deltaY / WHEEL_LINES_PER_DETENT) * 120;
+      }
       deltaX *= WHEEL_LINE_PX;
       deltaY *= WHEEL_LINE_PX;
     } else if (e.deltaMode === WHEEL_MODE_PAGE) {
-      v120x = deltaX * 120;
-      v120y = deltaY * 120;
+      if (notched) {
+        v120x = deltaX * 120;
+        v120y = deltaY * 120;
+      }
       deltaX *= g.dw;
       deltaY *= g.dh;
-    } else if (!smooth) {
+    } else if (notched) {
       // Pixel-mode wheel: browsers that report notches this way use
       // 120px per detent.
       v120x = (deltaX / WHEEL_DETENT_PX) * 120;
@@ -1730,7 +1769,7 @@ export class BlitSurfaceCanvas {
       dy: deltaY * g.sy,
       v120x,
       v120y,
-      smooth,
+      source,
     });
   }
 
@@ -1748,9 +1787,9 @@ export class BlitSurfaceCanvas {
     dy: number;
     v120x: number;
     v120y: number;
-    smooth: boolean;
+    source: number;
   }): void {
-    this.scrollSmoothLatch = part.smooth;
+    this.latchScrollSource(part.source);
     this.scrollSequenceOpen = true;
     const a = (this.scrollAccum ??= { dx: 0, dy: 0, v120x: 0, v120y: 0 });
     a.dx += part.dx;
@@ -1783,24 +1822,28 @@ export class BlitSurfaceCanvas {
       dy: a.dy,
       v120x: a.v120x,
       v120y: a.v120y,
-      source: this.scrollSmoothLatch ? AXIS_SOURCE_FINGER : AXIS_SOURCE_WHEEL,
+      source: this.scrollSource ?? AXIS_SOURCE_CONTINUOUS,
       stop: false,
     });
   }
 
   /**
-   * Tell the client the gesture is over.
+   * Close the sequence, and tell the client the gesture is over if a
+   * finger was what drove it.
    *
-   * Without this the app never learns a scroll ended, so toolkits that
-   * gate kinetic scrolling on a stop event either keep flinging or never
-   * settle. Claiming a `finger` source obliges us to send it.
+   * A lifted finger is a real event with a real moment, and the toolkits
+   * that fling do it off this: a flick on a touchscreen should coast,
+   * and without a stop it never would.
    *
-   * A notched wheel gets no stop: the protocol says a `wheel` sequence
-   * may or may not be terminated and that clients must not rely on it,
-   * and a wheel has no finger-lift moment to report anyway. Sending one
-   * only gives toolkits a reason to invent momentum — Chromium starts a
-   * fling off any `axis_stop`, without checking the source when it has a
-   * single frame of history to regress.
+   * Nothing else gets one. `axis_stop` is what a toolkit regresses a
+   * fling velocity from — Chromium starts one off any stop it can find
+   * recent frames behind — and every other sequence we send arrived as
+   * browser wheel events, which already carry whatever momentum the
+   * platform decided they deserved. A stop there would be asking for a
+   * second helping of it, which is exactly what a mouse wheel gliding to
+   * a halt looks like. The protocol agrees for `wheel` at least: the
+   * sequence may or may not be terminated and clients must not rely on
+   * it.
    */
   private endScrollSequence(): void {
     if (this.scrollStopTimer !== null) {
@@ -1812,11 +1855,11 @@ export class BlitSurfaceCanvas {
       this.scrollFlushHandle = null;
       this.flushScroll();
     }
-    const wasSmooth = this.scrollSmoothLatch;
-    this.scrollSmoothLatch = false;
+    const source = this.scrollSource;
+    this.scrollSource = null;
     if (!this.scrollSequenceOpen) return;
     this.scrollSequenceOpen = false;
-    if (!wasSmooth) return;
+    if (source !== AXIS_SOURCE_FINGER) return;
     const conn = this.getConn();
     if (!conn || !this.surface) return;
     conn.sendSurfaceAxis2(this._surfaceId, {
