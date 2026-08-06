@@ -881,6 +881,42 @@ function WorkspaceScreen(props: {
   const terminalInputSelector =
     'textarea[aria-label="Terminal input"][tabindex]:not([readonly])';
 
+  // The software keyboard rises only from the status-bar toggle, never from a
+  // tap: while it isn't wanted, every terminal textarea carries
+  // inputmode="none", which keeps focus semantics (hardware keys, scrollback
+  // navigation, paste) but tells the browser not to bring up an IME.  The
+  // observer exists because terminal textareas are created whenever a pane
+  // mounts, and the attribute has to be in place before the tap that focuses
+  // them — stamping on focus is too late for the IME decision.
+  createEffect(() => {
+    // `suppress` is false when leaving touch mode too (a DevTools device-mode
+    // flip), so that pass strips stale stamps before bailing.
+    const suppress = isMobileTouch() && !keyboardWanted();
+    const stampOne = (el: Element) => {
+      if (suppress) el.setAttribute("inputmode", "none");
+      else el.removeAttribute("inputmode");
+    };
+    const stamp = (root: ParentNode) => {
+      for (const el of root.querySelectorAll(
+        'textarea[aria-label="Terminal input"]',
+      ))
+        stampOne(el);
+    };
+    stamp(document);
+    if (!isMobileTouch()) return;
+    const mo = new MutationObserver((records) => {
+      for (const r of records) {
+        for (const n of r.addedNodes) {
+          if (!(n instanceof HTMLElement)) continue;
+          if (n.matches('textarea[aria-label="Terminal input"]')) stampOne(n);
+          else stamp(n);
+        }
+      }
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+    onCleanup(() => mo.disconnect());
+  });
+
   // The focused pane's terminal, else the first one on screen that can take
   // focus.  Every fallback matters: a pane holding an editor, a web view or a
   // surface has no terminal input at all, and until something is tapped no
@@ -937,14 +973,14 @@ function WorkspaceScreen(props: {
   createEffect(() => {
     if (!keyboardWanted()) {
       keyboardSeen = false;
-      // A full keyboard rising without the toggle is still the user asking
-      // for it — on Android, tapping a terminal raises the IME directly, and
-      // the icon sat dim over an open keyboard with no toolbar, so the first
-      // toggle tap looked like it did nothing.  Latch intent from reality.
-      // Gated on focus still being in a terminal so the drain after an
-      // explicit hide (the toggle blurred, occlusion not yet gone) cannot
-      // re-latch, and on >150px so the iPadOS shortcut bar and the floating
-      // keyboard don't count — only a real keyboard does.
+      // inputmode="none" means taps no longer raise the IME, but the OS still
+      // can (a keyboard-show gesture, stylus handwriting input).  If a full
+      // keyboard is genuinely up over a focused terminal, latch intent from
+      // reality so the icon and toolbar match what's on screen.  Gated on
+      // focus still being in a terminal so the drain after an explicit hide
+      // (the toggle blurred, occlusion not yet gone) cannot re-latch, and on
+      // >150px so the iPadOS shortcut bar and the floating keyboard don't
+      // count — only a real keyboard does.
       if (
         occlusion() > 150 &&
         document.activeElement instanceof HTMLElement &&
@@ -999,6 +1035,11 @@ function WorkspaceScreen(props: {
       const el = focusedTerminalInput();
       if (!el) return;
       setKeyboardWanted(true);
+      // The stamping effect above has cleared inputmode="none" by now (Solid
+      // runs it synchronously on the write), but the IME decision happens on
+      // this very element in this very gesture — clear it directly rather
+      // than trust effect ordering.
+      el.removeAttribute("inputmode");
       // Android leaves the textarea focused with no keyboard up — the
       // pane-focus effect focuses it at load with no user gesture (Chrome
       // moves focus but raises no IME), and the Back gesture dismisses the
@@ -3396,8 +3437,13 @@ function WorkspaceScreen(props: {
   const theme = () => themeFor(palette());
   const chromeScale = () => uiScale(fontSize());
   const mod = /Mac|iPhone|iPad/.test(navigator.platform) ? "Cmd" : "Ctrl";
+  // Intent alone isn't enough for the key line: it must vanish the moment the
+  // software keyboard is reduced, not a settling period later when intent
+  // expires — and never sit over a keyboard that failed to rise (hardware
+  // keyboard attached, focus lost to an overlay).  The occlusion gate tracks
+  // the keyboard itself; the iPadOS shortcut bar (>32px) still counts.
   const showMobileToolbar = createMemo(
-    () => isMobileTouch() && keyboardWanted(),
+    () => isMobileTouch() && keyboardWanted() && viewportOccluded(),
   );
   const statusBarHeight = () => chromeScale().md + chromeScale().controlY * 3;
 
