@@ -3249,6 +3249,24 @@ fn refuse_create(
     }
 }
 
+/// Read a `CREATE2` tag out of `data`, or name why it is unusable.
+///
+/// `data` is the whole message; the tag is `[tag_len:2]` at offset 8 followed
+/// by that many bytes.  Both failures used to fall back to an empty tag and
+/// let the create proceed, which breaks the one-outcome contract in two
+/// different ways.  A client correlating terminals by tag gets one it can
+/// never match.  Worse, an overrunning `tag_len` leaves the read cursor past
+/// the end of the message, so a `CREATE2` carrying a command but no cwd or
+/// deadline — nothing else left to bounds-check it — finds no command bytes
+/// and spawns the default shell instead of what was asked for.
+fn create2_tag(data: &[u8]) -> Result<&str, &'static str> {
+    let tag_len = u16::from_le_bytes([data[8], data[9]]) as usize;
+    let bytes = data
+        .get(10..10 + tag_len)
+        .ok_or("tag length past end of message")?;
+    std::str::from_utf8(bytes).map_err(|_| "tag is not valid UTF-8")
+}
+
 /// Name the field that would not survive `S2C_LIST`'s `u16` length prefixes,
 /// or `None` when the record is representable.  `pty_list_msg` casts both
 /// lengths with `as u16`, so an oversize value does not fail loudly — it
@@ -9819,10 +9837,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     continue;
                 }
                 let tag_len = u16::from_le_bytes([data[8], data[9]]) as usize;
-                let tag = if data.len() >= 10 + tag_len {
-                    std::str::from_utf8(&data[10..10 + tag_len]).unwrap_or_default()
-                } else {
-                    ""
+                let tag = match create2_tag(&data) {
+                    Ok(tag) => tag,
+                    Err(detail) => {
+                        refuse_create(&sess, client_id, want_status, nonce, STATUS_INVALID, detail);
+                        continue;
+                    }
                 };
                 let mut cursor = 10 + tag_len;
                 let src_dir = if features & CREATE2_HAS_SRC_PTY != 0 && data.len() >= cursor + 2 {
@@ -14931,6 +14951,49 @@ mod tests {
     }
 
     // ── create refusal ──
+
+    /// A `CREATE2` prefix: 1 opcode + 2 nonce + 2 rows + 2 cols + 1 features,
+    /// then `[tag_len:2]` at offset 8 and the tag bytes at 10.
+    fn create2_with_tag(tag_len: u16, tag: &[u8]) -> Vec<u8> {
+        let mut msg = vec![0u8; 8];
+        msg.extend_from_slice(&tag_len.to_le_bytes());
+        msg.extend_from_slice(tag);
+        msg
+    }
+
+    #[test]
+    fn create2_tag_reads_a_well_formed_tag() {
+        let msg = create2_with_tag(3, b"abc");
+        assert_eq!(create2_tag(&msg), Ok("abc"));
+        // Trailing bytes belong to the later fields, not the tag.
+        let msg = create2_with_tag(3, b"abcdef");
+        assert_eq!(create2_tag(&msg), Ok("abc"));
+        assert_eq!(create2_tag(&create2_with_tag(0, b"")), Ok(""));
+    }
+
+    /// The dangerous one: an overrunning `tag_len` used to yield an empty tag
+    /// and leave the cursor past the end, so a command-bearing create with no
+    /// cwd or deadline to bounds-check it spawned the default shell instead.
+    #[test]
+    fn create2_tag_refuses_a_length_past_the_end() {
+        assert_eq!(
+            create2_tag(&create2_with_tag(9, b"abc")),
+            Err("tag length past end of message")
+        );
+        // Exactly one byte short still overruns.
+        assert_eq!(
+            create2_tag(&create2_with_tag(4, b"abc")),
+            Err("tag length past end of message")
+        );
+    }
+
+    #[test]
+    fn create2_tag_refuses_a_non_utf8_tag() {
+        assert_eq!(
+            create2_tag(&create2_with_tag(2, &[0xff, 0xfe])),
+            Err("tag is not valid UTF-8")
+        );
+    }
 
     #[test]
     fn oversize_list_field_names_the_offender() {
