@@ -38,6 +38,7 @@ mod stub {
     pub enum PixelData {
         Bgra(Arc<Vec<u8>>),
         Rgba(Arc<Vec<u8>>),
+        GpuOnly,
         Nv12 {
             data: Arc<Vec<u8>>,
             y_stride: usize,
@@ -108,7 +109,8 @@ mod stub {
                 PixelData::DmaBuf { .. }
                 | PixelData::VaSurface { .. }
                 | PixelData::Nv12DmaBuf { .. }
-                | PixelData::Nv12OpaqueFd { .. } => false,
+                | PixelData::Nv12OpaqueFd { .. }
+                | PixelData::GpuOnly => false,
             }
         }
 

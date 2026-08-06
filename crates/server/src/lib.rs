@@ -5142,6 +5142,20 @@ async fn tick(state: &AppState) -> TickOutcome {
                 let pixels: blit_compositor::PixelData = {
                     let cs = sess.compositor.as_ref().unwrap();
                     match cs.last_pixels.get(&(sid, px_w, px_h)) {
+                        // A GPU-only commit carries no pixels — the
+                        // compositor skipped the readback because a Vulkan
+                        // Video encoder owned the surface and nothing had
+                        // registered a target for CPU pixels. This client
+                        // wants a server-side encoder, so its registration
+                        // is what makes the compositor resume publishing
+                        // BGRA; skip until that lands rather than encode an
+                        // empty frame.
+                        Some(lp) if matches!(lp.pixels, blit_compositor::PixelData::GpuOnly) => {
+                            let client = sess.clients.get_mut(&work.cid).unwrap();
+                            client.skip_last_pixels_mismatch_count =
+                                client.skip_last_pixels_mismatch_count.saturating_add(1);
+                            continue;
+                        }
                         Some(lp) => lp.pixels.clone(),
                         None => {
                             let client = sess.clients.get_mut(&work.cid).unwrap();
