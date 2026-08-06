@@ -10,7 +10,7 @@ use crate::pointer_focus::{
     ButtonRouting, button_routing, focus_transition, keyboard_focus_after_popup_close,
 };
 use crate::positioner::PositionerGeometry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1231,6 +1231,15 @@ struct Compositor {
     /// is already showing.  A content request (`false`) wins over an
     /// encoder-only one for the same toplevel.
     pending_recomposite_toplevels: HashMap<u16, bool>,
+    /// Surfaces whose `wl_buffer` is still held because the commit that
+    /// applied it deferred compositing rather than running it.
+    ///
+    /// A DMA-BUF is imported rather than copied, so the hold is the only
+    /// thing keeping the client off pixels the compositor has yet to read.
+    /// Keyed by the toplevel whose queued recomposite will read them, so the
+    /// drain releases exactly the buffers that composite consumed — releasing
+    /// another toplevel's would just move the race.
+    deferred_buffer_holds: HashMap<u16, HashSet<ObjectId>>,
     focused_surface_id: u16,
     /// The wl_surface ObjectId the pointer is currently over (None = none).
     pointer_entered_id: Option<ObjectId>,
@@ -1780,16 +1789,26 @@ impl Compositor {
         // downscale-target handlers already do for this same hazard.  The
         // event loop retires the in-flight submit on its 1 ms poll and
         // drains this queue once the GPU is idle.
-        if self
+        let deferred = self
             .vulkan_renderer
             .as_ref()
-            .is_some_and(|vk| vk.would_defer_submit())
-        {
+            .is_some_and(|vk| vk.would_defer_submit());
+        if deferred {
             // Always `false`, overwriting any queued encoder-only entry:
             // that variant skips publishing pixels on purpose, which is
             // the one thing this commit exists to do.
             self.pending_recomposite_toplevels
                 .insert(toplevel_sid, false);
+            // The composite that will read this surface has not run, so the
+            // buffer stays held — see the release below.  Recorded against
+            // the toplevel whose recomposite consumes it so the drain
+            // releases exactly what it read.
+            if self.held_buffers.contains_key(surface_id) {
+                self.deferred_buffer_holds
+                    .entry(toplevel_sid)
+                    .or_default()
+                    .insert(surface_id.clone());
+            }
             // Log sparsely: this fires whenever a commit lands in the fence
             // window, which on a busy surface is often.  Every one of these
             // used to be a discarded tree.
@@ -1809,7 +1828,19 @@ impl Compositor {
         // fd reference to the DMA-BUF via the persistent texture cache.
         // Release the held buffer so the client can reuse it for the
         // next frame.
-        if let Some(held) = self.held_buffers.remove(surface_id) {
+        //
+        // Only once something has actually read it, though.  A DMA-BUF is
+        // imported, not copied, so `held_buffers` is what stops the client
+        // drawing over pixels the compositor still needs (see
+        // `apply_pending_state`).  On the non-deferred path the submit above
+        // has already queued the read and implicit DMA-BUF fencing makes the
+        // client's next write wait on it — releasing here is safe because
+        // the GPU is the one holding the line.  A deferred commit has queued
+        // no GPU work at all, so there is no fence to wait on: release here
+        // and the client is free to redraw into the buffer the recomposite
+        // is about to read, which lands a torn or wrong-frame composite.  So
+        // keep holding, and let the drain release it once it has read.
+        if !deferred && let Some(held) = self.held_buffers.remove(surface_id) {
             held.release();
         }
 
@@ -6206,6 +6237,7 @@ fn run_compositor(
         pending_encoded: Vec::new(),
         pending_native_sizes: HashMap::new(),
         pending_recomposite_toplevels: HashMap::new(),
+        deferred_buffer_holds: HashMap::new(),
         focused_surface_id: 0,
         pointer_entered_id: None,
         pointer_entered_local: (0.0, 0.0),
@@ -6374,6 +6406,24 @@ fn run_compositor(
                 // would idle on its 1s dispatch timeout instead of
                 // the 1ms has_pending poll.
                 loop_signal.wakeup();
+            }
+            // Release whatever a deferred commit was still holding for this
+            // toplevel.  The composite above has read it, so the client is
+            // free to draw over it again — the same point on the timeline
+            // `handle_surface_commit` releases at when it composites inline.
+            //
+            // Unconditional, including when the toplevel resolved to nothing:
+            // then no composite will ever read these, and holding them would
+            // strand the client's buffers for the life of the surface.  A
+            // newer commit may have superseded an entry in the meantime, in
+            // which case `apply_pending_state` already released the old
+            // buffer and this releases the new one it just composited.
+            if let Some(surface_ids) = compositor.deferred_buffer_holds.remove(&sid) {
+                for surface_id in surface_ids {
+                    if let Some(held) = compositor.held_buffers.remove(&surface_id) {
+                        held.release();
+                    }
+                }
             }
         }
 
