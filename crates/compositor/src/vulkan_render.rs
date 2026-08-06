@@ -783,8 +783,9 @@ impl VulkanRenderer {
         // -----------------------------------------------------------
         // BGRA→I420 compute pipeline — planar YUV for software encoders
         // -----------------------------------------------------------
-        // find_device ignores the DRM node for now, so report the device
-        // Vulkan actually picked rather than the one that was requested.
+        // Report the device Vulkan actually picked alongside the one that
+        // was requested — find_device falls back to a different GPU when
+        // nothing reports the node, and that is worth seeing in the log.
         let dev_props = unsafe { instance.get_physical_device_properties(physical_device) };
         let dev_name = unsafe { std::ffi::CStr::from_ptr(dev_props.device_name.as_ptr()) };
         eprintln!(
@@ -912,33 +913,105 @@ impl VulkanRenderer {
         })
     }
 
+    /// (major, minor) of the device node at `path`.
+    fn drm_node_ids(path: &str) -> Option<(i64, i64)> {
+        use std::os::linux::fs::MetadataExt;
+        let rdev = std::fs::metadata(path).ok()?.st_rdev();
+        Some((libc::major(rdev) as i64, libc::minor(rdev) as i64))
+    }
+
+    /// Whether `pd` is the GPU behind the DRM node with this major/minor.
+    ///
+    /// Matches either node: callers hand us a render node, but a device
+    /// that only exposes a primary node should still match on it.
+    fn is_drm_node(
+        instance: &ash::Instance,
+        pd: vk::PhysicalDevice,
+        major: i64,
+        minor: i64,
+    ) -> bool {
+        // The struct may only be chained when the device supports the
+        // extension, so check before querying.
+        let supported = unsafe { instance.enumerate_device_extension_properties(pd) }
+            .unwrap_or_default()
+            .iter()
+            .any(|p| {
+                (unsafe { std::ffi::CStr::from_ptr(p.extension_name.as_ptr()) })
+                    == ash::ext::physical_device_drm::NAME
+            });
+        if !supported {
+            return false;
+        }
+
+        let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
+        unsafe { instance.get_physical_device_properties2(pd, &mut props2) };
+
+        (drm.has_render == vk::TRUE && drm.render_major == major && drm.render_minor == minor)
+            || (drm.has_primary == vk::TRUE
+                && drm.primary_major == major
+                && drm.primary_minor == minor)
+    }
+
+    /// First graphics queue family, and first video-encode family if any.
+    fn queue_families(
+        instance: &ash::Instance,
+        pd: vk::PhysicalDevice,
+    ) -> Option<(u32, Option<u32>)> {
+        let props = unsafe { instance.get_physical_device_queue_family_properties(pd) };
+        let mut graphics_qf = None;
+        let mut video_encode_qf = None;
+        for (i, qf) in props.iter().enumerate() {
+            if qf.queue_flags.contains(vk::QueueFlags::GRAPHICS) && graphics_qf.is_none() {
+                graphics_qf = Some(i as u32);
+            }
+            // VIDEO_ENCODE_KHR = 0x40
+            if qf.queue_flags.contains(vk::QueueFlags::from_raw(0x40)) && video_encode_qf.is_none()
+            {
+                video_encode_qf = Some(i as u32);
+            }
+        }
+        graphics_qf.map(|g| (g, video_encode_qf))
+    }
+
+    /// Pick the physical device backing `drm_device`.
+    ///
+    /// Taking the first device with a graphics queue is a trap on hybrid
+    /// machines: the loader can enumerate a small integrated GPU ahead of
+    /// the discrete card the caller asked for, and we then composite on
+    /// the wrong GPU — exhausting its carveout and losing the zero-copy
+    /// DMA-BUF path into the encoder, silently.  Match the node, and say
+    /// so loudly when we can't.
     fn find_device(
         instance: &ash::Instance,
         devices: &[vk::PhysicalDevice],
-        _drm_device: &str,
+        drm_device: &str,
     ) -> Option<(vk::PhysicalDevice, u32, Option<u32>)> {
-        // For now, pick the first device with a graphics queue.
-        // TODO: match against the DRM render node.
-        for &pd in devices {
-            let props = unsafe { instance.get_physical_device_queue_family_properties(pd) };
-            let mut graphics_qf = None;
-            let mut video_encode_qf = None;
-            for (i, qf) in props.iter().enumerate() {
-                if qf.queue_flags.contains(vk::QueueFlags::GRAPHICS) && graphics_qf.is_none() {
-                    graphics_qf = Some(i as u32);
-                }
-                // VIDEO_ENCODE_KHR = 0x40
-                if qf.queue_flags.contains(vk::QueueFlags::from_raw(0x40))
-                    && video_encode_qf.is_none()
-                {
-                    video_encode_qf = Some(i as u32);
-                }
-            }
-            if let Some(gqf) = graphics_qf {
-                return Some((pd, gqf, video_encode_qf));
-            }
+        let want = Self::drm_node_ids(drm_device);
+        if want.is_none() {
+            eprintln!("[vulkan-render] cannot stat {drm_device}, falling back to first device");
         }
-        None
+
+        let mut fallback = None;
+        for &pd in devices {
+            let Some((gqf, vqf)) = Self::queue_families(instance, pd) else {
+                continue;
+            };
+            if let Some((major, minor)) = want
+                && Self::is_drm_node(instance, pd, major, minor)
+            {
+                return Some((pd, gqf, vqf));
+            }
+            fallback.get_or_insert((pd, gqf, vqf));
+        }
+
+        if want.is_some() {
+            eprintln!(
+                "[vulkan-render] WARNING: no Vulkan device reports DRM node {drm_device}; \
+                 falling back to another GPU — expect degraded performance"
+            );
+        }
+        fallback
     }
 
     fn spirv_from_bytes(bytes: &[u8]) -> Option<Vec<u32>> {
