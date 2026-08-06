@@ -859,14 +859,21 @@ function WorkspaceScreen(props: {
     });
   });
 
-  // Keyboard open when visualViewport shrinks >150px from its baseline.
-  const keyboardOpen = createMemo(() => {
-    if (!isMobileTouch()) return false;
+  // How much of the layout viewport something is parked over: a software
+  // keyboard, but also iPadOS's ~55px shortcut bar when a hardware keyboard is
+  // attached, and the floating keyboard.  Only a full keyboard clears 150px,
+  // and gating the viewport pin on that number left <main> at its full 100dvh
+  // for the smaller two — with the footer, and the keyboard toggle in it,
+  // sitting underneath and untappable.  The deadband keeps momentum-scroll
+  // jitter from thrashing the layout.
+  const occlusion = createMemo(() => {
+    if (!isMobileTouch()) return 0;
     const h = vpHeight();
     const full = vpBaseHeight();
-    if (h === null || full === 0) return false;
-    return full - h > 150;
+    if (h === null || full === 0) return 0;
+    return Math.max(0, full - h);
   });
+  const viewportOccluded = createMemo(() => occlusion() > 32);
 
   // Sticky virtual keyboard: track explicit user intent so the keyboard
   // isn't dismissed when tapping elsewhere on the page.
@@ -874,16 +881,34 @@ function WorkspaceScreen(props: {
   const terminalInputSelector =
     'textarea[aria-label="Terminal input"][tabindex]:not([readonly])';
 
+  // The focused pane's terminal, else the first one on screen that can take
+  // focus.  Every fallback matters: a pane holding an editor, a web view or a
+  // surface has no terminal input at all, and until something is tapped no
+  // pane carries the focused marker.  Resolving to null there left the
+  // keyboard toggle dead for good — it returns before flipping
+  // `keyboardWanted`, so every later tap took the same branch and did nothing.
+  // Reaching into another pane is safe: that pane's own focusin moves BSP
+  // focus to match, so the caret never lands out of sight.
   function focusedTerminalInput(): HTMLElement | null {
+    // A soloed-away pane and a background tab are `display:none`, which nulls
+    // offsetParent on the absolutely positioned input.  focus() there is a
+    // silent no-op, so returning one lit the icon over a keyboard that never
+    // came up.
+    const focusable = (el: HTMLElement | null | undefined) =>
+      el?.offsetParent ? el : null;
     const focusedPane = document.querySelector<HTMLElement>(
       '[data-blit-bsp-focused="true"]',
     );
-    if (focusedPane) {
-      return focusedPane.querySelector<HTMLElement>(terminalInputSelector);
-    }
-    if (document.querySelector("[data-blit-bsp-pane-id]")) return null;
-    return document.querySelector<HTMLElement>(
-      `section ${terminalInputSelector}`,
+    return (
+      focusable(
+        focusedPane?.querySelector<HTMLElement>(terminalInputSelector),
+      ) ??
+      [
+        ...document.querySelectorAll<HTMLElement>(
+          `section ${terminalInputSelector}`,
+        ),
+      ].find((el) => el.offsetParent) ??
+      null
     );
   }
 
@@ -892,8 +917,31 @@ function WorkspaceScreen(props: {
     if (!(active instanceof HTMLElement)) return false;
     if (active.matches(terminalInputSelector)) return true;
     if (!active.closest("section")) return false;
-    return active.matches("input, textarea, select, canvas[tabindex]");
+    // CodeMirror focuses a contenteditable div, not a textarea.  Without it
+    // here the sticky re-focus reads an editor as "nothing took focus" and
+    // now that the terminal lookup falls back across panes, drags the caret
+    // out of the editor the user just tapped into.
+    return active.matches(
+      'input, textarea, select, canvas[tabindex], [contenteditable="true"]',
+    );
   }
+
+  // The keyboard going away is the user putting it away — iPadOS has a
+  // dedicated dismiss key, which produces a blur we cannot tell apart from
+  // "tapped a button", so intent has to be read off the viewport instead.
+  // Latching on the first occlusion keeps the gap between the tap and the
+  // keyboard animating in from counting as a dismissal.  This is also what
+  // stops the icon lying: it tracks intent, and intent now expires when the
+  // keyboard does.
+  let keyboardSeen = false;
+  createEffect(() => {
+    if (!keyboardWanted()) {
+      keyboardSeen = false;
+      return;
+    }
+    if (viewportOccluded()) keyboardSeen = true;
+    else if (keyboardSeen) setKeyboardWanted(false);
+  });
 
   // Re-focus the terminal textarea when it blurs while the user wants
   // the keyboard open, unless an overlay is active.
@@ -904,11 +952,15 @@ function WorkspaceScreen(props: {
       if (!e.target.matches(terminalInputSelector)) return;
       if (!(e.target as Element).closest?.("section")) return;
       if (overlay()) return;
+      // Long enough to outlast the dismiss animation, so the effect above has
+      // cleared `keyboardWanted` and this bails rather than shoving the
+      // keyboard back up.  A tap that merely stole focus never lowers the
+      // keyboard, so nothing is visibly slower for the case this exists for.
       setTimeout(() => {
         if (!keyboardWanted() || overlay()) return;
         if (focusSettledElsewhere()) return;
         focusedTerminalInput()?.focus();
-      }, 50);
+      }, 300);
     };
     document.addEventListener("focusout", handler, true);
     onCleanup(() => document.removeEventListener("focusout", handler, true));
@@ -918,11 +970,12 @@ function WorkspaceScreen(props: {
   function toggleMobileKeyboard() {
     if (keyboardWanted()) {
       setKeyboardWanted(false);
+      // Blur whatever actually holds the keyboard.  Matching only the terminal
+      // selector missed a focused editor, and the fallback then blurred a
+      // terminal that wasn't the one typing — the icon dimmed and the toolbar
+      // unmounted with the keyboard still up.
       const active = document.activeElement;
-      if (
-        active instanceof HTMLElement &&
-        active.matches(terminalInputSelector)
-      ) {
+      if (active instanceof HTMLElement && active.closest("section")) {
         active.blur();
       } else {
         focusedTerminalInput()?.blur();
@@ -3271,10 +3324,10 @@ function WorkspaceScreen(props: {
           "background-color": theme().bg,
           color: theme().fg,
           "font-family": resolvedFontWithFallback(),
-          // While the virtual keyboard is open, pin to the visual viewport so
-          // content is not hidden.  When closed, let the 100dvh root size the
-          // app natively to avoid double-counting keyboard/browser-chrome space.
-          ...(isMobileTouch() && keyboardOpen() && vpHeight()
+          // While anything is parked over the viewport, pin to it so content
+          // is not hidden.  Otherwise let the 100dvh root size the app
+          // natively to avoid double-counting keyboard/browser-chrome space.
+          ...(isMobileTouch() && viewportOccluded() && vpHeight()
             ? {
                 position: "fixed",
                 "inset-inline": "0",
