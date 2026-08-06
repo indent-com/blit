@@ -571,3 +571,239 @@ describe("BlitSurfaceCanvas size mediation", () => {
     restore();
   });
 });
+
+/** evdev keycode for KeyV, the key the paste chord defers. */
+const EVDEV_V = 47;
+
+/** A canvas wired for paste: captures what reaches the Wayland selection
+ *  and which keycodes are forwarded, in order. */
+function attachPasting() {
+  const clipboard: { mime: string; data: Uint8Array }[] = [];
+  const keys: { keycode: number; pressed: boolean }[] = [];
+  const conn = {
+    sendClipboard: (mime: string, data: Uint8Array) =>
+      clipboard.push({ mime, data }),
+    sendSurfaceInput: (_id: number, keycode: number, pressed: boolean) =>
+      keys.push({ keycode, pressed }),
+    sendSurfaceText: () => {},
+    // The container is in the document here, so canvas.focus() really does
+    // fire a focus event and the canvas really does claim keyboard focus.
+    sendSurfaceFocus: () => {},
+    surfaceStore: new Proxy(
+      {
+        getSurface: () => ({ width: 800, height: 600 }),
+        getCanvas: () => null,
+        canDecodeVideo: false,
+        generation: 0,
+      } as Record<string, unknown>,
+      {
+        get: (target, prop) =>
+          prop in target ? target[prop as string] : () => () => {},
+      },
+    ),
+    sendSurfaceSubscribe: () => {},
+    sendSurfaceUnsubscribe: () => {},
+  };
+  const workspace = {
+    getConnection: () => conn,
+    subscribe: () => () => {},
+  } as unknown as BlitWorkspace;
+  const surface = new BlitSurfaceCanvas({
+    workspace,
+    connectionId: "conn-1" as never,
+    surfaceId: 7,
+  });
+  const container = document.createElement("div");
+  // In the document, so a paste reaches the document-level capture listener
+  // as well as the canvas's own — as it does in a real page.
+  document.body.appendChild(container);
+  surface.attach(container);
+  const canvas = surface.canvasElement;
+  if (!canvas) throw new Error("Expected surface canvas");
+  // Only a live view takes input.
+  surface.setDisplaySize(800, 600, 120);
+
+  const pressCtrlV = () =>
+    canvas.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "v",
+        code: "KeyV",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+
+  /** Dispatch a paste carrying any mix of files and plain text. */
+  const firePaste = (opts: { files?: File[]; text?: string }) => {
+    const items = (opts.files ?? []).map(
+      (file) =>
+        ({
+          kind: "file",
+          type: file.type,
+          getAsFile: () => file,
+        }) as unknown as DataTransferItem,
+    );
+    const clipboardData = {
+      items: items as unknown as DataTransferItemList,
+      getData: (mime: string) =>
+        mime === "text/plain" ? (opts.text ?? "") : "",
+    } as unknown as DataTransfer;
+    const ev = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(ev, "clipboardData", { value: clipboardData });
+    canvas.dispatchEvent(ev);
+    return ev;
+  };
+
+  const dispose = () => {
+    surface.dispose();
+    container.remove();
+  };
+
+  return { surface, canvas, clipboard, keys, pressCtrlV, firePaste, dispose };
+}
+
+/** `File.arrayBuffer()` resolves on a microtask chain; drain it. */
+async function settle() {
+  for (let i = 0; i < 4; i++) await Promise.resolve();
+}
+
+describe("BlitSurfaceCanvas paste", () => {
+  beforeEach(() => {
+    // The paste chord reads the clipboard unconditionally; keep it denied so
+    // the `paste` event stays the only source, as it is in Chromium.
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      clipboard: { readText: vi.fn().mockRejectedValue(new Error("denied")) },
+    });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("offers a pasted image to the surface, then presses V", async () => {
+    const { clipboard, keys, pressCtrlV, firePaste, dispose } = attachPasting();
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]); // PNG magic
+    pressCtrlV();
+    firePaste({
+      files: [new File([bytes], "clip.png", { type: "image/png" })],
+    });
+    await settle();
+
+    expect(clipboard).toHaveLength(1);
+    expect(clipboard[0].mime).toBe("image/png");
+    expect(Array.from(clipboard[0].data)).toEqual(Array.from(bytes));
+    // The selection has to be in place before the app sees the chord.
+    expect(keys).toEqual([{ keycode: EVDEV_V, pressed: true }]);
+    dispose();
+  });
+
+  it("prefers text when the clipboard carries both", async () => {
+    const { clipboard, pressCtrlV, firePaste, dispose } = attachPasting();
+    pressCtrlV();
+    // What a spreadsheet range puts on the clipboard: the cells as text, and
+    // a picture of the same cells.  Pasting is expected to produce the text.
+    firePaste({
+      text: "a\tb",
+      files: [
+        new File([new Uint8Array([1])], "cells.png", { type: "image/png" }),
+      ],
+    });
+    await settle();
+
+    expect(clipboard).toHaveLength(1);
+    expect(clipboard[0].mime).toBe("text/plain;charset=utf-8");
+    expect(new TextDecoder().decode(clipboard[0].data)).toBe("a\tb");
+    dispose();
+  });
+
+  it("prefers PNG over the other image types on offer", async () => {
+    const { clipboard, pressCtrlV, firePaste, dispose } = attachPasting();
+    pressCtrlV();
+    firePaste({
+      files: [
+        new File([new Uint8Array([1])], "clip.jpg", { type: "image/jpeg" }),
+        new File([new Uint8Array([2])], "clip.png", { type: "image/png" }),
+      ],
+    });
+    await settle();
+
+    expect(clipboard).toHaveLength(1);
+    expect(clipboard[0].mime).toBe("image/png");
+    dispose();
+  });
+
+  it("drops an image too large for one protocol frame", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { clipboard, keys, pressCtrlV, firePaste, dispose } = attachPasting();
+    pressCtrlV();
+    firePaste({
+      files: [
+        new File([new Uint8Array(9 * 1024 * 1024)], "huge.png", {
+          type: "image/png",
+        }),
+      ],
+    });
+    await settle();
+
+    // Nothing on the wire — an over-length CLIPBOARD_SET is refused by the
+    // server, not truncated — and no V either.  Pressing it would paste
+    // whatever the selection held before, which is not what was copied.
+    expect(clipboard).toHaveLength(0);
+    expect(keys).toEqual([]);
+    expect(warn).toHaveBeenCalled();
+    dispose();
+  });
+
+  it("gives up rather than press V when the image cannot be read", async () => {
+    const { clipboard, keys, pressCtrlV, firePaste, dispose } = attachPasting();
+    const file = new File([new Uint8Array([1])], "clip.png", {
+      type: "image/png",
+    });
+    // A blob the browser can name but not hand over.
+    Object.defineProperty(file, "arrayBuffer", {
+      value: () => Promise.reject(new Error("unreadable")),
+    });
+    pressCtrlV();
+    firePaste({ files: [file] });
+    await settle();
+
+    expect(clipboard).toHaveLength(0);
+    expect(keys).toEqual([]);
+    dispose();
+  });
+
+  it("forwards one paste once, however many listeners see it", async () => {
+    const { clipboard, pressCtrlV, firePaste, dispose } = attachPasting();
+    pressCtrlV();
+    // The canvas listener and the document-level capture listener are both on
+    // this event's path.  Forwarding from each would put the image on the
+    // wire twice — cheap for text, megabytes for a screenshot.
+    firePaste({
+      files: [
+        new File([new Uint8Array(1024)], "clip.png", { type: "image/png" }),
+      ],
+    });
+    await settle();
+
+    expect(clipboard).toHaveLength(1);
+    dispose();
+  });
+
+  it("sends a bare paste with no chord in flight straight through", async () => {
+    const { clipboard, keys, firePaste, dispose } = attachPasting();
+    // A context-menu paste: no Ctrl+V, so no key to defer.
+    firePaste({
+      files: [
+        new File([new Uint8Array([7])], "clip.png", { type: "image/png" }),
+      ],
+    });
+    await settle();
+
+    expect(clipboard).toHaveLength(1);
+    expect(clipboard[0].mime).toBe("image/png");
+    expect(keys).toEqual([]);
+    dispose();
+  });
+});

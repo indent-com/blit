@@ -299,6 +299,32 @@ Each `(client, surface)` pair runs at most one server-side encoder, sized from t
 
 `C2S_AUDIO_SUBSCRIBE` carries a `bitrate_kbps` field (little-endian u16): the desired Opus bitrate in kbps, e.g. 64 for 64 kbps. `0` means server default. Clients may re-send `AUDIO_SUBSCRIBE` to adjust bitrate without unsubscribing first. When multiple clients are subscribed, the server uses the highest requested bitrate.
 
+### Clipboard
+
+`data` in `C2S_CLIPBOARD_SET` is opaque bytes and `mime` says what they are —
+`image/png` for a pasted screenshot as readily as `text/plain;charset=utf-8`
+for text. The compositor stores the pair as the external selection and
+advertises exactly that type on the `wl_data_offer` it hands to Wayland
+clients, so what an app can paste is what the browser actually had.
+
+Text alone picks up the conventional aliases: a selection whose type begins
+`text/plain` is additionally offered as `text/plain`,
+`text/plain;charset=utf-8` and `UTF8_STRING`, and answers a `receive` for any
+of them. No other type aliases, in either direction — an app that asks an
+image selection for `text/plain` gets an empty pipe, because bytes delivered
+under a type they are not are indistinguishable, to the client, from bytes
+that are.
+
+One `CLIPBOARD_SET` replaces the whole selection; there is no way to offer a
+second representation of the same copy. A browser holding both a text and an
+image form of one clipboard therefore has to choose, and `@blit-sh/core`
+sends the text — the picture of a spreadsheet range is rarely what pasting it
+is meant to produce. The payload is bounded by the 16 MiB frame ceiling like
+any other message, and is not fragmented; the reference client refuses to send
+an image above 8 MiB rather than have the frame refused, and cancels the paste
+outright instead of letting the keystroke land on a selection it did not
+update.
+
 ### Scroll
 
 `C2S_SURFACE_POINTER_AXIS2` (`0x32`) carries everything `wl_pointer` needs to describe a scroll, because the pieces are not interchangeable:
