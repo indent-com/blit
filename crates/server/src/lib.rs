@@ -5047,6 +5047,22 @@ async fn tick(state: &AppState) -> TickOutcome {
                         });
                     let client = sess.clients.get_mut(&work.cid).unwrap();
                     if let Some((ew, eh, data, is_keyframe, codec_flag, frame_gen, ts)) = encoded {
+                        // `last_encoded` holds only the newest frame per
+                        // (surface, client), so the session's opening IDR
+                        // survives there for one frame period — 16.6ms at
+                        // 60fps.  A tick that arrives after it has been
+                        // overwritten used to forward the P frame sitting
+                        // there to a subscriber that had never received a
+                        // keyframe, and never asked for another: the client
+                        // then had no SPS/PPS and no recovery point, so the
+                        // whole stream was undecodable until something else
+                        // happened to force an IDR.  Ask for one and wait.
+                        if owes_keyframe && !is_keyframe {
+                            pending_vulkan_keyframe_requests.push((sid as u32, work.cid));
+                            client.skip_vulkan_await_count =
+                                client.skip_vulkan_await_count.saturating_add(1);
+                            continue;
+                        }
                         if !owes_keyframe
                             && client
                                 .surface_subs
@@ -5232,6 +5248,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         .get(&sid)
                         .map_or(0, |s| s.vulkan_refused);
 
+                    let mut vulkan_selected = false;
                     for &pref in &state.config.surface_encoders {
                         if !pref.is_vulkan_video() {
                             continue;
@@ -5334,7 +5351,22 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 work.cid,
                             );
                         }
+                        vulkan_selected = true;
                         break;
+                    }
+
+                    // The compositor owns this subscription's encoder now.
+                    // Falling through would queue a server-side one for the
+                    // same (client, surface): a second encoder that never
+                    // encodes a frame, because the delivery path takes the
+                    // Vulkan bitstream and skips on `skip_vulkan_await`
+                    // until it arrives.  It is not a fallback either — a
+                    // refusal comes back asynchronously as
+                    // `VulkanEncoderUnavailable`, which latches
+                    // `vulkan_refused` so a later tick retries the tier
+                    // below with this encoder skipped.
+                    if vulkan_selected {
+                        continue;
                     }
 
                     // Defer encoder creation to spawn_blocking so the
