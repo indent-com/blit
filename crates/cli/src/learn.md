@@ -319,6 +319,8 @@ blit surface capture 1                              # screenshot → surface-1.p
 blit surface capture 1 --output s.png --scale 240   # 2x render (scale in 120ths: 120=1x, 240=2x)
 blit surface click 1 100 50                         # left-click at (100, 50)
 blit surface click 1 100 50 --button right          # right-click
+blit surface click 1 100 50 --button middle         # middle-click (pastes the primary selection)
+blit surface click 1 100 50 --button back           # thumb buttons: back, forward
 blit surface key 1 Return                           # key press
 blit surface key 1 ctrl+shift+c                     # modifier combo
 blit surface type 1 "hello{Return}"                 # type text ({braces} for special keys)

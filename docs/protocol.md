@@ -325,6 +325,28 @@ an image above 8 MiB rather than have the frame refused, and cancels the paste
 outright instead of letting the keystroke land on a selection it did not
 update.
 
+### Primary selection
+
+Middle-click paste reads PRIMARY, a selection the web platform does not
+expose, so the browser can neither fill it nor read it and the clipboard's
+round trip through `CLIPBOARD_SET` has no counterpart here. PRIMARY is
+therefore purely between Wayland clients: when one sets a
+`zwp_primary_selection_source_v1`, the compositor offers it to every bound
+device, and a `receive` is spliced straight to the owning client — the
+compositor never buffers the bytes and never sees them. Selecting text in one
+app and middle-clicking in another works; middle-clicking to paste what the
+browser has does not, and pasting from the browser stays on Ctrl+V.
+
+### Pointer buttons
+
+The `button` byte in `C2S_SURFACE_POINTER` is DOM `MouseEvent.button`
+numbering — 0 left, 1 middle, 2 right, 3 back, 4 forward — and the server
+translates to evdev. Back and forward become `BTN_SIDE` and `BTN_EXTRA`, the
+codes a physical mouse's thumb buttons actually emit and the ones toolkits
+bind to history navigation; `BTN_BACK` and `BTN_FORWARD` exist but are
+vestigial and largely unhandled. Unknown button numbers fall back to
+`BTN_LEFT`.
+
 ### Scroll
 
 `C2S_SURFACE_POINTER_AXIS2` (`0x32`) carries everything `wl_pointer` needs to describe a scroll, because the pieces are not interchangeable:

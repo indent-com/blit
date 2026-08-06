@@ -218,6 +218,7 @@ pub const DEADLINE_STOP_GRACE_MS: u32 = 5_000;
 pub const C2S_SURFACE_INPUT: u8 = 0x20;
 /// Pointer motion/button for a Wayland surface: [0x21][surface_id:2][type:1][button:1][x:2][y:2]
 /// type: 0=down, 1=up, 2=move
+/// button: DOM numbering — 0=left, 1=middle, 2=right, 3=back, 4=forward
 /// x,y: pixel coordinates relative to the surface origin
 pub const C2S_SURFACE_POINTER: u8 = 0x21;
 /// Pointer axis/scroll for a Wayland surface: [0x22][surface_id:2][axis:1][value_x100:4_signed]

@@ -1259,9 +1259,11 @@ pub async fn cmd_click(
         "left" => 0,
         "middle" => 1,
         "right" => 2,
+        "back" => 3,
+        "forward" => 4,
         other => {
             return Err(format!(
-                "unknown button '{other}': expected left, right, or middle"
+                "unknown button '{other}': expected left, right, middle, back, or forward"
             ));
         }
     };

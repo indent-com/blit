@@ -665,6 +665,28 @@ enum ResizeAction {
     Dispatch,
 }
 
+/// A DOM `MouseEvent.button` as the evdev code a Wayland client expects.
+///
+/// The thumb buttons are the ones worth explaining. Linux mice report them
+/// as `BTN_SIDE` and `BTN_EXTRA`, and that is what every toolkit binds to
+/// history navigation — GTK surfaces them as buttons 8 and 9, Chromium reads
+/// them as back and forward. `BTN_BACK` and `BTN_FORWARD` exist and read
+/// like the obvious choice, but almost no hardware emits them and almost
+/// nothing listens for them, so sending those would be a press that lands
+/// nowhere.
+///
+/// An unknown number becomes a left click, which is what this did before
+/// back and forward had codes of their own.
+fn evdev_button(dom_button: u8) -> u32 {
+    match dom_button {
+        1 => 0x112, // BTN_MIDDLE
+        2 => 0x111, // BTN_RIGHT
+        3 => 0x113, // BTN_SIDE, "back"
+        4 => 0x114, // BTN_EXTRA, "forward"
+        _ => 0x110, // BTN_LEFT
+    }
+}
+
 fn resize_action(
     last_configured: Option<(u16, u16, u16)>,
     last_resize_at: Option<Instant>,
@@ -10719,11 +10741,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             });
                             let _ = cs.handle.command_tx.send(CompositorCommand::PointerButton {
                                 surface_id,
-                                button: match button {
-                                    1 => 0x112,
-                                    2 => 0x111,
-                                    _ => 0x110,
-                                },
+                                button: evdev_button(button),
                                 pressed: ptype == 0,
                             });
                         }
@@ -11676,6 +11694,35 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+
+    /// Nothing between the browser and the app inspects the button code —
+    /// the compositor forwards the `u32` to `wl_pointer` verbatim — so this
+    /// table is the only place a wrong number can be caught. A mistake here
+    /// is silent: the press still arrives, as the wrong button.
+    mod evdev_buttons {
+        use super::super::evdev_button;
+
+        #[test]
+        fn the_three_common_buttons_keep_their_codes() {
+            assert_eq!(evdev_button(0), 0x110);
+            assert_eq!(evdev_button(1), 0x112);
+            assert_eq!(evdev_button(2), 0x111);
+        }
+
+        #[test]
+        fn back_and_forward_are_the_codes_a_real_mouse_sends() {
+            // Not BTN_BACK/BTN_FORWARD (0x116/0x115): toolkits bind the
+            // thumb buttons through BTN_SIDE/BTN_EXTRA.
+            assert_eq!(evdev_button(3), 0x113);
+            assert_eq!(evdev_button(4), 0x114);
+        }
+
+        #[test]
+        fn an_unknown_button_falls_back_to_left() {
+            assert_eq!(evdev_button(5), 0x110);
+            assert_eq!(evdev_button(255), 0x110);
+        }
+    }
 
     /// The NV12 OPAQUE_FD buffer is GPU-only memory published under a
     /// single (surface, w, h) key, so it is only safe when *every*
