@@ -686,6 +686,7 @@ pub enum CompositorCommand {
         qp: u8,
         width: u32,
         height: u32,
+        is_444: bool,
     },
     /// Retarget one client's encoder quantizer without rebuilding it.
     SetVulkanEncoderQp {
@@ -2024,6 +2025,7 @@ impl Compositor {
         let s120 = self.output_scale_120;
         let native = self.native_composite_size(toplevel_sid);
         let target_phys = native.map(|(pw, ph, _, _)| (pw, ph));
+        let mut encode_giveups: Vec<(u32, u64)> = Vec::new();
         let composited = if let Some(ref mut vk) = self.vulkan_renderer {
             let composited = vk.render_tree_sized(
                 root_id,
@@ -2034,10 +2036,29 @@ impl Compositor {
                 toplevel_sid,
             );
             self.pending_encoded.extend(vk.take_encoded_frames());
+            encode_giveups = vk.take_encode_giveups();
             composited
         } else {
             Vec::new()
         };
+
+        // A session that has stopped producing bitstreams reports the same
+        // way a session that was never created does, so the server takes the
+        // path it already has: latch the refusal and build a server-side
+        // encoder.  Without this the server cannot tell a dead encoder from
+        // one that is still warming up, and waits on it forever.
+        for (sid, cid) in encode_giveups {
+            if let Some(vk) = self.vulkan_renderer.as_mut() {
+                vk.destroy_vulkan_encoder(sid, Some(cid));
+            }
+            let _ = self
+                .event_tx
+                .send(CompositorEvent::VulkanEncoderUnavailable {
+                    surface_id: sid as u16,
+                    client_id: cid,
+                });
+            (self.event_notify)();
+        }
 
         // Record the compositor's native size once for this surface
         // (used to drive SurfaceResized).  All per-target results carry
@@ -3418,9 +3439,12 @@ impl Compositor {
                 qp,
                 width,
                 height,
+                is_444,
             } => {
                 let created = self.vulkan_renderer.as_mut().is_some_and(|vk| {
-                    vk.create_vulkan_encoder(surface_id, client_id, codec, qp, width, height)
+                    vk.create_vulkan_encoder(
+                        surface_id, client_id, codec, qp, width, height, is_444,
+                    )
                 });
                 if !created {
                     let _ = self

@@ -52,6 +52,11 @@ pub(crate) struct VideoFns {
     pub bind_video_session_memory: vk::PFN_vkBindVideoSessionMemoryKHR,
     pub create_video_session_parameters: vk::PFN_vkCreateVideoSessionParametersKHR,
     pub destroy_video_session_parameters: vk::PFN_vkDestroyVideoSessionParametersKHR,
+    /// Retrieves the encoded SPS/PPS (or AV1 sequence header) bytes.  Vulkan
+    /// Video does not put them in the output bitstream itself, so without
+    /// this the stream is nothing but slice NALs and no decoder will touch
+    /// it.
+    pub get_encoded_video_session_parameters: vk::PFN_vkGetEncodedVideoSessionParametersKHR,
     pub cmd_begin_video_coding: vk::PFN_vkCmdBeginVideoCodingKHR,
     pub cmd_end_video_coding: vk::PFN_vkCmdEndVideoCodingKHR,
     pub cmd_control_video_coding: vk::PFN_vkCmdControlVideoCodingKHR,
@@ -111,12 +116,64 @@ impl VideoFns {
             bind_video_session_memory: load_device!("vkBindVideoSessionMemoryKHR"),
             create_video_session_parameters: load_device!("vkCreateVideoSessionParametersKHR"),
             destroy_video_session_parameters: load_device!("vkDestroyVideoSessionParametersKHR"),
+            get_encoded_video_session_parameters: load_device!(
+                "vkGetEncodedVideoSessionParametersKHR"
+            ),
             cmd_begin_video_coding: load_device!("vkCmdBeginVideoCodingKHR"),
             cmd_end_video_coding: load_device!("vkCmdEndVideoCodingKHR"),
             cmd_control_video_coding: load_device!("vkCmdControlVideoCodingKHR"),
             cmd_encode_video: load_device!("vkCmdEncodeVideoKHR"),
         })
     }
+}
+
+/// Fetch the driver-encoded parameter-set bytes for a session.
+///
+/// Two-call idiom: once with a null buffer to learn the size, once to fill
+/// it.  `codec_get` is the codec-specific selector (which of SPS/PPS, or the
+/// AV1 sequence header, to write) and is chained into the get-info struct.
+unsafe fn get_encoded_session_parameters<T: vk::ExtendsVideoEncodeSessionParametersGetInfoKHR>(
+    device: &ash::Device,
+    video_fns: &VideoFns,
+    session_params: vk::VideoSessionParametersKHR,
+    codec_get: &mut T,
+) -> Option<Vec<u8>> {
+    let mut feedback = vk::VideoEncodeSessionParametersFeedbackInfoKHR::default();
+    let get_info = vk::VideoEncodeSessionParametersGetInfoKHR::default()
+        .video_session_parameters(session_params)
+        .push_next(codec_get);
+
+    let mut size: usize = 0;
+    let res = unsafe {
+        (video_fns.get_encoded_video_session_parameters)(
+            device.handle(),
+            &get_info,
+            &mut feedback,
+            &mut size,
+            ptr::null_mut(),
+        )
+    };
+    if res != vk::Result::SUCCESS || size == 0 {
+        eprintln!("[vulkan-encode] parameter-set size query failed: {res:?} size={size}");
+        return None;
+    }
+
+    let mut buf = vec![0u8; size];
+    let res = unsafe {
+        (video_fns.get_encoded_video_session_parameters)(
+            device.handle(),
+            &get_info,
+            &mut feedback,
+            &mut size,
+            buf.as_mut_ptr().cast(),
+        )
+    };
+    if res != vk::Result::SUCCESS {
+        eprintln!("[vulkan-encode] parameter-set fetch failed: {res:?}");
+        return None;
+    }
+    buf.truncate(size);
+    Some(buf)
 }
 
 // ===================================================================
@@ -158,6 +215,9 @@ pub(crate) struct VulkanVideoEncoder {
     idr_num: u32,
     force_idr: bool,
     qp: u8,
+    /// Encoded SPS/PPS, prepended to every IDR so the stream carries its own
+    /// parameter sets.  Vulkan Video does not emit them with the slice data.
+    params_bytes: Vec<u8>,
     /// Set when a fence wait timed out. The submission owning that fence is
     /// still running somewhere on the GPU and may still write to
     /// `bitstream_buffer`, so this encoder can never be used again — see
@@ -183,7 +243,7 @@ const H264_MAX_QP: u8 = 51;
 /// timeout is 5s — so reaching it means the device is not coming back.
 /// `BLIT_ENCODE_FENCE_TIMEOUT_MS` overrides it; `0` restores the old
 /// wait-forever behaviour for anyone debugging a driver.
-fn encode_fence_timeout_ns() -> u64 {
+pub(crate) fn encode_fence_timeout_ns() -> u64 {
     static V: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
         let ms = std::env::var("BLIT_ENCODE_FENCE_TIMEOUT_MS")
             .ok()
@@ -213,16 +273,37 @@ impl VulkanVideoEncoder {
         width: u32,
         height: u32,
         qp: u8,
+        is_444: bool,
     ) -> Option<Self> {
         // ---------------------------------------------------------------
         // 1. Video profile
         // ---------------------------------------------------------------
-        let mut h264_profile = vk::VideoEncodeH264ProfileInfoKHR::default()
-            .std_profile_idc(StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH);
+        // 4:4:4 is High 4:4:4 Predictive, a distinct profile — not High with
+        // a chroma flag flipped — and the picture format changes with it.
+        // Whether a device supports it is a runtime question: the RTX 4090
+        // does, the Raphael iGPU answers
+        // ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR to the caps query
+        // below, which returns None and lets the caller fall back.
+        let mut h264_profile =
+            vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(if is_444 {
+                StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE
+            } else {
+                StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
+            });
+
+        let picture_format = if is_444 {
+            vk::Format::G8_B8R8_2PLANE_444_UNORM
+        } else {
+            vk::Format::G8_B8R8_2PLANE_420_UNORM
+        };
 
         let profile = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
-            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+            .chroma_subsampling(if is_444 {
+                vk::VideoChromaSubsamplingFlagsKHR::TYPE_444
+            } else {
+                vk::VideoChromaSubsamplingFlagsKHR::TYPE_420
+            })
             .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
             .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
             .push_next(&mut h264_profile);
@@ -240,7 +321,14 @@ impl VulkanVideoEncoder {
             (video_fns.get_physical_device_video_capabilities)(physical_device, &profile, &mut caps)
         };
         if res != vk::Result::SUCCESS {
-            eprintln!("[vulkan-encode] vkGetPhysicalDeviceVideoCapabilitiesKHR failed: {res:?}",);
+            eprintln!(
+                "[vulkan-encode] vkGetPhysicalDeviceVideoCapabilitiesKHR failed for {} : {res:?}",
+                if is_444 {
+                    "H.264 4:4:4 High444Predictive"
+                } else {
+                    "H.264 4:2:0 High"
+                },
+            );
             return None;
         }
 
@@ -277,9 +365,9 @@ impl VulkanVideoEncoder {
         let session_create = vk::VideoSessionCreateInfoKHR::default()
             .queue_family_index(video_queue_family)
             .video_profile(&profile)
-            .picture_format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+            .picture_format(picture_format)
             .max_coded_extent(coded_extent)
-            .reference_picture_format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+            .reference_picture_format(picture_format)
             .max_dpb_slots(2)
             .max_active_reference_pictures(1)
             .std_header_version(&std_header_version)
@@ -320,22 +408,40 @@ impl VulkanVideoEncoder {
             sps_flags.set_frame_cropping_flag(1);
         }
 
+        // Crop offsets are expressed in CropUnitX/CropUnitY, which depend on
+        // the chroma format: 2x2 for 4:2:0, but 1x1 for 4:4:4 (and for
+        // monochrome).  Dividing by a hardcoded 2 would crop half as many
+        // columns and rows as intended on a 4:4:4 stream whose dimensions are
+        // not a multiple of 16, leaving a strip of padding visible.
+        let crop_unit = if is_444 { 1 } else { 2 };
         let crop_right = if width_in_mbs * 16 > width {
-            (width_in_mbs * 16 - width) / 2
+            (width_in_mbs * 16 - width) / crop_unit
         } else {
             0
         };
         let crop_bottom = if height_in_mbs * 16 > height {
-            (height_in_mbs * 16 - height) / 2
+            (height_in_mbs * 16 - height) / crop_unit
         } else {
             0
         };
 
         let mut sps: StdVideoH264SequenceParameterSet = unsafe { std::mem::zeroed() };
         sps.flags = sps_flags;
-        sps.profile_idc = StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH;
+        sps.profile_idc = if is_444 {
+            StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE
+        } else {
+            StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
+        };
         sps.level_idc = level_idc;
-        sps.chroma_format_idc = StdVideoH264ChromaFormatIdc_STD_VIDEO_H264_CHROMA_FORMAT_IDC_420;
+        // separate_colour_plane_flag stays 0 (the struct is zeroed), so
+        // ChromaArrayType == chroma_format_idc and the two chroma components
+        // stay interleaved in one plane — which is what the two-plane
+        // G8_B8R8_2PLANE_444_UNORM source provides.
+        sps.chroma_format_idc = if is_444 {
+            StdVideoH264ChromaFormatIdc_STD_VIDEO_H264_CHROMA_FORMAT_IDC_444
+        } else {
+            StdVideoH264ChromaFormatIdc_STD_VIDEO_H264_CHROMA_FORMAT_IDC_420
+        };
         sps.seq_parameter_set_id = 0;
         sps.bit_depth_luma_minus8 = 0;
         sps.bit_depth_chroma_minus8 = 0;
@@ -398,6 +504,50 @@ impl VulkanVideoEncoder {
             return None;
         }
 
+        // Retrieve the encoded SPS/PPS.  Vulkan Video never writes parameter
+        // sets into the output bitstream — `cmd_encode_video` emits slice
+        // NALs only — so without this the stream starts at a coded slice and
+        // every decoder rejects it (`ffprobe`: "Invalid data found").  They
+        // are fetched once here and prepended to each IDR below, which also
+        // lets a viewer that joins mid-stream start decoding at a keyframe.
+        let mut h264_get = vk::VideoEncodeH264SessionParametersGetInfoKHR::default()
+            .write_std_sps(true)
+            .write_std_pps(true);
+        let params_bytes = unsafe {
+            get_encoded_session_parameters(device, video_fns, session_params, &mut h264_get)
+        };
+        let Some(params_bytes) = params_bytes else {
+            // Known to happen for 4:4:4 on the NVIDIA proprietary driver
+            // (595.84): it advertises H.264 High 4:4:4 Predictive encode
+            // caps, accepts the SPS/PPS pair at
+            // vkCreateVideoSessionParametersKHR, serializes the SPS fine (14
+            // bytes) — and then fails the PPS with ERROR_OUT_OF_HOST_MEMORY.
+            // The same PPS serializes at 4:2:0, so this is the driver's
+            // serializer rather than our struct.  Refusing here is what makes
+            // the server fall back to a server-side 4:4:4 encoder instead of
+            // shipping a stream with no parameter sets.
+            eprintln!(
+                "[vulkan-encode] could not retrieve H.264 {} parameter sets; refusing the session",
+                if is_444 { "4:4:4" } else { "4:2:0" },
+            );
+            for &m in &session_memory {
+                unsafe { device.free_memory(m, None) };
+            }
+            unsafe {
+                (video_fns.destroy_video_session_parameters)(
+                    device.handle(),
+                    session_params,
+                    ptr::null(),
+                );
+                (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
+            }
+            return None;
+        };
+        eprintln!(
+            "[vulkan-encode] H.264 parameter sets: {} bytes",
+            params_bytes.len(),
+        );
+
         // ---------------------------------------------------------------
         // 6. DPB images (2x)
         // ---------------------------------------------------------------
@@ -411,6 +561,7 @@ impl VulkanVideoEncoder {
                 height,
                 video_queue_family,
                 &profile,
+                picture_format,
                 &session_memory,
                 session_params,
                 video_session,
@@ -481,6 +632,7 @@ impl VulkanVideoEncoder {
             idr_num: 0,
             force_idr: false,
             qp,
+            params_bytes,
             poisoned: false,
         })
     }
@@ -761,11 +913,18 @@ impl VulkanVideoEncoder {
             .base_array_layer(0)
             .image_view_binding(nv12_image_view);
 
-        // Inline query for encode feedback.
-        let mut inline_query = vk::VideoInlineQueryInfoKHR::default()
-            .query_pool(self.query_pool)
-            .first_query(0)
-            .query_count(1);
+        // Encode feedback (the encoded byte count) is collected with an
+        // ordinary begin/end query around the encode command.
+        //
+        // This used to chain `VkVideoInlineQueryInfoKHR` into the encode
+        // instead, which is only legal with `VK_KHR_video_maintenance1` —
+        // an extension this device never enables and never even probes for.
+        // Drivers that ignore the unrecognised pNext simply never wrote the
+        // query, and the `get_query_pool_results(WAIT)` below then blocked
+        // the compositor thread forever: the Wayland socket stopped being
+        // serviced and clients died with VK_ERROR_SURFACE_LOST_KHR.  An
+        // explicit query needs no extension and works on every driver.
+        unsafe { device.cmd_begin_query(cb, self.query_pool, 0, vk::QueryControlFlags::empty()) };
 
         // Build the encode info.
         //
@@ -779,8 +938,7 @@ impl VulkanVideoEncoder {
                 .dst_buffer_range(self.bitstream_capacity)
                 .src_picture_resource(src_picture_resource)
                 .setup_reference_slot(&setup_slot)
-                .push_next(&mut h264_pic_info)
-                .push_next(&mut inline_query);
+                .push_next(&mut h264_pic_info);
 
             unsafe { (video_fns.cmd_encode_video)(cb, &encode_info) };
         } else {
@@ -816,11 +974,12 @@ impl VulkanVideoEncoder {
                 .src_picture_resource(src_picture_resource)
                 .setup_reference_slot(&setup_slot)
                 .reference_slots(std::slice::from_ref(&ref_slot2))
-                .push_next(&mut h264_pic_info)
-                .push_next(&mut inline_query);
+                .push_next(&mut h264_pic_info);
 
             unsafe { (video_fns.cmd_encode_video)(cb, &encode_info) };
         }
+
+        unsafe { device.cmd_end_query(cb, self.query_pool, 0) };
 
         // End video coding.
         let end_coding = vk::VideoEndCodingInfoKHR::default();
@@ -886,9 +1045,17 @@ impl VulkanVideoEncoder {
             return None;
         }
 
-        // Copy bitstream from mapped pointer.
-        let bitstream =
-            unsafe { std::slice::from_raw_parts(self.bitstream_ptr, encoded_size).to_vec() };
+        // Copy bitstream from mapped pointer, prefixing an IDR with the
+        // parameter sets so each keyframe is a self-contained entry point.
+        let slices = unsafe { std::slice::from_raw_parts(self.bitstream_ptr, encoded_size) };
+        let bitstream = if is_idr {
+            let mut b = Vec::with_capacity(self.params_bytes.len() + encoded_size);
+            b.extend_from_slice(&self.params_bytes);
+            b.extend_from_slice(slices);
+            b
+        } else {
+            slices.to_vec()
+        };
 
         // Update state.
         if is_idr {
@@ -1160,6 +1327,8 @@ impl VulkanVideoEncoder {
                 coded_h,
                 video_queue_family,
                 &profile,
+                // AV1 here is 4:2:0 only — see `create_nv12_encode_image`.
+                vk::Format::G8_B8R8_2PLANE_420_UNORM,
                 &session_memory,
                 session_params,
                 video_session,
@@ -1247,6 +1416,11 @@ impl VulkanVideoEncoder {
             idr_num: 0,
             force_idr: false,
             qp,
+            // AV1 carries its sequence header in the temporal unit rather
+            // than as a separate parameter set, and this path is not
+            // reachable yet (see `create_nv12_encode_image`), so nothing is
+            // prepended here.
+            params_bytes: Vec::new(),
             poisoned: false,
         })
     }
@@ -1537,11 +1711,10 @@ impl VulkanVideoEncoder {
             .base_array_layer(0)
             .image_view_binding(nv12_image_view);
 
-        // Inline query for encode feedback.
-        let mut inline_query = vk::VideoInlineQueryInfoKHR::default()
-            .query_pool(self.query_pool)
-            .first_query(0)
-            .query_count(1);
+        // Explicit begin/end query rather than `VkVideoInlineQueryInfoKHR`,
+        // which needs `VK_KHR_video_maintenance1` — see the H.264 path for
+        // why relying on it hung the compositor thread.
+        unsafe { device.cmd_begin_query(cb, self.query_pool, 0, vk::QueryControlFlags::empty()) };
 
         // Build encode info.
         if is_key {
@@ -1550,8 +1723,7 @@ impl VulkanVideoEncoder {
                 .dst_buffer_offset(0)
                 .dst_buffer_range(self.bitstream_capacity)
                 .src_picture_resource(src_picture_resource)
-                .setup_reference_slot(&setup_slot)
-                .push_next(&mut inline_query);
+                .setup_reference_slot(&setup_slot);
 
             // Chain av1_pic_info via raw pNext.
             {
@@ -1606,8 +1778,7 @@ impl VulkanVideoEncoder {
                 .dst_buffer_range(self.bitstream_capacity)
                 .src_picture_resource(src_picture_resource)
                 .setup_reference_slot(&setup_slot)
-                .reference_slots(std::slice::from_ref(&ref_slot2))
-                .push_next(&mut inline_query);
+                .reference_slots(std::slice::from_ref(&ref_slot2));
 
             // Chain av1_pic_info.
             {
@@ -1623,6 +1794,8 @@ impl VulkanVideoEncoder {
 
             unsafe { (video_fns.cmd_encode_video)(cb, &encode_info) };
         }
+
+        unsafe { device.cmd_end_query(cb, self.query_pool, 0) };
 
         // End video coding.
         let end_coding = vk::VideoEndCodingInfoKHR::default();
@@ -1980,6 +2153,7 @@ unsafe fn allocate_dpb_slots(
     height: u32,
     video_queue_family: u32,
     profile: &vk::VideoProfileInfoKHR<'_>,
+    format: vk::Format,
     session_memory: &[vk::DeviceMemory],
     session_params: vk::VideoSessionParametersKHR,
     video_session: vk::VideoSessionKHR,
@@ -1995,6 +2169,7 @@ unsafe fn allocate_dpb_slots(
                 height,
                 video_queue_family,
                 profile,
+                format,
             )
         };
         let Some(dpb) = dpb else {
@@ -2204,13 +2379,15 @@ unsafe fn create_dpb_image(
     height: u32,
     queue_family: u32,
     profile: &vk::VideoProfileInfoKHR<'_>,
+    // Must match the session's `reference_picture_format`.
+    format: vk::Format,
 ) -> Option<DpbSlot> {
     let mut profile_list =
         vk::VideoProfileListInfoKHR::default().profiles(std::slice::from_ref(profile));
 
     let image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
-        .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+        .format(format)
         .extent(vk::Extent3D {
             width,
             height,
@@ -2261,7 +2438,7 @@ unsafe fn create_dpb_image(
     let view_info = vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
-        .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+        .format(format)
         .subresource_range(vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
@@ -2307,8 +2484,20 @@ unsafe fn destroy_dpb_slot(device: &ash::Device, slot: &DpbSlot) {
 /// `VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR` (0x00040000).
 const VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR: u32 = 0x0004_0000;
 
-/// `VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_SESSION_CREATE_INFO_KHR` = 1000513000.
-const VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_SESSION_CREATE_INFO_KHR: i32 = 1_000_513_000;
+// The AV1 encode structure types are NOT numbered in declaration order —
+// CAPABILITIES is the first value and SESSION_CREATE_INFO the tenth — so
+// transcribing them by position gets three of the six wrong, which is what
+// happened here: PROFILE_INFO was 004 (the real value is 005),
+// SESSION_CREATE_INFO was 000 (that is CAPABILITIES) and CAPABILITIES was 008
+// (that is QUALITY_LEVEL_PROPERTIES).  A wrong sType on the profile struct is
+// not a loud failure: the driver simply does not recognise the chained struct,
+// sees a codec operation with no AV1 profile behind it, and answers every
+// capability query with ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR — which
+// reads exactly like "this GPU cannot encode AV1".
+//
+// Values checked against vulkan_core.h 1.4.350.0.
+/// `VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_CAPABILITIES_KHR`.
+const VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_CAPABILITIES_KHR: i32 = 1_000_513_000;
 /// `VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_SESSION_PARAMETERS_CREATE_INFO_KHR`.
 const VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_SESSION_PARAMETERS_CREATE_INFO_KHR: i32 = 1_000_513_001;
 /// `VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PICTURE_INFO_KHR`.
@@ -2316,9 +2505,9 @@ const VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PICTURE_INFO_KHR: i32 = 1_000_513_002;
 /// `VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_DPB_SLOT_INFO_KHR`.
 const VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_DPB_SLOT_INFO_KHR: i32 = 1_000_513_003;
 /// `VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR`.
-const VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR: i32 = 1_000_513_004;
-/// `VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_CAPABILITIES_KHR`.
-const VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_CAPABILITIES_KHR: i32 = 1_000_513_008;
+const VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR: i32 = 1_000_513_005;
+/// `VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_SESSION_CREATE_INFO_KHR`.
+const VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_SESSION_CREATE_INFO_KHR: i32 = 1_000_513_009;
 
 // --- StdVideo AV1 types (encode-specific, not in ash 0.38) ---
 
@@ -2570,11 +2759,43 @@ struct VideoEncodeAV1SessionParametersCreateInfoKHR {
 }
 
 /// `VkVideoEncodeAV1ProfileInfoKHR`.
+///
+/// `pub(crate)` because the encode-source image in `vulkan_render.rs` has to
+/// be created against the very same profile the session uses, and ash 0.38
+/// has no definition of its own to share.
 #[repr(C)]
-struct VideoEncodeAV1ProfileInfoKHR {
-    s_type: vk::StructureType,
-    p_next: *const std::ffi::c_void,
-    std_profile: u32, // StdVideoAV1Profile
+pub(crate) struct VideoEncodeAV1ProfileInfoKHR {
+    pub s_type: vk::StructureType,
+    pub p_next: *const std::ffi::c_void,
+    pub std_profile: u32, // StdVideoAV1Profile
+}
+
+/// Build the AV1 encode profile, with its leaf struct chained in.
+///
+/// The caller owns `leaf` so it outlives the returned borrow; `pNext` is
+/// walked by hand because ash 0.38 predates `VK_KHR_video_encode_av1` and so
+/// has no `push_next` impl that accepts our stand-in struct.
+pub(crate) fn av1_encode_profile(
+    leaf: &mut VideoEncodeAV1ProfileInfoKHR,
+) -> vk::VideoProfileInfoKHR<'_> {
+    *leaf = VideoEncodeAV1ProfileInfoKHR {
+        s_type: vk::StructureType::from_raw(VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR),
+        p_next: ptr::null(),
+        std_profile: STD_VIDEO_AV1_PROFILE_MAIN,
+    };
+    let mut profile = vk::VideoProfileInfoKHR::default()
+        .video_codec_operation(vk::VideoCodecOperationFlagsKHR::from_raw(
+            VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR,
+        ))
+        // AV1 through this path is 4:2:0 only.
+        .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+        .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+        .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
+    let base = &mut profile as *mut _ as *mut vk::BaseOutStructure<'_>;
+    unsafe {
+        (*base).p_next = leaf as *mut _ as *mut vk::BaseOutStructure<'_>;
+    }
+    profile
 }
 
 /// `VkVideoEncodeAV1CapabilitiesKHR`.

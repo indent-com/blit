@@ -171,8 +171,8 @@ Set `BLIT_SURFACE_ENCODERS` to a comma-separated priority list of encoders.
 The server tries each in order and uses the first that works.
 
 ```bash
-# Default priority (hardware before software):
-# av1-nvenc,h264-nvenc,av1-vaapi,h264-vaapi,h264-software,av1-software
+# Default priority (compositor-resident, then hardware, then software):
+# h264-vulkan,av1-vulkan,av1-nvenc,h264-nvenc,av1-vaapi,h264-vaapi,h264-software,av1-software
 
 # Force software AV1 only:
 BLIT_SURFACE_ENCODERS=av1-software
@@ -181,14 +181,16 @@ BLIT_SURFACE_ENCODERS=av1-software
 BLIT_SURFACE_ENCODERS=av1-nvenc,h264-nvenc,h264-software
 ```
 
-| Value           | Codec | Backend          | Max resolution | Notes                                 |
-| --------------- | ----- | ---------------- | -------------- | ------------------------------------- |
-| `av1-nvenc`     | AV1   | NVIDIA NVENC     | 8192×4352      | RTX 40+ series; fastest AV1 encode    |
-| `h264-nvenc`    | H.264 | NVIDIA NVENC     | 3840×2160      | Requires proprietary NVIDIA driver    |
-| `av1-vaapi`     | AV1   | VA-API           | 8192×4352      | Intel/AMD GPU                         |
-| `h264-vaapi`    | H.264 | VA-API           | 3840×2160      | Intel/AMD GPU                         |
-| `h264-software` | H.264 | openh264 or x264 | 3840×2160      | Build-time choice (x264 = GPL opt-in) |
-| `av1-software`  | AV1   | rav1e (software) | 3840×2160      | CPU-bound; capped to stay interactive |
+| Value           | Codec | Backend          | Max resolution | Notes                                                                                                |
+| --------------- | ----- | ---------------- | -------------- | ---------------------------------------------------------------------------------------------------- |
+| `h264-vulkan`   | H.264 | Vulkan Video     | 3840×2160      | On the compositor's GPU, no server-side encode. Native size only; 4:4:4 where the driver supports it |
+| `av1-vulkan`    | AV1   | Vulkan Video     | 8192×4352      | In the default list, but declines until it can emit a sequence header — see `docs/server.md`         |
+| `av1-nvenc`     | AV1   | NVIDIA NVENC     | 8192×4352      | RTX 40+ series; fastest AV1 encode                                                                   |
+| `h264-nvenc`    | H.264 | NVIDIA NVENC     | 3840×2160      | Requires proprietary NVIDIA driver                                                                   |
+| `av1-vaapi`     | AV1   | VA-API           | 8192×4352      | Intel/AMD GPU                                                                                        |
+| `h264-vaapi`    | H.264 | VA-API           | 3840×2160      | Intel/AMD GPU                                                                                        |
+| `h264-software` | H.264 | openh264 or x264 | 3840×2160      | Build-time choice (x264 = GPL opt-in)                                                                |
+| `av1-software`  | AV1   | rav1e (software) | 3840×2160      | CPU-bound; capped to stay interactive                                                                |
 
 The browser automatically detects the codec from each frame and configures
 its WebCodecs decoder accordingly. Clients advertise which codecs they

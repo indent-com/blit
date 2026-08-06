@@ -27,6 +27,12 @@ use super::render::{GpuLayer, SurfaceMeta, collect_gpu_layers, to_physical};
 // VulkanRenderer
 // ===================================================================
 
+/// How many consecutive `encode` failures mean a Vulkan Video session is not
+/// coming back.  A handful of frames is enough to ride out a transient
+/// refusal while still giving up long before a viewer would call the surface
+/// broken — at 60 fps this is a fifth of a second.
+const VULKAN_ENCODE_FAILURE_LIMIT: u32 = 12;
+
 pub(crate) struct VulkanRenderer {
     /// Held only to keep libvulkan loaded, and deliberately never dropped --
     /// dropping it would `dlclose()` the library.  See the `Drop` impl.
@@ -75,6 +81,8 @@ pub(crate) struct VulkanRenderer {
 
     // BGRA→NV12 compute pipeline — image path (tiled NV12)
     compute_image_pipeline: vk::Pipeline,
+    /// BGRA→NV24 (2-plane 4:4:4).  Shares `compute_image_pipeline_layout`.
+    compute_nv24_pipeline: vk::Pipeline,
     compute_image_pipeline_layout: vk::PipelineLayout,
     compute_image_descriptor_set_layout: vk::DescriptorSetLayout,
 
@@ -116,6 +124,22 @@ pub(crate) struct VulkanRenderer {
     /// `(surface_id, target_w, target_h)` to mirror `external_outputs`.
     /// The `usize` is the round-robin index.
     nv12_outputs: HashMap<(u32, u32, u32), (Vec<Nv12Output>, usize)>,
+
+    /// Keys in `nv12_outputs` the compositor allocated itself to feed a
+    /// Vulkan Video encoder, as opposed to importing from VA-API, mapped to
+    /// the `(is_444, codec)` the image was created against.  Tracked so we
+    /// can tell "nothing is registered here" from "our own image is here",
+    /// and so a session whose profile does not match is refused rather than
+    /// handed an image the driver will reject.
+    owned_encode_nv12: HashMap<(u32, u32, u32), (bool, u8)>,
+
+    /// Consecutive `encode` failures per `(surface_id, client_id)`, reset by
+    /// the first bitstream that comes back.
+    vulkan_encode_failures: HashMap<(u32, u64), u32>,
+
+    /// Sessions that have failed [`VULKAN_ENCODE_FAILURE_LIMIT`] times in a
+    /// row, drained by the compositor so it can tell the server to fall back.
+    vulkan_encode_giveups: Vec<(u32, u64)>,
 
     /// Server-allocated BGRA downscale targets, keyed by
     /// `(surface_id, target_w, target_h)`.  Populated for per-client
@@ -177,11 +201,17 @@ struct ExternalOutput {
 
 /// NV12 output for zero-copy encode.
 struct Nv12Output {
-    fd: Arc<OwnedFd>,
+    /// The DMA-BUF this plane set was imported from, kept alive for as long
+    /// as the image is.  `None` for the compositor's own encode image, which
+    /// owns device-local memory and is never handed to another API.
+    fd: Option<Arc<OwnedFd>>,
     descriptor_set: vk::DescriptorSet,
     /// NV12 surface dimensions (encoder-padded, may be larger than source).
     width: u32,
     height: u32,
+    /// Full-resolution chroma (`G8_B8R8_2PLANE_444_UNORM`) rather than
+    /// subsampled NV12.  Decides which compute shader fills the planes.
+    is_444: bool,
     kind: Nv12OutputKind,
 }
 
@@ -307,6 +337,10 @@ static FRAG_SPV: &[u8] = include_bytes!("shaders/composite.frag.spv");
 static NV12_COMP_SPV: &[u8] = include_bytes!("shaders/bgra_to_nv12.comp.spv");
 
 static NV12_IMAGE_COMP_SPV: &[u8] = include_bytes!("shaders/bgra_to_nv12_image.comp.spv");
+/// 4:4:4 twin of the above: same two-plane shape and descriptor layout, but
+/// full-resolution chroma.  Used for `G8_B8R8_2PLANE_444_UNORM` encode
+/// sources.
+static NV24_IMAGE_COMP_SPV: &[u8] = include_bytes!("shaders/bgra_to_nv24_image.comp.spv");
 
 /// Convert a DRM fourcc to a VkFormat.  Returns None for unsupported formats.
 fn drm_fourcc_to_vk_format(fourcc: u32) -> Option<vk::Format> {
@@ -813,6 +847,33 @@ impl VulkanRenderer {
             device.destroy_shader_module(comp_image_mod, None);
         }
 
+        // Same layout, full-resolution chroma — see NV24_IMAGE_COMP_SPV.
+        let comp_nv24_code = Self::spirv_from_bytes(NV24_IMAGE_COMP_SPV)?;
+        let comp_nv24_shader_info = vk::ShaderModuleCreateInfo::default().code(&comp_nv24_code);
+        let comp_nv24_mod = unsafe {
+            device
+                .create_shader_module(&comp_nv24_shader_info, None)
+                .ok()?
+        };
+        let comp_nv24_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(comp_nv24_mod)
+            .name(c"main");
+        let compute_nv24_pipeline = unsafe {
+            device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default()
+                        .stage(comp_nv24_stage)
+                        .layout(compute_image_pipeline_layout)],
+                    None,
+                )
+                .ok()?[0]
+        };
+        unsafe {
+            device.destroy_shader_module(comp_nv24_mod, None);
+        }
+
         // -----------------------------------------------------------
         // BGRA→I420 compute pipeline — planar YUV for software encoders
         // -----------------------------------------------------------
@@ -926,6 +987,7 @@ impl VulkanRenderer {
             compute_pipeline_layout,
             compute_descriptor_set_layout,
             compute_image_pipeline,
+            compute_nv24_pipeline,
             compute_image_pipeline_layout,
             compute_image_descriptor_set_layout,
             output_images: Vec::new(),
@@ -937,6 +999,9 @@ impl VulkanRenderer {
             supported_dmabuf_modifiers,
             external_outputs: HashMap::new(),
             nv12_outputs: HashMap::new(),
+            owned_encode_nv12: HashMap::new(),
+            vulkan_encode_failures: HashMap::new(),
+            vulkan_encode_giveups: Vec::new(),
             downscale_outputs: HashMap::new(),
             target_natives: HashMap::new(),
             surface_textures: HashMap::new(),
@@ -1132,6 +1197,9 @@ impl VulkanRenderer {
         qp: u8,
         w: u32,
         h: u32,
+        // 4:4:4 rather than 4:2:0.  Device-dependent — the caps query
+        // refuses it on hardware that cannot, and the caller falls back.
+        is_444: bool,
     ) -> bool {
         if !self.has_video_encode {
             eprintln!("[vulkan-render] cannot create vulkan encoder: video encode not available");
@@ -1154,6 +1222,29 @@ impl VulkanRenderer {
             _ => "h264",
         };
 
+        // AV1 gets as far as a working session — the capability query, the
+        // session, the DPB and the encode itself all succeed on an RTX 4090
+        // now that the structure-type constants are right, and it emits frame
+        // OBUs.  What is missing is the sequence header: unlike H.264 there is
+        // no `VkVideoEncodeAV1SessionParametersGetInfoKHR` in the spec, so the
+        // driver never hands one back and the application has to serialize
+        // `sequence_header_obu()` itself from the same
+        // StdVideoAV1SequenceHeader it passed to session-parameter creation.
+        //
+        // Without it every frame belongs to a stream no decoder accepts, which
+        // is strictly worse than handing this client to a server-side encoder.
+        // Decline, and let the fallback do its job.
+        if codec == 0x02 {
+            eprintln!(
+                "[vulkan-render] av1-vulkan needs a sequence-header serializer before it can \
+                 produce a decodable stream; declining surface {surface_id}",
+            );
+            return false;
+        }
+
+        // Build the session first: its capability query is the real test of
+        // whether this device can encode the requested chroma, and it costs
+        // nothing to discover that before allocating an image for it.
         let encoder = match codec {
             0x02 if self.has_video_encode_av1 => unsafe {
                 crate::vulkan_encode::VulkanVideoEncoder::try_new_av1(
@@ -1183,9 +1274,78 @@ impl VulkanRenderer {
                     w,
                     h,
                     qp,
+                    is_444,
                 )
             },
         };
+
+        // The encoder reads its source from an image, and until now the only
+        // source of one was a VA-API-exported DMA-BUF.  Give this surface an
+        // image of our own if nothing has already registered one at this
+        // size, so the encode path does not depend on VA-API being in play.
+        //
+        // It has to match the session exactly: the image is created against a
+        // profile list, so an H.264 image cannot be read by an AV1 session,
+        // and a 4:4:4 session reads `G8_B8R8_2PLANE_444_UNORM` rather than a
+        // subsampled NV12 — both are format mismatches, not quality
+        // compromises.  The image is therefore tagged with what it was built
+        // for.
+        if encoder.is_some() {
+            let key = (surface_id, w, h);
+            let want = (is_444, codec);
+            let owned = self.owned_encode_nv12.get(&key).copied();
+            let usable = match owned {
+                // Ours and built for this session: reuse.
+                Some(have) => have == want,
+                // Someone else's (a VA-API import) already sits here; it is
+                // NV12 4:2:0 H.264-compatible and predates us.
+                None => self.nv12_outputs.contains_key(&key) && want == (false, 0x01),
+            };
+            if !usable {
+                // Replacing is only safe when no other session is reading it.
+                // A surface with two subscribers on different codecs keeps the
+                // first on Vulkan and lets the second fall back, rather than
+                // pulling the image out from under a live encoder.
+                let in_use_by_others = self
+                    .vulkan_encoders
+                    .keys()
+                    .any(|&(sid, cid)| sid == surface_id && cid != client_id);
+                if owned.is_some() && in_use_by_others {
+                    eprintln!(
+                        "[vulkan-render] surface {surface_id} already encodes with a different profile; refusing this session",
+                    );
+                    if let Some(mut enc) = encoder
+                        && let Some(ref vfns) = self.video_fns
+                    {
+                        unsafe { enc.destroy(&self.device, vfns) };
+                    }
+                    return false;
+                }
+                if owned.is_some() {
+                    self.destroy_nv12_outputs_for_target(surface_id, w, h);
+                }
+                if !self.nv12_outputs.contains_key(&key) {
+                    match self.create_nv12_encode_image(w, h, is_444, codec) {
+                        Some(nv12) => {
+                            self.nv12_outputs.insert(key, (vec![nv12], 0));
+                            self.owned_encode_nv12.insert(key, want);
+                        }
+                        None => {
+                            eprintln!(
+                                "[vulkan-render] no encode image for surface {surface_id} {w}x{h}; refusing vulkan encoder",
+                            );
+                            if let Some(mut enc) = encoder
+                                && let Some(ref vfns) = self.video_fns
+                            {
+                                unsafe { enc.destroy(&self.device, vfns) };
+                            }
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
         match encoder {
             Some(enc) => {
                 eprintln!(
@@ -1243,6 +1403,10 @@ impl VulkanRenderer {
             {
                 unsafe { enc.destroy(&self.device, vfns) };
             }
+            // A rebuilt session starts from a clean slate; carrying the old
+            // count over would retire its replacement early.
+            self.vulkan_encode_failures.remove(&key);
+            self.vulkan_encode_giveups.retain(|k| *k != key);
         }
         // Never hand a bitstream to a client whose encoder has just gone
         // away; the server would credit it against a subscription that no
@@ -1250,11 +1414,38 @@ impl VulkanRenderer {
         self.pending_encoded_frames.retain(|f| {
             !(f.surface_id as u32 == surface_id && client_id.is_none_or(|c| c == f.client_id))
         });
+        // Our own encode image exists only to feed those encoders.  Once the
+        // last one on this surface is gone it is dead weight — several MB of
+        // device-local memory per surface — so release it.  Anything VA-API
+        // imported is left alone: a server-side encoder may still be reading
+        // it.
+        if !self
+            .vulkan_encoders
+            .keys()
+            .any(|&(sid, _)| sid == surface_id)
+        {
+            let owned: Vec<(u32, u32, u32)> = self
+                .owned_encode_nv12
+                .keys()
+                .filter(|k| k.0 == surface_id)
+                .copied()
+                .collect();
+            for k in owned {
+                self.destroy_nv12_outputs_for_target(k.0, k.1, k.2);
+            }
+        }
     }
 
     /// Take the bitstreams produced since the last call.
     pub(crate) fn take_encoded_frames(&mut self) -> Vec<EncodedFrame> {
         std::mem::take(&mut self.pending_encoded_frames)
+    }
+
+    /// Take the sessions that have stopped producing bitstreams, so the
+    /// caller can tell the server to fall back to a server-side encoder.
+    /// Draining is what makes the report happen once rather than every frame.
+    pub(crate) fn take_encode_giveups(&mut self) -> Vec<(u32, u64)> {
+        std::mem::take(&mut self.vulkan_encode_giveups)
     }
 
     // ---------------------------------------------------------------
@@ -2006,6 +2197,11 @@ impl VulkanRenderer {
         if let Some((nv12s, _)) = self.nv12_outputs.remove(&(surface_id, target_w, target_h)) {
             self.destroy_nv12_vec(nv12s);
         }
+        // Every removal funnels through here, so clearing ownership here
+        // keeps the set from outliving the images it names — a stale key
+        // would make `create_vulkan_encoder` skip allocating a replacement.
+        self.owned_encode_nv12
+            .remove(&(surface_id, target_w, target_h));
     }
 
     fn destroy_nv12_outputs_for_surface(&mut self, surface_id: u32) {
@@ -2019,6 +2215,7 @@ impl VulkanRenderer {
             if let Some((nv12s, _)) = self.nv12_outputs.remove(&k) {
                 self.destroy_nv12_vec(nv12s);
             }
+            self.owned_encode_nv12.remove(&k);
         }
     }
 
@@ -2027,6 +2224,7 @@ impl VulkanRenderer {
         for nv12s in all {
             self.destroy_nv12_vec(nv12s);
         }
+        self.owned_encode_nv12.clear();
     }
 
     /// Allocate NV12 output planes for the BGRA→NV12 compute path.
@@ -2155,10 +2353,11 @@ impl VulkanRenderer {
                 unsafe { self.device.update_descriptor_sets(&[write], &[]) };
 
                 Some(Nv12Output {
-                    fd,
+                    fd: Some(fd),
                     descriptor_set,
                     width: w,
                     height: h,
+                    is_444: false,
                     kind: Nv12OutputKind::Buffer {
                         buffer,
                         memory,
@@ -2326,10 +2525,11 @@ impl VulkanRenderer {
         );
 
         Some(Nv12Output {
-            fd,
+            fd: Some(fd),
             descriptor_set,
             width: w,
             height: h,
+            is_444: false,
             kind: Nv12OutputKind::Buffer {
                 buffer,
                 memory,
@@ -2552,10 +2752,12 @@ impl VulkanRenderer {
         );
 
         Some(Nv12Output {
-            fd,
+            fd: Some(fd),
             descriptor_set,
             width: w,
             height: h,
+            // VA-API exports NV12 planes; 4:4:4 is the compositor-owned path.
+            is_444: false,
             kind: Nv12OutputKind::Image {
                 image,
                 y_memory,
@@ -2563,6 +2765,227 @@ impl VulkanRenderer {
                 uv_memory,
                 uv_view,
                 encode_view,
+            },
+        })
+    }
+
+    /// Allocate an NV12 image the Vulkan Video encoder can read, backed by
+    /// the compositor's own device-local memory.
+    ///
+    /// `import_nv12_image` was the only other producer of an encode-capable
+    /// NV12 image, and it runs solely on plane fds VA-API exported to us.
+    /// That left Vulkan Video — the tier that exists to *replace* VA-API —
+    /// reachable only on hosts where VA-API was already doing the work, and
+    /// silently dead everywhere else: the session was created, no frame ever
+    /// came out, and the surface stayed black.  Owning the memory here is
+    /// what makes "encode on the GPU" independent of who else is available.
+    ///
+    /// An image carrying `VIDEO_ENCODE_SRC_KHR` must be created against the
+    /// profile it will be read with, so this mirrors whichever session the
+    /// caller is about to build: H.264 High or High 4:4:4 Predictive, or AV1
+    /// Main.  The AV1 profile comes from `vulkan_encode`, which hand-rolls it
+    /// because ash 0.38 (Vulkan 1.3.281) predates `VK_KHR_video_encode_av1`.
+    ///
+    /// `is_444` selects the two-plane 4:4:4 format drivers advertise for High
+    /// 4:4:4 Predictive.  Both layouts are two-plane, so they share the
+    /// descriptor layout and differ only in the chroma plane's resolution and
+    /// the shader that fills it.  AV1 here is 4:2:0 only.
+    fn create_nv12_encode_image(
+        &self,
+        w: u32,
+        h: u32,
+        is_444: bool,
+        codec: u8,
+    ) -> Option<Nv12Output> {
+        let is_av1 = codec == 0x02;
+        let nv12_format = if is_444 && !is_av1 {
+            vk::Format::G8_B8R8_2PLANE_444_UNORM
+        } else {
+            vk::Format::G8_B8R8_2PLANE_420_UNORM
+        };
+        let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR;
+
+        // Both profile chains have to outlive the create call below, so both
+        // leaf structs are materialised here and only the matching one is
+        // chained in.  The H.264 profile must match the session's exactly,
+        // including the profile IDC — High 4:4:4 Predictive is a different
+        // profile, not High with a chroma flag flipped.
+        let mut h264_profile = vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(if is_444
+        {
+            ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE
+        } else {
+            ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
+        });
+        let mut av1_leaf = crate::vulkan_encode::VideoEncodeAV1ProfileInfoKHR {
+            s_type: vk::StructureType::default(),
+            p_next: std::ptr::null(),
+            std_profile: 0,
+        };
+        let profiles = [if is_av1 {
+            crate::vulkan_encode::av1_encode_profile(&mut av1_leaf)
+        } else {
+            vk::VideoProfileInfoKHR::default()
+                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
+                .chroma_subsampling(if is_444 {
+                    vk::VideoChromaSubsamplingFlagsKHR::TYPE_444
+                } else {
+                    vk::VideoChromaSubsamplingFlagsKHR::TYPE_420
+                })
+                .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+                .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+                .push_next(&mut h264_profile)
+        }];
+        let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+
+        // MUTABLE_FORMAT + the plane format list is what lets the compute
+        // shader bind each plane as its own storage image.
+        let format_list_entries = [vk::Format::R8_UNORM, vk::Format::R8G8_UNORM];
+        let mut format_list =
+            vk::ImageFormatListCreateInfo::default().view_formats(&format_list_entries);
+
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(nv12_format)
+            .extent(vk::Extent3D {
+                width: w,
+                height: h,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(usage)
+            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut profile_list)
+            .push_next(&mut format_list);
+
+        let image = match unsafe { self.device.create_image(&image_info, None) } {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("[vulkan-render] encode NV12 image create failed {w}x{h}: {e:?}");
+                return None;
+            }
+        };
+
+        let reqs = unsafe { self.device.get_image_memory_requirements(image) };
+        let Some(mem_type) =
+            self.find_memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        else {
+            unsafe { self.device.destroy_image(image, None) };
+            eprintln!("[vulkan-render] encode NV12 image: no DEVICE_LOCAL memory type");
+            return None;
+        };
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(mem_type);
+        let memory = match unsafe { self.device.allocate_memory(&alloc, None) } {
+            Ok(m) => m,
+            Err(e) => {
+                unsafe { self.device.destroy_image(image, None) };
+                eprintln!("[vulkan-render] encode NV12 memory alloc failed: {e:?}");
+                return None;
+            }
+        };
+        if unsafe { self.device.bind_image_memory(image, memory, 0) }.is_err() {
+            unsafe {
+                self.device.free_memory(memory, None);
+                self.device.destroy_image(image, None);
+            }
+            return None;
+        }
+
+        let plane_view = |aspect, format| unsafe {
+            self.device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(format)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: aspect,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        }),
+                    None,
+                )
+                .ok()
+        };
+        let cleanup = |views: &[vk::ImageView]| unsafe {
+            for v in views {
+                self.device.destroy_image_view(*v, None);
+            }
+            self.device.free_memory(memory, None);
+            self.device.destroy_image(image, None);
+        };
+
+        let Some(y_view) = plane_view(vk::ImageAspectFlags::PLANE_0, vk::Format::R8_UNORM) else {
+            cleanup(&[]);
+            return None;
+        };
+        let Some(uv_view) = plane_view(vk::ImageAspectFlags::PLANE_1, vk::Format::R8G8_UNORM)
+        else {
+            cleanup(&[y_view]);
+            return None;
+        };
+        let Some(encode_view) = plane_view(vk::ImageAspectFlags::COLOR, nv12_format) else {
+            cleanup(&[y_view, uv_view]);
+            return None;
+        };
+
+        let ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(std::slice::from_ref(
+                &self.compute_image_descriptor_set_layout,
+            ));
+        let Ok(sets) = (unsafe { self.device.allocate_descriptor_sets(&ds_alloc) }) else {
+            cleanup(&[y_view, uv_view, encode_view]);
+            return None;
+        };
+        let descriptor_set = sets[0];
+
+        let y_info = vk::DescriptorImageInfo::default()
+            .image_view(y_view)
+            .image_layout(vk::ImageLayout::GENERAL);
+        let uv_info = vk::DescriptorImageInfo::default()
+            .image_view(uv_view)
+            .image_layout(vk::ImageLayout::GENERAL);
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&y_info)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&uv_info)),
+        ];
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+
+        eprintln!(
+            "[vulkan-render] allocated encode image {w}x{h} {}",
+            if is_444 { "4:4:4" } else { "4:2:0" },
+        );
+
+        Some(Nv12Output {
+            fd: None,
+            descriptor_set,
+            width: w,
+            height: h,
+            is_444,
+            kind: Nv12OutputKind::Image {
+                image,
+                y_memory: memory,
+                y_view,
+                uv_memory: vk::DeviceMemory::null(),
+                uv_view,
+                encode_view: Some(encode_view),
             },
         })
     }
@@ -2821,7 +3244,13 @@ impl VulkanRenderer {
             self.device.cmd_bind_pipeline(
                 cb,
                 vk::PipelineBindPoint::COMPUTE,
-                self.compute_image_pipeline,
+                // Same bindings and push constants either way — only the
+                // chroma plane's resolution differs.
+                if nv12.is_444 {
+                    self.compute_nv24_pipeline
+                } else {
+                    self.compute_image_pipeline
+                },
             );
             self.device.cmd_bind_descriptor_sets(
                 cb,
@@ -4953,6 +5382,66 @@ impl VulkanRenderer {
             );
         }
 
+        // Fill our own NV12 encode image from the native composite, for
+        // Vulkan Video sessions that are not riding on a VA-API external.
+        // This runs after the staging copy so `out_image` is still a valid
+        // TRANSFER_SRC when that copy needs it, and restores the layout
+        // afterwards so the frame ends exactly as the rest of the code
+        // expects to find it.
+        let owns_encode_nv12 = self.owned_encode_nv12.contains_key(&(sid, phys_w, phys_h));
+        if owns_encode_nv12 {
+            let to_general = vk::ImageMemoryBarrier::default()
+                .image(out_image)
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_general],
+                );
+            }
+            let nv12_vec = &self.nv12_outputs[&(sid, phys_w, phys_h)].0;
+            self.dispatch_nv12_compute_image(cb, out_image, nv12_vec, 0, phys_w, phys_h, false);
+            let back_to_src = vk::ImageMemoryBarrier::default()
+                .image(out_image)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[back_to_src],
+                );
+            }
+        }
+
         // Submit asynchronously.
         unsafe {
             if let Err(e) = self.device.end_command_buffer(cb) {
@@ -5044,6 +5533,107 @@ impl VulkanRenderer {
         }
         let fence = tracking_fence;
 
+        // Vulkan Video encode (compositor-resident, native size only).  One
+        // encoder per subscribing client, so this runs once per client that
+        // owns a session on this surface and yields one bitstream each.  The
+        // NV12 image is only read — `encode` neither transitions nor
+        // consumes it — so every encoder shares the frame the compute pass
+        // just wrote.
+        //
+        // This used to sit inside the `external_targets` loop, which meant
+        // the tier billed as "no VA-API, no DMA-BUF export/import" only ran
+        // when VA-API had already exported a surface at native size.  On a
+        // host without VA-API the loop body never executed, no bitstream was
+        // ever produced, and the surface stayed black forever.  It belongs
+        // out here, keyed on the encoders that exist rather than on who else
+        // happens to want a copy of the frame.
+        //
+        // Unlike the VA-API consumers, which synchronise via DMA-BUF
+        // implicit fencing or the exported sync_fd, reading the NV12 image
+        // from the encode queue needs the compute that fills it to have
+        // landed — so wait for the submission first.  `encode` already
+        // blocks on its own fence, so this adds no new class of stall.
+        let mut encoder_cids: Vec<u64> = self
+            .vulkan_encoders
+            .keys()
+            .filter(|&&(esid, _)| esid == sid)
+            .map(|&(_, cid)| cid)
+            .collect();
+        if !encoder_cids.is_empty() {
+            encoder_cids.sort_unstable();
+            let nv12_image_and_view =
+                self.nv12_outputs
+                    .get(&(sid, phys_w, phys_h))
+                    .and_then(|(v, idx)| {
+                        let n = v.get(idx % v.len().max(1))?;
+                        match &n.kind {
+                            Nv12OutputKind::Image {
+                                image, encode_view, ..
+                            } => encode_view.map(|ev| (*image, ev)),
+                            _ => None,
+                        }
+                    });
+            if let Some((nv12_img, ev)) = nv12_image_and_view {
+                let waited = unsafe {
+                    self.device.wait_for_fences(
+                        &[fence],
+                        true,
+                        crate::vulkan_encode::encode_fence_timeout_ns(),
+                    )
+                }
+                .is_ok();
+                if !waited {
+                    eprintln!(
+                        "[vulkan-render] timed out waiting for the composite before encode; skipping surface {sid} this frame",
+                    );
+                    encoder_cids.clear();
+                }
+                for cid in encoder_cids {
+                    let encoder = self.vulkan_encoders.get_mut(&(sid, cid)).unwrap();
+                    let codec_flag = encoder.codec_flag();
+                    let encoded = unsafe {
+                        encoder.encode(
+                            &self.device,
+                            self.video_fns.as_ref().unwrap(),
+                            self.video_encode_queue.unwrap(),
+                            self.video_encode_command_pool.unwrap(),
+                            nv12_img,
+                            ev,
+                            false,
+                        )
+                    };
+                    match encoded {
+                        Some((bitstream, is_keyframe)) => {
+                            self.vulkan_encode_failures.remove(&(sid, cid));
+                            self.pending_encoded_frames.push(EncodedFrame {
+                                surface_id: toplevel_sid,
+                                client_id: cid,
+                                width: phys_w,
+                                height: phys_h,
+                                data: Arc::new(bitstream),
+                                is_keyframe,
+                                codec_flag,
+                            });
+                        }
+                        // A silent `None` here is what made a dead session
+                        // indistinguishable from a warming-up one, so the
+                        // server waited on `vulkan_await` forever.  Count
+                        // them and let the caller give up on this encoder.
+                        None => {
+                            let n = self.vulkan_encode_failures.entry((sid, cid)).or_insert(0);
+                            *n += 1;
+                            if *n == VULKAN_ENCODE_FAILURE_LIMIT {
+                                eprintln!(
+                                    "[vulkan-render] surface {sid} client {cid}: {n} consecutive encode failures; giving up on Vulkan Video",
+                                );
+                                self.vulkan_encode_giveups.push((sid, cid));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let submit_info = PendingSubmit {
             fence,
             cb,
@@ -5125,13 +5715,19 @@ impl VulkanRenderer {
                     va_display: ext_va_display,
                     _fd: ext_fd.clone(),
                 }
-            } else if let Some((nv12s, _)) = nv12_entry.filter(|(v, _)| !v.is_empty()) {
+            } else if let Some((nv12s, _)) = nv12_entry.filter(|(v, _)| !v.is_empty())
+                // Only an imported plane set can be handed to a server-side
+                // encoder — the compositor's own encode image has no fd to
+                // share.  It is never registered for an external target, so
+                // this filter is a guard rather than a behaviour change.
+                && let Some(nv12_fd) = nv12s[nv12_idx].fd.clone()
+            {
                 let nv12 = &nv12s[nv12_idx];
                 match &nv12.kind {
                     Nv12OutputKind::Buffer {
                         stride, uv_offset, ..
                     } => PixelData::Nv12DmaBuf {
-                        fd: nv12.fd.clone(),
+                        fd: nv12_fd,
                         stride: *stride,
                         uv_offset: *uv_offset,
                         width: tw,
@@ -5139,7 +5735,7 @@ impl VulkanRenderer {
                         sync_fd: None,
                     },
                     Nv12OutputKind::Image { .. } => PixelData::Nv12DmaBuf {
-                        fd: nv12.fd.clone(),
+                        fd: nv12_fd,
                         stride: 0,
                         uv_offset: 0,
                         width: tw,
@@ -5161,64 +5757,6 @@ impl VulkanRenderer {
                     y_invert: true,
                 }
             };
-
-            // Vulkan Video encode (compositor-resident, only at native
-            // size).  One encoder per subscribing client, so this runs
-            // once per client that owns a session on this surface and
-            // yields one bitstream each.  The NV12 image is only read —
-            // `encode` neither transitions nor consumes it — so every
-            // encoder can share the frame the compute pass just wrote.
-            if (tw, th) == (phys_w, phys_h) {
-                let mut encoder_cids: Vec<u64> = self
-                    .vulkan_encoders
-                    .keys()
-                    .filter(|&&(esid, _)| esid == sid)
-                    .map(|&(_, cid)| cid)
-                    .collect();
-                encoder_cids.sort_unstable();
-                if !encoder_cids.is_empty() {
-                    let nv12_image_and_view =
-                        self.nv12_outputs.get(&(sid, tw, th)).and_then(|(v, _)| {
-                            if v.is_empty() {
-                                return None;
-                            }
-                            match &v[nv12_idx].kind {
-                                Nv12OutputKind::Image {
-                                    image, encode_view, ..
-                                } => encode_view.map(|ev| (*image, ev)),
-                                _ => None,
-                            }
-                        });
-                    if let Some((nv12_img, ev)) = nv12_image_and_view {
-                        for cid in encoder_cids {
-                            let encoder = self.vulkan_encoders.get_mut(&(sid, cid)).unwrap();
-                            let codec_flag = encoder.codec_flag();
-                            let encoded = unsafe {
-                                encoder.encode(
-                                    &self.device,
-                                    self.video_fns.as_ref().unwrap(),
-                                    self.video_encode_queue.unwrap(),
-                                    self.video_encode_command_pool.unwrap(),
-                                    nv12_img,
-                                    ev,
-                                    false,
-                                )
-                            };
-                            if let Some((bitstream, is_keyframe)) = encoded {
-                                self.pending_encoded_frames.push(EncodedFrame {
-                                    surface_id: toplevel_sid,
-                                    client_id: cid,
-                                    width: tw,
-                                    height: th,
-                                    data: Arc::new(bitstream),
-                                    is_keyframe,
-                                    codec_flag,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
 
             // Attach the shared sync_fd to this NV12 result so the
             // encoder can wait off-thread instead of blocking the
@@ -5341,6 +5879,8 @@ impl Drop for VulkanRenderer {
                 .destroy_descriptor_set_layout(self.compute_descriptor_set_layout, None);
             self.device
                 .destroy_pipeline(self.compute_image_pipeline, None);
+            self.device
+                .destroy_pipeline(self.compute_nv24_pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.compute_image_pipeline_layout, None);
             self.device
