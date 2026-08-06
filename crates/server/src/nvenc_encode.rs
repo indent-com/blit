@@ -1604,6 +1604,30 @@ impl NvencDirectEncoder {
         let cu_get_buf = cuda.cuExternalMemoryGetMappedBuffer?;
         let cu_destroy = cuda.cuDestroyExternalMemory?;
 
+        // A buffer we imported can be destroyed compositor-side — on
+        // resize, or when a subscriber needing CPU pixels joins and the
+        // NV12 target is revoked. Those entries are never hit again (any
+        // replacement carries a fresh buf_id) but each holds a CUDA object,
+        // an NVENC registration and a dup'd fd, so left alone they
+        // accumulate for the encoder's lifetime. The compositor rotates
+        // three buffers per target, so passing this cap means the set has
+        // been replaced: drop everything and let whatever is still live
+        // re-import on its next frame. Nothing is mapped at this point —
+        // the encode path unmaps before returning — so this is safe.
+        const MAX_CACHED_IMPORTS: usize = 6;
+        if self.nv12_imports.len() >= MAX_CACHED_IMPORTS {
+            let stale: Vec<Nv12Import> = self.nv12_imports.drain().map(|(_, v)| v).collect();
+            for imp in stale {
+                unsafe {
+                    (self.fns.nvEncUnregisterResource)(self.encoder, imp.registered);
+                    cu_destroy(imp.ext_mem);
+                }
+            }
+            if self.verbose {
+                eprintln!("[nvenc-zerocopy] import cache full; dropped stale imports");
+            }
+        }
+
         let buf_size = (stride as u64) * (height as u64) * 3 / 2;
 
         // CUDA takes ownership of the fd on success, so hand it a dup —

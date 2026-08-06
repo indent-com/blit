@@ -1688,6 +1688,32 @@ impl VulkanRenderer {
         // the buffer is reusable while the stale native it carries is not.
         self.target_natives.insert(key, native);
         if self.downscale_outputs.contains_key(&key) {
+            // The BGRA buffer is reusable, but "can everyone reading this
+            // target take NV12" is not a property of the buffer — it is a
+            // property of the current subscribers, and a software encoder
+            // joining an NVENC one at the same size flips it. The server
+            // re-registers to say so. Returning early here would freeze the
+            // first subscriber's answer for the target's whole life and
+            // hand the newcomer GPU-only memory it cannot map.
+            let has_nv12 = self
+                .nv12_opaque_slot(surface_id, target_w, target_h)
+                .is_some();
+            if want_nv12_opaque && !has_nv12 {
+                self.create_nv12_outputs(
+                    surface_id,
+                    target_w,
+                    target_h,
+                    target_w,
+                    target_h,
+                    Nv12Export::OpaqueFd,
+                );
+            } else if !want_nv12_opaque && has_nv12 {
+                eprintln!(
+                    "[vulkan-render] sid {surface_id} {target_w}x{target_h}: dropping NV12 \
+                     opaque-fd target, a subscriber needs CPU pixels",
+                );
+                self.destroy_nv12_outputs_for_target(surface_id, target_w, target_h);
+            }
             return;
         }
         let Some(out) = self.create_downscale_output(target_w, target_h) else {
