@@ -323,6 +323,26 @@ fn drm_fourcc_to_vk_format(fourcc: u32) -> Option<vk::Format> {
     }
 }
 
+/// The layer rectangle `(x, y, w, h)` as a scissor, clipped to the render
+/// area.  Vulkan rejects a scissor that leaves the framebuffer, and a layer
+/// can start left of or above the origin (a toplevel with client-side
+/// decorations is shifted negative so only its geometry area shows) or run
+/// past the far edge (the composite follows the pane, which can be smaller
+/// than the window still painting into it).
+fn clamped_scissor(x: i32, y: i32, w: u32, h: u32, fb_w: u32, fb_h: u32) -> vk::Rect2D {
+    let x0 = x.max(0).min(fb_w as i32);
+    let y0 = y.max(0).min(fb_h as i32);
+    let x1 = x.saturating_add(w as i32).clamp(x0, fb_w as i32);
+    let y1 = y.saturating_add(h as i32).clamp(y0, fb_h as i32);
+    vk::Rect2D {
+        offset: vk::Offset2D { x: x0, y: y0 },
+        extent: vk::Extent2D {
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        },
+    }
+}
+
 impl VulkanRenderer {
     pub(crate) fn try_new(drm_device: &str) -> Option<Self> {
         // Load Vulkan at runtime via dlopen.
@@ -4444,6 +4464,10 @@ impl VulkanRenderer {
             image: vk::Image,
             old_layout: vk::ImageLayout,
             geom: [f32; 4],
+            /// Framebuffer-space rectangle this layer may write, when a
+            /// `wp_viewport` source crop means the quad deliberately
+            /// overhangs it.  `None` = the whole render area.
+            scissor: Option<vk::Rect2D>,
         }
         let mut draws: Vec<DrawCmd> = Vec::new();
 
@@ -4470,17 +4494,44 @@ impl VulkanRenderer {
                     continue;
                 };
 
+            // A `wp_viewport` source crop asks for a sub-rectangle of the
+            // texture to fill the destination.  The vertex shader hands the
+            // fragment stage `v_tc = pos`, so the quad always samples the
+            // whole texture and there is nowhere to put a crop — short of
+            // recompiling the SPIR-V, which is checked in as a blob with no
+            // build rule.
+            //
+            // Draw it as the same mapping instead: stretch the quad to
+            // wherever the *whole* texture would have to land for the
+            // cropped part to cover the destination exactly, then scissor
+            // back to the destination so only that part is written.  With
+            // `u = 0, w = 1` this collapses to the destination rect, so the
+            // uncropped path is unchanged.
+            let ((qx, qy, qw, qh), scissor) = match l.src {
+                Some((u, v, sw, sh)) if sw > 0.0 && sh > 0.0 => {
+                    let (fw, fh) = (pw as f32 / sw, ph as f32 / sh);
+                    (
+                        (px as f32 - u * fw, py as f32 - v * fh, fw, fh),
+                        Some(clamped_scissor(px, py, pw, ph, phys_w, phys_h)),
+                    )
+                }
+                _ => ((px as f32, py as f32, pw as f32, ph as f32), None),
+            };
+
             // Vulkan clip space: x=[-1,1] left→right, y=[-1,1] top→bottom.
-            let clip_x = (px as f32 / phys_w as f32) * 2.0 - 1.0;
-            let mut clip_y = (py as f32 / phys_h as f32) * 2.0 - 1.0;
-            let clip_w = (pw as f32 / phys_w as f32) * 2.0;
-            let mut clip_h = (ph as f32 / phys_h as f32) * 2.0;
+            let clip_x = (qx / phys_w as f32) * 2.0 - 1.0;
+            let mut clip_y = (qy / phys_h as f32) * 2.0 - 1.0;
+            let clip_w = (qw / phys_w as f32) * 2.0;
+            let mut clip_h = (qh / phys_h as f32) * 2.0;
 
             // For y_invert (OpenGL-origin) DMA-BUFs, flip the quad
             // vertically.  The vertex shader maps pos.y ∈ [0,1] to
             // v_tc.y ∈ [0,1]; negating clip_h and offsetting clip_y
             // by the old clip_h effectively samples v_tc.y from 1→0
-            // instead of 0→1, flipping the image.
+            // instead of 0→1, flipping the image.  It mirrors the quad
+            // about its own centre, so it composes with the stretch above:
+            // the crop offset is already baked into the quad's position,
+            // and the scissor is in framebuffer space either way.
             if l.y_invert {
                 clip_y += clip_h;
                 clip_h = -clip_h;
@@ -4491,6 +4542,7 @@ impl VulkanRenderer {
                 image: img,
                 old_layout,
                 geom: [clip_x, clip_y, clip_w, clip_h],
+                scissor,
             });
         }
 
@@ -4546,8 +4598,24 @@ impl VulkanRenderer {
         }
 
         // Now draw all layers.
+        let full_scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: phys_w,
+                height: phys_h,
+            },
+        };
+        let mut scissor_now = full_scissor;
         for d in &draws {
             unsafe {
+                // Only a cropped layer narrows the scissor, and it has to be
+                // widened again afterwards or it would clip every layer
+                // drawn on top of it.
+                let want = d.scissor.unwrap_or(full_scissor);
+                if want != scissor_now {
+                    self.device.cmd_set_scissor(cb, 0, &[want]);
+                    scissor_now = want;
+                }
                 self.device.cmd_bind_descriptor_sets(
                     cb,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -5290,5 +5358,51 @@ impl Drop for VulkanRenderer {
             // before `atexit` handlers, so by the time any guard of ours
             // could fire, the damage is done.
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamped_scissor;
+
+    fn rect(x: i32, y: i32, w: u32, h: u32, fw: u32, fh: u32) -> (i32, i32, u32, u32) {
+        let r = clamped_scissor(x, y, w, h, fw, fh);
+        (r.offset.x, r.offset.y, r.extent.width, r.extent.height)
+    }
+
+    #[test]
+    fn a_layer_inside_the_framebuffer_scissors_to_itself() {
+        assert_eq!(rect(0, 0, 1000, 1000, 1900, 1000), (0, 0, 1000, 1000));
+        assert_eq!(rect(40, 20, 100, 80, 1920, 1080), (40, 20, 100, 80));
+    }
+
+    #[test]
+    fn a_layer_starting_off_the_top_left_is_clipped_to_the_origin() {
+        // A toplevel with client-side decorations sits at a negative offset
+        // so only its window-geometry area lands in the output.
+        assert_eq!(rect(-35, -35, 200, 200, 1920, 1080), (0, 0, 165, 165));
+    }
+
+    #[test]
+    fn a_layer_running_past_the_far_edge_is_clipped_to_it() {
+        // The composite follows the pane, which shrinks before the window
+        // painting into it does.
+        assert_eq!(rect(900, 0, 1000, 500, 1000, 1000), (900, 0, 100, 500));
+    }
+
+    #[test]
+    fn a_layer_entirely_outside_scissors_to_nothing() {
+        // Vulkan rejects a scissor that leaves the framebuffer, so this has
+        // to come back empty rather than negative.
+        assert_eq!(rect(2000, 2000, 100, 100, 1000, 1000), (1000, 1000, 0, 0));
+        assert_eq!(rect(-500, -500, 100, 100, 1000, 1000), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn a_far_edge_that_would_overflow_i32_still_lands_inside() {
+        assert_eq!(
+            rect(i32::MAX - 1, 0, u32::MAX, 10, 1000, 1000),
+            (1000, 0, 0, 10),
+        );
     }
 }
