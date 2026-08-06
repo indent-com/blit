@@ -99,12 +99,18 @@ pub fn kill_pty(handle: &PtyHandle, signal: i32, group: bool) {
     }
 }
 
+/// Tear down the console, the pipes and the job.
+///
+/// Deliberately leaves `process` open: the caller reads the exit code through
+/// it immediately afterwards, and `GetExitCodeProcess` on a closed handle
+/// returns nothing useful — or, once the handle value is recycled, somebody
+/// else's exit code.  `collect_exit_status` closes it, and `abandon_pty_pid`
+/// covers the path that never asks for a status.
 pub fn close_pty(handle: &PtyHandle) {
     unsafe {
         ClosePseudoConsole(handle.conpty);
         CloseHandle(handle.input);
         CloseHandle(handle.output);
-        CloseHandle(handle.process);
         // Last handle to the job, so KILL_ON_JOB_CLOSE fires here and takes
         // any surviving descendant with it.
         if !handle.job.is_null() {
@@ -113,6 +119,10 @@ pub fn close_pty(handle: &PtyHandle) {
     }
 }
 
+/// Read the child's exit code and release the process handle.
+///
+/// Mirrors the Unix twin's contract: calling this is what says "this child is
+/// finished with", so it is also where the last reference goes away.
 pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
     const STILL_ACTIVE: u32 = 259;
     unsafe {
@@ -122,11 +132,15 @@ pub fn collect_exit_status(handle: &PtyHandle) -> i32 {
         // which can beat the kernel to the exit code by a hair.
         WaitForSingleObject(handle.process, 50);
         let mut exit_code: u32 = 0;
-        if GetExitCodeProcess(handle.process, &mut exit_code) != 0 && exit_code != STILL_ACTIVE {
+        let status = if GetExitCodeProcess(handle.process, &mut exit_code) != 0
+            && exit_code != STILL_ACTIVE
+        {
             exit_code as i32
         } else {
             blit_remote::EXIT_STATUS_UNKNOWN
-        }
+        };
+        CloseHandle(handle.process);
+        status
     }
 }
 
@@ -137,9 +151,14 @@ pub fn poll_child_exited(handle: &PtyHandle) -> bool {
     unsafe { WaitForSingleObject(handle.process, 0) == WAIT_OBJECT_0 }
 }
 
-/// No owned-pid table on Windows — the process handle is the ownership —
-/// so there is nothing to forget.
-pub fn forget_pty_pid(_handle: &PtyHandle) {}
+/// Give up on a child's exit status.  No zombies here — the process object
+/// goes away once the last handle closes — so this is just that close, the
+/// counterpart to the Unix wait.
+pub fn abandon_pty_pid(handle: &PtyHandle) {
+    unsafe {
+        CloseHandle(handle.process);
+    }
+}
 
 pub fn reap_zombies() {}
 
@@ -172,17 +191,31 @@ fn create_kill_on_close_job() -> HANDLE {
     }
 }
 
-/// Put a `CREATE_SUSPENDED` child into `job` and let it run.
+/// Put a `CREATE_SUSPENDED` child into `job` and let it run.  Returns the job
+/// actually in force — null when there is none, so the caller stores that and
+/// `kill_pty` falls back to terminating the leader.
 ///
 /// The child must be created suspended: assigning it after it has started
 /// races against anything it spawns in the meantime, and those grandchildren
 /// would land outside the job.
-fn adopt_into_job(job: HANDLE, pi: &PROCESS_INFORMATION) {
+///
+/// A failed assignment has to null the handle, not just log: an empty job
+/// still looks live to `kill_pty`, which would then route every kill —
+/// including the deadline's SIGKILL equivalent — to `TerminateJobObject` on a
+/// job containing nothing, leaving a terminal that cannot be killed at all.
+fn adopt_into_job(job: HANDLE, pi: &PROCESS_INFORMATION) -> HANDLE {
     unsafe {
-        if !job.is_null() {
-            AssignProcessToJobObject(job, pi.hProcess);
+        let mut job = job;
+        if !job.is_null() && AssignProcessToJobObject(job, pi.hProcess) == 0 {
+            let err = GetLastError();
+            eprintln!(
+                "blit-server: job assignment failed (error {err}); kill will not reach the process tree"
+            );
+            CloseHandle(job);
+            job = std::ptr::null_mut();
         }
         ResumeThread(pi.hThread);
+        job
     }
 }
 
@@ -407,7 +440,7 @@ pub fn spawn_pty(
         return None;
     }
 
-    adopt_into_job(job, &pi);
+    let job = adopt_into_job(job, &pi);
 
     unsafe {
         CloseHandle(pi.hThread);
@@ -453,6 +486,7 @@ pub fn spawn_pty(
         exit_reason: blit_remote::EXIT_REASON_NORMAL,
         exited: false,
         exited_at: None,
+        generation: 0,
         exit_status: blit_remote::EXIT_STATUS_UNKNOWN,
         command: command.map(|s| s.to_owned()),
         cwd: dir.map(|s| s.to_owned()),
@@ -569,7 +603,7 @@ pub fn respawn_child(
         return None;
     }
 
-    adopt_into_job(job, &pi);
+    let job = adopt_into_job(job, &pi);
 
     unsafe {
         CloseHandle(pi.hThread);

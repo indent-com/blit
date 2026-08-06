@@ -444,6 +444,10 @@ struct Pty {
     exited: bool,
     /// When it exited, for the retention bound.  `None` while live.
     exited_at: Option<Instant>,
+    /// Bumped every time this slot gets a fresh child, so work queued against
+    /// one generation cannot land on the next.  `C2S_RESTART` reuses the id
+    /// and the driver in place, which makes the id alone useless as identity.
+    generation: u64,
     /// Exit status: WEXITSTATUS if normal exit, negative signal number if signalled,
     /// EXIT_STATUS_UNKNOWN if not yet collected.
     exit_status: i32,
@@ -3430,16 +3434,16 @@ async fn enforce_deadlines(state: &AppState) {
 /// `blit terminal wait` blocked until its own client-side timeout.
 async fn supervise(state: &AppState) {
     enforce_deadlines(state).await;
-    let exited: Vec<u16> = {
+    let exited: Vec<(u16, u64)> = {
         let sess = state.session.lock().await;
         sess.ptys
             .iter()
             .filter(|(_, pty)| !pty.exited && pty::poll_child_exited(&pty.handle))
-            .map(|(&id, _)| id)
+            .map(|(&id, pty)| (id, pty.generation))
             .collect()
     };
-    for id in exited {
-        cleanup_pty_internal(id, state).await;
+    for (id, generation) in exited {
+        cleanup_pty_internal(id, Some(generation), state).await;
     }
     // The backstop still runs, now targeted at owned pids only, so a child
     // whose SIGCHLD we missed cannot linger as a zombie.
@@ -3447,13 +3451,26 @@ async fn supervise(state: &AppState) {
     evict_exited(state).await;
 }
 
-async fn cleanup_pty_internal(pty_id: u16, state: &AppState) {
-    state.pty_fds.write().unwrap().remove(&pty_id);
+/// Run a terminal's exit path.
+///
+/// `generation` is the child this cleanup was decided for.  The EOF path in
+/// the delivery tick defers by 50ms, and the supervisor now reaches the same
+/// terminal within a millisecond of SIGCHLD, so a client that sees
+/// `S2C_EXITED` and immediately restarts can have a fresh child running by the
+/// time the deferred call lands.  Without the check that call would drop the
+/// new child's fd, hang it up, and broadcast a second `S2C_EXITED` with an
+/// unknown status — the one place the exactly-once contract actually breaks.
+/// `None` means "whatever is there now", for callers that just looked.
+async fn cleanup_pty_internal(pty_id: u16, generation: Option<u64>, state: &AppState) {
     let mut sess = state.session.lock().await;
     if let Some(pty) = sess.ptys.get_mut(&pty_id) {
+        if generation.is_some_and(|g| g != pty.generation) {
+            return;
+        }
         if pty.exited {
             return;
         }
+        state.pty_fds.write().unwrap().remove(&pty_id);
         pty.exited = true;
         pty.exited_at = Some(Instant::now());
         pty.deadline = None;
@@ -5755,7 +5772,7 @@ async fn tick(state: &AppState) -> TickOutcome {
         .values()
         .flat_map(|c| c.subscriptions.iter().copied())
         .collect();
-    let mut eof_ptys: Vec<u16> = Vec::with_capacity(ids.len());
+    let mut eof_ptys: Vec<(u16, u64)> = Vec::with_capacity(ids.len());
     let mut cwd_msgs: Vec<Vec<u8>> = Vec::new();
     let mut parse_budget_hit = false;
     for &id in &ids {
@@ -5812,7 +5829,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                 }
                 PtyInput::Eof => {
-                    eof_ptys.push(id);
+                    eof_ptys.push((id, pty.generation));
                 }
             }
         }
@@ -5833,9 +5850,9 @@ async fn tick(state: &AppState) -> TickOutcome {
     }
     // Handle EOF outside the borrow loop.
     drop(sess);
-    for id in eof_ptys {
+    for (id, generation) in eof_ptys {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        cleanup_pty_internal(id, state).await;
+        cleanup_pty_internal(id, Some(generation), state).await;
     }
     let mut sess = state.session.lock().await;
 
@@ -8937,7 +8954,16 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 initial_msgs.push(msg);
             }
             if pty.exited {
-                initial_msgs.push(blit_remote::msg_exited(id, pty.exit_status));
+                // Carry the attribution, not just the status.  Arming a
+                // deadline, disconnecting, and reconnecting to collect is the
+                // case the reason byte exists for; replaying a bare
+                // `signal(15)` here would put back exactly the ambiguity it
+                // was added to remove.
+                initial_msgs.push(blit_remote::msg_exited_reason(
+                    id,
+                    pty.exit_status,
+                    pty.exit_reason,
+                ));
             }
         }
         initial_msgs.push(vec![S2C_READY]);
@@ -10630,6 +10656,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         pty.driver.reset_modes();
                         pty.exited = false;
                         pty.exited_at = None;
+                        // New child in the same slot: anything queued against
+                        // the old one must not land on this one.
+                        pty.generation = pty.generation.wrapping_add(1);
                         pty.exit_status = blit_remote::EXIT_STATUS_UNKNOWN;
                         // A restart is a new command, not a continuation of
                         // the one the deadline was armed for.  Carrying the
@@ -10820,11 +10849,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         state.pty_fds.write().unwrap().remove(&pid);
                         drop(pty.reader_handle);
                         pty::close_pty(&pty.handle);
-                        // Nobody will ask this child's exit status, so drop
-                        // it from the owned set — otherwise the pid stays
-                        // registered forever and the backstop parks a status
-                        // that is never drained.
-                        pty::forget_pty_pid(&pty.handle);
+                        // The SIGHUP only asks the child to die, and nobody
+                        // will ever collect its status — but it still has to
+                        // be waited or it stays a zombie for the life of the
+                        // server.  Hand it to the reaper to finish.
+                        pty::abandon_pty_pid(&pty.handle);
                     }
                     for client in sess.clients.values_mut() {
                         unsubscribe_client_from(client, pid);

@@ -5,6 +5,7 @@ import {
   C2S_DISPLAY_RATE,
   C2S_INPUT,
   C2S_KILL,
+  KILL_LEADER_ONLY,
   C2S_TERM_CWD,
   S2C_TERM_CWD,
   S2C_TERM_CWD_EVENT,
@@ -291,13 +292,25 @@ export function buildRestartMessage(ptyId: number): Uint8Array {
   return msg;
 }
 
-export function buildKillMessage(ptyId: number, signal: number): Uint8Array {
-  const msg = new Uint8Array(7);
+/**
+ * Signals a terminal. The server's default reaches the child's process group,
+ * which is what "stop this terminal" means and what the kernel does for a
+ * real `^C`. Pass `leaderOnly` to address the session leader alone; that
+ * needs `FEATURE_KILL_MODE`, and an older server is leader-only regardless
+ * because it ignores the trailing byte.
+ */
+export function buildKillMessage(
+  ptyId: number,
+  signal: number,
+  leaderOnly = false,
+): Uint8Array {
+  const msg = new Uint8Array(leaderOnly ? 8 : 7);
   msg[0] = C2S_KILL;
   msg[1] = ptyId & 0xff;
   msg[2] = (ptyId >> 8) & 0xff;
   const view = new DataView(msg.buffer);
   view.setInt32(3, signal, true);
+  if (leaderOnly) msg[7] = KILL_LEADER_ONLY;
   return msg;
 }
 

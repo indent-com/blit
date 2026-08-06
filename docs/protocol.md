@@ -131,6 +131,7 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 | `0x0D` | `USED_ROWS`         | `[pty_id:2][used_rows:2]`                                                                                          |
 | `0x0E` | `TERM_CWD`          | `[nonce:2][cwd_len:2][cwd:N]` — reply to `C2S_TERM_CWD`; empty = unknown                                           |
 | `0x0F` | `TERM_CWD_EVENT`    | `[pty_id:2][cwd:N]` — unsolicited push when the OSC 7-reported cwd changes                                         |
+| `0x10` | `CREATE_FAILED`     | `[nonce:2][status:1][detail:N]` — refusal of a `CREATE2(WANT_STATUS)`                                              |
 | `0x20` | `SURFACE_CREATED`   | `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`                              |
 | `0x21` | `SURFACE_DESTROYED` | `[surface_id:2]`                                                                                                   |
 | `0x22` | `SURFACE_FRAME`     | `[surface_id:2][timestamp:4][flags:1][w:2][h:2][data:N]`                                                           |

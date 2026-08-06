@@ -16,6 +16,7 @@ import {
   FEATURE_COPY_RANGE,
   FEATURE_CREATE_NONCE,
   FEATURE_CREATE_STATUS,
+  FEATURE_KILL_MODE,
   FEATURE_RESIZE_BATCH,
   FEATURE_RESTART,
   statusText,
@@ -995,7 +996,14 @@ export class BlitConnection {
     this.transport.send(buildRestartMessage(session.ptyId));
   }
 
-  killSession(sessionId: SessionId, signal = 15): void {
+  /**
+   * Signals a terminal. Reaches the child's process group by default, which
+   * is what a "kill this terminal" affordance means and what the kernel does
+   * for a real `^C`. `leaderOnly` addresses the session leader alone; it is
+   * dropped against a server without {@link FEATURE_KILL_MODE}, which is
+   * leader-only regardless.
+   */
+  killSession(sessionId: SessionId, signal = 15, leaderOnly = false): void {
     const session = this.sessionsById.get(sessionId);
     if (
       !session ||
@@ -1004,7 +1012,13 @@ export class BlitConnection {
     ) {
       return;
     }
-    this.transport.send(buildKillMessage(session.ptyId, signal));
+    this.transport.send(
+      buildKillMessage(
+        session.ptyId,
+        signal,
+        leaderOnly && (this.features & FEATURE_KILL_MODE) !== 0,
+      ),
+    );
   }
 
   focusSession(sessionId: SessionId | null): void {

@@ -230,6 +230,10 @@ export const C2S_CREATE_AT = 0x16;
 export const C2S_CREATE_N = 0x17;
 export const C2S_CREATE2 = 0x18;
 export const C2S_KILL = 0x1a;
+/** Optional trailing flag on `C2S_KILL`: signal the session leader alone
+ *  instead of the child's process group. Needs {@link FEATURE_KILL_MODE};
+ *  an older server is leader-only anyway, since it ignores the byte. */
+export const KILL_LEADER_ONLY = 1 << 0;
 export const C2S_COPY_RANGE = 0x1b;
 export const C2S_TERM_CWD = 0x1c;
 export const CREATE2_HAS_SRC_PTY = 1 << 0;
@@ -363,6 +367,10 @@ export const FEATURE_AUDIO = 1 << 5;
  *  Bits 6–13 belong to the per-family modules, which declare them beside
  *  their own wire constants (`fs.ts`, `git.ts`, `lsp.ts`, `kv.ts`, `net.ts`). */
 export const FEATURE_CREATE_STATUS = 1 << 14;
+/** `C2S_KILL` and `C2S_CLOSE` reach the child's process group rather than the
+ *  session leader alone, and `C2S_KILL` accepts a trailing
+ *  {@link KILL_LEADER_ONLY} byte to opt back out. */
+export const FEATURE_KILL_MODE = 1 << 15;
 
 // -- Common status registry (docs/protocol.md) ------------------------------
 //

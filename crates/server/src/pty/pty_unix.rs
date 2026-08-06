@@ -350,14 +350,19 @@ pub fn poll_child_exited(handle: &PtyHandle) -> bool {
     false
 }
 
-/// Drop a pid from the owned set without collecting a status, for the close
-/// path that kills a live child and never asks what it exited with.  Without
-/// this the pid stays owned forever and the backstop parks a status nobody
-/// drains.
-pub fn forget_pty_pid(handle: &PtyHandle) {
+/// Give up on a child's exit status without giving up on reaping it.
+///
+/// `C2S_CLOSE` hangs a live child up and never reports what it exited with,
+/// so nothing will ever call `collect_exit_status` for it.  It still has to be
+/// waited: the `SIGHUP` only asks it to die, and an unwaited child is a
+/// zombie for the life of the server.  Moving the pid here keeps
+/// `reap_zombies` sweeping it — discarding the status rather than parking it —
+/// until the wait succeeds and the registration goes away for good.
+pub fn abandon_pty_pid(handle: &PtyHandle) {
     let mut reaped = reaped_statuses().lock().unwrap();
     pty_pids().lock().unwrap().remove(&handle.child_pid);
     reaped.remove(&handle.child_pid);
+    abandoned_pids().lock().unwrap().insert(handle.child_pid);
 }
 
 /// Is reaping unowned children this process's job?
@@ -391,6 +396,14 @@ pub fn reap_zombies() {
             reaped.insert(pid, status_from_wstatus(wstatus));
         }
     }
+    // Children hung up by `C2S_CLOSE`.  Nobody wants their status, but they
+    // still have to be waited or they stay zombies — a server cycling
+    // terminals would march to RLIMIT_NPROC.  Drop each registration only
+    // once the wait succeeds, so a child still winding down is retried.
+    abandoned_pids()
+        .lock()
+        .unwrap()
+        .retain(|&pid| unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } <= 0);
     if !adopts_orphans() {
         return;
     }
@@ -415,6 +428,13 @@ pub fn reap_zombies() {
 fn reaped_statuses() -> &'static Mutex<HashMap<libc::pid_t, i32>> {
     static REAPED: OnceLock<Mutex<HashMap<libc::pid_t, i32>>> = OnceLock::new();
     REAPED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Pids hung up by `C2S_CLOSE`, whose status nobody will collect but which
+/// still need waiting.  Emptied by `reap_zombies` as each one dies.
+fn abandoned_pids() -> &'static Mutex<std::collections::HashSet<libc::pid_t>> {
+    static PIDS: OnceLock<Mutex<std::collections::HashSet<libc::pid_t>>> = OnceLock::new();
+    PIDS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
 /// Live PTY child pids, so the backstop parks statuses only for
@@ -697,6 +717,7 @@ pub fn spawn_pty(
         exit_reason: blit_remote::EXIT_REASON_NORMAL,
         exited: false,
         exited_at: None,
+        generation: 0,
         exit_status: blit_remote::EXIT_STATUS_UNKNOWN,
         command: command.map(|s| s.to_owned()),
         cwd: dir.map(|s| s.to_owned()),
@@ -1038,6 +1059,33 @@ mod tests {
             libc::waitpid(leader, std::ptr::null_mut(), 0);
         }
         wait_until_gone(grandchild);
+    }
+
+    /// `C2S_CLOSE` hangs a live child up and never asks its status.  It still
+    /// has to be waited, or every close leaves a zombie for the life of the
+    /// server and a terminal-cycling client marches to RLIMIT_NPROC.
+    #[test]
+    fn abandoned_children_are_still_reaped() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        super::register_pty_pid(pid);
+        let handle = PtyHandle {
+            master_fd: -1,
+            child_pid: pid,
+        };
+
+        // The close path: no status will ever be collected for this child.
+        super::abandon_pty_pid(&handle);
+        wait_until_zombie(pid);
+        reap_zombies();
+
+        // Reaped, so no longer waitable — a still-zombie child would return
+        // its pid here instead of -1.
+        let ret = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(ret, -1, "child was left unreaped");
     }
 
     fn child_env_map(env: Vec<std::ffi::CString>) -> HashMap<String, String> {

@@ -188,8 +188,12 @@ pub const C2S_COPY_RANGE: u8 = 0x1B;
 /// leader alone — killing a shell used to leave its children running.
 pub const C2S_KILL: u8 = 0x1A;
 /// Signal only the session leader, the pre-`FEATURE_KILL_MODE` behaviour.
-/// Right when emulating a keystroke for the foreground program, wrong when
-/// you mean "stop this terminal and everything in it".
+///
+/// This is for the narrow case of addressing the leader *itself* — telling a
+/// shell to exit without disturbing the jobs under it. It is not the right
+/// choice for emulating a keystroke: the kernel delivers `^C` to the
+/// terminal's foreground process group, which is what the default already
+/// does, and sending `SIGINT` to the shell alone mostly gets ignored.
 pub const KILL_LEADER_ONLY: u8 = 1 << 0;
 /// Request a PTY's live working directory: [0x1C][nonce:2][pty_id:2]
 pub const C2S_TERM_CWD: u8 = 0x1C;
@@ -2582,6 +2586,13 @@ pub fn msg_create2_with_cwd(
 ///
 /// Field order is load-bearing: the command has no length prefix and runs to
 /// the end of the message, so everything else has to precede it.
+///
+/// Only pass `deadline_ms` to a server advertising [`FEATURE_PTY_DEADLINE`].
+/// An older one does not know bit 4, so it will not skip the four bytes and
+/// will read them as the first four bytes of the command — spawning something
+/// other than what was asked for, silently. Every other optional field is
+/// safe against an old server, because an unknown flag with no trailing bytes
+/// is merely ignored; this one is not.
 #[allow(clippy::too_many_arguments)]
 pub fn msg_create2_full(
     nonce: u16,
