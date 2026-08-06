@@ -937,6 +937,21 @@ function WorkspaceScreen(props: {
   createEffect(() => {
     if (!keyboardWanted()) {
       keyboardSeen = false;
+      // A full keyboard rising without the toggle is still the user asking
+      // for it — on Android, tapping a terminal raises the IME directly, and
+      // the icon sat dim over an open keyboard with no toolbar, so the first
+      // toggle tap looked like it did nothing.  Latch intent from reality.
+      // Gated on focus still being in a terminal so the drain after an
+      // explicit hide (the toggle blurred, occlusion not yet gone) cannot
+      // re-latch, and on >150px so the iPadOS shortcut bar and the floating
+      // keyboard don't count — only a real keyboard does.
+      if (
+        occlusion() > 150 &&
+        document.activeElement instanceof HTMLElement &&
+        document.activeElement.matches(terminalInputSelector)
+      ) {
+        setKeyboardWanted(true);
+      }
       return;
     }
     if (viewportOccluded()) keyboardSeen = true;
@@ -984,7 +999,22 @@ function WorkspaceScreen(props: {
       const el = focusedTerminalInput();
       if (!el) return;
       setKeyboardWanted(true);
+      // Android leaves the textarea focused with no keyboard up — the
+      // pane-focus effect focuses it at load with no user gesture (Chrome
+      // moves focus but raises no IME), and the Back gesture dismisses the
+      // IME without a blur.  focus() on the already-focused element is a
+      // spec'd no-op no keyboard answers, so force a real transition —
+      // unless a full keyboard is already up, where blurring would only
+      // flicker it.
+      if (el === document.activeElement && occlusion() <= 150) el.blur();
       el.focus();
+      // Chromium's IME can stay down for a programmatic focus() even inside
+      // a tap; where this API exists (Chrome on Android) it raises the
+      // keyboard directly, and it fails silently everywhere else.  Safari
+      // has no virtualKeyboard object.
+      (
+        navigator as { virtualKeyboard?: { show?: () => void } }
+      ).virtualKeyboard?.show?.();
     }
   }
 
