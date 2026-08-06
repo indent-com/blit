@@ -685,6 +685,16 @@ struct SurfaceSubState {
     /// an independent reference chain for each, and one surface's keyframe
     /// says nothing about another's.
     has_keyframe: bool,
+    /// When this surface last put a frame on the wire for this client.
+    /// `None` until the first one goes out.  Drives the still-resend
+    /// watchdog, which needs to know how long the client has been looking
+    /// at whatever it last received.
+    last_sent_at: Option<Instant>,
+    /// The still-resend watchdog has already fired for the generation in
+    /// `last_encoded_gen`.  Latched so a settled surface costs exactly one
+    /// extra keyframe, not one every interval forever; cleared when a new
+    /// generation is encoded.
+    still_resent: bool,
     /// Pixel generation that was last encoded; used to skip re-
     /// encoding identical pixel data on subsequent ticks.
     last_encoded_gen: Option<u64>,
@@ -1111,6 +1121,49 @@ fn surface_send_interval(client: &ClientState) -> Duration {
 /// decoder reference chain for each, so one surface's keyframe says nothing
 /// about another's.  A surface with no sub state yet has been sent nothing
 /// and cannot decode a delta, so it owes one.
+/// Whether a settled surface should re-send the frame the client is already
+/// supposed to be looking at.
+///
+/// The encode loop skips a surface whose generation it has already encoded,
+/// which is right almost always and catastrophic in one case: if that frame
+/// never actually reached the client's screen, only new pixels can move the
+/// generation, and a still surface has none.  The client is then left on the
+/// frame *before* the one it wants, for as long as the surface stays still.
+///
+/// A frame can go missing anywhere along the path — a compositor commit
+/// dropped in a GPU fence window, a transport hiccup, a decoder holding the
+/// last chunk of a burst.  Rather than trust every producer, spend one
+/// keyframe once the surface has clearly settled.  `still_resent` latches it
+/// to exactly one per generation: a *periodic* refresh of a still picture was
+/// deliberately rejected, because it spends a keyframe every interval forever
+/// on a picture nobody is changing.
+///
+/// A surface that has never sent anything is not covered here — there is no
+/// frame to re-send, and its first keyframe is already owed via
+/// [`owes_keyframe`].
+fn should_resend_still(sub: &SurfaceSubState, now: Instant, after: Duration) -> bool {
+    !sub.still_resent
+        && sub
+            .last_sent_at
+            .is_some_and(|at| now.duration_since(at) >= after)
+}
+
+/// Fold an encode result into a sub's generation bookkeeping.
+///
+/// Advances `last_encoded_gen` only when the encode actually produced a
+/// bitstream — see [`encoded_generation`] — and re-arms the still-resend
+/// watchdog only when the mark genuinely moved.  That second condition is
+/// what keeps the watchdog a one-shot: its own re-encode replays the
+/// generation it just sent, so re-arming on every completion would turn it
+/// into the interval refresh it exists to avoid.
+fn record_encoded_generation(sub: &mut SurfaceSubState, generation: u64, produced_output: bool) {
+    let advanced = encoded_generation(sub.last_encoded_gen, generation, produced_output);
+    if advanced != sub.last_encoded_gen {
+        sub.still_resent = false;
+    }
+    sub.last_encoded_gen = advanced;
+}
+
 fn owes_keyframe(client: &ClientState, sid: u16) -> bool {
     !client
         .surface_subs
@@ -1180,6 +1233,11 @@ const WRITE_BLOCKED_CONGESTED_US: u64 = 25_000;
 const STILL_REFRESH_INTERVAL: Duration = Duration::from_millis(400);
 /// Smallest quantizer improvement worth spending a keyframe on.
 const STILL_REFINE_MIN_STEP: u8 = 16;
+/// How long a surface must sit still before the watchdog re-sends its last
+/// frame once.  Comfortably longer than the lulls between keystrokes and
+/// scroll gestures, so ordinary interaction never pays for it, while a
+/// genuinely stranded frame heals within a second.
+const STILL_RESEND_AFTER: Duration = Duration::from_millis(1000);
 
 /// Next quantizer when refining a frozen picture back toward the ceiling.
 ///
@@ -4008,8 +4066,20 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // step above bought an improvement, spend it; otherwise
                 // there is nothing to gain.
                 let still_refresh = unchanged && step.quantizer.is_some();
+                // …and if the surface has been settled for a while with
+                // nothing to refine, send it once anyway.  `unchanged` is
+                // trusting a frame it only knows was *encoded* — see
+                // `should_resend_still` for why that is not the same as the
+                // client having it, and why this fires once rather than on
+                // an interval.
+                let still_resend = unchanged
+                    && !still_refresh
+                    && client
+                        .surface_subs
+                        .get(&sid)
+                        .is_some_and(|s| should_resend_still(s, now, STILL_RESEND_AFTER));
                 if unchanged {
-                    if !still_refresh {
+                    if !still_refresh && !still_resend {
                         client.skip_same_gen_count = client.skip_same_gen_count.saturating_add(1);
                         continue;
                     }
@@ -4021,6 +4091,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // at it.  Delivery happens next tick, on the new
                         // generation.
                         pending_vulkan_keyframe_requests.push((sid as u32, work.cid));
+                        // The request *is* the action on this path, so latch
+                        // here.  `still_refresh` is rate-limited by the
+                        // controller's own interval, but the watchdog is not:
+                        // unlatched it would re-request every tick until the
+                        // recomposite lands.
+                        client.surface_subs.entry(sid).or_default().still_resent = true;
                         continue;
                     }
                 }
@@ -4097,13 +4173,19 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 if is_keyframe {
                                     s.has_keyframe = true;
                                 }
+                                s.last_sent_at = Some(now);
                                 s.burst_remaining = s.burst_remaining.saturating_sub(1);
                             }
                         }
                         encoded_client_surfaces.insert((work.cid, sid));
                         encode_dispatched_surfaces.insert(sid);
-                        client.surface_subs.entry(sid).or_default().last_encoded_gen =
-                            Some(frame_gen);
+                        // The bitstream was in hand on this path, so it always
+                        // counts as produced.
+                        record_encoded_generation(
+                            client.surface_subs.entry(sid).or_default(),
+                            frame_gen,
+                            true,
+                        );
                         continue;
                     }
                     // The session exists but has not produced a frame yet.
@@ -4380,7 +4462,14 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // A refresh has to be an IDR: a P-frame against an identical
                 // reference codes as skip blocks and refines nothing, however
                 // much finer the quantizer is.
-                let needs_kf = owes_keyframe || needs_new_encoder || still_refresh;
+                let needs_kf = owes_keyframe || needs_new_encoder || still_refresh || still_resend;
+                // Latch the watchdog here rather than at the gate: between
+                // the two are half a dozen `continue`s (pacing, in-flight
+                // encode, a snapshot at the wrong size), and marking it spent
+                // on a tick that dispatched nothing would waste the one shot.
+                if unchanged {
+                    client.surface_subs.entry(sid).or_default().still_resent = true;
+                }
                 encoded_client_surfaces.insert((work.cid, sid));
                 encode_dispatched_surfaces.insert(sid);
                 encode_jobs.push(EncodeJob {
@@ -4616,11 +4705,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                     // Record the generation we just encoded so we don't
                     // re-encode identical pixel data on subsequent ticks.
-                    state.last_encoded_gen = encoded_generation(
-                        state.last_encoded_gen,
-                        result.generation,
-                        result.nal_data.is_some(),
-                    );
+                    record_encoded_generation(state, result.generation, result.nal_data.is_some());
                 }
 
                 let Some((nal_data, is_keyframe)) = result.nal_data else {
@@ -4755,6 +4840,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         if is_keyframe {
                             s.has_keyframe = true;
                         }
+                        s.last_sent_at = Some(now);
                         s.burst_remaining = s.burst_remaining.saturating_sub(1);
                     }
                 }
@@ -12331,6 +12417,73 @@ mod tests {
             true,
         );
         assert_eq!(step.quantizer, None, "held until the queue drains");
+    }
+
+    #[test]
+    fn a_settled_surface_resends_its_last_frame_exactly_once() {
+        // The whole point: `unchanged` trusts a frame it only knows was
+        // encoded.  If that frame never reached the screen, no new pixels
+        // are coming to dislodge it, so spend one keyframe — and only one.
+        let after = Duration::from_millis(1000);
+        let now = Instant::now();
+        let mut sub = SurfaceSubState::default();
+
+        // Nothing sent yet: there is no frame to re-send, and the first
+        // keyframe is owed through a different route entirely.
+        assert!(!should_resend_still(&sub, now, after));
+
+        // Sent, but the surface has only just settled — an ordinary lull
+        // between keystrokes must not cost a keyframe.
+        sub.last_sent_at = Some(now - Duration::from_millis(999));
+        assert!(!should_resend_still(&sub, now, after));
+
+        // Settled long enough: fire.
+        sub.last_sent_at = Some(now - Duration::from_millis(1001));
+        assert!(should_resend_still(&sub, now, after));
+
+        // Latched.  A still picture that kept re-sending would spend a
+        // keyframe every interval forever on something nobody is changing —
+        // which is exactly why a periodic refresh was rejected.
+        sub.still_resent = true;
+        assert!(!should_resend_still(&sub, now, after));
+        sub.last_sent_at = Some(now - Duration::from_secs(3600));
+        assert!(
+            !should_resend_still(&sub, now, after),
+            "no amount of stillness un-latches it; only new pixels do",
+        );
+    }
+
+    #[test]
+    fn a_moved_picture_re_arms_the_watchdog_but_a_resend_does_not() {
+        // The re-send re-encodes the generation it just sent, so the encode
+        // completion sees the same value come back.  Re-arming on that would
+        // turn the one-shot into the interval refresh it exists to avoid.
+        let mut sub = SurfaceSubState {
+            last_encoded_gen: Some(7),
+            still_resent: true,
+            ..Default::default()
+        };
+
+        // The watchdog's own re-encode: same generation in, stays latched.
+        record_encoded_generation(&mut sub, 7, true);
+        assert_eq!(sub.last_encoded_gen, Some(7));
+        assert!(sub.still_resent, "a replay must not re-arm the watchdog");
+
+        // An encode that produced nothing leaves the mark alone, so it
+        // neither re-arms nor strands the frame — the invariant from the
+        // stranded-generation fix holding alongside this one.
+        record_encoded_generation(&mut sub, 9, false);
+        assert_eq!(sub.last_encoded_gen, Some(7), "nothing was sent");
+        assert!(
+            sub.still_resent,
+            "and nothing was shown, so nothing re-arms"
+        );
+
+        // New pixels actually encoded: the mark moves and the watchdog arms
+        // again for the new generation.
+        record_encoded_generation(&mut sub, 8, true);
+        assert_eq!(sub.last_encoded_gen, Some(8));
+        assert!(!sub.still_resent, "a moved picture re-arms it");
     }
 
     #[test]
