@@ -958,6 +958,17 @@ pub enum SurfaceCommand {
         /// Default: all codecs.
         #[arg(short, long, value_delimiter = ',')]
         codec: Vec<String>,
+
+        /// Ask for the surface at this size, as WIDTHxHEIGHT in physical
+        /// pixels (e.g. 5120x2880).  Default: whatever other viewers have
+        /// already negotiated.
+        ///
+        /// Recording writes the bitstream to a file rather than decoding it,
+        /// so this is also announced as the decode ceiling — which is what
+        /// lets a recording reach resolutions above the H.264 ceiling that
+        /// the server will not send to a client that hasn't asked.
+        #[arg(short, long)]
+        size: Option<String>,
     },
 }
 

@@ -181,18 +181,27 @@ BLIT_SURFACE_ENCODERS=av1-software
 BLIT_SURFACE_ENCODERS=av1-nvenc,h264-nvenc,h264-software
 ```
 
-| Value           | Codec | Backend          | Notes                                                |
-| --------------- | ----- | ---------------- | ---------------------------------------------------- |
-| `av1-nvenc`     | AV1   | NVIDIA NVENC     | RTX 40+ series; fastest AV1 encode                   |
-| `h264-nvenc`    | H.264 | NVIDIA NVENC     | Requires proprietary NVIDIA driver                   |
-| `av1-vaapi`     | AV1   | VA-API           | Intel/AMD GPU                                        |
-| `h264-vaapi`    | H.264 | VA-API           | Intel/AMD GPU; max 3840×2160                         |
-| `h264-software` | H.264 | openh264 or x264 | Max 3840×2160; build-time choice (x264 = GPL opt-in) |
-| `av1-software`  | AV1   | rav1e (software) | No resolution limit; CPU-heavy at high res           |
+| Value           | Codec | Backend          | Max resolution | Notes                                 |
+| --------------- | ----- | ---------------- | -------------- | ------------------------------------- |
+| `av1-nvenc`     | AV1   | NVIDIA NVENC     | 8192×4352      | RTX 40+ series; fastest AV1 encode    |
+| `h264-nvenc`    | H.264 | NVIDIA NVENC     | 3840×2160      | Requires proprietary NVIDIA driver    |
+| `av1-vaapi`     | AV1   | VA-API           | 8192×4352      | Intel/AMD GPU                         |
+| `h264-vaapi`    | H.264 | VA-API           | 3840×2160      | Intel/AMD GPU                         |
+| `h264-software` | H.264 | openh264 or x264 | 3840×2160      | Build-time choice (x264 = GPL opt-in) |
+| `av1-software`  | AV1   | rav1e (software) | 3840×2160      | CPU-bound; capped to stay interactive |
 
 The browser automatically detects the codec from each frame and configures
-its WebCodecs decoder accordingly. Clients can also advertise which codecs
-they support; the server skips encoders the client can't decode.
+its WebCodecs decoder accordingly. Clients advertise which codecs they
+support and the largest frame they can decode; the server skips encoders the
+client can't decode.
+
+The resolution ceiling is per viewer, not per surface. A surface is
+composited at whatever its most capable subscriber can receive — so an AV1
+client on a 5K display gets a native 5120×2880 stream — and any viewer whose
+encoder or decoder stops lower is served an aspect-preserving downscale of
+that same surface rather than dragging it down for everyone. Clients that
+don't report a decode ceiling (anything predating the field) stay at
+3840×2160.
 
 For `blit gateway` configuration, running as a systemd/launchd service, and Nix module setup, see [SERVICES.md](SERVICES.md) and [`nix/README.md`](nix/README.md).
 

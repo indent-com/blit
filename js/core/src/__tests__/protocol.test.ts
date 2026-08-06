@@ -16,6 +16,7 @@ import {
   buildCreate2Message,
   buildSurfaceAxis2Message,
   buildSurfaceSubscribeMessage,
+  buildClientFeaturesMessage,
 } from "../protocol";
 import {
   C2S_ACK,
@@ -34,6 +35,7 @@ import {
   CREATE2_HAS_CWD,
   C2S_SURFACE_POINTER_AXIS2,
   C2S_SURFACE_SUBSCRIBE,
+  C2S_CLIENT_FEATURES,
   AXIS_SOURCE_FINGER,
   AXIS_SOURCE_WHEEL,
   AXIS_FLAG_SOURCE_KNOWN,
@@ -428,5 +430,30 @@ describe("buildSurfaceSubscribeMessage", () => {
     // mediated anyway, so don't pay for the longer message.
     expect(buildSurfaceSubscribeMessage(1, 0, 0, 0, 320, 0)).toHaveLength(3);
     expect(buildSurfaceSubscribeMessage(1, 0, 0, 0, 0, 180)).toHaveLength(3);
+  });
+});
+
+/**
+ * C2S_CLIENT_FEATURES carries the decoder's frame-size ceiling alongside
+ * the codec bitmask.  The server holds an undeclared client to the H.264
+ * ceiling, so getting these bytes wrong silently caps every surface at 4K
+ * (or, worse, unlocks 5K for a decoder that can't take it).
+ */
+describe("buildClientFeaturesMessage", () => {
+  it("packs the decode ceiling as little-endian u16s", () => {
+    const msg = buildClientFeaturesMessage(0x03, 5120, 2880);
+    expect(msg).toHaveLength(6);
+    expect(msg[0]).toBe(C2S_CLIENT_FEATURES);
+    expect(msg[1]).toBe(0x03);
+    expect(msg[2] | (msg[3] << 8)).toBe(5120);
+    expect(msg[4] | (msg[5] << 8)).toBe(2880);
+  });
+
+  it("defaults the ceiling to zero, which the server reads as undeclared", () => {
+    const msg = buildClientFeaturesMessage(0x02);
+    expect(msg).toHaveLength(6);
+    expect(msg[1]).toBe(0x02);
+    expect(msg[2] | (msg[3] << 8)).toBe(0);
+    expect(msg[4] | (msg[5] << 8)).toBe(0);
   });
 });

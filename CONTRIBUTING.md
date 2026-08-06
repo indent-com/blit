@@ -287,8 +287,10 @@ Wayland app → compositor thread → CompositorEvent::SurfaceCommit
 - **NVENC AV1 / H.264** — NVIDIA GPU hardware encoding via CUDA + NVENC SDK (dlopen, no FFmpeg)
 - **AV1 VA-API** — Intel/AMD GPU hardware encoding via libva directly (dlopen, no FFmpeg)
 - **H.264 VA-API** — Intel/AMD GPU hardware encoding via libva directly (dlopen, no FFmpeg)
-- **AV1 (rav1e)** — software, handles odd dimensions
+- **AV1 (rav1e)** — software, handles odd dimensions. Capped at 3840x2160: rav1e has no limit of its own, but past 4K it stops keeping up.
 - **H.264 software (openh264 and/or x264)** — software fallback, max 3840x2160. Both are cargo features of `blit-server` (and `blit-cli`); default is `openh264` (MIT-friendly), release `-gpl` artifacts use `x264` (GPL-2.0-or-later, better compression). Build with neither and the software fallback is AV1-only.
+
+Hardware AV1 (NVENC, VA-API) goes to 8192x4352; everything else stops at 3840x2160. The ceiling is applied per viewer rather than per surface — `surface_encode_cap()` in `crates/server/src/lib.rs` resolves it from the backend that won the chain, and `mediated_size_for_surface()` composites for the widest ceiling across a surface's subscribers while `per_client_encode_target()` downscales into each viewer's own. A viewer's ceiling is also intersected with the decode size the client reports in `C2S_CLIENT_FEATURES`; clients that report nothing are held at 3840x2160.
 
 `BLIT_SURFACE_ENCODERS` is a comma-separated priority list. The server tries each in order and uses the first that succeeds. Default: `av1-nvenc,h264-nvenc,av1-vaapi,h264-vaapi,h264-software,av1-software`. `BLIT_SURFACE_BANDWIDTH` (low/medium/high/ultra, or a raw AV1 quantizer 10-255) is the ceiling on the bit budget — adaptation is always on and only moves cheaper than what you set, and `BLIT_SURFACE_SPEED` (slow/medium/fast/realtime, or a raw 10-255) controls how much encoder time a frame may cost. `BLIT_VAAPI_DEVICE` selects the VA-API render node (default `/dev/dri/renderD128`). `BLIT_CUDA_DEVICE` selects the CUDA device ordinal for NVENC (default `0`).
 

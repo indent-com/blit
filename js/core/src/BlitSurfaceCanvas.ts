@@ -25,6 +25,54 @@ import {
 /** Cached codec support bitmask.  Computed once, reused for all resize messages. */
 let _codecSupport: number | null = null;
 
+/**
+ * Largest frame any supported codec decoded in the probe, as [w, h].
+ * `[0, 0]` = nothing above 1080p was confirmed, which the server reads as
+ * "undeclared" and holds to the H.264 ceiling.
+ */
+let _maxDecode: [number, number] = [0, 0];
+
+/**
+ * Frame sizes to probe, largest first.  These are the ceilings the server
+ * will actually encode to, so probing anything between them would tell us
+ * nothing it could act on: the AV1 hardware ceiling, the 5K/6K panels that
+ * motivated raising it, and the H.264 ceiling below which the answer stops
+ * mattering.
+ */
+const DECODE_PROBE_SIZES: [number, number][] = [
+  [8192, 4352],
+  [6144, 3456],
+  [5120, 2880],
+  [3840, 2160],
+];
+
+/**
+ * AV1 `seq_level_idx` for a frame of this size at 60 fps, as the two-digit
+ * string a codec parameter wants.  Mirrors `av1_level_for()` on the server,
+ * which decides what the bitstream actually declares — probing at a level
+ * below what we would be sent would pass here and fail later, and probing
+ * above it under-reports on decoders that gate on level.
+ */
+function av1LevelString(width: number, height: number): string {
+  const sps = width * height * 60;
+  // [level, maxW, maxH, maxDecodeRate]
+  const specs: [string, number, number, number][] = [
+    ["00", 2048, 1152, 5529600],
+    ["01", 2816, 1152, 10454400],
+    ["04", 4352, 2448, 24969600],
+    ["05", 5504, 3096, 39938400],
+    ["08", 6144, 3456, 77856768],
+    ["09", 6144, 3456, 155713536],
+    ["12", 8192, 4352, 273715200],
+    ["13", 8192, 4352, 547430400],
+    ["16", 16384, 8704, 1176502272],
+  ];
+  for (const [level, maxW, maxH, maxRate] of specs) {
+    if (width <= maxW && height <= maxH && sps <= maxRate) return level;
+  }
+  return "16";
+}
+
 // Minimal 64×64 4:4:4 test frames for real-decode probing.
 // isConfigSupported() is unreliable for 4:4:4 — e.g. Chromium reports AV1
 // Professional Profile as supported but dav1d chokes on actual 4:4:4 OBUs.
@@ -161,11 +209,55 @@ export async function detectCodecSupport(): Promise<number> {
     }),
   );
 
+  // How large a frame can we actually decode?  The checks above only asked
+  // at 1080p, which says nothing about 4K or 5K — and the server will not
+  // composite a surface above the H.264 ceiling until we answer.  Probe
+  // each supported codec largest-first and report the best result: the
+  // server intersects it with the ceiling of whichever encoder it actually
+  // uses, so the maximum across codecs is the right thing to send.
+  //
+  // Only AV1 can exceed 3840x2160 server-side, so H.264 is probed at that
+  // ceiling and no further.
+  const sizesFor = (bit: number) =>
+    bit === CODEC_SUPPORT_AV1
+      ? DECODE_PROBE_SIZES
+      : DECODE_PROBE_SIZES.filter(([w, h]) => w <= 3840 && h <= 2160);
+  const perCodec = await Promise.all(
+    ([CODEC_SUPPORT_H264, CODEC_SUPPORT_AV1] as const)
+      .filter((bit) => mask & bit)
+      .map(async (bit): Promise<[number, number]> => {
+        for (const [w, h] of sizesFor(bit)) {
+          const codec =
+            bit === CODEC_SUPPORT_AV1
+              ? `av01.0.${av1LevelString(w, h)}M.08`
+              : "avc1.640034"; // High@5.2 — covers everything up to 4K
+          try {
+            const r = await VideoDecoder.isConfigSupported({
+              codec,
+              codedWidth: w,
+              codedHeight: h,
+            });
+            if (r.supported) return [w, h];
+          } catch {
+            // treat as unsupported at this size and try the next one down
+          }
+        }
+        return [0, 0];
+      }),
+  );
+  // Reduce after the fact rather than writing from each probe: the two run
+  // concurrently, and a smaller result landing last would under-report.
+  _maxDecode = perCodec.reduce<[number, number]>(
+    (best, got) => (got[0] * got[1] > best[0] * best[1] ? got : best),
+    [0, 0],
+  );
+
   _codecSupport = mask;
   console.log(
     `[blit] codec support: 0x${mask.toString(16).padStart(2, "0")} ` +
       `(h264=${!!(mask & CODEC_SUPPORT_H264)} av1=${!!(mask & CODEC_SUPPORT_AV1)} ` +
-      `h264-444=${!!(mask & CODEC_SUPPORT_H264_444)} av1-444=${!!(mask & CODEC_SUPPORT_AV1_444)})`,
+      `h264-444=${!!(mask & CODEC_SUPPORT_H264_444)} av1-444=${!!(mask & CODEC_SUPPORT_AV1_444)}) ` +
+      `max decode: ${_maxDecode[0]}x${_maxDecode[1]}`,
   );
   return mask;
 }
@@ -173,6 +265,14 @@ export async function detectCodecSupport(): Promise<number> {
 /** Return the cached codec support, or 0 if not yet probed. */
 export function getCodecSupport(): number {
   return _codecSupport ?? 0;
+}
+
+/**
+ * Largest frame the probe confirmed this browser can decode, as [w, h].
+ * `[0, 0]` before probing, or when nothing above 1080p was confirmed.
+ */
+export function getMaxDecodeSize(): [number, number] {
+  return _maxDecode;
 }
 
 // ---------------------------------------------------------------------------
