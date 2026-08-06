@@ -1525,6 +1525,14 @@ impl VulkanVideoEncoder {
         let is_key = self.force_idr || force_keyframe || self.frame_num == 0;
         if is_key {
             self.force_idr = false;
+            // A keyframe restarts the GOP, so restart the state it is
+            // built from before anything reads it.  Resetting only after
+            // the encode sent a forced mid-GOP key to the driver with a
+            // stale `current_frame_id`/`ref_frame_id` while its deltas
+            // then counted from 0 — the driver's DPB slot no longer
+            // matched what those deltas declared, and what came back was
+            // flagged on the wire as a keyframe without decoding as one.
+            self.frame_num = 0;
         }
 
         // Allocate command buffer.
@@ -1545,15 +1553,8 @@ impl VulkanVideoEncoder {
         // Reset query pool.
         unsafe { device.cmd_reset_query_pool(cb, self.query_pool, 0, 1) };
 
-        // 7-bit order hint.  A keyframe restarts the GOP at 0 — `frame_num`
-        // is only reset *after* this encode, so without the `is_key` arm a
-        // forced keyframe would carry the stale hint and its deltas would
-        // then count backwards from it.
-        let order_hint = if is_key {
-            0
-        } else {
-            (self.frame_num & 0x7F) as u8
-        };
+        // 7-bit order hint; 0 on a keyframe, since frame_num was reset.
+        let order_hint = (self.frame_num & 0x7F) as u8;
 
         // --- DPB setup ---
         let setup_dpb_idx = self.cur_dpb_idx;
@@ -1672,7 +1673,7 @@ impl VulkanVideoEncoder {
         // Fill AV1 encode picture info
         // ---------------------------------------------------------------
         let mut pic_flags = StdVideoEncodeAV1PictureInfoFlags::new();
-        pic_flags.set_error_resilient_mode(is_key);
+        pic_flags.set_error_resilient_mode(true);
         pic_flags.set_force_integer_mv(is_key);
         pic_flags.set_show_frame(true);
         // Frame size is the coded extent; tell decoders the display size
@@ -1713,7 +1714,7 @@ impl VulkanVideoEncoder {
             frame_presentation_time: 0,
             current_frame_id: self.frame_num,
             order_hint,
-            primary_ref_frame: if is_key { 7 } else { 0 }, // 7 = PRIMARY_REF_NONE
+            primary_ref_frame: 7, // PRIMARY_REF_NONE: no CDF inheritance
             refresh_frame_flags: if is_key {
                 0xFF
             } else {
@@ -1947,9 +1948,9 @@ impl VulkanVideoEncoder {
         }
         bitstream.extend_from_slice(slices);
 
-        // Update state.
+        // Update state.  frame_num was already reset for a keyframe before
+        // the encode — every std structure above carried the 0.
         if is_key {
-            self.frame_num = 0;
             self.idr_num = self.idr_num.wrapping_add(1);
             // refresh_frame_flags was 0xFF: every slot now holds this frame.
             self.ref_order_hints = [order_hint; 8];
