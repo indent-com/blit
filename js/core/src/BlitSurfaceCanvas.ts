@@ -309,8 +309,18 @@ const WHEEL_DETENT_PX = 120;
  * Long enough to bridge the frame cadence of a macOS momentum tail so one
  * flick stays one gesture, short enough that the app settles promptly
  * once the tail decays.
+ *
+ * Also deliberately past Chromium's `kFlingStartTimeoutMs` of 200ms: it
+ * turns `axis_stop` into a fling whose velocity it regresses from the
+ * last few frames, unless the gap since the last of them exceeds that.
+ * macOS has already appended its own momentum by the time we see these
+ * events, so a fling on top of it is a second helping — the page sails
+ * past where the tail left it, and stopping with fingers still down
+ * flings at the speed you were going before you stopped. Touch drags
+ * still want kinetic scrolling and are unaffected: they end their
+ * sequence on `touchend` rather than waiting out this timer.
  */
-const SCROLL_STOP_MS = 140;
+const SCROLL_STOP_MS = 280;
 
 /**
  * Framework-agnostic surface canvas. Manages a `<canvas>` element that renders
@@ -1634,6 +1644,13 @@ export class BlitSurfaceCanvas {
    * Without this the app never learns a scroll ended, so toolkits that
    * gate kinetic scrolling on a stop event either keep flinging or never
    * settle. Claiming a `finger` source obliges us to send it.
+   *
+   * A notched wheel gets no stop: the protocol says a `wheel` sequence
+   * may or may not be terminated and that clients must not rely on it,
+   * and a wheel has no finger-lift moment to report anyway. Sending one
+   * only gives toolkits a reason to invent momentum — Chromium starts a
+   * fling off any `axis_stop`, without checking the source when it has a
+   * single frame of history to regress.
    */
   private endScrollSequence(): void {
     if (this.scrollStopTimer !== null) {
@@ -1649,6 +1666,7 @@ export class BlitSurfaceCanvas {
     this.scrollSmoothLatch = false;
     if (!this.scrollSequenceOpen) return;
     this.scrollSequenceOpen = false;
+    if (!wasSmooth) return;
     const conn = this.getConn();
     if (!conn || !this.surface) return;
     conn.sendSurfaceAxis2(this._surfaceId, {
@@ -1656,7 +1674,7 @@ export class BlitSurfaceCanvas {
       dy: 0,
       v120x: 0,
       v120y: 0,
-      source: wasSmooth ? AXIS_SOURCE_FINGER : AXIS_SOURCE_WHEEL,
+      source: AXIS_SOURCE_FINGER,
       stop: true,
     });
   }

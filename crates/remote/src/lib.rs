@@ -2820,9 +2820,11 @@ pub fn msg_surface_pointer_axis(surface_id: u16, axis: u8, value_x100: i32) -> V
 
 /// A scroll event as it travels the wire and reaches the compositor.
 ///
-/// Distances are in surface-logical pixels; `v120_*` counts detents in
-/// 120ths. `source` is `None` when the sender did not classify the device,
-/// in which case no `wl_pointer.axis_source` is emitted.
+/// Distances are in the composited frame's pixel space, like pointer
+/// motion — the compositor converts them to surface-logical pixels on the
+/// way out. `v120_*` counts detents in 120ths. `source` is `None` when the
+/// sender did not classify the device, in which case no
+/// `wl_pointer.axis_source` is emitted.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PointerAxisEvent {
     pub surface_id: u16,
