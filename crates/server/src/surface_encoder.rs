@@ -1198,14 +1198,11 @@ impl SurfaceEncoder {
     }
 
     /// Whether this encoder can consume `PixelData::Nv12OpaqueFd`, i.e.
-    /// take NV12 straight out of a Vulkan `OPAQUE_FD` allocation with no CPU
-    /// copy.  Only NVENC can: CUDA is the sole importer of that handle type.
-    ///
-    /// Only for 4:2:0 sessions: NVENC has no 4:4:4 zero-copy input format,
-    /// and a 4:4:4 session handed NV12 rejects every picture with
-    /// INVALID_PARAM — the encoder then rebuilds in a loop, delivering a
-    /// frame or two per rebuild.  A 4:4:4 session takes the CPU YUV444
-    /// path instead.
+    /// take YUV straight out of a Vulkan `OPAQUE_FD` allocation with no CPU
+    /// copy.  Only NVENC can: CUDA is the sole importer of that handle
+    /// type.  The buffer's layout must match the session — NV12 for 4:2:0,
+    /// planar YUV444 for 4:4:4 — which is what `opaque_wants_444` reports;
+    /// the target registration carries it to the compositor.
     ///
     /// `BLIT_NVENC_ZEROCOPY=0` forces this off, so both the zero-copy and
     /// the BGRA-downscale arm can be measured against one binary.
@@ -1214,8 +1211,7 @@ impl SurfaceEncoder {
         if !matches!(
             self.kind,
             SurfaceEncoderKind::NvencH264(_) | SurfaceEncoderKind::NvencAV1(_)
-        ) || self.chroma.is_444()
-        {
+        ) {
             return false;
         }
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1231,6 +1227,13 @@ impl SurfaceEncoder {
     #[cfg(not(target_os = "linux"))]
     pub fn wants_nv12_opaque_fd(&self) -> bool {
         false
+    }
+
+    /// Which OPAQUE_FD layout this encoder's session consumes: planar
+    /// YUV444 for a 4:4:4 session, NV12 otherwise.  Only meaningful when
+    /// `wants_nv12_opaque_fd` is true.
+    pub fn opaque_wants_444(&self) -> bool {
+        self.chroma.is_444()
     }
 
     /// Get GBM-allocated LINEAR BGRA buffers for zero-copy compositor→encoder.
@@ -1439,6 +1442,7 @@ impl SurfaceEncoder {
                 uv_offset,
                 width,
                 height,
+                is_444,
                 sync_fd,
             } => {
                 use std::os::fd::AsRawFd;
@@ -1451,6 +1455,7 @@ impl SurfaceEncoder {
                             *uv_offset,
                             *width,
                             *height,
+                            *is_444,
                             sync_fd.as_ref().map(|s| s.as_raw_fd()),
                         ),
                     _ => {

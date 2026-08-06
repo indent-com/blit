@@ -65,6 +65,7 @@ mod stub {
             uv_offset: u32,
             width: u32,
             height: u32,
+            is_444: bool,
             sync_fd: Option<Arc<OwnedFd>>,
         },
         VaSurface {
@@ -282,6 +283,7 @@ mod stub {
             native_w: u32,
             native_h: u32,
             want_nv12_opaque: bool,
+            opaque_is_444: bool,
         },
         RestampTarget {
             surface_id: u32,

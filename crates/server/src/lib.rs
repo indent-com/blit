@@ -846,13 +846,17 @@ fn encode_capture(pixels: &[u8], width: u32, height: u32, format: u8, quality: u
 /// A subscriber at a different size is irrelevant — it reads its own key.
 fn nv12_opaque_safe_for_target(
     this_wants: bool,
+    this_444: bool,
     target: (u32, u32),
-    others: impl Iterator<Item = (Option<(u32, u32)>, bool)>,
+    others: impl Iterator<Item = (Option<(u32, u32)>, bool, bool)>,
 ) -> bool {
+    // Every subscriber sharing the target must not only take an OPAQUE_FD
+    // buffer but agree on its layout — a 4:2:0 session cannot read the
+    // planar YUV444 buffer a 4:4:4 neighbour needs, and vice versa.
     this_wants
-        && others
-            .into_iter()
-            .all(|(their_target, they_want)| their_target != Some(target) || they_want)
+        && others.into_iter().all(|(their_target, they_want, their_444)| {
+            their_target != Some(target) || (they_want && their_444 == this_444)
+        })
 }
 
 async fn request_surface_capture_with_timeout(
@@ -897,6 +901,19 @@ struct SurfaceSubState {
     /// missed during that window would be read as "can take NV12" and
     /// handed a buffer it cannot map.
     wants_nv12_opaque: bool,
+    /// The OPAQUE_FD layout this subscriber's session consumes (444 =
+    /// planar YUV444).  Meaningful only with `wants_nv12_opaque`; recorded
+    /// for the same reason.
+    wants_opaque_444: bool,
+    /// Until this instant, CPU-origin (BGRA/RGBA) frames are skipped for a
+    /// zero-copy-capable session rather than CPU-converted: the target
+    /// registration just sent implies a recomposite whose GPU-converted
+    /// frame arrives within a frame period, and encoding the interim BGRA
+    /// would put the whole conversion on the CPU for nothing.  Past the
+    /// deadline the zero-copy install evidently failed (export refusal,
+    /// Vulkan Video owns the image) and CPU conversion is the only path
+    /// left, so the gate lifts rather than starving the stream.
+    zero_copy_wait_until: Option<Instant>,
     /// Next tick this surface may send a frame (pacing deadline).
     next_send_at: Option<Instant>,
     /// Frames remaining in the post-subscribe burst window that
@@ -2659,7 +2676,7 @@ impl Session {
     /// buffer out from under clients still registered at that size, and it
     /// leaves survivors on BGRA until something unrelated re-registers them.
     fn resettle_downscale_target(&mut self, surface_id: u16, tw: u32, th: u32) {
-        let survivors: Vec<(bool, (u32, u32))> = self
+        let survivors: Vec<(bool, bool, (u32, u32))> = self
             .clients
             .values()
             .filter_map(|c| {
@@ -2667,6 +2684,7 @@ impl Session {
                 (s.last_registered_target == Some((tw, th))).then(|| {
                     (
                         s.wants_nv12_opaque,
+                        s.wants_opaque_444,
                         s.last_registered_native.unwrap_or((tw, th)),
                     )
                 })
@@ -2675,7 +2693,7 @@ impl Session {
         let Some(cs) = self.compositor.as_mut() else {
             return;
         };
-        if let Some(&(_, (native_w, native_h))) = survivors.first() {
+        if let Some(&(_, first_444, (native_w, native_h))) = survivors.first() {
             let _ = cs.handle.command_tx.send(
                 blit_compositor::CompositorCommand::RegisterDownscaleTarget {
                     surface_id: surface_id as u32,
@@ -2683,7 +2701,12 @@ impl Session {
                     target_h: th,
                     native_w,
                     native_h,
-                    want_nv12_opaque: survivors.iter().all(|(w, _)| *w),
+                    // Zero-copy needs unanimity on both taking the buffer
+                    // and its layout; a format split falls back to BGRA.
+                    want_nv12_opaque: survivors
+                        .iter()
+                        .all(|(w, is444, _)| *w && *is444 == first_444),
+                    opaque_is_444: first_444,
                 },
             );
         } else {
@@ -5217,14 +5240,38 @@ async fn tick(state: &AppState) -> TickOutcome {
                         .map(|lp| (lp.pixels.clone(), lp.encoder_skip))
                 };
                 // A cache-only entry (on-demand BGRA readback over a live
-                // NV12 zero-copy stream) must not be encoded — wrong color
-                // range for the stream.  Don't advance last_encoded_gen:
-                // the next zero-copy publish supersedes this entry within
-                // a frame period.
+                // NV12 zero-copy stream) must not be encoded — the stream
+                // already carries this frame.  Don't advance
+                // last_encoded_gen: the next zero-copy publish supersedes
+                // this entry within a frame period.
                 if matches!(cached, Some((_, true))) {
                     continue;
                 }
                 let cached = cached.map(|(p, _)| p);
+                // CPU-origin pixels for a zero-copy session, inside the
+                // post-registration grace window: wait for the
+                // GPU-converted frame instead of CPU-converting.  See
+                // `zero_copy_wait_until`.
+                if cached
+                    .as_ref()
+                    .is_some_and(|p| {
+                        matches!(
+                            p,
+                            blit_compositor::PixelData::Bgra(_)
+                                | blit_compositor::PixelData::Rgba(_)
+                        )
+                    })
+                    && sess
+                        .clients
+                        .get(&work.cid)
+                        .and_then(|c| c.surface_subs.get(&sid))
+                        .is_some_and(|s| {
+                            s.wants_nv12_opaque
+                                && s.zero_copy_wait_until.is_some_and(|t| Instant::now() < t)
+                        })
+                {
+                    continue;
+                }
                 let Some(pixels) = cached else {
                     // Nothing will fill this entry on its own: an idle
                     // Wayland app repaints only when a configure changes its
@@ -6270,8 +6317,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // Computed before the compositor borrow below, which
                     // takes `sess` mutably.
                     let encoder_wants_nv12_opaque = encoder.wants_nv12_opaque_fd();
+                    let encoder_opaque_444 = encoder.opaque_wants_444();
                     let want_nv12_opaque = nv12_opaque_safe_for_target(
                         encoder_wants_nv12_opaque,
+                        encoder_opaque_444,
                         (tw, th),
                         sess.clients
                             .iter()
@@ -6279,8 +6328,14 @@ async fn tick(state: &AppState) -> TickOutcome {
                             .map(|(_, c)| {
                                 c.surface_subs
                                     .get(&result.sid)
-                                    .map(|s| (s.last_registered_target, s.wants_nv12_opaque))
-                                    .unwrap_or((None, true))
+                                    .map(|s| {
+                                        (
+                                            s.last_registered_target,
+                                            s.wants_nv12_opaque,
+                                            s.wants_opaque_444,
+                                        )
+                                    })
+                                    .unwrap_or((None, true, encoder_opaque_444))
                             }),
                     );
                     if let Some(bufs) = external_bufs
@@ -6322,6 +6377,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 native_w: result.native_w,
                                 native_h: result.native_h,
                                 want_nv12_opaque,
+                                opaque_is_444: encoder_opaque_444,
                             },
                         );
                         cs.handle.wake();
@@ -6336,6 +6392,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // "no" we only arrived at because of a third party
                         // that has since gone away.
                         s.wants_nv12_opaque = encoder_wants_nv12_opaque;
+                        s.wants_opaque_444 = encoder_opaque_444;
+                        if encoder_wants_nv12_opaque {
+                            s.zero_copy_wait_until =
+                                Some(Instant::now() + Duration::from_millis(500));
+                        }
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -11859,15 +11920,21 @@ mod tests {
 
         #[test]
         fn sole_nvenc_subscriber_gets_it() {
-            assert!(nv12_opaque_safe_for_target(true, T, std::iter::empty()));
+            assert!(nv12_opaque_safe_for_target(
+                true,
+                false,
+                T,
+                std::iter::empty()
+            ));
         }
 
         #[test]
         fn a_non_nvenc_encoder_at_the_same_size_rules_it_out() {
             assert!(!nv12_opaque_safe_for_target(
                 true,
+                false,
                 T,
-                [(Some(T), false)].into_iter()
+                [(Some(T), false, false)].into_iter()
             ));
         }
 
@@ -11875,8 +11942,9 @@ mod tests {
         fn all_nvenc_subscribers_keep_it() {
             assert!(nv12_opaque_safe_for_target(
                 true,
+                false,
                 T,
-                [(Some(T), true), (Some(T), true)].into_iter()
+                [(Some(T), true, false), (Some(T), true, false)].into_iter()
             ));
         }
 
@@ -11885,8 +11953,9 @@ mod tests {
             // It reads its own (sid, w, h) key, which still carries BGRA.
             assert!(nv12_opaque_safe_for_target(
                 true,
+                false,
                 T,
-                [(Some((640, 360)), false), (None, false)].into_iter()
+                [(Some((640, 360)), false, false), (None, false, false)].into_iter()
             ));
         }
 
@@ -11894,8 +11963,14 @@ mod tests {
         fn one_dissenter_among_many_is_enough() {
             assert!(!nv12_opaque_safe_for_target(
                 true,
+                false,
                 T,
-                [(Some(T), true), (Some(T), false), (Some(T), true)].into_iter()
+                [
+                    (Some(T), true, false),
+                    (Some(T), false, false),
+                    (Some(T), true, false)
+                ]
+                .into_iter()
             ));
         }
 
@@ -11903,8 +11978,31 @@ mod tests {
         fn a_non_nvenc_encoder_never_asks_for_it() {
             assert!(!nv12_opaque_safe_for_target(
                 false,
+                false,
                 T,
-                [(Some(T), true)].into_iter()
+                [(Some(T), true, false)].into_iter()
+            ));
+        }
+
+        #[test]
+        fn a_chroma_format_split_rules_it_out() {
+            // One session needs NV12, the other planar YUV444 — one
+            // shared buffer cannot serve both layouts.
+            assert!(!nv12_opaque_safe_for_target(
+                true,
+                true,
+                T,
+                [(Some(T), true, false)].into_iter()
+            ));
+        }
+
+        #[test]
+        fn matching_444_subscribers_keep_it() {
+            assert!(nv12_opaque_safe_for_target(
+                true,
+                true,
+                T,
+                [(Some(T), true, true)].into_iter()
             ));
         }
     }

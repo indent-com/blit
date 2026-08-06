@@ -84,6 +84,8 @@ pub(crate) struct VulkanRenderer {
 
     // BGRA→NV12 compute pipeline — buffer path (linear NV12)
     compute_pipeline: vk::Pipeline,
+    /// BGRA→planar YUV444 buffer pipeline — the 4:4:4 OPAQUE_FD targets.
+    compute_yuv444_pipeline: vk::Pipeline,
     compute_pipeline_layout: vk::PipelineLayout,
     compute_descriptor_set_layout: vk::DescriptorSetLayout,
 
@@ -417,6 +419,7 @@ static VERT_SPV: &[u8] = include_bytes!("shaders/composite.vert.spv");
 static FRAG_SPV: &[u8] = include_bytes!("shaders/composite.frag.spv");
 
 static NV12_COMP_SPV: &[u8] = include_bytes!("shaders/bgra_to_nv12.comp.spv");
+static YUV444_COMP_SPV: &[u8] = include_bytes!("shaders/bgra_to_yuv444.comp.spv");
 
 static NV12_IMAGE_COMP_SPV: &[u8] = include_bytes!("shaders/bgra_to_nv12_image.comp.spv");
 /// 4:4:4 twin of the above: same two-plane shape and descriptor layout, but
@@ -835,12 +838,14 @@ impl VulkanRenderer {
                 .ok()?
         };
 
-        // Push constants: src_width, src_height, y_stride, uv_offset,
-        // enc_width, enc_height (6 × u32 = 24 bytes).
+        // Push constants: sized for the larger of the two buffer-target
+        // shaders — NV12 uses 6 × u32 (24 bytes), YUV444 7 × u32 (28).
+        // A layout range may exceed what a shader declares, so both
+        // pipelines share this layout.
         let compute_push_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(24);
+            .size(28);
         let compute_pl_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(std::slice::from_ref(&compute_descriptor_set_layout))
             .push_constant_ranges(std::slice::from_ref(&compute_push_range));
@@ -866,6 +871,32 @@ impl VulkanRenderer {
         };
         unsafe {
             device.destroy_shader_module(comp_mod, None);
+        }
+
+        // BGRA→YUV444 (planar, 3 full-resolution planes) into the same
+        // buffer-target shape — the 4:4:4 flavour of the OPAQUE_FD
+        // zero-copy path.  Same descriptor layout, one extra push u32.
+        let comp_444_code = Self::spirv_from_bytes(YUV444_COMP_SPV)?;
+        let comp_444_info = vk::ShaderModuleCreateInfo::default().code(&comp_444_code);
+        let comp_444_mod = unsafe { device.create_shader_module(&comp_444_info, None).ok()? };
+        let comp_444_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(comp_444_mod)
+            .name(comp_entry_name);
+        let compute_yuv444_pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(comp_444_stage)
+            .layout(compute_pipeline_layout);
+        let compute_yuv444_pipeline = unsafe {
+            device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[compute_yuv444_pipeline_info],
+                    None,
+                )
+                .ok()?[0]
+        };
+        unsafe {
+            device.destroy_shader_module(comp_444_mod, None);
         }
 
         // -----------------------------------------------------------
@@ -1081,6 +1112,7 @@ impl VulkanRenderer {
             descriptor_set_layout,
             descriptor_pool,
             compute_pipeline,
+            compute_yuv444_pipeline,
             compute_pipeline_layout,
             compute_descriptor_set_layout,
             compute_image_pipeline,
@@ -1626,6 +1658,7 @@ impl VulkanRenderer {
                     buffers[0].height,
                     // VA-API is the consumer here; it imports dma_bufs.
                     Nv12Export::DmaBuf,
+                    false,
                 );
             }
         }
@@ -1698,6 +1731,7 @@ impl VulkanRenderer {
         target_h: u32,
         native: (u32, u32),
         want_nv12_opaque: bool,
+        opaque_is_444: bool,
     ) {
         // A Vulkan Video encoder on this surface encodes from its own image,
         // so nothing would ever read the NV12 buffer we were asked for.
@@ -1716,10 +1750,20 @@ impl VulkanRenderer {
             // re-registers to say so. Returning early here would freeze the
             // first subscriber's answer for the target's whole life and
             // hand the newcomer GPU-only memory it cannot map.
-            let has_nv12 = self
+            // Format matters as much as existence: a 4:2:0 slot serving a
+            // subscriber that now wants 4:4:4 (or vice versa) would hand
+            // the encoder planes in the wrong geometry.
+            let slot_format = self
                 .nv12_opaque_slot(surface_id, target_w, target_h)
-                .is_some();
-            if want_nv12_opaque && !has_nv12 {
+                .and_then(|idx| {
+                    self.nv12_opaque_outputs
+                        .get(&(surface_id, target_w, target_h))
+                        .map(|(v, _)| v[idx].is_444)
+                });
+            if want_nv12_opaque && slot_format != Some(opaque_is_444) {
+                if slot_format.is_some() {
+                    self.destroy_nv12_outputs_for_target(surface_id, target_w, target_h);
+                }
                 self.create_nv12_outputs(
                     surface_id,
                     target_w,
@@ -1727,8 +1771,9 @@ impl VulkanRenderer {
                     target_w,
                     target_h,
                     Nv12Export::OpaqueFd,
+                    opaque_is_444,
                 );
-            } else if !want_nv12_opaque && has_nv12 {
+            } else if !want_nv12_opaque && slot_format.is_some() {
                 eprintln!(
                     "[vulkan-render] sid {surface_id} {target_w}x{target_h}: dropping NV12 \
                      opaque-fd target, a subscriber needs CPU pixels",
@@ -1758,6 +1803,7 @@ impl VulkanRenderer {
                 target_w,
                 target_h,
                 Nv12Export::OpaqueFd,
+                opaque_is_444,
             );
             let ok = self
                 .nv12_opaque_outputs
@@ -2493,6 +2539,7 @@ impl VulkanRenderer {
         w: u32,
         h: u32,
         export: Nv12Export,
+        is_444: bool,
     ) {
         // DMA-BUF export needs the dma_buf extensions; OPAQUE_FD does not,
         // and must not be gated on them — an NVIDIA-only host is exactly
@@ -2548,10 +2595,17 @@ impl VulkanRenderer {
         };
         let Some(get_fd_fp) = get_fd_fp else { return };
 
-        // NV12: stride aligned to 64 bytes, Y = stride*h, UV = stride*h/2.
+        // Stride aligned to 64 bytes.  NV12: Y = stride*h then interleaved
+        // UV at half height.  YUV444: three full planes, U at stride*h and
+        // V at 2*stride*h — `uv_offset` names the first chroma plane in
+        // both layouts, which is also where NVENC expects it.
         let stride = (w + 63) & !63;
         let uv_offset = stride * h;
-        let buf_size = (stride * h * 3 / 2) as u64;
+        let buf_size = if is_444 {
+            (stride * h * 3) as u64
+        } else {
+            (stride * h * 3 / 2) as u64
+        };
 
         for _ in 0..3 {
             let Some(nv12) = (|| -> Option<Nv12Output> {
@@ -2673,7 +2727,7 @@ impl VulkanRenderer {
                     descriptor_set,
                     width: w,
                     height: h,
-                    is_444: false,
+                    is_444,
                     kind: Nv12OutputKind::Buffer {
                         buffer,
                         memory,
@@ -2704,7 +2758,8 @@ impl VulkanRenderer {
             .get(&(surface_id, target_w, target_h))
             .map_or(0, |(v, _)| v.len());
         eprintln!(
-            "[vulkan-render] created {count} NV12 buffers {w}x{h} stride={stride} uv_offset={uv_offset} for target {target_w}x{target_h}",
+            "[vulkan-render] created {count} {} buffers {w}x{h} stride={stride} uv_offset={uv_offset} for target {target_w}x{target_h}",
+            if is_444 { "YUV444" } else { "NV12" },
         );
     }
 
@@ -3515,7 +3570,11 @@ impl VulkanRenderer {
             self.device.cmd_bind_pipeline(
                 cb,
                 vk::PipelineBindPoint::COMPUTE,
-                self.compute_pipeline,
+                if nv12.is_444 {
+                    self.compute_yuv444_pipeline
+                } else {
+                    self.compute_pipeline
+                },
             );
             self.device.cmd_bind_descriptor_sets(
                 cb,
@@ -3525,13 +3584,28 @@ impl VulkanRenderer {
                 &[nv12.descriptor_set],
                 &[],
             );
-            let push = [src_w, src_h, *stride, *uv_offset, enc_w, enc_h];
+            // YUV444 takes (…, u_offset, v_offset, …); NV12 a single
+            // uv_offset.  The planes share one stride, so V follows U by
+            // exactly one plane.
+            let push: Vec<u32> = if nv12.is_444 {
+                vec![
+                    src_w,
+                    src_h,
+                    *stride,
+                    *uv_offset,
+                    *uv_offset * 2,
+                    enc_w,
+                    enc_h,
+                ]
+            } else {
+                vec![src_w, src_h, *stride, *uv_offset, enc_w, enc_h]
+            };
             self.device.cmd_push_constants(
                 cb,
                 self.compute_pipeline_layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
-                std::slice::from_raw_parts(push.as_ptr() as *const u8, 24),
+                std::slice::from_raw_parts(push.as_ptr() as *const u8, push.len() * 4),
             );
             self.device
                 .cmd_dispatch(cb, enc_w.div_ceil(16), enc_h.div_ceil(16), 1);
@@ -6462,6 +6536,7 @@ impl VulkanRenderer {
                     uv_offset,
                     width: nv12.width,
                     height: nv12.height,
+                    is_444: nv12.is_444,
                     sync_fd: Some(sync),
                 },
                 false,
@@ -6664,6 +6739,8 @@ impl Drop for VulkanRenderer {
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.device.destroy_pipeline(self.compute_pipeline, None);
+            self.device
+                .destroy_pipeline(self.compute_yuv444_pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.compute_pipeline_layout, None);
             self.device

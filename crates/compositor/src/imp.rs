@@ -171,6 +171,12 @@ pub enum PixelData {
         uv_offset: u32,
         width: u32,
         height: u32,
+        /// Plane layout: false = NV12 (Y + interleaved half-height UV at
+        /// `uv_offset`); true = planar YUV444 (U at `uv_offset`, V one
+        /// full plane later).  The consumer must register the matching
+        /// NVENC buffer format — a mismatch reads chroma from the wrong
+        /// rows and NVENC rejects or garbles the picture.
+        is_444: bool,
         /// sync_file exported from the fence guarding the BGRA→NV12 compute
         /// dispatch. The consumer MUST poll this before reading: nothing
         /// else orders CUDA's reads against the compositor's writes, and an
@@ -715,6 +721,10 @@ pub enum CompositorCommand {
         native_w: u32,
         native_h: u32,
         want_nv12_opaque: bool,
+        /// With `want_nv12_opaque`: the layout the consuming session
+        /// expects — planar YUV444 for a 4:4:4 NVENC session, NV12
+        /// otherwise.  Ignored when `want_nv12_opaque` is false.
+        opaque_is_444: bool,
     },
     /// Re-stamp an already-registered target with the composite size it is
     /// now the right inscription of, without touching its buffers.
@@ -3511,6 +3521,7 @@ impl Compositor {
                 native_w,
                 native_h,
                 want_nv12_opaque,
+                opaque_is_444,
             } => {
                 if let Some(ref mut vk) = self.vulkan_renderer {
                     vk.register_downscale_target(
@@ -3519,6 +3530,7 @@ impl Compositor {
                         target_h,
                         (native_w, native_h),
                         want_nv12_opaque,
+                        opaque_is_444,
                     );
                 }
                 // See the SetExternalOutputBuffers handler above for

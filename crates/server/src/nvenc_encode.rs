@@ -1406,13 +1406,35 @@ impl NvencDirectEncoder {
         uv_offset: u32,
         width: u32,
         height: u32,
+        is_444: bool,
         sync_fd: Option<std::os::fd::RawFd>,
     ) -> Option<(Vec<u8>, bool)> {
-        // NVENC's NV12 layout has no independent UV offset: the chroma
-        // plane is assumed to start at exactly stride*height. The compute
-        // shader already writes that layout, so a mismatch means the two
-        // sides have drifted apart and the encode would sample chroma from
-        // the wrong place — better to refuse than to emit wrong colour.
+        // The buffer's format must match the session's chroma: NVENC
+        // rejects (or worse, garbles) a picture whose registered format
+        // disagrees with the encode config.  A mismatch means the server's
+        // target registration and this encoder have drifted apart.
+        if is_444 != !self.cuda_registered_yuv444.is_null() {
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[nvenc-zerocopy] buffer is_444={is_444} but session is {}; refusing",
+                    if self.cuda_registered_yuv444.is_null() {
+                        "4:2:0"
+                    } else {
+                        "4:4:4"
+                    },
+                );
+            }
+            return None;
+        }
+        // Neither layout has an independent chroma offset: NVENC assumes
+        // the first chroma plane starts at exactly stride*height (NV12
+        // interleaved UV, or the YUV444 U plane with V one plane later).
+        // The compute shaders write that layout, so a mismatch means the
+        // two sides have drifted apart and the encode would sample chroma
+        // from the wrong place — better to refuse than to emit wrong
+        // colour.
         if uv_offset != stride * height {
             static LOGGED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
@@ -1474,14 +1496,15 @@ impl NvencDirectEncoder {
             return None;
         }
 
-        let registered = match self.nv12_import(cuda, fd, buf_id, stride, height, enc_w, enc_h) {
-            Some(r) => r,
-            None => {
-                let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
-                unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
-                return None;
-            }
-        };
+        let registered =
+            match self.nv12_import(cuda, fd, buf_id, stride, height, enc_w, enc_h, is_444) {
+                Some(r) => r,
+                None => {
+                    let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
+                    unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+                    return None;
+                }
+            };
 
         // Map, encode, unmap. The registration is cached; the mapping is
         // per-frame, as NVENC requires.
@@ -1508,7 +1531,15 @@ impl NvencDirectEncoder {
         w64(&mut pic_buf, 24, self.frame_idx as u64);
         wptr(&mut pic_buf, 40, mapped_resource);
         wptr(&mut pic_buf, 48, self.output_buffer);
-        w32(&mut pic_buf, 64, NV_ENC_BUFFER_FORMAT_NV12);
+        w32(
+            &mut pic_buf,
+            64,
+            if is_444 {
+                NV_ENC_BUFFER_FORMAT_YUV444
+            } else {
+                NV_ENC_BUFFER_FORMAT_NV12
+            },
+        );
         w32(&mut pic_buf, 68, 1); // NV_ENC_PIC_STRUCT_FRAME
         if self.force_idr {
             // OUTPUT_SPSPPS (0x4) so AV1 keyframes carry the sequence
@@ -1585,6 +1616,7 @@ impl NvencDirectEncoder {
         height: u32,
         enc_w: u32,
         enc_h: u32,
+        is_444: bool,
     ) -> Option<*mut c_void> {
         if let Some(prev) = self.nv12_imports.get(&buf_id) {
             return Some(prev.registered);
@@ -1617,7 +1649,11 @@ impl NvencDirectEncoder {
             }
         }
 
-        let buf_size = (stride as u64) * (height as u64) * 3 / 2;
+        let buf_size = if is_444 {
+            (stride as u64) * (height as u64) * 3
+        } else {
+            (stride as u64) * (height as u64) * 3 / 2
+        };
 
         // CUDA takes ownership of the fd on success, so hand it a dup —
         // the compositor still owns the original and reuses it every frame.
@@ -1665,7 +1701,15 @@ impl NvencDirectEncoder {
         w32(&mut reg_buf, 12, enc_h);
         w32(&mut reg_buf, 16, stride);
         wptr(&mut reg_buf, 24, devptr as *mut c_void);
-        w32(&mut reg_buf, 40, NV_ENC_BUFFER_FORMAT_NV12);
+        w32(
+            &mut reg_buf,
+            40,
+            if is_444 {
+                NV_ENC_BUFFER_FORMAT_YUV444
+            } else {
+                NV_ENC_BUFFER_FORMAT_NV12
+            },
+        );
         let nv_status = unsafe {
             (self.fns.nvEncRegisterResource)(self.encoder, reg_buf.as_mut_ptr() as *mut c_void)
         };
@@ -1678,7 +1722,8 @@ impl NvencDirectEncoder {
 
         if self.verbose {
             eprintln!(
-                "[nvenc-zerocopy] imported NV12 buf_id={buf_id} {enc_w}x{enc_h} stride={stride} size={buf_size}",
+                "[nvenc-zerocopy] imported {} buf_id={buf_id} {enc_w}x{enc_h} stride={stride} size={buf_size}",
+                if is_444 { "YUV444" } else { "NV12" },
             );
         }
         self.nv12_imports.insert(
