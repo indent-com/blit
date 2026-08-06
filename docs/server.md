@@ -4,22 +4,23 @@
 
 ## Configuration
 
-| Variable                 | Default                                            | Purpose                                                                                |
-| ------------------------ | -------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `BLIT_SOCK`              | see path cascade in [transports.md](transports.md) | Unix socket listen path                                                                |
-| `SHELL`                  | `$SHELL` or `/bin/sh`                              | Shell spawned for new PTYs                                                             |
-| `BLIT_SHELL_FLAGS`       | `li` (Unix) / `` (Windows)                         | Shell invocation flags                                                                 |
-| `BLIT_SCROLLBACK`        | `1000000`                                          | Scrollback buffer rows per PTY                                                         |
-| `BLIT_VAAPI_DEVICE`      | `/dev/dri/renderD128`                              | VA-API render node for encoding                                                        |
-| `BLIT_CUDA_DEVICE`       | `0`                                                | CUDA device ordinal (NVENC)                                                            |
-| `BLIT_FD_CHANNEL`        | unset                                              | fd-channel file descriptor                                                             |
-| `BLIT_EXPORT_SOCK`       | unset                                              | `1` exports the socket path as `BLIT_SOCK` in spawned terminals (also `--export-sock`) |
-| `BLIT_INJECT_PATH`       | unset                                              | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)     |
-| `BLIT_SURFACE_ENCODERS`  | see encoder table                                  | Comma-separated encoder priority                                                       |
-| `BLIT_SURFACE_BANDWIDTH` | `medium`                                           | Ceiling on video bandwidth (adaptation only goes cheaper)                              |
-| `BLIT_SURFACE_SPEED`     | `realtime`                                         | Encoder speed preset                                                                   |
-| `BLIT_MAX_CONNECTIONS`   | `0` (unlimited)                                    | Reject client connections past this count                                              |
-| `BLIT_MAX_PTYS`          | `0` (unlimited)                                    | Refuse `CREATE` past this many PTYs across all clients                                 |
+| Variable                       | Default                                            | Purpose                                                                                |
+| ------------------------------ | -------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `BLIT_SOCK`                    | see path cascade in [transports.md](transports.md) | Unix socket listen path                                                                |
+| `SHELL`                        | `$SHELL` or `/bin/sh`                              | Shell spawned for new PTYs                                                             |
+| `BLIT_SHELL_FLAGS`             | `li` (Unix) / `` (Windows)                         | Shell invocation flags                                                                 |
+| `BLIT_SCROLLBACK`              | `1000000`                                          | Scrollback buffer rows per PTY                                                         |
+| `BLIT_VAAPI_DEVICE`            | `/dev/dri/renderD128`                              | VA-API render node for encoding                                                        |
+| `BLIT_CUDA_DEVICE`             | `0`                                                | CUDA device ordinal (NVENC)                                                            |
+| `BLIT_FD_CHANNEL`              | unset                                              | fd-channel file descriptor                                                             |
+| `BLIT_EXPORT_SOCK`             | unset                                              | `1` exports the socket path as `BLIT_SOCK` in spawned terminals (also `--export-sock`) |
+| `BLIT_INJECT_PATH`             | unset                                              | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)     |
+| `BLIT_SURFACE_ENCODERS`        | see encoder table                                  | Comma-separated encoder priority                                                       |
+| `BLIT_SURFACE_BANDWIDTH`       | `medium`                                           | Ceiling on video bandwidth (adaptation only goes cheaper)                              |
+| `BLIT_SURFACE_SPEED`           | `realtime`                                         | Encoder speed preset                                                                   |
+| `BLIT_MAX_CONNECTIONS`         | `0` (unlimited)                                    | Reject client connections past this count                                              |
+| `BLIT_MAX_PTYS`                | `0` (unlimited)                                    | Refuse `CREATE` past this many PTYs across all clients                                 |
+| `BLIT_ENCODE_FENCE_TIMEOUT_MS` | `10000`                                            | Give up on a Vulkan encode submission after this long (`0` = wait forever)             |
 
 `BLIT_MAX_CONNECTIONS` and `BLIT_MAX_PTYS` are an operator sanity bound against
 runaway automation, not a security control — a client that can open one PTY can
