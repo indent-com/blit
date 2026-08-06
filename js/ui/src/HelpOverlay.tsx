@@ -32,7 +32,7 @@ export function HelpOverlay(props: {
         [`${mod}+Shift+Enter`, t("help.newTerminalHere")],
         [`Ctrl+Shift+Q`, t("help.removeFromPane")],
         [`Ctrl+Alt+Shift+Q`, t("help.closeTerminal")],
-        ["Alt+Shift+[ / ]", t("help.prevNextTerminal")],
+        ["Alt+Shift+[ / ]", t("help.prevNextWindow")],
         ["Ctrl+[ / ]", t("help.prevNextPane")],
         ["Ctrl+Shift+V", t("help.paste")],
         ["Ctrl+Shift+E", t("help.dockExplorer")],

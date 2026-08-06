@@ -1248,6 +1248,42 @@ function WorkspaceScreen(props: {
     for (const a of localTabs()) take(a);
     return out.slice(0, BACKGROUND_TILES_MAX);
   });
+  /**
+   * Everything open, in the order Alt+Shift+[ / ] walks it: terminals, then
+   * surfaces, then tabs — the dock's own top-to-bottom order, so the chord
+   * agrees with what the eye already scanned. Terminals and surfaces are
+   * listed in their arrival order, which is what those two signals already
+   * hold.
+   *
+   * The tab block cannot simply follow `openTabs`, which is ordered by
+   * recency: displaying a tab re-registers it (the effect below), so walking
+   * the ring would float each tab to the front as it was reached and leave the
+   * chord ping-ponging between the last two it touched. So a tab keeps the
+   * slot it had on the previous pass and only newcomers append — the sequence
+   * they were opened in, which holds still because opening is the only thing
+   * that changes it. Solid hands the previous value to the memo, so the order
+   * is carried without a signal of its own.
+   */
+  const cycleRing = createMemo<string[]>((prev) => {
+    const out: string[] = [];
+    for (const s of sessions()) if (s.state !== "closed") out.push(s.id);
+    // Subsurfaces are composited into their parent — only a top-level window
+    // is somewhere focus can land.
+    for (const s of surfaces()) {
+      if (s.parentId === 0) {
+        out.push(surfaceAssignment(s.connectionId, s.surfaceId));
+      }
+    }
+    const tabs = new Set<string>();
+    for (const tab of openTabs()) tabs.add(tab.assignment);
+    for (const a of localTabs()) tabs.add(a);
+    // `delete` returns whether it was there, so this both keeps the old order
+    // and leaves only the newcomers behind — and a tab that has closed drops
+    // out, rather than holding its slot forever.
+    for (const a of prev) if (tabs.delete(a)) out.push(a);
+    out.push(...tabs);
+    return out;
+  }, []);
   // One prev/next pass over the displayed set (pane assignments plus the
   // non-BSP active tile) serves two jobs:
   //
@@ -1980,15 +2016,17 @@ function WorkspaceScreen(props: {
   }
 
   /**
-   * Drop a pane assignment onto the main view when there is no BSP layout to
-   * aim at. Single-pane mode has exactly one destination, so this does what
-   * clicking the dragged card would have done — dispatching on the assignment
-   * kind, because "the main view" means a different slot for each: activeTile
-   * for a tile, the focused surface for a surface, the focused session for a
-   * terminal. All three already dismiss the other two, so the modes can't
-   * overlap.
+   * Show an assignment of any kind, wherever "here" currently is — the focused
+   * BSP pane, or the single main view. This is the one entry point that does
+   * not care what it is holding: it dispatches on the assignment kind, because
+   * each has its own slot (activeTile for a tile, the focused surface for a
+   * surface, the focused session for a terminal), and each of the three
+   * functions below already knows how to place itself in a pane as well.
+   * All three dismiss the other two slots, so the modes can't overlap.
+   *
+   * Used by both drags that land on the main view and Alt+Shift+[ / ].
    */
-  function dropAssignmentIntoMainView(assignment: string) {
+  function focusAssignment(assignment: string) {
     const surface = parseSurfaceAssignment(assignment);
     if (surface) {
       focusSurface(surface.surfaceId, surface.connectionId);
@@ -2000,6 +2038,30 @@ function WorkspaceScreen(props: {
     }
     // Everything else in the assignment namespace is a bare session id.
     switchSession(assignment as SessionId);
+  }
+  /**
+   * What the slot those chords act on is showing right now: the focused BSP
+   * pane's occupant, or — with no layout — whichever of the three single-view
+   * slots is in use. Null when it holds nothing (a parked view), which makes
+   * the next cycle step enter the ring at its near end instead of skipping one.
+   */
+  function focusedAssignment(): string | null {
+    const paneId = bspFocusedPaneId();
+    if (activeLayout() && paneId) {
+      return layoutAssignments()?.assignments[paneId] ?? null;
+    }
+    const tile = activeTile();
+    if (tile) return tile;
+    const surfaceId = focusedSurfaceId();
+    if (surfaceId != null) {
+      const connId =
+        focusedSurfaceConnId() ??
+        surfaces().find((s) => s.surfaceId === surfaceId)?.connectionId;
+      if (connId) return surfaceAssignment(connId, surfaceId);
+    }
+    // Not wsState().focusedSessionId: the core always keeps *some* session
+    // focused, so only the main view's own slot can say "nothing here".
+    return mainViewSessionId();
   }
   /** Highlight shown while a drag hovers the non-BSP main view (BSP panes draw
    *  their own, per pane). */
@@ -3027,9 +3089,9 @@ function WorkspaceScreen(props: {
     openNewTerminalPicker,
     handleRestartOrClose,
     connectionCount: () => allConnections().length,
-    focusBySession: (sessionId) => {
-      focusSessionFromUi(sessionId);
-    },
+    cycleRing,
+    focusedAssignment,
+    focusAssignment,
     clearFocusedPaneAssignment: () => {
       const paneId = bspFocusedPaneId();
       if (paneId) clearPaneAssignmentFn?.(paneId);
@@ -3448,7 +3510,7 @@ function WorkspaceScreen(props: {
                 const assignment = tileDragAssignment(e);
                 if (!assignment) return;
                 e.preventDefault();
-                dropAssignmentIntoMainView(assignment);
+                focusAssignment(assignment);
               }}
             >
               <Show when={mainViewDragOver()}>

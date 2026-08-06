@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { forwardWebPaneCloseShortcut } from "../webPaneShortcuts";
+import { forwardWebPaneWorkspaceShortcut } from "../webPaneShortcuts";
 
-describe("forwardWebPaneCloseShortcut", () => {
+describe("forwardWebPaneWorkspaceShortcut", () => {
   it("relays Ctrl+Alt+Shift+Q and claims the pane before dispatch", () => {
     const source = new KeyboardEvent("keydown", {
       key: "Q",
@@ -24,7 +24,9 @@ describe("forwardWebPaneCloseShortcut", () => {
       event.preventDefault();
     });
 
-    expect(forwardWebPaneCloseShortcut(source, claimFocus, target)).toBe(true);
+    expect(forwardWebPaneWorkspaceShortcut(source, claimFocus, target)).toBe(
+      true,
+    );
     expect(order).toEqual(["claim", "dispatch"]);
     expect(claimFocus).toHaveBeenCalledOnce();
     expect(source.defaultPrevented).toBe(true);
@@ -39,7 +41,7 @@ describe("forwardWebPaneCloseShortcut", () => {
       shiftKey: true,
     });
     expect(
-      forwardWebPaneCloseShortcut(event, () => {}, new EventTarget()),
+      forwardWebPaneWorkspaceShortcut(event, () => {}, new EventTarget()),
     ).toBe(true);
   });
 
@@ -62,10 +64,43 @@ describe("forwardWebPaneCloseShortcut", () => {
     });
     target.addEventListener("keydown", listener);
 
-    expect(forwardWebPaneCloseShortcut(source, claimFocus, target)).toBe(true);
+    expect(forwardWebPaneWorkspaceShortcut(source, claimFocus, target)).toBe(
+      true,
+    );
     expect(claimFocus).toHaveBeenCalledOnce();
     expect(listener).toHaveBeenCalledOnce();
     expect(source.defaultPrevented).toBe(true);
+  });
+
+  it("relays Alt+Shift+[ / ] so a page cannot trap focus", () => {
+    for (const code of ["BracketLeft", "BracketRight"]) {
+      const source = new KeyboardEvent("keydown", {
+        // Alt rewrites [ and ] to " and ' on a Mac; only the code is reliable.
+        key: code === "BracketLeft" ? "“" : "‘",
+        code,
+        altKey: true,
+        shiftKey: true,
+        cancelable: true,
+      });
+      const target = new EventTarget();
+      const claimFocus = vi.fn();
+      const listener = vi.fn((raw: Event) => {
+        const event = raw as KeyboardEvent;
+        expect(event.code).toBe(code);
+        expect(event.altKey).toBe(true);
+        expect(event.shiftKey).toBe(true);
+        expect(event.ctrlKey).toBe(false);
+        event.preventDefault();
+      });
+      target.addEventListener("keydown", listener);
+
+      expect(forwardWebPaneWorkspaceShortcut(source, claimFocus, target)).toBe(
+        true,
+      );
+      expect(claimFocus).toHaveBeenCalledOnce();
+      expect(listener).toHaveBeenCalledOnce();
+      expect(source.defaultPrevented).toBe(true);
+    }
   });
 
   it("leaves all other iframe keyboard events alone", () => {
@@ -85,9 +120,21 @@ describe("forwardWebPaneCloseShortcut", () => {
         shiftKey: true,
         metaKey: true,
       },
+      // Bracket chords the page keeps: Ctrl+[ / ] is BSP's own pane cycle,
+      // handled in the workspace document, and a bare [ is just typing.
+      { key: "[", code: "BracketLeft" },
+      { key: "[", code: "BracketLeft", altKey: true },
+      { key: "[", code: "BracketLeft", ctrlKey: true, shiftKey: true },
+      {
+        key: "[",
+        code: "BracketLeft",
+        ctrlKey: true,
+        altKey: true,
+        shiftKey: true,
+      },
     ]) {
       expect(
-        forwardWebPaneCloseShortcut(
+        forwardWebPaneWorkspaceShortcut(
           new KeyboardEvent("keydown", init),
           claimFocus,
           target,

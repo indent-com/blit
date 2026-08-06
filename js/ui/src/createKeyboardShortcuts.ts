@@ -48,8 +48,16 @@ export interface KeyboardShortcutHandlers {
   openNewTerminalPicker: (paneId?: string) => void;
   handleRestartOrClose: () => void;
   connectionCount: () => number;
-  /** Focus a session by ID, updating BSP pane focus if a layout is active */
-  focusBySession: (sessionId: SessionId) => void;
+  /**
+   * Everything open, as pane assignments, in a stable order: terminals, then
+   * Wayland surfaces, then tabs (editors, diffs, commits, web panes). This is
+   * the ring Alt+Shift+[ / ] walks.
+   */
+  cycleRing: () => readonly string[];
+  /** What the focused slot (BSP pane, or the single main view) is showing. */
+  focusedAssignment: () => string | null;
+  /** Show an assignment of any kind in the focused slot, and focus it. */
+  focusAssignment: (assignment: string) => void;
   /** Clear the assignment for the focused BSP pane (remove term without closing) */
   clearFocusedPaneAssignment: () => void;
   /**
@@ -85,6 +93,37 @@ export function shouldHandleNewTerminalShortcut(
   h: SurfaceFocusHandlers,
 ): boolean {
   return !hasFocusedWaylandSurface(h);
+}
+
+/**
+ * The next thing Alt+Shift+[ / ] should show in the focused slot, or null when
+ * there is nothing to move to.
+ *
+ * `ring` is everything open; `displayedElsewhere` is what the OTHER BSP panes
+ * are already showing, which is excluded — the chord rotates the focused pane's
+ * occupant, tiling-WM style, and pulling in a window that is already on screen
+ * beside it would only shuffle the two. In single-pane mode nothing is
+ * elsewhere, so the ring is walked whole.
+ *
+ * `current` outside the ring (nothing focused, or a parked view) enters at the
+ * near end rather than skipping the first step.
+ */
+export function nextCycleTarget(
+  ring: readonly string[],
+  current: string | null,
+  direction: 1 | -1,
+  displayedElsewhere: ReadonlySet<string> = new Set(),
+): string | null {
+  const candidates = ring.filter((a) => !displayedElsewhere.has(a));
+  if (candidates.length === 0) return null;
+  const index = current == null ? -1 : candidates.indexOf(current);
+  if (index < 0) {
+    return direction === 1 ? candidates[0] : candidates[candidates.length - 1];
+  }
+  if (candidates.length < 2) return null;
+  return candidates[
+    (index + direction + candidates.length) % candidates.length
+  ];
 }
 
 /**
@@ -358,7 +397,10 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
         if (fid) void h.workspace.closeSession(fid);
         return;
       }
-      // Prev/next terminal: Alt+Shift+[ / ] on all platforms.
+      // Prev/next window: Alt+Shift+[ / ] on all platforms. "Window" is every
+      // kind the workspace holds — terminals, Wayland surfaces, editors, diffs,
+      // commits, web panes — not just terminals, so the chord reaches whatever
+      // is open rather than stranding you on the one kind it knew about.
       // Avoids browser tab-switching (Cmd/Ctrl+Shift+[/]) on Mac and Windows.
       // Use e.code (physical key) rather than e.key because Alt on Mac
       // transforms [ to " and ] to '.
@@ -370,61 +412,21 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
         (e.code === "BracketLeft" || e.code === "BracketRight")
       ) {
         e.preventDefault();
-        // When a surface is focused, cycling leaves the surface first.
-        if (h.focusedSurfaceId() != null) {
-          h.unfocusSurface();
-          return;
-        }
-        const all = h
-          .sessions()
-          .filter((s) => s.state !== "closed")
-          .map((s) => s.id);
-        if (all.length === 0) return;
-        const currentId = h.focusedSessionId();
-        const la = h.layoutAssignments();
         const fpId = h.bspFocusedPaneId();
+        const la = h.layoutAssignments();
+        const elsewhere = new Set<string>();
         if (la && fpId) {
-          // BSP layout active: rotate sessions within the focused pane.
-          // The candidate pool is sessions not locked into a *different* pane.
-          const assignedElsewhere = new Set(
-            Object.entries(la.assignments)
-              .filter(([pid, sid]) => pid !== fpId && sid != null)
-              .map(([, sid]) => sid as string),
-          );
-          const candidates = all.filter((id) => !assignedElsewhere.has(id));
-          if (candidates.length === 0) return;
-          const index = currentId ? candidates.indexOf(currentId) : -1;
-          if (index >= 0 && candidates.length < 2) return;
-          let nextId: string;
-          if (index < 0) {
-            nextId =
-              e.code === "BracketRight"
-                ? candidates[0]
-                : candidates[candidates.length - 1];
-          } else {
-            nextId =
-              e.code === "BracketRight"
-                ? candidates[(index + 1) % candidates.length]
-                : candidates[
-                    (index - 1 + candidates.length) % candidates.length
-                  ];
+          for (const [pid, value] of Object.entries(la.assignments)) {
+            if (pid !== fpId && value != null) elsewhere.add(value);
           }
-          h.focusBySession(nextId);
-        } else {
-          // No layout: simple global cycle.
-          const index = currentId ? all.indexOf(currentId) : -1;
-          if (index >= 0 && all.length < 2) return;
-          let nextId: string;
-          if (index < 0) {
-            nextId = e.code === "BracketRight" ? all[0] : all[all.length - 1];
-          } else {
-            nextId =
-              e.code === "BracketRight"
-                ? all[(index + 1) % all.length]
-                : all[(index - 1 + all.length) % all.length];
-          }
-          h.focusBySession(nextId);
         }
+        const next = nextCycleTarget(
+          h.cycleRing(),
+          h.focusedAssignment(),
+          e.code === "BracketRight" ? 1 : -1,
+          elsewhere,
+        );
+        if (next != null) h.focusAssignment(next);
         return;
       }
       if (e.key === "Escape") {

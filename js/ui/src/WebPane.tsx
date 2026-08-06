@@ -6,7 +6,7 @@ import {
   previewIframeUrl,
   webLocationLabel,
 } from "./preview";
-import { forwardWebPaneCloseShortcut } from "./webPaneShortcuts";
+import { forwardWebPaneWorkspaceShortcut } from "./webPaneShortcuts";
 
 export interface WebPaneState {
   /** Where the frame currently is, on the target's own terms (`/dashboard`). */
@@ -232,12 +232,13 @@ export function WebPane(props: WebPaneProps): JSX.Element {
     if (!doc) return;
     const claim = () => props.onFocusRequest?.();
     // Keyboard events stop at an iframe document; they do not bubble into the
-    // workspace window where createKeyboardShortcuts listens. Relay the
-    // pane removal chords so a focused browser pane behaves like every other
-    // focused tile. Keep this deliberately narrow: previewed apps retain all
-    // of their ordinary keyboard input and shortcuts.
+    // workspace window where createKeyboardShortcuts listens. Relay the pane
+    // removal and prev/next-window chords so a focused browser pane behaves
+    // like every other focused tile — and so a page that takes the keyboard is
+    // still one chord away from being left. Keep this deliberately narrow:
+    // previewed apps retain all of their ordinary keyboard input and shortcuts.
     const forwardWorkspaceShortcut = (event: KeyboardEvent) =>
-      forwardWebPaneCloseShortcut(event, claim);
+      forwardWebPaneWorkspaceShortcut(event, claim);
     doc.addEventListener("pointerdown", claim, true);
     doc.addEventListener("focusin", claim, true);
     doc.addEventListener("keydown", forwardWorkspaceShortcut, true);
