@@ -5358,6 +5358,40 @@ impl VulkanRenderer {
                     .is_some();
                 if !wanted_now && zero_copy_live {
                     // fall through to cleanup
+                } else if !wanted_now
+                    && self.vulkan_video_owns(pending.surface_id)
+                    && !self.downscale_outputs.contains_key(&(
+                        pending.surface_id,
+                        pending.phys_w,
+                        pending.phys_h,
+                    ))
+                {
+                    // A Vulkan Video encoder owns this surface and no
+                    // server-side encoder registered a target at the
+                    // composite size, so nothing downstream reads CPU
+                    // pixels — the encoder works from the GPU image. Copying
+                    // the staging buffer here moved `phys_w * phys_h * 4`
+                    // per frame (8.29 MB at 1080p, ~500 MB/s at 60fps) into
+                    // a Vec that was dropped unread.
+                    //
+                    // Publish the commit without the pixels rather than
+                    // publishing nothing: the server drives sizes, its
+                    // generation counter, and the `last_pixels` entry that
+                    // gates encoder creation off `SurfaceCommit`, so a
+                    // surface that skipped the publish entirely would never
+                    // be given an encoder at all — no commit, no encoder, no
+                    // target, no commit.
+                    //
+                    // Both conditions are re-checked every frame, so a
+                    // subscriber that later needs CPU pixels restores the
+                    // BGRA publish on the next composite by registering its
+                    // target; `wanted_now` covers `surface capture` asking
+                    // on demand.
+                    //
+                    // `encoder_skip` for the same reason the zero-copy arm
+                    // sets it: this frame exists to carry the commit, and
+                    // there are no pixels behind it for an encoder to read.
+                    results.push((pending.phys_w, pending.phys_h, PixelData::GpuOnly, true));
                 } else {
                     let size = pending.phys_w as usize * pending.phys_h as usize * 4;
                     let bgra =

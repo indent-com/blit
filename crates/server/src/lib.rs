@@ -5904,6 +5904,14 @@ async fn tick(state: &AppState) -> TickOutcome {
                     let cs = sess.compositor.as_ref().unwrap();
                     cs.last_pixels
                         .get(&(sid, px_w, px_h))
+                        // A GPU-only commit carries no CPU pixels: the
+                        // compositor skipped the readback because a Vulkan
+                        // Video encoder owned the surface and nothing had
+                        // registered a target needing them.  This client
+                        // wants a server-side encoder, so treat it as a miss
+                        // — the recomposite below asks for the native BGRA
+                        // publish that fills the entry for real.
+                        .filter(|lp| !matches!(lp.pixels, blit_compositor::PixelData::GpuOnly))
                         .map(|lp| (lp.pixels.clone(), lp.encoder_skip))
                 };
                 // A cache-only entry (on-demand BGRA readback over a live
