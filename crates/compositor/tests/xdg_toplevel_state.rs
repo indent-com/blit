@@ -31,6 +31,11 @@ struct App {
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     /// Every configure the server sent, as (width, height, states).
     configures: Vec<(i32, i32, Vec<u32>)>,
+    /// The capabilities the server advertised, if it did.
+    capabilities: Option<Vec<u32>>,
+    /// How many configures had arrived by the time they showed up -- the
+    /// protocol requires them before the first one.
+    configures_before_capabilities: usize,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for App {
@@ -54,8 +59,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
                     Some(registry.bind::<wl_compositor::WlCompositor, _, _>(name, 4, qh, ()));
             }
             "xdg_wm_base" => {
+                // Bind high, like Chromium does: wm_capabilities is a v5
+                // event, and a v1 binding would never see it.
                 state.wm_base =
-                    Some(registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 1, qh, ()));
+                    Some(registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 5, qh, ()));
             }
             _ => {}
         }
@@ -101,17 +108,22 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for App {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let xdg_toplevel::Event::Configure {
-            width,
-            height,
-            states,
-        } = event
-        {
-            let states = states
-                .chunks_exact(4)
+        let words = |raw: Vec<u8>| -> Vec<u32> {
+            raw.chunks_exact(4)
                 .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            state.configures.push((width, height, states));
+                .collect()
+        };
+        match event {
+            xdg_toplevel::Event::Configure {
+                width,
+                height,
+                states,
+            } => state.configures.push((width, height, words(states))),
+            xdg_toplevel::Event::WmCapabilities { capabilities } => {
+                state.configures_before_capabilities = state.configures.len();
+                state.capabilities = Some(words(capabilities));
+            }
+            _ => {}
         }
     }
 }
@@ -255,6 +267,50 @@ fn maximize_requests_are_answered_without_changing_anything() {
             "{name} answered with {states:?}, expected activated + maximized"
         );
     }
+}
+
+/// xdg_toplevel.wm_capabilities values, which are their own enum -- not the
+/// state numbers above.
+const CAP_WINDOW_MENU: u32 = 1;
+const CAP_MAXIMIZE: u32 = 2;
+const CAP_FULLSCREEN: u32 = 3;
+const CAP_MINIMIZE: u32 = 4;
+
+#[test]
+fn only_the_capabilities_we_honour_are_advertised() {
+    let fixture = Fixture::new();
+    let caps = fixture.app.capabilities.clone().expect(
+        "xdg-shell v5 requires wm_capabilities; a client that never \
+                 hears it assumes every request works",
+    );
+
+    // The one request that does something.  Without it advertised, a client
+    // hides its fullscreen button and the user cannot ask at all.
+    assert!(
+        caps.contains(&CAP_FULLSCREEN),
+        "fullscreen missing from {caps:?}; clients will hide the button"
+    );
+    // The rest are declined, so the buttons that trigger them should not be
+    // drawn.  Minimize especially: it is the one that used to strand a pane.
+    for (name, cap) in [
+        ("minimize", CAP_MINIMIZE),
+        ("maximize", CAP_MAXIMIZE),
+        ("window_menu", CAP_WINDOW_MENU),
+    ] {
+        assert!(
+            !caps.contains(&cap),
+            "{name} advertised in {caps:?} but the request is declined"
+        );
+    }
+
+    // "Compositors must send this event once before the first
+    // xdg_surface.configure event."
+    assert_eq!(
+        fixture.app.configures_before_capabilities, 0,
+        "wm_capabilities arrived after {} configure(s); clients latch \
+         capabilities when the first configure is acked",
+        fixture.app.configures_before_capabilities
+    );
 }
 
 #[test]

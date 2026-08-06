@@ -3718,6 +3718,15 @@ fn xdg_toplevel_states(states: &[xdg_toplevel::State]) -> Vec<u8> {
     bytes
 }
 
+/// Encode xdg_toplevel wm_capabilities the same way -- native-endian u32s.
+fn xdg_wm_capabilities(caps: &[xdg_toplevel::WmCapabilities]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(caps.len() * 4);
+    for cap in caps {
+        bytes.extend_from_slice(&(*cap as u32).to_ne_bytes());
+    }
+    bytes
+}
+
 fn create_keymap_fd(keymap_data: &[u8]) -> Option<OwnedFd> {
     use std::io::Write;
     let name = c"blit-keymap";
@@ -4261,6 +4270,17 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for Compositor {
                 state
                     .toplevel_surface_ids
                     .insert(surface_id, data.wl_surface_id.clone());
+
+                // Say up front which of the state requests are worth making,
+                // so a client can leave the rest out of its titlebar instead
+                // of drawing buttons that do nothing.  Fullscreen is the only
+                // one we honour; a pane cannot be minimized or unmaximized.
+                // This has to precede the first xdg_surface.configure.
+                if toplevel.version() >= 5 {
+                    toplevel.wm_capabilities(xdg_wm_capabilities(&[
+                        xdg_toplevel::WmCapabilities::Fullscreen,
+                    ]));
+                }
 
                 // Use a per-surface size if one was already configured
                 // (e.g. the browser sent C2S_SURFACE_RESIZE before the
