@@ -107,7 +107,7 @@ export const S2C_GIT_FETCH = 0xb4;
 /** `S2C_HELLO` feature bit: server supports the `GIT_*` message family. */
 export const FEATURE_GIT = 1 << 7;
 
-// One status table for every `status` byte in the family (docs/git.md).
+// Common status registry (docs/protocol.md), plus Git's declared family values.
 export const GIT_STATUS_OK = 0;
 export const GIT_STATUS_UNKNOWN_ID = 1;
 export const GIT_STATUS_NOT_FOUND = 2;
@@ -1933,7 +1933,7 @@ export function isGitPseudoRef(name: string): boolean {
   return !name.startsWith("refs/");
 }
 
-/** Human-readable unified-status text. */
+/** Human-readable common-status text. */
 export function gitStatusText(status: number): string {
   switch (status) {
     case GIT_STATUS_UNKNOWN_ID:

@@ -108,11 +108,10 @@ exactly one path: writes and ops address the empty string — the root
 file itself — anything else answers `INVALID`, and `MKPARENTS` is a
 no-op (the parent exists by construction; the watch sits on it).
 
-`FS_DONE.status`: the unified git/lsp status table, **not** `FS_SYNCED`'s
-grandfathered `0`–`4` — writes need `WRONG_TYPE` / `TOO_LARGE` /
-`BUDGET` / `INVALID`, and the unified table is already the family
-standard for git and lsp. One code is added, in lsp's `10 WARMING`
-extension style:
+`FS_DONE.status`: the
+[common status registry](../protocol.md#common-status-registry), **not**
+`FS_SYNCED`'s grandfathered `0`–`4` — writes need `WRONG_TYPE` /
+`TOO_LARGE` / `BUDGET` / `INVALID`. This design allocated common status:
 
 ```text
 11 CONFLICT   a precondition failed (CAS mismatch, create-exclusive on

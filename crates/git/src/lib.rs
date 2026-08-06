@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use blit_remote::git::{
     GIT_OID_FORMAT_SHA1, GIT_OID_FORMAT_SHA256, GIT_REPO_BARE, GIT_REPO_FETCHABLE, GIT_REPO_LINKED,
-    GIT_REPO_SHALLOW, GIT_REPO_SPARSE, GIT_STATUS_NOT_FOUND, GIT_STATUS_OTHER,
+    GIT_REPO_SHALLOW, GIT_REPO_SPARSE, GIT_STATUS_INVALID, GIT_STATUS_NOT_FOUND,
     GIT_STATUS_PERMISSION, GIT_STATUS_WRONG_TYPE, GitOid,
 };
 
@@ -205,10 +205,10 @@ fn repo_registry() -> &'static RepoRegistry {
 
 /// Discover the repository containing `path` (standard upward discovery,
 /// stopping at filesystem boundaries). Returns the handle plus the
-/// `GIT_REPO` payload, or a unified-status code and diagnostic.
+/// `GIT_REPO` payload, or a common-status code and diagnostic.
 pub fn open(path: &str) -> Result<(RepoHandle, RepoInfo), (u8, String)> {
     if path.is_empty() || path.contains('\0') {
-        return Err((GIT_STATUS_OTHER, "invalid path".into()));
+        return Err((GIT_STATUS_INVALID, "invalid path".into()));
     }
     let start = Path::new(path);
     if !start.exists() {
