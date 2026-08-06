@@ -161,7 +161,7 @@ pub(crate) struct VulkanVideoEncoder {
     /// Set when a fence wait timed out. The submission owning that fence is
     /// still running somewhere on the GPU and may still write to
     /// `bitstream_buffer`, so this encoder can never be used again — see
-    /// [`encode_fence_timeout_ns`].
+    /// [`encode_fence_timeout_ns`], and `encode` for why nothing rebuilds it.
     poisoned: bool,
 }
 
@@ -535,9 +535,16 @@ impl VulkanVideoEncoder {
         force_keyframe: bool,
     ) -> Option<(Vec<u8>, bool)> {
         // A previous submission never completed and still owns the bitstream
-        // buffer. Refuse immediately rather than submit alongside it; the
-        // server drops an encoder that returns nothing repeatedly and builds
-        // a fresh one, which is the only way out of this state.
+        // buffer. Refuse rather than submit alongside it.
+        //
+        // Nothing recovers from here on its own. The server's
+        // rebuild-after-repeated-failure path is gated on `needs_new_encoder`,
+        // which is hard-`false` whenever a Vulkan encoder exists, so a
+        // poisoned one is never torn down — the surface stays black for that
+        // client until a resize or resubscribe sends `DestroyVulkanEncoder`.
+        // Automatic recovery needs the compositor to tell the server the
+        // encoder is dead: "produced no bitstream" is the same signal a
+        // warming-up encoder gives, so the server cannot infer it.
         if self.poisoned {
             return None;
         }
