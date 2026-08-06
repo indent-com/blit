@@ -125,7 +125,10 @@ mod tests {
     fn handshake_and_alert_records_pass() {
         let mut d = DtlsFlightDedupe::new();
         assert!(d.accept(&record(22, 0, 0, &[0u8; 70])));
-        assert!(d.accept(&record(22, 0, 1, &[0u8; 70])), "flight resends pass");
+        assert!(
+            d.accept(&record(22, 0, 1, &[0u8; 70])),
+            "flight resends pass"
+        );
         assert!(d.accept(&record(21, 1, 0, &[0u8; 2])));
     }
 
