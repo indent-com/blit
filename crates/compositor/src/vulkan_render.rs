@@ -4793,7 +4793,7 @@ impl VulkanRenderer {
     #[allow(clippy::type_complexity)]
     pub fn try_retire_pending(
         &mut self,
-    ) -> (Option<(u16, u32, u32)>, Vec<(u16, u32, u32, PixelData)>) {
+    ) -> (Option<(u16, u32, u32)>, Vec<(u16, u32, u32, PixelData, bool)>) {
         // The compositor calls this every iteration of its event loop
         // (once per Wayland event). We deliberately do NOT drain
         // deferred external submits here: that happens at submit time
@@ -4826,7 +4826,7 @@ impl VulkanRenderer {
             Some(native),
             results
                 .into_iter()
-                .map(|(w, h, p)| (toplevel_sid, w, h, p))
+                .map(|(w, h, p, encoder_skip)| (toplevel_sid, w, h, p, encoder_skip))
                 .collect(),
         )
     }
@@ -4835,8 +4835,13 @@ impl VulkanRenderer {
     /// a completed GPU submission.  External targets were emitted
     /// immediately by `render_tree_sized` — `retire_pending` only
     /// handles staging readback (native + downscale targets).
-    fn retire_pending(&mut self, pending: PendingSubmit) -> Vec<(u32, u32, PixelData)> {
-        let mut results: Vec<(u32, u32, PixelData)> = Vec::new();
+    ///
+    /// The `bool` per result is `encoder_skip`: true when this BGRA was
+    /// published on demand over a live NV12 zero-copy stream and must not
+    /// reach an encoder (see the range-mismatch comment at the publish
+    /// site).
+    fn retire_pending(&mut self, pending: PendingSubmit) -> Vec<(u32, u32, PixelData, bool)> {
+        let mut results: Vec<(u32, u32, PixelData, bool)> = Vec::new();
 
         // Native BGRA from the self-alloc output_image staging buffer.
         if pending.self_output_idx < self.output_images.len() {
@@ -4865,14 +4870,18 @@ impl VulkanRenderer {
                 // capture` asks on demand, and the staging buffer is
                 // filled every frame regardless, so the pixels are already
                 // sitting there — only the copy that publishes them is
-                // skipped. One BGRA frame reaching the encoder instead of
-                // NV12 needs no coordination: it encodes either.
+                // skipped. That one BGRA frame must NOT reach the encoder,
+                // though: the zero-copy shader converts full-range
+                // (black = Y 0) while NVENC's own ARGB conversion is
+                // limited-range (black = Y 16), so one BGRA frame spliced
+                // into an NV12 stream lifts every black to gray for a
+                // frame.  Mark it encoder_skip so the server feeds it to
+                // the pixel cache but not to any encoder.
                 let wanted_now = std::mem::take(&mut self.publish_native_bgra_once);
-                if !wanted_now
-                    && self
-                        .nv12_opaque_slot(pending.surface_id, pending.phys_w, pending.phys_h)
-                        .is_some()
-                {
+                let zero_copy_live = self
+                    .nv12_opaque_slot(pending.surface_id, pending.phys_w, pending.phys_h)
+                    .is_some();
+                if !wanted_now && zero_copy_live {
                     // fall through to cleanup
                 } else {
                     let size = pending.phys_w as usize * pending.phys_h as usize * 4;
@@ -4882,6 +4891,7 @@ impl VulkanRenderer {
                         pending.phys_w,
                         pending.phys_h,
                         PixelData::Bgra(Arc::new(bgra)),
+                        zero_copy_live,
                     ));
                 }
             }
@@ -4908,7 +4918,7 @@ impl VulkanRenderer {
             }
             let size = (tw as usize) * (th as usize) * 4;
             let bgra = unsafe { std::slice::from_raw_parts(out.staging_ptr, size) }.to_vec();
-            results.push((tw, th, PixelData::Bgra(Arc::new(bgra))));
+            results.push((tw, th, PixelData::Bgra(Arc::new(bgra)), false));
         }
 
         // Always free the fence, command buffer, and per-frame textures.
@@ -5015,7 +5025,7 @@ impl VulkanRenderer {
         output_scale_120: u16,
         target_phys: Option<(u32, u32)>,
         toplevel_sid: u16,
-    ) -> Vec<(u16, u32, u32, PixelData)> {
+    ) -> Vec<(u16, u32, u32, PixelData, bool)> {
         // Retire the previous submission if done (non-blocking).  The
         // self-alloc readback (compositor BGRA at native) is one frame
         // delayed — staging buffer copy needs the fence to complete.
@@ -5025,9 +5035,11 @@ impl VulkanRenderer {
         static ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let entry_n = ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let had_pending = self.pending_submit.is_some();
-        let mut results: Vec<(u16, u32, u32, PixelData)> = Vec::new();
+        let mut results: Vec<(u16, u32, u32, PixelData, bool)> = Vec::new();
         if let Some(pending) = self.pending_submit.take() {
             let prev_sid = pending.toplevel_sid;
+            let (prev_surface, prev_w, prev_h) =
+                (pending.surface_id, pending.phys_w, pending.phys_h);
             let raw = unsafe {
                 (self.device.fp_v1_0().wait_for_fences)(
                     self.device.handle(),
@@ -5040,11 +5052,19 @@ impl VulkanRenderer {
             if raw == vk::Result::SUCCESS {
                 let r = self.retire_pending(pending);
                 self.free_frame_textures();
-                if r.is_empty() {
+                // Empty is the normal outcome under NV12 zero-copy: the
+                // frame was already published GPU-side and the readback
+                // is deliberately suppressed.  Only log when nothing was
+                // suppressing it.
+                if r.is_empty()
+                    && self
+                        .nv12_opaque_slot(prev_surface, prev_w, prev_h)
+                        .is_none()
+                {
                     eprintln!("[render_tree_sized] fence OK but retire_pending=empty");
                 }
-                for (w, h, p) in r {
-                    results.push((prev_sid, w, h, p));
+                for (w, h, p, encoder_skip) in r {
+                    results.push((prev_sid, w, h, p, encoder_skip));
                 }
             } else {
                 // Self-alloc readback: must wait for fence — re-stash
@@ -6202,6 +6222,7 @@ impl VulkanRenderer {
                     height: nv12.height,
                     sync_fd: Some(sync),
                 },
+                false,
             ));
             if let Some(entry) = self.nv12_opaque_outputs.get_mut(&(sid, tw, th)) {
                 let n = entry.0.len().max(1);
@@ -6292,7 +6313,7 @@ impl VulkanRenderer {
                 *sync_fd = Some(shared.clone());
             }
 
-            results.push((toplevel_sid, tw, th, pixel_data));
+            results.push((toplevel_sid, tw, th, pixel_data, false));
 
             // Advance the round-robin cursors for this target.
             if let Some(entry) = self.external_outputs.get_mut(&(sid, tw, th)) {

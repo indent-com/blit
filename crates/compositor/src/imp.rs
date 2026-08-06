@@ -540,6 +540,13 @@ pub enum CompositorEvent {
         /// stamp surface frames with the source's presentation timing
         /// rather than the (jittery) encode-delivery wall clock.
         timestamp_ms: u32,
+        /// This frame is for the pixel cache only — an on-demand BGRA
+        /// readback published while an NV12 zero-copy stream owns the
+        /// same key.  Encoders must not consume it: its RGB→YUV
+        /// conversion is full-range while NVENC's ARGB path is
+        /// limited-range, so encoding it splices one wrong-black-level
+        /// frame into the stream.
+        encoder_skip: bool,
     },
     /// A compositor-resident encoder produced a bitstream for one client.
     /// Carries its own timestamp for the same reason `SurfaceCommit` does.
@@ -1350,9 +1357,11 @@ struct Compositor {
     /// width, height)`.  Each render of one surface can produce
     /// several frames — one per registered per-client encoder target
     /// size — and each lands here as its own entry so the server sees
-    /// one `SurfaceCommit` per target.  Value is `(log_w, log_h, pixels)`
-    /// where the logicals are derived from the per-target physical size.
-    pending_commits: HashMap<(u16, u32, u32), (u32, u32, PixelData)>,
+    /// one `SurfaceCommit` per target.  Value is `(log_w, log_h, pixels,
+    /// encoder_skip)` where the logicals are derived from the per-target
+    /// physical size.
+    #[allow(clippy::type_complexity)]
+    pending_commits: HashMap<(u16, u32, u32), (u32, u32, PixelData, bool)>,
     /// Bitstreams from compositor-resident encoders awaiting the next
     /// flush.  Kept apart from `pending_commits` because these are owned
     /// by one client each and must never be coalesced by target size.
@@ -1750,16 +1759,17 @@ impl Compositor {
         // in a deterministic sequence.
         let now_ms = elapsed_ms();
         #[allow(clippy::type_complexity)]
-        let mut entries: Vec<((u16, u32, u32), (u32, u32, PixelData))> =
+        let mut entries: Vec<((u16, u32, u32), (u32, u32, PixelData, bool))> =
             self.pending_commits.drain().collect();
         entries.sort_by_key(|((sid, w, h), _)| (*sid, *w, *h));
-        for ((surface_id, width, height), (_log_w, _log_h, pixels)) in entries {
+        for ((surface_id, width, height), (_log_w, _log_h, pixels, encoder_skip)) in entries {
             let _ = self.event_tx.send(CompositorEvent::SurfaceCommit {
                 surface_id,
                 width,
                 height,
                 pixels,
                 timestamp_ms: now_ms,
+                encoder_skip,
             });
         }
         // Emitted after the commits so a client that owns a compositor
@@ -2165,9 +2175,9 @@ impl Compositor {
         if let Some((nw, nh, nlog_w, nlog_h)) = native {
             self.pending_native_sizes
                 .insert(toplevel_sid, (nw, nh, nlog_w, nlog_h));
-        } else if let Some((sid, nw, nh, _)) = composited
+        } else if let Some((sid, nw, nh, _, _)) = composited
             .iter()
-            .max_by_key(|(_, w, h, _)| (*w as u64) * (*h as u64))
+            .max_by_key(|(_, w, h, _, _)| (*w as u64) * (*h as u64))
         {
             let nlog_w = (nw * 120).div_ceil(s120_u32);
             let nlog_h = (nh * 120).div_ceil(s120_u32);
@@ -2175,7 +2185,7 @@ impl Compositor {
                 .insert(*sid, (*nw, *nh, nlog_w, nlog_h));
         }
 
-        for (result_sid, w, h, pixels) in composited {
+        for (result_sid, w, h, pixels, encoder_skip) in composited {
             if pixels.is_empty() {
                 continue;
             }
@@ -2222,7 +2232,7 @@ impl Compositor {
             let log_w = (w * 120).div_ceil(s120_u32);
             let log_h = (h * 120).div_ceil(s120_u32);
             self.pending_commits
-                .insert((result_sid, w, h), (log_w, log_h, pixels));
+                .insert((result_sid, w, h), (log_w, log_h, pixels, encoder_skip));
         }
     }
 
@@ -3366,12 +3376,14 @@ impl Compositor {
                         // for the native BGRA, which the NVENC zero-copy
                         // path otherwise leaves unpublished.
                         vk.request_native_bgra();
-                        let readable = |v: Vec<(u16, u32, u32, PixelData)>| {
+                        let readable = |v: Vec<(u16, u32, u32, PixelData, bool)>| {
                             // Take the first result we can actually read. A
                             // zero-copy NV12 handle may be in here too, and
                             // `to_rgba` is empty for it by construction —
-                            // it is GPU-only memory.
-                            v.into_iter().find_map(|(_sid, w, h, pixels)| {
+                            // it is GPU-only memory.  encoder_skip is
+                            // irrelevant here: capture IS the CPU-pixel
+                            // consumer the flag protects.
+                            v.into_iter().find_map(|(_sid, w, h, pixels, _skip)| {
                                 let rgba = pixels.to_rgba(w, h);
                                 (!rgba.is_empty()).then_some((w, h, rgba))
                             })
@@ -6943,12 +6955,12 @@ fn run_compositor(
                         .entry(sid)
                         .or_insert((nw, nh, log_w, log_h));
                 }
-                for (sid, w, h, pixels) in retired {
+                for (sid, w, h, pixels, encoder_skip) in retired {
                     let log_w = (w * 120).div_ceil(s120_u32);
                     let log_h = (h * 120).div_ceil(s120_u32);
                     compositor
                         .pending_commits
-                        .insert((sid, w, h), (log_w, log_h, pixels));
+                        .insert((sid, w, h), (log_w, log_h, pixels, encoder_skip));
                 }
             }
         }

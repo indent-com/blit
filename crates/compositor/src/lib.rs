@@ -152,6 +152,7 @@ mod stub {
             height: u32,
             pixels: PixelData,
             timestamp_ms: u32,
+            encoder_skip: bool,
         },
         SurfaceEncoded {
             frame: EncodedFrame,

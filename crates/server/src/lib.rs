@@ -494,6 +494,13 @@ struct LastPixels {
     /// Used as the surface frame timestamp so the client sees the source's
     /// presentation timing rather than the (jittery) encode-delivery clock.
     timestamp_ms: u32,
+    /// Pixel-cache only: an on-demand BGRA readback published while an
+    /// NV12 zero-copy stream owns this key.  The encode tick must not
+    /// feed it to an encoder — its color conversion is full-range while
+    /// NVENC's ARGB path is limited-range, so one such frame in an NV12
+    /// stream lifts blacks to gray for a frame.  Raw-paint consumers
+    /// (initial paint, capture) use it freely.
+    encoder_skip: bool,
 }
 
 /// The most recent bitstream a compositor-resident encoder produced for
@@ -4317,6 +4324,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     height,
                     pixels,
                     timestamp_ms,
+                    encoder_skip,
                 } => {
                     surface_commit_count += 1;
                     // The compositor emits one SurfaceCommit per
@@ -4340,6 +4348,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             pixels,
                             generation: cs.pixel_generation,
                             timestamp_ms,
+                            encoder_skip,
                         },
                     );
                 }
@@ -5173,12 +5182,21 @@ async fn tick(state: &AppState) -> TickOutcome {
                     continue;
                 }
 
-                let cached: Option<blit_compositor::PixelData> = {
+                let cached: Option<(blit_compositor::PixelData, bool)> = {
                     let cs = sess.compositor.as_ref().unwrap();
                     cs.last_pixels
                         .get(&(sid, px_w, px_h))
-                        .map(|lp| lp.pixels.clone())
+                        .map(|lp| (lp.pixels.clone(), lp.encoder_skip))
                 };
+                // A cache-only entry (on-demand BGRA readback over a live
+                // NV12 zero-copy stream) must not be encoded — wrong color
+                // range for the stream.  Don't advance last_encoded_gen:
+                // the next zero-copy publish supersedes this entry within
+                // a frame period.
+                if matches!(cached, Some((_, true))) {
+                    continue;
+                }
+                let cached = cached.map(|(p, _)| p);
                 let Some(pixels) = cached else {
                     // Nothing will fill this entry on its own: an idle
                     // Wayland app repaints only when a configure changes its
