@@ -171,9 +171,13 @@ struct NvEncFunctionList {
     _reserved: u32,
     nvEncOpenEncodeSession: *const c_void,
     nvEncGetEncodeGUIDCount: *const c_void,
-    nvEncGetEncodeGUIDs: *const c_void,
+    // Order matters: the driver fills this table positionally, so a field
+    // holds whichever entry the SDK puts at that index regardless of what we
+    // named it.  The profile-GUID pair precedes nvEncGetEncodeGUIDs in
+    // nvEncodeAPI.h — see NV_ENCODE_API_FUNCTION_LIST.
     nvEncGetEncodeProfileGUIDCount: *const c_void,
     nvEncGetEncodeProfileGUIDs: *const c_void,
+    nvEncGetEncodeGUIDs: *const c_void,
     nvEncGetInputFormatCount: *const c_void,
     nvEncGetInputFormats: *const c_void,
     nvEncGetEncodeCaps: unsafe extern "C" fn(
@@ -226,13 +230,43 @@ struct NvEncFunctionList {
         preset_config: *mut c_void,
     ) -> u32,
     nvEncGetSequenceParamEx: *const c_void,
+    nvEncRestoreEncoderState: *const c_void,
     nvEncLookaheadPicture: *const c_void,
-    // Padding for future SDK additions (13.x+).  NvEncodeAPICreateInstance
-    // fills function pointers into this struct; if the driver knows more
-    // entries than we declared it writes past our last field.  64 spare
-    // slots should cover several major version bumps.
-    _future: [*const c_void; 64],
+    // NV_ENCODE_API_FUNCTION_LIST::reserved2, which the SDK declares as
+    // `void* reserved2[275]` and documents as "[in]: Reserved and must be set
+    // to NULL".  It is the caller's job to supply that storage: the driver is
+    // entitled to read it, and a shorter struct would have it reading our
+    // stack.  Sizing it exactly as the header does also leaves room for
+    // entries a future SDK appends, which is what the padding here was
+    // originally for.
+    reserved2: [*const c_void; 275],
 }
+
+// NvEncodeAPICreateInstance fills this table positionally from the driver's
+// own layout, so an entry declared in the wrong slot silently aliases a
+// different function — a mistake that surfaces as an unrelated call
+// misbehaving at runtime, not as a load error.  Pin the offsets against
+// nv-codec-headers 12.1 (taken from `offsetof`, not counted by hand) so that
+// reordering or dropping an entry fails to compile instead.
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(offset_of!(NvEncFunctionList, nvEncGetEncodeGUIDs) == 40);
+    assert!(offset_of!(NvEncFunctionList, nvEncGetEncodeCaps) == 64);
+    assert!(offset_of!(NvEncFunctionList, nvEncInitializeEncoder) == 96);
+    assert!(offset_of!(NvEncFunctionList, nvEncEncodePicture) == 136);
+    assert!(offset_of!(NvEncFunctionList, nvEncLockBitstream) == 144);
+    assert!(offset_of!(NvEncFunctionList, nvEncMapInputResource) == 208);
+    assert!(offset_of!(NvEncFunctionList, nvEncDestroyEncoder) == 224);
+    assert!(offset_of!(NvEncFunctionList, nvEncOpenEncodeSessionEx) == 240);
+    assert!(offset_of!(NvEncFunctionList, nvEncRegisterResource) == 248);
+    assert!(offset_of!(NvEncFunctionList, nvEncReconfigureEncoder) == 264);
+    assert!(offset_of!(NvEncFunctionList, nvEncGetLastErrorString) == 304);
+    assert!(offset_of!(NvEncFunctionList, nvEncGetEncodePresetConfigEx) == 320);
+    assert!(offset_of!(NvEncFunctionList, nvEncRestoreEncoderState) == 336);
+    assert!(offset_of!(NvEncFunctionList, nvEncLookaheadPicture) == 344);
+    assert!(offset_of!(NvEncFunctionList, reserved2) == 352);
+    assert!(size_of::<NvEncFunctionList>() == 2552);
+};
 
 // SAFETY: NvEncFunctionList is a C function-pointer table loaded once via
 // dlopen.  The raw `*const c_void` fields are either unused placeholders or
