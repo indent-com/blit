@@ -2502,7 +2502,6 @@ impl Session {
     /// Clearing unconditionally would be wrong on both counts: it pulls the
     /// buffer out from under clients still registered at that size, and it
     /// leaves survivors on BGRA until something unrelated re-registers them.
-    #[cfg(target_os = "linux")]
     fn resettle_downscale_target(&mut self, surface_id: u16, tw: u32, th: u32) {
         let survivors: Vec<(bool, (u32, u32))> = self
             .clients
@@ -11338,7 +11337,6 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         // usual way a subscriber leaves — clients rarely send an explicit
         // unsubscribe first — so without re-deciding here, a target that
         // went to BGRA for a departed CPU-pixel reader would stay there.
-        #[cfg(target_os = "linux")]
         let departed_targets: Vec<(u16, (u32, u32))> = client
             .as_ref()
             .map(|c| {
@@ -11348,7 +11346,6 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     .collect()
             })
             .unwrap_or_default();
-        #[cfg(target_os = "linux")]
         for (sid, (tw, th)) in departed_targets {
             sess.resettle_downscale_target(sid, tw, th);
         }

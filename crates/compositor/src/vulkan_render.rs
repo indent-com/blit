@@ -2473,7 +2473,17 @@ impl VulkanRenderer {
         // where the OPAQUE_FD path is the whole point.
         match export {
             Nv12Export::DmaBuf if !self.has_dmabuf => return,
-            Nv12Export::OpaqueFd if !self.has_external_memory_fd => return,
+            // An OPAQUE_FD target is only publishable with a sync_fd — it
+            // has no implicit fencing, so the emit drops any frame it
+            // cannot attach one to. Building the target without the means
+            // to export a fence would suppress the BGRA publish for that
+            // key and then drop every frame: a permanently black stream,
+            // where declining here falls back to BGRA, which works.
+            Nv12Export::OpaqueFd
+                if !self.has_external_memory_fd || self.external_fence_fd_fn.is_none() =>
+            {
+                return;
+            }
             _ => {}
         }
         // A Vulkan Video session encodes from the compositor's own image at
