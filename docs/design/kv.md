@@ -319,6 +319,7 @@ calls from the client that already knows both worlds.
 | Store total bytes     | 256 MiB | `BLIT_KV_TOTAL_MAX`   |
 | Entries               | 16384   | `BLIT_KV_MAX_ENTRIES` |
 | Puts in flight / conn | 16      | `BLIT_KV_INFLIGHT`    |
+| Subscriptions / conn  | 16      | `BLIT_KV_MAX_SUBS`    |
 | Unacked bytes / sub   | 16 MiB  | `BLIT_KV_UNACKED_MAX` |
 
 Over-limit puts refuse with `TOO_LARGE`/`BUDGET`; nonce

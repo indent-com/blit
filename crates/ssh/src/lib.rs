@@ -5,7 +5,7 @@
 //! remote blit-servers without shelling out to the system `ssh` binary.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -215,64 +215,102 @@ impl client::Handler for SshHandler {
         &mut self,
         server_public_key: &keys::PublicKey,
     ) -> Result<bool, Self::Error> {
-        let known_hosts_path = match home_dir() {
-            Some(h) => h.join(".ssh").join("known_hosts"),
-            None => return Ok(true), // No home dir — accept
-        };
-        if !known_hosts_path.exists() {
-            // No known_hosts file — accept-new behaviour: create file and
-            // record the key.
-            if let Some(parent) = known_hosts_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+        let path = known_hosts_path().ok_or_else(|| {
+            Error::Other(
+                "cannot verify host keys: no home directory for ~/.ssh/known_hosts. \
+                 Set HOME, or point BLIT_SSH_KNOWN_HOSTS at a file."
+                    .into(),
+            )
+        })?;
+
+        // russh reports an unreadable known_hosts exactly like an absent one —
+        // an empty key list — so a permissions problem would read as "new
+        // host" and re-pin against whatever answered. Probe it here, where
+        // absent and unreadable are still distinguishable.
+        match std::fs::File::open(&path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Other(format!(
+                    "cannot read {}: {e}. Refusing rather than trusting an \
+                     unverified host key.",
+                    path.display()
+                )));
             }
-            append_known_host(&known_hosts_path, &self.host, self.port, server_public_key);
+        }
+
+        // Ask what is pinned for this host rather than "does the presented key
+        // match", because the two differ in a way that matters. russh answers
+        // `Ok(false)` both for a host it has never seen and for a host pinned
+        // under a *different key algorithm* — so appending on `Ok(false)`, as
+        // this did, let anyone bypass an ed25519 pin by presenting an RSA key.
+        // Nothing here constrains the algorithm the server may offer.
+        let recorded = keys::known_hosts::known_host_keys_path(&self.host, self.port, &path)
+            .map_err(|e| {
+                // A parse or IO failure means the pin could not be read, not
+                // that there is none. This arm used to append and accept, so
+                // one corrupt line — or a single non-UTF-8 byte anywhere in
+                // the file, which fails the whole read — silently unpinned the
+                // host and recorded whatever answered.
+                Error::Other(format!(
+                    "cannot parse {} for {}:{}: {e}. Refusing rather than \
+                     trusting an unverified host key.",
+                    path.display(),
+                    self.host,
+                    self.port
+                ))
+            })?;
+
+        if recorded.is_empty() {
+            // Genuinely unknown host: trust on first use, and record it so the
+            // second use is checked. Write errors are fatal — a read-only
+            // known_hosts silently re-learning on every connection is
+            // indistinguishable from having no pin at all.
+            keys::known_hosts::learn_known_hosts_path(
+                &self.host,
+                self.port,
+                server_public_key,
+                &path,
+            )
+            .map_err(|e| {
+                Error::Other(format!(
+                    "cannot record host key for {}:{} in {}: {e}",
+                    self.host,
+                    self.port,
+                    path.display()
+                ))
+            })?;
             return Ok(true);
         }
-        match keys::check_known_hosts_path(
-            &self.host,
-            self.port,
-            server_public_key,
-            &known_hosts_path,
-        ) {
-            Ok(true) => Ok(true),
-            Ok(false) => {
-                // Key not in file — accept-new: append and accept.
-                append_known_host(&known_hosts_path, &self.host, self.port, server_public_key);
-                Ok(true)
-            }
-            Err(keys::Error::KeyChanged { .. }) => Err(Error::Other(format!(
-                "host key for {}:{} has changed! \
-                     This could indicate a man-in-the-middle attack. \
-                     Remove the old key from ~/.ssh/known_hosts to continue.",
-                self.host, self.port
-            ))),
-            Err(_) => {
-                // Other errors (parse failure, etc.) — accept-new.
-                append_known_host(&known_hosts_path, &self.host, self.port, server_public_key);
-                Ok(true)
-            }
+
+        if recorded.iter().any(|(_, k)| k == server_public_key) {
+            return Ok(true);
         }
+
+        Err(Error::Other(format!(
+            "host key for {}:{} does not match the {} key(s) recorded in {}! \
+             This could indicate a man-in-the-middle attack. Remove the old \
+             entry to continue.",
+            self.host,
+            self.port,
+            recorded.len(),
+            path.display()
+        )))
     }
 }
 
-fn append_known_host(path: &Path, host: &str, port: u16, key: &keys::PublicKey) {
-    use keys::PublicKeyBase64;
-    let host_entry = if port == 22 {
-        host.to_string()
-    } else {
-        format!("[{host}]:{port}")
-    };
-    let algo = key.algorithm().to_string();
-    let b64 = key.public_key_base64();
-    let line = format!("{host_entry} {algo} {b64}\n");
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut f| {
-            use std::io::Write;
-            f.write_all(line.as_bytes())
-        });
+/// Where host keys are pinned.
+///
+/// `BLIT_SSH_KNOWN_HOSTS` overrides the location, which is also the escape
+/// hatch for contexts with no `HOME` — a daemon or container — where the old
+/// code accepted every host key unconditionally instead.
+fn known_hosts_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("BLIT_SSH_KNOWN_HOSTS")
+        && !p.is_empty()
+    {
+        return Some(PathBuf::from(p));
+    }
+    Some(home_dir()?.join(".ssh").join("known_hosts"))
 }
 
 // ── SSH Pool ───────────────────────────────────────────────────────────
@@ -637,4 +675,181 @@ pub fn parse_ssh_uri(s: &str) -> (Option<String>, String, Option<String>) {
         (None, host_part.to_string())
     };
     (user, host, socket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use russh::client::Handler;
+    use std::path::Path;
+
+    const KEY_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAiVpqLWTIigzpaNk7fXH5+QRGxbbMLM6XJ28iya08po";
+    const KEY_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJtJlwVPL88rnGVkDna6i1QqC5RVs5+X6cV+/x7MS4XA";
+    /// A different *algorithm* for the same host — the bypass that used to
+    /// read as "unknown host" rather than as a changed key.
+    const KEY_RSA: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDr4Cp7pJoEPmyqfRrTwJxojfO/6tEDd09BnDQXjz0tMw83/PXgMjig1EXfKn+zGfulY/GuktQb1FU3zg5f6MouxWfRDJnrX3RlsfaVEueK+ddtocOaVFgBB37kyRCcT5huNjJf6ixc+dnmaYZ5BRl0QbKQSfj9TeyaQxttxv81pTRN5uN6oOvTdbBR5p4+Px+kpuAVsdm9k5bNmlnm1N4MH1ueA1P4Rt/5YnHj4N47G6wfW/jNGz2tzt39zL/pezvxQl2ftI9gRHqFk7D8SD1mTB9fCewOaP8VmVCQio7hCMZf3+hmjGmLhtqHbXZDBKmHYe4BuIOpMT/ZD4P9dJop";
+
+    fn key(s: &str) -> keys::PublicKey {
+        keys::PublicKey::from_openssh(s).expect("fixture parses")
+    }
+
+    /// Each test gets its own known_hosts, pointed at via the env override.
+    /// The var is process-wide, so these run under one lock rather than in
+    /// parallel.
+    fn with_known_hosts<T>(initial: Option<&str>, f: impl FnOnce(&Path) -> T) -> T {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir().join(format!(
+            "blit-ssh-kh-{}-{:p}",
+            std::process::id(),
+            &initial as *const _
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        match initial {
+            Some(contents) => std::fs::write(&path, contents).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        unsafe { std::env::set_var("BLIT_SSH_KNOWN_HOSTS", &path) };
+        let out = f(&path);
+        unsafe { std::env::remove_var("BLIT_SSH_KNOWN_HOSTS") };
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    fn check(presented: &str) -> Result<bool, Error> {
+        let mut h = SshHandler {
+            host: "example.test".into(),
+            port: 22,
+        };
+        futures_lite_block_on(h.check_server_key(&key(presented)))
+    }
+
+    /// Minimal executor: `check_server_key` never yields, so polling once is
+    /// enough and the crate needs no async test runtime.
+    fn futures_lite_block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn noop(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        let waker = unsafe { Waker::from_raw(clone(std::ptr::null())) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(fut);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("check_server_key awaited something"),
+        }
+    }
+
+    #[test]
+    fn unknown_host_is_learned_then_enforced() {
+        with_known_hosts(None, |path| {
+            assert!(check(KEY_A).unwrap(), "first sight is trusted");
+            let recorded = std::fs::read_to_string(path).unwrap();
+            assert!(recorded.contains("example.test"), "key was recorded");
+            assert!(check(KEY_A).unwrap(), "same key still accepted");
+        });
+    }
+
+    /// The whole point of pinning: a different key for a pinned host is
+    /// refused rather than appended.
+    #[test]
+    fn a_changed_key_is_refused() {
+        with_known_hosts(Some(&format!("example.test {KEY_A}\n")), |_| {
+            let err = check(KEY_B).expect_err("changed key must not be accepted");
+            assert!(format!("{err}").contains("does not match"), "{err}");
+        });
+    }
+
+    /// russh answers `Ok(false)` for a host pinned under another algorithm,
+    /// which is indistinguishable from an unknown host. Appending on that —
+    /// as this used to — let an attacker bypass an ed25519 pin by presenting
+    /// an RSA key.
+    #[test]
+    fn a_different_algorithm_does_not_bypass_the_pin() {
+        with_known_hosts(Some(&format!("example.test {KEY_A}\n")), |path| {
+            let err = check(KEY_RSA).expect_err("algorithm switch must not be accepted");
+            assert!(format!("{err}").contains("does not match"), "{err}");
+            let after = std::fs::read_to_string(path).unwrap();
+            assert!(
+                !after.contains("ssh-rsa"),
+                "must not record the rejected key"
+            );
+        });
+    }
+
+    /// A corrupt entry means the pin could not be read, not that there is
+    /// none. This arm used to append the presented key and accept.
+    #[test]
+    fn a_corrupt_entry_for_this_host_is_fatal() {
+        with_known_hosts(
+            Some("example.test ssh-ed25519 !!!not-base64!!!\n"),
+            |path| {
+                let err = check(KEY_A).expect_err("unreadable pin must not be accepted");
+                assert!(format!("{err}").contains("cannot parse"), "{err}");
+                let after = std::fs::read_to_string(path).unwrap();
+                assert!(!after.contains(KEY_A), "must not record over a corrupt pin");
+            },
+        );
+    }
+
+    /// An entry for a *different* host must not pin this one, but must also
+    /// not stop this one being learned.
+    #[test]
+    fn another_hosts_entry_does_not_pin_this_one() {
+        with_known_hosts(Some(&format!("other.test {KEY_B}\n")), |path| {
+            assert!(check(KEY_A).unwrap(), "unrelated entry does not pin us");
+            let after = std::fs::read_to_string(path).unwrap();
+            assert!(after.contains("other.test"), "existing entry preserved");
+            assert!(after.contains("example.test"), "new entry appended");
+        });
+    }
+
+    /// The previous append hand-rolled the write and never checked for a
+    /// trailing newline, so a file not ending in one had its last entry
+    /// corrupted by concatenation.
+    #[test]
+    fn learning_does_not_corrupt_a_file_without_a_trailing_newline() {
+        with_known_hosts(Some(&format!("other.test {KEY_B}")), |path| {
+            assert!(check(KEY_A).unwrap());
+            let after = std::fs::read_to_string(path).unwrap();
+            let lines: Vec<_> = after.lines().filter(|l| !l.trim().is_empty()).collect();
+            assert_eq!(
+                lines.len(),
+                2,
+                "entries stayed on separate lines: {after:?}"
+            );
+            assert!(lines[0].starts_with("other.test"));
+            assert!(lines[1].starts_with("example.test"));
+        });
+    }
+
+    #[test]
+    fn russh_reports_an_algorithm_mismatch_as_unknown_host() {
+        // The premise behind `a_different_algorithm_does_not_bypass_the_pin`:
+        // russh cannot distinguish these two for us, so we must.
+        with_known_hosts(Some(&format!("example.test {KEY_A}\n")), |path| {
+            // Same algorithm, different key -> KeyChanged (russh catches it).
+            let e = keys::check_known_hosts_path("example.test", 22, &key(KEY_B), path);
+            assert!(
+                matches!(e, Err(keys::Error::KeyChanged { .. })),
+                "expected KeyChanged, got {e:?}"
+            );
+            // Different algorithm -> Ok(false), i.e. indistinguishable from
+            // a host that was never pinned at all.
+            let e = keys::check_known_hosts_path("example.test", 22, &key(KEY_RSA), path);
+            assert!(
+                matches!(e, Ok(false)),
+                "expected Ok(false) — the bypass — got {e:?}"
+            );
+        });
+    }
 }

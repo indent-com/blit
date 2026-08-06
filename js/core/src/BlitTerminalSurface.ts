@@ -255,9 +255,10 @@ export class BlitTerminalSurface {
    *  of pointer movement put ~9% of the whole recording in Recalculate
    *  style, blamed on `mouseToCell`. */
   private canvasRect: DOMRect | null = null;
-  /** Last value written to the canvas's cursor, so a mousemove that
+  /** Last value written to the scroll surface's cursor, so a mousemove that
    *  changes nothing does not dirty style. Writing the same value still
-   *  invalidates it, which is what made the read above expensive. */
+   *  invalidates it, which is what made the read above expensive.
+   *  Re-seeded to the element's inline baseline in `attach()`. */
   private lastCursor = "";
   private dpr: number;
   /** Sub-pixel correction currently applied to the canvas, in CSS px.
@@ -769,6 +770,11 @@ export class BlitTerminalSurface {
         zIndex: "1",
         background: "transparent",
       });
+      // setCursor dedups against this baseline, so the cache starts where the
+      // element does.  attach() after a detach() builds a fresh element with
+      // the inline "text" above; without this it would inherit the previous
+      // one's idea of what it is showing and skip the next real change.
+      this.lastCursor = "text";
       // WebKit/Blink scrollbar hider (no JS-readable property for it).
       this.scrollEl.classList.add("blit-scroll-surface");
       injectScrollSurfaceStyles();
@@ -1481,11 +1487,18 @@ export class BlitTerminalSurface {
     this.canvasRect = null;
   }
 
-  /** Set the canvas cursor, skipping a redundant write. */
+  /**
+   * Set the scroll surface's cursor, skipping a redundant write.
+   *
+   * The dedup is against {@link lastCursor}, which mirrors the element's
+   * inline style — so the two are seeded together where `scrollEl` is
+   * created.  Let them drift and the guard starts suppressing writes the
+   * element never received.
+   */
   private setCursor(target: HTMLElement, value: string): void {
     if (this.lastCursor === value) return;
     this.lastCursor = value;
-    this.setCursor(target, value);
+    target.style.cursor = value;
   }
 
   /** Write half: apply whatever `measureSnap` worked out. */

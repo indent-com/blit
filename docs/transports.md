@@ -290,6 +290,14 @@ The remote socket path is resolved on the remote host using the standard cascade
 remote, it is auto-installed to `~/.local/bin`. If the server is not running, it
 is auto-started. Connection retries with back-off handle the startup window.
 
+**Host keys** are trust-on-first-use against `~/.ssh/known_hosts`, overridable
+with `BLIT_SSH_KNOWN_HOSTS`. A host with no entry is recorded and accepted; a
+host that already has one must match it, under any algorithm. Everything else
+refuses the connection rather than re-recording: an unreadable or unparseable
+known_hosts, no home directory to find one in, or a key that does not match
+what is pinned. `UserKnownHostsFile`, `GlobalKnownHostsFile` and
+`HashKnownHosts` from `~/.ssh/config` are not consulted.
+
 ---
 
 ## blit proxy-daemon
