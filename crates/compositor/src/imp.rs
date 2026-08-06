@@ -1072,6 +1072,40 @@ struct ExternalClipboard {
     data: Vec<u8>,
 }
 
+impl ExternalClipboard {
+    /// Whether this selection answers to `mime_type`.
+    ///
+    /// Text picks up the conventional aliases: a client asking for
+    /// `UTF8_STRING` wants the same bytes as one asking for `text/plain`.
+    /// Anything else answers to its own type alone — handing a PNG to a
+    /// client that asked for `text/plain` is worse than handing it nothing,
+    /// because nothing in the protocol lets the client notice it did not
+    /// get text.
+    fn offers(&self, mime_type: &str) -> bool {
+        if self.mime_type == mime_type {
+            return true;
+        }
+        self.mime_type.starts_with("text/plain")
+            && matches!(
+                mime_type,
+                "text/plain" | "text/plain;charset=utf-8" | "UTF8_STRING"
+            )
+    }
+
+    /// Every MIME type to advertise for this selection, its own first.
+    fn mime_types(&self) -> Vec<String> {
+        let mut mimes = vec![self.mime_type.clone()];
+        if self.mime_type.starts_with("text/plain") {
+            for alias in ["text/plain", "text/plain;charset=utf-8", "UTF8_STRING"] {
+                if self.mime_type != alias {
+                    mimes.push(alias.to_string());
+                }
+            }
+        }
+        mimes
+    }
+}
+
 struct PrimarySourceData {
     mime_types: std::sync::Mutex<Vec<String>>,
 }
@@ -3657,18 +3691,7 @@ impl Compositor {
         if let Some(ref cb) = self.external_clipboard
             && !cb.mime_type.is_empty()
         {
-            let mut mimes = vec![cb.mime_type.clone()];
-            // Add standard text aliases.
-            if cb.mime_type.starts_with("text/plain") {
-                if cb.mime_type != "text/plain" {
-                    mimes.push("text/plain".to_string());
-                }
-                if cb.mime_type != "text/plain;charset=utf-8" {
-                    mimes.push("text/plain;charset=utf-8".to_string());
-                }
-                mimes.push("UTF8_STRING".to_string());
-            }
-            return mimes;
+            return cb.mime_types();
         }
         Vec::new()
     }
@@ -3680,12 +3703,7 @@ impl Compositor {
             && self.selection_source.is_none()
         {
             // External clipboard is active.
-            let matches = cb.mime_type == mime_type
-                || (cb.mime_type.starts_with("text/plain")
-                    && (mime_type == "text/plain"
-                        || mime_type == "text/plain;charset=utf-8"
-                        || mime_type == "UTF8_STRING"));
-            if matches {
+            if cb.offers(mime_type) {
                 return Some(cb.data.clone());
             }
             return None;
@@ -5822,12 +5840,11 @@ impl Dispatch<WlDataOffer, DataOfferData> for Compositor {
         match request {
             Request::Receive { mime_type, fd } => {
                 if data.external {
-                    // Write external clipboard data to the fd.
+                    // Write external clipboard data to the fd.  A type we
+                    // never offered gets the fd closed empty, not the bytes
+                    // we happen to be holding.
                     if let Some(ref cb) = state.external_clipboard
-                        && (cb.mime_type == mime_type
-                            || mime_type == "text/plain"
-                            || mime_type == "text/plain;charset=utf-8"
-                            || mime_type == "UTF8_STRING")
+                        && cb.offers(&mime_type)
                     {
                         use std::io::Write;
                         let mut f = std::fs::File::from(fd);
@@ -5894,7 +5911,7 @@ impl Compositor {
         let Some(ref cb) = self.external_clipboard else {
             return;
         };
-        let mime = cb.mime_type.clone();
+        let mimes = cb.mime_types();
         for dd in &self.data_devices {
             if let Some(client) = dd.client() {
                 let offer = client
@@ -5905,16 +5922,8 @@ impl Compositor {
                     )
                     .unwrap();
                 dd.data_offer(&offer);
-                offer.offer(mime.clone());
-                // Offer standard text aliases.
-                if mime.starts_with("text/plain") {
-                    if mime != "text/plain" {
-                        offer.offer("text/plain".to_string());
-                    }
-                    if mime != "text/plain;charset=utf-8" {
-                        offer.offer("text/plain;charset=utf-8".to_string());
-                    }
-                    offer.offer("UTF8_STRING".to_string());
+                for mime in &mimes {
+                    offer.offer(mime.clone());
                 }
                 dd.selection(Some(&offer));
             }
@@ -6048,11 +6057,12 @@ impl Dispatch<ZwpPrimarySelectionOfferV1, PrimaryOfferData> for Compositor {
         match request {
             Request::Receive { mime_type, fd } => {
                 if data.external {
-                    if let Some(ref cb) = state.external_primary {
+                    if let Some(ref cb) = state.external_primary
+                        && cb.offers(&mime_type)
+                    {
                         use std::io::Write;
                         let mut f = std::fs::File::from(fd);
                         let _ = f.write_all(&cb.data);
-                        let _ = mime_type; // accepted regardless
                     }
                 } else if let Some(ref src) = state.primary_source {
                     src.send(mime_type, fd.as_fd());

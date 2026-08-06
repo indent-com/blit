@@ -422,6 +422,78 @@ const WHEEL_DETENT_PX = 120;
  */
 const SCROLL_STOP_MS = 280;
 
+/** One clipboard representation on its way to the Wayland selection. */
+type ClipboardPayload = { mime: string; data: Uint8Array };
+
+/** Marks a paste event as already handled.  The canvas, the hidden textarea
+ *  and the document-level capture listener are all on the path of the same
+ *  event, and each of them would otherwise forward the selection again —
+ *  which for a screenshot means putting megabytes on the wire twice. */
+const PASTE_CLAIMED = Symbol("blit.pasteClaimed");
+
+/** Wrap plain text in the MIME type Wayland apps expect for a selection. */
+function textPayload(text: string): ClipboardPayload {
+  return {
+    mime: "text/plain;charset=utf-8",
+    data: new TextEncoder().encode(text),
+  };
+}
+
+/**
+ * Largest clipboard payload we will put on the wire.
+ *
+ * The protocol's frame ceiling is 16 MiB and a `C2S_CLIPBOARD_SET` over it is
+ * not truncated, it is refused — the connection reads a bad length and drops.
+ * Screenshots are the common case and land far below this; anything above it
+ * is not something a paste should risk the session on.
+ */
+const MAX_CLIPBOARD_BYTES = 8 * 1024 * 1024;
+
+/** Image types to prefer when a clipboard carries several, most portable
+ *  first.  `image/png` is what every toolkit asks for. */
+const IMAGE_MIME_PREFERENCE = ["image/png", "image/webp", "image/jpeg"];
+
+/** How long a paste chord waits for the clipboard before giving up on it.
+ *  Both reads it waits on — `readText()` and the `paste` event — are answered
+ *  from memory the browser already holds, so this only has to cover an IPC
+ *  round trip; the V keypress is stalled for the whole of it. */
+const PASTE_READ_MS = 300;
+/** The same deadline once an image is known to be on the clipboard: the
+ *  bytes still have to be read out of the blob, and a screenshot is megabytes
+ *  where text was bytes. */
+const PASTE_IMAGE_MS = 3000;
+
+/**
+ * The image a clipboard payload carries, if the image is what the paste means.
+ *
+ * Rich sources put several representations on the clipboard at once — a
+ * spreadsheet range arrives as text *and* as a picture of itself — and the
+ * text is what pasting is expected to produce. So an image only wins when
+ * there is no plain text at all, which is exactly the screenshot and
+ * copied-image case this exists for.
+ *
+ * `getAsFile()` has to run while the event is being dispatched; the `File` it
+ * returns stays readable afterwards.
+ */
+function clipboardImage(dt: DataTransfer | null): File | null {
+  if (!dt || dt.getData("text/plain")) return null;
+  const items = dt.items;
+  if (!items) return null;
+  const images: File[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (it.kind !== "file" || !it.type.startsWith("image/")) continue;
+    const file = it.getAsFile();
+    if (file) images.push(file);
+  }
+  if (images.length === 0) return null;
+  for (const mime of IMAGE_MIME_PREFERENCE) {
+    const match = images.find((f) => f.type === mime);
+    if (match) return match;
+  }
+  return images[0];
+}
+
 /**
  * Framework-agnostic surface canvas. Manages a `<canvas>` element that renders
  * decoded video frames from a Wayland-like surface, and forwards
@@ -560,7 +632,15 @@ export class BlitSurfaceCanvas {
     released: boolean;
     deferredCtrlRelease: boolean;
   } | null = null;
-  private _pendingPasteFlush: ((text: string | null) => void) | null = null;
+  private _pendingPasteFlush:
+    | ((payload: ClipboardPayload | null) => void)
+    | null = null;
+  /** Safety-net timer for the in-flight paste, and the cleanup it runs.
+   *  Kept as fields so reading a clipboard image — which is asynchronous,
+   *  unlike `getData()` — can push the deadline back instead of losing the
+   *  paste to it. */
+  private _pendingPasteTimer: ReturnType<typeof setTimeout> | null = null;
+  private _pendingPasteAbandon: (() => void) | null = null;
 
   // scroll batching; see queueScroll()
   private scrollAccum: {
@@ -1323,6 +1403,9 @@ export class BlitSurfaceCanvas {
     if (this.boundPaste) canvas.removeEventListener("paste", this.boundPaste);
     if (this.boundDocumentPaste)
       document.removeEventListener("paste", this.boundDocumentPaste, true);
+    this._pendingPaste = null;
+    this._pendingPasteFlush = null;
+    this.clearPasteDeadline();
 
     const ta = this.textInput;
     if (ta) {
@@ -1834,21 +1917,72 @@ export class BlitSurfaceCanvas {
   // permission, Firefox, insecure contexts, ...).  The `paste` event
   // delivers clipboard data synchronously without a permission prompt.
   private handlePaste(e: ClipboardEvent): void {
+    const claimed = e as ClipboardEvent & { [PASTE_CLAIMED]?: true };
+    if (claimed[PASTE_CLAIMED]) return;
+    claimed[PASTE_CLAIMED] = true;
     e.preventDefault();
     if (!this._displaySize) return;
     const conn = this.getConn();
     if (!conn || !this.surface) return;
-    const text = e.clipboardData?.getData("text/plain") ?? "";
-    if (this._pendingPasteFlush) {
-      const flush = this._pendingPasteFlush;
-      this._pendingPasteFlush = null;
-      flush(text || null);
-    } else if (text) {
-      conn.sendClipboard(
-        "text/plain;charset=utf-8",
-        new TextEncoder().encode(text),
-      );
+
+    // Claim the pending paste up front.  Reading an image blob is
+    // asynchronous, and a `readText()` resolving in the meantime must not
+    // paste the text representation out from under the image.
+    const flush = this._pendingPasteFlush;
+    this._pendingPasteFlush = null;
+
+    const image = clipboardImage(e.clipboardData);
+    if (image) {
+      this.extendPasteDeadline(PASTE_IMAGE_MS);
+      void image
+        .arrayBuffer()
+        .then((buf) => {
+          let payload: ClipboardPayload | null = null;
+          if (buf.byteLength > MAX_CLIPBOARD_BYTES) {
+            console.warn(
+              `blit: clipboard image is ${buf.byteLength} bytes, over the ` +
+                `${MAX_CLIPBOARD_BYTES}-byte paste limit — not pasted`,
+            );
+          } else {
+            payload = {
+              mime: image.type || "image/png",
+              data: new Uint8Array(buf),
+            };
+          }
+          if (flush) flush(payload);
+          else if (payload) conn.sendClipboard(payload.mime, payload.data);
+        })
+        .catch(() => {
+          if (flush) flush(null);
+        });
+      return;
     }
+
+    const text = e.clipboardData?.getData("text/plain") ?? "";
+    if (flush) {
+      flush(text ? textPayload(text) : null);
+    } else if (text) {
+      const payload = textPayload(text);
+      conn.sendClipboard(payload.mime, payload.data);
+    }
+  }
+
+  /** Push the in-flight paste's safety net back, for a clipboard read that
+   *  needs longer than the synchronous paths do. */
+  private extendPasteDeadline(ms: number): void {
+    if (!this._pendingPasteAbandon) return;
+    if (this._pendingPasteTimer !== null) {
+      clearTimeout(this._pendingPasteTimer);
+    }
+    this._pendingPasteTimer = setTimeout(this._pendingPasteAbandon, ms);
+  }
+
+  private clearPasteDeadline(): void {
+    if (this._pendingPasteTimer !== null) {
+      clearTimeout(this._pendingPasteTimer);
+      this._pendingPasteTimer = null;
+    }
+    this._pendingPasteAbandon = null;
   }
 
   private handleKey(e: KeyboardEvent, pressed: boolean): void {
@@ -1930,17 +2064,14 @@ export class BlitSurfaceCanvas {
       }
 
       const surfaceId = this._surfaceId;
-      const enc = new TextEncoder();
-      const flush = (clipboardText: string | null) => {
+      const flush = (payload: ClipboardPayload | null) => {
         const p = this._pendingPaste;
         if (!p || p.keycode !== keycode) return;
         this._pendingPaste = null;
         this._pendingPasteFlush = null;
-        if (clipboardText) {
-          conn.sendClipboard(
-            "text/plain;charset=utf-8",
-            enc.encode(clipboardText),
-          );
+        this.clearPasteDeadline();
+        if (payload) {
+          conn.sendClipboard(payload.mime, payload.data);
         }
         if (keycode !== 0) {
           this.pressedKeys.add(keycode);
@@ -1971,6 +2102,32 @@ export class BlitSurfaceCanvas {
       };
       this._pendingPasteFlush = flush;
 
+      // Safety net — if neither readText nor the paste event ever
+      // delivers (both paths blocked), clean up the pending state and
+      // undo the Meta→Ctrl translation.  Don't force V through without
+      // clipboard data; pasting stale content is worse than doing
+      // nothing.  Armed before either read starts so that a paste event
+      // carrying an image has a deadline to push back.
+      this._pendingPasteAbandon = () => {
+        const p = this._pendingPaste;
+        if (!p || p.keycode !== keycode) return;
+        this._pendingPaste = null;
+        this._pendingPasteFlush = null;
+        this.clearPasteDeadline();
+        if (p.deferredCtrlRelease) {
+          this.pressedKeys.delete(29);
+          conn.sendSurfaceInput(surfaceId, 29, false);
+          this._metaToCtrlKey = 0;
+        }
+        if (this.canvas && document.activeElement === this.textInput) {
+          this.canvas.focus();
+        }
+      };
+      this._pendingPasteTimer = setTimeout(
+        this._pendingPasteAbandon,
+        PASTE_READ_MS,
+      );
+
       // Chromium/Brave don't reliably dispatch `paste` to a focused
       // non-editable canvas, and `navigator.clipboard.readText()` is
       // often denied without an explicit user-granted permission.  Move
@@ -1987,31 +2144,15 @@ export class BlitSurfaceCanvas {
           // of rejecting — if we flushed on empty here, we'd close out
           // the pending paste and dispatch V with no clipboard update,
           // causing the Wayland app to paste its previous selection.
-          if (text) flush(text);
+          // `_pendingPasteFlush` being cleared means a paste event already
+          // claimed this chord: an image is on its way and its text
+          // representation, if any, must not pre-empt it.
+          if (text && this._pendingPasteFlush) flush(textPayload(text));
         },
         () => {
           /* paste event will flush */
         },
       );
-      // Safety net — if neither readText nor the paste event ever
-      // delivers (both paths blocked), clean up the pending state and
-      // undo the Meta→Ctrl translation.  Don't force V through without
-      // clipboard data; pasting stale content is worse than doing
-      // nothing.
-      setTimeout(() => {
-        const p = this._pendingPaste;
-        if (!p || p.keycode !== keycode) return;
-        this._pendingPaste = null;
-        this._pendingPasteFlush = null;
-        if (p.deferredCtrlRelease) {
-          this.pressedKeys.delete(29);
-          conn.sendSurfaceInput(surfaceId, 29, false);
-          this._metaToCtrlKey = 0;
-        }
-        if (this.canvas && document.activeElement === this.textInput) {
-          this.canvas.focus();
-        }
-      }, 300);
       return;
     }
 

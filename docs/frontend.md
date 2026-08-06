@@ -114,6 +114,37 @@ IME/composition input is handled via `compositionend` to capture multi-codepoint
 
 Mouse events are sent as `C2S_MOUSE` messages. The server generates the correct escape sequence based on the PTY's current mouse mode and encoding (X10, VT200, SGR, pixel). Client-side text selection (word/line granularity, drag) and clipboard copy are handled independently of terminal mouse mode — the browser intercepts the selection before it reaches the terminal emulator.
 
+### Paste
+
+Pasting into a Wayland surface is not a keystroke, it is a keystroke with a
+prerequisite: the app reads the selection the instant it sees Ctrl+V, so
+`BlitSurfaceCanvas` holds the V press back until the clipboard has been sent
+as `C2S_CLIPBOARD_SET`, then releases press, V release and Ctrl release in
+order. A 300 ms safety net gives up rather than delivering V with a stale
+selection behind it.
+
+Two reads race to supply the content, because neither is reliable alone:
+`navigator.clipboard.readText()` (denied without permission in Chromium and
+Brave) and the `paste` event (which browsers won't fire at a focused
+non-editable canvas, hence the focus shuffle through the hidden textarea).
+Only the `paste` event carries files, so **images arrive by that path only** —
+`clipboardImage()` takes the best `image/*` item on the event and forwards its
+bytes under their own MIME type, preferring PNG. Reading the blob is
+asynchronous, so claiming the paste pushes the safety net out to 3 s and locks
+out a `readText()` that resolves meanwhile.
+
+An image only wins when the clipboard has no plain text: rich sources put
+several representations on one clipboard, and the text is what pasting a
+spreadsheet range is expected to produce. The wire carries one representation
+per copy, so this is a choice, not a preference order the app gets to make.
+Payloads over 8 MiB are dropped with a console warning — the frame ceiling is
+16 MiB and an over-length message is refused, not truncated.
+
+Every listener on the event's path (canvas, hidden textarea, and the
+document-level capture listener that catches what the canvas misses) runs the
+same handler, so the first to see an event marks it; without that a screenshot
+would go out once per listener.
+
 ### Hyperlinks
 
 Two sources feed one code path in `BlitTerminalSurface`:
