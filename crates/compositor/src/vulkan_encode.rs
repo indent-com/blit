@@ -1703,8 +1703,30 @@ impl VulkanVideoEncoder {
     }
 
     /// Destroy all resources.  Must be called before the device is destroyed.
+    ///
+    /// A poisoned encoder is the exception: it leaks instead.  See below.
     #[allow(dead_code)]
     pub(crate) unsafe fn destroy(&mut self, device: &ash::Device, video_fns: &VideoFns) {
+        // The abandoned submission is still live on the device and still owns
+        // the bitstream buffer it writes into, the query pool it reports into,
+        // and every DPB image it reads and references.  Freeing them here is
+        // the same use-after-free the timeout path leaks a fence and a command
+        // buffer to avoid — and it is not hypothetical: tearing this encoder
+        // down on a resize or resubscribe is the *only* way a client recovers
+        // from a poisoned one, so the recovery path is the trigger.
+        //
+        // There is no safe point to free them.  A `device_wait_idle` here
+        // would wait on the very submission that already failed to signal, so
+        // it either hangs — reinstating the wedge this whole change exists to
+        // remove — or reports a lost device, after which the frees are moot.
+        // So leak, once, per encoder that hit a hang the driver never resolved.
+        if self.poisoned {
+            eprintln!(
+                "[vulkan-encode] leaking the resources of a poisoned encoder: \
+                 an abandoned submission still owns them",
+            );
+            return;
+        }
         unsafe {
             device.destroy_query_pool(self.query_pool, None);
             device.unmap_memory(self.bitstream_memory);
