@@ -7,6 +7,7 @@ macro_rules! verbose {
 }
 
 pub mod client;
+pub mod dtls_dedupe;
 pub mod ice;
 mod peer;
 pub mod signaling;

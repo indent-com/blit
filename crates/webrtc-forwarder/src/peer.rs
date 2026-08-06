@@ -388,6 +388,9 @@ pub async fn handle_peer(
     let mut buf4 = vec![0u8; 65535];
     let mut buf6 = vec![0u8; 65535];
     let mut signaling_alive = true;
+    // Shared across all inbound paths: they all feed one DTLS engine, and a
+    // retransmitted flight can arrive on a different path than the original.
+    let mut dtls_dedupe = crate::dtls_dedupe::DtlsFlightDedupe::new();
 
     let relay_addr = relay.as_ref().map(|r| r.relay_addr);
 
@@ -804,6 +807,11 @@ pub async fn handle_peer(
                                 channels_empty_since.get_or_insert_with(Instant::now);
                             }
                         }
+                        Event::Connected => {
+                            // DTLS is up: from here an epoch-0 ChangeCipherSpec
+                            // can only be a retransmission.
+                            dtls_dedupe.dtls_connected();
+                        }
                         Event::IceConnectionStateChange(state) => {
                             verbose!("ICE state: {state:?}");
                             if matches!(state, str0m::IceConnectionState::Disconnected) {
@@ -833,12 +841,14 @@ pub async fn handle_peer(
         tokio::select! {
             result = tokio_udp4.recv_from(&mut buf4) => {
                 let (n, source) = result?;
-                if let Ok(receive) = Receive::new(
-                    str0m::net::Protocol::Udp,
-                    source,
-                    host_addr4,
-                    &buf4[..n],
-                ) {
+                if dtls_dedupe.accept(&buf4[..n])
+                    && let Ok(receive) = Receive::new(
+                        str0m::net::Protocol::Udp,
+                        source,
+                        host_addr4,
+                        &buf4[..n],
+                    )
+                {
                     last_peer_activity = Instant::now();
                     rtc.handle_input(Input::Receive(last_peer_activity, receive))?;
                 }
@@ -852,6 +862,7 @@ pub async fn handle_peer(
             } => {
                 let (n, source) = result?;
                 if let Some(h6) = host_addr6
+                    && dtls_dedupe.accept(&buf6[..n])
                     && let Ok(receive) = Receive::new(
                         str0m::net::Protocol::Udp,
                         source,
@@ -875,6 +886,7 @@ pub async fn handle_peer(
             } => {
                 if let Some((peer_addr, data)) = turn_data
                     && let Some(ra) = relay_addr
+                    && dtls_dedupe.accept(&data)
                     && let Ok(receive) = Receive::new(
                         str0m::net::Protocol::Udp,
                         peer_addr,
