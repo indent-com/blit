@@ -757,6 +757,15 @@ struct SurfaceSubState {
     /// clears after a backoff so a freshly-created encoder can retry
     /// without needing a user-driven resize/resubscribe.
     nal_none_latched_at: Option<Instant>,
+    /// Consecutive encoder creations that came back with nothing, cleared
+    /// by the first that succeeds.
+    ///
+    /// A failure at a size some backend *could* have carried is retried at
+    /// that size rather than shrinking the surface, since the usual cause
+    /// is momentary.  This counts how long "momentary" has gone on: past
+    /// [`CREATE_FAILURES_BEFORE_DEGRADE`] the surface comes down to what
+    /// the whole chain clears, because a smaller picture beats none.
+    create_failures: u32,
     /// Per-surface codec support override from C2S_SURFACE_SUBSCRIBE
     /// (bitmask of CODEC_SUPPORT_*).  0 = defer to client-wide
     /// `surface_codec_support`.
@@ -889,6 +898,18 @@ fn surface_encode_cap(
     Some((cw.min(dw), ch.min(dh)))
 }
 
+/// How many creations in a row may come back empty at a size some backend
+/// could have carried before the surface is brought down anyway.
+///
+/// Failures there are usually momentary — an allocation, a busy engine, a
+/// compositor buffer not imported yet — and retrying at the same size keeps
+/// the viewer's resolution.  But a backend can also fail only at scale (VRAM
+/// for a 5K frame, a per-resolution driver limit the reported maximum does
+/// not admit to) and go on doing it, and then holding out for the large size
+/// means holding out forever.  Retries are spaced by
+/// `NAL_NONE_RETRY_BACKOFF`, so this is a few seconds of black at worst.
+const CREATE_FAILURES_BEFORE_DEGRADE: u32 = 3;
+
 /// Whether a failed encoder creation should narrow this surface's ceiling
 /// rather than simply be tried again.
 ///
@@ -902,6 +923,9 @@ fn surface_encode_cap(
 /// its failure was a momentary one — an allocation, a busy engine — and
 /// another attempt at the same size is the right answer; treating it as a
 /// size problem would pin the viewer to 2160p for the rest of the session.
+/// A backend that goes on failing anyway is caught by
+/// [`CREATE_FAILURES_BEFORE_DEGRADE`] instead, so "momentary" cannot mean
+/// "forever".
 ///
 /// `available` reports whether a backend has ever built an encoder here; it
 /// is a parameter so this stays a decision about the arguments rather than
@@ -5678,13 +5702,23 @@ async fn tick(state: &AppState) -> TickOutcome {
                         && let Some(s) = client.surface_subs.get_mut(&result.sid)
                     {
                         s.creation_in_flight = false;
-                        if result.oversized {
-                            // Not a broken host — just a frame bigger than any
-                            // backend that could have taken it.  Narrow the
-                            // ceiling and let the next tick retry at once;
-                            // spending the backoff here would stall the first
-                            // picture by seconds on every AV1-less host with a
-                            // >4K display.
+                        s.create_failures = s.create_failures.saturating_add(1);
+                        // Bring the surface down to what the whole chain
+                        // clears when the size is what stands in the way.
+                        // Either it plainly is — nothing eligible could have
+                        // carried the frame — or the backends that could have
+                        // keep failing, and after enough tries a smaller
+                        // picture beats none.  The counter is what separates
+                        // the two from a momentary failure, which must not
+                        // cost the viewer its resolution: this only clears on
+                        // a resubscribe.
+                        let narrow =
+                            result.oversized || s.create_failures >= CREATE_FAILURES_BEFORE_DEGRADE;
+                        if narrow && !s.encoder_cap_degraded {
+                            // Retry at once rather than serving the backoff:
+                            // the smaller size may simply work, and waiting
+                            // stalls the first picture by seconds on every
+                            // AV1-less host with a >4K display.
                             s.encoder_cap_degraded = true;
                             receilinged_surfaces.push(result.sid);
                         } else {
@@ -5824,6 +5858,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     state.encoder = Some(encoder);
                     state.nal_none_streak = 0;
                     state.nal_none_latched_at = None;
+                    state.create_failures = 0;
                     if let Some((name, codec_string)) = fresh_meta {
                         let enc_msg = msg_surface_encoder(result.sid, name, &codec_string);
                         let _ = send_outbox(client, enc_msg);
@@ -10402,6 +10437,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     let s = c.surface_subs.entry(surface_id).or_default();
                     s.nal_none_streak = 0;
                     s.nal_none_latched_at = None;
+                    // The failures counted so far were about the size being
+                    // replaced, and have no bearing on the new one.
+                    s.create_failures = 0;
                     s.burst_remaining = SURFACE_BURST_FRAMES;
                     s.next_send_at = None;
                     s.has_keyframe = false;
@@ -10495,6 +10533,10 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         // the surface to the old winner's ceiling.
                         state.selected_encoder = None;
                         state.encoder_cap_degraded = false;
+                        // The tally that justified narrowing goes with it,
+                        // or the very first failure on the new chain would
+                        // narrow again on the strength of the old one's.
+                        state.create_failures = 0;
                     }
                     let task_in_flight = state.encode_in_flight || state.creation_in_flight;
                     if meaningful_change {
@@ -12747,6 +12789,46 @@ mod tests {
         let h264 = blit_remote::CODEC_SUPPORT_H264;
         assert!(refused_for_size(&prefs, h264, 5120, 2880, all_work));
         assert!(!refused_for_size(&prefs, h264, 3840, 2160, all_work));
+    }
+
+    /// A backend can pass the 640x480 probe and still fail at 5K — VRAM for
+    /// the frame buffers, a per-resolution driver limit the reported maximum
+    /// doesn't admit to.  `refused_for_size` says no every time (the backend
+    /// fits, and the host has seen it work), so without a second way down the
+    /// surface would hold out for a size that never arrives and the viewer
+    /// would watch black instead of the 4K it could have had.
+    #[test]
+    fn a_backend_that_keeps_failing_at_size_eventually_narrows_anyway() {
+        let prefs = SurfaceEncoderPreference::defaults();
+        let av1 = blit_remote::CODEC_SUPPORT_AV1;
+        assert!(
+            !refused_for_size(&prefs, av1, 5120, 2880, |_| true),
+            "the size alone never explains this failure — hence the counter"
+        );
+
+        // What the creation loop does with that verdict, run out.
+        let mut sub = SurfaceSubState::default();
+        let mut narrowed_after = None;
+        for attempt in 1..=CREATE_FAILURES_BEFORE_DEGRADE + 2 {
+            sub.create_failures = sub.create_failures.saturating_add(1);
+            let narrow = sub.create_failures >= CREATE_FAILURES_BEFORE_DEGRADE;
+            if narrow && !sub.encoder_cap_degraded {
+                sub.encoder_cap_degraded = true;
+                narrowed_after.get_or_insert(attempt);
+            }
+        }
+        assert_eq!(narrowed_after, Some(CREATE_FAILURES_BEFORE_DEGRADE));
+
+        // And a run of failures that a success interrupts never gets there —
+        // the resolution survives a momentary fault, which is the whole
+        // reason the first failure doesn't narrow.
+        let mut sub = SurfaceSubState::default();
+        for _ in 0..CREATE_FAILURES_BEFORE_DEGRADE * 3 {
+            sub.create_failures = sub.create_failures.saturating_add(1);
+            assert!(sub.create_failures < CREATE_FAILURES_BEFORE_DEGRADE);
+            sub.create_failures = 0; // the next creation succeeds
+        }
+        assert!(!sub.encoder_cap_degraded);
     }
 
     /// The decoder ceiling is a hard intersection: advertising AV1 says

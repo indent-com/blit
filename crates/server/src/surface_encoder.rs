@@ -1723,10 +1723,9 @@ fn validate_surface_dimensions(
     // Refuse a frame this backend cannot carry so the chain moves on to one
     // that can.  Without this an H.264 encoder would happily accept a 5K
     // frame and emit a bitstream above what the client's decoder advertised,
-    // which fails in the browser rather than here.  This runs before
-    // `record_unavailable`, so a size rejection never poisons the
-    // family-unavailable cache — the same backend is retried at a size that
-    // fits.
+    // which fails in the browser rather than here.  This runs ahead of
+    // [`FamilyStatus`], so a size rejection is never mistaken for the host
+    // lacking the backend — the same one is retried at a size that fits.
     if !preference.fits(width, height) {
         let (max_w, max_h) = preference.max_dimensions();
         return Err(format!(
