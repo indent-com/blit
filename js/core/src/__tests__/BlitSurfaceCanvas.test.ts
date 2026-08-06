@@ -421,3 +421,125 @@ describe("BlitSurfaceCanvas touch", () => {
     surface.dispose();
   });
 });
+
+/**
+ * A view that reports a scaled target is excluded from the server's size
+ * mediation entirely — a thumbnail asks to be served a downscale of whatever
+ * the surface happens to be, so it gets no say in how big that is.  The
+ * target is therefore not merely a stream-size hint: registering one, or
+ * failing to drop one, decides whether this view can size the surface at all.
+ */
+function attachTargeting() {
+  const targets: ({ width: number; height: number } | null)[] = [];
+  let roCallback: ResizeObserverCallback | undefined;
+  const prevRO = globalThis.ResizeObserver;
+  globalThis.ResizeObserver = class {
+    constructor(cb: ResizeObserverCallback) {
+      roCallback = cb;
+    }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  } as unknown as typeof ResizeObserver;
+
+  const conn = {
+    surfaceStore: new Proxy(
+      {
+        getSurface: () => ({ width: 1920, height: 1080 }),
+        getCanvas: () => null,
+        canDecodeVideo: true,
+        generation: 0,
+      } as Record<string, unknown>,
+      {
+        get: (target, prop) =>
+          prop in target ? target[prop as string] : () => () => {},
+      },
+    ),
+    sendSurfaceSubscribe: (
+      _sid: number,
+      _viewId: string,
+      target: { width: number; height: number } | null,
+    ) => targets.push(target),
+    setSurfaceViewTarget: (
+      _sid: number,
+      _viewId: string,
+      target: { width: number; height: number } | null,
+    ) => targets.push(target),
+    sendSurfaceUnsubscribe: () => {},
+    sendSurfaceResize: () => true,
+    allocSurfaceViewId: () => "s1",
+  };
+  const workspace = {
+    getConnection: () => conn,
+    subscribe: () => () => {},
+  } as unknown as BlitWorkspace;
+  const surface = new BlitSurfaceCanvas({
+    workspace,
+    connectionId: "conn-1" as never,
+    surfaceId: 7,
+  });
+  surface.attach(document.createElement("div"));
+  /** Fire the box observer the way the browser does after layout. */
+  const layOut = (width: number, height: number) =>
+    roCallback?.(
+      [{ contentRect: { width, height } } as ResizeObserverEntry],
+      null as unknown as ResizeObserver,
+    );
+  const restore = () => {
+    surface.dispose();
+    globalThis.ResizeObserver = prevRO;
+  };
+  return { surface, targets, layOut, restore };
+}
+
+describe("BlitSurfaceCanvas size mediation", () => {
+  it("drops the scaled target once it is given a display size", () => {
+    const { surface, targets, layOut, restore } = attachTargeting();
+
+    // A pane whose box is measured before the binding's own observer gets
+    // to it — the container was still 0×0 when the effect ran, so
+    // getBoundingClientRect() declined to set a display size and this
+    // observer wins the race.  The view registers a thumbnail's target.
+    layOut(900, 500);
+    expect(targets.at(-1)).toEqual({ width: 1024, height: 512 });
+
+    // Now the binding measures and hands over the pane's real size.  This
+    // view is a live pane, not a thumbnail: it must give up the target, or
+    // the server keeps skipping it in mediation and the surface never
+    // resizes to the pane.
+    surface.setDisplaySize(900, 500, 120);
+    expect(targets.at(-1)).toBeNull();
+
+    restore();
+  });
+
+  it("re-registers the scaled target when the display size goes away", () => {
+    const { surface, targets, layOut, restore } = attachTargeting();
+
+    surface.setDisplaySize(900, 500, 120);
+    layOut(900, 500);
+    expect(targets.at(-1)).toBeNull();
+
+    // The pane became a thumbnail (a BSP leaf hidden behind a solo, a view
+    // moved back to the sidebar).  It stops sizing the surface and goes
+    // back to asking for a downscale of it.
+    surface.setDisplaySize(null);
+    expect(targets.at(-1)).toEqual({ width: 1024, height: 512 });
+
+    restore();
+  });
+
+  it("re-derives nothing while the box is still unmeasured", () => {
+    const { surface, targets, restore } = attachTargeting();
+
+    // Every wire subscribe costs the server an encoder rebuild and this
+    // client a keyframe, so a display size arriving before the box has been
+    // measured must not manufacture one: there is no box to scale to and
+    // the eager subscribe already went out unscaled.
+    const before = targets.length;
+    surface.setDisplaySize(900, 500, 120);
+    expect(targets.slice(before)).toEqual([]);
+
+    restore();
+  });
+});

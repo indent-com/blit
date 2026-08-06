@@ -814,8 +814,12 @@ export class BlitSurfaceCanvas {
     scale120?: number,
   ): void {
     if (width == null) {
+      const wasSized = this._displaySize !== null;
       this._displaySize = null;
       this.clearResizeConstraint();
+      // Back to watching at the mediated size, so this view offers a scaled
+      // request again.  See the note below on why the pair matters.
+      if (wasSized) this.refreshScaledTarget();
       this.applyLayout();
       return;
     }
@@ -827,7 +831,22 @@ export class BlitSurfaceCanvas {
       (typeof devicePixelRatio === "number"
         ? Math.round(devicePixelRatio * 120)
         : 0);
+    const wasSized = this._displaySize !== null;
     this._displaySize = { width: w, height: h, scale120: s };
+    // A scaled subscriber is left out of the server's size mediation
+    // entirely: it asked to be served a downscale of whatever the surface
+    // happens to be, so it gets no say in how big that is.  Gaining a
+    // display size is what turns this view from one of those into a live
+    // pane, and {@link scaledTarget} reads `_displaySize` — so the request
+    // has to be re-derived here, not only when the box changes.
+    //
+    // Without it, a pane that was still 0×0 when its binding first measured
+    // (the box observer then wins the race and registers a thumbnail's
+    // target) keeps that target forever: the server skips the client in
+    // mediation, every resize it sends is ignored, and the surface stays at
+    // the size it had in the sidebar until the pane's box next crosses an
+    // octave and the observer happens to re-derive.
+    if (!wasSized) this.refreshScaledTarget();
     // Canvas backing buffer is intentionally NOT resized here.  It tracks
     // the decoded frame size (set in blitFromStore) so the last sharp
     // frame stays sharp while applyLayout() places it in the new
@@ -1148,10 +1167,19 @@ export class BlitSurfaceCanvas {
     return width > 0 && height > 0 ? { width, height } : null;
   }
 
-  /** Re-derive the scaled request after the box or the surface changed. */
+  /** Re-derive the scaled request after the box or the display size
+   *  changed.
+   *
+   *  Nothing to re-derive before the box has been measured — the request is
+   *  the box — or once disposed: `dispose()` clears the display size on its
+   *  way to unsubscribing, and re-deriving there would put a subscribe on
+   *  the wire, costing the server an encoder rebuild, immediately before
+   *  the unsubscribe that makes it moot. */
   private refreshScaledTarget(): void {
     const sub = this._subscribedSurface;
-    if (!sub || !this._surfaceViewId) return;
+    if (this.disposed || !this._presentBox || !sub || !this._surfaceViewId) {
+      return;
+    }
     const conn =
       (this._workspace as any).getConnection(sub.connectionId) ?? null;
     conn?.setSurfaceViewTarget(
