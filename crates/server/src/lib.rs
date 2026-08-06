@@ -3451,7 +3451,6 @@ async fn enforce_deadlines(state: &AppState) {
 /// holding the slave open kept a dead terminal marked `running` forever, and
 /// `blit terminal wait` blocked until its own client-side timeout.
 async fn supervise(state: &AppState) {
-    enforce_deadlines(state).await;
     let exited: Vec<(u16, u64)> = {
         let sess = state.session.lock().await;
         sess.ptys
@@ -3463,6 +3462,11 @@ async fn supervise(state: &AppState) {
     for (id, generation) in exited {
         cleanup_pty_internal(id, Some(generation), state).await;
     }
+    // After the exit scan, never before it: `reap_zombies` waits a child
+    // without marking its terminal exited, so between that wait and the next
+    // scan the pty is `!exited` with its pid already freed.  Signalling first
+    // would aim the stop sequence's `kill(-pid)` at a released process group.
+    enforce_deadlines(state).await;
     // The backstop still runs, now targeted at owned pids only, so a child
     // whose SIGCHLD we missed cannot linger as a zombie.
     pty::reap_zombies();
