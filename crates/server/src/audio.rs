@@ -9,6 +9,7 @@ use blit_remote::{AUDIO_FRAME_CODEC_OPUS, S2C_AUDIO_FRAME};
 use opus::{Application, Channels, Encoder as OpusEncoder};
 use std::collections::{HashMap, VecDeque};
 use std::io::BufRead;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -320,11 +321,69 @@ fn wait_for_socket(path: &Path, timeout: std::time::Duration) -> bool {
     false
 }
 
+/// Name of the private runtime directory holding instance `instance_id`'s
+/// PipeWire and pulse sockets.  Scoped to this process; see the call site in
+/// `spawn` for why the pid has to be in there.
+fn audio_dir_name(instance_id: u16) -> String {
+    format!("blit-audio-{}-{instance_id}", std::process::id())
+}
+
+/// Delete `blit-audio-<pid>-<instance>` directories whose owning blit server
+/// is gone.  Restarting a pipeline inside one process reuses its own name, so
+/// the only leftovers are from servers that exited without running
+/// `shutdown()` — SIGKILL, or a panic that skipped the `Drop`.
+///
+/// Deliberately conservative, since the whole point of the pid in the name is
+/// to stop one server from deleting another's live sockets.  A directory goes
+/// only when its name parses, no process holds the pid, and we own it.
+/// Anything else is left alone, including the legacy `blit-audio-<instance>`
+/// names written by older servers: those carry no pid, so there is no way to
+/// tell a stale one from a running server's.
+///
+/// The pid check assumes the directory's owner shares our PID namespace.
+/// That holds for servers sharing a runtime dir on one host; a container that
+/// bind-mounts the host's temp dir but not its PID namespace could still see
+/// a live directory as stale.
+fn sweep_stale_audio_dirs(runtime_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(runtime_dir) else {
+        return;
+    };
+    // SAFETY: `getuid` is always successful and has no preconditions.
+    let self_uid = unsafe { libc::getuid() };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix("blit-audio-")) else {
+            continue;
+        };
+        let Some((pid, instance)) = rest.split_once('-') else {
+            continue;
+        };
+        if pid.parse::<u32>().is_err() || instance.parse::<u16>().is_err() {
+            continue;
+        }
+        if Path::new("/proc").join(pid).exists() {
+            continue;
+        }
+        // symlink_metadata, not metadata: never follow a link planted in a
+        // shared runtime dir such as /tmp.
+        let path = entry.path();
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
+        if !meta.is_dir() || meta.uid() != self_uid {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
 impl AudioPipeline {
     /// Spawn a new PipeWire instance and start capturing audio.
     ///
     /// `runtime_dir` is the XDG_RUNTIME_DIR for this compositor instance.
-    /// `instance_id` is used to name the PipeWire remote uniquely.
+    /// `instance_id` names the PipeWire remote uniquely *within this
+    /// process*; see the runtime-dir comment below for why that is not
+    /// enough on its own.
     /// `bitrate` is the Opus encoder bitrate in bits/sec (0 = default).
     /// `epoch` is the shared time origin (same `Instant` used by video
     /// timestamps) so audio and video share a common timebase for A/V sync.
@@ -340,13 +399,33 @@ impl AudioPipeline {
     ) -> Result<Self, String> {
         // Use a private subdirectory so the PulseAudio socket doesn't
         // collide with the system's or with other blit instances.
-        let audio_dir = runtime_dir.join(format!("blit-audio-{instance_id}"));
+        //
+        // The pid is part of the name because `instance_id` is a per-server
+        // counter that restarts at 1 in every blit server process — it is
+        // unique within one server, not across servers.  Two servers whose
+        // runtime dirs resolve to the same place both pick instance 1, and
+        // that is the common case rather than an exotic one: a compositor
+        // with no writable XDG_RUNTIME_DIR falls back to the temp dir, and
+        // it exports that fallback to its PTY children, so a dev stack
+        // started from inside a blit terminal inherits it too.  Both then
+        // land on /tmp/blit-audio-1, and the `remove_dir_all` below deletes
+        // the other server's live sockets: the loser's capture stream ends
+        // up reading a daemon that nothing feeds, its pipeline restarts,
+        // and the restart deletes the winner's directory in turn.  Audio
+        // then ping-pongs between the two servers, silent on whichever one
+        // did not spawn last.
+        let audio_dir = runtime_dir.join(audio_dir_name(instance_id));
 
         // Remove leftovers from a previous unclean exit so we don't trip
         // over stale PipeWire/pulse sockets ("Address already in use").
         if audio_dir.exists() {
             let _ = std::fs::remove_dir_all(&audio_dir);
         }
+
+        // Pid-scoped names are never reused, so a server that died without
+        // running `shutdown()` leaves its directory behind for good unless
+        // somebody collects it.
+        sweep_stale_audio_dirs(runtime_dir);
 
         std::fs::create_dir_all(&audio_dir)
             .map_err(|e| format!("failed to create audio runtime dir: {e}"))?;
@@ -974,5 +1053,75 @@ async fn encoder_task(
 
             byte_buf.drain(..consumed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pid with no `/proc` entry.  Scanning down from `pid_max` keeps us
+    /// clear of the low numbers the kernel is about to hand out.
+    fn dead_pid() -> u32 {
+        let max = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(32768);
+        (2..max)
+            .rev()
+            .find(|p| !Path::new("/proc").join(p.to_string()).exists())
+            .expect("no free pid to use as a dead one")
+    }
+
+    #[test]
+    fn sweep_collects_dead_servers_and_spares_everyone_else() {
+        let root =
+            std::env::temp_dir().join(format!("blit-audio-sweep-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Ours, for a pipeline that is currently running.  This is the case
+        // the pid exists to protect: another server sweeping the same
+        // runtime dir must not touch it.
+        let live = root.join(audio_dir_name(1));
+        // A server that died without cleaning up.
+        let stale = root.join(format!("blit-audio-{}-1", dead_pid()));
+        // Written by a pre-pid server: no way to tell stale from in-use.
+        let legacy = root.join("blit-audio-1");
+        // Neither of these parses as `<pid>-<instance>`.
+        let unparsable = root.join("blit-audio-nope-1");
+        let unrelated = root.join("wayland-0");
+        for d in [&live, &stale, &legacy, &unparsable, &unrelated] {
+            std::fs::create_dir(d).unwrap();
+        }
+        // Same name as a stale directory but a plain file, so `remove_dir_all`
+        // must not be pointed at it.
+        let file = root.join(format!("blit-audio-{}-2", dead_pid()));
+        std::fs::write(&file, b"").unwrap();
+
+        sweep_stale_audio_dirs(&root);
+
+        assert!(live.exists(), "swept a live pipeline's directory");
+        assert!(
+            legacy.exists(),
+            "swept a legacy directory of unknown status"
+        );
+        assert!(unparsable.exists(), "swept an unparsable name");
+        assert!(unrelated.exists(), "swept an unrelated entry");
+        assert!(file.exists(), "swept a non-directory");
+        assert!(!stale.exists(), "left a dead server's directory behind");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn audio_dir_name_is_scoped_to_this_process() {
+        let name = audio_dir_name(1);
+        assert!(
+            name.contains(&std::process::id().to_string()),
+            "{name} carries no pid, so a second server would pick the same one"
+        );
+        // Distinct compositor sessions still get distinct directories.
+        assert_ne!(audio_dir_name(1), audio_dir_name(2));
     }
 }
