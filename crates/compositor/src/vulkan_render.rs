@@ -1757,7 +1757,7 @@ impl VulkanRenderer {
                 Nv12Export::OpaqueFd,
             );
             let ok = self
-                .nv12_outputs
+                .nv12_opaque_outputs
                 .get(&key)
                 .is_some_and(|(v, _)| !v.is_empty());
             eprintln!(
@@ -1796,6 +1796,24 @@ impl VulkanRenderer {
             .remove(&(surface_id, target_w, target_h))
         {
             self.defer_or_destroy_downscale_output(out);
+        }
+        // The OPAQUE_FD NV12 buffers are filled from this target's blit, so
+        // they go with it.  Left behind, the key keeps telling
+        // `retire_pending` that an NV12 target "has already published this
+        // frame" whenever the composite returns to this exact size — but
+        // nothing fills the NV12 side any more, so nothing is published at
+        // all.  The server then never sees a SurfaceCommit *or* the
+        // SurfaceResized derived from it: its native size freezes at the old
+        // value, the encode loop waits for pixels that cannot arrive, and
+        // the surface streams black until some resize lands on a fresh size.
+        // Only the OPAQUE_FD map: `nv12_outputs` at this key can be a
+        // compositor-owned Vulkan Video encode image, which is not ours to
+        // destroy here.
+        if let Some((nv12s, _)) = self
+            .nv12_opaque_outputs
+            .remove(&(surface_id, target_w, target_h))
+        {
+            self.destroy_nv12_vec(nv12s);
         }
     }
 
