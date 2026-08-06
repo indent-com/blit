@@ -905,15 +905,6 @@ struct SurfaceSubState {
     /// planar YUV444).  Meaningful only with `wants_nv12_opaque`; recorded
     /// for the same reason.
     wants_opaque_444: bool,
-    /// Until this instant, CPU-origin (BGRA/RGBA) frames are skipped for a
-    /// zero-copy-capable session rather than CPU-converted: the target
-    /// registration just sent implies a recomposite whose GPU-converted
-    /// frame arrives within a frame period, and encoding the interim BGRA
-    /// would put the whole conversion on the CPU for nothing.  Past the
-    /// deadline the zero-copy install evidently failed (export refusal,
-    /// Vulkan Video owns the image) and CPU conversion is the only path
-    /// left, so the gate lifts rather than starving the stream.
-    zero_copy_wait_until: Option<Instant>,
     /// Next tick this surface may send a frame (pacing deadline).
     next_send_at: Option<Instant>,
     /// Frames remaining in the post-subscribe burst window that
@@ -5248,10 +5239,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                     continue;
                 }
                 let cached = cached.map(|(p, _)| p);
-                // CPU-origin pixels for a zero-copy session, inside the
-                // post-registration grace window: wait for the
-                // GPU-converted frame instead of CPU-converting.  See
-                // `zero_copy_wait_until`.
+                // CPU-origin pixels for a zero-copy session: the encoder
+                // would refuse them anyway — NVENC encodes GPU-converted
+                // frames or nothing — so don't burn an encode job.  The
+                // stream waits for the zero-copy frame the target
+                // registration's recomposite delivers.
                 if cached
                     .as_ref()
                     .is_some_and(|p| {
@@ -5265,10 +5257,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         .clients
                         .get(&work.cid)
                         .and_then(|c| c.surface_subs.get(&sid))
-                        .is_some_and(|s| {
-                            s.wants_nv12_opaque
-                                && s.zero_copy_wait_until.is_some_and(|t| Instant::now() < t)
-                        })
+                        .is_some_and(|s| s.wants_nv12_opaque)
                 {
                     continue;
                 }
@@ -6393,10 +6382,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // that has since gone away.
                         s.wants_nv12_opaque = encoder_wants_nv12_opaque;
                         s.wants_opaque_444 = encoder_opaque_444;
-                        if encoder_wants_nv12_opaque {
-                            s.zero_copy_wait_until =
-                                Some(Instant::now() + Duration::from_millis(500));
-                        }
                     }
                 }
                 #[cfg(not(target_os = "linux"))]

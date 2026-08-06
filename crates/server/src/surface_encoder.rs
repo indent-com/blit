@@ -1197,31 +1197,20 @@ impl SurfaceEncoder {
         }
     }
 
-    /// Whether this encoder can consume `PixelData::Nv12OpaqueFd`, i.e.
-    /// take YUV straight out of a Vulkan `OPAQUE_FD` allocation with no CPU
+    /// Whether this encoder consumes `PixelData::Nv12OpaqueFd`, i.e. takes
+    /// YUV straight out of a Vulkan `OPAQUE_FD` allocation with no CPU
     /// copy.  Only NVENC can: CUDA is the sole importer of that handle
     /// type.  The buffer's layout must match the session — NV12 for 4:2:0,
     /// planar YUV444 for 4:4:4 — which is what `opaque_wants_444` reports;
     /// the target registration carries it to the compositor.
     ///
-    /// `BLIT_NVENC_ZEROCOPY=0` forces this off, so both the zero-copy and
-    /// the BGRA-downscale arm can be measured against one binary.
+    /// There is no opt-out: NVENC encodes GPU-converted frames or nothing.
     #[cfg(target_os = "linux")]
     pub fn wants_nv12_opaque_fd(&self) -> bool {
-        if !matches!(
+        matches!(
             self.kind,
             SurfaceEncoderKind::NvencH264(_) | SurfaceEncoderKind::NvencAV1(_)
-        ) {
-            return false;
-        }
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            let on = std::env::var("BLIT_NVENC_ZEROCOPY").as_deref() != Ok("0");
-            if !on {
-                eprintln!("[surface-encoder] BLIT_NVENC_ZEROCOPY=0: NVENC takes the BGRA path");
-            }
-            on
-        })
+        )
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1294,30 +1283,14 @@ impl SurfaceEncoder {
     }
 
     pub fn encode(&mut self, rgba: &[u8]) -> Option<(Vec<u8>, bool)> {
-        // NVENC: convert on the CPU (full-range BT.601) rather than
-        // handing NVENC raw RGB — its internal RGB→YUV conversion is
-        // limited-range with no knob, which would splice wrong-range
-        // frames into streams whose zero-copy frames come from the
-        // compositor's full-range shaders.
+        // NVENC encodes GPU-converted frames only.  Raw RGB would go
+        // through its internal limited-range conversion (wrong for blit's
+        // full-range streams), and converting host-side puts the whole
+        // pipeline on the CPU — neither is acceptable, so CPU pixels are
+        // refused and the stream waits for the zero-copy frame.
         if let SurfaceEncoderKind::NvencH264(_) | SurfaceEncoderKind::NvencAV1(_) = &self.kind {
-            let (sw, sh) = (self.source_width as usize, self.source_height as usize);
-            let (enc_w, enc_h) = (self.width as usize, self.height as usize);
-            let is_444 = self.chroma.is_444();
-            let (SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc)) =
-                &mut self.kind
-            else {
-                unreachable!()
-            };
-            let mut result = if is_444 {
-                let planes = packed_to_yuv444_padded(rgba, sw, sh, enc_w, enc_h, 0, 1, 2);
-                enc.encode_yuv444(&planes, enc_w, enc_h)
-            } else {
-                let nv12 = packed_to_nv12_padded(rgba, sw, sh, enc_w, enc_h, 0, 1, 2);
-                let uv_stride = enc_w.div_ceil(2) * 2;
-                enc.encode_nv12(&nv12, enc_w, uv_stride, enc_h)
-            };
-            self.fixup_keyframe(&mut result);
-            return result;
+            nvenc_refuse_cpu_pixels();
+            return None;
         }
 
         let enc_len = expected_rgba_len(self.width, self.height);
@@ -1823,17 +1796,10 @@ impl SurfaceEncoder {
                 };
                 encoder.encode_yuv(yuv, self.width, self.height)
             }
-            SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => {
-                // CPU full-range conversion; NVENC's ARGB input would
-                // convert limited-range (see `encode`).
-                if self.chroma.is_444() {
-                    let planes = packed_to_yuv444_padded(bgra, src_w, src_h, enc_w, enc_h, 2, 1, 0);
-                    enc.encode_yuv444(&planes, enc_w, enc_h)
-                } else {
-                    let nv12 = packed_to_nv12_padded(bgra, src_w, src_h, enc_w, enc_h, 2, 1, 0);
-                    let uv_stride = enc_w.div_ceil(2) * 2;
-                    enc.encode_nv12(&nv12, enc_w, uv_stride, enc_h)
-                }
+            SurfaceEncoderKind::NvencH264(_) | SurfaceEncoderKind::NvencAV1(_) => {
+                // GPU-converted frames only — see `encode`.
+                nvenc_refuse_cpu_pixels();
+                None
             }
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(enc) => enc.encode_bgra_padded(bgra, src_w, src_h),
@@ -2248,68 +2214,15 @@ fn rgba_to_yuv444(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
 /// BGRA -> I420 with edge-pixel padding to encoder dimensions.
 /// `src_w × src_h` is the actual pixel count in `bgra`.
 /// `enc_w × enc_h` is the encoder output dimensions (>= src).
-/// Packed 4-byte RGB pixels → NV12 (Y plane + interleaved UV) at encoder
-/// dimensions, edge-extended.  Full-range BT.601, like every conversion in
-/// blit — NVENC's own ARGB input is limited-range with no knob, so the
-/// CPU input paths convert here instead of handing NVENC raw RGB.
-fn packed_to_nv12_padded(
-    src: &[u8],
-    src_w: usize,
-    src_h: usize,
-    enc_w: usize,
-    enc_h: usize,
-    r_off: usize,
-    g_off: usize,
-    b_off: usize,
-) -> Vec<u8> {
-    let y_size = enc_w * enc_h;
-    let uv_w = enc_w.div_ceil(2);
-    let uv_h = enc_h.div_ceil(2);
-    let mut out = vec![0u8; y_size + uv_w * uv_h * 2];
-    let (y_plane, uv) = out.split_at_mut(y_size);
-    compute_y_plane_padded(src, src_w, src_h, enc_w, enc_h, y_plane, r_off, g_off, b_off);
-    let mut u_plane = vec![0u8; uv_w * uv_h];
-    let mut v_plane = vec![0u8; uv_w * uv_h];
-    compute_uv_planes_padded(
-        src,
-        src_w,
-        src_h,
-        enc_w,
-        enc_h,
-        &mut u_plane,
-        &mut v_plane,
-        r_off,
-        g_off,
-        b_off,
-    );
-    for (i, uv2) in uv.chunks_exact_mut(2).enumerate() {
-        uv2[0] = u_plane[i];
-        uv2[1] = v_plane[i];
+/// Rate-limit stamp for the NVENC CPU-pixel refusal below.
+fn nvenc_refuse_cpu_pixels() {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[surface-encoder] NVENC encodes GPU-converted frames only; CPU pixels refused \
+             (waiting for the zero-copy target)",
+        );
     }
-    out
-}
-
-/// Packed 4-byte RGB pixels → planar YUV 4:4:4 at encoder dimensions,
-/// edge-extended.  Full-range BT.601; see `packed_to_nv12_padded`.
-fn packed_to_yuv444_padded(
-    src: &[u8],
-    src_w: usize,
-    src_h: usize,
-    enc_w: usize,
-    enc_h: usize,
-    r_off: usize,
-    g_off: usize,
-    b_off: usize,
-) -> Vec<u8> {
-    let plane_size = enc_w * enc_h;
-    let mut yuv = vec![0u8; plane_size * 3];
-    let (y_plane, uv) = yuv.split_at_mut(plane_size);
-    let (u_plane, v_plane) = uv.split_at_mut(plane_size);
-    compute_y_plane_padded(src, src_w, src_h, enc_w, enc_h, y_plane, r_off, g_off, b_off);
-    compute_uv_planes_444_padded(
-        src, src_w, src_h, enc_w, enc_h, u_plane, v_plane, r_off, g_off, b_off,
-    );
-    yuv
 }
 
 fn bgra_to_yuv420_padded(

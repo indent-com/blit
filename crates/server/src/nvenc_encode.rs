@@ -389,12 +389,9 @@ pub struct NvencDirectEncoder {
     cuda_devptr_nv12: gpu_libs::CUdeviceptr,
     cuda_registered_nv12: *mut c_void,
     nv12_pitch: u32,
-    // YUV444 buffer — planar Y,U,V at full resolution, height * 3 rows.
-    // Only allocated for 4:4:4 sessions; the CPU BGRA path uploads here
-    // so NVENC's own RGB→YUV conversion (limited-range, no knob) never
-    // runs — blit's streams are full-range throughout.
-    cuda_devptr_yuv444: gpu_libs::CUdeviceptr,
-    cuda_registered_yuv444: *mut c_void,
+    /// Session chroma: true = 4:4:4.  Zero-copy buffers must arrive in
+    /// the matching layout (planar YUV444 vs NV12).
+    session_is_444: bool,
     verbose: bool,
     /// Cached SPS+PPS NAL units (Annex B with start codes) from the first
     /// IDR frame.  Prepended to subsequent IDR frames that NVENC emits
@@ -890,51 +887,6 @@ impl NvencDirectEncoder {
             return Err(format!("cuMemAllocHost failed: {status}"));
         }
 
-        // --- YUV444 buffer (4:4:4 sessions only) ---
-        // Planar Y,U,V — three full-resolution planes sharing one pitch.
-        let mut cuda_devptr_yuv444: gpu_libs::CUdeviceptr = 0;
-        let mut cuda_registered_yuv444: *mut c_void = ptr::null_mut();
-        if chroma.is_444() {
-            let mut yuv444_pitch_bytes: usize = 0;
-            status = unsafe {
-                (cuda.cuMemAllocPitch_v2)(
-                    &mut cuda_devptr_yuv444,
-                    &mut yuv444_pitch_bytes,
-                    width as usize,
-                    (height * 3) as usize,
-                    16,
-                )
-            };
-            if status != 0 {
-                return Err(format!("cuMemAllocPitch (YUV444) failed: {status}"));
-            }
-            // NVENC derives the U/V plane offsets from pitch*height, so
-            // the planes must share the Y pitch — cuMemAllocPitch computed
-            // one pitch for all three rows-of-height, which is exactly that.
-            if yuv444_pitch_bytes as u32 != nv12_pitch {
-                unsafe { (cuda.cuMemFree_v2)(cuda_devptr_yuv444) };
-                return Err(format!(
-                    "YUV444 pitch {yuv444_pitch_bytes} != NV12 pitch {nv12_pitch}; same width and alignment should agree"
-                ));
-            }
-            let mut reg_yuv444 = vec![0u8; NVENC_REGISTER_RESOURCE_SIZE];
-            w32(&mut reg_yuv444, 0, NV_ENC_REGISTER_RESOURCE_VER);
-            w32(&mut reg_yuv444, 4, NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR);
-            w32(&mut reg_yuv444, 8, width);
-            w32(&mut reg_yuv444, 12, height);
-            w32(&mut reg_yuv444, 16, nv12_pitch);
-            wptr(&mut reg_yuv444, 24, cuda_devptr_yuv444 as *mut c_void);
-            w32(&mut reg_yuv444, 40, NV_ENC_BUFFER_FORMAT_YUV444);
-            let nv_status = unsafe {
-                (fns.nvEncRegisterResource)(encoder, reg_yuv444.as_mut_ptr() as *mut c_void)
-            };
-            if nv_status != NV_ENC_SUCCESS {
-                unsafe { (cuda.cuMemFree_v2)(cuda_devptr_yuv444) };
-                return Err(format!("nvEncRegisterResource (YUV444) failed: {nv_status}"));
-            }
-            cuda_registered_yuv444 = rptr(&reg_yuv444, 32);
-        }
-
         if verbose {
             eprintln!(
                 "[nvenc-direct] initialized {codec} encoder for {width}x{height} nv12_pitch={nv12_pitch} (CUDA upload)"
@@ -961,8 +913,7 @@ impl NvencDirectEncoder {
             cuda_devptr_nv12,
             cuda_registered_nv12,
             nv12_pitch,
-            cuda_devptr_yuv444,
-            cuda_registered_yuv444,
+            session_is_444: chroma.is_444(),
             verbose,
             h264_sps_pps: Vec::new(),
             nv12_imports: HashMap::new(),
@@ -1413,17 +1364,13 @@ impl NvencDirectEncoder {
         // rejects (or worse, garbles) a picture whose registered format
         // disagrees with the encode config.  A mismatch means the server's
         // target registration and this encoder have drifted apart.
-        if is_444 != !self.cuda_registered_yuv444.is_null() {
+        if is_444 != self.session_is_444 {
             static LOGGED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!(
                     "[nvenc-zerocopy] buffer is_444={is_444} but session is {}; refusing",
-                    if self.cuda_registered_yuv444.is_null() {
-                        "4:2:0"
-                    } else {
-                        "4:4:4"
-                    },
+                    if self.session_is_444 { "4:4:4" } else { "4:2:0" },
                 );
             }
             return None;
@@ -1814,53 +1761,6 @@ impl NvencDirectEncoder {
         self.upload_and_encode_nv12(nv12_total)
     }
 
-    /// Encode planar YUV 4:4:4 (three full-resolution planes, tightly
-    /// packed at `plane_stride` bytes per row).  Only valid on a session
-    /// created with 4:4:4 chroma — others never allocated the buffer.
-    pub fn encode_yuv444(
-        &mut self,
-        planes: &[u8],
-        plane_stride: usize,
-        src_h: usize,
-    ) -> Option<(Vec<u8>, bool)> {
-        if self.cuda_registered_yuv444.is_null() {
-            eprintln!("[nvenc-direct] encode_yuv444 on a non-4:4:4 session");
-            return None;
-        }
-        let enc_w = self.width as usize;
-        let enc_h = self.height as usize;
-        let pitch = self.nv12_pitch as usize;
-        let total = pitch * enc_h * 3;
-        assert!(total <= self.pinned_size);
-        let dst = self.pinned_host;
-
-        // Re-pitch each of the three planes into pinned staging.
-        for plane in 0..3 {
-            let src_base = plane * plane_stride * src_h;
-            let dst_base = plane * pitch * enc_h;
-            for row in 0..enc_h {
-                let sr = row.min(src_h.saturating_sub(1));
-                let src_off = src_base + sr * plane_stride;
-                let dst_off = dst_base + row * pitch;
-                let copy_len = enc_w.min(plane_stride);
-                if src_off + copy_len <= planes.len() {
-                    unsafe {
-                        ptr::copy_nonoverlapping(
-                            planes.as_ptr().add(src_off),
-                            dst.add(dst_off),
-                            copy_len,
-                        );
-                    }
-                }
-                if enc_w < pitch {
-                    unsafe { ptr::write_bytes(dst.add(dst_off + enc_w), 0, pitch - enc_w) };
-                }
-            }
-        }
-
-        self.upload_and_encode_yuv444(total)
-    }
-
     /// NV12-specific upload+encode.  Uses nv12_pitch for the encode params
     /// since NV12 has a different pitch from the RGBA buffers.
     fn upload_and_encode_nv12(&mut self, upload_bytes: usize) -> Option<(Vec<u8>, bool)> {
@@ -1869,17 +1769,6 @@ impl NvencDirectEncoder {
             self.cuda_devptr_nv12,
             self.cuda_registered_nv12,
             NV_ENC_BUFFER_FORMAT_NV12,
-        )
-    }
-
-    /// YUV444-specific upload+encode into the planar 4:4:4 buffer.  Shares
-    /// the NV12 pitch (same width, same alignment — checked at init).
-    fn upload_and_encode_yuv444(&mut self, upload_bytes: usize) -> Option<(Vec<u8>, bool)> {
-        self.upload_and_encode_planar(
-            upload_bytes,
-            self.cuda_devptr_yuv444,
-            self.cuda_registered_yuv444,
-            NV_ENC_BUFFER_FORMAT_YUV444,
         )
     }
 
@@ -2065,9 +1954,6 @@ impl Drop for NvencDirectEncoder {
             if !self.cuda_registered_nv12.is_null() {
                 (self.fns.nvEncUnregisterResource)(self.encoder, self.cuda_registered_nv12);
             }
-            if !self.cuda_registered_yuv444.is_null() {
-                (self.fns.nvEncUnregisterResource)(self.encoder, self.cuda_registered_yuv444);
-            }
             // Zero-copy imports: unregister before the encoder goes, and
             // release the CUDA side (which also closes the dup'd fd it took
             // ownership of at import).
@@ -2088,9 +1974,6 @@ impl Drop for NvencDirectEncoder {
                 }
                 if self.cuda_devptr_nv12 != 0 {
                     (cuda.cuMemFree_v2)(self.cuda_devptr_nv12);
-                }
-                if self.cuda_devptr_yuv444 != 0 {
-                    (cuda.cuMemFree_v2)(self.cuda_devptr_yuv444);
                 }
                 (cuda.cuCtxDestroy_v2)(self.cuda_ctx);
             }
