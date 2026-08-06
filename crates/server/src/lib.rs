@@ -2492,6 +2492,58 @@ struct TickOutcome {
 }
 
 impl Session {
+    /// Re-decide a downscale target whose subscriber set just changed.
+    ///
+    /// Re-registers it for whoever is left — which re-evaluates whether the
+    /// NV12 `OPAQUE_FD` shape is safe, so an NVENC reader gets the zero-copy
+    /// path back once a subscriber that needed CPU pixels has gone — or
+    /// clears it when nobody is left.
+    ///
+    /// Clearing unconditionally would be wrong on both counts: it pulls the
+    /// buffer out from under clients still registered at that size, and it
+    /// leaves survivors on BGRA until something unrelated re-registers them.
+    #[cfg(target_os = "linux")]
+    fn resettle_downscale_target(&mut self, surface_id: u16, tw: u32, th: u32) {
+        let survivors: Vec<(bool, (u32, u32))> = self
+            .clients
+            .values()
+            .filter_map(|c| {
+                let s = c.surface_subs.get(&surface_id)?;
+                (s.last_registered_target == Some((tw, th))).then(|| {
+                    (
+                        s.wants_nv12_opaque,
+                        s.last_registered_native.unwrap_or((tw, th)),
+                    )
+                })
+            })
+            .collect();
+        let Some(cs) = self.compositor.as_mut() else {
+            return;
+        };
+        if let Some(&(_, (native_w, native_h))) = survivors.first() {
+            let _ = cs.handle.command_tx.send(
+                blit_compositor::CompositorCommand::RegisterDownscaleTarget {
+                    surface_id: surface_id as u32,
+                    target_w: tw,
+                    target_h: th,
+                    native_w,
+                    native_h,
+                    want_nv12_opaque: survivors.iter().all(|(w, _)| *w),
+                },
+            );
+        } else {
+            let _ = cs.handle.command_tx.send(
+                blit_compositor::CompositorCommand::ClearDownscaleTarget {
+                    surface_id: surface_id as u32,
+                    target_w: tw,
+                    target_h: th,
+                },
+            );
+            cs.last_pixels.remove(&(surface_id, tw, th));
+        }
+        cs.handle.wake();
+    }
+
     fn new() -> Self {
         Self {
             ptys: HashMap::new(),
@@ -10719,18 +10771,18 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 }
                 // Drop the per-client downscale target this client had
                 // registered so the compositor stops blitting into a
-                // BGRA buffer no encoder will ever read.
-                if let Some((tw, th)) = clear_target
-                    && let Some(cs) = sess.compositor.as_mut()
-                {
-                    let _ = cs.handle.command_tx.send(
-                        blit_compositor::CompositorCommand::ClearDownscaleTarget {
-                            surface_id: surface_id as u32,
-                            target_w: tw,
-                            target_h: th,
-                        },
-                    );
-                    cs.last_pixels.remove(&(surface_id, tw, th));
+                // BGRA buffer no encoder will ever read — unless someone
+                // else is registered at the same size, in which case the
+                // target is still theirs.
+                //
+                // Whoever is left also decides afresh whether it can take
+                // NV12: a subscriber needing CPU pixels forces the whole
+                // size onto BGRA, and when it leaves the remaining NVENC
+                // readers should get the zero-copy path back rather than
+                // stay on BGRA until something else happens to
+                // re-register.
+                if let Some((tw, th)) = clear_target {
+                    sess.resettle_downscale_target(surface_id, tw, th);
                 }
                 // Destroy this client's Vulkan Video encoder.  Ownership is
                 // per `(surface, client)`, so no refcount sweep over the
@@ -11282,6 +11334,24 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             cs.audio_broadcast.unsubscribe(client_id);
         }
         let client = sess.clients.remove(&client_id);
+        // Downscale targets this client had registered. A disconnect is the
+        // usual way a subscriber leaves — clients rarely send an explicit
+        // unsubscribe first — so without re-deciding here, a target that
+        // went to BGRA for a departed CPU-pixel reader would stay there.
+        #[cfg(target_os = "linux")]
+        let departed_targets: Vec<(u16, (u32, u32))> = client
+            .as_ref()
+            .map(|c| {
+                c.surface_subs
+                    .iter()
+                    .filter_map(|(sid, s)| s.last_registered_target.map(|t| (*sid, t)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        #[cfg(target_os = "linux")]
+        for (sid, (tw, th)) in departed_targets {
+            sess.resettle_downscale_target(sid, tw, th);
+        }
         let affected_ptys = client
             .as_ref()
             .map(|c| c.view_sizes.keys().copied().collect::<Vec<_>>())

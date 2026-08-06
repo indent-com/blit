@@ -2358,11 +2358,17 @@ impl VulkanRenderer {
         target_w: u32,
         target_h: u32,
     ) {
-        if let Some((nv12s, _)) = self
-            .nv12_dest_mut(export)
-            .remove(&(surface_id, target_w, target_h))
-        {
+        let key = (surface_id, target_w, target_h);
+        if let Some((nv12s, _)) = self.nv12_dest_mut(export).remove(&key) {
             self.destroy_nv12_vec(nv12s);
+        }
+        // `nv12_outputs` is also where a compositor-owned encode image
+        // lives, and `owned_encode_nv12` names it. Dropping the image
+        // without the name leaves a key that outlives what it points at,
+        // which makes `create_vulkan_encoder` skip allocating a
+        // replacement — the surface then encodes from nothing.
+        if !matches!(export, Nv12Export::OpaqueFd) {
+            self.owned_encode_nv12.remove(&key);
         }
     }
 
@@ -2469,6 +2475,22 @@ impl VulkanRenderer {
             Nv12Export::DmaBuf if !self.has_dmabuf => return,
             Nv12Export::OpaqueFd if !self.has_external_memory_fd => return,
             _ => {}
+        }
+        // A Vulkan Video session encodes from the compositor's own image at
+        // this key and is what the client is being served by; installing
+        // either flavour of NV12 output over it would take the image away
+        // from a live encoder, and nothing would read what replaced it.
+        // `create_nv12_encode_image` is how that image is (re)built, and it
+        // does not come through here.
+        if self
+            .owned_encode_nv12
+            .contains_key(&(surface_id, target_w, target_h))
+        {
+            eprintln!(
+                "[vulkan-render] sid {surface_id} {target_w}x{target_h}: Vulkan Video owns the \
+                 encode image; not installing {export:?} NV12 outputs",
+            );
+            return;
         }
         let handle_type = export.handle_type();
         use std::os::fd::FromRawFd;
