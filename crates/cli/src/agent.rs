@@ -1023,6 +1023,7 @@ pub async fn cmd_record(
     max_frames: u32,
     max_duration: f64,
     source: RecordSource,
+    timing_path: Option<String>,
 ) -> Result<(), String> {
     use std::io::Write;
     use std::time::{Duration, Instant};
@@ -1107,6 +1108,14 @@ pub async fn cmd_record(
         let mut file: Option<std::fs::File> = None;
         let mut frame_count: u32 = 0;
         let mut total_bytes: u64 = 0;
+        let mut timing: Option<std::fs::File> = match timing_path {
+            Some(ref p) => {
+                let mut f = std::fs::File::create(p).map_err(|e| format!("create {p}: {e}"))?;
+                writeln!(f, "pts_ms,arrival_ms,bytes,key").map_err(|e| format!("write: {e}"))?;
+                Some(f)
+            }
+            None => None,
+        };
 
         loop {
             let data = conn.recv().await?;
@@ -1115,6 +1124,11 @@ pub async fn cmd_record(
             }
             if data[0] == S2C_SURFACE_FRAME && data.len() >= 12 {
                 let surface_id = u16::from_le_bytes([data[1], data[2]]);
+                // Capture-time PTS, stamped at compositor commit — the clock
+                // the browser schedules presentation against.  Recording it
+                // beside arrival time is what makes the delivery jitter a
+                // client has to absorb measurable without a browser.
+                let pts_ms = u32::from_le_bytes([data[3], data[4], data[5], data[6]]);
                 let flags = data[7];
                 let width = u16::from_le_bytes([data[8], data[9]]);
                 let height = u16::from_le_bytes([data[10], data[11]]);
@@ -1143,6 +1157,18 @@ pub async fn cmd_record(
                 if let Some(ref mut f) = file {
                     f.write_all(payload).map_err(|e| format!("write: {e}"))?;
                     total_bytes += payload.len() as u64;
+                }
+
+                if let Some(ref mut t) = timing {
+                    writeln!(
+                        t,
+                        "{},{:.3},{},{}",
+                        pts_ms,
+                        start.elapsed().as_secs_f64() * 1000.0,
+                        payload.len(),
+                        u8::from(is_key)
+                    )
+                    .map_err(|e| format!("write timing: {e}"))?;
                 }
 
                 frame_count += 1;

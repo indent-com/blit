@@ -301,6 +301,7 @@ async fn async_main() {
                         frames,
                         duration,
                         agent::RecordSource::Pty,
+                        None,
                     )
                     .await
                 }
@@ -354,6 +355,7 @@ async fn async_main() {
                     duration,
                     codec,
                     size,
+                    timing,
                 } => {
                     agent::cmd_record(
                         transport,
@@ -365,6 +367,7 @@ async fn async_main() {
                             codecs: codec,
                             size,
                         },
+                        timing,
                     )
                     .await
                 }

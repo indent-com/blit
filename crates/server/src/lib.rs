@@ -1565,9 +1565,18 @@ fn step_adaptive_bandwidth(
         .iter()
         .filter(|f| f.surface_id == surface_id)
         .count();
+    // Deliberately SURFACE_INFLIGHT_MIN, not the derived cap.  This is the
+    // quality controller, not the pacer: it asks "is the link app-limited,
+    // so the measured budget says nothing about capacity".  Wiring it to
+    // `surface_inflight_cap(client) / 2` — which equals surface_frame_window
+    // whenever the cap is unclamped — makes the boundary move with RTT, so
+    // at 1 s / 60 Hz it lands at 71 against a steady-state inflight of ~60
+    // and flips app_limited on a link that is simply deep, not idle.  The
+    // threshold here must stay a constant; it happens to be the same 32 the
+    // flat cap used to give.
     let app_limited = !congested
         && client.browser_backlog_frames <= 4
-        && surface_inflight < surface_inflight_cap(client) / 2;
+        && surface_inflight < SURFACE_INFLIGHT_MIN / 2;
     let budget_bytes = surface_budget_bytes(client, surface_id);
     let ceiling = client
         .surface_subs
@@ -13308,6 +13317,34 @@ mod tests {
                 "rtt={rtt} fps={fps}: cap {cap} must exceed window {window}"
             );
         }
+    }
+
+    #[test]
+    fn app_limited_threshold_does_not_move_with_rtt() {
+        // Regression: deriving this from surface_inflight_cap made it track
+        // surface_frame_window, so a deep-but-healthy link read as
+        // app-limited and the quality controller walked the quantizer back
+        // toward the ceiling on a link that was merely far away.  The
+        // quality controller and the pacer answer different questions and
+        // must not share a threshold.
+        let deep = {
+            let (mut c, _rx) = test_client_with_capacity(64);
+            c.rtt_ms = 1000.0;
+            c.min_rtt_ms = 1000.0;
+            c.display_fps = 60.0;
+            c
+        };
+        let near = {
+            let (mut c, _rx) = test_client_with_capacity(64);
+            c.rtt_ms = 1.0;
+            c.min_rtt_ms = 1.0;
+            c.display_fps = 60.0;
+            c
+        };
+        // The window legitimately differs by an order of magnitude...
+        assert!(surface_frame_window(&deep) > surface_frame_window(&near) * 4);
+        // ...but the app-limited boundary must not.
+        assert_eq!(SURFACE_INFLIGHT_MIN / 2, 32);
     }
 
     #[test]

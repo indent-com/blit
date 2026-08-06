@@ -89,25 +89,27 @@ interface SurfacePresenter {
   /** True after the first frame has been presented.  The first frame
    *  paints synchronously to minimise time-to-first-pixel. */
   initialized: boolean;
-  /** Local-clock (`performance.now()`) estimate of where this stream's PTS
-   *  origin sits: the smallest `arrival - pts` seen, i.e. the fastest path
-   *  the link has demonstrated.  A late frame feeds {@link lateness}, not
-   *  this, so the baseline tracks the floor rather than drifting up to the
-   *  mean.  Leaks upward by {@link SurfaceStore.OFFSET_LEAK_MS} per frame
-   *  so genuine clock drift between server and browser is still followed. */
-  clockOffsetMs: number | null;
-  /** Recent lateness samples (ms) relative to {@link clockOffsetMs}, held
-   *  for roughly {@link SurfaceStore.LATENESS_WINDOW_MS} of stream.  The
-   *  margin is a quantile of this rather than a peak-tracking average: a
-   *  peak tracker spends the whole latency budget reacting to outliers it
-   *  cannot cover anyway, then takes ~55 frames to come back down.  A
-   *  quantile sizes to the jitter that actually recurs and lets the tail
-   *  fall through to skip-to-newest, which is the right handling for an
-   *  outlier regardless. */
-  lateness: number[];
-  /** Current playout margin (ms), slewed toward the quantile rather than
-   *  set to it — see {@link SurfaceStore.MARGIN_GROW_MS}. */
-  marginMs: number;
+  /** Recent `arrival - pts` samples (ms), covering roughly
+   *  {@link SurfaceStore.OFFSET_WINDOW_MS} of stream.  Both the fast-path
+   *  baseline and the presentation point are quantiles of this one
+   *  distribution, which is what makes the scheduler robust in both
+   *  directions: a burst frame arriving early is a low outlier and a late
+   *  frame is a high outlier, and a quantile ignores each without needing
+   *  a separate clamp or leak rule for either.
+   *
+   *  The absolute values are meaningless — they carry the arbitrary offset
+   *  between the server's `elapsed_ms()` epoch and `performance.now()` —
+   *  but that constant cancels out, since every number derived here is a
+   *  difference or is added straight back to a PTS. */
+  offsets: number[];
+  /** {@link SurfaceStore.FAST_QUANTILE} of {@link offsets}: the fastest the
+   *  path has recently shown itself to be, outlier-resistant.  Only used as
+   *  the reference for how much latency presentation is adding. */
+  fastOffsetMs: number;
+  /** The offset presentation actually runs at: a frame is drawn at
+   *  `pts + presentOffsetMs`.  Slewed toward its target rather than set to
+   *  it, because moving it shifts every future due time at once. */
+  presentOffsetMs: number;
   /** PTS (ms) of the previous arrival, for rewind/wrap detection. */
   lastPtsMs: number | null;
   /** Consecutive arrivals that looked like part of one continuous stream. */
@@ -358,38 +360,41 @@ export class SurfaceStore {
   /** Hard ceiling on latency the presenter is allowed to add.  Smoothing
    *  past this trades away more interactivity than juddering costs. */
   private static readonly PRESENT_DELAY_MAX_MS = 50;
-  /** How much stream the lateness distribution covers.  Expressed in time
+  /** How much stream the offset distribution covers.  Expressed in time
    *  rather than frames so the horizon is the same at 24 and 240 fps —
-   *  too short and the margin chases noise, too long and it responds
+   *  too short and the schedule chases noise, too long and it responds
    *  sluggishly to a link that genuinely changed (a Wi-Fi roam). */
-  private static readonly LATENESS_WINDOW_MS = 2000;
-  private static readonly LATENESS_WINDOW_MIN = 60;
-  private static readonly LATENESS_WINDOW_MAX = 480;
-  /** Quantile of observed lateness the margin covers.  The remaining tail
-   *  is deliberately not buffered for: those frames arrive overdue and are
-   *  skipped to the newest due one, which costs nothing and is what should
-   *  happen to a rare outlier. */
-  private static readonly LATENESS_QUANTILE = 0.95;
-  /** Maximum margin movement per frame, growing and shrinking (ms).
+  private static readonly OFFSET_WINDOW_MS = 1000;
+  private static readonly OFFSET_WINDOW_MIN = 60;
+  private static readonly OFFSET_WINDOW_MAX = 480;
+  /** Quantile of the offset distribution that presentation targets.  The
+   *  remaining tail is deliberately not buffered for: those frames arrive
+   *  overdue and are skipped to the newest due one, which costs nothing and
+   *  is what should happen to a rare outlier. */
+  private static readonly PRESENT_QUANTILE = 0.95;
+  /** Low quantile taken as "the fastest this path goes".  Not the strict
+   *  minimum: a burst frame is captured later but shipped immediately
+   *  behind its predecessor, so its transit genuinely is shorter, and a
+   *  minimum would take that one-off as a permanently faster link.  A
+   *  quantile ignores it for the same reason the high end ignores a single
+   *  late frame — no separate clamp or leak rule needed at either end. */
+  private static readonly FAST_QUANTILE = 0.02;
+  /** Maximum movement of {@link SurfacePresenter.presentOffsetMs} per frame.
    *
-   *  A margin change *is* a latency change — every future due time shifts
-   *  with it — so stepping the margin injects exactly the timing
-   *  discontinuity this scheduler exists to remove.  Slewing turns it into
-   *  a sub-perceptual speed-up or slow-down instead: 2 ms against a 16.7 ms
-   *  frame is a 12% rate nudge while it moves, and the margin can still
-   *  cross its whole range in well under a second.  Shrinking is slower
-   *  than growing because being under-buffered judders and being
-   *  over-buffered only costs a little latency. */
+   *  Moving it *is* a latency change — every future due time shifts with
+   *  it — so stepping injects exactly the timing discontinuity this
+   *  scheduler exists to remove.  Slewing turns it into a sub-perceptual
+   *  rate nudge: 2 ms against a 16.7 ms frame is 12% while it moves.
+   *
+   *  Shrinking is proportional rather than a flat crawl.  A flat
+   *  0.25 ms/frame took ~5 s to unwind a single stall, and because video
+   *  rides a reliable ordered channel every lost packet is such a stall —
+   *  so a lossy link sat near the latency ceiling permanently, strictly
+   *  worse than not scheduling at all, for exactly the users this exists
+   *  to help.  Proportional decay unwinds the same stall in ~0.5 s. */
   private static readonly MARGIN_GROW_MS = 2;
   private static readonly MARGIN_SHRINK_MS = 0.25;
-  /** Upward leak on the PTS→local baseline, per frame (ms).  At 60 fps
-   *  this allows ~3 ms/s of tracked drift — far more than two decent
-   *  clocks diverge, far less than jitter would push it. */
-  private static readonly OFFSET_LEAK_MS = 0.05;
-  /** Max downward step of that baseline per frame (ms).  A real path
-   *  improvement is still tracked in a handful of frames; a single
-   *  fast-arriving burst frame is not mistaken for one. */
-  private static readonly OFFSET_DROP_MAX_MS = 5;
+  private static readonly MARGIN_SHRINK_FRAC = 0.08;
   /** Fallback display refresh interval before any rAF delta is measured. */
   private static readonly DEFAULT_REFRESH_MS = 1000 / 60;
   /** Bounds on an rAF delta that counts as a refresh period: 1000 Hz to
@@ -981,9 +986,9 @@ export class SurfaceStore {
         queue: [],
         rafId: null,
         initialized: false,
-        clockOffsetMs: null,
-        lateness: [],
-        marginMs: 0,
+        offsets: [],
+        fastOffsetMs: 0,
+        presentOffsetMs: NaN,
         lastPtsMs: null,
         steadyRun: 0,
         frameIntervalMs: SurfaceStore.DEFAULT_REFRESH_MS,
@@ -1054,9 +1059,9 @@ export class SurfaceStore {
     // time would mean no frame ever compares as due and the surface would
     // freeze outright, which is far worse than the judder being fixed here.
     if (!Number.isFinite(ptsMs)) {
-      p.clockOffsetMs = null;
-      p.lateness.length = 0;
-      p.marginMs = 0;
+      p.offsets.length = 0;
+      p.fastOffsetMs = 0;
+      p.presentOffsetMs = NaN;
       p.steadyRun = 0;
       p.smoothing = false;
       p.lastPtsMs = null;
@@ -1087,31 +1092,11 @@ export class SurfaceStore {
       (ptsMs < p.lastPtsMs || ptsMs - p.lastPtsMs > SurfaceStore.STREAM_GAP_MS);
 
     if (ptsBroke) {
-      p.clockOffsetMs = null;
-      p.lateness.length = 0;
-      p.marginMs = 0;
+      p.offsets.length = 0;
+      p.fastOffsetMs = 0;
+      p.presentOffsetMs = NaN;
       p.steadyRun = 0;
       p.smoothing = false;
-    }
-
-    const offset = nowMs - ptsMs;
-    if (p.clockOffsetMs === null) {
-      p.clockOffsetMs = offset;
-    } else {
-      // Track the floor, leaking up slowly so real clock drift is followed
-      // without jitter dragging the baseline along with it.
-      //
-      // Clamp how far one sample may pull the floor *down*.  When the
-      // encoder emits two frames back to back, the second was captured a
-      // frame later but shipped immediately behind the first, so its
-      // transit really is shorter — a plain minimum would take that
-      // one-off as "the path is now this fast" and collapse the margin the
-      // buffer is built on.  Bounding the step keeps a genuine improvement
-      // trackable within a few frames while a burst only nudges it.
-      p.clockOffsetMs = Math.max(
-        Math.min(offset, p.clockOffsetMs + SurfaceStore.OFFSET_LEAK_MS),
-        p.clockOffsetMs - SurfaceStore.OFFSET_DROP_MAX_MS,
-      );
     }
 
     if (p.lastPtsMs !== null) {
@@ -1123,49 +1108,67 @@ export class SurfaceStore {
       }
     }
 
-    p.lateness.push(Math.max(0, offset - p.clockOffsetMs));
-    this.updateMargin(p);
+    p.offsets.push(nowMs - ptsMs);
+    this.updateSchedule(p);
 
     p.lastPtsMs = ptsMs;
     p.steadyRun++;
     if (p.steadyRun >= SurfaceStore.SMOOTHING_ENGAGE_FRAMES) p.smoothing = true;
   }
 
-  /** Trim the lateness window to ~{@link LATENESS_WINDOW_MS} of stream and
-   *  slew the margin toward that window's {@link LATENESS_QUANTILE}. */
-  private updateMargin(p: SurfacePresenter): void {
+  /** Trim the offset window to ~{@link OFFSET_WINDOW_MS} of stream, then
+   *  slew the presentation offset toward the window's
+   *  {@link PRESENT_QUANTILE}, capped at {@link PRESENT_DELAY_MAX_MS} of
+   *  added latency over {@link FAST_QUANTILE}. */
+  private updateSchedule(p: SurfacePresenter): void {
     const interval = Math.max(
       SurfaceStore.MIN_FRAME_INTERVAL_MS,
       p.frameIntervalMs,
     );
     const window = Math.min(
-      SurfaceStore.LATENESS_WINDOW_MAX,
+      SurfaceStore.OFFSET_WINDOW_MAX,
       Math.max(
-        SurfaceStore.LATENESS_WINDOW_MIN,
-        Math.round(SurfaceStore.LATENESS_WINDOW_MS / interval),
+        SurfaceStore.OFFSET_WINDOW_MIN,
+        Math.round(SurfaceStore.OFFSET_WINDOW_MS / interval),
       ),
     );
     // One element off the front per frame, on an array of at most a few
     // hundred numbers — a memmove of a couple of KB, well below the cost
     // of decoding the frame it accompanies.
-    if (p.lateness.length > window) {
-      p.lateness.splice(0, p.lateness.length - window);
+    if (p.offsets.length > window) {
+      p.offsets.splice(0, p.offsets.length - window);
     }
 
+    p.fastOffsetMs = quantile(p.offsets, SurfaceStore.FAST_QUANTILE);
     const target = Math.min(
-      quantile(p.lateness, SurfaceStore.LATENESS_QUANTILE),
-      SurfaceStore.PRESENT_DELAY_MAX_MS,
+      quantile(p.offsets, SurfaceStore.PRESENT_QUANTILE),
+      p.fastOffsetMs + SurfaceStore.PRESENT_DELAY_MAX_MS,
     );
-    p.marginMs =
-      target > p.marginMs
-        ? Math.min(target, p.marginMs + SurfaceStore.MARGIN_GROW_MS)
-        : Math.max(target, p.marginMs - SurfaceStore.MARGIN_SHRINK_MS);
+
+    if (!Number.isFinite(p.presentOffsetMs)) {
+      p.presentOffsetMs = target;
+      return;
+    }
+    if (target > p.presentOffsetMs) {
+      p.presentOffsetMs = Math.min(
+        target,
+        p.presentOffsetMs + SurfaceStore.MARGIN_GROW_MS,
+      );
+    } else {
+      const gap = p.presentOffsetMs - target;
+      const step = Math.max(
+        SurfaceStore.MARGIN_SHRINK_MS,
+        gap * SurfaceStore.MARGIN_SHRINK_FRAC,
+      );
+      p.presentOffsetMs = Math.max(target, p.presentOffsetMs - step);
+    }
   }
 
   /** Playout margin: how far behind the fastest observed path frames are
    *  held so a late one still lands on its intended refresh. */
   private playoutDelayMs(p: SurfacePresenter): number {
-    return p.marginMs;
+    if (!Number.isFinite(p.presentOffsetMs)) return 0;
+    return Math.max(0, p.presentOffsetMs - p.fastOffsetMs);
   }
 
   /** How many frames the presenter may hold while scheduling.
@@ -1252,7 +1255,7 @@ export class SurfaceStore {
     const p = this.presenters.get(surfaceId);
     if (!p || p.queue.length === 0) return;
 
-    if (!p.smoothing || p.clockOffsetMs === null) {
+    if (!p.smoothing || !Number.isFinite(p.presentOffsetMs)) {
       this.presentIndex(surfaceId, p, p.queue.length - 1);
       return;
     }
@@ -1261,7 +1264,7 @@ export class SurfaceStore {
     // one refresh from here.  Rounding by half a refresh picks the nearest
     // vsync rather than always the later one.
     const deadline = performance.now() + this.refreshMs / 2;
-    const due = p.clockOffsetMs + this.playoutDelayMs(p);
+    const due = p.presentOffsetMs;
 
     let idx = -1;
     for (let i = 0; i < p.queue.length; i++) {
@@ -1384,9 +1387,9 @@ export class SurfaceStore {
       // immediately instead of waiting out a margin from before the gap.
       p.steadyRun = 0;
       p.smoothing = false;
-      p.clockOffsetMs = null;
-      p.lateness.length = 0;
-      p.marginMs = 0;
+      p.offsets.length = 0;
+      p.fastOffsetMs = 0;
+      p.presentOffsetMs = NaN;
       this.flushPresenter(sid);
     }
   }

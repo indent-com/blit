@@ -363,13 +363,20 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
     drain();
 
     // A clump of not-yet-due frames must not pin decoder buffers without
-    // limit just because none of them have come due.
+    // limit just because none of them have come due.  The live cap is
+    // derived from the added latency and the frame interval, so assert
+    // against the derivation rather than a number that silently stops
+    // meaning anything when the schedule changes.
     const frames = Array.from({ length: 12 }, (_, i) =>
       ptsFrame(streamPts + 400 + i * REFRESH),
     );
     for (const f of frames) enqueue(store, 1, f);
 
-    expect(presenter(store, 1)!.queue.length).toBeLessThanOrEqual(4);
+    const p = presenter(store, 1)!;
+    expect(p.queue.length).toBeLessThanOrEqual(
+      (store as any).smoothedQueueCap(p),
+    );
+    expect(p.queue.length).toBeLessThanOrEqual(26);
     expect(frames.some((f) => f.closed)).toBe(true);
   });
 
@@ -475,7 +482,11 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
     // made to drop frames just for being fast.
     for (const fps of [24, 30, 60, 90, 120, 144, 240, 360, 480]) {
       // marginMs at its ceiling — the worst case the cap has to cover.
-      const probe = { marginMs: 50, frameIntervalMs: 1000 / fps };
+      const probe = {
+        presentOffsetMs: 50,
+        fastOffsetMs: 0,
+        frameIntervalMs: 1000 / fps,
+      };
       const margin = (store as any).playoutDelayMs(probe);
       const cap = (store as any).smoothedQueueCap(probe);
       expect(margin).toBe(50); // PRESENT_DELAY_MAX_MS
@@ -486,7 +497,7 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
   it("bounds the queue when the frame interval is degenerate", () => {
     // A PTS stream claiming impossible rates must not inflate the queue —
     // the interval floor, not the depth cap, is what stops it.
-    const probe = { marginMs: 50, frameIntervalMs: 0 };
+    const probe = { presentOffsetMs: 50, fastOffsetMs: 0, frameIntervalMs: 0 };
     const cap = (store as any).smoothedQueueCap(probe);
     expect(cap).toBeLessThanOrEqual(26);
   });
@@ -551,5 +562,201 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
 
     tick();
     expect(presented).toContain(after);
+  });
+});
+
+/**
+ * Adversarial scenarios, each run against a NEWEST-WINS CONTROL.
+ *
+ * Every other test here asserts the scheduler does what it intends.  These
+ * assert the only thing that actually matters: that it is never worse than
+ * the code it replaced.  That is the assertion class the rest of the suite
+ * lacked, which is why it was fully green while two regressions sat in the
+ * diff — a strictly-worse presenter passes every "does it schedule?" test.
+ */
+describe("SurfaceStore vs newest-wins control", () => {
+  const REFRESH = 1000 / 60;
+  const LATENCY = 40;
+
+  let rafCb: FrameRequestCallback | null;
+  let clock: number;
+
+  beforeEach(() => {
+    clock = 10_000;
+    rafCb = null;
+    vi.spyOn(performance, "now").mockImplementation(() => clock);
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      rafCb = cb;
+      return 1;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {
+      rafCb = null;
+    });
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => "visible",
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    Reflect.deleteProperty(document, "visibilityState");
+  });
+
+  /**
+   * Drive one presenter through an arrival trace and report what reached
+   * the canvas.  `control` forces newest-wins — i.e. main's behaviour —
+   * by pinning `smoothing` false after every arrival.
+   */
+  const run = (trace: { pts: number; at: number }[], control: boolean) => {
+    const store = new SurfaceStore();
+    const presented: number[] = [];
+    const presentedAt: number[] = [];
+    const orig = (store as any).presentFrame.bind(store);
+    vi.spyOn(store as any, "presentFrame").mockImplementation(
+      (sid: number, f: any) => {
+        presented.push(f.timestamp / 1000);
+        presentedAt.push(clock);
+        orig(sid, f);
+      },
+    );
+
+    let i = 0;
+    const start = trace[0].at;
+    const end = trace[trace.length - 1].at + 40 * REFRESH;
+    // Interleave arrivals and a free-running 60 Hz rAF loop.
+    for (let t = start; t <= end; t += REFRESH) {
+      clock = t;
+      while (i < trace.length && trace[i].at <= t) {
+        (store as any).enqueueFrame(1, {
+          closed: false,
+          displayWidth: 64,
+          displayHeight: 48,
+          timestamp: trace[i].pts * 1000,
+          close() {
+            this.closed = true;
+          },
+        });
+        if (control) {
+          const p = (store as any).presenters.get(1);
+          if (p) p.smoothing = false;
+        }
+        i++;
+      }
+      if (rafCb) {
+        const cb = rafCb;
+        rafCb = null;
+        cb(t);
+      }
+    }
+
+    // Longest interval between consecutive paints — the judder metric.
+    let maxGap = 0;
+    for (let k = 1; k < presentedAt.length; k++) {
+      maxGap = Math.max(maxGap, presentedAt[k] - presentedAt[k - 1]);
+    }
+    store.destroy();
+    return { count: presented.length, maxGap, presented };
+  };
+
+  /** 60 fps capture grid; `jitter(i)` ms of extra delivery delay on frame i. */
+  const trace = (n: number, jitter: (i: number) => number = () => 0) =>
+    Array.from({ length: n }, (_, i) => ({
+      pts: 1000 + i * REFRESH,
+      at: 1000 + i * REFRESH + LATENCY + jitter(i),
+    }));
+
+  const NEVER_WORSE = (name: string, t: { pts: number; at: number }[]) => {
+    it(`is never worse than newest-wins: ${name}`, () => {
+      const control = run(t, true);
+      const scheduled = run(t, false);
+      expect(scheduled.count).toBeGreaterThanOrEqual(control.count);
+      expect(scheduled.maxGap).toBeLessThanOrEqual(control.maxGap + 1e-6);
+    });
+  };
+
+  it("control arm is not degenerate", () => {
+    // Guards the assertions below.  If forcing newest-wins produced the
+    // same trace as scheduling, every NEVER_WORSE case would hold
+    // vacuously and this whole describe block would assert nothing.
+    const t = trace(200, (i) => (i % 3 === 0 ? 28 : i % 3 === 1 ? 4 : 14));
+    const control = run(t, true);
+    const scheduled = run(t, false);
+    expect(scheduled.maxGap).toBeLessThan(control.maxGap);
+  });
+
+  NEVER_WORSE("clean stream", trace(200));
+  NEVER_WORSE(
+    "steady jitter",
+    trace(200, (i) => (i % 2 ? 9 : 0)),
+  );
+  NEVER_WORSE(
+    "heavy jitter",
+    trace(200, (i) => (i % 3 === 0 ? 28 : i % 3 === 1 ? 4 : 14)),
+  );
+
+  it("recovers its added latency quickly after a single stall", () => {
+    // Scenario D. Video rides a reliable ordered channel, so EVERY lost
+    // packet is a head-of-line stall of at least one RTT.  A flat
+    // 0.25 ms/frame unwind left the presenter pinned near the latency
+    // ceiling for ~5 s afterwards — on a lossy link, permanently, which is
+    // strictly worse than not scheduling at all for the exact users this
+    // feature exists to serve.
+    const t = trace(400).map((f, i) =>
+      // One 500 ms head-of-line block: 30 frames buffered, then released.
+      i >= 100 && i < 130 ? { ...f, at: trace(400)[130].at } : f,
+    );
+    const store = new SurfaceStore();
+    let i = 0;
+    const margins: number[] = [];
+    for (let k = 0; k < t.length; k++) {
+      clock = t[k].at;
+      (store as any).enqueueFrame(1, {
+        closed: false,
+        displayWidth: 64,
+        displayHeight: 48,
+        timestamp: t[k].pts * 1000,
+        close() {
+          this.closed = true;
+        },
+      });
+      if (rafCb) {
+        const cb = rafCb;
+        rafCb = null;
+        cb(clock);
+      }
+      const p = (store as any).presenters.get(1);
+      margins.push(p ? (store as any).playoutDelayMs(p) : 0);
+      i++;
+    }
+
+    const peak = Math.max(...margins);
+    expect(peak).toBeGreaterThan(5); // the stall did move it
+
+    // It must come back down within about a second of stream, not five.
+    const peakAt = margins.indexOf(peak);
+    const recovered = margins.findIndex((m, k) => k > peakAt && m < 5);
+    expect(recovered).toBeGreaterThan(-1);
+    expect(recovered - peakAt).toBeLessThan(90); // < 1.5 s at 60 fps
+    store.destroy();
+  });
+
+  it("recovers quickly when the path abruptly gets faster", () => {
+    // Scenario A. A VPN reconnect or Wi-Fi roam drops path latency in one
+    // step.  A baseline that could only descend a fixed few ms per frame
+    // held frames against a stale offset and froze the surface for the
+    // length of the improvement; quantiles over one window track it.
+    const t = trace(300).map((f, i) =>
+      i >= 150 ? { ...f, at: f.at - 200 } : f,
+    );
+    // Arrival order must stay monotonic for the simulation to be honest.
+    for (let k = 1; k < t.length; k++) {
+      if (t[k].at < t[k - 1].at) t[k].at = t[k - 1].at;
+    }
+    const scheduled = run(t, false);
+    const control = run(t, true);
+    expect(scheduled.count).toBeGreaterThanOrEqual(control.count);
+    expect(scheduled.maxGap).toBeLessThanOrEqual(control.maxGap + 1e-6);
   });
 });

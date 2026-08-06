@@ -997,6 +997,16 @@ pub enum SurfaceCommand {
         /// the server will not send to a client that hasn't asked.
         #[arg(short, long)]
         size: Option<String>,
+
+        /// Also write per-frame timing to this path as CSV:
+        /// `pts_ms,arrival_ms,bytes,key`.
+        ///
+        /// `pts_ms` is the capture clock stamped at compositor commit;
+        /// `arrival_ms` is when the frame reached this process.  Their
+        /// difference is the delivery jitter a viewer has to absorb, so this
+        /// measures the pipeline's timing without needing a browser.
+        #[arg(long)]
+        timing: Option<String>,
     },
 }
 
