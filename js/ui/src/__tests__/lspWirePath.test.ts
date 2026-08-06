@@ -21,9 +21,9 @@ describe("lspWirePath", () => {
   it("keeps a path outside the root absolute", () => {
     // Not a failure mode: a definition legitimately lands in the stdlib or a
     // registry checkout, and the server's `resolve_wire` takes it as-is.
-    expect(lspWirePath("/src/blit", "/home/u/.cargo/registry/src/x/lib.rs")).toBe(
-      "/home/u/.cargo/registry/src/x/lib.rs",
-    );
+    expect(
+      lspWirePath("/src/blit", "/home/u/.cargo/registry/src/x/lib.rs"),
+    ).toBe("/home/u/.cargo/registry/src/x/lib.rs");
   });
 
   it("does not treat a sibling with a shared prefix as a child", () => {
