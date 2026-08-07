@@ -2155,11 +2155,21 @@ fn step_adaptive_bandwidth(
     let congested = outbox_backpressured(client)
         || blocked_us.saturating_sub(client.write_blocked_us_seen) > WRITE_BLOCKED_CONGESTED_US;
     // Pressure evidence, from strongest to weakest: the writer blocking on
-    // the socket, the browser reporting an apply backlog (>4 is where
-    // pacing starts backing off too), and this surface's unacked frames
-    // piling up well past what send-rate × RTT parks in flight.  With none
-    // of these present the link is app-limited and the budget below says
-    // nothing about capacity.
+    // the socket, and this surface's unacked frames piling up well past what
+    // send-rate × RTT parks in flight.  With neither present the link is
+    // app-limited and the budget below says nothing about capacity.
+    //
+    // Deliberately *not* `browser_backlog_frames`, for the reason
+    // `surface_pacing_fps` spells out: that counter is `pendingAppliedFrames`,
+    // applied-but-unpainted *terminal* frames, cleared only when a terminal
+    // paints.  Reading it here let a burst of shell output — or a terminal
+    // that simply never repaints — say "the path is strained" about an
+    // unrelated video surface.  Worse than it was for pacing: pacing is a
+    // pure function of live state and recovers when the burst ends, while
+    // `adaptive_quantizer` is latched, so the backoff outlived its cause
+    // forever.  The budget arm cannot undo it (see
+    // `a_self_measured_budget_can_never_ask_for_better`), which made this the
+    // only way back up.
     let surface_inflight = client
         .surface_inflight_frames
         .iter()
@@ -2174,9 +2184,7 @@ fn step_adaptive_bandwidth(
     // and flips app_limited on a link that is simply deep, not idle.  The
     // threshold here must stay a constant; it happens to be the same 32 the
     // flat cap used to give.
-    let app_limited = !congested
-        && client.browser_backlog_frames <= 4
-        && surface_inflight < SURFACE_INFLIGHT_MIN / 2;
+    let app_limited = !congested && surface_inflight < SURFACE_INFLIGHT_MIN / 2;
     let budget_bytes = surface_budget_bytes(client, surface_id);
     let ceiling = client
         .surface_subs
@@ -15636,6 +15644,78 @@ mod tests {
     }
 
     #[test]
+    fn a_self_measured_budget_can_never_ask_for_better() {
+        // `surface_budget_bytes` is `goodput * ADAPTIVE_GOODPUT_SHARE / fps`,
+        // and on a link that is not the bottleneck `goodput` converges to
+        // exactly what we sent: `frame_bytes * fps`.  So observed/budget is
+        // pinned at `1/ADAPTIVE_GOODPUT_SHARE` = 1.25 however bad the picture
+        // gets — the ratio carries no information about quality at all.
+        // 1.25 is neither `> 1.25` nor `< 0.75`, so from a steady state the
+        // budget arm can only hold.  The improve arm needs the ratio under
+        // 0.75, i.e. sending 1.67x faster than the pacer allows: unreachable.
+        for q in [130u8, 170, ADAPTIVE_MAX_QUANTIZER] {
+            let observed = 20_000.0;
+            assert_eq!(
+                next_quantizer(RateSample {
+                    ceiling: 120,
+                    current: q,
+                    budget_bytes: observed * ADAPTIVE_GOODPUT_SHARE,
+                    observed_bytes: observed,
+                    congested: false,
+                    app_limited: false,
+                }),
+                q,
+                "self-measured budget moved the rate at q={q}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_busy_terminal_strands_video_quality_at_the_floor() {
+        // `browser_backlog_frames` is a *terminal* metric: it counts
+        // applied-but-unpainted terminal frames and is cleared only when a
+        // terminal paints.  `surface_pacing_fps` documents at length why
+        // video must not be paced off it.  The quality controller reads it
+        // anyway, through `app_limited` — and unlike pacing, which is a pure
+        // function of live state, the quantizer is latched, so the
+        // contamination does not wash out when the burst ends.
+        let settled = |backlog: u16| -> u8 {
+            let (mut client, _rx) = test_client_with_capacity(64);
+            client.display_fps = 60.0;
+            client.browser_backlog_frames = backlog;
+            // Self-consistent quiet link: goodput is what this surface sends.
+            let frame_bytes = 20_000.0;
+            client.goodput_bps = frame_bytes * client.display_fps;
+            let sub = client.surface_subs.entry(1).or_default();
+            sub.frame_bytes = frame_bytes;
+            sub.adaptive_quantizer = Some(ADAPTIVE_MAX_QUANTIZER);
+            // Far more steps than the ~14 it takes to walk 200 -> 120 at
+            // ADAPTIVE_STEP, and the picture is moving throughout.
+            for _ in 0..200 {
+                client.surface_subs.entry(1).or_default().rate_stepped_at = None;
+                step_adaptive_bandwidth(
+                    &mut client,
+                    SurfaceBandwidth::Medium,
+                    1,
+                    Instant::now(),
+                    false,
+                );
+            }
+            client.surface_subs[&1]
+                .adaptive_quantizer
+                .unwrap_or(SurfaceBandwidth::Medium.av1_quantizer() as u8)
+        };
+        let ceiling = SurfaceBandwidth::Medium.av1_quantizer() as u8;
+        assert_eq!(settled(0), ceiling, "quiet terminal: walks back up");
+        assert_eq!(
+            settled(20),
+            ceiling,
+            "a busy terminal must not strand an unrelated video surface at \
+             the quality floor",
+        );
+    }
+
+    #[test]
     fn surface_budget_splits_by_measured_share() {
         let (mut client, _rx) = test_client_with_capacity(64);
         client.goodput_bps = 1_000_000.0;
@@ -15859,10 +15939,13 @@ mod tests {
         let (mut client, _rx) = test_client_with_capacity(64);
         client.goodput_bps = 10_000.0;
         client.display_fps = 30.0;
-        // Degrading needs pressure evidence, not just a budget verdict: the
-        // browser reporting a backlog is what says the link truly can't
-        // carry these frames.
-        client.browser_backlog_frames = 20;
+        // Degrading needs pressure evidence, not just a budget verdict:
+        // this surface's own unacked frames piling up is what says the link
+        // truly can't carry them.
+        let now = Instant::now();
+        for _ in 0..SURFACE_INFLIGHT_MIN / 2 {
+            record_surface_frame_sent(&mut client, 4, 1_000, false, now);
+        }
         let sub = client.surface_subs.entry(4).or_default();
         sub.frame_bytes = 60_000.0;
         assert!(sub.encoder.is_none());
@@ -15955,9 +16038,12 @@ mod tests {
         let (mut client, _rx) = test_client_with_capacity(64);
         client.goodput_bps = 10_000.0;
         client.display_fps = 30.0;
-        // Backlogged, so the moving half of the contrast is genuinely
-        // strained (an unstrained link would recover instead).
-        client.browser_backlog_frames = 20;
+        // Queued deep on this surface, so the moving half of the contrast is
+        // genuinely strained (an unstrained link would recover instead).
+        let now = Instant::now();
+        for _ in 0..SURFACE_INFLIGHT_MIN / 2 {
+            record_surface_frame_sent(&mut client, 9, 1_000, false, now);
+        }
         let ceiling = SurfaceBandwidth::Medium.av1_quantizer() as u8;
         let sub = client.surface_subs.entry(9).or_default();
         sub.frame_bytes = 60_000.0;
