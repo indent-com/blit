@@ -2175,16 +2175,35 @@ fn step_adaptive_bandwidth(
         .iter()
         .filter(|f| f.surface_id == surface_id)
         .count();
-    // Deliberately SURFACE_INFLIGHT_MIN, not the derived cap.  This is the
-    // quality controller, not the pacer: it asks "is the link app-limited,
-    // so the measured budget says nothing about capacity".  Wiring it to
-    // `surface_inflight_cap(client) / 2` — which equals surface_frame_window
-    // whenever the cap is unclamped — makes the boundary move with RTT, so
-    // at 1 s / 60 Hz it lands at 71 against a steady-state inflight of ~60
-    // and flips app_limited on a link that is simply deep, not idle.  The
-    // threshold here must stay a constant; it happens to be the same 32 the
-    // flat cap used to give.
-    let app_limited = !congested && surface_inflight < SURFACE_INFLIGHT_MIN / 2;
+    // Unstrained if the queue is shallow in absolute terms, *or* no deeper
+    // than this link's own bandwidth-delay product.
+    //
+    // The second clause is what makes a deep link work.  A flat threshold
+    // asks "are many frames in flight", but the question here is "is a
+    // standing queue forming" — and at 1 s RTT / 60 Hz a healthy link
+    // legitimately holds ~60 frames.  Judged against a constant 32 such a
+    // link reads as strained forever, so `app_limited` never fires; and
+    // since the budget arm can only hold or degrade (see
+    // `a_self_measured_budget_can_never_ask_for_better`), the quantizer had
+    // no way back up at all.  Distance was being mistaken for congestion —
+    // exactly what `surface_frame_window` exists to avoid, and the same
+    // trap a flat `surface_inflight_cap` fell into.
+    //
+    // Deep is not saturated: with the queue stable at the BDP and nothing
+    // blocking, goodput still measures our own send rate, so the budget
+    // says nothing about capacity — which is precisely the case
+    // `app_limited` is for.  Real saturation shows up as the queue growing
+    // *past* the window, or as `congested`, and then the budget arm and the
+    // multiplicative backoff answer it.  Improving into a link that turns
+    // out to be full is the probe half of an AIMD loop, not an error.
+    //
+    // Floored at the old constant so this can only ever *add* recovery: on
+    // a shallow link the window is smaller than 32 and the behaviour is
+    // unchanged.  Ordered to short-circuit before `surface_frame_window`,
+    // which is not free and runs per surface per tick.
+    let app_limited = !congested
+        && (surface_inflight < SURFACE_INFLIGHT_MIN / 2
+            || surface_inflight <= surface_frame_window(client));
     let budget_bytes = surface_budget_bytes(client, surface_id);
     let ceiling = client
         .surface_subs
@@ -15712,6 +15731,74 @@ mod tests {
             ceiling,
             "a busy terminal must not strand an unrelated video surface at \
              the quality floor",
+        );
+    }
+
+    /// Walk a degraded surface for long enough to reach the ceiling if it
+    /// ever can, and report where it settled.
+    fn settle_quantizer(client: &mut ClientState, sid: u16) -> u8 {
+        for _ in 0..200 {
+            client.surface_subs.entry(sid).or_default().rate_stepped_at = None;
+            step_adaptive_bandwidth(client, SurfaceBandwidth::Medium, sid, Instant::now(), false);
+        }
+        client.surface_subs[&sid]
+            .adaptive_quantizer
+            .unwrap_or(SurfaceBandwidth::Medium.av1_quantizer() as u8)
+    }
+
+    /// A surface degraded to the floor on a 1 s / 60 Hz link, holding the
+    /// given multiple of its own bandwidth-delay product in flight and with
+    /// no congestion signal anywhere.
+    ///
+    /// `frame_bytes` is set well over budget deliberately: that is the arm
+    /// which can only hold or degrade, so anything that walks back up here
+    /// did so through `app_limited` and nothing else.
+    fn deep_link_holding(windows_in_flight: f32) -> (ClientState, usize) {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 60.0;
+        client.rtt_ms = 1_000.0;
+        client.min_rtt_ms = 1_000.0;
+        let window = surface_frame_window(&client);
+        let now = Instant::now();
+        for _ in 0..(window as f32 * windows_in_flight).round() as usize {
+            record_surface_frame_sent(&mut client, 1, 1_000, false, now);
+        }
+        client.goodput_bps = 20_000.0 * client.display_fps;
+        let sub = client.surface_subs.entry(1).or_default();
+        sub.frame_bytes = 60_000.0;
+        sub.adaptive_quantizer = Some(ADAPTIVE_MAX_QUANTIZER);
+        (client, window)
+    }
+
+    #[test]
+    fn a_deep_but_healthy_link_recovers() {
+        // 1 s RTT at 60 Hz legitimately parks ~60 frames in flight.  Against
+        // the old flat threshold of 32 that read as strained forever, so
+        // `app_limited` never fired — and the budget arm can only hold or
+        // degrade, so the quantizer was stranded at the floor for the life
+        // of the subscription.  Distance is not congestion.
+        let (mut client, window) = deep_link_holding(0.85);
+        assert!(
+            window > SURFACE_INFLIGHT_MIN / 2,
+            "fixture must be deeper than the old flat threshold, window={window}",
+        );
+        assert_eq!(
+            settle_quantizer(&mut client, 1),
+            SurfaceBandwidth::Medium.av1_quantizer() as u8,
+            "a healthy link at its bandwidth-delay product must walk back up",
+        );
+    }
+
+    #[test]
+    fn a_queue_past_the_bandwidth_delay_product_is_still_strained() {
+        // The other half: once the queue outgrows what the BDP explains, a
+        // standing queue really is forming.  That must still read as
+        // strained, or the fix above would just be "always improve".
+        let (mut client, _) = deep_link_holding(2.0);
+        assert_eq!(
+            settle_quantizer(&mut client, 1),
+            ADAPTIVE_MAX_QUANTIZER,
+            "a queue past the BDP must not be read as an unstrained link",
         );
     }
 
