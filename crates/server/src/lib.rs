@@ -4281,6 +4281,10 @@ async fn tick(state: &AppState) -> TickOutcome {
     // Surface IDs whose per-client encoders need to be invalidated.
     let mut invalidate_client_encoders: Vec<u16> = Vec::new();
     let mut vulkan_unavailable: Vec<(u16, u64)> = Vec::new();
+    // (sid, cid, overwritten generation) for compositor bitstreams replaced
+    // in `last_encoded` by a non-keyframe.  Resolved against each sub's
+    // delivered generation below: an undelivered overwrite broke the chain.
+    let mut encoded_overwrites: Vec<(u16, u64, u64)> = Vec::new();
     // Surface IDs resized by the compositor this tick.  After the
     // compositor borrow is released we wake pacing for every client
     // subscribed to each sid so the first post-resize frame bypasses
@@ -4373,8 +4377,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                 } => {
                     surface_commit_count += 1;
                     cs.pixel_generation += 1;
-                    cs.last_encoded.insert(
-                        (frame.surface_id, frame.client_id),
+                    let new_is_keyframe = frame.is_keyframe;
+                    let key = (frame.surface_id, frame.client_id);
+                    let prev = cs.last_encoded.insert(
+                        key,
                         LastEncoded {
                             width: frame.width,
                             height: frame.height,
@@ -4385,6 +4391,20 @@ async fn tick(state: &AppState) -> TickOutcome {
                             timestamp_ms,
                         },
                     );
+                    // Overwriting a frame the subscriber never received
+                    // removes a link from its delta chain: every later
+                    // delta references reconstructions the decoder now
+                    // lacks, and the picture visibly tears until the next
+                    // keyframe.  An overwrite *by* a keyframe restarts the
+                    // chain and is fine; anything else must force one —
+                    // including an overwritten undelivered keyframe, whose
+                    // following deltas reference a frame the client never
+                    // saw.  (Checked against the sub's delivered generation
+                    // after this event loop — the compositor borrow is live
+                    // here.)
+                    if !new_is_keyframe && let Some(prev) = prev {
+                        encoded_overwrites.push((key.0, key.1, prev.generation));
+                    }
                 }
                 CompositorEvent::VulkanEncoderUnavailable {
                     surface_id,
@@ -4527,6 +4547,23 @@ async fn tick(state: &AppState) -> TickOutcome {
                 },
             );
             cs.handle.wake();
+        }
+    }
+
+    // A compositor bitstream overwritten before this client fetched it is a
+    // hole in the delta chain — the decoder would silently mispredicts every
+    // frame after it (the picture "jumps back and forth" between the stale
+    // and fresh reference slots) until a keyframe.  Owe one: the delivery
+    // loop then withholds deltas and asks the session for an IDR.  Encoder
+    // pacing makes this rare; this is the backstop that keeps it invisible.
+    for (sid, cid, prev_gen) in encoded_overwrites {
+        if let Some(c) = sess.clients.get_mut(&cid)
+            && c.vulkan_video_surfaces.contains_key(&sid)
+            && let Some(sub) = c.surface_subs.get_mut(&sid)
+            && sub.last_encoded_gen != Some(prev_gen)
+            && sub.has_keyframe
+        {
+            sub.has_keyframe = false;
         }
     }
 
@@ -4852,6 +4889,7 @@ async fn tick(state: &AppState) -> TickOutcome {
             width: u32,
             height: u32,
             is_444: bool,
+            min_interval_us: u32,
         }
         let mut pending_vulkan_encoder_setups: Vec<VulkanEncoderSetup> = Vec::new();
         let mut pending_vulkan_keyframe_requests: Vec<(u32, u64)> = Vec::new();
@@ -5484,6 +5522,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                             _ => "vulkan",
                         };
                         // Queue commands to send after the client loop.
+                        // The session paces itself to this client's display
+                        // rate: composites arrive faster than the client
+                        // consumes, and every encoded-but-undelivered frame
+                        // would break the delta chain.
+                        let min_interval_us =
+                            (1_000_000.0 / client.display_fps.clamp(24.0, 480.0)) as u32;
                         pending_vulkan_encoder_setups.push(VulkanEncoderSetup {
                             surface_id: sid as u32,
                             client_id: work.cid,
@@ -5492,6 +5536,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             width: px_w,
                             height: px_h,
                             is_444,
+                            min_interval_us,
                         });
                         pending_vulkan_keyframe_requests.push((sid as u32, work.cid));
                         if let Some(s) = client.surface_subs.get_mut(&sid) {
@@ -5702,6 +5747,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         width: setup.width,
                         height: setup.height,
                         is_444: setup.is_444,
+                        min_interval_us: setup.min_interval_us,
                     },
                 );
             }
@@ -11156,9 +11202,17 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             state.encoder_invalidated = true;
                         }
                     }
-                    if meaningful_change {
-                        state.has_keyframe = false;
-                    }
+                    // Every explicit subscribe owes the client a keyframe —
+                    // including a repeated same-prefs one, because that IS
+                    // the client's keyframe request: SurfaceStore fires it
+                    // (once per recovery episode) when its decoder dies
+                    // mid-stream, and it then drops every delta until a key
+                    // arrives.  Suppressing this reset along with the burst
+                    // reset turned each decoder hiccup into a permanent
+                    // freeze with the dropped counter climbing — only a
+                    // resize (whose path clears has_keyframe) recovered it.
+                    // Churn is bounded by the client, not here.
+                    state.has_keyframe = false;
                     first_subscribe = !was_subscribed;
                     if was_subscribed
                         && prefs_changed

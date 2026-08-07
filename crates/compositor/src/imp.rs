@@ -765,6 +765,13 @@ pub enum CompositorCommand {
         width: u32,
         height: u32,
         is_444: bool,
+        /// Minimum microseconds between encodes for this session — the
+        /// subscriber's frame interval.  The compositor composites at
+        /// commit rate, which can exceed what the client consumes; every
+        /// encoded-but-undelivered frame breaks the delta chain, so frames
+        /// that would be skipped must be skipped *before* encoding.
+        /// 0 = encode every composite.
+        min_interval_us: u32,
     },
     /// Retarget one client's encoder quantizer without rebuilding it.
     SetVulkanEncoderQp {
@@ -3592,10 +3599,18 @@ impl Compositor {
                 width,
                 height,
                 is_444,
+                min_interval_us,
             } => {
                 let created = self.vulkan_renderer.as_mut().is_some_and(|vk| {
                     vk.create_vulkan_encoder(
-                        surface_id, client_id, codec, qp, width, height, is_444,
+                        surface_id,
+                        client_id,
+                        codec,
+                        qp,
+                        width,
+                        height,
+                        is_444,
+                        min_interval_us,
                     )
                 });
                 if !created {

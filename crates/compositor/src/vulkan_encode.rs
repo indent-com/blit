@@ -688,6 +688,11 @@ impl VulkanVideoEncoder {
         self.force_idr = true;
     }
 
+    /// Whether a forced keyframe is pending for the next encode.
+    pub(crate) fn wants_idr(&self) -> bool {
+        self.force_idr
+    }
+
     /// Retarget the constant quantizer from the next frame onwards.
     ///
     /// Both codecs read `self.qp` per frame — H.264 through the slice's

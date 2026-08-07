@@ -55,6 +55,12 @@ pub(crate) struct VulkanRenderer {
     /// subscriber owns its own session so its GOP, keyframe cadence and
     /// quantizer are independent of every other viewer's.
     vulkan_encoders: HashMap<(u32, u64), crate::vulkan_encode::VulkanVideoEncoder>,
+    /// Per-session encode pacing: (minimum interval, last encode time).
+    /// The compositor composites at commit rate; a session encoding faster
+    /// than its subscriber consumes produces frames the server overwrites
+    /// undelivered, and every one of those breaks the delta chain.  Frames
+    /// skipped here — before encoding — cost nothing.
+    vulkan_encoder_pacing: HashMap<(u32, u64), (std::time::Duration, Option<std::time::Instant>)>,
     /// Bitstreams produced by `vulkan_encoders` during the last render,
     /// awaiting collection by the compositor.  Kept out of the render
     /// return value because that function has a dozen early exits.
@@ -1099,6 +1105,7 @@ impl VulkanRenderer {
             video_encode_command_pool,
             video_fns,
             vulkan_encoders: HashMap::new(),
+            vulkan_encoder_pacing: HashMap::new(),
             pending_encoded_frames: Vec::new(),
             has_video_encode,
             has_video_encode_av1,
@@ -1328,6 +1335,7 @@ impl VulkanRenderer {
     /// driver runs out of concurrent video sessions — so the caller can tell
     /// the server to fall back to a server-side encoder instead of leaving
     /// that client waiting for a bitstream that will never arrive.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_vulkan_encoder(
         &mut self,
         surface_id: u32,
@@ -1339,6 +1347,8 @@ impl VulkanRenderer {
         // 4:4:4 rather than 4:2:0.  Device-dependent — the caps query
         // refuses it on hardware that cannot, and the caller falls back.
         is_444: bool,
+        // Minimum microseconds between encodes; 0 = every composite.
+        min_interval_us: u32,
     ) -> bool {
         if !self.has_video_encode {
             eprintln!("[vulkan-render] cannot create vulkan encoder: video encode not available");
@@ -1473,9 +1483,16 @@ impl VulkanRenderer {
         match encoder {
             Some(enc) => {
                 eprintln!(
-                    "[vulkan-render] created vulkan {codec_name} encoder for surface {surface_id} client {client_id} {w}x{h} qp={qp}",
+                    "[vulkan-render] created vulkan {codec_name} encoder for surface {surface_id} client {client_id} {w}x{h} qp={qp} interval={min_interval_us}us",
                 );
                 self.vulkan_encoders.insert((surface_id, client_id), enc);
+                self.vulkan_encoder_pacing.insert(
+                    (surface_id, client_id),
+                    (
+                        std::time::Duration::from_micros(min_interval_us as u64),
+                        None,
+                    ),
+                );
                 true
             }
             None => {
@@ -1531,6 +1548,7 @@ impl VulkanRenderer {
             // count over would retire its replacement early.
             self.vulkan_encode_failures.remove(&key);
             self.vulkan_encode_giveups.retain(|k| *k != key);
+            self.vulkan_encoder_pacing.remove(&key);
         }
         // Never hand a bitstream to a client whose encoder has just gone
         // away; the server would credit it against a subscription that no
@@ -6361,6 +6379,32 @@ impl VulkanRenderer {
                     encoder_cids.clear();
                 }
                 for cid in encoder_cids {
+                    // Pace to the subscriber: encoding faster than it
+                    // consumes produces frames the server overwrites
+                    // undelivered, and each of those breaks the delta chain
+                    // at the decoder.  Skipping *before* the encode is free
+                    // — the next delta simply spans a longer interval.  The
+                    // 0.7 factor leaves room for commit-clock jitter so a
+                    // source at exactly the subscriber's rate is not
+                    // halved.  A pending forced keyframe bypasses the
+                    // throttle: it is answering a recovery request, and
+                    // delaying it extends the freeze it exists to end.
+                    if let Some((interval, last)) =
+                        self.vulkan_encoder_pacing.get_mut(&(sid, cid))
+                    {
+                        let now = std::time::Instant::now();
+                        let throttled = last.is_some_and(|l| {
+                            now.duration_since(l) < interval.mul_f32(0.7)
+                        });
+                        let force = self
+                            .vulkan_encoders
+                            .get(&(sid, cid))
+                            .is_some_and(|e| e.wants_idr());
+                        if throttled && !force {
+                            continue;
+                        }
+                        *last = Some(now);
+                    }
                     let encoder = self.vulkan_encoders.get_mut(&(sid, cid)).unwrap();
                     let codec_flag = encoder.codec_flag();
                     // A session outlived the size it was built at (the
