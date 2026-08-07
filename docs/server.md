@@ -16,7 +16,7 @@
 | `BLIT_EXPORT_SOCK`             | unset                                              | `1` exports the socket path as `BLIT_SOCK` in spawned terminals (also `--export-sock`) |
 | `BLIT_INJECT_PATH`             | unset                                              | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)     |
 | `BLIT_SURFACE_ENCODERS`        | see encoder table                                  | Comma-separated encoder priority                                                       |
-| `BLIT_SURFACE_BANDWIDTH`       | `medium`                                           | Ceiling on video bandwidth (adaptation only goes cheaper)                              |
+| `BLIT_SURFACE_BANDWIDTH`       | `ultra`                                            | Ceiling on video bandwidth (adaptation only goes cheaper)                              |
 | `BLIT_SURFACE_SPEED`           | `realtime`                                         | Encoder speed preset                                                                   |
 | `BLIT_MAX_CONNECTIONS`         | `0` (unlimited)                                    | Reject client connections past this count                                              |
 | `BLIT_MAX_PTYS`                | `0` (unlimited)                                    | Refuse `CREATE` past this many PTYs across all clients                                 |
@@ -244,7 +244,7 @@ The Vulkan tier leads because it encodes on the compositor's own device with no 
 | `h264-software` | openh264/x264 (CPU) | Software H.264; backend is a build-time choice — openh264 by default, x264 in the GPL opt-in build (`blit --license`), absent if built with neither. 4:4:4 requires x264 (High 4:4:4 Predictive); openh264 is 4:2:0-only |
 | `av1-software`  | rav1e (CPU)         | Software AV1                                                                                                                                                                                                             |
 
-`BLIT_SURFACE_BANDWIDTH`: `low`, `medium` (default), `high`, `ultra`, or a raw
+`BLIT_SURFACE_BANDWIDTH`: `low`, `medium`, `high`, `ultra` (default), or a raw
 AV1 quantizer `10`–`255`. A **ceiling**, not a fixed rate: it is the most a
 surface may spend. Adaptation is always on and only ever moves cheaper than
 what you set, then back up as the link recovers.

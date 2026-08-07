@@ -418,18 +418,18 @@ pub struct SurfaceEncoding {
 /// bits; it says nothing about how long the encoder may take.
 ///
 /// - **Low**: quantizer 180 — visibly lossy
-/// - **Medium** (default): quantizer 120 — good balance
+/// - **Medium**: quantizer 120 — good balance
 /// - **High**: quantizer 80 — sharp
-/// - **Ultra**: quantizer 1 — maximum fidelity, very expensive
+/// - **Ultra** (default): quantizer 1 — maximum fidelity, very expensive
 /// - **Custom**: caller-specified AV1 quantizer (10–255)
 ///
 /// Set via `BLIT_SURFACE_BANDWIDTH=low|medium|high|ultra|<10–255>`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SurfaceBandwidth {
     Low,
-    #[default]
     Medium,
     High,
+    #[default]
     Ultra,
     /// Caller-specified AV1 quantizer (10–255).  H.264 QP and
     /// software-encoder bitrate are derived proportionally.
