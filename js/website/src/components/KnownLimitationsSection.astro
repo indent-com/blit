@@ -10,7 +10,7 @@ const items = [
   },
   {
     title: "Hardware encoding",
-    body: "Vulkan Video is tried first and encodes on the compositor's own GPU, but drivers vary in what they will accept — 4:4:4 in particular. NVENC needs the proprietary NVIDIA driver, VA-API needs Intel/AMD with libva, and either can take over. Falls back to software at any time.",
+    body: "Vulkan Video is tried first and encodes on the compositor's own GPU, but only at native size, with no rate control beyond a fixed quality — and a driver can decline the session outright, 4:4:4 being the profile it is most likely to lack. NVENC needs the proprietary NVIDIA driver, VA-API needs Intel/AMD with libva, and either can take over. Falls back to software at any time.",
   },
   {
     title: "IDE scope",

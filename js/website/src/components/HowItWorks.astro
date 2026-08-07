@@ -10,12 +10,12 @@ const stages = [
     chips: [
       "WS · WebTransport",
       "WebRTC · Unix · SSH",
-      "blit gateway · proxy-daemon",
+      "Blit gateway · proxy-daemon",
     ],
     note: "Stateless. Restartable. PTYs survive gateway and proxy restarts.",
   },
   {
-    title: "blit server",
+    title: "Blit server",
     chips: ["alacritty parser", "FrameState diff", "Wayland compositor (exp.)"],
     note: "Owns PTYs, scrollback, parsed state, per-client frame pacing, GPU encode.",
   },
@@ -37,7 +37,7 @@ const stages = [
           Send what changed. Paint it locally.
         </h2>
         <p class="mt-3 text-[14.5px] leading-relaxed text-[var(--dim)]">
-          blit does not stream a terminal as video or replay a river of ANSI
+          Blit does not stream a terminal as video or replay a river of ANSI
           bytes. The server understands the screen, computes a binary diff for
           each viewer, and sends only the cells that changed. The browser
           applies that diff in WASM and renders it on the GPU.
@@ -87,7 +87,7 @@ const stages = [
               Encode
             </dt>
             <dd class="mt-1 font-mono text-[13px] text-[var(--fg)]">
-              H.264 · AV1 · Vulkan
+              Vulkan · NVENC · VA-API · software
             </dd>
           </div>
         </dl>
