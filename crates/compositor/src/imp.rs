@@ -1189,13 +1189,6 @@ struct DataSourceData {
     mime_types: std::sync::Mutex<Vec<String>>,
 }
 
-struct DataOfferData {
-    /// If `true`, the offer represents external (browser/CLI) clipboard data
-    /// stored in `Compositor::external_clipboard`.  Otherwise it is backed by
-    /// a Wayland `wl_data_source`.
-    external: bool,
-}
-
 /// Stored state for the external (browser/CLI) clipboard selection.
 struct ExternalClipboard {
     mime_type: String,
@@ -6527,33 +6520,34 @@ impl Dispatch<WlDataDevice, ()> for Compositor {
     }
 }
 
-impl Dispatch<WlDataOffer, DataOfferData> for Compositor {
+impl Dispatch<WlDataOffer, ()> for Compositor {
     fn request(
         state: &mut Self,
         _: &Client,
         _: &WlDataOffer,
         request: <WlDataOffer as Resource>::Request,
-        data: &DataOfferData,
+        _: &(),
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
         use wl_data_offer::Request;
         match request {
+            // Every CLIPBOARD offer the compositor makes is external, so
+            // there is no Wayland-source branch to fall back to: a client's
+            // own selection is read out to the browser and comes back
+            // through `ClipboardOffer`, and that round trip stands in for
+            // splicing `receive` to the owner.  PRIMARY, which has no such
+            // detour, is the one that needs both — see `offer_primary_to`.
+            //
+            // A type we never offered gets the fd closed empty, not the
+            // bytes we happen to be holding.
             Request::Receive { mime_type, fd } => {
-                if data.external {
-                    // Write external clipboard data to the fd.  A type we
-                    // never offered gets the fd closed empty, not the bytes
-                    // we happen to be holding.
-                    if let Some(ref cb) = state.external_clipboard
-                        && cb.offers(&mime_type)
-                    {
-                        use std::io::Write;
-                        let mut f = std::fs::File::from(fd);
-                        let _ = f.write_all(&cb.data);
-                    }
-                } else if let Some(ref src) = state.selection_source {
-                    // Forward to the Wayland data source.
-                    src.send(mime_type, fd.as_fd());
+                if let Some(ref cb) = state.external_clipboard
+                    && cb.offers(&mime_type)
+                {
+                    use std::io::Write;
+                    let mut f = std::fs::File::from(fd);
+                    let _ = f.write_all(&cb.data);
                 }
             }
             Request::Destroy => {}
@@ -6616,10 +6610,10 @@ impl Compositor {
         for dd in &self.data_devices {
             if let Some(client) = dd.client() {
                 let offer = client
-                    .create_resource::<WlDataOffer, DataOfferData, Compositor>(
+                    .create_resource::<WlDataOffer, (), Compositor>(
                         &self.display_handle,
                         dd.version(),
-                        DataOfferData { external: true },
+                        (),
                     )
                     .unwrap();
                 dd.data_offer(&offer);
