@@ -7594,11 +7594,17 @@ async fn tick(state: &AppState) -> TickOutcome {
         // before the next one.
         state.delivery_notify.notify_one();
     }
-    // Handle EOF outside the borrow loop.
+    // Handle EOF outside the borrow loop.  The 50 ms grace period lets the
+    // PTY's final output drain, but doing it serially here would stall the
+    // tick for 50 ms per exited PTY.  Spawn each cleanup so the tick loop
+    // releases the session mutex and keeps processing.
     drop(sess);
     for (id, generation) in eof_ptys {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        cleanup_pty_internal(id, Some(generation), state).await;
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cleanup_pty_internal(id, Some(generation), &state).await;
+        });
     }
     let mut sess = state.session.lock().await;
 
@@ -7912,6 +7918,10 @@ async fn tick(state: &AppState) -> TickOutcome {
     // drop it, wait for a cooldown, and respawn.  This avoids permanent
     // audio loss that previously required a full client reconnect.
     //
+    // The actual shutdown + respawn runs in a spawned task: shutdown() waits
+    // on child processes and spawn() starts new ones, both of which can block
+    // for seconds and must not hold the session mutex or park the tick loop.
+    //
     // Bitrate is pre-computed here to avoid borrowing sess.clients inside
     // the sess.compositor mutable borrow (they're the same MutexGuard).
     #[cfg(target_os = "linux")]
@@ -7945,12 +7955,14 @@ async fn tick(state: &AppState) -> TickOutcome {
                 .is_none_or(|t| now.duration_since(t) >= RESTART_COOLDOWN);
             if can_restart {
                 cs.last_audio_restart = Some(now);
-                // Drop the dead pipeline — triggers shutdown() which kills
-                // orphaned child processes and cleans up the runtime dir.
-                cs.audio_pipeline = None;
+                // Take the dead pipeline out of the compositor and clear the
+                // slot synchronously so the next tick sees no pipeline and
+                // does not start a second restart while this one is in flight.
+                let dead_pipeline = cs.audio_pipeline.take();
                 let runtime_dir = std::path::Path::new(&cs.handle.socket_name)
                     .parent()
-                    .unwrap_or(std::path::Path::new("/tmp"));
+                    .unwrap_or(std::path::Path::new("/tmp"))
+                    .to_path_buf();
                 let session_id = cs.audio_session_id;
                 let epoch = cs.created_at;
                 let verbose = state.config.verbose;
@@ -7958,29 +7970,48 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // clients pick up frames from the restarted pipeline
                 // without re-subscribing.
                 let broadcast = cs.audio_broadcast.clone();
+                let state = state.clone();
                 eprintln!("[audio] pipeline died, restarting...");
-                let pipeline = tokio::task::block_in_place(|| {
-                    audio::AudioPipeline::spawn(
-                        runtime_dir,
-                        session_id,
-                        audio_restart_bitrate,
-                        verbose,
-                        epoch,
-                        broadcast,
-                    )
+                tokio::spawn(async move {
+                    // Drop the dead pipeline first; its Drop impl calls
+                    // shutdown() which waits on children and removes the
+                    // runtime dir.  Do this before spawning the replacement
+                    // so the old directory is gone before the new pipeline
+                    // tries to recreate it.
+                    drop(dead_pipeline);
+                    let pipeline = tokio::task::block_in_place(|| {
+                        audio::AudioPipeline::spawn(
+                            &runtime_dir,
+                            session_id,
+                            audio_restart_bitrate,
+                            verbose,
+                            epoch,
+                            broadcast,
+                        )
+                    });
+                    let mut sess = state.session.lock().await;
+                    let Some(cs) = sess.compositor.as_mut() else {
+                        return;
+                    };
+                    // Only install if this is still the same compositor
+                    // instance; if it was torn down while we were spawning,
+                    // dropping `pipeline` here cleans it up.
+                    if cs.audio_session_id != session_id || cs.created_at != epoch {
+                        return;
+                    }
+                    match pipeline {
+                        Ok(p) => {
+                            eprintln!(
+                                "[audio] pipeline restarted, PULSE_SERVER={}",
+                                p.pulse_server_path(),
+                            );
+                            cs.audio_pipeline = Some(p);
+                        }
+                        Err(e) => {
+                            eprintln!("[audio] failed to restart pipeline: {e}");
+                        }
+                    }
                 });
-                match pipeline {
-                    Ok(p) => {
-                        eprintln!(
-                            "[audio] pipeline restarted, PULSE_SERVER={}",
-                            p.pulse_server_path(),
-                        );
-                        cs.audio_pipeline = Some(p);
-                    }
-                    Err(e) => {
-                        eprintln!("[audio] failed to restart pipeline: {e}");
-                    }
-                }
             }
         }
     }
