@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{Notify, mpsc};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
@@ -154,10 +155,23 @@ pub fn poll_child_exited(handle: &PtyHandle) -> bool {
 /// Give up on a child's exit status.  No zombies here — the process object
 /// goes away once the last handle closes — so this is just that close, the
 /// counterpart to the Unix wait.
-pub fn abandon_pty_pid(handle: &PtyHandle) {
+///
+/// `kill_group_at` is ignored: `close_pty` already dropped the last handle to
+/// the kill-on-close job, so the tree is gone by the time this runs and there
+/// is nothing left to escalate against.
+pub fn abandon_pty_pid(handle: &PtyHandle, _kill_group_at: Instant) {
     unsafe {
         CloseHandle(handle.process);
     }
+}
+
+/// No-op: see [`abandon_pty_pid`].  The job object makes the hangup the kill.
+pub fn escalate_abandoned(_now: Instant) {}
+
+/// Always `None`: nothing here ever needs escalating, so the supervisor has no
+/// timer to arm.
+pub fn next_abandoned_kill() -> Option<Instant> {
+    None
 }
 
 pub fn reap_zombies() {}

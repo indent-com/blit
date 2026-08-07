@@ -271,6 +271,18 @@ not a signal. On Windows the job carries
 survivor with it; if the job cannot be created the PTY still runs and
 degrades to a leader-only kill.
 
+`CLOSE`'s hangup escalates the same way an expiry does: SIGHUP to the group,
+wait 5 s, then SIGKILL to the group, so a child that ignores SIGHUP — or whose
+descendants inherited that disposition — does not outlive its terminal. The
+escalation is invisible on the wire. `CLOSED` still arrives immediately and
+still means the slot is gone: the terminal leaves the catalog when the hangup
+goes out, and the rest is carried by the pid alone rather than by a retained
+"closing" entry, which would count against the PTY cap and never reach
+retention. A client learns nothing about, and waits for nothing in, the grace.
+Reaping beats escalating, not the other way round: once a child has been waited
+its pid may name an unrelated process group, so a hangup the child answered
+promptly cancels the pending SIGKILL instead of firing it late.
+
 This is opt-in rather than a reinterpretation of `CREATED_N`; a legacy client
 cannot mistake an error for PTY zero. `CREATE`, `CREATE_AT`, `CREATE_N`, and
 `CREATE2` without negotiated `WANT_STATUS` retain their existing success-only

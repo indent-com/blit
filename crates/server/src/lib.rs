@@ -4210,10 +4210,15 @@ const SUPERVISOR_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 async fn supervisor_loop(state: AppState) {
     loop {
         // Wake at whichever comes first: something asked us to recompute, an
-        // armed deadline is due, or the backstop sweep comes round.
+        // armed deadline or a pending hangup escalation is due, or the backstop
+        // sweep comes round.
         let next = {
             let sess = state.session.lock().await;
             earliest_armed_deadline(&sess)
+        };
+        let next = match (next, pty::next_abandoned_kill()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         };
         let sweep = Instant::now() + SUPERVISOR_SWEEP_INTERVAL;
         let wake = next.map_or(sweep, |d| d.min(sweep));
@@ -4304,6 +4309,14 @@ async fn evict_exited(state: &AppState) {
 const SIGKILL: i32 = 9;
 const SIGTERM: i32 = 15;
 
+/// `TimeoutStopSec`: how long a first, polite signal has before the stop
+/// sequence escalates to SIGKILL.  One value for both sequences that have one
+/// — a deadline's SIGTERM and `C2S_CLOSE`'s SIGHUP — because it answers the
+/// same question either time.
+fn stop_grace() -> Duration {
+    Duration::from_millis(blit_remote::DEADLINE_STOP_GRACE_MS as u64)
+}
+
 /// Act on terminals whose deadline has come due.
 ///
 /// Expiry is a two-step stop: SIGTERM to the group, then SIGKILL once the
@@ -4323,8 +4336,7 @@ async fn enforce_deadlines(state: &AppState) {
         } else if pty.deadline.is_some_and(|d| now >= d) {
             pty.deadline = None;
             pty.exit_reason = blit_remote::EXIT_REASON_DEADLINE;
-            pty.stop_deadline =
-                Some(now + Duration::from_millis(blit_remote::DEADLINE_STOP_GRACE_MS as u64));
+            pty.stop_deadline = Some(now + stop_grace());
             pty::kill_pty(&pty.handle, SIGTERM, true);
         }
     }
@@ -4354,6 +4366,10 @@ async fn supervise(state: &AppState) {
     // scan the pty is `!exited` with its pid already freed.  Signalling first
     // would aim the stop sequence's `kill(-pid)` at a released process group.
     enforce_deadlines(state).await;
+    // Same ordering argument, for the sequence `C2S_CLOSE` starts: the pid is
+    // ours to signal only until `reap_zombies` waits it, so escalate first and
+    // let the sweep below collect whatever the SIGKILL just killed.
+    pty::escalate_abandoned(Instant::now());
     // The backstop still runs, now targeted at owned pids only, so a child
     // whose SIGCHLD we missed cannot linger as a zombie.
     pty::reap_zombies();
@@ -12495,8 +12511,18 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         // The SIGHUP only asks the child to die, and nobody
                         // will ever collect its status — but it still has to
                         // be waited or it stays a zombie for the life of the
-                        // server.  Hand it to the reaper to finish.
-                        pty::abandon_pty_pid(&pty.handle);
+                        // server.  Hand it to the reaper to finish, with the
+                        // deadline for the SIGKILL that stops asking.
+                        //
+                        // The escalation lives on the pid rather than on a
+                        // "closing" terminal because the slot is already gone
+                        // here: keeping one would make `CLOSED` mean "going"
+                        // instead of "gone", and would put an entry in `ptys`
+                        // that is neither live (`live_ptys` counts it against
+                        // `--max-ptys`) nor exited (`evict_exited` keys off
+                        // `exited_at` and would never see it).
+                        pty::abandon_pty_pid(&pty.handle, Instant::now() + stop_grace());
+                        state.supervisor_notify.notify_one();
                     }
                     for client in sess.clients.values_mut() {
                         unsubscribe_client_from(client, pid);
