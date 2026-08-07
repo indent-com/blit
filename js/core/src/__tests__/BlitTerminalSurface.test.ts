@@ -1068,6 +1068,186 @@ describe("BlitTerminalSurface native scroll surface", () => {
     expect(spacer.style.height).toBe("1120px");
     expect(el.scrollTop).toBe(1000);
   });
+
+  it("leaves a gesture's scroll position where the user put it", () => {
+    // Writing scrollTop back mid-flick cancels the browser's momentum
+    // animation, and the only disagreement is where inside a row the
+    // gesture currently is — the offset derived from it is already right.
+    const { s, el } = makeSurface(100, 10, 80);
+    // @ts-expect-error — install and invoke the private scroll listener.
+    s.setupScrollSurface();
+    el.scrollTop = 746; // mid-row, as a pixel-precise device leaves it
+    // @ts-expect-error — the listener is the "user scrolled" signal.
+    s.boundScrollListener();
+
+    // @ts-expect-error — assert the offset the listener derived.
+    expect(s.scrollOffset).toBe(25);
+    // @ts-expect-error — exercising private DOM sync directly.
+    s.syncScrollSurface(true);
+    expect(el.scrollTop).toBe(746);
+  });
+
+  it("still re-aligns a jump that came from somewhere else", () => {
+    const { s, el } = makeSurface(100, 10, 80);
+    // @ts-expect-error — install and invoke the private scroll listener.
+    s.setupScrollSurface();
+    el.scrollTop = 746;
+    // @ts-expect-error — the listener is the "user scrolled" signal.
+    s.boundScrollListener();
+
+    // Shift+Home while the flick is still warm: rows, not a fraction of one.
+    // @ts-expect-error — what the scrollback-navigation keys do.
+    s.scrollOffset = 100;
+    // @ts-expect-error — exercising private DOM sync directly.
+    s.syncScrollSurface(true);
+    expect(el.scrollTop).toBe(0);
+  });
+
+  it("adopts the offset the server re-anchored a scrolled view to", () => {
+    const { s, el } = makeSurface(100, 10, 80);
+    let anchor: ((offset: number) => void) | null = null;
+    // @ts-expect-error — minimal connection exposing only the anchor hook.
+    s["_blitConn"] = {
+      addScrollAnchorListener: (_id: string, cb: (offset: number) => void) => {
+        anchor = cb;
+        return () => {};
+      },
+    };
+    // @ts-expect-error — the listener is per-session.
+    s["_sessionId"] = "s1";
+    // @ts-expect-error — wire the private listener.
+    s["setupScrollAnchorListener"]();
+    // @ts-expect-error — parked 25 rows above the live bottom.
+    s.scrollOffset = 25;
+    // @ts-expect-error — exercising private DOM sync directly.
+    s.syncScrollSurface(true);
+    expect(el.scrollTop).toBe(750);
+
+    // Three lines printed: the server moves us three rows deeper so the
+    // same text stays on screen, and the scrollback grows to match.
+    anchor!(28);
+    // @ts-expect-error — swap in the deepened scrollback the frame carries.
+    s.terminal = { scrollback_lines: () => 103 };
+    // @ts-expect-error — exercising private DOM sync directly.
+    s.syncScrollSurface(true);
+
+    // @ts-expect-error — assert private scrollback state.
+    expect(s.scrollOffset).toBe(28);
+    expect(el.scrollTop).toBe(750);
+  });
+
+  it("carries a selection along when the view is re-anchored", () => {
+    // Copying out of the scrollback while the app is still printing: the
+    // highlight has to stay on its words, not crawl off them.
+    const { s } = makeSurface(100, 10, 80);
+    let anchor: ((offset: number) => void) | null = null;
+    // @ts-expect-error — minimal connection exposing only the anchor hook.
+    s["_blitConn"] = {
+      addScrollAnchorListener: (_id: string, cb: (offset: number) => void) => {
+        anchor = cb;
+        return () => {};
+      },
+    };
+    // @ts-expect-error — the listener is per-session.
+    s["_sessionId"] = "s1";
+    // @ts-expect-error — wire the private listener.
+    s["setupScrollAnchorListener"]();
+    // @ts-expect-error — parked, with two rows selected.
+    s.scrollOffset = 25;
+    // @ts-expect-error — a selection anchored to the live bottom.
+    s.selStart = { row: 2, col: 0, tailOffset: 30 };
+    // @ts-expect-error — a selection anchored to the live bottom.
+    s.selEnd = { row: 3, col: 9, tailOffset: 29 };
+
+    anchor!(28);
+
+    // @ts-expect-error — assert private selection state.
+    expect([s.selStart.tailOffset, s.selEnd.tailOffset]).toEqual([33, 32]);
+  });
+});
+
+describe("BlitTerminalSurface wheel in mouse-reporting apps", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn(() => 1),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /** A surface whose app has asked for mouse reports (vim, htop, …). */
+  function attachMouseMode() {
+    const sendMouse = vi.fn();
+    const surface = new BlitTerminalSurface({ sessionId: "s1" });
+    const container = document.createElement("div");
+    surface.attach(container);
+    // @ts-expect-error — install a fake workspace stub.
+    surface["_workspace"] = { sendMouse };
+    // @ts-expect-error — minimal connection exposing a connected transport.
+    surface["_blitConn"] = { transport: { status: "connected" } };
+    // @ts-expect-error — the app reads the mouse (mode 3 = button tracking).
+    surface["terminal"] = { mouse_mode: () => 3 };
+    // @ts-expect-error — a known line height for the detent maths.
+    surface["cell"] = { h: 18, w: 8, pw: 8, ph: 18 };
+    const scrollEl = surface["scrollEl"];
+    if (!scrollEl) throw new Error("expected a scroll surface");
+    const wheel = (init: Partial<WheelEvent>) => {
+      const e = new WheelEvent("wheel", { cancelable: true });
+      Object.defineProperties(e, {
+        deltaY: { value: init.deltaY ?? 0 },
+        deltaX: { value: init.deltaX ?? 0 },
+        deltaMode: { value: init.deltaMode ?? 0 },
+      });
+      scrollEl.dispatchEvent(e);
+      return e;
+    };
+    return { surface, sendMouse, wheel };
+  }
+
+  it("reports one wheel button per notch, not per event", () => {
+    const { sendMouse, wheel } = attachMouseMode();
+    wheel({ deltaY: 120 });
+    expect(sendMouse).toHaveBeenCalledTimes(1);
+    expect(sendMouse.mock.calls[0][2]).toBe(65); // wheel down
+  });
+
+  it("does not report a step for every trackpad sliver", () => {
+    // One 6px sliver is a third of a row; twelve of them are four rows,
+    // which is one conventional three-line step and change.
+    const { sendMouse, wheel } = attachMouseMode();
+    for (let i = 0; i < 12; i++) wheel({ deltaY: 6 });
+    expect(sendMouse).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not scroll the app on a sideways swipe", () => {
+    // deltaY of 0 used to fall through to "wheel down" and scroll the app.
+    const { sendMouse, wheel } = attachMouseMode();
+    wheel({ deltaX: 240, deltaY: 0 });
+    expect(sendMouse).not.toHaveBeenCalled();
+  });
+
+  it("leaves ctrl+wheel to the browser as a zoom", () => {
+    const { surface, sendMouse } = attachMouseMode();
+    const scrollEl = surface["scrollEl"]!;
+    const e = new WheelEvent("wheel", { cancelable: true, ctrlKey: true });
+    Object.defineProperty(e, "deltaY", { value: 120 });
+    scrollEl.dispatchEvent(e);
+    expect(sendMouse).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(false);
+  });
 });
 
 describe("BlitTerminalSurface cursor", () => {

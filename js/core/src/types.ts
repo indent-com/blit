@@ -236,6 +236,15 @@ export const C2S_KILL = 0x1a;
 export const KILL_LEADER_ONLY = 1 << 0;
 export const C2S_COPY_RANGE = 0x1b;
 export const C2S_TERM_CWD = 0x1c;
+/** Move a scrolled view by a signed number of lines relative to wherever the
+ *  server holds it: `[pty_id:2][delta:4 i32]`.
+ *
+ *  `C2S_SCROLL`'s offset is measured from the live bottom, and under a
+ *  chatty app that bottom moves while the message is in flight — so an
+ *  absolute request computed from what the user was looking at lands short
+ *  by however many lines scrolled in between.  A notch, a page key and a
+ *  drag are relative motions anyway.  Needs {@link FEATURE_SCROLL_BY}. */
+export const C2S_SCROLL_BY = 0x1e;
 export const CREATE2_HAS_SRC_PTY = 1 << 0;
 export const CREATE2_HAS_COMMAND = 1 << 1;
 export const CREATE2_HAS_CWD = 1 << 2;
@@ -271,6 +280,14 @@ export const S2C_USED_ROWS = 0x0d;
  *  empty.  Only sent for a `C2S_CREATE2` that set
  *  {@link CREATE2_WANT_STATUS}. */
 export const S2C_CREATE_FAILED = 0x10;
+/** A scrolled-back view was re-anchored: [pty_id:2][offset:4].
+ *
+ *  A scroll offset is a distance from the live bottom, so output from the
+ *  app slides the text under a client reading its scrollback.  The server
+ *  holds that client still by growing the offset as lines scroll away and
+ *  reports the result here, so both ends keep naming the same rows.  Sent
+ *  only while scrolled back, and only when the offset actually moved. */
+export const S2C_SCROLL_OFFSET = 0x11;
 export const C2S_PING = 0x08;
 export const C2S_QUIT = 0x0f;
 
@@ -371,6 +388,12 @@ export const FEATURE_CREATE_STATUS = 1 << 14;
  *  session leader alone, and `C2S_KILL` accepts a trailing
  *  {@link KILL_LEADER_ONLY} byte to opt back out. */
 export const FEATURE_KILL_MODE = 1 << 15;
+/** Server-enforced terminal deadlines. */
+export const FEATURE_PTY_DEADLINE = 1 << 16;
+/** Scrollback that holds still under output: the server re-anchors a
+ *  scrolled client and reports it with {@link S2C_SCROLL_OFFSET}, and
+ *  accepts the relative {@link C2S_SCROLL_BY} that goes with it. */
+export const FEATURE_SCROLL_BY = 1 << 17;
 
 // -- Common status registry (docs/protocol.md) ------------------------------
 //

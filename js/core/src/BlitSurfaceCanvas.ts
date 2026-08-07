@@ -16,6 +16,14 @@ import {
   SURFACE_POINTER_MOVE,
 } from "./protocol";
 import {
+  SCROLL_STOP_MS,
+  WHEEL_DETENT_PX,
+  WHEEL_LINE_PX,
+  WHEEL_LINES_PER_DETENT,
+  WHEEL_MODE_LINE,
+  WHEEL_MODE_PAGE,
+} from "./wheel";
+import {
   devicePixelBox,
   drawHalved,
   halve,
@@ -438,32 +446,10 @@ export interface BlitSurfaceCanvasOptions {
 }
 
 // -- Scroll ----------------------------------------------------------------
-
-const WHEEL_MODE_LINE = 1;
-const WHEEL_MODE_PAGE = 2;
-/** CSS pixels per line when a browser reports a wheel in line mode
- *  (Firefox does, for notched mice). Matches the default line box. */
-const WHEEL_LINE_PX = 16;
-/** Lines a wheel notch conventionally travels, so line-mode deltas can be
- *  turned back into `axis_value120` detents. */
-const WHEEL_LINES_PER_DETENT = 3;
-/** CSS pixels per detent for browsers that report notched wheels in pixel
- *  mode on a whole-detent grid (Chrome and Edge on Windows and Linux).
- *  macOS reports a notch as a fraction of this and lets its own scroll
- *  acceleration vary it, so a wheel there is not recognisable by size. */
-const WHEEL_DETENT_PX = 120;
-/**
- * Idle gap that ends a scroll sequence.
- *
- * Long enough to bridge the frame cadence of a macOS momentum tail so one
- * flick stays one gesture: the source is latched for the length of a
- * sequence, and a tail split in two could have its second half reread as
- * a notched wheel. Short enough that the next scroll starts fresh.
- *
- * A touch drag doesn't wait for it — `touchend` ends that sequence at the
- * moment the finger leaves the glass.
- */
-const SCROLL_STOP_MS = 280;
+//
+// Wheel units live in ./wheel, shared with the terminal surface: the same
+// events reach both, and only one of them should be deciding what a notch
+// is.
 
 /** One clipboard representation on its way to the Wayland selection. */
 type ClipboardPayload = { mime: string; data: Uint8Array };

@@ -480,6 +480,19 @@ export class BlitWorkspace {
     );
   }
 
+  /** Move a scrolled view by `lines` instead of to a position; `offset` is
+   *  the caller's idea of where that lands.  See
+   *  {@link BlitConnection.scrollSessionBy}. */
+  scrollSessionBy(sessionId: SessionId, offset: number, lines: number): void {
+    const session = this.getSession(sessionId);
+    if (!session) return;
+    this.requireConnection(session.connectionId).scrollSessionBy(
+      sessionId,
+      offset,
+      lines,
+    );
+  }
+
   sendMouse(
     sessionId: SessionId,
     type: number,

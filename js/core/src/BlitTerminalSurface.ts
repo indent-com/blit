@@ -10,6 +10,7 @@ import { keyToBytes, ctrlCharToByte, encoder } from "./keyboard";
 import { MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE } from "./protocol";
 import { assessUrl, openUrlSafely, type UrlAssessment } from "./urlSecurity";
 import { devicePixelBox, drawHalved, halve, halvings } from "./downscale";
+import { WheelDetents } from "./wheel";
 
 /** One screen row's slice of a hyperlink's extent, inclusive of both columns. */
 interface LinkSegment {
@@ -83,6 +84,14 @@ export interface BlitTerminalSurfaceHandle {
 // ---------------------------------------------------------------------------
 
 type SelPos = { row: number; col: number; tailOffset: number };
+
+/** Move a selection endpoint `lines` further from the live bottom, keeping it
+ *  on the text it was on when the view underneath it is re-anchored.  Returns
+ *  a new object: the same endpoint may be held elsewhere as a drag anchor. */
+function shiftSelPos(pos: SelPos | null, lines: number): SelPos | null {
+  if (!pos || lines === 0) return pos;
+  return { ...pos, tailOffset: pos.tailOffset + lines };
+}
 
 // ---------------------------------------------------------------------------
 // DPR detection
@@ -165,6 +174,12 @@ function effectiveDpr(): number {
 // the scrollbar, so we ship a one-shot stylesheet on first attach.
 // ---------------------------------------------------------------------------
 
+/** Quiet time after the last scroll event that ends a gesture, for the
+ *  purpose of leaving its scroll position alone. Long enough to bridge the
+ *  gap between two frames of a momentum tail, short enough that a snap the
+ *  user could notice never waits on it. */
+const SCROLL_SETTLE_MS = 150;
+
 let scrollSurfaceStylesInjected = false;
 function injectScrollSurfaceStyles(): void {
   if (scrollSurfaceStylesInjected || typeof document === "undefined") return;
@@ -229,6 +244,9 @@ export class BlitTerminalSurface {
   /** The last scrollTop we assigned, so the render loop can tell whether a
    *  write is needed without reading the element back. */
   private lastScrollTop = 0;
+  /** When the user last moved the scroll surface themselves, so the render
+   *  loop can keep its hands off a gesture that is still in flight. */
+  private lastUserScrollAt = 0;
 
   // --- mutable state ---
   private viewId: string | null = null;
@@ -286,6 +304,14 @@ export class BlitTerminalSurface {
 
   private selStart: SelPos | null = null;
   private selEnd: SelPos | null = null;
+  /** The word/line a granularity drag started on, held so the selection can
+   *  grow outward from it in either direction. Fields rather than locals in
+   *  the mouse handlers: like `selStart`/`selEnd` they are positions in the
+   *  scrollback, so they travel when a scrolled view is re-anchored. */
+  private selAnchorStart: SelPos | null = null;
+  private selAnchorEnd: SelPos | null = null;
+  /** Where a touch selection was anchored, for the same reason. */
+  private touchSelAnchor: SelPos | null = null;
   private _selectionListeners = new Set<(hasSelection: boolean) => void>();
   private hoveredUrl: {
     segments: LinkSegment[];
@@ -317,6 +343,7 @@ export class BlitTerminalSurface {
 
   // --- subscriptions / observers ---
   private dirtyUnsub: (() => void) | null = null;
+  private scrollAnchorUnsub: (() => void) | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private dprMq: MediaQueryList | null = null;
   private dprCheckHandler: (() => void) | null = null;
@@ -535,6 +562,12 @@ export class BlitTerminalSurface {
 
   /** Clear any active selection. */
   clearSelection(): void {
+    // The drag anchors are cleared unconditionally: they outlive a single
+    // handler now, so a stale one left behind by a detach or a session swap
+    // would grow the next word-drag out of a position nothing points at.
+    this.selAnchorStart = null;
+    this.selAnchorEnd = null;
+    this.touchSelAnchor = null;
     if (!this.selStart && !this.selEnd) return;
     this.selStart = null;
     this.selEnd = null;
@@ -1170,6 +1203,7 @@ export class BlitTerminalSurface {
     if (!this._blitConn || this._sessionId === null) return;
     const conn = this._blitConn;
     const sessionId = this._sessionId;
+    this.setupScrollAnchorListener();
     this.dirtyUnsub = conn.addDirtyListener(sessionId, () => {
       const t = conn.getTerminal(sessionId);
       if (!t) return;
@@ -1200,6 +1234,46 @@ export class BlitTerminalSurface {
   private teardownDirtyListener(): void {
     this.dirtyUnsub?.();
     this.dirtyUnsub = null;
+    this.scrollAnchorUnsub?.();
+    this.scrollAnchorUnsub = null;
+  }
+
+  /**
+   * Follow the server's re-anchoring of a scrolled-back view.
+   *
+   * The offset names a distance from the live bottom, so it has to grow as
+   * the app prints for the text to stay where the reader left it. The
+   * server does that arithmetic — it is the one that knows how many lines
+   * scrolled, including once the scrollback is full and the depth stops
+   * growing — and we take its answer so the scrollbar, the selection
+   * anchors, and the next offset we send all keep meaning the same rows the
+   * frames do.
+   */
+  private setupScrollAnchorListener(): void {
+    if (!this._blitConn || this._sessionId === null) return;
+    this.scrollAnchorUnsub = this._blitConn.addScrollAnchorListener(
+      this._sessionId,
+      (offset) => {
+        if (offset === this.scrollOffset) return;
+        const moved = offset - this.scrollOffset;
+        this.scrollOffset = offset;
+        // A selection is anchored to the bottom the same way the view is,
+        // so it has to travel with it — otherwise the highlight crawls off
+        // the words it was on, which is exactly what someone copying out of
+        // a scrollback while the app keeps printing would be doing. The
+        // drag anchors go too: a re-anchor mid-drag would otherwise leave
+        // the selection growing from where its first word used to be.
+        this.selStart = shiftSelPos(this.selStart, moved);
+        this.selEnd = shiftSelPos(this.selEnd, moved);
+        this.selAnchorStart = shiftSelPos(this.selAnchorStart, moved);
+        this.selAnchorEnd = shiftSelPos(this.selAnchorEnd, moved);
+        this.touchSelAnchor = shiftSelPos(this.touchSelAnchor, moved);
+        // No scrollTop write here: the frame that goes with this offset
+        // deepens the scrollback by the same number of lines, so the
+        // position the render loop computes doesn't move.
+        this.scheduleRender();
+      },
+    );
   }
 
   // --- Palette ---
@@ -1945,11 +2019,16 @@ export class BlitTerminalSurface {
         if (maxScroll > 0 || this.scrollOffset > 0) {
           e.preventDefault();
           const delta = e.key === "PageUp" ? this._rows : -this._rows;
+          const prev = this.scrollOffset;
           this.scrollOffset = Math.max(
             0,
             Math.min(maxScroll, this.scrollOffset + delta),
           );
-          this.sendScroll(this._sessionId!, this.scrollOffset);
+          this.sendScrollBy(
+            this._sessionId!,
+            this.scrollOffset,
+            this.scrollOffset - prev,
+          );
           this.flashScrollbar();
           this.scheduleRender();
         }
@@ -2456,6 +2535,7 @@ export class BlitTerminalSurface {
       // real geometry while it is free.
       this.scrollViewH = el.clientHeight;
       this.lastScrollTop = el.scrollTop;
+      this.lastUserScrollAt = performance.now();
       const measured = el.scrollHeight - el.clientHeight;
       const maxScrollTop = measured > 0 ? measured : maxLines * cellH;
       const fromBottom = maxScrollTop - el.scrollTop;
@@ -2464,9 +2544,13 @@ export class BlitTerminalSurface {
         Math.min(maxLines, Math.round(fromBottom / cellH)),
       );
       if (next === this.scrollOffset) return;
+      const moved = next - this.scrollOffset;
       this.scrollOffset = next;
       if (this._sessionId !== null && this.status === "connected") {
-        this.sendScroll(this._sessionId, this.scrollOffset);
+        // `next` is absolute in *our* frame, which is one round trip behind
+        // the server's whenever the app is printing. The gesture that
+        // produced it is not.
+        this.sendScrollBy(this._sessionId, this.scrollOffset, moved);
       }
       if (this.scrollOffset > 0) this.flashScrollbar();
       this.scheduleRender();
@@ -2525,7 +2609,8 @@ export class BlitTerminalSurface {
     const targetTop = (lines - this.scrollOffset) * cellH;
     // Compared against what we last wrote rather than read back from the
     // element, for the same reason: a read here is a forced reflow.
-    if (Math.abs(this.lastScrollTop - targetTop) > 0.5) {
+    const drift = Math.abs(this.lastScrollTop - targetTop);
+    if (drift > 0.5 && !this.gestureOwnsScrollTop(drift, cellH)) {
       this.lastScrollTop = targetTop;
       this.suppressScrollSync = true;
       el.scrollTop = targetTop;
@@ -2534,6 +2619,29 @@ export class BlitTerminalSurface {
         this.suppressScrollSync = false;
       });
     }
+  }
+
+  /**
+   * True when a scroll gesture is still in flight and the only disagreement
+   * is where inside a row it stopped.
+   *
+   * `scrollOffset` is whole lines, so the position it maps back to is the
+   * nearest row boundary — never more than half a row from wherever the
+   * user actually is. Writing that back mid-gesture cancels the browser's
+   * momentum animation and restarts it from a snapped position, once per
+   * frame, which is what made a flick stutter. The offset the scroll
+   * listener derived is already correct either way; the write is only a
+   * cosmetic re-alignment, so it can wait for the gesture to end.
+   *
+   * A jump from somewhere else — Shift+PageUp, a paste, the server
+   * re-anchoring a scrolled view — moves by rows, not by a fraction of
+   * one, and still lands immediately.
+   */
+  private gestureOwnsScrollTop(drift: number, cellH: number): boolean {
+    return (
+      drift < cellH &&
+      performance.now() - this.lastUserScrollAt < SCROLL_SETTLE_MS
+    );
   }
 
   // --- Mouse input ---
@@ -2553,8 +2661,6 @@ export class BlitTerminalSurface {
     let lastMouseCell = { row: -1, col: -1 };
     let selecting = false;
     let selGranularity: 1 | 2 | 3 = 1;
-    let selAnchorStart: SelPos | null = null;
-    let selAnchorEnd: SelPos | null = null;
     let autoScrollTimer: ReturnType<typeof setInterval> | null = null;
     let autoScrollDir: -1 | 0 | 1 = 0;
     let lastHoverUrl: string | null = null;
@@ -2743,19 +2849,19 @@ export class BlitTerminalSurface {
         );
         if (next === prev) return;
         this.scrollOffset = next;
-        this.sendScroll(this._sessionId!, next);
+        this.sendScrollBy(this._sessionId!, next, next - prev);
         this.flashScrollbar();
         const edgeRow = dir === 1 ? 0 : this._rows - 1;
         const edgeCol = dir === 1 ? 0 : this._cols - 1;
         const edgeSel = cellToSel({ row: edgeRow, col: edgeCol });
-        if (selGranularity >= 2 && selAnchorStart && selAnchorEnd) {
+        if (selGranularity >= 2 && this.selAnchorStart && this.selAnchorEnd) {
           const { start: dragStart, end: dragEnd } =
             applyGranularitySel(edgeSel);
-          if (selPosBefore(dragStart, selAnchorStart)) {
+          if (selPosBefore(dragStart, this.selAnchorStart)) {
             this.selStart = dragStart;
-            this.selEnd = selAnchorEnd;
+            this.selEnd = this.selAnchorEnd;
           } else {
-            this.selStart = selAnchorStart;
+            this.selStart = this.selAnchorStart;
             this.selEnd = dragEnd;
           }
         } else {
@@ -2850,14 +2956,14 @@ export class BlitTerminalSurface {
           const { start, end } = applyGranularitySel(sel);
           this.selStart = start;
           this.selEnd = end;
-          selAnchorStart = start;
-          selAnchorEnd = end;
+          this.selAnchorStart = start;
+          this.selAnchorEnd = end;
           this.scheduleRender();
         } else {
           this.selStart = sel;
           this.selEnd = sel;
-          selAnchorStart = null;
-          selAnchorEnd = null;
+          this.selAnchorStart = null;
+          this.selAnchorEnd = null;
         }
       }
     };
@@ -2906,13 +3012,13 @@ export class BlitTerminalSurface {
         }
         const cell = mouseToCell(e);
         const sel = cellToSel(cell);
-        if (selGranularity >= 2 && selAnchorStart && selAnchorEnd) {
+        if (selGranularity >= 2 && this.selAnchorStart && this.selAnchorEnd) {
           const { start: dragStart, end: dragEnd } = applyGranularitySel(sel);
-          if (selPosBefore(dragStart, selAnchorStart)) {
+          if (selPosBefore(dragStart, this.selAnchorStart)) {
             this.selStart = dragStart;
-            this.selEnd = selAnchorEnd;
+            this.selEnd = this.selAnchorEnd;
           } else {
-            this.selStart = selAnchorStart;
+            this.selStart = this.selAnchorStart;
             this.selEnd = dragEnd;
           }
         } else {
@@ -2954,11 +3060,33 @@ export class BlitTerminalSurface {
       }
     };
 
+    // Mouse-reporting apps scroll themselves, so the wheel has to reach them
+    // as the discrete steps they expect — one per detent, three lines' worth
+    // of travel each. One report per DOM event instead let a trackpad, which
+    // emits an event per frame, scroll such an app about twenty times faster
+    // than the same flick moves anything else on screen.
+    const wheelDetents = new WheelDetents();
     const handleCanvasWheel = (e: WheelEvent) => {
       const t = this.terminal;
-      if (t && t.mouse_mode() > 0 && !e.shiftKey) {
-        e.preventDefault();
-        const button = e.deltaY < 0 ? 64 : 65;
+      if (!t || t.mouse_mode() === 0 || e.shiftKey) return;
+      // Ctrl+wheel is how browsers report a pinch-zoom, including macOS
+      // trackpad pinches. It is a zoom request, not a scroll.
+      if (e.ctrlKey) return;
+      // Claim the gesture even when it hasn't completed a step yet, or the
+      // leftover travel scrolls our own scrollback at the same time.
+      e.preventDefault();
+      const steps = wheelDetents.take(
+        e,
+        this.cell.h,
+        this._rows,
+        performance.now(),
+      );
+      // Sideways travel lands here with deltaY at 0 and produces no steps.
+      // It used to report a wheel-*down* per event, so a horizontal swipe
+      // scrolled the app.
+      if (steps === 0) return;
+      const button = steps < 0 ? 64 : 65;
+      for (let i = Math.abs(steps); i > 0; i--) {
         sendMouseEvent("down", e, button);
       }
     };
@@ -3112,7 +3240,6 @@ export class BlitTerminalSurface {
     let touchAccum = 0;
     let longPressTimer: ReturnType<typeof setTimeout> | null = null;
     let touchSelecting = false;
-    let touchSelAnchor: SelPos | null = null;
     let touchScrolled = false;
 
     const cancelLongPress = () => {
@@ -3142,7 +3269,7 @@ export class BlitTerminalSurface {
       };
       this.selStart = start;
       this.selEnd = end;
-      touchSelAnchor = sel;
+      this.touchSelAnchor = sel;
       touchSelecting = true;
       this.scheduleRender();
       this.notifySelectionChange();
@@ -3158,7 +3285,7 @@ export class BlitTerminalSurface {
         cancelLongPress();
         if (touchSelecting) {
           touchSelecting = false;
-          touchSelAnchor = null;
+          this.touchSelAnchor = null;
         }
         return;
       }
@@ -3196,7 +3323,7 @@ export class BlitTerminalSurface {
       if (!touch) return;
 
       // While selecting, drag extends the selection toward the finger.
-      if (touchSelecting && touchSelAnchor) {
+      if (touchSelecting && this.touchSelAnchor) {
         e.preventDefault();
         const cell = mouseToCell(
           new MouseEvent("touch", {
@@ -3205,11 +3332,11 @@ export class BlitTerminalSurface {
           }),
         );
         const sel = cellToSel(cell);
-        if (selPosBefore(sel, touchSelAnchor)) {
+        if (selPosBefore(sel, this.touchSelAnchor)) {
           this.selStart = sel;
-          this.selEnd = touchSelAnchor;
+          this.selEnd = this.touchSelAnchor;
         } else {
-          this.selStart = touchSelAnchor;
+          this.selStart = this.touchSelAnchor;
           this.selEnd = sel;
         }
         this.scheduleRender();
@@ -3285,7 +3412,7 @@ export class BlitTerminalSurface {
             // clipboard write fires before the gesture token expires.
             void this.copySelection();
             touchSelecting = false;
-            touchSelAnchor = null;
+            this.touchSelAnchor = null;
             // Suppress the synthetic mousedown/click iOS dispatches after
             // a long-press touch sequence, otherwise our mouse handler
             // would clear the freshly built selection.
@@ -3340,6 +3467,8 @@ export class BlitTerminalSurface {
   private teardownMouse(): void {
     this.mouseCleanup?.();
     this.mouseCleanup = null;
+    // Drop any in-progress selection state with the handlers that own it.
+    this.clearSelection();
   }
 
   // --- Helpers ---
@@ -3359,5 +3488,23 @@ export class BlitTerminalSurface {
 
   private sendScroll(sessionId: SessionId, offset: number): void {
     this._workspace?.scrollSession(sessionId, offset);
+  }
+
+  /**
+   * Report a scroll the user *moved* rather than one they aimed at.
+   *
+   * Everything incremental — a wheel notch, a page key, a selection drag
+   * running off the edge — belongs here: the absolute offset it works out
+   * to counts from a live bottom that the app may move before the message
+   * lands, and the server re-anchors us in that same window. Sent as a
+   * relative move, the two compose instead of racing. `offset` rides along
+   * for servers that only know the absolute form.
+   */
+  private sendScrollBy(
+    sessionId: SessionId,
+    offset: number,
+    lines: number,
+  ): void {
+    this._workspace?.scrollSessionBy(sessionId, offset, lines);
   }
 }

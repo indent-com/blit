@@ -4,22 +4,23 @@ use blit_remote::{
     C2S_ACK, C2S_CLIENT_FEATURES, C2S_CLIENT_METRICS, C2S_CLIPBOARD_GET, C2S_CLIPBOARD_LIST,
     C2S_CLIPBOARD_SET, C2S_CLOSE, C2S_COPY_RANGE, C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N,
     C2S_CREATE2, C2S_DEADLINE, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_KILL, C2S_MOUSE,
-    C2S_PING, C2S_QUIT, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SEARCH, C2S_SUBSCRIBE,
-    C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT,
-    C2S_SURFACE_LIST, C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2,
-    C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE,
-    C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND,
-    CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE, CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS,
-    FEATURE_COMPOSITOR, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS,
-    FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FrameState,
-    KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST,
-    S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST,
-    S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE,
-    SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN,
-    build_update_msg, msg_hello, msg_s2c_clipboard_content, msg_s2c_clipboard_list,
-    msg_s2c_used_rows, msg_surface_app_id, msg_surface_created, msg_surface_destroyed,
-    msg_surface_encoder, msg_surface_frame, msg_surface_resized, msg_surface_title,
-    msg_term_cwd_reply, parse_surface_pointer_axis2,
+    C2S_PING, C2S_QUIT, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SCROLL_BY, C2S_SEARCH,
+    C2S_SUBSCRIBE, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS,
+    C2S_SURFACE_INPUT, C2S_SURFACE_LIST, C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS,
+    C2S_SURFACE_POINTER_AXIS2, C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT,
+    C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
+    CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE,
+    CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS, FEATURE_COMPOSITOR, FEATURE_COPY_RANGE,
+    FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE,
+    FEATURE_RESIZE_BATCH, FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState, KILL_LEADER_ONLY,
+    READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT,
+    S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE,
+    STATUS_BUDGET, STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264,
+    SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN, build_update_msg, msg_hello,
+    msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_scroll_offset, msg_s2c_used_rows,
+    msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
+    msg_surface_frame, msg_surface_resized, msg_surface_title, msg_term_cwd_reply,
+    parse_surface_pointer_axis2,
 };
 #[cfg(target_os = "linux")]
 use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO};
@@ -169,6 +170,7 @@ trait PtyDriver: Send {
         end_col: u16,
     ) -> String;
     fn total_lines(&self) -> u32;
+    fn scrolled_lines(&self) -> u64;
 }
 
 struct PtySearchResult {
@@ -268,6 +270,10 @@ impl PtyDriver for AlacrittyDriver {
 
     fn total_lines(&self) -> u32 {
         AlacrittyDriver::total_lines(self)
+    }
+
+    fn scrolled_lines(&self) -> u64 {
+        AlacrittyDriver::scrolled_lines(self)
     }
 }
 
@@ -465,6 +471,10 @@ struct Pty {
     title_pending: bool,
     /// Last used visible rows value broadcast for this PTY.
     last_used_rows_sent: u16,
+    /// The driver's `scrolled_lines` as of the last re-anchor pass, so the
+    /// tick can turn a monotonic counter into "lines that moved since we
+    /// last looked" for every scrolled-back client at once.
+    last_scrolled_lines: u64,
     /// When the server should stop this terminal, if a client armed a
     /// deadline.  Absent means unbounded, which stays the default — a
     /// multiplexer whose sessions expire on their own would be useless.
@@ -2970,6 +2980,87 @@ fn update_client_scroll_state(client: &mut ClientState, pty_id: u16, next_offset
     }
     reset_inflight(client);
     true
+}
+
+/// Hold every scrolled-back client still while the app keeps printing.
+///
+/// A scroll offset is a distance from the live bottom, so lines leaving the
+/// viewport slide the text a parked client is reading upward.  A shell is
+/// quiet enough for that to pass unnoticed; an agent streaming output is
+/// not — the page crawls out from under the reader.  Grow each offset by
+/// however many lines actually scrolled and the content stays put, then
+/// tell the client so both ends keep naming the same rows.
+fn reanchor_scrolled_clients(sess: &mut Session) {
+    // (pty, lines that scrolled, deepest offset that still has content)
+    let mut moved: Vec<(u16, u64, usize)> = Vec::new();
+    for (&pid, pty) in sess.ptys.iter_mut() {
+        let scrolled = pty.driver.scrolled_lines();
+        let delta = scrolled - pty.last_scrolled_lines;
+        pty.last_scrolled_lines = scrolled;
+        if delta == 0 {
+            continue;
+        }
+        let rows = pty.driver.size().0 as u32;
+        let max_offset = pty.driver.total_lines().saturating_sub(rows) as usize;
+        moved.push((pid, delta, max_offset));
+    }
+    if moved.is_empty() {
+        return;
+    }
+    for client in sess.clients.values_mut() {
+        // `scroll_offsets` only holds the scrolled-back PTYs, so a client
+        // watching the live tail — every client, nearly all the time —
+        // costs one emptiness check.
+        if client.scroll_offsets.is_empty() {
+            continue;
+        }
+        for &(pid, delta, max_offset) in &moved {
+            if let Some(next) = reanchor_client(client, pid, delta, max_offset) {
+                let _ = send_outbox(client, msg_s2c_scroll_offset(pid, next as u32));
+            }
+        }
+    }
+}
+
+/// Apply a client's relative scroll request (`C2S_SCROLL_BY`) against the
+/// offset we hold for it right now — which is what makes the request immune
+/// to a re-anchor that crossed it on the wire.  Unlike a re-anchor this may
+/// start a live client scrolling, since a wheel notch on a live view is how
+/// scrolling back begins.  Returns the new offset when it changed.
+fn scroll_client_by(
+    client: &mut ClientState,
+    pid: u16,
+    delta: i64,
+    max_offset: usize,
+) -> Option<usize> {
+    let current = client.scroll_offsets.get(&pid).copied().unwrap_or(0) as i64;
+    let next = current.saturating_add(delta).clamp(0, max_offset as i64) as usize;
+    update_client_scroll_state(client, pid, next).then_some(next)
+}
+
+/// Move one client's parked view down by `delta` lines, bounded by the
+/// deepest offset that still has content.  Returns the new offset when it
+/// changed, which is exactly when the client has to be told.
+fn reanchor_client(
+    client: &mut ClientState,
+    pid: u16,
+    delta: u64,
+    max_offset: usize,
+) -> Option<usize> {
+    let offset = client.scroll_offsets.get(&pid).copied()?;
+    let next = offset.saturating_add(delta as usize).min(max_offset);
+    if next == offset {
+        return None;
+    }
+    if next == 0 {
+        // The whole scrollback scrolled away under the reader (the app
+        // cleared its history).  Same hand-back of the cached pre-scroll
+        // frame as a client scrolling home itself.
+        update_client_scroll_state(client, pid, 0);
+    } else {
+        client.scroll_offsets.insert(pid, next);
+    }
+    Some(next)
 }
 
 struct Session {
@@ -7530,6 +7621,8 @@ async fn tick(state: &AppState) -> TickOutcome {
         sess.tick_snaps += 1;
     }
 
+    reanchor_scrolled_clients(&mut sess);
+
     let client_ids: Vec<u64> = sess.clients.keys().copied().collect();
     for cid in client_ids {
         // When the pipe is idle (nothing in flight), RTT cannot be measured
@@ -10538,6 +10631,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | FEATURE_CREATE_STATUS
                 | FEATURE_KILL_MODE
                 | FEATURE_PTY_DEADLINE
+                | FEATURE_SCROLL_BY
                 | blit_remote::fs::FEATURE_FS
                 | blit_remote::git::FEATURE_GIT;
             // BLIT_LSP=0 disables the family: the bit is simply not
@@ -11169,6 +11263,27 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         pty.mark_dirty();
                         need_nudge = true;
                     }
+                }
+            }
+            C2S_SCROLL_BY if data.len() >= 7 => {
+                let pid = u16::from_le_bytes([data[1], data[2]]);
+                let delta = i32::from_le_bytes([data[3], data[4], data[5], data[6]]) as i64;
+                // Relative to whatever we hold *now*, which is what makes
+                // this immune to the re-anchoring that may have happened
+                // while the request was in flight.
+                if let Some(pty) = sess.ptys.get(&pid) {
+                    let rows = pty.driver.size().0 as u32;
+                    let max_offset = pty.driver.total_lines().saturating_sub(rows) as usize;
+                    if let Some(c) = sess.clients.get_mut(&client_id)
+                        && let Some(next) = scroll_client_by(c, pid, delta, max_offset)
+                    {
+                        // The client learns where its gesture landed: it
+                        // cannot work that out itself once we have clamped,
+                        // or once a re-anchor crossed on the way.
+                        let _ = send_outbox(c, msg_s2c_scroll_offset(pid, next as u32));
+                    }
+                    sess.ptys.get_mut(&pid).expect("checked above").mark_dirty();
+                    need_nudge = true;
                 }
             }
             C2S_RESIZE if data.len() >= 7 => {
@@ -15155,6 +15270,90 @@ mod tests {
         assert_eq!(client.scroll_offsets.get(&7), None);
         assert_eq!(client.last_sent.get(&7), Some(&history));
         assert_eq!(client.scroll_caches.get(&7), None);
+    }
+
+    #[test]
+    fn output_moves_a_parked_view_with_the_text_it_is_reading() {
+        // The offset counts up from the live bottom, so three lines of
+        // output have to push it three deeper for the reader to stay on the
+        // same rows.
+        let mut client = test_client();
+        client.subscriptions.insert(7);
+        client.scroll_offsets.insert(7, 12);
+
+        assert_eq!(reanchor_client(&mut client, 7, 3, 500), Some(15));
+        assert_eq!(client.scroll_offsets.get(&7), Some(&15));
+    }
+
+    #[test]
+    fn a_parked_view_stops_at_the_oldest_line_it_still_has() {
+        let mut client = test_client();
+        client.subscriptions.insert(7);
+        client.scroll_offsets.insert(7, 98);
+
+        // Scrollback full at 100: the text really is scrolling away now, and
+        // the deepest offset is as far back as the reader can follow it.
+        assert_eq!(reanchor_client(&mut client, 7, 5, 100), Some(100));
+        assert_eq!(reanchor_client(&mut client, 7, 5, 100), None);
+    }
+
+    #[test]
+    fn losing_the_whole_scrollback_returns_a_parked_view_to_the_live_tail() {
+        let mut client = test_client();
+        let history = sample_frame("hist");
+        client.lead = Some(7);
+        client.subscriptions.insert(7);
+        client.scroll_offsets.insert(7, 12);
+        client.scroll_caches.insert(7, history.clone());
+
+        assert_eq!(reanchor_client(&mut client, 7, 4, 0), Some(0));
+        assert_eq!(client.scroll_offsets.get(&7), None);
+        assert_eq!(client.last_sent.get(&7), Some(&history));
+    }
+
+    /// The point of the relative form: the client asked to go back three
+    /// lines from what it was looking at, and three lines of output landed
+    /// while it asked.  The gesture and the re-anchor compose.
+    #[test]
+    fn a_relative_scroll_lands_on_top_of_a_re_anchor() {
+        let mut client = test_client();
+        client.subscriptions.insert(7);
+        client.scroll_offsets.insert(7, 12);
+
+        // In flight: three lines scroll away and we hold the view still.
+        assert_eq!(reanchor_client(&mut client, 7, 3, 500), Some(15));
+        // The request was computed against offset 12 and still means "three
+        // more lines back", not "offset 15".
+        assert_eq!(scroll_client_by(&mut client, 7, 3, 500), Some(18));
+    }
+
+    #[test]
+    fn a_relative_scroll_starts_and_ends_a_scrollback_visit() {
+        let mut client = test_client();
+        client.subscriptions.insert(7);
+
+        assert_eq!(scroll_client_by(&mut client, 7, 3, 500), Some(3));
+        assert_eq!(scroll_client_by(&mut client, 7, -9, 500), Some(0));
+        assert_eq!(client.scroll_offsets.get(&7), None);
+    }
+
+    #[test]
+    fn a_relative_scroll_stops_at_the_ends() {
+        let mut client = test_client();
+        client.subscriptions.insert(7);
+        client.scroll_offsets.insert(7, 98);
+
+        assert_eq!(scroll_client_by(&mut client, 7, i64::MAX, 100), Some(100));
+        assert_eq!(scroll_client_by(&mut client, 7, 5, 100), None);
+    }
+
+    #[test]
+    fn a_live_client_is_left_alone() {
+        let mut client = test_client();
+        client.subscriptions.insert(7);
+
+        assert_eq!(reanchor_client(&mut client, 7, 9, 500), None);
+        assert!(client.scroll_offsets.is_empty());
     }
 
     #[tokio::test]

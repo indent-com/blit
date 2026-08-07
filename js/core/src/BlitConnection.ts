@@ -18,6 +18,7 @@ import {
   FEATURE_CREATE_STATUS,
   FEATURE_KILL_MODE,
   FEATURE_RESIZE_BATCH,
+  FEATURE_SCROLL_BY,
   FEATURE_RESTART,
   statusText,
   S2C_AUDIO_FRAME,
@@ -50,6 +51,7 @@ import {
   S2C_TERM_CWD_EVENT,
   S2C_UPDATE,
   S2C_USED_ROWS,
+  S2C_SCROLL_OFFSET,
   C2S_PING,
 } from "./types";
 import {
@@ -69,6 +71,7 @@ import {
   parseTermCwdEvent,
   buildRestartMessage,
   buildScrollMessage,
+  buildScrollByMessage,
   buildSearchMessage,
   buildSurfaceInputMessage,
   buildSurfaceTextMessage,
@@ -512,6 +515,10 @@ export class BlitConnection {
   readonly audioPlayer = new AudioPlayer();
 
   private readonly listeners = new Set<() => void>();
+  private readonly scrollAnchorListeners = new Set<{
+    ptyId: number;
+    listener: (offset: number) => void;
+  }>();
   private readonly sessionsById = new Map<SessionId, InternalSession>();
   private readonly currentSessionIdByPtyId = new Map<number, SessionId>();
   private readonly pendingCreates = new Map<number, PendingCreate>();
@@ -1160,6 +1167,35 @@ export class BlitConnection {
       return;
     }
     this.transport.send(buildScrollMessage(session.ptyId, offset));
+  }
+
+  /**
+   * Move a scrolled view by `lines` rather than to a position.
+   *
+   * A gesture is relative — a notch, a page, a drag — and the absolute
+   * offset it works out to only means what the user intended for as long as
+   * the live bottom it counts from stays put. Under a chatty app the server
+   * moves that bottom, and re-anchors this client, while the request is in
+   * flight; the stale absolute then lands short by however many lines
+   * scrolled in between.
+   *
+   * `offset` is where the caller believes the move lands, used verbatim
+   * against a server too old to know the relative form.
+   */
+  scrollSessionBy(sessionId: SessionId, offset: number, lines: number): void {
+    const session = this.sessionsById.get(sessionId);
+    if (
+      !session ||
+      !isLiveSession(session) ||
+      this.transport.status !== "connected"
+    ) {
+      return;
+    }
+    this.transport.send(
+      (this.features & FEATURE_SCROLL_BY) !== 0
+        ? buildScrollByMessage(session.ptyId, lines)
+        : buildScrollMessage(session.ptyId, offset),
+    );
   }
 
   sendMouse(
@@ -2743,6 +2779,27 @@ export class BlitConnection {
     });
   }
 
+  /**
+   * Called when the server re-anchors this session's scrolled-back view
+   * (`S2C_SCROLL_OFFSET`) with the offset it now holds for us.
+   *
+   * Separate from the dirty listener because it isn't a frame: the content
+   * hasn't been decided yet, only where in the scrollback it will be read
+   * from.
+   */
+  addScrollAnchorListener(
+    sessionId: SessionId,
+    listener: (offset: number) => void,
+  ): () => void {
+    const id = this.ptyId(sessionId);
+    if (id == null) return () => {};
+    const entry = { ptyId: id, listener };
+    this.scrollAnchorListeners.add(entry);
+    return () => {
+      this.scrollAnchorListeners.delete(entry);
+    };
+  }
+
   getSharedRenderer() {
     return this.store.getSharedRenderer();
   }
@@ -3558,6 +3615,17 @@ export class BlitConnection {
         const sessionId = this.currentSessionIdByPtyId.get(ptyId);
         if (sessionId) {
           this.updateSession(sessionId, { usedRows });
+        }
+        return;
+      }
+      case S2C_SCROLL_OFFSET: {
+        if (bytes.length < 7) return;
+        const ptyId = bytes[1] | (bytes[2] << 8);
+        const offset =
+          (bytes[3] | (bytes[4] << 8) | (bytes[5] << 16) | (bytes[6] << 24)) >>>
+          0;
+        for (const entry of this.scrollAnchorListeners) {
+          if (entry.ptyId === ptyId) entry.listener(offset);
         }
         return;
       }
