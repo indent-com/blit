@@ -893,6 +893,12 @@ export class SurfaceStore {
       if (
         prev !== undefined &&
         prev !== codecString &&
+        // Selection churn announces the whole preference walk — an avc1
+        // string can arrive while an AV1 decoder is live (and vice versa)
+        // before the codec actually switches.  Only apply a same-codec
+        // string to a live decoder; a real codec switch replaces the
+        // decoder when its first frame arrives (handleSurfaceFrame).
+        codecString.startsWith("av01") &&
         entry &&
         entry.codec === "av1" &&
         entry.decoder.state === "configured"
