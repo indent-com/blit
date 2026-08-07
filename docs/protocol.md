@@ -52,6 +52,7 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 | `0x1B` | `COPY_RANGE`            | `[nonce:2][pty_id:2][start_tail:4][start_col:2][end_tail:4][end_col:2][flags:1]`                                                                                     |
 | `0x1C` | `TERM_CWD`              | `[nonce:2][pty_id:2]` — request a PTY's live working directory (see [Working directory tracking](#working-directory-tracking))                                       |
 | `0x1D` | `DEADLINE`              | `[pty_id:2][ms:4]` — arm or refresh a server-enforced deadline; `ms = 0` clears it                                                                                   |
+| `0x1E` | `SCROLL_BY`             | `[pty_id:2][delta:4 i32]` — move a scrolled view relative to where the server holds it (see [Scrollback](#scrollback))                                               |
 | `0x20` | `SURFACE_INPUT`         | `[surface_id:2][keycode:4][pressed:1]`                                                                                                                               |
 | `0x21` | `SURFACE_POINTER`       | `[surface_id:2][type:1][button:1][x:2][y:2]`                                                                                                                         |
 | `0x22` | `SURFACE_POINTER_AXIS`  | `[surface_id:2][axis:1][value:4]` — legacy scroll, superseded by `0x32`                                                                                              |
@@ -132,6 +133,7 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 | `0x0E` | `TERM_CWD`          | `[nonce:2][cwd_len:2][cwd:N]` — reply to `C2S_TERM_CWD`; empty = unknown                                           |
 | `0x0F` | `TERM_CWD_EVENT`    | `[pty_id:2][cwd:N]` — unsolicited push when the OSC 7-reported cwd changes                                         |
 | `0x10` | `CREATE_FAILED`     | `[nonce:2][status:1][detail:N]` — refusal of a `CREATE2(WANT_STATUS)`                                              |
+| `0x11` | `SCROLL_OFFSET`     | `[pty_id:2][offset:4]` — this client's scrolled-back view was re-anchored (see Scrollback)                         |
 | `0x20` | `SURFACE_CREATED`   | `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`                              |
 | `0x21` | `SURFACE_DESTROYED` | `[surface_id:2]`                                                                                                   |
 | `0x22` | `SURFACE_FRAME`     | `[surface_id:2][timestamp:4][flags:1][w:2][h:2][data:N]`                                                           |
@@ -158,22 +160,23 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 
 `S2C_HELLO` is the first message sent on every new connection. `version` is the server's protocol version. `boot_generation` is an opaque little-endian identifier generated once per server process; clients can compare it across reconnects to detect a server restart. `server_version` is the server's release string (its crate version, e.g. `0.40.1`) — informational only: feature negotiation always goes through the feature bits, never a version comparison. Both trailing fields were appended without a protocol bump, so legacy servers omit them and clients must treat a short `HELLO` as valid. `features` is a 4-byte bitmask:
 
-| Bit | Name            | Meaning                                                        |
-| --- | --------------- | -------------------------------------------------------------- |
-| 0   | `CREATE_NONCE`  | Server supports `CREATE2` / `CREATED_N` with nonce correlation |
-| 1   | `RESTART`       | Server supports `C2S_RESTART` to respawn exited PTYs           |
-| 2   | `RESIZE_BATCH`  | Server accepts batched resize entries in a single `C2S_RESIZE` |
-| 3   | `COPY_RANGE`    | Server supports range-based text copy                          |
-| 4   | `COMPOSITOR`    | Server supports headless Wayland compositor                    |
-| 5   | `AUDIO`         | Server supports audio forwarding (PipeWire capture + Opus)     |
-| 6   | `FS`            | Server supports the `FS_*` filesystem sync family              |
-| 7   | `GIT`           | Server supports the `GIT_*` git introspection family           |
-| 8   | `LSP`           | Server supports the `LSP_*` language intelligence family       |
-| 9   | `KV`            | Server supports the `KV_*` key-value family                    |
-| 10  | `NET`           | Server supports the `NET_*` network-relay family               |
-| 14  | `CREATE_STATUS` | `CREATE2(WANT_STATUS)` receives an explicit failure            |
-| 15  | `KILL_MODE`     | `KILL`/`CLOSE` reach the process group; `KILL` takes `flags`   |
-| 16  | `PTY_DEADLINE`  | `C2S_DEADLINE`, `CREATE2(HAS_DEADLINE)`, and `EXITED.reason`   |
+| Bit | Name            | Meaning                                                         |
+| --- | --------------- | --------------------------------------------------------------- |
+| 0   | `CREATE_NONCE`  | Server supports `CREATE2` / `CREATED_N` with nonce correlation  |
+| 1   | `RESTART`       | Server supports `C2S_RESTART` to respawn exited PTYs            |
+| 2   | `RESIZE_BATCH`  | Server accepts batched resize entries in a single `C2S_RESIZE`  |
+| 3   | `COPY_RANGE`    | Server supports range-based text copy                           |
+| 4   | `COMPOSITOR`    | Server supports headless Wayland compositor                     |
+| 5   | `AUDIO`         | Server supports audio forwarding (PipeWire capture + Opus)      |
+| 6   | `FS`            | Server supports the `FS_*` filesystem sync family               |
+| 7   | `GIT`           | Server supports the `GIT_*` git introspection family            |
+| 8   | `LSP`           | Server supports the `LSP_*` language intelligence family        |
+| 9   | `KV`            | Server supports the `KV_*` key-value family                     |
+| 10  | `NET`           | Server supports the `NET_*` network-relay family                |
+| 14  | `CREATE_STATUS` | `CREATE2(WANT_STATUS)` receives an explicit failure             |
+| 15  | `KILL_MODE`     | `KILL`/`CLOSE` reach the process group; `KILL` takes `flags`    |
+| 16  | `PTY_DEADLINE`  | `C2S_DEADLINE`, `CREATE2(HAS_DEADLINE)`, and `EXITED.reason`    |
+| 17  | `SCROLL_BY`     | Scrollback holds still: `S2C_SCROLL_OFFSET` and `C2S_SCROLL_BY` |
 
 Bits 11 through 13 are held for the extension, channel, and process families
 under review in [#167](https://github.com/indent-com/blit/pull/167) and
@@ -311,6 +314,16 @@ advertised bit 14. A server must not send `CREATE_FAILED` for a request which
 did not set it.
 
 `S2C_EXITED` exit status: `WEXITSTATUS` for normal exits (0, 1, …); negative signal number for signal deaths (-9 = SIGKILL); `i32::MIN` when status is unknown.
+
+### Scrollback
+
+`C2S_SCROLL` (`0x02`) names a position as `offset` lines above the live bottom, per client — one terminal can have several viewers reading different parts of it. That makes the offset a moving target: every line the app pushes off the top of the viewport slides the text under anyone reading the scrollback. A shell is quiet enough for it to go unnoticed; an agent streaming output is not.
+
+The server holds those viewers still. Each tick it asks the driver how many lines actually scrolled (including once the scrollback is full and its depth stops growing, where the number is no longer inferable from the frames), grows every non-zero offset by that much, clamps it to the deepest offset that still has content, and reports the result as `S2C_SCROLL_OFFSET` (`0x11`). Sent only to a client that is scrolled back, only when its offset moved.
+
+A client adopts the value: its own copy of the offset feeds the scrollbar, its selection anchors, and the next scroll request it sends, all of which have to keep naming the same rows the frames do. Because the frame that accompanies the re-anchor deepens the scrollback by the same number of lines, the position on screen does not move — that is the point. A frame is sent for a change in scrollback depth alone, so a client whose content is being held still still learns how deep the history under it now goes.
+
+That leaves the client's own requests. An absolute offset only means what the user intended for as long as the bottom it counts from stays put, and the whole reason this section exists is that under a chatty app it does not: the request is computed from a view that is one round trip old, and lands short by however many lines scrolled while it was in flight. `C2S_SCROLL_BY` (`0x1E`, gated on `FEATURE_SCROLL_BY`) states the motion instead of the destination — the server applies it to whatever offset it currently holds, clamps, and answers with `S2C_SCROLL_OFFSET`. Every incremental gesture uses it: a wheel notch, a page key, a selection drag running off the edge. Absolute `C2S_SCROLL` stays right for the requests that really are absolute — home, end, dragging the scrollbar, and returning to the live tail — and remains the fallback against a server that does not advertise the bit.
 
 ### Working directory tracking
 

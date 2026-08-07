@@ -760,6 +760,7 @@ pub fn spawn_pty(
         last_title_send: std::time::Instant::now(),
         title_pending: false,
         last_used_rows_sent: 0,
+        last_scrolled_lines: 0,
         deadline: None,
         stop_deadline: None,
         exit_reason: blit_remote::EXIT_REASON_NORMAL,

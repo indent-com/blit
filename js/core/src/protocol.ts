@@ -13,6 +13,7 @@ import {
   C2S_RESTART,
   C2S_RESIZE,
   C2S_SCROLL,
+  C2S_SCROLL_BY,
   C2S_FOCUS,
   C2S_CLOSE,
   C2S_SUBSCRIBE,
@@ -131,6 +132,21 @@ export function buildClearResizeBatchMessage(
       cols: UNSET_VIEW_SIZE,
     })),
   );
+}
+
+/** Move a scrolled view by `lines` from wherever the server holds it
+ *  (negative = back toward the live bottom).  See {@link C2S_SCROLL_BY}. */
+export function buildScrollByMessage(ptyId: number, lines: number): Uint8Array {
+  const msg = new Uint8Array(7);
+  const delta = Math.trunc(lines) | 0;
+  msg[0] = C2S_SCROLL_BY;
+  msg[1] = ptyId & 0xff;
+  msg[2] = (ptyId >> 8) & 0xff;
+  msg[3] = delta & 0xff;
+  msg[4] = (delta >> 8) & 0xff;
+  msg[5] = (delta >> 16) & 0xff;
+  msg[6] = (delta >> 24) & 0xff;
+  return msg;
 }
 
 export function buildScrollMessage(ptyId: number, offset: number): Uint8Array {

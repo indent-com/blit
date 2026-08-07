@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::search::RegexSearch;
@@ -399,6 +399,23 @@ struct SearchCandidate {
 
 // ── Main driver ─────────────────────────────────────────────────────────
 
+// ── Scrollback anchoring ────────────────────────────────────────────────
+//
+// A client parked in the scrollback names its position as a distance from
+// the live bottom, so every line the app pushes moves the content it is
+// reading one row further up.  The grid already knows how to compensate —
+// `Grid::scroll_up` advances a non-zero display offset by however many
+// lines it just rotated away, saturating at the scrollback limit — but that
+// bookkeeping is per-terminal and blit has one scroll position per client,
+// so nothing here consumes it.
+//
+// Park the grid's own display offset at a fixed probe around each `process`
+// and the difference afterwards is exactly how far the content moved,
+// without reimplementing the walk.  `Grid::scroll_display` clamps to the
+// history size, so the probe only arms once a line has reached the
+// scrollback — which is also the first moment a client can be parked in it.
+const SCROLL_PROBE: usize = 1;
+
 pub struct TerminalDriver {
     term: Term<BlitEventProxy>,
     processor: alacritty_terminal::vte::ansi::Processor<NoSyncTimeout>,
@@ -409,6 +426,9 @@ pub struct TerminalDriver {
     saw_explicit_title: bool,
     used_rows: u16,
     used_rows_dirty: bool,
+    /// Lines rotated out of the viewport since this terminal was created.
+    /// Monotonic; consumers track their own last-seen value and use deltas.
+    scrolled_lines: u64,
 }
 
 impl TerminalDriver {
@@ -434,17 +454,44 @@ impl TerminalDriver {
             saw_explicit_title: false,
             used_rows: 0,
             used_rows_dirty: true,
+            scrolled_lines: 0,
         }
     }
 
     pub fn process(&mut self, data: &[u8]) {
         let used_rows_action = self.modes.process(data);
+        self.arm_scroll_probe();
         self.processor.advance(&mut self.term, data);
+        self.read_scroll_probe();
         if used_rows_action == UsedRowsAction::Reset {
             self.reset_used_rows();
         }
         self.update_used_rows_from_visible_grid();
         self.refresh_title();
+    }
+
+    /// Lines rotated out of the viewport since this terminal was created.
+    /// A client parked `n` lines above the bottom has to move by the delta
+    /// between two reads of this to keep looking at the same text.
+    pub fn scrolled_lines(&self) -> u64 {
+        self.scrolled_lines
+    }
+
+    fn arm_scroll_probe(&mut self) {
+        let current = self.term.grid().display_offset();
+        if current == SCROLL_PROBE {
+            return;
+        }
+        let delta = SCROLL_PROBE as i32 - current as i32;
+        // `grid_mut` rather than `Term::scroll_display`: the offset is the
+        // only thing wanted here, not the damage marking and vi-cursor
+        // clamping that come with the terminal-level call.
+        self.term.grid_mut().scroll_display(Scroll::Delta(delta));
+    }
+
+    fn read_scroll_probe(&mut self) {
+        let after = self.term.grid().display_offset();
+        self.scrolled_lines += after.saturating_sub(SCROLL_PROBE) as u64;
     }
 
     pub fn size(&self) -> (u16, u16) {
@@ -458,6 +505,11 @@ impl TerminalDriver {
             rows: rows as usize,
         };
         self.term.resize(dims);
+        // A resize shifts the history around on its own (rewrap, and lines
+        // pushed out when the viewport shrinks).  That motion isn't the app
+        // scrolling and the client re-derives its geometry from the next
+        // frame anyway, so re-arm the probe without counting it.
+        self.arm_scroll_probe();
         let capped = self.used_rows.min(rows);
         if capped != self.used_rows {
             self.used_rows = capped;

@@ -212,6 +212,24 @@ pub const C2S_DEADLINE: u8 = 0x1D;
 /// wrong for the workload this exists for — an agent that has already
 /// abandoned the terminal is not coming back to flush anything.
 pub const DEADLINE_STOP_GRACE_MS: u32 = 5_000;
+/// Move a scrolled view by a signed number of lines, relative to wherever
+/// the server currently holds it: [0x1E][pty_id:2][delta:4 i32].
+///
+/// `C2S_SCROLL`'s absolute offset is measured from the live bottom, so it
+/// only means what the client intended for as long as the bottom hasn't
+/// moved.  Under a chatty app it moves while the message is in flight, and
+/// the server re-anchors the client in the same window
+/// (`S2C_SCROLL_OFFSET`) — so an absolute request computed from what the
+/// user was looking at lands short by however many lines scrolled in
+/// between.  A wheel notch, a page key and a drag are all relative motions
+/// anyway; sent as one, they compose with the re-anchor instead of racing
+/// it.  Absolute `C2S_SCROLL` remains right for the jumps that really are
+/// absolute: home, end, and dragging the scrollbar.
+///
+/// The server clamps the result to the scrollback and answers with
+/// `S2C_SCROLL_OFFSET` carrying where the view actually ended up.
+/// Requires [`FEATURE_SCROLL_BY`].
+pub const C2S_SCROLL_BY: u8 = 0x1E;
 
 /// Keyboard input for a Wayland surface: [0x20][surface_id:2][data:N]
 /// data contains evdev keycodes encoded as [keycode:4][pressed:1] sequences.
@@ -415,6 +433,17 @@ pub const S2C_CREATE_FAILED: u8 = 0x10;
 /// Cap on `S2C_CREATE_FAILED`'s `detail`.  Matches the 1 KiB the other
 /// diagnostic-detail families use; the text is for humans, not parsing.
 pub const CREATE_FAILED_DETAIL_MAX: usize = 1024;
+/// A scrolled-back client's view was re-anchored: [0x11][pty_id:2][offset:4]
+///
+/// `C2S_SCROLL` names a position as a distance from the live bottom, so
+/// output from the app moves the text under a client that is reading its
+/// scrollback.  The server holds that client still by growing its offset
+/// as lines scroll away, and reports the result here so the client's own
+/// idea of where it is — scrollbar, selection anchors, the next
+/// `C2S_SCROLL` it sends — keeps agreeing with the frames it receives.
+/// Sent only to a client with a non-zero offset, only when that offset
+/// actually moved.
+pub const S2C_SCROLL_OFFSET: u8 = 0x11;
 /// Text response: [0x0A][nonce:2][pty_id:2][total_lines:4][offset:4][text:N]
 /// nonce: echoed from C2S_READ request
 /// total_lines: total available lines (scrollback + viewport rows)
@@ -427,6 +456,14 @@ pub fn msg_s2c_used_rows(pty_id: u16, used_rows: u16) -> Vec<u8> {
     msg.push(S2C_USED_ROWS);
     msg.extend_from_slice(&pty_id.to_le_bytes());
     msg.extend_from_slice(&used_rows.to_le_bytes());
+    msg
+}
+
+pub fn msg_s2c_scroll_offset(pty_id: u16, offset: u32) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(7);
+    msg.push(S2C_SCROLL_OFFSET);
+    msg.extend_from_slice(&pty_id.to_le_bytes());
+    msg.extend_from_slice(&offset.to_le_bytes());
     msg
 }
 
@@ -643,6 +680,10 @@ pub const FEATURE_KILL_MODE: u32 = 1 << 15;
 /// Server-enforced terminal deadlines: `C2S_DEADLINE`,
 /// `CREATE2(HAS_DEADLINE)`, and the `reason` byte on `S2C_EXITED`.
 pub const FEATURE_PTY_DEADLINE: u32 = 1 << 16;
+/// Scrollback that holds still under output: the server re-anchors a
+/// scrolled client and reports it with [`S2C_SCROLL_OFFSET`], and accepts
+/// the relative [`C2S_SCROLL_BY`] that goes with it.
+pub const FEATURE_SCROLL_BY: u32 = 1 << 17;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {
@@ -3458,11 +3499,20 @@ pub fn build_update_msg(
 
     if op_count == 0 {
         // No cell changes — still emit a frame if cursor/mode/title changed.
+        //
+        // The scrollback count belongs in that list: a client parked in the
+        // scrollback is held on the same rows while the app prints, so its
+        // frames stop changing while the history under it keeps growing.
+        // Skipping those updates leaves the client's idea of how deep the
+        // scrollback goes frozen at whenever it last saw a cell change —
+        // and that number is what its scrollbar, its clamping, and the
+        // offset it sends back are all built on.
         if !title_changed
             && !links_changed
             && current.cursor_row == previous.cursor_row
             && current.cursor_col == previous.cursor_col
             && current.mode == previous.mode
+            && current.scrollback_lines == previous.scrollback_lines
         {
             return None;
         }
@@ -5569,6 +5619,27 @@ mod tests {
         assert!(t.feed_compressed(&msg[3..]));
         assert_eq!(t.cursor_row(), 2);
         assert_eq!(t.cursor_col(), 5);
+    }
+
+    /// A client held still in the scrollback sees the same rows tick after
+    /// tick while the history under it grows.  If that costs no frame, its
+    /// scrollback depth freezes — and the scrollbar, the clamping, and the
+    /// offset it sends back are all built on that number.
+    #[test]
+    fn build_update_msg_reports_a_deeper_scrollback_under_still_content() {
+        let mut prev = FrameState::new(2, 4);
+        prev.set_scrollback_lines(120);
+        let mut next = prev.clone();
+        next.set_scrollback_lines(123);
+
+        let msg = build_update_msg(0, &next, &prev).expect("depth change is a frame");
+        let mut t = TerminalState::new(2, 4);
+        // The bool answers "did anything visible change", which is exactly
+        // what a deeper scrollback under still content does not do.
+        t.feed_compressed(&msg[3..]);
+        assert_eq!(t.frame.scrollback_lines(), 123);
+
+        assert!(build_update_msg(0, &next, &next).is_none());
     }
 
     #[test]

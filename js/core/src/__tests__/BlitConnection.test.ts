@@ -21,6 +21,7 @@ import {
   C2S_INPUT,
   C2S_RESIZE,
   C2S_SCROLL,
+  C2S_SCROLL_BY,
   C2S_FOCUS,
   C2S_CLOSE,
   C2S_COPY_RANGE,
@@ -32,6 +33,7 @@ import {
   FEATURE_CREATE_STATUS,
   FEATURE_RESIZE_BATCH,
   FEATURE_RESTART,
+  FEATURE_SCROLL_BY,
   FRAGMENT_FLAG_LAST,
   S2C_FRAGMENT,
   S2C_PING,
@@ -515,6 +517,29 @@ describe("BlitConnection", () => {
     expect(msg[1] | (msg[2] << 8)).toBe(2);
     const offset = msg[3] | (msg[4] << 8) | (msg[5] << 16) | (msg[6] << 24);
     expect(offset).toBe(100);
+  });
+
+  it("scrollSessionBy sends a relative SCROLL_BY when supported", () => {
+    transport.pushHello(1, FEATURE_SCROLL_BY);
+    transport.pushCreated(2, "");
+    const session = conn.getSnapshot().sessions[0];
+    conn.scrollSessionBy(session.id, 103, -3);
+    const msg = transport.sent.find((m) => m[0] === C2S_SCROLL_BY)!;
+    expect(msg[1] | (msg[2] << 8)).toBe(2);
+    const delta = msg[3] | (msg[4] << 8) | (msg[5] << 16) | (msg[6] << 24) | 0;
+    expect(delta).toBe(-3);
+  });
+
+  it("scrollSessionBy falls back to the absolute offset", () => {
+    // An older server would ignore SCROLL_BY outright, which would read as
+    // a scroll that does nothing.
+    transport.pushCreated(2, "");
+    const session = conn.getSnapshot().sessions[0];
+    conn.scrollSessionBy(session.id, 103, -3);
+    expect(transport.sent.some((m) => m[0] === C2S_SCROLL_BY)).toBe(false);
+    const msg = transport.sent.find((m) => m[0] === C2S_SCROLL)!;
+    const offset = msg[3] | (msg[4] << 8) | (msg[5] << 16) | (msg[6] << 24);
+    expect(offset).toBe(103);
   });
 
   it("focusSession sends FOCUS", () => {
