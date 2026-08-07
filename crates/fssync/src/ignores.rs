@@ -144,6 +144,11 @@ pub struct Ignores {
     /// kept apart from `base` so a nested repository can start a fresh
     /// stack with it still at the bottom.
     global: Option<Arc<Gitignore>>,
+    /// Where that file lives, from the same resolver that reads it, so the
+    /// path watched and the file consulted cannot drift apart. Recorded
+    /// even when the file is absent or empty: creating it, or adding the
+    /// first rule to it, is exactly the change that has to invalidate.
+    global_source: Option<PathBuf>,
     /// Sources for the root's own repository, ascending: `global`,
     /// `$GIT_DIR/info/exclude`, then each `.gitignore` between the
     /// enclosing worktree top and the root. Below every per-directory
@@ -196,6 +201,7 @@ impl Ignores {
         }
         let overrides = overrides.build().unwrap_or_else(|_| Gitignore::empty());
         let mut global = None;
+        let mut global_source = None;
         let mut base = Vec::new();
         let mut info_excludes = std::collections::HashSet::new();
         let mut external_sources = std::collections::HashSet::new();
@@ -210,6 +216,13 @@ impl Ignores {
                     base.push(found.clone());
                     global = Some(found);
                 }
+                // The path behind that matcher, from the very function
+                // `Gitignore::global` resolves it with. Recorded whether or
+                // not it exists or holds any rules today — the file is
+                // outside the root, so this is the only thing that can make
+                // an edit to it visible.
+                global_source = ignore::gitignore::gitconfig_excludes_path();
+                external_sources.extend(global_source.clone());
             }
             match gitdir_at(root) {
                 // The root is itself a repository top: its own stack is
@@ -270,6 +283,7 @@ impl Ignores {
             fold_case,
             overrides,
             global,
+            global_source,
             base,
             info_excludes,
             external_sources,
@@ -284,11 +298,21 @@ impl Ignores {
     /// what gets armed — a watch on a file follows its inode and misses
     /// the rename-over an editor or `git config` performs, the same reason
     /// a single-file sync watches the parent directory.
+    ///
+    /// A parent that is itself inside the root is dropped: the tree's own
+    /// watch already covers it, and `inotify_add_watch` hands back the
+    /// *same* descriptor for an inode already watched — so arming it twice
+    /// would remap notify's descriptor→path entry and make the tree report
+    /// under the wrong path (see `backend::watcher`). Only a global ignore
+    /// file living inside the synced tree can reach that case; the
+    /// ancestors' files are above the root by construction.
     pub fn external_watch_dirs(&self) -> Vec<PathBuf> {
         let mut dirs: Vec<PathBuf> = self
             .external_sources
             .iter()
-            .filter_map(|p| p.parent().map(Path::to_path_buf))
+            .filter_map(|p| p.parent())
+            .filter(|dir| !dir.starts_with(&self.root))
+            .map(Path::to_path_buf)
             .collect();
         dirs.sort();
         dirs.dedup();
@@ -350,7 +374,11 @@ impl Ignores {
         {
             return true;
         }
-        self.is_info_exclude(abs)
+        // The global file is named neither of the per-directory names, so
+        // a sync whose root contains it (a `$HOME` sync) recognizes it
+        // only here — its hint arrives from inside the tree, where
+        // `is_external_source` never runs.
+        self.global_source.as_deref() == Some(abs) || self.is_info_exclude(abs)
     }
 
     /// `$GIT_DIR/info/exclude`, the one ignore source not named by a
@@ -996,6 +1024,43 @@ mod tests {
         let mut ign = Ignores::new(&dir, &IgnoreSpec::default());
         assert!(!ign.matched("anything/at/all", false));
         assert!(!ign.source_affects_rules(&dir.join(".gitignore"), ".gitignore"));
+    }
+
+    /// The user's global ignore file is read at construction like the
+    /// ancestors' files are, so it has to be watched like them. It was not:
+    /// nothing recorded its path, so editing it changed what git ignores
+    /// while the sync served the copy it compiled at open, for the sync's
+    /// whole life.
+    ///
+    /// Asserted against the `ignore` crate's own resolver rather than
+    /// against a path this test spells out, because that is the property
+    /// that matters — the file watched has to be the file read.
+    #[test]
+    fn the_global_ignore_file_is_a_watched_source() {
+        let dir = temp_dir("global");
+        let global = ignore::gitignore::gitconfig_excludes_path()
+            .expect("git resolves one whenever HOME or XDG_CONFIG_HOME is set");
+        let ign = Ignores::new(&dir, &spec(&[], true, false));
+        assert!(
+            ign.is_external_source(&global),
+            "an edit to {global:?} has to invalidate the stack"
+        );
+        assert!(
+            ign.external_watch_dirs()
+                .iter()
+                .any(|d| Some(d.as_path()) == global.parent()),
+            "its directory has to be armed, since no hint from inside the tree reports it"
+        );
+
+        // `.ignore` alone reads no git sources, so it watches none either.
+        let dot_only = Ignores::new(
+            &dir,
+            &IgnoreSpec {
+                dot_ignore: true,
+                ..Default::default()
+            },
+        );
+        assert!(!dot_only.is_external_source(&global));
     }
 
     /// An ignore file inside an already-excluded directory is never read,
