@@ -8,6 +8,7 @@ import {
   restoreCodecSupport,
 } from "../BlitSurfaceCanvas";
 import type { BlitWorkspace } from "../BlitWorkspace";
+import type { BlitSurface } from "../types";
 import type { SurfaceAxisEvent } from "../protocol";
 import { SURFACE_POINTER_DOWN, SURFACE_POINTER_UP } from "../protocol";
 import {
@@ -38,6 +39,24 @@ function attachCanvas() {
   const canvas = surface.canvasElement;
   if (!canvas) throw new Error("Expected surface canvas");
   return { surface, canvas };
+}
+
+/** The store feeds this in; the stub workspace has no connection to do it. */
+function setSurfaceInfo(
+  surface: BlitSurfaceCanvas,
+  dims: { width: number; height: number; lw: number; lh: number },
+) {
+  (surface as unknown as { surface: BlitSurface }).surface = {
+    connectionId: "conn-1" as never,
+    surfaceId: 7,
+    parentId: 0,
+    title: "t",
+    appId: "a",
+    width: dims.width,
+    height: dims.height,
+    logicalWidth: dims.lw,
+    logicalHeight: dims.lh,
+  };
 }
 
 describe("BlitSurfaceCanvas layout", () => {
@@ -123,6 +142,67 @@ describe("BlitSurfaceCanvas layout", () => {
     expect(canvas.style.height).toBe(`${307 / 2}px`);
     expect(canvas.style.left).toBe("0px");
     expect(canvas.style.top).toBe(`${327 / 2}px`);
+    surface.dispose();
+  });
+
+  it("draws a surface a high-DPI viewer sized at 1x, not zoomed", () => {
+    // A 400×300 pane at 3x and a 1600×1200 pane at 1x watching one surface:
+    // mediation gives it the smaller logical size at the higher scale, so it
+    // composites 1200×900.  Filling the 1x pane with that frame would show
+    // the same window three times larger than the client that asked for it
+    // sees it; 400×300 device px is the size the window actually is.
+    const { surface, canvas } = attachCanvas();
+    setSurfaceInfo(surface, { width: 1200, height: 900, lw: 400, lh: 300 });
+    canvas.width = 1200;
+    canvas.height = 900;
+    surface.setDisplaySize(1600, 1200, 120);
+    expect(canvas.style.width).toBe("400px");
+    expect(canvas.style.height).toBe("300px");
+    // Centred: the pane keeps the leftover as letterbox on both sides.
+    expect(canvas.style.left).toBe("600px");
+    expect(canvas.style.top).toBe("450px");
+    surface.dispose();
+  });
+
+  it("still fills the pane of the viewer that sized the surface", () => {
+    const { surface, canvas } = attachCanvas();
+    setSurfaceInfo(surface, { width: 1200, height: 900, lw: 400, lh: 300 });
+    canvas.width = 1200;
+    canvas.height = 900;
+    // The 3x viewer: 400 logical × 3 = its whole 1200px pane.
+    surface.setDisplaySize(1200, 900, 360);
+    expect(canvas.style.width).toBe("400px"); // 1200 device px at 3x
+    expect(canvas.style.height).toBe("300px");
+    expect(canvas.style.left).toBe("0px");
+    expect(canvas.style.top).toBe("0px");
+    surface.dispose();
+  });
+
+  it("does not letterbox a pane the even grid rounded off the logical size", () => {
+    // The viewer setting the size gets a logical size rounded onto the
+    // 4:2:0 grid — a pixel or two under its own pane.  That is rounding
+    // noise, not a smaller window, and must not open a gap.
+    const { surface, canvas } = attachCanvas();
+    setSurfaceInfo(surface, { width: 1236, height: 842, lw: 1236, lh: 842 });
+    canvas.width = 1236;
+    canvas.height = 842;
+    surface.setDisplaySize(1237, 843, 120);
+    expect(canvas.style.width).toBe("1237px");
+    expect(canvas.style.height).toBe("843px");
+    expect(canvas.style.left).toBe("0px");
+    surface.dispose();
+  });
+
+  it("fills the pane while the surface's logical size is unknown", () => {
+    // Old server, or no resize reported yet: 0 means unknown, and guessing
+    // a 0-wide window would draw nothing.
+    const { surface, canvas } = attachCanvas();
+    setSurfaceInfo(surface, { width: 1200, height: 900, lw: 0, lh: 0 });
+    canvas.width = 1200;
+    canvas.height = 900;
+    surface.setDisplaySize(1600, 1200, 120);
+    expect(canvas.style.width).toBe("1600px");
+    expect(canvas.style.height).toBe("1200px");
     surface.dispose();
   });
 

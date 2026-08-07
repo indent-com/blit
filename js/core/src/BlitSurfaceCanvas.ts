@@ -1018,6 +1018,43 @@ export class BlitSurfaceCanvas {
    * do track the container (see {@link _presentBox}) but only to pick a
    * halving chain in blitFromStore, never to place the canvas.
    */
+  /**
+   * The box, in this view's device pixels, the surface may be drawn into:
+   * the pane, but never larger than the surface's own logical size at this
+   * view's DPR.  Null for views that don't size their own box.
+   *
+   * The server mediates one surface across all its viewers at the
+   * *highest* DPR any of them asked for (see `mediated_size_for_surface`),
+   * so a small 3x pane and a large 1x pane settle on a small window
+   * composited at 3x.  Filling the 1x pane with that frame would show the
+   * window at 3x zoom — the same window drawn three times too big on the
+   * client that never asked for a high-DPI anything.  Capping at
+   * `logical × own DPR` draws it at the size it actually is and lets the
+   * rest of the pane letterbox.
+   *
+   * The cap only bites when it clears the pane by more than rounding
+   * noise.  The viewer that *is* sizing the surface gets a cap within a
+   * pixel or two of its own pane — mediation rounds the logical size onto
+   * the even 4:2:0 grid — and snapping those back to the pane keeps its
+   * stream landing on the pane exactly rather than a hairline inside it.
+   */
+  private presentationBox(): { width: number; height: number } | null {
+    const ds = this._displaySize;
+    if (!ds || !ds.scale120) return null;
+    const lw = this.surface?.logicalWidth ?? 0;
+    const lh = this.surface?.logicalHeight ?? 0;
+    // Unknown logical size (old server, or no resize reported yet): the
+    // pane is the only answer we have.
+    if (lw <= 0 || lh <= 0) return { width: ds.width, height: ds.height };
+    const SNAP = 3;
+    const capW = Math.round((lw * ds.scale120) / 120);
+    const capH = Math.round((lh * ds.scale120) / 120);
+    return {
+      width: capW < ds.width - SNAP ? capW : ds.width,
+      height: capH < ds.height - SNAP ? capH : ds.height,
+    };
+  }
+
   private applyLayout(): void {
     const canvas = this.canvas;
     if (!canvas) return;
@@ -1038,12 +1075,16 @@ export class BlitSurfaceCanvas {
     const fw = canvas.width;
     const fh = canvas.height;
     if (fw === 0 || fh === 0) return;
+    const box = this.presentationBox() ?? ds;
     // Rounding, not flooring, and clamped to the box: a stream that is the
     // box's aspect to within the grid it was rounded onto has to land on
     // the box exactly, not a pixel inside it.
-    const fit = Math.min(ds.width / fw, ds.height / fh);
-    const w = Math.min(ds.width, Math.round(fw * fit));
-    const h = Math.min(ds.height, Math.round(fh * fit));
+    const fit = Math.min(box.width / fw, box.height / fh);
+    const w = Math.min(box.width, Math.round(fw * fit));
+    const h = Math.min(box.height, Math.round(fh * fit));
+    // Centred in the *pane*, not the box: when the box is the smaller of
+    // the two the difference is the letterbox, and it belongs on both
+    // sides.
     const left = Math.max(0, Math.round((ds.width - w) / 2));
     const top = Math.max(0, Math.round((ds.height - h) / 2));
     const last = this._lastLayout;
@@ -1239,15 +1280,18 @@ export class BlitSurfaceCanvas {
     if (src.width === 0 || src.height === 0) return;
     this._lastFrameSize = { width: src.width, height: src.height };
 
-    // A view that sizes its own box has nothing to prefilter: the backing
-    // buffer mirrors the source frame exactly and applyLayout fits it to
-    // the pane, which is the size the stream was asked for and so is at or
-    // near 1:1.
+    // A view that sizes its own box usually has nothing to prefilter: the
+    // backing buffer mirrors the source frame exactly and applyLayout fits
+    // it to the pane, which is the size the stream was asked for and so is
+    // at or near 1:1 — halvings() returns 0 for that and this is a no-op.
+    // It is not always 1:1 though: a 1x viewer watching a surface a
+    // high-DPI viewer sized draws it capped to its logical size, which can
+    // be a whole multiple down.
     //
     // A view that is *handed* a box — a dock thumbnail — is about to be
     // minified by the compositor instead, so bring the frame down to roughly
     // the box in whole halves first and leave CSS a scale it can filter.
-    const box = this._displaySize ? null : this._presentBox;
+    const box = this._displaySize ? this.presentationBox() : this._presentBox;
     const n = box ? halvings(src.width, src.height, box.width, box.height) : 0;
     this._presentHalvings = n;
     const w = halve(src.width, n);

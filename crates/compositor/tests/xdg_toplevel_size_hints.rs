@@ -195,6 +195,21 @@ impl Fixture {
     /// on -- the size it will actually render into, which is what the server
     /// hands to the encoder and the viewer.
     fn resize_pane(&mut self, surface_id: u16, width: u16, height: u16) -> (u16, u16) {
+        let (w, h, _, _) = self.resize_pane_at(surface_id, width, height, 120);
+        (w, h)
+    }
+
+    /// As `resize_pane`, at an explicit device pixel ratio, reporting the
+    /// logical half of the composited size too -- the window as its client
+    /// measures it, which is what a viewer at a *different* ratio needs to
+    /// know to draw it at the right size.
+    fn resize_pane_at(
+        &mut self,
+        surface_id: u16,
+        width: u16,
+        height: u16,
+        scale_120: u16,
+    ) -> (u16, u16, u16, u16) {
         let handle = self.handle.as_ref().expect("compositor running");
         handle
             .command_tx
@@ -202,7 +217,7 @@ impl Fixture {
                 surface_id,
                 width,
                 height,
-                scale_120: 120,
+                scale_120,
             })
             .expect("send resize");
 
@@ -213,8 +228,14 @@ impl Fixture {
                 .event_rx
                 .recv_timeout(std::time::Duration::from_millis(200))
             {
-                Ok(CompositorEvent::SurfaceResized { width, height, .. }) => {
-                    last = Some((width, height));
+                Ok(CompositorEvent::SurfaceResized {
+                    width,
+                    height,
+                    logical_width,
+                    logical_height,
+                    ..
+                }) => {
+                    last = Some((width, height, logical_width, logical_height));
                     break;
                 }
                 Ok(_) => continue,
@@ -368,6 +389,31 @@ fn a_pane_narrower_than_the_client_composites_at_the_clients_width() {
         fixture.resize_pane(sid, 300, 700),
         (300, 700),
         "withdrawing the minimum should hand the pane back its own size"
+    );
+}
+
+/// A composited size is two numbers, not one.  A viewer told only "1200x900"
+/// cannot tell a 1200x900 window at 1x from a 400x300 one at 3x, and those
+/// want to be drawn at wildly different sizes -- the second at a third the
+/// size on a 1x screen.  Mediation across viewers settles on the *highest*
+/// ratio any of them asked for, so the mismatched case is the normal one the
+/// moment a high-DPI viewer joins, and the logical half is the only thing
+/// that tells the others how large the window really is.
+#[test]
+fn a_resize_reports_the_logical_size_alongside_the_physical() {
+    let mut fixture = Fixture::new();
+    let sid = fixture.surface_id();
+
+    assert_eq!(
+        fixture.resize_pane_at(sid, 1200, 900, 360),
+        (1200, 900, 400, 300),
+        "a 400x300 window at 3x composites to 1200x900"
+    );
+    assert_eq!(
+        fixture.resize_pane_at(sid, 1200, 900, 120),
+        (1200, 900, 1200, 900),
+        "the same pixels at 1x are a 1200x900 window -- physical alone \
+         cannot distinguish the two, which is why logical is reported"
     );
 }
 

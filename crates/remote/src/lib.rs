@@ -443,7 +443,22 @@ pub const S2C_SURFACE_DESTROYED: u8 = 0x21;
 pub const S2C_SURFACE_FRAME: u8 = 0x22;
 /// A Wayland surface's title changed: [0x23][surface_id:2][title:N]
 pub const S2C_SURFACE_TITLE: u8 = 0x23;
-/// A Wayland surface was resized by the app: [0x24][surface_id:2][width:2][height:2]
+/// A Wayland surface was resized by the app:
+/// [0x24][surface_id:2][width:2][height:2]                            — legacy
+/// [0x24][surface_id:2][width:2][height:2][logical_w:2][logical_h:2]  — current
+///
+/// `width`/`height` are the composited frame's *physical* pixels.  The
+/// logical pair is the same size in surface-logical pixels — the window as
+/// its Wayland client measures it, before the mediated output scale.  The
+/// two differ whenever any subscriber is high-DPI, because mediation gives
+/// the surface the *highest* scale any viewer asked for (see
+/// `mediated_size_for_surface`), so a 1x viewer that assumes physical ==
+/// logical draws a 3x window three times too large.
+///
+/// A viewer should present the surface at `logical * its own DPR` device
+/// pixels, capped to its pane, so the window looks the same size on every
+/// screen watching it.  Older servers omit the pair; treat it as absent
+/// (not as 0x0) and fall back to filling the pane.
 pub const S2C_SURFACE_RESIZED: u8 = 0x24;
 /// A Wayland surface's app_id changed: [0x28][surface_id:2][app_id:N]
 pub const S2C_SURFACE_APP_ID: u8 = 0x28;
@@ -2036,6 +2051,9 @@ pub enum ServerMsg<'a> {
         surface_id: u16,
         width: u16,
         height: u16,
+        /// Surface-logical size, or `None` from a server that predates the
+        /// field.  See [`S2C_SURFACE_RESIZED`].
+        logical: Option<(u16, u16)>,
     },
     ClipboardContent {
         mime_type: &'a str,
@@ -2376,6 +2394,12 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
                 surface_id: u16::from_le_bytes([data[1], data[2]]),
                 width: u16::from_le_bytes([data[3], data[4]]),
                 height: u16::from_le_bytes([data[5], data[6]]),
+                logical: (data.len() >= 11).then(|| {
+                    (
+                        u16::from_le_bytes([data[7], data[8]]),
+                        u16::from_le_bytes([data[9], data[10]]),
+                    )
+                }),
             })
         }
         S2C_CLIPBOARD_CONTENT => {
@@ -3017,12 +3041,24 @@ pub fn msg_surface_encoder(surface_id: u16, encoder_name: &str, codec_string: &s
     msg
 }
 
-pub fn msg_surface_resized(surface_id: u16, width: u16, height: u16) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(7);
+/// `logical_width`/`logical_height` are the surface-logical size; pass the
+/// physical size when the scale is 1x or unknown, never 0 — a zero would
+/// tell a viewer the window has no size at all, where equal-to-physical is
+/// the honest "no scaling in play".
+pub fn msg_surface_resized(
+    surface_id: u16,
+    width: u16,
+    height: u16,
+    logical_width: u16,
+    logical_height: u16,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(11);
     msg.push(S2C_SURFACE_RESIZED);
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(&width.to_le_bytes());
     msg.extend_from_slice(&height.to_le_bytes());
+    msg.extend_from_slice(&logical_width.to_le_bytes());
+    msg.extend_from_slice(&logical_height.to_le_bytes());
     msg
 }
 
@@ -5574,5 +5610,47 @@ mod tests {
         let text = t.get_all_text();
         assert!(text.contains("AB"));
         assert!(text.contains("CD"));
+    }
+
+    /// The physical/logical split is the whole point of the message: a 1x
+    /// viewer needs the logical half to know it is watching a 400x300
+    /// window, not a 1200x900 one, and must not have to guess it from its
+    /// own DPR — which is exactly the DPR the surface was *not* sized at.
+    #[test]
+    fn surface_resized_carries_the_logical_size() {
+        let msg = msg_surface_resized(7, 1200, 900, 400, 300);
+        match parse_server_msg(&msg) {
+            Some(ServerMsg::SurfaceResized {
+                surface_id,
+                width,
+                height,
+                logical,
+            }) => {
+                assert_eq!((surface_id, width, height), (7, 1200, 900));
+                assert_eq!(logical, Some((400, 300)));
+            }
+            other => panic!("expected SurfaceResized, got {}", other.is_some()),
+        }
+    }
+
+    /// A server that predates the field stops at 7 bytes.  Absent must stay
+    /// distinguishable from 0x0 — a viewer that read a missing logical size
+    /// as an empty window would draw nothing at all.
+    #[test]
+    fn surface_resized_without_a_logical_size_reports_absent_not_zero() {
+        let mut legacy = msg_surface_resized(7, 1200, 900, 400, 300);
+        legacy.truncate(7);
+        match parse_server_msg(&legacy) {
+            Some(ServerMsg::SurfaceResized {
+                width,
+                height,
+                logical,
+                ..
+            }) => {
+                assert_eq!((width, height), (1200, 900));
+                assert_eq!(logical, None);
+            }
+            other => panic!("expected SurfaceResized, got {}", other.is_some()),
+        }
     }
 }

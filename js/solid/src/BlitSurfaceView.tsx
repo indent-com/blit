@@ -84,7 +84,16 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
     let lastSentW = 0;
     let lastSentH = 0;
     let lastSentScale120 = 0;
-    const RESIZE_DEBOUNCE_MS = 100;
+    // Short, because the server coalesces on its own: a configure opens a
+    // settle window there and every size that lands inside it is folded
+    // into one configure at the end.  A long trailing edge here doesn't
+    // save the compositor anything, it just delays the last size — and
+    // some layout changes are two box changes in quick succession rather
+    // than a drag.  Restoring a parked surface is one: the pane appears,
+    // then widens again as the dock the card left closes, and the second
+    // size used to sit here for 100 ms while the server built an encoder
+    // for the first.
+    const RESIZE_DEBOUNCE_MS = 30;
     // If no resize event for this long, the next one is treated as the
     // start of a fresh drag and fires immediately — so each user-visible
     // drag gets a leading-edge dispatch and the perceived reaction is

@@ -794,6 +794,10 @@ export class SurfaceStore {
       appId,
       width,
       height,
+      // S2C_SURFACE_CREATED carries no scale; the S2C_SURFACE_RESIZED the
+      // server sends right behind it does.  Unknown until then.
+      logicalWidth: 0,
+      logicalHeight: 0,
     });
     // Don't create a canvas yet — canvases are per-subscription now,
     // keyed by sub_id, and we don't have one until a view subscribes.
@@ -1154,9 +1158,28 @@ export class SurfaceStore {
     }
   }
 
-  handleSurfaceResized(surfaceId: number, width: number, height: number): void {
+  handleSurfaceResized(
+    surfaceId: number,
+    width: number,
+    height: number,
+    logicalWidth = 0,
+    logicalHeight = 0,
+  ): void {
     const surface = this.surfaces.get(surfaceId);
-    if (surface && (surface.width !== width || surface.height !== height)) {
+    // The logical size can move while the physical size holds still — a
+    // high-DPI viewer joining or leaving rescales the window without
+    // changing how many pixels it composites to — and that alone changes
+    // how large every viewer should draw it, so it gates the update too.
+    const logicalChanged =
+      !!surface &&
+      logicalWidth > 0 &&
+      logicalHeight > 0 &&
+      (surface.logicalWidth !== logicalWidth ||
+        surface.logicalHeight !== logicalHeight);
+    if (
+      surface &&
+      (surface.width !== width || surface.height !== height || logicalChanged)
+    ) {
       // Only emit a change for significant resizes (> 1px) to avoid
       // triggering a BSP re-render → ResizeObserver → resize feedback loop
       // from sub-pixel rounding in the compositor's physical↔logical
@@ -1165,26 +1188,44 @@ export class SurfaceStore {
         surface.width === 0 ||
         surface.height === 0 ||
         Math.abs(surface.width - width) > 1 ||
-        Math.abs(surface.height - height) > 1;
+        Math.abs(surface.height - height) > 1 ||
+        (logicalChanged &&
+          (surface.logicalWidth === 0 ||
+            Math.abs(surface.logicalWidth - logicalWidth) > 1 ||
+            Math.abs(surface.logicalHeight - logicalHeight) > 1));
+      const resolutionChanged =
+        surface.width !== width || surface.height !== height;
       surface.width = width;
       surface.height = height;
-      // Flush any queued frames from the old resolution.  Without this,
-      // stale VideoFrames occupy the decode buffer pool and the presenter
-      // draws a wrong-sized frame, stalling the pipeline.  Discarding
-      // resets `initialized` so the first frame at the new resolution
-      // paints synchronously (fast path).
-      this.discardPresenter(surfaceId);
-      // Proactively ask the server for a keyframe at the new dimensions
-      // and drop any delta frames that arrive before it.  The decoder
-      // must be reconfigured with the new SPS/PPS (H.264) or size hint
-      // anyway, so a keyframe is mandatory; waiting passively for the
-      // server to produce one adds an extra round-trip to the recovery.
-      const entry = this.decoders.get(surfaceId);
-      if (entry) {
-        entry.pendingKeyframe = true;
-        if (!entry.keyframeRequested) {
-          entry.keyframeRequested = true;
-          this._keyframeSender?.(surfaceId);
+      // A server that predates the field sends nothing; leave the last
+      // known value rather than clobbering it with a bogus 0.
+      if (logicalWidth > 0 && logicalHeight > 0) {
+        surface.logicalWidth = logicalWidth;
+        surface.logicalHeight = logicalHeight;
+      }
+      // Only the physical size reaches the decoder.  A logical-only
+      // change is a presentation change — the stream keeps arriving at
+      // the same resolution, so tearing the presenter down and spending a
+      // keyframe on it would cost a visible stall for nothing.
+      if (resolutionChanged) {
+        // Flush any queued frames from the old resolution.  Without this,
+        // stale VideoFrames occupy the decode buffer pool and the presenter
+        // draws a wrong-sized frame, stalling the pipeline.  Discarding
+        // resets `initialized` so the first frame at the new resolution
+        // paints synchronously (fast path).
+        this.discardPresenter(surfaceId);
+        // Proactively ask the server for a keyframe at the new dimensions
+        // and drop any delta frames that arrive before it.  The decoder
+        // must be reconfigured with the new SPS/PPS (H.264) or size hint
+        // anyway, so a keyframe is mandatory; waiting passively for the
+        // server to produce one adds an extra round-trip to the recovery.
+        const entry = this.decoders.get(surfaceId);
+        if (entry) {
+          entry.pendingKeyframe = true;
+          if (!entry.keyframeRequested) {
+            entry.keyframeRequested = true;
+            this._keyframeSender?.(surfaceId);
+          }
         }
       }
       if (significant) this.emitChange();

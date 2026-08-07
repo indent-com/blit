@@ -990,8 +990,15 @@ pub enum SurfaceCommand {
         codec: Vec<String>,
 
         /// Ask for the surface at this size, as WIDTHxHEIGHT in physical
-        /// pixels (e.g. 5120x2880).  Default: whatever other viewers have
-        /// already negotiated.
+        /// pixels (e.g. 5120x2880), optionally at a device pixel ratio:
+        /// WIDTHxHEIGHT@DPR (e.g. 1200x900@3).  Default: whatever other
+        /// viewers have already negotiated, at 1x.
+        ///
+        /// The ratio is what makes this viewer a high-DPI one for size
+        /// mediation: the surface is composited at the highest ratio any
+        /// viewer claims, and lower-ratio viewers are served a downscale of
+        /// it.  Claiming one is the only way to exercise that split without
+        /// a browser.
         ///
         /// Recording writes the bitstream to a file rather than decoding it,
         /// so this is also announced as the decode ceiling — which is what

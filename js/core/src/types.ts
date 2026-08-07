@@ -442,8 +442,22 @@ export type BlitSurface = {
   parentId: u16;
   title: string;
   appId: string;
+  /** Composited size in physical pixels — what the video stream carries. */
   width: number;
   height: number;
+  /**
+   * The same size in surface-logical pixels: the window as its Wayland
+   * client measures it, before the mediated output scale.  The server
+   * mediates one surface across every viewer at the *highest* DPR any of
+   * them asked for, so on a 1x viewer watching a surface a 3x viewer
+   * sized, `width` is three times `logicalWidth` and presenting the frame
+   * to fill the pane would show the window at 3x zoom.
+   *
+   * 0 until the server reports one (or from a server that predates the
+   * field), which callers must read as "unknown", not as an empty window.
+   */
+  logicalWidth: number;
+  logicalHeight: number;
 };
 
 type u16 = number;

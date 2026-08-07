@@ -808,6 +808,38 @@ describe("SurfaceStore surface dimensions", () => {
     store.destroy();
   });
 
+  it("takes a logical-size change that leaves the resolution alone", () => {
+    // A high-DPI viewer leaving rescales the window without changing how
+    // many pixels it composites to: 1200×900 stays, but it stops being a
+    // 400×300 window at 3x and becomes a 1200×900 one at 1x.  Every viewer
+    // has to redraw it at the new size, so the change must land and emit.
+    const store = new SurfaceStore();
+    store.handleSurfaceCreated(1, 0, 0, 0, "t", "a");
+    store.handleSurfaceResized(1, 1200, 900, 400, 300);
+    let changes = 0;
+    const unsub = store.onChange(() => changes++);
+    store.handleSurfaceResized(1, 1200, 900, 1200, 900);
+    const surface = store.getSurfaces().get(1)!;
+    expect(surface.logicalWidth).toBe(1200);
+    expect(surface.logicalHeight).toBe(900);
+    expect(changes).toBe(1);
+    unsub();
+    store.destroy();
+  });
+
+  it("keeps the known logical size when a server sends none", () => {
+    // Absent is not 0×0.  Clobbering it would tell every view the window
+    // has no size, and 0 is the one value that cannot be drawn.
+    const store = new SurfaceStore();
+    store.handleSurfaceCreated(1, 0, 0, 0, "t", "a");
+    store.handleSurfaceResized(1, 1200, 900, 400, 300);
+    store.handleSurfaceResized(1, 1600, 1200);
+    const surface = store.getSurfaces().get(1)!;
+    expect(surface.width).toBe(1600);
+    expect(surface.logicalWidth).toBe(400);
+    store.destroy();
+  });
+
   it("seeds a still-0×0 surface from the first frame's dimensions", () => {
     const store = new SurfaceStore();
     store.handleSurfaceCreated(1, 0, 0, 0, "t", "a");

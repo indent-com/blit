@@ -3787,7 +3787,16 @@ export class BlitConnection {
           const surfaceId = view.getUint16(1, true);
           const width = view.getUint16(3, true);
           const height = view.getUint16(5, true);
-          this.surfaceStore.handleSurfaceResized(surfaceId, width, height);
+          // Logical size is optional — servers before it simply stop at 7
+          // bytes, and 0 tells the store to keep what it has.
+          const hasLogical = bytes.length >= 11;
+          this.surfaceStore.handleSurfaceResized(
+            surfaceId,
+            width,
+            height,
+            hasLogical ? view.getUint16(7, true) : 0,
+            hasLogical ? view.getUint16(9, true) : 0,
+          );
         } catch {}
         return;
       }

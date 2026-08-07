@@ -574,6 +574,13 @@ pub enum CompositorEvent {
     VulkanEncoderUnavailable {
         surface_id: u16,
         client_id: u64,
+        /// The session was built and then failed to encode, rather than
+        /// never being built at all.  A driver that accepts a profile it
+        /// cannot encode does so for every surface, which makes this the
+        /// one refusal worth remembering beyond the pair that hit it;
+        /// a session that could not be created may simply have been too
+        /// large, or asked for an image another session was reading.
+        after_encode_failures: bool,
     },
     SurfaceTitle {
         surface_id: u16,
@@ -587,6 +594,14 @@ pub enum CompositorEvent {
         surface_id: u16,
         width: u16,
         height: u16,
+        /// The same size in surface-logical pixels — what the Wayland
+        /// client thinks its window measures, before the output scale is
+        /// applied.  Physical alone cannot tell a viewer how large the
+        /// window *is*: 1200x900 is a 400x300 window at 3x and a 1200x900
+        /// one at 1x, and a viewer that assumes its own scale draws the
+        /// former three times too big.
+        logical_width: u16,
+        logical_height: u16,
     },
     ClipboardContent {
         mime_type: String,
@@ -1833,13 +1848,18 @@ impl Compositor {
             self.last_reported_size
                 .insert(surface_id, (width, height, log_w, log_h));
             // The event, on the other hand, is genuinely about the size the
-            // client sees, so it stays gated — a scale change is not a
-            // resize to tell anyone about.
-            if prev.map(|(pw, ph, _, _)| (pw, ph)) != Some((width, height)) {
+            // client sees — but that includes the logical half.  A scale
+            // change alone (a high-DPI viewer joining or leaving) can leave
+            // the physical size untouched while the window it represents
+            // triples in size, and a viewer told only the physical number
+            // would go on drawing the old window at the old zoom.
+            if prev != Some((width, height, log_w, log_h)) {
                 let _ = self.event_tx.send(CompositorEvent::SurfaceResized {
                     surface_id,
                     width: width as u16,
                     height: height as u16,
+                    logical_width: log_w.min(u16::MAX as u32) as u16,
+                    logical_height: log_h.min(u16::MAX as u32) as u16,
                 });
             }
         }
@@ -2268,6 +2288,7 @@ impl Compositor {
                 .send(CompositorEvent::VulkanEncoderUnavailable {
                     surface_id: sid as u16,
                     client_id: cid,
+                    after_encode_failures: true,
                 });
             (self.event_notify)();
         }
@@ -3979,6 +4000,7 @@ impl Compositor {
                         .send(CompositorEvent::VulkanEncoderUnavailable {
                             surface_id: surface_id as u16,
                             client_id,
+                            after_encode_failures: false,
                         });
                     (self.event_notify)();
                 }

@@ -167,6 +167,7 @@ mod stub {
         VulkanEncoderUnavailable {
             surface_id: u16,
             client_id: u64,
+            after_encode_failures: bool,
         },
         SurfaceTitle {
             surface_id: u16,
@@ -180,6 +181,8 @@ mod stub {
             surface_id: u16,
             width: u16,
             height: u16,
+            logical_width: u16,
+            logical_height: u16,
         },
         ClipboardContent {
             surface_id: u16,

@@ -996,10 +996,32 @@ pub enum RecordSource {
     },
 }
 
-/// Parse a `WIDTHxHEIGHT` argument into physical pixel dimensions.
-fn parse_record_size(size: Option<&str>) -> Result<Option<(u16, u16)>, String> {
+/// Parse a `WIDTHxHEIGHT` or `WIDTHxHEIGHT@DPR` argument into physical
+/// pixel dimensions and a device pixel ratio in 120ths.
+///
+/// The ratio matters because the server mediates one surface across every
+/// viewer at the *highest* ratio any of them asked for, and then serves the
+/// lower-ratio ones a downscale of it.  Without a way to claim one, a
+/// recorder can only ever be the 1x viewer in a room of 1x viewers, and the
+/// mixed-DPI paths — which is where that mediation actually does anything —
+/// are unreachable without a browser.
+fn parse_record_size(size: Option<&str>) -> Result<Option<(u16, u16, u16)>, String> {
     let Some(s) = size else { return Ok(None) };
-    let (w, h) = s
+    let (dims, scale_120) = match s.split_once('@') {
+        Some((dims, dpr)) => {
+            let dpr: f64 = dpr
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad --size DPR {dpr:?} (expected e.g. 2 or 1.5)"))?;
+            let scaled = (dpr * 120.0).round();
+            if !(120.0..=f64::from(u16::MAX)).contains(&scaled) {
+                return Err(format!("--size DPR {dpr} must be at least 1"));
+            }
+            (dims, scaled as u16)
+        }
+        None => (s, 120),
+    };
+    let (w, h) = dims
         .split_once(['x', 'X'])
         .ok_or_else(|| format!("bad --size {s:?} (expected WIDTHxHEIGHT, e.g. 5120x2880)"))?;
     let parse = |v: &str, axis| {
@@ -1014,7 +1036,7 @@ fn parse_record_size(size: Option<&str>) -> Result<Option<(u16, u16)>, String> {
                 }
             })
     };
-    Ok(Some((parse(w, "width")?, parse(h, "height")?)))
+    Ok(Some((parse(w, "width")?, parse(h, "height")?, scale_120)))
 }
 
 pub async fn cmd_record(
@@ -1105,12 +1127,12 @@ pub async fn cmd_record(
         // native size must not send one — a ceiling below native drops the
         // target under it, and a Vulkan-only server (which encodes at
         // native or not at all) then serves nothing.
-        if let Some((w, h)) = size {
+        if let Some((w, h, scale_120)) = size {
             let mut features = vec![C2S_CLIENT_FEATURES, codec_support];
             features.extend_from_slice(&w.to_le_bytes());
             features.extend_from_slice(&h.to_le_bytes());
             conn.send(&features).await?;
-            conn.send(&msg_surface_resize(id, w, h, 120)).await?;
+            conn.send(&msg_surface_resize(id, w, h, scale_120)).await?;
         }
         if codec_support != 0 {
             conn.send(&msg_surface_subscribe_ext(id, codec_support, 0, 0))
