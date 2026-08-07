@@ -10,12 +10,12 @@ use blit_remote::{
     C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2, C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE,
     C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
     CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE,
-    CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS, FEATURE_COMPOSITOR, FEATURE_COPY_RANGE,
-    FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE,
-    FEATURE_RESIZE_BATCH, FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState, KILL_LEADER_ONLY,
-    READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT,
-    S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE,
-    STATUS_BUDGET, STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264,
+    CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE,
+    FEATURE_CREATE_STATUS, FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH,
+    FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState, KILL_LEADER_ONLY, READ_ANSI, READ_TAIL,
+    S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY,
+    S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, STATUS_BUDGET,
+    STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264,
     SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN, build_update_msg, msg_hello,
     msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_scroll_offset, msg_s2c_used_rows,
     msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
@@ -23,7 +23,7 @@ use blit_remote::{
     parse_surface_pointer_axis2,
 };
 #[cfg(target_os = "linux")]
-use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO};
+use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO, FEATURE_COMPOSITOR};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -10654,13 +10654,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | FEATURE_RESTART
                 | FEATURE_RESIZE_BATCH
                 | FEATURE_COPY_RANGE
-                | FEATURE_COMPOSITOR
                 | FEATURE_CREATE_STATUS
                 | FEATURE_KILL_MODE
                 | FEATURE_PTY_DEADLINE
                 | FEATURE_SCROLL_BY
                 | blit_remote::fs::FEATURE_FS
                 | blit_remote::git::FEATURE_GIT;
+            #[cfg(target_os = "linux")]
+            let features = features | FEATURE_COMPOSITOR;
             // BLIT_LSP=0 disables the family: the bit is simply not
             // advertised, matching the dispatch gate.
             let mut features = features;

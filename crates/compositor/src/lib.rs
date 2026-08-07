@@ -55,6 +55,7 @@ mod stub {
             modifier: u64,
             stride: u32,
             offset: u32,
+            y_invert: bool,
         },
         Nv12DmaBuf {
             fd: Arc<OwnedFd>,
@@ -187,7 +188,6 @@ mod stub {
             logical_height: u16,
         },
         ClipboardContent {
-            surface_id: u16,
             mime_type: String,
             data: Vec<u8>,
         },
@@ -371,6 +371,12 @@ mod stub {
         pub va_surface_id: u32,
         pub va_display: usize,
         pub planes: Vec<ExternalOutputPlane>,
+        pub nv12_fd: Option<Arc<OwnedFd>>,
+        pub nv12_stride: u32,
+        pub nv12_uv_offset: u32,
+        pub nv12_modifier: u64,
+        pub nv12_width: u32,
+        pub nv12_height: u32,
     }
 
     pub struct CompositorHandle {
