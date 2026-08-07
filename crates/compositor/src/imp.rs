@@ -1944,9 +1944,17 @@ impl Compositor {
             Some(sid) => sid,
             None => {
                 // No toplevel yet — release any held DMA-BUF buffer since
-                // no compositing will run to consume it.
+                // no compositing will run to consume it.  Still fence-gated:
+                // an earlier composite (before the toplevel went away) may
+                // be in flight over its import.
                 if let Some(held) = self.held_buffers.remove(surface_id) {
-                    held.release();
+                    let deferred = self
+                        .vulkan_renderer
+                        .as_mut()
+                        .is_some_and(|vk| vk.defer_buffer_release(held.clone()));
+                    if !deferred {
+                        held.release();
+                    }
                 }
                 // Fire any pending frame callbacks so the client doesn't
                 // stall.
@@ -2015,16 +2023,22 @@ impl Compositor {
         // Only once something has actually read it, though.  A DMA-BUF is
         // imported, not copied, so `held_buffers` is what stops the client
         // drawing over pixels the compositor still needs (see
-        // `apply_pending_state`).  On the non-deferred path the submit above
-        // has already queued the read and implicit DMA-BUF fencing makes the
-        // client's next write wait on it — releasing here is safe because
-        // the GPU is the one holding the line.  A deferred commit has queued
-        // no GPU work at all, so there is no fence to wait on: release here
-        // and the client is free to redraw into the buffer the recomposite
-        // is about to read, which lands a torn or wrong-frame composite.  So
-        // keep holding, and let the drain release it once it has read.
+        // `apply_pending_state`).  "Read" means the submit's fence has
+        // signalled: this used to release as soon as the read was *queued*,
+        // trusting implicit DMA-BUF fencing to hold the client's next write
+        // behind it — which NVIDIA's Vulkan driver does not honor, so a
+        // video overlay's recycled buffer got redrawn mid-read and the
+        // composite showed a future frame.  A deferred commit has queued no
+        // GPU work at all: keep holding, and let the drain release it once
+        // the recomposite has read.
         if !deferred && let Some(held) = self.held_buffers.remove(surface_id) {
-            held.release();
+            let gated = self
+                .vulkan_renderer
+                .as_mut()
+                .is_some_and(|vk| vk.defer_buffer_release(held.clone()));
+            if !gated {
+                held.release();
+            }
         }
 
         // Fire frame callbacks after processing a commit so clients can
@@ -2422,9 +2436,21 @@ impl Compositor {
         let Some(buf) = buffer else { return };
 
         // Release any previously held buffer for this surface — the new
-        // commit supersedes it.
+        // commit supersedes it.  Not straight away, though: in-flight GPU
+        // work may still sample its import, implicit dma-buf fencing does
+        // not hold NVIDIA's Vulkan driver off the memory, and a client
+        // with a fast-recycling pool (a video overlay subsurface) redraws
+        // a released buffer within the composite window — the in-flight
+        // composite then shows a *future* frame and the video visibly
+        // jumps back and forth.  Gate the release on the submit's fence.
         if let Some(old) = self.held_buffers.remove(surface_id) {
-            old.release();
+            let deferred = self
+                .vulkan_renderer
+                .as_mut()
+                .is_some_and(|vk| vk.defer_buffer_release(old.clone()));
+            if !deferred {
+                old.release();
+            }
         }
 
         // Fast path for non-cursor SHM buffers: the client's mmap'd pool
@@ -7042,7 +7068,16 @@ fn run_compositor(
             if let Some(surface_ids) = compositor.deferred_buffer_holds.remove(&sid) {
                 for surface_id in surface_ids {
                     if let Some(held) = compositor.held_buffers.remove(&surface_id) {
-                        held.release();
+                        // "Read" = the recomposite's fence has signalled,
+                        // not merely submitted — same gating as the inline
+                        // path.
+                        let gated = compositor
+                            .vulkan_renderer
+                            .as_mut()
+                            .is_some_and(|vk| vk.defer_buffer_release(held.clone()));
+                        if !gated {
+                            held.release();
+                        }
                     }
                 }
             }

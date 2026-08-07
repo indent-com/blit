@@ -368,6 +368,18 @@ struct PendingSubmit {
     /// Toplevel surface_id this submission was rendered for, so async
     /// retirement can attribute the pixels to the correct surface.
     toplevel_sid: u16,
+    /// wl_buffers whose release is gated on this submission's fence.
+    ///
+    /// A DMA-BUF is imported, not copied, and NVIDIA's driver does not
+    /// honor implicit dma-buf fencing for Vulkan importers — releasing a
+    /// buffer while recorded GPU work still samples its import lets the
+    /// client redraw it first, and the composite then shows a *future*
+    /// frame.  A fast-recycling pool (a browser's video overlay
+    /// subsurface) hits this every few frames: the video rectangle
+    /// visibly jumps back and forth while the parent surface looks fine.
+    /// Queue submission order means this fence signalling also proves
+    /// every earlier read of these buffers is done.
+    release_buffers: Vec<wayland_server::protocol::wl_buffer::WlBuffer>,
 }
 
 unsafe impl Send for VulkanRenderer {}
@@ -5045,6 +5057,30 @@ impl VulkanRenderer {
     /// than call and lose the tree.  `has_pending` is not a substitute: it
     /// is true for the whole life of a submit, including after its fence
     /// has signalled, when compositing proceeds normally.
+    /// Gate a wl_buffer release on in-flight GPU work.  Returns `true`
+    /// when the buffer was attached to a submission and will be released
+    /// once its fence signals; `false` when nothing is in flight — every
+    /// prior read has already been fence-waited, so the caller may
+    /// release immediately.
+    ///
+    /// Implicit dma-buf fencing cannot be trusted to hold the client off
+    /// the memory (NVIDIA's Vulkan driver ignores it); this is the
+    /// explicit substitute.
+    pub fn defer_buffer_release(
+        &mut self,
+        buf: wayland_server::protocol::wl_buffer::WlBuffer,
+    ) -> bool {
+        if let Some(p) = self.pending_submit.as_mut() {
+            p.release_buffers.push(buf);
+            return true;
+        }
+        if let Some(p) = self.deferred_submits.last_mut() {
+            p.release_buffers.push(buf);
+            return true;
+        }
+        false
+    }
+
     pub fn would_defer_submit(&self) -> bool {
         let Some(pending) = self.pending_submit.as_ref() else {
             return false;
@@ -5124,6 +5160,12 @@ impl VulkanRenderer {
     /// reach an encoder (see the range-mismatch comment at the publish
     /// site).
     fn retire_pending(&mut self, pending: PendingSubmit) -> Vec<(u32, u32, PixelData, bool)> {
+        // The fence has signalled (every caller waits first): the GPU is
+        // done with every buffer this submission — and, by queue order,
+        // any earlier one — sampled.  Only now may the client redraw them.
+        for buf in &pending.release_buffers {
+            buf.release();
+        }
         let mut results: Vec<(u32, u32, PixelData, bool)> = Vec::new();
 
         // Native BGRA from the self-alloc output_image staging buffer.
@@ -5257,6 +5299,9 @@ impl VulkanRenderer {
                 )
             };
             if raw == vk::Result::SUCCESS {
+                for buf in pending.release_buffers.drain(..) {
+                    buf.release();
+                }
                 unsafe {
                     self.device.destroy_fence(pending.fence, None);
                     self.device
@@ -6491,6 +6536,7 @@ impl VulkanRenderer {
             surface_id: sid,
             downscale_targets: staging_targets,
             toplevel_sid,
+            release_buffers: Vec::new(),
         };
 
         // Export the dedicated export-fence as a sync_fd ONCE (shared
@@ -6726,6 +6772,11 @@ impl Drop for VulkanRenderer {
                 .into_iter()
                 .chain(self.deferred_submits.drain(..));
             for pending in all_pending {
+                // wait_idle above covered every read; don't strand the
+                // client's buffers on teardown.
+                for buf in &pending.release_buffers {
+                    buf.release();
+                }
                 self.device.destroy_fence(pending.fence, None);
                 self.device
                     .free_command_buffers(self.command_pool, &[pending.cb]);
