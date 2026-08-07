@@ -421,10 +421,12 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
     // ceiling, then decayed at 0.98/frame — ~55 frames, nearly a second at
     // 60 Hz, of maximum latency bought by one outlier it could not cover
     // anyway.  A quantile treats it as the <5% tail it is.
-    runStream(60); // clean stream: margin settles near zero
+    // Clean stream: the margin settles at the fixed refresh of headroom
+    // every stream carries, and nothing on top of it.
+    runStream(60);
     const p = presenter(store, 1)!;
     const before = (store as any).playoutDelayMs(p);
-    expect(before).toBeLessThan(5);
+    expect(before).toBeLessThan(REFRESH + 5);
 
     // One frame arrives 200 ms late.
     const pts = streamPts;
@@ -438,7 +440,7 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
 
     // And a few clean frames later it is still not chasing the outlier.
     runStream(10);
-    expect((store as any).playoutDelayMs(p)).toBeLessThan(10);
+    expect((store as any).playoutDelayMs(p)).toBeLessThan(REFRESH + 10);
   });
 
   it("sizes the margin to jitter that actually recurs", () => {
@@ -733,11 +735,16 @@ describe("SurfaceStore vs newest-wins control", () => {
     }
 
     const peak = Math.max(...margins);
-    expect(peak).toBeGreaterThan(5); // the stall did move it
+    // The stall did move it, on top of the refresh of headroom every
+    // stream carries.
+    expect(peak).toBeGreaterThan(REFRESH + 5);
 
-    // It must come back down within about a second of stream, not five.
+    // It must come back down to that baseline within about a second of
+    // stream, not five.
     const peakAt = margins.indexOf(peak);
-    const recovered = margins.findIndex((m, k) => k > peakAt && m < 5);
+    const recovered = margins.findIndex(
+      (m, k) => k > peakAt && m < REFRESH + 5,
+    );
     expect(recovered).toBeGreaterThan(-1);
     expect(recovered - peakAt).toBeLessThan(90); // < 1.5 s at 60 fps
     store.destroy();

@@ -1487,13 +1487,21 @@ export class SurfaceStore {
     }
 
     p.fastOffsetMs = quantile(p.offsets, SurfaceStore.FAST_QUANTILE);
+    const jitterTarget = quantile(p.offsets, SurfaceStore.PRESENT_QUANTILE);
     const target = Math.min(
-      quantile(p.offsets, SurfaceStore.PRESENT_QUANTILE) + this.refreshMs,
+      jitterTarget + this.refreshMs,
       p.fastOffsetMs + SurfaceStore.PRESENT_DELAY_MAX_MS,
     );
 
     if (!Number.isFinite(p.presentOffsetMs)) {
-      p.presentOffsetMs = target;
+      // Seed at the jitter estimate alone and let the grow slew below walk
+      // the refresh of headroom in over ~8 frames.  Seeding at the full
+      // target makes engaging smoothing a one-step latency jump, and a step
+      // in the offset is a hole of exactly that size in the output — three
+      // refreshes of nothing, once, right at the start of every stream.
+      // That is the discontinuity this scheduler exists to remove, so it
+      // must not be the thing that turns it on.
+      p.presentOffsetMs = Math.min(jitterTarget, target);
       return;
     }
     if (target > p.presentOffsetMs) {
