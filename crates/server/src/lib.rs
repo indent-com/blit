@@ -5244,6 +5244,16 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // frames or nothing — so don't burn an encode job.  The
                 // stream waits for the zero-copy frame the target
                 // registration's recomposite delivers.
+                //
+                // Only while that frame is actually coming: the refusal is
+                // conditioned on an encoder sized for the current target.
+                // After a resize the old NV12 target is stamped for a native
+                // that no longer exists and the compositor skips filling it,
+                // so BGRA is the only pixel source left — refusing it here,
+                // above the rebuild below, starved the very selection that
+                // would register a fresh target.  The subscriber then
+                // streamed nothing, silently, until a resubscribe happened
+                // to reset the flag.
                 if cached
                     .as_ref()
                     .is_some_and(|p| {
@@ -5257,7 +5267,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                         .clients
                         .get(&work.cid)
                         .and_then(|c| c.surface_subs.get(&sid))
-                        .is_some_and(|s| s.wants_nv12_opaque)
+                        .is_some_and(|s| {
+                            s.wants_nv12_opaque
+                                && s.encoder
+                                    .as_ref()
+                                    .is_some_and(|e| e.source_dimensions() == (enc_w, enc_h))
+                        })
                 {
                     continue;
                 }

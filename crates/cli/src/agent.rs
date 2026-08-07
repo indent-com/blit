@@ -993,10 +993,6 @@ pub enum RecordSource {
         /// `WIDTHxHEIGHT` in physical pixels, if the caller wants the
         /// surface served at a specific size.
         size: Option<String>,
-        /// `SECS:WIDTHxHEIGHT` — send a second resize this long into the
-        /// recording, the way a browser window resize hits a live
-        /// subscription.
-        resize_after: Option<String>,
     },
 }
 
@@ -1021,23 +1017,6 @@ fn parse_record_size(size: Option<&str>) -> Result<Option<(u16, u16)>, String> {
     Ok(Some((parse(w, "width")?, parse(h, "height")?)))
 }
 
-/// Parse a `SECS:WIDTHxHEIGHT` argument into a delay and physical pixel
-/// dimensions.
-fn parse_resize_after(arg: Option<&str>) -> Result<Option<(f64, u16, u16)>, String> {
-    let Some(s) = arg else { return Ok(None) };
-    let (secs, size) = s
-        .split_once(':')
-        .ok_or_else(|| format!("bad --resize-after {s:?} (expected SECS:WIDTHxHEIGHT)"))?;
-    let secs = secs
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|v| *v >= 0.0)
-        .ok_or_else(|| format!("bad --resize-after seconds {secs:?}"))?;
-    let (w, h) = parse_record_size(Some(size))?.expect("size is Some");
-    Ok(Some((secs, w, h)))
-}
-
 pub async fn cmd_record(
     transport: Transport,
     id: u16,
@@ -1051,17 +1030,9 @@ pub async fn cmd_record(
     use std::time::{Duration, Instant};
 
     let is_surface = matches!(source, RecordSource::Surface { .. });
-    let (codecs, size, resize_after) = match source {
-        RecordSource::Pty => (Vec::new(), None, None),
-        RecordSource::Surface {
-            codecs,
-            size,
-            resize_after,
-        } => (
-            codecs,
-            parse_record_size(size.as_deref())?,
-            parse_resize_after(resize_after.as_deref())?,
-        ),
+    let (codecs, size) = match source {
+        RecordSource::Pty => (Vec::new(), None),
+        RecordSource::Surface { codecs, size } => (codecs, parse_record_size(size.as_deref())?),
     };
 
     let mut conn = AgentConn::connect(transport).await?;
@@ -1129,18 +1100,15 @@ pub async fn cmd_record(
         // Announce the decode ceiling before asking for the size, so the
         // server has it when it decides how large to composite.  A recorder
         // writes the bitstream straight to a file, so its only real ceiling
-        // is the largest size it will ever ask for.  Announced only
-        // alongside --size: the ceiling also caps the stream, so a recorder
-        // that follows the native size must not send one — a ceiling below
-        // native drops the target under it, and a Vulkan-only server (which
-        // encodes at native or not at all) then serves nothing.  A
-        // mid-stream resize announces its own just before it asks; by then
-        // the resize makes the ceiling and the mediated size agree.
+        // is what it asked for.  Announced only alongside --size: the
+        // ceiling also caps the stream, so a recorder that follows the
+        // native size must not send one — a ceiling below native drops the
+        // target under it, and a Vulkan-only server (which encodes at
+        // native or not at all) then serves nothing.
         if let Some((w, h)) = size {
-            let (rw, rh) = resize_after.map_or((0, 0), |(_, rw, rh)| (rw, rh));
             let mut features = vec![C2S_CLIENT_FEATURES, codec_support];
-            features.extend_from_slice(&w.max(rw).to_le_bytes());
-            features.extend_from_slice(&h.max(rh).to_le_bytes());
+            features.extend_from_slice(&w.to_le_bytes());
+            features.extend_from_slice(&h.to_le_bytes());
             conn.send(&features).await?;
             conn.send(&msg_surface_resize(id, w, h, 120)).await?;
         }
@@ -1154,7 +1122,6 @@ pub async fn cmd_record(
         let mut file: Option<std::fs::File> = None;
         let mut frame_count: u32 = 0;
         let mut total_bytes: u64 = 0;
-        let mut resize_sent = false;
         let mut timing: Option<std::fs::File> = match timing_path {
             Some(ref p) => {
                 let mut f = std::fs::File::create(p).map_err(|e| format!("create {p}: {e}"))?;
@@ -1227,27 +1194,6 @@ pub async fn cmd_record(
                 let mut ack = vec![C2S_SURFACE_ACK];
                 ack.extend_from_slice(&surface_id.to_le_bytes());
                 conn.send(&ack).await?;
-
-                // Checked per frame rather than on a timer: a resize of a
-                // stream that has already stopped flowing would only mask
-                // whatever stopped it.
-                if let Some((secs, w, h)) = resize_after
-                    && elapsed >= secs
-                    && !resize_sent
-                {
-                    resize_sent = true;
-                    eprintln!("\n  resizing to {w}x{h} at {elapsed:.1}s");
-                    if size.is_none() {
-                        // No ceiling was announced at subscribe (it would
-                        // have capped the native-size phase); raise it now
-                        // so the server will serve the requested size.
-                        let mut features = vec![C2S_CLIENT_FEATURES, codec_support];
-                        features.extend_from_slice(&w.to_le_bytes());
-                        features.extend_from_slice(&h.to_le_bytes());
-                        conn.send(&features).await?;
-                    }
-                    conn.send(&msg_surface_resize(id, w, h, 120)).await?;
-                }
 
                 if should_stop(frame_count) {
                     break;

@@ -1000,14 +1000,6 @@ pub enum SurfaceCommand {
         #[arg(short, long)]
         size: Option<String>,
 
-        /// Mid-recording, ask for the surface at a different size:
-        /// `SECS:WIDTHxHEIGHT` (e.g. `5:960x540`) resizes after SECS
-        /// seconds.  This is what a browser window resize does to a live
-        /// subscription, so it exercises the encoder-rebuild path the
-        /// subscribe-time `--size` cannot reach.
-        #[arg(long)]
-        resize_after: Option<String>,
-
         /// Also write per-frame timing to this path as CSV:
         /// `pts_ms,arrival_ms,bytes,key`.
         ///
