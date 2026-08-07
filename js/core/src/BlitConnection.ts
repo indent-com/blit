@@ -90,7 +90,12 @@ import {
 import { AudioPlayer } from "./AudioPlayer";
 import { SurfaceStore } from "./SurfaceStore";
 import { TerminalStore, type BlitWasmModule } from "./TerminalStore";
-import { detectCodecSupport, getMaxDecodeSize } from "./BlitSurfaceCanvas";
+import {
+  detectCodecSupport,
+  demoteCodecSupport,
+  restoreCodecSupport,
+  getMaxDecodeSize,
+} from "./BlitSurfaceCanvas";
 import {
   FEATURE_FS,
   FS_CLOSED_CLIENT_REQUEST,
@@ -742,6 +747,25 @@ export class BlitConnection {
         this.maybeSendSurfaceSubscribe(sub);
       }
     });
+    this.surfaceStore.setCodecDemoter((surfaceId, bits) => {
+      // A stream that keeps failing to decode after keyframe recoveries is
+      // one this platform's decoder rejects outright — the probe's tiny
+      // test frames passed on a decoder that rejects the real thing.
+      // Withdraw the codec-support bits that selected it and renegotiate:
+      // the server re-runs encoder selection against the reduced mask and
+      // every subscribed surface switches to a stream we can decode.
+      const mask = demoteCodecSupport(bits);
+      if (mask === null) return;
+      this._logger.warn(
+        `surface ${surfaceId}: repeated decode failures, dropping codec ` +
+          `support 0x${bits.toString(16)} (now 0x${mask.toString(16)}) and renegotiating`,
+      );
+      if (this.transport.status === "connected") {
+        this.sendClientFeatures(mask);
+        this.resubscribeWithCodecSupport();
+      }
+      this.scheduleCodecProbation(bits);
+    });
     this.store = new TerminalStore(
       {
         send: (data) => {
@@ -852,6 +876,10 @@ export class BlitConnection {
     this.resetLspAttachments(connectionError("Connection disposed"));
     this.resetKv(connectionError("Connection disposed"));
     this.resetFragmentReassembly();
+    for (const p of this.codecProbation.values()) {
+      if (p.timer !== null) clearTimeout(p.timer);
+    }
+    this.codecProbation.clear();
     this.termCwds.clear();
     this.resolveAllPendingCloses();
     this.clearSurfaceSubs();
@@ -3096,6 +3124,51 @@ export class BlitConnection {
       sub.lastSent = null;
       this.maybeSendSurfaceSubscribe(sub);
     }
+  }
+
+  /** Pending probation per withdrawn bit set: the timer that will re-offer
+   *  it, and how long this round's ban is (kept after the timer fires so
+   *  the next demotion of the same bits doubles it). */
+  private codecProbation = new Map<
+    number,
+    { timer: ReturnType<typeof setTimeout> | null; ms: number }
+  >();
+
+  /** First ban after a demotion, and the point past which bans stop
+   *  expiring.  A demotion is three decode failures deep — enough to get
+   *  the session unstuck, not enough to conclude the codec is broken — so
+   *  the first one is short.  Each repeat doubles it, and a codec that
+   *  fails again after every reprieve has earned the permanent one. */
+  private static readonly CODEC_PROBATION_MS = 60_000;
+  private static readonly CODEC_PROBATION_MAX_MS = 8 * 60_000;
+
+  /** Arrange for demoted codec bits to be offered again after a ban. */
+  private scheduleCodecProbation(bits: number): void {
+    const prev = this.codecProbation.get(bits);
+    if (prev?.timer !== null && prev?.timer !== undefined) {
+      clearTimeout(prev.timer);
+    }
+    const ms = prev ? prev.ms * 2 : BlitConnection.CODEC_PROBATION_MS;
+    if (ms > BlitConnection.CODEC_PROBATION_MAX_MS) {
+      this.codecProbation.set(bits, { timer: null, ms });
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.codecProbation.set(bits, { timer: null, ms });
+      const mask = restoreCodecSupport(bits);
+      if (mask === null) return;
+      this._logger.info(
+        `codec support 0x${bits.toString(16)} off probation ` +
+          `(now 0x${mask.toString(16)})`,
+      );
+      // Advertised, but deliberately not re-subscribed: every resubscribe
+      // costs the server an encoder rebuild and this client a keyframe on
+      // every surface at once, and unlike a demotion nothing is broken
+      // right now.  The next rebuild — a resize, a remount, a reconnect —
+      // picks the restored codec up.
+      if (this.transport.status === "connected") this.sendClientFeatures(mask);
+    }, ms);
+    this.codecProbation.set(bits, { timer, ms });
   }
 
   sendSurfaceUnsubscribe(surfaceId: number, viewId: string): void {

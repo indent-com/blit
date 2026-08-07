@@ -199,17 +199,21 @@ The compositor uses a Vulkan renderer (`VulkanRenderer`) loaded at runtime via `
 
 The render pipeline has three tiers, chosen at runtime based on hardware capabilities:
 
-**Tier 1 — Vulkan Video (fully on-GPU, preferred):**
+**Tier 1 — Vulkan Video (fully on-GPU):**
+Engaged on demand rather than by capability alone: the compositor only opens a session when the server asks for one, and the server asks only once the encoders ranked above the Vulkan tier are out (see [Encoder selection](#encoder-selection)).
+
 When `VK_KHR_video_encode_queue` + `VK_KHR_video_encode_h264` / `VK_KHR_video_encode_av1` are available, the compositor does the entire pipeline in Vulkan: render BGRA → compute shader BGRA→NV12 → Vulkan Video hardware encode → bitstream readback. The server sends the bitstream straight to its owner with zero encoding work. No VA-API, no DMA-BUF export/import, no cross-API sync — the compositor allocates the NV12 encode-source image from its own device-local memory, so this tier does not depend on VA-API being present. Gated purely on extension presence, so it is used on any driver that advertises them (AMD radv, Intel anv, and the NVIDIA proprietary driver alike).
 
-Chroma is a runtime property, not a build-time one. H.264 4:2:0 uses High with a `G8_B8R8_2PLANE_420_UNORM` source; 4:4:4 uses High 4:4:4 Predictive with `G8_B8R8_2PLANE_444_UNORM` — both two-plane, differing only in whether chroma is subsampled, so they share a descriptor layout and differ only in which compute shader fills the planes (`bgra_to_nv12_image` vs `bgra_to_nv24_image`).
+Chroma is a runtime property, not a build-time one, and in both codecs it is carried by the *profile* rather than by a flag beside it. H.264 4:2:0 uses High with a `G8_B8R8_2PLANE_420_UNORM` source; 4:4:4 uses High 4:4:4 Predictive with `G8_B8R8_2PLANE_444_UNORM`. AV1 4:2:0 uses Main, 4:4:4 uses High, over the same two source formats. The formats are both two-plane, differing only in whether chroma is subsampled, so they share a descriptor layout and differ only in which compute shader fills the planes (`bgra_to_nv12_image` vs `bgra_to_nv24_image`).
+
+For AV1 the profile also decides the shape of the sequence header: `color_config()` omits `mono_chrome` and `chroma_sample_position` at High, and never codes the subsampling flags at all because `seq_profile` implies them. blit serializes that header itself (Vulkan has no AV1 counterpart to `vkGetEncodedVideoSessionParametersKHR`), so leaving a conditional field in would shift every bit after it rather than corrupt one value — `av1_sequence_header_bit_budget_follows_the_profile` reads the header back field by field to catch exactly that.
 
 Whether 4:4:4 is _usable_ is a per-device question answered at session-creation time, and there are two distinct ways it can come back no:
 
 - The capability query refuses the profile outright. AMD Raphael (radv) answers `ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR`.
 - The profile is advertised but the driver cannot serialize its parameter sets. The NVIDIA proprietary driver (595.84) advertises H.264 High 4:4:4 Predictive, accepts the SPS/PPS pair, serializes the SPS, then fails the PPS with `ERROR_OUT_OF_HOST_MEMORY` — the same PPS that serializes at 4:2:0. A stream without parameter sets is undecodable, so the session is refused rather than shipped.
 
-Either way the session is declined and that client falls through to a server-side encoder, keeping its 4:4:4. Vulkan Video AV1 has no 4:4:4 path and steps aside for clients that asked for it.
+Either way the session is declined and that client falls through to the encoders below the tier, keeping its 4:4:4. AV1 High is the same story with a blunter answer: hardware AV1 4:4:4 is rare (NVENC has none), so the capability query usually refuses outright and `av1-vulkan` declines before allocating anything.
 
 Sessions are owned per `(surface_id, client_id)`, not per surface. Each subscriber gets its own GOP, its own keyframe cadence, and its own quantizer, so adaptive bandwidth applies here exactly as it does to a server-side encoder, and one viewer with a small viewport no longer costs every other viewer the hardware path. The cost is one encode per viewer per composited frame on the compositor thread, plus roughly 8-10 MB of GPU memory per 1080p session; there is no cap on live sessions, but the compositor reports any refusal (including the driver running out of them) so that client falls back to a server-side encoder.
 
@@ -226,21 +230,25 @@ External outputs and NV12 compute buffers are **per-surface** (`HashMap<u32, Vec
 Controlled by `BLIT_SURFACE_ENCODERS` (comma-separated priority list). The server tries each in order and uses the first that succeeds at runtime. Default priority:
 
 ```
-h264-vulkan, av1-vulkan, av1-nvenc, h264-nvenc, av1-vaapi, h264-vaapi, h264-software, av1-software
+av1-vulkan, h264-vulkan, av1-nvenc, h264-nvenc, av1-vaapi, h264-vaapi, h264-software, av1-software
 ```
 
-The Vulkan tier leads because it encodes on the compositor's own device with no server-side encode at all. It applies at native size, in either chroma the client asked for; anything else falls through to the entries after it, as does a session the driver refuses or one that stops producing bitstreams. Refusals are latched **per encoder**, so one Vulkan entry declining does not disqualify the others.
+The Vulkan tier is tried first. It encodes on the compositor's own device, so a frame never leaves the GPU that composited it and no server-side encode enters the path at all. What it gives up is reach: it applies only at native size, it has no speed control and no rate control beyond a fixed QP, and a session can still be declined after selection. None of that strands a client — the tier refuses per encoder and the request falls through to NVENC or VA-API with everything it asked for intact.
 
-`h264-vulkan` comes before `av1-vulkan`, against the AV1-first ordering used further down the list, because AV1 is not finished: the session, capability query, DPB and encode all work, but AV1 has no `vkGetEncodedVideoSessionParametersKHR` counterpart in the spec (there is no `VkVideoEncodeAV1SessionParametersGetInfoKHR`), so nothing hands back a sequence header and the application must serialize `sequence_header_obu()` itself. Until that exists `av1-vulkan` declines every session rather than emit a stream no decoder accepts, and putting it first would cost every new subscription a decline round-trip during which the client is served by a server-side encoder and then switched. Move it ahead of `h264-vulkan` once it produces a decodable stream.
+The rank still needs explicit code, because the Vulkan tier is selected by the tick loop rather than by the walk down the preference list: `outranking_encoder_pending()` in `crates/server/src/surface_encoder.rs` holds the tier back while any encoder ranked **above** it could still serve the client at this size. On the default list nothing is above it, so it answers no on the first step. It matters for a `BLIT_SURFACE_ENCODERS` that deliberately puts a dedicated engine first: without it, a listed Vulkan encoder would win wherever it sat. "Could still" is what the host has proven — NVENC answers exactly from its cached capability query, and any family that failed to build and reproduced the failure at probe size is written off. VA-API has no cheap probe, so it stays a candidate until the fallback chain has tried it once.
+
+Once the tier is reached, a session the driver refuses or one that stops producing bitstreams falls through to the entries after it. Refusals are latched **per encoder**, so one Vulkan entry declining does not disqualify the other.
+
+`av1-vulkan` leads the tier for its better compression. Both entries encode either chroma; which profile that means differs by codec, and the compositor asks the driver for the profile itself rather than for a subsampling flag beside it.
 
 | Encoder         | Backend             | Notes                                                                                                                                                                                                                    |
 | --------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `h264-vulkan`   | Vulkan Video (GPU)  | H.264 via VK_KHR_video_encode_h264. 4:2:0, or 4:4:4 where the driver serializes it. Default first choice                                                                                                                 |
-| `av1-vulkan`    | Vulkan Video (GPU)  | AV1 via VK_KHR_video_encode_av1, 4:2:0. In the default list but declines until it can emit a sequence header — see above                                                                                                 |
-| `av1-nvenc`     | NVENC (GPU)         | AV1 via CUDA                                                                                                                                                                                                             |
+| `av1-nvenc`     | NVENC (GPU)         | AV1 via CUDA. First of the dedicated engines                                                                                                                                                                             |
 | `h264-nvenc`    | NVENC (GPU)         | H.264 via CUDA                                                                                                                                                                                                           |
 | `av1-vaapi`     | VA-API (GPU)        | AV1 via libva                                                                                                                                                                                                            |
 | `h264-vaapi`    | VA-API (GPU)        | H.264 via libva                                                                                                                                                                                                          |
+| `av1-vulkan`    | Vulkan Video (GPU)  | AV1 via VK_KHR_video_encode_av1. Main, or High where the driver encodes 4:4:4. Native size only. Default first choice                                                                                                    |
+| `h264-vulkan`   | Vulkan Video (GPU)  | H.264 via VK_KHR_video_encode_h264. 4:2:0, or 4:4:4 where the driver serializes it. Native size only                                                                                                                     |
 | `h264-software` | openh264/x264 (CPU) | Software H.264; backend is a build-time choice — openh264 by default, x264 in the GPL opt-in build (`blit --license`), absent if built with neither. 4:4:4 requires x264 (High 4:4:4 Predictive); openh264 is 4:2:0-only |
 | `av1-software`  | rav1e (CPU)         | Software AV1                                                                                                                                                                                                             |
 

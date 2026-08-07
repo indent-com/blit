@@ -153,19 +153,25 @@ unsafe fn get_encoded_session_parameters<T: vk::ExtendsVideoEncodeSessionParamet
             ptr::null_mut(),
         )
     };
-    if res != vk::Result::SUCCESS || size == 0 {
-        // NVIDIA's driver (595.84) fails the pData=NULL *size query* for a
-        // High 4:4:4 Predictive PPS with ERROR_OUT_OF_HOST_MEMORY and
-        // size=0, but its *writer* works: retry against a caller-sized
-        // buffer before declaring the parameter sets unobtainable.
+    // NVIDIA's driver (595.84) fails the pData=NULL *size query* for a
+    // High 4:4:4 Predictive PPS with ERROR_OUT_OF_HOST_MEMORY and size=0,
+    // but its *writer* works: retry against a caller-sized buffer before
+    // declaring the parameter sets unobtainable.
+    let queried = res == vk::Result::SUCCESS && size != 0;
+    if !queried {
+        // Room for any SPS+PPS pair.  A driver that needs more answers
+        // VK_INCOMPLETE, which the fetch below treats as a failure rather
+        // than shipping a truncated parameter set.
+        const FALLBACK_CAPACITY: usize = 4096;
         eprintln!(
             "[vulkan-encode] parameter-set size query failed: {res:?} size={size}; \
              retrying with a fixed-size buffer",
         );
-        size = 4096;
+        size = FALLBACK_CAPACITY;
     }
 
-    let mut buf = vec![0u8; size];
+    let capacity = size;
+    let mut buf = vec![0u8; capacity];
     let res = unsafe {
         (video_fns.get_encoded_video_session_parameters)(
             device.handle(),
@@ -180,6 +186,19 @@ unsafe fn get_encoded_session_parameters<T: vk::ExtendsVideoEncodeSessionParamet
         return None;
     }
     buf.truncate(size);
+    if !queried && size == capacity {
+        // A driver that would not answer the size query cannot be trusted
+        // to write the byte count back either, and a size left at the
+        // capacity we guessed would ride along as padding on every IDR.
+        // Every parameter-set NAL ends on `rbsp_stop_one_bit`, so a
+        // trailing zero byte is padding and never payload.
+        let payload = buf.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        buf.truncate(payload);
+    }
+    if buf.is_empty() {
+        eprintln!("[vulkan-encode] parameter-set fetch wrote no bytes");
+        return None;
+    }
     Some(buf)
 }
 
@@ -505,6 +524,17 @@ impl VulkanVideoEncoder {
             h264_caps.flags.as_raw(),
             h264_caps.std_syntax_flags.as_raw(),
         );
+
+        // Same refusal the AV1 constructor makes: a session created past the
+        // profile's maxCodedExtent is a VUID violation the driver may accept
+        // and then encode garbage from.  Returning None latches a refusal
+        // server-side and a working fallback encoder takes over.
+        if width > max_coded_w || height > max_coded_h {
+            eprintln!(
+                "[vulkan-encode] H.264 coded extent {width}x{height} exceeds max {max_coded_w}x{max_coded_h}",
+            );
+            return None;
+        }
 
         // ---------------------------------------------------------------
         // 3. Create video session
@@ -1281,6 +1311,7 @@ impl VulkanVideoEncoder {
         width: u32,
         height: u32,
         qp: u8,
+        is_444: bool,
     ) -> Option<Self> {
         // The source size is used as the coded extent directly, like the
         // H.264 path: the driver pads to whole superblocks internally, and
@@ -1298,14 +1329,14 @@ impl VulkanVideoEncoder {
                 VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR,
             ),
             p_next: ptr::null(),
-            std_profile: STD_VIDEO_AV1_PROFILE_MAIN,
+            std_profile: av1_std_profile(is_444),
         };
 
         let mut profile = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::from_raw(
                 VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR,
             ))
-            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+            .chroma_subsampling(av1_chroma_subsampling(is_444))
             .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
             .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
         unsafe { push_next_raw(&mut profile, &mut av1_profile_info as *mut _) };
@@ -1325,8 +1356,12 @@ impl VulkanVideoEncoder {
             (video_fns.get_physical_device_video_capabilities)(physical_device, &profile, &mut caps)
         };
         if res != vk::Result::SUCCESS {
+            // The usual answer for a device whose AV1 engine has no 4:4:4
+            // (High profile) support at all — NVENC's does not — and the
+            // reason nothing below has to second-guess the request.
             eprintln!(
-                "[vulkan-encode] AV1 vkGetPhysicalDeviceVideoCapabilitiesKHR failed: {res:?}"
+                "[vulkan-encode] AV1 {} vkGetPhysicalDeviceVideoCapabilitiesKHR failed: {res:?}",
+                if is_444 { "4:4:4" } else { "4:2:0" },
             );
             return None;
         }
@@ -1350,8 +1385,19 @@ impl VulkanVideoEncoder {
             return None;
         }
 
-        // Pick a level.
-        let level = compute_av1_level(coded_w, coded_h).min(max_level);
+        // Pick a level — the same computation the server's announced codec
+        // string uses, so the sequence header and the string the decoder
+        // was configured with always agree.  Refuse rather than clamp to
+        // the driver max: a clamped stream would declare a level its own
+        // picture size violates, and the announcement (made before this
+        // session exists) could not know about the clamp.
+        let level = crate::av1_level::av1_level_idx(coded_w, coded_h);
+        if level > max_level {
+            eprintln!(
+                "[vulkan-encode] AV1 level {level} for {coded_w}x{coded_h} exceeds driver max {max_level}",
+            );
+            return None;
+        }
 
         // ---------------------------------------------------------------
         // 3. Create video session
@@ -1373,9 +1419,9 @@ impl VulkanVideoEncoder {
         let mut session_create = vk::VideoSessionCreateInfoKHR::default()
             .queue_family_index(video_queue_family)
             .video_profile(&profile)
-            .picture_format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+            .picture_format(av1_picture_format(is_444))
             .max_coded_extent(coded_extent)
-            .reference_picture_format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+            .reference_picture_format(av1_picture_format(is_444))
             .max_dpb_slots(2)
             .max_active_reference_pictures(1)
             .std_header_version(&std_header_version);
@@ -1415,8 +1461,12 @@ impl VulkanVideoEncoder {
             // blit's pixels are full-range BT.601 end to end.
             flags: 1 << 1,
             bit_depth: 8,
-            subsampling_x: 1,
-            subsampling_y: 1,
+            // 0/0 is 4:4:4, 1/1 is 4:2:0.  These are not free choices: the
+            // profile above fixes them (High implies 0/0, Main implies
+            // 1/1), and the serialized sequence header leaves them out
+            // entirely for exactly that reason.
+            subsampling_x: (!is_444) as u8,
+            subsampling_y: (!is_444) as u8,
             _reserved1: 0,
             color_primaries: 2,          // CP_UNSPECIFIED
             transfer_characteristics: 2, // TC_UNSPECIFIED
@@ -1446,7 +1496,7 @@ impl VulkanVideoEncoder {
 
         let mut seq_header: StdVideoAV1SequenceHeader = unsafe { std::mem::zeroed() };
         seq_header.flags = seq_flags;
-        seq_header.seq_profile = STD_VIDEO_AV1_PROFILE_MAIN;
+        seq_header.seq_profile = av1_std_profile(is_444);
         seq_header.frame_width_bits_minus_1 = (w_bits - 1) as u8;
         seq_header.frame_height_bits_minus_1 = (h_bits - 1) as u8;
         seq_header.max_frame_width_minus_1 = (coded_w - 1) as u16;
@@ -1499,15 +1549,14 @@ impl VulkanVideoEncoder {
                 coded_h,
                 video_queue_family,
                 &profile,
-                // AV1 here is 4:2:0 only — see `create_nv12_encode_image`.
-                vk::Format::G8_B8R8_2PLANE_420_UNORM,
+                av1_picture_format(is_444),
             )
         }?;
 
         // ---------------------------------------------------------------
         // 7. Bitstream buffer
         // ---------------------------------------------------------------
-        let bitstream_capacity = bitstream_capacity_for(coded_w, coded_h, false);
+        let bitstream_capacity = bitstream_capacity_for(coded_w, coded_h, is_444);
         let (bitstream_buffer, bitstream_memory, bitstream_ptr) = unsafe {
             allocate_bitstream_buffer(
                 device,
@@ -1527,13 +1576,13 @@ impl VulkanVideoEncoder {
                 VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR,
             ),
             p_next: ptr::null(),
-            std_profile: STD_VIDEO_AV1_PROFILE_MAIN,
+            std_profile: av1_std_profile(is_444),
         };
         let mut video_profile_for_query = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::from_raw(
                 VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR,
             ))
-            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+            .chroma_subsampling(av1_chroma_subsampling(is_444))
             .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
             .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
         unsafe {
@@ -1546,7 +1595,8 @@ impl VulkanVideoEncoder {
             unsafe { create_encode_query_pool(device, &mut video_profile_for_query) }?;
 
         eprintln!(
-            "[vulkan-encode] initialized AV1 encoder {coded_w}x{coded_h} (source {width}x{height}) qp={qp} level={level}",
+            "[vulkan-encode] initialized AV1 {} encoder {coded_w}x{coded_h} (source {width}x{height}) qp={qp} level={level}",
+            if is_444 { "4:4:4" } else { "4:2:0" },
         );
 
         let parts = guard.disarm();
@@ -1575,7 +1625,7 @@ impl VulkanVideoEncoder {
             // to serialize (from the same values `seq_header` was built
             // with) and gets prepended to every keyframe, mirroring how
             // H.264 prepends its SPS/PPS.
-            params_bytes: av1_sequence_header_obu(level, w_bits, h_bits, coded_w, coded_h),
+            params_bytes: av1_sequence_header_obu(level, w_bits, h_bits, coded_w, coded_h, is_444),
             poisoned: false,
         })
     }
@@ -1716,6 +1766,14 @@ impl VulkanVideoEncoder {
         // Fill AV1 encode picture info
         // ---------------------------------------------------------------
         let mut pic_flags = StdVideoEncodeAV1PictureInfoFlags::new();
+        // Unconditional, keys and deltas alike, and it must stay that way:
+        // with CDF inheritance on, the driver does not isolate entropy
+        // state between concurrent Vulkan Video sessions, so a second
+        // encoder on the same GPU seeds a delta with another session's
+        // probabilities and the tile data decodes nowhere.  Self-contained
+        // frames also survive a delivery gap, which the ref_order_hint
+        // cross-check otherwise fails.  Measured cost: +0.8% bitstream at
+        // qp=120 on 1080p screen content — see `primary_ref_frame` below.
         pic_flags.set_error_resilient_mode(true);
         pic_flags.set_force_integer_mv(is_key);
         pic_flags.set_show_frame(true);
@@ -1757,7 +1815,13 @@ impl VulkanVideoEncoder {
             frame_presentation_time: 0,
             current_frame_id: self.frame_num,
             order_hint,
-            primary_ref_frame: 7, // PRIMARY_REF_NONE: no CDF inheritance
+            // PRIMARY_REF_NONE on every frame: the deltas' entropy state
+            // must not chain, for the cross-session contamination reason
+            // spelled out at `error_resilient_mode` above.  Restoring the
+            // `if is_key` form buys back a little bitrate and brings back
+            // intermittently undecodable streams whenever a second encoder
+            // shares the GPU.
+            primary_ref_frame: 7,
             refresh_frame_flags: if is_key {
                 0xFF
             } else {
@@ -1946,7 +2010,9 @@ fn find_memory_type(
 /// Compute the H.264 level IDC for a given resolution.
 ///
 /// Mirrors the logic in the VA-API encoder: pick the lowest level whose
-/// MaxFS (max macroblocks per frame) accommodates the coded picture.
+/// MaxFS (max macroblocks per frame) accommodates the coded picture, and
+/// where two levels share a MaxFS, the lowest whose MaxMBPS also survives
+/// the rate the pipeline paces that picture at.
 fn compute_level_idc(width: u32, height: u32) -> StdVideoH264LevelIdc {
     let width_in_mbs = (width + 15) / 16;
     let height_in_mbs = (height + 15) / 16;
@@ -1962,11 +2028,20 @@ fn compute_level_idc(width: u32, height: u32) -> StdVideoH264LevelIdc {
         // Level 5.0: 3672x1536
         StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_0
     } else if max_fs <= 36864 {
-        // Level 5.1: 4096x2160
-        StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_1
-    } else {
-        // Level 5.2: 4096x2304
+        // Level 5.2: 4096x2160.  5.1 shares this MaxFS and differs only in
+        // MaxMBPS — 983040, which a picture this size exhausts at 27 fps —
+        // so at any rate the surface pipeline paces to, a stream that fits
+        // here is a 5.2 stream.  It is also the level the announced
+        // `avc1.640034` promises, which keeps the SPS from contradicting it.
         StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_2
+    } else if max_fs <= 139_264 {
+        // Level 6.0: 8192x4320.  5.2's MaxFS stops at 36864 MBs, so a
+        // picture past it needs a 6.x level however slowly it is encoded,
+        // even though decoders predating the 2016 addition refuse them.
+        StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_6_0
+    } else {
+        // Level 6.2: 16384x8704, the largest the spec defines.
+        StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_6_2
     }
 }
 
@@ -2154,6 +2229,7 @@ fn av1_sequence_header_obu(
     frame_height_bits: u32,
     coded_w: u32,
     coded_h: u32,
+    is_444: bool,
 ) -> Vec<u8> {
     // Big-endian bit packer, AV1 f(n) semantics.
     struct BitWriter {
@@ -2176,7 +2252,10 @@ fn av1_sequence_header_obu(
         bytes: Vec::new(),
         used: 0,
     };
-    w.put(3, 0); // seq_profile: Main (4:2:0 8-bit)
+    // High (4:4:4 8-bit) or Main (4:2:0 8-bit).  This is the bit the whole
+    // of `color_config()` below reads back: the profile decides subsampling,
+    // so the subsampling fields are not in the bitstream at all.
+    w.put(3, av1_std_profile(is_444));
     w.put(1, 0); // still_picture
     w.put(1, 0); // reduced_still_picture_header
     w.put(1, 0); // timing_info_present_flag (p_timing_info is null)
@@ -2208,14 +2287,25 @@ fn av1_sequence_header_obu(
     w.put(1, 0); // enable_superres
     w.put(1, 1); // enable_cdef — the hardware codes cdef_idx symbols
     w.put(1, 0); // enable_restoration
-    // color_config(): 8-bit 4:2:0, no colour description (the std struct's
+    // color_config(): 8-bit, no colour description (the std struct's
     // primaries/transfer/matrix are all 2 = unspecified, so nothing is lost
-    // by omitting them).
+    // by omitting them).  Two fields are conditional on the profile, and
+    // writing them anyway would shift every bit after them:
+    //  - `mono_chrome` is only coded for profiles other than High, which
+    //    fixes it at 0.
+    //  - `chroma_sample_position` is only coded when both subsampling flags
+    //    are set, i.e. for 4:2:0 alone.
+    // The subsampling flags themselves are never coded here: seq_profile
+    // determines them (0 -> 4:2:0, 1 -> 4:4:4).
     w.put(1, 0); // high_bitdepth
-    w.put(1, 0); // mono_chrome
+    if !is_444 {
+        w.put(1, 0); // mono_chrome
+    }
     w.put(1, 0); // color_description_present_flag
     w.put(1, 1); // color_range: full swing (blit is full-range end to end)
-    w.put(2, 0); // chroma_sample_position: unknown
+    if !is_444 {
+        w.put(2, 0); // chroma_sample_position: unknown
+    }
     w.put(1, 0); // separate_uv_delta_q
     w.put(1, 0); // film_grain_params_present
     w.put(1, 1); // trailing_one_bit (zero-padded to a byte by the packer)
@@ -2239,32 +2329,6 @@ fn av1_sequence_header_obu(
     }
     obu.extend_from_slice(&payload);
     obu
-}
-
-/// Compute the AV1 level for a given coded resolution.
-///
-/// Based on AV1 spec Table A.3 — pick the lowest level whose MaxPicSize
-/// can accommodate the coded picture.
-fn compute_av1_level(width: u32, height: u32) -> u32 {
-    let pic_size = (width as u64) * (height as u64);
-    // StdVideoAV1Level values: 2_0 = 0, 2_1 = 1, ... 5_1 = 13, 6_0 = 16, 6_3 = 19
-    if pic_size <= 147_456 {
-        0 // 2.0: 426x240
-    } else if pic_size <= 278_784 {
-        1 // 2.1
-    } else if pic_size <= 665_856 {
-        4 // 3.0: 1024x768
-    } else if pic_size <= 1_065_024 {
-        5 // 3.1: 1280x720+
-    } else if pic_size <= 2_359_296 {
-        8 // 4.0: 1920x1080
-    } else if pic_size <= 4_718_592 {
-        9 // 4.1: 2048x1152+
-    } else if pic_size <= 8_912_896 {
-        STD_VIDEO_AV1_LEVEL_5_1 // 5.1: 3840x2160
-    } else {
-        STD_VIDEO_AV1_LEVEL_6_0 // 6.0: 7680x4320
-    }
 }
 
 /// Query and bind memory for a video session.
@@ -2671,10 +2735,8 @@ const VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_SESSION_CREATE_INFO_KHR: i32 = 1_000_51
 
 /// StdVideoAV1Profile — matches vulkan_video_codec_av1std.h.
 const STD_VIDEO_AV1_PROFILE_MAIN: u32 = 0;
-
-/// StdVideoAV1Level — subset of levels we care about.
-const STD_VIDEO_AV1_LEVEL_5_1: u32 = 13;
-const STD_VIDEO_AV1_LEVEL_6_0: u32 = 16;
+/// AV1 High profile: 4:4:4, 8- or 10-bit.
+const STD_VIDEO_AV1_PROFILE_HIGH: u32 = 1;
 
 /// Minimal `StdVideoAV1SequenceHeader` for all-intra encode.
 ///
@@ -2991,22 +3053,53 @@ pub(crate) struct VideoEncodeAV1ProfileInfoKHR {
 /// has no `push_next` impl that accepts our stand-in struct.
 pub(crate) fn av1_encode_profile(
     leaf: &mut VideoEncodeAV1ProfileInfoKHR,
+    is_444: bool,
 ) -> vk::VideoProfileInfoKHR<'_> {
     *leaf = VideoEncodeAV1ProfileInfoKHR {
         s_type: vk::StructureType::from_raw(VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR),
         p_next: ptr::null(),
-        std_profile: STD_VIDEO_AV1_PROFILE_MAIN,
+        std_profile: av1_std_profile(is_444),
     };
     let mut profile = vk::VideoProfileInfoKHR::default()
         .video_codec_operation(vk::VideoCodecOperationFlagsKHR::from_raw(
             VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR,
         ))
-        // AV1 through this path is 4:2:0 only.
-        .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+        .chroma_subsampling(av1_chroma_subsampling(is_444))
         .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
         .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
     unsafe { push_next_raw(&mut profile, leaf as *mut VideoEncodeAV1ProfileInfoKHR) };
     profile
+}
+
+/// AV1 carries chroma in the *profile*, not in a flag beside it: 4:4:4 is
+/// High, a different profile from Main rather than Main with subsampling
+/// turned off.  The sequence header, the session, the DPB, the encode
+/// source image and the WebCodecs string the client configures its decoder
+/// from all have to agree on which one, so they all come through here.
+pub(crate) fn av1_std_profile(is_444: bool) -> u32 {
+    if is_444 {
+        STD_VIDEO_AV1_PROFILE_HIGH
+    } else {
+        STD_VIDEO_AV1_PROFILE_MAIN
+    }
+}
+
+/// The `VkVideoProfileInfoKHR` chroma flag matching [`av1_std_profile`].
+pub(crate) fn av1_chroma_subsampling(is_444: bool) -> vk::VideoChromaSubsamplingFlagsKHR {
+    if is_444 {
+        vk::VideoChromaSubsamplingFlagsKHR::TYPE_444
+    } else {
+        vk::VideoChromaSubsamplingFlagsKHR::TYPE_420
+    }
+}
+
+/// The two-plane source format matching [`av1_std_profile`].
+pub(crate) fn av1_picture_format(is_444: bool) -> vk::Format {
+    if is_444 {
+        vk::Format::G8_B8R8_2PLANE_444_UNORM
+    } else {
+        vk::Format::G8_B8R8_2PLANE_420_UNORM
+    }
 }
 
 /// `VkVideoEncodeAV1CapabilitiesKHR`.
@@ -3235,8 +3328,11 @@ mod tests {
     fn av1_sequence_header_golden_1080p() {
         // Level 4.0 (=8), 11 width/height bits — the values try_new_av1
         // derives for a 1920x1080 coded extent.
-        let obu = av1_sequence_header_obu(8, 11, 11, 1920, 1080);
+        let obu = av1_sequence_header_obu(8, 11, 11, 1920, 1080, false);
         assert_eq!(obu, GOLDEN_AV1_SEQ_1080P);
+        let obu444 = av1_sequence_header_obu(8, 11, 11, 1920, 1080, true);
+        assert_eq!(obu444, GOLDEN_AV1_SEQ_1080P_444);
+        assert_eq!(obu.len(), obu444.len(), "same length, different layout");
     }
 
     #[test]
@@ -3244,13 +3340,87 @@ mod tests {
         for (level, w, h) in [(8u32, 1920u32, 1080u32), (13, 3840, 2160), (0, 320, 200)] {
             let w_bits = 32u32.saturating_sub(w.leading_zeros()).max(1);
             let h_bits = 32u32.saturating_sub(h.leading_zeros()).max(1);
-            let obu = av1_sequence_header_obu(level, w_bits, h_bits, w, h);
-            // obu_header: OBU_SEQUENCE_HEADER (type 1), has_size_field.
-            assert_eq!(obu[0], 0x0A);
-            // Single-byte leb128 size matching the payload.
-            assert_eq!(obu[1] as usize, obu.len() - 2);
-            // seq_profile 0 and the four flag bits after it are all zero.
-            assert_eq!(obu[2] & 0b1111_1110, 0);
+            for is_444 in [false, true] {
+                let obu = av1_sequence_header_obu(level, w_bits, h_bits, w, h, is_444);
+                // obu_header: OBU_SEQUENCE_HEADER (type 1), has_size_field.
+                assert_eq!(obu[0], 0x0A);
+                // Single-byte leb128 size matching the payload.
+                assert_eq!(obu[1] as usize, obu.len() - 2);
+                // seq_profile, then four zero flag bits.
+                assert_eq!(obu[2] >> 5, if is_444 { 1 } else { 0 });
+                assert_eq!(obu[2] & 0b0001_1110, 0);
+            }
+        }
+    }
+
+    /// Read the header back the way a decoder does.
+    ///
+    /// Two `color_config()` fields are conditional on the profile, and
+    /// leaving one in at 4:4:4 would not corrupt a value so much as shift
+    /// every bit after it — the stream stays syntactically plausible and
+    /// decodes to nonsense.  Walking to the trailing bit is what catches
+    /// that: it only lands on the last set bit if every field before it was
+    /// the right width.
+    #[test]
+    fn av1_sequence_header_bit_budget_follows_the_profile() {
+        struct Reader<'a> {
+            bytes: &'a [u8],
+            pos: usize,
+        }
+        impl Reader<'_> {
+            fn f(&mut self, n: u32) -> u32 {
+                let mut v = 0;
+                for _ in 0..n {
+                    let bit = (self.bytes[self.pos / 8] >> (7 - self.pos % 8)) & 1;
+                    v = (v << 1) | bit as u32;
+                    self.pos += 1;
+                }
+                v
+            }
+        }
+
+        for is_444 in [false, true] {
+            let obu = av1_sequence_header_obu(8, 11, 11, 1920, 1080, is_444);
+            let payload = &obu[2..];
+            let mut r = Reader {
+                bytes: payload,
+                pos: 0,
+            };
+            assert_eq!(r.f(3), if is_444 { 1 } else { 0 }, "seq_profile");
+            assert_eq!(r.f(4), 0, "still_picture..initial_display_delay");
+            assert_eq!(r.f(5), 0, "operating_points_cnt_minus_1");
+            assert_eq!(r.f(12), 0, "operating_point_idc[0]");
+            assert_eq!(r.f(5), 8, "seq_level_idx[0]");
+            assert_eq!(r.f(1), 0, "seq_tier[0], coded because level > 7");
+            assert_eq!(r.f(4), 10, "frame_width_bits_minus_1");
+            assert_eq!(r.f(4), 10, "frame_height_bits_minus_1");
+            assert_eq!(r.f(11), 1919, "max_frame_width_minus_1");
+            assert_eq!(r.f(11), 1079, "max_frame_height_minus_1");
+            assert_eq!(r.f(8), 0, "frame_id_numbers_present .. enable_dual_filter");
+            assert_eq!(r.f(1), 1, "enable_order_hint");
+            assert_eq!(r.f(2), 0, "enable_jnt_comp, enable_ref_frame_mvs");
+            assert_eq!(r.f(2), 0b11, "seq_choose_screen_content_tools/integer_mv");
+            assert_eq!(r.f(3), 6, "order_hint_bits_minus_1");
+            assert_eq!(r.f(1), 0, "enable_superres");
+            assert_eq!(r.f(1), 1, "enable_cdef");
+            assert_eq!(r.f(1), 0, "enable_restoration");
+            // color_config()
+            assert_eq!(r.f(1), 0, "high_bitdepth");
+            if !is_444 {
+                assert_eq!(r.f(1), 0, "mono_chrome, not coded for High");
+            }
+            assert_eq!(r.f(1), 0, "color_description_present_flag");
+            assert_eq!(r.f(1), 1, "color_range: full swing");
+            if !is_444 {
+                assert_eq!(r.f(2), 0, "chroma_sample_position, 4:2:0 only");
+            }
+            assert_eq!(r.f(1), 0, "separate_uv_delta_q");
+            assert_eq!(r.f(1), 0, "film_grain_params_present");
+            assert_eq!(r.f(1), 1, "trailing_one_bit");
+            // Everything left is the packer's zero padding, and there is
+            // less than a byte of it.
+            assert!(payload.len() * 8 - r.pos < 8, "padded past a byte");
+            assert_eq!(r.f((payload.len() * 8 - r.pos) as u32), 0, "zero padding");
         }
     }
 
@@ -3258,20 +3428,24 @@ mod tests {
     fn level_tables() {
         use StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_3_1 as L31;
         use StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_4_0 as L40;
-        use StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_1 as L51;
+        use StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_2 as L52;
         assert_eq!(compute_level_idc(640, 480), L31);
         // The table's 3.1 cutoff (1620 MBs) is really level 3.0's MaxFS —
         // 3.1 allows 3600 — so 720p lands at 4.0.  Conservative, spec-legal,
         // and pinned here so a future retune shows up as a diff.
         assert_eq!(compute_level_idc(1280, 720), L40);
         assert_eq!(compute_level_idc(1920, 1080), L40);
-        assert_eq!(compute_level_idc(3840, 2160), L51);
+        // 4K fits 5.1's MaxFS but not its MaxMBPS past 27 fps, so the rung
+        // it shares with 5.2 is declared as the 5.2 it really is.
+        assert_eq!(compute_level_idc(3840, 2160), L52);
+        // Above 5.2's MaxFS the ladder continues into the 6.x levels
+        // instead of under-declaring 5.2 forever.
+        assert_eq!(
+            compute_level_idc(4400, 2400),
+            StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_6_0
+        );
         assert_eq!(h264_level_idc_value(L31), 31);
         assert_eq!(h264_level_idc_value(L40), 40);
-
-        assert_eq!(compute_av1_level(1920, 1080), 8);
-        assert_eq!(compute_av1_level(3840, 2160), STD_VIDEO_AV1_LEVEL_5_1);
-        assert_eq!(compute_av1_level(7680, 4320), STD_VIDEO_AV1_LEVEL_6_0);
     }
 
     #[test]
@@ -3297,4 +3471,10 @@ mod tests {
         0, 0, 0, 1, 104, 238, 6, 112, 192, // PPS
     ];
     const GOLDEN_AV1_SEQ_1080P: &[u8] = &[10, 11, 0, 0, 0, 66, 171, 191, 195, 112, 9, 228, 33];
+    /// The same header at 4:4:4.  Verified by handing it to ffmpeg's AV1
+    /// parser, which reads it as profile High; the variant that keeps the
+    /// 4:2:0 field layout under a High profile — same length, differing
+    /// only in this last byte — is rejected there with `trailing_one_bit
+    /// out of range`.
+    const GOLDEN_AV1_SEQ_1080P_444: &[u8] = &[10, 11, 32, 0, 0, 66, 171, 191, 195, 112, 9, 228, 72];
 }

@@ -1115,15 +1115,28 @@ struct AwaitingBuffer {
     is_cursor: bool,
     acquire: crate::drm_syncobj::SyncPoint,
     release: Option<crate::drm_syncobj::SyncPoint>,
+    /// When the commit parked, so a point that never signals cannot freeze
+    /// the surface forever.
+    parked_at: std::time::Instant,
 }
 
+/// How long a parked commit waits for its acquire point before it is
+/// installed anyway.  A client that commits before submitting its GPU work
+/// signals within a frame or two; past this it is wedged (context lost,
+/// killed mid-commit), and freezing its surface — and starving its buffer
+/// pool — is worse than showing a frame whose paint may be incomplete.
+const ACQUIRE_PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 impl AwaitingBuffer {
-    /// Discard without ever reading: the client gets both the wl_buffer
-    /// release and the release-point signal immediately.
-    fn discard(self) {
-        self.buf.release();
-        if let Some(r) = self.release {
-            r.signal();
+    /// Give the buffer back without ever reading it.  The release point
+    /// goes through the caller's fence gate rather than signalling here:
+    /// a timeline wait is satisfied by *any* point at or above it, so
+    /// signalling this one while an older release is still deferred would
+    /// tell the client an in-use buffer is free.
+    fn into_release(self) -> HeldBuffer {
+        HeldBuffer {
+            buf: self.buf,
+            release: self.release,
         }
     }
 }
@@ -2464,16 +2477,37 @@ impl Compositor {
         if self.awaiting_acquire.is_empty() {
             return;
         }
-        let ready: Vec<ObjectId> = self
+        let now = std::time::Instant::now();
+        let ready: Vec<(ObjectId, bool)> = self
             .awaiting_acquire
             .iter()
-            .filter(|(_, a)| a.acquire.signaled())
-            .map(|(id, _)| id.clone())
+            .filter_map(|(id, a)| {
+                if a.acquire.signaled() {
+                    Some((id.clone(), false))
+                } else if now.duration_since(a.parked_at) >= ACQUIRE_PARK_TIMEOUT {
+                    Some((id.clone(), true))
+                } else {
+                    None
+                }
+            })
             .collect();
-        for surface_id in ready {
+        for (surface_id, timed_out) in ready {
             let Some(a) = self.awaiting_acquire.remove(&surface_id) else {
                 continue;
             };
+            if timed_out {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[compositor] acquire point still unsignalled after {}ms; installing anyway rather than freezing the surface",
+                        ACQUIRE_PARK_TIMEOUT.as_millis(),
+                    );
+                }
+            }
+            // The commit's state was held back with its buffer; both land
+            // together now.
+            self.apply_committed_state(&surface_id);
             self.commit_buffer(&surface_id, a.buf, a.scale, a.is_cursor, a.release);
             let (root_id, toplevel_sid) = self.find_toplevel_root(&surface_id);
             let Some(tl) = toplevel_sid else {
@@ -2552,28 +2586,21 @@ impl Compositor {
                 return;
             }
         }
+        // Only the buffer and its sync points are taken here: the rest of
+        // the double-buffered state stays pending until the commit is known
+        // to install.  Applying it up front is what made a parked commit
+        // visible — scale, viewport and subsurface position would describe
+        // the new frame while `surface_meta` still described the old buffer,
+        // so the composite below stretched the previous frame into the new
+        // destination rect and cropped it against stale dimensions, for the
+        // frame or two until the promotion sweep ran.
         let (buffer, scale, is_cursor, acquire, release, syncobj_surface) = {
             let Some(surf) = self.surfaces.get_mut(surface_id) else {
                 return;
             };
-            surf.min_size = surf.pending_min_size;
-            surf.max_size = surf.pending_max_size;
-            let buffer = surf.pending_buffer.take();
-            let scale = surf.pending_buffer_scale;
-            surf.buffer_scale = scale;
-            surf.viewport_destination = surf.pending_viewport_destination;
-            surf.viewport_source = surf.pending_viewport_source;
-            surf.is_opaque = surf.pending_opaque;
-            if let Some(region) = surf.pending_input_region.take() {
-                surf.input_region = region;
-            }
-            surf.pending_damage = false;
-            if let Some(pos) = surf.pending_subsurface_position.take() {
-                surf.subsurface_position = pos;
-            }
             (
-                buffer,
-                scale,
+                surf.pending_buffer.take(),
+                surf.pending_buffer_scale,
                 surf.is_cursor,
                 surf.pending_acquire_point.take(),
                 surf.pending_release_point.take(),
@@ -2581,8 +2608,17 @@ impl Compositor {
             )
         };
         let Some(buf) = buffer else {
-            // Explicit-sync points are per-commit and only meaningful with
-            // a newly attached buffer; stale ones were already taken above.
+            // No new content, so there is nothing to stay in step with and
+            // the state applies now, as the protocol says it must.  The
+            // points came without a buffer, which the spec calls an error
+            // and blit treats leniently everywhere else: signal the release
+            // rather than dropping it, or the client waits on a point that
+            // can never be reached.
+            self.apply_committed_state(surface_id);
+            if let Some(r) = release {
+                r.signal();
+            }
+            drop(acquire);
             return;
         };
 
@@ -2594,14 +2630,25 @@ impl Compositor {
         // window.  Be lenient: treat such commits as unfenced (which SHM
         // is anyway, and an unfenced dma-buf is no worse than a client
         // that never bound the protocol), and say so once.
-        let (acquire, release) = if syncobj_surface.is_some()
-            && (acquire.is_none() || release.is_none() || buf.data::<ShmBufferData>().is_some())
-        {
+        // A missing *release* is no reason to throw away a usable acquire:
+        // dropping it composites the dma-buf with no wait at all, which is
+        // exactly the early sample this path exists to prevent — the
+        // client's previous frame, on the frame it navigates.  Only an
+        // absent acquire, or SHM (copied on commit, so a GPU fence means
+        // nothing), makes the commit genuinely unfenced.
+        let unfenced =
+            syncobj_surface.is_some() && (acquire.is_none() || buf.data::<ShmBufferData>().is_some());
+        let (acquire, release) = if unfenced {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let cause = if acquire.is_none() {
+                    "no acquire point"
+                } else {
+                    "SHM buffer"
+                };
                 eprintln!(
-                    "[compositor] explicit-sync surface committed without usable sync points; treating as unfenced (spec says error, lenient for browser startup)",
+                    "[compositor] explicit-sync surface committed with {cause}; treating as unfenced (spec says error, lenient for browser startup)",
                 );
             }
             // A release point without a usable acquire is still honored so
@@ -2621,33 +2668,39 @@ impl Compositor {
         // implicit sync with a driver that honors it.  Only when the point
         // has no fence yet (the client committed before submitting its GPU
         // work) fall back to parking the commit for the promotion sweep.
-        if let Some(acq) = acquire {
-            if !acq.signaled() {
-                let gpu_waited = acq
-                    .export_sync_file()
-                    .ok()
-                    .and_then(|fd| {
-                        self.vulkan_renderer
-                            .as_mut()
-                            .map(|vk| vk.add_acquire_wait_fd(fd))
-                    })
-                    .unwrap_or(false);
-                if !gpu_waited {
-                    let waiting = AwaitingBuffer {
-                        buf,
-                        scale,
-                        is_cursor,
-                        acquire: acq,
-                        release,
-                    };
-                    if let Some(prev) = self.awaiting_acquire.insert(surface_id.clone(), waiting)
-                    {
-                        // Superseded before its content was ever ready: hand
-                        // everything back immediately, it was never read.
-                        prev.discard();
-                    }
-                    return;
+        if let Some(acq) = acquire
+            && !acq.signaled()
+        {
+            let gpu_waited = acq
+                .export_sync_file()
+                .ok()
+                .and_then(|fd| {
+                    self.vulkan_renderer
+                        .as_mut()
+                        .map(|vk| vk.add_acquire_wait_fd(fd))
+                })
+                .unwrap_or(false);
+            if !gpu_waited {
+                let waiting = AwaitingBuffer {
+                    buf,
+                    scale,
+                    is_cursor,
+                    acquire: acq,
+                    release,
+                    parked_at: std::time::Instant::now(),
+                };
+                if let Some(prev) = self.awaiting_acquire.insert(surface_id.clone(), waiting) {
+                    // Superseded before its content was ever ready, so it
+                    // was never read — but its release point still goes
+                    // through the fence gate, in order with the displayed
+                    // buffer's.
+                    let stale = prev.into_release();
+                    self.release_held(stale);
                 }
+                // The commit's state stays pending with it: applying it now
+                // would describe this buffer while the surface still shows
+                // the last one.
+                return;
             }
         }
 
@@ -2662,10 +2715,37 @@ impl Compositor {
         // post-composite release gate treat this surface as parked,
         // stranding the buffer installed here.
         if let Some(stale) = self.awaiting_acquire.remove(surface_id) {
-            stale.discard();
+            let stale = stale.into_release();
+            self.release_held(stale);
         }
 
+        // This commit is installing, so its state lands with its pixels.
+        self.apply_committed_state(surface_id);
         self.commit_buffer(surface_id, buf, scale, is_cursor, release);
+    }
+
+    /// Apply a commit's double-buffered surface state.  Split out of
+    /// `apply_pending_state` so it runs at the moment the commit's buffer
+    /// becomes the surface's content — immediately for an ordinary commit,
+    /// at the promotion sweep for one parked on its acquire point — and
+    /// never describes a frame that is not on screen yet.
+    fn apply_committed_state(&mut self, surface_id: &ObjectId) {
+        let Some(surf) = self.surfaces.get_mut(surface_id) else {
+            return;
+        };
+        surf.min_size = surf.pending_min_size;
+        surf.max_size = surf.pending_max_size;
+        surf.buffer_scale = surf.pending_buffer_scale;
+        surf.viewport_destination = surf.pending_viewport_destination;
+        surf.viewport_source = surf.pending_viewport_source;
+        surf.is_opaque = surf.pending_opaque;
+        if let Some(region) = surf.pending_input_region.take() {
+            surf.input_region = region;
+        }
+        surf.pending_damage = false;
+        if let Some(pos) = surf.pending_subsurface_position.take() {
+            surf.subsurface_position = pos;
+        }
     }
 
     /// Install a committed buffer as the surface's current content.  The
@@ -2954,7 +3034,8 @@ impl Compositor {
                 self.release_held(held);
             }
             if let Some(a) = self.awaiting_acquire.remove(proto_id) {
-                a.discard();
+                let a = a.into_release();
+                self.release_held(a);
             }
             self.forget_pointer_focus(proto_id);
             // A crashed client's popup takes the keyboard with it otherwise:
@@ -4426,7 +4507,8 @@ impl Dispatch<WlSurface, ()> for Compositor {
                     state.release_held(held);
                 }
                 if let Some(a) = state.awaiting_acquire.remove(&sid) {
-                    a.discard();
+                    let a = a.into_release();
+                    state.release_held(a);
                 }
                 state.forget_pointer_focus(&sid);
                 if let Some(parent_id) = state
@@ -4680,11 +4762,17 @@ impl Dispatch<WpLinuxDrmSyncobjManagerV1, ()> for Compositor {
         match request {
             Request::GetSurface { id, surface } => {
                 let wl_surface_id = surface.id();
-                let exists = state
-                    .surfaces
-                    .get(&wl_surface_id)
-                    .is_some_and(|s| s.syncobj_surface.is_some());
-                if exists {
+                let Some(existing) = state.surfaces.get(&wl_surface_id) else {
+                    // Initialising first would hand back an object whose
+                    // every request lands on nothing — a silent no-op the
+                    // client cannot distinguish from working explicit sync.
+                    manager.post_error(
+                        wp_linux_drm_syncobj_manager_v1::Error::SurfaceExists,
+                        "no such wl_surface",
+                    );
+                    return;
+                };
+                if existing.syncobj_surface.is_some() {
                     manager.post_error(
                         wp_linux_drm_syncobj_manager_v1::Error::SurfaceExists,
                         "surface already has a syncobj surface",
@@ -4746,11 +4834,29 @@ impl Dispatch<WpLinuxDrmSyncobjTimelineV1, ()> for Compositor {
     }
 }
 
+/// Detach a syncobj surface object from its wl_surface, but only while the
+/// wl_surface still points at *this* object: a client may destroy the old
+/// one after having asked for a replacement, and clearing unconditionally
+/// there would strip explicit sync from a surface that just enabled it.
+fn clear_syncobj_surface(
+    state: &mut Compositor,
+    data: &SyncobjSurfaceData,
+    res: &WpLinuxDrmSyncobjSurfaceV1,
+) {
+    if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id)
+        && surf.syncobj_surface.as_ref().is_some_and(|s| s.id() == res.id())
+    {
+        surf.syncobj_surface = None;
+        surf.pending_acquire_point = None;
+        surf.pending_release_point = None;
+    }
+}
+
 impl Dispatch<WpLinuxDrmSyncobjSurfaceV1, SyncobjSurfaceData> for Compositor {
     fn request(
         state: &mut Self,
         _: &Client,
-        _: &WpLinuxDrmSyncobjSurfaceV1,
+        res: &WpLinuxDrmSyncobjSurfaceV1,
         request: <WpLinuxDrmSyncobjSurfaceV1 as Resource>::Request,
         data: &SyncobjSurfaceData,
         _: &DisplayHandle,
@@ -4758,13 +4864,26 @@ impl Dispatch<WpLinuxDrmSyncobjSurfaceV1, SyncobjSurfaceData> for Compositor {
     ) {
         use wp_linux_drm_syncobj_surface_v1::Request;
         let point_of = |state: &Self, timeline: &WpLinuxDrmSyncobjTimelineV1, hi: u32, lo: u32| {
-            state
+            let found = state
                 .syncobj_timelines
                 .get(&timeline.id())
                 .map(|tl| crate::drm_syncobj::SyncPoint {
                     timeline: tl.clone(),
                     point: ((hi as u64) << 32) | lo as u64,
-                })
+                });
+            if found.is_none() {
+                // The import failed earlier, so the commit silently becomes
+                // unfenced.  Say so once: without it the only symptom is a
+                // surface that samples early, which looks like a driver bug.
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[compositor] sync point names a timeline that was never imported; commit treated as unfenced",
+                    );
+                }
+            }
+            found
         };
         match request {
             Request::SetAcquirePoint {
@@ -4788,11 +4907,7 @@ impl Dispatch<WpLinuxDrmSyncobjSurfaceV1, SyncobjSurfaceData> for Compositor {
                 }
             }
             Request::Destroy => {
-                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
-                    surf.syncobj_surface = None;
-                    surf.pending_acquire_point = None;
-                    surf.pending_release_point = None;
-                }
+                clear_syncobj_surface(state, data, res);
             }
             _ => {}
         }
@@ -4801,14 +4916,10 @@ impl Dispatch<WpLinuxDrmSyncobjSurfaceV1, SyncobjSurfaceData> for Compositor {
     fn destroyed(
         state: &mut Self,
         _: wayland_server::backend::ClientId,
-        _: &WpLinuxDrmSyncobjSurfaceV1,
+        res: &WpLinuxDrmSyncobjSurfaceV1,
         data: &SyncobjSurfaceData,
     ) {
-        if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
-            surf.syncobj_surface = None;
-            surf.pending_acquire_point = None;
-            surf.pending_release_point = None;
-        }
+        clear_syncobj_surface(state, data, res);
     }
 }
 
@@ -5211,7 +5322,8 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                     state.release_held(held);
                 }
                 if let Some(a) = state.awaiting_acquire.remove(wl_surface_id) {
-                    a.discard();
+                    let a = a.into_release();
+                    state.release_held(a);
                 }
                 if let Some(surf) = state.surfaces.get_mut(wl_surface_id) {
                     let sid = surf.surface_id;

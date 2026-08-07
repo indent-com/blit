@@ -26,6 +26,11 @@ import {
 /** Cached codec support bitmask.  Computed once, reused for all resize messages. */
 let _codecSupport: number | null = null;
 
+/** What the probe found, before any demotion narrowed it.  Restoring a
+ *  demoted codec may only ever re-offer bits this browser did probe as
+ *  working — never invent support the probe never saw. */
+let _probedCodecSupport = 0;
+
 /**
  * Largest frame any supported codec decoded in the probe, as [w, h].
  * `[0, 0]` = nothing above 1080p was confirmed, which the server reads as
@@ -54,24 +59,32 @@ const DECODE_PROBE_SIZES: [number, number][] = [
  * below what we would be sent would pass here and fail later, and probing
  * above it under-reports on decoders that gate on level.
  */
-function av1LevelString(width: number, height: number): string {
-  const sps = width * height * 60;
-  // [level, maxW, maxH, maxDecodeRate]
-  const specs: [string, number, number, number][] = [
-    ["00", 2048, 1152, 5529600],
-    ["01", 2816, 1152, 10454400],
-    ["04", 4352, 2448, 24969600],
-    ["05", 5504, 3096, 39938400],
-    ["08", 6144, 3456, 77856768],
-    ["09", 6144, 3456, 155713536],
-    ["12", 8192, 4352, 273715200],
-    ["13", 8192, 4352, 547430400],
-    ["16", 16384, 8704, 1176502272],
+export function av1LevelString(width: number, height: number): string {
+  const pic = width * height;
+  const rate = pic * 60;
+  // [seq_level_idx, maxPicSize, maxHSize, maxVSize, maxDisplayRate] —
+  // spec Table A.3.  Levels whose limits duplicate the previous row for
+  // these fields (5.3, 6.3) can never be picked and are folded into the
+  // fallthrough, exactly like the server table.
+  const specs: [number, number, number, number, number][] = [
+    [0, 147456, 2048, 1152, 4423680],
+    [1, 278784, 2816, 1584, 8363520],
+    [4, 665856, 4352, 2448, 19975680],
+    [5, 1065024, 5504, 3096, 31950720],
+    [8, 2359296, 6144, 3456, 70778880],
+    [9, 2359296, 6144, 3456, 141557760],
+    [12, 8912896, 8192, 4352, 267386880],
+    [13, 8912896, 8192, 4352, 534773760],
+    [14, 8912896, 8192, 4352, 1069547520],
+    [16, 35651584, 16384, 8704, 1069547520],
+    [17, 35651584, 16384, 8704, 2139095040],
+    [18, 35651584, 16384, 8704, 4278190080],
   ];
-  for (const [level, maxW, maxH, maxRate] of specs) {
-    if (width <= maxW && height <= maxH && sps <= maxRate) return level;
+  for (const [idx, maxPic, maxW, maxH, maxRate] of specs) {
+    if (pic <= maxPic && width <= maxW && height <= maxH && rate <= maxRate)
+      return String(idx).padStart(2, "0");
   }
-  return "16";
+  return "19";
 }
 
 // Minimal 64×64 4:4:4 test frames for real-decode probing.
@@ -254,6 +267,7 @@ export async function detectCodecSupport(): Promise<number> {
   );
 
   _codecSupport = mask;
+  _probedCodecSupport = mask;
   console.log(
     `[blit] codec support: 0x${mask.toString(16).padStart(2, "0")} ` +
       `(h264=${!!(mask & CODEC_SUPPORT_H264)} av1=${!!(mask & CODEC_SUPPORT_AV1)} ` +
@@ -266,6 +280,38 @@ export async function detectCodecSupport(): Promise<number> {
 /** Return the cached codec support, or 0 if not yet probed. */
 export function getCodecSupport(): number {
   return _codecSupport ?? 0;
+}
+
+/**
+ * Drop codec-support bits after the stream they selected proved
+ * undecodable in practice — the probe's tiny test frames pass on decoders
+ * that then reject the real stream.  Returns the new mask, or null when
+ * nothing changed: the probe hasn't finished (nothing to demote), the bits
+ * were already clear, or clearing them would zero the mask — which the
+ * wire protocol reads as "accept anything" and would undo the demotion.
+ */
+export function demoteCodecSupport(bits: number): number | null {
+  if (_codecSupport === null) return null;
+  const next = _codecSupport & ~bits;
+  if (next === _codecSupport || next === 0) return null;
+  _codecSupport = next;
+  return next;
+}
+
+/**
+ * Re-offer bits a previous {@link demoteCodecSupport} withdrew, once the
+ * failures that triggered it are far enough behind to have been a transient
+ * fault (a GPU reset, a decoder the browser had briefly wedged) rather than
+ * a codec this platform cannot handle.  Returns the new mask, or null when
+ * nothing changed — the probe never confirmed those bits, or they are
+ * already offered.
+ */
+export function restoreCodecSupport(bits: number): number | null {
+  if (_codecSupport === null) return null;
+  const next = _codecSupport | (bits & _probedCodecSupport);
+  if (next === _codecSupport) return null;
+  _codecSupport = next;
+  return next;
 }
 
 /**
@@ -957,12 +1003,15 @@ export class BlitSurfaceCanvas {
   /**
    * Size and position the canvas's CSS box for the current frame.
    *
-   * A frame is shown at exactly one device pixel per canvas pixel — never
-   * upscaled.  The mediated surface size is the minimum across subscribed
-   * clients, so a smaller co-viewer shrinks the frames this client
-   * receives; those are shown at their native size, centered.  Only a
-   * frame *larger* than the container (transiently, mid-resize) is scaled
-   * down to fit, aspect-preserved.
+   * The box comes from the view's own display size, not from the frame:
+   * the stream is only ever an approximation of what was asked for — the
+   * server mediates across subscribed clients, rounds to the even 4:2:0
+   * grid, and may serve a downscale of the surface — and a box derived
+   * from it would move by a pixel or two every time any of those changed,
+   * with the picture never quite reaching the edge of its pane.  The frame
+   * is instead fitted to the box, aspect-preserved, so a genuinely
+   * different aspect ratio still letterboxes and nothing shifts when the
+   * stream size does.
    *
    * Non-resizable views (thumbnails, the React binding) keep the
    * fill-and-contain CSS from attach() and let the box drive the size.  They
@@ -989,11 +1038,14 @@ export class BlitSurfaceCanvas {
     const fw = canvas.width;
     const fh = canvas.height;
     if (fw === 0 || fh === 0) return;
-    const fit = Math.min(1, ds.width / fw, ds.height / fh);
-    const w = Math.floor(fw * fit);
-    const h = Math.floor(fh * fit);
-    const left = Math.max(0, Math.floor((ds.width - w) / 2));
-    const top = Math.max(0, Math.floor((ds.height - h) / 2));
+    // Rounding, not flooring, and clamped to the box: a stream that is the
+    // box's aspect to within the grid it was rounded onto has to land on
+    // the box exactly, not a pixel inside it.
+    const fit = Math.min(ds.width / fw, ds.height / fh);
+    const w = Math.min(ds.width, Math.round(fw * fit));
+    const h = Math.min(ds.height, Math.round(fh * fit));
+    const left = Math.max(0, Math.round((ds.width - w) / 2));
+    const top = Math.max(0, Math.round((ds.height - h) / 2));
     const last = this._lastLayout;
     if (
       last &&
@@ -1006,7 +1058,8 @@ export class BlitSurfaceCanvas {
     }
     this._lastLayout = { left, top, w, h };
     // All values are integer device pixels converted to CSS pixels, so the
-    // canvas lands on the device grid and the browser blits 1:1.
+    // canvas lands on the device grid — a stream served at the size that
+    // was asked for is then blitted 1:1.
     const scale = ds.scale120 / 120;
     Object.assign(canvas.style, {
       position: "absolute",
@@ -1186,10 +1239,10 @@ export class BlitSurfaceCanvas {
     if (src.width === 0 || src.height === 0) return;
     this._lastFrameSize = { width: src.width, height: src.height };
 
-    // A view that sizes its own box is already 1:1 and has nothing to
-    // prefilter: the backing buffer mirrors the source frame exactly and
-    // applyLayout sizes the CSS box to match (or, transiently mid-resize,
-    // scales a too-large frame down proportionally).
+    // A view that sizes its own box has nothing to prefilter: the backing
+    // buffer mirrors the source frame exactly and applyLayout fits it to
+    // the pane, which is the size the stream was asked for and so is at or
+    // near 1:1.
     //
     // A view that is *handed* a box — a dock thumbnail — is about to be
     // minified by the compositor instead, so bring the frame down to roughly
@@ -1478,8 +1531,8 @@ export class BlitSurfaceCanvas {
    * Where the frame is actually drawn, in CSS pixels, plus the scale that
    * takes CSS pixels to surface coordinates.
    *
-   * In resizable views applyLayout() sizes the CSS box to the drawn frame
-   * exactly, so the letterbox degenerates to dx = dy ≈ 0; views still on
+   * In resizable views applyLayout() gives the CSS box the frame's own
+   * aspect, so the letterbox degenerates to dx = dy ≈ 0; views still on
    * the fill-and-contain default (thumbnails) letterbox the intrinsic
    * aspect within the box via object-fit: contain.
    *

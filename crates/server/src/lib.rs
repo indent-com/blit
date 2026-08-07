@@ -870,6 +870,85 @@ fn nv12_opaque_safe_for_target(
         })
 }
 
+/// Whether an `OPAQUE_FD` frame is still coming for `(sid, target)`, i.e.
+/// BGRA sitting in the pixel cache is a transient this subscriber's stream
+/// supersedes rather than the shape the target has settled on.
+///
+/// A subscriber's own `wants_nv12_opaque` cannot answer this: it records the
+/// encoder's capability, while the compositor publishes the *negotiated*
+/// shape.  One co-subscriber that needs CPU pixels — or needs the other
+/// chroma layout — puts the whole target on BGRA for as long as it is there,
+/// and a subscriber that declined the BGRA on capability alone would wait
+/// for a frame nobody is going to publish: no encode, no bitstream, and no
+/// failure to recover from either.
+fn opaque_publish_pending(
+    clients: &HashMap<u64, ClientState>,
+    cid: u64,
+    sid: u16,
+    target: (u32, u32),
+) -> bool {
+    let Some(s) = clients.get(&cid).and_then(|c| c.surface_subs.get(&sid)) else {
+        return false;
+    };
+    if !s
+        .encoder
+        .as_ref()
+        .is_some_and(|e| e.source_dimensions() == target)
+    {
+        return false;
+    }
+    nv12_opaque_safe_for_target(
+        s.wants_nv12_opaque,
+        s.wants_opaque_444,
+        target,
+        clients
+            .iter()
+            .filter(|(other, _)| **other != cid)
+            .map(|(_, c)| {
+                c.surface_subs
+                    .get(&sid)
+                    .map(|o| {
+                        (
+                            o.last_registered_target,
+                            o.wants_nv12_opaque,
+                            o.wants_opaque_444,
+                        )
+                    })
+                    .unwrap_or((None, true, s.wants_opaque_444))
+            }),
+    )
+}
+
+/// Numeric H.264 `level_idc` for a coded picture, by the Annex A MaxFS
+/// limits.
+///
+/// The client configures its decoder from the announced codec string and a
+/// level-gating backend refuses a stream that then declares a higher level
+/// than it was configured for, so this has to agree with the `level_idc` the
+/// compositor writes into the SPS — keep it in lockstep with the encoder's
+/// own table.
+fn h264_level_idc_for(width: u32, height: u32) -> u32 {
+    let max_fs = width.div_ceil(16) * height.div_ceil(16);
+    if max_fs <= 1620 {
+        31
+    } else if max_fs <= 8192 {
+        40
+    } else if max_fs <= 22080 {
+        50
+    } else if max_fs <= 36864 {
+        // 5.1 shares this MaxFS and differs only in MaxMBPS, which a picture
+        // this size exhausts at 27 fps — below anything the pipeline paces
+        // to, so the rung is a 5.2 rung.
+        52
+    } else if max_fs <= 139_264 {
+        // Past 5.2's MaxFS the ladder continues into 6.x however slowly the
+        // picture is encoded.
+        60
+    } else {
+        62
+    }
+}
+
 async fn request_surface_capture_with_timeout(
     command_tx: std::sync::mpsc::Sender<CompositorCommand>,
     surface_id: u16,
@@ -3076,7 +3155,9 @@ impl Session {
         // the difference invisibly, and compositor-resident sessions —
         // which compare target to native exactly — stay eligible instead
         // of falling to a server-side downscale over 2px.  Only when
-        // native is itself even, so the parity guarantee holds.
+        // native is itself even, so the parity guarantee holds — always
+        // true of a mediated native (`mediated_size_for_surface` rounds),
+        // so an odd native here means the app picked its own odd size.
         if native_w & 1 == 0
             && native_h & 1 == 0
             && w.abs_diff(native_w) <= 3
@@ -3186,7 +3267,21 @@ impl Session {
         } else {
             (pw, ph)
         };
-        Some((pw.max(1), ph.max(1), s as u16))
+        // Negotiate onto the 4:2:0 grid instead of configuring a size no
+        // encoder can carry.  An odd extent here became an odd native, the
+        // per-client target rounded it even, and the two could never agree
+        // again: compositor-resident sessions (eligibility is target ==
+        // native, exactly) fell to a permanent 1px server-side downscale,
+        // and every consumer downstream had to tolerate the off-by-one.
+        // H.264 4:2:0 cannot even express an odd display width — its crop
+        // units are two luma samples — so the only honest answer to an odd
+        // request is the even size below it: the surface stays within the
+        // pane (a 1px letterbox, never a crop), and the client learns the
+        // real size from SurfaceResized rather than receiving a stream
+        // that silently disagrees with what it asked for.
+        let pw = (pw & !1).max(2);
+        let ph = (ph & !1).max(2);
+        Some((pw, ph, s as u16))
     }
 
     /// Ask the compositor for a new surface size, subject to the settle
@@ -4639,9 +4734,6 @@ async fn tick(state: &AppState) -> TickOutcome {
     for sid in resized_surface_ids {
         let mut had_vulkan = false;
         for c in sess.clients.values_mut() {
-            if !c.surface_subscriptions.contains(&sid) {
-                continue;
-            }
             // A compositor-resident session is bound to the size it was
             // built at and nothing recreates it on demand: the delivery
             // path skips on `vulkan_await` while the compositor, whose
@@ -4650,7 +4742,16 @@ async fn tick(state: &AppState) -> TickOutcome {
             // Drop the tracking so the next tick re-selects at the new
             // native size.  Deliberately not `vulkan_refused`: nothing
             // was declined, and latching would bar the rebuild.
+            //
+            // For every client, not just the subscribed ones: the teardown
+            // below names no client id, so it destroys sessions a client
+            // that has since unsubscribed still holds an entry for, and
+            // that entry would route it to a session that no longer exists
+            // if it resubscribed.
             had_vulkan |= c.vulkan_video_surfaces.remove(&sid).is_some();
+            if !c.surface_subscriptions.contains(&sid) {
+                continue;
+            }
             let s = c.surface_subs.entry(sid).or_default();
             s.burst_remaining = SURFACE_BURST_FRAMES;
             s.next_send_at = None;
@@ -4658,7 +4759,14 @@ async fn tick(state: &AppState) -> TickOutcome {
             s.nal_none_latched_at = None;
             s.has_keyframe = false;
         }
-        if had_vulkan && let Some(cs) = sess.compositor.as_ref() {
+        if had_vulkan && let Some(cs) = sess.compositor.as_mut() {
+            // A bitstream the old session emitted after the resize event
+            // was drained outlives the session that made it.  Delivery
+            // reads it next tick, finds it stamped with the pre-resize
+            // size, and tears down the session selection has just built —
+            // a create/destroy cycle that repeats for as long as the entry
+            // is there.
+            last_encoded_remove_for_sid(&mut cs.last_encoded, sid);
             let _ = cs.handle.command_tx.send(
                 blit_compositor::CompositorCommand::DestroyVulkanEncoder {
                     surface_id: sid as u32,
@@ -5298,44 +5406,40 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // already carries this frame.  Don't advance
                 // last_encoded_gen: the next zero-copy publish supersedes
                 // this entry within a frame period.
-                if matches!(cached, Some((_, true))) {
-                    continue;
-                }
-                let cached = cached.map(|(p, _)| p);
+                //
+                // Except for a subscriber that has no picture at all — one
+                // that just joined, or one whose keyframe request is still
+                // outstanding.  There is no next publish for it to wait for:
+                // an idle app repaints on nothing, so a capture or thumbnail
+                // readback latches the entry until something unrelated makes
+                // the app paint.  Treat it as absent instead, so the
+                // recomposite request below asks the compositor for the
+                // zero-copy frame this subscriber is missing.
+                let cached = match cached {
+                    Some((_, true)) if !owes_keyframe => continue,
+                    Some((_, true)) => None,
+                    other => other.map(|(p, _)| p),
+                };
                 // CPU-origin pixels for a zero-copy session: the encoder
                 // would refuse them anyway — NVENC encodes GPU-converted
                 // frames or nothing — so don't burn an encode job.  The
                 // stream waits for the zero-copy frame the target
                 // registration's recomposite delivers.
                 //
-                // Only while that frame is actually coming: the refusal is
-                // conditioned on an encoder sized for the current target.
-                // After a resize the old NV12 target is stamped for a native
-                // that no longer exists and the compositor skips filling it,
-                // so BGRA is the only pixel source left — refusing it here,
-                // above the rebuild below, starved the very selection that
-                // would register a fresh target.  The subscriber then
-                // streamed nothing, silently, until a resubscribe happened
-                // to reset the flag.
-                if cached
-                    .as_ref()
-                    .is_some_and(|p| {
-                        matches!(
-                            p,
-                            blit_compositor::PixelData::Bgra(_)
-                                | blit_compositor::PixelData::Rgba(_)
-                        )
-                    })
-                    && sess
-                        .clients
-                        .get(&work.cid)
-                        .and_then(|c| c.surface_subs.get(&sid))
-                        .is_some_and(|s| {
-                            s.wants_nv12_opaque
-                                && s.encoder
-                                    .as_ref()
-                                    .is_some_and(|e| e.source_dimensions() == (enc_w, enc_h))
-                        })
+                // Only while that frame is actually coming.  An encoder
+                // sized for the current target is one half of that: after a
+                // resize the old NV12 target is stamped for a native that no
+                // longer exists and the compositor skips filling it, so BGRA
+                // is the only pixel source left — refusing it here, above the
+                // rebuild below, starved the very selection that would
+                // register a fresh target.  The target's negotiated shape is
+                // the other half, and `opaque_publish_pending` answers both.
+                if cached.as_ref().is_some_and(|p| {
+                    matches!(
+                        p,
+                        blit_compositor::PixelData::Bgra(_) | blit_compositor::PixelData::Rgba(_)
+                    )
+                }) && opaque_publish_pending(&sess.clients, work.cid, sid, (enc_w, enc_h))
                 {
                     continue;
                 }
@@ -5463,7 +5567,19 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // the wrong resolution and we'd have no way to scale
                     // it.  Other subscribers are unaffected either way:
                     // each owns its own session.
-                    let vulkan_eligible = (target_w, target_h) == (px_w, px_h);
+                    //
+                    // And the tier ranks below the dedicated encode engines
+                    // (see `SurfaceEncoderPreference::defaults`), which this
+                    // block is what enforces: selection here runs ahead of
+                    // the fallback chain, so without the check a listed
+                    // Vulkan encoder would win no matter where it sits.
+                    let vulkan_eligible = (target_w, target_h) == (px_w, px_h)
+                        && !surface_encoder::outranking_encoder_pending(
+                            &state.config.surface_encoders,
+                            codec_support,
+                            px_w,
+                            px_h,
+                        );
                     let refused_bits = client
                         .surface_subs
                         .get(&sid)
@@ -5501,32 +5617,17 @@ async fn tick(state: &AppState) -> TickOutcome {
                         let want_444 = state.config.chroma.is_444()
                             && pref.supports_444_by_client(codec_support);
 
-                        // H.264 carries 4:4:4 as High 4:4:4 Predictive, which
-                        // the compositor asks the driver for and which the
-                        // 4090 supports (the Raphael iGPU does not — its caps
-                        // query refuses, the session is declined, and the
-                        // fallback chain takes over).  AV1 through Vulkan is
-                        // still 4:2:0-only here, so for a client that asked
-                        // for 4:4:4 it steps aside — but only when a
-                        // server-side encoder would actually deliver 4:4:4.
-                        // When the chain downstream would answer with 4:2:0
-                        // anyway (NVENC AV1 on the RTX 4090 has no 4:4:4),
-                        // yielding buys the client no chroma and costs the
-                        // compositor-resident encode.
-                        if want_444
-                            && pref == SurfaceEncoderPreference::VulkanVideoAV1
-                            && surface_encoder::server_chain_would_serve_444(
-                                &state.config.surface_encoders,
-                                codec_support,
-                                px_w,
-                                px_h,
-                            )
-                        {
-                            continue;
-                        }
-                        // What this session will actually encode: av1-vulkan
-                        // stays 4:2:0 even when the client could take 4:4:4.
-                        let is_444 = want_444 && pref != SurfaceEncoderPreference::VulkanVideoAV1;
+                        // Each codec carries 4:4:4 as its own profile — High
+                        // 4:4:4 Predictive for H.264, High for AV1 — and the
+                        // compositor asks the driver for that profile
+                        // directly.  Whether it gets one is a per-device
+                        // answer nothing here can predict (the 4090 does
+                        // H.264 4:4:4, the Raphael iGPU does not, and AV1
+                        // High is rarer than either), so the request goes out
+                        // as asked: a caps query that refuses declines the
+                        // session, and this client falls through to the
+                        // encoders below with its 4:4:4 intact.
+                        let is_444 = want_444;
                         let qp = match pref {
                             SurfaceEncoderPreference::VulkanVideoAV1 => {
                                 encoding.bandwidth.av1_qp_for_vulkan()
@@ -5543,7 +5644,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 "h264-vulkan 4:4:4"
                             }
                             (SurfaceEncoderPreference::VulkanVideoH264, false) => "h264-vulkan",
-                            (SurfaceEncoderPreference::VulkanVideoAV1, _) => "av1-vulkan",
+                            (SurfaceEncoderPreference::VulkanVideoAV1, true) => "av1-vulkan 4:4:4",
+                            (SurfaceEncoderPreference::VulkanVideoAV1, false) => "av1-vulkan",
                             _ => "vulkan",
                         };
                         // Queue commands to send after the client loop.
@@ -5584,15 +5686,26 @@ async fn tick(state: &AppState) -> TickOutcome {
                             .vulkan_video_surfaces
                             .insert(sid, (enc_name, pref.codec_flag()));
                         let codec_str = match pref {
-                            // High 4:4:4 Predictive, else High 4:2:0.
                             SurfaceEncoderPreference::VulkanVideoH264 => {
-                                if is_444 { "avc1.F4001f" } else { "avc1.640034" }.to_string()
+                                // High 4:4:4 Predictive, else High 4:2:0,
+                                // at the level the session's SPS declares —
+                                // a fixed one either understates the picture
+                                // (which a level-gating decoder refuses at
+                                // `configure()`) or overstates it.
+                                let profile = if is_444 { 0xF4 } else { 0x64 };
+                                let level = h264_level_idc_for(px_w, px_h);
+                                format!("avc1.{profile:02X}00{level:02x}")
                             }
                             SurfaceEncoderPreference::VulkanVideoAV1 => {
-                                // 4:2:0 only on this path — `is_444` is
-                                // forced off for av1-vulkan above.
-                                let profile =
-                                    surface_encoder::av1_profile_digit(ChromaSubsampling::Cs420);
+                                // Profile 1 (High) at 4:4:4, 0 (Main) at
+                                // 4:2:0 — the same digit the compositor
+                                // writes into the sequence header.
+                                let chroma = if is_444 {
+                                    ChromaSubsampling::Cs444
+                                } else {
+                                    ChromaSubsampling::Cs420
+                                };
+                                let profile = surface_encoder::av1_profile_digit(chroma);
                                 let level = surface_encoder::av1_level_for(px_w, px_h);
                                 format!("av01.{profile}.{level}M.08")
                             }
@@ -13441,13 +13554,14 @@ mod tests {
         }
     }
 
-    /// A lone viewer must get back exactly the size it asked for. The
-    /// logical round trip does not give that: at 2× an odd physical extent
-    /// comes back one pixel *larger* (1001 → 501 → 1002), so the surface was
-    /// a pixel bigger than the pane, `per_client_encode_target` inscribed the
-    /// native aspect into the smaller viewport, and the leftover showed as a
-    /// letterbox bar. Tiled panes have fractional CSS widths, so odd physical
-    /// extents are the common case rather than the corner one.
+    /// A lone viewer must get back the size it asked for, rounded only onto
+    /// the even 4:2:0 grid — never grown. The logical round trip does not
+    /// give that: at 2× an odd physical extent comes back one pixel *larger*
+    /// (1001 → 501 → 1002), so the surface was a pixel bigger than the pane,
+    /// `per_client_encode_target` inscribed the native aspect into the
+    /// smaller viewport, and the leftover showed as a letterbox bar. Tiled
+    /// panes have fractional CSS widths, so odd physical extents are the
+    /// common case rather than the corner one.
     #[test]
     fn mediated_surface_size_is_exact_for_one_viewer() {
         for &(w, h) in &[(1001u16, 563u16), (1000, 562), (1003, 999), (777, 1155)] {
@@ -13459,8 +13573,8 @@ mod tests {
                 session.clients.insert(1, c);
                 assert_eq!(
                     session.mediated_size_for_surface(1, &[]),
-                    Some((w, h, scale.max(120))),
-                    "one viewer at {w}x{h} scale={scale} must get its own size back"
+                    Some((w & !1, h & !1, scale.max(120))),
+                    "one viewer at {w}x{h} scale={scale} must get its own size back on the even grid"
                 );
             }
         }
@@ -13476,7 +13590,10 @@ mod tests {
         let mut c1 = test_client();
         let mut c2 = test_client();
         // c1 is narrower in logical terms and sits at the highest scale, so
-        // its odd physical width must survive verbatim.
+        // its physical extent is taken directly — the logical round trip
+        // would come back one pixel *larger* (1001 → 501 → 1002), a crop.
+        // The even grid then rounds down: still within the pane, and a
+        // size the 4:2:0 encoders can carry exactly.
         c1.surface_subscriptions.insert(1);
         c1.surface_view_sizes.insert(1, (1001, 563, 240));
         c2.surface_subscriptions.insert(1);
@@ -13485,7 +13602,7 @@ mod tests {
         session.clients.insert(2, c2);
         assert_eq!(
             session.mediated_size_for_surface(1, &[]),
-            Some((1001, 563, 240))
+            Some((1000, 562, 240))
         );
     }
 
@@ -14082,6 +14199,34 @@ mod tests {
             session.mediated_size_for_surface(1, &[]),
             Some((640, 360, 120))
         );
+    }
+
+    /// A pane measuring an odd pixel extent must not become an odd surface:
+    /// no 4:2:0 encoder can carry it, so the target would round even and
+    /// never equal native again — Vulkan Video permanently ineligible, a
+    /// 1px downscale forever.  Mediation negotiates down to the even grid
+    /// and the client learns the real size from SurfaceResized.
+    #[test]
+    fn mediated_surface_size_rounds_odd_extents_to_even() {
+        let mut session = Session::new();
+        let mut c = test_client();
+        c.surface_view_sizes.insert(1, (1237, 843, 120));
+        c.surface_subscriptions.insert(1);
+        session.clients.insert(1, c);
+        assert_eq!(
+            session.mediated_size_for_surface(1, &[]),
+            Some((1236, 842, 120))
+        );
+    }
+
+    /// The even-rounded mediated size round-trips through the per-client
+    /// target unchanged: once the surface is configured at it, the view
+    /// that asked for the odd size gets exactly the native stream, and the
+    /// eligibility comparison (target == native) holds.
+    #[test]
+    fn odd_view_over_even_mediated_native_targets_native_exactly() {
+        let target = Session::per_client_encode_target(Some((1237, 843, 120)), 1236, 842, None);
+        assert_eq!(target, (1236, 842));
     }
 
     #[test]

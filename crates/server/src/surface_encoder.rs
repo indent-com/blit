@@ -71,8 +71,8 @@ impl SurfaceEncoderPreference {
         Ok(result)
     }
 
-    /// Sensible default: compositor-resident before server-side, hardware
-    /// before software.
+    /// Sensible default: dedicated encode engines first, then the
+    /// compositor-resident Vulkan Video tier, then software.
     ///
     /// Override at runtime with `BLIT_SURFACE_ENCODERS=h264-nvenc,h264-software`
     /// (comma-separated list).
@@ -84,23 +84,22 @@ impl SurfaceEncoderPreference {
             return list;
         }
         vec![
-            // Vulkan Video encodes on the compositor's own device with no
-            // server-side encode at all, so it leads.  It is skipped unless
-            // the surface is at native size, and a session that cannot be
-            // created — or that stops producing bitstreams — falls through
-            // to the entries below, so listing it first costs nothing when
-            // it does not apply.
+            // Vulkan Video is tried first: it encodes on the compositor's own
+            // device, so the frame never leaves the GPU it was composited on
+            // and there is no server-side encode in the path at all.  What it
+            // costs is reach — native size only, no speed control, no rate
+            // control beyond a fixed QP — and a session the driver declines
+            // after selection.  Every one of those is recoverable: the tier
+            // refuses per encoder, and the client falls through to the
+            // dedicated engines below with its request intact.
             //
-            // H.264 leads the Vulkan tier, against the AV1-first ordering
-            // used below it, because its 4:4:4 path can serve a
-            // 4:4:4-capable client at full chroma where `av1-vulkan` is
-            // 4:2:0-only.  For such clients `av1-vulkan` steps aside only
-            // when a server-side encoder would actually deliver 4:4:4 (see
-            // [`server_chain_would_serve_444`]); otherwise it takes the
-            // session at the same 4:2:0 the fallback chain would have
-            // produced, saving the server-side encode.
-            Self::VulkanVideoH264,
+            // AV1 leads the tier for its better compression.  Both entries
+            // encode either chroma — AV1 4:4:4 is High profile, H.264 4:4:4
+            // is High 4:4:4 Predictive — where the driver has the profile;
+            // where it does not, the caps query declines that session and
+            // the client falls through with its 4:4:4 intact.
             Self::VulkanVideoAV1,
+            Self::VulkanVideoH264,
             Self::NvencAV1,
             Self::NvencH264,
             Self::AV1Vaapi,
@@ -180,15 +179,16 @@ impl SurfaceEncoderPreference {
     pub fn supports_444_by_encoder(self) -> bool {
         match self {
             Self::H264Vaapi => false,
-            // Vulkan Video H.264 encodes High 4:4:4 Predictive from a
-            // two-plane `G8_B8R8_2PLANE_444_UNORM` source — but only where the
-            // driver advertises that profile, which is a runtime question this
-            // structural check cannot answer (the RTX 4090 says yes, the
-            // Raphael iGPU says no).  The compositor's capability query is the
-            // real gate; a refusal there falls through to a server-side
-            // encoder.  AV1 through Vulkan has no 4:4:4 path at all.
-            Self::VulkanVideoH264 => true,
-            Self::VulkanVideoAV1 => false,
+            // Both Vulkan Video encoders read a two-plane
+            // `G8_B8R8_2PLANE_444_UNORM` source at 4:4:4 — H.264 as High
+            // 4:4:4 Predictive, AV1 as High profile — but only where the
+            // driver advertises the profile, which is a runtime question
+            // this structural check cannot answer (the RTX 4090 says yes to
+            // H.264, the Raphael iGPU says no; AV1 High is rarer still).
+            // The compositor's capability query is the real gate; a refusal
+            // there declines the session and this client falls through to
+            // the encoders below, keeping its 4:4:4.
+            Self::VulkanVideoH264 | Self::VulkanVideoAV1 => true,
             Self::H264Software => cfg!(all(target_os = "linux", feature = "x264")),
             _ => true,
         }
@@ -264,71 +264,66 @@ impl SurfaceEncoderPreference {
     }
 }
 
-/// Predict whether the server-side fallback chain ([`SurfaceEncoder::new`])
-/// would serve this client 4:4:4, without creating an encoder.
+/// Whether an encoder ranked above the Vulkan Video tier could still serve
+/// this client at this size — that is, whether the tier has to wait.
 ///
-/// The Vulkan-tier selection uses this to decide whether `av1-vulkan`
-/// (4:2:0-only) should step aside for a 4:4:4-capable client: yielding is
-/// only worth it when the chain would actually deliver 4:4:4.  On a GPU
-/// whose NVENC cannot encode AV1 4:4:4 (the RTX 4090), the chain answers
-/// with `av1-nvenc` 4:2:0 — the same chroma `av1-vulkan` would have encoded
-/// on the compositor's device without any server-side encode.
+/// Vulkan Video is selected by the tick loop rather than by
+/// [`SurfaceEncoder::new`], so nothing about the walk down the preference
+/// list enforces its rank; this does.  Entries below the tier never hold it
+/// back, which is the point of ordering it above them.
 ///
-/// Mirrors the chain's walk: the first encoder that would be created wins,
-/// and each tries 4:4:4 before falling back to 4:2:0.  NVENC's answer is
-/// exact (a cached caps query).  VA-API availability is only knowable by
-/// probing a device, so a VA-API candidate that might serve 4:4:4 counts as
-/// serving it: overestimating keeps `av1-vulkan` stepping aside (the status
-/// quo), underestimating would trade away chroma the client asked for.
-pub fn server_chain_would_serve_444(
+/// On the default list nothing outranks the tier, so this answers `false` on
+/// its first step and Vulkan Video simply wins.  It earns its keep for a
+/// `BLIT_SURFACE_ENCODERS` that puts a dedicated engine first: without it a
+/// listed Vulkan encoder would win wherever it sat.
+///
+/// "Could still" is what the host has proven, not what it might do.  A
+/// family leaves the running two ways, both cached and both free to consult:
+/// NVENC answers exactly from its capability query, and anything that failed
+/// to build and reproduced the failure at probe size is
+/// [`known_unavailable`].  VA-API has no cheap probe of its own, so it stays
+/// a candidate until the fallback chain has tried it once — which the chain
+/// does on the first subscription this host serves.  So on a machine with no
+/// server-side hardware encoder the first surface spends one tick on a lower
+/// encoder, the attempt records the verdict, and the next tick hands the
+/// surface to the compositor for good.  Guessing instead would cost more:
+/// assume VA-API is present and Vulkan Video never runs on a host that
+/// hasn't got it; assume it is absent and Vulkan Video takes surfaces away
+/// from a VA-API device that works.
+pub fn outranking_encoder_pending(
     preferences: &[SurfaceEncoderPreference],
     codec_support: u8,
     width: u32,
     height: u32,
 ) -> bool {
     for &pref in preferences {
-        if pref.is_vulkan_video()
-            || !pref.supported_by_client(codec_support)
-            || !pref.fits(width, height)
-        {
+        if pref.is_vulkan_video() {
+            return false;
+        }
+        if !pref.supported_by_client(codec_support) || !pref.fits(width, height) {
             continue;
         }
-        let eligible_444 =
-            pref.supports_444_by_encoder() && pref.supports_444_by_client(codec_support);
-        match pref {
-            SurfaceEncoderPreference::NvencH264 | SurfaceEncoderPreference::NvencAV1 => {
-                let codec = if pref == SurfaceEncoderPreference::NvencAV1 {
-                    "av1"
-                } else {
-                    "h264"
-                };
-                // No NVENC on this box: the chain moves past it, so do we.
-                let Ok(caps) = crate::nvenc_encode::caps(codec, false) else {
-                    continue;
-                };
-                // A frame outside the engine's range refuses both chromas.
-                if caps.refuse(width, height).is_some() {
-                    continue;
-                }
-                return eligible_444 && caps.yuv444;
-            }
-            SurfaceEncoderPreference::H264Vaapi | SurfaceEncoderPreference::AV1Vaapi => {
-                // Whether a device exists — and, for AV1, whether it encodes
-                // 4:4:4 — is a probe.  A candidate that might serve 4:4:4
-                // counts as serving it; a 4:2:0-only candidate that might
-                // not exist at all cannot conclude the walk either way.
-                if eligible_444 {
-                    return true;
-                }
-            }
-            SurfaceEncoderPreference::H264Software | SurfaceEncoderPreference::AV1Software => {
-                // Software encoders always instantiate.
-                return eligible_444;
-            }
-            // Unreachable: filtered by `is_vulkan_video` above.
-            SurfaceEncoderPreference::VulkanVideoH264
-            | SurfaceEncoderPreference::VulkanVideoAV1 => {}
+        if known_unavailable(pref, ChromaSubsampling::Cs420) {
+            continue;
         }
+        if matches!(
+            pref,
+            SurfaceEncoderPreference::NvencH264 | SurfaceEncoderPreference::NvencAV1
+        ) {
+            let codec = if pref == SurfaceEncoderPreference::NvencAV1 {
+                "av1"
+            } else {
+                "h264"
+            };
+            // No NVENC on this box, or a frame outside the engine's range:
+            // the chain moves past it, so it holds nothing back.
+            match crate::nvenc_encode::caps(codec, false) {
+                Err(_) => continue,
+                Ok(caps) if caps.refuse(width, height).is_some() => continue,
+                Ok(_) => {}
+            }
+        }
+        return true;
     }
     false
 }
@@ -382,28 +377,17 @@ pub fn av1_profile_digit(chroma: ChromaSubsampling) -> u8 {
     if chroma.is_444() { 1 } else { 0 }
 }
 
-/// Compute the AV1 level index string (e.g. "05") for the given dimensions,
-/// assuming 60 fps.  Mirrors the client-side `av1LevelString()`.
-pub fn av1_level_for(width: u32, height: u32) -> &'static str {
-    let sps = width as u64 * height as u64 * 60;
-    // (level_string, max_w, max_h, max_sample_rate)
-    const SPECS: &[(&str, u32, u32, u64)] = &[
-        ("00", 2048, 1152, 5_529_600),
-        ("01", 2816, 1152, 10_454_400),
-        ("04", 4352, 2448, 24_969_600),
-        ("05", 5504, 3096, 39_938_400),
-        ("08", 6144, 3456, 77_856_768),
-        ("09", 6144, 3456, 155_713_536),
-        ("12", 8192, 4352, 273_715_200),
-        ("13", 8192, 4352, 547_430_400),
-        ("16", 16384, 8704, 1_176_502_272),
-    ];
-    for &(level, max_w, max_h, max_rate) in SPECS {
-        if width <= max_w && height <= max_h && sps <= max_rate {
-            return level;
-        }
-    }
-    "16"
+/// The AV1 level index string (e.g. "05") for the given dimensions.
+///
+/// Delegates to the compositor's Table A.3 lookup — the same one the
+/// Vulkan encoder writes into the sequence header — so the announced
+/// WebCodecs string can never disagree with the bitstream's declared
+/// level.  Mirrored by the client-side `av1LevelString()`.
+pub fn av1_level_for(width: u32, height: u32) -> String {
+    format!(
+        "{:02}",
+        blit_compositor::av1_level::av1_level_idx(width, height)
+    )
 }
 
 /// The two independent axes of video encoding: how many bits a surface may
@@ -1796,10 +1780,21 @@ impl SurfaceEncoder {
                 };
                 encoder.encode_yuv(yuv, self.width, self.height)
             }
-            SurfaceEncoderKind::NvencH264(_) | SurfaceEncoderKind::NvencAV1(_) => {
-                // GPU-converted frames only — see `encode`.
-                nvenc_refuse_cpu_pixels();
-                None
+            SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => {
+                // The zero-copy path is the only one worth having, but it is
+                // not always available: a co-subscriber that needs CPU pixels,
+                // or a 4:2:0/4:4:4 split at the same target, makes the
+                // compositor publish BGRA instead.  Refusing outright there
+                // left the stream with no frames at all and no way back — a
+                // permanently black pane.  Convert host-side and keep going;
+                // it costs CPU, on a path that only runs while zero-copy is
+                // unavailable.  The matrix is the same full-range BT.601 the
+                // GPU shader uses, so the picture does not shift range when
+                // the pipeline falls back.
+                nvenc_cpu_pixel_fallback();
+                let i420 = bgra_to_yuv420_padded(bgra, src_w, src_h, enc_w, enc_h);
+                let nv12 = i420_to_nv12(&i420, enc_w, enc_h);
+                enc.encode_nv12(&nv12, enc_w, enc_w, enc_h)
             }
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(enc) => enc.encode_bgra_padded(bgra, src_w, src_h),
@@ -2214,6 +2209,38 @@ fn rgba_to_yuv444(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
 /// BGRA -> I420 with edge-pixel padding to encoder dimensions.
 /// `src_w × src_h` is the actual pixel count in `bgra`.
 /// `enc_w × enc_h` is the encoder output dimensions (>= src).
+/// Interleave I420's separate U and V planes into NV12's single UV plane.
+/// `enc_w`/`enc_h` are the encoder's (padded) dimensions, so the result is
+/// tightly packed at pitch `enc_w` for both planes — what `encode_nv12`
+/// expects when the source has no extra stride.
+fn i420_to_nv12(i420: &[u8], enc_w: usize, enc_h: usize) -> Vec<u8> {
+    let y_size = enc_w * enc_h;
+    let uv_w = enc_w.div_ceil(2);
+    let uv_h = enc_h.div_ceil(2);
+    let uv_size = uv_w * uv_h;
+    let mut out = vec![0u8; y_size + uv_size * 2];
+    let take = y_size.min(i420.len());
+    out[..take].copy_from_slice(&i420[..take]);
+    let u = &i420[y_size.min(i420.len())..(y_size + uv_size).min(i420.len())];
+    let v = &i420[(y_size + uv_size).min(i420.len())..(y_size + uv_size * 2).min(i420.len())];
+    for i in 0..uv_size {
+        out[y_size + i * 2] = u.get(i).copied().unwrap_or(128);
+        out[y_size + i * 2 + 1] = v.get(i).copied().unwrap_or(128);
+    }
+    out
+}
+
+/// Rate-limit stamp for the NVENC CPU-pixel fallback below.
+fn nvenc_cpu_pixel_fallback() {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[surface-encoder] NVENC given CPU pixels (zero-copy unavailable at this target); \
+             converting host-side",
+        );
+    }
+}
+
 /// Rate-limit stamp for the NVENC CPU-pixel refusal below.
 fn nvenc_refuse_cpu_pixels() {
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2906,61 +2933,50 @@ mod tests {
         assert_eq!(SurfaceEncoderPreference::widest_for_list(&[]), None);
     }
 
-    /// The 4:4:4 prediction the Vulkan tier consults before `av1-vulkan`
-    /// steps aside.  Only the NVENC arms depend on host hardware (a cached
-    /// caps query), so these cases stick to the structurally-decided
-    /// backends.
+    /// The Vulkan tier ranks below the dedicated encode engines, and this
+    /// is what holds it there.  Only the structurally-decided backends are
+    /// used: the NVENC arm reads host capabilities.
     #[test]
-    fn server_chain_444_prediction_follows_the_walk() {
+    fn the_vulkan_tier_waits_for_the_encoders_above_it() {
         use SurfaceEncoderPreference as P;
-        let all =
-            CODEC_SUPPORT_H264 | CODEC_SUPPORT_AV1 | CODEC_SUPPORT_H264_444 | CODEC_SUPPORT_AV1_444;
-        let no_444 = CODEC_SUPPORT_H264 | CODEC_SUPPORT_AV1;
+        let h264 = CODEC_SUPPORT_H264;
+        let av1 = CODEC_SUPPORT_AV1;
+        let chain = [P::H264Vaapi, P::VulkanVideoH264, P::H264Software];
 
-        // Software AV1 always instantiates and encodes 4:4:4 — but only for
-        // a client that announced the AV1 4:4:4 bit.
-        assert!(server_chain_would_serve_444(
-            &[P::AV1Software],
-            all,
+        // Whether a VA-API device exists is a probe, so it stays a
+        // candidate until something has actually tried it.
+        assert!(outranking_encoder_pending(&chain, h264, 800, 600));
+
+        // A client that cannot decode what the encoder above emits is not
+        // being served by it, so it holds nothing back.
+        assert!(!outranking_encoder_pending(&chain, av1, 800, 600));
+
+        // Nor is a backend the frame is too large for: H.264 VA-API stops
+        // at 4K.
+        assert!(!outranking_encoder_pending(&chain, h264, 5120, 2880));
+
+        // Entries *below* the tier are the whole point of ranking it above
+        // them — software never makes it wait.
+        assert!(!outranking_encoder_pending(
+            &[P::VulkanVideoH264, P::H264Software],
+            h264,
             800,
             600
         ));
-        assert!(!server_chain_would_serve_444(
-            &[P::AV1Software],
-            no_444,
-            800,
-            600
-        ));
+        assert!(!outranking_encoder_pending(&[], h264, 800, 600));
 
-        // H.264 VA-API is structurally 4:2:0-only, and whether the device
-        // exists at all is a probe — it cannot conclude the walk, so an
-        // empty remainder answers "no 4:4:4".
-        assert!(!server_chain_would_serve_444(
-            &[P::H264Vaapi],
-            all,
-            800,
-            600
-        ));
-
-        // AV1 VA-API's 4:4:4 support is a probe: it counts as serving.
-        assert!(server_chain_would_serve_444(&[P::AV1Vaapi], all, 800, 600));
-
-        // Vulkan entries are the caller's own tier, not the server chain.
-        assert!(!server_chain_would_serve_444(
-            &[P::VulkanVideoH264, P::VulkanVideoAV1],
-            all,
-            800,
-            600
-        ));
-
-        // A frame past a backend's ceiling skips it: software AV1 stops at
-        // the H.264 ceiling, so a 5K frame falls through to nothing.
-        assert!(!server_chain_would_serve_444(
-            &[P::AV1Software],
-            all,
-            5120,
-            2880
-        ));
+        // And the one way a VA-API candidate leaves the running for good:
+        // the host has been asked and said no.  That is what lets the tier
+        // ever run on a machine without a VA-API device.  The write is
+        // process-wide and permanent, so it comes last and stays inside
+        // this test — the only other assertions about `H264Vaapi` expect
+        // "no 4:4:4", which a missing family answers the same way.
+        record_family(
+            P::H264Vaapi,
+            ChromaSubsampling::Cs420,
+            FamilyStatus::Missing("no device".into()),
+        );
+        assert!(!outranking_encoder_pending(&chain, h264, 800, 600));
     }
 
     #[test]

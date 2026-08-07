@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { BlitSurfaceCanvas } from "../BlitSurfaceCanvas";
+import {
+  BlitSurfaceCanvas,
+  demoteCodecSupport,
+  detectCodecSupport,
+  getCodecSupport,
+  restoreCodecSupport,
+} from "../BlitSurfaceCanvas";
 import type { BlitWorkspace } from "../BlitWorkspace";
 import type { SurfaceAxisEvent } from "../protocol";
 import { SURFACE_POINTER_DOWN, SURFACE_POINTER_UP } from "../protocol";
@@ -8,6 +14,8 @@ import {
   AXIS_SOURCE_CONTINUOUS,
   AXIS_SOURCE_FINGER,
   AXIS_SOURCE_WHEEL,
+  CODEC_SUPPORT_AV1,
+  CODEC_SUPPORT_AV1_444,
 } from "../types";
 
 /** Minimal workspace stub: no connection, so the canvas never subscribes
@@ -41,17 +49,17 @@ describe("BlitSurfaceCanvas layout", () => {
     surface.dispose();
   });
 
-  it("shows a frame smaller than the view at 1:1 device pixels, centered", () => {
+  it("fills the view with a smaller frame of the same shape", () => {
     const { surface, canvas } = attachCanvas();
     // Backing buffer is the attach() default 640×480 "frame"; the view is
-    // 1280×960 device pixels at scale 2 (scale120 = 240).  The frame must
-    // not be upscaled: 640 device px = 320 CSS px, centered.
+    // 1280×960 device pixels at scale 2 (scale120 = 240).  Same 4:3 shape,
+    // so it fills the pane — 1280 device px = 640 CSS px, no offset.
     surface.setDisplaySize(1280, 960, 240);
     expect(canvas.style.position).toBe("absolute");
-    expect(canvas.style.width).toBe("320px");
-    expect(canvas.style.height).toBe("240px");
-    expect(canvas.style.left).toBe("160px");
-    expect(canvas.style.top).toBe("120px");
+    expect(canvas.style.width).toBe("640px");
+    expect(canvas.style.height).toBe("480px");
+    expect(canvas.style.left).toBe("0px");
+    expect(canvas.style.top).toBe("0px");
     surface.dispose();
   });
 
@@ -67,7 +75,45 @@ describe("BlitSurfaceCanvas layout", () => {
     surface.dispose();
   });
 
-  it("scales down (never clips) a frame transiently larger than the view", () => {
+  it("reaches the edges of a pane the encoder had to round off", () => {
+    // Even-grid mediation: the pane asked for 1237×843 and the stream came
+    // back on the 4:2:0 grid at 1236×842.  A box derived from the stream
+    // leaves a pixel of background showing along two edges.
+    const { surface, canvas } = attachCanvas();
+    canvas.width = 1236;
+    canvas.height = 842;
+    surface.setDisplaySize(1237, 843, 120);
+    expect(canvas.style.width).toBe("1237px");
+    expect(canvas.style.height).toBe("843px");
+    expect(canvas.style.left).toBe("0px");
+    expect(canvas.style.top).toBe("0px");
+    surface.dispose();
+  });
+
+  it("does not move the picture when the stream size changes", () => {
+    // A flip between the native stream and a downscaled target used to
+    // resize and re-centre the box under the picture.
+    const { surface, canvas } = attachCanvas();
+    canvas.width = 1236;
+    canvas.height = 842;
+    surface.setDisplaySize(1237, 843, 120);
+    const before = {
+      width: canvas.style.width,
+      height: canvas.style.height,
+      left: canvas.style.left,
+      top: canvas.style.top,
+    };
+    canvas.width = 618;
+    canvas.height = 421;
+    (surface as unknown as { applyLayout(): void }).applyLayout();
+    expect(canvas.style.width).toBe(before.width);
+    expect(canvas.style.height).toBe(before.height);
+    expect(canvas.style.left).toBe(before.left);
+    expect(canvas.style.top).toBe(before.top);
+    surface.dispose();
+  });
+
+  it("letterboxes a frame of a genuinely different aspect ratio", () => {
     const { surface, canvas } = attachCanvas();
     canvas.width = 2000;
     canvas.height = 480;
@@ -76,7 +122,7 @@ describe("BlitSurfaceCanvas layout", () => {
     expect(canvas.style.width).toBe("640px");
     expect(canvas.style.height).toBe(`${307 / 2}px`);
     expect(canvas.style.left).toBe("0px");
-    expect(canvas.style.top).toBe(`${326 / 2}px`);
+    expect(canvas.style.top).toBe(`${327 / 2}px`);
     surface.dispose();
   });
 
@@ -88,6 +134,50 @@ describe("BlitSurfaceCanvas layout", () => {
     expect(canvas.style.width).toBe("100%");
     expect(canvas.style.height).toBe("100%");
     surface.dispose();
+  });
+});
+
+describe("codec support demotion", () => {
+  /** Enough of WebCodecs for the probe: every configuration is supported,
+   *  and no decoder ever emits a frame, so the 4:4:4 checks (which demand a
+   *  real decode) come back negative. */
+  class ProbeDecoder {
+    state = "unconfigured";
+    constructor(_init: unknown) {}
+    static async isConfigSupported() {
+      return { supported: true };
+    }
+    configure() {
+      this.state = "configured";
+    }
+    decode() {}
+    flush() {
+      return Promise.resolve();
+    }
+    close() {
+      this.state = "closed";
+    }
+  }
+
+  it("takes a codec off probation, but never one the probe never found", async () => {
+    vi.stubGlobal("VideoDecoder", ProbeDecoder);
+    vi.stubGlobal("EncodedVideoChunk", class {});
+    const probed = await detectCodecSupport();
+    expect(probed & CODEC_SUPPORT_AV1).toBeTruthy();
+    expect(probed & CODEC_SUPPORT_AV1_444).toBe(0);
+
+    const av1 = CODEC_SUPPORT_AV1 | CODEC_SUPPORT_AV1_444;
+    expect(demoteCodecSupport(av1)).toBe(probed & ~av1);
+    expect(getCodecSupport() & CODEC_SUPPORT_AV1).toBe(0);
+
+    // Probation ends and the browser is offered the codec again — this is
+    // what keeps a transient decode fault from downgrading the page for as
+    // long as it stays open.
+    expect(restoreCodecSupport(av1)).toBe(probed);
+    expect(restoreCodecSupport(av1)).toBeNull();
+    // 4:4:4 was never probed as working, so restoring cannot invent it.
+    expect(getCodecSupport() & CODEC_SUPPORT_AV1_444).toBe(0);
+    vi.unstubAllGlobals();
   });
 });
 

@@ -3,7 +3,15 @@ import {
   SURFACE_FRAME_FLAG_KEYFRAME,
   SURFACE_FRAME_CODEC_MASK,
   SURFACE_FRAME_CODEC_AV1,
+  CODEC_SUPPORT_H264,
+  CODEC_SUPPORT_AV1,
+  CODEC_SUPPORT_H264_444,
+  CODEC_SUPPORT_AV1_444,
 } from "./types";
+// Shared with the codec probe rather than duplicated: the probe answers
+// for what this browser accepts at a given level, and a decoder configured
+// here at a different one would be asking a question nobody answered.
+import { av1LevelString } from "./BlitSurfaceCanvas";
 
 /**
  * Every Blit encoder produces full-range BT.601 (sRGB primaries/transfer).
@@ -316,6 +324,11 @@ export class SurfaceStore {
   private cursorShapes = new Map<number, string>();
   private encoderNames = new Map<number, string>();
   private codecStrings = new Map<number, string>();
+  /** Most recent *AV1* codec string announced per surface.  The plain
+   *  announcement can be an avc1 one from a preference walk the server is
+   *  still working through, which says nothing about the AV1 frames in
+   *  flight; this remembers the last string that did. */
+  private av1CodecStrings = new Map<number, string>();
   private cursorListeners = new Set<
     (surfaceId: number, shape: string) => void
   >();
@@ -452,6 +465,160 @@ export class SurfaceStore {
   /** Install the keyframe-request callback (called once by BlitConnection). */
   setKeyframeSender(fn: (surfaceId: number) => void): void {
     this._keyframeSender = fn;
+  }
+
+  /** Keyframe requests made while a decoder sat unconfigured, per surface:
+   *  when the last one went out and how many this episode has cost. */
+  private _unconfiguredRetry = new Map<number, { at: number; count: number }>();
+
+  /** Spacing and budget for those requests.  Each is a SURFACE_SUBSCRIBE on
+   *  the wire that rebuilds the server's encoder, so this must never become
+   *  a per-frame ask; a handful, seconds apart, is enough for a stream whose
+   *  configuration is one announcement away, and a stream that stays
+   *  unconfigurable stops costing anything after that. */
+  private static readonly UNCONFIGURED_RETRY_MS = 2000;
+  private static readonly UNCONFIGURED_RETRY_MAX = 5;
+
+  /**
+   * Ask for a keyframe on behalf of a surface whose decoder is dropping
+   * every frame because it was never configured.
+   *
+   * Without this the drop is silent and terminal: the codec-string
+   * announcement that would configure the decoder only arrives when the
+   * server rebuilds the session, which a healthy encoder has no reason to
+   * do, so the pane stays black for as long as frames keep flowing.  The
+   * request re-subscribes, which does rebuild it.
+   */
+  private retryUnconfigured(surfaceId: number): void {
+    const now = performance.now();
+    const state = this._unconfiguredRetry.get(surfaceId);
+    if (state) {
+      if (
+        state.count >= SurfaceStore.UNCONFIGURED_RETRY_MAX ||
+        now - state.at < SurfaceStore.UNCONFIGURED_RETRY_MS
+      ) {
+        return;
+      }
+      state.at = now;
+      state.count++;
+    } else {
+      this._unconfiguredRetry.set(surfaceId, { at: now, count: 1 });
+    }
+    this._keyframeSender?.(surfaceId);
+  }
+
+  /**
+   * WebCodecs codec string to configure an AV1 decoder for `surfaceId`
+   * with.  The announced string is authoritative when it describes an AV1
+   * stream; otherwise the frames themselves are the better evidence —
+   * they say AV1, so a string derived from them beats leaving the decoder
+   * unconfigured and dropping them.
+   */
+  private av1CodecString(
+    surfaceId: number,
+    width: number,
+    height: number,
+  ): string {
+    const announced = this.codecStrings.get(surfaceId);
+    if (announced?.startsWith("av01")) return announced;
+    const remembered = this.av1CodecStrings.get(surfaceId);
+    if (remembered) return remembered;
+    // Profile 0 at 8 bits: a 4:4:4 stream is profile 1, but the decoder
+    // reads the real profile out of the sequence header, and this is the
+    // last resort before a black pane.
+    return `av01.0.${av1LevelString(width, height)}M.08`;
+  }
+
+  /** Configure `entry`'s AV1 decoder, reporting whether it took.  A failure
+   *  leaves the decoder closed — it cannot decode and cannot be retried. */
+  private configureAv1Decoder(
+    entry: DecoderEntry,
+    surfaceId: number,
+    width: number,
+    height: number,
+  ): boolean {
+    const cs = this.av1CodecString(surfaceId, width, height);
+    try {
+      entry.decoder.configure({
+        codec: cs,
+        optimizeForLatency: true,
+        colorSpace: FULL_RANGE_BT601,
+      });
+      entry.lastCodecString = cs;
+      return true;
+    } catch (e) {
+      console.warn(
+        "[blit] surface decoder configure failed:",
+        surfaceId,
+        "av1",
+        cs,
+        e,
+      );
+      safeClose(entry.decoder);
+      return false;
+    }
+  }
+
+  /**
+   * Callback to drop codec-support bits and renegotiate the encoder.
+   * Called after a stream fails to decode repeatedly: a fresh keyframe of
+   * the same stream will fail the same way, so re-requesting keyframes
+   * forever just loops on a black pane.
+   */
+  private _codecDemoter: ((surfaceId: number, bits: number) => void) | null =
+    null;
+
+  /** Consecutive decode failures per surface since the last decoded frame,
+   *  with the timestamp of the most recent one. */
+  private _decodeFailStreak = new Map<number, { count: number; at: number }>();
+
+  /** Decode-failure episodes tolerated before demoting codec support. */
+  static readonly DECODE_FAILURES_BEFORE_DEMOTION = 3;
+
+  /** How long a decode failure keeps counting towards the streak.
+   *
+   *  Demotion is for a stream this platform cannot decode at all, which
+   *  fails on every keyframe recovery in a row — seconds apart at most.
+   *  Without a window, one bad frame an hour still accumulates, so a page
+   *  left open all day eventually demotes a codec that works. */
+  static readonly DECODE_FAILURE_WINDOW_MS = 10_000;
+
+  /** Install the codec-demotion callback (called once by BlitConnection). */
+  setCodecDemoter(fn: (surfaceId: number, bits: number) => void): void {
+    this._codecDemoter = fn;
+  }
+
+  /**
+   * Record a decode failure; after
+   * {@link DECODE_FAILURES_BEFORE_DEMOTION} in a row (each already a
+   * keyframe-recovery attempt), stop asking for keyframes of a stream this
+   * platform's decoder rejects and demote the codec-support bits that
+   * selected it, so the server renegotiates to a different encoder.  The
+   * 4:4:4 flavor goes first when the announced string says that is what we
+   * are being sent; the base codec goes only if failures continue.
+   */
+  private noteDecodeFailure(surfaceId: number, codec: "h264" | "av1"): void {
+    const now = performance.now();
+    const prev = this._decodeFailStreak.get(surfaceId);
+    const within =
+      prev !== undefined &&
+      now - prev.at <= SurfaceStore.DECODE_FAILURE_WINDOW_MS;
+    const n = within ? prev.count + 1 : 1;
+    if (n < SurfaceStore.DECODE_FAILURES_BEFORE_DEMOTION) {
+      this._decodeFailStreak.set(surfaceId, { count: n, at: now });
+      return;
+    }
+    this._decodeFailStreak.delete(surfaceId);
+    const announced = this.codecStrings.get(surfaceId);
+    const bits =
+      codec === "av1"
+        ? announced?.startsWith("av01.1")
+          ? CODEC_SUPPORT_AV1_444
+          : CODEC_SUPPORT_AV1 | CODEC_SUPPORT_AV1_444
+        : announced?.startsWith("avc1.F4")
+          ? CODEC_SUPPORT_H264_444
+          : CODEC_SUPPORT_H264 | CODEC_SUPPORT_H264_444;
+    this._codecDemoter?.(surfaceId, bits);
   }
 
   private sendAck(surfaceId: number): void {
@@ -637,6 +804,9 @@ export class SurfaceStore {
     this.surfaces.delete(surfaceId);
     this.encoderNames.delete(surfaceId);
     this.codecStrings.delete(surfaceId);
+    this.av1CodecStrings.delete(surfaceId);
+    this._decodeFailStreak.delete(surfaceId);
+    this._unconfiguredRetry.delete(surfaceId);
     this._surfaceFrameSamples.delete(surfaceId);
     this._surfaceOutputSamples.delete(surfaceId);
     this._surfaceDrops.delete(surfaceId);
@@ -684,6 +854,12 @@ export class SurfaceStore {
     if (!entry) {
       // No decoder — ACK immediately so the server doesn't stall.
       this.sendAck(surfaceId);
+      // initDecoder could not configure one for the codec string it had.
+      // A re-subscribe rebuilds the session and re-announces that string,
+      // which is the only thing that can change the outcome.  Rate-limited
+      // and capped, so a decoder that can never be built costs a handful of
+      // requests rather than one per frame.
+      this.retryUnconfigured(surfaceId);
       return;
     }
 
@@ -695,6 +871,16 @@ export class SurfaceStore {
       );
       // Dropped frame — ACK immediately.
       this.sendAck(surfaceId);
+      // Deltas arriving while we wait mean the keyframe this flag was set
+      // for may never come on its own — the reconfigure path relies on the
+      // server's promise that a rebuilt session opens with one, and that
+      // opening frame can be lost.  Ask instead of dropping forever.  The
+      // latch keeps this to one request per episode; it clears when a
+      // keyframe lands.
+      if (!entry.keyframeRequested) {
+        entry.keyframeRequested = true;
+        this._keyframeSender?.(surfaceId);
+      }
       return;
     }
     entry.pendingKeyframe = false;
@@ -790,13 +976,27 @@ export class SurfaceStore {
         }
       }
 
+      // An AV1 decoder can only be here if its configure() was skipped or
+      // undone; the frame in hand names its codec, so configure from that
+      // rather than dropping it (see {@link av1CodecString}).
+      if (codec === "av1" && entry.decoder.state === "unconfigured") {
+        if (!this.configureAv1Decoder(entry, surfaceId, width, height)) {
+          this.decoders.delete(surfaceId);
+        }
+      }
+
       // Guard: don't decode if the decoder was never configured
       // (e.g., old server without VPS/SPS/PPS or HVCC prefix).
       if (entry.decoder.state !== "configured") {
         this._diag.dropped++;
         this.sendAck(surfaceId);
+        // Nothing else will configure this decoder on its own — ask for a
+        // keyframe, which re-subscribes and rebuilds the session (and with
+        // it the codec announcement).  Rate-limited and capped.
+        this.retryUnconfigured(surfaceId);
         return;
       }
+      this._unconfiguredRetry.delete(surfaceId);
 
       const chunk = new EncodedVideoChunk({
         type: isKey ? "key" : "delta",
@@ -820,6 +1020,11 @@ export class SurfaceStore {
         `${width}x${height}`,
         isKey ? "key" : "delta",
         `${data.length}B`,
+        "head=" +
+          Array.from(data.slice(0, 24))
+            .map((b) => b.toString(16).padStart(2, "0"))
+            .join(""),
+        "cs=" + this.codecStrings.get(surfaceId),
         e,
       );
       if (entry) entry.pendingKeyframe = true;
@@ -828,6 +1033,7 @@ export class SurfaceStore {
         surfaceId,
         (this._surfaceErrors.get(surfaceId) ?? 0) + 1,
       );
+      this.noteDecodeFailure(surfaceId, codec);
       // Error — ACK immediately so the server doesn't permanently stall.
       this.sendAck(surfaceId);
       // Ask the server for a keyframe so the decoder can recover.
@@ -880,6 +1086,63 @@ export class SurfaceStore {
     this.encoderNames.set(surfaceId, encoderName);
     if (codecString) {
       this.codecStrings.set(surfaceId, codecString);
+      if (codecString.startsWith("av01")) {
+        this.av1CodecStrings.set(surfaceId, codecString);
+      }
+      // A rebuilt session can change the stream's level mid-subscription —
+      // resizing a pane across an AV1 level boundary (~2254px wide at
+      // 2094 tall flips av01.0.09M ↔ av01.0.13M) re-announces the codec
+      // string, and a live decoder configured for the lower level rejects
+      // the higher-level stream that follows.  H.264 re-derives its config
+      // from in-band SPS; AV1 has no in-band trigger, so reconfigure here.
+      // The announcement always precedes the new session's opening
+      // keyframe, and pendingKeyframe drops any stale deltas in between.
+      const entry = this.decoders.get(surfaceId);
+      // Selection churn announces the whole preference walk — an avc1
+      // string can arrive while an AV1 decoder is live (and vice versa)
+      // before the codec actually switches.  Only apply a same-codec
+      // string to a live decoder; a real codec switch replaces the
+      // decoder when its first frame arrives (handleSurfaceFrame).
+      //
+      // The comparison is against what the decoder was actually configured
+      // with, not against the previously announced string: those differ
+      // whenever the decoder had to fall back to a derived string, and that
+      // is exactly the case this authoritative announcement fixes.
+      if (
+        codecString.startsWith("av01") &&
+        entry &&
+        entry.codec === "av1" &&
+        entry.lastCodecString !== codecString &&
+        (entry.decoder.state === "unconfigured" ||
+          entry.decoder.state === "configured")
+      ) {
+        // Flush first so in-flight frames drain through the output
+        // callback before the reset (same reasoning as the H.264
+        // reconfigure path).  An unconfigured decoder has nothing queued
+        // and flush() on it would reject with InvalidStateError.
+        if (entry.decoder.state === "configured") {
+          entry.decoder.flush().catch(() => {
+            /* flush rejected — decoder likely closed */
+          });
+        }
+        try {
+          entry.decoder.configure({
+            codec: codecString,
+            optimizeForLatency: true,
+            colorSpace: FULL_RANGE_BT601,
+          });
+          entry.lastCodecString = codecString;
+          entry.pendingKeyframe = true;
+          this._unconfiguredRetry.delete(surfaceId);
+        } catch (e) {
+          console.warn(
+            "[blit] surface decoder reconfigure failed:",
+            surfaceId,
+            codecString,
+            e,
+          );
+        }
+      }
     }
   }
 
@@ -947,6 +1210,9 @@ export class SurfaceStore {
     this.surfaces.clear();
     this.encoderNames.clear();
     this.codecStrings.clear();
+    this.av1CodecStrings.clear();
+    this._decodeFailStreak.clear();
+    this._unconfiguredRetry.clear();
     this._surfaceFrameSamples.clear();
     this._surfaceOutputSamples.clear();
     this._surfaceDrops.clear();
@@ -971,6 +1237,9 @@ export class SurfaceStore {
     this.surfaces.clear();
     this.encoderNames.clear();
     this.codecStrings.clear();
+    this.av1CodecStrings.clear();
+    this._decodeFailStreak.clear();
+    this._unconfiguredRetry.clear();
     this._surfaceFrameSamples.clear();
     this._surfaceOutputSamples.clear();
     this._surfaceDrops.clear();
@@ -1462,6 +1731,11 @@ export class SurfaceStore {
     const decoder = new VideoDecoder({
       output: (frame) => {
         this._diag.output++;
+        // A decoded frame ends any failure streak — demotion is for
+        // streams this platform cannot decode at all — and proves the
+        // decoder is configured, so the retry budget starts fresh.
+        this._decodeFailStreak.delete(surfaceId);
+        this._unconfiguredRetry.delete(surfaceId);
 
         // Per-surface output sample for debug panel rate computation.
         let outputs = this._surfaceOutputSamples.get(surfaceId);
@@ -1498,40 +1772,13 @@ export class SurfaceStore {
           safeClose(entry.decoder);
           this.decoders.delete(surfaceId);
         }
+        this.noteDecodeFailure(surfaceId, codec);
         // Ask the server for a keyframe so the next decoder gets a
         // clean reference point.
         this._keyframeSender?.(surfaceId);
       },
     });
-    // Defer configure() until the first keyframe provides the codec
-    // description (AVCC for H.264).  Configuring without a description
-    // then reconfiguring with one causes VideoToolbox on macOS to drop
-    // the first decoded frame.
-    // AV1 has no description — configure it eagerly using the server-
-    // provided WebCodecs codec string.
-    if (codec === "av1") {
-      const cs = this.codecStrings.get(surfaceId);
-      if (cs) {
-        try {
-          decoder.configure({
-            codec: cs,
-            optimizeForLatency: true,
-            colorSpace: FULL_RANGE_BT601,
-          });
-        } catch (e) {
-          console.warn(
-            "[blit] surface decoder configure failed:",
-            surfaceId,
-            codec,
-            cs,
-            e,
-          );
-          decoder.close();
-          return;
-        }
-      }
-    }
-    this.decoders.set(surfaceId, {
+    const entry: DecoderEntry = {
       decoder,
       codec,
       pendingKeyframe: true,
@@ -1540,7 +1787,22 @@ export class SurfaceStore {
       lastDescription: null,
       lastConfiguredWidth: 0,
       lastConfiguredHeight: 0,
-    });
+    };
+    this.decoders.set(surfaceId, entry);
+    // Defer configure() until the first keyframe provides the codec
+    // description (AVCC for H.264).  Configuring without a description
+    // then reconfiguring with one causes VideoToolbox on macOS to drop
+    // the first decoded frame.
+    // AV1 has no description — configure it eagerly, from the announced
+    // codec string when that describes AV1 and from the frames' own codec
+    // otherwise.  {@link av1CodecString} explains the difference; a
+    // decoder left unconfigured drops every frame it is handed.
+    if (
+      codec === "av1" &&
+      !this.configureAv1Decoder(entry, surfaceId, width, height)
+    ) {
+      this.decoders.delete(surfaceId);
+    }
   }
 
   private emitChange(): void {

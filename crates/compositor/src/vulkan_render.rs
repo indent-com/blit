@@ -42,7 +42,6 @@ pub(crate) struct VulkanRenderer {
     device: ash::Device,
     physical_device: vk::PhysicalDevice,
     queue: vk::Queue,
-    #[expect(dead_code)]
     queue_family: u32,
     command_pool: vk::CommandPool,
 
@@ -669,8 +668,33 @@ impl VulkanRenderer {
         } else {
             None
         };
+        // Advertising the extension is not the same as being able to import
+        // a SYNC_FD payload — a driver may support only OPAQUE_FD.  Ask
+        // before relying on it: without the query the first import simply
+        // fails at runtime, every explicit-sync commit falls back to
+        // parking, and the GPU-side acquire wait silently never runs.
         let external_semaphore_fd_fn = if has_external_semaphore_fd {
-            Some(ash::khr::external_semaphore_fd::Device::new(&instance, &device))
+            let info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+                .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+            let mut props = vk::ExternalSemaphoreProperties::default();
+            unsafe {
+                instance.get_physical_device_external_semaphore_properties(
+                    physical_device,
+                    &info,
+                    &mut props,
+                );
+            }
+            let importable = props
+                .external_semaphore_features
+                .contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE);
+            if !importable {
+                eprintln!(
+                    "[vulkan-render] driver cannot import SYNC_FD semaphores; explicit-sync commits will park on their acquire point instead of waiting on the GPU",
+                );
+                None
+            } else {
+                Some(ash::khr::external_semaphore_fd::Device::new(&instance, &device))
+            }
         } else {
             None
         };
@@ -1425,6 +1449,7 @@ impl VulkanRenderer {
                     w,
                     h,
                     qp,
+                    is_444,
                 )
             },
             0x02 => {
@@ -3223,13 +3248,14 @@ impl VulkanRenderer {
     /// An image carrying `VIDEO_ENCODE_SRC_KHR` must be created against the
     /// profile it will be read with, so this mirrors whichever session the
     /// caller is about to build: H.264 High or High 4:4:4 Predictive, or AV1
-    /// Main.  The AV1 profile comes from `vulkan_encode`, which hand-rolls it
-    /// because ash 0.38 (Vulkan 1.3.281) predates `VK_KHR_video_encode_av1`.
+    /// Main or High.  The AV1 profile comes from `vulkan_encode`, which
+    /// hand-rolls it because ash 0.38 (Vulkan 1.3.281) predates
+    /// `VK_KHR_video_encode_av1`.
     ///
-    /// `is_444` selects the two-plane 4:4:4 format drivers advertise for High
-    /// 4:4:4 Predictive.  Both layouts are two-plane, so they share the
-    /// descriptor layout and differ only in the chroma plane's resolution and
-    /// the shader that fills it.  AV1 here is 4:2:0 only.
+    /// `is_444` selects the two-plane 4:4:4 format, which both codecs read at
+    /// 4:4:4 — H.264 for High 4:4:4 Predictive, AV1 for High.  Both layouts
+    /// are two-plane, so they share the descriptor layout and differ only in
+    /// the chroma plane's resolution and the shader that fills it.
     fn create_nv12_encode_image(
         &self,
         w: u32,
@@ -3238,7 +3264,7 @@ impl VulkanRenderer {
         codec: u8,
     ) -> Option<Nv12Output> {
         let is_av1 = codec == 0x02;
-        let nv12_format = if is_444 && !is_av1 {
+        let nv12_format = if is_444 {
             vk::Format::G8_B8R8_2PLANE_444_UNORM
         } else {
             vk::Format::G8_B8R8_2PLANE_420_UNORM
@@ -3266,7 +3292,7 @@ impl VulkanRenderer {
             std_profile: 0,
         };
         let profiles = [if is_av1 {
-            crate::vulkan_encode::av1_encode_profile(&mut av1_leaf)
+            crate::vulkan_encode::av1_encode_profile(&mut av1_leaf, is_444)
         } else {
             vk::VideoProfileInfoKHR::default()
                 .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
@@ -3348,7 +3374,18 @@ impl VulkanRenderer {
 
         // The encode-side image: `VIDEO_ENCODE_SRC` (against the session's
         // profile) + `TRANSFER_DST` for the per-frame copy, nothing else.
-        let encode_image_info = vk::ImageCreateInfo::default()
+        //
+        // The copy runs on the graphics queue and the encode reads it on the
+        // video-encode queue.  When those are different families an
+        // EXCLUSIVE image needs an ownership transfer between them or its
+        // contents are formally undefined to the consumer; declaring both
+        // families up front buys the same guarantee without a release
+        // /acquire barrier pair on every frame.
+        let encode_families: Vec<u32> = match self.video_encode_queue_family {
+            Some(enc_qf) if enc_qf != self.queue_family => vec![self.queue_family, enc_qf],
+            _ => Vec::new(),
+        };
+        let mut encode_image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(nv12_format)
             .extent(vk::Extent3D {
@@ -3362,8 +3399,14 @@ impl VulkanRenderer {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR)
             .initial_layout(vk::ImageLayout::UNDEFINED)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .push_next(&mut profile_list);
+        if encode_families.is_empty() {
+            encode_image_info = encode_image_info.sharing_mode(vk::SharingMode::EXCLUSIVE);
+        } else {
+            encode_image_info = encode_image_info
+                .sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(&encode_families);
+        }
         let encode_image = match unsafe { self.device.create_image(&encode_image_info, None) } {
             Ok(i) => i,
             Err(e) => {
@@ -3825,7 +3868,13 @@ impl VulkanRenderer {
             // GENERAL: the storage writes need it, vkCmdCopyImage accepts
             // it, and the encode path takes GENERAL as a source layout.
             if let Some((enc_img, _)) = encode_image {
-                let planes = vk::ImageAspectFlags::PLANE_0 | vk::ImageAspectFlags::PLANE_1;
+                // Both images are bound to one allocation and neither is
+                // DISJOINT, so a barrier names the whole image with COLOR —
+                // per-plane aspects are legal only on a disjoint image
+                // (VUID-VkImageMemoryBarrier-image-01673).  The copy regions
+                // below are the opposite case: there the plane aspects are
+                // required.
+                let planes = vk::ImageAspectFlags::COLOR;
                 let range = |aspect| vk::ImageSubresourceRange {
                     aspect_mask: aspect,
                     base_mip_level: 0,
@@ -3867,10 +3916,17 @@ impl VulkanRenderer {
                 // Plane extents are in each plane's own texel grid: full
                 // size for Y (and both planes at 4:4:4), halved for the
                 // 4:2:0 chroma plane.
+                // Round up: an odd-width 4:2:0 image still has a chroma
+                // column for the last luma column, and truncating leaves it
+                // out of the copy.  The destination is discarded to
+                // UNDEFINED every frame, so what is missed is not stale
+                // pixels but undefined ones — a coloured fringe down the
+                // right edge.  Mediation keeps sizes even today; an app that
+                // picks its own buffer size does not have to.
                 let (cw, ch) = if nv12.is_444 {
                     (enc_w, enc_h)
                 } else {
-                    (enc_w / 2, enc_h / 2)
+                    (enc_w.div_ceil(2), enc_h.div_ceil(2))
                 };
                 let regions = [
                     vk::ImageCopy {
@@ -5113,7 +5169,17 @@ impl VulkanRenderer {
                 self.pending_acquire_semaphores.push(sem);
                 true
             }
-            Err(_) => {
+            Err(e) => {
+                // Every commit on this surface now parks instead of waiting
+                // on the GPU, which costs a frame of latency and shows up
+                // only as a surface that looks a little behind.  Say it once.
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[vulkan-render] SYNC_FD semaphore import failed ({e:?}); explicit-sync commits fall back to parking",
+                    );
+                }
                 unsafe {
                     self.device.destroy_semaphore(sem, None);
                     libc::close(raw);
@@ -5128,6 +5194,11 @@ impl VulkanRenderer {
     /// once its fence signals; `false` when nothing is in flight — every
     /// prior read has already been fence-waited, so the caller may
     /// release immediately.
+    ///
+    /// `deferred_submits` is only ever drained, never pushed to, so in
+    /// practice the second branch does not fire: `pending_submit` is the
+    /// one gate.  It stays because it is the correct answer if a submit is
+    /// ever parked there, and costs a single check.
     ///
     /// Implicit dma-buf fencing cannot be trusted to hold the client off
     /// the memory (NVIDIA's Vulkan driver ignores it); this is the
@@ -6411,6 +6482,13 @@ impl VulkanRenderer {
                 .queue_submit(self.queue, &[submit], tracking_fence)
             {
                 eprintln!("[render_tree_sized] queue_submit (tracking) failed: {e}");
+                // The submit never reached the queue, so the imported
+                // payloads are not pending on it and destroying is legal —
+                // but only for a submit that was *rejected*.  Waiting on the
+                // device first makes that true regardless of how far the
+                // driver got, since destroying a semaphore still in use is
+                // undefined.
+                let _ = self.device.device_wait_idle();
                 for sem in &acquire_waits {
                     self.device.destroy_semaphore(*sem, None);
                 }
@@ -6526,13 +6604,10 @@ impl VulkanRenderer {
                     // halved.  A pending forced keyframe bypasses the
                     // throttle: it is answering a recovery request, and
                     // delaying it extends the freeze it exists to end.
-                    if let Some((interval, last)) =
-                        self.vulkan_encoder_pacing.get_mut(&(sid, cid))
-                    {
-                        let now = std::time::Instant::now();
-                        let throttled = last.is_some_and(|l| {
-                            now.duration_since(l) < interval.mul_f32(0.7)
-                        });
+                    let now = std::time::Instant::now();
+                    if let Some((interval, last)) = self.vulkan_encoder_pacing.get(&(sid, cid)) {
+                        let throttled = last
+                            .is_some_and(|l| now.duration_since(l) < interval.mul_f32(0.7));
                         let force = self
                             .vulkan_encoders
                             .get(&(sid, cid))
@@ -6540,7 +6615,6 @@ impl VulkanRenderer {
                         if throttled && !force {
                             continue;
                         }
-                        *last = Some(now);
                     }
                     let encoder = self.vulkan_encoders.get_mut(&(sid, cid)).unwrap();
                     let codec_flag = encoder.codec_flag();
@@ -6565,6 +6639,21 @@ impl VulkanRenderer {
                             self.vulkan_encode_giveups.push((sid, cid));
                         }
                         continue;
+                    }
+                    // Only now is a frame actually being spent, so only now
+                    // does the slot advance — the skips above used to
+                    // consume one, delaying the next real frame by a whole
+                    // extra interval.  Advance by whole intervals rather
+                    // than restarting the clock at the encode: restarting
+                    // lets a source that is consistently 30% early keep that
+                    // lead every frame, sustaining 1/0.7 of the subscriber's
+                    // rate, which is precisely the overproduction the
+                    // throttle exists to prevent.  Falling behind resyncs,
+                    // so an idle gap banks no credit for a catch-up burst.
+                    if let Some((interval, last)) = self.vulkan_encoder_pacing.get_mut(&(sid, cid))
+                    {
+                        let next = last.map(|l| l + *interval).filter(|n| *n > now);
+                        *last = Some(next.unwrap_or(now));
                     }
                     let encoded = unsafe {
                         encoder.encode(

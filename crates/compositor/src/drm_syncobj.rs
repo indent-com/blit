@@ -14,6 +14,15 @@
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// The type `libc::ioctl` takes its request in: `c_ulong` against glibc,
+/// `c_int` against musl and bionic.  The DRM request codes fit in 32 bits
+/// either way, so the truncating cast is exact.
+#[cfg(any(target_env = "musl", target_os = "android"))]
+type IoctlRequest = libc::c_int;
+#[cfg(not(any(target_env = "musl", target_os = "android")))]
+type IoctlRequest = libc::c_ulong;
 
 const DRM_IOCTL_BASE: u64 = b'd' as u64;
 
@@ -114,7 +123,7 @@ impl DrmSyncobjDevice {
             capability: DRM_CAP_SYNCOBJ_TIMELINE,
             value: 0,
         };
-        let r = unsafe { libc::ioctl(fd.as_raw_fd(), DRM_IOCTL_GET_CAP, &mut cap) };
+        let r = unsafe { libc::ioctl(fd.as_raw_fd(), DRM_IOCTL_GET_CAP as IoctlRequest, &mut cap) };
         if r != 0 || cap.value == 0 {
             return None;
         }
@@ -122,15 +131,21 @@ impl DrmSyncobjDevice {
     }
 
     fn ioctl<T>(&self, nr: u64, arg: &mut T) -> std::io::Result<()> {
-        // DRM ioctls restart on EINTR/EAGAIN by convention.
+        // DRM ioctls restart on EINTR/EAGAIN by convention, but every call
+        // here is made from the compositor thread: a driver that keeps
+        // saying "again" would stop the whole session rather than fail one
+        // commit, so the restarts get a deadline and the last error is
+        // reported like any other.
+        const RESTART_BUDGET: Duration = Duration::from_millis(250);
+        let deadline = Instant::now() + RESTART_BUDGET;
         loop {
-            let r = unsafe { libc::ioctl(self.fd.as_raw_fd(), nr, arg as *mut T) };
+            let r = unsafe { libc::ioctl(self.fd.as_raw_fd(), nr as IoctlRequest, arg as *mut T) };
             if r == 0 {
                 return Ok(());
             }
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
-                Some(libc::EINTR) | Some(libc::EAGAIN) => continue,
+                Some(libc::EINTR) | Some(libc::EAGAIN) if Instant::now() < deadline => continue,
                 _ => return Err(err),
             }
         }

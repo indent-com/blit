@@ -1,3 +1,6 @@
+// Compiled everywhere: the server derives its announced codec strings from
+// this same table on every platform.
+pub mod av1_level;
 #[cfg(target_os = "linux")]
 mod drm_syncobj;
 #[cfg(target_os = "linux")]

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SurfaceStore } from "../SurfaceStore";
+import { CODEC_SUPPORT_AV1, CODEC_SUPPORT_AV1_444 } from "../types";
 
 /** Minimal stand-in for a decoded VideoFrame — only what the presenter
  *  touches (close + display dimensions). */
@@ -761,6 +762,9 @@ describe("SurfaceStore vs newest-wins control", () => {
   });
 });
 
+/** SURFACE_FRAME_FLAG_KEYFRAME | SURFACE_FRAME_CODEC_AV1. */
+const KEY_AV1 = (1 << 0) | (1 << 1);
+
 describe("SurfaceStore surface dimensions", () => {
   // Pointer coordinates are scaled by surface.width/height, which must be
   // the native composite size from SurfaceResized.  Frames arrive at the
@@ -769,18 +773,28 @@ describe("SurfaceStore surface dimensions", () => {
   // short of the cursor by stream/native.
 
   /** Decoder entry stub: enough to get handleSurfaceFrame past the entry
-   *  checks and into the dimension update; the unconfigured state makes
-   *  the decode path bail before touching WebCodecs APIs. */
+   *  checks and into the dimension update.  Already configured, so the
+   *  frame path neither reconfigures nor drops it. */
   function stubDecoder(store: SurfaceStore, sid: number): void {
     (store as any).decoders.set(sid, {
       codec: "av1",
-      decoder: { state: "unconfigured" },
+      decoder: { state: "configured", decode() {} },
       pendingKeyframe: false,
       keyframeRequested: false,
     });
   }
 
-  const KEY_AV1 = (1 << 0) | (1 << 1); // SURFACE_FRAME_FLAG_KEYFRAME | CODEC_AV1
+  beforeEach(() => {
+    vi.stubGlobal(
+      "EncodedVideoChunk",
+      class {
+        constructor(_init: unknown) {}
+      },
+    );
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
 
   it("keeps the native size when downscaled frames arrive", () => {
     const store = new SurfaceStore();
@@ -802,6 +816,150 @@ describe("SurfaceStore surface dimensions", () => {
     const surface = store.getSurfaces().get(1)!;
     expect(surface.width).toBe(960);
     expect(surface.height).toBe(540);
+    store.destroy();
+  });
+});
+
+describe("SurfaceStore decoder recovery", () => {
+  /** Stand-in for WebCodecs' VideoDecoder, with switches for the two ways
+   *  a real one refuses: configure() rejecting the codec string, and
+   *  decode() rejecting the bitstream. */
+  class FakeDecoder {
+    static instances: FakeDecoder[] = [];
+    static failConfigure = false;
+    static failDecode = false;
+    state = "unconfigured";
+    configured: string[] = [];
+    decoded = 0;
+    constructor(_init: unknown) {
+      FakeDecoder.instances.push(this);
+    }
+    configure(config: { codec: string }) {
+      if (FakeDecoder.failConfigure) {
+        throw new DOMException("unsupported codec", "NotSupportedError");
+      }
+      this.state = "configured";
+      this.configured.push(config.codec);
+    }
+    decode() {
+      if (FakeDecoder.failDecode) {
+        throw new DOMException("bad bitstream", "EncodingError");
+      }
+      this.decoded++;
+    }
+    flush() {
+      return Promise.resolve();
+    }
+    close() {
+      this.state = "closed";
+    }
+  }
+
+  let clock = 0;
+  const frame = new Uint8Array([0x12, 0x00]);
+
+  function newStore(): SurfaceStore {
+    const store = new SurfaceStore();
+    store.handleSurfaceCreated(1, 0, 1280, 720, "t", "a");
+    return store;
+  }
+
+  beforeEach(() => {
+    clock = 0;
+    FakeDecoder.instances = [];
+    FakeDecoder.failConfigure = false;
+    FakeDecoder.failDecode = false;
+    vi.spyOn(performance, "now").mockImplementation(() => clock);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.stubGlobal("VideoDecoder", FakeDecoder);
+    vi.stubGlobal(
+      "EncodedVideoChunk",
+      class {
+        constructor(_init: unknown) {}
+      },
+    );
+    Object.defineProperty(window, "isSecureContext", {
+      configurable: true,
+      value: true,
+    });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("configures AV1 from the frame when the announced string is not AV1", () => {
+    // Encoder-selection churn announces the whole preference walk, so the
+    // stored string can name H.264 while AV1 frames are already flowing.
+    // Waiting for a better announcement means waiting forever: a healthy
+    // session has no reason to send one.
+    const store = newStore();
+    store.handleSurfaceEncoder(1, "openh264\0avc1.42001e");
+    store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+    const decoder = FakeDecoder.instances[0];
+    expect(decoder.configured[0]).toMatch(/^av01\./);
+    expect(decoder.decoded).toBe(1);
+    store.destroy();
+  });
+
+  it("re-applies the announced AV1 string over a derived one", () => {
+    const store = newStore();
+    store.handleSurfaceEncoder(1, "openh264\0avc1.42001e");
+    store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+    store.handleSurfaceEncoder(1, "av1-vulkan\0av01.0.09M.08");
+    const decoder = FakeDecoder.instances[0];
+    expect(decoder.configured[1]).toBe("av01.0.09M.08");
+    store.destroy();
+  });
+
+  it("rate-limits and caps keyframe requests while no decoder configures", () => {
+    const store = newStore();
+    const requests: number[] = [];
+    store.setKeyframeSender((sid) => requests.push(sid));
+    FakeDecoder.failConfigure = true;
+
+    for (let i = 0; i < 20; i++) {
+      store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+    }
+    expect(requests).toHaveLength(1);
+
+    // One per interval, and no more than the episode's budget however long
+    // the stream keeps arriving.
+    for (let round = 0; round < 20; round++) {
+      clock += 2001;
+      for (let i = 0; i < 5; i++) {
+        store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+      }
+    }
+    expect(requests).toHaveLength(5);
+    store.destroy();
+  });
+
+  it("demotes a codec on a burst of decode failures", () => {
+    const store = newStore();
+    const demoted: number[] = [];
+    store.setCodecDemoter((_sid, bits) => demoted.push(bits));
+    FakeDecoder.failDecode = true;
+    for (let i = 0; i < 3; i++) {
+      clock += 100;
+      store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+    }
+    // Both AV1 flavors: the announced string never claimed 4:4:4, so the
+    // failure is not attributable to that one.
+    expect(demoted).toEqual([CODEC_SUPPORT_AV1 | CODEC_SUPPORT_AV1_444]);
+    store.destroy();
+  });
+
+  it("does not accumulate decode failures spread over minutes", () => {
+    const store = newStore();
+    const demoted: number[] = [];
+    store.setCodecDemoter((_sid, bits) => demoted.push(bits));
+    FakeDecoder.failDecode = true;
+    for (let i = 0; i < 10; i++) {
+      clock += SurfaceStore.DECODE_FAILURE_WINDOW_MS + 1;
+      store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+    }
+    expect(demoted).toEqual([]);
     store.destroy();
   });
 });
