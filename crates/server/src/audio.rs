@@ -44,7 +44,18 @@ const MAX_OPUS_PACKET: usize = 4000;
 pub const DEFAULT_BITRATE: i32 = 64_000;
 
 /// Server-side ring buffer depth: 200 ms = 10 Opus frames at 20 ms.
+/// Also sizes the encoder -> fan-out channel (at `RING_CAPACITY * 2`),
+/// which needs slack for a briefly-descheduled fan-out task — so keep
+/// this independent of how much of the ring we actually replay.
 const RING_CAPACITY: usize = 10;
+
+/// How many of the ring's newest frames a new subscriber is sent as
+/// catch-up.  Only enough to prime the client's jitter buffer past its
+/// floor (3 frames / 60 ms) and cover the gap until the first live
+/// frame; every frame beyond that is start-up latency the client then
+/// has to spend seconds draining at its ±2 % servo rate.  Replaying the
+/// full 200 ms ring put every fresh subscribe ~140 ms in the hole.
+const CATCHUP_FRAMES: usize = 4;
 
 /// Minimum interval between sub-process heal attempts.
 const HEAL_COOLDOWN: Duration = Duration::from_secs(1);
@@ -93,8 +104,8 @@ impl AudioBroadcast {
         })
     }
 
-    /// Register a client for future frames and push the current ring
-    /// (catch-up) onto its tx queue.
+    /// Register a client for future frames and push the newest
+    /// `CATCHUP_FRAMES` of the ring onto its tx queue.
     ///
     /// Ordering guarantee: the fan-out task cannot deliver a frame to
     /// this client before we finish snapshotting+enqueuing the catch-up
@@ -110,7 +121,8 @@ impl AudioBroadcast {
         // (so replayed as catch-up) or will arrive after we release the
         // lock and register (so delivered live) — never both, never
         // neither.
-        for frame in ring_guard.iter() {
+        let skip = ring_guard.len().saturating_sub(CATCHUP_FRAMES);
+        for frame in ring_guard.iter().skip(skip) {
             let _ = tx.send(msg_audio_frame(frame));
         }
         let mut subs = self.subscribers.lock().unwrap();
@@ -1084,6 +1096,60 @@ async fn encoder_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame(ts: u32) -> OpusFrame {
+        OpusFrame {
+            timestamp: ts,
+            data: vec![0u8; 8],
+        }
+    }
+
+    /// Read the timestamp back out of a serialized S2C_AUDIO_FRAME.
+    fn frame_ts(msg: &[u8]) -> u32 {
+        u32::from_le_bytes(msg[1..5].try_into().unwrap())
+    }
+
+    /// A new subscriber must be primed, but only just: replaying the whole
+    /// ring hands it a jitter buffer that starts already behind live, and
+    /// the client can only drain that at its ±2 % servo rate.
+    #[test]
+    fn catch_up_replays_only_the_newest_frames() {
+        let bc = AudioBroadcast::new();
+        {
+            let mut ring = bc.ring.lock().unwrap();
+            for ts in 0..RING_CAPACITY as u32 {
+                ring.push_back(frame(ts));
+            }
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        bc.subscribe(1, tx);
+
+        let mut got = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            got.push(frame_ts(&msg));
+        }
+
+        assert_eq!(got.len(), CATCHUP_FRAMES);
+        // The newest frames, in order — never the stalest.
+        let first = RING_CAPACITY as u32 - CATCHUP_FRAMES as u32;
+        assert_eq!(got, (first..RING_CAPACITY as u32).collect::<Vec<_>>());
+    }
+
+    /// A ring shorter than the catch-up window is replayed whole rather
+    /// than under-delivering.
+    #[test]
+    fn catch_up_handles_a_partially_filled_ring() {
+        let bc = AudioBroadcast::new();
+        bc.ring.lock().unwrap().push_back(frame(7));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        bc.subscribe(1, tx);
+
+        let msg = rx.try_recv().expect("the one ring frame");
+        assert_eq!(frame_ts(&msg), 7);
+        assert!(rx.try_recv().is_err());
+    }
 
     /// A pid with no `/proc` entry.  Scanning down from `pid_max` keeps us
     /// clear of the low numbers the kernel is about to hand out.

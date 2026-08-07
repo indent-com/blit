@@ -14,8 +14,8 @@
  *
  * Audio and video frames share a common server-side wall-clock timestamp
  * (milliseconds since compositor creation).  The worklet performs linear-
- * interpolation resampling at a variable rate (±5%) so audio can speed up
- * or slow down to track video.  Video is never delayed.
+ * interpolation resampling at a variable rate (±MAX_RATE_OFFSET) so audio
+ * can speed up or slow down to track video.  Video is never delayed.
  *
  * Playback uses an AudioWorkletNode with an inline processor registered
  * from a Blob URL — no external file needed.
@@ -26,26 +26,50 @@ const MAX_BUFFER_FRAMES = 25; // 500 ms
 
 /**
  * Adaptive jitter buffer: the worklet starts at MIN_BUFFER_SAMPLES, grows
- * by one 20 ms frame on the leading edge of each underrun event, and
- * shrinks back one frame at a time after DECAY_STABLE_SAMPLES of
- * underrun-free playback.  No hard upper bound — the worklet's skip
- * path reclaims excess latency if the buffer ever runs away.  Hysteresis
- * is provided by the MIN floor: once bufferTarget hits it, shrinking
- * stops.  Floor is three frames (60 ms) to absorb two back-to-back late
- * arrivals before the buffer empties; stable connections steady-state at
- * 60 ms while jittery ones self-size to whatever headroom they need.
+ * on the leading edge of each underrun event, and shrinks back one frame
+ * at a time after DECAY_STABLE_SAMPLES of underrun-free playback.
+ * Hysteresis is provided by the MIN floor: once bufferTarget hits it,
+ * shrinking stops.  Floor is three frames (60 ms) to absorb two
+ * back-to-back late arrivals before the buffer empties; stable
+ * connections steady-state at 60 ms while jittery ones self-size to
+ * whatever headroom they need, up to MAX_BUFFER_TARGET_SAMPLES.
  */
-const MIN_BUFFER_SAMPLES = 2880; // 3 frames = 60 ms at 48 kHz
+export const MIN_BUFFER_SAMPLES = 2880; // 3 frames = 60 ms at 48 kHz
+
+/**
+ * Hard ceiling on the adaptive jitter buffer.
+ *
+ * Growth is per-underrun and decay is per-several-seconds-of-calm, so
+ * without a ceiling the target ratchets: an underrun buys 100 ms of
+ * latency back in one event and gives it up over tens of seconds.  A
+ * client that underruns faster than it decays (Safari on iPadOS missing
+ * render-quantum deadlines, or a server driving several concurrent video
+ * streams) walks the target into the seconds, and the servo then *holds*
+ * it there — `drift` is measured against the target, so a large target
+ * is defended by slowing playback down to refill it.  That is the
+ * "audio falls further and further behind" failure.
+ *
+ * 400 ms is roughly 2x the worst transport head-of-line gap the bulk-write
+ * fragmenter can produce (see BULK_CHUNK_BYTES, server-side), so a genuinely
+ * bad link still gets the headroom it needs to play without gaps; beyond
+ * that, more buffer is not buying smoothness, only latency.
+ */
+export const MAX_BUFFER_TARGET_SAMPLES = 19200; // 400 ms at 48 kHz
 
 /**
  * Samples of uninterrupted, non-buffering playback required before
- * bufferTarget shrinks by one frame.  Set long enough that recurring
- * jitter (underrun every few seconds) never decays the buffer back
- * toward the floor between events — otherwise the buffer oscillates
- * and glitches on every cycle.  Shrinking is slow by design; growth
- * reacts within one event.
+ * bufferTarget shrinks by one frame.  Long enough that recurring jitter
+ * never decays the buffer back toward the floor *between* events —
+ * otherwise the buffer oscillates and glitches on every cycle — but
+ * short enough that a link which has actually recovered gets its latency
+ * back in tens of seconds rather than minutes.  At 5 s per 20 ms frame,
+ * one underrun's worth of growth (100 ms) unwinds in 25 s of calm, and
+ * any link underrunning more often than every 5 s still ratchets up to
+ * the ceiling and stays there — which is the correct answer for a link
+ * that bad.  Shrinking stays slow by design; growth reacts within one
+ * event.
  */
-const DECAY_STABLE_SAMPLES = 720000; // 15 s at 48 kHz
+const DECAY_STABLE_SAMPLES = 240000; // 5 s at 48 kHz
 
 // -- A/V sync constants ----------------------------------------------------
 
@@ -78,7 +102,7 @@ const DRIFT_FULL_CORRECTION_MS = 300;
 const MAX_RATE_OFFSET = 0.02; // ±2%
 
 /** Minimum number of audio frames received before we start sync adjustment. */
-const SYNC_WARMUP_FRAMES = 10;
+export const SYNC_WARMUP_FRAMES = 10;
 
 /**
  * Exponential smoothing factor for rate changes.  Each update blends
@@ -97,7 +121,7 @@ const RATE_SMOOTHING_ALPHA = 0.15;
 const UNDERRUN_REBUFFER_THRESHOLD = 3;
 
 /** Samples per 20 ms Opus frame at 48 kHz (per-channel). */
-const SAMPLES_PER_20_MS = 960;
+export const SAMPLES_PER_20_MS = 960;
 
 /**
  * How many 20 ms frames to grow bufferTarget by on each underrun event.
@@ -106,10 +130,39 @@ const SAMPLES_PER_20_MS = 960;
  * the video bulk-write time — typically 100–200 ms on keyframes.  Growing
  * by a single frame makes convergence take dozens of audible underruns;
  * 5 frames (100 ms per event) reaches a buffer depth that absorbs those
- * bursts within a handful of events.  Decay (15 s of clean playback per
- * frame shrunk) claws back any overshoot.
+ * bursts within a handful of events.  Decay (DECAY_STABLE_SAMPLES of
+ * clean playback per frame shrunk) claws back any overshoot, and
+ * MAX_BUFFER_TARGET_SAMPLES bounds how far it can run.
  */
-const GROW_FRAMES_PER_UNDERRUN = 5;
+export const GROW_FRAMES_PER_UNDERRUN = 5;
+
+/**
+ * Excess buffered depth, over the current target, that triggers a hard
+ * `skip` instead of waiting for the rate servo to drain it.
+ *
+ * The servo can only drain at MAX_RATE_OFFSET, so reclaiming a second of
+ * accumulated latency by rate alone takes about a minute — and latency
+ * arrives in bursts (a backlogged server queue flushing, a catch-up
+ * replay on resubscribe, the tab being unthrottled after a stall) far
+ * faster than that.  Above this threshold we drop samples outright:
+ * a single ~1.3 ms fade (see FADE_SAMPLES) beats staying seconds behind.
+ *
+ * Set well above the depth swings of normal servo operation so ordinary
+ * jitter never trips it — this is the pathological-accumulation path,
+ * not a second servo.
+ */
+export const SKIP_EXCESS_MS = 200;
+
+/**
+ * Minimum interval between `skip` messages.
+ *
+ * The worklet's buffered depth reaches us via ~100 ms position reports,
+ * so the report following a skip can still describe the pre-skip depth.
+ * Without a cooldown that stale reading triggers a second skip and we
+ * discard twice what we meant to.  One second is far longer than the
+ * port round-trip and still bounds a genuinely runaway buffer quickly.
+ */
+export const SKIP_COOLDOWN_MS = 1000;
 
 /**
  * Fade-envelope length in samples used to mask the waveform discontinuity at
@@ -136,7 +189,7 @@ const FADE_SAMPLES = 64;
  *   { type: "pos", value: number } — cumulative source samples consumed
  *                                     (reported every ~100 ms)
  */
-const WORKLET_SRC = /* js */ `
+export const WORKLET_SRC = /* js */ `
 class BlitAudioProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
@@ -146,7 +199,7 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
     this.rate = 1.0;        // playback rate (1.0 = normal)
     this.consumed = 0;      // total source samples from fully-consumed chunks
     this.lastReport = 0;    // consumed+offset at last report
-    this.buffered = 0;      // total samples currently buffered
+    this.buffered = 0;      // queued samples, counting the head chunk whole
     this.buffering = true;  // true while accumulating the jitter buffer
     this.bufferTarget = ${MIN_BUFFER_SAMPLES}; // adaptive: grows on underrun, shrinks on stability
     this.stableSamples = 0; // consumed samples of underrun-free playback (drives shrinking)
@@ -183,27 +236,46 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
             this.offset = 0;
             toSkip -= remaining;
           } else {
+            // Advancing the read head is all that is needed: depth() nets
+            // offset out of buffered, so decrementing buffered here too
+            // would drop twice what was asked for.
             this.offset += toSkip;
-            this.buffered -= toSkip;
             toSkip = 0;
           }
         }
         this.frac = 0;
+        // Jumping the read position is a waveform discontinuity just like
+        // an underrun boundary.  Drop the envelope so the existing fade
+        // ramps back up over FADE_SAMPLES and the splice stays inaudible.
+        this.fadeGain = 0;
         this.port.postMessage({
           type: "event",
           kind: "skip",
           requested,
           skipped: requested - toSkip,
+          buffered: this.depth(),
         });
       } else if (e.data && e.data.type === "rate") {
         this.rate = e.data.value;
       } else {
         this.buffer.push(e.data);
         this.buffered += e.data.length / 2; // half = per-channel sample count
-        // No hard buffer cap: the "skip" message path reclaims excess
-        // latency if something pathological accumulates.
+        // No cap enforced here: dropping on arrival would discard the
+        // newest audio and keep the stalest.  The main thread watches
+        // the buffered depth in the position reports and posts "skip"
+        // when it runs past SKIP_EXCESS_MS over target, which drops
+        // from the front instead.
       }
     };
+  }
+
+  // Playable samples still ahead of the read head.  \`buffered\` counts the
+  // head chunk in full regardless of how far into it we have played, so
+  // it overstates true depth by up to one chunk (20 ms).  Everything that
+  // makes a latency decision — the buffering gate here and every depth
+  // reported to the main thread — wants the exact figure.
+  depth() {
+    return this.buffered - this.offset;
   }
 
   process(_inputs, outputs) {
@@ -216,13 +288,13 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
 
     // Jitter buffer: don't start playing until we've accumulated enough
     // audio.  This absorbs network jitter and main-thread stalls.
-    if (this.buffering && this.buffered >= this.bufferTarget) {
+    if (this.buffering && this.depth() >= this.bufferTarget) {
       this.buffering = false;
       this.port.postMessage({
         type: "event",
         kind: "rebuffer_end",
         target: this.bufferTarget,
-        buffered: this.buffered,
+        buffered: this.depth(),
       });
     }
 
@@ -326,12 +398,15 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
       if (this.consumed > 0 && !this.buffering) {
         this.underruns++;
         if (this.underruns === 1) {
-          this.bufferTarget += ${SAMPLES_PER_20_MS * GROW_FRAMES_PER_UNDERRUN};
+          this.bufferTarget = Math.min(
+            this.bufferTarget + ${SAMPLES_PER_20_MS * GROW_FRAMES_PER_UNDERRUN},
+            ${MAX_BUFFER_TARGET_SAMPLES}
+          );
           this.port.postMessage({
             type: "event",
             kind: "grow",
             target: this.bufferTarget,
-            buffered: this.buffered,
+            buffered: this.depth(),
           });
         }
         if (this.underruns >= ${UNDERRUN_REBUFFER_THRESHOLD}) {
@@ -380,7 +455,7 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
         type: "pos",
         value: totalPos,
         target: this.bufferTarget,
-        buffered: this.buffered,
+        buffered: this.depth(),
       });
     }
 
@@ -575,6 +650,8 @@ export class AudioPlayer {
   private currentBufferTarget = MIN_BUFFER_SAMPLES;
   /** Last observed buffered depth (samples, from pos reports) — feeds the drift servo. */
   private lastBufferedSamples = 0;
+  /** Timestamp (ms) of the last `skip` posted to the worklet; gates SKIP_COOLDOWN_MS. */
+  private lastSkipAt = 0;
 
   // -- Stall detection / auto-recovery ------------------------------------
 
@@ -864,6 +941,8 @@ export class AudioPlayer {
     this.currentRate = 1.0;
     this.smoothedRate = 1.0;
     this.currentBufferTarget = MIN_BUFFER_SAMPLES;
+    this.lastBufferedSamples = 0;
+    this.lastSkipAt = 0;
     this.resetDecoderState();
   }
 
@@ -898,7 +977,8 @@ export class AudioPlayer {
    * Called when the worklet reports its consumed-sample position.
    * Runs the buffer-depth servo: compares actual buffered depth against
    * the adaptive target and nudges the worklet's playback rate within
-   * ±5 % to push the buffer back toward target.
+   * ±MAX_RATE_OFFSET to push the buffer back toward target.  Excess too
+   * large for the rate servo to absorb is dropped outright instead.
    */
   private onWorkletPosition(): void {
     const now = Date.now();
@@ -906,6 +986,24 @@ export class AudioPlayer {
 
     // Don't adjust during warmup — not enough samples to stabilise.
     if (this.framesReceived < SYNC_WARMUP_FRAMES) return;
+
+    // Latency backstop, ahead of the servo: the rate servo trims at
+    // MAX_RATE_OFFSET, so anything that arrives in a burst (a backlogged
+    // server queue flushing, a catch-up replay, an unthrottled tab)
+    // would otherwise take tens of seconds to drain and be audible as
+    // lag the whole time.  Drop straight back to target instead.
+    if (
+      this.lastBufferedSamples >
+        this.currentBufferTarget + SKIP_EXCESS_MS * 48 &&
+      now - this.lastSkipAt >= SKIP_COOLDOWN_MS
+    ) {
+      this.lastSkipAt = now;
+      const excess = this.lastBufferedSamples - this.currentBufferTarget;
+      // Assume the skip lands; the next report may still be pre-skip and
+      // must not be read as "still too deep" once the cooldown expires.
+      this.lastBufferedSamples = this.currentBufferTarget;
+      this.postToWorklet({ type: "skip", samples: excess });
+    }
 
     // Servo target: keep `buffered` at `bufferTarget`.
     //   buffered < target → drift > 0 → rate < 1 (slow down, refill)
@@ -1269,6 +1367,12 @@ export class AudioPlayer {
     } else if (d.type === "event") {
       if (typeof d.target === "number") {
         this.currentBufferTarget = d.target;
+      }
+      // The skip reply carries the post-skip depth — authoritative, and
+      // it arrives before the next position report.  Adopt it so the
+      // servo works from the real depth rather than our projection.
+      if (d.kind === "skip" && typeof d.buffered === "number") {
+        this.lastBufferedSamples = d.buffered;
       }
     }
   }

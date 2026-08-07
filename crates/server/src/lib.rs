@@ -359,6 +359,38 @@ async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> 
 /// in flight.
 const BULK_CHUNK_BYTES: usize = 4 * 1024;
 
+/// Most audio frames allowed to sit in one client's queue before the
+/// oldest get discarded.  25 frames is 500 ms at the 20 ms cadence.
+///
+/// The queue is unbounded because dropping audio is worse than buffering
+/// it — but only up to a point.  When a client's socket backs up (a slow
+/// link, or a server writing several video streams at once) the writer
+/// blocks and frames pile up here with nothing to bound them.  They are
+/// then delivered in a burst, and every one is stale on arrival: the
+/// client plays a queue that is permanently N frames behind live.  Past
+/// half a second of backlog the old frames have no value left, and
+/// discarding them also spares an already-congested link the bytes.
+const AUDIO_QUEUE_MAX_FRAMES: usize = 25;
+
+/// Discard the oldest queued audio frames beyond `AUDIO_QUEUE_MAX_FRAMES`,
+/// returning how many were dropped.  Cheap when the queue is short (one
+/// `len()`), which is the normal case.
+///
+/// Drops from the front deliberately: the client's jitter buffer wants
+/// the *newest* audio, and its own skip path reclaims what slips past.
+fn drop_stale_audio(audio_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> usize {
+    let queued = audio_rx.len();
+    if queued <= AUDIO_QUEUE_MAX_FRAMES {
+        return 0;
+    }
+    let excess = queued - AUDIO_QUEUE_MAX_FRAMES;
+    let mut dropped = 0;
+    while dropped < excess && audio_rx.try_recv().is_ok() {
+        dropped += 1;
+    }
+    dropped
+}
+
 /// Write a bulk message, draining pending audio frames between chunks.
 ///
 /// Payloads that fit within `BULK_CHUNK_BYTES` are written as a single
@@ -375,6 +407,7 @@ async fn write_frame_interleaved(
 ) -> bool {
     // Small message: drain any queued audio, then write as-is.
     if payload.len() <= BULK_CHUNK_BYTES {
+        drop_stale_audio(audio_rx);
         while let Ok(audio_msg) = audio_rx.try_recv() {
             if !write_frame(writer, &audio_msg).await {
                 return false;
@@ -389,6 +422,7 @@ async fn write_frame_interleaved(
     // receiver concatenates them and dispatches the reassembled buffer.
     let mut offset = 0;
     while offset < payload.len() {
+        drop_stale_audio(audio_rx);
         while let Ok(audio_msg) = audio_rx.try_recv() {
             if !write_frame(writer, &audio_msg).await {
                 return false;
@@ -10190,6 +10224,10 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         loop {
             // Drain all pending audio before waiting for the next message.
             // Audio frames are tiny (~160 B) so this is near-instant.
+            let stale = drop_stale_audio(&mut audio_rx);
+            if stale > 0 && audio_debug {
+                eprintln!("[audio] writer dropped {stale} stale queued frame(s)");
+            }
             while let Ok(audio_msg) = audio_rx.try_recv() {
                 if !write_frame(&mut writer, &audio_msg).await {
                     return;
@@ -12562,6 +12600,62 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+
+    /// The per-client audio queue is unbounded so a brief write stall never
+    /// costs audio.  Past half a second of backlog, though, every queued
+    /// frame is stale on arrival and the client would play permanently
+    /// behind live — so the oldest go.
+    mod audio_queue_bound {
+        use super::super::{AUDIO_QUEUE_MAX_FRAMES, drop_stale_audio};
+        use tokio::sync::mpsc;
+
+        type Queue = (
+            mpsc::UnboundedSender<Vec<u8>>,
+            mpsc::UnboundedReceiver<Vec<u8>>,
+        );
+
+        /// Queue `n` frames whose first byte is the frame index.
+        fn queued(n: usize) -> Queue {
+            let (tx, rx) = mpsc::unbounded_channel();
+            for i in 0..n {
+                tx.send(vec![i as u8]).unwrap();
+            }
+            (tx, rx)
+        }
+
+        #[test]
+        fn a_short_queue_is_left_alone() {
+            let (_tx, mut rx) = queued(AUDIO_QUEUE_MAX_FRAMES);
+            assert_eq!(drop_stale_audio(&mut rx), 0);
+            assert_eq!(rx.len(), AUDIO_QUEUE_MAX_FRAMES);
+        }
+
+        #[test]
+        fn an_empty_queue_is_left_alone() {
+            let (_tx, mut rx) = queued(0);
+            assert_eq!(drop_stale_audio(&mut rx), 0);
+        }
+
+        #[test]
+        fn a_backlog_is_trimmed_to_the_cap() {
+            let overshoot = 40;
+            let (_tx, mut rx) = queued(AUDIO_QUEUE_MAX_FRAMES + overshoot);
+            assert_eq!(drop_stale_audio(&mut rx), overshoot);
+            assert_eq!(rx.len(), AUDIO_QUEUE_MAX_FRAMES);
+        }
+
+        /// The survivors must be the *newest* frames — dropping from the
+        /// back would keep the client behind, which is the whole problem.
+        #[test]
+        fn the_newest_frames_survive() {
+            let overshoot = 5;
+            let (_tx, mut rx) = queued(AUDIO_QUEUE_MAX_FRAMES + overshoot);
+            drop_stale_audio(&mut rx);
+
+            let first = rx.try_recv().expect("a frame survived");
+            assert_eq!(first[0], overshoot as u8);
+        }
+    }
 
     /// Nothing between the browser and the app inspects the button code —
     /// the compositor forwards the `u32` to `wl_pointer` verbatim — so this
