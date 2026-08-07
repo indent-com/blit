@@ -2872,7 +2872,10 @@ export class BlitConnection {
     const entry = this.surfaceViewSizes.get(surfaceId);
     if (!entry || !entry.views.delete(viewId)) return;
     if (entry.views.size === 0) {
-      if (entry.lastSent !== null && this.sendSurfaceResize(surfaceId, 0, 0, 0)) {
+      if (
+        entry.lastSent !== null &&
+        this.sendSurfaceResize(surfaceId, 0, 0, 0)
+      ) {
         entry.lastSent = null;
       }
       // Keep the entry only while it still says something the map's
@@ -2885,9 +2888,7 @@ export class BlitConnection {
 
   private flushSurfaceViewSize(
     surfaceId: number,
-    entry: NonNullable<
-      ReturnType<BlitConnection["surfaceViewSizes"]["get"]>
-    >,
+    entry: NonNullable<ReturnType<BlitConnection["surfaceViewSizes"]["get"]>>,
   ): boolean {
     let effective: { width: number; height: number; scale120: number } | null =
       null;

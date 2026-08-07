@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use tokio::sync::{Notify, mpsc};
 
 use crate::{AppState, PTY_CHANNEL_CAPACITY, PtyInput};
@@ -350,7 +351,8 @@ pub fn poll_child_exited(handle: &PtyHandle) -> bool {
     false
 }
 
-/// Give up on a child's exit status without giving up on reaping it.
+/// Give up on a child's exit status without giving up on reaping it, and
+/// schedule the `SIGKILL` that finishes the job if the `SIGHUP` did not.
 ///
 /// `C2S_CLOSE` hangs a live child up and never reports what it exited with,
 /// so nothing will ever call `collect_exit_status` for it.  It still has to be
@@ -358,11 +360,49 @@ pub fn poll_child_exited(handle: &PtyHandle) -> bool {
 /// zombie for the life of the server.  Moving the pid here keeps
 /// `reap_zombies` sweeping it — discarding the status rather than parking it —
 /// until the wait succeeds and the registration goes away for good.
-pub fn abandon_pty_pid(handle: &PtyHandle) {
+///
+/// `kill_group_at` is when [`escalate_abandoned`] stops asking.  Reaping is
+/// what cancels it: a pid the kernel has taken back may already name somebody
+/// else's process group, and this is the one place that signals a group by
+/// number with no handle left to check it against.
+pub fn abandon_pty_pid(handle: &PtyHandle, kill_group_at: Instant) {
     let mut reaped = reaped_statuses().lock().unwrap();
     pty_pids().lock().unwrap().remove(&handle.child_pid);
     reaped.remove(&handle.child_pid);
-    abandoned_pids().lock().unwrap().insert(handle.child_pid);
+    abandoned_pids()
+        .lock()
+        .unwrap()
+        .insert(handle.child_pid, Some(kill_group_at));
+}
+
+/// `SIGKILL` the process groups whose hangup grace has run out.
+///
+/// The second half of the stop sequence `C2S_CLOSE` starts: `SIGHUP` to the
+/// group, wait `TimeoutStopSec`, then this.  A child that ignores `SIGHUP`, or
+/// one whose descendants redirected away from the terminal, gets no say in
+/// this one.
+pub fn escalate_abandoned(now: Instant) {
+    let mut pids = abandoned_pids().lock().unwrap();
+    for (&pid, kill_at) in pids.iter_mut() {
+        if kill_at.is_some_and(|at| now >= at) {
+            *kill_at = None;
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// When [`escalate_abandoned`] next has work, so the supervisor sleeps until
+/// exactly then instead of finding out on its backstop sweep.
+pub fn next_abandoned_kill() -> Option<Instant> {
+    abandoned_pids()
+        .lock()
+        .unwrap()
+        .values()
+        .flatten()
+        .min()
+        .copied()
 }
 
 /// Is reaping unowned children this process's job?
@@ -399,11 +439,12 @@ pub fn reap_zombies() {
     // Children hung up by `C2S_CLOSE`.  Nobody wants their status, but they
     // still have to be waited or they stay zombies — a server cycling
     // terminals would march to RLIMIT_NPROC.  Drop each registration only
-    // once the wait succeeds, so a child still winding down is retried.
-    abandoned_pids()
-        .lock()
-        .unwrap()
-        .retain(|&pid| unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } <= 0);
+    // once the wait succeeds, so a child still winding down is retried; that
+    // is also what disarms a pending group `SIGKILL`, since the pid stops
+    // being ours to signal the moment the kernel takes it back.
+    let mut abandoned = abandoned_pids().lock().unwrap();
+    abandoned
+        .retain(|&pid, _| unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } <= 0);
     if !adopts_orphans() {
         return;
     }
@@ -420,6 +461,11 @@ pub fn reap_zombies() {
         if owned.contains(&pid) {
             reaped.insert(pid, status_from_wstatus(wstatus));
         }
+        // This drain is indiscriminate, so it can collect an abandoned child
+        // out from under its own escalation.  Forget the pid with the status:
+        // signalling a group whose number the kernel has already recycled is
+        // worse than letting a survivor run.
+        abandoned.remove(&pid);
     }
 }
 
@@ -430,11 +476,13 @@ fn reaped_statuses() -> &'static Mutex<HashMap<libc::pid_t, i32>> {
     REAPED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Pids hung up by `C2S_CLOSE`, whose status nobody will collect but which
-/// still need waiting.  Emptied by `reap_zombies` as each one dies.
-fn abandoned_pids() -> &'static Mutex<std::collections::HashSet<libc::pid_t>> {
-    static PIDS: OnceLock<Mutex<std::collections::HashSet<libc::pid_t>>> = OnceLock::new();
-    PIDS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+/// Children hung up by `C2S_CLOSE`, each mapped to the instant its process
+/// group gets `SIGKILL` — `None` once that has gone out, or once the child was
+/// reaped before the grace elapsed.  Emptied by `reap_zombies` as each one
+/// dies.
+fn abandoned_pids() -> &'static Mutex<HashMap<libc::pid_t, Option<Instant>>> {
+    static PIDS: OnceLock<Mutex<HashMap<libc::pid_t, Option<Instant>>>> = OnceLock::new();
+    PIDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Live PTY child pids, so the backstop parks statuses only for
@@ -887,6 +935,7 @@ pub fn respawn_child(
 mod tests {
     use super::{PtyHandle, build_child_env, collect_exit_status, reap_zombies};
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
     /// Block until `pid` exits but leave it unreaped (`WNOWAIT`), so the reaper
     /// under test still finds a zombie to consume.
@@ -930,6 +979,14 @@ mod tests {
     /// `pause()`.  Returns (leader, grandchild).  Mirrors the shape that
     /// matters in practice: a shell with a running command under it.
     fn fork_leader_with_child() -> (libc::pid_t, libc::pid_t) {
+        fork_leader_with_child_ignoring(&[])
+    }
+
+    /// As [`fork_leader_with_child`], with `signals` set to `SIG_IGN` before
+    /// the inner fork so the grandchild inherits the disposition too — the
+    /// shape `trap "" HUP` leaves behind, and the reason a hangup needs
+    /// escalating.
+    fn fork_leader_with_child_ignoring(signals: &[libc::c_int]) -> (libc::pid_t, libc::pid_t) {
         let mut fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
         let leader = unsafe { libc::fork() };
@@ -938,6 +995,9 @@ mod tests {
             unsafe {
                 libc::close(fds[0]);
                 libc::setsid();
+                for &sig in signals {
+                    libc::signal(sig, libc::SIG_IGN);
+                }
                 let grandchild = libc::fork();
                 if grandchild == 0 {
                     loop {
@@ -958,6 +1018,22 @@ mod tests {
         assert_eq!(n, 4, "did not receive grandchild pid");
         unsafe { libc::close(fds[0]) };
         (leader, i32::from_le_bytes(buf))
+    }
+
+    /// SIGKILL a forked group when the test ends, pass or fail.
+    ///
+    /// A failed assertion leaves the paused children holding the harness's
+    /// captured stdout open, so without this a regression hangs the whole run
+    /// instead of failing one test.
+    struct KillGroupOnDrop(libc::pid_t);
+
+    impl Drop for KillGroupOnDrop {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-self.0, libc::SIGKILL);
+                libc::waitpid(self.0, std::ptr::null_mut(), 0);
+            }
+        }
     }
 
     fn is_alive(pid: libc::pid_t) -> bool {
@@ -1078,7 +1154,8 @@ mod tests {
         };
 
         // The close path: no status will ever be collected for this child.
-        super::abandon_pty_pid(&handle);
+        // The grace is far off, so this is the plain hangup-worked case.
+        super::abandon_pty_pid(&handle, Instant::now() + Duration::from_secs(3600));
         wait_until_zombie(pid);
         reap_zombies();
 
@@ -1086,6 +1163,74 @@ mod tests {
         // its pid here instead of -1.
         let ret = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
         assert_eq!(ret, -1, "child was left unreaped");
+
+        // And the pending escalation went with it: the pid is the kernel's to
+        // hand out again, so nothing may signal that group afterwards.
+        assert!(
+            !super::abandoned_pids().lock().unwrap().contains_key(&pid),
+            "reaping left an armed escalation on a released pid"
+        );
+    }
+
+    /// The half `C2S_CLOSE` was missing: SIGHUP is a request, and a child that
+    /// ignores it — with a grandchild that inherited the disposition — has to
+    /// be gone anyway once `TimeoutStopSec` elapses.
+    #[test]
+    fn hangup_escalates_to_a_group_sigkill() {
+        let (leader, grandchild) = fork_leader_with_child_ignoring(&[libc::SIGHUP]);
+        let _cleanup = KillGroupOnDrop(leader);
+        super::register_pty_pid(leader);
+        let handle = PtyHandle {
+            master_fd: -1,
+            child_pid: leader,
+        };
+
+        // What the close path does, with a grace that has already run out.
+        let due = Instant::now();
+        super::kill_pty(&handle, libc::SIGHUP, true);
+        super::abandon_pty_pid(&handle, due);
+        assert!(
+            is_alive(leader),
+            "a child ignoring SIGHUP should survive the hangup"
+        );
+        assert_eq!(
+            super::abandoned_pids().lock().unwrap().get(&leader),
+            Some(&Some(due)),
+            "the escalation was not armed"
+        );
+
+        super::escalate_abandoned(due);
+        // The grandchild inherited the ignored SIGHUP and is only reachable
+        // through the group, so its death is what says the escalation reached
+        // past the leader.  Asserting on the leader instead would race the
+        // reaper: any concurrent `reap_zombies` may collect it first.
+        wait_until_gone(grandchild);
+        reap_zombies();
+    }
+
+    /// The grace is a grace: nothing may die before it elapses.
+    #[test]
+    fn an_undue_escalation_does_not_fire() {
+        let (leader, grandchild) = fork_leader_with_child_ignoring(&[libc::SIGHUP]);
+        let _cleanup = KillGroupOnDrop(leader);
+        let handle = PtyHandle {
+            master_fd: -1,
+            child_pid: leader,
+        };
+
+        let due = Instant::now() + Duration::from_secs(3600);
+        super::abandon_pty_pid(&handle, due);
+        super::escalate_abandoned(Instant::now());
+        assert!(is_alive(leader), "killed before the grace elapsed");
+        assert_eq!(
+            super::abandoned_pids().lock().unwrap().get(&leader),
+            Some(&Some(due)),
+            "an undue escalation should stay armed"
+        );
+
+        super::escalate_abandoned(due);
+        wait_until_gone(grandchild);
+        reap_zombies();
     }
 
     fn child_env_map(env: Vec<std::ffi::CString>) -> HashMap<String, String> {

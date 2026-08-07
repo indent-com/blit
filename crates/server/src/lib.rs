@@ -3693,22 +3693,34 @@ impl Session {
             .is_some_and(|cs| !cs.pending_resize.is_empty())
     }
 
+    /// Encoded size of [`Self::pty_list_msg`], without building it.
+    fn pty_list_bytes(&self) -> usize {
+        LIST_HEADER_BYTES
+            + self
+                .ptys
+                .values()
+                .map(|pty| list_entry_bytes(&pty.tag, pty.command.as_deref()))
+                .sum::<usize>()
+    }
+
     fn pty_list_msg(&self) -> Vec<u8> {
-        let mut msg = vec![S2C_LIST];
+        let expected = self.pty_list_bytes();
+        let mut msg = Vec::with_capacity(expected);
+        msg.push(S2C_LIST);
         let count = self.ptys.len() as u16;
         msg.extend_from_slice(&count.to_le_bytes());
         let mut ids: Vec<u16> = self.ptys.keys().copied().collect();
         ids.sort();
         for id in ids {
             let pty = &self.ptys[&id];
-            let tag = pty.tag.as_bytes();
-            msg.extend_from_slice(&id.to_le_bytes());
-            msg.extend_from_slice(&(tag.len() as u16).to_le_bytes());
-            msg.extend_from_slice(tag);
-            let cmd = pty.command.as_deref().unwrap_or("").as_bytes();
-            msg.extend_from_slice(&(cmd.len() as u16).to_le_bytes());
-            msg.extend_from_slice(cmd);
+            push_list_entry(&mut msg, id, &pty.tag, pty.command.as_deref());
         }
+        debug_assert_eq!(
+            msg.len(),
+            expected,
+            "pty_list_bytes disagrees with the encoder, so every projected \
+             ceiling check is against the wrong number"
+        );
         msg
     }
 
@@ -4168,9 +4180,66 @@ fn oversize_list_field(tag: &str, command: Option<&str>) -> Option<&'static str>
     None
 }
 
-/// Diagnostic for a `STATUS_BUDGET` creation refusal.  `allocate_pty_id`
-/// returns `None` for two different exhaustions and the operator fix differs,
-/// so name which one was hit.
+/// Ceiling for a complete `S2C_LIST`.
+///
+/// Not the 16 MiB frame size: the server fragments anything over 4 KiB and a
+/// logical message may exceed a frame (docs/protocol.md, "Fragmentation").
+/// What does bind is reassembly, where every client already refuses to grow a
+/// pending message past [`blit_remote::MAX_DECOMPRESSED`] — `read_message` in
+/// blit-cli and `BlitConnection` in `@blit-sh/core` both abort the connection
+/// there, with no diagnostic at either end.  A catalog the server cannot
+/// describe under that is a catalog nobody can be told about.
+const MAX_LIST_BYTES: usize = blit_remote::MAX_DECOMPRESSED;
+
+/// `S2C_LIST`'s fixed head: the opcode and the `u16` entry count.
+const LIST_HEADER_BYTES: usize = 3;
+
+/// Encoded size of one `S2C_LIST` entry.  Paired with [`push_list_entry`],
+/// which must append exactly this many bytes.
+fn list_entry_bytes(tag: &str, command: Option<&str>) -> usize {
+    // [pty_id:2][tag_len:2][tag:N][cmd_len:2][cmd:M]
+    6 + tag.len() + command.map_or(0, str::len)
+}
+
+/// Append one `S2C_LIST` entry.  Callers must have refused an oversize field
+/// already; see [`oversize_list_field`] for what the casts do otherwise.
+fn push_list_entry(msg: &mut Vec<u8>, id: u16, tag: &str, command: Option<&str>) {
+    let tag = tag.as_bytes();
+    let cmd = command.unwrap_or("").as_bytes();
+    msg.extend_from_slice(&id.to_le_bytes());
+    msg.extend_from_slice(&(tag.len() as u16).to_le_bytes());
+    msg.extend_from_slice(tag);
+    msg.extend_from_slice(&(cmd.len() as u16).to_le_bytes());
+    msg.extend_from_slice(cmd);
+}
+
+/// Why one more terminal cannot join the catalog: `(status, detail)` for a
+/// `S2C_CREATE_FAILED`, or `None` when it fits.
+///
+/// #204 enforced the per-field half of docs/protocol.md's requirement; this is
+/// the aggregate.  `catalog_bytes` is passed in, and callers read it off `ptys`
+/// with `pty_list_bytes` rather than keeping a running total: a counter is a
+/// second record of the same fact and drifts the first time a removal path
+/// forgets it, and a catalog that reports itself smaller than it encodes is
+/// exactly the desynchronizing frame this exists to prevent.  Deriving costs
+/// one pass over a map that a `fork` + `exec` is about to follow, and leaves the
+/// policy pure enough to test without a real PTY.
+fn list_refusal(catalog_bytes: usize, tag: &str, command: Option<&str>) -> Option<(u8, String)> {
+    if let Some(what) = oversize_list_field(tag, command) {
+        return Some((STATUS_TOO_LARGE, format!("{what} exceeds 65535 bytes")));
+    }
+    let projected = catalog_bytes + list_entry_bytes(tag, command);
+    if projected > MAX_LIST_BYTES {
+        return Some((
+            STATUS_BUDGET,
+            format!(
+                "catalog would reach {projected} bytes, over the {MAX_LIST_BYTES}-byte S2C_LIST ceiling"
+            ),
+        ));
+    }
+    None
+}
+
 /// The timer state a `C2S_DEADLINE` puts a terminal into: `(deadline,
 /// stop_deadline, exit_reason)`.
 ///
@@ -4184,6 +4253,9 @@ fn armed_deadline(now: Instant, ms: u32) -> (Option<Instant>, Option<Instant>, u
     (deadline, None, blit_remote::EXIT_REASON_NORMAL)
 }
 
+/// Diagnostic for a `STATUS_BUDGET` creation refusal.  `allocate_pty_id`
+/// returns `None` for two different exhaustions and the operator fix differs,
+/// so name which one was hit.
 fn pty_budget_detail(live: usize, max_ptys: usize) -> String {
     if max_ptys > 0 && live >= max_ptys {
         format!("terminal cap reached ({max_ptys}); raise --max-ptys or close a terminal")
@@ -4210,10 +4282,15 @@ const SUPERVISOR_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 async fn supervisor_loop(state: AppState) {
     loop {
         // Wake at whichever comes first: something asked us to recompute, an
-        // armed deadline is due, or the backstop sweep comes round.
+        // armed deadline or a pending hangup escalation is due, or the backstop
+        // sweep comes round.
         let next = {
             let sess = state.session.lock().await;
             earliest_armed_deadline(&sess)
+        };
+        let next = match (next, pty::next_abandoned_kill()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         };
         let sweep = Instant::now() + SUPERVISOR_SWEEP_INTERVAL;
         let wake = next.map_or(sweep, |d| d.min(sweep));
@@ -4304,6 +4381,14 @@ async fn evict_exited(state: &AppState) {
 const SIGKILL: i32 = 9;
 const SIGTERM: i32 = 15;
 
+/// `TimeoutStopSec`: how long a first, polite signal has before the stop
+/// sequence escalates to SIGKILL.  One value for both sequences that have one
+/// — a deadline's SIGTERM and `C2S_CLOSE`'s SIGHUP — because it answers the
+/// same question either time.
+fn stop_grace() -> Duration {
+    Duration::from_millis(blit_remote::DEADLINE_STOP_GRACE_MS as u64)
+}
+
 /// Act on terminals whose deadline has come due.
 ///
 /// Expiry is a two-step stop: SIGTERM to the group, then SIGKILL once the
@@ -4323,8 +4408,7 @@ async fn enforce_deadlines(state: &AppState) {
         } else if pty.deadline.is_some_and(|d| now >= d) {
             pty.deadline = None;
             pty.exit_reason = blit_remote::EXIT_REASON_DEADLINE;
-            pty.stop_deadline =
-                Some(now + Duration::from_millis(blit_remote::DEADLINE_STOP_GRACE_MS as u64));
+            pty.stop_deadline = Some(now + stop_grace());
             pty::kill_pty(&pty.handle, SIGTERM, true);
         }
     }
@@ -4354,6 +4438,10 @@ async fn supervise(state: &AppState) {
     // scan the pty is `!exited` with its pid already freed.  Signalling first
     // would aim the stop sequence's `kill(-pid)` at a released process group.
     enforce_deadlines(state).await;
+    // Same ordering argument, for the sequence `C2S_CLOSE` starts: the pid is
+    // ours to signal only until `reap_zombies` waits it, so escalate first and
+    // let the sweep below collect whatever the SIGKILL just killed.
+    pty::escalate_abandoned(Instant::now());
     // The backstop still runs, now targeted at owned pids only, so a child
     // whose SIGCHLD we missed cannot linger as a zombie.
     pty::reap_zombies();
@@ -10344,6 +10432,19 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
     {
         let mut sess = state.session.lock().await;
+        // Preflight the catalog before this connection exists.  Every create
+        // path refuses a terminal that would push `S2C_LIST` past the ceiling,
+        // so this is unreachable — and load-bearing the day one of them stops:
+        // a client whose reassembler aborts on the catalog drops the connection
+        // with nothing said at either end, so refuse it here, where the reason
+        // can be logged.
+        let catalog_bytes = sess.pty_list_bytes();
+        if catalog_bytes > MAX_LIST_BYTES {
+            eprintln!(
+                "blit-server: refusing a connection, S2C_LIST is {catalog_bytes} bytes, over the {MAX_LIST_BYTES}-byte ceiling"
+            );
+            return;
+        }
         client_id = sess.next_client_id;
         sess.next_client_id += 1;
         sess.clients.insert(
@@ -11132,6 +11233,16 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             .collect::<Vec<_>>()
                     })
                     .filter(|args| !args.is_empty());
+                // The legacy create opcodes carry no failure reply, so the
+                // log is the only place a refusal can be said — as
+                // `allocate_pty_id` already does for the cap.  Refusing is
+                // still necessary: `command` has no length prefix and runs to
+                // the end of the frame, so #204's guard never covered it and an
+                // oversize one truncates into a catalog every client misparses.
+                if let Some((_, detail)) = list_refusal(sess.pty_list_bytes(), tag, command) {
+                    eprintln!("blit-server: refusing CREATE, {detail}");
+                    continue;
+                }
                 let Some(id) = sess.allocate_pty_id(config.max_ptys) else {
                     continue;
                 };
@@ -11226,6 +11337,16 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             .collect::<Vec<_>>()
                     })
                     .filter(|args| !args.is_empty());
+                // The legacy create opcodes carry no failure reply, so the
+                // log is the only place a refusal can be said — as
+                // `allocate_pty_id` already does for the cap.  Refusing is
+                // still necessary: `command` has no length prefix and runs to
+                // the end of the frame, so #204's guard never covered it and an
+                // oversize one truncates into a catalog every client misparses.
+                if let Some((_, detail)) = list_refusal(sess.pty_list_bytes(), tag, command) {
+                    eprintln!("blit-server: refusing CREATE, {detail}");
+                    continue;
+                }
                 let Some(id) = sess.allocate_pty_id(config.max_ptys) else {
                     continue;
                 };
@@ -11315,6 +11436,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 } else {
                     None
                 };
+                // No command to overflow here, but the aggregate still
+                // applies, and like the other legacy opcodes CREATE_AT has no
+                // failure reply to carry a refusal.
+                if let Some((_, detail)) = list_refusal(sess.pty_list_bytes(), tag, None) {
+                    eprintln!("blit-server: refusing CREATE, {detail}");
+                    continue;
+                }
                 let Some(id) = sess.allocate_pty_id(config.max_ptys) else {
                     continue;
                 };
@@ -11480,18 +11608,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     .filter(|p| p.contains('\0'))
                     .map(|p| p.split('\0').filter(|a| !a.is_empty()).collect::<Vec<_>>())
                     .filter(|a| !a.is_empty());
-                // A tag or command that cannot round-trip S2C_LIST's u16
-                // length fields would truncate into a corrupt catalog frame
-                // for every client, so refuse the mutation instead.
-                if let Some(what) = oversize_list_field(tag, command) {
-                    refuse_create(
-                        &sess,
-                        client_id,
-                        want_status,
-                        nonce,
-                        STATUS_TOO_LARGE,
-                        &format!("{what} exceeds 65535 bytes"),
-                    );
+                // A record that cannot round-trip S2C_LIST's u16 length
+                // fields, or a catalog that would outgrow what a client will
+                // reassemble, means a corrupt or undeliverable frame for
+                // everyone.  Refuse the mutation instead.
+                if let Some((status, detail)) = list_refusal(sess.pty_list_bytes(), tag, command) {
+                    refuse_create(&sess, client_id, want_status, nonce, status, &detail);
                     continue;
                 }
                 let Some(id) = sess.allocate_pty_id(config.max_ptys) else {
@@ -12495,8 +12617,18 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         // The SIGHUP only asks the child to die, and nobody
                         // will ever collect its status — but it still has to
                         // be waited or it stays a zombie for the life of the
-                        // server.  Hand it to the reaper to finish.
-                        pty::abandon_pty_pid(&pty.handle);
+                        // server.  Hand it to the reaper to finish, with the
+                        // deadline for the SIGKILL that stops asking.
+                        //
+                        // The escalation lives on the pid rather than on a
+                        // "closing" terminal because the slot is already gone
+                        // here: keeping one would make `CLOSED` mean "going"
+                        // instead of "gone", and would put an entry in `ptys`
+                        // that is neither live (`live_ptys` counts it against
+                        // `--max-ptys`) nor exited (`evict_exited` keys off
+                        // `exited_at` and would never see it).
+                        pty::abandon_pty_pid(&pty.handle, Instant::now() + stop_grace());
+                        state.supervisor_notify.notify_one();
                     }
                     for client in sess.clients.values_mut() {
                         unsubscribe_client_from(client, pid);
@@ -16371,42 +16503,85 @@ mod tests {
     }
 
     #[test]
-    fn pty_list_msg_includes_tags() {
-        let _sess = Session::new();
-        // Insert minimal Pty entries. We can't call spawn_pty, so build
-        // a mock-like Pty with a stub driver. Instead, directly insert
-        // into the HashMap using an unsafe-free approach: just build the
-        // wire message by hand and verify against a known layout.
-        //
-        // The wire format is: [S2C_LIST] [count:u16le] [id:u16le tag_len:u16le tag_bytes]...
-        //
-        // Since we can't easily construct a Pty without forking, verify
-        // the format by constructing the expected bytes and comparing.
-        let tag1 = "shell";
-        let tag2 = "build";
-
-        // Expected wire for ptys {1 => "shell", 3 => "build"} sorted by id:
-        let mut expected = vec![S2C_LIST];
-        expected.extend_from_slice(&2u16.to_le_bytes());
-        // id=1
-        expected.extend_from_slice(&1u16.to_le_bytes());
-        expected.extend_from_slice(&(tag1.len() as u16).to_le_bytes());
-        expected.extend_from_slice(tag1.as_bytes());
-        // id=3
-        expected.extend_from_slice(&3u16.to_le_bytes());
-        expected.extend_from_slice(&(tag2.len() as u16).to_le_bytes());
-        expected.extend_from_slice(tag2.as_bytes());
-
-        // Verify our expected format starts with S2C_LIST and has correct count
-        assert_eq!(expected[0], S2C_LIST);
-        assert_eq!(u16::from_le_bytes([expected[1], expected[2]]), 2);
-        // Verify tags are embedded
-        let msg_str = String::from_utf8_lossy(&expected);
-        assert!(msg_str.contains("shell"));
-        assert!(msg_str.contains("build"));
+    fn pty_list_bytes_matches_the_encoder_on_an_empty_session() {
+        let sess = Session::new();
+        assert_eq!(sess.pty_list_bytes(), sess.pty_list_msg().len());
     }
 
-    // ── can_send_preview / record_preview_send ──
+    /// The projection and the encoder have to agree exactly: a `pty_list_bytes`
+    /// that undercounts turns the aggregate ceiling into a check against the
+    /// wrong number, which is how an over-cap catalog would ship anyway.
+    /// `Session` cannot be populated without forking, so pin the pairing at the
+    /// per-entry level, where both sides live.
+    #[test]
+    fn list_entry_bytes_matches_push_list_entry() {
+        for (tag, command) in [
+            ("", None),
+            ("shell", None),
+            ("shell", Some("")),
+            ("build", Some("cargo test --workspace")),
+            ("héllo", Some("echo ✓")),
+        ] {
+            let mut msg = Vec::new();
+            push_list_entry(&mut msg, 7, tag, command);
+            assert_eq!(
+                msg.len(),
+                list_entry_bytes(tag, command),
+                "tag={tag:?} command={command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn push_list_entry_writes_the_documented_layout() {
+        let mut msg = Vec::new();
+        push_list_entry(&mut msg, 3, "shell", Some("htop"));
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&3u16.to_le_bytes());
+        expected.extend_from_slice(&5u16.to_le_bytes());
+        expected.extend_from_slice(b"shell");
+        expected.extend_from_slice(&4u16.to_le_bytes());
+        expected.extend_from_slice(b"htop");
+        assert_eq!(msg, expected);
+        // An absent command is an empty one on the wire, not a missing field:
+        // the trailing pair is what older clients length-gate on.
+        let mut none = Vec::new();
+        push_list_entry(&mut none, 3, "shell", None);
+        let mut some_empty = Vec::new();
+        push_list_entry(&mut some_empty, 3, "shell", Some(""));
+        assert_eq!(none, some_empty);
+    }
+
+    #[test]
+    fn list_refusal_passes_a_record_that_fits() {
+        assert_eq!(list_refusal(LIST_HEADER_BYTES, "shell", Some("htop")), None);
+    }
+
+    #[test]
+    fn list_refusal_names_an_unrepresentable_field() {
+        let big = "x".repeat(u16::MAX as usize + 1);
+        let (status, detail) = list_refusal(LIST_HEADER_BYTES, &big, None).unwrap();
+        assert_eq!(status, STATUS_TOO_LARGE);
+        assert!(detail.starts_with("tag "), "{detail}");
+        let (status, detail) = list_refusal(LIST_HEADER_BYTES, "shell", Some(&big)).unwrap();
+        assert_eq!(status, STATUS_TOO_LARGE);
+        assert!(detail.starts_with("command "), "{detail}");
+    }
+
+    /// The gap #204 left: each field fits its `u16` and the catalog still does
+    /// not fit what a client will reassemble.
+    #[test]
+    fn list_refusal_budgets_the_aggregate() {
+        let entry = list_entry_bytes("", None);
+        // Landing exactly on the ceiling is representable; one byte past is not.
+        assert_eq!(list_refusal(MAX_LIST_BYTES - entry, "", None), None);
+        let (status, detail) = list_refusal(MAX_LIST_BYTES - entry + 1, "", None).unwrap();
+        assert_eq!(status, STATUS_BUDGET);
+        assert!(
+            detail.contains(&(MAX_LIST_BYTES + 1).to_string()),
+            "{detail}"
+        );
+    }
 
     #[test]
     fn can_send_preview_true_when_due() {

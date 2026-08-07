@@ -151,7 +151,11 @@ describe("audio latency backstop", () => {
   it("stays quiet during warmup", () => {
     (player as unknown as { framesReceived: number }).framesReceived =
       SYNC_WARMUP_FRAMES - 1;
-    report(player, MIN_BUFFER_SAMPLES + 1000 * SAMPLES_PER_MS, MIN_BUFFER_SAMPLES);
+    report(
+      player,
+      MIN_BUFFER_SAMPLES + 1000 * SAMPLES_PER_MS,
+      MIN_BUFFER_SAMPLES,
+    );
     expect(skips(posted)).toHaveLength(0);
   });
 });

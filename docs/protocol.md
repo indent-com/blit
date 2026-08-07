@@ -222,8 +222,27 @@ exhaustion return `BUDGET`, an unrepresentable tag or command returns
 `TOO_LARGE`, malformed fields return `INVALID`, and spawn failure returns
 `OTHER`. A tag or command that cannot round-trip `S2C_LIST`'s `u16` length
 prefixes is refused rather than silently truncated into a corrupt catalog
-frame; bounding the _aggregate_ `LIST` size needs a logical-message ceiling
-that does not exist yet.
+frame.
+
+Both halves are enforced at creation, the only point where either can change: a
+terminal's `tag` and `command` are fixed once it exists, so the catalog's
+encoded size only ever grows by an entry that a create put there. A create whose
+own entry is representable but which would push the complete `S2C_LIST` past the
+ceiling is refused with `BUDGET`. The ceiling is 64 MiB, the same
+`MAX_DECOMPRESSED` every reassembling client already enforces — not the 16 MiB
+frame size, which fragmentation makes irrelevant to a logical message (see
+"Fragmentation"). The bound is what a client will accept, not what fits in one
+frame. Creation is also the only place a refusal can be delivered, so the older
+create opcodes, which have no failure reply, refuse to the server log instead of
+sending anything.
+
+The projection is computed from the live catalog on each create rather than
+carried as a running total, so it cannot drift from what the encoder emits; a
+count that disagreed with the bytes would be the corrupt frame the check exists
+to prevent. Connecting preflights the same number before building the initial
+burst: an over-cap catalog aborts the bootstrap with a server diagnostic, since
+sending one would make the client drop the connection with nothing logged at
+either end.
 
 The PTY cap is `--max-ptys` / `BLIT_MAX_PTYS`, unlimited by default. It counts
 _live_ terminals only — a client that runs a hundred short
@@ -270,6 +289,18 @@ not a signal. On Windows the job carries
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so dropping the handle takes any
 survivor with it; if the job cannot be created the PTY still runs and
 degrades to a leader-only kill.
+
+`CLOSE`'s hangup escalates the same way an expiry does: SIGHUP to the group,
+wait 5 s, then SIGKILL to the group, so a child that ignores SIGHUP — or whose
+descendants inherited that disposition — does not outlive its terminal. The
+escalation is invisible on the wire. `CLOSED` still arrives immediately and
+still means the slot is gone: the terminal leaves the catalog when the hangup
+goes out, and the rest is carried by the pid alone rather than by a retained
+"closing" entry, which would count against the PTY cap and never reach
+retention. A client learns nothing about, and waits for nothing in, the grace.
+Reaping beats escalating, not the other way round: once a child has been waited
+its pid may name an unrelated process group, so a hangup the child answered
+promptly cancels the pending SIGKILL instead of firing it late.
 
 This is opt-in rather than a reinterpretation of `CREATED_N`; a legacy client
 cannot mistake an error for PTY zero. `CREATE`, `CREATE_AT`, `CREATE_N`, and
@@ -458,7 +489,9 @@ the receiver concatenates chunks into one logical message and dispatches it
 normally. Fragments of different messages never interleave — one pending
 reassembly buffer suffices — and only `S2C_AUDIO_FRAME` may appear between
 fragments. The server chunks any payload over 4 KiB; logical messages may
-exceed the 16 MiB frame limit.
+exceed the 16 MiB frame limit. What they may not exceed is `MAX_DECOMPRESSED`
+(64 MiB): a receiver aborts a reassembly that grows past it, so that is the real
+ceiling on a logical message, and the one `S2C_LIST` is bounded against.
 
 ## Compressed payloads
 
