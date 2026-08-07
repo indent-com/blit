@@ -2874,6 +2874,108 @@ fn ignored_flag_bypasses_event_filter() {
     state.stop();
 }
 
+/// The status view has to notice a rule change wherever the rule lives.
+///
+/// An in-tree `.gitignore` rides the worktree watch, but git reads two
+/// ignore sources that are not in the tree, and neither raised an event
+/// (#256): the user's global ignore file, and `$GIT_DIR/info/exclude` for
+/// a repo whose gitdir is elsewhere (`--separate-git-dir`, a submodule) —
+/// there the worktree watch covers no `.git`, and the targeted gitdir
+/// watches did not include `info/`. Both left the Changes view showing
+/// files git had just started ignoring, with nothing to correct it until
+/// an unrelated worktree write happened by.
+///
+/// The probe extension is deliberately outlandish so a rule in the *test
+/// host's* own global ignore file cannot decide the outcome.
+#[test]
+fn out_of_tree_ignore_sources_reach_the_status_view() {
+    for source in ["global", "info-exclude"] {
+        let base = temp_dir();
+        let dir = base.join("work");
+        let gitdir = base.join("gitdir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let global = base.join("globalignore");
+        match source {
+            "global" => {
+                git(&dir, &["init", "-b", "main"]);
+                std::fs::write(&global, "# nothing yet\n").unwrap();
+                git(
+                    &dir,
+                    &["config", "core.excludesFile", global.to_str().unwrap()],
+                );
+            }
+            _ => git(
+                &dir,
+                &[
+                    "init",
+                    "-b",
+                    "main",
+                    "--separate-git-dir",
+                    gitdir.to_str().unwrap(),
+                ],
+            ),
+        }
+        std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-m", "seed"]);
+        std::fs::write(dir.join("noise.blitprobe"), "x\n").unwrap();
+
+        let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+        let (sent, out) = sink();
+        let opts = StateOptions {
+            status: true,
+            untracked: true,
+            refs_latency: Duration::from_millis(20),
+            status_latency: Duration::from_millis(30),
+            ..Default::default()
+        };
+        let state = handle.start_state(1, opts, out);
+        let mut mirror = GitStateMirror::new();
+        let mut applied = 0usize;
+        let mut wait_until =
+            |mirror: &mut GitStateMirror, label: &str, pred: &dyn Fn(&GitStateMirror) -> bool| {
+                let deadline = Instant::now() + Duration::from_secs(45);
+                loop {
+                    let next = sent.lock().unwrap().get(applied).cloned();
+                    if let Some(msg) = next {
+                        applied += 1;
+                        let id = mirror.apply_state(&msg).complete().expect("valid state");
+                        state.ack(id);
+                        if pred(mirror) {
+                            return;
+                        }
+                    } else {
+                        assert!(
+                            Instant::now() < deadline,
+                            "{source}/{label}: never satisfied; status={:?}",
+                            mirror.status
+                        );
+                        std::thread::sleep(Duration::from_millis(15));
+                    }
+                }
+            };
+        wait_until(&mut mirror, "untracked-appears", &|m| {
+            m.status
+                .iter()
+                .any(|s| s.path == "noise.blitprobe" && s.unstaged == b'?')
+        });
+
+        // The edit git would honor on its next status — and so must we, on
+        // this settle rather than on whatever touches the tree next.
+        match source {
+            "global" => std::fs::write(&global, "*.blitprobe\n").unwrap(),
+            _ => {
+                std::fs::create_dir_all(gitdir.join("info")).unwrap();
+                std::fs::write(gitdir.join("info").join("exclude"), "*.blitprobe\n").unwrap();
+            }
+        }
+        wait_until(&mut mirror, "rule-retires-it", &|m| {
+            !m.status.iter().any(|s| s.path == "noise.blitprobe")
+        });
+        state.stop();
+    }
+}
+
 /// `GIT_PATCH_TEXT` is git's patch format, not a subset of it — checked
 /// against the real `git diff` rather than against our own intent
 /// (docs/design/git.md "GIT_PATCH_TEXT output"). Covers add, delete,

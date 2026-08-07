@@ -1189,10 +1189,25 @@ Per opened repo, one engine (thread + inbox, the [fs-watch.md](fs-watch.md)
 engine shape) owns the `GIT_STATE` stream. It reuses `blit-fssync`'s
 backend hints: a watch on the gitdir (HEAD, `refs/`, `packed-refs`,
 `index`, `logs/refs/stash`, `config` (upstream mapping), `MERGE_HEAD`,
-`rebase-merge/`, `sequencer/`, and the linked worktree's private dir)
-drives ref/op/upstream/stash snapshots; with `STATUS`, a watch on the
+`rebase-merge/`, `sequencer/`, `info/`, and the linked worktree's private
+dir) drives ref/op/upstream/stash snapshots; with `STATUS`, a watch on the
 worktree drives status recomputation through gix's stat-cache-aware
-status. Ahead/behind counts memoize by `(tip, upstream)` oid pair,
+status.
+
+Every ignore source the status walk reads is watched, wherever it lives —
+what counts as untracked is decided by rules, and a rule change that
+raises no event leaves the view showing the old answer with nothing to
+correct it. In-tree `.gitignore` files ride the worktree watch;
+`$GIT_DIR/info/exclude` rides the gitdir watch (`info/` is armed for it,
+and is redundant only while the worktree watch already covers a `.git`
+inside the tree); and the user's global ignore file —
+`core.excludesFile`, defaulting to `$XDG_CONFIG_HOME/git/ignore` — is
+outside every root, so its *parent directory* is armed on its own (a watch
+on a file follows its inode past the rename-over an editor performs, the
+same reason [fs-watch.md](fs-watch.md) watches parents). That directory is
+armed for one file: its siblings are ignored rather than falling into the
+"unclassifiable, recompute anyway" case. A `config` change re-resolves the
+path and moves the watch with it. Ahead/behind counts memoize by `(tip, upstream)` oid pair,
 accelerated by commit-graph generation numbers, bounded by
 `BLIT_GIT_WALK_MAX` (over budget: `COUNTS_VALID` cleared, never a stall).
 Requests (`GIT_LOG`, `GIT_TREE`, `GIT_BLOB`, `GIT_DIFF`, `GIT_PATCH`,
