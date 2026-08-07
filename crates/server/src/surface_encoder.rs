@@ -1541,52 +1541,25 @@ impl SurfaceEncoder {
         result
     }
 
-    /// Encode from a DMA-BUF fd — tries zero-copy GPU import first,
-    /// falls back to CPU mmap readback if no GPU path is available.
+    /// Encode from a DMA-BUF fd via a CPU mmap readback.
     ///
-    /// Only the VA-API arm's import actually succeeds. The NVENC one always
-    /// fails and takes the fallback; see `NvencDirectEncoder::encode_dmabuf_fd`
-    /// for why. Since the fallback is silent, a working picture here says
-    /// nothing about whether the GPU import ran.
+    /// There is deliberately no NVENC arm here. NVENC's only zero-copy import
+    /// is `OPAQUE_FD` (`PixelData::Nv12OpaqueFd`), which carries YUV the
+    /// compositor already converted full-range. Handing it a `dma_buf` meant
+    /// handing it packed RGB, and NVENC's internal RGB→YUV is limited-range
+    /// with no knob — those frames would decode with lifted blacks against a
+    /// stream header that claims full swing. VA-API encode uses the
+    /// `Nv12DmaBuf` path instead (compute shader writes NV12 into
+    /// VA-API-exported surfaces, no PRIME import).
     #[cfg(target_os = "linux")]
     fn encode_dmabuf(
         &mut self,
         fd: &std::os::fd::OwnedFd,
         fourcc: u32,
-        modifier: u64,
+        _modifier: u64,
         stride: u32,
         offset: u32,
     ) -> Option<(Vec<u8>, bool)> {
-        use std::os::fd::AsRawFd;
-
-        // The encoder's source dimensions match the DMA-BUF dimensions
-        // (both come from last_pixels).
-        let src_w = self.source_width;
-        let src_h = self.source_height;
-
-        // --- Zero-copy GPU path (NVENC CUDA import) ---
-        // VA-API encode uses the Nv12DmaBuf path instead (compute shader
-        // writes NV12 into VA-API-exported surfaces, no PRIME import).
-        let mut gpu_result = match &mut self.kind {
-            SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => enc
-                .encode_dmabuf_fd(
-                    fd.as_raw_fd(),
-                    fourcc,
-                    modifier,
-                    stride,
-                    offset,
-                    src_w,
-                    src_h,
-                ),
-            _ => None,
-        };
-        if gpu_result.is_some() {
-            self.fixup_keyframe(&mut gpu_result);
-            return gpu_result;
-        }
-
-        // --- CPU readback fallback ---
-        // Only reached if zero-copy failed (VPP unavailable, or non-VA-API encoder).
         // The GBM BO is created with GBM_BO_USE_LINEAR so mmap reads
         // pixels in the correct linear layout.
         self.encode_dmabuf_cpu_fallback(fd, fourcc, stride, offset)
