@@ -693,7 +693,9 @@ impl VulkanRenderer {
                 );
                 None
             } else {
-                Some(ash::khr::external_semaphore_fd::Device::new(&instance, &device))
+                Some(ash::khr::external_semaphore_fd::Device::new(
+                    &instance, &device,
+                ))
             }
         } else {
             None
@@ -5250,7 +5252,10 @@ impl VulkanRenderer {
     #[allow(clippy::type_complexity)]
     pub fn try_retire_pending(
         &mut self,
-    ) -> (Option<(u16, u32, u32)>, Vec<(u16, u32, u32, PixelData, bool)>) {
+    ) -> (
+        Option<(u16, u32, u32)>,
+        Vec<(u16, u32, u32, PixelData, bool)>,
+    ) {
         // The compositor calls this every iteration of its event loop
         // (once per Wayland event). We deliberately do NOT drain
         // deferred external submits here: that happens at submit time
@@ -6606,8 +6611,8 @@ impl VulkanRenderer {
                     // delaying it extends the freeze it exists to end.
                     let now = std::time::Instant::now();
                     if let Some((interval, last)) = self.vulkan_encoder_pacing.get(&(sid, cid)) {
-                        let throttled = last
-                            .is_some_and(|l| now.duration_since(l) < interval.mul_f32(0.7));
+                        let throttled =
+                            last.is_some_and(|l| now.duration_since(l) < interval.mul_f32(0.7));
                         let force = self
                             .vulkan_encoders
                             .get(&(sid, cid))

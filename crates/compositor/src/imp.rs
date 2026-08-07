@@ -2657,8 +2657,8 @@ impl Compositor {
         // client's previous frame, on the frame it navigates.  Only an
         // absent acquire, or SHM (copied on commit, so a GPU fence means
         // nothing), makes the commit genuinely unfenced.
-        let unfenced =
-            syncobj_surface.is_some() && (acquire.is_none() || buf.data::<ShmBufferData>().is_some());
+        let unfenced = syncobj_surface.is_some()
+            && (acquire.is_none() || buf.data::<ShmBufferData>().is_some());
         let (acquire, release) = if unfenced {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
@@ -4802,7 +4802,10 @@ impl Dispatch<WpLinuxDrmSyncobjManagerV1, ()> for Compositor {
                     return;
                 }
                 let res = data_init.init(id, SyncobjSurfaceData { wl_surface_id });
-                if let Some(surf) = state.surfaces.get_mut(&res.data::<SyncobjSurfaceData>().unwrap().wl_surface_id) {
+                if let Some(surf) = state
+                    .surfaces
+                    .get_mut(&res.data::<SyncobjSurfaceData>().unwrap().wl_surface_id)
+                {
                     surf.syncobj_surface = Some(res);
                 }
             }
@@ -4851,7 +4854,12 @@ impl Dispatch<WpLinuxDrmSyncobjTimelineV1, ()> for Compositor {
         }
     }
 
-    fn destroyed(state: &mut Self, _: wayland_server::backend::ClientId, res: &WpLinuxDrmSyncobjTimelineV1, _: &()) {
+    fn destroyed(
+        state: &mut Self,
+        _: wayland_server::backend::ClientId,
+        res: &WpLinuxDrmSyncobjTimelineV1,
+        _: &(),
+    ) {
         state.syncobj_timelines.remove(&res.id());
     }
 }
@@ -4866,7 +4874,10 @@ fn clear_syncobj_surface(
     res: &WpLinuxDrmSyncobjSurfaceV1,
 ) {
     if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id)
-        && surf.syncobj_surface.as_ref().is_some_and(|s| s.id() == res.id())
+        && surf
+            .syncobj_surface
+            .as_ref()
+            .is_some_and(|s| s.id() == res.id())
     {
         surf.syncobj_surface = None;
         surf.pending_acquire_point = None;
@@ -4886,13 +4897,12 @@ impl Dispatch<WpLinuxDrmSyncobjSurfaceV1, SyncobjSurfaceData> for Compositor {
     ) {
         use wp_linux_drm_syncobj_surface_v1::Request;
         let point_of = |state: &Self, timeline: &WpLinuxDrmSyncobjTimelineV1, hi: u32, lo: u32| {
-            let found = state
-                .syncobj_timelines
-                .get(&timeline.id())
-                .map(|tl| crate::drm_syncobj::SyncPoint {
+            let found = state.syncobj_timelines.get(&timeline.id()).map(|tl| {
+                crate::drm_syncobj::SyncPoint {
                     timeline: tl.clone(),
                     point: ((hi as u64) << 32) | lo as u64,
-                });
+                }
+            });
             if found.is_none() {
                 // The import failed earlier, so the commit silently becomes
                 // unfenced.  Say so once: without it the only symptom is a

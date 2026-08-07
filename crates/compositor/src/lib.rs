@@ -318,6 +318,9 @@ mod stub {
             width: u32,
             height: u32,
             is_444: bool,
+            /// Minimum microseconds between encodes for this session; 0 =
+            /// encode every composite.
+            min_interval_us: u32,
         },
         /// Retarget one client's encoder quantizer without rebuilding it.
         SetVulkanEncoderQp {
