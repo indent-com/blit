@@ -127,6 +127,17 @@ use wayland_server::{
 pub enum PixelData {
     Bgra(Arc<Vec<u8>>),
     Rgba(Arc<Vec<u8>>),
+    /// The frame exists only on the GPU: a Vulkan Video encoder owns the
+    /// surface and nothing asked for CPU pixels, so the staging readback
+    /// was skipped rather than copied into a `Vec` no one would read.
+    ///
+    /// It still carries a commit.  The server's surface state machine runs
+    /// off `SurfaceCommit` — sizes, generation counter, and the
+    /// `last_pixels` entry that gates encoder creation — so a surface that
+    /// published nothing at all would never get an encoder in the first
+    /// place.  Consumers that need real pixels must treat this as "no
+    /// frame this tick", not as an empty one.
+    GpuOnly,
     Nv12 {
         data: Arc<Vec<u8>>,
         y_stride: usize,
@@ -276,7 +287,9 @@ impl PixelData {
             // GPU. Returning empty rather than panicking keeps a
             // mis-route to a black frame instead of a crash, and
             // `is_empty()` below reports it honestly.
-            PixelData::Nv12OpaqueFd { .. } => Vec::new(),
+            // Same for a GPU-only commit: it deliberately carries no
+            // pixels, and the server never routes it to a CPU consumer.
+            PixelData::Nv12OpaqueFd { .. } | PixelData::GpuOnly => Vec::new(),
             PixelData::Rgba(data) => data.as_ref().clone(),
             PixelData::Bgra(data) => {
                 let mut rgba = Vec::with_capacity(w * h * 4);
@@ -505,10 +518,15 @@ impl PixelData {
         match self {
             PixelData::Bgra(v) | PixelData::Rgba(v) => v.is_empty(),
             PixelData::Nv12 { data, .. } => data.is_empty(),
+            // `GpuOnly` is not an empty frame — it is a real commit whose
+            // pixels live on the GPU. Reporting it empty would make
+            // `composite_toplevel_into_pending` drop it, and a surface that
+            // publishes nothing never gets an encoder at all.
             PixelData::DmaBuf { .. }
             | PixelData::VaSurface { .. }
             | PixelData::Nv12DmaBuf { .. }
-            | PixelData::Nv12OpaqueFd { .. } => false,
+            | PixelData::Nv12OpaqueFd { .. }
+            | PixelData::GpuOnly => false,
         }
     }
 
@@ -2331,6 +2349,7 @@ impl Compositor {
                 PixelData::VaSurface { .. } => "va-surface",
                 PixelData::Nv12DmaBuf { .. } => "nv12-dmabuf",
                 PixelData::Nv12OpaqueFd { .. } => "nv12-opaque-fd",
+                PixelData::GpuOnly => "gpu-only",
                 PixelData::DmaBuf { fd, .. } => {
                     use std::os::fd::AsRawFd;
                     let raw = fd.as_raw_fd();

@@ -1433,6 +1433,21 @@ impl SurfaceEncoder {
             }
             #[cfg(not(target_os = "linux"))]
             PixelData::Nv12OpaqueFd { .. } => None,
+            // The compositor skipped this frame's readback because a Vulkan
+            // Video encoder owned the surface. The delivery loop filters
+            // these out before dispatching an encode, so reaching here means
+            // a server-side encoder was handed one anyway — drop it rather
+            // than encode a blank frame.
+            PixelData::GpuOnly => {
+                static LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[surface-encoder] GpuOnly routed to a server-side encoder; dropping"
+                    );
+                }
+                None
+            }
             #[cfg(target_os = "linux")]
             PixelData::Nv12DmaBuf {
                 fd,
