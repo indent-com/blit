@@ -4,11 +4,11 @@ use blit_remote::{
     C2S_ACK, C2S_CLIENT_FEATURES, C2S_CLIENT_METRICS, C2S_CLIPBOARD_GET, C2S_CLIPBOARD_LIST,
     C2S_CLIPBOARD_SET, C2S_CLOSE, C2S_COPY_RANGE, C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N,
     C2S_CREATE2, C2S_DEADLINE, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_KILL, C2S_MOUSE,
-    C2S_PING, C2S_QUIT, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SCROLL_BY, C2S_SEARCH,
-    C2S_SUBSCRIBE, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS,
-    C2S_SURFACE_INPUT, C2S_SURFACE_LIST, C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS,
-    C2S_SURFACE_POINTER_AXIS2, C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT,
-    C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
+    C2S_PING, C2S_PRIMARY_SET, C2S_QUIT, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL,
+    C2S_SCROLL_BY, C2S_SEARCH, C2S_SUBSCRIBE, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE,
+    C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT, C2S_SURFACE_LIST, C2S_SURFACE_POINTER,
+    C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2, C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE,
+    C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
     CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE,
     CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS, FEATURE_COMPOSITOR, FEATURE_COPY_RANGE,
     FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE,
@@ -12369,7 +12369,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     c.surface_max_decode = max_decode;
                 }
             }
-            C2S_CLIPBOARD_SET if data.len() >= 5 => {
+            C2S_CLIPBOARD_SET | C2S_PRIMARY_SET if data.len() >= 5 => {
                 let mime_len = u16::from_le_bytes([data[1], data[2]]) as usize;
                 if data.len() >= 3 + mime_len + 4 {
                     let mime = std::str::from_utf8(&data[3..3 + mime_len])
@@ -12385,13 +12385,20 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     if data.len() >= payload_start + data_len {
                         let payload = data[payload_start..payload_start + data_len].to_vec();
                         if let Some(cs) = sess.compositor.as_ref() {
-                            let _ = cs
-                                .handle
-                                .command_tx
-                                .send(CompositorCommand::ClipboardOffer {
+                            // Identical framing for both selections; only
+                            // which one the bytes land in differs.
+                            let cmd = if data[0] == C2S_PRIMARY_SET {
+                                CompositorCommand::PrimaryOffer {
                                     mime_type: mime,
                                     data: payload,
-                                });
+                                }
+                            } else {
+                                CompositorCommand::ClipboardOffer {
+                                    mime_type: mime,
+                                    data: payload,
+                                }
+                            };
+                            let _ = cs.handle.command_tx.send(cmd);
                         }
                     }
                 }

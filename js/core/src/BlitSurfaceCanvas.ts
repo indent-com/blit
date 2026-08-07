@@ -478,6 +478,30 @@ function textPayload(text: string): ClipboardPayload {
  */
 const MAX_CLIPBOARD_BYTES = 8 * 1024 * 1024;
 
+/**
+ * The page's text selection as a payload, or null when there is none.
+ *
+ * Null deliberately means "say nothing rather than nothing-in-particular":
+ * the middle click still reaches the app, which then pastes whatever
+ * *Wayland* client owns PRIMARY — select in one surface, middle-click in
+ * another, with the browser never in the middle. Offering an empty
+ * selection instead would take ownership away from that client and paste
+ * zero bytes.
+ */
+function selectedPayload(): ClipboardPayload | null {
+  const text = document.getSelection()?.toString() ?? "";
+  if (!text) return null;
+  const payload = textPayload(text);
+  if (payload.data.length > MAX_CLIPBOARD_BYTES) {
+    console.warn(
+      `blit: selection is ${payload.data.length} bytes, over the ` +
+        `${MAX_CLIPBOARD_BYTES}-byte limit — not offered as PRIMARY`,
+    );
+    return null;
+  }
+  return payload;
+}
+
 /** Image types to prefer when a clipboard carries several, most portable
  *  first.  `image/png` is what every toolkit asks for. */
 const IMAGE_MIME_PREFERENCE = ["image/png", "image/webp", "image/jpeg"];
@@ -1528,6 +1552,12 @@ export class BlitSurfaceCanvas {
   }
 
   private handleMouse(e: MouseEvent, type: number): void {
+    // Read the selection first: focusing the canvas below collapses it, so
+    // by the time the button is on the wire there is nothing left to send.
+    const primary =
+      e.button === 1 && type === SURFACE_POINTER_DOWN
+        ? selectedPayload()
+        : null;
     // Back and forward navigate the page — out of the session entirely —
     // and middle click starts an autoscroll, all while the same press is
     // on its way to the app. Claim them; the surface still gets the
@@ -1535,6 +1565,15 @@ export class BlitSurfaceCanvas {
     // focus that a left press brings, and `contextmenu` is cancelled
     // separately so a right press is already harmless.
     if (e.button === 1 || e.button >= 3) e.preventDefault();
+    // Hand PRIMARY over on the press that pastes it, the way the clipboard
+    // is pushed on paste rather than on copy. The compositor serves these
+    // bytes itself, so owning the selection continuously would displace
+    // whichever Wayland client the user last selected text in — including
+    // when they middle-click with nothing selected here, which has to keep
+    // pasting that client's selection. Ordering holds because both
+    // messages ride the same connection, and the compositor advertises the
+    // offer before it delivers the button.
+    if (primary) this.getConn()?.sendPrimary(primary.mime, primary.data);
     this.sendPointerAt(e.clientX, e.clientY, type, e.button);
   }
 

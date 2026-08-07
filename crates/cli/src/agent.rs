@@ -10,10 +10,10 @@ use blit_remote::{
     S2C_READY, S2C_SURFACE_CAPTURE, S2C_SURFACE_FRAME, S2C_SURFACE_LIST, S2C_TERM_CWD, S2C_TEXT,
     S2C_TITLE, S2C_UPDATE, SURFACE_FRAME_CODEC_AV1, SURFACE_FRAME_CODEC_MASK,
     SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState, exit_reason_text, msg_ack,
-    msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_close,
-    msg_create2_full, msg_deadline, msg_input, msg_kill, msg_mouse, msg_quit, msg_read, msg_resize,
-    msg_restart, msg_subscribe, msg_surface_close, msg_surface_focus, msg_surface_input,
-    msg_surface_pointer_axis2, msg_surface_resize, msg_surface_subscribe,
+    msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_c2s_primary_set,
+    msg_close, msg_create2_full, msg_deadline, msg_input, msg_kill, msg_mouse, msg_quit, msg_read,
+    msg_resize, msg_restart, msg_subscribe, msg_surface_close, msg_surface_focus,
+    msg_surface_input, msg_surface_pointer_axis2, msg_surface_resize, msg_surface_subscribe,
     msg_surface_subscribe_ext, msg_surface_text, msg_term_cwd, parse_server_msg,
     parse_term_cwd_reply, status_text,
 };
@@ -857,6 +857,7 @@ pub async fn cmd_clipboard_list(transport: Transport) -> Result<(), String> {
 pub async fn cmd_clipboard_set(
     transport: Transport,
     mime: &str,
+    primary: bool,
     text: Option<String>,
 ) -> Result<(), String> {
     let data = match text {
@@ -868,8 +869,13 @@ pub async fn cmd_clipboard_set(
             buf
         }
     };
+    let msg = if primary {
+        msg_c2s_primary_set(mime, &data)
+    } else {
+        msg_c2s_clipboard_set(mime, &data)
+    };
     let mut conn = AgentConn::connect(transport).await?;
-    conn.send(&msg_c2s_clipboard_set(mime, &data)).await?;
+    conn.send(&msg).await?;
     conn.finish().await;
     Ok(())
 }

@@ -1040,6 +1040,11 @@ pub enum ClipboardCommand {
         #[arg(long, default_value = "text/plain;charset=utf-8")]
         mime: String,
 
+        /// Set the primary selection (what middle click pastes) instead of
+        /// the clipboard.  Displaces whichever app currently owns it.
+        #[arg(long)]
+        primary: bool,
+
         /// Text to set (if omitted, reads from stdin)
         text: Option<String>,
     },
