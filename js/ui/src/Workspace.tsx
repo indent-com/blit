@@ -544,7 +544,7 @@ function WorkspaceScreen(props: {
    *  A tile pane owns its own focus, so only a terminal needs the nudge. */
   function closeSearch() {
     setSearchOpen(false);
-    queueMicrotask(() => focusedTerminalInput()?.focus());
+    queueMicrotask(() => focusedKeyboardInput()?.focus());
   }
 
   /** Where a drag starts from when the pane was still auto-sized: its
@@ -880,14 +880,22 @@ function WorkspaceScreen(props: {
   const [keyboardWanted, setKeyboardWanted] = createSignal(false);
   const terminalInputSelector =
     'textarea[aria-label="Terminal input"][tabindex]:not([readonly])';
+  // A surface pane's IME textarea (BlitSurfaceCanvas creates it next to the
+  // canvas).  It routes keydown/keyup and composition into the surface, so
+  // it is what the software keyboard has to rest on — the canvas itself is
+  // not editable and an IME will not stay up for it.
+  const surfaceInputSelector = 'textarea[aria-label="Surface input"]';
+  const keyboardInputSelector = `${terminalInputSelector}, ${surfaceInputSelector}`;
 
   // The software keyboard rises only from the status-bar toggle, never from a
-  // tap: while it isn't wanted, every terminal textarea carries
+  // tap: while it isn't wanted, every terminal and surface textarea carries
   // inputmode="none", which keeps focus semantics (hardware keys, scrollback
   // navigation, paste) but tells the browser not to bring up an IME.  The
-  // observer exists because terminal textareas are created whenever a pane
+  // observer exists because the textareas are created whenever a pane
   // mounts, and the attribute has to be in place before the tap that focuses
   // them — stamping on focus is too late for the IME decision.
+  const stampSelector =
+    'textarea[aria-label="Terminal input"], textarea[aria-label="Surface input"]';
   createEffect(() => {
     // `suppress` is false when leaving touch mode too (a DevTools device-mode
     // flip), so that pass strips stale stamps before bailing.
@@ -897,10 +905,7 @@ function WorkspaceScreen(props: {
       else el.removeAttribute("inputmode");
     };
     const stamp = (root: ParentNode) => {
-      for (const el of root.querySelectorAll(
-        'textarea[aria-label="Terminal input"]',
-      ))
-        stampOne(el);
+      for (const el of root.querySelectorAll(stampSelector)) stampOne(el);
     };
     stamp(document);
     if (!isMobileTouch()) return;
@@ -908,7 +913,7 @@ function WorkspaceScreen(props: {
       for (const r of records) {
         for (const n of r.addedNodes) {
           if (!(n instanceof HTMLElement)) continue;
-          if (n.matches('textarea[aria-label="Terminal input"]')) stampOne(n);
+          if (n.matches(stampSelector)) stampOne(n);
           else stamp(n);
         }
       }
@@ -917,21 +922,22 @@ function WorkspaceScreen(props: {
     onCleanup(() => mo.disconnect());
   });
 
-  // The focused pane's terminal, else the first one on screen that can take
-  // focus.  Every fallback matters: a pane holding an editor, a web view or a
-  // surface has no terminal input at all, and until something is tapped no
-  // pane carries the focused marker.  Resolving to null there left the
-  // keyboard toggle dead for good — it returns before flipping
-  // `keyboardWanted`, so every later tap took the same branch and did nothing.
-  // Reaching into another pane is safe: that pane's own focusin moves BSP
-  // focus to match, so the caret never lands out of sight.
-  function focusedTerminalInput(): HTMLElement | null {
+  // The focused pane's terminal or surface input, else the first one on
+  // screen that can take focus.  Every fallback matters: a pane holding an
+  // editor or a web view has no keyboard input at all, and until something
+  // is tapped no pane carries the focused marker.  Resolving to null there
+  // left the keyboard toggle dead for good — it returns before flipping
+  // `keyboardWanted`, so every later tap took the same branch and did
+  // nothing.  Reaching into another pane is safe: that pane's own focusin
+  // moves BSP focus to match, so the caret never lands out of sight.
+  function focusedKeyboardInput(): HTMLElement | null {
     // A soloed-away pane and a background tab are `display:none`, which nulls
     // offsetParent on the absolutely positioned input.  focus() there is a
     // silent no-op, so returning one lit the icon over a keyboard that never
-    // came up.
+    // came up.  Parked thumbnails are `inert` — same silent no-op, but with
+    // offsetParent still set, so they need their own check.
     const focusable = (el: HTMLElement | null | undefined) =>
-      el?.offsetParent ? el : null;
+      el?.offsetParent && !el.closest("[inert]") ? el : null;
     const focusedPane = document.querySelector<HTMLElement>(
       '[data-blit-bsp-focused="true"]',
     );
@@ -939,11 +945,17 @@ function WorkspaceScreen(props: {
       focusable(
         focusedPane?.querySelector<HTMLElement>(terminalInputSelector),
       ) ??
+      focusable(
+        focusedPane?.querySelector<HTMLElement>(surfaceInputSelector),
+      ) ??
       [
         ...document.querySelectorAll<HTMLElement>(
           `section ${terminalInputSelector}`,
         ),
-      ].find((el) => el.offsetParent) ??
+        ...document.querySelectorAll<HTMLElement>(
+          `section ${surfaceInputSelector}`,
+        ),
+      ].find((el) => focusable(el)) ??
       null
     );
   }
@@ -984,7 +996,7 @@ function WorkspaceScreen(props: {
       if (
         occlusion() > 150 &&
         document.activeElement instanceof HTMLElement &&
-        document.activeElement.matches(terminalInputSelector)
+        document.activeElement.matches(keyboardInputSelector)
       ) {
         setKeyboardWanted(true);
       }
@@ -994,13 +1006,33 @@ function WorkspaceScreen(props: {
     else if (keyboardSeen) setKeyboardWanted(false);
   });
 
-  // Re-focus the terminal textarea when it blurs while the user wants
-  // the keyboard open, unless an overlay is active.
+  // While the keyboard is wanted, focus landing on a surface canvas would
+  // dismiss the IME — a canvas is not editable, and the surface's pointer
+  // handler focuses it on every tap (compositionend hands focus back to it
+  // too).  Redirect to the surface's hidden IME textarea in the same task,
+  // so the IME never sees a non-editable element at rest; keys still reach
+  // the surface because the textarea routes keydown/keyup and composition
+  // through the same handlers as the canvas.
+  createEffect(() => {
+    if (!isMobileTouch() || !keyboardWanted()) return;
+    const handler = (e: FocusEvent) => {
+      const t = e.target;
+      if (!(t instanceof HTMLCanvasElement) || !t.closest("section")) return;
+      t.parentElement
+        ?.querySelector<HTMLElement>(surfaceInputSelector)
+        ?.focus();
+    };
+    document.addEventListener("focusin", handler, true);
+    onCleanup(() => document.removeEventListener("focusin", handler, true));
+  });
+
+  // Re-focus the keyboard-holding textarea when it blurs while the user
+  // wants the keyboard open, unless an overlay is active.
   createEffect(() => {
     if (!isMobileTouch() || !keyboardWanted()) return;
     const handler = (e: FocusEvent) => {
       if (!(e.target instanceof HTMLTextAreaElement)) return;
-      if (!e.target.matches(terminalInputSelector)) return;
+      if (!e.target.matches(keyboardInputSelector)) return;
       if (!(e.target as Element).closest?.("section")) return;
       if (overlay()) return;
       // Long enough to outlast the dismiss animation, so the effect above has
@@ -1010,7 +1042,7 @@ function WorkspaceScreen(props: {
       setTimeout(() => {
         if (!keyboardWanted() || overlay()) return;
         if (focusSettledElsewhere()) return;
-        focusedTerminalInput()?.focus();
+        focusedKeyboardInput()?.focus();
       }, 300);
     };
     document.addEventListener("focusout", handler, true);
@@ -1029,10 +1061,10 @@ function WorkspaceScreen(props: {
       if (active instanceof HTMLElement && active.closest("section")) {
         active.blur();
       } else {
-        focusedTerminalInput()?.blur();
+        focusedKeyboardInput()?.blur();
       }
     } else {
-      const el = focusedTerminalInput();
+      const el = focusedKeyboardInput();
       if (!el) return;
       setKeyboardWanted(true);
       // The stamping effect above has cleared inputmode="none" by now (Solid

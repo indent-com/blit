@@ -24,6 +24,10 @@ async function authenticate(page: Page) {
   await page.goto("/");
   await page.evaluate(() => localStorage.clear());
   await page.goto("/#psk=test-secret");
+  // A hash-only navigation stores the psk but does not reliably (re)connect
+  // the config WS — only the first context in a fresh browser gets away
+  // without a real load.  Reload so the boot path picks the stored psk up.
+  await page.reload();
   await expect(
     page
       .getByRole("button", { name: "New terminal" })
@@ -102,4 +106,69 @@ test("keyboard rises only from the toggle and the key line tracks it", async ({
   await expect(keyLine).toHaveCount(0);
   await expect(page.getByTitle("Show keyboard")).toBeVisible();
   await expect(input).toHaveAttribute("inputmode", "none");
+});
+
+/**
+ * Surface panes must not override the icon: a surface focuses its canvas on
+ * every tap, and a canvas is not editable, so an IME dismisses over it —
+ * which used to expire the toggle's intent.  While the keyboard is wanted,
+ * focus landing on a surface canvas has to be redirected to the surface's
+ * hidden IME textarea (which routes keys into the surface), and that
+ * textarea carries the same inputmode="none" suppression while it is not.
+ *
+ * A real surface needs a Wayland client this stack does not run, so the test
+ * plants the exact DOM BlitSurfaceCanvas.attach() produces — a tabindex=0
+ * canvas with a labeled textarea beside it — inside the pane section, and
+ * exercises the Workspace policy against it.
+ */
+test("the icon's keyboard survives focus landing on a surface canvas", async ({
+  page,
+  context,
+}) => {
+  await authenticate(page);
+  await newTerminal(page);
+
+  await page.evaluate(() => {
+    const section = document.querySelector("section");
+    if (!section) throw new Error("no pane section");
+    const holder = document.createElement("div");
+    const ta = document.createElement("textarea");
+    ta.setAttribute("aria-label", "Surface input");
+    ta.tabIndex = -1;
+    const canvas = document.createElement("canvas");
+    canvas.tabIndex = 0;
+    canvas.dataset.testid = "fake-surface-canvas";
+    canvas.style.width = "60px";
+    canvas.style.height = "60px";
+    holder.append(ta, canvas);
+    section.append(holder);
+  });
+  const surfaceInput = page.locator('textarea[aria-label="Surface input"]');
+  const surfaceCanvas = page.getByTestId("fake-surface-canvas");
+
+  // While the keyboard is not wanted, the surface textarea is suppressed
+  // exactly like a terminal's (the MutationObserver stamps it on mount),
+  // and tapping the surface parks focus on the canvas — hardware keys and
+  // pointer input want it there, and nothing must shove an IME up.
+  await expect(surfaceInput).toHaveAttribute("inputmode", "none");
+  await surfaceCanvas.tap();
+  await expect(surfaceCanvas).toBeFocused();
+
+  // Raise the keyboard from the icon and emulate it occluding the viewport.
+  await page.getByTitle("Show keyboard").tap();
+  await expect(surfaceInput).not.toHaveAttribute("inputmode", "none");
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("Emulation.setDeviceMetricsOverride", {
+    width: 480,
+    height: 500,
+    deviceScaleFactor: 1,
+    mobile: true,
+  });
+  await expect(page.getByRole("button", { name: "Esc" })).toBeVisible();
+
+  // Tapping the surface focuses its canvas; the redirect must park focus on
+  // the IME textarea instead, and the icon's intent must survive.
+  await surfaceCanvas.tap();
+  await expect(surfaceInput).toBeFocused();
+  await expect(page.getByTitle("Hide keyboard")).toBeVisible();
 });

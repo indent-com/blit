@@ -671,7 +671,7 @@ export class BlitSurfaceCanvas {
   private boundKeyDown: ((e: KeyboardEvent) => void) | null = null;
   private boundKeyUp: ((e: KeyboardEvent) => void) | null = null;
   private boundFocus: (() => void) | null = null;
-  private boundBlur: (() => void) | null = null;
+  private boundBlur: ((e: FocusEvent) => void) | null = null;
   private boundContextMenu: ((e: Event) => void) | null = null;
   private boundTextInput: ((e: Event) => void) | null = null;
   private boundCompositionStart: ((e: Event) => void) | null = null;
@@ -725,6 +725,10 @@ export class BlitSurfaceCanvas {
     ta.setAttribute("autocorrect", "off");
     ta.setAttribute("autocapitalize", "off");
     ta.setAttribute("spellcheck", "false");
+    // The label is the UI's handle on this element: the mobile keyboard
+    // toggle focuses it (the canvas is not editable, so an IME will not
+    // stay up for it) and the inputmode stamping covers it.
+    ta.setAttribute("aria-label", "Surface input");
     ta.tabIndex = -1;
     ta.style.position = "absolute";
     ta.style.left = "0";
@@ -1306,7 +1310,7 @@ export class BlitSurfaceCanvas {
     this.boundKeyDown = (e) => this.handleKey(e, true);
     this.boundKeyUp = (e) => this.handleKey(e, false);
     this.boundFocus = () => this.handleFocus();
-    this.boundBlur = () => this.handleBlur();
+    this.boundBlur = (e) => this.handleBlur(e);
     this.boundContextMenu = (e) => e.preventDefault();
     this.boundPaste = (e) => this.handlePaste(e);
     // Some browsers don't dispatch `paste` to a focused non-editable
@@ -1359,6 +1363,11 @@ export class BlitSurfaceCanvas {
       // (e.g. Enter to confirm, Escape to cancel) still get routed.
       ta.addEventListener("keydown", this.boundKeyDown);
       ta.addEventListener("keyup", this.boundKeyUp);
+      // Focus can now *rest* on the textarea (the mobile keyboard toggle
+      // parks it there so the IME stays up), so it needs the same
+      // compositor-focus and key-release bookkeeping as the canvas.
+      ta.addEventListener("focus", this.boundFocus);
+      ta.addEventListener("blur", this.boundBlur);
       // Paste into the textarea would otherwise insert text that the
       // `input` handler forwards as surface text — intercept it so the
       // content goes through the Wayland clipboard path instead.
@@ -1429,6 +1438,8 @@ export class BlitSurfaceCanvas {
       if (this.boundKeyDown)
         ta.removeEventListener("keydown", this.boundKeyDown);
       if (this.boundKeyUp) ta.removeEventListener("keyup", this.boundKeyUp);
+      if (this.boundFocus) ta.removeEventListener("focus", this.boundFocus);
+      if (this.boundBlur) ta.removeEventListener("blur", this.boundBlur);
       if (this.boundPaste) ta.removeEventListener("paste", this.boundPaste);
     }
   }
@@ -2076,6 +2087,16 @@ export class BlitSurfaceCanvas {
       return;
     }
 
+    // Soft-keyboard synthesized keydowns (keyCode 229) name neither key nor
+    // code — the text arrives as an input event on the hidden textarea
+    // instead.  The evdev path below would send nothing for them anyway, and
+    // its preventDefault can cancel that input event, so step aside.
+    if (
+      (e.key === "Unidentified" || e.key === "Process") &&
+      domKeyToEvdev(e.code) === 0
+    )
+      return;
+
     // Paste shortcut: skip preventDefault so the browser fires a `paste`
     // event on the focused element.  Our paste handler uses it as a
     // fallback when `navigator.clipboard.readText()` is denied (e.g.
@@ -2315,13 +2336,30 @@ export class BlitSurfaceCanvas {
     }
   }
 
-  /** Handle text input from the hidden textarea (IME only). */
+  /** Handle text input from the hidden textarea. */
   private handleTextInput(e: InputEvent): void {
     // During IME composition, wait for compositionend.
     if (e.isComposing) return;
-    // Non-composition input events on the textarea can be ignored —
-    // normal typing is handled via e.key in handleKey directly.
     const ta = this.textInput;
+    // Any keydown handleKey processed was preventDefault'ed, which cancels
+    // its input event — so what reaches here is text the keyboard delivered
+    // *without* a usable keydown: soft-keyboard commits (keyCode 229),
+    // suggestion taps, autocorrect, and IMEs that delete or break lines via
+    // input events alone.  Everything else (insertFromPaste, and Firefox's
+    // post-compositionend insertCompositionText, which handleCompositionEnd
+    // already sent) stays ignored.
+    const conn = this.getConn();
+    if (conn && this.surface && this._displaySize) {
+      if (e.inputType === "insertText" && e.data) {
+        conn.sendSurfaceText(this._surfaceId, e.data);
+      } else if (e.inputType === "insertLineBreak") {
+        conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Enter, true);
+        conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Enter, false);
+      } else if (e.inputType === "deleteContentBackward") {
+        conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Backspace, true);
+        conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Backspace, false);
+      }
+    }
     if (ta) ta.value = "";
   }
 
@@ -2359,7 +2397,14 @@ export class BlitSurfaceCanvas {
     this._metaToCtrl = 0;
   }
 
-  private handleBlur(): void {
+  private handleBlur(e: FocusEvent): void {
+    // Focus shuffling between the canvas and its own IME textarea (paste,
+    // composition, the mobile keyboard parking on the textarea) never
+    // means the user left the surface — releasing held keys there sends
+    // phantom key-ups, e.g. a V-up while the paste chord's V is still
+    // physically down.
+    const to = e.relatedTarget;
+    if (to && (to === this.canvas || to === this.textInput)) return;
     // During an in-flight paste shortcut we may have temporarily moved
     // focus to the hidden textarea (so the browser dispatches the paste
     // event to an editable element).  Don't tear down key state — the
