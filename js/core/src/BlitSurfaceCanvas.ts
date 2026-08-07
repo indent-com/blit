@@ -1555,7 +1555,9 @@ export class BlitSurfaceCanvas {
     // Read the selection first: focusing the canvas below collapses it, so
     // by the time the button is on the wire there is nothing left to send.
     const primary =
-      e.button === 1 && type === SURFACE_POINTER_DOWN ? selectedPayload() : null;
+      e.button === 1 && type === SURFACE_POINTER_DOWN
+        ? selectedPayload()
+        : null;
     // Back and forward navigate the page — out of the session entirely —
     // and middle click starts an autoscroll, all while the same press is
     // on its way to the app. Claim them; the surface still gets the

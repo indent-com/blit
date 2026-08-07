@@ -72,6 +72,7 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 | `0x30` | `AUDIO_SUBSCRIBE`       | `[bitrate_kbps:2]`                                                                                                                                                   |
 | `0x31` | `AUDIO_UNSUBSCRIBE`     | (no payload)                                                                                                                                                         |
 | `0x32` | `SURFACE_POINTER_AXIS2` | `[surface_id:2][flags:1][dx_x100:4][dy_x100:4][v120_x:2][v120_y:2]` — see [Scroll](#scroll)                                                                          |
+| `0x33` | `PRIMARY_SET`           | `[mime_len:2][mime:N][data_len:4][data:M]` — take PRIMARY, see [Primary selection](#primary-selection)                                                               |
 | `0x40` | `FS_SYNC`               | `[nonce:2][flags:2][latency_ms:2][inline_max:4][path_len:2][path:N]` + `[exclude_len:2][exclude:M]` if `EXCLUDE` + `[src_pty_id:2]` if `FROM_PTY`                    |
 | `0x41` | `FS_STOP`               | `[sync_id:2]`                                                                                                                                                        |
 | `0x42` | `FS_ACK`                | `[sync_id:2][update_id:4]` — cumulative                                                                                                                              |
@@ -391,7 +392,7 @@ nothing selected in the page therefore still pastes that client's selection.
 Ownership is exclusive: whichever side claims PRIMARY displaces the other,
 and a displaced Wayland owner is told with `cancelled` so it stops answering
 `receive` from its own buffer. `blit clipboard set --primary` claims it from
-the CLI. Pasting *from* the browser with Ctrl+V remains the clipboard's job.
+the CLI. Pasting _from_ the browser with Ctrl+V remains the clipboard's job.
 
 ### Pointer buttons
 
