@@ -361,6 +361,12 @@ struct Arms {
     /// Targeted gitdir/common paths currently armed; empty while the
     /// worktree watch covers them.
     gitdir_paths: Vec<PathBuf>,
+    /// Directories outside every root above, armed because they hold an
+    /// ignore source the status pipeline reads (today: the user's global
+    /// ignore file). Never covered by the other two by construction —
+    /// [`Engine::ignore_watch_dirs`] excludes anything under them — so
+    /// these arm once and are only re-armed when the configured path moves.
+    ignore_paths: Vec<PathBuf>,
     worktree: bool,
 }
 
@@ -403,7 +409,9 @@ struct Engine {
     /// Exclude stack for ignore-filtering worktree events; invalidated on
     /// any ignore-source change and rebuilt lazily.
     excludes: Option<gix::worktree::Stack>,
-    /// `core.excludesFile` as configured, for event-path matching.
+    /// The user's global ignore file, resolved as the status pipeline
+    /// resolves it ([`global_excludes_file`]) — for event-path matching
+    /// and for the watch that makes those events arrive at all.
     excludes_file: Option<PathBuf>,
     watch: Option<Arms>,
     /// Set when watching can never work (watcher creation failed): every
@@ -471,7 +479,7 @@ impl Engine {
         let common = local.common_dir().to_path_buf();
         let workdir = local.workdir().map(|p| p.to_path_buf());
         let defaults = StateOptions::default();
-        let excludes_file = config_excludes_file(&local);
+        let excludes_file = global_excludes_file(&local);
         let config_paths = [gitdir.join("config"), common.join("config")];
         let exclude_paths = [
             gitdir.join("info").join("exclude"),
@@ -758,6 +766,7 @@ impl Engine {
         self.watch = Some(Arms {
             watcher,
             gitdir_paths: Vec::new(),
+            ignore_paths: Vec::new(),
             worktree: false,
         });
         // `sync_watches` picks the set: when a status subscriber's
@@ -769,10 +778,11 @@ impl Engine {
     }
 
     /// Non-recursive on the gitdir roots (HEAD, index, MERGE_HEAD…),
-    /// recursive on refs/ and the sequencer dirs. Individual arm failures
-    /// are tolerated (a missing subdir simply is not watched); the paths
-    /// that did arm are recorded so the set can be dropped when the
-    /// worktree watch covers it.
+    /// recursive on refs/, the sequencer dirs, and `info/` — which holds
+    /// `exclude`, an ignore source, and so decides what counts as
+    /// untracked. Individual arm failures are tolerated (a missing subdir
+    /// simply is not watched); the paths that did arm are recorded so the
+    /// set can be dropped when the worktree watch covers it.
     fn arm_gitdir(&mut self) {
         use notify::Watcher as _;
         let dirs = [self.gitdir.clone(), self.common.clone()];
@@ -796,6 +806,7 @@ impl Engine {
                 "rebase-apply",
                 "sequencer",
                 "logs/refs",
+                "info",
             ] {
                 let path = dir.join(sub);
                 if path.exists()
@@ -882,6 +893,60 @@ impl Engine {
                 arms.worktree = false;
             }
         }
+        self.sync_ignore_watch();
+    }
+
+    /// Directories to arm for the ignore sources that live *outside* every
+    /// watched root — today the user's global ignore file, which is
+    /// usually `~/.config/git/ignore` and so is reported by nothing else.
+    ///
+    /// The file's *parent* is what gets armed: a watch on a file follows
+    /// its inode and misses the rename-over an editor performs, the same
+    /// reason `blit_fssync` watches the parent of an out-of-tree ignore
+    /// source. A file already under the worktree or a gitdir root is left
+    /// alone — those are covered, and arming a second watch on a directory
+    /// this watcher already holds would remap notify's descriptor for it.
+    fn ignore_watch_dirs(&self) -> Vec<PathBuf> {
+        // Gated exactly as the worktree watch is: these rules decide only
+        // what a *status* records, so an open wanting none needs neither.
+        let Some(workdir) = self.workdir.as_deref() else {
+            return Vec::new();
+        };
+        if !self.subs.values().any(|s| s.opts.status && !s.gone) {
+            return Vec::new();
+        }
+        let Some(file) = self.excludes_file.as_deref() else {
+            return Vec::new();
+        };
+        if self.under_gitdir(file) || file.starts_with(workdir) {
+            return Vec::new();
+        }
+        file.parent().map(Path::to_path_buf).into_iter().collect()
+    }
+
+    /// Reconcile those watches. Best-effort, unlike the worktree watch: the
+    /// rules were already read at open, and the only loss when arming fails
+    /// is noticing a later edit. The attempted set is what is recorded, so
+    /// a directory that cannot be watched is not retried on every pass —
+    /// this runs once per engine loop.
+    fn sync_ignore_watch(&mut self) {
+        use notify::Watcher as _;
+        let want = self.ignore_watch_dirs();
+        let Some(arms) = &mut self.watch else {
+            return;
+        };
+        if arms.ignore_paths == want {
+            return;
+        }
+        for path in arms.ignore_paths.drain(..) {
+            let _ = arms.watcher.unwatch(&path);
+        }
+        for dir in want {
+            let _ = arms
+                .watcher
+                .watch(&dir, notify::RecursiveMode::NonRecursive);
+            arms.ignore_paths.push(dir);
+        }
     }
 
     // -- event classification (ignore-filtered) -----------------------------
@@ -921,6 +986,14 @@ impl Engine {
             }
             if self.under_gitdir(path) {
                 refs_side = true;
+                continue;
+            }
+            if self.in_ignore_watch_dir(path) {
+                // A sibling of the global ignore file — that directory is
+                // armed for one file, and everything else in it (the user's
+                // `config`, an editor's temp file) is not this repository's
+                // business. Without this the fallback below would recompute
+                // status for every write to `~/.config/git`.
                 continue;
             }
             match &workdir {
@@ -963,12 +1036,23 @@ impl Engine {
     }
 
     /// A file whose content feeds the exclude stack: any `.gitignore`,
-    /// the gitdir `info/exclude`s, or the configured `core.excludesFile`.
-    /// Its own events must both invalidate the stack and dirty status.
+    /// the gitdir `info/exclude`s, or the user's global ignore file. Its
+    /// own events must both invalidate the stack and dirty status.
     fn is_exclude_source(&self, path: &Path) -> bool {
         path.file_name().is_some_and(|n| n == ".gitignore")
             || self.exclude_paths.iter().any(|p| path == p)
             || self.excludes_file.as_deref() == Some(path)
+    }
+
+    /// Whether a path sits in a directory armed solely for the global
+    /// ignore file. Only that one file there matters; see [`handle_event`].
+    ///
+    /// [`handle_event`]: Engine::handle_event
+    fn in_ignore_watch_dir(&self, path: &Path) -> bool {
+        self.watch.as_ref().is_some_and(|arms| {
+            path.parent()
+                .is_some_and(|parent| arms.ignore_paths.iter().any(|d| d == parent))
+        })
     }
 
     /// True when any subscriber opened with IGNORED: ignored files appear
@@ -1019,15 +1103,13 @@ impl Engine {
         }
     }
 
-    /// (Re)build the exclude stack from the engine repository, refreshing
-    /// the remembered `core.excludesFile` path. Left `None` (every path
-    /// then reads not-ignored) when the repo has no worktree or a source
-    /// fails to load.
+    /// (Re)build the exclude stack from the engine repository. Left `None`
+    /// (every path then reads not-ignored) when the repo has no worktree or
+    /// a source fails to load.
     fn build_excludes(&mut self) {
         if self.local_stale {
             self.refresh_local();
         }
-        self.excludes_file = config_excludes_file(&self.local);
         self.excludes = self
             .local
             .worktree()
@@ -1038,12 +1120,19 @@ impl Engine {
     /// snapshot, so a `config` change re-opens the engine's own
     /// repository — the upstream mapping and exclude sources read fresh
     /// values. On failure the old instance stays: stale but serving.
+    ///
+    /// `core.excludesFile` is re-resolved here rather than lazily with the
+    /// stack, because the watch on it is armed off this path: a config
+    /// change that moves the global ignore file has to move the watch with
+    /// it, and the next event is what a lazy rebuild would be waiting for.
     fn refresh_local(&mut self) {
         self.local_stale = false;
         let start = self.workdir.as_deref().unwrap_or(&self.gitdir);
         if let Ok(fresh) = gix::ThreadSafeRepository::discover(start) {
             self.local = self.repo.sized(fresh.to_thread_local());
         }
+        self.excludes_file = global_excludes_file(&self.local);
+        self.sync_ignore_watch();
     }
 
     // -- snapshots ----------------------------------------------------------
@@ -1537,11 +1626,42 @@ fn status_segment(
     (records, truncated)
 }
 
-fn config_excludes_file(repo: &gix::Repository) -> Option<PathBuf> {
-    repo.config_snapshot()
-        .trusted_path("core.excludesFile")?
-        .ok()
-        .map(|path| path.into_owned())
+/// The user's global ignore file, resolved the way the status pipeline's
+/// own exclude stack resolves it: `core.excludesFile` when configured,
+/// otherwise git's XDG default (`$XDG_CONFIG_HOME/git/ignore`, or
+/// `~/.config/git/ignore`).
+///
+/// The fallback is the point. gix reads it whether or not the key is set,
+/// so it is a live ignore source for almost every checkout — and a version
+/// of this that only knew the configured key left the file most people
+/// actually use unwatched and unrecognized, so editing it changed what git
+/// ignores while the status view kept the old answer (#256).
+fn global_excludes_file(repo: &gix::Repository) -> Option<PathBuf> {
+    if let Some(configured) = repo
+        .config_snapshot()
+        .trusted_path("core.excludesFile")
+        .and_then(|path| path.ok().map(|path| path.into_owned()))
+    {
+        return Some(configured);
+    }
+    xdg_ignore_path(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        gix::path::env::home_dir().as_deref(),
+    )
+}
+
+/// git's default global ignore path from the two environment values that
+/// decide it. Split out from [`global_excludes_file`] so the rule is
+/// testable without touching the process environment.
+fn xdg_ignore_path(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let base = match xdg_config_home {
+        Some(xdg) if !xdg.is_empty() => PathBuf::from(xdg),
+        _ => home?.join(".config"),
+    };
+    Some(base.join("git").join("ignore"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1996,5 +2116,35 @@ fn upstream_of(repo: &gix::Repository, branch: &str) -> Option<(String, Option<g
             Some((escaped, id))
         }
         Err(_) => Some((escaped, None)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// git's global ignore file is `$XDG_CONFIG_HOME/git/ignore`, falling
+    /// back to `~/.config/git/ignore` — the file most checkouts really use,
+    /// since `core.excludesFile` is usually unset. The engine has to name it
+    /// exactly, or a watch is armed on the wrong directory and an edit to it
+    /// never reaches the status view (#256).
+    #[test]
+    fn the_default_global_ignore_path_is_gits() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            xdg_ignore_path(Some(OsStr::new("/x/cfg")), Some(Path::new("/home/u"))),
+            Some(PathBuf::from("/x/cfg/git/ignore")),
+        );
+        assert_eq!(
+            xdg_ignore_path(None, Some(Path::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.config/git/ignore")),
+        );
+        // An empty XDG_CONFIG_HOME is unset, which is how git reads it.
+        assert_eq!(
+            xdg_ignore_path(Some(OsStr::new("")), Some(Path::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.config/git/ignore")),
+        );
+        // No home to anchor it: nothing to watch, rather than a guess.
+        assert_eq!(xdg_ignore_path(None, None), None);
     }
 }
