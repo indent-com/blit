@@ -29,12 +29,6 @@ struct DrmGetCap {
 }
 
 #[repr(C)]
-struct DrmSyncobjCreate {
-    handle: u32,
-    flags: u32,
-}
-
-#[repr(C)]
 struct DrmSyncobjDestroy {
     handle: u32,
     pad: u32,
