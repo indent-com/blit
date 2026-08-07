@@ -3,9 +3,11 @@
 //! Uses the NVIDIA Video Codec SDK via `dlopen("libnvidia-encode.so")`.
 //! The CUDA context is created via `dlopen("libcuda.so")`.
 //!
-//! The encoder accepts BGRA input directly (`NV_ENC_BUFFER_FORMAT_ARGB`),
-//! so no CPU-side colorspace conversion is needed.  NVENC handles the
-//! BGRA→YUV conversion internally on the GPU.
+//! The encoder is fed YUV that is already full-range BT.601 — normally the
+//! compositor's compute shaders, via a zero-copy `OPAQUE_FD` import.  It is
+//! never handed packed RGB: NVENC's internal RGB→YUV is limited-range with
+//! no knob, so those frames would decode with lifted blacks against a
+//! stream header that claims full swing.
 
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
@@ -55,13 +57,10 @@ const NV_ENC_RECONFIGURE_PARAMS_VER: u32 = nvencapi_struct_version(1) | (1 << 31
 
 // Buffer formats (from nv-codec-headers 12.1)
 const NV_ENC_BUFFER_FORMAT_NV12: u32 = 0x00000001;
-// YUV444 and ABGR are only reached from the DMA-BUF / OPAQUE_FD import
-// paths, which are Linux-only.
+// YUV444 is only reached from the OPAQUE_FD import path, which is Linux-only.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const NV_ENC_BUFFER_FORMAT_YUV444: u32 = 0x00001000; // planar Y,U,V — NOT 0x10, that's YV12
 const NV_ENC_BUFFER_FORMAT_ARGB: u32 = 0x01000000; // B8G8R8A8 in memory (DRM ARGB8888)
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const NV_ENC_BUFFER_FORMAT_ABGR: u32 = 0x10000000; // R8G8B8A8 in memory (DRM ABGR8888)
 
 // Encoder capability query.  The values are ordinals into `NV_ENC_CAPS`
 // (nvEncodeAPI.h) — count the enum, don't guess: `SUPPORT_YUV444_ENCODE`
@@ -329,6 +328,18 @@ const NVENC_VUI_VIDEO_FULL_RANGE: usize = 16;
 /// `NV_ENC_CONFIG.encodeCodecConfig.av1Config.colorRange` (0 = studio
 /// swing, 1 = full swing), from the start of NV_ENC_CONFIG.
 const NVENC_AV1_COLOR_RANGE_OFFSET: usize = 248;
+/// `av1Config.colorPrimaries` / `.transferCharacteristics` /
+/// `.matrixCoefficients`, from the start of NV_ENC_CONFIG.  Zero is *not*
+/// "unspecified" for any of these: `NV_ENC_VUI_COLOR_PRIMARIES_RESERVED0`,
+/// `NV_ENC_VUI_TRANSFER_CHARACTERISTIC_RESERVED0` and — worst —
+/// `NV_ENC_VUI_MATRIX_COEFFS_RGB` (MC_IDENTITY, which on a 4:2:0 stream is
+/// spec-invalid and tells a conforming decoder to read the planes as GBR).
+/// Unspecified is 2.
+const NVENC_AV1_COLOR_PRIMARIES_OFFSET: usize = 236;
+const NVENC_AV1_TRANSFER_CHARACTERISTICS_OFFSET: usize = 240;
+const NVENC_AV1_MATRIX_COEFFICIENTS_OFFSET: usize = 244;
+/// `NV_ENC_VUI_*_UNSPECIFIED` — the same value (2) for all three enums.
+const NVENC_VUI_UNSPECIFIED: u32 = 2;
 
 fn w32(buf: &mut [u8], off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_ne_bytes());
@@ -792,6 +803,27 @@ impl NvencDirectEncoder {
             w32(&mut config_buf, vui + NVENC_VUI_VIDEO_FULL_RANGE, 1);
         } else {
             w32(&mut config_buf, NVENC_AV1_COLOR_RANGE_OFFSET, 1);
+            // AV1 has no flag we control to suppress the colour description,
+            // so the other three fields have to be meaningful.  The preset
+            // leaves them zeroed, and zero means RESERVED0/RESERVED0/
+            // MC_IDENTITY — not "unspecified".  Say unspecified explicitly
+            // and let colorRange carry the only claim blit actually makes;
+            // every other AV1 writer here (VA-API, Vulkan) already does.
+            w32(
+                &mut config_buf,
+                NVENC_AV1_COLOR_PRIMARIES_OFFSET,
+                NVENC_VUI_UNSPECIFIED,
+            );
+            w32(
+                &mut config_buf,
+                NVENC_AV1_TRANSFER_CHARACTERISTICS_OFFSET,
+                NVENC_VUI_UNSPECIFIED,
+            );
+            w32(
+                &mut config_buf,
+                NVENC_AV1_MATRIX_COEFFICIENTS_OFFSET,
+                NVENC_VUI_UNSPECIFIED,
+            );
         }
 
         // Initialize encoder
@@ -1022,327 +1054,13 @@ impl NvencDirectEncoder {
         }
     }
 
-    /// Encode from a DMA-BUF fd, importing it into CUDA device memory via
-    /// `cuImportExternalMemory` and registering that with NVENC.
-    ///
-    /// **This does not work today, and has never run.** Nothing hands NVENC a
-    /// `PixelData::DmaBuf` — the server only takes the external-buffer branch
-    /// for VA-API — so it has no live caller; and if it had one, the import
-    /// would still fail, because what it is handed is a `dma_buf`. It asks for
-    /// `CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD`, which CUDA documents as a
-    /// handle obtained from Vulkan via
-    /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT` — an NVIDIA-internal
-    /// object, not a `dma_buf`. Every fd this codebase can produce (GBM BOs,
-    /// `vkGetMemoryFdKHR` with `DMA_BUF_EXT`) is a `dma_buf`.
-    ///
-    /// An earlier round of this comment reported that handle types 1 through
-    /// 32 all return `CUDA_ERROR_INVALID_VALUE` against a real GBM BO, and
-    /// read that as the driver refusing `dma_buf`. That measurement was
-    /// confounded: it used this function's descriptor layout, which had
-    /// `size` at offset 16 and so passed size=0 (see the layout note below).
-    /// Every handle type fails that way, `dma_buf` or not, so the sweep could
-    /// not distinguish the two.
-    ///
-    /// Re-measured on nvidia-x11 595.84 / RTX 4090 with the corrected layout,
-    /// and with the positive control the earlier note called for — a
-    /// `VkBuffer` exported once as `OPAQUE_FD` and once as `DMA_BUF_EXT`, fed
-    /// to the same import:
-    ///   - `OPAQUE_FD` imports, maps through
-    ///     `cuExternalMemoryGetMappedBuffer`, and round-trips a byte pattern
-    ///     written through the device pointer. The approach is sound.
-    ///   - `DMA_BUF_EXT` fails with `CUDA_ERROR_UNKNOWN` — a different error
-    ///     than a malformed descriptor draws, i.e. the driver gets as far as
-    ///     considering the object and refuses it. Consistent with the blob's
-    ///     one dma_buf string,
-    ///     `CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMABUF_FD not supported on
-    ///     platform`.
-    ///
-    /// So the conclusion stands — this function cannot be fixed by pointing
-    /// it at a different handle type — but the reason is the handle *kind*,
-    /// not a descriptor the driver never accepted.
-    ///
-    /// Making the path real means exporting the compositor's NV12 buffer as
-    /// `OPAQUE_FD` instead of `DMA_BUF_EXT`, plus an exported `VkSemaphore`
-    /// waited on with `cuWaitExternalSemaphoresAsync`: an `OPAQUE_FD`
-    /// allocation carries no implicit `dma_buf` fencing, so CUDA would
-    /// otherwise race the Vulkan blit. Both halves of that are now known to
-    /// work on this host — `vkGetSemaphoreFdKHR(OPAQUE_FD)` exports and
-    /// `cuImportExternalSemaphore` accepts it. Kept rather than deleted
-    /// because the registration and encode half is still the shape that work
-    /// needs.
-    ///
-    /// Returns `None` if the CUDA driver lacks external-memory import
-    /// (pre-10.0) or if the import fails for this fd — today, always the
-    /// latter. Callers fall back to a CPU copy, which is why the failure is
-    /// invisible apart from the one-shot `[nvenc-dmabuf]
-    /// cuImportExternalMemory failed` line.
-    #[cfg(target_os = "linux")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn encode_dmabuf_fd(
-        &mut self,
-        fd: std::os::fd::RawFd,
-        fourcc: u32,
-        _modifier: u64,
-        stride: u32,
-        _offset: u32,
-        src_width: u32,
-        src_height: u32,
-    ) -> Option<(Vec<u8>, bool)> {
-        let cuda = gpu_libs::cuda().ok()?;
-        let cu_import = cuda.cuImportExternalMemory?;
-        let cu_get_buf = cuda.cuExternalMemoryGetMappedBuffer?;
-        let cu_destroy = cuda.cuDestroyExternalMemory?;
-
-        // Map DRM fourcc to the NVENC buffer format.  NVENC accepts ARGB
-        // (BGRA in memory) and ABGR (RGBA in memory) natively — no CPU
-        // colorspace conversion needed for either.
-        let nvenc_fmt = match fourcc {
-            f if f == blit_compositor::drm_fourcc::ARGB8888
-                || f == blit_compositor::drm_fourcc::XRGB8888 =>
-            {
-                NV_ENC_BUFFER_FORMAT_ARGB
-            }
-            f if f == blit_compositor::drm_fourcc::ABGR8888
-                || f == blit_compositor::drm_fourcc::XBGR8888 =>
-            {
-                NV_ENC_BUFFER_FORMAT_ABGR
-            }
-            _ => return None, // NV12 DMA-BUFs are multi-plane; skip for now
-        };
-
-        // DMA-BUF size from lseek.
-        let buf_size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
-        if buf_size <= 0 {
-            return None;
-        }
-        let buf_size = buf_size as u64;
-
-        // dup() the fd because CUDA takes ownership and closes it.
-        let dup_fd = unsafe { libc::dup(fd) };
-        if dup_fd < 0 {
-            return None;
-        }
-
-        unsafe { (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx) };
-
-        // CUDA_EXTERNAL_MEMORY_HANDLE_DESC (CUDA 10.0+)
-        // Layout (from cuda.h):
-        //   enum CUexternalMemoryHandleType type;  // offset 0, 4 bytes
-        //   union {                                 // offset 8 (8-byte aligned)
-        //       int fd;
-        //       struct { void *handle; const void *name; } win32;   // 16 bytes
-        //       const void *nvSciBufObject;
-        //   } handle;                               // occupies 8..24
-        //   unsigned long long size;                // offset 24
-        //   unsigned int flags;                     // offset 32
-        //   unsigned int reserved[16];              // offset 36
-        // Total size: ~104 bytes, we use 128 to be safe.
-        //
-        // The union is sized by its *largest* member — the 16-byte win32
-        // struct — not by `fd`.  This was long written as size@16/flags@24,
-        // which put `size` in the union's tail and read `size` out of what
-        // we meant as `flags`: every import got size=0 and was rejected
-        // with CUDA_ERROR_INVALID_VALUE, for every handle type.  That is
-        // what made this path look like a driver limitation rather than a
-        // bug here.  Verified on nvidia-x11 595.84 / RTX 4090: with the
-        // offsets below a Vulkan OPAQUE_FD allocation imports, maps via
-        // cuExternalMemoryGetMappedBuffer, and a byte pattern written
-        // through the resulting device pointer reads back intact.
-        const CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: u32 = 1;
-        let mut handle_desc = [0u8; 128];
-        // type @ 0
-        handle_desc[0..4].copy_from_slice(&CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD.to_ne_bytes());
-        // handle.fd @ 8 (first member of the union)
-        handle_desc[8..12].copy_from_slice(&dup_fd.to_ne_bytes());
-        // size @ 24 (after the 16-byte union)
-        handle_desc[24..32].copy_from_slice(&buf_size.to_ne_bytes());
-        // flags @ 32 = 0
-
-        let mut ext_mem: gpu_libs::CUexternalMemory = ptr::null_mut();
-        let status = unsafe { cu_import(&mut ext_mem, handle_desc.as_ptr() as *const _) };
-        if status != 0 {
-            // Import failed — close the dup'd fd (CUDA didn't take it).
-            unsafe { libc::close(dup_fd) };
-            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
-            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
-            static LOGGED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!("[nvenc-dmabuf] cuImportExternalMemory failed: {status}");
-            }
-            return None;
-        }
-        // fd ownership transferred to CUDA on success — do NOT close dup_fd.
-
-        // CUDA_EXTERNAL_MEMORY_BUFFER_DESC
-        // Layout:
-        //   unsigned long long offset;    // 0
-        //   unsigned long long size;      // 8
-        //   unsigned int flags;           // 16
-        //   unsigned int reserved[16];    // 20
-        // Total: ~84 bytes, use 128.
-        let mut buf_desc = [0u8; 128];
-        // offset @ 0 = 0
-        buf_desc[8..16].copy_from_slice(&buf_size.to_ne_bytes()); // size @ 8
-
-        let mut devptr: gpu_libs::CUdeviceptr = 0;
-        let status = unsafe { cu_get_buf(&mut devptr, ext_mem, buf_desc.as_ptr() as *const _) };
-        if status != 0 {
-            unsafe { cu_destroy(ext_mem) };
-            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
-            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
-            eprintln!("[nvenc-dmabuf] cuExternalMemoryGetMappedBuffer failed: {status}");
-            return None;
-        }
-
-        // Register the imported device pointer with NVENC as a temporary
-        // input resource.  The existing self.cuda_registered is for the
-        // persistent staging buffer — we need a separate registration here
-        // because the devptr, pitch, and dimensions may differ.
-        let enc_w = src_width;
-        let enc_h = src_height;
-        let pitch = stride;
-
-        let mut reg_buf = vec![0u8; NVENC_REGISTER_RESOURCE_SIZE];
-        w32(&mut reg_buf, 0, NV_ENC_REGISTER_RESOURCE_VER);
-        w32(&mut reg_buf, 4, NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR);
-        w32(&mut reg_buf, 8, enc_w);
-        w32(&mut reg_buf, 12, enc_h);
-        w32(&mut reg_buf, 16, pitch);
-        wptr(&mut reg_buf, 24, devptr as *mut c_void);
-        w32(&mut reg_buf, 40, nvenc_fmt);
-
-        let nv_status = unsafe {
-            (self.fns.nvEncRegisterResource)(self.encoder, reg_buf.as_mut_ptr() as *mut c_void)
-        };
-        if nv_status != NV_ENC_SUCCESS {
-            unsafe { cu_destroy(ext_mem) };
-            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
-            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
-            eprintln!("[nvenc-dmabuf] nvEncRegisterResource failed: {nv_status}");
-            return None;
-        }
-        let registered = rptr(&reg_buf, 32);
-
-        // Map the resource for encoding.
-        let mut map_buf = vec![0u8; NVENC_MAP_INPUT_RESOURCE_SIZE];
-        w32(&mut map_buf, 0, NV_ENC_MAP_INPUT_RESOURCE_VER);
-        wptr(&mut map_buf, 16, registered);
-
-        let nv_status = unsafe {
-            (self.fns.nvEncMapInputResource)(self.encoder, map_buf.as_mut_ptr() as *mut c_void)
-        };
-        if nv_status != NV_ENC_SUCCESS {
-            unsafe {
-                (self.fns.nvEncUnregisterResource)(self.encoder, registered);
-                cu_destroy(ext_mem);
-            }
-            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
-            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
-            eprintln!("[nvenc-dmabuf] nvEncMapInputResource failed: {nv_status}");
-            return None;
-        }
-        let mapped_resource = rptr(&map_buf, 24);
-
-        // Encode.
-        let mut pic_buf = vec![0u8; NVENC_PIC_PARAMS_SIZE];
-        w32(&mut pic_buf, 0, NV_ENC_PIC_PARAMS_VER);
-        w32(&mut pic_buf, 4, enc_w);
-        w32(&mut pic_buf, 8, enc_h);
-        w32(&mut pic_buf, 12, pitch);
-        w32(&mut pic_buf, 20, self.frame_idx);
-        w64(&mut pic_buf, 24, self.frame_idx as u64);
-        wptr(&mut pic_buf, 40, mapped_resource);
-        wptr(&mut pic_buf, 48, self.output_buffer);
-        w32(&mut pic_buf, 64, nvenc_fmt);
-        w32(&mut pic_buf, 68, 1); // NV_ENC_PIC_STRUCT_FRAME
-
-        if self.force_idr {
-            // Include OUTPUT_SPSPPS (0x4) so that AV1 keyframes contain
-            // the sequence header OBU and H.264 IDRs include SPS/PPS.
-            // Without this, decoders joining mid-stream cannot decode
-            // forced keyframes produced via the DMA-BUF path.
-            w32(&mut pic_buf, 16, NV_ENC_PIC_FLAGS_FORCEIDR | 0x4);
-            w32(&mut pic_buf, 72, NV_ENC_PIC_TYPE_IDR);
-        }
-
-        self.frame_idx += 1;
-
-        let nv_status = unsafe {
-            (self.fns.nvEncEncodePicture)(self.encoder, pic_buf.as_mut_ptr() as *mut c_void)
-        };
-
-        let result = if nv_status == NV_ENC_SUCCESS {
-            // Encode succeeded — safe to clear the IDR request.
-            self.force_idr = false;
-
-            // Lock and read bitstream.
-            let mut lock_buf = vec![0u8; NVENC_LOCK_BITSTREAM_SIZE];
-            w32(&mut lock_buf, 0, NV_ENC_LOCK_BITSTREAM_VER);
-            wptr(&mut lock_buf, 8, self.output_buffer);
-
-            let lock_status = unsafe {
-                (self.fns.nvEncLockBitstream)(self.encoder, lock_buf.as_mut_ptr() as *mut c_void)
-            };
-            if lock_status == NV_ENC_SUCCESS {
-                let size = r32(&lock_buf, 36) as usize;
-                let buf_ptr = rptr(&lock_buf, 56) as *const u8;
-                let nal_data = if !buf_ptr.is_null() && size > 0 {
-                    unsafe { std::slice::from_raw_parts(buf_ptr, size) }.to_vec()
-                } else {
-                    Vec::new()
-                };
-                let is_idr = self.is_keyframe_pic_type(r32(&lock_buf, 64));
-                unsafe { (self.fns.nvEncUnlockBitstream)(self.encoder, self.output_buffer) };
-                if nal_data.is_empty() {
-                    None
-                } else {
-                    let mut nal_data = nal_data;
-                    self.ensure_h264_sps_pps(&mut nal_data, is_idr);
-                    Some((nal_data, is_idr))
-                }
-            } else {
-                None
-            }
-        } else {
-            if nv_status != NV_ENC_ERR_NEED_MORE_INPUT {
-                eprintln!("[nvenc-dmabuf] nvEncEncodePicture failed: {nv_status}");
-            }
-            // force_idr stays true — next call retries.
-            None
-        };
-
-        // Cleanup: unmap, unregister, destroy external memory.
-        unsafe {
-            (self.fns.nvEncUnmapInputResource)(self.encoder, mapped_resource);
-            (self.fns.nvEncUnregisterResource)(self.encoder, registered);
-            cu_destroy(ext_mem);
-        }
-
-        let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
-        unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
-
-        if result.is_some() {
-            static LOGGED_OK: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !LOGGED_OK.swap(true, std::sync::atomic::Ordering::Relaxed) && self.verbose {
-                eprintln!(
-                    "[nvenc-dmabuf] zero-copy encode ok {src_width}x{src_height} stride={stride}"
-                );
-            }
-        }
-
-        result
-    }
-
     /// Zero-copy encode of an NV12 buffer the compositor exported as
     /// `OPAQUE_FD` — the pixels never leave the GPU.
     ///
-    /// This is the path `encode_dmabuf_fd` was documented as being and
-    /// never was. The difference is the handle type: CUDA imports an
-    /// `OPAQUE_FD` (verified on nvidia-x11 595.84 / RTX 4090, including a
-    /// byte-pattern round trip through the mapped pointer) and refuses a
-    /// `dma_buf`.
+    /// This is the only zero-copy import NVENC gets. The handle type is what
+    /// makes it work: CUDA imports an `OPAQUE_FD` (verified on nvidia-x11
+    /// 595.84 / RTX 4090, including a byte-pattern round trip through the
+    /// mapped pointer) and refuses a `dma_buf`.
     ///
     /// `sync_fd` is not optional in practice. An `OPAQUE_FD` allocation
     /// carries none of the implicit fencing a `dma_buf` does, so without
@@ -1432,8 +1150,8 @@ impl NvencDirectEncoder {
 
         // The session was created at self.width/self.height (even-rounded
         // and clamped to the caps). Encoding at the source dimensions
-        // instead — as encode_dmabuf_fd does — hands NVENC dimensions the
-        // session was not configured for.
+        // instead would hand NVENC dimensions the session was not
+        // configured for.
         let enc_w = self.width;
         let enc_h = self.height;
 
