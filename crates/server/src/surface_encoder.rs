@@ -1197,7 +1197,10 @@ impl SurfaceEncoder {
         )
     }
 
+    // Kept so non-Linux still compiles, though nothing off Linux registers
+    // a downscale target to ask.
     #[cfg(not(target_os = "linux"))]
+    #[allow(dead_code)]
     pub fn wants_nv12_opaque_fd(&self) -> bool {
         false
     }
@@ -1205,6 +1208,7 @@ impl SurfaceEncoder {
     /// Which OPAQUE_FD layout this encoder's session consumes: planar
     /// YUV444 for a 4:4:4 session, NV12 otherwise.  Only meaningful when
     /// `wants_nv12_opaque_fd` is true.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn opaque_wants_444(&self) -> bool {
         self.chroma.is_444()
     }

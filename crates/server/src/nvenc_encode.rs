@@ -55,8 +55,12 @@ const NV_ENC_RECONFIGURE_PARAMS_VER: u32 = nvencapi_struct_version(1) | (1 << 31
 
 // Buffer formats (from nv-codec-headers 12.1)
 const NV_ENC_BUFFER_FORMAT_NV12: u32 = 0x00000001;
+// YUV444 and ABGR are only reached from the DMA-BUF / OPAQUE_FD import
+// paths, which are Linux-only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const NV_ENC_BUFFER_FORMAT_YUV444: u32 = 0x00001000; // planar Y,U,V — NOT 0x10, that's YV12
 const NV_ENC_BUFFER_FORMAT_ARGB: u32 = 0x01000000; // B8G8R8A8 in memory (DRM ARGB8888)
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const NV_ENC_BUFFER_FORMAT_ABGR: u32 = 0x10000000; // R8G8B8A8 in memory (DRM ABGR8888)
 
 // Encoder capability query.  The values are ordinals into `NV_ENC_CAPS`
@@ -390,7 +394,9 @@ pub struct NvencDirectEncoder {
     cuda_registered_nv12: *mut c_void,
     nv12_pitch: u32,
     /// Session chroma: true = 4:4:4.  Zero-copy buffers must arrive in
-    /// the matching layout (planar YUV444 vs NV12).
+    /// the matching layout (planar YUV444 vs NV12).  Read only by the
+    /// OPAQUE_FD encode path, which is Linux-only.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     session_is_444: bool,
     verbose: bool,
     /// Cached SPS+PPS NAL units (Annex B with start codes) from the first
@@ -1370,7 +1376,11 @@ impl NvencDirectEncoder {
             if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!(
                     "[nvenc-zerocopy] buffer is_444={is_444} but session is {}; refusing",
-                    if self.session_is_444 { "4:4:4" } else { "4:2:0" },
+                    if self.session_is_444 {
+                        "4:4:4"
+                    } else {
+                        "4:2:0"
+                    },
                 );
             }
             return None;

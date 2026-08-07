@@ -993,9 +993,11 @@ fn nv12_opaque_safe_for_target(
     // buffer but agree on its layout — a 4:2:0 session cannot read the
     // planar YUV444 buffer a 4:4:4 neighbour needs, and vice versa.
     this_wants
-        && others.into_iter().all(|(their_target, they_want, their_444)| {
-            their_target != Some(target) || (they_want && their_444 == this_444)
-        })
+        && others
+            .into_iter()
+            .all(|(their_target, they_want, their_444)| {
+                their_target != Some(target) || (they_want && their_444 == this_444)
+            })
 }
 
 /// Whether an `OPAQUE_FD` frame is still coming for `(sid, target)`, i.e.
@@ -5270,7 +5272,10 @@ async fn tick(state: &AppState) -> TickOutcome {
         sid: u16,
         /// The compositor native size the target was inscribed into, carried
         /// through so the registration below can stamp it on the target.
+        /// Only the compositor-backed (Linux) path registers targets.
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
         native_w: u32,
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
         native_h: u32,
         /// None when `SurfaceEncoder::new` failed; the completion
         /// handler logs and latches a backoff so the tick loop doesn't
@@ -5520,7 +5525,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                     view,
                     native_w,
                     native_h,
-                    if scaled.is_some() { None } else { native_logical },
+                    if scaled.is_some() {
+                        None
+                    } else {
+                        native_logical
+                    },
                     surface_encode_cap(&state.config.surface_encoders, client, sid),
                 );
                 let (enc_w, enc_h) = (target_w, target_h);
@@ -14797,12 +14806,7 @@ mod tests {
         // Viewport 8000×4500 and native 8000×4500, but H.264 caps at
         // 3840×2160 — same 16:9 aspect, picks (3840, 2160).
         assert_eq!(
-            encode_target_at_1x(
-                Some((8000, 4500, 240)),
-                8000,
-                4500,
-                Some((3840, 2160))
-            ),
+            encode_target_at_1x(Some((8000, 4500, 240)), 8000, 4500, Some((3840, 2160))),
             (3840, 2160)
         );
     }
@@ -14810,10 +14814,7 @@ mod tests {
     #[test]
     fn per_client_encode_target_falls_back_to_native_without_view_size() {
         // Client hasn't sent C2S_SURFACE_RESIZE yet — encode at native.
-        assert_eq!(
-            encode_target_at_1x(None, 800, 600, None),
-            (800, 600)
-        );
+        assert_eq!(encode_target_at_1x(None, 800, 600, None), (800, 600));
         // Zero-dim viewport (cleared by client) ⇒ also fall back.
         assert_eq!(
             encode_target_at_1x(Some((0, 0, 120)), 800, 600, None),

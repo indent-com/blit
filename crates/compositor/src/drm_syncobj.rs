@@ -89,10 +89,8 @@ struct DrmSyncobjTimelineArray {
 const DRM_IOCTL_GET_CAP: u64 = drm_iowr(0x0c, std::mem::size_of::<DrmGetCap>());
 const DRM_IOCTL_SYNCOBJ_CREATE: u64 = drm_iowr(0xBF, std::mem::size_of::<DrmSyncobjCreate>());
 const DRM_IOCTL_SYNCOBJ_DESTROY: u64 = drm_iowr(0xC0, std::mem::size_of::<DrmSyncobjDestroy>());
-const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: u64 =
-    drm_iowr(0xC1, std::mem::size_of::<DrmSyncobjHandle>());
-const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: u64 =
-    drm_iowr(0xC2, std::mem::size_of::<DrmSyncobjHandle>());
+const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: u64 = drm_iowr(0xC1, std::mem::size_of::<DrmSyncobjHandle>());
+const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: u64 = drm_iowr(0xC2, std::mem::size_of::<DrmSyncobjHandle>());
 const DRM_IOCTL_SYNCOBJ_TRANSFER: u64 = drm_iowr(0xCC, std::mem::size_of::<DrmSyncobjTransfer>());
 
 /// `DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE`.
@@ -253,7 +251,10 @@ impl SyncPoint {
     pub(crate) fn export_sync_file(&self) -> std::io::Result<OwnedFd> {
         use std::os::fd::FromRawFd;
         let dev = &self.timeline.device;
-        let mut create = DrmSyncobjCreate { handle: 0, flags: 0 };
+        let mut create = DrmSyncobjCreate {
+            handle: 0,
+            flags: 0,
+        };
         dev.ioctl(DRM_IOCTL_SYNCOBJ_CREATE, &mut create)?;
         let tmp = create.handle;
         let result = (|| {
