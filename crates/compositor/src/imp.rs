@@ -798,6 +798,14 @@ pub enum CompositorCommand {
     TextInput {
         text: String,
     },
+    /// Text the user is still composing, for the app to show inline until it
+    /// is committed or withdrawn.  Delivered via `zwp_text_input_v3`
+    /// preedit_string; `cursor` is a byte offset into `text`, and an empty
+    /// `text` withdraws the composition.
+    Preedit {
+        text: String,
+        cursor: u16,
+    },
     /// Update the advertised output refresh rate (millihertz).
     SetRefreshRate {
         mhz: u32,
@@ -1409,8 +1417,22 @@ fn keycode_to_mod(keycode: u32) -> u32 {
 /// Per-object state for a `zwp_text_input_v3` resource.
 struct TextInputState {
     resource: ZwpTextInputV3,
-    /// Whether the client has sent `enable` (text input is active).
+    /// Whether text input is active, i.e. the client has sent `enable` *and*
+    /// the `commit` that applies it.
     enabled: bool,
+    /// The `enable`/`disable` the client has asked for but not yet committed.
+    /// Both requests are double-buffered, so acting on one before its commit
+    /// would hand text to an input the client has not turned on.
+    pending_enabled: bool,
+    /// Whether the app is currently drawing a preedit we put there.  Every
+    /// `done` resets the preedit, so this tracks who owes a clearing one:
+    /// a composition committed as synthesised keys sends no `done` of its
+    /// own, and its preedit would otherwise stay on screen forever.
+    preedit_shown: bool,
+    /// How many `commit` requests this object has issued.  The spec defines
+    /// the `done` serial as exactly this count, per object -- a client that
+    /// gets any other number applies the text without adopting the state.
+    commits: u32,
 }
 
 /// Main compositor state.
@@ -1562,10 +1584,6 @@ struct Compositor {
     /// composed text from the browser it delivers it via `commit_string`
     /// + `done` to the text_input object belonging to the focused surface.
     text_inputs: Vec<TextInputState>,
-    /// Serial counter for `zwp_text_input_v3.done` events.  Incremented on
-    /// every `done` event sent by the compositor.
-    #[expect(dead_code)]
-    text_input_serial: u32,
 
     // -- Activation --
     next_activation_token: u32,
@@ -1685,6 +1703,71 @@ impl Compositor {
         }
     }
 
+    /// Hand `composed` to the focused client's input method and clear it.
+    ///
+    /// Only the characters the keymap cannot express come through here, so a
+    /// client with no enabled input method is no worse off than before: they
+    /// were dropped then and they are dropped now.  What changes is that a
+    /// client which asked for text finally gets it.
+    fn flush_composed(&mut self, focused_wl: &WlSurface, composed: &mut String) {
+        if composed.is_empty() {
+            return;
+        }
+        let text = std::mem::take(composed);
+        for ti in &mut self.text_inputs {
+            if !ti.enabled || !same_client(&ti.resource, focused_wl) {
+                continue;
+            }
+            ti.resource.commit_string(Some(text.clone()));
+            // Nothing is inserted until `done` — commit_string only sets
+            // pending state.  That same `done` also resets the preedit, so
+            // the composition this text came from clears itself.
+            ti.resource.done(ti.commits);
+            ti.preedit_shown = false;
+        }
+    }
+
+    /// Show `text` as the composition in progress, or withdraw it when empty.
+    ///
+    /// A preedit is only meaningful inside the app's own text field, so a
+    /// client with no input method enabled is not sent one — its composed
+    /// text still arrives on commit, as keys or as `commit_string`.
+    fn send_preedit(&mut self, focused_wl: &WlSurface, text: &str, cursor: u16) {
+        let cursor = i32::from(cursor.min(text.len().min(i32::MAX as usize) as u16));
+        for ti in &mut self.text_inputs {
+            if !ti.enabled || !same_client(&ti.resource, focused_wl) {
+                continue;
+            }
+            // Withdrawing a preedit nobody is showing is a `done` that only
+            // costs the client a state reset it did not need.
+            if text.is_empty() && !ti.preedit_shown {
+                continue;
+            }
+            ti.resource.preedit_string(
+                (!text.is_empty()).then(|| text.to_string()),
+                cursor,
+                cursor,
+            );
+            ti.resource.done(ti.commits);
+            ti.preedit_shown = !text.is_empty();
+        }
+    }
+
+    /// Take back a preedit that nothing else has cleared.
+    ///
+    /// Committing through the synthesised-key path sends no `done`, so
+    /// without this the pending composition stays drawn under text the app
+    /// has already inserted.
+    fn clear_stale_preedit(&mut self, focused_wl: &WlSurface) {
+        for ti in &mut self.text_inputs {
+            if !ti.preedit_shown || !same_client(&ti.resource, focused_wl) {
+                continue;
+            }
+            ti.resource.done(ti.commits);
+            ti.preedit_shown = false;
+        }
+    }
+
     /// The surface that currently holds `wl_keyboard.enter`.
     ///
     /// A grabbing popup outranks the focused toplevel: while a menu is up it
@@ -1709,9 +1792,12 @@ impl Compositor {
                 kb.leave(serial, wl);
             }
         }
-        for ti in &self.text_inputs {
+        for ti in &mut self.text_inputs {
             if same_client(&ti.resource, wl) {
                 ti.resource.leave(wl);
+                // "The client should reset any preedit string previously
+                // set" — so whatever we last drew is already gone.
+                ti.preedit_shown = false;
             }
         }
     }
@@ -3214,12 +3300,12 @@ impl Compositor {
                 let _ = self.display_handle.flush_clients();
             }
             CompositorCommand::TextInput { text } => {
-                let focused_wl = self
-                    .toplevel_surface_ids
-                    .get(&self.focused_surface_id)
-                    .and_then(|root_id| self.surfaces.get(root_id))
-                    .map(|s| s.wl_surface.clone());
-                let Some(focused_wl) = focused_wl else { return };
+                // Whoever holds `wl_keyboard.enter` — a grabbing popup, else
+                // the focused toplevel — is also who was sent the text-input
+                // `enter`, so both halves below address the same surface.
+                let Some(focused_wl) = self.keyboard_focus_wl() else {
+                    return;
+                };
 
                 // Synthesise evdev key sequences for ASCII
                 // characters that exist on the US-QWERTY layout.
@@ -3237,9 +3323,24 @@ impl Compositor {
                 // subsequent key combo (e.g. Ctrl+Shift+Q) still sees
                 // the Shift modifier from the physically-held key.
                 const KEY_LEFTSHIFT: u32 = 42;
+                // Withdraw any composition before typing into it.  A
+                // commit_string that lands while a preedit is still up is
+                // applied at the composition's anchor rather than at the
+                // caret, so mixing it with synthesised keys puts the two
+                // halves in the wrong order — real Chromium turns "hi日本語"
+                // into "日本語hi".  Clearing first also means the key path,
+                // which sends no `done` of its own, cannot leave an
+                // abandoned composition on screen.
+                self.clear_stale_preedit(&focused_wl);
                 let saved_mods_depressed = self.mods_depressed;
+                // Characters US-QWERTY has no key for go to the input method
+                // instead.  They accumulate into runs so that a mixed string
+                // ("café") still reaches the app in source order: each run is
+                // flushed before the next key that follows it.
+                let mut composed = String::new();
                 for ch in text.chars() {
                     if let Some((kc, need_shift)) = char_to_keycode(ch) {
+                        self.flush_composed(&focused_wl, &mut composed);
                         let time = elapsed_ms();
                         if need_shift {
                             let serial = self.next_serial();
@@ -3281,10 +3382,11 @@ impl Compositor {
                             }
                             self.update_and_send_modifiers(KEY_LEFTSHIFT, false);
                         }
+                    } else {
+                        composed.push(ch);
                     }
-                    // Non-ASCII characters without a text_input_v3 path
-                    // are silently dropped.
                 }
+                self.flush_composed(&focused_wl, &mut composed);
                 // Restore the real modifier state that was active before
                 // text synthesis.  If the user is still holding Shift,
                 // this puts MOD_SHIFT back into mods_depressed.
@@ -3297,6 +3399,13 @@ impl Compositor {
                         }
                     }
                 }
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::Preedit { text, cursor } => {
+                let Some(focused_wl) = self.keyboard_focus_wl() else {
+                    return;
+                };
+                self.send_preedit(&focused_wl, &text, cursor);
                 let _ = self.display_handle.flush_clients();
             }
             CompositorCommand::PointerMotion { surface_id, x, y } => {
@@ -7009,6 +7118,9 @@ impl Dispatch<ZwpTextInputManagerV3, ()> for Compositor {
                 state.text_inputs.push(TextInputState {
                     resource: ti,
                     enabled: false,
+                    pending_enabled: false,
+                    preedit_shown: false,
+                    commits: 0,
                 });
             }
             Request::Destroy => {}
@@ -7028,32 +7140,33 @@ impl Dispatch<ZwpTextInputV3, ()> for Compositor {
         _: &mut DataInit<'_, Self>,
     ) {
         use zwp_text_input_v3::Request;
+        if matches!(request, Request::Destroy) {
+            state
+                .text_inputs
+                .retain(|t| t.resource.id() != resource.id());
+            return;
+        }
+        let Some(ti) = state
+            .text_inputs
+            .iter_mut()
+            .find(|t| t.resource.id() == resource.id())
+        else {
+            return;
+        };
         match request {
+            // enable/disable are double-buffered: they name the pending
+            // state, and only the commit below promotes it.
             Request::Enable => {
-                if let Some(ti) = state
-                    .text_inputs
-                    .iter_mut()
-                    .find(|t| t.resource.id() == resource.id())
-                {
-                    ti.enabled = true;
-                }
+                ti.pending_enabled = true;
+                // enable "resets all state associated with ... preedit_string",
+                // so the client is about to be showing nothing.
+                ti.preedit_shown = false;
             }
-            Request::Disable => {
-                if let Some(ti) = state
-                    .text_inputs
-                    .iter_mut()
-                    .find(|t| t.resource.id() == resource.id())
-                {
-                    ti.enabled = false;
-                }
-            }
+            Request::Disable => ti.pending_enabled = false,
             Request::Commit => {
-                // Client acknowledges our last done; nothing to do.
-            }
-            Request::Destroy => {
-                state
-                    .text_inputs
-                    .retain(|t| t.resource.id() != resource.id());
+                ti.enabled = ti.pending_enabled;
+                // This count *is* the serial we owe back on `done`.
+                ti.commits = ti.commits.wrapping_add(1);
             }
             // SetSurroundingText, SetTextChangeCause, SetContentType,
             // SetCursorRectangle — informational; ignored for now.
@@ -7510,7 +7623,6 @@ fn run_compositor(
         relative_pointers: Vec::new(),
         axis_scale: HashMap::new(),
         text_inputs: Vec::new(),
-        text_input_serial: 0,
         next_activation_token: 1,
         popup_grab_stack: Vec::new(),
         kb_focus_popup: None,

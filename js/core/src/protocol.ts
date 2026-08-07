@@ -35,6 +35,7 @@ import {
   C2S_SURFACE_ACK,
   C2S_SURFACE_CLOSE,
   C2S_CLIENT_FEATURES,
+  C2S_SURFACE_PREEDIT,
   C2S_SURFACE_TEXT,
   C2S_AUDIO_SUBSCRIBE,
   C2S_AUDIO_UNSUBSCRIBE,
@@ -424,6 +425,32 @@ export function buildSurfaceTextMessage(
   msg[1] = surfaceId & 0xff;
   msg[2] = (surfaceId >> 8) & 0xff;
   msg.set(encoded, 3);
+  return msg;
+}
+
+/**
+ * Composition in progress: [0x34][surface_id:2][cursor:2][text:N].
+ *
+ * `cursorUtf16` is a UTF-16 offset (what the DOM counts in) and goes on the
+ * wire as a byte offset, which is what zwp_text_input_v3 wants — the two
+ * disagree for exactly the characters a composition is usually made of.
+ */
+export function buildSurfacePreeditMessage(
+  surfaceId: number,
+  text: string,
+  cursorUtf16: number,
+): Uint8Array {
+  const encoded = textEncoder.encode(text);
+  const cursor = textEncoder.encode(
+    text.slice(0, Math.max(0, cursorUtf16)),
+  ).length;
+  const msg = new Uint8Array(5 + encoded.length);
+  msg[0] = C2S_SURFACE_PREEDIT;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  msg[3] = cursor & 0xff;
+  msg[4] = (cursor >> 8) & 0xff;
+  msg.set(encoded, 5);
   return msg;
 }
 

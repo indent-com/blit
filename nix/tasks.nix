@@ -632,7 +632,18 @@ in
       pkgs.libopus
     ];
     text = ''
-      ${fmt}/bin/blit-fmt --check
+      check=false
+      for arg in "$@"; do
+        case "$arg" in
+          --check) check=true ;;
+        esac
+      done
+
+      if [ "$check" = true ]; then
+        ${fmt}/bin/blit-fmt --check
+      else
+        ${fmt}/bin/blit-fmt
+      fi
       echo ""
       ${clippy}/bin/blit-clippy
     '';

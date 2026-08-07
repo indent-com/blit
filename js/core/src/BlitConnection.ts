@@ -74,6 +74,7 @@ import {
   buildScrollByMessage,
   buildSearchMessage,
   buildSurfaceInputMessage,
+  buildSurfacePreeditMessage,
   buildSurfaceTextMessage,
   buildSurfacePointerMessage,
   buildSurfaceAxisMessage,
@@ -2837,6 +2838,18 @@ export class BlitConnection {
   sendSurfaceText(surfaceId: number, text: string): void {
     if (this.transport.status !== "connected") return;
     this.transport.send(buildSurfaceTextMessage(surfaceId, text));
+  }
+
+  /** Report the composition in progress; empty text withdraws it. */
+  sendSurfacePreedit(
+    surfaceId: number,
+    text: string,
+    cursorUtf16: number,
+  ): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(
+      buildSurfacePreeditMessage(surfaceId, text, cursorUtf16),
+    );
   }
 
   sendSurfacePointer(

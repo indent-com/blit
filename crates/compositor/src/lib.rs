@@ -264,6 +264,14 @@ mod stub {
         TextInput {
             text: String,
         },
+        /// Text the user is still composing, for the app to show inline until
+        /// it is committed or withdrawn.  Delivered via `zwp_text_input_v3`
+        /// preedit_string; `cursor` is a byte offset into `text`, and an
+        /// empty `text` withdraws the composition.
+        Preedit {
+            text: String,
+            cursor: u16,
+        },
         ReleaseKeys {
             keycodes: Vec<u32>,
         },

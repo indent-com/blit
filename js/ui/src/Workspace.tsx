@@ -1007,12 +1007,13 @@ function WorkspaceScreen(props: {
   });
 
   // While the keyboard is wanted, focus landing on a surface canvas would
-  // dismiss the IME — a canvas is not editable, and the surface's pointer
-  // handler focuses it on every tap (compositionend hands focus back to it
-  // too).  Redirect to the surface's hidden IME textarea in the same task,
-  // so the IME never sees a non-editable element at rest; keys still reach
-  // the surface because the textarea routes keydown/keyup and composition
-  // through the same handlers as the canvas.
+  // dismiss the IME — a canvas is not editable.  BlitSurfaceCanvas hands its
+  // own canvas focus to the textarea beside it (an IME will not start a
+  // composition otherwise, on any platform), so this capture-phase pass is
+  // the net beneath it: it catches a canvas in a pane whatever put it there,
+  // and runs first, which makes the two agree rather than compete.  Keys
+  // still reach the surface because the textarea routes keydown/keyup and
+  // composition through the same handlers as the canvas.
   createEffect(() => {
     if (!isMobileTouch() || !keyboardWanted()) return;
     const handler = (e: FocusEvent) => {

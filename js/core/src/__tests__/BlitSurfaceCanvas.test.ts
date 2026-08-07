@@ -984,10 +984,13 @@ describe("BlitSurfaceCanvas paste", () => {
 function attachTyping() {
   const texts: string[] = [];
   const keys: { keycode: number; pressed: boolean }[] = [];
+  const preedits: { text: string; cursor: number }[] = [];
   const conn = {
     sendSurfaceText: (_id: number, text: string) => texts.push(text),
     sendSurfaceInput: (_id: number, keycode: number, pressed: boolean) =>
       keys.push({ keycode, pressed }),
+    sendSurfacePreedit: (_id: number, text: string, cursor: number) =>
+      preedits.push({ text, cursor }),
     sendSurfaceFocus: () => {},
     surfaceStore: new Proxy(
       {
@@ -1023,7 +1026,7 @@ function attachTyping() {
   if (!ta) throw new Error("Expected surface input textarea");
   // Only live views take input.
   surface.setDisplaySize(800, 600, 120);
-  return { surface, canvas, ta, texts, keys };
+  return { surface, canvas, ta, texts, keys, preedits };
 }
 
 function inputEvent(init: InputEventInit): InputEvent {
@@ -1064,9 +1067,10 @@ describe("BlitSurfaceCanvas soft-keyboard input", () => {
 
   it("keeps ignoring composition, paste, and composition-commit inputs", () => {
     const { surface, ta, texts, keys } = attachTyping();
-    // Mid-composition text belongs to compositionend; the trailing
-    // insertCompositionText some browsers fire after it was already sent
-    // there; pastes go through the clipboard path.
+    // Mid-composition text is a preedit, not a commit — the commit belongs
+    // to compositionend; the trailing insertCompositionText some browsers
+    // fire after it was already sent there; pastes go through the clipboard
+    // path.
     ta.dispatchEvent(
       inputEvent({ inputType: "insertText", data: "あ", isComposing: true }),
     );
@@ -1099,5 +1103,93 @@ describe("BlitSurfaceCanvas soft-keyboard input", () => {
     ta.dispatchEvent(arrow);
     expect(arrow.defaultPrevented).toBe(true);
     surface.dispose();
+  });
+});
+
+describe("BlitSurfaceCanvas IME focus", () => {
+  /** Focus only moves for real on an element in the document. */
+  function attachLive() {
+    const live = attachTyping();
+    const container = live.canvas.parentElement;
+    if (!container) throw new Error("Expected surface container");
+    document.body.appendChild(container);
+    return { ...live, container };
+  }
+
+  it("hands focus from the canvas to the textarea", () => {
+    // A canvas is not editable, so no browser will start a composition
+    // while focus rests on it — an input method needs the textarea, and
+    // focus reaches the canvas from outside this component (a pane taking
+    // focus, Tab) as well as from its own pointer handler.
+    const { surface, canvas, ta, container } = attachLive();
+
+    canvas.focus();
+
+    expect(document.activeElement).toBe(ta);
+    surface.dispose();
+    container.remove();
+  });
+
+  it("reports the composition in progress, with the caret in it", () => {
+    // The capture textarea is 1px and transparent, so the app drawing this
+    // is the only way the user sees what they have typed so far.  Read from
+    // the `input` event, where the value and caret are the ones on screen —
+    // compositionupdate runs before the DOM is updated and reports the
+    // previous caret, which pinned every composition's cursor to 0.
+    const { surface, ta, preedits, container } = attachLive();
+    ta.focus();
+
+    ta.value = "にほn";
+    ta.setSelectionRange(3, 3);
+    ta.dispatchEvent(
+      inputEvent({
+        inputType: "insertCompositionText",
+        data: "にほn",
+        isComposing: true,
+      }),
+    );
+
+    expect(preedits).toEqual([{ text: "にほn", cursor: 3 }]);
+    surface.dispose();
+    container.remove();
+  });
+
+  it("withdraws the preedit when a composition is cancelled", () => {
+    // Nothing is committed, so nothing else will take back what the app is
+    // still drawing.
+    const { surface, ta, preedits, texts, container } = attachLive();
+    ta.focus();
+    ta.value = "に";
+    ta.dispatchEvent(
+      inputEvent({
+        inputType: "insertCompositionText",
+        data: "に",
+        isComposing: true,
+      }),
+    );
+    preedits.length = 0;
+
+    ta.dispatchEvent(new CompositionEvent("compositionend", { data: "" }));
+
+    expect(preedits).toEqual([{ text: "", cursor: 0 }]);
+    expect(texts).toEqual([]);
+    surface.dispose();
+    container.remove();
+  });
+
+  it("keeps focus on the textarea across a composition", () => {
+    // Returning focus to the canvas after each commit would end the *next*
+    // composition before it began, which is every character after the first.
+    const { surface, ta, texts, container } = attachLive();
+    ta.focus();
+
+    ta.dispatchEvent(
+      new CompositionEvent("compositionend", { data: "日本語" }),
+    );
+
+    expect(texts).toEqual(["日本語"]);
+    expect(document.activeElement).toBe(ta);
+    surface.dispose();
+    container.remove();
   });
 });

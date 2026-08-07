@@ -85,10 +85,11 @@ cargo test --workspace           # all Rust tests
 ./bin/clippy                     # clippy (CI fails on any warning)
 ./bin/fmt --check                # formatting check (CI fails on any diff)
 ./bin/fmt                        # auto-fix formatting
-./bin/lint                       # all of the above in one pass
+./bin/lint --check               # fmt check + clippy (CI gate)
+./bin/lint                       # auto-fix formatting + clippy
 ```
 
-`./bin/fmt` runs `cargo fmt` (Rust) and `prettier` (JS/TS/JSON/MD). `./bin/lint` runs fmt check + clippy together — this is what CI runs.
+`./bin/fmt` runs `cargo fmt` (Rust) and `prettier` (JS/TS/JSON/MD). `./bin/lint` runs fmt + clippy together; pass `--check` to check instead of auto-fixing.
 
 TypeScript (JS workspace — core, react, solid):
 
@@ -252,7 +253,7 @@ CI on the verified tag builds debs/tarballs, publishes to crates.io and npm, upd
 
 ## Guardrails
 
-- `./bin/lint` is the CI gate (fmt + clippy). Run `./bin/fmt` to auto-fix formatting and `./bin/clippy` to check clippy warnings before pushing.
+- `./bin/lint --check` is the CI gate (fmt + clippy). Run `./bin/lint` to auto-fix formatting and `./bin/clippy` to check clippy warnings before pushing.
 - The WASM crate (`crates/browser/`) targets `wasm32-unknown-unknown` — don't add dependencies that pull in `std::net`, `std::fs`, etc.
 - `crates/browser/pkg/` is gitignored. It must be built locally (`./bin/build-browser`) before the UI or React tests will work.
 - The server uses raw `libc` calls (`openpty`, `waitpid`, `kill`, `ioctl`) — changes to PTY lifecycle code need careful attention to signal safety and fd leaks.
