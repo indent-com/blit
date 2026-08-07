@@ -3242,7 +3242,10 @@ export class BlitTerminalSurface {
           touchScrolled = true;
           const dir = touchAccum > 0 ? 1 : -1;
           touchAccum -= dir * lineH;
-          const button = dir > 0 ? 64 : 65;
+          // Natural touch semantics: a finger dragging the content up
+          // (dir > 0) reveals what's below, i.e. wheel-down (65) — the
+          // same sign convention as the finger scroll in BlitSurfaceCanvas.
+          const button = dir > 0 ? 65 : 64;
           const pos = mouseToCell(
             new MouseEvent("wheel", {
               clientX: touch.clientX,

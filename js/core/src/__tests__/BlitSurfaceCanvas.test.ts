@@ -808,3 +808,126 @@ describe("BlitSurfaceCanvas paste", () => {
     dispose();
   });
 });
+
+/** A live view with the text and key sends captured — what soft-keyboard
+ *  input lands on. */
+function attachTyping() {
+  const texts: string[] = [];
+  const keys: { keycode: number; pressed: boolean }[] = [];
+  const conn = {
+    sendSurfaceText: (_id: number, text: string) => texts.push(text),
+    sendSurfaceInput: (_id: number, keycode: number, pressed: boolean) =>
+      keys.push({ keycode, pressed }),
+    sendSurfaceFocus: () => {},
+    surfaceStore: new Proxy(
+      {
+        getSurface: () => ({ width: 800, height: 600 }),
+        getCanvas: () => null,
+        canDecodeVideo: false,
+        generation: 0,
+      } as Record<string, unknown>,
+      {
+        get: (target, prop) =>
+          prop in target ? target[prop as string] : () => () => {},
+      },
+    ),
+    sendSurfaceSubscribe: () => {},
+    sendSurfaceUnsubscribe: () => {},
+  };
+  const workspace = {
+    getConnection: () => conn,
+    subscribe: () => () => {},
+  } as unknown as BlitWorkspace;
+  const surface = new BlitSurfaceCanvas({
+    workspace,
+    connectionId: "conn-1" as never,
+    surfaceId: 7,
+  });
+  const container = document.createElement("div");
+  surface.attach(container);
+  const canvas = surface.canvasElement;
+  if (!canvas) throw new Error("Expected surface canvas");
+  const ta = container.querySelector<HTMLTextAreaElement>(
+    'textarea[aria-label="Surface input"]',
+  );
+  if (!ta) throw new Error("Expected surface input textarea");
+  // Only live views take input.
+  surface.setDisplaySize(800, 600, 120);
+  return { surface, canvas, ta, texts, keys };
+}
+
+function inputEvent(init: InputEventInit): InputEvent {
+  return new InputEvent("input", { cancelable: false, ...init });
+}
+
+describe("BlitSurfaceCanvas soft-keyboard input", () => {
+  it("labels the hidden IME textarea so the keyboard toggle can find it", () => {
+    const { surface, canvas, ta } = attachTyping();
+    // Same container as the canvas: the UI resolves the textarea from the
+    // canvas via parentElement when redirecting focus.
+    expect(ta.parentElement).toBe(canvas.parentElement);
+    expect(ta.tabIndex).toBe(-1);
+    surface.dispose();
+  });
+
+  it("forwards a keydown-less insertText commit as surface text", () => {
+    const { surface, ta, texts } = attachTyping();
+    ta.value = "hi";
+    ta.dispatchEvent(inputEvent({ inputType: "insertText", data: "hi" }));
+    expect(texts).toEqual(["hi"]);
+    expect(ta.value).toBe("");
+    surface.dispose();
+  });
+
+  it("maps input-event line breaks and deletes onto Enter and Backspace", () => {
+    const { surface, ta, keys } = attachTyping();
+    ta.dispatchEvent(inputEvent({ inputType: "insertLineBreak" }));
+    ta.dispatchEvent(inputEvent({ inputType: "deleteContentBackward" }));
+    expect(keys).toEqual([
+      { keycode: 28, pressed: true },
+      { keycode: 28, pressed: false },
+      { keycode: 14, pressed: true },
+      { keycode: 14, pressed: false },
+    ]);
+    surface.dispose();
+  });
+
+  it("keeps ignoring composition, paste, and composition-commit inputs", () => {
+    const { surface, ta, texts, keys } = attachTyping();
+    // Mid-composition text belongs to compositionend; the trailing
+    // insertCompositionText some browsers fire after it was already sent
+    // there; pastes go through the clipboard path.
+    ta.dispatchEvent(
+      inputEvent({ inputType: "insertText", data: "あ", isComposing: true }),
+    );
+    ta.dispatchEvent(
+      inputEvent({ inputType: "insertCompositionText", data: "あ" }),
+    );
+    ta.dispatchEvent(inputEvent({ inputType: "insertFromPaste", data: "x" }));
+    expect(texts).toEqual([]);
+    expect(keys).toEqual([]);
+    surface.dispose();
+  });
+
+  it("does not cancel a soft-keyboard keydown it cannot map", () => {
+    const { surface, ta } = attachTyping();
+    // keyCode-229 stand-in: no key name, no code.  preventDefault here
+    // would cancel the input event that carries the actual text.
+    const synthetic = new KeyboardEvent("keydown", {
+      key: "Unidentified",
+      code: "",
+      cancelable: true,
+    });
+    ta.dispatchEvent(synthetic);
+    expect(synthetic.defaultPrevented).toBe(false);
+    // A key the evdev path can map keeps being claimed.
+    const arrow = new KeyboardEvent("keydown", {
+      key: "ArrowDown",
+      code: "ArrowDown",
+      cancelable: true,
+    });
+    ta.dispatchEvent(arrow);
+    expect(arrow.defaultPrevented).toBe(true);
+    surface.dispose();
+  });
+});

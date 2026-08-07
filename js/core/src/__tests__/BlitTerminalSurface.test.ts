@@ -1158,3 +1158,98 @@ describe("BlitTerminalSurface cursor", () => {
     first.surface.dispose();
   });
 });
+
+describe("BlitTerminalSurface mouse-mode touch scrolling", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn(() => 1),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /** jsdom implements neither Touch nor TouchEvent, and the handlers only
+   *  ever reach for the identifier, the client point and the touch lists. */
+  function touchEvent(
+    type: string,
+    points: { identifier: number; clientX: number; clientY: number }[],
+    opts: { ongoing?: boolean } = {},
+  ): Event {
+    const list = {
+      length: points.length,
+      item: (i: number) => points[i] ?? null,
+      [0]: points[0],
+    } as unknown as TouchList;
+    const empty = { length: 0, item: () => null } as unknown as TouchList;
+    const ev = new Event(type, { bubbles: true, cancelable: true });
+    Object.defineProperty(ev, "touches", {
+      value: opts.ongoing === false ? empty : list,
+    });
+    Object.defineProperty(ev, "changedTouches", { value: list });
+    return ev;
+  }
+
+  function attachMouseMode() {
+    const sendMouse = vi.fn();
+    const surface = new BlitTerminalSurface({ sessionId: "s1" });
+    const container = document.createElement("div");
+    surface.attach(container);
+    // @ts-expect-error — fake workspace capturing mouse-mode wheel reports.
+    surface["_workspace"] = { sendMouse };
+    // @ts-expect-error — fake wasm terminal in mouse-reporting mode.
+    surface["terminal"] = { mouse_mode: () => 1 };
+    const scrollEl = surface["scrollEl"];
+    if (!scrollEl) throw new Error("expected a scroll surface");
+    const lineH = surface["cell"].h || 20;
+    return { surface, scrollEl, sendMouse, lineH };
+  }
+
+  it("swiping up reports wheel-down, matching natural touch scrolling", () => {
+    const { surface, scrollEl, sendMouse, lineH } = attachMouseMode();
+    const finger = { identifier: 1, clientX: 40, clientY: 300 };
+
+    scrollEl.dispatchEvent(touchEvent("touchstart", [finger]));
+    scrollEl.dispatchEvent(
+      touchEvent("touchmove", [{ ...finger, clientY: 300 - 2 * lineH }]),
+    );
+    scrollEl.dispatchEvent(
+      touchEvent("touchend", [{ ...finger, clientY: 300 - 2 * lineH }], {
+        ongoing: false,
+      }),
+    );
+
+    expect(sendMouse.mock.calls.map((c) => c[2])).toEqual([65, 65]);
+    surface.dispose();
+  });
+
+  it("swiping down reports wheel-up, matching natural touch scrolling", () => {
+    const { surface, scrollEl, sendMouse, lineH } = attachMouseMode();
+    const finger = { identifier: 1, clientX: 40, clientY: 100 };
+
+    scrollEl.dispatchEvent(touchEvent("touchstart", [finger]));
+    scrollEl.dispatchEvent(
+      touchEvent("touchmove", [{ ...finger, clientY: 100 + 2 * lineH }]),
+    );
+    scrollEl.dispatchEvent(
+      touchEvent("touchend", [{ ...finger, clientY: 100 + 2 * lineH }], {
+        ongoing: false,
+      }),
+    );
+
+    expect(sendMouse.mock.calls.map((c) => c[2])).toEqual([64, 64]);
+    surface.dispose();
+  });
+});
