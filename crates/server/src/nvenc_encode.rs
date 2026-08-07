@@ -3,9 +3,11 @@
 //! Uses the NVIDIA Video Codec SDK via `dlopen("libnvidia-encode.so")`.
 //! The CUDA context is created via `dlopen("libcuda.so")`.
 //!
-//! The encoder accepts BGRA input directly (`NV_ENC_BUFFER_FORMAT_ARGB`),
-//! so no CPU-side colorspace conversion is needed.  NVENC handles the
-//! BGRA→YUV conversion internally on the GPU.
+//! The encoder is fed YUV that is already full-range BT.601 — normally the
+//! compositor's compute shaders, via a zero-copy `OPAQUE_FD` import.  It is
+//! never handed packed RGB: NVENC's internal RGB→YUV is limited-range with
+//! no knob, so those frames would decode with lifted blacks against a
+//! stream header that claims full swing.
 
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
@@ -55,12 +57,10 @@ const NV_ENC_RECONFIGURE_PARAMS_VER: u32 = nvencapi_struct_version(1) | (1 << 31
 
 // Buffer formats (from nv-codec-headers 12.1)
 const NV_ENC_BUFFER_FORMAT_NV12: u32 = 0x00000001;
-// YUV444 and ABGR are only reached from the DMA-BUF / OPAQUE_FD import
-// paths, which are Linux-only.
+// YUV444 is only reached from the OPAQUE_FD import path, which is Linux-only.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const NV_ENC_BUFFER_FORMAT_YUV444: u32 = 0x00001000; // planar Y,U,V — NOT 0x10, that's YV12
 const NV_ENC_BUFFER_FORMAT_ARGB: u32 = 0x01000000; // B8G8R8A8 in memory (DRM ARGB8888)
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 // Encoder capability query.  The values are ordinals into `NV_ENC_CAPS`
 // (nvEncodeAPI.h) — count the enum, don't guess: `SUPPORT_YUV444_ENCODE`
@@ -1150,8 +1150,8 @@ impl NvencDirectEncoder {
 
         // The session was created at self.width/self.height (even-rounded
         // and clamped to the caps). Encoding at the source dimensions
-        // instead — as encode_dmabuf_fd does — hands NVENC dimensions the
-        // session was not configured for.
+        // instead would hand NVENC dimensions the session was not
+        // configured for.
         let enc_w = self.width;
         let enc_h = self.height;
 

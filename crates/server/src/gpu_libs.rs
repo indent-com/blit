@@ -115,7 +115,7 @@ pub type CUexternalSemaphore = *mut c_void;
 /// passes size=0, which `cuImportExternalMemory` rejects with
 /// `CUDA_ERROR_INVALID_VALUE` for *every* handle type, making a plain
 /// descriptor bug look like a driver limitation.  See the note on
-/// `NvencDirectEncoder::encode_dmabuf_fd`.
+/// `NvencDirectEncoder::encode_nv12_opaque_fd`.
 pub mod cu_ext_mem_desc {
     /// `CUexternalMemoryHandleType type`
     pub const TYPE: usize = 0;
