@@ -396,8 +396,11 @@ export class SurfaceStore {
   private static readonly OFFSET_WINDOW_MAX = 480;
   /** Quantile of the offset distribution that presentation targets.  The
    *  remaining tail is deliberately not buffered for: those frames arrive
-   *  overdue and are skipped to the newest due one, which costs nothing and
-   *  is what should happen to a rare outlier. */
+   *  overdue and are skipped to the newest due one, which is what should
+   *  happen to a rare outlier.  It is not free, though — a skip is a
+   *  dropped frame *and* a repeated one — so {@link updateSchedule} adds a
+   *  refresh of headroom on top rather than leaving 5% of a steady stream
+   *  landing after its own due time. */
   private static readonly PRESENT_QUANTILE = 0.95;
   /** Low quantile taken as "the fastest this path goes".  Not the strict
    *  minimum: a burst frame is captured later but shipped immediately
@@ -1449,8 +1452,21 @@ export class SurfaceStore {
 
   /** Trim the offset window to ~{@link OFFSET_WINDOW_MS} of stream, then
    *  slew the presentation offset toward the window's
-   *  {@link PRESENT_QUANTILE}, capped at {@link PRESENT_DELAY_MAX_MS} of
-   *  added latency over {@link FAST_QUANTILE}. */
+   *  {@link PRESENT_QUANTILE} plus one refresh, capped at
+   *  {@link PRESENT_DELAY_MAX_MS} of added latency over
+   *  {@link FAST_QUANTILE}.
+   *
+   *  The refresh is what makes the quantile usable as a due time.  A frame
+   *  can only be painted on a vsync, so scheduling it to become due at the
+   *  arrival quantile leaves it a fraction of a refresh to actually land —
+   *  and every frame that misses costs twice, once for the refresh that
+   *  repeats the previous frame and once for itself, skipped as overdue by
+   *  {@link presentIndex}.  Measured against a server delivering a clean
+   *  60 fps to a 60 Hz display, the margin settled at 4-15 ms, under one
+   *  refresh, and 3-19% of decoded frames never reached the canvas — two
+   *  to six visible hitches a second with an idle main thread and a
+   *  metronomic rAF.  Buying a whole refresh of headroom costs latency
+   *  that {@link PRESENT_DELAY_MAX_MS} was already budgeting for. */
   private updateSchedule(p: SurfacePresenter): void {
     const interval = Math.max(
       SurfaceStore.MIN_FRAME_INTERVAL_MS,
@@ -1471,13 +1487,21 @@ export class SurfaceStore {
     }
 
     p.fastOffsetMs = quantile(p.offsets, SurfaceStore.FAST_QUANTILE);
+    const jitterTarget = quantile(p.offsets, SurfaceStore.PRESENT_QUANTILE);
     const target = Math.min(
-      quantile(p.offsets, SurfaceStore.PRESENT_QUANTILE),
+      jitterTarget + this.refreshMs,
       p.fastOffsetMs + SurfaceStore.PRESENT_DELAY_MAX_MS,
     );
 
     if (!Number.isFinite(p.presentOffsetMs)) {
-      p.presentOffsetMs = target;
+      // Seed at the jitter estimate alone and let the grow slew below walk
+      // the refresh of headroom in over ~8 frames.  Seeding at the full
+      // target makes engaging smoothing a one-step latency jump, and a step
+      // in the offset is a hole of exactly that size in the output — three
+      // refreshes of nothing, once, right at the start of every stream.
+      // That is the discontinuity this scheduler exists to remove, so it
+      // must not be the thing that turns it on.
+      p.presentOffsetMs = Math.min(jitterTarget, target);
       return;
     }
     if (target > p.presentOffsetMs) {
