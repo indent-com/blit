@@ -379,7 +379,10 @@ struct PendingSubmit {
     /// visibly jumps back and forth while the parent surface looks fine.
     /// Queue submission order means this fence signalling also proves
     /// every earlier read of these buffers is done.
-    release_buffers: Vec<wayland_server::protocol::wl_buffer::WlBuffer>,
+    release_buffers: Vec<(
+        wayland_server::protocol::wl_buffer::WlBuffer,
+        Option<crate::drm_syncobj::SyncPoint>,
+    )>,
 }
 
 unsafe impl Send for VulkanRenderer {}
@@ -5069,13 +5072,14 @@ impl VulkanRenderer {
     pub fn defer_buffer_release(
         &mut self,
         buf: wayland_server::protocol::wl_buffer::WlBuffer,
+        release_point: Option<crate::drm_syncobj::SyncPoint>,
     ) -> bool {
         if let Some(p) = self.pending_submit.as_mut() {
-            p.release_buffers.push(buf);
+            p.release_buffers.push((buf, release_point));
             return true;
         }
         if let Some(p) = self.deferred_submits.last_mut() {
-            p.release_buffers.push(buf);
+            p.release_buffers.push((buf, release_point));
             return true;
         }
         false
@@ -5163,8 +5167,11 @@ impl VulkanRenderer {
         // The fence has signalled (every caller waits first): the GPU is
         // done with every buffer this submission — and, by queue order,
         // any earlier one — sampled.  Only now may the client redraw them.
-        for buf in &pending.release_buffers {
+        for (buf, point) in &pending.release_buffers {
             buf.release();
+            if let Some(p) = point {
+                p.signal();
+            }
         }
         let mut results: Vec<(u32, u32, PixelData, bool)> = Vec::new();
 
@@ -5299,8 +5306,11 @@ impl VulkanRenderer {
                 )
             };
             if raw == vk::Result::SUCCESS {
-                for buf in pending.release_buffers.drain(..) {
+                for (buf, point) in pending.release_buffers.drain(..) {
                     buf.release();
+                    if let Some(p) = point {
+                        p.signal();
+                    }
                 }
                 unsafe {
                     self.device.destroy_fence(pending.fence, None);
@@ -6774,8 +6784,11 @@ impl Drop for VulkanRenderer {
             for pending in all_pending {
                 // wait_idle above covered every read; don't strand the
                 // client's buffers on teardown.
-                for buf in &pending.release_buffers {
+                for (buf, point) in &pending.release_buffers {
                     buf.release();
+                    if let Some(p) = point {
+                        p.signal();
+                    }
                 }
                 self.device.destroy_fence(pending.fence, None);
                 self.device

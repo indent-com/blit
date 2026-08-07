@@ -1,4 +1,6 @@
 #[cfg(target_os = "linux")]
+mod drm_syncobj;
+#[cfg(target_os = "linux")]
 mod imp;
 #[cfg(target_os = "linux")]
 mod input_region;

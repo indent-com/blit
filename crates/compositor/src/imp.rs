@@ -28,6 +28,15 @@ use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_man
     self, WpFractionalScaleManagerV1,
 };
 use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_v1::WpFractionalScaleV1;
+use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_manager_v1::{
+    self, WpLinuxDrmSyncobjManagerV1,
+};
+use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1::{
+    self, WpLinuxDrmSyncobjSurfaceV1,
+};
+use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_timeline_v1::{
+    self, WpLinuxDrmSyncobjTimelineV1,
+};
 use wayland_protocols::wp::presentation_time::server::wp_presentation::{
     self, WpPresentation,
 };
@@ -820,6 +829,16 @@ pub(crate) struct Surface {
     /// coordinates. `None` is the default: all of it.
     input_region: Option<Vec<RegionOp>>,
 
+    // explicit sync (wp_linux_drm_syncobj_v1) — double-buffered per
+    // commit, meaningful only alongside a newly attached buffer.
+    pending_acquire_point: Option<crate::drm_syncobj::SyncPoint>,
+    pending_release_point: Option<crate::drm_syncobj::SyncPoint>,
+    /// The surface's syncobj object; its existence obliges every buffer
+    /// commit to carry both sync points.
+    syncobj_surface: Option<
+        wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
+    >,
+
     // subsurface
     pub parent_surface_id: Option<ObjectId>,
     pending_subsurface_position: Option<(i32, i32)>,
@@ -1081,6 +1100,34 @@ struct XdgToplevelData {
 struct XdgPopupData {
     wl_surface_id: ObjectId,
 }
+/// A client buffer the compositor still holds — plus the explicit-sync
+/// release point to signal when the hold ends, for clients on
+/// `wp_linux_drm_syncobj_v1`.
+struct HeldBuffer {
+    buf: WlBuffer,
+    release: Option<crate::drm_syncobj::SyncPoint>,
+}
+
+/// A committed dma-buf waiting for its explicit-sync acquire point.
+struct AwaitingBuffer {
+    buf: WlBuffer,
+    scale: i32,
+    is_cursor: bool,
+    acquire: crate::drm_syncobj::SyncPoint,
+    release: Option<crate::drm_syncobj::SyncPoint>,
+}
+
+impl AwaitingBuffer {
+    /// Discard without ever reading: the client gets both the wl_buffer
+    /// release and the release-point signal immediately.
+    fn discard(self) {
+        self.buf.release();
+        if let Some(r) = self.release {
+            r.signal();
+        }
+    }
+}
+
 struct SubsurfaceData {
     wl_surface_id: ObjectId,
     parent_surface_id: ObjectId,
@@ -1506,7 +1553,18 @@ struct Compositor {
     /// fence not ready).  We hold the `WlBuffer` alive so the client
     /// cannot reuse it while the GPU texture still references the fd.
     /// Released when the surface commits a new buffer or is destroyed.
-    held_buffers: HashMap<ObjectId, WlBuffer>,
+    held_buffers: HashMap<ObjectId, HeldBuffer>,
+    /// Explicit-sync device, when the render node supports timeline
+    /// syncobjs; gates the `wp_linux_drm_syncobj_v1` global.
+    syncobj_device: Option<std::sync::Arc<crate::drm_syncobj::DrmSyncobjDevice>>,
+    /// Imported client timelines by protocol object id.  Pending sync
+    /// points hold `Arc` clones, so dropping an entry never invalidates
+    /// a point already attached to a commit.
+    syncobj_timelines: HashMap<ObjectId, std::sync::Arc<crate::drm_syncobj::SyncobjTimeline>>,
+    /// Committed buffers whose acquire point has not signalled yet.  The
+    /// previous buffer stays current until promotion; a newer commit
+    /// discards the waiting one unread (signalling its release point).
+    awaiting_acquire: HashMap<ObjectId, AwaitingBuffer>,
 
     // -- Cursor pixel cache --
     /// CPU-accessible RGBA pixels for cursor surfaces.  Cursors aren't
@@ -1948,13 +2006,7 @@ impl Compositor {
                 // an earlier composite (before the toplevel went away) may
                 // be in flight over its import.
                 if let Some(held) = self.held_buffers.remove(surface_id) {
-                    let deferred = self
-                        .vulkan_renderer
-                        .as_mut()
-                        .is_some_and(|vk| vk.defer_buffer_release(held.clone()));
-                    if !deferred {
-                        held.release();
-                    }
+                    self.release_held(held);
                 }
                 // Fire any pending frame callbacks so the client doesn't
                 // stall.
@@ -2032,13 +2084,7 @@ impl Compositor {
         // GPU work at all: keep holding, and let the drain release it once
         // the recomposite has read.
         if !deferred && let Some(held) = self.held_buffers.remove(surface_id) {
-            let gated = self
-                .vulkan_renderer
-                .as_mut()
-                .is_some_and(|vk| vk.defer_buffer_release(held.clone()));
-            if !gated {
-                held.release();
-            }
+            self.release_held(held);
         }
 
         // Fire frame callbacks after processing a commit so clients can
@@ -2393,6 +2439,50 @@ impl Compositor {
     /// to composite.  The Vulkan renderer imports DMA-BUFs on the GPU
     /// and handles vendor-specific tiled layouts (NVIDIA, AMD) natively
     /// — CPU mmap of such buffers would produce garbage or block.
+    /// Install any parked commit whose explicit-sync acquire point has
+    /// signalled, and recomposite the toplevel it belongs to.  Runs every
+    /// loop pass; the loop shortens its poll timeout while anything waits
+    /// so a point signalled between Wayland events lands within ~1 ms.
+    fn promote_ready_acquires(&mut self) {
+        if self.awaiting_acquire.is_empty() {
+            return;
+        }
+        let ready: Vec<ObjectId> = self
+            .awaiting_acquire
+            .iter()
+            .filter(|(_, a)| a.acquire.signaled())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for surface_id in ready {
+            let Some(a) = self.awaiting_acquire.remove(&surface_id) else {
+                continue;
+            };
+            self.commit_buffer(&surface_id, a.buf, a.scale, a.is_cursor, a.release);
+            let (_, toplevel_sid) = self.find_toplevel_root(&surface_id);
+            if let Some(tl) = toplevel_sid {
+                // False = full recomposite: this content was never
+                // published anywhere.
+                self.pending_recomposite_toplevels.insert(tl, false);
+            }
+        }
+    }
+
+    /// Release a held client buffer, fence-gated on in-flight GPU work,
+    /// signalling its explicit-sync release point at the same moment.
+    fn release_held(&mut self, held: HeldBuffer) {
+        let HeldBuffer { buf, release } = held;
+        let gated = self
+            .vulkan_renderer
+            .as_mut()
+            .is_some_and(|vk| vk.defer_buffer_release(buf.clone(), release.clone()));
+        if !gated {
+            buf.release();
+            if let Some(r) = release {
+                r.signal();
+            }
+        }
+    }
+
     fn apply_pending_state(&mut self, surface_id: &ObjectId) {
         // The size hints are checked against each other here rather than as
         // they arrive: both halves are double-buffered, so a client may raise
@@ -2412,7 +2502,7 @@ impl Compositor {
                 return;
             }
         }
-        let (buffer, scale, is_cursor) = {
+        let (buffer, scale, is_cursor, acquire, release, syncobj_surface) = {
             let Some(surf) = self.surfaces.get_mut(surface_id) else {
                 return;
             };
@@ -2431,10 +2521,85 @@ impl Compositor {
             if let Some(pos) = surf.pending_subsurface_position.take() {
                 surf.subsurface_position = pos;
             }
-            (buffer, scale, surf.is_cursor)
+            (
+                buffer,
+                scale,
+                surf.is_cursor,
+                surf.pending_acquire_point.take(),
+                surf.pending_release_point.take(),
+                surf.syncobj_surface.clone(),
+            )
         };
-        let Some(buf) = buffer else { return };
+        let Some(buf) = buffer else {
+            // Explicit-sync points are per-commit and only meaningful with
+            // a newly attached buffer.
+            if (acquire.is_some() || release.is_some())
+                && let Some(sos) = syncobj_surface
+            {
+                use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1::Error as SyncobjError;
+                sos.post_error(SyncobjError::NoBuffer, "sync points set without a buffer");
+            }
+            return;
+        };
 
+        // A client bound to explicit sync must fence every buffer commit.
+        if let Some(sos) = &syncobj_surface {
+            use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1::Error as SyncobjError;
+            if acquire.is_none() {
+                sos.post_error(SyncobjError::NoAcquirePoint, "buffer without acquire point");
+                return;
+            }
+            if release.is_none() {
+                sos.post_error(SyncobjError::NoReleasePoint, "buffer without release point");
+                return;
+            }
+            if buf.data::<ShmBufferData>().is_some() {
+                sos.post_error(
+                    SyncobjError::UnsupportedBuffer,
+                    "explicit sync requires a dma-buf",
+                );
+                return;
+            }
+        }
+
+        // Explicit sync, acquire side: the buffer's content is not ready
+        // until the acquire point signals, and NVIDIA's Vulkan driver will
+        // not learn that from implicit fencing — sampling early shows the
+        // buffer's *previous* frame.  Park the commit; the previous buffer
+        // stays current, and the promotion sweep installs this one the
+        // moment the point signals.
+        if let Some(acq) = acquire {
+            if !acq.signaled() {
+                let waiting = AwaitingBuffer {
+                    buf,
+                    scale,
+                    is_cursor,
+                    acquire: acq,
+                    release,
+                };
+                if let Some(prev) = self.awaiting_acquire.insert(surface_id.clone(), waiting) {
+                    // Superseded before its content was ever ready: hand
+                    // everything back immediately, it was never read.
+                    prev.discard();
+                }
+                return;
+            }
+        }
+
+        self.commit_buffer(surface_id, buf, scale, is_cursor, release);
+    }
+
+    /// Install a committed buffer as the surface's current content.  The
+    /// second half of `apply_pending_state`, split out so a commit parked
+    /// on its explicit-sync acquire point can be installed later.
+    fn commit_buffer(
+        &mut self,
+        surface_id: &ObjectId,
+        buf: WlBuffer,
+        scale: i32,
+        is_cursor: bool,
+        release: Option<crate::drm_syncobj::SyncPoint>,
+    ) {
         // Release any previously held buffer for this surface — the new
         // commit supersedes it.  Not straight away, though: in-flight GPU
         // work may still sample its import, implicit dma-buf fencing does
@@ -2444,13 +2609,7 @@ impl Compositor {
         // composite then shows a *future* frame and the video visibly
         // jumps back and forth.  Gate the release on the submit's fence.
         if let Some(old) = self.held_buffers.remove(surface_id) {
-            let deferred = self
-                .vulkan_renderer
-                .as_mut()
-                .is_some_and(|vk| vk.defer_buffer_release(old.clone()));
-            if !deferred {
-                old.release();
-            }
+            self.release_held(old);
         }
 
         // Fast path for non-cursor SHM buffers: the client's mmap'd pool
@@ -2515,6 +2674,9 @@ impl Compositor {
                         },
                     );
                     buf.release();
+                    if let Some(r) = release {
+                        r.signal();
+                    }
                     return;
                 }
             }
@@ -2551,14 +2713,23 @@ impl Compositor {
             if pixels.is_dmabuf() {
                 // Hold the wl_buffer alive so the client cannot reuse it
                 // while the GPU texture still references the DMA-BUF fd.
-                self.held_buffers.insert(surface_id.clone(), buf);
+                // The explicit-sync release point travels with the hold and
+                // is signalled at the same fence-gated moment.
+                self.held_buffers
+                    .insert(surface_id.clone(), HeldBuffer { buf, release });
             } else {
                 // SHM buffers are snapshotted into the GPU texture.
                 // Release immediately so the client can reuse the buffer.
                 buf.release();
+                if let Some(r) = release {
+                    r.signal();
+                }
             }
         } else {
             buf.release();
+            if let Some(r) = release {
+                r.signal();
+            }
         }
     }
 
@@ -2701,7 +2872,10 @@ impl Compositor {
                 vk.remove_surface(proto_id);
             }
             if let Some(held) = self.held_buffers.remove(proto_id) {
-                held.release();
+                self.release_held(held);
+            }
+            if let Some(a) = self.awaiting_acquire.remove(proto_id) {
+                a.discard();
             }
             self.forget_pointer_focus(proto_id);
             // A crashed client's popup takes the keyboard with it otherwise:
@@ -4061,6 +4235,9 @@ impl Dispatch<WlCompositor, ()> for Compositor {
                         input_region: None,
                         buffer_scale: 1,
                         is_opaque: false,
+                        pending_acquire_point: None,
+                        pending_release_point: None,
+                        syncobj_surface: None,
                         parent_surface_id: None,
                         pending_subsurface_position: None,
                         subsurface_position: (0, 0),
@@ -4167,7 +4344,10 @@ impl Dispatch<WlSurface, ()> for Compositor {
                     vk.remove_surface(&sid);
                 }
                 if let Some(held) = state.held_buffers.remove(&sid) {
-                    held.release();
+                    state.release_held(held);
+                }
+                if let Some(a) = state.awaiting_acquire.remove(&sid) {
+                    a.discard();
                 }
                 state.forget_pointer_focus(&sid);
                 if let Some(parent_id) = state
@@ -4389,6 +4569,170 @@ impl Dispatch<WlSubcompositor, ()> for Compositor {
 }
 
 // -- wl_subsurface --
+/// User data for a `wp_linux_drm_syncobj_surface_v1`.
+struct SyncobjSurfaceData {
+    wl_surface_id: ObjectId,
+}
+
+impl GlobalDispatch<WpLinuxDrmSyncobjManagerV1, ()> for Compositor {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: wayland_server::New<WpLinuxDrmSyncobjManagerV1>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<WpLinuxDrmSyncobjManagerV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        manager: &WpLinuxDrmSyncobjManagerV1,
+        request: <WpLinuxDrmSyncobjManagerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use wp_linux_drm_syncobj_manager_v1::Request;
+        match request {
+            Request::GetSurface { id, surface } => {
+                let wl_surface_id = surface.id();
+                let exists = state
+                    .surfaces
+                    .get(&wl_surface_id)
+                    .is_some_and(|s| s.syncobj_surface.is_some());
+                if exists {
+                    manager.post_error(
+                        wp_linux_drm_syncobj_manager_v1::Error::SurfaceExists,
+                        "surface already has a syncobj surface",
+                    );
+                    return;
+                }
+                let res = data_init.init(id, SyncobjSurfaceData { wl_surface_id });
+                if let Some(surf) = state.surfaces.get_mut(&res.data::<SyncobjSurfaceData>().unwrap().wl_surface_id) {
+                    surf.syncobj_surface = Some(res);
+                }
+            }
+            Request::ImportTimeline { id, fd } => {
+                let Some(dev) = state.syncobj_device.clone() else {
+                    manager.post_error(
+                        wp_linux_drm_syncobj_manager_v1::Error::InvalidTimeline,
+                        "explicit sync unavailable",
+                    );
+                    return;
+                };
+                match dev.import_timeline(fd) {
+                    Ok(timeline) => {
+                        let res = data_init.init(id, ());
+                        state.syncobj_timelines.insert(res.id(), timeline);
+                    }
+                    Err(e) => {
+                        manager.post_error(
+                            wp_linux_drm_syncobj_manager_v1::Error::InvalidTimeline,
+                            format!("drm syncobj import failed: {e}"),
+                        );
+                    }
+                }
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WpLinuxDrmSyncobjTimelineV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        timeline: &WpLinuxDrmSyncobjTimelineV1,
+        request: <WpLinuxDrmSyncobjTimelineV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use wp_linux_drm_syncobj_timeline_v1::Request;
+        if let Request::Destroy = request {
+            // Pending points hold Arc clones, so dropping the map entry
+            // never invalidates a commit already carrying this timeline.
+            state.syncobj_timelines.remove(&timeline.id());
+        }
+    }
+
+    fn destroyed(state: &mut Self, _: wayland_server::backend::ClientId, res: &WpLinuxDrmSyncobjTimelineV1, _: &()) {
+        state.syncobj_timelines.remove(&res.id());
+    }
+}
+
+impl Dispatch<WpLinuxDrmSyncobjSurfaceV1, SyncobjSurfaceData> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WpLinuxDrmSyncobjSurfaceV1,
+        request: <WpLinuxDrmSyncobjSurfaceV1 as Resource>::Request,
+        data: &SyncobjSurfaceData,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use wp_linux_drm_syncobj_surface_v1::Request;
+        let point_of = |state: &Self, timeline: &WpLinuxDrmSyncobjTimelineV1, hi: u32, lo: u32| {
+            state
+                .syncobj_timelines
+                .get(&timeline.id())
+                .map(|tl| crate::drm_syncobj::SyncPoint {
+                    timeline: tl.clone(),
+                    point: ((hi as u64) << 32) | lo as u64,
+                })
+        };
+        match request {
+            Request::SetAcquirePoint {
+                timeline,
+                point_hi,
+                point_lo,
+            } => {
+                let point = point_of(state, &timeline, point_hi, point_lo);
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                    surf.pending_acquire_point = point;
+                }
+            }
+            Request::SetReleasePoint {
+                timeline,
+                point_hi,
+                point_lo,
+            } => {
+                let point = point_of(state, &timeline, point_hi, point_lo);
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                    surf.pending_release_point = point;
+                }
+            }
+            Request::Destroy => {
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                    surf.syncobj_surface = None;
+                    surf.pending_acquire_point = None;
+                    surf.pending_release_point = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _: wayland_server::backend::ClientId,
+        _: &WpLinuxDrmSyncobjSurfaceV1,
+        data: &SyncobjSurfaceData,
+    ) {
+        if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+            surf.syncobj_surface = None;
+            surf.pending_acquire_point = None;
+            surf.pending_release_point = None;
+        }
+    }
+}
+
 impl Dispatch<WlSubsurface, SubsurfaceData> for Compositor {
     fn request(
         state: &mut Self,
@@ -4785,7 +5129,10 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                     vk.remove_surface(wl_surface_id);
                 }
                 if let Some(held) = state.held_buffers.remove(wl_surface_id) {
-                    held.release();
+                    state.release_held(held);
+                }
+                if let Some(a) = state.awaiting_acquire.remove(wl_surface_id) {
+                    a.discard();
                 }
                 if let Some(surf) = state.surfaces.get_mut(wl_surface_id) {
                     let sid = surf.surface_id;
@@ -6804,6 +7151,19 @@ fn run_compositor(
     if has_dmabuf {
         dh.create_global::<Compositor, ZwpLinuxDmabufV1, ()>(4, ());
     }
+    // Explicit sync: only meaningful with DMA-BUF, and only when the
+    // kernel driver supports timeline syncobjs.  Without this global,
+    // NVIDIA clients fall back to implicit fencing the driver does not
+    // implement, and their GPU writes race our sampling.
+    let syncobj_device = if has_dmabuf {
+        crate::drm_syncobj::DrmSyncobjDevice::open(&gpu_device)
+    } else {
+        None
+    };
+    if syncobj_device.is_some() {
+        dh.create_global::<Compositor, WpLinuxDrmSyncobjManagerV1, ()>(1, ());
+        eprintln!("[compositor] explicit sync (wp_linux_drm_syncobj_v1) enabled");
+    }
     dh.create_global::<Compositor, WpViewporter, ()>(1, ());
     dh.create_global::<Compositor, WpFractionalScaleManagerV1, ()>(1, ());
     dh.create_global::<Compositor, ZxdgDecorationManagerV1, ()>(1, ());
@@ -6891,6 +7251,9 @@ fn run_compositor(
         kb_focus_popup: None,
         popup_dismiss_button: None,
         held_buffers: HashMap::new(),
+        syncobj_device,
+        syncobj_timelines: HashMap::new(),
+        awaiting_acquire: HashMap::new(),
         cursor_rgba: HashMap::new(),
     };
 
@@ -6965,6 +7328,7 @@ fn run_compositor(
             .vulkan_renderer
             .as_ref()
             .is_some_and(|vk| vk.has_pending())
+            || !compositor.awaiting_acquire.is_empty()
         {
             std::time::Duration::from_millis(1)
         } else {
@@ -6976,6 +7340,11 @@ fn run_compositor(
         {
             eprintln!("[compositor] event loop error: {e}");
         }
+
+        // Install commits whose explicit-sync acquire points signalled
+        // since the last pass, before the recomposite drain below so their
+        // content reaches this pass's composite.
+        compositor.promote_ready_acquires();
 
         // Check for completed Vulkan GPU work.  This runs independently
         // of surface commits so completed frames are flushed to the
@@ -7071,13 +7440,7 @@ fn run_compositor(
                         // "Read" = the recomposite's fence has signalled,
                         // not merely submitted — same gating as the inline
                         // path.
-                        let gated = compositor
-                            .vulkan_renderer
-                            .as_mut()
-                            .is_some_and(|vk| vk.defer_buffer_release(held.clone()));
-                        if !gated {
-                            held.release();
-                        }
+                        compositor.release_held(held);
                     }
                 }
             }
