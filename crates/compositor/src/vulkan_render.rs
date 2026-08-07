@@ -55,6 +55,12 @@ pub(crate) struct VulkanRenderer {
     /// subscriber owns its own session so its GOP, keyframe cadence and
     /// quantizer are independent of every other viewer's.
     vulkan_encoders: HashMap<(u32, u64), crate::vulkan_encode::VulkanVideoEncoder>,
+    /// Per-session encode pacing: (minimum interval, last encode time).
+    /// The compositor composites at commit rate; a session encoding faster
+    /// than its subscriber consumes produces frames the server overwrites
+    /// undelivered, and every one of those breaks the delta chain.  Frames
+    /// skipped here — before encoding — cost nothing.
+    vulkan_encoder_pacing: HashMap<(u32, u64), (std::time::Duration, Option<std::time::Instant>)>,
     /// Bitstreams produced by `vulkan_encoders` during the last render,
     /// awaiting collection by the compositor.  Kept out of the render
     /// return value because that function has a dozen early exits.
@@ -84,6 +90,8 @@ pub(crate) struct VulkanRenderer {
 
     // BGRA→NV12 compute pipeline — buffer path (linear NV12)
     compute_pipeline: vk::Pipeline,
+    /// BGRA→planar YUV444 buffer pipeline — the 4:4:4 OPAQUE_FD targets.
+    compute_yuv444_pipeline: vk::Pipeline,
     compute_pipeline_layout: vk::PipelineLayout,
     compute_descriptor_set_layout: vk::DescriptorSetLayout,
 
@@ -114,6 +122,12 @@ pub(crate) struct VulkanRenderer {
     /// VK_KHR_external_fence_fd function loader — used to export Vulkan
     /// fences as sync_fd for cross-process / cross-API synchronisation.
     external_fence_fd_fn: Option<ash::khr::external_fence_fd::Device>,
+    external_semaphore_fd_fn: Option<ash::khr::external_semaphore_fd::Device>,
+    /// Imported acquire-fence semaphores awaiting attachment to the next
+    /// composite submit.  Each is a client's explicit-sync acquire point:
+    /// the submit that samples the committed buffer must wait on it, or
+    /// the read races the client's GPU write.
+    pending_acquire_semaphores: Vec<vk::Semaphore>,
 
     /// Supported DRM format modifiers queried from the Vulkan device.
     pub(crate) supported_dmabuf_modifiers: Vec<(u32, u64)>,
@@ -306,8 +320,16 @@ enum Nv12OutputKind {
         y_view: vk::ImageView,
         uv_memory: vk::DeviceMemory,
         uv_view: vk::ImageView,
-        /// Full-image COLOR view for Vulkan Video encode source.
+        /// Full-image COLOR view for Vulkan Video encode source.  Belongs
+        /// to `encode_image` when that is present, to `image` otherwise.
         encode_view: Option<vk::ImageView>,
+        /// A separate `VIDEO_ENCODE_SRC` image the storage image is copied
+        /// into after each convert.  `STORAGE | VIDEO_ENCODE_SRC` on a
+        /// single image is not a supported combination (VUID 02251) — the
+        /// NVIDIA driver happens to tolerate it at 4:2:0 but rejects the
+        /// encode outright at 4:4:4 — so the compute shader writes a plain
+        /// storage image and the encode session reads this one.
+        encode_image: Option<(vk::Image, vk::DeviceMemory)>,
     },
 }
 
@@ -352,6 +374,24 @@ struct PendingSubmit {
     /// Toplevel surface_id this submission was rendered for, so async
     /// retirement can attribute the pixels to the correct surface.
     toplevel_sid: u16,
+    /// Acquire-fence semaphores this submission waited on; destroyed at
+    /// retire (a SYNC_FD import is consumed by its single wait).
+    wait_semaphores: Vec<vk::Semaphore>,
+    /// wl_buffers whose release is gated on this submission's fence.
+    ///
+    /// A DMA-BUF is imported, not copied, and NVIDIA's driver does not
+    /// honor implicit dma-buf fencing for Vulkan importers — releasing a
+    /// buffer while recorded GPU work still samples its import lets the
+    /// client redraw it first, and the composite then shows a *future*
+    /// frame.  A fast-recycling pool (a browser's video overlay
+    /// subsurface) hits this every few frames: the video rectangle
+    /// visibly jumps back and forth while the parent surface looks fine.
+    /// Queue submission order means this fence signalling also proves
+    /// every earlier read of these buffers is done.
+    release_buffers: Vec<(
+        wayland_server::protocol::wl_buffer::WlBuffer,
+        Option<crate::drm_syncobj::SyncPoint>,
+    )>,
 }
 
 unsafe impl Send for VulkanRenderer {}
@@ -409,6 +449,7 @@ static VERT_SPV: &[u8] = include_bytes!("shaders/composite.vert.spv");
 static FRAG_SPV: &[u8] = include_bytes!("shaders/composite.frag.spv");
 
 static NV12_COMP_SPV: &[u8] = include_bytes!("shaders/bgra_to_nv12.comp.spv");
+static YUV444_COMP_SPV: &[u8] = include_bytes!("shaders/bgra_to_yuv444.comp.spv");
 
 static NV12_IMAGE_COMP_SPV: &[u8] = include_bytes!("shaders/bgra_to_nv12_image.comp.spv");
 /// 4:4:4 twin of the above: same two-plane shape and descriptor layout, but
@@ -532,6 +573,11 @@ impl VulkanRenderer {
         // Probe for external fence fd support (needed for sync_fd export).
         let has_external_fence_fd = ext_names_all.contains(&ash::khr::external_fence_fd::NAME)
             && ext_names_all.contains(&ash::khr::external_fence::NAME);
+        // External semaphore fd import: how an explicit-sync client's
+        // acquire fence becomes a GPU-side wait on the composite submit.
+        let has_external_semaphore_fd = ext_names_all
+            .contains(&ash::khr::external_semaphore_fd::NAME)
+            && ext_names_all.contains(&ash::khr::external_semaphore::NAME);
 
         // DMA-BUF extensions are optional — llvmpipe and other software
         // renderers lack them.  When absent the compositor runs in SHM-only
@@ -568,6 +614,10 @@ impl VulkanRenderer {
         if has_external_fence_fd {
             device_extensions.push(ash::khr::external_fence::NAME.as_ptr());
             device_extensions.push(ash::khr::external_fence_fd::NAME.as_ptr());
+        }
+        if has_external_semaphore_fd {
+            device_extensions.push(ash::khr::external_semaphore::NAME.as_ptr());
+            device_extensions.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
         }
         if has_video_encode {
             device_extensions.push(c"VK_KHR_video_queue".as_ptr());
@@ -616,6 +666,11 @@ impl VulkanRenderer {
 
         let external_fence_fd_fn = if has_external_fence_fd {
             Some(ash::khr::external_fence_fd::Device::new(&instance, &device))
+        } else {
+            None
+        };
+        let external_semaphore_fd_fn = if has_external_semaphore_fd {
+            Some(ash::khr::external_semaphore_fd::Device::new(&instance, &device))
         } else {
             None
         };
@@ -827,12 +882,14 @@ impl VulkanRenderer {
                 .ok()?
         };
 
-        // Push constants: src_width, src_height, y_stride, uv_offset,
-        // enc_width, enc_height (6 × u32 = 24 bytes).
+        // Push constants: sized for the larger of the two buffer-target
+        // shaders — NV12 uses 6 × u32 (24 bytes), YUV444 7 × u32 (28).
+        // A layout range may exceed what a shader declares, so both
+        // pipelines share this layout.
         let compute_push_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(24);
+            .size(28);
         let compute_pl_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(std::slice::from_ref(&compute_descriptor_set_layout))
             .push_constant_ranges(std::slice::from_ref(&compute_push_range));
@@ -858,6 +915,32 @@ impl VulkanRenderer {
         };
         unsafe {
             device.destroy_shader_module(comp_mod, None);
+        }
+
+        // BGRA→YUV444 (planar, 3 full-resolution planes) into the same
+        // buffer-target shape — the 4:4:4 flavour of the OPAQUE_FD
+        // zero-copy path.  Same descriptor layout, one extra push u32.
+        let comp_444_code = Self::spirv_from_bytes(YUV444_COMP_SPV)?;
+        let comp_444_info = vk::ShaderModuleCreateInfo::default().code(&comp_444_code);
+        let comp_444_mod = unsafe { device.create_shader_module(&comp_444_info, None).ok()? };
+        let comp_444_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(comp_444_mod)
+            .name(comp_entry_name);
+        let compute_yuv444_pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(comp_444_stage)
+            .layout(compute_pipeline_layout);
+        let compute_yuv444_pipeline = unsafe {
+            device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[compute_yuv444_pipeline_info],
+                    None,
+                )
+                .ok()?[0]
+        };
+        unsafe {
+            device.destroy_shader_module(comp_444_mod, None);
         }
 
         // -----------------------------------------------------------
@@ -1060,6 +1143,7 @@ impl VulkanRenderer {
             video_encode_command_pool,
             video_fns,
             vulkan_encoders: HashMap::new(),
+            vulkan_encoder_pacing: HashMap::new(),
             pending_encoded_frames: Vec::new(),
             has_video_encode,
             has_video_encode_av1,
@@ -1073,6 +1157,7 @@ impl VulkanRenderer {
             descriptor_set_layout,
             descriptor_pool,
             compute_pipeline,
+            compute_yuv444_pipeline,
             compute_pipeline_layout,
             compute_descriptor_set_layout,
             compute_image_pipeline,
@@ -1085,6 +1170,8 @@ impl VulkanRenderer {
             pending_submit: None,
             deferred_submits: Vec::new(),
             external_fence_fd_fn,
+            external_semaphore_fd_fn,
+            pending_acquire_semaphores: Vec::new(),
             supported_dmabuf_modifiers,
             external_outputs: HashMap::new(),
             nv12_outputs: HashMap::new(),
@@ -1288,6 +1375,7 @@ impl VulkanRenderer {
     /// driver runs out of concurrent video sessions — so the caller can tell
     /// the server to fall back to a server-side encoder instead of leaving
     /// that client waiting for a bitstream that will never arrive.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_vulkan_encoder(
         &mut self,
         surface_id: u32,
@@ -1299,6 +1387,8 @@ impl VulkanRenderer {
         // 4:4:4 rather than 4:2:0.  Device-dependent — the caps query
         // refuses it on hardware that cannot, and the caller falls back.
         is_444: bool,
+        // Minimum microseconds between encodes; 0 = every composite.
+        min_interval_us: u32,
     ) -> bool {
         if !self.has_video_encode {
             eprintln!("[vulkan-render] cannot create vulkan encoder: video encode not available");
@@ -1433,9 +1523,16 @@ impl VulkanRenderer {
         match encoder {
             Some(enc) => {
                 eprintln!(
-                    "[vulkan-render] created vulkan {codec_name} encoder for surface {surface_id} client {client_id} {w}x{h} qp={qp}",
+                    "[vulkan-render] created vulkan {codec_name} encoder for surface {surface_id} client {client_id} {w}x{h} qp={qp} interval={min_interval_us}us",
                 );
                 self.vulkan_encoders.insert((surface_id, client_id), enc);
+                self.vulkan_encoder_pacing.insert(
+                    (surface_id, client_id),
+                    (
+                        std::time::Duration::from_micros(min_interval_us as u64),
+                        None,
+                    ),
+                );
                 true
             }
             None => {
@@ -1491,6 +1588,7 @@ impl VulkanRenderer {
             // count over would retire its replacement early.
             self.vulkan_encode_failures.remove(&key);
             self.vulkan_encode_giveups.retain(|k| *k != key);
+            self.vulkan_encoder_pacing.remove(&key);
         }
         // Never hand a bitstream to a client whose encoder has just gone
         // away; the server would credit it against a subscription that no
@@ -1618,6 +1716,7 @@ impl VulkanRenderer {
                     buffers[0].height,
                     // VA-API is the consumer here; it imports dma_bufs.
                     Nv12Export::DmaBuf,
+                    false,
                 );
             }
         }
@@ -1690,6 +1789,7 @@ impl VulkanRenderer {
         target_h: u32,
         native: (u32, u32),
         want_nv12_opaque: bool,
+        opaque_is_444: bool,
     ) {
         // A Vulkan Video encoder on this surface encodes from its own image,
         // so nothing would ever read the NV12 buffer we were asked for.
@@ -1708,10 +1808,20 @@ impl VulkanRenderer {
             // re-registers to say so. Returning early here would freeze the
             // first subscriber's answer for the target's whole life and
             // hand the newcomer GPU-only memory it cannot map.
-            let has_nv12 = self
+            // Format matters as much as existence: a 4:2:0 slot serving a
+            // subscriber that now wants 4:4:4 (or vice versa) would hand
+            // the encoder planes in the wrong geometry.
+            let slot_format = self
                 .nv12_opaque_slot(surface_id, target_w, target_h)
-                .is_some();
-            if want_nv12_opaque && !has_nv12 {
+                .and_then(|idx| {
+                    self.nv12_opaque_outputs
+                        .get(&(surface_id, target_w, target_h))
+                        .map(|(v, _)| v[idx].is_444)
+                });
+            if want_nv12_opaque && slot_format != Some(opaque_is_444) {
+                if slot_format.is_some() {
+                    self.destroy_nv12_outputs_for_target(surface_id, target_w, target_h);
+                }
                 self.create_nv12_outputs(
                     surface_id,
                     target_w,
@@ -1719,8 +1829,9 @@ impl VulkanRenderer {
                     target_w,
                     target_h,
                     Nv12Export::OpaqueFd,
+                    opaque_is_444,
                 );
-            } else if !want_nv12_opaque && has_nv12 {
+            } else if !want_nv12_opaque && slot_format.is_some() {
                 eprintln!(
                     "[vulkan-render] sid {surface_id} {target_w}x{target_h}: dropping NV12 \
                      opaque-fd target, a subscriber needs CPU pixels",
@@ -1750,6 +1861,7 @@ impl VulkanRenderer {
                 target_w,
                 target_h,
                 Nv12Export::OpaqueFd,
+                opaque_is_444,
             );
             let ok = self
                 .nv12_opaque_outputs
@@ -2347,9 +2459,14 @@ impl VulkanRenderer {
                     uv_memory,
                     uv_view,
                     encode_view,
+                    encode_image,
                 } => {
                     if let Some(ev) = encode_view {
                         self.device.destroy_image_view(ev, None);
+                    }
+                    if let Some((ei, em)) = encode_image {
+                        self.device.destroy_image(ei, None);
+                        self.device.free_memory(em, None);
                     }
                     self.device.destroy_image_view(y_view, None);
                     self.device.destroy_image_view(uv_view, None);
@@ -2480,6 +2597,7 @@ impl VulkanRenderer {
         w: u32,
         h: u32,
         export: Nv12Export,
+        is_444: bool,
     ) {
         // DMA-BUF export needs the dma_buf extensions; OPAQUE_FD does not,
         // and must not be gated on them — an NVIDIA-only host is exactly
@@ -2535,10 +2653,17 @@ impl VulkanRenderer {
         };
         let Some(get_fd_fp) = get_fd_fp else { return };
 
-        // NV12: stride aligned to 64 bytes, Y = stride*h, UV = stride*h/2.
+        // Stride aligned to 64 bytes.  NV12: Y = stride*h then interleaved
+        // UV at half height.  YUV444: three full planes, U at stride*h and
+        // V at 2*stride*h — `uv_offset` names the first chroma plane in
+        // both layouts, which is also where NVENC expects it.
         let stride = (w + 63) & !63;
         let uv_offset = stride * h;
-        let buf_size = (stride * h * 3 / 2) as u64;
+        let buf_size = if is_444 {
+            (stride * h * 3) as u64
+        } else {
+            (stride * h * 3 / 2) as u64
+        };
 
         for _ in 0..3 {
             let Some(nv12) = (|| -> Option<Nv12Output> {
@@ -2660,7 +2785,7 @@ impl VulkanRenderer {
                     descriptor_set,
                     width: w,
                     height: h,
-                    is_444: false,
+                    is_444,
                     kind: Nv12OutputKind::Buffer {
                         buffer,
                         memory,
@@ -2691,7 +2816,8 @@ impl VulkanRenderer {
             .get(&(surface_id, target_w, target_h))
             .map_or(0, |(v, _)| v.len());
         eprintln!(
-            "[vulkan-render] created {count} NV12 buffers {w}x{h} stride={stride} uv_offset={uv_offset} for target {target_w}x{target_h}",
+            "[vulkan-render] created {count} {} buffers {w}x{h} stride={stride} uv_offset={uv_offset} for target {target_w}x{target_h}",
+            if is_444 { "YUV444" } else { "NV12" },
         );
     }
 
@@ -3078,6 +3204,7 @@ impl VulkanRenderer {
                 uv_memory,
                 uv_view,
                 encode_view,
+                encode_image: None,
             },
         })
     }
@@ -3116,7 +3243,11 @@ impl VulkanRenderer {
         } else {
             vk::Format::G8_B8R8_2PLANE_420_UNORM
         };
-        let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR;
+        // The compute shader writes a storage image; the session reads a
+        // separate `VIDEO_ENCODE_SRC` image the storage image is copied
+        // into per frame (see `Nv12OutputKind::Image::encode_image` for why
+        // one image cannot legally wear both usages).
+        let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
 
         // Both profile chains have to outlive the create call below, so both
         // leaf structs are materialised here and only the matching one is
@@ -3156,6 +3287,12 @@ impl VulkanRenderer {
         let mut format_list =
             vk::ImageFormatListCreateInfo::default().view_formats(&format_list_entries);
 
+        // Storage image: no video usage, so no profile list — MUTABLE +
+        // the plane format list is what the compute shader needs, and
+        // EXTENDED_USAGE is what makes STORAGE legal here at all: the
+        // multiplanar 4:4:4 format itself has no STORAGE feature, only its
+        // R8/R8G8 plane view formats do, and EXTENDED_USAGE tells the
+        // implementation to validate usage against those.
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(nv12_format)
@@ -3169,10 +3306,9 @@ impl VulkanRenderer {
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage)
-            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
+            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .push_next(&mut profile_list)
             .push_next(&mut format_list);
 
         let image = match unsafe { self.device.create_image(&image_info, None) } {
@@ -3210,11 +3346,63 @@ impl VulkanRenderer {
             return None;
         }
 
-        let plane_view = |aspect, format| unsafe {
+        // The encode-side image: `VIDEO_ENCODE_SRC` (against the session's
+        // profile) + `TRANSFER_DST` for the per-frame copy, nothing else.
+        let encode_image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(nv12_format)
+            .extent(vk::Extent3D {
+                width: w,
+                height: h,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut profile_list);
+        let encode_image = match unsafe { self.device.create_image(&encode_image_info, None) } {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("[vulkan-render] encode-src image create failed {w}x{h}: {e:?}");
+                unsafe {
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_image(image, None);
+                }
+                return None;
+            }
+        };
+        let enc_reqs = unsafe { self.device.get_image_memory_requirements(encode_image) };
+        let enc_memory = self
+            .find_memory_type(
+                enc_reqs.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .and_then(|mt| {
+                let alloc = vk::MemoryAllocateInfo::default()
+                    .allocation_size(enc_reqs.size)
+                    .memory_type_index(mt);
+                unsafe { self.device.allocate_memory(&alloc, None) }.ok()
+            })
+            .filter(|&m| unsafe { self.device.bind_image_memory(encode_image, m, 0) }.is_ok());
+        let Some(enc_memory) = enc_memory else {
+            eprintln!("[vulkan-render] encode-src image memory alloc/bind failed");
+            unsafe {
+                self.device.destroy_image(encode_image, None);
+                self.device.free_memory(memory, None);
+                self.device.destroy_image(image, None);
+            }
+            return None;
+        };
+
+        let plane_view = |target, aspect, format| unsafe {
             self.device
                 .create_image_view(
                     &vk::ImageViewCreateInfo::default()
-                        .image(image)
+                        .image(target)
                         .view_type(vk::ImageViewType::TYPE_2D)
                         .format(format)
                         .subresource_range(vk::ImageSubresourceRange {
@@ -3232,20 +3420,25 @@ impl VulkanRenderer {
             for v in views {
                 self.device.destroy_image_view(*v, None);
             }
+            self.device.destroy_image(encode_image, None);
+            self.device.free_memory(enc_memory, None);
             self.device.free_memory(memory, None);
             self.device.destroy_image(image, None);
         };
 
-        let Some(y_view) = plane_view(vk::ImageAspectFlags::PLANE_0, vk::Format::R8_UNORM) else {
+        let Some(y_view) = plane_view(image, vk::ImageAspectFlags::PLANE_0, vk::Format::R8_UNORM)
+        else {
             cleanup(&[]);
             return None;
         };
-        let Some(uv_view) = plane_view(vk::ImageAspectFlags::PLANE_1, vk::Format::R8G8_UNORM)
+        let Some(uv_view) =
+            plane_view(image, vk::ImageAspectFlags::PLANE_1, vk::Format::R8G8_UNORM)
         else {
             cleanup(&[y_view]);
             return None;
         };
-        let Some(encode_view) = plane_view(vk::ImageAspectFlags::COLOR, nv12_format) else {
+        let Some(encode_view) = plane_view(encode_image, vk::ImageAspectFlags::COLOR, nv12_format)
+        else {
             cleanup(&[y_view, uv_view]);
             return None;
         };
@@ -3303,6 +3496,7 @@ impl VulkanRenderer {
                 uv_memory: vk::DeviceMemory::null(),
                 uv_view,
                 encode_view: Some(encode_view),
+                encode_image: Some((encode_image, enc_memory)),
             },
         })
     }
@@ -3434,7 +3628,11 @@ impl VulkanRenderer {
             self.device.cmd_bind_pipeline(
                 cb,
                 vk::PipelineBindPoint::COMPUTE,
-                self.compute_pipeline,
+                if nv12.is_444 {
+                    self.compute_yuv444_pipeline
+                } else {
+                    self.compute_pipeline
+                },
             );
             self.device.cmd_bind_descriptor_sets(
                 cb,
@@ -3444,13 +3642,28 @@ impl VulkanRenderer {
                 &[nv12.descriptor_set],
                 &[],
             );
-            let push = [src_w, src_h, *stride, *uv_offset, enc_w, enc_h];
+            // YUV444 takes (…, u_offset, v_offset, …); NV12 a single
+            // uv_offset.  The planes share one stride, so V follows U by
+            // exactly one plane.
+            let push: Vec<u32> = if nv12.is_444 {
+                vec![
+                    src_w,
+                    src_h,
+                    *stride,
+                    *uv_offset,
+                    *uv_offset * 2,
+                    enc_w,
+                    enc_h,
+                ]
+            } else {
+                vec![src_w, src_h, *stride, *uv_offset, enc_w, enc_h]
+            };
             self.device.cmd_push_constants(
                 cb,
                 self.compute_pipeline_layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
-                std::slice::from_raw_parts(push.as_ptr() as *const u8, 24),
+                std::slice::from_raw_parts(push.as_ptr() as *const u8, push.len() * 4),
             );
             self.device
                 .cmd_dispatch(cb, enc_w.div_ceil(16), enc_h.div_ceil(16), 1);
@@ -3483,7 +3696,12 @@ impl VulkanRenderer {
         let nv12 = &nv12_vec[nv12_idx];
         let enc_w = nv12.width;
         let enc_h = nv12.height;
-        let Nv12OutputKind::Image { image, .. } = &nv12.kind else {
+        let Nv12OutputKind::Image {
+            image,
+            encode_image,
+            ..
+        } = &nv12.kind
+        else {
             return;
         };
 
@@ -3601,6 +3819,111 @@ impl VulkanRenderer {
             );
             self.device
                 .cmd_dispatch(cb, enc_w.div_ceil(16), enc_h.div_ceil(16), 1);
+
+            // Copy the converted planes into the encode-only image (see
+            // `Nv12OutputKind::Image::encode_image`).  Everything stays in
+            // GENERAL: the storage writes need it, vkCmdCopyImage accepts
+            // it, and the encode path takes GENERAL as a source layout.
+            if let Some((enc_img, _)) = encode_image {
+                let planes = vk::ImageAspectFlags::PLANE_0 | vk::ImageAspectFlags::PLANE_1;
+                let range = |aspect| vk::ImageSubresourceRange {
+                    aspect_mask: aspect,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let src_barrier = vk::ImageMemoryBarrier::default()
+                    .image(*image)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .subresource_range(range(planes));
+                // Fully overwritten every frame, so the previous contents
+                // are discardable: UNDEFINED → GENERAL.
+                let dst_barrier = vk::ImageMemoryBarrier::default()
+                    .image(*enc_img)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .subresource_range(range(planes));
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[src_barrier, dst_barrier],
+                );
+                let layers = |aspect| vk::ImageSubresourceLayers {
+                    aspect_mask: aspect,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                // Plane extents are in each plane's own texel grid: full
+                // size for Y (and both planes at 4:4:4), halved for the
+                // 4:2:0 chroma plane.
+                let (cw, ch) = if nv12.is_444 {
+                    (enc_w, enc_h)
+                } else {
+                    (enc_w / 2, enc_h / 2)
+                };
+                let regions = [
+                    vk::ImageCopy {
+                        src_subresource: layers(vk::ImageAspectFlags::PLANE_0),
+                        src_offset: vk::Offset3D::default(),
+                        dst_subresource: layers(vk::ImageAspectFlags::PLANE_0),
+                        dst_offset: vk::Offset3D::default(),
+                        extent: vk::Extent3D {
+                            width: enc_w,
+                            height: enc_h,
+                            depth: 1,
+                        },
+                    },
+                    vk::ImageCopy {
+                        src_subresource: layers(vk::ImageAspectFlags::PLANE_1),
+                        src_offset: vk::Offset3D::default(),
+                        dst_subresource: layers(vk::ImageAspectFlags::PLANE_1),
+                        dst_offset: vk::Offset3D::default(),
+                        extent: vk::Extent3D {
+                            width: cw,
+                            height: ch,
+                            depth: 1,
+                        },
+                    },
+                ];
+                self.device.cmd_copy_image(
+                    cb,
+                    *image,
+                    vk::ImageLayout::GENERAL,
+                    *enc_img,
+                    vk::ImageLayout::GENERAL,
+                    &regions,
+                );
+                // Make the copy visible to the encode consumption that
+                // follows this submission (same fence-ordered handoff the
+                // storage image relied on before the split).
+                let avail = vk::ImageMemoryBarrier::default()
+                    .image(*enc_img)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+                    .subresource_range(range(planes));
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[avail],
+                );
+            }
         }
 
         unsafe { self.device.destroy_image_view(bgra_view, None) };
@@ -4762,6 +5085,69 @@ impl VulkanRenderer {
     /// than call and lose the tree.  `has_pending` is not a substitute: it
     /// is true for the whole life of a submit, including after its fence
     /// has signalled, when compositing proceeds normally.
+    /// Import an explicit-sync acquire fence (a sync_file fd) as a
+    /// semaphore the next composite submit will wait on.  Returns `false`
+    /// when the device lacks external-semaphore support or the import
+    /// fails — the caller then parks the commit CPU-side instead.
+    pub(crate) fn add_acquire_wait_fd(&mut self, fd: std::os::fd::OwnedFd) -> bool {
+        use std::os::fd::IntoRawFd;
+        let Some(sem_fn) = self.external_semaphore_fd_fn.as_ref() else {
+            return false;
+        };
+        let sem = match unsafe {
+            self.device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+        } {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let raw = fd.into_raw_fd();
+        let info = vk::ImportSemaphoreFdInfoKHR::default()
+            .semaphore(sem)
+            .flags(vk::SemaphoreImportFlags::TEMPORARY)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+            .fd(raw);
+        match unsafe { sem_fn.import_semaphore_fd(&info) } {
+            Ok(()) => {
+                // Ownership of the fd passed to the driver on success.
+                self.pending_acquire_semaphores.push(sem);
+                true
+            }
+            Err(_) => {
+                unsafe {
+                    self.device.destroy_semaphore(sem, None);
+                    libc::close(raw);
+                }
+                false
+            }
+        }
+    }
+
+    /// Gate a wl_buffer release on in-flight GPU work.  Returns `true`
+    /// when the buffer was attached to a submission and will be released
+    /// once its fence signals; `false` when nothing is in flight — every
+    /// prior read has already been fence-waited, so the caller may
+    /// release immediately.
+    ///
+    /// Implicit dma-buf fencing cannot be trusted to hold the client off
+    /// the memory (NVIDIA's Vulkan driver ignores it); this is the
+    /// explicit substitute.
+    pub fn defer_buffer_release(
+        &mut self,
+        buf: wayland_server::protocol::wl_buffer::WlBuffer,
+        release_point: Option<crate::drm_syncobj::SyncPoint>,
+    ) -> bool {
+        if let Some(p) = self.pending_submit.as_mut() {
+            p.release_buffers.push((buf, release_point));
+            return true;
+        }
+        if let Some(p) = self.deferred_submits.last_mut() {
+            p.release_buffers.push((buf, release_point));
+            return true;
+        }
+        false
+    }
+
     pub fn would_defer_submit(&self) -> bool {
         let Some(pending) = self.pending_submit.as_ref() else {
             return false;
@@ -4793,7 +5179,7 @@ impl VulkanRenderer {
     #[allow(clippy::type_complexity)]
     pub fn try_retire_pending(
         &mut self,
-    ) -> (Option<(u16, u32, u32)>, Vec<(u16, u32, u32, PixelData)>) {
+    ) -> (Option<(u16, u32, u32)>, Vec<(u16, u32, u32, PixelData, bool)>) {
         // The compositor calls this every iteration of its event loop
         // (once per Wayland event). We deliberately do NOT drain
         // deferred external submits here: that happens at submit time
@@ -4826,7 +5212,7 @@ impl VulkanRenderer {
             Some(native),
             results
                 .into_iter()
-                .map(|(w, h, p)| (toplevel_sid, w, h, p))
+                .map(|(w, h, p, encoder_skip)| (toplevel_sid, w, h, p, encoder_skip))
                 .collect(),
         )
     }
@@ -4835,8 +5221,25 @@ impl VulkanRenderer {
     /// a completed GPU submission.  External targets were emitted
     /// immediately by `render_tree_sized` — `retire_pending` only
     /// handles staging readback (native + downscale targets).
-    fn retire_pending(&mut self, pending: PendingSubmit) -> Vec<(u32, u32, PixelData)> {
-        let mut results: Vec<(u32, u32, PixelData)> = Vec::new();
+    ///
+    /// The `bool` per result is `encoder_skip`: true when this BGRA was
+    /// published on demand over a live NV12 zero-copy stream and must not
+    /// reach an encoder (see the range-mismatch comment at the publish
+    /// site).
+    fn retire_pending(&mut self, pending: PendingSubmit) -> Vec<(u32, u32, PixelData, bool)> {
+        // The fence has signalled (every caller waits first): the GPU is
+        // done with every buffer this submission — and, by queue order,
+        // any earlier one — sampled.  Only now may the client redraw them.
+        for sem in &pending.wait_semaphores {
+            unsafe { self.device.destroy_semaphore(*sem, None) };
+        }
+        for (buf, point) in &pending.release_buffers {
+            buf.release();
+            if let Some(p) = point {
+                p.signal();
+            }
+        }
+        let mut results: Vec<(u32, u32, PixelData, bool)> = Vec::new();
 
         // Native BGRA from the self-alloc output_image staging buffer.
         if pending.self_output_idx < self.output_images.len() {
@@ -4865,14 +5268,19 @@ impl VulkanRenderer {
                 // capture` asks on demand, and the staging buffer is
                 // filled every frame regardless, so the pixels are already
                 // sitting there — only the copy that publishes them is
-                // skipped. One BGRA frame reaching the encoder instead of
-                // NV12 needs no coordination: it encodes either.
+                // skipped. That one BGRA frame must still not reach the
+                // encoder: it would go through NVENC's own ARGB
+                // conversion, whose rounding (and possibly matrix)
+                // differs from the zero-copy shader's, so splicing it
+                // into the NV12 stream shifts the picture for one frame —
+                // and the re-encode of an identical frame is waste
+                // besides.  Mark it encoder_skip so the server feeds it
+                // to the pixel cache but not to any encoder.
                 let wanted_now = std::mem::take(&mut self.publish_native_bgra_once);
-                if !wanted_now
-                    && self
-                        .nv12_opaque_slot(pending.surface_id, pending.phys_w, pending.phys_h)
-                        .is_some()
-                {
+                let zero_copy_live = self
+                    .nv12_opaque_slot(pending.surface_id, pending.phys_w, pending.phys_h)
+                    .is_some();
+                if !wanted_now && zero_copy_live {
                     // fall through to cleanup
                 } else {
                     let size = pending.phys_w as usize * pending.phys_h as usize * 4;
@@ -4882,6 +5290,7 @@ impl VulkanRenderer {
                         pending.phys_w,
                         pending.phys_h,
                         PixelData::Bgra(Arc::new(bgra)),
+                        zero_copy_live,
                     ));
                 }
             }
@@ -4908,7 +5317,7 @@ impl VulkanRenderer {
             }
             let size = (tw as usize) * (th as usize) * 4;
             let bgra = unsafe { std::slice::from_raw_parts(out.staging_ptr, size) }.to_vec();
-            results.push((tw, th, PixelData::Bgra(Arc::new(bgra))));
+            results.push((tw, th, PixelData::Bgra(Arc::new(bgra)), false));
         }
 
         // Always free the fence, command buffer, and per-frame textures.
@@ -4931,7 +5340,7 @@ impl VulkanRenderer {
     }
 
     /// Free deferred external submissions whose fences have signalled.
-    fn drain_deferred_submits(&mut self) {
+    pub(crate) fn drain_deferred_submits(&mut self) {
         if self.deferred_submits.is_empty() {
             return;
         }
@@ -4963,6 +5372,15 @@ impl VulkanRenderer {
                 )
             };
             if raw == vk::Result::SUCCESS {
+                for sem in pending.wait_semaphores.drain(..) {
+                    unsafe { self.device.destroy_semaphore(sem, None) };
+                }
+                for (buf, point) in pending.release_buffers.drain(..) {
+                    buf.release();
+                    if let Some(p) = point {
+                        p.signal();
+                    }
+                }
                 unsafe {
                     self.device.destroy_fence(pending.fence, None);
                     self.device
@@ -5015,7 +5433,7 @@ impl VulkanRenderer {
         output_scale_120: u16,
         target_phys: Option<(u32, u32)>,
         toplevel_sid: u16,
-    ) -> Vec<(u16, u32, u32, PixelData)> {
+    ) -> Vec<(u16, u32, u32, PixelData, bool)> {
         // Retire the previous submission if done (non-blocking).  The
         // self-alloc readback (compositor BGRA at native) is one frame
         // delayed — staging buffer copy needs the fence to complete.
@@ -5025,9 +5443,11 @@ impl VulkanRenderer {
         static ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let entry_n = ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let had_pending = self.pending_submit.is_some();
-        let mut results: Vec<(u16, u32, u32, PixelData)> = Vec::new();
+        let mut results: Vec<(u16, u32, u32, PixelData, bool)> = Vec::new();
         if let Some(pending) = self.pending_submit.take() {
             let prev_sid = pending.toplevel_sid;
+            let (prev_surface, prev_w, prev_h) =
+                (pending.surface_id, pending.phys_w, pending.phys_h);
             let raw = unsafe {
                 (self.device.fp_v1_0().wait_for_fences)(
                     self.device.handle(),
@@ -5040,11 +5460,19 @@ impl VulkanRenderer {
             if raw == vk::Result::SUCCESS {
                 let r = self.retire_pending(pending);
                 self.free_frame_textures();
-                if r.is_empty() {
+                // Empty is the normal outcome under NV12 zero-copy: the
+                // frame was already published GPU-side and the readback
+                // is deliberately suppressed.  Only log when nothing was
+                // suppressing it.
+                if r.is_empty()
+                    && self
+                        .nv12_opaque_slot(prev_surface, prev_w, prev_h)
+                        .is_none()
+                {
                     eprintln!("[render_tree_sized] fence OK but retire_pending=empty");
                 }
-                for (w, h, p) in r {
-                    results.push((prev_sid, w, h, p));
+                for (w, h, p, encoder_skip) in r {
+                    results.push((prev_sid, w, h, p, encoder_skip));
                 }
             } else {
                 // Self-alloc readback: must wait for fence — re-stash
@@ -5962,7 +6390,17 @@ impl VulkanRenderer {
             None
         };
 
-        let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
+        // Wait on any explicit-sync acquire fences staged since the last
+        // submit: the compute passes below sample those clients' imports,
+        // and without this wait the read races the client's GPU write
+        // (NVIDIA honors no implicit dma-buf fencing).
+        let acquire_waits = std::mem::take(&mut self.pending_acquire_semaphores);
+        let acquire_stages: Vec<vk::PipelineStageFlags> =
+            vec![vk::PipelineStageFlags::ALL_COMMANDS; acquire_waits.len()];
+        let submit = vk::SubmitInfo::default()
+            .command_buffers(std::slice::from_ref(&cb))
+            .wait_semaphores(&acquire_waits)
+            .wait_dst_stage_mask(&acquire_stages);
         // Submit twice with different fences so each gets the GPU
         // completion signal independently.  The driver collapses these
         // into a single dispatch since the second submit only carries
@@ -5973,6 +6411,9 @@ impl VulkanRenderer {
                 .queue_submit(self.queue, &[submit], tracking_fence)
             {
                 eprintln!("[render_tree_sized] queue_submit (tracking) failed: {e}");
+                for sem in &acquire_waits {
+                    self.device.destroy_semaphore(*sem, None);
+                }
                 if let Some(ef) = export_fence {
                     self.device.destroy_fence(ef, None);
                 }
@@ -6026,11 +6467,39 @@ impl VulkanRenderer {
                         let n = v.get(idx % v.len().max(1))?;
                         match &n.kind {
                             Nv12OutputKind::Image {
-                                image, encode_view, ..
-                            } => encode_view.map(|ev| (*image, ev)),
+                                image,
+                                encode_view,
+                                encode_image,
+                                ..
+                            } => {
+                                // The session reads the encode-only image
+                                // when the storage/encode split is in
+                                // effect; imported images carry both roles.
+                                let img = encode_image.map_or(*image, |(ei, _)| ei);
+                                encode_view.map(|ev| (img, ev))
+                            }
                             _ => None,
                         }
                     });
+            if nv12_image_and_view.is_none() {
+                // Encoders exist but no encode image sits at the composite
+                // size — the surface resized under the sessions (their
+                // image is keyed at the size they were built for).  Skipped
+                // silently, this is a permanent freeze: no bitstream ever
+                // reaches the server, and no failure is counted, so the
+                // giveup path never fires either.  Count it.
+                for &cid in &encoder_cids {
+                    let n = self.vulkan_encode_failures.entry((sid, cid)).or_insert(0);
+                    *n += 1;
+                    if *n == VULKAN_ENCODE_FAILURE_LIMIT {
+                        eprintln!(
+                            "[vulkan-render] surface {sid} client {cid}: no encode image at \
+                             {phys_w}x{phys_h}; giving up on Vulkan Video",
+                        );
+                        self.vulkan_encode_giveups.push((sid, cid));
+                    }
+                }
+            }
             if let Some((nv12_img, ev)) = nv12_image_and_view {
                 let waited = unsafe {
                     self.device.wait_for_fences(
@@ -6047,8 +6516,56 @@ impl VulkanRenderer {
                     encoder_cids.clear();
                 }
                 for cid in encoder_cids {
+                    // Pace to the subscriber: encoding faster than it
+                    // consumes produces frames the server overwrites
+                    // undelivered, and each of those breaks the delta chain
+                    // at the decoder.  Skipping *before* the encode is free
+                    // — the next delta simply spans a longer interval.  The
+                    // 0.7 factor leaves room for commit-clock jitter so a
+                    // source at exactly the subscriber's rate is not
+                    // halved.  A pending forced keyframe bypasses the
+                    // throttle: it is answering a recovery request, and
+                    // delaying it extends the freeze it exists to end.
+                    if let Some((interval, last)) =
+                        self.vulkan_encoder_pacing.get_mut(&(sid, cid))
+                    {
+                        let now = std::time::Instant::now();
+                        let throttled = last.is_some_and(|l| {
+                            now.duration_since(l) < interval.mul_f32(0.7)
+                        });
+                        let force = self
+                            .vulkan_encoders
+                            .get(&(sid, cid))
+                            .is_some_and(|e| e.wants_idr());
+                        if throttled && !force {
+                            continue;
+                        }
+                        *last = Some(now);
+                    }
                     let encoder = self.vulkan_encoders.get_mut(&(sid, cid)).unwrap();
                     let codec_flag = encoder.codec_flag();
+                    // A session outlived the size it was built at (the
+                    // surface resized under it).  Encoding anyway would
+                    // read an image shaped differently from the coded
+                    // extent and emit a bitstream whose frames decode at
+                    // the old size while the wire header claims the new
+                    // one.  The server tears the session down on
+                    // SurfaceResized; count the skip as a failure so the
+                    // giveup path still unwedges us if that never lands.
+                    if encoder.source_dimensions() != (phys_w, phys_h) {
+                        let n = self.vulkan_encode_failures.entry((sid, cid)).or_insert(0);
+                        *n += 1;
+                        if *n == VULKAN_ENCODE_FAILURE_LIMIT {
+                            eprintln!(
+                                "[vulkan-render] surface {sid} client {cid}: session size {}x{} \
+                                 vs composite {phys_w}x{phys_h}; giving up on Vulkan Video",
+                                encoder.source_dimensions().0,
+                                encoder.source_dimensions().1,
+                            );
+                            self.vulkan_encode_giveups.push((sid, cid));
+                        }
+                        continue;
+                    }
                     let encoded = unsafe {
                         encoder.encode(
                             &self.device,
@@ -6111,6 +6628,8 @@ impl VulkanRenderer {
             surface_id: sid,
             downscale_targets: staging_targets,
             toplevel_sid,
+            wait_semaphores: acquire_waits,
+            release_buffers: Vec::new(),
         };
 
         // Export the dedicated export-fence as a sync_fd ONCE (shared
@@ -6200,8 +6719,10 @@ impl VulkanRenderer {
                     uv_offset,
                     width: nv12.width,
                     height: nv12.height,
+                    is_444: nv12.is_444,
                     sync_fd: Some(sync),
                 },
+                false,
             ));
             if let Some(entry) = self.nv12_opaque_outputs.get_mut(&(sid, tw, th)) {
                 let n = entry.0.len().max(1);
@@ -6292,7 +6813,7 @@ impl VulkanRenderer {
                 *sync_fd = Some(shared.clone());
             }
 
-            results.push((toplevel_sid, tw, th, pixel_data));
+            results.push((toplevel_sid, tw, th, pixel_data, false));
 
             // Advance the round-robin cursors for this target.
             if let Some(entry) = self.external_outputs.get_mut(&(sid, tw, th)) {
@@ -6344,6 +6865,17 @@ impl Drop for VulkanRenderer {
                 .into_iter()
                 .chain(self.deferred_submits.drain(..));
             for pending in all_pending {
+                for sem in &pending.wait_semaphores {
+                    self.device.destroy_semaphore(*sem, None);
+                }
+                // wait_idle above covered every read; don't strand the
+                // client's buffers on teardown.
+                for (buf, point) in &pending.release_buffers {
+                    buf.release();
+                    if let Some(p) = point {
+                        p.signal();
+                    }
+                }
                 self.device.destroy_fence(pending.fence, None);
                 self.device
                     .free_command_buffers(self.command_pool, &[pending.cb]);
@@ -6352,6 +6884,9 @@ impl Drop for VulkanRenderer {
                     self.device.destroy_image(t.image, None);
                     self.device.free_memory(t.memory, None);
                 }
+            }
+            for sem in self.pending_acquire_semaphores.drain(..) {
+                self.device.destroy_semaphore(sem, None);
             }
             self.destroy_output_images();
             // Destroy Vulkan Video encoders.
@@ -6401,6 +6936,8 @@ impl Drop for VulkanRenderer {
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.device.destroy_pipeline(self.compute_pipeline, None);
+            self.device
+                .destroy_pipeline(self.compute_yuv444_pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.compute_pipeline_layout, None);
             self.device

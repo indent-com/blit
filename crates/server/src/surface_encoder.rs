@@ -418,18 +418,18 @@ pub struct SurfaceEncoding {
 /// bits; it says nothing about how long the encoder may take.
 ///
 /// - **Low**: quantizer 180 — visibly lossy
-/// - **Medium** (default): quantizer 120 — good balance
+/// - **Medium**: quantizer 120 — good balance
 /// - **High**: quantizer 80 — sharp
-/// - **Ultra**: quantizer 1 — maximum fidelity, very expensive
+/// - **Ultra** (default): quantizer 1 — maximum fidelity, very expensive
 /// - **Custom**: caller-specified AV1 quantizer (10–255)
 ///
 /// Set via `BLIT_SURFACE_BANDWIDTH=low|medium|high|ultra|<10–255>`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SurfaceBandwidth {
     Low,
-    #[default]
     Medium,
     High,
+    #[default]
     Ultra,
     /// Caller-specified AV1 quantizer (10–255).  H.264 QP and
     /// software-encoder bitrate are derived proportionally.
@@ -1197,33 +1197,32 @@ impl SurfaceEncoder {
         }
     }
 
-    /// Whether this encoder can consume `PixelData::Nv12OpaqueFd`, i.e.
-    /// take NV12 straight out of a Vulkan `OPAQUE_FD` allocation with no CPU
-    /// copy.  Only NVENC can: CUDA is the sole importer of that handle type.
+    /// Whether this encoder consumes `PixelData::Nv12OpaqueFd`, i.e. takes
+    /// YUV straight out of a Vulkan `OPAQUE_FD` allocation with no CPU
+    /// copy.  Only NVENC can: CUDA is the sole importer of that handle
+    /// type.  The buffer's layout must match the session — NV12 for 4:2:0,
+    /// planar YUV444 for 4:4:4 — which is what `opaque_wants_444` reports;
+    /// the target registration carries it to the compositor.
     ///
-    /// `BLIT_NVENC_ZEROCOPY=0` forces this off, so both the zero-copy and
-    /// the BGRA-downscale arm can be measured against one binary.
+    /// There is no opt-out: NVENC encodes GPU-converted frames or nothing.
     #[cfg(target_os = "linux")]
     pub fn wants_nv12_opaque_fd(&self) -> bool {
-        if !matches!(
+        matches!(
             self.kind,
             SurfaceEncoderKind::NvencH264(_) | SurfaceEncoderKind::NvencAV1(_)
-        ) {
-            return false;
-        }
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            let on = std::env::var("BLIT_NVENC_ZEROCOPY").as_deref() != Ok("0");
-            if !on {
-                eprintln!("[surface-encoder] BLIT_NVENC_ZEROCOPY=0: NVENC takes the BGRA path");
-            }
-            on
-        })
+        )
     }
 
     #[cfg(not(target_os = "linux"))]
     pub fn wants_nv12_opaque_fd(&self) -> bool {
         false
+    }
+
+    /// Which OPAQUE_FD layout this encoder's session consumes: planar
+    /// YUV444 for a 4:4:4 session, NV12 otherwise.  Only meaningful when
+    /// `wants_nv12_opaque_fd` is true.
+    pub fn opaque_wants_444(&self) -> bool {
+        self.chroma.is_444()
     }
 
     /// Get GBM-allocated LINEAR BGRA buffers for zero-copy compositor→encoder.
@@ -1284,18 +1283,14 @@ impl SurfaceEncoder {
     }
 
     pub fn encode(&mut self, rgba: &[u8]) -> Option<(Vec<u8>, bool)> {
-        // NVENC handles RGBA→encoder-size padding internally in pinned
-        // GPU memory, so pass the original un-padded buffer with source
-        // dimensions.  The generic padding below produces enc_w stride
-        // which would cause a diagonal-skew artefact when
-        // encode_rgba_padded re-interprets it at src_w stride.
-        if let SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) =
-            &mut self.kind
-        {
-            let (sw, sh) = (self.source_width as usize, self.source_height as usize);
-            let mut result = enc.encode_rgba_padded(rgba, sw, sh);
-            self.fixup_keyframe(&mut result);
-            return result;
+        // NVENC encodes GPU-converted frames only.  Raw RGB would go
+        // through its internal limited-range conversion (wrong for blit's
+        // full-range streams), and converting host-side puts the whole
+        // pipeline on the CPU — neither is acceptable, so CPU pixels are
+        // refused and the stream waits for the zero-copy frame.
+        if let SurfaceEncoderKind::NvencH264(_) | SurfaceEncoderKind::NvencAV1(_) = &self.kind {
+            nvenc_refuse_cpu_pixels();
+            return None;
         }
 
         let enc_len = expected_rgba_len(self.width, self.height);
@@ -1420,6 +1415,7 @@ impl SurfaceEncoder {
                 uv_offset,
                 width,
                 height,
+                is_444,
                 sync_fd,
             } => {
                 use std::os::fd::AsRawFd;
@@ -1432,6 +1428,7 @@ impl SurfaceEncoder {
                             *uv_offset,
                             *width,
                             *height,
+                            *is_444,
                             sync_fd.as_ref().map(|s| s.as_raw_fd()),
                         ),
                     _ => {
@@ -1799,8 +1796,10 @@ impl SurfaceEncoder {
                 };
                 encoder.encode_yuv(yuv, self.width, self.height)
             }
-            SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => {
-                enc.encode_bgra_padded(bgra, src_w, src_h)
+            SurfaceEncoderKind::NvencH264(_) | SurfaceEncoderKind::NvencAV1(_) => {
+                // GPU-converted frames only — see `encode`.
+                nvenc_refuse_cpu_pixels();
+                None
             }
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(enc) => enc.encode_bgra_padded(bgra, src_w, src_h),
@@ -1994,21 +1993,21 @@ fn expected_rgba_len(width: u32, height: u32) -> Option<usize> {
 
 #[inline(always)]
 fn rgb_to_y(r: i32, g: i32, b: i32) -> u8 {
-    ((66 * r + 129 * g + 25 * b + 128) >> 8)
-        .wrapping_add(16)
-        .clamp(0, 255) as u8
+    // BT.601 full-range (black = 0), matching the compositor's compute
+    // shaders so CPU- and GPU-converted frames of one stream agree.
+    ((77 * r + 150 * g + 29 * b + 128) >> 8).clamp(0, 255) as u8
 }
 
 #[inline(always)]
 fn rgb_to_u(r: i32, g: i32, b: i32) -> u8 {
-    ((-38 * r - 74 * g + 112 * b + 128) >> 8)
+    ((-43 * r - 85 * g + 128 * b + 128) >> 8)
         .wrapping_add(128)
         .clamp(0, 255) as u8
 }
 
 #[inline(always)]
 fn rgb_to_v(r: i32, g: i32, b: i32) -> u8 {
-    ((112 * r - 94 * g - 18 * b + 128) >> 8)
+    ((128 * r - 107 * g - 21 * b + 128) >> 8)
         .wrapping_add(128)
         .clamp(0, 255) as u8
 }
@@ -2215,6 +2214,17 @@ fn rgba_to_yuv444(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
 /// BGRA -> I420 with edge-pixel padding to encoder dimensions.
 /// `src_w × src_h` is the actual pixel count in `bgra`.
 /// `enc_w × enc_h` is the encoder output dimensions (>= src).
+/// Rate-limit stamp for the NVENC CPU-pixel refusal below.
+fn nvenc_refuse_cpu_pixels() {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[surface-encoder] NVENC encodes GPU-converted frames only; CPU pixels refused \
+             (waiting for the zero-copy target)",
+        );
+    }
+}
+
 fn bgra_to_yuv420_padded(
     bgra: &[u8],
     src_w: usize,
@@ -2589,6 +2599,9 @@ impl X264Encoder {
             if x264_param_apply_profile(&mut par, profile.as_ptr()) < 0 {
                 return Err("x264_param_apply_profile failed".into());
             }
+            // blit's YUV is full-range BT.601 end to end; without the VUI
+            // flag decoders assume studio swing and lift blacks.
+            par.vui.b_fullrange = 1;
             let enc = x264_encoder_open(&mut par);
             if enc.is_null() {
                 return Err(format!("x264_encoder_open failed for {width}x{height}"));
@@ -2771,6 +2784,9 @@ impl SoftwareAV1Encoder {
             height: height as usize,
             chroma_sampling,
             chroma_sample_position: ChromaSamplePosition::Unknown,
+            // blit's YUV is full-range BT.601 end to end; the sequence
+            // header must say so or decoders assume studio swing.
+            pixel_range: PixelRange::Full,
             speed_settings: speed,
             low_latency: true,
             min_key_frame_interval: 0,

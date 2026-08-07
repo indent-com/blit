@@ -1097,11 +1097,15 @@ pub async fn cmd_record(
             }
             mask
         };
+        // Announce the decode ceiling before asking for the size, so the
+        // server has it when it decides how large to composite.  A recorder
+        // writes the bitstream straight to a file, so its only real ceiling
+        // is what it asked for.  Announced only alongside --size: the
+        // ceiling also caps the stream, so a recorder that follows the
+        // native size must not send one — a ceiling below native drops the
+        // target under it, and a Vulkan-only server (which encodes at
+        // native or not at all) then serves nothing.
         if let Some((w, h)) = size {
-            // Announce the decode ceiling before asking for the size, so the
-            // server has it when it decides how large to composite.  A
-            // recorder writes the bitstream straight to a file, so its only
-            // real ceiling is what it asked for.
             let mut features = vec![C2S_CLIENT_FEATURES, codec_support];
             features.extend_from_slice(&w.to_le_bytes());
             features.extend_from_slice(&h.to_le_bytes());

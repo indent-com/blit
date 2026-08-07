@@ -494,6 +494,14 @@ struct LastPixels {
     /// Used as the surface frame timestamp so the client sees the source's
     /// presentation timing rather than the (jittery) encode-delivery clock.
     timestamp_ms: u32,
+    /// Pixel-cache only: an on-demand BGRA readback published while an
+    /// NV12 zero-copy stream owns this key.  The encode tick must not
+    /// feed it to an encoder — the stream already carries this frame,
+    /// and re-encoding it through NVENC's ARGB conversion (whose
+    /// rounding differs from the zero-copy shader's) shifts the picture
+    /// for one frame.  Raw-paint consumers (initial paint, capture) use
+    /// it freely.
+    encoder_skip: bool,
 }
 
 /// The most recent bitstream a compositor-resident encoder produced for
@@ -700,8 +708,19 @@ fn resize_action(
     // resize look like a change, flooding the compositor with redundant
     // configures and re-creating the encoder (keyframe) on every tick during
     // a drag-resize.
-    if last_configured == Some(requested) {
-        return ResizeAction::Ignore;
+    if let Some((lw, lh, ls)) = last_configured {
+        let (rw, rh, rs) = requested;
+        // Within a couple of pixels is BSP settle noise, not a resize: the
+        // browser's pane measurement and the compositor's physical↔logical
+        // rounding disagree by ±2px and re-request each other's answer.
+        // Configuring the surface for that reconfigures the client, tears
+        // down every compositor-resident encode session on it, and opens
+        // each rebuilt one with a multi-megabyte keyframe — per nudge.
+        // The viewer letterboxes the difference invisibly instead
+        // (`per_client_encode_target` snaps such views to native).
+        if ls == rs && lw.abs_diff(rw) <= 2 && lh.abs_diff(rh) <= 2 {
+            return ResizeAction::Ignore;
+        }
     }
     match last_resize_at {
         Some(t) if now.duration_since(t) < SURFACE_RESIZE_SETTLE => ResizeAction::Hold,
@@ -838,13 +857,17 @@ fn encode_capture(pixels: &[u8], width: u32, height: u32, format: u8, quality: u
 /// A subscriber at a different size is irrelevant — it reads its own key.
 fn nv12_opaque_safe_for_target(
     this_wants: bool,
+    this_444: bool,
     target: (u32, u32),
-    others: impl Iterator<Item = (Option<(u32, u32)>, bool)>,
+    others: impl Iterator<Item = (Option<(u32, u32)>, bool, bool)>,
 ) -> bool {
+    // Every subscriber sharing the target must not only take an OPAQUE_FD
+    // buffer but agree on its layout — a 4:2:0 session cannot read the
+    // planar YUV444 buffer a 4:4:4 neighbour needs, and vice versa.
     this_wants
-        && others
-            .into_iter()
-            .all(|(their_target, they_want)| their_target != Some(target) || they_want)
+        && others.into_iter().all(|(their_target, they_want, their_444)| {
+            their_target != Some(target) || (they_want && their_444 == this_444)
+        })
 }
 
 async fn request_surface_capture_with_timeout(
@@ -889,6 +912,10 @@ struct SurfaceSubState {
     /// missed during that window would be read as "can take NV12" and
     /// handed a buffer it cannot map.
     wants_nv12_opaque: bool,
+    /// The OPAQUE_FD layout this subscriber's session consumes (444 =
+    /// planar YUV444).  Meaningful only with `wants_nv12_opaque`; recorded
+    /// for the same reason.
+    wants_opaque_444: bool,
     /// Next tick this surface may send a frame (pacing deadline).
     next_send_at: Option<Instant>,
     /// Frames remaining in the post-subscribe burst window that
@@ -2651,7 +2678,7 @@ impl Session {
     /// buffer out from under clients still registered at that size, and it
     /// leaves survivors on BGRA until something unrelated re-registers them.
     fn resettle_downscale_target(&mut self, surface_id: u16, tw: u32, th: u32) {
-        let survivors: Vec<(bool, (u32, u32))> = self
+        let survivors: Vec<(bool, bool, (u32, u32))> = self
             .clients
             .values()
             .filter_map(|c| {
@@ -2659,6 +2686,7 @@ impl Session {
                 (s.last_registered_target == Some((tw, th))).then(|| {
                     (
                         s.wants_nv12_opaque,
+                        s.wants_opaque_444,
                         s.last_registered_native.unwrap_or((tw, th)),
                     )
                 })
@@ -2667,7 +2695,7 @@ impl Session {
         let Some(cs) = self.compositor.as_mut() else {
             return;
         };
-        if let Some(&(_, (native_w, native_h))) = survivors.first() {
+        if let Some(&(_, first_444, (native_w, native_h))) = survivors.first() {
             let _ = cs.handle.command_tx.send(
                 blit_compositor::CompositorCommand::RegisterDownscaleTarget {
                     surface_id: surface_id as u32,
@@ -2675,7 +2703,12 @@ impl Session {
                     target_h: th,
                     native_w,
                     native_h,
-                    want_nv12_opaque: survivors.iter().all(|(w, _)| *w),
+                    // Zero-copy needs unanimity on both taking the buffer
+                    // and its layout; a format split falls back to BGRA.
+                    want_nv12_opaque: survivors
+                        .iter()
+                        .all(|(w, is444, _)| *w && *is444 == first_444),
+                    opaque_is_444: first_444,
                 },
             );
         } else {
@@ -3037,6 +3070,20 @@ impl Session {
         // dimensions.
         let w = (w & !1).max(2);
         let h = (h & !1).max(2);
+        // A view within a hair of native is the mediated size plus BSP
+        // settle noise (`resize_action` ignores ≤2px nudges) or the even
+        // rounding above.  Serve it the native stream: the viewer scales
+        // the difference invisibly, and compositor-resident sessions —
+        // which compare target to native exactly — stay eligible instead
+        // of falling to a server-side downscale over 2px.  Only when
+        // native is itself even, so the parity guarantee holds.
+        if native_w & 1 == 0
+            && native_h & 1 == 0
+            && w.abs_diff(native_w) <= 3
+            && h.abs_diff(native_h) <= 3
+        {
+            return (native_w, native_h);
+        }
         (w, h)
     }
 
@@ -4259,6 +4306,10 @@ async fn tick(state: &AppState) -> TickOutcome {
     // Surface IDs whose per-client encoders need to be invalidated.
     let mut invalidate_client_encoders: Vec<u16> = Vec::new();
     let mut vulkan_unavailable: Vec<(u16, u64)> = Vec::new();
+    // (sid, cid, overwritten generation) for compositor bitstreams replaced
+    // in `last_encoded` by a non-keyframe.  Resolved against each sub's
+    // delivered generation below: an undelivered overwrite broke the chain.
+    let mut encoded_overwrites: Vec<(u16, u64, u64)> = Vec::new();
     // Surface IDs resized by the compositor this tick.  After the
     // compositor borrow is released we wake pacing for every client
     // subscribed to each sid so the first post-resize frame bypasses
@@ -4317,6 +4368,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     height,
                     pixels,
                     timestamp_ms,
+                    encoder_skip,
                 } => {
                     surface_commit_count += 1;
                     // The compositor emits one SurfaceCommit per
@@ -4340,6 +4392,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             pixels,
                             generation: cs.pixel_generation,
                             timestamp_ms,
+                            encoder_skip,
                         },
                     );
                 }
@@ -4349,8 +4402,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                 } => {
                     surface_commit_count += 1;
                     cs.pixel_generation += 1;
-                    cs.last_encoded.insert(
-                        (frame.surface_id, frame.client_id),
+                    let new_is_keyframe = frame.is_keyframe;
+                    let key = (frame.surface_id, frame.client_id);
+                    let prev = cs.last_encoded.insert(
+                        key,
                         LastEncoded {
                             width: frame.width,
                             height: frame.height,
@@ -4361,6 +4416,20 @@ async fn tick(state: &AppState) -> TickOutcome {
                             timestamp_ms,
                         },
                     );
+                    // Overwriting a frame the subscriber never received
+                    // removes a link from its delta chain: every later
+                    // delta references reconstructions the decoder now
+                    // lacks, and the picture visibly tears until the next
+                    // keyframe.  An overwrite *by* a keyframe restarts the
+                    // chain and is fine; anything else must force one —
+                    // including an overwritten undelivered keyframe, whose
+                    // following deltas reference a frame the client never
+                    // saw.  (Checked against the sub's delivered generation
+                    // after this event loop — the compositor borrow is live
+                    // here.)
+                    if !new_is_keyframe && let Some(prev) = prev {
+                        encoded_overwrites.push((key.0, key.1, prev.generation));
+                    }
                 }
                 CompositorEvent::VulkanEncoderUnavailable {
                     surface_id,
@@ -4405,6 +4474,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // expensive encoder teardown+creation cycles for sizes
                     // that may never actually be encoded (because a newer
                     // SurfaceCommit arrives before the next encode tick).
+                    // Compositor-resident Vulkan sessions are the
+                    // exception — nothing recreates those on demand, so
+                    // the `resized_surface_ids` pass below tears them
+                    // down explicitly.
                     broadcast.push(msg_surface_resized(surface_id, width, height));
                     resized_surface_ids.push(surface_id);
                 }
@@ -4502,6 +4575,23 @@ async fn tick(state: &AppState) -> TickOutcome {
         }
     }
 
+    // A compositor bitstream overwritten before this client fetched it is a
+    // hole in the delta chain — the decoder would silently mispredicts every
+    // frame after it (the picture "jumps back and forth" between the stale
+    // and fresh reference slots) until a keyframe.  Owe one: the delivery
+    // loop then withholds deltas and asks the session for an IDR.  Encoder
+    // pacing makes this rare; this is the backstop that keeps it invisible.
+    for (sid, cid, prev_gen) in encoded_overwrites {
+        if let Some(c) = sess.clients.get_mut(&cid)
+            && c.vulkan_video_surfaces.contains_key(&sid)
+            && let Some(sub) = c.surface_subs.get_mut(&sid)
+            && sub.last_encoded_gen != Some(prev_gen)
+            && sub.has_keyframe
+        {
+            sub.has_keyframe = false;
+        }
+    }
+
     // A client the compositor could not give a session to falls back to a
     // server-side encoder.  The refusal has to be latched: selection only
     // asks whether the client's target matches native, which it still
@@ -4547,16 +4637,39 @@ async fn tick(state: &AppState) -> TickOutcome {
     // the per-surface time gate (up to ~1/fps), and force a keyframe
     // so decoders recover cleanly after the dimension change.
     for sid in resized_surface_ids {
+        let mut had_vulkan = false;
         for c in sess.clients.values_mut() {
             if !c.surface_subscriptions.contains(&sid) {
                 continue;
             }
+            // A compositor-resident session is bound to the size it was
+            // built at and nothing recreates it on demand: the delivery
+            // path skips on `vulkan_await` while the compositor, whose
+            // encode image now sits at a size no composite is produced
+            // at, never emits another bitstream — the surface freezes.
+            // Drop the tracking so the next tick re-selects at the new
+            // native size.  Deliberately not `vulkan_refused`: nothing
+            // was declined, and latching would bar the rebuild.
+            had_vulkan |= c.vulkan_video_surfaces.remove(&sid).is_some();
             let s = c.surface_subs.entry(sid).or_default();
             s.burst_remaining = SURFACE_BURST_FRAMES;
             s.next_send_at = None;
             s.nal_none_streak = 0;
             s.nal_none_latched_at = None;
             s.has_keyframe = false;
+        }
+        if had_vulkan && let Some(cs) = sess.compositor.as_ref() {
+            let _ = cs.handle.command_tx.send(
+                blit_compositor::CompositorCommand::DestroyVulkanEncoder {
+                    surface_id: sid as u32,
+                    client_id: None,
+                },
+            );
+            cs.handle.wake();
+            eprintln!(
+                "[vulkan-video] teardown sid={sid}: surface resized; \
+                 sessions rebuild at the new size",
+            );
         }
     }
 
@@ -4801,6 +4914,7 @@ async fn tick(state: &AppState) -> TickOutcome {
             width: u32,
             height: u32,
             is_444: bool,
+            min_interval_us: u32,
         }
         let mut pending_vulkan_encoder_setups: Vec<VulkanEncoderSetup> = Vec::new();
         let mut pending_vulkan_keyframe_requests: Vec<(u32, u64)> = Vec::new();
@@ -5173,12 +5287,58 @@ async fn tick(state: &AppState) -> TickOutcome {
                     continue;
                 }
 
-                let cached: Option<blit_compositor::PixelData> = {
+                let cached: Option<(blit_compositor::PixelData, bool)> = {
                     let cs = sess.compositor.as_ref().unwrap();
                     cs.last_pixels
                         .get(&(sid, px_w, px_h))
-                        .map(|lp| lp.pixels.clone())
+                        .map(|lp| (lp.pixels.clone(), lp.encoder_skip))
                 };
+                // A cache-only entry (on-demand BGRA readback over a live
+                // NV12 zero-copy stream) must not be encoded — the stream
+                // already carries this frame.  Don't advance
+                // last_encoded_gen: the next zero-copy publish supersedes
+                // this entry within a frame period.
+                if matches!(cached, Some((_, true))) {
+                    continue;
+                }
+                let cached = cached.map(|(p, _)| p);
+                // CPU-origin pixels for a zero-copy session: the encoder
+                // would refuse them anyway — NVENC encodes GPU-converted
+                // frames or nothing — so don't burn an encode job.  The
+                // stream waits for the zero-copy frame the target
+                // registration's recomposite delivers.
+                //
+                // Only while that frame is actually coming: the refusal is
+                // conditioned on an encoder sized for the current target.
+                // After a resize the old NV12 target is stamped for a native
+                // that no longer exists and the compositor skips filling it,
+                // so BGRA is the only pixel source left — refusing it here,
+                // above the rebuild below, starved the very selection that
+                // would register a fresh target.  The subscriber then
+                // streamed nothing, silently, until a resubscribe happened
+                // to reset the flag.
+                if cached
+                    .as_ref()
+                    .is_some_and(|p| {
+                        matches!(
+                            p,
+                            blit_compositor::PixelData::Bgra(_)
+                                | blit_compositor::PixelData::Rgba(_)
+                        )
+                    })
+                    && sess
+                        .clients
+                        .get(&work.cid)
+                        .and_then(|c| c.surface_subs.get(&sid))
+                        .is_some_and(|s| {
+                            s.wants_nv12_opaque
+                                && s.encoder
+                                    .as_ref()
+                                    .is_some_and(|e| e.source_dimensions() == (enc_w, enc_h))
+                        })
+                {
+                    continue;
+                }
                 let Some(pixels) = cached else {
                     // Nothing will fill this entry on its own: an idle
                     // Wayland app repaints only when a configure changes its
@@ -5387,6 +5547,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                             _ => "vulkan",
                         };
                         // Queue commands to send after the client loop.
+                        // The session paces itself to this client's display
+                        // rate: composites arrive faster than the client
+                        // consumes, and every encoded-but-undelivered frame
+                        // would break the delta chain.
+                        let min_interval_us =
+                            (1_000_000.0 / client.display_fps.clamp(24.0, 480.0)) as u32;
                         pending_vulkan_encoder_setups.push(VulkanEncoderSetup {
                             surface_id: sid as u32,
                             client_id: work.cid,
@@ -5395,6 +5561,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             width: px_w,
                             height: px_h,
                             is_444,
+                            min_interval_us,
                         });
                         pending_vulkan_keyframe_requests.push((sid as u32, work.cid));
                         if let Some(s) = client.surface_subs.get_mut(&sid) {
@@ -5605,6 +5772,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         width: setup.width,
                         height: setup.height,
                         is_444: setup.is_444,
+                        min_interval_us: setup.min_interval_us,
                     },
                 );
             }
@@ -6224,8 +6392,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // Computed before the compositor borrow below, which
                     // takes `sess` mutably.
                     let encoder_wants_nv12_opaque = encoder.wants_nv12_opaque_fd();
+                    let encoder_opaque_444 = encoder.opaque_wants_444();
                     let want_nv12_opaque = nv12_opaque_safe_for_target(
                         encoder_wants_nv12_opaque,
+                        encoder_opaque_444,
                         (tw, th),
                         sess.clients
                             .iter()
@@ -6233,8 +6403,14 @@ async fn tick(state: &AppState) -> TickOutcome {
                             .map(|(_, c)| {
                                 c.surface_subs
                                     .get(&result.sid)
-                                    .map(|s| (s.last_registered_target, s.wants_nv12_opaque))
-                                    .unwrap_or((None, true))
+                                    .map(|s| {
+                                        (
+                                            s.last_registered_target,
+                                            s.wants_nv12_opaque,
+                                            s.wants_opaque_444,
+                                        )
+                                    })
+                                    .unwrap_or((None, true, encoder_opaque_444))
                             }),
                     );
                     if let Some(bufs) = external_bufs
@@ -6276,6 +6452,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 native_w: result.native_w,
                                 native_h: result.native_h,
                                 want_nv12_opaque,
+                                opaque_is_444: encoder_opaque_444,
                             },
                         );
                         cs.handle.wake();
@@ -6290,6 +6467,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // "no" we only arrived at because of a third party
                         // that has since gone away.
                         s.wants_nv12_opaque = encoder_wants_nv12_opaque;
+                        s.wants_opaque_444 = encoder_opaque_444;
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -11049,9 +11227,17 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             state.encoder_invalidated = true;
                         }
                     }
-                    if meaningful_change {
-                        state.has_keyframe = false;
-                    }
+                    // Every explicit subscribe owes the client a keyframe —
+                    // including a repeated same-prefs one, because that IS
+                    // the client's keyframe request: SurfaceStore fires it
+                    // (once per recovery episode) when its decoder dies
+                    // mid-stream, and it then drops every delta until a key
+                    // arrives.  Suppressing this reset along with the burst
+                    // reset turned each decoder hiccup into a permanent
+                    // freeze with the dropped counter climbing — only a
+                    // resize (whose path clears has_keyframe) recovered it.
+                    // Churn is bounded by the client, not here.
+                    state.has_keyframe = false;
                     first_subscribe = !was_subscribed;
                     if was_subscribed
                         && prefs_changed
@@ -11813,15 +11999,21 @@ mod tests {
 
         #[test]
         fn sole_nvenc_subscriber_gets_it() {
-            assert!(nv12_opaque_safe_for_target(true, T, std::iter::empty()));
+            assert!(nv12_opaque_safe_for_target(
+                true,
+                false,
+                T,
+                std::iter::empty()
+            ));
         }
 
         #[test]
         fn a_non_nvenc_encoder_at_the_same_size_rules_it_out() {
             assert!(!nv12_opaque_safe_for_target(
                 true,
+                false,
                 T,
-                [(Some(T), false)].into_iter()
+                [(Some(T), false, false)].into_iter()
             ));
         }
 
@@ -11829,8 +12021,9 @@ mod tests {
         fn all_nvenc_subscribers_keep_it() {
             assert!(nv12_opaque_safe_for_target(
                 true,
+                false,
                 T,
-                [(Some(T), true), (Some(T), true)].into_iter()
+                [(Some(T), true, false), (Some(T), true, false)].into_iter()
             ));
         }
 
@@ -11839,8 +12032,9 @@ mod tests {
             // It reads its own (sid, w, h) key, which still carries BGRA.
             assert!(nv12_opaque_safe_for_target(
                 true,
+                false,
                 T,
-                [(Some((640, 360)), false), (None, false)].into_iter()
+                [(Some((640, 360)), false, false), (None, false, false)].into_iter()
             ));
         }
 
@@ -11848,8 +12042,14 @@ mod tests {
         fn one_dissenter_among_many_is_enough() {
             assert!(!nv12_opaque_safe_for_target(
                 true,
+                false,
                 T,
-                [(Some(T), true), (Some(T), false), (Some(T), true)].into_iter()
+                [
+                    (Some(T), true, false),
+                    (Some(T), false, false),
+                    (Some(T), true, false)
+                ]
+                .into_iter()
             ));
         }
 
@@ -11857,8 +12057,31 @@ mod tests {
         fn a_non_nvenc_encoder_never_asks_for_it() {
             assert!(!nv12_opaque_safe_for_target(
                 false,
+                false,
                 T,
-                [(Some(T), true)].into_iter()
+                [(Some(T), true, false)].into_iter()
+            ));
+        }
+
+        #[test]
+        fn a_chroma_format_split_rules_it_out() {
+            // One session needs NV12, the other planar YUV444 — one
+            // shared buffer cannot serve both layouts.
+            assert!(!nv12_opaque_safe_for_target(
+                true,
+                true,
+                T,
+                [(Some(T), true, false)].into_iter()
+            ));
+        }
+
+        #[test]
+        fn matching_444_subscribers_keep_it() {
+            assert!(nv12_opaque_safe_for_target(
+                true,
+                true,
+                T,
+                [(Some(T), true, true)].into_iter()
             ));
         }
     }
@@ -13106,9 +13329,37 @@ mod tests {
                 Some((800, 600, 120)),
                 Some(t0),
                 t0 + SURFACE_RESIZE_SETTLE / 2,
-                (801, 600, 120),
+                (810, 600, 120),
             ),
             ResizeAction::Hold
+        );
+    }
+
+    /// A couple of pixels is BSP settle noise, not a resize: the browser
+    /// and the compositor round each other by ±2px, and configuring for
+    /// it would tear down every compositor-resident session on the
+    /// surface per nudge.
+    #[test]
+    fn surface_resize_nudge_is_ignored() {
+        let t0 = Instant::now();
+        assert_eq!(
+            resize_action(
+                Some((800, 600, 120)),
+                Some(t0),
+                t0 + SURFACE_RESIZE_SETTLE,
+                (802, 598, 120),
+            ),
+            ResizeAction::Ignore
+        );
+        // A scale change is never a nudge.
+        assert_eq!(
+            resize_action(
+                Some((800, 600, 120)),
+                Some(t0),
+                t0 + SURFACE_RESIZE_SETTLE,
+                (802, 598, 240),
+            ),
+            ResizeAction::Dispatch
         );
     }
 
@@ -13123,7 +13374,7 @@ mod tests {
                 Some((800, 600, 120)),
                 Some(t0),
                 t0 + SURFACE_RESIZE_SETTLE,
-                (801, 600, 120),
+                (810, 600, 120),
             ),
             ResizeAction::Dispatch
         );

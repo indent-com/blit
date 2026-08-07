@@ -154,8 +154,15 @@ unsafe fn get_encoded_session_parameters<T: vk::ExtendsVideoEncodeSessionParamet
         )
     };
     if res != vk::Result::SUCCESS || size == 0 {
-        eprintln!("[vulkan-encode] parameter-set size query failed: {res:?} size={size}");
-        return None;
+        // NVIDIA's driver (595.84) fails the pData=NULL *size query* for a
+        // High 4:4:4 Predictive PPS with ERROR_OUT_OF_HOST_MEMORY and
+        // size=0, but its *writer* works: retry against a caller-sized
+        // buffer before declaring the parameter sets unobtainable.
+        eprintln!(
+            "[vulkan-encode] parameter-set size query failed: {res:?} size={size}; \
+             retrying with a fixed-size buffer",
+        );
+        size = 4096;
     }
 
     let mut buf = vec![0u8; size];
@@ -184,6 +191,125 @@ struct DpbSlot {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
+}
+
+/// Append `leaf` to the end of `base`'s pNext chain.
+///
+/// For the AV1 structs ash 0.38 predates: they have no `push_next` impls,
+/// so the chain is walked raw.  `leaf` must be a Vulkan struct that starts
+/// with sType/pNext, and must outlive every use of `base`.
+unsafe fn push_next_raw<B, L>(base: &mut B, leaf: *mut L) {
+    unsafe {
+        let mut cur = base as *mut B as *mut vk::BaseOutStructure<'_>;
+        while !(*cur).p_next.is_null() {
+            cur = (*cur).p_next;
+        }
+        (*cur).p_next = leaf as *mut vk::BaseOutStructure<'_>;
+    }
+}
+
+// ===================================================================
+// Construction guard
+// ===================================================================
+
+/// Owns everything a `try_new_*` constructor has created so far, and frees
+/// it — in reverse creation order — if construction fails.
+///
+/// Before this, every constructor step carried its own "free everything
+/// allocated so far" ladder (eight of them between the two codecs), and a
+/// step added without extending every later ladder leaked on failure.
+/// `disarm` transfers ownership to the finished encoder.
+struct ConstructionGuard<'a> {
+    device: &'a ash::Device,
+    video_fns: &'a VideoFns,
+    video_session: vk::VideoSessionKHR,
+    session_params: vk::VideoSessionParametersKHR,
+    session_memory: Vec<vk::DeviceMemory>,
+    dpb_slots: Vec<DpbSlot>,
+    /// `(buffer, memory)`; the memory is mapped once at allocation.
+    bitstream: Option<(vk::Buffer, vk::DeviceMemory)>,
+    query_pool: vk::QueryPool,
+}
+
+/// Everything `ConstructionGuard::disarm` hands to the finished encoder.
+struct EncoderParts {
+    video_session: vk::VideoSessionKHR,
+    session_params: vk::VideoSessionParametersKHR,
+    session_memory: Vec<vk::DeviceMemory>,
+    dpb_slots: [DpbSlot; 2],
+    bitstream_buffer: vk::Buffer,
+    bitstream_memory: vk::DeviceMemory,
+    query_pool: vk::QueryPool,
+}
+
+impl<'a> ConstructionGuard<'a> {
+    fn new(device: &'a ash::Device, video_fns: &'a VideoFns) -> Self {
+        Self {
+            device,
+            video_fns,
+            video_session: vk::VideoSessionKHR::null(),
+            session_params: vk::VideoSessionParametersKHR::null(),
+            session_memory: Vec::new(),
+            dpb_slots: Vec::new(),
+            bitstream: None,
+            query_pool: vk::QueryPool::null(),
+        }
+    }
+
+    /// Construction succeeded: hand everything over.  Every field is reset
+    /// to its empty value, so the Drop that still runs frees nothing.
+    fn disarm(mut self) -> EncoderParts {
+        let (bitstream_buffer, bitstream_memory) = self
+            .bitstream
+            .take()
+            .expect("disarm before the bitstream buffer was built");
+        EncoderParts {
+            video_session: std::mem::take(&mut self.video_session),
+            session_params: std::mem::take(&mut self.session_params),
+            session_memory: std::mem::take(&mut self.session_memory),
+            dpb_slots: std::mem::take(&mut self.dpb_slots)
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("disarm before DPB slots were built")),
+            bitstream_buffer,
+            bitstream_memory,
+            query_pool: std::mem::take(&mut self.query_pool),
+        }
+    }
+}
+
+impl Drop for ConstructionGuard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            if self.query_pool != vk::QueryPool::null() {
+                self.device.destroy_query_pool(self.query_pool, None);
+            }
+            if let Some((buffer, memory)) = self.bitstream.take() {
+                self.device.unmap_memory(memory);
+                self.device.free_memory(memory, None);
+                self.device.destroy_buffer(buffer, None);
+            }
+            for slot in &self.dpb_slots {
+                destroy_dpb_slot(self.device, slot);
+            }
+            if self.session_params != vk::VideoSessionParametersKHR::null() {
+                (self.video_fns.destroy_video_session_parameters)(
+                    self.device.handle(),
+                    self.session_params,
+                    ptr::null(),
+                );
+            }
+            for &m in &self.session_memory {
+                self.device.free_memory(m, None);
+            }
+            if self.video_session != vk::VideoSessionKHR::null() {
+                (self.video_fns.destroy_video_session)(
+                    self.device.handle(),
+                    self.video_session,
+                    ptr::null(),
+                );
+            }
+        }
+    }
 }
 
 // ===================================================================
@@ -238,8 +364,22 @@ pub(crate) struct VulkanVideoEncoder {
 
 unsafe impl Send for VulkanVideoEncoder {}
 
-/// Bitstream buffer size (2 MiB -- generous for a single frame).
-const BITSTREAM_CAPACITY: u64 = 2 * 1024 * 1024;
+/// Floor for the per-frame bitstream buffer size (2 MiB).
+const BITSTREAM_CAPACITY_FLOOR: u64 = 2 * 1024 * 1024;
+
+/// Size the bitstream buffer to the frames it must hold.
+///
+/// A fixed 2 MiB was generous at 1080p but not for a 4K keyframe at a low
+/// QP — and an overflowing frame is worse than dropped: the server never
+/// rebuilds a Vulkan encoder on encode failure (see `encode`), so a
+/// too-small buffer is a permanently black surface.  A raw frame (NV12,
+/// or double the chroma at 4:4:4) bounds any CQP output with a wide
+/// margin.
+fn bitstream_capacity_for(width: u32, height: u32, is_444: bool) -> u64 {
+    let px = width as u64 * height as u64;
+    let raw = if is_444 { px * 3 } else { px * 3 / 2 };
+    raw.max(BITSTREAM_CAPACITY_FLOOR)
+}
 
 /// Largest H.264 quantization parameter the spec defines for 8-bit luma.
 const H264_MAX_QP: u8 = 51;
@@ -361,7 +501,9 @@ impl VulkanVideoEncoder {
         };
 
         eprintln!(
-            "[vulkan-encode] H.264 caps: max_coded={max_coded_w}x{max_coded_h}, max_dpb={max_dpb}, max_level={max_level_idc}, level={level_idc}",
+            "[vulkan-encode] H.264 caps: max_coded={max_coded_w}x{max_coded_h}, max_dpb={max_dpb}, max_level={max_level_idc}, level={level_idc}, flags={:#x}, std_syntax={:#x}",
+            h264_caps.flags.as_raw(),
+            h264_caps.std_syntax_flags.as_raw(),
         );
 
         // ---------------------------------------------------------------
@@ -398,10 +540,15 @@ impl VulkanVideoEncoder {
             return None;
         }
 
+        // From here on the guard owns everything created so far and frees
+        // it, in reverse order, on any early return.
+        let mut guard = ConstructionGuard::new(device, video_fns);
+        guard.video_session = video_session;
+
         // ---------------------------------------------------------------
         // 4. Query and bind session memory
         // ---------------------------------------------------------------
-        let session_memory = unsafe {
+        guard.session_memory = unsafe {
             bind_session_memory(device, video_fns, video_session, physical_device, instance)
         }?;
 
@@ -418,6 +565,16 @@ impl VulkanVideoEncoder {
         if needs_crop {
             sps_flags.set_frame_cropping_flag(1);
         }
+        // VUI with video_full_range_flag=1: blit's pixels are full-range
+        // BT.601 end to end, and a decoder told nothing assumes limited —
+        // which would display every black lifted to gray.
+        sps_flags.set_vui_parameters_present_flag(1);
+        let mut vui_flags: StdVideoH264SpsVuiFlags = unsafe { std::mem::zeroed() };
+        vui_flags.set_video_signal_type_present_flag(1);
+        vui_flags.set_video_full_range_flag(1);
+        let mut vui: StdVideoH264SequenceParameterSetVui = unsafe { std::mem::zeroed() };
+        vui.flags = vui_flags;
+        vui.video_format = 5; // unspecified
 
         // Crop offsets are expressed in CropUnitX/CropUnitY, which depend on
         // the chroma format: 2x2 for 4:2:0, but 1x1 for 4:4:4 (and for
@@ -463,10 +620,21 @@ impl VulkanVideoEncoder {
         sps.pic_height_in_map_units_minus1 = height_in_mbs - 1;
         sps.frame_crop_right_offset = crop_right;
         sps.frame_crop_bottom_offset = crop_bottom;
+        // `vui` is a local: the driver copies it during session-parameters
+        // creation and the serializer below reads it before this returns.
+        sps.pSequenceParameterSetVui = &vui;
 
         let mut pps_flags: StdVideoH264PpsFlags = unsafe { std::mem::zeroed() };
         pps_flags.set_entropy_coding_mode_flag(1); // CABAC
         pps_flags.set_deblocking_filter_control_present_flag(1);
+        if is_444 {
+            // NVENC encodes High 4:4:4 Predictive with 8x8 transforms; a PPS
+            // claiming transform_8x8_mode_flag=0 asks the driver's writer to
+            // describe a stream the hardware won't produce, and it fails the
+            // PPS serialization (ERROR_OUT_OF_HOST_MEMORY, size=0) instead of
+            // overriding — the "NVIDIA can't serialize its 4:4:4 PPS" wall.
+            pps_flags.set_transform_8x8_mode_flag(1);
+        }
 
         let mut pps: StdVideoH264PictureParameterSet = unsafe { std::mem::zeroed() };
         pps.flags = pps_flags;
@@ -506,14 +674,9 @@ impl VulkanVideoEncoder {
         };
         if res != vk::Result::SUCCESS {
             eprintln!("[vulkan-encode] vkCreateVideoSessionParametersKHR failed: {res:?}");
-            for &m in &session_memory {
-                unsafe { device.free_memory(m, None) };
-            }
-            unsafe {
-                (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
-            }
             return None;
         }
+        guard.session_params = session_params;
 
         // Retrieve the encoded SPS/PPS.  Vulkan Video never writes parameter
         // sets into the output bitstream — `cmd_encode_video` emits slice
@@ -527,33 +690,22 @@ impl VulkanVideoEncoder {
         let params_bytes = unsafe {
             get_encoded_session_parameters(device, video_fns, session_params, &mut h264_get)
         };
-        let Some(params_bytes) = params_bytes else {
-            // Known to happen for 4:4:4 on the NVIDIA proprietary driver
-            // (595.84): it advertises H.264 High 4:4:4 Predictive encode
-            // caps, accepts the SPS/PPS pair at
-            // vkCreateVideoSessionParametersKHR, serializes the SPS fine (14
-            // bytes) — and then fails the PPS with ERROR_OUT_OF_HOST_MEMORY.
-            // The same PPS serializes at 4:2:0, so this is the driver's
-            // serializer rather than our struct.  Refusing here is what makes
-            // the server fall back to a server-side 4:4:4 encoder instead of
-            // shipping a stream with no parameter sets.
+        let params_bytes = params_bytes.unwrap_or_else(|| {
+            // The NVIDIA proprietary driver (595.84) advertises H.264 High
+            // 4:4:4 Predictive encode caps and accepts the SPS/PPS pair at
+            // vkCreateVideoSessionParametersKHR, but its own serializer
+            // fails the 4:4:4 PPS with ERROR_OUT_OF_HOST_MEMORY — in both
+            // the size-query and buffered forms.  The encode session itself
+            // works, so serialize the parameter sets ourselves from the very
+            // structs the driver just accepted, the same way the AV1 path
+            // writes its sequence header (where no get API exists at all).
             eprintln!(
-                "[vulkan-encode] could not retrieve H.264 {} parameter sets; refusing the session",
+                "[vulkan-encode] driver could not serialize H.264 {} parameter sets; \
+                 serializing them app-side",
                 if is_444 { "4:4:4" } else { "4:2:0" },
             );
-            for &m in &session_memory {
-                unsafe { device.free_memory(m, None) };
-            }
-            unsafe {
-                (video_fns.destroy_video_session_parameters)(
-                    device.handle(),
-                    session_params,
-                    ptr::null(),
-                );
-                (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
-            }
-            return None;
-        };
+            h264_parameter_sets(&sps, &pps, is_444)
+        });
         eprintln!(
             "[vulkan-encode] H.264 parameter sets: {} bytes",
             params_bytes.len(),
@@ -562,69 +714,64 @@ impl VulkanVideoEncoder {
         // ---------------------------------------------------------------
         // 6. DPB images (2x)
         // ---------------------------------------------------------------
-        let dpb_slots = unsafe {
+        guard.dpb_slots = unsafe {
             allocate_dpb_slots(
                 device,
                 instance,
                 physical_device,
-                video_fns,
                 width,
                 height,
                 video_queue_family,
                 &profile,
                 picture_format,
-                &session_memory,
-                session_params,
-                video_session,
             )
         }?;
 
         // ---------------------------------------------------------------
         // 7. Bitstream buffer (host-visible, host-coherent)
         // ---------------------------------------------------------------
+        let bitstream_capacity = bitstream_capacity_for(width, height, is_444);
         let (bitstream_buffer, bitstream_memory, bitstream_ptr) = unsafe {
             allocate_bitstream_buffer(
                 device,
                 instance,
                 physical_device,
-                video_fns,
-                BITSTREAM_CAPACITY,
-                &dpb_slots,
-                &session_memory,
-                session_params,
-                video_session,
+                bitstream_capacity,
+                &profile,
             )
         }?;
+        guard.bitstream = Some((bitstream_buffer, bitstream_memory));
 
         // ---------------------------------------------------------------
         // 8. Query pool (encode feedback)
         // ---------------------------------------------------------------
-        let mut h264_profile_for_qp = vk::VideoEncodeH264ProfileInfoKHR::default()
-            .std_profile_idc(StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH);
+        // The query pool must be created against the same profile as the
+        // session — a 4:4:4 session paired with a hardcoded High/4:2:0 pool
+        // is a spec violation the driver merely tolerates.
+        let mut h264_profile_for_qp =
+            vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(if is_444 {
+                StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE
+            } else {
+                StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
+            });
         let mut video_profile_for_query = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
-            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+            .chroma_subsampling(if is_444 {
+                vk::VideoChromaSubsamplingFlagsKHR::TYPE_444
+            } else {
+                vk::VideoChromaSubsamplingFlagsKHR::TYPE_420
+            })
             .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
             .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
             .push_next(&mut h264_profile_for_qp);
-        let query_pool = unsafe {
-            create_encode_query_pool(
-                device,
-                video_fns,
-                &mut video_profile_for_query,
-                bitstream_buffer,
-                bitstream_memory,
-                &dpb_slots,
-                &session_memory,
-                session_params,
-                video_session,
-            )
-        }?;
+        guard.query_pool =
+            unsafe { create_encode_query_pool(device, &mut video_profile_for_query) }?;
 
         eprintln!(
             "[vulkan-encode] initialized H.264 encoder {width}x{height} qp={qp} level={level_idc}",
         );
 
+        let parts = guard.disarm();
         Some(Self {
             width,
             height,
@@ -632,16 +779,16 @@ impl VulkanVideoEncoder {
             src_height: height,
             ref_order_hints: [0; 8],
             codec: VulkanVideoCodec::H264,
-            video_session,
-            session_params,
-            session_memory,
-            dpb_slots,
+            video_session: parts.video_session,
+            session_params: parts.session_params,
+            session_memory: parts.session_memory,
+            dpb_slots: parts.dpb_slots,
             cur_dpb_idx: 0,
-            bitstream_buffer,
-            bitstream_memory,
+            bitstream_buffer: parts.bitstream_buffer,
+            bitstream_memory: parts.bitstream_memory,
             bitstream_ptr,
-            bitstream_capacity: BITSTREAM_CAPACITY,
-            query_pool,
+            bitstream_capacity,
+            query_pool: parts.query_pool,
             frame_num: 0,
             idr_num: 0,
             force_idr: false,
@@ -655,6 +802,11 @@ impl VulkanVideoEncoder {
     #[allow(dead_code)]
     pub(crate) fn request_idr(&mut self) {
         self.force_idr = true;
+    }
+
+    /// Whether a forced keyframe is pending for the next encode.
+    pub(crate) fn wants_idr(&self) -> bool {
+        self.force_idr
     }
 
     /// Retarget the constant quantizer from the next frame onwards.
@@ -672,6 +824,13 @@ impl VulkanVideoEncoder {
     #[allow(dead_code)]
     pub(crate) fn qp(&self) -> u8 {
         self.qp
+    }
+
+    /// Pre-alignment source dimensions the session was built for.  A
+    /// bitstream from this session always decodes at this size, whatever
+    /// image it was fed.
+    pub(crate) fn source_dimensions(&self) -> (u32, u32) {
+        (self.src_width, self.src_height)
     }
 
     /// Codec flag matching `SURFACE_FRAME_CODEC_*` constants.
@@ -740,6 +899,128 @@ impl VulkanVideoEncoder {
         }
     }
 
+    /// Allocate and begin the one-shot encode command buffer, with the
+    /// feedback query reset.  Shared by both codecs.
+    unsafe fn begin_encode_cb(
+        &self,
+        device: &ash::Device,
+        encode_cmd_pool: vk::CommandPool,
+    ) -> Option<vk::CommandBuffer> {
+        let cb_alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(encode_cmd_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cbs = unsafe { device.allocate_command_buffers(&cb_alloc).ok()? };
+        let cb = cbs[0];
+
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        if unsafe { device.begin_command_buffer(cb, &begin) }.is_err() {
+            unsafe { device.free_command_buffers(encode_cmd_pool, &[cb]) };
+            return None;
+        }
+
+        unsafe { device.cmd_reset_query_pool(cb, self.query_pool, 0, 1) };
+        Some(cb)
+    }
+
+    /// Everything downstream of the codec-specific `vkCmdEncodeVideo`:
+    /// close the query and the coding scope, submit, wait (poisoning the
+    /// encoder on a fence timeout), read back the encoded size and copy
+    /// the bitstream out behind `prefix`.  Shared by both codecs — the
+    /// GOP-state bugs this file has a history of were all fixed twice
+    /// because this used to exist twice.
+    unsafe fn finish_encode(
+        &mut self,
+        device: &ash::Device,
+        video_fns: &VideoFns,
+        encode_queue: vk::Queue,
+        encode_cmd_pool: vk::CommandPool,
+        cb: vk::CommandBuffer,
+        prefix: &[u8],
+    ) -> Option<Vec<u8>> {
+        unsafe { device.cmd_end_query(cb, self.query_pool, 0) };
+
+        let end_coding = vk::VideoEndCodingInfoKHR::default();
+        unsafe { (video_fns.cmd_end_video_coding)(cb, &end_coding) };
+
+        if let Err(e) = unsafe { device.end_command_buffer(cb) } {
+            eprintln!("[vulkan-encode] vkEndCommandBuffer failed: {e:?}");
+            unsafe { device.free_command_buffers(encode_cmd_pool, &[cb]) };
+            return None;
+        }
+
+        // Submit.
+        let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
+        let fence = match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[vulkan-encode] vkCreateFence failed: {e:?}");
+                unsafe { device.free_command_buffers(encode_cmd_pool, &[cb]) };
+                return None;
+            }
+        };
+        if let Err(e) = unsafe { device.queue_submit(encode_queue, &[submit], fence) } {
+            eprintln!("[vulkan-encode] vkQueueSubmit failed: {e:?}");
+            unsafe {
+                device.destroy_fence(fence, None);
+                device.free_command_buffers(encode_cmd_pool, &[cb]);
+            }
+            return None;
+        }
+
+        // Wait for completion. A timeout means the submission is still live
+        // on the device, so the fence, the command buffer and the bitstream
+        // buffer it writes into are all still in use: freeing or reading any
+        // of them here would be a use-after-free the validation layers cannot
+        // save us from. Leak them and poison the encoder instead — one fence
+        // and one command buffer, once, against wedging the compositor.
+        if unsafe { device.wait_for_fences(&[fence], true, encode_fence_timeout_ns()) }.is_err() {
+            eprintln!(
+                "[vulkan-encode] fence wait timed out after {} ms; abandoning encoder",
+                encode_fence_timeout_ns() / 1_000_000
+            );
+            self.poisoned = true;
+            return None;
+        }
+        unsafe { device.destroy_fence(fence, None) };
+
+        // Read query result (encoded size).
+        let mut feedback = [0u32; 1];
+        let qr = unsafe {
+            device.get_query_pool_results(
+                self.query_pool,
+                0,
+                &mut feedback,
+                vk::QueryResultFlags::WAIT,
+            )
+        };
+        unsafe { device.free_command_buffers(encode_cmd_pool, &[cb]) };
+
+        if qr.is_err() {
+            eprintln!("[vulkan-encode] query pool result failed: {qr:?}");
+            return None;
+        }
+
+        let encoded_size = feedback[0] as usize;
+        if encoded_size == 0 || encoded_size > self.bitstream_capacity as usize {
+            eprintln!(
+                "[vulkan-encode] bad encoded size: {encoded_size} (capacity={})",
+                self.bitstream_capacity,
+            );
+            return None;
+        }
+
+        // Copy the bitstream from the mapped pointer, behind whatever the
+        // codec prepends (parameter sets on a keyframe, AV1's temporal
+        // delimiter on every frame).
+        let payload = unsafe { std::slice::from_raw_parts(self.bitstream_ptr, encoded_size) };
+        let mut bitstream = Vec::with_capacity(prefix.len() + encoded_size);
+        bitstream.extend_from_slice(prefix);
+        bitstream.extend_from_slice(payload);
+        Some(bitstream)
+    }
+
     /// H.264 encode path.
     #[allow(clippy::too_many_arguments, dead_code)]
     unsafe fn encode_h264(
@@ -755,25 +1036,25 @@ impl VulkanVideoEncoder {
         let is_idr = self.force_idr || force_keyframe || self.frame_num == 0;
         if is_idr {
             self.force_idr = false;
+            // An IDR restarts the GOP and the spec pins its frame_num at 0.
+            // Resetting only after the encode sent a mid-stream IDR out with
+            // the stale value, and every P frame after it then read as a
+            // frame_num gap — decoders inferred phantom references until
+            // their DPB accounting overflowed max_num_ref_frames on every
+            // frame.
+            self.frame_num = 0;
         }
 
-        // Allocate command buffer.
-        let cb_alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(encode_cmd_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cbs = unsafe { device.allocate_command_buffers(&cb_alloc).ok()? };
-        let cb = cbs[0];
+        // The SPS declares log2_max_frame_num_minus4 = 0: frame_num is four
+        // wire bits, interpreted modulo 16.  `self.frame_num` counts the
+        // whole GOP, so reduce it before it reaches any std struct — the
+        // spec range for these fields is [0, MaxFrameNum), and values past
+        // it only worked because the driver masked them on our behalf.
+        const MAX_FRAME_NUM: u32 = 16;
+        let frame_num = self.frame_num % MAX_FRAME_NUM;
+        let prev_frame_num = self.frame_num.wrapping_sub(1) % MAX_FRAME_NUM;
 
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        if unsafe { device.begin_command_buffer(cb, &begin) }.is_err() {
-            unsafe { device.free_command_buffers(encode_cmd_pool, &[cb]) };
-            return None;
-        }
-
-        // Reset query pool.
-        unsafe { device.cmd_reset_query_pool(cb, self.query_pool, 0, 1) };
+        let cb = unsafe { self.begin_encode_cb(device, encode_cmd_pool) }?;
 
         // --- DPB setup ---
         let setup_dpb_idx = self.cur_dpb_idx;
@@ -781,8 +1062,8 @@ impl VulkanVideoEncoder {
 
         // Reference info for the reconstructed (setup) picture.
         let mut setup_ref_info: StdVideoEncodeH264ReferenceInfo = unsafe { std::mem::zeroed() };
-        setup_ref_info.FrameNum = self.frame_num;
-        setup_ref_info.PicOrderCnt = (self.frame_num * 2) as i32;
+        setup_ref_info.FrameNum = frame_num;
+        setup_ref_info.PicOrderCnt = (frame_num * 2) as i32;
         setup_ref_info.primary_pic_type = if is_idr {
             StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_IDR
         } else {
@@ -817,8 +1098,8 @@ impl VulkanVideoEncoder {
         begin_ref_slots.push(setup_slot);
 
         if !is_idr {
-            ref_ref_info.FrameNum = self.frame_num.wrapping_sub(1);
-            ref_ref_info.PicOrderCnt = (self.frame_num.wrapping_sub(1) * 2) as i32;
+            ref_ref_info.FrameNum = prev_frame_num;
+            ref_ref_info.PicOrderCnt = (prev_frame_num * 2) as i32;
             ref_ref_info.primary_pic_type = StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P;
 
             ref_dpb_info =
@@ -894,8 +1175,8 @@ impl VulkanVideoEncoder {
         } else {
             StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P
         };
-        std_pic_info.frame_num = self.frame_num;
-        std_pic_info.PicOrderCnt = (self.frame_num * 2) as i32;
+        std_pic_info.frame_num = frame_num;
+        std_pic_info.PicOrderCnt = (frame_num * 2) as i32;
         std_pic_info.pRefLists = if is_idr { ptr::null() } else { &ref_lists };
 
         // Slice header.
@@ -940,140 +1221,39 @@ impl VulkanVideoEncoder {
         // explicit query needs no extension and works on every driver.
         unsafe { device.cmd_begin_query(cb, self.query_pool, 0, vk::QueryControlFlags::empty()) };
 
-        // Build the encode info.
-        //
-        // We need separate paths for IDR (no reference slots) vs P-frame
-        // (one reference slot) because the `reference_slots` builder
-        // captures a slice reference with a lifetime.
-        if is_idr {
-            let encode_info = vk::VideoEncodeInfoKHR::default()
-                .dst_buffer(self.bitstream_buffer)
-                .dst_buffer_offset(0)
-                .dst_buffer_range(self.bitstream_capacity)
-                .src_picture_resource(src_picture_resource)
-                .setup_reference_slot(&setup_slot)
-                .push_next(&mut h264_pic_info);
+        // Build the encode info.  The reference slots are the very ones the
+        // coding scope began with, minus the setup slot at index 0 — an
+        // empty slice on IDR.  (This used to re-build the reference slot
+        // from scratch, a second copy that had to match the first by hand.)
+        let encode_info = vk::VideoEncodeInfoKHR::default()
+            .dst_buffer(self.bitstream_buffer)
+            .dst_buffer_offset(0)
+            .dst_buffer_range(self.bitstream_capacity)
+            .src_picture_resource(src_picture_resource)
+            .setup_reference_slot(&setup_slot)
+            .reference_slots(&begin_ref_slots[1..])
+            .push_next(&mut h264_pic_info);
 
-            unsafe { (video_fns.cmd_encode_video)(cb, &encode_info) };
-        } else {
-            // For P-frames we need the ref_slot; it was pushed into
-            // begin_ref_slots above.  Re-build it here for the encode
-            // info reference_slots field.
-            let mut ref_ref_info2: StdVideoEncodeH264ReferenceInfo = unsafe { std::mem::zeroed() };
-            ref_ref_info2.FrameNum = self.frame_num.wrapping_sub(1);
-            ref_ref_info2.PicOrderCnt = (self.frame_num.wrapping_sub(1) * 2) as i32;
-            ref_ref_info2.primary_pic_type = StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P;
+        unsafe { (video_fns.cmd_encode_video)(cb, &encode_info) };
 
-            let mut ref_dpb_info2 =
-                vk::VideoEncodeH264DpbSlotInfoKHR::default().std_reference_info(&ref_ref_info2);
-
-            let ref_picture_resource2 = vk::VideoPictureResourceInfoKHR::default()
-                .coded_offset(vk::Offset2D { x: 0, y: 0 })
-                .coded_extent(vk::Extent2D {
-                    width: self.width,
-                    height: self.height,
-                })
-                .base_array_layer(0)
-                .image_view_binding(self.dpb_slots[ref_dpb_idx].view);
-
-            let ref_slot2 = vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(ref_dpb_idx as i32)
-                .picture_resource(&ref_picture_resource2)
-                .push_next(&mut ref_dpb_info2);
-
-            let encode_info = vk::VideoEncodeInfoKHR::default()
-                .dst_buffer(self.bitstream_buffer)
-                .dst_buffer_offset(0)
-                .dst_buffer_range(self.bitstream_capacity)
-                .src_picture_resource(src_picture_resource)
-                .setup_reference_slot(&setup_slot)
-                .reference_slots(std::slice::from_ref(&ref_slot2))
-                .push_next(&mut h264_pic_info);
-
-            unsafe { (video_fns.cmd_encode_video)(cb, &encode_info) };
-        }
-
-        unsafe { device.cmd_end_query(cb, self.query_pool, 0) };
-
-        // End video coding.
-        let end_coding = vk::VideoEndCodingInfoKHR::default();
-        unsafe { (video_fns.cmd_end_video_coding)(cb, &end_coding) };
-
-        // End command buffer.
-        if unsafe { device.end_command_buffer(cb) }.is_err() {
-            unsafe { device.free_command_buffers(encode_cmd_pool, &[cb]) };
-            return None;
-        }
-
-        // Submit.
-        let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
-        let fence_info = vk::FenceCreateInfo::default();
-        let fence = unsafe { device.create_fence(&fence_info, None).ok()? };
-        if unsafe { device.queue_submit(encode_queue, &[submit], fence) }.is_err() {
-            unsafe {
-                device.destroy_fence(fence, None);
-                device.free_command_buffers(encode_cmd_pool, &[cb]);
-            }
-            return None;
-        }
-
-        // Wait for completion. A timeout means the submission is still live
-        // on the device, so the fence, the command buffer and the bitstream
-        // buffer it writes into are all still in use: freeing or reading any
-        // of them here would be a use-after-free the validation layers cannot
-        // save us from. Leak them and poison the encoder instead — one fence
-        // and one command buffer, once, against wedging the compositor.
-        if unsafe { device.wait_for_fences(&[fence], true, encode_fence_timeout_ns()) }.is_err() {
-            eprintln!(
-                "[vulkan-encode] fence wait timed out after {} ms; abandoning encoder",
-                encode_fence_timeout_ns() / 1_000_000
-            );
-            self.poisoned = true;
-            return None;
-        }
-        unsafe { device.destroy_fence(fence, None) };
-
-        // Read query result (encoded size).
-        let mut feedback = [0u32; 1];
-        let qr = unsafe {
-            device.get_query_pool_results(
-                self.query_pool,
-                0,
-                &mut feedback,
-                vk::QueryResultFlags::WAIT,
+        // A keyframe carries the parameter sets so it is a self-contained
+        // entry point; Vulkan Video never writes them itself.
+        let prefix: &[u8] = if is_idr { &self.params_bytes } else { &[] };
+        let prefix = prefix.to_vec();
+        let bitstream = unsafe {
+            self.finish_encode(
+                device,
+                video_fns,
+                encode_queue,
+                encode_cmd_pool,
+                cb,
+                &prefix,
             )
-        };
-        unsafe { device.free_command_buffers(encode_cmd_pool, &[cb]) };
+        }?;
 
-        if qr.is_err() {
-            eprintln!("[vulkan-encode] query pool result failed: {qr:?}");
-            return None;
-        }
-
-        let encoded_size = feedback[0] as usize;
-        if encoded_size == 0 || encoded_size > self.bitstream_capacity as usize {
-            eprintln!(
-                "[vulkan-encode] bad encoded size: {encoded_size} (capacity={})",
-                self.bitstream_capacity,
-            );
-            return None;
-        }
-
-        // Copy bitstream from mapped pointer, prefixing an IDR with the
-        // parameter sets so each keyframe is a self-contained entry point.
-        let slices = unsafe { std::slice::from_raw_parts(self.bitstream_ptr, encoded_size) };
-        let bitstream = if is_idr {
-            let mut b = Vec::with_capacity(self.params_bytes.len() + encoded_size);
-            b.extend_from_slice(&self.params_bytes);
-            b.extend_from_slice(slices);
-            b
-        } else {
-            slices.to_vec()
-        };
-
-        // Update state.
+        // Update state.  frame_num was already reset for an IDR before the
+        // encode — the slice has to carry the 0.
         if is_idr {
-            self.frame_num = 0;
             self.idr_num = self.idr_num.wrapping_add(1);
         }
         self.frame_num = self.frame_num.wrapping_add(1);
@@ -1121,22 +1301,15 @@ impl VulkanVideoEncoder {
             std_profile: STD_VIDEO_AV1_PROFILE_MAIN,
         };
 
-        let profile = vk::VideoProfileInfoKHR::default()
+        let mut profile = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::from_raw(
                 VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR,
             ))
             .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
             .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
             .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
-        // Chain the AV1 profile info via raw pNext.
-        let profile = {
-            let mut p = profile;
-            let base = &mut p as *mut _ as *mut vk::BaseOutStructure<'_>;
-            unsafe {
-                (*base).p_next = &mut av1_profile_info as *mut _ as *mut vk::BaseOutStructure<'_>;
-            }
-            p
-        };
+        unsafe { push_next_raw(&mut profile, &mut av1_profile_info as *mut _) };
+        let profile = profile;
 
         // ---------------------------------------------------------------
         // 2. Query capabilities
@@ -1146,19 +1319,7 @@ impl VulkanVideoEncoder {
             vk::StructureType::from_raw(VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_CAPABILITIES_KHR);
         let mut encode_caps = vk::VideoEncodeCapabilitiesKHR::default();
         let mut caps = vk::VideoCapabilitiesKHR::default().push_next(&mut encode_caps);
-
-        // Chain av1_caps via raw pNext.
-        {
-            let base = &mut caps as *mut _ as *mut vk::BaseOutStructure<'_>;
-            // Walk to end of pNext chain.
-            let mut cur = base;
-            unsafe {
-                while !(*cur).p_next.is_null() {
-                    cur = (*cur).p_next;
-                }
-                (*cur).p_next = &mut av1_caps as *mut _ as *mut vk::BaseOutStructure<'_>;
-            }
-        }
+        unsafe { push_next_raw(&mut caps, &mut av1_caps as *mut _) };
 
         let res = unsafe {
             (video_fns.get_physical_device_video_capabilities)(physical_device, &profile, &mut caps)
@@ -1218,18 +1379,7 @@ impl VulkanVideoEncoder {
             .max_dpb_slots(2)
             .max_active_reference_pictures(1)
             .std_header_version(&std_header_version);
-
-        // Chain av1_session_create via raw pNext.
-        {
-            let base = &mut session_create as *mut _ as *mut vk::BaseOutStructure<'_>;
-            unsafe {
-                let mut cur = base;
-                while !(*cur).p_next.is_null() {
-                    cur = (*cur).p_next;
-                }
-                (*cur).p_next = &mut av1_session_create as *mut _ as *mut vk::BaseOutStructure<'_>;
-            }
-        }
+        unsafe { push_next_raw(&mut session_create, &mut av1_session_create as *mut _) };
 
         let mut video_session = vk::VideoSessionKHR::null();
         let res = unsafe {
@@ -1245,10 +1395,15 @@ impl VulkanVideoEncoder {
             return None;
         }
 
+        // From here on the guard owns everything created so far and frees
+        // it, in reverse order, on any early return.
+        let mut guard = ConstructionGuard::new(device, video_fns);
+        guard.video_session = video_session;
+
         // ---------------------------------------------------------------
         // 4. Query and bind session memory
         // ---------------------------------------------------------------
-        let session_memory = unsafe {
+        guard.session_memory = unsafe {
             bind_session_memory(device, video_fns, video_session, physical_device, instance)
         }?;
 
@@ -1256,7 +1411,9 @@ impl VulkanVideoEncoder {
         // 5. Session parameters (AV1 sequence header)
         // ---------------------------------------------------------------
         let color_config = StdVideoAV1ColorConfig {
-            flags: 0,
+            // Bit 1 = color_range (bit 0 is mono_chrome): full swing.
+            // blit's pixels are full-range BT.601 end to end.
+            flags: 1 << 1,
             bit_depth: 8,
             subsampling_x: 1,
             subsampling_y: 1,
@@ -1313,18 +1470,7 @@ impl VulkanVideoEncoder {
 
         let mut params_create =
             vk::VideoSessionParametersCreateInfoKHR::default().video_session(video_session);
-
-        // Chain AV1 params via raw pNext.
-        {
-            let base = &mut params_create as *mut _ as *mut vk::BaseOutStructure<'_>;
-            unsafe {
-                let mut cur = base;
-                while !(*cur).p_next.is_null() {
-                    cur = (*cur).p_next;
-                }
-                (*cur).p_next = &mut av1_params_create as *mut _ as *mut vk::BaseOutStructure<'_>;
-            }
-        }
+        unsafe { push_next_raw(&mut params_create, &mut av1_params_create as *mut _) };
 
         let mut session_params = vk::VideoSessionParametersKHR::null();
         let res = unsafe {
@@ -1337,52 +1483,41 @@ impl VulkanVideoEncoder {
         };
         if res != vk::Result::SUCCESS {
             eprintln!("[vulkan-encode] AV1 vkCreateVideoSessionParametersKHR failed: {res:?}");
-            for &m in &session_memory {
-                unsafe { device.free_memory(m, None) };
-            }
-            unsafe {
-                (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
-            }
             return None;
         }
+        guard.session_params = session_params;
 
         // ---------------------------------------------------------------
         // 6. DPB images (2x)
         // ---------------------------------------------------------------
-        let dpb_slots = unsafe {
+        guard.dpb_slots = unsafe {
             allocate_dpb_slots(
                 device,
                 instance,
                 physical_device,
-                video_fns,
                 coded_w,
                 coded_h,
                 video_queue_family,
                 &profile,
                 // AV1 here is 4:2:0 only — see `create_nv12_encode_image`.
                 vk::Format::G8_B8R8_2PLANE_420_UNORM,
-                &session_memory,
-                session_params,
-                video_session,
             )
         }?;
 
         // ---------------------------------------------------------------
         // 7. Bitstream buffer
         // ---------------------------------------------------------------
+        let bitstream_capacity = bitstream_capacity_for(coded_w, coded_h, false);
         let (bitstream_buffer, bitstream_memory, bitstream_ptr) = unsafe {
             allocate_bitstream_buffer(
                 device,
                 instance,
                 physical_device,
-                video_fns,
-                BITSTREAM_CAPACITY,
-                &dpb_slots,
-                &session_memory,
-                session_params,
-                video_session,
+                bitstream_capacity,
+                &profile,
             )
         }?;
+        guard.bitstream = Some((bitstream_buffer, bitstream_memory));
 
         // ---------------------------------------------------------------
         // 8. Query pool (encode feedback)
@@ -1401,35 +1536,20 @@ impl VulkanVideoEncoder {
             .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
             .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
             .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
-        // Chain av1 profile via raw pNext.
-        {
-            let base = &mut video_profile_for_query as *mut _ as *mut vk::BaseOutStructure<'_>;
-            unsafe {
-                let mut cur = base;
-                while !(*cur).p_next.is_null() {
-                    cur = (*cur).p_next;
-                }
-                (*cur).p_next = &mut av1_profile_for_qp as *mut _ as *mut vk::BaseOutStructure<'_>;
-            }
-        }
-        let query_pool = unsafe {
-            create_encode_query_pool(
-                device,
-                video_fns,
+        unsafe {
+            push_next_raw(
                 &mut video_profile_for_query,
-                bitstream_buffer,
-                bitstream_memory,
-                &dpb_slots,
-                &session_memory,
-                session_params,
-                video_session,
+                &mut av1_profile_for_qp as *mut _,
             )
-        }?;
+        };
+        guard.query_pool =
+            unsafe { create_encode_query_pool(device, &mut video_profile_for_query) }?;
 
         eprintln!(
             "[vulkan-encode] initialized AV1 encoder {coded_w}x{coded_h} (source {width}x{height}) qp={qp} level={level}",
         );
 
+        let parts = guard.disarm();
         Some(Self {
             width: coded_w,
             height: coded_h,
@@ -1437,16 +1557,16 @@ impl VulkanVideoEncoder {
             src_height: height,
             ref_order_hints: [0; 8],
             codec: VulkanVideoCodec::AV1,
-            video_session,
-            session_params,
-            session_memory,
-            dpb_slots,
+            video_session: parts.video_session,
+            session_params: parts.session_params,
+            session_memory: parts.session_memory,
+            dpb_slots: parts.dpb_slots,
             cur_dpb_idx: 0,
-            bitstream_buffer,
-            bitstream_memory,
+            bitstream_buffer: parts.bitstream_buffer,
+            bitstream_memory: parts.bitstream_memory,
             bitstream_ptr,
-            bitstream_capacity: BITSTREAM_CAPACITY,
-            query_pool,
+            bitstream_capacity,
+            query_pool: parts.query_pool,
             frame_num: 0,
             idr_num: 0,
             force_idr: false,
@@ -1475,35 +1595,20 @@ impl VulkanVideoEncoder {
         let is_key = self.force_idr || force_keyframe || self.frame_num == 0;
         if is_key {
             self.force_idr = false;
+            // A keyframe restarts the GOP, so restart the state it is
+            // built from before anything reads it.  Resetting only after
+            // the encode sent a forced mid-GOP key to the driver with a
+            // stale `current_frame_id`/`ref_frame_id` while its deltas
+            // then counted from 0 — the driver's DPB slot no longer
+            // matched what those deltas declared, and what came back was
+            // flagged on the wire as a keyframe without decoding as one.
+            self.frame_num = 0;
         }
 
-        // Allocate command buffer.
-        let cb_alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(encode_cmd_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cbs = unsafe { device.allocate_command_buffers(&cb_alloc).ok()? };
-        let cb = cbs[0];
+        let cb = unsafe { self.begin_encode_cb(device, encode_cmd_pool) }?;
 
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        if unsafe { device.begin_command_buffer(cb, &begin) }.is_err() {
-            unsafe { device.free_command_buffers(encode_cmd_pool, &[cb]) };
-            return None;
-        }
-
-        // Reset query pool.
-        unsafe { device.cmd_reset_query_pool(cb, self.query_pool, 0, 1) };
-
-        // 7-bit order hint.  A keyframe restarts the GOP at 0 — `frame_num`
-        // is only reset *after* this encode, so without the `is_key` arm a
-        // forced keyframe would carry the stale hint and its deltas would
-        // then count backwards from it.
-        let order_hint = if is_key {
-            0
-        } else {
-            (self.frame_num & 0x7F) as u8
-        };
+        // 7-bit order hint; 0 on a keyframe, since frame_num was reset.
+        let order_hint = (self.frame_num & 0x7F) as u8;
 
         // --- DPB setup ---
         let setup_dpb_idx = self.cur_dpb_idx;
@@ -1543,13 +1648,7 @@ impl VulkanVideoEncoder {
         let mut setup_slot = vk::VideoReferenceSlotInfoKHR::default()
             .slot_index(setup_dpb_idx as i32)
             .picture_resource(&setup_picture_resource);
-        // Chain dpb info via raw pNext.
-        {
-            let base = &mut setup_slot as *mut _ as *mut vk::BaseOutStructure<'_>;
-            unsafe {
-                (*base).p_next = &setup_dpb_info as *const _ as *mut vk::BaseOutStructure<'_>;
-            }
-        }
+        unsafe { push_next_raw(&mut setup_slot, &setup_dpb_info as *const _ as *mut ()) };
 
         let mut begin_ref_slots: Vec<vk::VideoReferenceSlotInfoKHR<'_>> = Vec::new();
         begin_ref_slots.push(setup_slot);
@@ -1586,12 +1685,7 @@ impl VulkanVideoEncoder {
             ref_slot = vk::VideoReferenceSlotInfoKHR::default()
                 .slot_index(ref_dpb_idx as i32)
                 .picture_resource(&ref_picture_resource);
-            {
-                let base = &mut ref_slot as *mut _ as *mut vk::BaseOutStructure<'_>;
-                unsafe {
-                    (*base).p_next = &ref_dpb_info as *const _ as *mut vk::BaseOutStructure<'_>;
-                }
-            }
+            unsafe { push_next_raw(&mut ref_slot, &ref_dpb_info as *const _ as *mut ()) };
             begin_ref_slots.push(ref_slot);
         }
 
@@ -1622,7 +1716,7 @@ impl VulkanVideoEncoder {
         // Fill AV1 encode picture info
         // ---------------------------------------------------------------
         let mut pic_flags = StdVideoEncodeAV1PictureInfoFlags::new();
-        pic_flags.set_error_resilient_mode(is_key);
+        pic_flags.set_error_resilient_mode(true);
         pic_flags.set_force_integer_mv(is_key);
         pic_flags.set_show_frame(true);
         // Frame size is the coded extent; tell decoders the display size
@@ -1663,7 +1757,7 @@ impl VulkanVideoEncoder {
             frame_presentation_time: 0,
             current_frame_id: self.frame_num,
             order_hint,
-            primary_ref_frame: if is_key { 7 } else { 0 }, // 7 = PRIMARY_REF_NONE
+            primary_ref_frame: 7, // PRIMARY_REF_NONE: no CDF inheritance
             refresh_frame_flags: if is_key {
                 0xFF
             } else {
@@ -1734,170 +1828,45 @@ impl VulkanVideoEncoder {
         // why relying on it hung the compositor thread.
         unsafe { device.cmd_begin_query(cb, self.query_pool, 0, vk::QueryControlFlags::empty()) };
 
-        // Build encode info.
-        if is_key {
-            let mut encode_info = vk::VideoEncodeInfoKHR::default()
-                .dst_buffer(self.bitstream_buffer)
-                .dst_buffer_offset(0)
-                .dst_buffer_range(self.bitstream_capacity)
-                .src_picture_resource(src_picture_resource)
-                .setup_reference_slot(&setup_slot);
+        // Build the encode info.  As in the H.264 path, the reference slots
+        // are the coding scope's own, minus the setup slot at index 0.
+        let mut encode_info = vk::VideoEncodeInfoKHR::default()
+            .dst_buffer(self.bitstream_buffer)
+            .dst_buffer_offset(0)
+            .dst_buffer_range(self.bitstream_capacity)
+            .src_picture_resource(src_picture_resource)
+            .setup_reference_slot(&setup_slot)
+            .reference_slots(&begin_ref_slots[1..]);
+        unsafe { push_next_raw(&mut encode_info, &av1_pic_info as *const _ as *mut ()) };
 
-            // Chain av1_pic_info via raw pNext.
-            {
-                let base = &mut encode_info as *mut _ as *mut vk::BaseOutStructure<'_>;
-                unsafe {
-                    let mut cur = base;
-                    while !(*cur).p_next.is_null() {
-                        cur = (*cur).p_next;
-                    }
-                    (*cur).p_next = &av1_pic_info as *const _ as *mut vk::BaseOutStructure<'_>;
-                }
-            }
+        unsafe { (video_fns.cmd_encode_video)(cb, &encode_info) };
 
-            unsafe { (video_fns.cmd_encode_video)(cb, &encode_info) };
-        } else {
-            // P-frame: rebuild ref_slot for encode info.
-            let ref_ref_info2 = StdVideoEncodeAV1ReferenceInfo {
-                flags: StdVideoEncodeAV1ReferenceInfoFlags { bits: 0 },
-                ref_frame_id: self.frame_num.wrapping_sub(1),
-                frame_type: STD_VIDEO_AV1_FRAME_TYPE_INTER,
-                order_hint: ((self.frame_num.wrapping_sub(1)) & 0x7F) as u8,
-                _reserved: [0; 3],
-                p_extension_header: ptr::null(),
-            };
-            let ref_dpb_info2 = VideoEncodeAV1DpbSlotInfoKHR {
-                s_type: vk::StructureType::from_raw(
-                    VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_DPB_SLOT_INFO_KHR,
-                ),
-                p_next: ptr::null(),
-                p_std_reference_info: &ref_ref_info2,
-            };
-            let ref_picture_resource2 = vk::VideoPictureResourceInfoKHR::default()
-                .coded_offset(vk::Offset2D { x: 0, y: 0 })
-                .coded_extent(vk::Extent2D {
-                    width: self.width,
-                    height: self.height,
-                })
-                .base_array_layer(0)
-                .image_view_binding(self.dpb_slots[ref_dpb_idx].view);
-            let mut ref_slot2 = vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(ref_dpb_idx as i32)
-                .picture_resource(&ref_picture_resource2);
-            {
-                let base = &mut ref_slot2 as *mut _ as *mut vk::BaseOutStructure<'_>;
-                unsafe {
-                    (*base).p_next = &ref_dpb_info2 as *const _ as *mut vk::BaseOutStructure<'_>;
-                }
-            }
-
-            let mut encode_info = vk::VideoEncodeInfoKHR::default()
-                .dst_buffer(self.bitstream_buffer)
-                .dst_buffer_offset(0)
-                .dst_buffer_range(self.bitstream_capacity)
-                .src_picture_resource(src_picture_resource)
-                .setup_reference_slot(&setup_slot)
-                .reference_slots(std::slice::from_ref(&ref_slot2));
-
-            // Chain av1_pic_info.
-            {
-                let base = &mut encode_info as *mut _ as *mut vk::BaseOutStructure<'_>;
-                unsafe {
-                    let mut cur = base;
-                    while !(*cur).p_next.is_null() {
-                        cur = (*cur).p_next;
-                    }
-                    (*cur).p_next = &av1_pic_info as *const _ as *mut vk::BaseOutStructure<'_>;
-                }
-            }
-
-            unsafe { (video_fns.cmd_encode_video)(cb, &encode_info) };
-        }
-
-        unsafe { device.cmd_end_query(cb, self.query_pool, 0) };
-
-        // End video coding.
-        let end_coding = vk::VideoEndCodingInfoKHR::default();
-        unsafe { (video_fns.cmd_end_video_coding)(cb, &end_coding) };
-
-        // End command buffer.
-        if unsafe { device.end_command_buffer(cb) }.is_err() {
-            unsafe { device.free_command_buffers(encode_cmd_pool, &[cb]) };
-            return None;
-        }
-
-        // Submit.
-        let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cb));
-        let fence_info = vk::FenceCreateInfo::default();
-        let fence = unsafe { device.create_fence(&fence_info, None).ok()? };
-        if unsafe { device.queue_submit(encode_queue, &[submit], fence) }.is_err() {
-            unsafe {
-                device.destroy_fence(fence, None);
-                device.free_command_buffers(encode_cmd_pool, &[cb]);
-            }
-            return None;
-        }
-
-        // Wait for completion. A timeout means the submission is still live
-        // on the device, so the fence, the command buffer and the bitstream
-        // buffer it writes into are all still in use: freeing or reading any
-        // of them here would be a use-after-free the validation layers cannot
-        // save us from. Leak them and poison the encoder instead — one fence
-        // and one command buffer, once, against wedging the compositor.
-        if unsafe { device.wait_for_fences(&[fence], true, encode_fence_timeout_ns()) }.is_err() {
-            eprintln!(
-                "[vulkan-encode] fence wait timed out after {} ms; abandoning encoder",
-                encode_fence_timeout_ns() / 1_000_000
-            );
-            self.poisoned = true;
-            return None;
-        }
-        unsafe { device.destroy_fence(fence, None) };
-
-        // Read query result.
-        let mut feedback = [0u32; 1];
-        let qr = unsafe {
-            device.get_query_pool_results(
-                self.query_pool,
-                0,
-                &mut feedback,
-                vk::QueryResultFlags::WAIT,
-            )
-        };
-        unsafe { device.free_command_buffers(encode_cmd_pool, &[cb]) };
-
-        if qr.is_err() {
-            eprintln!("[vulkan-encode] AV1 query pool result failed: {qr:?}");
-            return None;
-        }
-
-        let encoded_size = feedback[0] as usize;
-        if encoded_size == 0 || encoded_size > self.bitstream_capacity as usize {
-            eprintln!(
-                "[vulkan-encode] AV1 bad encoded size: {encoded_size} (capacity={})",
-                self.bitstream_capacity,
-            );
-            return None;
-        }
-
-        // Copy the bitstream out.  The driver emits bare frame OBUs (see
-        // `params_bytes` in `try_new_av1`), but the low-overhead bitstream
-        // format wants each temporal unit to open with a temporal-delimiter
-        // OBU — parsers use it to split units, and dav1d refuses a stream
-        // without one.  A keyframe additionally gets the sequence header, so
-        // each is a self-contained entry point.
+        // The driver emits bare frame OBUs (see `params_bytes` in
+        // `try_new_av1`), but the low-overhead bitstream format wants each
+        // temporal unit to open with a temporal-delimiter OBU — parsers use
+        // it to split units, and dav1d refuses a stream without one.  A
+        // keyframe additionally gets the sequence header, so each is a
+        // self-contained entry point.
         const TEMPORAL_DELIMITER: [u8; 2] = [0x12, 0x00];
-        let slices = unsafe { std::slice::from_raw_parts(self.bitstream_ptr, encoded_size) };
-        let mut bitstream = Vec::with_capacity(2 + self.params_bytes.len() + encoded_size);
-        bitstream.extend_from_slice(&TEMPORAL_DELIMITER);
+        let mut prefix = Vec::with_capacity(2 + self.params_bytes.len());
+        prefix.extend_from_slice(&TEMPORAL_DELIMITER);
         if is_key {
-            bitstream.extend_from_slice(&self.params_bytes);
+            prefix.extend_from_slice(&self.params_bytes);
         }
-        bitstream.extend_from_slice(slices);
+        let bitstream = unsafe {
+            self.finish_encode(
+                device,
+                video_fns,
+                encode_queue,
+                encode_cmd_pool,
+                cb,
+                &prefix,
+            )
+        }?;
 
-        // Update state.
+        // Update state.  frame_num was already reset for a keyframe before
+        // the encode — every std structure above carried the 0.
         if is_key {
-            self.frame_num = 0;
             self.idr_num = self.idr_num.wrapping_add(1);
             // refresh_frame_flags was 0xFF: every slot now holds this frame.
             self.ref_order_hints = [order_hint; 8];
@@ -2001,6 +1970,171 @@ fn compute_level_idc(width: u32, height: u32) -> StdVideoH264LevelIdc {
     }
 }
 
+/// H.264 Exp-Golomb bit writer for hand-serializing parameter sets.
+///
+/// Used when the driver's own serializer refuses: NVIDIA (595.84) fails
+/// `vkGetEncodedVideoSessionParametersKHR` for a High 4:4:4 Predictive PPS
+/// with `ERROR_OUT_OF_HOST_MEMORY` in both the size-query and write forms,
+/// while the encode session itself works — the same shape as AV1, where no
+/// serializer exists at all and the application writes the header itself.
+struct H264BitWriter {
+    bytes: Vec<u8>,
+    used: u8,
+}
+
+impl H264BitWriter {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            used: 0,
+        }
+    }
+
+    fn u(&mut self, n: u32, v: u32) {
+        for i in (0..n).rev() {
+            if self.used == 0 {
+                self.bytes.push(0);
+            }
+            let bit = ((v >> i) & 1) as u8;
+            *self.bytes.last_mut().unwrap() |= bit << (7 - self.used);
+            self.used = (self.used + 1) & 7;
+        }
+    }
+
+    /// ue(v): Exp-Golomb.
+    fn ue(&mut self, v: u32) {
+        let cw = v + 1;
+        let bits = 32 - cw.leading_zeros();
+        self.u(bits - 1, 0);
+        self.u(bits, cw);
+    }
+
+    /// se(v): signed Exp-Golomb.
+    fn se(&mut self, v: i32) {
+        let mapped = if v <= 0 {
+            (-2 * v) as u32
+        } else {
+            (2 * v - 1) as u32
+        };
+        self.ue(mapped);
+    }
+
+    /// rbsp_trailing_bits + emulation prevention + Annex B start code and
+    /// NAL header.
+    fn into_nal(mut self, nal_ref_idc: u8, nal_unit_type: u8) -> Vec<u8> {
+        self.u(1, 1); // rbsp_stop_one_bit
+        while self.used != 0 {
+            self.u(1, 0);
+        }
+        let mut out = vec![0, 0, 0, 1, (nal_ref_idc << 5) | nal_unit_type];
+        let mut zeros = 0u32;
+        for &b in &self.bytes {
+            if zeros >= 2 && b <= 3 {
+                out.push(3);
+                zeros = 0;
+            }
+            out.push(b);
+            zeros = if b == 0 { zeros + 1 } else { 0 };
+        }
+        out
+    }
+}
+
+/// Numeric `level_idc` for a `StdVideoH264LevelIdc` enum value (which counts
+/// levels in order, not by their H.264 numbering).
+fn h264_level_idc_value(level: StdVideoH264LevelIdc) -> u32 {
+    const LEVELS: [u32; 19] = [
+        10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40, 41, 42, 50, 51, 52, 60, 61, 62,
+    ];
+    LEVELS.get(level as usize).copied().unwrap_or(51)
+}
+
+/// Serialize the SPS + PPS `try_new_h264` handed the driver, as Annex B
+/// NALs.  Field for field the same values as the `StdVideoH264*ParameterSet`
+/// structs — keep them in lockstep, exactly like the AV1 sequence header.
+fn h264_parameter_sets(
+    sps: &StdVideoH264SequenceParameterSet,
+    pps: &StdVideoH264PictureParameterSet,
+    is_444: bool,
+) -> Vec<u8> {
+    let mut w = H264BitWriter::new();
+    w.u(8, sps.profile_idc);
+    w.u(8, 0); // constraint_set*_flag + reserved_zero_2bits
+    w.u(8, h264_level_idc_value(sps.level_idc));
+    w.ue(sps.seq_parameter_set_id as u32);
+    // profile_idc 100/244 branch (both High-family profiles we emit).
+    w.ue(sps.chroma_format_idc);
+    if sps.chroma_format_idc == StdVideoH264ChromaFormatIdc_STD_VIDEO_H264_CHROMA_FORMAT_IDC_444 {
+        w.u(1, 0); // separate_colour_plane_flag
+    }
+    w.ue(sps.bit_depth_luma_minus8 as u32);
+    w.ue(sps.bit_depth_chroma_minus8 as u32);
+    w.u(1, 0); // qpprime_y_zero_transform_bypass_flag
+    w.u(1, 0); // seq_scaling_matrix_present_flag
+    w.ue(sps.log2_max_frame_num_minus4 as u32);
+    w.ue(sps.pic_order_cnt_type); // 2: nothing further
+    w.ue(sps.max_num_ref_frames as u32);
+    w.u(1, 0); // gaps_in_frame_num_value_allowed_flag
+    w.ue(sps.pic_width_in_mbs_minus1);
+    w.ue(sps.pic_height_in_map_units_minus1);
+    w.u(1, 1); // frame_mbs_only_flag
+    w.u(1, 1); // direct_8x8_inference_flag
+    let cropping = sps.frame_crop_right_offset != 0 || sps.frame_crop_bottom_offset != 0;
+    w.u(1, cropping as u32);
+    if cropping {
+        w.ue(0);
+        w.ue(sps.frame_crop_right_offset);
+        w.ue(0);
+        w.ue(sps.frame_crop_bottom_offset);
+    }
+    let has_vui =
+        sps.flags.vui_parameters_present_flag() != 0 && !sps.pSequenceParameterSetVui.is_null();
+    w.u(1, has_vui as u32); // vui_parameters_present_flag
+    if has_vui {
+        let vui = unsafe { &*sps.pSequenceParameterSetVui };
+        w.u(1, vui.flags.aspect_ratio_info_present_flag());
+        w.u(1, vui.flags.overscan_info_present_flag());
+        let signal = vui.flags.video_signal_type_present_flag();
+        w.u(1, signal);
+        if signal != 0 {
+            w.u(3, vui.video_format as u32);
+            w.u(1, vui.flags.video_full_range_flag());
+            w.u(1, vui.flags.color_description_present_flag());
+        }
+        w.u(1, vui.flags.chroma_loc_info_present_flag());
+        w.u(1, vui.flags.timing_info_present_flag());
+        w.u(1, vui.flags.nal_hrd_parameters_present_flag());
+        w.u(1, vui.flags.vcl_hrd_parameters_present_flag());
+        w.u(1, 0); // pic_struct_present_flag
+        w.u(1, vui.flags.bitstream_restriction_flag());
+    }
+    let mut out = w.into_nal(3, 7);
+
+    let mut w = H264BitWriter::new();
+    w.ue(pps.pic_parameter_set_id as u32);
+    w.ue(pps.seq_parameter_set_id as u32);
+    w.u(1, 1); // entropy_coding_mode_flag (CABAC)
+    w.u(1, 0); // bottom_field_pic_order_in_frame_present_flag
+    w.ue(0); // num_slice_groups_minus1
+    w.ue(pps.num_ref_idx_l0_default_active_minus1 as u32);
+    w.ue(pps.num_ref_idx_l1_default_active_minus1 as u32);
+    w.u(1, 0); // weighted_pred_flag
+    w.u(2, 0); // weighted_bipred_idc (DEFAULT)
+    w.se(pps.pic_init_qp_minus26 as i32);
+    w.se(0); // pic_init_qs_minus26
+    w.se(0); // chroma_qp_index_offset
+    w.u(1, 1); // deblocking_filter_control_present_flag
+    w.u(1, 0); // constrained_intra_pred_flag
+    w.u(1, 0); // redundant_pic_cnt_present_flag
+    // High-profile tail — present so transform_8x8_mode_flag can state what
+    // the hardware does at 4:4:4 (see the PPS flags in `try_new_h264`).
+    w.u(1, is_444 as u32); // transform_8x8_mode_flag
+    w.u(1, 0); // pic_scaling_matrix_present_flag
+    w.se(0); // second_chroma_qp_index_offset
+    out.extend_from_slice(&w.into_nal(3, 8));
+    out
+}
+
 /// Serialize the `sequence_header_obu()` matching the
 /// `StdVideoAV1SequenceHeader` that `try_new_av1` hands the driver.
 ///
@@ -2080,7 +2214,7 @@ fn av1_sequence_header_obu(
     w.put(1, 0); // high_bitdepth
     w.put(1, 0); // mono_chrome
     w.put(1, 0); // color_description_present_flag
-    w.put(1, 0); // color_range: studio swing
+    w.put(1, 1); // color_range: full swing (blit is full-range end to end)
     w.put(2, 0); // chroma_sample_position: unknown
     w.put(1, 0); // separate_uv_delta_q
     w.put(1, 0); // film_grain_params_present
@@ -2133,33 +2267,12 @@ fn compute_av1_level(width: u32, height: u32) -> u32 {
     }
 }
 
-/// Clean up session resources on error during `try_new_h264`.
-unsafe fn cleanup_session(
-    device: &ash::Device,
-    video_fns: &VideoFns,
-    dpb_slots: &[DpbSlot],
-    session_memory: &[vk::DeviceMemory],
-    session_params: vk::VideoSessionParametersKHR,
-    video_session: vk::VideoSessionKHR,
-) {
-    unsafe {
-        for slot in dpb_slots {
-            destroy_dpb_slot(device, slot);
-        }
-        (video_fns.destroy_video_session_parameters)(device.handle(), session_params, ptr::null());
-        for &m in session_memory {
-            device.free_memory(m, None);
-        }
-        (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
-    }
-}
-
 /// Query and bind memory for a video session.
 ///
 /// Calls `vkGetVideoSessionMemoryRequirementsKHR`, allocates device-local
 /// memory for each requirement, and binds it via `vkBindVideoSessionMemoryKHR`.
-/// On failure, cleans up any partially-allocated memory and destroys the
-/// video session.
+/// On failure, frees any partially-allocated memory; the caller's
+/// `ConstructionGuard` owns the session itself.
 unsafe fn bind_session_memory(
     device: &ash::Device,
     video_fns: &VideoFns,
@@ -2178,9 +2291,6 @@ unsafe fn bind_session_memory(
     };
     if res != vk::Result::SUCCESS {
         eprintln!("[vulkan-encode] vkGetVideoSessionMemoryRequirementsKHR(count) failed: {res:?}",);
-        unsafe {
-            (video_fns.destroy_video_session)(device.handle(), session, ptr::null());
-        }
         return None;
     }
 
@@ -2196,9 +2306,6 @@ unsafe fn bind_session_memory(
     };
     if res != vk::Result::SUCCESS {
         eprintln!("[vulkan-encode] vkGetVideoSessionMemoryRequirementsKHR(data) failed: {res:?}",);
-        unsafe {
-            (video_fns.destroy_video_session)(device.handle(), session, ptr::null());
-        }
         return None;
     }
 
@@ -2225,9 +2332,6 @@ unsafe fn bind_session_memory(
             for &m in &session_memory {
                 unsafe { device.free_memory(m, None) };
             }
-            unsafe {
-                (video_fns.destroy_video_session)(device.handle(), session, ptr::null());
-            }
             return None;
         };
         let alloc = vk::MemoryAllocateInfo::default()
@@ -2239,9 +2343,6 @@ unsafe fn bind_session_memory(
                 eprintln!("[vulkan-encode] session memory alloc failed: {e:?}");
                 for &m in &session_memory {
                     unsafe { device.free_memory(m, None) };
-                }
-                unsafe {
-                    (video_fns.destroy_video_session)(device.handle(), session, ptr::null());
                 }
                 return None;
             }
@@ -2270,9 +2371,6 @@ unsafe fn bind_session_memory(
             for &m in &session_memory {
                 unsafe { device.free_memory(m, None) };
             }
-            unsafe {
-                (video_fns.destroy_video_session)(device.handle(), session, ptr::null());
-            }
             return None;
         }
     }
@@ -2282,24 +2380,20 @@ unsafe fn bind_session_memory(
 
 /// Allocate two DPB (Decoded Picture Buffer) slots for video encode.
 ///
-/// Each slot gets a `G8_B8R8_2PLANE_420_UNORM` image with `VIDEO_ENCODE_DPB`
-/// usage plus an image view.  On failure, cleans up partially-created slots
-/// and the full session (params + memory + session).
+/// Each slot gets an image in the session's reference format with
+/// `VIDEO_ENCODE_DPB` usage plus an image view.  On failure, destroys the
+/// partially-created slots; the caller's `ConstructionGuard` owns the rest.
 unsafe fn allocate_dpb_slots(
     device: &ash::Device,
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
-    video_fns: &VideoFns,
     width: u32,
     height: u32,
     video_queue_family: u32,
     profile: &vk::VideoProfileInfoKHR<'_>,
     format: vk::Format,
-    session_memory: &[vk::DeviceMemory],
-    session_params: vk::VideoSessionParametersKHR,
-    video_session: vk::VideoSessionKHR,
-) -> Option<[DpbSlot; 2]> {
-    let mut dpb_slots_vec = Vec::new();
+) -> Option<Vec<DpbSlot>> {
+    let mut dpb_slots = Vec::new();
     for i in 0..2 {
         let dpb = unsafe {
             create_dpb_image(
@@ -2315,63 +2409,45 @@ unsafe fn allocate_dpb_slots(
         };
         let Some(dpb) = dpb else {
             eprintln!("[vulkan-encode] DPB image {i} creation failed");
-            for slot in &dpb_slots_vec {
+            for slot in &dpb_slots {
                 unsafe { destroy_dpb_slot(device, slot) };
-            }
-            unsafe {
-                (video_fns.destroy_video_session_parameters)(
-                    device.handle(),
-                    session_params,
-                    ptr::null(),
-                );
-            }
-            for &m in session_memory {
-                unsafe { device.free_memory(m, None) };
-            }
-            unsafe {
-                (video_fns.destroy_video_session)(device.handle(), video_session, ptr::null());
             }
             return None;
         };
-        dpb_slots_vec.push(dpb);
+        dpb_slots.push(dpb);
     }
-    Some([dpb_slots_vec.remove(0), dpb_slots_vec.remove(0)])
+    Some(dpb_slots)
 }
 
 /// Allocate a host-visible, host-coherent mapped buffer for encoded bitstream
 /// output.
 ///
-/// Returns `(buffer, memory, mapped_ptr)`.  On failure, cleans up and returns
-/// `None`.
+/// Returns `(buffer, memory, mapped_ptr)`; the memory is left mapped for the
+/// encoder's lifetime.  On failure, frees what it created itself; the
+/// caller's `ConstructionGuard` owns the rest.
 unsafe fn allocate_bitstream_buffer(
     device: &ash::Device,
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
-    video_fns: &VideoFns,
     capacity: u64,
-    dpb_slots: &[DpbSlot; 2],
-    session_memory: &[vk::DeviceMemory],
-    session_params: vk::VideoSessionParametersKHR,
-    video_session: vk::VideoSessionKHR,
+    profile: &vk::VideoProfileInfoKHR,
 ) -> Option<(vk::Buffer, vk::DeviceMemory, *mut u8)> {
+    // A VIDEO_ENCODE_DST buffer must name the profiles it will be used
+    // with (VUID-VkBufferCreateInfo-usage-04814).  NVIDIA tolerates the
+    // omission for High 4:2:0 sessions but enforces it for High 4:4:4
+    // Predictive: the encode records fine and then vkEndCommandBuffer
+    // fails with ERROR_INITIALIZATION_FAILED.
+    let profiles = [*profile];
+    let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
     let buf_info = vk::BufferCreateInfo::default()
         .size(capacity)
         .usage(vk::BufferUsageFlags::VIDEO_ENCODE_DST_KHR)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .push_next(&mut profile_list);
     let bitstream_buffer = match unsafe { device.create_buffer(&buf_info, None) } {
         Ok(b) => b,
         Err(e) => {
             eprintln!("[vulkan-encode] bitstream buffer create failed: {e:?}");
-            unsafe {
-                cleanup_session(
-                    device,
-                    video_fns,
-                    dpb_slots,
-                    session_memory,
-                    session_params,
-                    video_session,
-                );
-            }
             return None;
         }
     };
@@ -2384,17 +2460,7 @@ unsafe fn allocate_bitstream_buffer(
     );
     let Some(buf_mem_type) = buf_mem_type else {
         eprintln!("[vulkan-encode] no host-visible memory for bitstream buffer");
-        unsafe {
-            device.destroy_buffer(bitstream_buffer, None);
-            cleanup_session(
-                device,
-                video_fns,
-                dpb_slots,
-                session_memory,
-                session_params,
-                video_session,
-            );
-        }
+        unsafe { device.destroy_buffer(bitstream_buffer, None) };
         return None;
     };
     let buf_alloc = vk::MemoryAllocateInfo::default()
@@ -2405,16 +2471,6 @@ unsafe fn allocate_bitstream_buffer(
         Err(e) => {
             eprintln!("[vulkan-encode] bitstream memory alloc failed: {e:?}");
             unsafe { device.destroy_buffer(bitstream_buffer, None) };
-            unsafe {
-                cleanup_session(
-                    device,
-                    video_fns,
-                    dpb_slots,
-                    session_memory,
-                    session_params,
-                    video_session,
-                );
-            }
             return None;
         }
     };
@@ -2423,14 +2479,6 @@ unsafe fn allocate_bitstream_buffer(
         unsafe {
             device.free_memory(bitstream_memory, None);
             device.destroy_buffer(bitstream_buffer, None);
-            cleanup_session(
-                device,
-                video_fns,
-                dpb_slots,
-                session_memory,
-                session_params,
-                video_session,
-            );
         }
         return None;
     }
@@ -2449,16 +2497,6 @@ unsafe fn allocate_bitstream_buffer(
                 device.free_memory(bitstream_memory, None);
                 device.destroy_buffer(bitstream_buffer, None);
             }
-            unsafe {
-                cleanup_session(
-                    device,
-                    video_fns,
-                    dpb_slots,
-                    session_memory,
-                    session_params,
-                    video_session,
-                );
-            }
             return None;
         }
     };
@@ -2472,14 +2510,7 @@ unsafe fn allocate_bitstream_buffer(
 /// chained via pNext before being passed here.
 unsafe fn create_encode_query_pool(
     device: &ash::Device,
-    video_fns: &VideoFns,
     profile_for_query: &mut vk::VideoProfileInfoKHR<'_>,
-    bitstream_buffer: vk::Buffer,
-    bitstream_memory: vk::DeviceMemory,
-    dpb_slots: &[DpbSlot; 2],
-    session_memory: &[vk::DeviceMemory],
-    session_params: vk::VideoSessionParametersKHR,
-    video_session: vk::VideoSessionKHR,
 ) -> Option<vk::QueryPool> {
     let mut encode_feedback_info = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default()
         .encode_feedback_flags(vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN);
@@ -2488,27 +2519,13 @@ unsafe fn create_encode_query_pool(
         .query_count(1)
         .push_next(&mut encode_feedback_info)
         .push_next(profile_for_query);
-    let query_pool = match unsafe { device.create_query_pool(&qp_info, None) } {
-        Ok(q) => q,
+    match unsafe { device.create_query_pool(&qp_info, None) } {
+        Ok(q) => Some(q),
         Err(e) => {
             eprintln!("[vulkan-encode] query pool create failed: {e:?}");
-            unsafe {
-                device.unmap_memory(bitstream_memory);
-                device.free_memory(bitstream_memory, None);
-                device.destroy_buffer(bitstream_buffer, None);
-                cleanup_session(
-                    device,
-                    video_fns,
-                    dpb_slots,
-                    session_memory,
-                    session_params,
-                    video_session,
-                );
-            }
-            return None;
+            None
         }
-    };
-    Some(query_pool)
+    }
 }
 
 /// Create a DPB (Decoded Picture Buffer) image + view.
@@ -2901,21 +2918,36 @@ struct StdVideoEncodeAV1ReferenceInfo {
     p_extension_header: *const std::ffi::c_void,
 }
 
-// Layout guards for the hand-rolled std-header mirrors above.  Sizes are
-// from vulkan_video_codec_av1std*.h compiled on x86_64 — a mismatch here
-// means fields have drifted, which the driver reports as
+// Layout guards for the hand-rolled std-header mirrors above.  Sizes and
+// offsets are from vulkan_video_codec_av1std*.h compiled on x86_64 — a
+// mismatch here means fields have drifted, which the driver reports as
 // ERROR_INVALID_VIDEO_STD_PARAMETERS_KHR at best and reads as garbage
-// pointers at worst.
+// pointers at worst.  The offsets pin the packing decisions that are easy
+// to get wrong by eye: the u8 arrays sitting at odd offsets with no
+// padding, and every pointer the driver will chase.
 const _: () = {
-    assert!(std::mem::size_of::<StdVideoAV1ColorConfig>() == 24);
-    assert!(std::mem::size_of::<StdVideoAV1TimingInfo>() == 16);
-    assert!(std::mem::size_of::<StdVideoAV1SequenceHeader>() == 40);
-    assert!(std::mem::size_of::<StdVideoAV1TileInfo>() == 48);
-    assert!(std::mem::size_of::<StdVideoAV1Quantization>() == 16);
-    assert!(std::mem::size_of::<StdVideoAV1LoopFilter>() == 24);
-    assert!(std::mem::size_of::<StdVideoAV1LoopRestoration>() == 20);
-    assert!(std::mem::size_of::<StdVideoEncodeAV1PictureInfo>() == 152);
-    assert!(std::mem::size_of::<StdVideoEncodeAV1ReferenceInfo>() == 24);
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<StdVideoAV1ColorConfig>() == 24);
+    assert!(offset_of!(StdVideoAV1ColorConfig, color_primaries) == 8);
+    assert!(size_of::<StdVideoAV1TimingInfo>() == 16);
+    assert!(size_of::<StdVideoAV1SequenceHeader>() == 40);
+    assert!(offset_of!(StdVideoAV1SequenceHeader, order_hint_bits_minus_1) == 16);
+    assert!(offset_of!(StdVideoAV1SequenceHeader, p_color_config) == 24);
+    assert!(offset_of!(StdVideoAV1SequenceHeader, p_timing_info) == 32);
+    assert!(size_of::<StdVideoAV1TileInfo>() == 48);
+    assert!(offset_of!(StdVideoAV1TileInfo, p_mi_col_starts) == 16);
+    assert!(size_of::<StdVideoAV1Quantization>() == 16);
+    assert!(size_of::<StdVideoAV1LoopFilter>() == 24);
+    assert!(size_of::<StdVideoAV1LoopRestoration>() == 20);
+    assert!(size_of::<StdVideoEncodeAV1PictureInfo>() == 152);
+    assert!(offset_of!(StdVideoEncodeAV1PictureInfo, order_hint) == 16);
+    assert!(offset_of!(StdVideoEncodeAV1PictureInfo, ref_order_hint) == 34);
+    assert!(offset_of!(StdVideoEncodeAV1PictureInfo, ref_frame_idx) == 42);
+    assert!(offset_of!(StdVideoEncodeAV1PictureInfo, delta_frame_id_minus_1) == 52);
+    assert!(offset_of!(StdVideoEncodeAV1PictureInfo, p_tile_info) == 80);
+    assert!(size_of::<StdVideoEncodeAV1ReferenceInfo>() == 24);
+    assert!(offset_of!(StdVideoEncodeAV1ReferenceInfo, order_hint) == 12);
+    assert!(offset_of!(StdVideoEncodeAV1ReferenceInfo, p_extension_header) == 16);
 };
 
 // --- Vulkan structs ---
@@ -2973,10 +3005,7 @@ pub(crate) fn av1_encode_profile(
         .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
         .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
         .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
-    let base = &mut profile as *mut _ as *mut vk::BaseOutStructure<'_>;
-    unsafe {
-        (*base).p_next = leaf as *mut _ as *mut vk::BaseOutStructure<'_>;
-    }
+    unsafe { push_next_raw(&mut profile, leaf as *mut VideoEncodeAV1ProfileInfoKHR) };
     profile
 }
 
@@ -3043,3 +3072,229 @@ const VK_VIDEO_ENCODE_AV1_RATE_CONTROL_GROUP_PREDICTIVE_KHR: u32 = 1;
 
 /// `STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_NONE`.
 const STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_NONE: u32 = 0;
+
+// ===================================================================
+// Tests
+// ===================================================================
+//
+// The two hand-written serializers are the highest-risk code here: the
+// AV1 sequence header must stay bit-for-bit in lockstep with the
+// `StdVideoAV1SequenceHeader` handed to the driver, and the H.264 fallback
+// serializer with its SPS/PPS structs — drift in either direction is a
+// stream no decoder accepts.  The goldens pin the exact bytes produced by
+// the field-verified implementation (decoded by ffmpeg/dav1d/Chromium in
+// production); any diff against them is a deliberate format change or a
+// regression, never noise.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SPS + PPS exactly as `try_new_h264` builds them, so the golden test
+    /// exercises the same structs the driver sees.
+    fn build_h264_params(
+        width: u32,
+        height: u32,
+        qp: u8,
+        is_444: bool,
+    ) -> (
+        StdVideoH264SequenceParameterSet,
+        Box<StdVideoH264SequenceParameterSetVui>,
+        StdVideoH264PictureParameterSet,
+    ) {
+        let width_in_mbs = (width + 15) / 16;
+        let height_in_mbs = (height + 15) / 16;
+        let needs_crop = (width_in_mbs * 16 != width) || (height_in_mbs * 16 != height);
+
+        let mut sps_flags: StdVideoH264SpsFlags = unsafe { std::mem::zeroed() };
+        sps_flags.set_frame_mbs_only_flag(1);
+        sps_flags.set_direct_8x8_inference_flag(1);
+        if needs_crop {
+            sps_flags.set_frame_cropping_flag(1);
+        }
+        sps_flags.set_vui_parameters_present_flag(1);
+        let mut vui_flags: StdVideoH264SpsVuiFlags = unsafe { std::mem::zeroed() };
+        vui_flags.set_video_signal_type_present_flag(1);
+        vui_flags.set_video_full_range_flag(1);
+        let mut vui: Box<StdVideoH264SequenceParameterSetVui> =
+            Box::new(unsafe { std::mem::zeroed() });
+        vui.flags = vui_flags;
+        vui.video_format = 5;
+
+        let crop_unit = if is_444 { 1 } else { 2 };
+        let crop_right = (width_in_mbs * 16 - width) / crop_unit;
+        let crop_bottom = (height_in_mbs * 16 - height) / crop_unit;
+
+        let mut sps: StdVideoH264SequenceParameterSet = unsafe { std::mem::zeroed() };
+        sps.flags = sps_flags;
+        sps.profile_idc = if is_444 {
+            StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE
+        } else {
+            StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
+        };
+        sps.level_idc = compute_level_idc(width, height);
+        sps.chroma_format_idc = if is_444 {
+            StdVideoH264ChromaFormatIdc_STD_VIDEO_H264_CHROMA_FORMAT_IDC_444
+        } else {
+            StdVideoH264ChromaFormatIdc_STD_VIDEO_H264_CHROMA_FORMAT_IDC_420
+        };
+        sps.pic_order_cnt_type = StdVideoH264PocType_STD_VIDEO_H264_POC_TYPE_2;
+        sps.max_num_ref_frames = 1;
+        sps.pic_width_in_mbs_minus1 = width_in_mbs - 1;
+        sps.pic_height_in_map_units_minus1 = height_in_mbs - 1;
+        sps.frame_crop_right_offset = crop_right;
+        sps.frame_crop_bottom_offset = crop_bottom;
+        sps.pSequenceParameterSetVui = &*vui;
+
+        let mut pps_flags: StdVideoH264PpsFlags = unsafe { std::mem::zeroed() };
+        pps_flags.set_entropy_coding_mode_flag(1);
+        pps_flags.set_deblocking_filter_control_present_flag(1);
+        if is_444 {
+            pps_flags.set_transform_8x8_mode_flag(1);
+        }
+        let mut pps: StdVideoH264PictureParameterSet = unsafe { std::mem::zeroed() };
+        pps.flags = pps_flags;
+        pps.weighted_bipred_idc =
+            StdVideoH264WeightedBipredIdc_STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_DEFAULT;
+        pps.pic_init_qp_minus26 = qp.min(H264_MAX_QP) as i8 - 26;
+
+        (sps, vui, pps)
+    }
+
+    #[test]
+    fn h264_bitwriter_exp_golomb() {
+        // ue(0) ue(1) ue(2) pack to 1 010 011; the stop bit completes the
+        // byte: 0b1010_0111.
+        let mut w = H264BitWriter::new();
+        w.ue(0);
+        w.ue(1);
+        w.ue(2);
+        assert_eq!(w.into_nal(0, 1), vec![0, 0, 0, 1, 0x01, 0xA7]);
+
+        // se maps 1 → codeword 1 ("010"), -1 → codeword 2 ("011").
+        let mut w = H264BitWriter::new();
+        w.se(1);
+        w.se(-1);
+        // 010 011 + stop 1 + pad 0 = 0b0100_1110.
+        assert_eq!(w.into_nal(0, 1), vec![0, 0, 0, 1, 0x01, 0x4E]);
+    }
+
+    #[test]
+    fn h264_bitwriter_emulation_prevention() {
+        // Three zero payload bytes would embed a start code; the writer must
+        // escape after two zeros when the next byte is <= 3.
+        let mut w = H264BitWriter::new();
+        w.u(24, 0);
+        // Payload after rbsp_stop: 00 00 00 80 → escaped 00 00 03 00 80.
+        assert_eq!(w.into_nal(3, 7), vec![0, 0, 0, 1, 0x67, 0, 0, 3, 0, 0x80]);
+    }
+
+    #[test]
+    fn h264_parameter_sets_golden_720p() {
+        // 1280x720 4:2:0: macroblock-exact, no cropping; the level table
+        // puts 720p at 4.0 (see `level_tables`).
+        let (sps, _vui, pps) = build_h264_params(1280, 720, 26, false);
+        let bytes = h264_parameter_sets(&sps, &pps, false);
+        assert_eq!(bytes, GOLDEN_SPS_PPS_720P);
+    }
+
+    #[test]
+    fn h264_parameter_sets_golden_cropped_1918x1078() {
+        // Not macroblock-aligned: 1920x1088 coded, crop_right=1,
+        // crop_bottom=5 in 4:2:0 crop units.
+        let (sps, _vui, pps) = build_h264_params(1918, 1078, 32, false);
+        assert_eq!(sps.frame_crop_right_offset, 1);
+        assert_eq!(sps.frame_crop_bottom_offset, 5);
+        let bytes = h264_parameter_sets(&sps, &pps, false);
+        assert_eq!(bytes, GOLDEN_SPS_PPS_1918X1078);
+    }
+
+    #[test]
+    fn h264_parameter_sets_structure() {
+        for (w, h, is_444) in [
+            (1280u32, 720u32, false),
+            (1918, 1078, false),
+            (640, 480, true),
+        ] {
+            let (sps, _vui, pps) = build_h264_params(w, h, 26, is_444);
+            let bytes = h264_parameter_sets(&sps, &pps, is_444);
+            // Annex B start code + SPS NAL header.
+            assert_eq!(&bytes[..4], &[0, 0, 0, 1]);
+            assert_eq!(bytes[4], 0x67, "nal_ref_idc=3, type=7 (SPS)");
+            // profile_idc is the real IDC value (High=100, High444=244).
+            assert_eq!(bytes[5], if is_444 { 244 } else { 100 });
+            // A PPS NAL follows.
+            let pps_pos = bytes[4..]
+                .windows(5)
+                .position(|win| win[..4] == [0, 0, 0, 1] && win[4] == 0x68)
+                .expect("PPS NAL present");
+            assert!(pps_pos > 0);
+        }
+    }
+
+    #[test]
+    fn av1_sequence_header_golden_1080p() {
+        // Level 4.0 (=8), 11 width/height bits — the values try_new_av1
+        // derives for a 1920x1080 coded extent.
+        let obu = av1_sequence_header_obu(8, 11, 11, 1920, 1080);
+        assert_eq!(obu, GOLDEN_AV1_SEQ_1080P);
+    }
+
+    #[test]
+    fn av1_sequence_header_structure() {
+        for (level, w, h) in [(8u32, 1920u32, 1080u32), (13, 3840, 2160), (0, 320, 200)] {
+            let w_bits = 32u32.saturating_sub(w.leading_zeros()).max(1);
+            let h_bits = 32u32.saturating_sub(h.leading_zeros()).max(1);
+            let obu = av1_sequence_header_obu(level, w_bits, h_bits, w, h);
+            // obu_header: OBU_SEQUENCE_HEADER (type 1), has_size_field.
+            assert_eq!(obu[0], 0x0A);
+            // Single-byte leb128 size matching the payload.
+            assert_eq!(obu[1] as usize, obu.len() - 2);
+            // seq_profile 0 and the four flag bits after it are all zero.
+            assert_eq!(obu[2] & 0b1111_1110, 0);
+        }
+    }
+
+    #[test]
+    fn level_tables() {
+        use StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_3_1 as L31;
+        use StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_4_0 as L40;
+        use StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_5_1 as L51;
+        assert_eq!(compute_level_idc(640, 480), L31);
+        // The table's 3.1 cutoff (1620 MBs) is really level 3.0's MaxFS —
+        // 3.1 allows 3600 — so 720p lands at 4.0.  Conservative, spec-legal,
+        // and pinned here so a future retune shows up as a diff.
+        assert_eq!(compute_level_idc(1280, 720), L40);
+        assert_eq!(compute_level_idc(1920, 1080), L40);
+        assert_eq!(compute_level_idc(3840, 2160), L51);
+        assert_eq!(h264_level_idc_value(L31), 31);
+        assert_eq!(h264_level_idc_value(L40), 40);
+
+        assert_eq!(compute_av1_level(1920, 1080), 8);
+        assert_eq!(compute_av1_level(3840, 2160), STD_VIDEO_AV1_LEVEL_5_1);
+        assert_eq!(compute_av1_level(7680, 4320), STD_VIDEO_AV1_LEVEL_6_0);
+    }
+
+    #[test]
+    fn bitstream_capacity_scales_with_resolution() {
+        // Small frames keep the floor; 4K raises it past a raw NV12 frame.
+        assert_eq!(
+            bitstream_capacity_for(1280, 720, false),
+            BITSTREAM_CAPACITY_FLOOR
+        );
+        assert_eq!(
+            bitstream_capacity_for(3840, 2160, false),
+            3840 * 2160 * 3 / 2
+        );
+        assert_eq!(bitstream_capacity_for(3840, 2160, true), 3840 * 2160 * 3);
+    }
+
+    const GOLDEN_SPS_PPS_720P: &[u8] = &[
+        0, 0, 0, 1, 103, 100, 0, 40, 172, 180, 2, 128, 45, 211, 96, 32, // SPS
+        0, 0, 0, 1, 104, 238, 60, 48, // PPS
+    ];
+    const GOLDEN_SPS_PPS_1918X1078: &[u8] = &[
+        0, 0, 0, 1, 103, 100, 0, 40, 172, 180, 3, 192, 17, 61, 77, 54, 2, // SPS
+        0, 0, 0, 1, 104, 238, 6, 112, 192, // PPS
+    ];
+    const GOLDEN_AV1_SEQ_1080P: &[u8] = &[10, 11, 0, 0, 0, 66, 171, 191, 195, 112, 9, 228, 33];
+}

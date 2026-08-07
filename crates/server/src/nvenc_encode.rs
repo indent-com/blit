@@ -55,6 +55,7 @@ const NV_ENC_RECONFIGURE_PARAMS_VER: u32 = nvencapi_struct_version(1) | (1 << 31
 
 // Buffer formats (from nv-codec-headers 12.1)
 const NV_ENC_BUFFER_FORMAT_NV12: u32 = 0x00000001;
+const NV_ENC_BUFFER_FORMAT_YUV444: u32 = 0x00001000; // planar Y,U,V — NOT 0x10, that's YV12
 const NV_ENC_BUFFER_FORMAT_ARGB: u32 = 0x01000000; // B8G8R8A8 in memory (DRM ARGB8888)
 const NV_ENC_BUFFER_FORMAT_ABGR: u32 = 0x10000000; // R8G8B8A8 in memory (DRM ABGR8888)
 
@@ -312,6 +313,18 @@ const NVENC_LOCK_BITSTREAM_SIZE: usize = 1552;
 /// offset from the start of NV_ENC_CONFIG (encodeCodecConfig itself sits at
 /// 168).  1 = yuv420, 3 = yuv444.
 const NVENC_H264_CHROMA_FORMAT_IDC_OFFSET: usize = 360;
+/// `NV_ENC_CONFIG.encodeCodecConfig.h264Config.h264VUIParameters`, from the
+/// start of NV_ENC_CONFIG.  All four offsets below verified with
+/// offsetof() against nv-codec-headers sdk/12.1 (same header that agrees
+/// with NVENC_CONFIG_SIZE=3584 and chromaFormatIDC=360 above).
+const NVENC_H264_VUI_OFFSET: usize = 240;
+/// Offsets within NV_ENC_CONFIG_H264_VUI_PARAMETERS.
+const NVENC_VUI_VIDEO_SIGNAL_TYPE_PRESENT: usize = 8;
+const NVENC_VUI_VIDEO_FORMAT: usize = 12;
+const NVENC_VUI_VIDEO_FULL_RANGE: usize = 16;
+/// `NV_ENC_CONFIG.encodeCodecConfig.av1Config.colorRange` (0 = studio
+/// swing, 1 = full swing), from the start of NV_ENC_CONFIG.
+const NVENC_AV1_COLOR_RANGE_OFFSET: usize = 248;
 
 fn w32(buf: &mut [u8], off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_ne_bytes());
@@ -366,21 +379,19 @@ pub struct NvencDirectEncoder {
     codec_flag: u8, // SURFACE_FRAME_CODEC_* for the wire protocol
     fns: &'static NvEncFunctionList,
     cuda_ctx: gpu_libs::CUcontext,
-    // CUDA-accelerated input path: device memory + registered NVENC resource.
-    // BGRA (ARGB) buffer — used for BGRA input and the legacy write_input_bgra path.
-    cuda_devptr: gpu_libs::CUdeviceptr,
-    cuda_registered: *mut c_void, // NV_ENC registered resource handle (ARGB format)
-    cuda_pitch: u32,              // pitch in bytes (width * 4 for ARGB)
-    pinned_host: *mut u8,         // page-locked staging buffer
+    // CUDA-accelerated input path: device memory + registered NVENC
+    // resources.  All CPU input is YUV converted host-side (full-range
+    // BT.601) — NVENC's own RGB→YUV conversion is limited-range with no
+    // knob, so no RGB buffer is registered at all.
+    pinned_host: *mut u8, // page-locked staging buffer
     pinned_size: usize,
-    // RGBA (ABGR) buffer — separate device allocation registered as ABGR format,
-    // so NVENC handles RGBA→YUV conversion on the GPU without CPU R/B swaps.
-    cuda_devptr_abgr: gpu_libs::CUdeviceptr,
-    cuda_registered_abgr: *mut c_void,
     // NV12 buffer — semi-planar YUV, height * 1.5 bytes, different size from RGB.
     cuda_devptr_nv12: gpu_libs::CUdeviceptr,
     cuda_registered_nv12: *mut c_void,
     nv12_pitch: u32,
+    /// Session chroma: true = 4:4:4.  Zero-copy buffers must arrive in
+    /// the matching layout (planar YUV444 vs NV12).
+    session_is_444: bool,
     verbose: bool,
     /// Cached SPS+PPS NAL units (Annex B with start codes) from the first
     /// IDR frame.  Prepended to subsequent IDR frames that NVENC emits
@@ -761,6 +772,22 @@ impl NvencDirectEncoder {
             w32(&mut config_buf, NVENC_H264_CHROMA_FORMAT_IDC_OFFSET, 3);
         }
 
+        // Signal full range: every frame blit feeds NVENC is full-range
+        // BT.601 (CPU-converted or the compositor's shaders), and a decoder
+        // told nothing assumes limited — lifting every black to gray.
+        if codec == "h264" {
+            let vui = NVENC_H264_VUI_OFFSET;
+            w32(
+                &mut config_buf,
+                vui + NVENC_VUI_VIDEO_SIGNAL_TYPE_PRESENT,
+                1,
+            );
+            w32(&mut config_buf, vui + NVENC_VUI_VIDEO_FORMAT, 5); // unspecified
+            w32(&mut config_buf, vui + NVENC_VUI_VIDEO_FULL_RANGE, 1);
+        } else {
+            w32(&mut config_buf, NVENC_AV1_COLOR_RANGE_OFFSET, 1);
+        }
+
         // Initialize encoder
         let mut init_buf = vec![0u8; NVENC_INITIALIZE_PARAMS_SIZE];
         w32(&mut init_buf, 0, NV_ENC_INITIALIZE_PARAMS_VER);
@@ -810,102 +837,6 @@ impl NvencDirectEncoder {
         }
         let output_buffer_ptr = rptr(&output_buf, 16); // bitstreamBuffer @ 16
 
-        // Allocate CUDA device memory for input frames.  Using cuMemcpyHtoD
-        // to upload BGRA data is ~100× faster than writing through the PCIe
-        // BAR via nvEncLockInputBuffer (DMA engine vs uncached CPU writes).
-        //
-        // Use cuMemAllocPitch to get a pitch aligned to the GPU's preferred
-        // alignment (typically 256 or 512 bytes).  NVENC's DMA engine reads
-        // entire pitch-aligned rows; an unaligned pitch from cuMemAlloc can
-        // cause the video engine to read garbage bytes at row boundaries.
-        let mut cuda_devptr: gpu_libs::CUdeviceptr = 0;
-        let mut cuda_pitch_bytes: usize = 0;
-        status = unsafe {
-            (cuda.cuMemAllocPitch_v2)(
-                &mut cuda_devptr,
-                &mut cuda_pitch_bytes,
-                (width * 4) as usize, // width in bytes (ARGB = 4 bpp)
-                height as usize,
-                16, // element size hint (4 bytes per pixel, but 16 aligns rows)
-            )
-        };
-        if status != 0 {
-            return Err(format!("cuMemAllocPitch failed: {status}"));
-        }
-        let cuda_pitch = cuda_pitch_bytes as u32;
-        let frame_size = cuda_pitch_bytes * height as usize;
-
-        // Allocate page-locked (pinned) host memory for staging.
-        // cuMemcpyHtoD from pinned memory uses DMA at full PCIe bandwidth;
-        // from pageable memory the driver must pin pages on every call (~60ms
-        // overhead at 1920×1080).
-        //
-        // Size to the pitch-aligned frame so we can write at the aligned
-        // stride directly into pinned memory before the DMA transfer.
-        let mut pinned_host: *mut c_void = ptr::null_mut();
-        status = unsafe { (cuda.cuMemAllocHost_v2)(&mut pinned_host, frame_size) };
-        if status != 0 {
-            unsafe { (cuda.cuMemFree_v2)(cuda_devptr) };
-            return Err(format!("cuMemAllocHost failed: {status}"));
-        }
-
-        // Register the CUDA device memory with NVENC.
-        // NV_ENC_REGISTER_RESOURCE offsets (12.1):
-        //   version=0, resourceType=4, width=8, height=12,
-        //   pitch=16, subResourceIndex=20, resourceToRegister=24(ptr),
-        //   registeredResource=32(ptr), bufferFormat=40, bufferUsage=44
-        let mut reg_buf = vec![0u8; NVENC_REGISTER_RESOURCE_SIZE];
-        w32(&mut reg_buf, 0, NV_ENC_REGISTER_RESOURCE_VER);
-        w32(&mut reg_buf, 4, NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR);
-        w32(&mut reg_buf, 8, width);
-        w32(&mut reg_buf, 12, height);
-        w32(&mut reg_buf, 16, cuda_pitch);
-        // resourceToRegister is a CUdeviceptr (u64) written as a pointer-sized value
-        wptr(&mut reg_buf, 24, cuda_devptr as *mut c_void);
-        w32(&mut reg_buf, 40, NV_ENC_BUFFER_FORMAT_ARGB);
-
-        let nv_status =
-            unsafe { (fns.nvEncRegisterResource)(encoder, reg_buf.as_mut_ptr() as *mut c_void) };
-        if nv_status != NV_ENC_SUCCESS {
-            unsafe { (cuda.cuMemFree_v2)(cuda_devptr) };
-            return Err(format!("nvEncRegisterResource failed: {nv_status}"));
-        }
-        let cuda_registered = rptr(&reg_buf, 32); // registeredResource @ 32
-
-        // --- ABGR (RGBA-in-memory) buffer ---
-        // Same pixel size as ARGB, same pitch-aligned allocation.
-        let mut cuda_devptr_abgr: gpu_libs::CUdeviceptr = 0;
-        let mut abgr_pitch_bytes: usize = 0;
-        status = unsafe {
-            (cuda.cuMemAllocPitch_v2)(
-                &mut cuda_devptr_abgr,
-                &mut abgr_pitch_bytes,
-                (width * 4) as usize,
-                height as usize,
-                16,
-            )
-        };
-        if status != 0 {
-            return Err(format!("cuMemAllocPitch (ABGR) failed: {status}"));
-        }
-        // Pitch should match the ARGB buffer (same width and element size).
-        debug_assert_eq!(abgr_pitch_bytes, cuda_pitch_bytes);
-        let mut reg_abgr = vec![0u8; NVENC_REGISTER_RESOURCE_SIZE];
-        w32(&mut reg_abgr, 0, NV_ENC_REGISTER_RESOURCE_VER);
-        w32(&mut reg_abgr, 4, NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR);
-        w32(&mut reg_abgr, 8, width);
-        w32(&mut reg_abgr, 12, height);
-        w32(&mut reg_abgr, 16, cuda_pitch);
-        wptr(&mut reg_abgr, 24, cuda_devptr_abgr as *mut c_void);
-        w32(&mut reg_abgr, 40, NV_ENC_BUFFER_FORMAT_ABGR);
-        let nv_status =
-            unsafe { (fns.nvEncRegisterResource)(encoder, reg_abgr.as_mut_ptr() as *mut c_void) };
-        if nv_status != NV_ENC_SUCCESS {
-            unsafe { (cuda.cuMemFree_v2)(cuda_devptr_abgr) };
-            return Err(format!("nvEncRegisterResource (ABGR) failed: {nv_status}"));
-        }
-        let cuda_registered_abgr = rptr(&reg_abgr, 32);
-
         // --- NV12 buffer ---
         // Semi-planar: Y plane (width × height) + UV plane (width × height/2).
         // Use cuMemAllocPitch for aligned NV12 pitch (1 byte per Y sample).
@@ -943,9 +874,22 @@ impl NvencDirectEncoder {
         }
         let cuda_registered_nv12 = rptr(&reg_nv12, 32);
 
+        // Allocate page-locked (pinned) host memory for staging planar
+        // uploads.  cuMemcpyHtoD from pinned memory uses DMA at full PCIe
+        // bandwidth; from pageable memory the driver must pin pages on
+        // every call (~60ms overhead at 1920×1080).  Sized generously —
+        // 4 bytes/pixel at the planar pitch covers NV12 (1.5) and
+        // YUV444 (3) with room to spare.
+        let pinned_size = nv12_pitch_bytes * height as usize * 4;
+        let mut pinned_host: *mut c_void = ptr::null_mut();
+        status = unsafe { (cuda.cuMemAllocHost_v2)(&mut pinned_host, pinned_size) };
+        if status != 0 {
+            return Err(format!("cuMemAllocHost failed: {status}"));
+        }
+
         if verbose {
             eprintln!(
-                "[nvenc-direct] initialized {codec} encoder for {width}x{height} pitch={cuda_pitch} nv12_pitch={nv12_pitch} (CUDA upload)"
+                "[nvenc-direct] initialized {codec} encoder for {width}x{height} nv12_pitch={nv12_pitch} (CUDA upload)"
             );
         }
 
@@ -964,16 +908,12 @@ impl NvencDirectEncoder {
             codec_flag,
             fns,
             cuda_ctx: ctx,
-            cuda_devptr,
-            cuda_registered,
-            cuda_pitch,
             pinned_host: pinned_host as *mut u8,
-            pinned_size: frame_size,
-            cuda_devptr_abgr,
-            cuda_registered_abgr,
+            pinned_size,
             cuda_devptr_nv12,
             cuda_registered_nv12,
             nv12_pitch,
+            session_is_444: chroma.is_444(),
             verbose,
             h264_sps_pps: Vec::new(),
             nv12_imports: HashMap::new(),
@@ -1417,13 +1357,31 @@ impl NvencDirectEncoder {
         uv_offset: u32,
         width: u32,
         height: u32,
+        is_444: bool,
         sync_fd: Option<std::os::fd::RawFd>,
     ) -> Option<(Vec<u8>, bool)> {
-        // NVENC's NV12 layout has no independent UV offset: the chroma
-        // plane is assumed to start at exactly stride*height. The compute
-        // shader already writes that layout, so a mismatch means the two
-        // sides have drifted apart and the encode would sample chroma from
-        // the wrong place — better to refuse than to emit wrong colour.
+        // The buffer's format must match the session's chroma: NVENC
+        // rejects (or worse, garbles) a picture whose registered format
+        // disagrees with the encode config.  A mismatch means the server's
+        // target registration and this encoder have drifted apart.
+        if is_444 != self.session_is_444 {
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[nvenc-zerocopy] buffer is_444={is_444} but session is {}; refusing",
+                    if self.session_is_444 { "4:4:4" } else { "4:2:0" },
+                );
+            }
+            return None;
+        }
+        // Neither layout has an independent chroma offset: NVENC assumes
+        // the first chroma plane starts at exactly stride*height (NV12
+        // interleaved UV, or the YUV444 U plane with V one plane later).
+        // The compute shaders write that layout, so a mismatch means the
+        // two sides have drifted apart and the encode would sample chroma
+        // from the wrong place — better to refuse than to emit wrong
+        // colour.
         if uv_offset != stride * height {
             static LOGGED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
@@ -1485,14 +1443,15 @@ impl NvencDirectEncoder {
             return None;
         }
 
-        let registered = match self.nv12_import(cuda, fd, buf_id, stride, height, enc_w, enc_h) {
-            Some(r) => r,
-            None => {
-                let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
-                unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
-                return None;
-            }
-        };
+        let registered =
+            match self.nv12_import(cuda, fd, buf_id, stride, height, enc_w, enc_h, is_444) {
+                Some(r) => r,
+                None => {
+                    let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
+                    unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
+                    return None;
+                }
+            };
 
         // Map, encode, unmap. The registration is cached; the mapping is
         // per-frame, as NVENC requires.
@@ -1519,7 +1478,15 @@ impl NvencDirectEncoder {
         w64(&mut pic_buf, 24, self.frame_idx as u64);
         wptr(&mut pic_buf, 40, mapped_resource);
         wptr(&mut pic_buf, 48, self.output_buffer);
-        w32(&mut pic_buf, 64, NV_ENC_BUFFER_FORMAT_NV12);
+        w32(
+            &mut pic_buf,
+            64,
+            if is_444 {
+                NV_ENC_BUFFER_FORMAT_YUV444
+            } else {
+                NV_ENC_BUFFER_FORMAT_NV12
+            },
+        );
         w32(&mut pic_buf, 68, 1); // NV_ENC_PIC_STRUCT_FRAME
         if self.force_idr {
             // OUTPUT_SPSPPS (0x4) so AV1 keyframes carry the sequence
@@ -1596,6 +1563,7 @@ impl NvencDirectEncoder {
         height: u32,
         enc_w: u32,
         enc_h: u32,
+        is_444: bool,
     ) -> Option<*mut c_void> {
         if let Some(prev) = self.nv12_imports.get(&buf_id) {
             return Some(prev.registered);
@@ -1628,7 +1596,11 @@ impl NvencDirectEncoder {
             }
         }
 
-        let buf_size = (stride as u64) * (height as u64) * 3 / 2;
+        let buf_size = if is_444 {
+            (stride as u64) * (height as u64) * 3
+        } else {
+            (stride as u64) * (height as u64) * 3 / 2
+        };
 
         // CUDA takes ownership of the fd on success, so hand it a dup —
         // the compositor still owns the original and reuses it every frame.
@@ -1676,7 +1648,15 @@ impl NvencDirectEncoder {
         w32(&mut reg_buf, 12, enc_h);
         w32(&mut reg_buf, 16, stride);
         wptr(&mut reg_buf, 24, devptr as *mut c_void);
-        w32(&mut reg_buf, 40, NV_ENC_BUFFER_FORMAT_NV12);
+        w32(
+            &mut reg_buf,
+            40,
+            if is_444 {
+                NV_ENC_BUFFER_FORMAT_YUV444
+            } else {
+                NV_ENC_BUFFER_FORMAT_NV12
+            },
+        );
         let nv_status = unsafe {
             (self.fns.nvEncRegisterResource)(self.encoder, reg_buf.as_mut_ptr() as *mut c_void)
         };
@@ -1689,7 +1669,8 @@ impl NvencDirectEncoder {
 
         if self.verbose {
             eprintln!(
-                "[nvenc-zerocopy] imported NV12 buf_id={buf_id} {enc_w}x{enc_h} stride={stride} size={buf_size}",
+                "[nvenc-zerocopy] imported {} buf_id={buf_id} {enc_w}x{enc_h} stride={stride} size={buf_size}",
+                if is_444 { "YUV444" } else { "NV12" },
             );
         }
         self.nv12_imports.insert(
@@ -1704,281 +1685,6 @@ impl NvencDirectEncoder {
 
     pub fn codec_flag(&self) -> u8 {
         self.codec_flag
-    }
-
-    /// Encode from BGRA with edge-pixel padding for odd dimensions.
-    pub fn encode_bgra_padded(
-        &mut self,
-        bgra: &[u8],
-        src_w: usize,
-        src_h: usize,
-    ) -> Option<(Vec<u8>, bool)> {
-        let t0 = std::time::Instant::now();
-        let enc_w = self.width as usize;
-        let enc_h = self.height as usize;
-        let pitch = self.cuda_pitch as usize; // aligned pitch from cuMemAllocPitch
-        let frame_bytes = pitch * enc_h;
-
-        // Write directly into the pinned staging buffer — avoids an extra
-        // memcpy through a temporary Vec.  Pinned memory is regular RAM
-        // that the CUDA driver has page-locked for fast DMA.
-        //
-        // The pinned buffer uses the pitch-aligned stride so the layout
-        // matches the device allocation exactly.
-        assert!(frame_bytes <= self.pinned_size);
-        let dst = self.pinned_host;
-
-        // Always write row-by-row because the destination pitch (aligned)
-        // will generally differ from the source stride (width * 4).
-        let src_row_bytes = src_w * 4;
-        let copy_bytes = (enc_w.min(src_w)) * 4;
-        for row in 0..enc_h {
-            let sr = row.min(src_h.saturating_sub(1));
-            let src_start = sr * src_row_bytes;
-            let dst_off = row * pitch;
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    bgra.as_ptr().add(src_start),
-                    dst.add(dst_off),
-                    copy_bytes,
-                );
-            }
-            // If the encoder width exceeds the source, replicate the last
-            // source pixel across padding columns.
-            if enc_w > src_w {
-                let last = unsafe {
-                    std::slice::from_raw_parts(bgra.as_ptr().add(src_start + (src_w - 1) * 4), 4)
-                };
-                for col in src_w..enc_w {
-                    let off = dst_off + col * 4;
-                    unsafe { ptr::copy_nonoverlapping(last.as_ptr(), dst.add(off), 4) };
-                }
-            }
-            // Zero any trailing padding bytes between enc_w*4 and pitch.
-            let used = enc_w * 4;
-            if used < pitch {
-                unsafe { ptr::write_bytes(dst.add(dst_off + used), 0, pitch - used) };
-            }
-        }
-
-        let t_write = t0.elapsed();
-
-        // --- Single CUDA context scope for upload + encode ---
-        // Keeping the context pushed through both the DMA transfer and the
-        // NVENC encode ensures the video engine sees the completed writes.
-        let result = self.upload_and_encode(
-            self.cuda_devptr,
-            self.cuda_registered,
-            NV_ENC_BUFFER_FORMAT_ARGB,
-            frame_bytes,
-        );
-
-        let t_total = t0.elapsed();
-        if t_total.as_millis() > 50 && self.verbose {
-            eprintln!(
-                "[nvenc-timing] {}x{} (src {}x{}) write={:.1}ms encode={:.1}ms total={:.1}ms",
-                self.width,
-                self.height,
-                src_w,
-                src_h,
-                t_write.as_secs_f64() * 1000.0,
-                (t_total - t_write).as_secs_f64() * 1000.0,
-                t_total.as_secs_f64() * 1000.0,
-            );
-        }
-        result
-    }
-
-    /// Unified upload → sync → encode pipeline.
-    ///
-    /// Keeps the CUDA context pushed through the entire sequence so that
-    /// the NVENC video engine is guaranteed to see the completed DMA
-    /// transfer.  All error paths clean up properly (unmap, pop context).
-    fn upload_and_encode(
-        &mut self,
-        devptr: gpu_libs::CUdeviceptr,
-        registered: *mut c_void,
-        buf_fmt: u32,
-        upload_bytes: usize,
-    ) -> Option<(Vec<u8>, bool)> {
-        let pitch = self.cuda_pitch;
-        let cuda = crate::gpu_libs::cuda().expect("CUDA loaded during init");
-
-        // Push CUDA context — stays active until the very end.
-        unsafe { (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx) };
-
-        // Upload pinned host → device.
-        let status = unsafe {
-            (cuda.cuMemcpyHtoD_v2)(devptr, self.pinned_host as *const c_void, upload_bytes)
-        };
-        if status != 0 {
-            eprintln!("[nvenc-direct] cuMemcpyHtoD failed: {status}");
-            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
-            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
-            return None;
-        }
-
-        // Belt-and-suspenders: drain the default stream so the DMA is
-        // fully complete before NVENC's video engine reads the buffer.
-        unsafe { (cuda.cuStreamSynchronize)(ptr::null_mut()) };
-
-        // Map the registered CUDA resource for NVENC input.
-        let mut map_buf = vec![0u8; NVENC_MAP_INPUT_RESOURCE_SIZE];
-        w32(&mut map_buf, 0, NV_ENC_MAP_INPUT_RESOURCE_VER);
-        wptr(&mut map_buf, 16, registered);
-
-        let status = unsafe {
-            (self.fns.nvEncMapInputResource)(self.encoder, map_buf.as_mut_ptr() as *mut c_void)
-        };
-        if status != NV_ENC_SUCCESS {
-            eprintln!("[nvenc-direct] nvEncMapInputResource failed: {status}");
-            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
-            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
-            return None;
-        }
-        let mapped_resource = rptr(&map_buf, 24);
-
-        // NV_ENC_PIC_PARAMS offsets (from nv-codec-headers 12.1):
-        //   version=0, inputWidth=4, inputHeight=8, inputPitch=12,
-        //   encodePicFlags=16, frameIdx=20, inputTimestamp=24(u64),
-        //   inputBuffer=40(ptr), outputBitstream=48(ptr),
-        //   bufferFmt=64, pictureStruct=68, pictureType=72
-        let mut pic_buf = vec![0u8; NVENC_PIC_PARAMS_SIZE];
-        w32(&mut pic_buf, 0, NV_ENC_PIC_PARAMS_VER);
-        w32(&mut pic_buf, 4, self.width);
-        w32(&mut pic_buf, 8, self.height);
-        w32(&mut pic_buf, 12, pitch);
-        w32(&mut pic_buf, 20, self.frame_idx);
-        w64(&mut pic_buf, 24, self.frame_idx as u64);
-        wptr(&mut pic_buf, 40, mapped_resource);
-        wptr(&mut pic_buf, 48, self.output_buffer);
-        w32(&mut pic_buf, 64, buf_fmt);
-        w32(&mut pic_buf, 68, 1); // NV_ENC_PIC_STRUCT_FRAME
-
-        if self.force_idr {
-            w32(&mut pic_buf, 16, NV_ENC_PIC_FLAGS_FORCEIDR | 0x4);
-            w32(&mut pic_buf, 72, NV_ENC_PIC_TYPE_IDR);
-        }
-
-        self.frame_idx += 1;
-
-        let status = unsafe {
-            (self.fns.nvEncEncodePicture)(self.encoder, pic_buf.as_mut_ptr() as *mut c_void)
-        };
-
-        // On any encode failure, clean up mapped resource and context.
-        if status != NV_ENC_SUCCESS {
-            unsafe { (self.fns.nvEncUnmapInputResource)(self.encoder, mapped_resource) };
-            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
-            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
-            if status != NV_ENC_ERR_NEED_MORE_INPUT {
-                eprintln!("[nvenc-direct] nvEncEncodePicture failed: {status}");
-            }
-            // force_idr stays true — next call retries.
-            return None;
-        }
-        // Encode succeeded — safe to clear the IDR request.
-        self.force_idr = false;
-
-        // Lock and read bitstream.
-        let mut lock_buf = vec![0u8; NVENC_LOCK_BITSTREAM_SIZE];
-        w32(&mut lock_buf, 0, NV_ENC_LOCK_BITSTREAM_VER);
-        wptr(&mut lock_buf, 8, self.output_buffer);
-
-        let status = unsafe {
-            (self.fns.nvEncLockBitstream)(self.encoder, lock_buf.as_mut_ptr() as *mut c_void)
-        };
-        if status != NV_ENC_SUCCESS {
-            eprintln!("[nvenc-direct] nvEncLockBitstream failed: {status}");
-            unsafe { (self.fns.nvEncUnmapInputResource)(self.encoder, mapped_resource) };
-            let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
-            unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
-            return None;
-        }
-
-        let size = r32(&lock_buf, 36) as usize;
-        let buf_ptr = rptr(&lock_buf, 56) as *const u8;
-        let nal_data = if !buf_ptr.is_null() && size > 0 {
-            unsafe { std::slice::from_raw_parts(buf_ptr, size) }.to_vec()
-        } else {
-            Vec::new()
-        };
-
-        let is_idr = self.is_keyframe_pic_type(r32(&lock_buf, 64));
-
-        unsafe { (self.fns.nvEncUnlockBitstream)(self.encoder, self.output_buffer) };
-
-        // Unmap the CUDA input resource.
-        unsafe { (self.fns.nvEncUnmapInputResource)(self.encoder, mapped_resource) };
-
-        // Pop CUDA context.
-        let mut dummy_ctx: gpu_libs::CUcontext = ptr::null_mut();
-        unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy_ctx) };
-
-        if nal_data.is_empty() {
-            None
-        } else {
-            let mut nal_data = nal_data;
-            self.ensure_h264_sps_pps(&mut nal_data, is_idr);
-            Some((nal_data, is_idr))
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // RGBA (ABGR) path — avoids CPU R/B swap
-    // -----------------------------------------------------------------------
-
-    /// Encode from RGBA with edge-pixel padding for odd dimensions.
-    /// Uploads to the ABGR-registered CUDA buffer so NVENC does the
-    /// RGBA→YUV conversion on the GPU — no CPU colorspace conversion.
-    pub fn encode_rgba_padded(
-        &mut self,
-        rgba: &[u8],
-        src_w: usize,
-        src_h: usize,
-    ) -> Option<(Vec<u8>, bool)> {
-        let enc_w = self.width as usize;
-        let enc_h = self.height as usize;
-        let pitch = self.cuda_pitch as usize;
-        let frame_bytes = pitch * enc_h;
-
-        assert!(frame_bytes <= self.pinned_size);
-        let dst = self.pinned_host;
-
-        let src_row_bytes = src_w * 4;
-        let copy_bytes = (enc_w.min(src_w)) * 4;
-        for row in 0..enc_h {
-            let sr = row.min(src_h.saturating_sub(1));
-            let src_start = sr * src_row_bytes;
-            let dst_off = row * pitch;
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    rgba.as_ptr().add(src_start),
-                    dst.add(dst_off),
-                    copy_bytes,
-                );
-            }
-            if enc_w > src_w {
-                let last = unsafe {
-                    std::slice::from_raw_parts(rgba.as_ptr().add(src_start + (src_w - 1) * 4), 4)
-                };
-                for col in src_w..enc_w {
-                    let off = dst_off + col * 4;
-                    unsafe { ptr::copy_nonoverlapping(last.as_ptr(), dst.add(off), 4) };
-                }
-            }
-            let used = enc_w * 4;
-            if used < pitch {
-                unsafe { ptr::write_bytes(dst.add(dst_off + used), 0, pitch - used) };
-            }
-        }
-
-        self.upload_and_encode(
-            self.cuda_devptr_abgr,
-            self.cuda_registered_abgr,
-            NV_ENC_BUFFER_FORMAT_ABGR,
-            frame_bytes,
-        )
     }
 
     // -----------------------------------------------------------------------
@@ -2058,20 +1764,34 @@ impl NvencDirectEncoder {
     /// NV12-specific upload+encode.  Uses nv12_pitch for the encode params
     /// since NV12 has a different pitch from the RGBA buffers.
     fn upload_and_encode_nv12(&mut self, upload_bytes: usize) -> Option<(Vec<u8>, bool)> {
+        self.upload_and_encode_planar(
+            upload_bytes,
+            self.cuda_devptr_nv12,
+            self.cuda_registered_nv12,
+            NV_ENC_BUFFER_FORMAT_NV12,
+        )
+    }
+
+    /// Upload `upload_bytes` of pinned staging into `devptr` and encode it
+    /// through `registered` with `fmt`.  All planar YUV inputs share
+    /// `nv12_pitch` (1 byte per sample at the same width and alignment).
+    fn upload_and_encode_planar(
+        &mut self,
+        upload_bytes: usize,
+        devptr: gpu_libs::CUdeviceptr,
+        registered: *mut c_void,
+        fmt: u32,
+    ) -> Option<(Vec<u8>, bool)> {
         let pitch = self.nv12_pitch;
         let cuda = crate::gpu_libs::cuda().expect("CUDA loaded during init");
 
         unsafe { (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx) };
 
         let status = unsafe {
-            (cuda.cuMemcpyHtoD_v2)(
-                self.cuda_devptr_nv12,
-                self.pinned_host as *const c_void,
-                upload_bytes,
-            )
+            (cuda.cuMemcpyHtoD_v2)(devptr, self.pinned_host as *const c_void, upload_bytes)
         };
         if status != 0 {
-            eprintln!("[nvenc-direct] cuMemcpyHtoD (NV12) failed: {status}");
+            eprintln!("[nvenc-direct] cuMemcpyHtoD (fmt={fmt:#x}) failed: {status}");
             let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
             unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
             return None;
@@ -2079,16 +1799,16 @@ impl NvencDirectEncoder {
 
         unsafe { (cuda.cuStreamSynchronize)(ptr::null_mut()) };
 
-        // Map the registered NV12 resource.
+        // Map the registered resource.
         let mut map_buf = vec![0u8; NVENC_MAP_INPUT_RESOURCE_SIZE];
         w32(&mut map_buf, 0, NV_ENC_MAP_INPUT_RESOURCE_VER);
-        wptr(&mut map_buf, 16, self.cuda_registered_nv12);
+        wptr(&mut map_buf, 16, registered);
 
         let status = unsafe {
             (self.fns.nvEncMapInputResource)(self.encoder, map_buf.as_mut_ptr() as *mut c_void)
         };
         if status != NV_ENC_SUCCESS {
-            eprintln!("[nvenc-direct] nvEncMapInputResource (NV12) failed: {status}");
+            eprintln!("[nvenc-direct] nvEncMapInputResource (fmt={fmt:#x}) failed: {status}");
             let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
             unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
             return None;
@@ -2104,7 +1824,7 @@ impl NvencDirectEncoder {
         w64(&mut pic_buf, 24, self.frame_idx as u64);
         wptr(&mut pic_buf, 40, mapped_resource);
         wptr(&mut pic_buf, 48, self.output_buffer);
-        w32(&mut pic_buf, 64, NV_ENC_BUFFER_FORMAT_NV12);
+        w32(&mut pic_buf, 64, fmt);
         w32(&mut pic_buf, 68, 1);
 
         if self.force_idr {
@@ -2122,7 +1842,7 @@ impl NvencDirectEncoder {
             let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
             unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
             if status != NV_ENC_ERR_NEED_MORE_INPUT {
-                eprintln!("[nvenc-direct] nvEncEncodePicture (NV12) failed: {status}");
+                eprintln!("[nvenc-direct] nvEncEncodePicture (fmt={fmt:#x}) failed: {status}");
             }
             return None;
         }
@@ -2136,7 +1856,7 @@ impl NvencDirectEncoder {
             (self.fns.nvEncLockBitstream)(self.encoder, lock_buf.as_mut_ptr() as *mut c_void)
         };
         if status != NV_ENC_SUCCESS {
-            eprintln!("[nvenc-direct] nvEncLockBitstream (NV12) failed: {status}");
+            eprintln!("[nvenc-direct] nvEncLockBitstream (fmt={fmt:#x}) failed: {status}");
             unsafe { (self.fns.nvEncUnmapInputResource)(self.encoder, mapped_resource) };
             let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
             unsafe { (cuda.cuCtxPopCurrent_v2)(&mut dummy) };
@@ -2231,12 +1951,6 @@ impl Drop for NvencDirectEncoder {
             if let Ok(cuda) = gpu_libs::cuda() {
                 (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx);
             }
-            if !self.cuda_registered.is_null() {
-                (self.fns.nvEncUnregisterResource)(self.encoder, self.cuda_registered);
-            }
-            if !self.cuda_registered_abgr.is_null() {
-                (self.fns.nvEncUnregisterResource)(self.encoder, self.cuda_registered_abgr);
-            }
             if !self.cuda_registered_nv12.is_null() {
                 (self.fns.nvEncUnregisterResource)(self.encoder, self.cuda_registered_nv12);
             }
@@ -2257,12 +1971,6 @@ impl Drop for NvencDirectEncoder {
             if let Ok(cuda) = gpu_libs::cuda() {
                 if !self.pinned_host.is_null() {
                     (cuda.cuMemFreeHost)(self.pinned_host as *mut c_void);
-                }
-                if self.cuda_devptr != 0 {
-                    (cuda.cuMemFree_v2)(self.cuda_devptr);
-                }
-                if self.cuda_devptr_abgr != 0 {
-                    (cuda.cuMemFree_v2)(self.cuda_devptr_abgr);
                 }
                 if self.cuda_devptr_nv12 != 0 {
                     (cuda.cuMemFree_v2)(self.cuda_devptr_nv12);

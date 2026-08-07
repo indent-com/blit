@@ -28,6 +28,15 @@ use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_man
     self, WpFractionalScaleManagerV1,
 };
 use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_v1::WpFractionalScaleV1;
+use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_manager_v1::{
+    self, WpLinuxDrmSyncobjManagerV1,
+};
+use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1::{
+    self, WpLinuxDrmSyncobjSurfaceV1,
+};
+use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_timeline_v1::{
+    self, WpLinuxDrmSyncobjTimelineV1,
+};
 use wayland_protocols::wp::presentation_time::server::wp_presentation::{
     self, WpPresentation,
 };
@@ -171,6 +180,12 @@ pub enum PixelData {
         uv_offset: u32,
         width: u32,
         height: u32,
+        /// Plane layout: false = NV12 (Y + interleaved half-height UV at
+        /// `uv_offset`); true = planar YUV444 (U at `uv_offset`, V one
+        /// full plane later).  The consumer must register the matching
+        /// NVENC buffer format — a mismatch reads chroma from the wrong
+        /// rows and NVENC rejects or garbles the picture.
+        is_444: bool,
         /// sync_file exported from the fence guarding the BGRA→NV12 compute
         /// dispatch. The consumer MUST poll this before reading: nothing
         /// else orders CUDA's reads against the compositor's writes, and an
@@ -540,6 +555,13 @@ pub enum CompositorEvent {
         /// stamp surface frames with the source's presentation timing
         /// rather than the (jittery) encode-delivery wall clock.
         timestamp_ms: u32,
+        /// This frame is for the pixel cache only — an on-demand BGRA
+        /// readback published while an NV12 zero-copy stream owns the
+        /// same key.  Encoders must not consume it: it would re-encode
+        /// a frame the stream already has, through NVENC's own ARGB
+        /// conversion whose rounding differs from the zero-copy
+        /// shader's — a visible one-frame shift for pure waste.
+        encoder_skip: bool,
     },
     /// A compositor-resident encoder produced a bitstream for one client.
     /// Carries its own timestamp for the same reason `SurfaceCommit` does.
@@ -708,6 +730,10 @@ pub enum CompositorCommand {
         native_w: u32,
         native_h: u32,
         want_nv12_opaque: bool,
+        /// With `want_nv12_opaque`: the layout the consuming session
+        /// expects — planar YUV444 for a 4:4:4 NVENC session, NV12
+        /// otherwise.  Ignored when `want_nv12_opaque` is false.
+        opaque_is_444: bool,
     },
     /// Re-stamp an already-registered target with the composite size it is
     /// now the right inscription of, without touching its buffers.
@@ -748,6 +774,13 @@ pub enum CompositorCommand {
         width: u32,
         height: u32,
         is_444: bool,
+        /// Minimum microseconds between encodes for this session — the
+        /// subscriber's frame interval.  The compositor composites at
+        /// commit rate, which can exceed what the client consumes; every
+        /// encoded-but-undelivered frame breaks the delta chain, so frames
+        /// that would be skipped must be skipped *before* encoding.
+        /// 0 = encode every composite.
+        min_interval_us: u32,
     },
     /// Retarget one client's encoder quantizer without rebuilding it.
     SetVulkanEncoderQp {
@@ -795,6 +828,16 @@ pub(crate) struct Surface {
     /// Where this surface accepts pointer input, in surface-local
     /// coordinates. `None` is the default: all of it.
     input_region: Option<Vec<RegionOp>>,
+
+    // explicit sync (wp_linux_drm_syncobj_v1) — double-buffered per
+    // commit, meaningful only alongside a newly attached buffer.
+    pending_acquire_point: Option<crate::drm_syncobj::SyncPoint>,
+    pending_release_point: Option<crate::drm_syncobj::SyncPoint>,
+    /// The surface's syncobj object; its existence obliges every buffer
+    /// commit to carry both sync points.
+    syncobj_surface: Option<
+        wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
+    >,
 
     // subsurface
     pub parent_surface_id: Option<ObjectId>,
@@ -1057,6 +1100,34 @@ struct XdgToplevelData {
 struct XdgPopupData {
     wl_surface_id: ObjectId,
 }
+/// A client buffer the compositor still holds — plus the explicit-sync
+/// release point to signal when the hold ends, for clients on
+/// `wp_linux_drm_syncobj_v1`.
+struct HeldBuffer {
+    buf: WlBuffer,
+    release: Option<crate::drm_syncobj::SyncPoint>,
+}
+
+/// A committed dma-buf waiting for its explicit-sync acquire point.
+struct AwaitingBuffer {
+    buf: WlBuffer,
+    scale: i32,
+    is_cursor: bool,
+    acquire: crate::drm_syncobj::SyncPoint,
+    release: Option<crate::drm_syncobj::SyncPoint>,
+}
+
+impl AwaitingBuffer {
+    /// Discard without ever reading: the client gets both the wl_buffer
+    /// release and the release-point signal immediately.
+    fn discard(self) {
+        self.buf.release();
+        if let Some(r) = self.release {
+            r.signal();
+        }
+    }
+}
+
 struct SubsurfaceData {
     wl_surface_id: ObjectId,
     parent_surface_id: ObjectId,
@@ -1350,9 +1421,11 @@ struct Compositor {
     /// width, height)`.  Each render of one surface can produce
     /// several frames — one per registered per-client encoder target
     /// size — and each lands here as its own entry so the server sees
-    /// one `SurfaceCommit` per target.  Value is `(log_w, log_h, pixels)`
-    /// where the logicals are derived from the per-target physical size.
-    pending_commits: HashMap<(u16, u32, u32), (u32, u32, PixelData)>,
+    /// one `SurfaceCommit` per target.  Value is `(log_w, log_h, pixels,
+    /// encoder_skip)` where the logicals are derived from the per-target
+    /// physical size.
+    #[allow(clippy::type_complexity)]
+    pending_commits: HashMap<(u16, u32, u32), (u32, u32, PixelData, bool)>,
     /// Bitstreams from compositor-resident encoders awaiting the next
     /// flush.  Kept apart from `pending_commits` because these are owned
     /// by one client each and must never be coalesced by target size.
@@ -1480,7 +1553,18 @@ struct Compositor {
     /// fence not ready).  We hold the `WlBuffer` alive so the client
     /// cannot reuse it while the GPU texture still references the fd.
     /// Released when the surface commits a new buffer or is destroyed.
-    held_buffers: HashMap<ObjectId, WlBuffer>,
+    held_buffers: HashMap<ObjectId, HeldBuffer>,
+    /// Explicit-sync device, when the render node supports timeline
+    /// syncobjs; gates the `wp_linux_drm_syncobj_v1` global.
+    syncobj_device: Option<std::sync::Arc<crate::drm_syncobj::DrmSyncobjDevice>>,
+    /// Imported client timelines by protocol object id.  Pending sync
+    /// points hold `Arc` clones, so dropping an entry never invalidates
+    /// a point already attached to a commit.
+    syncobj_timelines: HashMap<ObjectId, std::sync::Arc<crate::drm_syncobj::SyncobjTimeline>>,
+    /// Committed buffers whose acquire point has not signalled yet.  The
+    /// previous buffer stays current until promotion; a newer commit
+    /// discards the waiting one unread (signalling its release point).
+    awaiting_acquire: HashMap<ObjectId, AwaitingBuffer>,
 
     // -- Cursor pixel cache --
     /// CPU-accessible RGBA pixels for cursor surfaces.  Cursors aren't
@@ -1750,16 +1834,17 @@ impl Compositor {
         // in a deterministic sequence.
         let now_ms = elapsed_ms();
         #[allow(clippy::type_complexity)]
-        let mut entries: Vec<((u16, u32, u32), (u32, u32, PixelData))> =
+        let mut entries: Vec<((u16, u32, u32), (u32, u32, PixelData, bool))> =
             self.pending_commits.drain().collect();
         entries.sort_by_key(|((sid, w, h), _)| (*sid, *w, *h));
-        for ((surface_id, width, height), (_log_w, _log_h, pixels)) in entries {
+        for ((surface_id, width, height), (_log_w, _log_h, pixels, encoder_skip)) in entries {
             let _ = self.event_tx.send(CompositorEvent::SurfaceCommit {
                 surface_id,
                 width,
                 height,
                 pixels,
                 timestamp_ms: now_ms,
+                encoder_skip,
             });
         }
         // Emitted after the commits so a client that owns a compositor
@@ -1917,9 +2002,11 @@ impl Compositor {
             Some(sid) => sid,
             None => {
                 // No toplevel yet — release any held DMA-BUF buffer since
-                // no compositing will run to consume it.
+                // no compositing will run to consume it.  Still fence-gated:
+                // an earlier composite (before the toplevel went away) may
+                // be in flight over its import.
                 if let Some(held) = self.held_buffers.remove(surface_id) {
-                    held.release();
+                    self.release_held(held);
                 }
                 // Fire any pending frame callbacks so the client doesn't
                 // stall.
@@ -1959,7 +2046,16 @@ impl Compositor {
             // buffer stays held — see the release below.  Recorded against
             // the toplevel whose recomposite consumes it so the drain
             // releases exactly what it read.
-            if self.held_buffers.contains_key(surface_id) {
+            //
+            // Not when this commit parked on its acquire point, though —
+            // same gate as the inline release below: the held buffer is
+            // then still the surface's *displayed* content, and the drain
+            // releasing it would hand it (and its release point) back
+            // mid-use.  The parked buffer's promotion supersedes and
+            // releases it instead.
+            if self.held_buffers.contains_key(surface_id)
+                && !self.awaiting_acquire.contains_key(surface_id)
+            {
                 self.deferred_buffer_holds
                     .entry(toplevel_sid)
                     .or_default()
@@ -1988,16 +2084,24 @@ impl Compositor {
         // Only once something has actually read it, though.  A DMA-BUF is
         // imported, not copied, so `held_buffers` is what stops the client
         // drawing over pixels the compositor still needs (see
-        // `apply_pending_state`).  On the non-deferred path the submit above
-        // has already queued the read and implicit DMA-BUF fencing makes the
-        // client's next write wait on it — releasing here is safe because
-        // the GPU is the one holding the line.  A deferred commit has queued
-        // no GPU work at all, so there is no fence to wait on: release here
-        // and the client is free to redraw into the buffer the recomposite
-        // is about to read, which lands a torn or wrong-frame composite.  So
-        // keep holding, and let the drain release it once it has read.
-        if !deferred && let Some(held) = self.held_buffers.remove(surface_id) {
-            held.release();
+        // `apply_pending_state`).  "Read" means the submit's fence has
+        // signalled: this used to release as soon as the read was *queued*,
+        // trusting implicit DMA-BUF fencing to hold the client's next write
+        // behind it — which NVIDIA's Vulkan driver does not honor, so a
+        // video overlay's recycled buffer got redrawn mid-read and the
+        // composite showed a future frame.  A deferred commit has queued no
+        // GPU work at all: keep holding, and let the drain release it once
+        // the recomposite has read.
+        // Not when the commit parked on its acquire point, though: nothing
+        // superseded the held buffer — it is still the surface's displayed
+        // content and future composites keep sampling it until the parked
+        // buffer promotes.  Releasing it here handed it (and its release
+        // point) back mid-use.
+        if !deferred
+            && !self.awaiting_acquire.contains_key(surface_id)
+            && let Some(held) = self.held_buffers.remove(surface_id)
+        {
+            self.release_held(held);
         }
 
         // Fire frame callbacks after processing a commit so clients can
@@ -2165,9 +2269,9 @@ impl Compositor {
         if let Some((nw, nh, nlog_w, nlog_h)) = native {
             self.pending_native_sizes
                 .insert(toplevel_sid, (nw, nh, nlog_w, nlog_h));
-        } else if let Some((sid, nw, nh, _)) = composited
+        } else if let Some((sid, nw, nh, _, _)) = composited
             .iter()
-            .max_by_key(|(_, w, h, _)| (*w as u64) * (*h as u64))
+            .max_by_key(|(_, w, h, _, _)| (*w as u64) * (*h as u64))
         {
             let nlog_w = (nw * 120).div_ceil(s120_u32);
             let nlog_h = (nh * 120).div_ceil(s120_u32);
@@ -2175,7 +2279,7 @@ impl Compositor {
                 .insert(*sid, (*nw, *nh, nlog_w, nlog_h));
         }
 
-        for (result_sid, w, h, pixels) in composited {
+        for (result_sid, w, h, pixels, encoder_skip) in composited {
             if pixels.is_empty() {
                 continue;
             }
@@ -2222,7 +2326,7 @@ impl Compositor {
             let log_w = (w * 120).div_ceil(s120_u32);
             let log_h = (h * 120).div_ceil(s120_u32);
             self.pending_commits
-                .insert((result_sid, w, h), (log_w, log_h, pixels));
+                .insert((result_sid, w, h), (log_w, log_h, pixels, encoder_skip));
         }
     }
 
@@ -2352,6 +2456,83 @@ impl Compositor {
     /// to composite.  The Vulkan renderer imports DMA-BUFs on the GPU
     /// and handles vendor-specific tiled layouts (NVIDIA, AMD) natively
     /// — CPU mmap of such buffers would produce garbage or block.
+    /// Install any parked commit whose explicit-sync acquire point has
+    /// signalled, and recomposite the toplevel it belongs to.  Runs every
+    /// loop pass; the loop shortens its poll timeout while anything waits
+    /// so a point signalled between Wayland events lands within ~1 ms.
+    fn promote_ready_acquires(&mut self) {
+        if self.awaiting_acquire.is_empty() {
+            return;
+        }
+        let ready: Vec<ObjectId> = self
+            .awaiting_acquire
+            .iter()
+            .filter(|(_, a)| a.acquire.signaled())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for surface_id in ready {
+            let Some(a) = self.awaiting_acquire.remove(&surface_id) else {
+                continue;
+            };
+            self.commit_buffer(&surface_id, a.buf, a.scale, a.is_cursor, a.release);
+            let (root_id, toplevel_sid) = self.find_toplevel_root(&surface_id);
+            let Some(tl) = toplevel_sid else {
+                // No toplevel resolves (destroyed while this commit was
+                // parked, or a role-less surface): no composite will ever
+                // read the buffer `commit_buffer` just held.  Release it —
+                // and signal its release point — exactly like
+                // `handle_surface_commit`'s no-toplevel branch; holding on
+                // starves the client's buffer pool, and an explicit-sync
+                // client waiting on that release point wedges outright.
+                if let Some(held) = self.held_buffers.remove(&surface_id) {
+                    self.release_held(held);
+                }
+                continue;
+            };
+            // Mirror handle_surface_commit's tail exactly.  Routing every
+            // promoted frame through the cache-refill recomposite queue
+            // instead would serialize to one toplevel per loop pass AND
+            // force the native BGRA readback per frame — the copy the
+            // zero-copy path exists to suppress — on a path that runs for
+            // nearly every frame of an explicit-sync client, since those
+            // commit before their GPU work signals.
+            let deferred = self
+                .vulkan_renderer
+                .as_ref()
+                .is_some_and(|vk| vk.would_defer_submit());
+            if deferred {
+                self.pending_recomposite_toplevels.insert(tl, false);
+                if self.held_buffers.contains_key(&surface_id) {
+                    self.deferred_buffer_holds
+                        .entry(tl)
+                        .or_default()
+                        .insert(surface_id.clone());
+                }
+            } else {
+                self.composite_toplevel_into_pending(&root_id, tl, false);
+                if let Some(held) = self.held_buffers.remove(&surface_id) {
+                    self.release_held(held);
+                }
+            }
+        }
+    }
+
+    /// Release a held client buffer, fence-gated on in-flight GPU work,
+    /// signalling its explicit-sync release point at the same moment.
+    fn release_held(&mut self, held: HeldBuffer) {
+        let HeldBuffer { buf, release } = held;
+        let gated = self
+            .vulkan_renderer
+            .as_mut()
+            .is_some_and(|vk| vk.defer_buffer_release(buf.clone(), release.clone()));
+        if !gated {
+            buf.release();
+            if let Some(r) = release {
+                r.signal();
+            }
+        }
+    }
+
     fn apply_pending_state(&mut self, surface_id: &ObjectId) {
         // The size hints are checked against each other here rather than as
         // they arrive: both halves are double-buffered, so a client may raise
@@ -2371,7 +2552,7 @@ impl Compositor {
                 return;
             }
         }
-        let (buffer, scale, is_cursor) = {
+        let (buffer, scale, is_cursor, acquire, release, syncobj_surface) = {
             let Some(surf) = self.surfaces.get_mut(surface_id) else {
                 return;
             };
@@ -2390,14 +2571,124 @@ impl Compositor {
             if let Some(pos) = surf.pending_subsurface_position.take() {
                 surf.subsurface_position = pos;
             }
-            (buffer, scale, surf.is_cursor)
+            (
+                buffer,
+                scale,
+                surf.is_cursor,
+                surf.pending_acquire_point.take(),
+                surf.pending_release_point.take(),
+                surf.syncobj_surface.clone(),
+            )
         };
-        let Some(buf) = buffer else { return };
+        let Some(buf) = buffer else {
+            // Explicit-sync points are per-commit and only meaningful with
+            // a newly attached buffer; stale ones were already taken above.
+            return;
+        };
 
+        // The spec makes an unfenced buffer commit on an explicit-sync
+        // surface a fatal protocol error — but Chromium-family browsers
+        // associate the syncobj surface early and then commit software
+        // raster frames without points during startup, and killing the
+        // connection there is a browser that hangs before its first
+        // window.  Be lenient: treat such commits as unfenced (which SHM
+        // is anyway, and an unfenced dma-buf is no worse than a client
+        // that never bound the protocol), and say so once.
+        let (acquire, release) = if syncobj_surface.is_some()
+            && (acquire.is_none() || release.is_none() || buf.data::<ShmBufferData>().is_some())
+        {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[compositor] explicit-sync surface committed without usable sync points; treating as unfenced (spec says error, lenient for browser startup)",
+                );
+            }
+            // A release point without a usable acquire is still honored so
+            // the client's buffer bookkeeping never wedges.
+            (None, release)
+        } else {
+            (acquire, release)
+        };
+
+        // Explicit sync, acquire side: the buffer's content is not ready
+        // until the acquire point signals, and NVIDIA's Vulkan driver will
+        // not learn that from implicit fencing — sampling early shows the
+        // buffer's *previous* frame.  Prefer a GPU-side wait: export the
+        // point's fence as a sync_file, import it as a semaphore, and let
+        // the next composite submit wait on it — the commit installs
+        // immediately and costs no latency, exactly like a client on
+        // implicit sync with a driver that honors it.  Only when the point
+        // has no fence yet (the client committed before submitting its GPU
+        // work) fall back to parking the commit for the promotion sweep.
+        if let Some(acq) = acquire {
+            if !acq.signaled() {
+                let gpu_waited = acq
+                    .export_sync_file()
+                    .ok()
+                    .and_then(|fd| {
+                        self.vulkan_renderer
+                            .as_mut()
+                            .map(|vk| vk.add_acquire_wait_fd(fd))
+                    })
+                    .unwrap_or(false);
+                if !gpu_waited {
+                    let waiting = AwaitingBuffer {
+                        buf,
+                        scale,
+                        is_cursor,
+                        acquire: acq,
+                        release,
+                    };
+                    if let Some(prev) = self.awaiting_acquire.insert(surface_id.clone(), waiting)
+                    {
+                        // Superseded before its content was ever ready: hand
+                        // everything back immediately, it was never read.
+                        prev.discard();
+                    }
+                    return;
+                }
+            }
+        }
+
+        // This commit installs now — signalled, unfenced, or ordered on
+        // the queue by the GPU-side wait — so it supersedes any older
+        // commit still parked on its acquire point; discard that one the
+        // same way a newer *parked* commit would.  Leaving it in place let
+        // the promotion sweep later install the stale frame over this one
+        // (a fence-less first commit parks, the next fenced one installs
+        // past it, and a first-start burst then regressed to the client's
+        // initial blank frame), and its mere presence made the
+        // post-composite release gate treat this surface as parked,
+        // stranding the buffer installed here.
+        if let Some(stale) = self.awaiting_acquire.remove(surface_id) {
+            stale.discard();
+        }
+
+        self.commit_buffer(surface_id, buf, scale, is_cursor, release);
+    }
+
+    /// Install a committed buffer as the surface's current content.  The
+    /// second half of `apply_pending_state`, split out so a commit parked
+    /// on its explicit-sync acquire point can be installed later.
+    fn commit_buffer(
+        &mut self,
+        surface_id: &ObjectId,
+        buf: WlBuffer,
+        scale: i32,
+        is_cursor: bool,
+        release: Option<crate::drm_syncobj::SyncPoint>,
+    ) {
         // Release any previously held buffer for this surface — the new
-        // commit supersedes it.
+        // commit supersedes it.  Not straight away, though: in-flight GPU
+        // work may still sample its import, implicit dma-buf fencing does
+        // not hold NVIDIA's Vulkan driver off the memory, and a client
+        // with a fast-recycling pool (a video overlay subsurface) redraws
+        // a released buffer within the composite window — the in-flight
+        // composite then shows a *future* frame and the video visibly
+        // jumps back and forth.  Gate the release on the submit's fence.
         if let Some(old) = self.held_buffers.remove(surface_id) {
-            old.release();
+            self.release_held(old);
         }
 
         // Fast path for non-cursor SHM buffers: the client's mmap'd pool
@@ -2462,6 +2753,9 @@ impl Compositor {
                         },
                     );
                     buf.release();
+                    if let Some(r) = release {
+                        r.signal();
+                    }
                     return;
                 }
             }
@@ -2498,14 +2792,23 @@ impl Compositor {
             if pixels.is_dmabuf() {
                 // Hold the wl_buffer alive so the client cannot reuse it
                 // while the GPU texture still references the DMA-BUF fd.
-                self.held_buffers.insert(surface_id.clone(), buf);
+                // The explicit-sync release point travels with the hold and
+                // is signalled at the same fence-gated moment.
+                self.held_buffers
+                    .insert(surface_id.clone(), HeldBuffer { buf, release });
             } else {
                 // SHM buffers are snapshotted into the GPU texture.
                 // Release immediately so the client can reuse the buffer.
                 buf.release();
+                if let Some(r) = release {
+                    r.signal();
+                }
             }
         } else {
             buf.release();
+            if let Some(r) = release {
+                r.signal();
+            }
         }
     }
 
@@ -2648,7 +2951,10 @@ impl Compositor {
                 vk.remove_surface(proto_id);
             }
             if let Some(held) = self.held_buffers.remove(proto_id) {
-                held.release();
+                self.release_held(held);
+            }
+            if let Some(a) = self.awaiting_acquire.remove(proto_id) {
+                a.discard();
             }
             self.forget_pointer_focus(proto_id);
             // A crashed client's popup takes the keyboard with it otherwise:
@@ -3366,12 +3672,14 @@ impl Compositor {
                         // for the native BGRA, which the NVENC zero-copy
                         // path otherwise leaves unpublished.
                         vk.request_native_bgra();
-                        let readable = |v: Vec<(u16, u32, u32, PixelData)>| {
+                        let readable = |v: Vec<(u16, u32, u32, PixelData, bool)>| {
                             // Take the first result we can actually read. A
                             // zero-copy NV12 handle may be in here too, and
                             // `to_rgba` is empty for it by construction —
-                            // it is GPU-only memory.
-                            v.into_iter().find_map(|(_sid, w, h, pixels)| {
+                            // it is GPU-only memory.  encoder_skip is
+                            // irrelevant here: capture IS the CPU-pixel
+                            // consumer the flag protects.
+                            v.into_iter().find_map(|(_sid, w, h, pixels, _skip)| {
                                 let rgba = pixels.to_rgba(w, h);
                                 (!rgba.is_empty()).then_some((w, h, rgba))
                             })
@@ -3499,6 +3807,7 @@ impl Compositor {
                 native_w,
                 native_h,
                 want_nv12_opaque,
+                opaque_is_444,
             } => {
                 if let Some(ref mut vk) = self.vulkan_renderer {
                     vk.register_downscale_target(
@@ -3507,6 +3816,7 @@ impl Compositor {
                         target_h,
                         (native_w, native_h),
                         want_nv12_opaque,
+                        opaque_is_444,
                     );
                 }
                 // See the SetExternalOutputBuffers handler above for
@@ -3568,10 +3878,18 @@ impl Compositor {
                 width,
                 height,
                 is_444,
+                min_interval_us,
             } => {
                 let created = self.vulkan_renderer.as_mut().is_some_and(|vk| {
                     vk.create_vulkan_encoder(
-                        surface_id, client_id, codec, qp, width, height, is_444,
+                        surface_id,
+                        client_id,
+                        codec,
+                        qp,
+                        width,
+                        height,
+                        is_444,
+                        min_interval_us,
                     )
                 });
                 if !created {
@@ -3870,12 +4188,14 @@ fn same_client<R1: Resource, R2: Resource>(a: &R1, b: &R2) -> bool {
 }
 
 fn yuv420_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
-    let y = (y as i32 - 16).max(0);
+    // BT.601 full-range inverse, matching the full-range forward
+    // conversion everywhere in blit (shaders and CPU paths).
+    let y = y as i32;
     let u = u as i32 - 128;
     let v = v as i32 - 128;
-    let r = ((298 * y + 409 * v + 128) >> 8).clamp(0, 255) as u8;
-    let g = ((298 * y - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8;
-    let b = ((298 * y + 516 * u + 128) >> 8).clamp(0, 255) as u8;
+    let r = ((256 * y + 359 * v + 128) >> 8).clamp(0, 255) as u8;
+    let g = ((256 * y - 88 * u - 183 * v + 128) >> 8).clamp(0, 255) as u8;
+    let b = ((256 * y + 454 * u + 128) >> 8).clamp(0, 255) as u8;
     [r, g, b]
 }
 
@@ -3994,6 +4314,9 @@ impl Dispatch<WlCompositor, ()> for Compositor {
                         input_region: None,
                         buffer_scale: 1,
                         is_opaque: false,
+                        pending_acquire_point: None,
+                        pending_release_point: None,
+                        syncobj_surface: None,
                         parent_surface_id: None,
                         pending_subsurface_position: None,
                         subsurface_position: (0, 0),
@@ -4100,7 +4423,10 @@ impl Dispatch<WlSurface, ()> for Compositor {
                     vk.remove_surface(&sid);
                 }
                 if let Some(held) = state.held_buffers.remove(&sid) {
-                    held.release();
+                    state.release_held(held);
+                }
+                if let Some(a) = state.awaiting_acquire.remove(&sid) {
+                    a.discard();
                 }
                 state.forget_pointer_focus(&sid);
                 if let Some(parent_id) = state
@@ -4322,6 +4648,170 @@ impl Dispatch<WlSubcompositor, ()> for Compositor {
 }
 
 // -- wl_subsurface --
+/// User data for a `wp_linux_drm_syncobj_surface_v1`.
+struct SyncobjSurfaceData {
+    wl_surface_id: ObjectId,
+}
+
+impl GlobalDispatch<WpLinuxDrmSyncobjManagerV1, ()> for Compositor {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: wayland_server::New<WpLinuxDrmSyncobjManagerV1>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<WpLinuxDrmSyncobjManagerV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        manager: &WpLinuxDrmSyncobjManagerV1,
+        request: <WpLinuxDrmSyncobjManagerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use wp_linux_drm_syncobj_manager_v1::Request;
+        match request {
+            Request::GetSurface { id, surface } => {
+                let wl_surface_id = surface.id();
+                let exists = state
+                    .surfaces
+                    .get(&wl_surface_id)
+                    .is_some_and(|s| s.syncobj_surface.is_some());
+                if exists {
+                    manager.post_error(
+                        wp_linux_drm_syncobj_manager_v1::Error::SurfaceExists,
+                        "surface already has a syncobj surface",
+                    );
+                    return;
+                }
+                let res = data_init.init(id, SyncobjSurfaceData { wl_surface_id });
+                if let Some(surf) = state.surfaces.get_mut(&res.data::<SyncobjSurfaceData>().unwrap().wl_surface_id) {
+                    surf.syncobj_surface = Some(res);
+                }
+            }
+            Request::ImportTimeline { id, fd } => {
+                let Some(dev) = state.syncobj_device.clone() else {
+                    manager.post_error(
+                        wp_linux_drm_syncobj_manager_v1::Error::InvalidTimeline,
+                        "explicit sync unavailable",
+                    );
+                    return;
+                };
+                match dev.import_timeline(fd) {
+                    Ok(timeline) => {
+                        let res = data_init.init(id, ());
+                        state.syncobj_timelines.insert(res.id(), timeline);
+                    }
+                    Err(e) => {
+                        manager.post_error(
+                            wp_linux_drm_syncobj_manager_v1::Error::InvalidTimeline,
+                            format!("drm syncobj import failed: {e}"),
+                        );
+                    }
+                }
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WpLinuxDrmSyncobjTimelineV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        timeline: &WpLinuxDrmSyncobjTimelineV1,
+        request: <WpLinuxDrmSyncobjTimelineV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use wp_linux_drm_syncobj_timeline_v1::Request;
+        if let Request::Destroy = request {
+            // Pending points hold Arc clones, so dropping the map entry
+            // never invalidates a commit already carrying this timeline.
+            state.syncobj_timelines.remove(&timeline.id());
+        }
+    }
+
+    fn destroyed(state: &mut Self, _: wayland_server::backend::ClientId, res: &WpLinuxDrmSyncobjTimelineV1, _: &()) {
+        state.syncobj_timelines.remove(&res.id());
+    }
+}
+
+impl Dispatch<WpLinuxDrmSyncobjSurfaceV1, SyncobjSurfaceData> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WpLinuxDrmSyncobjSurfaceV1,
+        request: <WpLinuxDrmSyncobjSurfaceV1 as Resource>::Request,
+        data: &SyncobjSurfaceData,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use wp_linux_drm_syncobj_surface_v1::Request;
+        let point_of = |state: &Self, timeline: &WpLinuxDrmSyncobjTimelineV1, hi: u32, lo: u32| {
+            state
+                .syncobj_timelines
+                .get(&timeline.id())
+                .map(|tl| crate::drm_syncobj::SyncPoint {
+                    timeline: tl.clone(),
+                    point: ((hi as u64) << 32) | lo as u64,
+                })
+        };
+        match request {
+            Request::SetAcquirePoint {
+                timeline,
+                point_hi,
+                point_lo,
+            } => {
+                let point = point_of(state, &timeline, point_hi, point_lo);
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                    surf.pending_acquire_point = point;
+                }
+            }
+            Request::SetReleasePoint {
+                timeline,
+                point_hi,
+                point_lo,
+            } => {
+                let point = point_of(state, &timeline, point_hi, point_lo);
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                    surf.pending_release_point = point;
+                }
+            }
+            Request::Destroy => {
+                if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+                    surf.syncobj_surface = None;
+                    surf.pending_acquire_point = None;
+                    surf.pending_release_point = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _: wayland_server::backend::ClientId,
+        _: &WpLinuxDrmSyncobjSurfaceV1,
+        data: &SyncobjSurfaceData,
+    ) {
+        if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
+            surf.syncobj_surface = None;
+            surf.pending_acquire_point = None;
+            surf.pending_release_point = None;
+        }
+    }
+}
+
 impl Dispatch<WlSubsurface, SubsurfaceData> for Compositor {
     fn request(
         state: &mut Self,
@@ -4718,7 +5208,10 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                     vk.remove_surface(wl_surface_id);
                 }
                 if let Some(held) = state.held_buffers.remove(wl_surface_id) {
-                    held.release();
+                    state.release_held(held);
+                }
+                if let Some(a) = state.awaiting_acquire.remove(wl_surface_id) {
+                    a.discard();
                 }
                 if let Some(surf) = state.surfaces.get_mut(wl_surface_id) {
                     let sid = surf.surface_id;
@@ -6737,6 +7230,19 @@ fn run_compositor(
     if has_dmabuf {
         dh.create_global::<Compositor, ZwpLinuxDmabufV1, ()>(4, ());
     }
+    // Explicit sync: only meaningful with DMA-BUF, and only when the
+    // kernel driver supports timeline syncobjs.  Without this global,
+    // NVIDIA clients fall back to implicit fencing the driver does not
+    // implement, and their GPU writes race our sampling.
+    let syncobj_device = if has_dmabuf {
+        crate::drm_syncobj::DrmSyncobjDevice::open(&gpu_device)
+    } else {
+        None
+    };
+    if syncobj_device.is_some() {
+        dh.create_global::<Compositor, WpLinuxDrmSyncobjManagerV1, ()>(1, ());
+        eprintln!("[compositor] explicit sync (wp_linux_drm_syncobj_v1) enabled");
+    }
     dh.create_global::<Compositor, WpViewporter, ()>(1, ());
     dh.create_global::<Compositor, WpFractionalScaleManagerV1, ()>(1, ());
     dh.create_global::<Compositor, ZxdgDecorationManagerV1, ()>(1, ());
@@ -6824,6 +7330,9 @@ fn run_compositor(
         kb_focus_popup: None,
         popup_dismiss_button: None,
         held_buffers: HashMap::new(),
+        syncobj_device,
+        syncobj_timelines: HashMap::new(),
+        awaiting_acquire: HashMap::new(),
         cursor_rgba: HashMap::new(),
     };
 
@@ -6898,6 +7407,7 @@ fn run_compositor(
             .vulkan_renderer
             .as_ref()
             .is_some_and(|vk| vk.has_pending())
+            || !compositor.awaiting_acquire.is_empty()
         {
             std::time::Duration::from_millis(1)
         } else {
@@ -6910,12 +7420,26 @@ fn run_compositor(
             eprintln!("[compositor] event loop error: {e}");
         }
 
+        // Install commits whose explicit-sync acquire points signalled
+        // since the last pass, before the recomposite drain below so their
+        // content reaches this pass's composite.
+        compositor.promote_ready_acquires();
+
         // Check for completed Vulkan GPU work.  This runs independently
         // of surface commits so completed frames are flushed to the
         // server without waiting for the next Wayland event.  One submit
         // can yield multiple results (one per per-client downscale target
         // plus the native composite).
         if let Some(ref mut vk) = compositor.vulkan_renderer {
+            // Deferred submits used to be cleaned up lazily at the next
+            // render, which was fine when they only owned GPU objects.
+            // They now carry client-visible wl_buffer releases and
+            // explicit-sync release points: left undrained across an idle
+            // spell, a client waiting on those points stalls its own GPU
+            // work, which stalls its commits, which is what was keeping
+            // the compositor busy — a standstill no page refresh can
+            // break.  One batched fence probe per pass keeps them moving.
+            vk.drain_deferred_submits();
             let (native, retired) = vk.try_retire_pending();
             if !retired.is_empty() {
                 let s120_u32 = (compositor.output_scale_120 as u32).max(120);
@@ -6943,12 +7467,12 @@ fn run_compositor(
                         .entry(sid)
                         .or_insert((nw, nh, log_w, log_h));
                 }
-                for (sid, w, h, pixels) in retired {
+                for (sid, w, h, pixels, encoder_skip) in retired {
                     let log_w = (w * 120).div_ceil(s120_u32);
                     let log_h = (h * 120).div_ceil(s120_u32);
                     compositor
                         .pending_commits
-                        .insert((sid, w, h), (log_w, log_h, pixels));
+                        .insert((sid, w, h), (log_w, log_h, pixels, encoder_skip));
                 }
             }
         }
@@ -7000,8 +7524,18 @@ fn run_compositor(
             // buffer and this releases the new one it just composited.
             if let Some(surface_ids) = compositor.deferred_buffer_holds.remove(&sid) {
                 for surface_id in surface_ids {
+                    // A commit may have parked on its acquire point since
+                    // this hold was recorded — the held buffer is then the
+                    // surface's displayed content again and must stay held
+                    // until the parked buffer's promotion supersedes it.
+                    if compositor.awaiting_acquire.contains_key(&surface_id) {
+                        continue;
+                    }
                     if let Some(held) = compositor.held_buffers.remove(&surface_id) {
-                        held.release();
+                        // "Read" = the recomposite's fence has signalled,
+                        // not merely submitted — same gating as the inline
+                        // path.
+                        compositor.release_held(held);
                     }
                 }
             }
