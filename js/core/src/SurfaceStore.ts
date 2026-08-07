@@ -879,7 +879,46 @@ export class SurfaceStore {
     const codecString = nul >= 0 ? rawPayload.slice(nul + 1) : null;
     this.encoderNames.set(surfaceId, encoderName);
     if (codecString) {
+      const prev = this.codecStrings.get(surfaceId);
       this.codecStrings.set(surfaceId, codecString);
+      // A rebuilt session can change the stream's level mid-subscription —
+      // resizing a pane across an AV1 level boundary (~2254px wide at
+      // 2094 tall flips av01.0.09M ↔ av01.0.13M) re-announces the codec
+      // string, and a live decoder configured for the lower level rejects
+      // the higher-level stream that follows.  H.264 re-derives its config
+      // from in-band SPS; AV1 has no in-band trigger, so reconfigure here.
+      // The announcement always precedes the new session's opening
+      // keyframe, and pendingKeyframe drops any stale deltas in between.
+      const entry = this.decoders.get(surfaceId);
+      if (
+        prev !== undefined &&
+        prev !== codecString &&
+        entry &&
+        entry.codec === "av1" &&
+        entry.decoder.state === "configured"
+      ) {
+        // Flush first so in-flight frames drain through the output
+        // callback before the reset (same reasoning as the H.264
+        // reconfigure path).
+        entry.decoder.flush().catch(() => {
+          /* flush rejected — decoder likely closed */
+        });
+        try {
+          entry.decoder.configure({
+            codec: codecString,
+            optimizeForLatency: true,
+            colorSpace: FULL_RANGE_BT601,
+          });
+          entry.pendingKeyframe = true;
+        } catch (e) {
+          console.warn(
+            "[blit] surface decoder reconfigure failed:",
+            surfaceId,
+            codecString,
+            e,
+          );
+        }
+      }
     }
   }
 
