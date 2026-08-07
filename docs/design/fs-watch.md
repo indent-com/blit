@@ -272,6 +272,21 @@ before the filter — `$GIT_DIR/info/exclude` lives inside the directory
 `EXCLUDE_GIT` excludes, and the other order would drop the hint that its
 own rules moved.
 
+That holds for the sources outside the tree too, which no hint from inside
+it could ever report: the ancestors' own files, the governing
+`info/exclude` when its gitdir sits above the root, and the user's global
+ignore file (`core.excludesFile`, else `$XDG_CONFIG_HOME/git/ignore`). The
+directory holding each is armed on its own — the _directory_, since a
+watch on a file follows its inode past the rename-over an editor performs
+— and the global one's path comes from the same resolver that reads it, so
+what is watched cannot drift from what is consulted. A parent that is
+itself inside the root is left to the tree's own watch rather than armed
+twice, since `inotify_add_watch` returns the same descriptor for an inode
+already watched and the second arm would remap it. Re-pointing
+`core.excludesFile` in the user's `~/.gitconfig` is not itself watched:
+that would mean a watch on `$HOME`, and the rules it names are what change
+in practice.
+
 Only sources that can actually change a verdict count. An ignore file
 inside an already-excluded directory is never read, because the directory
 is never descended, so writing one is not a rules change and costs
