@@ -820,6 +820,11 @@ export class SurfaceStore {
         `${width}x${height}`,
         isKey ? "key" : "delta",
         `${data.length}B`,
+        "head=" +
+          Array.from(data.slice(0, 24))
+            .map((b) => b.toString(16).padStart(2, "0"))
+            .join(""),
+        "cs=" + this.codecStrings.get(surfaceId),
         e,
       );
       if (entry) entry.pendingKeyframe = true;
