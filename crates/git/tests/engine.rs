@@ -22,16 +22,33 @@ fn temp_dir() -> PathBuf {
     dir.canonicalize().unwrap()
 }
 
-fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .current_dir(dir)
+/// A `git` invocation that sees no configuration but the fixture repo's
+/// own: the developer's `~/.gitconfig` is not part of the fixture, and it
+/// changes what these tests observe. `tag.gpgSign` turns `git tag v1` into
+/// an annotated tag that then fails for want of a message; `diff.algorithm`
+/// and `diff.mnemonicPrefix` rewrite the very bytes the oracle comparisons
+/// against the real CLI diff against (`a/`…`b/` becomes `c/`…`w/`).
+/// Identity is set for the opposite reason — a box with no `user.email`
+/// cannot commit at all.
+fn git_cmd(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        // The same door held open by `-c`, which reaches a child process
+        // through the environment rather than through argv.
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "t@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
         .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .args(args)
-        .output()
-        .expect("run git");
+        .args(args);
+    cmd
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = git_cmd(dir, args).output().expect("run git");
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -62,15 +79,7 @@ fn fixture() -> PathBuf {
 /// Run git and return its stdout (trimmed of a trailing newline), asserting
 /// success — for oracle comparisons against the real CLI.
 fn git_out(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .env("GIT_AUTHOR_NAME", "Test")
-        .env("GIT_AUTHOR_EMAIL", "t@example.com")
-        .env("GIT_COMMITTER_NAME", "Test")
-        .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .args(args)
-        .output()
-        .expect("run git");
+    let out = git_cmd(dir, args).output().expect("run git");
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -107,11 +116,7 @@ fn wait_first_state(handle: &RepoHandle, opts: StateOptions) -> Vec<u8> {
 }
 
 fn rev(dir: &Path, spec: &str) -> GitOid {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .args(["rev-parse", spec])
-        .output()
-        .unwrap();
+    let out = git_cmd(dir, &["rev-parse", spec]).output().unwrap();
     let hex = String::from_utf8(out.stdout).unwrap();
     let mut oid = GIT_OID_NONE;
     for (i, chunk) in hex.trim().as_bytes().chunks(2).enumerate() {
@@ -208,15 +213,7 @@ fn state_snapshot_records() {
 fn op_state_and_special_refs() {
     // Run git expecting failure to be fine (conflicts exit nonzero).
     let git_any = |dir: &Path, args: &[&str]| {
-        let _ = Command::new("git")
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "t@example.com")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "t@example.com")
-            .args(args)
-            .output()
-            .expect("run git");
+        let _ = git_cmd(dir, args).output().expect("run git");
     };
     let state_mirror = |dir: &Path| {
         let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
@@ -2943,16 +2940,7 @@ fn text_patch_matches_git_diff() {
     };
     let theirs = git_out(
         &dir,
-        &[
-            "-c",
-            "diff.noprefix=false",
-            "diff",
-            "-M50%",
-            "--no-color",
-            "-U3",
-            "HEAD~1",
-            "HEAD",
-        ],
+        &["diff", "-M50%", "--no-color", "-U3", "HEAD~1", "HEAD"],
     );
 
     /// Collapse the documented deviations so the comparison is about the
@@ -4568,17 +4556,7 @@ fn worktree_patch_reads_unstaged_content_from_disk() {
 
     // The tracked half against git itself, oids aside: hunk headers included,
     // since a wrong new side gets those wrong too.
-    let theirs = git_out(
-        &dir,
-        &[
-            "-c",
-            "diff.noprefix=false",
-            "diff",
-            "--no-color",
-            "-U3",
-            "HEAD",
-        ],
-    );
+    let theirs = git_out(&dir, &["diff", "--no-color", "-U3", "HEAD"]);
     let mut in_untracked = false;
     let tracked: Vec<String> = ours
         .lines()
