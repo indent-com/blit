@@ -2,6 +2,7 @@ import {
   C2S_ACK,
   C2S_CLIENT_METRICS,
   C2S_CLIPBOARD_SET,
+  C2S_PRIMARY_SET,
   C2S_DISPLAY_RATE,
   C2S_INPUT,
   C2S_KILL,
@@ -625,9 +626,33 @@ export function buildClipboardMessage(
   mimeType: string,
   data: Uint8Array,
 ): Uint8Array {
+  return buildSelectionMessage(C2S_CLIPBOARD_SET, mimeType, data);
+}
+
+/**
+ * Take ownership of PRIMARY, the selection a middle click pastes.
+ *
+ * Sent just before the middle button reaches the surface rather than
+ * whenever the page selection changes: the compositor serves these bytes
+ * itself, so owning PRIMARY continuously would mean permanently displacing
+ * whichever Wayland client the user last selected text in.
+ */
+export function buildPrimaryMessage(
+  mimeType: string,
+  data: Uint8Array,
+): Uint8Array {
+  return buildSelectionMessage(C2S_PRIMARY_SET, mimeType, data);
+}
+
+/** Shared framing for the two selection setters, which differ only in tag. */
+function buildSelectionMessage(
+  tag: number,
+  mimeType: string,
+  data: Uint8Array,
+): Uint8Array {
   const mimeBytes = textEncoder.encode(mimeType);
   const msg = new Uint8Array(7 + mimeBytes.length + data.length);
-  msg[0] = C2S_CLIPBOARD_SET;
+  msg[0] = tag;
   msg[1] = mimeBytes.length & 0xff;
   msg[2] = (mimeBytes.length >> 8) & 0xff;
   msg.set(mimeBytes, 3);

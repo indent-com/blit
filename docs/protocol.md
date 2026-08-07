@@ -371,15 +371,27 @@ update.
 
 ### Primary selection
 
-Middle-click paste reads PRIMARY, a selection the web platform does not
-expose, so the browser can neither fill it nor read it and the clipboard's
-round trip through `CLIPBOARD_SET` has no counterpart here. PRIMARY is
-therefore purely between Wayland clients: when one sets a
-`zwp_primary_selection_source_v1`, the compositor offers it to every bound
-device, and a `receive` is spliced straight to the owning client — the
-compositor never buffers the bytes and never sees them. Selecting text in one
-app and middle-clicking in another works; middle-clicking to paste what the
-browser has does not, and pasting from the browser stays on Ctrl+V.
+Middle-click paste reads PRIMARY, which has two possible owners.
+
+A Wayland client owns it by setting a `zwp_primary_selection_source_v1`: the
+compositor offers it to every bound device and splices a `receive` straight
+through to the owner, never buffering the bytes or seeing them. Selecting
+text in one app and middle-clicking in another works with the browser out of
+the picture entirely.
+
+The browser owns it with `C2S_PRIMARY_SET` (0x33), same framing as
+`CLIPBOARD_SET`. The web platform exposes no PRIMARY to read on demand, so
+the bytes arrive up front and the compositor serves them itself. The
+reference client sends them on the middle press rather than on every
+selection change — the way the clipboard is pushed on paste rather than on
+copy — because owning PRIMARY continuously would permanently displace
+whichever Wayland client the user last selected text in. A middle click with
+nothing selected in the page therefore still pastes that client's selection.
+
+Ownership is exclusive: whichever side claims PRIMARY displaces the other,
+and a displaced Wayland owner is told with `cancelled` so it stops answering
+`receive` from its own buffer. `blit clipboard set --primary` claims it from
+the CLI. Pasting *from* the browser with Ctrl+V remains the clipboard's job.
 
 ### Pointer buttons
 

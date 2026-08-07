@@ -256,6 +256,17 @@ pub const C2S_SURFACE_FOCUS: u8 = 0x24;
 /// Set clipboard content:
 /// [0x25][mime_len:2][mime:N][data_len:4][data:N]
 pub const C2S_CLIPBOARD_SET: u8 = 0x25;
+/// Take ownership of the primary selection (what middle click pastes):
+/// [0x33][mime_len:2][mime:N][data_len:4][data:N]
+///
+/// Same framing as [`C2S_CLIPBOARD_SET`], a different selection. PRIMARY is
+/// not readable from the web platform, so a client that wants to own it
+/// pushes the bytes up front instead of the compositor fetching them from
+/// the owner on demand; send it immediately before the
+/// [`C2S_SURFACE_POINTER`] carrying the middle button, so the offer is
+/// advertised by the time the app reacts. Displaces any Wayland client
+/// that held the selection, and is displaced in turn when one claims it.
+pub const C2S_PRIMARY_SET: u8 = 0x33;
 /// Request a list of all compositor surfaces: [0x26]
 pub const C2S_SURFACE_LIST: u8 = 0x26;
 /// Request a screenshot of a surface:
@@ -3347,9 +3358,19 @@ pub fn msg_s2c_clipboard_list(mime_types: &[String]) -> Vec<u8> {
 }
 
 pub fn msg_c2s_clipboard_set(mime_type: &str, data: &[u8]) -> Vec<u8> {
+    msg_c2s_selection_set(C2S_CLIPBOARD_SET, mime_type, data)
+}
+
+/// Take ownership of the primary selection: see [`C2S_PRIMARY_SET`].
+pub fn msg_c2s_primary_set(mime_type: &str, data: &[u8]) -> Vec<u8> {
+    msg_c2s_selection_set(C2S_PRIMARY_SET, mime_type, data)
+}
+
+/// Shared framing for the two selection setters, which differ only in tag.
+fn msg_c2s_selection_set(tag: u8, mime_type: &str, data: &[u8]) -> Vec<u8> {
     let mime_bytes = mime_type.as_bytes();
     let mut msg = Vec::with_capacity(7 + mime_bytes.len() + data.len());
-    msg.push(C2S_CLIPBOARD_SET);
+    msg.push(tag);
     msg.extend_from_slice(&(mime_bytes.len() as u16).to_le_bytes());
     msg.extend_from_slice(mime_bytes);
     msg.extend_from_slice(&(data.len() as u32).to_le_bytes());

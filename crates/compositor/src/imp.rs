@@ -684,6 +684,10 @@ pub enum CompositorCommand {
         mime_type: String,
         data: Vec<u8>,
     },
+    PrimaryOffer {
+        mime_type: String,
+        data: Vec<u8>,
+    },
     Capture {
         surface_id: u16,
         scale_120: u16,
@@ -3769,6 +3773,16 @@ impl Compositor {
                 }
                 self.offer_external_clipboard();
             }
+            CompositorCommand::PrimaryOffer { mime_type, data } => {
+                self.external_primary = Some(ExternalClipboard { mime_type, data });
+                // Same reasoning as ClipboardOffer: a client that still
+                // believes it owns PRIMARY answers `receive` from its own
+                // buffer, so the displaced owner has to be told.
+                if let Some(src) = self.primary_source.take() {
+                    src.cancelled();
+                }
+                self.offer_primary_selection();
+            }
             CompositorCommand::Capture {
                 surface_id,
                 scale_120,
@@ -6620,14 +6634,26 @@ impl Compositor {
 
     /// Hand the current primary selection to one device, or clear it there.
     ///
-    /// The clipboard gets away without an equivalent: a `wl_data_device`
-    /// selection is read out to the browser as text, and comes back as an
-    /// external offer when the user pastes, so the round trip substitutes
-    /// for compositor-side plumbing. Primary has no such detour — the web
-    /// platform exposes no PRIMARY — so unless the compositor hands the
-    /// selection over itself, a middle click lands on nothing.
+    /// PRIMARY has two possible owners. A Wayland client owns it by setting
+    /// a `zwp_primary_selection_source_v1`, and the compositor splices
+    /// `receive` straight through to it. The browser owns it by pushing
+    /// bytes ([`CompositorCommand::PrimaryOffer`]), which the compositor
+    /// then serves itself — the web platform exposes no PRIMARY to read on
+    /// demand, so the bytes have to arrive up front rather than be fetched
+    /// when a client asks.
+    ///
+    /// At most one of the two holds it at a time: taking PRIMARY on either
+    /// side clears the other, so precedence is never ambiguous.
     fn offer_primary_to(&self, pd: &ZwpPrimarySelectionDeviceV1) {
-        let Some(ref src) = self.primary_source else {
+        let (mimes, external) = if let Some(ref cb) = self.external_primary {
+            (cb.mime_types(), true)
+        } else if let Some(ref src) = self.primary_source {
+            let mimes = src
+                .data::<PrimarySourceData>()
+                .map(|d| d.mime_types.lock().unwrap().clone())
+                .unwrap_or_default();
+            (mimes, false)
+        } else {
             pd.selection(None);
             return;
         };
@@ -6638,16 +6664,14 @@ impl Compositor {
             .create_resource::<ZwpPrimarySelectionOfferV1, PrimaryOfferData, Compositor>(
                 &self.display_handle,
                 pd.version(),
-                PrimaryOfferData { external: false },
+                PrimaryOfferData { external },
             )
         else {
             return;
         };
         pd.data_offer(&offer);
-        if let Some(data) = src.data::<PrimarySourceData>() {
-            for mime in data.mime_types.lock().unwrap().iter() {
-                offer.offer(mime.clone());
-            }
+        for mime in mimes {
+            offer.offer(mime);
         }
         pd.selection(Some(&offer));
     }
@@ -6769,6 +6793,11 @@ impl Dispatch<ZwpPrimarySelectionDeviceV1, ()> for Compositor {
                 {
                     prev.cancelled();
                 }
+                // A Wayland client taking PRIMARY displaces the browser's
+                // copy, keeping the two owners mutually exclusive.  Leaving
+                // it would shadow the client that just claimed it, since
+                // the external selection is served in preference.
+                state.external_primary = None;
                 state.primary_source = source;
                 state.offer_primary_selection();
             }

@@ -86,6 +86,7 @@ import {
   buildSurfaceUnsubscribeMessage,
   buildSurfaceAckMessage,
   buildClipboardMessage,
+  buildPrimaryMessage,
   buildClientFeaturesMessage,
   buildAudioSubscribeMessage,
   buildAudioUnsubscribeMessage,
@@ -3325,6 +3326,17 @@ export class BlitConnection {
   sendClipboard(mimeType: string, data: Uint8Array): void {
     if (this.transport.status !== "connected") return;
     this.transport.send(buildClipboardMessage(mimeType, data));
+  }
+
+  /**
+   * Take ownership of PRIMARY, the selection a middle click pastes.
+   *
+   * The compositor serves these bytes itself, so send them only when the
+   * user actually asks to paste — see {@link buildPrimaryMessage}.
+   */
+  sendPrimary(mimeType: string, data: Uint8Array): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(buildPrimaryMessage(mimeType, data));
   }
 
   /**

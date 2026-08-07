@@ -390,9 +390,11 @@ async fn async_main() {
             let result = match cmd {
                 ClipboardCommand::List => agent::cmd_clipboard_list(transport).await,
                 ClipboardCommand::Get { mime } => agent::cmd_clipboard_get(transport, &mime).await,
-                ClipboardCommand::Set { mime, text } => {
-                    agent::cmd_clipboard_set(transport, &mime, text).await
-                }
+                ClipboardCommand::Set {
+                    mime,
+                    primary,
+                    text,
+                } => agent::cmd_clipboard_set(transport, &mime, primary, text).await,
             };
             if let Err(e) = result {
                 eprintln!("blit: {e}");

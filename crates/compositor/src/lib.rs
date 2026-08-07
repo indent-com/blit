@@ -238,6 +238,16 @@ mod stub {
             mime_type: String,
             data: Vec<u8>,
         },
+        /// Take ownership of the primary selection on the browser's behalf.
+        ///
+        /// Unlike the clipboard, whose contents the compositor can fetch
+        /// from the owning client on demand, PRIMARY has no web-side API to
+        /// read from, so the bytes arrive up front and the compositor
+        /// serves them itself.  Displaces any Wayland client that owned it.
+        PrimaryOffer {
+            mime_type: String,
+            data: Vec<u8>,
+        },
         /// List available clipboard MIME types.
         ClipboardListMimes {
             reply: mpsc::SyncSender<Vec<String>>,

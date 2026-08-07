@@ -316,6 +316,8 @@ export const AXIS_FLAG_STOP = 1 << 3;
 export const C2S_SURFACE_RESIZE = 0x23;
 export const C2S_SURFACE_FOCUS = 0x24;
 export const C2S_CLIPBOARD_SET = 0x25;
+/** Take ownership of PRIMARY — what a middle click pastes. */
+export const C2S_PRIMARY_SET = 0x33;
 export const C2S_SURFACE_SUBSCRIBE = 0x28;
 export const C2S_SURFACE_UNSUBSCRIBE = 0x29;
 export const C2S_SURFACE_ACK = 0x2a;
