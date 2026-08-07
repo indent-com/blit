@@ -91,16 +91,13 @@ impl SurfaceEncoderPreference {
             // to the entries below, so listing it first costs nothing when
             // it does not apply.
             //
-            // H.264 leads the Vulkan tier, against the AV1-first ordering
-            // used below it, because its 4:4:4 path can serve a
-            // 4:4:4-capable client at full chroma where `av1-vulkan` is
-            // 4:2:0-only.  For such clients `av1-vulkan` steps aside only
-            // when a server-side encoder would actually deliver 4:4:4 (see
-            // [`server_chain_would_serve_444`]); otherwise it takes the
-            // session at the same 4:2:0 the fallback chain would have
-            // produced, saving the server-side encode.
-            Self::VulkanVideoH264,
+            // AV1 leads the Vulkan tier for its better compression; for a
+            // 4:4:4-capable client it yields only when a lower entry would
+            // actually deliver 4:4:4 (see [`server_chain_would_serve_444`]),
+            // otherwise it keeps the session at the same 4:2:0 the fallback
+            // chain would have produced.
             Self::VulkanVideoAV1,
+            Self::VulkanVideoH264,
             Self::NvencAV1,
             Self::NvencH264,
             Self::AV1Vaapi,
