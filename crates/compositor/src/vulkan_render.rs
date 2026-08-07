@@ -5274,7 +5274,7 @@ impl VulkanRenderer {
     }
 
     /// Free deferred external submissions whose fences have signalled.
-    fn drain_deferred_submits(&mut self) {
+    pub(crate) fn drain_deferred_submits(&mut self) {
         if self.deferred_submits.is_empty() {
             return;
         }

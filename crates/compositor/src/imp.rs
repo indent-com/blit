@@ -2083,7 +2083,15 @@ impl Compositor {
         // composite showed a future frame.  A deferred commit has queued no
         // GPU work at all: keep holding, and let the drain release it once
         // the recomposite has read.
-        if !deferred && let Some(held) = self.held_buffers.remove(surface_id) {
+        // Not when the commit parked on its acquire point, though: nothing
+        // superseded the held buffer — it is still the surface's displayed
+        // content and future composites keep sampling it until the parked
+        // buffer promotes.  Releasing it here handed it (and its release
+        // point) back mid-use.
+        if !deferred
+            && !self.awaiting_acquire.contains_key(surface_id)
+            && let Some(held) = self.held_buffers.remove(surface_id)
+        {
             self.release_held(held);
         }
 
@@ -2458,11 +2466,32 @@ impl Compositor {
                 continue;
             };
             self.commit_buffer(&surface_id, a.buf, a.scale, a.is_cursor, a.release);
-            let (_, toplevel_sid) = self.find_toplevel_root(&surface_id);
-            if let Some(tl) = toplevel_sid {
-                // False = full recomposite: this content was never
-                // published anywhere.
+            let (root_id, toplevel_sid) = self.find_toplevel_root(&surface_id);
+            let Some(tl) = toplevel_sid else { continue };
+            // Mirror handle_surface_commit's tail exactly.  Routing every
+            // promoted frame through the cache-refill recomposite queue
+            // instead would serialize to one toplevel per loop pass AND
+            // force the native BGRA readback per frame — the copy the
+            // zero-copy path exists to suppress — on a path that runs for
+            // nearly every frame of an explicit-sync client, since those
+            // commit before their GPU work signals.
+            let deferred = self
+                .vulkan_renderer
+                .as_ref()
+                .is_some_and(|vk| vk.would_defer_submit());
+            if deferred {
                 self.pending_recomposite_toplevels.insert(tl, false);
+                if self.held_buffers.contains_key(&surface_id) {
+                    self.deferred_buffer_holds
+                        .entry(tl)
+                        .or_default()
+                        .insert(surface_id.clone());
+                }
+            } else {
+                self.composite_toplevel_into_pending(&root_id, tl, false);
+                if let Some(held) = self.held_buffers.remove(&surface_id) {
+                    self.release_held(held);
+                }
             }
         }
     }
@@ -7352,6 +7381,15 @@ fn run_compositor(
         // can yield multiple results (one per per-client downscale target
         // plus the native composite).
         if let Some(ref mut vk) = compositor.vulkan_renderer {
+            // Deferred submits used to be cleaned up lazily at the next
+            // render, which was fine when they only owned GPU objects.
+            // They now carry client-visible wl_buffer releases and
+            // explicit-sync release points: left undrained across an idle
+            // spell, a client waiting on those points stalls its own GPU
+            // work, which stalls its commits, which is what was keeping
+            // the compositor busy — a standstill no page refresh can
+            // break.  One batched fence probe per pass keeps them moving.
+            vk.drain_deferred_submits();
             let (native, retired) = vk.try_retire_pending();
             if !retired.is_empty() {
                 let s120_u32 = (compositor.output_scale_120 as u32).max(120);
