@@ -435,6 +435,28 @@ function domKeyToEvdev(code: string): number {
   return EVDEV_MAP[code] ?? 0;
 }
 
+/**
+ * True when the browser is on macOS/iPadOS, where the Alt key doubles as
+ * the Option character modifier: Option+E is a dead key, Option+F types
+ * "ƒ".  Only there is the Alt press held back pending dead-key detection;
+ * elsewhere Alt means the modifier alone and is forwarded immediately.
+ * (`navigator.platform` is deprecated but is the only source Firefox and
+ * Safari implement; iPadOS reports "MacIntel", which is the right answer
+ * here since its keyboards do dead keys too.)
+ */
+function detectMacOptionChars(): boolean {
+  const nav = navigator as Navigator & {
+    userAgentData?: { platform?: string };
+  };
+  const platform = (
+    nav.userAgentData?.platform ??
+    nav.platform ??
+    ""
+  ).toLowerCase();
+  if (platform) return platform.startsWith("mac") || platform.startsWith("ip");
+  return /mac|ipad|iphone/.test((nav.userAgent ?? "").toLowerCase());
+}
+
 // ---------------------------------------------------------------------------
 // BlitSurfaceCanvas
 // ---------------------------------------------------------------------------
@@ -575,6 +597,23 @@ export class BlitSurfaceCanvas {
    *  can release them when focus leaves or the canvas is disposed — preventing
    *  stuck modifiers and runaway key-repeat in the compositor. */
   private pressedKeys = new Set<number>();
+
+  /** Alt presses held back pending dead-key detection (evdev keycodes).
+   *  A macOS Option keydown may turn out to be the start of a dead-key
+   *  composition (Option+E → é), in which case the Alt press must never
+   *  reach the app: Electron apps (Slack) react to a bare Alt press by
+   *  activating their menu bar, which then swallows the composed text. */
+  private pendingAlt = new Set<number>();
+
+  /** Alt presses that a dead-key composition consumed: never forwarded,
+   *  so their physical key-up must be ignored too. */
+  private swallowedAlt = new Set<number>();
+
+  /** Whether the browser's Alt key doubles as the macOS Option character
+   *  modifier.  Only then is the Alt press held back (pendingAlt above);
+   *  on other platforms it is forwarded immediately, keeping Alt-tap and
+   *  Alt-hold semantics for apps that react to them. */
+  private macOptionChars = detectMacOptionChars();
 
   /** Active single-finger gesture used to emulate mouse input on iPadOS. */
   private activeTouch: {
@@ -1597,6 +1636,9 @@ export class BlitSurfaceCanvas {
     if (type === SURFACE_POINTER_DOWN) {
       this.focusKeyboardTarget();
       this.pressedButtons.add(button);
+      // Alt+click is a real chord: any Alt press still pending dead-key
+      // detection belongs ahead of this button.
+      this.flushPendingAlt(conn);
     } else if (type === SURFACE_POINTER_UP) {
       this.pressedButtons.delete(button);
     }
@@ -1973,7 +2015,8 @@ export class BlitSurfaceCanvas {
     // those take no other input either. Claiming the wheel there would
     // scroll an app the user is only previewing, and the preventDefault
     // below would stop the page scrolling under the cursor.
-    if (!this.getConn() || !this.surface || !this._displaySize) return;
+    const conn = this.getConn();
+    if (!conn || !this.surface || !this._displaySize) return;
     // Ctrl+wheel is how browsers report a pinch-zoom gesture, including
     // macOS trackpad pinches. It is a zoom request, not a scroll; sending
     // it on would scroll the surface while the user pinches.
@@ -1981,6 +2024,10 @@ export class BlitSurfaceCanvas {
     const g = this.drawnGeometry();
     if (!g) return;
     e.preventDefault();
+    // Alt+scroll is a real chord (horizontal scroll, zoom in some apps):
+    // a held-back Alt press belongs ahead of the axis events.  No-op when
+    // no Alt press is pending dead-key detection.
+    this.flushPendingAlt(conn);
 
     // The latch has to win before the detent maths below, not just when
     // labelling the source, or a smooth event ends up carrying notches.
@@ -2212,6 +2259,11 @@ export class BlitSurfaceCanvas {
     // textarea so the browser's composition UI can work.  The textarea's
     // compositionend handler sends the result and returns focus here.
     if (pressed && (e.key === "Dead" || e.isComposing)) {
+      // A macOS dead key (Option+E → ´) means the Alt press held back below
+      // is part of a character composition, not a modifier chord — drop it
+      // so the app never sees it (and ignore its key-up later).
+      for (const kc of this.pendingAlt) this.swallowedAlt.add(kc);
+      this.pendingAlt.clear();
       if (this.textInput) {
         this.textInput.focus();
       }
@@ -2243,6 +2295,60 @@ export class BlitSurfaceCanvas {
     if (!isPasteShortcut) e.preventDefault();
     const conn = this.getConn();
     if (!conn || !this.surface) return;
+
+    // macOS Option as a character modifier, no dead key involved: the
+    // browser resolves Option+F to "ƒ", Option+G to "©", and reports a
+    // single printable (non-ASCII) key with altKey set.  That is text,
+    // not an Alt chord — and the Alt press held back below belongs to the
+    // character the way a dead key's does.  Linux Alt+F reports "f"
+    // (ASCII) instead, so real Alt chords are unaffected; AltGr typing
+    // (also non-ASCII) lands here too, which is what GUI apps want.
+    if (
+      pressed &&
+      e.altKey &&
+      !e.ctrlKey &&
+      !e.metaKey &&
+      e.key.length === 1 &&
+      e.key.charCodeAt(0) > 127
+    ) {
+      for (const kc of this.pendingAlt) this.swallowedAlt.add(kc);
+      this.pendingAlt.clear();
+      conn.sendSurfaceText(this._surfaceId, e.key);
+      return;
+    }
+
+    // Hold back the Alt press until the next event shows whether it starts
+    // a dead-key composition (handled above) or a real modifier chord.
+    // Only on macOS, where Option is a character modifier — elsewhere Alt
+    // is forwarded immediately so apps see Alt-hold and Alt-tap as usual.
+    const altKeycode = domKeyToEvdev(e.code);
+    if (this.macOptionChars && (altKeycode === 56 || altKeycode === 100)) {
+      if (pressed) {
+        this.pendingAlt.add(altKeycode);
+      } else if (this.pendingAlt.delete(altKeycode)) {
+        // Bare Alt tap: deliver press+release together, as a native
+        // compositor would.
+        conn.sendSurfaceInput(this._surfaceId, altKeycode, true);
+        conn.sendSurfaceInput(this._surfaceId, altKeycode, false);
+      } else if (this.swallowedAlt.delete(altKeycode)) {
+        // Consumed by a dead-key composition: never pressed, never released.
+      } else if (this.pressedKeys.delete(altKeycode)) {
+        // Forwarded as part of a chord — release it.
+        conn.sendSurfaceInput(this._surfaceId, altKeycode, false);
+      }
+      return;
+    }
+    this.flushPendingAlt(conn);
+    if (pressed && e.altKey && this.swallowedAlt.size !== 0) {
+      // A dead-key composition was abandoned while Option is still held
+      // (and this keydown is no composition): put Alt back so the app sees
+      // a consistent modifier for this chord.
+      for (const kc of this.swallowedAlt) {
+        this.pressedKeys.add(kc);
+        conn.sendSurfaceInput(this._surfaceId, kc, true);
+      }
+      this.swallowedAlt.clear();
+    }
 
     // On keydown, reconcile modifier state with the browser before
     // forwarding the key.  Window managers may intercept modifier keys
@@ -2459,6 +2565,17 @@ export class BlitSurfaceCanvas {
     }
   }
 
+  /** Forward any Alt presses held back for dead-key detection, ahead of
+   *  the event that proves they are a real modifier chord. */
+  private flushPendingAlt(conn: BlitConnection): void {
+    if (this.pendingAlt.size === 0) return;
+    for (const kc of this.pendingAlt) {
+      this.pressedKeys.add(kc);
+      conn.sendSurfaceInput(this._surfaceId, kc, true);
+    }
+    this.pendingAlt.clear();
+  }
+
   /** Handle text input from the hidden textarea. */
   private handleTextInput(e: InputEvent): void {
     const ta = this.textInput;
@@ -2524,6 +2641,10 @@ export class BlitSurfaceCanvas {
     this._pendingPasteFlush = null;
     this._ctrlReleaseDeferred = false;
     this._metaToCtrlKey = 0;
+    // Held-back and swallowed Alt presses never reached the compositor, so
+    // they need no release — only forgetting.
+    this.pendingAlt.clear();
+    this.swallowedAlt.clear();
     if (this.pressedKeys.size === 0) return;
     const conn = this.getConn();
     if (!conn || !this.surface) return;

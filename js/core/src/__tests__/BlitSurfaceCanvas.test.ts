@@ -268,9 +268,12 @@ function attachScrolling(
   const [fw, fh] = opts.frame ?? [800, 600];
   const [cw, ch] = opts.css ?? [800, 600];
   const sent: SurfaceAxisEvent[] = [];
+  const keys: { keycode: number; pressed: boolean }[] = [];
   const pointers: { type: number; button: number; x: number; y: number }[] = [];
   const conn = {
     sendSurfaceAxis2: (_id: number, ev: SurfaceAxisEvent) => sent.push(ev),
+    sendSurfaceInput: (_id: number, keycode: number, pressed: boolean) =>
+      keys.push({ keycode, pressed }),
     sendSurfacePointer: (
       _id: number,
       type: number,
@@ -325,7 +328,7 @@ function attachScrolling(
     // inside the idle window so the gesture is still open.
     vi.advanceTimersByTime(FRAME_MS);
   };
-  return { surface, canvas, sent, pointers, wheel };
+  return { surface, canvas, sent, keys, pointers, wheel };
 }
 
 /** One animation frame, as the fake clock models requestAnimationFrame. */
@@ -482,6 +485,28 @@ describe("BlitSurfaceCanvas scroll", () => {
     wheel({ deltaY: 120, deltaMode: 0 });
     expect(sent[1].source).toBe(AXIS_SOURCE_WHEEL);
     expect(sent[1].v120y).toBe(120);
+    surface.dispose();
+  });
+
+  it("flushes a pending Alt ahead of a scroll", () => {
+    // Alt+scroll is a chord (horizontal scroll, zoom in some apps); an Alt
+    // press held back for dead-key detection must beat the axis events
+    // onto the wire.
+    const { surface, canvas, sent, keys, wheel } = attachScrolling();
+    (surface as unknown as { macOptionChars: boolean }).macOptionChars = true;
+
+    canvas.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Alt",
+        code: "AltLeft",
+        altKey: true,
+        cancelable: true,
+      }),
+    );
+    wheel({ deltaY: 40, deltaMode: 0 });
+
+    expect(keys).toEqual([{ keycode: 56, pressed: true }]);
+    expect(sent).toHaveLength(1);
     surface.dispose();
   });
 });
@@ -985,12 +1010,15 @@ function attachTyping() {
   const texts: string[] = [];
   const keys: { keycode: number; pressed: boolean }[] = [];
   const preedits: { text: string; cursor: number }[] = [];
+  const pointers: { type: number; button: number }[] = [];
   const conn = {
     sendSurfaceText: (_id: number, text: string) => texts.push(text),
     sendSurfaceInput: (_id: number, keycode: number, pressed: boolean) =>
       keys.push({ keycode, pressed }),
     sendSurfacePreedit: (_id: number, text: string, cursor: number) =>
       preedits.push({ text, cursor }),
+    sendSurfacePointer: (_id: number, type: number, button: number) =>
+      pointers.push({ type, button }),
     sendSurfaceFocus: () => {},
     surfaceStore: new Proxy(
       {
@@ -1026,7 +1054,7 @@ function attachTyping() {
   if (!ta) throw new Error("Expected surface input textarea");
   // Only live views take input.
   surface.setDisplaySize(800, 600, 120);
-  return { surface, canvas, ta, texts, keys, preedits };
+  return { surface, canvas, ta, texts, keys, preedits, pointers };
 }
 
 function inputEvent(init: InputEventInit): InputEvent {
@@ -1191,5 +1219,185 @@ describe("BlitSurfaceCanvas IME focus", () => {
     expect(document.activeElement).toBe(ta);
     surface.dispose();
     container.remove();
+  });
+});
+
+describe("BlitSurfaceCanvas macOS dead keys", () => {
+  const key = (
+    type: "keydown" | "keyup",
+    init: KeyboardEventInit,
+  ): KeyboardEvent =>
+    new KeyboardEvent(type, { bubbles: true, cancelable: true, ...init });
+
+  /** The Alt deferral these flows exercise exists only where Option is a
+   *  character modifier; jsdom's navigator does not claim to be one. */
+  function attachMac() {
+    const typing = attachTyping();
+    (typing.surface as unknown as { macOptionChars: boolean }).macOptionChars =
+      true;
+    return typing;
+  }
+
+  it("never sends Alt for an Option+E dead-key composition", () => {
+    // Option+E is the macOS acute-accent dead key: the browser reports the
+    // Option press, then a "Dead" keydown, and the finished character
+    // arrives as a composition commit.  Forwarding that Alt press made
+    // Electron apps (Slack) open their menu bar and eat the é; Chromium
+    // (Brave) has no menu bar, which is why it only broke there.
+    const { surface, canvas, ta, texts, keys } = attachMac();
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "Alt", code: "AltLeft", altKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keydown", { key: "Dead", code: "KeyE", altKey: true }),
+    );
+    ta.dispatchEvent(new CompositionEvent("compositionend", { data: "é" }));
+    canvas.dispatchEvent(
+      key("keyup", { key: "e", code: "KeyE", altKey: true }),
+    );
+    canvas.dispatchEvent(key("keyup", { key: "Alt", code: "AltLeft" }));
+
+    expect(texts).toEqual(["é"]);
+    expect(keys).toEqual([]);
+    surface.dispose();
+  });
+
+  it("forwards a real Alt chord with the press ahead of the key", () => {
+    // Linux-style Alt+E (no dead key involved): the held-back press goes
+    // out the moment the chord's key arrives, so the app sees the same
+    // stream as before — Alt down, E down, E up, Alt up.
+    const { surface, canvas, keys } = attachMac();
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "Alt", code: "AltLeft", altKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keydown", { key: "e", code: "KeyE", altKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keyup", { key: "e", code: "KeyE", altKey: true }),
+    );
+    canvas.dispatchEvent(key("keyup", { key: "Alt", code: "AltLeft" }));
+
+    expect(keys).toEqual([
+      { keycode: 56, pressed: true },
+      { keycode: 18, pressed: true },
+      { keycode: 18, pressed: false },
+      { keycode: 56, pressed: false },
+    ]);
+    surface.dispose();
+  });
+
+  it("delivers a bare Alt tap as press+release on key-up", () => {
+    const { surface, canvas, keys } = attachMac();
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "Alt", code: "AltRight", altKey: true }),
+    );
+    canvas.dispatchEvent(key("keyup", { key: "Alt", code: "AltRight" }));
+
+    expect(keys).toEqual([
+      { keycode: 100, pressed: true },
+      { keycode: 100, pressed: false },
+    ]);
+    surface.dispose();
+  });
+
+  it("restores Alt when a chord follows an abandoned composition", () => {
+    // Option+E started a dead key, but the next keydown is no composition
+    // and Option is still held: the app needs Alt back for this chord.
+    const { surface, canvas, keys } = attachMac();
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "Alt", code: "AltLeft", altKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keydown", { key: "Dead", code: "KeyE", altKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keydown", { key: "k", code: "KeyK", altKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keyup", { key: "k", code: "KeyK", altKey: true }),
+    );
+    canvas.dispatchEvent(key("keyup", { key: "Alt", code: "AltLeft" }));
+
+    expect(keys).toEqual([
+      { keycode: 56, pressed: true },
+      { keycode: 37, pressed: true },
+      { keycode: 37, pressed: false },
+      { keycode: 56, pressed: false },
+    ]);
+    surface.dispose();
+  });
+
+  it("flushes a pending Alt ahead of a mouse press", () => {
+    // Alt+click is a chord in plenty of apps; the deferred press must beat
+    // the button onto the wire.
+    const { surface, canvas, keys, pointers } = attachMac();
+    canvas.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, width: 800, height: 600 }) as DOMRect;
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "Alt", code: "AltLeft", altKey: true }),
+    );
+    canvas.dispatchEvent(
+      new MouseEvent("mousedown", {
+        bubbles: true,
+        cancelable: true,
+        button: 0,
+        clientX: 10,
+        clientY: 10,
+        altKey: true,
+      }),
+    );
+
+    expect(keys).toEqual([{ keycode: 56, pressed: true }]);
+    expect(pointers).toEqual([{ type: SURFACE_POINTER_DOWN, button: 0 }]);
+    surface.dispose();
+  });
+
+  it("sends a direct Option character as text, not an Alt chord", () => {
+    // Option+F is no dead key: macOS resolves it to "ƒ" outright and the
+    // browser reports a single non-ASCII key with altKey set.  Forwarding
+    // it as Alt+F opens Slack's File menu; it has to go out as text, and
+    // the held-back Alt belongs to the character as with a dead key.
+    const { surface, canvas, texts, keys } = attachMac();
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "Alt", code: "AltLeft", altKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keydown", { key: "ƒ", code: "KeyF", altKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keyup", { key: "ƒ", code: "KeyF", altKey: true }),
+    );
+    canvas.dispatchEvent(key("keyup", { key: "Alt", code: "AltLeft" }));
+
+    expect(texts).toEqual(["ƒ"]);
+    expect(keys).toEqual([]);
+    surface.dispose();
+  });
+
+  it("forwards Alt immediately when the browser is not on a Mac", () => {
+    // No Option character semantics there: Alt is the modifier alone, and
+    // apps that react to Alt-hold or a bare tap (GTK mnemonic underlines,
+    // Electron's menu peek) see it exactly as they did before the deferral.
+    const { surface, canvas, keys } = attachTyping();
+    (surface as unknown as { macOptionChars: boolean }).macOptionChars = false;
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "Alt", code: "AltLeft", altKey: true }),
+    );
+    expect(keys).toEqual([{ keycode: 56, pressed: true }]);
+
+    canvas.dispatchEvent(key("keyup", { key: "Alt", code: "AltLeft" }));
+    expect(keys).toEqual([
+      { keycode: 56, pressed: true },
+      { keycode: 56, pressed: false },
+    ]);
+    surface.dispose();
   });
 });
