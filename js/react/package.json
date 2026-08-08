@@ -1,6 +1,6 @@
 {
   "name": "@blit-sh/react",
-  "version": "0.45.2",
+  "version": "0.45.3",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",

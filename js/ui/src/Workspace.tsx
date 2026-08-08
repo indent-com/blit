@@ -1771,7 +1771,11 @@ function WorkspaceScreen(props: {
     // parking it.  focusedSessionId still points at that terminal, so
     // without this branch it would be filtered out below while nothing
     // renders it.
-    if (focusedSurfaceId() != null || activeTile() != null || mainTerminalParked()) {
+    if (
+      focusedSurfaceId() != null ||
+      activeTile() != null ||
+      mainTerminalParked()
+    ) {
       return sess.filter((s) => s.state !== "closed");
     }
     return sess.filter(
@@ -2996,7 +3000,8 @@ function WorkspaceScreen(props: {
 
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
-    ((sessionId: SessionId, targetPaneId: string) => void) | null = null;
+    | ((sessionId: SessionId, targetPaneId: string) => void)
+    | null = null;
   let moveToPaneFn:
     | ((value: string, targetPaneId: string, fromPaneId?: string) => void)
     | null = null;

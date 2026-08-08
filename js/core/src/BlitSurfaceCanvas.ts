@@ -725,7 +725,8 @@ export class BlitSurfaceCanvas {
     deferredCtrlRelease: boolean;
   } | null = null;
   private _pendingPasteFlush:
-    ((payload: ClipboardPayload | null) => void) | null = null;
+    | ((payload: ClipboardPayload | null) => void)
+    | null = null;
   /** Safety-net timer for the in-flight paste, and the cleanup it runs.
    *  Kept as fields so reading a clipboard image — which is asynchronous,
    *  unlike `getData()` — can push the deadline back instead of losing the

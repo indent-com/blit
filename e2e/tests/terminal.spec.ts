@@ -112,9 +112,7 @@ test.describe("Terminal", () => {
 
     // The switcher closes and the search pane's input takes focus.
     await expect(dialog).toHaveCount(0);
-    await expect(
-      page.locator("[data-blit-search-pane] input"),
-    ).toBeFocused();
+    await expect(page.locator("[data-blit-search-pane] input")).toBeFocused();
   });
 
   test("can create a new PTY from Switcher", async ({ page }) => {

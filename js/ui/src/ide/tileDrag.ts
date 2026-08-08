@@ -236,10 +236,7 @@ export function startTouchDrag(
         // is cancelled; the listeners stay armed until the finger lifts.
         const dx = ev.clientX - startX;
         const dy = ev.clientY - startY;
-        if (
-          dx <= -TOUCH_DRAG_THRESHOLD_PX &&
-          Math.abs(dx) >= Math.abs(dy)
-        ) {
+        if (dx <= -TOUCH_DRAG_THRESHOLD_PX && Math.abs(dx) >= Math.abs(dy)) {
           begin(ev);
         } else {
           if (holdTimer !== null && moved(ev, LONG_PRESS_SLOP_PX)) {
