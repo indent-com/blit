@@ -2300,11 +2300,13 @@ export class BlitSurfaceCanvas {
     // browser resolves Option+F to "ƒ", Option+G to "©", and reports a
     // single printable (non-ASCII) key with altKey set.  That is text,
     // not an Alt chord — and the Alt press held back below belongs to the
-    // character the way a dead key's does.  Linux Alt+F reports "f"
-    // (ASCII) instead, so real Alt chords are unaffected; AltGr typing
-    // (also non-ASCII) lands here too, which is what GUI apps want.
+    // character the way a dead key's does.  Gated to macOS: on other
+    // platforms Alt is a pure modifier, and on national layouts where a
+    // base key is non-ASCII (e.g. Alt+ä on a German layout) this same
+    // event shape is a real Meta chord that must reach the app as keys.
     if (
       pressed &&
+      this.macOptionChars &&
       e.altKey &&
       !e.ctrlKey &&
       !e.metaKey &&

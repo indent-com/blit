@@ -1400,4 +1400,32 @@ describe("BlitSurfaceCanvas macOS dead keys", () => {
     ]);
     surface.dispose();
   });
+
+  it("keeps a non-ASCII Alt chord a chord when the browser is not on a Mac", () => {
+    // On a national layout where a base key is non-ASCII (ä on a German
+    // layout), Alt+ä is a real Meta chord, not Option typing — sending it
+    // as text would break Meta keybindings.  The text branch is macOS-only.
+    const { surface, canvas, keys, texts } = attachTyping();
+    (surface as unknown as { macOptionChars: boolean }).macOptionChars = false;
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "Alt", code: "AltLeft", altKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keydown", { key: "ä", code: "KeyA", altKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keyup", { key: "ä", code: "KeyA", altKey: true }),
+    );
+    canvas.dispatchEvent(key("keyup", { key: "Alt", code: "AltLeft" }));
+
+    expect(texts).toEqual([]);
+    expect(keys).toEqual([
+      { keycode: 56, pressed: true },
+      { keycode: 30, pressed: true },
+      { keycode: 30, pressed: false },
+      { keycode: 56, pressed: false },
+    ]);
+    surface.dispose();
+  });
 });
