@@ -11,9 +11,10 @@
 //! and pacing is coalescing per subscriber: at most one snapshot in
 //! flight, the latest state wins once acked.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,26 @@ fn watch_close_reason(err: &notify::Error) -> u8 {
             _ => GIT_CLOSED_BACKEND_FAILED,
         },
         _ => GIT_CLOSED_BACKEND_FAILED,
+    }
+}
+
+/// Push one watch event without ever blocking the notify thread: a full
+/// queue coalesces to the rescan path, since the events that did not fit
+/// are unknowable.
+fn queue_event(tx: &SyncSender<EngineMsg>, overflow: &AtomicBool, msg: EngineMsg) {
+    if tx.try_send(msg).is_err() {
+        queue_rescan(tx, overflow);
+    }
+}
+
+/// Record one lost-events signal (queue overflow, `IN_Q_OVERFLOW`, a
+/// backend error): the first loss queues the rescan — an empty path set,
+/// `handle_event`'s "unattributable" shape — and later losses only keep
+/// the flag the engine checks every pass, since one rescan covers any
+/// number of losses.
+fn queue_rescan(tx: &SyncSender<EngineMsg>, overflow: &AtomicBool) {
+    if !overflow.swap(true, Ordering::Relaxed) {
+        let _ = tx.try_send(EngineMsg::Event { paths: Vec::new() });
     }
 }
 
@@ -90,7 +111,8 @@ enum EngineMsg {
         state_id: u32,
     },
     /// Raw watcher event paths, classified on the engine thread (where the
-    /// exclude stack lives).
+    /// exclude stack lives). An empty path set is the coalesced rescan
+    /// signal: queue overflow or a backend loss event.
     Event {
         paths: Vec<PathBuf>,
     },
@@ -118,6 +140,12 @@ enum EngineMsg {
 // Engine registry: one engine per canonical gitdir, refcounted by handles
 // ---------------------------------------------------------------------------
 
+/// Engine inbox capacity. Watch events arrive in bursts — a build touches
+/// thousands of files — but the notify callback never blocks: a full queue
+/// coalesces to one rescan ([`queue_event`]), so the queue only has to
+/// absorb a burst, not a build.
+const ENGINE_INBOX: usize = 4096;
+
 /// Live engines by canonical gitdir. Handles hold the strong refs, so the
 /// map never keeps an engine alive on its own.
 type EngineRegistry = Mutex<HashMap<PathBuf, Weak<EngineRef>>>;
@@ -130,7 +158,7 @@ fn engines() -> &'static EngineRegistry {
 /// The shared engine's inbox plus its registry key. Every `StateHandle`
 /// holds one; the last drop is the teardown edge.
 struct EngineRef {
-    tx: Sender<EngineMsg>,
+    tx: SyncSender<EngineMsg>,
     key: Arc<PathBuf>,
 }
 
@@ -177,6 +205,19 @@ pub fn debug_status_recomputes(gitdir: &Path) -> u64 {
 fn status_recomputes() -> &'static Mutex<HashMap<PathBuf, u64>> {
     static COUNTS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
     COUNTS.get_or_init(Default::default)
+}
+
+/// The engine's armed per-directory worktree watch set for the repo keyed
+/// by canonical `gitdir` (the same registry key), `None` before the first
+/// arm. Test/diagnostic hook.
+#[doc(hidden)]
+pub fn debug_worktree_watches(gitdir: &Path) -> Option<Vec<PathBuf>> {
+    worktree_watch_sets().lock().unwrap().get(gitdir).cloned()
+}
+
+fn worktree_watch_sets() -> &'static Mutex<HashMap<PathBuf, Vec<PathBuf>>> {
+    static SETS: OnceLock<Mutex<HashMap<PathBuf, Vec<PathBuf>>>> = OnceLock::new();
+    SETS.get_or_init(Default::default)
 }
 
 /// Handle to one open's subscription on the shared state engine; dropping
@@ -261,7 +302,7 @@ impl RepoHandle {
                 Err(std::sync::mpsc::SendError(msg)) => attach = msg,
             }
         }
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(ENGINE_INBOX);
         let engine = Arc::new(EngineRef {
             tx,
             key: self.gitdir.clone(),
@@ -352,10 +393,10 @@ struct Parts {
     demand: Demand,
 }
 
-/// The armed native watches. The recursive worktree watch already covers
-/// a gitdir living inside the worktree, so while it is up the targeted
-/// gitdir watches are dropped rather than double-watching the `.git`
-/// subtree.
+/// The armed native watches. The per-directory worktree watch already
+/// covers a gitdir living inside the worktree, so while it is up the
+/// targeted gitdir watches are dropped rather than double-watching the
+/// `.git` subtree.
 struct Arms {
     watcher: notify::RecommendedWatcher,
     /// Targeted gitdir/common paths currently armed; empty while the
@@ -367,7 +408,26 @@ struct Arms {
     /// [`Engine::ignore_watch_dirs`] excludes anything under them — so
     /// these arm once and are only re-armed when the configured path moves.
     ignore_paths: Vec<PathBuf>,
+    /// The worktree watch is up (a status subscriber exists).
     worktree: bool,
+    /// Worktree directories armed one at a time (`NonRecursive`), the root
+    /// included, so an ignored subtree costs no descriptor — the whole
+    /// point on inotify, where a recursive watch is one descriptor per
+    /// directory whether or not git status can ever see it. Ordered,
+    /// because disarming is always a *subtree*: `Path`'s component-wise
+    /// ordering puts a directory's descendants immediately after it, so a
+    /// range query finds them (the same trick `blit_fssync`'s `Watches`
+    /// uses).
+    worktree_dirs: BTreeSet<PathBuf>,
+    /// Whether the armed set was cut with ignore pruning on. An IGNORED
+    /// open surfaces ignored files, so their directories can affect status
+    /// and nothing is pruned; a demand change past this re-walks.
+    worktree_pruned: bool,
+    /// The set may have drifted from the tree — directory churn, a rescan,
+    /// an ignore-source edit — so reconcile on the next `sync_watches`.
+    worktree_stale: bool,
+    /// Changed since the last debug-hook publish.
+    watch_set_changed: bool,
 }
 
 struct Engine {
@@ -413,6 +473,9 @@ struct Engine {
     /// resolves it ([`global_excludes_file`]) — for event-path matching
     /// and for the watch that makes those events arrive at all.
     excludes_file: Option<PathBuf>,
+    /// Set by the notify callback when an event (or the rescan itself)
+    /// could not be queued; the engine loop folds it into one full rescan.
+    watch_overflow: Arc<AtomicBool>,
     watch: Option<Arms>,
     /// Set when watching can never work (watcher creation failed): every
     /// current and future subscriber is closed with this reason.
@@ -501,6 +564,7 @@ impl Engine {
             parts: None,
             excludes: None,
             excludes_file,
+            watch_overflow: Arc::new(AtomicBool::new(false)),
             watch: None,
             fatal: None,
             gitdir,
@@ -511,7 +575,7 @@ impl Engine {
         }
     }
 
-    fn run(mut self, rx: Receiver<EngineMsg>, watch_tx: Sender<EngineMsg>) {
+    fn run(mut self, rx: Receiver<EngineMsg>, watch_tx: SyncSender<EngineMsg>) {
         // Serve the attaches queued before this thread started, so the
         // watch set is armed against real subscriber demand in one pass
         // (see `sync_watches`) rather than armed broadly and narrowed.
@@ -531,6 +595,12 @@ impl Engine {
             self.close_all(reason);
         }
         loop {
+            // Events dropped to a full queue (or an unqueueable rescan)
+            // coalesce here into one full rescan: both sides dirty, watch
+            // set reconciled.
+            if self.watch_overflow.swap(false, Ordering::Relaxed) {
+                self.handle_event(&[]);
+            }
             let now = Instant::now();
             // Fire elapsed settle timers. A ref change invalidates the
             // shared snapshot and every log subscription (its endpoints
@@ -625,7 +695,14 @@ impl Engine {
                     sub.unacked = None;
                 }
             }
-            EngineMsg::Event { paths } => self.handle_event(&paths),
+            EngineMsg::Event { paths } => {
+                // A queued rescan satisfies the overflow flag standing
+                // behind it.
+                if paths.is_empty() {
+                    self.watch_overflow.store(false, Ordering::Relaxed);
+                }
+                self.handle_event(&paths);
+            }
             EngineMsg::WatchLog {
                 sub_id,
                 log_id,
@@ -735,14 +812,18 @@ impl Engine {
 
     /// Create the watcher and arm the initial set. `Err(reason)` when the
     /// watcher itself cannot exist.
-    fn arm_watcher(&mut self, tx: Sender<EngineMsg>) -> Result<(), u8> {
+    fn arm_watcher(&mut self, tx: SyncSender<EngineMsg>) -> Result<(), u8> {
         // The dominant gitdir churn (fetch/gc/commit/hash-object) writes
         // under objects/; those events carry no HEAD/ref/status meaning,
         // so drop them before they reach the engine thread.
         let objects = [self.gitdir.join("objects"), self.common.join("objects")];
+        let overflow = self.watch_overflow.clone();
         let watcher = blit_fssync::backend::watcher(move |res: notify::Result<notify::Event>| {
-            let Ok(event) = &res else {
-                return;
+            // Backend-reported loss (IN_Q_OVERFLOW) and notify errors take
+            // the same coalesced path as a full queue.
+            let event = match res {
+                Ok(event) if !event.need_rescan() => event,
+                _ => return queue_rescan(&tx, &overflow),
             };
             // Recomputing status opens `.gitignore`, `HEAD` and the refs it
             // watches; on Linux those opens come back as events, so without
@@ -758,9 +839,7 @@ impl Engine {
             {
                 return;
             }
-            let _ = tx.send(EngineMsg::Event {
-                paths: event.paths.clone(),
-            });
+            queue_event(&tx, &overflow, EngineMsg::Event { paths: event.paths });
         })
         .map_err(|e| watch_close_reason(&e))?;
         self.watch = Some(Arms {
@@ -768,6 +847,10 @@ impl Engine {
             gitdir_paths: Vec::new(),
             ignore_paths: Vec::new(),
             worktree: false,
+            worktree_dirs: BTreeSet::new(),
+            worktree_pruned: false,
+            worktree_stale: false,
+            watch_set_changed: false,
         });
         // `sync_watches` picks the set: when a status subscriber's
         // recursive worktree watch already covers the gitdir, arming the
@@ -831,8 +914,9 @@ impl Engine {
         }
     }
 
-    /// True when the recursive worktree watch already delivers gitdir
-    /// events (the `.git` directory lives inside the worktree).
+    /// True when the worktree watch already delivers gitdir events (the
+    /// `.git` directory lives inside the worktree, and the per-directory
+    /// arming never prunes the gitdir subtree).
     fn gitdir_covered(&self) -> bool {
         self.workdir
             .as_deref()
@@ -845,11 +929,12 @@ impl Engine {
     /// double-watching the `.git` subtree.
     fn sync_watches(&mut self) {
         use notify::Watcher as _;
-        let Some(arms) = &self.watch else {
-            return;
-        };
-        let armed = arms.worktree;
+        let armed = self.watch.as_ref().is_some_and(|a| a.worktree);
         let want = self.workdir.is_some() && self.subs.values().any(|s| s.opts.status && !s.gone);
+        // An IGNORED open surfaces ignored files, so their directories can
+        // affect status and nothing is pruned — the same gate
+        // `handle_event`'s filter uses.
+        let prune = !self.ignored_surfaced();
         if want && !armed {
             let workdir = self.workdir.clone().expect("want implies workdir");
             let result = self
@@ -857,9 +942,18 @@ impl Engine {
                 .as_mut()
                 .expect("checked above")
                 .watcher
-                .watch(&workdir, notify::RecursiveMode::Recursive);
+                .watch(&workdir, notify::RecursiveMode::NonRecursive);
             match result {
-                Ok(()) => self.watch.as_mut().expect("checked above").worktree = true,
+                Ok(()) => {
+                    let arms = self.watch.as_mut().expect("checked above");
+                    arms.worktree = true;
+                    arms.worktree_pruned = prune;
+                    arms.worktree_stale = false;
+                    arms.worktree_dirs.insert(workdir);
+                    arms.watch_set_changed = true;
+                    // Arm the rest of the walkable set.
+                    self.reconcile_worktree_watches();
+                }
                 Err(e) => {
                     // The worktree watch is load-bearing for status: those
                     // subscribers would silently never update, so close
@@ -870,6 +964,21 @@ impl Engine {
                         sub.gone = true;
                     }
                 }
+            }
+        } else if want {
+            // Rebuild the per-directory set when it may have drifted:
+            // directory churn, a rescan, an ignore-source edit, or a
+            // demand change past the pruning mode.
+            let stale = self
+                .watch
+                .as_ref()
+                .is_some_and(|a| a.worktree_stale || a.worktree_pruned != prune);
+            if stale {
+                if let Some(arms) = &mut self.watch {
+                    arms.worktree_stale = false;
+                    arms.worktree_pruned = prune;
+                }
+                self.reconcile_worktree_watches();
             }
         }
         // Reconcile the targeted gitdir watches against what the worktree
@@ -886,14 +995,187 @@ impl Engine {
             // move is unseen.
             self.arm_gitdir();
         }
-        if !want && armed {
-            let workdir = self.workdir.clone().expect("armed implies workdir");
-            if let Some(arms) = &mut self.watch {
-                let _ = arms.watcher.unwatch(&workdir);
-                arms.worktree = false;
+        if !want
+            && armed
+            && let Some(arms) = &mut self.watch
+        {
+            let dirs = std::mem::take(&mut arms.worktree_dirs);
+            for dir in dirs {
+                let _ = arms.watcher.unwatch(&dir);
+            }
+            arms.worktree = false;
+            arms.watch_set_changed = true;
+        }
+        self.publish_worktree_watches();
+        self.sync_ignore_watch();
+    }
+
+    /// Reconcile the per-directory worktree watch set with the tree and
+    /// the ignore rules: arm directories that became watchable (a create,
+    /// an un-ignoring edit), drop the ones that stopped being watchable
+    /// or vanished. Arming precedes disarming, so no window opens where a
+    /// live directory is unwatched.
+    fn reconcile_worktree_watches(&mut self) {
+        let (workdir, prune) = match &self.watch {
+            Some(arms) if arms.worktree => match &self.workdir {
+                Some(workdir) => (workdir.clone(), arms.worktree_pruned),
+                None => return,
+            },
+            _ => return,
+        };
+        let desired = self.watchable_dirs(&workdir, prune);
+        let Some(arms) = &self.watch else { return };
+        let missing: Vec<PathBuf> = desired.difference(&arms.worktree_dirs).cloned().collect();
+        let extra: Vec<PathBuf> = arms.worktree_dirs.difference(&desired).cloned().collect();
+        for dir in missing {
+            self.arm_worktree_dir(&dir);
+        }
+        for dir in extra {
+            self.disarm_worktree_subtree(&dir);
+        }
+    }
+
+    /// The worktree directories that can still affect `git status`, root
+    /// included: the gitdir subtree always can (ref moves arrive through
+    /// the worktree watch — `gitdir_covered`), and every other directory
+    /// can unless the exclude stack marks it ignored. Pruning an ignored
+    /// directory is sound by git's own rule — no negation re-includes a
+    /// path under an excluded directory — so any negation that matters is
+    /// one matching the directory itself, and then the stack does not
+    /// mark it ignored. Symlinks do not count as directories, matching
+    /// the watcher's no-follow config.
+    fn watchable_dirs(&mut self, workdir: &Path, prune: bool) -> BTreeSet<PathBuf> {
+        let mut set = BTreeSet::from([workdir.to_path_buf()]);
+        let mut pending = vec![workdir.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if !kind.is_dir() {
+                    continue;
+                }
+                let path = entry.path();
+                if self.dir_watchable(workdir, &path, prune) {
+                    set.insert(path.clone());
+                    pending.push(path);
+                }
             }
         }
-        self.sync_ignore_watch();
+        set
+    }
+
+    /// Whether the subtree at `abs` is worth a descriptor; see
+    /// [`Engine::watchable_dirs`].
+    fn dir_watchable(&mut self, workdir: &Path, abs: &Path, prune: bool) -> bool {
+        !prune || self.under_gitdir(abs) || !self.path_ignored(abs, workdir)
+    }
+
+    /// Arm one worktree directory, non-recursively. Idempotent — the armed
+    /// set is the bookkeeping, and re-arming would rebuild the native
+    /// stream (see `sync_watches`). A directory that vanished mid-walk is
+    /// simply skipped; any other failure leaves a live directory
+    /// unwatched — status would silently never update — so status
+    /// subscribers are closed with the reason, the contract the root arm
+    /// in `sync_watches` keeps.
+    fn arm_worktree_dir(&mut self, dir: &Path) {
+        use notify::Watcher as _;
+        let Some(arms) = &mut self.watch else {
+            return;
+        };
+        if arms.worktree_dirs.contains(dir) {
+            return;
+        }
+        match arms.watcher.watch(dir, notify::RecursiveMode::NonRecursive) {
+            Ok(()) => {
+                arms.worktree_dirs.insert(dir.to_path_buf());
+                arms.watch_set_changed = true;
+            }
+            Err(e) => {
+                if !dir.exists() {
+                    return;
+                }
+                let reason = watch_close_reason(&e);
+                for sub in self.subs.values_mut().filter(|s| s.opts.status && !s.gone) {
+                    let _ = (sub.outbox)(msg_git_closed(sub.repo_id, reason));
+                    sub.gone = true;
+                }
+            }
+        }
+    }
+
+    /// Drop `dir` and everything under it from the watch bookkeeping — a
+    /// deleted, renamed-away, or newly ignored subtree. inotify retires
+    /// the kernel watch on deletion by itself; this is what keeps notify's
+    /// descriptor→path map (and the debug hook) from growing stale.
+    fn disarm_worktree_subtree(&mut self, dir: &Path) {
+        use notify::Watcher as _;
+        let Some(arms) = &mut self.watch else {
+            return;
+        };
+        let gone: Vec<PathBuf> = arms
+            .worktree_dirs
+            .range(dir.to_path_buf()..)
+            .take_while(|p| p.starts_with(dir))
+            .cloned()
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        for path in gone {
+            let _ = arms.watcher.unwatch(&path);
+            arms.worktree_dirs.remove(&path);
+        }
+        arms.watch_set_changed = true;
+    }
+
+    /// A directory appearing or vanishing under the worktree reshapes the
+    /// per-directory watch set. Flag it for the reconcile `sync_watches`
+    /// runs once per pass rather than re-walking per event — a checkout's
+    /// mkdir burst then costs one walk, not one per event.
+    fn note_event_dir(&mut self, path: &Path) {
+        let Some(workdir) = self.workdir.as_deref() else {
+            return;
+        };
+        if !path.starts_with(workdir) {
+            return;
+        }
+        let Some(arms) = &mut self.watch else {
+            return;
+        };
+        if !arms.worktree || arms.worktree_stale {
+            return;
+        }
+        arms.worktree_stale = match std::fs::symlink_metadata(path) {
+            // A directory the set does not know: created or moved in.
+            Ok(md) if md.is_dir() => !arms.worktree_dirs.contains(path),
+            // Gone or no longer a directory: suspect when the set still
+            // holds it or anything beneath it.
+            _ => arms
+                .worktree_dirs
+                .range::<Path, _>((std::ops::Bound::Included(path), std::ops::Bound::Unbounded))
+                .next()
+                .is_some_and(|p| p.starts_with(path)),
+        };
+    }
+
+    /// Republish the armed worktree set for the debug hook after a change.
+    fn publish_worktree_watches(&mut self) {
+        let Some(arms) = &mut self.watch else {
+            return;
+        };
+        if !arms.watch_set_changed {
+            return;
+        }
+        arms.watch_set_changed = false;
+        let dirs = arms.worktree_dirs.iter().cloned().collect();
+        worktree_watch_sets()
+            .lock()
+            .unwrap()
+            .insert((*self.repo.gitdir).clone(), dirs);
     }
 
     /// Directories to arm for the ignore sources that live *outside* every
@@ -958,18 +1240,28 @@ impl Engine {
     fn handle_event(&mut self, paths: &[PathBuf]) {
         let mut refs_side = false;
         let mut status_side = false;
-        // An empty path set (backend rescan) is unattributable: both sides.
+        // An empty path set (queue overflow, backend rescan) is
+        // unattributable: both sides. Events were lost — possibly
+        // directory creates — so the watch set itself is suspect too.
         if paths.is_empty() {
+            if let Some(arms) = &mut self.watch {
+                arms.worktree_stale = true;
+            }
             refs_side = true;
             status_side = true;
         }
         let workdir = self.workdir.clone();
         for path in paths {
+            self.note_event_dir(path);
             if self.is_exclude_source(path) {
                 // An ignore-source edit changes classifications the
                 // previous snapshot baked in: rebuild the stack AND
-                // recompute status.
+                // recompute status. The pruning the watch set was cut
+                // with may have changed too, so reconcile it.
                 self.excludes = None;
+                if let Some(arms) = &mut self.watch {
+                    arms.worktree_stale = true;
+                }
                 status_side = true;
                 if self.under_gitdir(path) {
                     refs_side = true;
@@ -978,8 +1270,12 @@ impl Engine {
             }
             if self.config_paths.iter().any(|c| path == c) {
                 // Config drives the upstream mapping and core.excludesFile:
-                // refresh the engine repository and the exclude stack.
+                // refresh the engine repository and the exclude stack, and
+                // reconcile the watch set against the new rules.
                 self.excludes = None;
+                if let Some(arms) = &mut self.watch {
+                    arms.worktree_stale = true;
+                }
                 self.local_stale = true;
                 refs_side = true;
                 continue;
@@ -2146,5 +2442,31 @@ mod tests {
         );
         // No home to anchor it: nothing to watch, rather than a guess.
         assert_eq!(xdg_ignore_path(None, None), None);
+    }
+
+    /// A full watch-event queue never blocks the notify callback: the
+    /// first loss queues one rescan (an empty path set), later losses only
+    /// keep the flag the engine folds into a rescan each pass.
+    #[test]
+    fn watch_overflow_coalesces_to_one_rescan() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<EngineMsg>(2);
+        let overflow = AtomicBool::new(false);
+        let event = |name: &str| EngineMsg::Event {
+            paths: vec![PathBuf::from(name)],
+        };
+        queue_event(&tx, &overflow, event("/a"));
+        // Two loss signals: one rescan queued, the flag holding the rest.
+        queue_rescan(&tx, &overflow);
+        queue_rescan(&tx, &overflow);
+        assert!(overflow.load(Ordering::Relaxed));
+        // A drop while the queue is full routes to the same coalesced
+        // path: nothing more is queued, the flag stands.
+        queue_event(&tx, &overflow, event("/b"));
+        assert!(overflow.load(Ordering::Relaxed));
+        // The queue holds exactly the event and one rescan — the dropped
+        // event and the second loss signal added nothing.
+        assert!(matches!(rx.try_recv(), Ok(EngineMsg::Event { paths }) if paths == [PathBuf::from("/a")]));
+        assert!(matches!(rx.try_recv(), Ok(EngineMsg::Event { paths }) if paths.is_empty()));
+        assert!(rx.try_recv().is_err(), "no second rescan was queued");
     }
 }

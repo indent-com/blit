@@ -27,7 +27,7 @@ mod state;
 pub use reads::{DiscoverLimits, discover, discover_within, open_submodule};
 pub use state::{StateHandle, StateOptions};
 #[doc(hidden)]
-pub use state::{debug_engine_refs, debug_status_recomputes};
+pub use state::{debug_engine_refs, debug_status_recomputes, debug_worktree_watches};
 
 /// Messages ready for the client outbox. Returns `false` when the client
 /// is gone; the engine then exits.

@@ -2871,6 +2871,111 @@ fn ignored_flag_bypasses_event_filter() {
     state.stop();
 }
 
+/// The worktree watch is armed per directory, and a directory the exclude
+/// stack marks ignored gets none: nothing beneath it can affect `git
+/// status`, because git's own rule is that no negation re-includes a path
+/// under an excluded directory. So `!blitprune-target/keep` does NOT save
+/// the subtree — but `!blitprune-build/`, which un-ignores the directory
+/// itself, does keep it watched. The gitdir subtree is never pruned: ref
+/// moves arrive through the worktree watch.
+///
+/// The directory names carry a `blitprune` prefix so a rule in the test
+/// host's own global ignore file cannot decide the outcome.
+#[test]
+fn worktree_watch_prunes_ignored_dirs() {
+    let dir = temp_dir();
+    git(&dir, &["init", "-b", "main"]);
+    std::fs::write(
+        dir.join(".gitignore"),
+        "blitprune-target/\n!blitprune-target/keep\nblitprune-build*\n!blitprune-build/\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "seed"]);
+    std::fs::create_dir_all(dir.join("blitprune-target/keep")).unwrap();
+    std::fs::create_dir_all(dir.join("blitprune-build")).unwrap();
+    std::fs::create_dir_all(dir.join("src/nested")).unwrap();
+
+    let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+    let gitdir = dir.join(".git");
+    let (_sent, out) = sink();
+    let state = handle.start_state(
+        1,
+        StateOptions {
+            status: true,
+            ..Default::default()
+        },
+        out,
+    );
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let armed = loop {
+        if let Some(dirs) = blit_git::debug_worktree_watches(&gitdir) {
+            break dirs;
+        }
+        assert!(Instant::now() < deadline, "watch set never published");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let has = |suffix: &str| armed.iter().any(|d| *d == dir.join(suffix));
+    assert!(has(""), "the root is armed");
+    assert!(has("src") && has("src/nested"));
+    assert!(has(".git"), "the gitdir subtree is never pruned");
+    assert!(
+        !has("blitprune-target") && !has("blitprune-target/keep"),
+        "an ignored subtree gets no watch; its negation cannot re-include: {armed:?}"
+    );
+    assert!(
+        has("blitprune-build"),
+        "a negation matching the directory itself keeps it watched: {armed:?}"
+    );
+    state.stop();
+}
+
+/// A `.gitignore` edit that newly ignores a directory retires its watch;
+/// emptying the file re-arms it — the watch set reconciles against the
+/// new rules on the same settle that recomputes status.
+#[test]
+fn worktree_watch_follows_ignore_edits() {
+    let dir = temp_dir();
+    git(&dir, &["init", "-b", "main"]);
+    std::fs::write(dir.join(".gitignore"), "\n").unwrap();
+    std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "seed"]);
+    std::fs::create_dir_all(dir.join("blitprune-gen")).unwrap();
+
+    let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+    let gitdir = dir.join(".git");
+    let (_sent, out) = sink();
+    let state = handle.start_state(
+        1,
+        StateOptions {
+            status: true,
+            ..Default::default()
+        },
+        out,
+    );
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let wait_set = |label: &str, pred: &dyn Fn(&[PathBuf]) -> bool| {
+        loop {
+            if let Some(dirs) = blit_git::debug_worktree_watches(&gitdir)
+                && pred(&dirs)
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{label}: watch set never converged");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let has_gen = |dirs: &[PathBuf]| dirs.iter().any(|d| *d == dir.join("blitprune-gen"));
+    wait_set("initial", &|dirs| has_gen(dirs));
+    std::fs::write(dir.join(".gitignore"), "blitprune-gen/\n").unwrap();
+    wait_set("newly-ignored", &|dirs| !has_gen(dirs));
+    std::fs::write(dir.join(".gitignore"), "\n").unwrap();
+    wait_set("unignored", &|dirs| has_gen(dirs));
+    state.stop();
+}
+
 /// The status view has to notice a rule change wherever the rule lives.
 ///
 /// An in-tree `.gitignore` rides the worktree watch, but git reads two
@@ -4935,3 +5040,4 @@ fn submodule_reads_its_checked_out_head() {
         vec![("deps/mod".to_string(), b' ', b'M')]
     );
 }
+
