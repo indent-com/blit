@@ -351,6 +351,13 @@ export function StatusBar(props: {
           )
         }
       </Show>
+      <button
+        onClick={props.toggleDebug}
+        style={{ ...iconButtonStyle(), opacity: props.debug ? 1 : 0.3 }}
+        title={t("statusbar.debugStats")}
+      >
+        {"\u25C6"}
+      </button>
       <Show when={props.audioAvailable || props.hasSurfaces}>
         <button
           onClick={props.onMedia}
@@ -363,13 +370,6 @@ export function StatusBar(props: {
           {"\u266A"}
         </button>
       </Show>
-      <button
-        onClick={props.toggleDebug}
-        style={{ ...iconButtonStyle(), opacity: props.debug ? 1 : 0.3 }}
-        title={t("statusbar.debugStats")}
-      >
-        {"\u25C6"}
-      </button>
       <button
         onClick={props.onToggleLeftDock}
         style={{

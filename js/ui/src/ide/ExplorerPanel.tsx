@@ -995,27 +995,31 @@ export function ExplorerPanel(props: {
                               // Touch never reaches onDragStart. A hold, so
                               // the tree still scrolls — and the same two
                               // payloads, or a file dropped on a directory
-                              // would open instead of moving.
+                              // would open instead of moving. A hold released
+                              // without moving is the touch right-click: it
+                              // opens the row's menu. Rows with nothing to
+                              // drag pass a null fill and get only the menu.
                               onPointerDown={(e) => {
                                 const s = props.session;
                                 if (!s) return;
-                                if (row.type !== FS_ENTRY_FILE && !isMoveTarget)
-                                  return;
                                 startTouchDrag(
                                   e,
-                                  (dt) => {
-                                    if (row.type === FS_ENTRY_FILE)
-                                      fillTileDrag(
-                                        dt,
-                                        s.fileAssignment(row.relPath),
-                                      );
-                                    fillFsMoveDrag(dt, {
-                                      connectionId: String(s.connectionId),
-                                      root: s.root() ?? "",
-                                      relPath: row.relPath,
-                                    });
-                                  },
+                                  row.type === FS_ENTRY_FILE || isMoveTarget
+                                    ? (dt) => {
+                                        if (row.type === FS_ENTRY_FILE)
+                                          fillTileDrag(
+                                            dt,
+                                            s.fileAssignment(row.relPath),
+                                          );
+                                        fillFsMoveDrag(dt, {
+                                          connectionId: String(s.connectionId),
+                                          root: s.root() ?? "",
+                                          relPath: row.relPath,
+                                        });
+                                      }
+                                    : null,
                                   "long-press",
+                                  { holdMenu: true },
                                 );
                               }}
                               onDragOver={(e) => {

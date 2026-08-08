@@ -43,7 +43,6 @@ export function HelpOverlay(props: {
         ["Ctrl+Shift+K", t("help.soloPane")],
         ["Ctrl+Shift+O", "Open a URL as a web pane"],
         ["Ctrl+Shift+`", t("help.debugPanel")],
-        ["Ctrl+Shift+A", t("help.resetAudio")],
         ["Ctrl+?", t("help.thisHelp")],
         ["Escape", t("help.closeOverlay")],
       ],
@@ -125,6 +124,7 @@ export function HelpOverlay(props: {
       items: [
         ["Swipe", t("help.touchScroll")],
         ["Long-press + drag", t("help.touchSelectCopy")],
+        ["Long-press, release", t("help.touchRightClick")],
         ["Toolbar Paste", t("help.touchPaste")],
       ],
     },

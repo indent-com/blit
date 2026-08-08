@@ -622,7 +622,7 @@ export class BlitSurfaceCanvas {
     startY: number;
     lastX: number;
     lastY: number;
-    mode: "pending" | "scroll" | "drag";
+    mode: "pending" | "held" | "scroll" | "drag";
     longPressTimer: ReturnType<typeof setTimeout> | null;
     pointerId?: number;
   } | null = null;
@@ -1772,9 +1772,10 @@ export class BlitSurfaceCanvas {
         const active = this.activeTouch;
         if (!active || active.identifier !== identifier) return;
         active.longPressTimer = null;
-        active.mode = "drag";
-        this.sendPointerAt(active.lastX, active.lastY, SURFACE_POINTER_MOVE, 0);
-        this.sendPointerAt(active.lastX, active.lastY, SURFACE_POINTER_DOWN, 0);
+        // The hold completed, but nothing goes on the wire yet: moving from
+        // here starts the left-button drag, lifting without moving is a
+        // right-click. The finger's next event decides which.
+        active.mode = "held";
       }, 350),
     };
   }
@@ -1800,6 +1801,14 @@ export class BlitSurfaceCanvas {
       // left — another window, or nowhere — and the first drag after
       // touching elsewhere scrolls nothing until a tap re-seeds it.
       this.sendPointerAt(clientX, clientY, SURFACE_POINTER_MOVE, 0);
+    }
+
+    if (active.mode === "held" && moved > 8) {
+      // The held finger moved: this is the drag the hold was waiting for.
+      // The press lands where the finger is now, and the motion that
+      // follows carries it.
+      active.mode = "drag";
+      this.sendPointerAt(clientX, clientY, SURFACE_POINTER_DOWN, 0);
     }
 
     active.lastX = clientX;
@@ -1832,6 +1841,11 @@ export class BlitSurfaceCanvas {
     if (active.mode === "drag") {
       this.sendPointerAt(clientX, clientY, SURFACE_POINTER_MOVE, 0);
       this.sendPointerAt(clientX, clientY, SURFACE_POINTER_UP, 0);
+    } else if (active.mode === "held") {
+      // A hold that never moved is a right-click. Button 2 is the DOM's
+      // right button, mapped to BTN_RIGHT server-side like a mouse's.
+      this.sendPointerAt(clientX, clientY, SURFACE_POINTER_DOWN, 2);
+      this.sendPointerAt(clientX, clientY, SURFACE_POINTER_UP, 2);
     } else if (active.mode === "pending") {
       this.sendPointerAt(clientX, clientY, SURFACE_POINTER_DOWN, 0);
       this.sendPointerAt(clientX, clientY, SURFACE_POINTER_UP, 0);
@@ -1936,6 +1950,10 @@ export class BlitSurfaceCanvas {
 
     if (active.mode === "drag") {
       this.sendPointerAt(active.lastX, active.lastY, SURFACE_POINTER_UP, 0);
+    } else if (active.mode === "held") {
+      // As in endTouchGesture(): a hold that never moved is a right-click.
+      this.sendPointerAt(touch.clientX, touch.clientY, SURFACE_POINTER_DOWN, 2);
+      this.sendPointerAt(touch.clientX, touch.clientY, SURFACE_POINTER_UP, 2);
     } else if (active.mode === "pending") {
       // A tap is a left click.  Use the release coordinate to match what the
       // user sees if their finger drifted slightly during the tap.

@@ -685,6 +685,61 @@ describe("BlitSurfaceCanvas touch", () => {
     ]);
     surface.dispose();
   });
+
+  /**
+   * The touch right-click: a hold that completes and releases without the
+   * finger ever travelling. Button 2 is the DOM's right button, mapped to
+   * BTN_RIGHT server-side exactly like a mouse's right press.
+   */
+  it("sends a right-click for a hold released without moving", () => {
+    const { surface, canvas, pointers } = attachScrolling();
+
+    canvas.dispatchEvent(pointerEvent("pointerdown", 40, 40));
+    canvas.dispatchEvent(touchEvent("touchstart", [FINGER]));
+    vi.advanceTimersByTime(400); // past the 350ms hold
+    canvas.dispatchEvent(pointerEvent("pointerup", 40, 40));
+    canvas.dispatchEvent(touchEvent("touchend", [FINGER], { ongoing: false }));
+
+    expect(pointers).toEqual([
+      { type: SURFACE_POINTER_DOWN, button: 2, x: 40, y: 40 },
+      { type: SURFACE_POINTER_UP, button: 2, x: 40, y: 40 },
+    ]);
+    surface.dispose();
+  });
+
+  /** The same hold, followed by movement, stays the drag it always was. */
+  it("still starts a left drag when the held finger moves", () => {
+    const { surface, canvas, pointers } = attachScrolling();
+
+    canvas.dispatchEvent(pointerEvent("pointerdown", 40, 40));
+    vi.advanceTimersByTime(400);
+    canvas.dispatchEvent(pointerEvent("pointermove", 40, 100));
+    canvas.dispatchEvent(pointerEvent("pointermove", 40, 120));
+    canvas.dispatchEvent(pointerEvent("pointerup", 40, 120));
+
+    expect(pointers).toEqual([
+      { type: SURFACE_POINTER_DOWN, button: 0, x: 40, y: 100 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 40, y: 100 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 40, y: 120 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 40, y: 120 },
+      { type: SURFACE_POINTER_UP, button: 0, x: 40, y: 120 },
+    ]);
+    surface.dispose();
+  });
+
+  it("sends a right-click when only touch events arrive", () => {
+    const { surface, canvas, pointers } = attachScrolling();
+
+    canvas.dispatchEvent(touchEvent("touchstart", [FINGER]));
+    vi.advanceTimersByTime(400);
+    canvas.dispatchEvent(touchEvent("touchend", [FINGER], { ongoing: false }));
+
+    expect(pointers).toEqual([
+      { type: SURFACE_POINTER_DOWN, button: 2, x: 40, y: 40 },
+      { type: SURFACE_POINTER_UP, button: 2, x: 40, y: 40 },
+    ]);
+    surface.dispose();
+  });
 });
 
 /**

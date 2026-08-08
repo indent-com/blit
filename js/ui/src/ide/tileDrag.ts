@@ -131,10 +131,21 @@ const LONG_PRESS_SLOP_PX = 10;
  * takes over only for touch. See {@link TouchDragActivation} for why a handle
  * and a list row start differently.
  */
+/** Optional behaviours for {@link startTouchDrag}. */
+export interface TouchDragOptions {
+  /** A hold released without travel is a right-click: rather than dropping
+   *  the payload back on the element it lifted from, dispatch a contextmenu
+   *  where the finger rises (and swallow the click the release also
+   *  produces). Pair with a `null` fill on elements that have a menu but
+   *  nothing to drag. */
+  holdMenu?: boolean;
+}
+
 export function startTouchDrag(
   e: PointerEvent,
-  fill: (data: DataTransfer) => void,
+  fill: ((data: DataTransfer) => void) | null,
   activate: TouchDragActivation = "move",
+  options?: TouchDragOptions,
 ): void {
   // Touch only, and tested positively rather than by excluding mouse: a pen
   // drives native drag-and-drop in Chromium just as a mouse does, so letting
@@ -147,11 +158,15 @@ export function startTouchDrag(
   if (!handle || typeof DataTransfer !== "function") return;
 
   const data = new DataTransfer();
-  fill(data);
+  fill?.(data);
 
   const startX = e.clientX;
   const startY = e.clientY;
   let dragging = false;
+  /** The hold completed (long-press / swipe-left only). */
+  let held = false;
+  /** The drag travelled past the tap threshold. */
+  let dragMoved = false;
   let over: Element | null = null;
   let holdTimer: ReturnType<typeof setTimeout> | null = null;
   let last: PointerEvent = e;
@@ -243,6 +258,7 @@ export function startTouchDrag(
         begin(ev);
       }
     }
+    if (!dragMoved && moved(ev, TOUCH_DRAG_THRESHOLD_PX)) dragMoved = true;
     // Capture routes the pointer events here, but hit-testing is ours to do.
     const el = document.elementFromPoint(ev.clientX, ev.clientY);
     if (el !== over) {
@@ -257,16 +273,10 @@ export function startTouchDrag(
     if (el) fire(el, "dragover", ev);
   };
 
-  const onUp = (ev: PointerEvent) => {
-    if (ev.pointerId !== e.pointerId) return;
-    stop();
-    if (!dragging) return; // a tap: leave the click alone
-    const el = document.elementFromPoint(ev.clientX, ev.clientY);
-    if (el) fire(el, "drop", ev);
-    fire(handle, "dragend", ev);
-    // The release also produces a click, which on this handle means "move the
-    // toolbar to the next corner" — not what a completed drag asked for. The
-    // native path gets this for free; here it has to be swallowed.
+  // The release also produces a click, which on this handle means "move the
+  // toolbar to the next corner" — not what a completed drag or a menu asked
+  // for. The native path gets this for free; here it has to be swallowed.
+  const swallowClick = () => {
     const swallow = (click: Event) => {
       click.stopPropagation();
       click.preventDefault();
@@ -276,6 +286,32 @@ export function startTouchDrag(
       () => handle.removeEventListener("click", swallow, { capture: true }),
       0,
     );
+  };
+
+  const onUp = (ev: PointerEvent) => {
+    if (ev.pointerId !== e.pointerId) return;
+    stop();
+    if (options?.holdMenu && held && !dragMoved) {
+      // A hold that went nowhere is a right-click, not a drop on the element
+      // the press started from. Balance the drag the hold began, then open
+      // the context menu where the finger lifts.
+      if (dragging) fire(handle, "dragend", ev);
+      handle.dispatchEvent(
+        new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          clientX: ev.clientX,
+          clientY: ev.clientY,
+        }),
+      );
+      swallowClick();
+      return;
+    }
+    if (!dragging) return; // a tap: leave the click alone
+    const el = document.elementFromPoint(ev.clientX, ev.clientY);
+    if (el) fire(el, "drop", ev);
+    fire(handle, "dragend", ev);
+    swallowClick();
   };
 
   const onCancel = (ev: PointerEvent) => {
@@ -304,9 +340,12 @@ export function startTouchDrag(
   if (activate === "long-press" || activate === "swipe-left") {
     holdTimer = setTimeout(() => {
       holdTimer = null;
+      held = true;
       // Still down and still still: the press was a request to drag, not to
       // scroll past. Everything after this point is the same as a handle's.
-      if (!dragging) begin(last);
+      // A null fill means the element has nothing to drag — the hold only
+      // arms the menu a stationary release asks for.
+      if (!dragging && fill) begin(last);
     }, LONG_PRESS_MS);
   }
 }

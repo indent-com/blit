@@ -68,8 +68,6 @@ export interface KeyboardShortcutHandlers {
   backgroundFocusedTile: () => boolean;
   /** Close the focused IDE tile outright (no dock parking). */
   closeFocusedTile: () => boolean;
-  /** Reset the audio pipeline on all connections to recover from stalled audio */
-  resetAudio: () => void;
   /** Navigate the focused tile pane's history back / forward (like a browser). */
   navigateBack: () => void;
   navigateForward: () => void;
@@ -208,6 +206,10 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
     const isMacLike = /Mac|iPhone|iPad/.test(navigator.platform);
     const handler = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
+      // Wayland applications own their Ctrl+Shift chords (Zed's command
+      // palette is Ctrl+Shift+P): while a surface has keyboard focus, blit's
+      // dock/overlay shortcuts must not steal them.
+      const surfaceOwnsCtrlShift = hasFocusedWaylandSurface(h);
 
       if (mod && !e.shiftKey && e.key === "k") {
         // On a Mac keyboard, Ctrl+K in a focused terminal is the shell's
@@ -221,39 +223,49 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
           return;
         }
       }
-      if (e.ctrlKey && e.shiftKey && (e.key === "?" || e.code === "Slash")) {
+      if (
+        !surfaceOwnsCtrlShift &&
+        e.ctrlKey &&
+        e.shiftKey &&
+        (e.key === "?" || e.code === "Slash")
+      ) {
         e.preventDefault();
         h.toggleOverlay("help");
         return;
       }
-      if (e.ctrlKey && e.shiftKey && (e.key === "~" || e.key === "`")) {
+      if (
+        !surfaceOwnsCtrlShift &&
+        e.ctrlKey &&
+        e.shiftKey &&
+        (e.key === "~" || e.key === "`")
+      ) {
         e.preventDefault();
         h.toggleDebug();
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "B") {
+      if (!surfaceOwnsCtrlShift && e.ctrlKey && e.shiftKey && e.key === "B") {
         e.preventDefault();
         h.togglePreviewPanel();
         return;
       }
       // Ctrl+Shift+E/L/P: reveal a left-dock section. (Changes is folded into
       // Files, so its former Ctrl+Shift+G is retired.)
-      if (e.ctrlKey && e.shiftKey && e.key === "E") {
+      if (!surfaceOwnsCtrlShift && e.ctrlKey && e.shiftKey && e.key === "E") {
         e.preventDefault();
         h.toggleLeftPanel("explorer");
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "F") {
+      if (!surfaceOwnsCtrlShift && e.ctrlKey && e.shiftKey && e.key === "F") {
         e.preventDefault();
         h.toggleSearch();
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "L") {
+      if (!surfaceOwnsCtrlShift && e.ctrlKey && e.shiftKey && e.key === "L") {
         e.preventDefault();
         h.toggleLeftPanel("log");
         return;
       }
-      if (e.ctrlKey && e.shiftKey && e.key === "P") {
+      if (!surfaceOwnsCtrlShift && e.ctrlKey && e.shiftKey && e.key === "P") {
         e.preventDefault();
         h.toggleLeftPanel("problems");
         return;
@@ -271,19 +283,20 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
       }
       // Ctrl+Shift+O: open a URL as a web pane. (Chrome binds this to its
       // bookmark manager on Windows/Linux; it is one line to change here.)
-      if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.key === "O") {
+      if (
+        !surfaceOwnsCtrlShift &&
+        e.ctrlKey &&
+        e.shiftKey &&
+        !e.altKey &&
+        !e.metaKey &&
+        e.key === "O"
+      ) {
         e.preventDefault();
         h.toggleOverlay("web");
         return;
       }
       // Workspace roots have no shortcut of their own: they are an entry in
       // the Cmd+K switcher, alongside remotes, palette, and font.
-      // Ctrl+Shift+A: reset audio pipeline (recover from stalled audio).
-      if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.key === "A") {
-        e.preventDefault();
-        h.resetAudio();
-        return;
-      }
       if (mod && !e.shiftKey && e.key === "Enter") {
         if (h.overlay()) {
           // Let the overlay handle it.

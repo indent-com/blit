@@ -48,7 +48,6 @@ export function MediaOverlay(props: {
   onVideoSpeedChange: (speed: number) => void;
   onSurfaceStreamingChange: (enabled: boolean) => void;
   onToggleAudio: () => void;
-  onResetAudio: () => void;
   onClose: () => void;
 }) {
   const theme = () => themeFor(props.palette);
@@ -452,17 +451,6 @@ export function MediaOverlay(props: {
                       On
                     </button>
                   </div>
-                  <button
-                    onClick={props.onResetAudio}
-                    title="Reset audio pipeline (Ctrl+Shift+A)"
-                    style={{
-                      ...ui.btn,
-                      "font-size": `${scale().sm}px`,
-                      opacity: 0.6,
-                    }}
-                  >
-                    Reset
-                  </button>
                 </div>
               </div>
             </Show>

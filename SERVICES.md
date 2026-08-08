@@ -1,6 +1,6 @@
 # Services
 
-This document describes the hosted services and CI/CD infrastructure that support blit. For the system architecture, see [ARCHITECTURE.md](ARCHITECTURE.md). For development workflow, see [CONTRIBUTING.md](CONTRIBUTING.md).
+This document describes the hosted services and CI/CD infrastructure that support blit. For the system architecture, see [ARCHITECTURE.md](ARCHITECTURE.md). editor:local:/src/blit/SERVICES.mdFor development workflow, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Running as a service
 

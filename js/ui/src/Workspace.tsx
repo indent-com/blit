@@ -1766,9 +1766,12 @@ function WorkspaceScreen(props: {
       );
       return sess.filter((s) => s.state !== "closed" && !assigned.has(s.id));
     }
-    // When a surface is focused the terminal it displaced is off-screen — as
-    // is the parked one, which is the whole point of parking it.
-    if (focusedSurfaceId() != null || mainTerminalParked()) {
+    // When a surface or a tile is focused the terminal it displaced is
+    // off-screen — as is the parked one, which is the whole point of
+    // parking it.  focusedSessionId still points at that terminal, so
+    // without this branch it would be filtered out below while nothing
+    // renders it.
+    if (focusedSurfaceId() != null || activeTile() != null || mainTerminalParked()) {
       return sess.filter((s) => s.state !== "closed");
     }
     return sess.filter(
@@ -4127,6 +4130,16 @@ function WorkspaceScreen(props: {
                 closeOverlay();
               }}
               onApplyLayout={(l) => {
+                // Re-applying the already-active layout object (e.g. the
+                // current preset from the switcher) is a no-op: the signal
+                // setter below would not notify on the same reference, so
+                // clearing layoutAssignments here would leave it null
+                // forever — tile counts vanish from the status bar and the
+                // side panel goes empty until reload.
+                if (l === activeLayout()) {
+                  closeOverlay();
+                  return;
+                }
                 // Clear stale assignments immediately so the hash sync
                 // effect (which runs before BSPContainer re-computes)
                 // doesn't write old pane IDs into the URL.
@@ -4464,8 +4477,18 @@ function WorkspaceScreen(props: {
           <StatusBar
             sessions={sessions()}
             surfaceCount={surfaces().length}
-            tileCount={paneKindCount(isTileAssignment)}
-            webCount={paneKindCount(isWebAssignment)}
+            // Displayed panes plus docked tabs: backgroundTiles already
+            // excludes whatever a pane (or the non-BSP slot) displays, so
+            // the two never double count — and a parked editor still shows
+            // up in the tally, like off-screen terminals do.
+            tileCount={
+              paneKindCount(isTileAssignment) +
+              backgroundTiles().filter(isTileAssignment).length
+            }
+            webCount={
+              paneKindCount(isWebAssignment) +
+              backgroundTiles().filter(isWebAssignment).length
+            }
             hoveredLink={hoveredLink()}
             focusedSession={
               focusedSurfaceId() != null || bspFocusedSurface() != null

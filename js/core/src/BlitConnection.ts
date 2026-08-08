@@ -3326,16 +3326,6 @@ export class BlitConnection {
     this.audioPlayer.setSubscribed(false);
   }
 
-  /**
-   * Reset the audio pipeline to recover from stalled or broken audio.
-   * The server subscription stays active — audio rebuilds automatically
-   * on the next incoming frame without a re-subscribe round-trip.
-   */
-  resetAudio(): void {
-    this._logger.info(`${this.id}: audio pipeline reset`);
-    this.audioPlayer.resetPipeline();
-  }
-
   sendClipboard(mimeType: string, data: Uint8Array): void {
     if (this.transport.status !== "connected") return;
     this.transport.send(buildClipboardMessage(mimeType, data));
