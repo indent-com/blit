@@ -528,16 +528,6 @@ function selectedPayload(): ClipboardPayload | null {
  *  first.  `image/png` is what every toolkit asks for. */
 const IMAGE_MIME_PREFERENCE = ["image/png", "image/webp", "image/jpeg"];
 
-/** How long a paste chord waits for the clipboard before giving up on it.
- *  Both reads it waits on — `readText()` and the `paste` event — are answered
- *  from memory the browser already holds, so this only has to cover an IPC
- *  round trip; the V keypress is stalled for the whole of it. */
-const PASTE_READ_MS = 300;
-/** The same deadline once an image is known to be on the clipboard: the
- *  bytes still have to be read out of the blob, and a screenshot is megabytes
- *  where text was bytes. */
-const PASTE_IMAGE_MS = 3000;
-
 /**
  * The image a clipboard payload carries, if the image is what the paste means.
  *
@@ -714,24 +704,30 @@ export class BlitSurfaceCanvas {
   /** Ctrl release is waiting for the paste-chord key to be released. */
   private _ctrlReleaseDeferred = false;
   /** In-flight Ctrl+V/Cmd+V state.  We defer the V press until the
-   *  clipboard read completes (readText resolve, paste event, or
-   *  timeout) so the Wayland app sees `selection` before `key` — and
-   *  defer the V release and Ctrl release that may fire physically
-   *  during that window, otherwise V arrives at the compositor with
-   *  Ctrl already released and the app types 'v' repeatedly. */
+   *  clipboard read completes — readText resolve/reject, clipboard.read,
+   *  or the paste event — so the Wayland app sees `selection` before
+   *  `key`, and defer the V release and Ctrl release that may fire
+   *  physically during that window, otherwise V arrives at the compositor
+   *  with Ctrl already released and the app types 'v' repeatedly. */
   private _pendingPaste: {
     keycode: number;
     released: boolean;
     deferredCtrlRelease: boolean;
+    /** The chord used Cmd (macOS paste).  Chrome on macOS eats the
+     *  key-up of a key that triggered a menu command (Cmd+V → Paste),
+     *  so its V release never arrives and cannot be waited for: the
+     *  flush sends press and release together.  Cmd chords don't
+     *  autorepeat on macOS, so holding changes nothing. */
+    metaChord: boolean;
   } | null = null;
   private _pendingPasteFlush:
-    | ((payload: ClipboardPayload | null) => void)
-    | null = null;
-  /** Safety-net timer for the in-flight paste, and the cleanup it runs.
-   *  Kept as fields so reading a clipboard image — which is asynchronous,
-   *  unlike `getData()` — can push the deadline back instead of losing the
-   *  paste to it. */
-  private _pendingPasteTimer: ReturnType<typeof setTimeout> | null = null;
+    ((payload: ClipboardPayload | null) => void) | null = null;
+  /** Stand the in-flight chord down without pressing V, releasing anything
+   *  the deferral held back.  Runs when the clipboard is known to hold
+   *  nothing pastable, when an image we declined is all it held, or when
+   *  focus leaves mid-chord.  No timer: every clipboard read is a promise
+   *  that settles, and the paste event is dispatched with the keydown, so
+   *  the chord's outcome is always decided by an event, never guessed. */
   private _pendingPasteAbandon: (() => void) | null = null;
 
   // scroll batching; see queueScroll()
@@ -1578,7 +1574,7 @@ export class BlitSurfaceCanvas {
       document.removeEventListener("paste", this.boundDocumentPaste, true);
     this._pendingPaste = null;
     this._pendingPasteFlush = null;
-    this.clearPasteDeadline();
+    this._pendingPasteAbandon = null;
 
     const ta = this.textInput;
     if (ta) {
@@ -2219,7 +2215,6 @@ export class BlitSurfaceCanvas {
 
     const image = clipboardImage(e.clipboardData);
     if (image) {
-      this.extendPasteDeadline(PASTE_IMAGE_MS);
       void image
         .arrayBuffer()
         .then((buf) => {
@@ -2258,22 +2253,63 @@ export class BlitSurfaceCanvas {
     }
   }
 
-  /** Push the in-flight paste's safety net back, for a clipboard read that
-   *  needs longer than the synchronous paths do. */
-  private extendPasteDeadline(ms: number): void {
-    if (!this._pendingPasteAbandon) return;
-    if (this._pendingPasteTimer !== null) {
-      clearTimeout(this._pendingPasteTimer);
+  /** Read an image off the clipboard for a Ctrl-chord paste whose
+   *  `readText()` came back empty or was denied.  Only ever called for
+   *  Ctrl chords: a Cmd chord's paste event is guaranteed (the macOS menu
+   *  command fires for the textarea focus is forced onto) and owns the
+   *  chord's outcome, while a Ctrl chord that no paste event has claimed
+   *  by the time a promise settles will never see one.  This is what lets
+   *  Ctrl+V paste a screenshot on macOS Chrome.  Every settle of every
+   *  read ends the chord — flush on an image, abandon otherwise — so no
+   *  timer has to guess when the clipboard is done answering.  Needs the
+   *  clipboard-read permission; with no deadline, a first-time prompt no
+   *  longer kills the chord — it flushes when the user grants. */
+  private readClipboardImage(
+    flush: (payload: ClipboardPayload | null) => void,
+  ): void {
+    const read = navigator.clipboard?.read?.bind(navigator.clipboard);
+    if (!read) {
+      this._pendingPasteAbandon?.();
+      return;
     }
-    this._pendingPasteTimer = setTimeout(this._pendingPasteAbandon, ms);
-  }
-
-  private clearPasteDeadline(): void {
-    if (this._pendingPasteTimer !== null) {
-      clearTimeout(this._pendingPasteTimer);
-      this._pendingPasteTimer = null;
-    }
-    this._pendingPasteAbandon = null;
+    void read().then(
+      async (items) => {
+        try {
+          if (!this._pendingPasteFlush) return; // a paste event claimed it
+          const images: { mime: string; item: ClipboardItem }[] = [];
+          for (const item of items) {
+            for (const mime of item.types) {
+              if (mime.startsWith("image/")) images.push({ mime, item });
+            }
+          }
+          // No image either: the clipboard holds nothing we can paste.
+          if (images.length === 0) {
+            this._pendingPasteAbandon?.();
+            return;
+          }
+          // Same preference order as the paste-event path: PNG is what
+          // every toolkit asks for.
+          const pick =
+            IMAGE_MIME_PREFERENCE.map((mime) =>
+              images.find((i) => i.mime === mime),
+            ).find((i) => i !== undefined) ?? images[0];
+          const buf = await (await pick.item.getType(pick.mime)).arrayBuffer();
+          if (!this._pendingPasteFlush) return;
+          if (buf.byteLength > MAX_CLIPBOARD_BYTES) {
+            console.warn(
+              `blit: clipboard image is ${buf.byteLength} bytes, over the ` +
+                `${MAX_CLIPBOARD_BYTES}-byte paste limit — not pasted`,
+            );
+            this._pendingPasteAbandon?.();
+            return;
+          }
+          flush({ mime: pick.mime || "image/png", data: new Uint8Array(buf) });
+        } catch {
+          this._pendingPasteAbandon?.();
+        }
+      },
+      () => this._pendingPasteAbandon?.(),
+    );
   }
 
   private handleKey(e: KeyboardEvent, pressed: boolean): void {
@@ -2404,6 +2440,7 @@ export class BlitSurfaceCanvas {
         keycode,
         released: false,
         deferredCtrlRelease: false,
+        metaChord: e.metaKey && !e.ctrlKey,
       };
 
       // On macOS, Cmd+V arrives with metaKey set.  Wayland apps expect
@@ -2431,20 +2468,24 @@ export class BlitSurfaceCanvas {
         if (!p || p.keycode !== keycode) return;
         this._pendingPaste = null;
         this._pendingPasteFlush = null;
-        this.clearPasteDeadline();
+        this._pendingPasteAbandon = null;
         if (payload) {
           conn.sendClipboard(payload.mime, payload.data);
         }
         if (keycode !== 0) {
           this.pressedKeys.add(keycode);
           conn.sendSurfaceInput(surfaceId, keycode, true);
-          if (p.released) {
+          // A Cmd chord's V key-up never reaches the page (Chrome on macOS
+          // consumes the key equivalent whole — see metaChord above), so
+          // its release goes out with the press; waiting for it would
+          // leave V held and the app key-repeating the paste forever.
+          if (p.released || p.metaChord) {
             this.pressedKeys.delete(keycode);
             conn.sendSurfaceInput(surfaceId, keycode, false);
           }
         }
         if (p.deferredCtrlRelease) {
-          if (keycode !== 0 && !p.released) {
+          if (keycode !== 0 && !p.released && !p.metaChord) {
             // V is still physically held — defer Ctrl release until the
             // keyup V event arrives.  Releasing Ctrl now would leave a
             // bare V press on the Wayland side which the app would
@@ -2459,54 +2500,61 @@ export class BlitSurfaceCanvas {
       };
       this._pendingPasteFlush = flush;
 
-      // Safety net — if neither readText nor the paste event ever
-      // delivers (both paths blocked), clean up the pending state and
-      // undo the Meta→Ctrl translation.  Don't force V through without
-      // clipboard data; pasting stale content is worse than doing
-      // nothing.  Armed before either read starts so that a paste event
-      // carrying an image has a deadline to push back.
+      // Stand-down for the outcomes that must not press V: a clipboard
+      // holding nothing we can paste, or an image we declined to forward —
+      // pressing V behind either would paste something the user did not
+      // copy.  Releases whatever the deferral held back and undoes the
+      // Meta→Ctrl translation.  Never on a timer: the chord's outcome is
+      // decided by the clipboard reads settling, the paste event, or blur.
       this._pendingPasteAbandon = () => {
         const p = this._pendingPaste;
         if (!p || p.keycode !== keycode) return;
         this._pendingPaste = null;
         this._pendingPasteFlush = null;
-        this.clearPasteDeadline();
+        this._pendingPasteAbandon = null;
         if (p.deferredCtrlRelease) {
           this.pressedKeys.delete(29);
           conn.sendSurfaceInput(surfaceId, 29, false);
           this._metaToCtrlKey = 0;
         }
       };
-      this._pendingPasteTimer = setTimeout(
-        this._pendingPasteAbandon,
-        PASTE_READ_MS,
-      );
 
       // `navigator.clipboard.readText()` is often denied without an
       // explicit user-granted permission, and the `paste` event that backs
       // it up only fires reliably on an editable element — Chromium/Brave
       // do not dispatch it to a focused canvas.  Focus normally rests on
       // the textarea already; this is the belt for a view that somehow
-      // left it on the canvas.  handleBlur ignores the transient blur via
-      // the `_pendingPaste` check above.
+      // left it on the canvas.  The canvas↔textarea shuffle this can cause
+      // is exactly what handleBlur's relatedTarget check ignores.
       if (this.textInput) this.textInput.focus({ preventScroll: true });
 
-      navigator.clipboard.readText().then(
-        (text) => {
-          // Only flush when readText actually returned content.  Some
-          // browsers (Brave with sanitization) resolve with `""` instead
-          // of rejecting — if we flushed on empty here, we'd close out
-          // the pending paste and dispatch V with no clipboard update,
-          // causing the Wayland app to paste its previous selection.
-          // `_pendingPasteFlush` being cleared means a paste event already
-          // claimed this chord: an image is on its way and its text
-          // representation, if any, must not pre-empt it.
-          if (text && this._pendingPasteFlush) flush(textPayload(text));
-        },
-        () => {
-          /* paste event will flush */
-        },
-      );
+      const metaChord = e.metaKey && !e.ctrlKey;
+      const imageFallback = () => {
+        // `_pendingPasteFlush` being cleared means a paste event already
+        // claimed this chord: an image is on its way and its text
+        // representation, if any, must not pre-empt it.
+        if (!this._pendingPasteFlush) return;
+        // A Cmd chord's paste event is guaranteed — the macOS menu command
+        // fires against the textarea focus is forced onto — and may trail
+        // the readText settle by a task, so leave the chord for it.  A Ctrl
+        // chord no paste event has claimed by now never gets one (browsers
+        // dispatch it with the keydown, or not at all — macOS Chrome
+        // reserves paste for Cmd), so the image has to be read directly.
+        if (!metaChord) this.readClipboardImage(flush);
+      };
+      navigator.clipboard.readText().then((text) => {
+        if (!this._pendingPasteFlush) return; // a paste event claimed it
+        // Only flush when readText actually returned content.  Some
+        // browsers (Brave with sanitization) resolve with `""` instead
+        // of rejecting — if we flushed on empty here, we'd close out
+        // the pending paste and dispatch V with no clipboard update,
+        // causing the Wayland app to paste its previous selection.
+        if (text) {
+          flush(textPayload(text));
+          return;
+        }
+        imageFallback();
+      }, imageFallback);
       return;
     }
 
@@ -2670,6 +2718,7 @@ export class BlitSurfaceCanvas {
   private releaseAllKeys(): void {
     this._pendingPaste = null;
     this._pendingPasteFlush = null;
+    this._pendingPasteAbandon = null;
     this._ctrlReleaseDeferred = false;
     this._metaToCtrlKey = 0;
     // Held-back and swallowed Alt presses never reached the compositor, so
@@ -2694,11 +2743,10 @@ export class BlitSurfaceCanvas {
     // physically down.
     const to = e.relatedTarget;
     if (to && (to === this.canvas || to === this.textInput)) return;
-    // During an in-flight paste shortcut we may have temporarily moved
-    // focus to the hidden textarea (so the browser dispatches the paste
-    // event to an editable element).  Don't tear down key state — the
-    // paste flush will refocus the canvas and cleanup naturally.
-    if (this._pendingPaste) return;
+    // Focus genuinely leaving mid-paste-chord is the one thing no
+    // clipboard read or paste event will ever settle: stand the chord
+    // down (its V was never pressed) before releasing what is held.
+    this._pendingPasteAbandon?.();
     this.releaseAllKeys();
   }
 

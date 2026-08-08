@@ -1099,6 +1099,220 @@ describe("BlitSurfaceCanvas paste", () => {
     expect(keys).toEqual([]);
     dispose();
   });
+
+  it("releases a Cmd chord's V with its press — macOS eats the key-up", async () => {
+    const { clipboard, keys, canvas, firePaste, dispose } = attachPasting();
+    // Chrome on macOS consumes Cmd+V as the Paste menu command: the page
+    // sees the keydown and the paste event, but the V key-up never
+    // arrives.  Waiting for it would leave V held at the compositor,
+    // key-repeating the paste forever.
+    const key = (
+      type: "keydown" | "keyup",
+      k: string,
+      code: string,
+      meta: boolean,
+    ) =>
+      canvas.dispatchEvent(
+        new KeyboardEvent(type, {
+          key: k,
+          code,
+          metaKey: meta,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    key("keydown", "Meta", "MetaLeft", true);
+    key("keydown", "v", "KeyV", true);
+    firePaste({
+      files: [
+        new File([new Uint8Array([1])], "clip.png", { type: "image/png" }),
+      ],
+    });
+    await settle();
+    // A late V key-up, if a browser ever delivers one, must be inert.
+    key("keyup", "v", "KeyV", true);
+    key("keyup", "Meta", "MetaLeft", false);
+    await settle();
+
+    expect(clipboard).toHaveLength(1);
+    expect(keys).toEqual([
+      { keycode: 125, pressed: true }, // MetaLeft in…
+      { keycode: 125, pressed: false }, // …swapped for Ctrl — Wayland apps paste on Ctrl+V
+      { keycode: 29, pressed: true },
+      { keycode: EVDEV_V, pressed: true },
+      { keycode: EVDEV_V, pressed: false }, // sent with the press, not awaited
+      { keycode: 29, pressed: false }, // the physical Cmd key-up
+    ]);
+    dispose();
+  });
+
+  it("reads an image off the clipboard when the chord fires no paste event", async () => {
+    // macOS Chrome Ctrl+V: no menu command, no paste event — readText
+    // resolves "" for an image-only clipboard and that used to be the end
+    // of it.  The async clipboard API can still hand over the image.
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      clipboard: {
+        readText: vi.fn().mockResolvedValue(""),
+        read: vi.fn().mockResolvedValue([
+          {
+            types: ["image/png"],
+            getType: (mime: string) =>
+              Promise.resolve(new Blob([bytes], { type: mime })),
+          },
+        ]),
+      },
+    });
+    const { clipboard, keys, canvas, pressCtrlV, dispose } = attachPasting();
+    pressCtrlV();
+    await settle();
+    await settle();
+
+    expect(clipboard).toHaveLength(1);
+    expect(clipboard[0].mime).toBe("image/png");
+    expect(Array.from(clipboard[0].data)).toEqual(Array.from(bytes));
+    expect(keys).toEqual([{ keycode: EVDEV_V, pressed: true }]);
+
+    // Ctrl+V keeps its key-up: only Cmd chords release with the press.
+    canvas.dispatchEvent(
+      new KeyboardEvent("keyup", {
+        key: "v",
+        code: "KeyV",
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    expect(keys).toEqual([
+      { keycode: EVDEV_V, pressed: true },
+      { keycode: EVDEV_V, pressed: false },
+    ]);
+    dispose();
+  });
+
+  it("never reads the clipboard directly for a Cmd chord", async () => {
+    // The macOS paste command always follows Cmd+V with a paste event; it
+    // may trail the readText settle by a task, but it owns the chord.
+    // Reading directly anyway would race it — and needlessly prompt for
+    // the clipboard-read permission.
+    const read = vi.fn();
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      clipboard: {
+        readText: vi.fn().mockResolvedValue(""),
+        read,
+      },
+    });
+    const { clipboard, canvas, firePaste, dispose } = attachPasting();
+    canvas.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Meta",
+        code: "MetaLeft",
+        metaKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    canvas.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "v",
+        code: "KeyV",
+        metaKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    firePaste({
+      files: [
+        new File([new Uint8Array([1])], "clip.png", { type: "image/png" }),
+      ],
+    });
+    await settle();
+
+    expect(clipboard).toHaveLength(1);
+    expect(read).not.toHaveBeenCalled();
+    dispose();
+  });
+
+  it("stands a Ctrl chord down on a clipboard with nothing pastable", async () => {
+    // Empty clipboard, no paste event: the chord ends with no V pressed —
+    // decided by the reads settling, not by a timer.
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      clipboard: {
+        readText: vi.fn().mockResolvedValue(""),
+        read: vi.fn().mockResolvedValue([]),
+      },
+    });
+    const { clipboard, keys, canvas, pressCtrlV, dispose } = attachPasting();
+    canvas.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Control",
+        code: "ControlLeft",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    pressCtrlV();
+    // Releasing both keys mid-read defers both releases…
+    canvas.dispatchEvent(
+      new KeyboardEvent("keyup", {
+        key: "v",
+        code: "KeyV",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    canvas.dispatchEvent(
+      new KeyboardEvent("keyup", {
+        key: "Control",
+        code: "ControlLeft",
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    await settle();
+    await settle();
+
+    // …and the stand-down releases the deferred Ctrl without pressing V.
+    expect(clipboard).toHaveLength(0);
+    expect(keys).toEqual([
+      { keycode: 29, pressed: true }, // the physical Ctrl keydown
+      { keycode: 29, pressed: false }, // released by the stand-down
+    ]);
+    dispose();
+  });
+
+  it("stands the chord down when focus leaves mid-read", async () => {
+    // A readText that never settles stands in for a permission prompt;
+    // the user clicking away is the event that ends the chord.
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      clipboard: { readText: vi.fn().mockReturnValue(new Promise(() => {})) },
+    });
+    const { clipboard, keys, canvas, pressCtrlV, dispose } = attachPasting();
+    canvas.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Control",
+        code: "ControlLeft",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    pressCtrlV();
+    canvas.dispatchEvent(new FocusEvent("blur"));
+    await settle();
+
+    expect(clipboard).toHaveLength(0);
+    expect(keys).toEqual([
+      { keycode: 29, pressed: true },
+      { keycode: 29, pressed: false },
+    ]);
+    dispose();
+  });
 });
 
 /** A live view with the text and key sends captured — what soft-keyboard
