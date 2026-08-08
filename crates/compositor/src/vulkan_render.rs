@@ -4223,7 +4223,7 @@ impl VulkanRenderer {
                     .get(surface_id)
                     .is_some_and(|cur| Arc::ptr_eq(cur, &tex));
                 if !same && let Some(old) = self.surface_textures.insert(surface_id.clone(), tex) {
-                    self.pending_destroy_textures.push(old);
+                    self.push_pending_destroy(old);
                 }
                 return;
             }
@@ -4305,10 +4305,10 @@ impl VulkanRenderer {
                 && let Some(bid) = buffer_id
                 && let Some(old) = self.buffer_textures.insert(bid.clone(), tex.clone())
             {
-                self.pending_destroy_textures.push(old);
+                self.push_pending_destroy(old);
             }
             if let Some(old) = self.surface_textures.insert(surface_id.clone(), tex) {
-                self.pending_destroy_textures.push(old);
+                self.push_pending_destroy(old);
             }
         } else {
             static UF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -4333,7 +4333,7 @@ impl VulkanRenderer {
     /// Remove a surface's cached texture.  Called when the surface is destroyed.
     pub(crate) fn remove_surface(&mut self, surface_id: &ObjectId) {
         if let Some(old) = self.surface_textures.remove(surface_id) {
-            self.pending_destroy_textures.push(old);
+            self.push_pending_destroy(old);
         }
     }
 
@@ -4343,7 +4343,7 @@ impl VulkanRenderer {
     /// and the Vulkan objects are freed once that reference goes too.
     pub(crate) fn remove_buffer(&mut self, buffer_id: &ObjectId) {
         if let Some(old) = self.buffer_textures.remove(buffer_id) {
-            self.pending_destroy_textures.push(old);
+            self.push_pending_destroy(old);
         }
     }
 
@@ -4533,7 +4533,7 @@ impl VulkanRenderer {
             .surface_textures
             .insert(surface_id.clone(), Arc::new(tex))
         {
-            self.pending_destroy_textures.push(old);
+            self.push_pending_destroy(old);
         }
         true
     }
@@ -4562,19 +4562,41 @@ impl VulkanRenderer {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::PREINITIALIZED);
 
-        let image = unsafe { self.device.create_image(&image_info, None).ok()? };
+        let image = match unsafe { self.device.create_image(&image_info, None) } {
+            Ok(i) => i,
+            Err(_) => return None,
+        };
         let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
 
-        let mem_type = self.find_memory_type(
+        let Some(mem_type) = self.find_memory_type(
             mem_reqs.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
+        ) else {
+            unsafe { self.device.destroy_image(image, None) };
+            return None;
+        };
 
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
             .memory_type_index(mem_type);
-        let memory = unsafe { self.device.allocate_memory(&alloc_info, None).ok()? };
-        unsafe { self.device.bind_image_memory(image, memory, 0).ok()? };
+        // Every failure past this point must destroy what was already
+        // created: these are full-size (w*h*4) host-visible allocations,
+        // and a descriptor-pool exhaustion here used to leak one per
+        // commit, untracked by any list, until the device was torn down.
+        let memory = match unsafe { self.device.allocate_memory(&alloc_info, None) } {
+            Ok(m) => m,
+            Err(_) => {
+                unsafe { self.device.destroy_image(image, None) };
+                return None;
+            }
+        };
+        if unsafe { self.device.bind_image_memory(image, memory, 0) }.is_err() {
+            unsafe {
+                self.device.free_memory(memory, None);
+                self.device.destroy_image(image, None);
+            }
+            return None;
+        }
 
         // Query actual row pitch and upload.
         let subresource = vk::ImageSubresource {
@@ -4586,11 +4608,19 @@ impl VulkanRenderer {
         let dst_row_pitch = layout.row_pitch as usize;
         let src_row_bytes = width as usize * 4;
 
-        let ptr = unsafe {
+        let ptr = match unsafe {
             self.device
                 .map_memory(memory, 0, layout.size, vk::MemoryMapFlags::empty())
-                .ok()?
-        } as *mut u8;
+        } {
+            Ok(p) => p as *mut u8,
+            Err(_) => {
+                unsafe {
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_image(image, None);
+                }
+                return None;
+            }
+        };
         unsafe {
             let dst = ptr.add(layout.offset as usize);
             for row in 0..height as usize {
@@ -4618,13 +4648,32 @@ impl VulkanRenderer {
                 base_array_layer: 0,
                 layer_count: 1,
             });
-        let view = unsafe { self.device.create_image_view(&view_info, None).ok()? };
+        let view = match unsafe { self.device.create_image_view(&view_info, None) } {
+            Ok(v) => v,
+            Err(_) => {
+                unsafe {
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_image(image, None);
+                }
+                return None;
+            }
+        };
 
         let layouts = [self.descriptor_set_layout];
         let ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&layouts);
-        let descriptor_set = unsafe { self.device.allocate_descriptor_sets(&ds_alloc).ok()?[0] };
+        let descriptor_set = match unsafe { self.device.allocate_descriptor_sets(&ds_alloc) } {
+            Ok(sets) => sets[0],
+            Err(_) => {
+                unsafe {
+                    self.device.destroy_image_view(view, None);
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_image(image, None);
+                }
+                return None;
+            }
+        };
 
         let img_info = vk::DescriptorImageInfo::default()
             .sampler(self.sampler)
@@ -4678,6 +4727,7 @@ impl VulkanRenderer {
         for tex in self.pending_destroy_textures.drain(..) {
             // Still shared with a live cache slot (or another pending
             // entry): drop this reference only.  Whoever holds the last
+            // entry): drop this reference only.  Whoever holds the last
             // one destroys the Vulkan objects when it is evicted itself.
             let Ok(tex) = Arc::try_unwrap(tex) else {
                 continue;
@@ -4690,6 +4740,26 @@ impl VulkanRenderer {
                 self.device.destroy_image(tex.image, None);
                 self.device.free_memory(tex.memory, None);
             }
+        }
+    }
+
+    /// Evict a texture from the caches onto the pending-destroy list.  When
+    /// no tracked GPU work is in flight nothing can still sample it, so
+    /// destroy the backlog right away instead of waiting for the next
+    /// composite-time drain — a surface whose commits never reach a
+    /// composite otherwise piles one full-size texture per commit onto this
+    /// list with nothing to drain it (observed OOM: >100 GB anonymous RSS).
+    fn push_pending_destroy(&mut self, tex: Arc<CachedSurfaceTexture>) {
+        self.pending_destroy_textures.push(tex);
+        if !self.has_tracked_in_flight_work() {
+            self.drain_pending_destroy_textures();
+            return;
+        }
+        let n = self.pending_destroy_textures.len();
+        if n >= 64 && n.is_power_of_two() {
+            eprintln!(
+                "[vulkan-render] pending_destroy_textures backlog at {n} textures; GPU work continuously in flight?"
+            );
         }
     }
 
@@ -4922,14 +4992,33 @@ impl VulkanRenderer {
                 base_array_layer: 0,
                 layer_count: 1,
             });
-        let view = unsafe { self.device.create_image_view(&view_info, None).ok()? };
+        let view = match unsafe { self.device.create_image_view(&view_info, None) } {
+            Ok(v) => v,
+            Err(_) => {
+                unsafe {
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_image(image, None);
+                }
+                return None;
+            }
+        };
 
         // Allocate descriptor set.
         let layouts = [self.descriptor_set_layout];
         let ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&layouts);
-        let descriptor_set = unsafe { self.device.allocate_descriptor_sets(&ds_alloc).ok()?[0] };
+        let descriptor_set = match unsafe { self.device.allocate_descriptor_sets(&ds_alloc) } {
+            Ok(sets) => sets[0],
+            Err(_) => {
+                unsafe {
+                    self.device.destroy_image_view(view, None);
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_image(image, None);
+                }
+                return None;
+            }
+        };
 
         // Update descriptor.
         let img_info = vk::DescriptorImageInfo::default()

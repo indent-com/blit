@@ -1453,6 +1453,12 @@ struct Compositor {
     /// loop that overruns the server's display-rate pacing. See the fallback
     /// note in `handle_surface_commit`.
     last_request_frame_ms: HashMap<u16, u32>,
+    /// Per-surface timestamp (`elapsed_ms`) of the last fallback frame
+    /// callback fired for a surface with no live toplevel.  Nothing
+    /// composites such a surface, so the server's RequestFrame pacing never
+    /// reaches it and firing per commit would let a client that repaints
+    /// per callback free-run at full speed on a window nobody can see.
+    last_topless_frame_ms: HashMap<ObjectId, u32>,
     next_surface_id: u16,
     shm_pools: HashMap<ObjectId, Arc<ShmPool>>,
     /// Per-surface metadata (dimensions, scale, flags) populated at commit time.
@@ -2142,10 +2148,24 @@ impl Compositor {
                 if let Some(held) = self.held_buffers.remove(surface_id) {
                     self.release_held(held);
                 }
-                // Fire any pending frame callbacks so the client doesn't
-                // stall.
-                self.fire_surface_frame_callbacks(surface_id);
-                let _ = self.display_handle.flush_clients();
+                // Fire pending frame callbacks so the client doesn't stall —
+                // but paced.  Nothing composites this surface, so the
+                // server's RequestFrame throttle never reaches it and a
+                // client that repaints per callback would otherwise free-run
+                // at full speed on a window nobody can see.  Unfired
+                // callbacks stay pending; they fire on a later commit here
+                // or once the surface gets a toplevel.
+                const TOPLESS_FRAME_INTERVAL_MS: u32 = 250;
+                let now = elapsed_ms();
+                let due = self
+                    .last_topless_frame_ms
+                    .get(surface_id)
+                    .is_none_or(|&t| now.wrapping_sub(t) >= TOPLESS_FRAME_INTERVAL_MS);
+                if due {
+                    self.last_topless_frame_ms.insert(surface_id.clone(), now);
+                    self.fire_surface_frame_callbacks(surface_id);
+                    let _ = self.display_handle.flush_clients();
+                }
                 return;
             }
         };
@@ -2894,6 +2914,24 @@ impl Compositor {
             self.release_held(old);
         }
 
+        // A surface with no live toplevel — never mapped, or its toplevel
+        // destroyed while the wl_surface lives on — is never composited, so
+        // an upload has no consumer.  It still cost one full-size
+        // host-visible texture per commit, and with no composite running,
+        // nothing drained the eviction backlog either: an animating client
+        // in this state grew the server by w*h*4 per commit until the
+        // kernel OOM-killed it (observed: >100 GB anonymous RSS in minutes
+        // from a 60 fps client).  Consume and release the buffer so the
+        // client's pool doesn't starve, but keep the pixels on the floor.
+        // Cursor surfaces are exempt: their pixels feed `cursor_rgba`.
+        if !is_cursor && self.find_toplevel_root(surface_id).1.is_none() {
+            buf.release();
+            if let Some(r) = release {
+                r.signal();
+            }
+            return;
+        }
+
         // Fast path for non-cursor SHM buffers: the client's mmap'd pool
         // has the pixels already; we copy+convert straight into Vulkan
         // memory and skip the `read_buffer → Vec<u8>` intermediate. Cursor
@@ -3177,6 +3215,7 @@ impl Compositor {
                 for fb in surf.pending_presentation_feedbacks {
                     fb.discarded();
                 }
+                self.last_topless_frame_ms.remove(proto_id);
                 if let Some(ref parent_id) = surf.parent_surface_id
                     && let Some(parent) = self.surfaces.get_mut(parent_id)
                 {
@@ -4680,6 +4719,7 @@ impl Dispatch<WlSurface, ()> for Compositor {
                     for fb in surf.pending_presentation_feedbacks {
                         fb.discarded();
                     }
+                    state.last_topless_frame_ms.remove(&sid);
                     if surf.surface_id > 0 {
                         state.toplevel_surface_ids.remove(&surf.surface_id);
                         state.last_reported_size.remove(&surf.surface_id);
@@ -7579,6 +7619,7 @@ fn run_compositor(
         regions: HashMap::new(),
         toplevel_surface_ids: HashMap::new(),
         last_request_frame_ms: HashMap::new(),
+        last_topless_frame_ms: HashMap::new(),
         next_surface_id: 1,
         shm_pools: HashMap::new(),
         surface_meta: HashMap::new(),
