@@ -407,6 +407,9 @@ struct OutputImage {
     staging_buf: vk::Buffer,
     staging_mem: vk::DeviceMemory,
     staging_ptr: *mut u8,
+
+    /// Readback frame-buffer pool, see [`pooled_pixel_buf`].
+    pixel_pool: Vec<Arc<Vec<u8>>>,
 }
 
 /// Server-allocated BGRA target sized at `(width, height)` for a
@@ -422,6 +425,49 @@ struct DownscaleOutput {
     staging_buf: vk::Buffer,
     staging_mem: vk::DeviceMemory,
     staging_ptr: *mut u8,
+    /// Readback frame-buffer pool, see [`pooled_pixel_buf`].
+    pixel_pool: Vec<Arc<Vec<u8>>>,
+}
+
+/// Reclaim a uniquely-owned readback buffer from the pool, or allocate.
+///
+/// The published `PixelData::Bgra(Arc<Vec<u8>>)` is also held by the
+/// server's `last_pixels` (until the next commit for that key replaces
+/// it) and briefly by encoders, so the previous frame's buffer is
+/// usually still shared when the next frame retires.  Two slots cover
+/// that cadence: by frame N the server has dropped frame N-2's buffer,
+/// leaving it solely to the pool.  A slot is only reused when
+/// `Arc::get_mut` proves unique ownership (sole strong ref, no weak
+/// refs) — a buffer anyone else can still read is never overwritten,
+/// it is dropped from the pool and a fresh one allocated instead.
+fn pooled_pixel_buf(slots: &mut Vec<Arc<Vec<u8>>>, size: usize) -> Arc<Vec<u8>> {
+    let mut idx = 0;
+    while idx < slots.len() {
+        if Arc::strong_count(&slots[idx]) != 1 {
+            idx += 1;
+            continue;
+        }
+        let mut arc = slots.swap_remove(idx);
+        if let Some(v) = Arc::get_mut(&mut arc) {
+            v.clear();
+            if v.capacity() < size {
+                v.reserve(size);
+            }
+            return arc;
+        }
+        // A weak ref lingered: not uniquely owned after all.  The slot
+        // stays out of the pool; keep scanning.
+    }
+    Arc::new(Vec::with_capacity(size))
+}
+
+/// Return a published frame buffer to the pool for later reuse,
+/// keeping at most two slots (see [`pooled_pixel_buf`]).
+fn pool_pixel_buf(slots: &mut Vec<Arc<Vec<u8>>>, arc: &Arc<Vec<u8>>) {
+    slots.push(arc.clone());
+    if slots.len() > 2 {
+        slots.remove(0);
+    }
 }
 
 // Inline SPIR-V for vertex and fragment shaders.
@@ -1146,6 +1192,14 @@ impl VulkanRenderer {
                 if !has_linear {
                     mods.push((drm_fmt, 0u64));
                 }
+                // Advertise DRM_FORMAT_MOD_INVALID (implicit modifier): some
+                // clients (Chromium) refuse to fall back to modifier-less
+                // allocation — letting the driver pick — unless the
+                // compositor opts in this way.  Without it, a driver that
+                // rejects every explicitly advertised modifier (observed with
+                // NVIDIA GBM) leaves the client with no allocation path at
+                // all, even though a plain driver-chosen allocation works.
+                mods.push((drm_fmt, 0x00ff_ffff_ffff_ffffu64));
             }
             eprintln!(
                 "[vulkan-render] {} supported DMA-BUF format/modifier pairs",
@@ -2149,6 +2203,7 @@ impl VulkanRenderer {
             staging_buf,
             staging_mem,
             staging_ptr,
+            pixel_pool: Vec::new(),
         })
     }
 
@@ -4162,6 +4217,7 @@ impl VulkanRenderer {
             staging_buf,
             staging_mem,
             staging_ptr,
+            pixel_pool: Vec::new(),
         })
     }
 
@@ -5483,12 +5539,21 @@ impl VulkanRenderer {
                     results.push((pending.phys_w, pending.phys_h, PixelData::GpuOnly, true));
                 } else {
                     let size = pending.phys_w as usize * pending.phys_h as usize * 4;
-                    let bgra =
-                        unsafe { std::slice::from_raw_parts(img.staging_ptr, size) }.to_vec();
+                    // Re-borrow mutably: the `img` above is a shared
+                    // borrow still live in the arms that call `&self`
+                    // methods; this arm runs after those.
+                    let img = &mut self.output_images[pending.self_output_idx];
+                    let mut bgra = pooled_pixel_buf(&mut img.pixel_pool, size);
+                    Arc::get_mut(&mut bgra)
+                        .expect("pooled_pixel_buf returns a uniquely owned buffer")
+                        .extend_from_slice(unsafe {
+                            std::slice::from_raw_parts(img.staging_ptr, size)
+                        });
+                    pool_pixel_buf(&mut img.pixel_pool, &bgra);
                     results.push((
                         pending.phys_w,
                         pending.phys_h,
-                        PixelData::Bgra(Arc::new(bgra)),
+                        PixelData::Bgra(bgra),
                         zero_copy_live,
                     ));
                 }
@@ -5504,7 +5569,10 @@ impl VulkanRenderer {
         // Per-downscale-target BGRA — server-allocated targets that the
         // render loop blitted into and copied to staging this frame.
         for &(tw, th) in &pending.downscale_targets {
-            let Some(out) = self.downscale_outputs.get(&(pending.surface_id, tw, th)) else {
+            let Some(out) = self
+                .downscale_outputs
+                .get_mut(&(pending.surface_id, tw, th))
+            else {
                 // Target was cleared between submit and retire.  Drop.
                 continue;
             };
@@ -5515,8 +5583,12 @@ impl VulkanRenderer {
                 continue;
             }
             let size = (tw as usize) * (th as usize) * 4;
-            let bgra = unsafe { std::slice::from_raw_parts(out.staging_ptr, size) }.to_vec();
-            results.push((tw, th, PixelData::Bgra(Arc::new(bgra)), false));
+            let mut bgra = pooled_pixel_buf(&mut out.pixel_pool, size);
+            Arc::get_mut(&mut bgra)
+                .expect("pooled_pixel_buf returns a uniquely owned buffer")
+                .extend_from_slice(unsafe { std::slice::from_raw_parts(out.staging_ptr, size) });
+            pool_pixel_buf(&mut out.pixel_pool, &bgra);
+            results.push((tw, th, PixelData::Bgra(bgra), false));
         }
 
         // Always free the fence, command buffer, and per-frame textures.
