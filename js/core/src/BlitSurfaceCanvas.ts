@@ -726,7 +726,7 @@ export class BlitSurfaceCanvas {
   private boundPointerCancel: ((e: PointerEvent) => void) | null = null;
   private boundKeyDown: ((e: KeyboardEvent) => void) | null = null;
   private boundKeyUp: ((e: KeyboardEvent) => void) | null = null;
-  private boundFocus: (() => void) | null = null;
+  private boundFocus: ((e: FocusEvent) => void) | null = null;
   private boundBlur: ((e: FocusEvent) => void) | null = null;
   private boundContextMenu: ((e: Event) => void) | null = null;
   private boundTextInput: ((e: Event) => void) | null = null;
@@ -1416,7 +1416,7 @@ export class BlitSurfaceCanvas {
     this.boundPointerCancel = (e) => this.handlePointerCancel(e);
     this.boundKeyDown = (e) => this.handleKey(e, true);
     this.boundKeyUp = (e) => this.handleKey(e, false);
-    this.boundFocus = () => this.handleFocus();
+    this.boundFocus = (e) => this.handleFocus(e);
     this.boundBlur = (e) => this.handleBlur(e);
     this.boundContextMenu = (e) => e.preventDefault();
     this.boundPaste = (e) => this.handlePaste(e);
@@ -1470,8 +1470,7 @@ export class BlitSurfaceCanvas {
       // (e.g. Enter to confirm, Escape to cancel) still get routed.
       ta.addEventListener("keydown", this.boundKeyDown);
       ta.addEventListener("keyup", this.boundKeyUp);
-      // Focus can now *rest* on the textarea (the mobile keyboard toggle
-      // parks it there so the IME stays up), so it needs the same
+      // Focus *rests* on the textarea, so it carries the same
       // compositor-focus and key-release bookkeeping as the canvas.
       ta.addEventListener("focus", this.boundFocus);
       ta.addEventListener("blur", this.boundBlur);
@@ -1481,10 +1480,12 @@ export class BlitSurfaceCanvas {
       if (this.boundPaste) ta.addEventListener("paste", this.boundPaste);
     }
 
-    // Detect IME composition start on the canvas and redirect focus
-    // to the textarea so the browser's IME UI can work.
+    // Belt and braces for a browser that starts a composition on the canvas
+    // anyway.  Chromium does not — it fires nothing at all while a canvas
+    // holds focus, which is why the handoff cannot wait for this event and
+    // happens on focus instead.
     this.boundCompositionStart = () => {
-      if (this.textInput) this.textInput.focus();
+      if (this.textInput) this.textInput.focus({ preventScroll: true });
     };
     canvas.addEventListener("compositionstart", this.boundCompositionStart);
   }
@@ -1577,6 +1578,14 @@ export class BlitSurfaceCanvas {
     this.sendPointerAt(e.clientX, e.clientY, type, e.button);
   }
 
+  /** Focus where keystrokes should land: the editable textarea, so an input
+   *  method has something to attach to.  The canvas routes the same key
+   *  handlers, so it stands in only while the textarea does not exist. */
+  private focusKeyboardTarget(): void {
+    const target = this.textInput ?? this.canvas;
+    target?.focus({ preventScroll: true });
+  }
+
   private sendPointerAt(
     clientX: number,
     clientY: number,
@@ -1586,7 +1595,7 @@ export class BlitSurfaceCanvas {
     const conn = this.getConn();
     if (!conn || !this.canvas || !this.surface || !this._displaySize) return;
     if (type === SURFACE_POINTER_DOWN) {
-      this.canvas.focus();
+      this.focusKeyboardTarget();
       this.pressedButtons.add(button);
     } else if (type === SURFACE_POINTER_UP) {
       this.pressedButtons.delete(button);
@@ -1704,7 +1713,7 @@ export class BlitSurfaceCanvas {
     pointerId?: number,
   ): void {
     if (!this.canvas || !this.surface || !this._displaySize) return;
-    this.canvas.focus();
+    this.focusKeyboardTarget();
     this.clearActiveTouch();
     this.activeTouch = {
       identifier,
@@ -2310,11 +2319,6 @@ export class BlitSurfaceCanvas {
             this._metaToCtrlKey = 0;
           }
         }
-        // Restore focus to the canvas after the paste event processed on
-        // the hidden textarea (see focus shuffle below).
-        if (this.canvas && document.activeElement === this.textInput) {
-          this.canvas.focus();
-        }
       };
       this._pendingPasteFlush = flush;
 
@@ -2335,23 +2339,20 @@ export class BlitSurfaceCanvas {
           conn.sendSurfaceInput(surfaceId, 29, false);
           this._metaToCtrlKey = 0;
         }
-        if (this.canvas && document.activeElement === this.textInput) {
-          this.canvas.focus();
-        }
       };
       this._pendingPasteTimer = setTimeout(
         this._pendingPasteAbandon,
         PASTE_READ_MS,
       );
 
-      // Chromium/Brave don't reliably dispatch `paste` to a focused
-      // non-editable canvas, and `navigator.clipboard.readText()` is
-      // often denied without an explicit user-granted permission.  Move
-      // focus to the hidden (editable) textarea so the browser's native
-      // paste handling targets it — the paste event fires reliably
-      // there with populated clipboardData.  handleBlur ignores the
-      // transient blur via the `_pendingPaste` check above.
-      if (this.textInput) this.textInput.focus();
+      // `navigator.clipboard.readText()` is often denied without an
+      // explicit user-granted permission, and the `paste` event that backs
+      // it up only fires reliably on an editable element — Chromium/Brave
+      // do not dispatch it to a focused canvas.  Focus normally rests on
+      // the textarea already; this is the belt for a view that somehow
+      // left it on the canvas.  handleBlur ignores the transient blur via
+      // the `_pendingPaste` check above.
+      if (this.textInput) this.textInput.focus({ preventScroll: true });
 
       navigator.clipboard.readText().then(
         (text) => {
@@ -2460,9 +2461,20 @@ export class BlitSurfaceCanvas {
 
   /** Handle text input from the hidden textarea. */
   private handleTextInput(e: InputEvent): void {
-    // During IME composition, wait for compositionend.
-    if (e.isComposing) return;
     const ta = this.textInput;
+    // A composition in progress goes out as a preedit, so the app can draw
+    // it: the textarea capturing it is 1px and transparent, so this is the
+    // only place the pending text becomes legible.  Reported from `input`
+    // rather than `compositionupdate` because that one fires *before* the
+    // DOM is updated — the caret read there is the previous one, which put
+    // the app's cursor at 0 for every composition.
+    if (e.isComposing) {
+      const conn = this.getConn();
+      if (conn && this.surface && this._displaySize && ta) {
+        conn.sendSurfacePreedit(this._surfaceId, ta.value, ta.selectionStart);
+      }
+      return;
+    }
     // Any keydown handleKey processed was preventDefault'ed, which cancels
     // its input event — so what reaches here is text the keyboard delivered
     // *without* a usable keydown: soft-keyboard commits (keyCode 229),
@@ -2485,21 +2497,24 @@ export class BlitSurfaceCanvas {
     if (ta) ta.value = "";
   }
 
-  /** Handle IME composition end — send the composed text and return
-   *  focus to the canvas. */
+  /** Handle IME composition end — send the composed text. */
   private handleCompositionEnd(e: CompositionEvent): void {
     const ta = this.textInput;
     if (!ta) return;
+    const conn = this.getConn();
     if (e.data) {
-      const conn = this.getConn();
       if (conn && this.surface) {
         conn.sendSurfaceText(this._surfaceId, e.data);
       }
+    } else if (conn && this.surface && this._displaySize) {
+      // Cancelled: nothing to commit, so nothing else will take back the
+      // preedit still on screen.
+      conn.sendSurfacePreedit(this._surfaceId, "", 0);
     }
     ta.value = "";
-    // Return focus to the canvas so subsequent keystrokes go through
-    // the normal evdev / e.key path.
-    if (this.canvas) this.canvas.focus();
+    // Focus stays here.  Handing it back to the canvas would end the next
+    // composition before it started, and the keydown/keyup handlers the
+    // canvas would take back are already attached to this element.
   }
 
   /** Send synthetic key-up for every key still held.  Prevents stuck
@@ -2618,7 +2633,21 @@ export class BlitSurfaceCanvas {
     }
   }
 
-  private handleFocus(): void {
+  private handleFocus(e: FocusEvent): void {
+    // Focus that lands on the canvas is handed straight to the textarea.
+    // An input method only engages for an editable element, and a canvas is
+    // not one: while focus rests there the browser fires no composition
+    // events at all, so a composition never starts and everything an IME
+    // exists to produce is never typed.  Focus arrives here from outside
+    // this component too (a pane taking focus, Tab), which is why the
+    // handoff lives on the event rather than only at our own call sites.
+    if (e.target === this.canvas && this.textInput && this._displaySize) {
+      // The textarea is a 1px box in the corner of the container; scrolling
+      // the pane to it would be a visible jump for an invisible element.
+      this.textInput.focus({ preventScroll: true });
+      // Its own focus event sends the surface focus — one message, not two.
+      return;
+    }
     const conn = this.getConn();
     if (!conn || !this.surface || !this._displaySize) return;
     conn.sendSurfaceFocus(this._surfaceId);

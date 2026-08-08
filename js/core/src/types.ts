@@ -325,6 +325,9 @@ export const C2S_SURFACE_CLOSE = 0x2b;
 export const C2S_CLIENT_FEATURES = 0x2d;
 /** Composed text input for a Wayland surface (UTF-8): [0x2F][surface_id:2][text:N] */
 export const C2S_SURFACE_TEXT = 0x2f;
+/** Composition in progress (UTF-8): [0x34][surface_id:2][cursor:2][text:N].
+ *  `cursor` is a byte offset into `text`; empty text withdraws it. */
+export const C2S_SURFACE_PREEDIT = 0x34;
 export const S2C_SURFACE_CREATED = 0x20;
 export const S2C_SURFACE_DESTROYED = 0x21;
 export const S2C_SURFACE_FRAME = 0x22;

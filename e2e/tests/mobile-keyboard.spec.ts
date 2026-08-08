@@ -109,17 +109,19 @@ test("keyboard rises only from the toggle and the key line tracks it", async ({
 });
 
 /**
- * Surface panes must not override the icon: a surface focuses its canvas on
- * every tap, and a canvas is not editable, so an IME dismisses over it —
- * which used to expire the toggle's intent.  While the keyboard is wanted,
- * focus landing on a surface canvas has to be redirected to the surface's
- * hidden IME textarea (which routes keys into the surface), and that
- * textarea carries the same inputmode="none" suppression while it is not.
+ * Surface panes must not override the icon: a canvas is not editable, so an
+ * IME dismisses over it — which used to expire the toggle's intent.  Focus
+ * landing on a surface canvas has to reach the surface's hidden IME textarea
+ * (which routes keys into the surface) instead, and that textarea carries the
+ * same inputmode="none" suppression while the keyboard is not wanted.
  *
- * A real surface needs a Wayland client this stack does not run, so the test
- * plants the exact DOM BlitSurfaceCanvas.attach() produces — a tabindex=0
- * canvas with a labeled textarea beside it — inside the pane section, and
- * exercises the Workspace policy against it.
+ * BlitSurfaceCanvas now performs that handoff itself, on every platform, so
+ * that a composition can start at all.  What this test covers is the
+ * Workspace-level redirect behind it: a capture-phase net for any canvas in a
+ * pane, which is what a synthetic one exercises.  A real surface needs a
+ * Wayland client this stack does not run, so the test plants the DOM shape
+ * BlitSurfaceCanvas.attach() produces — a tabindex=0 canvas with a labeled
+ * textarea beside it — and holds the Workspace policy to it on its own.
  */
 test("the icon's keyboard survives focus landing on a surface canvas", async ({
   page,

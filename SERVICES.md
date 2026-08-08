@@ -273,7 +273,7 @@ flowchart LR
 | Job              | Runner                    | What it does                                                                                                                |
 | ---------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | `nix-syntax`     | ubuntu (4 vCPU)           | `nix-instantiate --parse` on all `.nix` files — catches syntax errors in modules that aren't evaluated by `nix flake check` |
-| `lint`           | ubuntu (4 vCPU)           | `./bin/lint` — `cargo fmt --check` + `prettier --check` + clippy                                                            |
+| `lint`           | ubuntu (4 vCPU)           | `./bin/lint --check` — `cargo fmt --check` + `prettier --check` + clippy                                                    |
 | `dev-check`      | ubuntu (8 vCPU)           | Enters the Nix devshell and runs `bin/dev-check` (smoke-tests the full dev stack)                                           |
 | `test`           | ubuntu (8 vCPU), macOS    | `./bin/tests` — `cargo test --workspace`                                                                                    |
 | `e2e`            | ubuntu (8 vCPU)           | `./bin/e2e` — Playwright against the full stack; uploads report artifact                                                    |

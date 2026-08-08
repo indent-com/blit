@@ -17,6 +17,7 @@ import {
   buildSurfaceAxis2Message,
   buildSurfaceSubscribeMessage,
   buildClientFeaturesMessage,
+  buildSurfacePreeditMessage,
 } from "../protocol";
 import {
   C2S_ACK,
@@ -36,6 +37,7 @@ import {
   C2S_SURFACE_POINTER_AXIS2,
   C2S_SURFACE_SUBSCRIBE,
   C2S_CLIENT_FEATURES,
+  C2S_SURFACE_PREEDIT,
   AXIS_SOURCE_FINGER,
   AXIS_SOURCE_WHEEL,
   AXIS_FLAG_SOURCE_KNOWN,
@@ -473,5 +475,29 @@ describe("buildClientFeaturesMessage", () => {
     expect(msg[1]).toBe(0x02);
     expect(msg[2] | (msg[3] << 8)).toBe(0);
     expect(msg[4] | (msg[5] << 8)).toBe(0);
+  });
+});
+
+/**
+ * The cursor is a byte offset on the wire, because that is what
+ * zwp_text_input_v3 counts in — but the DOM hands us a UTF-16 offset. The two
+ * agree only for ASCII, and a composition is made of exactly the characters
+ * where they don't: a caret sent as a UTF-16 offset lands mid-codepoint in
+ * the app, which is where it draws the cursor.
+ */
+describe("buildSurfacePreeditMessage", () => {
+  it("converts the caret from UTF-16 units to bytes", () => {
+    // "にほ" is 2 UTF-16 units and 6 UTF-8 bytes.
+    const msg = buildSurfacePreeditMessage(7, "にほn", 2);
+    expect(msg[0]).toBe(C2S_SURFACE_PREEDIT);
+    expect(msg[1] | (msg[2] << 8)).toBe(7);
+    expect(msg[3] | (msg[4] << 8)).toBe(6);
+    expect(new TextDecoder().decode(msg.slice(5))).toBe("にほn");
+  });
+
+  it("carries an empty composition, which withdraws it", () => {
+    const msg = buildSurfacePreeditMessage(7, "", 0);
+    expect(msg).toHaveLength(5);
+    expect(msg[3] | (msg[4] << 8)).toBe(0);
   });
 });

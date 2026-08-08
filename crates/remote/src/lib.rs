@@ -347,6 +347,20 @@ pub const C2S_CLIENT_FEATURES: u8 = 0x2D;
 /// for ASCII characters.  Non-ASCII characters are delivered via
 /// zwp_text_input_v3 commit_string when available.
 pub const C2S_SURFACE_TEXT: u8 = 0x2F;
+/// Composition still in progress for a Wayland surface (UTF-8):
+/// [0x34][surface_id:2][cursor:2][text:N]
+///
+/// `cursor` is a byte offset into `text`.  An empty `text` withdraws the
+/// composition, which is what a cancelled one leaves behind.
+///
+/// Sent while the user is still choosing characters, so the app can show the
+/// pending text inline.  Without it a composition is invisible until it is
+/// committed: the browser captures it in an off-screen textarea, so there is
+/// nowhere for the user to read what they have typed so far.  Delivered via
+/// `zwp_text_input_v3` preedit_string, and dropped when the focused client
+/// has no input method enabled — a preedit has nowhere to go but the app's
+/// own text field.
+pub const C2S_SURFACE_PREEDIT: u8 = 0x34;
 /// Read clipboard content for a specific MIME type:
 /// [0x2E][mime_len:2][mime:N]
 /// Server responds with S2C_CLIPBOARD_CONTENT (0x25) containing the data.
@@ -3255,6 +3269,21 @@ pub fn msg_surface_text(surface_id: u16, text: &str) -> Vec<u8> {
     let mut msg = Vec::with_capacity(3 + tb.len());
     msg.push(C2S_SURFACE_TEXT);
     msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(tb);
+    msg
+}
+
+/// Build a `C2S_SURFACE_PREEDIT`: [0x34][surface_id:2][cursor:2][text:N].
+///
+/// `cursor` is a byte offset into `text`, clamped to its length — an offset
+/// past the end would put the caret outside the string the app is drawing.
+pub fn msg_surface_preedit(surface_id: u16, text: &str, cursor: u16) -> Vec<u8> {
+    let tb = text.as_bytes();
+    let cursor = cursor.min(tb.len().min(u16::MAX as usize) as u16);
+    let mut msg = Vec::with_capacity(5 + tb.len());
+    msg.push(C2S_SURFACE_PREEDIT);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(&cursor.to_le_bytes());
     msg.extend_from_slice(tb);
     msg
 }
