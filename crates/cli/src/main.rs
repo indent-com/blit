@@ -20,6 +20,12 @@ use cli::{
     SurfaceCommand, TerminalCommand,
 };
 
+// glibc malloc retains freed memory in per-thread arenas (up to 8 per core);
+// with one tokio worker per core this inflates RSS by hundreds of MB under
+// streaming load. mimalloc returns memory far more aggressively.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     // ProxyDaemon must run synchronously — blit_proxy::run() builds its own
     // tokio runtime, which panics if called from within an existing one.
