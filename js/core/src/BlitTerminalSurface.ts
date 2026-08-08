@@ -3365,6 +3365,16 @@ export class BlitTerminalSurface {
         touchLastY = touch.clientY;
         touchAccum += dy;
         const lineH = this.cell.h || 20;
+        // Every report carries the cell where the drag began: the first
+        // wheel step places the app's cursor there (vim & co. move the
+        // cursor to the reported position), and pinning the rest keeps a
+        // sideways-drifting finger from walking the cursor mid-scroll.
+        const pos = mouseToCell(
+          new MouseEvent("wheel", {
+            clientX: touchStartX,
+            clientY: touchStartY,
+          }),
+        );
         while (Math.abs(touchAccum) >= lineH) {
           touchScrolled = true;
           const dir = touchAccum > 0 ? 1 : -1;
@@ -3373,12 +3383,6 @@ export class BlitTerminalSurface {
           // (dir > 0) reveals what's below, i.e. wheel-down (65) — the
           // same sign convention as the finger scroll in BlitSurfaceCanvas.
           const button = dir > 0 ? 65 : 64;
-          const pos = mouseToCell(
-            new MouseEvent("wheel", {
-              clientX: touch.clientX,
-              clientY: touch.clientY,
-            }),
-          );
           this._workspace?.sendMouse(
             this._sessionId!,
             MOUSE_DOWN,

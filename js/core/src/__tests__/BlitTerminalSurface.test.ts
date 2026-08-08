@@ -1432,4 +1432,41 @@ describe("BlitTerminalSurface mouse-mode touch scrolling", () => {
     expect(sendMouse.mock.calls.map((c) => c[2])).toEqual([64, 64]);
     surface.dispose();
   });
+
+  it("reports every wheel step at the cell where the drag began", () => {
+    const { surface, scrollEl, sendMouse } = attachMouseMode();
+    // Pin the cell metrics and grid size so client pixels map to cells
+    // deterministically (jsdom layout would otherwise collapse the grid).
+    // @ts-expect-error — touching private state purely to drive the test.
+    surface["cell"] = { w: 10, h: 20, pw: 20, ph: 40 };
+    // @ts-expect-error — touching private state purely to drive the test.
+    surface["_rows"] = 24;
+    // @ts-expect-error — touching private state purely to drive the test.
+    surface["_cols"] = 80;
+    const lineH = 20;
+    const finger = { identifier: 1, clientX: 45, clientY: 300 };
+
+    scrollEl.dispatchEvent(touchEvent("touchstart", [finger]));
+    // Drag up two lines while wandering sideways; the reported position
+    // must stay where the drag began, not follow the finger.
+    scrollEl.dispatchEvent(
+      touchEvent("touchmove", [
+        { ...finger, clientX: 120, clientY: 300 - 2 * lineH },
+      ]),
+    );
+    scrollEl.dispatchEvent(
+      touchEvent(
+        "touchend",
+        [{ ...finger, clientX: 120, clientY: 300 - 2 * lineH }],
+        { ongoing: false },
+      ),
+    );
+
+    // Drag-begin cell: col floor(45/10)=4, row floor(300/20)=15.
+    expect(sendMouse.mock.calls.map((c) => [c[2], c[3], c[4]])).toEqual([
+      [65, 4, 15],
+      [65, 4, 15],
+    ]);
+    surface.dispose();
+  });
 });
