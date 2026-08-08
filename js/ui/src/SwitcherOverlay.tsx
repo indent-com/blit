@@ -107,7 +107,8 @@ type ActionItem = {
     | "change-layout"
     | "change-remotes"
     | "change-roots"
-    | "open-web";
+    | "open-web"
+    | "open-search";
   connectionId?: string;
 };
 
@@ -450,6 +451,19 @@ function ActionGlyph(props: {
             />
           </svg>
         );
+      case "open-search":
+        return (
+          <svg
+            viewBox="0 0 24 24"
+            width="24"
+            height="24"
+            fill="none"
+            stroke-width="1.5"
+          >
+            <circle cx="10.5" cy="10.5" r="6" stroke={props.fg} />
+            <path d="M15 15l5 5" stroke={props.fg} />
+          </svg>
+        );
       case "change-remotes":
         return (
           <svg
@@ -709,6 +723,8 @@ export function SwitcherOverlay(props: {
   onRemoveLayout?: (dsl: string) => void;
   /** Open the web-pane picker. */
   onOpenWeb?: () => void;
+  /** Open the project search panel and focus its query input. */
+  onOpenSearch?: () => void;
   onClearLayout?: () => void;
   onSelectPane?: (
     paneId: string,
@@ -1289,7 +1305,7 @@ export function SwitcherOverlay(props: {
       return [{ title: t("switcher.sectionNewTerminal"), items }];
     }
 
-    if (isCommand() && !props.multiConnection) {
+    if (isCommand()) {
       const cmd = commandText();
       return [
         {
@@ -1456,6 +1472,15 @@ export function SwitcherOverlay(props: {
         title: "New web pane",
         subtitle: "Open a URL the server can reach",
         action: "open-web",
+      });
+    }
+    if (props.onOpenSearch) {
+      actions.push({
+        type: "action",
+        key: "action:open-search",
+        title: t("switcher.search"),
+        subtitle: t("switcher.searchDesc"),
+        action: "open-search",
       });
     }
     // Offer "Share URL" when a passphrase is stored locally.
@@ -1658,22 +1683,45 @@ export function SwitcherOverlay(props: {
     }),
   );
 
+  // Narrow viewport: hide preview sidebar, shrink thumbnails.
+  const [narrow, setNarrow] = createSignal(window.innerWidth < 640);
+  onMount(() => {
+    const mq = matchMedia("(max-width: 639px)");
+    const handler = () => setNarrow(mq.matches);
+    mq.addEventListener?.("change", handler);
+    onCleanup(() => mq.removeEventListener?.("change", handler));
+  });
+
+  // Position the preview next to the selected item, clamped to the wrapper.
+  // The wrapper fills the overlay backdrop, which tracks the visual viewport
+  // (software keyboard included), so the wrapper's bounds are the visible
+  // bounds.
+  const positionPreview = () => {
+    const el = itemRefs[selectedIdx()];
+    if (!el || !wrapperRef) return;
+    const wrapperRect = wrapperRef.getBoundingClientRect();
+    const itemRect = el.getBoundingClientRect();
+    const previewH = previewRef?.offsetHeight ?? 0;
+    const itemCenter = itemRect.top + itemRect.height / 2 - wrapperRect.top;
+    const unclamped = itemCenter - previewH / 2;
+    setPreviewTop(
+      Math.max(0, Math.min(unclamped, wrapperRect.height - previewH)),
+    );
+  };
+
   // Scroll selected item into view and position preview panel.
   createEffect(() => {
-    const idx = selectedIdx();
-    const el = itemRefs[idx];
+    const el = itemRefs[selectedIdx()];
     el?.scrollIntoView({ block: "nearest" });
-    requestAnimationFrame(() => {
-      if (!el || !wrapperRef) return;
-      const wrapperRect = wrapperRef.getBoundingClientRect();
-      const itemRect = el.getBoundingClientRect();
-      const previewH = previewRef?.offsetHeight ?? 0;
-      const itemCenter = itemRect.top + itemRect.height / 2 - wrapperRect.top;
-      const unclamped = itemCenter - previewH / 2;
-      setPreviewTop(
-        Math.max(0, Math.min(unclamped, wrapperRect.height - previewH)),
-      );
-    });
+    requestAnimationFrame(positionPreview);
+  });
+
+  // Wrapper resizes when the window or the software keyboard changes the
+  // visible band — re-clamp the preview.
+  onMount(() => {
+    const ro = new ResizeObserver(positionPreview);
+    ro.observe(wrapperRef);
+    onCleanup(() => ro.disconnect());
   });
 
   const selectedItem = () => flatItems()[selectedIdx()] ?? null;
@@ -1689,14 +1737,6 @@ export function SwitcherOverlay(props: {
       sel.type !== "symbol"
     );
   };
-  // Narrow viewport: hide preview sidebar, shrink thumbnails.
-  const [narrow, setNarrow] = createSignal(window.innerWidth < 640);
-  onMount(() => {
-    const mq = matchMedia("(max-width: 639px)");
-    const handler = () => setNarrow(mq.matches);
-    mq.addEventListener?.("change", handler);
-    onCleanup(() => mq.removeEventListener?.("change", handler));
-  });
 
   const uiFont = () => props.fontFamily ?? "inherit";
   const compact = 0.75;
@@ -1948,17 +1988,25 @@ export function SwitcherOverlay(props: {
       props.onOpenWeb?.();
       return;
     }
+    if (item.action === "open-search") {
+      props.onOpenSearch?.();
+      return;
+    }
     if (item.action === "clear-local-storage") {
       localStorage.clear();
       location.reload();
       return;
     }
     // new-terminal: if remotes are configured, no connection is already
-    // resolved (e.g. via "rabbit>htop" prefix), and we're not already in the
-    // sub-menu, show the "New terminal on…" picker instead of creating immediately.
+    // resolved (e.g. via "rabbit>htop" prefix), we're not already in the
+    // sub-menu, and there is no command to run, show the "New terminal on…"
+    // picker instead of creating immediately.  A bare ">cmd" runs locally —
+    // diverting it to the picker would clear the query and lose the command.
+    const cmd = commandText() || inlineCmd() || undefined;
     if (
       item.action === "new-terminal" &&
       !item.connectionId &&
+      !cmd &&
       !newTerminalMode() &&
       props.remotes &&
       props.remotes.length > 0
@@ -1970,7 +2018,6 @@ export function SwitcherOverlay(props: {
       searchRef?.focus();
       return;
     }
-    const cmd = commandText() || inlineCmd() || undefined;
     if (props.focusedPaneId && props.onSelectPane) {
       props.onSelectPane(props.focusedPaneId, null, cmd, item.connectionId);
     } else {
@@ -2110,6 +2157,12 @@ export function SwitcherOverlay(props: {
         ref={wrapperRef}
         style={{
           position: "relative",
+          // Full backdrop height so the panel's percentage max-height
+          // resolves (and the panel stays vertically centered).
+          height: "100%",
+          display: "flex",
+          "flex-direction": "column",
+          "justify-content": "center",
           "margin-right":
             narrow() || newTerminalMode() ? undefined : sidebarWidth,
         }}
@@ -2675,7 +2728,9 @@ export function SwitcherOverlay(props: {
                 left: "100%",
                 top: `${previewTop()}px`,
                 width: sidebarWidth,
-                "max-height": "20em",
+                // % of the wrapper, which fills the band-tracking backdrop.
+                // The preview scrolls instead of running off the screen.
+                "max-height": "calc(100% - 16px)",
                 "background-color": theme().solidPanelBg,
                 border: `1px solid ${theme().subtleBorder}`,
                 "border-left": "none",
@@ -2684,7 +2739,8 @@ export function SwitcherOverlay(props: {
                 "flex-direction": "column",
                 gap: `${scale().tightGap}px`,
                 "border-radius": "0",
-                overflow: "hidden",
+                "overflow-y": "auto",
+                ...scrollbarStyle(theme()),
               }}
             >
               <Show when={sel().type === "layout"}>

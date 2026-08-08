@@ -19,7 +19,7 @@ import {
   createBlitWorkspaceState,
   createBlitWorkspaceConnection,
 } from "@blit-sh/solid";
-import { BlitWorkspace, PALETTES, LSP_STATUS_OK } from "@blit-sh/core";
+import { BlitWorkspace, PALETTES, LSP_STATUS_OK, isIOS } from "@blit-sh/core";
 import type {
   BlitTransport,
   BlitSession,
@@ -931,13 +931,18 @@ function WorkspaceScreen(props: {
   // nothing.  Reaching into another pane is safe: that pane's own focusin
   // moves BSP focus to match, so the caret never lands out of sight.
   function focusedKeyboardInput(): HTMLElement | null {
-    // A soloed-away pane and a background tab are `display:none`, which nulls
-    // offsetParent on the absolutely positioned input.  focus() there is a
-    // silent no-op, so returning one lit the icon over a keyboard that never
-    // came up.  Parked thumbnails are `inert` — same silent no-op, but with
-    // offsetParent still set, so they need their own check.
+    // A soloed-away pane and a background tab are `display:none`, which
+    // leaves the input with no client rects.  focus() there is a silent
+    // no-op, so returning one lit the icon over a keyboard that never came
+    // up.  offsetParent can't be the test: the IME textareas are
+    // position:fixed (pinned to the screen top, always clear of the
+    // keyboard), and offsetParent is null on fixed elements even when
+    // rendered.  Parked thumbnails are `inert` — same silent no-op, but
+    // with boxes still laid out, so they need their own check.
     const focusable = (el: HTMLElement | null | undefined) =>
-      el?.offsetParent && !el.closest("[inert]") ? el : null;
+      el && el.getClientRects().length > 0 && !el.closest("[inert]")
+        ? el
+        : null;
     const focusedPane = document.querySelector<HTMLElement>(
       '[data-blit-bsp-focused="true"]',
     );
@@ -1051,8 +1056,71 @@ function WorkspaceScreen(props: {
   });
 
   /** Toggle the virtual keyboard on mobile. */
+  // Completes the iPadOS focus hop (see toggleMobileKeyboard): the real
+  // target gets focus back once something is genuinely parked over the
+  // viewport — the only signal that WebKit accepted the host's assist.
+  let pendingHopLand: (() => void) | null = null;
+  createEffect(() => {
+    // Read occlusion() unconditionally: short-circuiting it behind
+    // pendingHopLand would subscribe to nothing on the first run, and the
+    // effect would never fire.
+    const occ = occlusion();
+    const land = pendingHopLand;
+    if (land && occ > 32) {
+      pendingHopLand = null;
+      land();
+    }
+  });
+
+  // The focus-hop host for iPadOS (see toggleMobileKeyboard): a plain 1px
+  // textarea at the document level.  It must stay outside `section` (so the
+  // sticky-refocus net reads it as "nothing took focus") and outside the
+  // inputmode-stamping selectors (so it keeps a real inputmode and the IME
+  // will assist it).
+  let keyboardHost: HTMLTextAreaElement | null = null;
+  function keyboardHostEl(): HTMLTextAreaElement {
+    if (!keyboardHost || !keyboardHost.isConnected) {
+      keyboardHost = document.createElement("textarea");
+      keyboardHost.setAttribute("aria-label", "Keyboard host");
+      Object.assign(keyboardHost.style, {
+        position: "fixed",
+        top: "0",
+        left: "0",
+        width: "1px",
+        height: "1px",
+        opacity: "0",
+        padding: "0",
+        border: "none",
+        outline: "none",
+        resize: "none",
+        overflow: "hidden",
+      });
+      document.body.appendChild(keyboardHost);
+    }
+    return keyboardHost;
+  }
+
+  // What held focus just before the current tap.  Whether a tapped button
+  // takes focus differs by engine (iPadOS: no; Chromium: yes, during the
+  // tap's click), so the already-focused decision in the toggle reads this
+  // snapshot — the state *before* the tap's own focus churn — instead of
+  // the live activeElement at handler time.
+  let preTapFocus: Element | null = null;
+  const snapshotPreTapFocus = () => {
+    preTapFocus = document.activeElement;
+  };
+  document.addEventListener("pointerdown", snapshotPreTapFocus, true);
+  onCleanup(() =>
+    document.removeEventListener("pointerdown", snapshotPreTapFocus, true),
+  );
+
   function toggleMobileKeyboard() {
-    if (keyboardWanted()) {
+    // A tap means "put it away" only when a full keyboard is genuinely up.
+    // While intent is lit but no keyboard rose — the IME refused the focus
+    // transition, or the tap landed while the last keyboard was still
+    // draining — the tap is the user asking for the keyboard again, and
+    // taking the hide branch is exactly backwards.
+    if (keyboardWanted() && occlusion() > 150) {
       setKeyboardWanted(false);
       // Blur whatever actually holds the keyboard.  Matching only the terminal
       // selector missed a focused editor, and the fallback then blurred a
@@ -1073,14 +1141,50 @@ function WorkspaceScreen(props: {
       // this very element in this very gesture — clear it directly rather
       // than trust effect ordering.
       el.removeAttribute("inputmode");
-      // Android leaves the textarea focused with no keyboard up — the
-      // pane-focus effect focuses it at load with no user gesture (Chrome
-      // moves focus but raises no IME), and the Back gesture dismisses the
-      // IME without a blur.  focus() on the already-focused element is a
-      // spec'd no-op no keyboard answers, so force a real transition —
-      // unless a full keyboard is already up, where blurring would only
-      // flicker it.
-      if (el === document.activeElement && occlusion() <= 150) el.blur();
+      if (el === preTapFocus) {
+        // A keyboard already up for this very element was only missing the
+        // intent — adopt it without any focus churn, which would just
+        // flicker the keyboard.
+        if (occlusion() > 150) return;
+        if (isIOS()) {
+          // iPadOS only answers a focus CHANGE: focus() on the element that
+          // already holds focus is a no-op, and blur+focus within one tap
+          // nets to zero — no keyboard.  (The tell: switching panes raised
+          // the keyboard, because that lands focus on a *different*
+          // element.)  Hop focus through a neutral host the IME freshly
+          // assists, then hand it to the real target — editable→editable
+          // moves keep the keyboard.  The host lives outside any pane, so
+          // it never holds focus when a show tap happens and every hop is
+          // a real change.
+          const host = keyboardHostEl();
+          el.blur();
+          host.focus();
+          // The handback runs when the keyboard is actually rising — the
+          // occlusion reading is the only proof WebKit accepted the assist —
+          // with a timeout as the fallback for a keyboard that never shows,
+          // so focus isn't parked on the host forever.
+          pendingHopLand = () => {
+            if (keyboardWanted() && document.activeElement === host) el.focus();
+          };
+          setTimeout(() => {
+            const land = pendingHopLand;
+            pendingHopLand = null;
+            land?.();
+          }, 600);
+          return;
+        }
+        // Android leaves the textarea focused with no keyboard up — the
+        // pane-focus effect focuses it at load with no user gesture (Chrome
+        // moves focus but raises no IME), and the Back gesture dismisses the
+        // IME without a blur.  focus() on the already-focused element is a
+        // spec'd no-op no keyboard answers, so force a real transition.  This
+        // must not be gated on the occlusion reading: a keyboard still
+        // draining after an OS dismiss sits over 150px for a moment, and
+        // skipping the blur there made this focus() a no-op — the tap lit
+        // the icon over a keyboard that never rose, and the keyboard then
+        // took extra taps to appear.
+        el.blur();
+      }
       el.focus();
       // Chromium's IME can stay down for a programmatic focus() even inside
       // a tap; where this API exists (Chrome on Android) it raises the
@@ -2492,6 +2596,12 @@ function WorkspaceScreen(props: {
     return rf === base ? rf : `${rf}, ${base}`;
   };
 
+  // Overlays portal to <body> (Overlay.tsx) to escape <main>'s keyboard-pin
+  // transform; give them the font they used to inherit from <main>.
+  createEffect(() => {
+    document.body.style.fontFamily = resolvedFontWithFallback();
+  });
+
   onMount(loadServerFonts);
 
   let lru: SessionId[] = [];
@@ -2694,6 +2804,14 @@ function WorkspaceScreen(props: {
     if (!sid && surfId == null) return; // nothing to focus
     // Defer until Solid commits the DOM update.
     setTimeout(() => {
+      // A switcher action may have moved focus somewhere deliberate by now
+      // (the search panel's input) — don't yank it back to the terminal.
+      const active = document.activeElement;
+      if (
+        active instanceof HTMLElement &&
+        active.closest("[data-blit-search-pane]")
+      )
+        return;
       const el = document.querySelector<HTMLElement>(
         "section textarea[tabindex], section canvas[tabindex]",
       );
@@ -2884,8 +3002,7 @@ function WorkspaceScreen(props: {
 
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
-    | ((sessionId: SessionId, targetPaneId: string) => void)
-    | null = null;
+    ((sessionId: SessionId, targetPaneId: string) => void) | null = null;
   let moveToPaneFn:
     | ((value: string, targetPaneId: string, fromPaneId?: string) => void)
     | null = null;
@@ -4110,6 +4227,15 @@ function WorkspaceScreen(props: {
               }
               onChangeRoots={() => toggleOverlay("roots")}
               onOpenWeb={() => toggleOverlay("web")}
+              onOpenSearch={() => {
+                // Null first: closeOverlay restores previousFocus (the
+                // terminal) on a timeout, which would steal the search
+                // input's focus right back.
+                previousFocus = null;
+                closeOverlay();
+                if (!searchOpen()) setSearchOpen(true);
+                setSearchFocus((n) => n + 1);
+              }}
               defaultRemote={defaultRemote()}
               remotes={remotes()}
               remoteStatuses={remoteStatuses()}
@@ -4466,7 +4592,9 @@ function WorkspaceScreen(props: {
             audioAvailable={allConnections().some((c) => c.supportsAudio)}
             hasSurfaces={surfaces().length > 0}
             isMobileTouch={isMobileTouch()}
-            keyboardOpen={keyboardWanted()}
+            // The icon and the toggle agree: lit means a full keyboard is
+            // genuinely up, so a dim icon's tap always asks for one.
+            keyboardOpen={keyboardWanted() && occlusion() > 150}
             onToggleKeyboard={toggleMobileKeyboard}
             onMedia={() => toggleOverlay("media")}
           />
@@ -4737,8 +4865,9 @@ const SWIPE_THRESHOLD = 60;
 /** Minimum ratio of horizontal to vertical movement for a swipe. */
 const SWIPE_RATIO = 1.5;
 
-/** Shared wrapper for preview-panel thumbnails.  Handles swipe-to-dismiss,
- *  hover state, dismiss animation, header bar with close button. */
+/** Shared wrapper for preview-panel thumbnails.  Handles swipe-right-to-
+ *  dismiss (swipe-left starts a drag, via the touch-drag bridge), hover
+ *  state, dismiss animation, header bar with close button. */
 function Thumbnail(props: {
   theme: Theme;
   scale: UIScale;
@@ -4780,18 +4909,29 @@ function Thumbnail(props: {
     if (!locked) {
       if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
       locked = true;
-      if (Math.abs(dx) < Math.abs(dy) * SWIPE_RATIO) return;
+      // Only a rightward, horizontal-dominant swipe dismisses. A leftward
+      // one is the touch-drag bridge's gesture (see onPointerDown), and a
+      // vertical one is the list's scroll: neither is claimed here.
+      if (dx <= 0 || dx < Math.abs(dy) * SWIPE_RATIO) return;
       setSwiping(true);
     }
     if (!swiping()) return;
     e.preventDefault();
+    if (dx <= 0) {
+      // Reversed through the origin: the gesture is now a leftward drag,
+      // which the touch-drag bridge claims. Hand the card back to rest and
+      // stay out of the way for the rest of the gesture.
+      setSwiping(false);
+      setSwipeX(0);
+      return;
+    }
     setSwipeX(dx);
   }
 
   function onTouchEnd() {
-    if (swiping() && Math.abs(swipeX()) >= SWIPE_THRESHOLD) {
+    if (swiping() && swipeX() >= SWIPE_THRESHOLD) {
       setDismissed(true);
-      setSwipeX(swipeX() > 0 ? 400 : -400);
+      setSwipeX(400);
       setTimeout(() => props.onClose(), 200);
     } else {
       setSwipeX(0);
@@ -4808,14 +4948,15 @@ function Thumbnail(props: {
     <div
       draggable={true}
       onDragStart={(e) => startTileDrag(e, props.assignment)}
-      // Touch never reaches onDragStart. A hold, which is the one gesture the
-      // swipe-to-dismiss below does not claim: that starts on movement, this
-      // on stillness, so the card can still be flicked away.
+      // Touch never reaches onDragStart. A leftward swipe starts the drag —
+      // the one horizontal gesture the swipe-to-dismiss below does not claim
+      // (it claims rightward) — and a hold works as a fallback. Either way
+      // the card can still be flicked away to the right.
       onPointerDown={(e) =>
         startTouchDrag(
           e,
           (dt) => fillTileDrag(dt, props.assignment),
-          "long-press",
+          "swipe-left",
         )
       }
       onMouseEnter={() => setHover(true)}

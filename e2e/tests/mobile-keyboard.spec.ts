@@ -109,6 +109,161 @@ test("keyboard rises only from the toggle and the key line tracks it", async ({
 });
 
 /**
+ * A tap on the toggle means "put the keyboard away" only when a keyboard is
+ * genuinely up.  When the IME refused the focus transition — iPadOS with the
+ * textarea already focused, or a tap landing while the last keyboard was
+ * still draining — intent stays lit over a keyboard that never rose, and the
+ * next tap is the user asking again, not asking to hide.  Taking the hide
+ * branch there is exactly backwards: it made a missed raise cost extra taps.
+ */
+test("a tap while the keyboard failed to rise retries instead of hiding", async ({
+  page,
+  context,
+}) => {
+  await authenticate(page);
+  await newTerminal(page);
+
+  const input = page.locator('textarea[aria-label="Terminal input"]').first();
+  const keyLine = page.getByRole("button", { name: "Esc" });
+
+  // Intent lights, but no keyboard ever rises (no viewport shrink) — the
+  // icon keeps offering the keyboard rather than claiming one is up.
+  await page.getByTitle("Show keyboard").tap();
+  await expect(input).not.toHaveAttribute("inputmode", "none");
+  await expect(page.getByTitle("Show keyboard")).toBeVisible();
+  await expect(page.getByTitle("Hide keyboard")).toHaveCount(0);
+
+  // The next tap retries the raise: intent stays lit and focus is
+  // re-asserted, instead of the old hide branch re-arming the suppression.
+  await page.getByTitle("Show keyboard").tap();
+  await expect(input).not.toHaveAttribute("inputmode", "none");
+  await expect(input).toBeFocused();
+
+  // And the retried intent still tracks a keyboard that does rise.
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("Emulation.setDeviceMetricsOverride", {
+    width: 480,
+    height: 500,
+    deviceScaleFactor: 1,
+    mobile: true,
+  });
+  await expect(keyLine).toBeVisible();
+  await expect(page.getByTitle("Hide keyboard")).toBeVisible();
+
+  // A tap with the keyboard genuinely up still puts it away.
+  await page.getByTitle("Hide keyboard").tap();
+  await cdp.send("Emulation.setDeviceMetricsOverride", {
+    width: 480,
+    height: 800,
+    deviceScaleFactor: 1,
+    mobile: true,
+  });
+  await expect(keyLine).toHaveCount(0);
+  await expect(input).toHaveAttribute("inputmode", "none");
+});
+
+/**
+ * iOS does not merely shrink the visual viewport when the software keyboard
+ * rises — it also pans it (offsetTop > 0) to keep the focused input visible.
+ * The app answers by pinning <main> with a translateY(offsetTop) transform,
+ * and a transformed ancestor becomes the containing block for position:fixed:
+ * an overlay rendered inside <main> then added its own band offset on top of
+ * <main>'s and landed off-screen — Cmd+K was invisible with the keyboard up.
+ * Chrome's metrics override cannot pan the visual viewport, so the test stubs
+ * window.visualViewport to reproduce the iOS reading exactly.
+ */
+test("the switcher stays in view when the keyboard pans the visual viewport", async ({
+  page,
+}) => {
+  await authenticate(page);
+  await newTerminal(page);
+
+  // Intent lit and a terminal input holding focus, as with a real keyboard.
+  await page.getByTitle("Show keyboard").tap();
+
+  // The iOS reading with a keyboard up: height shrunk by 300, panned by 150.
+  // Shadow the getters on the real visualViewport — the app attached its
+  // listeners to it at mount, so replacing the object would miss them.
+  await page.evaluate(() => {
+    const vv = window.visualViewport!;
+    Object.defineProperty(vv, "height", { get: () => 500 });
+    Object.defineProperty(vv, "offsetTop", { get: () => 150 });
+    vv.dispatchEvent(new Event("resize"));
+    vv.dispatchEvent(new Event("scroll"));
+  });
+
+  // The app believes a keyboard occludes 300px: the key line shows and
+  // <main> pins to the band with a translateY transform.
+  await expect(page.getByRole("button", { name: "Esc" })).toBeVisible();
+
+  await page.keyboard.press("ControlOrMeta+k");
+  const dialog = page.locator('div[role="dialog"]');
+  await expect(dialog).toBeVisible({ timeout: 5_000 });
+
+  // The dialog must cover the visible band [150, 650] in page coordinates —
+  // not sit under it. Before the portal fix it rendered at [300, 800].
+  const box = await dialog.boundingBox();
+  expect(box).not.toBeNull();
+  expect(box!.y).toBeGreaterThanOrEqual(148);
+  expect(box!.y).toBeLessThanOrEqual(152);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(652);
+});
+
+test("key-line taps cancel the touch so the keyboard stays up", async ({
+  page,
+  context,
+}) => {
+  await authenticate(page);
+  await newTerminal(page);
+
+  const input = page.locator('textarea[aria-label="Terminal input"]').first();
+  const keyLine = page.getByRole("button", { name: "Esc" });
+
+  await page.getByTitle("Show keyboard").tap();
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("Emulation.setDeviceMetricsOverride", {
+    width: 480,
+    height: 500,
+    deviceScaleFactor: 1,
+    mobile: true,
+  });
+  await expect(keyLine).toBeVisible();
+
+  // iPadOS blurs the focused terminal textarea when a tap lands on a
+  // non-editable element, and cancelling pointerdown does not stop it — the
+  // touchstart itself has to be cancelled or the software keyboard drops on
+  // every key-line tap.  Watch for the cancellation at document level, where
+  // it is visible once the button's own listener has run.
+  await page.evaluate(() => {
+    (window as unknown as { __touchCancelled?: boolean }).__touchCancelled =
+      undefined;
+    document.addEventListener("touchstart", (e) => {
+      (window as unknown as { __touchCancelled?: boolean }).__touchCancelled =
+        e.defaultPrevented;
+    });
+  });
+  const touchCancelled = () =>
+    page.evaluate(
+      () =>
+        (window as unknown as { __touchCancelled?: boolean }).__touchCancelled,
+    );
+
+  for (const name of ["Esc", "Ctrl", "←"]) {
+    await page.getByRole("button", { name, exact: true }).tap();
+    expect(await touchCancelled()).toBe(true);
+  }
+
+  // Focus never left the terminal and the key line is still up.
+  await expect(input).toBeFocused();
+  await expect(keyLine).toBeVisible();
+
+  // Paste is the one exception: its clipboard read is authorised by a genuine
+  // click, which a cancelled touch would suppress.
+  await page.getByRole("button", { name: "Paste" }).tap();
+  expect(await touchCancelled()).toBe(false);
+});
+
+/**
  * Surface panes must not override the icon: a canvas is not editable, so an
  * IME dismisses over it — which used to expire the toggle's intent.  Focus
  * landing on a surface canvas has to reach the surface's hidden IME textarea
@@ -173,4 +328,49 @@ test("the icon's keyboard survives focus landing on a surface canvas", async ({
   await surfaceCanvas.tap();
   await expect(surfaceInput).toBeFocused();
   await expect(page.getByTitle("Hide keyboard")).toBeVisible();
+});
+
+/**
+ * iPadOS only answers a focus CHANGE: focus() on the element that already
+ * holds focus is a no-op, and blur+focus within one tap nets to zero — no
+ * keyboard.  (The tell on device: switching panes raised the keyboard,
+ * because that lands focus on a different element.)  The show path
+ * therefore hops focus through a neutral host textarea when the target
+ * already holds focus, then hands focus back.  navigator.platform is
+ * stubbed to take the iOS branch under Chromium.
+ */
+test("iOS hops focus through a host when the target already holds it", async ({
+  page,
+  context,
+}) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "platform", { get: () => "iPad" });
+  });
+  await authenticate(page);
+  await newTerminal(page);
+
+  const input = page.locator('textarea[aria-label="Terminal input"]').first();
+  // The pane-focus effect has the terminal input holding focus from the
+  // start — the case a plain focus() cannot raise a keyboard from.
+  await expect(input).toBeFocused();
+
+  await page.getByTitle("Show keyboard").tap();
+
+  // The hop: focus leaves for the neutral host...
+  const host = page.locator('textarea[aria-label="Keyboard host"]');
+  await expect(host).toBeFocused();
+
+  // ...and the handback is driven by the keyboard actually rising, not a
+  // fixed delay: emulate the occlusion now and focus must return to the
+  // real target well ahead of the 600ms fallback.
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("Emulation.setDeviceMetricsOverride", {
+    width: 480,
+    height: 500,
+    deviceScaleFactor: 1,
+    mobile: true,
+  });
+  await expect(input).toBeFocused({ timeout: 550 });
+  await expect(input).not.toHaveAttribute("inputmode", "none");
+  await expect(page.getByRole("button", { name: "Esc" })).toBeVisible();
 });

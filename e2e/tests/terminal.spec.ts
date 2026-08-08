@@ -91,6 +91,32 @@ test.describe("Terminal", () => {
     await expect(dialog.locator("section").first()).toBeVisible();
   });
 
+  test("Switcher offers a Search action that opens the search panel", async ({
+    page,
+  }) => {
+    await authenticate(page);
+    // The auto-opened Remotes dialog is modal; dismiss it before clicking.
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(500);
+    const canvas = page.locator("canvas").first();
+    if (!(await canvas.isVisible().catch(() => false))) {
+      await page.getByRole("button", { name: "New terminal" }).first().click();
+    }
+    await expect(canvas).toBeVisible({ timeout: 10_000 });
+
+    await page.keyboard.press("Control+k");
+    const dialog = page.locator('div[role="dialog"]');
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
+
+    await dialog.getByText("Search", { exact: true }).first().click();
+
+    // The switcher closes and the search pane's input takes focus.
+    await expect(dialog).toHaveCount(0);
+    await expect(
+      page.locator("[data-blit-search-pane] input"),
+    ).toBeFocused();
+  });
+
   test("can create a new PTY from Switcher", async ({ page }) => {
     await authenticateAndCreateTerminal(page);
     await page.waitForTimeout(500);

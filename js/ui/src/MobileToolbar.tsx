@@ -51,6 +51,18 @@ function ToolbarButton(props: {
         if (props.disabled || props.clickToActivate) return;
         props.onPress();
       }}
+      on:touchstart={(e) => {
+        // iPadOS blurs the focused terminal textarea when a tap lands on a
+        // non-editable element, and cancelling pointerdown does not stop it —
+        // the touch itself has to be cancelled or the software keyboard drops
+        // on every toolbar tap.  Bound with on: so the listener sits on the
+        // button: Solid's delegated onTouchStart is a document-level listener,
+        // which Chromium makes passive, and a passive listener cannot
+        // preventDefault.  Click-activated buttons (Paste) are exempt:
+        // cancelling the touch would suppress the click their clipboard read
+        // is authorised by.
+        if (!props.clickToActivate) e.preventDefault();
+      }}
       onClick={() => {
         if (!props.clickToActivate || props.disabled) return;
         props.onPress();
@@ -123,6 +135,9 @@ function ArrowButton(props: {
         e.stopPropagation();
         start();
       }}
+      // See ToolbarButton: cancel the touch itself or iPadOS drops the
+      // software keyboard on every toolbar tap.
+      on:touchstart={(e) => e.preventDefault()}
       onPointerUp={stop}
       onPointerCancel={stop}
       onPointerLeave={stop}
@@ -237,7 +252,12 @@ export function MobileToolbar(props: {
         "align-items": "center",
         "flex-wrap": "wrap-reverse",
         gap: "3px",
-        padding: "4px 6px calc(4px + env(safe-area-inset-bottom))",
+        // No safe-area inset here: the toolbar renders only while something
+        // (software keyboard, iPadOS shortcut bar) is parked over the bottom
+        // of the viewport, and that something covers the home-indicator strip.
+        // The inset would sit between the keys and the keyboard as dead space;
+        // the footer owns the inset again the moment the toolbar unmounts.
+        padding: "4px 6px",
         "background-color": props.theme.bg,
         "border-top": `1px solid ${props.theme.subtleBorder}`,
         "flex-shrink": 0,

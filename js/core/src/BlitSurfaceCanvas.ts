@@ -725,8 +725,7 @@ export class BlitSurfaceCanvas {
     deferredCtrlRelease: boolean;
   } | null = null;
   private _pendingPasteFlush:
-    | ((payload: ClipboardPayload | null) => void)
-    | null = null;
+    ((payload: ClipboardPayload | null) => void) | null = null;
   /** Safety-net timer for the in-flight paste, and the cleanup it runs.
    *  Kept as fields so reading a clipboard image — which is asynchronous,
    *  unlike `getData()` — can push the deadline back instead of losing the
@@ -813,8 +812,9 @@ export class BlitSurfaceCanvas {
     canvas.width = this.surface?.width || 640;
     canvas.height = this.surface?.height || 480;
     // Hidden textarea for capturing IME composition and properly-shifted
-    // characters.  Positioned behind the canvas so it doesn't interfere
-    // with rendering but still receives focus and keyboard events.
+    // characters.  1px and transparent at the screen's top-left corner
+    // (z-index -1 keeps it out of hit-testing).  Receives focus and
+    // keyboard events.
     const ta = document.createElement("textarea");
     ta.autocomplete = "off";
     ta.setAttribute("autocorrect", "off");
@@ -825,7 +825,10 @@ export class BlitSurfaceCanvas {
     // stay up for it) and the inputmode stamping covers it.
     ta.setAttribute("aria-label", "Surface input");
     ta.tabIndex = -1;
-    ta.style.position = "absolute";
+    // Fixed at the top of the screen, for the same reason as the terminal's
+    // textarea (see BlitTerminalSurface): an assist target iPadOS can
+    // always keep clear of the keyboard, whatever the pane's position.
+    ta.style.position = "fixed";
     ta.style.left = "0";
     ta.style.top = "0";
     ta.style.width = "1px";
@@ -836,9 +839,9 @@ export class BlitSurfaceCanvas {
     ta.style.outline = "none";
     ta.style.resize = "none";
     ta.style.overflow = "hidden";
-    ta.style.pointerEvents = "none";
     ta.style.zIndex = "-1";
-    // Ensure the container is a positioning context for the textarea.
+    // Ensure the container is a positioning context: applyLayout() places
+    // the canvas absolutely within it.
     if (getComputedStyle(container).position === "static") {
       container.style.position = "relative";
     }
@@ -1790,6 +1793,13 @@ export class BlitSurfaceCanvas {
       if (active.longPressTimer) clearTimeout(active.longPressTimer);
       active.longPressTimer = null;
       active.mode = "scroll";
+      // Scroll goes to the surface holding pointer focus, and only motion
+      // moves that focus (a tap counts: the server synthesises a move from
+      // the press coordinates).  A finger drag sends no motion of its own,
+      // so without this the axis events land wherever the cursor was last
+      // left — another window, or nowhere — and the first drag after
+      // touching elsewhere scrolls nothing until a tap re-seeds it.
+      this.sendPointerAt(clientX, clientY, SURFACE_POINTER_MOVE, 0);
     }
 
     active.lastX = clientX;

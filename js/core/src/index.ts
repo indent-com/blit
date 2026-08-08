@@ -130,7 +130,7 @@ export { keyToBytes, ctrlCharToByte, encoder } from "./keyboard";
 export type { GlRenderer, RendererBackend } from "./gl-renderer";
 export { createWebGpuRenderer } from "./webgpu-renderer";
 
-export { BlitTerminalSurface } from "./BlitTerminalSurface";
+export { BlitTerminalSurface, isIOS } from "./BlitTerminalSurface";
 export type {
   BlitTerminalSurfaceOptions,
   BlitTerminalSurfaceHandle,

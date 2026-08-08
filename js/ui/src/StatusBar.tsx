@@ -134,6 +134,15 @@ export function StatusBar(props: {
     "font-size": `${scale().md}px`,
     opacity: 1,
   });
+  // Icon buttons get a doubled glyph on touch devices, where the pointer
+  // is a finger and the status bar's usual density is untappable.
+  const touch = () => props.isMobileTouch ?? false;
+  const iconSize = () => scale().md * (touch() ? 2 : 1);
+  const iconButtonStyle = (): JSX.CSSProperties => ({
+    ...buttonStyle(),
+    "font-size": `${iconSize()}px`,
+  });
+  const dotSize = () => (touch() ? 14 : 7);
 
   // Count connections by bucket: ok / busy / bad
   const connCounts = () => {
@@ -156,7 +165,7 @@ export function StatusBar(props: {
     <>
       <button
         onClick={props.onSwitcher}
-        style={buttonStyle()}
+        style={iconButtonStyle()}
         title={t("statusbar.menuTitle")}
       >
         {tp("statusbar.terminals", { count: visible().length })}
@@ -346,7 +355,7 @@ export function StatusBar(props: {
         <button
           onClick={props.onMedia}
           style={{
-            ...buttonStyle(),
+            ...iconButtonStyle(),
             opacity: !props.audioAvailable || props.audioMuted ? 0.5 : 1,
           }}
           title="Media settings"
@@ -356,7 +365,7 @@ export function StatusBar(props: {
       </Show>
       <button
         onClick={props.toggleDebug}
-        style={{ ...buttonStyle(), opacity: props.debug ? 1 : 0.3 }}
+        style={{ ...iconButtonStyle(), opacity: props.debug ? 1 : 0.3 }}
         title={t("statusbar.debugStats")}
       >
         {"\u25C6"}
@@ -364,7 +373,7 @@ export function StatusBar(props: {
       <button
         onClick={props.onToggleLeftDock}
         style={{
-          ...buttonStyle(),
+          ...iconButtonStyle(),
           opacity: props.leftDockOpen ? 1 : 0.3,
         }}
         title="Toggle IDE dock (Ctrl+Shift+E)"
@@ -374,7 +383,7 @@ export function StatusBar(props: {
       <button
         onClick={props.onPreviewPanel}
         style={{
-          ...buttonStyle(),
+          ...iconButtonStyle(),
           opacity: props.previewPanelOpen ? 1 : 0.3,
         }}
         title={t("statusbar.previewPanel")}
@@ -383,14 +392,14 @@ export function StatusBar(props: {
       </button>
       <button
         onClick={props.onPalette}
-        style={buttonStyle()}
+        style={iconButtonStyle()}
         title={tp("statusbar.paletteTitle", { name: props.palette.name })}
       >
         {props.palette.dark ? "\u25D1" : "\u25D0"}
       </button>
       <button
         onClick={props.onFont}
-        style={buttonStyle()}
+        style={iconButtonStyle()}
         title={t("statusbar.fontTitle")}
       >
         <Show
@@ -425,8 +434,8 @@ export function StatusBar(props: {
           }
         >
           <svg
-            width="16"
-            height="16"
+            width="32"
+            height="32"
             viewBox="0 0 16 16"
             fill="none"
             stroke="currentColor"
@@ -454,7 +463,7 @@ export function StatusBar(props: {
         onClick={props.onRemotes}
         disabled={!props.onRemotes}
         style={{
-          ...buttonStyle(),
+          ...iconButtonStyle(),
           display: "flex",
           "align-items": "center",
           gap: "3px",
@@ -466,6 +475,7 @@ export function StatusBar(props: {
             color={theme().success}
             count={connCounts().ok}
             total={props.connections.length}
+            size={dotSize()}
           />
         </Show>
         <Show when={connCounts().busy > 0}>
@@ -473,6 +483,7 @@ export function StatusBar(props: {
             color={theme().warning}
             count={connCounts().busy}
             total={props.connections.length}
+            size={dotSize()}
           />
         </Show>
         <Show when={connCounts().bad > 0}>
@@ -480,6 +491,7 @@ export function StatusBar(props: {
             color={theme().error}
             count={connCounts().bad}
             total={props.connections.length}
+            size={dotSize()}
           />
         </Show>
         {/* Gateway dot — shown when no blit connections exist and the
@@ -490,7 +502,12 @@ export function StatusBar(props: {
             props.gatewayStatus === "connecting"
           }
         >
-          <ConnectionDot color={theme().warning} count={1} total={1} />
+          <ConnectionDot
+            color={theme().warning}
+            count={1}
+            total={1}
+            size={dotSize()}
+          />
         </Show>
         <Show
           when={
@@ -498,7 +515,12 @@ export function StatusBar(props: {
             props.gatewayStatus === "unavailable"
           }
         >
-          <ConnectionDot color={theme().error} count={1} total={1} />
+          <ConnectionDot
+            color={theme().error}
+            count={1}
+            total={1}
+            size={dotSize()}
+          />
         </Show>
       </button>
 
@@ -930,7 +952,12 @@ function EditorActions(props: {
   );
 }
 
-function ConnectionDot(props: { color: string; count: number; total: number }) {
+function ConnectionDot(props: {
+  color: string;
+  count: number;
+  total: number;
+  size: number;
+}) {
   return (
     <span
       style={{
@@ -941,8 +968,8 @@ function ConnectionDot(props: { color: string; count: number; total: number }) {
     >
       <span
         style={{
-          width: "7px",
-          height: "7px",
+          width: `${props.size}px`,
+          height: `${props.size}px`,
           "border-radius": "50%",
           background: props.color,
           display: "inline-block",

@@ -10,7 +10,11 @@ import {
 import type { BlitWorkspace } from "../BlitWorkspace";
 import type { BlitSurface } from "../types";
 import type { SurfaceAxisEvent } from "../protocol";
-import { SURFACE_POINTER_DOWN, SURFACE_POINTER_UP } from "../protocol";
+import {
+  SURFACE_POINTER_DOWN,
+  SURFACE_POINTER_MOVE,
+  SURFACE_POINTER_UP,
+} from "../protocol";
 import {
   AXIS_SOURCE_CONTINUOUS,
   AXIS_SOURCE_FINGER,
@@ -600,6 +604,44 @@ describe("BlitSurfaceCanvas touch", () => {
       SURFACE_POINTER_DOWN,
       SURFACE_POINTER_UP,
     ]);
+    surface.dispose();
+  });
+
+  /**
+   * Axis events go to the surface holding pointer focus, and only motion
+   * moves that focus (a tap gets one synthesised from its press point).  A
+   * finger drag sends no motion of its own, so a drag that starts without
+   * re-seeding the position scrolls wherever the cursor was last left —
+   * another window, or nowhere — until a tap places it again.
+   */
+  it("re-seeds the pointer position when a drag becomes a scroll", () => {
+    const { surface, canvas, sent, pointers } = attachScrolling();
+    const moved = { identifier: 1, clientX: 40, clientY: 100 };
+
+    canvas.dispatchEvent(touchEvent("touchstart", [FINGER]));
+    canvas.dispatchEvent(touchEvent("touchmove", [moved]));
+    vi.advanceTimersByTime(FRAME_MS);
+
+    // The move lands where the finger is, ahead of the first axis event.
+    expect(pointers).toEqual([
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 40, y: 100 },
+    ]);
+    expect(sent[0].source).toBe(AXIS_SOURCE_FINGER);
+
+    // And it is one move per gesture, not one per frame of the drag.
+    canvas.dispatchEvent(
+      touchEvent("touchmove", [{ identifier: 1, clientX: 40, clientY: 140 }]),
+    );
+    vi.advanceTimersByTime(FRAME_MS);
+    expect(
+      pointers.filter((p) => p.type === SURFACE_POINTER_MOVE),
+    ).toHaveLength(1);
+
+    canvas.dispatchEvent(
+      touchEvent("touchend", [{ identifier: 1, clientX: 40, clientY: 140 }], {
+        ongoing: false,
+      }),
+    );
     surface.dispose();
   });
 

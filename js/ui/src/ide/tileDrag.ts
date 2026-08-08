@@ -92,11 +92,16 @@ const TOUCH_DRAG_THRESHOLD_PX = 6;
  * no competing gesture, so any movement means the drag.
  *
  * `long-press` suits anything living in a scrollable list — explorer rows,
- * commits, dock cards. Those must keep scrolling (and, for a dock card,
- * swiping to dismiss), so a drag cannot begin on movement without stealing
- * it. Holding still is the one gesture none of them claim.
+ * commits. Those must keep scrolling, so a drag cannot begin on movement
+ * without stealing it. Holding still is the one gesture none of them claim.
+ *
+ * `swipe-left` suits the dock card, whose horizontal swipes are directional:
+ * rightward is the card's own swipe-to-dismiss, so a leftward swipe can start
+ * the drag immediately. A hold still works too, and a swipe that starts
+ * rightward and reverses through the origin becomes a drag as well — only
+ * vertical movement (scrolling) stays unclaimed.
  */
-export type TouchDragActivation = "move" | "long-press";
+export type TouchDragActivation = "move" | "long-press" | "swipe-left";
 
 /** Hold before a press on a list row becomes a drag. Long enough not to fire
  *  during a flick, short enough not to feel broken. */
@@ -186,6 +191,10 @@ export function startTouchDrag(
 
   const begin = (ev: PointerEvent) => {
     dragging = true;
+    if (holdTimer !== null) {
+      clearTimeout(holdTimer);
+      holdTimer = null;
+    }
     handle.setPointerCapture?.(ev.pointerId);
     // Only now does the page stop scrolling under the finger. A row cannot
     // carry `touch-action: none` the way a dedicated handle can — that would
@@ -205,14 +214,34 @@ export function startTouchDrag(
     if (ev.pointerId !== e.pointerId) return;
     last = ev;
     if (!dragging) {
-      if (activate === "long-press") {
+      if (activate === "swipe-left") {
+        // Leftward and horizontal-dominant: the drag. Rightward is the
+        // card's swipe-to-dismiss and vertical its scroll — but either can
+        // reverse into a leftward drag mid-gesture, so only the hold timer
+        // is cancelled; the listeners stay armed until the finger lifts.
+        const dx = ev.clientX - startX;
+        const dy = ev.clientY - startY;
+        if (
+          dx <= -TOUCH_DRAG_THRESHOLD_PX &&
+          Math.abs(dx) >= Math.abs(dy)
+        ) {
+          begin(ev);
+        } else {
+          if (holdTimer !== null && moved(ev, LONG_PRESS_SLOP_PX)) {
+            clearTimeout(holdTimer);
+            holdTimer = null;
+          }
+          return;
+        }
+      } else if (activate === "long-press") {
         // Moving before the hold completes means this was a scroll or a
         // swipe, which the page is entitled to handle instead.
         if (moved(ev, LONG_PRESS_SLOP_PX)) stop();
         return;
+      } else {
+        if (!moved(ev, TOUCH_DRAG_THRESHOLD_PX)) return;
+        begin(ev);
       }
-      if (!moved(ev, TOUCH_DRAG_THRESHOLD_PX)) return;
-      begin(ev);
     }
     // Capture routes the pointer events here, but hit-testing is ours to do.
     const el = document.elementFromPoint(ev.clientX, ev.clientY);
@@ -272,7 +301,7 @@ export function startTouchDrag(
   window.addEventListener("pointermove", onMove);
   window.addEventListener("pointerup", onUp);
   window.addEventListener("pointercancel", onCancel);
-  if (activate === "long-press") {
+  if (activate === "long-press" || activate === "swipe-left") {
     holdTimer = setTimeout(() => {
       holdTimer = null;
       // Still down and still still: the press was a request to drag, not to

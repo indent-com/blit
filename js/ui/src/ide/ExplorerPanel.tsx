@@ -17,6 +17,7 @@ import {
   untrack,
   type JSX,
 } from "solid-js";
+import { Portal } from "solid-js/web";
 import {
   FS_ENTRY_FILE,
   FS_ENTRY_DIR,
@@ -1182,57 +1183,63 @@ export function ExplorerPanel(props: {
       </div>
       <Show when={menu()}>
         {(m) => (
-          <div
-            data-fs-menu
-            style={{
-              position: "fixed",
-              left: `${m().x}px`,
-              top: `${m().y}px`,
-              "z-index": 1000,
-              background: props.theme.solidPanelBg,
-              border: `1px solid ${props.theme.border}`,
-              "border-radius": "3px",
-              padding: "2px",
-              "min-width": "150px",
-              "font-family": props.fontFamily,
-              "font-size": `${props.scale.sm}px`,
-              "box-shadow": "0 4px 16px rgba(0, 0, 0, 0.4)",
-            }}
-          >
-            <MenuItem
-              label="New file…"
-              theme={props.theme}
-              scale={props.scale}
-              onPick={() => startCreate("create-file")}
-            />
-            <MenuItem
-              label="New folder…"
-              theme={props.theme}
-              scale={props.scale}
-              onPick={() => startCreate("create-dir")}
-            />
-            <Show when={m().row}>
+          // Portal to <body>: the coordinates are viewport-relative, and
+          // while the software keyboard is up Workspace pins <main> with a
+          // translateY transform, which would capture position:fixed and
+          // shift the menu down by that offset (same fix as Overlay.tsx).
+          <Portal mount={document.body}>
+            <div
+              data-fs-menu
+              style={{
+                position: "fixed",
+                left: `${m().x}px`,
+                top: `${m().y}px`,
+                "z-index": 1000,
+                background: props.theme.solidPanelBg,
+                border: `1px solid ${props.theme.border}`,
+                "border-radius": "3px",
+                padding: "2px",
+                "min-width": "150px",
+                "font-family": props.fontFamily,
+                "font-size": `${props.scale.sm}px`,
+                "box-shadow": "0 4px 16px rgba(0, 0, 0, 0.4)",
+              }}
+            >
               <MenuItem
-                label="Copy path"
+                label="New file…"
                 theme={props.theme}
                 scale={props.scale}
-                onPick={copyPath}
+                onPick={() => startCreate("create-file")}
               />
               <MenuItem
-                label="Rename / move…"
+                label="New folder…"
                 theme={props.theme}
                 scale={props.scale}
-                onPick={startRename}
+                onPick={() => startCreate("create-dir")}
               />
-              <MenuItem
-                label={m().confirmDelete ? "Really delete? ⏎" : "Delete"}
-                color={m().confirmDelete ? props.theme.errorText : undefined}
-                theme={props.theme}
-                scale={props.scale}
-                onPick={handleDelete}
-              />
-            </Show>
-          </div>
+              <Show when={m().row}>
+                <MenuItem
+                  label="Copy path"
+                  theme={props.theme}
+                  scale={props.scale}
+                  onPick={copyPath}
+                />
+                <MenuItem
+                  label="Rename / move…"
+                  theme={props.theme}
+                  scale={props.scale}
+                  onPick={startRename}
+                />
+                <MenuItem
+                  label={m().confirmDelete ? "Really delete? ⏎" : "Delete"}
+                  color={m().confirmDelete ? props.theme.errorText : undefined}
+                  theme={props.theme}
+                  scale={props.scale}
+                  onPick={handleDelete}
+                />
+              </Show>
+            </div>
+          </Portal>
         )}
       </Show>
     </div>

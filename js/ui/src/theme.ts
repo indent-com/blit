@@ -245,7 +245,10 @@ export const layout: Record<string, JSX.CSSProperties> = {
   },
   panel: {
     padding: "16px",
-    "max-height": "80vh",
+    // % of the backdrop, not vh: OverlayBackdrop sizes itself to the visual
+    // viewport, so this cap dodges the software keyboard too. The backdrop
+    // raises it to 100% when the band is cramped (keyboard open).
+    "max-height": "var(--overlay-panel-cap, 80%)",
     overflow: "auto",
   },
 };

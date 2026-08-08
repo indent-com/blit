@@ -125,6 +125,8 @@ function isIOS(): boolean {
   return isIPadOS() || /iPhone|iPod/.test(navigator.platform);
 }
 
+export { isIOS };
+
 // iOS soft keyboards only auto-repeat Backspace while the focused field still
 // has content to delete.  The hidden capture textarea is otherwise empty, so a
 // held Backspace fires a single deleteContentBackward and stops.  We keep the
@@ -763,7 +765,12 @@ export class BlitTerminalSurface {
       `blit-input-${this._sessionId ?? `anon-${++surfaceCounter}`}`,
     );
     Object.assign(this.inputEl.style, {
-      position: "absolute",
+      // Fixed at the top of the screen, not of the pane: an assist target
+      // iPadOS can always keep clear of the software keyboard, so no reveal
+      // pan is ever needed on focus — whatever the pane's position in a
+      // split.  When <main> is pinned and transformed (keyboard up), fixed
+      // resolves against it, and its top is the screen's top either way.
+      position: "fixed",
       opacity: "0",
       width: "1px",
       height: "1px",
