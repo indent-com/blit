@@ -104,24 +104,34 @@ main() {
 
   tar -xzf "$tmp/$tarball" -C "$tmp"
 
-  # Walk up to the deepest existing ancestor to test writability — `-w` on a
-  # nonexistent directory always fails and would force sudo needlessly.
-  check="$PREFIX/bin"
-  while [ ! -e "$check" ]; do
-    parent=$(dirname -- "$check")
-    [ "$parent" = "$check" ] && break
-    check="$parent"
-  done
+  # Install via a temp file + rename: writing over a running binary fails
+  # with ETXTBSY ("Text file busy"), while rename(2) atomically swaps the
+  # directory entry and leaves the old inode to the running process.
+  dst="$PREFIX/bin/blit"
+  install_bin() {
+    # $1: elevation command (sudo/doas) or empty for a plain install.
+    $1 mkdir -p "$PREFIX/bin" &&
+      $1 cp "$tmp/bin/blit" "$dst.tmp.$$" &&
+      $1 chmod +x "$dst.tmp.$$" &&
+      $1 mv -f "$dst.tmp.$$" "$dst" || {
+      $1 rm -f "$dst.tmp.$$" 2>/dev/null
+      return 1
+    }
+  }
+
+  # Try without elevation first; only escalate when that genuinely fails
+  # (a `-w` writability guess would force sudo in writable homes too often).
   elevate=""
-  if ! [ -w "$check" ] && [ "$(id -u)" != "0" ]; then
+  echo "installing to $PREFIX/bin..."
+  if install_bin "" 2>/dev/null; then
+    :
+  elif [ "$(id -u)" != "0" ]; then
     elevate=$(pick_elevate)
-    echo "installing to $PREFIX/bin (requires $elevate)..."
+    echo "elevation required, retrying with $elevate..."
+    install_bin "$elevate" || err "installation failed"
   else
-    echo "installing to $PREFIX/bin..."
+    err "installation failed"
   fi
-  $elevate mkdir -p "$PREFIX/bin"
-  $elevate cp "$tmp/bin/blit" "$PREFIX/bin/blit"
-  $elevate chmod +x "$PREFIX/bin/blit"
 
   # Ad-hoc codesign on macOS so Gatekeeper doesn't kill the binary.
   case "$os" in
