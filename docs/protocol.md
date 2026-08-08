@@ -149,6 +149,7 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 | `0x2A` | `SURFACE_ENCODER`   | `[surface_id:2][name][0x00][codec_string]` — encoder display name + WebCodecs codec string, NUL-separated          |
 | `0x2B` | `FRAGMENT`          | `[flags:1][chunk:N]` — see [Fragmentation](#fragmentation)                                                         |
 | `0x2C` | `CLIPBOARD_LIST`    | `[count:2] repeated{ [mime_len:2][mime:N] }`                                                                       |
+| `0x2D` | `SURFACE_ACTIVATED` | `[surface_id:2]` — the Wayland client asked for its toplevel to be activated (xdg_activation_v1); raise and focus the pane |
 | `0x30` | `AUDIO_FRAME`       | `[timestamp:4][flags:1][data:N]`                                                                                   |
 | `0x40` | `FS_SYNCED`         | `[nonce:2][sync_id:2][status:1][detail_len:2][detail:N]`                                                           |
 | `0x41` | `FS_UPDATE`         | `[sync_id:2][update_id:4][flags:1][records:LZ4]`                                                                   |

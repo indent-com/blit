@@ -34,6 +34,7 @@ import {
   S2C_READY,
   S2C_SEARCH_RESULTS,
   S2C_SURFACE_APP_ID,
+  S2C_SURFACE_ACTIVATED,
   S2C_SURFACE_CURSOR,
   S2C_SURFACE_CREATED,
   S2C_SURFACE_DESTROYED,
@@ -3861,6 +3862,14 @@ export class BlitConnection {
           const surfaceId = bytes[1] | (bytes[2] << 8);
           const appId = textDecoder.decode(bytes.subarray(3));
           this.surfaceStore.handleSurfaceAppId(surfaceId, appId);
+        } catch {}
+        return;
+      }
+      case S2C_SURFACE_ACTIVATED: {
+        try {
+          if (bytes.length < 3) return;
+          const surfaceId = bytes[1] | (bytes[2] << 8);
+          this.surfaceStore.handleSurfaceActivated(surfaceId);
         } catch {}
         return;
       }

@@ -468,6 +468,14 @@ function WorkspaceScreen(props: {
       const conn = workspace.getConnection(spec.id);
       if (!conn) continue;
       cleanups.push(conn.surfaceStore.onChange(syncAll));
+      // A client asking to be activated (xdg_activation_v1 — e.g. an
+      // Electron app reacting to a notification click) gets the same
+      // treatment as picking its surface in the switcher.
+      cleanups.push(
+        conn.surfaceStore.onActivated((surfaceId) =>
+          focusSurface(surfaceId, spec.id),
+        ),
+      );
     }
     // Also refresh on workspace state changes (connection status
     // transitions) so the surface list stays in sync after reconnects

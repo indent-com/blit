@@ -335,6 +335,9 @@ export const S2C_SURFACE_TITLE = 0x23;
 export const S2C_SURFACE_RESIZED = 0x24;
 export const S2C_CLIPBOARD_CONTENT = 0x25;
 export const S2C_SURFACE_APP_ID = 0x28;
+/** The Wayland client asked for its toplevel to be activated
+ *  (xdg_activation_v1): [0x2D][surface_id:2] — raise and focus the pane. */
+export const S2C_SURFACE_ACTIVATED = 0x2d;
 export const S2C_SURFACE_CURSOR = 0x29;
 /** Encoder backend info for a surface: [0x2A][surface_id:2][name:N] */
 export const S2C_SURFACE_ENCODER = 0x2a;

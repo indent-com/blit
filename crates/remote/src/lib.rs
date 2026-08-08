@@ -524,6 +524,10 @@ pub const S2C_SURFACE_TITLE: u8 = 0x23;
 pub const S2C_SURFACE_RESIZED: u8 = 0x24;
 /// A Wayland surface's app_id changed: [0x28][surface_id:2][app_id:N]
 pub const S2C_SURFACE_APP_ID: u8 = 0x28;
+/// A Wayland client asked for its toplevel to be activated
+/// (xdg_activation_v1) — raise and focus the matching pane:
+/// [0x2D][surface_id:2]
+pub const S2C_SURFACE_ACTIVATED: u8 = 0x2D;
 /// Clipboard content (response to C2S_CLIPBOARD_GET or unsolicited broadcast on change):
 /// [0x25][mime_len:2][mime:N][data_len:4][data:N]
 pub const S2C_CLIPBOARD_CONTENT: u8 = 0x25;
@@ -2113,6 +2117,9 @@ pub enum ServerMsg<'a> {
         surface_id: u16,
         app_id: &'a str,
     },
+    SurfaceActivated {
+        surface_id: u16,
+    },
     SurfaceResized {
         surface_id: u16,
         width: u16,
@@ -2450,6 +2457,14 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             Some(ServerMsg::SurfaceAppId {
                 surface_id: u16::from_le_bytes([data[1], data[2]]),
                 app_id,
+            })
+        }
+        S2C_SURFACE_ACTIVATED => {
+            if data.len() < 3 {
+                return None;
+            }
+            Some(ServerMsg::SurfaceActivated {
+                surface_id: u16::from_le_bytes([data[1], data[2]]),
             })
         }
         S2C_SURFACE_RESIZED => {
@@ -3088,6 +3103,13 @@ pub fn msg_surface_app_id(surface_id: u16, app_id: &str) -> Vec<u8> {
     msg.push(S2C_SURFACE_APP_ID);
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(app_id_bytes);
+    msg
+}
+
+pub fn msg_surface_activated(surface_id: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(3);
+    msg.push(S2C_SURFACE_ACTIVATED);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
     msg
 }
 

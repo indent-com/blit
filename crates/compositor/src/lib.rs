@@ -180,6 +180,11 @@ mod stub {
             surface_id: u16,
             app_id: String,
         },
+        /// The client asked for one of its toplevels to be activated
+        /// (xdg_activation_v1) — e.g. an Electron app reacting to a
+        /// notification click.  Pane focus belongs to the frontend, so the
+        /// request is forwarded, not acted on here.
+        SurfaceActivated { surface_id: u16 },
         SurfaceResized {
             surface_id: u16,
             width: u16,

@@ -332,6 +332,7 @@ export class SurfaceStore {
   private cursorListeners = new Set<
     (surfaceId: number, shape: string) => void
   >();
+  private activationListeners = new Set<(surfaceId: number) => void>();
   private eventListeners = new Set<SurfaceEventCallback>();
   private _diag = {
     received: 0,
@@ -1082,6 +1083,26 @@ export class SurfaceStore {
     this.cursorListeners.add(listener);
     return () => {
       this.cursorListeners.delete(listener);
+    };
+  }
+
+  /** A Wayland client asked for its toplevel to be activated
+   *  (xdg_activation_v1 — e.g. a notification click).  Not a state change,
+   *  so it goes to dedicated listeners, not the change cycle. */
+  handleSurfaceActivated(surfaceId: number): void {
+    if (!this.surfaces.has(surfaceId)) return;
+    for (const listener of this.activationListeners) {
+      try {
+        listener(surfaceId);
+      } catch {}
+    }
+  }
+
+  /** Register a callback for surface activation requests. Returns unsubscribe fn. */
+  onActivated(listener: (surfaceId: number) => void): () => void {
+    this.activationListeners.add(listener);
+    return () => {
+      this.activationListeners.delete(listener);
     };
   }
 

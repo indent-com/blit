@@ -564,6 +564,9 @@ pub enum CompositorEvent {
     SurfaceDestroyed {
         surface_id: u16,
     },
+    /// A client asked to activate (raise/focus) a surface via
+    /// xdg_activation_v1; forwarded so the frontend can raise the pane.
+    SurfaceActivated { surface_id: u16 },
     SurfaceCommit {
         surface_id: u16,
         width: u32,
@@ -7247,12 +7250,22 @@ impl Dispatch<XdgActivationV1, ()> for Compositor {
                 state.next_activation_token = serial.wrapping_add(1);
                 data_init.init(id, ActivationTokenData { serial });
             }
-            Request::Activate {
-                token: _,
-                surface: _,
-            } => {
-                // In a headless compositor, activation requests are always
-                // granted (focus is managed externally by the browser/CLI).
+            Request::Activate { token: _, surface } => {
+                // Tokens are issued unvalidated, so there is nothing to
+                // check here.  Pane focus is managed externally by the
+                // browser/CLI, but "always granted" must not mean "silently
+                // dropped": forward the request so the frontend can raise
+                // and focus the matching pane.  An ignored activation is
+                // what strands an Electron app that asks to come back
+                // (Slack on a notification click) behind everything else.
+                if let Some(surf) = state.surfaces.get(&surface.id())
+                    && surf.surface_id > 0
+                {
+                    let _ = state.event_tx.send(CompositorEvent::SurfaceActivated {
+                        surface_id: surf.surface_id,
+                    });
+                    (state.event_notify)();
+                }
             }
             Request::Destroy => {}
             _ => {}

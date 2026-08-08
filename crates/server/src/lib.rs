@@ -18,9 +18,9 @@ use blit_remote::{
     STATUS_BUDGET, STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264,
     SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN, build_update_msg, msg_hello,
     msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_scroll_offset, msg_s2c_used_rows,
-    msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
-    msg_surface_frame, msg_surface_resized, msg_surface_title, msg_term_cwd_reply,
-    parse_surface_pointer_axis2,
+    msg_surface_activated, msg_surface_app_id, msg_surface_created, msg_surface_destroyed,
+    msg_surface_encoder, msg_surface_frame, msg_surface_resized, msg_surface_title,
+    msg_term_cwd_reply, parse_surface_pointer_axis2,
 };
 #[cfg(target_os = "linux")]
 use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO, FEATURE_COMPOSITOR};
@@ -5086,6 +5086,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                         info.app_id = app_id.clone();
                     }
                     broadcast.push(msg_surface_app_id(surface_id, &app_id));
+                }
+                CompositorEvent::SurfaceActivated { surface_id } => {
+                    // Nothing to cache — the client is asked to raise and
+                    // focus the pane, which it answers with C2S_SURFACE_FOCUS.
+                    broadcast.push(msg_surface_activated(surface_id));
                 }
                 CompositorEvent::SurfaceResized {
                     surface_id,
