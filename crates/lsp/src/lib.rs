@@ -52,7 +52,7 @@ pub struct Budgets {
     pub spawn_rate_per_min: usize,
     pub max_overlays: usize,
     pub buffer_max: usize,
-    pub diags_max_files: usize,
+    pub diags_cold: Duration,
 }
 
 impl Default for Budgets {
@@ -89,10 +89,12 @@ impl Default for Budgets {
             // back to saved state, never an error.
             max_overlays: env_u64("BLIT_LSP_MAX_OVERLAYS", 64).max(1) as usize,
             buffer_max: env_u64("BLIT_LSP_BUFFER_MAX", 8 * 1024 * 1024) as usize,
-            // Hard cap on cached per-file diagnostic sets: non-empty
-            // entries are otherwise never pruned and the cache grows
-            // for the backend's lifetime. LRU by publish seq.
-            diags_max_files: env_u64("BLIT_LSP_DIAGS_MAX_FILES", 4_096) as usize,
+            // Freeze the payload of a file with no publish for this
+            // long: lz4-compressed in place (seq/hash stay plaintext),
+            // a memory bound on the otherwise unbounded per-backend
+            // cache that loses nothing — replays and publishes decode
+            // transparently.
+            diags_cold: Duration::from_secs(env_u64("BLIT_LSP_DIAGS_COLD_SECS", 600)),
         }
     }
 }

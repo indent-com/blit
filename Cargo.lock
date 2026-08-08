@@ -861,6 +861,7 @@ dependencies = [
  "blit-fssync",
  "blit-remote",
  "libc",
+ "lz4_flex",
  "notify",
  "serde_json",
 ]

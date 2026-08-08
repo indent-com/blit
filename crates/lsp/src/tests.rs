@@ -619,6 +619,128 @@ fn diagnostics_full_replay_reaches_late_joiner() {
     check(&att2, &rx2);
 }
 
+/// A frozen (lz4 cold) cache entry is subscriber-indistinguishable
+/// from a live one: a late joiner's FULL replay decodes it, and the
+/// next publish for the path lands as an ordinary live entry.
+#[test]
+fn frozen_diag_entry_replays_and_republishes() {
+    let root = tmp_root("frozen");
+    std::fs::write(root.join("a.rs"), "fn x() {}\n").unwrap();
+    let uri = crate::text::path_to_uri(&root.join("a.rs"));
+    let publish = move |msg: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": { "uri": uri, "diagnostics": [ {
+                "range": { "start": { "line": 0, "character": 0 },
+                           "end": { "line": 0, "character": 1 } },
+                "severity": 1,
+                "message": msg,
+            } ] },
+        })
+    };
+    // A fake server that publishes "v1" after init and "v2" when a
+    // hover query arrives.
+    let serve = move |mut reader: BufReader<Box<dyn Read + Send>>,
+                      mut writer: Box<dyn Write + Send>| {
+        while let Some(msg) = rpc::read_msg(&mut reader) {
+            match msg {
+                rpc::RpcMsg::Request { id, method, .. } => {
+                    let reply = match method.as_str() {
+                        "initialize" => rpc::response(
+                            &id,
+                            json!({
+                                "capabilities": {
+                                    "positionEncoding": "utf-16",
+                                    "hoverProvider": true,
+                                },
+                                "serverInfo": { "name": "fake" },
+                            }),
+                        ),
+                        _ => rpc::response(&id, Value::Null),
+                    };
+                    let _ = rpc::write_msg(writer.as_mut(), &reply);
+                    if method == "textDocument/hover" {
+                        let _ = rpc::write_msg(writer.as_mut(), &publish("v2"));
+                    }
+                }
+                rpc::RpcMsg::Notification { method, .. } => {
+                    if method == "initialized" {
+                        let _ = rpc::write_msg(writer.as_mut(), &publish("v1"));
+                    }
+                    if method == "exit" {
+                        return;
+                    }
+                }
+                rpc::RpcMsg::Response { .. } => {}
+            }
+        }
+    };
+    let backend = testutil::pipe_backend(test_spec(), root.clone(), test_budgets(), serve);
+    // Wait for v1 to land, then freeze the entry in place.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "v1 publish never landed");
+        if backend
+            .shared
+            .diags
+            .lock()
+            .unwrap()
+            .contains_key(&root.join("a.rs"))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    {
+        let mut diags = backend.shared.diags.lock().unwrap();
+        crate::backend::freeze_cold_diags(&mut diags, Duration::ZERO);
+        assert!(matches!(
+            diags[&root.join("a.rs")].diags,
+            crate::backend::Diags::Cold(_)
+        ));
+    }
+    // A late joiner's FULL replay decodes the frozen entry.
+    let (sink, rx) = collector();
+    let att = attach(&root, &backend, LSP_OPEN_DIAGS, sink.clone());
+    let mut mirror = LspDiagMirror::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "no FULL replay of the frozen entry");
+        let msg = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        if msg.first() != Some(&S2C_LSP_DIAG) {
+            continue;
+        }
+        let update_id = mirror.apply_diag(&msg).unwrap();
+        att.ack(LSP_STREAM_DIAG, update_id);
+        if let Some(file) = mirror.files.get("a.rs") {
+            assert_eq!(file.diags[0].msg, "v1");
+            break;
+        }
+    }
+    // A publish against the frozen entry: hover makes the server
+    // republish, the cache entry goes live again, and the subscriber
+    // sees the incremental.
+    att.query(1, LSP_QUERY_HOVER, 0, 0, 0, "a.rs", "", sink);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "v2 publish never landed");
+        let msg = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        if msg.first() != Some(&S2C_LSP_DIAG) {
+            continue;
+        }
+        let update_id = mirror.apply_diag(&msg).unwrap();
+        att.ack(LSP_STREAM_DIAG, update_id);
+        if mirror.files["a.rs"].diags[0].msg == "v2" {
+            break;
+        }
+    }
+    let diags = backend.shared.diags.lock().unwrap();
+    let a = &diags[&root.join("a.rs")];
+    assert!(matches!(a.diags, crate::backend::Diags::Live(_)));
+    assert_eq!(a.diags()[0].msg, "v2");
+}
+
 #[test]
 fn rename_returns_edit_plan_and_applyedit_is_refused() {
     let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
@@ -1168,7 +1290,7 @@ fn empty_publishes_skip_tombstones_and_pings() {
     assert!(!diags.contains_key(&root.join("never.rs")));
     // a.rs holds one tombstone (seq 2), not two.
     let a = &diags[&root.join("a.rs")];
-    assert!(a.diags.is_empty());
+    assert!(a.is_empty());
     assert_eq!(a.seq, 2);
     // Seqs: a.rs diag (1), a.rs clear (2), b.rs diag (3) — the skipped
     // publishes never bumped the counter.

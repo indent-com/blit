@@ -559,7 +559,7 @@ impl Pacer {
             for (path, file) in &changed {
                 // In a FULL replay, absent files are unknown; empty
                 // tombstones carry no information.
-                if full && file.diags.is_empty() {
+                if full && file.is_empty() {
                     let e = new_floors.entry(backend.server_ref).or_insert(0);
                     *e = (*e).max(file.seq);
                     continue;
@@ -583,7 +583,9 @@ impl Pacer {
                 // follow it, rather than a promise made before the budget
                 // was consulted.
                 let wire = wire_of(&self.root, path);
-                append_file_diags(&mut records, &wire, file.hash, &file.diags, self.bytes_max);
+                // Cold entries decode here, off the cache lock.
+                let diags = file.diags();
+                append_file_diags(&mut records, &wire, file.hash, &diags, self.bytes_max);
                 let e = new_floors.entry(backend.server_ref).or_insert(0);
                 *e = (*e).max(file.seq);
                 entries += 1;

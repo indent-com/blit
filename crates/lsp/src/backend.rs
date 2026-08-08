@@ -96,7 +96,7 @@ pub fn command_spawner(spec: &ServerSpec, root: &Path) -> Spawner {
 }
 
 /// One diagnostic already in wire form (byte columns).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WireDiag {
     pub severity: u8,
     pub flags: u8,
@@ -109,14 +109,48 @@ pub struct WireDiag {
     pub msg: String,
 }
 
-/// One file's cached diagnostic set. An empty `diags` is a tombstone —
-/// the wire `n = 0` clear record.
+/// One file's cached diagnostic set. An empty live `diags` is a
+/// tombstone — the wire `n = 0` clear record.
 #[derive(Clone, Debug)]
 pub struct FileDiags {
     /// Monotonic per-backend change sequence, for attachment cursors.
     pub seq: u64,
     pub hash: LspHash,
-    pub diags: Vec<WireDiag>,
+    /// When this entry was last published; the freeze clock. Stays
+    /// plaintext alongside `seq`/`hash` — none of it requires decoding
+    /// the payload.
+    pub published: Instant,
+    pub diags: Diags,
+}
+
+impl FileDiags {
+    /// Tombstone test shared by publish dedupe and pruning. A cold
+    /// entry is never empty: only non-empty entries freeze.
+    pub fn is_empty(&self) -> bool {
+        matches!(&self.diags, Diags::Live(v) if v.is_empty())
+    }
+
+    /// The diagnostic set, decoding a cold entry. Callers get an owned
+    /// vec; cold entries decode only on a replay or publish, never on
+    /// the seq-floor fast path.
+    pub fn diags(&self) -> Vec<WireDiag> {
+        match &self.diags {
+            Diags::Live(v) => v.clone(),
+            Diags::Cold(bytes) => decode_diags(bytes),
+        }
+    }
+}
+
+/// A file's diagnostic payload: live, or lz4-compressed in place once
+/// the entry has gone `diags_cold` without a publish (docs/design/lsp.md
+/// limits table). The bound is lossless: every read path decodes
+/// transparently, so a cold entry is subscriber-indistinguishable from
+/// a live one.
+#[derive(Clone, Debug)]
+pub enum Diags {
+    Live(Vec<WireDiag>),
+    /// `encode_diags` output, lz4 block-compressed with prepended size.
+    Cold(Vec<u8>),
 }
 
 /// Projected backend state, as the `SERVER` record reports it.
@@ -459,35 +493,91 @@ struct EncodeJob {
     bytes_max: usize,
 }
 
-/// LRU-evict the oldest non-empty diagnostic entries past `cap`. Seq
-/// doubles as the LRU clock: it is issued monotonically on every
-/// publish, so the lowest seq is the least recently published.
-/// Eviction only drops the cached copy — a FULL replay reads an absent
-/// path as unknown (never as clean), and the server's next
-/// `textDocument/publishDiagnostics` for the path re-populates the
-/// entry — so a subscriber holding the diagnostics keeps showing them
-/// until then. Entries every diag subscriber has acked
-/// (`seq <= min_floor`) are evicted first; an un-acked one goes only
-/// when a pinned ack floor leaves no other victim, and that subscriber
-/// then misses the file until the next publish.
-fn evict_diags_over_cap(diags: &mut HashMap<PathBuf, FileDiags>, min_floor: u64, cap: usize) {
-    let over = diags
-        .values()
-        .filter(|f| !f.diags.is_empty())
-        .count()
-        .saturating_sub(cap);
-    if over == 0 {
-        return;
+/// Cold-payload encoding version; bump on any layout change.
+const COLD_VERSION: u8 = 1;
+
+/// Encode a diagnostic set for cold storage. Fixed layout, no serde:
+/// one version byte, a u32 LE count, then per diagnostic `severity` and
+/// `flags` (u8), the four range ints (u32 LE), and `code`/`source`/`msg`
+/// as u32 LE length-prefixed UTF-8.
+fn encode_diags(diags: &[WireDiag]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(COLD_VERSION);
+    out.extend_from_slice(&(diags.len() as u32).to_le_bytes());
+    for d in diags {
+        out.push(d.severity);
+        out.push(d.flags);
+        for v in [d.line, d.col, d.end_line, d.end_col] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for s in [&d.code, &d.source, &d.msg] {
+            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
     }
-    // Acked (sorts false) before un-acked, oldest seq first.
-    let mut victims: Vec<(bool, u64, PathBuf)> = diags
-        .iter()
-        .filter(|(_, f)| !f.diags.is_empty())
-        .map(|(p, f)| (f.seq > min_floor, f.seq, p.clone()))
-        .collect();
-    victims.sort_unstable();
-    for (_, _, path) in victims.into_iter().take(over) {
-        diags.remove(&path);
+    out
+}
+
+/// Decode a cold payload (`encode_diags` + lz4 with prepended size).
+/// Corrupt or foreign-version input — never produced in-process —
+/// decodes to empty rather than panicking: the next publish for the
+/// path re-populates the entry.
+fn decode_diags(bytes: &[u8]) -> Vec<WireDiag> {
+    fn take<'a>(raw: &'a [u8], at: &mut usize, n: usize) -> Option<&'a [u8]> {
+        let slice = raw.get(*at..at.checked_add(n)?)?;
+        *at += n;
+        Some(slice)
+    }
+    fn u32_at(raw: &[u8], at: &mut usize) -> Option<u32> {
+        Some(u32::from_le_bytes(take(raw, at, 4)?.try_into().ok()?))
+    }
+    fn string_at(raw: &[u8], at: &mut usize) -> Option<String> {
+        let n = u32_at(raw, at)? as usize;
+        String::from_utf8(take(raw, at, n)?.to_vec()).ok()
+    }
+    let Ok(raw) = lz4_flex::decompress_size_prepended(bytes) else {
+        return Vec::new();
+    };
+    let mut at = 0usize;
+    let parsed = (|| {
+        if take(&raw, &mut at, 1)? != [COLD_VERSION] {
+            return None;
+        }
+        let n = u32_at(&raw, &mut at)? as usize;
+        let mut diags = Vec::with_capacity(n);
+        for _ in 0..n {
+            diags.push(WireDiag {
+                severity: take(&raw, &mut at, 1)?[0],
+                flags: take(&raw, &mut at, 1)?[0],
+                line: u32_at(&raw, &mut at)?,
+                col: u32_at(&raw, &mut at)?,
+                end_line: u32_at(&raw, &mut at)?,
+                end_col: u32_at(&raw, &mut at)?,
+                code: string_at(&raw, &mut at)?,
+                source: string_at(&raw, &mut at)?,
+                msg: string_at(&raw, &mut at)?,
+            });
+        }
+        Some(diags)
+    })();
+    parsed.unwrap_or_default()
+}
+
+/// lz4-compress the payload of every live non-empty entry whose last
+/// publish is at least `cold_after` ago. Tombstones stay live — the
+/// prune retain owns them — and `seq`/`hash` stay plaintext, so
+/// subscriber floors and cursors never decode. Lossless: replays and
+/// publishes decode transparently.
+pub(crate) fn freeze_cold_diags(diags: &mut HashMap<PathBuf, FileDiags>, cold_after: Duration) {
+    for f in diags.values_mut() {
+        if f.published.elapsed() < cold_after {
+            continue;
+        }
+        if let Diags::Live(v) = &f.diags
+            && !v.is_empty()
+        {
+            f.diags = Diags::Cold(lz4_flex::compress_prepend_size(&encode_diags(v)));
+        }
     }
 }
 
@@ -1105,7 +1195,7 @@ impl Engine {
             .lock()
             .unwrap()
             .get(&path)
-            .map(|f| (f.diags.is_empty(), f.hash));
+            .map(|f| (f.is_empty(), f.hash));
         if items.is_empty() && prior.is_none() {
             return;
         }
@@ -1184,20 +1274,24 @@ impl Engine {
             });
         }
         let seq = self.shared.diag_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        self.shared
-            .diags
-            .lock()
-            .unwrap()
-            .insert(path, FileDiags { seq, hash, diags });
+        self.shared.diags.lock().unwrap().insert(
+            path,
+            FileDiags {
+                seq,
+                hash,
+                published: Instant::now(),
+                diags: Diags::Live(diags),
+            },
+        );
         self.ping_subs();
     }
 
     /// Drop empty diagnostics entries every diag subscriber's acked
     /// floor has passed (all of them, when no diag subscriber exists) —
     /// FULL replays skip tombstones, so nobody can still need them.
-    /// Then bound the cache: non-empty entries are never pruned by the
-    /// retain above and would otherwise grow for the backend's
-    /// lifetime, so the oldest past `diags_max_files` are evicted.
+    /// Then freeze entries with no publish for `diags_cold`: the
+    /// payload is lz4-compressed in place, bounding the otherwise
+    /// unbounded cache's memory without dropping a single diagnostic.
     fn prune_diag_tombstones(&mut self) {
         if self.last_diag_prune.elapsed() < Duration::from_secs(30) {
             return;
@@ -1213,8 +1307,8 @@ impl Engine {
             .copied()
             .unwrap_or(u64::MAX);
         let mut diags = self.shared.diags.lock().unwrap();
-        diags.retain(|_, f| !f.diags.is_empty() || f.seq > min_floor);
-        evict_diags_over_cap(&mut diags, min_floor, self.budgets.diags_max_files);
+        diags.retain(|_, f| !f.is_empty() || f.seq > min_floor);
+        freeze_cold_diags(&mut diags, self.budgets.diags_cold);
     }
 
     // -- open set ---------------------------------------------------------
@@ -2088,65 +2182,118 @@ fn rss_of_pid(_pid: u32) -> u64 {
 mod tests {
     use super::*;
 
-    fn entry(seq: u64, n: usize) -> FileDiags {
-        FileDiags {
-            seq,
-            hash: [0; 16],
-            diags: (0..n)
-                .map(|i| WireDiag {
-                    severity: 1,
-                    flags: 0,
-                    line: 0,
-                    col: 0,
-                    end_line: 0,
-                    end_col: 1,
-                    code: String::new(),
-                    source: String::new(),
-                    msg: format!("m{i}"),
-                })
-                .collect(),
+    fn diag(msg: String) -> WireDiag {
+        WireDiag {
+            severity: 1,
+            flags: 0,
+            line: 0,
+            col: 0,
+            end_line: 0,
+            end_col: 1,
+            code: String::new(),
+            source: String::new(),
+            msg,
         }
     }
 
-    fn cache(seqs: std::ops::RangeInclusive<u64>) -> HashMap<PathBuf, FileDiags> {
-        seqs.map(|seq| (PathBuf::from(format!("f{seq}.rs")), entry(seq, 1)))
-            .collect()
-    }
-
-    fn kept_seqs(diags: &HashMap<PathBuf, FileDiags>) -> Vec<u64> {
-        let mut v: Vec<u64> = diags.values().map(|f| f.seq).collect();
-        v.sort_unstable();
-        v
-    }
-
-    #[test]
-    fn evict_diags_over_cap_drops_oldest_published() {
-        // Under the cap: nothing moves, tombstones included.
-        let mut diags = cache(1..=3);
-        diags.insert(PathBuf::from("t.rs"), entry(9, 0));
-        evict_diags_over_cap(&mut diags, u64::MAX, 3);
-        assert_eq!(kept_seqs(&diags), vec![1, 2, 3, 9]);
-
-        // Over the cap: the oldest publishes go; the tombstone is not
-        // counted and stays for the retain in prune_diag_tombstones.
-        let mut diags = cache(1..=5);
-        diags.insert(PathBuf::from("t.rs"), entry(9, 0));
-        evict_diags_over_cap(&mut diags, u64::MAX, 3);
-        assert_eq!(kept_seqs(&diags), vec![3, 4, 5, 9]);
+    fn entry(seq: u64, diags: Vec<WireDiag>, published: Instant) -> FileDiags {
+        FileDiags {
+            seq,
+            hash: [0; 16],
+            published,
+            diags: Diags::Live(diags),
+        }
     }
 
     #[test]
-    fn evict_diags_over_cap_prefers_acked_entries() {
-        // A subscriber pinned at floor 2: seqs 3..=5 are un-acked. The
-        // cap still holds — acked entries go first, then the oldest
-        // un-acked.
-        let mut diags = cache(1..=6);
-        evict_diags_over_cap(&mut diags, 2, 3);
-        assert_eq!(kept_seqs(&diags), vec![4, 5, 6]);
+    fn diag_codec_round_trip() {
+        // Empty strings, boundary ints, and multi-KB messages survive
+        // the encode/compress/decode trip exactly.
+        let diags = vec![
+            diag(String::new()),
+            WireDiag {
+                severity: u8::MAX,
+                flags: 3,
+                line: u32::MAX,
+                col: 1,
+                end_line: 2,
+                end_col: 3,
+                code: "E0308".into(),
+                source: "rustc".into(),
+                msg: "mismatched types: expected `u32`, found `&str`\n".repeat(500),
+            },
+        ];
+        let raw = encode_diags(&diags);
+        let cold = lz4_flex::compress_prepend_size(&raw);
+        let decoded = decode_diags(&cold);
+        assert_eq!(decoded, diags);
+        assert_eq!(encode_diags(&decoded), raw, "re-encode not byte-identical");
+        println!(
+            "cold ratio: {} raw -> {} compressed ({:.0}%)",
+            raw.len(),
+            cold.len(),
+            100.0 * cold.len() as f64 / raw.len() as f64
+        );
+        // Garbage decodes to empty, never panics.
+        assert_eq!(decode_diags(&[0xff, 0x00]), Vec::new());
+    }
 
-        // Nothing acked at all: the cap is still hard.
-        let mut diags = cache(1..=5);
-        evict_diags_over_cap(&mut diags, 0, 3);
-        assert_eq!(kept_seqs(&diags), vec![3, 4, 5]);
+    #[test]
+    fn freeze_cold_diags_compresses_stale_entries() {
+        let old = Instant::now() - Duration::from_secs(3600);
+        let live_diags = vec![diag("m0".into()), diag("m1".into())];
+        let mut diags: HashMap<PathBuf, FileDiags> = [
+            (
+                PathBuf::from("stale.rs"),
+                entry(1, live_diags.clone(), old),
+            ),
+            (
+                PathBuf::from("fresh.rs"),
+                entry(2, vec![diag("m2".into())], Instant::now()),
+            ),
+            // A stale tombstone is the prune retain's business, not the
+            // freeze's: it stays live.
+            (PathBuf::from("tomb.rs"), entry(3, Vec::new(), old)),
+        ]
+        .into_iter()
+        .collect();
+        freeze_cold_diags(&mut diags, Duration::from_secs(600));
+
+        // The stale entry froze; seq and hash are untouched, and the
+        // decoded payload is byte-identical to the live one.
+        let stale = &diags[&PathBuf::from("stale.rs")];
+        assert!(matches!(stale.diags, Diags::Cold(_)));
+        assert_eq!(stale.seq, 1);
+        assert_eq!(stale.hash, [0; 16]);
+        assert!(!stale.is_empty());
+        assert_eq!(stale.diags(), live_diags);
+        // Fresh and tombstone entries stay live.
+        assert!(matches!(
+            diags[&PathBuf::from("fresh.rs")].diags,
+            Diags::Live(_)
+        ));
+        assert!(diags[&PathBuf::from("tomb.rs")].is_empty());
+    }
+
+    #[test]
+    fn publish_against_cold_entry_yields_live_entry() {
+        // on_publish_diagnostics reads only is_empty/hash from the
+        // prior entry and replaces it wholesale: a cold entry dedupes
+        // as non-empty and the publish lands live.
+        let old = Instant::now() - Duration::from_secs(3600);
+        let mut diags: HashMap<PathBuf, FileDiags> =
+            [(PathBuf::from("a.rs"), entry(1, vec![diag("old".into())], old))]
+                .into_iter()
+                .collect();
+        freeze_cold_diags(&mut diags, Duration::from_secs(600));
+        let prior = diags[&PathBuf::from("a.rs")].is_empty();
+        assert!(!prior, "cold entry must not dedupe as a tombstone");
+        diags.insert(
+            PathBuf::from("a.rs"),
+            entry(2, vec![diag("new".into())], Instant::now()),
+        );
+        let after = &diags[&PathBuf::from("a.rs")];
+        assert!(matches!(after.diags, Diags::Live(_)));
+        assert_eq!(after.diags(), vec![diag("new".into())]);
     }
 }
