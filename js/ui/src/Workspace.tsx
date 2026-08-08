@@ -2954,15 +2954,6 @@ function WorkspaceScreen(props: {
     // subscribing/unsubscribing and applying mute to all connections.
   }
 
-  function resetAudio() {
-    for (const snap of allConnections()) {
-      if (!snap.supportsAudio) continue;
-      const conn = workspace.getConnection(snap.id);
-      if (!conn) continue;
-      conn.resetAudio();
-    }
-  }
-
   function changeVideoBandwidth(bandwidth: number) {
     setVideoBandwidth(bandwidth);
     writeStorage(VIDEO_BANDWIDTH_KEY, String(bandwidth));
@@ -3236,7 +3227,6 @@ function WorkspaceScreen(props: {
     },
     backgroundFocusedTile,
     closeFocusedTile,
-    resetAudio,
     navigateBack: () => navigateHistory("back"),
     navigateForward: () => navigateHistory("forward"),
   });
@@ -4000,43 +3990,20 @@ function WorkspaceScreen(props: {
                     const d = tileDisplay(assignment);
                     const web = parseWebAssignment(assignment);
                     return (
-                      // Draggable like any other tile source (an explorer row,
-                      // a commit): drop it on a BSP pane to restore it *there*
-                      // instead of the click target restoreTile would pick.
-                      // The whole card is the handle — the thumbnail below is
-                      // pointer-events:none, so a drag can only start here.
-                      <div
-                        draggable={true}
-                        onDragStart={(e) => startTileDrag(e, assignment)}
-                        // Touch never reaches onDragStart; a hold starts it,
-                        // so the dock still scrolls.
-                        onPointerDown={(e) =>
-                          startTouchDrag(
-                            e,
-                            (dt) => fillTileDrag(dt, assignment),
-                            "long-press",
-                          )
-                        }
-                        style={{
-                          "border-bottom": `1px solid ${theme().subtleBorder}`,
-                          display: "flex",
-                          "flex-direction": "column",
-                          "flex-shrink": 0,
-                        }}
-                      >
-                        <div
-                          style={{
-                            display: "flex",
-                            "align-items": "center",
-                            gap: `${chromeScale().tightGap}px`,
-                            padding: `${chromeScale().controlY}px ${chromeScale().tightGap}px`,
-                          }}
-                        >
-                          <button
-                            onClick={() => restoreTile(assignment)}
-                            title="Open in main view"
+                      // The same card parked terminals and surfaces get:
+                      // swipe right dismisses, swipe left (or a hold)
+                      // starts the drag, a click restores to the main view.
+                      <Thumbnail
+                        theme={theme()}
+                        scale={chromeScale()}
+                        isMobileTouch={isMobileTouch()}
+                        assignment={assignment}
+                        onFocus={() => restoreTile(assignment)}
+                        onClose={() => closeBackgroundTile(assignment)}
+                        closeTitle="Close"
+                        header={() => (
+                          <span
                             style={{
-                              ...ui.btn,
                               flex: 1,
                               "min-width": 0,
                               "text-align": "left",
@@ -4070,49 +4037,23 @@ function WorkspaceScreen(props: {
                                 {d.subtitle}
                               </span>
                             </Show>
-                          </button>
-                          <button
-                            onClick={() => closeBackgroundTile(assignment)}
-                            title="Close"
-                            style={{
-                              ...ui.btn,
-                              "flex-shrink": 0,
-                              "font-size": `${chromeScale().sm}px`,
-                              padding: `0 ${chromeScale().tightGap}px`,
-                              opacity: 0.5,
-                            }}
-                          >
-                            {"✕"}
-                          </button>
-                        </div>
-                        {/* Read-only zoomed-out preview, terminal-thumbnail
-                            semantics: click to bring it back to the main
-                            view. Only the most recent cards are live — a
-                            mounted preview editor holds an fs sync and a web
-                            preview holds an iframe, so both are budgeted
-                            (LIVE_DOCK_PREVIEWS). */}
-                        <Show when={index() < LIVE_DOCK_PREVIEWS}>
-                          <div
-                            onClick={() => restoreTile(assignment)}
-                            title="Open in main view"
-                            style={{
-                              position: "relative",
-                              width: "100%",
-                              height: `${Math.min(240, Math.max(120, Math.round(fontSize() * 12)))}px`,
-                              overflow: "hidden",
-                              "background-color": theme().bg,
-                              cursor: "pointer",
-                            }}
-                          >
-                            {/* Inert content: pointer-events none keeps every
-                              wheel/click on the card itself, so a dock pane
-                              can't be scrolled or interacted with — a click
-                              only ever restores it. */}
+                          </span>
+                        )}
+                        body={() => (
+                          // Read-only zoomed-out preview, terminal-thumbnail
+                          // semantics: click to bring it back to the main
+                          // view. Only the most recent cards are live — a
+                          // mounted preview editor holds an fs sync and a web
+                          // preview holds an iframe, so both are budgeted
+                          // (LIVE_DOCK_PREVIEWS).
+                          <Show when={index() < LIVE_DOCK_PREVIEWS}>
                             <div
                               style={{
-                                position: "absolute",
-                                inset: 0,
-                                "pointer-events": "none",
+                                position: "relative",
+                                width: "100%",
+                                height: `${Math.min(240, Math.max(120, Math.round(fontSize() * 12)))}px`,
+                                overflow: "hidden",
+                                "background-color": theme().bg,
                               }}
                             >
                               <Show
@@ -4144,9 +4085,9 @@ function WorkspaceScreen(props: {
                                 )}
                               </Show>
                             </div>
-                          </div>
-                        </Show>
-                      </div>
+                          </Show>
+                        )}
+                      />
                     );
                   }}
                 </For>
@@ -4501,7 +4442,6 @@ function WorkspaceScreen(props: {
               onVideoSpeedChange={changeVideoSpeed}
               onSurfaceStreamingChange={changeSurfaceStreaming}
               onToggleAudio={toggleAudio}
-              onResetAudio={resetAudio}
               onClose={closeOverlay}
             />
           )}
@@ -4873,7 +4813,8 @@ function Thumbnail(props: {
   scale: UIScale;
   isMobileTouch: boolean;
   /** The pane assignment this card carries when dragged onto a BSP pane —
-   *  a session id for a terminal, `surfaceAssignment(...)` for a surface. */
+   *  a session id for a terminal, `surfaceAssignment(...)` for a surface,
+   *  a tile assignment (`editor:`/…) for a background editor. */
   assignment: string;
   onFocus: () => void;
   onClose: () => void;
