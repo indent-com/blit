@@ -156,6 +156,8 @@ The compositor is optionally enabled for terminals that need GUI app support. It
 
 All PTYs forked after the compositor starts inherit `WAYLAND_DISPLAY` pointing at the shared compositor socket. Any program — shell, TUI, or GUI app — can open Wayland surfaces from any PTY.
 
+PTYs never inherit the server's `DBUS_SESSION_BUS_ADDRESS` (the server runs a private D-Bus daemon for its PipeWire pipeline; that bus must not leak into terminals). Instead, when the PTY's `XDG_RUNTIME_DIR` holds a `bus` socket, terminals get `DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus` — the standard per-user session bus. Desktop apps stall or silently lose features without it (Spotify's renderer exits before its window ever maps). On headless servers with no such socket the variable stays unset.
+
 ### Surface lifecycle
 
 1. The app creates an `xdg_toplevel` surface; the compositor assigns it a `surface_id`.

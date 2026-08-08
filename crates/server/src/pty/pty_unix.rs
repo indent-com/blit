@@ -86,6 +86,22 @@ fn build_child_env(
         set(&mut env, "XDG_SESSION_TYPE", "wayland");
         // DISPLAY was already filtered out above.
     }
+    // The inherited DBUS_SESSION_BUS_ADDRESS was filtered out above: the
+    // server's own bus, if any, is not the terminal user's session bus.
+    // But when the child's XDG_RUNTIME_DIR holds a `bus` socket, that is the
+    // standard per-user session bus, and desktop apps misbehave without it
+    // (Spotify's renderer exits before the window ever maps).  Point
+    // terminals at it; stays unset on headless servers with no socket.
+    if let Some((_, xdg)) = env.iter().find(|(k, _)| k == "XDG_RUNTIME_DIR") {
+        let bus = std::path::Path::new(xdg).join("bus");
+        if bus.exists() {
+            set(
+                &mut env,
+                "DBUS_SESSION_BUS_ADDRESS",
+                &format!("unix:path={}", bus.display()),
+            );
+        }
+    }
     if let Some(ps) = pulse_server {
         set(&mut env, "PULSE_SERVER", ps);
     } else {
@@ -1268,6 +1284,37 @@ mod tests {
             Some("wayland"),
         );
         assert!(!env.contains_key("DISPLAY"));
+    }
+
+    #[test]
+    fn child_env_points_dbus_at_the_runtime_dir_session_bus() {
+        // No bus socket under XDG_RUNTIME_DIR: stays unset.
+        let dir = std::env::temp_dir().join(format!("blit-env-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let wayland = dir.join("wayland-7");
+        let env = child_env_map(build_child_env(
+            Some(wayland.to_str().unwrap()),
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert!(!env.contains_key("DBUS_SESSION_BUS_ADDRESS"));
+
+        // Bus socket present: terminals get the standard session bus address.
+        std::fs::File::create(dir.join("bus")).expect("bus socket placeholder");
+        let env = child_env_map(build_child_env(
+            Some(wayland.to_str().unwrap()),
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            env.get("DBUS_SESSION_BUS_ADDRESS").map(String::as_str),
+            Some(format!("unix:path={}/bus", dir.display()).as_str())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
