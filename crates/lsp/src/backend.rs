@@ -459,6 +459,38 @@ struct EncodeJob {
     bytes_max: usize,
 }
 
+/// LRU-evict the oldest non-empty diagnostic entries past `cap`. Seq
+/// doubles as the LRU clock: it is issued monotonically on every
+/// publish, so the lowest seq is the least recently published.
+/// Eviction only drops the cached copy — a FULL replay reads an absent
+/// path as unknown (never as clean), and the server's next
+/// `textDocument/publishDiagnostics` for the path re-populates the
+/// entry — so a subscriber holding the diagnostics keeps showing them
+/// until then. Entries every diag subscriber has acked
+/// (`seq <= min_floor`) are evicted first; an un-acked one goes only
+/// when a pinned ack floor leaves no other victim, and that subscriber
+/// then misses the file until the next publish.
+fn evict_diags_over_cap(diags: &mut HashMap<PathBuf, FileDiags>, min_floor: u64, cap: usize) {
+    let over = diags
+        .values()
+        .filter(|f| !f.diags.is_empty())
+        .count()
+        .saturating_sub(cap);
+    if over == 0 {
+        return;
+    }
+    // Acked (sorts false) before un-acked, oldest seq first.
+    let mut victims: Vec<(bool, u64, PathBuf)> = diags
+        .iter()
+        .filter(|(_, f)| !f.diags.is_empty())
+        .map(|(p, f)| (f.seq > min_floor, f.seq, p.clone()))
+        .collect();
+    victims.sort_unstable();
+    for (_, _, path) in victims.into_iter().take(over) {
+        diags.remove(&path);
+    }
+}
+
 impl Engine {
     fn run(mut self) {
         self.start_session();
@@ -1163,6 +1195,9 @@ impl Engine {
     /// Drop empty diagnostics entries every diag subscriber's acked
     /// floor has passed (all of them, when no diag subscriber exists) —
     /// FULL replays skip tombstones, so nobody can still need them.
+    /// Then bound the cache: non-empty entries are never pruned by the
+    /// retain above and would otherwise grow for the backend's
+    /// lifetime, so the oldest past `diags_max_files` are evicted.
     fn prune_diag_tombstones(&mut self) {
         if self.last_diag_prune.elapsed() < Duration::from_secs(30) {
             return;
@@ -1177,11 +1212,9 @@ impl Engine {
             .min()
             .copied()
             .unwrap_or(u64::MAX);
-        self.shared
-            .diags
-            .lock()
-            .unwrap()
-            .retain(|_, f| !f.diags.is_empty() || f.seq > min_floor);
+        let mut diags = self.shared.diags.lock().unwrap();
+        diags.retain(|_, f| !f.diags.is_empty() || f.seq > min_floor);
+        evict_diags_over_cap(&mut diags, min_floor, self.budgets.diags_max_files);
     }
 
     // -- open set ---------------------------------------------------------
@@ -2049,4 +2082,71 @@ fn rss_of_pid(pid: u32) -> u64 {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn rss_of_pid(_pid: u32) -> u64 {
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(seq: u64, n: usize) -> FileDiags {
+        FileDiags {
+            seq,
+            hash: [0; 16],
+            diags: (0..n)
+                .map(|i| WireDiag {
+                    severity: 1,
+                    flags: 0,
+                    line: 0,
+                    col: 0,
+                    end_line: 0,
+                    end_col: 1,
+                    code: String::new(),
+                    source: String::new(),
+                    msg: format!("m{i}"),
+                })
+                .collect(),
+        }
+    }
+
+    fn cache(seqs: std::ops::RangeInclusive<u64>) -> HashMap<PathBuf, FileDiags> {
+        seqs.map(|seq| (PathBuf::from(format!("f{seq}.rs")), entry(seq, 1)))
+            .collect()
+    }
+
+    fn kept_seqs(diags: &HashMap<PathBuf, FileDiags>) -> Vec<u64> {
+        let mut v: Vec<u64> = diags.values().map(|f| f.seq).collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn evict_diags_over_cap_drops_oldest_published() {
+        // Under the cap: nothing moves, tombstones included.
+        let mut diags = cache(1..=3);
+        diags.insert(PathBuf::from("t.rs"), entry(9, 0));
+        evict_diags_over_cap(&mut diags, u64::MAX, 3);
+        assert_eq!(kept_seqs(&diags), vec![1, 2, 3, 9]);
+
+        // Over the cap: the oldest publishes go; the tombstone is not
+        // counted and stays for the retain in prune_diag_tombstones.
+        let mut diags = cache(1..=5);
+        diags.insert(PathBuf::from("t.rs"), entry(9, 0));
+        evict_diags_over_cap(&mut diags, u64::MAX, 3);
+        assert_eq!(kept_seqs(&diags), vec![3, 4, 5, 9]);
+    }
+
+    #[test]
+    fn evict_diags_over_cap_prefers_acked_entries() {
+        // A subscriber pinned at floor 2: seqs 3..=5 are un-acked. The
+        // cap still holds — acked entries go first, then the oldest
+        // un-acked.
+        let mut diags = cache(1..=6);
+        evict_diags_over_cap(&mut diags, 2, 3);
+        assert_eq!(kept_seqs(&diags), vec![4, 5, 6]);
+
+        // Nothing acked at all: the cap is still hard.
+        let mut diags = cache(1..=5);
+        evict_diags_over_cap(&mut diags, 0, 3);
+        assert_eq!(kept_seqs(&diags), vec![3, 4, 5]);
+    }
 }

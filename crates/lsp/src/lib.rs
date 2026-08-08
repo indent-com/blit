@@ -52,6 +52,7 @@ pub struct Budgets {
     pub spawn_rate_per_min: usize,
     pub max_overlays: usize,
     pub buffer_max: usize,
+    pub diags_max_files: usize,
 }
 
 impl Default for Budgets {
@@ -88,6 +89,10 @@ impl Default for Budgets {
             // back to saved state, never an error.
             max_overlays: env_u64("BLIT_LSP_MAX_OVERLAYS", 64).max(1) as usize,
             buffer_max: env_u64("BLIT_LSP_BUFFER_MAX", 8 * 1024 * 1024) as usize,
+            // Hard cap on cached per-file diagnostic sets: non-empty
+            // entries are otherwise never pruned and the cache grows
+            // for the backend's lifetime. LRU by publish seq.
+            diags_max_files: env_u64("BLIT_LSP_DIAGS_MAX_FILES", 4_096) as usize,
         }
     }
 }

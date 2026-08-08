@@ -553,6 +553,7 @@ by construction, [git.md](git.md)'s stance.
 | Idle shutdown                    | 900 s            | `BLIT_LSP_IDLE_SECS`                          |
 | Records / bytes per response     | 200 000 / 48 MiB | `BLIT_LSP_ENTRIES_MAX` / `BLIT_LSP_BYTES_MAX` |
 | Diagnostics per file             | 65 535           | the `n` field's own ceiling                   |
+| Diagnostic files per backend     | 4 096            | `BLIT_LSP_DIAGS_MAX_FILES`                    |
 | Restarts per backend             | 3/hour           | `BLIT_LSP_MAX_RESTARTS`                       |
 | Spawns per daemon                | 30/minute        | `BLIT_LSP_SPAWN_RATE`                         |
 
