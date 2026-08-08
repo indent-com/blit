@@ -1,6 +1,6 @@
 [package]
 name = "blit-lsp"
-version = "0.45.3"
+version = "0.45.4"
 edition.workspace = true
 description = "Language intelligence engine: warm shared language servers projected into blit records"
 license.workspace = true
