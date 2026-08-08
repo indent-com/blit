@@ -55,7 +55,7 @@ import { resolveTab, isPtyRef } from "../ide/tabRegistry";
 import { ResizeHandle } from "./ResizeHandle";
 import { BSPTreeContext, useBSPTree, type BSPTreeCtx } from "./treeContext";
 import type { Theme } from "../theme";
-import { themeFor, ui, uiScale } from "../theme";
+import { themeFor, ui, uiScale, z } from "../theme";
 import { t, tp } from "../i18n";
 import { shellCapabilities } from "../shellCapabilities";
 
@@ -1535,6 +1535,11 @@ function LeafPane(props: {
                     display: "flex",
                     "align-items": "center",
                     gap: `${scale().gap}px`,
+                    // Above the terminal's scroll surface (z-index 1), which
+                    // otherwise hit-tests over the banner and swallows the
+                    // tap — invisible, but the top layer. Same treatment as
+                    // the non-BSP banner in Workspace.
+                    "z-index": z.exitedBanner,
                   }}
                 >
                   <mark
