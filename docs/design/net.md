@@ -1,9 +1,13 @@
 # RFC: TCP and UDP Relay (`NET_*`)
 
-- **Status:** Implemented through PR 7 — the `NET_*` wire, the server's TCP
+- **Status:** Implemented in full — the `NET_*` wire, the server's TCP
   and UDP relay, TLS termination with ALPN, `blit forward` with a spec list
-  (`tcp/`, `udp/`, `tls/`), and `blit.forwards`. PRs 8–11, the browser path,
-  are unstarted.
+  (`tcp/`, `udp/`, `tls/`), `blit.forwards`, `blit socks` (PR 7a), and the
+  browser path (PRs 8–11): the `@blit-sh/core` stream API
+  (`js/core/src/net.ts`), the gateway's service-worker asset route
+  (`sw.js` with `Service-Worker-Allowed: /`), the service worker itself
+  (`js/ui/src/sw/`: HTTP/1.1 over relayed streams, pooling, rewriting),
+  and the preview panel wiring in `js/ui`.
 - **Date:** 2026-07-28
 - **Companion to:** [../protocol.md](../protocol.md),
   [../transports.md](../transports.md), [kv.md](kv.md), [../ide.md](../ide.md)
