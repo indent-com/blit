@@ -12,12 +12,13 @@
 
 #![allow(non_upper_case_globals, clippy::too_many_arguments)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use ash::vk;
+use wayland_server::Resource;
 use wayland_server::backend::ObjectId;
 
 use super::imp::{EncodedFrame, ExternalOutputBuffer, PixelData, Surface};
@@ -32,6 +33,189 @@ use super::render::{GpuLayer, SurfaceMeta, collect_gpu_layers, to_physical};
 /// refusal while still giving up long before a viewer would call the surface
 /// broken — at 60 fps this is a fifth of a second.
 const VULKAN_ENCODE_FAILURE_LIMIT: u32 = 12;
+const MAX_REUSABLE_SHM_TEXTURES: usize = 16;
+const SHM_DAMAGE_HISTORY_LIMIT: usize = 64;
+const MAX_SHM_DAMAGE_RECTS: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ShmDamageRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ShmUploadResult {
+    Staged,
+    Imported,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ShmTextureKey {
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    force_opaque: bool,
+}
+
+struct ShmTextureState {
+    key: ShmTextureKey,
+    /// Persistently mapped host-cached transfer source. Stored as an integer
+    /// so the renderer remains Send when moved onto the compositor thread.
+    staging_buffer: vk::Buffer,
+    staging_memory: vk::DeviceMemory,
+    mapped_ptr: usize,
+    row_pitch: usize,
+    surface_id: Option<ObjectId>,
+    generation: u64,
+}
+
+enum PendingShmSource {
+    Owned(vk::Buffer),
+    External {
+        host: Arc<ExternalHostBuffer>,
+        buffer_id: ObjectId,
+    },
+}
+
+struct PendingShmUpload {
+    source: PendingShmSource,
+    offset: vk::DeviceSize,
+    stride: usize,
+    damage: Vec<ShmDamageRect>,
+    release_buffers: Vec<(
+        wayland_server::protocol::wl_buffer::WlBuffer,
+        Option<crate::drm_syncobj::SyncPoint>,
+    )>,
+}
+
+impl PendingShmUpload {
+    fn buffer(&self) -> vk::Buffer {
+        match &self.source {
+            PendingShmSource::Owned(buffer) => *buffer,
+            PendingShmSource::External { host, .. } => host.buffer,
+        }
+    }
+
+    fn buffer_id(&self) -> Option<&ObjectId> {
+        match &self.source {
+            PendingShmSource::Owned(_) => None,
+            PendingShmSource::External { buffer_id, .. } => Some(buffer_id),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ShmUploadCounters {
+    commits: u64,
+    full_commits: u64,
+    damaged_pixels: u64,
+    total_pixels: u64,
+    cpu_copied_bytes: u64,
+    imported_commits: u64,
+}
+
+struct ExternalHostBuffer {
+    device: ash::Device,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped_ptr: *mut libc::c_void,
+    mapped_len: usize,
+    usable_len: usize,
+}
+
+unsafe impl Send for ExternalHostBuffer {}
+unsafe impl Sync for ExternalHostBuffer {}
+
+impl Drop for ExternalHostBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_buffer(self.buffer, None);
+            self.device.free_memory(self.memory, None);
+            libc::munmap(self.mapped_ptr, self.mapped_len);
+        }
+    }
+}
+
+fn page_rounded_len(len: usize, page_size: usize) -> Option<usize> {
+    if page_size == 0 {
+        return None;
+    }
+    len.checked_add(page_size - 1)
+        .and_then(|value| (value / page_size).checked_mul(page_size))
+}
+
+unsafe fn mmap_aligned_file(fd: RawFd, len: usize, alignment: usize) -> Option<*mut libc::c_void> {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page <= 0 || len == 0 {
+        return None;
+    }
+    let alignment = alignment.max(page as usize);
+    let reserve_len = len.checked_add(alignment)?;
+    let reserve = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            reserve_len,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if reserve == libc::MAP_FAILED {
+        return None;
+    }
+    let base = reserve as usize;
+    let Some(aligned) = base
+        .checked_add(alignment - 1)
+        .and_then(|value| (value / alignment).checked_mul(alignment))
+    else {
+        unsafe { libc::munmap(reserve, reserve_len) };
+        return None;
+    };
+    let mapped = unsafe {
+        libc::mmap(
+            aligned as *mut libc::c_void,
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_FIXED,
+            fd,
+            0,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        unsafe { libc::munmap(reserve, reserve_len) };
+        return None;
+    }
+    let prefix = aligned - base;
+    if prefix != 0 {
+        unsafe { libc::munmap(reserve, prefix) };
+    }
+    let suffix_start = aligned + len;
+    let reserve_end = base + reserve_len;
+    if suffix_start < reserve_end {
+        unsafe {
+            libc::munmap(
+                suffix_start as *mut libc::c_void,
+                reserve_end - suffix_start,
+            )
+        };
+    }
+    Some(mapped)
+}
+
+#[derive(Clone, Debug)]
+struct ShmDamageFrame {
+    generation: u64,
+    rects: Vec<ShmDamageRect>,
+}
+
+struct ShmSurfaceHistory {
+    key: ShmTextureKey,
+    generation: u64,
+    frames: VecDeque<ShmDamageFrame>,
+}
 
 pub(crate) struct VulkanRenderer {
     /// Held only to keep libvulkan loaded, and deliberately never dropped --
@@ -78,6 +262,8 @@ pub(crate) struct VulkanRenderer {
     /// zero-copy path exists to avoid paying when nobody wants CPU pixels.
     publish_native_bgra_once: bool,
     has_external_memory_fd: bool,
+    external_memory_host_fn: Option<ash::ext::external_memory_host::Device>,
+    external_memory_host_alignment: usize,
 
     // Render pipeline
     render_pass: vk::RenderPass,
@@ -112,6 +298,21 @@ pub(crate) struct VulkanRenderer {
     // once the fence signals.
     pending_submit: Option<PendingSubmit>,
 
+    /// Tracking fences and primary command buffers retired from completed
+    /// submissions. Both objects are reset before entering these pools, so
+    /// steady-state rendering does not allocate and destroy driver objects
+    /// for every frame.
+    recycled_tracking_fences: Vec<vk::Fence>,
+    recycled_export_fences: Vec<vk::Fence>,
+    recycled_command_buffers: Vec<vk::CommandBuffer>,
+    recycled_acquire_semaphores: Vec<vk::Semaphore>,
+    recycled_export_semaphores: Vec<vk::Semaphore>,
+
+    /// The compositor loop may wake many times between a submit and its GPU
+    /// completion. Throttle zero-timeout fence probes so a busy Wayland
+    /// client cannot turn that interval into a tight NVIDIA ioctl loop.
+    last_pending_poll: Option<std::time::Instant>,
+
     /// Submissions for external outputs whose fences we don't need to
     /// block on (VPP handles sync via implicit DMA-BUF fencing).  We
     /// only keep them alive so we can free the Vulkan command buffer,
@@ -122,6 +323,8 @@ pub(crate) struct VulkanRenderer {
     /// fences as sync_fd for cross-process / cross-API synchronisation.
     external_fence_fd_fn: Option<ash::khr::external_fence_fd::Device>,
     external_semaphore_fd_fn: Option<ash::khr::external_semaphore_fd::Device>,
+    sync_fd_semaphore_importable: bool,
+    sync_fd_semaphore_exportable: bool,
     /// Imported acquire-fence semaphores awaiting attachment to the next
     /// composite submit.  Each is a client's explicit-sync acquire point:
     /// the submit that samples the committed buffer must wait on it, or
@@ -217,6 +420,23 @@ pub(crate) struct VulkanRenderer {
     /// `Arc` — otherwise the remaining holder (`surface_textures` /
     /// `buffer_textures`) re-pushes it on its own eviction.
     pending_destroy_textures: Vec<Arc<CachedSurfaceTexture>>,
+
+    /// Fence-retired SHM textures ready to be written and installed again.
+    /// Entries stay persistently mapped, so steady-state commits perform no
+    /// Vulkan allocation, mapping, view, or descriptor operations.
+    reusable_shm_textures: Vec<CachedSurfaceTexture>,
+    /// Staging writes waiting to become buffer-to-image copies in the next
+    /// command buffer that samples the image.
+    pending_shm_uploads: HashMap<vk::Image, PendingShmUpload>,
+    /// Direct imports of live wl_shm buffers. The mapping and VkBuffer are
+    /// cached by wl_buffer identity and evicted by wl_buffer.destroy.
+    shm_host_buffers: HashMap<ObjectId, Arc<ExternalHostBuffer>>,
+    shm_host_import_failures: HashSet<ObjectId>,
+    shm_upload_counters: ShmUploadCounters,
+    /// Recent per-surface damage. A ring entry can miss several commits while
+    /// the GPU owns it; replaying the union since its generation brings it
+    /// directly to the newest frame without copying the unchanged pixels.
+    shm_surface_history: HashMap<ObjectId, ShmSurfaceHistory>,
 
     /// External / NV12 / downscale targets removed while a Vulkan submit
     /// may still reference them.  Freed once all tracked submits retire.
@@ -350,6 +570,114 @@ struct CachedSurfaceTexture {
     /// Vulkan image layout — SHM textures start at PREINITIALIZED,
     /// DMA-BUF imports start at UNDEFINED.
     initial_layout: vk::ImageLayout,
+    /// Layout used while sampling. Persistently host-written SHM images stay
+    /// GENERAL; immutable uploads and DMA-BUF imports use SHADER_READ_ONLY.
+    sample_layout: vk::ImageLayout,
+    /// Set when a command buffer first transitions the image. Recycled SHM
+    /// images remain in GENERAL while host writes update their coherent
+    /// backing memory.
+    layout_initialized: std::sync::atomic::AtomicBool,
+    /// Present only for persistently mapped, reusable wl_shm textures.
+    shm: Option<ShmTextureState>,
+}
+
+fn full_shm_damage(key: ShmTextureKey) -> ShmDamageRect {
+    ShmDamageRect {
+        x: 0,
+        y: 0,
+        width: key.width,
+        height: key.height,
+    }
+}
+
+fn damage_rects_touch(a: ShmDamageRect, b: ShmDamageRect) -> bool {
+    let ar = a.x as u64 + a.width as u64;
+    let ab = a.y as u64 + a.height as u64;
+    let br = b.x as u64 + b.width as u64;
+    let bb = b.y as u64 + b.height as u64;
+    a.x as u64 <= br && b.x as u64 <= ar && a.y as u64 <= bb && b.y as u64 <= ab
+}
+
+fn merged_damage_rect(a: ShmDamageRect, b: ShmDamageRect) -> ShmDamageRect {
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = (a.x as u64 + a.width as u64).max(b.x as u64 + b.width as u64);
+    let y1 = (a.y as u64 + a.height as u64).max(b.y as u64 + b.height as u64);
+    ShmDamageRect {
+        x: x0,
+        y: y0,
+        width: (x1 - x0 as u64) as u32,
+        height: (y1 - y0 as u64) as u32,
+    }
+}
+
+fn coalesce_shm_damage(
+    rects: impl IntoIterator<Item = ShmDamageRect>,
+    key: ShmTextureKey,
+) -> Vec<ShmDamageRect> {
+    let full = full_shm_damage(key);
+    let mut merged: Vec<ShmDamageRect> = Vec::new();
+    for rect in rects {
+        if rect.width == 0 || rect.height == 0 {
+            continue;
+        }
+        if rect == full {
+            return vec![full];
+        }
+        let mut next = rect;
+        let mut i = 0;
+        while i < merged.len() {
+            if damage_rects_touch(merged[i], next) {
+                next = merged_damage_rect(merged.swap_remove(i), next);
+                i = 0;
+            } else {
+                i += 1;
+            }
+        }
+        merged.push(next);
+        if merged.len() > MAX_SHM_DAMAGE_RECTS {
+            return vec![full];
+        }
+    }
+    let copied_area: u64 = merged
+        .iter()
+        .map(|rect| rect.width as u64 * rect.height as u64)
+        .sum();
+    let full_area = key.width as u64 * key.height as u64;
+    if copied_area.saturating_mul(2) >= full_area {
+        vec![full]
+    } else {
+        merged
+    }
+}
+
+/// Return damage after `generation`, or `None` when retained history has a
+/// gap and a full copy is required.
+fn shm_damage_since(
+    frames: &VecDeque<ShmDamageFrame>,
+    generation: u64,
+    current_generation: u64,
+    key: ShmTextureKey,
+) -> Option<Vec<ShmDamageRect>> {
+    if generation == current_generation {
+        return Some(Vec::new());
+    }
+    if generation > current_generation {
+        return None;
+    }
+    let mut expected = generation.saturating_add(1);
+    let mut rects = Vec::new();
+    for frame in frames.iter().filter(|frame| frame.generation > generation) {
+        if frame.generation != expected {
+            return None;
+        }
+        rects.extend_from_slice(&frame.rects);
+        expected = expected.saturating_add(1);
+    }
+    if expected != current_generation.saturating_add(1) {
+        return None;
+    }
+    Some(coalesce_shm_damage(rects, key))
 }
 
 /// In-flight GPU submission.  Resources are kept alive until the fence
@@ -376,6 +704,8 @@ struct PendingSubmit {
     /// Acquire-fence semaphores this submission waited on; destroyed at
     /// retire (a SYNC_FD import is consumed by its single wait).
     wait_semaphores: Vec<vk::Semaphore>,
+    /// Imported wl_shm host mappings read by this command buffer.
+    _shm_host_buffers: Vec<Arc<ExternalHostBuffer>>,
     /// wl_buffers whose release is gated on this submission's fence.
     ///
     /// A DMA-BUF is imported, not copied, and NVIDIA's driver does not
@@ -592,6 +922,31 @@ impl VulkanRenderer {
             .iter()
             .map(|p| unsafe { std::ffi::CStr::from_ptr(p.extension_name.as_ptr()) })
             .collect();
+        let physical_properties =
+            unsafe { instance.get_physical_device_properties(physical_device) };
+        let external_host_enabled = std::env::var_os("BLIT_DISABLE_EXTERNAL_MEMORY_HOST").is_none();
+        let has_external_memory_host = physical_properties.vendor_id == 0x10de
+            && external_host_enabled
+            && ext_names_all.contains(&ash::ext::external_memory_host::NAME);
+        let external_memory_host_alignment = if has_external_memory_host {
+            let mut host_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut host_props);
+            unsafe {
+                instance.get_physical_device_properties2(physical_device, &mut props);
+            }
+            eprintln!(
+                "[vulkan-render] direct wl_shm host import available (alignment={})",
+                host_props.min_imported_host_pointer_alignment,
+            );
+            host_props.min_imported_host_pointer_alignment as usize
+        } else {
+            if physical_properties.vendor_id == 0x10de {
+                eprintln!(
+                    "[vulkan-render] direct wl_shm host import unavailable; using staging copies"
+                );
+            }
+            0
+        };
 
         let has_video_encode = {
             let has_video_queue = ext_names_all.contains(&c"VK_KHR_video_queue");
@@ -670,6 +1025,9 @@ impl VulkanRenderer {
             device_extensions.push(ash::khr::external_semaphore::NAME.as_ptr());
             device_extensions.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
         }
+        if has_external_memory_host {
+            device_extensions.push(ash::ext::external_memory_host::NAME.as_ptr());
+        }
         if has_video_encode {
             device_extensions.push(c"VK_KHR_video_queue".as_ptr());
             device_extensions.push(c"VK_KHR_video_encode_queue".as_ptr());
@@ -715,6 +1073,9 @@ impl VulkanRenderer {
         };
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
 
+        let external_memory_host_fn = has_external_memory_host
+            .then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
+
         let external_fence_fd_fn = if has_external_fence_fd {
             Some(ash::khr::external_fence_fd::Device::new(&instance, &device))
         } else {
@@ -725,33 +1086,38 @@ impl VulkanRenderer {
         // before relying on it: without the query the first import simply
         // fails at runtime, every explicit-sync commit falls back to
         // parking, and the GPU-side acquire wait silently never runs.
-        let external_semaphore_fd_fn = if has_external_semaphore_fd {
-            let info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
-                .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-            let mut props = vk::ExternalSemaphoreProperties::default();
-            unsafe {
-                instance.get_physical_device_external_semaphore_properties(
-                    physical_device,
-                    &info,
-                    &mut props,
-                );
-            }
-            let importable = props
-                .external_semaphore_features
-                .contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE);
-            if !importable {
-                eprintln!(
-                    "[vulkan-render] driver cannot import SYNC_FD semaphores; explicit-sync commits will park on their acquire point instead of waiting on the GPU",
-                );
-                None
+        let (external_semaphore_fd_fn, sync_fd_semaphore_importable, sync_fd_semaphore_exportable) =
+            if has_external_semaphore_fd {
+                let info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+                    .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+                let mut props = vk::ExternalSemaphoreProperties::default();
+                unsafe {
+                    instance.get_physical_device_external_semaphore_properties(
+                        physical_device,
+                        &info,
+                        &mut props,
+                    );
+                }
+                let importable = props
+                    .external_semaphore_features
+                    .contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE);
+                let exportable = props
+                    .external_semaphore_features
+                    .contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE);
+                if !importable {
+                    eprintln!(
+                        "[vulkan-render] driver cannot import SYNC_FD semaphores; explicit-sync commits will park on their acquire point instead of waiting on the GPU",
+                    );
+                }
+                if exportable {
+                    eprintln!("[vulkan-render] SYNC_FD semaphore export enabled");
+                }
+                let loader = (importable || exportable)
+                    .then(|| ash::khr::external_semaphore_fd::Device::new(&instance, &device));
+                (loader, importable, exportable)
             } else {
-                Some(ash::khr::external_semaphore_fd::Device::new(
-                    &instance, &device,
-                ))
-            }
-        } else {
-            None
-        };
+                (None, false, false)
+            };
 
         // Video encode queue and command pool.
         let (video_encode_queue, video_encode_command_pool, video_fns) = if let Some(enc_qf) =
@@ -1236,6 +1602,8 @@ impl VulkanRenderer {
             has_dmabuf,
             publish_native_bgra_once: false,
             has_external_memory_fd,
+            external_memory_host_fn,
+            external_memory_host_alignment,
             render_pass,
             pipeline_layout,
             pipeline,
@@ -1254,9 +1622,17 @@ impl VulkanRenderer {
             output_idx: 0,
             frame_textures: Vec::new(),
             pending_submit: None,
+            recycled_tracking_fences: Vec::new(),
+            recycled_export_fences: Vec::new(),
+            recycled_command_buffers: Vec::new(),
+            recycled_acquire_semaphores: Vec::new(),
+            recycled_export_semaphores: Vec::new(),
+            last_pending_poll: None,
             deferred_submits: Vec::new(),
             external_fence_fd_fn,
             external_semaphore_fd_fn,
+            sync_fd_semaphore_importable,
+            sync_fd_semaphore_exportable,
             pending_acquire_semaphores: Vec::new(),
             supported_dmabuf_modifiers,
             external_outputs: HashMap::new(),
@@ -1270,6 +1646,12 @@ impl VulkanRenderer {
             surface_textures: HashMap::new(),
             buffer_textures: HashMap::new(),
             pending_destroy_textures: Vec::new(),
+            reusable_shm_textures: Vec::new(),
+            pending_shm_uploads: HashMap::new(),
+            shm_host_buffers: HashMap::new(),
+            shm_host_import_failures: HashSet::new(),
+            shm_upload_counters: ShmUploadCounters::default(),
+            shm_surface_history: HashMap::new(),
             pending_destroy_external_outputs: Vec::new(),
             pending_destroy_nv12_outputs: Vec::new(),
             pending_destroy_downscale_outputs: Vec::new(),
@@ -1421,6 +1803,154 @@ impl VulkanRenderer {
                     .property_flags
                     .contains(properties)
         })
+    }
+
+    fn external_host_buffer(
+        &mut self,
+        buffer_id: &ObjectId,
+        fd: RawFd,
+        pool_size: usize,
+        needed: usize,
+    ) -> Option<Arc<ExternalHostBuffer>> {
+        if let Some(host) = self.shm_host_buffers.get(buffer_id)
+            && host.usable_len >= needed
+        {
+            return Some(host.clone());
+        }
+        let loader = self.external_memory_host_fn.as_ref()?;
+        let alignment = self.external_memory_host_alignment.max(1);
+        // The mapped SHM pages are ordinary host memory. "Foreign memory"
+        // means memory originating from another device, which NVIDIA does
+        // not accept for these anonymous SHM files.
+        let handle_type = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+
+        let mut external_info =
+            vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(needed as vk::DeviceSize)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut external_info);
+        let buffer = match unsafe { self.device.create_buffer(&buffer_info, None) } {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                eprintln!("[shm-host-import] create buffer failed: {error:?}");
+                return None;
+            }
+        };
+        let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        let Some(import_len) = (requirements.size as usize)
+            .checked_add(alignment - 1)
+            .map(|value| value / alignment * alignment)
+        else {
+            eprintln!(
+                "[shm-host-import] size overflow requirements={}",
+                requirements.size
+            );
+            unsafe { self.device.destroy_buffer(buffer, None) };
+            return None;
+        };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let mapped_pool_len = if page_size > 0 {
+            page_rounded_len(pool_size, page_size as usize).unwrap_or(pool_size)
+        } else {
+            pool_size
+        };
+        // mmap exposes the zero-filled remainder of the file's final page.
+        // NVIDIA rounds imported host allocations to 4 KiB, so an exact-size
+        // wl_shm pool is still a valid import when the only excess is that
+        // already-mapped partial page. Copies never address the padding.
+        if import_len > mapped_pool_len || import_len < needed {
+            eprintln!(
+                "[shm-host-import] pool too small needed={needed} requirements={} import={import_len} mapped_pool={mapped_pool_len} pool={pool_size}",
+                requirements.size,
+            );
+            unsafe { self.device.destroy_buffer(buffer, None) };
+            return None;
+        }
+        let mapped_ptr = match unsafe { mmap_aligned_file(fd, import_len, alignment) } {
+            Some(ptr) => ptr,
+            None => {
+                eprintln!(
+                    "[shm-host-import] aligned mmap failed len={import_len} alignment={alignment}"
+                );
+                unsafe { self.device.destroy_buffer(buffer, None) };
+                return None;
+            }
+        };
+
+        let mut host_properties = vk::MemoryHostPointerPropertiesEXT::default();
+        let query = unsafe {
+            (loader.fp().get_memory_host_pointer_properties_ext)(
+                loader.device(),
+                handle_type,
+                mapped_ptr,
+                &mut host_properties,
+            )
+        };
+        if query != vk::Result::SUCCESS {
+            eprintln!("[shm-host-import] pointer query failed: {query:?}");
+            unsafe {
+                libc::munmap(mapped_ptr, import_len);
+                self.device.destroy_buffer(buffer, None);
+            }
+            return None;
+        }
+        let type_bits = requirements.memory_type_bits & host_properties.memory_type_bits;
+        let Some(memory_type) = self.find_memory_type(
+            type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) else {
+            eprintln!(
+                "[shm-host-import] no coherent memory type buffer_bits=0x{:x} host_bits=0x{:x}",
+                requirements.memory_type_bits, host_properties.memory_type_bits,
+            );
+            unsafe {
+                libc::munmap(mapped_ptr, import_len);
+                self.device.destroy_buffer(buffer, None);
+            }
+            return None;
+        };
+        let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+            .handle_type(handle_type)
+            .host_pointer(mapped_ptr);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(import_len as vk::DeviceSize)
+            .memory_type_index(memory_type)
+            .push_next(&mut import);
+        let memory = match unsafe { self.device.allocate_memory(&alloc_info, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                eprintln!(
+                    "[shm-host-import] allocate failed: {error:?} size={import_len} type={memory_type}"
+                );
+                unsafe {
+                    libc::munmap(mapped_ptr, import_len);
+                    self.device.destroy_buffer(buffer, None);
+                }
+                return None;
+            }
+        };
+        if let Err(error) = unsafe { self.device.bind_buffer_memory(buffer, memory, 0) } {
+            eprintln!("[shm-host-import] bind failed: {error:?}");
+            unsafe {
+                self.device.free_memory(memory, None);
+                libc::munmap(mapped_ptr, import_len);
+                self.device.destroy_buffer(buffer, None);
+            }
+            return None;
+        }
+        let host = Arc::new(ExternalHostBuffer {
+            device: self.device.clone(),
+            buffer,
+            memory,
+            mapped_ptr,
+            mapped_len: import_len,
+            usable_len: import_len,
+        });
+        self.shm_host_buffers
+            .insert(buffer_id.clone(), host.clone());
+        Some(host)
     }
 
     // ---------------------------------------------------------------
@@ -4337,6 +4867,9 @@ impl VulkanRenderer {
                             view: temp.view,
                             descriptor_set: temp.descriptor_set,
                             initial_layout: vk::ImageLayout::PREINITIALIZED,
+                            sample_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            layout_initialized: std::sync::atomic::AtomicBool::new(false),
+                            shm: None,
                         })
                     } else {
                         None
@@ -4397,6 +4930,7 @@ impl VulkanRenderer {
         if let Some(old) = self.surface_textures.remove(surface_id) {
             self.push_pending_destroy(old);
         }
+        self.shm_surface_history.remove(surface_id);
     }
 
     /// Drop a destroyed wl_buffer's cached import.  A surface still
@@ -4407,63 +4941,259 @@ impl VulkanRenderer {
         if let Some(old) = self.buffer_textures.remove(buffer_id) {
             self.push_pending_destroy(old);
         }
+        self.shm_host_buffers.remove(buffer_id);
+        self.shm_host_import_failures.remove(buffer_id);
     }
 
-    /// Zero-copy SHM upload: copies (with format conversion) directly from
-    /// the client's mmap'd pool memory into Vulkan-mapped texture memory,
-    /// skipping the intermediate owned `Vec<u8>` that the PixelData path
-    /// allocates. `mmap` is the full pool slice; `offset` is the byte
-    /// offset of the surface's first pixel; `stride` is bytes per row.
-    ///
-    /// `swap_rb` true means source pixels are BGRA byte-order; we swap the
-    /// first and third byte to produce RGBA as Vulkan expects. When false
-    /// the source is already RGBA byte-order. `force_opaque` forces the
-    /// alpha byte to 0xFF (for X-formats with undefined alpha).
+    /// Copy damaged SHM pixels directly from the client's mmap into a
+    /// persistently mapped, fence-retired Vulkan texture. `mmap` is the full
+    /// pool slice; `offset` is the first pixel and `stride` is bytes per row.
     pub(crate) fn upload_surface_shm_mmap(
         &mut self,
         surface_id: &ObjectId,
+        buffer_id: &ObjectId,
+        pool_fd: RawFd,
         mmap: &[u8],
         offset: usize,
         stride: usize,
         width: u32,
         height: u32,
-        swap_rb: bool,
+        source_bgra: bool,
         force_opaque: bool,
-    ) -> bool {
+        damage: &[ShmDamageRect],
+    ) -> Option<ShmUploadResult> {
+        if width == 0 || height == 0 {
+            return None;
+        }
         let row_bytes = width as usize * 4;
-        let end = offset.saturating_add(stride.saturating_mul(height as usize));
-        if end > mmap.len() && offset + stride * (height as usize - 1) + row_bytes > mmap.len() {
-            return false;
+        let needed = stride
+            .checked_mul(height as usize - 1)
+            .and_then(|body| body.checked_add(offset))
+            .and_then(|n| n.checked_add(row_bytes))?;
+        if needed > mmap.len() {
+            return None;
         }
 
-        let fmt = vk::Format::R8G8B8A8_UNORM;
+        // wl_shm ARGB/XRGB is BGRA byte-order on little-endian hosts. Using
+        // the matching Vulkan format makes the whole update a row memcpy;
+        // X formats force alpha through the image-view swizzle instead of a
+        // scalar per-pixel loop.
+        let fmt = if source_bgra {
+            vk::Format::B8G8R8A8_UNORM
+        } else {
+            vk::Format::R8G8B8A8_UNORM
+        };
+        let key = ShmTextureKey {
+            width,
+            height,
+            format: fmt,
+            force_opaque,
+        };
+        let current_damage = coalesce_shm_damage(damage.iter().copied(), key);
+        let generation = {
+            let history = self
+                .shm_surface_history
+                .entry(surface_id.clone())
+                .or_insert_with(|| ShmSurfaceHistory {
+                    key,
+                    generation: 0,
+                    frames: VecDeque::new(),
+                });
+            if history.key != key {
+                history.key = key;
+                history.frames.clear();
+            }
+            history.generation = match history.generation.checked_add(1) {
+                Some(generation) => generation,
+                None => {
+                    history.frames.clear();
+                    1
+                }
+            };
+            history.frames.push_back(ShmDamageFrame {
+                generation: history.generation,
+                rects: current_damage,
+            });
+            while history.frames.len() > SHM_DAMAGE_HISTORY_LIMIT {
+                history.frames.pop_front();
+            }
+            history.generation
+        };
+
+        let reusable_index = self
+            .reusable_shm_textures
+            .iter()
+            .position(|texture| {
+                texture.shm.as_ref().is_some_and(|state| {
+                    state.key == key && state.surface_id.as_ref() == Some(surface_id)
+                })
+            })
+            .or_else(|| {
+                self.reusable_shm_textures
+                    .iter()
+                    .position(|texture| texture.shm.as_ref().is_some_and(|state| state.key == key))
+            });
+        let (mut texture, newly_allocated) = match reusable_index {
+            Some(index) => (self.reusable_shm_textures.swap_remove(index), false),
+            None => (self.allocate_reusable_shm_texture(key)?, true),
+        };
+        // A texture may have been superseded before any composite consumed
+        // its staging write. Its device image still contains the older
+        // generation, so initialize it from the newest client contents.
+        let stale_upload = self.pending_shm_uploads.remove(&texture.image);
+        let had_unsubmitted_upload = stale_upload.is_some();
+        if let Some(stale) = stale_upload {
+            Self::release_pending_shm_upload(stale);
+        }
+
+        let copy_damage = if newly_allocated || had_unsubmitted_upload {
+            vec![full_shm_damage(key)]
+        } else {
+            let state = texture.shm.as_ref().expect("reusable texture is SHM");
+            if state.key == key && state.surface_id.as_ref() == Some(surface_id) {
+                self.shm_surface_history
+                    .get(surface_id)
+                    .and_then(|history| {
+                        shm_damage_since(&history.frames, state.generation, generation, key)
+                    })
+                    .unwrap_or_else(|| vec![full_shm_damage(key)])
+            } else {
+                vec![full_shm_damage(key)]
+            }
+        };
+
+        let try_external_host = self.external_memory_host_fn.is_some()
+            && !self.shm_host_import_failures.contains(buffer_id);
+        let external_host = try_external_host
+            .then(|| self.external_host_buffer(buffer_id, pool_fd, mmap.len(), needed))
+            .flatten();
+        if try_external_host && external_host.is_none() {
+            self.shm_host_import_failures.insert(buffer_id.clone());
+        }
+        let result = if external_host.is_some() {
+            ShmUploadResult::Imported
+        } else {
+            if !Self::copy_into_reusable_shm_texture(&texture, mmap, offset, stride, &copy_damage) {
+                self.destroy_cached_texture(texture);
+                return None;
+            }
+            ShmUploadResult::Staged
+        };
+        if let Some(state) = texture.shm.as_mut() {
+            state.surface_id = Some(surface_id.clone());
+            state.generation = generation;
+        }
+        let state = texture.shm.as_ref().expect("reusable texture is SHM");
+        self.pending_shm_uploads.insert(
+            texture.image,
+            PendingShmUpload {
+                source: match external_host {
+                    Some(host) => PendingShmSource::External {
+                        host,
+                        buffer_id: buffer_id.clone(),
+                    },
+                    None => PendingShmSource::Owned(state.staging_buffer),
+                },
+                offset: if result == ShmUploadResult::Imported {
+                    offset as vk::DeviceSize
+                } else {
+                    0
+                },
+                stride: if result == ShmUploadResult::Imported {
+                    stride
+                } else {
+                    state.row_pitch
+                },
+                damage: copy_damage.clone(),
+                release_buffers: Vec::new(),
+            },
+        );
+        let damaged_pixels: u64 = copy_damage
+            .iter()
+            .map(|rect| rect.width as u64 * rect.height as u64)
+            .sum();
+        let total_pixels = width as u64 * height as u64;
+        self.shm_upload_counters.commits += 1;
+        self.shm_upload_counters.full_commits +=
+            u64::from(copy_damage.len() == 1 && copy_damage[0] == full_shm_damage(key));
+        self.shm_upload_counters.damaged_pixels += damaged_pixels;
+        self.shm_upload_counters.total_pixels += total_pixels;
+        self.shm_upload_counters.cpu_copied_bytes += if result == ShmUploadResult::Staged {
+            damaged_pixels.saturating_mul(4)
+        } else {
+            0
+        };
+        self.shm_upload_counters.imported_commits += u64::from(result == ShmUploadResult::Imported);
+        if self.shm_upload_counters.commits <= 10
+            || self.shm_upload_counters.commits.is_multiple_of(1000)
+        {
+            let counters = &self.shm_upload_counters;
+            let pct = if counters.total_pixels == 0 {
+                0.0
+            } else {
+                counters.damaged_pixels as f64 * 100.0 / counters.total_pixels as f64
+            };
+            eprintln!(
+                "[shm-upload] commits={} imported={} full={} damaged={}/{} ({pct:.1}%) cpu_copy={} MiB",
+                counters.commits,
+                counters.imported_commits,
+                counters.full_commits,
+                counters.damaged_pixels,
+                counters.total_pixels,
+                counters.cpu_copied_bytes / (1024 * 1024),
+            );
+        }
+        if let Some(old) = self
+            .surface_textures
+            .insert(surface_id.clone(), Arc::new(texture))
+        {
+            self.push_pending_destroy(old);
+        }
+        Some(result)
+    }
+
+    fn release_pending_shm_upload(upload: PendingShmUpload) {
+        for (buffer, point) in upload.release_buffers {
+            buffer.release();
+            if let Some(point) = point {
+                point.signal();
+            }
+        }
+    }
+
+    fn allocate_reusable_shm_texture(
+        &mut self,
+        key: ShmTextureKey,
+    ) -> Option<CachedSurfaceTexture> {
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(fmt)
+            .format(key.format)
             .extent(vk::Extent3D {
-                width,
-                height,
+                width: key.width,
+                height: key.height,
                 depth: 1,
             })
             .mip_levels(1)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::LINEAR)
-            .usage(vk::ImageUsageFlags::SAMPLED)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::PREINITIALIZED);
+            .initial_layout(vk::ImageLayout::UNDEFINED);
 
-        let image = match unsafe { self.device.create_image(&image_info, None) } {
-            Ok(i) => i,
-            Err(_) => return false,
-        };
+        let image = unsafe { self.device.create_image(&image_info, None) }.ok()?;
         let mem_reqs = unsafe { self.device.get_image_memory_requirements(image) };
-        let Some(mem_type) = self.find_memory_type(
-            mem_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ) else {
+        let Some(mem_type) = self
+            .find_memory_type(
+                mem_reqs.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .or_else(|| {
+                self.find_memory_type(mem_reqs.memory_type_bits, vk::MemoryPropertyFlags::empty())
+            })
+        else {
             unsafe { self.device.destroy_image(image, None) };
-            return false;
+            return None;
         };
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
@@ -4472,7 +5202,7 @@ impl VulkanRenderer {
             Ok(m) => m,
             Err(_) => {
                 unsafe { self.device.destroy_image(image, None) };
-                return false;
+                return None;
             }
         };
         if unsafe { self.device.bind_image_memory(image, memory, 0) }.is_err() {
@@ -4480,65 +5210,104 @@ impl VulkanRenderer {
                 self.device.free_memory(memory, None);
                 self.device.destroy_image(image, None);
             }
-            return false;
+            return None;
         }
 
-        let subresource = vk::ImageSubresource {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            mip_level: 0,
-            array_layer: 0,
+        let row_pitch = key.width as usize * 4;
+        let Some(staging_size) = row_pitch.checked_mul(key.height as usize) else {
+            unsafe {
+                self.device.free_memory(memory, None);
+                self.device.destroy_image(image, None);
+            }
+            return None;
         };
-        let layout = unsafe { self.device.get_image_subresource_layout(image, subresource) };
-        let dst_row_pitch = layout.row_pitch as usize;
-
-        let map_ptr = match unsafe {
-            self.device
-                .map_memory(memory, 0, layout.size, vk::MemoryMapFlags::empty())
-        } {
-            Ok(p) => p as *mut u8,
+        let staging_size = staging_size as vk::DeviceSize;
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(staging_size)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let staging_buffer = match unsafe { self.device.create_buffer(&buffer_info, None) } {
+            Ok(buffer) => buffer,
             Err(_) => {
                 unsafe {
                     self.device.free_memory(memory, None);
                     self.device.destroy_image(image, None);
                 }
-                return false;
+                return None;
             }
         };
-
-        // Single pass: read from the client mmap, convert, write into
-        // Vulkan mapped memory. Saves the intermediate `Vec<u8>` copy
-        // that the PixelData path allocates in `ShmPool::read_buffer`.
-        unsafe {
-            let dst_base = map_ptr.add(layout.offset as usize);
-            for row in 0..height as usize {
-                let src = mmap.as_ptr().add(offset + row * stride);
-                let dst = dst_base.add(row * dst_row_pitch);
-                if !swap_rb && !force_opaque {
-                    std::ptr::copy_nonoverlapping(src, dst, row_bytes);
-                } else {
-                    for col in 0..width as usize {
-                        let s = src.add(col * 4);
-                        let d = dst.add(col * 4);
-                        if swap_rb {
-                            *d = *s.add(2);
-                            *d.add(1) = *s.add(1);
-                            *d.add(2) = *s;
-                        } else {
-                            *d = *s;
-                            *d.add(1) = *s.add(1);
-                            *d.add(2) = *s.add(2);
-                        }
-                        *d.add(3) = if force_opaque { 0xFF } else { *s.add(3) };
-                    }
-                }
+        let staging_reqs = unsafe { self.device.get_buffer_memory_requirements(staging_buffer) };
+        let Some(staging_mem_type) = self.find_readback_memory_type(staging_reqs.memory_type_bits)
+        else {
+            unsafe {
+                self.device.destroy_buffer(staging_buffer, None);
+                self.device.free_memory(memory, None);
+                self.device.destroy_image(image, None);
             }
-            self.device.unmap_memory(memory);
+            return None;
+        };
+        let staging_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(staging_reqs.size)
+            .memory_type_index(staging_mem_type);
+        let staging_memory = match unsafe { self.device.allocate_memory(&staging_alloc, None) } {
+            Ok(memory) => memory,
+            Err(_) => {
+                unsafe {
+                    self.device.destroy_buffer(staging_buffer, None);
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_image(image, None);
+                }
+                return None;
+            }
+        };
+        if unsafe {
+            self.device
+                .bind_buffer_memory(staging_buffer, staging_memory, 0)
         }
+        .is_err()
+        {
+            unsafe {
+                self.device.free_memory(staging_memory, None);
+                self.device.destroy_buffer(staging_buffer, None);
+                self.device.free_memory(memory, None);
+                self.device.destroy_image(image, None);
+            }
+            return None;
+        }
+        let map_ptr = match unsafe {
+            self.device.map_memory(
+                staging_memory,
+                0,
+                vk::WHOLE_SIZE,
+                vk::MemoryMapFlags::empty(),
+            )
+        } {
+            Ok(p) => p as *mut u8,
+            Err(_) => {
+                unsafe {
+                    self.device.free_memory(staging_memory, None);
+                    self.device.destroy_buffer(staging_buffer, None);
+                    self.device.free_memory(memory, None);
+                    self.device.destroy_image(image, None);
+                }
+                return None;
+            }
+        };
 
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(fmt)
+            .format(key.format)
+            .components(vk::ComponentMapping {
+                r: vk::ComponentSwizzle::IDENTITY,
+                g: vk::ComponentSwizzle::IDENTITY,
+                b: vk::ComponentSwizzle::IDENTITY,
+                a: if key.force_opaque {
+                    vk::ComponentSwizzle::ONE
+                } else {
+                    vk::ComponentSwizzle::IDENTITY
+                },
+            })
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
@@ -4550,10 +5319,13 @@ impl VulkanRenderer {
             Ok(v) => v,
             Err(_) => {
                 unsafe {
+                    self.device.unmap_memory(staging_memory);
+                    self.device.free_memory(staging_memory, None);
+                    self.device.destroy_buffer(staging_buffer, None);
                     self.device.free_memory(memory, None);
                     self.device.destroy_image(image, None);
                 }
-                return false;
+                return None;
             }
         };
 
@@ -4566,10 +5338,13 @@ impl VulkanRenderer {
             Err(_) => {
                 unsafe {
                     self.device.destroy_image_view(view, None);
+                    self.device.unmap_memory(staging_memory);
+                    self.device.free_memory(staging_memory, None);
+                    self.device.destroy_buffer(staging_buffer, None);
                     self.device.free_memory(memory, None);
                     self.device.destroy_image(image, None);
                 }
-                return false;
+                return None;
             }
         };
 
@@ -4584,18 +5359,68 @@ impl VulkanRenderer {
             .image_info(std::slice::from_ref(&img_info));
         unsafe { self.device.update_descriptor_sets(&[write], &[]) };
 
-        let tex = CachedSurfaceTexture {
+        Some(CachedSurfaceTexture {
             image,
             memory,
             view,
             descriptor_set,
-            initial_layout: vk::ImageLayout::PREINITIALIZED,
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            sample_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            layout_initialized: std::sync::atomic::AtomicBool::new(false),
+            shm: Some(ShmTextureState {
+                key,
+                staging_buffer,
+                staging_memory,
+                mapped_ptr: map_ptr as usize,
+                row_pitch,
+                surface_id: None,
+                generation: 0,
+            }),
+        })
+    }
+
+    fn copy_into_reusable_shm_texture(
+        texture: &CachedSurfaceTexture,
+        mmap: &[u8],
+        offset: usize,
+        stride: usize,
+        damage: &[ShmDamageRect],
+    ) -> bool {
+        let Some(state) = texture.shm.as_ref() else {
+            return false;
         };
-        if let Some(old) = self
-            .surface_textures
-            .insert(surface_id.clone(), Arc::new(tex))
-        {
-            self.push_pending_destroy(old);
+        for rect in damage {
+            if rect.x.saturating_add(rect.width) > state.key.width
+                || rect.y.saturating_add(rect.height) > state.key.height
+            {
+                return false;
+            }
+            let row_bytes = rect.width as usize * 4;
+            for row in rect.y as usize..rect.y.saturating_add(rect.height) as usize {
+                let Some(src_offset) = row
+                    .checked_mul(stride)
+                    .and_then(|n| n.checked_add(offset))
+                    .and_then(|n| n.checked_add(rect.x as usize * 4))
+                else {
+                    return false;
+                };
+                if src_offset.saturating_add(row_bytes) > mmap.len() {
+                    return false;
+                }
+                let Some(dst_offset) = row
+                    .checked_mul(state.row_pitch)
+                    .and_then(|n| n.checked_add(rect.x as usize * 4))
+                else {
+                    return false;
+                };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        mmap.as_ptr().add(src_offset),
+                        (state.mapped_ptr as *mut u8).add(dst_offset),
+                        row_bytes,
+                    );
+                }
+            }
         }
         true
     }
@@ -4754,6 +5579,9 @@ impl VulkanRenderer {
             view,
             descriptor_set,
             initial_layout: vk::ImageLayout::PREINITIALIZED,
+            sample_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            layout_initialized: std::sync::atomic::AtomicBool::new(false),
+            shm: None,
         })
     }
 
@@ -4782,26 +5610,59 @@ impl VulkanRenderer {
             view: temp.view,
             descriptor_set: temp.descriptor_set,
             initial_layout: vk::ImageLayout::UNDEFINED,
+            sample_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            layout_initialized: std::sync::atomic::AtomicBool::new(false),
+            shm: None,
         })
     }
 
     fn drain_pending_destroy_textures(&mut self) {
-        for tex in self.pending_destroy_textures.drain(..) {
+        let pending = std::mem::take(&mut self.pending_destroy_textures);
+        for tex in pending {
             // Still shared with a live cache slot (or another pending
             // entry): drop this reference only.  Whoever holds the last
-            // entry): drop this reference only.  Whoever holds the last
             // one destroys the Vulkan objects when it is evicted itself.
-            let Ok(tex) = Arc::try_unwrap(tex) else {
+            let Ok(mut tex) = Arc::try_unwrap(tex) else {
                 continue;
             };
-            unsafe {
-                self.device
-                    .free_descriptor_sets(self.descriptor_pool, &[tex.descriptor_set])
-                    .ok();
-                self.device.destroy_image_view(tex.view, None);
-                self.device.destroy_image(tex.image, None);
-                self.device.free_memory(tex.memory, None);
+            if tex.shm.is_some() {
+                // If it was superseded before rendering, no command buffer
+                // will consume its pending source. Retire that source (and
+                // any wl_buffer release parked on it) before pooling.
+                if let Some(upload) = self.pending_shm_uploads.remove(&tex.image) {
+                    Self::release_pending_shm_upload(upload);
+                    if let Some(state) = tex.shm.as_mut() {
+                        state.surface_id = None;
+                        state.generation = 0;
+                    }
+                }
+                if self.reusable_shm_textures.len() >= MAX_REUSABLE_SHM_TEXTURES {
+                    let evicted = self.reusable_shm_textures.remove(0);
+                    self.destroy_cached_texture(evicted);
+                }
+                self.reusable_shm_textures.push(tex);
+            } else {
+                self.destroy_cached_texture(tex);
             }
+        }
+    }
+
+    fn destroy_cached_texture(&mut self, tex: CachedSurfaceTexture) {
+        if let Some(upload) = self.pending_shm_uploads.remove(&tex.image) {
+            Self::release_pending_shm_upload(upload);
+        }
+        unsafe {
+            self.device
+                .free_descriptor_sets(self.descriptor_pool, &[tex.descriptor_set])
+                .ok();
+            self.device.destroy_image_view(tex.view, None);
+            if let Some(shm) = tex.shm {
+                self.device.unmap_memory(shm.staging_memory);
+                self.device.destroy_buffer(shm.staging_buffer, None);
+                self.device.free_memory(shm.staging_memory, None);
+            }
+            self.device.destroy_image(tex.image, None);
+            self.device.free_memory(tex.memory, None);
         }
     }
 
@@ -5284,31 +6145,26 @@ impl VulkanRenderer {
         self.pending_submit.is_some()
     }
 
-    /// True when `render_tree_sized` would drop the tree instead of
-    /// submitting it: a previous submit is still in flight and its fence
-    /// has not signalled, so the early return at the top of that function
-    /// would fire.
-    ///
-    /// Callers that composite in response to an event which will not
-    /// repeat — a `wl_surface.commit` — must consult this and defer rather
-    /// than call and lose the tree.  `has_pending` is not a substitute: it
-    /// is true for the whole life of a submit, including after its fence
-    /// has signalled, when compositing proceeds normally.
+    /// True when a caller should defer a one-shot composite until the main
+    /// loop has retired the submission it currently owns.
     /// Import an explicit-sync acquire fence (a sync_file fd) as a
     /// semaphore the next composite submit will wait on.  Returns `false`
     /// when the device lacks external-semaphore support or the import
     /// fails — the caller then parks the commit CPU-side instead.
     pub(crate) fn add_acquire_wait_fd(&mut self, fd: std::os::fd::OwnedFd) -> bool {
         use std::os::fd::IntoRawFd;
-        let Some(sem_fn) = self.external_semaphore_fd_fn.as_ref() else {
+        if !self.sync_fd_semaphore_importable || self.external_semaphore_fd_fn.is_none() {
             return false;
-        };
-        let sem = match unsafe {
-            self.device
-                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-        } {
-            Ok(s) => s,
-            Err(_) => return false,
+        }
+        let sem = match self.recycled_acquire_semaphores.pop() {
+            Some(sem) => sem,
+            None => match unsafe {
+                self.device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            } {
+                Ok(s) => s,
+                Err(_) => return false,
+            },
         };
         let raw = fd.into_raw_fd();
         let info = vk::ImportSemaphoreFdInfoKHR::default()
@@ -5316,7 +6172,12 @@ impl VulkanRenderer {
             .flags(vk::SemaphoreImportFlags::TEMPORARY)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
             .fd(raw);
-        match unsafe { sem_fn.import_semaphore_fd(&info) } {
+        match unsafe {
+            self.external_semaphore_fd_fn
+                .as_ref()
+                .unwrap()
+                .import_semaphore_fd(&info)
+        } {
             Ok(()) => {
                 // Ownership of the fd passed to the driver on success.
                 self.pending_acquire_semaphores.push(sem);
@@ -5333,10 +6194,10 @@ impl VulkanRenderer {
                         "[vulkan-render] SYNC_FD semaphore import failed ({e:?}); explicit-sync commits fall back to parking",
                     );
                 }
-                unsafe {
-                    self.device.destroy_semaphore(sem, None);
-                    libc::close(raw);
-                }
+                // A failed import leaves the semaphore's permanent,
+                // unsignalled payload intact, so it remains reusable.
+                self.recycled_acquire_semaphores.push(sem);
+                unsafe { libc::close(raw) };
                 false
             }
         }
@@ -5369,23 +6230,24 @@ impl VulkanRenderer {
             p.release_buffers.push((buf, release_point));
             return true;
         }
+        let buffer_id = buf.id();
+        if let Some(upload) = self
+            .pending_shm_uploads
+            .values_mut()
+            .find(|upload| upload.buffer_id() == Some(&buffer_id))
+        {
+            upload.release_buffers.push((buf, release_point));
+            return true;
+        }
         false
     }
 
     pub fn would_defer_submit(&self) -> bool {
-        let Some(pending) = self.pending_submit.as_ref() else {
-            return false;
-        };
-        let raw = unsafe {
-            (self.device.fp_v1_0().wait_for_fences)(
-                self.device.handle(),
-                1,
-                [pending.fence].as_ptr(),
-                vk::TRUE,
-                0,
-            )
-        };
-        raw != vk::Result::SUCCESS
+        // The main loop retires completed work before draining deferred
+        // recomposites. A commit that arrives while a submit is still held
+        // can therefore defer unconditionally; probing the same fence here
+        // only duplicates the loop's Vulkan ioctl, once per client commit.
+        self.pending_submit.is_some()
     }
 
     /// Non-blocking check: if the previous GPU submission has completed,
@@ -5415,8 +6277,19 @@ impl VulkanRenderer {
         // self-allocated pending_submit needs per-iteration polling
         // because its staging readback is what produces a frame.
         let Some(pending) = self.pending_submit.take() else {
+            self.last_pending_poll = None;
             return (None, Vec::new());
         };
+        const MIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_micros(500);
+        let now = std::time::Instant::now();
+        if self
+            .last_pending_poll
+            .is_some_and(|last| now.duration_since(last) < MIN_POLL_INTERVAL)
+        {
+            self.pending_submit = Some(pending);
+            return (None, Vec::new());
+        }
+        self.last_pending_poll = Some(now);
         let raw = unsafe {
             (self.device.fp_v1_0().wait_for_fences)(
                 self.device.handle(),
@@ -5430,6 +6303,7 @@ impl VulkanRenderer {
             self.pending_submit = Some(pending);
             return (None, Vec::new());
         }
+        self.last_pending_poll = None;
         let toplevel_sid = pending.toplevel_sid;
         let native = (toplevel_sid, pending.phys_w, pending.phys_h);
         let results = self.retire_pending(pending);
@@ -5457,9 +6331,11 @@ impl VulkanRenderer {
         // The fence has signalled (every caller waits first): the GPU is
         // done with every buffer this submission — and, by queue order,
         // any earlier one — sampled.  Only now may the client redraw them.
-        for sem in &pending.wait_semaphores {
-            unsafe { self.device.destroy_semaphore(*sem, None) };
-        }
+        // SYNC_FD imports are temporary. Submitting the wait restores each
+        // semaphore's permanent unsignalled payload, so completion makes
+        // the objects ready for the next acquire import without recreation.
+        self.recycled_acquire_semaphores
+            .extend(pending.wait_semaphores.iter().copied());
         for (buf, point) in &pending.release_buffers {
             buf.release();
             if let Some(p) = point {
@@ -5597,12 +6473,7 @@ impl VulkanRenderer {
             results.push((tw, th, PixelData::Bgra(bgra), false));
         }
 
-        // Always free the fence, command buffer, and per-frame textures.
-        unsafe {
-            self.device.destroy_fence(pending.fence, None);
-            self.device
-                .free_command_buffers(self.command_pool, &[pending.cb]);
-        }
+        self.recycle_submit_resources(pending.fence, pending.cb);
         for t in pending.textures {
             unsafe {
                 self.device
@@ -5614,6 +6485,29 @@ impl VulkanRenderer {
             }
         }
         results
+    }
+
+    /// Reset completed submission objects for reuse. Reset failure is rare
+    /// and means the object state is not trustworthy, so discard that pair
+    /// and let the next frame allocate replacements.
+    fn recycle_submit_resources(&mut self, fence: vk::Fence, cb: vk::CommandBuffer) {
+        let (fence_ok, cb_ok) = unsafe {
+            (
+                self.device.reset_fences(&[fence]).is_ok(),
+                self.device
+                    .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
+                    .is_ok(),
+            )
+        };
+        if fence_ok && cb_ok {
+            self.recycled_tracking_fences.push(fence);
+            self.recycled_command_buffers.push(cb);
+        } else {
+            unsafe {
+                self.device.destroy_fence(fence, None);
+                self.device.free_command_buffers(self.command_pool, &[cb]);
+            }
+        }
     }
 
     /// Free deferred external submissions whose fences have signalled.
@@ -5638,6 +6532,8 @@ impl VulkanRenderer {
         if any_ready != vk::Result::SUCCESS {
             return;
         }
+        let mut completed_resources = Vec::new();
+        let mut completed_acquire_semaphores = Vec::new();
         self.deferred_submits.retain_mut(|pending| {
             let raw = unsafe {
                 (self.device.fp_v1_0().wait_for_fences)(
@@ -5649,20 +6545,14 @@ impl VulkanRenderer {
                 )
             };
             if raw == vk::Result::SUCCESS {
-                for sem in pending.wait_semaphores.drain(..) {
-                    unsafe { self.device.destroy_semaphore(sem, None) };
-                }
+                completed_acquire_semaphores.append(&mut pending.wait_semaphores);
                 for (buf, point) in pending.release_buffers.drain(..) {
                     buf.release();
                     if let Some(p) = point {
                         p.signal();
                     }
                 }
-                unsafe {
-                    self.device.destroy_fence(pending.fence, None);
-                    self.device
-                        .free_command_buffers(self.command_pool, &[pending.cb]);
-                }
+                completed_resources.push((pending.fence, pending.cb));
                 for t in pending.textures.drain(..) {
                     unsafe {
                         self.device
@@ -5678,6 +6568,11 @@ impl VulkanRenderer {
                 true // keep
             }
         });
+        for (fence, cb) in completed_resources {
+            self.recycle_submit_resources(fence, cb);
+        }
+        self.recycled_acquire_semaphores
+            .extend(completed_acquire_semaphores);
         self.drain_pending_destroy_targets_if_idle();
     }
 
@@ -5968,17 +6863,23 @@ impl VulkanRenderer {
             (img.framebuffer, img.image, img.staging_buf)
         };
 
-        // Allocate command buffer.
-        let cb_alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cb = unsafe {
-            match self.device.allocate_command_buffers(&cb_alloc) {
-                Ok(v) => v[0],
-                Err(e) => {
-                    eprintln!("[render_tree_sized] allocate_command_buffers failed: {e}");
-                    return results;
+        // Reuse the previous frame's reset primary command buffer. The
+        // renderer serialises self-output submissions, so one entry covers
+        // steady state; allocation remains the cold-start/failure fallback.
+        let cb = if let Some(cb) = self.recycled_command_buffers.pop() {
+            cb
+        } else {
+            let cb_alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            unsafe {
+                match self.device.allocate_command_buffers(&cb_alloc) {
+                    Ok(v) => v[0],
+                    Err(e) => {
+                        eprintln!("[render_tree_sized] allocate_command_buffers failed: {e}");
+                        return results;
+                    }
                 }
             }
         };
@@ -5993,54 +6894,12 @@ impl VulkanRenderer {
             }
         };
 
-        // Begin render pass.
-        let clear = vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [0.0, 0.0, 0.0, 1.0],
-            },
-        };
-        let rp_begin = vk::RenderPassBeginInfo::default()
-            .render_pass(self.render_pass)
-            .framebuffer(out_framebuffer)
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D {
-                    width: phys_w,
-                    height: phys_h,
-                },
-            })
-            .clear_values(std::slice::from_ref(&clear));
-
-        unsafe {
-            self.device
-                .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
-            self.device
-                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
-
-            let viewport = vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: phys_w as f32,
-                height: phys_h as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
-            self.device.cmd_set_viewport(cb, 0, &[viewport]);
-            let scissor = vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D {
-                    width: phys_w,
-                    height: phys_h,
-                },
-            };
-            self.device.cmd_set_scissor(cb, 0, &[scissor]);
-        }
-
         // Pre-process layers: import/upload textures and collect draw info.
         struct DrawCmd {
             descriptor_set: vk::DescriptorSet,
             image: vk::Image,
             old_layout: vk::ImageLayout,
+            sample_layout: vk::ImageLayout,
             geom: [f32; 4],
             /// Framebuffer-space rectangle this layer may write, when a
             /// `wp_viewport` source crop means the quad deliberately
@@ -6063,9 +6922,21 @@ impl VulkanRenderer {
             let ph = to_physical(l.logical_h, s120);
 
             // Look up the persistent texture for this surface.
-            let (ds, img, old_layout) =
+            let (ds, img, old_layout, sample_layout) =
                 if let Some(cached) = self.surface_textures.get(&l.surface_id) {
-                    (cached.descriptor_set, cached.image, cached.initial_layout)
+                    let initialized = cached
+                        .layout_initialized
+                        .swap(true, std::sync::atomic::Ordering::Relaxed);
+                    (
+                        cached.descriptor_set,
+                        cached.image,
+                        if initialized {
+                            cached.sample_layout
+                        } else {
+                            cached.initial_layout
+                        },
+                        cached.sample_layout,
+                    )
                 } else {
                     // No cached texture — surface hasn't committed a buffer
                     // yet, or the upload failed.  Skip this layer.
@@ -6119,6 +6990,7 @@ impl VulkanRenderer {
                 descriptor_set: ds,
                 image: img,
                 old_layout,
+                sample_layout,
                 geom: [clip_x, clip_y, clip_w, clip_h],
                 scissor,
             });
@@ -6142,37 +7014,188 @@ impl VulkanRenderer {
             return results;
         }
 
-        // Transition all input textures to SHADER_READ_ONLY_OPTIMAL.
-        {
-            let barriers: Vec<vk::ImageMemoryBarrier> = draws
-                .iter()
-                .map(|d| {
-                    vk::ImageMemoryBarrier::default()
-                        .image(d.image)
-                        .old_layout(d.old_layout)
-                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                        .src_access_mask(vk::AccessFlags::HOST_WRITE)
-                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                        .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            base_mip_level: 0,
-                            level_count: 1,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        })
-                })
-                .collect();
-            unsafe {
-                self.device.cmd_pipeline_barrier(
-                    cb,
-                    vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &barriers,
-                );
+        // Upload damaged SHM regions into optimal tiled images, then make all
+        // sampled images visible to the fragment stage. Each image is handled
+        // once even when multiple scene layers reference it.
+        let mut transitioned = HashSet::new();
+        let mut submit_shm_host_buffers = Vec::new();
+        let mut submit_shm_release_buffers = Vec::new();
+        for d in &draws {
+            if !transitioned.insert(d.image) {
+                continue;
             }
+            let range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            if let Some(upload) = self.pending_shm_uploads.remove(&d.image) {
+                let upload_buffer = upload.buffer();
+                let buffer_barrier = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .buffer(upload_buffer)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE);
+                let to_transfer = vk::ImageMemoryBarrier::default()
+                    .image(d.image)
+                    .old_layout(d.old_layout)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_access_mask(if d.old_layout == vk::ImageLayout::UNDEFINED {
+                        vk::AccessFlags::empty()
+                    } else {
+                        vk::AccessFlags::SHADER_READ
+                    })
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .subresource_range(range);
+                unsafe {
+                    self.device.cmd_pipeline_barrier(
+                        cb,
+                        if d.old_layout == vk::ImageLayout::UNDEFINED {
+                            vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::TOP_OF_PIPE
+                        } else {
+                            vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::FRAGMENT_SHADER
+                        },
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[buffer_barrier],
+                        &[to_transfer],
+                    );
+                }
+
+                let regions: Vec<vk::BufferImageCopy> = upload
+                    .damage
+                    .iter()
+                    .map(|rect| {
+                        vk::BufferImageCopy::default()
+                            .buffer_offset(
+                                upload.offset
+                                    + rect.y as vk::DeviceSize * upload.stride as vk::DeviceSize
+                                    + rect.x as vk::DeviceSize * 4,
+                            )
+                            .buffer_row_length((upload.stride / 4) as u32)
+                            .buffer_image_height(0)
+                            .image_subresource(vk::ImageSubresourceLayers {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                mip_level: 0,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            })
+                            .image_offset(vk::Offset3D {
+                                x: rect.x as i32,
+                                y: rect.y as i32,
+                                z: 0,
+                            })
+                            .image_extent(vk::Extent3D {
+                                width: rect.width,
+                                height: rect.height,
+                                depth: 1,
+                            })
+                    })
+                    .collect();
+                if !regions.is_empty() {
+                    unsafe {
+                        self.device.cmd_copy_buffer_to_image(
+                            cb,
+                            upload_buffer,
+                            d.image,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            &regions,
+                        );
+                    }
+                }
+                let to_sample = vk::ImageMemoryBarrier::default()
+                    .image(d.image)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(d.sample_layout)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .subresource_range(range);
+                unsafe {
+                    self.device.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_sample],
+                    );
+                }
+                if let PendingShmSource::External { host, .. } = upload.source {
+                    submit_shm_host_buffers.push(host);
+                }
+                submit_shm_release_buffers.extend(upload.release_buffers);
+            } else if d.old_layout != d.sample_layout {
+                let barrier = vk::ImageMemoryBarrier::default()
+                    .image(d.image)
+                    .old_layout(d.old_layout)
+                    .new_layout(d.sample_layout)
+                    .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .subresource_range(range);
+                unsafe {
+                    self.device.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[barrier],
+                    );
+                }
+            }
+        }
+
+        // The transfer commands above must be outside the render pass.
+        let clear = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        };
+        let rp_begin = vk::RenderPassBeginInfo::default()
+            .render_pass(self.render_pass)
+            .framebuffer(out_framebuffer)
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: phys_w,
+                    height: phys_h,
+                },
+            })
+            .clear_values(std::slice::from_ref(&clear));
+        unsafe {
+            self.device
+                .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
+            self.device
+                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            self.device.cmd_set_viewport(
+                cb,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: phys_w as f32,
+                    height: phys_h as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            self.device.cmd_set_scissor(
+                cb,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D {
+                        width: phys_w,
+                        height: phys_h,
+                    },
+                }],
+            );
         }
 
         // Now draw all layers.
@@ -6608,58 +7631,94 @@ impl VulkanRenderer {
 
         // When any external target needs explicit sync (tiled NV12 on
         // radv) we export a SYNC_FD so the encoder can wait off-thread.
-        // Note: vkGetFenceFdKHR with SYNC_FD transfers the payload and
-        // resets the source VkFence — we cannot use the same fence for
-        // both export and our own cleanup tracking.  When sync_fd
-        // export is needed we submit two signal targets: an
-        // export-only fence (consumed by sync_fd) and a separate
-        // tracking fence we use to retire `cb` and per-frame textures.
+        // Prefer an exportable semaphore signalled by the render submit;
+        // retain the older second-fence submit as a capability fallback.
+        // The ordinary tracking fence remains private so it can safely
+        // retire `cb` and the per-frame textures.
         //
         // Every OPAQUE_FD target needs it too, and unconditionally: a
         // dma_buf carries implicit fencing that orders a later importer
         // against our writes, and an OPAQUE_FD allocation carries none. If
         // the export fails there we must not publish the buffer at all —
         // see the emit below.
-        let needs_sync_fd_export = self.external_fence_fd_fn.is_some()
-            && (external_targets.iter().any(|&(tw, th, _)| {
-                self.nv12_outputs
-                    .get(&(sid, tw, th))
-                    .is_some_and(|(v, idx)| {
-                        !v.is_empty()
-                            && matches!(v[idx % v.len()].kind, Nv12OutputKind::Image { .. })
-                    })
-            }) || downscale_targets
-                .iter()
-                .any(|&(tw, th)| self.nv12_opaque_slot(sid, tw, th).is_some()));
+        let has_sync_fd_consumer = external_targets.iter().any(|&(tw, th, _)| {
+            self.nv12_outputs
+                .get(&(sid, tw, th))
+                .is_some_and(|(v, idx)| {
+                    !v.is_empty() && matches!(v[idx % v.len()].kind, Nv12OutputKind::Image { .. })
+                })
+        }) || downscale_targets
+            .iter()
+            .any(|&(tw, th)| self.nv12_opaque_slot(sid, tw, th).is_some());
+        let can_export_semaphore =
+            self.sync_fd_semaphore_exportable && self.external_semaphore_fd_fn.is_some();
+        let needs_sync_fd_export =
+            has_sync_fd_consumer && (can_export_semaphore || self.external_fence_fd_fn.is_some());
 
-        let tracking_fence = unsafe {
-            match self
-                .device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("[render_tree_sized] create_fence(tracking) failed: {e}");
-                    self.device.free_command_buffers(self.command_pool, &[cb]);
-                    return results;
+        let tracking_fence = if let Some(fence) = self.recycled_tracking_fences.pop() {
+            fence
+        } else {
+            unsafe {
+                match self
+                    .device
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("[render_tree_sized] create_fence(tracking) failed: {e}");
+                        self.device.free_command_buffers(self.command_pool, &[cb]);
+                        return results;
+                    }
                 }
             }
         };
-        // Optional secondary fence whose payload we will export as a
-        // sync_fd for the encoder.  Created with SYNC_FD export
-        // capability when needed; destroyed once the export is done.
-        let export_fence: Option<vk::Fence> = if needs_sync_fd_export {
-            let mut export_info = vk::ExportFenceCreateInfo::default()
-                .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
-            let fence_info = vk::FenceCreateInfo::default().push_next(&mut export_info);
-            unsafe {
-                match self.device.create_fence(&fence_info, None) {
-                    Ok(f) => Some(f),
-                    Err(e) => {
-                        eprintln!("[render_tree_sized] create_fence(sync_fd) failed: {e}");
-                        // Continue without sync_fd export — fall back to
-                        // the blocking wait branch below.
-                        None
+        // Prefer a signal semaphore on the real render submission. This
+        // exports the same sync_file without a second, empty queue submit.
+        let export_semaphore: Option<vk::Semaphore> = if needs_sync_fd_export
+            && can_export_semaphore
+        {
+            if let Some(semaphore) = self.recycled_export_semaphores.pop() {
+                Some(semaphore)
+            } else {
+                let mut export_info = vk::ExportSemaphoreCreateInfo::default()
+                    .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+                let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
+                unsafe {
+                    match self.device.create_semaphore(&create_info, None) {
+                        Ok(semaphore) => Some(semaphore),
+                        Err(e) => {
+                            eprintln!("[render_tree_sized] create_semaphore(sync_fd) failed: {e}");
+                            None
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        // Fence fallback for implementations that cannot export a SYNC_FD
+        // semaphore. It requires a second empty submit because a submit can
+        // carry only one completion fence.
+        let mut export_fence: Option<vk::Fence> = if needs_sync_fd_export
+            && export_semaphore.is_none()
+            && self.external_fence_fd_fn.is_some()
+        {
+            if let Some(fence) = self.recycled_export_fences.pop() {
+                Some(fence)
+            } else {
+                let mut export_info = vk::ExportFenceCreateInfo::default()
+                    .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+                let fence_info = vk::FenceCreateInfo::default().push_next(&mut export_info);
+                unsafe {
+                    match self.device.create_fence(&fence_info, None) {
+                        Ok(f) => Some(f),
+                        Err(e) => {
+                            eprintln!("[render_tree_sized] create_fence(sync_fd) failed: {e}");
+                            // Continue without sync_fd export — fall back to
+                            // the blocking wait branch below.
+                            None
+                        }
                     }
                 }
             }
@@ -6677,11 +7736,8 @@ impl VulkanRenderer {
         let submit = vk::SubmitInfo::default()
             .command_buffers(std::slice::from_ref(&cb))
             .wait_semaphores(&acquire_waits)
-            .wait_dst_stage_mask(&acquire_stages);
-        // Submit twice with different fences so each gets the GPU
-        // completion signal independently.  The driver collapses these
-        // into a single dispatch since the second submit only carries
-        // a fence and no work.
+            .wait_dst_stage_mask(&acquire_stages)
+            .signal_semaphores(export_semaphore.as_slice());
         unsafe {
             if let Err(e) = self
                 .device
@@ -6701,15 +7757,21 @@ impl VulkanRenderer {
                 if let Some(ef) = export_fence {
                     self.device.destroy_fence(ef, None);
                 }
+                if let Some(es) = export_semaphore {
+                    self.device.destroy_semaphore(es, None);
+                }
                 self.device.destroy_fence(tracking_fence, None);
                 self.device.free_command_buffers(self.command_pool, &[cb]);
                 return results;
             }
+            // Only the fence fallback needs a second submission. The
+            // preferred export semaphore was signalled by `submit` above.
             if let Some(ef) = export_fence {
                 let empty = vk::SubmitInfo::default();
                 if let Err(e) = self.device.queue_submit(self.queue, &[empty], ef) {
                     eprintln!("[render_tree_sized] queue_submit (export fence) failed: {e}");
                     self.device.destroy_fence(ef, None);
+                    export_fence = None;
                     // Continue with tracking fence; encoder will block.
                 }
             }
@@ -6924,48 +7986,78 @@ impl VulkanRenderer {
             downscale_targets: staging_targets,
             toplevel_sid,
             wait_semaphores: acquire_waits,
-            release_buffers: Vec::new(),
+            _shm_host_buffers: submit_shm_host_buffers,
+            release_buffers: submit_shm_release_buffers,
         };
 
-        // Export the dedicated export-fence as a sync_fd ONCE (shared
-        // across all targets that need explicit sync).
-        // vkGetFenceFdKHR(SYNC_FD) consumes the fence's payload and
-        // resets it, so we use a dedicated `export_fence` distinct
-        // from `tracking_fence` (which we use to know when the cb is
-        // safe to free).  Each consumer Arc-shares the OwnedFd so
-        // dup()/poll() works independently per consumer.
-        let shared_sync_fd: Option<Arc<std::os::fd::OwnedFd>> =
-            if let (Some(ext_fence_fn), Some(ef)) =
-                (self.external_fence_fd_fn.as_ref(), export_fence)
-            {
-                let get_info = vk::FenceGetFdInfoKHR::default()
-                    .fence(ef)
-                    .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
-                let result = match unsafe { ext_fence_fn.get_fence_fd(&get_info) } {
-                    Ok(raw_fd) if raw_fd >= 0 => {
-                        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
-                        Some(Arc::new(owned))
+        // Export one sync_fd shared by every target. SYNC_FD copy export
+        // consumes the pending signal and restores the Vulkan object's
+        // permanent unsignalled payload, making it reusable.
+        let shared_sync_fd: Option<Arc<std::os::fd::OwnedFd>> = if let (
+            Some(ext_semaphore_fn),
+            Some(es),
+        ) =
+            (self.external_semaphore_fd_fn.as_ref(), export_semaphore)
+        {
+            let get_info = vk::SemaphoreGetFdInfoKHR::default()
+                .semaphore(es)
+                .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+            match unsafe { ext_semaphore_fn.get_semaphore_fd(&get_info) } {
+                Ok(raw_fd) if raw_fd >= 0 => {
+                    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
+                    // The next render is also tracking-fence serialised
+                    // behind this one, so the reset semaphore can serve it.
+                    self.recycled_export_semaphores.push(es);
+                    Some(Arc::new(owned))
+                }
+                Ok(_) | Err(_) => {
+                    eprintln!(
+                        "[vulkan-render] vkGetSemaphoreFdKHR failed; falling back to blocking wait"
+                    );
+                    unsafe {
+                        let _ = self.device.wait_for_fences(&[fence], true, 5_000_000_000);
+                        self.device.destroy_semaphore(es, None);
                     }
-                    Ok(_) | Err(_) => {
-                        // Fallback: block on tracking_fence so the encoder
-                        // still sees a finished frame.
-                        eprintln!(
-                            "[vulkan-render] vkGetFenceFdKHR failed; \
+                    None
+                }
+            }
+        } else if let (Some(ext_fence_fn), Some(ef)) =
+            (self.external_fence_fd_fn.as_ref(), export_fence)
+        {
+            let get_info = vk::FenceGetFdInfoKHR::default()
+                .fence(ef)
+                .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+            let (result, reusable) = match unsafe { ext_fence_fn.get_fence_fd(&get_info) } {
+                Ok(raw_fd) if raw_fd >= 0 => {
+                    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
+                    (Some(Arc::new(owned)), true)
+                }
+                Ok(_) | Err(_) => {
+                    // Fallback: block on tracking_fence so the encoder
+                    // still sees a finished frame.
+                    eprintln!(
+                        "[vulkan-render] vkGetFenceFdKHR failed; \
                          falling back to blocking wait"
-                        );
-                        unsafe {
-                            let _ = self.device.wait_for_fences(&[fence], true, 5_000_000_000);
-                        }
-                        None
+                    );
+                    unsafe {
+                        let _ = self.device.wait_for_fences(&[fence], true, 5_000_000_000);
                     }
-                };
-                // The export-fence's payload has been consumed and the
-                // VkFence is now reset; we can safely destroy it.
-                unsafe { self.device.destroy_fence(ef, None) };
-                result
-            } else {
-                None
+                    (None, false)
+                }
             };
+            // SYNC_FD uses copy transference. Export has the same
+            // effect on the source payload as vkResetFences, including
+            // when its signal operation is still pending, so this
+            // exportable fence can serve every frame.
+            if reusable {
+                self.recycled_export_fences.push(ef);
+            } else {
+                unsafe { self.device.destroy_fence(ef, None) };
+            }
+            result
+        } else {
+            None
+        };
 
         // NVENC zero-copy targets.  Published immediately, like the
         // external ones and for the same reason: the consumer synchronises
@@ -7131,6 +8223,7 @@ impl VulkanRenderer {
         // the fence to signal before reading the staging buffer —
         // the standard self-alloc latency model.
         self.pending_submit = Some(submit_info);
+        self.last_pending_poll = Some(std::time::Instant::now());
         self.output_idx = (self.output_idx + 1) % self.output_images.len();
 
         if entry_n < 20 || entry_n.is_multiple_of(50) {
@@ -7183,6 +8276,23 @@ impl Drop for VulkanRenderer {
             for sem in self.pending_acquire_semaphores.drain(..) {
                 self.device.destroy_semaphore(sem, None);
             }
+            for fence in self.recycled_tracking_fences.drain(..) {
+                self.device.destroy_fence(fence, None);
+            }
+            for fence in self.recycled_export_fences.drain(..) {
+                self.device.destroy_fence(fence, None);
+            }
+            for sem in self.recycled_acquire_semaphores.drain(..) {
+                self.device.destroy_semaphore(sem, None);
+            }
+            for sem in self.recycled_export_semaphores.drain(..) {
+                self.device.destroy_semaphore(sem, None);
+            }
+            if !self.recycled_command_buffers.is_empty() {
+                self.device
+                    .free_command_buffers(self.command_pool, &self.recycled_command_buffers);
+                self.recycled_command_buffers.clear();
+            }
             self.destroy_output_images();
             // Destroy Vulkan Video encoders.
             for (_, mut enc) in self.vulkan_encoders.drain() {
@@ -7215,17 +8325,20 @@ impl Drop for VulkanRenderer {
                 .chain(self.buffer_textures.drain().map(|(_, tex)| tex))
                 .chain(self.pending_destroy_textures.drain(..))
                 .collect();
+            let mut unique_textures = std::mem::take(&mut self.reusable_shm_textures);
             for tex in all_textures {
-                let Ok(tex) = Arc::try_unwrap(tex) else {
-                    continue;
-                };
-                self.device
-                    .free_descriptor_sets(self.descriptor_pool, &[tex.descriptor_set])
-                    .ok();
-                self.device.destroy_image_view(tex.view, None);
-                self.device.destroy_image(tex.image, None);
-                self.device.free_memory(tex.memory, None);
+                if let Ok(tex) = Arc::try_unwrap(tex) {
+                    unique_textures.push(tex);
+                }
             }
+            for tex in unique_textures {
+                self.destroy_cached_texture(tex);
+            }
+            for upload in self.pending_shm_uploads.drain().map(|(_, upload)| upload) {
+                Self::release_pending_shm_upload(upload);
+            }
+            self.shm_host_buffers.clear();
+            self.shm_host_import_failures.clear();
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
             self.device
@@ -7275,7 +8388,12 @@ impl Drop for VulkanRenderer {
 
 #[cfg(test)]
 mod tests {
-    use super::clamped_scissor;
+    use super::{
+        ShmDamageFrame, ShmDamageRect, ShmTextureKey, clamped_scissor, coalesce_shm_damage,
+        page_rounded_len, shm_damage_since,
+    };
+    use ash::vk;
+    use std::collections::VecDeque;
 
     fn rect(x: i32, y: i32, w: u32, h: u32, fw: u32, fh: u32) -> (i32, i32, u32, u32) {
         let r = clamped_scissor(x, y, w, h, fw, fh);
@@ -7316,5 +8434,120 @@ mod tests {
             rect(i32::MAX - 1, 0, u32::MAX, 10, 1000, 1000),
             (1000, 0, 0, 10),
         );
+    }
+
+    fn shm_key() -> ShmTextureKey {
+        ShmTextureKey {
+            width: 100,
+            height: 80,
+            format: vk::Format::B8G8R8A8_UNORM,
+            force_opaque: true,
+        }
+    }
+
+    #[test]
+    fn touching_shm_damage_is_coalesced() {
+        assert_eq!(
+            coalesce_shm_damage(
+                [
+                    ShmDamageRect {
+                        x: 10,
+                        y: 20,
+                        width: 10,
+                        height: 10,
+                    },
+                    ShmDamageRect {
+                        x: 20,
+                        y: 20,
+                        width: 5,
+                        height: 10,
+                    },
+                ],
+                shm_key(),
+            ),
+            vec![ShmDamageRect {
+                x: 10,
+                y: 20,
+                width: 15,
+                height: 10,
+            }]
+        );
+    }
+
+    #[test]
+    fn large_damage_uses_one_full_copy() {
+        assert_eq!(
+            coalesce_shm_damage(
+                [ShmDamageRect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 40,
+                }],
+                shm_key(),
+            ),
+            vec![ShmDamageRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+            }]
+        );
+    }
+
+    #[test]
+    fn ring_texture_replays_every_missed_damage_generation() {
+        let frames = VecDeque::from([
+            ShmDamageFrame {
+                generation: 2,
+                rects: vec![ShmDamageRect {
+                    x: 1,
+                    y: 2,
+                    width: 3,
+                    height: 4,
+                }],
+            },
+            ShmDamageFrame {
+                generation: 3,
+                rects: vec![ShmDamageRect {
+                    x: 50,
+                    y: 60,
+                    width: 5,
+                    height: 6,
+                }],
+            },
+        ]);
+        assert_eq!(
+            shm_damage_since(&frames, 1, 3, shm_key()),
+            Some(vec![
+                ShmDamageRect {
+                    x: 1,
+                    y: 2,
+                    width: 3,
+                    height: 4,
+                },
+                ShmDamageRect {
+                    x: 50,
+                    y: 60,
+                    width: 5,
+                    height: 6,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn expired_ring_history_requires_a_full_copy() {
+        let frames = VecDeque::from([ShmDamageFrame {
+            generation: 3,
+            rects: Vec::new(),
+        }]);
+        assert_eq!(shm_damage_since(&frames, 1, 3, shm_key()), None);
+    }
+
+    #[test]
+    fn host_import_may_use_the_remainder_of_the_files_last_page() {
+        assert_eq!(page_rounded_len(160_000, 4096), Some(163_840));
+        assert_eq!(page_rounded_len(163_840, 4096), Some(163_840));
     }
 }

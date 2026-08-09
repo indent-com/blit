@@ -907,7 +907,7 @@ pub(crate) struct Surface {
     // pending state
     pending_buffer: Option<WlBuffer>,
     pending_buffer_scale: i32,
-    pending_damage: bool,
+    pending_damage: Vec<PendingDamage>,
     pending_frame_callbacks: Vec<WlCallback>,
     pending_presentation_feedbacks: Vec<WpPresentationFeedback>,
     pending_opaque: bool,
@@ -984,6 +984,160 @@ pub(crate) struct Surface {
 
     is_cursor: bool,
     cursor_hotspot: (i32, i32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingDamage {
+    /// Coordinates are surface-local and still need buffer-scale conversion.
+    Surface {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+    /// Coordinates are already in buffer pixels.
+    Buffer {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+    /// Used for protocol state we do not model precisely (for example a
+    /// legacy non-zero attach offset).  Over-copying is the safe fallback.
+    Full,
+}
+
+fn clipped_shm_damage_rect(
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+    buffer_width: u32,
+    buffer_height: u32,
+) -> Option<crate::vulkan_render::ShmDamageRect> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let x0 = x.max(0).min(buffer_width as i64);
+    let y0 = y.max(0).min(buffer_height as i64);
+    let x1 = x.saturating_add(width).max(0).min(buffer_width as i64);
+    let y1 = y.saturating_add(height).max(0).min(buffer_height as i64);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(crate::vulkan_render::ShmDamageRect {
+        x: x0 as u32,
+        y: y0 as u32,
+        width: (x1 - x0) as u32,
+        height: (y1 - y0) as u32,
+    })
+}
+
+fn shm_damage_rects(
+    pending: &[PendingDamage],
+    buffer_width: u32,
+    buffer_height: u32,
+    buffer_scale: i32,
+    viewport_source: Option<(f64, f64, f64, f64)>,
+    viewport_destination: Option<(i32, i32)>,
+) -> Vec<crate::vulkan_render::ShmDamageRect> {
+    let full = || {
+        vec![crate::vulkan_render::ShmDamageRect {
+            x: 0,
+            y: 0,
+            width: buffer_width,
+            height: buffer_height,
+        }]
+    };
+    // A client is required to damage newly attached content, but copying the
+    // full buffer here makes malformed/old clients safe and initializes a new
+    // texture pool entry correctly.
+    if pending.is_empty() {
+        return full();
+    }
+
+    let scale = buffer_scale.max(1) as f64;
+    let mut out = Vec::with_capacity(pending.len());
+    for damage in pending {
+        let rect = match *damage {
+            PendingDamage::Full => return full(),
+            PendingDamage::Buffer {
+                x,
+                y,
+                width,
+                height,
+            } => clipped_shm_damage_rect(
+                x as i64,
+                y as i64,
+                width as i64,
+                height as i64,
+                buffer_width,
+                buffer_height,
+            ),
+            PendingDamage::Surface {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                if width <= 0 || height <= 0 {
+                    continue;
+                }
+
+                // wp_viewport's source rectangle is expressed after buffer
+                // scale.  Map both damage edges through crop/scale and round
+                // outwards so every touched source pixel is uploaded.
+                let default_source = (
+                    0.0,
+                    0.0,
+                    buffer_width as f64 / scale,
+                    buffer_height as f64 / scale,
+                );
+                let (source_x, source_y, source_width, source_height) =
+                    viewport_source.unwrap_or(default_source);
+                let (surface_width, surface_height) = match viewport_destination {
+                    Some((width, height)) if width > 0 && height > 0 => {
+                        (width as f64, height as f64)
+                    }
+                    Some(_) => return full(),
+                    None => (source_width, source_height),
+                };
+                if !source_x.is_finite()
+                    || !source_y.is_finite()
+                    || !source_width.is_finite()
+                    || !source_height.is_finite()
+                    || source_width <= 0.0
+                    || source_height <= 0.0
+                    || surface_width <= 0.0
+                    || surface_height <= 0.0
+                {
+                    return full();
+                }
+
+                let x0 = (source_x + x as f64 * source_width / surface_width) * scale;
+                let y0 = (source_y + y as f64 * source_height / surface_height) * scale;
+                let x1 =
+                    (source_x + (x as f64 + width as f64) * source_width / surface_width) * scale;
+                let y1 = (source_y + (y as f64 + height as f64) * source_height / surface_height)
+                    * scale;
+                if !x0.is_finite() || !y0.is_finite() || !x1.is_finite() || !y1.is_finite() {
+                    return full();
+                }
+                clipped_shm_damage_rect(
+                    x0.floor() as i64,
+                    y0.floor() as i64,
+                    (x1.ceil() - x0.floor()) as i64,
+                    (y1.ceil() - y0.floor()) as i64,
+                    buffer_width,
+                    buffer_height,
+                )
+            }
+        };
+        if let Some(rect) = rect {
+            out.push(rect);
+        }
+    }
+    out
 }
 
 struct ShmPool {
@@ -2844,8 +2998,8 @@ impl Compositor {
             }
             // The commit's state was held back with its buffer; both land
             // together now.
-            self.apply_committed_state(&surface_id);
-            self.commit_buffer(&surface_id, a.buf, a.scale, a.is_cursor, a.release);
+            let damage = self.apply_committed_state(&surface_id);
+            self.commit_buffer(&surface_id, a.buf, a.scale, a.is_cursor, a.release, &damage);
             let (root_id, toplevel_sid) = self.find_toplevel_root(&surface_id);
             let Some(tl) = toplevel_sid else {
                 // No toplevel resolves (destroyed while this commit was
@@ -3057,8 +3211,8 @@ impl Compositor {
         }
 
         // This commit is installing, so its state lands with its pixels.
-        self.apply_committed_state(surface_id);
-        self.commit_buffer(surface_id, buf, scale, is_cursor, release);
+        let damage = self.apply_committed_state(surface_id);
+        self.commit_buffer(surface_id, buf, scale, is_cursor, release, &damage);
     }
 
     /// Apply a commit's double-buffered surface state.  Split out of
@@ -3066,9 +3220,9 @@ impl Compositor {
     /// becomes the surface's content — immediately for an ordinary commit,
     /// at the promotion sweep for one parked on its acquire point — and
     /// never describes a frame that is not on screen yet.
-    fn apply_committed_state(&mut self, surface_id: &ObjectId) {
+    fn apply_committed_state(&mut self, surface_id: &ObjectId) -> Vec<PendingDamage> {
         let Some(surf) = self.surfaces.get_mut(surface_id) else {
-            return;
+            return Vec::new();
         };
         surf.min_size = surf.pending_min_size;
         surf.max_size = surf.pending_max_size;
@@ -3079,10 +3233,11 @@ impl Compositor {
         if let Some(region) = surf.pending_input_region.take() {
             surf.input_region = region;
         }
-        surf.pending_damage = false;
+        let damage = std::mem::take(&mut surf.pending_damage);
         if let Some(pos) = surf.pending_subsurface_position.take() {
             surf.subsurface_position = pos;
         }
+        damage
     }
 
     /// Install a committed buffer as the surface's current content.  The
@@ -3095,6 +3250,7 @@ impl Compositor {
         scale: i32,
         is_cursor: bool,
         release: Option<crate::drm_syncobj::SyncPoint>,
+        damage: &[PendingDamage],
     ) {
         // Release any previously held buffer for this surface — the new
         // commit supersedes it.  Not straight away, though: in-flight GPU
@@ -3146,12 +3302,20 @@ impl Compositor {
                 && shm.offset >= 0
                 && let Some(ref mut vk) = self.vulkan_renderer
             {
-                let swap_rb =
+                let source_bgra =
                     !matches!(format, wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888);
                 let force_opaque =
                     matches!(format, wl_shm::Format::Xrgb8888 | wl_shm::Format::Xbgr8888);
+                let (viewport_source, viewport_destination) = self
+                    .surfaces
+                    .get(surface_id)
+                    .map(|surface| (surface.viewport_source, surface.viewport_destination))
+                    .unwrap_or((None, None));
+                let damage =
+                    shm_damage_rects(damage, w, h, scale, viewport_source, viewport_destination);
                 let row_bytes = w as usize * 4;
-                let uploaded = shm
+                let buffer_id = buf.id();
+                let upload_result = shm
                     .pool
                     .with_mmap(|slice| {
                         // Checked arithmetic: a crafted stride/height/offset
@@ -3163,21 +3327,24 @@ impl Compositor {
                             .and_then(|n| n.checked_add(row_bytes));
                         match needed {
                             Some(n) if n <= slice.len() => {}
-                            _ => return false,
+                            _ => return None,
                         }
                         vk.upload_surface_shm_mmap(
                             surface_id,
+                            &buffer_id,
+                            shm.pool.fd.as_raw_fd(),
                             slice,
                             offset,
                             stride,
                             w,
                             h,
-                            swap_rb,
+                            source_bgra,
                             force_opaque,
+                            &damage,
                         )
                     })
-                    .unwrap_or(false);
-                if uploaded {
+                    .flatten();
+                if let Some(upload_result) = upload_result {
                     self.surface_meta.insert(
                         surface_id.clone(),
                         super::render::SurfaceMeta {
@@ -3187,9 +3354,14 @@ impl Compositor {
                             y_invert: false,
                         },
                     );
-                    buf.release();
-                    if let Some(r) = release {
-                        r.signal();
+                    if upload_result == super::vulkan_render::ShmUploadResult::Imported {
+                        self.held_buffers
+                            .insert(surface_id.clone(), HeldBuffer { buf, release });
+                    } else {
+                        buf.release();
+                        if let Some(r) = release {
+                            r.signal();
+                        }
                     }
                     return;
                 }
@@ -4860,7 +5032,7 @@ impl Dispatch<WlCompositor, ()> for Compositor {
                         wl_surface: surface,
                         pending_buffer: None,
                         pending_buffer_scale: 1,
-                        pending_damage: false,
+                        pending_damage: Vec::new(),
                         pending_frame_callbacks: Vec::new(),
                         pending_presentation_feedbacks: Vec::new(),
                         pending_opaque: false,
@@ -4918,14 +5090,42 @@ impl Dispatch<WlSurface, ()> for Compositor {
         use wayland_server::protocol::wl_surface::Request;
         let sid = resource.id();
         match request {
-            Request::Attach { buffer, x: _, y: _ } => {
+            Request::Attach { buffer, x, y } => {
                 if let Some(surf) = state.surfaces.get_mut(&sid) {
                     surf.pending_buffer = buffer;
+                    if x != 0 || y != 0 {
+                        surf.pending_damage.push(PendingDamage::Full);
+                    }
                 }
             }
-            Request::Damage { .. } | Request::DamageBuffer { .. } => {
+            Request::Damage {
+                x,
+                y,
+                width,
+                height,
+            } => {
                 if let Some(surf) = state.surfaces.get_mut(&sid) {
-                    surf.pending_damage = true;
+                    surf.pending_damage.push(PendingDamage::Surface {
+                        x,
+                        y,
+                        width,
+                        height,
+                    });
+                }
+            }
+            Request::DamageBuffer {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                if let Some(surf) = state.surfaces.get_mut(&sid) {
+                    surf.pending_damage.push(PendingDamage::Buffer {
+                        x,
+                        y,
+                        width,
+                        height,
+                    });
                 }
             }
             Request::Frame { callback } => {
@@ -6238,6 +6438,17 @@ impl Dispatch<WlBuffer, ShmBufferData> for Compositor {
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _: wayland_server::backend::ClientId,
+        buffer: &WlBuffer,
+        _: &ShmBufferData,
+    ) {
+        if let Some(ref mut vk) = state.vulkan_renderer {
+            vk.remove_buffer(&buffer.id());
+        }
     }
 }
 
@@ -9056,7 +9267,11 @@ fn run_compositor(
 
 #[cfg(test)]
 mod tests {
-    use super::{dir_is_chromium, next_surface_id_after, scan_free_surface_id};
+    use super::{
+        PendingDamage, dir_is_chromium, next_surface_id_after, scan_free_surface_id,
+        shm_damage_rects,
+    };
+    use crate::vulkan_render::ShmDamageRect;
     use std::collections::HashSet;
 
     /// A scratch directory that removes itself, so the marker test can
@@ -9143,5 +9358,101 @@ mod tests {
     fn scan_tolerates_a_zero_seed() {
         assert_eq!(scan_free_surface_id(0, |_| false), Some(1));
         assert_eq!(scan_free_surface_id(0, |_| true), None);
+    }
+
+    #[test]
+    fn absent_shm_damage_initializes_the_full_texture() {
+        assert_eq!(
+            shm_damage_rects(&[], 100, 80, 1, None, None),
+            vec![ShmDamageRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+            }]
+        );
+    }
+
+    #[test]
+    fn buffer_damage_is_clipped_without_changing_units() {
+        let pending = [PendingDamage::Buffer {
+            x: -10,
+            y: 70,
+            width: 40,
+            height: 30,
+        }];
+        assert_eq!(
+            shm_damage_rects(&pending, 100, 80, 2, None, None),
+            vec![ShmDamageRect {
+                x: 0,
+                y: 70,
+                width: 30,
+                height: 10,
+            }]
+        );
+    }
+
+    #[test]
+    fn surface_damage_uses_the_committed_buffer_scale() {
+        let pending = [PendingDamage::Surface {
+            x: 3,
+            y: 4,
+            width: 5,
+            height: 6,
+        }];
+        assert_eq!(
+            shm_damage_rects(&pending, 100, 80, 2, None, None),
+            vec![ShmDamageRect {
+                x: 6,
+                y: 8,
+                width: 10,
+                height: 12,
+            }]
+        );
+    }
+
+    #[test]
+    fn surface_damage_maps_through_viewport_crop_and_scale() {
+        let pending = [PendingDamage::Surface {
+            x: 3,
+            y: 4,
+            width: 5,
+            height: 6,
+        }];
+        assert_eq!(
+            shm_damage_rects(
+                &pending,
+                100,
+                80,
+                2,
+                Some((10.5, 5.25, 20.0, 30.0)),
+                Some((40, 60)),
+            ),
+            vec![ShmDamageRect {
+                x: 24,
+                y: 14,
+                width: 5,
+                height: 7,
+            }]
+        );
+    }
+
+    #[test]
+    fn surface_damage_maps_destination_against_the_full_buffer() {
+        let pending = [PendingDamage::Surface {
+            x: 10,
+            y: 5,
+            width: 20,
+            height: 10,
+        }];
+        assert_eq!(
+            shm_damage_rects(&pending, 200, 100, 2, None, Some((50, 25))),
+            vec![ShmDamageRect {
+                x: 40,
+                y: 20,
+                width: 80,
+                height: 40,
+            }]
+        );
     }
 }
