@@ -43,6 +43,9 @@ export interface BSPTreeCtx {
   palette: TerminalPalette;
   fontFamily: string;
   fontSize: number;
+  /** Surface zoom as a factor (1 = the pane's DPI alone), applied on top of
+   *  DPI awareness by every resizable surface pane. */
+  surfaceZoom: number;
   tabMemory: Record<string, number>;
   onRender?: (renderMs?: number) => void;
   /** Called with each terminal pane's surface as it mounts (and null as it

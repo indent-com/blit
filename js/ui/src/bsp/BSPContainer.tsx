@@ -131,6 +131,8 @@ export function BSPContainer(props: {
   palette: TerminalPalette;
   fontFamily: string;
   fontSize: number;
+  /** Surface zoom factor (1 = the pane's DPI alone). Defaults to 1. */
+  surfaceZoom?: number;
 
   focusedSessionId: SessionId | null;
   lruSessionIds: readonly SessionId[];
@@ -976,6 +978,9 @@ export function BSPContainer(props: {
     get fontSize() {
       return props.fontSize;
     },
+    get surfaceZoom() {
+      return props.surfaceZoom ?? 1;
+    },
     tabMemory,
     get onRender() {
       return props.onRender;
@@ -1599,6 +1604,7 @@ function LeafPane(props: {
                 surfaceId={surfaceId()!}
                 focus={props.isFocused}
                 resizable
+                zoom={ctx.surfaceZoom}
                 style={{ width: "100%", height: "100%" }}
               />
             </div>

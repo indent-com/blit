@@ -50,6 +50,7 @@ import { tileDisplay } from "./ide/tileDisplay";
 import { t, tp } from "./i18n";
 import { readStoredPassphrase } from "./passphrase-storage";
 import { getInstallPrompt, clearInstallPrompt } from "./installPrompt";
+import { stabilizeSections } from "./switcherStabilize";
 
 const SOURCE_LABEL: Record<number, string> = {
   [SEARCH_SOURCE_TITLE]: t("switcher.sourceTitle"),
@@ -1245,7 +1246,7 @@ export function SwitcherOverlay(props: {
     return items;
   });
 
-  const sections = createMemo<SwitcherSection[]>(() => {
+  const buildSections = (): SwitcherSection[] => {
     if (isFileSearch()) {
       const items: FileItem[] = fileResults().map((relPath) => {
         const slash = relPath.lastIndexOf("/");
@@ -1634,7 +1635,15 @@ export function SwitcherOverlay(props: {
     }
 
     return next.filter((section) => section.items.length > 0);
-  });
+  };
+
+  // Workspace emits (titles, usedRows, output-driven title sync) rebuild the
+  // item data constantly. Reuse unchanged section/item objects so Solid's
+  // <For> keeps existing rows — and their live thumbnails — mounted instead of
+  // remounting the whole list (visible as flashing) on every emit.
+  const sections = createMemo<SwitcherSection[]>((prev) =>
+    stabilizeSections(prev, buildSections()),
+  );
 
   const flatItems = createMemo(() =>
     sections().flatMap((section) => section.items),
@@ -1766,7 +1775,12 @@ export function SwitcherOverlay(props: {
       ? Math.round(scale().icon * compact * 0.55)
       : Math.round(scale().icon * compact);
 
-  function renderItemSquare(item: SwitcherItem, selected: boolean) {
+  // A component (not a function call in the row JSX) so the body runs once
+  // per row: the selection border stays reactive via square.selected while the
+  // live terminal/surface thumbnails keep their mount instead of being
+  // destroyed and recreated on every selection move.
+  function ItemSquare(square: { item: SwitcherItem; selected: boolean }) {
+    const item = square.item;
     return (
       <div
         style={{
@@ -1774,7 +1788,7 @@ export function SwitcherOverlay(props: {
           height: `${iconSize()}px`,
           "flex-shrink": 0,
           "border-radius": "0",
-          border: `1px solid ${selected ? theme().accent : theme().subtleBorder}`,
+          border: `1px solid ${square.selected ? theme().accent : theme().subtleBorder}`,
           "background-color": theme().solidPanelBg,
           display: "flex",
           "align-items": "center",
@@ -1939,7 +1953,7 @@ export function SwitcherOverlay(props: {
         const rest = location.hash
           .slice(1)
           .split("&")
-          .filter((s) => /^[lpast]=/.test(s));
+          .filter((s) => /^[lpastdx]=/.test(s));
         const hash = [`psk=${encodeURIComponent(passphrase)}`, ...rest].join(
           "&",
         );
@@ -2343,7 +2357,7 @@ export function SwitcherOverlay(props: {
                                   "border-color 120ms ease, background-color 120ms ease",
                               }}
                             >
-                              {renderItemSquare(item, selected())}
+                              <ItemSquare item={item} selected={selected()} />
 
                               <div
                                 style={{
@@ -2616,6 +2630,37 @@ export function SwitcherOverlay(props: {
                                     e.stopPropagation();
                                     void workspace.closeSession(
                                       (item as SessionItem).sessionId,
+                                    );
+                                  }}
+                                  style={{
+                                    background: railBg(),
+                                    border: `1px solid ${theme().subtleBorder}`,
+                                    color: "inherit",
+                                    cursor: "pointer",
+                                    opacity: 0.75,
+                                    "font-size": `${fsSm()}px`,
+                                    padding: `${scale().controlY}px ${scale().controlX}px`,
+                                    "font-family": "inherit",
+                                    "align-self": "stretch",
+                                    "border-radius": "0",
+                                    "min-width": `${fsMd() * 2}px`,
+                                    display: "flex",
+                                    "align-items": "center",
+                                    "justify-content": "center",
+                                  }}
+                                >
+                                  {t("switcher.close")}
+                                </button>
+                              </Show>
+                              <Show when={item.type === "surface"}>
+                                <button
+                                  type="button"
+                                  title={t("switcher.close")}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    workspace.closeSurface(
+                                      (item as SurfaceItem).connectionId,
+                                      (item as SurfaceItem).surfaceId,
                                     );
                                   }}
                                   style={{

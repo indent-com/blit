@@ -632,6 +632,16 @@ export class BlitSurfaceCanvas {
     width: number;
     height: number;
     scale120: number;
+    /**
+     * The container's own device-pixel ratio, in 1/120ths — the ratio that
+     * converts this view's device pixels back to CSS pixels.
+     *
+     * Equal to `scale120` unless the binding applied a zoom factor: zoom
+     * multiplies the *surface* scale (the app renders larger and the window
+     * fits fewer of its own logical pixels in the pane) while the pane's
+     * device↔CSS ratio is unchanged, so the two must not be conflated.
+     */
+    cssScale120: number;
   } | null = null;
   /**
    * The container's size in device pixels, tracked for every view.
@@ -999,11 +1009,18 @@ export class BlitSurfaceCanvas {
    *
    * This should be called by the framework binding's ResizeObserver so the
    * canvas is immediately at the correct resolution — no CSS scaling needed.
+   *
+   * `scale120` is the scale the *surface* is asked to render at, in 1/120ths
+   * (Wayland convention): the app is handed `width * 120 / scale120` logical
+   * pixels.  `cssScale120` is the container's device-pixel ratio and defaults
+   * to `scale120`; a binding applying a zoom factor passes the two
+   * separately, since zoom moves the surface scale only.
    */
   setDisplaySize(
     width: number | null,
     height?: number,
     scale120?: number,
+    cssScale120?: number,
   ): void {
     if (width == null) {
       const wasSized = this._displaySize !== null;
@@ -1024,7 +1041,13 @@ export class BlitSurfaceCanvas {
         ? Math.round(devicePixelRatio * 120)
         : 0);
     const wasSized = this._displaySize !== null;
-    this._displaySize = { width: w, height: h, scale120: s };
+    this._displaySize = {
+      width: w,
+      height: h,
+      scale120: s,
+      // A binding that applies no zoom passes one scale for both.
+      cssScale120: cssScale120 && cssScale120 > 0 ? cssScale120 : s,
+    };
     // A scaled subscriber is left out of the server's size mediation
     // entirely: it asked to be served a downscale of whatever the surface
     // happens to be, so it gets no say in how big that is.  Gaining a
@@ -1149,8 +1172,10 @@ export class BlitSurfaceCanvas {
     this._lastLayout = { left, top, w, h };
     // All values are integer device pixels converted to CSS pixels, so the
     // canvas lands on the device grid — a stream served at the size that
-    // was asked for is then blitted 1:1.
-    const scale = ds.scale120 / 120;
+    // was asked for is then blitted 1:1.  The container's own ratio, not the
+    // surface scale: under a zoom factor the two differ, and dividing by the
+    // zoomed scale would draw the canvas that many times too small.
+    const scale = ds.cssScale120 / 120;
     Object.assign(canvas.style, {
       position: "absolute",
       left: `${left / scale}px`,

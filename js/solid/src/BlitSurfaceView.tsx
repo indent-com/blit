@@ -3,6 +3,8 @@ import {
   onCleanup,
   createEffect,
   createSignal,
+  on,
+  untrack,
   Show,
   type JSX,
 } from "solid-js";
@@ -19,7 +21,37 @@ export interface BlitSurfaceViewProps {
   focus?: boolean;
   /** When true the surface is resized to fill the container. */
   resizable?: boolean;
+  /**
+   * Zoom factor applied on top of the display's DPI, e.g. 1.25 for 125%.
+   *
+   * The pane keeps its device-pixel resolution; the surface is asked to
+   * render at `devicePixelRatio * zoom`, so the app lays itself out in
+   * proportionally fewer logical pixels and its content — text, chrome,
+   * everything — comes out larger.  Defaults to 1.  Only resizable views
+   * drive the surface's scale, so it has no effect elsewhere.
+   */
+  zoom?: number;
 }
+
+/** Clamp to a range that stays useful at both ends: below 0.25 an app is
+ *  handed a logical size most toolkits refuse to lay out, and above 4 one
+ *  pane's demand for scale would dominate every co-viewer's stream. */
+function clampZoom(zoom: number | undefined): number {
+  if (typeof zoom !== "number" || !Number.isFinite(zoom) || zoom <= 0) return 1;
+  return Math.min(4, Math.max(0.25, zoom));
+}
+
+/**
+ * The floor on the scale that goes on the wire.
+ *
+ * The compositor derives the window's logical size as
+ * `physical * 120 / max(scale, 120)` — a sub-1x scale gives the app a 1x
+ * window while still moving the output's advertised scale, so asking for one
+ * does not zoom out, it just puts those two out of step.  Zooming below 100%
+ * therefore only bites where there is DPI to give back: a 2x pane reaches
+ * 1.5x at 75%, a 1x pane is already at the floor.
+ */
+const MIN_SCALE_120 = 120;
 
 export function BlitSurfaceView(props: BlitSurfaceViewProps) {
   const workspace = useRequiredBlitWorkspace();
@@ -65,6 +97,10 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
     }
   });
 
+  /** Set by the resize effect while it owns an observer; re-sends the
+   *  current box after the zoom factor changes. */
+  let reapplyZoom: (() => void) | null = null;
+
   // Observe container size and request a server-side resize when resizable.
   // The canvas resolution is set immediately via setDisplaySize so there is
   // no CSS-scaling gap while waiting for the Wayland app to resize.
@@ -78,6 +114,19 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
     const fallbackScale120 = () =>
       Math.round((window.devicePixelRatio || 1) * 120);
     detectCodecSupport();
+
+    // Read untracked: a zoom change must not tear this effect down and
+    // rebuild the observer (that unsubscribes the view and costs a keyframe).
+    // The dedicated effect below re-applies the last box instead.
+    const zoom = () => clampZoom(untrack(() => props.zoom));
+    // The last box the observer reported, so a zoom change can be re-applied
+    // without waiting for the container to change size — it never will.
+    let lastBox: {
+      cssW: number;
+      cssH: number;
+      physicalW?: number;
+      physicalH?: number;
+    } | null = null;
 
     let resizeTimer: ReturnType<typeof setTimeout> | undefined;
     let lastResizeAt = 0;
@@ -129,11 +178,21 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
         Math.round(physicalH ?? cssH * (window.devicePixelRatio || 1)),
       );
       if (w <= 0 || h <= 0) return;
-      const scale120 =
+      // The container's measured device-pixel ratio, which is what converts
+      // the canvas's device pixels back to a CSS box.
+      const cssScale120 =
         cssW > 0 && cssH > 0
           ? Math.round(((w / cssW + h / cssH) / 2) * 120)
           : fallbackScale120();
-      s.setDisplaySize(w, h, scale120);
+      // Zoom rides on top of it: the pane still holds `w × h` device pixels,
+      // but the surface is composited at a higher scale, so the app gets
+      // proportionally fewer logical pixels and draws everything larger.
+      const scale120 = Math.max(
+        MIN_SCALE_120,
+        Math.round(cssScale120 * zoom()),
+      );
+      s.setDisplaySize(w, h, scale120, cssScale120);
+      lastBox = { cssW, cssH, physicalW, physicalH };
       const now = performance.now();
       const isDragStart = now - lastResizeAt > DRAG_GAP_MS;
       lastResizeAt = now;
@@ -176,12 +235,38 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
       applySize(rect.width, rect.height);
     }
 
+    // Changing the zoom is a resize as far as the surface is concerned: the
+    // box is unchanged, so the observer will never fire, but the logical
+    // size the app is being handed just moved.  Re-apply the last box under
+    // the new factor — through applySize, so it takes the same debounce and
+    // the same de-duplication as a drag.
+    reapplyZoom = () => {
+      if (!lastBox) return;
+      applySize(
+        lastBox.cssW,
+        lastBox.cssH,
+        lastBox.physicalW,
+        lastBox.physicalH,
+      );
+    };
+
     onCleanup(() => {
+      reapplyZoom = null;
       clearTimeout(resizeTimer);
       ro.disconnect();
       s.setDisplaySize(null);
     });
   });
+
+  // Tracks the zoom factor only, and `defer` skips the mount run — the
+  // effect above has already applied the initial box with it.
+  createEffect(
+    on(
+      () => props.zoom,
+      () => reapplyZoom?.(),
+      { defer: true },
+    ),
+  );
 
   return (
     <div

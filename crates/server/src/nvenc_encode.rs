@@ -1,7 +1,9 @@
 //! Direct NVENC encoder — no ffmpeg dependency.
 //!
 //! Uses the NVIDIA Video Codec SDK via `dlopen("libnvidia-encode.so")`.
-//! The CUDA context is created via `dlopen("libcuda.so")`.
+//! All encoders share one CUDA primary context per device, retained via
+//! `dlopen("libcuda.so")` — a private context per encoder costs tens of MB
+//! of driver host memory plus driver threads each.
 //!
 //! The encoder is fed YUV that is already full-range BT.601 — normally the
 //! compositor's compute shaders, via a zero-copy `OPAQUE_FD` import.  It is
@@ -438,31 +440,30 @@ unsafe impl Send for NvencDirectEncoder {}
 
 /// Unwinds what `try_new` has acquired when it bails out partway.
 ///
-/// `try_new` has a dozen early-error paths after `cuCtxCreate_v2`, and
-/// every one of them used to return without releasing the context — so
-/// each rejected configuration leaked one.  That is not a slow drip:
+/// `try_new` has a dozen early-error paths after the encode session is
+/// opened, and every one of them used to return without releasing it —
+/// so each rejected configuration leaked one.  That is not a slow drip:
 /// the server retries encoder creation per surface, per client, per
 /// tick, so a host that refuses the first configuration tried (4:4:4,
 /// say) burns through device memory until *every* encoder fails to
 /// initialize and the whole pipeline silently falls back to CPU
 /// encoding.
 ///
-/// Destroying the context is enough to reclaim the pitched device
-/// allocations and pinned host memory made after it, since those belong
-/// to it; the encode session is torn down explicitly first because it
-/// is owned by NVENC rather than by the context.
+/// Only the session is unwound here.  The CUDA context is the shared
+/// device primary context (see [`primary_ctx`]), retained for the
+/// process lifetime and used by other encoders — destroying it on an
+/// error path would take live encoders down with it.  The device and
+/// pinned-host allocations made after the session is opened are
+/// released explicitly at their own error paths instead.
 struct NvencInitGuard<'a> {
-    cuda: &'a gpu_libs::CudaFns,
     fns: Option<&'a NvEncFunctionList>,
-    ctx: gpu_libs::CUcontext,
     encoder: *mut c_void,
 }
 
 impl NvencInitGuard<'_> {
-    /// Hand ownership of the context and session to the encoder being
-    /// returned, so they outlive this guard.
+    /// Hand ownership of the session to the encoder being returned, so it
+    /// outlives this guard.
     fn disarm(mut self) {
-        self.ctx = ptr::null_mut();
         self.encoder = ptr::null_mut();
     }
 }
@@ -474,9 +475,6 @@ impl Drop for NvencInitGuard<'_> {
                 && !self.encoder.is_null()
             {
                 (fns.nvEncDestroyEncoder)(self.encoder);
-            }
-            if !self.ctx.is_null() {
-                (self.cuda.cuCtxDestroy_v2)(self.ctx);
             }
         }
     }
@@ -575,13 +573,11 @@ pub fn caps(codec: &str, verbose: bool) -> Result<NvencCaps, String> {
     let answer = (|| {
         let (codec_guid, _) = nvenc_codec(codec)?;
         let cuda = gpu_libs::cuda().map_err(|e| format!("CUDA: {e}"))?;
-        let (fns, ctx, encoder) = open_session(cuda)?;
-        // Releases both when this scope ends — the session existed only to
-        // answer the query.
+        let (fns, _ctx, encoder) = open_session(cuda)?;
+        // Releases the session when this scope ends — it existed only to
+        // answer the query.  The shared context stays.
         let guard = NvencInitGuard {
-            cuda,
             fns: Some(fns),
-            ctx,
             encoder,
         };
         let caps = NvencCaps {
@@ -621,8 +617,48 @@ pub fn caps(codec: &str, verbose: bool) -> Result<NvencCaps, String> {
     answer
 }
 
-/// Open a CUDA context and an NVENC session on it.  Both belong to the
-/// caller, who must hand them to an [`NvencInitGuard`] or an encoder.
+/// Retain the device's primary context, once per process and device.
+///
+/// Every encoder used to create a private context with `cuCtxCreate_v2`,
+/// and encoders are per-(surface, client): three live encoders meant three
+/// contexts, each costing tens of MB of NVIDIA driver host memory plus its
+/// own driver threads (`cuda-EvtHandlr` & co).  The primary context is
+/// shared instead; NVENC sessions on it are independent objects, so
+/// concurrent encoders only need the context *current* on their calling
+/// thread, which the encode paths already arrange with push/pop.
+///
+/// The retain is never released — a process-lifetime "leak" on purpose,
+/// like the GBM device in vaapi_encode.rs: releasing it while another
+/// encoder still runs would destroy its allocations.
+fn primary_ctx(
+    cuda: &gpu_libs::CudaFns,
+    device: gpu_libs::CUdevice,
+) -> Result<gpu_libs::CUcontext, String> {
+    // `CUcontext` is a raw pointer and not `Send`; the map stores it as
+    // `usize`.  It is a process-wide driver handle, valid on any thread.
+    static PRIMARY_CTXS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<gpu_libs::CUdevice, usize>>,
+    > = std::sync::OnceLock::new();
+    let map = PRIMARY_CTXS.get_or_init(Default::default);
+    let mut map = map
+        .lock()
+        .map_err(|_| "primary context lock poisoned".to_string())?;
+    if let Some(&ctx) = map.get(&device) {
+        return Ok(ctx as gpu_libs::CUcontext);
+    }
+    let mut ctx: gpu_libs::CUcontext = ptr::null_mut();
+    let status = unsafe { (cuda.cuDevicePrimaryCtxRetain)(&mut ctx, device) };
+    if status != 0 {
+        return Err(format!("cuDevicePrimaryCtxRetain({device}) failed: {status}"));
+    }
+    map.insert(device, ctx as usize);
+    Ok(ctx)
+}
+
+/// Open an NVENC session on the shared device primary context, and make
+/// that context current on the calling thread.  The session belongs to
+/// the caller, who must hand it to an [`NvencInitGuard`] or an encoder;
+/// the context is process-shared and must not be destroyed.
 fn open_session(
     cuda: &'static gpu_libs::CudaFns,
 ) -> Result<(&'static NvEncFunctionList, gpu_libs::CUcontext, *mut c_void), String> {
@@ -644,10 +680,12 @@ fn open_session(
         return Err(format!("cuDeviceGet({cuda_device_idx}) failed: {status}"));
     }
 
-    let mut ctx: gpu_libs::CUcontext = ptr::null_mut();
-    status = unsafe { (cuda.cuCtxCreate_v2)(&mut ctx, 0, device) };
+    let ctx = primary_ctx(cuda, device)?;
+    // Retaining the primary context does not make it current on this
+    // thread (cuCtxCreate_v2 did); the allocations below need it current.
+    status = unsafe { (cuda.cuCtxSetCurrent)(ctx) };
     if status != 0 {
-        return Err(format!("cuCtxCreate failed: {status}"));
+        return Err(format!("cuCtxSetCurrent failed: {status}"));
     }
 
     // NVENC function table — initialized once, reused across all sessions.
@@ -668,10 +706,7 @@ fn open_session(
     });
     let fns = match result {
         Ok(fl) => fl,
-        Err(e) => {
-            unsafe { (cuda.cuCtxDestroy_v2)(ctx) };
-            return Err(e.clone());
-        }
+        Err(e) => return Err(e.clone()),
     };
     let fns: &'static NvEncFunctionList =
         // SAFETY: OnceLock guarantees the value lives for 'static.
@@ -689,7 +724,6 @@ fn open_session(
         (fns.nvEncOpenEncodeSessionEx)(open_buf.as_mut_ptr() as *mut c_void, &mut encoder)
     };
     if nv_status != NV_ENC_SUCCESS {
-        unsafe { (cuda.cuCtxDestroy_v2)(ctx) };
         return Err(format!("nvEncOpenEncodeSessionEx failed: {nv_status}"));
     }
     Ok((fns, ctx, encoder))
@@ -729,13 +763,11 @@ impl NvencDirectEncoder {
 
         let cuda = gpu_libs::cuda().map_err(|e| format!("CUDA: {e}"))?;
         let (fns, ctx, encoder) = open_session(cuda)?;
-        // From here on every `return Err` must release the context and the
-        // session; the guard does it so new early-exits cannot reintroduce
-        // the leak.
+        // From here on every `return Err` must release the session and any
+        // allocation already made; the guard does the session so new
+        // early-exits cannot reintroduce the leak.
         let guard = NvencInitGuard {
-            cuda,
             fns: Some(fns),
-            ctx,
             encoder,
         };
         let mut status;
@@ -922,6 +954,13 @@ impl NvencDirectEncoder {
         let mut pinned_host: *mut c_void = ptr::null_mut();
         status = unsafe { (cuda.cuMemAllocHost_v2)(&mut pinned_host, pinned_size) };
         if status != 0 {
+            // The shared context outlives this failure, so what init
+            // already allocated has to be unwound explicitly — destroying
+            // the context is no longer there to do it.
+            unsafe {
+                (fns.nvEncUnregisterResource)(encoder, cuda_registered_nv12);
+                (cuda.cuMemFree_v2)(cuda_devptr_nv12);
+            }
             return Err(format!("cuMemAllocHost failed: {status}"));
         }
 
@@ -931,8 +970,9 @@ impl NvencDirectEncoder {
             );
         }
 
-        // Construction succeeded — the encoder below owns the context and
-        // session now, and frees them in its own Drop.
+        // Construction succeeded — the encoder below owns the session now
+        // and frees it (and its allocations) in its own Drop.  The context
+        // is shared and stays retained.
         guard.disarm();
 
         Ok(Self {
@@ -1703,7 +1743,9 @@ impl Drop for NvencDirectEncoder {
                 if self.cuda_devptr_nv12 != 0 {
                     (cuda.cuMemFree_v2)(self.cuda_devptr_nv12);
                 }
-                (cuda.cuCtxDestroy_v2)(self.cuda_ctx);
+                // The context is the shared device primary context — other
+                // encoders are using it, so it is never destroyed here (the
+                // retain in `primary_ctx` is process-lifetime).
             }
         }
     }

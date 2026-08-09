@@ -46,6 +46,9 @@ import {
   VIDEO_BANDWIDTH_KEY,
   VIDEO_SPEED_KEY,
   SURFACE_STREAMING_KEY,
+  SURFACE_ZOOM_KEY,
+  MIN_SURFACE_ZOOM,
+  MAX_SURFACE_ZOOM,
   LEFT_DOCK_WIDTH_KEY,
   PREVIEW_PANEL_WIDTH_KEY,
   writeStorage,
@@ -60,6 +63,7 @@ import {
   preferredVideoBandwidth,
   preferredVideoSpeed,
   preferredSurfaceStreaming,
+  preferredSurfaceZoom,
   preferredLeftDockWidth,
   preferredPreviewPanelWidth,
   MIN_PREVIEW_PANEL_WIDTH,
@@ -96,9 +100,16 @@ import {
   z,
 } from "./theme";
 import { t } from "./i18n";
+import { TerminalDropTarget } from "./terminalDrop";
 import { StatusBar } from "./StatusBar";
 import { LeftDock, LEFT_PANELS, type LeftPanel } from "./LeftDock";
 import { foldedSections, liveOverrides, toggleSection } from "./dockSections";
+import {
+  formatExpandedHash,
+  formatPanelsHash,
+  parseExpandedHash,
+  parsePanelsHash,
+} from "./panelHash";
 import { fontCatalog } from "./fontCatalog";
 import { ExplorerPanel } from "./ide/ExplorerPanel";
 import { LogPanel } from "./ide/LogPanel";
@@ -530,7 +541,16 @@ function WorkspaceScreen(props: {
   const [surfaceStreaming, setSurfaceStreaming] = createSignal(
     preferredSurfaceStreaming(),
   );
-  const [previewPanelOpen, setPreviewPanelOpen] = createSignal(true);
+  const [surfaceZoom, setSurfaceZoom] = createSignal(preferredSurfaceZoom());
+  // Panel chrome in the URL hash (d= open side panels, x= expanded left-dock
+  // sections) is authoritative when present; absent keys fall back to
+  // localStorage/defaults. Parsed once up front — the focus params (s=/t=)
+  // further down read the same object.
+  const initHash = new URLSearchParams(location.hash.slice(1));
+  const initPanels = parsePanelsHash(initHash.get("d"));
+  const [previewPanelOpen, setPreviewPanelOpen] = createSignal(
+    initPanels?.preview ?? true,
+  );
   const [previewPanelWidth, setPreviewPanelWidth] = createSignal(
     preferredPreviewPanelWidth(),
   );
@@ -564,10 +584,15 @@ function WorkspaceScreen(props: {
       ? el.clientHeight / parent.clientHeight
       : 0.32;
   };
-  const [leftDockOpen, setLeftDockOpen] = createSignal(preferredLeftDockOpen());
+  const [leftDockOpen, setLeftDockOpen] = createSignal(
+    initPanels?.left ?? preferredLeftDockOpen(),
+  );
   const [collapsedSections, setCollapsedSections] = createSignal<
     Set<LeftPanel>
-  >(new Set(preferredCollapsedSections() as LeftPanel[]));
+  >(
+    parseExpandedHash(initHash.get("x")) ??
+      new Set(preferredCollapsedSections() as LeftPanel[]),
+  );
   // Sections auto-folded because they don't apply here, which the user asked
   // to see anyway. Not persisted: it is an override of a fold this root
   // caused, not a preference about the dock.
@@ -1204,12 +1229,10 @@ function WorkspaceScreen(props: {
     }
   }
 
-  // Parse focus params from URL hash on init.
+  // Focus params from the URL hash (initHash is parsed at the top of the
+  // component, next to the panel-chrome restore).
   // Surface: s=<connectionId>:<surfaceId>
   // Terminal: t=<sessionId>  (sessionId is already "<connectionId>:<counter>")
-  const initHash = new URLSearchParams(
-    location.hash.slice(1).replace(/&/g, "&"),
-  );
   const hashSurface = initHash.get("s");
   const hashTerminal = initHash.get("t");
 
@@ -2488,11 +2511,9 @@ function WorkspaceScreen(props: {
   const remoteFont = useConfigValue(FONT_KEY);
   const remoteFontSize = useConfigValue(FONT_SIZE_KEY);
   const remoteTextGamma = useConfigValue(TEXT_GAMMA_KEY);
-  const remoteAudioBitrate = useConfigValue(AUDIO_BITRATE_KEY);
-  const remoteAudioMuted = useConfigValue(AUDIO_MUTED_KEY);
-  const remoteVideoBandwidth = useConfigValue(VIDEO_BANDWIDTH_KEY);
-  const remoteVideoSpeed = useConfigValue(VIDEO_SPEED_KEY);
-  const remoteSurfaceStreaming = useConfigValue(SURFACE_STREAMING_KEY);
+  // No media settings here on purpose — bitrate, mute, encoder effort,
+  // streaming and zoom are device-local (see storage.ts), so they are read
+  // from localStorage once at startup and never taken from another device.
 
   createEffect(() => {
     const id = remotePaletteId();
@@ -2518,39 +2539,6 @@ function WorkspaceScreen(props: {
     if (!s) return;
     const n = Number(s);
     if (Number.isFinite(n) && n >= 0.5 && n <= 2.5) setTextGamma(n);
-  });
-
-  createEffect(() => {
-    const s = remoteAudioBitrate();
-    if (!s) return;
-    const n = parseInt(s, 10);
-    if (n >= 0) setAudioBitrate(n);
-  });
-
-  createEffect(() => {
-    const s = remoteAudioMuted();
-    if (s === "0") setAudioMuted(false);
-    else if (s === "1") setAudioMuted(true);
-  });
-
-  createEffect(() => {
-    const s = remoteVideoBandwidth();
-    if (!s) return;
-    const n = parseInt(s, 10);
-    if (n >= 0 && n <= 255) setVideoBandwidth(n);
-  });
-
-  createEffect(() => {
-    const s = remoteVideoSpeed();
-    if (!s) return;
-    const n = parseInt(s, 10);
-    if (n >= 0 && n <= 255) setVideoSpeed(n);
-  });
-
-  createEffect(() => {
-    const s = remoteSurfaceStreaming();
-    if (s === "0") setSurfaceStreaming(false);
-    else if (s === "1") setSurfaceStreaming(true);
   });
 
   // Sync media preferences to all connections so new subscribes use them.
@@ -3006,6 +2994,18 @@ function WorkspaceScreen(props: {
     }
   }
 
+  /** Zoom is applied client-side, on top of the pane's DPI: every resizable
+   *  surface view re-derives the scale it asks the compositor for, so there
+   *  is nothing to push to the connections here. */
+  function changeSurfaceZoom(percent: number) {
+    const clamped = Math.min(
+      MAX_SURFACE_ZOOM,
+      Math.max(MIN_SURFACE_ZOOM, Math.round(percent)),
+    );
+    setSurfaceZoom(clamped);
+    writeStorage(SURFACE_ZOOM_KEY, String(clamped));
+  }
+
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
     | ((sessionId: SessionId, targetPaneId: string) => void)
@@ -3452,6 +3452,12 @@ function WorkspaceScreen(props: {
       const t = stripConn(fTile);
       if (t) parts.push(`tile=${t.connectionId}:${tabId(t.bare)}`);
     }
+    // Panel chrome: which side panels are open (d=) and which left-dock
+    // sections are expanded (x=). Always written so a present key is
+    // authoritative on restore — "both panels closed" (d=) and "all sections
+    // collapsed" (x=) are states the hash must be able to carry.
+    parts.push(`d=${formatPanelsHash(leftDockOpen(), previewPanelOpen())}`);
+    parts.push(`x=${formatExpandedHash(collapsedSections())}`);
     const existing = location.hash.slice(1);
     // Strip layout-managed keys (l, p, a) from the old hash only when we
     // have fresh values to replace them.  While BSPContainer is still
@@ -3481,7 +3487,7 @@ function WorkspaceScreen(props: {
         // while a hash-restored tile ref is still resolving (the fetch
         // hasn't settled); erasing it then would lose the restore target.
         !(s.startsWith("tile=") && !pendingActiveTileRef()) &&
-        !(/^[lpast]=/.test(s) && written.has(s.slice(0, s.indexOf("=")))),
+        !(/^[lpastdx]=/.test(s) && written.has(s.slice(0, s.indexOf("=")))),
     );
     const merged = [...kept, ...parts];
     const newHash = merged.join("&");
@@ -3841,6 +3847,7 @@ function WorkspaceScreen(props: {
                                 surfaceId={sid()}
                                 focus
                                 resizable
+                                zoom={surfaceZoom() / 100}
                                 style={{
                                   width: "100%",
                                   height: "100%",
@@ -3904,6 +3911,7 @@ function WorkspaceScreen(props: {
                     palette={palette()}
                     fontFamily={resolvedFontWithFallback()}
                     fontSize={fontSize()}
+                    surfaceZoom={surfaceZoom() / 100}
                     focusedSessionId={wsState().focusedSessionId}
                     lruSessionIds={lru}
                     liveSurfaceKeys={surfaces().map(
@@ -4463,10 +4471,12 @@ function WorkspaceScreen(props: {
               audioMuted={audioMuted()}
               audioAvailable={allConnections().some((c) => c.supportsAudio)}
               surfaceStreaming={surfaceStreaming()}
+              surfaceZoom={surfaceZoom()}
               onAudioBitrateChange={changeAudioBitrate}
               onVideoBandwidthChange={changeVideoBandwidth}
               onVideoSpeedChange={changeVideoSpeed}
               onSurfaceStreamingChange={changeSurfaceStreaming}
+              onSurfaceZoomChange={changeSurfaceZoom}
               onToggleAudio={toggleAudio}
               onClose={closeOverlay}
             />

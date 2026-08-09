@@ -11,11 +11,10 @@
 import { createSignal, For, Show, type JSX } from "solid-js";
 import type { Theme, UIScale } from "./theme";
 import { t } from "./i18n";
+import { LEFT_PANELS, type LeftPanel } from "./dockSections";
 
-export type LeftPanel = "explorer" | "log" | "problems";
-
-/** Fixed section order in the accordion. */
-export const LEFT_PANELS: LeftPanel[] = ["explorer", "log", "problems"];
+export type { LeftPanel };
+export { LEFT_PANELS };
 
 /** Section titles. A function, not a constant map, so the strings are
  *  read through `t()` at render time rather than frozen at module load. */

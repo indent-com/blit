@@ -210,6 +210,37 @@ describe("BlitSurfaceCanvas layout", () => {
     surface.dispose();
   });
 
+  it("sizes the CSS box by the pane's DPI, not by a zoomed surface scale", () => {
+    // A 1x pane, 800×600 CSS px, at 150% zoom: the surface composites at
+    // 1.5x, so it lays out in 533×400 of its own logical pixels, but the
+    // pane is still 800×600 device pixels and the picture has to cover it.
+    // Dividing the box by the surface scale instead would draw it at 2/3
+    // size with a third of the pane left empty.
+    const { surface, canvas } = attachCanvas();
+    setSurfaceInfo(surface, { width: 800, height: 600, lw: 534, lh: 400 });
+    canvas.width = 800;
+    canvas.height = 600;
+    surface.setDisplaySize(800, 600, 180, 120);
+    expect(canvas.style.width).toBe("800px");
+    expect(canvas.style.height).toBe("600px");
+    expect(canvas.style.left).toBe("0px");
+    expect(canvas.style.top).toBe("0px");
+    surface.dispose();
+  });
+
+  it("keeps the CSS box on the device grid under zoom on a 2x pane", () => {
+    // 640×480 CSS px at 2x with 125% zoom: 1280×960 device pixels, surface
+    // scale 300 (2 × 1.25), logical 512×384.
+    const { surface, canvas } = attachCanvas();
+    setSurfaceInfo(surface, { width: 1280, height: 960, lw: 512, lh: 384 });
+    canvas.width = 1280;
+    canvas.height = 960;
+    surface.setDisplaySize(1280, 960, 300, 240);
+    expect(canvas.style.width).toBe("640px");
+    expect(canvas.style.height).toBe("480px");
+    surface.dispose();
+  });
+
   it("reverts to fill-and-contain when the display size is cleared", () => {
     const { surface, canvas } = attachCanvas();
     surface.setDisplaySize(1280, 960, 240);

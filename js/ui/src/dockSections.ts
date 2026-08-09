@@ -10,7 +10,13 @@
  * it rather than record a collapse it already looks like it has.
  */
 
-import type { LeftPanel } from "./LeftDock";
+export type LeftPanel = "explorer" | "log" | "problems";
+
+/** Fixed section order in the accordion. Defined here (not in LeftDock.tsx)
+ *  so non-JSX modules like panelHash can read it without pulling in a
+ *  component file. */
+export const LEFT_PANELS: LeftPanel[] = ["explorer", "log", "problems"];
+
 
 /**
  * The set LeftDock renders as collapsed: everything the user collapsed, plus

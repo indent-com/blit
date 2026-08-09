@@ -257,6 +257,7 @@ describe("BlitTerminalSurface mobile copy/paste API", () => {
       value: {
         writeText: vi.fn().mockResolvedValue(undefined),
         readText: vi.fn().mockResolvedValue(""),
+        read: vi.fn().mockResolvedValue([]),
       },
     });
     mockCanvasContext();
@@ -268,6 +269,29 @@ describe("BlitTerminalSurface mobile copy/paste API", () => {
 
   function newSurface(): BlitTerminalSurface {
     return new BlitTerminalSurface({ sessionId: null });
+  }
+
+  function newConnectedSurface(): {
+    s: BlitTerminalSurface;
+    sendInput: ReturnType<typeof vi.fn>;
+    sendClipboard: ReturnType<typeof vi.fn>;
+  } {
+    const s = new BlitTerminalSurface({ sessionId: "s1" });
+    const sendInput = vi.fn();
+    const sendClipboard = vi.fn();
+    // @ts-expect-error — install a fake workspace stub.
+    s["_workspace"] = { sendInput };
+    // @ts-expect-error — connection exposing a connected transport + clipboard.
+    s["_blitConn"] = { transport: { status: "connected" }, sendClipboard };
+    return { s, sendInput, sendClipboard };
+  }
+
+  function imageClipboardItem(bytes: Uint8Array): ClipboardItem {
+    return {
+      types: ["image/png"],
+      getType: () =>
+        Promise.resolve(new Blob([bytes], { type: "image/png" })),
+    } as unknown as ClipboardItem;
   }
 
   it("starts with no selection", () => {
@@ -366,6 +390,76 @@ describe("BlitTerminalSurface mobile copy/paste API", () => {
     // sessionId is null; even if connected, it would short-circuit.
     const result = await s.pasteFromClipboard();
     expect(result).toBeNull();
+  });
+
+  it("pasteFromClipboard() forwards an image-only clipboard then sends ^V", async () => {
+    const { s, sendInput, sendClipboard } = newConnectedSurface();
+    const bytes = new Uint8Array([137, 80, 78, 71]); // "\x89PNG"
+    vi.mocked(navigator.clipboard.read).mockResolvedValue([
+      imageClipboardItem(bytes),
+    ]);
+    const result = await s.pasteFromClipboard();
+    expect(result).toBeNull();
+    expect(sendClipboard).toHaveBeenCalledTimes(1);
+    expect(sendClipboard).toHaveBeenCalledWith("image/png", bytes);
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    expect(sendInput).toHaveBeenCalledWith("s1", new Uint8Array([0x16]));
+    // The clipboard must be populated server-side before ^V reaches the app.
+    expect(sendClipboard.mock.invocationCallOrder[0]).toBeLessThan(
+      sendInput.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("pasteFromClipboard() tries the image read when readText rejects", async () => {
+    const { s, sendClipboard } = newConnectedSurface();
+    const bytes = new Uint8Array([1, 2, 3]);
+    vi.mocked(navigator.clipboard.readText).mockRejectedValue(
+      new Error("No valid data on clipboard."),
+    );
+    vi.mocked(navigator.clipboard.read).mockResolvedValue([
+      imageClipboardItem(bytes),
+    ]);
+    const result = await s.pasteFromClipboard();
+    expect(result).toBeNull();
+    expect(sendClipboard).toHaveBeenCalledWith("image/png", bytes);
+  });
+
+  it("pasteFromClipboard() drops a clipboard image over the size cap", async () => {
+    const { s, sendInput, sendClipboard } = newConnectedSurface();
+    const bytes = new Uint8Array(8 * 1024 * 1024 + 1);
+    vi.mocked(navigator.clipboard.read).mockResolvedValue([
+      imageClipboardItem(bytes),
+    ]);
+    const result = await s.pasteFromClipboard();
+    expect(result).toBeNull();
+    expect(sendClipboard).not.toHaveBeenCalled();
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it("pasteFromClipboard() returns null when clipboard.read is unavailable", async () => {
+    const { s, sendInput, sendClipboard } = newConnectedSurface();
+    // Browsers without the structured read API (jsdom's default) leave the
+    // image path a silent no-op rather than an error.
+    Object.defineProperty(navigator.clipboard, "read", {
+      configurable: true,
+      writable: true,
+      value: undefined,
+    });
+    const result = await s.pasteFromClipboard();
+    expect(result).toBeNull();
+    expect(sendClipboard).not.toHaveBeenCalled();
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it("pasteFromClipboard() returns null when clipboard.read rejects", async () => {
+    const { s, sendInput, sendClipboard } = newConnectedSurface();
+    vi.mocked(navigator.clipboard.read).mockRejectedValue(
+      new Error("NotAllowedError"),
+    );
+    const result = await s.pasteFromClipboard();
+    expect(result).toBeNull();
+    expect(sendClipboard).not.toHaveBeenCalled();
+    expect(sendInput).not.toHaveBeenCalled();
   });
 
   it("pasteText() is a no-op when read-only", () => {
@@ -1134,6 +1228,52 @@ describe("BlitTerminalSurface native scroll surface", () => {
     // @ts-expect-error — assert private scrollback state.
     expect(s.scrollOffset).toBe(28);
     expect(el.scrollTop).toBe(750);
+  });
+
+  it("defers re-anchor compensation while a gesture is in flight", () => {
+    // Scrollback capped: the app prints three lines but the depth no longer
+    // grows, so the anchor moves targetTop by whole rows. Writing that back
+    // mid-flick cancels the browser's momentum animation — the jumps.
+    const { s, el } = makeSurface(100, 10, 80);
+    // @ts-expect-error — install and invoke the private scroll listener.
+    s.setupScrollSurface();
+    el.scrollTop = 750;
+    // @ts-expect-error — the listener is the "user scrolled" signal.
+    s.boundScrollListener();
+    // @ts-expect-error — assert the offset the listener derived.
+    expect(s.scrollOffset).toBe(25);
+
+    // @ts-expect-error — what the anchor listener does with a capped depth.
+    s.scrollOffset = 28;
+    // @ts-expect-error — three rows of re-anchor pending at the next sync.
+    s.anchorRowsSinceSync = 3;
+    // @ts-expect-error — exercising private DOM sync directly.
+    s.syncScrollSurface(true);
+
+    expect(el.scrollTop).toBe(750);
+    // @ts-expect-error — the compensation was folded into the bookkeeping.
+    expect(s.lastScrollTop).toBe(720);
+  });
+
+  it("writes re-anchor compensation once the gesture has settled", () => {
+    const { s, el } = makeSurface(100, 10, 80);
+    // @ts-expect-error — install and invoke the private scroll listener.
+    s.setupScrollSurface();
+    el.scrollTop = 750;
+    // @ts-expect-error — the listener is the "user scrolled" signal.
+    s.boundScrollListener();
+    // @ts-expect-error — the flick ended long ago; the view is just parked.
+    s.lastUserScrollAt = 0;
+
+    // @ts-expect-error — what the anchor listener does with a capped depth.
+    s.scrollOffset = 28;
+    // @ts-expect-error — three rows of re-anchor pending at the next sync.
+    s.anchorRowsSinceSync = 3;
+    // @ts-expect-error — exercising private DOM sync directly.
+    s.syncScrollSurface(true);
+
+    // No gesture to protect: the parked view tracks its content exactly.
+    expect(el.scrollTop).toBe(720);
   });
 
   it("carries a selection along when the view is re-anchored", () => {

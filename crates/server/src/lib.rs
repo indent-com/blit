@@ -4630,6 +4630,15 @@ fn build_scrollback_update(
     msg.map(|m| (m, frame))
 }
 
+/// True when the client is parked in this PTY's scrollback. A scrolled PTY is
+/// served by the scrollback frame loop; sending it a live preview frame as
+/// well would stomp the parked view with the live bottom.
+fn is_scrolled(scrolled_ptys: &[(u16, usize)], pid: u16) -> bool {
+    scrolled_ptys
+        .iter()
+        .any(|&(spid, offset)| spid == pid && offset > 0)
+}
+
 fn build_search_results_msg(request_id: u16, results: &[SearchResultRow]) -> Vec<u8> {
     let count = results.len().min(u16::MAX as usize);
     let payload_bytes: usize = results[..count]
@@ -7832,7 +7841,9 @@ async fn tick(state: &AppState) -> TickOutcome {
         }
 
         let mut preview_ids = subscriptions;
-        preview_ids.retain(|pid| Some(*pid) != lead);
+        // A scrolled PTY is served by the scrollback loop above; a live
+        // preview frame would stomp the parked view with the live bottom.
+        preview_ids.retain(|pid| Some(*pid) != lead && !is_scrolled(&scrolled_ptys, *pid));
         preview_ids.sort_unstable();
 
         for pid in preview_ids {
@@ -13003,6 +13014,29 @@ mod tests {
 
             let first = rx.try_recv().expect("a frame survived");
             assert_eq!(first[0], overshoot as u8);
+        }
+    }
+
+    /// A scrolled PTY gets its frames from the scrollback loop; the preview
+    /// loop must skip it, or every preview tick overwrites the parked
+    /// scrollback view with the live bottom.
+    mod scrolled_preview_filter {
+        use super::super::is_scrolled;
+
+        #[test]
+        fn a_positive_offset_counts_as_scrolled() {
+            assert!(is_scrolled(&[(3, 40)], 3));
+        }
+
+        #[test]
+        fn offset_zero_does_not() {
+            assert!(!is_scrolled(&[(3, 0)], 3));
+        }
+
+        #[test]
+        fn other_ptys_do_not() {
+            assert!(!is_scrolled(&[(3, 40)], 4));
+            assert!(!is_scrolled(&[], 3));
         }
     }
 

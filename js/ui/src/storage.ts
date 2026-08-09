@@ -207,13 +207,23 @@ export const FONT_SIZE_KEY = "blit.fontSize";
 /** Glyph antialiasing coverage gamma — see DEFAULT_TEXT_GAMMA. */
 export const TEXT_GAMMA_KEY = "blit.textGamma";
 export const TARGET_KEY = "blit.target";
+// Media settings are device-local: they stay out of PERSISTED_KEYS below and
+// round-trip through localStorage only.  Every one of them is a statement
+// about the machine in front of you rather than about the account — what the
+// link between here and the server will carry, how much CPU the far end
+// should spend on it, whether this device has speakers worth unmuting, and
+// how large this screen needs the picture.  Syncing them meant a phone on
+// mobile data dictating the bitrate to a desktop on the same account, and
+// the desktop dictating it back on the next change.
 export const AUDIO_BITRATE_KEY = "blit.audioBitrate";
 export const AUDIO_MUTED_KEY = "blit.audioMuted";
 export const VIDEO_BANDWIDTH_KEY = "blit.videoBandwidth";
 export const VIDEO_SPEED_KEY = "blit.videoSpeed";
 export const SURFACE_STREAMING_KEY = "blit.surfaceStreaming";
-// Panel widths are UI-local (not synced to blit.conf), so they stay out of
-// PERSISTED_KEYS below and round-trip through localStorage only.
+/** Surface zoom, in percent (100 = native). Applied on top of the display's
+ *  DPI, so a 2x screen at 150% composites the surface at 3x. */
+export const SURFACE_ZOOM_KEY = "blit.surfaceZoom";
+// Panel widths are UI-local for the same reason, being chrome geometry.
 export const LEFT_DOCK_WIDTH_KEY = "blit.leftDockWidth";
 export const PREVIEW_PANEL_WIDTH_KEY = "blit.previewPanelWidth";
 /** Whether the IDE dock is open ("1"/"0"). */
@@ -232,11 +242,6 @@ const PERSISTED_KEYS = new Set([
   EDITOR_WRAP_KEY,
   "blit.layouts",
   TARGET_KEY,
-  AUDIO_BITRATE_KEY,
-  AUDIO_MUTED_KEY,
-  VIDEO_BANDWIDTH_KEY,
-  VIDEO_SPEED_KEY,
-  SURFACE_STREAMING_KEY,
 ]);
 
 // ---------------------------------------------------------------------------
@@ -613,6 +618,19 @@ export function preferredSurfaceStreaming(): boolean {
   const s = readStorage(SURFACE_STREAMING_KEY);
   if (s === "0") return false;
   return true;
+}
+
+/** Zoom bounds, in percent.  Matched by `clampZoom` in the surface view —
+ *  the floor keeps the app's logical size layoutable, the ceiling keeps one
+ *  pane from dictating a scale every co-viewer then has to stream. */
+export const MIN_SURFACE_ZOOM = 25;
+export const MAX_SURFACE_ZOOM = 400;
+
+/** Preferred surface zoom in percent.  Defaults to 100 (DPI only). */
+export function preferredSurfaceZoom(): number {
+  const n = parseInt(readStorage(SURFACE_ZOOM_KEY) ?? "", 10);
+  if (!Number.isFinite(n)) return 100;
+  return Math.min(MAX_SURFACE_ZOOM, Math.max(MIN_SURFACE_ZOOM, n));
 }
 
 /** The narrowest the right dock can be dragged. Wide enough for a card's

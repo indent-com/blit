@@ -50,6 +50,10 @@ export interface LinkHover {
 // the paste-trigger TUIs like Claude Code use to read the clipboard).
 const CTRL_V = 0x16;
 
+/** Screenshots land far below this; anything above it is not something a
+ *  paste should risk the session on. */
+const MAX_CLIPBOARD_BYTES = 8 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -249,6 +253,10 @@ export class BlitTerminalSurface {
   /** When the user last moved the scroll surface themselves, so the render
    *  loop can keep its hands off a gesture that is still in flight. */
   private lastUserScrollAt = 0;
+  /** Rows the server's re-anchor moved scrollOffset by since the last
+   *  syncScrollSurface, so the sync can tell anchor-driven drift (deferrable
+   *  mid-gesture) from an external jump (lands immediately). */
+  private anchorRowsSinceSync = 0;
 
   // --- mutable state ---
   private viewId: string | null = null;
@@ -641,20 +649,70 @@ export class BlitTerminalSurface {
    * session, wrapped in bracketed-paste markers when the terminal is in
    * bracketed-paste mode. Must be invoked from a user gesture for
    * `navigator.clipboard.readText` to succeed in most browsers. Returns
-   * the pasted text, or null when nothing is available.
+   * the pasted text, or null when nothing is available. An image-only
+   * clipboard (e.g. a fresh phone screenshot) is forwarded to the server
+   * clipboard instead, followed by a ^V so the app reads it — the same
+   * convention as the Ctrl+V paste-event path.
    */
   async pasteFromClipboard(): Promise<string | null> {
     if (this._readOnly) return null;
     if (this._sessionId === null || this.status !== "connected") return null;
-    let text: string;
+    let text = "";
     try {
       text = await navigator.clipboard.readText();
     } catch {
-      return null;
+      // readText rejects for image-only clipboards on some browsers; the
+      // image attempt below is the fallback.
     }
-    if (!text) return null;
-    this.pasteText(text);
-    return text;
+    if (text) {
+      this.pasteText(text);
+      return text;
+    }
+    await this.pasteImageFromClipboard();
+    return null;
+  }
+
+  /** Paste an image-only clipboard (e.g. a fresh phone screenshot) by
+   *  pushing it to the server clipboard and triggering the app's read with
+   *  ^V — the same convention as the Ctrl+V paste-event path.  Returns true
+   *  when an image was forwarded. */
+  private async pasteImageFromClipboard(): Promise<boolean> {
+    if (typeof navigator.clipboard.read !== "function") return false;
+    const conn = this._blitConn;
+    const sid = this._sessionId;
+    if (!conn || sid === null) return false;
+    let items: ClipboardItem[];
+    try {
+      items = await navigator.clipboard.read();
+    } catch {
+      return false; // empty clipboard, or read() rejected
+    }
+    // Same preference order as BlitSurfaceCanvas: PNG is what every toolkit
+    // asks for.
+    for (const mime of ["image/png", "image/webp", "image/jpeg"]) {
+      const item = items.find((i) => i.types.includes(mime));
+      if (!item) continue;
+      try {
+        const buf = await (await item.getType(mime)).arrayBuffer();
+        if (buf.byteLength > MAX_CLIPBOARD_BYTES) {
+          console.warn(
+            `blit: clipboard image is ${buf.byteLength} bytes, over the ` +
+              `${MAX_CLIPBOARD_BYTES}-byte paste limit — not pasted`,
+          );
+          return false;
+        }
+        if (this._sessionId !== sid || this.status !== "connected")
+          return false;
+        // Transport messages are ordered, so the clipboard is populated
+        // server-side before the ^V input arrives and the app reads it.
+        conn.sendClipboard(mime, new Uint8Array(buf));
+        this.sendInput(sid, new Uint8Array([CTRL_V]));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
   }
 
   /**
@@ -1275,9 +1333,13 @@ export class BlitTerminalSurface {
         this.selAnchorStart = shiftSelPos(this.selAnchorStart, moved);
         this.selAnchorEnd = shiftSelPos(this.selAnchorEnd, moved);
         this.touchSelAnchor = shiftSelPos(this.touchSelAnchor, moved);
-        // No scrollTop write here: the frame that goes with this offset
-        // deepens the scrollback by the same number of lines, so the
-        // position the render loop computes doesn't move.
+        this.anchorRowsSinceSync += moved;
+        // No scrollTop write here: while the scrollback is still growing,
+        // the frame that goes with this offset deepens it by the same number
+        // of lines, so the position the render loop computes doesn't move.
+        // Once the scrollback is capped it *does* move, and syncScrollSurface
+        // decides from anchorRowsSinceSync whether writing that compensation
+        // is safe (parked view) or would stomp an in-flight gesture.
         this.scheduleRender();
       },
     );
@@ -2617,6 +2679,23 @@ export class BlitTerminalSurface {
     // Compared against what we last wrote rather than read back from the
     // element, for the same reason: a read here is a forced reflow.
     const drift = Math.abs(this.lastScrollTop - targetTop);
+    const anchorPx = Math.abs(this.anchorRowsSinceSync) * cellH;
+    this.anchorRowsSinceSync = 0;
+    if (
+      drift > 0.5 &&
+      drift <= anchorPx + cellH &&
+      performance.now() - this.lastUserScrollAt < SCROLL_SETTLE_MS
+    ) {
+      // Mid-gesture and the disagreement is fully explained by the server's
+      // re-anchoring (plus the usual sub-row snap): once the scrollback is
+      // capped, every tick moves targetTop by whole rows, and writing them
+      // back cancels the browser's momentum animation each time — the
+      // "jumps". Fold the compensation into the bookkeeping instead; the
+      // next genuine scroll event refreshes lastScrollTop from real DOM
+      // geometry and re-derives the offset, so nothing is lost.
+      this.lastScrollTop = targetTop;
+      return;
+    }
     if (drift > 0.5 && !this.gestureOwnsScrollTop(drift, cellH)) {
       this.lastScrollTop = targetTop;
       this.suppressScrollSync = true;

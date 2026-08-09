@@ -434,12 +434,18 @@ struct DownscaleOutput {
 /// The published `PixelData::Bgra(Arc<Vec<u8>>)` is also held by the
 /// server's `last_pixels` (until the next commit for that key replaces
 /// it) and briefly by encoders, so the previous frame's buffer is
-/// usually still shared when the next frame retires.  Two slots cover
-/// that cadence: by frame N the server has dropped frame N-2's buffer,
-/// leaving it solely to the pool.  A slot is only reused when
-/// `Arc::get_mut` proves unique ownership (sole strong ref, no weak
-/// refs) — a buffer anyone else can still read is never overwritten,
-/// it is dropped from the pool and a fresh one allocated instead.
+/// usually still shared when the next frame retires.  The pool keeps a
+/// single slot: a second one only retains a full frame (~9.6 MB at
+/// 2000x1200) against a miss whose cost is one transient allocation.
+/// The output-ring pools still hit — the ring is double-buffered, so
+/// each image's pool is drawn every other frame and its slot has aged
+/// out of `last_pixels` by then; the downscale pools are drawn every
+/// frame and typically miss, paying one mimalloc alloc/free per frame.
+/// A slot is only reused when `Arc::get_mut` proves unique ownership
+/// (sole strong ref, no weak refs) — a buffer anyone else can still
+/// read is never overwritten, it is dropped from the pool and a fresh
+/// one allocated instead.  Correctness therefore never depends on the
+/// pool's depth, only its cost does.
 fn pooled_pixel_buf(slots: &mut Vec<Arc<Vec<u8>>>, size: usize) -> Arc<Vec<u8>> {
     let mut idx = 0;
     while idx < slots.len() {
@@ -462,10 +468,10 @@ fn pooled_pixel_buf(slots: &mut Vec<Arc<Vec<u8>>>, size: usize) -> Arc<Vec<u8>> 
 }
 
 /// Return a published frame buffer to the pool for later reuse,
-/// keeping at most two slots (see [`pooled_pixel_buf`]).
+/// keeping at most one slot (see [`pooled_pixel_buf`]).
 fn pool_pixel_buf(slots: &mut Vec<Arc<Vec<u8>>>, arc: &Arc<Vec<u8>>) {
     slots.push(arc.clone());
-    if slots.len() > 2 {
+    if slots.len() > 1 {
         slots.remove(0);
     }
 }

@@ -155,6 +155,11 @@ pub struct CudaFns {
     pub cuCtxDestroy_v2: unsafe extern "C" fn(ctx: CUcontext) -> CUresult,
     pub cuCtxPushCurrent_v2: unsafe extern "C" fn(ctx: CUcontext) -> CUresult,
     pub cuCtxPopCurrent_v2: unsafe extern "C" fn(pctx: *mut CUcontext) -> CUresult,
+    // Device primary context, retained once per device and shared by every
+    // encoder in the process — see nvenc_encode.rs::primary_ctx.
+    pub cuDevicePrimaryCtxRetain:
+        unsafe extern "C" fn(pctx: *mut CUcontext, dev: CUdevice) -> CUresult,
+    pub cuCtxSetCurrent: unsafe extern "C" fn(ctx: CUcontext) -> CUresult,
     pub cuMemAlloc_v2: unsafe extern "C" fn(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult,
     pub cuMemFree_v2: unsafe extern "C" fn(dptr: CUdeviceptr) -> CUresult,
     pub cuMemcpyHtoD_v2:
@@ -226,6 +231,8 @@ impl CudaFns {
                 cuCtxDestroy_v2: lib.sym("cuCtxDestroy_v2")?,
                 cuCtxPushCurrent_v2: lib.sym("cuCtxPushCurrent_v2")?,
                 cuCtxPopCurrent_v2: lib.sym("cuCtxPopCurrent_v2")?,
+                cuDevicePrimaryCtxRetain: lib.sym("cuDevicePrimaryCtxRetain")?,
+                cuCtxSetCurrent: lib.sym("cuCtxSetCurrent")?,
                 cuMemAlloc_v2: lib.sym("cuMemAlloc_v2")?,
                 cuMemFree_v2: lib.sym("cuMemFree_v2")?,
                 cuMemcpyHtoD_v2: lib.sym("cuMemcpyHtoD_v2")?,

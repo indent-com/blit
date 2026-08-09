@@ -1,6 +1,7 @@
 import { createSignal, Show, For, type JSX } from "solid-js";
 import type { TerminalPalette } from "@blit-sh/core";
 import { themeFor, ui, uiScale } from "./theme";
+import { MAX_SURFACE_ZOOM, MIN_SURFACE_ZOOM } from "./storage";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 
 const AUDIO_PRESETS: { label: string; kbps: number }[] = [
@@ -29,6 +30,9 @@ const SPEED_PRESETS: { label: string; value: number }[] = [
   { label: "Realtime", value: 4 },
 ];
 
+/** Zoom factors in percent, applied on top of the display's DPI. */
+const ZOOM_PRESETS = [50, 75, 100, 125, 150, 200];
+
 /** Default slider positions when switching to custom for the first time. */
 const CUSTOM_DEFAULT_QUANTIZER = 80;
 const CUSTOM_DEFAULT_SPEED = 128;
@@ -43,10 +47,13 @@ export function MediaOverlay(props: {
   audioMuted: boolean;
   audioAvailable: boolean;
   surfaceStreaming: boolean;
+  /** Surface zoom in percent (100 = the display's DPI alone). */
+  surfaceZoom: number;
   onAudioBitrateChange: (kbps: number) => void;
   onVideoBandwidthChange: (bandwidth: number) => void;
   onVideoSpeedChange: (speed: number) => void;
   onSurfaceStreamingChange: (enabled: boolean) => void;
+  onSurfaceZoomChange: (percent: number) => void;
   onToggleAudio: () => void;
   onClose: () => void;
 }) {
@@ -76,6 +83,13 @@ export function MediaOverlay(props: {
   const [speedSlider, setSpeedSlider] = createSignal(
     isCustomSpeed() ? props.videoSpeed : CUSTOM_DEFAULT_SPEED,
   );
+
+  // ---- Zoom custom state ----
+  // Unlike the wire settings there is no reserved range here — any percent
+  // off the preset list is a custom one, so the slider opens on it.
+  const initCustomZoom = !ZOOM_PRESETS.includes(props.surfaceZoom);
+  const [customZoom, setCustomZoom] = createSignal(initCustomZoom);
+  const [zoomSlider, setZoomSlider] = createSignal(props.surfaceZoom);
 
   // ---- Shared styles ----
   const cardStyle = (): JSX.CSSProperties => ({
@@ -166,6 +180,29 @@ export function MediaOverlay(props: {
     const v = parseInt((e.target as HTMLInputElement).value, 10);
     setSpeedSlider(v);
     props.onVideoSpeedChange(v);
+  };
+
+  /** What the surface will actually be composited at.  The compositor will
+   *  not go below 1x (it derives the window's logical size with
+   *  `max(scale, 120)`), so on a 1x display zooming out has nothing to give
+   *  back — showing the result keeps that from being a silent no-op. */
+  const effectiveScale = (): number => {
+    const dpr =
+      typeof devicePixelRatio === "number" && devicePixelRatio > 0
+        ? devicePixelRatio
+        : 1;
+    return Math.max(1, (dpr * props.surfaceZoom) / 100);
+  };
+
+  const activateCustomZoom = () => {
+    setCustomZoom(true);
+    setZoomSlider(props.surfaceZoom);
+  };
+
+  const handleZoomSlider = (e: Event) => {
+    const v = parseInt((e.target as HTMLInputElement).value, 10);
+    setZoomSlider(v);
+    props.onSurfaceZoomChange(v);
   };
 
   // The server treats the setting as a ceiling and spends less when the
@@ -406,6 +443,88 @@ export function MediaOverlay(props: {
                     </span>
                   </div>
                 </Show>
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  "flex-direction": "column",
+                  gap: `${scale().tightGap}px`,
+                }}
+              >
+                <span style={labelStyle()}>Zoom</span>
+                <div
+                  style={{
+                    display: "flex",
+                    "flex-wrap": "wrap",
+                    gap: `${scale().tightGap}px`,
+                  }}
+                >
+                  <For each={ZOOM_PRESETS}>
+                    {(preset) => (
+                      <button
+                        onClick={() => {
+                          setCustomZoom(false);
+                          props.onSurfaceZoomChange(preset);
+                        }}
+                        style={chipStyle(
+                          props.surfaceZoom === preset && !customZoom(),
+                        )}
+                      >
+                        {preset}%
+                      </button>
+                    )}
+                  </For>
+                  <button
+                    onClick={activateCustomZoom}
+                    style={chipStyle(customZoom())}
+                  >
+                    Custom
+                  </button>
+                </div>
+                <Show when={customZoom()}>
+                  <div
+                    style={{
+                      display: "flex",
+                      "flex-direction": "column",
+                      gap: `${scale().tightGap}px`,
+                    }}
+                  >
+                    <div style={sliderRowStyle()}>
+                      <span
+                        style={{
+                          ...sliderLabelStyle(),
+                          "min-width": "3em",
+                          "text-align": "right",
+                        }}
+                      >
+                        {MIN_SURFACE_ZOOM}%
+                      </span>
+                      <input
+                        type="range"
+                        min={MIN_SURFACE_ZOOM}
+                        max={MAX_SURFACE_ZOOM}
+                        step="5"
+                        value={zoomSlider()}
+                        onInput={handleZoomSlider}
+                        style={sliderStyle()}
+                      />
+                      <span
+                        style={{ ...sliderLabelStyle(), "min-width": "4.5em" }}
+                      >
+                        {MAX_SURFACE_ZOOM}%
+                      </span>
+                    </div>
+                    <span style={sliderHintStyle()}>{zoomSlider()}%</span>
+                  </div>
+                </Show>
+                <span style={sliderHintStyle()}>
+                  On top of this display's DPI: surfaces render at{" "}
+                  {effectiveScale()
+                    .toFixed(2)
+                    .replace(/\.?0+$/, "")}
+                  ×, so apps draw larger and fit less in the pane.
+                </span>
               </div>
             </div>
           </div>
