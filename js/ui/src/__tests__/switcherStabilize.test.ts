@@ -1,8 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  stabilizeSections,
-  type KeyedSection,
-} from "../switcherStabilize";
+import { stabilizeSections, type KeyedSection } from "../switcherStabilize";
 
 interface TestItem {
   key: string;
@@ -89,9 +86,7 @@ describe("stabilizeSections", () => {
   });
 
   it("treats differing field counts as different content", () => {
-    const prev: KeyedSection<TestItem>[] = [
-      { title: "s", items: [item("a")] },
-    ];
+    const prev: KeyedSection<TestItem>[] = [{ title: "s", items: [item("a")] }];
     const withExtra = [
       {
         title: "s",

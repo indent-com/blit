@@ -2963,7 +2963,10 @@ fn worktree_watch_follows_ignore_edits() {
             {
                 return;
             }
-            assert!(Instant::now() < deadline, "{label}: watch set never converged");
+            assert!(
+                Instant::now() < deadline,
+                "{label}: watch set never converged"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     };

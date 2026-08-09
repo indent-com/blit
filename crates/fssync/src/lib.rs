@@ -34,8 +34,8 @@ use blit_remote::fs::{
     FS_OP_MKDIR, FS_OP_MKPARENTS, FS_OP_NO_CAS, FS_OP_REMOVE, FS_OP_RENAME, FS_OP_SYMLINK,
     FS_UPDATE_RESET, FS_UPDATE_SYNC, FS_UPLOAD_DURABLE, FS_UPLOAD_FLAGS_KNOWN,
     FS_UPLOAD_FOLLOW_SYMLINK, FS_UPLOAD_MKPARENTS, FS_UPLOAD_NO_CAS, FS_WRITE_DURABLE,
-    FS_WRITE_FOLLOW_SYMLINK, FS_WRITE_MKPARENTS, FS_WRITE_NO_CAS, FsContent,
-    FsRecord, append_fs_record, msg_fs_closed, msg_fs_done, msg_fs_file, msg_fs_update,
+    FS_WRITE_FOLLOW_SYMLINK, FS_WRITE_MKPARENTS, FS_WRITE_NO_CAS, FsContent, FsRecord,
+    append_fs_record, msg_fs_closed, msg_fs_done, msg_fs_file, msg_fs_update,
     msg_fs_upload_begin_result, msg_fs_upload_chunk_result, msg_fs_upload_finish_result,
 };
 
@@ -212,12 +212,19 @@ impl Drop for Upload {
 #[derive(Clone, Debug)]
 pub enum Command {
     Ack(u32),
-    Fetch { nonce: u16, path: String },
+    Fetch {
+        nonce: u16,
+        path: String,
+    },
     Write(WriteReq),
     Op(OpReq),
     UploadBegin(UploadBeginReq),
     /// Append one chunk to a live upload; `data` is the plaintext chunk.
-    UploadChunk { upload_id: u16, offset: u64, data: Vec<u8> },
+    UploadChunk {
+        upload_id: u16,
+        offset: u64,
+        data: Vec<u8>,
+    },
     /// Land (or refuse) the upload; terminates it either way.
     UploadFinish {
         nonce: u16,
@@ -225,7 +232,9 @@ pub enum Command {
         inflight: Option<Arc<InflightGuard>>,
     },
     /// Abort the upload and remove its temp file. No reply.
-    UploadCancel { upload_id: u16 },
+    UploadCancel {
+        upload_id: u16,
+    },
     Stop,
 }
 
@@ -3968,7 +3977,11 @@ impl SyncEngine {
     fn handle_upload_begin(&mut self, b: UploadBeginReq) -> bool {
         let (status, hash) = self.exec_upload_begin(&b);
         (self.outbox)(msg_fs_upload_begin_result(
-            b.nonce, status, b.upload_id, hash, 0,
+            b.nonce,
+            status,
+            b.upload_id,
+            hash,
+            0,
         ))
     }
 
@@ -4130,7 +4143,9 @@ impl SyncEngine {
         // rename below cannot fail on an entry an external creator lands in
         // this window — the path lock only serializes blit writers.
         let file = up.file.take().expect("live upload has a file");
-        if up.durable && let Err(e) = file.sync_all() {
+        if up.durable
+            && let Err(e) = file.sync_all()
+        {
             return (write_io_status(&e), 0, 0);
         }
         // Closed before the rename, as write_atomic does (and as Windows
@@ -5864,7 +5879,10 @@ mod tests {
 
         handle.command(upload_begin(1, 0, "big.bin", 0, 0, content.len() as u64));
         let m = await_opcode(&sent, S2C_FS_UPLOAD_BEGIN, 0);
-        assert_eq!(parse_fs_upload_begin_result(&m), Some((1, FS_DONE_OK, 0, 0, 0)));
+        assert_eq!(
+            parse_fs_upload_begin_result(&m),
+            Some((1, FS_DONE_OK, 0, 0, 0))
+        );
 
         let half = content.len() / 2;
         handle.command(upload_chunk(0, 0, &content[..half]));
@@ -6116,7 +6134,11 @@ mod tests {
         while Instant::now() < deadline {
             hint.send(Hint::Dirty(root.clone()));
             pump_mirror(&sent, &handle, &mut mirror, &mut seen);
-            assert!(no_temp(&mirror), "temp file mirrored: {:?}", mirror.live.keys());
+            assert!(
+                no_temp(&mirror),
+                "temp file mirrored: {:?}",
+                mirror.live.keys()
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
 
@@ -6124,9 +6146,14 @@ mod tests {
         await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 1);
         handle.command(upload_finish(2, 0));
         await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_FINISH, 0);
-        pump_until(&sent, &handle, &mut mirror, &mut seen, "uploaded file", |m| {
-            m.live.contains_key("a.txt")
-        });
+        pump_until(
+            &sent,
+            &handle,
+            &mut mirror,
+            &mut seen,
+            "uploaded file",
+            |m| m.live.contains_key("a.txt"),
+        );
         assert!(no_temp(&mirror));
 
         handle.command(Command::Stop);
@@ -6191,16 +6218,10 @@ mod tests {
 
         // Create-exclusive on an existing file: CONFLICT with the live hash.
         handle.command(upload_begin(1, 0, "a.txt", 0, 0, 3));
-        assert_eq!(
-            begin_result(0),
-            Some((1, FS_DONE_CONFLICT, 0, old_hash, 0))
-        );
+        assert_eq!(begin_result(0), Some((1, FS_DONE_CONFLICT, 0, old_hash, 0)));
         // CAS with a stale base: same answer.
         handle.command(upload_begin(2, 0, "a.txt", 0, 0xdead, 3));
-        assert_eq!(
-            begin_result(1),
-            Some((2, FS_DONE_CONFLICT, 0, old_hash, 0))
-        );
+        assert_eq!(begin_result(1), Some((2, FS_DONE_CONFLICT, 0, old_hash, 0)));
         // CAS on a missing target: CONFLICT with the "absent" zero hash,
         // exactly as FS_WRITE (not NOT_FOUND).
         handle.command(upload_begin(3, 0, "gone.txt", 0, 0xdead, 1));

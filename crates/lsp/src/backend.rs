@@ -2243,10 +2243,7 @@ mod tests {
         let old = Instant::now() - Duration::from_secs(3600);
         let live_diags = vec![diag("m0".into()), diag("m1".into())];
         let mut diags: HashMap<PathBuf, FileDiags> = [
-            (
-                PathBuf::from("stale.rs"),
-                entry(1, live_diags.clone(), old),
-            ),
+            (PathBuf::from("stale.rs"), entry(1, live_diags.clone(), old)),
             (
                 PathBuf::from("fresh.rs"),
                 entry(2, vec![diag("m2".into())], Instant::now()),
@@ -2281,10 +2278,12 @@ mod tests {
         // prior entry and replaces it wholesale: a cold entry dedupes
         // as non-empty and the publish lands live.
         let old = Instant::now() - Duration::from_secs(3600);
-        let mut diags: HashMap<PathBuf, FileDiags> =
-            [(PathBuf::from("a.rs"), entry(1, vec![diag("old".into())], old))]
-                .into_iter()
-                .collect();
+        let mut diags: HashMap<PathBuf, FileDiags> = [(
+            PathBuf::from("a.rs"),
+            entry(1, vec![diag("old".into())], old),
+        )]
+        .into_iter()
+        .collect();
         freeze_cold_diags(&mut diags, Duration::from_secs(600));
         let prior = diags[&PathBuf::from("a.rs")].is_empty();
         assert!(!prior, "cold entry must not dedupe as a tombstone");

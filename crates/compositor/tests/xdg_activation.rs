@@ -17,9 +17,7 @@ use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noo
 
 use blit_compositor::{CompositorEvent, CompositorHandle, spawn_compositor};
 
-use wayland_protocols::xdg::activation::v1::client::{
-    xdg_activation_token_v1, xdg_activation_v1,
-};
+use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 #[derive(Default)]
@@ -56,8 +54,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
                     Some(registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 1, qh, ()));
             }
             "xdg_activation_v1" => {
-                state.activation =
-                    Some(registry.bind::<xdg_activation_v1::XdgActivationV1, _, _>(name, 1, qh, ()));
+                state.activation = Some(registry.bind::<xdg_activation_v1::XdgActivationV1, _, _>(
+                    name,
+                    1,
+                    qh,
+                    (),
+                ));
             }
             _ => {}
         }

@@ -3734,7 +3734,10 @@ function WorkspaceScreen(props: {
                                         sessionId={fid()}
                                         readOnly={isSessionReadOnly(fid())}
                                         onRender={countFrame}
-                                        style={{ width: "100%", height: "100%" }}
+                                        style={{
+                                          width: "100%",
+                                          height: "100%",
+                                        }}
                                         fontFamily={resolvedFontWithFallback()}
                                         fontSize={fontSize()}
                                         palette={palette()}

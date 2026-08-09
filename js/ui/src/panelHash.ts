@@ -19,7 +19,10 @@ export interface PanelsState {
 }
 
 /** Format the `d=` value: comma list of open panels. */
-export function formatPanelsHash(leftOpen: boolean, previewOpen: boolean): string {
+export function formatPanelsHash(
+  leftOpen: boolean,
+  previewOpen: boolean,
+): string {
   const open: string[] = [];
   if (leftOpen) open.push("l");
   if (previewOpen) open.push("r");

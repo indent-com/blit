@@ -1855,7 +1855,9 @@ describe("BlitSurfaceCanvas drag-and-drop", () => {
     });
     fireDrag("drop", {
       types: ["Files"],
-      files: [new File([new Uint8Array([1])], "shot.png", { type: "image/png" })],
+      files: [
+        new File([new Uint8Array([1])], "shot.png", { type: "image/png" }),
+      ],
     });
     await settle();
 

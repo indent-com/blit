@@ -994,8 +994,10 @@ const ja: Messages = {
   "terminalDrop.hoverCwd": "ドロップで {cwd} にアップロード",
   "terminalDrop.uploading": "{name} をアップロード中 — {pct}%",
   "terminalDrop.failed": "アップロードに失敗しました",
-  "terminalDrop.unsupported": "このサーバーはファイルのアップロードに対応していません",
-  "terminalDrop.noDirs": "フォルダはアップロードできません — ファイルをドロップしてください",
+  "terminalDrop.unsupported":
+    "このサーバーはファイルのアップロードに対応していません",
+  "terminalDrop.noDirs":
+    "フォルダはアップロードできません — ファイルをドロップしてください",
 
   "bsp.tab": "タブ {index}",
   "bsp.exited": "終了",

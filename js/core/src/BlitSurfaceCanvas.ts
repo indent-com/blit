@@ -467,10 +467,7 @@ function detectMacOptionChars(): boolean {
  * canvas boundary while a remote app is drawing its own drag icon; routing
  * the window event by hit-test keeps the compositor's drag over the surface
  * actually under the pointer. */
-const mountedSurfaceCanvases = new Map<
-  HTMLCanvasElement,
-  BlitSurfaceCanvas
->();
+const mountedSurfaceCanvases = new Map<HTMLCanvasElement, BlitSurfaceCanvas>();
 const routedGrabMouseEvents = new WeakSet<Event>();
 let activeSurfaceMouseGrab: {
   owner: BlitSurfaceCanvas;
@@ -1892,11 +1889,7 @@ export class BlitSurfaceCanvas {
     const hitTest = doc.elementsFromPoint?.bind(doc);
     const hits = hitTest ? hitTest(e.clientX, e.clientY) : [];
     const elements =
-      hits.length > 0
-        ? hits
-        : e.target instanceof Element
-          ? [e.target]
-          : [];
+      hits.length > 0 ? hits : e.target instanceof Element ? [e.target] : [];
     const connection = this.getConn();
     for (const element of elements) {
       let node: Element | null = element;
@@ -2521,9 +2514,8 @@ export class BlitSurfaceCanvas {
     if (!point) return;
     this.dragActive = true;
     const itemMimes = dragFileItemMimes(e.dataTransfer);
-    this.dragPlannedNames = itemMimes?.map((mime, index) =>
-      plannedDropName(mime, index),
-    ) ?? null;
+    this.dragPlannedNames =
+      itemMimes?.map((mime, index) => plannedDropName(mime, index)) ?? null;
     // The file items' MIMEs ride along so the server can pre-create the
     // planned staging files and serve their text/uri-list during hover:
     // Chromium fetches the offer's data at wl_data_device.enter and only

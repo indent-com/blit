@@ -1,6 +1,6 @@
 [package]
 name = "blit-git"
-version = "0.45.4"
+version = "0.46.0"
 edition.workspace = true
 description = "Git introspection engine: repo state streaming, object reads, diffs and patches"
 license.workspace = true

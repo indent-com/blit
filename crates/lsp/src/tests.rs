@@ -706,7 +706,10 @@ fn frozen_diag_entry_replays_and_republishes() {
     let mut mirror = LspDiagMirror::new();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        assert!(Instant::now() < deadline, "no FULL replay of the frozen entry");
+        assert!(
+            Instant::now() < deadline,
+            "no FULL replay of the frozen entry"
+        );
         let msg = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         if msg.first() != Some(&S2C_LSP_DIAG) {
             continue;

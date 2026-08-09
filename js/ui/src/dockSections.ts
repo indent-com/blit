@@ -17,7 +17,6 @@ export type LeftPanel = "explorer" | "log" | "problems";
  *  component file. */
 export const LEFT_PANELS: LeftPanel[] = ["explorer", "log", "problems"];
 
-
 /**
  * The set LeftDock renders as collapsed: everything the user collapsed, plus
  * the inapplicable sections they have not overridden.

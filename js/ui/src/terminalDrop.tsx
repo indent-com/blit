@@ -283,7 +283,9 @@ export function TerminalDropTarget(props: {
 
   const hoverLabel = (): string => {
     const root = handles.get(props.sessionId)?.root;
-    return root ? tp("terminalDrop.hoverCwd", { cwd: root }) : t("terminalDrop.hover");
+    return root
+      ? tp("terminalDrop.hoverCwd", { cwd: root })
+      : t("terminalDrop.hover");
   };
 
   return (

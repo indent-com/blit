@@ -636,9 +636,8 @@ fn primary_ctx(
 ) -> Result<gpu_libs::CUcontext, String> {
     // `CUcontext` is a raw pointer and not `Send`; the map stores it as
     // `usize`.  It is a process-wide driver handle, valid on any thread.
-    static PRIMARY_CTXS: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<gpu_libs::CUdevice, usize>>,
-    > = std::sync::OnceLock::new();
+    static PRIMARY_CTXS: std::sync::OnceLock<std::sync::Mutex<HashMap<gpu_libs::CUdevice, usize>>> =
+        std::sync::OnceLock::new();
     let map = PRIMARY_CTXS.get_or_init(Default::default);
     let mut map = map
         .lock()
@@ -649,7 +648,9 @@ fn primary_ctx(
     let mut ctx: gpu_libs::CUcontext = ptr::null_mut();
     let status = unsafe { (cuda.cuDevicePrimaryCtxRetain)(&mut ctx, device) };
     if status != 0 {
-        return Err(format!("cuDevicePrimaryCtxRetain({device}) failed: {status}"));
+        return Err(format!(
+            "cuDevicePrimaryCtxRetain({device}) failed: {status}"
+        ));
     }
     map.insert(device, ctx as usize);
     Ok(ctx)

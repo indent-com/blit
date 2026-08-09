@@ -289,8 +289,7 @@ describe("BlitTerminalSurface mobile copy/paste API", () => {
   function imageClipboardItem(bytes: Uint8Array): ClipboardItem {
     return {
       types: ["image/png"],
-      getType: () =>
-        Promise.resolve(new Blob([bytes], { type: "image/png" })),
+      getType: () => Promise.resolve(new Blob([bytes], { type: "image/png" })),
     } as unknown as ClipboardItem;
   }
 

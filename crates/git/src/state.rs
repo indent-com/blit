@@ -13,8 +13,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -2465,7 +2465,9 @@ mod tests {
         assert!(overflow.load(Ordering::Relaxed));
         // The queue holds exactly the event and one rescan — the dropped
         // event and the second loss signal added nothing.
-        assert!(matches!(rx.try_recv(), Ok(EngineMsg::Event { paths }) if paths == [PathBuf::from("/a")]));
+        assert!(
+            matches!(rx.try_recv(), Ok(EngineMsg::Event { paths }) if paths == [PathBuf::from("/a")])
+        );
         assert!(matches!(rx.try_recv(), Ok(EngineMsg::Event { paths }) if paths.is_empty()));
         assert!(rx.try_recv().is_err(), "no second rescan was queued");
     }

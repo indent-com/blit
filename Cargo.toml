@@ -28,20 +28,20 @@ repository = "https://github.com/indent-com/blit"
 homepage = "https://blit.sh"
 
 [workspace.dependencies]
-blit-remote = { version = "0.45.4", path = "crates/remote" }
-blit-fssync = { version = "0.45.4", path = "crates/fssync" }
-blit-git = { version = "0.45.4", path = "crates/git" }
-blit-lsp = { version = "0.45.4", path = "crates/lsp" }
-blit-alacritty = { version = "0.45.4", path = "crates/alacritty-driver" }
-blit-fonts = { version = "0.45.4", path = "crates/fonts" }
-blit-webserver = { version = "0.45.4", path = "crates/webserver" }
-blit-server = { version = "0.45.4", path = "crates/server", default-features = false }
-blit-gateway = { version = "0.45.4", path = "crates/gateway" }
-blit-proxy = { version = "0.45.4", path = "crates/proxy" }
-blit-webrtc-forwarder = { version = "0.45.4", path = "crates/webrtc-forwarder" }
-blit-compositor = { version = "0.45.4", path = "crates/compositor" }
-blit-sd-notify = { version = "0.45.4", path = "crates/sd-notify" }
-blit-ssh = { version = "0.45.4", path = "crates/ssh" }
+blit-remote = { version = "0.46.0", path = "crates/remote" }
+blit-fssync = { version = "0.46.0", path = "crates/fssync" }
+blit-git = { version = "0.46.0", path = "crates/git" }
+blit-lsp = { version = "0.46.0", path = "crates/lsp" }
+blit-alacritty = { version = "0.46.0", path = "crates/alacritty-driver" }
+blit-fonts = { version = "0.46.0", path = "crates/fonts" }
+blit-webserver = { version = "0.46.0", path = "crates/webserver" }
+blit-server = { version = "0.46.0", path = "crates/server", default-features = false }
+blit-gateway = { version = "0.46.0", path = "crates/gateway" }
+blit-proxy = { version = "0.46.0", path = "crates/proxy" }
+blit-webrtc-forwarder = { version = "0.46.0", path = "crates/webrtc-forwarder" }
+blit-compositor = { version = "0.46.0", path = "crates/compositor" }
+blit-sd-notify = { version = "0.46.0", path = "crates/sd-notify" }
+blit-ssh = { version = "0.46.0", path = "crates/ssh" }
 
 [profile.release]
 opt-level = 3

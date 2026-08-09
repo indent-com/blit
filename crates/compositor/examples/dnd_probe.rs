@@ -233,12 +233,10 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for App {
                     log!("DND-DROP with no live offer");
                 }
             }
-            wl_data_device::Event::Selection { id } => {
-                match id {
-                    Some(offer) => log!("SELECTION offer={}", offer_key(&offer)),
-                    None => log!("SELECTION none"),
-                }
-            }
+            wl_data_device::Event::Selection { id } => match id {
+                Some(offer) => log!("SELECTION offer={}", offer_key(&offer)),
+                None => log!("SELECTION none"),
+            },
             _ => {}
         }
     }

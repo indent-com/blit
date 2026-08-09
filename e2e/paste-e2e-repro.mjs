@@ -100,7 +100,9 @@ page.on("websocket", (ws) => {
       const mimeLen = b.readUInt16LE(1);
       const mime = b.subarray(3, 3 + mimeLen).toString();
       const dataLen = b.readUInt32LE(3 + mimeLen);
-      const text = b.subarray(7 + mimeLen, 7 + mimeLen + Math.min(dataLen, 64)).toString();
+      const text = b
+        .subarray(7 + mimeLen, 7 + mimeLen + Math.min(dataLen, 64))
+        .toString();
       wsLog.push(
         `[ws] recv 0x25 CLIPBOARD_CONTENT mime=${mime} dataLen=${dataLen} [${text}]`,
       );
@@ -139,14 +141,23 @@ await context.addInitScript(() => {
           const surfaceId = dv.getUint16(1, true);
           const keys = [];
           for (let off = 3; off + 5 <= u8.length; off += 5)
-            keys.push(`evdev=${dv.getUint32(off, true)}:${u8[off + 4] ? "down" : "up"}`);
-          window.__wsSent.push(`0x20 SURFACE_INPUT surface=${surfaceId} ${keys.join(",")}`);
+            keys.push(
+              `evdev=${dv.getUint32(off, true)}:${u8[off + 4] ? "down" : "up"}`,
+            );
+          window.__wsSent.push(
+            `0x20 SURFACE_INPUT surface=${surfaceId} ${keys.join(",")}`,
+          );
         } else if (op === 0x24) {
-          window.__wsSent.push(`0x24 SURFACE_FOCUS surface=${dv.getUint16(1, true)}`);
+          window.__wsSent.push(
+            `0x24 SURFACE_FOCUS surface=${dv.getUint16(1, true)}`,
+          );
         }
       };
       if (data instanceof ArrayBuffer) note(data);
-      else if (ArrayBuffer.isView(data)) note(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+      else if (ArrayBuffer.isView(data))
+        note(
+          data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
+        );
       else if (data instanceof Blob) data.arrayBuffer().then(note);
     } catch {}
     return origSend.call(this, data);
@@ -164,7 +175,8 @@ await context.addInitScript(() => {
     (e) => {
       const items = [];
       if (e.clipboardData)
-        for (const it of e.clipboardData.items) items.push(it.kind + ":" + it.type);
+        for (const it of e.clipboardData.items)
+          items.push(it.kind + ":" + it.type);
       window.__evts.push(
         `paste target=${e.target?.tagName}/${e.target?.getAttribute?.("aria-label") ?? ""} items=[${items.join(",")}] text=${JSON.stringify(e.clipboardData?.getData("text/plain") ?? "")}`,
       );
@@ -184,88 +196,97 @@ const drainPage = async (label) => {
 };
 
 try {
-await page.goto(`${BASE}/#psk=test-secret`);
-// Wait for the workspace: the probe's surface should show up as a pane with
-// a "Surface input" textarea.
-await waitFor(
-  () => wsLog.length > 0,
-  10000,
-  "websocket open",
-);
-const surfaceInput = page.locator('textarea[aria-label="Surface input"]');
-await surfaceInput.waitFor({ state: "attached", timeout: 15000 });
-wsLog.push("[ui] surface pane present");
-await page.waitForTimeout(2000); // let frames flow so _displaySize is set
+  await page.goto(`${BASE}/#psk=test-secret`);
+  // Wait for the workspace: the probe's surface should show up as a pane with
+  // a "Surface input" textarea.
+  await waitFor(() => wsLog.length > 0, 10000, "websocket open");
+  const surfaceInput = page.locator('textarea[aria-label="Surface input"]');
+  await surfaceInput.waitFor({ state: "attached", timeout: 15000 });
+  wsLog.push("[ui] surface pane present");
+  await page.waitForTimeout(2000); // let frames flow so _displaySize is set
 
-// Click the canvas in the same pane as the surface textarea.
-const clickPoint = await surfaceInput.evaluate((el) => {
-  let node = el.parentElement;
-  let canvas = null;
-  while (node && !canvas) {
-    canvas = node.querySelector("canvas");
-    node = node.parentElement;
-  }
-  if (!canvas) return null;
-  const r = canvas.getBoundingClientRect();
-  return { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height };
-});
-wsLog.push(`[ui] canvas rect: ${JSON.stringify(clickPoint)}`);
-if (clickPoint) await page.mouse.click(clickPoint.x, clickPoint.y);
-wsLog.push("[ui] clicked surface canvas");
+  // Click the canvas in the same pane as the surface textarea.
+  const clickPoint = await surfaceInput.evaluate((el) => {
+    let node = el.parentElement;
+    let canvas = null;
+    while (node && !canvas) {
+      canvas = node.querySelector("canvas");
+      node = node.parentElement;
+    }
+    if (!canvas) return null;
+    const r = canvas.getBoundingClientRect();
+    return {
+      x: r.x + r.width / 2,
+      y: r.y + r.height / 2,
+      w: r.width,
+      h: r.height,
+    };
+  });
+  wsLog.push(`[ui] canvas rect: ${JSON.stringify(clickPoint)}`);
+  if (clickPoint) await page.mouse.click(clickPoint.x, clickPoint.y);
+  wsLog.push("[ui] clicked surface canvas");
 
-await waitFor(
-  () => probeStdout.includes("KBD-ENTER"),
-  8000,
-  "probe KBD-ENTER (surface focused)",
-).catch(async (e) => {
-  wsLog.push(`[warn] ${e.message}`);
+  await waitFor(
+    () => probeStdout.includes("KBD-ENTER"),
+    8000,
+    "probe KBD-ENTER (surface focused)",
+  ).catch(async (e) => {
+    wsLog.push(`[warn] ${e.message}`);
+    wsLog.push(
+      `[warn] activeElement=${await page.evaluate(() => document.activeElement?.outerHTML?.slice(0, 200))}`,
+    );
+  });
+  await drainPage("after-focus");
+
+  // --- Test 1: image paste ---
+  wsLog.push("=== TEST 1: image/png paste ===");
+  await page.evaluate(async () => {
+    const c = document.createElement("canvas");
+    c.width = 8;
+    c.height = 8;
+    const g = c.getContext("2d");
+    g.fillStyle = "#f00";
+    g.fillRect(0, 0, 8, 8);
+    const blob = await new Promise((r) => c.toBlob(r, "image/png"));
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+  });
+  wsLog.push("[ui] clipboard now holds image/png");
+  const t1Mark = clientLog.length;
+  await page.keyboard.press("Control+V");
+  await page.waitForTimeout(2500);
+  await drainPage("test1");
   wsLog.push(
-    `[warn] activeElement=${await page.evaluate(() => document.activeElement?.outerHTML?.slice(0, 200))}`,
+    `[test1] client log after Ctrl+V:\n${clientLog.slice(t1Mark).join("\n")}`,
   );
-});
-await drainPage("after-focus");
 
-// --- Test 1: image paste ---
-wsLog.push("=== TEST 1: image/png paste ===");
-await page.evaluate(async () => {
-  const c = document.createElement("canvas");
-  c.width = 8;
-  c.height = 8;
-  const g = c.getContext("2d");
-  g.fillStyle = "#f00";
-  g.fillRect(0, 0, 8, 8);
-  const blob = await new Promise((r) => c.toBlob(r, "image/png"));
-  await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
-});
-wsLog.push("[ui] clipboard now holds image/png");
-const t1Mark = clientLog.length;
-await page.keyboard.press("Control+V");
-await page.waitForTimeout(2500);
-await drainPage("test1");
-wsLog.push(`[test1] client log after Ctrl+V:\n${clientLog.slice(t1Mark).join("\n")}`);
+  // --- Test 2: text paste freshness ---
+  wsLog.push("=== TEST 2: text paste freshness ===");
+  await page.evaluate(() =>
+    navigator.clipboard.writeText("MARKER-FROM-BROWSER"),
+  );
+  const t2Mark = clientLog.length;
+  await page.keyboard.press("Control+V");
+  await page.waitForTimeout(2500);
+  await drainPage("test2");
+  wsLog.push(
+    `[test2] client log after Ctrl+V:\n${clientLog.slice(t2Mark).join("\n")}`,
+  );
 
-// --- Test 2: text paste freshness ---
-wsLog.push("=== TEST 2: text paste freshness ===");
-await page.evaluate(() => navigator.clipboard.writeText("MARKER-FROM-BROWSER"));
-const t2Mark = clientLog.length;
-await page.keyboard.press("Control+V");
-await page.waitForTimeout(2500);
-await drainPage("test2");
-wsLog.push(`[test2] client log after Ctrl+V:\n${clientLog.slice(t2Mark).join("\n")}`);
+  // --- Test 3: copy-out (wayland client -> browser clipboard) ---
+  wsLog.push("=== TEST 3: copy-out ===");
+  probe.stdin.write("copy\n");
+  await page.waitForTimeout(2500);
+  let browserClip = "<readText failed>";
+  try {
+    browserClip = await page.evaluate(() => navigator.clipboard.readText());
+  } catch (e) {
+    browserClip = `<readText threw: ${e}>`;
+  }
+  wsLog.push(
+    `[test3] browser clipboard readText() = ${JSON.stringify(browserClip)}`,
+  );
 
-// --- Test 3: copy-out (wayland client -> browser clipboard) ---
-wsLog.push("=== TEST 3: copy-out ===");
-probe.stdin.write("copy\n");
-await page.waitForTimeout(2500);
-let browserClip = "<readText failed>";
-try {
-  browserClip = await page.evaluate(() => navigator.clipboard.readText());
-} catch (e) {
-  browserClip = `<readText threw: ${e}>`;
-}
-wsLog.push(`[test3] browser clipboard readText() = ${JSON.stringify(browserClip)}`);
-
-// --- summary ---
+  // --- summary ---
 } catch (e) {
   wsLog.push(`[fatal] ${e}`);
   try {

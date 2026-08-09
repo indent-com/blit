@@ -248,6 +248,26 @@ mod stub {
             mime_type: String,
             data: Vec<u8>,
         },
+        DragEnter {
+            surface_id: u16,
+            x: f64,
+            y: f64,
+            mimes: Vec<String>,
+            planned_uri_list: Option<Vec<u8>>,
+        },
+        DragMotion {
+            surface_id: u16,
+            x: f64,
+            y: f64,
+        },
+        DragLeave,
+        DragDrop {
+            surface_id: u16,
+            x: f64,
+            y: f64,
+            offers: Vec<(String, Vec<u8>)>,
+        },
+        DragCancel,
         /// Take ownership of the primary selection on the browser's behalf.
         ///
         /// Unlike the clipboard, whose contents the compositor can fetch

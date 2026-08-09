@@ -217,23 +217,21 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for App {
             wl_data_device::Event::Leave => log!("DND-LEAVE"),
             wl_data_device::Event::Motion { .. } => {}
             wl_data_device::Event::Drop => log!("DND-DROP"),
-            wl_data_device::Event::Selection { id } => {
-                match id {
-                    Some(offer) => {
-                        let key = format!("{:?}", offer.id());
-                        let mimes = state
-                            .offers
-                            .get(&key)
-                            .map(|(_, m)| m.clone())
-                            .unwrap_or_default();
-                        log!("SELECTION offer={key} mimes={mimes:?}");
-                        for mime in mimes {
-                            receive_and_log(&offer, conn, &mime);
-                        }
+            wl_data_device::Event::Selection { id } => match id {
+                Some(offer) => {
+                    let key = format!("{:?}", offer.id());
+                    let mimes = state
+                        .offers
+                        .get(&key)
+                        .map(|(_, m)| m.clone())
+                        .unwrap_or_default();
+                    log!("SELECTION offer={key} mimes={mimes:?}");
+                    for mime in mimes {
+                        receive_and_log(&offer, conn, &mime);
                     }
-                    None => log!("SELECTION none"),
                 }
-            }
+                None => log!("SELECTION none"),
+            },
             _ => {}
         }
     }
@@ -398,9 +396,7 @@ fn main() {
     const W: i32 = 200;
     const H: i32 = 200;
     let size = (W * H * 4) as usize;
-    let fd = unsafe {
-        libc::memfd_create(c"paste-probe".as_ptr(), 0)
-    };
+    let fd = unsafe { libc::memfd_create(c"paste-probe".as_ptr(), 0) };
     assert!(fd >= 0, "memfd_create failed");
     assert_eq!(unsafe { libc::ftruncate(fd, size as libc::off_t) }, 0);
     let pixels = vec![0xFFu8; size];
@@ -486,9 +482,7 @@ fn main() {
                 }
                 if pfds[1].revents & libc::POLLIN != 0 {
                     let mut buf = [0u8; 64];
-                    unsafe {
-                        libc::read(pipe_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                    };
+                    unsafe { libc::read(pipe_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
                 }
             }
             None => {}
