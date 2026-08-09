@@ -74,7 +74,12 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 | `0x32` | `SURFACE_POINTER_AXIS2` | `[surface_id:2][flags:1][dx_x100:4][dy_x100:4][v120_x:2][v120_y:2]` — see [Scroll](#scroll)                                                                          |
 | `0x33` | `PRIMARY_SET`           | `[mime_len:2][mime:N][data_len:4][data:M]` — take PRIMARY, see [Primary selection](#primary-selection)                                                               |
 | `0x34` | `SURFACE_PREEDIT`       | `[surface_id:2][cursor:2][text:N]` — composition in progress (UTF-8); `cursor` is a byte offset, empty text withdraws it                                             |
-| `0x40` | `FS_SYNC`               | `[nonce:2][flags:2][latency_ms:2][inline_max:4][path_len:2][path:N]` + `[exclude_len:2][exclude:M]` if `EXCLUDE` + `[src_pty_id:2]` if `FROM_PTY`                    |
+| `0x35` | `SURFACE_DRAG_ENTER`    | `[surface_id:2][x:2][y:2][mime_count:2][mime entries][optional item trailer]` — begin/retarget a drag; each entry is `[mime_len:2][mime:N]`; the append-only trailer is `[item_count:2][item MIME entries]`, see [Drag and drop](#drag-and-drop) |
+| `0x36` | `SURFACE_DRAG_MOTION`   | `[surface_id:2][x:2][y:2]` — move the drag                                                                                                                         |
+| `0x37` | `SURFACE_DRAG_LEAVE`    | `[surface_id:2]` — the drag left the surface                                                                                                                       |
+| `0x38` | `SURFACE_DRAG_DROP`     | `[surface_id:2][x:2][y:2][item_count:2][items]` — complete the drop; item is `[mime_len:2][mime][name_len:2][name][data_len:4][data]`, see [Drag and drop](#drag-and-drop) |
+| `0x39` | `SURFACE_DRAG_CANCEL`   | _(empty)_ — abort the drag (Escape / drag left the window)                                                                                                         |
+| `0x40` | `FS_SYNC`               | `[nonce:2][flags:2][latency_ms:2][inline_max:4][path_len:2][path:N]` + `[exclude_len:2][exclude:M]` if `EXCLUDE` + `[src_pty_id:2]` if `FROM_PTY`; `STAGING` roots the sync at the drag staging dir, see [Drag and drop](#drag-and-drop) |
 | `0x41` | `FS_STOP`               | `[sync_id:2]`                                                                                                                                                        |
 | `0x42` | `FS_ACK`                | `[sync_id:2][update_id:4]` — cumulative                                                                                                                              |
 | `0x43` | `FS_FETCH`              | `[nonce:2][sync_id:2][path_len:2][path:N]`                                                                                                                           |
@@ -82,6 +87,10 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 | `0x45` | `FS_OP`                 | `[nonce:2][sync_id:2][op:1][flags:1][base:16][mode:4][a_len:2][a:N][b_len:2][b:N]` — mkdir/remove/rename/symlink/hardlink ([design/fs-write.md](design/fs-write.md)) |
 | `0x46` | `FS_SEARCH`             | `[nonce:2][limit:2][root_len:2][root:N][query_len:2][query:M]` — server-side fuzzy file search ([design/fs-search.md](design/fs-search.md))                          |
 | `0x47` | `FS_INDEX`              | `[nonce:2][flags:1][root_len:2][root:N]` — candidate list for client-side search ([design/fs-search.md](design/fs-search.md))                                        |
+| `0x49` | `FS_UPLOAD_BEGIN`       | `[nonce:2][sync_id:2][flags:1][base:16][mode:4][size:8][path_len:2][path:N]` — begin a chunked upload; `base` is the `FS_WRITE` CAS precondition |
+| `0x4A` | `FS_UPLOAD_CHUNK`       | `[upload_id:2][offset:8][data:LZ4]` — sequential append; `offset` must equal the bytes accepted so far                                                              |
+| `0x4B` | `FS_UPLOAD_FINISH`      | `[nonce:2][upload_id:2]` — land the upload (terminates it either way)                                                                                                |
+| `0x4C` | `FS_UPLOAD_CANCEL`      | `[upload_id:2]` — abort the upload; no reply                                                                                                                         |
 
 **Notes:**
 
@@ -150,6 +159,7 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 | `0x2B` | `FRAGMENT`          | `[flags:1][chunk:N]` — see [Fragmentation](#fragmentation)                                                         |
 | `0x2C` | `CLIPBOARD_LIST`    | `[count:2] repeated{ [mime_len:2][mime:N] }`                                                                       |
 | `0x2D` | `SURFACE_ACTIVATED` | `[surface_id:2]` — the Wayland client asked for its toplevel to be activated (xdg_activation_v1); raise and focus the pane |
+| `0x2E` | `CLIPBOARD_OWNER`   | `[wayland:1]` — `1` while a Wayland client owns the selection; `0` when empty or externally owned                  |
 | `0x30` | `AUDIO_FRAME`       | `[timestamp:4][flags:1][data:N]`                                                                                   |
 | `0x40` | `FS_SYNCED`         | `[nonce:2][sync_id:2][status:1][detail_len:2][detail:N]`                                                           |
 | `0x41` | `FS_UPDATE`         | `[sync_id:2][update_id:4][flags:1][records:LZ4]`                                                                   |
@@ -158,6 +168,9 @@ All the trailing bytes are optional — a 3-byte message uses connection/server 
 | `0x44` | `FS_DONE`           | `[nonce:2][status:1][hash:16][mtime_ns:8]` — one per `FS_WRITE`/`FS_OP` ([design/fs-write.md](design/fs-write.md)) |
 | `0x45` | `FS_SEARCH`         | `[nonce:2][status:1][count:2] repeated{ [path_len:2][path:N] }` ([design/fs-search.md](design/fs-search.md))       |
 | `0x46` | `FS_INDEX`          | `[nonce:2][status:1][flags:1][count:4][paths:LZ4]` ([design/fs-search.md](design/fs-search.md))                    |
+| `0x49` | `FS_UPLOAD_BEGIN`   | `[nonce:2][status:1][upload_id:2][hash:16][mtime_ns:8]` — `upload_id` meaningful only on `OK`; `hash` is the current on-disk hash on `CONFLICT` |
+| `0x4A` | `FS_UPLOAD_CHUNK`   | `[upload_id:2][status:1][received:8]` — per-chunk ack/progress; `received` is the resume point on `OFFSET_MISMATCH` |
+| `0x4B` | `FS_UPLOAD_FINISH`  | `[nonce:2][status:1][hash:16][mtime_ns:8]` — the `FS_DONE` payload on success (zeroes otherwise)                 |
 
 **Notes:**
 
@@ -372,6 +385,25 @@ an image above 8 MiB rather than have the frame refused, and cancels the paste
 outright instead of letting the keystroke land on a selection it did not
 update.
 
+A selection owned by a Wayland client does not take that browser round trip.
+The compositor advertises the owner's MIME list to every `wl_data_device` and
+splices each accepted `receive` fd directly back to its `wl_data_source`.
+This is load-bearing for non-text selections: copying `image/png` in one
+streamed app and pasting it in another works without the browser ever reading
+or rewriting the image. Ownership is exclusive in either direction; a
+`CLIPBOARD_SET` cancels the prior Wayland owner, and a client selection clears
+the stored external one. Each offer pins the owner or bytes it advertised, so
+a late receive on an old offer cannot read a replacement selection.
+
+`S2C_CLIPBOARD_OWNER` makes that authority explicit to every web client and
+is replayed before `READY` on connect. While it is `1`, Ctrl/Cmd+V cancels the
+browser's native paste and forwards the shortcut without a `CLIPBOARD_SET`,
+preserving the app owner's full MIME set for the direct splice. The web client
+marks that status unknown only when the window/tab loses authority or a real
+DOM copy/cut occurs; its next paste then reads the browser clipboard, sends
+`CLIPBOARD_SET`, and becomes the external owner. Merely moving focus between
+streamed surfaces does not invalidate the Wayland owner.
+
 ### Primary selection
 
 Middle-click paste reads PRIMARY, which has two possible owners.
@@ -395,6 +427,96 @@ Ownership is exclusive: whichever side claims PRIMARY displaces the other,
 and a displaced Wayland owner is told with `cancelled` so it stops answering
 `receive` from its own buffer. `blit clipboard set --primary` claims it from
 the CLI. Pasting _from_ the browser with Ctrl+V remains the clipboard's job.
+
+### Drag and drop
+
+Dragging an OS file from the user's desktop into a streamed app is a real
+`wl_data_device` drag session, driven by the compositor with no client
+`wl_data_source` behind it (`wl_data_device.enter`'s source is allow-null
+for exactly this case). The browser tracks HTML5 drag events over the
+surface element and reports them with the `SURFACE_DRAG_*` family; the
+server keeps one session per connection and the compositor enters, motions
+and drops on the target surface like any other drag. `surface_id`, `x` and
+`y` are encoded exactly as in `C2S_SURFACE_POINTER` — LE u16s in the
+composited frame's physical pixel space — and go through the same
+logical-coordinate conversion and hit-test as pointer motion.
+
+`SURFACE_DRAG_ENTER` (0x35) starts the session and carries the MIME types
+the browser can offer; the list reaches the app unchanged on the
+compositor-owned `wl_data_offer`. For a file drag it also appends an item
+plan: one MIME per file-kind `DataTransferItem`, in item order. The trailer
+is optional and append-only, so an ENTER without it is byte-identical to the
+original format. The server derives a staging name for every planned item
+(`0.png`, `1.jpg`, or `.webp`/`.gif`; unknown types use `.bin`), creates the
+empty files, and can therefore answer `receive("text/uri-list")` during
+hover. Chromium fetches that URI list at Wayland enter before delivering
+the page's `dragenter`; answering it immediately lets the remote app show
+its drop UI before release.
+
+A second ENTER retargets the session: the old surface gets `leave`, the new
+one gets `enter`. `SURFACE_DRAG_MOTION` (0x36) and `SURFACE_DRAG_LEAVE`
+(0x37) forward as `motion` and `leave`. `SURFACE_DRAG_CANCEL` (0x39) aborts
+— Escape, or the drag leaving the browser window. DROP, CANCEL and
+connection close all end the session.
+
+The actual bytes arrive only through the staging upload or inline in
+`SURFACE_DRAG_DROP` (0x38), whose payload is a list of items
+`[mime_len:2][mime][name_len:2][name][data_len:4][data]`. The distinction
+that matters is `name`:
+
+- An item with a non-empty `name` is a file, and its bytes are not in the
+  message: `data_len` is 0 and `name` is a path relative to the
+  connection's drag staging dir naming a file the client already uploaded
+  through the fs family. With an ENTER plan this must be the exact derived
+  name already present in the hover URI list; both item count and names are
+  checked at DROP. A client without the optional plan may use another safe
+  relative name (the original implementation used `0-shot.png`). The
+  staging dir is opened with an ordinary `FS_SYNC`
+  carrying the `FS_SYNC_STAGING` flag (bit 9): the `path` field is ignored
+  (send it empty), the server resolves the sync root to the per-connection
+  staging dir — creating it on first use — and the file bytes ride the
+  chunked `FS_UPLOAD` path with its pacing and cancel like any other
+  upload, so a large drop never queues one giant frame ahead of
+  interactive input. `FS_SYNC_STAGING` combined with `FS_SYNC_FROM_PTY` is
+  invalid and gets the usual invalid-flag refusal. The dir is removed on
+  connection close, never on `FS_STOP`: the staged URIs must outlive the
+  drop. A `name` that escapes the staging root (`../x`, absolute) or names
+  no uploaded file abandons the drop — the session ends with no offer. The
+  server offers `text/uri-list`: RFC 2483 `file://` URIs, percent-encoded
+  (spaces and non-ASCII bytes become `%XX`), one per staged item,
+  CRLF-terminated. When the drop is a single named item its own mime is
+  offered too, served from the staged file's bytes — an app that pastes
+  content rather than opening files still gets it.
+- A name-less item is dragged content (text, HTML) and is offered directly
+  under its own mime with its inline bytes, never touching the staging
+  dir. Being small by nature, it is also the only part of a drop the
+  16 MiB frame cap still bounds.
+
+The app reads the data the usual Wayland way. A planned `text/uri-list`
+receive can complete between `enter` and `drop`; every other early receive
+is parked until DROP supplies its payload. Receives after DROP are served
+from that payload by MIME (an unoffered MIME gets an empty pipe), followed
+by `finish`. With no source there is no
+`dnd_drop_performed`/`dnd_finished` — nobody to notify. Client-initiated
+drags (a Wayland app starting one via `start_drag`) take the complementary
+path: while the physical button is held, browser mouse events are hit-tested
+across mounted surface canvases and drive the compositor's implicit drag grab.
+Crossing surfaces sends `leave` then a fresh offer/`enter`; `receive` is fd-
+spliced to the source, a valid release sends `drop`/`dnd_drop_performed`, and
+target `finish` sends `dnd_finished`. Source and target action masks are negotiated;
+each fresh target offer receives the source mask before `enter`, and no
+selected `action` is announced until that target replies with `set_actions`.
+This ordering matters to Chromium/Electron targets: they do not start their
+pre-drop MIME fetches from an incomplete v3 offer.
+An empty mask intersection is announced as `action(NONE)` without leaving the
+surface, because the target may renegotiate on a later motion. Release becomes
+a drop only with both a non-NONE action and an accepted MIME; otherwise the
+target is left and the source is cancelled. The target's `accept(mime)` is
+relayed as `wl_data_source.target(mime)` so the
+source commits and serves the representation the destination selected;
+the source mask declared before `start_drag` is retained on the data source,
+as required by the Wayland request order. Releasing over no surface cancels
+the source.
 
 ### Pointer buttons
 
@@ -547,6 +669,35 @@ each answered by one `FS_DONE`
 ([design/fs-write.md](design/fs-write.md)). The write side shares the
 family's feature bit; `BLIT_FS_WRITE=0` makes a deployment read-only
 (writes answer `PERMISSION`).
+
+Files too large for one frame upload in chunks
+(`FS_UPLOAD_BEGIN`/`CHUNK`/`FINISH`/`CANCEL`): `BEGIN` names the sync,
+root-relative path (same %-encoding and traversal validation as
+`FS_WRITE`), mode, total plaintext `size`, and `base` — the same CAS
+precondition as `FS_WRITE` (`NO_CAS` overwrites unconditionally, `base` 0
+is create-exclusive, anything else must equal the current content hash).
+BEGIN flags alias the `FS_WRITE` flag bits exactly: 0x01 `NO_CAS`,
+0x02 `MKPARENTS`, 0x04 `DURABLE`, 0x08 `FOLLOW_SYMLINK`; anything else
+answers `INVALID`. The precondition is two-phase: BEGIN evaluates it
+fail-fast, before any bytes flow (CONFLICT carries the current on-disk
+hash, as `FS_DONE` does), and FINISH re-verifies it under the target's
+write lock immediately before the rename, so a file changed mid-upload
+fails landing with CONFLICT and the now-current hash rather than being
+clobbered. The server answers BEGIN with a per-connection `upload_id`.
+Chunks append strictly in order — each `offset` must equal the bytes
+accepted so far — and each is acked with the cumulative `received` count,
+which on `OFFSET_MISMATCH` is the resume point. The engine stages the
+bytes in a temp sibling of the target (never mirrored; `.blit-tmp-*`
+names are excluded from sync) and `FINISH` verifies `received == size`
+(else `SIZE_MISMATCH`), fsyncs when `DURABLE`, and atomically renames
+over the target, creating parents under `MKPARENTS`; the success reply
+carries the `FS_DONE` hash/mtime payload. `FINISH` terminates the upload
+whatever the outcome; `CANCEL`, sync stop, and connection close all drop
+the state and remove the temp file. Limits: `BLIT_FS_UPLOAD_MAX`
+(1 GiB default, `TOO_LARGE` past it) and `BLIT_FS_UPLOAD_INFLIGHT`
+(4 concurrent uploads per connection, `BUDGET` past it). Upload statuses
+extend the common registry with family-local values (128–255):
+128 `OFFSET_MISMATCH`, 129 `SIZE_MISMATCH`, 130 `UNKNOWN_UPLOAD`.
 Wire details, record layouts, and semantics:
 [design/fs-watch.md](design/fs-watch.md); server engine:
 `crates/fssync`; codecs and the `FsMirror` reference reducer:

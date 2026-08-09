@@ -132,6 +132,7 @@ import {
 import {
   registerActiveEditor,
   clearActiveEditor,
+  setActiveEditorFocused,
   type EditorController,
   type EditorBanner,
 } from "./activeEditor";
@@ -270,6 +271,8 @@ export function BlitEditor(props: {
   /** Read-only preview (the background dock): no editing, no LSP, no buffer
    *  parking, no status-bar registration — an always-on view, terminal-style. */
   preview?: boolean;
+  /** Whether this tile's workspace pane is focused. */
+  focused?: boolean;
 }) {
   let host!: HTMLDivElement;
   let view: EditorView | null = null;
@@ -1817,9 +1820,9 @@ export function BlitEditor(props: {
     return null;
   };
 
-  // The editor's chrome (filename + actions) lives in the global StatusBar, not
-  // a per-tile header. Publish this editor as the active one when it gains
-  // focus; clear it on unmount so the bar never reads a disposed signal.
+  // The editor's chrome (filename + actions) lives in the global StatusBar.
+  // BSP keeps background tiles mounted, so pane focus — not mount state — owns
+  // the bar. Clear on unmount so it never reads a disposed signal.
   const controller: EditorController = {
     kind: "editor",
     connectionId: props.connectionId,
@@ -1840,12 +1843,11 @@ export function BlitEditor(props: {
     showOutline: () => void showOutline(),
     onOpenTile: props.onOpenTile,
   };
-  // Register on mount as well as on focus: switching a tile from a diff to
-  // its editor via the status-bar switcher replaces the tile without moving
-  // keyboard focus, and mount-registration keeps the switcher in the bar
-  // instead of dropping back to the terminal identity (diffs do the same).
-  onMount(() => {
-    if (!props.preview) registerActiveEditor(controller);
+  createEffect(() => {
+    setActiveEditorFocused(
+      controller,
+      !props.preview && props.focused !== false,
+    );
   });
   onCleanup(() => clearActiveEditor(controller));
 

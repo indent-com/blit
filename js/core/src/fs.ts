@@ -80,6 +80,12 @@ export const FS_SYNC_EXCLUDE = 1 << 7;
  *  different questions, and `.ignore` brings none of git's
  *  repository-wide sources with it. */
 export const FS_SYNC_DOTIGNORE = 1 << 8;
+/** Root the sync at this connection's drag staging dir instead of a server
+ *  path: the path is ignored (sent empty), the dir is auto-created, and it
+ *  lives until the connection closes. Browser drag-and-drop stages files
+ *  here so `C2S_SURFACE_DRAG_DROP` can name them without inlining their
+ *  bytes. Carries no trailer; invalid with `FS_SYNC_FROM_PTY`. */
+export const FS_SYNC_STAGING = 1 << 9;
 
 // S2C_FS_UPDATE flags.
 /** Begin a staged snapshot: apply this and subsequent records to an empty
@@ -612,6 +618,17 @@ export const FS_DONE_INVALID = 7;
 export const FS_DONE_OTHER = 9;
 /** A precondition failed; `FsDone.hash` carries the current on-disk hash. */
 export const FS_DONE_CONFLICT = 11;
+/* Family-local statuses live at 128+ per docs/protocol.md's common status
+ * registry (0–127 is the centralized range); keep in sync with
+ * crates/remote/src/fs.rs. */
+/** Chunked upload: the chunk's offset is not the server's resume point;
+ * the reply's `received` field names where to resend from. */
+export const FS_DONE_OFFSET_MISMATCH = 128;
+/** Chunked upload: the assembled size does not match the declared size. */
+export const FS_DONE_SIZE_MISMATCH = 129;
+/** Chunked upload: the `upload_id` is unknown (never began, finished, or
+ * cancelled already). */
+export const FS_DONE_UNKNOWN_UPLOAD = 130;
 
 /** Human-readable `FS_DONE` status. */
 export function fsDoneStatusText(status: number): string {
@@ -632,6 +649,12 @@ export function fsDoneStatusText(status: number): string {
       return "invalid request";
     case FS_DONE_CONFLICT:
       return "conflict";
+    case FS_DONE_OFFSET_MISMATCH:
+      return "offset mismatch";
+    case FS_DONE_SIZE_MISMATCH:
+      return "size mismatch";
+    case FS_DONE_UNKNOWN_UPLOAD:
+      return "unknown upload";
     default:
       return "error";
   }
@@ -764,6 +787,230 @@ export function buildFsDoneMessage(
   const msg = new Uint8Array(28);
   const v = new DataView(msg.buffer);
   msg[0] = S2C_FS_DONE;
+  v.setUint16(1, nonce, true);
+  msg[3] = status;
+  setU128(v, 4, hash);
+  v.setBigUint64(20, mtimeNs, true);
+  return msg;
+}
+
+// -- Upload family (chunked writes) ------------------------------------------
+//
+// Large files that would not fit one `FS_WRITE` frame go up as a BEGIN, an
+// ordered run of CHUNKs (each individually LZ4-framed like `FS_WRITE`
+// content), and a FINISH; CANCEL abandons. Chunks are pipelined: each is
+// acked with the cumulative plaintext bytes accepted, and a mismatch asks
+// the client to resend from the server's resume point. Same feature bit as
+// the rest of the FS family (`FEATURE_FS`).
+
+/** Begin a chunked upload: [0x49][nonce:2][sync_id:2][flags:1][mode:4][size:8][path_len:2][path:N] */
+export const C2S_FS_UPLOAD_BEGIN = 0x49;
+/** One chunk: [0x4a][upload_id:2][offset:8][data:LZ4] */
+export const C2S_FS_UPLOAD_CHUNK = 0x4a;
+/** Commit an upload: [0x4b][nonce:2][upload_id:2] */
+export const C2S_FS_UPLOAD_FINISH = 0x4b;
+/** Abandon an upload (no reply): [0x4c][upload_id:2] */
+export const C2S_FS_UPLOAD_CANCEL = 0x4c;
+
+/** Begin accepted or rejected: [0x49][nonce:2][status:1][upload_id:2] */
+export const S2C_FS_UPLOAD_BEGIN = 0x49;
+/** Chunk ack: [0x4a][upload_id:2][status:1][received:8] */
+export const S2C_FS_UPLOAD_CHUNK = 0x4a;
+/** Commit result: [0x4b][nonce:2][status:1][hash:16][mtime_ns:8] — the
+ *  `FS_DONE` payload shape on success. */
+export const S2C_FS_UPLOAD_FINISH = 0x4b;
+
+// C2S_FS_UPLOAD_BEGIN flags — deliberately the same bit values as the
+// FS_WRITE flags above, the semantics are identical.
+export const FS_UPLOAD_NO_CAS = FS_WRITE_NO_CAS;
+export const FS_UPLOAD_MKPARENTS = FS_WRITE_MKPARENTS;
+export const FS_UPLOAD_DURABLE = FS_WRITE_DURABLE;
+export const FS_UPLOAD_FOLLOW_SYMLINK = FS_WRITE_FOLLOW_SYMLINK;
+
+export interface FsUploadBeginArgs {
+  nonce: number;
+  syncId: number;
+  flags: number;
+  /** Precondition, exactly as FS_WRITE's base: ignored under NO_CAS;
+   *  0 without NO_CAS = create-exclusive; otherwise CAS against the
+   *  current content hash. Checked at BEGIN (fail fast) and re-verified
+   *  at FINISH before the rename. */
+  base: bigint;
+  mode: number;
+  /** Total plaintext bytes to be uploaded. */
+  size: number;
+  path: string;
+}
+
+export function buildFsUploadBeginMessage(a: FsUploadBeginArgs): Uint8Array {
+  const pathBytes = textEncoder.encode(a.path);
+  const msg = new Uint8Array(36 + pathBytes.length);
+  const v = new DataView(msg.buffer);
+  msg[0] = C2S_FS_UPLOAD_BEGIN;
+  v.setUint16(1, a.nonce, true);
+  v.setUint16(3, a.syncId, true);
+  msg[5] = a.flags;
+  setU128(v, 6, a.base);
+  v.setUint32(22, a.mode, true);
+  v.setBigUint64(26, BigInt(a.size), true);
+  v.setUint16(34, pathBytes.length, true);
+  msg.set(pathBytes, 36);
+  return msg;
+}
+
+/** Build a `C2S_FS_UPLOAD_CHUNK`; `data` is the plaintext chunk, compressed
+ *  with the same lz4-prepend-size framing as `FS_WRITE` content. */
+export function buildFsUploadChunkMessage(
+  uploadId: number,
+  offset: number,
+  data: Uint8Array,
+): Uint8Array {
+  const compressed = fsCompress(data);
+  const msg = new Uint8Array(11 + compressed.length);
+  const v = new DataView(msg.buffer);
+  msg[0] = C2S_FS_UPLOAD_CHUNK;
+  v.setUint16(1, uploadId, true);
+  v.setBigUint64(3, BigInt(offset), true);
+  msg.set(compressed, 11);
+  return msg;
+}
+
+export function buildFsUploadFinishMessage(
+  nonce: number,
+  uploadId: number,
+): Uint8Array {
+  const msg = new Uint8Array(5);
+  const v = new DataView(msg.buffer);
+  msg[0] = C2S_FS_UPLOAD_FINISH;
+  v.setUint16(1, nonce, true);
+  v.setUint16(3, uploadId, true);
+  return msg;
+}
+
+export function buildFsUploadCancelMessage(uploadId: number): Uint8Array {
+  const msg = new Uint8Array(3);
+  const v = new DataView(msg.buffer);
+  msg[0] = C2S_FS_UPLOAD_CANCEL;
+  v.setUint16(1, uploadId, true);
+  return msg;
+}
+
+export interface FsUploadBeginReply {
+  nonce: number;
+  status: number;
+  uploadId: number;
+  /** Current on-disk content hash when `status` is CONFLICT, 0 otherwise
+   *  (same convention as `FsDone.hash`). */
+  hash: bigint;
+  mtimeNs: bigint;
+}
+
+/** Parse an `S2C_FS_UPLOAD_BEGIN`; null = malformed or wrong opcode. */
+export function parseFsUploadBeginReply(
+  msg: Uint8Array,
+): FsUploadBeginReply | null {
+  if (msg.length < 30 || msg[0] !== S2C_FS_UPLOAD_BEGIN) return null;
+  const v = new DataView(msg.buffer, msg.byteOffset, msg.byteLength);
+  return {
+    nonce: v.getUint16(1, true),
+    status: msg[3],
+    uploadId: v.getUint16(4, true),
+    hash: getU128(v, 6),
+    mtimeNs: v.getBigUint64(22, true),
+  };
+}
+
+export interface FsUploadChunkAck {
+  uploadId: number;
+  status: number;
+  /** Cumulative plaintext bytes accepted; on `FS_DONE_OFFSET_MISMATCH`,
+   * the resume point to resend from. */
+  received: number;
+}
+
+/** Parse an `S2C_FS_UPLOAD_CHUNK` ack; null = malformed or wrong opcode. */
+export function parseFsUploadChunkAck(
+  msg: Uint8Array,
+): FsUploadChunkAck | null {
+  if (msg.length < 12 || msg[0] !== S2C_FS_UPLOAD_CHUNK) return null;
+  const v = new DataView(msg.buffer, msg.byteOffset, msg.byteLength);
+  return {
+    uploadId: v.getUint16(1, true),
+    status: msg[3],
+    received: Number(v.getBigUint64(4, true)),
+  };
+}
+
+export interface FsUploadFinishReply {
+  nonce: number;
+  status: number;
+  /** Post-write content hash on success (same slot as `FsDone.hash`). */
+  hash: bigint;
+  /** The hash's raw 16 wire bytes (little-endian u128), for callers that
+   *  want bytes rather than a bigint. */
+  hashBytes: Uint8Array;
+  mtimeNs: bigint;
+}
+
+/** Parse an `S2C_FS_UPLOAD_FINISH`; null = malformed or wrong opcode. */
+export function parseFsUploadFinishReply(
+  msg: Uint8Array,
+): FsUploadFinishReply | null {
+  if (msg.length < 28 || msg[0] !== S2C_FS_UPLOAD_FINISH) return null;
+  const v = new DataView(msg.buffer, msg.byteOffset, msg.byteLength);
+  return {
+    nonce: v.getUint16(1, true),
+    status: msg[3],
+    hash: getU128(v, 4),
+    hashBytes: msg.slice(4, 20),
+    mtimeNs: v.getBigUint64(20, true),
+  };
+}
+
+/** Build an `S2C_FS_UPLOAD_BEGIN` (tests and mock servers). */
+export function buildFsUploadBeginReply(
+  nonce: number,
+  status: number,
+  uploadId: number,
+  hash = 0n,
+  mtimeNs = 0n,
+): Uint8Array {
+  const msg = new Uint8Array(30);
+  const v = new DataView(msg.buffer);
+  msg[0] = S2C_FS_UPLOAD_BEGIN;
+  v.setUint16(1, nonce, true);
+  msg[3] = status;
+  v.setUint16(4, uploadId, true);
+  setU128(v, 6, hash);
+  v.setBigUint64(22, mtimeNs, true);
+  return msg;
+}
+
+/** Build an `S2C_FS_UPLOAD_CHUNK` ack (tests and mock servers). */
+export function buildFsUploadChunkAck(
+  uploadId: number,
+  status: number,
+  received: number,
+): Uint8Array {
+  const msg = new Uint8Array(12);
+  const v = new DataView(msg.buffer);
+  msg[0] = S2C_FS_UPLOAD_CHUNK;
+  v.setUint16(1, uploadId, true);
+  msg[3] = status;
+  v.setBigUint64(4, BigInt(received), true);
+  return msg;
+}
+
+/** Build an `S2C_FS_UPLOAD_FINISH` (tests and mock servers). */
+export function buildFsUploadFinishReply(
+  nonce: number,
+  status: number,
+  hash: bigint,
+  mtimeNs: bigint,
+): Uint8Array {
+  const msg = new Uint8Array(28);
+  const v = new DataView(msg.buffer);
+  msg[0] = S2C_FS_UPLOAD_FINISH;
   v.setUint16(1, nonce, true);
   msg[3] = status;
   setU128(v, 4, hash);
@@ -1248,6 +1495,13 @@ export interface FsSyncOptions {
    *  `cd` (docs/ide.md Decision 3). The session must be on the same
    *  connection as the sync. */
   fromSessionId?: SessionId;
+  /** Root the sync at this connection's drag staging dir
+   *  ({@link FS_SYNC_STAGING}): `path` is ignored and sent empty, the dir
+   *  is auto-created server-side, and it lives until the connection
+   *  closes. Browser drag-and-drop stages dropped files here so a DROP
+   *  message names them instead of inlining their bytes. Invalid with
+   *  `fromSessionId` — `syncFs` throws on the combination. */
+  staging?: boolean;
 }
 
 /** A live sync established by `BlitConnection.syncFs`. */
@@ -1276,6 +1530,48 @@ export interface FsWriteOptions {
   createParents?: boolean;
   /** fsync the file and its parent before resolving. */
   durable?: boolean;
+}
+
+/** Options for {@link FsSyncHandle.upload}. */
+export interface FsUploadOptions {
+  /** Unix mode for a created file; omitted/0 preserves the default. */
+  mode?: number;
+  /** Create missing parent directories. */
+  createParents?: boolean;
+  /** fsync the file and its parent before resolving. */
+  durable?: boolean;
+  /** CAS: upload only if the current content hash equals this. Checked
+   *  at BEGIN (fail fast, before bytes flow) and re-verified at FINISH;
+   *  a mismatch rejects with an {@link FsConflictError} carrying the
+   *  current on-disk hash. Mutually exclusive with `create`/`force`. */
+  ifHash?: bigint;
+  /** Create-exclusive: fail with CONFLICT when the target exists. */
+  create?: boolean;
+  /** Overwrite unconditionally (the default when neither `ifHash` nor
+   *  `create` is given). */
+  force?: boolean;
+  /** Plaintext bytes per chunk; default 256 KiB. Each chunk rides its own
+   *  transport frame, LZ4-compressed. Chunks are small and at most 512 KiB
+   *  is left unacked on the wire, so interactive input sharing the
+   *  connection is not stuck behind a large upload backlog. */
+  chunkSize?: number;
+  /** Progress in cumulative plaintext bytes accepted by the server. */
+  onProgress?: (uploaded: number, total: number) => void;
+  /** Aborting sends `FS_UPLOAD_CANCEL` and rejects the promise. */
+  signal?: AbortSignal;
+}
+
+/** Result of a successful chunked upload. */
+export interface FsUploadResult {
+  /** Post-write content hash: the raw 16 wire bytes (little-endian u128). */
+  hash: Uint8Array;
+  /** The same hash as a bigint (matches `FsWriteResult.hash`). */
+  hashU128: bigint;
+  /** Modification time in nanoseconds since the epoch (number; loses
+   *  sub-microsecond precision — use `mtimeNs` when exactness matters). */
+  mtime: number;
+  /** Modification time in nanoseconds since the epoch, full precision. */
+  mtimeNs: bigint;
 }
 
 /** Options for {@link FsSyncHandle.symlink} / {@link FsSyncHandle.hardlink}. */
@@ -1311,12 +1607,28 @@ export interface FsSyncHandle extends ReactiveStore {
    *  form (as in `live`). Rejects with an {@link FsConflictError} carrying
    *  the current on-disk hash when a precondition fails. On success the
    *  returned hash is also recorded as {@link lastWrittenHash} so the
-   *  matching echo can be recognized. */
+   *  matching echo can be recognized. Every full-content write goes out as
+   *  a chunked {@link upload} — paced so it can't stall interactive input
+   *  sharing the connection; only delta writes (`deltaBase`) still use a
+   *  single FS_WRITE frame, small by construction. */
   writeFile(
     path: string,
     data: Uint8Array,
     options?: FsWriteOptions,
   ): Promise<FsWriteResult>;
+  /** Upload a file as an ordered run of chunks (the `FS_UPLOAD_*` family)
+   *  for content too large — or too inconvenient — for a single
+   *  `writeFile` frame. Accepts a `Blob` (e.g. a dropped `File`) and reads
+   *  it slice by slice, so the whole file is never held in memory at once.
+   *  Chunks are pipelined a few frames ahead; `onProgress` reports the
+   *  server's cumulative ack. Resolves from the FINISH reply; rejects on an
+   *  error status or abort (which also sends `FS_UPLOAD_CANCEL`). The
+   *  returned hash is recorded as {@link lastWrittenHash}, like a write. */
+  upload(
+    path: string,
+    data: Uint8Array | Blob,
+    opts?: FsUploadOptions,
+  ): Promise<FsUploadResult>;
   /** Create a directory. */
   mkdir(
     path: string,

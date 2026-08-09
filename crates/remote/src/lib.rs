@@ -361,6 +361,38 @@ pub const C2S_SURFACE_TEXT: u8 = 0x2F;
 /// has no input method enabled — a preedit has nowhere to go but the app's
 /// own text field.
 pub const C2S_SURFACE_PREEDIT: u8 = 0x34;
+
+// -- Browser-initiated drag-and-drop (docs/protocol.md "Drag and drop") --
+//
+// `surface_id`, `x` and `y` are encoded exactly as in
+// [`C2S_SURFACE_POINTER`]: LE u16s, coordinates in the composited frame's
+// physical pixel space, converted to surface-local logical coordinates by
+// the compositor the same way pointer motion is.
+
+/// Begin (or retarget) a drag session over a Wayland surface:
+/// [0x35][surface_id:2][x:2][y:2][mime_count:2][mime entries]
+/// where a mime entry is [mime_len:2][mime:N].  The mime list is what the
+/// browser can offer; it is advertised to the app unchanged, and the data
+/// arrives later, inside [`C2S_SURFACE_DRAG_DROP`].
+pub const C2S_SURFACE_DRAG_ENTER: u8 = 0x35;
+/// Move the drag over a surface: [0x36][surface_id:2][x:2][y:2]
+pub const C2S_SURFACE_DRAG_MOTION: u8 = 0x36;
+/// The drag left the surface: [0x37][surface_id:2]
+pub const C2S_SURFACE_DRAG_LEAVE: u8 = 0x37;
+/// Complete the drop:
+/// [0x38][surface_id:2][x:2][y:2][item_count:2][items]
+/// where an item is [mime_len:2][mime:N][name_len:2][name:M][data_len:4][data:D].
+/// Items with a non-empty `name` are files the client already uploaded into
+/// the connection's drag staging dir through the fs family
+/// (`FS_SYNC_STAGING` + chunked upload); `name` is the path relative to the
+/// staging root and `data` is empty.  The server offers their `file://`
+/// URIs as `text/uri-list`.  Name-less items are dragged content (text,
+/// HTML, …) offered directly under their own mime; only they carry inline
+/// `data`, so they are the only part of a drop the 16 MiB frame cap still
+/// bounds.
+pub const C2S_SURFACE_DRAG_DROP: u8 = 0x38;
+/// Abort the drag (Escape, or the drag left the window): [0x39].  No payload.
+pub const C2S_SURFACE_DRAG_CANCEL: u8 = 0x39;
 /// Read clipboard content for a specific MIME type:
 /// [0x2E][mime_len:2][mime:N]
 /// Server responds with S2C_CLIPBOARD_CONTENT (0x25) containing the data.
@@ -551,6 +583,10 @@ pub const S2C_SURFACE_ENCODER: u8 = 0x2A;
 /// List of MIME types available on the clipboard:
 /// [0x2C][count:2] repeated{ [mime_len:2][mime:N] }
 pub const S2C_CLIPBOARD_LIST: u8 = 0x2C;
+/// Which side currently owns the compositor clipboard selection:
+/// [0x2E][wayland:1].  `1` means a Wayland client owns it and browser paste
+/// must not replace it; `0` means the selection is empty or externally owned.
+pub const S2C_CLIPBOARD_OWNER: u8 = 0x2E;
 
 // -- Audio forwarding ---------------------------------------------------
 
@@ -2144,6 +2180,9 @@ pub enum ServerMsg<'a> {
     ClipboardList {
         mime_types: Vec<String>,
     },
+    ClipboardOwner {
+        wayland: bool,
+    },
     Quit,
 }
 
@@ -2592,6 +2631,14 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
                 offset += mime_len;
             }
             Some(ServerMsg::ClipboardList { mime_types })
+        }
+        S2C_CLIPBOARD_OWNER => {
+            if data.len() != 2 || data[1] > 1 {
+                return None;
+            }
+            Some(ServerMsg::ClipboardOwner {
+                wayland: data[1] != 0,
+            })
         }
         S2C_QUIT => Some(ServerMsg::Quit),
         _ => None,
@@ -3161,6 +3208,11 @@ pub fn msg_s2c_clipboard_content(mime_type: &str, data: &[u8]) -> Vec<u8> {
     msg
 }
 
+/// Announce whether a Wayland client owns the clipboard selection.
+pub fn msg_s2c_clipboard_owner(wayland: bool) -> Vec<u8> {
+    vec![S2C_CLIPBOARD_OWNER, u8::from(wayland)]
+}
+
 pub fn msg_surface_input(surface_id: u16, data: &[u8]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(3 + data.len());
     msg.push(C2S_SURFACE_INPUT);
@@ -3308,6 +3360,244 @@ pub fn msg_surface_preedit(surface_id: u16, text: &str, cursor: u16) -> Vec<u8> 
     msg.extend_from_slice(&cursor.to_le_bytes());
     msg.extend_from_slice(tb);
     msg
+}
+
+// -- Drag-and-drop codecs --
+
+/// A [`C2S_SURFACE_DRAG_ENTER`] payload, parsed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceDragEnter {
+    pub surface_id: u16,
+    pub x: u16,
+    pub y: u16,
+    /// MIME types the browser can offer, advertised to the app unchanged.
+    pub mimes: Vec<String>,
+    /// The drop plan: one MIME type per dragged item, from the optional
+    /// trailer.  During hover the browser cannot read file bytes, but it
+    /// knows the item count and types, so the server pre-creates the
+    /// planned staging files (see [`surface_drag_planned_name`]) and the
+    /// `text/uri-list` offer becomes servable immediately — Chromium
+    /// fetches it at `wl_data_device.enter`.  `None` = no plan (legacy
+    /// ENTER, park-until-drop behavior).
+    pub items: Option<Vec<String>>,
+}
+
+/// One item of a [`C2S_SURFACE_DRAG_DROP`] payload.
+///
+/// A non-empty `name` makes the item a file the client pre-uploaded into
+/// the connection's drag staging dir — `name` is the path relative to the
+/// staging root and `data` is empty — offered by `file://` URI; an empty
+/// `name` is dragged content offered directly under `mime`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceDragDropItem {
+    pub mime: String,
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
+/// A [`C2S_SURFACE_DRAG_DROP`] payload, parsed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceDragDrop {
+    pub surface_id: u16,
+    pub x: u16,
+    pub y: u16,
+    pub items: Vec<SurfaceDragDropItem>,
+}
+
+/// Header size shared by ENTER/MOTION/DROP: opcode + surface_id + x + y.
+const SURFACE_DRAG_POS_LEN: usize = 7;
+
+/// Build a `C2S_SURFACE_DRAG_ENTER`:
+/// [0x35][surface_id:2][x:2][y:2][mime_count:2][mime entries].
+pub fn msg_surface_drag_enter(surface_id: u16, x: u16, y: u16, mimes: &[String]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(SURFACE_DRAG_POS_LEN + 2);
+    msg.push(C2S_SURFACE_DRAG_ENTER);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(&x.to_le_bytes());
+    msg.extend_from_slice(&y.to_le_bytes());
+    msg.extend_from_slice(&(mimes.len() as u16).to_le_bytes());
+    for mime in mimes {
+        push_str(&mut msg, mime);
+    }
+    msg
+}
+
+/// Build a `C2S_SURFACE_DRAG_ENTER` with the item-plan trailer:
+/// [0x35][surface_id:2][x:2][y:2][mime_count:2][mime entries]
+/// [item_count:2] then per item [mime_len:2][mime bytes].
+///
+/// `items` carries one MIME type per dragged item; the server derives each
+/// item's planned staging name with [`surface_drag_planned_name`].  The
+/// trailer is append-only: a reader that finds no bytes after the mime
+/// list parses the message as a legacy no-plan ENTER.
+pub fn msg_surface_drag_enter_with_items(
+    surface_id: u16,
+    x: u16,
+    y: u16,
+    mimes: &[String],
+    items: &[String],
+) -> Vec<u8> {
+    let mut msg = msg_surface_drag_enter(surface_id, x, y, mimes);
+    msg.extend_from_slice(&(items.len() as u16).to_le_bytes());
+    for mime in items {
+        push_str(&mut msg, mime);
+    }
+    msg
+}
+
+/// The planned staging-relative name both sides derive for drag item
+/// `index` with MIME type `mime`: `{index}.{ext}` where `ext` is the
+/// conventional extension for the image types the browser reports and
+/// `bin` for anything else.  The browser uploads the item's real bytes to
+/// this path before it sends the DROP; the server pre-creates it empty at
+/// ENTER so the planned `text/uri-list` can name it immediately.
+pub fn surface_drag_planned_name(index: usize, mime: &str) -> String {
+    let ext = match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "bin",
+    };
+    format!("{index}.{ext}")
+}
+
+/// Build a `C2S_SURFACE_DRAG_MOTION`: [0x36][surface_id:2][x:2][y:2].
+pub fn msg_surface_drag_motion(surface_id: u16, x: u16, y: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(SURFACE_DRAG_POS_LEN);
+    msg.push(C2S_SURFACE_DRAG_MOTION);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(&x.to_le_bytes());
+    msg.extend_from_slice(&y.to_le_bytes());
+    msg
+}
+
+/// Build a `C2S_SURFACE_DRAG_LEAVE`: [0x37][surface_id:2].
+pub fn msg_surface_drag_leave(surface_id: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(3);
+    msg.push(C2S_SURFACE_DRAG_LEAVE);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg
+}
+
+/// Build a `C2S_SURFACE_DRAG_DROP`:
+/// [0x38][surface_id:2][x:2][y:2][item_count:2][items].
+pub fn msg_surface_drag_drop(
+    surface_id: u16,
+    x: u16,
+    y: u16,
+    items: &[SurfaceDragDropItem],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(SURFACE_DRAG_POS_LEN + 2);
+    msg.push(C2S_SURFACE_DRAG_DROP);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(&x.to_le_bytes());
+    msg.extend_from_slice(&y.to_le_bytes());
+    msg.extend_from_slice(&(items.len() as u16).to_le_bytes());
+    for item in items {
+        push_str(&mut msg, &item.mime);
+        push_str(&mut msg, &item.name);
+        msg.extend_from_slice(&(item.data.len() as u32).to_le_bytes());
+        msg.extend_from_slice(&item.data);
+    }
+    msg
+}
+
+/// Build a `C2S_SURFACE_DRAG_CANCEL`: [0x39]. No payload.
+pub fn msg_surface_drag_cancel() -> Vec<u8> {
+    vec![C2S_SURFACE_DRAG_CANCEL]
+}
+
+/// Read one `[len:2][bytes]` field as a string at `pos`, advancing it.
+/// Returns `None` when the field overruns the message — a corrupt count
+/// must not panic the server on its hot input path.
+fn take_str(data: &[u8], pos: &mut usize) -> Option<String> {
+    let len = u16::from_le_bytes([*data.get(*pos)?, *data.get(*pos + 1)?]) as usize;
+    *pos += 2;
+    let bytes = data.get(*pos..*pos + len)?;
+    *pos += len;
+    Some(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// Parse a [`C2S_SURFACE_DRAG_ENTER`] message. `data` includes the opcode
+/// byte. Returns `None` if the message is truncated.
+pub fn parse_surface_drag_enter(data: &[u8]) -> Option<SurfaceDragEnter> {
+    if data.len() < SURFACE_DRAG_POS_LEN + 2 || data[0] != C2S_SURFACE_DRAG_ENTER {
+        return None;
+    }
+    let (surface_id, x, y) = drag_pos(data);
+    let mut pos = SURFACE_DRAG_POS_LEN;
+    let count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+    let mut mimes = Vec::with_capacity(count.min(64));
+    for _ in 0..count {
+        mimes.push(take_str(data, &mut pos)?);
+    }
+    // The item-plan trailer is append-only: present iff bytes remain.
+    let items = if pos < data.len() {
+        let count = u16::from_le_bytes([*data.get(pos)?, *data.get(pos + 1)?]) as usize;
+        pos += 2;
+        let mut items = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            items.push(take_str(data, &mut pos)?);
+        }
+        Some(items)
+    } else {
+        None
+    };
+    Some(SurfaceDragEnter {
+        surface_id,
+        x,
+        y,
+        mimes,
+        items,
+    })
+}
+
+/// Parse the `[surface_id:2][x:2][y:2]` head shared by ENTER/MOTION/DROP.
+fn drag_pos(data: &[u8]) -> (u16, u16, u16) {
+    (
+        u16::from_le_bytes([data[1], data[2]]),
+        u16::from_le_bytes([data[3], data[4]]),
+        u16::from_le_bytes([data[5], data[6]]),
+    )
+}
+
+/// Parse a [`C2S_SURFACE_DRAG_DROP`] message. `data` includes the opcode
+/// byte. Returns `None` if the message is truncated.
+pub fn parse_surface_drag_drop(data: &[u8]) -> Option<SurfaceDragDrop> {
+    if data.len() < SURFACE_DRAG_POS_LEN + 2 || data[0] != C2S_SURFACE_DRAG_DROP {
+        return None;
+    }
+    let (surface_id, x, y) = drag_pos(data);
+    let mut pos = SURFACE_DRAG_POS_LEN;
+    let count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+    let mut items = Vec::with_capacity(count.min(64));
+    for _ in 0..count {
+        let mime = take_str(data, &mut pos)?;
+        let name = take_str(data, &mut pos)?;
+        let data_len = u32::from_le_bytes([
+            *data.get(pos)?,
+            *data.get(pos + 1)?,
+            *data.get(pos + 2)?,
+            *data.get(pos + 3)?,
+        ]) as usize;
+        pos += 4;
+        let bytes = data.get(pos..pos + data_len)?;
+        pos += data_len;
+        items.push(SurfaceDragDropItem {
+            mime,
+            name,
+            data: bytes.to_vec(),
+        });
+    }
+    Some(SurfaceDragDrop {
+        surface_id,
+        x,
+        y,
+        items,
+    })
 }
 
 pub fn msg_surface_subscribe(surface_id: u16) -> Vec<u8> {
@@ -4114,6 +4404,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clipboard_owner_round_trips_and_rejects_invalid_states() {
+        assert!(matches!(
+            parse_server_msg(&msg_s2c_clipboard_owner(true)),
+            Some(ServerMsg::ClipboardOwner { wayland: true })
+        ));
+        assert!(matches!(
+            parse_server_msg(&msg_s2c_clipboard_owner(false)),
+            Some(ServerMsg::ClipboardOwner { wayland: false })
+        ));
+        assert!(parse_server_msg(&[S2C_CLIPBOARD_OWNER]).is_none());
+        assert!(parse_server_msg(&[S2C_CLIPBOARD_OWNER, 2]).is_none());
+        assert!(parse_server_msg(&[S2C_CLIPBOARD_OWNER, 1, 0]).is_none());
+    }
+
+    #[test]
     fn pointer_axis2_round_trips() {
         let ev = PointerAxisEvent {
             surface_id: 9,
@@ -4128,6 +4433,190 @@ mod tests {
         assert_eq!(msg.len(), SURFACE_POINTER_AXIS2_LEN);
         assert_eq!(msg[0], C2S_SURFACE_POINTER_AXIS2);
         assert_eq!(parse_surface_pointer_axis2(&msg), Some(ev));
+    }
+
+    // Drag-and-drop codecs are pinned byte-for-byte: js/core builds these
+    // messages against the same fixtures, so a drift on either side fails a
+    // test rather than a user's drop.
+
+    /// `[0x35][surface_id:2][x:2][y:2][mime_count:2][mime entries]` with
+    /// `[len:2][bytes]` entries — the exact bytes for surface 7 at
+    /// (100, 200) offering `text/uri-list` and `application/octet-stream`.
+    #[test]
+    fn drag_enter_matches_the_pinned_fixture() {
+        let msg = msg_surface_drag_enter(
+            7,
+            100,
+            200,
+            &[
+                "text/uri-list".to_string(),
+                "application/octet-stream".to_string(),
+            ],
+        );
+        let mut fixture = vec![
+            0x35, 0x07, 0x00, 0x64, 0x00, 0xc8, 0x00, 0x02, 0x00, 0x0d, 0x00,
+        ];
+        fixture.extend_from_slice(b"text/uri-list");
+        fixture.extend_from_slice(&[0x18, 0x00]);
+        fixture.extend_from_slice(b"application/octet-stream");
+        assert_eq!(msg, fixture);
+        assert_eq!(
+            parse_surface_drag_enter(&msg),
+            Some(SurfaceDragEnter {
+                surface_id: 7,
+                x: 100,
+                y: 200,
+                mimes: vec![
+                    "text/uri-list".to_string(),
+                    "application/octet-stream".to_string(),
+                ],
+                // No trailer: a legacy ENTER parses as plan-less.
+                items: None,
+            })
+        );
+    }
+
+    /// The ENTER with the item-plan trailer:
+    /// `[0x35][surface_id:2][x:2][y:2][mime_count:2][mime entries]`
+    /// `[item_count:2]` then per item `[mime_len:2][mime bytes]` — surface 7
+    /// at (100, 200), mimes `["text/uri-list","application/octet-stream"]`,
+    /// items `["image/png","image/jpeg"]`.
+    #[test]
+    fn drag_enter_with_items_matches_the_pinned_fixture() {
+        let msg = msg_surface_drag_enter_with_items(
+            7,
+            100,
+            200,
+            &[
+                "text/uri-list".to_string(),
+                "application/octet-stream".to_string(),
+            ],
+            &["image/png".to_string(), "image/jpeg".to_string()],
+        );
+        let mut fixture = vec![
+            0x35, 0x07, 0x00, 0x64, 0x00, 0xc8, 0x00, 0x02, 0x00, 0x0d, 0x00,
+        ];
+        fixture.extend_from_slice(b"text/uri-list");
+        fixture.extend_from_slice(&[0x18, 0x00]);
+        fixture.extend_from_slice(b"application/octet-stream");
+        fixture.extend_from_slice(&[0x02, 0x00, 0x09, 0x00]);
+        fixture.extend_from_slice(b"image/png");
+        fixture.extend_from_slice(&[0x0a, 0x00]);
+        fixture.extend_from_slice(b"image/jpeg");
+        assert_eq!(msg, fixture);
+        assert_eq!(
+            parse_surface_drag_enter(&msg),
+            Some(SurfaceDragEnter {
+                surface_id: 7,
+                x: 100,
+                y: 200,
+                mimes: vec![
+                    "text/uri-list".to_string(),
+                    "application/octet-stream".to_string(),
+                ],
+                items: Some(vec!["image/png".to_string(), "image/jpeg".to_string()]),
+            })
+        );
+        // A truncated trailer is a corrupt message, not a plan-less one.
+        assert!(parse_surface_drag_enter(&msg[..msg.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn planned_names_use_the_conventional_extension_per_type() {
+        assert_eq!(surface_drag_planned_name(0, "image/png"), "0.png");
+        assert_eq!(surface_drag_planned_name(1, "image/jpeg"), "1.jpg");
+        assert_eq!(surface_drag_planned_name(2, "image/webp"), "2.webp");
+        assert_eq!(surface_drag_planned_name(3, "image/gif"), "3.gif");
+        assert_eq!(surface_drag_planned_name(4, "application/pdf"), "4.bin");
+        assert_eq!(surface_drag_planned_name(5, "text/plain"), "5.bin");
+    }
+
+    /// `[0x38][surface_id:2][x:2][y:2][item_count:2][items]` with
+    /// `[mime_len:2][mime][name_len:2][name][data_len:4][data]` items — the
+    /// exact bytes for surface 7 at (100, 200), one `image/png` item named
+    /// `a b.png` with data `[0x89, 0x50]`.
+    #[test]
+    fn drag_drop_matches_the_pinned_fixture() {
+        let msg = msg_surface_drag_drop(
+            7,
+            100,
+            200,
+            &[SurfaceDragDropItem {
+                mime: "image/png".to_string(),
+                name: "a b.png".to_string(),
+                data: vec![0x89, 0x50],
+            }],
+        );
+        let mut fixture = vec![
+            0x38, 0x07, 0x00, 0x64, 0x00, 0xc8, 0x00, 0x01, 0x00, 0x09, 0x00,
+        ];
+        fixture.extend_from_slice(b"image/png");
+        fixture.extend_from_slice(&[0x07, 0x00]);
+        fixture.extend_from_slice(b"a b.png");
+        fixture.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x89, 0x50]);
+        assert_eq!(msg, fixture);
+        assert_eq!(
+            parse_surface_drag_drop(&msg),
+            Some(SurfaceDragDrop {
+                surface_id: 7,
+                x: 100,
+                y: 200,
+                items: vec![SurfaceDragDropItem {
+                    mime: "image/png".to_string(),
+                    name: "a b.png".to_string(),
+                    data: vec![0x89, 0x50],
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn drag_motion_leave_and_cancel_match_their_layouts() {
+        assert_eq!(
+            msg_surface_drag_motion(7, 100, 200),
+            vec![0x36, 0x07, 0x00, 0x64, 0x00, 0xc8, 0x00]
+        );
+        assert_eq!(msg_surface_drag_leave(7), vec![0x37, 0x07, 0x00]);
+        assert_eq!(msg_surface_drag_cancel(), vec![0x39]);
+    }
+
+    #[test]
+    fn drag_parsers_reject_truncated_and_foreign_messages() {
+        let enter = msg_surface_drag_enter(7, 100, 200, &["text/uri-list".to_string()]);
+        assert!(parse_surface_drag_enter(&enter[..enter.len() - 1]).is_none());
+        // A corrupt mime count must not read past the end.
+        assert!(parse_surface_drag_enter(&enter[..9]).is_none());
+        assert!(parse_surface_drag_enter(&msg_surface_drag_drop(7, 100, 200, &[])).is_none());
+
+        let drop_msg = msg_surface_drag_drop(
+            7,
+            100,
+            200,
+            &[SurfaceDragDropItem {
+                mime: "image/png".to_string(),
+                name: "a.png".to_string(),
+                data: vec![0x89, 0x50],
+            }],
+        );
+        assert!(parse_surface_drag_drop(&drop_msg[..drop_msg.len() - 1]).is_none());
+        // A corrupt item count must not read past the end.
+        assert!(parse_surface_drag_drop(&drop_msg[..9]).is_none());
+        assert!(parse_surface_drag_drop(&enter).is_none());
+
+        // A name-less item is dragged content, not a file.
+        let text = msg_surface_drag_drop(
+            7,
+            100,
+            200,
+            &[SurfaceDragDropItem {
+                mime: "text/plain".to_string(),
+                name: String::new(),
+                data: b"hello".to_vec(),
+            }],
+        );
+        let parsed = parse_surface_drag_drop(&text).unwrap();
+        assert_eq!(parsed.items[0].name, "");
+        assert_eq!(parsed.items[0].data, b"hello");
     }
 
     /// A wheel source is 0, so it only survives the round trip because the

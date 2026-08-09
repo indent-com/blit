@@ -45,6 +45,7 @@ import {
 } from "./layout";
 import { BlitTile } from "../ide/BlitTile";
 import { PaneTools } from "../PaneTools";
+import { TerminalDropTarget } from "../terminalDrop";
 import { WebPaneHost, type WebPaneHostRegistrar } from "../WebPaneHost";
 import {
   isTileDrag,
@@ -1278,6 +1279,9 @@ function LeafPane(props: {
   const [tileDragOver, setTileDragOver] = createSignal(false);
   // Reveals the corner tools on pointer devices (see PaneTools).
   const [hovered, setHovered] = createSignal(false);
+  // The pane's live terminal surface, for the drop target's post-upload paste.
+  const [termSurface, setTermSurface] =
+    createSignal<BlitTerminalSurface | null>(null);
   const surfaceConnectionId = () =>
     surfaceParsed()?.connectionId ?? ctx.connectionId;
 
@@ -1452,6 +1456,7 @@ function LeafPane(props: {
           <BlitTile
             workspace={workspace}
             assignment={props.sessionId!}
+            focused={props.isFocused}
             theme={theme()}
             palette={ctx.palette}
             scale={scale()}
@@ -1508,7 +1513,14 @@ function LeafPane(props: {
                 />
               }
             >
-              <div style={{ width: "100%", height: "100%" }}>
+              <TerminalDropTarget
+                workspace={workspace}
+                sessionId={props.sessionId!}
+                connectionId={session()?.connectionId ?? ctx.connectionId}
+                surface={termSurface}
+                theme={theme()}
+                scale={scale()}
+              >
                 <BlitTerminal
                   sessionId={props.sessionId}
                   readOnly={
@@ -1523,9 +1535,12 @@ function LeafPane(props: {
                   style={{ width: "100%", height: "100%" }}
                   showCursor={props.isFocused}
                   onRender={ctx.onRender}
-                  surfaceRef={(s) => ctx.onTerminalSurface?.(s)}
+                  surfaceRef={(s) => {
+                    setTermSurface(s);
+                    ctx.onTerminalSurface?.(s);
+                  }}
                 />
-              </div>
+              </TerminalDropTarget>
               <Show when={session()?.state === "exited"}>
                 <div
                   style={{

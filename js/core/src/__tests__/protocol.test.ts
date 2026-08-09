@@ -18,6 +18,7 @@ import {
   buildSurfaceSubscribeMessage,
   buildClientFeaturesMessage,
   buildSurfacePreeditMessage,
+  buildSurfaceDragEnterMessage,
 } from "../protocol";
 import {
   C2S_ACK,
@@ -499,5 +500,56 @@ describe("buildSurfacePreeditMessage", () => {
     const msg = buildSurfacePreeditMessage(7, "", 0);
     expect(msg).toHaveLength(5);
     expect(msg[3] | (msg[4] << 8)).toBe(0);
+  });
+});
+
+describe("buildSurfaceDragEnterMessage", () => {
+  const hex = (msg: Uint8Array) =>
+    Array.from(msg, (b) => b.toString(16).padStart(2, "0")).join("");
+
+  // The wire layout, pinned: the Rust side pins this exact fixture.
+  // [0x35][surface:2][x:2][y:2][mime_count:2][mime_len:2][mime]... then the
+  // optional item trailer [item_count:2][mime_len:2][mime]...
+  const ENTER_NO_ITEMS =
+    "35" + // C2S_SURFACE_DRAG_ENTER
+    "0700" + // surface 7
+    "6400" + // x 100
+    "c800" + // y 200
+    "0200" + // two offered MIMEs
+    "0d00" +
+    "746578742f7572692d6c697374" + // "text/uri-list"
+    "1800" +
+    "6170706c69636174696f6e2f6f637465742d73747265616d"; // "application/octet-stream"
+
+  it("appends the item MIMEs as a trailer", () => {
+    expect(
+      hex(
+        buildSurfaceDragEnterMessage(
+          7,
+          100,
+          200,
+          ["text/uri-list", "application/octet-stream"],
+          ["image/png", "image/jpeg"],
+        ),
+      ),
+    ).toBe(
+      ENTER_NO_ITEMS +
+        "0200" + // two items
+        "0900" +
+        "696d6167652f706e67" + // "image/png"
+        "0a00" +
+        "696d6167652f6a706567", // "image/jpeg"
+    );
+  });
+
+  it("stays byte-identical without items", () => {
+    expect(
+      hex(
+        buildSurfaceDragEnterMessage(7, 100, 200, [
+          "text/uri-list",
+          "application/octet-stream",
+        ]),
+      ),
+    ).toBe(ENTER_NO_ITEMS);
   });
 });

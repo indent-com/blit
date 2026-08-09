@@ -1,8 +1,8 @@
 /**
  * The focused tile's chrome (filename, navigation, state, and actions) lives
- * in the global StatusBar rather than a per-tile header. An editor publishes
- * itself here when it gains focus; a diff publishes on mount and click. The
- * StatusBar reads the current controller and renders identity + actions.
+ * in the global StatusBar rather than a per-tile header. A tile publishes
+ * itself here while its workspace pane is focused. The StatusBar reads the
+ * current controller and renders identity + actions.
  *
  * The accessors close over the owning tile's signals, so the StatusBar stays
  * reactive without any prop threading. A controller is cleared when its tile
@@ -96,22 +96,20 @@ export function registerActiveEditor(c: TileChrome): void {
   setActiveEditor(c);
 }
 
+/**
+ * Keep `c`'s status-bar ownership in sync with its workspace pane.
+ *
+ * BSP keeps every pane mounted. A background tile must therefore neither
+ * claim the bar on mount nor leave its old controller behind when focus moves
+ * to a terminal, surface, web view, empty pane, or another tile. The
+ * identity check on release makes focus-effect ordering irrelevant: an old
+ * pane cannot clear the controller a newly focused pane just registered.
+ */
+export function setActiveEditorFocused(c: TileChrome, focused: boolean): void {
+  setActiveEditor((cur) => (focused ? c : cur === c ? null : cur));
+}
+
 /** Clear `c` if it is still the active one (call on tile unmount). */
 export function clearActiveEditor(c: TileChrome): void {
   setActiveEditor((cur) => (cur === c ? null : cur));
-}
-
-/**
- * Drop whatever chrome is registered, whoever owns it.
- *
- * A tile only ever clears itself on unmount, which is enough in the
- * single-tile layout (focusing a terminal dismisses the tile) but not
- * under BSP, where a tile and a terminal are on screen at once: focus
- * leaves the tile, nothing unmounts, and the bar keeps showing the
- * editor's identity and its Save/Def/Refs actions while the user types
- * in a terminal. Called when a terminal takes focus, which is the one
- * moment the tile chrome is definitely not what the bar should show.
- */
-export function clearTileChrome(): void {
-  setActiveEditor(null);
 }

@@ -5040,4 +5040,3 @@ fn submodule_reads_its_checked_out_head() {
         vec![("deps/mod".to_string(), b' ', b'M')]
     );
 }
-

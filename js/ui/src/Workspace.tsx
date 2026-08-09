@@ -148,7 +148,6 @@ import {
 } from "./ide/rootsStore";
 import { useIdeSession, type IdeSessionDescriptor } from "./ide/session";
 import { localFileIndex, searchFileIndex } from "./ide/fileIndex";
-import { clearTileChrome } from "./ide/activeEditor";
 import { editorRecencySnapshot } from "./ide/editorPositions";
 import { SwitcherOverlay } from "./SwitcherOverlay";
 import { PaletteOverlay } from "./PaletteOverlay";
@@ -328,41 +327,7 @@ function WorkspaceScreen(props: {
     if (!snap.focusedSessionId) return null;
     return snap.sessions.find((s) => s.id === snap.focusedSessionId) ?? null;
   };
-
-  // A terminal taking focus owns the status bar. Under BSP an editor tile
-  // and a terminal are on screen together, so focus can leave the tile
-  // without unmounting it — and a tile only clears its own chrome on
-  // unmount, which would leave the bar showing the editor's filename and
-  // its Save/Def/Refs buttons while the user types in a terminal.
-  //
-  // Memoized on the id, not read off the snapshot: snapshots churn on every
-  // terminal frame, and clearing on each one would wipe the chrome an
-  // editor had just registered.
   const focusedSessionId = createMemo(() => wsState().focusedSessionId);
-  // Focusing a tile pane pushes a null session id — but a null focus does
-  // not stay null: resolveFocusedSessionId resurrects it from the
-  // per-connection fallback on the next connection event, and a terminal
-  // title update is enough. So a truthy session id says nothing about what
-  // the user is actually looking at, and clearing on it alone dropped the
-  // chrome of an editor or diff a moment after it was focused. Gate on the
-  // focused slot's own content instead. (The document title effect below
-  // guards the same resurrection the same way.)
-  //
-  // Lazy on purpose: it reads consts declared further down, so it must not
-  // run until the effect below does — after the component body.
-  const focusedSlotHoldsTile = () => {
-    const assign = inBsp()
-      ? (layoutAssignments()?.assignments[bspFocusedPaneId() ?? ""] ?? null)
-      : activeTile();
-    return typeof assign === "string" && isTileAssignment(assign);
-  };
-  createEffect(() => {
-    // Both read unconditionally: the effect has to re-run when focus moves
-    // between panes even while the session id sits still (it can already
-    // name the terminal the user is moving to).
-    const holdsTile = focusedSlotHoldsTile();
-    if (focusedSessionId() && !holdsTile) clearTileChrome();
-  });
 
   /** The connection that owns the currently focused session (or the first). */
   const activeConnectionId = (): ConnectionId => {
@@ -479,14 +444,6 @@ function WorkspaceScreen(props: {
       const conn = workspace.getConnection(spec.id);
       if (!conn) continue;
       cleanups.push(conn.surfaceStore.onChange(syncAll));
-      // A client asking to be activated (xdg_activation_v1 — e.g. an
-      // Electron app reacting to a notification click) gets the same
-      // treatment as picking its surface in the switcher.
-      cleanups.push(
-        conn.surfaceStore.onActivated((surfaceId) =>
-          focusSurface(surfaceId, spec.id),
-        ),
-      );
     }
     // Also refresh on workspace state changes (connection status
     // transitions) so the surface list stays in sync after reconnects
@@ -3097,6 +3054,9 @@ function WorkspaceScreen(props: {
     } else {
       focusSurfaceById(surfaceId, connectionId);
     }
+    // Null first: closeOverlay restores previousFocus on a timeout, which
+    // would steal focus back from the surface — see selectPane.
+    previousFocus = null;
     closeOverlay();
   }
 
@@ -3169,6 +3129,10 @@ function WorkspaceScreen(props: {
       // Empty pane, no command — just move focus.
       focusPaneFn?.(paneId);
     }
+    // Null first: closeOverlay restores previousFocus on a timeout, which
+    // would steal focus back from the chosen pane — on touch devices that
+    // drops the virtual keyboard and clears keyboardWanted.
+    previousFocus = null;
     closeOverlay();
   }
 
@@ -3755,19 +3719,31 @@ function WorkspaceScreen(props: {
                               >
                                 {(fid) => (
                                   <>
-                                    <BlitTerminal
+                                    <TerminalDropTarget
+                                      workspace={workspace}
                                       sessionId={fid()}
-                                      readOnly={isSessionReadOnly(fid())}
-                                      onRender={countFrame}
-                                      style={{ width: "100%", height: "100%" }}
-                                      fontFamily={resolvedFontWithFallback()}
-                                      fontSize={fontSize()}
-                                      palette={palette()}
-                                      surfaceRef={(s) => {
-                                        setTerminalSurface(s);
-                                        bindTerminalLinks(s);
-                                      }}
-                                    />
+                                      connectionId={
+                                        focusedSession()?.connectionId ??
+                                        activeConnectionId()
+                                      }
+                                      surface={terminalSurface}
+                                      theme={theme()}
+                                      scale={chromeScale()}
+                                    >
+                                      <BlitTerminal
+                                        sessionId={fid()}
+                                        readOnly={isSessionReadOnly(fid())}
+                                        onRender={countFrame}
+                                        style={{ width: "100%", height: "100%" }}
+                                        fontFamily={resolvedFontWithFallback()}
+                                        fontSize={fontSize()}
+                                        palette={palette()}
+                                        surfaceRef={(s) => {
+                                          setTerminalSurface(s);
+                                          bindTerminalLinks(s);
+                                        }}
+                                      />
+                                    </TerminalDropTarget>
                                     <Show
                                       when={
                                         focusedSession()?.state === "exited"
@@ -3871,6 +3847,7 @@ function WorkspaceScreen(props: {
                             <BlitTile
                               workspace={workspace}
                               assignment={tile()}
+                              focused
                               theme={theme()}
                               palette={palette()}
                               scale={chromeScale()}
@@ -4148,6 +4125,9 @@ function WorkspaceScreen(props: {
               onMoveToPane={(sessionId, targetPaneId) => {
                 moveSessionToPaneFn?.(sessionId, targetPaneId);
                 workspace.focusSession(sessionId);
+                // Null first: closeOverlay restores previousFocus on a
+                // timeout — see selectPane.
+                previousFocus = null;
                 closeOverlay();
               }}
               onApplyLayout={(l) => {
@@ -4224,6 +4204,9 @@ function WorkspaceScreen(props: {
               onMoveSurfaceToPane={(sid, connId, targetPaneId) => {
                 moveToPaneFn?.(surfaceAssignment(connId, sid), targetPaneId);
                 focusSurfaceById(null);
+                // Null first: closeOverlay restores previousFocus on a
+                // timeout — see selectPane.
+                previousFocus = null;
                 closeOverlay();
               }}
               backgroundTiles={backgroundTiles()}

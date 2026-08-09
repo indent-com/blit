@@ -10,7 +10,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
 use wayland_client::protocol::{
-    wl_data_device, wl_data_device_manager, wl_data_offer, wl_registry, wl_seat,
+    wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source, wl_registry, wl_seat,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noop};
 
@@ -32,6 +32,7 @@ struct App {
     offered: Vec<String>,
     /// The offer the compositor last named as the selection.
     selection: Option<wl_data_offer::WlDataOffer>,
+    source_sends: Vec<String>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for App {
@@ -101,6 +102,23 @@ impl Dispatch<wl_data_offer::WlDataOffer, ()> for App {
     ) {
         if let wl_data_offer::Event::Offer { mime_type } = event {
             state.offered.push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<wl_data_source::WlDataSource, ()> for App {
+    fn event(
+        state: &mut Self,
+        _: &wl_data_source::WlDataSource,
+        event: wl_data_source::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_data_source::Event::Send { mime_type, fd } = event {
+            let mut file = std::fs::File::from(fd);
+            file.write_all(PNG).expect("write clipboard image");
+            state.source_sends.push(mime_type);
         }
     }
 }
@@ -258,4 +276,78 @@ fn replacing_a_text_selection_with_an_image_withdraws_the_text_types() {
     assert_eq!(fx.receive("image/png"), PNG);
     assert!(fx.receive("text/plain").is_empty());
     fx.drain_events();
+}
+
+#[test]
+fn a_wayland_clients_image_selection_splices_directly_to_another_client() {
+    let mut fx = Fixture::new();
+
+    // A second Wayland client is the clipboard owner (Slack); the fixture's
+    // original client is the eventual paste target (Legcord).
+    let socket = fx
+        .handle
+        .as_ref()
+        .expect("compositor running")
+        .socket_name
+        .clone();
+    let stream = UnixStream::connect(socket).expect("connect owner");
+    let owner_conn = Connection::from_socket(stream).expect("owner connection");
+    let mut owner_queue = owner_conn.new_event_queue();
+    let owner_qh = owner_queue.handle();
+    owner_conn.display().get_registry(&owner_qh, ());
+    let mut owner = App::default();
+    owner_queue
+        .roundtrip(&mut owner)
+        .expect("owner registry roundtrip");
+    let ddm = owner.ddm.clone().expect("owner ddm");
+    let seat = owner.seat.clone().expect("owner seat");
+    let device = ddm.get_data_device(&seat, &owner_qh, ());
+    let source = ddm.create_data_source(&owner_qh, ());
+    source.offer("image/png".to_string());
+    device.set_selection(Some(&source), 0);
+    owner_queue
+        .roundtrip(&mut owner)
+        .expect("publish owner selection");
+
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        fx.drain_events()
+            .iter()
+            .any(|event| matches!(event, CompositorEvent::ClipboardOwner { wayland: true })),
+        "the web side must learn that browser paste may not replace this selection"
+    );
+    fx.queue
+        .roundtrip(&mut fx.app)
+        .expect("target selection roundtrip");
+    assert_eq!(fx.app.offered, vec!["image/png".to_string()]);
+
+    let offer = fx.app.selection.clone().expect("target selection offer");
+    let (mut reader, writer) = UnixStream::pair().expect("transfer pipe");
+    offer.receive("image/png".to_string(), writer.as_fd());
+    fx.conn.flush().expect("flush target receive");
+    drop(writer);
+    std::thread::sleep(Duration::from_millis(50));
+    owner_queue
+        .roundtrip(&mut owner)
+        .expect("owner handles send");
+
+    reader
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).expect("read image");
+    assert_eq!(bytes, PNG);
+    assert_eq!(owner.source_sends, vec!["image/png".to_string()]);
+
+    source.destroy();
+    owner_queue
+        .roundtrip(&mut owner)
+        .expect("destroy owner selection");
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        fx.drain_events()
+            .iter()
+            .any(|event| matches!(event, CompositorEvent::ClipboardOwner { wayland: false })),
+        "destroying the owner must re-enable browser clipboard import"
+    );
 }

@@ -93,6 +93,8 @@ export type {
   FsGrepOptions,
   FsSyncOptions,
   FsSyncHandle,
+  FsUploadOptions,
+  FsUploadResult,
 } from "./fs";
 export * from "./git";
 export * from "./lsp";

@@ -48,6 +48,9 @@ export function BlitTile(props: {
    *  buffer parking — a zoomed-out always-on view, like a terminal
    *  thumbnail. */
   preview?: boolean;
+  /** Whether this tile owns workspace focus. BSP panes stay mounted in the
+   *  background, so status-bar chrome must follow this separately. */
+  focused?: boolean;
 }) {
   const view = (assignment: string) => {
     const t = parseTileAssignment(assignment);
@@ -67,6 +70,7 @@ export function BlitTile(props: {
           fontSize={props.fontSize}
           onOpenTile={props.onOpenTile}
           preview={props.preview}
+          focused={props.focused}
         />
       );
     }
@@ -82,6 +86,7 @@ export function BlitTile(props: {
           fontSize={props.fontSize}
           onOpenTile={props.onOpenTile}
           preview={props.preview}
+          focused={props.focused}
         />
       );
     }
@@ -100,6 +105,7 @@ export function BlitTile(props: {
           fontSize={props.fontSize}
           onOpenTile={props.onOpenTile}
           preview={props.preview}
+          focused={props.focused}
         />
       );
     }
@@ -114,6 +120,7 @@ export function BlitTile(props: {
         fontSize={props.fontSize}
         onOpenTile={props.onOpenTile}
         preview={props.preview}
+        focused={props.focused}
       />
     );
   };

@@ -1,4 +1,5 @@
 import type { ConnectionId, BlitSurface } from "./types";
+import type { FsSyncHandle } from "./fs";
 import {
   CODEC_SUPPORT_H264,
   CODEC_SUPPORT_AV1,
@@ -461,6 +462,21 @@ function detectMacOptionChars(): boolean {
 // BlitSurfaceCanvas
 // ---------------------------------------------------------------------------
 
+/** Mounted live canvases, used to hand an in-progress physical mouse grab
+ * across DOM elements.  Browser mouse capture is not consistent across a
+ * canvas boundary while a remote app is drawing its own drag icon; routing
+ * the window event by hit-test keeps the compositor's drag over the surface
+ * actually under the pointer. */
+const mountedSurfaceCanvases = new Map<
+  HTMLCanvasElement,
+  BlitSurfaceCanvas
+>();
+const routedGrabMouseEvents = new WeakSet<Event>();
+let activeSurfaceMouseGrab: {
+  owner: BlitSurfaceCanvas;
+  buttons: Set<number>;
+} | null = null;
+
 export interface BlitSurfaceCanvasOptions {
   workspace: BlitWorkspace;
   connectionId: ConnectionId;
@@ -557,6 +573,117 @@ function clipboardImage(dt: DataTransfer | null): File | null {
     if (match) return match;
   }
   return images[0];
+}
+
+/**
+ * Largest inline drop payload we will put on the wire.
+ *
+ * `C2S_SURFACE_DRAG_DROP` rides a single transport frame — there is no
+ * fragmentation on the C2S path — and the frame ceiling is 16 MiB; a frame
+ * over it is refused, not truncated.  Stay a full 1 MiB under the ceiling
+ * to cover the MIME/name/framing overhead around the payload bytes.  Only
+ * name-less items (dragged text) still ride the frame inline: dropped
+ * FILES are staged through the chunked FS upload pump and the DROP names
+ * them, so they have no size cap here.
+ */
+const MAX_DND_BYTES = 15 * 1024 * 1024;
+
+/** A dragleave this soon after a SURFACE_DRAG_ENTER for the same surface
+ * is not an exit: DOM fires dragenter on the new target *before* dragleave
+ * on the old one, so crossing between two mounts of one surface delivers
+ * the surface's ENTER and then the old mount's stale LEAVE — which would
+ * kill the session the ENTER just retargeted (and the drop with it).  A
+ * genuine exit follows the last ENTER by the whole hover, not by
+ * milliseconds.  The cost of dropping a genuinely instant exit is benign:
+ * the session stays open, the next ENTER retargets it, and a DROP still
+ * lands. */
+const DRAG_LEAVE_STALE_MS = 100;
+
+/** Per (connection, surface): when the last SURFACE_DRAG_ENTER went out. */
+const lastDragEnterAt = new WeakMap<BlitConnection, Map<number, number>>();
+
+function recordDragEnter(conn: BlitConnection, surfaceId: number): void {
+  let bySurface = lastDragEnterAt.get(conn);
+  if (!bySurface) {
+    bySurface = new Map();
+    lastDragEnterAt.set(conn, bySurface);
+  }
+  bySurface.set(surfaceId, Date.now());
+}
+
+/** One MIME per file-kind drag item, in item order — readable during
+ *  hover, unlike the files themselves.  Undefined for a drag with no file
+ *  items: text drags send no items trailer. */
+function dragFileItemMimes(dt: DataTransfer | null): string[] | undefined {
+  if (!dt) return undefined;
+  const mimes: string[] = [];
+  for (const item of Array.from(dt.items ?? [])) {
+    if (item.kind !== "file") continue;
+    mimes.push(item.type || "application/octet-stream");
+  }
+  return mimes.length > 0 ? mimes : undefined;
+}
+
+/**
+ * The MIME list to offer the compositor for a drag, or null when the drag
+ * is none of ours.  OS file drags usually list "Files" among the types —
+ * but macOS file promises (the screenshot's floating thumbnail) can arrive
+ * with only a file-kind item and no "Files" type, so items count too.  File
+ * drags are offered as a URI list with a raw-bytes fallback; a text drag as
+ * plain text.  Anything else — pane/tile moves carry only custom MIMEs — is
+ * an internal UI drag and must pass through untouched.
+ */
+function dragOfferMimes(dt: DataTransfer | null): string[] | null {
+  if (!dt) return null;
+  const types = Array.from(dt.types ?? []);
+  if (types.includes("Files") || dragHasFileItem(dt))
+    return ["text/uri-list", "application/octet-stream"];
+  if (types.includes("text/plain"))
+    return ["text/plain;charset=utf-8", "text/plain"];
+  return null;
+}
+
+/** True when any drag item is a file (available even when types omit
+ *  "Files", as with macOS file-promise drags). */
+function dragHasFileItem(dt: DataTransfer): boolean {
+  for (const item of Array.from(dt.items ?? [])) {
+    if (item.kind === "file") return true;
+  }
+  return false;
+}
+
+/** The files a drop carries, from `files` or — macOS file promises again —
+ *  from file-kind items when `files` is empty. */
+function droppedFiles(dt: DataTransfer): File[] {
+  if (dt.files.length > 0) return Array.from(dt.files);
+  const files: File[] = [];
+  for (const item of Array.from(dt.items ?? [])) {
+    if (item.kind !== "file") continue;
+    const file = item.getAsFile();
+    if (file) files.push(file);
+  }
+  return files;
+}
+
+/** The staging path for drag item `index` with MIME `mime`, derived
+ *  identically on the server from the item list ENTER carried: the
+ *  text/uri-list served during hover names exactly these paths, so the
+ *  DROP must stage to them.  Real filenames are lost in the offered
+ *  uri-list (a dropped image shows as e.g. `0.png`) — the accepted
+ *  trade-off for the remote app's drop UI appearing before
+ *  mouse-release. */
+function plannedDropName(mime: string, index: number): string {
+  const ext =
+    mime === "image/png"
+      ? "png"
+      : mime === "image/jpeg"
+        ? "jpg"
+        : mime === "image/webp"
+          ? "webp"
+          : mime === "image/gif"
+            ? "gif"
+            : "bin";
+  return `${index}.${ext}`;
 }
 
 /**
@@ -731,7 +858,8 @@ export class BlitSurfaceCanvas {
     metaChord: boolean;
   } | null = null;
   private _pendingPasteFlush:
-    ((payload: ClipboardPayload | null) => void) | null = null;
+    | ((payload: ClipboardPayload | null) => void)
+    | null = null;
   /** Stand the in-flight chord down without pressing V, releasing anything
    *  the deferral held back.  Runs when the clipboard is known to hold
    *  nothing pastable, when an image we declined is all it held, or when
@@ -760,6 +888,8 @@ export class BlitSurfaceCanvas {
   private boundMouseDown: ((e: MouseEvent) => void) | null = null;
   private boundMouseUp: ((e: MouseEvent) => void) | null = null;
   private boundMouseMove: ((e: MouseEvent) => void) | null = null;
+  private boundWindowMouseUp: ((e: MouseEvent) => void) | null = null;
+  private boundWindowMouseMove: ((e: MouseEvent) => void) | null = null;
   private boundWheel: ((e: WheelEvent) => void) | null = null;
   private boundTouchStart: ((e: TouchEvent) => void) | null = null;
   private boundTouchMove: ((e: TouchEvent) => void) | null = null;
@@ -779,6 +909,29 @@ export class BlitSurfaceCanvas {
   private boundCompositionEnd: ((e: CompositionEvent) => void) | null = null;
   private boundPaste: ((e: ClipboardEvent) => void) | null = null;
   private boundDocumentPaste: ((e: ClipboardEvent) => void) | null = null;
+  private boundWindowBlur: (() => void) | null = null;
+  private boundBrowserClipboardChange: (() => void) | null = null;
+  private boundDragEnter: ((e: DragEvent) => void) | null = null;
+  private boundDragOver: ((e: DragEvent) => void) | null = null;
+  private boundDragLeave: ((e: DragEvent) => void) | null = null;
+  private boundDrop: ((e: DragEvent) => void) | null = null;
+  private boundDragEnd: (() => void) | null = null;
+  /** True between a sent DRAG_ENTER and its LEAVE / DROP / CANCEL — the
+   *  compositor has a live wl_data_device drag session we are driving. */
+  private dragActive = false;
+  /** Staging names announced by the most recent file ENTER, in item order.
+   *  These names are authoritative at DROP: `DataTransferItem.type` is
+   *  visible during hover, while `File.type` is read after release and can
+   *  differ (notably for file promises). */
+  private dragPlannedNames: string[] | null = null;
+
+  /** Per-canvas staging sync for file drops (FS_SYNC_STAGING), opened
+   *  lazily on the first file drop and reused across drops: the staging
+   *  dir is per-connection and lives until the connection closes, so one
+   *  sync serves every drop on this canvas.  Stopped on dispose. */
+  private dragStaging: FsSyncHandle | null = null;
+  /** An in-flight open of `dragStaging` — concurrent drops share it. */
+  private dragStagingOpening: Promise<FsSyncHandle> | null = null;
 
   constructor(options: BlitSurfaceCanvasOptions) {
     this._workspace = options.workspace;
@@ -859,6 +1012,7 @@ export class BlitSurfaceCanvas {
 
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
+    mountedSurfaceCanvases.set(canvas, this);
 
     this.observePresentBox(container);
     this.subscribe();
@@ -910,6 +1064,8 @@ export class BlitSurfaceCanvas {
     this.releaseAllButtons();
     this.endScrollSequence();
     this.setDisplaySize(null);
+    this.dragStaging?.stop();
+    this.dragStaging = null;
     this.serverUnsubscribe();
     this.detachEvents();
     this.unsubscribeAll();
@@ -917,6 +1073,7 @@ export class BlitSurfaceCanvas {
       this.container.removeChild(this.textInput);
     }
     this.textInput = null;
+    if (this.canvas) mountedSurfaceCanvases.delete(this.canvas);
     if (this.canvas && this.container) {
       this.container.removeChild(this.canvas);
     }
@@ -1469,6 +1626,10 @@ export class BlitSurfaceCanvas {
     this.boundMouseDown = (e) => this.handleMouse(e, SURFACE_POINTER_DOWN);
     this.boundMouseUp = (e) => this.handleMouse(e, SURFACE_POINTER_UP);
     this.boundMouseMove = (e) => this.handleMouse(e, SURFACE_POINTER_MOVE);
+    this.boundWindowMouseMove = (e) =>
+      this.handleWindowMouseGrab(e, SURFACE_POINTER_MOVE);
+    this.boundWindowMouseUp = (e) =>
+      this.handleWindowMouseGrab(e, SURFACE_POINTER_UP);
     this.boundWheel = (e) => this.handleWheel(e);
     this.boundTouchStart = (e) => this.handleTouchStart(e);
     this.boundTouchMove = (e) => this.handleTouchMove(e);
@@ -1491,10 +1652,19 @@ export class BlitSurfaceCanvas {
     this.boundDocumentPaste = (e) => {
       if (this._pendingPasteFlush) this.handlePaste(e);
     };
+    // A Wayland selection stays authoritative while focus moves between
+    // streamed surfaces.  Only leaving the browser context, or a genuine
+    // DOM copy/cut, means the host clipboard may now be newer.
+    this.boundWindowBlur = () =>
+      this.getConn()?.noteBrowserClipboardMayHaveChanged();
+    this.boundBrowserClipboardChange = () =>
+      this.getConn()?.noteBrowserClipboardMayHaveChanged();
 
     canvas.addEventListener("mousedown", this.boundMouseDown);
     canvas.addEventListener("mouseup", this.boundMouseUp);
     canvas.addEventListener("mousemove", this.boundMouseMove);
+    window.addEventListener("mousemove", this.boundWindowMouseMove, true);
+    window.addEventListener("mouseup", this.boundWindowMouseUp, true);
     canvas.addEventListener("wheel", this.boundWheel, { passive: false });
     canvas.addEventListener("pointerdown", this.boundPointerDown);
     canvas.addEventListener("pointermove", this.boundPointerMove);
@@ -1519,6 +1689,31 @@ export class BlitSurfaceCanvas {
     canvas.addEventListener("contextmenu", this.boundContextMenu);
     canvas.addEventListener("paste", this.boundPaste);
     document.addEventListener("paste", this.boundDocumentPaste, true);
+    window.addEventListener("blur", this.boundWindowBlur);
+    document.addEventListener("copy", this.boundBrowserClipboardChange, true);
+    document.addEventListener("cut", this.boundBrowserClipboardChange, true);
+
+    // OS drag-and-drop onto the surface.  Drags that carry only custom
+    // MIMEs (pane/tile moves inside the page) are not ours: the handlers
+    // return before touching them, so the page's own DnD is unaffected.
+    this.boundDragEnter = (e) => this.handleDragEnter(e);
+    this.boundDragOver = (e) => this.handleDragOver(e);
+    this.boundDragLeave = (e) => this.handleDragLeave(e);
+    this.boundDrop = (e) => this.handleDrop(e);
+    canvas.addEventListener("dragenter", this.boundDragEnter);
+    canvas.addEventListener("dragover", this.boundDragOver);
+    canvas.addEventListener("dragleave", this.boundDragLeave);
+    canvas.addEventListener("drop", this.boundDrop);
+    // Belt and braces: an OS-source drag usually never fires dragend (it
+    // belongs to the drag source), but if one does while our session is
+    // still open, it means the drag was abandoned without a drop.
+    this.boundDragEnd = () => {
+      if (!this.dragActive) return;
+      this.dragActive = false;
+      this.dragPlannedNames = null;
+      this.getConn()?.sendSurfaceDragCancel();
+    };
+    window.addEventListener("dragend", this.boundDragEnd);
 
     // Hidden textarea is only used for IME composition.  Focus stays on
     // the canvas during normal typing; we redirect to the textarea when
@@ -1564,6 +1759,10 @@ export class BlitSurfaceCanvas {
       canvas.removeEventListener("mouseup", this.boundMouseUp);
     if (this.boundMouseMove)
       canvas.removeEventListener("mousemove", this.boundMouseMove);
+    if (this.boundWindowMouseMove)
+      window.removeEventListener("mousemove", this.boundWindowMouseMove, true);
+    if (this.boundWindowMouseUp)
+      window.removeEventListener("mouseup", this.boundWindowMouseUp, true);
     if (this.boundWheel) canvas.removeEventListener("wheel", this.boundWheel);
     if (this.boundPointerDown)
       canvas.removeEventListener("pointerdown", this.boundPointerDown);
@@ -1597,6 +1796,35 @@ export class BlitSurfaceCanvas {
     if (this.boundPaste) canvas.removeEventListener("paste", this.boundPaste);
     if (this.boundDocumentPaste)
       document.removeEventListener("paste", this.boundDocumentPaste, true);
+    if (this.boundWindowBlur)
+      window.removeEventListener("blur", this.boundWindowBlur);
+    if (this.boundBrowserClipboardChange) {
+      document.removeEventListener(
+        "copy",
+        this.boundBrowserClipboardChange,
+        true,
+      );
+      document.removeEventListener(
+        "cut",
+        this.boundBrowserClipboardChange,
+        true,
+      );
+    }
+    if (this.boundDragEnter)
+      canvas.removeEventListener("dragenter", this.boundDragEnter);
+    if (this.boundDragOver)
+      canvas.removeEventListener("dragover", this.boundDragOver);
+    if (this.boundDragLeave)
+      canvas.removeEventListener("dragleave", this.boundDragLeave);
+    if (this.boundDrop) canvas.removeEventListener("drop", this.boundDrop);
+    if (this.boundDragEnd)
+      window.removeEventListener("dragend", this.boundDragEnd);
+    // Disposing mid-drag must not leave the compositor session dangling.
+    if (this.dragActive) {
+      this.dragActive = false;
+      this.dragPlannedNames = null;
+      this.getConn()?.sendSurfaceDragCancel();
+    }
     this._pendingPaste = null;
     this._pendingPasteFlush = null;
     this._pendingPasteAbandon = null;
@@ -1617,6 +1845,10 @@ export class BlitSurfaceCanvas {
   }
 
   private handleMouse(e: MouseEvent, type: number): void {
+    // The window-capture bridge already routed this physical event to the
+    // surface under the pointer.  Its ordinary target listener must not
+    // put the same packet on the wire a second time.
+    if (routedGrabMouseEvents.has(e)) return;
     // Read the selection first: focusing the canvas below collapses it, so
     // by the time the button is on the wire there is nothing left to send.
     const primary =
@@ -1640,6 +1872,67 @@ export class BlitSurfaceCanvas {
     // offer before it delivers the button.
     if (primary) this.getConn()?.sendPrimary(primary.mime, primary.data);
     this.sendPointerAt(e.clientX, e.clientY, type, e.button);
+    if (
+      type === SURFACE_POINTER_DOWN &&
+      e.button === 0 &&
+      this.pressedButtons.has(e.button)
+    ) {
+      if (!activeSurfaceMouseGrab || activeSurfaceMouseGrab.owner !== this) {
+        activeSurfaceMouseGrab = { owner: this, buttons: new Set() };
+      }
+      activeSurfaceMouseGrab.buttons.add(e.button);
+    }
+  }
+
+  /** Find the mounted surface canvas under a window mouse event.  Use the
+   * full hit-test stack so pane chrome layered above a canvas does not turn
+   * a cross-surface drag into a gap. */
+  private mouseGrabTarget(e: MouseEvent): BlitSurfaceCanvas | null {
+    const doc = this.canvas?.ownerDocument ?? document;
+    const hitTest = doc.elementsFromPoint?.bind(doc);
+    const hits = hitTest ? hitTest(e.clientX, e.clientY) : [];
+    const elements =
+      hits.length > 0
+        ? hits
+        : e.target instanceof Element
+          ? [e.target]
+          : [];
+    const connection = this.getConn();
+    for (const element of elements) {
+      let node: Element | null = element;
+      while (node) {
+        const target =
+          node instanceof HTMLCanvasElement
+            ? mountedSurfaceCanvases.get(node)
+            : undefined;
+        if (target && target.getConn() === connection) return target;
+        node = node.parentElement;
+      }
+    }
+    return null;
+  }
+
+  /** Route held-mouse move/release at window capture phase.  This is the
+   * browser half of Wayland's implicit DnD grab: it remains alive through
+   * pane gaps and switches surface ids as the pointer crosses canvases. */
+  private handleWindowMouseGrab(e: MouseEvent, type: number): void {
+    const grab = activeSurfaceMouseGrab;
+    if (!grab || grab.owner !== this || routedGrabMouseEvents.has(e)) return;
+    if (type === SURFACE_POINTER_UP && !grab.buttons.has(e.button)) return;
+    const target = this.mouseGrabTarget(e);
+    // A gap carries no surface-local coordinate.  Keep the grab alive and
+    // wait for the next canvas; a release in the gap still has to cancel it.
+    if (type === SURFACE_POINTER_MOVE && !target) return;
+    const receiver = target ?? this;
+    routedGrabMouseEvents.add(e);
+    receiver.sendPointerAt(e.clientX, e.clientY, type, e.button);
+    if (type === SURFACE_POINTER_UP) {
+      // The release may have been sent by another canvas, but the button was
+      // recorded by the origin.  Clear both views of the physical grab.
+      this.pressedButtons.delete(e.button);
+      grab.buttons.delete(e.button);
+      if (grab.buttons.size === 0) activeSurfaceMouseGrab = null;
+    }
   }
 
   /** Focus where keystrokes should land: the editable textarea, so an input
@@ -1754,6 +2047,9 @@ export class BlitSurfaceCanvas {
       );
     }
     this.pressedButtons.clear();
+    if (activeSurfaceMouseGrab?.owner === this) {
+      activeSurfaceMouseGrab = null;
+    }
   }
 
   private clearActiveTouch(): void {
@@ -2216,6 +2512,201 @@ export class BlitSurfaceCanvas {
     });
   }
 
+  private handleDragEnter(e: DragEvent): void {
+    const mimes = dragOfferMimes(e.dataTransfer);
+    if (!mimes) return;
+    const conn = this.getConn();
+    if (!conn || !this.surface || !this._displaySize) return;
+    const point = this.surfacePointFromClient(e.clientX, e.clientY);
+    if (!point) return;
+    this.dragActive = true;
+    const itemMimes = dragFileItemMimes(e.dataTransfer);
+    this.dragPlannedNames = itemMimes?.map((mime, index) =>
+      plannedDropName(mime, index),
+    ) ?? null;
+    // The file items' MIMEs ride along so the server can pre-create the
+    // planned staging files and serve their text/uri-list during hover:
+    // Chromium fetches the offer's data at wl_data_device.enter and only
+    // fires the page's dragenter — the remote app's drop UI — once that
+    // completes.  Chrome preserves items/files order between dragover and
+    // drop, so the index alignment the planned names rely on holds.
+    conn.sendSurfaceDragEnter(
+      this._surfaceId,
+      point.x,
+      point.y,
+      mimes,
+      itemMimes,
+    );
+    recordDragEnter(conn, this._surfaceId);
+  }
+
+  private handleDragOver(e: DragEvent): void {
+    if (!dragOfferMimes(e.dataTransfer)) return;
+    // Required for `drop` to fire at all.  We always allow: whether the
+    // remote app accepts the offered types is not reported back.
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+    const conn = this.getConn();
+    if (!conn || !this.surface || !this._displaySize) return;
+    const point = this.surfacePointFromClient(e.clientX, e.clientY);
+    if (!point) return;
+    // Unthrottled, like pointer motion — the events fire continuously.
+    conn.sendSurfaceDragMotion(this._surfaceId, point.x, point.y);
+  }
+
+  private handleDragLeave(e: DragEvent): void {
+    if (!this.dragActive) return;
+    // dragleave also fires when the pointer crosses into a child element;
+    // only leaving the canvas itself ends the session.
+    if (e.relatedTarget && this.canvas?.contains(e.relatedTarget as Node))
+      return;
+    // And it fires *after* the new target's dragenter, so crossing between
+    // two mounts of one surface produces ENTER then a stale LEAVE that
+    // would kill the freshly retargeted session — drop those (see
+    // DRAG_LEAVE_STALE_MS).
+    const conn = this.getConn();
+    const enteredAt = conn
+      ? lastDragEnterAt.get(conn)?.get(this._surfaceId)
+      : undefined;
+    if (enteredAt !== undefined && Date.now() - enteredAt < DRAG_LEAVE_STALE_MS)
+      return;
+    this.dragActive = false;
+    this.dragPlannedNames = null;
+    conn?.sendSurfaceDragLeave(this._surfaceId);
+  }
+
+  private handleDrop(e: DragEvent): void {
+    const dt = e.dataTransfer;
+    if (!dragOfferMimes(dt)) return;
+    e.preventDefault();
+    this.dragActive = false;
+    const plannedNames = this.dragPlannedNames;
+    this.dragPlannedNames = null;
+    const conn = this.getConn();
+    if (!conn || !this.surface || !this._displaySize || !dt) return;
+    const point = this.surfacePointFromClient(e.clientX, e.clientY);
+    if (!point) return;
+    const surfaceId = this._surfaceId;
+
+    const fileDrag =
+      Array.from(dt.types ?? []).includes("Files") || dragHasFileItem(dt);
+    const files = fileDrag ? droppedFiles(dt) : [];
+    if (fileDrag) {
+      if (files.length === 0) {
+        // A file drag we could not read any file out of — say so rather
+        // than silently falling through to the text path.
+        console.warn("blit: file drop carried no readable files");
+        conn.sendSurfaceDragCancel();
+        return;
+      }
+      if (plannedNames && plannedNames.length !== files.length) {
+        // The remote app already received a URI list with this many paths.
+        // A different DROP cannot be made consistent with that snapshot.
+        console.warn(
+          "blit: file drop item count changed after drag enter — drag cancelled",
+        );
+        conn.sendSurfaceDragCancel();
+        return;
+      }
+      // Files are staged through the chunked upload pump first; the DROP
+      // goes out once every upload settles, naming the staged paths with
+      // empty data — the paced chunks never stall interactive input the
+      // way one big inline frame did.
+      void this.dropFiles(
+        conn,
+        surfaceId,
+        point.x,
+        point.y,
+        files,
+        plannedNames,
+      );
+      return;
+    }
+
+    const text = dt.getData("text/plain");
+    const data = new TextEncoder().encode(text);
+    if (data.length > MAX_DND_BYTES) {
+      console.warn(
+        `blit: dropped text is ${data.length} bytes, over the ` +
+          `${MAX_DND_BYTES}-byte drag-and-drop limit — not dropped`,
+      );
+      return;
+    }
+    conn.sendSurfaceDragDrop(surfaceId, point.x, point.y, [
+      {
+        mime: "text/plain;charset=utf-8",
+        name: "",
+        data,
+      },
+    ]);
+  }
+
+  /** Upload dropped files into the connection's drag staging dir, then
+   *  send the DROP naming them.  Any failure — the staging open or an
+   *  upload — cancels the session so no drag session dangles
+   *  compositor-side. */
+  private async dropFiles(
+    conn: BlitConnection,
+    surfaceId: number,
+    x: number,
+    y: number,
+    files: File[],
+    plannedNames: readonly string[] | null,
+  ): Promise<void> {
+    try {
+      const handle = await this.dragStagingHandle(conn);
+      const items: { mime: string; name: string; data: Uint8Array }[] = [];
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        // Stage to the path ENTER pre-announced for this item — the
+        // uri-list the remote app already received names exactly it.
+        const staged = plannedNames?.[i] ?? plannedDropName(file.type, i);
+        await handle.upload(staged, file);
+        items.push({
+          mime: file.type || "application/octet-stream",
+          name: staged,
+          data: new Uint8Array(0),
+        });
+      }
+      conn.sendSurfaceDragDrop(surfaceId, x, y, items);
+    } catch (err) {
+      console.warn(
+        `blit: could not stage a dropped file — drag cancelled`,
+        err,
+      );
+      conn.sendSurfaceDragCancel();
+    }
+  }
+
+  /** The canvas's staging sync, opened on first use and reused; a drop
+   *  that arrives while one is opening joins the same open. */
+  private dragStagingHandle(conn: BlitConnection): Promise<FsSyncHandle> {
+    if (this.dragStaging) return Promise.resolve(this.dragStaging);
+    this.dragStagingOpening ??= conn
+      .syncFs("", {
+        staging: true,
+        onClosed: () => {
+          // Closed from under us (server restart, connection loss) — the
+          // next drop reopens fresh.
+          this.dragStaging = null;
+        },
+      })
+      .then((handle) => {
+        this.dragStagingOpening = null;
+        if (this.disposed) {
+          handle.stop();
+        } else {
+          this.dragStaging = handle;
+        }
+        return handle;
+      })
+      .catch((err) => {
+        this.dragStagingOpening = null;
+        throw err;
+      });
+    return this.dragStagingOpening;
+  }
+
   // Fallback clipboard-read path for browsers/contexts where
   // `navigator.clipboard.readText()` is denied (Brave without granted
   // permission, Firefox, insecure contexts, ...).  The `paste` event
@@ -2228,6 +2719,7 @@ export class BlitSurfaceCanvas {
     if (!this._displaySize) return;
     const conn = this.getConn();
     if (!conn || !this.surface) return;
+    if (conn.usesWaylandClipboard()) return;
 
     // Claim the pending paste up front.  Reading an image blob is
     // asynchronous, and a `readText()` resolving in the meantime must not
@@ -2385,6 +2877,9 @@ export class BlitSurfaceCanvas {
     if (!isPasteShortcut) e.preventDefault();
     const conn = this.getConn();
     if (!conn || !this.surface) return;
+    const preserveWaylandClipboard =
+      isPasteShortcut && conn.usesWaylandClipboard();
+    if (preserveWaylandClipboard) e.preventDefault();
 
     // macOS Option as a character modifier, no dead key involved: the
     // browser resolves Option+F to "ƒ", Option+G to "©", and reports a
@@ -2543,6 +3038,15 @@ export class BlitSurfaceCanvas {
           this._metaToCtrlKey = 0;
         }
       };
+
+      // The compositor already has a live client-owned selection.  Press V
+      // immediately and let the destination receive its chosen MIME
+      // directly from that source; touching navigator.clipboard here would
+      // collapse/replace the selection (and loses image-only app copies).
+      if (preserveWaylandClipboard) {
+        flush(null);
+        return;
+      }
 
       // `navigator.clipboard.readText()` is often denied without an
       // explicit user-granted permission, and the `paste` event that backs

@@ -14,6 +14,7 @@ import {
   SURFACE_POINTER_DOWN,
   SURFACE_POINTER_MOVE,
   SURFACE_POINTER_UP,
+  buildSurfaceDragDropMessage,
 } from "../protocol";
 import {
   AXIS_SOURCE_CONTINUOUS,
@@ -581,6 +582,111 @@ function pointerEvent(type: string, x: number, y: number): Event {
   return ev;
 }
 
+describe("BlitSurfaceCanvas cross-surface mouse grabs", () => {
+  it("routes a held move and release to the canvas under the pointer", () => {
+    const pointers: {
+      id: number;
+      type: number;
+      button: number;
+      x: number;
+      y: number;
+    }[] = [];
+    const conn = {
+      sendSurfacePointer: (
+        id: number,
+        type: number,
+        button: number,
+        x: number,
+        y: number,
+      ) => pointers.push({ id, type, button, x, y }),
+      sendSurfaceFocus: () => {},
+      surfaceStore: new Proxy(
+        {
+          getSurface: (id: number) => ({
+            connectionId: "conn-1",
+            surfaceId: id,
+            width: 100,
+            height: 100,
+          }),
+          getCanvas: () => null,
+          canDecodeVideo: false,
+          generation: 0,
+        } as Record<string, unknown>,
+        {
+          get: (target, prop) =>
+            prop in target ? target[prop as string] : () => () => {},
+        },
+      ),
+      sendSurfaceSubscribe: () => {},
+      sendSurfaceUnsubscribe: () => {},
+    };
+    const workspace = {
+      getConnection: () => conn,
+      subscribe: () => () => {},
+    } as unknown as BlitWorkspace;
+    const mount = (id: number, left: number) => {
+      const surface = new BlitSurfaceCanvas({
+        workspace,
+        connectionId: "conn-1" as never,
+        surfaceId: id,
+      });
+      const container = document.createElement("div");
+      document.body.appendChild(container);
+      surface.attach(container);
+      surface.setDisplaySize(100, 100, 120);
+      const canvas = surface.canvasElement!;
+      canvas.width = 100;
+      canvas.height = 100;
+      canvas.getBoundingClientRect = () =>
+        ({ left, top: 0, width: 100, height: 100 }) as DOMRect;
+      return { surface, canvas, container };
+    };
+    const first = mount(1, 0);
+    const second = mount(2, 100);
+
+    try {
+      first.canvas.dispatchEvent(
+        new MouseEvent("mousedown", {
+          bubbles: true,
+          button: 0,
+          buttons: 1,
+          clientX: 10,
+          clientY: 20,
+        }),
+      );
+      second.canvas.dispatchEvent(
+        new MouseEvent("mousemove", {
+          bubbles: true,
+          button: 0,
+          buttons: 1,
+          clientX: 130,
+          clientY: 40,
+        }),
+      );
+      second.canvas.dispatchEvent(
+        new MouseEvent("mouseup", {
+          bubbles: true,
+          button: 0,
+          buttons: 0,
+          clientX: 140,
+          clientY: 50,
+        }),
+      );
+
+      expect(pointers).toEqual([
+        { id: 1, type: SURFACE_POINTER_DOWN, button: 0, x: 10, y: 20 },
+        { id: 2, type: SURFACE_POINTER_MOVE, button: 0, x: 30, y: 40 },
+        { id: 2, type: SURFACE_POINTER_UP, button: 0, x: 40, y: 50 },
+      ]);
+    } finally {
+      first.surface.dispose();
+      second.surface.dispose();
+      first.container.remove();
+      second.container.remove();
+    }
+  });
+});
+
 describe("BlitSurfaceCanvas touch", () => {
   beforeEach(() => {
     vi.useFakeTimers({
@@ -901,9 +1007,10 @@ const EVDEV_V = 47;
 
 /** A canvas wired for paste: captures what reaches the Wayland selection
  *  and which keycodes are forwarded, in order. */
-function attachPasting() {
+function attachPasting(initialWaylandOwner = false) {
   const clipboard: { mime: string; data: Uint8Array }[] = [];
   const keys: { keycode: number; pressed: boolean }[] = [];
+  let waylandOwner: boolean | null = initialWaylandOwner;
   const conn = {
     sendClipboard: (mime: string, data: Uint8Array) =>
       clipboard.push({ mime, data }),
@@ -913,6 +1020,10 @@ function attachPasting() {
     // The container is in the document here, so canvas.focus() really does
     // fire a focus event and the canvas really does claim keyboard focus.
     sendSurfaceFocus: () => {},
+    usesWaylandClipboard: () => waylandOwner === true,
+    noteBrowserClipboardMayHaveChanged: () => {
+      waylandOwner = null;
+    },
     surfaceStore: new Proxy(
       {
         getSurface: () => ({ width: 800, height: 600 }),
@@ -1000,6 +1111,25 @@ describe("BlitSurfaceCanvas paste", () => {
       ...navigator,
       clipboard: { readText: vi.fn().mockRejectedValue(new Error("denied")) },
     });
+  });
+
+  it("preserves an app-owned image selection instead of importing the browser clipboard", () => {
+    const readText = vi.fn().mockResolvedValue("stale browser clipboard");
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { readText, read: vi.fn() },
+    });
+    const { clipboard, keys, pressCtrlV, dispose } = attachPasting(true);
+
+    // dispatchEvent returns false when the handler cancelled the browser's
+    // native paste.  The V press is sent straight to Wayland, whose current
+    // image/png source answers the destination directly.
+    expect(pressCtrlV()).toBe(false);
+    expect(readText).not.toHaveBeenCalled();
+    expect(clipboard).toEqual([]);
+    expect(keys).toContainEqual({ keycode: EVDEV_V, pressed: true });
+
+    dispose();
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -1346,6 +1476,585 @@ describe("BlitSurfaceCanvas paste", () => {
   });
 });
 
+/** One drag session message, in wire order. */
+type DragSend =
+  | {
+      kind: "enter";
+      id: number;
+      x: number;
+      y: number;
+      mimes: string[];
+      items?: string[];
+    }
+  | { kind: "motion"; id: number; x: number; y: number }
+  | { kind: "leave"; id: number }
+  | {
+      kind: "drop";
+      id: number;
+      x: number;
+      y: number;
+      items: { mime: string; name: string; data: Uint8Array }[];
+    }
+  | { kind: "cancel" };
+
+/** A canvas wired for drag-and-drop: captures the session messages in
+ *  order, with the drawn region declared 1:1 with the surface so client
+ *  coordinates are surface coordinates.  File drops stage through a mocked
+ *  per-canvas staging sync: `uploads` records what the pump was asked to
+ *  send, and `syncFs` can be made to reject for the open-failure path. */
+function attachDragging() {
+  const sends: DragSend[] = [];
+  const uploads: { path: string; file: File }[] = [];
+  const stagingHandle = {
+    upload: vi.fn((path: string, file: File) => {
+      uploads.push({ path, file });
+      return Promise.resolve({});
+    }),
+    stop: vi.fn(),
+  };
+  const conn = {
+    sendSurfaceDragEnter: (
+      id: number,
+      x: number,
+      y: number,
+      mimes: string[],
+      items?: string[],
+    ) => sends.push({ kind: "enter", id, x, y, mimes, items }),
+    sendSurfaceDragMotion: (id: number, x: number, y: number) =>
+      sends.push({ kind: "motion", id, x, y }),
+    sendSurfaceDragLeave: (id: number) => sends.push({ kind: "leave", id }),
+    sendSurfaceDragDrop: (
+      id: number,
+      x: number,
+      y: number,
+      items: { mime: string; name: string; data: Uint8Array }[],
+    ) => sends.push({ kind: "drop", id, x, y, items }),
+    sendSurfaceDragCancel: () => sends.push({ kind: "cancel" }),
+    sendSurfaceFocus: () => {},
+    syncFs: vi.fn((_path: string, _options?: unknown) =>
+      Promise.resolve(stagingHandle),
+    ),
+    surfaceStore: new Proxy(
+      {
+        getSurface: () => ({ width: 800, height: 600 }),
+        getCanvas: () => null,
+        canDecodeVideo: false,
+        generation: 0,
+      } as Record<string, unknown>,
+      {
+        get: (target, prop) =>
+          prop in target ? target[prop as string] : () => () => {},
+      },
+    ),
+    sendSurfaceSubscribe: () => {},
+    sendSurfaceUnsubscribe: () => {},
+  };
+  const workspace = {
+    getConnection: () => conn,
+    subscribe: () => () => {},
+  } as unknown as BlitWorkspace;
+
+  /** One mount of the shared surface: its own canvas, sized like a live
+   *  view.  Several mounts of one surface_id is a normal BSP situation
+   *  (the same app in two panes) and the drag handlers must cope. */
+  const makeMount = () => {
+    const surface = new BlitSurfaceCanvas({
+      workspace,
+      connectionId: "conn-1" as never,
+      surfaceId: 7,
+    });
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    surface.attach(container);
+    const canvas = surface.canvasElement;
+    if (!canvas) throw new Error("Expected surface canvas");
+    // Only a live view takes input.
+    surface.setDisplaySize(800, 600, 120);
+    // jsdom lays nothing out, so the drawn region has to be declared.
+    canvas.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, width: 800, height: 600 }) as DOMRect;
+
+    /** Dispatch one drag event with a dataTransfer carrying any mix of
+     *  types, files, items and plain text. */
+    const fireDrag = (
+      type: "dragenter" | "dragover" | "dragleave" | "drop",
+      opts: {
+        x?: number;
+        y?: number;
+        types?: string[];
+        files?: File[];
+        items?: { kind: string; type: string; file?: File | null }[];
+        text?: string;
+        relatedTarget?: EventTarget | null;
+      } = {},
+    ) => {
+      const items = (
+        opts.items ??
+        (opts.files ?? []).map((f) => ({ kind: "file", type: f.type, file: f }))
+      ).map(
+        (it) =>
+          ({
+            kind: it.kind,
+            type: it.type,
+            getAsFile: () => it.file ?? null,
+          }) as unknown as DataTransferItem,
+      );
+      const dataTransfer = {
+        types: opts.types ?? (opts.files ? ["Files"] : ["text/plain"]),
+        files: opts.files ?? [],
+        items,
+        getData: (mime: string) =>
+          mime === "text/plain" ? (opts.text ?? "") : "",
+        dropEffect: "none",
+      } as unknown as DataTransfer;
+      // jsdom has no DragEvent; a MouseEvent carries the client coords and
+      // relatedTarget the handlers read.
+      const ev = new MouseEvent(type, {
+        clientX: opts.x ?? 0,
+        clientY: opts.y ?? 0,
+        bubbles: true,
+        cancelable: true,
+        relatedTarget: opts.relatedTarget ?? null,
+      });
+      Object.defineProperty(ev, "dataTransfer", { value: dataTransfer });
+      canvas.dispatchEvent(ev);
+      return ev;
+    };
+
+    const dispose = () => {
+      surface.dispose();
+      container.remove();
+    };
+
+    return { surface, canvas, fireDrag, dispose };
+  };
+
+  const first = makeMount();
+
+  return {
+    surface: first.surface,
+    canvas: first.canvas,
+    sends,
+    fireDrag: first.fireDrag,
+    dispose: first.dispose,
+    uploads,
+    stagingHandle,
+    syncFs: conn.syncFs,
+    attachMount: makeMount,
+  };
+}
+
+describe("BlitSurfaceCanvas drag-and-drop", () => {
+  it("sends ENTER with the offered MIMEs and surface coords on dragenter", () => {
+    const { sends, fireDrag, dispose } = attachDragging();
+    fireDrag("dragenter", { x: 100, y: 200, types: ["Files"] });
+    expect(sends).toEqual([
+      {
+        kind: "enter",
+        id: 7,
+        x: 100,
+        y: 200,
+        mimes: ["text/uri-list", "application/octet-stream"],
+      },
+    ]);
+    expect(sends[0].kind === "enter" && sends[0].items).toBeUndefined();
+    dispose();
+  });
+
+  it("sends the file items' MIMEs with ENTER, in item order", () => {
+    const { sends, fireDrag, dispose } = attachDragging();
+    fireDrag("dragenter", {
+      x: 1,
+      y: 2,
+      types: ["Files"],
+      items: [
+        { kind: "file", type: "image/png" },
+        { kind: "string", type: "text/plain" },
+        { kind: "file", type: "image/jpeg" },
+        { kind: "file", type: "" },
+      ],
+    });
+    const enter = sends[0];
+    if (enter.kind !== "enter") throw new Error("Expected an ENTER");
+    // File-kind items only; a typeless one falls back to octet-stream.
+    expect(enter.items).toEqual([
+      "image/png",
+      "image/jpeg",
+      "application/octet-stream",
+    ]);
+    dispose();
+  });
+
+  it("offers plain-text MIMEs for a text drag", () => {
+    const { sends, fireDrag, dispose } = attachDragging();
+    fireDrag("dragenter", { x: 1, y: 2, types: ["text/plain"] });
+    expect(sends).toEqual([
+      {
+        kind: "enter",
+        id: 7,
+        x: 1,
+        y: 2,
+        mimes: ["text/plain;charset=utf-8", "text/plain"],
+      },
+    ]);
+    // A text drag carries no items trailer.
+    expect(sends[0].kind === "enter" && sends[0].items).toBeUndefined();
+    dispose();
+  });
+
+  it("sends MOTION on dragover and claims the event", () => {
+    const { sends, fireDrag, dispose } = attachDragging();
+    fireDrag("dragenter", { x: 0, y: 0, types: ["Files"] });
+    const ev = fireDrag("dragover", { x: 10, y: 20, types: ["Files"] });
+    expect(ev.defaultPrevented).toBe(true);
+    expect(
+      (ev as unknown as { dataTransfer: DataTransfer }).dataTransfer.dropEffect,
+    ).toBe("copy");
+    expect(sends.at(-1)).toEqual({ kind: "motion", id: 7, x: 10, y: 20 });
+    dispose();
+  });
+
+  it("sends LEAVE only when the drag leaves the canvas itself", () => {
+    vi.useFakeTimers();
+    const { sends, canvas, fireDrag, dispose } = attachDragging();
+    fireDrag("dragenter", { x: 0, y: 0, types: ["Files"] });
+    // Crossing into a child is not leaving the surface.
+    fireDrag("dragleave", { types: ["Files"], relatedTarget: canvas });
+    expect(sends).toHaveLength(1);
+    // A genuine exit follows the hover, not the ENTER by milliseconds (see
+    // the stale-LEAVE filter for the DOM enter-before-leave order).
+    vi.advanceTimersByTime(1000);
+    fireDrag("dragleave", { types: ["Files"] });
+    expect(sends.at(-1)).toEqual({ kind: "leave", id: 7 });
+    vi.useRealTimers();
+    dispose();
+  });
+
+  it("ignores a belated LEAVE from another mount of the same surface", () => {
+    // DOM fires dragenter on the new target BEFORE dragleave on the old
+    // one: crossing between two mounts of one surface would otherwise kill
+    // the session the second ENTER just retargeted.
+    vi.useFakeTimers();
+    const first = attachDragging();
+    const second = first.attachMount();
+    try {
+      first.fireDrag("dragenter", { x: 1, y: 1, types: ["Files"] });
+      expect(first.sends).toHaveLength(1);
+      second.fireDrag("dragenter", { x: 2, y: 2, types: ["Files"] });
+      expect(first.sends).toHaveLength(2);
+      // The old mount's belated dragleave, moments after the second ENTER:
+      // the DOM order artifact, not an exit — it must not go out.
+      first.fireDrag("dragleave", {
+        types: ["Files"],
+        relatedTarget: second.canvas,
+      });
+      expect(first.sends.filter((s) => s.kind === "leave")).toHaveLength(0);
+      // A genuine exit (after the hover) still leaves.
+      vi.advanceTimersByTime(1000);
+      second.fireDrag("dragleave", { types: ["Files"] });
+      expect(first.sends.at(-1)).toEqual({ kind: "leave", id: 7 });
+    } finally {
+      vi.useRealTimers();
+      second.dispose();
+      first.dispose();
+    }
+  });
+
+  it("stages dropped files, then sends DROP naming them with empty data", async () => {
+    const { sends, fireDrag, dispose, uploads, syncFs } = attachDragging();
+    fireDrag("dragenter", { x: 100, y: 200, types: ["Files"] });
+    fireDrag("drop", {
+      x: 100,
+      y: 200,
+      types: ["Files"],
+      files: [
+        new File([new Uint8Array([0x89, 0x50])], "a b.png", {
+          type: "image/png",
+        }),
+      ],
+    });
+    await settle();
+
+    // The staging sync opened with the flag and an empty path, and the
+    // file was staged under the planned name ENTER pre-announced.
+    expect(syncFs).toHaveBeenCalledWith(
+      "",
+      expect.objectContaining({ staging: true }),
+    );
+    expect(uploads.map((u) => u.path)).toEqual(["0.png"]);
+
+    const drop = sends.find((s) => s.kind === "drop");
+    if (!drop || drop.kind !== "drop") throw new Error("Expected a DROP");
+    expect(drop.id).toBe(7);
+    expect(drop.x).toBe(100);
+    expect(drop.y).toBe(200);
+    expect(drop.items).toHaveLength(1);
+    expect(drop.items[0].mime).toBe("image/png");
+    expect(drop.items[0].name).toBe("0.png");
+    expect(drop.items[0].data).toHaveLength(0);
+
+    // The wire layout, pinned: the Rust compositor pins this exact fixture.
+    // [0x38][surface:2][x:2][y:2][items:2][mime_len:2][mime][name_len:2]
+    // [name][data_len:4][data] — a staged item names its planned
+    // staging-relative path and carries no inline data.
+    const msg = buildSurfaceDragDropMessage(7, 100, 200, drop.items);
+    const hex = Array.from(msg, (b) => b.toString(16).padStart(2, "0")).join(
+      "",
+    );
+    expect(hex).toBe(
+      "38" + // C2S_SURFACE_DRAG_DROP
+        "0700" + // surface 7
+        "6400" + // x 100
+        "c800" + // y 200
+        "0100" + // one item
+        "0900" +
+        "696d6167652f706e67" + // "image/png"
+        "0500" +
+        "302e706e67" + // "0.png"
+        "00000000", // staged: no inline data
+    );
+    dispose();
+  });
+
+  it("stages each file under the planned name of its own MIME type", async () => {
+    const { sends, fireDrag, dispose, uploads } = attachDragging();
+    fireDrag("drop", {
+      x: 1,
+      y: 2,
+      types: ["Files"],
+      files: [
+        new File([new Uint8Array([1])], "cat photo.PNG", {
+          type: "image/png",
+        }),
+        new File([new Uint8Array([2])], "notes", { type: "image/jpeg" }),
+        new File([new Uint8Array([3])], "archive.zip", { type: "" }),
+      ],
+    });
+    // The staging open plus three sequential uploads outlast one drain.
+    await settle();
+    await settle();
+    expect(uploads.map((u) => u.path)).toEqual(["0.png", "1.jpg", "2.bin"]);
+    const drop = sends.find((s) => s.kind === "drop");
+    if (!drop || drop.kind !== "drop") throw new Error("Expected a DROP");
+    expect(drop.items.map((item) => item.name)).toEqual([
+      "0.png",
+      "1.jpg",
+      "2.bin",
+    ]);
+    dispose();
+  });
+
+  it("uses the hover plan when the file MIME changes at drop", async () => {
+    const { sends, fireDrag, dispose, uploads } = attachDragging();
+    // A typeless promise is announced as 0.bin.  The materialized File may
+    // reveal image/png after release, but the URI already served to the app
+    // still names 0.bin and therefore remains authoritative.
+    fireDrag("dragenter", {
+      types: ["Files"],
+      items: [{ kind: "file", type: "" }],
+    });
+    fireDrag("drop", {
+      types: ["Files"],
+      files: [new File([new Uint8Array([1])], "shot.png", { type: "image/png" })],
+    });
+    await settle();
+
+    expect(uploads.map((u) => u.path)).toEqual(["0.bin"]);
+    const drop = sends.find((s) => s.kind === "drop");
+    if (!drop || drop.kind !== "drop") throw new Error("Expected a DROP");
+    expect(drop.items[0]).toEqual(
+      expect.objectContaining({ mime: "image/png", name: "0.bin" }),
+    );
+    dispose();
+  });
+
+  it("cancels when the file count changes after the hover plan", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { sends, fireDrag, dispose, uploads } = attachDragging();
+    fireDrag("dragenter", {
+      types: ["Files"],
+      items: [{ kind: "file", type: "image/png" }],
+    });
+    fireDrag("drop", {
+      types: ["Files"],
+      files: [
+        new File([new Uint8Array([1])], "one.png", { type: "image/png" }),
+        new File([new Uint8Array([2])], "two.png", { type: "image/png" }),
+      ],
+    });
+    await settle();
+
+    expect(uploads).toHaveLength(0);
+    expect(sends.at(-1)).toEqual({ kind: "cancel" });
+    expect(warn).toHaveBeenCalled();
+    dispose();
+  });
+
+  it("accepts a macOS file-promise drop (file items, no Files type)", async () => {
+    const { sends, fireDrag, dispose, uploads } = attachDragging();
+    // The screenshot's floating thumbnail: no "Files" type, an empty files
+    // list, one file-kind item.
+    const file = new File([new Uint8Array([0x89, 0x50])], "shot.png", {
+      type: "image/png",
+    });
+    const items = [{ kind: "file", type: "image/png", file }];
+    fireDrag("dragenter", { x: 1, y: 2, types: [], items });
+    const over = fireDrag("dragover", { x: 1, y: 2, types: [], items });
+    expect(over.defaultPrevented).toBe(true);
+    fireDrag("drop", { x: 1, y: 2, types: [], items });
+    await settle();
+
+    // The item MIME rode ENTER, and the file staged under the planned name.
+    const enter = sends[0];
+    if (enter.kind !== "enter") throw new Error("Expected an ENTER");
+    expect(enter.items).toEqual(["image/png"]);
+    expect(uploads.map((u) => u.path)).toEqual(["0.png"]);
+    expect(sends.find((s) => s.kind === "drop")).toBeTruthy();
+    dispose();
+  });
+
+  it("names a nameless promised file from its MIME type", async () => {
+    const { fireDrag, dispose, uploads } = attachDragging();
+    fireDrag("drop", {
+      types: ["Files"],
+      files: [new File([new Uint8Array([1])], "", { type: "image/png" })],
+    });
+    await settle();
+
+    expect(uploads.map((u) => u.path)).toEqual(["0.png"]);
+    dispose();
+  });
+
+  it("cancels when a file drag carries no readable files", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { sends, fireDrag, dispose } = attachDragging();
+    fireDrag("drop", {
+      x: 1,
+      y: 2,
+      types: [],
+      items: [{ kind: "file", type: "image/png", file: null }],
+    });
+    await settle();
+
+    expect(sends).toEqual([{ kind: "cancel" }]);
+    expect(warn).toHaveBeenCalled();
+    dispose();
+  });
+
+  it("sends DROP with the text for a text drag", async () => {
+    const { sends, fireDrag, dispose, syncFs } = attachDragging();
+    fireDrag("dragenter", { x: 5, y: 6, types: ["text/plain"] });
+    fireDrag("drop", { x: 5, y: 6, types: ["text/plain"], text: "héllo" });
+    await settle();
+
+    const drop = sends.find((s) => s.kind === "drop");
+    if (!drop || drop.kind !== "drop") throw new Error("Expected a DROP");
+    expect(drop.items).toHaveLength(1);
+    expect(drop.items[0].mime).toBe("text/plain;charset=utf-8");
+    expect(drop.items[0].name).toBe("");
+    expect(new TextDecoder().decode(drop.items[0].data)).toBe("héllo");
+    // Text stays inline: no staging sync is opened for it.
+    expect(syncFs).not.toHaveBeenCalled();
+    dispose();
+  });
+
+  it("refuses inline text approaching the frame cap", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { sends, fireDrag, dispose } = attachDragging();
+    fireDrag("dragenter", { x: 0, y: 0, types: ["text/plain"] });
+    fireDrag("drop", {
+      types: ["text/plain"],
+      text: "x".repeat(16 * 1024 * 1024),
+    });
+    await settle();
+
+    // An over-length DROP is refused by the server, not truncated — so it
+    // never goes on the wire.  Only inline items (dragged text) are capped;
+    // files stage through the upload pump and carry no inline bytes.
+    expect(sends.filter((s) => s.kind === "drop")).toHaveLength(0);
+    expect(warn).toHaveBeenCalled();
+    dispose();
+  });
+
+  it("reuses the staging sync across drops and stops it on dispose", async () => {
+    const { fireDrag, dispose, syncFs, stagingHandle } = attachDragging();
+    fireDrag("drop", {
+      types: ["Files"],
+      files: [new File([new Uint8Array([1])], "a.txt")],
+    });
+    await settle();
+    fireDrag("drop", {
+      types: ["Files"],
+      files: [new File([new Uint8Array([2])], "b.txt")],
+    });
+    await settle();
+    expect(syncFs).toHaveBeenCalledTimes(1);
+    expect(stagingHandle.stop).not.toHaveBeenCalled();
+    dispose();
+    expect(stagingHandle.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels the session when the staging sync cannot be opened", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { sends, fireDrag, dispose, syncFs } = attachDragging();
+    syncFs.mockRejectedValueOnce(new Error("no staging"));
+    fireDrag("dragenter", { x: 0, y: 0, types: ["Files"] });
+    fireDrag("drop", {
+      types: ["Files"],
+      files: [
+        new File([new Uint8Array([1])], "clip.png", { type: "image/png" }),
+      ],
+    });
+    await settle();
+
+    expect(sends.filter((s) => s.kind === "drop")).toHaveLength(0);
+    expect(sends.at(-1)).toEqual({ kind: "cancel" });
+    expect(warn).toHaveBeenCalled();
+    dispose();
+  });
+
+  it("cancels the session when a staging upload fails", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { sends, fireDrag, dispose, stagingHandle } = attachDragging();
+    stagingHandle.upload.mockRejectedValueOnce(new Error("disk full"));
+    fireDrag("dragenter", { x: 0, y: 0, types: ["Files"] });
+    fireDrag("drop", {
+      types: ["Files"],
+      files: [
+        new File([new Uint8Array([1])], "clip.png", { type: "image/png" }),
+      ],
+    });
+    await settle();
+
+    expect(sends.filter((s) => s.kind === "drop")).toHaveLength(0);
+    expect(sends.at(-1)).toEqual({ kind: "cancel" });
+    expect(warn).toHaveBeenCalled();
+    dispose();
+  });
+
+  it("cancels an open session if a dragend fires", () => {
+    const { sends, fireDrag, dispose } = attachDragging();
+    fireDrag("dragenter", { x: 0, y: 0, types: ["Files"] });
+    window.dispatchEvent(new Event("dragend"));
+    expect(sends.at(-1)).toEqual({ kind: "cancel" });
+    dispose();
+  });
+
+  it("leaves internal UI drags untouched", () => {
+    const { sends, fireDrag, dispose } = attachDragging();
+    // Pane/tile moves inside the page carry only custom MIMEs.
+    const types = ["application/x-blit-tile"];
+    const enter = fireDrag("dragenter", { types });
+    const over = fireDrag("dragover", { types });
+    const drop = fireDrag("drop", { types });
+    expect(enter.defaultPrevented).toBe(false);
+    expect(over.defaultPrevented).toBe(false);
+    expect(drop.defaultPrevented).toBe(false);
+    expect(sends).toEqual([]);
+    dispose();
+  });
+});
+
 /** A live view with the text and key sends captured — what soft-keyboard
  *  input lands on. */
 function attachTyping() {
@@ -1602,6 +2311,61 @@ describe("BlitSurfaceCanvas macOS dead keys", () => {
 
     expect(texts).toEqual(["é"]);
     expect(keys).toEqual([]);
+    surface.dispose();
+  });
+
+  it("delivers é exactly once across the full UI Events dead-key sequence", () => {
+    // The spec's dead-key sequence (uievents §4.3.2, adapted to Option+E on
+    // macOS): the completing keystroke's keydown carries the *composed*
+    // character with isComposing=true, mid-composition keyups carry
+    // isComposing=true, and the textarea's post-commit input event must not
+    // re-send what compositionend already delivered.
+    const { surface, canvas, ta, texts, keys, preedits } = attachMac();
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "Alt", code: "AltLeft", altKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keydown", { key: "Dead", code: "KeyE", altKey: true }),
+    );
+    ta.dispatchEvent(new CompositionEvent("compositionstart", { data: "" }));
+    ta.value = "´";
+    ta.dispatchEvent(
+      new InputEvent("input", {
+        data: "´",
+        inputType: "insertCompositionText",
+        isComposing: true,
+      }),
+    );
+    canvas.dispatchEvent(
+      key("keyup", {
+        key: "Dead",
+        code: "KeyE",
+        altKey: true,
+        isComposing: true,
+      }),
+    );
+    canvas.dispatchEvent(
+      key("keyup", { key: "Alt", code: "AltLeft", isComposing: true }),
+    );
+    // The completing keystroke: key is the composed character, still within
+    // the composition session.
+    canvas.dispatchEvent(
+      key("keydown", { key: "é", code: "KeyE", isComposing: true }),
+    );
+    ta.dispatchEvent(new CompositionEvent("compositionend", { data: "é" }));
+    ta.value = "é";
+    ta.dispatchEvent(
+      new InputEvent("input", {
+        data: "é",
+        inputType: "insertCompositionText",
+      }),
+    );
+    canvas.dispatchEvent(key("keyup", { key: "e", code: "KeyE" }));
+
+    expect(texts).toEqual(["é"]);
+    expect(keys).toEqual([]);
+    expect(preedits.map((p) => p.text)).toEqual(["´"]);
     surface.dispose();
   });
 

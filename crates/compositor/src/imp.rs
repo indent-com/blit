@@ -100,7 +100,9 @@ use wayland_server::protocol::wl_buffer::WlBuffer;
 use wayland_server::protocol::wl_callback::WlCallback;
 use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_data_device::{self, WlDataDevice};
-use wayland_server::protocol::wl_data_device_manager::{self, WlDataDeviceManager};
+use wayland_server::protocol::wl_data_device_manager::{
+    self, DndAction, WlDataDeviceManager,
+};
 use wayland_server::protocol::wl_data_offer::{self, WlDataOffer};
 use wayland_server::protocol::wl_data_source::{self, WlDataSource};
 use wayland_server::protocol::wl_keyboard::{self, WlKeyboard};
@@ -566,7 +568,9 @@ pub enum CompositorEvent {
     },
     /// A client asked to activate (raise/focus) a surface via
     /// xdg_activation_v1; forwarded so the frontend can raise the pane.
-    SurfaceActivated { surface_id: u16 },
+    SurfaceActivated {
+        surface_id: u16,
+    },
     SurfaceCommit {
         surface_id: u16,
         width: u32,
@@ -628,6 +632,12 @@ pub enum CompositorEvent {
         mime_type: String,
         data: Vec<u8>,
     },
+    /// Clipboard authority changed.  Browser clients use this to decide
+    /// whether Ctrl/Cmd+V should import the host clipboard or preserve a
+    /// Wayland client's multi-MIME selection for a direct client splice.
+    ClipboardOwner {
+        wayland: bool,
+    },
     SurfaceCursor {
         surface_id: u16,
         cursor: CursorImage,
@@ -687,6 +697,41 @@ pub enum CompositorCommand {
         mime_type: String,
         data: Vec<u8>,
     },
+    /// Begin (or retarget) a browser-initiated drag over a surface.
+    /// `mimes` are what the browser can offer; the data arrives with
+    /// [`CompositorCommand::DragDrop`].  Coordinates are in the composited
+    /// frame's physical pixel space, as in `PointerMotion`.
+    ///
+    /// `planned_uri_list` is the pre-staged `text/uri-list` payload from an
+    /// ENTER carrying the item plan: the staging files exist (empty) from
+    /// the start, so a `receive("text/uri-list")` during hover can be
+    /// answered immediately.  `None` parks every receive until the drop.
+    DragEnter {
+        surface_id: u16,
+        x: f64,
+        y: f64,
+        mimes: Vec<String>,
+        planned_uri_list: Option<Vec<u8>>,
+    },
+    /// Move an in-flight browser drag.
+    DragMotion {
+        surface_id: u16,
+        x: f64,
+        y: f64,
+    },
+    /// The drag left the surface; the session ends.
+    DragLeave,
+    /// Complete a browser drag: `offers` is the final payload map
+    /// (mime → bytes), served to the target on `receive` until it finishes
+    /// or destroys the offer.
+    DragDrop {
+        surface_id: u16,
+        x: f64,
+        y: f64,
+        offers: Vec<(String, Vec<u8>)>,
+    },
+    /// Abort an in-flight browser drag (Escape / drag left the window).
+    DragCancel,
     PrimaryOffer {
         mime_type: String,
         data: Vec<u8>,
@@ -1198,9 +1243,21 @@ struct SubsurfaceData {
 
 struct DataSourceData {
     mime_types: std::sync::Mutex<Vec<String>>,
+    /// v3 action state is declared exactly once before `start_drag`.
+    /// `None` means no request was made; `Some(NONE)` is a real mask and
+    /// must not be confused with the pre-v3 implicit Copy action.
+    dnd: std::sync::Mutex<DataSourceDndState>,
+}
+
+#[derive(Default)]
+struct DataSourceDndState {
+    actions: Option<DndAction>,
+    /// A wl_data_source is single-use across selection and DnD.
+    used: bool,
 }
 
 /// Stored state for the external (browser/CLI) clipboard selection.
+#[derive(Clone)]
 struct ExternalClipboard {
     mime_type: String,
     data: Vec<u8>,
@@ -1245,6 +1302,135 @@ struct PrimarySourceData {
 }
 struct PrimaryOfferData {
     external: bool,
+}
+
+/// What backs a compositor-created `WlDataOffer`.
+///
+/// Clipboard offers pin the selection that was current when the offer was
+/// announced.  Otherwise an old offer could paste a newer owner's bytes.
+enum DataOfferKind {
+    ClipboardExternal(ExternalClipboard),
+    ClipboardSource {
+        source: WlDataSource,
+        mime_types: Vec<String>,
+    },
+    BrowserDrag,
+    ClientDrag,
+}
+
+struct DataOfferData {
+    kind: DataOfferKind,
+    /// After a successful v3 `finish`, only `destroy` is legal.
+    finished: std::sync::atomic::AtomicBool,
+}
+
+impl DataOfferData {
+    fn new(kind: DataOfferKind) -> Self {
+        Self {
+            kind,
+            finished: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+/// A drag started by a Wayland client (`wl_data_device.start_drag`).
+///
+/// The compositor owns the implicit grab: while the session is active,
+/// pointer motion/button commands do not reach `wl_pointer` — they drive
+/// enter/motion/leave/drop on whatever surface is under the point, exactly
+/// as a physical-pointer drag would.  The `icon` surface from `start_drag`
+/// is ignored entirely: nothing maps or positions it, so a client that
+/// relies on seeing its drag icon gets none (the cursor stays the normal
+/// pointer).  That is a visual limitation only; the transfer is unaffected.
+struct ClientDragState {
+    /// The drag source; `receive` on the target offer is forwarded to it,
+    /// and it gets `dnd_drop_performed`/`dnd_finished`/`cancelled`.
+    source: WlDataSource,
+    /// Surface the drag started on.  Only diagnostic today — the origin is
+    /// allowed to be destroyed mid-drag without affecting the session.
+    origin: WlSurface,
+    /// MIME types the source offered, advertised on every target offer.
+    mimes: Vec<String>,
+    /// The surface the drag is currently over, if any.
+    target: Option<ClientDragTarget>,
+    /// Actions from the source's `set_actions`; empty = never set.
+    source_actions: DndAction,
+    /// The button was released: the grab is over and pointer input flows
+    /// normally again, while the session lives on until the target's
+    /// `finish` (or offer destroy) completes the source.
+    dropped: bool,
+}
+
+/// The target side of a [`ClientDragState`]: one entered surface.
+struct ClientDragTarget {
+    device: WlDataDevice,
+    offer: WlDataOffer,
+    surface: WlSurface,
+    /// MIME type from the target's `accept`, if it sent one.
+    accepted_mime: Option<String>,
+    /// Actions from the offer's `set_actions`; empty = never set.
+    offer_actions: DndAction,
+    /// The destination's single preferred action from `set_actions`.
+    preferred_action: DndAction,
+    /// The negotiated action last announced to both sides.
+    action: Option<DndAction>,
+    /// Distinguishes "no action event yet" from an announced NONE action.
+    action_announced: bool,
+    /// `drop` was sent; a following `finish` completes the transfer.
+    dropped: bool,
+}
+
+/// State of a browser-initiated drag session (no client `wl_data_source`
+/// exists — `wl_data_device.enter` allows a null source for
+/// compositor-initiated drags).
+struct DragSessionState {
+    /// The device the drag was entered on, so motion/leave/drop go where
+    /// the enter went.
+    device: WlDataDevice,
+    /// The offer handed to the target at `enter`, kept alive through the
+    /// drop so the client can `receive` + `finish` it.
+    offer: WlDataOffer,
+    /// The DROP-time payload map; `Receive` serves from it by mime.  Empty
+    /// until the drop lands.
+    offers: Vec<(String, Vec<u8>)>,
+    /// The planned `text/uri-list` payload from the ENTER's item plan, if
+    /// the browser sent one: the staging files exist (empty) from the
+    /// start, so `receive("text/uri-list")` is answered with this
+    /// immediately — Chromium fetches it at `enter`, and only that
+    /// completed fetch fires its page-level dragenter during hover.
+    planned_uri_list: Option<Vec<u8>>,
+    /// Receives issued before the drop landed.  Chromium fetches every
+    /// supported mime at `enter` and delivers the fetched snapshot at
+    /// `drop`, so an early `receive` must not be answered empty — it is
+    /// parked here and written out the moment `drag_drop` fills `offers`.
+    /// Wayland lets the source answer at any time.  If the session ends
+    /// without a drop the OwnedFds just close (an empty read).
+    parked: Vec<(String, OwnedFd)>,
+    /// `drop` was sent; the offer now exists only for `receive`/`finish`,
+    /// so ending the session must not send `leave`.
+    dropped: bool,
+    /// The client sent `finish` after the drop.
+    finished: bool,
+}
+
+/// The staged bytes a browser-drag session serves for `mime`.
+///
+/// Beyond the exact match, `application/octet-stream` — which the browser
+/// advertises on every ENTER but never stages under that name — falls back
+/// to the single non-uri-list offer when there is exactly one: a dropped
+/// file's own bytes.  With zero or several candidates the fallback is
+/// ambiguous and answers empty.
+fn browser_drag_bytes<'a>(offers: &'a [(String, Vec<u8>)], mime: &str) -> Option<&'a [u8]> {
+    if let Some((_, bytes)) = offers.iter().find(|(m, _)| m == mime) {
+        return Some(bytes);
+    }
+    if mime == "application/octet-stream" {
+        let mut candidates = offers.iter().filter(|(m, _)| m != "text/uri-list");
+        if let (Some((_, bytes)), None) = (candidates.next(), candidates.next()) {
+            return Some(bytes);
+        }
+    }
+    None
 }
 
 // -- Activation token data --
@@ -1574,6 +1760,11 @@ struct Compositor {
     selection_source: Option<WlDataSource>,
     /// External clipboard data offered from the browser or CLI.
     external_clipboard: Option<ExternalClipboard>,
+    /// Browser-initiated drag session in flight, if any.
+    drag: Option<DragSessionState>,
+    /// Client-initiated drag session in flight, if any.  While one is
+    /// active and not yet dropped, pointer input is the drag grab.
+    client_drag: Option<ClientDragState>,
 
     // -- Primary selection --
     primary_devices: Vec<ZwpPrimarySelectionDeviceV1>,
@@ -3451,6 +3642,13 @@ impl Compositor {
                 let _ = self.display_handle.flush_clients();
             }
             CompositorCommand::PointerMotion { surface_id, x, y } => {
+                // A client-initiated drag owns the pointer: motion drives
+                // the drag session instead of wl_pointer.
+                if self.client_drag_grabbed() {
+                    self.client_drag_motion(surface_id, x, y);
+                    let _ = self.display_handle.flush_clients();
+                    return;
+                }
                 let time = elapsed_ms();
                 // The browser sends coordinates in the composited frame's
                 // physical pixel space.  Convert to logical (surface-local)
@@ -3568,6 +3766,16 @@ impl Compositor {
                 button,
                 pressed,
             } => {
+                // A client-initiated drag swallows button input: presses go
+                // nowhere, and the release ends the grab — drop on the
+                // current target, or dnd_cancelled when there is none.
+                if self.client_drag_grabbed() {
+                    if !pressed {
+                        self.client_drag_release();
+                    }
+                    let _ = self.display_handle.flush_clients();
+                    return;
+                }
                 let serial = self.next_serial();
                 let time = elapsed_ms();
                 let state = if pressed {
@@ -3915,7 +4123,47 @@ impl Compositor {
                 if let Some(src) = self.selection_source.take() {
                     src.cancelled();
                 }
-                self.offer_external_clipboard();
+                self.offer_clipboard_selection();
+                let _ = self
+                    .event_tx
+                    .send(CompositorEvent::ClipboardOwner { wayland: false });
+                (self.event_notify)();
+            }
+            CompositorCommand::DragEnter {
+                surface_id,
+                x,
+                y,
+                mimes,
+                planned_uri_list,
+            } => {
+                self.drag_enter(surface_id, x, y, &mimes, planned_uri_list);
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::DragMotion { surface_id, x, y } => {
+                if self.drag.is_some()
+                    && let Some((_, lx, ly)) = self.drag_target(surface_id, x, y)
+                    && let Some(ref drag) = self.drag
+                {
+                    drag.device.motion(elapsed_ms(), lx, ly);
+                }
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::DragLeave => {
+                self.drag_end(true);
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::DragDrop {
+                surface_id,
+                x,
+                y,
+                offers,
+            } => {
+                self.drag_drop(surface_id, x, y, offers);
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::DragCancel => {
+                self.drag_end(true);
+                let _ = self.display_handle.flush_clients();
             }
             CompositorCommand::PrimaryOffer { mime_type, data } => {
                 self.external_primary = Some(ExternalClipboard { mime_type, data });
@@ -4467,6 +4715,32 @@ fn same_client<R1: Resource, R2: Resource>(a: &R1, b: &R2) -> bool {
     }
 }
 
+/// Negotiate the drag-and-drop action after the destination's `set_actions`.
+/// Its preferred action wins when it is in the intersection; otherwise Copy,
+/// Move, then Ask provide a stable compositor preference.  An empty target
+/// mask means it has not selected any action yet, not "accept anything".
+fn negotiate_dnd_action(
+    source: DndAction,
+    offer: DndAction,
+    preferred: DndAction,
+) -> Option<DndAction> {
+    if offer.is_empty() {
+        return None;
+    }
+    let both = source & offer;
+    if !preferred.is_empty() && both.contains(preferred) {
+        Some(preferred)
+    } else if both.contains(DndAction::Copy) {
+        Some(DndAction::Copy)
+    } else if both.contains(DndAction::Move) {
+        Some(DndAction::Move)
+    } else if both.contains(DndAction::Ask) {
+        Some(DndAction::Ask)
+    } else {
+        None
+    }
+}
+
 fn yuv420_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
     // BT.601 full-range inverse, matching the full-range forward
     // conversion everywhere in blit (shaders and CPU paths).
@@ -4710,6 +4984,19 @@ impl Dispatch<WlSurface, ()> for Compositor {
                     state.release_held(a);
                 }
                 state.forget_pointer_focus(&sid);
+                let client_drag_target_dropped = state
+                    .client_drag
+                    .as_ref()
+                    .and_then(|drag| drag.target.as_ref())
+                    .filter(|target| target.surface.id() == sid)
+                    .map(|target| target.dropped);
+                match client_drag_target_dropped {
+                    Some(true) => state.client_drag_cancel(false),
+                    Some(false) => {
+                        state.client_drag_depart_target(true);
+                    }
+                    None => {}
+                }
                 if let Some(parent_id) = state
                     .surfaces
                     .get(&sid)
@@ -6577,11 +6864,15 @@ impl Dispatch<WlDataDeviceManager, ()> for Compositor {
                     id,
                     DataSourceData {
                         mime_types: std::sync::Mutex::new(Vec::new()),
+                        dnd: std::sync::Mutex::new(DataSourceDndState::default()),
                     },
                 );
             }
             Request::GetDataDevice { id, seat: _ } => {
                 let dd = data_init.init(id, ());
+                // A late-binding client must see the selection that already
+                // exists; there may be no later focus change to re-offer it.
+                state.offer_clipboard_to(&dd);
                 state.data_devices.push(dd);
             }
             _ => {}
@@ -6591,9 +6882,9 @@ impl Dispatch<WlDataDeviceManager, ()> for Compositor {
 
 impl Dispatch<WlDataSource, DataSourceData> for Compositor {
     fn request(
-        _: &mut Self,
+        _state: &mut Self,
         _: &Client,
-        _: &WlDataSource,
+        source: &WlDataSource,
         request: <WlDataSource as Resource>::Request,
         data: &DataSourceData,
         _: &DisplayHandle,
@@ -6604,8 +6895,27 @@ impl Dispatch<WlDataSource, DataSourceData> for Compositor {
             Request::Offer { mime_type } => {
                 data.mime_types.lock().unwrap().push(mime_type);
             }
+            Request::SetActions { dnd_actions } => {
+                let Ok(actions) = dnd_actions.into_result() else {
+                    source.post_error(
+                        wl_data_source::Error::InvalidActionMask,
+                        "set_actions contains an unknown action bit",
+                    );
+                    return;
+                };
+                let mut dnd = data.dnd.lock().unwrap();
+                if dnd.used || dnd.actions.is_some() {
+                    drop(dnd);
+                    source.post_error(
+                        wl_data_source::Error::InvalidSource,
+                        "set_actions must be called exactly once before start_drag",
+                    );
+                    return;
+                }
+                dnd.actions = Some(actions);
+            }
             Request::Destroy => {}
-            _ => {} // SetActions — DnD, ignored
+            _ => {}
         }
     }
 
@@ -6621,6 +6931,25 @@ impl Dispatch<WlDataSource, DataSourceData> for Compositor {
             .is_some_and(|s| s.id() == resource.id())
         {
             state.selection_source = None;
+            state.offer_clipboard_selection();
+            let _ = state
+                .event_tx
+                .send(CompositorEvent::ClipboardOwner { wayland: false });
+            (state.event_notify)();
+        }
+        // The drag source went away mid-drag (client destroyed it, or the
+        // whole client disconnected): abort the session.  The target gets a
+        // `leave`; the source itself cannot be told — it is gone.
+        let aborts = state
+            .client_drag
+            .as_ref()
+            .is_some_and(|drag| drag.source.id() == resource.id());
+        if aborts
+            && let Some(drag) = state.client_drag.take()
+            && let Some(target) = drag.target
+            && !target.dropped
+        {
+            target.device.leave();
         }
     }
 }
@@ -6629,7 +6958,7 @@ impl Dispatch<WlDataDevice, ()> for Compositor {
     fn request(
         state: &mut Self,
         _: &Client,
-        _: &WlDataDevice,
+        device: &WlDataDevice,
         request: <WlDataDevice as Resource>::Request,
         _: &(),
         _: &DisplayHandle,
@@ -6638,7 +6967,46 @@ impl Dispatch<WlDataDevice, ()> for Compositor {
         use wl_data_device::Request;
         match request {
             Request::SetSelection { source, serial: _ } => {
+                if let Some(source) = source.as_ref()
+                    && let Some(data) = source.data::<DataSourceData>()
+                {
+                    let mut dnd = data.dnd.lock().unwrap();
+                    if dnd.used {
+                        drop(dnd);
+                        device.post_error(
+                            wl_data_device::Error::UsedSource,
+                            "a data source cannot be reused for set_selection",
+                        );
+                        return;
+                    }
+                    if dnd.actions.is_some() {
+                        drop(dnd);
+                        source.post_error(
+                            wl_data_source::Error::InvalidSource,
+                            "a source with DnD actions cannot be used as a selection",
+                        );
+                        return;
+                    }
+                    dnd.used = true;
+                }
+                // Client ownership is direct: advertise this source to every
+                // data device and splice each receive fd back to it.  The
+                // browser text mirror below is only a convenience, never the
+                // transport between two Wayland clients.
+                if let Some(previous) = state.selection_source.take()
+                    && !source
+                        .as_ref()
+                        .is_some_and(|current| current.id() == previous.id())
+                {
+                    previous.cancelled();
+                }
+                state.external_clipboard = None;
                 state.selection_source = source.clone();
+                state.offer_clipboard_selection();
+                let _ = state.event_tx.send(CompositorEvent::ClipboardOwner {
+                    wayland: source.is_some(),
+                });
+                (state.event_notify)();
                 // Try to read text content and emit an event.
                 if let Some(ref src) = source {
                     let data = src.data::<DataSourceData>().unwrap();
@@ -6657,8 +7025,76 @@ impl Dispatch<WlDataDevice, ()> for Compositor {
                     }
                 }
             }
+            Request::StartDrag {
+                source,
+                origin,
+                icon,
+                serial: _,
+            } => {
+                // Icon surfaces are not mapped or positioned anywhere — a
+                // client that relies on seeing its drag icon gets none.
+                // The transfer itself is unaffected.
+                if icon.is_some() && state.verbose {
+                    eprintln!("[dnd] start_drag icon surface ignored (not implemented)");
+                }
+                let Some(source) = source else {
+                    return; // start_drag without a source carries no data
+                };
+                let mimes = source
+                    .data::<DataSourceData>()
+                    .map(|d| d.mime_types.lock().unwrap().clone())
+                    .unwrap_or_default();
+                let Some(data) = source.data::<DataSourceData>() else {
+                    return;
+                };
+                let mut dnd = data.dnd.lock().unwrap();
+                if dnd.used {
+                    drop(dnd);
+                    device.post_error(
+                        wl_data_device::Error::UsedSource,
+                        "a data source cannot be reused for start_drag",
+                    );
+                    return;
+                }
+                let source_actions = if source.version() < 3 {
+                    // Before v3, Copy is implicit and set_actions does not
+                    // exist.
+                    DndAction::Copy
+                } else {
+                    let Some(actions) = dnd.actions else {
+                        drop(dnd);
+                        source.post_error(
+                            wl_data_source::Error::InvalidSource,
+                            "a v3 drag source must call set_actions before start_drag",
+                        );
+                        return;
+                    };
+                    actions
+                };
+                dnd.used = true;
+                drop(dnd);
+                // Only a valid new source supersedes an existing session: a
+                // browser-driven target gets a leave and a prior client
+                // source is cancelled.
+                state.drag_end(true);
+                state.client_drag_cancel(true);
+                if state.verbose {
+                    eprintln!(
+                        "[dnd] start_drag origin={:?} source_actions={source_actions:?} mimes={mimes:?}",
+                        origin.id()
+                    );
+                }
+                state.client_drag = Some(ClientDragState {
+                    source,
+                    origin,
+                    mimes,
+                    target: None,
+                    source_actions,
+                    dropped: false,
+                });
+            }
             Request::Release => {}
-            _ => {} // StartDrag — ignored
+            _ => {}
         }
     }
 
@@ -6669,41 +7105,359 @@ impl Dispatch<WlDataDevice, ()> for Compositor {
         _: &(),
     ) {
         state.data_devices.retain(|d| d.id() != resource.id());
+        // Before drop, loss of the target only clears focus and the source
+        // drag may continue. After drop it ends the session: no target is
+        // left that can finish the transfer.
+        let client_target_dropped = state
+            .client_drag
+            .as_ref()
+            .and_then(|drag| drag.target.as_ref())
+            .filter(|target| target.device.id() == resource.id())
+            .map(|target| target.dropped);
+        match client_target_dropped {
+            Some(true) => state.client_drag_cancel(false),
+            Some(false) => {
+                state.client_drag_depart_target(false);
+            }
+            None => {}
+        }
+        // Same for a browser-driven drag whose target went away.
+        if state
+            .drag
+            .as_ref()
+            .is_some_and(|d| d.device.id() == resource.id())
+        {
+            state.drag = None;
+        }
     }
 }
 
-impl Dispatch<WlDataOffer, ()> for Compositor {
+impl Dispatch<WlDataOffer, DataOfferData> for Compositor {
     fn request(
         state: &mut Self,
         _: &Client,
-        _: &WlDataOffer,
+        offer: &WlDataOffer,
         request: <WlDataOffer as Resource>::Request,
-        _: &(),
+        data: &DataOfferData,
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
         use wl_data_offer::Request;
-        match request {
-            // Every CLIPBOARD offer the compositor makes is external, so
-            // there is no Wayland-source branch to fall back to: a client's
-            // own selection is read out to the browser and comes back
-            // through `ClipboardOffer`, and that round trip stands in for
-            // splicing `receive` to the owner.  PRIMARY, which has no such
-            // detour, is the one that needs both — see `offer_primary_to`.
-            //
-            // A type we never offered gets the fd closed empty, not the
-            // bytes we happen to be holding.
-            Request::Receive { mime_type, fd } => {
-                if let Some(ref cb) = state.external_clipboard
-                    && cb.offers(&mime_type)
+        match &data.kind {
+            DataOfferKind::ClientDrag => {
+                // A client-initiated drag: this offer is the splice point
+                // between the target and the drag source.
+                if data.finished.load(std::sync::atomic::Ordering::Relaxed)
+                    && !matches!(&request, Request::Destroy)
                 {
-                    use std::io::Write;
-                    let mut f = std::fs::File::from(fd);
-                    let _ = f.write_all(&cb.data);
+                    offer.post_error(
+                        wl_data_offer::Error::InvalidFinish,
+                        "only destroy is legal after finish",
+                    );
+                    return;
+                }
+                match request {
+                    Request::Accept { mime_type, .. } => {
+                        let mut notify_source = None;
+                        if let Some(drag) = state.client_drag.as_mut()
+                            && let Some(t) = drag.target.as_mut()
+                            && t.offer.id() == offer.id()
+                        {
+                            t.accepted_mime = mime_type.clone();
+                            notify_source = Some(drag.source.clone());
+                        }
+                        if let Some(source) = notify_source {
+                            // `accept` is protocol feedback. Chromium does
+                            // not use target as its data trigger (receive is),
+                            // but other sources may use it for UI feedback.
+                            source.target(mime_type.clone());
+                        }
+                        if state.verbose {
+                            eprintln!("[dnd] target accept mime={mime_type:?}");
+                        }
+                    }
+                    Request::Receive { mime_type, fd } => {
+                        // Forward to the source; the fd must stay alive
+                        // until the flush hands it across, so flush here
+                        // rather than letting the OwnedFd close first.
+                        let forward = state
+                            .client_drag
+                            .as_ref()
+                            .and_then(|drag| drag.target.as_ref())
+                            .is_some_and(|t| t.offer.id() == offer.id());
+                        if forward {
+                            if let Some(drag) = state.client_drag.as_ref() {
+                                drag.source.send(mime_type.clone(), fd.as_fd());
+                            }
+                            let _ = state.display_handle.flush_clients();
+                        }
+                        if state.verbose {
+                            eprintln!("[dnd] target receive mime={mime_type:?} forward={forward}");
+                        }
+                    }
+                    Request::Finish => {
+                        let valid = state
+                            .client_drag
+                            .as_ref()
+                            .and_then(|drag| drag.target.as_ref())
+                            .is_some_and(|t| {
+                                t.offer.id() == offer.id()
+                                    && t.dropped
+                                    && t.accepted_mime.is_some()
+                                    && matches!(
+                                        t.action,
+                                        Some(action)
+                                            if action == DndAction::Copy
+                                                || action == DndAction::Move
+                                    )
+                            });
+                        if !valid {
+                            offer.post_error(
+                                wl_data_offer::Error::InvalidFinish,
+                                "finish requires a dropped, accepted Copy or Move offer",
+                            );
+                            return;
+                        }
+                        data.finished
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(drag) = state.client_drag.take()
+                            && drag.source.version() >= 3
+                        {
+                            drag.source.dnd_finished();
+                        }
+                        if state.verbose {
+                            eprintln!("[dnd] target finish complete=true");
+                        }
+                    }
+                    Request::SetActions {
+                        dnd_actions,
+                        preferred_action,
+                    } => {
+                        let Ok(actions) = dnd_actions.into_result() else {
+                            offer.post_error(
+                                wl_data_offer::Error::InvalidActionMask,
+                                "set_actions contains an unknown action bit",
+                            );
+                            return;
+                        };
+                        let Ok(preferred) = preferred_action.into_result() else {
+                            offer.post_error(
+                                wl_data_offer::Error::InvalidAction,
+                                "set_actions has an unknown preferred action",
+                            );
+                            return;
+                        };
+                        let active = state.client_drag.as_ref().is_some_and(|drag| {
+                            drag.target
+                                .as_ref()
+                                .is_some_and(|t| t.offer.id() == offer.id())
+                        });
+                        // A set_actions already queued when the pointer left
+                        // belongs to a stale offer. The peer has also been
+                        // sent leave and will destroy it; do not turn that
+                        // cross-client race into a protocol error.
+                        if !active {
+                            return;
+                        }
+                        let preferred_valid = preferred.is_empty()
+                            || (preferred.bits().count_ones() == 1 && actions.contains(preferred));
+                        if !preferred_valid {
+                            offer.post_error(
+                                wl_data_offer::Error::InvalidAction,
+                                "preferred action must be one action from the destination mask",
+                            );
+                            return;
+                        }
+                        let mut on_target = false;
+                        if let Some(drag) = state.client_drag.as_mut()
+                            && let Some(t) = drag.target.as_mut()
+                            && t.offer.id() == offer.id()
+                        {
+                            t.offer_actions = actions;
+                            t.preferred_action = preferred;
+                            on_target = true;
+                        }
+                        if on_target {
+                            state.client_drag_renegotiate();
+                        }
+                        if state.verbose {
+                            eprintln!(
+                                "[dnd] target set_actions actions={actions:?} preferred={preferred:?}"
+                            );
+                        }
+                    }
+                    Request::Destroy => {
+                        let dropped = state
+                            .client_drag
+                            .as_ref()
+                            .and_then(|drag| drag.target.as_ref())
+                            .filter(|target| target.offer.id() == offer.id())
+                            .map(|target| target.dropped);
+                        if let Some(dropped) = dropped {
+                            // An explicit pre-drop cancellation still ends
+                            // the entered session with leave. Disconnect
+                            // teardown cannot send it and stays in destroyed.
+                            state.client_drag_cancel(!dropped);
+                        }
+                    }
+                    _ => {}
                 }
             }
-            Request::Destroy => {}
-            _ => {} // Accept, Finish, SetActions — DnD
+            DataOfferKind::BrowserDrag => {
+                // A browser-initiated drag.  The payload arrives with the
+                // DROP; until then, receives are parked rather than
+                // answered empty (see `DragSessionState::parked`).  After
+                // the drop, `receive` serves the staged payload by mime,
+                // empty for a mime it never carried.
+                match request {
+                    Request::Receive { mime_type, fd } => {
+                        // A planned uri-list is servable at enter:
+                        // Chromium's enter-time fetch completes during
+                        // hover, which is what fires its page-level
+                        // dragenter (and shows the drop target) before the
+                        // mouse release.
+                        // A late request on an offer from a previous enter
+                        // must never see the replacement session's plan or
+                        // payload.  Offer resources outlive compositor-side
+                        // session state until their client destroys them.
+                        let active = state.drag.as_ref().filter(|d| d.offer.id() == offer.id());
+                        let planned = active.and_then(|d| {
+                            if mime_type == "text/uri-list" && !d.dropped {
+                                d.planned_uri_list.clone()
+                            } else {
+                                None
+                            }
+                        });
+                        let staged = active.and_then(|d| {
+                            browser_drag_bytes(&d.offers, &mime_type).map(<[u8]>::to_vec)
+                        });
+                        match planned.or(staged) {
+                            Some(bytes) => {
+                                use std::io::Write;
+                                let mut f = std::fs::File::from(fd);
+                                let _ = f.write_all(&bytes);
+                            }
+                            None => {
+                                let parkable = state
+                                    .drag
+                                    .as_ref()
+                                    .is_some_and(|d| d.offer.id() == offer.id() && !d.dropped);
+                                if parkable && let Some(d) = state.drag.as_mut() {
+                                    d.parked.push((mime_type, fd));
+                                }
+                                // Otherwise (no session, or the drop already
+                                // landed without this mime) the fd closes
+                                // empty.
+                            }
+                        }
+                    }
+                    Request::Finish => {
+                        if let Some(ref mut d) = state.drag
+                            && d.offer.id() == offer.id()
+                        {
+                            d.finished = true;
+                        }
+                    }
+                    Request::SetActions { dnd_actions, .. } => {
+                        // There is no source to negotiate with, but the
+                        // destination's mask still has to be answered:
+                        // Chromium takes its negotiated operation from the
+                        // `action` event and refuses the drop without one.
+                        // A browser drop is a copy, so Copy is the whole
+                        // source side; an empty intersection is NONE.
+                        if state
+                            .drag
+                            .as_ref()
+                            .is_some_and(|d| d.offer.id() == offer.id())
+                        {
+                            let dst = dnd_actions
+                                .into_result()
+                                .unwrap_or_else(|_| DndAction::empty());
+                            let negotiated =
+                                negotiate_dnd_action(DndAction::Copy, dst, DndAction::Copy)
+                                    .unwrap_or_else(DndAction::empty);
+                            offer.action(negotiated);
+                        }
+                    }
+                    Request::Destroy => {
+                        if let Some(d) = state.drag.as_ref()
+                            && d.offer.id() == offer.id()
+                        {
+                            state.drag = None;
+                        }
+                    }
+                    _ => {} // Accept
+                }
+            }
+            DataOfferKind::ClipboardExternal(cb) => {
+                match request {
+                    // A type we never offered gets the fd closed empty, not the
+                    // bytes we happen to be holding.
+                    Request::Receive { mime_type, fd } => {
+                        if cb.offers(&mime_type) {
+                            use std::io::Write;
+                            let mut f = std::fs::File::from(fd);
+                            let _ = f.write_all(&cb.data);
+                        }
+                    }
+                    Request::Destroy => {}
+                    _ => {} // Accept, Finish, SetActions — DnD
+                }
+            }
+            DataOfferKind::ClipboardSource { source, mime_types } => match request {
+                Request::Receive { mime_type, fd } => {
+                    if mime_types.contains(&mime_type) {
+                        // Keep the fd alive through the flush that hands it
+                        // to the owner, exactly like a client-drag splice.
+                        source.send(mime_type, fd.as_fd());
+                        let _ = state.display_handle.flush_clients();
+                    }
+                }
+                Request::Destroy => {}
+                _ => {} // Accept, Finish, SetActions — DnD
+            },
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _: wayland_server::backend::ClientId,
+        resource: &WlDataOffer,
+        data: &DataOfferData,
+    ) {
+        match &data.kind {
+            DataOfferKind::ClientDrag => {
+                let dropped = state
+                    .client_drag
+                    .as_ref()
+                    .and_then(|drag| drag.target.as_ref())
+                    .filter(|target| target.offer.id() == resource.id())
+                    .map(|target| target.dropped);
+                match dropped {
+                    Some(true) => state.client_drag_cancel(false),
+                    // Destroying the active offer is the destination's
+                    // explicit cancellation (ordinary leaves already clear
+                    // `target` before the client destroys its stale offer).
+                    Some(false) => state.client_drag_cancel(false),
+                    None => return,
+                }
+                if state.verbose {
+                    eprintln!(
+                        "[dnd] target offer destroyed dropped={}",
+                        dropped.unwrap_or(false)
+                    );
+                }
+            }
+            DataOfferKind::BrowserDrag => {
+                if state
+                    .drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.offer.id() == resource.id())
+                {
+                    state.drag = None;
+                }
+            }
+            DataOfferKind::ClipboardExternal(_) | DataOfferKind::ClipboardSource { .. } => {}
         }
     }
 }
@@ -6753,29 +7507,415 @@ impl Compositor {
         }
     }
 
-    /// Push external clipboard to all connected wl_data_device objects.
-    fn offer_external_clipboard(&mut self) {
-        let Some(ref cb) = self.external_clipboard else {
+    /// Hand the current clipboard selection to one data device, or clear it.
+    /// External selections are served from pinned bytes; Wayland-client
+    /// selections are fd-spliced directly back to their source.
+    fn offer_clipboard_to(&self, dd: &WlDataDevice) {
+        let (mimes, kind) = if let Some(ref cb) = self.external_clipboard {
+            (
+                cb.mime_types(),
+                DataOfferKind::ClipboardExternal(cb.clone()),
+            )
+        } else if let Some(ref source) = self.selection_source {
+            let mime_types = source
+                .data::<DataSourceData>()
+                .map(|d| d.mime_types.lock().unwrap().clone())
+                .unwrap_or_default();
+            (
+                mime_types.clone(),
+                DataOfferKind::ClipboardSource {
+                    source: source.clone(),
+                    mime_types,
+                },
+            )
+        } else {
+            dd.selection(None);
             return;
         };
-        let mimes = cb.mime_types();
+        let Some(client) = dd.client() else {
+            return;
+        };
+        let Ok(offer) = client.create_resource::<WlDataOffer, DataOfferData, Compositor>(
+            &self.display_handle,
+            dd.version(),
+            DataOfferData::new(kind),
+        ) else {
+            return;
+        };
+        dd.data_offer(&offer);
+        for mime in mimes {
+            offer.offer(mime);
+        }
+        dd.selection(Some(&offer));
+    }
+
+    /// Push the current clipboard selection to all connected data devices.
+    fn offer_clipboard_selection(&mut self) {
         for dd in &self.data_devices {
-            if let Some(client) = dd.client() {
-                let offer = client
-                    .create_resource::<WlDataOffer, (), Compositor>(
-                        &self.display_handle,
-                        dd.version(),
-                        (),
-                    )
-                    .unwrap();
-                dd.data_offer(&offer);
-                for mime in &mimes {
-                    offer.offer(mime.clone());
-                }
-                dd.selection(Some(&offer));
-            }
+            self.offer_clipboard_to(dd);
         }
         let _ = self.display_handle.flush_clients();
+    }
+
+    // -- Browser-initiated drag and drop --
+    //
+    // A drag that starts on the user's desktop has no Wayland client behind
+    // it, so the compositor drives the `wl_data_device` drag session itself
+    // with a null source: it enters with a compositor-owned offer, forwards
+    // motion, and on drop hands the staged payload over through the offer's
+    // `receive`.  There is no source to notify, so `dnd_drop_performed` /
+    // `dnd_finished` are never sent.
+
+    /// Convert composited-frame physical coordinates to a hit-tested
+    /// surface-local logical position, exactly as `PointerMotion` does.
+    fn drag_target(&self, surface_id: u16, x: f64, y: f64) -> Option<(WlSurface, f64, f64)> {
+        let (mut x, mut y) =
+            if let Some(&(cw, ch, lw, lh)) = self.last_reported_size.get(&surface_id) {
+                let sx = if cw > 0 { lw as f64 / cw as f64 } else { 1.0 };
+                let sy = if ch > 0 { lh as f64 / ch as f64 } else { 1.0 };
+                (x * sx, y * sy)
+            } else {
+                (x, y)
+            };
+        if let Some((gx, gy, _, _)) = self
+            .toplevel_surface_ids
+            .get(&surface_id)
+            .and_then(|rid| self.surfaces.get(rid))
+            .and_then(|s| s.xdg_geometry)
+        {
+            x += gx as f64;
+            y += gy as f64;
+        }
+        self.toplevel_surface_ids
+            .get(&surface_id)
+            .and_then(|root_id| self.hit_test_surface_at(root_id, x, y))
+    }
+
+    /// Enter a drag session on the surface under (`x`, `y`), advertising
+    /// `mimes`.  A second enter retargets: the old session is left first.
+    fn drag_enter(
+        &mut self,
+        surface_id: u16,
+        x: f64,
+        y: f64,
+        mimes: &[String],
+        planned_uri_list: Option<Vec<u8>>,
+    ) {
+        // A browser drag supersedes a client-initiated one: the source is
+        // told its drag was cancelled, its target gets a leave.
+        self.client_drag_cancel(true);
+        self.drag_end(true);
+        let Some((wl_surface, lx, ly)) = self.drag_target(surface_id, x, y) else {
+            return;
+        };
+        let serial = self.next_serial();
+        for dd in &self.data_devices {
+            if !same_client(dd, &wl_surface) {
+                continue;
+            }
+            let Some(client) = dd.client() else {
+                continue;
+            };
+            let Ok(offer) = client.create_resource::<WlDataOffer, DataOfferData, Compositor>(
+                &self.display_handle,
+                dd.version(),
+                DataOfferData::new(DataOfferKind::BrowserDrag),
+            ) else {
+                continue;
+            };
+            dd.data_offer(&offer);
+            for mime in mimes {
+                offer.offer(mime.clone());
+            }
+            // Chromium initializes its negotiated action to NONE and only
+            // updates it from source_actions/action events; without one it
+            // refuses the drop outright, however the drag ends.
+            if offer.version() >= 3 {
+                offer.source_actions(DndAction::Copy);
+            }
+            // wl_data_device.enter's source is allow-null exactly for this:
+            // a drag with no client source behind it.
+            dd.enter(serial, &wl_surface, lx, ly, Some(&offer));
+            self.drag = Some(DragSessionState {
+                device: dd.clone(),
+                offer,
+                offers: Vec::new(),
+                planned_uri_list,
+                parked: Vec::new(),
+                dropped: false,
+                finished: false,
+            });
+            // One drag targets one device; further devices of the same
+            // client are its other seat bindings, not other targets.
+            break;
+        }
+    }
+
+    /// Land the drop: hand the payload to the session and send `drop`.
+    /// The offer stays alive afterwards — the target still has to `receive`
+    /// the data and `finish`; with no source there is nobody to tell.
+    fn drag_drop(&mut self, surface_id: u16, x: f64, y: f64, offers: Vec<(String, Vec<u8>)>) {
+        if self.drag.is_none() {
+            return;
+        }
+        // A final motion so the drop lands where the pointer is, not where
+        // the last MOTION happened to leave it.
+        if let Some((_, lx, ly)) = self.drag_target(surface_id, x, y)
+            && let Some(ref drag) = self.drag
+        {
+            drag.device.motion(elapsed_ms(), lx, ly);
+        }
+        if let Some(ref mut drag) = self.drag {
+            drag.offers = offers;
+            // Answer the receives an eager fetcher (Chromium reads every
+            // supported mime at enter) parked with us — before the drop
+            // event goes out, so the fetched snapshot is complete by the
+            // time the client processes the drop.  A mime the drop did not
+            // stage closes empty.
+            let parked = std::mem::take(&mut drag.parked);
+            for (mime, fd) in parked {
+                if let Some(bytes) = browser_drag_bytes(&drag.offers, &mime) {
+                    use std::io::Write;
+                    let mut f = std::fs::File::from(fd);
+                    let _ = f.write_all(bytes);
+                }
+            }
+            drag.dropped = true;
+            drag.device.drop();
+        }
+    }
+
+    /// End the session, optionally telling the target (`leave`).  A session
+    /// that already dropped gets no `leave` — the drop completed it — but
+    /// its offer may still be in `receive`/`finish`, so only the state's
+    /// session slot is cleared.  Dropping the offer handle does not destroy
+    /// it client-side — the client owns that and will `destroy` it.
+    fn drag_end(&mut self, leave: bool) {
+        if let Some(drag) = self.drag.take()
+            && leave
+            && !drag.dropped
+        {
+            drag.device.leave();
+        }
+    }
+
+    // -- Client-initiated drag and drop (wl_data_device.start_drag) --
+    //
+    // The compositor owns the implicit grab: while a client drag is active
+    // and undropped, PointerMotion/PointerButton commands drive the session
+    // instead of reaching wl_pointer.  Enter/motion/leave follow the
+    // hit-tested surface under the point; a release drops on the current
+    // target or cancels at the source.
+
+    /// End the current target focus while keeping the source drag alive so
+    /// it can enter another surface.
+    fn client_drag_depart_target(&mut self, leave: bool) -> bool {
+        let Some(drag) = self.client_drag.as_mut() else {
+            return false;
+        };
+        let Some(target) = drag.target.take() else {
+            return false;
+        };
+        if leave && !target.dropped {
+            target.device.leave();
+        }
+        if !target.dropped {
+            drag.source.target(None);
+            if drag.source.version() >= 3 {
+                drag.source.action(DndAction::empty());
+            }
+        }
+        true
+    }
+
+    /// Abort the entire source drag. A pre-drop target is left and its
+    /// source feedback is reset; after drop, only cancellation remains.
+    fn client_drag_cancel(&mut self, leave: bool) {
+        let Some(mut drag) = self.client_drag.take() else {
+            return;
+        };
+        if let Some(target) = drag.target.take()
+            && !target.dropped
+        {
+            if leave {
+                target.device.leave();
+            }
+            drag.source.target(None);
+            if drag.source.version() >= 3 {
+                drag.source.action(DndAction::empty());
+            }
+        }
+        drag.source.cancelled();
+    }
+
+    /// Whether pointer input currently belongs to a client drag.
+    fn client_drag_grabbed(&self) -> bool {
+        self.client_drag.as_ref().is_some_and(|drag| !drag.dropped)
+    }
+
+    /// Drive the session to the surface under (`x`, `y`): leave the old
+    /// target on crossing, enter (with a fresh offer) on arrival, motion
+    /// while inside.
+    fn client_drag_motion(&mut self, surface_id: u16, x: f64, y: f64) {
+        let hit = self.drag_target(surface_id, x, y);
+        // Crossed off the current target's surface?
+        let crossed = match (
+            self.client_drag.as_ref().and_then(|d| d.target.as_ref()),
+            &hit,
+        ) {
+            (Some(t), Some((wl, _, _))) => t.surface.id() != wl.id(),
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if crossed {
+            self.client_drag_depart_target(true);
+        }
+        let Some((wl_surface, lx, ly)) = hit else {
+            return;
+        };
+        let already_inside = self
+            .client_drag
+            .as_ref()
+            .and_then(|d| d.target.as_ref())
+            .is_some();
+        if already_inside {
+            if let Some(drag) = self.client_drag.as_ref()
+                && let Some(t) = drag.target.as_ref()
+            {
+                t.device.motion(elapsed_ms(), lx, ly);
+            }
+            return;
+        }
+        // Enter: hand the target's client an offer advertising the source's
+        // mime list, on the first data device it bound.
+        let Some(drag) = self.client_drag.as_ref() else {
+            return;
+        };
+        let mimes = drag.mimes.clone();
+        let source_actions = drag.source_actions;
+        let mut entered: Option<(WlDataDevice, WlDataOffer)> = None;
+        for dd in &self.data_devices {
+            if !same_client(dd, &wl_surface) {
+                continue;
+            }
+            let Some(client) = dd.client() else {
+                continue;
+            };
+            let Ok(offer) = client.create_resource::<WlDataOffer, DataOfferData, Compositor>(
+                &self.display_handle,
+                dd.version(),
+                DataOfferData::new(DataOfferKind::ClientDrag),
+            ) else {
+                continue;
+            };
+            // The target has not declared its action mask yet. Advertise
+            // the source and enter; negotiation begins when set_actions
+            // arrives for this offer.
+            dd.data_offer(&offer);
+            for mime in &mimes {
+                offer.offer(mime.clone());
+            }
+            // v3 destinations cannot choose an action until they know the
+            // source mask.  The protocol requires this immediately after
+            // the offer is created, before enter; action follows only after
+            // the destination replies with set_actions.
+            if offer.version() >= 3 {
+                offer.source_actions(source_actions);
+            }
+            entered = Some((dd.clone(), offer));
+            break;
+        }
+        let Some((device, offer)) = entered else {
+            return;
+        };
+        let legacy_action = if offer.version() < 3 && source_actions.contains(DndAction::Copy) {
+            Some(DndAction::Copy)
+        } else {
+            None
+        };
+        let serial = self.next_serial();
+        device.enter(serial, &wl_surface, lx, ly, Some(&offer));
+        if let Some(drag) = self.client_drag.as_mut() {
+            if offer.version() < 3 && drag.source.version() >= 3 {
+                drag.source
+                    .action(legacy_action.unwrap_or_else(DndAction::empty));
+            }
+            drag.target = Some(ClientDragTarget {
+                device,
+                offer,
+                surface: wl_surface,
+                accepted_mime: None,
+                offer_actions: if legacy_action.is_some() {
+                    DndAction::Copy
+                } else {
+                    DndAction::empty()
+                },
+                preferred_action: legacy_action.unwrap_or_else(DndAction::empty),
+                action: legacy_action,
+                action_announced: legacy_action.is_some(),
+                dropped: false,
+            });
+        }
+    }
+
+    /// The button went up: drop on the current target (the source learns
+    /// `dnd_finished` when the target finishes), or cancel at the source
+    /// when there is none.  Either way the grab is over.
+    fn client_drag_release(&mut self) {
+        let Some(drag) = self.client_drag.as_ref() else {
+            return;
+        };
+        let valid = drag.target.as_ref().is_some_and(|target| {
+            target.action.is_some()
+                && (target.offer.version() < 3 || target.accepted_mime.is_some())
+        });
+        if self.verbose {
+            eprintln!(
+                "[dnd] release origin={:?} accepted_mime={:?} action={:?} valid={valid}",
+                drag.origin.id(),
+                drag.target
+                    .as_ref()
+                    .and_then(|target| target.accepted_mime.as_ref()),
+                drag.target.as_ref().and_then(|target| target.action),
+            );
+        }
+        if !valid {
+            self.client_drag_cancel(true);
+            return;
+        }
+        let Some(drag) = self.client_drag.as_mut() else {
+            return;
+        };
+        drag.dropped = true;
+        if let Some(t) = drag.target.as_mut() {
+            t.dropped = true;
+            t.device.drop();
+            if drag.source.version() >= 3 {
+                drag.source.dnd_drop_performed();
+            }
+        }
+    }
+
+    /// Recompute the selected action after the destination's `set_actions`.
+    /// NONE is a real, transient result: keep the pointer focus and announce
+    /// it so a later destination update can make the same offer viable.
+    fn client_drag_renegotiate(&mut self) {
+        let Some(drag) = self.client_drag.as_mut() else {
+            return;
+        };
+        let Some(t) = drag.target.as_mut() else {
+            return;
+        };
+        let new = negotiate_dnd_action(drag.source_actions, t.offer_actions, t.preferred_action);
+        if !t.action_announced || t.action != new {
+            t.action = new;
+            t.action_announced = true;
+            let action = new.unwrap_or_else(DndAction::empty);
+            t.offer.action(action);
+            if drag.source.version() >= 3 {
+                drag.source.action(action);
+            }
+        }
     }
 
     /// Hand the current primary selection to one device, or clear it there.
@@ -7671,6 +8811,8 @@ fn run_compositor(
         data_devices: Vec::new(),
         selection_source: None,
         external_clipboard: None,
+        drag: None,
+        client_drag: None,
         primary_devices: Vec::new(),
         primary_source: None,
         external_primary: None,

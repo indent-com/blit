@@ -61,6 +61,7 @@ import { setReveal } from "./reveal";
 import {
   registerActiveEditor,
   clearActiveEditor,
+  setActiveEditorFocused,
   type CommitController,
 } from "./activeEditor";
 
@@ -80,6 +81,8 @@ export function BlitCommit(props: {
   /** Read-only preview (the background dock): no status-bar registration,
    *  so a thumbnail never takes the bar from the focused tile. */
   preview?: boolean;
+  /** Whether this tile's workspace pane is focused. */
+  focused?: boolean;
 }) {
   // Syntax highlighting for the patch, matched to the editor/diff scheme.
   const highlighter = createMemo(() =>
@@ -132,8 +135,8 @@ export function BlitCommit(props: {
 
   const [commit, setCommit] = createSignal<CommitInfo | null>(null);
   // The tile's chrome (oid, subject, unified/split toggle) lives in the
-  // StatusBar, like the diff's. A commit view has no focusable input, so
-  // it registers on mount and on click rather than on focus.
+  // StatusBar, like the diff's. BSP keeps background tiles mounted, so its
+  // pane's focus state owns registration.
   const controller: CommitController = {
     kind: "commit",
     connectionId: props.connectionId,
@@ -148,10 +151,13 @@ export function BlitCommit(props: {
     toggleViewMode: () =>
       setViewMode((m) => (m === "unified" ? "split" : "unified")),
   };
-  if (!props.preview) {
-    onMount(() => registerActiveEditor(controller));
-    onCleanup(() => clearActiveEditor(controller));
-  }
+  createEffect(() => {
+    setActiveEditorFocused(
+      controller,
+      !props.preview && props.focused !== false,
+    );
+  });
+  onCleanup(() => clearActiveEditor(controller));
 
   // `null` = the patch has not arrived yet — distinct from an empty
   // commit, so the viewer shows "Loading…" instead of "No file changes."

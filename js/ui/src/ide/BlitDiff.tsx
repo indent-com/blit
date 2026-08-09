@@ -50,6 +50,7 @@ import {
 import {
   registerActiveEditor,
   clearActiveEditor,
+  setActiveEditorFocused,
   type DiffController,
 } from "./activeEditor";
 import { acquireRepo } from "./repoRegistry";
@@ -168,6 +169,8 @@ export function BlitDiff(props: {
   onOpenTile?: (assignment: string) => void;
   /** Read-only dock preview: no status-bar registration. */
   preview?: boolean;
+  /** Whether this tile's workspace pane is focused. */
+  focused?: boolean;
 }) {
   // Syntax highlighting: the language's Lezer parser drives per-line coloring,
   // recolored on theme/palette change.
@@ -206,8 +209,8 @@ export function BlitDiff(props: {
   const [viewMode, setViewMode] = createSignal<"unified" | "split">("unified");
 
   // The diff's chrome (filename, view switcher, unified/split toggle) lives
-  // in the StatusBar, like the editor's. A diff has no focusable input, so it
-  // registers on mount and on click rather than on focus.
+  // in the StatusBar, like the editor's. BSP keeps background tiles mounted,
+  // so its pane's focus state owns registration.
   const controller: DiffController = {
     kind: "diff",
     connectionId: props.connectionId,
@@ -226,10 +229,13 @@ export function BlitDiff(props: {
       setViewMode((m) => (m === "unified" ? "split" : "unified")),
     onOpenTile: props.onOpenTile,
   };
-  if (!props.preview) {
-    onMount(() => registerActiveEditor(controller));
-    onCleanup(() => clearActiveEditor(controller));
-  }
+  createEffect(() => {
+    setActiveEditorFocused(
+      controller,
+      !props.preview && props.focused !== false,
+    );
+  });
+  onCleanup(() => clearActiveEditor(controller));
 
   // Flatten the aligned records into unified lines: a modified row becomes a
   // "-" (old) line followed by a "+" (new) line; pure add/delete/context map

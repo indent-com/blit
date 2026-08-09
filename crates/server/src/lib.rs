@@ -6,21 +6,24 @@ use blit_remote::{
     C2S_CREATE2, C2S_DEADLINE, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_KILL, C2S_MOUSE,
     C2S_PING, C2S_PRIMARY_SET, C2S_QUIT, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL,
     C2S_SCROLL_BY, C2S_SEARCH, C2S_SUBSCRIBE, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE,
-    C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT, C2S_SURFACE_LIST, C2S_SURFACE_POINTER,
-    C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2, C2S_SURFACE_PREEDIT, C2S_SURFACE_RESIZE,
-    C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD,
-    C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_CWD,
-    CREATE2_HAS_DEADLINE, CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS, FEATURE_COPY_RANGE,
-    FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE,
-    FEATURE_RESIZE_BATCH, FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState, KILL_LEADER_ONLY,
-    READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT,
-    S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE,
-    STATUS_BUDGET, STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264,
+    C2S_SURFACE_CLOSE, C2S_SURFACE_DRAG_CANCEL, C2S_SURFACE_DRAG_DROP, C2S_SURFACE_DRAG_ENTER,
+    C2S_SURFACE_DRAG_LEAVE, C2S_SURFACE_DRAG_MOTION, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT,
+    C2S_SURFACE_LIST, C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2,
+    C2S_SURFACE_PREEDIT, C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT,
+    C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
+    CAPTURE_FORMAT_PNG, CREATE2_HAS_COMMAND, CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE,
+    CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE,
+    FEATURE_CREATE_STATUS, FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH,
+    FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState, KILL_LEADER_ONLY, READ_ANSI, READ_TAIL,
+    S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY,
+    S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, STATUS_BUDGET,
+    STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264,
     SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN, build_update_msg, msg_hello,
-    msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_scroll_offset, msg_s2c_used_rows,
-    msg_surface_activated, msg_surface_app_id, msg_surface_created, msg_surface_destroyed,
-    msg_surface_encoder, msg_surface_frame, msg_surface_resized, msg_surface_title,
-    msg_term_cwd_reply, parse_surface_pointer_axis2,
+    msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_clipboard_owner,
+    msg_s2c_scroll_offset, msg_s2c_used_rows, msg_surface_activated, msg_surface_app_id,
+    msg_surface_created, msg_surface_destroyed, msg_surface_encoder, msg_surface_frame,
+    msg_surface_resized, msg_surface_title, msg_term_cwd_reply, parse_surface_drag_drop,
+    parse_surface_drag_enter, parse_surface_pointer_axis2,
 };
 #[cfg(target_os = "linux")]
 use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO, FEATURE_COMPOSITOR};
@@ -622,6 +625,9 @@ fn compositor_native_for_sid(
 
 struct SharedCompositor {
     handle: CompositorHandle,
+    /// Current compositor clipboard authority, replayed to every new web
+    /// client before READY so its first paste takes the correct path.
+    wayland_clipboard_owned: bool,
     surfaces: HashMap<u16, CachedSurfaceInfo>,
     /// Latest pixel snapshot per `(surface_id, width, height)`.  The
     /// compositor renders one surface into multiple per-target buffers
@@ -1516,6 +1522,199 @@ struct ClientState {
     /// surfaces.  On disconnect we send synthetic key-up events for each
     /// so modifiers don't stay stuck and keys don't auto-repeat forever.
     pressed_surface_keys: HashSet<u32>,
+    /// Browser drag-and-drop session in flight (`C2S_SURFACE_DRAG_*`), at
+    /// most one per connection: a second ENTER retargets.
+    drag_session: Option<DragSession>,
+    /// Per-connection staging dir for dropped files, created lazily at the
+    /// first `FS_SYNC_STAGING` sync open; removed on connection close.  The
+    /// files must outlive the drop itself — the `file://` URIs the app
+    /// receives point at them.
+    drag_staging_dir: Option<std::path::PathBuf>,
+}
+
+/// An in-flight browser drag session (docs/protocol.md "Drag and drop").
+struct DragSession {
+    /// Surface the drag is currently over.
+    surface_id: u16,
+    /// The authoritative hover-time plan, if ENTER carried the item trailer.
+    /// DROP must name these exact paths in this order: this is the URI list
+    /// Chromium already fetched, so substituting another path would leave
+    /// the app holding an empty planned file.
+    plan: Option<DragPlan>,
+}
+
+struct DragPlan {
+    names: Vec<String>,
+    uri_list: Vec<u8>,
+}
+
+/// Pre-create the planned staging files for an ENTER carrying the
+/// item-plan trailer and build the planned `text/uri-list`: each item gets
+/// its derived empty file (truncating whatever a previous drop left under
+/// the same planned name), and the list names them in order with the same
+/// encoding [`build_drag_offers`] uses.  `None` when the staging dir
+/// cannot be prepared — the drag then falls back to park-until-drop.
+fn build_drag_plan(client: &mut ClientState, client_id: u64, items: &[String]) -> Option<DragPlan> {
+    let staging = drag_staging_dir(client, client_id).ok()?;
+    let mut names = Vec::with_capacity(items.len());
+    let mut uri_list = String::new();
+    for (index, mime) in items.iter().enumerate() {
+        let name = blit_remote::surface_drag_planned_name(index, mime);
+        let path = staging.join(&name);
+        if std::fs::write(&path, b"").is_err() {
+            return None;
+        }
+        names.push(name);
+        uri_list.push_str(&drag_file_uri(&path));
+        uri_list.push_str("\r\n");
+    }
+    Some(DragPlan {
+        names,
+        uri_list: uri_list.into_bytes(),
+    })
+}
+
+/// Percent-encode every byte of `path` outside the RFC 3986 unreserved set
+/// (plus `/`, which separates path segments) for use in a `file://` URI.
+fn percent_encode_uri_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for &b in path.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// The `file://` URI (RFC 2483) for a staged drop file.
+fn drag_file_uri(path: &std::path::Path) -> String {
+    format!(
+        "file://{}",
+        percent_encode_uri_path(&path.to_string_lossy())
+    )
+}
+
+/// Get-or-create the connection's drag staging dir: one tempdir per
+/// connection, shared by every staging sync and DROP of that connection.
+fn drag_staging_dir(
+    client: &mut ClientState,
+    client_id: u64,
+) -> std::io::Result<std::path::PathBuf> {
+    if let Some(dir) = &client.drag_staging_dir {
+        return Ok(dir.clone());
+    }
+    let dir = std::env::temp_dir().join(format!("blit_drag_{}_{client_id}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    client.drag_staging_dir = Some(dir.clone());
+    Ok(dir)
+}
+
+/// Resolve a `C2S_FS_SYNC` carrying `FS_SYNC_STAGING`: get-or-create the
+/// connection's drag staging dir and rebase the sync onto it as a plain
+/// path-based sync, so the fs handler stays path-only. `Err(detail)` is
+/// the refusal to send back: the staging root is per-connection, so naming
+/// a source pty (`FROM_PTY`) contradicts it, and a dir that cannot be
+/// created cannot serve uploads.
+fn rebase_staging_sync(
+    client: &mut ClientState,
+    client_id: u64,
+    data: &[u8],
+) -> Result<Vec<u8>, String> {
+    let flags = blit_remote::fs::fs_sync_flags(data).unwrap_or(0);
+    if flags & blit_remote::fs::FS_SYNC_FROM_PTY != 0 {
+        return Err("staging sync cannot name a source terminal".to_string());
+    }
+    let dir = drag_staging_dir(client, client_id).map_err(|e| format!("drag staging dir: {e}"))?;
+    blit_remote::fs::fs_sync_rebase_staging(data, &dir.to_string_lossy())
+        .ok_or_else(|| "malformed staging sync".to_string())
+}
+
+/// Resolve a staged drop name against the staging root: the name must be a
+/// relative path that never leaves the root — `../x` and absolute names are
+/// rejected outright — and must name a file the client already uploaded
+/// there. `None` abandons the drop.
+fn resolve_staged_path(staging: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let rel = std::path::Path::new(name);
+    if rel.components().any(|c| {
+        !matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return None;
+    }
+    let path = staging.join(rel);
+    path.is_file().then_some(path)
+}
+
+/// Build the compositor's offer list for a DROP.
+///
+/// Named items are files the client already uploaded into the connection's
+/// staging dir through the fs family: they are offered as `text/uri-list`
+/// (RFC 2483: CRLF-separated `file://` URIs, one per staged item, each line
+/// terminated).  A single named item also keeps its own mime, served from
+/// the staged file's bytes, so an app that pastes content rather than
+/// opening files still gets it.  Name-less items — dragged text, HTML —
+/// are offered directly under their own mime, unstaged.
+///
+/// `None` abandons the drop: a named item whose upload never landed — no
+/// staging sync on the connection, a name that escapes the staging root, a
+/// missing file, or inline bytes where the protocol puts none — ends the
+/// session with no offer rather than handing the app half a drop.
+fn build_drag_offers(
+    client: &ClientState,
+    items: &[blit_remote::SurfaceDragDropItem],
+) -> Option<Vec<(String, Vec<u8>)>> {
+    let plan = client.drag_session.as_ref().and_then(|s| s.plan.as_ref());
+    if let Some(plan) = plan
+        && (items.len() != plan.names.len()
+            || items
+                .iter()
+                .zip(&plan.names)
+                .any(|(item, planned)| item.name != *planned))
+    {
+        return None;
+    }
+    let mut offers: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut uris: Vec<String> = Vec::new();
+    let mut staged: Vec<std::path::PathBuf> = Vec::new();
+    for item in items {
+        if item.name.is_empty() {
+            offers.push((item.mime.clone(), item.data.clone()));
+            continue;
+        }
+        // A named item's bytes are already on disk; inline data here is a
+        // protocol violation.
+        if !item.data.is_empty() {
+            return None;
+        }
+        let staging = client.drag_staging_dir.as_ref()?;
+        let path = resolve_staged_path(staging, &item.name)?;
+        uris.push(drag_file_uri(&path));
+        staged.push(path);
+    }
+    if !uris.is_empty() {
+        // A planned drop advertises the uri-list the ENTER staged —
+        // verbatim, so what the app fetched during hover is exactly what
+        // the drop names.  Without a plan, derive it from the items.
+        let uri_list = plan.map(|plan| plan.uri_list.clone()).unwrap_or_else(|| {
+            let mut uri_list = String::new();
+            for uri in &uris {
+                uri_list.push_str(uri);
+                uri_list.push_str("\r\n");
+            }
+            uri_list.into_bytes()
+        });
+        offers.insert(0, ("text/uri-list".to_string(), uri_list));
+    }
+    if items.len() == 1 && !items[0].name.is_empty() {
+        let bytes = std::fs::read(staged.first()?).ok()?;
+        offers.push((items[0].mime.clone(), bytes));
+    }
+    Some(offers)
 }
 
 struct InFlightFrame {
@@ -3283,6 +3482,7 @@ impl Session {
 
             self.compositor = Some(SharedCompositor {
                 handle,
+                wayland_clipboard_owned: false,
                 surfaces: HashMap::new(),
                 last_pixels: HashMap::new(),
                 last_encoded: HashMap::new(),
@@ -5166,6 +5366,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                     mime_type, data, ..
                 } => {
                     broadcast.push(msg_s2c_clipboard_content(&mime_type, &data));
+                }
+                CompositorEvent::ClipboardOwner { wayland } => {
+                    cs.wayland_clipboard_owned = wayland;
+                    broadcast.push(msg_s2c_clipboard_owner(wayland));
                 }
                 CompositorEvent::SurfaceCursor { surface_id, cursor } => {
                     // Format: [0x29][surface_id:2][type:1][payload...]
@@ -8185,8 +8389,21 @@ struct FsSyncs {
     /// cap, its own set so search and index nonce spaces stay independent.
     inflight_searches: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
     inflight_greps: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    /// Live chunked uploads on this connection (upload_id → sync_id routing
+    /// plus the concurrent-upload cap). Shared with the sync sinks, which
+    /// free the id of a BEGIN the engine refused.
+    uploads: std::sync::Arc<std::sync::Mutex<Uploads>>,
     /// `FS_FETCH` in-flight cap and overflow queue.
     fetches: std::sync::Arc<FetchGate>,
+}
+
+/// Chunked-upload routing table: upload_id → sync_id, with wrap-around
+/// allocation mirroring `FsSyncs::alloc_id`. The upload state itself lives
+/// in the sync's engine; this is only the per-connection id namespace.
+#[derive(Default)]
+struct Uploads {
+    map: HashMap<u16, u16>,
+    next: u16,
 }
 
 impl FsSyncs {
@@ -8297,6 +8514,56 @@ impl FsSyncs {
             self.inflight_searches.clone(),
             nonce,
         )))
+    }
+
+    fn max_upload_inflight() -> usize {
+        // 4: an upload is one open temp file per sync engine — cheap — but
+        // each can stream up to BLIT_FS_UPLOAD_MAX through the connection,
+        // so a client gets a few concurrent ones, not an unbounded set.
+        static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            std::env::var("BLIT_FS_UPLOAD_INFLIGHT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4)
+        });
+        *V
+    }
+
+    /// Allocate an upload id routed to `sync_id`. `None` at the
+    /// concurrent-upload cap (`BUDGET`).
+    fn alloc_upload(&self, sync_id: u16) -> Option<u16> {
+        let mut uploads = self.uploads.lock().unwrap();
+        if uploads.map.len() >= Self::max_upload_inflight() {
+            return None;
+        }
+        for _ in 0..=u16::MAX {
+            let id = uploads.next;
+            uploads.next = uploads.next.wrapping_add(1);
+            if let std::collections::hash_map::Entry::Vacant(slot) = uploads.map.entry(id) {
+                slot.insert(sync_id);
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn free_upload(&self, upload_id: u16) {
+        self.uploads.lock().unwrap().map.remove(&upload_id);
+    }
+
+    /// The sync an upload id routes to.
+    fn upload_sync(&self, upload_id: u16) -> Option<u16> {
+        self.uploads.lock().unwrap().map.get(&upload_id).copied()
+    }
+
+    /// Drop upload routing for dead syncs (engine exited on its own) and
+    /// for `stopped` (an explicit FS_STOP). The engines have already
+    /// removed the temp files; this is only the id namespace.
+    fn reap_uploads(&self, stopped: Option<u16>) {
+        let mut uploads = self.uploads.lock().unwrap();
+        uploads
+            .map
+            .retain(|_, sid| Some(*sid) != stopped && self.map.contains_key(sid));
     }
 }
 
@@ -8783,22 +9050,58 @@ fn fs_search_walk(root: &str, query: &str, limit: usize) -> Vec<String> {
     scored.into_iter().map(|(_, p)| p).collect()
 }
 
+/// The read-only (`BLIT_FS_WRITE=0`) refusal for the FS family's write
+/// side: `Some(reply)` when `msg` is a write-family request, to be sent
+/// instead of dispatching. Every nonce-bearing request gets its one reply
+/// with `PERMISSION` (docs/design/fs-write.md "Security"); `UPLOAD_CHUNK`
+/// carries no nonce but has a per-upload reply channel, and `UPLOAD_CANCEL`
+/// defines no reply at all, so it returns an empty "swallowed" marker.
+fn fs_readonly_refusal(msg: &[u8]) -> Option<Vec<u8>> {
+    use blit_remote::fs::{
+        C2S_FS_OP, C2S_FS_UPLOAD_BEGIN, C2S_FS_UPLOAD_CANCEL, C2S_FS_UPLOAD_CHUNK,
+        C2S_FS_UPLOAD_FINISH, C2S_FS_WRITE, FS_DONE_PERMISSION, msg_fs_done,
+        msg_fs_upload_begin_result, msg_fs_upload_chunk_result, msg_fs_upload_finish_result,
+    };
+    // Both the nonce and the upload id sit at bytes 1..3 in every one of
+    // these messages.
+    let id = msg
+        .get(1..3)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .unwrap_or(0);
+    match msg.first().copied() {
+        Some(C2S_FS_WRITE) | Some(C2S_FS_OP) => Some(msg_fs_done(id, FS_DONE_PERMISSION, 0, 0)),
+        Some(C2S_FS_UPLOAD_BEGIN) => {
+            Some(msg_fs_upload_begin_result(id, FS_DONE_PERMISSION, 0, 0, 0))
+        }
+        Some(C2S_FS_UPLOAD_CHUNK) => Some(msg_fs_upload_chunk_result(id, FS_DONE_PERMISSION, 0)),
+        Some(C2S_FS_UPLOAD_FINISH) => {
+            Some(msg_fs_upload_finish_result(id, FS_DONE_PERMISSION, 0, 0))
+        }
+        Some(C2S_FS_UPLOAD_CANCEL) => Some(Vec::new()),
+        _ => None,
+    }
+}
+
 async fn handle_fs_message(
     data: &[u8],
     syncs: &mut FsSyncs,
     out: &mpsc::UnboundedSender<Vec<u8>>,
     verbose: bool,
 ) {
-    use blit_fssync::{OpReq, WriteReq};
+    use blit_fssync::{OpReq, UploadBeginReq, WriteReq};
     use blit_remote::fs::{
         C2S_FS_ACK, C2S_FS_FETCH, C2S_FS_GREP, C2S_FS_INDEX, C2S_FS_OP, C2S_FS_SEARCH, C2S_FS_STOP,
-        C2S_FS_SYNC, C2S_FS_WRITE, FS_DONE_INVALID, FS_DONE_NOT_FOUND, FS_DONE_OK, FS_DONE_OTHER,
-        FS_DONE_PERMISSION, FS_DONE_WRONG_TYPE, FS_FILE_OTHER, FS_INDEX_TRUNCATED, FS_STATUS_OK,
-        FS_STATUS_OTHER, FS_STATUS_RESOURCE_LIMIT, FS_SYNC_CONTENT, FS_SYNC_CROSS_FILESYSTEM,
-        FS_SYNC_DOTIGNORE, FS_SYNC_EXCLUDE_GIT, FS_SYNC_FLAGS_KNOWN, FS_SYNC_GITIGNORE,
-        FS_SYNC_HEADER, FS_SYNC_ID_INVALID, FS_SYNC_RECURSIVE, FS_SYNC_SINGLE, fs_sync_flags_valid,
-        msg_fs_done, msg_fs_file, msg_fs_index_result, msg_fs_search_result, msg_fs_synced,
-        parse_fs_index, parse_fs_op, parse_fs_search, parse_fs_write,
+        C2S_FS_SYNC, C2S_FS_UPLOAD_BEGIN, C2S_FS_UPLOAD_CANCEL, C2S_FS_UPLOAD_CHUNK,
+        C2S_FS_UPLOAD_FINISH, C2S_FS_WRITE, FS_DONE_BUDGET, FS_DONE_INVALID, FS_DONE_NOT_FOUND,
+        FS_DONE_OK, FS_DONE_OTHER, FS_DONE_PERMISSION, FS_DONE_UNKNOWN_UPLOAD, FS_DONE_WRONG_TYPE,
+        FS_FILE_OTHER, FS_INDEX_TRUNCATED, FS_STATUS_OK, FS_STATUS_OTHER, FS_STATUS_RESOURCE_LIMIT,
+        FS_SYNC_CONTENT, FS_SYNC_CROSS_FILESYSTEM, FS_SYNC_DOTIGNORE, FS_SYNC_EXCLUDE_GIT,
+        FS_SYNC_FLAGS_KNOWN, FS_SYNC_GITIGNORE, FS_SYNC_HEADER, FS_SYNC_ID_INVALID,
+        FS_SYNC_RECURSIVE, FS_SYNC_SINGLE, fs_sync_flags_valid, msg_fs_done, msg_fs_file,
+        msg_fs_index_result, msg_fs_search_result, msg_fs_synced, msg_fs_upload_begin_result,
+        msg_fs_upload_chunk_result, msg_fs_upload_finish_result, parse_fs_index, parse_fs_op,
+        parse_fs_search, parse_fs_upload_begin, parse_fs_upload_chunk, parse_fs_upload_finish,
+        parse_fs_write,
     };
     match data[0] {
         C2S_FS_SEARCH => {
@@ -9021,6 +9324,7 @@ async fn handle_fs_message(
             // FS_CLOSED but never sent FS_STOP, so their slots would
             // otherwise leak against the budget until disconnect.
             syncs.map.retain(|_, entry| !entry.handle.is_done());
+            syncs.reap_uploads(None);
             if syncs.map.len() >= FsSyncs::max_syncs() {
                 refuse(FS_STATUS_RESOURCE_LIMIT, "sync limit reached");
                 return;
@@ -9099,19 +9403,40 @@ async fn handle_fs_message(
             // The sink watches for FS_FILE replies to free fetch slots
             // (and dispatch queued fetches): the engine is the only
             // producer of them, so every reply pairs with one dispatched
-            // Command::Fetch.
+            // Command::Fetch. It also frees the upload id of a BEGIN the
+            // engine refused — the id was reserved at dispatch, and a
+            // refused begin never becomes an upload.
             let engine_out = out.clone();
             let gate = syncs.fetches.clone();
             let gate_out = out.clone();
+            let uploads = syncs.uploads.clone();
             let handle = blit_fssync::start_sync(
                 &shared,
                 sync_id,
                 opts,
                 Box::new(move |msg| {
-                    let is_file_reply = msg.first() == Some(&blit_remote::fs::S2C_FS_FILE);
+                    let first = msg.first().copied();
+                    // Extracted before the send consumes the message.
+                    let refused_begin = match first {
+                        Some(blit_remote::fs::S2C_FS_UPLOAD_BEGIN)
+                            if msg.get(3).copied() != Some(blit_remote::fs::FS_DONE_OK) =>
+                        {
+                            msg.get(4..6).map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        }
+                        _ => None,
+                    };
                     let sent = engine_out.send(msg).is_ok();
-                    if is_file_reply {
-                        fetch_finish(&gate, &gate_out);
+                    match first {
+                        Some(blit_remote::fs::S2C_FS_FILE) => fetch_finish(&gate, &gate_out),
+                        Some(blit_remote::fs::S2C_FS_UPLOAD_BEGIN) => {
+                            if let Some(upload_id) = refused_begin {
+                                let routed = uploads.lock().unwrap().map.get(&upload_id).copied();
+                                if routed == Some(sync_id) {
+                                    uploads.lock().unwrap().map.remove(&upload_id);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                     sent
                 }),
@@ -9131,6 +9456,9 @@ async fn handle_fs_message(
             if let Some(entry) = syncs.map.remove(&sync_id) {
                 entry.handle.command(blit_fssync::Command::Stop);
             }
+            // Stopping a sync ends its uploads (the engine removes their
+            // temp files on exit); drop the routing entries with it.
+            syncs.reap_uploads(Some(sync_id));
         }
         C2S_FS_ACK if data.len() >= 7 => {
             let sync_id = u16::from_le_bytes([data[1], data[2]]);
@@ -9272,6 +9600,187 @@ async fn handle_fs_message(
                 let _ = out.send(msg_fs_done(nonce, FS_DONE_INVALID, 0, 0));
             }
         },
+        C2S_FS_UPLOAD_BEGIN => {
+            // Chunked upload into a synced root (docs/protocol.md
+            // "Filesystem sync"). The server owns the per-connection upload
+            // id namespace and routing; the sync's engine owns the state
+            // (temp sibling, byte count) so the landed file flows through
+            // the same watcher/shadow path as a one-shot write.
+            match parse_fs_upload_begin(data) {
+                Some(b) => {
+                    if !syncs.map.contains_key(&b.sync_id) {
+                        let _ = out.send(msg_fs_upload_begin_result(
+                            b.nonce,
+                            FS_DONE_INVALID,
+                            0,
+                            0,
+                            0,
+                        ));
+                        return;
+                    }
+                    let inflight = match syncs.reserve_write(b.nonce) {
+                        Ok(guard) => guard,
+                        Err(status) => {
+                            let _ = out.send(msg_fs_upload_begin_result(b.nonce, status, 0, 0, 0));
+                            return;
+                        }
+                    };
+                    let Some(upload_id) = syncs.alloc_upload(b.sync_id) else {
+                        let _ =
+                            out.send(msg_fs_upload_begin_result(b.nonce, FS_DONE_BUDGET, 0, 0, 0));
+                        return;
+                    };
+                    // Reserved above, so the entry exists. A false return
+                    // means the engine exited but was not reaped yet: answer
+                    // here and free the id (the sink never sees a reply).
+                    let sent = syncs
+                        .map
+                        .get(&b.sync_id)
+                        .expect("checked above")
+                        .handle
+                        .command(blit_fssync::Command::UploadBegin(UploadBeginReq {
+                            nonce: b.nonce,
+                            upload_id,
+                            path: b.path,
+                            flags: b.flags,
+                            base: b.base,
+                            mode: b.mode,
+                            size: b.size,
+                            inflight: Some(inflight),
+                        }));
+                    if !sent {
+                        syncs.free_upload(upload_id);
+                        let _ = out.send(msg_fs_upload_begin_result(
+                            b.nonce,
+                            FS_DONE_INVALID,
+                            0,
+                            0,
+                            0,
+                        ));
+                    }
+                    // An engine refusal reaches the client through the sync
+                    // sink, which frees the id; a live upload frees it on
+                    // FINISH/CANCEL dispatch below.
+                }
+                None => {
+                    let nonce = data
+                        .get(1..3)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .unwrap_or(0);
+                    let _ = out.send(msg_fs_upload_begin_result(nonce, FS_DONE_INVALID, 0, 0, 0));
+                }
+            }
+        }
+        C2S_FS_UPLOAD_CHUNK => {
+            match parse_fs_upload_chunk(data) {
+                Some((upload_id, offset, bytes)) => {
+                    let entry = syncs
+                        .upload_sync(upload_id)
+                        .and_then(|sid| syncs.map.get(&sid));
+                    match entry {
+                        Some(entry) => {
+                            let sent = entry.handle.command(blit_fssync::Command::UploadChunk {
+                                upload_id,
+                                offset,
+                                data: bytes,
+                            });
+                            // Dead engine: the upload is gone with it.
+                            if !sent {
+                                syncs.free_upload(upload_id);
+                                let _ = out.send(msg_fs_upload_chunk_result(
+                                    upload_id,
+                                    FS_DONE_UNKNOWN_UPLOAD,
+                                    0,
+                                ));
+                            }
+                        }
+                        None => {
+                            let _ = out.send(msg_fs_upload_chunk_result(
+                                upload_id,
+                                FS_DONE_UNKNOWN_UPLOAD,
+                                0,
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    // Malformed or over the decompression cap; the id field
+                    // is still recoverable for the reply.
+                    let upload_id = data
+                        .get(1..3)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .unwrap_or(0);
+                    let _ = out.send(msg_fs_upload_chunk_result(upload_id, FS_DONE_INVALID, 0));
+                }
+            }
+        }
+        C2S_FS_UPLOAD_FINISH => {
+            match parse_fs_upload_finish(data) {
+                Some((nonce, upload_id)) => {
+                    let entry = syncs
+                        .upload_sync(upload_id)
+                        .and_then(|sid| syncs.map.get(&sid));
+                    match entry {
+                        Some(entry) => {
+                            let inflight = match syncs.reserve_write(nonce) {
+                                Ok(guard) => guard,
+                                Err(status) => {
+                                    let _ =
+                                        out.send(msg_fs_upload_finish_result(nonce, status, 0, 0));
+                                    return;
+                                }
+                            };
+                            // FINISH terminates the upload whatever the
+                            // engine answers, so the id frees at dispatch.
+                            syncs.free_upload(upload_id);
+                            let sent = entry.handle.command(blit_fssync::Command::UploadFinish {
+                                nonce,
+                                upload_id,
+                                inflight: Some(inflight),
+                            });
+                            if !sent {
+                                let _ = out.send(msg_fs_upload_finish_result(
+                                    nonce,
+                                    FS_DONE_OTHER,
+                                    0,
+                                    0,
+                                ));
+                            }
+                        }
+                        None => {
+                            let _ = out.send(msg_fs_upload_finish_result(
+                                nonce,
+                                FS_DONE_UNKNOWN_UPLOAD,
+                                0,
+                                0,
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    let nonce = data
+                        .get(1..3)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .unwrap_or(0);
+                    let _ = out.send(msg_fs_upload_finish_result(nonce, FS_DONE_INVALID, 0, 0));
+                }
+            }
+        }
+        C2S_FS_UPLOAD_CANCEL if data.len() >= 3 => {
+            let upload_id = u16::from_le_bytes([data[1], data[2]]);
+            let entry = syncs
+                .upload_sync(upload_id)
+                .and_then(|sid| syncs.map.get(&sid));
+            syncs.free_upload(upload_id);
+            if let Some(entry) = entry {
+                // No reply: the client's next message to the id (if any)
+                // answers UNKNOWN_UPLOAD.
+                entry
+                    .handle
+                    .command(blit_fssync::Command::UploadCancel { upload_id });
+            }
+        }
+        C2S_FS_UPLOAD_CANCEL => {}
         // A frame too short to clear the length guards above still carries a
         // nonce for these read opcodes: recover it and reply, so the request
         // is not left hanging (mirrors the FS_WRITE/FS_OP recovery).
@@ -10692,6 +11201,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 surface_codec_support: 0,
                 surface_max_decode: (0, 0),
                 pressed_surface_keys: HashSet::new(),
+                drag_session: None,
+                drag_staging_dir: None,
             },
         );
         // Wake the tick loop so the new client gets its first frame.
@@ -10746,6 +11257,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         // set — otherwise the BSP reconciliation runs with an empty
         // surface list and wipes restored surface assignments.
         if let Some(cs) = sess.compositor.as_ref() {
+            initial_msgs.push(msg_s2c_clipboard_owner(cs.wayland_clipboard_owned));
             for info in cs.surfaces.values() {
                 // Use the authoritative native size if the stored
                 // width/height is still 0 (surface created before first
@@ -10890,13 +11402,45 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | blit_remote::fs::C2S_FS_SEARCH
                 | blit_remote::fs::C2S_FS_INDEX
                 | blit_remote::fs::C2S_FS_GREP
+                | blit_remote::fs::C2S_FS_UPLOAD_BEGIN
+                | blit_remote::fs::C2S_FS_UPLOAD_CHUNK
+                | blit_remote::fs::C2S_FS_UPLOAD_FINISH
+                | blit_remote::fs::C2S_FS_UPLOAD_CANCEL
         ) {
             // A FROM_PTY sync (docs/ide.md Decision 3) names a source pty
             // whose live cwd is session state; resolve it here — the sole
             // place these connection-scoped families touch the session
             // mutex, and only when the client opts in — then rebase to a
             // plain path-based sync so the handler stays path-only.
-            let msg: std::borrow::Cow<[u8]> = if data[0] == blit_remote::fs::C2S_FS_SYNC {
+            // A STAGING sync (docs/protocol.md "Drag and drop") roots at
+            // the connection's drag staging dir — connection state, so it
+            // is resolved here like FROM_PTY, on the sole connection-scoped
+            // family that otherwise never touches the session mutex — then
+            // rebased to a plain path-based sync so the handler stays
+            // path-only. The invalid `STAGING|FROM_PTY` combination gets
+            // the usual invalid-flag refusal.
+            let msg: std::borrow::Cow<[u8]> = if data[0] == blit_remote::fs::C2S_FS_SYNC
+                && blit_remote::fs::fs_sync_flags(&data)
+                    .is_some_and(|f| f & blit_remote::fs::FS_SYNC_STAGING != 0)
+            {
+                let nonce = u16::from_le_bytes([data[1], data[2]]);
+                let mut sess = state.session.lock().await;
+                match sess.clients.get_mut(&client_id) {
+                    Some(client) => match rebase_staging_sync(client, client_id, &data) {
+                        Ok(rebased) => std::borrow::Cow::Owned(rebased),
+                        Err(detail) => {
+                            let _ = fs_out.send(blit_remote::fs::msg_fs_synced(
+                                nonce,
+                                blit_remote::fs::FS_SYNC_ID_INVALID,
+                                blit_remote::fs::FS_STATUS_OTHER,
+                                &detail,
+                            ));
+                            continue;
+                        }
+                    },
+                    None => continue,
+                }
+            } else if data[0] == blit_remote::fs::C2S_FS_SYNC {
                 if let Some(src) = blit_remote::fs::fs_sync_src_pty(&data) {
                     let cwd = {
                         let sess = state.session.lock().await;
@@ -10926,23 +11470,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             };
             // A read-only deployment (BLIT_FS_WRITE=0) shares the family's
             // feature bit, so writes are refused here rather than dropped:
-            // every nonce still gets its one FS_DONE.
-            if !fs_write_enabled
-                && matches!(
-                    msg[0],
-                    blit_remote::fs::C2S_FS_WRITE | blit_remote::fs::C2S_FS_OP
-                )
-            {
-                let nonce = msg
-                    .get(1..3)
-                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                    .unwrap_or(0);
-                let _ = fs_out.send(blit_remote::fs::msg_fs_done(
-                    nonce,
-                    blit_remote::fs::FS_DONE_PERMISSION,
-                    0,
-                    0,
-                ));
+            // every nonce still gets its one reply.
+            if !fs_write_enabled && let Some(reply) = fs_readonly_refusal(&msg) {
+                if !reply.is_empty() {
+                    let _ = fs_out.send(reply);
+                }
             } else {
                 handle_fs_message(&msg, &mut fs_syncs, &fs_out, config.verbose).await;
             }
@@ -11955,6 +12487,115 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     state.delivery_notify.notify_one();
                 }
             }
+            C2S_SURFACE_DRAG_ENTER => {
+                if let Some(enter) = parse_surface_drag_enter(&data) {
+                    // One session per connection: a second ENTER retargets —
+                    // the compositor leaves the old surface itself.  An ENTER
+                    // carrying the item-plan trailer pre-creates the planned
+                    // staging files, so the uri-list is servable at enter.
+                    let planned_uri_list = sess
+                        .clients
+                        .get_mut(&client_id)
+                        .map(|client| {
+                            let plan = enter
+                                .items
+                                .as_ref()
+                                .and_then(|items| build_drag_plan(client, client_id, items));
+                            let planned_uri_list = plan.as_ref().map(|plan| plan.uri_list.clone());
+                            client.drag_session = Some(DragSession {
+                                surface_id: enter.surface_id,
+                                plan,
+                            });
+                            planned_uri_list
+                        })
+                        .unwrap_or(None);
+                    if let Some(cs) = sess.compositor.as_mut() {
+                        let _ = cs.handle.command_tx.send(CompositorCommand::DragEnter {
+                            surface_id: enter.surface_id,
+                            x: f64::from(enter.x),
+                            y: f64::from(enter.y),
+                            mimes: enter.mimes,
+                            planned_uri_list,
+                        });
+                        cs.handle.wake();
+                    }
+                }
+                state.delivery_notify.notify_one();
+            }
+            C2S_SURFACE_DRAG_MOTION if data.len() >= 7 => {
+                let surface_id = u16::from_le_bytes([data[1], data[2]]);
+                let x = f64::from(u16::from_le_bytes([data[3], data[4]]));
+                let y = f64::from(u16::from_le_bytes([data[5], data[6]]));
+                let active = sess
+                    .clients
+                    .get(&client_id)
+                    .and_then(|c| c.drag_session.as_ref())
+                    .is_some_and(|s| s.surface_id == surface_id);
+                if active && let Some(cs) = sess.compositor.as_mut() {
+                    let _ = cs.handle.command_tx.send(CompositorCommand::DragMotion {
+                        surface_id,
+                        x,
+                        y,
+                    });
+                    cs.handle.wake();
+                }
+                state.delivery_notify.notify_one();
+            }
+            C2S_SURFACE_DRAG_LEAVE if data.len() >= 3 => {
+                // Forwarded as-is: the compositor's session ends here, but
+                // the browser may re-enter (a fresh ENTER retargets), so the
+                // server-side session is only ended by DROP/CANCEL/close.
+                let surface_id = u16::from_le_bytes([data[1], data[2]]);
+                let active = sess
+                    .clients
+                    .get(&client_id)
+                    .and_then(|c| c.drag_session.as_ref())
+                    .is_some_and(|s| s.surface_id == surface_id);
+                if active && let Some(cs) = sess.compositor.as_mut() {
+                    let _ = cs.handle.command_tx.send(CompositorCommand::DragLeave);
+                    cs.handle.wake();
+                }
+                state.delivery_notify.notify_one();
+            }
+            C2S_SURFACE_DRAG_DROP => {
+                let command = parse_surface_drag_drop(&data).and_then(|drop| {
+                    // None abandons the drop: a named item whose upload
+                    // never landed, or which disagrees with the hover plan,
+                    // must not hand the app a partial/inconsistent offer.
+                    let offers = sess
+                        .clients
+                        .get(&client_id)
+                        .and_then(|client| build_drag_offers(client, &drop.items))?;
+                    Some(CompositorCommand::DragDrop {
+                        surface_id: drop.surface_id,
+                        x: f64::from(drop.x),
+                        y: f64::from(drop.y),
+                        offers,
+                    })
+                });
+                if let Some(cs) = sess.compositor.as_mut() {
+                    let _ = cs
+                        .handle
+                        .command_tx
+                        .send(command.unwrap_or(CompositorCommand::DragCancel));
+                    cs.handle.wake();
+                }
+                // The session is over whether or not the drop parsed.
+                if let Some(client) = sess.clients.get_mut(&client_id) {
+                    client.drag_session = None;
+                }
+                state.delivery_notify.notify_one();
+            }
+            C2S_SURFACE_DRAG_CANCEL => {
+                if let Some(client) = sess.clients.get_mut(&client_id) {
+                    client.drag_session = None;
+                }
+                if let Some(cs) = sess.compositor.as_mut() {
+                    let _ = cs.handle.command_tx.send(CompositorCommand::DragCancel);
+                    cs.handle.wake();
+                }
+                state.delivery_notify.notify_one();
+            }
             C2S_SURFACE_POINTER if data.len() >= 9 => {
                 let surface_id = u16::from_le_bytes([data[1], data[2]]);
                 let ptype = data[3];
@@ -12944,6 +13585,20 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 cs.handle.wake();
             }
         }
+        // A mid-flight browser drag belongs to this connection: cancel it so
+        // the compositor doesn't hold an offer for a client that is gone,
+        // and remove the staged files its URIs pointed at.
+        if let Some(ref client) = client {
+            if client.drag_session.is_some()
+                && let Some(cs) = sess.compositor.as_mut()
+            {
+                let _ = cs.handle.command_tx.send(CompositorCommand::DragCancel);
+                cs.handle.wake();
+            }
+            if let Some(ref dir) = client.drag_staging_dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
         drop(sess);
         if need_nudge {
             nudge_delivery(&state);
@@ -13405,6 +14060,8 @@ mod tests {
             surface_codec_support: 0,
             surface_max_decode: (0, 0),
             pressed_surface_keys: HashSet::new(),
+            drag_session: None,
+            drag_staging_dir: None,
         };
         (client, rx)
     }
@@ -13412,6 +14069,235 @@ mod tests {
     fn test_client() -> ClientState {
         let (client, _rx) = test_client_with_capacity(0);
         client
+    }
+
+    /// Percent-encoding, staging and offer construction for browser drops.
+    mod drag {
+        use super::super::*;
+        use super::test_client;
+        use blit_remote::SurfaceDragDropItem;
+
+        #[test]
+        fn uri_path_encoding_leaves_unreserved_and_slashes() {
+            assert_eq!(
+                percent_encode_uri_path("/tmp/blit_drag_1_2/plain-~ok.txt"),
+                "/tmp/blit_drag_1_2/plain-~ok.txt"
+            );
+        }
+
+        #[test]
+        fn uri_path_encoding_escapes_spaces_and_non_ascii() {
+            assert_eq!(percent_encode_uri_path("/tmp/a b.png"), "/tmp/a%20b.png");
+            // UTF-8 bytes are encoded one %XX at a time.
+            assert_eq!(
+                percent_encode_uri_path("/tmp/fötö 🚀.png"),
+                "/tmp/f%C3%B6t%C3%B6%20%F0%9F%9A%80.png"
+            );
+            // Bytes that are legal in paths but not in URIs.
+            assert_eq!(percent_encode_uri_path("/tmp/#?%.x"), "/tmp/%23%3F%25.x");
+        }
+
+        #[test]
+        fn staged_names_resolve_only_under_the_staging_root() {
+            let staging =
+                std::env::temp_dir().join(format!("blit_drag_resolve_{}", std::process::id()));
+            std::fs::create_dir_all(&staging).unwrap();
+            std::fs::write(staging.join("shot.png"), b"x").unwrap();
+
+            assert_eq!(
+                resolve_staged_path(&staging, "shot.png"),
+                Some(staging.join("shot.png"))
+            );
+            // Traversal and absolute names are rejected, never reduced.
+            assert_eq!(resolve_staged_path(&staging, "../shot.png"), None);
+            assert_eq!(resolve_staged_path(&staging, "sub/../../shot.png"), None);
+            assert_eq!(
+                resolve_staged_path(&staging, &staging.join("shot.png").to_string_lossy()),
+                None
+            );
+            // A well-formed name that was never uploaded does not resolve.
+            assert_eq!(resolve_staged_path(&staging, "missing.png"), None);
+            // A name pointing at the staging dir itself is not a file.
+            assert_eq!(resolve_staged_path(&staging, "."), None);
+
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+
+        #[test]
+        fn a_staged_drop_offers_uri_list_plus_own_mime_from_disk() {
+            let mut client = test_client();
+            let staging = drag_staging_dir(&mut client, 4242).unwrap();
+            std::fs::write(staging.join("0-a b.png"), [0x89, 0x50]).unwrap();
+
+            let items = vec![SurfaceDragDropItem {
+                mime: "image/png".to_string(),
+                name: "0-a b.png".to_string(),
+                data: vec![],
+            }];
+            let offers = build_drag_offers(&client, &items).expect("staged drop");
+
+            assert_eq!(offers.len(), 2, "uri-list plus the item's own mime");
+            assert_eq!(offers[0].0, "text/uri-list");
+            let uri_list = String::from_utf8(offers[0].1.clone()).unwrap();
+            let expected_uri = format!(
+                "file://{}/0-a%20b.png\r\n",
+                percent_encode_uri_path(&staging.to_string_lossy())
+            );
+            assert_eq!(uri_list, expected_uri);
+            // A single named item also keeps its own mime, read from the
+            // staged file rather than carried inline.
+            assert_eq!(offers[1].0, "image/png");
+            assert_eq!(offers[1].1, vec![0x89, 0x50]);
+
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+
+        #[test]
+        fn a_multi_file_drop_offers_only_the_uri_list() {
+            let mut client = test_client();
+            let staging = drag_staging_dir(&mut client, 4243).unwrap();
+            std::fs::write(staging.join("0-one.png"), [1]).unwrap();
+            std::fs::write(staging.join("1-two.txt"), [2]).unwrap();
+
+            let items = vec![
+                SurfaceDragDropItem {
+                    mime: "image/png".to_string(),
+                    name: "0-one.png".to_string(),
+                    data: vec![],
+                },
+                SurfaceDragDropItem {
+                    mime: "text/plain".to_string(),
+                    name: "1-two.txt".to_string(),
+                    data: vec![],
+                },
+            ];
+            let offers = build_drag_offers(&client, &items).expect("staged drop");
+            assert_eq!(offers.len(), 1, "no per-item mime for a multi-file drop");
+            let uri_list = String::from_utf8(offers[0].1.clone()).unwrap();
+            assert_eq!(uri_list.matches("file://").count(), 2);
+            assert!(uri_list.ends_with("\r\n"));
+
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+
+        #[test]
+        fn an_enter_plan_precreates_empty_files_and_a_real_uri_list() {
+            let mut client = test_client();
+            let staging = drag_staging_dir(&mut client, 4247).unwrap();
+            // Reusing a planned name from an earlier drag must not expose its
+            // stale bytes to an enter-time reader.
+            std::fs::write(staging.join("0.png"), [1, 2, 3]).unwrap();
+
+            let plan = build_drag_plan(
+                &mut client,
+                4247,
+                &["image/png".to_string(), "application/pdf".to_string()],
+            )
+            .expect("drag plan");
+
+            assert_eq!(plan.names, vec!["0.png", "1.bin"]);
+            assert_eq!(std::fs::read(staging.join("0.png")).unwrap(), b"");
+            assert_eq!(std::fs::read(staging.join("1.bin")).unwrap(), b"");
+            let uri_list = String::from_utf8(plan.uri_list).unwrap();
+            assert_eq!(uri_list.matches("file://").count(), 2);
+            assert!(uri_list.contains("/0.png\r\n"));
+            assert!(uri_list.contains("/1.bin\r\n"));
+
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+
+        #[test]
+        fn a_planned_drop_must_name_the_paths_announced_at_enter() {
+            let mut client = test_client();
+            let plan =
+                build_drag_plan(&mut client, 4248, &["image/png".to_string()]).expect("plan");
+            let planned_uri_list = plan.uri_list.clone();
+            let staging = client.drag_staging_dir.clone().unwrap();
+            std::fs::write(staging.join("0.png"), [0x89, 0x50]).unwrap();
+            client.drag_session = Some(DragSession {
+                surface_id: 7,
+                plan: Some(plan),
+            });
+
+            let matching = vec![SurfaceDragDropItem {
+                mime: "image/png".to_string(),
+                name: "0.png".to_string(),
+                data: vec![],
+            }];
+            let offers = build_drag_offers(&client, &matching).expect("matching plan");
+            assert_eq!(offers[0], ("text/uri-list".to_string(), planned_uri_list));
+            assert_eq!(offers[1], ("image/png".to_string(), vec![0x89, 0x50]));
+
+            // Even an existing alternative file cannot replace the path the
+            // destination already fetched in the hover-time URI list.
+            std::fs::write(staging.join("other.png"), [1]).unwrap();
+            let mismatched = vec![SurfaceDragDropItem {
+                mime: "image/png".to_string(),
+                name: "other.png".to_string(),
+                data: vec![],
+            }];
+            assert_eq!(build_drag_offers(&client, &mismatched), None);
+            assert_eq!(build_drag_offers(&client, &[]), None);
+
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+
+        #[test]
+        fn an_unstaged_or_escaping_name_abandons_the_drop() {
+            let mut client = test_client();
+            let staging = drag_staging_dir(&mut client, 4245).unwrap();
+            std::fs::write(staging.join("0-ok.png"), [1]).unwrap();
+            let named = |name: &str, data: Vec<u8>| {
+                vec![SurfaceDragDropItem {
+                    mime: "image/png".to_string(),
+                    name: name.to_string(),
+                    data,
+                }]
+            };
+
+            // Never uploaded, traversal, absolute: all abandon, none crash.
+            assert_eq!(
+                build_drag_offers(&client, &named("0-missing.png", vec![])),
+                None
+            );
+            assert_eq!(
+                build_drag_offers(&client, &named("../0-ok.png", vec![])),
+                None
+            );
+            assert_eq!(
+                build_drag_offers(
+                    &client,
+                    &named(&staging.join("0-ok.png").to_string_lossy(), vec![])
+                ),
+                None
+            );
+            // Inline bytes on a named item violate the protocol: abandon.
+            assert_eq!(
+                build_drag_offers(&client, &named("0-ok.png", vec![1])),
+                None
+            );
+            // No staging sync ever opened on the connection: abandon.
+            let fresh = test_client();
+            assert_eq!(build_drag_offers(&fresh, &named("0-ok.png", vec![])), None);
+
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+
+        #[test]
+        fn a_nameless_drop_is_offered_directly_without_staging() {
+            let client = test_client();
+            let items = vec![SurfaceDragDropItem {
+                mime: "text/plain".to_string(),
+                name: String::new(),
+                data: b"dragged text".to_vec(),
+            }];
+            let offers = build_drag_offers(&client, &items).expect("text drop");
+            assert_eq!(
+                offers,
+                vec![("text/plain".to_string(), b"dragged text".to_vec())]
+            );
+            assert!(client.drag_staging_dir.is_none(), "nothing was staged");
+        }
     }
 
     fn fill_inflight(client: &mut ClientState, frames: usize, bytes_per_frame: usize) {
@@ -13684,6 +14570,252 @@ mod tests {
         }
         assert!(syncs.map.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Chunked upload flow: BEGIN allocates a per-connection id, chunks ack
+    /// cumulative progress, FINISH lands the exact bytes with the FS_DONE
+    /// payload; bad ids answer UNKNOWN_UPLOAD, a cancel ends the upload.
+    #[tokio::test]
+    async fn fs_upload_message_flow() {
+        use blit_remote::fs::{
+            FS_DONE_INVALID, FS_DONE_OK, FS_DONE_UNKNOWN_UPLOAD, FS_STATUS_OK, FS_SYNC_RECURSIVE,
+            S2C_FS_SYNCED, S2C_FS_UPLOAD_BEGIN, S2C_FS_UPLOAD_CHUNK, S2C_FS_UPLOAD_FINISH,
+            msg_fs_sync, msg_fs_upload_begin, msg_fs_upload_cancel, msg_fs_upload_chunk,
+            msg_fs_upload_finish, parse_fs_upload_begin_result, parse_fs_upload_chunk_result,
+            parse_fs_upload_finish_result,
+        };
+
+        let dir = std::env::temp_dir()
+            .join(format!("blit-server-fs-upload-{}", std::process::id()))
+            .canonicalize_or_create();
+
+        let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut syncs = FsSyncs::default();
+
+        handle_fs_message(
+            &msg_fs_sync(1, FS_SYNC_RECURSIVE, 5, 0, &dir.to_string_lossy()),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let msg = recv_blocking(&mut rx);
+        assert_eq!(msg[0], S2C_FS_SYNCED);
+        let sync_id = u16::from_le_bytes([msg[3], msg[4]]);
+        assert_eq!(msg[5], FS_STATUS_OK);
+
+        // BEGIN on an unknown sync is INVALID.
+        let bad = blit_remote::fs::FsUploadBegin {
+            nonce: 9,
+            sync_id: sync_id.wrapping_add(100),
+            flags: 0,
+            base: 0,
+            mode: 0,
+            size: 1,
+            path: "nope".into(),
+        };
+        handle_fs_message(&msg_fs_upload_begin(&bad), &mut syncs, &out, false).await;
+        let msg = recv_blocking(&mut rx);
+        assert_eq!(
+            parse_fs_upload_begin_result(&msg),
+            Some((9, FS_DONE_INVALID, 0, 0, 0))
+        );
+
+        // Happy path: two chunks, then finish.
+        let begin = blit_remote::fs::FsUploadBegin {
+            nonce: 10,
+            sync_id,
+            flags: 0,
+            base: 0,
+            mode: 0,
+            size: 11,
+            path: "up.txt".into(),
+        };
+        handle_fs_message(&msg_fs_upload_begin(&begin), &mut syncs, &out, false).await;
+        let (nonce, status, upload_id, ..) = loop {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_UPLOAD_BEGIN {
+                break parse_fs_upload_begin_result(&msg).unwrap();
+            }
+        };
+        assert_eq!((nonce, status), (10, FS_DONE_OK));
+
+        handle_fs_message(
+            &msg_fs_upload_chunk(upload_id, 0, b"hello "),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let (id, status, received) = loop {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_UPLOAD_CHUNK {
+                break parse_fs_upload_chunk_result(&msg).unwrap();
+            }
+        };
+        assert_eq!((id, status, received), (upload_id, FS_DONE_OK, 6));
+
+        // A chunk for an unknown id answers UNKNOWN_UPLOAD.
+        handle_fs_message(
+            &msg_fs_upload_chunk(upload_id.wrapping_add(50), 0, b"x"),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let (id, status, _) = loop {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_UPLOAD_CHUNK {
+                break parse_fs_upload_chunk_result(&msg).unwrap();
+            }
+        };
+        assert_eq!(
+            (id, status),
+            (upload_id.wrapping_add(50), FS_DONE_UNKNOWN_UPLOAD)
+        );
+
+        handle_fs_message(
+            &msg_fs_upload_chunk(upload_id, 6, b"world"),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let (_, status, received) = loop {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_UPLOAD_CHUNK {
+                break parse_fs_upload_chunk_result(&msg).unwrap();
+            }
+        };
+        assert_eq!((status, received), (FS_DONE_OK, 11));
+
+        handle_fs_message(
+            &msg_fs_upload_finish(11, upload_id),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let (nonce, status, hash, mtime_ns) = loop {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_UPLOAD_FINISH {
+                break parse_fs_upload_finish_result(&msg).unwrap();
+            }
+        };
+        assert_eq!((nonce, status), (11, FS_DONE_OK));
+        assert_eq!(hash, blit_fssync::blake3_128(b"hello world"));
+        assert_ne!(mtime_ns, 0);
+        assert_eq!(std::fs::read(dir.join("up.txt")).unwrap(), b"hello world");
+
+        // FINISH frees the id: a second one answers UNKNOWN_UPLOAD.
+        handle_fs_message(
+            &msg_fs_upload_finish(12, upload_id),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let (nonce, status, ..) = loop {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_UPLOAD_FINISH {
+                break parse_fs_upload_finish_result(&msg).unwrap();
+            }
+        };
+        assert_eq!((nonce, status), (12, FS_DONE_UNKNOWN_UPLOAD));
+
+        // Cancel: begun then cancelled, so its FINISH finds nothing.
+        let begin2 = blit_remote::fs::FsUploadBegin {
+            nonce: 13,
+            sync_id,
+            flags: 0,
+            base: 0,
+            mode: 0,
+            size: 1,
+            path: "cancelled.txt".into(),
+        };
+        handle_fs_message(&msg_fs_upload_begin(&begin2), &mut syncs, &out, false).await;
+        let (_, status, upload_id2, ..) = loop {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_UPLOAD_BEGIN {
+                break parse_fs_upload_begin_result(&msg).unwrap();
+            }
+        };
+        assert_eq!(status, FS_DONE_OK);
+        handle_fs_message(&msg_fs_upload_cancel(upload_id2), &mut syncs, &out, false).await;
+        handle_fs_message(
+            &msg_fs_upload_finish(14, upload_id2),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let (nonce, status, ..) = loop {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_UPLOAD_FINISH {
+                break parse_fs_upload_finish_result(&msg).unwrap();
+            }
+        };
+        assert_eq!((nonce, status), (14, FS_DONE_UNKNOWN_UPLOAD));
+        assert!(!dir.join("cancelled.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The read-only gate refuses the whole write side of the family with
+    /// one reply per nonce (PERMISSION); CANCEL defines no reply and is
+    /// swallowed; reads route through untouched.
+    #[test]
+    fn fs_readonly_refusal_covers_the_write_side() {
+        use blit_remote::fs::{
+            FS_DONE_PERMISSION, msg_fs_ack, msg_fs_fetch, msg_fs_upload_begin,
+            msg_fs_upload_cancel, msg_fs_upload_chunk, msg_fs_upload_finish, msg_fs_write,
+            parse_fs_done, parse_fs_upload_begin_result, parse_fs_upload_chunk_result,
+            parse_fs_upload_finish_result,
+        };
+
+        let write = msg_fs_write(&blit_remote::fs::FsWrite {
+            nonce: 7,
+            sync_id: 1,
+            flags: 0,
+            base: 0,
+            mode: 0,
+            content_kind: 1,
+            path: "a".into(),
+            content: b"x".to_vec(),
+        });
+        let reply = fs_readonly_refusal(&write).unwrap();
+        assert_eq!(parse_fs_done(&reply), Some((7, FS_DONE_PERMISSION, 0, 0)));
+
+        let begin = msg_fs_upload_begin(&blit_remote::fs::FsUploadBegin {
+            nonce: 8,
+            sync_id: 1,
+            flags: 0,
+            base: 0,
+            mode: 0,
+            size: 1,
+            path: "a".into(),
+        });
+        let reply = fs_readonly_refusal(&begin).unwrap();
+        assert_eq!(
+            parse_fs_upload_begin_result(&reply),
+            Some((8, FS_DONE_PERMISSION, 0, 0, 0))
+        );
+
+        let reply = fs_readonly_refusal(&msg_fs_upload_chunk(3, 0, b"x")).unwrap();
+        assert_eq!(
+            parse_fs_upload_chunk_result(&reply),
+            Some((3, FS_DONE_PERMISSION, 0))
+        );
+
+        let reply = fs_readonly_refusal(&msg_fs_upload_finish(9, 3)).unwrap();
+        assert_eq!(
+            parse_fs_upload_finish_result(&reply),
+            Some((9, FS_DONE_PERMISSION, 0, 0))
+        );
+
+        assert_eq!(fs_readonly_refusal(&msg_fs_upload_cancel(3)), Some(vec![]));
+        assert!(fs_readonly_refusal(&msg_fs_fetch(1, 1, "a")).is_none());
+        assert!(fs_readonly_refusal(&msg_fs_ack(1, 1)).is_none());
     }
 
     /// The exclusion flags and the trailing pattern list survive the wire
@@ -14332,6 +15464,124 @@ mod tests {
         assert_eq!(run(FS_GREP_WORD).await, vec![0, 2]);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A staging sync open roots at the connection's drag staging dir — the
+    /// same dir DROP resolves names against — and a file pushed through the
+    /// chunked upload path into that sync is what a staged DROP then
+    /// offers, uri-list and own-mime bytes both built from disk.
+    #[tokio::test]
+    async fn staging_sync_shares_its_root_with_drop() {
+        use blit_remote::fs::{
+            FS_DONE_OK, FS_STATUS_OK, FS_SYNC_RECURSIVE, FS_SYNC_STAGING, S2C_FS_SYNCED,
+            S2C_FS_UPLOAD_BEGIN, S2C_FS_UPLOAD_FINISH, msg_fs_sync_full, msg_fs_sync_staging,
+            msg_fs_upload_begin, msg_fs_upload_chunk, msg_fs_upload_finish,
+            parse_fs_upload_begin_result, parse_fs_upload_finish_result,
+        };
+
+        let mut client = test_client();
+        let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut syncs = FsSyncs::default();
+
+        // Open: the flag resolves and creates the dir on first use, and the
+        // rebased sync the handler consumes is a plain path sync onto it.
+        let sync = msg_fs_sync_staging(1, FS_SYNC_RECURSIVE, 5, 0);
+        let rebased = rebase_staging_sync(&mut client, 4246, &sync).expect("staging rebase");
+        let staging = client.drag_staging_dir.clone().unwrap();
+        assert!(staging.is_dir(), "created on first use");
+        assert_eq!(
+            blit_remote::fs::fs_sync_flags(&rebased).unwrap() & FS_SYNC_STAGING,
+            0,
+            "the handler sees a plain path sync"
+        );
+        // A second staging open shares the dir instead of making another.
+        let again = rebase_staging_sync(&mut client, 4246, &msg_fs_sync_staging(2, 0, 5, 0))
+            .expect("second staging rebase");
+        assert_eq!(blit_remote::fs::fs_sync_flags(&again).unwrap(), 0);
+
+        // The invalid STAGING|FROM_PTY combination is refused, not rebased.
+        let bad = msg_fs_sync_full(3, FS_SYNC_STAGING, 0, 0, "", "", Some(1));
+        assert!(rebase_staging_sync(&mut client, 4246, &bad).is_err());
+
+        handle_fs_message(&rebased, &mut syncs, &out, false).await;
+        let msg = recv_blocking(&mut rx);
+        assert_eq!(msg[0], S2C_FS_SYNCED);
+        assert_eq!(msg[5], FS_STATUS_OK);
+        let sync_id = u16::from_le_bytes([msg[3], msg[4]]);
+
+        // Upload "0-shot.png" the way a staging browser would.
+        let begin = blit_remote::fs::FsUploadBegin {
+            nonce: 10,
+            sync_id,
+            flags: 0,
+            base: 0,
+            mode: 0,
+            size: 4,
+            path: "0-shot.png".into(),
+        };
+        handle_fs_message(&msg_fs_upload_begin(&begin), &mut syncs, &out, false).await;
+        let (nonce, status, upload_id, ..) = loop {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_UPLOAD_BEGIN {
+                break parse_fs_upload_begin_result(&msg).unwrap();
+            }
+        };
+        assert_eq!((nonce, status), (10, FS_DONE_OK));
+        handle_fs_message(
+            &msg_fs_upload_chunk(upload_id, 0, b"\x89PNG"),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        handle_fs_message(
+            &msg_fs_upload_finish(11, upload_id),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        let (nonce, status, ..) = loop {
+            let msg = recv_blocking(&mut rx);
+            if msg[0] == S2C_FS_UPLOAD_FINISH {
+                break parse_fs_upload_finish_result(&msg).unwrap();
+            }
+        };
+        assert_eq!((nonce, status), (11, FS_DONE_OK));
+        assert_eq!(
+            std::fs::read(staging.join("0-shot.png")).unwrap(),
+            b"\x89PNG"
+        );
+
+        // The DROP names the staged file; both offers are built from disk.
+        let items = vec![blit_remote::SurfaceDragDropItem {
+            mime: "image/png".to_string(),
+            name: "0-shot.png".to_string(),
+            data: vec![],
+        }];
+        let offers = build_drag_offers(&client, &items).expect("staged drop");
+        assert_eq!(offers[0].0, "text/uri-list");
+        assert_eq!(
+            String::from_utf8(offers[0].1.clone()).unwrap(),
+            format!(
+                "file://{}/0-shot.png\r\n",
+                percent_encode_uri_path(&staging.to_string_lossy())
+            )
+        );
+        assert_eq!(offers[1], ("image/png".to_string(), b"\x89PNG".to_vec()));
+
+        // Stopping the sync must not take the staging dir with it: staged
+        // URIs outlive the drop. Only connection close removes it.
+        handle_fs_message(
+            &blit_remote::fs::msg_fs_stop(sync_id),
+            &mut syncs,
+            &out,
+            false,
+        )
+        .await;
+        assert!(staging.join("0-shot.png").is_file());
+
+        let _ = std::fs::remove_dir_all(&staging);
     }
 
     fn recv_blocking(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<u8> {

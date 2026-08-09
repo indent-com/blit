@@ -26,14 +26,17 @@ use std::{fs, io};
 
 use blit_remote::fs::{
     FS_CLOSED_CLIENT_REQUEST, FS_CLOSED_RESOURCE_LIMIT, FS_CLOSED_ROOT_GONE, FS_DONE_CONFLICT,
-    FS_DONE_INVALID, FS_DONE_NOT_FOUND, FS_DONE_OK, FS_DONE_OTHER, FS_DONE_PERMISSION,
-    FS_DONE_TOO_LARGE, FS_DONE_WRONG_TYPE, FS_ENTRY_DIR, FS_ENTRY_FILE, FS_ENTRY_FILTERED,
-    FS_ENTRY_LINK_DIR, FS_ENTRY_NO_CONTENT, FS_ENTRY_OTHER, FS_ENTRY_SYMLINK, FS_ENTRY_TYPE_MASK,
-    FS_ENTRY_UNREADABLE, FS_ENTRY_UNSTABLE, FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_UNREADABLE,
-    FS_OP_HARDLINK, FS_OP_MKDIR, FS_OP_MKPARENTS, FS_OP_NO_CAS, FS_OP_REMOVE, FS_OP_RENAME,
-    FS_OP_SYMLINK, FS_UPDATE_RESET, FS_UPDATE_SYNC, FS_WRITE_DURABLE, FS_WRITE_FOLLOW_SYMLINK,
-    FS_WRITE_MKPARENTS, FS_WRITE_NO_CAS, FsContent, FsRecord, append_fs_record, msg_fs_closed,
-    msg_fs_done, msg_fs_file, msg_fs_update,
+    FS_DONE_INVALID, FS_DONE_NOT_FOUND, FS_DONE_OFFSET_MISMATCH, FS_DONE_OK, FS_DONE_OTHER,
+    FS_DONE_PERMISSION, FS_DONE_SIZE_MISMATCH, FS_DONE_TOO_LARGE, FS_DONE_UNKNOWN_UPLOAD,
+    FS_DONE_WRONG_TYPE, FS_ENTRY_DIR, FS_ENTRY_FILE, FS_ENTRY_FILTERED, FS_ENTRY_LINK_DIR,
+    FS_ENTRY_NO_CONTENT, FS_ENTRY_OTHER, FS_ENTRY_SYMLINK, FS_ENTRY_TYPE_MASK, FS_ENTRY_UNREADABLE,
+    FS_ENTRY_UNSTABLE, FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_UNREADABLE, FS_OP_HARDLINK,
+    FS_OP_MKDIR, FS_OP_MKPARENTS, FS_OP_NO_CAS, FS_OP_REMOVE, FS_OP_RENAME, FS_OP_SYMLINK,
+    FS_UPDATE_RESET, FS_UPDATE_SYNC, FS_UPLOAD_DURABLE, FS_UPLOAD_FLAGS_KNOWN,
+    FS_UPLOAD_FOLLOW_SYMLINK, FS_UPLOAD_MKPARENTS, FS_UPLOAD_NO_CAS, FS_WRITE_DURABLE,
+    FS_WRITE_FOLLOW_SYMLINK, FS_WRITE_MKPARENTS, FS_WRITE_NO_CAS, FsContent,
+    FsRecord, append_fs_record, msg_fs_closed, msg_fs_done, msg_fs_file, msg_fs_update,
+    msg_fs_upload_begin_result, msg_fs_upload_chunk_result, msg_fs_upload_finish_result,
 };
 
 pub mod backend;
@@ -154,6 +157,57 @@ pub struct OpReq {
     pub inflight: Option<Arc<InflightGuard>>,
 }
 
+/// A chunked-upload begin forwarded to the engine (docs/protocol.md
+/// "Filesystem sync"). `path` is the escaped wire path; `flags` are
+/// `FS_UPLOAD_*`; `base` is the CAS precondition with `FS_WRITE`'s exact
+/// semantics; `size` is the total plaintext bytes the client will send.
+/// `upload_id` is the server-allocated per-connection id echoed in replies.
+#[derive(Clone, Debug)]
+pub struct UploadBeginReq {
+    pub nonce: u16,
+    pub upload_id: u16,
+    pub path: String,
+    pub flags: u8,
+    pub base: u128,
+    pub mode: u32,
+    pub size: u64,
+    /// Freed (nonce slot released) when this request is dropped after the
+    /// engine answers it. `None` in tests and embedders without accounting.
+    pub inflight: Option<Arc<InflightGuard>>,
+}
+
+/// One in-progress chunked upload: chunks append sequentially to a temp
+/// sibling of the target (same directory ⇒ same filesystem ⇒ atomic rename
+/// at FINISH). Dropping removes the temp file — cancel, sync stop, engine
+/// exit, and connection close all funnel through it.
+struct Upload {
+    tmp: PathBuf,
+    /// Client's wire path, re-resolved at FINISH (the symlink policy
+    /// applies then as at BEGIN) and the echo-key fallback.
+    wire: String,
+    /// `Some` until FINISH takes it for the durable fsync + rename.
+    file: Option<fs::File>,
+    received: u64,
+    size: u64,
+    durable: bool,
+    /// The CAS precondition, re-verified at FINISH (FS_WRITE semantics:
+    /// `no_cas` ignores `base`, `base` 0 is create-exclusive, anything else
+    /// must equal the current content hash).
+    base: u128,
+    no_cas: bool,
+    follow_symlink: bool,
+    /// Set once the temp has been renamed onto the target.
+    landed: bool,
+}
+
+impl Drop for Upload {
+    fn drop(&mut self) {
+        if !self.landed {
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
+}
+
 /// Commands forwarded from the client connection.
 #[derive(Clone, Debug)]
 pub enum Command {
@@ -161,6 +215,17 @@ pub enum Command {
     Fetch { nonce: u16, path: String },
     Write(WriteReq),
     Op(OpReq),
+    UploadBegin(UploadBeginReq),
+    /// Append one chunk to a live upload; `data` is the plaintext chunk.
+    UploadChunk { upload_id: u16, offset: u64, data: Vec<u8> },
+    /// Land (or refuse) the upload; terminates it either way.
+    UploadFinish {
+        nonce: u16,
+        upload_id: u16,
+        inflight: Option<Arc<InflightGuard>>,
+    },
+    /// Abort the upload and remove its temp file. No reply.
+    UploadCancel { upload_id: u16 },
     Stop,
 }
 
@@ -1355,6 +1420,17 @@ fn fs_write_max() -> u64 {
         .unwrap_or(16 * 1024 * 1024)
 }
 
+/// Total-size cap for one chunked upload (`BLIT_FS_UPLOAD_MAX`, default
+/// 1 GiB); `UPLOAD_BEGIN` refuses a larger declared `size` with `TOO_LARGE`.
+/// Per-chunk bounds are the frame cap and the decompress guard — this caps
+/// the sum.
+fn fs_upload_max() -> u64 {
+    std::env::var("BLIT_FS_UPLOAD_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024 * 1024 * 1024)
+}
+
 fn write_io_status(e: &io::Error) -> u8 {
     match e.kind() {
         io::ErrorKind::NotFound => FS_DONE_NOT_FOUND,
@@ -1431,13 +1507,21 @@ fn resolve_write_target(root: &Path, wire: &str, policy: SymlinkPolicy) -> Resul
     }
 }
 
+/// Final-component prefix of blit's own staging files (atomic writes and
+/// chunked-upload temp siblings). The reconciler never indexes these — a
+/// pure name filter like the `.git` exclusion, and unconditional because
+/// the files are blit-internal artifacts: an upload's temp lives in the
+/// watched directory for the whole transfer, and mirroring it would
+/// re-stat — for a content sync, re-read — a growing file on every batch.
+const TEMP_FILE_PREFIX: &str = ".blit-tmp-";
+
 /// A unique sibling temp path for atomic replace (same directory ⇒ same
 /// filesystem ⇒ atomic `rename`).
 fn temp_sibling(target: &Path) -> PathBuf {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
-    dir.join(format!(".blit-tmp-{}-{n}", std::process::id()))
+    dir.join(format!("{TEMP_FILE_PREFIX}{}-{n}", std::process::id()))
 }
 
 /// Set `mode` on an open file (Unix); preserve the replaced file's mode
@@ -1556,6 +1640,34 @@ fn current_hash(path: &Path) -> u128 {
         // arbitrarily large allocation.
         _ => hash_file_streamed(path).unwrap_or(0),
     }
+}
+
+/// The write family's CAS precondition against the current on-disk entry,
+/// shared by one-shot writes (`exec_write`) and chunked uploads (checked at
+/// BEGIN and re-verified at FINISH): `no_cas` passes unconditionally,
+/// `base` 0 is create-exclusive, anything else must equal the live content
+/// hash. `Err((CONFLICT, hash))` carries the live hash (0 = absent), so
+/// the client rebases without a round trip. The caller holds the target's
+/// write lock.
+fn check_write_precondition(target: &Path, base: u128, no_cas: bool) -> Result<(), (u8, u128)> {
+    if no_cas {
+        return Ok(());
+    }
+    if base == 0 {
+        // symlink_metadata, not exists(): a dangling symlink at the target
+        // is an entry and must fail create-exclusive. (The resolve step has
+        // already refused or followed any symlink, so this mirrors
+        // exec_write's `target.exists()` in practice.)
+        if fs::symlink_metadata(target).is_ok() {
+            return Err((FS_DONE_CONFLICT, current_hash(target)));
+        }
+    } else {
+        let cur = current_hash(target);
+        if cur != base {
+            return Err((FS_DONE_CONFLICT, cur));
+        }
+    }
+    Ok(())
 }
 
 /// BLAKE3-128 of a file's bytes, read through a fixed buffer so peak memory
@@ -2049,6 +2161,15 @@ impl Reconciler {
     /// *real* directory: git's syntax distinguishes `build` from `build/`,
     /// and a symlink is a file to it even when it resolves to a directory.
     fn ignored(&mut self, rel: &str, is_dir: bool) -> bool {
+        // blit's own staging files (see TEMP_FILE_PREFIX) are never part of
+        // the tree, whatever the configured rules say.
+        if rel
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.starts_with(TEMP_FILE_PREFIX))
+        {
+            return true;
+        }
         match &mut self.ignores {
             Some(ignores) => ignores.matched(rel, is_dir),
             None => false,
@@ -2862,6 +2983,9 @@ struct SyncEngine {
     /// A snapshot arrived without a changed set: the next emit must fall
     /// back to the full two-map walk.
     full_diff: bool,
+    /// Live chunked uploads, keyed by the server-allocated per-connection
+    /// id. Dropped (temp files removed) when the engine exits.
+    uploads: std::collections::HashMap<u16, Upload>,
 }
 
 impl SyncEngine {
@@ -2896,6 +3020,7 @@ impl SyncEngine {
             pending_changed: Default::default(),
             pending_recheck: Default::default(),
             full_diff: false,
+            uploads: Default::default(),
         }
     }
 
@@ -2934,10 +3059,23 @@ impl SyncEngine {
                 SyncMsg::Cmd(Command::Op(o)) => {
                     let _ = (self.outbox)(msg_fs_done(o.nonce, FS_DONE_OTHER, 0, 0));
                 }
+                SyncMsg::Cmd(Command::UploadBegin(b)) => {
+                    let _ =
+                        (self.outbox)(msg_fs_upload_begin_result(b.nonce, FS_DONE_OTHER, 0, 0, 0));
+                }
+                SyncMsg::Cmd(Command::UploadFinish { nonce, .. }) => {
+                    let _ = (self.outbox)(msg_fs_upload_finish_result(nonce, FS_DONE_OTHER, 0, 0));
+                }
                 SyncMsg::Cmd(Command::Fetch { nonce, .. }) => {
                     let _ = (self.outbox)(msg_fs_file(nonce, blit_remote::fs::FS_FILE_OTHER, &[]));
                 }
-                SyncMsg::Cmd(Command::Ack(_) | Command::Stop) | SyncMsg::Root(_) => {}
+                SyncMsg::Cmd(
+                    Command::Ack(_)
+                    | Command::UploadChunk { .. }
+                    | Command::UploadCancel { .. }
+                    | Command::Stop,
+                )
+                | SyncMsg::Root(_) => {}
             }
         }
     }
@@ -2978,6 +3116,30 @@ impl SyncEngine {
                     if !self.handle_op(o) {
                         return Exit::ClientGone;
                     }
+                }
+                Ok(SyncMsg::Cmd(Command::UploadBegin(b))) => {
+                    if !self.handle_upload_begin(b) {
+                        return Exit::ClientGone;
+                    }
+                }
+                Ok(SyncMsg::Cmd(Command::UploadChunk {
+                    upload_id,
+                    offset,
+                    data,
+                })) => {
+                    if !self.handle_upload_chunk(upload_id, offset, data) {
+                        return Exit::ClientGone;
+                    }
+                }
+                Ok(SyncMsg::Cmd(Command::UploadFinish {
+                    nonce, upload_id, ..
+                })) => {
+                    if !self.handle_upload_finish(nonce, upload_id) {
+                        return Exit::ClientGone;
+                    }
+                }
+                Ok(SyncMsg::Cmd(Command::UploadCancel { upload_id })) => {
+                    self.handle_upload_cancel(upload_id);
                 }
                 Ok(SyncMsg::Cmd(Command::Stop)) => return Exit::Stopped,
                 Err(RecvTimeoutError::Timeout) => {}
@@ -3525,6 +3687,30 @@ impl SyncEngine {
                         return Err(Exit::ClientGone);
                     }
                 }
+                Ok(SyncMsg::Cmd(Command::UploadBegin(b))) => {
+                    if !self.handle_upload_begin(b) {
+                        return Err(Exit::ClientGone);
+                    }
+                }
+                Ok(SyncMsg::Cmd(Command::UploadChunk {
+                    upload_id,
+                    offset,
+                    data,
+                })) => {
+                    if !self.handle_upload_chunk(upload_id, offset, data) {
+                        return Err(Exit::ClientGone);
+                    }
+                }
+                Ok(SyncMsg::Cmd(Command::UploadFinish {
+                    nonce, upload_id, ..
+                })) => {
+                    if !self.handle_upload_finish(nonce, upload_id) {
+                        return Err(Exit::ClientGone);
+                    }
+                }
+                Ok(SyncMsg::Cmd(Command::UploadCancel { upload_id })) => {
+                    self.handle_upload_cancel(upload_id);
+                }
                 Ok(SyncMsg::Cmd(Command::Stop)) => return Err(Exit::Stopped),
                 Ok(SyncMsg::Root(update)) => self.handle_root(update)?,
                 Err(_) => return Err(Exit::ClientGone),
@@ -3745,17 +3931,8 @@ impl SyncEngine {
             }
             Some(applied)
         } else {
-            if !no_cas {
-                if w.base == 0 {
-                    if target.exists() {
-                        return (FS_DONE_CONFLICT, current_hash(&target), 0);
-                    }
-                } else {
-                    let cur = current_hash(&target);
-                    if cur != w.base {
-                        return (FS_DONE_CONFLICT, cur, 0);
-                    }
-                }
+            if let Err((status, hash)) = check_write_precondition(&target, w.base, no_cas) {
+                return (status, hash, 0);
             }
             None
         };
@@ -3786,6 +3963,219 @@ impl SyncEngine {
     fn handle_op(&mut self, o: OpReq) -> bool {
         let (status, hash, mtime_ns) = self.exec_op(&o);
         (self.outbox)(msg_fs_done(o.nonce, status, hash, mtime_ns))
+    }
+
+    fn handle_upload_begin(&mut self, b: UploadBeginReq) -> bool {
+        let (status, hash) = self.exec_upload_begin(&b);
+        (self.outbox)(msg_fs_upload_begin_result(
+            b.nonce, status, b.upload_id, hash, 0,
+        ))
+    }
+
+    /// Validate an upload begin and stage its temp sibling. The CAS
+    /// precondition (`base`, FS_WRITE semantics) is checked here — fail
+    /// fast, before any bytes flow — and re-verified at FINISH. The id is
+    /// server-allocated and unique per connection, so a duplicate here means
+    /// a dispatcher bug and is refused rather than silently replacing the
+    /// live upload (whose temp its Drop would remove).
+    fn exec_upload_begin(&mut self, b: &UploadBeginReq) -> (u8, u128) {
+        if b.flags & !FS_UPLOAD_FLAGS_KNOWN != 0 {
+            return (FS_DONE_INVALID, 0);
+        }
+        if b.size > fs_upload_max() {
+            return (FS_DONE_TOO_LARGE, 0);
+        }
+        // A SINGLE sync's parent exists by construction; MKPARENTS is a
+        // no-op there exactly as for FS_WRITE.
+        if !self.single
+            && b.flags & FS_UPLOAD_MKPARENTS != 0
+            && let Some(parent) = resolve_wire_path(&self.root, &b.path)
+                .and_then(|a| a.parent().map(Path::to_path_buf))
+            && let Err(status) = create_parents_confined(&self.root, &parent)
+        {
+            return (status, 0);
+        }
+        let policy = if b.flags & FS_UPLOAD_FOLLOW_SYMLINK != 0 {
+            SymlinkPolicy::Follow
+        } else {
+            SymlinkPolicy::Refuse
+        };
+        let target = match self.resolve_target(&b.path, policy) {
+            Ok(t) => t,
+            Err(status) => return (status, 0),
+        };
+        if self.uploads.contains_key(&b.upload_id) {
+            return (FS_DONE_INVALID, 0);
+        }
+        // Serialize check-and-stage against every other blit writer of this
+        // exact file, as a one-shot write's check-and-write does.
+        let lock = path_write_lock(&target);
+        let _guard = lock.lock().unwrap();
+        // Never clobber a directory with a file (re-checked at FINISH under
+        // the same lock — the target may change type mid-upload).
+        if fs::symlink_metadata(&target)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            return (FS_DONE_WRONG_TYPE, 0);
+        }
+        if let Err(conflict) =
+            check_write_precondition(&target, b.base, b.flags & FS_UPLOAD_NO_CAS != 0)
+        {
+            return conflict;
+        }
+        let tmp = temp_sibling(&target);
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        if b.mode != 0 {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(b.mode);
+        }
+        let f = match opts.open(&tmp) {
+            Ok(f) => f,
+            Err(e) => return (write_io_status(&e), 0),
+        };
+        // mode 0 preserves the replaced file's mode, as write_atomic does.
+        apply_mode(&f, &target, b.mode);
+        self.uploads.insert(
+            b.upload_id,
+            Upload {
+                tmp,
+                wire: b.path.clone(),
+                file: Some(f),
+                received: 0,
+                size: b.size,
+                durable: b.flags & FS_UPLOAD_DURABLE != 0,
+                base: b.base,
+                no_cas: b.flags & FS_UPLOAD_NO_CAS != 0,
+                follow_symlink: b.flags & FS_UPLOAD_FOLLOW_SYMLINK != 0,
+                landed: false,
+            },
+        );
+        (FS_DONE_OK, 0)
+    }
+
+    /// Append one chunk. Transports are ordered, so the chunk's offset must
+    /// equal the bytes accepted so far; on mismatch the ack reports the
+    /// resume point. A failed write keeps `received` where it was, so the
+    /// client can retry the same offset.
+    fn handle_upload_chunk(&mut self, upload_id: u16, offset: u64, data: Vec<u8>) -> bool {
+        let (status, received) = match self.uploads.get_mut(&upload_id) {
+            None => (FS_DONE_UNKNOWN_UPLOAD, 0),
+            Some(up) => {
+                if offset != up.received {
+                    (FS_DONE_OFFSET_MISMATCH, up.received)
+                } else if up.received + data.len() as u64 > up.size {
+                    // Past the declared total: refuse the chunk whole, never
+                    // truncate it — a partial append would corrupt the file.
+                    (FS_DONE_TOO_LARGE, up.received)
+                } else {
+                    use std::io::Write as _;
+                    let file = up.file.as_mut().expect("live upload has a file");
+                    match file.write_all(&data) {
+                        Ok(()) => {
+                            up.received += data.len() as u64;
+                            (FS_DONE_OK, up.received)
+                        }
+                        Err(e) => (write_io_status(&e), up.received),
+                    }
+                }
+            }
+        };
+        (self.outbox)(msg_fs_upload_chunk_result(upload_id, status, received))
+    }
+
+    fn handle_upload_finish(&mut self, nonce: u16, upload_id: u16) -> bool {
+        let (status, hash, mtime_ns) = self.exec_upload_finish(upload_id);
+        (self.outbox)(msg_fs_upload_finish_result(nonce, status, hash, mtime_ns))
+    }
+
+    /// Land an upload: verify the byte count, re-resolve the wire path and
+    /// re-verify the CAS precondition under the target's write lock (the
+    /// BEGIN-time checks are TOCTOU-stale after a long transfer), fsync
+    /// when DURABLE, rename the temp over the target, then prime the echo
+    /// exactly as a one-shot write does. FINISH terminates the upload
+    /// whatever happens — on failure `up`'s Drop removes the temp.
+    fn exec_upload_finish(&mut self, upload_id: u16) -> (u8, u128, u64) {
+        let Some(mut up) = self.uploads.remove(&upload_id) else {
+            return (FS_DONE_UNKNOWN_UPLOAD, 0, 0);
+        };
+        if up.received != up.size {
+            return (FS_DONE_SIZE_MISMATCH, 0, 0);
+        }
+        // Re-resolve as at BEGIN: the entry the wire path names may have
+        // changed type, grown a symlink, or been retargeted mid-upload.
+        let policy = if up.follow_symlink {
+            SymlinkPolicy::Follow
+        } else {
+            SymlinkPolicy::Refuse
+        };
+        let target = match self.resolve_target(&up.wire, policy) {
+            Ok(t) => t,
+            Err(status) => return (status, 0, 0),
+        };
+        let lock = path_write_lock(&target);
+        let _guard = lock.lock().unwrap();
+        if fs::symlink_metadata(&target)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            return (FS_DONE_WRONG_TYPE, 0, 0);
+        }
+        if let Err((status, hash)) = check_write_precondition(&target, up.base, up.no_cas) {
+            return (status, hash, 0);
+        }
+        // Create-exclusive caveat: unlike FS_WRITE's O_EXCL create, the
+        // rename below cannot fail on an entry an external creator lands in
+        // this window — the path lock only serializes blit writers.
+        let file = up.file.take().expect("live upload has a file");
+        if up.durable && let Err(e) = file.sync_all() {
+            return (write_io_status(&e), 0, 0);
+        }
+        // Closed before the rename, as write_atomic does (and as Windows
+        // requires).
+        drop(file);
+        if let Err(e) = fs::rename(&up.tmp, &target) {
+            return (write_io_status(&e), 0, 0);
+        }
+        up.landed = true;
+        #[cfg(unix)]
+        if up.durable
+            && let Ok(d) = fs::File::open(target.parent().unwrap_or_else(|| Path::new(".")))
+        {
+            let _ = d.sync_all();
+        }
+        let mtime_ns = stat_meta(&target).map(|m| m.mtime_ns).unwrap_or(0);
+        let echo_wire = wire_key_for(&self.root, &target).unwrap_or_else(|| up.wire.clone());
+        // Small files prime the full echo from their bytes, like a write;
+        // large ones stream the hash and skip the blob store — re-reading
+        // up to a gigabyte to cache content the reconciler will not inline
+        // anyway would double the I/O for nothing.
+        if up.size <= fs_write_max() {
+            match fs::read(&target) {
+                Ok(bytes) => {
+                    let hash = blake3_128(&bytes);
+                    self.prime_echo(&echo_wire, &target, hash, &bytes, mtime_ns);
+                    (FS_DONE_OK, hash, mtime_ns)
+                }
+                Err(e) => (write_io_status(&e), 0, 0),
+            }
+        } else {
+            match hash_file_streamed(&target) {
+                Ok(hash) => {
+                    self.prime_echo_unstored(&echo_wire, &target, hash, mtime_ns);
+                    (FS_DONE_OK, hash, mtime_ns)
+                }
+                Err(e) => (write_io_status(&e), 0, 0),
+            }
+        }
+    }
+
+    fn handle_upload_cancel(&mut self, upload_id: u16) {
+        // Drop removes the temp file. Unknown ids are a no-op, matching
+        // FS_STOP of an unknown sync.
+        self.uploads.remove(&upload_id);
     }
 
     /// Execute a metadata op (mkdir/remove/rename), each under the affected
@@ -4035,6 +4425,21 @@ impl SyncEngine {
             .lock()
             .unwrap()
             .put(hash, Arc::new(bytes.to_vec()));
+        self.held.insert(wire.to_string(), hash);
+        if !racily_clean(mtime_ns)
+            && let Ok(mut meta) = stat_meta(abs)
+        {
+            meta.hash = hash;
+            self.teach_hash(wire, meta);
+        }
+        self.hint_change(abs);
+    }
+
+    /// [`prime_echo`] without the blob-store insert, for files too large to
+    /// be worth caching (chunked uploads over the inline cap): the echo and
+    /// hash teaching behave the same, only cross-client content serving
+    /// falls back to reading the file.
+    fn prime_echo_unstored(&mut self, wire: &str, abs: &Path, hash: u128, mtime_ns: u64) {
         self.held.insert(wire.to_string(), hash);
         if !racily_clean(mtime_ns)
             && let Ok(mut meta) = stat_meta(abs)
@@ -5374,6 +5779,570 @@ mod tests {
 
         handle.command(Command::Stop);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ── Chunked uploads (docs/protocol.md "Filesystem sync") ──────────────
+
+    /// Poll the sent log for the `n`th (0-based) message with `opcode`.
+    fn await_opcode(sent: &Arc<Mutex<Vec<Vec<u8>>>>, opcode: u8, n: usize) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(m) = sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m[0] == opcode)
+                .nth(n)
+                .cloned()
+            {
+                return m;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no reply #{n} with opcode {opcode:#x}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn upload_begin(
+        nonce: u16,
+        upload_id: u16,
+        path: &str,
+        flags: u8,
+        base: u128,
+        size: u64,
+    ) -> Command {
+        Command::UploadBegin(UploadBeginReq {
+            nonce,
+            upload_id,
+            path: path.into(),
+            flags,
+            base,
+            mode: 0,
+            size,
+            inflight: None,
+        })
+    }
+
+    fn upload_chunk(upload_id: u16, offset: u64, data: &[u8]) -> Command {
+        Command::UploadChunk {
+            upload_id,
+            offset,
+            data: data.to_vec(),
+        }
+    }
+
+    fn upload_finish(nonce: u16, upload_id: u16) -> Command {
+        Command::UploadFinish {
+            nonce,
+            upload_id,
+            inflight: None,
+        }
+    }
+
+    /// Any staging file left in `root`?
+    fn temp_files_in(root: &Path) -> Vec<String> {
+        fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(TEMP_FILE_PREFIX))
+            .collect()
+    }
+
+    #[test]
+    fn upload_happy_path_lands_exact_bytes() {
+        use blit_remote::fs::{
+            S2C_FS_UPLOAD_BEGIN, S2C_FS_UPLOAD_CHUNK, S2C_FS_UPLOAD_FINISH,
+            parse_fs_upload_begin_result, parse_fs_upload_chunk_result,
+            parse_fs_upload_finish_result,
+        };
+        let root = temp_dir().canonicalize().unwrap();
+        let (sent, handle, _hint) = drive_engine(&root);
+        let content: Vec<u8> = (0..100_000u32).flat_map(|i| i.to_le_bytes()).collect();
+
+        handle.command(upload_begin(1, 0, "big.bin", 0, 0, content.len() as u64));
+        let m = await_opcode(&sent, S2C_FS_UPLOAD_BEGIN, 0);
+        assert_eq!(parse_fs_upload_begin_result(&m), Some((1, FS_DONE_OK, 0, 0, 0)));
+
+        let half = content.len() / 2;
+        handle.command(upload_chunk(0, 0, &content[..half]));
+        let m = await_opcode(&sent, S2C_FS_UPLOAD_CHUNK, 0);
+        assert_eq!(
+            parse_fs_upload_chunk_result(&m),
+            Some((0, FS_DONE_OK, half as u64))
+        );
+        handle.command(upload_chunk(0, half as u64, &content[half..]));
+        let m = await_opcode(&sent, S2C_FS_UPLOAD_CHUNK, 1);
+        assert_eq!(
+            parse_fs_upload_chunk_result(&m),
+            Some((0, FS_DONE_OK, content.len() as u64))
+        );
+
+        handle.command(upload_finish(2, 0));
+        let m = await_opcode(&sent, S2C_FS_UPLOAD_FINISH, 0);
+        let (nonce, status, hash, mtime_ns) = parse_fs_upload_finish_result(&m).unwrap();
+        assert_eq!((nonce, status), (2, FS_DONE_OK));
+        assert_eq!(hash, blake3_128(&content));
+        assert_ne!(mtime_ns, 0);
+        assert_eq!(fs::read(root.join("big.bin")).unwrap(), content);
+        assert_eq!(temp_files_in(&root), Vec::<String>::new());
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upload_offset_mismatch_reports_resume_point() {
+        use blit_remote::fs::{
+            FS_DONE_OFFSET_MISMATCH, S2C_FS_UPLOAD_CHUNK, parse_fs_upload_chunk_result,
+        };
+        let root = temp_dir().canonicalize().unwrap();
+        let (sent, handle, _hint) = drive_engine(&root);
+
+        handle.command(upload_begin(1, 0, "a.txt", 0, 0, 11));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_BEGIN, 0);
+
+        // A gap is refused; the ack says where to resume.
+        handle.command(upload_chunk(0, 4, b"ello"));
+        let m = await_opcode(&sent, S2C_FS_UPLOAD_CHUNK, 0);
+        assert_eq!(
+            parse_fs_upload_chunk_result(&m),
+            Some((0, FS_DONE_OFFSET_MISMATCH, 0))
+        );
+        // A replayed (overlapping) offset is refused the same way.
+        handle.command(upload_chunk(0, 0, b"hello "));
+        let m = await_opcode(&sent, S2C_FS_UPLOAD_CHUNK, 1);
+        assert_eq!(parse_fs_upload_chunk_result(&m), Some((0, FS_DONE_OK, 6)));
+        handle.command(upload_chunk(0, 0, b"hello "));
+        let m = await_opcode(&sent, S2C_FS_UPLOAD_CHUNK, 2);
+        assert_eq!(
+            parse_fs_upload_chunk_result(&m),
+            Some((0, FS_DONE_OFFSET_MISMATCH, 6))
+        );
+        handle.command(upload_chunk(0, 6, b"world"));
+        let m = await_opcode(&sent, S2C_FS_UPLOAD_CHUNK, 3);
+        assert_eq!(parse_fs_upload_chunk_result(&m), Some((0, FS_DONE_OK, 11)));
+
+        handle.command(upload_finish(2, 0));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_FINISH, 0);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_finish_result(&m).map(|(n, s, _, _)| (n, s)),
+            Some((2, FS_DONE_OK))
+        );
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"hello world");
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upload_finish_size_mismatch_drops_upload() {
+        use blit_remote::fs::{FS_DONE_SIZE_MISMATCH, FS_DONE_UNKNOWN_UPLOAD};
+        let root = temp_dir().canonicalize().unwrap();
+        let (sent, handle, _hint) = drive_engine(&root);
+
+        handle.command(upload_begin(1, 0, "a.txt", 0, 0, 10));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_BEGIN, 0);
+        handle.command(upload_chunk(0, 0, b"12345"));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 0);
+
+        handle.command(upload_finish(2, 0));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_FINISH, 0);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_finish_result(&m).map(|(n, s, _, _)| (n, s)),
+            Some((2, FS_DONE_SIZE_MISMATCH))
+        );
+        // A failed FINISH terminates the upload: the temp is gone, the
+        // target never appeared, and the id no longer routes.
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(temp_files_in(&root), Vec::<String>::new());
+        handle.command(upload_chunk(0, 5, b"67890"));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 1);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_chunk_result(&m),
+            Some((0, FS_DONE_UNKNOWN_UPLOAD, 0))
+        );
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upload_cancel_removes_temp() {
+        use blit_remote::fs::FS_DONE_UNKNOWN_UPLOAD;
+        let root = temp_dir().canonicalize().unwrap();
+        let (sent, handle, _hint) = drive_engine(&root);
+
+        handle.command(upload_begin(1, 0, "a.txt", 0, 0, 10));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_BEGIN, 0);
+        handle.command(upload_chunk(0, 0, b"12345"));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 0);
+        assert_eq!(temp_files_in(&root).len(), 1, "staging file exists");
+
+        handle.command(Command::UploadCancel { upload_id: 0 });
+        // No reply is defined for cancel; the next chunk proves the upload
+        // is gone, and the temp file must be too.
+        handle.command(upload_chunk(0, 5, b"67890"));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 1);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_chunk_result(&m),
+            Some((0, FS_DONE_UNKNOWN_UPLOAD, 0))
+        );
+        assert_eq!(temp_files_in(&root), Vec::<String>::new());
+        assert!(!root.join("a.txt").exists());
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upload_overwrites_existing_file() {
+        let root = temp_dir().canonicalize().unwrap();
+        fs::write(root.join("a.txt"), b"old contents").unwrap();
+        let (sent, handle, _hint) = drive_engine(&root);
+
+        handle.command(upload_begin(1, 0, "a.txt", FS_UPLOAD_NO_CAS, 0, 3));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_BEGIN, 0);
+        handle.command(upload_chunk(0, 0, b"new"));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 0);
+        handle.command(upload_finish(2, 0));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_FINISH, 0);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_finish_result(&m).map(|(n, s, h, _)| (n, s, h)),
+            Some((2, FS_DONE_OK, blake3_128(b"new")))
+        );
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"new");
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upload_mkparents_creates_directories() {
+        use blit_remote::fs::{FS_DONE_NOT_FOUND, FS_UPLOAD_MKPARENTS};
+        let root = temp_dir().canonicalize().unwrap();
+        let (sent, handle, _hint) = drive_engine(&root);
+
+        // Missing parents without MKPARENTS: refused at begin.
+        handle.command(upload_begin(1, 0, "d/e/f.txt", 0, 0, 4));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_BEGIN, 0);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_begin_result(&m),
+            Some((1, FS_DONE_NOT_FOUND, 0, 0, 0))
+        );
+
+        handle.command(upload_begin(2, 0, "d/e/f.txt", FS_UPLOAD_MKPARENTS, 0, 4));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_BEGIN, 1);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_begin_result(&m),
+            Some((2, FS_DONE_OK, 0, 0, 0))
+        );
+        handle.command(upload_chunk(0, 0, b"deep"));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 0);
+        handle.command(upload_finish(3, 0));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_FINISH, 0);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_finish_result(&m).map(|(n, s, _, _)| (n, s)),
+            Some((3, FS_DONE_OK))
+        );
+        assert_eq!(fs::read(root.join("d/e/f.txt")).unwrap(), b"deep");
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upload_unknown_id_size_cap_and_flags() {
+        use blit_remote::fs::{FS_DONE_TOO_LARGE, FS_DONE_UNKNOWN_UPLOAD};
+        let root = temp_dir().canonicalize().unwrap();
+        let (sent, handle, _hint) = drive_engine(&root);
+
+        // Chunk/finish on an id no BEGIN opened.
+        handle.command(upload_chunk(7, 0, b"x"));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 0);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_chunk_result(&m),
+            Some((7, FS_DONE_UNKNOWN_UPLOAD, 0))
+        );
+        handle.command(upload_finish(9, 7));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_FINISH, 0);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_finish_result(&m).map(|(n, s, _, _)| (n, s)),
+            Some((9, FS_DONE_UNKNOWN_UPLOAD))
+        );
+
+        // Over the BLIT_FS_UPLOAD_MAX default (1 GiB): refused at begin.
+        handle.command(upload_begin(1, 0, "huge.bin", 0, 0, 2 * 1024 * 1024 * 1024));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_BEGIN, 0);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_begin_result(&m),
+            Some((1, FS_DONE_TOO_LARGE, 0, 0, 0))
+        );
+
+        // Unknown flags are INVALID.
+        handle.command(upload_begin(2, 0, "a.txt", 0x80, 0, 1));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_BEGIN, 1);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_begin_result(&m),
+            Some((2, FS_DONE_INVALID, 0, 0, 0))
+        );
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An upload's staging file sits in the watched directory for the whole
+    /// transfer; the reconciler's name filter keeps it out of the mirror
+    /// (TEMP_FILE_PREFIX), so clients never see the temp appear, grow, and
+    /// move onto the target.
+    #[test]
+    fn upload_temp_file_is_never_mirrored() {
+        let root = temp_dir().canonicalize().unwrap();
+        let (sent, handle, hint) = drive_engine(&root);
+        let mut mirror = FsMirror::new();
+        let mut seen = 0;
+        let no_temp = |m: &FsMirror| !m.live.keys().any(|k| k.contains(TEMP_FILE_PREFIX));
+
+        handle.command(upload_begin(1, 0, "a.txt", 0, 0, 11));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_BEGIN, 0);
+        handle.command(upload_chunk(0, 0, b"hello "));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 0);
+        assert_eq!(temp_files_in(&root).len(), 1);
+        // Re-list the root while the temp exists. Give the reconciler many
+        // settle windows; the temp must never surface.
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            hint.send(Hint::Dirty(root.clone()));
+            pump_mirror(&sent, &handle, &mut mirror, &mut seen);
+            assert!(no_temp(&mirror), "temp file mirrored: {:?}", mirror.live.keys());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        handle.command(upload_chunk(0, 6, b"world"));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 1);
+        handle.command(upload_finish(2, 0));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_FINISH, 0);
+        pump_until(&sent, &handle, &mut mirror, &mut seen, "uploaded file", |m| {
+            m.live.contains_key("a.txt")
+        });
+        assert!(no_temp(&mirror));
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A SINGLE sync's one addressable path is "" — uploads land on the
+    /// root file itself, exactly as writes do.
+    #[test]
+    fn upload_into_single_file_sync() {
+        let dir = temp_dir().canonicalize().unwrap();
+        let file = dir.join("note.txt");
+        fs::write(&file, b"v1").unwrap();
+        let (sent, handle, _hint) = drive_single_engine(&file);
+
+        handle.command(upload_begin(1, 0, "other.txt", 0, 0, 2));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_BEGIN, 0);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_begin_result(&m),
+            Some((1, FS_DONE_INVALID, 0, 0, 0))
+        );
+
+        handle.command(upload_begin(2, 0, "", FS_UPLOAD_NO_CAS, 0, 2));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_BEGIN, 1);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_begin_result(&m),
+            Some((2, FS_DONE_OK, 0, 0, 0))
+        );
+        handle.command(upload_chunk(0, 0, b"v2"));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 0);
+        handle.command(upload_finish(3, 0));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_FINISH, 0);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_finish_result(&m).map(|(n, s, _, _)| (n, s)),
+            Some((3, FS_DONE_OK))
+        );
+        assert_eq!(fs::read(&file).unwrap(), b"v2");
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The FS_WRITE precondition, checked at BEGIN: create-exclusive fails
+    /// on an existing target with CONFLICT + the live hash, CAS fails on a
+    /// stale base the same way and passes on the live one, a missing target
+    /// fails CAS with the "absent" zero hash, and NO_CAS overwrites
+    /// unconditionally.
+    #[test]
+    fn upload_precondition_at_begin() {
+        use blit_remote::fs::{FS_DONE_CONFLICT, FS_UPLOAD_NO_CAS};
+        let root = temp_dir().canonicalize().unwrap();
+        fs::write(root.join("a.txt"), b"old").unwrap();
+        let old_hash = blake3_128(b"old");
+        let (sent, handle, _hint) = drive_engine(&root);
+        let begin_result = |n: usize| {
+            blit_remote::fs::parse_fs_upload_begin_result(&await_opcode(
+                &sent,
+                blit_remote::fs::S2C_FS_UPLOAD_BEGIN,
+                n,
+            ))
+        };
+
+        // Create-exclusive on an existing file: CONFLICT with the live hash.
+        handle.command(upload_begin(1, 0, "a.txt", 0, 0, 3));
+        assert_eq!(
+            begin_result(0),
+            Some((1, FS_DONE_CONFLICT, 0, old_hash, 0))
+        );
+        // CAS with a stale base: same answer.
+        handle.command(upload_begin(2, 0, "a.txt", 0, 0xdead, 3));
+        assert_eq!(
+            begin_result(1),
+            Some((2, FS_DONE_CONFLICT, 0, old_hash, 0))
+        );
+        // CAS on a missing target: CONFLICT with the "absent" zero hash,
+        // exactly as FS_WRITE (not NOT_FOUND).
+        handle.command(upload_begin(3, 0, "gone.txt", 0, 0xdead, 1));
+        assert_eq!(begin_result(2), Some((3, FS_DONE_CONFLICT, 0, 0, 0)));
+        // Create-exclusive on a missing target: staged.
+        handle.command(upload_begin(4, 0, "new.txt", 0, 0, 1));
+        assert_eq!(begin_result(3), Some((4, FS_DONE_OK, 0, 0, 0)));
+        handle.command(upload_chunk(0, 0, b"x"));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 0);
+        handle.command(upload_finish(5, 0));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_FINISH, 0);
+        assert_eq!(fs::read(root.join("new.txt")).unwrap(), b"x");
+
+        // CAS with the live base lands.
+        handle.command(upload_begin(6, 0, "a.txt", 0, old_hash, 3));
+        assert_eq!(begin_result(4), Some((6, FS_DONE_OK, 0, 0, 0)));
+        handle.command(upload_chunk(0, 0, b"new"));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 1);
+        handle.command(upload_finish(7, 0));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_FINISH, 1);
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"new");
+
+        // NO_CAS overwrites unconditionally, base ignored.
+        handle.command(upload_begin(8, 0, "a.txt", FS_UPLOAD_NO_CAS, 0xdead, 5));
+        assert_eq!(begin_result(5), Some((8, FS_DONE_OK, 0, 0, 0)));
+        handle.command(upload_chunk(0, 0, b"force"));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 2);
+        handle.command(upload_finish(9, 0));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_FINISH, 2);
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"force");
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The precondition is re-verified at FINISH under the write lock: a
+    /// file changed (or created) by someone else between BEGIN and FINISH
+    /// turns the landing into CONFLICT with the now-current hash, and the
+    /// uploaded bytes are dropped with the temp.
+    #[test]
+    fn upload_finish_reverifies_precondition() {
+        use blit_remote::fs::FS_DONE_CONFLICT;
+        let root = temp_dir().canonicalize().unwrap();
+        fs::write(root.join("a.txt"), b"v1").unwrap();
+        let (sent, handle, _hint) = drive_engine(&root);
+        let finish_result = |n: usize| {
+            blit_remote::fs::parse_fs_upload_finish_result(&await_opcode(
+                &sent,
+                blit_remote::fs::S2C_FS_UPLOAD_FINISH,
+                n,
+            ))
+        };
+
+        // CAS upload begins clean...
+        handle.command(upload_begin(1, 0, "a.txt", 0, blake3_128(b"v1"), 2));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_BEGIN, 0);
+        handle.command(upload_chunk(0, 0, b"v2"));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 0);
+        // ...then an external writer moves the target mid-upload.
+        fs::write(root.join("a.txt"), b"changed").unwrap();
+        handle.command(upload_finish(2, 0));
+        assert_eq!(
+            finish_result(0),
+            Some((2, FS_DONE_CONFLICT, blake3_128(b"changed"), 0))
+        );
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"changed");
+        assert_eq!(temp_files_in(&root), Vec::<String>::new());
+
+        // Create-exclusive: the target appears between BEGIN and FINISH.
+        handle.command(upload_begin(3, 0, "fresh.txt", 0, 0, 1));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_BEGIN, 1);
+        handle.command(upload_chunk(0, 0, b"y"));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 1);
+        fs::write(root.join("fresh.txt"), b"sneak").unwrap();
+        handle.command(upload_finish(4, 0));
+        assert_eq!(
+            finish_result(1),
+            Some((4, FS_DONE_CONFLICT, blake3_128(b"sneak"), 0))
+        );
+        assert_eq!(fs::read(root.join("fresh.txt")).unwrap(), b"sneak");
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FOLLOW_SYMLINK writes through a final-component symlink whose target
+    /// stays under the root (same meaning as FS_WRITE's); the default
+    /// refuses one, and a link escaping the root is refused even with it.
+    #[test]
+    fn upload_follow_symlink() {
+        use blit_remote::fs::{FS_DONE_PERMISSION, FS_UPLOAD_FOLLOW_SYMLINK};
+        let root = temp_dir().canonicalize().unwrap();
+        fs::write(root.join("real.txt"), b"v1").unwrap();
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("link")).unwrap();
+        let outside = temp_dir().canonicalize().unwrap();
+        fs::write(outside.join("out.txt"), b"out").unwrap();
+        std::os::unix::fs::symlink(outside.join("out.txt"), root.join("esc")).unwrap();
+        let (sent, handle, _hint) = drive_engine(&root);
+        let begin_result = |n: usize| {
+            blit_remote::fs::parse_fs_upload_begin_result(&await_opcode(
+                &sent,
+                blit_remote::fs::S2C_FS_UPLOAD_BEGIN,
+                n,
+            ))
+        };
+
+        // Default: a final-component symlink is refused.
+        handle.command(upload_begin(1, 0, "link", 0, blake3_128(b"v1"), 2));
+        assert_eq!(begin_result(0), Some((1, FS_DONE_PERMISSION, 0, 0, 0)));
+        // FOLLOW_SYMLINK: CAS applies to the resolved target's content and
+        // the bytes land on it; the link itself survives.
+        handle.command(upload_begin(
+            2,
+            0,
+            "link",
+            FS_UPLOAD_FOLLOW_SYMLINK,
+            blake3_128(b"v1"),
+            2,
+        ));
+        assert_eq!(begin_result(1), Some((2, FS_DONE_OK, 0, 0, 0)));
+        handle.command(upload_chunk(0, 0, b"v2"));
+        await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_CHUNK, 0);
+        handle.command(upload_finish(3, 0));
+        let m = await_opcode(&sent, blit_remote::fs::S2C_FS_UPLOAD_FINISH, 0);
+        assert_eq!(
+            blit_remote::fs::parse_fs_upload_finish_result(&m).map(|(n, s, _, _)| (n, s)),
+            Some((3, FS_DONE_OK))
+        );
+        assert_eq!(fs::read(root.join("real.txt")).unwrap(), b"v2");
+        assert!(
+            fs::symlink_metadata(root.join("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        // A link resolving outside the root is refused even with FOLLOW.
+        handle.command(upload_begin(4, 0, "esc", FS_UPLOAD_FOLLOW_SYMLINK, 0, 1));
+        assert_eq!(begin_result(2), Some((4, FS_DONE_PERMISSION, 0, 0, 0)));
+
+        handle.command(Command::Stop);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     fn delta_req(nonce: u16, path: &str, base: u128, flags: u8, ops: &[u8]) -> Command {

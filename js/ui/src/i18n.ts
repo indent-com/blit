@@ -304,6 +304,13 @@ const en: Messages = {
   "workspace.restart": "Restart",
   "workspace.close": "Close",
 
+  "terminalDrop.hover": "Drop to upload to this terminal",
+  "terminalDrop.hoverCwd": "Drop to upload to {cwd}",
+  "terminalDrop.uploading": "Uploading {name} — {pct}%",
+  "terminalDrop.failed": "Upload failed",
+  "terminalDrop.unsupported": "This server can't accept file uploads",
+  "terminalDrop.noDirs": "Folders can't be uploaded — drop files instead",
+
   "bsp.tab": "Tab {index}",
   "bsp.exited": "Exited",
   "bsp.restart": "Restart",
@@ -474,6 +481,13 @@ const es: Messages = {
   "workspace.restart": "Reiniciar",
   "workspace.close": "Cerrar",
 
+  "terminalDrop.hover": "Suelta para subir a esta terminal",
+  "terminalDrop.hoverCwd": "Suelta para subir a {cwd}",
+  "terminalDrop.uploading": "Subiendo {name} — {pct}%",
+  "terminalDrop.failed": "Error al subir",
+  "terminalDrop.unsupported": "Este servidor no acepta subidas de archivos",
+  "terminalDrop.noDirs": "No se pueden subir carpetas — suelta archivos",
+
   "bsp.tab": "Pestaña {index}",
   "bsp.exited": "Finalizado",
   "bsp.restart": "Reiniciar",
@@ -636,6 +650,14 @@ const fr: Messages = {
   "workspace.exited": "Terminé",
   "workspace.restart": "Redémarrer",
   "workspace.close": "Fermer",
+
+  "terminalDrop.hover": "Déposez pour envoyer vers ce terminal",
+  "terminalDrop.hoverCwd": "Déposez pour envoyer vers {cwd}",
+  "terminalDrop.uploading": "Envoi de {name} — {pct}%",
+  "terminalDrop.failed": "Échec de l'envoi",
+  "terminalDrop.unsupported": "Ce serveur n'accepte pas les envois de fichiers",
+  "terminalDrop.noDirs":
+    "Les dossiers ne peuvent pas être envoyés — déposez des fichiers",
 
   "bsp.tab": "Onglet {index}",
   "bsp.exited": "Terminé",
@@ -801,6 +823,14 @@ const de: Messages = {
   "workspace.restart": "Neustart",
   "workspace.close": "Schließen",
 
+  "terminalDrop.hover": "Zum Hochladen auf dieses Terminal ablegen",
+  "terminalDrop.hoverCwd": "Zum Hochladen nach {cwd} ablegen",
+  "terminalDrop.uploading": "Lade {name} hoch — {pct}%",
+  "terminalDrop.failed": "Hochladen fehlgeschlagen",
+  "terminalDrop.unsupported": "Dieser Server akzeptiert keine Datei-Uploads",
+  "terminalDrop.noDirs":
+    "Ordner können nicht hochgeladen werden — Dateien ablegen",
+
   "bsp.tab": "Tab {index}",
   "bsp.exited": "Beendet",
   "bsp.restart": "Neustart",
@@ -960,6 +990,13 @@ const ja: Messages = {
   "workspace.restart": "再起動",
   "workspace.close": "閉じる",
 
+  "terminalDrop.hover": "ドロップでこのターミナルにアップロード",
+  "terminalDrop.hoverCwd": "ドロップで {cwd} にアップロード",
+  "terminalDrop.uploading": "{name} をアップロード中 — {pct}%",
+  "terminalDrop.failed": "アップロードに失敗しました",
+  "terminalDrop.unsupported": "このサーバーはファイルのアップロードに対応していません",
+  "terminalDrop.noDirs": "フォルダはアップロードできません — ファイルをドロップしてください",
+
   "bsp.tab": "タブ {index}",
   "bsp.exited": "終了",
   "bsp.restart": "再起動",
@@ -1117,6 +1154,13 @@ const zh: Messages = {
   "workspace.exited": "已结束",
   "workspace.restart": "重新启动",
   "workspace.close": "关闭",
+
+  "terminalDrop.hover": "拖放到此以上传到该终端",
+  "terminalDrop.hoverCwd": "拖放到此以上传到 {cwd}",
+  "terminalDrop.uploading": "正在上传 {name} — {pct}%",
+  "terminalDrop.failed": "上传失败",
+  "terminalDrop.unsupported": "此服务器不支持文件上传",
+  "terminalDrop.noDirs": "无法上传文件夹 — 请拖放文件",
 
   "bsp.tab": "标签页 {index}",
   "bsp.exited": "已结束",

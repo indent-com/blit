@@ -36,6 +36,7 @@ import {
   FEATURE_SCROLL_BY,
   FRAGMENT_FLAG_LAST,
   S2C_FRAGMENT,
+  S2C_CLIPBOARD_OWNER,
   S2C_PING,
   C2S_SURFACE_SUBSCRIBE,
   C2S_SURFACE_RESIZE,
@@ -90,6 +91,24 @@ describe("BlitConnection", () => {
   it("tracks status changes", () => {
     transport.setStatus("disconnected");
     expect(conn.getSnapshot().status).toBe("disconnected");
+  });
+
+  it("tracks compositor clipboard authority independently of browser invalidation", () => {
+    expect(conn.usesWaylandClipboard()).toBe(false);
+
+    transport.push(new Uint8Array([S2C_CLIPBOARD_OWNER, 1]));
+    expect(conn.usesWaylandClipboard()).toBe(true);
+
+    conn.noteBrowserClipboardMayHaveChanged();
+    expect(conn.usesWaylandClipboard()).toBe(false);
+
+    transport.push(new Uint8Array([S2C_CLIPBOARD_OWNER, 1]));
+    conn.sendClipboard("image/png", new Uint8Array([1, 2, 3]));
+    expect(conn.usesWaylandClipboard()).toBe(false);
+
+    // Invalid states cannot accidentally suppress browser clipboard import.
+    transport.push(new Uint8Array([S2C_CLIPBOARD_OWNER, 2]));
+    expect(conn.usesWaylandClipboard()).toBe(false);
   });
 
   it("tracks retryCount on failed connection attempts", () => {

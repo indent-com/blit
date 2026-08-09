@@ -3,6 +3,7 @@ import { BlitConnection } from "../BlitConnection";
 import { MockTransport } from "./mock-transport";
 import type { BlitWasmModule } from "../TerminalStore";
 import { S2C_FRAGMENT, FRAGMENT_FLAG_LAST, C2S_TERM_CWD } from "../types";
+import type { SessionId } from "../types";
 import {
   FEATURE_FS,
   FS_CLOSED_CLIENT_REQUEST,
@@ -21,6 +22,7 @@ import {
   FS_STATUS_NOT_FOUND,
   FS_SYNC_CONTENT,
   FS_SYNC_RECURSIVE,
+  FS_SYNC_STAGING,
   FS_UPDATE_RESET,
   FS_UPDATE_SYNC,
   FsMirror,
@@ -73,6 +75,24 @@ import {
   FS_OP_SYMLINK,
   FS_WRITE_CONTENT_FULL,
   FS_WRITE_MKPARENTS,
+  FS_DONE_OFFSET_MISMATCH,
+  FS_UPLOAD_DURABLE,
+  FS_UPLOAD_MKPARENTS,
+  FS_UPLOAD_NO_CAS,
+  C2S_FS_UPLOAD_BEGIN,
+  C2S_FS_UPLOAD_CANCEL,
+  C2S_FS_UPLOAD_CHUNK,
+  C2S_FS_UPLOAD_FINISH,
+  buildFsUploadBeginMessage,
+  buildFsUploadBeginReply,
+  buildFsUploadCancelMessage,
+  buildFsUploadChunkAck,
+  buildFsUploadChunkMessage,
+  buildFsUploadFinishMessage,
+  buildFsUploadFinishReply,
+  parseFsUploadBeginReply,
+  parseFsUploadChunkAck,
+  parseFsUploadFinishReply,
   S2C_FS_CLOSED,
   S2C_FS_FILE,
   S2C_FS_SYNCED,
@@ -180,6 +200,13 @@ describe("fs wire fixtures (cross-checked with Rust)", () => {
     expect(
       toHex(buildFsSyncMessage(7, FS_SYNC_RECURSIVE, 0, 0, "sub", 42, "")),
     ).toBe("400700110000000000000003007375622a00");
+    // STAGING sync: flag bit set, path ignored and sent empty, no trailer
+    // (drag-and-drop staging, FS_SYNC_STAGING).
+    expect(
+      toHex(
+        buildFsSyncMessage(7, FS_SYNC_RECURSIVE | FS_SYNC_STAGING, 0, 0, ""),
+      ),
+    ).toBe("40070001020000000000000000");
   });
 
   it("record encoder emits the pinned bytes", () => {
@@ -1029,6 +1056,40 @@ describe("BlitConnection.syncFs", () => {
   });
 });
 
+describe("BlitConnection.syncFs staging", () => {
+  it("opens with the STAGING flag and an empty path", async () => {
+    const { conn, transport } = fsReadyConnection();
+    // A given path is ignored: the staging dir is per-connection.
+    const handlePromise = conn.syncFs("/ignored", { staging: true });
+    const syncMsg = transport.sent.find((m) => m[0] === C2S_FS_SYNC)!;
+    const v = new DataView(syncMsg.buffer);
+    expect(v.getUint16(3, true) & FS_SYNC_STAGING).toBe(FS_SYNC_STAGING);
+    expect(v.getUint16(11, true)).toBe(0); // path_len
+    expect(syncMsg.length).toBe(13); // header only, no path or trailer
+    pushSynced(
+      transport,
+      syncMsg[1] | (syncMsg[2] << 8),
+      3,
+      0,
+      "/home/u/.cache/blit/drag",
+    );
+    expect((await handlePromise).syncId).toBe(3);
+    conn.dispose();
+  });
+
+  it("rejects staging rooted at a terminal's cwd", async () => {
+    const { conn, transport } = fsReadyConnection();
+    await expect(
+      conn.syncFs("", {
+        staging: true,
+        fromSessionId: "session-1" as SessionId,
+      }),
+    ).rejects.toThrow(/staging/);
+    expect(transport.sent.some((m) => m[0] === C2S_FS_SYNC)).toBe(false);
+    conn.dispose();
+  });
+});
+
 describe("BlitConnection.syncFs open contract", () => {
   // A single-file sync is one record, so the server's accept echo and the
   // coherent snapshot go out back to back and reach the client in one
@@ -1386,15 +1447,38 @@ describe("BlitConnection writes", () => {
     return { conn, transport, handle };
   }
 
+  /** writeFile always rides the chunked upload now: answer BEGIN, ack the
+   *  chunks as they land, answer FINISH with `hash`/`mtimeNs`. */
+  async function driveUpload(
+    transport: MockTransport,
+    hash: bigint,
+    mtimeNs: bigint,
+  ) {
+    const begin = transport.sent.find((m) => m[0] === C2S_FS_UPLOAD_BEGIN)!;
+    expect(begin).toBeDefined();
+    const nonce = begin[1] | (begin[2] << 8);
+    transport.push(buildFsUploadBeginReply(nonce, FS_DONE_OK, 9));
+    await flushTimers();
+    const size = Number(new DataView(begin.buffer).getBigUint64(26, true));
+    for (let received = 0; received < size; ) {
+      received = Math.min(received + 256 * 1024, size);
+      transport.push(buildFsUploadChunkAck(9, FS_DONE_OK, received));
+      await flushTimers();
+    }
+    const finish = transport.sent.find((m) => m[0] === C2S_FS_UPLOAD_FINISH)!;
+    expect(finish).toBeDefined();
+    const finishNonce = finish[1] | (finish[2] << 8);
+    transport.push(
+      buildFsUploadFinishReply(finishNonce, FS_DONE_OK, hash, mtimeNs),
+    );
+  }
+
   it("writeFile resolves with the hash and records lastWrittenHash", async () => {
     const { conn, transport, handle } = await writeReadyHandle();
     const p = handle.writeFile("a.txt", new TextEncoder().encode("hi"), {
       create: true,
     });
-    const writeMsg = transport.sent.find((m) => m[0] === C2S_FS_WRITE)!;
-    expect(writeMsg).toBeDefined();
-    const nonce = writeMsg[1] | (writeMsg[2] << 8);
-    transport.push(buildFsDoneMessage(nonce, FS_DONE_OK, 0xabcdn, 123n));
+    await driveUpload(transport, 0xabcdn, 123n);
     const res = await p;
     expect(res.hash).toBe(0xabcdn);
     expect(res.mtimeNs).toBe(123n);
@@ -1406,9 +1490,11 @@ describe("BlitConnection writes", () => {
   it("writeFile rejects with FsConflictError carrying the disk hash", async () => {
     const { conn, transport, handle } = await writeReadyHandle();
     const p = handle.writeFile("a.txt", new Uint8Array(), { ifHash: 1n });
-    const writeMsg = transport.sent.find((m) => m[0] === C2S_FS_WRITE)!;
-    const nonce = writeMsg[1] | (writeMsg[2] << 8);
-    transport.push(buildFsDoneMessage(nonce, FS_DONE_CONFLICT, 0x999n, 0n));
+    const begin = transport.sent.find((m) => m[0] === C2S_FS_UPLOAD_BEGIN)!;
+    const nonce = begin[1] | (begin[2] << 8);
+    transport.push(
+      buildFsUploadBeginReply(nonce, FS_DONE_CONFLICT, 0, 0x999n, 0n),
+    );
     await expect(p).rejects.toMatchObject({
       name: "FsConflictError",
       hash: 0x999n,
@@ -1474,9 +1560,7 @@ describe("BlitConnection writes", () => {
       "a.txt",
       new TextEncoder().encode("hi"),
     );
-    const writeMsg = transport.sent.find((m) => m[0] === C2S_FS_WRITE)!;
-    const nonce = writeMsg[1] | (writeMsg[2] << 8);
-    transport.push(buildFsDoneMessage(nonce, FS_DONE_OK, 0xabcdn, 1n));
+    await driveUpload(transport, 0xabcdn, 1n);
     await writePromise;
     expect(handle.lastWrittenHash("a.txt")).toBe(0xabcdn);
 
@@ -1524,9 +1608,7 @@ describe("BlitConnection writes", () => {
       "a.txt",
       new TextEncoder().encode("hi"),
     );
-    const writeMsg = transport.sent.find((m) => m[0] === C2S_FS_WRITE)!;
-    const nonce = writeMsg[1] | (writeMsg[2] << 8);
-    transport.push(buildFsDoneMessage(nonce, FS_DONE_OK, 0xabcdn, 1n));
+    await driveUpload(transport, 0xabcdn, 1n);
     await writePromise;
 
     // Recorded on the writing handle only: to the other consumer this
@@ -1545,13 +1627,413 @@ describe("BlitConnection writes", () => {
 
   it("surfaces a read-only server's PERMISSION refusal", async () => {
     // Writes share FEATURE_FS; a BLIT_FS_WRITE=0 server answers each
-    // write with FS_DONE PERMISSION instead of withholding a bit.
+    // write — the upload BEGIN included — with PERMISSION instead of
+    // withholding a bit.
     const { conn, transport, handle } = await writeReadyHandle();
     const p = handle.writeFile("a", new Uint8Array());
-    const writeMsg = transport.sent.find((m) => m[0] === C2S_FS_WRITE)!;
-    const nonce = writeMsg[1] | (writeMsg[2] << 8);
-    transport.push(buildFsDoneMessage(nonce, FS_DONE_PERMISSION, 0n, 0n));
+    const begin = transport.sent.find((m) => m[0] === C2S_FS_UPLOAD_BEGIN)!;
+    const nonce = begin[1] | (begin[2] << 8);
+    transport.push(buildFsUploadBeginReply(nonce, FS_DONE_PERMISSION, 0));
     await expect(p).rejects.toThrow(/permission denied/);
+    conn.dispose();
+  });
+});
+
+// -- Chunked upload ----------------------------------------------------------
+
+describe("fs upload codec", () => {
+  it("encodes BEGIN with flags, base, mode, size and path", () => {
+    const msg = buildFsUploadBeginMessage({
+      nonce: 7,
+      syncId: 5,
+      flags: FS_UPLOAD_MKPARENTS | FS_UPLOAD_DURABLE,
+      base: 0x0102n,
+      mode: 0o644,
+      size: 1000,
+      path: "a/b.txt",
+    });
+    const v = new DataView(msg.buffer);
+    expect(msg[0]).toBe(C2S_FS_UPLOAD_BEGIN);
+    expect(v.getUint16(1, true)).toBe(7);
+    expect(v.getUint16(3, true)).toBe(5);
+    expect(msg[5]).toBe(FS_UPLOAD_MKPARENTS | FS_UPLOAD_DURABLE);
+    expect(v.getBigUint64(6, true)).toBe(0x0102n);
+    expect(v.getBigUint64(14, true)).toBe(0n); // base high word
+    expect(v.getUint32(22, true)).toBe(0o644);
+    expect(v.getBigUint64(26, true)).toBe(1000n);
+    expect(v.getUint16(34, true)).toBe(7);
+    expect(new TextDecoder().decode(msg.subarray(36))).toBe("a/b.txt");
+  });
+
+  it("roundtrips CHUNK through the LZ4 framing", () => {
+    const data = new TextEncoder().encode("some chunk bytes".repeat(16));
+    const msg = buildFsUploadChunkMessage(0x0102, 4096, data);
+    const v = new DataView(msg.buffer);
+    expect(msg[0]).toBe(C2S_FS_UPLOAD_CHUNK);
+    expect(v.getUint16(1, true)).toBe(0x0102);
+    expect(v.getBigUint64(3, true)).toBe(4096n);
+    expect(toHex(fsDecompress(msg.subarray(11))!)).toBe(toHex(data));
+  });
+
+  it("encodes FINISH and CANCEL", () => {
+    expect(toHex(buildFsUploadFinishMessage(7, 0x0102))).toBe("4b07000201");
+    expect(toHex(buildFsUploadCancelMessage(0x0102))).toBe("4c0201");
+  });
+
+  it("matches the Rust byte fixtures", () => {
+    // Pinned against `fs_upload_byte_fixtures` in crates/remote/src/fs.rs —
+    // the same discipline as the "fs wire fixtures" suite above. The u64
+    // size/offset value keeps its significant bits under 2^53: wire sizes
+    // are `number` here, and a wider fixture could not pin identical bytes.
+    expect(
+      toHex(
+        buildFsUploadBeginMessage({
+          nonce: 0x0102,
+          syncId: 0x0304,
+          flags: FS_UPLOAD_MKPARENTS,
+          base: 0n,
+          mode: 0o644,
+          size: 0x0102_0304_0506_0000,
+          path: "a/b.txt",
+        }),
+      ),
+    ).toBe(
+      "49020104030200000000000000000000000000000000a401000000000605040302010700612f622e747874",
+    );
+    expect(toHex(buildFsUploadFinishMessage(0x0102, 0x0506))).toBe(
+      "4b02010605",
+    );
+    expect(toHex(buildFsUploadBeginReply(0x0102, 0, 0x0506))).toBe(
+      "490201000605000000000000000000000000000000000000000000000000",
+    );
+    expect(toHex(buildFsUploadChunkAck(0x0506, 0, 0x0102_0304_0506_0000))).toBe(
+      "4a0605000000060504030201",
+    );
+  });
+
+  it("roundtrips the three reply shapes", () => {
+    expect(parseFsUploadBeginReply(buildFsUploadBeginReply(7, 0, 9))).toEqual({
+      nonce: 7,
+      status: 0,
+      uploadId: 9,
+      hash: 0n,
+      mtimeNs: 0n,
+    });
+    // A CONFLICT begin reply carries the current on-disk hash.
+    expect(
+      parseFsUploadBeginReply(buildFsUploadBeginReply(7, 11, 0, 0x999n, 3n)),
+    ).toEqual({ nonce: 7, status: 11, uploadId: 0, hash: 0x999n, mtimeNs: 3n });
+    expect(parseFsUploadChunkAck(buildFsUploadChunkAck(9, 0, 1 << 20))).toEqual(
+      { uploadId: 9, status: 0, received: 1 << 20 },
+    );
+    const finish = parseFsUploadFinishReply(
+      buildFsUploadFinishReply(7, 0, 0xabcn, 5n),
+    );
+    expect(finish).toMatchObject({ nonce: 7, status: 0, hash: 0xabcn });
+    expect(finish!.hashBytes).toHaveLength(16);
+    expect(finish!.mtimeNs).toBe(5n);
+  });
+
+  it("rejects wrong opcodes and truncated messages", () => {
+    expect(
+      parseFsUploadBeginReply(new Uint8Array([0x44, 1, 0, 0, 0])),
+    ).toBeNull();
+    expect(parseFsUploadBeginReply(new Uint8Array([0x49, 1]))).toBeNull();
+    expect(parseFsUploadChunkAck(new Uint8Array(12))).toBeNull();
+    expect(parseFsUploadFinishReply(new Uint8Array(28))).toBeNull();
+  });
+});
+
+describe("BlitConnection.upload", () => {
+  async function uploadReadyHandle() {
+    const transport = new MockTransport();
+    const conn = new BlitConnection({
+      id: "test",
+      transport,
+      wasm,
+      autoConnect: false,
+    });
+    transport.pushHello(1, FEATURE_FS);
+    transport.pushReady();
+    const handlePromise = conn.syncFs("/w");
+    const syncMsg = transport.sent.find((m) => m[0] === C2S_FS_SYNC)!;
+    pushSynced(transport, syncMsg[1] | (syncMsg[2] << 8), 7, 0, "/w");
+    const handle = await handlePromise;
+    await flushTimers();
+    return { conn, transport, handle };
+  }
+
+  /** Answer the pending BEGIN with `uploadId` 9 and let the pump's async
+   *  slice reads land on the wire. */
+  async function acceptBegin(transport: MockTransport, uploadId = 9) {
+    const begin = transport.sent.find((m) => m[0] === C2S_FS_UPLOAD_BEGIN)!;
+    expect(begin).toBeDefined();
+    const nonce = begin[1] | (begin[2] << 8);
+    transport.push(buildFsUploadBeginReply(nonce, FS_DONE_OK, uploadId));
+    await flushTimers();
+    return begin;
+  }
+
+  const chunkOffsets = (transport: MockTransport) =>
+    transport.sent
+      .filter((m) => m[0] === C2S_FS_UPLOAD_CHUNK)
+      .map((m) => Number(new DataView(m.buffer).getBigUint64(3, true)));
+
+  it("pipelines chunks and resolves from the FINISH reply", async () => {
+    const { conn, transport, handle } = await uploadReadyHandle();
+    const progress: Array<[number, number]> = [];
+    const data = new TextEncoder().encode("0123456789"); // 10 bytes
+    const p = handle.upload("big.bin", data, {
+      chunkSize: 4,
+      createParents: true,
+      durable: true,
+      mode: 0o600,
+      onProgress: (uploaded, total) => progress.push([uploaded, total]),
+    });
+    const begin = await acceptBegin(transport);
+    // BEGIN advertised flags, base, mode, total size and path.
+    const bv = new DataView(begin.buffer);
+    expect(begin[5]).toBe(
+      FS_UPLOAD_NO_CAS | FS_UPLOAD_MKPARENTS | FS_UPLOAD_DURABLE,
+    );
+    expect(bv.getBigUint64(6, true)).toBe(0n); // base: no precondition here
+    expect(bv.getUint32(22, true)).toBe(0o600);
+    expect(bv.getBigUint64(26, true)).toBe(10n);
+    expect(new TextDecoder().decode(begin.subarray(36))).toBe("big.bin");
+
+    // Three chunks, in order, each LZ4-framed plaintext.
+    expect(chunkOffsets(transport)).toEqual([0, 4, 8]);
+    const chunks = transport.sent.filter((m) => m[0] === C2S_FS_UPLOAD_CHUNK);
+    expect(toHex(fsDecompress(chunks[0].subarray(11))!)).toBe(
+      toHex(data.subarray(0, 4)),
+    );
+    expect(toHex(fsDecompress(chunks[2].subarray(11))!)).toBe(
+      toHex(data.subarray(8)),
+    );
+
+    transport.push(buildFsUploadChunkAck(9, FS_DONE_OK, 4));
+    transport.push(buildFsUploadChunkAck(9, FS_DONE_OK, 8));
+    transport.push(buildFsUploadChunkAck(9, FS_DONE_OK, 10));
+    await flushTimers();
+    expect(progress).toEqual([
+      [4, 10],
+      [8, 10],
+      [10, 10],
+    ]);
+
+    // Fully acked: FINISH went out; answer it.
+    const finish = transport.sent.find((m) => m[0] === C2S_FS_UPLOAD_FINISH)!;
+    expect(finish).toBeDefined();
+    expect(finish[3] | (finish[4] << 8)).toBe(9);
+    const finishNonce = finish[1] | (finish[2] << 8);
+    transport.push(
+      buildFsUploadFinishReply(finishNonce, FS_DONE_OK, 0xabcdn, 5n),
+    );
+    const res = await p;
+    expect(res.mtime).toBe(5);
+    expect(res.hash).toHaveLength(16);
+    expect(res.hash[0]).toBe(0xcd); // little-endian u128 on the wire
+    expect(handle.lastWrittenHash("big.bin")).toBe(0xabcdn);
+    conn.dispose();
+  });
+
+  it("uploads a Blob slice by slice", async () => {
+    const { conn, transport, handle } = await uploadReadyHandle();
+    const data = new TextEncoder().encode("0123456789");
+    const p = handle.upload("blob.bin", new Blob([data]), { chunkSize: 4 });
+    void p.catch(() => {});
+    const begin = await acceptBegin(transport);
+    expect(new DataView(begin.buffer).getBigUint64(26, true)).toBe(10n);
+    expect(chunkOffsets(transport)).toEqual([0, 4, 8]);
+    const first = transport.sent.find((m) => m[0] === C2S_FS_UPLOAD_CHUNK)!;
+    expect(toHex(fsDecompress(first.subarray(11))!)).toBe(
+      toHex(data.subarray(0, 4)),
+    );
+    conn.dispose();
+  });
+
+  it("resends from the resume point on OFFSET_MISMATCH", async () => {
+    const { conn, transport, handle } = await uploadReadyHandle();
+    const data = new TextEncoder().encode("0123456789ab"); // 12 bytes
+    const p = handle.upload("big.bin", data, { chunkSize: 4 });
+    await acceptBegin(transport);
+    expect(chunkOffsets(transport)).toEqual([0, 4, 8]);
+
+    // The server took only the first chunk: resend from 4.
+    transport.push(buildFsUploadChunkAck(9, FS_DONE_OFFSET_MISMATCH, 4));
+    await flushTimers();
+    expect(chunkOffsets(transport)).toEqual([0, 4, 8, 4, 8]);
+
+    transport.push(buildFsUploadChunkAck(9, FS_DONE_OK, 8));
+    transport.push(buildFsUploadChunkAck(9, FS_DONE_OK, 12));
+    await flushTimers();
+    const finish = transport.sent.find((m) => m[0] === C2S_FS_UPLOAD_FINISH)!;
+    const finishNonce = finish[1] | (finish[2] << 8);
+    transport.push(buildFsUploadFinishReply(finishNonce, FS_DONE_OK, 1n, 1n));
+    await p;
+    conn.dispose();
+  });
+
+  it("caps unacked bytes on the wire instead of chunk count", async () => {
+    const { conn, transport, handle } = await uploadReadyHandle();
+    const chunk = 300 * 1024;
+    // Three 300 KiB chunks; the 512 KiB in-flight cap admits two at a time
+    // (one chunk may overshoot the cap), so a slow uplink never queues a
+    // multi-MiB backlog ahead of interactive input on the same connection.
+    const data = new Uint8Array(3 * chunk);
+    const p = handle.upload("big.bin", data, { chunkSize: chunk });
+    void p.catch(() => {});
+    await acceptBegin(transport);
+    expect(chunkOffsets(transport)).toEqual([0, chunk]);
+
+    transport.push(buildFsUploadChunkAck(9, FS_DONE_OK, chunk));
+    await flushTimers();
+    expect(chunkOffsets(transport)).toEqual([0, chunk, 2 * chunk]);
+
+    transport.push(buildFsUploadChunkAck(9, FS_DONE_OK, 2 * chunk));
+    transport.push(buildFsUploadChunkAck(9, FS_DONE_OK, 3 * chunk));
+    await flushTimers();
+    const finish = transport.sent.find((m) => m[0] === C2S_FS_UPLOAD_FINISH)!;
+    const finishNonce = finish[1] | (finish[2] << 8);
+    transport.push(buildFsUploadFinishReply(finishNonce, FS_DONE_OK, 1n, 1n));
+    await p;
+    conn.dispose();
+  });
+
+  it("routes large unconditional writeFile through the chunked pump", async () => {
+    const { conn, transport, handle } = await uploadReadyHandle();
+    const data = new Uint8Array(1024 * 1024 + 7);
+    const p = handle.writeFile("huge.bin", data);
+    void p.catch(() => {});
+    await flushTimers();
+    expect(transport.sent.some((m) => m[0] === C2S_FS_WRITE)).toBe(false);
+    await acceptBegin(transport);
+    // Walk the acks (256 KiB default chunks) until FINISH goes out.
+    let received = 0;
+    for (
+      let i = 0;
+      i < 16 && !transport.sent.some((m) => m[0] === C2S_FS_UPLOAD_FINISH);
+      i++
+    ) {
+      received = Math.min(received + 256 * 1024, data.length);
+      transport.push(buildFsUploadChunkAck(9, FS_DONE_OK, received));
+      await flushTimers();
+    }
+    const finish = transport.sent.find((m) => m[0] === C2S_FS_UPLOAD_FINISH)!;
+    expect(finish).toBeDefined();
+    const finishNonce = finish[1] | (finish[2] << 8);
+    transport.push(
+      buildFsUploadFinishReply(finishNonce, FS_DONE_OK, 0xabcdn, 5n),
+    );
+    const res = await p;
+    // Same shape a single-frame FS_WRITE would have resolved with.
+    expect(res.hash).toBe(0xabcdn);
+    expect(res.mtimeNs).toBe(5n);
+    expect(handle.lastWrittenHash("huge.bin")).toBe(0xabcdn);
+    conn.dispose();
+  });
+
+  it("routes large CAS and create writes through the pump with their precondition", async () => {
+    const { conn, transport, handle } = await uploadReadyHandle();
+    const data = new Uint8Array(1024 * 1024 + 7); // over the 1 MiB threshold
+    const cas = handle.writeFile("huge.bin", data, { ifHash: 0x1234n });
+    void cas.catch(() => {});
+    const create = handle.writeFile("new.bin", data, { create: true });
+    void create.catch(() => {});
+    await flushTimers();
+    // Both went out as uploads, not single-frame writes.
+    expect(transport.sent.some((m) => m[0] === C2S_FS_WRITE)).toBe(false);
+    const begins = transport.sent.filter((m) => m[0] === C2S_FS_UPLOAD_BEGIN);
+    expect(begins).toHaveLength(2);
+    // CAS: base carries ifHash, NO_CAS clear.
+    expect(new DataView(begins[0].buffer).getBigUint64(6, true)).toBe(0x1234n);
+    expect(begins[0][5] & FS_UPLOAD_NO_CAS).toBe(0);
+    // Create-exclusive: base 0, NO_CAS clear.
+    expect(new DataView(begins[1].buffer).getBigUint64(6, true)).toBe(0n);
+    expect(begins[1][5] & FS_UPLOAD_NO_CAS).toBe(0);
+    conn.dispose();
+  });
+
+  it("rejects with FsConflictError on a BEGIN CONFLICT", async () => {
+    const { conn, transport, handle } = await uploadReadyHandle();
+    const p = handle.upload("big.bin", new Uint8Array(8), { ifHash: 1n });
+    const begin = transport.sent.find((m) => m[0] === C2S_FS_UPLOAD_BEGIN)!;
+    const nonce = begin[1] | (begin[2] << 8);
+    transport.push(
+      buildFsUploadBeginReply(nonce, FS_DONE_CONFLICT, 0, 0x999n, 0n),
+    );
+    await expect(p).rejects.toMatchObject({
+      name: "FsConflictError",
+      hash: 0x999n,
+    });
+    expect(
+      transport.sent.filter((m) => m[0] === C2S_FS_UPLOAD_CHUNK),
+    ).toHaveLength(0);
+    conn.dispose();
+  });
+
+  it("rejects with FsConflictError on a FINISH CONFLICT", async () => {
+    const { conn, transport, handle } = await uploadReadyHandle();
+    const data = new TextEncoder().encode("0123456789ab"); // 12 bytes
+    const p = handle.upload("big.bin", data, { chunkSize: 4, ifHash: 1n });
+    await acceptBegin(transport);
+    transport.push(buildFsUploadChunkAck(9, FS_DONE_OK, 4));
+    transport.push(buildFsUploadChunkAck(9, FS_DONE_OK, 8));
+    transport.push(buildFsUploadChunkAck(9, FS_DONE_OK, 12));
+    await flushTimers();
+    const finish = transport.sent.find((m) => m[0] === C2S_FS_UPLOAD_FINISH)!;
+    const finishNonce = finish[1] | (finish[2] << 8);
+    transport.push(
+      buildFsUploadFinishReply(finishNonce, FS_DONE_CONFLICT, 0x999n, 0n),
+    );
+    await expect(p).rejects.toMatchObject({
+      name: "FsConflictError",
+      hash: 0x999n,
+    });
+    expect(handle.lastWrittenHash("big.bin")).toBeUndefined();
+    conn.dispose();
+  });
+
+  it("rejects on a BEGIN error status without sending chunks", async () => {
+    const { conn, transport, handle } = await uploadReadyHandle();
+    const p = handle.upload("big.bin", new Uint8Array(8));
+    const begin = transport.sent.find((m) => m[0] === C2S_FS_UPLOAD_BEGIN)!;
+    const nonce = begin[1] | (begin[2] << 8);
+    transport.push(buildFsUploadBeginReply(nonce, FS_DONE_PERMISSION, 0));
+    await expect(p).rejects.toThrow(/permission denied/);
+    expect(
+      transport.sent.filter((m) => m[0] === C2S_FS_UPLOAD_CHUNK),
+    ).toHaveLength(0);
+    conn.dispose();
+  });
+
+  it("rejects on a FINISH error status", async () => {
+    const { conn, transport, handle } = await uploadReadyHandle();
+    const p = handle.upload("empty.bin", new Uint8Array(0));
+    await acceptBegin(transport);
+    // An empty upload finishes immediately.
+    const finish = transport.sent.find((m) => m[0] === C2S_FS_UPLOAD_FINISH)!;
+    const finishNonce = finish[1] | (finish[2] << 8);
+    transport.push(
+      buildFsUploadFinishReply(finishNonce, FS_DONE_INVALID, 0n, 0n),
+    );
+    await expect(p).rejects.toThrow(/invalid request/);
+    conn.dispose();
+  });
+
+  it("abort sends CANCEL and rejects", async () => {
+    const { conn, transport, handle } = await uploadReadyHandle();
+    const controller = new AbortController();
+    const p = handle.upload("big.bin", new Uint8Array(16), {
+      chunkSize: 4,
+      signal: controller.signal,
+    });
+    await acceptBegin(transport);
+    controller.abort();
+    await expect(p).rejects.toThrow(/aborted/);
+    const cancel = transport.sent.find((m) => m[0] === C2S_FS_UPLOAD_CANCEL)!;
+    expect(cancel).toBeDefined();
+    expect(cancel[1] | (cancel[2] << 8)).toBe(9);
     conn.dispose();
   });
 });

@@ -42,6 +42,22 @@ pub const C2S_FS_INDEX: u8 = 0x47;
 /// files — it ranks them last.
 pub const C2S_FS_GREP: u8 = 0x48;
 
+/// Begin a chunked upload into a synced root:
+/// [0x49][nonce:2][sync_id:2][flags:1][base:16][mode:4][size:8][path_len:2][path:N].
+/// `flags` is `FS_UPLOAD_*`; `base` is the CAS precondition with `FS_WRITE`'s
+/// exact semantics; `size` is the total plaintext bytes; `path` is relative
+/// to the sync root with the same %-encoding and traversal validation as
+/// `FS_WRITE`.
+pub const C2S_FS_UPLOAD_BEGIN: u8 = 0x49;
+/// Append one chunk: [0x4A][upload_id:2][offset:8][data:LZ4]. Chunks are
+/// sequential — `offset` must equal the bytes accepted so far.
+pub const C2S_FS_UPLOAD_CHUNK: u8 = 0x4A;
+/// Land the upload: [0x4B][nonce:2][upload_id:2]. Terminates the upload
+/// whatever the outcome.
+pub const C2S_FS_UPLOAD_FINISH: u8 = 0x4B;
+/// Abort the upload: [0x4C][upload_id:2]. No reply.
+pub const C2S_FS_UPLOAD_CANCEL: u8 = 0x4C;
+
 /// Sync accepted or rejected: [0x40][nonce:2][sync_id:2][status:1][detail_len:2][detail:N]
 /// On success detail is the canonical root (UTF-8); on failure a diagnostic.
 pub const S2C_FS_SYNCED: u8 = 0x40;
@@ -65,6 +81,21 @@ pub const S2C_FS_INDEX: u8 = 0x46;
 /// `FILE`/`MATCH` records (docs/design/fs-grep.md). Status is the unified
 /// table (`FS_DONE_*`); `detail` carries a regex compile error on `INVALID`.
 pub const S2C_FS_GREP: u8 = 0x47;
+
+/// Upload begin result:
+/// [0x49][nonce:2][status:1][upload_id:2][hash:16][mtime_ns:8] —
+/// `upload_id` is meaningful only when `status` is `FS_DONE_OK`; `hash`
+/// carries the current on-disk content hash on `CONFLICT` (the `FS_DONE`
+/// convention), zero otherwise.
+pub const S2C_FS_UPLOAD_BEGIN: u8 = 0x49;
+/// Per-chunk acknowledgement (doubles as progress):
+/// [0x4A][upload_id:2][status:1][received:8] — `received` is the cumulative
+/// plaintext bytes accepted; on `OFFSET_MISMATCH` it is the resume point.
+pub const S2C_FS_UPLOAD_CHUNK: u8 = 0x4A;
+/// Upload result: [0x4B][nonce:2][status:1][hash:16][mtime_ns:8] — the
+/// `FS_DONE` payload on success (zeroes otherwise), or the current on-disk
+/// hash on `CONFLICT` (the precondition re-verified at FINISH failed).
+pub const S2C_FS_UPLOAD_FINISH: u8 = 0x4B;
 
 /// `S2C_HELLO` feature bit: server supports the `FS_*` message family,
 /// reads and writes alike (docs/design/fs-watch.md, docs/design/fs-write.md).
@@ -115,6 +146,14 @@ pub const FS_SYNC_EXCLUDE: u16 = 1 << 7;
 /// sources with it. `FS_INDEX` and `FS_GREP` apply both together; a sync
 /// picks.
 pub const FS_SYNC_DOTIGNORE: u16 = 1 << 8;
+/// Resolve the sync root to the connection's drag staging dir instead of
+/// `path` (which the client sends empty): the dir a browser drag-and-drop
+/// pre-uploads its files into before `SURFACE_DRAG_DROP` names them
+/// (docs/protocol.md "Drag and drop"). The server creates the dir on first
+/// use and removes it on connection close — never on `FS_STOP`, since the
+/// staged `file://` URIs must outlive the drop. The staging root belongs to
+/// the connection, so combining with `FROM_PTY` is invalid.
+pub const FS_SYNC_STAGING: u16 = 1 << 9;
 
 /// Bits a `C2S_FS_SYNC` may set; anything else answers with the
 /// unknown-flags refusal.
@@ -126,7 +165,8 @@ pub const FS_SYNC_FLAGS_KNOWN: u16 = FS_SYNC_RECURSIVE
     | FS_SYNC_EXCLUDE_GIT
     | FS_SYNC_GITIGNORE
     | FS_SYNC_EXCLUDE
-    | FS_SYNC_DOTIGNORE;
+    | FS_SYNC_DOTIGNORE
+    | FS_SYNC_STAGING;
 
 /// Every exclusion flag, which is also the set `SINGLE` rejects.
 pub const FS_SYNC_EXCLUSION_FLAGS: u16 =
@@ -136,8 +176,13 @@ pub const FS_SYNC_EXCLUSION_FLAGS: u16 =
 /// file, so `RECURSIVE` contradicts it and the pair is rejected at
 /// validation (docs/design/fs-watch.md "Single-file sync"). The exclusion
 /// flags apply to enumeration, which `SINGLE` does none of, so they are
-/// rejected with it too rather than silently doing nothing.
+/// rejected with it too rather than silently doing nothing. `STAGING`
+/// resolves the root from connection state, so `FROM_PTY`'s pty-relative
+/// root contradicts it — also rejected here.
 pub fn fs_sync_flags_valid(flags: u16) -> bool {
+    if flags & FS_SYNC_STAGING != 0 && flags & FS_SYNC_FROM_PTY != 0 {
+        return false;
+    }
     flags & FS_SYNC_SINGLE == 0 || flags & (FS_SYNC_RECURSIVE | FS_SYNC_EXCLUSION_FLAGS) == 0
 }
 
@@ -229,6 +274,17 @@ pub const FS_GREP_MAX_LINE: usize = 512;
 /// without a round trip. Added in lsp's `10 WARMING` extension style.
 pub const FS_DONE_CONFLICT: u8 = 11;
 
+// Chunked-upload statuses (FS_UPLOAD_*). Family-local allocations per the
+// common status registry (docs/protocol.md), which reserves 128–255 for
+// exactly this: a family the registry does not centralize.
+/// A chunk's `offset` did not equal the bytes accepted so far. The
+/// ack's `received` field carries the resume point.
+pub const FS_DONE_OFFSET_MISMATCH: u8 = 128;
+/// FINISH arrived with `received != size`; the upload is dropped.
+pub const FS_DONE_SIZE_MISMATCH: u8 = 129;
+/// The `upload_id` names no live upload on this connection.
+pub const FS_DONE_UNKNOWN_UPLOAD: u8 = 130;
+
 /// Human-readable name for an `FS_DONE` status code.
 pub fn fs_done_status_text(status: u8) -> &'static str {
     match status {
@@ -240,6 +296,9 @@ pub fn fs_done_status_text(status: u8) -> &'static str {
         FS_DONE_BUDGET => "budget exhausted",
         FS_DONE_INVALID => "invalid request",
         FS_DONE_CONFLICT => "conflict",
+        FS_DONE_OFFSET_MISMATCH => "offset mismatch",
+        FS_DONE_SIZE_MISMATCH => "size mismatch",
+        FS_DONE_UNKNOWN_UPLOAD => "unknown upload",
         _ => "error",
     }
 }
@@ -263,6 +322,22 @@ pub const FS_WRITE_FOLLOW_SYMLINK: u8 = 1 << 3;
 // (docs/design/fs-write.md "Wire"). A client may always send full.
 pub const FS_WRITE_CONTENT_FULL: u8 = 1;
 pub const FS_WRITE_CONTENT_DELTA: u8 = 2;
+
+// FS_UPLOAD_BEGIN flags. Aliases of the FS_WRITE flags — identical bits,
+// identical meanings, so a client moving a write between the one-shot and
+// the chunked path keeps one flag set.
+/// Ignore `base`; unconditional overwrite/create.
+pub const FS_UPLOAD_NO_CAS: u8 = FS_WRITE_NO_CAS;
+/// Create missing parent directories.
+pub const FS_UPLOAD_MKPARENTS: u8 = FS_WRITE_MKPARENTS;
+/// fsync the file and its parent before the FINISH rename lands.
+pub const FS_UPLOAD_DURABLE: u8 = FS_WRITE_DURABLE;
+/// Write through a final-component symlink whose resolved target stays
+/// under the root; default refuses one.
+pub const FS_UPLOAD_FOLLOW_SYMLINK: u8 = FS_WRITE_FOLLOW_SYMLINK;
+/// Bits a `C2S_FS_UPLOAD_BEGIN` may set; anything else answers `INVALID`.
+pub const FS_UPLOAD_FLAGS_KNOWN: u8 =
+    FS_UPLOAD_NO_CAS | FS_UPLOAD_MKPARENTS | FS_UPLOAD_DURABLE | FS_UPLOAD_FOLLOW_SYMLINK;
 
 // FS_OP op selector.
 pub const FS_OP_MKDIR: u8 = 1;
@@ -565,6 +640,21 @@ pub fn msg_fs_sync_from_pty(
     )
 }
 
+/// Build a `C2S_FS_SYNC` rooted at the connection's drag staging dir: sets
+/// `FS_SYNC_STAGING` and sends an empty `path`, which the flag makes the
+/// server ignore (docs/protocol.md "Drag and drop").
+pub fn msg_fs_sync_staging(nonce: u16, flags: u16, latency_ms: u16, inline_max: u32) -> Vec<u8> {
+    msg_fs_sync_full(
+        nonce,
+        flags | FS_SYNC_STAGING,
+        latency_ms,
+        inline_max,
+        "",
+        "",
+        None,
+    )
+}
+
 /// Every `C2S_FS_SYNC` variant, in field order. The optional trailers are
 /// self-describing through their flags — `EXCLUDE` first, `FROM_PTY` last —
 /// which is what lets a parser skip one to reach the other.
@@ -680,6 +770,34 @@ pub fn fs_sync_rebase(msg: &[u8], cwd: &str) -> Option<Vec<u8>> {
         .into_owned();
     Some(msg_fs_sync_full(
         nonce, flags, latency_ms, inline_max, &eff, exclude, None,
+    ))
+}
+
+/// Rebase a `STAGING` `C2S_FS_SYNC` onto the connection's resolved drag
+/// staging dir: `staging` replaces the ignored `path` field and `STAGING`
+/// is cleared, producing a plain path-based sync the handler consumes
+/// unchanged. `None` when the flag is unset, when `FROM_PTY` rides along
+/// (an invalid combination the caller must refuse, not rebase), or when the
+/// message is malformed — like `fs_sync_rebase`, a caller that cannot
+/// resolve must refuse rather than forward: the empty `path` would
+/// otherwise be read as a root. Any exclude field rides along.
+pub fn fs_sync_rebase_staging(msg: &[u8], staging: &str) -> Option<Vec<u8>> {
+    let flags = fs_sync_flags(msg)?;
+    if flags & FS_SYNC_STAGING == 0 || flags & FS_SYNC_FROM_PTY != 0 {
+        return None;
+    }
+    let nonce = u16::from_le_bytes([msg[1], msg[2]]);
+    let latency_ms = u16::from_le_bytes([msg[5], msg[6]]);
+    let inline_max = u32::from_le_bytes([msg[7], msg[8], msg[9], msg[10]]);
+    let exclude = fs_sync_exclude(msg)?;
+    Some(msg_fs_sync_full(
+        nonce,
+        flags & !FS_SYNC_STAGING,
+        latency_ms,
+        inline_max,
+        staging,
+        exclude,
+        None,
     ))
 }
 
@@ -1128,6 +1246,202 @@ pub fn parse_fs_done(msg: &[u8]) -> Option<(u16, u8, u128, u64)> {
     let hash = u128::from_le_bytes(msg[4..20].try_into().unwrap());
     let mtime_ns = u64::from_le_bytes(msg[20..28].try_into().unwrap());
     Some((nonce, status, hash, mtime_ns))
+}
+
+// ---------------------------------------------------------------------------
+// Chunked upload family (docs/protocol.md "Filesystem sync"): begin →
+// sequential chunks → finish, for files too large to fit one FS_WRITE
+// frame. Upload ids are per-connection, allocated by the server.
+// ---------------------------------------------------------------------------
+
+/// An upload begin (`C2S_FS_UPLOAD_BEGIN`). `path` is the escaped wire path
+/// relative to the sync root; `size` the total plaintext bytes. `base` is
+/// the CAS precondition, exactly as `FsWrite::base`: the current on-disk
+/// content hash to match (non-zero), zero for create-exclusive, ignored
+/// under `FS_UPLOAD_NO_CAS`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FsUploadBegin {
+    pub nonce: u16,
+    pub sync_id: u16,
+    pub flags: u8,
+    pub base: u128,
+    pub mode: u32,
+    pub size: u64,
+    pub path: String,
+}
+
+pub fn msg_fs_upload_begin(b: &FsUploadBegin) -> Vec<u8> {
+    let pb = b.path.as_bytes();
+    let mut msg = Vec::with_capacity(36 + pb.len());
+    msg.push(C2S_FS_UPLOAD_BEGIN);
+    msg.extend_from_slice(&b.nonce.to_le_bytes());
+    msg.extend_from_slice(&b.sync_id.to_le_bytes());
+    msg.push(b.flags);
+    msg.extend_from_slice(&b.base.to_le_bytes());
+    msg.extend_from_slice(&b.mode.to_le_bytes());
+    msg.extend_from_slice(&b.size.to_le_bytes());
+    push_str(&mut msg, &b.path);
+    msg
+}
+
+/// Parse a `C2S_FS_UPLOAD_BEGIN`. `None` = malformed or a non-UTF-8 path.
+pub fn parse_fs_upload_begin(msg: &[u8]) -> Option<FsUploadBegin> {
+    // [nonce:2][sync_id:2][flags:1][base:16][mode:4][size:8][path_len:2][path:N]
+    if msg.len() < 36 || msg[0] != C2S_FS_UPLOAD_BEGIN {
+        return None;
+    }
+    let nonce = u16::from_le_bytes([msg[1], msg[2]]);
+    let sync_id = u16::from_le_bytes([msg[3], msg[4]]);
+    let flags = msg[5];
+    let base = u128::from_le_bytes(msg[6..22].try_into().unwrap());
+    let mode = u32::from_le_bytes(msg[22..26].try_into().unwrap());
+    let size = u64::from_le_bytes(msg[26..34].try_into().unwrap());
+    let path_len = u16::from_le_bytes([msg[34], msg[35]]) as usize;
+    let path = std::str::from_utf8(msg.get(36..36 + path_len)?)
+        .ok()?
+        .to_string();
+    Some(FsUploadBegin {
+        nonce,
+        sync_id,
+        flags,
+        base,
+        mode,
+        size,
+        path,
+    })
+}
+
+/// Build a `C2S_FS_UPLOAD_CHUNK`; `data` is the plaintext chunk.
+pub fn msg_fs_upload_chunk(upload_id: u16, offset: u64, data: &[u8]) -> Vec<u8> {
+    let compressed = lz4_flex::compress_prepend_size(data);
+    let mut msg = Vec::with_capacity(11 + compressed.len());
+    msg.push(C2S_FS_UPLOAD_CHUNK);
+    msg.extend_from_slice(&upload_id.to_le_bytes());
+    msg.extend_from_slice(&offset.to_le_bytes());
+    msg.extend_from_slice(&compressed);
+    msg
+}
+
+/// Parse a `C2S_FS_UPLOAD_CHUNK` → `(upload_id, offset, data)`. Applies the
+/// standard decompression guard; `None` = malformed or over-sized.
+pub fn parse_fs_upload_chunk(msg: &[u8]) -> Option<(u16, u64, Vec<u8>)> {
+    // [upload_id:2][offset:8][data:LZ4]
+    if msg.len() < 11 || msg[0] != C2S_FS_UPLOAD_CHUNK {
+        return None;
+    }
+    let upload_id = u16::from_le_bytes([msg[1], msg[2]]);
+    let offset = u64::from_le_bytes(msg[3..11].try_into().unwrap());
+    let data = decompress_guarded(&msg[11..])?;
+    Some((upload_id, offset, data))
+}
+
+pub fn msg_fs_upload_finish(nonce: u16, upload_id: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(5);
+    msg.push(C2S_FS_UPLOAD_FINISH);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.extend_from_slice(&upload_id.to_le_bytes());
+    msg
+}
+
+/// Parse a `C2S_FS_UPLOAD_FINISH` → `(nonce, upload_id)`.
+pub fn parse_fs_upload_finish(msg: &[u8]) -> Option<(u16, u16)> {
+    if msg.len() < 5 || msg[0] != C2S_FS_UPLOAD_FINISH {
+        return None;
+    }
+    Some((
+        u16::from_le_bytes([msg[1], msg[2]]),
+        u16::from_le_bytes([msg[3], msg[4]]),
+    ))
+}
+
+pub fn msg_fs_upload_cancel(upload_id: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(3);
+    msg.push(C2S_FS_UPLOAD_CANCEL);
+    msg.extend_from_slice(&upload_id.to_le_bytes());
+    msg
+}
+
+/// Build an `S2C_FS_UPLOAD_BEGIN` result. On `CONFLICT`, `hash` is the
+/// current on-disk content hash (the `FS_DONE` convention); both stat
+/// fields are zero otherwise.
+pub fn msg_fs_upload_begin_result(
+    nonce: u16,
+    status: u8,
+    upload_id: u16,
+    hash: u128,
+    mtime_ns: u64,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(30);
+    msg.push(S2C_FS_UPLOAD_BEGIN);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.push(status);
+    msg.extend_from_slice(&upload_id.to_le_bytes());
+    msg.extend_from_slice(&hash.to_le_bytes());
+    msg.extend_from_slice(&mtime_ns.to_le_bytes());
+    msg
+}
+
+/// Parse an `S2C_FS_UPLOAD_BEGIN` → `(nonce, status, upload_id, hash, mtime_ns)`.
+pub fn parse_fs_upload_begin_result(msg: &[u8]) -> Option<(u16, u8, u16, u128, u64)> {
+    if msg.len() < 30 || msg[0] != S2C_FS_UPLOAD_BEGIN {
+        return None;
+    }
+    Some((
+        u16::from_le_bytes([msg[1], msg[2]]),
+        msg[3],
+        u16::from_le_bytes([msg[4], msg[5]]),
+        u128::from_le_bytes(msg[6..22].try_into().unwrap()),
+        u64::from_le_bytes(msg[22..30].try_into().unwrap()),
+    ))
+}
+
+/// Build an `S2C_FS_UPLOAD_CHUNK` acknowledgement.
+pub fn msg_fs_upload_chunk_result(upload_id: u16, status: u8, received: u64) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(12);
+    msg.push(S2C_FS_UPLOAD_CHUNK);
+    msg.extend_from_slice(&upload_id.to_le_bytes());
+    msg.push(status);
+    msg.extend_from_slice(&received.to_le_bytes());
+    msg
+}
+
+/// Parse an `S2C_FS_UPLOAD_CHUNK` → `(upload_id, status, received)`.
+pub fn parse_fs_upload_chunk_result(msg: &[u8]) -> Option<(u16, u8, u64)> {
+    if msg.len() < 12 || msg[0] != S2C_FS_UPLOAD_CHUNK {
+        return None;
+    }
+    Some((
+        u16::from_le_bytes([msg[1], msg[2]]),
+        msg[3],
+        u64::from_le_bytes(msg[4..12].try_into().unwrap()),
+    ))
+}
+
+/// Build an `S2C_FS_UPLOAD_FINISH` result. On success `hash`/`mtime_ns` are
+/// the post-rename stat, exactly as `FS_DONE` carries for a write; on
+/// `CONFLICT` (the FINISH-time precondition re-verification failed),
+/// `hash` is the current on-disk hash.
+pub fn msg_fs_upload_finish_result(nonce: u16, status: u8, hash: u128, mtime_ns: u64) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(28);
+    msg.push(S2C_FS_UPLOAD_FINISH);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.push(status);
+    msg.extend_from_slice(&hash.to_le_bytes());
+    msg.extend_from_slice(&mtime_ns.to_le_bytes());
+    msg
+}
+
+/// Parse an `S2C_FS_UPLOAD_FINISH` → `(nonce, status, hash, mtime_ns)`.
+pub fn parse_fs_upload_finish_result(msg: &[u8]) -> Option<(u16, u8, u128, u64)> {
+    if msg.len() < 28 || msg[0] != S2C_FS_UPLOAD_FINISH {
+        return None;
+    }
+    Some((
+        u16::from_le_bytes([msg[1], msg[2]]),
+        msg[3],
+        u128::from_le_bytes(msg[4..20].try_into().unwrap()),
+        u64::from_le_bytes(msg[20..28].try_into().unwrap()),
+    ))
 }
 
 /// The complete client obligation: apply updates, read `live`.
@@ -1868,6 +2182,56 @@ mod tests {
         }
     }
 
+    /// A staging sync roots at the connection's drag staging dir: the flag
+    /// is known, the rebase swaps the empty client path for the resolved
+    /// dir and clears the flag, and `FROM_PTY` contradicts it at both
+    /// levels — flag validation and the rebase itself.
+    #[test]
+    fn staging_sync_rebases_onto_the_staging_dir() {
+        assert_ne!(FS_SYNC_FLAGS_KNOWN & FS_SYNC_STAGING, 0);
+        assert!(fs_sync_flags_valid(FS_SYNC_STAGING | FS_SYNC_RECURSIVE));
+        assert!(!fs_sync_flags_valid(FS_SYNC_STAGING | FS_SYNC_FROM_PTY));
+
+        let m = msg_fs_sync_staging(9, FS_SYNC_RECURSIVE, 0, 0);
+        assert_eq!(
+            fs_sync_flags(&m).unwrap(),
+            FS_SYNC_STAGING | FS_SYNC_RECURSIVE
+        );
+        let plen = u16::from_le_bytes([m[11], m[12]]) as usize;
+        assert_eq!(plen, 0, "the client sends an empty path");
+
+        let reb = fs_sync_rebase_staging(&m, "/tmp/blit_drag_1_2").expect("staging rebase");
+        assert_eq!(fs_sync_flags(&reb).unwrap(), FS_SYNC_RECURSIVE);
+        let plen = u16::from_le_bytes([reb[11], reb[12]]) as usize;
+        assert_eq!(
+            std::str::from_utf8(&reb[FS_SYNC_HEADER..FS_SYNC_HEADER + plen]).unwrap(),
+            "/tmp/blit_drag_1_2"
+        );
+        assert_eq!(
+            u16::from_le_bytes([reb[1], reb[2]]),
+            9,
+            "the nonce survives"
+        );
+
+        // No flag, no rebase; FROM_PTY is refused, not rebased.
+        assert_eq!(
+            fs_sync_rebase_staging(&msg_fs_sync(9, FS_SYNC_RECURSIVE, 0, 0, ""), "/tmp/x"),
+            None
+        );
+        assert_eq!(
+            fs_sync_rebase_staging(
+                &msg_fs_sync_full(9, FS_SYNC_STAGING, 0, 0, "", "", Some(3)),
+                "/tmp/x"
+            ),
+            None
+        );
+        // A truncated message is malformed, not a staging sync.
+        assert_eq!(
+            fs_sync_rebase_staging(&m[..FS_SYNC_HEADER - 1], "/tmp/x"),
+            None
+        );
+    }
+
     fn upsert(path: &str, content: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         append_fs_record(
@@ -2215,6 +2579,112 @@ mod tests {
         // CONFLICT carries the current disk hash.
         let c = msg_fs_done(6, FS_DONE_CONFLICT, hash, 0);
         assert_eq!(parse_fs_done(&c), Some((6, FS_DONE_CONFLICT, hash, 0)));
+    }
+
+    #[test]
+    fn fs_upload_roundtrips() {
+        let b = FsUploadBegin {
+            nonce: 7,
+            sync_id: 3,
+            flags: FS_UPLOAD_MKPARENTS | FS_UPLOAD_DURABLE,
+            base: 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef,
+            mode: 0o644,
+            size: 1_000_000_001,
+            path: "dir/big.bin".to_string(),
+        };
+        assert_eq!(parse_fs_upload_begin(&msg_fs_upload_begin(&b)), Some(b));
+        assert_eq!(parse_fs_upload_begin(&[C2S_FS_UPLOAD_BEGIN, 0, 0]), None);
+
+        assert_eq!(
+            parse_fs_upload_chunk(&msg_fs_upload_chunk(9, 4096, b"chunk-data")),
+            Some((9, 4096, b"chunk-data".to_vec()))
+        );
+        // An empty chunk (a zero-length final flush) round-trips too.
+        assert_eq!(
+            parse_fs_upload_chunk(&msg_fs_upload_chunk(9, 0, b"")),
+            Some((9, 0, Vec::new()))
+        );
+        assert_eq!(parse_fs_upload_chunk(&[C2S_FS_UPLOAD_CHUNK, 0]), None);
+        // The decompression guard applies to chunk data.
+        let mut forged = vec![C2S_FS_UPLOAD_CHUNK];
+        forged.extend_from_slice(&1u16.to_le_bytes());
+        forged.extend_from_slice(&0u64.to_le_bytes());
+        forged.extend_from_slice(&(1u32 << 30).to_le_bytes());
+        forged.extend_from_slice(&[0u8; 8]);
+        assert_eq!(parse_fs_upload_chunk(&forged), None);
+
+        assert_eq!(
+            parse_fs_upload_finish(&msg_fs_upload_finish(5, 9)),
+            Some((5, 9))
+        );
+        assert_eq!(parse_fs_upload_finish(&[C2S_FS_UPLOAD_FINISH, 0]), None);
+        assert_eq!(msg_fs_upload_cancel(9), vec![C2S_FS_UPLOAD_CANCEL, 9, 0]);
+
+        let hash = 0xdead_beef_dead_beef_dead_beef_dead_beefu128;
+        assert_eq!(
+            parse_fs_upload_begin_result(&msg_fs_upload_begin_result(
+                7,
+                FS_DONE_CONFLICT,
+                9,
+                hash,
+                0
+            )),
+            Some((7, FS_DONE_CONFLICT, 9, hash, 0))
+        );
+        assert_eq!(
+            parse_fs_upload_chunk_result(&msg_fs_upload_chunk_result(
+                9,
+                FS_DONE_OFFSET_MISMATCH,
+                4096
+            )),
+            Some((9, FS_DONE_OFFSET_MISMATCH, 4096))
+        );
+        assert_eq!(
+            parse_fs_upload_finish_result(&msg_fs_upload_finish_result(
+                5,
+                FS_DONE_OK,
+                hash,
+                1_700_000_000_000_000_000
+            )),
+            Some((5, FS_DONE_OK, hash, 1_700_000_000_000_000_000))
+        );
+    }
+
+    #[test]
+    fn fs_upload_byte_fixtures() {
+        // Pinned bytes, same discipline as fs_write_family_byte_fixtures.
+        // The u64 size/offset fixture value keeps its significant bits under
+        // 2^53 so the JavaScript fixtures (js/core/src/__tests__/fs.test.ts,
+        // where wire sizes are `number`) pin the identical bytes.
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let b = FsUploadBegin {
+            nonce: 0x0102,
+            sync_id: 0x0304,
+            flags: FS_UPLOAD_MKPARENTS,
+            base: 0,
+            mode: 0o644,
+            size: 0x0102_0304_0506_0000,
+            path: "a/b.txt".into(),
+        };
+        assert_eq!(
+            hex(&msg_fs_upload_begin(&b)),
+            "49020104030200000000000000000000000000000000a401000000000605040302010700612f622e747874"
+        );
+        assert_eq!(hex(&msg_fs_upload_finish(0x0102, 0x0506)), "4b02010605");
+        assert_eq!(
+            hex(&msg_fs_upload_begin_result(
+                0x0102, FS_DONE_OK, 0x0506, 0, 0
+            )),
+            "490201000605000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            hex(&msg_fs_upload_chunk_result(
+                0x0506,
+                FS_DONE_OK,
+                0x0102_0304_0506_0000
+            )),
+            "4a0605000000060504030201"
+        );
     }
 
     #[test]

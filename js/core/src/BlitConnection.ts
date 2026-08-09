@@ -24,6 +24,7 @@ import {
   S2C_AUDIO_FRAME,
   PROTOCOL_VERSION,
   S2C_CLIPBOARD_CONTENT,
+  S2C_CLIPBOARD_OWNER,
   S2C_CLOSED,
   S2C_CREATED,
   S2C_CREATED_N,
@@ -78,6 +79,12 @@ import {
   buildSurfacePreeditMessage,
   buildSurfaceTextMessage,
   buildSurfacePointerMessage,
+  buildSurfaceDragEnterMessage,
+  buildSurfaceDragMotionMessage,
+  buildSurfaceDragLeaveMessage,
+  buildSurfaceDragDropMessage,
+  buildSurfaceDragCancelMessage,
+  type SurfaceDragItem,
   buildSurfaceAxisMessage,
   buildSurfaceAxis2Message,
   type SurfaceAxisEvent,
@@ -108,6 +115,7 @@ import {
   FS_CLOSED_CONNECTION_LOST,
   FS_DONE_CONFLICT,
   FS_DONE_INVALID,
+  FS_DONE_OFFSET_MISMATCH,
   FS_DONE_OK,
   FS_FILE_OK,
   FS_OP_HARDLINK,
@@ -125,11 +133,15 @@ import {
   FS_SYNC_GITIGNORE,
   FS_SYNC_RECURSIVE,
   FS_SYNC_SINGLE,
+  FS_SYNC_STAGING,
   FS_WRITE_CONTENT_DELTA,
   FS_WRITE_CONTENT_FULL,
   FS_WRITE_DURABLE,
   FS_WRITE_MKPARENTS,
   FS_WRITE_NO_CAS,
+  FS_UPLOAD_DURABLE,
+  FS_UPLOAD_MKPARENTS,
+  FS_UPLOAD_NO_CAS,
   FS_UPDATE_RESET,
   FS_UPDATE_SYNC,
   FsMirror,
@@ -141,6 +153,9 @@ import {
   S2C_FS_SYNCED,
   S2C_FS_UPDATE,
   S2C_FS_DONE,
+  S2C_FS_UPLOAD_BEGIN,
+  S2C_FS_UPLOAD_CHUNK,
+  S2C_FS_UPLOAD_FINISH,
   buildFsAckMessage,
   buildFsFetchMessage,
   buildFsIndexMessage,
@@ -148,6 +163,10 @@ import {
   buildFsOpMessage,
   buildFsStopMessage,
   buildFsSyncMessage,
+  buildFsUploadBeginMessage,
+  buildFsUploadCancelMessage,
+  buildFsUploadChunkMessage,
+  buildFsUploadFinishMessage,
   buildFsWriteMessage,
   parseFsIndexResult,
   buildFsGrepMessage,
@@ -159,6 +178,9 @@ import {
   fsFileStatusText,
   parseFsDoneMessage,
   parseFsFileMessage,
+  parseFsUploadBeginReply,
+  parseFsUploadChunkAck,
+  parseFsUploadFinishReply,
   encodeFsDelta,
   FS_MAX_DECOMPRESSED,
   FsConflictError,
@@ -170,6 +192,8 @@ import {
   type FsRecord,
   type FsSyncHandle,
   type FsSyncOptions,
+  type FsUploadOptions,
+  type FsUploadResult,
   type FsWriteOptions,
   type FsWriteResult,
 } from "./fs";
@@ -457,6 +481,16 @@ function connectionError(message: string): Error {
   return new Error(message);
 }
 
+/** Unacked upload bytes allowed on the wire at once. Kept small on purpose:
+ *  C2S has no flow control, so every queued upload byte sits ahead of
+ *  interactive input (keyboard/mouse) sharing this connection — a multi-MiB
+ *  backlog makes the terminal hang for seconds on a slow uplink. */
+const FS_UPLOAD_MAX_IN_FLIGHT = 512 * 1024;
+/** Default plaintext bytes per upload chunk: small enough that the in-flight
+ *  cap above holds only a couple of chunks, and still far under the 16 MiB
+ *  transport frame cap after compression. */
+const FS_UPLOAD_DEFAULT_CHUNK = 256 * 1024;
+
 function isLiveSession(session: InternalSession): boolean {
   return (
     session.state === "creating" ||
@@ -582,6 +616,34 @@ export class BlitConnection {
       onInvalid?: () => void;
     }
   >();
+  /** Unanswered `C2S_FS_UPLOAD_BEGIN`s by nonce. */
+  private readonly pendingFsUploadBegins = new Map<
+    number,
+    {
+      resolve: (uploadId: number) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  /** Live chunked uploads by server `upload_id`; `ack` is driven by each
+   *  `S2C_FS_UPLOAD_CHUNK` reply. */
+  private readonly pendingFsUploads = new Map<
+    number,
+    {
+      ack: (status: number, received: number) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  /** Unanswered `C2S_FS_UPLOAD_FINISH`es by nonce. */
+  private readonly pendingFsUploadFinishes = new Map<
+    number,
+    {
+      resolve: (result: FsUploadResult) => void;
+      reject: (error: Error) => void;
+      /** As `pendingFsWrites.record`: a successful commit records the hash
+       *  in the issuing consumer's `lastWritten`. */
+      record?: { consumer: FsSyncConsumer; path: string };
+    }
+  >();
   private readonly pendingKvOpens = new Map<
     number,
     {
@@ -693,6 +755,10 @@ export class BlitConnection {
   private retryCount = 0;
   private generation = 0;
   private lastError: string | null = null;
+  /** Clipboard authority learned from the compositor.  `null` means the
+   *  browser may have acquired a newer clipboard while this page was not
+   *  authoritative, so the next paste must import it before pressing V. */
+  private waylandClipboardOwned: boolean | null = null;
 
   /** Default video bandwidth for new surface subscriptions (0 = server default). */
   defaultSurfaceBandwidth = 0;
@@ -1276,6 +1342,13 @@ export class BlitConnection {
         "A single-file sync cannot be recursive (docs/design/fs-watch.md)",
       );
     }
+    // A staging sync is rooted at the connection's drag staging dir, which
+    // no pty cwd can name — the server refuses the pair, so say so here.
+    if (options.staging && options.fromSessionId) {
+      throw connectionError(
+        "A staging sync cannot be resolved from a terminal's cwd",
+      );
+    }
     // Exclusion narrows enumeration and a single-file sync enumerates
     // nothing; the server refuses the pair, so say so here rather than
     // spend a round trip on it.
@@ -1304,13 +1377,17 @@ export class BlitConnection {
     if (options.ignore || options.gitignore) flags |= FS_SYNC_GITIGNORE;
     if (options.ignore || options.dotIgnore) flags |= FS_SYNC_DOTIGNORE;
     if (options.ignore || options.excludeGit) flags |= FS_SYNC_EXCLUDE_GIT;
+    if (options.staging) flags |= FS_SYNC_STAGING;
     const srcPtyId = this.srcPtyForOpen(options.fromSessionId);
     const latencyMs = options.latencyMs ?? 0;
     const inlineMax = options.inlineMax ?? 0;
+    // A staging sync's root is the connection's drag staging dir — the
+    // path field is ignored and goes out empty.
+    const syncPath = options.staging ? "" : path;
     // The pattern list is part of what the sync *is* — two opens that
     // exclude different things mirror different trees — so it joins the
     // coalescing key alongside the flags.
-    const key = `${flags}:${latencyMs}:${inlineMax}:${srcPtyId ?? ""}:${exclude.length}:${exclude}${path}`;
+    const key = `${flags}:${latencyMs}:${inlineMax}:${srcPtyId ?? ""}:${exclude.length}:${exclude}${syncPath}`;
     const share = this.fsSyncsByKey.get(key);
     if (share) {
       return this.joinFsShare(share, options);
@@ -1335,7 +1412,7 @@ export class BlitConnection {
           flags,
           latencyMs,
           inlineMax,
-          path,
+          syncPath,
           srcPtyId,
           exclude,
         ),
@@ -1459,6 +1536,8 @@ export class BlitConnection {
       fetch: (path: string) => this.fsFetch(syncId, path),
       writeFile: (path, data, options = {}) =>
         this.fsWrite(syncId, consumer, path, data, options),
+      upload: (path, data, opts = {}) =>
+        this.fsUpload(syncId, consumer, path, data, opts),
       mkdir: (path, options = {}) =>
         this.fsOp(
           syncId,
@@ -1828,6 +1907,44 @@ export class BlitConnection {
     data: Uint8Array,
     options: FsWriteOptions,
   ): Promise<FsWriteResult> {
+    // A delta applies against the exact bytes the CAS precondition
+    // names (docs/design/fs-write.md content_kind 2), so it demands a
+    // real nonzero-hash anchor: no `force`, no create-exclusive, no
+    // unconditional write.
+    if (
+      options.deltaBase !== undefined &&
+      (options.force || options.ifHash === undefined || options.ifHash === 0n)
+    ) {
+      return Promise.reject(
+        connectionError(
+          "deltaBase requires a nonzero ifHash precondition (without force)",
+        ),
+      );
+    }
+    // Decide the encoding before routing: delta ops go out only when
+    // clearly smaller than the full content (the server's own heuristic,
+    // crates/fssync/src/lib.rs), which keeps them far under the frame cap.
+    let deltaOps: Uint8Array | undefined;
+    if (options.deltaBase !== undefined) {
+      const ops = encodeFsDelta(options.deltaBase, data);
+      if (ops.length * 8 < data.length * 7) deltaOps = ops;
+    }
+    // Every full-content write rides the chunked-upload pump — preconditions
+    // included, the upload family carries FS_WRITE's base semantics. We care
+    // about interactive latency above per-write round trips: a paced stream
+    // of small chunks can never queue ahead of keyboard/mouse input on this
+    // connection, however big the write. Delta frames are small by
+    // construction and stay on FS_WRITE.
+    if (deltaOps === undefined) {
+      return this.fsUpload(syncId, consumer, path, data, {
+        mode: options.mode,
+        createParents: options.createParents,
+        durable: options.durable,
+        ifHash: options.ifHash,
+        create: options.create,
+        force: options.force,
+      }).then((r) => ({ hash: r.hashU128, mtimeNs: r.mtimeNs }));
+    }
     return new Promise<FsWriteResult>((resolve, reject) => {
       if (!this.fsSyncs.has(syncId)) {
         reject(connectionError("Sync is closed"));
@@ -1847,21 +1964,6 @@ export class BlitConnection {
         base = options.ifHash;
       } else {
         flags |= FS_WRITE_NO_CAS;
-      }
-      // A delta applies against the exact bytes the CAS precondition
-      // names (docs/design/fs-write.md content_kind 2), so it demands a
-      // real nonzero-hash anchor: no `force`, no create-exclusive, no
-      // unconditional write.
-      if (
-        options.deltaBase !== undefined &&
-        (options.force || options.ifHash === undefined || options.ifHash === 0n)
-      ) {
-        reject(
-          connectionError(
-            "deltaBase requires a nonzero ifHash precondition (without force)",
-          ),
-        );
-        return;
       }
       const send = (
         contentKind: number,
@@ -1890,22 +1992,193 @@ export class BlitConnection {
           }),
         );
       };
-      if (options.deltaBase !== undefined) {
-        const ops = encodeFsDelta(options.deltaBase, data);
-        // The server's own worthwhile heuristic (crates/fssync/src/lib.rs):
-        // send the delta only when clearly smaller than the full content.
-        if (ops.length * 8 < data.length * 7) {
-          // A pre-delta server answers INVALID for content_kind 2: retry
-          // once as a full write with the same precondition, surfacing
-          // only the retry's outcome. (CONFLICT is a real CAS failure
-          // and never retries.)
-          send(FS_WRITE_CONTENT_DELTA, ops, () =>
-            send(FS_WRITE_CONTENT_FULL, data),
-          );
+      if (deltaOps !== undefined) {
+        // A pre-delta server answers INVALID for content_kind 2: retry
+        // once as a full write with the same precondition, surfacing
+        // only the retry's outcome. (CONFLICT is a real CAS failure
+        // and never retries.)
+        send(FS_WRITE_CONTENT_DELTA, deltaOps, () =>
+          send(FS_WRITE_CONTENT_FULL, data),
+        );
+      }
+    });
+  }
+
+  /**
+   * Chunked upload (the `FS_UPLOAD_*` family): BEGIN, a pipelined run of
+   * CHUNKs acked cumulatively, FINISH. `data` may be a `Blob`, read slice
+   * by slice so the whole file is never in memory at once.
+   */
+  private fsUpload(
+    syncId: number,
+    consumer: FsSyncConsumer,
+    path: string,
+    data: Uint8Array | Blob,
+    options: FsUploadOptions,
+  ): Promise<FsUploadResult> {
+    return new Promise<FsUploadResult>((resolve, reject) => {
+      if (!this.fsSyncs.has(syncId)) {
+        reject(connectionError("Sync is closed"));
+        return;
+      }
+      const total = data instanceof Blob ? data.size : data.length;
+      const chunkSize = options.chunkSize ?? FS_UPLOAD_DEFAULT_CHUNK;
+      if (!Number.isInteger(chunkSize) || chunkSize <= 0) {
+        reject(connectionError("chunkSize must be a positive integer"));
+        return;
+      }
+      const signal = options.signal;
+      if (signal?.aborted) {
+        reject(connectionError("Upload aborted"));
+        return;
+      }
+      let flags = 0;
+      if (options.createParents) flags |= FS_UPLOAD_MKPARENTS;
+      if (options.durable) flags |= FS_UPLOAD_DURABLE;
+      // Precondition, mirroring fsWrite: create-exclusive (base 0), CAS
+      // (base = ifHash), or — by default or under force — an unconditional
+      // overwrite. Checked at BEGIN and re-verified at FINISH.
+      let base = 0n;
+      if (options.force) {
+        flags |= FS_UPLOAD_NO_CAS;
+      } else if (options.create) {
+        base = 0n;
+      } else if (options.ifHash !== undefined) {
+        base = options.ifHash;
+      } else {
+        flags |= FS_UPLOAD_NO_CAS;
+      }
+
+      let settled = false;
+      const fail = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        if (uploadId >= 0) this.pendingFsUploads.delete(uploadId);
+        signal?.removeEventListener("abort", onAbort);
+        reject(error);
+      };
+      const done = (result: FsUploadResult): void => {
+        if (settled) return;
+        settled = true;
+        if (uploadId >= 0) this.pendingFsUploads.delete(uploadId);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(result);
+      };
+
+      // Chunk-pump state, valid once BEGIN is accepted.
+      let uploadId = -1;
+      let sent = 0; // next plaintext offset to send
+      let inFlightBytes = 0; // unacked plaintext bytes on the wire
+      const inFlightLens: number[] = []; // FIFO of unacked chunk lengths
+      let generation = 0; // bumped on a rewind so stale async reads drop out
+      let finishing = false;
+      const sliceAt = async (
+        offset: number,
+        length: number,
+      ): Promise<Uint8Array> =>
+        data instanceof Blob
+          ? new Uint8Array(
+              await data.slice(offset, offset + length).arrayBuffer(),
+            )
+          : data.subarray(offset, offset + length);
+      const finish = (): void => {
+        if (finishing) return;
+        finishing = true;
+        const nonce = this.nextFsNonce(this.pendingFsUploadFinishes);
+        this.pendingFsUploadFinishes.set(nonce, {
+          resolve: done,
+          reject: fail,
+          record: { consumer, path },
+        });
+        this.transport.send(buildFsUploadFinishMessage(nonce, uploadId));
+      };
+      const kick = (): void => {
+        while (
+          !settled &&
+          !finishing &&
+          inFlightBytes < FS_UPLOAD_MAX_IN_FLIGHT &&
+          sent < total
+        ) {
+          const offset = sent;
+          const length = Math.min(chunkSize, total - sent);
+          const gen = generation;
+          sent += length;
+          inFlightBytes += length;
+          inFlightLens.push(length);
+          void sliceAt(offset, length).then((bytes) => {
+            // A rewind (OFFSET_MISMATCH) or abort while the slice was being
+            // read makes this chunk stale; it must not hit the wire.
+            if (gen !== generation || settled) return;
+            this.transport.send(
+              buildFsUploadChunkMessage(uploadId, offset, bytes),
+            );
+          });
+        }
+        if (!settled && sent >= total && inFlightBytes === 0) {
+          // total 0 never enters the loop; every byte acked ends here too.
+          finish();
+        }
+      };
+      const ack = (status: number, received: number): void => {
+        if (settled || finishing) return;
+        if (status === FS_DONE_OFFSET_MISMATCH) {
+          // Resend from the server's resume point; in-order transports mean
+          // the acks already in flight belong to chunks past that point and
+          // their duplicate mismatches converge on the same offset.
+          generation++;
+          sent = received;
+          inFlightBytes = 0;
+          inFlightLens.length = 0;
+          kick();
           return;
         }
-      }
-      send(FS_WRITE_CONTENT_FULL, data);
+        if (status !== FS_DONE_OK) {
+          fail(connectionError(`Upload failed: ${fsDoneStatusText(status)}`));
+          return;
+        }
+        inFlightBytes -= inFlightLens.shift() ?? 0;
+        options.onProgress?.(received, total);
+        kick();
+      };
+      const onAbort = (): void => {
+        if (uploadId >= 0 && this.transport.status === "connected") {
+          this.transport.send(buildFsUploadCancelMessage(uploadId));
+        }
+        fail(connectionError("Upload aborted"));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+
+      const nonce = this.nextFsNonce(this.pendingFsUploadBegins);
+      this.pendingFsUploadBegins.set(nonce, {
+        resolve: (id) => {
+          if (settled) {
+            // Aborted while BEGIN was in flight: the server now holds an
+            // upload it must be told to drop.
+            if (this.transport.status === "connected") {
+              this.transport.send(buildFsUploadCancelMessage(id));
+            }
+            return;
+          }
+          uploadId = id;
+          this.pendingFsUploads.set(id, {
+            ack,
+            reject: fail,
+          });
+          kick();
+        },
+        reject: fail,
+      });
+      this.transport.send(
+        buildFsUploadBeginMessage({
+          nonce,
+          syncId,
+          flags,
+          base,
+          mode: options.mode ?? 0,
+          size: total,
+          path,
+        }),
+      );
     });
   }
 
@@ -2651,6 +2924,18 @@ export class BlitConnection {
       pending.reject(error);
     }
     this.pendingFsWrites.clear();
+    for (const pending of this.pendingFsUploadBegins.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsUploadBegins.clear();
+    for (const pending of this.pendingFsUploads.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsUploads.clear();
+    for (const pending of this.pendingFsUploadFinishes.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsUploadFinishes.clear();
     const shares = [...this.fsSyncs.values()];
     this.fsSyncs.clear();
     this.fsSyncsByKey.clear();
@@ -2864,6 +3149,44 @@ export class BlitConnection {
     this.transport.send(
       buildSurfacePointerMessage(surfaceId, type, button, x, y),
     );
+  }
+
+  sendSurfaceDragEnter(
+    surfaceId: number,
+    x: number,
+    y: number,
+    mimes: string[],
+    items?: string[],
+  ): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(
+      buildSurfaceDragEnterMessage(surfaceId, x, y, mimes, items),
+    );
+  }
+
+  sendSurfaceDragMotion(surfaceId: number, x: number, y: number): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(buildSurfaceDragMotionMessage(surfaceId, x, y));
+  }
+
+  sendSurfaceDragLeave(surfaceId: number): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(buildSurfaceDragLeaveMessage(surfaceId));
+  }
+
+  sendSurfaceDragDrop(
+    surfaceId: number,
+    x: number,
+    y: number,
+    items: SurfaceDragItem[],
+  ): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(buildSurfaceDragDropMessage(surfaceId, x, y, items));
+  }
+
+  sendSurfaceDragCancel(): void {
+    if (this.transport.status !== "connected") return;
+    this.transport.send(buildSurfaceDragCancelMessage());
   }
 
   sendSurfaceAxis(surfaceId: number, axis: number, valueX100: number): void {
@@ -3329,7 +3652,22 @@ export class BlitConnection {
 
   sendClipboard(mimeType: string, data: Uint8Array): void {
     if (this.transport.status !== "connected") return;
+    this.waylandClipboardOwned = false;
     this.transport.send(buildClipboardMessage(mimeType, data));
+  }
+
+  /** True when Ctrl/Cmd+V must preserve the compositor's current selection.
+   *  A Wayland-owned selection can carry several representations and is
+   *  spliced directly from its source to the destination client. */
+  usesWaylandClipboard(): boolean {
+    return this.waylandClipboardOwned === true;
+  }
+
+  /** The page lost clipboard authority (window/tab loss, or a real DOM
+   *  copy/cut).  The next paste probes the browser clipboard and publishes
+   *  it to the compositor before forwarding V. */
+  noteBrowserClipboardMayHaveChanged(): void {
+    this.waylandClipboardOwned = null;
   }
 
   /**
@@ -3923,6 +4261,11 @@ export class BlitConnection {
         } catch {}
         return;
       }
+      case S2C_CLIPBOARD_OWNER: {
+        if (bytes.length !== 2 || bytes[1] > 1) return;
+        this.waylandClipboardOwned = bytes[1] !== 0;
+        return;
+      }
       case S2C_TEXT: {
         if (bytes.length < 13) return;
         const nonce = bytes[1] | (bytes[2] << 8);
@@ -4181,6 +4524,68 @@ export class BlitConnection {
         } else {
           pending.reject(
             connectionError(`Write failed: ${fsDoneStatusText(parsed.status)}`),
+          );
+        }
+        return;
+      }
+      case S2C_FS_UPLOAD_BEGIN: {
+        const parsed = parseFsUploadBeginReply(bytes);
+        if (!parsed) return;
+        const pending = this.pendingFsUploadBegins.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingFsUploadBegins.delete(parsed.nonce);
+        if (parsed.status === FS_DONE_OK) {
+          pending.resolve(parsed.uploadId);
+        } else if (parsed.status === FS_DONE_CONFLICT) {
+          // Same conflict shape as fs writes: `hash` carries the current
+          // on-disk hash so the caller rebases without a round trip.
+          pending.reject(new FsConflictError(parsed.hash));
+        } else {
+          pending.reject(
+            connectionError(
+              `Upload failed: ${fsDoneStatusText(parsed.status)}`,
+            ),
+          );
+        }
+        return;
+      }
+      case S2C_FS_UPLOAD_CHUNK: {
+        const parsed = parseFsUploadChunkAck(bytes);
+        if (!parsed) return;
+        this.pendingFsUploads
+          .get(parsed.uploadId)
+          ?.ack(parsed.status, parsed.received);
+        return;
+      }
+      case S2C_FS_UPLOAD_FINISH: {
+        const parsed = parseFsUploadFinishReply(bytes);
+        if (!parsed) return;
+        const pending = this.pendingFsUploadFinishes.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingFsUploadFinishes.delete(parsed.nonce);
+        if (parsed.status === FS_DONE_OK) {
+          // Record the hash for self-echo suppression, as `fsWrite` does.
+          if (pending.record) {
+            pending.record.consumer.lastWritten.set(
+              pending.record.path,
+              parsed.hash,
+            );
+          }
+          pending.resolve({
+            hash: parsed.hashBytes,
+            hashU128: parsed.hash,
+            mtime: Number(parsed.mtimeNs),
+            mtimeNs: parsed.mtimeNs,
+          });
+        } else if (parsed.status === FS_DONE_CONFLICT) {
+          // The precondition held at BEGIN but the file changed during the
+          // upload; same conflict shape as fs writes.
+          pending.reject(new FsConflictError(parsed.hash));
+        } else {
+          pending.reject(
+            connectionError(
+              `Upload failed: ${fsDoneStatusText(parsed.status)}`,
+            ),
           );
         }
         return;
@@ -4554,6 +4959,7 @@ export class BlitConnection {
       status === "closed" ||
       status === "error"
     ) {
+      this.waylandClipboardOwned = null;
       if (this.pingTimer !== null) {
         clearInterval(this.pingTimer);
         this.pingTimer = null;

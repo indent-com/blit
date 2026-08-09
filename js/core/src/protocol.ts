@@ -37,6 +37,11 @@ import {
   C2S_CLIENT_FEATURES,
   C2S_SURFACE_PREEDIT,
   C2S_SURFACE_TEXT,
+  C2S_SURFACE_DRAG_ENTER,
+  C2S_SURFACE_DRAG_MOTION,
+  C2S_SURFACE_DRAG_LEAVE,
+  C2S_SURFACE_DRAG_DROP,
+  C2S_SURFACE_DRAG_CANCEL,
   C2S_AUDIO_SUBSCRIBE,
   C2S_AUDIO_UNSUBSCRIBE,
   CREATE2_HAS_SRC_PTY,
@@ -476,6 +481,139 @@ export function buildSurfacePointerMessage(
   msg[7] = y & 0xff;
   msg[8] = (y >> 8) & 0xff;
   return msg;
+}
+
+/** One dropped payload: the bytes, the MIME they are offered under, and
+ *  the file name when the drag source had one. */
+export interface SurfaceDragItem {
+  mime: string;
+  name: string;
+  data: Uint8Array;
+}
+
+/** Drag session messages mirror C2S_SURFACE_POINTER's field encoding:
+ *  surface_id, x and y are little-endian u16.  An ENTER may carry an
+ *  optional item trailer — `[item_count:2]` then per item
+ *  `[mime_len:2][mime]`, one MIME per dragged file in item order.  The
+ *  trailer is append-only: no `items` arg builds bytes identical to the
+ *  pre-trailer form.  Chromium fetches the drag offer's data at
+ *  wl_data_device.enter, so the server uses the list to pre-create the
+ *  planned staging files and serve a real text/uri-list during hover. */
+export function buildSurfaceDragEnterMessage(
+  surfaceId: number,
+  x: number,
+  y: number,
+  mimes: string[],
+  items?: string[],
+): Uint8Array {
+  const encoded = mimes.map((mime) => textEncoder.encode(mime));
+  const encodedItems = items?.map((mime) => textEncoder.encode(mime));
+  let length = 9;
+  for (const mime of encoded) length += 2 + mime.length;
+  if (encodedItems) {
+    length += 2;
+    for (const mime of encodedItems) length += 2 + mime.length;
+  }
+  const msg = new Uint8Array(length);
+  msg[0] = C2S_SURFACE_DRAG_ENTER;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  msg[3] = x & 0xff;
+  msg[4] = (x >> 8) & 0xff;
+  msg[5] = y & 0xff;
+  msg[6] = (y >> 8) & 0xff;
+  msg[7] = encoded.length & 0xff;
+  msg[8] = (encoded.length >> 8) & 0xff;
+  let at = 9;
+  for (const mime of encoded) {
+    msg[at] = mime.length & 0xff;
+    msg[at + 1] = (mime.length >> 8) & 0xff;
+    msg.set(mime, at + 2);
+    at += 2 + mime.length;
+  }
+  if (encodedItems) {
+    msg[at] = encodedItems.length & 0xff;
+    msg[at + 1] = (encodedItems.length >> 8) & 0xff;
+    at += 2;
+    for (const mime of encodedItems) {
+      msg[at] = mime.length & 0xff;
+      msg[at + 1] = (mime.length >> 8) & 0xff;
+      msg.set(mime, at + 2);
+      at += 2 + mime.length;
+    }
+  }
+  return msg;
+}
+
+export function buildSurfaceDragMotionMessage(
+  surfaceId: number,
+  x: number,
+  y: number,
+): Uint8Array {
+  const msg = new Uint8Array(7);
+  msg[0] = C2S_SURFACE_DRAG_MOTION;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  msg[3] = x & 0xff;
+  msg[4] = (x >> 8) & 0xff;
+  msg[5] = y & 0xff;
+  msg[6] = (y >> 8) & 0xff;
+  return msg;
+}
+
+export function buildSurfaceDragLeaveMessage(surfaceId: number): Uint8Array {
+  const msg = new Uint8Array(3);
+  msg[0] = C2S_SURFACE_DRAG_LEAVE;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  return msg;
+}
+
+export function buildSurfaceDragDropMessage(
+  surfaceId: number,
+  x: number,
+  y: number,
+  items: SurfaceDragItem[],
+): Uint8Array {
+  const encoded = items.map((item) => ({
+    mime: textEncoder.encode(item.mime),
+    name: textEncoder.encode(item.name),
+    data: item.data,
+  }));
+  let length = 9;
+  for (const item of encoded)
+    length +=
+      2 + item.mime.length + 2 + item.name.length + 4 + item.data.length;
+  const msg = new Uint8Array(length);
+  msg[0] = C2S_SURFACE_DRAG_DROP;
+  msg[1] = surfaceId & 0xff;
+  msg[2] = (surfaceId >> 8) & 0xff;
+  msg[3] = x & 0xff;
+  msg[4] = (x >> 8) & 0xff;
+  msg[5] = y & 0xff;
+  msg[6] = (y >> 8) & 0xff;
+  msg[7] = encoded.length & 0xff;
+  msg[8] = (encoded.length >> 8) & 0xff;
+  const v = new DataView(msg.buffer);
+  let at = 9;
+  for (const item of encoded) {
+    msg[at] = item.mime.length & 0xff;
+    msg[at + 1] = (item.mime.length >> 8) & 0xff;
+    msg.set(item.mime, at + 2);
+    at += 2 + item.mime.length;
+    msg[at] = item.name.length & 0xff;
+    msg[at + 1] = (item.name.length >> 8) & 0xff;
+    msg.set(item.name, at + 2);
+    at += 2 + item.name.length;
+    v.setUint32(at, item.data.length, true);
+    msg.set(item.data, at + 4);
+    at += 4 + item.data.length;
+  }
+  return msg;
+}
+
+export function buildSurfaceDragCancelMessage(): Uint8Array {
+  return new Uint8Array([C2S_SURFACE_DRAG_CANCEL]);
 }
 
 export function buildSurfaceAxisMessage(

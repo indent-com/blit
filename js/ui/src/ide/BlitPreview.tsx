@@ -25,7 +25,6 @@ import {
   createMemo,
   createSignal,
   onCleanup,
-  onMount,
   Show,
 } from "solid-js";
 import type { BlitWorkspace, ConnectionId, FsSyncHandle } from "@blit-sh/core";
@@ -35,8 +34,8 @@ import type { Theme, UIScale } from "../theme";
 import { scrollbarStyle } from "../theme";
 import { isConnReady, connGeneration } from "./reactive";
 import {
-  registerActiveEditor,
   clearActiveEditor,
+  setActiveEditorFocused,
   type PreviewController,
 } from "./activeEditor";
 import {
@@ -62,6 +61,8 @@ export function BlitPreview(props: {
   onOpenTile: (assignment: string) => void;
   /** Read-only thumbnail (the background dock): no status-bar claim. */
   preview?: boolean;
+  /** Whether this tile's workspace pane is focused. */
+  focused?: boolean;
 }) {
   const kind = createMemo<PreviewKind | null>(() => previewKindFor(props.path));
   const [bytes, setBytes] = createSignal<Uint8Array | null>(null);
@@ -93,16 +94,19 @@ export function BlitPreview(props: {
     connGeneration(wsState(), props.connectionId),
   );
 
-  if (!props.preview) {
-    const controller: PreviewController = {
-      kind: "preview",
-      connectionId: props.connectionId,
-      path: props.path,
-      onOpenTile: props.onOpenTile,
-    };
-    onMount(() => registerActiveEditor(controller));
-    onCleanup(() => clearActiveEditor(controller));
-  }
+  const controller: PreviewController = {
+    kind: "preview",
+    connectionId: props.connectionId,
+    path: props.path,
+    onOpenTile: props.onOpenTile,
+  };
+  createEffect(() => {
+    setActiveEditorFocused(
+      controller,
+      !props.preview && props.focused !== false,
+    );
+  });
+  onCleanup(() => clearActiveEditor(controller));
 
   /** Fetch one path's bytes through a short-lived single-file sync.
    *  Embedded assets are one-shot reads, so they do not hold a sync open. */

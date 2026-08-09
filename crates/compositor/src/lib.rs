@@ -184,7 +184,9 @@ mod stub {
         /// (xdg_activation_v1) — e.g. an Electron app reacting to a
         /// notification click.  Pane focus belongs to the frontend, so the
         /// request is forwarded, not acted on here.
-        SurfaceActivated { surface_id: u16 },
+        SurfaceActivated {
+            surface_id: u16,
+        },
         SurfaceResized {
             surface_id: u16,
             width: u16,
@@ -195,6 +197,9 @@ mod stub {
         ClipboardContent {
             mime_type: String,
             data: Vec<u8>,
+        },
+        ClipboardOwner {
+            wayland: bool,
         },
         SurfaceCursor {
             surface_id: u16,

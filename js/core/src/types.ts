@@ -328,12 +328,32 @@ export const C2S_SURFACE_TEXT = 0x2f;
 /** Composition in progress (UTF-8): [0x34][surface_id:2][cursor:2][text:N].
  *  `cursor` is a byte offset into `text`; empty text withdraws it. */
 export const C2S_SURFACE_PREEDIT = 0x34;
+/** Browser-source drag entered a surface:
+ *  [0x35][surface_id:2][x:2][y:2][mime_count:2][mime entries], mime entry
+ *  [len:2][bytes].  Starts the compositor's wl_data_device drag session. */
+export const C2S_SURFACE_DRAG_ENTER = 0x35;
+/** Drag pointer moved: [0x36][surface_id:2][x:2][y:2] */
+export const C2S_SURFACE_DRAG_MOTION = 0x36;
+/** Drag left the surface without dropping: [0x37][surface_id:2] */
+export const C2S_SURFACE_DRAG_LEAVE = 0x37;
+/** Dropped on the surface:
+ *  [0x38][surface_id:2][x:2][y:2][item_count:2][items], item
+ *  [mime_len:2][mime][name_len:2][name][data_len:4][data].  Rides a single
+ *  transport frame, so the whole message must fit the 16 MiB frame cap. */
+export const C2S_SURFACE_DRAG_DROP = 0x38;
+/** Drag aborted before a drop (source read failed, session dangled):
+ *  opcode only. */
+export const C2S_SURFACE_DRAG_CANCEL = 0x39;
 export const S2C_SURFACE_CREATED = 0x20;
 export const S2C_SURFACE_DESTROYED = 0x21;
 export const S2C_SURFACE_FRAME = 0x22;
 export const S2C_SURFACE_TITLE = 0x23;
 export const S2C_SURFACE_RESIZED = 0x24;
 export const S2C_CLIPBOARD_CONTENT = 0x25;
+/** Clipboard authority: [0x2E][wayland:1].  When true, Ctrl/Cmd+V must
+ *  preserve the compositor's client-owned selection instead of importing
+ *  the browser clipboard over it. */
+export const S2C_CLIPBOARD_OWNER = 0x2e;
 export const S2C_SURFACE_APP_ID = 0x28;
 /** The Wayland client asked for its toplevel to be activated
  *  (xdg_activation_v1): [0x2D][surface_id:2] — raise and focus the pane. */
