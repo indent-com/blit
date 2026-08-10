@@ -10,7 +10,7 @@ use crate::pointer_focus::{
     ButtonRouting, button_routing, focus_transition, keyboard_focus_after_popup_close,
 };
 use crate::positioner::PositionerGeometry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -18,6 +18,7 @@ use std::sync::mpsc;
 
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopSignal, PostAction};
+use rustc_hash::{FxHashMap, FxHashSet};
 use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::{
     self, WpCursorShapeDeviceV1,
 };
@@ -1349,7 +1350,11 @@ struct DmaBufParamsPending {
     modifier: u64,
 }
 
-struct ClientState;
+struct ClientState {
+    /// Set by the backend's disconnect callback so the compositor can avoid
+    /// probing every live resource after every ordinary request batch.
+    cleanup_needed: Arc<AtomicBool>,
+}
 struct XdgSurfaceData {
     wl_surface_id: ObjectId,
 }
@@ -1793,13 +1798,16 @@ struct TextInputState {
 /// Main compositor state.
 struct Compositor {
     display_handle: DisplayHandle,
-    surfaces: HashMap<ObjectId, Surface>,
+    /// Client disconnects are rare; resource liveness scans are not cheap.
+    /// The matching `ClientState` callback raises this edge-triggered flag.
+    cleanup_needed: Arc<AtomicBool>,
+    surfaces: FxHashMap<ObjectId, Surface>,
     /// Rectangles accumulated per live `wl_region`, until a surface takes a
     /// copy via `set_input_region`. The resource is kept so entries from a
     /// client that disconnected without destroying its regions can be
     /// reclaimed in `cleanup_dead_surfaces`.
-    regions: HashMap<ObjectId, (WlRegion, Vec<RegionOp>)>,
-    toplevel_surface_ids: HashMap<u16, ObjectId>,
+    regions: FxHashMap<ObjectId, (WlRegion, Vec<RegionOp>)>,
+    toplevel_surface_ids: FxHashMap<u16, ObjectId>,
     /// Per-toplevel timestamp (`elapsed_ms`) of the last server-driven
     /// `RequestFrame`. Lets `handle_surface_commit` tell whether the server
     /// is actively pacing this surface (a viewer is connected): while it is,
@@ -1807,13 +1815,13 @@ struct Compositor {
     /// drive a nested compositor (e.g. weston) into an unthrottled repaint
     /// loop that overruns the server's display-rate pacing. See the fallback
     /// note in `handle_surface_commit`.
-    last_request_frame_ms: HashMap<u16, u32>,
+    last_request_frame_ms: FxHashMap<u16, u32>,
     /// Per-surface timestamp (`elapsed_ms`) of the last fallback frame
     /// callback fired for a surface with no live toplevel.  Nothing
     /// composites such a surface, so the server's RequestFrame pacing never
     /// reaches it and firing per commit would let a client that repaints
     /// per callback free-run at full speed on a window nobody can see.
-    last_topless_frame_ms: HashMap<ObjectId, u32>,
+    last_topless_frame_ms: FxHashMap<ObjectId, u32>,
     /// A fixed-clock deadline that found no frame callback ready yet.
     ///
     /// `wl_surface.frame` takes effect with the client's next commit. At high
@@ -1821,17 +1829,17 @@ struct Compositor {
     /// microseconds: dropping the empty clock tick then makes the freshly
     /// committed callback wait an entire refresh period. Keep only the newest
     /// such deadline per toplevel and consume it after that commit instead.
-    pending_request_frames: HashMap<u16, std::time::Instant>,
+    pending_request_frames: FxHashMap<u16, std::time::Instant>,
     /// Toplevels known to contain at least one frame callback or presentation
     /// feedback. Fixed clocks consult this before walking a surface tree.
-    frame_callback_toplevels: HashSet<u16>,
+    frame_callback_toplevels: FxHashSet<u16>,
     next_surface_id: u16,
-    shm_pools: HashMap<ObjectId, Arc<ShmPool>>,
+    shm_pools: FxHashMap<ObjectId, Arc<ShmPool>>,
     /// Per-surface metadata (dimensions, scale, flags) populated at commit time.
     /// Replaces the old pixel_cache — pixel data now lives as persistent GPU
     /// textures inside VulkanRenderer.
-    surface_meta: HashMap<ObjectId, super::render::SurfaceMeta>,
-    dmabuf_params: HashMap<ObjectId, DmaBufParamsPending>,
+    surface_meta: FxHashMap<ObjectId, super::render::SurfaceMeta>,
+    dmabuf_params: FxHashMap<ObjectId, DmaBufParamsPending>,
     vulkan_renderer: Option<super::vulkan_render::VulkanRenderer>,
     output_width: i32,
     output_height: i32,
@@ -1873,7 +1881,7 @@ struct Compositor {
     /// must reflect the compositor's native output so pointer
     /// coordinate mapping stays consistent regardless of how many
     /// clients are subscribed at what sizes.
-    pending_native_sizes: HashMap<u16, (u32, u32, u32, u32)>,
+    pending_native_sizes: FxHashMap<u16, (u32, u32, u32, u32)>,
     /// Toplevels that need a re-composite the next time the GPU
     /// pipeline is idle.  Populated when a per-client encoder target
     /// is installed (`SetExternalOutputBuffers` /
@@ -1891,7 +1899,7 @@ struct Compositor {
     /// burn a generation and make every other viewer re-encode the frame it
     /// is already showing.  A content request (`false`) wins over an
     /// encoder-only one for the same toplevel.
-    pending_recomposite_toplevels: HashMap<u16, bool>,
+    pending_recomposite_toplevels: FxHashMap<u16, bool>,
     /// Surfaces whose `wl_buffer` is still held because the commit that
     /// applied it deferred compositing rather than running it.
     ///
@@ -1900,7 +1908,7 @@ struct Compositor {
     /// Keyed by the toplevel whose queued recomposite will read them, so the
     /// drain releases exactly the buffers that composite consumed — releasing
     /// another toplevel's would just move the race.
-    deferred_buffer_holds: HashMap<u16, HashSet<ObjectId>>,
+    deferred_buffer_holds: FxHashMap<u16, FxHashSet<ObjectId>>,
     focused_surface_id: u16,
     /// The wl_surface ObjectId the pointer is currently over (None = none).
     pointer_entered_id: Option<ObjectId>,
@@ -1918,13 +1926,13 @@ struct Compositor {
     /// Track last reported size per toplevel surface_id to detect changes.
     /// Per-toplevel: (composited_w, composited_h, logical_w, logical_h).
     /// Used for pointer coordinate mapping (browser→Wayland).
-    last_reported_size: HashMap<u16, (u32, u32, u32, u32)>,
+    last_reported_size: FxHashMap<u16, (u32, u32, u32, u32)>,
     /// Per-toplevel configured size.  Each surface can live in a
     /// differently-sized BSP pane, so we need to track sizes individually
     /// rather than relying on the single `output_width`/`output_height`.
-    surface_sizes: HashMap<u16, (i32, i32)>,
+    surface_sizes: FxHashMap<u16, (i32, i32)>,
     /// Pending positioner geometry, keyed by XdgPositioner protocol id.
-    positioners: HashMap<ObjectId, PositionerState>,
+    positioners: FxHashMap<ObjectId, PositionerState>,
     /// Active wp_fractional_scale_v1 objects.  When `output_scale_120`
     /// changes we send `preferred_scale` to every entry.
     fractional_scales: Vec<WpFractionalScaleV1>,
@@ -1991,24 +1999,24 @@ struct Compositor {
     /// fence not ready).  We hold the `WlBuffer` alive so the client
     /// cannot reuse it while the GPU texture still references the fd.
     /// Released when the surface commits a new buffer or is destroyed.
-    held_buffers: HashMap<ObjectId, HeldBuffer>,
+    held_buffers: FxHashMap<ObjectId, HeldBuffer>,
     /// Explicit-sync device, when the render node supports timeline
     /// syncobjs; gates the `wp_linux_drm_syncobj_v1` global.
     syncobj_device: Option<std::sync::Arc<crate::drm_syncobj::DrmSyncobjDevice>>,
     /// Imported client timelines by protocol object id.  Pending sync
     /// points hold `Arc` clones, so dropping an entry never invalidates
     /// a point already attached to a commit.
-    syncobj_timelines: HashMap<ObjectId, std::sync::Arc<crate::drm_syncobj::SyncobjTimeline>>,
+    syncobj_timelines: FxHashMap<ObjectId, std::sync::Arc<crate::drm_syncobj::SyncobjTimeline>>,
     /// Committed buffers whose acquire point has not signalled yet.  The
     /// previous buffer stays current until promotion; a newer commit
     /// discards the waiting one unread (signalling its release point).
-    awaiting_acquire: HashMap<ObjectId, AwaitingBuffer>,
+    awaiting_acquire: FxHashMap<ObjectId, AwaitingBuffer>,
 
     // -- Cursor pixel cache --
     /// CPU-accessible RGBA pixels for cursor surfaces.  Cursors aren't
     /// GPU-composited — they're sent as cursor image events.  Updated
     /// at cursor surface commit time.
-    cursor_rgba: HashMap<ObjectId, (u32, u32, Vec<u8>)>,
+    cursor_rgba: FxHashMap<ObjectId, (u32, u32, Vec<u8>)>,
 }
 
 /// Scan for a free surface id starting at `from`, wrapping past `u16::MAX`
@@ -3578,6 +3586,12 @@ impl Compositor {
     /// This handles the case where a Wayland client process exits or crashes
     /// without explicitly destroying its surfaces — `dispatch_clients()`
     /// marks the resources as dead, and we clean up here.
+    fn cleanup_disconnected_clients(&mut self) {
+        if self.cleanup_needed.swap(false, Ordering::AcqRel) {
+            self.cleanup_dead_surfaces();
+        }
+    }
+
     fn cleanup_dead_surfaces(&mut self) {
         // Purge stale protocol objects from disconnected clients.
         self.fractional_scales.retain(|fs| fs.is_alive());
@@ -8924,6 +8938,7 @@ impl wayland_server::backend::ClientData for ClientState {
         _: wayland_server::backend::ClientId,
         _: wayland_server::backend::DisconnectReason,
     ) {
+        self.cleanup_needed.store(true, Ordering::Release);
     }
 }
 
@@ -8994,7 +9009,7 @@ struct FrameClockEntry {
 }
 
 fn update_frame_clock(
-    clocks: &mut HashMap<u16, FrameClockEntry>,
+    clocks: &mut FxHashMap<u16, FrameClockEntry>,
     surface_id: u16,
     interval: Option<std::time::Duration>,
 ) {
@@ -9044,7 +9059,7 @@ fn run_frame_clock(
     requests: Arc<AtomicU32>,
     shutdown: Arc<AtomicBool>,
 ) {
-    let mut clocks: HashMap<u16, FrameClockEntry> = HashMap::new();
+    let mut clocks: FxHashMap<u16, FrameClockEntry> = FxHashMap::default();
     loop {
         let now = std::time::Instant::now();
         let wait = clocks
@@ -9295,19 +9310,21 @@ fn run_compositor(
     socket_tx.send(socket_name).unwrap();
     let _ = signal_tx.send(loop_signal.clone());
 
+    let cleanup_needed = Arc::new(AtomicBool::new(false));
     let mut compositor = Compositor {
         display_handle: dh,
-        surfaces: HashMap::new(),
-        regions: HashMap::new(),
-        toplevel_surface_ids: HashMap::new(),
-        last_request_frame_ms: HashMap::new(),
-        last_topless_frame_ms: HashMap::new(),
-        pending_request_frames: HashMap::new(),
-        frame_callback_toplevels: HashSet::new(),
+        cleanup_needed: Arc::clone(&cleanup_needed),
+        surfaces: FxHashMap::default(),
+        regions: FxHashMap::default(),
+        toplevel_surface_ids: FxHashMap::default(),
+        last_request_frame_ms: FxHashMap::default(),
+        last_topless_frame_ms: FxHashMap::default(),
+        pending_request_frames: FxHashMap::default(),
+        frame_callback_toplevels: FxHashSet::default(),
         next_surface_id: 1,
-        shm_pools: HashMap::new(),
-        surface_meta: HashMap::new(),
-        dmabuf_params: HashMap::new(),
+        shm_pools: FxHashMap::default(),
+        surface_meta: FxHashMap::default(),
+        dmabuf_params: FxHashMap::default(),
         vulkan_renderer,
         output_width: 1920,
         output_height: 1080,
@@ -9325,9 +9342,9 @@ fn run_compositor(
         loop_signal: loop_signal.clone(),
         pending_commits: HashMap::new(),
         pending_encoded: Vec::new(),
-        pending_native_sizes: HashMap::new(),
-        pending_recomposite_toplevels: HashMap::new(),
-        deferred_buffer_holds: HashMap::new(),
+        pending_native_sizes: FxHashMap::default(),
+        pending_recomposite_toplevels: FxHashMap::default(),
+        deferred_buffer_holds: FxHashMap::default(),
         focused_surface_id: 0,
         pointer_entered_id: None,
         pointer_entered_local: (0.0, 0.0),
@@ -9335,9 +9352,9 @@ fn run_compositor(
         gpu_device,
         verbose,
         shutdown: shutdown.clone(),
-        last_reported_size: HashMap::new(),
-        surface_sizes: HashMap::new(),
-        positioners: HashMap::new(),
+        last_reported_size: FxHashMap::default(),
+        surface_sizes: FxHashMap::default(),
+        positioners: FxHashMap::default(),
         fractional_scales: Vec::new(),
         data_devices: Vec::new(),
         selection_source: None,
@@ -9354,11 +9371,11 @@ fn run_compositor(
         popup_grab_stack: Vec::new(),
         kb_focus_popup: None,
         popup_dismiss_button: None,
-        held_buffers: HashMap::new(),
+        held_buffers: FxHashMap::default(),
         syncobj_device,
-        syncobj_timelines: HashMap::new(),
-        awaiting_acquire: HashMap::new(),
-        cursor_rgba: HashMap::new(),
+        syncobj_timelines: FxHashMap::default(),
+        awaiting_acquire: FxHashMap::default(),
+        cursor_rgba: FxHashMap::default(),
     };
 
     // Report Vulkan Video encode capabilities to the server.
@@ -9383,7 +9400,6 @@ fn run_compositor(
             {
                 eprintln!("[compositor] dispatch_clients error: {e}");
             }
-            state.cleanup_dead_surfaces();
             if let Err(e) = d.flush_clients()
                 && state.verbose
             {
@@ -9399,9 +9415,12 @@ fn run_compositor(
         .insert_source(socket_source, |_, socket, state| {
             let ls = unsafe { socket.get_mut() };
             if let Some(client_stream) = ls.accept().ok().flatten()
-                && let Err(e) = state
-                    .display_handle
-                    .insert_client(client_stream, Arc::new(ClientState))
+                && let Err(e) = state.display_handle.insert_client(
+                    client_stream,
+                    Arc::new(ClientState {
+                        cleanup_needed: Arc::clone(&state.cleanup_needed),
+                    }),
+                )
                 && state.verbose
             {
                 eprintln!("[compositor] insert_client error: {e}");
@@ -9433,6 +9452,7 @@ fn run_compositor(
                 {
                     eprintln!("[compositor] pre-frame event loop error: {e}");
                 }
+                compositor.cleanup_disconnected_clients();
                 drained_wayland_before_frame = true;
             }
             match cmd {
@@ -9461,6 +9481,9 @@ fn run_compositor(
         {
             eprintln!("[compositor] event loop error: {e}");
         }
+        // Explicit destroy handlers remove their own state. The full
+        // liveness scan exists for clients that disappear without them.
+        compositor.cleanup_disconnected_clients();
 
         // Install commits whose explicit-sync acquire points signalled
         // since the last pass, before the recomposite drain below so their
@@ -9606,7 +9629,7 @@ mod tests {
         next_surface_id_after, scan_free_surface_id, shm_damage_rects, update_frame_clock,
     };
     use crate::vulkan_render::ShmDamageRect;
-    use std::collections::{HashMap, HashSet};
+    use rustc_hash::FxHashMap;
 
     /// A scratch directory that removes itself, so the marker test can
     /// stage an executable's neighbours without a temp-file dependency.
@@ -9667,7 +9690,7 @@ mod tests {
 
         // Seeded past the end of a small taken set, the scan wraps around
         // to the first free id rather than giving up.
-        let taken: HashSet<u16> = (1..=10).collect();
+        let taken: std::collections::HashSet<u16> = (1..=10).collect();
         assert_eq!(scan_free_surface_id(5, |id| taken.contains(&id)), Some(11));
         assert_eq!(
             scan_free_surface_id(u16::MAX, |id| taken.contains(&id)),
@@ -9692,7 +9715,7 @@ mod tests {
     fn unchanged_frame_clock_update_preserves_phase() {
         let interval = std::time::Duration::from_millis(8);
         let next = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        let mut clocks = HashMap::from([(1, FrameClockEntry { interval, next })]);
+        let mut clocks = FxHashMap::from_iter([(1, FrameClockEntry { interval, next })]);
 
         update_frame_clock(&mut clocks, 1, Some(interval));
 

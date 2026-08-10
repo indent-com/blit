@@ -1,7 +1,7 @@
 //! TCP and UDP relay (docs/design/net.md).
 //! Connection-scoped sockets: the client names a host and port, the server opens a socket and copies payload.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +19,7 @@ use blit_remote::net::{
     msg_net_closed, msg_net_data_s2c, msg_net_dgram_s2c, msg_net_opened, msg_net_opened_tcp,
     parse_net_ack_c2s, parse_net_close, parse_net_data_c2s, parse_net_dgram_c2s, parse_net_open,
 };
+use rustc_hash::FxHashMap;
 
 /// Connect and TLS-handshake timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -405,7 +406,7 @@ enum TcpWrite {
 /// Every relayed socket on one blit connection.
 #[derive(Default)]
 pub struct NetSockets {
-    map: HashMap<u16, Entry>,
+    map: FxHashMap<u16, Entry>,
     /// Outbox byte counter shared with the sender loop, for the advisory congestion check that paces relayed datagrams.
     outbox_bytes: Option<Arc<std::sync::atomic::AtomicUsize>>,
     outbox_frames: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -431,7 +432,7 @@ impl NetSockets {
         bytes: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         Self {
-            map: HashMap::new(),
+            map: FxHashMap::default(),
             outbox_bytes: Some(bytes),
             outbox_frames: Some(frames),
             ..Self::default()

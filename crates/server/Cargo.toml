@@ -52,6 +52,7 @@ ravif = { version = "0.13", default-features = false }
 rgb = "0.8"
 png = "0.18"
 smallvec = "1"
+rustc-hash = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

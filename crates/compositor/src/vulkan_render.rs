@@ -18,6 +18,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use ash::vk;
+use rustc_hash::{FxHashMap, FxHashSet};
 use wayland_server::Resource;
 use wayland_server::backend::ObjectId;
 
@@ -405,7 +406,7 @@ pub(crate) struct VulkanRenderer {
     /// Textures are created at surface commit time and reused across
     /// frames until the surface commits a new buffer or is destroyed.
     /// DMA-BUF entries are shared with `buffer_textures` (same `Arc`).
-    surface_textures: HashMap<ObjectId, Arc<CachedSurfaceTexture>>,
+    surface_textures: FxHashMap<ObjectId, Arc<CachedSurfaceTexture>>,
 
     /// Zero-copy DMA-BUF imports keyed by wl_buffer ObjectId.  The
     /// imported VkImage references the client's buffer memory, so one
@@ -415,7 +416,7 @@ pub(crate) struct VulkanRenderer {
     /// commit.  Keyed by wl_buffer identity, never the dmabuf fd — the
     /// kernel recycles fd numbers, and a stale hit would hand the GPU
     /// freed memory.  Evicted when the client destroys the wl_buffer.
-    buffer_textures: HashMap<ObjectId, Arc<CachedSurfaceTexture>>,
+    buffer_textures: FxHashMap<ObjectId, Arc<CachedSurfaceTexture>>,
 
     /// Textures replaced by a surface commit but still potentially
     /// referenced by in-flight GPU work.  Freed when the pending
@@ -434,13 +435,13 @@ pub(crate) struct VulkanRenderer {
     pending_shm_uploads: HashMap<vk::Image, PendingShmUpload>,
     /// Direct imports of live wl_shm buffers. The mapping and VkBuffer are
     /// cached by wl_buffer identity and evicted by wl_buffer.destroy.
-    shm_host_buffers: HashMap<ObjectId, Arc<ExternalHostBuffer>>,
-    shm_host_import_failures: HashSet<ObjectId>,
+    shm_host_buffers: FxHashMap<ObjectId, Arc<ExternalHostBuffer>>,
+    shm_host_import_failures: FxHashSet<ObjectId>,
     shm_upload_counters: ShmUploadCounters,
     /// Recent per-surface damage. A ring entry can miss several commits while
     /// the GPU owns it; replaying the union since its generation brings it
     /// directly to the newest frame without copying the unchanged pixels.
-    shm_surface_history: HashMap<ObjectId, ShmSurfaceHistory>,
+    shm_surface_history: FxHashMap<ObjectId, ShmSurfaceHistory>,
 
     /// External / NV12 / downscale targets removed while a Vulkan submit
     /// may still reference them.  Freed once all tracked submits retire.
@@ -1701,15 +1702,15 @@ impl VulkanRenderer {
             vulkan_encode_giveups: Vec::new(),
             downscale_outputs: HashMap::new(),
             target_natives: HashMap::new(),
-            surface_textures: HashMap::new(),
-            buffer_textures: HashMap::new(),
+            surface_textures: FxHashMap::default(),
+            buffer_textures: FxHashMap::default(),
             pending_destroy_textures: Vec::new(),
             reusable_shm_textures: Vec::new(),
             pending_shm_uploads: HashMap::new(),
-            shm_host_buffers: HashMap::new(),
-            shm_host_import_failures: HashSet::new(),
+            shm_host_buffers: FxHashMap::default(),
+            shm_host_import_failures: FxHashSet::default(),
             shm_upload_counters: ShmUploadCounters::default(),
-            shm_surface_history: HashMap::new(),
+            shm_surface_history: FxHashMap::default(),
             pending_destroy_external_outputs: Vec::new(),
             pending_destroy_nv12_outputs: Vec::new(),
             pending_destroy_downscale_outputs: Vec::new(),
@@ -6733,8 +6734,8 @@ impl VulkanRenderer {
     pub fn render_tree_sized(
         &mut self,
         root_id: &ObjectId,
-        surfaces: &HashMap<ObjectId, Surface>,
-        meta: &HashMap<ObjectId, SurfaceMeta>,
+        surfaces: &FxHashMap<ObjectId, Surface>,
+        meta: &FxHashMap<ObjectId, SurfaceMeta>,
         output_scale_120: u16,
         target_phys: Option<(u32, u32)>,
         toplevel_sid: u16,

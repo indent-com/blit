@@ -11,7 +11,7 @@
 //! as soon as the in-memory mutation lands; a `DURABLE` put's `KV_DONE`
 //! (and its own echo) wait for the commit to confirm.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 
@@ -24,6 +24,7 @@ use blit_remote::kv::{
     parse_kv_fetch, parse_kv_open, parse_kv_put, parse_kv_stop,
 };
 use redb::ReadableTable;
+use rustc_hash::FxHashMap;
 use tokio::sync::mpsc;
 
 const TABLE: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("kv");
@@ -278,7 +279,7 @@ impl SubEntry {
 /// the store's `Weak` references die with it.
 #[derive(Default)]
 pub struct KvSubs {
-    map: HashMap<u16, Arc<SubEntry>>,
+    map: FxHashMap<u16, Arc<SubEntry>>,
     next_id: u16,
     /// `DURABLE` puts awaiting their commit on this connection — the puts
     /// in flight docs/design/kv.md § Budgets caps (non-durable puts are

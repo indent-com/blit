@@ -2,8 +2,7 @@
 //!
 //! `collect_gpu_layers` gathers layer metadata for the Vulkan renderer.
 
-use std::collections::HashMap;
-
+use rustc_hash::FxHashMap;
 use wayland_server::backend::ObjectId;
 
 use super::imp::Surface;
@@ -75,8 +74,8 @@ pub(crate) fn surface_logical_size(surf: &Surface, sm: &SurfaceMeta) -> (f64, f6
 /// so the Vulkan renderer can look up its cached texture.
 pub(crate) fn collect_gpu_layers(
     surface_id: &ObjectId,
-    surfaces: &HashMap<ObjectId, Surface>,
-    meta: &HashMap<ObjectId, SurfaceMeta>,
+    surfaces: &FxHashMap<ObjectId, Surface>,
+    meta: &FxHashMap<ObjectId, SurfaceMeta>,
     parent_x: i32,
     parent_y: i32,
     layers: &mut Vec<GpuLayer>,

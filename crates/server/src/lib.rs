@@ -28,8 +28,10 @@ use blit_remote::{
 };
 #[cfg(target_os = "linux")]
 use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO, FEATURE_COMPOSITOR};
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -58,7 +60,7 @@ pub use surface_encoder::SurfaceEncoderPreference;
 pub use surface_encoder::SurfaceH264EncoderPreference;
 pub use surface_encoder::{SurfaceBandwidth, SurfaceEncoding, SurfaceSpeed};
 
-type PtyFds = Arc<std::sync::RwLock<HashMap<u16, PtyWriteTarget>>>;
+type PtyFds = Arc<std::sync::RwLock<FxHashMap<u16, PtyWriteTarget>>>;
 
 /// How many exited-but-retained terminals to keep, oldest evicted first.
 /// `BLIT_MAX_EXITED` overrides; 0 disables the bound.
@@ -700,8 +702,8 @@ type PixelSnapshot = (u16, u32, u32, u64, u32, u16);
 /// stale value, mis-clamping `per_client_encode_target` and triggering
 /// avoidable encoder rebuilds — and on aspect-ratio mismatches, freezing
 /// visible frames at the stale target until the entry is cleared.
-fn compositor_native_for_sid(
-    native_sizes: &HashMap<u16, (u32, u32)>,
+fn compositor_native_for_sid<S: BuildHasher>(
+    native_sizes: &HashMap<u16, (u32, u32), S>,
     pixel_snapshot: &[PixelSnapshot],
     sid: u16,
 ) -> Option<(u32, u32)> {
@@ -720,7 +722,7 @@ struct SharedCompositor {
     /// Current compositor clipboard authority, replayed to every new web
     /// client before READY so its first paste takes the correct path.
     wayland_clipboard_owned: bool,
-    surfaces: HashMap<u16, CachedSurfaceInfo>,
+    surfaces: FxHashMap<u16, CachedSurfaceInfo>,
     /// Latest pixel snapshot per `(surface_id, width, height)`.  The
     /// compositor renders one surface into multiple per-target buffers
     /// (one per registered per-client encoder size) plus a native BGRA
@@ -738,7 +740,7 @@ struct SharedCompositor {
     last_encoded: HashMap<(u16, u64), LastEncoded>,
     /// Display-rate clocks currently installed in the compositor.  Kept here
     /// only to avoid sending unchanged clock configuration every tick.
-    frame_clock_intervals: HashMap<u16, Duration>,
+    frame_clock_intervals: FxHashMap<u16, Duration>,
     /// Subscription/display/surface topology changed since the last clock
     /// reconciliation. Keeps unchanged delivery ticks out of the client ×
     /// subscription scan.
@@ -756,11 +758,11 @@ struct SharedCompositor {
     /// (`info.width`/`info.height`) may differ from the requested size
     /// when the Wayland client sets `xdg_geometry` (e.g. excluding a
     /// title bar), so we compare against the actually-requested values.
-    last_configured_size: HashMap<u16, (u16, u16, u16)>,
+    last_configured_size: FxHashMap<u16, (u16, u16, u16)>,
     /// Instant of the last resize actually handed to the compositor, per
     /// surface.  Opens that surface's settle window; see
     /// `SURFACE_RESIZE_SETTLE`.
-    last_resize_at: HashMap<u16, Instant>,
+    last_resize_at: FxHashMap<u16, Instant>,
     /// Vulkan Video encoders this device has built and then failed to encode
     /// with, by the name the selection uses (`h264-vulkan 4:4:4` and friends,
     /// so chroma counts — 4:2:0 is a different profile and usually works
@@ -781,12 +783,12 @@ struct SharedCompositor {
     /// has not reported back yet, and when it went out.  An encoder built
     /// against the size the surface is *leaving* is finished work nobody
     /// wants: see `RESIZE_ENCODER_GRACE`.
-    resize_inflight: HashMap<u16, Instant>,
+    resize_inflight: FxHashMap<u16, Instant>,
     /// The most recent size requested for a surface while its settle window
     /// was still open.  Dispatched by `flush_due_resizes` once the window
     /// closes; overwritten (not queued) by every further request, so a drag
     /// costs one configure per window rather than one per frame.
-    pending_resize: HashMap<u16, (u16, u16, u16)>,
+    pending_resize: FxHashMap<u16, (u16, u16, u16)>,
     /// Authoritative compositor native (physical) size per surface, set from
     /// `CompositorEvent::SurfaceResized`.  Used by the per-client encode
     /// target computation as the `(native_w, native_h)` clamp.
@@ -802,7 +804,7 @@ struct SharedCompositor {
     /// targets and new compositor native, the encoder ends up sized for
     /// the stale target, freezing visible frames at the wrong size until
     /// the stale entry is cleared.
-    native_sizes: HashMap<u16, (u32, u32)>,
+    native_sizes: FxHashMap<u16, (u32, u32)>,
     /// Audio capture pipeline (PipeWire daemon → in-process libpipewire capture → Opus encode).
     /// `None` when PipeWire is not available or `BLIT_AUDIO=0`.
     #[cfg(target_os = "linux")]
@@ -1722,9 +1724,9 @@ struct ClientState {
     #[cfg(target_os = "linux")]
     audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     lead: Option<u16>,
-    subscriptions: HashSet<u16>,
+    subscriptions: FxHashSet<u16>,
     /// Active surface subscriptions for this client.
-    surface_subscriptions: HashSet<u16>,
+    surface_subscriptions: FxHashSet<u16>,
     /// Whether this client is subscribed to audio frames.
     #[cfg(target_os = "linux")]
     audio_subscribed: bool,
@@ -1732,12 +1734,12 @@ struct ClientState {
     /// 0 means use the server/env default.
     #[cfg(target_os = "linux")]
     audio_bitrate_kbps: u16,
-    view_sizes: HashMap<u16, (u16, u16)>,
-    scroll_offsets: HashMap<u16, usize>,
-    scroll_caches: HashMap<u16, FrameState>,
-    last_sent: HashMap<u16, FrameState>,
-    last_used_rows_sent: HashMap<u16, u16>,
-    preview_next_send_at: HashMap<u16, Instant>,
+    view_sizes: FxHashMap<u16, (u16, u16)>,
+    scroll_offsets: FxHashMap<u16, usize>,
+    scroll_caches: FxHashMap<u16, FrameState>,
+    last_sent: FxHashMap<u16, FrameState>,
+    last_used_rows_sent: FxHashMap<u16, u16>,
+    preview_next_send_at: FxHashMap<u16, Instant>,
     /// EWMA RTT estimate in milliseconds.
     rtt_ms: f32,
     /// Minimum-path RTT estimate in milliseconds, excluding queue growth.
@@ -1807,10 +1809,10 @@ struct ClientState {
     /// subscribed surface.  Entries are created lazily via
     /// `entry(sid).or_default()` on first touch and dropped wholesale
     /// on UNSUBSCRIBE / SurfaceDestroyed.
-    surface_subs: HashMap<u16, SurfaceSubState>,
+    surface_subs: FxHashMap<u16, SurfaceSubState>,
     /// Surfaces that use Vulkan Video encoding in the compositor rather than
     /// a local SurfaceEncoder.
-    vulkan_video_surfaces: HashMap<u16, VulkanVideoSurfaceState>,
+    vulkan_video_surfaces: FxHashMap<u16, VulkanVideoSurfaceState>,
     /// Surface frames in flight — separate from terminal inflight so surface
     /// ACKs feed shared RTT / goodput without corrupting terminal frame-size
     /// averages or probe_frames.
@@ -1822,7 +1824,7 @@ struct ClientState {
     /// `scale_120` is the requested presentation scale in 1/120th units:
     /// 60 = 0.5×, 120 = 1×, 240 = 2×. It may be the viewer's DPR or
     /// an exact scale selected independently of DPR.
-    surface_view_sizes: HashMap<u16, (u16, u16, u16)>,
+    surface_view_sizes: FxHashMap<u16, (u16, u16, u16)>,
     /// Intersection of codec support across all surfaces for this client.
     /// Used to pick an encoder the client can decode.  0 = accept anything.
     surface_codec_support: u8,
@@ -3809,7 +3811,7 @@ fn reanchor_client(
 }
 
 struct Session {
-    ptys: HashMap<u16, Pty>,
+    ptys: FxHashMap<u16, Pty>,
     compositor: Option<SharedCompositor>,
     next_client_id: u64,
     next_compositor_id: u16,
@@ -3913,7 +3915,7 @@ impl Session {
 
     fn new() -> Self {
         Self {
-            ptys: HashMap::new(),
+            ptys: FxHashMap::default(),
             compositor: None,
             next_client_id: 1,
             next_compositor_id: 1,
@@ -4022,23 +4024,23 @@ impl Session {
             self.compositor = Some(SharedCompositor {
                 handle,
                 wayland_clipboard_owned: false,
-                surfaces: HashMap::new(),
+                surfaces: FxHashMap::default(),
                 last_pixels: HashMap::new(),
                 pixel_snapshot: Arc::new(Vec::new()),
                 pixel_snapshot_dirty: false,
                 last_encoded: HashMap::new(),
-                frame_clock_intervals: HashMap::new(),
+                frame_clock_intervals: FxHashMap::default(),
                 frame_clocks_dirty: true,
                 #[cfg(target_os = "linux")]
                 created_at,
                 pixel_generation: 0,
                 last_blanket_frame_request: Instant::now(),
-                last_configured_size: HashMap::new(),
-                last_resize_at: HashMap::new(),
+                last_configured_size: FxHashMap::default(),
+                last_resize_at: FxHashMap::default(),
                 declined_vulkan_encoders: HashSet::new(),
-                resize_inflight: HashMap::new(),
-                pending_resize: HashMap::new(),
-                native_sizes: HashMap::new(),
+                resize_inflight: FxHashMap::default(),
+                pending_resize: FxHashMap::default(),
+                native_sizes: FxHashMap::default(),
                 #[cfg(target_os = "linux")]
                 audio_pipeline,
                 #[cfg(target_os = "linux")]
@@ -5529,7 +5531,7 @@ pub async fn run(config: Config) {
         config,
         boot_generation: new_boot_generation(),
         session: Mutex::new(Session::new()),
-        pty_fds: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        pty_fds: Arc::new(std::sync::RwLock::new(FxHashMap::default())),
         delivery_notify: Arc::new(Notify::new()),
         shutdown_notify: Arc::new(Notify::new()),
         supervisor_notify: Arc::new(Notify::new()),
@@ -8401,7 +8403,7 @@ async fn tick(state: &AppState) -> TickOutcome {
         .is_some_and(|cs| cs.frame_clocks_dirty);
     {
         let mut desired_clocks = reconcile_cadence.then(|| {
-            let mut clocks: HashMap<u16, Duration> = HashMap::new();
+            let mut clocks: FxHashMap<u16, Duration> = FxHashMap::default();
             for client in sess.clients.values() {
                 for &sid in &client.surface_subscriptions {
                     let interval = surface_source_interval(client, sid);
@@ -8592,7 +8594,7 @@ async fn tick(state: &AppState) -> TickOutcome {
     //    Without it this loop parses a flooding PTY for as long as the
     //    reader can refill the channel, holding the session mutex the
     //    whole time.
-    let ptys_with_subscribers: HashSet<u16> = sess
+    let ptys_with_subscribers: FxHashSet<u16> = sess
         .clients
         .values()
         .flat_map(|c| c.subscriptions.iter().copied())
@@ -8690,7 +8692,7 @@ async fn tick(state: &AppState) -> TickOutcome {
     // Only snapshot PTYs that have at least one client ready to consume a fresh
     // frame right now. This avoids burning CPU on snapshot+diff+compress work
     // while the lead is merely waiting for its next pacing deadline.
-    let needful_ptys: HashSet<u16> = sess
+    let needful_ptys: FxHashSet<u16> = sess
         .clients
         .values()
         .flat_map(|c| {
@@ -8706,7 +8708,7 @@ async fn tick(state: &AppState) -> TickOutcome {
         })
         .collect();
 
-    let mut snapshots: HashMap<u16, FrameState> = HashMap::new();
+    let mut snapshots: FxHashMap<u16, FrameState> = FxHashMap::default();
     for &id in &ids {
         let Some(pty) = sess.ptys.get_mut(&id) else {
             continue;
@@ -9234,7 +9236,7 @@ fn fetch_finish(gate: &std::sync::Arc<FetchGate>, out: &mpsc::UnboundedSender<Ve
 
 #[derive(Default)]
 struct FsSyncs {
-    map: HashMap<u16, FsSyncEntry>,
+    map: FxHashMap<u16, FsSyncEntry>,
     next_id: u16,
     /// Nonces of writes/ops in flight on this connection (write-family
     /// nonce namespace). Membership dedups a duplicate nonce; the count is
@@ -9263,7 +9265,7 @@ struct FsSyncs {
 /// in the sync's engine; this is only the per-connection id namespace.
 #[derive(Default)]
 struct Uploads {
-    map: HashMap<u16, u16>,
+    map: FxHashMap<u16, u16>,
     next: u16,
 }
 
@@ -10686,10 +10688,10 @@ struct GitRepoEntry {
 
 #[derive(Default)]
 struct GitRepos {
-    map: HashMap<u16, GitRepoEntry>,
+    map: FxHashMap<u16, GitRepoEntry>,
     next_id: u16,
     /// In-flight request cancel flags by nonce (per-connection namespace).
-    cancels: std::sync::Arc<std::sync::Mutex<HashMap<u16, blit_git::Cancel>>>,
+    cancels: std::sync::Arc<std::sync::Mutex<FxHashMap<u16, blit_git::Cancel>>>,
 }
 
 impl GitRepos {
@@ -11491,12 +11493,12 @@ async fn handle_git_message(
 /// they attach to are daemon-owned and warm inside `blit-lsp`.
 #[derive(Default)]
 struct LspConns {
-    map: HashMap<u16, blit_lsp::Attachment>,
+    map: FxHashMap<u16, blit_lsp::Attachment>,
     next_id: u16,
     /// Query nonces in flight (per-connection namespace); a duplicate
     /// is answered `INVALID` without executing, and the size bounds
     /// pending queries per connection.
-    inflight: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    inflight: std::sync::Arc<std::sync::Mutex<FxHashSet<u16>>>,
 }
 
 impl LspConns {
@@ -11544,7 +11546,7 @@ fn lsp_stream_sink(out: &mpsc::UnboundedSender<Vec<u8>>) -> blit_lsp::Sink {
 /// set when its `S2C_LSP_QUERY` response passes through.
 fn lsp_query_sink(
     out: &mpsc::UnboundedSender<Vec<u8>>,
-    inflight: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    inflight: &std::sync::Arc<std::sync::Mutex<FxHashSet<u16>>>,
     nonce: u16,
 ) -> blit_lsp::Sink {
     let out = out.clone();
@@ -12011,18 +12013,18 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 #[cfg(target_os = "linux")]
                 audio_tx,
                 lead: None,
-                subscriptions: HashSet::new(),
-                surface_subscriptions: HashSet::new(),
+                subscriptions: FxHashSet::default(),
+                surface_subscriptions: FxHashSet::default(),
                 #[cfg(target_os = "linux")]
                 audio_subscribed: false,
                 #[cfg(target_os = "linux")]
                 audio_bitrate_kbps: 0,
-                view_sizes: HashMap::new(),
-                scroll_offsets: HashMap::new(),
-                scroll_caches: HashMap::new(),
-                last_sent: HashMap::new(),
-                last_used_rows_sent: HashMap::new(),
-                preview_next_send_at: HashMap::new(),
+                view_sizes: FxHashMap::default(),
+                scroll_offsets: FxHashMap::default(),
+                scroll_caches: FxHashMap::default(),
+                last_sent: FxHashMap::default(),
+                last_used_rows_sent: FxHashMap::default(),
+                preview_next_send_at: FxHashMap::default(),
                 rtt_ms: 50.0,
                 min_rtt_ms: 0.0,
                 display_fps: 60.0,
@@ -12063,10 +12065,10 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 encode_loop_iters: 0,
                 goodput_window_bytes: 0,
                 goodput_window_start: Instant::now(),
-                surface_subs: HashMap::new(),
+                surface_subs: FxHashMap::default(),
                 surface_inflight_frames: VecDeque::new(),
-                vulkan_video_surfaces: HashMap::new(),
-                surface_view_sizes: HashMap::new(),
+                vulkan_video_surfaces: FxHashMap::default(),
+                surface_view_sizes: FxHashMap::default(),
                 surface_codec_support: 0,
                 surface_max_decode: (0, 0),
                 surface_timestamp_sub_us: false,
@@ -15047,18 +15049,18 @@ mod tests {
             #[cfg(target_os = "linux")]
             audio_tx,
             lead: None,
-            subscriptions: HashSet::new(),
-            surface_subscriptions: HashSet::new(),
+            subscriptions: FxHashSet::default(),
+            surface_subscriptions: FxHashSet::default(),
             #[cfg(target_os = "linux")]
             audio_subscribed: false,
             #[cfg(target_os = "linux")]
             audio_bitrate_kbps: 0,
-            view_sizes: HashMap::new(),
-            scroll_offsets: HashMap::new(),
-            scroll_caches: HashMap::new(),
-            last_sent: HashMap::new(),
-            last_used_rows_sent: HashMap::new(),
-            preview_next_send_at: HashMap::new(),
+            view_sizes: FxHashMap::default(),
+            scroll_offsets: FxHashMap::default(),
+            scroll_caches: FxHashMap::default(),
+            last_sent: FxHashMap::default(),
+            last_used_rows_sent: FxHashMap::default(),
+            preview_next_send_at: FxHashMap::default(),
             rtt_ms: 50.0,
             min_rtt_ms: 50.0,
             display_fps: 60.0,
@@ -15095,10 +15097,10 @@ mod tests {
             encode_loop_iters: 0,
             goodput_window_bytes: 0,
             goodput_window_start: Instant::now(),
-            surface_subs: HashMap::new(),
+            surface_subs: FxHashMap::default(),
             surface_inflight_frames: VecDeque::new(),
-            vulkan_video_surfaces: HashMap::new(),
-            surface_view_sizes: HashMap::new(),
+            vulkan_video_surfaces: FxHashMap::default(),
+            surface_view_sizes: FxHashMap::default(),
             surface_codec_support: 0,
             surface_max_decode: (0, 0),
             surface_timestamp_sub_us: false,
