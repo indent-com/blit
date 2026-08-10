@@ -21,6 +21,8 @@
 | `BLIT_MAX_CONNECTIONS`         | `0` (unlimited)                                    | Reject client connections past this count                                              |
 | `BLIT_MAX_PTYS`                | `0` (unlimited)                                    | Refuse `CREATE` past this many PTYs across all clients                                 |
 | `BLIT_ENCODE_FENCE_TIMEOUT_MS` | `10000`                                            | Give up on a Vulkan encode submission after this long (`0` = wait forever)             |
+| `BLIT_ENABLE_EXTERNAL_MEMORY_HOST` | unset                                          | Force experimental direct `wl_shm` host import when Vulkan supports it                  |
+| `BLIT_DISABLE_EXTERNAL_MEMORY_HOST` | unset                                         | Disable automatic direct `wl_shm` host import                                           |
 
 `BLIT_MAX_CONNECTIONS` and `BLIT_MAX_PTYS` are an operator sanity bound against
 runaway automation, not a security control — a client that can open one PTY can
@@ -195,7 +197,7 @@ sequenceDiagram
 
 ### GPU rendering and encoding
 
-The compositor uses a Vulkan renderer (`VulkanRenderer`) loaded at runtime via `ash` (dlopen `libvulkan.so`). Client surface buffers (SHM or DMA-BUF) are uploaded as persistent GPU textures at `wl_surface.commit` time and reused across frames until the surface commits a new buffer.
+The compositor uses a Vulkan renderer (`VulkanRenderer`) loaded at runtime via `ash` (dlopen `libvulkan.so`). Client surface buffers (SHM or DMA-BUF) are uploaded as persistent GPU textures at `wl_surface.commit` time and reused across frames until the surface commits a new buffer. SHM normally copies only accumulated damaged rows into a reusable mapped staging buffer. When `VK_EXT_external_memory_host` exposes the client mapping as coherent device-local memory, Vulkan reads those damaged rows directly and the compositor retains the `wl_buffer` until the submission fence signals. NVIDIA host import remains opt-in because its driver currently shadows the full allocation, which is slower than the damage-aware staging path.
 
 #### Output pipeline
 

@@ -53,6 +53,62 @@ pub(crate) enum ShmUploadResult {
     Imported,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShmHostImportMode {
+    Disabled,
+    /// Import only when the client's pointer is compatible with coherent,
+    /// device-local memory. This is the zero-extra-CPU-copy path on UMA.
+    DeviceLocal,
+    /// Explicit operator override for drivers where the memory architecture
+    /// alone is not a reliable performance signal.
+    Forced,
+    /// NVIDIA currently shadows the complete host allocation in its driver.
+    /// Restrict an explicit override to frames that would be copied in full
+    /// anyway, so small damage never becomes an implicit full-surface copy.
+    ForcedFullUploads,
+}
+
+impl ShmHostImportMode {
+    fn should_try(self, full_upload: bool) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::DeviceLocal | Self::Forced => true,
+            Self::ForcedFullUploads => full_upload,
+        }
+    }
+
+    fn requires_device_local(self) -> bool {
+        self == Self::DeviceLocal
+    }
+}
+
+fn shm_host_import_mode(
+    extension_available: bool,
+    transfer_src_importable: bool,
+    coherent_device_local_type_available: bool,
+    vendor_id: u32,
+    forced: bool,
+    disabled: bool,
+) -> ShmHostImportMode {
+    if disabled || !extension_available || !transfer_src_importable {
+        return ShmHostImportMode::Disabled;
+    }
+    if forced {
+        return if vendor_id == 0x10de {
+            ShmHostImportMode::ForcedFullUploads
+        } else {
+            ShmHostImportMode::Forced
+        };
+    }
+    if vendor_id == 0x10de {
+        ShmHostImportMode::Disabled
+    } else if coherent_device_local_type_available {
+        ShmHostImportMode::DeviceLocal
+    } else {
+        ShmHostImportMode::Disabled
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct ShmTextureKey {
     width: u32,
@@ -262,6 +318,7 @@ pub(crate) struct VulkanRenderer {
     has_external_memory_fd: bool,
     external_memory_host_fn: Option<ash::ext::external_memory_host::Device>,
     external_memory_host_alignment: usize,
+    shm_host_import_mode: ShmHostImportMode,
 
     // Render pipeline
     render_pass: vk::RenderPass,
@@ -977,17 +1034,56 @@ impl VulkanRenderer {
             .collect();
         let physical_properties =
             unsafe { instance.get_physical_device_properties(physical_device) };
-        // NVIDIA accepts ordinary wl_shm mappings through
-        // VK_EXT_external_memory_host, but currently shadows the entire
-        // allocation with a CPU memmove before every transfer. That is much
-        // slower than copying damaged rows into our cached staging buffer, so
-        // keep this path available for driver experiments without enabling it
-        // by default.
-        let external_host_enabled = std::env::var_os("BLIT_ENABLE_EXTERNAL_MEMORY_HOST").is_some()
-            && std::env::var_os("BLIT_DISABLE_EXTERNAL_MEMORY_HOST").is_none();
-        let has_external_memory_host = physical_properties.vendor_id == 0x10de
-            && external_host_enabled
-            && ext_names_all.contains(&ash::ext::external_memory_host::NAME);
+        // Importing an arbitrary wl_shm mapping is useful only when the driver
+        // can expose that pointer as a transfer source. Extension presence is
+        // not enough: external handle capabilities are usage-specific.
+        let external_memory_host_available =
+            ext_names_all.contains(&ash::ext::external_memory_host::NAME);
+        let external_memory_host_importable = if external_memory_host_available {
+            let info = vk::PhysicalDeviceExternalBufferInfo::default()
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+            let mut properties = vk::ExternalBufferProperties::default();
+            unsafe {
+                instance.get_physical_device_external_buffer_properties(
+                    physical_device,
+                    &info,
+                    &mut properties,
+                );
+            }
+            let features = properties
+                .external_memory_properties
+                .external_memory_features;
+            features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+                && !features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY)
+        } else {
+            false
+        };
+        let memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let coherent_device_local_type_available = memory_properties.memory_types
+            [..memory_properties.memory_type_count as usize]
+            .iter()
+            .any(|memory_type| {
+                memory_type.property_flags.contains(
+                    vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT
+                        | vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                )
+            });
+        let force_external_memory_host =
+            std::env::var_os("BLIT_ENABLE_EXTERNAL_MEMORY_HOST").is_some();
+        let disable_external_memory_host =
+            std::env::var_os("BLIT_DISABLE_EXTERNAL_MEMORY_HOST").is_some();
+        let shm_host_import_mode = shm_host_import_mode(
+            external_memory_host_available,
+            external_memory_host_importable,
+            coherent_device_local_type_available,
+            physical_properties.vendor_id,
+            force_external_memory_host,
+            disable_external_memory_host,
+        );
+        let has_external_memory_host = shm_host_import_mode != ShmHostImportMode::Disabled;
         let external_memory_host_alignment = if has_external_memory_host {
             let mut host_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
             let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut host_props);
@@ -995,14 +1091,29 @@ impl VulkanRenderer {
                 instance.get_physical_device_properties2(physical_device, &mut props);
             }
             eprintln!(
-                "[vulkan-render] direct wl_shm host import available (alignment={})",
+                "[vulkan-render] direct wl_shm host import enabled mode={shm_host_import_mode:?} alignment={}",
                 host_props.min_imported_host_pointer_alignment,
             );
             host_props.min_imported_host_pointer_alignment as usize
         } else {
-            if physical_properties.vendor_id == 0x10de {
+            if external_memory_host_available && !external_memory_host_importable {
                 eprintln!(
-                    "[vulkan-render] direct wl_shm host import unavailable; using staging copies"
+                    "[vulkan-render] direct wl_shm host import unavailable for transfer sources"
+                );
+            } else if physical_properties.vendor_id == 0x10de
+                && !disable_external_memory_host
+                && !force_external_memory_host
+            {
+                eprintln!(
+                    "[vulkan-render] direct wl_shm host import is slower on NVIDIA; using damaged staging copies"
+                );
+            } else if external_memory_host_importable
+                && !coherent_device_local_type_available
+                && !disable_external_memory_host
+                && !force_external_memory_host
+            {
+                eprintln!(
+                    "[vulkan-render] direct wl_shm host import has no coherent device-local memory; using staging copies"
                 );
             }
             0
@@ -1664,6 +1775,7 @@ impl VulkanRenderer {
             has_external_memory_fd,
             external_memory_host_fn,
             external_memory_host_alignment,
+            shm_host_import_mode,
             render_pass,
             pipeline_layout,
             pipeline,
@@ -1961,14 +2073,38 @@ impl VulkanRenderer {
             return None;
         }
         let type_bits = requirements.memory_type_bits & host_properties.memory_type_bits;
-        // Prefer ordinary cached system memory when the imported pointer can
-        // be represented by more than one compatible Vulkan memory type.
-        // This does not guarantee zero-copy, but avoids selecting a
-        // write-combined host type merely because it has the lowest index.
-        let Some(memory_type) = self.find_readback_memory_type(type_bits) else {
+        // Automatic import is intentionally stricter than the extension's
+        // validity rules. A coherent DEVICE_LOCAL type means the GPU and CPU
+        // share the payload closely enough that skipping our damaged-row copy
+        // is likely a real win (the normal UMA case). Merely HOST_VISIBLE
+        // memory can make a discrete driver shadow the allocation internally.
+        // The explicit override retains the broader, spec-valid selection for
+        // driver experiments and unusual memory architectures.
+        let memory_type = if self.shm_host_import_mode.requires_device_local() {
+            self.find_memory_type(
+                type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE
+                    | vk::MemoryPropertyFlags::HOST_COHERENT
+                    | vk::MemoryPropertyFlags::HOST_CACHED
+                    | vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .or_else(|| {
+                self.find_memory_type(
+                    type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT
+                        | vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                )
+            })
+        } else {
+            self.find_readback_memory_type(type_bits)
+        };
+        let Some(memory_type) = memory_type else {
             eprintln!(
-                "[shm-host-import] no coherent memory type buffer_bits=0x{:x} host_bits=0x{:x}",
-                requirements.memory_type_bits, host_properties.memory_type_bits,
+                "[shm-host-import] no suitable memory type mode={:?} buffer_bits=0x{:x} host_bits=0x{:x}",
+                self.shm_host_import_mode,
+                requirements.memory_type_bits,
+                host_properties.memory_type_bits,
             );
             unsafe {
                 libc::munmap(mapped_ptr, import_len);
@@ -5258,12 +5394,11 @@ impl VulkanRenderer {
         };
 
         let full_upload = is_full_shm_damage(&copy_damage, key);
-        // VK_EXT_external_memory_host guarantees access to the imported
-        // pointer, not that the driver will access it without copying. NVIDIA
-        // currently copies the whole imported allocation before a transfer,
-        // so importing a small-damage frame amplifies a small row copy into a
-        // full-surface copy. Keep the import path for full uploads only.
-        let try_external_host = full_upload
+        // On coherent device-local host memory, copy the damaged regions from
+        // the client's mapping directly on the GPU and avoid our CPU memcpy.
+        // A forced NVIDIA import remains full-upload-only because that driver
+        // shadows the complete allocation before every transfer.
+        let try_external_host = self.shm_host_import_mode.should_try(full_upload)
             && self.external_memory_host_fn.is_some()
             && !self.shm_host_import_failures.contains(buffer_id);
         let external_host = try_external_host
@@ -8629,9 +8764,9 @@ impl Drop for VulkanRenderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeReadback, ShmDamageFrame, ShmDamageRect, ShmTextureKey, clamped_scissor,
-        coalesce_shm_damage, is_full_shm_damage, native_readback_plan, page_rounded_len,
-        shm_damage_since,
+        NativeReadback, ShmDamageFrame, ShmDamageRect, ShmHostImportMode, ShmTextureKey,
+        clamped_scissor, coalesce_shm_damage, is_full_shm_damage, native_readback_plan,
+        page_rounded_len, shm_damage_since, shm_host_import_mode,
     };
     use ash::vk;
     use std::collections::VecDeque;
@@ -8737,7 +8872,7 @@ mod tests {
     }
 
     #[test]
-    fn host_import_is_reserved_for_full_surface_damage() {
+    fn full_surface_damage_is_detected() {
         assert!(is_full_shm_damage(
             &[ShmDamageRect {
                 x: 0,
@@ -8757,6 +8892,47 @@ mod tests {
             shm_key(),
         ));
         assert!(!is_full_shm_damage(&[], shm_key()));
+    }
+
+    #[test]
+    fn automatic_host_import_requires_capability() {
+        assert_eq!(
+            shm_host_import_mode(false, false, true, 0x8086, false, false),
+            ShmHostImportMode::Disabled,
+        );
+        assert_eq!(
+            shm_host_import_mode(true, false, true, 0x8086, false, false),
+            ShmHostImportMode::Disabled,
+        );
+        assert_eq!(
+            shm_host_import_mode(true, true, true, 0x8086, false, false),
+            ShmHostImportMode::DeviceLocal,
+        );
+        assert!(ShmHostImportMode::DeviceLocal.should_try(false));
+        assert_eq!(
+            shm_host_import_mode(true, true, false, 0x8086, false, false),
+            ShmHostImportMode::Disabled,
+        );
+    }
+
+    #[test]
+    fn nvidia_host_import_remains_an_explicit_full_upload_override() {
+        assert_eq!(
+            shm_host_import_mode(true, true, true, 0x10de, false, false),
+            ShmHostImportMode::Disabled,
+        );
+        let forced = shm_host_import_mode(true, true, false, 0x10de, true, false);
+        assert_eq!(forced, ShmHostImportMode::ForcedFullUploads);
+        assert!(forced.should_try(true));
+        assert!(!forced.should_try(false));
+    }
+
+    #[test]
+    fn disabling_host_import_wins_over_the_force_override() {
+        assert_eq!(
+            shm_host_import_mode(true, true, true, 0x8086, true, true),
+            ShmHostImportMode::Disabled,
+        );
     }
 
     #[test]
