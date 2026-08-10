@@ -715,8 +715,11 @@ export class MuxTransport {
     if (typeof Worker === "undefined" || buffer.byteLength === 0) return;
     try {
       if (!this.bufferRecycler) {
+        // `.js`, not `.ts`: tsc copies this literal into dist verbatim, and the
+        // published package resolves from dist. Vite maps it back to the `.ts`
+        // source when core is consumed from src inside this repo.
         this.bufferRecycler = new Worker(
-          new URL("./buffer-recycler-worker.ts", import.meta.url),
+          new URL("./buffer-recycler-worker.js", import.meta.url),
           { type: "module", name: "blit-buffer-recycler" },
         );
       }
