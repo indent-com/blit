@@ -2064,6 +2064,11 @@ const SURFACE_INFLIGHT_MIN: usize = 64;
 /// kilobytes, not megabytes.
 const SURFACE_INFLIGHT_HARD_MAX: usize = 8_192;
 
+/// Terminal previews are rendered as small thumbnails.  Driving every
+/// background PTY at a high-refresh display's full cadence wastes snapshot,
+/// compression, transport, and browser paint work without improving the menu.
+const TERMINAL_PREVIEW_MAX_FPS: f32 = 15.0;
+
 /// Cap on unacked surface frames tracked per client.  A frame can go
 /// unacked forever (client teardown mid-flight, a transport that drops
 /// it), and every orphan permanently offsets the queue — so the oldest
@@ -2140,7 +2145,8 @@ impl Pacing {
         let bandwidth_floor_bps = bandwidth_floor_bps(client);
         // Inline of `throughput_limited`, reusing the two roots above.
         let lead_bps = client.avg_paced_frame_bytes.max(256.0) * browser_pacing_fps;
-        let preview_bps = client.avg_preview_frame_bytes.max(256.0) * client.display_fps.max(1.0);
+        let preview_bps = client.avg_preview_frame_bytes.max(256.0)
+            * client.display_fps.clamp(1.0, TERMINAL_PREVIEW_MAX_FPS);
         Self {
             throughput_limited: (lead_bps + preview_bps) > bandwidth_floor_bps * 0.9,
             browser_pacing_fps,
@@ -2221,12 +2227,13 @@ impl Pacing {
     }
 
     fn preview_fps(&self, client: &ClientState) -> f32 {
-        let mut fps = client.display_fps.max(1.0);
+        let mut fps = client.display_fps.clamp(1.0, TERMINAL_PREVIEW_MAX_FPS);
         if client.lead.is_some() && self.throughput_limited {
             // Only budget preview bandwidth when the link is actually saturated.
             // Without this, large preview frames (e.g. 12 KB) at 30 fps consume
             // 360 KB/s, starving the lead even when lead frames are tiny.
-            // On fast links (localhost, LAN), previews run at display_fps.
+            // On fast links (localhost, LAN), previews run at their thumbnail
+            // cap rather than consuming one full display-rate stream per PTY.
             let avail = self.bandwidth_floor_bps;
             let lead_bps = client.avg_paced_frame_bytes.max(256.0) * self.browser_pacing_fps;
             let preview_budget = (avail - lead_bps).max(avail * 0.25).max(0.0);
@@ -19754,6 +19761,17 @@ mod tests {
         assert!(!throughput_limited(&client));
     }
 
+    #[test]
+    fn throughput_demand_uses_terminal_preview_cap() {
+        let mut client = test_client();
+        client.display_fps = 144.0;
+        client.avg_paced_frame_bytes = 256.0;
+        client.avg_preview_frame_bytes = 12_000.0;
+        client.goodput_bps = 400_000.0;
+        client.delivery_bps = 400_000.0;
+        assert!(!throughput_limited(&client));
+    }
+
     // ── browser_pacing_fps ──
 
     #[test]
@@ -19851,6 +19869,24 @@ mod tests {
     fn preview_fps_at_least_one() {
         let client = test_client();
         assert!(preview_fps(&client) >= 1.0);
+    }
+
+    #[test]
+    fn preview_fps_is_capped_at_thumbnail_rate() {
+        let mut client = test_client();
+        client.display_fps = 144.0;
+        client.goodput_bps = 100_000_000.0;
+        client.delivery_bps = 100_000_000.0;
+        assert_eq!(preview_fps(&client), TERMINAL_PREVIEW_MAX_FPS);
+    }
+
+    #[test]
+    fn preview_fps_preserves_lower_display_rate() {
+        let mut client = test_client();
+        client.display_fps = 10.0;
+        client.goodput_bps = 100_000_000.0;
+        client.delivery_bps = 100_000_000.0;
+        assert_eq!(preview_fps(&client), 10.0);
     }
 
     // ── window_open ──
