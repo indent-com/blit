@@ -83,27 +83,27 @@ impl SurfaceEncoderPreference {
         {
             return list;
         }
+        Self::builtin_defaults()
+    }
+
+    fn builtin_defaults() -> Vec<Self> {
         vec![
-            // Vulkan Video is tried first: it encodes on the compositor's own
-            // device, so the frame never leaves the GPU it was composited on
-            // and there is no server-side encode in the path at all.  What it
-            // costs is reach — no speed control, no rate control beyond the
-            // adaptive QP, and a session the driver declines after selection.
-            // Every one of those is recoverable: the tier refuses per encoder,
-            // and the client falls through to the dedicated engines below
-            // with its request intact.
+            Self::NvencAV1,
+            Self::NvencH264,
+            Self::AV1Vaapi,
+            Self::H264Vaapi,
+            // Vulkan Video follows the dedicated encode engines but remains
+            // above software. It keeps the frame on the compositor's device,
+            // at the cost of having no speed control and no rate control
+            // beyond the adaptive QP.
             //
-            // AV1 leads the tier for its better compression.  Both entries
+            // AV1 leads the Vulkan tier for its better compression. Both entries
             // encode either chroma — AV1 4:4:4 is High profile, H.264 4:4:4
             // is High 4:4:4 Predictive — where the driver has the profile;
             // where it does not, the caps query declines that session and
             // the client falls through with its 4:4:4 intact.
             Self::VulkanVideoAV1,
             Self::VulkanVideoH264,
-            Self::NvencAV1,
-            Self::NvencH264,
-            Self::AV1Vaapi,
-            Self::H264Vaapi,
             Self::H264Software,
             Self::AV1Software,
         ]
@@ -272,10 +272,9 @@ impl SurfaceEncoderPreference {
 /// list enforces its rank; this does.  Entries below the tier never hold it
 /// back, which is the point of ordering it above them.
 ///
-/// On the default list nothing outranks the tier, so this answers `false` on
-/// its first step and Vulkan Video simply wins.  It earns its keep for a
-/// `BLIT_SURFACE_ENCODERS` that puts a dedicated engine first: without it a
-/// listed Vulkan encoder would win wherever it sat.
+/// On the default list NVENC and VA-API outrank the tier. Without this check,
+/// a listed Vulkan encoder would win wherever it sat because its selection
+/// happens before the server-side fallback walk.
 ///
 /// "Could still" is what the host has proven, not what it might do.  A
 /// family leaves the running two ways, both cached and both free to consult:
@@ -2893,6 +2892,24 @@ mod tests {
         );
         assert_eq!(SurfaceEncoderPreference::tightest_for_list(&[]), None);
         assert_eq!(SurfaceEncoderPreference::widest_for_list(&[]), None);
+    }
+
+    #[test]
+    fn builtin_priority_puts_vulkan_after_dedicated_engines() {
+        use SurfaceEncoderPreference as P;
+        assert_eq!(
+            P::builtin_defaults(),
+            vec![
+                P::NvencAV1,
+                P::NvencH264,
+                P::AV1Vaapi,
+                P::H264Vaapi,
+                P::VulkanVideoAV1,
+                P::VulkanVideoH264,
+                P::H264Software,
+                P::AV1Software,
+            ]
+        );
     }
 
     /// The Vulkan tier ranks below the dedicated encode engines, and this

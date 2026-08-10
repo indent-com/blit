@@ -171,8 +171,8 @@ Set `BLIT_SURFACE_ENCODERS` to a comma-separated priority list of encoders.
 The server tries each in order and uses the first that works.
 
 ```bash
-# Default priority (compositor-resident, then encode engines, then software):
-# av1-vulkan,h264-vulkan,av1-nvenc,h264-nvenc,av1-vaapi,h264-vaapi,h264-software,av1-software
+# Default priority (dedicated encode engines, compositor-resident, then software):
+# av1-nvenc,h264-nvenc,av1-vaapi,h264-vaapi,av1-vulkan,h264-vulkan,h264-software,av1-software
 
 # Force software AV1 only:
 BLIT_SURFACE_ENCODERS=av1-software

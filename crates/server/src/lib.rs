@@ -1609,6 +1609,10 @@ struct SurfaceSubState {
     /// thumbnail that is below the device minimum permanently condemns the
     /// later full-size pane to a server-side fallback encoder.
     vulkan_refused_extent: Option<(u32, u32)>,
+    /// Extent at which every server-side encoder ranked above Vulkan was
+    /// attempted and failed. This admits Vulkan on the next tick even when a
+    /// predecessor works generally but refused this particular frame shape.
+    vulkan_predecessors_exhausted_extent: Option<(u32, u32)>,
     /// Last per-client downscale target dims registered with the
     /// compositor.  Used to send `ClearDownscaleTarget` for the old
     /// dims when the encoder is recreated at a new size, so stale
@@ -3651,6 +3655,29 @@ fn vulkan_video_tier_eligible(
     height: u32,
 ) -> bool {
     !surface_encoder::outranking_encoder_pending(preferences, codec_support, width, height)
+}
+
+/// Preferences the server-side creation task may walk without jumping over
+/// Vulkan Video. The boolean records that a failure exhausts the predecessors
+/// at this extent and should admit Vulkan immediately on the next tick.
+fn server_creation_preferences(
+    preferences: &[SurfaceEncoderPreference],
+    vulkan_eligible: bool,
+) -> (Vec<SurfaceEncoderPreference>, bool) {
+    let probing_vulkan_predecessors =
+        !vulkan_eligible && preferences.iter().any(|pref| pref.is_vulkan_video());
+    if probing_vulkan_predecessors {
+        (
+            preferences
+                .iter()
+                .copied()
+                .take_while(|pref| !pref.is_vulkan_video())
+                .collect(),
+            true,
+        )
+    } else {
+        (preferences.to_vec(), false)
+    }
 }
 
 /// Choose the chroma profile for the next attempt at one Vulkan codec.
@@ -6498,6 +6525,7 @@ async fn tick(state: &AppState) -> TickOutcome {
     }
     struct EncoderCreateParams {
         preferences: Vec<SurfaceEncoderPreference>,
+        probing_vulkan_predecessors: bool,
         vaapi_device: String,
         encoding: SurfaceEncoding,
         verbose: bool,
@@ -6548,6 +6576,10 @@ async fn tick(state: &AppState) -> TickOutcome {
         /// and lets the next tick retry immediately instead of spending the
         /// failure backoff on a request that is merely too big.
         oversized: bool,
+        /// Set only when creation stopped at the Vulkan boundary. If every
+        /// predecessor failed, the next tick should try Vulkan rather than
+        /// back off or let software jump the tier.
+        vulkan_predecessors_exhausted: Option<(u32, u32)>,
     }
     /// Metadata shipped with an encode result when the encoder was
     /// created this tick (deferred to spawn_blocking).  `Some` = the
@@ -7381,7 +7413,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     continue;
                 }
 
-                // --- Try Vulkan Video first ---
+                // --- Try Vulkan Video at its configured rank ---
                 if needs_new_encoder {
                     let codec_support = surface_codec_support(client, sid);
                     let encoding = SurfaceEncoding {
@@ -7402,12 +7434,16 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // block is what enforces: selection here runs ahead of
                     // the fallback chain, so without the check a listed
                     // Vulkan encoder would win no matter where it sits.
-                    let vulkan_eligible = vulkan_video_tier_eligible(
-                        &state.config.surface_encoders,
-                        codec_support,
-                        enc_w,
-                        enc_h,
-                    );
+                    let predecessors_exhausted = client.surface_subs.get(&sid).is_some_and(|sub| {
+                        sub.vulkan_predecessors_exhausted_extent == Some((enc_w, enc_h))
+                    });
+                    let vulkan_eligible = predecessors_exhausted
+                        || vulkan_video_tier_eligible(
+                            &state.config.surface_encoders,
+                            codec_support,
+                            enc_w,
+                            enc_h,
+                        );
                     let (refused_bits, refused_444_bits) = vulkan_refusals_for_extent(
                         client.surface_subs.entry(sid).or_default(),
                         enc_w,
@@ -7591,6 +7627,19 @@ async fn tick(state: &AppState) -> TickOutcome {
                         continue;
                     }
 
+                    // If Vulkan is waiting behind a server-side backend, only
+                    // probe the entries ranked above it. Walking past Vulkan
+                    // to software here would make software win even when the
+                    // compositor can provide the higher-ranked Vulkan tier.
+                    // Once the preceding probes are known unavailable, the
+                    // next tick admits Vulkan; if Vulkan itself is unavailable,
+                    // a later creation uses the full list and reaches software.
+                    let (creation_preferences, probing_vulkan_predecessors) =
+                        server_creation_preferences(
+                            &state.config.surface_encoders,
+                            vulkan_eligible,
+                        );
+
                     // Defer encoder creation to spawn_blocking so the
                     // tick loop isn't blocked by slow VA-API init.
                     // The creation task allocates GBM buffers and
@@ -7611,7 +7660,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                         native_w,
                         native_h,
                         params: EncoderCreateParams {
-                            preferences: state.config.surface_encoders.clone(),
+                            preferences: creation_preferences,
+                            probing_vulkan_predecessors,
                             vaapi_device: state.config.vaapi_device.clone(),
                             encoding,
                             verbose: state.config.verbose,
@@ -8270,6 +8320,9 @@ async fn tick(state: &AppState) -> TickOutcome {
                                     encoder: None,
                                     fresh: None,
                                     oversized,
+                                    vulkan_predecessors_exhausted: params
+                                        .probing_vulkan_predecessors
+                                        .then_some((job.target_w, job.target_h)),
                                 };
                             }
                         };
@@ -8340,6 +8393,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             encoder: Some(encoder),
                             fresh: Some(fresh),
                             oversized: false,
+                            vulkan_predecessors_exhausted: None,
                         }
                     })
                 })
@@ -8425,6 +8479,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                     if let Some(client) = sess.clients.get_mut(&result.cid)
                         && let Some(s) = client.surface_subs.get_mut(&result.sid)
                     {
+                        if let Some(extent) = result.vulkan_predecessors_exhausted {
+                            s.vulkan_predecessors_exhausted_extent = Some(extent);
+                            s.nal_none_streak = 0;
+                            s.nal_none_latched_at = None;
+                            continue;
+                        }
                         s.create_failures = s.create_failures.saturating_add(1);
                         // Bring the surface down to what the whole chain
                         // clears when the size is what stands in the way.
@@ -14002,6 +14062,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         // the surface to the old winner's ceiling.
                         state.selected_encoder = None;
                         state.encoder_cap_degraded = false;
+                        state.vulkan_predecessors_exhausted_extent = None;
                         // The tally that justified narrowing goes with it,
                         // or the very first failure on the new chain would
                         // narrow again on the strength of the old one's.
@@ -15191,6 +15252,20 @@ mod tests {
     fn vulkan_video_accepts_a_scaled_client_target() {
         let preferences = [SurfaceEncoderPreference::VulkanVideoAV1];
         assert!(vulkan_video_tier_eligible(&preferences, 0, 1280, 720));
+    }
+
+    #[test]
+    fn server_creation_does_not_jump_from_dedicated_engines_over_vulkan() {
+        use SurfaceEncoderPreference as P;
+        let preferences = [P::NvencAV1, P::AV1Vaapi, P::VulkanVideoAV1, P::AV1Software];
+        assert_eq!(
+            server_creation_preferences(&preferences, false),
+            (vec![P::NvencAV1, P::AV1Vaapi], true)
+        );
+        assert_eq!(
+            server_creation_preferences(&preferences, true),
+            (preferences.to_vec(), false)
+        );
     }
 
     #[test]
