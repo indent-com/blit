@@ -95,6 +95,34 @@ test("keyboard rises only from the toggle and the key line tracks it", async ({
   });
   await expect(keyLine).toBeVisible();
 
+  // Extra keys travel through the terminal's keyboard path, where cursor
+  // application mode and one-shot modifiers are encoded. Raw workspace bytes
+  // bypassed that state and made the row fail inside TUIs.
+  await page.evaluate(() => {
+    const input = document.querySelector<HTMLTextAreaElement>(
+      'textarea[aria-label="Terminal input"]',
+    );
+    if (!input) throw new Error("no terminal input");
+    const log: string[] = [];
+    (
+      window as unknown as { __terminalExtraKeys: string[] }
+    ).__terminalExtraKeys = log;
+    for (const type of ["keydown", "keyup"] as const) {
+      input.addEventListener(type, (event) => {
+        log.push(`${type}:${event.key}:${event.code}`);
+      });
+    }
+  });
+  await page.getByRole("button", { name: "↑", exact: true }).tap();
+  expect(
+    await page.evaluate(
+      () =>
+        (
+          window as unknown as { __terminalExtraKeys: string[] }
+        ).__terminalExtraKeys,
+    ),
+  ).toEqual(["keydown:ArrowUp:ArrowUp", "keyup:ArrowUp:ArrowUp"]);
+
   // Reducing the keyboard removes the key line immediately, expires the
   // toggle's intent, and re-arms the suppression.
   await cdp.send("Emulation.setDeviceMetricsOverride", {
@@ -328,6 +356,40 @@ test("the icon's keyboard survives focus landing on a surface canvas", async ({
   await surfaceCanvas.tap();
   await expect(surfaceInput).toBeFocused();
   await expect(page.getByTitle("Hide keyboard")).toBeVisible();
+
+  // The extra row belongs to the keyboard-holding input, not to the last
+  // terminal session. Surface panes used to show the row while every key in
+  // it was still written to a stale terminal.
+  await page.evaluate(() => {
+    const input = document.querySelector<HTMLTextAreaElement>(
+      'textarea[aria-label="Surface input"]',
+    );
+    if (!input) throw new Error("no surface input");
+    const log: string[] = [];
+    (
+      window as unknown as { __surfaceExtraKeys: string[] }
+    ).__surfaceExtraKeys = log;
+    for (const type of ["keydown", "keyup"] as const) {
+      input.addEventListener(type, (event) => {
+        log.push(`${type}:${event.key}:${event.code}`);
+      });
+    }
+  });
+  await page.getByRole("button", { name: "Esc", exact: true }).tap();
+  await page.getByRole("button", { name: "/", exact: true }).tap();
+  expect(
+    await page.evaluate(
+      () =>
+        (
+          window as unknown as { __surfaceExtraKeys: string[] }
+        ).__surfaceExtraKeys,
+    ),
+  ).toEqual([
+    "keydown:Escape:Escape",
+    "keyup:Escape:Escape",
+    "keydown:/:Slash",
+    "keyup:/:Slash",
+  ]);
 });
 
 /**

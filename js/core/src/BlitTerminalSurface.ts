@@ -54,6 +54,23 @@ const CTRL_V = 0x16;
  *  paste should risk the session on. */
 const MAX_CLIPBOARD_BYTES = 8 * 1024 * 1024;
 
+/** The mounted terminal surface owning each hidden keyboard textarea. */
+const terminalSurfaceByInput = new WeakMap<
+  HTMLTextAreaElement,
+  BlitTerminalSurface
+>();
+
+/** Resolve a terminal surface from the hidden textarea that currently holds
+ * keyboard focus. UI chrome uses this instead of retaining whichever split
+ * happened to mount last. */
+export function terminalSurfaceForInput(
+  input: Element | null,
+): BlitTerminalSurface | null {
+  return input instanceof HTMLTextAreaElement
+    ? (terminalSurfaceByInput.get(input) ?? null)
+    : null;
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -843,6 +860,7 @@ export class BlitTerminalSurface {
       overflow: "hidden",
     });
     container.appendChild(this.inputEl);
+    terminalSurfaceByInput.set(this.inputEl, this);
 
     // Native scroll surface — sits over the canvas, captures all pointer/
     // wheel/touch input, and lets the browser handle scrollback navigation
@@ -922,8 +940,11 @@ export class BlitTerminalSurface {
     if (this.glCanvas && this.container?.contains(this.glCanvas)) {
       this.container.removeChild(this.glCanvas);
     }
-    if (this.inputEl && this.container?.contains(this.inputEl)) {
-      this.container.removeChild(this.inputEl);
+    if (this.inputEl) {
+      terminalSurfaceByInput.delete(this.inputEl);
+      if (this.container?.contains(this.inputEl)) {
+        this.container.removeChild(this.inputEl);
+      }
     }
     if (this.scrollEl && this.container?.contains(this.scrollEl)) {
       this.container.removeChild(this.scrollEl);

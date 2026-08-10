@@ -140,7 +140,11 @@ export { keyToBytes, ctrlCharToByte, encoder } from "./keyboard";
 export type { GlRenderer, RendererBackend } from "./gl-renderer";
 export { createWebGpuRenderer } from "./webgpu-renderer";
 
-export { BlitTerminalSurface, isIOS } from "./BlitTerminalSurface";
+export {
+  BlitTerminalSurface,
+  isIOS,
+  terminalSurfaceForInput,
+} from "./BlitTerminalSurface";
 export type {
   BlitTerminalSurfaceOptions,
   BlitTerminalSurfaceHandle,
@@ -149,6 +153,7 @@ export type {
 
 export {
   BlitSurfaceCanvas,
+  surfaceCanvasForInput,
   detectCodecSupport,
   getCodecSupport,
   getMaxDecodeSize,

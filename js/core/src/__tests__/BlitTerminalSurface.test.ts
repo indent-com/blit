@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { BlitTerminalSurface } from "../BlitTerminalSurface";
+import {
+  BlitTerminalSurface,
+  terminalSurfaceForInput,
+} from "../BlitTerminalSurface";
 
 function mockCanvasContext(): void {
   // jsdom returns null for getContext("2d") on detached canvases.
@@ -77,6 +80,16 @@ describe("BlitTerminalSurface sizing", () => {
     }
     return { surface, canvas };
   }
+
+  it("resolves the mounted surface from its keyboard textarea", () => {
+    const { surface, canvas } = attachSurface();
+    const input = canvas.parentElement?.querySelector(
+      'textarea[aria-label="Terminal input"]',
+    );
+    expect(terminalSurfaceForInput(input ?? null)).toBe(surface);
+    surface.dispose();
+    expect(terminalSurfaceForInput(input ?? null)).toBeNull();
+  });
 
   it("uses the same resizable layout in read-only and writable modes", () => {
     const writable = attachSurface();

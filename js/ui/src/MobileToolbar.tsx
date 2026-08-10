@@ -1,25 +1,59 @@
 import { createSignal, createEffect, onCleanup } from "solid-js";
-import type { BlitTerminalSurface, SessionId } from "@blit-sh/core";
-import { encoder } from "@blit-sh/core";
-import type { BlitWorkspace } from "@blit-sh/core";
+import type { BlitSurfaceCanvas, BlitTerminalSurface } from "@blit-sh/core";
+import {
+  surfaceCanvasForInput,
+  terminalSurfaceForInput,
+} from "@blit-sh/core";
 import type { Theme, UIScale } from "./theme";
 
 // ---------------------------------------------------------------------------
-// Terminal byte sequences
+// Extra-key definitions
 // ---------------------------------------------------------------------------
 
-const ESC = encoder.encode("\x1b");
-const TAB = encoder.encode("\t");
-const ARROW_UP = encoder.encode("\x1b[A");
-const ARROW_DOWN = encoder.encode("\x1b[B");
-const ARROW_RIGHT = encoder.encode("\x1b[C");
-const ARROW_LEFT = encoder.encode("\x1b[D");
+type ExtraKey = { key: string; code: string; shiftKey?: boolean };
 
-const CHAR_SLASH = encoder.encode("/");
-const CHAR_PIPE = encoder.encode("|");
-const CHAR_BACKSLASH = encoder.encode("\\");
-const CHAR_TILDE = encoder.encode("~");
-const CHAR_BACKTICK = encoder.encode("`");
+const ESC: ExtraKey = { key: "Escape", code: "Escape" };
+const TAB: ExtraKey = { key: "Tab", code: "Tab" };
+const ARROW_UP: ExtraKey = { key: "ArrowUp", code: "ArrowUp" };
+const ARROW_DOWN: ExtraKey = { key: "ArrowDown", code: "ArrowDown" };
+const ARROW_RIGHT: ExtraKey = { key: "ArrowRight", code: "ArrowRight" };
+const ARROW_LEFT: ExtraKey = { key: "ArrowLeft", code: "ArrowLeft" };
+
+const CHAR_SLASH: ExtraKey = { key: "/", code: "Slash" };
+const CHAR_PIPE: ExtraKey = {
+  key: "|",
+  code: "Backslash",
+  shiftKey: true,
+};
+const CHAR_BACKSLASH: ExtraKey = { key: "\\", code: "Backslash" };
+const CHAR_TILDE: ExtraKey = {
+  key: "~",
+  code: "Backquote",
+  shiftKey: true,
+};
+const CHAR_BACKTICK: ExtraKey = { key: "`", code: "Backquote" };
+
+type ModifierSurface = Pick<
+  BlitTerminalSurface | BlitSurfaceCanvas,
+  | "ctrlModifier"
+  | "altModifier"
+  | "setCtrlModifier"
+  | "setAltModifier"
+  | "onCtrlModifierChange"
+  | "onAltModifierChange"
+>;
+
+function dispatchKey(target: HTMLElement, key: ExtraKey): void {
+  const init: KeyboardEventInit = {
+    key: key.key,
+    code: key.code,
+    shiftKey: key.shiftKey,
+    bubbles: true,
+    cancelable: true,
+  };
+  target.dispatchEvent(new KeyboardEvent("keydown", init));
+  target.dispatchEvent(new KeyboardEvent("keyup", init));
+}
 
 // ---------------------------------------------------------------------------
 // ToolbarButton — a single button in the toolbar strip
@@ -103,8 +137,8 @@ function ToolbarButton(props: {
 function ArrowButton(props: {
   label: string;
   title: string;
-  bytes: Uint8Array;
-  send: (bytes: Uint8Array) => void;
+  key: ExtraKey;
+  send: (key: ExtraKey) => void;
   theme: Theme;
   scale: UIScale;
 }) {
@@ -112,9 +146,9 @@ function ArrowButton(props: {
   let timeout: ReturnType<typeof setTimeout> | undefined;
 
   function start() {
-    props.send(props.bytes);
+    props.send(props.key);
     timeout = setTimeout(() => {
-      timer = setInterval(() => props.send(props.bytes), 80);
+      timer = setInterval(() => props.send(props.key), 80);
     }, 300);
   }
 
@@ -172,9 +206,7 @@ function ArrowButton(props: {
 // ---------------------------------------------------------------------------
 
 export function MobileToolbar(props: {
-  workspace: BlitWorkspace;
-  focusedSessionId: () => SessionId | null;
-  surface: () => BlitTerminalSurface | null;
+  keyboardTarget: () => HTMLElement | null;
   theme: Theme;
   scale: UIScale;
 }) {
@@ -182,16 +214,22 @@ export function MobileToolbar(props: {
   const [altActive, setAltActive] = createSignal(false);
   const canPaste = typeof navigator !== "undefined" && !!navigator.clipboard;
 
+  const modifierSurface = (): ModifierSurface | null => {
+    const target = props.keyboardTarget();
+    return terminalSurfaceForInput(target) ?? surfaceCanvasForInput(target);
+  };
+
   // Sync Ctrl modifier state from surface
   let ctrlUnsub: (() => void) | undefined;
   createEffect(() => {
     ctrlUnsub?.();
-    const surface = props.surface();
+    const surface = modifierSurface();
     if (surface) {
+      setCtrlActive(surface.ctrlModifier);
       ctrlUnsub = surface.onCtrlModifierChange((active) =>
         setCtrlActive(active),
       );
-    }
+    } else setCtrlActive(false);
   });
   onCleanup(() => ctrlUnsub?.());
 
@@ -199,28 +237,68 @@ export function MobileToolbar(props: {
   let altUnsub: (() => void) | undefined;
   createEffect(() => {
     altUnsub?.();
-    const surface = props.surface();
+    const surface = modifierSurface();
     if (surface) {
+      setAltActive(surface.altModifier);
       altUnsub = surface.onAltModifierChange((active) => setAltActive(active));
-    }
+    } else setAltActive(false);
   });
   onCleanup(() => altUnsub?.());
 
-  const send = (bytes: Uint8Array) => {
-    const sid = props.focusedSessionId();
-    if (sid) props.workspace.sendInput(sid, bytes);
+  const send = (key: ExtraKey) => {
+    const target = props.keyboardTarget();
+    if (target) dispatchKey(target, key);
   };
 
   const handlePaste = () => {
-    const surface = props.surface();
+    const target = props.keyboardTarget();
+    if (!target) return;
+    const terminal = terminalSurfaceForInput(target);
+    if (terminal) {
+      void terminal.pasteFromClipboard();
+      // Keep the keyboard up: some browsers move focus to the tapped button.
+      terminal.focus();
+      return;
+    }
+    const surface = surfaceCanvasForInput(target);
     if (!surface) return;
-    void surface.pasteFromClipboard();
-    // Keep the keyboard up: some browsers move focus to the tapped button.
-    surface.focus();
+    // Wayland paste is a native Ctrl+V chord. Dispatch it from this genuine
+    // click so the surface's clipboard read retains transient activation.
+    surface.setCtrlModifier(false);
+    surface.setAltModifier(false);
+    target.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Control",
+        code: "ControlLeft",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    for (const type of ["keydown", "keyup"] as const) {
+      target.dispatchEvent(
+        new KeyboardEvent(type, {
+          key: "v",
+          code: "KeyV",
+          ctrlKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    }
+    target.dispatchEvent(
+      new KeyboardEvent("keyup", {
+        key: "Control",
+        code: "ControlLeft",
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    target.focus();
   };
 
   const toggleCtrl = () => {
-    const surface = props.surface();
+    const surface = modifierSurface();
     if (!surface) return;
     const next = !surface.ctrlModifier;
     surface.setCtrlModifier(next);
@@ -233,7 +311,7 @@ export function MobileToolbar(props: {
   };
 
   const toggleAlt = () => {
-    const surface = props.surface();
+    const surface = modifierSurface();
     if (!surface) return;
     const next = !surface.altModifier;
     surface.setAltModifier(next);
@@ -350,7 +428,7 @@ export function MobileToolbar(props: {
         <ArrowButton
           label="←"
           title="Left"
-          bytes={ARROW_LEFT}
+          key={ARROW_LEFT}
           send={send}
           theme={props.theme}
           scale={props.scale}
@@ -358,7 +436,7 @@ export function MobileToolbar(props: {
         <ArrowButton
           label="→"
           title="Right"
-          bytes={ARROW_RIGHT}
+          key={ARROW_RIGHT}
           send={send}
           theme={props.theme}
           scale={props.scale}
@@ -366,7 +444,7 @@ export function MobileToolbar(props: {
         <ArrowButton
           label="↑"
           title="Up"
-          bytes={ARROW_UP}
+          key={ARROW_UP}
           send={send}
           theme={props.theme}
           scale={props.scale}
@@ -374,7 +452,7 @@ export function MobileToolbar(props: {
         <ArrowButton
           label="↓"
           title="Down"
-          bytes={ARROW_DOWN}
+          key={ARROW_DOWN}
           send={send}
           theme={props.theme}
           scale={props.scale}

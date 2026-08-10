@@ -6,6 +6,7 @@ import {
   detectCodecSupport,
   getCodecSupport,
   restoreCodecSupport,
+  surfaceCanvasForInput,
 } from "../BlitSurfaceCanvas";
 import type { BlitWorkspace } from "../BlitWorkspace";
 import type { BlitSurface } from "../types";
@@ -2301,6 +2302,53 @@ describe("BlitSurfaceCanvas soft-keyboard input", () => {
     // canvas via parentElement when redirecting focus.
     expect(ta.parentElement).toBe(canvas.parentElement);
     expect(ta.tabIndex).toBe(-1);
+    expect(surfaceCanvasForInput(ta)).toBe(surface);
+    surface.dispose();
+    expect(surfaceCanvasForInput(ta)).toBeNull();
+  });
+
+  it("applies a one-shot toolbar modifier to a named keydown", () => {
+    const { surface, ta, keys } = attachTyping();
+    const changes: boolean[] = [];
+    surface.onCtrlModifierChange((active) => changes.push(active));
+    surface.setCtrlModifier(true);
+
+    ta.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "c",
+        code: "KeyC",
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+
+    expect(keys).toEqual([
+      { keycode: 29, pressed: true },
+      { keycode: 46, pressed: true },
+      { keycode: 46, pressed: false },
+      { keycode: 29, pressed: false },
+    ]);
+    expect(surface.ctrlModifier).toBe(false);
+    expect(changes).toEqual([true, false]);
+    surface.dispose();
+  });
+
+  it("applies a one-shot toolbar modifier to keydown-less text", () => {
+    const { surface, ta, keys, texts } = attachTyping();
+    surface.setAltModifier(true);
+    ta.value = "x";
+
+    ta.dispatchEvent(inputEvent({ inputType: "insertText", data: "x" }));
+
+    expect(keys).toEqual([
+      { keycode: 56, pressed: true },
+      { keycode: 45, pressed: true },
+      { keycode: 45, pressed: false },
+      { keycode: 56, pressed: false },
+    ]);
+    expect(texts).toEqual([]);
+    expect(ta.value).toBe("");
+    expect(surface.altModifier).toBe(false);
     surface.dispose();
   });
 

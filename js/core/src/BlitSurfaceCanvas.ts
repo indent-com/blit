@@ -436,6 +436,56 @@ function domKeyToEvdev(code: string): number {
   return EVDEV_MAP[code] ?? 0;
 }
 
+/** Recover a physical DOM code when a soft keyboard supplied only text. */
+function domCodeForCharacter(key: string): string {
+  if (/^[a-z]$/i.test(key)) return `Key${key.toUpperCase()}`;
+  if (/^[0-9]$/.test(key)) return `Digit${key}`;
+  return (
+    {
+      " ": "Space",
+      "!": "Digit1",
+      "@": "Digit2",
+      "#": "Digit3",
+      "$": "Digit4",
+      "%": "Digit5",
+      "^": "Digit6",
+      "&": "Digit7",
+      "*": "Digit8",
+      "(": "Digit9",
+      ")": "Digit0",
+      "-": "Minus",
+      _: "Minus",
+      "=": "Equal",
+      "+": "Equal",
+      "[": "BracketLeft",
+      "{": "BracketLeft",
+      "]": "BracketRight",
+      "}": "BracketRight",
+      ";": "Semicolon",
+      ":": "Semicolon",
+      "'": "Quote",
+      '"': "Quote",
+      "`": "Backquote",
+      "~": "Backquote",
+      "\\": "Backslash",
+      "|": "Backslash",
+      ",": "Comma",
+      "<": "Comma",
+      ".": "Period",
+      ">": "Period",
+      "/": "Slash",
+      "?": "Slash",
+    } as Record<string, string>
+  )[key] ?? "";
+}
+
+function characterNeedsShift(key: string): boolean {
+  return (
+    /^[A-Z]$/.test(key) ||
+    '~!@#$%^&*()_+{}|:"<>?'.includes(key)
+  );
+}
+
 /** Modifier keys must stay held across a chord; every other Cmd-chord key can
  *  be released with its press on macOS, where the browser may eat its keyup. */
 const EVDEV_MODIFIERS = new Set([29, 42, 54, 56, 97, 100, 125, 126]);
@@ -472,6 +522,20 @@ function detectMacOptionChars(): boolean {
  * the window event by hit-test keeps the compositor's drag over the surface
  * actually under the pointer. */
 const mountedSurfaceCanvases = new Map<HTMLCanvasElement, BlitSurfaceCanvas>();
+const surfaceCanvasByInput = new WeakMap<
+  HTMLTextAreaElement,
+  BlitSurfaceCanvas
+>();
+
+/** Resolve the live Wayland surface view owning a hidden IME textarea. */
+export function surfaceCanvasForInput(
+  input: Element | null,
+): BlitSurfaceCanvas | null {
+  return input instanceof HTMLTextAreaElement
+    ? (surfaceCanvasByInput.get(input) ?? null)
+    : null;
+}
+
 const routedGrabMouseEvents = new WeakSet<Event>();
 let activeSurfaceMouseGrab: {
   owner: BlitSurfaceCanvas;
@@ -718,6 +782,12 @@ export class BlitSurfaceCanvas {
    *  stuck modifiers and runaway key-repeat in the compositor. */
   private pressedKeys = new Set<number>();
 
+  /** One-shot modifiers armed by the mobile extra-keys row. */
+  private _ctrlModifier = false;
+  private _ctrlModifierListeners = new Set<(active: boolean) => void>();
+  private _altModifier = false;
+  private _altModifierListeners = new Set<(active: boolean) => void>();
+
   /** Alt presses held back pending dead-key detection (evdev keycodes).
    *  A macOS Option keydown may turn out to be the start of a dead-key
    *  composition (Option+E → é), in which case the Alt press must never
@@ -961,6 +1031,36 @@ export class BlitSurfaceCanvas {
     return this.canvas;
   }
 
+  setCtrlModifier(active: boolean): void {
+    if (this._ctrlModifier === active) return;
+    this._ctrlModifier = active;
+    for (const listener of this._ctrlModifierListeners) listener(active);
+  }
+
+  get ctrlModifier(): boolean {
+    return this._ctrlModifier;
+  }
+
+  onCtrlModifierChange(listener: (active: boolean) => void): () => void {
+    this._ctrlModifierListeners.add(listener);
+    return () => this._ctrlModifierListeners.delete(listener);
+  }
+
+  setAltModifier(active: boolean): void {
+    if (this._altModifier === active) return;
+    this._altModifier = active;
+    for (const listener of this._altModifierListeners) listener(active);
+  }
+
+  get altModifier(): boolean {
+    return this._altModifier;
+  }
+
+  onAltModifierChange(listener: (active: boolean) => void): () => void {
+    this._altModifierListeners.add(listener);
+    return () => this._altModifierListeners.delete(listener);
+  }
+
   attach(container: HTMLElement): void {
     if (this.disposed) return;
     this.container = container;
@@ -1017,6 +1117,7 @@ export class BlitSurfaceCanvas {
     }
     container.appendChild(ta);
     this.textInput = ta;
+    surfaceCanvasByInput.set(ta, this);
 
     container.appendChild(canvas);
 
@@ -1116,8 +1217,9 @@ export class BlitSurfaceCanvas {
     this.serverUnsubscribe();
     this.detachEvents();
     this.unsubscribeAll();
-    if (this.textInput && this.container) {
-      this.container.removeChild(this.textInput);
+    if (this.textInput) {
+      surfaceCanvasByInput.delete(this.textInput);
+      if (this.container) this.container.removeChild(this.textInput);
     }
     this.textInput = null;
     if (this.canvas) mountedSurfaceCanvases.delete(this.canvas);
@@ -2951,6 +3053,19 @@ export class BlitSurfaceCanvas {
     )
       return;
 
+    // Ctrl/Alt in the mobile row are one-shot modifiers. Browser-generated
+    // events cannot carry a modifier armed by page chrome, so synthesize the
+    // complete native chord here and consume the modifier. A later key-up is
+    // harmless because this path completes the press/release atomically.
+    if (
+      pressed &&
+      !EVDEV_MODIFIERS.has(domKeyToEvdev(e.code)) &&
+      this.sendOneShotModifiedKey(e.key, e.code, e.shiftKey)
+    ) {
+      e.preventDefault();
+      return;
+    }
+
     // Paste shortcut: skip preventDefault so the browser fires a `paste`
     // event on the focused element.  Our paste handler uses it as a
     // fallback when `navigator.clipboard.readText()` is denied (e.g.
@@ -3310,6 +3425,38 @@ export class BlitSurfaceCanvas {
     this.pendingAlt.clear();
   }
 
+  /** Send one key with the mobile toolbar's armed modifier, if any. */
+  private sendOneShotModifiedKey(
+    key: string,
+    code: string,
+    shiftKey: boolean,
+  ): boolean {
+    if (!this._ctrlModifier && !this._altModifier) return false;
+    const keycode = domKeyToEvdev(code || domCodeForCharacter(key));
+    if (keycode === 0) return false;
+
+    const conn = this.getConn();
+    if (!conn || !this.surface || !this._displaySize) return false;
+
+    const modifiers: number[] = [];
+    if (this._ctrlModifier) modifiers.push(EVDEV_MAP.ControlLeft);
+    if (this._altModifier) modifiers.push(EVDEV_MAP.AltLeft);
+    if (shiftKey || characterNeedsShift(key)) {
+      modifiers.push(EVDEV_MAP.ShiftLeft);
+    }
+    for (const modifier of modifiers) {
+      conn.sendSurfaceInput(this._surfaceId, modifier, true);
+    }
+    conn.sendSurfaceInput(this._surfaceId, keycode, true);
+    conn.sendSurfaceInput(this._surfaceId, keycode, false);
+    for (const modifier of modifiers.reverse()) {
+      conn.sendSurfaceInput(this._surfaceId, modifier, false);
+    }
+    this.setCtrlModifier(false);
+    this.setAltModifier(false);
+    return true;
+  }
+
   /** Handle text input from the hidden textarea. */
   private handleTextInput(e: InputEvent): void {
     const ta = this.textInput;
@@ -3325,6 +3472,21 @@ export class BlitSurfaceCanvas {
         conn.sendSurfacePreedit(this._surfaceId, ta.value, ta.selectionStart);
       }
       return;
+    }
+
+    if (this._ctrlModifier || this._altModifier) {
+      const modified =
+        e.inputType === "insertText" && e.data
+          ? this.sendOneShotModifiedKey(e.data[0], "", false)
+          : e.inputType === "insertLineBreak"
+            ? this.sendOneShotModifiedKey("Enter", "Enter", false)
+            : e.inputType === "deleteContentBackward"
+              ? this.sendOneShotModifiedKey("Backspace", "Backspace", false)
+              : false;
+      if (modified) {
+        if (ta) ta.value = "";
+        return;
+      }
     }
     // Any keydown handleKey processed was preventDefault'ed, which cancels
     // its input event — so what reaches here is text the keyboard delivered

@@ -1011,6 +1011,14 @@ function WorkspaceScreen(props: {
       el && el.getClientRects().length > 0 && !el.closest("[inert]")
         ? el
         : null;
+    const active = document.activeElement;
+    if (
+      active instanceof HTMLElement &&
+      active.matches(keyboardInputSelector)
+    ) {
+      const focused = focusable(active);
+      if (focused) return focused;
+    }
     const focusedPane = document.querySelector<HTMLElement>(
       '[data-blit-bsp-focused="true"]',
     );
@@ -4692,9 +4700,15 @@ function WorkspaceScreen(props: {
         </footer>
         <Show when={showMobileToolbar()}>
           <MobileToolbar
-            workspace={workspace}
-            focusedSessionId={() => wsState().focusedSessionId}
-            surface={terminalSurface}
+            keyboardTarget={() => {
+              // Subscribe the lookup to pane/session focus. The target itself
+              // is DOM-owned, but the toolbar must re-bind its modifier state
+              // when focus moves while the software keyboard stays open.
+              wsState().focusedSessionId;
+              focusedSurfaceId();
+              bspFocusedSurface();
+              return focusedKeyboardInput();
+            }}
             theme={theme()}
             scale={chromeScale()}
           />
