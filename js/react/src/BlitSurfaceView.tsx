@@ -8,6 +8,8 @@ export interface BlitSurfaceViewProps {
   surfaceId: number;
   className?: string;
   style?: React.CSSProperties;
+  /** Render cached frames without owning a server stream when false. */
+  live?: boolean;
 }
 
 export interface BlitSurfaceViewHandle {
@@ -18,7 +20,10 @@ export interface BlitSurfaceViewHandle {
 export const BlitSurfaceView = forwardRef<
   BlitSurfaceViewHandle,
   BlitSurfaceViewProps
->(function BlitSurfaceView({ connectionId, surfaceId, className, style }, ref) {
+>(function BlitSurfaceView(
+  { connectionId, surfaceId, className, style, live },
+  ref,
+) {
   const workspace = useRequiredBlitWorkspace();
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<BlitSurfaceCanvas | null>(null);
@@ -39,6 +44,7 @@ export const BlitSurfaceView = forwardRef<
       workspace,
       connectionId,
       surfaceId,
+      live,
     });
     surface.attach(container);
     canvasRef.current = surface;
@@ -46,7 +52,7 @@ export const BlitSurfaceView = forwardRef<
       surface.dispose();
       canvasRef.current = null;
     };
-  }, [workspace, connectionId, surfaceId]);
+  }, [workspace, connectionId, surfaceId, live]);
 
   return (
     <div

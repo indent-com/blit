@@ -1052,6 +1052,49 @@ describe("BlitSurfaceCanvas size mediation", () => {
 });
 
 describe("BlitSurfaceCanvas visibility", () => {
+  it("does not open a server stream for a cached-only mount", () => {
+    const subscribes: { surfaceId: number; viewId: string }[] = [];
+    const unsubscribes: { surfaceId: number; viewId: string }[] = [];
+    const store = {
+      getSurface: () => ({ width: 1920, height: 1080 }),
+      getCanvas: () => null,
+      getCursor: () => "default",
+      canDecodeVideo: true,
+      generation: 0,
+      onChange: () => () => {},
+      onCursor: () => () => {},
+      onFrame: () => () => {},
+    };
+    const conn = {
+      surfaceStore: store,
+      allocSurfaceViewId: () => "s1",
+      sendSurfaceSubscribe: (surfaceId: number, viewId: string) =>
+        subscribes.push({ surfaceId, viewId }),
+      sendSurfaceUnsubscribe: (surfaceId: number, viewId: string) =>
+        unsubscribes.push({ surfaceId, viewId }),
+    };
+    const workspace = {
+      getConnection: () => conn,
+      subscribe: () => () => {},
+    } as unknown as BlitWorkspace;
+    const surface = new BlitSurfaceCanvas({
+      workspace,
+      connectionId: "conn-1" as never,
+      surfaceId: 7,
+      live: false,
+    });
+
+    surface.attach(document.createElement("div"));
+    expect(subscribes).toEqual([]);
+
+    surface.setLive(true);
+    expect(subscribes).toEqual([{ surfaceId: 7, viewId: "s1" }]);
+
+    surface.setLive(false);
+    expect(unsubscribes).toEqual([{ surfaceId: 7, viewId: "s1" }]);
+    surface.dispose();
+  });
+
   it("releases hidden mounts and reclaims the same view on entry", () => {
     let intersectionCallback: IntersectionObserverCallback | undefined;
     let disconnected = false;

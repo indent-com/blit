@@ -22,6 +22,11 @@ export interface BlitSurfaceViewProps {
   /** When true the surface is resized to fill the container. */
   resizable?: boolean;
   /**
+   * When false, render only frames already present in the shared cache and
+   * do not create a server-side video subscription. Defaults to true.
+   */
+  live?: boolean;
+  /**
    * Surface zoom factor, e.g. 1.25 for 125% or an exact 1.25x scale.
    *
    * How this value is interpreted is controlled by `zoomMode`. Defaults to
@@ -60,6 +65,7 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
       workspace,
       connectionId: props.connectionId,
       surfaceId: props.surfaceId,
+      live: props.live,
     });
     surface.attach(containerRef);
     setMounted(surface);
@@ -80,6 +86,7 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
 
   createEffect(() => mounted()?.setConnectionId(props.connectionId));
   createEffect(() => mounted()?.setSurfaceId(props.surfaceId));
+  createEffect(() => mounted()?.setLive(props.live !== false));
 
   // Focus the canvas when props.focus is true AND the surface is mounted.
   createEffect(() => {

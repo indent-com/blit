@@ -546,6 +546,12 @@ export interface BlitSurfaceCanvasOptions {
   workspace: BlitWorkspace;
   connectionId: ConnectionId;
   surfaceId: number;
+  /**
+   * Whether this mount owns a server-side video subscription.  Cached-only
+   * mounts still paint frames produced by another live view from the shared
+   * SurfaceStore, but never create an encoder themselves.  Defaults to true.
+   */
+  live?: boolean;
 }
 
 // -- Scroll ----------------------------------------------------------------
@@ -765,6 +771,7 @@ export class BlitSurfaceCanvas {
   private _workspace: BlitWorkspace;
   private _connectionId: ConnectionId;
   private _surfaceId: number;
+  private _live: boolean;
 
   private container: HTMLElement | null = null;
   private canvas: HTMLCanvasElement | null = null;
@@ -1017,6 +1024,7 @@ export class BlitSurfaceCanvas {
     this._workspace = options.workspace;
     this._connectionId = options.connectionId;
     this._surfaceId = options.surfaceId;
+    this._live = options.live !== false;
   }
 
   // -----------------------------------------------------------------------
@@ -1245,6 +1253,21 @@ export class BlitSurfaceCanvas {
     this._surfaceId = surfaceId;
     this.resubscribe();
     this.resendDisplaySize();
+  }
+
+  /** Toggle ownership of the server-side stream without dropping the shared
+   * store listeners that keep a cached preview current. */
+  setLive(live: boolean): void {
+    if (this._live === live) return;
+    this._live = live;
+    if (!live) {
+      this.serverUnsubscribe();
+      return;
+    }
+    this.serverSubscribe();
+    this.resendDisplaySize();
+    const store = this.getConn()?.surfaceStore ?? this._store;
+    if (store) this.blitFromStore(store);
   }
 
   /**
@@ -1648,6 +1671,7 @@ export class BlitSurfaceCanvas {
       conn?.surfaceStore ?? this._store,
   ): void {
     if (
+      !this._live ||
       !this._isIntersecting ||
       !conn ||
       !store?.canDecodeVideo ||

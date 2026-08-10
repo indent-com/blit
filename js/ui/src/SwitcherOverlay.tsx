@@ -1821,6 +1821,7 @@ export function SwitcherOverlay(props: {
           <BlitSurfaceView
             connectionId={(item as SurfaceItem).connectionId}
             surfaceId={(item as SurfaceItem).surfaceId}
+            live={false}
             style={{
               width: `${iconSize()}px`,
               height: `${iconSize()}px`,
