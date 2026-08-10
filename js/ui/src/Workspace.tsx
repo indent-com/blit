@@ -36,6 +36,7 @@ import type { ConnectionSpec } from "./App";
 import { createMetrics } from "./createMetrics";
 import { createFontLoader } from "./createFontLoader";
 import { createKeyboardShortcuts } from "./createKeyboardShortcuts";
+import { truncateDocumentEntityTitle } from "./documentTitle";
 import {
   PALETTE_KEY,
   FONT_KEY,
@@ -2836,7 +2837,7 @@ function WorkspaceScreen(props: {
     const sessionFocused = al ? bspHasSession : focusedSurfaceId() == null;
     const fs = sessionFocused ? focusedSession() : null;
     if (fs) {
-      if (fs.title) parts.push(fs.title);
+      if (fs.title) parts.push(truncateDocumentEntityTitle(fs.title));
       const label = connectionLabels().get(fs.connectionId);
       if (label) parts.push(label);
     } else {
@@ -2851,7 +2852,7 @@ function WorkspaceScreen(props: {
           : bspFocusedSurface();
       if (surf) {
         const name = surf.title || surf.appId;
-        if (name) parts.push(name);
+        if (name) parts.push(truncateDocumentEntityTitle(name));
         const label = connectionLabels().get(surf.connectionId);
         if (label) parts.push(label);
       }
