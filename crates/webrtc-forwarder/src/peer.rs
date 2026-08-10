@@ -27,6 +27,12 @@ const GATHER_TIMEOUT: Duration = Duration::from_secs(3);
 /// Returns `true` for C2S message tags that are safe to forward for
 /// read-only consumers. Unknown and newly-added opcodes are blocked by default
 /// so they cannot become write-capability bypasses.
+///
+/// In particular, none of the messages that populate the server's shared
+/// sizing inputs are present: PTY `RESIZE` (and every create opcode, which
+/// carries an initial size) and `SURFACE_RESIZE` are all denied.  The size on
+/// an allowed `SURFACE_SUBSCRIBE` is a per-consumer encode box; the server
+/// explicitly excludes scaled subscriptions from surface-size mediation.
 fn is_read_only_allowed_message(tag: u8) -> bool {
     matches!(
         tag,
@@ -51,6 +57,20 @@ fn is_read_only_allowed_message(tag: u8) -> bool {
             | C2S_AUDIO_SUBSCRIBE
             | C2S_AUDIO_UNSUBSCRIBE
     )
+}
+
+/// Apply the consumer's protocol capability at the producer boundary.
+///
+/// Keep this shared by the legacy and mux pumps: access is authenticated once
+/// during signaling, while each data channel opens an otherwise ordinary
+/// connection to blit-server, which has no read-only mode of its own.
+fn should_forward_client_message(access: crate::Access, data: &[u8]) -> bool {
+    match access {
+        crate::Access::ReadWrite => true,
+        crate::Access::ReadOnly => data
+            .first()
+            .is_some_and(|&tag| is_read_only_allowed_message(tag)),
+    }
 }
 
 /// Mux control opcodes (stream_id=0).
@@ -592,10 +612,7 @@ pub async fn handle_peer(
                                         });
                                         let write_handle = tokio::spawn(async move {
                                             while let Some(data) = write_rx.recv().await {
-                                                if access == crate::Access::ReadOnly
-                                                    && !data.is_empty()
-                                                    && !is_read_only_allowed_message(data[0])
-                                                {
+                                                if !should_forward_client_message(access, &data) {
                                                     continue;
                                                 }
                                                 let frame_len = (data.len() as u32).to_le_bytes();
@@ -713,12 +730,9 @@ pub async fn handle_peer(
                                                 });
                                                 let write_handle = tokio::spawn(async move {
                                                     while let Some(data) = write_rx.recv().await {
-                                                        if access == crate::Access::ReadOnly
-                                                            && !data.is_empty()
-                                                            && !is_read_only_allowed_message(
-                                                                data[0],
-                                                            )
-                                                        {
+                                                        if !should_forward_client_message(
+                                                            access, &data,
+                                                        ) {
                                                             continue;
                                                         }
                                                         let frame_len =
@@ -1075,5 +1089,45 @@ mod tests {
                 "tag {tag:#04x} should be blocked"
             );
         }
+    }
+
+    #[test]
+    fn read_only_forwarding_cannot_supply_shared_sizes() {
+        // RESIZE is the only way an existing connection populates a PTY's
+        // mediated view_sizes entry.  Create messages also carry an initial
+        // grid size, but a read-only consumer cannot create a PTY at all.
+        for message in [
+            vec![C2S_RESIZE, 1, 0, 24, 0, 80, 0],
+            vec![C2S_CREATE, 24, 0, 80, 0, 0, 0],
+            vec![C2S_CREATE_AT, 24, 0, 80, 0, 0, 0, 1, 0],
+            vec![C2S_CREATE_N, 1, 0, 24, 0, 80, 0, 0, 0],
+            vec![C2S_CREATE2, 1, 0, 24, 0, 80, 0, 0, 0, 0],
+            vec![C2S_SURFACE_RESIZE, 1, 0, 0x20, 0x03, 0x58, 0x02, 120, 0],
+        ] {
+            assert!(
+                !should_forward_client_message(crate::Access::ReadOnly, &message),
+                "sizing message {:#04x} should be blocked",
+                message[0]
+            );
+        }
+
+        // Read-write forwarding remains transparent.
+        assert!(should_forward_client_message(
+            crate::Access::ReadWrite,
+            &[C2S_RESIZE, 1, 0, 24, 0, 80, 0]
+        ));
+    }
+
+    #[test]
+    fn read_only_forwarding_is_deny_by_default() {
+        assert!(!should_forward_client_message(crate::Access::ReadOnly, &[]));
+        assert!(!should_forward_client_message(
+            crate::Access::ReadOnly,
+            &[0xff]
+        ));
+        assert!(should_forward_client_message(
+            crate::Access::ReadOnly,
+            &[C2S_READ]
+        ));
     }
 }

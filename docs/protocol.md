@@ -132,6 +132,41 @@ viewer receives a downscaled stream at its requested physical size.
 
 All the trailing bytes are optional — a 3-byte message uses connection/server defaults — but they are positional, so asking for a size or cadence means sending the earlier fields too (as zeros, if you have no preference). Re-subscribing to an already-subscribed surface updates the supplied values. Codec, bandwidth, speed, and size changes force encoder recreation; a cadence-only change does not.
 
+## WebRTC read-only profile
+
+The base wire protocol does not carry an access bit. A client connected
+directly to `blit-server` is therefore not made read-only by the protocol.
+Read-only share tokens (`.ro`) are enforced by the producer-side `blit share`
+forwarder, after signaling authenticates the token and before a client message
+reaches the server. The same filter applies to legacy `"blit"` data channels
+and virtual streams on a `"mux"` channel.
+
+The profile is deny-by-default. It forwards only these client operations:
+
+- Connection and delivery accounting: `ACK`, `PING`, `CLIENT_FEATURES`, and
+  `CLIENT_METRICS`.
+- Terminal viewing: `SCROLL`, `FOCUS`, `SUBSCRIBE`, `UNSUBSCRIBE`, `SEARCH`,
+  `READ`, and `COPY_RANGE`.
+- Surface viewing: `SURFACE_LIST`, `SURFACE_CAPTURE`, `SURFACE_SUBSCRIBE`,
+  `SURFACE_UNSUBSCRIBE`, and `SURFACE_ACK`.
+- Clipboard reads: `CLIPBOARD_LIST` and `CLIPBOARD_GET`.
+- Audio listening: `AUDIO_SUBSCRIBE` and `AUDIO_UNSUBSCRIBE`.
+
+Every other opcode, including unknown future opcodes, is silently dropped.
+Consequently read-only peers cannot send input, create/restart/kill/close a
+PTY, focus or control a Wayland surface, write either clipboard selection,
+shut down the server, or access the filesystem, Git, LSP, KV, and network
+families.
+
+Read-only peers never participate in shared sizing. `RESIZE` and all create
+opcodes are blocked, so they cannot add a PTY view-size constraint.
+`SURFACE_RESIZE` is blocked, so they cannot add a surface-size constraint or
+raise the compositor output scale. The optional width and height on the
+allowed `SURFACE_SUBSCRIBE` are a fixed encode box for that peer alone; such a
+scaled subscription is explicitly excluded from surface-size mediation.
+Likewise, `CLIENT_FEATURES` can cap that peer's decoder/encoder path but has no
+shared sizing input without a `SURFACE_RESIZE` entry.
+
 ## Server → Client (S2C)
 
 | Opcode | Name                | Layout                                                                                                                                          |
