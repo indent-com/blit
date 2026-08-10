@@ -344,6 +344,7 @@ mod stub {
             native_w: u32,
             native_h: u32,
             want_nv12_opaque: bool,
+            want_cpu_pixels: bool,
             opaque_is_444: bool,
         },
         RestampTarget {

@@ -821,6 +821,9 @@ pub enum CompositorCommand {
         native_w: u32,
         native_h: u32,
         want_nv12_opaque: bool,
+        /// Keep publishing host-visible BGRA when a CPU reader shares this
+        /// target with one or more zero-copy NVENC readers.
+        want_cpu_pixels: bool,
         /// With `want_nv12_opaque`: the layout the consuming session
         /// expects — planar YUV444 for a 4:4:4 NVENC session, NV12
         /// otherwise.  Ignored when `want_nv12_opaque` is false.
@@ -4609,6 +4612,7 @@ impl Compositor {
                 native_w,
                 native_h,
                 want_nv12_opaque,
+                want_cpu_pixels,
                 opaque_is_444,
             } => {
                 if let Some(ref mut vk) = self.vulkan_renderer {
@@ -4618,6 +4622,7 @@ impl Compositor {
                         target_h,
                         (native_w, native_h),
                         want_nv12_opaque,
+                        want_cpu_pixels,
                         opaque_is_444,
                     );
                 }

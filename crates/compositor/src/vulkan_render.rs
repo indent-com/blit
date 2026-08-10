@@ -388,6 +388,11 @@ pub(crate) struct VulkanRenderer {
     /// emits one `PixelData::Bgra` per downscale target so the per-client
     /// encoder consumes target-sized BGRA without a CPU resize step.
     downscale_outputs: HashMap<(u32, u32, u32), DownscaleOutput>,
+    /// Downscale targets whose staging buffer is still a live output.
+    ///
+    /// An NVENC-only target omits the readback; a mixed CPU/NVENC target
+    /// keeps it while also filling `nv12_opaque_outputs`.
+    cpu_readback_targets: HashSet<(u32, u32, u32)>,
 
     /// The native composite size each target above was sized against, keyed
     /// the same way.  The blits stretch the whole native frame across the
@@ -1701,6 +1706,7 @@ impl VulkanRenderer {
             vulkan_encode_failures: HashMap::new(),
             vulkan_encode_giveups: Vec::new(),
             downscale_outputs: HashMap::new(),
+            cpu_readback_targets: HashSet::new(),
             target_natives: HashMap::new(),
             surface_textures: FxHashMap::default(),
             buffer_textures: FxHashMap::default(),
@@ -2169,18 +2175,16 @@ impl VulkanRenderer {
                     return false;
                 }
                 if owned.is_some() {
-                    self.destroy_nv12_outputs_for_target(surface_id, w, h);
+                    // Replace only the compositor-owned encode image. An
+                    // NVENC subscriber may simultaneously read the separate
+                    // OPAQUE_FD allocation at this key.
+                    self.destroy_nv12_outputs_in(Nv12Export::None, surface_id, w, h);
                 }
                 if !self.nv12_outputs.contains_key(&key) {
                     match self.create_nv12_encode_image(w, h, is_444, codec) {
                         Some(nv12) => {
                             self.nv12_outputs.insert(key, (vec![nv12], 0));
                             self.owned_encode_nv12.insert(key, want);
-                            // This surface now encodes on the compositor's
-                            // own GPU, so any NVENC zero-copy target left
-                            // over from before is computing into a buffer
-                            // nothing reads.
-                            self.destroy_nv12_outputs_in(Nv12Export::OpaqueFd, surface_id, w, h);
                         }
                         None => {
                             eprintln!(
@@ -2312,7 +2316,9 @@ impl VulkanRenderer {
                 .copied()
                 .collect();
             for k in owned {
-                self.destroy_nv12_outputs_for_target(k.0, k.1, k.2);
+                // Do not pull a concurrent NVENC target out from under its
+                // subscriber when the last Vulkan Video session leaves.
+                self.destroy_nv12_outputs_in(Nv12Export::None, k.0, k.1, k.2);
             }
         }
     }
@@ -2474,10 +2480,10 @@ impl VulkanRenderer {
     // Server-allocated BGRA downscale targets
     // ---------------------------------------------------------------
 
-    /// Allocate a BGRA downscale target sized at `(target_w, target_h)`
-    /// for `surface_id`.  Used by per-client encoders that don't import
-    /// GBM buffers (NVENC, software).  Re-registering an identical
-    /// target is a no-op so callers can register idempotently.
+    /// Allocate a downscale target sized at `(target_w, target_h)` for
+    /// `surface_id`. Used by per-client encoders that don't import GBM
+    /// buffers (NVENC, software). The target may publish host-visible BGRA,
+    /// opaque NV12/NV24, or both. Re-registering updates those outputs.
     ///
     /// `native` is the composite size the target was inscribed into.  See
     /// {@link target_natives}.
@@ -2488,25 +2494,29 @@ impl VulkanRenderer {
         target_h: u32,
         native: (u32, u32),
         want_nv12_opaque: bool,
+        want_cpu_pixels: bool,
         opaque_is_444: bool,
     ) {
-        // A Vulkan Video encoder on this surface encodes from its own image,
-        // so nothing would ever read the NV12 buffer we were asked for.
-        let want_nv12_opaque = want_nv12_opaque && !self.vulkan_video_owns(surface_id);
+        // Encoder ownership is per client, not per surface. A Vulkan Video
+        // session may read `nv12_outputs` while another client's NVENC
+        // session reads the separate `nv12_opaque_outputs` allocation.
+        let mut want_cpu_pixels = want_cpu_pixels;
         let key = (surface_id, target_w, target_h);
         // Recorded before the early return: the same target size can be
         // asked for again against a *different* native — a surface that
         // shrinks and grows back lands on sizes it has held before — and
         // the buffer is reusable while the stale native it carries is not.
         self.target_natives.insert(key, native);
+        if want_cpu_pixels {
+            self.cpu_readback_targets.insert(key);
+        } else {
+            self.cpu_readback_targets.remove(&key);
+        }
         if self.downscale_outputs.contains_key(&key) {
-            // The BGRA buffer is reusable, but "can everyone reading this
-            // target take NV12" is not a property of the buffer — it is a
-            // property of the current subscribers, and a software encoder
-            // joining an NVENC one at the same size flips it. The server
-            // re-registers to say so. Returning early here would freeze the
-            // first subscriber's answer for the target's whole life and
-            // hand the newcomer GPU-only memory it cannot map.
+            // The BGRA buffer is reusable, but the live representations are
+            // a property of the current subscribers. The server re-registers
+            // when that set changes, so reconcile the opaque allocation and
+            // CPU staging flag rather than freezing the first answer.
             // Format matters as much as existence: a 4:2:0 slot serving a
             // subscriber that now wants 4:4:4 (or vice versa) would hand
             // the encoder planes in the wrong geometry.
@@ -2519,7 +2529,12 @@ impl VulkanRenderer {
                 });
             if want_nv12_opaque && slot_format != Some(opaque_is_444) {
                 if slot_format.is_some() {
-                    self.destroy_nv12_outputs_for_target(surface_id, target_w, target_h);
+                    self.destroy_nv12_outputs_in(
+                        Nv12Export::OpaqueFd,
+                        surface_id,
+                        target_w,
+                        target_h,
+                    );
                 }
                 self.create_nv12_outputs(
                     surface_id,
@@ -2530,12 +2545,18 @@ impl VulkanRenderer {
                     Nv12Export::OpaqueFd,
                     opaque_is_444,
                 );
+                if self
+                    .nv12_opaque_slot(surface_id, target_w, target_h)
+                    .is_none()
+                {
+                    self.cpu_readback_targets.insert(key);
+                }
             } else if !want_nv12_opaque && slot_format.is_some() {
                 eprintln!(
                     "[vulkan-render] sid {surface_id} {target_w}x{target_h}: dropping NV12 \
-                     opaque-fd target, a subscriber needs CPU pixels",
+                     opaque-fd target, opaque readers disagree on layout",
                 );
-                self.destroy_nv12_outputs_for_target(surface_id, target_w, target_h);
+                self.destroy_nv12_outputs_in(Nv12Export::OpaqueFd, surface_id, target_w, target_h);
             }
             return;
         }
@@ -2566,8 +2587,12 @@ impl VulkanRenderer {
                 .nv12_opaque_outputs
                 .get(&key)
                 .is_some_and(|(v, _)| !v.is_empty());
+            if !ok {
+                want_cpu_pixels = true;
+                self.cpu_readback_targets.insert(key);
+            }
             eprintln!(
-                "[vulkan-render] registered downscale target sid {surface_id} {target_w}x{target_h} (nv12 opaque-fd: {})",
+                "[vulkan-render] registered downscale target sid {surface_id} {target_w}x{target_h} (nv12 opaque-fd: {}, CPU pixels: {want_cpu_pixels})",
                 if ok { "yes" } else { "FAILED, using BGRA" },
             );
             return;
@@ -2597,6 +2622,8 @@ impl VulkanRenderer {
 
     /// Tear down a single downscale target, if registered.
     pub(crate) fn clear_downscale_target(&mut self, surface_id: u32, target_w: u32, target_h: u32) {
+        self.cpu_readback_targets
+            .remove(&(surface_id, target_w, target_h));
         if let Some(out) = self
             .downscale_outputs
             .remove(&(surface_id, target_w, target_h))
@@ -2624,6 +2651,7 @@ impl VulkanRenderer {
     }
 
     fn destroy_downscale_outputs_for_surface(&mut self, surface_id: u32) {
+        self.cpu_readback_targets.retain(|k| k.0 != surface_id);
         let keys: Vec<(u32, u32, u32)> = self
             .downscale_outputs
             .keys()
@@ -2638,6 +2666,7 @@ impl VulkanRenderer {
     }
 
     fn destroy_all_downscale_outputs(&mut self) {
+        self.cpu_readback_targets.clear();
         let outs: Vec<DownscaleOutput> = self.downscale_outputs.drain().map(|(_, v)| v).collect();
         for out in outs {
             self.defer_or_destroy_downscale_output(out);
@@ -3286,10 +3315,10 @@ impl VulkanRenderer {
         self.owned_encode_nv12.clear();
     }
 
-    /// Whether a compositor-resident Vulkan Video encoder is serving this
-    /// surface.  When one is, it encodes from its own image and the frames
-    /// never reach NVENC, so an NV12 `OPAQUE_FD` target would run the
-    /// compute pass and hold three buffers for a reader that does not exist.
+    /// Whether at least one compositor-resident Vulkan Video encoder is
+    /// serving this surface. Used to suppress an otherwise-unneeded native
+    /// CPU readback; a different client may still have its own downscale or
+    /// NVENC target.
     fn vulkan_video_owns(&self, surface_id: u32) -> bool {
         self.vulkan_encoders
             .keys()
@@ -3352,15 +3381,13 @@ impl VulkanRenderer {
             }
             _ => {}
         }
-        // A Vulkan Video session encodes from the compositor's own image at
-        // this key and is what the client is being served by; installing
-        // either flavour of NV12 output over it would take the image away
-        // from a live encoder, and nothing would read what replaced it.
-        // `create_nv12_encode_image` is how that image is (re)built, and it
-        // does not come through here.
-        if self
-            .owned_encode_nv12
-            .contains_key(&(surface_id, target_w, target_h))
+        // A non-opaque output shares `nv12_outputs` with the compositor's
+        // Vulkan Video image and must not replace it. OPAQUE_FD has its own
+        // map precisely so a different client's NVENC session can coexist.
+        if !matches!(export, Nv12Export::OpaqueFd)
+            && self
+                .owned_encode_nv12
+                .contains_key(&(surface_id, target_w, target_h))
         {
             eprintln!(
                 "[vulkan-render] sid {surface_id} {target_w}x{target_h}: Vulkan Video owns the \
@@ -6989,7 +7016,7 @@ impl VulkanRenderer {
         // GPU-only frame never schedules the image-to-staging transfer.
         let native_key = (sid, phys_w, phys_h);
         let has_native_cpu_target = self.downscale_outputs.contains_key(&native_key)
-            && self.nv12_opaque_slot(sid, phys_w, phys_h).is_none();
+            && self.cpu_readback_targets.contains(&native_key);
         let native_readback = native_readback_plan(
             self.publish_native_bgra_once,
             has_native_cpu_target,
@@ -7527,11 +7554,10 @@ impl VulkanRenderer {
             }
         }
 
-        // For each downscale target (server-allocated BGRA, no GBM):
-        // blit (LINEAR) the native composite into the target image
-        // then copy it into the CPU-mapped staging buffer.  retire_pending
-        // emits one PixelData::Bgra per downscale target so the per-client
-        // encoder receives target-sized BGRA without a CPU resize step.
+        // For each server-allocated downscale target, blit (LINEAR) the
+        // native composite into its BGRA image. Depending on the registered
+        // readers, convert it to opaque NV12/NV24, copy it to CPU-mapped
+        // staging, or do both.
         for &(tw, th) in &downscale_targets {
             let (ds_image, ds_staging) = {
                 let out = &self.downscale_outputs[&(sid, tw, th)];
@@ -7632,10 +7658,8 @@ impl VulkanRenderer {
             }
 
             // NVENC zero-copy: convert straight into the OPAQUE_FD NV12
-            // buffer and stop.  The staging copy below, and the `to_vec()`
-            // in `retire_pending` that reads it, are the two per-frame
-            // full-surface copies this whole path exists to remove — so
-            // skipping them is the point, not an optimisation on top.
+            // buffer. An NVENC-only target stops here; a mixed target also
+            // fills staging below for its CPU reader.
             if let Some((nv12_vec, nv12_idx)) = self
                 .nv12_opaque_outputs
                 .get(&(sid, tw, th))
@@ -7644,7 +7668,37 @@ impl VulkanRenderer {
                 && nv12_vec[nv12_idx].export == Nv12Export::OpaqueFd
             {
                 self.dispatch_nv12_compute(cb, ds_image, nv12_vec, nv12_idx, tw, th, true);
-                continue;
+                if !self.cpu_readback_targets.contains(&(sid, tw, th)) {
+                    continue;
+                }
+                // The compute helper moved the BGRA source from
+                // TRANSFER_SRC_OPTIMAL to GENERAL. A mixed target still
+                // needs the image-to-staging copy below, so make that read
+                // legal and order it after the shader read.
+                let back_to_transfer_src = vk::ImageMemoryBarrier::default()
+                    .image(ds_image)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::SHADER_READ)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                unsafe {
+                    self.device.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[back_to_transfer_src],
+                    );
+                }
             }
 
             let region = vk::BufferImageCopy {
@@ -8118,14 +8172,20 @@ impl VulkanRenderer {
             }
         }
 
-        // Split the targets by who publishes them.  An OPAQUE_FD target
-        // wrote NV12 and never touched its staging buffer, so leaving it in
-        // `downscale_targets` would have `retire_pending` read that stale
-        // staging and publish a `Bgra` frame over the top of the NV12 one.
+        // One target can now appear in both lists: opaque pixels publish
+        // immediately with the exported fence, while CPU pixels publish
+        // after the staging copy retires.
         type Targets = Vec<(u32, u32)>;
-        let (nv12_opaque_targets, staging_targets): (Targets, Targets) = downscale_targets
+        let nv12_opaque_targets: Targets = downscale_targets
             .iter()
-            .partition(|&&(tw, th)| self.nv12_opaque_slot(sid, tw, th).is_some());
+            .copied()
+            .filter(|&(tw, th)| self.nv12_opaque_slot(sid, tw, th).is_some())
+            .collect();
+        let staging_targets: Targets = downscale_targets
+            .iter()
+            .copied()
+            .filter(|&(tw, th)| self.cpu_readback_targets.contains(&(sid, tw, th)))
+            .collect();
 
         let submit_info = PendingSubmit {
             fence,

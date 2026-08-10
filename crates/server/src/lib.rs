@@ -732,9 +732,16 @@ struct SharedCompositor {
     /// without a registered external fall back to the largest entry
     /// (the native composite) and downscale themselves.
     last_pixels: HashMap<(u16, u32, u32), LastPixels>,
+    /// Opaque NV12/NV24 alternatives for targets that simultaneously
+    /// publish CPU-readable BGRA. Kept separate so one representation does
+    /// not overwrite the other under the shared `(surface, w, h)` key.
+    last_opaque_pixels: HashMap<(u16, u32, u32), LastPixels>,
     /// Copy-on-write metadata view of `last_pixels`. Rebuilt only after a
     /// pixel-cache mutation, then shared by pointer across delivery ticks.
     pixel_snapshot: Arc<Vec<PixelSnapshot>>,
+    /// Exact metadata for `last_opaque_pixels`; NVENC clients prefer this
+    /// generation while other clients use `pixel_snapshot`.
+    opaque_pixel_snapshot: Arc<Vec<PixelSnapshot>>,
     pixel_snapshot_dirty: bool,
     /// Latest compositor-encoded bitstream per `(surface_id, client_id)`.
     last_encoded: HashMap<(u16, u64), LastEncoded>,
@@ -849,7 +856,7 @@ const SURFACE_RESIZE_SETTLE: Duration = Duration::from_millis(100);
 /// How long a subscriber holds out for the `OPAQUE_FD` publish it asked for
 /// before encoding the BGRA the compositor actually published.
 ///
-/// `RegisterDownscaleTarget { want_nv12_opaque }` is a request, not a
+/// `RegisterDownscaleTarget { want_nv12_opaque, .. }` is a request, not a
 /// commitment: the renderer falls back to BGRA on its own when the fd export
 /// fails, and it does not report that it did.  Declining BGRA on the strength
 /// of the request alone is therefore a wait with no end — no encode, no
@@ -954,7 +961,7 @@ impl SharedCompositor {
         self.pixel_snapshot_dirty = true;
     }
 
-    fn pixel_snapshot(&mut self) -> Arc<Vec<PixelSnapshot>> {
+    fn pixel_snapshots(&mut self) -> (Arc<Vec<PixelSnapshot>>, Arc<Vec<PixelSnapshot>>) {
         if self.pixel_snapshot_dirty {
             let snapshot = Arc::make_mut(&mut self.pixel_snapshot);
             snapshot.clear();
@@ -968,9 +975,40 @@ impl SharedCompositor {
                     lp.timestamp_sub_us,
                 )
             }));
+            // Opaque-only targets have no entry in `last_pixels`; add them to
+            // the general index so the encode loop still sees the target.
+            snapshot.extend(
+                self.last_opaque_pixels
+                    .iter()
+                    .filter_map(|(&(sid, w, h), lp)| {
+                        (!self.last_pixels.contains_key(&(sid, w, h))).then_some((
+                            sid,
+                            lp.width,
+                            lp.height,
+                            lp.generation,
+                            lp.timestamp_ms,
+                            lp.timestamp_sub_us,
+                        ))
+                    }),
+            );
+            let opaque = Arc::make_mut(&mut self.opaque_pixel_snapshot);
+            opaque.clear();
+            opaque.extend(self.last_opaque_pixels.iter().map(|(&(sid, _, _), lp)| {
+                (
+                    sid,
+                    lp.width,
+                    lp.height,
+                    lp.generation,
+                    lp.timestamp_ms,
+                    lp.timestamp_sub_us,
+                )
+            }));
             self.pixel_snapshot_dirty = false;
         }
-        Arc::clone(&self.pixel_snapshot)
+        (
+            Arc::clone(&self.pixel_snapshot),
+            Arc::clone(&self.opaque_pixel_snapshot),
+        )
     }
 
     /// Hand a resize to the compositor and open a fresh settle window.
@@ -1118,30 +1156,64 @@ fn encode_capture(pixels: &[u8], width: u32, height: u32, format: u8, quality: u
 /// Whether a target may be published as a GPU-only NV12 `OPAQUE_FD`
 /// buffer.
 ///
-/// The compositor publishes one representation per `(surface, w, h)`, so
-/// this is a property of every subscriber at that size rather than of the
-/// one being registered. Only NVENC can import an `OPAQUE_FD` handle; a
-/// software or VA-API encoder sharing the size would be handed memory it
-/// cannot map and would encode black. One dissenter puts everyone at that
-/// size back on BGRA.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DownscaleTargetMode {
+    /// At least one NVENC reader can consume this opaque layout.
+    want_nv12_opaque: bool,
+    /// At least one reader needs host-visible BGRA pixels as well.
+    want_cpu_pixels: bool,
+    /// Layout shared by the opaque readers, when `want_nv12_opaque`.
+    opaque_is_444: bool,
+}
+
+/// Representations the compositor must publish for one `(surface, w, h)`.
 ///
-/// `others` yields each *other* subscriber's `(target, can_take_nv12)`.
-/// A subscriber at a different size is irrelevant — it reads its own key.
-fn nv12_opaque_safe_for_target(
+/// CPU and NVENC readers can coexist: the compositor keeps the BGRA staging
+/// copy for the former and additionally publishes its GPU-converted opaque
+/// NV12/NV24 buffer for the latter. A split between 4:2:0 and 4:4:4 NVENC
+/// sessions still has no single opaque layout, so that rarer combination
+/// stays on the CPU-compatible representation.
+///
+/// `others` yields each *other* subscriber's `(target, can_take_nv12,
+/// wants_444)`. A subscriber at a different size is irrelevant.
+fn downscale_target_mode(
     this_wants: bool,
     this_444: bool,
     target: (u32, u32),
     others: impl Iterator<Item = (Option<(u32, u32)>, bool, bool)>,
-) -> bool {
-    // Every subscriber sharing the target must not only take an OPAQUE_FD
-    // buffer but agree on its layout — a 4:2:0 session cannot read the
-    // planar YUV444 buffer a 4:4:4 neighbour needs, and vice versa.
-    this_wants
-        && others
-            .into_iter()
-            .all(|(their_target, they_want, their_444)| {
-                their_target != Some(target) || (they_want && their_444 == this_444)
-            })
+) -> DownscaleTargetMode {
+    let mut opaque_layout = this_wants.then_some(this_444);
+    let mut want_cpu_pixels = !this_wants;
+    let mut split_opaque_layout = false;
+
+    for (their_target, they_want, their_444) in others {
+        if their_target != Some(target) {
+            continue;
+        }
+        if !they_want {
+            want_cpu_pixels = true;
+            continue;
+        }
+        match opaque_layout {
+            Some(layout) if layout != their_444 => split_opaque_layout = true,
+            None => opaque_layout = Some(their_444),
+            _ => {}
+        }
+    }
+
+    if split_opaque_layout {
+        DownscaleTargetMode {
+            want_nv12_opaque: false,
+            want_cpu_pixels: true,
+            opaque_is_444: false,
+        }
+    } else {
+        DownscaleTargetMode {
+            want_nv12_opaque: opaque_layout.is_some(),
+            want_cpu_pixels,
+            opaque_is_444: opaque_layout.unwrap_or(false),
+        }
+    }
 }
 
 /// Whether an `OPAQUE_FD` frame is still coming for `(sid, target)`, i.e.
@@ -1150,11 +1222,10 @@ fn nv12_opaque_safe_for_target(
 ///
 /// A subscriber's own `wants_nv12_opaque` cannot answer this: it records the
 /// encoder's capability, while the compositor publishes the *negotiated*
-/// shape.  One co-subscriber that needs CPU pixels — or needs the other
-/// chroma layout — puts the whole target on BGRA for as long as it is there,
-/// and a subscriber that declined the BGRA on capability alone would wait
-/// for a frame nobody is going to publish: no encode, no bitstream, and no
-/// failure to recover from either.
+/// representations. A CPU co-subscriber no longer prevents opaque output,
+/// but an incompatible opaque chroma layout still does. Declining BGRA when
+/// no opaque representation is coming would leave the stream with no encode,
+/// bitstream, or failure to recover from.
 fn opaque_publish_pending(
     clients: &HashMap<u64, ClientState>,
     cid: u64,
@@ -1171,7 +1242,7 @@ fn opaque_publish_pending(
     {
         return false;
     }
-    nv12_opaque_safe_for_target(
+    downscale_target_mode(
         s.wants_nv12_opaque,
         s.wants_opaque_444,
         target,
@@ -1191,6 +1262,7 @@ fn opaque_publish_pending(
                     .unwrap_or((None, true, s.wants_opaque_444))
             }),
     )
+    .want_nv12_opaque
 }
 
 /// Return the future deadline when an emergency NVENC CPU conversion should
@@ -3944,7 +4016,16 @@ impl Session {
         let Some(cs) = self.compositor.as_mut() else {
             return;
         };
-        if let Some(&(_, first_444, (native_w, native_h))) = survivors.first() {
+        if let Some(&(first_wants, first_444, (native_w, native_h))) = survivors.first() {
+            let mode = downscale_target_mode(
+                first_wants,
+                first_444,
+                (tw, th),
+                survivors
+                    .iter()
+                    .skip(1)
+                    .map(|(wants, is_444, _)| (Some((tw, th)), *wants, *is_444)),
+            );
             let _ = cs.handle.command_tx.send(
                 blit_compositor::CompositorCommand::RegisterDownscaleTarget {
                     surface_id: surface_id as u32,
@@ -3952,14 +4033,16 @@ impl Session {
                     target_h: th,
                     native_w,
                     native_h,
-                    // Zero-copy needs unanimity on both taking the buffer
-                    // and its layout; a format split falls back to BGRA.
-                    want_nv12_opaque: survivors
-                        .iter()
-                        .all(|(w, is444, _)| *w && *is444 == first_444),
-                    opaque_is_444: first_444,
+                    want_nv12_opaque: mode.want_nv12_opaque,
+                    want_cpu_pixels: mode.want_cpu_pixels,
+                    opaque_is_444: mode.opaque_is_444,
                 },
             );
+            // Re-registration may replace or remove the Vulkan allocation.
+            // Never leave its old exported fd available to a later NVENC
+            // subscriber while the compositor builds the new shape.
+            cs.last_opaque_pixels.remove(&(surface_id, tw, th));
+            cs.mark_pixel_snapshot_dirty();
         } else {
             let _ = cs.handle.command_tx.send(
                 blit_compositor::CompositorCommand::ClearDownscaleTarget {
@@ -3969,6 +4052,7 @@ impl Session {
                 },
             );
             cs.last_pixels.remove(&(surface_id, tw, th));
+            cs.last_opaque_pixels.remove(&(surface_id, tw, th));
             cs.mark_pixel_snapshot_dirty();
         }
         cs.handle.wake();
@@ -4087,7 +4171,9 @@ impl Session {
                 wayland_clipboard_owned: false,
                 surfaces: FxHashMap::default(),
                 last_pixels: HashMap::new(),
+                last_opaque_pixels: HashMap::new(),
                 pixel_snapshot: Arc::new(Vec::new()),
+                opaque_pixel_snapshot: Arc::new(Vec::new()),
                 pixel_snapshot_dirty: false,
                 last_encoded: HashMap::new(),
                 frame_clock_intervals: FxHashMap::default(),
@@ -5884,6 +5970,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         },
                     );
                     last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
+                    last_pixels_remove_for_sid(&mut cs.last_opaque_pixels, surface_id);
                     cs.mark_pixel_snapshot_dirty();
                     last_encoded_remove_for_sid(&mut cs.last_encoded, surface_id);
                     cs.frame_clocks_dirty = true;
@@ -5892,6 +5979,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 CompositorEvent::SurfaceDestroyed { surface_id } => {
                     cs.surfaces.remove(&surface_id);
                     last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
+                    last_pixels_remove_for_sid(&mut cs.last_opaque_pixels, surface_id);
                     cs.mark_pixel_snapshot_dirty();
                     last_encoded_remove_for_sid(&mut cs.last_encoded, surface_id);
                     cs.last_configured_size.remove(&surface_id);
@@ -5926,15 +6014,27 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // oscillated between the client's display-capped size
                     // and native, rebuilding every encoder on every cycle.
                     // Keep all target dimensions solely in `last_pixels`.
-                    cache_surface_commit(
-                        &mut cs.last_pixels,
-                        &mut cs.pixel_generation,
-                        (surface_id, width, height),
-                        pixels,
-                        timestamp_ms,
-                        timestamp_sub_us,
-                        encoder_skip,
-                    );
+                    if matches!(&pixels, blit_compositor::PixelData::Nv12OpaqueFd { .. }) {
+                        cache_surface_commit(
+                            &mut cs.last_opaque_pixels,
+                            &mut cs.pixel_generation,
+                            (surface_id, width, height),
+                            pixels,
+                            timestamp_ms,
+                            timestamp_sub_us,
+                            encoder_skip,
+                        );
+                    } else {
+                        cache_surface_commit(
+                            &mut cs.last_pixels,
+                            &mut cs.pixel_generation,
+                            (surface_id, width, height),
+                            pixels,
+                            timestamp_ms,
+                            timestamp_sub_us,
+                            encoder_skip,
+                        );
+                    }
                     cs.mark_pixel_snapshot_dirty();
                 }
                 CompositorEvent::SurfaceEncoded {
@@ -6038,6 +6138,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     cs.resize_inflight.remove(&surface_id);
                     if resolution_changed {
                         last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
+                        last_pixels_remove_for_sid(&mut cs.last_opaque_pixels, surface_id);
                         cs.mark_pixel_snapshot_dirty();
                         last_encoded_remove_for_sid(&mut cs.last_encoded, surface_id);
                         // Don't eagerly invalidate client encoders here.  The
@@ -6306,10 +6407,13 @@ async fn tick(state: &AppState) -> TickOutcome {
     // entry.  One sid can appear several times — once for each
     // distinct (width, height) the renderer produced (per-encoder
     // target plus the native composite).
-    let pixel_snapshot: Arc<Vec<PixelSnapshot>> = sess
+    let (pixel_snapshot, opaque_pixel_snapshot): (
+        Arc<Vec<PixelSnapshot>>,
+        Arc<Vec<PixelSnapshot>>,
+    ) = sess
         .compositor
         .as_mut()
-        .map(SharedCompositor::pixel_snapshot)
+        .map(SharedCompositor::pixel_snapshots)
         .unwrap_or_default();
     if pixel_snapshot.is_empty() {
         sess.ticks_pixel_snapshot_empty = sess.ticks_pixel_snapshot_empty.saturating_add(1);
@@ -6533,10 +6637,9 @@ async fn tick(state: &AppState) -> TickOutcome {
         let mut pending_vulkan_keyframe_requests: Vec<(u32, u64)> = Vec::new();
         // Downscale targets registered by a server-side encoder this tick is
         // replacing with a Vulkan Video session: `(surface, target_w,
-        // target_h)`.  Cleared with the setup commands below — leaving one
-        // registered keeps the compositor blitting into it every frame, and
-        // that concurrent consumer corrupts the Vulkan session's bitstreams
-        // (tile data no decoder accepts), besides being pure waste.
+        // target_h)`. Re-settle each after the client loop: an orphaned
+        // interim target is waste, but another client's NVENC encoder may
+        // legitimately still own the same target.
         let mut pending_vulkan_clear_targets: Vec<(u32, u32, u32)> = Vec::new();
         let mut pending_vulkan_qp_updates: Vec<(u32, u64, u8)> = Vec::new();
 
@@ -6720,9 +6823,23 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // encoder garbles content (the encoder reads at
                 // `source_dimensions` stride into a different-sized
                 // buffer, which wraps rows).
-                let target_snapshot = pixel_snapshot
+                let wants_opaque_pixels = client
+                    .surface_subs
+                    .get(&sid)
+                    .is_some_and(|s| s.wants_nv12_opaque);
+                let preferred_snapshot = if wants_opaque_pixels {
+                    opaque_pixel_snapshot.as_slice()
+                } else {
+                    pixel_snapshot.as_slice()
+                };
+                let target_snapshot = preferred_snapshot
                     .iter()
                     .find(|&&(s, w, h, _, _, _)| s == sid && (w, h) == (target_w, target_h))
+                    .or_else(|| {
+                        pixel_snapshot
+                            .iter()
+                            .find(|&&(s, w, h, _, _, _)| s == sid && (w, h) == (target_w, target_h))
+                    })
                     .copied();
                 let (px_w, px_h, px_gen, px_timestamp_ms, px_timestamp_sub_us) = target_snapshot
                     .map(|(_, w, h, g, t, sub_us)| (w, h, g, t, sub_us))
@@ -6964,8 +7081,15 @@ async fn tick(state: &AppState) -> TickOutcome {
 
                 let cached: Option<(blit_compositor::PixelData, bool)> = {
                     let cs = sess.compositor.as_ref().unwrap();
-                    cs.last_pixels
-                        .get(&(sid, px_w, px_h))
+                    let key = (sid, px_w, px_h);
+                    let pixels = if wants_opaque_pixels {
+                        cs.last_opaque_pixels
+                            .get(&key)
+                            .or_else(|| cs.last_pixels.get(&key))
+                    } else {
+                        cs.last_pixels.get(&key)
+                    };
+                    pixels
                         // A GPU-only commit carries no CPU pixels: the
                         // compositor skipped the readback because a Vulkan
                         // Video encoder owned the surface and nothing had
@@ -7333,8 +7457,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                             if s.encode_in_flight || s.creation_in_flight {
                                 s.encoder_invalidated = true;
                             }
-                            // And clear any downscale target an interim
-                            // server-side encoder registered (see
+                            // And remove this client from any downscale target
+                            // its interim server-side encoder registered (see
                             // `pending_vulkan_clear_targets`).
                             if let Some((tw, th)) = s.last_registered_target.take() {
                                 pending_vulkan_clear_targets.push((sid as u32, tw, th));
@@ -7395,11 +7519,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // refusal comes back asynchronously as
                     // `VulkanEncoderUnavailable`, which latches
                     // `vulkan_refused` so a later tick retries the tier
-                    // below with this encoder skipped.  (An NVENC encoder
-                    // running against the same surface also corrupts the
-                    // Vulkan session's bitstreams into tile data no decoder
-                    // accepts, so this skip is a correctness matter, not
-                    // just waste.)
+                    // below with this encoder skipped. An interim NVENC
+                    // encoder for this same subscription must not survive
+                    // the takeover; another client's independently tracked
+                    // encoder is allowed to coexist.
                     if vulkan_selected {
                         continue;
                     }
@@ -7537,24 +7660,11 @@ async fn tick(state: &AppState) -> TickOutcome {
             }
         }
 
-        // Clear downscale targets orphaned by this tick's Vulkan takeovers,
-        // before the session setups so the compositor stops filling them
-        // ahead of the first Vulkan encode.
-        if !pending_vulkan_clear_targets.is_empty()
-            && let Some(cs) = sess.compositor.as_mut()
-        {
-            for (surface_id, tw, th) in pending_vulkan_clear_targets {
-                let _ = cs.handle.command_tx.send(
-                    blit_compositor::CompositorCommand::ClearDownscaleTarget {
-                        surface_id,
-                        target_w: tw,
-                        target_h: th,
-                    },
-                );
-                cs.last_pixels.remove(&(surface_id as u16, tw, th));
-                cs.mark_pixel_snapshot_dirty();
-            }
-            cs.handle.wake();
+        // Reconcile targets this tick's Vulkan takeovers left. The taking
+        // client cleared `last_registered_target` above, so survivors alone
+        // decide whether the target stays and which representations it has.
+        for (surface_id, tw, th) in pending_vulkan_clear_targets {
+            sess.resettle_downscale_target(surface_id as u16, tw, th);
         }
 
         // Send Vulkan Video encoder commands to compositor.
@@ -8287,6 +8397,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // entries (e.g. native BGRA from a previous
                         // tick) will be re-added by SurfaceCommit.
                         last_pixels_remove_for_sid(&mut cs.last_pixels, result.sid);
+                        last_pixels_remove_for_sid(&mut cs.last_opaque_pixels, result.sid);
                         cs.mark_pixel_snapshot_dirty();
                     }
                 }
@@ -8327,21 +8438,20 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // the encode loop can't pick it up after we've
                         // moved on.
                         cs.last_pixels.remove(&(result.sid, pw, ph));
+                        cs.last_opaque_pixels.remove(&(result.sid, pw, ph));
                         cs.mark_pixel_snapshot_dirty();
                     }
-                    // Whether the NV12 OPAQUE_FD shape is safe for this
-                    // target, which is a property of *every* subscriber at
-                    // it, not just this one. The buffer is GPU-only memory
-                    // published under a single (sid, w, h) key, so one
-                    // software or VA-API encoder sharing the size is enough
-                    // to rule it out for all of them — it would be handed a
-                    // handle it cannot map and would show black.
+                    // Resolve both representations for this target. Mixed
+                    // CPU/NVENC subscribers get BGRA and opaque NV12/NV24;
+                    // matching NVENC-only subscribers keep the no-readback
+                    // path. A 4:2:0/4:4:4 split still falls back to BGRA
+                    // because one opaque allocation cannot have both shapes.
                     //
                     // Computed before the compositor borrow below, which
                     // takes `sess` mutably.
                     let encoder_wants_nv12_opaque = encoder.wants_nv12_opaque_fd();
                     let encoder_opaque_444 = encoder.opaque_wants_444();
-                    let want_nv12_opaque = nv12_opaque_safe_for_target(
+                    let target_mode = downscale_target_mode(
                         encoder_wants_nv12_opaque,
                         encoder_opaque_444,
                         (tw, th),
@@ -8392,6 +8502,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // stays a request rather than a commitment, and it
                         // reconciles a `false` here by dropping an NV12
                         // target it had already built.
+                        // The command can replace the opaque allocation
+                        // (layout change, failed export, or Vulkan takeover).
+                        // Its cached fd must not outlive that allocation.
+                        cs.last_opaque_pixels.remove(&(result.sid, tw, th));
+                        cs.mark_pixel_snapshot_dirty();
                         let _ = cs.handle.command_tx.send(
                             blit_compositor::CompositorCommand::RegisterDownscaleTarget {
                                 surface_id: result.sid as u32,
@@ -8399,8 +8514,9 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 target_h: th,
                                 native_w: result.native_w,
                                 native_h: result.native_h,
-                                want_nv12_opaque,
-                                opaque_is_444: encoder_opaque_444,
+                                want_nv12_opaque: target_mode.want_nv12_opaque,
+                                want_cpu_pixels: target_mode.want_cpu_pixels,
+                                opaque_is_444: target_mode.opaque_is_444,
                             },
                         );
                         cs.handle.wake();
@@ -14816,106 +14932,131 @@ mod tests {
         }
     }
 
-    /// The NV12 OPAQUE_FD buffer is GPU-only memory published under a
-    /// single (surface, w, h) key, so it is only safe when *every*
-    /// subscriber at that size can import it. These pin the rule that
-    /// stops a software encoder being handed a handle it cannot map —
-    /// which reaches the viewer as a black picture, not as an error.
+    /// Pin the representation arbitration for one downscale target. Mixed
+    /// CPU/NVENC readers receive both BGRA and opaque NV12; NVENC readers
+    /// must still agree on the opaque chroma layout.
     mod nv12_opaque_target {
         use super::super::{
-            NVENC_CPU_FALLBACK_MAX_FPS, SurfaceSubState, nv12_opaque_safe_for_target,
-            nvenc_cpu_fallback_deadline,
+            DownscaleTargetMode, NVENC_CPU_FALLBACK_MAX_FPS, SurfaceSubState,
+            downscale_target_mode, nvenc_cpu_fallback_deadline,
         };
         use std::time::{Duration, Instant};
 
         const T: (u32, u32) = (1280, 720);
+        const OPAQUE_420: DownscaleTargetMode = DownscaleTargetMode {
+            want_nv12_opaque: true,
+            want_cpu_pixels: false,
+            opaque_is_444: false,
+        };
+        const OPAQUE_444: DownscaleTargetMode = DownscaleTargetMode {
+            want_nv12_opaque: true,
+            want_cpu_pixels: false,
+            opaque_is_444: true,
+        };
+        const MIXED_420: DownscaleTargetMode = DownscaleTargetMode {
+            want_nv12_opaque: true,
+            want_cpu_pixels: true,
+            opaque_is_444: false,
+        };
+        const CPU_ONLY: DownscaleTargetMode = DownscaleTargetMode {
+            want_nv12_opaque: false,
+            want_cpu_pixels: true,
+            opaque_is_444: false,
+        };
 
         #[test]
         fn sole_nvenc_subscriber_gets_it() {
-            assert!(nv12_opaque_safe_for_target(
-                true,
-                false,
-                T,
-                std::iter::empty()
-            ));
+            assert_eq!(
+                downscale_target_mode(true, false, T, std::iter::empty()),
+                OPAQUE_420
+            );
         }
 
         #[test]
-        fn a_non_nvenc_encoder_at_the_same_size_rules_it_out() {
-            assert!(!nv12_opaque_safe_for_target(
-                true,
-                false,
-                T,
-                [(Some(T), false, false)].into_iter()
-            ));
+        fn mixed_cpu_and_nvenc_subscribers_get_both_representations() {
+            assert_eq!(
+                downscale_target_mode(true, false, T, [(Some(T), false, false)].into_iter()),
+                MIXED_420
+            );
         }
 
         #[test]
         fn all_nvenc_subscribers_keep_it() {
-            assert!(nv12_opaque_safe_for_target(
-                true,
-                false,
-                T,
-                [(Some(T), true, false), (Some(T), true, false)].into_iter()
-            ));
+            assert_eq!(
+                downscale_target_mode(
+                    true,
+                    false,
+                    T,
+                    [(Some(T), true, false), (Some(T), true, false)].into_iter()
+                ),
+                OPAQUE_420
+            );
         }
 
         #[test]
         fn a_dissenter_at_another_size_is_irrelevant() {
             // It reads its own (sid, w, h) key, which still carries BGRA.
-            assert!(nv12_opaque_safe_for_target(
-                true,
-                false,
-                T,
-                [(Some((640, 360)), false, false), (None, false, false)].into_iter()
-            ));
+            assert_eq!(
+                downscale_target_mode(
+                    true,
+                    false,
+                    T,
+                    [(Some((640, 360)), false, false), (None, false, false)].into_iter()
+                ),
+                OPAQUE_420
+            );
         }
 
         #[test]
-        fn one_dissenter_among_many_is_enough() {
-            assert!(!nv12_opaque_safe_for_target(
-                true,
-                false,
-                T,
-                [
-                    (Some(T), true, false),
-                    (Some(T), false, false),
-                    (Some(T), true, false)
-                ]
-                .into_iter()
-            ));
+        fn one_cpu_reader_among_many_keeps_both_representations() {
+            assert_eq!(
+                downscale_target_mode(
+                    true,
+                    false,
+                    T,
+                    [
+                        (Some(T), true, false),
+                        (Some(T), false, false),
+                        (Some(T), true, false)
+                    ]
+                    .into_iter()
+                ),
+                MIXED_420
+            );
         }
 
         #[test]
-        fn a_non_nvenc_encoder_never_asks_for_it() {
-            assert!(!nv12_opaque_safe_for_target(
-                false,
-                false,
-                T,
-                [(Some(T), true, false)].into_iter()
-            ));
+        fn arbitration_is_independent_of_which_subscriber_triggered_it() {
+            assert_eq!(
+                downscale_target_mode(false, false, T, [(Some(T), true, false)].into_iter()),
+                MIXED_420
+            );
+        }
+
+        #[test]
+        fn cpu_only_subscribers_need_no_opaque_buffer() {
+            assert_eq!(
+                downscale_target_mode(false, false, T, [(Some(T), false, false)].into_iter()),
+                CPU_ONLY
+            );
         }
 
         #[test]
         fn a_chroma_format_split_rules_it_out() {
             // One session needs NV12, the other planar YUV444 — one
             // shared buffer cannot serve both layouts.
-            assert!(!nv12_opaque_safe_for_target(
-                true,
-                true,
-                T,
-                [(Some(T), true, false)].into_iter()
-            ));
+            assert_eq!(
+                downscale_target_mode(true, true, T, [(Some(T), true, false)].into_iter()),
+                CPU_ONLY
+            );
         }
 
         #[test]
         fn matching_444_subscribers_keep_it() {
-            assert!(nv12_opaque_safe_for_target(
-                true,
-                true,
-                T,
-                [(Some(T), true, true)].into_iter()
-            ));
+            assert_eq!(
+                downscale_target_mode(true, true, T, [(Some(T), true, true)].into_iter()),
+                OPAQUE_444
+            );
         }
 
         #[test]
