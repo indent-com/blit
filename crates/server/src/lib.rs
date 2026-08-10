@@ -843,6 +843,11 @@ const SURFACE_RESIZE_SETTLE: Duration = Duration::from_millis(100);
 /// about to go zero-copy (a frame or two at any refresh rate), and turns the
 /// black surface into a stream.
 const OPAQUE_PUBLISH_GRACE: Duration = Duration::from_millis(250);
+/// A missing compositor NV12 target must not turn NVENC's emergency CPU
+/// conversion into a full-refresh-rate permanent mode.  Thirty fps keeps the
+/// fallback usable while bounding a 4K conversion that can otherwise pin a
+/// core until the target is re-registered.
+const NVENC_CPU_FALLBACK_MAX_FPS: f32 = 30.0;
 
 /// How long a dispatched configure may hold off building an encoder for the
 /// size the surface is leaving.
@@ -1150,6 +1155,28 @@ fn opaque_publish_pending(
     )
 }
 
+/// Return the future deadline when an emergency NVENC CPU conversion should
+/// be skipped, or `None` when this frame may proceed.  GPU-origin pixels clear
+/// the limiter immediately, restoring the normal display-rate path.
+fn nvenc_cpu_fallback_deadline(
+    sub: &mut SurfaceSubState,
+    cpu_origin: bool,
+    now: Instant,
+) -> Option<Instant> {
+    if !cpu_origin || !sub.wants_nv12_opaque {
+        sub.cpu_fallback_next_at = None;
+        return None;
+    }
+    let interval = Duration::from_secs_f64(1.0 / NVENC_CPU_FALLBACK_MAX_FPS as f64);
+    let deadline = sub.cpu_fallback_next_at.unwrap_or(now);
+    if deadline > now {
+        return Some(deadline);
+    }
+    let deadline = sub.cpu_fallback_next_at.get_or_insert(now);
+    advance_deadline(deadline, now, interval);
+    None
+}
+
 /// Numeric H.264 `level_idc` for a coded picture, by the Annex A MaxFS
 /// limits.
 ///
@@ -1384,6 +1411,9 @@ struct SurfaceSubState {
     /// whenever there is nothing to hold out for; see
     /// `OPAQUE_PUBLISH_GRACE`.
     opaque_wait_since: Option<Instant>,
+    /// Pacing deadline used only while an NVENC subscription is consuming
+    /// emergency CPU-origin pixels.  Cleared as soon as its GPU frame lands.
+    cpu_fallback_next_at: Option<Instant>,
     /// This client holds a decodable keyframe for this surface, so a delta
     /// frame is safe to send.  Cleared whenever the reference chain breaks
     /// or becomes unknown: encoder rebuilt or lost, surface resized,
@@ -2463,6 +2493,43 @@ fn encoded_generation(
     } else {
         previous
     }
+}
+
+/// Apply an encode completion to its subscription.
+///
+/// A resubscribe can invalidate an encode while it is running.  Its output
+/// belongs to the old codec or dimensions, so it must neither be delivered
+/// nor advance the generation mark used by the delivery gate.  In
+/// particular, an old-size keyframe must not satisfy the new encoder's
+/// keyframe debt.
+fn accept_completed_encode(
+    state: &mut SurfaceSubState,
+    generation: u64,
+    produced_output: bool,
+) -> bool {
+    state.encode_in_flight = false;
+    state.in_flight_generation = None;
+    if std::mem::replace(&mut state.encoder_invalidated, false) {
+        state.pending_encode = None;
+        return false;
+    }
+    state.last_encoded_gen =
+        encoded_generation(state.last_encoded_gen, generation, produced_output);
+    true
+}
+
+/// Retire an encoder-creation task at the subscription boundary.
+///
+/// Creation allocates compositor targets as well as the encoder itself.  A
+/// dock/undock handoff can change the requested target several times while
+/// that blocking work runs, so a stale completion must be rejected before
+/// it registers buffers or clears the current pixel cache.  Registering it
+/// first can leave only thumbnail-sized pixels cached while the final native
+/// subscription waits for native pixels before dispatching its own creation;
+/// a later surface resize happens to break that deadlock by recompositing.
+fn accept_completed_creation(state: &mut SurfaceSubState) -> bool {
+    state.creation_in_flight = false;
+    !std::mem::replace(&mut state.encoder_invalidated, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -6809,7 +6876,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // the app paint.  Treat it as absent instead, so the
                 // recomposite request below asks the compositor for the
                 // zero-copy frame this subscriber is missing.
-                let cached = match cached {
+                let mut cached = match cached {
                     Some((_, true)) if !owes_keyframe => continue,
                     Some((_, true)) => None,
                     other => other.map(|(p, _)| p),
@@ -6876,40 +6943,22 @@ async fn tick(state: &AppState) -> TickOutcome {
                         continue;
                     }
                 }
-                let Some(pixels) = cached else {
-                    // Nothing will fill this entry on its own: an idle
-                    // Wayland app repaints only when a configure changes its
-                    // size, and the composite that would publish
-                    // `(sid, px_w, px_h)` only runs on a commit or a target
-                    // install.  A reloading browser lands exactly here — its
-                    // old connection's teardown cleared the surface's target
-                    // and cache entry, and the resubscribe mediates to the
-                    // unchanged size, so no configure ever comes.  Ask for a
-                    // recomposite of the current committed state; throttled,
-                    // because this loop retries at frame rate and one is
-                    // enough.
-                    let now_inst = Instant::now();
-                    let client = sess.clients.get_mut(&work.cid).unwrap();
-                    client.skip_last_pixels_mismatch_count =
-                        client.skip_last_pixels_mismatch_count.saturating_add(1);
-                    let recomposite_due = client.surface_subs.get_mut(&sid).is_some_and(|sub| {
-                        let due = sub
-                            .recomposite_requested_at
-                            .is_none_or(|at| now_inst.duration_since(at).as_millis() >= 250);
-                        if due {
-                            sub.recomposite_requested_at = Some(now_inst);
-                        }
-                        due
-                    });
-                    if recomposite_due && let Some(cs) = sess.compositor.as_ref() {
-                        let _ = cs.handle.command_tx.send(
-                            blit_compositor::CompositorCommand::Recomposite { surface_id: sid },
-                        );
-                        cs.handle.wake();
-                    }
-                    continue;
-                };
                 let client = sess.clients.get_mut(&work.cid).unwrap();
+
+                // NVENC normally consumes the compositor's GPU-converted
+                // OPAQUE_FD frame.  During target rebuilds it can briefly be
+                // handed native BGRA instead; its compatibility path converts
+                // that whole frame on the CPU.  Bound the emergency path so
+                // a missing/stale target cannot pin a core at 120+ Hz.
+                if let Some(deadline) = nvenc_cpu_fallback_deadline(
+                    client.surface_subs.entry(sid).or_default(),
+                    cached_is_cpu_pixels,
+                    now,
+                ) {
+                    next_deadline = Some(next_deadline.map_or(deadline, |d| d.min(deadline)));
+                    client.skip_pacing_count = client.skip_pacing_count.saturating_add(1);
+                    continue;
+                }
 
                 // Skip if an encode or creation job is already in
                 // flight for this surface.  Creations also block encode
@@ -6928,6 +6977,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         && sub.encode_in_flight
                         && !sub.creation_in_flight
                         && !sub.encoder_invalidated
+                        && cached.is_some()
                         && (px_w, px_h) == (target_w, target_h)
                         && (still_refresh
                             || pending_generation_is_newer(
@@ -6944,7 +6994,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         sub.pending_encode = Some(PendingSurfaceEncode {
                             target_w: enc_w,
                             target_h: enc_h,
-                            pixels,
+                            pixels: cached.take().unwrap(),
                             needs_keyframe: owes_keyframe || still_refresh,
                             force_quality_refresh: still_refresh,
                             generation: px_gen,
@@ -7270,6 +7320,35 @@ async fn tick(state: &AppState) -> TickOutcome {
                     continue;
                 }
 
+                let Some(pixels) = cached else {
+                    // Encoder creation above is deliberately independent of
+                    // this cache lookup.  Installing its target is what makes
+                    // the compositor publish pixels at a newly-restored
+                    // native size; gating creation on those pixels deadlocks
+                    // after a thumbnail target was the last one registered.
+                    // Once an encoder already exists, a recomposite of the
+                    // current committed state is enough to fill its target.
+                    let now_inst = Instant::now();
+                    client.skip_last_pixels_mismatch_count =
+                        client.skip_last_pixels_mismatch_count.saturating_add(1);
+                    let recomposite_due = client.surface_subs.get_mut(&sid).is_some_and(|sub| {
+                        let due = sub
+                            .recomposite_requested_at
+                            .is_none_or(|at| now_inst.duration_since(at).as_millis() >= 250);
+                        if due {
+                            sub.recomposite_requested_at = Some(now_inst);
+                        }
+                        due
+                    });
+                    if recomposite_due && let Some(cs) = sess.compositor.as_ref() {
+                        let _ = cs.handle.command_tx.send(
+                            blit_compositor::CompositorCommand::Recomposite { surface_id: sid },
+                        );
+                        cs.handle.wake();
+                    }
+                    continue;
+                };
+
                 // The per-client encoder reads pixels at its
                 // `source_dimensions` stride.  If the only available
                 // snapshot is at native dims (e.g. the compositor
@@ -7542,6 +7621,13 @@ async fn tick(state: &AppState) -> TickOutcome {
                 let mut local_encode_bytes = 0u64;
                 let mut local_frames_sent = 0u32;
                 let mut chained_jobs = Vec::new();
+                // A successful completion delivers its frame here and either
+                // chains the newest pending generation or returns the encoder
+                // to the subscription.  In both cases there is no work for
+                // the delivery tick: the next compositor commit will wake it
+                // when that returned encoder is needed.  Only exceptional
+                // paths that need to retry cached state have to nudge it.
+                let mut needs_delivery_nudge = !failed.is_empty() || timed_out;
 
                 // Clean up in-flight tracking for panicked/timed-out encodes.
                 // Without this, the surface is permanently blocked from
@@ -7595,32 +7681,27 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // tick's `needs_new_encoder` check rebuilds the
                     // encoder before any encode at the new size.
                     let mut returned_encoder = Some(result.encoder);
-                    let invalidated = if let Some(client) = sess.clients.get_mut(&result.cid) {
+                    let accepted = if let Some(client) = sess.clients.get_mut(&result.cid) {
                         let state = client.surface_subs.entry(result.sid).or_default();
-                        state.encode_in_flight = false;
-                        state.in_flight_generation = None;
-                        let invalidated = std::mem::replace(&mut state.encoder_invalidated, false);
-                        if invalidated {
-                            state.pending_encode = None;
-                        }
-                        // Record the generation we just encoded so we don't
-                        // re-encode identical pixel data on subsequent ticks.
-                        state.last_encoded_gen = encoded_generation(
-                            state.last_encoded_gen,
-                            result.generation,
-                            result.nal_data.is_some(),
-                        );
-                        invalidated
+                        accept_completed_encode(state, result.generation, result.nal_data.is_some())
                     } else {
                         continue;
                     };
+                    if !accepted {
+                        // This output belongs to the pre-resubscribe encoder.
+                        // Dropping it preserves the keyframe debt set by the
+                        // subscription change, so the replacement encoder
+                        // starts a decoder-compatible reference chain.
+                        retire_encoder(returned_encoder.take());
+                        needs_delivery_nudge = true;
+                        continue;
+                    }
 
                     let Some((nal_data, is_keyframe)) = result.nal_data else {
+                        needs_delivery_nudge = true;
                         if let Some(client) = sess.clients.get_mut(&result.cid) {
                             let state = client.surface_subs.entry(result.sid).or_default();
-                            if !invalidated {
-                                state.encoder = returned_encoder.take();
-                            }
+                            state.encoder = returned_encoder.take();
                             state.pending_encode = None;
                             state.nal_none_streak += 1;
                             let streak = state.nal_none_streak;
@@ -7769,45 +7850,49 @@ async fn tick(state: &AppState) -> TickOutcome {
                         }
                     };
 
-                    if !invalidated {
-                        let can_chain = sent
-                            && !surface_delivery_is_throttled(client, result.sid)
-                            && !outbox_backpressured(client);
-                        let state = client.surface_subs.entry(result.sid).or_default();
-                        let pending = state.pending_encode.take();
-                        if can_chain
-                            && let Some(pending) = pending
-                            && returned_encoder.as_ref().is_some_and(|encoder| {
-                                encoder.source_dimensions() == (pending.target_w, pending.target_h)
-                            })
-                        {
-                            state.encode_in_flight = true;
-                            state.in_flight_generation = Some(pending.generation);
-                            chained_jobs.push(EncodeJob {
-                                cid: result.cid,
-                                sid: result.sid,
-                                target_w: pending.target_w,
-                                target_h: pending.target_h,
-                                pixels: pending.pixels,
-                                // A keyframe that just satisfied startup or
-                                // recovery debt also makes the queued frame's
-                                // reference chain decodable. Do not emit a
-                                // redundant second IDR. A quality refresh is
-                                // a separate explicit refresh request.
-                                needs_keyframe: chained_encode_needs_keyframe(
-                                    pending.needs_keyframe,
-                                    pending.force_quality_refresh,
-                                    is_keyframe,
-                                ),
-                                generation: pending.generation,
-                                encoder: returned_encoder.take().unwrap(),
-                                timestamp_ms: pending.timestamp_ms,
-                                timestamp_sub_us: pending.timestamp_sub_us,
-                                queued_at: Instant::now(),
-                            });
-                        } else {
-                            state.encoder = returned_encoder.take();
-                        }
+                    let can_chain = sent
+                        && !surface_delivery_is_throttled(client, result.sid)
+                        && !outbox_backpressured(client);
+                    let state = client.surface_subs.entry(result.sid).or_default();
+                    let pending = state.pending_encode.take();
+                    let had_pending = pending.is_some();
+                    if can_chain
+                        && let Some(pending) = pending
+                        && returned_encoder.as_ref().is_some_and(|encoder| {
+                            encoder.source_dimensions() == (pending.target_w, pending.target_h)
+                        })
+                    {
+                        state.encode_in_flight = true;
+                        state.in_flight_generation = Some(pending.generation);
+                        chained_jobs.push(EncodeJob {
+                            cid: result.cid,
+                            sid: result.sid,
+                            target_w: pending.target_w,
+                            target_h: pending.target_h,
+                            pixels: pending.pixels,
+                            // A keyframe that just satisfied startup or
+                            // recovery debt also makes the queued frame's
+                            // reference chain decodable. Do not emit a
+                            // redundant second IDR. A quality refresh is
+                            // a separate explicit refresh request.
+                            needs_keyframe: chained_encode_needs_keyframe(
+                                pending.needs_keyframe,
+                                pending.force_quality_refresh,
+                                is_keyframe,
+                            ),
+                            generation: pending.generation,
+                            encoder: returned_encoder.take().unwrap(),
+                            timestamp_ms: pending.timestamp_ms,
+                            timestamp_sub_us: pending.timestamp_sub_us,
+                            queued_at: Instant::now(),
+                        });
+                    } else {
+                        state.encoder = returned_encoder.take();
+                        // A pending frame that could not be chained (size
+                        // change or fresh backpressure) has been dropped
+                        // intentionally.  Revisit the authoritative cache
+                        // so it can be rebuilt or sent when the gate opens.
+                        needs_delivery_nudge |= had_pending;
                     }
                 }
                 sess.surface_encodes += local_encodes;
@@ -7817,9 +7902,9 @@ async fn tick(state: &AppState) -> TickOutcome {
                 for job in chained_jobs {
                     spawn_encode_job(&mut tasks, &mut job_ids, job);
                 }
-                // Wake the tick loop so this surface can immediately reuse
-                // its returned encoder for the next frame.
-                state2.delivery_notify.notify_one();
+                if needs_delivery_nudge {
+                    state2.delivery_notify.notify_one();
+                }
                 if timed_out {
                     break;
                 }
@@ -8024,11 +8109,25 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                     continue;
                 }
+
+                // Reject a creation invalidated by a resubscribe before it
+                // changes compositor targets or pixel caches.  The final
+                // target will be built on the next delivery tick.
+                let accepted = if let Some(client) = sess.clients.get_mut(&result.cid)
+                    && let Some(state) = client.surface_subs.get_mut(&result.sid)
+                {
+                    accept_completed_creation(state)
+                } else {
+                    false
+                };
+                if !accepted {
+                    continue;
+                }
+
                 let Some(encoder) = result.encoder else {
                     if let Some(client) = sess.clients.get_mut(&result.cid)
                         && let Some(s) = client.surface_subs.get_mut(&result.sid)
                     {
-                        s.creation_in_flight = false;
                         s.create_failures = s.create_failures.saturating_add(1);
                         // Bring the surface down to what the whole chain
                         // clears when the size is what stands in the way.
@@ -8206,15 +8305,6 @@ async fn tick(state: &AppState) -> TickOutcome {
 
                 if let Some(client) = sess.clients.get_mut(&result.cid) {
                     let state = client.surface_subs.entry(result.sid).or_default();
-                    state.creation_in_flight = false;
-                    let invalidated = std::mem::replace(&mut state.encoder_invalidated, false);
-                    if invalidated {
-                        // Preferences changed mid-creation (codec /
-                        // bandwidth / speed resubscribe).  Drop the encoder we just built;
-                        // the next tick will dispatch a fresh creation
-                        // with the new prefs.
-                        continue;
-                    }
                     // Sizing has been guessing which backend would win; now it
                     // knows.  A surface that came up on AV1 can grow past the
                     // H.264 ceiling, and one that came up on H.264 stops
@@ -8263,8 +8353,8 @@ async fn tick(state: &AppState) -> TickOutcome {
     {
         let mut desired_clocks: HashMap<u16, Duration> = HashMap::new();
         for client in sess.clients.values() {
-            let interval = surface_source_interval(client);
             for &sid in &client.surface_subscriptions {
+                let interval = surface_source_interval(client);
                 desired_clocks
                     .entry(sid)
                     .and_modify(|current| *current = (*current).min(interval))
@@ -13793,7 +13883,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     }
                     record_surface_ack(c, surface_id);
                 }
-                state.delivery_notify.notify_one();
+                // Surface delivery is not ACK-gated: its source clock keeps
+                // producing commits, and each commit wakes the tick.  ACKs
+                // only update accounting and decoder pressure, both consumed
+                // on that next commit.  Waking here added one otherwise-empty
+                // full-session tick per frame at the client's display rate.
             }
             C2S_CLIENT_FEATURES if data.len() >= 2 => {
                 // Byte 0: codec_support bitmask.  Bytes 1..5, when present:
@@ -14537,7 +14631,11 @@ mod tests {
     /// stops a software encoder being handed a handle it cannot map —
     /// which reaches the viewer as a black picture, not as an error.
     mod nv12_opaque_target {
-        use super::super::nv12_opaque_safe_for_target;
+        use super::super::{
+            NVENC_CPU_FALLBACK_MAX_FPS, SurfaceSubState, nv12_opaque_safe_for_target,
+            nvenc_cpu_fallback_deadline,
+        };
+        use std::time::{Duration, Instant};
 
         const T: (u32, u32) = (1280, 720);
 
@@ -14627,6 +14725,39 @@ mod tests {
                 T,
                 [(Some(T), true, true)].into_iter()
             ));
+        }
+
+        #[test]
+        fn nvenc_cpu_fallback_is_rate_limited() {
+            let now = Instant::now();
+            let interval = Duration::from_secs_f64(1.0 / NVENC_CPU_FALLBACK_MAX_FPS as f64);
+            let mut sub = SurfaceSubState {
+                wants_nv12_opaque: true,
+                ..Default::default()
+            };
+
+            assert_eq!(nvenc_cpu_fallback_deadline(&mut sub, true, now), None);
+            let deadline = sub.cpu_fallback_next_at.expect("deadline installed");
+            assert_eq!(deadline, now + interval);
+            assert_eq!(
+                nvenc_cpu_fallback_deadline(&mut sub, true, now + interval / 2),
+                Some(deadline)
+            );
+            assert_eq!(nvenc_cpu_fallback_deadline(&mut sub, true, deadline), None);
+        }
+
+        #[test]
+        fn gpu_frame_clears_nvenc_cpu_fallback_limit() {
+            let now = Instant::now();
+            let mut sub = SurfaceSubState {
+                wants_nv12_opaque: true,
+                ..Default::default()
+            };
+            assert_eq!(nvenc_cpu_fallback_deadline(&mut sub, true, now), None);
+            assert!(sub.cpu_fallback_next_at.is_some());
+
+            assert_eq!(nvenc_cpu_fallback_deadline(&mut sub, false, now), None);
+            assert_eq!(sub.cpu_fallback_next_at, None);
         }
     }
     use super::*;
@@ -18956,6 +19087,77 @@ mod tests {
         );
         mark = encoded_generation(mark, 12, true);
         assert!(unchanged(mark, 12), "and settle once it is actually sent");
+    }
+
+    #[test]
+    fn an_invalidated_encode_completion_is_not_accepted() {
+        let mut sub = SurfaceSubState {
+            encode_in_flight: true,
+            in_flight_generation: Some(12),
+            encoder_invalidated: true,
+            has_keyframe: false,
+            last_encoded_gen: Some(11),
+            ..Default::default()
+        };
+
+        assert!(
+            !accept_completed_encode(&mut sub, 12, true),
+            "old-size output must be dropped after a resubscribe",
+        );
+        assert!(!sub.encode_in_flight);
+        assert_eq!(sub.in_flight_generation, None);
+        assert_eq!(
+            sub.last_encoded_gen,
+            Some(11),
+            "stale output must remain owed to the replacement encoder",
+        );
+        assert!(!sub.has_keyframe, "stale keyframe cannot pay new debt");
+        assert!(!sub.encoder_invalidated);
+    }
+
+    #[test]
+    fn a_current_encode_completion_advances_the_generation() {
+        let mut sub = SurfaceSubState {
+            encode_in_flight: true,
+            in_flight_generation: Some(12),
+            last_encoded_gen: Some(11),
+            ..Default::default()
+        };
+
+        assert!(accept_completed_encode(&mut sub, 12, true));
+        assert!(!sub.encode_in_flight);
+        assert_eq!(sub.in_flight_generation, None);
+        assert_eq!(sub.last_encoded_gen, Some(12));
+    }
+
+    #[test]
+    fn an_invalidated_creation_is_rejected_before_registration() {
+        let mut sub = SurfaceSubState {
+            creation_in_flight: true,
+            encoder_invalidated: true,
+            last_registered_target: Some((256, 184)),
+            ..Default::default()
+        };
+
+        assert!(!accept_completed_creation(&mut sub));
+        assert!(!sub.creation_in_flight);
+        assert!(!sub.encoder_invalidated);
+        assert_eq!(
+            sub.last_registered_target,
+            Some((256, 184)),
+            "rejection itself must not mutate compositor registration state",
+        );
+    }
+
+    #[test]
+    fn a_current_creation_is_accepted() {
+        let mut sub = SurfaceSubState {
+            creation_in_flight: true,
+            ..Default::default()
+        };
+
+        assert!(accept_completed_creation(&mut sub));
+        assert!(!sub.creation_in_flight);
     }
 
     #[test]

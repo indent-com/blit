@@ -1006,8 +1006,13 @@ describe("SurfaceStore decoder recovery", () => {
     decoded = 0;
     decodeQueueSize = 0;
     private readonly onError: (error: DOMException) => void;
-    constructor(init: { error: (error: DOMException) => void }) {
+    private readonly onOutput: (frame: VideoFrame) => void;
+    constructor(init: {
+      error: (error: DOMException) => void;
+      output: (frame: VideoFrame) => void;
+    }) {
       this.onError = init.error;
+      this.onOutput = init.output;
       FakeDecoder.instances.push(this);
     }
     configure(config: { codec: string }) {
@@ -1033,6 +1038,9 @@ describe("SurfaceStore decoder recovery", () => {
     }
     close() {
       this.state = "closed";
+    }
+    output(frame: VideoFrame) {
+      this.onOutput(frame);
     }
   }
 
@@ -1097,13 +1105,78 @@ describe("SurfaceStore decoder recovery", () => {
     store.destroy();
   });
 
-  it("re-applies the announced AV1 string over a derived one", () => {
+  it("replaces AV1 when an authoritative codec string changes", () => {
     const store = newStore();
     store.handleSurfaceEncoder(1, "openh264\0avc1.42001e");
     store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
     store.handleSurfaceEncoder(1, "av1-vulkan\0av01.0.09M.08");
-    const decoder = FakeDecoder.instances[0];
-    expect(decoder.configured[1]).toBe("av01.0.09M.08");
+    const [derivedDecoder, announcedDecoder] = FakeDecoder.instances;
+    expect(FakeDecoder.instances).toHaveLength(2);
+    expect(derivedDecoder.configured[0]).toMatch(/^av01\./);
+    expect(announcedDecoder.configured).toEqual(["av01.0.09M.08"]);
+    store.destroy();
+  });
+
+  it("replaces the AV1 decoder when a thumbnail returns to native size", () => {
+    // The native surface stays 1280x720 throughout, so no SurfaceResized
+    // message accompanies this transition.  The frame dimensions are the
+    // only indication that the scaled dock subscription became a full-size
+    // pane subscription again.
+    const store = newStore();
+    store.handleSurfaceEncoder(1, "av1-software\0av01.0.09M.08");
+    store.handleSurfaceFrame(1, 0, KEY_AV1, 320, 180, frame);
+    store.handleSurfaceFrame(1, 1, KEY_AV1, 1280, 720, frame);
+
+    const [thumbnailDecoder, nativeDecoder] = FakeDecoder.instances;
+    expect(FakeDecoder.instances).toHaveLength(2);
+    expect(thumbnailDecoder.configured).toEqual(["av01.0.09M.08"]);
+    expect(thumbnailDecoder.decoded).toBe(1);
+    expect(nativeDecoder.configured).toEqual(["av01.0.09M.08"]);
+    expect(nativeDecoder.decoded).toBe(1);
+    store.destroy();
+  });
+
+  it("drops thumbnail output flushed after the decoder replacement", () => {
+    const store = newStore();
+    store.handleSurfaceFrame(1, 0, KEY_AV1, 320, 180, frame);
+    store.handleSurfaceFrame(1, 1, KEY_AV1, 1280, 720, frame);
+
+    const stale = {
+      displayWidth: 320,
+      displayHeight: 180,
+      timestamp: 0,
+      close: vi.fn(),
+    } as unknown as VideoFrame;
+    FakeDecoder.instances[0].output(stale);
+
+    expect(stale.close).toHaveBeenCalledOnce();
+    expect((store as any)._diag.output).toBe(0);
+    expect((store as any)._diag.dropped).toBe(1);
+    store.destroy();
+  });
+
+  it("accepts output dimensions reported by the active decoder", () => {
+    const store = newStore();
+    store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+    const enqueue = vi.fn((_sid: number, output: VideoFrame) => output.close());
+    (store as any).enqueueFrame = enqueue;
+    const output = {
+      displayWidth: 1278,
+      displayHeight: 720,
+      timestamp: 0,
+      close: vi.fn(),
+    } as unknown as VideoFrame;
+
+    FakeDecoder.instances[0].output(output);
+
+    expect(enqueue).toHaveBeenCalledWith(
+      1,
+      output,
+      expect.any(Number),
+      expect.any(Number),
+    );
+    expect((store as any)._diag.output).toBe(1);
+    expect((store as any)._diag.dropped).toBe(0);
     store.destroy();
   });
 

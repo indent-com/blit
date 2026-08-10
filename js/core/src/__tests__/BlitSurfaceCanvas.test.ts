@@ -1039,6 +1039,93 @@ describe("BlitSurfaceCanvas size mediation", () => {
   });
 });
 
+describe("BlitSurfaceCanvas visibility", () => {
+  it("releases hidden mounts and reclaims the same view on entry", () => {
+    let intersectionCallback: IntersectionObserverCallback | undefined;
+    let disconnected = false;
+    const prevIO = globalThis.IntersectionObserver;
+    globalThis.IntersectionObserver = class {
+      constructor(cb: IntersectionObserverCallback) {
+        intersectionCallback = cb;
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {
+        disconnected = true;
+      }
+    } as unknown as typeof IntersectionObserver;
+
+    let generation = 0;
+    let change: (() => void) | undefined;
+    const subscribes: { surfaceId: number; viewId: string }[] = [];
+    const unsubscribes: { surfaceId: number; viewId: string }[] = [];
+    const store = {
+      getSurface: () => ({ width: 1920, height: 1080 }),
+      getCanvas: () => null,
+      getCursor: () => "default",
+      canDecodeVideo: true,
+      get generation() {
+        return generation;
+      },
+      onChange: (cb: () => void) => {
+        change = cb;
+        return () => {};
+      },
+      onCursor: () => () => {},
+      onFrame: () => () => {},
+    };
+    const conn = {
+      surfaceStore: store,
+      allocSurfaceViewId: () => "s1",
+      sendSurfaceSubscribe: (surfaceId: number, viewId: string) =>
+        subscribes.push({ surfaceId, viewId }),
+      sendSurfaceUnsubscribe: (surfaceId: number, viewId: string) =>
+        unsubscribes.push({ surfaceId, viewId }),
+      refreshSurfaceSubscribe: () => {},
+    };
+    const workspace = {
+      getConnection: () => conn,
+      subscribe: () => () => {},
+    } as unknown as BlitWorkspace;
+    const surface = new BlitSurfaceCanvas({
+      workspace,
+      connectionId: "conn-1" as never,
+      surfaceId: 7,
+    });
+
+    const intersect = (isIntersecting: boolean) =>
+      intersectionCallback?.(
+        [{ isIntersecting } as IntersectionObserverEntry],
+        null as unknown as IntersectionObserver,
+      );
+
+    try {
+      surface.attach(document.createElement("div"));
+      expect(subscribes).toEqual([{ surfaceId: 7, viewId: "s1" }]);
+
+      intersect(false);
+      expect(unsubscribes).toEqual([{ surfaceId: 7, viewId: "s1" }]);
+
+      // Store reconnect/change notifications while hidden must not bring
+      // the invisible stream back.
+      generation++;
+      change?.();
+      intersect(false);
+      expect(subscribes).toHaveLength(1);
+
+      intersect(true);
+      expect(subscribes).toEqual([
+        { surfaceId: 7, viewId: "s1" },
+        { surfaceId: 7, viewId: "s1" },
+      ]);
+    } finally {
+      surface.dispose();
+      globalThis.IntersectionObserver = prevIO;
+    }
+    expect(disconnected).toBe(true);
+  });
+});
+
 /** evdev keycode for KeyV, the key the paste chord defers. */
 const EVDEV_V = 47;
 

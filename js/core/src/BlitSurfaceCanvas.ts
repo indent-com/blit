@@ -782,6 +782,12 @@ export class BlitSurfaceCanvas {
    */
   private _presentBox: { width: number; height: number } | null = null;
   private _presentObserver: ResizeObserver | null = null;
+  /** Whether this mount intersects the document viewport.  Hidden BSP
+   *  leaves and inactive tabs can remain mounted; keeping their server
+   *  subscription alive would make the compositor render and encode a
+   *  stream nobody can see. */
+  private _isIntersecting = true;
+  private _intersectionObserver: IntersectionObserver | null = null;
   /** This view's surface-subscription token.  Allocated lazily and kept
    *  across resubscribes so the connection tracks one entry per view. */
   private _surfaceViewId: string | null = null;
@@ -1017,6 +1023,7 @@ export class BlitSurfaceCanvas {
     mountedSurfaceCanvases.set(canvas, this);
 
     this.observePresentBox(container);
+    this.observeIntersection(container);
     this.subscribe();
     this.attachEvents();
   }
@@ -1053,6 +1060,40 @@ export class BlitSurfaceCanvas {
     this._presentObserver = observer;
   }
 
+  /** Drop this view's server subscription while its mount is off-screen.
+   *
+   * Store listeners stay attached so metadata/cursor state remains current,
+   * and the last decoded frame stays on the canvas.  On re-entry we reclaim
+   * the same view token and immediately paint the store's newest frame.
+   */
+  private observeIntersection(container: HTMLElement): void {
+    if (typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      if (
+        !entry ||
+        this.disposed ||
+        entry.isIntersecting === this._isIntersecting
+      )
+        return;
+      this._isIntersecting = entry.isIntersecting;
+      if (!this._isIntersecting) {
+        this.serverUnsubscribe();
+        return;
+      }
+
+      this.serverSubscribe();
+      // A reconnect while hidden loses the server-side view size along with
+      // its subscription.  The container did not resize, so its observer
+      // will not send the size again for us.
+      this.resendDisplaySize();
+      const store = this.getConn()?.surfaceStore ?? this._store;
+      if (store) this.blitFromStore(store);
+    });
+    observer.observe(container);
+    this._intersectionObserver = observer;
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
@@ -1062,6 +1103,8 @@ export class BlitSurfaceCanvas {
     }
     this._presentObserver?.disconnect();
     this._presentObserver = null;
+    this._intersectionObserver?.disconnect();
+    this._intersectionObserver = null;
     this.releaseAllKeys();
     this.releaseAllButtons();
     this.endScrollSequence();
@@ -1418,18 +1461,7 @@ export class BlitSurfaceCanvas {
     // Only gate on canDecodeVideo: subscribing when WebCodecs is
     // unavailable (non-secure context) drives the server encoder for
     // nothing and can crash it.
-    if (conn && store.canDecodeVideo) {
-      conn.sendSurfaceSubscribe(
-        this._surfaceId,
-        this.surfaceViewId(conn),
-        this.scaledTarget(),
-      );
-      this._subscribedGeneration = store.generation;
-      this._subscribedSurface = {
-        connectionId: this._connectionId,
-        surfaceId: this._surfaceId,
-      };
-    }
+    if (conn && store.canDecodeVideo) this.serverSubscribe(conn, store);
 
     // Flush any pending resize and paint the latest frame immediately
     // so newly-mounted views aren't blank.
@@ -1445,7 +1477,13 @@ export class BlitSurfaceCanvas {
       // just arrived" case here because subscribe() above sends the
       // subscribe eagerly before the surface metadata is available.
       if (this.surface && store.canDecodeVideo) {
-        if (this._subscribedGeneration !== store.generation) {
+        if (this._isIntersecting && !this._subscribedSurface) {
+          this.serverSubscribe(this.getConn(), store);
+          this.resendDisplaySize();
+        } else if (
+          this._isIntersecting &&
+          this._subscribedGeneration !== store.generation
+        ) {
           const c = this.getConn();
           if (c) {
             // Refresh on reconnect — don't bump the ref-count, we
@@ -1497,6 +1535,32 @@ export class BlitSurfaceCanvas {
       if (!this._hasBlitFirstFrame) this._hasBlitFirstFrame = true;
       this.blitFromStore(store);
     });
+  }
+
+  /** Register this visible mount with the connection exactly once. */
+  private serverSubscribe(
+    conn: BlitConnection | null = this.getConn(),
+    store: import("./SurfaceStore").SurfaceStore | null =
+      conn?.surfaceStore ?? this._store,
+  ): void {
+    if (
+      !this._isIntersecting ||
+      !conn ||
+      !store?.canDecodeVideo ||
+      this._subscribedSurface
+    ) {
+      return;
+    }
+    conn.sendSurfaceSubscribe(
+      this._surfaceId,
+      this.surfaceViewId(conn),
+      this.scaledTarget(),
+    );
+    this._subscribedGeneration = store.generation;
+    this._subscribedSurface = {
+      connectionId: this._connectionId,
+      surfaceId: this._surfaceId,
+    };
   }
 
   private unsubscribeAll(): void {

@@ -980,6 +980,8 @@ export class SurfaceStore {
         colorSpace: FULL_RANGE_BT601,
       });
       entry.lastCodecString = cs;
+      entry.lastConfiguredWidth = width;
+      entry.lastConfiguredHeight = height;
       return true;
     } catch (e) {
       console.warn(
@@ -1441,6 +1443,33 @@ export class SurfaceStore {
       }
       return;
     }
+
+    // A scaled subscription can change the stream resolution without the
+    // Wayland surface changing at all.  Moving a native 1920x1080 surface
+    // from a 320x180 dock thumbnail back into a pane is exactly that: there
+    // is no SURFACE_RESIZED to reset the decoder, only a new full-size
+    // keyframe.  H.264 reconfigures from the SPS below; AV1 has no separate
+    // description, so explicitly re-apply its configuration for the new
+    // dimensions.  Replace the decoder instead of reconfiguring it in
+    // place: Chromium accepts configure() but its AV1 decoder can stop
+    // producing output after that resolution transition.  A fresh decoder
+    // also gives the new keyframe a clean reference chain.  The old one is
+    // flushed asynchronously; its output callback rejects it by identity.
+    // Discard presentation and correlation state with it so nothing from
+    // the thumbnail stream can be painted or matched after the restore.
+    const streamDimensionsChanged =
+      entry.lastConfiguredWidth > 0 &&
+      entry.lastConfiguredHeight > 0 &&
+      (width !== entry.lastConfiguredWidth ||
+        height !== entry.lastConfiguredHeight);
+    if (isKey && streamDimensionsChanged) {
+      entry = this.replaceDecoder(surfaceId, codec, width, height);
+      if (!entry) {
+        this.sendAck(surfaceId);
+        this.retryUnconfigured(surfaceId);
+        return;
+      }
+    }
     const surface = this.surfaces.get(surfaceId);
     // Frame dimensions are the *stream* size, which the server downscales
     // per client (per_client_encode_target), while surface.width/height
@@ -1492,6 +1521,7 @@ export class SurfaceStore {
               width !== entry.lastConfiguredWidth ||
               height !== entry.lastConfiguredHeight;
             if (cs !== entry.lastCodecString || dimsChanged) {
+              if (dimsChanged) this.discardPresenter(surfaceId);
               entry.lastCodecString = cs;
               entry.lastDescription = description;
               entry.lastConfiguredWidth = width;
@@ -1680,12 +1710,15 @@ export class SurfaceStore {
       if (codecString.startsWith("av01")) {
         this.av1CodecStrings.set(surfaceId, codecString);
       }
-      // A rebuilt session can change the stream's level mid-subscription —
+      // A rebuilt session can change the stream's profile or level
+      // mid-subscription —
       // resizing a pane across an AV1 level boundary (~2254px wide at
       // 2094 tall flips av01.0.09M ↔ av01.0.13M) re-announces the codec
-      // string, and a live decoder configured for the lower level rejects
-      // the higher-level stream that follows.  H.264 re-derives its config
-      // from in-band SPS; AV1 has no in-band trigger, so reconfigure here.
+      // string, while switching between compositor 4:4:4 and a thumbnail
+      // encoder changes profile 1 ↔ 0 at the same dimensions.  A live
+      // decoder configured for the old string rejects the stream that
+      // follows.  H.264 re-derives its config from in-band SPS; AV1 has no
+      // separate description, so replace its decoder here.
       // The announcement always precedes the new session's opening
       // keyframe, and pendingKeyframe drops any stale deltas in between.
       const entry = this.decoders.get(surfaceId);
@@ -1704,34 +1737,17 @@ export class SurfaceStore {
         entry &&
         entry.codec === "av1" &&
         entry.lastCodecString !== codecString &&
-        (entry.decoder.state === "unconfigured" ||
-          entry.decoder.state === "configured")
+        entry.lastConfiguredWidth > 0 &&
+        entry.lastConfiguredHeight > 0
       ) {
-        // Flush first so in-flight frames drain through the output
-        // callback before the reset (same reasoning as the H.264
-        // reconfigure path).  An unconfigured decoder has nothing queued
-        // and flush() on it would reject with InvalidStateError.
-        if (entry.decoder.state === "configured") {
-          entry.decoder.flush().catch(() => {
-            /* flush rejected — decoder likely closed */
-          });
-        }
-        try {
-          entry.decoder.configure({
-            codec: codecString,
-            optimizeForLatency: true,
-            colorSpace: FULL_RANGE_BT601,
-          });
-          entry.lastCodecString = codecString;
-          entry.pendingKeyframe = true;
-          this._unconfiguredRetry.delete(surfaceId);
-        } catch (e) {
-          console.warn(
-            "[blit] surface decoder reconfigure failed:",
-            surfaceId,
-            codecString,
-            e,
-          );
+        const replacement = this.replaceDecoder(
+          surfaceId,
+          "av1",
+          entry.lastConfiguredWidth,
+          entry.lastConfiguredHeight,
+        );
+        if (!replacement) {
+          this.retryUnconfigured(surfaceId);
         }
       }
     }
@@ -2420,6 +2436,28 @@ export class SurfaceStore {
 
   private webCodecsUnavailableWarned = false;
 
+  /** Replace a decoder at a stream boundary.
+   *
+   * Chromium can accept an AV1 configure() that changes resolution,
+   * profile, or level and then stop producing output.  A new instance is
+   * the reliable boundary.  The old instance drains asynchronously, and
+   * its output callback drops every frame once the map points elsewhere. */
+  private replaceDecoder(
+    surfaceId: number,
+    codec: SurfaceCodec,
+    width: number,
+    height: number,
+  ): DecoderEntry | undefined {
+    const previous = this.decoders.get(surfaceId);
+    if (previous) safeClose(previous.decoder);
+    this.decoders.delete(surfaceId);
+    this._pendingFrameSamples.delete(surfaceId);
+    this._pendingFrameReceiveTimes.delete(surfaceId);
+    this.discardPresenter(surfaceId);
+    this.initDecoder(surfaceId, codec, width, height);
+    return this.decoders.get(surfaceId);
+  }
+
   private initDecoder(
     surfaceId: number,
     codec: SurfaceCodec,
@@ -2441,17 +2479,44 @@ export class SurfaceStore {
     }
     const decoder = new VideoDecoder({
       output: (frame) => {
+        const active = this.decoders.get(surfaceId);
+        // safeClose() flushes before closing so Chromium releases every
+        // VideoFrame cleanly.  Those outputs can arrive after a replacement
+        // decoder is installed, and do not belong in the current presenter.
+        // Decoder identity is the stream boundary.  Do not compare the
+        // output dimensions with the configure() hint: WebCodecs is allowed
+        // to derive display dimensions from the AV1 sequence header, and
+        // rejecting that active decoder's output leaves the last thumbnail
+        // painted forever even while native-size frames keep arriving.
+        if (active?.decoder !== decoder) {
+          this._diag.dropped++;
+          this._pendingFrameReceiveTimes
+            .get(surfaceId)
+            ?.takeByPts(frame.timestamp);
+          const staleSample = this._pendingFrameSamples
+            .get(surfaceId)
+            ?.takeByPts(frame.timestamp);
+          if (staleSample !== undefined && staleSample >= 0) {
+            this._surfaceDrops.set(
+              surfaceId,
+              (this._surfaceDrops.get(surfaceId) ?? 0) + 1,
+            );
+          }
+          try {
+            frame.close();
+          } catch {
+            /* already closed */
+          }
+          return;
+        }
         this._diag.output++;
         // A decoded frame ends any failure streak — demotion is for
         // streams this platform cannot decode at all — and proves the
         // decoder is configured, so the retry budget starts fresh.
         this._decodeFailStreak.delete(surfaceId);
         this._unconfiguredRetry.delete(surfaceId);
-        const active = this.decoders.get(surfaceId);
-        if (active?.decoder === decoder) {
-          active.pendingKeyframe = false;
-          active.keyframeRequested = false;
-        }
+        active.pendingKeyframe = false;
+        active.keyframeRequested = false;
 
         const outputT = performance.now();
         const receiveT =

@@ -5529,35 +5529,74 @@ impl VulkanRenderer {
             return false;
         };
         for rect in damage {
-            if rect.x.saturating_add(rect.width) > state.key.width
-                || rect.y.saturating_add(rect.height) > state.key.height
-            {
+            let Some(end_x) = rect.x.checked_add(rect.width) else {
+                return false;
+            };
+            let Some(end_y) = rect.y.checked_add(rect.height) else {
+                return false;
+            };
+            if end_x > state.key.width || end_y > state.key.height {
                 return false;
             }
-            let row_bytes = rect.width as usize * 4;
-            for row in rect.y as usize..rect.y.saturating_add(rect.height) as usize {
-                let Some(src_offset) = row
-                    .checked_mul(stride)
-                    .and_then(|n| n.checked_add(offset))
-                    .and_then(|n| n.checked_add(rect.x as usize * 4))
-                else {
-                    return false;
-                };
-                if src_offset.saturating_add(row_bytes) > mmap.len() {
-                    return false;
-                }
-                let Some(dst_offset) = row
-                    .checked_mul(state.row_pitch)
-                    .and_then(|n| n.checked_add(rect.x as usize * 4))
-                else {
+            let Some(x_bytes) = (rect.x as usize).checked_mul(4) else {
+                return false;
+            };
+            let Some(row_bytes) = (rect.width as usize).checked_mul(4) else {
+                return false;
+            };
+            let rows = rect.height as usize;
+            if rows == 0 || row_bytes == 0 {
+                continue;
+            }
+            let Some(src_start) = (rect.y as usize)
+                .checked_mul(stride)
+                .and_then(|n| n.checked_add(offset))
+                .and_then(|n| n.checked_add(x_bytes))
+            else {
+                return false;
+            };
+            let Some(dst_start) = (rect.y as usize)
+                .checked_mul(state.row_pitch)
+                .and_then(|n| n.checked_add(x_bytes))
+            else {
+                return false;
+            };
+            let Some(src_end) = (rows - 1)
+                .checked_mul(stride)
+                .and_then(|n| n.checked_add(src_start))
+                .and_then(|n| n.checked_add(row_bytes))
+            else {
+                return false;
+            };
+            if src_end > mmap.len() {
+                return false;
+            }
+
+            // The common full-width case is one contiguous copy.  For
+            // partial damage, validate once above and keep the hot row loop
+            // to pointer bumps plus memcpy — no checked arithmetic or bounds
+            // branch for every scanline.
+            if x_bytes == 0 && row_bytes == stride && row_bytes == state.row_pitch {
+                let Some(len) = row_bytes.checked_mul(rows) else {
                     return false;
                 };
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        mmap.as_ptr().add(src_offset),
-                        (state.mapped_ptr as *mut u8).add(dst_offset),
-                        row_bytes,
+                        mmap.as_ptr().add(src_start),
+                        (state.mapped_ptr as *mut u8).add(dst_start),
+                        len,
                     );
+                }
+                continue;
+            }
+
+            let mut src = unsafe { mmap.as_ptr().add(src_start) };
+            let mut dst = unsafe { (state.mapped_ptr as *mut u8).add(dst_start) };
+            for row in 0..rows {
+                unsafe { std::ptr::copy_nonoverlapping(src, dst, row_bytes) };
+                if row + 1 < rows {
+                    src = unsafe { src.add(stride) };
+                    dst = unsafe { dst.add(state.row_pitch) };
                 }
             }
         }
