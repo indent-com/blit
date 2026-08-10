@@ -1758,6 +1758,15 @@ impl SurfaceEncoder {
 
     /// Encode from BGRA pixels — converts directly to YUV, skipping RGBA.
     fn encode_bgra(&mut self, bgra: &[u8]) -> Option<(Vec<u8>, bool)> {
+        // This is an invariant, not a best-effort preference. The
+        // compositor's Vulkan compute pass is the only BGRA -> YUV path for
+        // NVENC. Falling back here silently turns a missing shared target
+        // into a permanent full-frame CPU conversion loop.
+        if let SurfaceEncoderKind::NvencH264(_) | SurfaceEncoderKind::NvencAV1(_) = &self.kind {
+            nvenc_refuse_cpu_pixels();
+            return None;
+        }
+
         let enc_w = self.width as usize;
         let enc_h = self.height as usize;
         let src_w = self.source_width as usize;
@@ -1772,22 +1781,8 @@ impl SurfaceEncoder {
                 };
                 encoder.encode_yuv(yuv, self.width, self.height)
             }
-            SurfaceEncoderKind::NvencH264(enc) | SurfaceEncoderKind::NvencAV1(enc) => {
-                // The zero-copy path is the only one worth having, but it is
-                // not always available: a co-subscriber that needs CPU pixels,
-                // or a 4:2:0/4:4:4 split at the same target, makes the
-                // compositor publish BGRA instead.  Refusing outright there
-                // left the stream with no frames at all and no way back — a
-                // permanently black pane.  Convert host-side and keep going;
-                // it costs CPU, on a path that only runs while zero-copy is
-                // unavailable.  The matrix is the same full-range BT.601 the
-                // GPU shader uses, so the picture does not shift range when
-                // the pipeline falls back.
-                nvenc_cpu_pixel_fallback();
-                let i420 = bgra_to_yuv420_padded(bgra, src_w, src_h, enc_w, enc_h);
-                let nv12 = i420_to_nv12(&i420, enc_w, enc_h);
-                enc.encode_nv12(&nv12, enc_w, enc_w, enc_h)
-            }
+            // NVENC early-returned above.
+            SurfaceEncoderKind::NvencH264(_) | SurfaceEncoderKind::NvencAV1(_) => unreachable!(),
             #[cfg(target_os = "linux")]
             SurfaceEncoderKind::H264Vaapi(enc) => enc.encode_bgra_padded(bgra, src_w, src_h),
             #[cfg(target_os = "linux")]
@@ -2198,41 +2193,6 @@ fn rgba_to_yuv444(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     yuv
 }
 
-/// BGRA -> I420 with edge-pixel padding to encoder dimensions.
-/// `src_w × src_h` is the actual pixel count in `bgra`.
-/// `enc_w × enc_h` is the encoder output dimensions (>= src).
-/// Interleave I420's separate U and V planes into NV12's single UV plane.
-/// `enc_w`/`enc_h` are the encoder's (padded) dimensions, so the result is
-/// tightly packed at pitch `enc_w` for both planes — what `encode_nv12`
-/// expects when the source has no extra stride.
-fn i420_to_nv12(i420: &[u8], enc_w: usize, enc_h: usize) -> Vec<u8> {
-    let y_size = enc_w * enc_h;
-    let uv_w = enc_w.div_ceil(2);
-    let uv_h = enc_h.div_ceil(2);
-    let uv_size = uv_w * uv_h;
-    let mut out = vec![0u8; y_size + uv_size * 2];
-    let take = y_size.min(i420.len());
-    out[..take].copy_from_slice(&i420[..take]);
-    let u = &i420[y_size.min(i420.len())..(y_size + uv_size).min(i420.len())];
-    let v = &i420[(y_size + uv_size).min(i420.len())..(y_size + uv_size * 2).min(i420.len())];
-    for i in 0..uv_size {
-        out[y_size + i * 2] = u.get(i).copied().unwrap_or(128);
-        out[y_size + i * 2 + 1] = v.get(i).copied().unwrap_or(128);
-    }
-    out
-}
-
-/// Rate-limit stamp for the NVENC CPU-pixel fallback below.
-fn nvenc_cpu_pixel_fallback() {
-    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        eprintln!(
-            "[surface-encoder] NVENC given CPU pixels (zero-copy unavailable at this target); \
-             converting host-side",
-        );
-    }
-}
-
 /// Rate-limit stamp for the NVENC CPU-pixel refusal below.
 fn nvenc_refuse_cpu_pixels() {
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2244,6 +2204,9 @@ fn nvenc_refuse_cpu_pixels() {
     }
 }
 
+/// BGRA -> I420 with edge-pixel padding to encoder dimensions.
+/// `src_w × src_h` is the actual pixel count in `bgra`.
+/// `enc_w × enc_h` is the encoder output dimensions (>= src).
 fn bgra_to_yuv420_padded(
     bgra: &[u8],
     src_w: usize,

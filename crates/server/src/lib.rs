@@ -854,22 +854,15 @@ struct SharedCompositor {
 const SURFACE_RESIZE_SETTLE: Duration = Duration::from_millis(100);
 
 /// How long a subscriber holds out for the `OPAQUE_FD` publish it asked for
-/// before encoding the BGRA the compositor actually published.
+/// before re-registering the shared target.
 ///
 /// `RegisterDownscaleTarget { want_nv12_opaque, .. }` is a request, not a
 /// commitment: the renderer falls back to BGRA on its own when the fd export
-/// fails, and it does not report that it did.  Declining BGRA on the strength
-/// of the request alone is therefore a wait with no end — no encode, no
-/// bitstream, no error, just a surface that never paints.  Bounding it costs
-/// at most this much delay on the first frame of a target that really is
-/// about to go zero-copy (a frame or two at any refresh rate), and turns the
-/// black surface into a stream.
+/// fails, and a later subscriber lifecycle transition can invalidate the
+/// allocation. NVENC never consumes that BGRA on the CPU; after this grace
+/// the server repairs the registration and asks the compositor to render the
+/// GPU representation again.
 const OPAQUE_PUBLISH_GRACE: Duration = Duration::from_millis(250);
-/// A missing compositor NV12 target must not turn NVENC's emergency CPU
-/// conversion into a full-refresh-rate permanent mode.  Thirty fps keeps the
-/// fallback usable while bounding a 4K conversion that can otherwise pin a
-/// core until the target is re-registered.
-const NVENC_CPU_FALLBACK_MAX_FPS: f32 = 30.0;
 
 /// How long a dispatched configure may hold off building an encoder for the
 /// size the surface is leaving.
@@ -1216,77 +1209,6 @@ fn downscale_target_mode(
     }
 }
 
-/// Whether an `OPAQUE_FD` frame is still coming for `(sid, target)`, i.e.
-/// BGRA sitting in the pixel cache is a transient this subscriber's stream
-/// supersedes rather than the shape the target has settled on.
-///
-/// A subscriber's own `wants_nv12_opaque` cannot answer this: it records the
-/// encoder's capability, while the compositor publishes the *negotiated*
-/// representations. A CPU co-subscriber no longer prevents opaque output,
-/// but an incompatible opaque chroma layout still does. Declining BGRA when
-/// no opaque representation is coming would leave the stream with no encode,
-/// bitstream, or failure to recover from.
-fn opaque_publish_pending(
-    clients: &HashMap<u64, ClientState>,
-    cid: u64,
-    sid: u16,
-    target: (u32, u32),
-) -> bool {
-    let Some(s) = clients.get(&cid).and_then(|c| c.surface_subs.get(&sid)) else {
-        return false;
-    };
-    if !s
-        .encoder
-        .as_ref()
-        .is_some_and(|e| e.source_dimensions() == target)
-    {
-        return false;
-    }
-    downscale_target_mode(
-        s.wants_nv12_opaque,
-        s.wants_opaque_444,
-        target,
-        clients
-            .iter()
-            .filter(|(other, _)| **other != cid)
-            .map(|(_, c)| {
-                c.surface_subs
-                    .get(&sid)
-                    .map(|o| {
-                        (
-                            o.last_registered_target,
-                            o.wants_nv12_opaque,
-                            o.wants_opaque_444,
-                        )
-                    })
-                    .unwrap_or((None, true, s.wants_opaque_444))
-            }),
-    )
-    .want_nv12_opaque
-}
-
-/// Return the future deadline when an emergency NVENC CPU conversion should
-/// be skipped, or `None` when this frame may proceed.  GPU-origin pixels clear
-/// the limiter immediately, restoring the normal display-rate path.
-fn nvenc_cpu_fallback_deadline(
-    sub: &mut SurfaceSubState,
-    cpu_origin: bool,
-    now: Instant,
-) -> Option<Instant> {
-    if !cpu_origin || !sub.wants_nv12_opaque {
-        sub.cpu_fallback_next_at = None;
-        return None;
-    }
-    let interval = Duration::from_secs_f64(1.0 / NVENC_CPU_FALLBACK_MAX_FPS as f64);
-    let deadline = sub.cpu_fallback_next_at.unwrap_or(now);
-    if deadline > now {
-        return Some(deadline);
-    }
-    let deadline = sub.cpu_fallback_next_at.get_or_insert(now);
-    advance_deadline(deadline, now, interval);
-    None
-}
-
 /// Numeric H.264 `level_idc` for a coded picture, by the Annex A MaxFS
 /// limits.
 ///
@@ -1517,17 +1439,11 @@ struct SurfaceSubState {
     /// bandwidth / speed change (resubscribe) while encoding — the completion
     /// handler must drop the stale encoder instead of reinserting it.
     encoder_invalidated: bool,
-    /// When this subscriber first declined a BGRA frame because it was
-    /// holding out for the `OPAQUE_FD` publish it asked for.  The request
-    /// is not a commitment — the renderer falls back to BGRA on its own
-    /// when the export fails — so the wait has to be bounded or the
-    /// subscriber waits for a frame nobody will ever publish.  Cleared
-    /// whenever there is nothing to hold out for; see
-    /// `OPAQUE_PUBLISH_GRACE`.
+    /// When this subscriber first declined BGRA while waiting for its
+    /// `OPAQUE_FD` publish. After `OPAQUE_PUBLISH_GRACE` this becomes the
+    /// rate limit for re-registering and recompositing a missing target.
+    /// Cleared when the GPU representation arrives.
     opaque_wait_since: Option<Instant>,
-    /// Pacing deadline used only while an NVENC subscription is consuming
-    /// emergency CPU-origin pixels.  Cleared as soon as its GPU frame lands.
-    cpu_fallback_next_at: Option<Instant>,
     /// This client holds a decodable keyframe for this surface, so a delta
     /// frame is safe to send.  Cleared whenever the reference chain breaks
     /// or becomes unknown: encoder rebuilt or lost, surface resized,
@@ -7119,37 +7035,27 @@ async fn tick(state: &AppState) -> TickOutcome {
                     Some((_, true)) => None,
                     other => other.map(|(p, _)| p),
                 };
-                // CPU-origin pixels for a zero-copy session: the encoder
-                // would refuse them anyway — NVENC encodes GPU-converted
-                // frames or nothing — so don't burn an encode job.  The
-                // stream waits for the zero-copy frame the target
-                // registration's recomposite delivers.
-                //
-                // Only while that frame is actually coming.  An encoder
-                // sized for the current target is one half of that: after a
-                // resize the old NV12 target is stamped for a native that no
-                // longer exists and the compositor skips filling it, so BGRA
-                // is the only pixel source left — refusing it here, above the
-                // rebuild below, starved the very selection that would
-                // register a fresh target.  The target's negotiated shape is
-                // the other half, and `opaque_publish_pending` answers both.
+                // CPU-origin pixels for a registered NVENC target are never
+                // an encode input. They mean its independent OPAQUE_FD
+                // representation has not arrived. Give an in-flight
+                // registration one short grace period, then re-register the
+                // shared target and let that command's recomposite refill it.
                 let cached_is_cpu_pixels = cached.as_ref().is_some_and(|p| {
                     matches!(
                         p,
                         blit_compositor::PixelData::Bgra(_) | blit_compositor::PixelData::Rgba(_)
                     )
                 });
-                let holding_out_for_opaque = cached_is_cpu_pixels
-                    && opaque_publish_pending(&sess.clients, work.cid, sid, (enc_w, enc_h));
+                let registered_nvenc_target = cached_is_cpu_pixels
+                    && sess
+                        .clients
+                        .get(&work.cid)
+                        .and_then(|c| c.surface_subs.get(&sid))
+                        .is_some_and(|s| {
+                            s.wants_nv12_opaque && s.last_registered_target == Some((enc_w, enc_h))
+                        });
+                let mut repair_opaque_target = false;
                 {
-                    // Bounded, because the OPAQUE_FD publish being waited on
-                    // was only ever requested.  When the renderer answered
-                    // the request with BGRA — it falls back silently, and a
-                    // co-subscriber holding a compositor-resident Vulkan
-                    // session is one way to get there — the frame this waits
-                    // for does not exist, and waiting for it unbounded is a
-                    // surface that never paints.  Take the BGRA once the
-                    // grace is up: a stream one frame late beats no stream.
                     let now_inst = Instant::now();
                     let sub = sess
                         .clients
@@ -7157,46 +7063,30 @@ async fn tick(state: &AppState) -> TickOutcome {
                         .and_then(|c| c.surface_subs.get_mut(&sid));
                     if let Some(sub) = sub {
                         if !cached_is_cpu_pixels {
-                            // An OPAQUE_FD frame did arrive: there is
-                            // nothing to hold out for, and a later transient
-                            // gets a fresh grace of its own.
+                            // The GPU representation arrived. A later loss
+                            // gets a fresh grace period and repair attempt.
                             sub.opaque_wait_since = None;
-                        } else if holding_out_for_opaque {
+                        } else if registered_nvenc_target {
                             let since = *sub.opaque_wait_since.get_or_insert(now_inst);
                             if now_inst.duration_since(since) < OPAQUE_PUBLISH_GRACE {
                                 continue;
                             }
-                            // Grace spent: fall through and encode the BGRA.
-                            // `opaque_wait_since` deliberately stays set —
-                            // clearing it here would re-arm the grace on the
-                            // next frame and pace the surface at 1/grace.
+                            // Rate-limit repairs to the same interval. A
+                            // successful registration publishes OPAQUE_FD
+                            // and clears this above; a failed export never
+                            // falls through to host conversion.
+                            sub.opaque_wait_since = Some(now_inst);
+                            repair_opaque_target = true;
                         }
-                        // Still CPU pixels but not holding out — most often
-                        // because this subscriber's encoder is off in an
-                        // encode task, which empties the slot
-                        // `opaque_publish_pending` reads.  That is not
-                        // evidence the wait is over, so the clock keeps
-                        // running rather than restarting every other frame.
-                    } else if holding_out_for_opaque {
+                    } else if registered_nvenc_target {
                         continue;
                     }
                 }
-                let client = sess.clients.get_mut(&work.cid).unwrap();
-
-                // NVENC normally consumes the compositor's GPU-converted
-                // OPAQUE_FD frame.  During target rebuilds it can briefly be
-                // handed native BGRA instead; its compatibility path converts
-                // that whole frame on the CPU.  Bound the emergency path so
-                // a missing/stale target cannot pin a core at 120+ Hz.
-                if let Some(deadline) = nvenc_cpu_fallback_deadline(
-                    client.surface_subs.entry(sid).or_default(),
-                    cached_is_cpu_pixels,
-                    now,
-                ) {
-                    next_deadline = Some(next_deadline.map_or(deadline, |d| d.min(deadline)));
-                    client.skip_pacing_count = client.skip_pacing_count.saturating_add(1);
+                if repair_opaque_target {
+                    sess.resettle_downscale_target(sid, enc_w, enc_h);
                     continue;
                 }
+                let client = sess.clients.get_mut(&work.cid).unwrap();
 
                 // Skip if an encode or creation job is already in
                 // flight for this surface.  Creations also block encode
@@ -8425,21 +8315,22 @@ async fn tick(state: &AppState) -> TickOutcome {
                         .and_then(|s| s.last_registered_target);
                     if let Some((pw, ph)) = prev_target
                         && (pw, ph) != (tw, th)
-                        && let Some(cs) = sess.compositor.as_mut()
                     {
-                        let _ = cs.handle.command_tx.send(
-                            blit_compositor::CompositorCommand::ClearDownscaleTarget {
-                                surface_id: result.sid as u32,
-                                target_w: pw,
-                                target_h: ph,
-                            },
-                        );
-                        // Drop any cached snapshot at the old size so
-                        // the encode loop can't pick it up after we've
-                        // moved on.
-                        cs.last_pixels.remove(&(result.sid, pw, ph));
-                        cs.last_opaque_pixels.remove(&(result.sid, pw, ph));
-                        cs.mark_pixel_snapshot_dirty();
+                        // Ownership is shared by target key, not by client.
+                        // Remove this subscriber from the old key first, then
+                        // let the surviving subscribers decide whether it is
+                        // re-registered or actually cleared. Clearing it
+                        // directly strands every survivor on BGRA while
+                        // their state still says the opaque target exists.
+                        if let Some(s) = sess
+                            .clients
+                            .get_mut(&result.cid)
+                            .and_then(|c| c.surface_subs.get_mut(&result.sid))
+                        {
+                            s.last_registered_target = None;
+                            s.last_registered_native = None;
+                        }
+                        sess.resettle_downscale_target(result.sid, pw, ph);
                     }
                     // Resolve both representations for this target. Mixed
                     // CPU/NVENC subscribers get BGRA and opaque NV12/NV24;
@@ -14936,11 +14827,7 @@ mod tests {
     /// CPU/NVENC readers receive both BGRA and opaque NV12; NVENC readers
     /// must still agree on the opaque chroma layout.
     mod nv12_opaque_target {
-        use super::super::{
-            DownscaleTargetMode, NVENC_CPU_FALLBACK_MAX_FPS, SurfaceSubState,
-            downscale_target_mode, nvenc_cpu_fallback_deadline,
-        };
-        use std::time::{Duration, Instant};
+        use super::super::{DownscaleTargetMode, downscale_target_mode};
 
         const T: (u32, u32) = (1280, 720);
         const OPAQUE_420: DownscaleTargetMode = DownscaleTargetMode {
@@ -15057,39 +14944,6 @@ mod tests {
                 downscale_target_mode(true, true, T, [(Some(T), true, true)].into_iter()),
                 OPAQUE_444
             );
-        }
-
-        #[test]
-        fn nvenc_cpu_fallback_is_rate_limited() {
-            let now = Instant::now();
-            let interval = Duration::from_secs_f64(1.0 / NVENC_CPU_FALLBACK_MAX_FPS as f64);
-            let mut sub = SurfaceSubState {
-                wants_nv12_opaque: true,
-                ..Default::default()
-            };
-
-            assert_eq!(nvenc_cpu_fallback_deadline(&mut sub, true, now), None);
-            let deadline = sub.cpu_fallback_next_at.expect("deadline installed");
-            assert_eq!(deadline, now + interval);
-            assert_eq!(
-                nvenc_cpu_fallback_deadline(&mut sub, true, now + interval / 2),
-                Some(deadline)
-            );
-            assert_eq!(nvenc_cpu_fallback_deadline(&mut sub, true, deadline), None);
-        }
-
-        #[test]
-        fn gpu_frame_clears_nvenc_cpu_fallback_limit() {
-            let now = Instant::now();
-            let mut sub = SurfaceSubState {
-                wants_nv12_opaque: true,
-                ..Default::default()
-            };
-            assert_eq!(nvenc_cpu_fallback_deadline(&mut sub, true, now), None);
-            assert!(sub.cpu_fallback_next_at.is_some());
-
-            assert_eq!(nvenc_cpu_fallback_deadline(&mut sub, false, now), None);
-            assert_eq!(sub.cpu_fallback_next_at, None);
         }
     }
     use super::*;

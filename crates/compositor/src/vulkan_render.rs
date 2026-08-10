@@ -2442,7 +2442,11 @@ impl VulkanRenderer {
         {
             self.defer_or_destroy_external_outputs(exts);
         }
-        self.destroy_nv12_outputs_for_target(surface_id, target_w, target_h);
+        // External/VA-API outputs share `nv12_outputs`; an NVENC subscriber
+        // at the same target owns an independent OPAQUE_FD allocation. A
+        // VA-API pool refresh must not pull that allocation out from under
+        // the NVENC session.
+        self.destroy_nv12_outputs_in(Nv12Export::DmaBuf, surface_id, target_w, target_h);
     }
 
     /// Destroy every external + NV12 buffer pool belonging to a surface,
@@ -3266,23 +3270,6 @@ impl VulkanRenderer {
         }
     }
 
-    fn destroy_nv12_outputs_for_target(&mut self, surface_id: u32, target_w: u32, target_h: u32) {
-        if let Some((nv12s, _)) = self
-            .nv12_opaque_outputs
-            .remove(&(surface_id, target_w, target_h))
-        {
-            self.destroy_nv12_vec(nv12s);
-        }
-        if let Some((nv12s, _)) = self.nv12_outputs.remove(&(surface_id, target_w, target_h)) {
-            self.destroy_nv12_vec(nv12s);
-        }
-        // Every removal funnels through here, so clearing ownership here
-        // keeps the set from outliving the images it names — a stale key
-        // would make `create_vulkan_encoder` skip allocating a replacement.
-        self.owned_encode_nv12
-            .remove(&(surface_id, target_w, target_h));
-    }
-
     fn destroy_nv12_outputs_for_surface(&mut self, surface_id: u32) {
         let keys: Vec<(u32, u32, u32)> = self
             .nv12_outputs
@@ -3597,7 +3584,10 @@ impl VulkanRenderer {
         if !self.has_dmabuf {
             return;
         }
-        self.destroy_nv12_outputs_for_target(surface_id, target_w, target_h);
+        // These fds replace only the VA-API/DMA-BUF representation. NVENC
+        // may simultaneously consume the OPAQUE_FD representation at the
+        // same target.
+        self.destroy_nv12_outputs_in(Nv12Export::DmaBuf, surface_id, target_w, target_h);
 
         for (fd, stride, uv_offset, w, h, modifier) in fds {
             let (fd, stride, uv_offset, w, h, modifier) =
