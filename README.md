@@ -187,8 +187,8 @@ BLIT_SURFACE_ENCODERS=av1-nvenc,h264-nvenc,h264-software
 | `h264-nvenc`    | H.264 | NVIDIA NVENC     | 3840×2160      | Requires proprietary NVIDIA driver                                                                   |
 | `av1-vaapi`     | AV1   | VA-API           | 8192×4352      | Intel/AMD GPU                                                                                        |
 | `h264-vaapi`    | H.264 | VA-API           | 3840×2160      | Intel/AMD GPU                                                                                        |
-| `av1-vulkan`    | AV1   | Vulkan Video     | 8192×4352      | On the compositor's GPU, no server-side encode. Native size only; 4:4:4 where the driver supports it |
-| `h264-vulkan`   | H.264 | Vulkan Video     | 3840×2160      | On the compositor's GPU, no server-side encode. Native size only; 4:4:4 where the driver supports it |
+| `av1-vulkan`    | AV1   | Vulkan Video     | 8192×4352      | On the compositor's GPU; per-client scaling and pacing; 4:4:4 where the driver supports it           |
+| `h264-vulkan`   | H.264 | Vulkan Video     | 3840×2160      | On the compositor's GPU; per-client scaling and pacing; 4:4:4 where the driver supports it           |
 | `h264-software` | H.264 | openh264 or x264 | 3840×2160      | Build-time choice (x264 = GPL opt-in)                                                                |
 | `av1-software`  | AV1   | rav1e (software) | 3840×2160      | CPU-bound; capped to stay interactive                                                                |
 

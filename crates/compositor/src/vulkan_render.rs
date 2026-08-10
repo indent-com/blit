@@ -240,12 +240,11 @@ pub(crate) struct VulkanRenderer {
     /// subscriber owns its own session so its GOP, keyframe cadence and
     /// quantizer are independent of every other viewer's.
     vulkan_encoders: HashMap<(u32, u64), crate::vulkan_encode::VulkanVideoEncoder>,
-    /// Per-session encode pacing: (minimum interval, last encode time).
-    /// The compositor composites at commit rate; a session encoding faster
-    /// than its subscriber consumes produces frames the server overwrites
-    /// undelivered, and every one of those breaks the delta chain.  Frames
-    /// skipped here — before encoding — cost nothing.
-    vulkan_encoder_pacing: HashMap<(u32, u64), (std::time::Duration, Option<std::time::Instant>)>,
+    /// Sessions allowed to produce one frame. The server rearms a session
+    /// only after consuming its previous bitstream, putting Vulkan Video
+    /// behind the same client/outbox gate as the server-side encoders instead
+    /// of letting it encode and overwrite frames while that client is blocked.
+    vulkan_encoder_armed: HashSet<(u32, u64)>,
     /// Bitstreams produced by `vulkan_encoders` during the last render,
     /// awaiting collection by the compositor.  Kept out of the render
     /// return value because that function has a dozen early exits.
@@ -1656,7 +1655,7 @@ impl VulkanRenderer {
             video_encode_command_pool,
             video_fns,
             vulkan_encoders: HashMap::new(),
-            vulkan_encoder_pacing: HashMap::new(),
+            vulkan_encoder_armed: HashSet::new(),
             pending_encoded_frames: Vec::new(),
             has_video_encode,
             has_video_encode_av1,
@@ -2067,11 +2066,11 @@ impl VulkanRenderer {
         qp: u8,
         w: u32,
         h: u32,
+        native_w: u32,
+        native_h: u32,
         // 4:4:4 rather than 4:2:0.  Device-dependent — the caps query
         // refuses it on hardware that cannot, and the caller falls back.
         is_444: bool,
-        // Minimum microseconds between encodes; 0 = every composite.
-        min_interval_us: u32,
     ) -> bool {
         if !self.has_video_encode {
             eprintln!("[vulkan-render] cannot create vulkan encoder: video encode not available");
@@ -2082,7 +2081,10 @@ impl VulkanRenderer {
             None => return false,
         };
 
-        // Remove existing encoder if any.
+        // Remove existing encoder if any. Its one-shot permission must not
+        // survive a replacement that may fail to build: an armed key without
+        // an encoder would make the render loop look up a nonexistent session.
+        self.vulkan_encoder_armed.remove(&(surface_id, client_id));
         if let Some(mut old) = self.vulkan_encoders.remove(&(surface_id, client_id))
             && let Some(ref vfns) = self.video_fns
         {
@@ -2132,6 +2134,18 @@ impl VulkanRenderer {
             },
         };
 
+        if encoder.is_some()
+            && (w, h) != (native_w, native_h)
+            && !self.ensure_vulkan_downscale_target(surface_id, w, h, (native_w, native_h))
+        {
+            if let Some(mut enc) = encoder
+                && let Some(ref vfns) = self.video_fns
+            {
+                unsafe { enc.destroy(&self.device, vfns) };
+            }
+            return false;
+        }
+
         // The encoder reads its source from an image, and until now the only
         // source of one was a VA-API-exported DMA-BUF.  Give this surface an
         // image of our own if nothing has already registered one at this
@@ -2159,10 +2173,9 @@ impl VulkanRenderer {
                 // A surface with two subscribers on different codecs keeps the
                 // first on Vulkan and lets the second fall back, rather than
                 // pulling the image out from under a live encoder.
-                let in_use_by_others = self
-                    .vulkan_encoders
-                    .keys()
-                    .any(|&(sid, cid)| sid == surface_id && cid != client_id);
+                let in_use_by_others = self.vulkan_encoders.iter().any(|(&(sid, cid), enc)| {
+                    sid == surface_id && cid != client_id && enc.source_dimensions() == (w, h)
+                });
                 if owned.is_some() && in_use_by_others {
                     eprintln!(
                         "[vulkan-render] surface {surface_id} already encodes with a different profile; refusing this session",
@@ -2205,16 +2218,12 @@ impl VulkanRenderer {
         match encoder {
             Some(enc) => {
                 eprintln!(
-                    "[vulkan-render] created vulkan {codec_name} encoder for surface {surface_id} client {client_id} {w}x{h} qp={qp} interval={min_interval_us}us",
+                    "[vulkan-render] created vulkan {codec_name} encoder for surface {surface_id} client {client_id} {w}x{h} qp={qp}",
                 );
                 self.vulkan_encoders.insert((surface_id, client_id), enc);
-                self.vulkan_encoder_pacing.insert(
-                    (surface_id, client_id),
-                    (
-                        std::time::Duration::from_micros(min_interval_us as u64),
-                        None,
-                    ),
-                );
+                // The opening keyframe is the one exception to server-driven
+                // rearming: there is no prior frame for the server to consume.
+                self.vulkan_encoder_armed.insert((surface_id, client_id));
                 true
             }
             None => {
@@ -2223,27 +2232,6 @@ impl VulkanRenderer {
                 );
                 false
             }
-        }
-    }
-
-    /// Retarget one client's pre-encode pacing without rebuilding the
-    /// Vulkan Video session.  Reset the phase so both increases and decreases
-    /// take effect from this command rather than inheriting a deadline from
-    /// the old cadence.
-    pub(crate) fn set_vulkan_encoder_interval(
-        &mut self,
-        surface_id: u32,
-        client_id: u64,
-        min_interval_us: u32,
-    ) {
-        if self.vulkan_encoders.contains_key(&(surface_id, client_id)) {
-            self.vulkan_encoder_pacing.insert(
-                (surface_id, client_id),
-                (
-                    std::time::Duration::from_micros(min_interval_us as u64),
-                    None,
-                ),
-            );
         }
     }
 
@@ -2268,6 +2256,16 @@ impl VulkanRenderer {
     pub(crate) fn request_encoder_keyframe(&mut self, surface_id: u32, client_id: u64) {
         if let Some(enc) = self.vulkan_encoders.get_mut(&(surface_id, client_id)) {
             enc.request_idr();
+            self.vulkan_encoder_armed.insert((surface_id, client_id));
+        }
+    }
+
+    /// Allow one more frame from a compositor-resident encoder. Successful
+    /// encode consumes the token; failures retain it so a transient driver or
+    /// synchronization failure does not wedge the stream.
+    pub(crate) fn request_vulkan_frame(&mut self, surface_id: u32, client_id: u64) {
+        if self.vulkan_encoders.contains_key(&(surface_id, client_id)) {
+            self.vulkan_encoder_armed.insert((surface_id, client_id));
         }
     }
 
@@ -2281,17 +2279,30 @@ impl VulkanRenderer {
             .filter(|&&(sid, cid)| sid == surface_id && client_id.is_none_or(|c| c == cid))
             .copied()
             .collect();
+        let mut removed_targets = Vec::new();
         for key in keys {
-            if let Some(mut enc) = self.vulkan_encoders.remove(&key)
-                && let Some(ref vfns) = self.video_fns
-            {
-                unsafe { enc.destroy(&self.device, vfns) };
+            if let Some(mut enc) = self.vulkan_encoders.remove(&key) {
+                removed_targets.push(enc.source_dimensions());
+                if let Some(ref vfns) = self.video_fns {
+                    unsafe { enc.destroy(&self.device, vfns) };
+                }
             }
             // A rebuilt session starts from a clean slate; carrying the old
             // count over would retire its replacement early.
             self.vulkan_encode_failures.remove(&key);
             self.vulkan_encode_giveups.retain(|k| *k != key);
-            self.vulkan_encoder_pacing.remove(&key);
+            self.vulkan_encoder_armed.remove(&key);
+        }
+        removed_targets.sort_unstable();
+        removed_targets.dedup();
+        for (w, h) in removed_targets {
+            let still_used = self
+                .vulkan_encoders
+                .iter()
+                .any(|(&(sid, _), enc)| sid == surface_id && enc.source_dimensions() == (w, h));
+            if !still_used && self.owned_encode_nv12.contains_key(&(surface_id, w, h)) {
+                self.destroy_nv12_outputs_in(Nv12Export::None, surface_id, w, h);
+            }
         }
         // Never hand a bitstream to a client whose encoder has just gone
         // away; the server would credit it against a subscription that no
@@ -2483,6 +2494,39 @@ impl VulkanRenderer {
     // ---------------------------------------------------------------
     // Server-allocated BGRA downscale targets
     // ---------------------------------------------------------------
+
+    /// Ensure a target-sized BGRA scratch image exists for Vulkan Video.
+    ///
+    /// Unlike `register_downscale_target`, this does not change which
+    /// representations are published for server-side readers sharing the
+    /// same target. Vulkan Video consumes the scratch image entirely inside
+    /// the compositor after the BGRA→NV12/NV24 compute pass.
+    fn ensure_vulkan_downscale_target(
+        &mut self,
+        surface_id: u32,
+        target_w: u32,
+        target_h: u32,
+        native: (u32, u32),
+    ) -> bool {
+        let key = (surface_id, target_w, target_h);
+        self.target_natives.insert(key, native);
+        if self.downscale_outputs.contains_key(&key) {
+            return true;
+        }
+        let Some(out) = self.create_downscale_output(target_w, target_h) else {
+            eprintln!(
+                "[vulkan-render] failed to allocate Vulkan downscale target \
+                 {target_w}x{target_h} for sid {surface_id}",
+            );
+            return false;
+        };
+        self.downscale_outputs.insert(key, out);
+        eprintln!(
+            "[vulkan-render] registered Vulkan downscale target sid {surface_id} \
+             {target_w}x{target_h}",
+        );
+        true
+    }
 
     /// Allocate a downscale target sized at `(target_w, target_h)` for
     /// `surface_id`. Used by per-client encoders that don't import GBM
@@ -6883,6 +6927,16 @@ impl VulkanRenderer {
         // staging readback of the native frame runs only when a native CPU
         // target or an on-demand capture needs it.
         let sid = toplevel_sid as u32;
+        let armed_vulkan_targets: HashSet<(u32, u32)> = self
+            .vulkan_encoder_armed
+            .iter()
+            .filter(|&&(encoder_sid, _)| encoder_sid == sid)
+            .filter_map(|key| {
+                self.vulkan_encoders
+                    .get(key)
+                    .map(|enc| enc.source_dimensions())
+            })
+            .collect();
 
         // Forget what a target was sized against once the target itself is
         // gone.  Done here rather than in each teardown path because this is
@@ -6970,6 +7024,12 @@ impl VulkanRenderer {
         let downscale_targets: Vec<(u32, u32)> = downscale_target_keys
             .iter()
             .filter(|&&key| {
+                let has_reader = self.cpu_readback_targets.contains(&key)
+                    || self.nv12_opaque_slot(sid, key.1, key.2).is_some()
+                    || armed_vulkan_targets.contains(&(key.1, key.2));
+                if !has_reader {
+                    return false;
+                }
                 // A target at exactly the composite size would blit the
                 // native frame onto itself and stage a second,
                 // byte-identical readback.  The native staging copy
@@ -7619,53 +7679,59 @@ impl VulkanRenderer {
                 );
             }
 
-            // Transition to TRANSFER_SRC_OPTIMAL — for the buffer copy, or
-            // as the layout `dispatch_nv12_compute` expects to move to
-            // GENERAL from.
-            let to_src = vk::ImageMemoryBarrier::default()
-                .image(ds_image)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
-            unsafe {
-                self.device.cmd_pipeline_barrier(
-                    cb,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_src],
-                );
-            }
-
-            // NVENC zero-copy: convert straight into the OPAQUE_FD NV12
-            // buffer. An NVENC-only target stops here; a mixed target also
-            // fills staging below for its CPU reader.
-            if let Some((nv12_vec, nv12_idx)) = self
+            let key = (sid, tw, th);
+            let vulkan_dispatch = armed_vulkan_targets.contains(&(tw, th))
+                && self.owned_encode_nv12.contains_key(&key);
+            let opaque_dispatch = self
                 .nv12_opaque_outputs
-                .get(&(sid, tw, th))
+                .get(&key)
                 .filter(|(v, _)| !v.is_empty())
                 .map(|(v, i)| (v, *i % v.len()))
-                && nv12_vec[nv12_idx].export == Nv12Export::OpaqueFd
-            {
-                self.dispatch_nv12_compute(cb, ds_image, nv12_vec, nv12_idx, tw, th, true);
-                if !self.cpu_readback_targets.contains(&(sid, tw, th)) {
+                .filter(|(v, i)| v[*i].export == Nv12Export::OpaqueFd);
+            let wants_cpu = self.cpu_readback_targets.contains(&key);
+
+            if vulkan_dispatch || opaque_dispatch.is_some() {
+                // Both compositor-resident Vulkan Video and NVENC consume a
+                // GPU conversion of this target-sized BGRA image. Transition
+                // it once, then let each independent destination read it.
+                let to_general = vk::ImageMemoryBarrier::default()
+                    .image(ds_image)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                unsafe {
+                    self.device.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_general],
+                    );
+                }
+
+                if vulkan_dispatch {
+                    let nv12_vec = &self.nv12_outputs[&key].0;
+                    self.dispatch_nv12_compute_image(cb, ds_image, nv12_vec, 0, tw, th, false);
+                }
+                if let Some((nv12_vec, nv12_idx)) = opaque_dispatch {
+                    self.dispatch_nv12_compute(cb, ds_image, nv12_vec, nv12_idx, tw, th, false);
+                }
+
+                if !wants_cpu {
                     continue;
                 }
-                // The compute helper moved the BGRA source from
-                // TRANSFER_SRC_OPTIMAL to GENERAL. A mixed target still
-                // needs the image-to-staging copy below, so make that read
-                // legal and order it after the shader read.
-                let back_to_transfer_src = vk::ImageMemoryBarrier::default()
+
+                let to_src = vk::ImageMemoryBarrier::default()
                     .image(ds_image)
                     .old_layout(vk::ImageLayout::GENERAL)
                     .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
@@ -7686,9 +7752,36 @@ impl VulkanRenderer {
                         vk::DependencyFlags::empty(),
                         &[],
                         &[],
-                        &[back_to_transfer_src],
+                        &[to_src],
                     );
                 }
+            } else if wants_cpu {
+                let to_src = vk::ImageMemoryBarrier::default()
+                    .image(ds_image)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                unsafe {
+                    self.device.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_src],
+                    );
+                }
+            } else {
+                continue;
             }
 
             let region = vk::BufferImageCopy {
@@ -7756,7 +7849,8 @@ impl VulkanRenderer {
         // TRANSFER_SRC when that copy needs it, and restores the layout
         // afterwards so the frame ends exactly as the rest of the code
         // expects to find it.
-        let owns_encode_nv12 = self.owned_encode_nv12.contains_key(&(sid, phys_w, phys_h));
+        let owns_encode_nv12 = armed_vulkan_targets.contains(&(phys_w, phys_h))
+            && self.owned_encode_nv12.contains_key(&(sid, phys_w, phys_h));
         if owns_encode_nv12 {
             let to_general = vk::ImageMemoryBarrier::default()
                 .image(out_image)
@@ -7974,12 +8068,10 @@ impl VulkanRenderer {
         }
         let fence = tracking_fence;
 
-        // Vulkan Video encode (compositor-resident, native size only).  One
-        // encoder per subscribing client, so this runs once per client that
-        // owns a session on this surface and yields one bitstream each.  The
-        // NV12 image is only read — `encode` neither transitions nor
-        // consumes it — so every encoder shares the frame the compute pass
-        // just wrote.
+        // Vulkan Video encode. One encoder per subscribing client, each at
+        // that client's target size. Sessions with the same target/profile
+        // share the converted image; differently sized sessions read their
+        // own per-target conversion of the same native composite.
         //
         // This used to sit inside the `external_targets` loop, which meant
         // the tier billed as "no VA-API, no DMA-BUF export/import" only ran
@@ -7995,167 +8087,112 @@ impl VulkanRenderer {
         // landed — so wait for the submission first.  `encode` already
         // blocks on its own fence, so this adds no new class of stall.
         let mut encoder_cids: Vec<u64> = self
-            .vulkan_encoders
-            .keys()
+            .vulkan_encoder_armed
+            .iter()
             .filter(|&&(esid, _)| esid == sid)
             .map(|&(_, cid)| cid)
             .collect();
         if !encoder_cids.is_empty() {
             encoder_cids.sort_unstable();
-            let nv12_image_and_view =
-                self.nv12_outputs
-                    .get(&(sid, phys_w, phys_h))
-                    .and_then(|(v, idx)| {
-                        let n = v.get(idx % v.len().max(1))?;
-                        match &n.kind {
-                            Nv12OutputKind::Image {
-                                image,
-                                encode_view,
-                                encode_image,
-                                ..
-                            } => {
-                                // The session reads the encode-only image
-                                // when the storage/encode split is in
-                                // effect; imported images carry both roles.
-                                let img = encode_image.map_or(*image, |(ei, _)| ei);
-                                encode_view.map(|ev| (img, ev))
+            let waited = unsafe {
+                self.device.wait_for_fences(
+                    &[fence],
+                    true,
+                    crate::vulkan_encode::encode_fence_timeout_ns(),
+                )
+            }
+            .is_ok();
+            if !waited {
+                eprintln!(
+                    "[vulkan-render] timed out waiting for the composite before encode; skipping surface {sid} this frame",
+                );
+                encoder_cids.clear();
+            }
+            for cid in encoder_cids {
+                let (enc_w, enc_h) = self.vulkan_encoders[&(sid, cid)].source_dimensions();
+                let source_prepared = (enc_w, enc_h) == (phys_w, phys_h)
+                    || downscale_targets.contains(&(enc_w, enc_h))
+                    || external_targets
+                        .iter()
+                        .any(|&(w, h, _)| (w, h) == (enc_w, enc_h));
+                if !source_prepared {
+                    // The target was stamped against the previous native
+                    // aspect. The server will restamp or rebuild it; retain
+                    // the one-frame token so that recovery needs no rearm.
+                    continue;
+                }
+                let nv12_image_and_view =
+                    self.nv12_outputs
+                        .get(&(sid, enc_w, enc_h))
+                        .and_then(|(v, idx)| {
+                            let n = v.get(idx % v.len().max(1))?;
+                            match &n.kind {
+                                Nv12OutputKind::Image {
+                                    image,
+                                    encode_view,
+                                    encode_image,
+                                    ..
+                                } => {
+                                    let img = encode_image.map_or(*image, |(ei, _)| ei);
+                                    encode_view.map(|ev| (img, ev))
+                                }
+                                _ => None,
                             }
-                            _ => None,
-                        }
-                    });
-            if nv12_image_and_view.is_none() {
-                // Encoders exist but no encode image sits at the composite
-                // size — the surface resized under the sessions (their
-                // image is keyed at the size they were built for).  Skipped
-                // silently, this is a permanent freeze: no bitstream ever
-                // reaches the server, and no failure is counted, so the
-                // giveup path never fires either.  Count it.
-                for &cid in &encoder_cids {
+                        });
+                let Some((nv12_img, ev)) = nv12_image_and_view else {
                     let n = self.vulkan_encode_failures.entry((sid, cid)).or_insert(0);
                     *n += 1;
                     if *n == VULKAN_ENCODE_FAILURE_LIMIT {
                         eprintln!(
                             "[vulkan-render] surface {sid} client {cid}: no encode image at \
-                             {phys_w}x{phys_h}; giving up on Vulkan Video",
+                             {enc_w}x{enc_h}; giving up on Vulkan Video",
                         );
                         self.vulkan_encode_giveups.push((sid, cid));
                     }
-                }
-            }
-            if let Some((nv12_img, ev)) = nv12_image_and_view {
-                let waited = unsafe {
-                    self.device.wait_for_fences(
-                        &[fence],
-                        true,
-                        crate::vulkan_encode::encode_fence_timeout_ns(),
+                    continue;
+                };
+                let encoder = self.vulkan_encoders.get_mut(&(sid, cid)).unwrap();
+                let codec_flag = encoder.codec_flag();
+                let encoded = unsafe {
+                    encoder.encode(
+                        &self.device,
+                        self.video_fns.as_ref().unwrap(),
+                        self.video_encode_queue.unwrap(),
+                        self.video_encode_command_pool.unwrap(),
+                        nv12_img,
+                        ev,
+                        false,
                     )
-                }
-                .is_ok();
-                if !waited {
-                    eprintln!(
-                        "[vulkan-render] timed out waiting for the composite before encode; skipping surface {sid} this frame",
-                    );
-                    encoder_cids.clear();
-                }
-                for cid in encoder_cids {
-                    // Pace to the subscriber: encoding faster than it
-                    // consumes produces frames the server overwrites
-                    // undelivered, and each of those breaks the delta chain
-                    // at the decoder.  Skipping *before* the encode is free
-                    // — the next delta simply spans a longer interval.  The
-                    // 0.7 factor leaves room for commit-clock jitter so a
-                    // source at exactly the subscriber's rate is not
-                    // halved.  A pending forced keyframe bypasses the
-                    // throttle: it is answering a recovery request, and
-                    // delaying it extends the freeze it exists to end.
-                    let now = std::time::Instant::now();
-                    if let Some((interval, last)) = self.vulkan_encoder_pacing.get(&(sid, cid)) {
-                        let throttled =
-                            last.is_some_and(|l| now.duration_since(l) < interval.mul_f32(0.7));
-                        let force = self
-                            .vulkan_encoders
-                            .get(&(sid, cid))
-                            .is_some_and(|e| e.wants_idr());
-                        if throttled && !force {
-                            continue;
-                        }
+                };
+                match encoded {
+                    Some((bitstream, is_keyframe)) => {
+                        // One successful encode spends the client's token.
+                        // The server rearms only after it has accepted this
+                        // bitstream into that client's delivery path.
+                        self.vulkan_encoder_armed.remove(&(sid, cid));
+                        self.vulkan_encode_failures.remove(&(sid, cid));
+                        self.pending_encoded_frames.push(EncodedFrame {
+                            surface_id: toplevel_sid,
+                            client_id: cid,
+                            width: enc_w,
+                            height: enc_h,
+                            data: Arc::new(bitstream),
+                            is_keyframe,
+                            codec_flag,
+                        });
                     }
-                    let encoder = self.vulkan_encoders.get_mut(&(sid, cid)).unwrap();
-                    let codec_flag = encoder.codec_flag();
-                    // A session outlived the size it was built at (the
-                    // surface resized under it).  Encoding anyway would
-                    // read an image shaped differently from the coded
-                    // extent and emit a bitstream whose frames decode at
-                    // the old size while the wire header claims the new
-                    // one.  The server tears the session down on
-                    // SurfaceResized; count the skip as a failure so the
-                    // giveup path still unwedges us if that never lands.
-                    if encoder.source_dimensions() != (phys_w, phys_h) {
+                    // A silent `None` here is what made a dead session
+                    // indistinguishable from a warming-up one, so the
+                    // server waited on `vulkan_await` forever.  Count
+                    // them and let the caller give up on this encoder.
+                    None => {
                         let n = self.vulkan_encode_failures.entry((sid, cid)).or_insert(0);
                         *n += 1;
                         if *n == VULKAN_ENCODE_FAILURE_LIMIT {
                             eprintln!(
-                                "[vulkan-render] surface {sid} client {cid}: session size {}x{} \
-                                 vs composite {phys_w}x{phys_h}; giving up on Vulkan Video",
-                                encoder.source_dimensions().0,
-                                encoder.source_dimensions().1,
+                                "[vulkan-render] surface {sid} client {cid}: {n} consecutive encode failures; giving up on Vulkan Video",
                             );
                             self.vulkan_encode_giveups.push((sid, cid));
-                        }
-                        continue;
-                    }
-                    // Only now is a frame actually being spent, so only now
-                    // does the slot advance — the skips above used to
-                    // consume one, delaying the next real frame by a whole
-                    // extra interval.  Advance by whole intervals rather
-                    // than restarting the clock at the encode: restarting
-                    // lets a source that is consistently 30% early keep that
-                    // lead every frame, sustaining 1/0.7 of the subscriber's
-                    // rate, which is precisely the overproduction the
-                    // throttle exists to prevent.  Falling behind resyncs,
-                    // so an idle gap banks no credit for a catch-up burst.
-                    if let Some((interval, last)) = self.vulkan_encoder_pacing.get_mut(&(sid, cid))
-                    {
-                        let next = last.map(|l| l + *interval).filter(|n| *n > now);
-                        *last = Some(next.unwrap_or(now));
-                    }
-                    let encoded = unsafe {
-                        encoder.encode(
-                            &self.device,
-                            self.video_fns.as_ref().unwrap(),
-                            self.video_encode_queue.unwrap(),
-                            self.video_encode_command_pool.unwrap(),
-                            nv12_img,
-                            ev,
-                            false,
-                        )
-                    };
-                    match encoded {
-                        Some((bitstream, is_keyframe)) => {
-                            self.vulkan_encode_failures.remove(&(sid, cid));
-                            self.pending_encoded_frames.push(EncodedFrame {
-                                surface_id: toplevel_sid,
-                                client_id: cid,
-                                width: phys_w,
-                                height: phys_h,
-                                data: Arc::new(bitstream),
-                                is_keyframe,
-                                codec_flag,
-                            });
-                        }
-                        // A silent `None` here is what made a dead session
-                        // indistinguishable from a warming-up one, so the
-                        // server waited on `vulkan_await` forever.  Count
-                        // them and let the caller give up on this encoder.
-                        None => {
-                            let n = self.vulkan_encode_failures.entry((sid, cid)).or_insert(0);
-                            *n += 1;
-                            if *n == VULKAN_ENCODE_FAILURE_LIMIT {
-                                eprintln!(
-                                    "[vulkan-render] surface {sid} client {cid}: {n} consecutive encode failures; giving up on Vulkan Video",
-                                );
-                                self.vulkan_encode_giveups.push((sid, cid));
-                            }
                         }
                     }
                 }

@@ -599,7 +599,8 @@ pub enum CompositorEvent {
         timestamp_sub_us: u16,
     },
     /// No Vulkan Video encoder could be created for this `(surface,
-    /// client)` pair, so the server must encode for that client itself.
+    /// client)` pair. The server may retry the codec at 4:2:0 before moving
+    /// to a server-side encoder.
     VulkanEncoderUnavailable {
         surface_id: u16,
         client_id: u64,
@@ -875,27 +876,23 @@ pub enum CompositorCommand {
         qp: u8,
         width: u32,
         height: u32,
+        /// Native composite dimensions this per-client target was inscribed
+        /// into. The renderer uses them to reject stale-aspect targets after
+        /// a resize, exactly like the server-side encoder paths.
+        native_w: u32,
+        native_h: u32,
         is_444: bool,
-        /// Minimum microseconds between encodes for this session — the
-        /// subscriber's frame interval.  The compositor composites at
-        /// commit rate, which can exceed what the client consumes; every
-        /// encoded-but-undelivered frame breaks the delta chain, so frames
-        /// that would be skipped must be skipped *before* encoding.
-        /// 0 = encode every composite.
-        min_interval_us: u32,
-    },
-    /// Retarget one client's encoder cadence without rebuilding its Vulkan
-    /// Video session or reference chain.
-    SetVulkanEncoderInterval {
-        surface_id: u32,
-        client_id: u64,
-        min_interval_us: u32,
     },
     /// Retarget one client's encoder quantizer without rebuilding it.
     SetVulkanEncoderQp {
         surface_id: u32,
         client_id: u64,
         qp: u8,
+    },
+    /// Permit one compositor-resident encode for this client and surface.
+    RequestVulkanFrame {
+        surface_id: u32,
+        client_id: u64,
     },
     /// Request a keyframe from one client's Vulkan Video encoder.
     RequestVulkanKeyframe {
@@ -4687,19 +4684,13 @@ impl Compositor {
                 qp,
                 width,
                 height,
+                native_w,
+                native_h,
                 is_444,
-                min_interval_us,
             } => {
                 let created = self.vulkan_renderer.as_mut().is_some_and(|vk| {
                     vk.create_vulkan_encoder(
-                        surface_id,
-                        client_id,
-                        codec,
-                        qp,
-                        width,
-                        height,
-                        is_444,
-                        min_interval_us,
+                        surface_id, client_id, codec, qp, width, height, native_w, native_h, is_444,
                     )
                 });
                 if !created {
@@ -4713,15 +4704,6 @@ impl Compositor {
                     (self.event_notify)();
                 }
             }
-            CompositorCommand::SetVulkanEncoderInterval {
-                surface_id,
-                client_id,
-                min_interval_us,
-            } => {
-                if let Some(ref mut vk) = self.vulkan_renderer {
-                    vk.set_vulkan_encoder_interval(surface_id, client_id, min_interval_us);
-                }
-            }
             CompositorCommand::SetVulkanEncoderQp {
                 surface_id,
                 client_id,
@@ -4729,6 +4711,14 @@ impl Compositor {
             } => {
                 if let Some(ref mut vk) = self.vulkan_renderer {
                     vk.set_vulkan_encoder_qp(surface_id, client_id, qp);
+                }
+            }
+            CompositorCommand::RequestVulkanFrame {
+                surface_id,
+                client_id,
+            } => {
+                if let Some(vk) = self.vulkan_renderer.as_mut() {
+                    vk.request_vulkan_frame(surface_id, client_id);
                 }
             }
             CompositorCommand::RequestVulkanKeyframe {

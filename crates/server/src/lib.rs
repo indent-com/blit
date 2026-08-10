@@ -1168,23 +1168,28 @@ struct DownscaleTargetMode {
 /// stays on the CPU-compatible representation.
 ///
 /// `others` yields each *other* subscriber's `(target, can_take_nv12,
-/// wants_444)`. A subscriber at a different size is irrelevant.
+/// wants_444, needs_cpu_pixels)`. A subscriber at a different size is
+/// irrelevant. Vulkan Video needs neither published representation: it reads
+/// the shared BGRA scratch inside the compositor.
 fn downscale_target_mode(
     this_wants: bool,
     this_444: bool,
+    this_needs_cpu: bool,
     target: (u32, u32),
-    others: impl Iterator<Item = (Option<(u32, u32)>, bool, bool)>,
+    others: impl Iterator<Item = (Option<(u32, u32)>, bool, bool, bool)>,
 ) -> DownscaleTargetMode {
     let mut opaque_layout = this_wants.then_some(this_444);
-    let mut want_cpu_pixels = !this_wants;
+    let mut want_cpu_pixels = this_needs_cpu;
     let mut split_opaque_layout = false;
 
-    for (their_target, they_want, their_444) in others {
+    for (their_target, they_want, their_444, they_need_cpu) in others {
         if their_target != Some(target) {
             continue;
         }
-        if !they_want {
+        if they_need_cpu {
             want_cpu_pixels = true;
+        }
+        if !they_want {
             continue;
         }
         match opaque_layout {
@@ -1525,17 +1530,21 @@ struct SurfaceSubState {
     /// otherwise a saturated link alternates between one expensive stall
     /// and an immediate walk back to maximum quality.
     congested_at: Option<Instant>,
-    /// Bit per Vulkan Video encoder the compositor has refused this client on
-    /// this surface (see [`SurfaceEncoderPreference::vulkan_refusal_bit`]).
-    /// Latched so selection stops offering that one — otherwise the next tick
-    /// re-selects it, is refused again, and the surface never reaches a
-    /// server-side encoder.  Cleared when the surface is invalidated
-    /// (resize / destroy), which is a fair time to retry.
+    /// Bit per Vulkan Video encoder whose 4:2:0 profile the compositor has
+    /// refused for this client and surface (see
+    /// [`SurfaceEncoderPreference::vulkan_refusal_bit`]). Latched so selection
+    /// stops offering that codec after both chroma profiles are exhausted.
+    /// Cleared when the subscription is recreated.
     ///
     /// Per encoder rather than one flag for the tier: with `av1-vulkan` ahead
     /// of `h264-vulkan` in the default list, a single flag let an AV1 refusal
     /// disqualify H.264 too, losing a path that works.
     vulkan_refused: u8,
+    /// Bit per Vulkan Video encoder whose 4:4:4 profile the compositor refused
+    /// for this subscription.  Unlike `vulkan_refused`, this does not reject
+    /// the backend: selection retries the same codec at 4:2:0 before advancing
+    /// to the next preference.
+    vulkan_444_refused: u8,
     /// Last per-client downscale target dims registered with the
     /// compositor.  Used to send `ClearDownscaleTarget` for the old
     /// dims when the encoder is recreated at a new size, so stale
@@ -1688,10 +1697,11 @@ fn refused_for_size(
 struct VulkanVideoSurfaceState {
     encoder_name: &'static str,
     codec_flag: u8,
-    /// Cadence currently installed in the compositor-resident encoder.
-    /// Kept here so a live C2S_DISPLAY_RATE change can be reconciled without
-    /// rebuilding the encoder (which would also force a keyframe).
-    min_interval_us: u32,
+    width: u32,
+    height: u32,
+    /// The profile requested from the compositor.  A refusal of 4:4:4 still
+    /// leaves the same codec's 4:2:0 profile worth trying.
+    is_444: bool,
 }
 
 struct ClientState {
@@ -2479,37 +2489,6 @@ fn surface_delivery_is_throttled(client: &ClientState, surface_id: u16) -> bool 
 /// makes its rAF clock depend on network RTT.
 fn surface_source_interval(client: &ClientState, surface_id: u16) -> Duration {
     Duration::from_secs_f64(1.0 / surface_pacing_fps(client, surface_id) as f64)
-}
-
-/// Vulkan Video sessions pace before encoding, because dropping their output
-/// afterwards would break the decoder's reference chain. Honor low-rate
-/// subscriptions directly: another viewer may drive the shared source faster,
-/// so relying on the source clock alone would still over-encode this session.
-fn vulkan_encoder_interval_us(pacing_fps: f32) -> u32 {
-    (1_000_000.0 / pacing_fps.max(1.0)) as u32
-}
-
-/// Update the server-side cadence cache and return only the compositor
-/// commands made necessary by a live display-rate change.
-fn reconcile_vulkan_encoder_intervals(
-    clients: &mut HashMap<u64, ClientState>,
-) -> Vec<(u32, u64, u32)> {
-    let mut updates = Vec::new();
-    for (&client_id, client) in clients {
-        let surface_ids: SmallVec<[u16; 4]> =
-            client.vulkan_video_surfaces.keys().copied().collect();
-        for surface_id in surface_ids {
-            let min_interval_us =
-                vulkan_encoder_interval_us(surface_pacing_fps(client, surface_id));
-            let state = client.vulkan_video_surfaces.get_mut(&surface_id).unwrap();
-            if state.min_interval_us == min_interval_us {
-                continue;
-            }
-            state.min_interval_us = min_interval_us;
-            updates.push((surface_id as u32, client_id, min_interval_us));
-        }
-    }
-    updates
 }
 
 /// Slowest surface pacing across this client, for the metrics line.
@@ -3591,6 +3570,48 @@ fn vulkan_encoder_name(pref: SurfaceEncoderPreference, is_444: bool) -> &'static
     }
 }
 
+/// Whether the Vulkan Video tier may be tried for this client's coded extent.
+///
+/// The extent is deliberately the per-client target, not the compositor's
+/// native surface size. Scaling is part of the compositor-resident path.
+fn vulkan_video_tier_eligible(
+    preferences: &[SurfaceEncoderPreference],
+    codec_support: u8,
+    width: u32,
+    height: u32,
+) -> bool {
+    !surface_encoder::outranking_encoder_pending(preferences, codec_support, width, height)
+}
+
+/// Choose the chroma profile for the next attempt at one Vulkan codec.
+///
+/// A 4:4:4 refusal is profile-specific, not a reason to discard the backend:
+/// AV1 High is much rarer than AV1 Main, and the latter still keeps the frame
+/// on the compositor's GPU.  A refused 4:2:0 profile exhausts this codec.
+fn vulkan_encoder_chroma(
+    pref: SurfaceEncoderPreference,
+    want_444: bool,
+    refused_444: u8,
+    declined: &HashSet<&'static str>,
+) -> Option<bool> {
+    let refusal_bit = pref.vulkan_refusal_bit();
+    if want_444
+        && refused_444 & refusal_bit == 0
+        && !declined.contains(vulkan_encoder_name(pref, true))
+    {
+        return Some(true);
+    }
+    (!declined.contains(vulkan_encoder_name(pref, false))).then_some(false)
+}
+
+fn latch_vulkan_refusal(sub: &mut SurfaceSubState, pref: SurfaceEncoderPreference, is_444: bool) {
+    if is_444 {
+        sub.vulkan_444_refused |= pref.vulkan_refusal_bit();
+    } else {
+        sub.vulkan_refused |= pref.vulkan_refusal_bit();
+    }
+}
+
 fn retire_encoder(encoder: Option<SurfaceEncoder>) {
     let Some(encoder) = encoder else { return };
     // Outside a runtime (tests) there is nowhere to hand it to, and no
@@ -3922,15 +3943,17 @@ impl Session {
     /// buffer out from under clients still registered at that size, and it
     /// leaves survivors on BGRA until something unrelated re-registers them.
     fn resettle_downscale_target(&mut self, surface_id: u16, tw: u32, th: u32) {
-        let survivors: Vec<(bool, bool, (u32, u32))> = self
+        let survivors: Vec<(bool, bool, bool, (u32, u32))> = self
             .clients
             .values()
             .filter_map(|c| {
                 let s = c.surface_subs.get(&surface_id)?;
                 (s.last_registered_target == Some((tw, th))).then(|| {
+                    let is_vulkan = c.vulkan_video_surfaces.contains_key(&surface_id);
                     (
                         s.wants_nv12_opaque,
                         s.wants_opaque_444,
+                        !is_vulkan && !s.wants_nv12_opaque,
                         s.last_registered_native.unwrap_or((tw, th)),
                     )
                 })
@@ -3939,15 +3962,17 @@ impl Session {
         let Some(cs) = self.compositor.as_mut() else {
             return;
         };
-        if let Some(&(first_wants, first_444, (native_w, native_h))) = survivors.first() {
+        if let Some(&(first_wants, first_444, first_cpu, (native_w, native_h))) = survivors.first()
+        {
             let mode = downscale_target_mode(
                 first_wants,
                 first_444,
+                first_cpu,
                 (tw, th),
                 survivors
                     .iter()
                     .skip(1)
-                    .map(|(wants, is_444, _)| (Some((tw, th)), *wants, *is_444)),
+                    .map(|(wants, is_444, cpu, _)| (Some((tw, th)), *wants, *is_444, *cpu)),
             );
             let _ = cs.handle.command_tx.send(
                 blit_compositor::CompositorCommand::RegisterDownscaleTarget {
@@ -6002,10 +6027,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                     client_id,
                     after_encode_failures,
                 } => {
-                    // The compositor could not give this client a session
-                    // (driver refusal, or we are at the session cap).  Drop
-                    // the tracking entry so the next tick routes it through
-                    // a server-side encoder instead of waiting forever.
+                    // The compositor could not give this client the requested
+                    // profile (driver refusal, or we are at the session cap).
+                    // Drop the tracking entry so the next tick can retry this
+                    // Vulkan codec at 4:2:0 or advance to another encoder.
                     vulkan_unavailable.push((surface_id, client_id, after_encode_failures));
                 }
                 CompositorEvent::SurfaceTitle { surface_id, title } => {
@@ -6192,8 +6217,9 @@ async fn tick(state: &AppState) -> TickOutcome {
     // hole in the delta chain — the decoder would silently mispredicts every
     // frame after it (the picture "jumps back and forth" between the stale
     // and fresh reference slots) until a keyframe.  Owe one: the delivery
-    // loop then withholds deltas and asks the session for an IDR.  Encoder
-    // pacing makes this rare; this is the backstop that keeps it invisible.
+    // loop then withholds deltas and asks the session for an IDR. The
+    // one-frame token makes this rare; this is the backstop that keeps it
+    // invisible.
     for (sid, cid, prev_gen) in encoded_overwrites {
         if let Some(c) = sess.clients.get_mut(&cid)
             && c.vulkan_video_surfaces.contains_key(&sid)
@@ -6205,11 +6231,10 @@ async fn tick(state: &AppState) -> TickOutcome {
         }
     }
 
-    // A client the compositor could not give a session to falls back to a
-    // server-side encoder.  The refusal has to be latched: selection only
-    // asks whether the client's target matches native, which it still
-    // does, so without the latch the next tick re-selects Vulkan, is
-    // refused again, and the surface never reaches an encoder at all.
+    // A client the compositor could not give a session to retries 4:2:0 when
+    // the refused profile was 4:4:4, then falls through when that also fails.
+    // The exact refusal has to be latched or the next tick re-selects the
+    // same profile forever.
     for (sid, cid, after_encode_failures) in vulkan_unavailable {
         let mut declined_name = None;
         if let Some(c) = sess.clients.get_mut(&cid)
@@ -6234,19 +6259,27 @@ async fn tick(state: &AppState) -> TickOutcome {
             // Keep the rest of the subscription: it carries this client's
             // bandwidth/speed/codec overrides, which a refusal is no
             // reason to reset.  Clearing the encoder is enough to make the
-            // next tick build a server-side one.
+            // next tick retry Vulkan 4:2:0 or build the next encoder.
             let sub = c.surface_subs.entry(sid).or_default();
-            sub.vulkan_refused |= refused.vulkan_refusal_bit();
+            latch_vulkan_refusal(sub, refused, vulkan.is_444);
+            sub.selected_encoder = None;
             retire_encoder(sub.encoder.take());
             sub.has_keyframe = false;
             if sub.encode_in_flight || sub.creation_in_flight {
                 sub.encoder_invalidated = true;
             }
             forget_surface_inflight(c, sid);
-            eprintln!(
-                "[vulkan-video] cid={cid} sid={sid}: compositor declined a session, \
-                 falling back to a server-side encoder",
-            );
+            if vulkan.is_444 {
+                eprintln!(
+                    "[vulkan-video] cid={cid} sid={sid}: compositor declined the 4:4:4 \
+                     profile, retrying the same Vulkan codec at 4:2:0",
+                );
+            } else {
+                eprintln!(
+                    "[vulkan-video] cid={cid} sid={sid}: compositor declined a 4:2:0 \
+                     session, falling back to the next encoder",
+                );
+            }
         }
         if let Some(name) = declined_name
             && let Some(cs) = sess.compositor.as_mut()
@@ -6536,8 +6569,8 @@ async fn tick(state: &AppState) -> TickOutcome {
             .unwrap_or_default();
 
         // `(surface, client)` pairs whose Vulkan Video encoder should be
-        // torn down after the client loop, because that client now wants a
-        // per-client target smaller than the compositor's native size.
+        // torn down after the client loop because its per-client coded
+        // extent changed.
         // Deferred so we can mutate the client map and the compositor
         // without holding the per-client mutable borrow used inside the
         // loop.  Only the affected client is torn down; ownership is per
@@ -6553,10 +6586,12 @@ async fn tick(state: &AppState) -> TickOutcome {
             qp: u8,
             width: u32,
             height: u32,
+            native_w: u32,
+            native_h: u32,
             is_444: bool,
-            min_interval_us: u32,
         }
         let mut pending_vulkan_encoder_setups: Vec<VulkanEncoderSetup> = Vec::new();
+        let mut pending_vulkan_frame_requests: Vec<(u32, u64)> = Vec::new();
         let mut pending_vulkan_keyframe_requests: Vec<(u32, u64)> = Vec::new();
         // Downscale targets registered by a server-side encoder this tick is
         // replacing with a Vulkan Video session: `(surface, target_w,
@@ -6684,6 +6719,36 @@ async fn tick(state: &AppState) -> TickOutcome {
                 );
                 let (enc_w, enc_h) = (target_w, target_h);
 
+                // A Vulkan Video session is per client and per encoded size,
+                // just like every server-side encoder. A viewport change
+                // replaces only this client's session; other viewers keep
+                // their independently sized streams.
+                let has_vulkan_enc = match client.vulkan_video_surfaces.get(&sid) {
+                    Some(vulkan) if (vulkan.width, vulkan.height) == (enc_w, enc_h) => true,
+                    Some(_) => {
+                        client.vulkan_video_surfaces.remove(&sid);
+                        if !vulkan_teardown.contains(&(sid, work.cid)) {
+                            vulkan_teardown.push((sid, work.cid));
+                        }
+                        if let Some((tw, th)) = client
+                            .surface_subs
+                            .entry(sid)
+                            .or_default()
+                            .last_registered_target
+                            .take()
+                        {
+                            client
+                                .surface_subs
+                                .entry(sid)
+                                .or_default()
+                                .last_registered_native = None;
+                            pending_vulkan_clear_targets.push((sid as u32, tw, th));
+                        }
+                        false
+                    }
+                    None => false,
+                };
+
                 // The target the compositor holds is stamped with the native
                 // it was inscribed into, and it refuses to fill one whose
                 // stamp has gone stale — otherwise the composite moves
@@ -6777,7 +6842,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // the bitstream stream, not the pixel snapshot, and the two
                 // carry independent generations; ask the one it is actually
                 // fed from.
-                let has_vulkan_enc = client.vulkan_video_surfaces.contains_key(&sid);
                 let latest_gen = if has_vulkan_enc {
                     // The session exists but may not have produced anything
                     // yet; in that case there is nothing to hold still.
@@ -6927,14 +6991,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                             continue;
                         }
                         if (target_w, target_h) != (ew, eh) {
-                            // This client now wants a different size than
-                            // the compositor encodes at.  Vulkan Video only
-                            // emits at native, so drop this client's
-                            // session and let its server-side encoder take
-                            // over.  Every other subscriber keeps theirs.
-                            if !vulkan_teardown.contains(&(sid, work.cid)) {
-                                vulkan_teardown.push((sid, work.cid));
-                            }
+                            // A size replacement can leave the old session's
+                            // final frame in the event cache until the new
+                            // opening keyframe arrives. Never stamp those old
+                            // dimensions onto the new decoder stream.
+                            client.skip_vulkan_await_count =
+                                client.skip_vulkan_await_count.saturating_add(1);
                             continue;
                         }
                         let flags = codec_flag
@@ -6977,6 +7039,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                                     s.has_keyframe = true;
                                 }
                                 s.burst_remaining = s.burst_remaining.saturating_sub(1);
+                                // Match the server-side one-in-flight encoder
+                                // discipline. Vulkan may produce one successor
+                                // only after this frame entered the client's
+                                // delivery path; if the outbox blocks now, that
+                                // successor is the sole frame allowed to wait.
+                                pending_vulkan_frame_requests.push((sid as u32, work.cid));
                             }
                         }
                         encoded_client_surfaces.insert((work.cid, sid));
@@ -7239,30 +7307,21 @@ async fn tick(state: &AppState) -> TickOutcome {
                             .unwrap_or(state.config.surface_encoding.speed),
                     };
 
-                    // Vulkan Video encodes at the compositor's native size
-                    // — only valid when this client's per-client target
-                    // matches native.  If we selected Vulkan Video here for
-                    // a smaller-target client, the bitstream would be at
-                    // the wrong resolution and we'd have no way to scale
-                    // it.  Other subscribers are unaffected either way:
-                    // each owns its own session.
-                    //
-                    // And the tier ranks below the dedicated encode engines
+                    // The tier ranks below any dedicated encode engines
                     // (see `SurfaceEncoderPreference::defaults`), which this
                     // block is what enforces: selection here runs ahead of
                     // the fallback chain, so without the check a listed
                     // Vulkan encoder would win no matter where it sits.
-                    let vulkan_eligible = (target_w, target_h) == (px_w, px_h)
-                        && !surface_encoder::outranking_encoder_pending(
-                            &state.config.surface_encoders,
-                            codec_support,
-                            px_w,
-                            px_h,
-                        );
-                    let refused_bits = client
+                    let vulkan_eligible = vulkan_video_tier_eligible(
+                        &state.config.surface_encoders,
+                        codec_support,
+                        enc_w,
+                        enc_h,
+                    );
+                    let (refused_bits, refused_444_bits) = client
                         .surface_subs
                         .get(&sid)
-                        .map_or(0, |s| s.vulkan_refused);
+                        .map_or((0, 0), |s| (s.vulkan_refused, s.vulkan_444_refused));
 
                     let mut vulkan_selected = false;
                     for &pref in &state.config.surface_encoders {
@@ -7279,6 +7338,9 @@ async fn tick(state: &AppState) -> TickOutcome {
                             continue;
                         }
                         if !pref.supported_by_client(codec_support) {
+                            continue;
+                        }
+                        if !pref.fits(enc_w, enc_h) {
                             continue;
                         }
                         // Check compositor capability (pre-extracted above).
@@ -7304,17 +7366,21 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // H.264 4:4:4, the Raphael iGPU does not, and AV1
                         // High is rarer than either), so the request goes out
                         // as asked: a caps query that refuses declines the
-                        // session, and this client falls through to the
-                        // encoders below with its 4:4:4 intact.
-                        let is_444 = want_444;
-                        // Except where this device has already proved it
-                        // cannot: a profile it accepts and then fails to
-                        // encode fails the same way for every surface, and
-                        // finding that out again costs a session setup and a
-                        // dozen failing encodes before the fallback.
-                        if declined_vulkan_encoders.contains(vulkan_encoder_name(pref, is_444)) {
+                        // session. Selection remembers that exact profile and
+                        // retries the same codec at 4:2:0 on the next tick.
+                        // A refusal is profile-specific.  If 4:4:4 failed,
+                        // retry this codec at 4:2:0 before walking on to the
+                        // next backend.  A profile that built and then failed
+                        // to encode is remembered device-wide; a setup-time
+                        // refusal is remembered for this subscription.
+                        let Some(is_444) = vulkan_encoder_chroma(
+                            pref,
+                            want_444,
+                            refused_444_bits,
+                            &declined_vulkan_encoders,
+                        ) else {
                             continue;
-                        }
+                        };
                         let qp = match pref {
                             SurfaceEncoderPreference::VulkanVideoAV1 => {
                                 encoding.bandwidth.av1_qp_for_vulkan()
@@ -7327,22 +7393,21 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // 4:4:4 Predictive for a High 4:2:0 stream (or the
                         // reverse) misconfigures it.
                         let enc_name = vulkan_encoder_name(pref, is_444);
-                        // Queue commands to send after the client loop.
-                        // The session paces itself to this client's display
-                        // rate: composites arrive faster than the client
-                        // consumes, and every encoded-but-undelivered frame
-                        // would break the delta chain.
-                        let min_interval_us =
-                            vulkan_encoder_interval_us(surface_pacing_fps(client, sid));
+                        // Queue commands to send after the client loop. The
+                        // server's ordinary per-client surface gate owns
+                        // cadence; the compositor receives one encode token
+                        // only after the prior bitstream enters that client's
+                        // delivery path.
                         pending_vulkan_encoder_setups.push(VulkanEncoderSetup {
                             surface_id: sid as u32,
                             client_id: work.cid,
                             codec: pref.vulkan_codec(),
                             qp,
-                            width: px_w,
-                            height: px_h,
+                            width: enc_w,
+                            height: enc_h,
+                            native_w,
+                            native_h,
                             is_444,
-                            min_interval_us,
                         });
                         pending_vulkan_keyframe_requests.push((sid as u32, work.cid));
                         if let Some(s) = client.surface_subs.get_mut(&sid) {
@@ -7354,21 +7419,33 @@ async fn tick(state: &AppState) -> TickOutcome {
                             if s.encode_in_flight || s.creation_in_flight {
                                 s.encoder_invalidated = true;
                             }
-                            // And remove this client from any downscale target
-                            // its interim server-side encoder registered (see
-                            // `pending_vulkan_clear_targets`).
+                            // Reconcile any target its interim server-side
+                            // encoder registered. Vulkan keeps the same BGRA
+                            // scratch at a non-native size but no longer needs
+                            // that target's CPU/OPAQUE publication.
                             if let Some((tw, th)) = s.last_registered_target.take() {
                                 pending_vulkan_clear_targets.push((sid as u32, tw, th));
                             }
+                            s.last_registered_native = None;
+                            s.selected_encoder = Some(pref);
                         }
                         client.vulkan_video_surfaces.insert(
                             sid,
                             VulkanVideoSurfaceState {
                                 encoder_name: enc_name,
                                 codec_flag: pref.codec_flag(),
-                                min_interval_us,
+                                width: enc_w,
+                                height: enc_h,
+                                is_444,
                             },
                         );
+                        if (enc_w, enc_h) != (native_w, native_h) {
+                            let sub = client.surface_subs.entry(sid).or_default();
+                            sub.last_registered_target = Some((enc_w, enc_h));
+                            sub.last_registered_native = Some((native_w, native_h));
+                            sub.wants_nv12_opaque = false;
+                            sub.wants_opaque_444 = false;
+                        }
                         let codec_str = match pref {
                             SurfaceEncoderPreference::VulkanVideoH264 => {
                                 // High 4:4:4 Predictive, else High 4:2:0,
@@ -7377,7 +7454,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 // (which a level-gating decoder refuses at
                                 // `configure()`) or overstates it.
                                 let profile = if is_444 { 0xF4 } else { 0x64 };
-                                let level = h264_level_idc_for(px_w, px_h);
+                                let level = h264_level_idc_for(enc_w, enc_h);
                                 format!("avc1.{profile:02X}00{level:02x}")
                             }
                             SurfaceEncoderPreference::VulkanVideoAV1 => {
@@ -7390,7 +7467,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                                     ChromaSubsampling::Cs420
                                 };
                                 let profile = surface_encoder::av1_profile_digit(chroma);
-                                let level = surface_encoder::av1_level_for(px_w, px_h);
+                                let level = surface_encoder::av1_level_for(enc_w, enc_h);
                                 format!("av01.{profile}.{level}M.08")
                             }
                             _ => String::new(),
@@ -7399,7 +7476,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         let _ = send_outbox(client, enc_msg);
                         if state.config.verbose {
                             eprintln!(
-                                "[surface-encoder] cid={} sid={sid} {px_w}x{px_h}: using {enc_name}",
+                                "[surface-encoder] cid={} sid={sid} {enc_w}x{enc_h}: using {enc_name}",
                                 work.cid,
                             );
                         }
@@ -7530,11 +7607,9 @@ async fn tick(state: &AppState) -> TickOutcome {
             }
         }
 
-        // Tear down Vulkan Video for surfaces where at least one client
-        // wants a per-client target smaller than the compositor's native
-        // size.  After this, the compositor produces raw NV12/BGRA on
-        // the next frame and every subscriber's per-client encoder takes
-        // over.
+        // Tear down only the superseded per-client Vulkan sessions. A new
+        // target may already be queued below; command ordering destroys the
+        // old coded extent before installing its replacement.
         for &(sid, cid) in &vulkan_teardown {
             if let Some(c) = sess.clients.get_mut(&cid)
                 && c.vulkan_video_surfaces.remove(&sid).is_some()
@@ -7551,8 +7626,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 );
                 cs.handle.wake();
                 eprintln!(
-                    "[vulkan-video] teardown sid={sid} cid={cid}: target ≠ native size; \
-                     switching that client to a server-side encoder",
+                    "[vulkan-video] teardown sid={sid} cid={cid}: replacing per-client target",
                 );
             }
         }
@@ -7566,6 +7640,7 @@ async fn tick(state: &AppState) -> TickOutcome {
 
         // Send Vulkan Video encoder commands to compositor.
         if (!pending_vulkan_encoder_setups.is_empty()
+            || !pending_vulkan_frame_requests.is_empty()
             || !pending_vulkan_keyframe_requests.is_empty()
             || !pending_vulkan_qp_updates.is_empty())
             && let Some(cs) = sess.compositor.as_ref()
@@ -7588,8 +7663,9 @@ async fn tick(state: &AppState) -> TickOutcome {
                         qp: setup.qp,
                         width: setup.width,
                         height: setup.height,
+                        native_w: setup.native_w,
+                        native_h: setup.native_h,
                         is_444: setup.is_444,
-                        min_interval_us: setup.min_interval_us,
                     },
                 );
             }
@@ -7599,6 +7675,14 @@ async fn tick(state: &AppState) -> TickOutcome {
                         surface_id,
                         client_id,
                         qp,
+                    },
+                );
+            }
+            for (surface_id, client_id) in pending_vulkan_frame_requests {
+                let _ = cs.handle.command_tx.send(
+                    blit_compositor::CompositorCommand::RequestVulkanFrame {
+                        surface_id,
+                        client_id,
                     },
                 );
             }
@@ -8352,6 +8436,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     let target_mode = downscale_target_mode(
                         encoder_wants_nv12_opaque,
                         encoder_opaque_444,
+                        !encoder_wants_nv12_opaque,
                         (tw, th),
                         sess.clients
                             .iter()
@@ -8360,13 +8445,16 @@ async fn tick(state: &AppState) -> TickOutcome {
                                 c.surface_subs
                                     .get(&result.sid)
                                     .map(|s| {
+                                        let is_vulkan =
+                                            c.vulkan_video_surfaces.contains_key(&result.sid);
                                         (
                                             s.last_registered_target,
                                             s.wants_nv12_opaque,
                                             s.wants_opaque_444,
+                                            !is_vulkan && !s.wants_nv12_opaque,
                                         )
                                     })
-                                    .unwrap_or((None, true, encoder_opaque_444))
+                                    .unwrap_or((None, true, encoder_opaque_444, false))
                             }),
                     );
                     if let Some(bufs) = external_bufs
@@ -8569,32 +8657,6 @@ async fn tick(state: &AppState) -> TickOutcome {
                 .saturating_add(clock_requests)
                 .saturating_add(blanket_requests);
         }
-    }
-
-    // A compositor-resident encoder copied the display cadence when its
-    // session was created.  Keep that pacing gate in sync in place: rebuilding
-    // on a C2S_DISPLAY_RATE change is both unnecessary and visible (new
-    // session, forced keyframe).  The client update nudges this tick, so the
-    // new interval is installed without waiting for a surface commit.
-    let vulkan_interval_updates = if reconcile_cadence && sess.compositor.is_some() {
-        reconcile_vulkan_encoder_intervals(&mut sess.clients)
-    } else {
-        Vec::new()
-    };
-    if !vulkan_interval_updates.is_empty()
-        && let Some(cs) = sess.compositor.as_ref()
-    {
-        for (surface_id, client_id, min_interval_us) in vulkan_interval_updates {
-            let _ = cs
-                .handle
-                .command_tx
-                .send(CompositorCommand::SetVulkanEncoderInterval {
-                    surface_id,
-                    client_id,
-                    min_interval_us,
-                });
-        }
-        cs.handle.wake();
     }
 
     // Yield the session lock briefly so pending encode deliveries from
@@ -14861,7 +14923,7 @@ mod tests {
         #[test]
         fn sole_nvenc_subscriber_gets_it() {
             assert_eq!(
-                downscale_target_mode(true, false, T, std::iter::empty()),
+                downscale_target_mode(true, false, false, T, std::iter::empty()),
                 OPAQUE_420
             );
         }
@@ -14869,7 +14931,13 @@ mod tests {
         #[test]
         fn mixed_cpu_and_nvenc_subscribers_get_both_representations() {
             assert_eq!(
-                downscale_target_mode(true, false, T, [(Some(T), false, false)].into_iter()),
+                downscale_target_mode(
+                    true,
+                    false,
+                    false,
+                    T,
+                    [(Some(T), false, false, true)].into_iter()
+                ),
                 MIXED_420
             );
         }
@@ -14880,8 +14948,9 @@ mod tests {
                 downscale_target_mode(
                     true,
                     false,
+                    false,
                     T,
-                    [(Some(T), true, false), (Some(T), true, false)].into_iter()
+                    [(Some(T), true, false, false), (Some(T), true, false, false)].into_iter()
                 ),
                 OPAQUE_420
             );
@@ -14894,8 +14963,13 @@ mod tests {
                 downscale_target_mode(
                     true,
                     false,
+                    false,
                     T,
-                    [(Some((640, 360)), false, false), (None, false, false)].into_iter()
+                    [
+                        (Some((640, 360)), false, false, true),
+                        (None, false, false, true)
+                    ]
+                    .into_iter()
                 ),
                 OPAQUE_420
             );
@@ -14907,11 +14981,12 @@ mod tests {
                 downscale_target_mode(
                     true,
                     false,
+                    false,
                     T,
                     [
-                        (Some(T), true, false),
-                        (Some(T), false, false),
-                        (Some(T), true, false)
+                        (Some(T), true, false, false),
+                        (Some(T), false, false, true),
+                        (Some(T), true, false, false)
                     ]
                     .into_iter()
                 ),
@@ -14922,7 +14997,13 @@ mod tests {
         #[test]
         fn arbitration_is_independent_of_which_subscriber_triggered_it() {
             assert_eq!(
-                downscale_target_mode(false, false, T, [(Some(T), true, false)].into_iter()),
+                downscale_target_mode(
+                    false,
+                    false,
+                    true,
+                    T,
+                    [(Some(T), true, false, false)].into_iter()
+                ),
                 MIXED_420
             );
         }
@@ -14930,7 +15011,13 @@ mod tests {
         #[test]
         fn cpu_only_subscribers_need_no_opaque_buffer() {
             assert_eq!(
-                downscale_target_mode(false, false, T, [(Some(T), false, false)].into_iter()),
+                downscale_target_mode(
+                    false,
+                    false,
+                    true,
+                    T,
+                    [(Some(T), false, false, true)].into_iter()
+                ),
                 CPU_ONLY
             );
         }
@@ -14940,7 +15027,13 @@ mod tests {
             // One session needs NV12, the other planar YUV444 — one
             // shared buffer cannot serve both layouts.
             assert_eq!(
-                downscale_target_mode(true, true, T, [(Some(T), true, false)].into_iter()),
+                downscale_target_mode(
+                    true,
+                    true,
+                    false,
+                    T,
+                    [(Some(T), true, false, false)].into_iter()
+                ),
                 CPU_ONLY
             );
         }
@@ -14948,12 +15041,63 @@ mod tests {
         #[test]
         fn matching_444_subscribers_keep_it() {
             assert_eq!(
-                downscale_target_mode(true, true, T, [(Some(T), true, true)].into_iter()),
+                downscale_target_mode(
+                    true,
+                    true,
+                    false,
+                    T,
+                    [(Some(T), true, true, false)].into_iter()
+                ),
                 OPAQUE_444
+            );
+        }
+
+        #[test]
+        fn vulkan_only_target_needs_no_published_pixels() {
+            assert_eq!(
+                downscale_target_mode(false, false, false, T, std::iter::empty()),
+                DownscaleTargetMode {
+                    want_nv12_opaque: false,
+                    want_cpu_pixels: false,
+                    opaque_is_444: false,
+                }
             );
         }
     }
     use super::*;
+
+    #[test]
+    fn vulkan_video_accepts_a_scaled_client_target() {
+        let preferences = [SurfaceEncoderPreference::VulkanVideoAV1];
+        assert!(vulkan_video_tier_eligible(&preferences, 0, 1280, 720));
+    }
+
+    #[test]
+    fn vulkan_444_refusal_retries_the_same_codec_at_420() {
+        let pref = SurfaceEncoderPreference::VulkanVideoAV1;
+        let mut declined = HashSet::new();
+        assert_eq!(vulkan_encoder_chroma(pref, true, 0, &declined), Some(true));
+
+        let mut sub = SurfaceSubState::default();
+        latch_vulkan_refusal(&mut sub, pref, true);
+        assert_eq!(sub.vulkan_refused, 0, "4:4:4 must not reject AV1 Vulkan");
+        assert_ne!(sub.vulkan_444_refused, 0);
+        assert_eq!(
+            vulkan_encoder_chroma(pref, true, sub.vulkan_444_refused, &declined),
+            Some(false),
+        );
+
+        // The device-wide memory used after encode failures has the same
+        // profile-specific fallback behavior.
+        declined.insert(vulkan_encoder_name(pref, true));
+        assert_eq!(vulkan_encoder_chroma(pref, true, 0, &declined), Some(false));
+
+        // Only a 4:2:0 refusal exhausts the codec.
+        latch_vulkan_refusal(&mut sub, pref, false);
+        assert_ne!(sub.vulkan_refused, 0);
+        declined.insert(vulkan_encoder_name(pref, false));
+        assert_eq!(vulkan_encoder_chroma(pref, true, 0, &declined), None);
+    }
 
     /// The index walk (docs/design/fs-search.md) prunes `.git`, honors
     /// `.gitignore`, keeps other dotfiles, sorts, and reports truncation.
@@ -17902,10 +18046,8 @@ mod tests {
     }
 
     /// A pane measuring an odd pixel extent must not become an odd surface:
-    /// no 4:2:0 encoder can carry it, so the target would round even and
-    /// never equal native again — Vulkan Video permanently ineligible, a
-    /// 1px downscale forever.  Mediation negotiates down to the even grid
-    /// and the client learns the real size from SurfaceResized.
+    /// no 4:2:0 encoder can carry it. Mediation negotiates down to the even
+    /// grid and the client learns the real size from SurfaceResized.
     #[test]
     fn mediated_surface_size_rounds_odd_extents_to_even() {
         let mut session = Session::new();
@@ -17921,8 +18063,7 @@ mod tests {
 
     /// The even-rounded mediated size round-trips through the per-client
     /// target unchanged: once the surface is configured at it, the view
-    /// that asked for the odd size gets exactly the native stream, and the
-    /// eligibility comparison (target == native) holds.
+    /// that asked for the odd size gets exactly the native stream.
     #[test]
     fn odd_view_over_even_mediated_native_targets_native_exactly() {
         let target = encode_target_at_1x(Some((1237, 843, 120)), 1236, 842, None);
@@ -18635,40 +18776,6 @@ mod tests {
 
         assert_eq!(surface_pacing_fps(&client, 1), 240.0);
         assert!(!surface_delivery_is_throttled(&client, 1));
-    }
-
-    #[test]
-    fn live_display_rate_retargets_vulkan_encoder_cadence_once() {
-        let mut client = test_client();
-        client.display_fps = 60.0;
-        client.vulkan_video_surfaces.insert(
-            9,
-            VulkanVideoSurfaceState {
-                encoder_name: "vulkan-h264",
-                codec_flag: SURFACE_FRAME_CODEC_H264,
-                min_interval_us: vulkan_encoder_interval_us(client.display_fps),
-            },
-        );
-        let mut clients = HashMap::from([(42, client)]);
-
-        assert!(reconcile_vulkan_encoder_intervals(&mut clients).is_empty());
-
-        clients.get_mut(&42).unwrap().display_fps = 120.0;
-        assert_eq!(
-            reconcile_vulkan_encoder_intervals(&mut clients),
-            vec![(9, 42, 8_333)],
-        );
-        assert_eq!(
-            clients
-                .get(&42)
-                .unwrap()
-                .vulkan_video_surfaces
-                .get(&9)
-                .unwrap()
-                .min_interval_us,
-            8_333,
-        );
-        assert!(reconcile_vulkan_encoder_intervals(&mut clients).is_empty());
     }
 
     #[test]

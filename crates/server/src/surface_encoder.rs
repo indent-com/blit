@@ -87,11 +87,11 @@ impl SurfaceEncoderPreference {
             // Vulkan Video is tried first: it encodes on the compositor's own
             // device, so the frame never leaves the GPU it was composited on
             // and there is no server-side encode in the path at all.  What it
-            // costs is reach — native size only, no speed control, no rate
-            // control beyond a fixed QP — and a session the driver declines
-            // after selection.  Every one of those is recoverable: the tier
-            // refuses per encoder, and the client falls through to the
-            // dedicated engines below with its request intact.
+            // costs is reach — no speed control, no rate control beyond the
+            // adaptive QP, and a session the driver declines after selection.
+            // Every one of those is recoverable: the tier refuses per encoder,
+            // and the client falls through to the dedicated engines below
+            // with its request intact.
             //
             // AV1 leads the tier for its better compression.  Both entries
             // encode either chroma — AV1 4:4:4 is High profile, H.264 4:4:4

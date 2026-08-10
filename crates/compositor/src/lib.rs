@@ -172,6 +172,9 @@ mod stub {
         VulkanEncoderUnavailable {
             surface_id: u16,
             client_id: u64,
+            /// Whether a session was created before encoding failed.  The
+            /// server uses the requested profile it tracks for this pair to
+            /// retry 4:4:4 refusals at 4:2:0 before changing backends.
             after_encode_failures: bool,
         },
         SurfaceTitle {
@@ -371,23 +374,20 @@ mod stub {
             qp: u8,
             width: u32,
             height: u32,
+            native_w: u32,
+            native_h: u32,
             is_444: bool,
-            /// Minimum microseconds between encodes for this session; 0 =
-            /// encode every composite.
-            min_interval_us: u32,
-        },
-        /// Retarget one client's encoder cadence without rebuilding its
-        /// Vulkan Video session.
-        SetVulkanEncoderInterval {
-            surface_id: u32,
-            client_id: u64,
-            min_interval_us: u32,
         },
         /// Retarget one client's encoder quantizer without rebuilding it.
         SetVulkanEncoderQp {
             surface_id: u32,
             client_id: u64,
             qp: u8,
+        },
+        /// Permit one compositor-resident encode for this client and surface.
+        RequestVulkanFrame {
+            surface_id: u32,
+            client_id: u64,
         },
         /// Request a keyframe from one client's Vulkan Video encoder.
         RequestVulkanKeyframe {
