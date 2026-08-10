@@ -36,6 +36,7 @@ import type { LspHandle, LspOpenOptions } from "./lsp";
 import { WebSocketTransport } from "./transports/websocket";
 import { WebTransportTransport } from "./transports/webtransport";
 import { createShareTransport } from "./transports/webrtc-share";
+import { BlitActivityStore } from "./activity";
 
 export interface AddBlitConnectionOptions extends Omit<
   CreateBlitConnectionOptions,
@@ -101,6 +102,8 @@ export class BlitWorkspace {
   private readonly connections = new Map<ConnectionId, BlitConnection>();
   private readonly defaultWasm: BlitWasmModule | Promise<BlitWasmModule>;
   private surfaceDiagnosticsEnabled = false;
+  /** Slow operations surfaced by shell chrome such as the status bar. */
+  readonly activities = new BlitActivityStore();
   readonly logger: BlitLogger;
 
   private snapshot: BlitWorkspaceSnapshot = {
@@ -176,6 +179,7 @@ export class BlitWorkspace {
       this.removeConnection(connectionId);
     }
     this.listeners.clear();
+    this.activities.clear();
   }
 
   getConnection(connectionId: ConnectionId): BlitConnection | null {

@@ -336,7 +336,7 @@ const URI_LIST: &[u8] = b"file:///tmp/blit_drag_1_2/a%20b.png\r\n";
 const PNG_BYTES: &[u8] = &[0x89, b'P', b'N', b'G'];
 
 #[test]
-fn a_drop_enters_motions_and_serves_the_uri_list() {
+fn a_drop_enters_motions_leaves_and_serves_the_uri_list() {
     let mut fx = Fixture::new();
     let surface_id = fx.surface_id;
 
@@ -400,7 +400,11 @@ fn a_drop_enters_motions_and_serves_the_uri_list() {
         y: 40.0,
         offers: vec![("text/uri-list".to_string(), URI_LIST.to_vec())],
     });
-    assert_eq!(fx.app.events.last(), Some(&Drag::Drop));
+    assert_eq!(
+        &fx.app.events[fx.app.events.len() - 2..],
+        &[Drag::Drop, Drag::Leave],
+        "a successful drop must also clear the destination drag focus"
+    );
 
     // The parked receive now yields the staged bytes; the parked one for a
     // mime the drop did not carry closed empty.
@@ -612,9 +616,9 @@ fn a_reenter_survives_the_old_offers_late_destroy() {
         offers: vec![("text/uri-list".to_string(), URI_LIST.to_vec())],
     });
     assert_eq!(
-        fx.app.events.last(),
-        Some(&Drag::Drop),
-        "the drop must survive the old offer's late destroy"
+        &fx.app.events[fx.app.events.len() - 2..],
+        &[Drag::Drop, Drag::Leave],
+        "the drop and terminal leave must survive the old offer's late destroy"
     );
     assert_eq!(fx.receive("text/uri-list"), URI_LIST);
 

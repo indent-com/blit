@@ -1852,6 +1852,41 @@ describe("BlitConnection.upload", () => {
     conn.dispose();
   });
 
+  it("serializes lazy Blob reads while keeping their chunks pipelined", async () => {
+    const { conn, transport, handle } = await uploadReadyHandle();
+    const data = new TextEncoder().encode("0123456789");
+    const blob = new Blob([data]);
+    const realSlice = blob.slice.bind(blob);
+    let releaseFirst!: () => void;
+    const firstReady = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    vi.spyOn(blob, "slice").mockImplementation((start, end, type) => {
+      const part = realSlice(start, end, type);
+      if ((start ?? 0) === 0) {
+        const realArrayBuffer = part.arrayBuffer.bind(part);
+        vi.spyOn(part, "arrayBuffer").mockImplementation(async () => {
+          await firstReady;
+          return realArrayBuffer();
+        });
+      }
+      return part;
+    });
+
+    const p = handle.upload("ordered.bin", blob, { chunkSize: 4 });
+    void p.catch(() => {});
+    await acceptBegin(transport);
+    // Provider-backed blobs (notably iPad screenshots) must never have more
+    // than one materialization request outstanding.
+    expect(blob.slice).toHaveBeenCalledTimes(1);
+    expect(chunkOffsets(transport)).toEqual([]);
+    releaseFirst();
+    await flushTimers();
+    expect(blob.slice).toHaveBeenCalledTimes(3);
+    expect(chunkOffsets(transport)).toEqual([0, 4, 8]);
+    conn.dispose();
+  });
+
   it("resends from the resume point on OFFSET_MISMATCH", async () => {
     const { conn, transport, handle } = await uploadReadyHandle();
     const data = new TextEncoder().encode("0123456789ab"); // 12 bytes

@@ -2122,6 +2122,16 @@ export class BlitConnection {
       let inFlightBytes = 0; // unacked plaintext bytes on the wire
       const inFlightLens: number[] = []; // FIFO of unacked chunk lengths
       let generation = 0; // bumped on a rewind so stale async reads drop out
+      // Drag-provider Files are lazy Blobs.  In particular, iPad screenshot
+      // providers can stop making progress when asked to materialize several
+      // slices concurrently.  Serialize Blob reads, while still allowing the
+      // chunks already materialized and sent to remain pipelined on the wire.
+      // Uint8Array reads do not touch a provider and can stay parallel.
+      let blobReadTail = Promise.resolve();
+      // The transport is ordered too: even a non-Blob async source must never
+      // let a later slice overtake an earlier one.
+      let nextToWire = 0;
+      const readyChunks = new Map<number, Uint8Array>();
       let finishing = false;
       const sliceAt = async (
         offset: number,
@@ -2143,6 +2153,40 @@ export class BlitConnection {
         });
         this.transport.send(buildFsUploadFinishMessage(nonce, uploadId));
       };
+      const flushReadyChunks = (): void => {
+        while (!settled) {
+          const bytes = readyChunks.get(nextToWire);
+          if (!bytes) return;
+          readyChunks.delete(nextToWire);
+          const offset = nextToWire;
+          nextToWire += bytes.length;
+          this.transport.send(
+            buildFsUploadChunkMessage(uploadId, offset, bytes),
+          );
+        }
+      };
+      const failSourceRead = (cause: unknown): void => {
+        if (settled) return;
+        if (uploadId >= 0 && this.transport.status === "connected") {
+          this.transport.send(buildFsUploadCancelMessage(uploadId));
+        }
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        fail(connectionError(`Upload source read failed: ${detail}`));
+      };
+      const queueSlice = (
+        offset: number,
+        length: number,
+      ): Promise<Uint8Array> => {
+        if (!(data instanceof Blob)) return sliceAt(offset, length);
+        const read = blobReadTail.then(() => sliceAt(offset, length));
+        // Keep later reads moving after this one rejects; `read` still
+        // reports the failure through failSourceRead below.
+        blobReadTail = read.then(
+          () => undefined,
+          () => undefined,
+        );
+        return read;
+      };
       const kick = (): void => {
         while (
           !settled &&
@@ -2156,14 +2200,23 @@ export class BlitConnection {
           sent += length;
           inFlightBytes += length;
           inFlightLens.push(length);
-          void sliceAt(offset, length).then((bytes) => {
-            // A rewind (OFFSET_MISMATCH) or abort while the slice was being
-            // read makes this chunk stale; it must not hit the wire.
-            if (gen !== generation || settled) return;
-            this.transport.send(
-              buildFsUploadChunkMessage(uploadId, offset, bytes),
-            );
-          });
+          void queueSlice(offset, length)
+            .then((bytes) => {
+              // A rewind (OFFSET_MISMATCH) or abort while the slice was being
+              // read makes this chunk stale; it must not hit the wire.
+              if (gen !== generation || settled) return;
+              if (bytes.length !== length) {
+                throw new Error(
+                  `slice at ${offset} returned ${bytes.length} of ${length} bytes`,
+                );
+              }
+              readyChunks.set(offset, bytes);
+              flushReadyChunks();
+            })
+            .catch((cause) => {
+              if (gen !== generation || settled) return;
+              failSourceRead(cause);
+            });
         }
         if (!settled && sent >= total && inFlightBytes === 0) {
           // total 0 never enters the loop; every byte acked ends here too.
@@ -2178,6 +2231,11 @@ export class BlitConnection {
           // their duplicate mismatches converge on the same offset.
           generation++;
           sent = received;
+          nextToWire = received;
+          readyChunks.clear();
+          // Reads queued by the superseded generation must not hold up the
+          // resumed stream.  Their generation guards discard late results.
+          blobReadTail = Promise.resolve();
           inFlightBytes = 0;
           inFlightLens.length = 0;
           kick();

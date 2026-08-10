@@ -11,6 +11,7 @@ import type {
   SurfaceFrameHistory,
   NumberRing,
   LinkHover,
+  BlitActivity,
 } from "@blit-sh/core";
 import { formatBw } from "./createMetrics";
 import type { Metrics, RenderSampleRing, NetSampleRing } from "./createMetrics";
@@ -35,6 +36,7 @@ import {
 } from "./ide/activeEditor";
 import { lineWrap, toggleLineWrap } from "./ide/editorPrefs";
 import { FileViewSwitcher } from "./ide/FileViewSwitcher";
+import { activityDescription, activityPercent } from "./activityStatus";
 
 type SurfaceDebugInfo = {
   surfaceId: number;
@@ -124,6 +126,8 @@ export function StatusBar(props: {
   isMobileTouch?: boolean;
   keyboardOpen?: boolean;
   onToggleKeyboard?: () => void;
+  /** Workspace-wide slow operations, newest last. */
+  activities: readonly BlitActivity[];
 }) {
   const theme = () => themeFor(props.palette);
   const scale = () => uiScale(props.fontSize);
@@ -335,6 +339,16 @@ export function StatusBar(props: {
           )}
         </Show>
       </span>
+      <Show when={props.activities.at(-1)} keyed>
+        {(activity) => (
+          <ActivityStatus
+            activity={activity}
+            extra={Math.max(0, props.activities.length - 1)}
+            theme={theme()}
+            scale={scale()}
+          />
+        )}
+      </Show>
       <Show when={activeEditor()} keyed>
         {(ed) =>
           ed.kind === "diff" ? (
@@ -538,6 +552,67 @@ export function StatusBar(props: {
         />
       </Show>
     </>
+  );
+}
+
+/** Compact, always-visible progress for the newest slow operation. */
+export function ActivityStatus(props: {
+  activity: BlitActivity;
+  extra: number;
+  theme: Theme;
+  scale: UIScale;
+}) {
+  const percent = () => activityPercent(props.activity);
+  const description = () => activityDescription(props.activity);
+
+  return (
+    <span
+      role="status"
+      aria-live="polite"
+      title={description()}
+      style={{
+        position: "relative",
+        display: "flex",
+        "align-items": "center",
+        gap: `${props.scale.tightGap}px`,
+        "max-width": "min(42vw, 32em)",
+        overflow: "hidden",
+        padding: `0 ${props.scale.tightGap}px`,
+        "flex-shrink": 1,
+        color: props.theme.fg,
+      }}
+    >
+      <span
+        style={{
+          overflow: "hidden",
+          "text-overflow": "ellipsis",
+          "white-space": "nowrap",
+        }}
+      >
+        {description()}
+      </span>
+      <Show when={percent() !== null}>
+        <span style={{ "flex-shrink": 0 }}>{percent()}%</span>
+      </Show>
+      <Show when={props.extra > 0}>
+        <span style={{ "flex-shrink": 0, opacity: 0.6 }}>+{props.extra}</span>
+      </Show>
+      <Show when={percent()}>
+        {(pct) => (
+          <span
+            aria-hidden="true"
+            style={{
+              position: "absolute",
+              left: 0,
+              bottom: 0,
+              width: `${pct()}%`,
+              height: "2px",
+              "background-color": props.theme.accent,
+            }}
+          />
+        )}
+      </Show>
+    </span>
   );
 }
 

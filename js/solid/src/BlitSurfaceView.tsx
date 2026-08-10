@@ -66,6 +66,7 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
       connectionId: props.connectionId,
       surfaceId: props.surfaceId,
       live: props.live,
+      resizable: props.resizable,
     });
     surface.attach(containerRef);
     setMounted(surface);

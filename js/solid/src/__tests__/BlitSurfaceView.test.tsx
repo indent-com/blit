@@ -26,6 +26,7 @@ vi.mock("@blit-sh/core", async () => {
       requestResize = mockRequestResize;
       setConnectionId = vi.fn();
       setSurfaceId = vi.fn();
+      setLive = vi.fn();
     },
   };
 });

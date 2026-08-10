@@ -1,5 +1,11 @@
 export { BlitWorkspace, consoleLogger, nullLogger } from "./BlitWorkspace";
 export type { BlitLogger } from "./BlitWorkspace";
+export { BlitActivityStore } from "./activity";
+export type {
+  BlitActivity,
+  BlitActivityHandle,
+  BlitActivityUpdate,
+} from "./activity";
 
 export {
   SEARCH_SOURCE_TITLE,

@@ -487,12 +487,22 @@ logical-coordinate conversion and hit-test as pointer motion.
 
 `SURFACE_DRAG_ENTER` (0x35) starts the session and carries the MIME types
 the browser can offer; the list reaches the app unchanged on the
-compositor-owned `wl_data_offer`. For a file drag it also appends an item
-plan: one MIME per file-kind `DataTransferItem`, in item order. The trailer
-is optional and append-only, so an ENTER without it is byte-identical to the
-original format. The server derives a staging name for every planned item
-(`0.png`, `1.jpg`, or `.webp`/`.gif`; unknown types use `.bin`), creates the
-empty files, and can therefore answer `receive("text/uri-list")` during
+compositor-owned `wl_data_offer`. For a file drag it may also append an item
+plan: one MIME per file-kind `DataTransferItem`, in item order. The reference
+browser sends a plan only when every item exposes a MIME with a useful
+extension; WebKit items that are typeless during hover omit it rather than
+committing the eventual file to `.bin`. iPad screenshots are the deliberate
+exception: WebKit exposes only the `Files` marker until DROP, so the client
+sends a provisional one-file octet-stream plan to let the remote app receive
+`dragenter` during hover. Once DROP exposes the representation, the client
+sniffs an absent/unknown MIME and sends a replacement ENTER with its actual
+image type and derived name before uploading. The provisional `.bin` is never
+dropped. The trailer is optional and append-only, so an ENTER without it is
+byte-identical to the original format.
+The server derives a staging name for every planned item
+(`0.png`, `1.jpg`, `.webp`/`.gif`, HEIF-family formats, TIFF, or BMP; unknown
+types use `.bin`), creates the empty files, and can therefore answer
+`receive("text/uri-list")` during
 hover. Chromium fetches that URI list at Wayland enter before delivering
 the page's `dragenter`; answering it immediately lets the remote app show
 its drop UI before release.
@@ -539,8 +549,10 @@ that matters is `name`:
 The app reads the data the usual Wayland way. A planned `text/uri-list`
 receive can complete between `enter` and `drop`; every other early receive
 is parked until DROP supplies its payload. Receives after DROP are served
-from that payload by MIME (an unoffered MIME gets an empty pipe), followed
-by `finish`. With no source there is no
+from that payload by MIME (an unoffered MIME gets an empty pipe). The
+compositor sends `drop` followed by the terminal `leave`, clearing the
+destination's drag UI while the offer remains valid for post-drop reads and
+`finish`. With no source there is no
 `dnd_drop_performed`/`dnd_finished` — nobody to notify. Client-initiated
 drags (a Wayland app starting one via `start_drag`) take the complementary
 path: while the physical button is held, browser mouse events are hit-tested

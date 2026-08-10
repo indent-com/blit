@@ -6948,8 +6948,6 @@ impl VulkanRenderer {
         let mut results: Vec<(u16, u32, u32, PixelData, bool)> = Vec::new();
         if let Some(pending) = self.pending_submit.take() {
             let prev_sid = pending.toplevel_sid;
-            let (prev_surface, prev_w, prev_h) =
-                (pending.surface_id, pending.phys_w, pending.phys_h);
             let raw = unsafe {
                 (self.device.fp_v1_0().wait_for_fences)(
                     self.device.handle(),
@@ -6962,17 +6960,6 @@ impl VulkanRenderer {
             if raw == vk::Result::SUCCESS {
                 let r = self.retire_pending(pending);
                 self.free_frame_textures();
-                // Empty is the normal outcome under NV12 zero-copy: the
-                // frame was already published GPU-side and the readback
-                // is deliberately suppressed.  Only log when nothing was
-                // suppressing it.
-                if r.is_empty()
-                    && self
-                        .nv12_opaque_slot(prev_surface, prev_w, prev_h)
-                        .is_none()
-                {
-                    eprintln!("[render_tree_sized] fence OK but retire_pending=empty");
-                }
                 for (w, h, p, encoder_skip) in r {
                     results.push((prev_sid, w, h, p, encoder_skip));
                 }

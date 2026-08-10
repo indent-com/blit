@@ -9,6 +9,8 @@ import {
   surfaceCanvasForInput,
 } from "../BlitSurfaceCanvas";
 import type { BlitWorkspace } from "../BlitWorkspace";
+import { BlitActivityStore } from "../activity";
+import type { FsUploadOptions } from "../fs";
 import type { BlitSurface } from "../types";
 import type { SurfaceAxisEvent } from "../protocol";
 import {
@@ -329,8 +331,12 @@ function attachScrolling(
   const sent: SurfaceAxisEvent[] = [];
   const keys: { keycode: number; pressed: boolean }[] = [];
   const pointers: { type: number; button: number; x: number; y: number }[] = [];
+  const inputOrder: ("pointer" | "axis")[] = [];
   const conn = {
-    sendSurfaceAxis2: (_id: number, ev: SurfaceAxisEvent) => sent.push(ev),
+    sendSurfaceAxis2: (_id: number, ev: SurfaceAxisEvent) => {
+      inputOrder.push("axis");
+      sent.push(ev);
+    },
     sendSurfaceInput: (_id: number, keycode: number, pressed: boolean) =>
       keys.push({ keycode, pressed }),
     sendSurfacePointer: (
@@ -339,7 +345,10 @@ function attachScrolling(
       button: number,
       x: number,
       y: number,
-    ) => pointers.push({ type, button, x, y }),
+    ) => {
+      inputOrder.push("pointer");
+      pointers.push({ type, button, x, y });
+    },
     // Only the surface geometry matters here; everything else the canvas
     // reaches for during attach() answers with an inert unsubscribe, so
     // this stub does not need updating when the store grows a method.
@@ -387,7 +396,7 @@ function attachScrolling(
     // inside the idle window so the gesture is still open.
     vi.advanceTimersByTime(FRAME_MS);
   };
-  return { surface, canvas, sent, keys, pointers, wheel };
+  return { surface, canvas, sent, keys, pointers, inputOrder, wheel };
 }
 
 /** One animation frame, as the fake clock models requestAnimationFrame. */
@@ -431,6 +440,21 @@ describe("BlitSurfaceCanvas scroll", () => {
     expect(sent).toHaveLength(1);
     expect(sent[0].dy).toBeCloseTo(3.5);
     expect(sent[0].source).toBe(AXIS_SOURCE_CONTINUOUS);
+    surface.dispose();
+  });
+
+  it("re-hit-tests pointer focus before every wheel delta", () => {
+    const { surface, pointers, inputOrder, wheel } = attachScrolling();
+    wheel({ clientX: 30, clientY: 40, deltaY: 3.5, deltaMode: 0 });
+    // Keep the sequence open: a popup can disappear during momentum, so
+    // seeding only the first delta would still strand the rest.
+    wheel({ clientX: 31, clientY: 41, deltaY: 4.5, deltaMode: 0 });
+
+    expect(inputOrder).toEqual(["pointer", "axis", "pointer", "axis"]);
+    expect(pointers).toEqual([
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 30, y: 40 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 31, y: 41 },
+    ]);
     surface.dispose();
   });
 
@@ -924,7 +948,10 @@ describe("BlitSurfaceCanvas touch", () => {
  * target is therefore not merely a stream-size hint: registering one, or
  * failing to drop one, decides whether this view can size the surface at all.
  */
-function attachTargeting() {
+function attachTargeting(options?: {
+  initialBox?: { width: number; height: number };
+  resizable?: boolean;
+}) {
   const targets: ({ width: number; height: number } | null)[] = [];
   const maxFps: number[] = [];
   let roCallback: ResizeObserverCallback | undefined;
@@ -982,8 +1009,15 @@ function attachTargeting() {
     workspace,
     connectionId: "conn-1" as never,
     surfaceId: 7,
+    resizable: options?.resizable,
   });
-  surface.attach(document.createElement("div"));
+  const container = document.createElement("div");
+  if (options?.initialBox) {
+    const { width, height } = options.initialBox;
+    container.getBoundingClientRect = () =>
+      ({ width, height, left: 0, top: 0 }) as DOMRect;
+  }
+  surface.attach(container);
   /** Fire the box observer the way the browser does after layout. */
   const layOut = (width: number, height: number) =>
     roCallback?.(
@@ -998,6 +1032,33 @@ function attachTargeting() {
 }
 
 describe("BlitSurfaceCanvas size mediation", () => {
+  it("puts an already-laid-out thumbnail target on the first subscribe", () => {
+    const { targets, maxFps, restore } = attachTargeting({
+      initialBox: { width: 400, height: 200 },
+    });
+
+    // Waiting for ResizeObserver used to send native first and replace it
+    // with this target a frame later, rebuilding the encoder both times.
+    expect(targets).toEqual([{ width: 512, height: 256 }]);
+    expect(maxFps).toEqual([15]);
+
+    restore();
+  });
+
+  it("keeps a resizable view on the eager unscaled fast path", () => {
+    const { targets, maxFps, restore } = attachTargeting({
+      initialBox: { width: 400, height: 200 },
+      resizable: true,
+    });
+
+    // Its binding is about to call setDisplaySize.  Starting scaled here
+    // would merely reverse the same two-subscribe churn for foreground panes.
+    expect(targets).toEqual([null]);
+    expect(maxFps).toEqual([0]);
+
+    restore();
+  });
+
   it("drops the scaled target once it is given a display size", () => {
     const { surface, targets, maxFps, layOut, restore } = attachTargeting();
 
@@ -1729,9 +1790,11 @@ type DragSend =
 function attachDragging() {
   const sends: DragSend[] = [];
   const uploads: { path: string; file: File }[] = [];
+  const activities = new BlitActivityStore();
   const stagingHandle = {
-    upload: vi.fn((path: string, file: File) => {
+    upload: vi.fn((path: string, file: File, opts?: FsUploadOptions) => {
       uploads.push({ path, file });
+      opts?.onProgress?.(file.size, file.size);
       return Promise.resolve({});
     }),
     stop: vi.fn(),
@@ -1776,6 +1839,7 @@ function attachDragging() {
   const workspace = {
     getConnection: () => conn,
     subscribe: () => () => {},
+    activities,
   } as unknown as BlitWorkspace;
 
   /** One mount of the shared surface: its own canvas, sized like a live
@@ -1810,6 +1874,7 @@ function attachDragging() {
         items?: { kind: string; type: string; file?: File | null }[];
         text?: string;
         relatedTarget?: EventTarget | null;
+        dispatchOn?: EventTarget;
       } = {},
     ) => {
       const items = (
@@ -1841,7 +1906,7 @@ function attachDragging() {
         relatedTarget: opts.relatedTarget ?? null,
       });
       Object.defineProperty(ev, "dataTransfer", { value: dataTransfer });
-      canvas.dispatchEvent(ev);
+      (opts.dispatchOn ?? canvas).dispatchEvent(ev);
       return ev;
     };
 
@@ -1862,6 +1927,7 @@ function attachDragging() {
     fireDrag: first.fireDrag,
     dispose: first.dispose,
     uploads,
+    activities,
     stagingHandle,
     syncFs: conn.syncFs,
     attachMount: makeMount,
@@ -1871,7 +1937,16 @@ function attachDragging() {
 describe("BlitSurfaceCanvas drag-and-drop", () => {
   it("sends ENTER with the offered MIMEs and surface coords on dragenter", () => {
     const { sends, fireDrag, dispose } = attachDragging();
-    fireDrag("dragenter", { x: 100, y: 200, types: ["Files"] });
+    const enter = fireDrag("dragenter", {
+      x: 100,
+      y: 200,
+      types: ["Files"],
+    });
+    expect(enter.defaultPrevented).toBe(true);
+    expect(
+      (enter as unknown as { dataTransfer: DataTransfer }).dataTransfer
+        .dropEffect,
+    ).toBe("copy");
     expect(sends).toEqual([
       {
         kind: "enter",
@@ -1895,17 +1970,24 @@ describe("BlitSurfaceCanvas drag-and-drop", () => {
         { kind: "file", type: "image/png" },
         { kind: "string", type: "text/plain" },
         { kind: "file", type: "image/jpeg" },
-        { kind: "file", type: "" },
       ],
     });
     const enter = sends[0];
     if (enter.kind !== "enter") throw new Error("Expected an ENTER");
-    // File-kind items only; a typeless one falls back to octet-stream.
-    expect(enter.items).toEqual([
-      "image/png",
-      "image/jpeg",
-      "application/octet-stream",
-    ]);
+    // File-kind items only.
+    expect(enter.items).toEqual(["image/png", "image/jpeg"]);
+    dispose();
+  });
+
+  it("omits the hover plan instead of committing a typeless item to .bin", () => {
+    const { sends, fireDrag, dispose } = attachDragging();
+    fireDrag("dragenter", {
+      types: ["Files"],
+      items: [{ kind: "file", type: "" }],
+    });
+    const enter = sends[0];
+    if (enter.kind !== "enter") throw new Error("Expected an ENTER");
+    expect(enter.items).toBeUndefined();
     dispose();
   });
 
@@ -1938,19 +2020,31 @@ describe("BlitSurfaceCanvas drag-and-drop", () => {
     dispose();
   });
 
+  it("keeps claiming WebKit dragovers when their protected store goes empty", () => {
+    const { sends, fireDrag, dispose } = attachDragging();
+    fireDrag("dragenter", { x: 0, y: 0, types: ["Files"], items: [] });
+    // WebKit can expose Files at ENTER and no types/items while the drag
+    // store is protected.  Failing to prevent this DRAGOVER suppresses DROP.
+    const ev = fireDrag("dragover", {
+      x: 10,
+      y: 20,
+      types: [],
+      items: [],
+    });
+    expect(ev.defaultPrevented).toBe(true);
+    expect(sends.at(-1)).toEqual({ kind: "motion", id: 7, x: 10, y: 20 });
+    dispose();
+  });
+
   it("sends LEAVE only when the drag leaves the canvas itself", () => {
-    vi.useFakeTimers();
     const { sends, canvas, fireDrag, dispose } = attachDragging();
     fireDrag("dragenter", { x: 0, y: 0, types: ["Files"] });
     // Crossing into a child is not leaving the surface.
     fireDrag("dragleave", { types: ["Files"], relatedTarget: canvas });
     expect(sends).toHaveLength(1);
-    // A genuine exit follows the hover, not the ENTER by milliseconds (see
-    // the stale-LEAVE filter for the DOM enter-before-leave order).
-    vi.advanceTimersByTime(1000);
+    // Even an immediate genuine exit must close the remote session.
     fireDrag("dragleave", { types: ["Files"] });
     expect(sends.at(-1)).toEqual({ kind: "leave", id: 7 });
-    vi.useRealTimers();
     dispose();
   });
 
@@ -1958,7 +2052,6 @@ describe("BlitSurfaceCanvas drag-and-drop", () => {
     // DOM fires dragenter on the new target BEFORE dragleave on the old
     // one: crossing between two mounts of one surface would otherwise kill
     // the session the second ENTER just retargeted.
-    vi.useFakeTimers();
     const first = attachDragging();
     const second = first.attachMount();
     try {
@@ -1973,19 +2066,51 @@ describe("BlitSurfaceCanvas drag-and-drop", () => {
         relatedTarget: second.canvas,
       });
       expect(first.sends.filter((s) => s.kind === "leave")).toHaveLength(0);
-      // A genuine exit (after the hover) still leaves.
-      vi.advanceTimersByTime(1000);
+      // A genuine exit still leaves, even immediately.
       second.fireDrag("dragleave", { types: ["Files"] });
       expect(first.sends.at(-1)).toEqual({ kind: "leave", id: 7 });
     } finally {
-      vi.useRealTimers();
+      second.dispose();
+      first.dispose();
+    }
+  });
+
+  it("routes a document DROP to the most recently entered mount", async () => {
+    const first = attachDragging();
+    const second = first.attachMount();
+    try {
+      first.fireDrag("dragenter", { x: 1, y: 1, types: ["Files"] });
+      second.fireDrag("dragenter", { x: 22, y: 33, types: ["Files"] });
+      const file = new File([new Uint8Array([1])], "shot.png", {
+        type: "image/png",
+      });
+      first.fireDrag("drop", {
+        types: ["Files"],
+        files: [file],
+        dispatchOn: document.body,
+      });
+      await settle();
+
+      const drops = first.sends.filter((send) => send.kind === "drop");
+      expect(drops).toHaveLength(1);
+      expect(drops[0]).toEqual(expect.objectContaining({ x: 22, y: 33 }));
+    } finally {
       second.dispose();
       first.dispose();
     }
   });
 
   it("stages dropped files, then sends DROP naming them with empty data", async () => {
-    const { sends, fireDrag, dispose, uploads, syncFs } = attachDragging();
+    const { sends, fireDrag, dispose, uploads, syncFs, activities } =
+      attachDragging();
+    const activitySnapshots: { completed?: number; total?: number }[][] = [];
+    activities.subscribe(() =>
+      activitySnapshots.push(
+        activities
+          .getSnapshot()
+          .map(({ completed, total }) => ({ completed, total })),
+      ),
+    );
     fireDrag("dragenter", { x: 100, y: 200, types: ["Files"] });
     fireDrag("drop", {
       x: 100,
@@ -2006,6 +2131,9 @@ describe("BlitSurfaceCanvas drag-and-drop", () => {
       expect.objectContaining({ staging: true }),
     );
     expect(uploads.map((u) => u.path)).toEqual(["0.png"]);
+    expect(activitySnapshots).toContainEqual([{ completed: 0, total: 2 }]);
+    expect(activitySnapshots).toContainEqual([{ completed: 2, total: 2 }]);
+    expect(activities.getSnapshot()).toEqual([]);
 
     const drop = sends.find((s) => s.kind === "drop");
     if (!drop || drop.kind !== "drop") throw new Error("Expected a DROP");
@@ -2040,7 +2168,47 @@ describe("BlitSurfaceCanvas drag-and-drop", () => {
     dispose();
   });
 
-  it("stages each file under the planned name of its own MIME type", async () => {
+  it("does not land the remote drop until the planned file is populated", async () => {
+    const { sends, fireDrag, dispose, stagingHandle, activities } =
+      attachDragging();
+    let finishUpload: () => void = () => {};
+    const uploadPending = new Promise<void>((resolve) => {
+      finishUpload = resolve;
+    });
+    stagingHandle.upload.mockImplementation(() =>
+      uploadPending.then(() => ({})),
+    );
+
+    try {
+      fireDrag("dragenter", {
+        x: 1,
+        y: 2,
+        types: ["Files"],
+        items: [{ kind: "file", type: "image/png" }],
+      });
+      fireDrag("drop", {
+        x: 1,
+        y: 2,
+        types: ["Files"],
+        files: [new File([new Uint8Array([0x89, 0x50])], "shot.png")],
+      });
+      await settle();
+
+      expect(sends.some((send) => send.kind === "drop")).toBe(false);
+      expect(activities.getSnapshot()).toEqual([
+        expect.objectContaining({ kind: "upload", completed: 0, total: 2 }),
+      ]);
+
+      finishUpload();
+      await settle();
+      expect(sends.some((send) => send.kind === "drop")).toBe(true);
+      expect(activities.getSnapshot()).toEqual([]);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("stages each unplanned file with a useful MIME or filename extension", async () => {
     const { sends, fireDrag, dispose, uploads } = attachDragging();
     fireDrag("drop", {
       x: 1,
@@ -2057,22 +2225,21 @@ describe("BlitSurfaceCanvas drag-and-drop", () => {
     // The staging open plus three sequential uploads outlast one drain.
     await settle();
     await settle();
-    expect(uploads.map((u) => u.path)).toEqual(["0.png", "1.jpg", "2.bin"]);
+    expect(uploads.map((u) => u.path)).toEqual(["0.png", "1.jpg", "2.zip"]);
     const drop = sends.find((s) => s.kind === "drop");
     if (!drop || drop.kind !== "drop") throw new Error("Expected a DROP");
     expect(drop.items.map((item) => item.name)).toEqual([
       "0.png",
       "1.jpg",
-      "2.bin",
+      "2.zip",
     ]);
     dispose();
   });
 
-  it("uses the hover plan when the file MIME changes at drop", async () => {
+  it("uses the materialized MIME when a typeless hover item becomes PNG", async () => {
     const { sends, fireDrag, dispose, uploads } = attachDragging();
-    // A typeless promise is announced as 0.bin.  The materialized File may
-    // reveal image/png after release, but the URI already served to the app
-    // still names 0.bin and therefore remains authoritative.
+    // Do not announce 0.bin during hover.  Once the File materializes, its
+    // MIME gives the drop the useful 0.png name.
     fireDrag("dragenter", {
       types: ["Files"],
       items: [{ kind: "file", type: "" }],
@@ -2085,12 +2252,34 @@ describe("BlitSurfaceCanvas drag-and-drop", () => {
     });
     await settle();
 
-    expect(uploads.map((u) => u.path)).toEqual(["0.bin"]);
+    const enter = sends[0];
+    if (enter.kind !== "enter") throw new Error("Expected an ENTER");
+    expect(enter.items).toBeUndefined();
+    expect(uploads.map((u) => u.path)).toEqual(["0.png"]);
     const drop = sends.find((s) => s.kind === "drop");
     if (!drop || drop.kind !== "drop") throw new Error("Expected a DROP");
     expect(drop.items[0]).toEqual(
-      expect.objectContaining({ mime: "image/png", name: "0.bin" }),
+      expect.objectContaining({ mime: "image/png", name: "0.png" }),
     );
+    dispose();
+  });
+
+  it("keeps a screenshot filename extension when its MIME stays empty", async () => {
+    const { sends, fireDrag, dispose, uploads } = attachDragging();
+    fireDrag("dragenter", {
+      types: ["Files"],
+      items: [{ kind: "file", type: "" }],
+    });
+    fireDrag("drop", {
+      types: ["Files"],
+      files: [new File([new Uint8Array([1])], "Screenshot.PNG")],
+    });
+    await settle();
+
+    expect(uploads.map((u) => u.path)).toEqual(["0.png"]);
+    const drop = sends.find((s) => s.kind === "drop");
+    if (!drop || drop.kind !== "drop") throw new Error("Expected a DROP");
+    expect(drop.items[0].name).toBe("0.png");
     dispose();
   });
 
@@ -2136,6 +2325,89 @@ describe("BlitSurfaceCanvas drag-and-drop", () => {
     expect(enter.items).toEqual(["image/png"]);
     expect(uploads.map((u) => u.path)).toEqual(["0.png"]);
     expect(sends.find((s) => s.kind === "drop")).toBeTruthy();
+    dispose();
+  });
+
+  it("finishes an iPad file drop when only files are exposed at DROP", async () => {
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      platform: "MacIntel",
+      maxTouchPoints: 5,
+    });
+    const { sends, fireDrag, dispose, uploads } = attachDragging();
+    try {
+      // WebKit's hover-time DataTransfer can carry only the Files marker.
+      // A provisional file lets Chromium deliver remote dragenter without
+      // pretending to know which representation DROP will materialize.
+      fireDrag("dragenter", { x: 1, y: 2, types: ["Files"], items: [] });
+      const enter = sends[0];
+      if (enter.kind !== "enter") throw new Error("Expected an ENTER");
+      expect(enter.items).toEqual(["application/octet-stream"]);
+
+      // The real promised representation has no name or MIME. Its signature
+      // is JPEG, not the PNG the hover-only implementation used to assume.
+      const file = new File(
+        [new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0])],
+        "",
+      );
+      // At DROP, the concrete FileList is readable even when types/items are
+      // empty.  The accepted ENTER still has to terminate on the wire.
+      const drop = fireDrag("drop", {
+        x: 1,
+        y: 2,
+        types: [],
+        items: [],
+        files: [file],
+      });
+      await settle();
+      await settle();
+
+      expect(drop.defaultPrevented).toBe(true);
+      expect(uploads.map((u) => u.path)).toEqual(["0.jpg"]);
+      const enters = sends.filter((send) => send.kind === "enter");
+      expect(enters).toHaveLength(2);
+      expect(enters[1]).toEqual(
+        expect.objectContaining({ items: ["image/jpeg"] }),
+      );
+      const landed = sends.find((send) => send.kind === "drop");
+      expect(landed).toEqual(
+        expect.objectContaining({
+          items: [
+            expect.objectContaining({ mime: "image/jpeg", name: "0.jpg" }),
+          ],
+        }),
+      );
+    } finally {
+      dispose();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("finishes an iPad DROP retargeted to the document", async () => {
+    const { sends, fireDrag, dispose, uploads } = attachDragging();
+    fireDrag("dragenter", { x: 123, y: 234, types: ["Files"], items: [] });
+    const file = new File([new Uint8Array([0x89, 0x50])], "shot.png", {
+      type: "image/png",
+    });
+
+    // Some iPad providers end the gesture above the canvas and report 0,0.
+    // The window capture fallback must still claim the drop and use the last
+    // valid surface position while DataTransfer is readable.
+    const drop = fireDrag("drop", {
+      x: 0,
+      y: 0,
+      types: [],
+      items: [],
+      files: [file],
+      dispatchOn: document.body,
+    });
+    await settle();
+
+    expect(drop.defaultPrevented).toBe(true);
+    expect(uploads.map((u) => u.path)).toEqual(["0.png"]);
+    expect(sends.find((s) => s.kind === "drop")).toEqual(
+      expect.objectContaining({ x: 123, y: 234 }),
+    );
     dispose();
   });
 
@@ -2198,6 +2470,7 @@ describe("BlitSurfaceCanvas drag-and-drop", () => {
     // never goes on the wire.  Only inline items (dragged text) are capped;
     // files stage through the upload pump and carry no inline bytes.
     expect(sends.filter((s) => s.kind === "drop")).toHaveLength(0);
+    expect(sends.at(-1)).toEqual({ kind: "cancel" });
     expect(warn).toHaveBeenCalled();
     dispose();
   });

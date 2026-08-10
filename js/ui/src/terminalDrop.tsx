@@ -94,12 +94,6 @@ export function TerminalDropTarget(props: {
   children: JSX.Element;
 }) {
   const [dragOver, setDragOver] = createSignal(false);
-  const [current, setCurrent] = createSignal<{
-    name: string;
-    pct: number;
-    index: number;
-    count: number;
-  } | null>(null);
   const [error, setError] = createSignal<string | null>(null);
 
   let enterDepth = 0;
@@ -181,33 +175,42 @@ export function TerminalDropTarget(props: {
   async function uploadFiles(files: File[], dirsSkipped: boolean) {
     const sid = props.sessionId;
     const pasted: string[] = [];
+    const totalBytes = files.reduce((total, file) => total + file.size, 0);
+    const activity = props.workspace.activities.begin({
+      kind: "upload",
+      label:
+        files.length === 1
+          ? (baseName(files[0].name) ?? fallbackName(files[0].type, 0))
+          : `${files.length} files`,
+      completed: 0,
+      total: totalBytes,
+    });
+    let completedBytes = 0;
     try {
       const handle = await handleFor(sid);
       if (!handle) return;
+      activity.update({ target: handle.root });
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
         // File promises (the screenshot thumbnail) can arrive nameless —
         // fall back to a MIME-derived name rather than skipping the file.
         const name = baseName(file.name) ?? fallbackName(file.type, i);
-        setCurrent({ name, pct: 0, index: i + 1, count: files.length });
+        activity.update({ label: name, completed: completedBytes });
         await handle.upload(name, file, {
           onProgress: (uploaded, total) =>
-            setCurrent({
-              name,
-              pct: total > 0 ? Math.round((uploaded / total) * 100) : 100,
-              index: i + 1,
-              count: files.length,
+            activity.update({
+              completed: completedBytes + uploaded,
+              total: totalBytes || total,
             }),
         });
+        completedBytes += file.size;
         pasted.push(name);
       }
-      setCurrent(null);
       if (dirsSkipped) showError(t("terminalDrop.noDirs"));
       const surface = props.surface();
       if (surface && pasted.length > 0)
         surface.pasteText(pasted.map(shellQuote).join(" "));
     } catch (err) {
-      setCurrent(null);
       // The failure may have killed the cached sync (connection lost,
       // server closed it) — drop it so the next drop reopens fresh.
       const h = handles.get(sid);
@@ -216,6 +219,8 @@ export function TerminalDropTarget(props: {
         handles.delete(sid);
       }
       showError(err instanceof Error ? err.message : String(err));
+    } finally {
+      activity.finish();
     }
   }
 
@@ -316,24 +321,6 @@ export function TerminalDropTarget(props: {
         >
           <div style={banner()}>{hoverLabel()}</div>
         </div>
-      </Show>
-      <Show when={current()}>
-        {(u) => (
-          <div
-            style={{
-              ...banner(),
-              position: "absolute",
-              bottom: "8px",
-              left: "50%",
-              transform: "translateX(-50%)",
-              "pointer-events": "none",
-              "z-index": z.exitedBanner,
-            }}
-          >
-            {tp("terminalDrop.uploading", { name: u().name, pct: u().pct })}
-            {u().count > 1 ? ` (${u().index}/${u().count})` : ""}
-          </div>
-        )}
       </Show>
       <Show when={error()}>
         <div

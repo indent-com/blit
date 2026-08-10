@@ -31,6 +31,7 @@ import type {
   ConnectionId,
   LinkHover,
   UrlAssessment,
+  BlitActivity,
 } from "@blit-sh/core";
 import type { ConnectionSpec } from "./App";
 import { createMetrics } from "./createMetrics";
@@ -362,6 +363,13 @@ function WorkspaceScreen(props: {
   const workspace = createBlitWorkspace();
   const wsState = createBlitWorkspaceState(workspace);
   const sessions = createBlitSessions(workspace);
+  const [activities, setActivities] = createSignal<readonly BlitActivity[]>(
+    workspace.activities.getSnapshot(),
+  );
+  const unsubscribeActivities = workspace.activities.subscribe(() =>
+    setActivities(workspace.activities.getSnapshot()),
+  );
+  onCleanup(unsubscribeActivities);
 
   /** Connection ID labels from the CLI config — reactive. */
   const connectionLabels = createMemo(
@@ -4651,6 +4659,7 @@ function WorkspaceScreen(props: {
           }}
         >
           <StatusBar
+            activities={activities()}
             sessions={sessions()}
             surfaceCount={surfaces().length}
             // Displayed panes plus docked tabs: backgroundTiles already

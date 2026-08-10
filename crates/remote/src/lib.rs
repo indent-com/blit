@@ -3496,6 +3496,11 @@ pub fn surface_drag_planned_name(index: usize, mime: &str) -> String {
         "image/jpeg" => "jpg",
         "image/webp" => "webp",
         "image/gif" => "gif",
+        "image/avif" => "avif",
+        "image/heic" => "heic",
+        "image/heif" => "heif",
+        "image/tiff" => "tiff",
+        "image/bmp" => "bmp",
         _ => "bin",
     };
     format!("{index}.{ext}")
@@ -4566,8 +4571,13 @@ mod tests {
         assert_eq!(surface_drag_planned_name(1, "image/jpeg"), "1.jpg");
         assert_eq!(surface_drag_planned_name(2, "image/webp"), "2.webp");
         assert_eq!(surface_drag_planned_name(3, "image/gif"), "3.gif");
-        assert_eq!(surface_drag_planned_name(4, "application/pdf"), "4.bin");
-        assert_eq!(surface_drag_planned_name(5, "text/plain"), "5.bin");
+        assert_eq!(surface_drag_planned_name(4, "image/avif"), "4.avif");
+        assert_eq!(surface_drag_planned_name(5, "image/heic"), "5.heic");
+        assert_eq!(surface_drag_planned_name(6, "image/heif"), "6.heif");
+        assert_eq!(surface_drag_planned_name(7, "image/tiff"), "7.tiff");
+        assert_eq!(surface_drag_planned_name(8, "image/bmp"), "8.bmp");
+        assert_eq!(surface_drag_planned_name(9, "application/pdf"), "9.bin");
+        assert_eq!(surface_drag_planned_name(10, "text/plain"), "10.bin");
     }
 
     /// `[0x38][surface_id:2][x:2][y:2][item_count:2][items]` with

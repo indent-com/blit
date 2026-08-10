@@ -546,6 +546,13 @@ export interface BlitSurfaceCanvasOptions {
   connectionId: ConnectionId;
   surfaceId: number;
   /**
+   * Whether this mount is expected to drive the surface size.  This lets an
+   * already-laid-out passive view put its scaled target on the very first
+   * subscribe, while preserving the eager unscaled subscribe for a pane
+   * whose framework binding is about to call `setDisplaySize`.
+   */
+  resizable?: boolean;
+  /**
    * Whether this mount owns a server-side video subscription.  Cached-only
    * mounts still paint frames produced by another live view from the shared
    * SurfaceStore, but never create an encoder themselves.  Defaults to true.
@@ -658,40 +665,57 @@ function clipboardImage(dt: DataTransfer | null): File | null {
  */
 const MAX_DND_BYTES = 15 * 1024 * 1024;
 
-/** A dragleave this soon after a SURFACE_DRAG_ENTER for the same surface
- * is not an exit: DOM fires dragenter on the new target *before* dragleave
- * on the old one, so crossing between two mounts of one surface delivers
- * the surface's ENTER and then the old mount's stale LEAVE — which would
- * kill the session the ENTER just retargeted (and the drop with it).  A
- * genuine exit follows the last ENTER by the whole hover, not by
- * milliseconds.  The cost of dropping a genuinely instant exit is benign:
- * the session stays open, the next ENTER retargets it, and a DROP still
- * lands. */
-const DRAG_LEAVE_STALE_MS = 100;
+/** The most recently entered canvas for a connection.  A WebKit drop can
+ *  be retargeted from the canvas to the document, while a stale mount may
+ *  still think it is active because DOM enter precedes leave. */
+const activeBrowserDragCanvas = new WeakMap<
+  BlitConnection,
+  BlitSurfaceCanvas
+>();
 
-/** Per (connection, surface): when the last SURFACE_DRAG_ENTER went out. */
-const lastDragEnterAt = new WeakMap<BlitConnection, Map<number, number>>();
+/** One DROP is observed by both the window fallback and canvas. */
+const DROP_CLAIMED = Symbol("blit-surface-drop-claimed");
 
-function recordDragEnter(conn: BlitConnection, surfaceId: number): void {
-  let bySurface = lastDragEnterAt.get(conn);
-  if (!bySurface) {
-    bySurface = new Map();
-    lastDragEnterAt.set(conn, bySurface);
-  }
-  bySurface.set(surfaceId, Date.now());
-}
-
-/** One MIME per file-kind drag item, in item order — readable during
- *  hover, unlike the files themselves.  Undefined for a drag with no file
- *  items: text drags send no items trailer. */
+/** One known image MIME per file-kind drag item, in item order — readable
+ *  during hover, unlike the files themselves.  The plan is all-or-nothing:
+ *  a typeless/unknown WebKit item would commit its visible URI to `.bin`, so
+ *  omit the trailer and derive a useful name once the File materializes.
+ *
+ *  iPad screenshots are the exception: WebKit exposes only the `Files`
+ *  marker during hover, then materializes the real representation at DROP.
+ *  Without an item plan the compositor must park Chromium's eager URI read,
+ *  so the remote page does not receive dragenter until after release.  Use a
+ *  provisional single-file plan for hover; DROP replaces it with a second
+ *  ENTER carrying the materialized MIME before uploading the file. */
 function dragFileItemMimes(dt: DataTransfer | null): string[] | undefined {
   if (!dt) return undefined;
+  const items = Array.from(dt.items ?? []).filter(
+    (item) => item.kind === "file",
+  );
   const mimes: string[] = [];
-  for (const item of Array.from(dt.items ?? [])) {
-    if (item.kind !== "file") continue;
-    mimes.push(item.type || "application/octet-stream");
+  for (const item of items) {
+    const mime = normalizedMime(item.type);
+    if (!plannedDropExtension(mime)) {
+      return isIPadOS() && items.length === 1
+        ? ["application/octet-stream"]
+        : undefined;
+    }
+    mimes.push(mime);
   }
-  return mimes.length > 0 ? mimes : undefined;
+  if (mimes.length > 0) return mimes;
+  return isIPadOS() && Array.from(dt.types ?? []).includes("Files")
+    ? ["application/octet-stream"]
+    : undefined;
+}
+
+/** Modern iPadOS identifies Safari as MacIntel; touch-point count separates
+ *  it from desktop Safari without relying on the mutable user-agent string. */
+function isIPadOS(): boolean {
+  const platform = navigator.platform ?? "";
+  return (
+    /^iPad$/i.test(platform) ||
+    (platform === "MacIntel" && navigator.maxTouchPoints > 1)
+  );
 }
 
 /**
@@ -706,11 +730,21 @@ function dragFileItemMimes(dt: DataTransfer | null): string[] | undefined {
 function dragOfferMimes(dt: DataTransfer | null): string[] | null {
   if (!dt) return null;
   const types = Array.from(dt.types ?? []);
-  if (types.includes("Files") || dragHasFileItem(dt))
-    return ["text/uri-list", "application/octet-stream"];
+  if (dragHasFiles(dt)) return ["text/uri-list", "application/octet-stream"];
   if (types.includes("text/plain"))
     return ["text/plain;charset=utf-8", "text/plain"];
   return null;
+}
+
+/** True when the transfer exposes a file through any browser API.  WebKit
+ *  can keep `items` empty during hover and expose only `files` at DROP, so
+ *  no one collection is authoritative for the whole gesture. */
+function dragHasFiles(dt: DataTransfer): boolean {
+  return (
+    Array.from(dt.types ?? []).includes("Files") ||
+    (dt.files?.length ?? 0) > 0 ||
+    dragHasFileItem(dt)
+  );
 }
 
 /** True when any drag item is a file (available even when types omit
@@ -735,25 +769,176 @@ function droppedFiles(dt: DataTransfer): File[] {
   return files;
 }
 
-/** The staging path for drag item `index` with MIME `mime`, derived
- *  identically on the server from the item list ENTER carried: the
- *  text/uri-list served during hover names exactly these paths, so the
- *  DROP must stage to them.  Real filenames are lost in the offered
- *  uri-list (a dropped image shows as e.g. `0.png`) — the accepted
- *  trade-off for the remote app's drop UI appearing before
- *  mouse-release. */
+function normalizedMime(mime: string): string {
+  return mime.split(";", 1)[0].trim().toLowerCase();
+}
+
+/** Extensions both protocol peers can derive from hover-time MIME alone. */
+function plannedDropExtension(mime: string): string | null {
+  switch (normalizedMime(mime)) {
+    case "image/png":
+      return "png";
+    case "image/jpeg":
+      return "jpg";
+    case "image/webp":
+      return "webp";
+    case "image/gif":
+      return "gif";
+    case "image/avif":
+      return "avif";
+    case "image/heic":
+      return "heic";
+    case "image/heif":
+      return "heif";
+    case "image/tiff":
+      return "tiff";
+    case "image/bmp":
+      return "bmp";
+    default:
+      return null;
+  }
+}
+
+function mimeFromDropName(name: string): string | null {
+  const dot = name.lastIndexOf(".");
+  const ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
+  switch (ext) {
+    case "png":
+      return "image/png";
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    case "webp":
+      return "image/webp";
+    case "gif":
+      return "image/gif";
+    case "avif":
+      return "image/avif";
+    case "heic":
+      return "image/heic";
+    case "heif":
+      return "image/heif";
+    case "tif":
+    case "tiff":
+      return "image/tiff";
+    case "bmp":
+      return "image/bmp";
+    default:
+      return null;
+  }
+}
+
+/** Determine the representation WebKit finally materialized.  A promised
+ *  iPad image can have neither a useful MIME nor a name, so fall back to the
+ *  file signature instead of assigning an extension by assumption. */
+function materializedDropMimeFromMetadata(file: File): string | null {
+  const declared = normalizedMime(file.type);
+  if (plannedDropExtension(declared)) return declared;
+  const named = mimeFromDropName(file.name);
+  if (named) return named;
+  if (declared && !declared.startsWith("image/")) return declared;
+  const dot = file.name.lastIndexOf(".");
+  if (dot >= 0 && /^[a-z0-9]{1,10}$/i.test(file.name.slice(dot + 1)))
+    return declared || "application/octet-stream";
+  return null;
+}
+
+async function materializedDropMime(file: File): Promise<string> {
+  const declared = normalizedMime(file.type);
+  const known = materializedDropMimeFromMetadata(file);
+  if (known) return known;
+
+  const bytes = new Uint8Array(await file.slice(0, 64).arrayBuffer());
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  )
+    return "image/png";
+  if (
+    bytes.length >= 3 &&
+    bytes[0] === 0xff &&
+    bytes[1] === 0xd8 &&
+    bytes[2] === 0xff
+  )
+    return "image/jpeg";
+  const ascii = (start: number, end: number) =>
+    String.fromCharCode(...bytes.subarray(start, end));
+  if (
+    bytes.length >= 6 &&
+    (ascii(0, 6) === "GIF87a" || ascii(0, 6) === "GIF89a")
+  )
+    return "image/gif";
+  if (bytes.length >= 12 && ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP")
+    return "image/webp";
+  if (
+    bytes.length >= 4 &&
+    ((bytes[0] === 0x49 &&
+      bytes[1] === 0x49 &&
+      bytes[2] === 0x2a &&
+      bytes[3] === 0) ||
+      (bytes[0] === 0x4d &&
+        bytes[1] === 0x4d &&
+        bytes[2] === 0 &&
+        bytes[3] === 0x2a))
+  )
+    return "image/tiff";
+  if (bytes.length >= 2 && ascii(0, 2) === "BM") return "image/bmp";
+  if (bytes.length >= 12 && ascii(4, 8) === "ftyp") {
+    const brands: string[] = [];
+    for (let offset = 8; offset + 4 <= bytes.length; offset += 4)
+      brands.push(ascii(offset, offset + 4));
+    if (brands.some((brand) => brand === "avif" || brand === "avis"))
+      return "image/avif";
+    if (
+      brands.some((brand) =>
+        ["heic", "heix", "hevc", "hevx", "heim", "heis"].includes(brand),
+      )
+    )
+      return "image/heic";
+    if (brands.some((brand) => brand === "mif1" || brand === "msf1"))
+      return "image/heif";
+  }
+  return declared || "application/octet-stream";
+}
+
+/** The staging path for a hover plan, derived identically on the server. */
 function plannedDropName(mime: string, index: number): string {
-  const ext =
-    mime === "image/png"
-      ? "png"
-      : mime === "image/jpeg"
-        ? "jpg"
-        : mime === "image/webp"
-          ? "webp"
-          : mime === "image/gif"
-            ? "gif"
-            : "bin";
+  const ext = plannedDropExtension(mime) ?? "bin";
   return `${index}.${ext}`;
+}
+
+/** Name an item that had no hover plan.  At DROP the browser may finally
+ *  reveal a MIME and filename; prefer a known image MIME, then retain a safe
+ *  filename extension (the iPad screenshot path), then use a simple image
+ *  subtype before conceding `.bin`. */
+function materializedDropName(file: File, index: number): string {
+  let ext = plannedDropExtension(file.type);
+  if (!ext) {
+    const dot = file.name.lastIndexOf(".");
+    const candidate = dot >= 0 ? file.name.slice(dot + 1).toLowerCase() : "";
+    if (/^[a-z0-9]{1,10}$/.test(candidate)) ext = candidate;
+  }
+  if (!ext) {
+    const mime = normalizedMime(file.type);
+    if (mime.startsWith("image/")) {
+      const subtype = mime.slice("image/".length);
+      const candidate =
+        subtype === "svg+xml"
+          ? "svg"
+          : subtype === "x-icon" || subtype === "vnd.microsoft.icon"
+            ? "ico"
+            : subtype;
+      if (/^[a-z0-9]{1,10}$/.test(candidate)) ext = candidate;
+    }
+  }
+  return `${index}.${ext ?? "bin"}`;
 }
 
 /**
@@ -771,6 +956,7 @@ export class BlitSurfaceCanvas {
   private _connectionId: ConnectionId;
   private _surfaceId: number;
   private _live: boolean;
+  private _expectsDisplaySize: boolean;
 
   private container: HTMLElement | null = null;
   private canvas: HTMLCanvasElement | null = null;
@@ -1005,6 +1191,13 @@ export class BlitSurfaceCanvas {
   /** True between a sent DRAG_ENTER and its LEAVE / DROP / CANCEL — the
    *  compositor has a live wl_data_device drag session we are driving. */
   private dragActive = false;
+  /** The active ENTER was a file drag.  Keep this independently of the
+   *  current event's DataTransfer: WebKit may expose Files at ENTER, an
+   *  empty protected store at DRAGOVER, and concrete files only at DROP. */
+  private dragFilesActive = false;
+  /** Last valid surface coordinates seen during this drag.  iPad WebKit can
+   *  retarget DROP to the document and report its client position as 0,0. */
+  private dragLastPoint: { x: number; y: number } | null = null;
   /** Staging names announced by the most recent file ENTER, in item order.
    *  These names are authoritative at DROP: `DataTransferItem.type` is
    *  visible during hover, while `File.type` is read after release and can
@@ -1024,6 +1217,7 @@ export class BlitSurfaceCanvas {
     this._connectionId = options.connectionId;
     this._surfaceId = options.surfaceId;
     this._live = options.live !== false;
+    this._expectsDisplaySize = options.resizable === true;
   }
 
   // -----------------------------------------------------------------------
@@ -1144,6 +1338,23 @@ export class BlitSurfaceCanvas {
    */
   private observePresentBox(container: HTMLElement): void {
     if (typeof ResizeObserver === "undefined") return;
+    // ResizeObserver runs after layout, but attach() subscribes immediately.
+    // A sidebar card is already laid out by this point, so seed its box
+    // synchronously and make the first subscribe scaled.  Without this every
+    // card briefly asked for a native stream, then replaced it with a
+    // ~512 px stream in the observer callback: two encoder builds and a
+    // visible native↔thumbnail resolution flip on every fresh load.
+    //
+    // Do not do this for a resizable pane.  Its binding calls setDisplaySize
+    // immediately after attach; keeping the initial request unscaled avoids
+    // creating the inverse thumbnail→native churn there.
+    if (!this._expectsDisplaySize) {
+      const rect = container.getBoundingClientRect();
+      const dpr = (globalThis.devicePixelRatio ?? 1) || 1;
+      const width = Math.round(rect.width * dpr);
+      const height = Math.round(rect.height * dpr);
+      if (width > 0 && height > 0) this._presentBox = { width, height };
+    }
     const observer = new ResizeObserver((entries) => {
       const entry = entries[entries.length - 1];
       const box = entry && devicePixelBox(entry);
@@ -1910,14 +2121,29 @@ export class BlitSurfaceCanvas {
     canvas.addEventListener("dragover", this.boundDragOver);
     canvas.addEventListener("dragleave", this.boundDragLeave);
     canvas.addEventListener("drop", this.boundDrop);
+    // iPad WebKit can deliver the terminal DROP above the canvas (usually
+    // document/body).  Capture it at the window while DataTransfer is still
+    // readable; DROP_CLAIMED keeps the canvas listener from handling it twice.
+    window.addEventListener("drop", this.boundDrop, true);
     // Belt and braces: an OS-source drag usually never fires dragend (it
     // belongs to the drag source), but if one does while our session is
     // still open, it means the drag was abandoned without a drop.
     this.boundDragEnd = () => {
       if (!this.dragActive) return;
+      const conn = this.getConn();
+      const current = conn ? activeBrowserDragCanvas.get(conn) : undefined;
       this.dragActive = false;
+      this.dragFilesActive = false;
+      this.dragLastPoint = null;
       this.dragPlannedNames = null;
-      this.getConn()?.sendSurfaceDragCancel();
+      // Every mount observes window.dragend.  A stale previous mount must
+      // clear only its local flag, not cancel the newer mount's session.
+      if (conn && current === this) {
+        activeBrowserDragCanvas.delete(conn);
+        conn.sendSurfaceDragCancel();
+      } else if (conn && !current) {
+        conn.sendSurfaceDragCancel();
+      }
     };
     window.addEventListener("dragend", this.boundDragEnd);
 
@@ -2023,13 +2249,24 @@ export class BlitSurfaceCanvas {
     if (this.boundDragLeave)
       canvas.removeEventListener("dragleave", this.boundDragLeave);
     if (this.boundDrop) canvas.removeEventListener("drop", this.boundDrop);
+    if (this.boundDrop)
+      window.removeEventListener("drop", this.boundDrop, true);
     if (this.boundDragEnd)
       window.removeEventListener("dragend", this.boundDragEnd);
     // Disposing mid-drag must not leave the compositor session dangling.
     if (this.dragActive) {
       this.dragActive = false;
+      this.dragFilesActive = false;
+      this.dragLastPoint = null;
       this.dragPlannedNames = null;
-      this.getConn()?.sendSurfaceDragCancel();
+      const conn = this.getConn();
+      const current = conn ? activeBrowserDragCanvas.get(conn) : undefined;
+      if (conn && current === this) {
+        activeBrowserDragCanvas.delete(conn);
+        conn.sendSurfaceDragCancel();
+      } else if (conn && !current) {
+        conn.sendSurfaceDragCancel();
+      }
     }
     this._pendingPaste = null;
     this._pendingPasteFlush = null;
@@ -2576,6 +2813,13 @@ export class BlitSurfaceCanvas {
     // a held-back Alt press belongs ahead of the axis events.  No-op when
     // no Alt press is pending dead-key detection.
     this.flushPendingAlt(conn);
+    // Axis routing follows the compositor's last pointer-motion hit test,
+    // not the toplevel id carried by the axis message.  Re-seed it from the
+    // wheel's own coordinates before every delta: a popup can disappear
+    // under a stationary cursor (including halfway through momentum), which
+    // otherwise leaves no live surface to receive this or any later scroll.
+    // Touch scrolling does the same when the drag first becomes a scroll.
+    this.sendPointerAt(e.clientX, e.clientY, SURFACE_POINTER_MOVE, 0);
 
     // The latch has to win before the detent maths below, not just when
     // labelling the source, or a smooth event ends up carrying notches.
@@ -2727,7 +2971,15 @@ export class BlitSurfaceCanvas {
     if (!conn || !this.surface || !this._displaySize) return;
     const point = this.surfacePointFromClient(e.clientX, e.clientY);
     if (!point) return;
+    // WebKit's target contract asks both ENTER and OVER to prevent default.
+    // In particular, accepting only OVER is not enough for every iPad drag
+    // provider to deliver the terminal DROP.
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
     this.dragActive = true;
+    this.dragFilesActive = !!e.dataTransfer && dragHasFiles(e.dataTransfer);
+    this.dragLastPoint = point;
+    activeBrowserDragCanvas.set(conn, this);
     const itemMimes = dragFileItemMimes(e.dataTransfer);
     this.dragPlannedNames =
       itemMimes?.map((mime, index) => plannedDropName(mime, index)) ?? null;
@@ -2744,11 +2996,14 @@ export class BlitSurfaceCanvas {
       mimes,
       itemMimes,
     );
-    recordDragEnter(conn, this._surfaceId);
   }
 
   private handleDragOver(e: DragEvent): void {
-    if (!dragOfferMimes(e.dataTransfer)) return;
+    // Once ENTER claimed a native drag, keep claiming it.  WebKit's
+    // protected DataTransfer view is not stable across the gesture; asking
+    // it to classify every DRAGOVER can skip preventDefault(), which makes
+    // the browser suppress DROP and strands the Wayland session at ENTER.
+    if (!this.dragActive && !dragOfferMimes(e.dataTransfer)) return;
     // Required for `drop` to fire at all.  We always allow: whether the
     // remote app accepts the offered types is not reported back.
     e.preventDefault();
@@ -2757,6 +3012,7 @@ export class BlitSurfaceCanvas {
     if (!conn || !this.surface || !this._displaySize) return;
     const point = this.surfacePointFromClient(e.clientX, e.clientY);
     if (!point) return;
+    this.dragLastPoint = point;
     // Unthrottled, like pointer motion — the events fire continuously.
     conn.sendSurfaceDragMotion(this._surfaceId, point.x, point.y);
   }
@@ -2767,36 +3023,75 @@ export class BlitSurfaceCanvas {
     // only leaving the canvas itself ends the session.
     if (e.relatedTarget && this.canvas?.contains(e.relatedTarget as Node))
       return;
-    // And it fires *after* the new target's dragenter, so crossing between
-    // two mounts of one surface produces ENTER then a stale LEAVE that
-    // would kill the freshly retargeted session — drop those (see
-    // DRAG_LEAVE_STALE_MS).
+    // It fires *after* the new target's dragenter.  The latest canvas map
+    // distinguishes that stale old-mount LEAVE from a real, possibly very
+    // quick exit; never discard a genuine exit on timing alone.
     const conn = this.getConn();
-    const enteredAt = conn
-      ? lastDragEnterAt.get(conn)?.get(this._surfaceId)
-      : undefined;
-    if (enteredAt !== undefined && Date.now() - enteredAt < DRAG_LEAVE_STALE_MS)
+    const current = conn ? activeBrowserDragCanvas.get(conn) : undefined;
+    if (current && current !== this) {
+      this.dragActive = false;
+      this.dragFilesActive = false;
+      this.dragLastPoint = null;
+      this.dragPlannedNames = null;
       return;
+    }
     this.dragActive = false;
+    this.dragFilesActive = false;
+    this.dragLastPoint = null;
     this.dragPlannedNames = null;
+    if (conn && activeBrowserDragCanvas.get(conn) === this)
+      activeBrowserDragCanvas.delete(conn);
     conn?.sendSurfaceDragLeave(this._surfaceId);
   }
 
   private handleDrop(e: DragEvent): void {
+    const claimed = e as DragEvent & { [DROP_CLAIMED]?: true };
+    if (claimed[DROP_CLAIMED]) return;
     const dt = e.dataTransfer;
-    if (!dragOfferMimes(dt)) return;
+    const conn = this.getConn();
+    const current = conn ? activeBrowserDragCanvas.get(conn) : undefined;
+    // Several mounts can briefly retain dragActive across enter-before-leave.
+    // The most recently entered one owns a document-retargeted DROP.
+    if (current && current !== this) return;
+    const targetIsThisCanvas =
+      !!this.canvas && e.composedPath().includes(this.canvas);
+    // A DROP for a session we entered is ours even if WebKit now presents a
+    // different (or empty) DataTransfer view.  Every accepted ENTER must end
+    // in DROP or CANCEL; returning here leaves the remote app looking as if
+    // the user never released the drag.
+    if (
+      !this.dragActive &&
+      current !== this &&
+      !(targetIsThisCanvas && dragOfferMimes(dt))
+    )
+      return;
+    claimed[DROP_CLAIMED] = true;
     e.preventDefault();
+    const fileDrag = this.dragFilesActive || (!!dt && dragHasFiles(dt));
+    const lastPoint = this.dragLastPoint;
     this.dragActive = false;
+    this.dragFilesActive = false;
+    this.dragLastPoint = null;
     const plannedNames = this.dragPlannedNames;
     this.dragPlannedNames = null;
-    const conn = this.getConn();
-    if (!conn || !this.surface || !this._displaySize || !dt) return;
-    const point = this.surfacePointFromClient(e.clientX, e.clientY);
-    if (!point) return;
+    if (conn && activeBrowserDragCanvas.get(conn) === this)
+      activeBrowserDragCanvas.delete(conn);
+    if (!conn) return;
+    if (!this.surface || !this._displaySize || !dt) {
+      conn.sendSurfaceDragCancel();
+      return;
+    }
+    const eventPoint = this.surfacePointFromClient(e.clientX, e.clientY);
+    const point =
+      lastPoint && e.clientX === 0 && e.clientY === 0
+        ? lastPoint
+        : (eventPoint ?? lastPoint);
+    if (!point) {
+      conn.sendSurfaceDragCancel();
+      return;
+    }
     const surfaceId = this._surfaceId;
 
-    const fileDrag =
-      Array.from(dt.types ?? []).includes("Files") || dragHasFileItem(dt);
     const files = fileDrag ? droppedFiles(dt) : [];
     if (fileDrag) {
       if (files.length === 0) {
@@ -2837,6 +3132,7 @@ export class BlitSurfaceCanvas {
         `blit: dropped text is ${data.length} bytes, over the ` +
           `${MAX_DND_BYTES}-byte drag-and-drop limit — not dropped`,
       );
+      conn.sendSurfaceDragCancel();
       return;
     }
     conn.sendSurfaceDragDrop(surfaceId, point.x, point.y, [
@@ -2860,17 +3156,78 @@ export class BlitSurfaceCanvas {
     files: File[],
     plannedNames: readonly string[] | null,
   ): Promise<void> {
+    const totalBytes = files.reduce((total, file) => total + file.size, 0);
+    const firstName =
+      files[0]?.name ||
+      (files[0]
+        ? (plannedNames?.[0] ?? materializedDropName(files[0], 0))
+        : "file");
+    const target = this.surface?.title || this.surface?.appId || undefined;
+    // Tests and third-party structural workspace mocks may predate the
+    // activity registry, hence the defensive optional access.
+    const activity = this._workspace.activities?.begin({
+      kind: "upload",
+      label: files.length === 1 ? firstName : `${files.length} files`,
+      target,
+      completed: 0,
+      total: totalBytes,
+    });
+    let completedBytes = 0;
     try {
+      const knownMimes = files.map(materializedDropMimeFromMetadata);
+      const materializedMimes = knownMimes.every(
+        (mime): mime is string => mime !== null,
+      )
+        ? knownMimes
+        : await Promise.all(
+            files.map(
+              (file, index) => knownMimes[index] ?? materializedDropMime(file),
+            ),
+          );
+      const materializedNames = materializedMimes.map((mime, index) =>
+        plannedDropName(mime, index),
+      );
+      let stagedNames = plannedNames;
+      if (
+        plannedNames &&
+        plannedNames.some((name, index) => name !== materializedNames[index])
+      ) {
+        // WebKit's typeless iPad hover used a provisional .bin URI solely
+        // to let the destination show its drag UI.  Now that DROP exposes
+        // the real representation, replace that offer before any bytes land
+        // so the destination receives the truthful filename and MIME.
+        conn.sendSurfaceDragEnter(
+          surfaceId,
+          x,
+          y,
+          ["text/uri-list", "application/octet-stream"],
+          materializedMimes,
+        );
+        stagedNames = materializedNames;
+      }
       const handle = await this.dragStagingHandle(conn);
       const items: { mime: string; name: string; data: Uint8Array }[] = [];
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
+        const mime = materializedMimes[i];
         // Stage to the path ENTER pre-announced for this item — the
         // uri-list the remote app already received names exactly it.
-        const staged = plannedNames?.[i] ?? plannedDropName(file.type, i);
-        await handle.upload(staged, file);
+        const staged =
+          stagedNames?.[i] ??
+          (plannedDropExtension(mime)
+            ? plannedDropName(mime, i)
+            : materializedDropName(file, i));
+        await handle.upload(staged, file, {
+          onProgress: (uploaded) =>
+            activity?.update({
+              label: file.name || staged,
+              completed: completedBytes + uploaded,
+              total: totalBytes,
+            }),
+        });
+        completedBytes += file.size;
         items.push({
-          mime: file.type || "application/octet-stream",
+          mime,
           name: staged,
           data: new Uint8Array(0),
         });
@@ -2882,6 +3239,8 @@ export class BlitSurfaceCanvas {
         err,
       );
       conn.sendSurfaceDragCancel();
+    } finally {
+      activity?.finish();
     }
   }
 

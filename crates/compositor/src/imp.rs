@@ -1577,8 +1577,8 @@ struct DragSessionState {
     /// Wayland lets the source answer at any time.  If the session ends
     /// without a drop the OwnedFds just close (an empty read).
     parked: Vec<(String, OwnedFd)>,
-    /// `drop` was sent; the offer now exists only for `receive`/`finish`,
-    /// so ending the session must not send `leave`.
+    /// `drop` and its terminal `leave` were sent; the offer now exists only
+    /// for the destination's post-drop `receive`/`finish` requests.
     dropped: bool,
     /// The client sent `finish` after the drop.
     finished: bool,
@@ -8030,9 +8030,11 @@ impl Compositor {
         }
     }
 
-    /// Land the drop: hand the payload to the session and send `drop`.
-    /// The offer stays alive afterwards — the target still has to `receive`
-    /// the data and `finish`; with no source there is nobody to tell.
+    /// Land the drop: hand the payload to the session, send `drop`, then end
+    /// the target focus with `leave`.  Chromium uses that final leave to tear
+    /// down its native/DOM drag state; without it an app can accept the data
+    /// while leaving its drag overlay visible.  The offer stays alive for
+    /// post-drop `receive`/`finish` requests.
     fn drag_drop(&mut self, surface_id: u16, x: f64, y: f64, offers: Vec<(String, Vec<u8>)>) {
         if self.drag.is_none() {
             return;
@@ -8061,14 +8063,15 @@ impl Compositor {
             }
             drag.dropped = true;
             drag.device.drop();
+            drag.device.leave();
         }
     }
 
     /// End the session, optionally telling the target (`leave`).  A session
-    /// that already dropped gets no `leave` — the drop completed it — but
-    /// its offer may still be in `receive`/`finish`, so only the state's
-    /// session slot is cleared.  Dropping the offer handle does not destroy
-    /// it client-side — the client owns that and will `destroy` it.
+    /// that already dropped already received its terminal `leave`, but its
+    /// offer may still be in `receive`/`finish`, so only the state's session
+    /// slot is cleared.  Dropping the offer handle does not destroy it
+    /// client-side — the client owns that and will `destroy` it.
     fn drag_end(&mut self, leave: bool) {
         if let Some(drag) = self.drag.take()
             && leave
