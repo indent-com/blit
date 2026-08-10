@@ -1367,6 +1367,8 @@ impl VulkanVideoEncoder {
         }
 
         let std_header_version = caps.std_header_version;
+        let min_coded_w = caps.min_coded_extent.width;
+        let min_coded_h = caps.min_coded_extent.height;
         let max_coded_w = caps.max_coded_extent.width;
         let max_coded_h = caps.max_coded_extent.height;
         let max_dpb = caps.max_dpb_slots;
@@ -1375,9 +1377,15 @@ impl VulkanVideoEncoder {
         let max_level = av1_caps.max_level;
 
         eprintln!(
-            "[vulkan-encode] AV1 caps: max_coded={max_coded_w}x{max_coded_h}, max_dpb={max_dpb}, max_level={max_level}",
+            "[vulkan-encode] AV1 caps: coded={min_coded_w}x{min_coded_h}–{max_coded_w}x{max_coded_h}, max_dpb={max_dpb}, max_level={max_level}",
         );
 
+        if coded_w < min_coded_w || coded_h < min_coded_h {
+            eprintln!(
+                "[vulkan-encode] AV1 coded extent {coded_w}x{coded_h} is below minimum {min_coded_w}x{min_coded_h}",
+            );
+            return None;
+        }
         if coded_w > max_coded_w || coded_h > max_coded_h {
             eprintln!(
                 "[vulkan-encode] AV1 coded extent {coded_w}x{coded_h} exceeds max {max_coded_w}x{max_coded_h}",

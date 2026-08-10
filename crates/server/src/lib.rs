@@ -1589,9 +1589,11 @@ struct SurfaceSubState {
     congested_at: Option<Instant>,
     /// Bit per Vulkan Video encoder whose 4:2:0 profile the compositor has
     /// refused for this client and surface (see
-    /// [`SurfaceEncoderPreference::vulkan_refusal_bit`]). Latched so selection
-    /// stops offering that codec after both chroma profiles are exhausted.
-    /// Cleared when the subscription is recreated.
+    /// [`SurfaceEncoderPreference::vulkan_refusal_bit`]). Latched at one
+    /// encoded extent so selection stops offering that codec after both
+    /// chroma profiles are exhausted. A different extent gets a fresh try:
+    /// profile creation and encode can fail solely because the old extent was
+    /// below the device minimum, above its maximum, or otherwise unsupported.
     ///
     /// Per encoder rather than one flag for the tier: with `av1-vulkan` ahead
     /// of `h264-vulkan` in the default list, a single flag let an AV1 refusal
@@ -1602,6 +1604,11 @@ struct SurfaceSubState {
     /// the backend: selection retries the same codec at 4:2:0 before advancing
     /// to the next preference.
     vulkan_444_refused: u8,
+    /// Encoded extent the two Vulkan refusal masks describe. Selection clears
+    /// both masks before trying a different extent; without this, a tiny
+    /// thumbnail that is below the device minimum permanently condemns the
+    /// later full-size pane to a server-side fallback encoder.
+    vulkan_refused_extent: Option<(u32, u32)>,
     /// Last per-client downscale target dims registered with the
     /// compositor.  Used to send `ClearDownscaleTarget` for the old
     /// dims when the encoder is recreated at a new size, so stale
@@ -3667,7 +3674,27 @@ fn vulkan_encoder_chroma(
     false
 }
 
-fn latch_vulkan_refusal(sub: &mut SurfaceSubState, pref: SurfaceEncoderPreference, is_444: bool) {
+fn vulkan_refusals_for_extent(sub: &mut SurfaceSubState, width: u32, height: u32) -> (u8, u8) {
+    let extent = (width, height);
+    if sub.vulkan_refused_extent != Some(extent) {
+        sub.vulkan_refused = 0;
+        sub.vulkan_444_refused = 0;
+        sub.vulkan_refused_extent = Some(extent);
+    }
+    (sub.vulkan_refused, sub.vulkan_444_refused)
+}
+
+fn latch_vulkan_refusal(
+    sub: &mut SurfaceSubState,
+    pref: SurfaceEncoderPreference,
+    is_444: bool,
+    width: u32,
+    height: u32,
+) {
+    // The compositor reply belongs to the session at this exact extent. If
+    // the target moved while the reply was in flight, do not let its refusal
+    // poison the new target's attempt.
+    let _ = vulkan_refusals_for_extent(sub, width, height);
     if is_444 {
         sub.vulkan_444_refused |= pref.vulkan_refusal_bit();
     } else {
@@ -6324,7 +6351,7 @@ async fn tick(state: &AppState) -> TickOutcome {
             // reason to reset.  Clearing the encoder is enough to make the
             // next tick retry Vulkan 4:2:0 or build the next encoder.
             let sub = c.surface_subs.entry(sid).or_default();
-            latch_vulkan_refusal(sub, refused, vulkan.is_444);
+            latch_vulkan_refusal(sub, refused, vulkan.is_444, vulkan.width, vulkan.height);
             sub.selected_encoder = None;
             retire_encoder(sub.encoder.take());
             sub.has_keyframe = false;
@@ -7381,10 +7408,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                         enc_w,
                         enc_h,
                     );
-                    let (refused_bits, refused_444_bits) = client
-                        .surface_subs
-                        .get(&sid)
-                        .map_or((0, 0), |s| (s.vulkan_refused, s.vulkan_444_refused));
+                    let (refused_bits, refused_444_bits) = vulkan_refusals_for_extent(
+                        client.surface_subs.entry(sid).or_default(),
+                        enc_w,
+                        enc_h,
+                    );
 
                     let mut vulkan_selected = false;
                     for &pref in &state.config.surface_encoders {
@@ -15172,7 +15200,7 @@ mod tests {
         assert!(vulkan_encoder_chroma(pref, true, 0, &declined));
 
         let mut sub = SurfaceSubState::default();
-        latch_vulkan_refusal(&mut sub, pref, true);
+        latch_vulkan_refusal(&mut sub, pref, true, 102, 64);
         assert_eq!(sub.vulkan_refused, 0, "4:4:4 must not reject AV1 Vulkan");
         assert_ne!(sub.vulkan_444_refused, 0);
         assert!(!vulkan_encoder_chroma(
@@ -15189,9 +15217,28 @@ mod tests {
 
         // A 4:2:0 refusal exhausts the codec only for this subscription; it
         // is deliberately never inserted into the device-wide set.
-        latch_vulkan_refusal(&mut sub, pref, false);
+        latch_vulkan_refusal(&mut sub, pref, false, 102, 64);
         assert_ne!(sub.vulkan_refused, 0);
         assert!(!declined.contains(vulkan_encoder_name(pref, false)));
+    }
+
+    #[test]
+    fn vulkan_refusal_is_scoped_to_the_encoded_extent() {
+        let pref = SurfaceEncoderPreference::VulkanVideoAV1;
+        let mut sub = SurfaceSubState::default();
+
+        latch_vulkan_refusal(&mut sub, pref, false, 102, 64);
+        assert_ne!(
+            vulkan_refusals_for_extent(&mut sub, 102, 64).0,
+            0,
+            "the failed thumbnail extent must not retry every tick"
+        );
+        assert_eq!(
+            vulkan_refusals_for_extent(&mut sub, 684, 1064),
+            (0, 0),
+            "a full-size target must not inherit the thumbnail's refusal"
+        );
+        assert_eq!(sub.vulkan_refused_extent, Some((684, 1064)));
     }
 
     /// The index walk (docs/design/fs-search.md) prunes `.git`, honors
