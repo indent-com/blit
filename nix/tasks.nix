@@ -490,11 +490,25 @@ let
       export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
       export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
-      echo "=== Setting up UI dist ==="
+      # Clippy only needs these include_bytes! inputs to exist; building the
+      # production UI here makes every lint run realize the browser WASM and
+      # pnpm closures before Clippy can start. Preserve real development
+      # assets, and remove any compile-only placeholders when lint exits.
+      echo "=== Setting up UI dist inputs ==="
       mkdir -p js/ui/dist
-      rm -f js/ui/dist/index.html js/ui/dist/index.html.br js/ui/dist/sw.js js/ui/dist/sw.js.br
-      cp ${webAppDist}/index.html ${webAppDist}/index.html.br \
-        ${webAppDist}/sw.js ${webAppDist}/sw.js.br js/ui/dist/
+      placeholder_assets=()
+      cleanup_ui_dist() {
+        if (( ''${#placeholder_assets[@]} )); then
+          rm -f "''${placeholder_assets[@]}"
+        fi
+      }
+      trap cleanup_ui_dist EXIT
+      for asset in js/ui/dist/index.html.br js/ui/dist/sw.js.br; do
+        if [ ! -e "$asset" ]; then
+          : > "$asset"
+          placeholder_assets+=("$asset")
+        fi
+      done
 
       echo "=== Clippy ==="
       cargo clippy --workspace -- -D warnings
