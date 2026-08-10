@@ -822,22 +822,27 @@ struct SharedCompositor {
     /// surface.  Opens that surface's settle window; see
     /// `SURFACE_RESIZE_SETTLE`.
     last_resize_at: FxHashMap<u16, Instant>,
-    /// Vulkan Video encoders this device has built and then failed to encode
-    /// with, by the name the selection uses (`h264-vulkan 4:4:4` and friends,
-    /// so chroma counts — 4:2:0 is a different profile and usually works
-    /// where 4:4:4 does not).
+    /// Vulkan Video 4:4:4 profiles this device has built and then failed to
+    /// encode with, by the name the selection uses (`h264-vulkan 4:4:4` and
+    /// friends).
     ///
     /// The per-subscription `vulkan_refused` bits are the right memory for a
     /// session that could not be built: that can be about this frame's size.
-    /// Being unable to *encode* one that was built is about the driver, and
-    /// re-learning it costs a session setup plus a dozen failing encodes —
-    /// ~90 ms — every time a viewer subscribes or a pane changes size.  On
+    /// A built 4:4:4 profile that cannot encode is a driver capability lie,
+    /// and re-learning it costs a session setup plus a dozen failing encodes
+    /// — ~90 ms — every time a viewer subscribes or a pane changes size. On
     /// NVIDIA, H.264 4:4:4 is advertised, initialises, and then fails every
-    /// encode, so this fires on the most common desktop GPU there is.
+    /// encode, so remembering that profile saves real work.
+    ///
+    /// Do not put 4:2:0 here. It is the baseline profile, and an encode can
+    /// fail because of one surface, extent, or transient synchronization
+    /// problem. Permanently declining it device-wide after that one failure
+    /// sends every later surface to a lower encoder even when a fresh Vulkan
+    /// session works.
     ///
     /// Lives here rather than in the config: it describes the device this
     /// compositor came up on, and a new compositor gets to find out afresh.
-    declined_vulkan_encoders: HashSet<&'static str>,
+    declined_vulkan_444_encoders: HashSet<&'static str>,
     /// Surfaces with a configure on the wire whose new size the compositor
     /// has not reported back yet, and when it went out.  An encoder built
     /// against the size the surface is *leaving* is finished work nobody
@@ -3650,16 +3655,16 @@ fn vulkan_encoder_chroma(
     pref: SurfaceEncoderPreference,
     want_444: bool,
     refused_444: u8,
-    declined: &HashSet<&'static str>,
-) -> Option<bool> {
+    declined_444: &HashSet<&'static str>,
+) -> bool {
     let refusal_bit = pref.vulkan_refusal_bit();
     if want_444
         && refused_444 & refusal_bit == 0
-        && !declined.contains(vulkan_encoder_name(pref, true))
+        && !declined_444.contains(vulkan_encoder_name(pref, true))
     {
-        return Some(true);
+        return true;
     }
-    (!declined.contains(vulkan_encoder_name(pref, false))).then_some(false)
+    false
 }
 
 fn latch_vulkan_refusal(sub: &mut SurfaceSubState, pref: SurfaceEncoderPreference, is_444: bool) {
@@ -4190,7 +4195,7 @@ impl Session {
                 last_blanket_frame_request: Instant::now(),
                 last_configured_size: FxHashMap::default(),
                 last_resize_at: FxHashMap::default(),
-                declined_vulkan_encoders: HashSet::new(),
+                declined_vulkan_444_encoders: HashSet::new(),
                 resize_inflight: FxHashMap::default(),
                 pending_resize: FxHashMap::default(),
                 native_sizes: FxHashMap::default(),
@@ -6298,11 +6303,11 @@ async fn tick(state: &AppState) -> TickOutcome {
         if let Some(c) = sess.clients.get_mut(&cid)
             && let Some(vulkan) = c.vulkan_video_surfaces.remove(&sid)
         {
-            // A session that was built and then could not encode says the
-            // driver cannot encode this profile at all; remember it for the
-            // device rather than making every later subscriber re-discover
-            // it at the price of a setup and a dozen failing encodes.
-            if after_encode_failures {
+            // Cache only the optional 4:4:4 profile device-wide. A 4:2:0
+            // encode failure can be surface-, extent-, or synchronization-
+            // specific; the per-subscription refusal below is enough to
+            // fall this client back without poisoning every later surface.
+            if after_encode_failures && vulkan.is_444 {
                 declined_name = Some(vulkan.encoder_name);
             }
             // Latch only the encoder that was actually refused.  The entry we
@@ -6341,11 +6346,11 @@ async fn tick(state: &AppState) -> TickOutcome {
         }
         if let Some(name) = declined_name
             && let Some(cs) = sess.compositor.as_mut()
-            && cs.declined_vulkan_encoders.insert(name)
+            && cs.declined_vulkan_444_encoders.insert(name)
         {
             eprintln!(
-                "[vulkan-video] {name}: built a session this device could not encode with; \
-                 not offering it again",
+                "[vulkan-video] {name}: built a 4:4:4 session this device could not encode \
+                 with; not offering that profile again",
             );
         }
         if let Some(cs) = sess.compositor.as_mut() {
@@ -6620,10 +6625,10 @@ async fn tick(state: &AppState) -> TickOutcome {
             .as_ref()
             .is_some_and(|cs| cs.handle.vulkan_video_encode_av1);
         // Same reason, and at most a handful of names.
-        let declined_vulkan_encoders = sess
+        let declined_vulkan_444_encoders = sess
             .compositor
             .as_ref()
-            .map(|cs| cs.declined_vulkan_encoders.clone())
+            .map(|cs| cs.declined_vulkan_444_encoders.clone())
             .unwrap_or_default();
 
         // `(surface, client)` pairs whose Vulkan Video encoder should be
@@ -7426,19 +7431,18 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // as asked: a caps query that refuses declines the
                         // session. Selection remembers that exact profile and
                         // retries the same codec at 4:2:0 on the next tick.
-                        // A refusal is profile-specific.  If 4:4:4 failed,
+                        // A refusal is profile-specific. If 4:4:4 failed,
                         // retry this codec at 4:2:0 before walking on to the
-                        // next backend.  A profile that built and then failed
-                        // to encode is remembered device-wide; a setup-time
-                        // refusal is remembered for this subscription.
-                        let Some(is_444) = vulkan_encoder_chroma(
+                        // next backend. A 4:4:4 profile that built and then
+                        // failed to encode is remembered device-wide; all
+                        // 4:2:0 failures and setup refusals stay scoped to
+                        // this subscription.
+                        let is_444 = vulkan_encoder_chroma(
                             pref,
                             want_444,
                             refused_444_bits,
-                            &declined_vulkan_encoders,
-                        ) else {
-                            continue;
-                        };
+                            &declined_vulkan_444_encoders,
+                        );
                         let qp = match pref {
                             SurfaceEncoderPreference::VulkanVideoAV1 => {
                                 encoding.bandwidth.av1_qp_for_vulkan()
@@ -15165,27 +15169,29 @@ mod tests {
     fn vulkan_444_refusal_retries_the_same_codec_at_420() {
         let pref = SurfaceEncoderPreference::VulkanVideoAV1;
         let mut declined = HashSet::new();
-        assert_eq!(vulkan_encoder_chroma(pref, true, 0, &declined), Some(true));
+        assert!(vulkan_encoder_chroma(pref, true, 0, &declined));
 
         let mut sub = SurfaceSubState::default();
         latch_vulkan_refusal(&mut sub, pref, true);
         assert_eq!(sub.vulkan_refused, 0, "4:4:4 must not reject AV1 Vulkan");
         assert_ne!(sub.vulkan_444_refused, 0);
-        assert_eq!(
-            vulkan_encoder_chroma(pref, true, sub.vulkan_444_refused, &declined),
-            Some(false),
-        );
+        assert!(!vulkan_encoder_chroma(
+            pref,
+            true,
+            sub.vulkan_444_refused,
+            &declined
+        ));
 
-        // The device-wide memory used after encode failures has the same
-        // profile-specific fallback behavior.
+        // A device-wide 4:4:4 encode failure has the same profile-specific
+        // fallback behavior.
         declined.insert(vulkan_encoder_name(pref, true));
-        assert_eq!(vulkan_encoder_chroma(pref, true, 0, &declined), Some(false));
+        assert!(!vulkan_encoder_chroma(pref, true, 0, &declined));
 
-        // Only a 4:2:0 refusal exhausts the codec.
+        // A 4:2:0 refusal exhausts the codec only for this subscription; it
+        // is deliberately never inserted into the device-wide set.
         latch_vulkan_refusal(&mut sub, pref, false);
         assert_ne!(sub.vulkan_refused, 0);
-        declined.insert(vulkan_encoder_name(pref, false));
-        assert_eq!(vulkan_encoder_chroma(pref, true, 0, &declined), None);
+        assert!(!declined.contains(vulkan_encoder_name(pref, false)));
     }
 
     /// The index walk (docs/design/fs-search.md) prunes `.git`, honors
