@@ -599,7 +599,7 @@ S2C_EXITED      (one per exited-but-retained PTY)
 S2C_READY       (end of initial burst)
 ```
 
-After `S2C_READY`, the client can start sending commands. `S2C_UPDATE` frames are not sent until the client subscribes to a PTY with `C2S_SUBSCRIBE`.
+After `S2C_READY`, the client can start sending commands. `S2C_UPDATE` frames are not sent until the client subscribes to a PTY with `C2S_SUBSCRIBE`. Each `C2S_SUBSCRIBE`, including one repeated for an already subscribed PTY, starts a fresh diff stream: the next update is a full-state keyframe. Clients use that repeat to recover after discarding or failing to apply a delta.
 
 ## Frame update encoding
 

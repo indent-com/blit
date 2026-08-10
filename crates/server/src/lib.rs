@@ -1738,6 +1738,15 @@ struct ClientState {
     scroll_offsets: FxHashMap<u16, usize>,
     scroll_caches: FxHashMap<u16, FrameState>,
     last_sent: FxHashMap<u16, FrameState>,
+    /// Monotonic source for `terminal_stream_epochs`.  A terminal diff is
+    /// built outside the session lock, so every baseline change gets a new
+    /// value and the sender can reject work built against the old baseline
+    /// when it reacquires the lock.
+    next_terminal_stream_epoch: u64,
+    /// Per-PTY identity of the diff stream the client is currently applying.
+    /// Missing means unsubscribed (tests that construct subscriptions by hand
+    /// use the legacy epoch 0).
+    terminal_stream_epochs: FxHashMap<u16, u64>,
     last_used_rows_sent: FxHashMap<u16, u16>,
     preview_next_send_at: FxHashMap<u16, Instant>,
     /// EWMA RTT estimate in milliseconds.
@@ -3678,14 +3687,62 @@ fn clamp_view_size(rows: u16, cols: u16) -> (u16, u16) {
 
 fn subscribe_client_to(client: &mut ClientState, pty_id: u16) {
     if client.subscriptions.insert(pty_id) {
-        client.last_sent.remove(&pty_id);
-        client.last_used_rows_sent.remove(&pty_id);
-        client.preview_next_send_at.remove(&pty_id);
+        reset_client_terminal_baseline(client, pty_id);
     }
+}
+
+/// Start a fresh terminal diff stream even when the client was already
+/// subscribed.  Repeating C2S_SUBSCRIBE is the browser's recovery request
+/// after it loses a delta; retaining `last_sent` here would make the server
+/// continue from the very state the browser no longer has.
+fn resubscribe_client_to(client: &mut ClientState, pty_id: u16) {
+    client.subscriptions.insert(pty_id);
+    reset_client_terminal_baseline(client, pty_id);
+}
+
+fn advance_client_terminal_stream(client: &mut ClientState, pty_id: u16) {
+    client.next_terminal_stream_epoch = client.next_terminal_stream_epoch.wrapping_add(1);
+    // Reserve zero for hand-built legacy test clients.  This also keeps a
+    // wrap from making a reset indistinguishable from their implicit epoch.
+    if client.next_terminal_stream_epoch == 0 {
+        client.next_terminal_stream_epoch = 1;
+    }
+    client
+        .terminal_stream_epochs
+        .insert(pty_id, client.next_terminal_stream_epoch);
+}
+
+fn reset_client_terminal_baseline(client: &mut ClientState, pty_id: u16) {
+    client.last_sent.remove(&pty_id);
+    // A parked view diffs against `scroll_caches`, not `last_sent`.  A
+    // repeated subscribe is a resync request in either mode, so retaining
+    // this cache would keep sending deltas from the state the browser lost.
+    client.scroll_caches.remove(&pty_id);
+    client.last_used_rows_sent.remove(&pty_id);
+    client.preview_next_send_at.remove(&pty_id);
+    advance_client_terminal_stream(client, pty_id);
+}
+
+fn client_terminal_stream_epoch(client: &ClientState, pty_id: u16) -> u64 {
+    client
+        .terminal_stream_epochs
+        .get(&pty_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn client_terminal_stream_is_current(
+    client: &ClientState,
+    pty_id: u16,
+    expected_epoch: u64,
+) -> bool {
+    client.subscriptions.contains(&pty_id)
+        && client_terminal_stream_epoch(client, pty_id) == expected_epoch
 }
 
 fn unsubscribe_client_from(client: &mut ClientState, pty_id: u16) -> bool {
     let removed_sub = client.subscriptions.remove(&pty_id);
+    client.terminal_stream_epochs.remove(&pty_id);
     client.last_sent.remove(&pty_id);
     client.last_used_rows_sent.remove(&pty_id);
     client.preview_next_send_at.remove(&pty_id);
@@ -3725,6 +3782,10 @@ fn update_client_scroll_state(client: &mut ClientState, pty_id: u16, next_offset
     } else {
         client.scroll_offsets.remove(&pty_id);
     }
+    // A live diff may currently be compressing without the session lock.
+    // It was built for the other side of this live/scrollback transition and
+    // must not land after the cache hand-off above.
+    advance_client_terminal_stream(client, pty_id);
     reset_inflight(client);
     true
 }
@@ -4147,6 +4208,7 @@ impl Session {
             if c.subscriptions.contains(&pty_id) {
                 c.last_sent.remove(&pty_id);
                 c.last_used_rows_sent.remove(&pty_id);
+                advance_client_terminal_stream(c, pty_id);
             }
             if c.scroll_caches.remove(&pty_id).is_some() {
                 reset_inflight(c);
@@ -5498,6 +5560,7 @@ enum SendOutcome {
     NoChange,
     Sent,
     Backpressured,
+    Stale,
 }
 
 fn try_send_update(
@@ -5505,9 +5568,17 @@ fn try_send_update(
     pid: u16,
     current: FrameState,
     msg: Option<Vec<u8>>,
+    expected_stream_epoch: u64,
     now: Instant,
     paced: bool,
 ) -> SendOutcome {
+    // Compression runs without the session lock.  A subscribe, unsubscribe,
+    // resize, or scroll transition may have replaced the diff baseline while
+    // this message was being built.  Never advance the new stream with work
+    // from the old one; the caller re-dirties the PTY and rebuilds instead.
+    if !client_terminal_stream_is_current(client, pid, expected_stream_epoch) {
+        return SendOutcome::Stale;
+    }
     let Some(msg) = msg else {
         return SendOutcome::NoChange;
     };
@@ -8838,7 +8909,9 @@ async fn tick(state: &AppState) -> TickOutcome {
                             pty.mark_dirty();
                         }
                     }
-                    SendOutcome::NoChange => {}
+                    // Scrollback frames are built and sent under the lock, so
+                    // this branch cannot become stale.
+                    SendOutcome::NoChange | SendOutcome::Stale => {}
                 }
             } else if is_lead && lead_has_window {
                 next_deadline = Some(match next_deadline {
@@ -8860,10 +8933,15 @@ async fn tick(state: &AppState) -> TickOutcome {
         if let Some(pid) = lead {
             if lead_scroll_offset == 0 && can_send_lead {
                 if let Some(cur) = snapshots.get(&pid).cloned() {
-                    let previous = sess
+                    let (previous, stream_epoch) = sess
                         .clients
                         .get(&cid)
-                        .and_then(|c| c.last_sent.get(&pid).cloned())
+                        .map(|c| {
+                            (
+                                c.last_sent.get(&pid).cloned().unwrap_or_default(),
+                                client_terminal_stream_epoch(c, pid),
+                            )
+                        })
                         .unwrap_or_default();
                     drop(sess);
                     let msg = build_update_msg(pid, &cur, &previous);
@@ -8871,9 +8949,9 @@ async fn tick(state: &AppState) -> TickOutcome {
                     let Some(c) = sess.clients.get_mut(&cid) else {
                         continue;
                     };
-                    match try_send_update(c, pid, cur, msg, now, true) {
+                    match try_send_update(c, pid, cur, msg, stream_epoch, now, true) {
                         SendOutcome::Sent => {}
-                        SendOutcome::Backpressured => {
+                        SendOutcome::Backpressured | SendOutcome::Stale => {
                             if let Some(pty) = sess.ptys.get_mut(&pid) {
                                 pty.mark_dirty();
                             }
@@ -8954,10 +9032,15 @@ async fn tick(state: &AppState) -> TickOutcome {
                 continue;
             };
             let cur = cur.clone();
-            let previous = sess
+            let (previous, stream_epoch) = sess
                 .clients
                 .get(&cid)
-                .and_then(|c| c.last_sent.get(&pid).cloned())
+                .map(|c| {
+                    (
+                        c.last_sent.get(&pid).cloned().unwrap_or_default(),
+                        client_terminal_stream_epoch(c, pid),
+                    )
+                })
                 .unwrap_or_default();
             drop(sess);
             let msg = build_update_msg(pid, &cur, &previous);
@@ -8965,11 +9048,11 @@ async fn tick(state: &AppState) -> TickOutcome {
             let Some(c) = sess.clients.get_mut(&cid) else {
                 break;
             };
-            match try_send_update(c, pid, cur, msg, now, false) {
+            match try_send_update(c, pid, cur, msg, stream_epoch, now, false) {
                 SendOutcome::Sent => {
                     record_preview_send(c, pid, now);
                 }
-                SendOutcome::Backpressured => {
+                SendOutcome::Backpressured | SendOutcome::Stale => {
                     if let Some(pty) = sess.ptys.get_mut(&pid) {
                         pty.mark_dirty();
                     }
@@ -12023,6 +12106,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 scroll_offsets: FxHashMap::default(),
                 scroll_caches: FxHashMap::default(),
                 last_sent: FxHashMap::default(),
+                next_terminal_stream_epoch: 0,
+                terminal_stream_epochs: FxHashMap::default(),
                 last_used_rows_sent: FxHashMap::default(),
                 preview_next_send_at: FxHashMap::default(),
                 rtt_ms: 50.0,
@@ -14157,7 +14242,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 let pid = u16::from_le_bytes([data[1], data[2]]);
                 if sess.ptys.contains_key(&pid) {
                     if let Some(c) = sess.clients.get_mut(&client_id) {
-                        subscribe_client_to(c, pid);
+                        resubscribe_client_to(c, pid);
                     }
                     if let Some(pty) = sess.ptys.get_mut(&pid) {
                         pty.mark_dirty();
@@ -15059,6 +15144,8 @@ mod tests {
             scroll_offsets: FxHashMap::default(),
             scroll_caches: FxHashMap::default(),
             last_sent: FxHashMap::default(),
+            next_terminal_stream_epoch: 0,
+            terminal_stream_epochs: FxHashMap::default(),
             last_used_rows_sent: FxHashMap::default(),
             preview_next_send_at: FxHashMap::default(),
             rtt_ms: 50.0,
@@ -21159,15 +21246,19 @@ mod tests {
     #[test]
     fn try_send_no_change() {
         let mut client = test_client();
+        subscribe_client_to(&mut client, 1);
+        let stream_epoch = client_terminal_stream_epoch(&client, 1);
         let frame = sample_frame("x");
         let now = Instant::now();
-        let outcome = try_send_update(&mut client, 1, frame, None, now, false);
+        let outcome = try_send_update(&mut client, 1, frame, None, stream_epoch, now, false);
         assert!(matches!(outcome, SendOutcome::NoChange));
     }
 
     #[test]
     fn try_send_sent() {
         let (mut client, _rx) = test_client_with_capacity(8);
+        subscribe_client_to(&mut client, 1);
+        let stream_epoch = client_terminal_stream_epoch(&client, 1);
         let frame = sample_frame("x");
         let now = Instant::now();
         let outcome = try_send_update(
@@ -21175,6 +21266,7 @@ mod tests {
             1,
             frame.clone(),
             Some(vec![1, 2, 3]),
+            stream_epoch,
             now,
             true,
         );
@@ -21185,6 +21277,8 @@ mod tests {
     #[test]
     fn try_send_backpressured_on_disconnect() {
         let (mut client, rx) = test_client_with_capacity(0);
+        subscribe_client_to(&mut client, 1);
+        let stream_epoch = client_terminal_stream_epoch(&client, 1);
         let frame = sample_frame("x");
         let now = Instant::now();
         // Drop the receiver to simulate a disconnected client.
@@ -21194,6 +21288,7 @@ mod tests {
             1,
             frame.clone(),
             Some(vec![1, 2, 3]),
+            stream_epoch,
             now,
             true,
         );
@@ -21202,6 +21297,56 @@ mod tests {
             client.last_sent.contains_key(&1),
             "last_sent should advance even on disconnect"
         );
+    }
+
+    #[test]
+    fn repeated_subscribe_resets_the_terminal_diff_baseline() {
+        let mut client = test_client();
+        subscribe_client_to(&mut client, 7);
+        let first_epoch = client_terminal_stream_epoch(&client, 7);
+        client.last_sent.insert(7, sample_frame("server-basis"));
+        client
+            .scroll_caches
+            .insert(7, sample_frame("scrollback-basis"));
+        client.last_used_rows_sent.insert(7, 12);
+        client.preview_next_send_at.insert(7, Instant::now());
+
+        resubscribe_client_to(&mut client, 7);
+
+        assert!(client.subscriptions.contains(&7));
+        assert!(!client.last_sent.contains_key(&7));
+        assert!(!client.scroll_caches.contains_key(&7));
+        assert!(!client.last_used_rows_sent.contains_key(&7));
+        assert!(!client.preview_next_send_at.contains_key(&7));
+        assert_ne!(client_terminal_stream_epoch(&client, 7), first_epoch);
+    }
+
+    #[test]
+    fn update_built_before_resubscribe_cannot_advance_the_new_stream() {
+        let (mut client, mut rx) = test_client_with_capacity(8);
+        subscribe_client_to(&mut client, 1);
+        let old_epoch = client_terminal_stream_epoch(&client, 1);
+        client.last_sent.insert(1, sample_frame("old basis"));
+
+        // Models C2S_SUBSCRIBE arriving while build_update_msg is compressing
+        // without the session lock.
+        resubscribe_client_to(&mut client, 1);
+        let outcome = try_send_update(
+            &mut client,
+            1,
+            sample_frame("stale delta target"),
+            Some(vec![1, 2, 3]),
+            old_epoch,
+            Instant::now(),
+            true,
+        );
+
+        assert!(matches!(outcome, SendOutcome::Stale));
+        assert!(client.last_sent.get(&1).is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     /// With the family disabled, every nonce-bearing LSP request still gets
