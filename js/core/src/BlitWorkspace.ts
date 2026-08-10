@@ -100,6 +100,7 @@ export class BlitWorkspace {
   private readonly termCwdUnsubs = new Map<ConnectionId, () => void>();
   private readonly connections = new Map<ConnectionId, BlitConnection>();
   private readonly defaultWasm: BlitWasmModule | Promise<BlitWasmModule>;
+  private surfaceDiagnosticsEnabled = false;
   readonly logger: BlitLogger;
 
   private snapshot: BlitWorkspaceSnapshot = {
@@ -138,6 +139,9 @@ export class BlitWorkspace {
       wasm: options.wasm ?? this.defaultWasm,
       logger: this.logger,
     });
+    connection.surfaceStore.setDiagnosticsEnabled(
+      this.surfaceDiagnosticsEnabled,
+    );
     this.connections.set(options.id, connection);
     this.connectionListeners.set(
       options.id,
@@ -176,6 +180,13 @@ export class BlitWorkspace {
 
   getConnection(connectionId: ConnectionId): BlitConnection | null {
     return this.connections.get(connectionId) ?? null;
+  }
+
+  /** Drop terminal view-size registrations while keeping connections alive. */
+  resetViewSizes(): void {
+    for (const connection of this.connections.values()) {
+      connection.resetViewSizes();
+    }
   }
 
   getConnectionSnapshot(
@@ -552,6 +563,15 @@ export class BlitWorkspace {
       connection.setVisibleSessionIds(
         desiredByConnection.get(connectionId) ?? [],
       );
+    }
+  }
+
+  /** Enable the per-frame histories used only by the UI debug pane. */
+  setSurfaceDiagnosticsEnabled(enabled: boolean): void {
+    if (enabled === this.surfaceDiagnosticsEnabled) return;
+    this.surfaceDiagnosticsEnabled = enabled;
+    for (const connection of this.connections.values()) {
+      connection.surfaceStore.setDiagnosticsEnabled(enabled);
     }
   }
 

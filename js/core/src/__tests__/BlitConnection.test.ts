@@ -38,6 +38,7 @@ import {
   S2C_FRAGMENT,
   S2C_CLIPBOARD_OWNER,
   S2C_PING,
+  C2S_PING,
   C2S_SURFACE_SUBSCRIBE,
   C2S_SURFACE_RESIZE,
   STATUS_BUDGET,
@@ -955,6 +956,57 @@ describe("BlitConnection — advanced scenarios", () => {
     expect(msg[3] | (msg[4] << 8)).toBe(40);
     expect(msg[5] | (msg[6] << 8)).toBe(120);
   });
+
+  it("prunes a disconnected HMR view before computing the minimum", () => {
+    const { conn, transport } = createConnection();
+    transport.pushHello(1, FEATURE_RESIZE_BATCH);
+    transport.pushCreated(1, "");
+    const session = conn.getSnapshot().sessions[0];
+    conn.setViewSize(session.id, conn.allocViewId(), 12, 40, () => false);
+
+    const before = transport.sent.length;
+    conn.setViewSize(session.id, conn.allocViewId(), 40, 120, () => true);
+
+    const sent = transport.sent
+      .slice(before)
+      .filter((message) => message[0] === C2S_RESIZE);
+    expect(sent).toHaveLength(1);
+    const msg = sent[0]!;
+    expect(msg[3] | (msg[4] << 8)).toBe(40);
+    expect(msg[5] | (msg[6] << 8)).toBe(120);
+  });
+
+  it("resetViewSizes clears every stale HMR view in one batch", () => {
+    const { conn, transport } = createConnection();
+    transport.pushHello(1, FEATURE_RESIZE_BATCH);
+    transport.pushCreated(1, "");
+    transport.pushCreated(2, "");
+    const [first, second] = conn.getSnapshot().sessions;
+    conn.setViewSize(first.id, conn.allocViewId(), 12, 40);
+    conn.setViewSize(second.id, conn.allocViewId(), 20, 60);
+
+    const before = transport.sent.length;
+    conn.resetViewSizes();
+
+    const sent = transport.sent
+      .slice(before)
+      .filter((message) => message[0] === C2S_RESIZE);
+    expect(sent).toHaveLength(1);
+    const msg = sent[0]!;
+    expect(msg).toHaveLength(13);
+    expect(msg[1] | (msg[2] << 8)).toBe(1);
+    expect(msg[3] | (msg[4] << 8)).toBe(0);
+    expect(msg[5] | (msg[6] << 8)).toBe(0);
+    expect(msg[7] | (msg[8] << 8)).toBe(2);
+    expect(msg[9] | (msg[10] << 8)).toBe(0);
+    expect(msg[11] | (msg[12] << 8)).toBe(0);
+
+    // Late cleanup from an old HMR surface must not re-send or disturb a new
+    // generation after the registry has already been dropped.
+    const afterReset = transport.sent.length;
+    conn.removeView(first.id, "v1");
+    expect(transport.sent).toHaveLength(afterReset);
+  });
 });
 
 describe("BlitConnection git", () => {
@@ -1086,10 +1138,44 @@ describe("BlitConnection fragment reassembly", () => {
     );
   });
 
+  it("copies borrowed fragment bytes into the reusable accumulator", () => {
+    const { conn, transport } = createConnection();
+    const firstPayload = new Uint8Array([S2C_PING, 0x12, 0x34]);
+    const first = fragment(false, firstPayload);
+    const receiveBuffer = new Uint8Array(first.length);
+    receiveBuffer.set(first);
+
+    transport.pushBorrowed(receiveBuffer);
+    receiveBuffer.fill(0);
+
+    const state = conn as unknown as {
+      fragmentBuffer: Uint8Array;
+      fragmentBytes: number;
+    };
+    expect(
+      Array.from(state.fragmentBuffer.subarray(0, state.fragmentBytes)),
+    ).toEqual(Array.from(firstPayload));
+  });
+
+  it("reuses accumulator capacity across complete fragmented messages", () => {
+    const { conn, transport } = createConnection();
+    const state = conn as unknown as {
+      fragmentBuffer: Uint8Array;
+      fragmentBytes: number;
+    };
+
+    transport.push(fragment(false, new Uint8Array([S2C_PING])));
+    const allocation = state.fragmentBuffer.buffer;
+    transport.push(fragment(true, new Uint8Array([0x00])));
+    expect(state.fragmentBytes).toBe(0);
+
+    transport.push(fragment(false, new Uint8Array([S2C_PING])));
+    expect(state.fragmentBuffer.buffer).toBe(allocation);
+  });
+
   // Without a ceiling, a peer that never sets FRAGMENT_FLAG_LAST grows the
-  // buffer until the tab dies — and each chunk is a subarray pinning the
-  // whole frame it arrived in, so the retained bytes are worse than the
-  // payload alone. The Rust reader has always refused past this same bound.
+  // buffer until the tab dies. The Rust reader has always refused past this
+  // same bound.
   it("drops an unterminated fragment stream at the decompression ceiling", () => {
     const { conn, transport } = createConnection();
     const bytes = () =>

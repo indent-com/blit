@@ -924,6 +924,7 @@ dependencies = [
  "rgb",
  "rustls",
  "rustls-native-certs",
+ "smallvec",
  "tokio",
  "tokio-rustls",
  "windows-sys 0.61.2",

@@ -12,6 +12,7 @@ import {
   useRemotes,
   useDefaultRemote,
   useWtCertHash,
+  useWtAddr,
   configWsStatus,
   connectConfigWs,
   disconnectConfigWs,
@@ -21,6 +22,7 @@ import { themeFor } from "./theme";
 import { t as i18n } from "./i18n";
 import { Workspace } from "./Workspace";
 import { PASSPHRASE_KEY } from "./passphrase-storage";
+import { muxWtUrl } from "./transportUrls";
 
 function decodeHashValue(value: string): string {
   try {
@@ -119,15 +121,6 @@ function muxWsUrl(): string {
     ? location.pathname
     : location.pathname + "/";
   return proto + "//" + location.host + base + "mux";
-}
-
-/** Build the WebTransport URL for the multiplexed endpoint.
- *  WebTransport always uses https:// (QUIC requires TLS). */
-function muxWtUrl(): string {
-  const base = location.pathname.endsWith("/")
-    ? location.pathname
-    : location.pathname + "/";
-  return "https://" + location.host + base + "mux";
 }
 
 export function App(props: { wasm: BlitWasmModule }) {
@@ -240,10 +233,16 @@ function AppCrash(props: { err: unknown }) {
 // ---------------------------------------------------------------------------
 
 type HmrData = {
+  version: number;
   mux: MuxTransport;
   channelCache: Map<string, { uri: string; transport: BlitTransport }>;
   passphrase: string;
 };
+
+// Bump when preserved transport instances are incompatible with hot code.
+// Existing class instances keep their old prototype and receive callbacks,
+// so reusing one would silently leave transport fixes inactive until reload.
+const HMR_DATA_VERSION = 4;
 
 function getHmrData(): HmrData | null {
   return (import.meta.hot?.data?.connectedApp as HmrData) ?? null;
@@ -269,11 +268,14 @@ function ConnectedApp(props: {
   const remotes = useRemotes();
   const defaultRemote = useDefaultRemote();
   const certHash = useWtCertHash();
+  const advertisedWtAddr = useWtAddr();
 
   // Reuse the mux and channel cache from a previous HMR cycle if the
   // passphrase hasn't changed; otherwise start fresh.
   const prev = getHmrData();
-  if (prev && prev.passphrase !== props.passphrase) {
+  const reusablePrev =
+    prev?.version === HMR_DATA_VERSION && prev.passphrase === props.passphrase;
+  if (prev && !reusablePrev) {
     prev.mux.close();
     for (const entry of prev.channelCache.values()) {
       entry.transport.close();
@@ -281,19 +283,18 @@ function ConnectedApp(props: {
   }
 
   const channelCache: Map<string, { uri: string; transport: BlitTransport }> =
-    prev && prev.passphrase === props.passphrase
-      ? prev.channelCache
-      : new Map();
+    reusablePrev ? prev.channelCache : new Map();
 
   // The MuxTransport is created only once the config WS has resolved.  Before
   // that, mux() returns null and no connection is attempted.
   const [mux, setMux] = createSignal<MuxTransport | null>(
-    prev && prev.passphrase === props.passphrase ? prev.mux : null,
+    reusablePrev ? prev.mux : null,
   );
 
   createEffect(() => {
     const status = configWsStatus();
     const hash = certHash();
+    const wtUrl = muxWtUrl(location.href, advertisedWtAddr());
     if (status === "connecting") return;
     const existing = mux();
     if (existing) {
@@ -301,11 +302,11 @@ function ConnectedApp(props: {
       // and republishes the hash. A long-lived tab has to adopt it, or every
       // later QUIC attempt fails validation and the session silently stays on
       // WebSocket until someone reloads.
-      if (hash) existing.updateWtCertHash(hash, muxWtUrl());
+      if (hash) existing.updateWtCertHash(hash, wtUrl);
       return;
     }
     const m = new MuxTransport(muxWsUrl(), props.passphrase, {
-      wtUrl: hash ? muxWtUrl() : undefined,
+      wtUrl: hash ? wtUrl : undefined,
       wtCertHash: hash,
       debug: muxDebug,
     });
@@ -333,7 +334,13 @@ function ConnectedApp(props: {
 
   createEffect(() => {
     const m = mux();
-    if (m) setHmrData({ mux: m, channelCache, passphrase: props.passphrase });
+    if (m)
+      setHmrData({
+        version: HMR_DATA_VERSION,
+        mux: m,
+        channelCache,
+        passphrase: props.passphrase,
+      });
   });
 
   // On real unmount (passphrase change / auth error) close all transports.

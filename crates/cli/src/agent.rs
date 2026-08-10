@@ -11,11 +11,11 @@ use blit_remote::{
     S2C_TITLE, S2C_UPDATE, SURFACE_FRAME_CODEC_AV1, SURFACE_FRAME_CODEC_MASK,
     SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState, exit_reason_text, msg_ack,
     msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_c2s_primary_set,
-    msg_close, msg_create2_full, msg_deadline, msg_input, msg_kill, msg_mouse, msg_quit, msg_read,
-    msg_resize, msg_restart, msg_subscribe, msg_surface_close, msg_surface_focus,
-    msg_surface_input, msg_surface_pointer_axis2, msg_surface_resize, msg_surface_subscribe,
-    msg_surface_subscribe_ext, msg_surface_text, msg_term_cwd, parse_server_msg,
-    parse_term_cwd_reply, status_text,
+    msg_close, msg_create2_full, msg_deadline, msg_display_rate, msg_input, msg_kill, msg_mouse,
+    msg_quit, msg_read, msg_resize, msg_restart, msg_subscribe, msg_surface_close,
+    msg_surface_focus, msg_surface_input, msg_surface_pointer_axis2, msg_surface_resize,
+    msg_surface_subscribe, msg_surface_subscribe_ext, msg_surface_subscribe_scaled,
+    msg_surface_text, msg_term_cwd, parse_server_msg, parse_term_cwd_reply, status_text,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -999,6 +999,10 @@ pub enum RecordSource {
         /// `WIDTHxHEIGHT` in physical pixels, if the caller wants the
         /// surface served at a specific size.
         size: Option<String>,
+        /// Fixed per-client encode size, which does not resize the surface.
+        encode_size: Option<String>,
+        /// Source cadence to ask the server/compositor to produce.
+        fps: u16,
     },
 }
 
@@ -1045,6 +1049,14 @@ fn parse_record_size(size: Option<&str>) -> Result<Option<(u16, u16, u16)>, Stri
     Ok(Some((parse(w, "width")?, parse(h, "height")?, scale_120)))
 }
 
+fn parse_record_encode_size(size: Option<&str>) -> Result<Option<(u16, u16)>, String> {
+    let Some(value) = size else { return Ok(None) };
+    if value.contains('@') {
+        return Err("--encode-size expects WIDTHxHEIGHT without a DPR".to_string());
+    }
+    parse_record_size(Some(value)).map(|parsed| parsed.map(|(w, h, _)| (w, h)))
+}
+
 pub async fn cmd_record(
     transport: Transport,
     id: u16,
@@ -1058,9 +1070,24 @@ pub async fn cmd_record(
     use std::time::{Duration, Instant};
 
     let is_surface = matches!(source, RecordSource::Surface { .. });
-    let (codecs, size) = match source {
-        RecordSource::Pty => (Vec::new(), None),
-        RecordSource::Surface { codecs, size } => (codecs, parse_record_size(size.as_deref())?),
+    let (codecs, size, encode_size, display_fps) = match source {
+        RecordSource::Pty => (Vec::new(), None, None, None),
+        RecordSource::Surface {
+            codecs,
+            size,
+            encode_size,
+            fps,
+        } => {
+            if fps == 0 {
+                return Err("surface recording fps must be nonzero".to_string());
+            }
+            (
+                codecs,
+                parse_record_size(size.as_deref())?,
+                parse_record_encode_size(encode_size.as_deref())?,
+                Some(fps),
+            )
+        }
     };
 
     let mut conn = AgentConn::connect(transport).await?;
@@ -1103,6 +1130,7 @@ pub async fn cmd_record(
 
     if is_surface {
         // --- Surface recording ---
+        conn.send(&msg_display_rate(display_fps.unwrap())).await?;
         let codec_support = if codecs.is_empty() {
             0 // accept anything
         } else {
@@ -1139,8 +1167,16 @@ pub async fn cmd_record(
             features.extend_from_slice(&h.to_le_bytes());
             conn.send(&features).await?;
             conn.send(&msg_surface_resize(id, w, h, scale_120)).await?;
+        } else if let Some((w, h)) = encode_size {
+            let mut features = vec![C2S_CLIENT_FEATURES, codec_support];
+            features.extend_from_slice(&w.to_le_bytes());
+            features.extend_from_slice(&h.to_le_bytes());
+            conn.send(&features).await?;
         }
-        if codec_support != 0 {
+        if let Some((w, h)) = encode_size {
+            conn.send(&msg_surface_subscribe_scaled(id, codec_support, 0, 0, w, h))
+                .await?;
+        } else if codec_support != 0 {
             conn.send(&msg_surface_subscribe_ext(id, codec_support, 0, 0))
                 .await?;
         } else {

@@ -35,6 +35,7 @@ import {
   C2S_SURFACE_ACK,
   C2S_SURFACE_CLOSE,
   C2S_CLIENT_FEATURES,
+  CLIENT_FEATURE_SURFACE_TIMESTAMP_SUB_US,
   C2S_SURFACE_PREEDIT,
   C2S_SURFACE_TEXT,
   C2S_SURFACE_DRAG_ENTER,
@@ -81,10 +82,16 @@ export function buildClientMetricsMessage(
 }
 
 export function buildDisplayRateMessage(fps: number): Uint8Array {
-  const msg = new Uint8Array(3);
+  // Keep the original integer field so this client remains compatible with
+  // older servers, then append the unsnapped millihertz measurement for new
+  // servers. At 240 Hz, rounding to a whole fps throws away more than four
+  // milliseconds of source time per second.
+  const clamped = Math.max(0, Math.min(65_535, fps));
+  const msg = new Uint8Array(7);
   msg[0] = C2S_DISPLAY_RATE;
-  msg[1] = fps & 0xff;
-  msg[2] = (fps >> 8) & 0xff;
+  const view = new DataView(msg.buffer);
+  view.setUint16(1, Math.round(clamped), true);
+  view.setUint32(3, Math.round(clamped * 1_000), true);
   return msg;
 }
 
@@ -680,8 +687,8 @@ export function buildSurfaceAxis2Message(
 }
 
 /**
- * @param scale120 DPR in 1/120th units (Wayland convention):
- *                 120 = 1×, 180 = 1.5×, 240 = 2×.
+ * @param scale120 Requested presentation scale in 1/120th units:
+ *                 60 = 0.5×, 120 = 1×, 180 = 1.5×, 240 = 2×.
  *                 0 means unspecified (server defaults to 1×).
  * @param codecSupport Bitmask of CODEC_SUPPORT_* flags. 0 = accept anything.
  */
@@ -779,11 +786,17 @@ export function buildSurfaceUnsubscribeMessage(surfaceId: number): Uint8Array {
   return msg;
 }
 
-export function buildSurfaceAckMessage(surfaceId: number): Uint8Array {
-  const msg = new Uint8Array(3);
+export function buildSurfaceAckMessage(
+  surfaceId: number,
+  decoderQueueDepth = 0,
+): Uint8Array {
+  // Byte 3 is an optional, backward-compatible WebCodecs decodeQueueSize.
+  // Old servers ignore it; old/CLI clients omit it and new servers read 0.
+  const msg = new Uint8Array(4);
   msg[0] = C2S_SURFACE_ACK;
   msg[1] = surfaceId & 0xff;
   msg[2] = (surfaceId >> 8) & 0xff;
+  msg[3] = Math.max(0, Math.min(255, Math.trunc(decoderQueueDepth)));
   return msg;
 }
 
@@ -834,14 +847,16 @@ function buildSelectionMessage(
  * decoder was confirmed to handle, as little-endian u16s.  `0` means "not
  * determined"; the server then holds the client to the H.264 ceiling rather
  * than assume a decoder that advertises AV1 will take a 5K frame.  Servers
- * predating the field ignore the extra bytes.
+ * predating the field ignore the extra bytes. `clientFeatures` negotiates
+ * optional frame extensions; bit 0 requests precise surface timestamps.
  */
 export function buildClientFeaturesMessage(
   codecSupport: number,
   maxDecodeW: number = 0,
   maxDecodeH: number = 0,
+  clientFeatures: number = CLIENT_FEATURE_SURFACE_TIMESTAMP_SUB_US,
 ): Uint8Array {
-  const msg = new Uint8Array(6);
+  const msg = new Uint8Array(7);
   msg[0] = C2S_CLIENT_FEATURES;
   msg[1] = codecSupport & 0xff;
   const w = maxDecodeW & 0xffff;
@@ -850,6 +865,7 @@ export function buildClientFeaturesMessage(
   msg[3] = (w >> 8) & 0xff;
   msg[4] = h & 0xff;
   msg[5] = (h >> 8) & 0xff;
+  msg[6] = clientFeatures & 0xff;
   return msg;
 }
 

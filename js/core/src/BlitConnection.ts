@@ -3,6 +3,7 @@ import type {
   BlitSearchResult,
   BlitSession,
   BlitTransport,
+  BlitTransportMessage,
   ConnectionId,
   ConnectionStatus,
   CopyRangeResult,
@@ -41,6 +42,7 @@ import {
   S2C_SURFACE_DESTROYED,
   S2C_SURFACE_ENCODER,
   S2C_SURFACE_FRAME,
+  SURFACE_FRAME_FLAG_TIMESTAMP_SUB_US,
   S2C_SURFACE_RESIZED,
   S2C_SURFACE_TITLE,
   S2C_FRAGMENT,
@@ -748,7 +750,7 @@ export class BlitConnection {
   /** Per-session, per-view size registry for computing minimum resize. */
   private viewSizes = new Map<
     SessionId,
-    Map<string, { rows: number; cols: number }>
+    Map<string, { rows: number; cols: number; isActive?: () => boolean }>
   >();
   private viewIdCounter = 0;
   private hasReceivedList = false;
@@ -771,16 +773,20 @@ export class BlitConnection {
   surfaceStreamingEnabled = true;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private readonly pingIntervalMs = 10_000;
+  private clockPingNonce = 0;
+  private pendingClockPings = new Map<number, number>();
 
   /**
-   * Reassembly buffer for `S2C_FRAGMENT` messages.  TCP preserves order
-   * and the server only splits one bulk message at a time, so a single
-   * buffer is enough — fragments of different messages never interleave.
-   * Audio frames and other small messages may arrive between fragments
-   * and are dispatched immediately, bypassing this buffer.
+   * Reusable accumulator for `S2C_FRAGMENT` messages. TCP preserves order
+   * and the server only splits one bulk message at a time, so fragments of
+   * different messages never interleave. Incoming transport views are
+   * borrowed; copy them into this buffer synchronously, then reuse its
+   * capacity after dispatch instead of allocating once per fragment.
+   * Audio frames and other small messages bypass this buffer.
    */
-  private fragmentChunks: Uint8Array[] = [];
+  private fragmentBuffer = new Uint8Array(0);
   private fragmentBytes = 0;
+  private readonly surfaceAckMessages = new Map<number, Uint8Array>();
 
   private snapshot: BlitConnectionSnapshot;
   private sessions: InternalSession[] = [];
@@ -803,9 +809,19 @@ export class BlitConnection {
       warn: (m, ...a) => console.warn(`[blit] ${m}`, ...a),
     };
     this.surfaceStore.setConnectionId(id);
-    this.surfaceStore.setAckSender((surfaceId) => {
+    this.surfaceStore.setAckSender((surfaceId, decoderQueueDepth) => {
       if (this.transport.status === "connected") {
-        this.transport.send(buildSurfaceAckMessage(surfaceId));
+        let message = this.surfaceAckMessages.get(surfaceId);
+        if (!message) {
+          message = buildSurfaceAckMessage(surfaceId, decoderQueueDepth);
+          this.surfaceAckMessages.set(surfaceId, message);
+        } else {
+          message[3] = Math.max(
+            0,
+            Math.min(255, Math.trunc(decoderQueueDepth)),
+          );
+        }
+        this.transport.send(message);
       }
     });
     this.surfaceStore.setKeyframeSender((surfaceId) => {
@@ -940,6 +956,7 @@ export class BlitConnection {
       clearInterval(this.pingTimer);
       this.pingTimer = null;
     }
+    this.pendingClockPings.clear();
     this.transport.removeEventListener("message", this.handleMessage);
     this.transport.removeEventListener("statuschange", this.handleStatusChange);
     this.rejectPendingCreates(
@@ -2998,13 +3015,14 @@ export class BlitConnection {
     viewId: string,
     rows: number,
     cols: number,
+    isActive?: () => boolean,
   ): void {
     let views = this.viewSizes.get(sessionId);
     if (!views) {
       views = new Map();
       this.viewSizes.set(sessionId, views);
     }
-    views.set(viewId, { rows, cols });
+    views.set(viewId, { rows, cols, isActive });
     this.sendMinSize(sessionId);
   }
 
@@ -3021,9 +3039,46 @@ export class BlitConnection {
     }
   }
 
+  /**
+   * Forget every mounted terminal view owned by this browser client.
+   *
+   * This is primarily an HMR recovery boundary. A hot update can replace the
+   * UI tree without running every old surface cleanup, leaving an orphaned
+   * (often smaller) view in {@link viewSizes}. Since the session uses the
+   * minimum of all registered views, that stale entry pins the terminal to a
+   * small grid until the page is refreshed. Clear the server constraints in
+   * one batch before the replacement tree registers its live views again.
+   */
+  resetViewSizes(): void {
+    const sessionIds = [...this.viewSizes.keys()];
+    if (sessionIds.length === 0) return;
+    this.viewSizes.clear();
+    this.clearSessionSizes(sessionIds);
+  }
+
   private sendMinSize(sessionId: SessionId): void {
     const views = this.viewSizes.get(sessionId);
     if (!views || views.size === 0) return;
+    // HMR can remove a terminal's DOM subtree without reaching the old
+    // component cleanup. The replacement surface still registers normally;
+    // prune disconnected predecessors at that point so an orphaned small pane
+    // cannot remain the session minimum until a full page refresh.
+    for (const [viewId, view] of views) {
+      if (!view.isActive) continue;
+      let active = false;
+      try {
+        active = view.isActive();
+      } catch {
+        // A liveness probe belongs to UI teardown code. If that code is gone,
+        // the view it described is gone too.
+      }
+      if (!active) views.delete(viewId);
+    }
+    if (views.size === 0) {
+      this.viewSizes.delete(sessionId);
+      this.clearSessionSize(sessionId);
+      return;
+    }
     let minRows = Infinity;
     let minCols = Infinity;
     for (const { rows, cols } of views.values()) {
@@ -3728,12 +3783,27 @@ export class BlitConnection {
   /** Drop any half-received fragment sequence (reconnect or dispose) so it
    *  cannot bleed into the first fragmented message on the next connection. */
   private resetFragmentReassembly(): void {
-    this.fragmentChunks = [];
+    // Disconnects and malformed over-sized sequences release the allocation;
+    // successful messages only reset fragmentBytes and retain capacity.
+    this.fragmentBuffer = new Uint8Array(0);
     this.fragmentBytes = 0;
   }
 
-  private handleMessage = (data: ArrayBuffer): void => {
-    const bytes = new Uint8Array(data);
+  /** Grow the fragment accumulator geometrically. In steady state the first
+   *  large frame sizes it and later frames require no reassembly allocation. */
+  private ensureFragmentCapacity(required: number): void {
+    if (required <= this.fragmentBuffer.length) return;
+    let capacity = Math.max(4 * 1024, this.fragmentBuffer.length);
+    while (capacity < required) {
+      capacity = Math.min(capacity * 2, FS_MAX_DECOMPRESSED);
+    }
+    const grown = new Uint8Array(capacity);
+    grown.set(this.fragmentBuffer.subarray(0, this.fragmentBytes));
+    this.fragmentBuffer = grown;
+  }
+
+  private handleMessage = (data: BlitTransportMessage): void => {
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
     if (bytes.length === 0) return;
 
     const type = bytes[0];
@@ -3747,26 +3817,28 @@ export class BlitConnection {
       // A complete message can never exceed the protocol-wide decompressed
       // ceiling, so a fragment stream that grows past it is a buggy or
       // hostile peer — drop the partial rather than reassemble without
-      // bound. Without this a peer that never sets FRAGMENT_FLAG_LAST grows
-      // the buffer until the tab dies, and each chunk is a subarray that
-      // pins the whole frame it arrived in. The Rust reader has always had
-      // this guard; the browser did not.
+      // bound. The Rust reader has always had this guard; the browser did not.
       if (this.fragmentBytes + chunk.length > FS_MAX_DECOMPRESSED) {
         this.resetFragmentReassembly();
         return;
       }
-      this.fragmentChunks.push(chunk);
-      this.fragmentBytes += chunk.length;
+      // Transport callbacks may expose a borrowed view into a reusable BYOB
+      // or decoder buffer. Copy it now into one reusable accumulator; keeping
+      // the view itself would let the next read overwrite this fragment.
+      const nextBytes = this.fragmentBytes + chunk.length;
+      this.ensureFragmentCapacity(nextBytes);
+      this.fragmentBuffer.set(chunk, this.fragmentBytes);
+      this.fragmentBytes = nextBytes;
       if (flags & FRAGMENT_FLAG_LAST) {
-        const reassembled = new Uint8Array(this.fragmentBytes);
-        let offset = 0;
-        for (const c of this.fragmentChunks) {
-          reassembled.set(c, offset);
-          offset += c.length;
-        }
-        this.fragmentChunks = [];
+        // handleMessage and all synchronous parsers honor the transport's
+        // borrowed-view contract. Promise results that escape it take their
+        // own copy at the resolve site below.
+        const reassembled = this.fragmentBuffer.subarray(
+          0,
+          this.fragmentBytes,
+        );
         this.fragmentBytes = 0;
-        this.handleMessage(reassembled.buffer);
+        this.handleMessage(reassembled);
       }
       return;
     }
@@ -3777,7 +3849,24 @@ export class BlitConnection {
 
     switch (type) {
       case S2C_PING:
-        // Application-level keepalive — no action needed.
+        if (bytes.length >= 9) {
+          const view = new DataView(
+            bytes.buffer,
+            bytes.byteOffset,
+            bytes.byteLength,
+          );
+          const nonce = view.getUint32(1, true);
+          const serverMs = view.getUint32(5, true);
+          const sentAt = this.pendingClockPings.get(nonce);
+          if (sentAt !== undefined) {
+            this.pendingClockPings.delete(nonce);
+            this.surfaceStore.noteServerClock(
+              serverMs,
+              sentAt,
+              performance.now(),
+            );
+          }
+        }
         return;
       case S2C_QUIT:
         // Server is shutting down.  Immediately dismiss all sessions and
@@ -4080,7 +4169,11 @@ export class BlitConnection {
       case S2C_SURFACE_CREATED: {
         try {
           if (bytes.length < 11) return;
-          const view = new DataView(data);
+          const view = new DataView(
+            bytes.buffer,
+            bytes.byteOffset,
+            bytes.byteLength,
+          );
           const surfaceId = view.getUint16(1, true);
           const parentId = view.getUint16(3, true);
           const width = view.getUint16(5, true);
@@ -4117,14 +4210,26 @@ export class BlitConnection {
         return;
       }
       case S2C_SURFACE_FRAME: {
-        // Layout: [type][sid 2][timestamp 4][flags 1][w 2][h 2][data…]
+        // Base layout: [type][sid 2][timestamp 4][flags 1][w 2][h 2][data…]
+        // Precise layout appends [sub_us 2] before data and marks flag bit 3.
         if (bytes.length < 12) return;
-        const view = new DataView(data);
-        const surfaceId = view.getUint16(1, true);
-        const timestamp = view.getUint32(3, true);
+        const surfaceId = bytes[1] | (bytes[2] << 8);
+        const timestamp =
+          (bytes[3] |
+            (bytes[4] << 8) |
+            (bytes[5] << 16) |
+            (bytes[6] << 24)) >>>
+          0;
         const flags = bytes[7];
-        const width = view.getUint16(8, true);
-        const height = view.getUint16(10, true);
+        const width = bytes[8] | (bytes[9] << 8);
+        const height = bytes[10] | (bytes[11] << 8);
+        const hasSubUs =
+          (flags & SURFACE_FRAME_FLAG_TIMESTAMP_SUB_US) !== 0;
+        if (hasSubUs && bytes.length < 14) return;
+        const timestampSubUs = hasSubUs
+          ? bytes[12] | (bytes[13] << 8)
+          : 0;
+        const dataOffset = hasSubUs ? 14 : 12;
         try {
           // The store sends ACKs itself, deferring them when the decode
           // queue is deep to apply backpressure on the server.
@@ -4134,7 +4239,8 @@ export class BlitConnection {
             flags,
             width,
             height,
-            bytes.subarray(12),
+            bytes.subarray(dataOffset),
+            timestampSubUs,
           );
         } catch {
           // Swallowed decode errors must still ACK so the server's pacing
@@ -4169,11 +4275,17 @@ export class BlitConnection {
           } else if (cursorType === 2) {
             // Custom image: hotx(2) + hoty(2) + w(2) + h(2) + png
             if (bytes.length < 12) return;
-            const view = new DataView(data);
+            const view = new DataView(
+              bytes.buffer,
+              bytes.byteOffset,
+              bytes.byteLength,
+            );
             const hotX = view.getUint16(4, true);
             const hotY = view.getUint16(6, true);
             const pngData = bytes.subarray(12);
-            const blob = new Blob([pngData], { type: "image/png" });
+            const blob = new Blob([new Uint8Array(pngData)], {
+              type: "image/png",
+            });
             const url = URL.createObjectURL(blob);
             this.surfaceStore.handleSurfaceCursor(
               surfaceId,
@@ -4187,7 +4299,11 @@ export class BlitConnection {
         try {
           // Layout: [type][sid 2][name + 0 + codec_str]
           if (bytes.length < 3) return;
-          const view = new DataView(data);
+          const view = new DataView(
+            bytes.buffer,
+            bytes.byteOffset,
+            bytes.byteLength,
+          );
           const surfaceId = view.getUint16(1, true);
           const encoderName = textDecoder.decode(bytes.subarray(3));
           this.surfaceStore.handleSurfaceEncoder(surfaceId, encoderName);
@@ -4214,7 +4330,11 @@ export class BlitConnection {
       case S2C_SURFACE_RESIZED: {
         try {
           if (bytes.length < 7) return;
-          const view = new DataView(data);
+          const view = new DataView(
+            bytes.buffer,
+            bytes.byteOffset,
+            bytes.byteLength,
+          );
           const surfaceId = view.getUint16(1, true);
           const width = view.getUint16(3, true);
           const height = view.getUint16(5, true);
@@ -4234,7 +4354,11 @@ export class BlitConnection {
       case S2C_AUDIO_FRAME: {
         try {
           if (bytes.length < 6) return;
-          const view = new DataView(data);
+          const view = new DataView(
+            bytes.buffer,
+            bytes.byteOffset,
+            bytes.byteLength,
+          );
           const timestamp = view.getUint32(1, true);
           const flags = bytes[5];
           const audioData = bytes.subarray(6);
@@ -4245,7 +4369,11 @@ export class BlitConnection {
       case S2C_CLIPBOARD_CONTENT: {
         try {
           if (bytes.length < 7) return;
-          const view = new DataView(data);
+          const view = new DataView(
+            bytes.buffer,
+            bytes.byteOffset,
+            bytes.byteLength,
+          );
           const mimeLen = view.getUint16(1, true);
           if (bytes.length < 3 + mimeLen + 4) return;
           const mimeType = textDecoder.decode(bytes.subarray(3, 3 + mimeLen));
@@ -4797,7 +4925,7 @@ export class BlitConnection {
         this.pendingGitRequests.delete(nonce);
         // An abandoned request has already rejected; the reply only
         // releases its nonce.
-        if (!pending.abandoned) pending.resolve(bytes);
+        if (!pending.abandoned) pending.resolve(bytes.slice());
         return;
       }
       case S2C_LSP_OPENED: {
@@ -4872,7 +5000,7 @@ export class BlitConnection {
         const pending = this.pendingLspRequests.get(nonce);
         if (!pending) return;
         this.pendingLspRequests.delete(nonce);
-        pending.resolve(bytes);
+        pending.resolve(bytes.slice());
         return;
       }
       case S2C_LSP_CLOSED: {
@@ -4904,12 +5032,13 @@ export class BlitConnection {
       this.hasReceivedList = false;
       this.retryCount = 0;
       this.lastError = null;
+      this.pendingClockPings.clear();
+      this.surfaceStore.clearServerClock();
+      this.sendClockPing();
       // Start application-level keepalive.
       if (this.pingTimer === null && this.pingIntervalMs > 0) {
         this.pingTimer = setInterval(() => {
-          if (this.transport.status === "connected") {
-            this.transport.send(new Uint8Array([C2S_PING]));
-          }
+          this.sendClockPing();
         }, this.pingIntervalMs);
       }
       // Detect supported codecs and inform the server.  Surface subscribes
@@ -4964,6 +5093,8 @@ export class BlitConnection {
         clearInterval(this.pingTimer);
         this.pingTimer = null;
       }
+      this.pendingClockPings.clear();
+      this.surfaceStore.clearServerClock();
       this.rejectPendingCreates(
         connectionError(`Transport ${status} before PTY creation completed`),
       );
@@ -5016,6 +5147,21 @@ export class BlitConnection {
 
     this.emit();
   };
+
+  private sendClockPing(): void {
+    if (this.transport.status !== "connected") return;
+    this.clockPingNonce = (this.clockPingNonce + 1) >>> 0;
+    const message = new Uint8Array(5);
+    message[0] = C2S_PING;
+    new DataView(message.buffer).setUint32(1, this.clockPingNonce, true);
+    this.pendingClockPings.set(this.clockPingNonce, performance.now());
+    while (this.pendingClockPings.size > 4) {
+      const oldest = this.pendingClockPings.keys().next().value;
+      if (oldest === undefined) break;
+      this.pendingClockPings.delete(oldest);
+    }
+    this.transport.send(message);
+  }
 
   private parseListMessage(
     bytes: Uint8Array,

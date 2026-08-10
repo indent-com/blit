@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { MuxTransport } from "../transports/mux";
+import type { BlitTransportMessage } from "../types";
 
 class MockWebSocket {
   static CONNECTING = 0 as const;
@@ -67,6 +68,73 @@ class NeverReadyWebTransport {
   }
 }
 
+class EofReader {
+  private index = 0;
+
+  constructor(private readonly chunks: Uint8Array[]) {}
+
+  async read(): Promise<ReadableStreamReadResult<Uint8Array>> {
+    if (this.index >= this.chunks.length) {
+      return { done: true, value: undefined };
+    }
+    return { done: false, value: this.chunks[this.index++] };
+  }
+
+  releaseLock() {}
+}
+
+class MockWtWriter {
+  writes: Uint8Array[] = [];
+
+  async write(data: Uint8Array): Promise<void> {
+    this.writes.push(new Uint8Array(data));
+  }
+}
+
+/** A WT session whose stream reaches EOF while wt.closed stays pending. */
+class StreamEofWebTransport {
+  static instances: StreamEofWebTransport[] = [];
+  static queuedChunks: Uint8Array[][] = [];
+
+  readonly ready = Promise.resolve();
+  readonly closed = new Promise<WebTransportCloseInfo>(() => {});
+  readonly reader: EofReader;
+  readonly writer = new MockWtWriter();
+  closedByClient = false;
+
+  constructor(readonly url: string) {
+    this.reader = new EofReader(
+      StreamEofWebTransport.queuedChunks.shift() ?? [],
+    );
+    StreamEofWebTransport.instances.push(this);
+  }
+
+  static queueConnection(...chunks: Uint8Array[]) {
+    StreamEofWebTransport.queuedChunks.push(chunks);
+  }
+
+  async createBidirectionalStream(): Promise<WebTransportBidirectionalStream> {
+    const reader = this.reader;
+    return {
+      readable: {
+        getReader(options?: { mode?: string }) {
+          if (options?.mode === "byob") throw new TypeError("not a byte stream");
+          return reader;
+        },
+      },
+      writable: { getWriter: () => this.writer },
+    } as unknown as WebTransportBidirectionalStream;
+  }
+
+  close() {
+    this.closedByClient = true;
+  }
+}
+
+async function flushPromises(): Promise<void> {
+  for (let i = 0; i < 12; i++) await Promise.resolve();
+}
+
 function latestSocket(): MockWebSocket {
   return MockWebSocket.instances[MockWebSocket.instances.length - 1];
 }
@@ -104,6 +172,8 @@ describe("MuxTransport", () => {
     vi.useFakeTimers();
     MockWebSocket.instances = [];
     NeverReadyWebTransport.instances = [];
+    StreamEofWebTransport.instances = [];
+    StreamEofWebTransport.queuedChunks = [];
     vi.stubGlobal("WebSocket", MockWebSocket);
   });
 
@@ -127,6 +197,44 @@ describe("MuxTransport", () => {
     expect(MockWebSocket.instances).toHaveLength(1);
     expect(latestSocket().url).toBe("ws://host/mux");
     expect(NeverReadyWebTransport.instances[0].closedByClient).toBe(true);
+
+    mux.close();
+  });
+
+  it("falls back to WebSocket when WebTransport authentication reaches EOF", async () => {
+    vi.stubGlobal("WebTransport", StreamEofWebTransport);
+    StreamEofWebTransport.queueConnection();
+    const mux = new MuxTransport("ws://host/mux", "secret", {
+      wtUrl: "https://host/mux",
+    });
+    const ch = mux.createChannel("remote");
+
+    mux.connect();
+    await flushPromises();
+
+    expect(ch.authRejected).toBe(false);
+    expect(MockWebSocket.instances).toHaveLength(1);
+
+    mux.close();
+  });
+
+  it("reconnects when the WT receive stream ends but the session stays open", async () => {
+    vi.stubGlobal("WebTransport", StreamEofWebTransport);
+    StreamEofWebTransport.queueConnection(new Uint8Array([1]));
+    const mux = new MuxTransport("ws://host/mux", "secret", {
+      wtUrl: "https://host/mux",
+      reconnectDelay: 20,
+    });
+
+    mux.connect();
+    await flushPromises();
+
+    expect(mux.status).toBe("disconnected");
+    expect(StreamEofWebTransport.instances[0].closedByClient).toBe(true);
+    expect(MockWebSocket.instances).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(20);
+    expect(MockWebSocket.instances).toHaveLength(1);
 
     mux.close();
   });
@@ -211,6 +319,35 @@ describe("MuxTransport", () => {
     mux.close();
   });
 
+  it("adopts a changed WT authority even when the cert hash is unchanged", async () => {
+    vi.stubGlobal("WebTransport", NeverReadyWebTransport);
+    const hash = "aa".repeat(32);
+    const mux = new MuxTransport("ws://host/mux", "secret", {
+      wtUrl: "https://old-host/mux",
+      wtCertHash: hash,
+      wtConnectTimeoutMs: 25,
+      wtReprobeMs: 10_000,
+      reconnectDelay: 20,
+    });
+
+    mux.connect();
+    await vi.advanceTimersByTimeAsync(25);
+    expect(NeverReadyWebTransport.instances).toHaveLength(1);
+
+    mux.updateWtCertHash(hash, "https://new-host/mux");
+    latestSocket().simulateOpen();
+    latestSocket().simulateMessage("mux");
+    latestSocket().close();
+    await vi.advanceTimersByTimeAsync(20);
+
+    expect(NeverReadyWebTransport.instances).toHaveLength(2);
+    expect(NeverReadyWebTransport.instances[1].url).toBe(
+      "https://new-host/mux",
+    );
+
+    mux.close();
+  });
+
   it("retries a virtual channel open when the gateway never acknowledges it", async () => {
     const mux = new MuxTransport("ws://host/mux", "secret", {
       reconnectDelay: 20,
@@ -257,6 +394,64 @@ describe("MuxTransport", () => {
     ]);
 
     mux.close();
+  });
+
+  it("delivers channel payloads as zero-copy views", () => {
+    const mux = new MuxTransport("ws://host/mux", "secret");
+    const ch = mux.createChannel("remote");
+    const received: BlitTransportMessage[] = [];
+    ch.addEventListener("message", (data) => received.push(data));
+
+    mux.connect();
+    latestSocket().simulateOpen();
+    latestSocket().simulateMessage("mux");
+    ch.connect();
+    latestSocket().simulateMessage(controlFrame(0x81, 0));
+
+    const frame = new Uint8Array([0, 0, 10, 20, 30]);
+    latestSocket().simulateMessage(frame.buffer);
+
+    expect(received).toHaveLength(1);
+    expect(received[0]).toBeInstanceOf(Uint8Array);
+    const payload = received[0] as Uint8Array;
+    expect(payload.buffer).toBe(frame.buffer);
+    expect(payload.byteOffset).toBe(2);
+    expect(Array.from(payload)).toEqual([10, 20, 30]);
+
+    mux.close();
+  });
+
+  it("moves consumed WebSocket backing stores to the recycler worker", () => {
+    const posted: ArrayBuffer[] = [];
+    const terminated: boolean[] = [];
+    vi.stubGlobal(
+      "Worker",
+      class {
+        postMessage(buffer: ArrayBuffer) {
+          posted.push(buffer);
+        }
+        terminate() {
+          terminated.push(true);
+        }
+      },
+    );
+    const mux = new MuxTransport("ws://host/mux", "secret");
+    const ch = mux.createChannel("remote");
+    ch.addEventListener("message", () => {});
+
+    mux.connect();
+    latestSocket().simulateOpen();
+    latestSocket().simulateMessage("mux");
+    ch.connect();
+    latestSocket().simulateMessage(controlFrame(0x81, 0));
+    posted.length = 0;
+
+    const frame = new Uint8Array([0, 0, 10, 20, 30]);
+    latestSocket().simulateMessage(frame.buffer);
+    expect(posted).toEqual([frame.buffer]);
+
+    mux.close();
+    expect(terminated).toEqual([true]);
   });
 
   // "busy" is the throttle refusing a handshake without checking the

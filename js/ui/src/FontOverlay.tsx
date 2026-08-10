@@ -78,6 +78,11 @@ export function FontOverlay(props: {
     return (!curated() && trimmedQuery()) || originalFamily;
   };
 
+  const previewSize = (nextSize: number) => {
+    setSize(nextSize);
+    props.onPreview(pendingFamily(), nextSize, gamma());
+  };
+
   const selectFont = (idx: number) => {
     const f = filtered();
     setSelectedIdx(idx);
@@ -268,7 +273,7 @@ export function FontOverlay(props: {
               min={8}
               max={32}
               value={size()}
-              onInput={(e) => setSize(Number(e.currentTarget.value))}
+              onInput={(e) => previewSize(Number(e.currentTarget.value))}
               style={{ flex: 1 }}
             />
             <input
@@ -279,7 +284,7 @@ export function FontOverlay(props: {
               value={size()}
               onInput={(e) => {
                 const n = Number(e.currentTarget.value);
-                if (n > 0) setSize(n);
+                if (n > 0) previewSize(n);
               }}
               style={{
                 ...inputStyle(),

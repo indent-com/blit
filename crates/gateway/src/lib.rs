@@ -79,6 +79,26 @@ static SW_ETAG: LazyLock<String> = LazyLock::new(|| blit_webserver::html_etag(SW
 
 type DestMap = std::collections::HashMap<String, GatewayConnector>;
 
+#[derive(Debug, PartialEq, Eq)]
+struct WebTransportPublicAddr {
+    /// `None` means the browser reuses the page hostname.
+    host: Option<String>,
+    port: u16,
+}
+
+impl std::fmt::Display for WebTransportPublicAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.host.as_deref() {
+            Some(host) if host.starts_with('[') && host.ends_with(']') => {
+                write!(f, "{host}:{}", self.port)
+            }
+            Some(host) if host.contains(':') => write!(f, "[{host}]:{}", self.port),
+            Some(host) => write!(f, "{host}:{}", self.port),
+            None => write!(f, ":{}", self.port),
+        }
+    }
+}
+
 struct Config {
     passphrase: blit_webserver::config::AuthPassphrase,
     /// Resolved connectors for routing WebSocket/WebTransport connections.
@@ -92,6 +112,9 @@ struct Config {
     roots: blit_webserver::config::RootsState,
     cors_origin: Option<String>,
     wt_cert_hash: std::sync::RwLock<Option<String>>,
+    /// Browser-facing `host:port` (or `:port`) advertised to authenticated
+    /// clients. The browser location supplies an omitted hostname.
+    wt_public_addr: Option<WebTransportPublicAddr>,
     config_state: blit_webserver::config::ConfigState,
     /// When `BLIT_PROXY=1`, all proxiable upstream connections are routed
     /// through this blit-proxy socket path instead of connecting directly.
@@ -403,10 +426,37 @@ type AppState = Arc<Config>;
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
+/// AF41 maps interactive video onto the Wi-Fi Multimedia video access class
+/// on networks that honor DSCP, instead of competing as best-effort bulk TCP.
+const INTERACTIVE_TOS: u32 = 34 << 2;
+/// Keep at most roughly one large encoded frame waiting unsent in the kernel.
+/// The default effectively lets the whole autotuned send buffer fill, hiding
+/// congestion from the async writer and turning a Wi-Fi loss into a long
+/// stale-video queue before application backpressure can react.
+#[cfg(target_os = "linux")]
+const TCP_NOTSENT_LOWAT: u32 = 64 * 1024;
+
+fn configure_browser_tcp(stream: &tokio::net::TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let socket = socket2::SockRef::from(stream);
+    let _ = socket.set_tos_v4(INTERACTIVE_TOS);
+    #[cfg(unix)]
+    let _ = socket.set_tclass_v6(INTERACTIVE_TOS);
+    #[cfg(target_os = "linux")]
+    {
+        // Linux priority 4 is the 802.1D video class. This also selects the
+        // corresponding hardware queue when the egress device exposes one.
+        let _ = socket.set_priority(4);
+        let _ = socket.set_tcp_notsent_lowat(TCP_NOTSENT_LOWAT);
+    }
+}
+
 /// Upstream data frames the mux writer may hold for one browser before the
-/// upstream readers stall.  Deep enough to absorb a jittery WebSocket write,
-/// shallow enough that the blit server feels the backpressure.
-const MUX_DATA_QUEUE_FRAMES: usize = 8;
+/// upstream readers stall. Keep only one waiting behind the frame currently
+/// being written: at 240 fps an eight-frame application queue could hide over
+/// 33 ms of congestion from the server before TCP backpressure reached it.
+/// The socket buffers and server ACK window still carry the link BDP.
+const MUX_DATA_QUEUE_FRAMES: usize = 1;
 
 /// Largest `/config` message. That endpoint speaks short text control lines
 /// (`set k v`, `remotes-add …`), so 64 KiB is already generous; the point is
@@ -498,6 +548,34 @@ pub async fn run() {
         .ok()
         .map(|v| v == "1")
         .unwrap_or(false);
+    let wt_public_addr = if quic_enabled {
+        let configured = std::env::var("BLIT_QUIC_PUBLIC_ADDR")
+            .ok()
+            .filter(|raw| !raw.trim().is_empty());
+        configured.map_or_else(
+            || {
+                let port = addr
+                    .parse::<SocketAddr>()
+                    .unwrap_or_else(|e| {
+                        eprintln!("blit gateway: invalid BLIT_ADDR '{addr}': {e}");
+                        std::process::exit(1);
+                    })
+                    .port();
+                Some(WebTransportPublicAddr { host: None, port })
+            },
+            |raw| {
+                Some(parse_webtransport_public_addr(&raw).unwrap_or_else(|| {
+                    eprintln!(
+                        "blit gateway: invalid BLIT_QUIC_PUBLIC_ADDR '{raw}' \
+                         (expected hostname:port or :port)"
+                    );
+                    std::process::exit(1);
+                }))
+            },
+        )
+    } else {
+        None
+    };
 
     let cors_origin = std::env::var("BLIT_CORS").ok();
     let config_state = blit_webserver::config::ConfigState::new();
@@ -530,6 +608,7 @@ pub async fn run() {
         roots,
         cors_origin,
         wt_cert_hash: std::sync::RwLock::new(None),
+        wt_public_addr,
         config_state,
         proxy_sock,
         ssh_pool,
@@ -583,7 +662,7 @@ pub async fn run() {
             std::process::exit(1);
         });
     let listener = tcp.tap_io(|stream| {
-        let _ = stream.set_nodelay(true);
+        configure_browser_tcp(stream);
     });
     eprintln!(
         "listening on {addr} (WebSocket{}){}",
@@ -733,6 +812,35 @@ fn mux_error(ch: u16, msg: &str) -> Vec<u8> {
     buf
 }
 
+fn parse_webtransport_public_addr(raw: &str) -> Option<WebTransportPublicAddr> {
+    let raw = raw.trim();
+    if let Some(port) = raw.strip_prefix(':') {
+        let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
+        return Some(WebTransportPublicAddr { host: None, port });
+    }
+
+    let url = url::Url::parse(&format!("https://{raw}")).ok()?;
+    if url.username() != ""
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?.to_string();
+    let port = raw
+        .rsplit_once(':')?
+        .1
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)?;
+    Some(WebTransportPublicAddr {
+        host: Some(host),
+        port,
+    })
+}
+
 async fn root_handler(State(state): State<AppState>, request: axum::extract::Request) -> Response {
     let auth_peer = request
         .extensions()
@@ -784,6 +892,9 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
                             .webrtc_enabled
                             .then_some(mark_share_remotes_proxiable as fn(&str) -> String);
                         let mut extra_init = Vec::new();
+                        if let Some(addr) = state.wt_public_addr.as_ref() {
+                            extra_init.push(format!("wt-addr={addr}"));
+                        }
                         if let Some(hash) = state.wt_cert_hash.read().unwrap().as_ref() {
                             extra_init.push(format!("wt={hash}"));
                         }
@@ -1335,6 +1446,14 @@ fn build_quinn_server_config(
     // pings alone can't keep an idle session alive.  Server-initiated QUIC
     // PINGs reset the idle timers on both ends independently of the page.
     let mut transport = wt::quinn::TransportConfig::default();
+    // A ten-packet initial window is smaller than a typical surface frame and
+    // makes a fresh high-refresh stream stop for ACKs mid-frame. Keep enough
+    // initial flight for a local-Wi-Fi BDP, but use CUBIC rather than Quinn's
+    // experimental BBR implementation: BBR's 1.25/0.75 ProbeBW gain cycle
+    // advances once per RTT and showed up as a deterministic video cadence.
+    let mut cubic = wt::quinn::congestion::CubicConfig::default();
+    cubic.initial_window(256 * 1024);
+    transport.congestion_controller_factory(Arc::new(cubic));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
     transport.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into()?));
     server_config.transport_config(Arc::new(transport));
@@ -1348,7 +1467,37 @@ fn bind_v6only_udp(addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpS
     Ok(sock.into())
 }
 
-/// Run the WebTransport server on both IPv4 and IPv6.
+fn bind_webtransport_endpoint(
+    config: wt::quinn::ServerConfig,
+    bind_addr: std::net::SocketAddr,
+) -> std::io::Result<wt::quinn::Endpoint> {
+    if bind_addr.is_ipv6() {
+        let sock = bind_v6only_udp(bind_addr)?;
+        wt::quinn::Endpoint::new(
+            wt::quinn::EndpointConfig::default(),
+            Some(config),
+            sock,
+            wt::quinn::default_runtime().unwrap(),
+        )
+    } else {
+        wt::quinn::Endpoint::server(config, bind_addr)
+    }
+}
+
+/// `0.0.0.0` means the gateway should be reachable on every local address,
+/// including IPv6. Exact IPv4 addresses and all explicit IPv6 addresses keep
+/// their requested scope.
+fn webtransport_secondary_bind_addr(
+    bind_addr: std::net::SocketAddr,
+) -> Option<std::net::SocketAddr> {
+    if bind_addr.ip().is_ipv4() && bind_addr.ip().is_unspecified() {
+        Some(([0, 0, 0, 0, 0, 0, 0, 0], bind_addr.port()).into())
+    } else {
+        None
+    }
+}
+
+/// Run the WebTransport server on the configured address.
 /// For self-signed certs, regenerates every 13 days.
 async fn run_webtransport_loop(state: AppState, addr: &str, has_explicit_cert: bool) {
     let bind_addr: std::net::SocketAddr = match addr.parse() {
@@ -1358,8 +1507,6 @@ async fn run_webtransport_loop(state: AppState, addr: &str, has_explicit_cert: b
             return;
         }
     };
-    let port = bind_addr.port();
-
     loop {
         let (certs, key, cert_hash) = if has_explicit_cert {
             match load_tls_cert(
@@ -1377,8 +1524,6 @@ async fn run_webtransport_loop(state: AppState, addr: &str, has_explicit_cert: b
         };
 
         let hash_hex: String = cert_hash.iter().map(|b| format!("{b:02x}")).collect();
-        eprintln!("webtransport cert SHA-256: {hash_hex}");
-        *state.wt_cert_hash.write().unwrap() = Some(hash_hex);
 
         let config = match build_quinn_server_config(certs, key) {
             Ok(c) => c,
@@ -1388,72 +1533,45 @@ async fn run_webtransport_loop(state: AppState, addr: &str, has_explicit_cert: b
             }
         };
 
-        // Bind both IPv4 and IPv6 so localhost (::1) and 127.0.0.1 both work.
-        let v4_addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
-        let v6_addr: std::net::SocketAddr = ([0, 0, 0, 0, 0, 0, 0, 0], port).into();
-
-        let mut server4 = match wt::quinn::Endpoint::server(config.clone(), v4_addr) {
-            Ok(ep) => {
-                eprintln!("webtransport: listening on {v4_addr} (IPv4/QUIC)");
-                wt::Server::new(ep)
-            }
+        // Match the TCP listener's scope exactly. In particular,
+        // BLIT_ADDR=127.0.0.1 must not expose QUIC on every interface.
+        let endpoint = match bind_webtransport_endpoint(config.clone(), bind_addr) {
+            Ok(endpoint) => endpoint,
             Err(e) => {
-                eprintln!("webtransport: IPv4 bind failed: {e}");
+                eprintln!("webtransport: bind failed on {bind_addr}: {e}");
+                *state.wt_cert_hash.write().unwrap() = None;
                 return;
             }
         };
-        let mut server6 = match bind_v6only_udp(v6_addr) {
-            Ok(sock) => match wt::quinn::Endpoint::new(
-                wt::quinn::EndpointConfig::default(),
-                Some(config),
-                sock,
-                wt::quinn::default_runtime().unwrap(),
-            ) {
-                Ok(ep) => {
-                    eprintln!("webtransport: listening on [{v6_addr}] (IPv6/QUIC)");
-                    wt::Server::new(ep)
-                }
+        let mut server = wt::Server::new(endpoint);
+        let secondary_addr = webtransport_secondary_bind_addr(bind_addr);
+        let mut secondary_server =
+            secondary_addr.and_then(|addr| match bind_webtransport_endpoint(config, addr) {
+                Ok(endpoint) => Some(wt::Server::new(endpoint)),
                 Err(e) => {
-                    eprintln!("webtransport: IPv6 endpoint failed (continuing IPv4-only): {e}");
-                    run_wt_accept_loop(&state, &mut server4, has_explicit_cert).await;
-                    if has_explicit_cert {
-                        return;
-                    }
-                    continue;
+                    eprintln!(
+                        "webtransport: secondary bind failed on {addr} (continuing IPv4-only): {e}"
+                    );
+                    None
                 }
-            },
-            Err(e) => {
-                eprintln!("webtransport: IPv6 bind failed (continuing IPv4-only): {e}");
-                run_wt_accept_loop(&state, &mut server4, has_explicit_cert).await;
-                if has_explicit_cert {
-                    return;
-                }
-                continue;
-            }
-        };
+            });
 
-        if has_explicit_cert {
-            // Production cert: accept from both forever.
-            loop {
-                tokio::select! {
-                    req = server4.accept() => dispatch_wt_request(req, &state),
-                    req = server6.accept() => dispatch_wt_request(req, &state),
-                }
-            }
+        eprintln!("webtransport cert SHA-256: {hash_hex}");
+        *state.wt_cert_hash.write().unwrap() = Some(hash_hex);
+        eprintln!("webtransport: listening on {bind_addr} (QUIC)");
+        if let Some(addr) = secondary_addr.filter(|_| secondary_server.is_some()) {
+            eprintln!("webtransport: listening on {addr} (QUIC)");
         }
 
-        // Self-signed cert: accept for 13 days, then regenerate.
-        let rotate_after = tokio::time::sleep(std::time::Duration::from_secs(13 * 24 * 3600));
-        tokio::pin!(rotate_after);
-        loop {
-            tokio::select! {
-                req = server4.accept() => dispatch_wt_request(req, &state),
-                req = server6.accept() => dispatch_wt_request(req, &state),
-                _ = &mut rotate_after => {
-                    eprintln!("webtransport: rotating self-signed certificate");
-                    break;
-                }
-            }
+        run_wt_accept_loop(
+            &state,
+            &mut server,
+            secondary_server.as_mut(),
+            has_explicit_cert,
+        )
+        .await;
+        if has_explicit_cert {
+            return;
         }
     }
 }
@@ -1469,7 +1587,37 @@ fn dispatch_wt_request(request: Option<wt::Request>, state: &AppState) {
     }
 }
 
-async fn run_wt_accept_loop(state: &AppState, server: &mut wt::Server, permanent: bool) {
+async fn run_wt_accept_loop(
+    state: &AppState,
+    server: &mut wt::Server,
+    secondary: Option<&mut wt::Server>,
+    permanent: bool,
+) {
+    if let Some(secondary) = secondary {
+        if permanent {
+            loop {
+                tokio::select! {
+                    req = server.accept() => dispatch_wt_request(req, state),
+                    req = secondary.accept() => dispatch_wt_request(req, state),
+                }
+            }
+        }
+
+        let rotate_after = tokio::time::sleep(std::time::Duration::from_secs(13 * 24 * 3600));
+        tokio::pin!(rotate_after);
+        loop {
+            tokio::select! {
+                req = server.accept() => dispatch_wt_request(req, state),
+                req = secondary.accept() => dispatch_wt_request(req, state),
+                _ = &mut rotate_after => {
+                    eprintln!("webtransport: rotating self-signed certificate");
+                    break;
+                }
+            }
+        }
+        return;
+    }
+
     if permanent {
         while let Some(request) = server.accept().await {
             dispatch_wt_request(Some(request), state);
@@ -1877,6 +2025,7 @@ mod tests {
             roots: blit_webserver::config::RootsState::ephemeral(String::new()),
             cors_origin,
             wt_cert_hash: std::sync::RwLock::new(None),
+            wt_public_addr: None,
             config_state: blit_webserver::config::ConfigState::new(),
             proxy_sock: None,
             ssh_pool: blit_ssh::SshPool::new(),
@@ -1885,6 +2034,51 @@ mod tests {
             shutdown: Arc::new(tokio::sync::Notify::new()),
             auth_throttle: blit_webserver::config::AuthThrottle::new(),
         })
+    }
+
+    #[test]
+    fn webtransport_public_addr_supports_hostname_or_port_only_override() {
+        assert_eq!(
+            parse_webtransport_public_addr(":10001")
+                .unwrap()
+                .to_string(),
+            ":10001"
+        );
+        assert_eq!(
+            parse_webtransport_public_addr("hound.local:443")
+                .unwrap()
+                .to_string(),
+            "hound.local:443"
+        );
+        assert_eq!(
+            parse_webtransport_public_addr("[::1]:4443")
+                .unwrap()
+                .to_string(),
+            "[::1]:4443"
+        );
+    }
+
+    #[tokio::test]
+    async fn webtransport_endpoint_preserves_loopback_bind_scope() {
+        let (certs, key, _) = generate_self_signed_cert();
+        let config = build_quinn_server_config(certs, key).unwrap();
+        let requested: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let endpoint = bind_webtransport_endpoint(config, requested).unwrap();
+
+        assert_eq!(endpoint.local_addr().unwrap().ip(), requested.ip());
+    }
+
+    #[test]
+    fn webtransport_ipv4_wildcard_adds_ipv6_wildcard() {
+        let v4: std::net::SocketAddr = "0.0.0.0:10001".parse().unwrap();
+        let loopback: std::net::SocketAddr = "127.0.0.1:10001".parse().unwrap();
+
+        assert_eq!(
+            webtransport_secondary_bind_addr(v4),
+            Some("[::]:10001".parse().unwrap())
+        );
+        assert_eq!(webtransport_secondary_bind_addr(loopback), None);
     }
 
     fn test_app() -> axum::Router {

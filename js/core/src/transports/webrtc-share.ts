@@ -13,6 +13,7 @@ import {
   noopDebug,
   type BlitDebug,
   type BlitTransport,
+  type BlitTransportData,
   type ConnectionStatus,
 } from "../types";
 
@@ -277,8 +278,8 @@ export function createShareTransport(
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectDelay = 1000;
   const MAX_RECONNECT_DELAY = 30_000;
-  const earlyMessages: ArrayBuffer[] = [];
-  const messageListeners = new Set<(data: ArrayBuffer) => void>();
+  const earlyMessages: BlitTransportData[] = [];
+  const messageListeners = new Set<(data: BlitTransportData) => void>();
   const statusListeners = new Set<(status: ConnectionStatus) => void>();
 
   function clearReconnectTimer() {
@@ -316,7 +317,7 @@ export function createShareTransport(
     }
   }
 
-  function dispatch(data: ArrayBuffer) {
+  function dispatch(data: BlitTransportData) {
     if (!started) {
       earlyMessages.push(data);
     } else {
@@ -477,9 +478,10 @@ export function createShareTransport(
       inner = dcTransport;
 
       // Forward inner transport events
-      dcTransport.addEventListener("message", (data: ArrayBuffer) =>
-        dispatch(data),
-      );
+      dcTransport.addEventListener("message", (data) => {
+        if (data instanceof ArrayBuffer) dispatch(data);
+        else dispatch(new Uint8Array(data).buffer);
+      });
       dcTransport.addEventListener("statuschange", (s: ConnectionStatus) => {
         if (disposed || generation !== connectGeneration) return;
         if (s === "connected") {
@@ -655,7 +657,7 @@ export function createShareTransport(
     addEventListener(type: string, listener: (data: never) => void) {
       if (type === "message") {
         messageListeners.add(
-          listener as unknown as (data: ArrayBuffer) => void,
+          listener as unknown as (data: BlitTransportData) => void,
         );
       } else if (type === "statuschange") {
         statusListeners.add(
@@ -667,7 +669,7 @@ export function createShareTransport(
     removeEventListener(type: string, listener: (data: never) => void) {
       if (type === "message") {
         messageListeners.delete(
-          listener as unknown as (data: ArrayBuffer) => void,
+          listener as unknown as (data: BlitTransportData) => void,
         );
       } else if (type === "statuschange") {
         statusListeners.delete(

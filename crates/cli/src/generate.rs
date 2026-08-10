@@ -28,6 +28,7 @@ fn blit_gateway_cmd() -> Command {
              BLIT_FONT_DIRS     Colon-separated extra font directories\n    \
              BLIT_CORS          CORS origin for font routes (* or specific origin)\n    \
              BLIT_QUIC          Set to 1 to enable WebTransport (QUIC/HTTP3)\n    \
+             BLIT_QUIC_PUBLIC_ADDR Browser-facing hostname:port or :port advertised to clients\n    \
              BLIT_TLS_CERT      PEM certificate file (for WebTransport)\n    \
              BLIT_TLS_KEY       PEM private key file (for WebTransport)\n    \
              BLIT_STORE_CONFIG  Set to 1 to sync browser settings to ~/.config/blit/blit.conf",

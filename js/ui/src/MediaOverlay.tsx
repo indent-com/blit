@@ -1,7 +1,11 @@
 import { createSignal, Show, For, type JSX } from "solid-js";
 import type { TerminalPalette } from "@blit-sh/core";
 import { themeFor, ui, uiScale } from "./theme";
-import { MAX_SURFACE_ZOOM, MIN_SURFACE_ZOOM } from "./storage";
+import {
+  MAX_SURFACE_ZOOM,
+  MIN_SURFACE_ZOOM,
+  type SurfaceZoomMode,
+} from "./storage";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 
 const AUDIO_PRESETS: { label: string; kbps: number }[] = [
@@ -30,8 +34,9 @@ const SPEED_PRESETS: { label: string; value: number }[] = [
   { label: "Realtime", value: 4 },
 ];
 
-/** Zoom factors in percent, applied on top of the display's DPI. */
-const ZOOM_PRESETS = [50, 75, 100, 125, 150, 200];
+/** Zoom values are stored as integer percentages in both modes. */
+const RELATIVE_ZOOM_PRESETS = [50, 75, 100, 125, 150, 200];
+const EXACT_ZOOM_PRESETS = [50, 75, 100, 150, 200, 300, 400];
 
 /** Default slider positions when switching to custom for the first time. */
 const CUSTOM_DEFAULT_QUANTIZER = 80;
@@ -47,13 +52,17 @@ export function MediaOverlay(props: {
   audioMuted: boolean;
   audioAvailable: boolean;
   surfaceStreaming: boolean;
-  /** Surface zoom in percent (100 = the display's DPI alone). */
+  surfaceSmoothing: boolean;
+  /** Surface zoom value in percent. */
   surfaceZoom: number;
+  surfaceZoomMode: SurfaceZoomMode;
   onAudioBitrateChange: (kbps: number) => void;
   onVideoBandwidthChange: (bandwidth: number) => void;
   onVideoSpeedChange: (speed: number) => void;
   onSurfaceStreamingChange: (enabled: boolean) => void;
+  onSurfaceSmoothingChange: (enabled: boolean) => void;
   onSurfaceZoomChange: (percent: number) => void;
+  onSurfaceZoomModeChange: (mode: SurfaceZoomMode) => void;
   onToggleAudio: () => void;
   onClose: () => void;
 }) {
@@ -87,7 +96,9 @@ export function MediaOverlay(props: {
   // ---- Zoom custom state ----
   // Unlike the wire settings there is no reserved range here — any percent
   // off the preset list is a custom one, so the slider opens on it.
-  const initCustomZoom = !ZOOM_PRESETS.includes(props.surfaceZoom);
+  const zoomPresets = (mode = props.surfaceZoomMode) =>
+    mode === "exact" ? EXACT_ZOOM_PRESETS : RELATIVE_ZOOM_PRESETS;
+  const initCustomZoom = !zoomPresets().includes(props.surfaceZoom);
   const [customZoom, setCustomZoom] = createSignal(initCustomZoom);
   const [zoomSlider, setZoomSlider] = createSignal(props.surfaceZoom);
 
@@ -182,16 +193,28 @@ export function MediaOverlay(props: {
     props.onVideoSpeedChange(v);
   };
 
-  /** What the surface will actually be composited at.  The compositor will
-   *  not go below 1x (it derives the window's logical size with
-   *  `max(scale, 120)`), so on a 1x display zooming out has nothing to give
-   *  back — showing the result keeps that from being a silent no-op. */
+  /** The requested presentation scale after applying the selected mode. */
   const effectiveScale = (): number => {
     const dpr =
       typeof devicePixelRatio === "number" && devicePixelRatio > 0
         ? devicePixelRatio
         : 1;
-    return Math.max(1, (dpr * props.surfaceZoom) / 100);
+    return (
+      (props.surfaceZoomMode === "relative" ? dpr : 1) *
+      (props.surfaceZoom / 100)
+    );
+  };
+
+  const formatScale = (percent: number): string =>
+    `${(percent / 100).toFixed(2).replace(/\.?0+$/, "")}×`;
+
+  const formatZoom = (percent: number): string =>
+    props.surfaceZoomMode === "exact" ? formatScale(percent) : `${percent}%`;
+
+  const selectZoomMode = (mode: SurfaceZoomMode) => {
+    setCustomZoom(!zoomPresets(mode).includes(props.surfaceZoom));
+    setZoomSlider(props.surfaceZoom);
+    props.onSurfaceZoomModeChange(mode);
   };
 
   const activateCustomZoom = () => {
@@ -279,6 +302,32 @@ export function MediaOverlay(props: {
                   style={chipStyle(props.surfaceStreaming)}
                 >
                   On
+                </button>
+              </div>
+            </div>
+
+            <div
+              style={{
+                display: "flex",
+                "align-items": "center",
+                "justify-content": "space-between",
+              }}
+            >
+              <span style={{ "font-size": `${scale().md}px`, opacity: 0.8 }}>
+                Presentation
+              </span>
+              <div style={{ display: "flex" }}>
+                <button
+                  onClick={() => props.onSurfaceSmoothingChange(false)}
+                  style={chipStyle(!props.surfaceSmoothing)}
+                >
+                  Low latency
+                </button>
+                <button
+                  onClick={() => props.onSurfaceSmoothingChange(true)}
+                  style={chipStyle(props.surfaceSmoothing)}
+                >
+                  Smooth
                 </button>
               </div>
             </div>
@@ -460,7 +509,32 @@ export function MediaOverlay(props: {
                     gap: `${scale().tightGap}px`,
                   }}
                 >
-                  <For each={ZOOM_PRESETS}>
+                  <button
+                    onClick={() => selectZoomMode("relative")}
+                    style={chipStyle(props.surfaceZoomMode === "relative")}
+                  >
+                    Relative to display
+                  </button>
+                  <button
+                    onClick={() => selectZoomMode("exact")}
+                    style={chipStyle(props.surfaceZoomMode === "exact")}
+                  >
+                    Exact scale
+                  </button>
+                </div>
+                <span style={sliderHintStyle()}>
+                  {props.surfaceZoomMode === "relative"
+                    ? "A percentage of this display's DPI."
+                    : "A fixed surface scale, independent of display DPI."}
+                </span>
+                <div
+                  style={{
+                    display: "flex",
+                    "flex-wrap": "wrap",
+                    gap: `${scale().tightGap}px`,
+                  }}
+                >
+                  <For each={zoomPresets()}>
                     {(preset) => (
                       <button
                         onClick={() => {
@@ -471,7 +545,7 @@ export function MediaOverlay(props: {
                           props.surfaceZoom === preset && !customZoom(),
                         )}
                       >
-                        {preset}%
+                        {formatZoom(preset)}
                       </button>
                     )}
                   </For>
@@ -498,7 +572,7 @@ export function MediaOverlay(props: {
                           "text-align": "right",
                         }}
                       >
-                        {MIN_SURFACE_ZOOM}%
+                        {formatZoom(MIN_SURFACE_ZOOM)}
                       </span>
                       <input
                         type="range"
@@ -512,18 +586,20 @@ export function MediaOverlay(props: {
                       <span
                         style={{ ...sliderLabelStyle(), "min-width": "4.5em" }}
                       >
-                        {MAX_SURFACE_ZOOM}%
+                        {formatZoom(MAX_SURFACE_ZOOM)}
                       </span>
                     </div>
-                    <span style={sliderHintStyle()}>{zoomSlider()}%</span>
+                    <span style={sliderHintStyle()}>
+                      {formatZoom(zoomSlider())}
+                    </span>
                   </div>
                 </Show>
                 <span style={sliderHintStyle()}>
-                  On top of this display's DPI: surfaces render at{" "}
+                  Requested surface scale:{" "}
                   {effectiveScale()
                     .toFixed(2)
                     .replace(/\.?0+$/, "")}
-                  ×, so apps draw larger and fit less in the pane.
+                  ×. Values below 1× zoom out and fit more in the pane.
                 </span>
               </div>
             </div>

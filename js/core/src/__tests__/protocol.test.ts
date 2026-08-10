@@ -5,6 +5,7 @@ import {
   buildClearResizeMessage,
   buildResizeBatchMessage,
   buildClientMetricsMessage,
+  buildDisplayRateMessage,
   buildInputMessage,
   buildResizeMessage,
   buildScrollMessage,
@@ -15,6 +16,7 @@ import {
   buildSearchMessage,
   buildCreate2Message,
   buildSurfaceAxis2Message,
+  buildSurfaceAckMessage,
   buildSurfaceSubscribeMessage,
   buildClientFeaturesMessage,
   buildSurfacePreeditMessage,
@@ -23,6 +25,7 @@ import {
 import {
   C2S_ACK,
   C2S_CLIENT_METRICS,
+  C2S_DISPLAY_RATE,
   C2S_INPUT,
   C2S_RESIZE,
   C2S_SCROLL,
@@ -36,6 +39,7 @@ import {
   CREATE2_HAS_COMMAND,
   CREATE2_HAS_CWD,
   C2S_SURFACE_POINTER_AXIS2,
+  C2S_SURFACE_ACK,
   C2S_SURFACE_SUBSCRIBE,
   C2S_CLIENT_FEATURES,
   C2S_SURFACE_PREEDIT,
@@ -60,6 +64,14 @@ describe("protocol message builders", () => {
     expect(msg[1] | (msg[2] << 8)).toBe(3);
     expect(msg[3] | (msg[4] << 8)).toBe(5);
     expect(msg[5] | (msg[6] << 8)).toBe(27);
+  });
+
+  it("buildDisplayRateMessage preserves precise unsnapped refresh", () => {
+    const msg = buildDisplayRateMessage(239.976);
+    const view = new DataView(msg.buffer);
+    expect(msg[0]).toBe(C2S_DISPLAY_RATE);
+    expect(view.getUint16(1, true)).toBe(240);
+    expect(view.getUint32(3, true)).toBe(239_976);
   });
 
   it("buildInputMessage", () => {
@@ -454,6 +466,20 @@ describe("buildSurfaceSubscribeMessage", () => {
   });
 });
 
+describe("buildSurfaceAckMessage", () => {
+  it("appends decoder depth without changing the legacy prefix", () => {
+    expect(buildSurfaceAckMessage(0x1234, 7)).toEqual(
+      new Uint8Array([C2S_SURFACE_ACK, 0x34, 0x12, 7]),
+    );
+  });
+
+  it("clamps decoder queue depth to one wire byte", () => {
+    expect(buildSurfaceAckMessage(1, 999)[3]).toBe(255);
+    expect(buildSurfaceAckMessage(1, -1)[3]).toBe(0);
+  });
+
+});
+
 /**
  * C2S_CLIENT_FEATURES carries the decoder's frame-size ceiling alongside
  * the codec bitmask.  The server holds an undeclared client to the H.264
@@ -463,16 +489,17 @@ describe("buildSurfaceSubscribeMessage", () => {
 describe("buildClientFeaturesMessage", () => {
   it("packs the decode ceiling as little-endian u16s", () => {
     const msg = buildClientFeaturesMessage(0x03, 5120, 2880);
-    expect(msg).toHaveLength(6);
+    expect(msg).toHaveLength(7);
     expect(msg[0]).toBe(C2S_CLIENT_FEATURES);
     expect(msg[1]).toBe(0x03);
     expect(msg[2] | (msg[3] << 8)).toBe(5120);
     expect(msg[4] | (msg[5] << 8)).toBe(2880);
+    expect(msg[6]).toBe(1);
   });
 
   it("defaults the ceiling to zero, which the server reads as undeclared", () => {
     const msg = buildClientFeaturesMessage(0x02);
-    expect(msg).toHaveLength(6);
+    expect(msg).toHaveLength(7);
     expect(msg[1]).toBe(0x02);
     expect(msg[2] | (msg[3] << 8)).toBe(0);
     expect(msg[4] | (msg[5] << 8)).toBe(0);

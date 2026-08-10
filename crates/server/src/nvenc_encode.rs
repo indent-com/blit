@@ -75,6 +75,7 @@ const NV_ENC_CAPS_HEIGHT_MAX: u32 = 17;
 const NV_ENC_CAPS_SUPPORT_YUV444_ENCODE: u32 = 33;
 const NV_ENC_CAPS_WIDTH_MIN: u32 = 45;
 const NV_ENC_CAPS_HEIGHT_MIN: u32 = 46;
+const NV_ENC_CAPS_NUM_ENCODER_ENGINES: u32 = 49;
 
 // Resource types for nvEncRegisterResource
 const NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR: u32 = 0x01;
@@ -336,12 +337,29 @@ const NVENC_AV1_COLOR_RANGE_OFFSET: usize = 248;
 /// `NV_ENC_VUI_TRANSFER_CHARACTERISTIC_RESERVED0` and — worst —
 /// `NV_ENC_VUI_MATRIX_COEFFS_RGB` (MC_IDENTITY, which on a 4:2:0 stream is
 /// spec-invalid and tells a conforming decoder to read the planes as GBR).
-/// Unspecified is 2.
+/// Blit's actual values are BT.709 primaries, sRGB transfer and the
+/// SMPTE-170M (BT.601) matrix.
 const NVENC_AV1_COLOR_PRIMARIES_OFFSET: usize = 236;
 const NVENC_AV1_TRANSFER_CHARACTERISTICS_OFFSET: usize = 240;
 const NVENC_AV1_MATRIX_COEFFICIENTS_OFFSET: usize = 244;
-/// `NV_ENC_VUI_*_UNSPECIFIED` — the same value (2) for all three enums.
-const NVENC_VUI_UNSPECIFIED: u32 = 2;
+const NVENC_VUI_COLOR_PRIMARIES_BT709: u32 = 1;
+const NVENC_VUI_TRANSFER_CHARACTERISTIC_IEC61966_2_1: u32 = 13;
+const NVENC_VUI_MATRIX_COEFFS_SMPTE170M: u32 = 6;
+/// NVIDIA's documented low-latency setting: keep one reference chain until
+/// the application explicitly requests recovery instead of inserting an IDR
+/// every fixed number of frames. A frame-count GOP scales keyframe bandwidth
+/// with refresh rate (120 meant every 500 ms at 240 Hz).
+const NVENC_INFINITE_GOPLENGTH: u32 = u32::MAX;
+/// Bit position of `NV_ENC_INITIALIZE_PARAMS::splitEncodeMode` inside the
+/// packed flags word at offset 68 (five one-bit flags precede it).
+const NVENC_SPLIT_ENCODE_MODE_SHIFT: u32 = 5;
+/// `NV_ENC_SPLIT_TWO_FORCED_MODE`: use two strips when the GPU has multiple
+/// NVENC engines, falling back to one strip when it does not.
+const NVENC_SPLIT_TWO_FORCED_MODE: u32 = 2;
+/// Split-frame setup is overhead at ordinary sizes. At 3840-wide AV1 it lets
+/// multi-NVENC Ada GPUs share the frame instead of making one engine carry a
+/// 4K/240-Hz-equivalent pixel rate alone.
+const NVENC_SPLIT_MIN_WIDTH: u32 = 3840;
 
 fn w32(buf: &mut [u8], off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_ne_bytes());
@@ -364,6 +382,46 @@ fn write_const_qp(config_buf: &mut [u8], qp: u32) {
     w32(config_buf, 48, qp); // constQP.qpInterP
     w32(config_buf, 52, qp); // constQP.qpInterB
     w32(config_buf, 56, qp); // constQP.qpIntra
+}
+
+fn write_stream_gop(config_buf: &mut [u8]) {
+    // NV_ENC_CONFIG::gopLength / frameIntervalP. NVIDIA requires IPP (1)
+    // when the infinite-GOP sentinel is used.
+    w32(config_buf, 20, NVENC_INFINITE_GOPLENGTH);
+    w32(config_buf, 24, 1);
+}
+
+/// Write a complete AV1 colour description so the sequence header and the
+/// WebCodecs configuration describe the same conversion across decoder
+/// creation and reset.
+fn write_av1_color_description(config_buf: &mut [u8]) {
+    w32(config_buf, NVENC_AV1_COLOR_RANGE_OFFSET, 1);
+    w32(
+        config_buf,
+        NVENC_AV1_COLOR_PRIMARIES_OFFSET,
+        NVENC_VUI_COLOR_PRIMARIES_BT709,
+    );
+    w32(
+        config_buf,
+        NVENC_AV1_TRANSFER_CHARACTERISTICS_OFFSET,
+        NVENC_VUI_TRANSFER_CHARACTERISTIC_IEC61966_2_1,
+    );
+    w32(
+        config_buf,
+        NVENC_AV1_MATRIX_COEFFICIENTS_OFFSET,
+        NVENC_VUI_MATRIX_COEFFS_SMPTE170M,
+    );
+}
+
+fn write_split_encode_mode(init_buf: &mut [u8], codec: &str, width: u32) {
+    if codec == "av1" && width >= NVENC_SPLIT_MIN_WIDTH {
+        let flags = r32(init_buf, 68);
+        w32(
+            init_buf,
+            68,
+            flags | (NVENC_SPLIT_TWO_FORCED_MODE << NVENC_SPLIT_ENCODE_MODE_SHIFT),
+        );
+    }
 }
 
 fn r32(buf: &[u8], off: usize) -> u32 {
@@ -495,6 +553,7 @@ pub struct NvencCaps {
     pub max_width: u32,
     pub max_height: u32,
     pub yuv444: bool,
+    pub encoder_engines: u32,
 }
 
 impl NvencCaps {
@@ -593,6 +652,8 @@ pub fn caps(codec: &str, verbose: bool) -> Result<NvencCaps, String> {
                 .unwrap_or(u16::MAX as u32),
             yuv444: encode_cap(fns, encoder, codec_guid, NV_ENC_CAPS_SUPPORT_YUV444_ENCODE)
                 .is_some(),
+            encoder_engines: encode_cap(fns, encoder, codec_guid, NV_ENC_CAPS_NUM_ENCODER_ENGINES)
+                .unwrap_or(1),
         };
         drop(guard);
         Ok(caps)
@@ -601,12 +662,13 @@ pub fn caps(codec: &str, verbose: bool) -> Result<NvencCaps, String> {
     if verbose {
         match &answer {
             Ok(c) => eprintln!(
-                "[nvenc] {codec}: {}x{}–{}x{}, 4:4:4 {}",
+                "[nvenc] {codec}: {}x{}–{}x{}, 4:4:4 {}, engines={}",
                 c.min_width,
                 c.min_height,
                 c.max_width,
                 c.max_height,
                 if c.yuv444 { "yes" } else { "no" },
+                c.encoder_engines,
             ),
             Err(e) => eprintln!("[nvenc] {codec}: unavailable — {e}"),
         }
@@ -796,9 +858,10 @@ impl NvencDirectEncoder {
         // and apply our overrides.
         let mut config_buf = vec![0u8; NVENC_CONFIG_SIZE];
         config_buf.copy_from_slice(&preset_buf[8..8 + NVENC_CONFIG_SIZE]);
-        // gopLength @ 20, frameIntervalP @ 24
-        w32(&mut config_buf, 20, 120); // gop_length
-        w32(&mut config_buf, 24, 1); // frame_interval_p (no B-frames)
+        // gopLength @ 20, frameIntervalP @ 24. This transport is reliable and
+        // ordered; startup, decoder recovery, and reference-chain loss request
+        // IDRs explicitly, so periodic keyframes only waste encode/wire time.
+        write_stream_gop(&mut config_buf);
         // rcParams starts at config offset 40 (after version=0, profileGUID=4,
         // gopLength=20, frameIntervalP=24, monoChromeEncoding=28,
         // frameFieldMode=32, mvPrecision=36).  NV_ENC_RC_PARAMS itself opens
@@ -835,28 +898,7 @@ impl NvencDirectEncoder {
             w32(&mut config_buf, vui + NVENC_VUI_VIDEO_FORMAT, 5); // unspecified
             w32(&mut config_buf, vui + NVENC_VUI_VIDEO_FULL_RANGE, 1);
         } else {
-            w32(&mut config_buf, NVENC_AV1_COLOR_RANGE_OFFSET, 1);
-            // AV1 has no flag we control to suppress the colour description,
-            // so the other three fields have to be meaningful.  The preset
-            // leaves them zeroed, and zero means RESERVED0/RESERVED0/
-            // MC_IDENTITY — not "unspecified".  Say unspecified explicitly
-            // and let colorRange carry the only claim blit actually makes;
-            // every other AV1 writer here (VA-API, Vulkan) already does.
-            w32(
-                &mut config_buf,
-                NVENC_AV1_COLOR_PRIMARIES_OFFSET,
-                NVENC_VUI_UNSPECIFIED,
-            );
-            w32(
-                &mut config_buf,
-                NVENC_AV1_TRANSFER_CHARACTERISTICS_OFFSET,
-                NVENC_VUI_UNSPECIFIED,
-            );
-            w32(
-                &mut config_buf,
-                NVENC_AV1_MATRIX_COEFFICIENTS_OFFSET,
-                NVENC_VUI_UNSPECIFIED,
-            );
+            write_av1_color_description(&mut config_buf);
         }
 
         // Initialize encoder
@@ -871,6 +913,7 @@ impl NvencDirectEncoder {
         w32(&mut init_buf, 52, 60); // frameRateNum @ 52
         w32(&mut init_buf, 56, 1); // frameRateDen @ 56
         w32(&mut init_buf, 64, 1); // enablePTD @ 64
+        write_split_encode_mode(&mut init_buf, codec, width);
         wptr(&mut init_buf, 88, config_buf.as_mut_ptr() as *mut c_void); // encodeConfig ptr @ 88
         w32(&mut init_buf, 96, width); // maxEncodeWidth @ 96
         w32(&mut init_buf, 100, height); // maxEncodeHeight @ 100
@@ -880,6 +923,13 @@ impl NvencDirectEncoder {
             unsafe { (fns.nvEncInitializeEncoder)(encoder, init_buf.as_mut_ptr() as *mut c_void) };
         if nv_status != NV_ENC_SUCCESS {
             return Err(format!("nvEncInitializeEncoder failed: {nv_status}"));
+        }
+        if verbose {
+            let split_mode = (r32(&init_buf, 68) >> NVENC_SPLIT_ENCODE_MODE_SHIFT) & 0xf;
+            eprintln!(
+                "[nvenc] initialized {codec} {width}x{height} engines={} split_mode={split_mode}",
+                caps.encoder_engines,
+            );
         }
 
         // Create input buffer (BGRA)
@@ -1163,6 +1213,8 @@ impl NvencDirectEncoder {
             return None;
         }
 
+        let timing_start = std::time::Instant::now();
+
         // Wait for the compute pass before touching the buffer.
         if let Some(sync) = sync_fd {
             let mut pfd = libc::pollfd {
@@ -1185,6 +1237,7 @@ impl NvencDirectEncoder {
                 }
             }
         }
+        let timing_after_fence = std::time::Instant::now();
 
         let cuda = gpu_libs::cuda().ok()?;
         unsafe { (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx) };
@@ -1237,6 +1290,7 @@ impl NvencDirectEncoder {
             return None;
         }
         let mapped_resource = rptr(&map_buf, 24);
+        let timing_after_map = std::time::Instant::now();
 
         let mut pic_buf = vec![0u8; NVENC_PIC_PARAMS_SIZE];
         w32(&mut pic_buf, 0, NV_ENC_PIC_PARAMS_VER);
@@ -1269,6 +1323,7 @@ impl NvencDirectEncoder {
         let nv_status = unsafe {
             (self.fns.nvEncEncodePicture)(self.encoder, pic_buf.as_mut_ptr() as *mut c_void)
         };
+        let timing_after_submit = std::time::Instant::now();
         let result = if nv_status == NV_ENC_SUCCESS {
             self.force_idr = false;
             let mut lock_buf = vec![0u8; NVENC_LOCK_BITSTREAM_SIZE];
@@ -1277,6 +1332,7 @@ impl NvencDirectEncoder {
             let lock_status = unsafe {
                 (self.fns.nvEncLockBitstream)(self.encoder, lock_buf.as_mut_ptr() as *mut c_void)
             };
+            let timing_after_lock = std::time::Instant::now();
             if lock_status == NV_ENC_SUCCESS {
                 let size = r32(&lock_buf, 36) as usize;
                 let buf_ptr = rptr(&lock_buf, 56) as *const u8;
@@ -1287,6 +1343,20 @@ impl NvencDirectEncoder {
                 };
                 let is_idr = self.is_keyframe_pic_type(r32(&lock_buf, 64));
                 unsafe { (self.fns.nvEncUnlockBitstream)(self.encoder, self.output_buffer) };
+                let timing_after_copy = std::time::Instant::now();
+                if self.verbose && (self.frame_idx <= 3 || self.frame_idx.is_multiple_of(1200)) {
+                    let ms = |duration: std::time::Duration| duration.as_secs_f64() * 1_000.0;
+                    eprintln!(
+                        "[nvenc-timing] frame={} fence={:.3}ms map={:.3}ms submit={:.3}ms lock={:.3}ms copy={:.3}ms total={:.3}ms",
+                        self.frame_idx,
+                        ms(timing_after_fence.duration_since(timing_start)),
+                        ms(timing_after_map.duration_since(timing_after_fence)),
+                        ms(timing_after_submit.duration_since(timing_after_map)),
+                        ms(timing_after_lock.duration_since(timing_after_submit)),
+                        ms(timing_after_copy.duration_since(timing_after_lock)),
+                        ms(timing_after_copy.duration_since(timing_start)),
+                    );
+                }
                 if nal_data.is_empty() {
                     None
                 } else {
@@ -1764,7 +1834,53 @@ mod tests {
             max_width: 8192,
             max_height: 8192,
             yuv444: false,
+            encoder_engines: 2,
         }
+    }
+
+    #[test]
+    fn stream_gop_uses_nvencs_infinite_low_latency_form() {
+        let mut config = vec![0u8; NVENC_CONFIG_SIZE];
+        write_stream_gop(&mut config);
+        assert_eq!(r32(&config, 20), NVENC_INFINITE_GOPLENGTH);
+        assert_eq!(r32(&config, 24), 1, "infinite GOP requires IPP");
+    }
+
+    #[test]
+    fn av1_color_description_matches_the_full_range_bt601_pipeline() {
+        let mut config = vec![0u8; NVENC_CONFIG_SIZE];
+        write_av1_color_description(&mut config);
+        assert_eq!(r32(&config, NVENC_AV1_COLOR_RANGE_OFFSET), 1);
+        assert_eq!(
+            r32(&config, NVENC_AV1_COLOR_PRIMARIES_OFFSET),
+            NVENC_VUI_COLOR_PRIMARIES_BT709,
+        );
+        assert_eq!(
+            r32(&config, NVENC_AV1_TRANSFER_CHARACTERISTICS_OFFSET),
+            NVENC_VUI_TRANSFER_CHARACTERISTIC_IEC61966_2_1,
+        );
+        assert_eq!(
+            r32(&config, NVENC_AV1_MATRIX_COEFFICIENTS_OFFSET),
+            NVENC_VUI_MATRIX_COEFFS_SMPTE170M,
+        );
+    }
+
+    #[test]
+    fn wide_av1_forces_two_strip_split_encode() {
+        let mut init = vec![0u8; NVENC_INITIALIZE_PARAMS_SIZE];
+        write_split_encode_mode(&mut init, "av1", 3840);
+        assert_eq!(
+            r32(&init, 68),
+            NVENC_SPLIT_TWO_FORCED_MODE << NVENC_SPLIT_ENCODE_MODE_SHIFT,
+        );
+
+        let mut narrow = vec![0u8; NVENC_INITIALIZE_PARAMS_SIZE];
+        write_split_encode_mode(&mut narrow, "av1", 2560);
+        assert_eq!(r32(&narrow, 68), 0, "ordinary frames stay automatic");
+
+        let mut h264 = vec![0u8; NVENC_INITIALIZE_PARAMS_SIZE];
+        write_split_encode_mode(&mut h264, "h264", 3840);
+        assert_eq!(r32(&h264, 68), 0, "split mode does not apply to H.264");
     }
 
     /// The dock renders panes at 256x54.  That is a statement about the

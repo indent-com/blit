@@ -1,8 +1,16 @@
 import type {
   BlitTransport,
+  BlitTransportData,
   BlitTransportOptions,
   ConnectionStatus,
 } from "../types";
+import { LengthPrefixedFrameDecoder } from "./length-prefixed";
+
+const MAX_FRAME_LENGTH = 16 * 1024 * 1024;
+// Keep each synchronous decoder dispatch slice short at high video rates.
+// Split frames are copied into the decoder's reusable accumulator, so this
+// does not reintroduce one allocation per transport chunk.
+const WT_BYOB_BUFFER_SIZE = 32 * 1024;
 
 export interface WebTransportTransportOptions extends BlitTransportOptions {
   /**
@@ -26,7 +34,7 @@ export class WebTransportTransport implements BlitTransport {
   private connectPromise: Promise<void> | null = null;
   private currentDelay: number;
   private disposed = false;
-  private messageListeners = new Set<(data: ArrayBuffer) => void>();
+  private messageListeners = new Set<(data: BlitTransportData) => void>();
   private statusListeners = new Set<(status: ConnectionStatus) => void>();
   /** True when the server explicitly rejected the passphrase. */
   authRejected = false;
@@ -85,7 +93,7 @@ export class WebTransportTransport implements BlitTransport {
 
   addEventListener(
     type: "message",
-    listener: (data: ArrayBuffer) => void,
+    listener: (data: BlitTransportData) => void,
   ): void;
   addEventListener(
     type: "statuschange",
@@ -93,7 +101,7 @@ export class WebTransportTransport implements BlitTransport {
   ): void;
   addEventListener(type: string, listener: (...args: never[]) => void): void {
     if (type === "message") {
-      this.messageListeners.add(listener as (data: ArrayBuffer) => void);
+      this.messageListeners.add(listener as (data: BlitTransportData) => void);
     } else if (type === "statuschange") {
       this.statusListeners.add(listener as (status: ConnectionStatus) => void);
     }
@@ -101,7 +109,7 @@ export class WebTransportTransport implements BlitTransport {
 
   removeEventListener(
     type: "message",
-    listener: (data: ArrayBuffer) => void,
+    listener: (data: BlitTransportData) => void,
   ): void;
   removeEventListener(
     type: "statuschange",
@@ -112,7 +120,9 @@ export class WebTransportTransport implements BlitTransport {
     listener: (...args: never[]) => void,
   ): void {
     if (type === "message") {
-      this.messageListeners.delete(listener as (data: ArrayBuffer) => void);
+      this.messageListeners.delete(
+        listener as (data: BlitTransportData) => void,
+      );
     } else if (type === "statuschange") {
       this.statusListeners.delete(
         listener as (status: ConnectionStatus) => void,
@@ -252,8 +262,20 @@ export class WebTransportTransport implements BlitTransport {
       this.currentDelay = this.initialDelay;
       this.setStatus("connected");
 
-      // Read loop: length-prefixed frames
-      void this.readLoop(reader, wt, new Uint8Array(remainder));
+      // Read loop: use a reusable caller-owned receive buffer when this
+      // WebTransport implementation exposes its stream as a byte stream.
+      reader.releaseLock();
+      let dataReader:
+        | ReadableStreamDefaultReader<Uint8Array>
+        | ReadableStreamBYOBReader;
+      let byob = false;
+      try {
+        dataReader = stream.readable.getReader({ mode: "byob" });
+        byob = true;
+      } catch {
+        dataReader = stream.readable.getReader();
+      }
+      void this.readLoop(dataReader, wt, remainder, byob);
 
       // Handle connection close
       wt.closed
@@ -292,43 +314,54 @@ export class WebTransportTransport implements BlitTransport {
   }
 
   private async readLoop(
-    reader: ReadableStreamDefaultReader<Uint8Array>,
+    reader:
+      | ReadableStreamDefaultReader<Uint8Array>
+      | ReadableStreamBYOBReader,
     wt: WebTransport,
-    initialBuffer = new Uint8Array(0),
+    initialBuffer: Uint8Array,
+    byob: boolean,
   ): Promise<void> {
-    let buffer = initialBuffer;
+    const decoder = new LengthPrefixedFrameDecoder(
+      MAX_FRAME_LENGTH,
+      (payload) => {
+        for (const l of this.messageListeners) l(payload);
+      },
+    );
+    let byobBuffer = new ArrayBuffer(WT_BYOB_BUFFER_SIZE);
 
     try {
-      while (true) {
-        while (buffer.length >= 4) {
-          const len =
-            buffer[0] |
-            (buffer[1] << 8) |
-            (buffer[2] << 16) |
-            (buffer[3] << 24);
-          if (len < 0 || len > 16 * 1024 * 1024) {
-            // Invalid frame — close
-            wt.close();
-            return;
-          }
-          if (buffer.length < 4 + len) break;
-          const payload = buffer.slice(4, 4 + len);
-          buffer = buffer.subarray(4 + len);
-          for (const l of this.messageListeners) l(payload.buffer);
-        }
-
-        const { value, done } = await reader.read();
-        if (done || this.disposed || this.wt !== wt) break;
-        if (!value || value.length === 0) continue;
-
-        // Append to buffer
-        const newBuf = new Uint8Array(buffer.length + value.length);
-        newBuf.set(buffer);
-        newBuf.set(value, buffer.length);
-        buffer = newBuf;
+      if (initialBuffer.length > 0 && !decoder.push(initialBuffer)) {
+        throw new Error("invalid WebTransport frame");
       }
-    } catch {
-      // Stream closed or error
+      while (true) {
+        const { value, done } = byob
+          ? await (reader as ReadableStreamBYOBReader).read(
+              new Uint8Array(byobBuffer),
+            )
+          : await (
+              reader as ReadableStreamDefaultReader<Uint8Array>
+            ).read();
+        if (this.disposed || this.wt !== wt) return;
+        if (done) throw new Error("WebTransport receive stream closed");
+        if (!value || value.length === 0) continue;
+        if (!decoder.push(value)) {
+          throw new Error("invalid WebTransport frame");
+        }
+        if (byob) {
+          byobBuffer =
+            value.buffer instanceof ArrayBuffer &&
+            value.buffer.byteLength >= WT_BYOB_BUFFER_SIZE
+              ? value.buffer
+              : new ArrayBuffer(WT_BYOB_BUFFER_SIZE);
+        }
+      }
+    } catch (err) {
+      if (this.disposed || this.wt !== wt) return;
+      this.cleanup();
+      this.lastError =
+        err instanceof Error ? err.message : "WebTransport receive failed";
+      this.setStatus("disconnected");
+      this.scheduleReconnect();
     }
   }
 }

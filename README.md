@@ -197,13 +197,15 @@ its WebCodecs decoder accordingly. Clients advertise which codecs they
 support and the largest frame they can decode; the server skips encoders the
 client can't decode.
 
-The resolution ceiling is per viewer, not per surface. A surface is
-composited at whatever its most capable subscriber can receive — so an AV1
-client on a 5K display gets a native 5120×2880 stream — and any viewer whose
-encoder or decoder stops lower is served an aspect-preserving downscale of
-that same surface rather than dragging it down for everyone. Clients that
-don't report a decode ceiling (anything predating the field) stay at
-3840×2160.
+The resolution ceiling is per viewer, not per surface. At ordinary display
+scales a surface is composited at whatever its most capable subscriber can
+receive — so an AV1 client on a 5K display gets a native 5120×2880 stream —
+and any viewer whose encoder or decoder stops lower is served an
+aspect-preserving downscale of that same surface rather than dragging it down
+for everyone. At a sub-1× zoom the 1× compositor source may be larger than the
+encode ceiling; the viewer still receives only its viewport-sized downscale.
+Clients that don't report a decode ceiling (anything predating the field)
+stay at 3840×2160.
 
 For `blit gateway` configuration, running as a systemd/launchd service, and Nix module setup, see [SERVICES.md](SERVICES.md) and [`nix/README.md`](nix/README.md).
 

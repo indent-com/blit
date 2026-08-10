@@ -42,10 +42,61 @@ export type SurfaceEventCallback = (
 export interface SurfaceFrameSample {
   /** `performance.now()` when the frame arrived. */
   t: number;
+  /** Server CLOCK_MONOTONIC capture timestamp (wrapping u32 ms). */
+  sourceT: number;
+  /** Microseconds within `sourceT`, when negotiated with the server. */
+  sourceSubUs?: number;
+  /** Exact integer microsecond PTS submitted to WebCodecs. */
+  ptsUs?: number;
   /** Encoded frame payload size in bytes. */
   bytes: number;
   /** Whether this was a keyframe. */
   key: boolean;
+  /** `performance.now()` when WebCodecs produced the decoded frame. */
+  decodeT?: number;
+  /** `performance.now()` after synchronous visible-canvas blits completed. */
+  presentT?: number;
+  /** Estimated capture-to-receive time after midpoint clock calibration. */
+  sourceToRecvMs?: number;
+  /** Receive-to-decoder-output time. */
+  decodeMs?: number;
+  /** Decoder-output-to-visible-canvas time, including playout delay. */
+  presentMs?: number;
+  /** Estimated capture-to-visible-canvas submission time. */
+  e2eMs?: number;
+}
+
+export interface ServerClockSample {
+  serverMs: number;
+  clientMidMs: number;
+  rttMs: number;
+}
+
+/** Signed difference between two wrapping u32 millisecond timestamps. */
+export function wrappingTimestampDelta(a: number, b: number): number {
+  return ((a - b + 0x8000_0000) >>> 0) - 0x8000_0000;
+}
+
+/** Signed source-time delta in ms, including the wire's fractional part. */
+export function sourceTimestampDelta(
+  a: Pick<SurfaceFrameSample, "sourceT" | "sourceSubUs">,
+  b: Pick<SurfaceFrameSample, "sourceT" | "sourceSubUs">,
+): number {
+  return (
+    wrappingTimestampDelta(a.sourceT, b.sourceT) +
+    ((a.sourceSubUs ?? 0) - (b.sourceSubUs ?? 0)) / 1000
+  );
+}
+
+/** Map a server timestamp to the browser performance timeline. */
+export function estimateSourceToReceiveMs(
+  sourceMs: number,
+  receiveMs: number,
+  sync: ServerClockSample,
+): number {
+  const sourceClientMs =
+    sync.clientMidMs + wrappingTimestampDelta(sourceMs, sync.serverMs);
+  return receiveMs - sourceClientMs;
 }
 
 type SurfaceCodec = "h264" | "av1";
@@ -100,18 +151,24 @@ interface CanvasEntry {
  *  one frame per refresh and an endless 2-0-1-2-0 cadence. */
 interface SurfacePresenter {
   /** Decoded VideoFrames waiting to be presented.  Bounded at
-   *  {@link SurfaceStore.PRESENT_QUEUE_MAX} (or
-   *  {@link SurfaceStore.PRESENT_QUEUE_MAX_SMOOTHED} once scheduling is
-   *  engaged) — each entry pins a decoded buffer in the codec's frame
-   *  pool, so an undrained queue (hidden tab, throttled rAF) would
-   *  otherwise grow until the renderer OOMs. */
+   *  {@link SurfaceStore.PRESENT_QUEUE_MAX}, or by the cadence-derived
+   *  {@link SurfaceStore.smoothedQueueCap} once scheduling is engaged — each
+   *  entry pins a decoded buffer in the codec's frame pool, so an undrained
+   *  queue (hidden tab, throttled rAF) would otherwise grow until the
+   *  renderer OOMs. */
   queue: VideoFrame[];
+  /** Diagnostic slot tokens parallel to {@link queue}; -1 when sampling is
+   * disabled or the frame predates the active sampling window. */
+  sampleTokens: number[];
   /** Pending `requestAnimationFrame` handle, or null. */
   rafId: number | null;
+  /** Stable callback reused for every tick. Allocating a closure for every
+   * refresh is visible GC pressure at 240–480 Hz. */
+  rafCallback: FrameRequestCallback;
   /** True after the first frame has been presented.  The first frame
    *  paints synchronously to minimise time-to-first-pixel. */
   initialized: boolean;
-  /** Recent `arrival - pts` samples (ms), covering roughly
+  /** Recent transport `receive - pts` samples (ms), covering roughly
    *  {@link SurfaceStore.OFFSET_WINDOW_MS} of stream.  Both the fast-path
    *  baseline and the presentation point are quantiles of this one
    *  distribution, which is what makes the scheduler robust in both
@@ -123,14 +180,19 @@ interface SurfacePresenter {
    *  between the server's `elapsed_ms()` epoch and `performance.now()` —
    *  but that constant cancels out, since every number derived here is a
    *  difference or is added straight back to a PTS. */
-  offsets: number[];
-  /** {@link SurfaceStore.FAST_QUANTILE} of {@link offsets}: the fastest the
-   *  path has recently shown itself to be, outlier-resistant.  Only used as
+  offsets: RollingQuantile;
+  /** Recent receive-to-decoder-output durations. Kept separate from
+   *  {@link offsets} so hardware-decoder batching is not mistaken for
+   *  network jitter and converted into permanent playout latency. */
+  decodeDelays: RollingQuantile;
+  /** Fast transport offset plus fast decode duration: the earliest useful
+   *  presentation point the pipeline has recently demonstrated. Only used as
    *  the reference for how much latency presentation is adding. */
   fastOffsetMs: number;
   /** The offset presentation actually runs at: a frame is drawn at
-   *  `pts + presentOffsetMs`.  Slewed toward its target rather than set to
-   *  it, because moving it shifts every future due time at once. */
+   *  `pts + presentOffsetMs`. Grows immediately when recurring jitter needs
+   *  more cover and slews down when the path settles, so shedding latency
+   *  does not make several queued frames become due at once. */
   presentOffsetMs: number;
   /** PTS (ms) of the previous arrival, for rewind/wrap detection. */
   lastPtsMs: number | null;
@@ -146,13 +208,389 @@ interface SurfacePresenter {
   smoothing: boolean;
 }
 
-/** Nearest-rank quantile of `samples`, which is left unmodified.  `q` is in
- *  [0, 1]; an empty set is 0. */
-function quantile(samples: readonly number[], q: number): number {
-  const n = samples.length;
-  if (n === 0) return 0;
-  const sorted = Array.from(samples).sort((a, b) => a - b);
-  return sorted[Math.min(n - 1, Math.max(0, Math.ceil(q * n) - 1))];
+/** Fixed-capacity insertion-order numeric ring backed by a TypedArray. */
+export class NumberRing {
+  private readonly values: Float64Array;
+  private start = 0;
+  length = 0;
+
+  constructor(readonly capacity: number) {
+    if (!Number.isInteger(capacity) || capacity < 1)
+      throw new RangeError("capacity must be a positive integer");
+    this.values = new Float64Array(capacity);
+  }
+
+  push(value: number): void {
+    if (this.length < this.capacity) {
+      this.values[(this.start + this.length) % this.capacity] = value;
+      this.length++;
+      return;
+    }
+    this.values[this.start] = value;
+    this.start = (this.start + 1) % this.capacity;
+  }
+
+  time(index: number): number {
+    return index < 0 || index >= this.length
+      ? NaN
+      : this.values[(this.start + index) % this.capacity];
+  }
+
+  toArray(): number[] {
+    const result = new Array<number>(this.length);
+    for (let i = 0; i < this.length; i++) {
+      result[i] = this.values[(this.start + i) % this.capacity];
+    }
+    return result;
+  }
+}
+
+/** Struct-of-TypedArrays storage for the surface debug timeline. A compact
+ * numeric token identifies a slot while it moves through decode/presentation,
+ * so the 240–480 Hz receive path creates no sample objects. */
+export class SurfaceFrameHistory {
+  private readonly times: Float64Array;
+  private readonly sourceTimes: Uint32Array;
+  private readonly sourceSubTimes: Uint16Array;
+  private readonly pts: Float64Array;
+  private readonly sizes: Uint32Array;
+  private readonly keys: Uint8Array;
+  private readonly sourceToReceive: Float64Array;
+  private readonly decodeTimes: Float64Array;
+  private readonly decodeDurations: Float64Array;
+  private readonly presentTimes: Float64Array;
+  private readonly presentDurations: Float64Array;
+  private readonly e2eDurations: Float64Array;
+  private readonly generations: Uint32Array;
+  private start = 0;
+  length = 0;
+
+  constructor(readonly capacity: number) {
+    this.times = new Float64Array(capacity);
+    this.sourceTimes = new Uint32Array(capacity);
+    this.sourceSubTimes = new Uint16Array(capacity);
+    this.pts = new Float64Array(capacity);
+    this.sizes = new Uint32Array(capacity);
+    this.keys = new Uint8Array(capacity);
+    this.sourceToReceive = new Float64Array(capacity);
+    this.decodeTimes = new Float64Array(capacity);
+    this.decodeDurations = new Float64Array(capacity);
+    this.presentTimes = new Float64Array(capacity);
+    this.presentDurations = new Float64Array(capacity);
+    this.e2eDurations = new Float64Array(capacity);
+    this.generations = new Uint32Array(capacity);
+  }
+
+  push(
+    time: number,
+    sourceTime: number,
+    sourceSubTime: number,
+    pts: number,
+    bytes: number,
+    key: boolean,
+    sourceToReceive: number,
+  ): number {
+    let index: number;
+    if (this.length < this.capacity) {
+      index = (this.start + this.length) % this.capacity;
+      this.length++;
+    } else {
+      index = this.start;
+      this.start = (this.start + 1) % this.capacity;
+    }
+    let generation = (this.generations[index] + 1) >>> 0;
+    if (generation === 0) generation = 1;
+    this.generations[index] = generation;
+    this.times[index] = time;
+    this.sourceTimes[index] = sourceTime;
+    this.sourceSubTimes[index] = sourceSubTime;
+    this.pts[index] = pts;
+    this.sizes[index] = bytes;
+    this.keys[index] = key ? 1 : 0;
+    this.sourceToReceive[index] = sourceToReceive;
+    this.decodeTimes[index] = NaN;
+    this.decodeDurations[index] = NaN;
+    this.presentTimes[index] = NaN;
+    this.presentDurations[index] = NaN;
+    this.e2eDurations[index] = NaN;
+    return generation * this.capacity + index;
+  }
+
+  private resolve(token: number): number {
+    if (token < 0) return -1;
+    const index = token % this.capacity;
+    const generation = Math.floor(token / this.capacity);
+    return this.generations[index] === generation ? index : -1;
+  }
+
+  private physical(logical: number): number {
+    return logical < 0 || logical >= this.length
+      ? -1
+      : (this.start + logical) % this.capacity;
+  }
+
+  time(logical: number): number {
+    const index = this.physical(logical);
+    return index < 0 ? NaN : this.times[index];
+  }
+
+  bytes(logical: number): number {
+    const index = this.physical(logical);
+    return index < 0 ? 0 : this.sizes[index];
+  }
+
+  isKey(logical: number): boolean {
+    const index = this.physical(logical);
+    return index >= 0 && this.keys[index] !== 0;
+  }
+
+  sourceToRecvMs(logical: number): number {
+    const index = this.physical(logical);
+    return index < 0 ? NaN : this.sourceToReceive[index];
+  }
+
+  decodeMs(logical: number): number {
+    const index = this.physical(logical);
+    return index < 0 ? NaN : this.decodeDurations[index];
+  }
+
+  presentMs(logical: number): number {
+    const index = this.physical(logical);
+    return index < 0 ? NaN : this.presentDurations[index];
+  }
+
+  e2eMs(logical: number): number {
+    const index = this.physical(logical);
+    return index < 0 ? NaN : this.e2eDurations[index];
+  }
+
+  sourceDelta(later: number, earlier: number): number {
+    const a = this.physical(later);
+    const b = this.physical(earlier);
+    if (a < 0 || b < 0) return NaN;
+    const ms = wrappingTimestampDelta(
+      this.sourceTimes[a],
+      this.sourceTimes[b],
+    );
+    return ms + (this.sourceSubTimes[a] - this.sourceSubTimes[b]) / 1000;
+  }
+
+  markDecoded(token: number, time: number): boolean {
+    const index = this.resolve(token);
+    if (index < 0) return false;
+    this.decodeTimes[index] = time;
+    this.decodeDurations[index] = Math.max(0, time - this.times[index]);
+    return true;
+  }
+
+  markPresented(token: number, time: number): void {
+    const index = this.resolve(token);
+    if (index < 0) return;
+    this.presentTimes[index] = time;
+    const decodeTime = this.decodeTimes[index];
+    this.presentDurations[index] = Math.max(
+      0,
+      time - (Number.isFinite(decodeTime) ? decodeTime : time),
+    );
+    if (Number.isFinite(this.sourceToReceive[index])) {
+      this.e2eDurations[index] =
+        this.sourceToReceive[index] +
+        (Number.isFinite(this.decodeDurations[index])
+          ? this.decodeDurations[index]
+          : 0) +
+        this.presentDurations[index];
+    }
+  }
+
+  toArray(): SurfaceFrameSample[] {
+    const result = new Array<SurfaceFrameSample>(this.length);
+    for (let logical = 0; logical < this.length; logical++) {
+      const index = (this.start + logical) % this.capacity;
+      const sample: SurfaceFrameSample = {
+        t: this.times[index],
+        sourceT: this.sourceTimes[index],
+        sourceSubUs: this.sourceSubTimes[index],
+        ptsUs: this.pts[index],
+        bytes: this.sizes[index],
+        key: this.keys[index] !== 0,
+      };
+      if (Number.isFinite(this.sourceToReceive[index]))
+        sample.sourceToRecvMs = this.sourceToReceive[index];
+      if (Number.isFinite(this.decodeTimes[index]))
+        sample.decodeT = this.decodeTimes[index];
+      if (Number.isFinite(this.decodeDurations[index]))
+        sample.decodeMs = this.decodeDurations[index];
+      if (Number.isFinite(this.presentTimes[index]))
+        sample.presentT = this.presentTimes[index];
+      if (Number.isFinite(this.presentDurations[index]))
+        sample.presentMs = this.presentDurations[index];
+      if (Number.isFinite(this.e2eDurations[index]))
+        sample.e2eMs = this.e2eDurations[index];
+      result[logical] = sample;
+    }
+    return result;
+  }
+}
+
+/** Bounded decoder-correlation queue backed by TypedArrays. */
+export class PendingFrameSamples {
+  private readonly pts: Float64Array;
+  private readonly tokens: Float64Array;
+  length = 0;
+
+  constructor(readonly capacity: number) {
+    this.pts = new Float64Array(capacity);
+    this.tokens = new Float64Array(capacity);
+  }
+
+  push(pts: number, token: number): void {
+    if (this.length === this.capacity) {
+      this.pts.copyWithin(0, 1);
+      this.tokens.copyWithin(0, 1);
+      this.length--;
+    }
+    this.pts[this.length] = pts;
+    this.tokens[this.length] = token;
+    this.length++;
+  }
+
+  takeByPts(pts: number): number {
+    for (let i = 0; i < this.length; i++) {
+      if (this.pts[i] !== pts) continue;
+      return this.removeAt(i);
+    }
+    return -1;
+  }
+
+  removeToken(token: number): void {
+    for (let i = 0; i < this.length; i++) {
+      if (this.tokens[i] === token) {
+        this.removeAt(i);
+        return;
+      }
+    }
+  }
+
+  private removeAt(index: number): number {
+    const token = this.tokens[index];
+    this.pts.copyWithin(index, index + 1, this.length);
+    this.tokens.copyWithin(index, index + 1, this.length);
+    this.length--;
+    return token;
+  }
+}
+
+/** Sliding nearest-rank quantile with no per-sample allocations. The FIFO
+ * and sorted views are typed arrays; insertion/removal are bounded memmoves
+ * over at most 480 doubles, replacing an allocated full sort every frame. */
+export class RollingQuantile {
+  private readonly fifo: Float64Array;
+  private readonly sorted: Float64Array;
+  private head = 0;
+  length = 0;
+
+  constructor(readonly capacity: number) {
+    if (!Number.isInteger(capacity) || capacity < 1)
+      throw new RangeError("capacity must be a positive integer");
+    this.fifo = new Float64Array(capacity);
+    this.sorted = new Float64Array(capacity);
+  }
+
+  clear(): void {
+    this.head = 0;
+    this.length = 0;
+  }
+
+  private lowerBound(value: number): number {
+    let lo = 0;
+    let hi = this.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (this.sorted[mid] < value) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  private removeOldest(): void {
+    const value = this.fifo[this.head];
+    this.head = (this.head + 1) % this.capacity;
+    const index = this.lowerBound(value);
+    this.sorted.copyWithin(index, index + 1, this.length);
+    this.length--;
+  }
+
+  push(value: number, window: number = this.capacity): void {
+    const limit = Math.max(1, Math.min(this.capacity, window | 0));
+    while (this.length >= limit) this.removeOldest();
+
+    const insertAt = this.lowerBound(value);
+    this.sorted.copyWithin(insertAt + 1, insertAt, this.length);
+    this.sorted[insertAt] = value;
+    this.fifo[(this.head + this.length) % this.capacity] = value;
+    this.length++;
+  }
+
+  quantile(q: number): number {
+    if (this.length === 0) return 0;
+    const index = Math.min(
+      this.length - 1,
+      Math.max(0, Math.ceil(q * this.length) - 1),
+    );
+    return this.sorted[index];
+  }
+}
+
+/** Remove an array prefix without allocating the discarded array that
+ * `splice()` returns. This is used on the per-refresh VideoFrame queue. */
+function removePrefixInPlace<T>(values: T[], count: number): void {
+  if (count <= 0) return;
+  if (count >= values.length) {
+    values.length = 0;
+    return;
+  }
+  values.copyWithin(0, count);
+  values.length -= count;
+}
+
+/** Insert into an ascending numeric array without creating a temporary
+ *  array. */
+function insertSorted(sorted: number[], value: number): void {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (sorted[mid] <= value) lo = mid + 1;
+    else hi = mid;
+  }
+  sorted.push(value);
+  sorted.copyWithin(lo + 1, lo, sorted.length - 1);
+  sorted[lo] = value;
+}
+
+/** Remove one exact value from an ascending numeric array in place. */
+function removeSorted(sorted: number[], value: number): void {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (sorted[mid] < value) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo >= sorted.length || sorted[lo] !== value) return;
+  sorted.copyWithin(lo, lo + 1);
+  sorted.length--;
+}
+
+/** Discard a prefix without `splice()` allocating the removed elements. */
+function dropPrefixInPlace<T>(items: T[], count: number): void {
+  if (count <= 0) return;
+  if (count >= items.length) {
+    items.length = 0;
+    return;
+  }
+  items.copyWithin(0, count);
+  items.length -= count;
 }
 
 function codecFromFlags(flags: number): SurfaceCodec {
@@ -344,38 +782,39 @@ export class SurfaceStore {
   };
   private _diagTimer: ReturnType<typeof setInterval> | null = null;
   private _visibilityHandler: (() => void) | null = null;
+  private diagnosticsEnabled = true;
+  /** Whether continuous streams may trade latency for smoother cadence.
+   *  Embedders retain the historical smoothing default; the interactive UI
+   *  exposes this as a device-local preference and defaults it off. */
+  private presentationSmoothingEnabled = true;
 
   // Per-surface diagnostics exposed to the debug panel.
-  private _surfaceFrameSamples = new Map<number, SurfaceFrameSample[]>();
+  private _surfaceFrameSamples = new Map<number, SurfaceFrameHistory>();
+  private readonly _emptyFrameSamples = new SurfaceFrameHistory(1);
   /** Timestamps of decoded output frames (for computing output fps). */
-  private _surfaceOutputSamples = new Map<number, number[]>();
+  private _surfaceOutputSamples = new Map<number, NumberRing>();
+  private readonly _emptyOutputSamples = new NumberRing(1);
   /** Cumulative per-surface drop/error counters. */
   private _surfaceDrops = new Map<number, number>();
   private _surfaceErrors = new Map<number, number>();
+  /** Recent midpoint clock calibrations; the lowest-RTT sample has the
+   *  smallest one-way/asymmetry error and is used for source-age estimates. */
+  private _serverClockSamples: ServerClockSample[] = [];
+  private _serverClock: ServerClockSample | null = null;
+  /** Received samples waiting for the corresponding WebCodecs output. */
+  private _pendingFrameSamples = new Map<number, PendingFrameSamples>();
+  /** Transport receive timestamps waiting for the corresponding decoder
+   *  output. This is always populated; unlike diagnostic samples it drives
+   *  presentation timing. */
+  private _pendingFrameReceiveTimes = new Map<number, PendingFrameSamples>();
 
   private static readonly FRAME_SAMPLE_MAX = 500;
   private static readonly OUTPUT_SAMPLE_MAX = 500;
+  private static readonly CLOCK_SAMPLE_MAX = 12;
   /** Max decoded frames a presenter may hold between rAF ticks while
    *  presenting newest-wins (no scheduling, so depth is pure overflow
    *  slack). */
   private static readonly PRESENT_QUEUE_MAX = 2;
-  /** Fastest frame interval the pipeline can legitimately produce.  The
-   *  server clamps a client's reported display rate to `MAX_DISPLAY_FPS`
-   *  (480) and paces surfaces at it, so nothing real arrives faster.
-   *  Flooring the learned interval here — rather than capping depth — is
-   *  what keeps a degenerate PTS stream from inflating the queue. */
-  private static readonly MIN_FRAME_INTERVAL_MS = 1000 / 480;
-  /** Ceiling on held frames once PTS scheduling is engaged.
-   *
-   *  Deliberately sized so it never binds: the margin can reach
-   *  {@link PRESENT_DELAY_MAX_MS} and frames arrive no faster than
-   *  {@link MIN_FRAME_INTERVAL_MS}, so the most any real stream can need is
-   *  `50 / 2.08 = 24`, plus the two of slack {@link smoothedQueueCap} adds.
-   *  Anything that would exceed this is a broken frame interval, and that
-   *  is already handled by the floor above — so a stream is never made to
-   *  drop frames just because it runs at a high rate. */
-  private static readonly PRESENT_QUEUE_MAX_SMOOTHED =
-    Math.ceil(50 / (1000 / 480)) + 2;
   /** Consecutive continuous arrivals before PTS scheduling engages.  Long
    *  enough that a couple of repaints from a click don't trip it, short
    *  enough that it is running well inside the first second of playback. */
@@ -385,9 +824,6 @@ export class SurfaceStore {
    *  interaction and must paint immediately rather than wait out a
    *  playout margin computed for the previous episode. */
   private static readonly STREAM_GAP_MS = 250;
-  /** Hard ceiling on latency the presenter is allowed to add.  Smoothing
-   *  past this trades away more interactivity than juddering costs. */
-  private static readonly PRESENT_DELAY_MAX_MS = 50;
   /** How much stream the offset distribution covers.  Expressed in time
    *  rather than frames so the horizon is the same at 24 and 240 fps —
    *  too short and the schedule chases noise, too long and it responds
@@ -395,14 +831,6 @@ export class SurfaceStore {
   private static readonly OFFSET_WINDOW_MS = 1000;
   private static readonly OFFSET_WINDOW_MIN = 60;
   private static readonly OFFSET_WINDOW_MAX = 480;
-  /** Quantile of the offset distribution that presentation targets.  The
-   *  remaining tail is deliberately not buffered for: those frames arrive
-   *  overdue and are skipped to the newest due one, which is what should
-   *  happen to a rare outlier.  It is not free, though — a skip is a
-   *  dropped frame *and* a repeated one — so {@link updateSchedule} adds a
-   *  refresh of headroom on top rather than leaving 5% of a steady stream
-   *  landing after its own due time. */
-  private static readonly PRESENT_QUANTILE = 0.95;
   /** Low quantile taken as "the fastest this path goes".  Not the strict
    *  minimum: a burst frame is captured later but shipped immediately
    *  behind its predecessor, so its transit genuinely is shorter, and a
@@ -410,29 +838,26 @@ export class SurfaceStore {
    *  quantile ignores it for the same reason the high end ignores a single
    *  late frame — no separate clamp or leak rule needed at either end. */
   private static readonly FAST_QUANTILE = 0.02;
-  /** Maximum movement of {@link SurfacePresenter.presentOffsetMs} per frame.
-   *
-   *  Moving it *is* a latency change — every future due time shifts with
-   *  it — so stepping injects exactly the timing discontinuity this
-   *  scheduler exists to remove.  Slewing turns it into a sub-perceptual
-   *  rate nudge: 2 ms against a 16.7 ms frame is 12% while it moves.
-   *
-   *  Shrinking is proportional rather than a flat crawl.  A flat
-   *  0.25 ms/frame took ~5 s to unwind a single stall, and because video
-   *  rides a reliable ordered channel every lost packet is such a stall —
-   *  so a lossy link sat near the latency ceiling permanently, strictly
-   *  worse than not scheduling at all, for exactly the users this exists
-   *  to help.  Proportional decay unwinds the same stall in ~0.5 s. */
-  private static readonly MARGIN_GROW_MS = 2;
-  private static readonly MARGIN_SHRINK_MS = 0.25;
-  private static readonly MARGIN_SHRINK_FRAC = 0.08;
+  /** Highest receive samples ignored when choosing the playout point. A
+   *  percentage tail is the wrong unit here: at 240 Hz even 2% discards five
+   *  frames, enough to hide the leading edge of every Wi-Fi recovery burst.
+   *  Ignoring exactly one sample rejects an isolated pause at every rate but
+   *  retains any recurring jitter. */
+  private static readonly PLAYOUT_OUTLIERS = 1;
+  /** A sub-2 ms protocol ping identifies a same-host server even when the UI
+   *  itself was opened through a named gateway route. */
+  private static readonly LOCAL_RTT_MAX_MS = 2;
+  /** Bound the interaction-latency cost of smoothing. The transport is
+   *  expected to deliver inside this window; longer outages still collapse
+   *  to newest-wins when the burst arrives rather than replaying stale video. */
+  private static readonly MAX_PLAYOUT_DELAY_MS = 96;
+  /** Fraction of one source interval removed from a shrinking playout margin
+   *  per frame. This sheds the full margin in roughly 3.2 seconds at any FPS. */
+  private static readonly PLAYOUT_SLEW_DOWN_PER_FRAME = 0.03;
   /** Fallback display refresh interval before any rAF delta is measured. */
   private static readonly DEFAULT_REFRESH_MS = 1000 / 60;
-  /** Bounds on an rAF delta that counts as a refresh period: 1000 Hz to
-   *  10 Hz.  Outside this it is a stalled or backgrounded tick, not a
-   *  display rate — see {@link noteRafInterval} for why both ends are
-   *  this permissive. */
-  private static readonly RAF_DELTA_MIN_MS = 1;
+  /** Longest rAF delta that counts as a refresh period.  Faster positive
+   *  cadences have no policy cutoff; longer gaps are stalls/backgrounding. */
   private static readonly RAF_DELTA_MAX_MS = 100;
 
   /** EWMA of observed rAF intervals — the display's refresh period.  Used
@@ -449,10 +874,13 @@ export class SurfaceStore {
 
   /**
    * Callback to send a surface ACK to the server.  Injected by the
-   * connection layer so the store can defer ACKs when the decode queue
-   * is deep (backpressure).
+   * connection layer; each ACK carries the current WebCodecs queue depth so
+   * the server sees decoder pressure without interpreting JS scheduling as
+   * congestion.
    */
-  private _ackSender: ((surfaceId: number) => void) | null = null;
+  private _ackSender:
+    | ((surfaceId: number, decoderQueueDepth: number) => void)
+    | null = null;
 
   /**
    * Callback to request a keyframe from the server (re-subscribe).
@@ -462,7 +890,9 @@ export class SurfaceStore {
   private _keyframeSender: ((surfaceId: number) => void) | null = null;
 
   /** Install the ACK sender callback (called once by BlitConnection). */
-  setAckSender(fn: (surfaceId: number) => void): void {
+  setAckSender(
+    fn: (surfaceId: number, decoderQueueDepth: number) => void,
+  ): void {
     this._ackSender = fn;
   }
 
@@ -471,13 +901,14 @@ export class SurfaceStore {
     this._keyframeSender = fn;
   }
 
-  /** Keyframe requests made while a decoder sat unconfigured, per surface:
-   *  when the last one went out and how many this episode has cost. */
+  /** Keyframe requests made while a decoder cannot produce output, per
+   *  surface: when the last one went out and how many this episode has cost.
+   *  Successful decoded output clears the episode. */
   private _unconfiguredRetry = new Map<number, { at: number; count: number }>();
 
-  /** Spacing and budget for those requests.  Each is a SURFACE_SUBSCRIBE on
-   *  the wire that rebuilds the server's encoder, so this must never become
-   *  a per-frame ask; a handful, seconds apart, is enough for a stream whose
+  /** Spacing and budget for recovery requests.  Each is a SURFACE_SUBSCRIBE on
+   *  the wire that forces another keyframe, so this must never become a
+   *  per-frame ask; a handful, seconds apart, is enough for a stream whose
    *  configuration is one announcement away, and a stream that stays
    *  unconfigurable stops costing anything after that. */
   private static readonly UNCONFIGURED_RETRY_MS = 2000;
@@ -485,7 +916,7 @@ export class SurfaceStore {
 
   /**
    * Ask for a keyframe on behalf of a surface whose decoder is dropping
-   * every frame because it was never configured.
+   * every frame because it cannot configure or decode the stream.
    *
    * Without this the drop is silent and terminal: the codec-string
    * announcement that would configure the decoder only arrives when the
@@ -626,13 +1057,22 @@ export class SurfaceStore {
   }
 
   private sendAck(surfaceId: number): void {
-    this._ackSender?.(surfaceId);
+    let decoderQueueDepth = 0;
+    const entry = this.decoders.get(surfaceId);
+    try {
+      if (entry?.decoder.state === "configured") {
+        decoderQueueDepth = entry.decoder.decodeQueueSize;
+      }
+    } catch {
+      // The decoder can close between the state and queue-depth reads.
+    }
+    this._ackSender?.(surfaceId, decoderQueueDepth);
   }
 
   /** Send an ACK unconditionally — used by the connection layer's catch
    *  path when handleSurfaceFrame throws before it can ACK itself. */
   sendAckFallback(surfaceId: number): void {
-    this._ackSender?.(surfaceId);
+    this.sendAck(surfaceId);
   }
 
   /**
@@ -724,16 +1164,18 @@ export class SurfaceStore {
     encoder: string;
     width: number;
     height: number;
-    /** Ring buffer of recent incoming frame samples (for timeline graph). */
-    frameSamples: SurfaceFrameSample[];
+    /** Typed ring of recent incoming frame samples (for timeline graph). */
+    frameSamples: SurfaceFrameHistory;
     /** Ring buffer of decoded-output timestamps (for fps computation). */
-    outputSamples: readonly number[];
+    outputSamples: NumberRing;
     /** Cumulative dropped frame count. */
     dropped: number;
     /** Cumulative decode error count. */
     errors: number;
     /** Current WebCodecs decode queue depth. */
     queueDepth: number;
+    /** RTT of the midpoint clock sample used for latency estimation. */
+    clockRttMs: number | null;
   }[] {
     const result: ReturnType<SurfaceStore["getDebugStats"]> = [];
     for (const [id, surface] of this.surfaces) {
@@ -756,11 +1198,14 @@ export class SurfaceStore {
         encoder: this.encoderNames.get(id) ?? "",
         width: surface.width,
         height: surface.height,
-        frameSamples: this._surfaceFrameSamples.get(id) ?? [],
-        outputSamples: this._surfaceOutputSamples.get(id) ?? [],
+        frameSamples:
+          this._surfaceFrameSamples.get(id) ?? this._emptyFrameSamples,
+        outputSamples:
+          this._surfaceOutputSamples.get(id) ?? this._emptyOutputSamples,
         dropped: this._surfaceDrops.get(id) ?? 0,
         errors: this._surfaceErrors.get(id) ?? 0,
         queueDepth,
+        clockRttMs: this._serverClock?.rttMs ?? null,
       });
     }
     return result;
@@ -778,8 +1223,83 @@ export class SurfaceStore {
     return this.canvases.get(surfaceId)?.canvas ?? null;
   }
 
+  /** Per-frame latency histories are only useful while the debug pane is
+   * visible. Keeping them off otherwise removes diagnostic allocation and
+   * correlation work from the video hot path. */
+  setDiagnosticsEnabled(enabled: boolean): void {
+    if (enabled === this.diagnosticsEnabled) return;
+    this.diagnosticsEnabled = enabled;
+    if (enabled) return;
+    this._surfaceFrameSamples.clear();
+    this._surfaceOutputSamples.clear();
+    this._pendingFrameSamples.clear();
+    for (const presenter of this.presenters.values()) {
+      presenter.sampleTokens.fill(-1);
+    }
+  }
+
+  /** Allow or bypass the decoded-frame playout buffer.
+   *
+   * Disabling it is an immediate latency operation: cancel any pending rAF,
+   * discard the learned path margin, and paint the newest queued frame now.
+   * Re-enabling starts with a fresh timing window so an old network stall
+   * cannot become latency in the new smoothing episode. */
+  setPresentationSmoothingEnabled(enabled: boolean): void {
+    if (enabled === this.presentationSmoothingEnabled) return;
+    this.presentationSmoothingEnabled = enabled;
+    for (const [surfaceId, p] of this.presenters) {
+      if (p.rafId !== null) {
+        cancelAnimationFrame(p.rafId);
+        p.rafId = null;
+      }
+      p.steadyRun = 0;
+      p.smoothing = false;
+      p.offsets.clear();
+      p.decodeDelays.clear();
+      p.fastOffsetMs = 0;
+      p.presentOffsetMs = NaN;
+      p.lastPtsMs = null;
+      if (!enabled) this.flushPresenter(surfaceId);
+    }
+  }
+
   setConnectionId(id: ConnectionId): void {
     this.connectionId = id;
+  }
+
+  /** Add one server CLOCK_MONOTONIC ↔ performance.now() calibration.
+   *  The midpoint estimate assumes a roughly symmetric path; retaining the
+   *  lowest-RTT sample bounds queueing error and gives the debug pane an
+   *  honest uncertainty indicator. */
+  noteServerClock(
+    serverMs: number,
+    clientSendMs: number,
+    clientReceiveMs: number,
+  ): void {
+    const rttMs = Math.max(0, clientReceiveMs - clientSendMs);
+    if (!Number.isFinite(rttMs) || rttMs > 60_000) return;
+    const sample: ServerClockSample = {
+      serverMs: serverMs >>> 0,
+      clientMidMs: clientSendMs + rttMs / 2,
+      rttMs,
+    };
+    this._serverClockSamples.push(sample);
+    if (
+      this._serverClockSamples.length > SurfaceStore.CLOCK_SAMPLE_MAX
+    ) {
+      this._serverClockSamples.splice(
+        0,
+        this._serverClockSamples.length - SurfaceStore.CLOCK_SAMPLE_MAX,
+      );
+    }
+    this._serverClock = this._serverClockSamples.reduce((best, candidate) =>
+      candidate.rttMs < best.rttMs ? candidate : best,
+    );
+  }
+
+  clearServerClock(): void {
+    this._serverClockSamples.length = 0;
+    this._serverClock = null;
   }
 
   handleSurfaceCreated(
@@ -819,6 +1339,8 @@ export class SurfaceStore {
     this._surfaceOutputSamples.delete(surfaceId);
     this._surfaceDrops.delete(surfaceId);
     this._surfaceErrors.delete(surfaceId);
+    this._pendingFrameSamples.delete(surfaceId);
+    this._pendingFrameReceiveTimes.delete(surfaceId);
     this.discardPresenter(surfaceId);
     const entry = this.decoders.get(surfaceId);
     if (entry) safeClose(entry.decoder);
@@ -829,24 +1351,48 @@ export class SurfaceStore {
 
   handleSurfaceFrame(
     surfaceId: number,
-    _timestamp: number,
+    timestamp: number,
     flags: number,
     width: number,
     height: number,
     data: Uint8Array,
+    timestampSubUs: number = 0,
   ): void {
     this._diag.received++;
+    const receiveT = performance.now();
     const isKey = (flags & SURFACE_FRAME_FLAG_KEYFRAME) !== 0;
+    const sourceSubUs = Math.max(0, Math.min(999, timestampSubUs | 0));
+    const ptsUs = (timestamp >>> 0) * 1000 + sourceSubUs;
+    let sampleToken = -1;
+    if (this.diagnosticsEnabled) {
+      const sourceToReceive = this._serverClock
+        ? Math.max(
+            0,
+            estimateSourceToReceiveMs(
+              timestamp >>> 0,
+              receiveT,
+              this._serverClock,
+            ) -
+              sourceSubUs / 1000,
+          )
+        : NaN;
 
-    // Per-surface frame timeline sample.
-    let samples = this._surfaceFrameSamples.get(surfaceId);
-    if (!samples) {
-      samples = [];
-      this._surfaceFrameSamples.set(surfaceId, samples);
+      // Per-surface frame timeline sample.
+      let samples = this._surfaceFrameSamples.get(surfaceId);
+      if (!samples) {
+        samples = new SurfaceFrameHistory(SurfaceStore.FRAME_SAMPLE_MAX);
+        this._surfaceFrameSamples.set(surfaceId, samples);
+      }
+      sampleToken = samples.push(
+        receiveT,
+        timestamp >>> 0,
+        sourceSubUs,
+        ptsUs,
+        data.length,
+        isKey,
+        sourceToReceive,
+      );
     }
-    samples.push({ t: performance.now(), bytes: data.length, key: isKey });
-    if (samples.length > SurfaceStore.FRAME_SAMPLE_MAX)
-      samples.splice(0, samples.length - SurfaceStore.FRAME_SAMPLE_MAX);
 
     const codec = codecFromFlags(flags);
 
@@ -856,6 +1402,8 @@ export class SurfaceStore {
         safeClose(entry.decoder);
       }
       this.decoders.delete(surfaceId);
+      this._pendingFrameSamples.delete(surfaceId);
+      this._pendingFrameReceiveTimes.delete(surfaceId);
       this.initDecoder(surfaceId, codec, width, height);
       entry = this.decoders.get(surfaceId);
     }
@@ -883,20 +1431,16 @@ export class SurfaceStore {
       // for may never come on its own — the reconfigure path relies on the
       // server's promise that a rebuilt session opens with one, and that
       // opening frame can be lost.  Ask instead of dropping forever.  The
-      // latch keeps this to one request per episode; it clears when a
-      // keyframe lands.
+      // Share the recovery budget with decoder errors. An asynchronous
+      // decoder failure removes its decoder; without the shared budget, the
+      // first delta seen by each replacement decoder could send a second
+      // immediate subscribe and recreate the original per-frame loop.
       if (!entry.keyframeRequested) {
         entry.keyframeRequested = true;
-        this._keyframeSender?.(surfaceId);
+        this.retryUnconfigured(surfaceId);
       }
       return;
     }
-    entry.pendingKeyframe = false;
-    // A keyframe landed (or at least was accepted for decode) — future
-    // decode errors will legitimately need a fresh keyframe request, so
-    // drop the "already asked" latch.
-    entry.keyframeRequested = false;
-
     const surface = this.surfaces.get(surfaceId);
     // Frame dimensions are the *stream* size, which the server downscales
     // per client (per_client_encode_target), while surface.width/height
@@ -1004,23 +1548,42 @@ export class SurfaceStore {
         this.retryUnconfigured(surfaceId);
         return;
       }
-      this._unconfiguredRetry.delete(surfaceId);
-
       const chunk = new EncodedVideoChunk({
         type: isKey ? "key" : "delta",
-        timestamp: _timestamp * 1000,
+        timestamp: ptsUs,
         data: frameData,
       });
+      if (sampleToken >= 0) {
+        let pending = this._pendingFrameSamples.get(surfaceId);
+        if (!pending) {
+          pending = new PendingFrameSamples(SurfaceStore.FRAME_SAMPLE_MAX);
+          this._pendingFrameSamples.set(surfaceId, pending);
+        }
+        pending.push(ptsUs, sampleToken);
+      }
+      let pendingReceive = this._pendingFrameReceiveTimes.get(surfaceId);
+      if (!pendingReceive) {
+        pendingReceive = new PendingFrameSamples(SurfaceStore.FRAME_SAMPLE_MAX);
+        this._pendingFrameReceiveTimes.set(surfaceId, pendingReceive);
+      }
+      pendingReceive.push(ptsUs, receiveT);
       entry.decoder.decode(chunk);
+      // decode() accepted the keyframe. Deltas may now be queued behind it,
+      // but keep the request latch armed until the output callback proves
+      // that the decoder actually produced a frame.
+      if (isKey) entry.pendingKeyframe = false;
       this._diag.decoded++;
 
-      // ACK immediately — the server already paces delivery via its own
-      // inflight window and time-based send interval.  Deferring ACKs
-      // until the output callback adds decode latency to the effective
-      // round-trip, starving the server's pacing window on high-latency
-      // or software-decode paths.
+      // ACK immediately with decodeQueueSize.  Deferring until output would
+      // mix decode latency into delivery accounting; queue depth reports the
+      // same pressure directly and independently of path RTT.
       this.sendAck(surfaceId);
     } catch (e) {
+      this._pendingFrameReceiveTimes.get(surfaceId)?.takeByPts(ptsUs);
+      if (sampleToken >= 0) {
+        const pending = this._pendingFrameSamples.get(surfaceId);
+        pending?.removeToken(sampleToken);
+      }
       console.warn(
         "[blit] surface decode error:",
         surfaceId,
@@ -1048,10 +1611,10 @@ export class SurfaceStore {
       // Fire at most once per pendingKeyframe episode — each request is
       // a SURFACE_SUBSCRIBE on the wire and resets server-side pacing.
       // The flag is cleared when a keyframe decodes successfully.
-      if (entry && !entry.keyframeRequested) {
+      if (entry) {
         entry.keyframeRequested = true;
-        this._keyframeSender?.(surfaceId);
       }
+      this.retryUnconfigured(surfaceId);
     }
   }
 
@@ -1282,6 +1845,9 @@ export class SurfaceStore {
     this._surfaceOutputSamples.clear();
     this._surfaceDrops.clear();
     this._surfaceErrors.clear();
+    this._pendingFrameSamples.clear();
+    this._pendingFrameReceiveTimes.clear();
+    this.clearServerClock();
     this._generation++;
     this.emitChange();
   }
@@ -1309,6 +1875,9 @@ export class SurfaceStore {
     this._surfaceOutputSamples.clear();
     this._surfaceDrops.clear();
     this._surfaceErrors.clear();
+    this._pendingFrameSamples.clear();
+    this._pendingFrameReceiveTimes.clear();
+    this.clearServerClock();
     this._generation++;
     this.emitChange();
   }
@@ -1334,14 +1903,26 @@ export class SurfaceStore {
 
   /** Push a decoded frame into the surface's presenter, paint the very
    *  first one synchronously, and schedule the next vsync tick. */
-  private enqueueFrame(surfaceId: number, frame: VideoFrame): void {
+  private enqueueFrame(
+    surfaceId: number,
+    frame: VideoFrame,
+    sampleToken: number = -1,
+    receiveT?: number,
+  ): void {
     let p = this.presenters.get(surfaceId);
     if (!p) {
-      p = {
+      const presenter: SurfacePresenter = {
         queue: [],
+        sampleTokens: [],
         rafId: null,
+        rafCallback: (frameTimeMs) => {
+          presenter.rafId = null;
+          this.noteRafInterval(frameTimeMs);
+          this.tickPresent(surfaceId, frameTimeMs);
+        },
         initialized: false,
-        offsets: [],
+        offsets: new RollingQuantile(SurfaceStore.OFFSET_WINDOW_MAX),
+        decodeDelays: new RollingQuantile(SurfaceStore.OFFSET_WINDOW_MAX),
         fastOffsetMs: 0,
         presentOffsetMs: NaN,
         lastPtsMs: null,
@@ -1349,18 +1930,46 @@ export class SurfaceStore {
         frameIntervalMs: SurfaceStore.DEFAULT_REFRESH_MS,
         smoothing: false,
       };
+      p = presenter;
       this.presenters.set(surfaceId, p);
     }
 
-    this.trackArrival(p, frame);
+    if (this.presentationSmoothingEnabled) {
+      this.trackArrival(p, frame, receiveT);
+    }
+
+    // Low-latency mode and same-host paths both bypass the playout queue.
+    // Drawing here can still make the browser's imminent composite; waiting
+    // for a newly requested rAF adds up to a full refresh of pure input lag.
+    if (!this.presentationSmoothingEnabled || this.isLocalFastPath()) {
+      if (p.rafId !== null) {
+        cancelAnimationFrame(p.rafId);
+        p.rafId = null;
+      }
+      for (const queued of p.queue) {
+        try {
+          queued.close();
+        } catch {
+          /* already closed */
+        }
+      }
+      if (p.queue.length > 0) this._diag.dropped += p.queue.length;
+      p.queue.length = 0;
+      p.sampleTokens.length = 0;
+      p.initialized = true;
+      p.smoothing = false;
+      this.presentFrame(surfaceId, frame, sampleToken);
+      return;
+    }
 
     if (!p.initialized) {
       p.initialized = true;
-      this.presentFrame(surfaceId, frame);
+      this.presentFrame(surfaceId, frame, sampleToken);
       return;
     }
 
     p.queue.push(frame);
+    p.sampleTokens.push(sampleToken);
 
     // Hidden tabs never fire rAF, but decode output keeps arriving (the
     // stream stays subscribed and ACKed).  Present immediately instead of
@@ -1395,7 +2004,8 @@ export class SurfaceStore {
           /* already closed */
         }
       }
-      p.queue.splice(0, excess);
+      removePrefixInPlace(p.queue, excess);
+      removePrefixInPlace(p.sampleTokens, excess);
       this._diag.dropped += excess;
     }
 
@@ -1404,17 +2014,22 @@ export class SurfaceStore {
 
   /** Fold one arrival into the presenter's clock model and decide whether
    *  this surface is streaming continuously enough to schedule off PTS. */
-  private trackArrival(p: SurfacePresenter, frame: VideoFrame): void {
+  private trackArrival(
+    p: SurfacePresenter,
+    frame: VideoFrame,
+    receiveT?: number,
+  ): void {
     const nowMs = performance.now();
-    // VideoFrame.timestamp is µs; the wire carries u32 ms (see
-    // handleSurfaceFrame), so this divides back to whole ms.
+    // VideoFrame.timestamp is µs; negotiated frames carry a u16
+    // microseconds-within-the-ms field after the base wire header.
     const ptsMs = frame.timestamp / 1000;
 
     // No usable PTS — stay on newest-wins.  Scheduling against a NaN due
     // time would mean no frame ever compares as due and the surface would
     // freeze outright, which is far worse than the judder being fixed here.
     if (!Number.isFinite(ptsMs)) {
-      p.offsets.length = 0;
+      p.offsets.clear();
+      p.decodeDelays.clear();
       p.fastOffsetMs = 0;
       p.presentOffsetMs = NaN;
       p.steadyRun = 0;
@@ -1447,7 +2062,8 @@ export class SurfaceStore {
       (ptsMs < p.lastPtsMs || ptsMs - p.lastPtsMs > SurfaceStore.STREAM_GAP_MS);
 
     if (ptsBroke) {
-      p.offsets.length = 0;
+      p.offsets.clear();
+      p.decodeDelays.clear();
       p.fastOffsetMs = 0;
       p.presentOffsetMs = NaN;
       p.steadyRun = 0;
@@ -1463,36 +2079,33 @@ export class SurfaceStore {
       }
     }
 
-    p.offsets.push(nowMs - ptsMs);
-    this.updateSchedule(p);
+    const hasReceiveT = Number.isFinite(receiveT);
+    const receiveOffsetMs = hasReceiveT ? receiveT! - ptsMs : nowMs - ptsMs;
+    const decodeDelayMs = hasReceiveT ? Math.max(0, nowMs - receiveT!) : 0;
+    this.updateSchedule(p, receiveOffsetMs, decodeDelayMs);
 
     p.lastPtsMs = ptsMs;
     p.steadyRun++;
     if (p.steadyRun >= SurfaceStore.SMOOTHING_ENGAGE_FRAMES) p.smoothing = true;
   }
 
-  /** Trim the offset window to ~{@link OFFSET_WINDOW_MS} of stream, then
-   *  slew the presentation offset toward the window's
-   *  {@link PRESENT_QUANTILE} plus one refresh, capped at
-   *  {@link PRESENT_DELAY_MAX_MS} of added latency over
-   *  {@link FAST_QUANTILE}.
+  /** Trim the offset window to ~{@link OFFSET_WINDOW_MS} of stream and map
+   *  PTS onto a bounded late-arrival quantile.
    *
-   *  The refresh is what makes the quantile usable as a due time.  A frame
-   *  can only be painted on a vsync, so scheduling it to become due at the
-   *  arrival quantile leaves it a fraction of a refresh to actually land —
-   *  and every frame that misses costs twice, once for the refresh that
-   *  repeats the previous frame and once for itself, skipped as overdue by
-   *  {@link presentIndex}.  Measured against a server delivering a clean
-   *  60 fps to a 60 Hz display, the margin settled at 4-15 ms, under one
-   *  refresh, and 3-19% of decoded frames never reached the canvas — two
-   *  to six visible hitches a second with an idle main thread and a
-   *  metronomic rAF.  Buying a whole refresh of headroom costs latency
-   *  that {@link PRESENT_DELAY_MAX_MS} was already budgeting for. */
-  private updateSchedule(p: SurfacePresenter): void {
-    const interval = Math.max(
-      SurfaceStore.MIN_FRAME_INTERVAL_MS,
-      p.frameIntervalMs,
-    );
+   *  The old fastest-path schedule added zero playout latency, but it also
+   *  exposed every reliable-stream ACK/GC stall as a frozen canvas followed
+   *  by a burst. A high quantile turns recurring jitter into a small steady
+   *  delay. The low quantile remains the baseline so the added delay is
+   *  observable and queue depth can be derived from it. */
+  private updateSchedule(
+    p: SurfacePresenter,
+    receiveOffsetMs: number,
+    decodeDelayMs: number,
+  ): void {
+    const interval = this.validFrameInterval(p);
+    const maxPlayoutDelayMs = this.isLocalFastPath()
+      ? 0
+      : SurfaceStore.MAX_PLAYOUT_DELAY_MS;
     const window = Math.min(
       SurfaceStore.OFFSET_WINDOW_MAX,
       Math.max(
@@ -1500,44 +2113,49 @@ export class SurfaceStore {
         Math.round(SurfaceStore.OFFSET_WINDOW_MS / interval),
       ),
     );
-    // One element off the front per frame, on an array of at most a few
-    // hundred numbers — a memmove of a couple of KB, well below the cost
-    // of decoding the frame it accompanies.
-    if (p.offsets.length > window) {
-      p.offsets.splice(0, p.offsets.length - window);
-    }
-
-    p.fastOffsetMs = quantile(p.offsets, SurfaceStore.FAST_QUANTILE);
-    const jitterTarget = quantile(p.offsets, SurfaceStore.PRESENT_QUANTILE);
-    const target = Math.min(
-      jitterTarget + this.refreshMs,
-      p.fastOffsetMs + SurfaceStore.PRESENT_DELAY_MAX_MS,
+    p.offsets.push(receiveOffsetMs, window);
+    p.decodeDelays.push(decodeDelayMs, window);
+    const fastReceiveOffsetMs = p.offsets.quantile(
+      SurfaceStore.FAST_QUANTILE,
     );
-
-    if (!Number.isFinite(p.presentOffsetMs)) {
-      // Seed at the jitter estimate alone and let the grow slew below walk
-      // the refresh of headroom in over ~8 frames.  Seeding at the full
-      // target makes engaging smoothing a one-step latency jump, and a step
-      // in the offset is a hole of exactly that size in the output — three
-      // refreshes of nothing, once, right at the start of every stream.
-      // That is the discontinuity this scheduler exists to remove, so it
-      // must not be the thing that turns it on.
-      p.presentOffsetMs = Math.min(jitterTarget, target);
-      return;
-    }
-    if (target > p.presentOffsetMs) {
-      p.presentOffsetMs = Math.min(
-        target,
-        p.presentOffsetMs + SurfaceStore.MARGIN_GROW_MS,
+    const fastDecodeDelayMs = p.decodeDelays.quantile(
+      SurfaceStore.FAST_QUANTILE,
+    );
+    p.fastOffsetMs = fastReceiveOffsetMs + fastDecodeDelayMs;
+    const lateReceiveOffsetMs = p.offsets.quantile(
+      Math.max(
+        0,
+        1 - SurfaceStore.PLAYOUT_OUTLIERS / p.offsets.length,
+      ),
+    );
+    const targetOffsetMs =
+      p.fastOffsetMs +
+      Math.min(
+        maxPlayoutDelayMs,
+        Math.max(0, lateReceiveOffsetMs - fastReceiveOffsetMs),
       );
+    if (
+      !Number.isFinite(p.presentOffsetMs) ||
+      targetOffsetMs >= p.presentOffsetMs
+    ) {
+      p.presentOffsetMs = targetOffsetMs;
     } else {
-      const gap = p.presentOffsetMs - target;
-      const step = Math.max(
-        SurfaceStore.MARGIN_SHRINK_MS,
-        gap * SurfaceStore.MARGIN_SHRINK_FRAC,
+      // Clamp first in case the whole path got faster; an old absolute
+      // offset must never turn into more than MAX_PLAYOUT_DELAY_MS of margin.
+      const currentOffsetMs = Math.min(
+        p.presentOffsetMs,
+        p.fastOffsetMs + maxPlayoutDelayMs,
       );
-      p.presentOffsetMs = Math.max(target, p.presentOffsetMs - step);
+      p.presentOffsetMs = Math.max(
+        targetOffsetMs,
+        currentOffsetMs - interval * SurfaceStore.PLAYOUT_SLEW_DOWN_PER_FRAME,
+      );
     }
+  }
+
+  private isLocalFastPath(): boolean {
+    const rttMs = this._serverClock?.rttMs;
+    return rttMs !== undefined && rttMs <= SurfaceStore.LOCAL_RTT_MAX_MS;
   }
 
   /** Playout margin: how far behind the fastest observed path frames are
@@ -1556,50 +2174,40 @@ export class SurfaceStore {
    *  not-yet-due frames per interval — dropping most of the stream in the
    *  name of bounding it.
    *
-   *  The interval is floored rather than the depth ceilinged, so the outer
-   *  bound is unreachable for any real frame rate and no stream is made to
-   *  drop frames merely for being fast. */
+   *  There is no high-rate ceiling: the cap grows directly from the learned
+   *  positive interval.  A non-positive or non-finite interval is not a
+   *  cadence and falls back to the initial refresh estimate. */
   private smoothedQueueCap(p: SurfacePresenter): number {
-    const interval = Math.max(
-      SurfaceStore.MIN_FRAME_INTERVAL_MS,
-      p.frameIntervalMs,
-    );
+    const interval = this.validFrameInterval(p);
     const span = Math.ceil(this.playoutDelayMs(p) / interval);
-    return Math.min(
-      Math.max(span + 2, SurfaceStore.PRESENT_QUEUE_MAX),
-      SurfaceStore.PRESENT_QUEUE_MAX_SMOOTHED,
-    );
+    return Math.max(span + 2, SurfaceStore.PRESENT_QUEUE_MAX);
+  }
+
+  private validFrameInterval(p: SurfacePresenter): number {
+    return Number.isFinite(p.frameIntervalMs) && p.frameIntervalMs > 0
+      ? p.frameIntervalMs
+      : SurfaceStore.DEFAULT_REFRESH_MS;
   }
 
   private schedulePresent(surfaceId: number): void {
     const p = this.presenters.get(surfaceId);
     if (!p || p.rafId !== null) return;
-    p.rafId = requestAnimationFrame(() => {
-      p.rafId = null;
-      this.noteRafInterval();
-      this.tickPresent(surfaceId);
-    });
+    p.rafId = requestAnimationFrame(p.rafCallback);
   }
 
-  /** Track the display's refresh period from rAF deltas.  Accepts anything
-   *  from {@link RAF_DELTA_MIN_MS} to {@link RAF_DELTA_MAX_MS} — 1000 Hz
-   *  down to 10 Hz — and ignores the rest as a stalled or backgrounded
-   *  tick rather than a refresh rate. */
-  private noteRafInterval(): void {
-    const now = performance.now();
+  /** Track the display's refresh period from rAF deltas.  Accepts every
+   *  positive cadence through {@link RAF_DELTA_MAX_MS} (10 Hz) and ignores
+   *  longer gaps as a stalled or backgrounded tick.
+   *
+   *  Use the timestamp supplied by rAF, not `performance.now()`. Every rAF
+   *  callback in one browser frame receives the same timestamp, while the
+   *  wall clock advances as earlier surfaces draw. Measuring the latter
+   *  made a multi-pane frame's draw time look like a 1–3 ms display period
+   *  and corrupted the shared presentation clock. */
+  private noteRafInterval(now: number): void {
     if (this.lastRafMs !== null) {
       const dt = now - this.lastRafMs;
-      // The band is wide on purpose, at both ends.
-      //
-      // Low: the server accepts a reported display rate up to
-      // MAX_DISPLAY_FPS (480) and paces surfaces at it, so anything above
-      // that is already beyond what the pipeline produces — but rejecting
-      // fast deltas is the expensive mistake.  A 4 ms floor (250 Hz) threw
-      // away every sample on a 360/480 Hz panel and left this pinned at the
-      // 60 Hz default, which then puts half a *60 Hz* refresh of lookahead
-      // on the due-time comparison — several refreshes early at that rate.
-      //
-      // High: a 10 Hz tick is a real cadence on a loaded machine or an
+      // A 10 Hz tick is a real cadence on a loaded machine or an
       // occluded window, and the rounding window should match whatever the
       // page is actually painting at.  The cost of admitting it is that a
       // transient stall drags the estimate up and presents slightly early
@@ -1607,10 +2215,7 @@ export class SurfaceStore {
       // ~25 ms, about 4 ms of extra lookahead, gone within ten frames at
       // the 0.1 EWMA weight.  Cheaper than mistaking a slow display for a
       // fast one.
-      if (
-        dt >= SurfaceStore.RAF_DELTA_MIN_MS &&
-        dt <= SurfaceStore.RAF_DELTA_MAX_MS
-      ) {
+      if (dt > 0 && dt <= SurfaceStore.RAF_DELTA_MAX_MS) {
         this.refreshMs += (dt - this.refreshMs) * 0.1;
       }
     }
@@ -1627,7 +2232,7 @@ export class SurfaceStore {
    *  PTS maps to.  Frames not yet due stay queued — that is what makes a
    *  30 fps source hold each frame for exactly two refreshes on a 60 Hz
    *  display instead of racing through the queue and then starving. */
-  private tickPresent(surfaceId: number): void {
+  private tickPresent(surfaceId: number, frameTimeMs: number): void {
     const p = this.presenters.get(surfaceId);
     if (!p || p.queue.length === 0) return;
 
@@ -1639,7 +2244,11 @@ export class SurfaceStore {
     // rAF fires just before the next composite, so what is drawn now lands
     // one refresh from here.  Rounding by half a refresh picks the nearest
     // vsync rather than always the later one.
-    const deadline = performance.now() + this.refreshMs / 2;
+    // The same rAF timestamp also gives every surface in this browser frame
+    // one presentation deadline. `performance.now()` would make later panes
+    // appear due several milliseconds later merely because earlier panes
+    // took time to draw.
+    const deadline = frameTimeMs + this.refreshMs / 2;
     const due = p.presentOffsetMs;
 
     let idx = -1;
@@ -1675,8 +2284,10 @@ export class SurfaceStore {
     }
     if (idx > 0) this._diag.dropped += idx;
     const chosen = p.queue[idx];
-    p.queue.splice(0, idx + 1);
-    this.presentFrame(surfaceId, chosen);
+    const sampleToken = p.sampleTokens[idx];
+    removePrefixInPlace(p.queue, idx + 1);
+    removePrefixInPlace(p.sampleTokens, idx + 1);
+    this.presentFrame(surfaceId, chosen, sampleToken);
   }
 
   /** Drain everything now, newest wins — for paths where rAF will not run
@@ -1689,7 +2300,11 @@ export class SurfaceStore {
 
   /** Draw a frame to the backing canvas and notify listeners.  Closes the
    *  frame on the way out. */
-  private presentFrame(surfaceId: number, frame: VideoFrame): void {
+  private presentFrame(
+    surfaceId: number,
+    frame: VideoFrame,
+    sampleToken: number,
+  ): void {
     // Counted here rather than at the call sites: this is the one place a
     // frame actually reaches the canvas, so `presented` stays comparable
     // against `output` no matter which path drew it.  A healthy stream has
@@ -1722,6 +2337,15 @@ export class SurfaceStore {
         // Prevent a single broken listener from blocking others.
       }
     }
+    // Frame listeners synchronously copy the shared backing canvas into
+    // every visible canvas. Record after them, not after the backing draw,
+    // so the client-side stage includes all CPU work required to submit the
+    // visible frame. Physical scanout is estimated separately in the debug
+    // pane because browsers expose no presentation timestamp for canvas.
+    if (sampleToken >= 0)
+      this._surfaceFrameSamples
+        .get(surfaceId)
+        ?.markPresented(sampleToken, performance.now());
   }
 
   private discardPresenter(surfaceId: number): void {
@@ -1763,7 +2387,8 @@ export class SurfaceStore {
       // immediately instead of waiting out a margin from before the gap.
       p.steadyRun = 0;
       p.smoothing = false;
-      p.offsets.length = 0;
+      p.offsets.clear();
+      p.decodeDelays.clear();
       p.fastOffsetMs = 0;
       p.presentOffsetMs = NaN;
       this.flushPresenter(sid);
@@ -1822,22 +2447,45 @@ export class SurfaceStore {
         // decoder is configured, so the retry budget starts fresh.
         this._decodeFailStreak.delete(surfaceId);
         this._unconfiguredRetry.delete(surfaceId);
-
-        // Per-surface output sample for debug panel rate computation.
-        let outputs = this._surfaceOutputSamples.get(surfaceId);
-        if (!outputs) {
-          outputs = [];
-          this._surfaceOutputSamples.set(surfaceId, outputs);
+        const active = this.decoders.get(surfaceId);
+        if (active?.decoder === decoder) {
+          active.pendingKeyframe = false;
+          active.keyframeRequested = false;
         }
-        outputs.push(performance.now());
-        if (outputs.length > SurfaceStore.OUTPUT_SAMPLE_MAX)
-          outputs.splice(0, outputs.length - SurfaceStore.OUTPUT_SAMPLE_MAX);
+
+        const outputT = performance.now();
+        const receiveT =
+          this._pendingFrameReceiveTimes
+            .get(surfaceId)
+            ?.takeByPts(frame.timestamp) ?? -1;
+        let sampleToken = -1;
+        if (this.diagnosticsEnabled) {
+          // Per-surface output sample for debug panel rate computation.
+          let outputs = this._surfaceOutputSamples.get(surfaceId);
+          if (!outputs) {
+            outputs = new NumberRing(SurfaceStore.OUTPUT_SAMPLE_MAX);
+            this._surfaceOutputSamples.set(surfaceId, outputs);
+          }
+          outputs.push(outputT);
+
+          const pending = this._pendingFrameSamples.get(surfaceId);
+          sampleToken = pending?.takeByPts(frame.timestamp) ?? -1;
+          if (sampleToken >= 0)
+            this._surfaceFrameSamples
+              .get(surfaceId)
+              ?.markDecoded(sampleToken, outputT);
+        }
 
         // Queue + paced presentation absorbs network/decoder jitter and
         // prevents 30 fps content from juddering on a 120 Hz display.
         // The first frame paints synchronously inside enqueueFrame to
         // minimise time-to-first-pixel.
-        this.enqueueFrame(surfaceId, frame);
+        this.enqueueFrame(
+          surfaceId,
+          frame,
+          sampleToken,
+          receiveT >= 0 ? receiveT : undefined,
+        );
       },
       error: (e: DOMException) => {
         console.warn(
@@ -1859,9 +2507,10 @@ export class SurfaceStore {
           this.decoders.delete(surfaceId);
         }
         this.noteDecodeFailure(surfaceId, codec);
-        // Ask the server for a keyframe so the next decoder gets a
-        // clean reference point.
-        this._keyframeSender?.(surfaceId);
+        // Ask the server for a keyframe so the next decoder gets a clean
+        // reference point. Decoder errors can repeat once per incoming
+        // frame, so share the same retry budget as configuration failures.
+        this.retryUnconfigured(surfaceId);
       },
     });
     const entry: DecoderEntry = {

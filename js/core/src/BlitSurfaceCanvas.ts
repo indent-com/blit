@@ -436,6 +436,10 @@ function domKeyToEvdev(code: string): number {
   return EVDEV_MAP[code] ?? 0;
 }
 
+/** Modifier keys must stay held across a chord; every other Cmd-chord key can
+ *  be released with its press on macOS, where the browser may eat its keyup. */
+const EVDEV_MODIFIERS = new Set([29, 42, 54, 56, 97, 100, 125, 126]);
+
 /**
  * True when the browser is on macOS/iPadOS, where the Alt key doubles as
  * the Option character modifier: Option+E is a dead key, Option+F types
@@ -760,10 +764,9 @@ export class BlitSurfaceCanvas {
      * The container's own device-pixel ratio, in 1/120ths — the ratio that
      * converts this view's device pixels back to CSS pixels.
      *
-     * Equal to `scale120` unless the binding applied a zoom factor: zoom
-     * multiplies the *surface* scale (the app renders larger and the window
-     * fits fewer of its own logical pixels in the pane) while the pane's
-     * device↔CSS ratio is unchanged, so the two must not be conflated.
+     * Equal to `scale120` unless the binding selected a relative or exact
+     * surface scale that differs from the display DPI. The pane's device↔CSS
+     * ratio is unchanged, so the two must not be conflated.
      */
     cssScale120: number;
   } | null = null;
@@ -788,6 +791,8 @@ export class BlitSurfaceCanvas {
   /** Source frame size of the last blit, so the observer can recompute the
    *  reduction without going back to the store. */
   private _lastFrameSize: { width: number; height: number } | null = null;
+  /** Reused result for presentationBox(); callers consume it synchronously. */
+  private readonly _presentationBox = { width: 0, height: 0 };
   /** Last layout applied by applyLayout(), to skip redundant style writes. */
   private _lastLayout: {
     left: number;
@@ -1166,9 +1171,9 @@ export class BlitSurfaceCanvas {
    *
    * `scale120` is the scale the *surface* is asked to render at, in 1/120ths
    * (Wayland convention): the app is handed `width * 120 / scale120` logical
-   * pixels.  `cssScale120` is the container's device-pixel ratio and defaults
-   * to `scale120`; a binding applying a zoom factor passes the two
-   * separately, since zoom moves the surface scale only.
+   * pixels. `cssScale120` is the container's device-pixel ratio and defaults
+   * to `scale120`; a binding applying relative zoom or an exact scale passes
+   * the two separately, since the control moves the surface scale only.
    */
   setDisplaySize(
     width: number | null,
@@ -1247,15 +1252,15 @@ export class BlitSurfaceCanvas {
   /**
    * The box, in this view's device pixels, the surface may be drawn into:
    * the pane, but never larger than the surface's own logical size at this
-   * view's DPR.  Null for views that don't size their own box.
+   * view's requested scale. Null for views that don't size their own box.
    *
    * The server mediates one surface across all its viewers at the
-   * *highest* DPR any of them asked for (see `mediated_size_for_surface`),
+   * *highest* scale any of them asked for (see `mediated_size_for_surface`),
    * so a small 3x pane and a large 1x pane settle on a small window
    * composited at 3x.  Filling the 1x pane with that frame would show the
    * window at 3x zoom — the same window drawn three times too big on the
    * client that never asked for a high-DPI anything.  Capping at
-   * `logical × own DPR` draws it at the size it actually is and lets the
+   * `logical × own scale` draws it at the requested size and lets the
    * rest of the pane letterbox.
    *
    * The cap only bites when it clears the pane by more than rounding
@@ -1269,16 +1274,20 @@ export class BlitSurfaceCanvas {
     if (!ds || !ds.scale120) return null;
     const lw = this.surface?.logicalWidth ?? 0;
     const lh = this.surface?.logicalHeight ?? 0;
+    const box = this._presentationBox;
     // Unknown logical size (old server, or no resize reported yet): the
     // pane is the only answer we have.
-    if (lw <= 0 || lh <= 0) return { width: ds.width, height: ds.height };
+    if (lw <= 0 || lh <= 0) {
+      box.width = ds.width;
+      box.height = ds.height;
+      return box;
+    }
     const SNAP = 3;
     const capW = Math.round((lw * ds.scale120) / 120);
     const capH = Math.round((lh * ds.scale120) / 120);
-    return {
-      width: capW < ds.width - SNAP ? capW : ds.width,
-      height: capH < ds.height - SNAP ? capH : ds.height,
-    };
+    box.width = capW < ds.width - SNAP ? capW : ds.width;
+    box.height = capH < ds.height - SNAP ? capH : ds.height;
+    return box;
   }
 
   private applyLayout(): void {
@@ -1506,7 +1515,12 @@ export class BlitSurfaceCanvas {
     const ctx = this.ctx;
     if (!src || !canvas || !ctx) return;
     if (src.width === 0 || src.height === 0) return;
-    this._lastFrameSize = { width: src.width, height: src.height };
+    if (this._lastFrameSize) {
+      this._lastFrameSize.width = src.width;
+      this._lastFrameSize.height = src.height;
+    } else {
+      this._lastFrameSize = { width: src.width, height: src.height };
+    }
 
     // A view that sizes its own box usually has nothing to prefilter: the
     // backing buffer mirrors the source frame exactly and applyLayout fits
@@ -2409,11 +2423,11 @@ export class BlitSurfaceCanvas {
   /**
    * Add to the pending scroll and arrange for it to be sent.
    *
-   * Deltas are batched to one message per animation frame. macOS momentum
-   * alone emits events at 60–120Hz for a second or more after the fingers
-   * lift; one message each turns into one `wl_pointer.frame` each, and
-   * network jitter then delivers them in bursts that read as stutter no
-   * matter how correct the magnitudes are.
+   * Smooth wheel events already arrive at the browser's input cadence. Send
+   * those immediately: waiting for the next animation frame couples input
+   * to presentation, so one missed viewer frame merges two small trackpad
+   * deltas into one visible jump. Notched wheels and direct touch gestures
+   * retain frame batching to keep bursts bounded.
    */
   private queueScroll(part: {
     dx: number;
@@ -2422,7 +2436,7 @@ export class BlitSurfaceCanvas {
     v120y: number;
     source: number;
   }): void {
-    this.latchScrollSource(part.source);
+    const source = this.latchScrollSource(part.source);
     this.scrollSequenceOpen = true;
     const a = (this.scrollAccum ??= { dx: 0, dy: 0, v120x: 0, v120y: 0 });
     a.dx += part.dx;
@@ -2430,7 +2444,13 @@ export class BlitSurfaceCanvas {
     a.v120x += part.v120x;
     a.v120y += part.v120y;
 
-    if (this.scrollFlushHandle === null) {
+    if (source === AXIS_SOURCE_CONTINUOUS) {
+      if (this.scrollFlushHandle !== null) {
+        cancelAnimationFrame(this.scrollFlushHandle);
+        this.scrollFlushHandle = null;
+      }
+      this.flushScroll();
+    } else if (this.scrollFlushHandle === null) {
       this.scrollFlushHandle = requestAnimationFrame(() => {
         this.scrollFlushHandle = null;
         this.flushScroll();
@@ -2762,29 +2782,34 @@ export class BlitSurfaceCanvas {
     }
   }
 
-  /** Read an image off the clipboard for a Ctrl-chord paste whose
-   *  `readText()` came back empty or was denied.  Only ever called for
-   *  Ctrl chords: a Cmd chord's paste event is guaranteed (the macOS menu
-   *  command fires for the textarea focus is forced onto) and owns the
-   *  chord's outcome, while a Ctrl chord that no paste event has claimed
-   *  by the time a promise settles will never see one.  This is what lets
-   *  Ctrl+V paste a screenshot on macOS Chrome.  Every settle of every
-   *  read ends the chord — flush on an image, abandon otherwise — so no
-   *  timer has to guess when the clipboard is done answering.  Needs the
-   *  clipboard-read permission; with no deadline, a first-time prompt no
-   *  longer kills the chord — it flushes when the user grants. */
+  /** Read an image from a clipboard read started by the Ctrl keydown.
+   *
+   *  Starting `clipboard.read()` synchronously is load-bearing on browsers
+   *  that gate it on transient user activation: waiting for `readText()` to
+   *  settle first loses the key event's activation on macOS, so an image-only
+   *  clipboard is refused even though the user just pressed Ctrl+V.  We still
+   *  wait for `readText()` before consuming this result because text wins when
+   *  the clipboard carries both representations.
+   *
+   *  Only used for Ctrl chords.  A Cmd chord's paste event is guaranteed (the
+   *  macOS menu command fires for the textarea focus is forced onto) and owns
+   *  the chord's outcome. */
   private readClipboardImage(
+    read: Promise<ClipboardItem[] | null> | null,
     flush: (payload: ClipboardPayload | null) => void,
   ): void {
-    const read = navigator.clipboard?.read?.bind(navigator.clipboard);
     if (!read) {
       this._pendingPasteAbandon?.();
       return;
     }
-    void read().then(
+    void read.then(
       async (items) => {
         try {
           if (!this._pendingPasteFlush) return; // a paste event claimed it
+          if (!items) {
+            this._pendingPasteAbandon?.();
+            return;
+          }
           const images: { mime: string; item: ClipboardItem }[] = [];
           for (const item of items) {
             for (const mime of item.types) {
@@ -2817,6 +2842,8 @@ export class BlitSurfaceCanvas {
           this._pendingPasteAbandon?.();
         }
       },
+      // The promise is normalized when it is started, but keep the rejection
+      // path defensive in case a non-native implementation returns one.
       () => this._pendingPasteAbandon?.(),
     );
   }
@@ -3050,6 +3077,25 @@ export class BlitSurfaceCanvas {
       if (this.textInput) this.textInput.focus({ preventScroll: true });
 
       const metaChord = e.metaKey && !e.ctrlKey;
+      const startImageRead = (): Promise<ClipboardItem[] | null> | null => {
+        const read = navigator.clipboard?.read?.bind(navigator.clipboard);
+        if (!read) return null;
+        try {
+          return read().then(
+            (items) => items,
+            () => null,
+          );
+        } catch {
+          return Promise.resolve(null);
+        }
+      };
+      // macOS does not treat Ctrl+V as its native paste command, so no paste
+      // event will authorize the richer read.  Start it now, within the
+      // keydown's transient activation.  Elsewhere Ctrl+V normally produces a
+      // paste event; don't prompt for async clipboard permission unless that
+      // event and readText both fail to supply content.
+      const imageRead =
+        !metaChord && this.macOptionChars ? startImageRead() : null;
       const imageFallback = () => {
         // `_pendingPasteFlush` being cleared means a paste event already
         // claimed this chord: an image is on its way and its text
@@ -3061,7 +3107,8 @@ export class BlitSurfaceCanvas {
         // chord no paste event has claimed by now never gets one (browsers
         // dispatch it with the keydown, or not at all — macOS Chrome
         // reserves paste for Cmd), so the image has to be read directly.
-        if (!metaChord) this.readClipboardImage(flush);
+        if (!metaChord)
+          this.readClipboardImage(imageRead ?? startImageRead(), flush);
       };
       navigator.clipboard.readText().then((text) => {
         if (!this._pendingPasteFlush) return; // a paste event claimed it
@@ -3138,6 +3185,23 @@ export class BlitSurfaceCanvas {
         conn.sendSurfaceInput(this._surfaceId, 29, false);
         this._metaToCtrl = 0;
         this._metaToCtrlKey = 0;
+        return;
+      }
+      // Chromium/WebKit on macOS may consume the key-up of a key that
+      // triggered a Cmd menu command (Cmd+A is the common example).  Leaving
+      // the press live makes the remote compositor key-repeat that key after
+      // Cmd is released.  macOS Cmd chords do not autorepeat, so complete the
+      // remote press/release while Meta is still depressed.  A real late
+      // key-up is then ignored by the normal
+      // pressedKeys guard below.  Linux/Windows retain down-until-key-up.
+      if (
+        pressed &&
+        this.macOptionChars &&
+        e.metaKey &&
+        !EVDEV_MODIFIERS.has(keycode)
+      ) {
+        conn.sendSurfaceInput(this._surfaceId, keycode, true);
+        conn.sendSurfaceInput(this._surfaceId, keycode, false);
         return;
       }
       if (pressed) {

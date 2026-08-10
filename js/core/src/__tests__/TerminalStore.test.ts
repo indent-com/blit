@@ -1,9 +1,18 @@
-import { afterEach, describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import type { BlitWasmModule } from "../TerminalStore";
-import { TerminalStore, type TerminalStoreDelegate } from "../TerminalStore";
+import {
+  estimateDisplayFps,
+  TerminalStore,
+  type TerminalStoreDelegate,
+} from "../TerminalStore";
 import type { GlRenderer } from "../gl-renderer";
 import { MockTransport } from "./mock-transport";
-import { C2S_ACK, C2S_CLIENT_METRICS, C2S_SUBSCRIBE } from "../types";
+import {
+  C2S_ACK,
+  C2S_CLIENT_METRICS,
+  C2S_DISPLAY_RATE,
+  C2S_SUBSCRIBE,
+} from "../types";
 
 class FakeTerminal {
   constructor(_rows: number, _cols: number, _cellPw: number, _cellPh: number) {}
@@ -39,6 +48,36 @@ afterEach(() => {
   delete (navigator as Navigator & { userAgent?: unknown }).userAgent;
   delete (navigator as Navigator & { platform?: unknown }).platform;
   delete (navigator as Navigator & { maxTouchPoints?: unknown }).maxTouchPoints;
+});
+
+describe("display refresh estimation", () => {
+  it("recovers a 240 Hz period from quantized timestamps", () => {
+    // 4.166... ms represented at 0.1 ms precision: two 4.2 ms intervals
+    // for each 4.1 ms interval.
+    const samples = Array.from({ length: 60 }, (_, i) =>
+      i % 3 === 0 ? 4.1 : 4.2,
+    );
+    expect(estimateDisplayFps(samples)).toBeCloseTo(240, 6);
+  });
+
+  it("recovers an arbitrary rate without nominal-mode snapping", () => {
+    expect(estimateDisplayFps(Array(60).fill(1_000 / 137))).toBeCloseTo(
+      137,
+      6,
+    );
+    expect(estimateDisplayFps(Array(60).fill(1_000 / 145))).toBeCloseTo(
+      145,
+      6,
+    );
+  });
+
+  it("trims isolated missed and compensating animation frames", () => {
+    const samples = Array(60).fill(1_000 / 225);
+    samples[4] *= 2;
+    samples[17] *= 3;
+    samples[31] *= 0.5;
+    expect(estimateDisplayFps(samples)).toBeCloseTo(225, 6);
+  });
 });
 
 describe("TerminalStore WebGPU probe", () => {
@@ -78,6 +117,129 @@ describe("TerminalStore WebGPU probe", () => {
     ).toBeNull();
 
     store.destroy();
+  });
+});
+
+describe("TerminalStore display-rate probe", () => {
+  it("recovers 240 Hz from 0.1 ms-quantized rAF timestamps", () => {
+    let rafCb: FrameRequestCallback | null = null;
+    let rafId = 0;
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      rafCb = cb;
+      return ++rafId;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {
+      rafCb = null;
+    });
+
+    const sent: Uint8Array[] = [];
+    const store = new TerminalStore(
+      {
+        send: (data) => sent.push(data),
+        getStatus: () => "connected",
+      },
+      wasm,
+    );
+    const interval = 1_000 / 240;
+    for (let i = 0; ; i++) {
+      const cb = rafCb;
+      if (!cb) break;
+      if (i > 1_000) throw new Error("rAF probe did not stop");
+      rafCb = null;
+      const quantizedTimestamp = Math.round((1_000 + i * interval) * 10) / 10;
+      cb(quantizedTimestamp);
+    }
+
+    const reportedRates = sent
+      .filter((msg) => msg[0] === C2S_DISPLAY_RATE)
+      .map((msg) => msg[1] | (msg[2] << 8));
+    expect(reportedRates).toEqual([240]);
+
+    store.destroy();
+    vi.unstubAllGlobals();
+  });
+
+  it("re-measures after a busy startup sample", () => {
+    vi.useFakeTimers();
+    let rafCb: FrameRequestCallback | null = null;
+    let rafId = 0;
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      rafCb = cb;
+      return ++rafId;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {
+      rafCb = null;
+    });
+
+    const sent: Uint8Array[] = [];
+    const store = new TerminalStore(
+      {
+        send: (data) => sent.push(data),
+        getStatus: () => "connected",
+      },
+      wasm,
+    );
+    const runProbe = (fps: number, start: number) => {
+      const interval = 1000 / fps;
+      for (let i = 0; ; i++) {
+        const cb = rafCb;
+        if (!cb) break;
+        if (i > 1_000) throw new Error("rAF probe did not stop");
+        rafCb = null;
+        cb(start + i * interval);
+      }
+    };
+    const reportedRates = () =>
+      sent
+        .filter((msg) => msg[0] === C2S_DISPLAY_RATE)
+        .map((msg) => msg[1] | (msg[2] << 8));
+
+    runProbe(120, 1_000);
+    expect(reportedRates()).toEqual([120]);
+
+    vi.advanceTimersByTime(10_000);
+    runProbe(145, 12_000);
+    expect(reportedRates()).toEqual([120, 145]);
+
+    // Adjacent upward rounding noise is no more trustworthy than downward
+    // noise: a 240 Hz display must not become 241 after one short probe.
+    vi.advanceTimersByTime(10_000);
+    runProbe(146, 23_000);
+    vi.advanceTimersByTime(10_000);
+    runProbe(146, 34_000);
+    expect(reportedRates()).toEqual([120, 145]);
+
+    // Returning to the established rate clears the tentative higher sample.
+    vi.advanceTimersByTime(10_000);
+    runProbe(145, 45_000);
+
+    // A single slightly-slow probe must not retime Chromium's virtual output.
+    vi.advanceTimersByTime(10_000);
+    runProbe(143, 56_000);
+    expect(reportedRates()).toEqual([120, 145]);
+
+    // Returning to the established rate clears the tentative lower sample.
+    vi.advanceTimersByTime(10_000);
+    runProbe(145, 67_000);
+    vi.advanceTimersByTime(10_000);
+    runProbe(143, 78_000);
+    vi.advanceTimersByTime(10_000);
+    runProbe(143, 89_000);
+    expect(reportedRates()).toEqual([120, 145]);
+
+    // Three consistent probes accept a genuine small mode change.
+    vi.advanceTimersByTime(10_000);
+    runProbe(143, 100_000);
+    expect(reportedRates()).toEqual([120, 145, 143]);
+
+    // A substantial monitor-rate change does not wait for confirmation.
+    vi.advanceTimersByTime(10_000);
+    runProbe(120, 111_000);
+    expect(reportedRates()).toEqual([120, 145, 143, 120]);
+
+    store.destroy();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 });
 

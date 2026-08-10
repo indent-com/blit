@@ -28,11 +28,14 @@
 
 import {
   noopDebug,
+  S2C_SURFACE_FRAME,
   type BlitDebug,
   type BlitTransport,
+  type BlitTransportMessage,
   type BlitTransportOptions,
   type ConnectionStatus,
 } from "../types";
+import { LengthPrefixedFrameDecoder } from "./length-prefixed";
 
 // -- Protocol constants -----------------------------------------------------
 
@@ -42,6 +45,12 @@ const MUX_C2S_CLOSE = 0x02;
 const MUX_S2C_OPENED = 0x81;
 const MUX_S2C_CLOSED = 0x82;
 const MUX_S2C_ERROR = 0x83;
+const MAX_MUX_FRAME_LENGTH = 16 * 1024 * 1024;
+// Bound the amount of transport work one fulfilled read can dump into the
+// main thread. At 6–8 MB/s a 256 KiB read spans 30–40 ms and Chromium may
+// deliver several complete video frames synchronously; 32 KiB keeps the
+// dispatch slice around one frame without returning to per-packet churn.
+const WT_BYOB_BUFFER_SIZE = 32 * 1024;
 
 const textDecoder = new TextDecoder();
 
@@ -74,6 +83,7 @@ export class MuxTransport {
   private wt: WebTransport | null = null;
   private wtWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private wtReadAbort: AbortController | null = null;
+  private bufferRecycler: Worker | null = null;
 
   private _status: ConnectionStatus = "disconnected";
   private _authRejected = false;
@@ -103,6 +113,9 @@ export class MuxTransport {
   private wtFailed = false;
   private wtReprobeTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly dbg: BlitDebug;
+  /** Exact-size reusable WS frames for high-rate small messages (notably
+   * surface ACKs). WebSocket.send snapshots BufferSource data synchronously. */
+  private readonly wsSmallSendFrames = new Map<number, Uint8Array>();
 
   /** All channels keyed by channel ID. */
   private readonly channels = new Map<number, MuxChannel>();
@@ -169,10 +182,16 @@ export class MuxTransport {
   updateWtCertHash(hexHash: string, wtUrl?: string): void {
     if (this.disposed) return;
     const next = hexToBytes(hexHash);
-    if (this.wtCertHash && bytesEqual(this.wtCertHash, next)) return;
+    const urlChanged = !!wtUrl && wtUrl !== this.wtUrl;
+    if (wtUrl) this.wtUrl = wtUrl;
+    if (this.wtCertHash && bytesEqual(this.wtCertHash, next)) {
+      // Config may publish the same certificate at a different authority.
+      // A failure against the old endpoint says nothing about the new one.
+      if (urlChanged) this.clearWtFailure();
+      return;
+    }
     this.dbg.log("adopting rotated WebTransport cert hash");
     this.wtCertHash = next;
-    if (wtUrl) this.wtUrl = wtUrl;
     // A failure against the *old* hash says nothing about the new one.
     this.clearWtFailure();
   }
@@ -267,6 +286,8 @@ export class MuxTransport {
     this.pendingReopen.clear();
     this.cleanupWs();
     this.cleanupWt();
+    this.bufferRecycler?.terminate();
+    this.bufferRecycler = null;
     this.setStatus("closed");
   }
 
@@ -325,6 +346,42 @@ export class MuxTransport {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(data as Uint8Array<ArrayBuffer>);
     }
+  }
+
+  /** Send one channel payload without first building an intermediate mux
+   * frame. WT gets one combined allocation instead of two; WS reuses exact
+   * small buffers after their first send. */
+  _sendChannel(channelId: number, data: Uint8Array): void {
+    const muxLength = 2 + data.length;
+    if (this.wtWriter) {
+      const frame = new Uint8Array(4 + muxLength);
+      frame[0] = muxLength & 0xff;
+      frame[1] = (muxLength >> 8) & 0xff;
+      frame[2] = (muxLength >> 16) & 0xff;
+      frame[3] = (muxLength >> 24) & 0xff;
+      frame[4] = channelId & 0xff;
+      frame[5] = (channelId >> 8) & 0xff;
+      frame.set(data, 6);
+      this.wtWriter.write(frame).catch(() => {});
+      return;
+    }
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    let frame: Uint8Array;
+    if (muxLength <= 64) {
+      const key = channelId * 65 + muxLength;
+      const cached = this.wsSmallSendFrames.get(key);
+      if (cached) frame = cached;
+      else {
+        frame = new Uint8Array(muxLength);
+        this.wsSmallSendFrames.set(key, frame);
+      }
+    } else {
+      frame = new Uint8Array(muxLength);
+    }
+    frame[0] = channelId & 0xff;
+    frame[1] = (channelId >> 8) & 0xff;
+    frame.set(data, 2);
+    this.ws.send(frame as Uint8Array<ArrayBuffer>);
   }
 
   /** Send an OPEN control message for a channel. */
@@ -404,7 +461,11 @@ export class MuxTransport {
       }
 
       if (authenticated && e.data instanceof ArrayBuffer) {
-        this.handleMuxFrame(e.data);
+        this.handleMuxFrame(new Uint8Array(e.data));
+        // All mux consumers honor the synchronous borrowed-view contract.
+        // Transfer the now-dead backing store so its reclamation is charged
+        // to the recycler worker instead of a video-presenting main-thread GC.
+        this.recycleBuffer(e.data);
       }
     };
 
@@ -497,11 +558,17 @@ export class MuxTransport {
       await writer.write(authMsg);
 
       // Read 1-byte auth response.
-      const authResp = await readExact(reader, 1);
-      if (!authResp || authResp[0] !== 1) {
+      const { data: authResp, remainder } = await readExactBuffered(reader, 1);
+      if (!authResp) {
+        // EOF is a broken handshake, not a credential verdict. Let the normal
+        // WT failure path fall back to WebSocket instead of permanently
+        // parking every channel in authRejected.
+        throw new Error("WebTransport closed during authentication");
+      }
+      if (authResp[0] !== 1) {
         this.dbg.warn(
           "WebTransport auth rejected (resp=%s)",
-          authResp ? authResp[0] : "EOF",
+          authResp[0],
         );
         this._authRejected = true;
         for (const ch of this.channels.values()) {
@@ -532,7 +599,19 @@ export class MuxTransport {
       // Start read loop in background.
       const abort = new AbortController();
       this.wtReadAbort = abort;
-      this.wtReadLoop(reader, wt, abort.signal);
+      reader.releaseLock();
+      let dataReader:
+        | ReadableStreamDefaultReader<Uint8Array>
+        | ReadableStreamBYOBReader;
+      let byob = false;
+      try {
+        dataReader = stream.readable.getReader({ mode: "byob" });
+        byob = true;
+      } catch {
+        // Older WebTransport implementations may not expose a byte stream.
+        dataReader = stream.readable.getReader();
+      }
+      this.wtReadLoop(dataReader, wt, abort.signal, remainder, byob);
 
       // Handle connection close.
       wt.closed
@@ -566,43 +645,61 @@ export class MuxTransport {
   }
 
   private wtReadLoop(
-    reader: ReadableStreamDefaultReader<Uint8Array>,
+    reader:
+      | ReadableStreamDefaultReader<Uint8Array>
+      | ReadableStreamBYOBReader,
     wt: WebTransport,
     signal: AbortSignal,
+    initialBuffer: Uint8Array,
+    byob: boolean,
   ): void {
-    // Run async read loop; on exit, close the WT session.
+    // Run the async read loop in the background. A bidirectional stream can
+    // end without the enclosing WebTransport session closing, so recover from
+    // stream EOF/error here rather than relying only on `wt.closed`.
     (async () => {
-      let buffer = new Uint8Array(0);
+      const decoder = new LengthPrefixedFrameDecoder(
+        MAX_MUX_FRAME_LENGTH,
+        (frame) => this.handleMuxFrame(frame),
+      );
+      let byobBuffer = new ArrayBuffer(WT_BYOB_BUFFER_SIZE);
       try {
-        while (!signal.aborted) {
-          // Parse length-prefixed frames from buffer.
-          while (buffer.length >= 4) {
-            const len =
-              buffer[0] |
-              (buffer[1] << 8) |
-              (buffer[2] << 16) |
-              (buffer[3] << 24);
-            if (len < 0 || len > 16 * 1024 * 1024) {
-              wt.close();
-              return;
-            }
-            if (buffer.length < 4 + len) break;
-            const frame = buffer.slice(4, 4 + len);
-            buffer = buffer.subarray(4 + len);
-            this.handleMuxFrame(frame.buffer);
-          }
-
-          const { value, done } = await reader.read();
-          if (done || signal.aborted || this.wt !== wt) break;
-          if (!value || value.length === 0) continue;
-
-          const newBuf = new Uint8Array(buffer.length + value.length);
-          newBuf.set(buffer);
-          newBuf.set(value, buffer.length);
-          buffer = newBuf;
+        if (initialBuffer.length > 0 && !decoder.push(initialBuffer)) {
+          throw new Error("invalid WebTransport frame");
         }
-      } catch {
-        // Stream closed or error — handled by wt.closed handler.
+        while (!signal.aborted) {
+          const { value, done } = byob
+            ? await (reader as ReadableStreamBYOBReader).read(
+                new Uint8Array(byobBuffer),
+              )
+            : await (
+                reader as ReadableStreamDefaultReader<Uint8Array>
+              ).read();
+          if (signal.aborted || this.wt !== wt) return;
+          if (done) throw new Error("WebTransport receive stream closed");
+          if (!value || value.length === 0) continue;
+          if (!decoder.push(value)) {
+            throw new Error("invalid WebTransport frame");
+          }
+          if (byob) {
+            // BYOB transfers the supplied ArrayBuffer and returns ownership in
+            // `value`. Reuse it after synchronous frame dispatch; this avoids
+            // allocating a receive buffer for every network chunk.
+            byobBuffer =
+              value.buffer instanceof ArrayBuffer &&
+              value.buffer.byteLength >= WT_BYOB_BUFFER_SIZE
+                ? value.buffer
+                : new ArrayBuffer(WT_BYOB_BUFFER_SIZE);
+          }
+        }
+      } catch (err) {
+        if (signal.aborted || this.disposed || this.wt !== wt) return;
+        this.dbg.warn(
+          "WebTransport receive stream failed: %s",
+          err instanceof Error ? err.message : String(err),
+        );
+        this.markWtFailed();
+        this.cleanupWt();
+        this.handleDisconnect();
       }
     })();
   }
@@ -618,6 +715,22 @@ export class MuxTransport {
         this.wt.close();
       } catch {}
       this.wt = null;
+    }
+  }
+
+  private recycleBuffer(buffer: ArrayBuffer): void {
+    if (typeof Worker === "undefined" || buffer.byteLength === 0) return;
+    try {
+      if (!this.bufferRecycler) {
+        this.bufferRecycler = new Worker(
+          new URL("./buffer-recycler-worker.ts", import.meta.url),
+          { type: "module", name: "blit-buffer-recycler" },
+        );
+      }
+      this.bufferRecycler.postMessage(buffer, [buffer]);
+    } catch {
+      // Recycling is an optimization. A CSP or browser without module workers
+      // keeps the ordinary GC path without affecting transport correctness.
     }
   }
 
@@ -779,9 +892,8 @@ export class MuxTransport {
     this.pendingReopen.clear();
   }
 
-  private handleMuxFrame(data: ArrayBuffer): void {
-    if (data.byteLength < 2) return;
-    const bytes = new Uint8Array(data);
+  private handleMuxFrame(bytes: Uint8Array): void {
+    if (bytes.byteLength < 2) return;
     const chId = bytes[0] | (bytes[1] << 8);
 
     if (chId === MUX_CONTROL) {
@@ -789,8 +901,8 @@ export class MuxTransport {
     } else {
       const ch = this.channels.get(chId);
       if (ch) {
-        // Deliver the payload (without the 2-byte channel prefix).
-        ch._deliverMessage(data.slice(2));
+        // A view strips the prefix without copying the encoded frame.
+        ch._deliverMessage(bytes.subarray(2));
       }
     }
   }
@@ -855,7 +967,7 @@ export class MuxChannel implements BlitTransport {
   readonly channelId: number;
   readonly destName: string;
   private _authRejected = false;
-  private messageListeners = new Set<(data: ArrayBuffer) => void>();
+  private messageListeners = new Set<(data: BlitTransportMessage) => void>();
   private statusListeners = new Set<(status: ConnectionStatus) => void>();
 
   constructor(
@@ -913,12 +1025,7 @@ export class MuxChannel implements BlitTransport {
 
   send(data: Uint8Array): void {
     if (this._internalStatus !== "connected") return;
-    // Prepend the 2-byte channel ID.
-    const frame = new Uint8Array(2 + data.length);
-    frame[0] = this.channelId & 0xff;
-    frame[1] = (this.channelId >> 8) & 0xff;
-    frame.set(data, 2);
-    this.mux._sendRaw(frame);
+    this.mux._sendChannel(this.channelId, data);
   }
 
   close(): void {
@@ -929,7 +1036,7 @@ export class MuxChannel implements BlitTransport {
 
   addEventListener(
     type: "message",
-    listener: (data: ArrayBuffer) => void,
+    listener: (data: BlitTransportMessage) => void,
   ): void;
   addEventListener(
     type: "statuschange",
@@ -937,7 +1044,7 @@ export class MuxChannel implements BlitTransport {
   ): void;
   addEventListener(type: string, listener: (...args: never[]) => void): void {
     if (type === "message") {
-      this.messageListeners.add(listener as (data: ArrayBuffer) => void);
+      this.messageListeners.add(listener as (data: BlitTransportMessage) => void);
     } else if (type === "statuschange") {
       this.statusListeners.add(listener as (status: ConnectionStatus) => void);
     }
@@ -945,7 +1052,7 @@ export class MuxChannel implements BlitTransport {
 
   removeEventListener(
     type: "message",
-    listener: (data: ArrayBuffer) => void,
+    listener: (data: BlitTransportMessage) => void,
   ): void;
   removeEventListener(
     type: "statuschange",
@@ -956,7 +1063,9 @@ export class MuxChannel implements BlitTransport {
     listener: (...args: never[]) => void,
   ): void {
     if (type === "message") {
-      this.messageListeners.delete(listener as (data: ArrayBuffer) => void);
+      this.messageListeners.delete(
+        listener as (data: BlitTransportMessage) => void,
+      );
     } else if (type === "statuschange") {
       this.statusListeners.delete(
         listener as (status: ConnectionStatus) => void,
@@ -988,7 +1097,7 @@ export class MuxChannel implements BlitTransport {
   }
 
   /** @internal */
-  _deliverMessage(data: ArrayBuffer): void {
+  _deliverMessage(data: BlitTransportMessage): void {
     for (const l of this.messageListeners) l(data);
   }
 }
@@ -1012,23 +1121,23 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
-/** Read exactly `n` bytes from a ReadableStreamDefaultReader, buffering
- *  partial reads.  Returns null on EOF before `n` bytes. */
-async function readExact(
+/** Read exactly `n` bytes and retain anything coalesced after them. */
+async function readExactBuffered(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   n: number,
-): Promise<Uint8Array | null> {
+): Promise<{ data: Uint8Array | null; remainder: Uint8Array }> {
   const buf = new Uint8Array(n);
   let offset = 0;
+  let remainder: Uint8Array = new Uint8Array(0);
   while (offset < n) {
     const { value, done } = await reader.read();
-    if (done || !value) return null;
+    if (done || !value) {
+      return { data: null, remainder: new Uint8Array(0) };
+    }
     const take = Math.min(value.length, n - offset);
     buf.set(value.subarray(0, take), offset);
     offset += take;
-    // If we got more than we needed, that's a problem — but for the 1-byte
-    // auth response this won't happen.  The read loop handles buffering for
-    // the data path.
+    remainder = value.subarray(take);
   }
-  return buf;
+  return { data: buf, remainder };
 }

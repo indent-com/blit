@@ -1,6 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { SurfaceStore } from "../SurfaceStore";
+import {
+  NumberRing,
+  PendingFrameSamples,
+  RollingQuantile,
+  SurfaceFrameHistory,
+  SurfaceStore,
+  estimateSourceToReceiveMs,
+  wrappingTimestampDelta,
+  sourceTimestampDelta,
+} from "../SurfaceStore";
 import { CODEC_SUPPORT_AV1, CODEC_SUPPORT_AV1_444 } from "../types";
 
 /** Minimal stand-in for a decoded VideoFrame — only what the presenter
@@ -27,9 +36,117 @@ function presenter(store: SurfaceStore, sid: number): Presenter | undefined {
   return (store as any).presenters.get(sid);
 }
 
-function enqueue(store: SurfaceStore, sid: number, frame: unknown): void {
-  (store as any).enqueueFrame(sid, frame);
+function enqueue(
+  store: SurfaceStore,
+  sid: number,
+  frame: unknown,
+  receiveT?: number,
+): void {
+  (store as any).enqueueFrame(sid, frame, -1, receiveT);
 }
+
+describe("bounded sample structures", () => {
+  it("keeps an ordered snapshot of the newest ring entries", () => {
+    const ring = new NumberRing(3);
+    for (const value of [1, 2, 3, 4, 5]) ring.push(value);
+    expect(ring.length).toBe(3);
+    expect(ring.toArray()).toEqual([3, 4, 5]);
+  });
+
+  it("maintains nearest-rank quantiles across wrap and window shrink", () => {
+    const values = new RollingQuantile(5);
+    for (const value of [5, 1, 3, 2, 4]) values.push(value);
+    expect(values.quantile(0.2)).toBe(1);
+    expect(values.quantile(0.5)).toBe(3);
+    expect(values.quantile(0.8)).toBe(4);
+
+    values.push(6);
+    expect(values.quantile(0.8)).toBe(4);
+
+    values.push(7, 3);
+    expect(values.length).toBe(3);
+    expect(values.quantile(0.5)).toBe(6);
+
+    values.clear();
+    for (const value of [2, 2, 1]) values.push(value, 3);
+    values.push(3, 3);
+    expect(values.quantile(0.5)).toBe(2);
+  });
+
+  it("correlates typed surface samples without per-frame objects", () => {
+    const history = new SurfaceFrameHistory(2);
+    const first = history.push(10, 100, 5, 100_005, 200, false, 3);
+    const second = history.push(20, 104, 10, 104_010, 300, true, 4);
+
+    expect(history.markDecoded(second, 22)).toBe(true);
+    history.markPresented(second, 23);
+    expect(history.toArray()).toEqual([
+      {
+        t: 10,
+        sourceT: 100,
+        sourceSubUs: 5,
+        ptsUs: 100_005,
+        bytes: 200,
+        key: false,
+        sourceToRecvMs: 3,
+      },
+      {
+        t: 20,
+        sourceT: 104,
+        sourceSubUs: 10,
+        ptsUs: 104_010,
+        bytes: 300,
+        key: true,
+        sourceToRecvMs: 4,
+        decodeT: 22,
+        decodeMs: 2,
+        presentT: 23,
+        presentMs: 1,
+        e2eMs: 7,
+      },
+    ]);
+
+    history.push(30, 108, 15, 108_015, 400, false, NaN);
+    expect(history.markDecoded(first, 31)).toBe(false);
+  });
+
+  it("keeps duplicate PTS decoder correlations in FIFO order", () => {
+    const pending = new PendingFrameSamples(3);
+    pending.push(10, 101);
+    pending.push(10, 102);
+    pending.push(20, 103);
+    expect(pending.takeByPts(10)).toBe(101);
+    expect(pending.takeByPts(10)).toBe(102);
+    pending.removeToken(103);
+    expect(pending.takeByPts(20)).toBe(-1);
+  });
+});
+
+describe("surface latency clock mapping", () => {
+  it("computes signed deltas across the u32 timestamp wrap", () => {
+    expect(wrappingTimestampDelta(2, 0xffff_fffe)).toBe(4);
+    expect(wrappingTimestampDelta(0xffff_fffe, 2)).toBe(-4);
+  });
+
+  it("includes fractional source timestamps across millisecond boundaries", () => {
+    expect(
+      sourceTimestampDelta(
+        { sourceT: 11, sourceSubUs: 32 },
+        { sourceT: 10, sourceSubUs: 960 },
+      ),
+    ).toBeCloseTo(0.072);
+  });
+
+  it("maps source timestamps onto performance.now()", () => {
+    expect(
+      estimateSourceToReceiveMs(1004, 5009, {
+        serverMs: 1000,
+        clientMidMs: 5000,
+        rttMs: 6,
+      }),
+    ).toBe(5);
+  });
+});
 
 describe("SurfaceStore presenter", () => {
   let store: SurfaceStore;
@@ -153,9 +270,6 @@ function ptsFrame(ptsMs: number) {
   return { ...fakeFrame(), timestamp: ptsMs * 1000 };
 }
 
-/** Mirrors `SurfaceStore.MARGIN_GROW_MS`, which is private. */
-const SurfaceStore_MARGIN_GROW = 2;
-
 /**
  * Presentation scheduling.
  *
@@ -193,7 +307,7 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
       const pts = streamPts;
       streamPts += REFRESH;
       clock = pts + LATENCY + jitter(i);
-      enqueue(store, 1, ptsFrame(pts));
+      enqueue(store, 1, ptsFrame(pts), clock);
       if (rafCb) tick();
     }
   };
@@ -253,26 +367,56 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
     expect(new Set(presented).size).toBe(30);
   });
 
-  it("builds a playout margin when arrivals are jittery", () => {
+  it("turns recurring arrival jitter into bounded playout headroom", () => {
     runStream(24, (i) => (i % 2 ? 8 : 0));
     const p = presenter(store, 1)!;
     expect(p.smoothing).toBe(true);
-    // Margin tracks the jitter it saw, and stays under the hard ceiling.
-    const delay = (store as any).playoutDelayMs(p);
-    expect(delay).toBeGreaterThan(4);
-    expect(delay).toBeLessThanOrEqual(50);
+    expect((store as any).playoutDelayMs(p)).toBeCloseTo(8, 5);
   });
 
-  it("holds an on-time frame behind the margin rather than drawing it early", () => {
-    // Jitter has to exceed half a refresh for this to be observable at all:
-    // a margin below that is inside the nearest-vsync rounding window, so
-    // the frame is legitimately due on the very tick it arrives.
+  it("does not turn decoder-output batching into playout latency", () => {
+    for (let i = 0; i < 24; i++) {
+      const pts = streamPts;
+      streamPts += REFRESH;
+      const receiveT = pts + LATENCY;
+      clock = receiveT + (i % 2 ? 30 : 1);
+      enqueue(store, 1, ptsFrame(pts), receiveT);
+      if (rafCb) tick();
+    }
+    const p = presenter(store, 1)!;
+    expect(p.smoothing).toBe(true);
+    expect((store as any).playoutDelayMs(p)).toBe(0);
+  });
+
+  it("presents same-host frames synchronously without an rAF boundary", () => {
+    store.noteServerClock(1_000, clock, clock + 0.5);
+    runStream(24, (i) => (i % 2 ? 30 : 0));
+
+    const p = presenter(store, 1)!;
+    expect(p.smoothing).toBe(false);
+    expect(p.rafId).toBeNull();
+    expect(p.queue).toHaveLength(0);
+    expect((store as any).playoutDelayMs(p)).toBe(0);
+    expect(presented).toHaveLength(24);
+  });
+
+  it("bypasses playout buffering when smoothing is disabled", () => {
+    store.setPresentationSmoothingEnabled(false);
+    runStream(24, (i) => (i % 2 ? 30 : 0));
+
+    const p = presenter(store, 1)!;
+    expect(p.smoothing).toBe(false);
+    expect(p.rafId).toBeNull();
+    expect(p.queue).toHaveLength(0);
+    expect((store as any).playoutDelayMs(p)).toBe(0);
+    expect(presented).toHaveLength(24);
+  });
+
+  it("holds an on-time frame inside the learned playout window", () => {
     runStream(30, (i) => (i % 2 ? 25 : 0));
     drain();
     presented = [];
 
-    // Arrives at the fastest-path time, so it is early relative to the
-    // margin the jitter established — it must wait, not paint now.
     const pts = streamPts;
     clock = pts + LATENCY;
     const f = ptsFrame(pts);
@@ -280,35 +424,32 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
     tick();
 
     expect(presented).not.toContain(f);
-    expect(presenter(store, 1)!.queue).toContain(f);
-
-    // And it does paint once its due time arrives.
-    for (let i = 0; i < 6 && !presented.includes(f); i++) step();
+    step();
+    step();
     expect(presented).toContain(f);
+    expect(presenter(store, 1)!.queue).not.toContain(f);
   });
 
-  it("spreads a burst across refreshes instead of dropping all but the newest", () => {
+  it("paces a short transport burst across future refreshes", () => {
     runStream(24, (i) => (i % 2 ? 8 : 0));
     drain();
     presented = [];
 
-    // Two frames shipped back to back: distinct capture times, one arrival
-    // instant.  Old behaviour drew the newest and closed the other unseen.
+    // The learned margin makes the first frame due while keeping the second
+    // for the next refresh, so a short receive burst does not become a visual
+    // burst followed by a frozen canvas.
     const a = ptsFrame(streamPts);
     const b = ptsFrame(streamPts + REFRESH);
-    clock = streamPts + LATENCY;
+    clock = streamPts + LATENCY + REFRESH / 2;
     enqueue(store, 1, a);
     enqueue(store, 1, b);
 
-    // rAF runs every refresh, including the one at which `a` comes due —
-    // stepping past it would leave both overdue, where drawing only the
-    // newest is the right call and nothing is being tested.
     if (rafCb) tick();
-    for (let i = 0; i < 8 && !presented.includes(b); i++) step();
 
     expect(presented).toContain(a);
-    expect(presented).toContain(b);
-    expect(presented.indexOf(a)).toBeLessThan(presented.indexOf(b));
+    expect(presented).not.toContain(b);
+    expect(a.closed).toBe(true);
+    expect(presenter(store, 1)!.queue).toContain(b);
   });
 
   it("stays engaged through a transport stall that keeps PTS continuous", () => {
@@ -381,38 +522,24 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
     expect(frames.some((f) => f.closed)).toBe(true);
   });
 
-  it("sizes the queue to the margin at a high refresh rate", () => {
-    // 240 Hz source on a link that stalls periodically — the combination
-    // the fixed cap of 4 could not serve: the margin grows to tens of ms
-    // while the frame interval shrinks to ~4 ms, so the frames legitimately
-    // in hand run to double digits.  Capping at 4 there trims not-yet-due
-    // frames every interval and drops most of the stream.
+  it("keeps the queue latency-bounded at a high refresh rate", () => {
     const fast = 1000 / 240;
-    // Anchor the wall clock to the stream, or the monotonic clamp below
-    // pins every arrival at the initial clock and no jitter registers.
     clock = streamPts + LATENCY;
     for (let i = 0; i < 120; i++) {
       const pts = streamPts;
       streamPts += fast;
-      // Arrivals are delayed but never reordered: an ordered transport
-      // bunches frames behind a stall rather than overtaking.
       clock = Math.max(clock, pts + LATENCY + (i % 8 === 0 ? 35 : 0));
       enqueue(store, 1, ptsFrame(pts));
       if (rafCb) tick();
     }
     const p = presenter(store, 1)!;
     expect(p.smoothing).toBe(true);
-    // Interval was learned from PTS deltas, not assumed to be 60 Hz.
     expect(p.frameIntervalMs).toBeLessThan(10);
-
-    const margin = (store as any).playoutDelayMs(p);
-    const needed = Math.ceil(margin / fast);
-    // The scenario has to actually outgrow the old fixed cap, or this test
-    // would pass against the bug it exists to catch.
-    expect(needed).toBeGreaterThan(4);
-
-    const cap = (store as any).smoothedQueueCap(p);
-    expect(cap).toBeGreaterThanOrEqual(needed);
+    expect((store as any).playoutDelayMs(p)).toBeLessThanOrEqual(96);
+    expect((store as any).playoutDelayMs(p)).toBeGreaterThan(20);
+    expect(p.queue.length).toBeLessThanOrEqual(
+      (store as any).smoothedQueueCap(p),
+    );
   });
 
   it("does not let one outlier pin the margin", () => {
@@ -434,89 +561,90 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
     clock = pts + LATENCY + 200;
     enqueue(store, 1, ptsFrame(pts));
 
-    expect((store as any).playoutDelayMs(p)).toBeLessThan(
-      before + SurfaceStore_MARGIN_GROW * 2,
-    );
+    expect((store as any).playoutDelayMs(p)).toBeCloseTo(before, 5);
 
     // And a few clean frames later it is still not chasing the outlier.
     runStream(10);
     expect((store as any).playoutDelayMs(p)).toBeLessThan(REFRESH + 10);
   });
 
-  it("sizes the margin to jitter that actually recurs", () => {
-    // Two thirds of frames land 12 ms late — well inside the quantile, so
-    // the margin must grow to cover them rather than average them away.
+  it("buffers recurring jitter", () => {
     runStream(120, (i) => (i % 3 === 0 ? 0 : 12));
     const p = presenter(store, 1)!;
-    const margin = (store as any).playoutDelayMs(p);
-    expect(margin).toBeGreaterThanOrEqual(10);
-    expect(margin).toBeLessThanOrEqual(50);
+    expect((store as any).playoutDelayMs(p)).toBeCloseTo(12, 5);
   });
 
-  it("slews the margin instead of stepping it", () => {
-    // Every margin change shifts all future due times, so a step is itself
-    // a timing discontinuity.  Movement must stay bounded per frame.
+  it("covers recurring 75 ms Wi-Fi recovery bursts at 240 fps", () => {
+    const interval = 1000 / 240;
+    for (let i = 0; i < 240; i++) {
+      const pts = streamPts;
+      streamPts += interval;
+      const phase = i % 60;
+      // Eighteen source-spaced frames become readable together after one
+      // reliable-stream hole. Their offsets descend as the source catches
+      // back up, matching a TCP/QUIC head-of-line recovery burst.
+      const jitter = phase < 18 ? 75 - phase * interval : 0;
+      clock = pts + LATENCY + jitter;
+      enqueue(store, 1, ptsFrame(pts));
+      if (rafCb) tick();
+    }
+    const p = presenter(store, 1)!;
+    expect((store as any).playoutDelayMs(p)).toBeGreaterThanOrEqual(70);
+    expect((store as any).playoutDelayMs(p)).toBeLessThanOrEqual(96);
+  });
+
+  it("bounds and then sheds margin when path latency changes", () => {
     runStream(60);
     const p = presenter(store, 1)!;
+    let maxMargin = 0;
 
-    let prev = (store as any).playoutDelayMs(p);
-    let maxJump = 0;
-    // Jitter jumps abruptly to 40 ms; the target moves at once, the margin
-    // must not.
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 80; i++) {
       const pts = streamPts;
       streamPts += REFRESH;
       clock = pts + LATENCY + 40;
       enqueue(store, 1, ptsFrame(pts));
-      const now = (store as any).playoutDelayMs(p);
-      maxJump = Math.max(maxJump, Math.abs(now - prev));
-      prev = now;
+      maxMargin = Math.max(maxMargin, (store as any).playoutDelayMs(p));
       if (rafCb) tick();
     }
-    expect(maxJump).toBeLessThanOrEqual(SurfaceStore_MARGIN_GROW + 1e-6);
-    // ...but it does get there.
-    expect(prev).toBeGreaterThan(30);
+    expect(maxMargin).toBeLessThanOrEqual(96);
+    expect((store as any).playoutDelayMs(p)).toBeCloseTo(0, 5);
   });
 
   it("never lets the depth bound clip the margin at any real frame rate", () => {
-    // The bound exists for broken PTS streams, not fast ones.  Across every
-    // rate the server can pace a surface at — up to MAX_DISPLAY_FPS — the
-    // derived cap must always cover the full margin, so no stream is ever
-    // made to drop frames just for being fast.
-    for (const fps of [24, 30, 60, 90, 120, 144, 240, 360, 480]) {
-      // marginMs at its ceiling — the worst case the cap has to cover.
+    // The derived cap must always cover the full margin, including rates
+    // above 1000 fps: there is no high-rate policy ceiling.
+    for (const fps of [24, 60, 240, 480, 1000, 5000, 65_535]) {
+      // Margin at its ceiling — the worst case the cap has to cover.
+      const interval = 1000 / fps;
       const probe = {
-        presentOffsetMs: 50,
-        fastOffsetMs: 0,
-        frameIntervalMs: 1000 / fps,
+        presentOffsetMs: interval + 96,
+        fastOffsetMs: interval,
+        frameIntervalMs: interval,
       };
       const margin = (store as any).playoutDelayMs(probe);
-      const cap = (store as any).smoothedQueueCap(probe);
-      expect(margin).toBe(50); // PRESENT_DELAY_MAX_MS
-      expect(cap).toBeGreaterThanOrEqual(Math.ceil(margin / (1000 / fps)));
+      expect(margin).toBeCloseTo(96, 10);
+      expect((store as any).smoothedQueueCap(probe)).toBe(
+        Math.ceil(margin / interval) + 2,
+      );
     }
   });
 
   it("bounds the queue when the frame interval is degenerate", () => {
-    // A PTS stream claiming impossible rates must not inflate the queue —
-    // the interval floor, not the depth cap, is what stops it.
+    // Zero is not a cadence.  It falls back to the initial refresh estimate
+    // without imposing a floor on any positive high-rate stream.
     const probe = { presentOffsetMs: 50, fastOffsetMs: 0, frameIntervalMs: 0 };
     const cap = (store as any).smoothedQueueCap(probe);
-    expect(cap).toBeLessThanOrEqual(26);
+    expect(cap).toBe(5);
   });
 
   it("measures refresh intervals across the whole accepted band", () => {
-    // 1000 Hz to 10 Hz all count as real cadences.  The fast end matters
-    // most: the server will pace a surface at MAX_DISPLAY_FPS (480), and
-    // rejecting those deltas pins the estimate at the 60 Hz default, which
-    // then puts half a 60 Hz refresh of lookahead on every due-time
-    // comparison — several refreshes early at that rate.
-    for (const hz of [1000, 480, 360, 144, 60, 30, 10]) {
+    // Positive sub-millisecond cadences count too; 1000 Hz is not a ceiling.
+    for (const hz of [10_000, 2000, 1000, 480, 144, 60, 10]) {
       const s = new SurfaceStore();
       const interval = 1000 / hz;
       for (let i = 0; i < 60; i++) {
         clock += interval;
-        (s as any).noteRafInterval();
+        (s as any).noteRafInterval(clock);
       }
       expect((s as any).refreshMs).toBeCloseTo(interval, 0);
       s.destroy();
@@ -526,11 +654,26 @@ describe("SurfaceStore PTS-scheduled presentation", () => {
   it("ignores rAF deltas outside the band", () => {
     const s = new SurfaceStore();
     const before = (s as any).refreshMs;
-    for (const dt of [0.4, 250, 5000]) {
+    for (const dt of [250, 5000]) {
       clock += dt;
-      (s as any).noteRafInterval();
+      (s as any).noteRafInterval(clock);
     }
     expect((s as any).refreshMs).toBe(before);
+    s.destroy();
+  });
+
+  it("measures one refresh when several surfaces present in the same frame", () => {
+    const s = new SurfaceStore();
+    const interval = 1000 / 120;
+    for (let i = 0; i < 60; i++) {
+      clock += interval;
+      // rAF guarantees the same timestamp to callbacks sharing a frame.
+      // A store can have one callback per visible surface.
+      (s as any).noteRafInterval(clock);
+      (s as any).noteRafInterval(clock);
+      (s as any).noteRafInterval(clock);
+    }
+    expect((s as any).refreshMs).toBeCloseTo(interval, 1);
     s.destroy();
   });
 
@@ -632,15 +775,20 @@ describe("SurfaceStore vs newest-wins control", () => {
     for (let t = start; t <= end; t += REFRESH) {
       clock = t;
       while (i < trace.length && trace[i].at <= t) {
-        (store as any).enqueueFrame(1, {
-          closed: false,
-          displayWidth: 64,
-          displayHeight: 48,
-          timestamp: trace[i].pts * 1000,
-          close() {
-            this.closed = true;
+        (store as any).enqueueFrame(
+          1,
+          {
+            closed: false,
+            displayWidth: 64,
+            displayHeight: 48,
+            timestamp: trace[i].pts * 1000,
+            close() {
+              this.closed = true;
+            },
           },
-        });
+          -1,
+          trace[i].at,
+        );
         if (control) {
           const p = (store as any).presenters.get(1);
           if (p) p.smoothing = false;
@@ -679,14 +827,12 @@ describe("SurfaceStore vs newest-wins control", () => {
     });
   };
 
-  it("control arm is not degenerate", () => {
-    // Guards the assertions below.  If forcing newest-wins produced the
-    // same trace as scheduling, every NEVER_WORSE case would hold
-    // vacuously and this whole describe block would assert nothing.
+  it("does not add latency to the heavy-jitter control trace", () => {
     const t = trace(200, (i) => (i % 3 === 0 ? 28 : i % 3 === 1 ? 4 : 14));
     const control = run(t, true);
     const scheduled = run(t, false);
-    expect(scheduled.maxGap).toBeLessThan(control.maxGap);
+    expect(scheduled.count).toBeGreaterThanOrEqual(control.count);
+    expect(scheduled.maxGap).toBeLessThanOrEqual(control.maxGap + 1e-6);
   });
 
   NEVER_WORSE("clean stream", trace(200));
@@ -699,31 +845,29 @@ describe("SurfaceStore vs newest-wins control", () => {
     trace(200, (i) => (i % 3 === 0 ? 28 : i % 3 === 1 ? 4 : 14)),
   );
 
-  it("recovers its added latency quickly after a single stall", () => {
-    // Scenario D. Video rides a reliable ordered channel, so EVERY lost
-    // packet is a head-of-line stall of at least one RTT.  A flat
-    // 0.25 ms/frame unwind left the presenter pinned near the latency
-    // ceiling for ~5 s afterwards — on a lossy link, permanently, which is
-    // strictly worse than not scheduling at all for the exact users this
-    // feature exists to serve.
+  it("caps and then sheds added latency after a single stall", () => {
     const t = trace(400).map((f, i) =>
       // One 500 ms head-of-line block: 30 frames buffered, then released.
       i >= 100 && i < 130 ? { ...f, at: trace(400)[130].at } : f,
     );
     const store = new SurfaceStore();
-    let i = 0;
     const margins: number[] = [];
     for (let k = 0; k < t.length; k++) {
       clock = t[k].at;
-      (store as any).enqueueFrame(1, {
-        closed: false,
-        displayWidth: 64,
-        displayHeight: 48,
-        timestamp: t[k].pts * 1000,
-        close() {
-          this.closed = true;
+      (store as any).enqueueFrame(
+        1,
+        {
+          closed: false,
+          displayWidth: 64,
+          displayHeight: 48,
+          timestamp: t[k].pts * 1000,
+          close() {
+            this.closed = true;
+          },
         },
-      });
+        -1,
+        t[k].at,
+      );
       if (rafCb) {
         const cb = rafCb;
         rafCb = null;
@@ -731,22 +875,10 @@ describe("SurfaceStore vs newest-wins control", () => {
       }
       const p = (store as any).presenters.get(1);
       margins.push(p ? (store as any).playoutDelayMs(p) : 0);
-      i++;
     }
 
-    const peak = Math.max(...margins);
-    // The stall did move it, on top of the refresh of headroom every
-    // stream carries.
-    expect(peak).toBeGreaterThan(REFRESH + 5);
-
-    // It must come back down to that baseline within about a second of
-    // stream, not five.
-    const peakAt = margins.indexOf(peak);
-    const recovered = margins.findIndex(
-      (m, k) => k > peakAt && m < REFRESH + 5,
-    );
-    expect(recovered).toBeGreaterThan(-1);
-    expect(recovered - peakAt).toBeLessThan(90); // < 1.5 s at 60 fps
+    expect(Math.max(...margins)).toBeLessThanOrEqual(96);
+    expect(margins.at(-1)).toBeCloseTo(0, 5);
     store.destroy();
   });
 
@@ -771,6 +903,7 @@ describe("SurfaceStore vs newest-wins control", () => {
 
 /** SURFACE_FRAME_FLAG_KEYFRAME | SURFACE_FRAME_CODEC_AV1. */
 const KEY_AV1 = (1 << 0) | (1 << 1);
+const DELTA_AV1 = 1 << 1;
 
 describe("SurfaceStore surface dimensions", () => {
   // Pointer coordinates are scaled by surface.width/height, which must be
@@ -867,10 +1000,14 @@ describe("SurfaceStore decoder recovery", () => {
     static instances: FakeDecoder[] = [];
     static failConfigure = false;
     static failDecode = false;
+    static failDecodeAsync = false;
     state = "unconfigured";
     configured: string[] = [];
     decoded = 0;
-    constructor(_init: unknown) {
+    decodeQueueSize = 0;
+    private readonly onError: (error: DOMException) => void;
+    constructor(init: { error: (error: DOMException) => void }) {
+      this.onError = init.error;
       FakeDecoder.instances.push(this);
     }
     configure(config: { codec: string }) {
@@ -884,7 +1021,12 @@ describe("SurfaceStore decoder recovery", () => {
       if (FakeDecoder.failDecode) {
         throw new DOMException("bad bitstream", "EncodingError");
       }
+      if (FakeDecoder.failDecodeAsync) {
+        this.onError(new DOMException("bad bitstream", "EncodingError"));
+        return;
+      }
       this.decoded++;
+      this.decodeQueueSize++;
     }
     flush() {
       return Promise.resolve();
@@ -908,6 +1050,7 @@ describe("SurfaceStore decoder recovery", () => {
     FakeDecoder.instances = [];
     FakeDecoder.failConfigure = false;
     FakeDecoder.failDecode = false;
+    FakeDecoder.failDecodeAsync = false;
     vi.spyOn(performance, "now").mockImplementation(() => clock);
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.stubGlobal("VideoDecoder", FakeDecoder);
@@ -941,6 +1084,19 @@ describe("SurfaceStore decoder recovery", () => {
     store.destroy();
   });
 
+  it("reports WebCodecs queue depth with each surface ACK", () => {
+    const store = newStore();
+    const acks: Array<[number, number]> = [];
+    store.setAckSender((sid, queueDepth) => acks.push([sid, queueDepth]));
+    store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+    store.handleSurfaceFrame(1, 1, DELTA_AV1, 1280, 720, frame);
+    expect(acks).toEqual([
+      [1, 1],
+      [1, 2],
+    ]);
+    store.destroy();
+  });
+
   it("re-applies the announced AV1 string over a derived one", () => {
     const store = newStore();
     store.handleSurfaceEncoder(1, "openh264\0avc1.42001e");
@@ -971,6 +1127,48 @@ describe("SurfaceStore decoder recovery", () => {
       }
     }
     expect(requests).toHaveLength(5);
+    store.destroy();
+  });
+
+  it("rate-limits keyframe requests when decode rejects every frame", () => {
+    const store = newStore();
+    const requests: number[] = [];
+    store.setKeyframeSender((sid) => requests.push(sid));
+    FakeDecoder.failDecode = true;
+
+    for (let i = 0; i < 20; i++) {
+      store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+    }
+    expect(requests).toHaveLength(1);
+
+    for (let round = 0; round < 20; round++) {
+      clock += 2001;
+      store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+    }
+    expect(requests).toHaveLength(5);
+    store.destroy();
+  });
+
+  it("rate-limits asynchronous decoder-error recovery", () => {
+    const store = newStore();
+    const requests: number[] = [];
+    store.setKeyframeSender((sid) => requests.push(sid));
+    FakeDecoder.failDecodeAsync = true;
+
+    for (let i = 0; i < 20; i++) {
+      store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+      // The error callback removes the decoder. Its replacement sees this
+      // delta while pending a keyframe and must share the same retry budget.
+      store.handleSurfaceFrame(1, 0, DELTA_AV1, 1280, 720, frame);
+    }
+    expect(requests).toHaveLength(1);
+
+    clock += 2001;
+    for (let i = 0; i < 20; i++) {
+      store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+      store.handleSurfaceFrame(1, 0, DELTA_AV1, 1280, 720, frame);
+    }
+    expect(requests).toHaveLength(2);
     store.destroy();
   });
 

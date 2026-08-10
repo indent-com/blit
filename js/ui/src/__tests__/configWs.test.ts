@@ -158,4 +158,97 @@ describe("config WebSocket authentication", () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(MockWebSocket.instances.length).toBe(before + 1);
   });
+
+  it("accepts the WebTransport authority advertised by the gateway", async () => {
+    const storage = await freshStorage();
+    storage.connectConfigWs();
+    latest().open();
+    latest().message("ok");
+    latest().message("wt-addr=:10001");
+    latest().message("wt=001122");
+    latest().message("ready");
+
+    expect(storage.useWtAddr()()).toBe(":10001");
+    expect(storage.useWtCertHash()()).toBe("001122");
+  });
+
+  it("publishes committed shared settings locally and to the config socket", async () => {
+    const storage = await freshStorage();
+    storage.connectConfigWs();
+    latest().open();
+    latest().message("ok");
+    latest().message("ready");
+
+    const changes: string[] = [];
+    storage.onConfigChange((key, value) => changes.push(`${key}=${value}`));
+    storage.writeStorage(storage.FONT_SIZE_KEY, "18");
+
+    expect(changes).toEqual(["blit.fontSize=18"]);
+    expect(latest().sentData).toContain("set blit.fontSize 18");
+  });
+
+  it("keeps media, streaming, and panel geometry off the config socket", async () => {
+    const storage = await freshStorage();
+    storage.connectConfigWs();
+    latest().open();
+    latest().message("ok");
+    latest().message("ready");
+
+    const localSettings = [
+      storage.AUDIO_BITRATE_KEY,
+      storage.AUDIO_MUTED_KEY,
+      storage.VIDEO_BANDWIDTH_KEY,
+      storage.VIDEO_SPEED_KEY,
+      storage.SURFACE_STREAMING_KEY,
+      storage.SURFACE_SMOOTHING_KEY,
+      storage.LEFT_DOCK_WIDTH_KEY,
+      storage.PREVIEW_PANEL_WIDTH_KEY,
+      storage.LEFT_DOCK_OPEN_KEY,
+      storage.LEFT_COLLAPSED_KEY,
+    ];
+    const sentBefore = latest().sentData.length;
+    for (const key of localSettings) storage.writeStorage(key, "1");
+
+    expect(latest().sentData).toHaveLength(sentBefore);
+    for (const key of localSettings) {
+      expect(localStorage.getItem(key)).toBe("1");
+    }
+  });
+
+  it("ignores peer config values for device-local media settings", async () => {
+    localStorage.setItem("blit.audioBitrate", "64");
+    localStorage.setItem("blit.audioMuted", "0");
+    localStorage.setItem("blit.videoBandwidth", "2");
+    localStorage.setItem("blit.videoSpeed", "3");
+    localStorage.setItem("blit.surfaceStreaming", "0");
+    const storage = await freshStorage();
+    storage.connectConfigWs();
+    latest().open();
+    latest().message("ok");
+    latest().message("blit.audioBitrate=128");
+    latest().message("blit.audioMuted=1");
+    latest().message("blit.videoBandwidth=4");
+    latest().message("blit.videoSpeed=4");
+    latest().message("blit.surfaceStreaming=1");
+    latest().message("ready");
+
+    expect(storage.preferredAudioBitrate()).toBe(64);
+    expect(storage.preferredAudioMuted()).toBe(false);
+    expect(storage.preferredVideoBandwidth()).toBe(2);
+    expect(storage.preferredVideoSpeed()).toBe(3);
+    expect(storage.preferredSurfaceStreaming()).toBe(false);
+  });
+
+  it("applies a peer editor-wrap toggle to mounted editors", async () => {
+    const storage = await freshStorage();
+    const editorPrefs = await import("../ide/editorPrefs");
+    expect(editorPrefs.lineWrap()).toBe(true);
+    storage.connectConfigWs();
+    latest().open();
+    latest().message("ok");
+
+    latest().message("blit.editorWrap=0");
+
+    expect(editorPrefs.lineWrap()).toBe(false);
+  });
 });

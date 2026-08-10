@@ -340,6 +340,8 @@ pub enum Command {
     ///
     ///   BLIT_QUIC         Set to 1 for WebTransport
     ///
+    ///   BLIT_QUIC_PUBLIC_ADDR  Browser-facing hostname:port or :port to advertise
+    ///
     ///   BLIT_PROXY        Set to 0 to disable blit-proxy
     Gateway,
 
@@ -1006,6 +1008,18 @@ pub enum SurfaceCommand {
         /// the server will not send to a client that hasn't asked.
         #[arg(short, long)]
         size: Option<String>,
+
+        /// Encode only this recorder's stream at WIDTHxHEIGHT without
+        /// resizing or participating in mediation for the compositor
+        /// surface. Useful for exercising a server-side encoder when the
+        /// native-size stream would use Vulkan Video.
+        #[arg(long, conflicts_with = "size")]
+        encode_size: Option<String>,
+
+        /// Display refresh rate to advertise to the server. This drives the
+        /// compositor source clock during browser-free timing tests.
+        #[arg(long, default_value_t = 60)]
+        fps: u16,
 
         /// Also write per-frame timing to this path as CSV:
         /// `pts_ms,arrival_ms,bytes,key`.

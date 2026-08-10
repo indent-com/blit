@@ -22,15 +22,19 @@ export interface BlitSurfaceViewProps {
   /** When true the surface is resized to fill the container. */
   resizable?: boolean;
   /**
-   * Zoom factor applied on top of the display's DPI, e.g. 1.25 for 125%.
+   * Surface zoom factor, e.g. 1.25 for 125% or an exact 1.25x scale.
    *
-   * The pane keeps its device-pixel resolution; the surface is asked to
-   * render at `devicePixelRatio * zoom`, so the app lays itself out in
-   * proportionally fewer logical pixels and its content — text, chrome,
-   * everything — comes out larger.  Defaults to 1.  Only resizable views
-   * drive the surface's scale, so it has no effect elsewhere.
+   * How this value is interpreted is controlled by `zoomMode`. Defaults to
+   * 1. Only resizable views drive the surface's scale, so it has no effect
+   * elsewhere.
    */
   zoom?: number;
+  /**
+   * `relative` multiplies the display's DPI by `zoom`; `exact` uses `zoom`
+   * as the absolute surface scale, independent of display DPI. Defaults to
+   * `relative` for backwards compatibility.
+   */
+  zoomMode?: "relative" | "exact";
 }
 
 /** Clamp to a range that stays useful at both ends: below 0.25 an app is
@@ -40,18 +44,6 @@ function clampZoom(zoom: number | undefined): number {
   if (typeof zoom !== "number" || !Number.isFinite(zoom) || zoom <= 0) return 1;
   return Math.min(4, Math.max(0.25, zoom));
 }
-
-/**
- * The floor on the scale that goes on the wire.
- *
- * The compositor derives the window's logical size as
- * `physical * 120 / max(scale, 120)` — a sub-1x scale gives the app a 1x
- * window while still moving the output's advertised scale, so asking for one
- * does not zoom out, it just puts those two out of step.  Zooming below 100%
- * therefore only bites where there is DPI to give back: a 2x pane reaches
- * 1.5x at 75%, a 1x pane is already at the floor.
- */
-const MIN_SCALE_120 = 120;
 
 export function BlitSurfaceView(props: BlitSurfaceViewProps) {
   const workspace = useRequiredBlitWorkspace();
@@ -119,6 +111,7 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
     // rebuild the observer (that unsubscribes the view and costs a keyframe).
     // The dedicated effect below re-applies the last box instead.
     const zoom = () => clampZoom(untrack(() => props.zoom));
+    const zoomMode = () => untrack(() => props.zoomMode ?? "relative");
     // The last box the observer reported, so a zoom change can be re-applied
     // without waiting for the container to change size — it never will.
     let lastBox: {
@@ -184,12 +177,14 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
         cssW > 0 && cssH > 0
           ? Math.round(((w / cssW + h / cssH) / 2) * 120)
           : fallbackScale120();
-      // Zoom rides on top of it: the pane still holds `w × h` device pixels,
-      // but the surface is composited at a higher scale, so the app gets
-      // proportionally fewer logical pixels and draws everything larger.
+      // The pane always holds `w × h` device pixels. Relative zoom rides
+      // on its DPI; exact zoom names the surface scale directly. A sub-1x
+      // scale is meaningful: the server gives the app a larger logical
+      // window, composites at Wayland's 1x floor, and downsamples the stream
+      // into this pane.
       const scale120 = Math.max(
-        MIN_SCALE_120,
-        Math.round(cssScale120 * zoom()),
+        1,
+        Math.round((zoomMode() === "exact" ? 120 : cssScale120) * zoom()),
       );
       s.setDisplaySize(w, h, scale120, cssScale120);
       lastBox = { cssW, cssH, physicalW, physicalH };
@@ -258,14 +253,12 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
     });
   });
 
-  // Tracks the zoom factor only, and `defer` skips the mount run — the
-  // effect above has already applied the initial box with it.
+  // Tracks the zoom controls only, and `defer` skips the mount run — the
+  // effect above has already applied the initial box with them.
   createEffect(
-    on(
-      () => props.zoom,
-      () => reapplyZoom?.(),
-      { defer: true },
-    ),
+    on([() => props.zoom, () => props.zoomMode], () => reapplyZoom?.(), {
+      defer: true,
+    }),
   );
 
   return (

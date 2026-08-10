@@ -9,11 +9,17 @@ export {
 
 export type { BlitWasmModule } from "./TerminalStore";
 export { AudioPlayer } from "./AudioPlayer";
-export { SurfaceStore } from "./SurfaceStore";
+export { NumberRing, SurfaceFrameHistory, SurfaceStore } from "./SurfaceStore";
 export type {
   SurfaceFrameCallback,
   SurfaceEventCallback,
   SurfaceFrameSample,
+  ServerClockSample,
+} from "./SurfaceStore";
+export {
+  estimateSourceToReceiveMs,
+  sourceTimestampDelta,
+  wrappingTimestampDelta,
 } from "./SurfaceStore";
 
 export { measureCell, cssFontFamily } from "./measure";
@@ -35,6 +41,7 @@ export * from "./http1";
 export * from "./preview";
 
 export { DEFAULT_FONT, DEFAULT_FONT_SIZE, DEFAULT_TEXT_GAMMA } from "./types";
+export type { BlitTransportMessage } from "./types";
 
 export {
   EXIT_STATUS_UNKNOWN,
@@ -109,6 +116,7 @@ export type {
   BlitSurface,
   BlitWorkspaceSnapshot,
   BlitTransport,
+  BlitTransportData,
   BlitSession,
   ConnectionId,
   ConnectionStatus,

@@ -15,6 +15,36 @@ import {
 } from "./gl-renderer";
 import { createWebGpuRenderer } from "./webgpu-renderer";
 
+const DISPLAY_FPS_SAMPLE_COUNT = 120;
+
+/**
+ * Infer refresh from rAF intervals without assuming a table of display modes.
+ *
+ * Browser timestamps are quantized: a 240 Hz clock can alternate between
+ * 4.1 and 4.2 ms.  Taking the median selects one bucket (4.2 -> 238 Hz),
+ * while averaging recovers the underlying 4.166... ms period. Reject Tukey
+ * outliers first so isolated missed callbacks and compensating intervals do
+ * not skew the result without changing the ratio of the 4.1/4.2 ms buckets.
+ */
+export function estimateDisplayFps(intervals: readonly number[]): number {
+  const sorted = [...intervals]
+    .filter((dt) => Number.isFinite(dt) && dt > 0)
+    .sort((a, b) => a - b);
+  if (sorted.length === 0) return 0;
+
+  const q1 = sorted[Math.floor((sorted.length - 1) * 0.25)];
+  const q3 = sorted[Math.floor((sorted.length - 1) * 0.75)];
+  const iqr = q3 - q1;
+  const median = sorted[Math.floor((sorted.length - 1) * 0.5)];
+  const low = iqr > Number.EPSILON ? q1 - 1.5 * iqr : median * 0.75;
+  const high = iqr > Number.EPSILON ? q3 + 1.5 * iqr : median * 1.25;
+  const accepted = sorted.filter((dt) => dt >= low && dt <= high);
+  let total = 0;
+  for (const dt of accepted) total += dt;
+  const mean = total / accepted.length;
+  return 1_000 / mean;
+}
+
 export type BlitWasmModule = typeof import("@blit-sh/browser");
 
 export type TerminalDirtyListener = (ptyId: number) => void;
@@ -54,9 +84,20 @@ export class TerminalStore {
   private webgpuRenderer: GlRenderer | null = null;
   private webgpuCanvas: HTMLCanvasElement | null = null;
   private displayFps = 0;
+  /** Small display-rate changes are commonly measurement noise, not a mode
+   * change. Require the same nearby result repeatedly so a steady clock does
+   * not alternate between adjacent integer rates every ten seconds. */
+  private pendingDisplayFps = 0;
+  private pendingDisplayFpsCount = 0;
+  private static readonly DISPLAY_FPS_CONFIRMATIONS = 3;
+  private static readonly IMMEDIATE_DISPLAY_FPS_DROP_RATIO = 0.9;
+  private static readonly RAF_PROBE_MIN_SAMPLES = 20;
+  private static readonly RAF_PROBE_DURATION_MS = 500;
   private rafHandle = 0;
+  private rafProbeTimer: ReturnType<typeof setInterval> | null = null;
   private visibilityHandler: (() => void) | null = null;
   private rafPrev = 0;
+  private rafProbeStartedAt = 0;
   private rafSamples: number[] = [];
   private pendingAppliedFrames = 0;
   private ackAheadFrames = 0;
@@ -650,30 +691,85 @@ export class TerminalStore {
     }
   }
 
+  /** Apply one completed rAF probe. Mode-sized changes take effect
+   * immediately; adjacent integer results need confirmation because they are
+   * the expected rounding noise around a stable physical refresh rate. */
+  private acceptDisplayFps(fps: number): boolean {
+    if (fps <= 0) return false;
+    if (
+      this.displayFps === 0 ||
+      fps >= this.displayFps + 2 ||
+      fps <=
+        this.displayFps * TerminalStore.IMMEDIATE_DISPLAY_FPS_DROP_RATIO
+    ) {
+      const changed = fps !== this.displayFps;
+      this.displayFps = fps;
+      this.pendingDisplayFps = 0;
+      this.pendingDisplayFpsCount = 0;
+      return changed;
+    }
+    if (fps === this.displayFps) {
+      this.pendingDisplayFps = 0;
+      this.pendingDisplayFpsCount = 0;
+      return false;
+    }
+    if (fps !== this.pendingDisplayFps) {
+      this.pendingDisplayFps = fps;
+      this.pendingDisplayFpsCount = 1;
+      return false;
+    }
+    this.pendingDisplayFpsCount++;
+    if (
+      this.pendingDisplayFpsCount < TerminalStore.DISPLAY_FPS_CONFIRMATIONS
+    )
+      return false;
+    this.displayFps = fps;
+    this.pendingDisplayFps = 0;
+    this.pendingDisplayFpsCount = 0;
+    return true;
+  }
+
   private startRafProbe(): void {
     if (this.rafHandle || typeof requestAnimationFrame === "undefined") return;
+    this.rafPrev = 0;
+    this.rafProbeStartedAt = 0;
+    this.rafSamples = [];
     const measure = (ts: number) => {
       if (this.disposed) return;
+      if (this.rafProbeStartedAt === 0) this.rafProbeStartedAt = ts;
       if (this.rafPrev > 0) {
         const dt = ts - this.rafPrev;
         if (dt > 0) {
           this.rafSamples.push(dt);
-          if (this.rafSamples.length >= 20) {
+          if (
+            this.rafSamples.length >= TerminalStore.RAF_PROBE_MIN_SAMPLES &&
+            ts - this.rafProbeStartedAt >=
+              TerminalStore.RAF_PROBE_DURATION_MS
+          ) {
             this.rafSamples.sort((a, b) => a - b);
-            const median = this.rafSamples[this.rafSamples.length >> 1];
-            const fps = Math.round(1_000 / median);
+            // Browser timestamps are commonly quantized to 0.1 ms. At
+            // 240 Hz the true 4.1667 ms period therefore alternates between
+            // 4.1 and 4.2 ms; taking the median alone selects 4.2 ms and
+            // systematically reports 238 Hz. Average the middle 80% instead:
+            // quantization cancels across the window, while a missed rAF or
+            // one unusually early callback is trimmed away.
+            const trim = Math.floor(this.rafSamples.length * 0.1);
+            const stableSamples = this.rafSamples.slice(
+              trim,
+              this.rafSamples.length - trim,
+            );
+            const mean =
+              stableSamples.reduce((sum, sample) => sum + sample, 0) /
+              stableSamples.length;
+            const fps = Math.round(1_000 / mean);
             this.rafSamples = [];
-            if (fps > 0 && fps !== this.displayFps) {
-              this.displayFps = fps;
+            if (this.acceptDisplayFps(fps)) {
               this.sendDisplayFps();
             }
-            // Established, so stop. This loop used to reschedule itself
-            // forever to keep re-measuring a number that changes only when
-            // the display does, which kept a rAF callback running every
-            // frame for the life of the page — visible in a profile as
-            // hundreds of ms of animation-frame work, and it denies the
-            // browser any idle frame to coalesce style invalidation into.
-            // `armRafProbe` re-measures when the display plausibly changed.
+            // Established, so stop. `armRafProbe` samples another short
+            // window periodically; keeping this callback alive every frame
+            // for the life of the page showed up in profiles and denied the
+            // browser idle frames for style coalescing.
             this.stopRafProbe();
             return;
           }
@@ -688,19 +784,25 @@ export class TerminalStore {
   /**
    * Re-measure the display rate when it may have changed: returning to a
    * visible tab, which is also when a window has plausibly been dragged to
-   * a monitor with a different refresh rate. Cheap — the probe stops again
-   * after ~20 frames.
+   * a monitor with a different refresh rate, and every ten seconds while
+   * visible. The periodic sample lets a startup probe taken during a busy
+   * burst recover; each probe stops after a 500 ms measurement window.
    */
   private armRafProbe(): void {
-    if (typeof document === "undefined") return;
+    if (
+      typeof document === "undefined" ||
+      typeof requestAnimationFrame === "undefined"
+    )
+      return;
     this.visibilityHandler = () => {
       if (document.visibilityState === "visible") {
-        this.rafPrev = 0;
-        this.rafSamples = [];
         this.startRafProbe();
       }
     };
     document.addEventListener("visibilitychange", this.visibilityHandler);
+    this.rafProbeTimer = setInterval(() => {
+      if (document.visibilityState === "visible") this.startRafProbe();
+    }, 10_000);
   }
 
   private stopRafProbe(): void {
@@ -720,6 +822,10 @@ export class TerminalStore {
   destroy(): void {
     this.disposed = true;
     this.stopRafProbe();
+    if (this.rafProbeTimer !== null) {
+      clearInterval(this.rafProbeTimer);
+      this.rafProbeTimer = null;
+    }
     if (this.visibilityHandler) {
       document.removeEventListener("visibilitychange", this.visibilityHandler);
       this.visibilityHandler = null;

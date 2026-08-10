@@ -229,6 +229,28 @@ describe("BlitSurfaceCanvas layout", () => {
     surface.dispose();
   });
 
+  it("fills the pane with a sub-1x surface downscale", () => {
+    // An 800×600 pane at exact 0.5x gives the app a 1600×1200 logical
+    // window. The compositor renders that at Wayland's 1x floor and the
+    // server sends this viewer an 800×600 downscale, which still fills the
+    // pane at its own 1x CSS density.
+    const { surface, canvas } = attachCanvas();
+    setSurfaceInfo(surface, {
+      width: 1600,
+      height: 1200,
+      lw: 1600,
+      lh: 1200,
+    });
+    canvas.width = 800;
+    canvas.height = 600;
+    surface.setDisplaySize(800, 600, 60, 120);
+    expect(canvas.style.width).toBe("800px");
+    expect(canvas.style.height).toBe("600px");
+    expect(canvas.style.left).toBe("0px");
+    expect(canvas.style.top).toBe("0px");
+    surface.dispose();
+  });
+
   it("keeps the CSS box on the device grid under zoom on a 2x pane", () => {
     // 640×480 CSS px at 2x with 125% zoom: 1280×960 device pixels, surface
     // scale 300 (2 × 1.25), logical 512×384.
@@ -397,6 +419,20 @@ describe("BlitSurfaceCanvas scroll", () => {
     surface.dispose();
   });
 
+  it("forwards smooth trackpad input without waiting for a display frame", () => {
+    const { surface, canvas, sent } = attachScrolling();
+    canvas.dispatchEvent(
+      new WheelEvent("wheel", {
+        deltaY: 3.5,
+        cancelable: true,
+      }),
+    );
+    expect(sent).toHaveLength(1);
+    expect(sent[0].dy).toBeCloseTo(3.5);
+    expect(sent[0].source).toBe(AXIS_SOURCE_CONTINUOUS);
+    surface.dispose();
+  });
+
   /**
    * The bug this all exists for. macOS hands the browser a notched wheel
    * as plain pixel deltas — around a third of a 120px detent, varied by
@@ -474,16 +510,17 @@ describe("BlitSurfaceCanvas scroll", () => {
     surface.dispose();
   });
 
-  it("batches a burst of events into one message per frame", () => {
+  it("batches a burst of notched-wheel events into one message per frame", () => {
     const { surface, canvas, sent } = attachScrolling();
     for (let i = 0; i < 5; i++) {
       canvas.dispatchEvent(
-        new WheelEvent("wheel", { deltaY: 3.5, cancelable: true }),
+        new WheelEvent("wheel", { deltaY: 120, cancelable: true }),
       );
     }
     vi.advanceTimersByTime(FRAME_MS);
     expect(sent).toHaveLength(1);
-    expect(sent[0].dy).toBeCloseTo(17.5);
+    expect(sent[0].dy).toBeCloseTo(600);
+    expect(sent[0].v120y).toBe(600);
     surface.dispose();
   });
 
@@ -1153,6 +1190,33 @@ describe("BlitSurfaceCanvas paste", () => {
     dispose();
   });
 
+  it("does not request an eager rich read where Ctrl+V fires a paste event", async () => {
+    const read = vi.fn();
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        readText: vi.fn().mockReturnValue(new Promise(() => {})),
+        read,
+      },
+    });
+    const { clipboard, pressCtrlV, firePaste, dispose } = attachPasting();
+    pressCtrlV();
+
+    // Non-macOS browsers authorize and deliver the normal paste event.  A
+    // second async read here would create an unnecessary permission prompt.
+    expect(read).not.toHaveBeenCalled();
+    firePaste({
+      files: [
+        new File([new Uint8Array([1])], "clip.png", { type: "image/png" }),
+      ],
+    });
+    await settle();
+
+    expect(clipboard).toHaveLength(1);
+    expect(read).not.toHaveBeenCalled();
+    dispose();
+  });
+
   it("prefers text when the clipboard carries both", async () => {
     const { clipboard, pressCtrlV, firePaste, dispose } = attachPasting();
     pressCtrlV();
@@ -1307,26 +1371,44 @@ describe("BlitSurfaceCanvas paste", () => {
     dispose();
   });
 
-  it("reads an image off the clipboard when the chord fires no paste event", async () => {
+  it("starts the image read while the Ctrl keydown still has user activation", async () => {
     // macOS Chrome Ctrl+V: no menu command, no paste event — readText
-    // resolves "" for an image-only clipboard and that used to be the end
-    // of it.  The async clipboard API can still hand over the image.
+    // resolves "" for an image-only clipboard.  clipboard.read() must start
+    // before that promise settles or macOS browsers can reject it after the
+    // key event's transient user activation has expired.
     const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    let resolveText: (text: string) => void = () => {};
+    const readText = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveText = resolve;
+        }),
+    );
+    const read = vi.fn().mockResolvedValue([
+      {
+        types: ["image/png"],
+        getType: (mime: string) =>
+          Promise.resolve(new Blob([bytes], { type: mime })),
+      },
+    ]);
     vi.stubGlobal("navigator", {
       ...navigator,
+      platform: "MacIntel",
       clipboard: {
-        readText: vi.fn().mockResolvedValue(""),
-        read: vi.fn().mockResolvedValue([
-          {
-            types: ["image/png"],
-            getType: (mime: string) =>
-              Promise.resolve(new Blob([bytes], { type: mime })),
-          },
-        ]),
+        readText,
+        read,
       },
     });
     const { clipboard, keys, canvas, pressCtrlV, dispose } = attachPasting();
     pressCtrlV();
+
+    // readText is still pending, but the richer read has already captured
+    // the keydown's authorization window.
+    expect(readText).toHaveBeenCalledOnce();
+    expect(read).toHaveBeenCalledOnce();
+    expect(clipboard).toHaveLength(0);
+
+    resolveText("");
     await settle();
     await settle();
 
@@ -2272,6 +2354,73 @@ describe("BlitSurfaceCanvas IME focus", () => {
     expect(document.activeElement).toBe(ta);
     surface.dispose();
     container.remove();
+  });
+});
+
+describe("BlitSurfaceCanvas Command chords", () => {
+  const key = (
+    type: "keydown" | "keyup",
+    init: KeyboardEventInit,
+  ): KeyboardEvent =>
+    new KeyboardEvent(type, { bubbles: true, cancelable: true, ...init });
+
+  it("releases a macOS Cmd+A with its press when the browser eats keyup", () => {
+    const { surface, canvas, keys } = attachTyping();
+    (surface as unknown as { macOptionChars: boolean }).macOptionChars = true;
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "Meta", code: "MetaLeft", metaKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keydown", { key: "a", code: "KeyA", metaKey: true }),
+    );
+    // Chrome/Safari may omit the A key-up for a macOS menu command.  Cmd's
+    // release must not leave A held remotely.
+    canvas.dispatchEvent(
+      key("keyup", { key: "Meta", code: "MetaLeft", metaKey: false }),
+    );
+    // If a browser does deliver A's key-up late, it remains inert.
+    canvas.dispatchEvent(
+      key("keyup", { key: "a", code: "KeyA", metaKey: false }),
+    );
+
+    expect(keys).toEqual([
+      { keycode: 125, pressed: true },
+      { keycode: 30, pressed: true },
+      { keycode: 30, pressed: false },
+      { keycode: 125, pressed: false },
+    ]);
+    surface.dispose();
+  });
+
+  it("keeps Linux Meta+A held until its real keyup", () => {
+    const { surface, canvas, keys } = attachTyping();
+    (surface as unknown as { macOptionChars: boolean }).macOptionChars = false;
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "Meta", code: "MetaLeft", metaKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keydown", { key: "a", code: "KeyA", metaKey: true }),
+    );
+    expect(keys).toEqual([
+      { keycode: 125, pressed: true },
+      { keycode: 30, pressed: true },
+    ]);
+
+    canvas.dispatchEvent(
+      key("keyup", { key: "a", code: "KeyA", metaKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keyup", { key: "Meta", code: "MetaLeft", metaKey: false }),
+    );
+    expect(keys).toEqual([
+      { keycode: 125, pressed: true },
+      { keycode: 30, pressed: true },
+      { keycode: 30, pressed: false },
+      { keycode: 125, pressed: false },
+    ]);
+    surface.dispose();
   });
 });
 

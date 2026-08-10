@@ -26,7 +26,7 @@ rcgen = "0.14"
 ring = "0.17"
 rustls-pemfile = "2"
 rustls-pki-types = "1"
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 time = "0.3"
 url = "2"
 

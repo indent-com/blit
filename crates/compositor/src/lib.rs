@@ -161,11 +161,13 @@ mod stub {
             height: u32,
             pixels: PixelData,
             timestamp_ms: u32,
+            timestamp_sub_us: u16,
             encoder_skip: bool,
         },
         SurfaceEncoded {
             frame: EncodedFrame,
             timestamp_ms: u32,
+            timestamp_sub_us: u16,
         },
         VulkanEncoderUnavailable {
             surface_id: u16,
@@ -316,6 +318,7 @@ mod stub {
         /// the server is ready to consume a new frame (streaming or capture).
         RequestFrame {
             surface_id: u16,
+            presentation_at: std::time::Instant,
         },
         /// Re-composite a toplevel from its current committed state and
         /// republish the pixels, without waiting for the client to commit.
@@ -370,6 +373,13 @@ mod stub {
             is_444: bool,
             /// Minimum microseconds between encodes for this session; 0 =
             /// encode every composite.
+            min_interval_us: u32,
+        },
+        /// Retarget one client's encoder cadence without rebuilding its
+        /// Vulkan Video session.
+        SetVulkanEncoderInterval {
+            surface_id: u32,
+            client_id: u64,
             min_interval_us: u32,
         },
         /// Retarget one client's encoder quantizer without rebuilding it.
@@ -433,6 +443,13 @@ mod stub {
     impl CompositorHandle {
         /// Wake the compositor event loop immediately.
         pub fn wake(&self) {}
+
+        pub fn set_frame_interval(&self, _surface_id: u16, _interval: Option<std::time::Duration>) {
+        }
+
+        pub fn take_frame_clock_requests(&self) -> u32 {
+            0
+        }
 
         /// Stop the compositor and wait for it to finish tearing down.
         pub fn stop(self) {

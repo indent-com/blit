@@ -120,26 +120,28 @@ Pasting into a Wayland surface is not a keystroke, it is a keystroke with a
 prerequisite: the app reads the selection the instant it sees Ctrl+V, so
 `BlitSurfaceCanvas` holds the V press back until the clipboard has been sent
 as `C2S_CLIPBOARD_SET`, then releases press, V release and Ctrl release in
-order. A 300 ms safety net gives up rather than delivering V with a stale
-selection behind it.
+order. Clipboard reads and focus loss settle the chord; a failed read gives up
+rather than delivering V with a stale selection behind it.
 
-Two reads race to supply the content, because neither is reliable alone:
-`navigator.clipboard.readText()` (denied without permission in Chromium and
-Brave) and the `paste` event (which browsers won't fire at a focused
-non-editable canvas, hence the focus shuffle through the hidden textarea).
-Only the `paste` event carries files, so **images arrive by that path only** —
+A paste event and async clipboard reads can supply the content, because neither
+path is reliable alone. `navigator.clipboard.readText()` may be denied without
+permission in Chromium and Brave, while browsers may not fire `paste` at a
+focused non-editable canvas (hence the focus shuffle through the hidden
+textarea).
 `clipboardImage()` takes the best `image/*` item on the event and forwards its
-bytes under their own MIME type, preferring PNG. Reading the blob is
-asynchronous, so claiming the paste pushes the safety net out to 3 s and locks
-out a `readText()` that resolves meanwhile.
+bytes under their own MIME type, preferring PNG. On a Ctrl chord that does not
+produce a paste event (notably Ctrl+V on macOS), `navigator.clipboard.read()` is
+also started synchronously in the keydown handler so it retains the event's
+transient user activation. Its image result is only consumed after
+`readText()` returns empty or is denied, preserving text preference.
 
 An image only wins when the clipboard has no plain text: rich sources put
 several representations on one clipboard, and the text is what pasting a
 spreadsheet range is expected to produce. The wire carries one representation
 per copy, so this is a choice, not a preference order the app gets to make.
 
-An image over 8 MiB — or a blob that will not read — takes the safety net's
-path rather than the flush's: warn, stand the chord down, no V. The frame
+An image over 8 MiB — or a blob that will not read — takes the stand-down path
+rather than the flush's: warn, stand the chord down, no V. The frame
 ceiling is 16 MiB and an over-length message is refused rather than truncated,
 so the bytes are not going anywhere; pressing V anyway would paste whatever the
 selection held _before_, which is not what was copied. An empty clipboard is
@@ -207,25 +209,23 @@ GUI app surfaces (see [server.md § Headless Wayland compositor](server.md#headl
 
 The PTS is `S2C_SURFACE_FRAME.timestamp`, stamped at compositor-commit time — the only clock in the pipeline taken before encode and transport, so replaying against it cancels the jitter both add. Encode runs fire-and-forget off the server's tick loop, so per-frame encode latency varies; without scheduling that variance lands directly on screen as an uneven 2-0-1-2 cadence at a nominally perfect frame rate.
 
-Presentation runs at the `PRESENT_QUANTILE` (p95) of the `arrival − pts` offsets seen over the last `OFFSET_WINDOW_MS` (1 s) of stream, capped at `PRESENT_DELAY_MAX_MS` (50 ms) above the `FAST_QUANTILE` (p2) of the same window — so a LAN link, where jitter is near zero, buffers almost nothing.
+Presentation uses the late end of the `arrival − pts` offsets seen over the last `OFFSET_WINDOW_MS` (1 s) of stream, ignoring one isolated high sample. The low `FAST_QUANTILE` (p2), plus its matching decoder delay, is the fast-path baseline. Added headroom is hard-capped at the smaller of one source-frame interval and 8 ms; a same-host path identified by a protocol RTT of at most 2 ms bypasses scheduling entirely.
 
 Both ends come from **one** distribution, which is what makes this robust in both directions without special-case rules. A burst frame — captured later but shipped immediately behind its predecessor, so genuinely faster in transit — is a low outlier; a frame delayed by a stall is a high outlier; a quantile ignores each for the same reason. An earlier design tracked the baseline as a running minimum with an upward leak and a clamped downward step, which needed two constants and still froze the surface for the length of any abrupt path improvement, because the baseline could only descend a few ms per frame while the true offset had already dropped.
 
 A quantile rather than a peak-tracking average, because a peak tracker spends the entire latency budget on outliers it cannot cover anyway: one frame 200 ms late took the old estimator from 0 to 100 in a single sample, pinned the margin at the ceiling, and then decayed at 0.98/frame — about 55 frames, nearly a second at 60 Hz, of maximum latency bought by one event. The quantile sizes to the jitter that recurs and lets the tail fall through to skip-to-newest, which is the correct handling for an outlier regardless. The window is expressed in time, not frames, so the horizon is the same at 24 and 240 fps.
 
-The presentation offset is slewed toward that target, not set to it (`MARGIN_GROW_MS` 2 ms/frame up; down by the larger of `MARGIN_SHRINK_MS` and `MARGIN_SHRINK_FRAC` of the remaining gap). Moving it _is_ a latency change — every future due time shifts with it — so stepping would inject exactly the discontinuity the scheduler exists to remove. Slewing turns it into a sub-perceptual rate nudge instead.
-
-Shrinking is proportional rather than a flat crawl, which matters more than it looks. A flat 0.25 ms/frame took roughly five seconds to unwind a single stall; because video rides a reliable ordered channel, every lost packet _is_ such a stall, so a lossy link would have sat near the latency ceiling permanently — strictly worse than not scheduling at all, and precisely for the users this feature exists to serve. Proportional decay unwinds the same stall in about half a second.
+The presentation offset grows to a measured target immediately and sheds excess headroom by a small fraction of one source interval per frame. Moving it _is_ a latency change — every future due time shifts with it — so the downward slew avoids injecting a second visible discontinuity after the path recovers.
 
 A **PTS** gap over `STREAM_GAP_MS` (250 ms), a backwards PTS (the server's u32 ms counter wrapping), or the tab going hidden all reset the presenter to newest-wins. A frame without a finite PTS never engages scheduling.
 
-The reset keys on capture time, never on arrival time, because the two mean opposite things. A source that went idle stops advancing PTS, and its next frame answers input — that one must paint immediately. A stalled transport kept producing all along; those frames arrive late in a burst with their PTS spacing intact, and scheduling is exactly what should handle them. Since surface video rides a reliable ordered channel, one lost packet head-of-line blocks for at least a round trip, so judging by arrival would disengage scheduling on every loss — permanently, on a high-latency link. PTS spacing survives head-of-line blocking, which makes this correct at any RTT without the client needing an RTT estimate.
+The reset keys on capture time, never on arrival time, because the two mean opposite things. A source that went idle stops advancing PTS, and its next frame answers input — that one must paint immediately. A stalled transport kept producing all along; those frames retain continuous PTS even when they arrive late. Surface video currently remains on a reliable ordered channel, so transport order also remains codec decode order.
 
-The queue depth is derived, not fixed: the frames a margin legitimately spans is `margin / frame_interval`, and the frame interval is learned from PTS deltas rather than assumed. That matters because the server paces a surface at the client's display rate — up to `MAX_DISPLAY_FPS` (480) — so at 240 Hz a 50 ms margin holds 12 frames, not 3. Learning the interval from PTS also means the depth follows the rate the encoder _actually_ sustains, not the rate that was requested.
+The queue depth is derived, not fixed: the frames a margin legitimately spans is `margin / frame_interval`, plus two frames of scheduling slack, and the frame interval is learned from PTS deltas rather than assumed. With the one-frame headroom ceiling this remains small even at 240 Hz. Learning the interval from PTS also means the depth follows the rate the encoder _actually_ sustains, not the rate that was requested.
 
 **Measured on loopback** (`blit surface record --timing`, mpv at 1280×720 into a local server, 471 frames): the capture clock is a clean grid — PTS deltas mean 16.69 ms, p95 19 ms, one 38 ms outlier — and delivery jitter is tiny, p95 − p2 of **2.5 ms**. That is below half a refresh, so on a local link the scheduler cannot hold a frame and is a no-op by construction. Its value is entirely on links with real jitter, which is also the only place it carries risk. Note the recorder ACKs immediately and never sends `C2S_DISPLAY_RATE`, so these numbers are capture + encode + transport jitter — exactly the input the margin absorbs — and say nothing about pacing under backlog.
 
-**Limits.** Jitter beyond `PRESENT_DELAY_MAX_MS` is not absorbed: frames later than the margin are already overdue and paint immediately, so a link whose p95 offset spread exceeds 50 ms still judders on those frames — it degrades toward newest-wins rather than breaking. That ceiling is a flat millisecond count, which is the wrong shape in principle: 50 ms is a savage penalty against a 1 ms round trip and rounding error against a 1 s one. In practice it has not been observed to bind — the margin tracks measured jitter, and on the one link measured so far that is 2.5 ms. Making it relative would need a client-side RTT estimate, and there is none today: `C2S_PING` is a server-side no-op with no reply, so there is nothing to time. The margin is also real added latency, though it tracks measured jitter, so a distant-but-stable link pays almost nothing. A margin below half a refresh cannot hold a frame at all, since the nearest-vsync rounding already covers it. The refresh period itself is learned from rAF deltas between `RAF_DELTA_MIN_MS` and `RAF_DELTA_MAX_MS` (1000 Hz to 10 Hz); outside that band a tick is treated as a stall rather than a cadence. Depth is bounded, but sized so the bound never binds for a real stream: the margin tops out at 50 ms and frames arrive no faster than `MIN_FRAME_INTERVAL_MS` (480 fps, the server's own `MAX_DISPLAY_FPS` ceiling), so 24 frames plus slack covers every rate the pipeline can produce. A degenerate PTS stream is caught by flooring the _interval_, not by clipping depth — so no stream is ever made to drop frames merely for being fast. Depth also follows the rate the encoder actually sustains, since the interval is learned from PTS: a 4K surface encoding at 30 fps holds two frames regardless of the panel's refresh rate. A transport stall no longer disengages scheduling, but the backlog it releases is stale by the length of the stall, and the presenter skips to the newest due frame rather than replaying it — correct for a live desktop, though it reads as a jump rather than a smooth catch-up.
+**Limits.** Jitter beyond one source frame is deliberately not absorbed. Hiding a 70 ms reliable-stream recovery requires imposing roughly 70 ms of permanent input latency, and still fails on the next larger outlier. The presenter instead skips stale decoded frames after they arrive. A lost packet on the reliable ordered transport can still stall every newer encoded frame until retransmission; avoiding that without corrupting inter-frame codec references requires explicit frame sequencing and keyframe recovery, not unordered decoder submission. The refresh period is learned from plausible rAF deltas; longer intervals are treated as main-thread/background stalls rather than display cadence.
 
 ## Font serving
 

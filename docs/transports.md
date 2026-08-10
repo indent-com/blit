@@ -140,12 +140,14 @@ Terminal IDs are namespaced by connection (`"rabbit:1"`, `"hound:2"`) so they ne
 
 Enabled with `BLIT_QUIC=1`. The gateway listens for QUIC connections on the same port and address as WebSocket.
 
+The gateway sends its browser-facing authority as `wt-addr=<hostname:port|:port>` before the certificate hash. The browser resolves a `:port` value against its own page hostname, so reverse proxies cannot accidentally replace the public hostname with an upstream loopback address. Set `BLIT_QUIC_PUBLIC_ADDR` to override the authority; by default the gateway advertises `:<listen-port>`.
+
 ### Certificate management
 
 Self-signed certificates are auto-generated at startup and rotated every 13 days (the WebTransport `serverCertificateHashes` API requires `notAfter - notBefore ≤ 14 days`). The certificate's SHA-256 hash is:
 
 1. Stored in the gateway's in-memory `wt_cert_hash` field.
-2. Served in the initial `remotes:` WebSocket message as a `certHash` field (browsers reading from the config WS get it automatically).
+2. Served over the config WebSocket as `wt=<hash>` alongside `wt-addr=<authority>`.
 3. Available at the `/config` endpoint for backward compatibility.
 
 The browser constructs `new WebTransport(url, { serverCertificateHashes: [{ algorithm: "sha-256", value: hash }] })`.

@@ -13,7 +13,7 @@ use crate::positioner::PositionerGeometry;
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 
 use calloop::generic::Generic;
@@ -580,6 +580,8 @@ pub enum CompositorEvent {
         /// stamp surface frames with the source's presentation timing
         /// rather than the (jittery) encode-delivery wall clock.
         timestamp_ms: u32,
+        /// Microseconds within `timestamp_ms`, preserving sub-ms cadence.
+        timestamp_sub_us: u16,
         /// This frame is for the pixel cache only — an on-demand BGRA
         /// readback published while an NV12 zero-copy stream owns the
         /// same key.  Encoders must not consume it: it would re-encode
@@ -593,6 +595,7 @@ pub enum CompositorEvent {
     SurfaceEncoded {
         frame: EncodedFrame,
         timestamp_ms: u32,
+        timestamp_sub_us: u16,
     },
     /// No Vulkan Video encoder could be created for this `(surface,
     /// client)` pair, so the server must encode for that client itself.
@@ -743,6 +746,8 @@ pub enum CompositorCommand {
     },
     RequestFrame {
         surface_id: u16,
+        /// Absolute point on the server's fixed-rate refresh timeline.
+        presentation_at: std::time::Instant,
     },
     /// Re-composite a toplevel from its current committed state and
     /// republish the pixels, without waiting for the client to commit.
@@ -873,6 +878,13 @@ pub enum CompositorCommand {
         /// encoded-but-undelivered frame breaks the delta chain, so frames
         /// that would be skipped must be skipped *before* encoding.
         /// 0 = encode every composite.
+        min_interval_us: u32,
+    },
+    /// Retarget one client's encoder cadence without rebuilding its Vulkan
+    /// Video session or reference chain.
+    SetVulkanEncoderInterval {
+        surface_id: u32,
+        client_id: u64,
         min_interval_us: u32,
     },
     /// Retarget one client's encoder quantizer without rebuilding it.
@@ -1802,6 +1814,14 @@ struct Compositor {
     /// reaches it and firing per commit would let a client that repaints
     /// per callback free-run at full speed on a window nobody can see.
     last_topless_frame_ms: HashMap<ObjectId, u32>,
+    /// A fixed-clock deadline that found no frame callback ready yet.
+    ///
+    /// `wl_surface.frame` takes effect with the client's next commit. At high
+    /// refresh rates that request and the server clock can cross by a few
+    /// microseconds: dropping the empty clock tick then makes the freshly
+    /// committed callback wait an entire refresh period. Keep only the newest
+    /// such deadline per toplevel and consume it after that commit instead.
+    pending_request_frames: HashMap<u16, std::time::Instant>,
     next_surface_id: u16,
     shm_pools: HashMap<ObjectId, Arc<ShmPool>>,
     /// Per-surface metadata (dimensions, scale, flags) populated at commit time.
@@ -2320,7 +2340,7 @@ impl Compositor {
         }
         // Drain into a stable order so per-surface targets are emitted
         // in a deterministic sequence.
-        let now_ms = elapsed_ms();
+        let (now_ms, now_sub_us) = elapsed_timestamp();
         #[allow(clippy::type_complexity)]
         let mut entries: Vec<((u16, u32, u32), (u32, u32, PixelData, bool))> =
             self.pending_commits.drain().collect();
@@ -2332,6 +2352,7 @@ impl Compositor {
                 height,
                 pixels,
                 timestamp_ms: now_ms,
+                timestamp_sub_us: now_sub_us,
                 encoder_skip,
             });
         }
@@ -2342,6 +2363,7 @@ impl Compositor {
             let _ = self.event_tx.send(CompositorEvent::SurfaceEncoded {
                 frame,
                 timestamp_ms: now_ms,
+                timestamp_sub_us: now_sub_us,
             });
         }
         (self.event_notify)();
@@ -2511,7 +2533,7 @@ impl Compositor {
                     .is_none_or(|&t| now.wrapping_sub(t) >= TOPLESS_FRAME_INTERVAL_MS);
                 if due {
                     self.last_topless_frame_ms.insert(surface_id.clone(), now);
-                    self.fire_surface_frame_callbacks(surface_id);
+                    self.fire_surface_frame_callbacks(surface_id, None);
                     let _ = self.display_handle.flush_clients();
                 }
                 return;
@@ -2625,8 +2647,17 @@ impl Compositor {
             .last_request_frame_ms
             .get(&toplevel_sid)
             .is_some_and(|&t| elapsed_ms().wrapping_sub(t) < PACING_GRACE_MS);
-        if !paced {
-            self.fire_frame_callbacks_for_toplevel(toplevel_sid);
+        let pending_presentation = paced
+            .then(|| self.pending_request_frames.get(&toplevel_sid).copied())
+            .flatten();
+        if let Some(presentation_at) = pending_presentation {
+            // A fixed-clock tick crossed this commit's frame request before it
+            // became visible to the compositor. Consume that same tick now;
+            // waiting for the next one creates a full-period hole at 240 Hz.
+            self.fire_frame_callbacks_for_toplevel(toplevel_sid, Some(presentation_at));
+        } else if !paced {
+            self.pending_request_frames.remove(&toplevel_sid);
+            self.fire_frame_callbacks_for_toplevel(toplevel_sid, None);
         }
 
         // After an output scale change, re-send keyboard leave/enter on
@@ -3419,24 +3450,40 @@ impl Compositor {
         }
     }
 
-    fn fire_surface_frame_callbacks(&mut self, surface_id: &ObjectId) {
+    fn fire_surface_frame_callbacks(
+        &mut self,
+        surface_id: &ObjectId,
+        presentation_at: Option<std::time::Instant>,
+    ) -> bool {
         let (callbacks, feedbacks) = {
             let Some(surf) = self.surfaces.get_mut(surface_id) else {
-                return;
+                return false;
             };
             (
                 std::mem::take(&mut surf.pending_frame_callbacks),
                 std::mem::take(&mut surf.pending_presentation_feedbacks),
             )
         };
-        let time = elapsed_ms();
+        // Keep wl_callback.done on the fixed frame-clock phase, but report
+        // wp_presentation at the instant we actually emit the feedback. A
+        // scheduled deadline is only the compositor's target; cross-thread
+        // dispatch and a late client commit can make it older than the real
+        // presentation, while converting an Instant back into the advertised
+        // CLOCK_MONOTONIC domain has an unavoidable sampling error. Chromium
+        // exposes that error as negative frame latency. The protocol asks for
+        // when the content became visible, so "now" is the accurate value.
+        let (callback_sec, callback_nsec) =
+            presentation_at.map_or_else(monotonic_timespec, monotonic_timespec_at);
+        let fired = !callbacks.is_empty() || !feedbacks.is_empty();
+        let time = (callback_sec as u32)
+            .wrapping_mul(1000)
+            .wrapping_add(callback_nsec as u32 / 1_000_000);
         for cb in callbacks {
             cb.done(time);
         }
         if !feedbacks.is_empty() {
-            let (sec, nsec) = monotonic_timespec();
+            let (presented_sec, presented_nsec) = monotonic_timespec();
             // Send sync_output for each feedback, then presented().
-            // refresh=0 means unknown (headless, no real display).
             for fb in feedbacks {
                 for output in &self.outputs {
                     if same_client(&fb, output) {
@@ -3450,16 +3497,19 @@ impl Compositor {
                     0
                 };
                 fb.presented(
-                    (sec >> 32) as u32,
-                    sec as u32,
-                    nsec as u32,
+                    (presented_sec >> 32) as u32,
+                    presented_sec as u32,
+                    presented_nsec as u32,
                     refresh_ns,
-                    0, // seq_hi
-                    0, // seq_lo
-                    WpPresentationFeedbackKind::empty(),
+                    0, // sequence unknown for the synthetic output
+                    0,
+                    // The headless output is software-timed, but it is still
+                    // presented on the fixed refresh timeline above.
+                    WpPresentationFeedbackKind::Vsync,
                 );
             }
         }
+        fired
     }
 
     /// Forget pointer focus if it named `gone`.
@@ -3597,6 +3647,7 @@ impl Compositor {
                         self.focused_surface_id = 0;
                     }
                     self.last_request_frame_ms.remove(&surf.surface_id);
+                    self.pending_request_frames.remove(&surf.surface_id);
                     self.last_reported_size.remove(&surf.surface_id);
                     self.surface_sizes.remove(&surf.surface_id);
                     if let Some(ref mut vk) = self.vulkan_renderer {
@@ -3636,15 +3687,24 @@ impl Compositor {
         let _ = self.display_handle.flush_clients();
     }
 
-    fn fire_frame_callbacks_for_toplevel(&mut self, toplevel_sid: u16) {
+    fn fire_frame_callbacks_for_toplevel(
+        &mut self,
+        toplevel_sid: u16,
+        presentation_at: Option<std::time::Instant>,
+    ) -> bool {
         let Some(root_id) = self.toplevel_surface_ids.get(&toplevel_sid).cloned() else {
-            return;
+            return false;
         };
         let tree = self.collect_surface_tree(&root_id);
+        let mut fired = false;
         for sid in &tree {
-            self.fire_surface_frame_callbacks(sid);
+            fired |= self.fire_surface_frame_callbacks(sid, presentation_at);
+        }
+        if fired {
+            self.pending_request_frames.remove(&toplevel_sid);
         }
         let _ = self.display_handle.flush_clients();
+        fired
     }
 
     fn handle_cursor_commit(&mut self, surface_id: &ObjectId) {
@@ -3668,7 +3728,7 @@ impl Compositor {
                 },
             });
         }
-        self.fire_surface_frame_callbacks(surface_id);
+        self.fire_surface_frame_callbacks(surface_id, None);
         let _ = self.display_handle.flush_clients();
     }
 
@@ -4216,7 +4276,7 @@ impl Compositor {
                     // scale.
                     let all_sids: Vec<u16> = self.toplevel_surface_ids.keys().copied().collect();
                     for sid in all_sids {
-                        self.fire_frame_callbacks_for_toplevel(sid);
+                        self.fire_frame_callbacks_for_toplevel(sid, None);
                     }
 
                     // Reset pointer/keyboard state — scale change
@@ -4241,7 +4301,7 @@ impl Compositor {
                             xs.configure(serial);
                         }
                     }
-                    self.fire_frame_callbacks_for_toplevel(surface_id);
+                    self.fire_frame_callbacks_for_toplevel(surface_id, None);
                 }
 
                 // The composite target moved the moment `surface_sizes`
@@ -4419,12 +4479,23 @@ impl Compositor {
                 };
                 let _ = reply.send(result);
             }
-            CompositorCommand::RequestFrame { surface_id } => {
+            CompositorCommand::RequestFrame {
+                surface_id,
+                presentation_at,
+            } => {
                 // Remember that the server paced this surface, so the eager
                 // per-commit fire in `handle_surface_commit` can stand down
                 // while this (display-rate-throttled) path is driving frames.
                 self.last_request_frame_ms.insert(surface_id, elapsed_ms());
-                self.fire_frame_callbacks_for_toplevel(surface_id);
+                if self.toplevel_surface_ids.contains_key(&surface_id) {
+                    if !self.fire_frame_callbacks_for_toplevel(surface_id, Some(presentation_at)) {
+                        // The client's next frame request has not reached us
+                        // yet. Latch this deadline; its associated commit will
+                        // consume it instead of losing a complete refresh.
+                        self.pending_request_frames
+                            .insert(surface_id, presentation_at);
+                    }
+                }
             }
             CompositorCommand::ReleaseKeys { keycodes } => {
                 let time = elapsed_ms();
@@ -4546,11 +4617,14 @@ impl Compositor {
                 }
             }
             CompositorCommand::SetRefreshRate { mhz } => {
-                // Only update on meaningful changes (>2 Hz difference) to
+                // Only update on meaningful changes (2 Hz or larger) to
                 // avoid flooding clients with mode events from jittery
-                // requestAnimationFrame measurements.
+                // requestAnimationFrame measurements.  Two hertz itself is
+                // meaningful at high refresh rates: a busy startup sample
+                // can report 143 Hz for a 145 Hz display, then recover when
+                // the short client probe runs again.
                 let diff = (mhz as i64 - self.output_refresh_mhz as i64).unsigned_abs();
-                if diff > 2000 && mhz > 0 {
+                if diff >= 2000 && mhz > 0 {
                     self.output_refresh_mhz = mhz;
                     let s120 = self.output_scale_120 as i32;
                     let mode_w = self.output_width * s120 / 120;
@@ -4600,6 +4674,15 @@ impl Compositor {
                             after_encode_failures: false,
                         });
                     (self.event_notify)();
+                }
+            }
+            CompositorCommand::SetVulkanEncoderInterval {
+                surface_id,
+                client_id,
+                min_interval_us,
+            } => {
+                if let Some(ref mut vk) = self.vulkan_renderer {
+                    vk.set_vulkan_encoder_interval(surface_id, client_id, min_interval_us);
                 }
             }
             CompositorCommand::SetVulkanEncoderQp {
@@ -4804,6 +4887,37 @@ fn monotonic_timespec() -> (i64, i64) {
     (ts.tv_sec, ts.tv_nsec)
 }
 
+/// Convert an absolute `Instant` into the Wayland presentation clock domain.
+/// On Linux `Instant` and `CLOCK_MONOTONIC` share a clock, but Rust keeps the
+/// former opaque; sampling both once lets us preserve the server's scheduled
+/// refresh phase instead of replacing it with compositor wake-up time.
+fn monotonic_timespec_at(when: std::time::Instant) -> (i64, i64) {
+    // Read CLOCK_MONOTONIC first and Instant second.  Reading them in the
+    // opposite order maps `when` ahead by the time spent in clock_gettime:
+    // the kernel clock has advanced but the Instant anchor has not.  Chromium
+    // then sees a presentation a few dozen microseconds in its future and
+    // reports negative frame latency.  This order makes the same unavoidable
+    // sampling error conservative (slightly in the past).  A timer may still
+    // wake a hair before its scheduled phase, so the result is capped at the
+    // sampled clock below: presentation feedback must never describe an event
+    // in the future.  Past deadlines retain their exact frame-clock phase.
+    let (sec, nsec) = monotonic_timespec();
+    let instant_now = std::time::Instant::now();
+    let now_ns = (sec as u128)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec as u128);
+    let scheduled_ns = if when <= instant_now {
+        now_ns.saturating_sub(instant_now.duration_since(when).as_nanos())
+    } else {
+        now_ns.saturating_add(when.duration_since(instant_now).as_nanos())
+    };
+    let when_ns = scheduled_ns.min(now_ns);
+    (
+        (when_ns / 1_000_000_000) as i64,
+        (when_ns % 1_000_000_000) as i64,
+    )
+}
+
 fn elapsed_ms() -> u32 {
     // Use CLOCK_MONOTONIC directly so the timestamp matches what Wayland
     // clients (especially Chromium/Brave) expect for frame-latency
@@ -4813,6 +4927,15 @@ fn elapsed_ms() -> u32 {
     (sec as u32)
         .wrapping_mul(1000)
         .wrapping_add(nsec as u32 / 1_000_000)
+}
+
+/// Read the same clock as [`elapsed_ms`] while retaining its sub-ms part.
+fn elapsed_timestamp() -> (u32, u16) {
+    let (sec, nsec) = monotonic_timespec();
+    let ms = (sec as u32)
+        .wrapping_mul(1000)
+        .wrapping_add(nsec as u32 / 1_000_000);
+    (ms, ((nsec as u32 % 1_000_000) / 1_000) as u16)
 }
 
 /// Map a scroll source onto `wl_pointer.axis_source`, for a pointer bound
@@ -5212,6 +5335,7 @@ impl Dispatch<WlSurface, ()> for Compositor {
                     state.last_topless_frame_ms.remove(&sid);
                     if surf.surface_id > 0 {
                         state.toplevel_surface_ids.remove(&surf.surface_id);
+                        state.last_request_frame_ms.remove(&surf.surface_id);
                         state.last_reported_size.remove(&surf.surface_id);
                         state.surface_sizes.remove(&surf.surface_id);
                         if let Some(ref mut vk) = state.vulkan_renderer {
@@ -8781,6 +8905,9 @@ pub struct CompositorHandle {
     /// Whether the compositor's Vulkan renderer supports Vulkan Video AV1 encode.
     pub vulkan_video_encode_av1: bool,
     thread: std::thread::JoinHandle<()>,
+    frame_clock_thread: std::thread::JoinHandle<()>,
+    frame_clock_tx: mpsc::Sender<FrameClockCommand>,
+    frame_clock_requests: Arc<AtomicU32>,
     shutdown: Arc<AtomicBool>,
     loop_signal: LoopSignal,
 }
@@ -8790,14 +8917,153 @@ impl CompositorHandle {
         self.loop_signal.wakeup();
     }
 
+    /// Drive one surface's Wayland frame callbacks from a clock that is
+    /// independent of server encode and network-delivery work.
+    pub fn set_frame_interval(&self, surface_id: u16, interval: Option<std::time::Duration>) {
+        let _ = self.frame_clock_tx.send(FrameClockCommand::Set {
+            surface_id,
+            interval,
+        });
+    }
+
+    /// Number of fixed-clock frame requests emitted since the last call.
+    pub fn take_frame_clock_requests(&self) -> u32 {
+        self.frame_clock_requests.swap(0, Ordering::Relaxed)
+    }
+
     /// Stop the compositor and wait for it to finish tearing down.
     ///
     /// Simply dropping the handle leaves the compositor running instead --
     /// there is no orderly stop without calling this.
     pub fn stop(self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        let _ = self.frame_clock_tx.send(FrameClockCommand::Shutdown);
         self.loop_signal.wakeup();
+        let _ = self.frame_clock_thread.join();
         let _ = self.thread.join();
+    }
+}
+
+enum FrameClockCommand {
+    Set {
+        surface_id: u16,
+        interval: Option<std::time::Duration>,
+    },
+    Shutdown,
+}
+
+#[derive(Clone, Copy)]
+struct FrameClockEntry {
+    interval: std::time::Duration,
+    next: std::time::Instant,
+}
+
+fn update_frame_clock(
+    clocks: &mut HashMap<u16, FrameClockEntry>,
+    surface_id: u16,
+    interval: Option<std::time::Duration>,
+) {
+    let Some(interval) = interval.filter(|interval| !interval.is_zero()) else {
+        clocks.remove(&surface_id);
+        return;
+    };
+    let now = std::time::Instant::now();
+    match clocks.get_mut(&surface_id) {
+        Some(clock) if clock.interval == interval => {}
+        Some(clock) => {
+            clock.interval = interval;
+            clock.next = now;
+        }
+        None => {
+            clocks.insert(
+                surface_id,
+                FrameClockEntry {
+                    interval,
+                    next: now,
+                },
+            );
+        }
+    }
+}
+
+fn consume_frame_clock_deadline(
+    deadline: &mut std::time::Instant,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> std::time::Instant {
+    let elapsed = now.saturating_duration_since(*deadline).as_nanos() / interval.as_nanos();
+    let elapsed = u32::try_from(elapsed).unwrap_or(u32::MAX);
+    let presentation_at = deadline
+        .checked_add(interval.saturating_mul(elapsed))
+        .unwrap_or(now);
+    *deadline = presentation_at
+        .checked_add(interval)
+        .unwrap_or(now + interval);
+    presentation_at
+}
+
+fn run_frame_clock(
+    rx: mpsc::Receiver<FrameClockCommand>,
+    command_tx: mpsc::Sender<CompositorCommand>,
+    loop_signal: LoopSignal,
+    requests: Arc<AtomicU32>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut clocks: HashMap<u16, FrameClockEntry> = HashMap::new();
+    loop {
+        let now = std::time::Instant::now();
+        let wait = clocks
+            .values()
+            .map(|clock| clock.next)
+            .min()
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .unwrap_or(std::time::Duration::from_secs(3600));
+        match rx.recv_timeout(wait) {
+            Ok(FrameClockCommand::Set {
+                surface_id,
+                interval,
+            }) => update_frame_clock(&mut clocks, surface_id, interval),
+            Ok(FrameClockCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        // Coalesce a burst of subscription/rate updates before deciding
+        // which deadlines are due.
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                FrameClockCommand::Set {
+                    surface_id,
+                    interval,
+                } => update_frame_clock(&mut clocks, surface_id, interval),
+                FrameClockCommand::Shutdown => return,
+            }
+        }
+
+        let now = std::time::Instant::now();
+        let mut sent = 0u32;
+        for (&surface_id, clock) in &mut clocks {
+            if clock.next > now {
+                continue;
+            }
+            let presentation_at =
+                consume_frame_clock_deadline(&mut clock.next, now, clock.interval);
+            if command_tx
+                .send(CompositorCommand::RequestFrame {
+                    surface_id,
+                    presentation_at,
+                })
+                .is_ok()
+            {
+                sent = sent.saturating_add(1);
+            }
+        }
+        if sent > 0 {
+            requests.fetch_add(sent, Ordering::Relaxed);
+            loop_signal.wakeup();
+        }
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
     }
 }
 
@@ -8868,12 +9134,29 @@ pub fn spawn_compositor(
         .recv()
         .expect("compositor failed to send loop signal");
     let (vulkan_video_encode, vulkan_video_encode_av1) = caps_rx.recv().unwrap_or((false, false));
+    let (frame_clock_tx, frame_clock_rx) = mpsc::channel();
+    let frame_clock_requests = Arc::new(AtomicU32::new(0));
+    let frame_clock_thread = {
+        let command_tx = command_tx.clone();
+        let loop_signal = loop_signal.clone();
+        let requests = frame_clock_requests.clone();
+        let shutdown = shutdown.clone();
+        std::thread::Builder::new()
+            .name("compositor-frame-clock".into())
+            .spawn(move || {
+                run_frame_clock(frame_clock_rx, command_tx, loop_signal, requests, shutdown);
+            })
+            .expect("failed to spawn compositor frame clock")
+    };
 
     CompositorHandle {
         event_rx,
         command_tx,
         socket_name,
         thread,
+        frame_clock_thread,
+        frame_clock_tx,
+        frame_clock_requests,
         shutdown,
         vulkan_video_encode,
         vulkan_video_encode_av1,
@@ -8984,6 +9267,7 @@ fn run_compositor(
         toplevel_surface_ids: HashMap::new(),
         last_request_frame_ms: HashMap::new(),
         last_topless_frame_ms: HashMap::new(),
+        pending_request_frames: HashMap::new(),
         next_surface_id: 1,
         shm_pools: HashMap::new(),
         surface_meta: HashMap::new(),
@@ -9096,7 +9380,25 @@ fn run_compositor(
 
     while !shutdown.load(Ordering::Relaxed) {
         // Process commands.
+        let mut drained_wayland_before_frame = false;
         while let Ok(cmd) = command_rx.try_recv() {
+            // A client commonly queues its next wl_surface.frame request at
+            // the same time the server's display-rate tick wakes this loop.
+            // Dispatch already-readable Wayland requests before the first
+            // RequestFrame in the batch; otherwise the tick can observe no
+            // callback, then dispatch it immediately afterwards and leave it
+            // waiting for the following refresh interval.
+            if matches!(cmd, CompositorCommand::RequestFrame { .. })
+                && !drained_wayland_before_frame
+            {
+                if let Err(e) =
+                    event_loop.dispatch(Some(std::time::Duration::ZERO), &mut compositor)
+                    && verbose
+                {
+                    eprintln!("[compositor] pre-frame event loop error: {e}");
+                }
+                drained_wayland_before_frame = true;
+            }
             match cmd {
                 CompositorCommand::Shutdown => {
                     shutdown.store(true, Ordering::Relaxed);
@@ -9118,7 +9420,6 @@ fn run_compositor(
         } else {
             std::time::Duration::from_secs(1)
         };
-
         if let Err(e) = event_loop.dispatch(Some(poll_timeout), &mut compositor)
             && verbose
         {
@@ -9200,15 +9501,12 @@ fn run_compositor(
         {
             compositor.pending_recomposite_toplevels.remove(&sid);
             if let Some(root_id) = compositor.toplevel_surface_ids.get(&sid).cloned() {
-                // A full (pixel-publishing) recomposite exists to refill the
-                // server's pixel cache, so the native BGRA must actually be
-                // published — an NV12 OPAQUE_FD slot left by a departed
-                // client would otherwise suppress the readback and the
-                // recomposite would publish nothing at all.  Same on-demand
-                // ask the capture path makes.
-                if !encoder_only && let Some(ref mut vk) = compositor.vulkan_renderer {
-                    vk.request_native_bgra();
-                }
+                // A full recomposite must publish pixels, but it need not
+                // force the native CPU readback. Registered GPU/downscale
+                // targets publish their own result; when none is usable the
+                // renderer's native-readback plan falls back to BGRA. Keeping
+                // the explicit request here made every commit deferred behind
+                // an in-flight submit copy the full native frame to the CPU.
                 compositor.composite_toplevel_into_pending(&root_id, sid, encoder_only);
                 // Wake the loop so the retire path runs again
                 // promptly — without an explicit wakeup the loop
@@ -9268,11 +9566,11 @@ fn run_compositor(
 #[cfg(test)]
 mod tests {
     use super::{
-        PendingDamage, dir_is_chromium, next_surface_id_after, scan_free_surface_id,
-        shm_damage_rects,
+        FrameClockEntry, PendingDamage, consume_frame_clock_deadline, dir_is_chromium,
+        next_surface_id_after, scan_free_surface_id, shm_damage_rects, update_frame_clock,
     };
     use crate::vulkan_render::ShmDamageRect;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     /// A scratch directory that removes itself, so the marker test can
     /// stage an executable's neighbours without a temp-file dependency.
@@ -9339,6 +9637,30 @@ mod tests {
             scan_free_surface_id(u16::MAX, |id| taken.contains(&id)),
             Some(u16::MAX)
         );
+    }
+
+    #[test]
+    fn frame_clock_skips_missed_ticks_without_drifting() {
+        let base = std::time::Instant::now();
+        let interval = std::time::Duration::from_millis(8);
+        let mut deadline = base + interval;
+        let late = base + std::time::Duration::from_millis(21);
+
+        let presentation = consume_frame_clock_deadline(&mut deadline, late, interval);
+
+        assert_eq!(presentation, base + interval * 2);
+        assert_eq!(deadline, base + interval * 3);
+    }
+
+    #[test]
+    fn unchanged_frame_clock_update_preserves_phase() {
+        let interval = std::time::Duration::from_millis(8);
+        let next = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut clocks = HashMap::from([(1, FrameClockEntry { interval, next })]);
+
+        update_frame_clock(&mut clocks, 1, Some(interval));
+
+        assert_eq!(clocks[&1].next, next);
     }
 
     /// The whole point of the Option: a full space must refuse, not alias.

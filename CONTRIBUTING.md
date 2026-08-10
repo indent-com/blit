@@ -144,7 +144,7 @@ There is no `rustfmt.toml` or `.clippy.toml` — default rustfmt, prettier, and 
 | `build`        | One-shot `cargo build -p blit-cli --profile profiling`; restart to rebuild | n/a                   |
 | `browser-wasm` | Watches `crates/browser/src` + `crates/remote/src`, rebuilds WASM          | n/a                   |
 | `server`       | Runs `blit server`, auto-restarts when the binary changes                  | `/tmp/blit-dev.sock`  |
-| `gateway`      | Runs `blit gateway` (pass=`dev`), auto-restarts when binary changes        | `127.0.0.1:10001`     |
+| `gateway`      | Runs `blit gateway` with WebSocket + WebTransport (pass=`dev`)             | `127.0.0.1:10001`     |
 | `ui`           | Vite dev server for `js/ui/`                                               | `127.0.0.1:10000`     |
 | `website`      | Astro dev server for `js/website/`                                         | `127.0.0.1:10002`     |
 
@@ -164,13 +164,14 @@ DEV_INSTANCE=1 ./bin/dev   # second stack on 10005-10007
 
 `bin/dev` prints the concrete addresses on startup. `DEV_INSTANCE` is intentionally unprefixed: blit strips most `BLIT_*` variables from child terminals, but passes everything else through. This means `DEV_INSTANCE` propagates into nested shells so you always know which instance you're inside and can pick a different one. You can also override individual values:
 
-| Variable             | Default (instance 0) | Description                   |
-| -------------------- | -------------------- | ----------------------------- |
-| `DEV_INSTANCE`       | `0`                  | Instance number (0, 1, 2, …)  |
-| `BLIT_DEV_SOCK`      | `/tmp/blit-dev.sock` | blit server Unix socket       |
-| `BLIT_DEV_UI_PORT`   | `10000`              | Vite UI dev-server port       |
-| `BLIT_DEV_GW_PORT`   | `10001`              | blit gateway port             |
-| `BLIT_DEV_SITE_PORT` | `10002`              | Astro website dev-server port |
+| Variable             | Default (instance 0) | Description                                            |
+| -------------------- | -------------------- | ------------------------------------------------------ |
+| `DEV_INSTANCE`       | `0`                  | Instance number (0, 1, 2, …)                           |
+| `BLIT_DEV_SOCK`      | `/tmp/blit-dev.sock` | blit server Unix socket                                |
+| `BLIT_DEV_UI_PORT`   | `10000`              | Vite UI dev-server port                                |
+| `BLIT_DEV_GW_PORT`   | `10001`              | Gateway TCP + WebTransport UDP port                    |
+| `BLIT_DEV_WT_ADDR`   | `:10001`             | Browser-facing WebTransport `hostname:port` or `:port` |
+| `BLIT_DEV_SITE_PORT` | `10002`              | Astro website dev-server port                          |
 
 ## Project structure
 
@@ -291,7 +292,7 @@ Wayland app → compositor thread → CompositorEvent::SurfaceCommit
 - **AV1 (rav1e)** — software, handles odd dimensions. Capped at 3840x2160: rav1e has no limit of its own, but past 4K it stops keeping up.
 - **H.264 software (openh264 and/or x264)** — software fallback, max 3840x2160. Both are cargo features of `blit-server` (and `blit-cli`); default is `openh264` (MIT-friendly), release `-gpl` artifacts use `x264` (GPL-2.0-or-later, better compression). Build with neither and the software fallback is AV1-only.
 
-Hardware AV1 (NVENC, VA-API) goes to 8192x4352; everything else stops at 3840x2160. The ceiling is applied per viewer rather than per surface — `surface_encode_cap()` in `crates/server/src/lib.rs` resolves it from the backend that won the chain, and `mediated_size_for_surface()` composites for the widest ceiling across a surface's subscribers while `per_client_encode_target()` downscales into each viewer's own. A viewer's ceiling is also intersected with the decode size the client reports in `C2S_CLIENT_FEATURES`; clients that report nothing are held at 3840x2160.
+Hardware AV1 (NVENC, VA-API) goes to 8192x4352; everything else stops at 3840x2160. The ceiling is applied per viewer rather than per surface — `surface_encode_cap()` in `crates/server/src/lib.rs` resolves it from the backend that won the chain, and `mediated_size_for_surface()` translates each ceiling into compositor pixels at that viewer's requested scale before taking the widest across a surface's subscribers. This lets a sub-1× viewer drive a larger 1× source while `per_client_encode_target()` still downsamples into the viewer's smaller encoded frame. A viewer's ceiling is also intersected with the decode size the client reports in `C2S_CLIENT_FEATURES`; clients that report nothing are held at 3840x2160 encoded pixels.
 
 `BLIT_SURFACE_ENCODERS` is a comma-separated priority list. The server tries each in order and uses the first that succeeds. Default: `av1-vulkan,h264-vulkan,av1-nvenc,h264-nvenc,av1-vaapi,h264-vaapi,h264-software,av1-software` — the Vulkan Video tier is tried first because it encodes on the compositor's own device with no server-side encode at all; it applies only at native size and has no rate or speed control beyond a fixed QP, and where that or the driver's profile support does not stretch, the session is declined and the client falls through to the dedicated engines with its request intact (see `docs/server.md` for how that is decided, and for the two ways 4:4:4 can come back no). `BLIT_SURFACE_BANDWIDTH` (low/medium/high/ultra, or a raw AV1 quantizer 10-255) is the ceiling on the bit budget — adaptation is always on and only moves cheaper than what you set, and `BLIT_SURFACE_SPEED` (slow/medium/fast/realtime, or a raw 10-255) controls how much encoder time a frame may cost. `BLIT_VAAPI_DEVICE` selects the VA-API render node (default `/dev/dri/renderD128`). `BLIT_CUDA_DEVICE` selects the CUDA device ordinal for NVENC (default `0`).
 

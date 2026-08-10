@@ -94,6 +94,13 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 
 **Notes:**
 
+`SURFACE_RESIZE.scale_120` is the viewer's requested presentation scale in
+1/120th units: 60 = 0.5×, 120 = 1×, 240 = 2×, and 0 means unspecified
+(1×). It may carry the display's DPI-derived scale or an exact scale chosen
+independently of display DPI. Sub-1× values enlarge the surface's logical
+window while the compositor stays at Wayland's minimum 1× output scale; the
+viewer receives a downscaled stream at its requested physical size.
+
 `CREATE2` extends `CREATE` with a nonce for response correlation and optional fields gated by feature bits in the `features` byte:
 
 - Bit 0 (`HAS_SRC_PTY`): followed by `[src_pty_id:2]` — create the new PTY in the same working directory as `src_pty_id`.
@@ -351,7 +358,7 @@ Two complementary paths report a PTY's working directory:
 
 Clients that predate `TERM_CWD_EVENT` are unaffected: consistent with the version-stability rule above (new message types are added under new opcodes), both reference clients drop unrecognized S2C opcodes — `js/core`'s `BlitConnection.handleMessage` dispatch falls through to a no-op `default`, and the CLI's message matches end in a catch-all `_ => {}`.
 
-`S2C_SURFACE_FRAME` flags byte: bit 0 is the keyframe flag; bits 1–2 encode the codec — H.264 (0), AV1 (1), PNG (2). Remaining bits are reserved. `timestamp` is a monotonic millisecond counter captured at compositor-commit time (not wire-send time), so clients can drive video presentation and A/V sync off encode-time instead of network-delivery jitter.
+`S2C_SURFACE_FRAME` flags byte: bit 0 is the keyframe flag; bits 1–2 encode the codec — H.264 (0), AV1 (1), PNG (2). Bit 3 means a `[timestamp_sub_us:2]` field appears between the base header and encoded data. The base `timestamp` is a wrapping monotonic millisecond counter captured at compositor-commit time (not wire-send time); `timestamp_sub_us` is its 0–999 µs fractional part. The server only sends the extended layout when `C2S_CLIENT_FEATURES.client_features` bit 0 is set. Bits 4–7 remain reserved.
 
 Each `(client, surface)` pair runs at most one server-side encoder, sized from that client's view size — or from its scaled subscribe, which overrides it. Multiple mounts on the same client share one subscription, and the size sent on the wire is derived across them: any mount wanting the surface unscaled wins outright, otherwise the largest requested size does. (Shrinking a stream further is cheap; the reverse is lossy.) `S2C_SURFACE_FRAME` is broadcast to every subscribed client.
 

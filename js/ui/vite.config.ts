@@ -6,6 +6,7 @@ import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { brotliCompressSync, constants as zlibConstants } from "node:zlib";
 import { request as httpRequest } from "node:http";
+import { Socket } from "node:net";
 
 const wasmPath = resolve(
   __dirname,
@@ -82,6 +83,7 @@ export default bin.buffer;
     isDev && {
       name: "blit-dev-proxy",
       configureServer(server) {
+        const proxySockets = new Set<import("node:stream").Duplex>();
         const gwHost =
           process.env.VITE_BLIT_GATEWAY ||
           `localhost:${process.env.BLIT_DEV_GW_PORT || "3266"}`;
@@ -95,8 +97,13 @@ export default bin.buffer;
         function proxyWsToGateway(
           req: import("node:http").IncomingMessage,
           socket: import("node:stream").Duplex,
+          head: Buffer,
           gwPath: string,
         ) {
+          // This is a frame transport, not an HTTP bulk transfer. Do not let
+          // either local proxy leg wait for a delayed ACK before forwarding a
+          // completed WebSocket message.
+          if (socket instanceof Socket) socket.setNoDelay(true);
           const proxyReq = httpRequest({
             hostname: gwHostname,
             port: parseInt(gwPort),
@@ -105,6 +112,28 @@ export default bin.buffer;
             headers: req.headers,
           });
           proxyReq.on("upgrade", (_res, proxySocket, proxyHead) => {
+            // Both legs are loopback sockets carrying latency-sensitive
+            // protocol messages. Make the intent explicit rather than
+            // inheriting a Node version's Nagle default.
+            if ("setNoDelay" in socket) socket.setNoDelay(true);
+            proxySocket.setNoDelay(true);
+
+            const closeBoth = () => {
+              proxySockets.delete(socket);
+              proxySockets.delete(proxySocket);
+              socket.destroy();
+              proxySocket.destroy();
+            };
+            // pipe() does not consume stream errors. A client reload used to
+            // turn a routine EPIPE into an uncaught exception that restarted
+            // the whole Vite process, pausing every other connection too.
+            socket.on("error", closeBoth);
+            proxySocket.on("error", closeBoth);
+            socket.on("close", closeBoth);
+            proxySocket.on("close", closeBoth);
+            proxySockets.add(socket);
+            proxySockets.add(proxySocket);
+
             socket.write(
               "HTTP/1.1 101 Switching Protocols\r\n" +
                 "Upgrade: websocket\r\n" +
@@ -116,6 +145,9 @@ export default bin.buffer;
                 "\r\n",
             );
             if (proxyHead.length) socket.write(proxyHead);
+            // Bytes following the browser's upgrade headers belong to the
+            // WebSocket stream and must be forwarded to the gateway.
+            if (head.length) proxySocket.write(head);
             proxySocket.pipe(socket);
             socket.pipe(proxySocket);
           });
@@ -123,7 +155,11 @@ export default bin.buffer;
           proxyReq.end();
         }
 
-        server.httpServer?.on("upgrade", (req, socket, head) => {
+        const onUpgrade = (
+          req: import("node:http").IncomingMessage,
+          socket: import("node:stream").Duplex,
+          head: Buffer,
+        ) => {
           const path = req.url || "/";
 
           // Let Vite handle its own WS connections (HMR, etc.).
@@ -132,7 +168,13 @@ export default bin.buffer;
           if (url.searchParams.has("token")) return;
 
           // Blit WebSocket connections (config sync, /d/… transport) → gateway.
-          proxyWsToGateway(req, socket, path);
+          proxyWsToGateway(req, socket, head, path);
+        };
+        server.httpServer?.on("upgrade", onUpgrade);
+        server.httpServer?.once("close", () => {
+          server.httpServer?.off("upgrade", onUpgrade);
+          for (const socket of proxySockets) socket.destroy();
+          proxySockets.clear();
         });
       },
     },

@@ -26,6 +26,7 @@ import type { IdeSession, IdeCommitRow } from "./session";
 import { layoutGraph, type GraphRow, type GraphLayoutState } from "./git-graph";
 import { fillTileDrag, startTileDrag, startTouchDrag } from "./tileDrag";
 import { collectRefPills, RefPills, type RefPill } from "./refPills";
+import { msUntilNextSecond, relativeTime } from "./relativeTime";
 
 const LANE_W = 6;
 const NODE_R = 2;
@@ -46,16 +47,6 @@ function initials(name: string): string {
   }
   if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
   return (words[0][0] + words[words.length - 1][0]).toUpperCase();
-}
-
-function relTime(seconds: bigint, nowSec: number): string {
-  let d = nowSec - Number(seconds);
-  if (d < 0) d = 0;
-  if (d < 60) return `${d}s`;
-  if (d < 3600) return `${Math.floor(d / 60)}m`;
-  if (d < 86400) return `${Math.floor(d / 3600)}h`;
-  if (d < 86400 * 30) return `${Math.floor(d / 86400)}d`;
-  return `${Math.floor(d / (86400 * 30))}mo`;
 }
 
 /** ISO-8601 to the second, e.g. 2026-07-24T03:59:02Z. */
@@ -83,24 +74,24 @@ export function LogPanel(props: {
     return s.logLoaded() ? "No commits." : "Loading…";
   };
 
-  // Tick so relative timestamps advance on their own. Coarse (the rendered
-  // strings are minute-grained soon after a commit lands) and paused while
-  // the document is hidden; becoming visible refreshes immediately.
+  // Tick on Unix-second boundaries so new commits count 1s, 2s, 3s without
+  // drift. Pause while hidden; becoming visible refreshes immediately.
   const [now, setNow] = createSignal(Math.floor(Date.now() / 1000));
-  const TICK_MS = 30_000;
-  let tickTimer: ReturnType<typeof setInterval> | null = null;
+  let tickTimer: ReturnType<typeof setTimeout> | null = null;
   const stopTick = () => {
     if (tickTimer != null) {
-      clearInterval(tickTimer);
+      clearTimeout(tickTimer);
       tickTimer = null;
     }
   };
   const startTick = () => {
-    if (tickTimer == null)
-      tickTimer = setInterval(
-        () => setNow(Math.floor(Date.now() / 1000)),
-        TICK_MS,
-      );
+    if (tickTimer != null) return;
+    const nowMs = Date.now();
+    tickTimer = setTimeout(() => {
+      tickTimer = null;
+      setNow(Math.floor(Date.now() / 1000));
+      startTick();
+    }, msUntilNextSecond(nowMs));
   };
   const onVisibility = () => {
     if (document.hidden) stopTick();
@@ -387,7 +378,7 @@ export function LogPanel(props: {
           "font-variant-numeric": "tabular-nums",
         }}
       >
-        {absTimes().has(c.oid) ? isoTime(c.time) : relTime(c.time, now())}
+        {absTimes().has(c.oid) ? isoTime(c.time) : relativeTime(c.time, now())}
       </span>
       <span
         style={{

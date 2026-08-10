@@ -249,7 +249,8 @@ pub const C2S_SURFACE_POINTER: u8 = 0x21;
 /// source, so no `wl_pointer.axis_source` is emitted.
 pub const C2S_SURFACE_POINTER_AXIS: u8 = 0x22;
 /// Resize a Wayland surface: [0x23][surface_id:2][width:2][height:2][scale_120:2]
-/// scale_120: device pixel ratio in 1/120th units (120 = 1×, 240 = 2×).
+/// scale_120: requested presentation scale in 1/120th units
+/// (60 = 0.5×, 120 = 1×, 240 = 2×; 0 = unspecified/1×).
 pub const C2S_SURFACE_RESIZE: u8 = 0x23;
 /// Set keyboard/pointer focus to a Wayland surface: [0x24][surface_id:2]
 pub const C2S_SURFACE_FOCUS: u8 = 0x24;
@@ -532,7 +533,10 @@ pub const S2C_SURFACE_CREATED: u8 = 0x20;
 pub const S2C_SURFACE_DESTROYED: u8 = 0x21;
 /// An encoded video frame for a Wayland surface:
 /// [0x22][surface_id:2][timestamp:4][flags:1][width:2][height:2][data:N]
-/// flags: bit 0 = keyframe, bits 1-2 = codec (0 = H.264, 1 = AV1).
+/// With `SURFACE_FRAME_FLAG_TIMESTAMP_SUB_US`:
+/// [0x22][surface_id:2][timestamp:4][flags:1][width:2][height:2][sub_us:2][data:N]
+/// flags: bit 0 = keyframe, bits 1-2 = codec (0 = H.264, 1 = AV1),
+/// bit 3 = sub-millisecond timestamp field present.
 /// timestamp: milliseconds since compositor session start.
 pub const S2C_SURFACE_FRAME: u8 = 0x22;
 /// A Wayland surface's title changed: [0x23][surface_id:2][title:N]
@@ -549,9 +553,9 @@ pub const S2C_SURFACE_TITLE: u8 = 0x23;
 /// `mediated_size_for_surface`), so a 1x viewer that assumes physical ==
 /// logical draws a 3x window three times too large.
 ///
-/// A viewer should present the surface at `logical * its own DPR` device
-/// pixels, capped to its pane, so the window looks the same size on every
-/// screen watching it.  Older servers omit the pair; treat it as absent
+/// A viewer should present the surface at `logical * its requested scale`
+/// device pixels, capped to its pane. In the default relative mode that scale
+/// includes its DPR. Older servers omit the pair; treat it as absent
 /// (not as 0x0) and fall back to filling the pane.
 pub const S2C_SURFACE_RESIZED: u8 = 0x24;
 /// A Wayland surface's app_id changed: [0x28][surface_id:2][app_id:N]
@@ -671,6 +675,10 @@ pub const SURFACE_FRAME_CODEC_MASK: u8 = 0b110;
 pub const SURFACE_FRAME_CODEC_H264: u8 = 0 << 1;
 pub const SURFACE_FRAME_CODEC_AV1: u8 = 1 << 1;
 pub const SURFACE_FRAME_CODEC_PNG: u8 = 2 << 1;
+pub const SURFACE_FRAME_FLAG_TIMESTAMP_SUB_US: u8 = 1 << 3;
+
+/// Optional byte 6 of `C2S_CLIENT_FEATURES`.
+pub const CLIENT_FEATURE_SURFACE_TIMESTAMP_SUB_US: u8 = 1 << 0;
 
 /// Bitmask for client-supported codecs in C2S_CLIENT_FEATURES and
 /// C2S_SURFACE_SUBSCRIBE.  0 means "accept anything".
@@ -2140,6 +2148,7 @@ pub enum ServerMsg<'a> {
     SurfaceFrame {
         surface_id: u16,
         timestamp: u32,
+        timestamp_sub_us: Option<u16>,
         flags: u8,
         width: u16,
         height: u16,
@@ -2469,13 +2478,21 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             if data.len() < 12 {
                 return None;
             }
+            let flags = data[7];
+            let has_sub_us = flags & SURFACE_FRAME_FLAG_TIMESTAMP_SUB_US != 0;
+            if has_sub_us && data.len() < 14 {
+                return None;
+            }
             Some(ServerMsg::SurfaceFrame {
                 surface_id: u16::from_le_bytes([data[1], data[2]]),
                 timestamp: u32::from_le_bytes([data[3], data[4], data[5], data[6]]),
-                flags: data[7],
+                timestamp_sub_us: has_sub_us.then(|| u16::from_le_bytes([data[12], data[13]])),
+                flags,
                 width: u16::from_le_bytes([data[8], data[9]]),
                 height: u16::from_le_bytes([data[10], data[11]]),
-                data: data.get(12..).unwrap_or_default(),
+                data: data
+                    .get(if has_sub_us { 14.. } else { 12.. })
+                    .unwrap_or_default(),
             })
         }
         S2C_SURFACE_TITLE => {
@@ -3135,6 +3152,27 @@ pub fn msg_surface_frame(
     msg
 }
 
+pub fn msg_surface_frame_precise(
+    surface_id: u16,
+    timestamp: u32,
+    timestamp_sub_us: u16,
+    flags: u8,
+    width: u16,
+    height: u16,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(14 + data.len());
+    msg.push(S2C_SURFACE_FRAME);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(&timestamp.to_le_bytes());
+    msg.push(flags | SURFACE_FRAME_FLAG_TIMESTAMP_SUB_US);
+    msg.extend_from_slice(&width.to_le_bytes());
+    msg.extend_from_slice(&height.to_le_bytes());
+    msg.extend_from_slice(&timestamp_sub_us.min(999).to_le_bytes());
+    msg.extend_from_slice(data);
+    msg
+}
+
 pub fn msg_surface_title(surface_id: u16, title: &str) -> Vec<u8> {
     let title_bytes = title.as_bytes();
     let mut msg = Vec::with_capacity(3 + title_bytes.len());
@@ -3311,9 +3349,10 @@ pub fn parse_surface_pointer_axis2(data: &[u8]) -> Option<PointerAxisEvent> {
     })
 }
 
-/// `scale_120` is the device-pixel-ratio in 1/120th units, matching
-/// Wayland's `fractional_scale_v1` convention: 120 = 1×, 180 = 1.5×,
-/// 240 = 2×.  A value of 0 means "unspecified" (server defaults to 1×).
+/// `scale_120` is the requested presentation scale in 1/120th units:
+/// 60 = 0.5×, 120 = 1×, 180 = 1.5×, 240 = 2×. A value of 0 means
+/// "unspecified" (server defaults to 1×). Values below 120 zoom out by
+/// enlarging the logical window at Wayland's 1× output floor.
 pub fn msg_surface_resize(surface_id: u16, width: u16, height: u16, scale_120: u16) -> Vec<u8> {
     let mut msg = Vec::with_capacity(9);
     msg.push(C2S_SURFACE_RESIZE);
@@ -6247,7 +6286,7 @@ mod tests {
     /// The physical/logical split is the whole point of the message: a 1x
     /// viewer needs the logical half to know it is watching a 400x300
     /// window, not a 1200x900 one, and must not have to guess it from its
-    /// own DPR — which is exactly the DPR the surface was *not* sized at.
+    /// own scale — which is exactly the scale the surface was *not* sized at.
     #[test]
     fn surface_resized_carries_the_logical_size() {
         let msg = msg_surface_resized(7, 1200, 900, 400, 300);
@@ -6283,6 +6322,24 @@ mod tests {
                 assert_eq!(logical, None);
             }
             other => panic!("expected SurfaceResized, got {}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn precise_surface_timestamp_uses_one_flag_bit_and_a_u16_field() {
+        let msg = msg_surface_frame_precise(7, 123, 987, SURFACE_FRAME_CODEC_AV1, 8, 9, &[4, 5]);
+        match parse_server_msg(&msg) {
+            Some(ServerMsg::SurfaceFrame {
+                timestamp_sub_us,
+                flags,
+                data,
+                ..
+            }) => {
+                assert_eq!(timestamp_sub_us, Some(987));
+                assert_eq!(flags & SURFACE_FRAME_FLAG_TIMESTAMP_SUB_US, 1 << 3);
+                assert_eq!(data, &[4, 5]);
+            }
+            _ => panic!("expected surface frame"),
         }
     }
 }

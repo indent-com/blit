@@ -38,8 +38,16 @@ export type SessionId = string;
  * Implementations handle the underlying protocol (WebSocket, WebTransport, etc.)
  * while consumers only deal with binary messages and status changes.
  */
+/** Binary transport payload. Multiplexed transports use a borrowed
+ * Uint8Array view so stripping their channel prefix does not copy every video
+ * frame. Listeners must consume or copy the view synchronously. */
+export type BlitTransportMessage = ArrayBuffer | Uint8Array;
+/** Backward-compatible name retained for transports compiled against the
+ * pre-view API. */
+export type BlitTransportData = BlitTransportMessage;
+
 export type BlitTransportEventMap = {
-  message: ArrayBuffer;
+  message: BlitTransportMessage;
   statuschange: ConnectionStatus;
 };
 
@@ -74,7 +82,7 @@ export interface BlitTransport {
   /** Register a listener for transport events. */
   addEventListener(
     type: "message",
-    listener: (data: ArrayBuffer) => void,
+    listener: (data: BlitTransportMessage) => void,
   ): void;
   addEventListener(
     type: "statuschange",
@@ -83,7 +91,7 @@ export interface BlitTransport {
   /** Remove a previously registered listener. */
   removeEventListener(
     type: "message",
-    listener: (data: ArrayBuffer) => void,
+    listener: (data: BlitTransportMessage) => void,
   ): void;
   removeEventListener(
     type: "statuschange",
@@ -376,6 +384,11 @@ export const SURFACE_FRAME_CODEC_MASK = 0b110;
 export const SURFACE_FRAME_CODEC_H264 = 0 << 1;
 export const SURFACE_FRAME_CODEC_AV1 = 1 << 1;
 export const SURFACE_FRAME_CODEC_PNG = 2 << 1;
+/** A u16 microseconds-within-the-ms field follows the base frame header. */
+export const SURFACE_FRAME_FLAG_TIMESTAMP_SUB_US = 1 << 3;
+
+/** Optional byte 6 of C2S_CLIENT_FEATURES. */
+export const CLIENT_FEATURE_SURFACE_TIMESTAMP_SUB_US = 1 << 0;
 
 /** Bitmask for client-supported codecs in C2S_SURFACE_RESIZE / C2S_SURFACE_SUBSCRIBE. 0 = accept anything. */
 export const CODEC_SUPPORT_H264 = 1 << 0;

@@ -36,6 +36,7 @@ const VULKAN_ENCODE_FAILURE_LIMIT: u32 = 12;
 const MAX_REUSABLE_SHM_TEXTURES: usize = 16;
 const SHM_DAMAGE_HISTORY_LIMIT: usize = 64;
 const MAX_SHM_DAMAGE_RECTS: usize = 32;
+const OUTPUT_IMAGE_CACHE_LIMIT: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ShmDamageRect {
@@ -112,7 +113,7 @@ struct ShmUploadCounters {
     full_commits: u64,
     damaged_pixels: u64,
     total_pixels: u64,
-    cpu_copied_bytes: u64,
+    staged_copy_bytes: u64,
     imported_commits: u64,
 }
 
@@ -254,12 +255,9 @@ pub(crate) struct VulkanRenderer {
     has_video_encode_av1: bool,
     /// Whether the device supports DMA-BUF import/export extensions.
     has_dmabuf: bool,
-    /// Set by an on-demand consumer (capture) to make the next retire
-    /// publish the native BGRA even when an NV12 OPAQUE_FD target would
-    /// otherwise claim that key.  The staging copy happens every frame
-    /// regardless; what this re-enables is the `to_vec` that publishes it,
-    /// which is one of the two per-frame full-surface copies the
-    /// zero-copy path exists to avoid paying when nobody wants CPU pixels.
+    /// Set by an on-demand consumer (capture) to make the next submission
+    /// stage and publish the native BGRA even when a GPU target would
+    /// otherwise make the readback unnecessary.
     publish_native_bgra_once: bool,
     has_external_memory_fd: bool,
     external_memory_host_fn: Option<ash::ext::external_memory_host::Device>,
@@ -287,9 +285,15 @@ pub(crate) struct VulkanRenderer {
     compute_image_pipeline_layout: vk::PipelineLayout,
     compute_image_descriptor_set_layout: vk::DescriptorSetLayout,
 
-    // Output images (triple-buffered)
+    // Active output images (double-buffered) plus recently used size sets.
+    // Multiple surfaces are rendered through one VulkanRenderer; keeping only
+    // the last size would recreate NVIDIA images and mappings every time the
+    // compositor alternated between differently sized surfaces.
     output_images: Vec<OutputImage>,
     output_idx: usize,
+    output_image_cache: HashMap<(u32, u32), (Vec<OutputImage>, usize)>,
+    output_image_cache_switches: u64,
+    output_image_cache_hits: u64,
 
     // Per-frame temporary textures (SHM uploads) — freed at start of next frame.
     frame_textures: Vec<TempTexture>,
@@ -590,6 +594,10 @@ fn full_shm_damage(key: ShmTextureKey) -> ShmDamageRect {
     }
 }
 
+fn is_full_shm_damage(damage: &[ShmDamageRect], key: ShmTextureKey) -> bool {
+    damage.len() == 1 && damage[0] == full_shm_damage(key)
+}
+
 fn damage_rects_touch(a: ShmDamageRect, b: ShmDamageRect) -> bool {
     let ar = a.x as u64 + a.width as u64;
     let ab = a.y as u64 + a.height as u64;
@@ -692,6 +700,10 @@ struct PendingSubmit {
     /// Native (compositor) frame size — the size we composited at.
     phys_w: u32,
     phys_h: u32,
+    /// What to publish for the native composite once this submission's
+    /// fence signals. `Readback` means this command buffer copied the
+    /// native image to its staging buffer.
+    native_readback: NativeReadback,
     /// Surface id used to look up downscale outputs at retire time.
     surface_id: u32,
     /// Per-target sizes whose downscale staging buffers contain valid
@@ -721,6 +733,42 @@ struct PendingSubmit {
         wayland_server::protocol::wl_buffer::WlBuffer,
         Option<crate::drm_syncobj::SyncPoint>,
     )>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeReadback {
+    /// A registered target publishes this frame without native CPU pixels.
+    Skip,
+    /// Publish a commit for encoder/bootstrap bookkeeping, without pixels.
+    GpuOnly,
+    /// Copy the native staging buffer to CPU memory after the fence signals.
+    Readback { encoder_skip: bool },
+}
+
+fn native_readback_plan(
+    requested: bool,
+    has_native_cpu_target: bool,
+    has_other_target: bool,
+    gpu_encoder_owns_surface: bool,
+) -> NativeReadback {
+    if requested || has_native_cpu_target {
+        NativeReadback::Readback {
+            // An on-demand capture over a GPU-only stream belongs in the
+            // pixel cache, not in that stream's encoder input.
+            encoder_skip: !has_native_cpu_target,
+        }
+    } else if has_other_target {
+        NativeReadback::Skip
+    } else if gpu_encoder_owns_surface {
+        NativeReadback::GpuOnly
+    } else {
+        // Bootstrap pixels are what let the server select and create its
+        // first encoder target. Publishing GpuOnly here makes the server ask
+        // for a recomposite, which publishes GpuOnly again forever.
+        NativeReadback::Readback {
+            encoder_skip: false,
+        }
+    }
 }
 
 unsafe impl Send for VulkanRenderer {}
@@ -924,7 +972,14 @@ impl VulkanRenderer {
             .collect();
         let physical_properties =
             unsafe { instance.get_physical_device_properties(physical_device) };
-        let external_host_enabled = std::env::var_os("BLIT_DISABLE_EXTERNAL_MEMORY_HOST").is_none();
+        // NVIDIA accepts ordinary wl_shm mappings through
+        // VK_EXT_external_memory_host, but currently shadows the entire
+        // allocation with a CPU memmove before every transfer. That is much
+        // slower than copying damaged rows into our cached staging buffer, so
+        // keep this path available for driver experiments without enabling it
+        // by default.
+        let external_host_enabled = std::env::var_os("BLIT_ENABLE_EXTERNAL_MEMORY_HOST").is_some()
+            && std::env::var_os("BLIT_DISABLE_EXTERNAL_MEMORY_HOST").is_none();
         let has_external_memory_host = physical_properties.vendor_id == 0x10de
             && external_host_enabled
             && ext_names_all.contains(&ash::ext::external_memory_host::NAME);
@@ -1620,6 +1675,9 @@ impl VulkanRenderer {
             compute_image_descriptor_set_layout,
             output_images: Vec::new(),
             output_idx: 0,
+            output_image_cache: HashMap::new(),
+            output_image_cache_switches: 0,
+            output_image_cache_hits: 0,
             frame_textures: Vec::new(),
             pending_submit: None,
             recycled_tracking_fences: Vec::new(),
@@ -1897,10 +1955,11 @@ impl VulkanRenderer {
             return None;
         }
         let type_bits = requirements.memory_type_bits & host_properties.memory_type_bits;
-        let Some(memory_type) = self.find_memory_type(
-            type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ) else {
+        // Prefer ordinary cached system memory when the imported pointer can
+        // be represented by more than one compatible Vulkan memory type.
+        // This does not guarantee zero-copy, but avoids selecting a
+        // write-combined host type merely because it has the lowest index.
+        let Some(memory_type) = self.find_readback_memory_type(type_bits) else {
             eprintln!(
                 "[shm-host-import] no coherent memory type buffer_bits=0x{:x} host_bits=0x{:x}",
                 requirements.memory_type_bits, host_properties.memory_type_bits,
@@ -1972,10 +2031,11 @@ impl VulkanRenderer {
         self.has_dmabuf
     }
 
-    /// Ask the next retire to publish the native BGRA even if an NV12
-    /// OPAQUE_FD target would otherwise claim that key.  For consumers that
-    /// need CPU pixels and can say so — `surface capture` — rather than
-    /// keeping the readback published every frame on the chance one comes.
+    /// Ask the next submission to stage and publish the native BGRA even if
+    /// a GPU target would otherwise make the readback unnecessary. For
+    /// consumers that need CPU pixels and can say so — `surface capture` —
+    /// rather than keeping the readback live every frame on the chance one
+    /// comes.
     pub(crate) fn request_native_bgra(&mut self) {
         self.publish_native_bgra_once = true;
     }
@@ -2158,6 +2218,27 @@ impl VulkanRenderer {
                 );
                 false
             }
+        }
+    }
+
+    /// Retarget one client's pre-encode pacing without rebuilding the
+    /// Vulkan Video session.  Reset the phase so both increases and decreases
+    /// take effect from this command rather than inheriting a deadline from
+    /// the old cadence.
+    pub(crate) fn set_vulkan_encoder_interval(
+        &mut self,
+        surface_id: u32,
+        client_id: u64,
+        min_interval_us: u32,
+    ) {
+        if self.vulkan_encoders.contains_key(&(surface_id, client_id)) {
+            self.vulkan_encoder_pacing.insert(
+                (surface_id, client_id),
+                (
+                    std::time::Duration::from_micros(min_interval_us as u64),
+                    None,
+                ),
+            );
         }
     }
 
@@ -3039,15 +3120,50 @@ impl VulkanRenderer {
             let _ = self.retire_pending(pending);
             self.free_frame_textures();
         }
-        // Destroy old.
-        self.destroy_output_images();
-        // Double-buffered: one being rendered to, one being read back.
-        for _ in 0..2 {
-            if let Some(img) = self.create_output_image(w, h) {
-                self.output_images.push(img);
+        if let Some(current) = self.output_images.first() {
+            let key = (current.width, current.height);
+            let images = std::mem::take(&mut self.output_images);
+            let index = std::mem::replace(&mut self.output_idx, 0);
+            if let Some((replaced, _)) = self.output_image_cache.insert(key, (images, index)) {
+                self.destroy_output_image_set(replaced);
             }
         }
-        self.output_idx = 0;
+
+        self.output_image_cache_switches += 1;
+        if let Some((images, index)) = self.output_image_cache.remove(&(w, h)) {
+            self.output_image_cache_hits += 1;
+            self.output_idx = index % images.len().max(1);
+            self.output_images = images;
+        } else {
+            // Double-buffered: one being rendered to, one being read back.
+            for _ in 0..2 {
+                if let Some(img) = self.create_output_image(w, h) {
+                    self.output_images.push(img);
+                }
+            }
+            self.output_idx = 0;
+        }
+
+        while self.output_image_cache.len() > OUTPUT_IMAGE_CACHE_LIMIT {
+            let Some(key) = self.output_image_cache.keys().next().copied() else {
+                break;
+            };
+            if let Some((images, _)) = self.output_image_cache.remove(&key) {
+                self.destroy_output_image_set(images);
+            }
+        }
+        if self.output_image_cache_switches <= 10
+            || self.output_image_cache_switches.is_multiple_of(1000)
+        {
+            eprintln!(
+                "[output-cache] switches={} hits={} cached={} active={}x{}",
+                self.output_image_cache_switches,
+                self.output_image_cache_hits,
+                self.output_image_cache.len(),
+                w,
+                h,
+            );
+        }
     }
 
     fn destroy_nv12_vec(&mut self, nv12s: Vec<Nv12Output>) {
@@ -4757,8 +4873,8 @@ impl VulkanRenderer {
         })
     }
 
-    fn destroy_output_images(&mut self) {
-        for img in self.output_images.drain(..) {
+    fn destroy_output_image_set(&self, images: Vec<OutputImage>) {
+        for img in images {
             unsafe {
                 self.device.destroy_framebuffer(img.framebuffer, None);
                 self.device.destroy_image_view(img.view, None);
@@ -4768,6 +4884,23 @@ impl VulkanRenderer {
                 self.device.destroy_image(img.image, None);
                 self.device.free_memory(img.memory, None);
             }
+        }
+    }
+
+    fn destroy_output_images(&mut self) {
+        let images = std::mem::take(&mut self.output_images);
+        self.destroy_output_image_set(images);
+    }
+
+    fn destroy_cached_output_images(&mut self) {
+        self.destroy_output_images();
+        let cached: Vec<Vec<OutputImage>> = self
+            .output_image_cache
+            .drain()
+            .map(|(_, (images, _))| images)
+            .collect();
+        for images in cached {
+            self.destroy_output_image_set(images);
         }
     }
 
@@ -5062,7 +5195,14 @@ impl VulkanRenderer {
             }
         };
 
-        let try_external_host = self.external_memory_host_fn.is_some()
+        let full_upload = is_full_shm_damage(&copy_damage, key);
+        // VK_EXT_external_memory_host guarantees access to the imported
+        // pointer, not that the driver will access it without copying. NVIDIA
+        // currently copies the whole imported allocation before a transfer,
+        // so importing a small-damage frame amplifies a small row copy into a
+        // full-surface copy. Keep the import path for full uploads only.
+        let try_external_host = full_upload
+            && self.external_memory_host_fn.is_some()
             && !self.shm_host_import_failures.contains(buffer_id);
         let external_host = try_external_host
             .then(|| self.external_host_buffer(buffer_id, pool_fd, mmap.len(), needed))
@@ -5114,11 +5254,10 @@ impl VulkanRenderer {
             .sum();
         let total_pixels = width as u64 * height as u64;
         self.shm_upload_counters.commits += 1;
-        self.shm_upload_counters.full_commits +=
-            u64::from(copy_damage.len() == 1 && copy_damage[0] == full_shm_damage(key));
+        self.shm_upload_counters.full_commits += u64::from(full_upload);
         self.shm_upload_counters.damaged_pixels += damaged_pixels;
         self.shm_upload_counters.total_pixels += total_pixels;
-        self.shm_upload_counters.cpu_copied_bytes += if result == ShmUploadResult::Staged {
+        self.shm_upload_counters.staged_copy_bytes += if result == ShmUploadResult::Staged {
             damaged_pixels.saturating_mul(4)
         } else {
             0
@@ -5134,13 +5273,13 @@ impl VulkanRenderer {
                 counters.damaged_pixels as f64 * 100.0 / counters.total_pixels as f64
             };
             eprintln!(
-                "[shm-upload] commits={} imported={} full={} damaged={}/{} ({pct:.1}%) cpu_copy={} MiB",
+                "[shm-upload] commits={} imported={} full={} damaged={}/{} ({pct:.1}%) staged_copy={} MiB",
                 counters.commits,
                 counters.imported_commits,
                 counters.full_commits,
                 counters.damaged_pixels,
                 counters.total_pixels,
-                counters.cpu_copied_bytes / (1024 * 1024),
+                counters.staged_copy_bytes / (1024 * 1024),
             );
         }
         if let Some(old) = self
@@ -6243,11 +6382,26 @@ impl VulkanRenderer {
     }
 
     pub fn would_defer_submit(&self) -> bool {
-        // The main loop retires completed work before draining deferred
-        // recomposites. A commit that arrives while a submit is still held
-        // can therefore defer unconditionally; probing the same fence here
-        // only duplicates the loop's Vulkan ioctl, once per client commit.
-        self.pending_submit.is_some()
+        // A Wayland commit can arrive after the GPU fence signalled and
+        // before the main loop's retirement poll ran. Treating the mere
+        // presence of `pending_submit` as busy coalesces that serviceable
+        // commit. At 240 Hz those misses are systematic. Probe without
+        // waiting; when complete, `render_tree_sized` immediately retires
+        // the same fence and submits this commit. An unsignalled fence still
+        // takes the existing deferred path, including its buffer hold.
+        let Some(pending) = self.pending_submit.as_ref() else {
+            return false;
+        };
+        let raw = unsafe {
+            (self.device.fp_v1_0().wait_for_fences)(
+                self.device.handle(),
+                1,
+                [pending.fence].as_ptr(),
+                vk::TRUE,
+                0,
+            )
+        };
+        raw != vk::Result::SUCCESS
     }
 
     /// Non-blocking check: if the previous GPU submission has completed,
@@ -6344,108 +6498,48 @@ impl VulkanRenderer {
         }
         let mut results: Vec<(u32, u32, PixelData, bool)> = Vec::new();
 
-        // Native BGRA from the self-alloc output_image staging buffer.
-        if pending.self_output_idx < self.output_images.len() {
-            let img = &self.output_images[pending.self_output_idx];
-            if img.width != pending.phys_w || img.height != pending.phys_h {
-                // Output images were recreated (resize) between submit
-                // and retire — the staging buffer we'd read has been
-                // freed.  Drop this frame.
-                eprintln!(
-                    "[retire_pending] output image size mismatch: pending={}x{} current={}x{} (resize during flight)",
-                    pending.phys_w, pending.phys_h, img.width, img.height,
-                );
-            } else {
-                // Widen before multiplying, matching the allocation in
-                // `create_output_image`. Both used to wrap the same way, so
-                // the read stayed in bounds by coincidence rather than by
-                // construction.
-                // An NV12 OPAQUE_FD target at the composite size has
-                // already published this frame under the same key, from
-                // the GPU, without a readback. Publishing BGRA on top
-                // would overwrite it a tick later and put NVENC straight
-                // back on the copy this path exists to remove — and the
-                // `to_vec()` right below is one of the two copies.
-                //
-                // Unless something wants CPU pixels right now. `surface
-                // capture` asks on demand, and the staging buffer is
-                // filled every frame regardless, so the pixels are already
-                // sitting there — only the copy that publishes them is
-                // skipped. That one BGRA frame must still not reach the
-                // encoder: it would go through NVENC's own ARGB
-                // conversion, whose rounding (and possibly matrix)
-                // differs from the zero-copy shader's, so splicing it
-                // into the NV12 stream shifts the picture for one frame —
-                // and the re-encode of an identical frame is waste
-                // besides.  Mark it encoder_skip so the server feeds it
-                // to the pixel cache but not to any encoder.
-                let wanted_now = std::mem::take(&mut self.publish_native_bgra_once);
-                let zero_copy_live = self
-                    .nv12_opaque_slot(pending.surface_id, pending.phys_w, pending.phys_h)
-                    .is_some();
-                if !wanted_now && zero_copy_live {
-                    // fall through to cleanup
-                } else if !wanted_now
-                    && self.vulkan_video_owns(pending.surface_id)
-                    && !self.downscale_outputs.contains_key(&(
-                        pending.surface_id,
-                        pending.phys_w,
-                        pending.phys_h,
-                    ))
-                {
-                    // A Vulkan Video encoder owns this surface and no
-                    // server-side encoder registered a target at the
-                    // composite size, so nothing downstream reads CPU
-                    // pixels — the encoder works from the GPU image. Copying
-                    // the staging buffer here moved `phys_w * phys_h * 4`
-                    // per frame (8.29 MB at 1080p, ~500 MB/s at 60fps) into
-                    // a Vec that was dropped unread.
-                    //
-                    // Publish the commit without the pixels rather than
-                    // publishing nothing: the server drives sizes, its
-                    // generation counter, and the `last_pixels` entry that
-                    // gates encoder creation off `SurfaceCommit`, so a
-                    // surface that skipped the publish entirely would never
-                    // be given an encoder at all — no commit, no encoder, no
-                    // target, no commit.
-                    //
-                    // Both conditions are re-checked every frame, so a
-                    // subscriber that later needs CPU pixels restores the
-                    // BGRA publish on the next composite by registering its
-                    // target; `wanted_now` covers `surface capture` asking
-                    // on demand.
-                    //
-                    // `encoder_skip` for the same reason the zero-copy arm
-                    // sets it: this frame exists to carry the commit, and
-                    // there are no pixels behind it for an encoder to read.
-                    results.push((pending.phys_w, pending.phys_h, PixelData::GpuOnly, true));
+        // The submission decided whether CPU pixels were needed before
+        // command recording. Retirement therefore never reads an unstaged
+        // buffer, and target changes while the GPU is busy cannot alter the
+        // decision for this frame.
+        match pending.native_readback {
+            NativeReadback::Skip => {}
+            NativeReadback::GpuOnly => {
+                results.push((pending.phys_w, pending.phys_h, PixelData::GpuOnly, true));
+            }
+            NativeReadback::Readback { encoder_skip } => {
+                let output_len = self.output_images.len();
+                if let Some(img) = self.output_images.get_mut(pending.self_output_idx) {
+                    if img.width != pending.phys_w || img.height != pending.phys_h {
+                        eprintln!(
+                            "[retire_pending] output image size mismatch: pending={}x{} current={}x{} (resize during flight)",
+                            pending.phys_w, pending.phys_h, img.width, img.height,
+                        );
+                    } else {
+                        // Widen before multiplying, matching the allocation
+                        // in `create_output_image`.
+                        let size = pending.phys_w as usize * pending.phys_h as usize * 4;
+                        let mut bgra = pooled_pixel_buf(&mut img.pixel_pool, size);
+                        Arc::get_mut(&mut bgra)
+                            .expect("pooled_pixel_buf returns a uniquely owned buffer")
+                            .extend_from_slice(unsafe {
+                                std::slice::from_raw_parts(img.staging_ptr, size)
+                            });
+                        pool_pixel_buf(&mut img.pixel_pool, &bgra);
+                        results.push((
+                            pending.phys_w,
+                            pending.phys_h,
+                            PixelData::Bgra(bgra),
+                            encoder_skip,
+                        ));
+                    }
                 } else {
-                    let size = pending.phys_w as usize * pending.phys_h as usize * 4;
-                    // Re-borrow mutably: the `img` above is a shared
-                    // borrow still live in the arms that call `&self`
-                    // methods; this arm runs after those.
-                    let img = &mut self.output_images[pending.self_output_idx];
-                    let mut bgra = pooled_pixel_buf(&mut img.pixel_pool, size);
-                    Arc::get_mut(&mut bgra)
-                        .expect("pooled_pixel_buf returns a uniquely owned buffer")
-                        .extend_from_slice(unsafe {
-                            std::slice::from_raw_parts(img.staging_ptr, size)
-                        });
-                    pool_pixel_buf(&mut img.pixel_pool, &bgra);
-                    results.push((
-                        pending.phys_w,
-                        pending.phys_h,
-                        PixelData::Bgra(bgra),
-                        zero_copy_live,
-                    ));
+                    eprintln!(
+                        "[retire_pending] self_output_idx {} out of range (len={output_len})",
+                        pending.self_output_idx,
+                    );
                 }
             }
-        } else {
-            eprintln!(
-                "[retire_pending] self_output_idx {} out of range (len={})",
-                pending.self_output_idx,
-                self.output_images.len(),
-            );
         }
 
         // Per-downscale-target BGRA — server-allocated targets that the
@@ -6729,10 +6823,8 @@ impl VulkanRenderer {
         // GPU-blit (LINEAR) the native frame into each per-target
         // external buffer for the per-client encoders, then dispatch
         // the BGRA→NV12 compute against the resized BGRA copy.  A
-        // staging readback of the native frame always runs so callers
-        // that want plain BGRA at native (e.g. CPU encoders, the
-        // Capture command) get pixels even when no external target is
-        // registered.
+        // staging readback of the native frame runs only when a native CPU
+        // target or an on-demand capture needs it.
         let sid = toplevel_sid as u32;
 
         // Forget what a target was sized against once the target itself is
@@ -6850,6 +6942,20 @@ impl VulkanRenderer {
             })
             .map(|&(_, w, h)| (w, h))
             .collect();
+
+        // A CPU encoder registered at native size consumes the native
+        // staging buffer directly; every other registered target publishes
+        // its own GPU or target-sized result. Decide before recording so a
+        // GPU-only frame never schedules the image-to-staging transfer.
+        let native_key = (sid, phys_w, phys_h);
+        let has_native_cpu_target = self.downscale_outputs.contains_key(&native_key)
+            && self.nv12_opaque_slot(sid, phys_w, phys_h).is_none();
+        let native_readback = native_readback_plan(
+            self.publish_native_bgra_once,
+            has_native_cpu_target,
+            !external_targets.is_empty() || !downscale_targets.is_empty(),
+            self.vulkan_video_owns(sid),
+        );
 
         // Self-allocated native output image — always present.
         self.ensure_output_images(phys_w, phys_h);
@@ -7529,35 +7635,35 @@ impl VulkanRenderer {
             }
         }
 
-        // Always copy the native composite into the staging buffer for
-        // CPU readback.  Out_image is in TRANSFER_SRC_OPTIMAL after the
-        // render pass — we never transitioned it (the blits above use
-        // it as a source) so the copy can run directly.
-        let region = vk::BufferImageCopy {
-            buffer_offset: 0,
-            buffer_row_length: 0,
-            buffer_image_height: 0,
-            image_subresource: vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
-            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-            image_extent: vk::Extent3D {
-                width: phys_w,
-                height: phys_h,
-                depth: 1,
-            },
-        };
-        unsafe {
-            self.device.cmd_copy_image_to_buffer(
-                cb,
-                out_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                out_staging_buf,
-                &[region],
-            );
+        // Out_image is in TRANSFER_SRC_OPTIMAL after the render pass. Only
+        // transfer it to host-visible memory when retirement will read it.
+        if matches!(native_readback, NativeReadback::Readback { .. }) {
+            let region = vk::BufferImageCopy {
+                buffer_offset: 0,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                image_extent: vk::Extent3D {
+                    width: phys_w,
+                    height: phys_h,
+                    depth: 1,
+                },
+            };
+            unsafe {
+                self.device.cmd_copy_image_to_buffer(
+                    cb,
+                    out_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    out_staging_buf,
+                    &[region],
+                );
+            }
         }
 
         // Fill our own NV12 encode image from the native composite, for
@@ -7776,6 +7882,12 @@ impl VulkanRenderer {
                 }
             }
         }
+        // A successful submission containing the requested staging copy now
+        // owns the one-shot request. A rejected submit leaves it armed for
+        // the next frame.
+        if matches!(native_readback, NativeReadback::Readback { .. }) {
+            self.publish_native_bgra_once = false;
+        }
         let fence = tracking_fence;
 
         // Vulkan Video encode (compositor-resident, native size only).  One
@@ -7982,6 +8094,7 @@ impl VulkanRenderer {
             self_output_idx,
             phys_w,
             phys_h,
+            native_readback,
             surface_id: sid,
             downscale_targets: staging_targets,
             toplevel_sid,
@@ -8293,7 +8406,7 @@ impl Drop for VulkanRenderer {
                     .free_command_buffers(self.command_pool, &self.recycled_command_buffers);
                 self.recycled_command_buffers.clear();
             }
-            self.destroy_output_images();
+            self.destroy_cached_output_images();
             // Destroy Vulkan Video encoders.
             for (_, mut enc) in self.vulkan_encoders.drain() {
                 if let Some(ref vfns) = self.video_fns {
@@ -8389,8 +8502,9 @@ impl Drop for VulkanRenderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        ShmDamageFrame, ShmDamageRect, ShmTextureKey, clamped_scissor, coalesce_shm_damage,
-        page_rounded_len, shm_damage_since,
+        NativeReadback, ShmDamageFrame, ShmDamageRect, ShmTextureKey, clamped_scissor,
+        coalesce_shm_damage, is_full_shm_damage, native_readback_plan, page_rounded_len,
+        shm_damage_since,
     };
     use ash::vk;
     use std::collections::VecDeque;
@@ -8496,6 +8610,29 @@ mod tests {
     }
 
     #[test]
+    fn host_import_is_reserved_for_full_surface_damage() {
+        assert!(is_full_shm_damage(
+            &[ShmDamageRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+            }],
+            shm_key(),
+        ));
+        assert!(!is_full_shm_damage(
+            &[ShmDamageRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 40,
+            }],
+            shm_key(),
+        ));
+        assert!(!is_full_shm_damage(&[], shm_key()));
+    }
+
+    #[test]
     fn ring_texture_replays_every_missed_damage_generation() {
         let frames = VecDeque::from([
             ShmDamageFrame {
@@ -8549,5 +8686,49 @@ mod tests {
     fn host_import_may_use_the_remainder_of_the_files_last_page() {
         assert_eq!(page_rounded_len(160_000, 4096), Some(163_840));
         assert_eq!(page_rounded_len(163_840, 4096), Some(163_840));
+    }
+
+    #[test]
+    fn gpu_target_skips_native_readback() {
+        assert_eq!(
+            native_readback_plan(false, false, true, false),
+            NativeReadback::Skip,
+        );
+    }
+
+    #[test]
+    fn native_cpu_target_reads_back_for_the_encoder() {
+        assert_eq!(
+            native_readback_plan(false, true, true, false),
+            NativeReadback::Readback {
+                encoder_skip: false,
+            },
+        );
+    }
+
+    #[test]
+    fn on_demand_readback_does_not_enter_a_gpu_only_encoder() {
+        assert_eq!(
+            native_readback_plan(true, false, true, true),
+            NativeReadback::Readback { encoder_skip: true },
+        );
+    }
+
+    #[test]
+    fn a_surface_without_targets_reads_back_bootstrap_pixels() {
+        assert_eq!(
+            native_readback_plan(false, false, false, false),
+            NativeReadback::Readback {
+                encoder_skip: false,
+            },
+        );
+    }
+
+    #[test]
+    fn a_gpu_owned_surface_without_other_targets_skips_cpu_pixels() {
+        assert_eq!(
+            native_readback_plan(false, false, false, true),
+            NativeReadback::GpuOnly,
+        );
     }
 }

@@ -3,18 +3,23 @@ import { WebTransportTransport } from "../transports/webtransport";
 
 class MockReader {
   private readonly chunks: Uint8Array[];
+  private readonly eof: boolean;
   private index = 0;
 
-  constructor(chunks: Uint8Array[]) {
+  constructor(chunks: Uint8Array[], eof = false) {
     this.chunks = chunks;
+    this.eof = eof;
   }
 
   async read(): Promise<ReadableStreamReadResult<Uint8Array>> {
     if (this.index >= this.chunks.length) {
-      return { done: true, value: undefined };
+      if (this.eof) return { done: true, value: undefined };
+      return new Promise(() => {});
     }
     return { done: false, value: this.chunks[this.index++] };
   }
+
+  releaseLock() {}
 }
 
 class MockWriter {
@@ -27,7 +32,7 @@ class MockWriter {
 
 class MockWebTransport {
   static instances: MockWebTransport[] = [];
-  static queuedChunks: Uint8Array[][] = [];
+  static queuedConnections: { chunks: Uint8Array[]; eof: boolean }[] = [];
 
   readonly writer = new MockWriter();
   readonly reader: MockReader;
@@ -35,12 +40,20 @@ class MockWebTransport {
   readonly closed = new Promise<void>(() => {});
 
   constructor(_url: string, _opts?: WebTransportOptions) {
-    this.reader = new MockReader(MockWebTransport.queuedChunks.shift() ?? []);
+    const queued = MockWebTransport.queuedConnections.shift() ?? {
+      chunks: [],
+      eof: false,
+    };
+    this.reader = new MockReader(queued.chunks, queued.eof);
     MockWebTransport.instances.push(this);
   }
 
   static queueConnection(...chunks: Uint8Array[]) {
-    MockWebTransport.queuedChunks.push(chunks);
+    MockWebTransport.queuedConnections.push({ chunks, eof: false });
+  }
+
+  static queueEofConnection(...chunks: Uint8Array[]) {
+    MockWebTransport.queuedConnections.push({ chunks, eof: true });
   }
 
   async createBidirectionalStream() {
@@ -73,11 +86,12 @@ function frame(payload: Uint8Array): Uint8Array {
 describe("WebTransportTransport", () => {
   beforeEach(() => {
     MockWebTransport.instances = [];
-    MockWebTransport.queuedChunks = [];
+    MockWebTransport.queuedConnections = [];
     vi.stubGlobal("WebTransport", MockWebTransport);
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -197,6 +211,28 @@ describe("WebTransportTransport", () => {
     expect(transport.authRejected).toBe(false);
     expect(transport.lastError).toBeNull();
     expect(transport.status).toBe("connected");
+  });
+
+  it("reconnects when the receive stream ends before wt.closed", async () => {
+    vi.useFakeTimers();
+    MockWebTransport.queueEofConnection(new Uint8Array([1]));
+    const transport = new WebTransportTransport(
+      "https://example.test",
+      "secret",
+      { reconnectDelay: 20 },
+    );
+
+    transport.connect();
+    await flushPromises();
+
+    expect(transport.status).toBe("disconnected");
+    expect(transport.lastError).toBe("WebTransport receive stream closed");
+
+    vi.advanceTimersByTime(20);
+    await flushPromises();
+    expect(MockWebTransport.instances).toHaveLength(2);
+
+    transport.close();
   });
 
   it("uses configurable connectTimeoutMs", async () => {

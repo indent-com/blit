@@ -1,6 +1,6 @@
 import { WebPaneNav } from "./WebPaneNav";
 import type { WebPaneHandle } from "./WebPane";
-import { Show, For, type JSX } from "solid-js";
+import { Show, For, createMemo, type JSX } from "solid-js";
 import { onMount, onCleanup } from "solid-js";
 import type {
   BlitSession,
@@ -8,11 +8,16 @@ import type {
   BlitConnectionSnapshot,
   ConnectionStatus,
   TerminalPalette,
-  SurfaceFrameSample,
+  SurfaceFrameHistory,
+  NumberRing,
   LinkHover,
 } from "@blit-sh/core";
 import { formatBw } from "./createMetrics";
-import type { Metrics, RenderSample, NetSample } from "./createMetrics";
+import type {
+  Metrics,
+  RenderSampleRing,
+  NetSampleRing,
+} from "./createMetrics";
 import {
   sessionName,
   sessionPrefix,
@@ -41,11 +46,12 @@ type SurfaceDebugInfo = {
   encoder: string;
   width: number;
   height: number;
-  frameSamples: SurfaceFrameSample[];
-  outputSamples: readonly number[];
+  frameSamples: SurfaceFrameHistory;
+  outputSamples: NumberRing;
   dropped: number;
   errors: number;
   queueDepth: number;
+  clockRttMs: number | null;
 };
 
 type DebugStats = {
@@ -110,8 +116,8 @@ export function StatusBar(props: {
     retarget: (url: string) => void;
   } | null;
   debugStats: DebugStats;
-  timeline: RenderSample[];
-  net: NetSample[];
+  timeline: RenderSampleRing;
+  net: NetSampleRing;
   onSwitcher: () => void;
   onPalette: () => void;
   onFont: () => void;
@@ -990,8 +996,8 @@ function DebugPanel(props: {
   debugStats: DebugStats;
   palette: TerminalPalette;
   fontSize: number;
-  timeline: RenderSample[];
-  net: NetSample[];
+  timeline: RenderSampleRing;
+  net: NetSampleRing;
   focusedSurfaceId: number | null;
 }) {
   const stats = () =>
@@ -1022,20 +1028,109 @@ function DebugPanel(props: {
 
   /** Count samples whose timestamp falls within the last `windowMs`. */
   const countRecent = (
-    samples: readonly number[] | SurfaceFrameSample[],
+    samples: { length: number; time(index: number): number },
     windowMs: number,
   ): number => {
     const cutoff = performance.now() - windowMs;
     let n = 0;
     for (let i = samples.length - 1; i >= 0; i--) {
-      const t =
-        typeof samples[i] === "number"
-          ? (samples[i] as number)
-          : (samples[i] as SurfaceFrameSample).t;
-      if (t < cutoff) break;
+      if (samples.time(i) < cutoff) break;
       n++;
     }
     return n;
+  };
+
+  /** Capture cadence derived from source PTS, independent of bursty recv. */
+  const sourceFps = (samples: SurfaceFrameHistory): number => {
+    if (samples.length < 2) return 0;
+    const last = samples.length - 1;
+    if (performance.now() - samples.time(last) > 1000) return 0;
+    let first = samples.length - 1;
+    while (first > 0 && samples.sourceDelta(last, first - 1) <= 1000) {
+      first--;
+    }
+    const span = samples.sourceDelta(last, first);
+    if (span <= 0) return 0;
+    return Math.round(((samples.length - first - 1) * 1000) / span);
+  };
+
+  const recentMaxGaps = (
+    samples: SurfaceFrameHistory,
+    windowMs: number,
+  ): { src: number; recv: number } => {
+    const cutoff = performance.now() - windowMs;
+    let first = samples.length - 1;
+    while (first > 0 && samples.time(first - 1) >= cutoff) first--;
+    let src = 0;
+    let recv = 0;
+    for (let i = Math.max(1, first); i < samples.length; i++) {
+      recv = Math.max(recv, samples.time(i) - samples.time(i - 1));
+      const sourceGap = samples.sourceDelta(i, i - 1);
+      if (sourceGap >= 0) src = Math.max(src, sourceGap);
+    }
+    return { src, recv };
+  };
+
+  let latencyScratch = new Float64Array(512);
+  const percentile = (
+    samples: SurfaceFrameHistory,
+    cutoff: number,
+    metric: "source" | "decode" | "present" | "e2e",
+    p: number,
+  ): number => {
+    if (samples.length > latencyScratch.length)
+      latencyScratch = new Float64Array(samples.length);
+    let count = 0;
+    for (let i = 0; i < samples.length; i++) {
+      if (samples.time(i) < cutoff || !Number.isFinite(samples.e2eMs(i)))
+        continue;
+      let value: number;
+      switch (metric) {
+        case "source":
+          value = samples.sourceToRecvMs(i);
+          break;
+        case "decode":
+          value = samples.decodeMs(i);
+          break;
+        case "present":
+          value = samples.presentMs(i);
+          break;
+        case "e2e":
+          value = samples.e2eMs(i);
+          break;
+      }
+      latencyScratch[count++] = Number.isFinite(value) ? value : 0;
+    }
+    if (count === 0) return 0;
+    latencyScratch.fill(Infinity, count);
+    latencyScratch.sort();
+    return latencyScratch[Math.min(count - 1, Math.floor(p * count))];
+  };
+
+  const surfaceLatency = (surf: SurfaceDebugInfo, displayFps: number) => {
+    const cutoff = performance.now() - 2000;
+    const samples = surf.frameSamples;
+    let completed = 0;
+    for (let i = samples.length - 1; i >= 0; i--) {
+      if (samples.time(i) < cutoff) break;
+      if (Number.isFinite(samples.e2eMs(i))) completed++;
+    }
+    if (completed === 0) return null;
+    const srcRecv = percentile(samples, cutoff, "source", 0.5);
+    const net = Math.min(srcRecv, (surf.clockRttMs ?? 0) / 2);
+    // rAF/paint-to-photons is not observable for a canvas. Half a refresh
+    // is the expected wait to scanout; expose it as an estimate rather than
+    // silently calling canvas submission end-to-end.
+    const display = displayFps > 0 ? 500 / displayFps : 0;
+    return {
+      p50: percentile(samples, cutoff, "e2e", 0.5) + display,
+      p95: percentile(samples, cutoff, "e2e", 0.95) + display,
+      host: Math.max(0, srcRecv - net),
+      net,
+      decode: percentile(samples, cutoff, "decode", 0.5),
+      present: percentile(samples, cutoff, "present", 0.5),
+      display,
+    };
   };
 
   const graphSeparator = (): JSX.CSSProperties => ({
@@ -1050,9 +1145,7 @@ function DebugPanel(props: {
         position: "fixed",
         top: 0,
         right: 0,
-        "background-color": rgba(props.palette.bg, dark() ? 0.78 : 0.84),
-        "backdrop-filter": "blur(6px)",
-        "-webkit-backdrop-filter": "blur(6px)",
+        "background-color": rgba(props.palette.bg, dark() ? 0.94 : 0.96),
         color: theme().fg,
         "border-left": `1px solid ${theme().subtleBorder}`,
         "border-bottom": `1px solid ${theme().subtleBorder}`,
@@ -1067,8 +1160,8 @@ function DebugPanel(props: {
     >
       {/* ── Common rows (always visible) ── */}
       <Row
-        label="FPS / UPS"
-        value={`${props.metrics.fps} / ${props.metrics.ups}`}
+        label="Terminal renders"
+        value={`${props.metrics.fps}/s (${props.metrics.ups} updates/s)`}
       />
       <Row label="Bandwidth" value={formatBw(props.metrics.bw)} />
       <Row
@@ -1083,8 +1176,13 @@ function DebugPanel(props: {
       {/* ── Surface-focused section ── */}
       <Show when={focusedSurf()} keyed>
         {(surf) => {
+          const srcFps = () => sourceFps(surf.frameSamples);
           const recvFps = () => countRecent(surf.frameSamples, 1000);
           const outFps = () => countRecent(surf.outputSamples, 1000);
+          const gaps = createMemo(() => recentMaxGaps(surf.frameSamples, 2000));
+          const latency = createMemo(() =>
+            surfaceLatency(surf, stats().displayFps),
+          );
           return (
             <>
               <div
@@ -1108,8 +1206,35 @@ function DebugPanel(props: {
               />
               <Row
                 label="Frames"
-                value={`${recvFps()} recv/s, ${outFps()} out/s`}
+                value={`${srcFps()} src/s, ${recvFps()} recv/s, ${outFps()} out/s`}
               />
+              <Row
+                label="Max gap"
+                value={`${gaps().src.toFixed(1)} ms src, ${gaps().recv.toFixed(1)} ms recv`}
+              />
+              <Show
+                when={latency()}
+                fallback={<Row label="E2E latency" value="syncing…" />}
+              >
+                {(value) => (
+                  <>
+                    <Row
+                      label="E2E latency"
+                      value={`${value().p50.toFixed(1)} ms p50 est, ${value().p95.toFixed(1)} ms p95`}
+                    />
+                    <Row
+                      label="Breakdown"
+                      value={`${value().host.toFixed(1)} host + ~${value().net.toFixed(1)} net + ${value().decode.toFixed(1)} decode + ${value().present.toFixed(1)} present + ~${value().display.toFixed(1)} display ms`}
+                    />
+                  </>
+                )}
+              </Show>
+              <Show when={surf.clockRttMs !== null}>
+                <Row
+                  label="Clock"
+                  value={`${surf.clockRttMs?.toFixed(1)} ms RTT, ±${((surf.clockRttMs ?? 0) / 2).toFixed(1)} ms est`}
+                />
+              </Show>
               <Row label="Dropped" value={surf.dropped} />
               <Row label="Errors" value={surf.errors} />
               <Row label="Queue" value={`${surf.queueDepth} decode`} />
@@ -1184,6 +1309,7 @@ function DebugPanel(props: {
 function Row(props: { label: string; value: string | number }) {
   return (
     <div
+      data-debug-label={props.label}
       style={{
         display: "flex",
         "justify-content": "space-between",
@@ -1196,39 +1322,48 @@ function Row(props: { label: string; value: string | number }) {
   );
 }
 
+// Debug canvases are observability tools, not part of presentation. Drawing
+// them at display refresh (240–480 Hz on the machines they diagnose) made the
+// profiler itself the largest source of missed frames. 20 Hz keeps a 2-second
+// timeline readable while leaving the video rAF path alone.
+const DEBUG_GRAPH_INTERVAL_MS = 50;
+
 function RenderTimeline(props: {
-  timeline: RenderSample[];
+  timeline: RenderSampleRing;
   palette: TerminalPalette;
   displayFps: number;
   fontSize: number;
 }) {
   let canvas!: HTMLCanvasElement;
-  let raf = 0;
+  let timer: ReturnType<typeof setInterval> | undefined;
   const W = 300;
   const H = 80;
   const dpr = typeof devicePixelRatio !== "undefined" ? devicePixelRatio : 1;
+  const pixelW = Math.max(1, Math.ceil(W * dpr));
+  const columnMaxMs = new Float32Array(pixelW);
 
   onMount(() => {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
     const draw = () => {
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
       ctx.clearRect(0, 0, W * dpr, H * dpr);
 
       const samples = props.timeline;
-      if (!samples || samples.length < 2) {
-        raf = requestAnimationFrame(draw);
-        return;
-      }
+      if (!samples || samples.length < 2) return;
 
       const fg = props.palette.fg;
       const success = props.palette.ansi[2] ?? props.palette.fg;
       const warning = props.palette.ansi[3] ?? props.palette.fg;
       const error = props.palette.ansi[1] ?? props.palette.fg;
+      const successFill = rgba(success, 0.82);
+      const warningFill = rgba(warning, 0.82);
+      const errorFill = rgba(error, 0.82);
 
       const now = performance.now();
       const windowMs = 2000;
       const maxMs = 20;
       const budgetMs = props.displayFps > 0 ? 1000 / props.displayFps : 16.67;
+      columnMaxMs.fill(0);
 
       ctx.strokeStyle = rgba(error, 0.45);
       ctx.lineWidth = dpr;
@@ -1238,18 +1373,29 @@ function RenderTimeline(props: {
       ctx.lineTo(W * dpr, budgetY);
       ctx.stroke();
 
-      for (const sample of samples) {
-        const age = now - sample.t;
+      for (let i = 0; i < samples.length; i++) {
+        const sampleT = samples.time(i);
+        const sampleMs = samples.duration(i);
+        const age = now - sampleT;
         if (age > windowMs || age < 0) continue;
-        const x = ((windowMs - age) / windowMs) * W * dpr;
-        const barH = Math.min(sample.ms / maxMs, 1) * H * dpr;
+        const x = Math.min(
+          pixelW - 1,
+          Math.floor(((windowMs - age) / windowMs) * pixelW),
+        );
+        columnMaxMs[x] = Math.max(columnMaxMs[x], sampleMs);
+      }
+      // Hundreds of high-rate samples land on the same 300 CSS pixels.
+      // Collapse them before touching Canvas2D; drawing every sample made the
+      // diagnostics overlay create the stalls it was meant to measure.
+      for (let x = 0; x < pixelW; x++) {
+        const sampleMs = columnMaxMs[x];
+        if (sampleMs <= 0) continue;
+        const barH = Math.min(sampleMs / maxMs, 1) * H * dpr;
         const y = H * dpr - barH;
-
-        if (sample.ms < budgetMs) ctx.fillStyle = rgba(success, 0.82);
-        else if (sample.ms < budgetMs * 2) ctx.fillStyle = rgba(warning, 0.82);
-        else ctx.fillStyle = rgba(error, 0.82);
-
-        ctx.fillRect(x, y, Math.max(1, dpr), barH);
+        if (sampleMs < budgetMs) ctx.fillStyle = successFill;
+        else if (sampleMs < budgetMs * 2) ctx.fillStyle = warningFill;
+        else ctx.fillStyle = errorFill;
+        ctx.fillRect(x, y, 1, barH);
       }
 
       ctx.fillStyle = rgba(fg, 0.45);
@@ -1265,17 +1411,18 @@ function RenderTimeline(props: {
       ctx.textAlign = "left";
       ctx.textBaseline = "bottom";
       ctx.fillText("0ms", 2 * dpr, H * dpr - 2 * dpr);
-
-      raf = requestAnimationFrame(draw);
     };
-    raf = requestAnimationFrame(draw);
-    onCleanup(() => cancelAnimationFrame(raf));
+    draw();
+    timer = setInterval(draw, DEBUG_GRAPH_INTERVAL_MS);
+    onCleanup(() => {
+      if (timer !== undefined) clearInterval(timer);
+    });
   });
 
   return (
     <canvas
       ref={canvas}
-      width={W * dpr}
+      width={pixelW}
       height={H * dpr}
       style={{ width: `${W}px`, height: `${H}px`, "margin-top": "2px" }}
     />
@@ -1283,40 +1430,52 @@ function RenderTimeline(props: {
 }
 
 function NetTimeline(props: {
-  net: NetSample[];
+  net: NetSampleRing;
   palette: TerminalPalette;
   fontSize: number;
 }) {
   let canvas!: HTMLCanvasElement;
-  let raf = 0;
+  let timer: ReturnType<typeof setInterval> | undefined;
   const W = 300;
   const H = 50;
   const dpr = typeof devicePixelRatio !== "undefined" ? devicePixelRatio : 1;
+  const pixelW = Math.max(1, Math.ceil(W * dpr));
+  const rxColumns = new Uint32Array(pixelW);
+  const txColumns = new Uint32Array(pixelW);
 
   onMount(() => {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
     const draw = () => {
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
       ctx.clearRect(0, 0, W * dpr, H * dpr);
 
       const samples = props.net;
-      if (!samples || samples.length === 0) {
-        raf = requestAnimationFrame(draw);
-        return;
-      }
+      if (!samples || samples.length === 0) return;
 
       const fg = props.palette.fg;
       const rx =
         props.palette.ansi[12] ?? props.palette.ansi[6] ?? props.palette.fg;
       const tx =
         props.palette.ansi[11] ?? props.palette.ansi[3] ?? props.palette.fg;
+      const rxFill = rgba(rx, 0.82);
+      const txFill = rgba(tx, 0.82);
 
       const now = performance.now();
       const windowMs = 2000;
       let maxBytes = 256;
-      for (const sample of samples) {
-        if (now - sample.t <= windowMs)
-          maxBytes = Math.max(maxBytes, sample.bytes);
+      rxColumns.fill(0);
+      txColumns.fill(0);
+      for (let i = 0; i < samples.length; i++) {
+        const age = now - samples.time(i);
+        if (age > windowMs || age < 0) continue;
+        const bytes = samples.bytes(i);
+        maxBytes = Math.max(maxBytes, bytes);
+        const x = Math.min(
+          pixelW - 1,
+          Math.floor(((windowMs - age) / windowMs) * pixelW),
+        );
+        const columns = samples.isRx(i) ? rxColumns : txColumns;
+        columns[x] = Math.max(columns[x], bytes);
       }
 
       const midY = (H * dpr) / 2;
@@ -1328,14 +1487,19 @@ function NetTimeline(props: {
       ctx.lineTo(W * dpr, midY);
       ctx.stroke();
 
-      for (const sample of samples) {
-        const age = now - sample.t;
-        if (age > windowMs || age < 0) continue;
-        const x = ((windowMs - age) / windowMs) * W * dpr;
-        const barH = Math.min(sample.bytes / maxBytes, 1) * (H * dpr * 0.45);
-        const y = sample.dir === "rx" ? midY - barH : midY;
-        ctx.fillStyle = sample.dir === "rx" ? rgba(rx, 0.82) : rgba(tx, 0.82);
-        ctx.fillRect(x, y, Math.max(1, dpr), barH);
+      for (let x = 0; x < pixelW; x++) {
+        const rxBytes = rxColumns[x];
+        if (rxBytes > 0) {
+          const barH = Math.min(rxBytes / maxBytes, 1) * (H * dpr * 0.45);
+          ctx.fillStyle = rxFill;
+          ctx.fillRect(x, midY - barH, 1, barH);
+        }
+        const txBytes = txColumns[x];
+        if (txBytes > 0) {
+          const barH = Math.min(txBytes / maxBytes, 1) * (H * dpr * 0.45);
+          ctx.fillStyle = txFill;
+          ctx.fillRect(x, midY, 1, barH);
+        }
       }
 
       ctx.fillStyle = rgba(fg, 0.45);
@@ -1345,17 +1509,18 @@ function NetTimeline(props: {
       ctx.textBaseline = "bottom";
       ctx.fillText("rx", 2 * dpr, midY - 2 * dpr);
       ctx.fillText("tx", 2 * dpr, H * dpr - 2 * dpr);
-
-      raf = requestAnimationFrame(draw);
     };
-    raf = requestAnimationFrame(draw);
-    onCleanup(() => cancelAnimationFrame(raf));
+    draw();
+    timer = setInterval(draw, DEBUG_GRAPH_INTERVAL_MS);
+    onCleanup(() => {
+      if (timer !== undefined) clearInterval(timer);
+    });
   });
 
   return (
     <canvas
       ref={canvas}
-      width={W * dpr}
+      width={pixelW}
       height={H * dpr}
       style={{ width: `${W}px`, height: `${H}px`, "margin-top": "2px" }}
     />
@@ -1368,53 +1533,63 @@ function NetTimeline(props: {
  * are drawn in a distinct accent colour.
  */
 function SurfaceTimeline(props: {
-  samples: SurfaceFrameSample[];
+  samples: SurfaceFrameHistory;
   palette: TerminalPalette;
   fontSize: number;
 }) {
   let canvas!: HTMLCanvasElement;
-  let raf = 0;
+  let timer: ReturnType<typeof setInterval> | undefined;
   const W = 300;
   const H = 60;
   const dpr = typeof devicePixelRatio !== "undefined" ? devicePixelRatio : 1;
+  const pixelW = Math.max(1, Math.ceil(W * dpr));
+  const byteColumns = new Uint32Array(pixelW);
+  const keyColumns = new Uint8Array(pixelW);
 
   onMount(() => {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
     const draw = () => {
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
       ctx.clearRect(0, 0, W * dpr, H * dpr);
 
       const samples = props.samples;
-      if (!samples || samples.length === 0) {
-        raf = requestAnimationFrame(draw);
-        return;
-      }
+      if (!samples || samples.length === 0) return;
 
       const fg = props.palette.fg;
       // Delta frames: green (ansi 2); keyframes: blue/cyan (ansi 4 / 12).
       const deltaColor = props.palette.ansi[2] ?? props.palette.fg;
       const keyColor =
         props.palette.ansi[4] ?? props.palette.ansi[12] ?? props.palette.fg;
+      const deltaFill = rgba(deltaColor, 0.7);
+      const keyFill = rgba(keyColor, 0.9);
 
       const now = performance.now();
       const windowMs = 2000;
       let maxBytes = 1024; // minimum scale: 1 KB
-      for (const sample of samples) {
-        if (now - sample.t <= windowMs)
-          maxBytes = Math.max(maxBytes, sample.bytes);
+      byteColumns.fill(0);
+      keyColumns.fill(0);
+      for (let i = 0; i < samples.length; i++) {
+        const age = now - samples.time(i);
+        if (age > windowMs || age < 0) continue;
+        const bytes = samples.bytes(i);
+        maxBytes = Math.max(maxBytes, bytes);
+        const x = Math.min(
+          pixelW - 1,
+          Math.floor(((windowMs - age) / windowMs) * pixelW),
+        );
+        if (bytes >= byteColumns[x]) {
+          byteColumns[x] = bytes;
+          keyColumns[x] = samples.isKey(i) ? 1 : 0;
+        }
       }
 
-      for (const sample of samples) {
-        const age = now - sample.t;
-        if (age > windowMs || age < 0) continue;
-        const x = ((windowMs - age) / windowMs) * W * dpr;
-        const barH = Math.min(sample.bytes / maxBytes, 1) * H * dpr * 0.9;
+      for (let x = 0; x < pixelW; x++) {
+        const bytes = byteColumns[x];
+        if (bytes === 0) continue;
+        const barH = Math.min(bytes / maxBytes, 1) * H * dpr * 0.9;
         const y = H * dpr - barH;
-
-        ctx.fillStyle = sample.key
-          ? rgba(keyColor, 0.9)
-          : rgba(deltaColor, 0.7);
-        ctx.fillRect(x, y, Math.max(1, dpr), barH);
+        ctx.fillStyle = keyColumns[x] ? keyFill : deltaFill;
+        ctx.fillRect(x, y, 1, barH);
       }
 
       // Labels
@@ -1428,22 +1603,23 @@ function SurfaceTimeline(props: {
       // Legend (right-aligned)
       ctx.textAlign = "right";
       ctx.textBaseline = "top";
-      ctx.fillStyle = rgba(keyColor, 0.9);
+      ctx.fillStyle = keyFill;
       ctx.fillText("key", (W - 2) * dpr, 2 * dpr);
-      ctx.fillStyle = rgba(deltaColor, 0.7);
+      ctx.fillStyle = deltaFill;
       ctx.fillText("delta", (W - 30) * dpr, 2 * dpr);
       ctx.textAlign = "left";
-
-      raf = requestAnimationFrame(draw);
     };
-    raf = requestAnimationFrame(draw);
-    onCleanup(() => cancelAnimationFrame(raf));
+    draw();
+    timer = setInterval(draw, DEBUG_GRAPH_INTERVAL_MS);
+    onCleanup(() => {
+      if (timer !== undefined) clearInterval(timer);
+    });
   });
 
   return (
     <canvas
       ref={canvas}
-      width={W * dpr}
+      width={pixelW}
       height={H * dpr}
       style={{ width: `${W}px`, height: `${H}px`, "margin-top": "2px" }}
     />

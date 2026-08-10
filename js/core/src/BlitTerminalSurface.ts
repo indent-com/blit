@@ -355,6 +355,8 @@ export class BlitTerminalSurface {
   private dirtyUnsub: (() => void) | null = null;
   private scrollAnchorUnsub: (() => void) | null = null;
   private resizeObserver: ResizeObserver | null = null;
+  /** Used by BlitConnection to reap a surface whose HMR cleanup was skipped. */
+  private readonly viewIsActive = () => this.container?.isConnected === true;
   private dprMq: MediaQueryList | null = null;
   private dprCheckHandler: (() => void) | null = null;
   /** Re-snaps the canvas when layout moves it, not only when a frame renders
@@ -1462,7 +1464,11 @@ export class BlitTerminalSurface {
     const cols = Math.max(1, Math.floor(w / this.cell.w));
     const rows = Math.max(1, Math.floor(h / this.cell.h));
     const sizeChanged = cols !== this._cols || rows !== this._rows;
-    if (sizeChanged) {
+    // `immediate` is used when an observer is first installed. Register the
+    // view even when its box happens to be exactly the 80x24 defaults; after an
+    // HMR registry reset (and on an ordinary first mount) equality must not
+    // turn the registration into a no-op.
+    if (sizeChanged || immediate) {
       this._rows = rows;
       this._cols = cols;
       // The grid is server-owned: the wasm terminal's cols/rows are
@@ -1485,6 +1491,7 @@ export class BlitTerminalSurface {
             this.viewId,
             this._rows,
             this._cols,
+            this.viewIsActive,
           );
         };
         clearTimeout(this._resizeTimer);
@@ -1541,6 +1548,7 @@ export class BlitTerminalSurface {
         this.viewId,
         this._rows,
         this._cols,
+        this.viewIsActive,
       );
     }
   }
@@ -2482,9 +2490,22 @@ export class BlitTerminalSurface {
       // and suppress the textarea's own text paste so we don't double-send.
       e.preventDefault();
       this.sendCtrlV();
+      return;
     }
-    // Otherwise (Cmd+V / Ctrl+Shift+V text paste): leave it to the existing
-    // input(insertFromPaste) path — do not touch the event.
+
+    // Cmd+V / context-menu text paste: clipboardData is available
+    // synchronously on the paste event, so send it now instead of waiting for
+    // the hidden textarea's later input(insertFromPaste) event.  WebKit can
+    // defer that input until the next edit of an invisible textarea, which
+    // makes the paste appear only after the user types another character.
+    // Leave an empty/unavailable payload to the input-event fallback: some
+    // browsers expose the text there but redact it from clipboardData.
+    const text = e.clipboardData?.getData("text/plain") ?? "";
+    if (text) {
+      e.preventDefault();
+      this.pasteText(text);
+      this.resetCaptureField();
+    }
   }
 
   /** Stream Android IME composition updates to the shell one character at a

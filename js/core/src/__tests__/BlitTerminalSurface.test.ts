@@ -246,6 +246,39 @@ describe("BlitTerminalSurface sizing", () => {
     surface.resendSize();
     expect(setViewSize).toHaveBeenCalledOnce();
   });
+
+  it("registers an exact 80x24 view during initial sizing", () => {
+    const setViewSize = vi.fn();
+    const removeView = vi.fn();
+    const surface = new BlitTerminalSurface({ sessionId: "s1" });
+    const container = document.createElement("div");
+    const cell = surface["cell"];
+    Object.defineProperties(container, {
+      clientWidth: { configurable: true, value: cell.w * 80 + cell.w / 2 },
+      clientHeight: { configurable: true, value: cell.h * 24 + cell.h / 2 },
+    });
+    surface["container"] = container;
+    surface["viewId"] = "v1";
+    surface["_blitConn"] = {
+      setViewSize,
+      removeView,
+      release: vi.fn(),
+    } as never;
+
+    // rows/cols already hold their constructor defaults. Initial setup must
+    // still publish the view instead of treating equality as no work.
+    surface["handleResize"](true);
+    expect(setViewSize).toHaveBeenCalledOnce();
+    expect(setViewSize.mock.calls[0]!.slice(0, 4)).toEqual([
+      "s1",
+      "v1",
+      24,
+      80,
+    ]);
+    expect(setViewSize.mock.calls[0]![4]).toBeTypeOf("function");
+
+    surface.dispose();
+  });
 });
 
 describe("BlitTerminalSurface mobile copy/paste API", () => {
@@ -604,6 +637,44 @@ describe("BlitTerminalSurface Ctrl+V image paste", () => {
     input.dispatchEvent(ev);
     return ev;
   }
+
+  function fireTextPaste(input: HTMLTextAreaElement, text: string) {
+    const clipboardData = {
+      items: null,
+      getData: (type: string) => (type === "text/plain" ? text : ""),
+    } as unknown as DataTransfer;
+    const ev = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(ev, "clipboardData", { value: clipboardData });
+    input.dispatchEvent(ev);
+    return ev;
+  }
+
+  it("sends bracketed Cmd+V text without waiting for another input", () => {
+    const sendInput = vi.fn();
+    const { s, input } = attach(sendInput);
+    // Fish enables bracketed paste while editing the command line.
+    // @ts-expect-error — only the mode queried by pasteText is needed here.
+    s["terminal"] = {
+      app_cursor: () => false,
+      bracketed_paste: () => true,
+    };
+
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "v",
+        code: "KeyV",
+        metaKey: true,
+        bubbles: true,
+      }),
+    );
+    const ev = fireTextPaste(input, "pasted-text");
+
+    expect(ev.defaultPrevented).toBe(true);
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    expect(new TextDecoder().decode(sendInput.mock.calls[0][1])).toBe(
+      "\x1b[200~pasted-text\x1b[201~",
+    );
+  });
 
   it("forwards a pasted image to the server clipboard then sends ^V", async () => {
     const sendInput = vi.fn();

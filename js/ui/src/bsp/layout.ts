@@ -34,7 +34,7 @@ export {
 import { readStorage, writeStorage } from "../storage";
 
 const LAYOUT_KEY = "blit.layout";
-const LAYOUT_HISTORY_KEY = "blit.layouts";
+export const LAYOUT_HISTORY_KEY = "blit.layouts";
 type StoredRecentLayout = string | { name: string; dsl: string };
 
 function parseHash(): Record<string, string> {

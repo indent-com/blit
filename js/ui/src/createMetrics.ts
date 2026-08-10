@@ -1,16 +1,5 @@
 import { createSignal, createEffect, onCleanup, onMount } from "solid-js";
-import type { BlitTransport } from "@blit-sh/core";
-
-export interface RenderSample {
-  t: number;
-  ms: number;
-}
-
-export interface NetSample {
-  t: number;
-  bytes: number;
-  dir: "rx" | "tx";
-}
+import type { BlitTransport, BlitTransportMessage } from "@blit-sh/core";
 
 export interface Metrics {
   bw: number;
@@ -20,19 +9,114 @@ export interface Metrics {
   maxRenderMs: number;
 }
 
+abstract class TypedSampleRing {
+  private start = 0;
+  length = 0;
+
+  constructor(readonly capacity: number) {
+    if (!Number.isInteger(capacity) || capacity < 1)
+      throw new RangeError("capacity must be a positive integer");
+  }
+
+  protected pushIndex(): number {
+    if (this.length < this.capacity) {
+      const index = (this.start + this.length) % this.capacity;
+      this.length++;
+      return index;
+    }
+    const index = this.start;
+    this.start = (this.start + 1) % this.capacity;
+    return index;
+  }
+
+  protected physicalIndex(index: number): number {
+    return index < 0 || index >= this.length
+      ? -1
+      : (this.start + index) % this.capacity;
+  }
+}
+
+/** Struct-of-typed-arrays render history: no sample objects, shifts, or
+ * backing-store allocations in the measurement path. */
+export class RenderSampleRing extends TypedSampleRing {
+  private readonly times: Float64Array;
+  private readonly durations: Float64Array;
+
+  constructor(capacity: number) {
+    super(capacity);
+    this.times = new Float64Array(capacity);
+    this.durations = new Float64Array(capacity);
+  }
+
+  push(time: number, duration: number): void {
+    const index = this.pushIndex();
+    this.times[index] = time;
+    this.durations[index] = duration;
+  }
+
+  time(index: number): number {
+    const physical = this.physicalIndex(index);
+    return physical < 0 ? NaN : this.times[physical];
+  }
+
+  duration(index: number): number {
+    const physical = this.physicalIndex(index);
+    return physical < 0 ? NaN : this.durations[physical];
+  }
+}
+
+/** Struct-of-typed-arrays network history. */
+export class NetSampleRing extends TypedSampleRing {
+  private readonly times: Float64Array;
+  private readonly sizes: Uint32Array;
+  private readonly directions: Uint8Array;
+
+  constructor(capacity: number) {
+    super(capacity);
+    this.times = new Float64Array(capacity);
+    this.sizes = new Uint32Array(capacity);
+    this.directions = new Uint8Array(capacity);
+  }
+
+  push(time: number, bytes: number, rx: boolean): void {
+    const index = this.pushIndex();
+    this.times[index] = time;
+    this.sizes[index] = bytes;
+    this.directions[index] = rx ? 1 : 0;
+  }
+
+  time(index: number): number {
+    const physical = this.physicalIndex(index);
+    return physical < 0 ? NaN : this.times[physical];
+  }
+
+  bytes(index: number): number {
+    const physical = this.physicalIndex(index);
+    return physical < 0 ? 0 : this.sizes[physical];
+  }
+
+  isRx(index: number): boolean {
+    const physical = this.physicalIndex(index);
+    return physical >= 0 && this.directions[physical] !== 0;
+  }
+}
+
 const INTERVAL = 1000;
 
-export function createMetrics(transports: () => readonly BlitTransport[]): {
+export function createMetrics(
+  transports: () => readonly BlitTransport[],
+  sampleTimelines: () => boolean = () => true,
+): {
   metrics: () => Metrics;
   countFrame: (renderMs?: number) => void;
-  timeline: RenderSample[];
-  net: NetSample[];
+  timeline: RenderSampleRing;
+  net: NetSampleRing;
 } {
   const TIMELINE_MAX = 500;
   const NET_MAX = 2000;
 
-  const timeline: RenderSample[] = [];
-  const net: NetSample[] = [];
+  const timeline = new RenderSampleRing(TIMELINE_MAX);
+  const net = new NetSampleRing(NET_MAX);
 
   let bytes = 0;
   let frames = 0;
@@ -53,18 +137,22 @@ export function createMetrics(transports: () => readonly BlitTransport[]): {
     if (renderMs != null) {
       renderMsSum += renderMs;
       renderMsMax = Math.max(renderMsMax, renderMs);
-      timeline.push({ t: performance.now(), ms: renderMs });
-      if (timeline.length > TIMELINE_MAX)
-        timeline.splice(0, timeline.length - TIMELINE_MAX);
+      if (sampleTimelines())
+        timeline.push(performance.now(), renderMs);
     }
   }
 
-  const onMessage = (data: ArrayBuffer) => {
+  const onMessage = (data: BlitTransportMessage) => {
     bytes += data.byteLength;
-    const view = new Uint8Array(data);
-    if (view[0] === 0x00) updates++;
-    net.push({ t: performance.now(), bytes: data.byteLength, dir: "rx" });
-    if (net.length > NET_MAX) net.splice(0, net.length - NET_MAX);
+    const first =
+      data.byteLength === 0
+        ? undefined
+        : data instanceof Uint8Array
+          ? data[0]
+          : new Uint8Array(data, 0, 1)[0];
+    if (first === 0x00) updates++;
+    if (sampleTimelines())
+      net.push(performance.now(), data.byteLength, true);
   };
 
   // Re-register transport listeners whenever the transport list changes.

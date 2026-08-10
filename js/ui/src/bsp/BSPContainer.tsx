@@ -59,6 +59,7 @@ import type { Theme } from "../theme";
 import { themeFor, ui, uiScale, z } from "../theme";
 import { t, tp } from "../i18n";
 import { shellCapabilities } from "../shellCapabilities";
+import type { SurfaceZoomMode } from "../storage";
 
 // The tree context lives in ./treeContext so its identity survives hot
 // reloads of this module (see that file).
@@ -132,8 +133,10 @@ export function BSPContainer(props: {
   palette: TerminalPalette;
   fontFamily: string;
   fontSize: number;
-  /** Surface zoom factor (1 = the pane's DPI alone). Defaults to 1. */
+  /** Surface zoom factor. Defaults to 1. */
   surfaceZoom?: number;
+  /** Whether surface zoom is relative to display DPI or an exact scale. */
+  surfaceZoomMode?: SurfaceZoomMode;
 
   focusedSessionId: SessionId | null;
   lruSessionIds: readonly SessionId[];
@@ -982,6 +985,9 @@ export function BSPContainer(props: {
     get surfaceZoom() {
       return props.surfaceZoom ?? 1;
     },
+    get surfaceZoomMode() {
+      return props.surfaceZoomMode ?? "relative";
+    },
     tabMemory,
     get onRender() {
       return props.onRender;
@@ -1620,6 +1626,7 @@ function LeafPane(props: {
                 focus={props.isFocused}
                 resizable
                 zoom={ctx.surfaceZoom}
+                zoomMode={ctx.surfaceZoomMode}
                 style={{ width: "100%", height: "100%" }}
               />
             </div>

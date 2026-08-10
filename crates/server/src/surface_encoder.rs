@@ -2606,8 +2606,10 @@ impl X264Encoder {
             par.i_threads = 1;
             par.i_fps_num = 30;
             par.i_fps_den = 1;
-            // Same periodic-keyframe cadence as the AV1 software encoder.
-            par.i_keyint_max = 60;
+            // The reliable ordered stream requests IDRs explicitly for
+            // startup and recovery. Keep x264's scene-cut placement, but do
+            // not impose a refresh-rate-dependent periodic keyframe.
+            par.i_keyint_max = X264_KEYINT_MAX_INFINITE as i32;
             par.i_log_level = X264_LOG_NONE;
             par.rc.i_rc_method = X264_RC_ABR as i32;
             par.rc.i_bitrate = (encoding.bandwidth.h264_bitrate() / 1000) as i32; // kbit/s
@@ -2798,7 +2800,7 @@ impl SoftwareAV1Encoder {
         };
         let mut speed = SpeedSettings::from_preset(encoding.speed.av1_speed());
         speed.rdo_lookahead_frames = 1;
-        let enc = EncoderConfig {
+        let mut enc = EncoderConfig {
             width: width as usize,
             height: height as usize,
             chroma_sampling,
@@ -2809,12 +2811,17 @@ impl SoftwareAV1Encoder {
             speed_settings: speed,
             low_latency: true,
             min_key_frame_interval: 0,
-            max_key_frame_interval: 60,
+            // Replaced through set_key_frame_interval below; zero is only
+            // interpreted as infinity by that API, not as a raw field value.
+            max_key_frame_interval: 0,
             quantizer: encoding.bandwidth.av1_quantizer(),
             min_quantizer: encoding.bandwidth.av1_min_quantizer(),
             bitrate: 0,
             ..Default::default()
         };
+        // Preserve scene-change keyframes while removing the fixed interval.
+        // Startup and decoder recovery arrive through request_keyframe().
+        enc.set_key_frame_interval(0, 0);
         let cfg = Config::new().with_encoder_config(enc);
         let ctx = cfg
             .new_context()

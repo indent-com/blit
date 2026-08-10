@@ -48,16 +48,22 @@ export function useRemotes(): () => Remote[] {
 }
 
 // ---------------------------------------------------------------------------
-// WebTransport cert hash — pushed by the gateway via the config WS as
-// `wt=<sha256hex>` when QUIC is enabled.
+// WebTransport authority and cert hash — pushed by the gateway via the config
+// WS as `wt-addr=<host:port|:port>` and `wt=<sha256hex>` when QUIC is enabled.
 // ---------------------------------------------------------------------------
 
 const [wtCertHash, setWtCertHash] = createSignal<string | undefined>(undefined);
+const [wtAddr, setWtAddr] = createSignal<string | undefined>(undefined);
 
 /** Reactive accessor — returns the WebTransport cert hash (hex), or
  *  undefined when the gateway does not offer WebTransport. */
 export function useWtCertHash(): () => string | undefined {
   return wtCertHash;
+}
+
+/** Reactive accessor — returns the gateway-advertised WebTransport authority. */
+export function useWtAddr(): () => string | undefined {
+  return wtAddr;
 }
 
 /** Send a remotes-add command over the config WebSocket. */
@@ -220,9 +226,14 @@ export const AUDIO_MUTED_KEY = "blit.audioMuted";
 export const VIDEO_BANDWIDTH_KEY = "blit.videoBandwidth";
 export const VIDEO_SPEED_KEY = "blit.videoSpeed";
 export const SURFACE_STREAMING_KEY = "blit.surfaceStreaming";
-/** Surface zoom, in percent (100 = native). Applied on top of the display's
- *  DPI, so a 2x screen at 150% composites the surface at 3x. */
+/** Whether decoded surface frames may be held to smooth transport jitter. */
+export const SURFACE_SMOOTHING_KEY = "blit.surfaceSmoothing";
+/** Surface zoom value, stored as an integer percentage. Its interpretation is
+ *  selected by SURFACE_ZOOM_MODE_KEY. */
 export const SURFACE_ZOOM_KEY = "blit.surfaceZoom";
+/** "relative" multiplies display DPI; "exact" names an absolute scale. */
+export const SURFACE_ZOOM_MODE_KEY = "blit.surfaceZoomMode";
+export type SurfaceZoomMode = "relative" | "exact";
 // Panel widths are UI-local for the same reason, being chrome geometry.
 export const LEFT_DOCK_WIDTH_KEY = "blit.leftDockWidth";
 export const PREVIEW_PANEL_WIDTH_KEY = "blit.previewPanelWidth";
@@ -372,6 +383,10 @@ export function connectConfigWs(): void {
       setRootsSignal(parseRootsText(msg.slice("roots:".length)));
       return;
     }
+    if (msg.startsWith("wt-addr=")) {
+      setWtAddr(msg.slice("wt-addr=".length));
+      return;
+    }
     if (msg.startsWith("wt=")) {
       setWtCertHash(msg.slice(3));
       return;
@@ -428,6 +443,10 @@ export function writeStorage(key: string, value: string) {
   } catch {}
   if (PERSISTED_KEYS.has(key)) {
     cache.set(key, value);
+    // A document can host more than one Workspace (the embedding API does),
+    // and they share this module-level config connection. Publish locally as
+    // well as over the socket so every frontend reacts in the same turn.
+    notifyListeners(key, value);
     if (configWs && configWs.readyState === WebSocket.OPEN && configReady) {
       configWs.send(`set ${key} ${value}`);
     } else if (configWs && !configReady) {
@@ -595,9 +614,9 @@ const LEGACY_VIDEO_QUALITY_KEY = "blit.videoQuality";
  * Nothing is carried to the speed axis: the old knob implied a speed rather
  * than letting anyone choose one, and its implied value is the new default.
  *
- * Writing through `writeStorage` republishes it to `blit.conf` like any
- * other change, so the legacy key can be dropped here rather than read
- * forever.
+ * Writing through `writeStorage` keeps the migrated value device-local, like
+ * the rest of the media controls, so the legacy key can be dropped here
+ * rather than read forever.
  */
 export function migrateLegacyVideoQuality(): void {
   const legacy = readLocal(LEGACY_VIDEO_QUALITY_KEY);
@@ -620,17 +639,28 @@ export function preferredSurfaceStreaming(): boolean {
   return true;
 }
 
+/** Prefer interaction latency over cadence smoothing unless explicitly set. */
+export function preferredSurfaceSmoothing(): boolean {
+  return readStorage(SURFACE_SMOOTHING_KEY) === "1";
+}
+
 /** Zoom bounds, in percent.  Matched by `clampZoom` in the surface view —
  *  the floor keeps the app's logical size layoutable, the ceiling keeps one
  *  pane from dictating a scale every co-viewer then has to stream. */
 export const MIN_SURFACE_ZOOM = 25;
 export const MAX_SURFACE_ZOOM = 400;
 
-/** Preferred surface zoom in percent.  Defaults to 100 (DPI only). */
+/** Preferred surface zoom value in percent. Defaults to 100. */
 export function preferredSurfaceZoom(): number {
   const n = parseInt(readStorage(SURFACE_ZOOM_KEY) ?? "", 10);
   if (!Number.isFinite(n)) return 100;
   return Math.min(MAX_SURFACE_ZOOM, Math.max(MIN_SURFACE_ZOOM, n));
+}
+
+/** How the surface zoom value is interpreted. Existing preferences remain
+ *  relative so upgrading does not change their rendered size. */
+export function preferredSurfaceZoomMode(): SurfaceZoomMode {
+  return readStorage(SURFACE_ZOOM_MODE_KEY) === "exact" ? "exact" : "relative";
 }
 
 /** The narrowest the right dock can be dragged. Wide enough for a card's

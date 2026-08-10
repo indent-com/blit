@@ -7,7 +7,12 @@
  * its compartment, so a change reaches tiles that already exist.
  */
 import { createSignal } from "solid-js";
-import { EDITOR_WRAP_KEY, readStorage, writeStorage } from "../storage";
+import {
+  EDITOR_WRAP_KEY,
+  onConfigChange,
+  readStorage,
+  writeStorage,
+} from "../storage";
 
 const [lineWrap, setLineWrapSignal] = createSignal(
   // Default on: most of what gets opened here is prose-ish or long-lined
@@ -17,6 +22,13 @@ const [lineWrap, setLineWrapSignal] = createSignal(
 );
 
 export { lineWrap };
+
+// Unlike component-owned preferences, editor wrap lives in a module signal.
+// Keep it attached to the shared config stream so a toggle in any frontend
+// reconfigures editors that are already open everywhere else.
+onConfigChange((key, value) => {
+  if (key === EDITOR_WRAP_KEY) setLineWrapSignal(value !== "0");
+});
 
 export function setLineWrap(on: boolean): void {
   setLineWrapSignal(on);

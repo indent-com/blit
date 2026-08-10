@@ -48,7 +48,10 @@ class NoopResizeObserver {
 const PANE_CSS_W = 800;
 const PANE_CSS_H = 600;
 
-function renderView(zoom: () => number | undefined) {
+function renderView(
+  zoom: () => number | undefined,
+  zoomMode: () => "relative" | "exact" | undefined = () => undefined,
+) {
   return render(() => (
     <BlitWorkspaceProvider workspace={workspace}>
       <BlitSurfaceView
@@ -56,6 +59,7 @@ function renderView(zoom: () => number | undefined) {
         surfaceId={7}
         resizable
         zoom={zoom()}
+        zoomMode={zoomMode()}
       />
     </BlitWorkspaceProvider>
   ));
@@ -127,12 +131,11 @@ describe("BlitSurfaceView zoom", () => {
     expect(mockSetDisplaySize).toHaveBeenLastCalledWith(800, 600, 120, 120);
   });
 
-  it("never asks for less than 1x, which the compositor would not honour", () => {
-    // A 1x pane has no density to give back: the compositor computes the
-    // window's logical size with `max(scale, 120)`, so a 0.5x request would
-    // leave the app at its 1x size while the output claimed 0.5x.
+  it("sends a sub-1x relative scale so a 1x pane can zoom out", () => {
     renderView(() => 0.5);
-    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(800, 600, 120, 120);
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(800, 600, 60, 120);
+    vi.advanceTimersByTime(50);
+    expect(mockRequestResize).toHaveBeenLastCalledWith(800, 600, 60);
   });
 
   it("zooms out into the display's own DPI where there is some", () => {
@@ -142,5 +145,26 @@ describe("BlitSurfaceView zoom", () => {
     vi.stubGlobal("devicePixelRatio", 2);
     renderView(() => 0.75);
     expect(mockSetDisplaySize).toHaveBeenLastCalledWith(1600, 1200, 180, 240);
+  });
+
+  it("uses an exact scale independently of display DPI", () => {
+    vi.stubGlobal("devicePixelRatio", 2);
+    renderView(
+      () => 1,
+      () => "exact",
+    );
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(1600, 1200, 120, 240);
+    vi.advanceTimersByTime(50);
+    expect(mockRequestResize).toHaveBeenLastCalledWith(1600, 1200, 120);
+  });
+
+  it("re-sends the box when switching between relative and exact scale", () => {
+    vi.stubGlobal("devicePixelRatio", 2);
+    const [mode, setMode] = createSignal<"relative" | "exact">("relative");
+    renderView(() => 1, mode);
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(1600, 1200, 240, 240);
+
+    setMode("exact");
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(1600, 1200, 120, 240);
   });
 });

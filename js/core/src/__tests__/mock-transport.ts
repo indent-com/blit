@@ -1,6 +1,7 @@
 import type {
   BlitTransport,
   BlitTransportEventMap,
+  BlitTransportMessage,
   ConnectionStatus,
 } from "../types";
 import {
@@ -20,7 +21,7 @@ import {
 
 export class MockTransport implements BlitTransport {
   private _status: ConnectionStatus;
-  private messageListeners = new Set<(data: ArrayBuffer) => void>();
+  private messageListeners = new Set<(data: BlitTransportMessage) => void>();
   private statusListeners = new Set<(status: ConnectionStatus) => void>();
   sent: Uint8Array[] = [];
   authRejected = false;
@@ -56,7 +57,9 @@ export class MockTransport implements BlitTransport {
     listener: (data: BlitTransportEventMap[K]) => void,
   ): void {
     if (type === "message") {
-      this.messageListeners.add(listener as (data: ArrayBuffer) => void);
+      this.messageListeners.add(
+        listener as (data: BlitTransportMessage) => void,
+      );
     } else if (type === "statuschange") {
       this.statusListeners.add(listener as (status: ConnectionStatus) => void);
     }
@@ -67,7 +70,9 @@ export class MockTransport implements BlitTransport {
     listener: (data: BlitTransportEventMap[K]) => void,
   ): void {
     if (type === "message") {
-      this.messageListeners.delete(listener as (data: ArrayBuffer) => void);
+      this.messageListeners.delete(
+        listener as (data: BlitTransportMessage) => void,
+      );
     } else if (type === "statuschange") {
       this.statusListeners.delete(
         listener as (status: ConnectionStatus) => void,
@@ -86,6 +91,11 @@ export class MockTransport implements BlitTransport {
       data.byteOffset + data.byteLength,
     ) as ArrayBuffer;
     for (const l of this.messageListeners) l(buf);
+  }
+
+  /** Deliver a borrowed view without copying, as BYOB transports do. */
+  pushBorrowed(data: Uint8Array) {
+    for (const l of this.messageListeners) l(data);
   }
 
   // --- Helpers to build wire-format server messages ---

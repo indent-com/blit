@@ -104,7 +104,11 @@ function resolvePassphrase(): PassphraseResult {
     if (!plaintext.endsWith(".ro")) {
       try {
         const encrypted = encryptPassphrase(plaintext);
-        history.replaceState(null, "", `/s#${encodeURIComponent(encrypted)}`);
+        const nextHash = [
+          encodeURIComponent(encrypted),
+          ...(debug ? ["debug"] : []),
+        ].join("&");
+        history.replaceState(null, "", `/s#${nextHash}`);
       } catch (e) {
         console.error("[blit] encryptPassphrase failed:", e);
         // Fall through — still return the plaintext passphrase.
@@ -207,8 +211,8 @@ export default function SharePage() {
                         r.passphrase,
                         // `#…&debug` on the fragment narrates signaling to
                         // the console — connection problems on a static
-                        // page are otherwise invisible. Captured before
-                        // the encrypting URL rewrite erases the flag.
+                        // page are otherwise invisible. The workspace also
+                        // reads and maintains the same flag for its pane.
                         r.debug ? console : undefined,
                       ),
                       // A `.ro` watch link: the server refuses writes, so

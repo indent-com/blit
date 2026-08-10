@@ -46,7 +46,9 @@ import {
   VIDEO_BANDWIDTH_KEY,
   VIDEO_SPEED_KEY,
   SURFACE_STREAMING_KEY,
+  SURFACE_SMOOTHING_KEY,
   SURFACE_ZOOM_KEY,
+  SURFACE_ZOOM_MODE_KEY,
   MIN_SURFACE_ZOOM,
   MAX_SURFACE_ZOOM,
   LEFT_DOCK_WIDTH_KEY,
@@ -63,7 +65,9 @@ import {
   preferredVideoBandwidth,
   preferredVideoSpeed,
   preferredSurfaceStreaming,
+  preferredSurfaceSmoothing,
   preferredSurfaceZoom,
+  preferredSurfaceZoomMode,
   preferredLeftDockWidth,
   preferredPreviewPanelWidth,
   MIN_PREVIEW_PANEL_WIDTH,
@@ -87,6 +91,7 @@ import {
   toggleRoot,
   reorderRoots,
   type Root,
+  type SurfaceZoomMode,
 } from "./storage";
 import type { UIScale, Theme } from "./theme";
 import {
@@ -189,6 +194,7 @@ import {
   saveToHistory,
   removeFromHistory,
   loadRecentLayouts,
+  LAYOUT_HISTORY_KEY,
   PRESETS,
   surfaceAssignment,
   isSurfaceAssignment,
@@ -205,6 +211,10 @@ import {
   loadFocusedTileFromHash,
 } from "./bsp/layout";
 import { setReveal } from "./ide/reveal";
+import {
+  debugPanelOpenFromHash,
+  withDebugPanelState,
+} from "./workspaceUrl";
 
 export type Overlay =
   | "expose"
@@ -218,11 +228,71 @@ export type Overlay =
   | "link"
   | null;
 
+type HmrWorkspaceData = {
+  workspace: BlitWorkspace;
+  /** Module-local identity. A new object means this module was hot-reloaded. */
+  owner: object;
+};
+
+const hmrWorkspaceOwner = {};
+
+/**
+ * Reset terminal view leases on both current and pre-fix preserved workspaces.
+ * HMR keeps the object itself, so an instance constructed by the previous
+ * module does not gain methods added to the new class prototype.
+ */
+function resetHmrViewSizes(workspace: BlitWorkspace): void {
+  const current = workspace as BlitWorkspace & {
+    resetViewSizes?: () => void;
+  };
+  if (typeof current.resetViewSizes === "function") {
+    current.resetViewSizes();
+    return;
+  }
+
+  for (const snapshot of workspace.getSnapshot().connections) {
+    const connection = workspace.getConnection(snapshot.id);
+    if (!connection) continue;
+    const legacy = connection as unknown as {
+      viewSizes?: Map<SessionId, unknown>;
+    };
+    const sessionIds = legacy.viewSizes ? [...legacy.viewSizes.keys()] : [];
+    legacy.viewSizes?.clear();
+    connection.clearSessionSizes(sessionIds);
+  }
+}
+
 function getHmrWorkspace(wasm: BlitWasmModule): BlitWorkspace {
-  const prev = import.meta.hot?.data?.workspace as BlitWorkspace | undefined;
-  if (prev) return prev;
+  const raw = import.meta.hot?.data?.workspace as
+    | HmrWorkspaceData
+    | BlitWorkspace
+    | undefined;
+  // Accept the raw BlitWorkspace stored by versions before HmrWorkspaceData.
+  const prev = raw && "workspace" in raw ? raw.workspace : raw;
+  const previousOwner = raw && "workspace" in raw ? raw.owner : null;
+  if (prev) {
+    // Solid normally disposes every old terminal surface, but HMR is allowed to
+    // replace a component boundary without visiting all of those cleanups. The
+    // preserved workspace would then retain the vanished pane's size forever,
+    // and the minimum-size policy would leave most of a larger pane blank.
+    // Reset once per module generation; the replacement surfaces immediately
+    // register their real boxes while transports and terminal state stay live.
+    if (previousOwner !== hmrWorkspaceOwner) resetHmrViewSizes(prev);
+    if (import.meta.hot) {
+      import.meta.hot.data.workspace = {
+        workspace: prev,
+        owner: hmrWorkspaceOwner,
+      } satisfies HmrWorkspaceData;
+    }
+    return prev;
+  }
   const ws = new BlitWorkspace({ wasm });
-  if (import.meta.hot) import.meta.hot.data.workspace = ws;
+  if (import.meta.hot) {
+    import.meta.hot.data.workspace = {
+      workspace: ws,
+      owner: hmrWorkspaceOwner,
+    } satisfies HmrWorkspaceData;
+  }
   return ws;
 }
 
@@ -488,7 +558,9 @@ function WorkspaceScreen(props: {
   const [newTerminalTargetPaneId, setNewTerminalTargetPaneId] = createSignal<
     string | null
   >(null);
-  const [debugPanel, setDebugPanel] = createSignal(false);
+  const [debugPanel, setDebugPanel] = createSignal(
+    debugPanelOpenFromHash(location.hash),
+  );
   const [audioMuted, setAudioMuted] = createSignal(preferredAudioMuted());
   const [audioBitrate, setAudioBitrate] = createSignal(preferredAudioBitrate());
   const [videoBandwidth, setVideoBandwidth] = createSignal(
@@ -498,7 +570,13 @@ function WorkspaceScreen(props: {
   const [surfaceStreaming, setSurfaceStreaming] = createSignal(
     preferredSurfaceStreaming(),
   );
+  const [surfaceSmoothing, setSurfaceSmoothing] = createSignal(
+    preferredSurfaceSmoothing(),
+  );
   const [surfaceZoom, setSurfaceZoom] = createSignal(preferredSurfaceZoom());
+  const [surfaceZoomMode, setSurfaceZoomMode] = createSignal(
+    preferredSurfaceZoomMode(),
+  );
   // Panel chrome in the URL hash (d= open side panels, x= expanded left-dock
   // sections) is authoritative when present; absent keys fall back to
   // localStorage/defaults. Parsed once up front — the focus params (s=/t=)
@@ -1602,6 +1680,7 @@ function WorkspaceScreen(props: {
   // back/forward swipes and old-URL autocompletes.
   createEffect(() => {
     const onHashChange = () => {
+      setDebugPanel(debugPanelOpenFromHash(location.hash));
       const fromHash = loadLayoutFromHash();
       if (fromHash && fromHash.dsl !== activeLayout()?.dsl) {
         // A layout arriving from outside hides the fullscreen slot, same as
@@ -2504,6 +2583,7 @@ function WorkspaceScreen(props: {
     const speed = videoSpeed();
     const b = audioBitrate();
     const streaming = surfaceStreaming();
+    const smoothing = surfaceSmoothing();
     for (const snap of allConnections()) {
       const conn = workspace.getConnection(snap.id);
       if (conn) {
@@ -2511,6 +2591,7 @@ function WorkspaceScreen(props: {
         conn.defaultSurfaceSpeed = speed;
         conn.defaultAudioBitrateKbps = b;
         conn.surfaceStreamingEnabled = streaming;
+        conn.surfaceStore.setPresentationSmoothingEnabled(smoothing);
       }
     }
   });
@@ -2951,9 +3032,18 @@ function WorkspaceScreen(props: {
     }
   }
 
-  /** Zoom is applied client-side, on top of the pane's DPI: every resizable
-   *  surface view re-derives the scale it asks the compositor for, so there
-   *  is nothing to push to the connections here. */
+  function changeSurfaceSmoothing(enabled: boolean) {
+    setSurfaceSmoothing(enabled);
+    writeStorage(SURFACE_SMOOTHING_KEY, enabled ? "1" : "0");
+    for (const snap of allConnections()) {
+      workspace
+        .getConnection(snap.id)
+        ?.surfaceStore.setPresentationSmoothingEnabled(enabled);
+    }
+  }
+
+  /** Every resizable surface view re-derives the scale it asks the compositor
+   *  for, so there is nothing to push to the connections here. */
   function changeSurfaceZoom(percent: number) {
     const clamped = Math.min(
       MAX_SURFACE_ZOOM,
@@ -2963,10 +3053,14 @@ function WorkspaceScreen(props: {
     writeStorage(SURFACE_ZOOM_KEY, String(clamped));
   }
 
+  function changeSurfaceZoomMode(mode: SurfaceZoomMode) {
+    setSurfaceZoomMode(mode);
+    writeStorage(SURFACE_ZOOM_MODE_KEY, mode);
+  }
+
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
-    | ((sessionId: SessionId, targetPaneId: string) => void)
-    | null = null;
+    ((sessionId: SessionId, targetPaneId: string) => void) | null = null;
   let moveToPaneFn:
     | ((value: string, targetPaneId: string, fromPaneId?: string) => void)
     | null = null;
@@ -3343,6 +3437,20 @@ function WorkspaceScreen(props: {
 
   // Sync layout + focus to URL hash.
   createEffect(() => {
+    // Debug visibility is local UI state, so keep it shareable even while the
+    // transport is disconnected and the connection-gated state below cannot
+    // yet be refreshed.
+    const debugOpen = debugPanel();
+    const currentHash = location.hash.slice(1);
+    const debugHash = withDebugPanelState(currentHash, debugOpen);
+    if (debugHash !== currentHash) {
+      history.replaceState(
+        null,
+        "",
+        debugHash ? `#${debugHash}` : location.pathname + location.search,
+      );
+    }
+
     // Record every session we see so the hash can reference sessions whose
     // connection has been removed.  This runs unconditionally (before the
     // connected guard) so entries are populated before they're needed.
@@ -3454,7 +3562,7 @@ function WorkspaceScreen(props: {
         !(/^[lpastdx]=/.test(s) && written.has(s.slice(0, s.indexOf("=")))),
     );
     const merged = [...kept, ...parts];
-    const newHash = merged.join("&");
+    const newHash = withDebugPanelState(merged.join("&"), debugOpen);
     if (newHash !== existing) {
       history.replaceState(
         null,
@@ -3464,9 +3572,14 @@ function WorkspaceScreen(props: {
     }
   });
 
-  const { countFrame, timeline, net, metrics } = createMetrics(() =>
-    props.connectionSpecs().map((s) => s.transport),
+  const { countFrame, timeline, net, metrics } = createMetrics(
+    () => props.connectionSpecs().map((s) => s.transport),
+    debugPanel,
   );
+
+  // Surface timing samples exist solely for the debug pane. Avoid creating
+  // and correlating one record per video frame while it is closed.
+  createEffect(() => workspace.setSurfaceDiagnosticsEnabled(debugPanel()));
 
   // Periodically bump a counter while the debug panel is open so that
   // debugStats (which reads from non-reactive Maps) gets re-sampled.
@@ -3827,6 +3940,7 @@ function WorkspaceScreen(props: {
                                 focus
                                 resizable
                                 zoom={surfaceZoom() / 100}
+                                zoomMode={surfaceZoomMode()}
                                 style={{
                                   width: "100%",
                                   height: "100%",
@@ -3892,6 +4006,7 @@ function WorkspaceScreen(props: {
                     fontFamily={resolvedFontWithFallback()}
                     fontSize={fontSize()}
                     surfaceZoom={surfaceZoom() / 100}
+                    surfaceZoomMode={surfaceZoomMode()}
                     focusedSessionId={wsState().focusedSessionId}
                     lruSessionIds={lru}
                     liveSurfaceKeys={surfaces().map(
@@ -4457,12 +4572,16 @@ function WorkspaceScreen(props: {
               audioMuted={audioMuted()}
               audioAvailable={allConnections().some((c) => c.supportsAudio)}
               surfaceStreaming={surfaceStreaming()}
+              surfaceSmoothing={surfaceSmoothing()}
               surfaceZoom={surfaceZoom()}
+              surfaceZoomMode={surfaceZoomMode()}
               onAudioBitrateChange={changeAudioBitrate}
               onVideoBandwidthChange={changeVideoBandwidth}
               onVideoSpeedChange={changeVideoSpeed}
               onSurfaceStreamingChange={changeSurfaceStreaming}
+              onSurfaceSmoothingChange={changeSurfaceSmoothing}
               onSurfaceZoomChange={changeSurfaceZoom}
+              onSurfaceZoomModeChange={changeSurfaceZoomMode}
               onToggleAudio={toggleAudio}
               onClose={closeOverlay}
             />
