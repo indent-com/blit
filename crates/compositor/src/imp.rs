@@ -1822,6 +1822,9 @@ struct Compositor {
     /// committed callback wait an entire refresh period. Keep only the newest
     /// such deadline per toplevel and consume it after that commit instead.
     pending_request_frames: HashMap<u16, std::time::Instant>,
+    /// Toplevels known to contain at least one frame callback or presentation
+    /// feedback. Fixed clocks consult this before walking a surface tree.
+    frame_callback_toplevels: HashSet<u16>,
     next_surface_id: u16,
     shm_pools: HashMap<ObjectId, Arc<ShmPool>>,
     /// Per-surface metadata (dimensions, scale, flags) populated at commit time.
@@ -2539,6 +2542,12 @@ impl Compositor {
                 return;
             }
         };
+        if self.surfaces.get(surface_id).is_some_and(|surface| {
+            !surface.pending_frame_callbacks.is_empty()
+                || !surface.pending_presentation_feedbacks.is_empty()
+        }) {
+            self.frame_callback_toplevels.insert(toplevel_sid);
+        }
 
         // Compositing while a previous submit's fence is still unsignalled
         // does not queue behind it — `render_tree_sized` early-returns and
@@ -3648,6 +3657,7 @@ impl Compositor {
                     }
                     self.last_request_frame_ms.remove(&surf.surface_id);
                     self.pending_request_frames.remove(&surf.surface_id);
+                    self.frame_callback_toplevels.remove(&surf.surface_id);
                     self.last_reported_size.remove(&surf.surface_id);
                     self.surface_sizes.remove(&surf.surface_id);
                     if let Some(ref mut vk) = self.vulkan_renderer {
@@ -3692,7 +3702,11 @@ impl Compositor {
         toplevel_sid: u16,
         presentation_at: Option<std::time::Instant>,
     ) -> bool {
+        if !self.frame_callback_toplevels.contains(&toplevel_sid) {
+            return false;
+        }
         let Some(root_id) = self.toplevel_surface_ids.get(&toplevel_sid).cloned() else {
+            self.frame_callback_toplevels.remove(&toplevel_sid);
             return false;
         };
         let tree = self.collect_surface_tree(&root_id);
@@ -3702,8 +3716,12 @@ impl Compositor {
         }
         if fired {
             self.pending_request_frames.remove(&toplevel_sid);
+            let _ = self.display_handle.flush_clients();
         }
-        let _ = self.display_handle.flush_clients();
+        // The set is a cheap readiness hint. If topology changed underneath
+        // a pending request, clear the stale hint and let the next protocol
+        // request or commit re-arm it.
+        self.frame_callback_toplevels.remove(&toplevel_sid);
         fired
     }
 
@@ -4487,14 +4505,14 @@ impl Compositor {
                 // per-commit fire in `handle_surface_commit` can stand down
                 // while this (display-rate-throttled) path is driving frames.
                 self.last_request_frame_ms.insert(surface_id, elapsed_ms());
-                if self.toplevel_surface_ids.contains_key(&surface_id) {
-                    if !self.fire_frame_callbacks_for_toplevel(surface_id, Some(presentation_at)) {
-                        // The client's next frame request has not reached us
-                        // yet. Latch this deadline; its associated commit will
-                        // consume it instead of losing a complete refresh.
-                        self.pending_request_frames
-                            .insert(surface_id, presentation_at);
-                    }
+                if self.toplevel_surface_ids.contains_key(&surface_id)
+                    && !self.fire_frame_callbacks_for_toplevel(surface_id, Some(presentation_at))
+                {
+                    // The client's next frame request has not reached us
+                    // yet. Latch this deadline; its associated commit will
+                    // consume it instead of losing a complete refresh.
+                    self.pending_request_frames
+                        .insert(surface_id, presentation_at);
                 }
             }
             CompositorCommand::ReleaseKeys { keycodes } => {
@@ -5256,6 +5274,9 @@ impl Dispatch<WlSurface, ()> for Compositor {
                 if let Some(surf) = state.surfaces.get_mut(&sid) {
                     surf.pending_frame_callbacks.push(cb);
                 }
+                if let Some(toplevel_sid) = state.find_toplevel_root(&sid).1 {
+                    state.frame_callback_toplevels.insert(toplevel_sid);
+                }
             }
             Request::SetBufferScale { scale } => {
                 if let Some(surf) = state.surfaces.get_mut(&sid) {
@@ -5336,6 +5357,8 @@ impl Dispatch<WlSurface, ()> for Compositor {
                     if surf.surface_id > 0 {
                         state.toplevel_surface_ids.remove(&surf.surface_id);
                         state.last_request_frame_ms.remove(&surf.surface_id);
+                        state.pending_request_frames.remove(&surf.surface_id);
+                        state.frame_callback_toplevels.remove(&surf.surface_id);
                         state.last_reported_size.remove(&surf.surface_id);
                         state.surface_sizes.remove(&surf.surface_id);
                         if let Some(ref mut vk) = state.vulkan_renderer {
@@ -5400,6 +5423,9 @@ impl Dispatch<WpPresentation, ()> for Compositor {
                 let sid = surface.id();
                 if let Some(surf) = state.surfaces.get_mut(&sid) {
                     surf.pending_presentation_feedbacks.push(fb);
+                }
+                if let Some(toplevel_sid) = state.find_toplevel_root(&sid).1 {
+                    state.frame_callback_toplevels.insert(toplevel_sid);
                 }
             }
             Request::Destroy => {}
@@ -5901,6 +5927,12 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for Compositor {
                 state
                     .toplevel_surface_ids
                     .insert(surface_id, data.wl_surface_id.clone());
+                if state.surfaces.get(&data.wl_surface_id).is_some_and(|surf| {
+                    !surf.pending_frame_callbacks.is_empty()
+                        || !surf.pending_presentation_feedbacks.is_empty()
+                }) {
+                    state.frame_callback_toplevels.insert(surface_id);
+                }
 
                 // Say up front which of the state requests are worth making,
                 // so a client can leave the rest out of its titlebar instead
@@ -6154,6 +6186,9 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                     surf.xdg_fullscreen = false;
                     if sid > 0 {
                         state.toplevel_surface_ids.remove(&sid);
+                        state.last_request_frame_ms.remove(&sid);
+                        state.pending_request_frames.remove(&sid);
+                        state.frame_callback_toplevels.remove(&sid);
                         state.last_reported_size.remove(&sid);
                         state.surface_sizes.remove(&sid);
                         if let Some(ref mut vk) = state.vulkan_renderer {
@@ -9268,6 +9303,7 @@ fn run_compositor(
         last_request_frame_ms: HashMap::new(),
         last_topless_frame_ms: HashMap::new(),
         pending_request_frames: HashMap::new(),
+        frame_callback_toplevels: HashSet::new(),
         next_surface_id: 1,
         shm_pools: HashMap::new(),
         surface_meta: HashMap::new(),

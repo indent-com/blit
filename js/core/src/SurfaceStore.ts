@@ -1987,9 +1987,10 @@ export class SurfaceStore {
     p.queue.push(frame);
     p.sampleTokens.push(sampleToken);
 
-    // Hidden tabs never fire rAF, but decode output keeps arriving (the
-    // stream stays subscribed and ACKed).  Present immediately instead of
-    // queueing so every frame is closed promptly and the backing canvas
+    // Hidden tabs never fire rAF, but frames already in the decoder can keep
+    // arriving while the connection's unsubscribe crosses the wire (and a
+    // standalone store may remain subscribed). Present immediately instead
+    // of queueing so every frame is closed promptly and the backing canvas
     // holds the latest frame when the tab is refocused.
     if (
       typeof document !== "undefined" &&

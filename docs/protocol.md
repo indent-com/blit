@@ -61,7 +61,7 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 | `0x25` | `CLIPBOARD_SET`         | `[mime_len:2][mime:N][data_len:4][data:M]`                                                                                                                                                                                                       |
 | `0x26` | `SURFACE_LIST`          | _(empty)_ — request list of compositor surfaces                                                                                                                                                                                                  |
 | `0x27` | `SURFACE_CAPTURE`       | `[surface_id:2][format:1][quality:1]` — screenshot (0=PNG, 1=AVIF)                                                                                                                                                                               |
-| `0x28` | `SURFACE_SUBSCRIBE`     | `[surface_id:2][codec:1][bandwidth:1][speed:1][width:2][height:2]`                                                                                                                                                                               |
+| `0x28` | `SURFACE_SUBSCRIBE`     | `[surface_id:2][codec:1][bandwidth:1][speed:1][width:2][height:2][max_fps:2]`                                                                                                                                                                    |
 | `0x29` | `SURFACE_UNSUBSCRIBE`   | `[surface_id:2]`                                                                                                                                                                                                                                 |
 | `0x2A` | `SURFACE_ACK`           | `[surface_id:2]` — acknowledge receipt of video frame                                                                                                                                                                                            |
 | `0x2B` | `SURFACE_CLOSE`         | `[surface_id:2]` — request close of Wayland surface                                                                                                                                                                                              |
@@ -118,7 +118,7 @@ viewer receives a downscaled stream at its requested physical size.
 
 `RESIZE` is batched: after the opcode, the payload contains one or more `[pty_id:2][rows:2][cols:2]` triplets. Requires the `RESIZE_BATCH` feature bit in `S2C_HELLO`.
 
-`SURFACE_SUBSCRIBE` has optional trailing bytes for per-surface codec, bandwidth and speed control, and for a fixed encode size:
+`SURFACE_SUBSCRIBE` has optional trailing bytes for per-surface codec, bandwidth, speed, fixed encode size, and cadence control:
 
 - `codec` (byte 3): `CODEC_SUPPORT_*` bitmask restricting which codecs the server may use for this surface. `0` = use the connection-level default (from `C2S_CLIENT_FEATURES`).
 - `bandwidth` (byte 4): the **most** bits the surface may spend. `0` = server default (from `BLIT_SURFACE_BANDWIDTH`), `1` = low, `2` = medium, `3` = high, `4` = ultra, `5`–`9` reserved, `10`–`255` = an AV1 quantizer used as the floor. The server adapts below this ceiling on its own — there is no `auto` value to ask for and no way to switch adaptation off. What you pick is the best quality the encoder is allowed to produce; congestion moves it cheaper and recovery moves it back.
@@ -128,7 +128,9 @@ viewer receives a downscaled stream at its requested physical size.
 
   A viewer that is _handed_ a box rather than sizing one — a side-panel thumbnail — is what this is for. Without it such a viewer has only two options, and both are wrong: report its box and shrink the window for every other viewer, or report nothing and decode full-resolution video into a card.
 
-All the trailing bytes are optional — a 3-byte message uses connection/server defaults — but they are positional, so asking for a size means sending the preference bytes too (as zeros, if you have no preference). Re-subscribing to an already-subscribed surface with different values updates the preferences and/or the scaled size, and forces encoder recreation.
+- `max_fps` (bytes 10–11, LE u16): a ceiling for this subscription's source and delivery cadence. `0` or absent means the client's declared display rate. This is independent of the encode size, so a scaled recording can still request full cadence while a live thumbnail can request a cheaper rate.
+
+All the trailing bytes are optional — a 3-byte message uses connection/server defaults — but they are positional, so asking for a size or cadence means sending the earlier fields too (as zeros, if you have no preference). Re-subscribing to an already-subscribed surface updates the supplied values. Codec, bandwidth, speed, and size changes force encoder recreation; a cadence-only change does not.
 
 ## Server → Client (S2C)
 

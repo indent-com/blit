@@ -696,6 +696,8 @@ function plannedDropName(mime: string, index: number): string {
  * and forward option changes via setters.
  */
 export class BlitSurfaceCanvas {
+  /** Live previews do not need to drive applications at monitor refresh. */
+  private static readonly THUMBNAIL_MAX_FPS = 15;
   private _workspace: BlitWorkspace;
   private _connectionId: ConnectionId;
   private _surfaceId: number;
@@ -1551,10 +1553,12 @@ export class BlitSurfaceCanvas {
     ) {
       return;
     }
+    const target = this.scaledTarget();
     conn.sendSurfaceSubscribe(
       this._surfaceId,
       this.surfaceViewId(conn),
-      this.scaledTarget(),
+      target,
+      target ? BlitSurfaceCanvas.THUMBNAIL_MAX_FPS : 0,
     );
     this._subscribedGeneration = store.generation;
     this._subscribedSurface = {
@@ -1682,10 +1686,12 @@ export class BlitSurfaceCanvas {
     }
     const conn =
       (this._workspace as any).getConnection(sub.connectionId) ?? null;
+    const target = this.scaledTarget();
     conn?.setSurfaceViewTarget(
       sub.surfaceId,
       this._surfaceViewId,
-      this.scaledTarget(),
+      target,
+      target ? BlitSurfaceCanvas.THUMBNAIL_MAX_FPS : 0,
     );
   }
 

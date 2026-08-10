@@ -121,6 +121,62 @@ describe("TerminalStore WebGPU probe", () => {
 });
 
 describe("TerminalStore display-rate probe", () => {
+  it("reports 4 Hz while hidden and restores the measured rate on return", () => {
+    let rafCb: FrameRequestCallback | null = null;
+    let rafId = 0;
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      rafCb = cb;
+      return ++rafId;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {
+      rafCb = null;
+    });
+    const original = document.visibilityState;
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
+    const sent: Uint8Array[] = [];
+    const store = new TerminalStore(
+      {
+        send: (data) => sent.push(data),
+        getStatus: () => "connected",
+      },
+      wasm,
+    );
+    const interval = 1_000 / 120;
+    for (let i = 0; ; i++) {
+      const cb = rafCb;
+      if (!cb) break;
+      if (i > 1_000) throw new Error("rAF probe did not stop");
+      rafCb = null;
+      cb(1_000 + i * interval);
+    }
+
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "hidden",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+
+    const rates = sent
+      .filter((msg) => msg[0] === C2S_DISPLAY_RATE)
+      .map((msg) => msg[1] | (msg[2] << 8));
+    expect(rates).toEqual([120, 4, 120]);
+
+    store.destroy();
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: original,
+    });
+    vi.unstubAllGlobals();
+  });
+
   it("recovers 240 Hz from 0.1 ms-quantized rAF timestamps", () => {
     let rafCb: FrameRequestCallback | null = null;
     let rafId = 0;

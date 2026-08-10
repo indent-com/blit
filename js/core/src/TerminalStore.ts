@@ -56,6 +56,9 @@ export interface TerminalStoreDelegate {
 }
 
 export class TerminalStore {
+  /** Hidden documents retain low-rate liveness without spending a display
+   *  refresh worth of terminal and compositor work. */
+  private static readonly HIDDEN_DISPLAY_FPS = 4;
   private mod: BlitWasmModule | null = null;
   private terminals = new Map<number, Terminal>();
   private staleTerminals = new Map<number, Terminal>();
@@ -730,7 +733,13 @@ export class TerminalStore {
   }
 
   private startRafProbe(): void {
-    if (this.rafHandle || typeof requestAnimationFrame === "undefined") return;
+    if (
+      this.rafHandle ||
+      typeof requestAnimationFrame === "undefined" ||
+      (typeof document !== "undefined" &&
+        document.visibilityState === "hidden")
+    )
+      return;
     this.rafPrev = 0;
     this.rafProbeStartedAt = 0;
     this.rafSamples = [];
@@ -796,7 +805,15 @@ export class TerminalStore {
       return;
     this.visibilityHandler = () => {
       if (document.visibilityState === "visible") {
+        // Restore the last measured rate immediately; the fresh probe takes
+        // about 500 ms and should refine cadence, not hold it at 4 Hz.
+        this.sendDisplayFps();
         this.startRafProbe();
+      } else if (this.delegate.getStatus() === "connected") {
+        this.stopRafProbe();
+        this.delegate.send(
+          buildDisplayRateMessage(TerminalStore.HIDDEN_DISPLAY_FPS),
+        );
       }
     };
     document.addEventListener("visibilitychange", this.visibilityHandler);
@@ -813,7 +830,17 @@ export class TerminalStore {
   }
 
   private resync(): void {
-    this.sendDisplayFps();
+    if (
+      typeof document !== "undefined" &&
+      document.visibilityState === "hidden" &&
+      this.delegate.getStatus() === "connected"
+    ) {
+      this.delegate.send(
+        buildDisplayRateMessage(TerminalStore.HIDDEN_DISPLAY_FPS),
+      );
+    } else {
+      this.sendDisplayFps();
+    }
     this.subscribed.clear();
     this.syncSubscriptions();
   }

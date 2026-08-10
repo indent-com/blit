@@ -682,6 +682,11 @@ fn last_encoded_remove_for_sid(last_encoded: &mut HashMap<(u16, u64), LastEncode
     last_encoded.retain(|k, _| k.0 != sid);
 }
 
+/// Immutable metadata used by one delivery pass. Pixel buffers stay in
+/// `last_pixels`; this compact index is shared across ticks until the cache
+/// changes, avoiding a full map walk for PTY-only wakeups.
+type PixelSnapshot = (u16, u32, u32, u64, u32, u16);
+
 /// Authoritative compositor native dims for `sid`, preferring the value
 /// stored from the most recent `SurfaceResized` event.  Falls back to the
 /// largest entry in the per-target pixel snapshot when the resized event
@@ -697,7 +702,7 @@ fn last_encoded_remove_for_sid(last_encoded: &mut HashMap<(u16, u64), LastEncode
 /// visible frames at the stale target until the entry is cleared.
 fn compositor_native_for_sid(
     native_sizes: &HashMap<u16, (u32, u32)>,
-    pixel_snapshot: &[(u16, u32, u32, u64, u32, u16)],
+    pixel_snapshot: &[PixelSnapshot],
     sid: u16,
 ) -> Option<(u32, u32)> {
     if let Some(&dims) = native_sizes.get(&sid) {
@@ -725,11 +730,19 @@ struct SharedCompositor {
     /// without a registered external fall back to the largest entry
     /// (the native composite) and downscale themselves.
     last_pixels: HashMap<(u16, u32, u32), LastPixels>,
+    /// Copy-on-write metadata view of `last_pixels`. Rebuilt only after a
+    /// pixel-cache mutation, then shared by pointer across delivery ticks.
+    pixel_snapshot: Arc<Vec<PixelSnapshot>>,
+    pixel_snapshot_dirty: bool,
     /// Latest compositor-encoded bitstream per `(surface_id, client_id)`.
     last_encoded: HashMap<(u16, u64), LastEncoded>,
     /// Display-rate clocks currently installed in the compositor.  Kept here
     /// only to avoid sending unchanged clock configuration every tick.
     frame_clock_intervals: HashMap<u16, Duration>,
+    /// Subscription/display/surface topology changed since the last clock
+    /// reconciliation. Keeps unchanged delivery ticks out of the client ×
+    /// subscription scan.
+    frame_clocks_dirty: bool,
     #[cfg(target_os = "linux")]
     created_at: Instant,
     /// Monotonically increasing counter for pixel generations.
@@ -935,6 +948,29 @@ fn resize_action(
 }
 
 impl SharedCompositor {
+    fn mark_pixel_snapshot_dirty(&mut self) {
+        self.pixel_snapshot_dirty = true;
+    }
+
+    fn pixel_snapshot(&mut self) -> Arc<Vec<PixelSnapshot>> {
+        if self.pixel_snapshot_dirty {
+            let snapshot = Arc::make_mut(&mut self.pixel_snapshot);
+            snapshot.clear();
+            snapshot.extend(self.last_pixels.iter().map(|(&(sid, _, _), lp)| {
+                (
+                    sid,
+                    lp.width,
+                    lp.height,
+                    lp.generation,
+                    lp.timestamp_ms,
+                    lp.timestamp_sub_us,
+                )
+            }));
+            self.pixel_snapshot_dirty = false;
+        }
+        Arc::clone(&self.pixel_snapshot)
+    }
+
     /// Hand a resize to the compositor and open a fresh settle window.
     fn dispatch_resize(
         &mut self,
@@ -1363,6 +1399,10 @@ struct SurfaceSubState {
     wants_opaque_444: bool,
     /// Next tick this surface may send a frame (pacing deadline).
     next_send_at: Option<Instant>,
+    /// Actual shared compositor clock for this surface. Delivery needs a
+    /// second cadence gate only when another viewer drives the source faster
+    /// than this subscription requested.
+    source_interval: Option<Duration>,
     /// Frames remaining in the post-subscribe burst window that
     /// bypass time-based pacing so bandwidth estimates ramp up fast
     /// on high-latency links.
@@ -1476,6 +1516,10 @@ struct SurfaceSubState {
     /// `None` — the default — means the client participates in mediation via
     /// C2S_SURFACE_RESIZE like any other viewer.
     scaled_target: Option<(u16, u16)>,
+    /// Explicit cadence ceiling from C2S_SURFACE_SUBSCRIBE. `None` uses the
+    /// client's display rate; thumbnails set a lower value without changing
+    /// the cadence of a full-size view of another surface.
+    max_fps: Option<f32>,
     /// EWMA of this surface's encoded frame size in bytes.  Per surface
     /// (unlike `avg_surface_frame_bytes`) so a client watching two
     /// surfaces can split its bandwidth budget between them.  0 = no
@@ -2397,8 +2441,13 @@ fn update_surface_decoder_queue(sub: &mut SurfaceSubState, depth: u8, now: Insta
 /// the controller is meant to prevent.  Real transport overload is bounded by
 /// the socket writer/outbox; decoder pressure buys cheaper frames, never fewer
 /// frames.
-fn surface_pacing_fps(client: &ClientState, _surface_id: u16) -> f32 {
-    client.display_fps.max(1.0)
+fn surface_pacing_fps(client: &ClientState, surface_id: u16) -> f32 {
+    client
+        .surface_subs
+        .get(&surface_id)
+        .and_then(|s| s.max_fps)
+        .map_or(client.display_fps, |limit| client.display_fps.min(limit))
+        .max(1.0)
 }
 
 fn surface_send_interval(client: &ClientState, surface_id: u16) -> Duration {
@@ -2410,23 +2459,28 @@ fn surface_send_interval(client: &ClientState, surface_id: u16) -> Duration {
 /// in the busier delivery loop can only discard fresh generations when that
 /// loop wakes a fraction late.
 fn surface_delivery_is_throttled(client: &ClientState, surface_id: u16) -> bool {
-    surface_pacing_fps(client, surface_id) < client.display_fps.max(1.0)
+    let desired = surface_send_interval(client, surface_id);
+    client
+        .surface_subs
+        .get(&surface_id)
+        .and_then(|sub| sub.source_interval)
+        .is_some_and(|source| desired > source)
 }
 
 /// Wayland source cadence is a display property, not a transport property.
 /// Encoding and delivery may pace down under congestion, but feeding that
 /// decision back into `wl_surface.frame` slows the application itself and
 /// makes its rAF clock depend on network RTT.
-fn surface_source_interval(client: &ClientState) -> Duration {
-    Duration::from_secs_f64(1.0 / client.display_fps.max(1.0) as f64)
+fn surface_source_interval(client: &ClientState, surface_id: u16) -> Duration {
+    Duration::from_secs_f64(1.0 / surface_pacing_fps(client, surface_id) as f64)
 }
 
 /// Vulkan Video sessions pace before encoding, because dropping their output
-/// afterwards would break the decoder's reference chain.  Keep the historical
-/// 24 fps floor for diagnostic low-rate clients; the compositor source clock
-/// remains the effective limiter below it.
-fn vulkan_encoder_interval_us(display_fps: f32) -> u32 {
-    (1_000_000.0 / display_fps.max(24.0)) as u32
+/// afterwards would break the decoder's reference chain. Honor low-rate
+/// subscriptions directly: another viewer may drive the shared source faster,
+/// so relying on the source clock alone would still over-encode this session.
+fn vulkan_encoder_interval_us(pacing_fps: f32) -> u32 {
+    (1_000_000.0 / pacing_fps.max(1.0)) as u32
 }
 
 /// Update the server-side cadence cache and return only the compositor
@@ -2436,8 +2490,12 @@ fn reconcile_vulkan_encoder_intervals(
 ) -> Vec<(u32, u64, u32)> {
     let mut updates = Vec::new();
     for (&client_id, client) in clients {
-        let min_interval_us = vulkan_encoder_interval_us(client.display_fps);
-        for (&surface_id, state) in &mut client.vulkan_video_surfaces {
+        let surface_ids: SmallVec<[u16; 4]> =
+            client.vulkan_video_surfaces.keys().copied().collect();
+        for surface_id in surface_ids {
+            let min_interval_us =
+                vulkan_encoder_interval_us(surface_pacing_fps(client, surface_id));
+            let state = client.vulkan_video_surfaces.get_mut(&surface_id).unwrap();
             if state.min_interval_us == min_interval_us {
                 continue;
             }
@@ -3574,6 +3632,14 @@ fn parse_display_rate(data: &[u8]) -> Option<f32> {
     (fps > 0).then_some(fps as f32)
 }
 
+fn parse_surface_max_fps(data: &[u8]) -> Option<f32> {
+    if data.len() < 12 || data[0] != C2S_SURFACE_SUBSCRIBE {
+        return None;
+    }
+    let fps = u16::from_le_bytes([data[10], data[11]]);
+    (fps > 0).then_some(fps as f32)
+}
+
 /// Longest `C2S_SEARCH` query accepted, in bytes.
 ///
 /// The query is a regex, compiled once per PTY on every search while the
@@ -3840,6 +3906,7 @@ impl Session {
                 },
             );
             cs.last_pixels.remove(&(surface_id, tw, th));
+            cs.mark_pixel_snapshot_dirty();
         }
         cs.handle.wake();
     }
@@ -3957,8 +4024,11 @@ impl Session {
                 wayland_clipboard_owned: false,
                 surfaces: HashMap::new(),
                 last_pixels: HashMap::new(),
+                pixel_snapshot: Arc::new(Vec::new()),
+                pixel_snapshot_dirty: false,
                 last_encoded: HashMap::new(),
                 frame_clock_intervals: HashMap::new(),
+                frame_clocks_dirty: true,
                 #[cfg(target_os = "linux")]
                 created_at,
                 pixel_generation: 0,
@@ -5638,16 +5708,15 @@ pub async fn run(config: Config) {
 /// frames.  Also used as the maximum tick-loop sleep so the loop never
 /// blocks longer than this.
 ///
-/// When any client has an active surface subscription, use 62.5 ms (16 Hz)
-/// so video players keep getting frame callbacks.  Without active surfaces,
-/// 250 ms (4 Hz) is enough to keep apps from stalling entirely.
+/// Unwatched applications receive only 4 Hz even while another surface is
+/// active. A watched surface owns an independent fixed-rate clock; raising
+/// every other application to 16 Hz spends application and compositor CPU
+/// on frames no client consumes.
 ///
 /// This is a floor on liveness, not the frame rate: a subscribed surface is
-/// paced by `frame_window` and the adaptive controller, which run far above
-/// 16 Hz.  The blanket round only exists so an app nobody is watching still
-/// makes progress.
-const BLANKET_FRAME_INTERVAL_IDLE: Duration = Duration::from_millis(250);
-const BLANKET_FRAME_INTERVAL_SURFACE: Duration = Duration::from_micros(62_500);
+/// paced by its subscription clock. The blanket round only exists so an app
+/// nobody is watching still makes progress.
+const BLANKET_FRAME_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Returns the interval at which the tick loop must send blanket
 /// `RequestFrame` events to keep Wayland apps (mpv, browsers, etc.)
@@ -5658,15 +5727,7 @@ fn blanket_frame_interval(sess: &Session) -> Option<Duration> {
     if sess.clients.is_empty() {
         return None;
     }
-    let has_surface_subs = sess
-        .clients
-        .values()
-        .any(|c| !c.surface_subscriptions.is_empty());
-    if has_surface_subs {
-        Some(BLANKET_FRAME_INTERVAL_SURFACE)
-    } else {
-        Some(BLANKET_FRAME_INTERVAL_IDLE)
-    }
+    Some(BLANKET_FRAME_INTERVAL)
 }
 
 async fn tick(state: &AppState) -> TickOutcome {
@@ -5750,12 +5811,15 @@ async fn tick(state: &AppState) -> TickOutcome {
                         },
                     );
                     last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
+                    cs.mark_pixel_snapshot_dirty();
                     last_encoded_remove_for_sid(&mut cs.last_encoded, surface_id);
+                    cs.frame_clocks_dirty = true;
                     invalidate_client_encoders.push(surface_id);
                 }
                 CompositorEvent::SurfaceDestroyed { surface_id } => {
                     cs.surfaces.remove(&surface_id);
                     last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
+                    cs.mark_pixel_snapshot_dirty();
                     last_encoded_remove_for_sid(&mut cs.last_encoded, surface_id);
                     cs.last_configured_size.remove(&surface_id);
                     cs.last_resize_at.remove(&surface_id);
@@ -5763,6 +5827,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     cs.resize_inflight.remove(&surface_id);
                     cs.native_sizes.remove(&surface_id);
                     cs.frame_clock_intervals.remove(&surface_id);
+                    cs.frame_clocks_dirty = true;
                     cs.handle.set_frame_interval(surface_id, None);
                     invalidate_client_encoders.push(surface_id);
                     broadcast.push(msg_surface_destroyed(surface_id));
@@ -5797,6 +5862,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         timestamp_sub_us,
                         encoder_skip,
                     );
+                    cs.mark_pixel_snapshot_dirty();
                 }
                 CompositorEvent::SurfaceEncoded {
                     frame,
@@ -5899,6 +5965,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     cs.resize_inflight.remove(&surface_id);
                     if resolution_changed {
                         last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
+                        cs.mark_pixel_snapshot_dirty();
                         last_encoded_remove_for_sid(&mut cs.last_encoded, surface_id);
                         // Don't eagerly invalidate client encoders here.  The
                         // encode path already checks for dimension mismatches
@@ -6002,8 +6069,10 @@ async fn tick(state: &AppState) -> TickOutcome {
             // interacts with may never give it a reason to.
             let still_subscribed = c.surface_subscriptions.contains(&sid);
             let previous = c.surface_subs.remove(&sid);
-            if still_subscribed && let Some(target) = previous.and_then(|s| s.scaled_target) {
-                c.surface_subs.entry(sid).or_default().scaled_target = Some(target);
+            if still_subscribed && let Some(previous) = previous {
+                let state = c.surface_subs.entry(sid).or_default();
+                state.scaled_target = previous.scaled_target;
+                state.max_fps = previous.max_fps;
             }
             had_vulkan |= c.vulkan_video_surfaces.remove(&sid).is_some();
             forget_surface_inflight(c, sid);
@@ -6155,49 +6224,19 @@ async fn tick(state: &AppState) -> TickOutcome {
     // Each client has its own encoder per surface.  We encode from
     // shared last_pixels into each client's encoder and deliver.
     //
-    // Snapshot pixel metadata from the compositor first to avoid
-    // holding an immutable borrow on sess.compositor while mutating
-    // sess.clients.
-    // Snapshot every surface entry so each client's per-surface encoder
-    // can draw from the latest pixels without holding the compositor
-    // borrow through the (lengthy) encoder-dispatch loop below.
+    // Share the cached pixel metadata index so each client's per-surface
+    // encoder can draw from the latest pixels without holding the compositor
+    // borrow through the (lengthy) encoder-dispatch loop below. PTY-only and
+    // deadline wakeups reuse the same allocation until a surface commit
+    // changes the cache.
     // (sid, width, height, generation, timestamp_ms, timestamp_sub_us) per target
     // entry.  One sid can appear several times — once for each
     // distinct (width, height) the renderer produced (per-encoder
     // target plus the native composite).
-    type PixelSnapshot = (u16, u32, u32, u64, u32, u16);
-    let pixel_snapshot: SmallVec<[PixelSnapshot; 8]> = sess
+    let pixel_snapshot: Arc<Vec<PixelSnapshot>> = sess
         .compositor
-        .as_ref()
-        .map(|cs| {
-            cs.last_pixels
-                .iter()
-                .map(|(&(sid, _, _), lp)| {
-                    (
-                        sid,
-                        lp.width,
-                        lp.height,
-                        lp.generation,
-                        lp.timestamp_ms,
-                        lp.timestamp_sub_us,
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    // Compositor-encoded bitstreams live on their own generation stream,
-    // one per `(surface, client)`.  Snapshotted here so the encode loop can
-    // ask "does this client already have this frame?" without reaching back
-    // into `sess.compositor` while it holds a client borrow.
-    let encoded_snapshot: HashMap<(u16, u64), u64> = sess
-        .compositor
-        .as_ref()
-        .map(|cs| {
-            cs.last_encoded
-                .iter()
-                .map(|(&key, e)| (key, e.generation))
-                .collect()
-        })
+        .as_mut()
+        .map(SharedCompositor::pixel_snapshot)
         .unwrap_or_default();
     if pixel_snapshot.is_empty() {
         sess.ticks_pixel_snapshot_empty = sess.ticks_pixel_snapshot_empty.saturating_add(1);
@@ -6435,7 +6474,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // historical "largest pixel snapshot" pick is wrong
                 // after a resize).
                 let Some((native_w, native_h)) = sess.compositor.as_ref().and_then(|cs| {
-                    compositor_native_for_sid(&cs.native_sizes, &pixel_snapshot, sid)
+                    compositor_native_for_sid(&cs.native_sizes, pixel_snapshot.as_slice(), sid)
                 }) else {
                     let client = sess.clients.get_mut(&work.cid).unwrap();
                     client.skip_last_pixels_mismatch_count =
@@ -6485,6 +6524,11 @@ async fn tick(state: &AppState) -> TickOutcome {
                     let client = sess.clients.get_mut(&work.cid).unwrap();
                     client.encode_loop_iters = client.encode_loop_iters.saturating_add(1);
                 }
+                let encoded_generation = sess
+                    .compositor
+                    .as_ref()
+                    .and_then(|cs| cs.last_encoded.get(&(sid, work.cid)))
+                    .map(|e| e.generation);
                 let client = sess.clients.get_mut(&work.cid).unwrap();
 
                 // Per-surface pacing gate. At full display rate the source
@@ -6622,12 +6666,9 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // fed from.
                 let has_vulkan_enc = client.vulkan_video_surfaces.contains_key(&sid);
                 let latest_gen = if has_vulkan_enc {
-                    match encoded_snapshot.get(&(sid, work.cid)) {
-                        Some(&g) => g,
-                        // The session exists but has not produced anything
-                        // yet; there is nothing to hold still.
-                        None => u64::MAX,
-                    }
+                    // The session exists but may not have produced anything
+                    // yet; in that case there is nothing to hold still.
+                    encoded_generation.unwrap_or(u64::MAX)
                 } else {
                     px_gen
                 };
@@ -7197,7 +7238,8 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // rate: composites arrive faster than the client
                         // consumes, and every encoded-but-undelivered frame
                         // would break the delta chain.
-                        let min_interval_us = vulkan_encoder_interval_us(client.display_fps);
+                        let min_interval_us =
+                            vulkan_encoder_interval_us(surface_pacing_fps(client, sid));
                         pending_vulkan_encoder_setups.push(VulkanEncoderSetup {
                             surface_id: sid as u32,
                             client_id: work.cid,
@@ -7437,6 +7479,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     },
                 );
                 cs.last_pixels.remove(&(surface_id as u16, tw, th));
+                cs.mark_pixel_snapshot_dirty();
             }
             cs.handle.wake();
         }
@@ -8171,6 +8214,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // entries (e.g. native BGRA from a previous
                         // tick) will be re-added by SurfaceCommit.
                         last_pixels_remove_for_sid(&mut cs.last_pixels, result.sid);
+                        cs.mark_pixel_snapshot_dirty();
                     }
                 }
                 #[cfg(target_os = "linux")]
@@ -8210,6 +8254,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         // the encode loop can't pick it up after we've
                         // moved on.
                         cs.last_pixels.remove(&(result.sid, pw, ph));
+                        cs.mark_pixel_snapshot_dirty();
                     }
                     // Whether the NV12 OPAQUE_FD shape is safe for this
                     // target, which is a property of *every* subscriber at
@@ -8350,39 +8395,57 @@ async fn tick(state: &AppState) -> TickOutcome {
     // its configuration when subscriptions or display rates change.  A slow
     // encoder, a closed transport window, or 200 ms of RTT can therefore
     // discard stream frames without slowing the application/rAF clock.
+    let reconcile_cadence = sess
+        .compositor
+        .as_ref()
+        .is_some_and(|cs| cs.frame_clocks_dirty);
     {
-        let mut desired_clocks: HashMap<u16, Duration> = HashMap::new();
-        for client in sess.clients.values() {
-            for &sid in &client.surface_subscriptions {
-                let interval = surface_source_interval(client);
-                desired_clocks
-                    .entry(sid)
-                    .and_modify(|current| *current = (*current).min(interval))
-                    .or_insert(interval);
+        let mut desired_clocks = reconcile_cadence.then(|| {
+            let mut clocks: HashMap<u16, Duration> = HashMap::new();
+            for client in sess.clients.values() {
+                for &sid in &client.surface_subscriptions {
+                    let interval = surface_source_interval(client, sid);
+                    clocks
+                        .entry(sid)
+                        .and_modify(|current| *current = (*current).min(interval))
+                        .or_insert(interval);
+                }
+            }
+            clocks
+        });
+        if let Some(clocks) = desired_clocks.as_ref() {
+            for client in sess.clients.values_mut() {
+                for &sid in &client.surface_subscriptions {
+                    client.surface_subs.entry(sid).or_default().source_interval =
+                        clocks.get(&sid).copied();
+                }
             }
         }
 
         let blanket_interval = blanket_frame_interval(&sess);
         if let Some(cs) = sess.compositor.as_mut() {
-            // A stale subscription can briefly outlive its Wayland surface;
-            // do not leave a useless high-rate clock installed for it.
-            desired_clocks.retain(|sid, _| cs.surfaces.contains_key(sid));
+            if let Some(desired_clocks) = desired_clocks.as_mut() {
+                // A stale subscription can briefly outlive its Wayland
+                // surface; do not leave a useless high-rate clock installed.
+                desired_clocks.retain(|sid, _| cs.surfaces.contains_key(sid));
 
-            let removed: Vec<u16> = cs
-                .frame_clock_intervals
-                .keys()
-                .filter(|sid| !desired_clocks.contains_key(sid))
-                .copied()
-                .collect();
-            for sid in removed {
-                cs.handle.set_frame_interval(sid, None);
-                cs.frame_clock_intervals.remove(&sid);
-            }
-            for (&sid, &interval) in &desired_clocks {
-                if cs.frame_clock_intervals.get(&sid) != Some(&interval) {
-                    cs.handle.set_frame_interval(sid, Some(interval));
-                    cs.frame_clock_intervals.insert(sid, interval);
+                let removed: Vec<u16> = cs
+                    .frame_clock_intervals
+                    .keys()
+                    .filter(|sid| !desired_clocks.contains_key(sid))
+                    .copied()
+                    .collect();
+                for sid in removed {
+                    cs.handle.set_frame_interval(sid, None);
+                    cs.frame_clock_intervals.remove(&sid);
                 }
+                for (&sid, &interval) in desired_clocks.iter() {
+                    if cs.frame_clock_intervals.get(&sid) != Some(&interval) {
+                        cs.handle.set_frame_interval(sid, Some(interval));
+                        cs.frame_clock_intervals.insert(sid, interval);
+                    }
+                }
+                cs.frame_clocks_dirty = false;
             }
 
             // Unwatched surfaces retain the low-rate liveness callback.  Do
@@ -8393,7 +8456,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 && now.duration_since(cs.last_blanket_frame_request) >= interval
             {
                 for &sid in cs.surfaces.keys() {
-                    if desired_clocks.contains_key(&sid) {
+                    if cs.frame_clock_intervals.contains_key(&sid) {
                         continue;
                     }
                     if cs
@@ -8426,7 +8489,7 @@ async fn tick(state: &AppState) -> TickOutcome {
     // on a C2S_DISPLAY_RATE change is both unnecessary and visible (new
     // session, forced keyframe).  The client update nudges this tick, so the
     // new interval is installed without waiting for a surface commit.
-    let vulkan_interval_updates = if sess.compositor.is_some() {
+    let vulkan_interval_updates = if reconcile_cadence && sess.compositor.is_some() {
         reconcile_vulkan_encoder_intervals(&mut sess.clients)
     } else {
         Vec::new()
@@ -12434,8 +12497,18 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             // ceiling on high-refresh or diagnostic streams.
             if let Some(fps) = parse_display_rate(&data) {
                 let mut sess = state.session.lock().await;
+                let mut cadence_changed = false;
                 if let Some(c) = sess.clients.get_mut(&client_id) {
+                    cadence_changed = c.display_fps != fps;
                     c.display_fps = fps;
+                    if cadence_changed {
+                        for sub in c.surface_subs.values_mut() {
+                            sub.next_send_at = None;
+                        }
+                    }
+                }
+                if cadence_changed && let Some(cs) = sess.compositor.as_mut() {
+                    cs.frame_clocks_dirty = true;
                 }
                 sess.sync_compositor_refresh_rate();
             }
@@ -13590,9 +13663,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 } else {
                     None
                 };
+                // Append-only cadence ceiling. Zero/absent keeps the
+                // connection display rate and remains compatible with every
+                // pre-cadence client and server.
+                let max_fps = parse_surface_max_fps(&data);
                 let mut destroy_vulkan_enc_sid = None;
                 let mut first_subscribe = false;
                 let mut meaningful_change = false;
+                let mut cadence_changed = false;
                 let mut keyframe_requested = false;
                 // Joining or leaving the scaled set changes who mediation
                 // counts, so the surface has to be re-mediated even though
@@ -13605,6 +13683,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     let new_speed = SurfaceSpeed::from_wire(speed_wire);
 
                     let state = c.surface_subs.entry(surface_id).or_default();
+                    cadence_changed = state.max_fps != max_fps;
                     // A changed scaled target means a different encode size,
                     // so it invalidates the encoder exactly like the other
                     // three preferences do.
@@ -13625,6 +13704,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     state.bandwidth_override = new_bandwidth;
                     state.speed_override = new_speed;
                     state.scaled_target = scaled_target;
+                    state.max_fps = max_fps;
+                    if cadence_changed {
+                        // Do not inherit a deadline from the previous rate.
+                        // The next fresh generation establishes the new phase.
+                        state.next_send_at = None;
+                    }
                     if prefs_changed {
                         // The encoder is about to be rebuilt and may not come
                         // back as the same backend — a client that just gained
@@ -13675,8 +13760,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     // First subscriptions and preference changes always
                     // invalidate the old reference chain and bypass the
                     // cooldown.
-                    keyframe_requested =
-                        request_surface_keyframe(state, Instant::now(), meaningful_change);
+                    keyframe_requested = if cadence_changed && !meaningful_change {
+                        false
+                    } else {
+                        request_surface_keyframe(state, Instant::now(), meaningful_change)
+                    };
                     first_subscribe = !was_subscribed;
                     if was_subscribed
                         && prefs_changed
@@ -13685,6 +13773,11 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         destroy_vulkan_enc_sid = Some(surface_id);
                     }
                 }
+                if (first_subscribe || cadence_changed)
+                    && let Some(cs) = sess.compositor.as_mut()
+                {
+                    cs.frame_clocks_dirty = true;
+                }
                 if state.config.verbose {
                     static SUBSCRIBE_LOGS: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
@@ -13692,9 +13785,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     // Meaningful changes and accepted recovery requests are
                     // useful diagnostics. Suppressed duplicates are sampled
                     // so a client-side loop cannot fill stderr by itself.
-                    if meaningful_change || keyframe_requested || n < 20 || n.is_multiple_of(1000) {
+                    if meaningful_change
+                        || cadence_changed
+                        || keyframe_requested
+                        || n < 20
+                        || n.is_multiple_of(1000)
+                    {
                         deferred_verbose_log = Some(format!(
-                            "C2S_SURFACE_SUBSCRIBE #{n}: cid={client_id} surface={surface_id} codec={codec_support:#04x} bandwidth={bandwidth_wire} speed={speed_wire} scaled={scaled_target:?} meaningful={meaningful_change} keyframe={keyframe_requested}"
+                            "C2S_SURFACE_SUBSCRIBE #{n}: cid={client_id} surface={surface_id} codec={codec_support:#04x} bandwidth={bandwidth_wire} speed={speed_wire} scaled={scaled_target:?} max_fps={max_fps:?} meaningful={meaningful_change} cadence_changed={cadence_changed} keyframe={keyframe_requested}"
                         ));
                     }
                 }
@@ -13755,6 +13853,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     forget_surface_inflight(c, surface_id);
                     removed_vulkan = c.vulkan_video_surfaces.remove(&surface_id).is_some();
                     c.surface_view_sizes.remove(&surface_id);
+                }
+                if let Some(cs) = sess.compositor.as_mut() {
+                    cs.frame_clocks_dirty = true;
                 }
                 // Drop the per-client downscale target this client had
                 // registered so the compositor stops blitting into a
@@ -14361,6 +14462,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             cs.audio_broadcast.unsubscribe(client_id);
         }
         let client = sess.clients.remove(&client_id);
+        if let Some(cs) = sess.compositor.as_mut() {
+            cs.frame_clocks_dirty = true;
+        }
         // The departing client may have owned the maximum refresh rate.
         // Recompute after removal so the Wayland output follows the fastest
         // display that is still connected (or returns to 60 Hz when idle).
@@ -18543,9 +18647,31 @@ mod tests {
         assert_eq!(surface_pacing_fps(&client, 1), client.display_fps);
         assert!(!surface_delivery_is_throttled(&client, 1));
         assert_eq!(
-            surface_source_interval(&client),
+            surface_source_interval(&client, 1),
             Duration::from_secs_f64(1.0 / 145.0)
         );
+    }
+
+    #[test]
+    fn per_surface_cadence_caps_source_and_delivery() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        client.display_fps = 120.0;
+        let sub = client.surface_subs.entry(1).or_default();
+        sub.max_fps = Some(15.0);
+        sub.source_interval = Some(Duration::from_secs_f64(1.0 / 15.0));
+
+        assert_eq!(surface_pacing_fps(&client, 1), 15.0);
+        assert_eq!(
+            surface_source_interval(&client, 1),
+            Duration::from_secs_f64(1.0 / 15.0)
+        );
+        assert!(!surface_delivery_is_throttled(&client, 1));
+
+        // A second viewer can drive the shared application clock at 120 Hz;
+        // this 15 Hz subscriber must then pace its own delivery.
+        client.surface_subs.get_mut(&1).unwrap().source_interval =
+            Some(Duration::from_secs_f64(1.0 / 120.0));
+        assert!(surface_delivery_is_throttled(&client, 1));
     }
 
     #[test]
@@ -18554,6 +18680,17 @@ mod tests {
         assert_eq!(parse_display_rate(&precise), Some(239.976));
         assert_eq!(parse_display_rate(&[C2S_DISPLAY_RATE, 145, 0]), Some(145.0));
         assert_eq!(parse_display_rate(&[C2S_DISPLAY_RATE, 0, 0]), None);
+    }
+
+    #[test]
+    fn surface_max_fps_is_append_only_and_zero_means_display_rate() {
+        let mut message = [0u8; 12];
+        message[0] = C2S_SURFACE_SUBSCRIBE;
+        message[10..12].copy_from_slice(&15u16.to_le_bytes());
+        assert_eq!(parse_surface_max_fps(&message), Some(15.0));
+        assert_eq!(parse_surface_max_fps(&message[..10]), None);
+        message[10..12].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(parse_surface_max_fps(&message), None);
     }
 
     #[test]

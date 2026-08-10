@@ -511,6 +511,18 @@ export interface SurfaceTarget {
   height: number;
 }
 
+function normalizeSurfaceMaxFps(maxFps: number): number {
+  return Number.isFinite(maxFps)
+    ? Math.max(0, Math.min(65_535, Math.round(maxFps)))
+    : 0;
+}
+
+interface SurfaceViewRequest {
+  target: SurfaceTarget | null;
+  /** Zero means the connection's declared display rate. */
+  maxFps: number;
+}
+
 /** Per-surface subscription state.  One entry per visible surface on
  *  this connection.  `views` tracks the live mounts (e.g. BSP view plus
  *  side-panel preview) sharing the stream: the wire UNSUBSCRIBE fires
@@ -518,12 +530,12 @@ export interface SurfaceTarget {
  *  two mounts tears down the stream for both. */
 interface SurfaceSub {
   surfaceId: number;
-  /** Live mounts, keyed by the token allocSurfaceViewId() handed out.
-   *  The value is the fixed encode size that view wants, or null when it
-   *  wants the mediated surface at full size.  Held per view rather than
-   *  collapsed to a count because the effective request is derived from
-   *  all of them — and on unmount we have to know which one left. */
-  views: Map<string, SurfaceTarget | null>;
+  /** Live mounts, keyed by the token allocSurfaceViewId() handed out. Each
+   *  request carries the fixed encode size and cadence that view wants.
+   *  Held per view rather than collapsed to a count because the effective
+   *  request is derived from all of them — and on unmount we have to know
+   *  which one left. */
+  views: Map<string, SurfaceViewRequest>;
   /** Bandwidth override set via {@link BlitConnection.sendSurfaceResubscribe}. */
   bandwidthOverride: number | null;
   /** Speed override set via {@link BlitConnection.sendSurfaceResubscribe}. */
@@ -534,6 +546,7 @@ interface SurfaceSub {
     speed: number;
     width: number;
     height: number;
+    maxFps: number;
   } | null;
   /** When the last mount has gone away we schedule a deferred wire
    *  UNSUBSCRIBE instead of firing it immediately.  Moving a surface
@@ -771,6 +784,11 @@ export class BlitConnection {
   /** When false, surface subscribe messages are suppressed (ref-counts
    *  still tracked so re-enabling restores subscriptions). */
   surfaceStreamingEnabled = true;
+  /** Page visibility is an effective streaming gate, separate from the
+   *  user's persistent video preference above. */
+  private pageVisible =
+    typeof document === "undefined" || document.visibilityState !== "hidden";
+  private pageVisibilityHandler: (() => void) | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private readonly pingIntervalMs = 10_000;
   private clockPingNonce = 0;
@@ -898,6 +916,15 @@ export class BlitConnection {
     this.transport.addEventListener("message", this.handleMessage);
     this.transport.addEventListener("statuschange", this.handleStatusChange);
     this.store.handleStatusChange(this.transport.status);
+    if (typeof document !== "undefined") {
+      this.pageVisibilityHandler = () => {
+        this.setPageVisible(document.visibilityState !== "hidden");
+      };
+      document.addEventListener(
+        "visibilitychange",
+        this.pageVisibilityHandler,
+      );
+    }
 
     // Propagate AudioPlayer state changes (e.g. reset on reconnect) into the
     // connection's listener chain so the reactive graph re-evaluates audio
@@ -959,6 +986,13 @@ export class BlitConnection {
     this.pendingClockPings.clear();
     this.transport.removeEventListener("message", this.handleMessage);
     this.transport.removeEventListener("statuschange", this.handleStatusChange);
+    if (this.pageVisibilityHandler && typeof document !== "undefined") {
+      document.removeEventListener(
+        "visibilitychange",
+        this.pageVisibilityHandler,
+      );
+      this.pageVisibilityHandler = null;
+    }
     this.rejectPendingCreates(
       connectionError("Connection disposed before PTY creation completed"),
     );
@@ -3414,12 +3448,23 @@ export class BlitConnection {
   private effectiveSurfaceTarget(sub: SurfaceSub): SurfaceTarget | null {
     let width = 0;
     let height = 0;
-    for (const target of sub.views.values()) {
-      if (!target) return null;
-      width = Math.max(width, target.width);
-      height = Math.max(height, target.height);
+    for (const view of sub.views.values()) {
+      if (!view.target) return null;
+      width = Math.max(width, view.target.width);
+      height = Math.max(height, view.target.height);
     }
     return width > 0 && height > 0 ? { width, height } : null;
+  }
+
+  /** Highest cadence any live view needs. Zero (uncapped) wins, just as an
+   *  unscaled target wins the resolution derivation above. */
+  private effectiveSurfaceMaxFps(sub: SurfaceSub): number {
+    let maxFps = 0;
+    for (const view of sub.views.values()) {
+      if (view.maxFps <= 0) return 0;
+      maxFps = Math.max(maxFps, view.maxFps);
+    }
+    return maxFps;
   }
 
   /** Grace window before a refCount=0 subscription's wire UNSUB fires.
@@ -3466,24 +3511,27 @@ export class BlitConnection {
 
   private maybeSendSurfaceSubscribe(sub: SurfaceSub): void {
     if (this.transport.status !== "connected") return;
-    if (!this.surfaceStreamingEnabled) return;
+    if (!this.surfaceStreamingEnabled || !this.pageVisible) return;
+    if (sub.views.size === 0) return;
     const bandwidth = sub.bandwidthOverride ?? this.defaultSurfaceBandwidth;
     const speed = sub.speedOverride ?? this.defaultSurfaceSpeed;
     const target = this.effectiveSurfaceTarget(sub);
     const width = target?.width ?? 0;
     const height = target?.height ?? 0;
+    const maxFps = this.effectiveSurfaceMaxFps(sub);
     if (
       sub.lastSent !== null &&
       sub.lastSent.bandwidth === bandwidth &&
       sub.lastSent.speed === speed &&
       sub.lastSent.width === width &&
-      sub.lastSent.height === height
+      sub.lastSent.height === height &&
+      sub.lastSent.maxFps === maxFps
     ) {
       return;
     }
-    sub.lastSent = { bandwidth, speed, width, height };
+    sub.lastSent = { bandwidth, speed, width, height, maxFps };
     this._logger.info(
-      `surface sub ${this.id}:${sub.surfaceId}${target ? ` @${width}x${height}` : ""}`,
+      `surface sub ${this.id}:${sub.surfaceId}${target ? ` @${width}x${height}` : ""}${maxFps ? ` ${maxFps}fps` : ""}`,
     );
     this.transport.send(
       buildSurfaceSubscribeMessage(
@@ -3493,6 +3541,7 @@ export class BlitConnection {
         speed,
         width,
         height,
+        maxFps,
       ),
     );
   }
@@ -3505,12 +3554,14 @@ export class BlitConnection {
    * `viewId` comes from {@link allocSurfaceViewId} and identifies this view
    * for the lifetime of its mount.  `target` asks the server to encode a
    * fixed-size downscale for this client instead of sizing the surface to
-   * fit — pass null to watch the surface at its mediated size.
+   * fit — pass null to watch the surface at its mediated size. `maxFps`
+   * limits this view's cadence; zero uses the display rate.
    */
   sendSurfaceSubscribe(
     surfaceId: number,
     viewId: string,
     target: SurfaceTarget | null = null,
+    maxFps: number = 0,
   ): void {
     let sub = this.surfaceSubs.get(surfaceId);
     if (!sub) {
@@ -3529,7 +3580,10 @@ export class BlitConnection {
       clearTimeout(sub.pendingUnsub);
       sub.pendingUnsub = null;
     }
-    sub.views.set(viewId, target);
+    sub.views.set(viewId, {
+      target,
+      maxFps: normalizeSurfaceMaxFps(maxFps),
+    });
     this.maybeSendSurfaceSubscribe(sub);
   }
 
@@ -3539,17 +3593,23 @@ export class BlitConnection {
     surfaceId: number,
     viewId: string,
     target: SurfaceTarget | null,
+    maxFps?: number,
   ): void {
     const sub = this.surfaceSubs.get(surfaceId);
     if (!sub || !sub.views.has(viewId)) return;
     const previous = sub.views.get(viewId);
+    const nextMaxFps =
+      maxFps === undefined
+        ? (previous?.maxFps ?? 0)
+        : normalizeSurfaceMaxFps(maxFps);
     if (
-      previous?.width === target?.width &&
-      previous?.height === target?.height
+      previous?.target?.width === target?.width &&
+      previous?.target?.height === target?.height &&
+      previous?.maxFps === nextMaxFps
     ) {
       return;
     }
-    sub.views.set(viewId, target);
+    sub.views.set(viewId, { target, maxFps: nextMaxFps });
     this.maybeSendSurfaceSubscribe(sub);
   }
 
@@ -3570,7 +3630,7 @@ export class BlitConnection {
    *  anything") before the probe completed get updated. */
   private resubscribeWithCodecSupport(): void {
     if (this.transport.status !== "connected") return;
-    if (!this.surfaceStreamingEnabled) return;
+    if (!this.surfaceStreamingEnabled || !this.pageVisible) return;
     for (const sub of this.surfaceSubs.values()) {
       sub.lastSent = null;
       this.maybeSendSurfaceSubscribe(sub);
@@ -3675,14 +3735,41 @@ export class BlitConnection {
     if (this.surfaceStreamingEnabled === enabled) return;
     this.surfaceStreamingEnabled = enabled;
     if (this.transport.status !== "connected") return;
-    if (enabled) {
+    if (enabled && this.pageVisible) {
+      for (const sub of this.surfaceSubs.values()) {
+        sub.lastSent = null;
+        this.maybeSendSurfaceSubscribe(sub);
+      }
+    } else if (!enabled && this.pageVisible) {
+      for (const sub of this.surfaceSubs.values()) {
+        this.transport.send(buildSurfaceUnsubscribeMessage(sub.surfaceId));
+        sub.lastSent = null;
+      }
+    }
+  }
+
+  /** Suspend video while the document is hidden without overwriting the
+   *  user's persistent streaming preference. The live view registry stays
+   *  intact, so becoming visible restores exactly the previous streams. */
+  private setPageVisible(visible: boolean): void {
+    if (this.pageVisible === visible) return;
+    this.pageVisible = visible;
+    if (
+      this.transport.status !== "connected" ||
+      !this.surfaceStreamingEnabled
+    ) {
+      return;
+    }
+    if (visible) {
       for (const sub of this.surfaceSubs.values()) {
         sub.lastSent = null;
         this.maybeSendSurfaceSubscribe(sub);
       }
     } else {
       for (const sub of this.surfaceSubs.values()) {
-        this.transport.send(buildSurfaceUnsubscribeMessage(sub.surfaceId));
+        if (sub.views.size > 0) {
+          this.transport.send(buildSurfaceUnsubscribeMessage(sub.surfaceId));
+        }
         sub.lastSent = null;
       }
     }

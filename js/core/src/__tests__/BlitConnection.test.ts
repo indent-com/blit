@@ -40,6 +40,7 @@ import {
   S2C_PING,
   C2S_PING,
   C2S_SURFACE_SUBSCRIBE,
+  C2S_SURFACE_UNSUBSCRIBE,
   C2S_SURFACE_RESIZE,
   STATUS_BUDGET,
   STATUS_OTHER,
@@ -1211,6 +1212,17 @@ describe("BlitConnection surface subscriptions", () => {
     return { width: v.getUint16(6, true), height: v.getUint16(8, true) };
   }
 
+  function lastMaxFps(): number {
+    const subs = transport.sent.filter((m) => m[0] === C2S_SURFACE_SUBSCRIBE);
+    const msg = subs[subs.length - 1];
+    if (!msg) throw new Error("no surface subscribe was sent");
+    if (msg.length < 12) return 0;
+    return new DataView(msg.buffer, msg.byteOffset, msg.byteLength).getUint16(
+      10,
+      true,
+    );
+  }
+
   const countSubscribes = () =>
     transport.sent.filter((m) => m[0] === C2S_SURFACE_SUBSCRIBE).length;
 
@@ -1280,6 +1292,51 @@ describe("BlitConnection surface subscriptions", () => {
       height: 180,
     });
     expect(lastTarget()).toEqual({ width: 320, height: 180 });
+  });
+
+  it("uses the highest requested cadence and lets an uncapped view win", () => {
+    const thumb = conn.allocSurfaceViewId();
+    const pane = conn.allocSurfaceViewId();
+    conn.sendSurfaceSubscribe(1, thumb, { width: 320, height: 180 }, 15);
+    expect(lastMaxFps()).toBe(15);
+
+    conn.sendSurfaceSubscribe(1, pane, null, 0);
+    expect(lastMaxFps()).toBe(0);
+
+    conn.sendSurfaceUnsubscribe(1, pane);
+    expect(lastMaxFps()).toBe(15);
+  });
+
+  it("suspends live surface subscriptions while the page is hidden", () => {
+    const original = document.visibilityState;
+    conn.dispose();
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
+    ({ conn, transport } = createConnection());
+    const view = conn.allocSurfaceViewId();
+    conn.sendSurfaceSubscribe(1, view, null);
+
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "hidden",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(transport.sent.at(-1)?.[0]).toBe(C2S_SURFACE_UNSUBSCRIBE);
+
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(transport.sent.at(-1)?.[0]).toBe(C2S_SURFACE_SUBSCRIBE);
+
+    conn.dispose();
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: original,
+    });
   });
 });
 

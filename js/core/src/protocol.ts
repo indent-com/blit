@@ -736,6 +736,7 @@ export function buildSurfaceCloseMessage(surfaceId: number): Uint8Array {
  * @param speed - SURFACE_SPEED_* constant (0 = use server default)
  * @param width - fixed encode width in pixels (0 = participate in mediation)
  * @param height - fixed encode height in pixels (0 = participate in mediation)
+ * @param maxFps - per-surface frame-rate ceiling (0 = client display rate)
  *
  * Asking for a size opts this subscription out of surface-size mediation:
  * the server encodes a downscale of the surface for this client alone
@@ -749,17 +750,24 @@ export function buildSurfaceSubscribeMessage(
   speed?: number,
   width?: number,
   height?: number,
+  maxFps?: number,
 ): Uint8Array {
   const cs = (codecSupport ?? 0) & 0xff;
   const bw = (bandwidth ?? 0) & 0xff;
   const sp = (speed ?? 0) & 0xff;
   const w = (width ?? 0) & 0xffff;
   const h = (height ?? 0) & 0xffff;
+  const requestedFps = maxFps ?? 0;
+  const fps = Number.isFinite(requestedFps)
+    ? Math.max(0, Math.min(65_535, Math.round(requestedFps)))
+    : 0;
   // The size lives at bytes 6..10, so asking for one forces the long form
   // even when all three preference bytes are at their defaults.
   const hasScaled = w !== 0 && h !== 0;
-  const hasExtended = hasScaled || cs !== 0 || bw !== 0 || sp !== 0;
-  const len = hasScaled ? 10 : hasExtended ? 6 : 3;
+  const hasCadence = fps !== 0;
+  const hasExtended =
+    hasScaled || hasCadence || cs !== 0 || bw !== 0 || sp !== 0;
+  const len = hasCadence ? 12 : hasScaled ? 10 : hasExtended ? 6 : 3;
   const msg = new Uint8Array(len);
   msg[0] = C2S_SURFACE_SUBSCRIBE;
   msg[1] = surfaceId & 0xff;
@@ -774,6 +782,10 @@ export function buildSurfaceSubscribeMessage(
     msg[7] = (w >> 8) & 0xff;
     msg[8] = h & 0xff;
     msg[9] = (h >> 8) & 0xff;
+  }
+  if (hasCadence) {
+    msg[10] = fps & 0xff;
+    msg[11] = (fps >> 8) & 0xff;
   }
   return msg;
 }

@@ -925,6 +925,7 @@ describe("BlitSurfaceCanvas touch", () => {
  */
 function attachTargeting() {
   const targets: ({ width: number; height: number } | null)[] = [];
+  const maxFps: number[] = [];
   let roCallback: ResizeObserverCallback | undefined;
   const prevRO = globalThis.ResizeObserver;
   globalThis.ResizeObserver = class {
@@ -953,12 +954,20 @@ function attachTargeting() {
       _sid: number,
       _viewId: string,
       target: { width: number; height: number } | null,
-    ) => targets.push(target),
+      fps: number,
+    ) => {
+      targets.push(target);
+      maxFps.push(fps);
+    },
     setSurfaceViewTarget: (
       _sid: number,
       _viewId: string,
       target: { width: number; height: number } | null,
-    ) => targets.push(target),
+      fps: number,
+    ) => {
+      targets.push(target);
+      maxFps.push(fps);
+    },
     sendSurfaceUnsubscribe: () => {},
     offerSurfaceViewSize: () => true,
     withdrawSurfaceViewSize: () => {},
@@ -984,12 +993,12 @@ function attachTargeting() {
     surface.dispose();
     globalThis.ResizeObserver = prevRO;
   };
-  return { surface, targets, layOut, restore };
+  return { surface, targets, maxFps, layOut, restore };
 }
 
 describe("BlitSurfaceCanvas size mediation", () => {
   it("drops the scaled target once it is given a display size", () => {
-    const { surface, targets, layOut, restore } = attachTargeting();
+    const { surface, targets, maxFps, layOut, restore } = attachTargeting();
 
     // A pane whose box is measured before the binding's own observer gets
     // to it — the container was still 0×0 when the effect ran, so
@@ -997,6 +1006,7 @@ describe("BlitSurfaceCanvas size mediation", () => {
     // observer wins the race.  The view registers a thumbnail's target.
     layOut(900, 500);
     expect(targets.at(-1)).toEqual({ width: 1024, height: 512 });
+    expect(maxFps.at(-1)).toBe(15);
 
     // Now the binding measures and hands over the pane's real size.  This
     // view is a live pane, not a thumbnail: it must give up the target, or
@@ -1004,6 +1014,7 @@ describe("BlitSurfaceCanvas size mediation", () => {
     // resizes to the pane.
     surface.setDisplaySize(900, 500, 120);
     expect(targets.at(-1)).toBeNull();
+    expect(maxFps.at(-1)).toBe(0);
 
     restore();
   });

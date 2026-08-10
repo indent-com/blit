@@ -422,6 +422,7 @@ describe("buildSurfaceSubscribeMessage", () => {
       speed: msg[5],
       width: v.getUint16(6, true),
       height: v.getUint16(8, true),
+      maxFps: msg.length >= 12 ? v.getUint16(10, true) : 0,
     };
   };
 
@@ -446,6 +447,7 @@ describe("buildSurfaceSubscribeMessage", () => {
       speed: 3,
       width: 1472,
       height: 2092,
+      maxFps: 0,
     });
   });
 
@@ -463,6 +465,18 @@ describe("buildSurfaceSubscribeMessage", () => {
     // mediated anyway, so don't pay for the longer message.
     expect(buildSurfaceSubscribeMessage(1, 0, 0, 0, 320, 0)).toHaveLength(3);
     expect(buildSurfaceSubscribeMessage(1, 0, 0, 0, 0, 180)).toHaveLength(3);
+  });
+
+  it("appends a per-surface frame-rate ceiling", () => {
+    const msg = buildSurfaceSubscribeMessage(1, 0, 0, 0, 320, 180, 15);
+    expect(msg).toHaveLength(12);
+    expect(read(msg)).toMatchObject({ width: 320, height: 180, maxFps: 15 });
+  });
+
+  it("can request a cadence without a scaled target", () => {
+    const msg = buildSurfaceSubscribeMessage(1, 0, 0, 0, 0, 0, 30);
+    expect(msg).toHaveLength(12);
+    expect(read(msg)).toMatchObject({ width: 0, height: 0, maxFps: 30 });
   });
 });
 
