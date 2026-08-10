@@ -21,8 +21,16 @@
  * from a Blob URL — no external file needed.
  */
 
-/** Maximum jitter buffer depth in decoded frames (~20 ms each). */
-const MAX_BUFFER_FRAMES = 25; // 500 ms
+/**
+ * Maximum pre-worklet staging depth in decoded frames (~20 ms each).
+ *
+ * Audio decoded while AudioWorklet.addModule() is still loading must be
+ * staged somewhere, but keeping half a second here defeats the worklet's
+ * lower latency bound before its servo even starts.  Keep only the newest
+ * 260 ms (13 whole Opus frames), enough to fill the 250 ms adaptive-buffer
+ * ceiling below.
+ */
+export const MAX_STAGING_FRAMES = 13; // 260 ms
 
 /**
  * Adaptive jitter buffer: the worklet starts at MIN_BUFFER_SAMPLES, grows
@@ -49,12 +57,16 @@ export const MIN_BUFFER_SAMPLES = 2880; // 3 frames = 60 ms at 48 kHz
  * is defended by slowing playback down to refill it.  That is the
  * "audio falls further and further behind" failure.
  *
- * 400 ms is roughly 2x the worst transport head-of-line gap the bulk-write
- * fragmenter can produce (see BULK_CHUNK_BYTES, server-side), so a genuinely
- * bad link still gets the headroom it needs to play without gaps; beyond
- * that, more buffer is not buying smoothness, only latency.
+ * 250 ms leaves 190 ms of adaptive headroom above the 60 ms floor: two
+ * underrun events can buy enough margin for the scheduling jitter observed
+ * on iPadOS.  The servo must preserve that adaptive target; forcing every
+ * client back to the floor causes repeated gaps.  The ceiling still prevents
+ * a stressed client from ratcheting hundreds of milliseconds behind a clean
+ * client.  The server interleaves audio at 4 KiB boundaries once a bulk
+ * writer shows backpressure, so a larger allowance is no longer justified
+ * by transport head-of-line blocking.
  */
-export const MAX_BUFFER_TARGET_SAMPLES = 19200; // 400 ms at 48 kHz
+export const MAX_BUFFER_TARGET_SAMPLES = 12000; // 250 ms at 48 kHz
 
 /**
  * Samples of uninterrupted, non-buffering playback required before
@@ -77,18 +89,17 @@ const DECAY_STABLE_SAMPLES = 240000; // 5 s at 48 kHz
 const POS_REPORT_INTERVAL = 4800; // ~100 ms at 48 kHz
 
 /*
- * The steady-state target for `audioMs - lastVideoTimestampMs` is computed
- * per-position from the worklet's current bufferTarget (reported alongside
- * each pos message).  Audio held in the jitter buffer lags video by that
- * many ms, so treating the current (adaptive) depth as the equilibrium
- * keeps drift=0 aligned with "buffer at desired depth" even as the target
- * grows or shrinks during the session.
+ * The steady-state target is the worklet's current adaptive bufferTarget,
+ * reported alongside each position.  Treating it as the equilibrium keeps
+ * the safety margin learned from real underruns; MAX_BUFFER_TARGET_SAMPLES
+ * bounds the extra latency instead of discarding the margin after every
+ * rebuffer.
  */
 
 /**
  * Drift dead-zone: don't adjust rate if |drift| is below this (ms).
- * Drift is already measured relative to the adaptive target, so zero
- * means "buffer at target depth".  Avoids oscillation when sync is good.
+ * Drift is measured relative to the adaptive target, so zero means "buffer
+ * at the learned safe depth".  Avoids oscillation when sync is good.
  */
 const DRIFT_DEADZONE_MS = 10;
 
@@ -137,8 +148,8 @@ export const SAMPLES_PER_20_MS = 960;
 export const GROW_FRAMES_PER_UNDERRUN = 5;
 
 /**
- * Excess buffered depth, over the current target, that triggers a hard
- * `skip` instead of waiting for the rate servo to drain it.
+ * Excess buffered depth over the current adaptive target that triggers a
+ * hard `skip` instead of waiting for the rate servo to drain it.
  *
  * The servo can only drain at MAX_RATE_OFFSET, so reclaiming a second of
  * accumulated latency by rate alone takes about a minute — and latency
@@ -147,11 +158,10 @@ export const GROW_FRAMES_PER_UNDERRUN = 5;
  * faster than that.  Above this threshold we drop samples outright:
  * a single ~1.3 ms fade (see FADE_SAMPLES) beats staying seconds behind.
  *
- * Set well above the depth swings of normal servo operation so ordinary
- * jitter never trips it — this is the pathological-accumulation path,
- * not a second servo.
+ * Four Opus frames above target is outside normal report-to-report wobble,
+ * but small enough to keep even transient lag bounded tightly.
  */
-export const SKIP_EXCESS_MS = 200;
+export const SKIP_EXCESS_MS = 80;
 
 /**
  * Minimum interval between `skip` messages.
@@ -548,7 +558,11 @@ function onDecodedFrame(frame) {
   frame.close();
   if (port) {
     port.postMessage(pcm, [pcm.buffer]);
-  } else if (pending.length < ${MAX_BUFFER_FRAMES}) {
+  } else {
+    // AudioWorklet.addModule() can be slow on iPadOS.  Bound startup latency
+    // by retaining the newest frames, not the oldest frames from when setup
+    // began.
+    if (pending.length >= ${MAX_STAGING_FRAMES}) pending.shift();
     pending.push(pcm);
   }
   sendStats(now);
@@ -632,13 +646,11 @@ export class AudioPlayer {
 
   // -- Rate servo state ---------------------------------------------------
   //
-  // Audio runs a simple depth-based servo: if the worklet buffer sits
-  // below `bufferTarget` we slow consumption (rate < 1) to refill;
-  // above target we speed up (rate > 1) to drain.  Video is played
-  // back at its own real-time pace with no explicit A/V sync — both
-  // media are delivered as fast as the transport allows, so they stay
-  // aligned within the ppm-level clock skew of the sample-rate
-  // converters, which is imperceptible for sub-hour sessions.
+  // Audio runs a simple depth-based servo against the worklet's adaptive
+  // bufferTarget: below it we slow consumption (rate < 1) to refill; above
+  // it we speed up (rate > 1) to drain.  Keeping the learned target as the
+  // steady depth is what lets jittery clients remain glitch-free; the hard
+  // target ceiling bounds the resulting latency.
 
   /** Number of audio frames received (for warmup). */
   private framesReceived = 0;
@@ -646,7 +658,7 @@ export class AudioPlayer {
   private currentRate = 1.0;
   /** Smoothed rate — exponentially filtered to avoid wow/flutter. */
   private smoothedRate = 1.0;
-  /** Worklet's current adaptive bufferTarget (samples), mirrored from pos reports. */
+  /** Worklet's current adaptive bufferTarget (samples), mirrored from reports. */
   private currentBufferTarget = MIN_BUFFER_SAMPLES;
   /** Last observed buffered depth (samples, from pos reports) — feeds the drift servo. */
   private lastBufferedSamples = 0;
@@ -977,8 +989,8 @@ export class AudioPlayer {
    * Called when the worklet reports its consumed-sample position.
    * Runs the buffer-depth servo: compares actual buffered depth against
    * the adaptive target and nudges the worklet's playback rate within
-   * ±MAX_RATE_OFFSET to push the buffer back toward target.  Excess too
-   * large for the rate servo to absorb is dropped outright instead.
+   * ±MAX_RATE_OFFSET to return there.  Excess too large for the rate servo
+   * to absorb is dropped outright.
    */
   private onWorkletPosition(): void {
     const now = Date.now();
@@ -993,7 +1005,7 @@ export class AudioPlayer {
     // would otherwise take tens of seconds to drain and be audible as
     // lag the whole time.  Drop straight back to target instead.
     if (
-      this.lastBufferedSamples >
+      this.lastBufferedSamples >=
         this.currentBufferTarget + SKIP_EXCESS_MS * 48 &&
       now - this.lastSkipAt >= SKIP_COOLDOWN_MS
     ) {
@@ -1005,13 +1017,9 @@ export class AudioPlayer {
       this.postToWorklet({ type: "skip", samples: excess });
     }
 
-    // Servo target: keep `buffered` at `bufferTarget`.
+    // Servo target: keep `buffered` at the learned adaptive target.
     //   buffered < target → drift > 0 → rate < 1 (slow down, refill)
     //   buffered > target → drift < 0 → rate > 1 (speed up, drain)
-    // No A/V sync: video is played as it arrives and audio targets a
-    // small buffer; both ride the same real-time network pacing, so
-    // they stay aligned to within ppm-level clock skew which is
-    // imperceptible over typical session lengths.
     const targetMs = this.currentBufferTarget / 48;
     const bufferedMs = this.lastBufferedSamples / 48;
     const drift = targetMs - bufferedMs;
@@ -1373,6 +1381,12 @@ export class AudioPlayer {
       // servo works from the real depth rather than our projection.
       if (d.kind === "skip" && typeof d.buffered === "number") {
         this.lastBufferedSamples = d.buffered;
+      } else if (d.kind === "rebuffer_end" && typeof d.buffered === "number") {
+        // Adopt the post-rebuffer depth and target immediately, before the
+        // next ~100 ms position report.  At the target this is intentionally
+        // a no-op: the newly learned safety margin must be preserved.
+        this.lastBufferedSamples = d.buffered;
+        this.onWorkletPosition();
       }
     }
   }
@@ -1489,8 +1503,10 @@ export class AudioPlayer {
     if (this.worklet) {
       // Transfer the buffer to the audio thread (zero-copy).
       this.worklet.port.postMessage(pcm, [pcm.buffer]);
-    } else if (this.buffer.length < MAX_BUFFER_FRAMES) {
-      // Worklet not ready yet — queue locally.
+    } else {
+      // Worklet not ready yet.  Keep the newest bounded tail so a slow
+      // AudioWorklet.addModule() does not start playback far behind live.
+      if (this.buffer.length >= MAX_STAGING_FRAMES) this.buffer.shift();
       this.buffer.push(pcm);
     }
   }

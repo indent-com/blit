@@ -15,9 +15,11 @@
 
 import { describe, it, expect, beforeEach } from "vitest";
 import {
+  AudioPlayer,
   WORKLET_SRC,
   MIN_BUFFER_SAMPLES,
   MAX_BUFFER_TARGET_SAMPLES,
+  MAX_STAGING_FRAMES,
   SAMPLES_PER_20_MS,
   GROW_FRAMES_PER_UNDERRUN,
 } from "../AudioPlayer";
@@ -131,8 +133,8 @@ describe("audio worklet jitter buffer", () => {
     for (let i = 0; i < events; i++) underrunOnce(proc);
 
     expect(proc.bufferTarget).toBe(MAX_BUFFER_TARGET_SAMPLES);
-    // 400 ms is the contract the server and the servo are tuned against.
-    expect(proc.bufferTarget / 48).toBeLessThanOrEqual(400);
+    // A stressed client may sit at most 190 ms behind the 60 ms clean floor.
+    expect(proc.bufferTarget / 48).toBeLessThanOrEqual(250);
   });
 
   describe("skip", () => {
@@ -195,5 +197,39 @@ describe("audio worklet jitter buffer", () => {
       send(proc, { type: "skip", samples: SAMPLES_PER_20_MS * 5 });
       expect(proc.bufferTarget).toBe(target);
     });
+  });
+});
+
+describe("audio pre-worklet staging", () => {
+  it("can stage enough whole frames to fill the adaptive ceiling", () => {
+    expect(MAX_STAGING_FRAMES * SAMPLES_PER_20_MS).toBeGreaterThanOrEqual(
+      MAX_BUFFER_TARGET_SAMPLES,
+    );
+  });
+
+  it("keeps the newest bounded tail while the worklet loads", () => {
+    const player = new AudioPlayer();
+    const inner = player as unknown as {
+      buffer: Float32Array[];
+      onDecodedFrame(frame: AudioData): void;
+    };
+
+    for (let value = 0; value < MAX_STAGING_FRAMES + 4; value++) {
+      const frame = {
+        numberOfFrames: 1,
+        copyTo(destination: Float32Array) {
+          destination[0] = value;
+        },
+        close() {},
+      } as unknown as AudioData;
+      inner.onDecodedFrame(frame);
+    }
+
+    expect(inner.buffer).toHaveLength(MAX_STAGING_FRAMES);
+    expect(inner.buffer[0][0]).toBe(4);
+    expect(inner.buffer[MAX_STAGING_FRAMES - 1][0]).toBe(
+      MAX_STAGING_FRAMES + 3,
+    );
+    player.destroy();
   });
 });

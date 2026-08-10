@@ -12,6 +12,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   AudioPlayer,
+  MAX_BUFFER_TARGET_SAMPLES,
   MIN_BUFFER_SAMPLES,
   SKIP_EXCESS_MS,
   SKIP_COOLDOWN_MS,
@@ -73,7 +74,7 @@ describe("audio latency backstop", () => {
     vi.useRealTimers();
   });
 
-  it("does not skip when the buffer sits at target", () => {
+  it("does not skip when the buffer sits at the steady target", () => {
     report(player, MIN_BUFFER_SAMPLES, MIN_BUFFER_SAMPLES);
     expect(skips(posted)).toHaveLength(0);
   });
@@ -82,6 +83,39 @@ describe("audio latency backstop", () => {
     const justUnder = SKIP_EXCESS_MS * SAMPLES_PER_MS - 1;
     report(player, MIN_BUFFER_SAMPLES + justUnder, MIN_BUFFER_SAMPLES);
     expect(skips(posted)).toHaveLength(0);
+  });
+
+  it("preserves an adaptive target as jitter headroom", () => {
+    report(player, MAX_BUFFER_TARGET_SAMPLES, MAX_BUFFER_TARGET_SAMPLES);
+    expect(skips(posted)).toHaveLength(0);
+  });
+
+  it("adopts the adaptive target when rebuffering ends", () => {
+    (
+      player as unknown as { handleWorkletMessage(d: unknown): void }
+    ).handleWorkletMessage({
+      type: "event",
+      kind: "rebuffer_end",
+      target: MAX_BUFFER_TARGET_SAMPLES,
+      buffered: MAX_BUFFER_TARGET_SAMPLES,
+    });
+
+    expect(
+      (player as unknown as { currentBufferTarget: number })
+        .currentBufferTarget,
+    ).toBe(MAX_BUFFER_TARGET_SAMPLES);
+    expect(skips(posted)).toHaveLength(0);
+  });
+
+  it("skips only the excess over the adaptive target", () => {
+    const excess = SKIP_EXCESS_MS * SAMPLES_PER_MS;
+    report(
+      player,
+      MAX_BUFFER_TARGET_SAMPLES + excess,
+      MAX_BUFFER_TARGET_SAMPLES,
+    );
+
+    expect(skips(posted)).toEqual([{ type: "skip", samples: excess }]);
   });
 
   it("skips the whole excess once the buffer runs away", () => {
