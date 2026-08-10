@@ -779,6 +779,9 @@ export class BlitConnection {
   defaultSurfaceBandwidth = 0;
   /** Default encoder speed for new surface subscriptions (0 = server default). */
   defaultSurfaceSpeed = 0;
+  /** User-selected ceiling applied after each view's own cadence request.
+   *  Zero leaves surface cadence tied to the display rate. */
+  private surfaceMaxFpsCap = 0;
   /** Default audio bitrate in kbps for audio subscriptions (0 = server default). */
   defaultAudioBitrateKbps = 0;
   /** When false, surface subscribe messages are suppressed (ref-counts
@@ -3456,15 +3459,22 @@ export class BlitConnection {
     return width > 0 && height > 0 ? { width, height } : null;
   }
 
-  /** Highest cadence any live view needs. Zero (uncapped) wins, just as an
-   *  unscaled target wins the resolution derivation above. */
+  /** Highest cadence any live view needs, constrained by the user's global
+   *  ceiling. Zero (uncapped) wins between views, just as an unscaled target
+   *  wins the resolution derivation above, but it does not bypass that cap. */
   private effectiveSurfaceMaxFps(sub: SurfaceSub): number {
     let maxFps = 0;
     for (const view of sub.views.values()) {
-      if (view.maxFps <= 0) return 0;
+      if (view.maxFps <= 0) {
+        maxFps = 0;
+        break;
+      }
       maxFps = Math.max(maxFps, view.maxFps);
     }
-    return maxFps;
+    if (this.surfaceMaxFpsCap <= 0) return maxFps;
+    return maxFps <= 0
+      ? this.surfaceMaxFpsCap
+      : Math.min(maxFps, this.surfaceMaxFpsCap);
   }
 
   /** Grace window before a refCount=0 subscription's wire UNSUB fires.
@@ -3724,6 +3734,18 @@ export class BlitConnection {
     sub.speedOverride = speed;
     sub.lastSent = null;
     this.maybeSendSurfaceSubscribe(sub);
+  }
+
+  /** Apply a user-selected cadence ceiling to every active surface stream.
+   *  Existing per-view limits (such as the 15 fps thumbnail limit) still win
+   *  when they are lower. Zero disables the global ceiling. */
+  setSurfaceMaxFpsCap(maxFps: number): void {
+    const next = normalizeSurfaceMaxFps(maxFps);
+    if (this.surfaceMaxFpsCap === next) return;
+    this.surfaceMaxFpsCap = next;
+    for (const sub of this.surfaceSubs.values()) {
+      this.maybeSendSurfaceSubscribe(sub);
+    }
   }
 
   /**

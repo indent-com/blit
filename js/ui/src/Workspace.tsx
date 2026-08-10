@@ -48,6 +48,7 @@ import {
   VIDEO_SPEED_KEY,
   SURFACE_STREAMING_KEY,
   SURFACE_SMOOTHING_KEY,
+  SURFACE_MAX_FPS_KEY,
   SURFACE_ZOOM_KEY,
   SURFACE_ZOOM_MODE_KEY,
   MIN_SURFACE_ZOOM,
@@ -67,6 +68,7 @@ import {
   preferredVideoSpeed,
   preferredSurfaceStreaming,
   preferredSurfaceSmoothing,
+  preferredSurfaceMaxFps,
   preferredSurfaceZoom,
   preferredSurfaceZoomMode,
   preferredLeftDockWidth,
@@ -573,6 +575,9 @@ function WorkspaceScreen(props: {
   );
   const [surfaceSmoothing, setSurfaceSmoothing] = createSignal(
     preferredSurfaceSmoothing(),
+  );
+  const [surfaceMaxFps, setSurfaceMaxFps] = createSignal(
+    preferredSurfaceMaxFps(),
   );
   const [surfaceZoom, setSurfaceZoom] = createSignal(preferredSurfaceZoom());
   const [surfaceZoomMode, setSurfaceZoomMode] = createSignal(
@@ -2582,8 +2587,9 @@ function WorkspaceScreen(props: {
   const remoteFontSize = useConfigValue(FONT_SIZE_KEY);
   const remoteTextGamma = useConfigValue(TEXT_GAMMA_KEY);
   // No media settings here on purpose — bitrate, mute, encoder effort,
-  // streaming and zoom are device-local (see storage.ts), so they are read
-  // from localStorage once at startup and never taken from another device.
+  // streaming, frame rate and zoom are device-local (see storage.ts), so they
+  // are read from localStorage once at startup and never taken from another
+  // device.
 
   createEffect(() => {
     const id = remotePaletteId();
@@ -2618,6 +2624,7 @@ function WorkspaceScreen(props: {
     const b = audioBitrate();
     const streaming = surfaceStreaming();
     const smoothing = surfaceSmoothing();
+    const maxFps = surfaceMaxFps();
     for (const snap of allConnections()) {
       const conn = workspace.getConnection(snap.id);
       if (conn) {
@@ -2626,6 +2633,7 @@ function WorkspaceScreen(props: {
         conn.defaultAudioBitrateKbps = b;
         conn.surfaceStreamingEnabled = streaming;
         conn.surfaceStore.setPresentationSmoothingEnabled(smoothing);
+        conn.setSurfaceMaxFpsCap(maxFps);
       }
     }
   });
@@ -3074,6 +3082,11 @@ function WorkspaceScreen(props: {
         .getConnection(snap.id)
         ?.surfaceStore.setPresentationSmoothingEnabled(enabled);
     }
+  }
+
+  function changeSurfaceMaxFps(maxFps: number) {
+    setSurfaceMaxFps(maxFps);
+    writeStorage(SURFACE_MAX_FPS_KEY, String(maxFps));
   }
 
   /** Every resizable surface view re-derives the scale it asks the compositor
@@ -4608,6 +4621,7 @@ function WorkspaceScreen(props: {
               audioAvailable={allConnections().some((c) => c.supportsAudio)}
               surfaceStreaming={surfaceStreaming()}
               surfaceSmoothing={surfaceSmoothing()}
+              surfaceMaxFps={surfaceMaxFps()}
               surfaceZoom={surfaceZoom()}
               surfaceZoomMode={surfaceZoomMode()}
               onAudioBitrateChange={changeAudioBitrate}
@@ -4615,6 +4629,7 @@ function WorkspaceScreen(props: {
               onVideoSpeedChange={changeVideoSpeed}
               onSurfaceStreamingChange={changeSurfaceStreaming}
               onSurfaceSmoothingChange={changeSurfaceSmoothing}
+              onSurfaceMaxFpsChange={changeSurfaceMaxFps}
               onSurfaceZoomChange={changeSurfaceZoom}
               onSurfaceZoomModeChange={changeSurfaceZoomMode}
               onToggleAudio={toggleAudio}

@@ -228,6 +228,8 @@ export const VIDEO_SPEED_KEY = "blit.videoSpeed";
 export const SURFACE_STREAMING_KEY = "blit.surfaceStreaming";
 /** Whether decoded surface frames may be held to smooth transport jitter. */
 export const SURFACE_SMOOTHING_KEY = "blit.surfaceSmoothing";
+/** Per-surface source and delivery cadence ceiling. 0 means uncapped. */
+export const SURFACE_MAX_FPS_KEY = "blit.surfaceMaxFps";
 /** Surface zoom value, stored as an integer percentage. Its interpretation is
  *  selected by SURFACE_ZOOM_MODE_KEY. */
 export const SURFACE_ZOOM_KEY = "blit.surfaceZoom";
@@ -642,6 +644,24 @@ export function preferredSurfaceStreaming(): boolean {
 /** Prefer interaction latency over cadence smoothing unless explicitly set. */
 export function preferredSurfaceSmoothing(): boolean {
   return readStorage(SURFACE_SMOOTHING_KEY) === "1";
+}
+
+/** Bounds for the custom frame-rate control. The wire supports u16, but a
+ *  four-digit cap already exceeds practical displays and keeps the UI useful. */
+export const MIN_SURFACE_MAX_FPS = 1;
+export const MAX_SURFACE_MAX_FPS = 1000;
+
+/** Preferred surface frame-rate ceiling. 0 = disabled/display cadence. */
+export function preferredSurfaceMaxFps(): number {
+  const n = parseInt(readStorage(SURFACE_MAX_FPS_KEY) ?? "", 10);
+  if (
+    !Number.isFinite(n) ||
+    n < MIN_SURFACE_MAX_FPS ||
+    n > MAX_SURFACE_MAX_FPS
+  ) {
+    return 0;
+  }
+  return n;
 }
 
 /** Zoom bounds, in percent.  Matched by `clampZoom` in the surface view —

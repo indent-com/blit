@@ -2,7 +2,9 @@ import { createSignal, Show, For, type JSX } from "solid-js";
 import type { TerminalPalette } from "@blit-sh/core";
 import { themeFor, ui, uiScale } from "./theme";
 import {
+  MAX_SURFACE_MAX_FPS,
   MAX_SURFACE_ZOOM,
+  MIN_SURFACE_MAX_FPS,
   MIN_SURFACE_ZOOM,
   type SurfaceZoomMode,
 } from "./storage";
@@ -34,6 +36,13 @@ const SPEED_PRESETS: { label: string; value: number }[] = [
   { label: "Realtime", value: 4 },
 ];
 
+const FPS_PRESETS: { label: string; value: number }[] = [
+  { label: "Disabled", value: 0 },
+  { label: "30 fps", value: 30 },
+  { label: "60 fps", value: 60 },
+  { label: "120 fps", value: 120 },
+];
+
 /** Zoom values are stored as integer percentages in both modes. */
 const RELATIVE_ZOOM_PRESETS = [50, 75, 100, 125, 150, 200];
 const EXACT_ZOOM_PRESETS = [50, 75, 100, 150, 200, 300, 400];
@@ -42,6 +51,7 @@ const EXACT_ZOOM_PRESETS = [50, 75, 100, 150, 200, 300, 400];
 const CUSTOM_DEFAULT_QUANTIZER = 80;
 const CUSTOM_DEFAULT_SPEED = 128;
 const CUSTOM_DEFAULT_AUDIO_KBPS = 128;
+const CUSTOM_DEFAULT_FPS = 60;
 
 export function MediaOverlay(props: {
   palette: TerminalPalette;
@@ -53,6 +63,8 @@ export function MediaOverlay(props: {
   audioAvailable: boolean;
   surfaceStreaming: boolean;
   surfaceSmoothing: boolean;
+  /** Per-surface source and delivery cadence ceiling. 0 means uncapped. */
+  surfaceMaxFps: number;
   /** Surface zoom value in percent. */
   surfaceZoom: number;
   surfaceZoomMode: SurfaceZoomMode;
@@ -61,6 +73,7 @@ export function MediaOverlay(props: {
   onVideoSpeedChange: (speed: number) => void;
   onSurfaceStreamingChange: (enabled: boolean) => void;
   onSurfaceSmoothingChange: (enabled: boolean) => void;
+  onSurfaceMaxFpsChange: (maxFps: number) => void;
   onSurfaceZoomChange: (percent: number) => void;
   onSurfaceZoomModeChange: (mode: SurfaceZoomMode) => void;
   onToggleAudio: () => void;
@@ -91,6 +104,14 @@ export function MediaOverlay(props: {
 
   const [speedSlider, setSpeedSlider] = createSignal(
     isCustomSpeed() ? props.videoSpeed : CUSTOM_DEFAULT_SPEED,
+  );
+
+  // ---- Frame-rate custom state ----
+  const isCustomFps = () =>
+    props.surfaceMaxFps > 0 &&
+    !FPS_PRESETS.some((preset) => preset.value === props.surfaceMaxFps);
+  const [fpsSlider, setFpsSlider] = createSignal(
+    isCustomFps() ? props.surfaceMaxFps : CUSTOM_DEFAULT_FPS,
   );
 
   // ---- Zoom custom state ----
@@ -191,6 +212,18 @@ export function MediaOverlay(props: {
     const v = parseInt((e.target as HTMLInputElement).value, 10);
     setSpeedSlider(v);
     props.onVideoSpeedChange(v);
+  };
+
+  const activateCustomFps = () => {
+    const fps = isCustomFps() ? fpsSlider() : CUSTOM_DEFAULT_FPS;
+    setFpsSlider(fps);
+    props.onSurfaceMaxFpsChange(fps);
+  };
+
+  const handleFpsSlider = (e: Event) => {
+    const fps = parseInt((e.target as HTMLInputElement).value, 10);
+    setFpsSlider(fps);
+    props.onSurfaceMaxFpsChange(fps);
   };
 
   /** The requested presentation scale after applying the selected mode. */
@@ -343,6 +376,85 @@ export function MediaOverlay(props: {
                 transition: "opacity 0.15s ease",
               }}
             >
+              <div
+                style={{
+                  display: "flex",
+                  "flex-direction": "column",
+                  gap: `${scale().tightGap}px`,
+                }}
+              >
+                <span style={labelStyle()}>Frame rate cap</span>
+                <div
+                  style={{
+                    display: "flex",
+                    "flex-wrap": "wrap",
+                    gap: `${scale().tightGap}px`,
+                  }}
+                >
+                  <For each={FPS_PRESETS}>
+                    {(preset) => (
+                      <button
+                        onClick={() =>
+                          props.onSurfaceMaxFpsChange(preset.value)
+                        }
+                        style={chipStyle(
+                          props.surfaceMaxFps === preset.value &&
+                            !isCustomFps(),
+                        )}
+                      >
+                        {preset.label}
+                      </button>
+                    )}
+                  </For>
+                  <button
+                    onClick={activateCustomFps}
+                    style={chipStyle(isCustomFps())}
+                  >
+                    Custom
+                  </button>
+                </div>
+                <Show when={isCustomFps()}>
+                  <div
+                    style={{
+                      display: "flex",
+                      "flex-direction": "column",
+                      gap: `${scale().tightGap}px`,
+                    }}
+                  >
+                    <div style={sliderRowStyle()}>
+                      <span
+                        style={{
+                          ...sliderLabelStyle(),
+                          "min-width": "3em",
+                          "text-align": "right",
+                        }}
+                      >
+                        {MIN_SURFACE_MAX_FPS}
+                      </span>
+                      <input
+                        type="range"
+                        min={MIN_SURFACE_MAX_FPS}
+                        max={MAX_SURFACE_MAX_FPS}
+                        step="1"
+                        value={fpsSlider()}
+                        onInput={handleFpsSlider}
+                        style={sliderStyle()}
+                      />
+                      <span
+                        style={{ ...sliderLabelStyle(), "min-width": "4.5em" }}
+                      >
+                        {MAX_SURFACE_MAX_FPS}
+                      </span>
+                    </div>
+                  </div>
+                </Show>
+                <span style={sliderHintStyle()}>
+                  {props.surfaceMaxFps > 0
+                    ? `At most ${props.surfaceMaxFps} fps.`
+                    : "Uses this display's refresh rate."}
+                </span>
+              </div>
+
               <div
                 style={{
                   display: "flex",

@@ -1307,6 +1307,38 @@ describe("BlitConnection surface subscriptions", () => {
     expect(lastMaxFps()).toBe(15);
   });
 
+  it("applies and removes a global frame-rate cap", () => {
+    conn.sendSurfaceSubscribe(1, conn.allocSurfaceViewId(), null, 0);
+    expect(lastMaxFps()).toBe(0);
+
+    conn.setSurfaceMaxFpsCap(60);
+    expect(lastMaxFps()).toBe(60);
+
+    conn.setSurfaceMaxFpsCap(30);
+    expect(lastMaxFps()).toBe(30);
+
+    conn.setSurfaceMaxFpsCap(0);
+    expect(lastMaxFps()).toBe(0);
+  });
+
+  it("keeps a lower per-view frame-rate limit under the global cap", () => {
+    conn.setSurfaceMaxFpsCap(60);
+    conn.sendSurfaceSubscribe(
+      1,
+      conn.allocSurfaceViewId(),
+      { width: 320, height: 180 },
+      15,
+    );
+    expect(lastMaxFps()).toBe(15);
+
+    const before = countSubscribes();
+    conn.setSurfaceMaxFpsCap(120);
+    expect(countSubscribes()).toBe(before);
+
+    conn.setSurfaceMaxFpsCap(10);
+    expect(lastMaxFps()).toBe(10);
+  });
+
   it("suspends live surface subscriptions while the page is hidden", () => {
     const original = document.visibilityState;
     conn.dispose();
