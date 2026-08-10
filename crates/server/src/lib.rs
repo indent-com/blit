@@ -157,6 +157,7 @@ trait PtyDriver: Send {
     fn take_used_rows_dirty(&mut self) -> bool;
     fn cursor_position(&self) -> (u16, u16);
     fn synced_output(&self) -> bool;
+    fn alt_screen(&self) -> bool;
     fn snapshot(&mut self, echo: bool, icanon: bool) -> FrameState;
     fn scrollback_frame(&mut self, offset: usize) -> FrameState;
     fn reset_modes(&mut self);
@@ -241,6 +242,10 @@ impl PtyDriver for AlacrittyDriver {
         AlacrittyDriver::synced_output(self)
     }
 
+    fn alt_screen(&self) -> bool {
+        AlacrittyDriver::alt_screen(self)
+    }
+
     fn snapshot(&mut self, echo: bool, icanon: bool) -> FrameState {
         AlacrittyDriver::snapshot(self, echo, icanon)
     }
@@ -305,6 +310,15 @@ const OUTBOX_SOFT_QUEUE_LIMIT_BYTES: usize = 1024 * 1024;
 const PREVIEW_FRAME_RESERVE: usize = 1;
 const READY_FRAME_QUEUE_CAP: usize = 4;
 const PTY_CHANNEL_CAPACITY: usize = 64;
+/// Alternate-screen TUIs commonly emit one repaint as hundreds of writes with
+/// tens of microseconds between them. Consider a burst complete after this
+/// much quiet instead of exposing its clear/redraw intermediates. Ordinary
+/// shell output is never held for this heuristic.
+const PTY_OUTPUT_QUIET: Duration = Duration::from_millis(1);
+/// A low-refresh viewer should not make a continuously writing TUI disappear
+/// indefinitely. The effective ceiling is the smaller of this and its fastest
+/// viewer's display interval, so high-refresh displays remain uncapped.
+const PTY_OUTPUT_COALESCE_MAX: Duration = Duration::from_millis(8);
 /// Max bytes of PTY output parsed per PTY per tick.  Parsing happens inside
 /// the tick task while it holds the session mutex, so an unbudgeted drain of
 /// a flooding PTY (`dd if=/dev/random`) starves every input handler, every
@@ -516,6 +530,12 @@ struct Pty {
     /// Client-chosen tag set at creation time.
     tag: String,
     dirty: bool,
+    /// Earliest time an ordinary (non-synchronized) output burst should be
+    /// snapshotted. `None` means the dirty state may be sent immediately.
+    snapshot_not_before: Option<Instant>,
+    /// Hard end of the current coalescing burst. Unlike
+    /// `snapshot_not_before`, later chunks do not move it.
+    snapshot_by: Option<Instant>,
     ready_frames: VecDeque<FrameState>,
     /// Receives raw byte chunks from the PTY reader task without mutex contention.
     byte_rx: mpsc::Receiver<PtyInput>,
@@ -569,9 +589,41 @@ impl Pty {
         self.dirty = true;
     }
 
+    fn mark_output_dirty(&mut self, now: Instant, coalesce_cap: Duration) {
+        self.dirty = true;
+        if self.driver.alt_screen() {
+            arm_pty_output_coalesce(
+                &mut self.snapshot_not_before,
+                &mut self.snapshot_by,
+                now,
+                coalesce_cap,
+            );
+        } else {
+            self.snapshot_not_before = None;
+            self.snapshot_by = None;
+        }
+    }
+
     fn clear_dirty(&mut self) {
         self.dirty = false;
+        self.snapshot_not_before = None;
+        self.snapshot_by = None;
     }
+}
+
+fn pty_output_coalesce_cap(display_fps: f32) -> Duration {
+    let display_interval = Duration::from_secs_f64(1.0 / display_fps.max(1.0) as f64);
+    PTY_OUTPUT_COALESCE_MAX.min(display_interval)
+}
+
+fn arm_pty_output_coalesce(
+    snapshot_not_before: &mut Option<Instant>,
+    snapshot_by: &mut Option<Instant>,
+    now: Instant,
+    coalesce_cap: Duration,
+) {
+    let hard_deadline = *snapshot_by.get_or_insert(now + coalesce_cap);
+    *snapshot_not_before = Some((now + PTY_OUTPUT_QUIET).min(hard_deadline));
 }
 
 struct CachedSurfaceInfo {
@@ -3057,8 +3109,14 @@ fn consume_deadline(deadline: &mut Instant, now: Instant, interval: Duration) ->
     consumed
 }
 
-fn should_snapshot_pty(dirty: bool, needful: bool, synced_output: bool) -> bool {
-    dirty && needful && !synced_output
+fn should_snapshot_pty(
+    dirty: bool,
+    needful: bool,
+    synced_output: bool,
+    snapshot_not_before: Option<Instant>,
+    now: Instant,
+) -> bool {
+    dirty && needful && !synced_output && snapshot_not_before.is_none_or(|deadline| deadline <= now)
 }
 
 fn enqueue_ready_frame(queue: &mut VecDeque<FrameState>, frame: FrameState) -> bool {
@@ -8672,6 +8730,12 @@ async fn tick(state: &AppState) -> TickOutcome {
         .values()
         .map(browser_pacing_fps)
         .fold(1.0_f32, f32::max);
+    let max_display_fps = sess
+        .clients
+        .values()
+        .map(|client| client.display_fps)
+        .fold(1.0_f32, f32::max);
+    let output_coalesce_cap = pty_output_coalesce_cap(max_display_fps);
     let title_interval = Duration::from_secs_f64(1.0 / max_fps as f64);
     let ids: SmallVec<[u16; 8]> = sess.ptys.keys().copied().collect();
     let mut clipboard_msgs: Vec<Vec<u8>> = Vec::new();
@@ -8779,7 +8843,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                         cwd_msgs.push(msg);
                     }
                     pty.driver.process(&data);
-                    pty.mark_dirty();
+                    pty.mark_output_dirty(now, output_coalesce_cap);
                 }
                 PtyInput::SyncBoundary { before } => {
                     budget = budget.saturating_sub(before.len());
@@ -8794,7 +8858,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                             cwd_msgs.push(msg);
                         }
                         pty.driver.process(&before);
-                        pty.mark_dirty();
+                        pty.mark_output_dirty(now, output_coalesce_cap);
                     }
                     if !pty.driver.synced_output() {
                         let frame = take_snapshot(pty);
@@ -8860,23 +8924,48 @@ async fn tick(state: &AppState) -> TickOutcome {
         let Some(pty) = sess.ptys.get_mut(&id) else {
             continue;
         };
-        if needful_ptys.contains(&id)
-            && let Some(frame) = pty.ready_frames.pop_front()
+        let needful = needful_ptys.contains(&id);
+        let synced_output = pty.driver.synced_output();
+        // A deferred burst may be the event that woke this tick, with no more
+        // PTY bytes forthcoming. Keep the delivery loop armed for the point at
+        // which it becomes snapshot-safe instead of waiting for unrelated IO.
+        if pty.dirty
+            && needful
+            && !synced_output
+            && let Some(deadline) = pty.snapshot_not_before
+            && deadline > now
         {
+            next_deadline = Some(next_deadline.map_or(deadline, |d| d.min(deadline)));
+        }
+        if needful && let Some(frame) = pty.ready_frames.pop_front() {
+            // Only one state per PTY is sent in a tick. If ordinary output
+            // followed this synchronized frame, make sure its already-due
+            // snapshot gets another turn even when no more bytes arrive.
+            if pty.dirty
+                && !synced_output
+                && pty
+                    .snapshot_not_before
+                    .is_none_or(|deadline| deadline <= now)
+            {
+                next_deadline = Some(next_deadline.map_or(now, |d| d.min(now)));
+            }
             snapshots.insert(id, frame);
             sess.tick_snaps += 1;
             continue;
         }
         if !should_snapshot_pty(
             pty.dirty,
-            needful_ptys.contains(&id),
-            pty.driver.synced_output(),
+            needful,
+            synced_output,
+            pty.snapshot_not_before,
+            now,
         ) {
             continue;
         }
-        // Applications that care about complete-frame boundaries should
-        // use DEC synchronized output (?2026). Outside that bracket we
-        // snapshot immediately instead of heuristically coalescing reads.
+        // DEC synchronized output supplies exact frame boundaries. Without
+        // it, ordinary shell output is immediate and alternate-screen output
+        // reaches here after either a short quiet period or the display-rate
+        // liveness ceiling.
         snapshots.insert(id, take_snapshot(pty));
         pty.clear_dirty();
         sess.tick_snaps += 1;
@@ -18356,15 +18445,67 @@ mod tests {
 
     #[test]
     fn should_snapshot_pty_requires_dirty_and_needful() {
-        assert!(should_snapshot_pty(true, true, false));
-        assert!(!should_snapshot_pty(false, true, false));
-        assert!(!should_snapshot_pty(true, false, false));
+        let now = Instant::now();
+        assert!(should_snapshot_pty(true, true, false, None, now));
+        assert!(!should_snapshot_pty(false, true, false, None, now));
+        assert!(!should_snapshot_pty(true, false, false, None, now));
     }
 
     #[test]
     fn should_snapshot_pty_defers_synced_output() {
-        assert!(!should_snapshot_pty(true, true, true));
-        assert!(should_snapshot_pty(true, true, false));
+        let now = Instant::now();
+        assert!(!should_snapshot_pty(true, true, true, None, now));
+        assert!(should_snapshot_pty(true, true, false, None, now));
+    }
+
+    #[test]
+    fn should_snapshot_pty_waits_for_output_coalescing() {
+        let now = Instant::now();
+        let deadline = now + PTY_OUTPUT_QUIET;
+        assert!(!should_snapshot_pty(true, true, false, Some(deadline), now,));
+        assert!(should_snapshot_pty(
+            true,
+            true,
+            false,
+            Some(deadline),
+            deadline,
+        ));
+    }
+
+    #[test]
+    fn output_coalescing_slides_until_its_hard_deadline() {
+        let now = Instant::now();
+        let mut deadline = None;
+        let mut hard_deadline = None;
+        arm_pty_output_coalesce(
+            &mut deadline,
+            &mut hard_deadline,
+            now,
+            PTY_OUTPUT_COALESCE_MAX,
+        );
+        assert_eq!(deadline, Some(now + PTY_OUTPUT_QUIET));
+        arm_pty_output_coalesce(
+            &mut deadline,
+            &mut hard_deadline,
+            now + Duration::from_millis(4),
+            PTY_OUTPUT_COALESCE_MAX,
+        );
+        assert_eq!(deadline, Some(now + Duration::from_millis(5)));
+        arm_pty_output_coalesce(
+            &mut deadline,
+            &mut hard_deadline,
+            now + PTY_OUTPUT_COALESCE_MAX,
+            PTY_OUTPUT_COALESCE_MAX,
+        );
+        assert_eq!(deadline, Some(now + PTY_OUTPUT_COALESCE_MAX));
+        assert_eq!(hard_deadline, Some(now + PTY_OUTPUT_COALESCE_MAX));
+    }
+
+    #[test]
+    fn output_coalescing_ceiling_tracks_high_refresh_displays() {
+        assert_eq!(pty_output_coalesce_cap(60.0), PTY_OUTPUT_COALESCE_MAX);
+        assert_eq!(pty_output_coalesce_cap(1_000.0), Duration::from_millis(1),);
+        assert!(pty_output_coalesce_cap(2_000.0) < Duration::from_millis(1));
     }
 
     #[test]

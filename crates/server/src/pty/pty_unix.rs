@@ -768,6 +768,8 @@ pub fn spawn_pty(
         driver: Box::new(blit_alacritty::TerminalDriver::new(rows, cols, scrollback)),
         tag: tag.to_owned(),
         dirty: true,
+        snapshot_not_before: None,
+        snapshot_by: None,
         ready_frames: std::collections::VecDeque::new(),
         byte_rx,
         reader_handle,

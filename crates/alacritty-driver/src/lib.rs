@@ -640,6 +640,10 @@ impl TerminalDriver {
         self.modes.synced_output
     }
 
+    pub fn alt_screen(&self) -> bool {
+        self.modes.alt_screen
+    }
+
     pub fn total_lines(&self) -> u32 {
         self.term.grid().total_lines() as u32
     }
@@ -1274,6 +1278,16 @@ mod tests {
         let frame = driver.snapshot(true, true);
         assert_eq!(frame.rows(), 24);
         assert_eq!(frame.cols(), 80);
+    }
+
+    #[test]
+    fn alternate_screen_tracking() {
+        let mut driver = TerminalDriver::new(24, 80, 1000);
+        assert!(!driver.alt_screen());
+        driver.process(b"\x1b[?1049h");
+        assert!(driver.alt_screen());
+        driver.process(b"\x1b[?1049l");
+        assert!(!driver.alt_screen());
     }
 
     #[test]
