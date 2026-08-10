@@ -214,10 +214,7 @@ import {
   loadFocusedTileFromHash,
 } from "./bsp/layout";
 import { setReveal } from "./ide/reveal";
-import {
-  debugPanelOpenFromHash,
-  withDebugPanelState,
-} from "./workspaceUrl";
+import { debugPanelOpenFromHash, withDebugPanelState } from "./workspaceUrl";
 
 export type Overlay =
   | "expose"
@@ -3107,7 +3104,8 @@ function WorkspaceScreen(props: {
 
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
-    ((sessionId: SessionId, targetPaneId: string) => void) | null = null;
+    | ((sessionId: SessionId, targetPaneId: string) => void)
+    | null = null;
   let moveToPaneFn:
     | ((value: string, targetPaneId: string, fromPaneId?: string) => void)
     | null = null;

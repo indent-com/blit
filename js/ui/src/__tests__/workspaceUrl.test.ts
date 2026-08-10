@@ -1,8 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  debugPanelOpenFromHash,
-  withDebugPanelState,
-} from "../workspaceUrl";
+import { debugPanelOpenFromHash, withDebugPanelState } from "../workspaceUrl";
 
 describe("workspace debug URL state", () => {
   it("recognizes the established bare debug flag", () => {
@@ -20,9 +17,7 @@ describe("workspace debug URL state", () => {
     expect(withDebugPanelState("l=two:a|b&t=local:1", true)).toBe(
       "l=two:a|b&t=local:1&debug",
     );
-    expect(withDebugPanelState("secret&debug=1", true)).toBe(
-      "secret&debug",
-    );
+    expect(withDebugPanelState("secret&debug=1", true)).toBe("secret&debug");
   });
 
   it("removes the flag without disturbing other URL state", () => {

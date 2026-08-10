@@ -13,11 +13,7 @@ import type {
   LinkHover,
 } from "@blit-sh/core";
 import { formatBw } from "./createMetrics";
-import type {
-  Metrics,
-  RenderSampleRing,
-  NetSampleRing,
-} from "./createMetrics";
+import type { Metrics, RenderSampleRing, NetSampleRing } from "./createMetrics";
 import {
   sessionName,
   sessionPrefix,

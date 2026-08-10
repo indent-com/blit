@@ -566,10 +566,7 @@ export class MuxTransport {
         throw new Error("WebTransport closed during authentication");
       }
       if (authResp[0] !== 1) {
-        this.dbg.warn(
-          "WebTransport auth rejected (resp=%s)",
-          authResp[0],
-        );
+        this.dbg.warn("WebTransport auth rejected (resp=%s)", authResp[0]);
         this._authRejected = true;
         for (const ch of this.channels.values()) {
           ch._setAuthRejected();
@@ -645,9 +642,7 @@ export class MuxTransport {
   }
 
   private wtReadLoop(
-    reader:
-      | ReadableStreamDefaultReader<Uint8Array>
-      | ReadableStreamBYOBReader,
+    reader: ReadableStreamDefaultReader<Uint8Array> | ReadableStreamBYOBReader,
     wt: WebTransport,
     signal: AbortSignal,
     initialBuffer: Uint8Array,
@@ -671,9 +666,7 @@ export class MuxTransport {
             ? await (reader as ReadableStreamBYOBReader).read(
                 new Uint8Array(byobBuffer),
               )
-            : await (
-                reader as ReadableStreamDefaultReader<Uint8Array>
-              ).read();
+            : await (reader as ReadableStreamDefaultReader<Uint8Array>).read();
           if (signal.aborted || this.wt !== wt) return;
           if (done) throw new Error("WebTransport receive stream closed");
           if (!value || value.length === 0) continue;
@@ -1044,7 +1037,9 @@ export class MuxChannel implements BlitTransport {
   ): void;
   addEventListener(type: string, listener: (...args: never[]) => void): void {
     if (type === "message") {
-      this.messageListeners.add(listener as (data: BlitTransportMessage) => void);
+      this.messageListeners.add(
+        listener as (data: BlitTransportMessage) => void,
+      );
     } else if (type === "statuschange") {
       this.statusListeners.add(listener as (status: ConnectionStatus) => void);
     }

@@ -702,8 +702,7 @@ export class TerminalStore {
     if (
       this.displayFps === 0 ||
       fps >= this.displayFps + 2 ||
-      fps <=
-        this.displayFps * TerminalStore.IMMEDIATE_DISPLAY_FPS_DROP_RATIO
+      fps <= this.displayFps * TerminalStore.IMMEDIATE_DISPLAY_FPS_DROP_RATIO
     ) {
       const changed = fps !== this.displayFps;
       this.displayFps = fps;
@@ -722,9 +721,7 @@ export class TerminalStore {
       return false;
     }
     this.pendingDisplayFpsCount++;
-    if (
-      this.pendingDisplayFpsCount < TerminalStore.DISPLAY_FPS_CONFIRMATIONS
-    )
+    if (this.pendingDisplayFpsCount < TerminalStore.DISPLAY_FPS_CONFIRMATIONS)
       return false;
     this.displayFps = fps;
     this.pendingDisplayFps = 0;
@@ -736,8 +733,7 @@ export class TerminalStore {
     if (
       this.rafHandle ||
       typeof requestAnimationFrame === "undefined" ||
-      (typeof document !== "undefined" &&
-        document.visibilityState === "hidden")
+      (typeof document !== "undefined" && document.visibilityState === "hidden")
     )
       return;
     this.rafPrev = 0;
@@ -752,8 +748,7 @@ export class TerminalStore {
           this.rafSamples.push(dt);
           if (
             this.rafSamples.length >= TerminalStore.RAF_PROBE_MIN_SAMPLES &&
-            ts - this.rafProbeStartedAt >=
-              TerminalStore.RAF_PROBE_DURATION_MS
+            ts - this.rafProbeStartedAt >= TerminalStore.RAF_PROBE_DURATION_MS
           ) {
             this.rafSamples.sort((a, b) => a - b);
             // Browser timestamps are commonly quantized to 0.1 ms. At

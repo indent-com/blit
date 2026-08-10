@@ -368,10 +368,7 @@ export class SurfaceFrameHistory {
     const a = this.physical(later);
     const b = this.physical(earlier);
     if (a < 0 || b < 0) return NaN;
-    const ms = wrappingTimestampDelta(
-      this.sourceTimes[a],
-      this.sourceTimes[b],
-    );
+    const ms = wrappingTimestampDelta(this.sourceTimes[a], this.sourceTimes[b]);
     return ms + (this.sourceSubTimes[a] - this.sourceSubTimes[b]) / 1000;
   }
 
@@ -1286,9 +1283,7 @@ export class SurfaceStore {
       rttMs,
     };
     this._serverClockSamples.push(sample);
-    if (
-      this._serverClockSamples.length > SurfaceStore.CLOCK_SAMPLE_MAX
-    ) {
+    if (this._serverClockSamples.length > SurfaceStore.CLOCK_SAMPLE_MAX) {
       this._serverClockSamples.splice(
         0,
         this._serverClockSamples.length - SurfaceStore.CLOCK_SAMPLE_MAX,
@@ -2132,18 +2127,13 @@ export class SurfaceStore {
     );
     p.offsets.push(receiveOffsetMs, window);
     p.decodeDelays.push(decodeDelayMs, window);
-    const fastReceiveOffsetMs = p.offsets.quantile(
-      SurfaceStore.FAST_QUANTILE,
-    );
+    const fastReceiveOffsetMs = p.offsets.quantile(SurfaceStore.FAST_QUANTILE);
     const fastDecodeDelayMs = p.decodeDelays.quantile(
       SurfaceStore.FAST_QUANTILE,
     );
     p.fastOffsetMs = fastReceiveOffsetMs + fastDecodeDelayMs;
     const lateReceiveOffsetMs = p.offsets.quantile(
-      Math.max(
-        0,
-        1 - SurfaceStore.PLAYOUT_OUTLIERS / p.offsets.length,
-      ),
+      Math.max(0, 1 - SurfaceStore.PLAYOUT_OUTLIERS / p.offsets.length),
     );
     const targetOffsetMs =
       p.fastOffsetMs +

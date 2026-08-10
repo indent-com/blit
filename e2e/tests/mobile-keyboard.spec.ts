@@ -117,9 +117,8 @@ test("keyboard rises only from the toggle and the key line tracks it", async ({
   expect(
     await page.evaluate(
       () =>
-        (
-          window as unknown as { __terminalExtraKeys: string[] }
-        ).__terminalExtraKeys,
+        (window as unknown as { __terminalExtraKeys: string[] })
+          .__terminalExtraKeys,
     ),
   ).toEqual(["keydown:ArrowUp:ArrowUp", "keyup:ArrowUp:ArrowUp"]);
 
@@ -366,9 +365,8 @@ test("the icon's keyboard survives focus landing on a surface canvas", async ({
     );
     if (!input) throw new Error("no surface input");
     const log: string[] = [];
-    (
-      window as unknown as { __surfaceExtraKeys: string[] }
-    ).__surfaceExtraKeys = log;
+    (window as unknown as { __surfaceExtraKeys: string[] }).__surfaceExtraKeys =
+      log;
     for (const type of ["keydown", "keyup"] as const) {
       input.addEventListener(type, (event) => {
         log.push(`${type}:${event.key}:${event.code}`);
@@ -380,9 +378,8 @@ test("the icon's keyboard survives focus landing on a surface canvas", async ({
   expect(
     await page.evaluate(
       () =>
-        (
-          window as unknown as { __surfaceExtraKeys: string[] }
-        ).__surfaceExtraKeys,
+        (window as unknown as { __surfaceExtraKeys: string[] })
+          .__surfaceExtraKeys,
     ),
   ).toEqual([
     "keydown:Escape:Escape",

@@ -118,7 +118,8 @@ class StreamEofWebTransport {
     return {
       readable: {
         getReader(options?: { mode?: string }) {
-          if (options?.mode === "byob") throw new TypeError("not a byte stream");
+          if (options?.mode === "byob")
+            throw new TypeError("not a byte stream");
           return reader;
         },
       },

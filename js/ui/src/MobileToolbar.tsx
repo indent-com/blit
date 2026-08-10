@@ -1,9 +1,6 @@
 import { createSignal, createEffect, onCleanup } from "solid-js";
 import type { BlitSurfaceCanvas, BlitTerminalSurface } from "@blit-sh/core";
-import {
-  surfaceCanvasForInput,
-  terminalSurfaceForInput,
-} from "@blit-sh/core";
+import { surfaceCanvasForInput, terminalSurfaceForInput } from "@blit-sh/core";
 import type { Theme, UIScale } from "./theme";
 
 // ---------------------------------------------------------------------------

@@ -4,25 +4,25 @@
 
 ## Configuration
 
-| Variable                       | Default                                            | Purpose                                                                                |
-| ------------------------------ | -------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `BLIT_SOCK`                    | see path cascade in [transports.md](transports.md) | Unix socket listen path                                                                |
-| `SHELL`                        | `$SHELL` or `/bin/sh`                              | Shell spawned for new PTYs                                                             |
-| `BLIT_SHELL_FLAGS`             | `li` (Unix) / `` (Windows)                         | Shell invocation flags                                                                 |
-| `BLIT_SCROLLBACK`              | `10000`                                            | Scrollback buffer rows per PTY                                                         |
-| `BLIT_VAAPI_DEVICE`            | `/dev/dri/renderD128`                              | VA-API render node for encoding                                                        |
-| `BLIT_CUDA_DEVICE`             | `0`                                                | CUDA device ordinal (NVENC)                                                            |
-| `BLIT_FD_CHANNEL`              | unset                                              | fd-channel file descriptor                                                             |
-| `BLIT_EXPORT_SOCK`             | unset                                              | `1` exports the socket path as `BLIT_SOCK` in spawned terminals (also `--export-sock`) |
-| `BLIT_INJECT_PATH`             | unset                                              | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)     |
-| `BLIT_SURFACE_ENCODERS`        | see encoder table                                  | Comma-separated encoder priority                                                       |
-| `BLIT_SURFACE_BANDWIDTH`       | `ultra`                                            | Ceiling on video bandwidth (adaptation only goes cheaper)                              |
-| `BLIT_SURFACE_SPEED`           | `realtime`                                         | Encoder speed preset                                                                   |
-| `BLIT_MAX_CONNECTIONS`         | `0` (unlimited)                                    | Reject client connections past this count                                              |
-| `BLIT_MAX_PTYS`                | `0` (unlimited)                                    | Refuse `CREATE` past this many PTYs across all clients                                 |
-| `BLIT_ENCODE_FENCE_TIMEOUT_MS` | `10000`                                            | Give up on a Vulkan encode submission after this long (`0` = wait forever)             |
-| `BLIT_ENABLE_EXTERNAL_MEMORY_HOST` | unset                                          | Force experimental direct `wl_shm` host import when Vulkan supports it                  |
-| `BLIT_DISABLE_EXTERNAL_MEMORY_HOST` | unset                                         | Disable automatic direct `wl_shm` host import                                           |
+| Variable                            | Default                                            | Purpose                                                                                |
+| ----------------------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `BLIT_SOCK`                         | see path cascade in [transports.md](transports.md) | Unix socket listen path                                                                |
+| `SHELL`                             | `$SHELL` or `/bin/sh`                              | Shell spawned for new PTYs                                                             |
+| `BLIT_SHELL_FLAGS`                  | `li` (Unix) / `` (Windows)                         | Shell invocation flags                                                                 |
+| `BLIT_SCROLLBACK`                   | `10000`                                            | Scrollback buffer rows per PTY                                                         |
+| `BLIT_VAAPI_DEVICE`                 | `/dev/dri/renderD128`                              | VA-API render node for encoding                                                        |
+| `BLIT_CUDA_DEVICE`                  | `0`                                                | CUDA device ordinal (NVENC)                                                            |
+| `BLIT_FD_CHANNEL`                   | unset                                              | fd-channel file descriptor                                                             |
+| `BLIT_EXPORT_SOCK`                  | unset                                              | `1` exports the socket path as `BLIT_SOCK` in spawned terminals (also `--export-sock`) |
+| `BLIT_INJECT_PATH`                  | unset                                              | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)     |
+| `BLIT_SURFACE_ENCODERS`             | see encoder table                                  | Comma-separated encoder priority                                                       |
+| `BLIT_SURFACE_BANDWIDTH`            | `ultra`                                            | Ceiling on video bandwidth (adaptation only goes cheaper)                              |
+| `BLIT_SURFACE_SPEED`                | `realtime`                                         | Encoder speed preset                                                                   |
+| `BLIT_MAX_CONNECTIONS`              | `0` (unlimited)                                    | Reject client connections past this count                                              |
+| `BLIT_MAX_PTYS`                     | `0` (unlimited)                                    | Refuse `CREATE` past this many PTYs across all clients                                 |
+| `BLIT_ENCODE_FENCE_TIMEOUT_MS`      | `10000`                                            | Give up on a Vulkan encode submission after this long (`0` = wait forever)             |
+| `BLIT_ENABLE_EXTERNAL_MEMORY_HOST`  | unset                                              | Force experimental direct `wl_shm` host import when Vulkan supports it                 |
+| `BLIT_DISABLE_EXTERNAL_MEMORY_HOST` | unset                                              | Disable automatic direct `wl_shm` host import                                          |
 
 `BLIT_MAX_CONNECTIONS` and `BLIT_MAX_PTYS` are an operator sanity bound against
 runaway automation, not a security control — a client that can open one PTY can
@@ -251,8 +251,8 @@ Once the tier is reached, a 4:4:4 session the driver refuses or one that stops p
 | `h264-nvenc`    | NVENC (GPU)         | H.264 via CUDA                                                                                                                                                                                                           |
 | `av1-vaapi`     | VA-API (GPU)        | AV1 via libva                                                                                                                                                                                                            |
 | `h264-vaapi`    | VA-API (GPU)        | H.264 via libva                                                                                                                                                                                                          |
-| `av1-vulkan`    | Vulkan Video (GPU)  | AV1 via VK_KHR_video_encode_av1. Main, or High where the driver encodes 4:4:4. Per-client scaled target. Fallback after dedicated engines                                                                            |
-| `h264-vulkan`   | Vulkan Video (GPU)  | H.264 via VK_KHR_video_encode_h264. 4:2:0, or 4:4:4 where the driver serializes it. Per-client scaled target                                                                                                            |
+| `av1-vulkan`    | Vulkan Video (GPU)  | AV1 via VK_KHR_video_encode_av1. Main, or High where the driver encodes 4:4:4. Per-client scaled target. Fallback after dedicated engines                                                                                |
+| `h264-vulkan`   | Vulkan Video (GPU)  | H.264 via VK_KHR_video_encode_h264. 4:2:0, or 4:4:4 where the driver serializes it. Per-client scaled target                                                                                                             |
 | `h264-software` | openh264/x264 (CPU) | Software H.264; backend is a build-time choice — openh264 by default, x264 in the GPL opt-in build (`blit --license`), absent if built with neither. 4:4:4 requires x264 (High 4:4:4 Predictive); openh264 is 4:2:0-only |
 | `av1-software`  | rav1e (CPU)         | Software AV1                                                                                                                                                                                                             |
 

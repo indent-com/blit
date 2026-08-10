@@ -923,10 +923,7 @@ export class BlitConnection {
       this.pageVisibilityHandler = () => {
         this.setPageVisible(document.visibilityState !== "hidden");
       };
-      document.addEventListener(
-        "visibilitychange",
-        this.pageVisibilityHandler,
-      );
+      document.addEventListener("visibilitychange", this.pageVisibilityHandler);
     }
 
     // Propagate AudioPlayer state changes (e.g. reset on reconnect) into the
@@ -3942,10 +3939,7 @@ export class BlitConnection {
         // handleMessage and all synchronous parsers honor the transport's
         // borrowed-view contract. Promise results that escape it take their
         // own copy at the resolve site below.
-        const reassembled = this.fragmentBuffer.subarray(
-          0,
-          this.fragmentBytes,
-        );
+        const reassembled = this.fragmentBuffer.subarray(0, this.fragmentBytes);
         this.fragmentBytes = 0;
         this.handleMessage(reassembled);
       }
@@ -4324,20 +4318,14 @@ export class BlitConnection {
         if (bytes.length < 12) return;
         const surfaceId = bytes[1] | (bytes[2] << 8);
         const timestamp =
-          (bytes[3] |
-            (bytes[4] << 8) |
-            (bytes[5] << 16) |
-            (bytes[6] << 24)) >>>
+          (bytes[3] | (bytes[4] << 8) | (bytes[5] << 16) | (bytes[6] << 24)) >>>
           0;
         const flags = bytes[7];
         const width = bytes[8] | (bytes[9] << 8);
         const height = bytes[10] | (bytes[11] << 8);
-        const hasSubUs =
-          (flags & SURFACE_FRAME_FLAG_TIMESTAMP_SUB_US) !== 0;
+        const hasSubUs = (flags & SURFACE_FRAME_FLAG_TIMESTAMP_SUB_US) !== 0;
         if (hasSubUs && bytes.length < 14) return;
-        const timestampSubUs = hasSubUs
-          ? bytes[12] | (bytes[13] << 8)
-          : 0;
+        const timestampSubUs = hasSubUs ? bytes[12] | (bytes[13] << 8) : 0;
         const dataOffset = hasSubUs ? 14 : 12;
         try {
           // The store sends ACKs itself, deferring them when the decode

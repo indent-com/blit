@@ -137,8 +137,7 @@ export function createMetrics(
     if (renderMs != null) {
       renderMsSum += renderMs;
       renderMsMax = Math.max(renderMsMax, renderMs);
-      if (sampleTimelines())
-        timeline.push(performance.now(), renderMs);
+      if (sampleTimelines()) timeline.push(performance.now(), renderMs);
     }
   }
 
@@ -151,8 +150,7 @@ export function createMetrics(
           ? data[0]
           : new Uint8Array(data, 0, 1)[0];
     if (first === 0x00) updates++;
-    if (sampleTimelines())
-      net.push(performance.now(), data.byteLength, true);
+    if (sampleTimelines()) net.push(performance.now(), data.byteLength, true);
   };
 
   // Re-register transport listeners whenever the transport list changes.

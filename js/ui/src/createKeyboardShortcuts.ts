@@ -107,7 +107,9 @@ export function shouldForwardClosingSwitcherCtrlK(
 export function isSwitcherShortcut(
   event: Pick<KeyboardEvent, "ctrlKey" | "metaKey" | "shiftKey" | "key">,
 ): boolean {
-  return (event.ctrlKey || event.metaKey) && !event.shiftKey && event.key === "k";
+  return (
+    (event.ctrlKey || event.metaKey) && !event.shiftKey && event.key === "k"
+  );
 }
 
 /**

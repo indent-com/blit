@@ -61,14 +61,8 @@ describe("display refresh estimation", () => {
   });
 
   it("recovers an arbitrary rate without nominal-mode snapping", () => {
-    expect(estimateDisplayFps(Array(60).fill(1_000 / 137))).toBeCloseTo(
-      137,
-      6,
-    );
-    expect(estimateDisplayFps(Array(60).fill(1_000 / 145))).toBeCloseTo(
-      145,
-      6,
-    );
+    expect(estimateDisplayFps(Array(60).fill(1_000 / 137))).toBeCloseTo(137, 6);
+    expect(estimateDisplayFps(Array(60).fill(1_000 / 145))).toBeCloseTo(145, 6);
   });
 
   it("trims isolated missed and compensating animation frames", () => {

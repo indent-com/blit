@@ -441,49 +441,48 @@ function domCodeForCharacter(key: string): string {
   if (/^[a-z]$/i.test(key)) return `Key${key.toUpperCase()}`;
   if (/^[0-9]$/.test(key)) return `Digit${key}`;
   return (
-    {
-      " ": "Space",
-      "!": "Digit1",
-      "@": "Digit2",
-      "#": "Digit3",
-      "$": "Digit4",
-      "%": "Digit5",
-      "^": "Digit6",
-      "&": "Digit7",
-      "*": "Digit8",
-      "(": "Digit9",
-      ")": "Digit0",
-      "-": "Minus",
-      _: "Minus",
-      "=": "Equal",
-      "+": "Equal",
-      "[": "BracketLeft",
-      "{": "BracketLeft",
-      "]": "BracketRight",
-      "}": "BracketRight",
-      ";": "Semicolon",
-      ":": "Semicolon",
-      "'": "Quote",
-      '"': "Quote",
-      "`": "Backquote",
-      "~": "Backquote",
-      "\\": "Backslash",
-      "|": "Backslash",
-      ",": "Comma",
-      "<": "Comma",
-      ".": "Period",
-      ">": "Period",
-      "/": "Slash",
-      "?": "Slash",
-    } as Record<string, string>
-  )[key] ?? "";
+    (
+      {
+        " ": "Space",
+        "!": "Digit1",
+        "@": "Digit2",
+        "#": "Digit3",
+        $: "Digit4",
+        "%": "Digit5",
+        "^": "Digit6",
+        "&": "Digit7",
+        "*": "Digit8",
+        "(": "Digit9",
+        ")": "Digit0",
+        "-": "Minus",
+        _: "Minus",
+        "=": "Equal",
+        "+": "Equal",
+        "[": "BracketLeft",
+        "{": "BracketLeft",
+        "]": "BracketRight",
+        "}": "BracketRight",
+        ";": "Semicolon",
+        ":": "Semicolon",
+        "'": "Quote",
+        '"': "Quote",
+        "`": "Backquote",
+        "~": "Backquote",
+        "\\": "Backslash",
+        "|": "Backslash",
+        ",": "Comma",
+        "<": "Comma",
+        ".": "Period",
+        ">": "Period",
+        "/": "Slash",
+        "?": "Slash",
+      } as Record<string, string>
+    )[key] ?? ""
+  );
 }
 
 function characterNeedsShift(key: string): boolean {
-  return (
-    /^[A-Z]$/.test(key) ||
-    '~!@#$%^&*()_+{}|:"<>?'.includes(key)
-  );
+  return /^[A-Z]$/.test(key) || '~!@#$%^&*()_+{}|:"<>?'.includes(key);
 }
 
 /** Modifier keys must stay held across a chord; every other Cmd-chord key can
@@ -1667,8 +1666,8 @@ export class BlitSurfaceCanvas {
   /** Register this visible mount with the connection exactly once. */
   private serverSubscribe(
     conn: BlitConnection | null = this.getConn(),
-    store: import("./SurfaceStore").SurfaceStore | null =
-      conn?.surfaceStore ?? this._store,
+    store: import("./SurfaceStore").SurfaceStore | null = conn?.surfaceStore ??
+      this._store,
   ): void {
     if (
       !this._live ||

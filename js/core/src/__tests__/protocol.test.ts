@@ -491,7 +491,6 @@ describe("buildSurfaceAckMessage", () => {
     expect(buildSurfaceAckMessage(1, 999)[3]).toBe(255);
     expect(buildSurfaceAckMessage(1, -1)[3]).toBe(0);
   });
-
 });
 
 /**

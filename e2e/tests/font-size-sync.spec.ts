@@ -3,9 +3,9 @@ import { expect, test, type Page } from "@playwright/test";
 const PASSPHRASE = process.env.BLIT_PASSPHRASE ?? "test-secret";
 
 async function fontButtonSize(page: Page): Promise<string> {
-  return page.locator('button[title="Font"]').evaluate((el) =>
-    getComputedStyle(el).fontSize,
-  );
+  return page
+    .locator('button[title="Font"]')
+    .evaluate((el) => getComputedStyle(el).fontSize);
 }
 
 test("font size stays local while previewing and reaches peers on Apply", async ({

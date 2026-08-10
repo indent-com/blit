@@ -314,9 +314,7 @@ export class WebTransportTransport implements BlitTransport {
   }
 
   private async readLoop(
-    reader:
-      | ReadableStreamDefaultReader<Uint8Array>
-      | ReadableStreamBYOBReader,
+    reader: ReadableStreamDefaultReader<Uint8Array> | ReadableStreamBYOBReader,
     wt: WebTransport,
     initialBuffer: Uint8Array,
     byob: boolean,
@@ -338,9 +336,7 @@ export class WebTransportTransport implements BlitTransport {
           ? await (reader as ReadableStreamBYOBReader).read(
               new Uint8Array(byobBuffer),
             )
-          : await (
-              reader as ReadableStreamDefaultReader<Uint8Array>
-            ).read();
+          : await (reader as ReadableStreamDefaultReader<Uint8Array>).read();
         if (this.disposed || this.wt !== wt) return;
         if (done) throw new Error("WebTransport receive stream closed");
         if (!value || value.length === 0) continue;
