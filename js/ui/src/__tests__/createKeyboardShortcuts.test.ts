@@ -3,8 +3,10 @@ import type { BSPAssignments } from "@blit-sh/core";
 import { surfaceAssignment } from "../bsp/layout";
 import {
   hasFocusedWaylandSurface,
+  isSwitcherShortcut,
   nextCycleTarget,
   shouldHandleNewTerminalShortcut,
+  shouldForwardClosingSwitcherCtrlK,
 } from "../createKeyboardShortcuts";
 
 function focusState(options: {
@@ -45,6 +47,51 @@ describe("hasFocusedWaylandSurface", () => {
     const state = focusState({ paneId: "pane-1", assignment: "session-1" });
     expect(hasFocusedWaylandSurface(state)).toBe(false);
     expect(shouldHandleNewTerminalShortcut(state)).toBe(true);
+  });
+});
+
+describe("Ctrl-K switcher toggle", () => {
+  it("opens for Ctrl-K as well as Cmd-K on every platform", () => {
+    expect(
+      isSwitcherShortcut({
+        ctrlKey: true,
+        metaKey: false,
+        shiftKey: false,
+        key: "k",
+      }),
+    ).toBe(true);
+    expect(
+      isSwitcherShortcut({
+        ctrlKey: false,
+        metaKey: true,
+        shiftKey: false,
+        key: "k",
+      }),
+    ).toBe(true);
+  });
+
+  it("forwards the second Ctrl-K to the focused pane", () => {
+    expect(
+      shouldForwardClosingSwitcherCtrlK("expose", {
+        ctrlKey: true,
+        metaKey: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not forward the opening chord or Cmd-K", () => {
+    expect(
+      shouldForwardClosingSwitcherCtrlK(null, {
+        ctrlKey: true,
+        metaKey: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldForwardClosingSwitcherCtrlK("expose", {
+        ctrlKey: false,
+        metaKey: true,
+      }),
+    ).toBe(false);
   });
 });
 

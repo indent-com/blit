@@ -2353,6 +2353,31 @@ function WorkspaceScreen(props: {
     // focused, so only the main view's own slot can say "nothing here".
     return mainViewSessionId();
   }
+
+  /**
+   * The first Ctrl-K belongs to Blit's switcher. Repeating it dismisses the
+   * switcher and sends the chord to the pane that was underneath it.
+   */
+  function forwardCtrlKToFocusedPane() {
+    const assignment = focusedAssignment();
+    if (!assignment) return;
+    const surface = parseSurfaceAssignment(assignment);
+    if (surface) {
+      const conn = workspace.getConnection(surface.connectionId);
+      if (!conn) return;
+      // Linux evdev: KEY_LEFTCTRL=29, KEY_K=37. BlitSurfaceCanvas uses the
+      // same codes for physical keyboard input.
+      conn.sendSurfaceInput(surface.surfaceId, 29, true);
+      conn.sendSurfaceInput(surface.surfaceId, 37, true);
+      conn.sendSurfaceInput(surface.surfaceId, 37, false);
+      conn.sendSurfaceInput(surface.surfaceId, 29, false);
+      return;
+    }
+    // Editors and web panes own no PTY input channel. Do not send the chord to
+    // a stale focused terminal behind one of those tiles.
+    if (isTileAssignment(assignment) || isWebAssignment(assignment)) return;
+    workspace.sendInput(assignment as SessionId, new Uint8Array([0x0b]));
+  }
   /** Highlight shown while a drag hovers the non-BSP main view (BSP panes draw
    *  their own, per pane). */
   const [mainViewDragOver, setMainViewDragOver] = createSignal(false);
@@ -3276,6 +3301,7 @@ function WorkspaceScreen(props: {
       focusSurfaceById(null);
     },
     toggleOverlay,
+    forwardCtrlK: forwardCtrlKToFocusedPane,
     cancelOverlay,
     toggleDebug,
     togglePreviewPanel,

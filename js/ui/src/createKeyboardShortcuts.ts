@@ -37,6 +37,8 @@ export interface KeyboardShortcutHandlers {
   unfocusSurface: () => void;
 
   toggleOverlay: (target: Overlay) => void;
+  /** Send Ctrl-K to the terminal or Wayland surface in the focused pane. */
+  forwardCtrlK: () => void;
   cancelOverlay: () => void;
   toggleDebug: () => void;
   togglePreviewPanel: () => void;
@@ -91,6 +93,21 @@ export function shouldHandleNewTerminalShortcut(
   h: SurfaceFocusHandlers,
 ): boolean {
   return !hasFocusedWaylandSurface(h);
+}
+
+/** The second Ctrl-K closes the switcher and belongs to the pane underneath. */
+export function shouldForwardClosingSwitcherCtrlK(
+  current: Overlay,
+  event: Pick<KeyboardEvent, "ctrlKey" | "metaKey">,
+): boolean {
+  return current === "expose" && event.ctrlKey && !event.metaKey;
+}
+
+/** Both Ctrl-K and Cmd-K open the switcher on every platform. */
+export function isSwitcherShortcut(
+  event: Pick<KeyboardEvent, "ctrlKey" | "metaKey" | "shiftKey" | "key">,
+): boolean {
+  return (event.ctrlKey || event.metaKey) && !event.shiftKey && event.key === "k";
 }
 
 /**
@@ -203,7 +220,6 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
       h.handleRestartOrClose();
       return true;
     };
-    const isMacLike = /Mac|iPhone|iPad/.test(navigator.platform);
     const handler = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
       // Wayland applications own their Ctrl+Shift chords (Zed's command
@@ -211,17 +227,12 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
       // dock/overlay shortcuts must not steal them.
       const surfaceOwnsCtrlShift = hasFocusedWaylandSurface(h);
 
-      if (mod && !e.shiftKey && e.key === "k") {
-        // On a Mac keyboard, Ctrl+K in a focused terminal is the shell's
-        // kill-line — only Cmd+K opens the switcher there. (Elsewhere
-        // Ctrl+K is the app's only binding, so it keeps winning.)
-        const ctrlOnlyInTerminal =
-          isMacLike && !e.metaKey && isTerminalInput(eventElement(e.target));
-        if (!ctrlOnlyInTerminal) {
-          e.preventDefault();
-          h.toggleOverlay("expose");
-          return;
-        }
+      if (isSwitcherShortcut(e)) {
+        const forward = shouldForwardClosingSwitcherCtrlK(h.overlay(), e);
+        e.preventDefault();
+        h.toggleOverlay("expose");
+        if (forward) h.forwardCtrlK();
+        return;
       }
       if (
         !surfaceOwnsCtrlShift &&
