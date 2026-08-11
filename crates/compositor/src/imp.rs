@@ -1355,6 +1355,79 @@ struct ClientState {
     /// probing every live resource after every ordinary request batch.
     cleanup_needed: Arc<AtomicBool>,
 }
+
+/// Stop dispatching a client's stale request backlog once its socket closes.
+///
+/// wayland-backend drains every already-readable request before it reads EOF.
+/// A killed client can leave thousands of commits in the socket, making its
+/// dead surface keep rendering for seconds before cleanup runs.  POLLRDHUP is
+/// raised as soon as the connection itself loses its writer, even while data
+/// remains readable.  Shutting down our clone discards the socket backlog;
+/// marking the backend client dead also stops requests it already decoded at
+/// the next dispatch boundary.
+///
+/// This deliberately follows the socket rather than SO_PEERCRED: passing a
+/// Wayland fd to another process remains valid, and does not produce RDHUP.
+fn monitor_client_disconnect(
+    watched_stream: std::os::unix::net::UnixStream,
+    cancel: &std::os::unix::net::UnixStream,
+    backend: wayland_server::backend::Handle,
+    client_id: wayland_server::backend::ClientId,
+    verbose: bool,
+) {
+    let Ok(cancel) = cancel.try_clone() else {
+        return;
+    };
+
+    let spawn = std::thread::Builder::new()
+        .name("wayland-client-disconnect".into())
+        .spawn(move || {
+            let mut fds = [
+                libc::pollfd {
+                    fd: watched_stream.as_raw_fd(),
+                    events: libc::POLLRDHUP,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: cancel.as_raw_fd(),
+                    events: libc::POLLRDHUP,
+                    revents: 0,
+                },
+            ];
+            loop {
+                let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+                if ready < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return;
+                }
+                if fds[0].revents
+                    & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+                    != 0
+                {
+                    let _ = watched_stream.shutdown(std::net::Shutdown::Both);
+                    backend.kill_client(
+                        client_id,
+                        wayland_server::backend::DisconnectReason::ConnectionClosed,
+                    );
+                    return;
+                }
+                if fds[1].revents != 0 {
+                    // The compositor is stopping.  The monitor's cloned fd
+                    // must not keep the client connected after Display drops.
+                    let _ = watched_stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+            }
+        });
+    if let Err(err) = spawn
+        && verbose
+    {
+        eprintln!("[compositor] cannot monitor Wayland client disconnect: {err}");
+    }
+}
+
 struct XdgSurfaceData {
     wl_surface_id: ObjectId,
 }
@@ -9387,6 +9460,11 @@ fn run_compositor(
     }
 
     let handle = event_loop.handle();
+    // Every per-client disconnect monitor watches the read half.  Dropping the
+    // sole write half on any run_compositor exit wakes them all, so their
+    // cloned client sockets cannot outlive the compositor Display.
+    let (monitor_cancel_read, _monitor_cancel_write) =
+        std::os::unix::net::UnixStream::pair().expect("failed to create client-monitor cancel fd");
 
     // Insert display fd source.
     let display_source = Generic::new(display, Interest::READ, calloop::Mode::Level);
@@ -9409,19 +9487,36 @@ fn run_compositor(
 
     // Insert listening socket.
     let socket_source = Generic::new(listening_socket, Interest::READ, calloop::Mode::Level);
+    let monitor_cancel = monitor_cancel_read
+        .try_clone()
+        .expect("failed to clone client-monitor cancel fd");
     handle
-        .insert_source(socket_source, |_, socket, state| {
+        .insert_source(socket_source, move |_, socket, state| {
             let ls = unsafe { socket.get_mut() };
-            if let Some(client_stream) = ls.accept().ok().flatten()
-                && let Err(e) = state.display_handle.insert_client(
+            if let Some(client_stream) = ls.accept().ok().flatten() {
+                let watched_stream = client_stream.try_clone().ok();
+                match state.display_handle.insert_client(
                     client_stream,
                     Arc::new(ClientState {
                         cleanup_needed: Arc::clone(&state.cleanup_needed),
                     }),
-                )
-                && state.verbose
-            {
-                eprintln!("[compositor] insert_client error: {e}");
+                ) {
+                    Ok(client) => {
+                        if let Some(watched_stream) = watched_stream {
+                            monitor_client_disconnect(
+                                watched_stream,
+                                &monitor_cancel,
+                                state.display_handle.backend_handle(),
+                                client.id(),
+                                state.verbose,
+                            );
+                        }
+                    }
+                    Err(e) if state.verbose => {
+                        eprintln!("[compositor] insert_client error: {e}");
+                    }
+                    Err(_) => {}
+                }
             }
             Ok(PostAction::Continue)
         })
