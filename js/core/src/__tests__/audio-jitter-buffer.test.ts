@@ -133,8 +133,8 @@ describe("audio worklet jitter buffer", () => {
     for (let i = 0; i < events; i++) underrunOnce(proc);
 
     expect(proc.bufferTarget).toBe(MAX_BUFFER_TARGET_SAMPLES);
-    // A stressed client may sit at most 190 ms behind the 60 ms clean floor.
-    expect(proc.bufferTarget / 48).toBeLessThanOrEqual(250);
+    // A stressed client may sit at most 340 ms behind the 60 ms clean floor.
+    expect(proc.bufferTarget / 48).toBeLessThanOrEqual(400);
   });
 
   describe("skip", () => {

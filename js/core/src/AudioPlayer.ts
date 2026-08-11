@@ -27,10 +27,10 @@
  * Audio decoded while AudioWorklet.addModule() is still loading must be
  * staged somewhere, but keeping half a second here defeats the worklet's
  * lower latency bound before its servo even starts.  Keep only the newest
- * 260 ms (13 whole Opus frames), enough to fill the 250 ms adaptive-buffer
+ * 400 ms (20 whole Opus frames), enough to fill the adaptive-buffer
  * ceiling below.
  */
-export const MAX_STAGING_FRAMES = 13; // 260 ms
+export const MAX_STAGING_FRAMES = 20; // 400 ms
 
 /**
  * Adaptive jitter buffer: the worklet starts at MIN_BUFFER_SAMPLES, grows
@@ -57,16 +57,14 @@ export const MIN_BUFFER_SAMPLES = 2880; // 3 frames = 60 ms at 48 kHz
  * is defended by slowing playback down to refill it.  That is the
  * "audio falls further and further behind" failure.
  *
- * 250 ms leaves 190 ms of adaptive headroom above the 60 ms floor: two
- * underrun events can buy enough margin for the scheduling jitter observed
- * on iPadOS.  The servo must preserve that adaptive target; forcing every
- * client back to the floor causes repeated gaps.  The ceiling still prevents
- * a stressed client from ratcheting hundreds of milliseconds behind a clean
- * client.  The server interleaves audio at 4 KiB boundaries once a bulk
- * writer shows backpressure, so a larger allowance is no longer justified
- * by transport head-of-line blocking.
+ * 400 ms leaves 340 ms of adaptive headroom above the 60 ms floor.  That
+ * covers browser scheduling stalls and transport batching that can exceed
+ * 250 ms even when protocol RTT and server-side queues look healthy.  The
+ * servo must preserve that adaptive target; forcing every client back to the
+ * floor causes repeated gaps.  The ceiling still prevents a stressed client
+ * from ratcheting into seconds of latency.
  */
-export const MAX_BUFFER_TARGET_SAMPLES = 12000; // 250 ms at 48 kHz
+export const MAX_BUFFER_TARGET_SAMPLES = 19200; // 400 ms at 48 kHz
 
 /**
  * Samples of uninterrupted, non-buffering playback required before
@@ -158,10 +156,11 @@ export const GROW_FRAMES_PER_UNDERRUN = 5;
  * faster than that.  Above this threshold we drop samples outright:
  * a single ~1.3 ms fade (see FADE_SAMPLES) beats staying seconds behind.
  *
- * Four Opus frames above target is outside normal report-to-report wobble,
- * but small enough to keep even transient lag bounded tightly.
+ * Keep this above the 100 ms position-report cadence and ordinary transport
+ * batching.  A smaller threshold can turn a stale depth report into a skip
+ * that consumes the current safety margin and induces an underrun.
  */
-export const SKIP_EXCESS_MS = 80;
+export const SKIP_EXCESS_MS = 200;
 
 /**
  * Minimum interval between `skip` messages.
