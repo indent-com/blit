@@ -23,6 +23,13 @@ import { t as i18n } from "./i18n";
 import { Workspace } from "./Workspace";
 import { PASSPHRASE_KEY } from "./passphrase-storage";
 import { muxWtUrl } from "./transportUrls";
+import {
+  cancelHmrRelease,
+  claimHmrLease,
+  closeTransportBundle,
+  deferHmrRelease,
+  type HmrLeaseState,
+} from "./hmrLease";
 
 function decodeHashValue(value: string): string {
   try {
@@ -232,17 +239,19 @@ function AppCrash(props: { err: unknown }) {
 // hot-module reloads so remote connections are not torn down.
 // ---------------------------------------------------------------------------
 
-type HmrData = {
+type HmrData = HmrLeaseState & {
   version: number;
   mux: MuxTransport;
   channelCache: Map<string, { uri: string; transport: BlitTransport }>;
   passphrase: string;
+  workspaceKey: object;
+  closed?: boolean;
 };
 
 // Bump when preserved transport instances are incompatible with hot code.
 // Existing class instances keep their old prototype and receive callbacks,
 // so reusing one would silently leave transport fixes inactive until reload.
-const HMR_DATA_VERSION = 4;
+const HMR_DATA_VERSION = 5;
 
 function getHmrData(): HmrData | null {
   return (import.meta.hot?.data?.connectedApp as HmrData) ?? null;
@@ -252,6 +261,19 @@ function setHmrData(data: HmrData): void {
   if (import.meta.hot) {
     import.meta.hot.data.connectedApp = data;
   }
+}
+
+function clearHmrData(data: HmrData): void {
+  if (import.meta.hot?.data?.connectedApp === data) {
+    delete import.meta.hot.data.connectedApp;
+  }
+}
+
+function closeHmrData(data: HmrData): void {
+  cancelHmrRelease(data);
+  if (data.closed) return;
+  data.closed = true;
+  closeTransportBundle(data.mux, data.channelCache);
 }
 
 const muxDebug = {
@@ -265,6 +287,7 @@ function ConnectedApp(props: {
   passphrase: string;
   onAuthError: () => void;
 }) {
+  const hmrLeaseOwner = {};
   const remotes = useRemotes();
   const defaultRemote = useDefaultRemote();
   const certHash = useWtCertHash();
@@ -274,16 +297,18 @@ function ConnectedApp(props: {
   // passphrase hasn't changed; otherwise start fresh.
   const prev = getHmrData();
   const reusablePrev =
-    prev?.version === HMR_DATA_VERSION && prev.passphrase === props.passphrase;
+    prev?.version === HMR_DATA_VERSION &&
+    prev.passphrase === props.passphrase &&
+    !prev.closed;
   if (prev && !reusablePrev) {
-    prev.mux.close();
-    for (const entry of prev.channelCache.values()) {
-      entry.transport.close();
-    }
+    closeHmrData(prev);
+    clearHmrData(prev);
   }
+  if (reusablePrev) claimHmrLease(prev, hmrLeaseOwner);
 
   const channelCache: Map<string, { uri: string; transport: BlitTransport }> =
     reusablePrev ? prev.channelCache : new Map();
+  const workspaceKey = reusablePrev ? prev.workspaceKey : {};
 
   // The MuxTransport is created only once the config WS has resolved.  Before
   // that, mux() returns null and no connection is attempted.
@@ -334,23 +359,51 @@ function ConnectedApp(props: {
 
   createEffect(() => {
     const m = mux();
-    if (m)
-      setHmrData({
-        version: HMR_DATA_VERSION,
-        mux: m,
-        channelCache,
-        passphrase: props.passphrase,
-      });
+    if (!m) return;
+    const current = getHmrData();
+    if (
+      current?.mux === m &&
+      current.channelCache === channelCache &&
+      !current.closed
+    ) {
+      claimHmrLease(current, hmrLeaseOwner);
+      setHmrData(current);
+    } else {
+      setHmrData(
+        claimHmrLease<HmrData>(
+          {
+            version: HMR_DATA_VERSION,
+            mux: m,
+            channelCache,
+            passphrase: props.passphrase,
+            workspaceKey,
+          },
+          hmrLeaseOwner,
+        ),
+      );
+    }
   });
 
-  // On real unmount (passphrase change / auth error) close all transports.
-  // During HMR the data persists and the next mount will re-adopt them.
+  // import.meta.hot exists for ordinary unmounts too. Give a replacement HMR
+  // mount one task to claim the state; otherwise close every live transport.
   onCleanup(() => {
-    if (!import.meta.hot) {
-      mux()?.close();
-      for (const entry of channelCache.values()) {
-        entry.transport.close();
-      }
+    const m = mux();
+    if (!m) return;
+    const current = getHmrData();
+    if (
+      import.meta.hot &&
+      current?.mux === m &&
+      current.channelCache === channelCache
+    ) {
+      deferHmrRelease(
+        current,
+        hmrLeaseOwner,
+        () => getHmrData() === current,
+        () => closeHmrData(current),
+        () => clearHmrData(current),
+      );
+    } else {
+      closeTransportBundle(m, channelCache);
     }
   });
 
@@ -403,6 +456,7 @@ function ConnectedApp(props: {
     <Workspace
       connections={connections}
       wasm={props.wasm}
+      hmrKey={workspaceKey}
       onAuthError={props.onAuthError}
     />
   );

@@ -307,6 +307,12 @@ const OUTBOX_SOFT_QUEUE_MAX_SECS: f32 = 2.5;
 // when a single frame exceeds the cap — surface_window_open returns false
 // even at outbox=1, and no new frames can ever be produced.
 const OUTBOX_SOFT_QUEUE_LIMIT_BYTES: usize = 1024 * 1024;
+/// Surface viewers send an ACK or application ping at least every 10 seconds.
+/// If neither arrives for this long, the browser-side consumer is gone even
+/// when a leaked WebTransport mux keeps the underlying socket established.
+/// Reaping only clients with surface subscriptions leaves passive CLI/agent
+/// connections, which do not send application pings, unchanged.
+const STALE_SURFACE_CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 const PREVIEW_FRAME_RESERVE: usize = 1;
 const READY_FRAME_QUEUE_CAP: usize = 4;
 const PTY_CHANNEL_CAPACITY: usize = 64;
@@ -12577,7 +12583,33 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         eprintln!("client connected");
     }
 
-    while let Some(data) = read_frame(&mut reader).await {
+    loop {
+        let has_surface_subscriptions = {
+            let sess = state.session.lock().await;
+            sess.clients
+                .get(&client_id)
+                .is_some_and(|client| !client.surface_subscriptions.is_empty())
+        };
+        let next = if has_surface_subscriptions {
+            match tokio::time::timeout(STALE_SURFACE_CLIENT_TIMEOUT, read_frame(&mut reader)).await
+            {
+                Ok(next) => next,
+                Err(_) => {
+                    if state.config.verbose {
+                        eprintln!(
+                            "client {client_id}: no ACK, ping, or input for {}s; disconnecting stale surface subscriber",
+                            STALE_SURFACE_CLIENT_TIMEOUT.as_secs(),
+                        );
+                    }
+                    break;
+                }
+            }
+        } else {
+            read_frame(&mut reader).await
+        };
+        let Some(data) = next else {
+            break;
+        };
         if data.is_empty() {
             continue;
         }

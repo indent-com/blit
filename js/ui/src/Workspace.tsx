@@ -216,6 +216,12 @@ import {
 } from "./bsp/layout";
 import { setReveal } from "./ide/reveal";
 import { debugPanelOpenFromHash, withDebugPanelState } from "./workspaceUrl";
+import {
+  cancelHmrRelease,
+  claimHmrLease,
+  deferHmrRelease,
+  type HmrLeaseState,
+} from "./hmrLease";
 
 export type Overlay =
   | "expose"
@@ -229,10 +235,12 @@ export type Overlay =
   | "link"
   | null;
 
-type HmrWorkspaceData = {
+type HmrWorkspaceData = HmrLeaseState & {
   workspace: BlitWorkspace;
   /** Module-local identity. A new object means this module was hot-reloaded. */
   owner: object;
+  /** Transport generation owned by the parent ConnectedApp. */
+  key: object;
 };
 
 const hmrWorkspaceOwner = {};
@@ -263,7 +271,17 @@ function resetHmrViewSizes(workspace: BlitWorkspace): void {
   }
 }
 
-function getHmrWorkspace(wasm: BlitWasmModule): BlitWorkspace {
+function removeWorkspaceConnections(workspace: BlitWorkspace): void {
+  for (const conn of workspace.getSnapshot().connections) {
+    workspace.removeConnection(conn.id);
+  }
+}
+
+function getHmrWorkspace(
+  wasm: BlitWasmModule,
+  key: object,
+  leaseOwner: object,
+): HmrWorkspaceData {
   const raw = import.meta.hot?.data?.workspace as
     | HmrWorkspaceData
     | BlitWorkspace
@@ -271,7 +289,8 @@ function getHmrWorkspace(wasm: BlitWasmModule): BlitWorkspace {
   // Accept the raw BlitWorkspace stored by versions before HmrWorkspaceData.
   const prev = raw && "workspace" in raw ? raw.workspace : raw;
   const previousOwner = raw && "workspace" in raw ? raw.owner : null;
-  if (prev) {
+  const previousKey = raw && "workspace" in raw ? raw.key : null;
+  if (prev && previousKey === key) {
     // Solid normally disposes every old terminal surface, but HMR is allowed to
     // replace a component boundary without visiting all of those cleanups. The
     // preserved workspace would then retain the vanished pane's size forever,
@@ -279,30 +298,41 @@ function getHmrWorkspace(wasm: BlitWasmModule): BlitWorkspace {
     // Reset once per module generation; the replacement surfaces immediately
     // register their real boxes while transports and terminal state stay live.
     if (previousOwner !== hmrWorkspaceOwner) resetHmrViewSizes(prev);
-    if (import.meta.hot) {
-      import.meta.hot.data.workspace = {
-        workspace: prev,
-        owner: hmrWorkspaceOwner,
-      } satisfies HmrWorkspaceData;
-    }
-    return prev;
+    const data = raw as HmrWorkspaceData;
+    data.owner = hmrWorkspaceOwner;
+    claimHmrLease(data, leaseOwner);
+    if (import.meta.hot) import.meta.hot.data.workspace = data;
+    return data;
+  }
+  if (prev) {
+    if (raw && "workspace" in raw) cancelHmrRelease(raw);
+    removeWorkspaceConnections(prev);
   }
   const ws = new BlitWorkspace({ wasm });
+  const data = claimHmrLease<HmrWorkspaceData>(
+    { workspace: ws, owner: hmrWorkspaceOwner, key },
+    leaseOwner,
+  );
   if (import.meta.hot) {
-    import.meta.hot.data.workspace = {
-      workspace: ws,
-      owner: hmrWorkspaceOwner,
-    } satisfies HmrWorkspaceData;
+    import.meta.hot.data.workspace = data;
   }
-  return ws;
+  return data;
 }
 
 export function Workspace(props: {
   connections: ConnectionSpec[] | (() => ConnectionSpec[]);
   wasm: BlitWasmModule;
+  hmrKey?: object;
   onAuthError: () => void;
 }) {
-  const workspace = getHmrWorkspace(props.wasm);
+  const hmrLeaseOwner = {};
+  const hmrKey = props.hmrKey ?? {};
+  const hmrData = getHmrWorkspace(
+    props.wasm,
+    hmrKey,
+    hmrLeaseOwner,
+  );
+  const workspace = hmrData.workspace;
 
   // Normalise: accept either a static array or a reactive accessor.
   const getConnections =
@@ -335,12 +365,20 @@ export function Workspace(props: {
   });
 
   onCleanup(() => {
-    // On real teardown, remove all connections. During HMR, keep them alive —
-    // the reconciliation effect will re-adopt them on the next mount.
-    if (!import.meta.hot) {
-      for (const conn of workspace.getSnapshot().connections) {
-        workspace.removeConnection(conn.id);
-      }
+    if (import.meta.hot) {
+      deferHmrRelease(
+        hmrData,
+        hmrLeaseOwner,
+        () => import.meta.hot?.data?.workspace === hmrData,
+        () => removeWorkspaceConnections(workspace),
+        () => {
+          if (import.meta.hot?.data?.workspace === hmrData) {
+            delete import.meta.hot.data.workspace;
+          }
+        },
+      );
+    } else {
+      removeWorkspaceConnections(workspace);
     }
   });
 
