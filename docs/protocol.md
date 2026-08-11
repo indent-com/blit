@@ -599,6 +599,12 @@ vestigial and largely unhandled. Unknown button numbers fall back to
 
 `C2S_SURFACE_POINTER_AXIS2` (`0x32`) carries everything `wl_pointer` needs to describe a scroll, because the pieces are not interchangeable:
 
+The message's `surface_id` is its dispatch target, not merely a scale hint. If
+the shared Wayland seat has since entered another toplevel, the compositor
+re-hit-tests the last pointer position recorded for the named surface before
+delivering the axis frame. An unknown, unmapped, or pointerless target drops
+the scroll instead of falling through to whichever window held focus.
+
 - `dx`/`dy` — smooth distance ×100, positive = right/down, in the composited frame's pixel space. The server converts to surface-logical pixels using the same ratio it applies to `SURFACE_POINTER`, so a wheel and a drag move content by equal amounts on a scaled surface. Sending both axes in one message keeps a diagonal gesture in a single `wl_pointer.frame`.
 - `v120_x`/`v120_y` — discrete travel in 120ths of a detent (`axis_value120`'s convention: 120 = one notch). Zero for devices without detents. Clients bound below `wl_pointer` v8 get the equivalent `axis_discrete`; sub-detent travel reaches them as smooth motion only.
 - `flags` bits 0–1 — the device source, matching `wl_pointer.axis_source` (0 wheel, 1 finger, 2 continuous, 3 wheel tilt). Bit 2 marks the source as known; when clear no `axis_source` is emitted, which is what the legacy `0x22` opcode does.

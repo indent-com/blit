@@ -290,9 +290,9 @@ impl Fixture {
         surface.commit();
         queue.roundtrip(&mut app).expect("map roundtrip");
 
-        // The compositor names the surface in an event; scroll is routed to
-        // whichever surface the pointer last entered, so the id is needed
-        // both to aim the motion and to look up the scale.
+        // The compositor names the surface in an event. Seed a pointer point
+        // there so later axis messages can preserve the precise hit target as
+        // well as use the surface's scale.
         let surface_id = loop {
             match handle.event_rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(CompositorEvent::SurfaceCreated { surface_id, .. }) => break surface_id,
@@ -376,6 +376,45 @@ impl Fixture {
             .expect("subsurface map roundtrip");
         (child, subsurface, buffer)
     }
+
+    fn map_toplevel(
+        &mut self,
+    ) -> (
+        u16,
+        wl_surface::WlSurface,
+        xdg_surface::XdgSurface,
+        xdg_toplevel::XdgToplevel,
+    ) {
+        let qh = self.queue.handle();
+        let surface = self.compositor.create_surface(&qh, ());
+        let wm_base = self.app.wm_base.as_ref().expect("xdg_wm_base advertised");
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+        let toplevel = xdg_surface.get_toplevel(&qh, ());
+        surface.commit();
+        self.queue
+            .roundtrip(&mut self.app)
+            .expect("second configure roundtrip");
+
+        surface.attach(Some(&self._root_buffer), 0, 0);
+        surface.damage_buffer(0, 0, 64, 64);
+        surface.commit();
+        self.queue
+            .roundtrip(&mut self.app)
+            .expect("second map roundtrip");
+
+        let handle = self.handle.as_ref().expect("compositor running");
+        let surface_id = loop {
+            match handle.event_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(CompositorEvent::SurfaceCreated { surface_id, .. }) => break surface_id,
+                Ok(_) => continue,
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("no second SurfaceCreated within 5s")
+                }
+                Err(e) => panic!("compositor event channel closed: {e}"),
+            }
+        };
+        (surface_id, surface, xdg_surface, toplevel)
+    }
 }
 
 fn finger(surface_id: u16, dx: f64, dy: f64) -> CompositorCommand {
@@ -392,6 +431,31 @@ fn finger(surface_id: u16, dx: f64, dy: f64) -> CompositorCommand {
 
 const VERTICAL: u32 = 0;
 const HORIZONTAL: u32 = 1;
+
+#[test]
+fn the_surface_named_by_scroll_is_the_target() {
+    let mut f = Fixture::new();
+    let (second_id, second, _xdg_surface, _toplevel) = f.map_toplevel();
+
+    // Pointer focus is still on the first toplevel. The axis message names
+    // the second one, so routing it through the stale global focus would
+    // scroll the wrong window.
+    let events = f.scroll(finger(second_id, 0.0, 4.5));
+    assert!(events.contains(&Ptr::Leave(f._surface.id())));
+    assert!(events.contains(&Ptr::Enter(second.id())));
+    assert!(events.contains(&Ptr::Axis {
+        axis: VERTICAL,
+        value: 4.5,
+    }));
+}
+
+#[test]
+fn an_unknown_scroll_target_does_not_fall_through_to_pointer_focus() {
+    let mut f = Fixture::new();
+
+    let events = f.scroll(finger(u16::MAX, 0.0, 4.5));
+    assert!(events.is_empty());
+}
 
 #[test]
 fn null_buffer_unmap_retargets_scroll_from_a_stale_subsurface() {

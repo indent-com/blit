@@ -2033,6 +2033,11 @@ struct Compositor {
     /// Where the cursor last was inside `pointer_entered_id`, in surface-local
     /// coordinates, so a pointer created later can be entered there.
     pointer_entered_local: (f64, f64),
+    /// Last browser-frame position seen for each toplevel. Axis messages name
+    /// their destination but carry no coordinates, so this lets a scroll
+    /// re-establish the named target after another surface stole the shared
+    /// pointer focus.
+    pointer_frame_positions: FxHashMap<u16, (f64, f64)>,
     /// Set after output scale change; triggers keyboard leave/re-enter
     /// on the next surface commit so clients have time to process the
     /// reconfigure before receiving new input events.
@@ -3960,6 +3965,7 @@ impl Compositor {
                     self.pending_request_frames.remove(&surf.surface_id);
                     self.frame_callback_toplevels.remove(&surf.surface_id);
                     self.last_reported_size.remove(&surf.surface_id);
+                    self.pointer_frame_positions.remove(&surf.surface_id);
                     self.surface_sizes.remove(&surf.surface_id);
                     if let Some(ref mut vk) = self.vulkan_renderer {
                         vk.destroy_external_outputs_for_surface(surf.surface_id as u32);
@@ -4058,6 +4064,118 @@ impl Compositor {
         }
         self.fire_surface_frame_callbacks(surface_id, None);
         let _ = self.display_handle.flush_clients();
+    }
+
+    fn pointer_focus_matches_surface(&self, surface_id: u16) -> bool {
+        let Some(root_id) = self.toplevel_surface_ids.get(&surface_id) else {
+            return false;
+        };
+        self.surface_meta.contains_key(root_id)
+            && self.pointer_entered_id.as_ref().is_some_and(|entered| {
+                self.surface_meta.contains_key(entered)
+                    && self.find_toplevel_root(entered).0 == *root_id
+            })
+    }
+
+    /// Hit-test and dispatch one pointer motion in composited-frame
+    /// coordinates. The browser motion path and scroll retargeting share this
+    /// so they cannot disagree about scale, crop, popup, or subsurface rules.
+    fn dispatch_pointer_motion(&mut self, surface_id: u16, x: f64, y: f64) {
+        let time = elapsed_ms();
+        // The browser sends coordinates in the composited frame's physical
+        // pixel space. Convert to logical (surface-local) coordinates using
+        // the actual composited-to-logical ratio for this surface.
+        let (mut x, mut y) =
+            if let Some(&(cw, ch, lw, lh)) = self.last_reported_size.get(&surface_id) {
+                let sx = if cw > 0 { lw as f64 / cw as f64 } else { 1.0 };
+                let sy = if ch > 0 { lh as f64 / ch as f64 } else { 1.0 };
+                (x * sx, y * sy)
+            } else {
+                (x, y)
+            };
+        // The composited frame is cropped to xdg_geometry (if set), so the
+        // browser's (0,0) corresponds to (geo_x, geo_y) in the surface tree.
+        if let Some((gx, gy, _, _)) = self
+            .toplevel_surface_ids
+            .get(&surface_id)
+            .and_then(|rid| self.surfaces.get(rid))
+            .and_then(|s| s.xdg_geometry)
+        {
+            x += gx as f64;
+            y += gy as f64;
+        }
+        // Hit-test the surface tree to find the actual target (which may be a
+        // subsurface or popup rather than the root).
+        let target_wl = self
+            .toplevel_surface_ids
+            .get(&surface_id)
+            .and_then(|root_id| self.hit_test_surface_at(root_id, x, y))
+            .map(|(wl_surface, lx, ly)| (wl_surface.id(), wl_surface, lx, ly));
+
+        static PTR_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let pn = PTR_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if pn < 5 || pn.is_multiple_of(500) {
+            let root = self.toplevel_surface_ids.get(&surface_id).cloned();
+            let lrs = self.last_reported_size.get(&surface_id).copied();
+            eprintln!(
+                "[pointer #{pn}] sid={surface_id} logical=({x:.1},{y:.1}) lrs={lrs:?} root={root:?} hit={:?}",
+                target_wl
+                    .as_ref()
+                    .map(|(pid, _, lx, ly)| format!("proto={pid:?} local=({lx:.1},{ly:.1})"))
+            );
+        }
+        if let Some((proto_id, wl_surface, lx, ly)) = target_wl {
+            // Remember where we are inside the surface, so a pointer created
+            // after this can be entered at the right spot.
+            self.pointer_entered_local = (lx, ly);
+            let matching_ptrs = self
+                .pointers
+                .iter()
+                .filter(|p| same_client(*p, &wl_surface))
+                .count();
+            if let Some(change) = focus_transition(
+                self.pointer_entered_id.as_ref(),
+                &proto_id,
+                matching_ptrs > 0,
+            ) {
+                let serial = self.next_serial();
+                if matching_ptrs == 0 {
+                    eprintln!(
+                        "[pointer-enter] proto={proto_id:?} has no pointer yet (total_ptrs={}); deferring",
+                        self.pointers.len()
+                    );
+                }
+                if let Some(ref leaving) = change.leave {
+                    let old_wl = self
+                        .surfaces
+                        .values()
+                        .find(|s| s.wl_surface.id() == *leaving)
+                        .map(|s| s.wl_surface.clone());
+                    if let Some(old_wl) = old_wl {
+                        for ptr in &self.pointers {
+                            if same_client(ptr, &old_wl) {
+                                ptr.leave(serial, &old_wl);
+                                ptr.frame();
+                            }
+                        }
+                    }
+                }
+                for ptr in &self.pointers {
+                    if same_client(ptr, &wl_surface) {
+                        ptr.enter(serial, &wl_surface, lx, ly);
+                    }
+                }
+                // An enter nobody received is not focus. The next motion
+                // retries instead of silently dispatching into a void.
+                self.pointer_entered_id = change.entered;
+            }
+            for ptr in &self.pointers {
+                if same_client(ptr, &wl_surface) {
+                    ptr.motion(time, lx, ly);
+                    ptr.frame();
+                }
+            }
+        }
     }
 
     fn handle_command(&mut self, cmd: CompositorCommand) {
@@ -4209,116 +4327,8 @@ impl Compositor {
                     let _ = self.display_handle.flush_clients();
                     return;
                 }
-                let time = elapsed_ms();
-                // The browser sends coordinates in the composited frame's
-                // physical pixel space.  Convert to logical (surface-local)
-                // coordinates using the actual composited-to-logical ratio
-                // for this surface.
-                let (mut x, mut y) =
-                    if let Some(&(cw, ch, lw, lh)) = self.last_reported_size.get(&surface_id) {
-                        let sx = if cw > 0 { lw as f64 / cw as f64 } else { 1.0 };
-                        let sy = if ch > 0 { lh as f64 / ch as f64 } else { 1.0 };
-                        (x * sx, y * sy)
-                    } else {
-                        (x, y)
-                    };
-                // The composited frame is cropped to xdg_geometry (if set),
-                // so the browser's (0,0) corresponds to (geo_x, geo_y) in the
-                // surface tree.  Offset accordingly.
-                if let Some((gx, gy, _, _)) = self
-                    .toplevel_surface_ids
-                    .get(&surface_id)
-                    .and_then(|rid| self.surfaces.get(rid))
-                    .and_then(|s| s.xdg_geometry)
-                {
-                    x += gx as f64;
-                    y += gy as f64;
-                }
-                // Hit-test the surface tree to find the actual target
-                // (may be a subsurface or popup rather than the root).
-                let target_wl = self
-                    .toplevel_surface_ids
-                    .get(&surface_id)
-                    .and_then(|root_id| self.hit_test_surface_at(root_id, x, y))
-                    .map(|(wl_surface, lx, ly)| (wl_surface.id(), wl_surface, lx, ly));
-
-                static PTR_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let pn = PTR_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if pn < 5 || pn.is_multiple_of(500) {
-                    let root = self.toplevel_surface_ids.get(&surface_id).cloned();
-                    let lrs = self.last_reported_size.get(&surface_id).copied();
-                    eprintln!(
-                        "[pointer #{pn}] sid={surface_id} logical=({x:.1},{y:.1}) lrs={lrs:?} root={root:?} hit={:?}",
-                        target_wl.as_ref().map(|(pid, _, lx, ly)| format!(
-                            "proto={pid:?} local=({lx:.1},{ly:.1})"
-                        ))
-                    );
-                }
-                if let Some((proto_id, wl_surface, lx, ly)) = target_wl {
-                    // Remember where we are inside the surface, so a pointer
-                    // created *after* this can be entered at the right spot
-                    // rather than waiting for the next motion (`GetPointer`).
-                    self.pointer_entered_local = (lx, ly);
-                    let matching_ptrs = self
-                        .pointers
-                        .iter()
-                        .filter(|p| same_client(*p, &wl_surface))
-                        .count();
-                    if let Some(change) = focus_transition(
-                        self.pointer_entered_id.as_ref(),
-                        &proto_id,
-                        matching_ptrs > 0,
-                    ) {
-                        let serial = self.next_serial();
-                        if matching_ptrs == 0 {
-                            // The client has mapped a surface but has not
-                            // asked for a pointer yet — Firefox routinely
-                            // takes long enough to start that the cursor is
-                            // already over its pane. Say so, and (below)
-                            // decline to latch: an enter nobody received must
-                            // not count as having entered.
-                            eprintln!(
-                                "[pointer-enter] proto={proto_id:?} has no pointer yet (total_ptrs={}); deferring",
-                                self.pointers.len()
-                            );
-                        }
-                        // Leave old surface.
-                        if let Some(ref leaving) = change.leave {
-                            let old_wl = self
-                                .surfaces
-                                .values()
-                                .find(|s| s.wl_surface.id() == *leaving)
-                                .map(|s| s.wl_surface.clone());
-                            if let Some(old_wl) = old_wl {
-                                for ptr in &self.pointers {
-                                    if same_client(ptr, &old_wl) {
-                                        ptr.leave(serial, &old_wl);
-                                        ptr.frame();
-                                    }
-                                }
-                            }
-                        }
-                        for ptr in &self.pointers {
-                            if same_client(ptr, &wl_surface) {
-                                ptr.enter(serial, &wl_surface, lx, ly);
-                            }
-                        }
-                        // Whatever `focus_transition` decided — including
-                        // recording nothing when no pointer received the
-                        // enter, so the next motion retries rather than the
-                        // state machine believing the job is done. Its tests
-                        // enumerate the cases; see pointer_focus.rs.
-                        self.pointer_entered_id = change.entered;
-                    }
-                    for ptr in &self.pointers {
-                        if same_client(ptr, &wl_surface) {
-                            ptr.motion(time, lx, ly);
-                            ptr.frame();
-                        }
-                    }
-                }
-                // When no surface is hit, don't send motion events —
-                // there is no valid surface-local coordinate to report.
+                self.pointer_frame_positions.insert(surface_id, (x, y));
+                self.dispatch_pointer_motion(surface_id, x, y);
                 let _ = self.display_handle.flush_clients();
             }
             CompositorCommand::PointerButton {
@@ -4411,6 +4421,43 @@ impl Compositor {
                 source,
                 stop,
             } => {
+                if !self.pointer_focus_matches_surface(surface_id) {
+                    // One Wayland seat is shared by every browser viewer. A
+                    // motion from another pane can therefore steal focus
+                    // between this viewer's wheel motion and axis message.
+                    // Re-hit-test the last point on the surface the axis
+                    // explicitly named before dispatching the delta.
+                    let point = self
+                        .pointer_frame_positions
+                        .get(&surface_id)
+                        .copied()
+                        .or_else(|| {
+                            self.last_reported_size.get(&surface_id).map(
+                                |&(width, height, _, _)| {
+                                    (f64::from(width) / 2.0, f64::from(height) / 2.0)
+                                },
+                            )
+                        })
+                        .or_else(|| {
+                            let root_id = self.toplevel_surface_ids.get(&surface_id)?;
+                            let surface = self.surfaces.get(root_id)?;
+                            let meta = self.surface_meta.get(root_id)?;
+                            let (width, height) = surface.xdg_geometry.map_or_else(
+                                || super::render::surface_logical_size(surface, meta),
+                                |(_, _, width, height)| (f64::from(width), f64::from(height)),
+                            );
+                            Some((width / 2.0, height / 2.0))
+                        });
+                    if let Some((x, y)) = point {
+                        self.dispatch_pointer_motion(surface_id, x, y);
+                    }
+                    if !self.pointer_focus_matches_surface(surface_id) {
+                        // An invalid, unmapped, or pointerless destination is
+                        // not permission to scroll whichever surface happened
+                        // to hold the shared seat before this message.
+                        return;
+                    }
+                }
                 let time = elapsed_ms();
                 // Scroll distance arrives in the composited frame's pixel
                 // space, like pointer motion; wl_pointer.axis wants
@@ -5894,6 +5941,7 @@ impl Dispatch<WlSurface, ()> for Compositor {
                         state.pending_request_frames.remove(&surf.surface_id);
                         state.frame_callback_toplevels.remove(&surf.surface_id);
                         state.last_reported_size.remove(&surf.surface_id);
+                        state.pointer_frame_positions.remove(&surf.surface_id);
                         state.surface_sizes.remove(&surf.surface_id);
                         if let Some(ref mut vk) = state.vulkan_renderer {
                             vk.destroy_external_outputs_for_surface(surf.surface_id as u32);
@@ -6724,6 +6772,7 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                         state.pending_request_frames.remove(&sid);
                         state.frame_callback_toplevels.remove(&sid);
                         state.last_reported_size.remove(&sid);
+                        state.pointer_frame_positions.remove(&sid);
                         state.surface_sizes.remove(&sid);
                         if let Some(ref mut vk) = state.vulkan_renderer {
                             vk.destroy_external_outputs_for_surface(sid as u32);
@@ -9913,6 +9962,7 @@ fn run_compositor(
         focused_surface_id: 0,
         pointer_entered_id: None,
         pointer_entered_local: (0.0, 0.0),
+        pointer_frame_positions: FxHashMap::default(),
         pending_kb_reenter: false,
         gpu_device,
         verbose,
