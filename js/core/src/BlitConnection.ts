@@ -774,6 +774,13 @@ export class BlitConnection {
    *  browser may have acquired a newer clipboard while this page was not
    *  authoritative, so the next paste must import it before pressing V. */
   private waylandClipboardOwned: boolean | null = null;
+  private clipboardChangeTarget: EventTarget | null = null;
+  private clipboardChangeHandler: EventListener | null = null;
+  private clipboardMirrorToken = 0;
+  private pendingClipboardMirrors = new Map<
+    number,
+    ReturnType<typeof setTimeout>
+  >();
 
   /** Default video bandwidth for new surface subscriptions (0 = server default). */
   defaultSurfaceBandwidth = 0;
@@ -925,6 +932,26 @@ export class BlitConnection {
       };
       document.addEventListener("visibilitychange", this.pageVisibilityHandler);
     }
+    if (typeof navigator !== "undefined") {
+      const clipboard = navigator.clipboard as
+        | (Clipboard & { onclipboardchange?: unknown })
+        | undefined;
+      // `clipboardchange` is still progressively deployed.  Checking the
+      // event-handler property is the feature detection recommended by the
+      // API; EventTarget alone is not enough because older Clipboard objects
+      // accept arbitrary event names without ever dispatching them.
+      if (clipboard && "onclipboardchange" in clipboard) {
+        this.clipboardChangeTarget = clipboard;
+        this.clipboardChangeHandler = (event) => {
+          if (this.consumeMirroredClipboardChange(event)) return;
+          this.noteBrowserClipboardMayHaveChanged();
+        };
+        clipboard.addEventListener(
+          "clipboardchange",
+          this.clipboardChangeHandler,
+        );
+      }
+    }
 
     // Propagate AudioPlayer state changes (e.g. reset on reconnect) into the
     // connection's listener chain so the reactive graph re-evaluates audio
@@ -993,6 +1020,15 @@ export class BlitConnection {
       );
       this.pageVisibilityHandler = null;
     }
+    if (this.clipboardChangeTarget && this.clipboardChangeHandler) {
+      this.clipboardChangeTarget.removeEventListener(
+        "clipboardchange",
+        this.clipboardChangeHandler,
+      );
+      this.clipboardChangeTarget = null;
+      this.clipboardChangeHandler = null;
+    }
+    this.clearPendingClipboardMirrors();
     this.rejectPendingCreates(
       connectionError("Connection disposed before PTY creation completed"),
     );
@@ -3882,11 +3918,63 @@ export class BlitConnection {
     return this.waylandClipboardOwned === true;
   }
 
-  /** The page lost clipboard authority (window/tab loss, or a real DOM
-   *  copy/cut).  The next paste probes the browser clipboard and publishes
-   *  it to the compositor before forwarding V. */
+  /** The host clipboard may be newer (clipboardchange, window/tab loss, or a
+   *  real DOM copy/cut).  The next paste probes the browser clipboard and
+   *  publishes it to the compositor before forwarding V. */
   noteBrowserClipboardMayHaveChanged(): void {
     this.waylandClipboardOwned = null;
+  }
+
+  /** Expect the text-only clipboardchange caused by mirroring a Wayland
+   *  selection into the host clipboard.  That write must not make us forget
+   *  the richer, client-owned Wayland source. */
+  private expectMirroredClipboardChange(): number | null {
+    if (!this.clipboardChangeTarget || this.waylandClipboardOwned !== true) {
+      return null;
+    }
+    const token = ++this.clipboardMirrorToken;
+    const timer = setTimeout(() => {
+      this.pendingClipboardMirrors.delete(token);
+    }, 1_000);
+    this.pendingClipboardMirrors.set(token, timer);
+    return token;
+  }
+
+  private finishMirroredClipboardChange(token: number | null): void {
+    if (token === null) return;
+    const timer = this.pendingClipboardMirrors.get(token);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.pendingClipboardMirrors.delete(token);
+  }
+
+  private clearPendingClipboardMirrors(): void {
+    for (const timer of this.pendingClipboardMirrors.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingClipboardMirrors.clear();
+  }
+
+  private consumeMirroredClipboardChange(event: Event): boolean {
+    if (this.pendingClipboardMirrors.size === 0) return false;
+    const types = (event as Event & { readonly types?: readonly string[] })
+      .types;
+    // writeText() exposes only text/plain.  A screenshot is image/png, so it
+    // must invalidate immediately even if it closely follows our own mirror.
+    const textOnly =
+      types !== undefined &&
+      types.length !== 0 &&
+      types.every(
+        (type) => type === "text/plain" || type.startsWith("text/plain;"),
+      );
+    if (!textOnly) {
+      this.clearPendingClipboardMirrors();
+      return false;
+    }
+    const token = this.pendingClipboardMirrors.keys().next().value;
+    if (token === undefined) return false;
+    this.finishMirroredClipboardChange(token);
+    return true;
   }
 
   /**
@@ -4539,7 +4627,14 @@ export class BlitConnection {
             const text = textDecoder.decode(
               bytes.subarray(dataStart, dataStart + dataLen),
             );
-            navigator.clipboard.writeText(text).catch(() => {});
+            const mirrorToken = this.expectMirroredClipboardChange();
+            try {
+              navigator.clipboard
+                .writeText(text)
+                .catch(() => this.finishMirroredClipboardChange(mirrorToken));
+            } catch {
+              this.finishMirroredClipboardChange(mirrorToken);
+            }
           }
         } catch {}
         return;

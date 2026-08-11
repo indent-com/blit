@@ -36,6 +36,7 @@ import {
   FEATURE_SCROLL_BY,
   FRAGMENT_FLAG_LAST,
   S2C_FRAGMENT,
+  S2C_CLIPBOARD_CONTENT,
   S2C_CLIPBOARD_OWNER,
   S2C_PING,
   C2S_PING,
@@ -72,6 +73,47 @@ function createConnection(transport?: MockTransport) {
     autoConnect: false,
   });
   return { conn, transport: t };
+}
+
+class FakeClipboard extends EventTarget {
+  onclipboardchange: ((event: Event) => void) | null = null;
+  writeText = vi.fn((_text: string) => Promise.resolve());
+
+  change(types: readonly string[]): void {
+    const event = new Event("clipboardchange");
+    Object.defineProperty(event, "types", { value: types });
+    this.dispatchEvent(event);
+  }
+}
+
+function installClipboard(clipboard: FakeClipboard): () => void {
+  const descriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: clipboard,
+  });
+  return () => {
+    if (descriptor) {
+      Object.defineProperty(navigator, "clipboard", descriptor);
+    } else {
+      // The original may live on Navigator.prototype rather than as an own
+      // property, so deleting our override restores it.
+      delete (navigator as Navigator & { clipboard?: Clipboard }).clipboard;
+    }
+  };
+}
+
+function clipboardContent(text: string): Uint8Array {
+  const mime = new TextEncoder().encode("text/plain;charset=utf-8");
+  const data = new TextEncoder().encode(text);
+  const message = new Uint8Array(7 + mime.length + data.length);
+  const view = new DataView(message.buffer);
+  message[0] = S2C_CLIPBOARD_CONTENT;
+  view.setUint16(1, mime.length, true);
+  message.set(mime, 3);
+  view.setUint32(3 + mime.length, data.length, true);
+  message.set(data, 7 + mime.length);
+  return message;
 }
 
 describe("BlitConnection", () => {
@@ -111,6 +153,65 @@ describe("BlitConnection", () => {
     // Invalid states cannot accidentally suppress browser clipboard import.
     transport.push(new Uint8Array([S2C_CLIPBOARD_OWNER, 2]));
     expect(conn.usesWaylandClipboard()).toBe(false);
+  });
+
+  it("invalidates Wayland clipboard authority on clipboardchange", () => {
+    const clipboard = new FakeClipboard();
+    const restoreClipboard = installClipboard(clipboard);
+    const { conn: clipboardConn, transport: clipboardTransport } =
+      createConnection();
+    try {
+      clipboardTransport.push(new Uint8Array([S2C_CLIPBOARD_OWNER, 1]));
+      expect(clipboardConn.usesWaylandClipboard()).toBe(true);
+
+      clipboard.change(["image/png"]);
+      expect(clipboardConn.usesWaylandClipboard()).toBe(false);
+    } finally {
+      clipboardConn.dispose();
+      restoreClipboard();
+    }
+  });
+
+  it("does not invalidate Wayland ownership for its own text mirror", () => {
+    const clipboard = new FakeClipboard();
+    clipboard.writeText.mockImplementation((_text: string) => {
+      clipboard.change(["text/plain"]);
+      return Promise.resolve();
+    });
+    const restoreClipboard = installClipboard(clipboard);
+    const { conn: clipboardConn, transport: clipboardTransport } =
+      createConnection();
+    try {
+      clipboardTransport.push(new Uint8Array([S2C_CLIPBOARD_OWNER, 1]));
+      clipboardTransport.push(clipboardContent("copied in the surface"));
+
+      expect(clipboard.writeText).toHaveBeenCalledWith("copied in the surface");
+      expect(clipboardConn.usesWaylandClipboard()).toBe(true);
+
+      // A subsequent host image is not confused with the text-only mirror.
+      clipboard.change(["image/png"]);
+      expect(clipboardConn.usesWaylandClipboard()).toBe(false);
+    } finally {
+      clipboardConn.dispose();
+      restoreClipboard();
+    }
+  });
+
+  it("removes the clipboardchange listener when disposed", () => {
+    const clipboard = new FakeClipboard();
+    const restoreClipboard = installClipboard(clipboard);
+    const { conn: clipboardConn, transport: clipboardTransport } =
+      createConnection();
+    try {
+      clipboardTransport.push(new Uint8Array([S2C_CLIPBOARD_OWNER, 1]));
+      clipboardConn.dispose();
+
+      clipboard.change(["image/png"]);
+      expect(clipboardConn.usesWaylandClipboard()).toBe(true);
+    } finally {
+      clipboardConn.dispose();
+      restoreClipboard();
+    }
   });
 
   it("tracks retryCount on failed connection attempts", () => {
