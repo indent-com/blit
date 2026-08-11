@@ -11,6 +11,10 @@ import {
 } from "./types";
 import type { BlitWorkspace } from "./BlitWorkspace";
 import type { BlitConnection } from "./BlitConnection";
+import type {
+  RemoteSurfacePointer,
+  SurfaceCursorImage,
+} from "./SurfaceStore";
 import {
   SURFACE_POINTER_DOWN,
   SURFACE_POINTER_UP,
@@ -39,6 +43,101 @@ let _codecSupport: number | null = null;
  *  demoted codec may only ever re-offer bits this browser did probe as
  *  working — never invent support the probe never saw. */
 let _probedCodecSupport = 0;
+
+const REMOTE_CURSOR_ARROW =
+  "M 0.75 0.75 L 0.75 20 L 6 14.75 L 10.5 23 L 14 21 L 9.5 13 L 17 13 Z";
+const REMOTE_CURSOR_HAND =
+  "M 0 0 C -1 -3 1 -5 3 -5 C 5 -5 6 -3 6 -1 L 6 8 L 8 8 L 8 3 C 8 1 11 1 11 3 L 11 8 L 13 8 L 13 4 C 13 2 16 2 16 4 L 16 9 L 18 9 L 18 6 C 18 4 21 4 21 6 L 21 14 C 21 21 17 25 10 25 C 6 25 3 22 1 19 L -3 13 C -4 11 -3 9 -1 8 C 1 8 3 11 3 11 L 3 0 Z";
+const REMOTE_CURSOR_GRAB =
+  "M -10 -2 C -10 -5 -6 -6 -5 -3 L -5 -8 C -5 -11 -1 -11 0 -8 C 1 -12 5 -11 5 -8 C 7 -10 10 -8 10 -5 L 10 5 C 10 11 6 14 0 14 C -5 14 -9 10 -11 6 L -14 1 C -15 -2 -12 -4 -10 -2 Z";
+const REMOTE_CURSOR_TEXT =
+  "M -7 -12 H 7 V -9 H 2 V 9 H 7 V 12 H -7 V 9 H -2 V -9 H -7 Z";
+const REMOTE_CURSOR_CROSSHAIR =
+  "M -1 -12 H 1 V -2 H 12 V 2 H 1 V 12 H -1 V 2 H -12 V -2 H -1 Z";
+const REMOTE_CURSOR_EW =
+  "M -12 0 L -6 -6 V -2 H 6 V -6 L 12 0 L 6 6 V 2 H -6 V 6 Z";
+const REMOTE_CURSOR_NS =
+  "M 0 -12 L 6 -6 H 2 V 6 H 6 L 0 12 L -6 6 H -2 V -6 H -6 Z";
+const REMOTE_CURSOR_MOVE =
+  "M 0 -13 L 5 -8 H 2 V -2 H 8 V -5 L 13 0 L 8 5 V 2 H 2 V 8 H 5 L 0 13 L -5 8 H -2 V 2 H -8 V 5 L -13 0 L -8 -5 V -2 H -2 V -8 H -5 Z";
+const REMOTE_CURSOR_PROHIBITED =
+  "M 0 -12 A 12 12 0 1 1 0 12 A 12 12 0 0 1 0 -12 Z M -6 -8 L 8 6 L 6 8 L -8 -6 Z";
+const REMOTE_CURSOR_WAIT =
+  "M 0 -12 A 12 12 0 1 1 -12 0 H -8 A 8 8 0 1 0 0 -8 Z";
+const REMOTE_CURSOR_ZOOM =
+  "M -3 -11 A 8 8 0 1 1 -3 5 A 8 8 0 0 1 -3 -11 Z M -3 -7 A 4 4 0 1 0 -3 1 A 4 4 0 0 0 -3 -7 Z M 3 3 L 12 12 L 9 15 L 0 6 Z";
+const REMOTE_CURSOR_CONTEXT_MENU = `${REMOTE_CURSOR_ARROW} M 12 16 H 22 V 18 H 12 Z M 12 20 H 22 V 22 H 12 Z`;
+const REMOTE_CURSOR_HELP = `${REMOTE_CURSOR_ARROW} M 13 15 C 13 11 21 11 21 16 C 21 19 18 19 18 21 H 15 C 15 17 18 17 18 15 C 18 13 16 13 16 15 Z M 15 23 H 18 V 26 H 15 Z`;
+const REMOTE_CURSOR_COPY = `${REMOTE_CURSOR_ARROW} M 13 16 H 17 V 12 H 20 V 16 H 24 V 19 H 20 V 23 H 17 V 19 H 13 Z`;
+const REMOTE_CURSOR_ALIAS = `${REMOTE_CURSOR_ARROW} M 13 19 H 18 V 16 L 24 21 L 18 26 V 23 H 13 Z`;
+const REMOTE_CURSOR_PROGRESS = `${REMOTE_CURSOR_ARROW} M 18 12 A 6 6 0 1 1 12 18 H 15 A 3 3 0 1 0 18 15 Z`;
+const REMOTE_CURSOR_ZOOM_IN = `${REMOTE_CURSOR_ZOOM} M -6 -4 H -4 V -6 H -2 V -4 H 0 V -2 H -2 V 0 H -4 V -2 H -6 Z`;
+const REMOTE_CURSOR_ZOOM_OUT = `${REMOTE_CURSOR_ZOOM} M -6 -4 H 0 V -2 H -6 Z`;
+
+interface RemoteCursorGlyph {
+  path: string;
+  rotation?: number;
+}
+
+/** A compact, high-contrast approximation of the platform cursor shape. */
+function remoteCursorGlyph(name: string): RemoteCursorGlyph {
+  switch (name) {
+    case "context-menu":
+      return { path: REMOTE_CURSOR_CONTEXT_MENU };
+    case "help":
+      return { path: REMOTE_CURSOR_HELP };
+    case "pointer":
+      return { path: REMOTE_CURSOR_HAND };
+    case "alias":
+      return { path: REMOTE_CURSOR_ALIAS };
+    case "copy":
+      return { path: REMOTE_CURSOR_COPY };
+    case "grab":
+    case "grabbing":
+      return { path: REMOTE_CURSOR_GRAB };
+    case "text":
+      return { path: REMOTE_CURSOR_TEXT };
+    case "vertical-text":
+      return { path: REMOTE_CURSOR_TEXT, rotation: 90 };
+    case "cell":
+    case "crosshair":
+      return { path: REMOTE_CURSOR_CROSSHAIR };
+    case "e-resize":
+    case "w-resize":
+    case "ew-resize":
+    case "col-resize":
+      return { path: REMOTE_CURSOR_EW };
+    case "n-resize":
+    case "s-resize":
+    case "ns-resize":
+    case "row-resize":
+      return { path: REMOTE_CURSOR_NS };
+    case "ne-resize":
+    case "sw-resize":
+    case "nesw-resize":
+      return { path: REMOTE_CURSOR_EW, rotation: -45 };
+    case "nw-resize":
+    case "se-resize":
+    case "nwse-resize":
+      return { path: REMOTE_CURSOR_EW, rotation: 45 };
+    case "move":
+    case "all-scroll":
+      return { path: REMOTE_CURSOR_MOVE };
+    case "no-drop":
+    case "not-allowed":
+      return { path: REMOTE_CURSOR_PROHIBITED };
+    case "wait":
+      return { path: REMOTE_CURSOR_WAIT };
+    case "progress":
+      return { path: REMOTE_CURSOR_PROGRESS };
+    case "zoom-in":
+      return { path: REMOTE_CURSOR_ZOOM_IN };
+    case "zoom-out":
+      return { path: REMOTE_CURSOR_ZOOM_OUT };
+    default:
+      return { path: REMOTE_CURSOR_ARROW };
+  }
+}
 
 /**
  * Largest frame any supported codec decoded in the probe, as [w, h].
@@ -969,6 +1068,16 @@ export class BlitSurfaceCanvas {
   private container: HTMLElement | null = null;
   private canvas: HTMLCanvasElement | null = null;
   private ctx: CanvasRenderingContext2D | null = null;
+  /** Pointer overlay for the client currently driving this shared surface.
+   *  The originating client is told to hide it and keeps its native cursor. */
+  private remotePointerSvg: SVGSVGElement | null = null;
+  private remotePointerGlyph: SVGPathElement | null = null;
+  private remotePointerImage: SVGImageElement | null = null;
+  private remotePointer: RemoteSurfacePointer | null = null;
+  private remoteCursor: SurfaceCursorImage = {
+    kind: "named",
+    name: "default",
+  };
 
   private surface: BlitSurface | undefined;
   private disposed = false;
@@ -1085,6 +1194,7 @@ export class BlitSurfaceCanvas {
   // subscriptions
   private unsubFrame: (() => void) | null = null;
   private unsubCursor: (() => void) | null = null;
+  private unsubRemotePointer: (() => void) | null = null;
   private unsubChange: (() => void) | null = null;
 
   /** True after the first frame has been blitted.  Kept as a tripwire so
@@ -1330,6 +1440,39 @@ export class BlitSurfaceCanvas {
 
     container.appendChild(canvas);
 
+    const svgNs = "http://www.w3.org/2000/svg";
+    const remotePointerSvg = document.createElementNS(svgNs, "svg");
+    remotePointerSvg.setAttribute("aria-hidden", "true");
+    remotePointerSvg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+    remotePointerSvg.setAttribute("data-blit-remote-pointer", "");
+    Object.assign(remotePointerSvg.style, {
+      position: "absolute",
+      left: "0",
+      top: "0",
+      width: "100%",
+      height: "100%",
+      overflow: "visible",
+      pointerEvents: "none",
+      visibility: "hidden",
+      zIndex: "1",
+    });
+    const remotePointerGlyph = document.createElementNS(svgNs, "path");
+    remotePointerGlyph.setAttribute("d", REMOTE_CURSOR_ARROW);
+    remotePointerGlyph.setAttribute("fill", "#38bdf8");
+    remotePointerGlyph.setAttribute("stroke", "#0b1020");
+    remotePointerGlyph.setAttribute("stroke-width", "1.5");
+    remotePointerGlyph.setAttribute("stroke-linejoin", "round");
+    remotePointerGlyph.setAttribute("fill-rule", "evenodd");
+    remotePointerGlyph.setAttribute("vector-effect", "non-scaling-stroke");
+    remotePointerSvg.appendChild(remotePointerGlyph);
+    const remotePointerImage = document.createElementNS(svgNs, "image");
+    remotePointerImage.style.display = "none";
+    remotePointerSvg.appendChild(remotePointerImage);
+    container.appendChild(remotePointerSvg);
+    this.remotePointerSvg = remotePointerSvg;
+    this.remotePointerGlyph = remotePointerGlyph;
+    this.remotePointerImage = remotePointerImage;
+
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
     mountedSurfaceCanvases.set(canvas, this);
@@ -1467,8 +1610,15 @@ export class BlitSurfaceCanvas {
     if (this.canvas && this.container) {
       this.container.removeChild(this.canvas);
     }
+    if (this.remotePointerSvg && this.container) {
+      this.container.removeChild(this.remotePointerSvg);
+    }
     this.canvas = null;
     this.ctx = null;
+    this.remotePointerSvg = null;
+    this.remotePointerGlyph = null;
+    this.remotePointerImage = null;
+    this.remotePointer = null;
     this.container = null;
   }
 
@@ -1696,6 +1846,7 @@ export class BlitSurfaceCanvas {
   private applyLayout(): void {
     const canvas = this.canvas;
     if (!canvas) return;
+    const remotePointerSvg = this.remotePointerSvg;
     const ds = this._displaySize;
     if (!ds || !ds.scale120) {
       if (this._lastLayout) {
@@ -1704,6 +1855,15 @@ export class BlitSurfaceCanvas {
           position: "",
           left: "",
           top: "",
+          width: "100%",
+          height: "100%",
+        });
+      }
+      if (remotePointerSvg) {
+        Object.assign(remotePointerSvg.style, {
+          position: "absolute",
+          left: "0",
+          top: "0",
           width: "100%",
           height: "100%",
         });
@@ -1749,6 +1909,15 @@ export class BlitSurfaceCanvas {
       width: `${w / scale}px`,
       height: `${h / scale}px`,
     });
+    if (remotePointerSvg) {
+      Object.assign(remotePointerSvg.style, {
+        position: "absolute",
+        left: `${left / scale}px`,
+        top: `${top / scale}px`,
+        width: `${w / scale}px`,
+        height: `${h / scale}px`,
+      });
+    }
   }
 
   /**
@@ -1831,6 +2000,7 @@ export class BlitSurfaceCanvas {
     this.unsubChange = store.onChange(() => {
       const prev = this.surface;
       this.surface = store.getSurface(this._surfaceId);
+      this.updateRemotePointerOverlay();
       // Re-subscribe when the store generation changed (reconnect — the
       // server dropped all subscriptions but the surface reappeared with
       // the same IDs).  We no longer need to handle the "surface info
@@ -1880,11 +2050,37 @@ export class BlitSurfaceCanvas {
     this.unsubCursor = store.onCursor((sid, shape) => {
       if (sid !== this._surfaceId || !this.canvas) return;
       this.canvas.style.cursor = shape;
+      this.remoteCursor =
+        store.getCursorImage?.(sid) ??
+        (shape === "none"
+          ? { kind: "hidden" }
+          : { kind: "named", name: shape });
+      this.updateRemotePointerOverlay();
     });
     // Apply initial cursor.
     if (this.canvas) {
       this.canvas.style.cursor = store.getCursor(this._surfaceId);
     }
+    this.remoteCursor = store.getCursorImage?.(this._surfaceId) ?? {
+      kind: "named",
+      name: "default",
+    };
+
+    // Some embedders provide a narrow SurfaceStore-shaped test/cache facade;
+    // keep the new overlay optional for those older facades.
+    this.unsubRemotePointer = store.onRemotePointer?.((sid, pointer) => {
+      if (sid !== this._surfaceId) return;
+      this.remotePointer = pointer;
+      this.updateRemotePointerOverlay();
+    });
+    const initialRemotePointer = store.getRemotePointer?.(this._surfaceId);
+    this.remotePointer =
+      initialRemotePointer &&
+      Number.isFinite(initialRemotePointer.x) &&
+      Number.isFinite(initialRemotePointer.y)
+        ? initialRemotePointer
+        : null;
+    this.updateRemotePointerOverlay();
 
     this.unsubFrame = store.onFrame((sid) => {
       if (sid !== this._surfaceId) return;
@@ -1931,9 +2127,60 @@ export class BlitSurfaceCanvas {
     this.unsubFrame?.();
     this.unsubChange?.();
     this.unsubCursor?.();
+    this.unsubRemotePointer?.();
     this.unsubFrame = null;
     this.unsubChange = null;
     this.unsubCursor = null;
+    this.unsubRemotePointer = null;
+  }
+
+  private updateRemotePointerOverlay(): void {
+    const svg = this.remotePointerSvg;
+    const glyph = this.remotePointerGlyph;
+    const image = this.remotePointerImage;
+    const pointer = this.remotePointer;
+    const surface = this.surface;
+    const cursor = this.remoteCursor;
+    if (
+      !svg ||
+      !glyph ||
+      !image ||
+      !pointer ||
+      !surface ||
+      cursor.kind === "hidden"
+    ) {
+      if (svg) svg.style.visibility = "hidden";
+      return;
+    }
+    const width = Math.max(1, surface.width);
+    const height = Math.max(1, surface.height);
+    // Pointer artwork is sized in logical pixels. Scale it into the physical
+    // composite so it remains a normal cursor size on high-DPI surfaces.
+    const cursorScale =
+      surface.logicalWidth > 0 ? width / surface.logicalWidth : 1;
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    const x = Math.max(0, Math.min(width, pointer.x));
+    const y = Math.max(0, Math.min(height, pointer.y));
+    if (cursor.kind === "custom") {
+      glyph.style.display = "none";
+      image.style.display = "";
+      image.setAttribute("href", cursor.url);
+      image.setAttribute("x", String(x - cursor.hotspotX * cursorScale));
+      image.setAttribute("y", String(y - cursor.hotspotY * cursorScale));
+      image.setAttribute("width", String(cursor.width));
+      image.setAttribute("height", String(cursor.height));
+    } else {
+      image.style.display = "none";
+      glyph.style.display = "";
+      const artwork = remoteCursorGlyph(cursor.name);
+      glyph.setAttribute("d", artwork.path);
+      const rotation = artwork.rotation ? ` rotate(${artwork.rotation})` : "";
+      glyph.setAttribute(
+        "transform",
+        `translate(${x} ${y}) scale(${cursorScale})${rotation}`,
+      );
+    }
+    svg.style.visibility = "visible";
   }
 
   /** Copy the shared backing canvas onto our visible canvas. */
@@ -1977,6 +2224,9 @@ export class BlitSurfaceCanvas {
   private resubscribe(): void {
     this.serverUnsubscribe();
     this.unsubscribeAll();
+    this.remotePointer = null;
+    this.remoteCursor = { kind: "named", name: "default" };
+    this.updateRemotePointerOverlay();
     this._hasBlitFirstFrame = false;
     if (!this.disposed) this.subscribe();
   }

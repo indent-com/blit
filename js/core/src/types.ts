@@ -369,6 +369,9 @@ export const S2C_SURFACE_ACTIVATED = 0x2d;
 export const S2C_SURFACE_CURSOR = 0x29;
 /** Encoder backend info for a surface: [0x2A][surface_id:2][name:N] */
 export const S2C_SURFACE_ENCODER = 0x2a;
+/** Pointer position from another viewer:
+ *  [0x31][surface_id:2][visible:1][x:2][y:2]. */
+export const S2C_SURFACE_POINTER = 0x31;
 /**
  * Fragment of a larger S2C message: [0x2B][flags:1][chunk:N].
  * Bulk messages above the server's chunk threshold are split into

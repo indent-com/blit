@@ -38,6 +38,8 @@ import {
   S2C_FRAGMENT,
   S2C_CLIPBOARD_CONTENT,
   S2C_CLIPBOARD_OWNER,
+  S2C_SURFACE_CURSOR,
+  S2C_SURFACE_POINTER,
   S2C_PING,
   C2S_PING,
   C2S_SURFACE_SUBSCRIBE,
@@ -153,6 +155,111 @@ describe("BlitConnection", () => {
     // Invalid states cannot accidentally suppress browser clipboard import.
     transport.push(new Uint8Array([S2C_CLIPBOARD_OWNER, 2]));
     expect(conn.usesWaylandClipboard()).toBe(false);
+  });
+
+  it("tracks another client's shared surface pointer", () => {
+    const updates: Array<{
+      id: number;
+      pointer: { x: number; y: number } | null;
+    }> = [];
+    const unsubscribe = conn.surfaceStore.onRemotePointer((id, pointer) =>
+      updates.push({ id, pointer }),
+    );
+    try {
+      transport.push(
+        new Uint8Array([S2C_SURFACE_POINTER, 7, 0, 1, 0x34, 0x12, 0x78, 0x56]),
+      );
+      expect(conn.surfaceStore.getRemotePointer(7)).toEqual({
+        x: 0x1234,
+        y: 0x5678,
+      });
+
+      transport.push(
+        new Uint8Array([S2C_SURFACE_POINTER, 7, 0, 0, 0, 0, 0, 0]),
+      );
+      expect(conn.surfaceStore.getRemotePointer(7)).toBeNull();
+      expect(updates).toEqual([
+        { id: 7, pointer: { x: 0x1234, y: 0x5678 } },
+        { id: 7, pointer: null },
+      ]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("preserves surface cursor artwork for remote pointer overlays", () => {
+    const name = new TextEncoder().encode("vertical-text");
+    transport.push(
+      new Uint8Array([S2C_SURFACE_CURSOR, 7, 0, 0, name.length, ...name]),
+    );
+    expect(conn.surfaceStore.getCursorImage(7)).toEqual({
+      kind: "named",
+      name: "vertical-text",
+    });
+
+    const createDescriptor = Object.getOwnPropertyDescriptor(
+      URL,
+      "createObjectURL",
+    );
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(
+      URL,
+      "revokeObjectURL",
+    );
+    const createObjectURL = vi.fn(() => "blob:cursor");
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: createObjectURL,
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: revokeObjectURL,
+    });
+    try {
+      transport.push(
+        new Uint8Array([
+          S2C_SURFACE_CURSOR,
+          7,
+          0,
+          2,
+          4,
+          0,
+          5,
+          0,
+          32,
+          0,
+          24,
+          0,
+          0x89,
+        ]),
+      );
+      expect(createObjectURL).toHaveBeenCalledOnce();
+      expect(conn.surfaceStore.getCursorImage(7)).toEqual({
+        kind: "custom",
+        url: "blob:cursor",
+        hotspotX: 4,
+        hotspotY: 5,
+        width: 32,
+        height: 24,
+      });
+
+      transport.push(new Uint8Array([S2C_SURFACE_CURSOR, 7, 0, 1]));
+      expect(conn.surfaceStore.getCursorImage(7)).toEqual({ kind: "hidden" });
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:cursor");
+    } finally {
+      if (createDescriptor) {
+        Object.defineProperty(URL, "createObjectURL", createDescriptor);
+      } else {
+        delete (URL as unknown as { createObjectURL?: unknown })
+          .createObjectURL;
+      }
+      if (revokeDescriptor) {
+        Object.defineProperty(URL, "revokeObjectURL", revokeDescriptor);
+      } else {
+        delete (URL as unknown as { revokeObjectURL?: unknown })
+          .revokeObjectURL;
+      }
+    }
   });
 
   it("invalidates Wayland clipboard authority on clipboardchange", () => {

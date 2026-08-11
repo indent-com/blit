@@ -38,6 +38,25 @@ export type SurfaceEventCallback = (
   surfaces: ReadonlyMap<number, BlitSurface>,
 ) => void;
 
+/** Shared compositor pointer when its latest motion came from another client. */
+export interface RemoteSurfacePointer {
+  x: number;
+  y: number;
+}
+
+/** Cursor artwork announced by the Wayland client for a surface. */
+export type SurfaceCursorImage =
+  | { kind: "named"; name: string }
+  | { kind: "hidden" }
+  | {
+      kind: "custom";
+      url: string;
+      hotspotX: number;
+      hotspotY: number;
+      width: number;
+      height: number;
+    };
+
 /** Timestamped record of an incoming surface video frame. */
 export interface SurfaceFrameSample {
   /** `performance.now()` when the frame arrived. */
@@ -757,6 +776,8 @@ export class SurfaceStore {
   private canvases = new Map<number, CanvasEntry>();
   private frameListeners = new Set<SurfaceFrameCallback>();
   private cursorShapes = new Map<number, string>();
+  private cursorImages = new Map<number, SurfaceCursorImage>();
+  private remotePointers = new Map<number, RemoteSurfacePointer>();
   private encoderNames = new Map<number, string>();
   private codecStrings = new Map<number, string>();
   /** Most recent *AV1* codec string announced per surface.  The plain
@@ -766,6 +787,9 @@ export class SurfaceStore {
   private av1CodecStrings = new Map<number, string>();
   private cursorListeners = new Set<
     (surfaceId: number, shape: string) => void
+  >();
+  private remotePointerListeners = new Set<
+    (surfaceId: number, pointer: RemoteSurfacePointer | null) => void
   >();
   private activationListeners = new Set<(surfaceId: number) => void>();
   private eventListeners = new Set<SurfaceEventCallback>();
@@ -1327,6 +1351,8 @@ export class SurfaceStore {
 
   handleSurfaceDestroyed(surfaceId: number): void {
     this.surfaces.delete(surfaceId);
+    this.clearCursor(surfaceId);
+    this.clearRemotePointer(surfaceId);
     this.encoderNames.delete(surfaceId);
     this.codecStrings.delete(surfaceId);
     this.av1CodecStrings.delete(surfaceId);
@@ -1651,8 +1677,17 @@ export class SurfaceStore {
     }
   }
 
-  handleSurfaceCursor(surfaceId: number, shape: string): void {
+  handleSurfaceCursor(
+    surfaceId: number,
+    shape: string,
+    image: SurfaceCursorImage =
+      shape === "none"
+        ? { kind: "hidden" }
+        : { kind: "named", name: shape },
+  ): void {
+    this.releaseCursorImage(this.cursorImages.get(surfaceId), image);
     this.cursorShapes.set(surfaceId, shape);
+    this.cursorImages.set(surfaceId, image);
     // Notify cursor listeners without triggering a full change cycle.
     for (const listener of this.cursorListeners) {
       try {
@@ -1666,11 +1701,47 @@ export class SurfaceStore {
     return this.cursorShapes.get(surfaceId) ?? "default";
   }
 
+  /** Get the cursor artwork used for another viewer's pointer overlay. */
+  getCursorImage(surfaceId: number): SurfaceCursorImage {
+    return (
+      this.cursorImages.get(surfaceId) ?? { kind: "named", name: "default" }
+    );
+  }
+
   /** Register a callback for cursor shape changes. Returns unsubscribe fn. */
   onCursor(listener: (surfaceId: number, shape: string) => void): () => void {
     this.cursorListeners.add(listener);
     return () => {
       this.cursorListeners.delete(listener);
+    };
+  }
+
+  handleRemotePointer(
+    surfaceId: number,
+    visible: boolean,
+    x: number,
+    y: number,
+  ): void {
+    const pointer = visible ? { x, y } : null;
+    if (pointer) this.remotePointers.set(surfaceId, pointer);
+    else this.remotePointers.delete(surfaceId);
+    for (const listener of this.remotePointerListeners) {
+      try {
+        listener(surfaceId, pointer);
+      } catch {}
+    }
+  }
+
+  getRemotePointer(surfaceId: number): RemoteSurfacePointer | null {
+    return this.remotePointers.get(surfaceId) ?? null;
+  }
+
+  onRemotePointer(
+    listener: (surfaceId: number, pointer: RemoteSurfacePointer | null) => void,
+  ): () => void {
+    this.remotePointerListeners.add(listener);
+    return () => {
+      this.remotePointerListeners.delete(listener);
     };
   }
 
@@ -1840,6 +1911,8 @@ export class SurfaceStore {
    * re-subscribe for video frames.
    */
   handleDisconnect(): void {
+    this.clearCursors();
+    this.clearRemotePointers();
     this.discardAllPresenters();
     for (const entry of this.decoders.values()) {
       safeClose(entry.decoder);
@@ -1870,6 +1943,8 @@ export class SurfaceStore {
    * individual S2C_SURFACE_CREATED messages.
    */
   reset(): void {
+    this.clearCursors();
+    this.clearRemotePointers();
     this.discardAllPresenters();
     for (const entry of this.decoders.values()) {
       safeClose(entry.decoder);
@@ -1906,6 +1981,56 @@ export class SurfaceStore {
       this._visibilityHandler = null;
     }
     this.reset();
+  }
+
+  private clearRemotePointer(surfaceId: number): void {
+    if (!this.remotePointers.delete(surfaceId)) return;
+    for (const listener of this.remotePointerListeners) {
+      try {
+        listener(surfaceId, null);
+      } catch {}
+    }
+  }
+
+  private releaseCursorImage(
+    previous: SurfaceCursorImage | undefined,
+    next?: SurfaceCursorImage,
+  ): void {
+    if (
+      previous?.kind !== "custom" ||
+      (next?.kind === "custom" && next.url === previous.url)
+    ) {
+      return;
+    }
+    try {
+      URL.revokeObjectURL(previous.url);
+    } catch {}
+  }
+
+  private clearCursor(surfaceId: number): void {
+    this.releaseCursorImage(this.cursorImages.get(surfaceId));
+    this.cursorImages.delete(surfaceId);
+    this.cursorShapes.delete(surfaceId);
+  }
+
+  private clearCursors(): void {
+    for (const image of this.cursorImages.values()) {
+      this.releaseCursorImage(image);
+    }
+    this.cursorImages.clear();
+    this.cursorShapes.clear();
+  }
+
+  private clearRemotePointers(): void {
+    const surfaceIds = [...this.remotePointers.keys()];
+    this.remotePointers.clear();
+    for (const surfaceId of surfaceIds) {
+      for (const listener of this.remotePointerListeners) {
+        try {
+          listener(surfaceId, null);
+        } catch {}
+      }
+    }
   }
 
   // -----------------------------------------------------------------------

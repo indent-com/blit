@@ -46,7 +46,7 @@ function attachCanvas() {
   surface.attach(container);
   const canvas = surface.canvasElement;
   if (!canvas) throw new Error("Expected surface canvas");
-  return { surface, canvas };
+  return { surface, canvas, container };
 }
 
 /** The store feeds this in; the stub workspace has no connection to do it. */
@@ -68,6 +68,78 @@ function setSurfaceInfo(
 }
 
 describe("BlitSurfaceCanvas layout", () => {
+  it("draws another client's pointer over the shared surface", () => {
+    const { surface, canvas, container } = attachCanvas();
+    setSurfaceInfo(surface, { width: 640, height: 480, lw: 640, lh: 480 });
+    surface.setDisplaySize(640, 480, 120);
+
+    const internal = surface as unknown as {
+      remotePointer: { x: number; y: number } | null;
+      remoteCursor:
+        | { kind: "named"; name: string }
+        | { kind: "hidden" }
+        | {
+            kind: "custom";
+            url: string;
+            hotspotX: number;
+            hotspotY: number;
+            width: number;
+            height: number;
+          };
+      updateRemotePointerOverlay(): void;
+    };
+    internal.remotePointer = { x: 123, y: 234 };
+    internal.updateRemotePointerOverlay();
+
+    const overlay = container.querySelector<SVGSVGElement>(
+      "[data-blit-remote-pointer]",
+    );
+    const glyph = overlay?.querySelector("path");
+    expect(overlay?.style.visibility).toBe("visible");
+    expect(overlay?.getAttribute("viewBox")).toBe("0 0 640 480");
+    expect(glyph?.getAttribute("transform")).toBe(
+      "translate(123 234) scale(1)",
+    );
+    expect(overlay?.style.left).toBe(canvas.style.left);
+    expect(overlay?.style.top).toBe(canvas.style.top);
+    expect(overlay?.style.width).toBe(canvas.style.width);
+    expect(overlay?.style.height).toBe(canvas.style.height);
+
+    const arrowPath = glyph?.getAttribute("d");
+    internal.remoteCursor = { kind: "named", name: "vertical-text" };
+    internal.updateRemotePointerOverlay();
+    expect(glyph?.getAttribute("d")).not.toBe(arrowPath);
+    expect(glyph?.getAttribute("transform")).toBe(
+      "translate(123 234) scale(1) rotate(90)",
+    );
+
+    internal.remoteCursor = {
+      kind: "custom",
+      url: "blob:cursor",
+      hotspotX: 4,
+      hotspotY: 5,
+      width: 32,
+      height: 24,
+    };
+    internal.updateRemotePointerOverlay();
+    const image = overlay?.querySelector("image");
+    expect(glyph?.style.display).toBe("none");
+    expect(image?.getAttribute("href")).toBe("blob:cursor");
+    expect(image?.getAttribute("x")).toBe("119");
+    expect(image?.getAttribute("y")).toBe("229");
+    expect(image?.getAttribute("width")).toBe("32");
+    expect(image?.getAttribute("height")).toBe("24");
+
+    internal.remoteCursor = { kind: "hidden" };
+    internal.updateRemotePointerOverlay();
+    expect(overlay?.style.visibility).toBe("hidden");
+
+    internal.remotePointer = null;
+    internal.updateRemotePointerOverlay();
+    expect(overlay?.style.visibility).toBe("hidden");
+    surface.dispose();
+  });
+
   it("fills the container until a display size is known", () => {
     const { surface, canvas } = attachCanvas();
     expect(canvas.style.width).toBe("100%");

@@ -20,10 +20,10 @@ use blit_remote::{
     S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE,
     SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN,
     build_update_msg, msg_hello, msg_s2c_clipboard_content, msg_s2c_clipboard_list,
-    msg_s2c_clipboard_owner, msg_s2c_scroll_offset, msg_s2c_used_rows, msg_surface_activated,
-    msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
-    msg_surface_frame, msg_surface_frame_precise, msg_surface_resized, msg_surface_title,
-    msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
+    msg_s2c_clipboard_owner, msg_s2c_scroll_offset, msg_s2c_surface_pointer, msg_s2c_used_rows,
+    msg_surface_activated, msg_surface_app_id, msg_surface_created, msg_surface_destroyed,
+    msg_surface_encoder, msg_surface_frame, msg_surface_frame_precise, msg_surface_resized,
+    msg_surface_title, msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
     parse_surface_pointer_axis2,
 };
 #[cfg(target_os = "linux")]
@@ -4039,6 +4039,18 @@ struct Session {
     pixel_snapshot_len: usize,
     last_ping: Instant,
     clients: HashMap<u64, ClientState>,
+    /// The compositor has one shared pointer. Its latest browser owner is
+    /// hidden from that browser (which has a native cursor) and mirrored to
+    /// every other subscribed viewer.
+    surface_pointer: Option<SharedSurfacePointer>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SharedSurfacePointer {
+    owner: u64,
+    surface_id: u16,
+    x: u16,
+    y: u16,
 }
 
 struct SearchResultRow {
@@ -4154,6 +4166,7 @@ impl Session {
             pixel_snapshot_len: 0,
             last_ping: Instant::now(),
             surface_frames_sent: 0,
+            surface_pointer: None,
         }
     }
 
@@ -4331,6 +4344,86 @@ impl Session {
         for c in self.clients.values() {
             let _ = send_outbox(c, msg.to_vec());
         }
+    }
+
+    /// Make `owner` the shared compositor pointer's latest driver. The
+    /// owner's browser cursor is already visible, so only its peers get the
+    /// overlay. Moving across surfaces first withdraws the old overlay.
+    fn update_surface_pointer(&mut self, owner: u64, surface_id: u16, x: u16, y: u16) {
+        if let Some(previous) = self.surface_pointer
+            && previous.surface_id != surface_id
+        {
+            self.hide_surface_pointer(previous.surface_id);
+        }
+
+        self.surface_pointer = Some(SharedSurfacePointer {
+            owner,
+            surface_id,
+            x,
+            y,
+        });
+        let visible = msg_s2c_surface_pointer(surface_id, true, x, y);
+        let hidden = msg_s2c_surface_pointer(surface_id, false, 0, 0);
+        for (&client_id, client) in &self.clients {
+            if !client.surface_subscriptions.contains(&surface_id) {
+                continue;
+            }
+            let msg = if client_id == owner {
+                hidden.clone()
+            } else {
+                visible.clone()
+            };
+            let _ = send_outbox(client, msg);
+        }
+    }
+
+    fn hide_surface_pointer(&self, surface_id: u16) {
+        let msg = msg_s2c_surface_pointer(surface_id, false, 0, 0);
+        for client in self.clients.values() {
+            if client.surface_subscriptions.contains(&surface_id) {
+                let _ = send_outbox(client, msg.clone());
+            }
+        }
+    }
+
+    fn clear_surface_pointer(&mut self, surface_id: u16) {
+        if self
+            .surface_pointer
+            .is_some_and(|pointer| pointer.surface_id == surface_id)
+        {
+            self.hide_surface_pointer(surface_id);
+            self.surface_pointer = None;
+        }
+    }
+
+    fn clear_surface_pointer_owner(&mut self, owner: u64) {
+        if let Some(pointer) = self.surface_pointer
+            && pointer.owner == owner
+        {
+            self.hide_surface_pointer(pointer.surface_id);
+            self.surface_pointer = None;
+        }
+    }
+
+    /// Seed a newly subscribed view with the current shared pointer instead
+    /// of waiting for the remote user to move again.
+    fn send_surface_pointer_to(&self, client_id: u64, surface_id: u16) {
+        let Some(pointer) = self
+            .surface_pointer
+            .filter(|pointer| pointer.surface_id == surface_id)
+        else {
+            return;
+        };
+        let Some(client) = self.clients.get(&client_id) else {
+            return;
+        };
+        let visible = pointer.owner != client_id;
+        let (x, y) = if visible {
+            (pointer.x, pointer.y)
+        } else {
+            (0, 0)
+        };
+        let _ = send_outbox(client, msg_s2c_surface_pointer(surface_id, visible, x, y));
     }
 
     fn mediated_size_for_pty(&self, pty_id: u16) -> Option<(u16, u16)> {
@@ -6006,6 +6099,9 @@ async fn tick(state: &AppState) -> TickOutcome {
     // subscribed to each sid so the first post-resize frame bypasses
     // the per-surface time gate.
     let mut resized_surface_ids: Vec<u16> = Vec::new();
+    // Destroyed surfaces also retire any shared-pointer overlay after the
+    // compositor borrow below is released.
+    let mut destroyed_surface_ids: Vec<u16> = Vec::new();
 
     let mut surface_commit_count = 0u32;
     if let Some(cs) = sess.compositor.as_mut() {
@@ -6062,6 +6158,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     cs.frame_clocks_dirty = true;
                     cs.handle.set_frame_interval(surface_id, None);
                     invalidate_client_encoders.push(surface_id);
+                    destroyed_surface_ids.push(surface_id);
                     broadcast.push(msg_surface_destroyed(surface_id));
                 }
                 CompositorEvent::SurfaceCommit {
@@ -6297,6 +6394,10 @@ async fn tick(state: &AppState) -> TickOutcome {
         }
     }
     sess.surface_commits += surface_commit_count;
+
+    for surface_id in destroyed_surface_ids {
+        sess.clear_surface_pointer(surface_id);
+    }
 
     // Apply deferred per-client encoder invalidation (couldn't mutate
     // sess.clients while sess.compositor was borrowed above).  Any
@@ -13858,8 +13959,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 let surface_id = u16::from_le_bytes([data[1], data[2]]);
                 let ptype = data[3];
                 let button = data[4];
-                let x = u16::from_le_bytes([data[5], data[6]]) as f64;
-                let y = u16::from_le_bytes([data[7], data[8]]) as f64;
+                let pointer_x = u16::from_le_bytes([data[5], data[6]]);
+                let pointer_y = u16::from_le_bytes([data[7], data[8]]);
+                let x = f64::from(pointer_x);
+                let y = f64::from(pointer_y);
+                if matches!(ptype, 0..=2) {
+                    sess.update_surface_pointer(client_id, surface_id, pointer_x, pointer_y);
+                }
                 if let Some(cs) = sess.compositor.as_mut() {
                     match ptype {
                         0 | 1 => {
@@ -14192,6 +14298,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         &state.config.surface_encoders,
                         state.config.verbose,
                     );
+                }
+                if first_subscribe {
+                    sess.send_surface_pointer_to(client_id, surface_id);
                 }
                 // A first subscriber with an empty pixel cache would wait
                 // forever: the delivery loop can't build an encoder without
@@ -14838,6 +14947,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         if let Some(cs) = sess.compositor.as_ref() {
             cs.audio_broadcast.unsubscribe(client_id);
         }
+        sess.clear_surface_pointer_owner(client_id);
         let client = sess.clients.remove(&client_id);
         if let Some(cs) = sess.compositor.as_mut() {
             cs.frame_clocks_dirty = true;
@@ -15596,6 +15706,50 @@ mod tests {
     fn test_client() -> ClientState {
         let (client, _rx) = test_client_with_capacity(0);
         client
+    }
+
+    #[test]
+    fn shared_surface_pointer_is_hidden_from_its_owner_and_sent_to_peers() {
+        let mut sess = Session::new();
+        let (mut first, mut first_rx) = test_client_with_capacity(0);
+        let (mut second, mut second_rx) = test_client_with_capacity(0);
+        first.surface_subscriptions.insert(7);
+        second.surface_subscriptions.insert(7);
+        sess.clients.insert(1, first);
+        sess.clients.insert(2, second);
+
+        sess.update_surface_pointer(1, 7, 123, 456);
+        assert_eq!(
+            first_rx.try_recv().unwrap(),
+            msg_s2c_surface_pointer(7, false, 0, 0)
+        );
+        assert_eq!(
+            second_rx.try_recv().unwrap(),
+            msg_s2c_surface_pointer(7, true, 123, 456)
+        );
+
+        // Ownership follows the latest input. The old owner now sees the
+        // shared cursor; the new owner falls back to its native one.
+        sess.update_surface_pointer(2, 7, 321, 654);
+        assert_eq!(
+            first_rx.try_recv().unwrap(),
+            msg_s2c_surface_pointer(7, true, 321, 654)
+        );
+        assert_eq!(
+            second_rx.try_recv().unwrap(),
+            msg_s2c_surface_pointer(7, false, 0, 0)
+        );
+
+        sess.clear_surface_pointer_owner(2);
+        assert_eq!(
+            first_rx.try_recv().unwrap(),
+            msg_s2c_surface_pointer(7, false, 0, 0)
+        );
+        assert_eq!(
+            second_rx.try_recv().unwrap(),
+            msg_s2c_surface_pointer(7, false, 0, 0)
+        );
+        assert!(sess.surface_pointer.is_none());
     }
 
     fn force_decoder_pressure(client: &mut ClientState, surface_id: u16, depth: u8) {

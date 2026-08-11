@@ -592,6 +592,14 @@ pub const S2C_CLIPBOARD_LIST: u8 = 0x2C;
 /// must not replace it; `0` means the selection is empty or externally owned.
 pub const S2C_CLIPBOARD_OWNER: u8 = 0x2E;
 
+/// Position of the compositor pointer when another client last moved it:
+/// [0x31][surface_id:2][visible:1][x:2][y:2].
+///
+/// The server sends `visible = 0` to the client that originated the motion,
+/// because that client already has its native browser cursor at the same
+/// position. Other viewers receive `visible = 1` and render an overlay.
+pub const S2C_SURFACE_POINTER: u8 = 0x31;
+
 // -- Audio forwarding ---------------------------------------------------
 
 /// Subscribe to audio: [0x30][bitrate_kbps:2]
@@ -3251,6 +3259,17 @@ pub fn msg_s2c_clipboard_owner(wayland: bool) -> Vec<u8> {
     vec![S2C_CLIPBOARD_OWNER, u8::from(wayland)]
 }
 
+/// Announce the shared surface pointer to one viewer.
+pub fn msg_s2c_surface_pointer(surface_id: u16, visible: bool, x: u16, y: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(8);
+    msg.push(S2C_SURFACE_POINTER);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.push(u8::from(visible));
+    msg.extend_from_slice(&x.to_le_bytes());
+    msg.extend_from_slice(&y.to_le_bytes());
+    msg
+}
+
 pub fn msg_surface_input(surface_id: u16, data: &[u8]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(3 + data.len());
     msg.push(C2S_SURFACE_INPUT);
@@ -4477,6 +4496,18 @@ mod tests {
         assert_eq!(msg.len(), SURFACE_POINTER_AXIS2_LEN);
         assert_eq!(msg[0], C2S_SURFACE_POINTER_AXIS2);
         assert_eq!(parse_surface_pointer_axis2(&msg), Some(ev));
+    }
+
+    #[test]
+    fn surface_pointer_visibility_has_a_fixed_layout() {
+        assert_eq!(
+            msg_s2c_surface_pointer(0x1234, true, 0x5678, 0x9abc),
+            [S2C_SURFACE_POINTER, 0x34, 0x12, 1, 0x78, 0x56, 0xbc, 0x9a]
+        );
+        assert_eq!(
+            msg_s2c_surface_pointer(7, false, 0, 0),
+            [S2C_SURFACE_POINTER, 7, 0, 0, 0, 0, 0, 0]
+        );
     }
 
     // Drag-and-drop codecs are pinned byte-for-byte: js/core builds these

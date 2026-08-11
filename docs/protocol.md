@@ -205,6 +205,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | `0x2D` | `SURFACE_ACTIVATED` | `[surface_id:2]` — the Wayland client asked for its toplevel to be activated (xdg_activation_v1); raise and focus the pane                      |
 | `0x2E` | `CLIPBOARD_OWNER`   | `[wayland:1]` — `1` while a Wayland client owns the selection; `0` when empty or externally owned                                               |
 | `0x30` | `AUDIO_FRAME`       | `[timestamp:4][flags:1][data:N]`                                                                                                                |
+| `0x31` | `SURFACE_POINTER`   | `[surface_id:2][visible:1][x:2][y:2]` — shared pointer position; hidden for the client that originated it                                       |
 | `0x40` | `FS_SYNCED`         | `[nonce:2][sync_id:2][status:1][detail_len:2][detail:N]`                                                                                        |
 | `0x41` | `FS_UPDATE`         | `[sync_id:2][update_id:4][flags:1][records:LZ4]`                                                                                                |
 | `0x42` | `FS_FILE`           | `[nonce:2][status:1][data:LZ4]`                                                                                                                 |
@@ -575,6 +576,14 @@ as required by the Wayland request order. Releasing over no surface cancels
 the source.
 
 ### Pointer buttons
+
+`S2C_SURFACE_POINTER` mirrors the compositor's shared pointer position to
+surface viewers. The client that originated the latest pointer event receives
+`visible = 0`, because its browser cursor already marks that position; other
+subscribed clients receive `visible = 1` and draw a pointer overlay at `x, y`.
+The coordinates use the same composited-frame pixel space as
+`C2S_SURFACE_POINTER`. Moving between surfaces or disconnecting the pointer's
+owner hides the old overlay.
 
 The `button` byte in `C2S_SURFACE_POINTER` is DOM `MouseEvent.button`
 numbering — 0 left, 1 middle, 2 right, 3 back, 4 forward — and the server

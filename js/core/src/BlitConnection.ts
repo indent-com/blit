@@ -38,6 +38,7 @@ import {
   S2C_SURFACE_APP_ID,
   S2C_SURFACE_ACTIVATED,
   S2C_SURFACE_CURSOR,
+  S2C_SURFACE_POINTER,
   S2C_SURFACE_CREATED,
   S2C_SURFACE_DESTROYED,
   S2C_SURFACE_ENCODER,
@@ -4511,10 +4512,15 @@ export class BlitConnection {
             const nameLen = bytes[4];
             if (bytes.length < 5 + nameLen) return;
             const shape = textDecoder.decode(bytes.subarray(5, 5 + nameLen));
-            this.surfaceStore.handleSurfaceCursor(surfaceId, shape);
+            this.surfaceStore.handleSurfaceCursor(surfaceId, shape, {
+              kind: "named",
+              name: shape,
+            });
           } else if (cursorType === 1) {
             // Hidden
-            this.surfaceStore.handleSurfaceCursor(surfaceId, "none");
+            this.surfaceStore.handleSurfaceCursor(surfaceId, "none", {
+              kind: "hidden",
+            });
           } else if (cursorType === 2) {
             // Custom image: hotx(2) + hoty(2) + w(2) + h(2) + png
             if (bytes.length < 12) return;
@@ -4525,6 +4531,9 @@ export class BlitConnection {
             );
             const hotX = view.getUint16(4, true);
             const hotY = view.getUint16(6, true);
+            const width = view.getUint16(8, true);
+            const height = view.getUint16(10, true);
+            if (width === 0 || height === 0) return;
             const pngData = bytes.subarray(12);
             const blob = new Blob([new Uint8Array(pngData)], {
               type: "image/png",
@@ -4533,9 +4542,36 @@ export class BlitConnection {
             this.surfaceStore.handleSurfaceCursor(
               surfaceId,
               `url(${url}) ${hotX} ${hotY}, auto`,
+              {
+                kind: "custom",
+                url,
+                hotspotX: hotX,
+                hotspotY: hotY,
+                width,
+                height,
+              },
             );
           }
         } catch {}
+        return;
+      }
+      case S2C_SURFACE_POINTER: {
+        // Fixed layout: [type][sid:2][visible:1][x:2][y:2].
+        if (bytes.length !== 8) return;
+        const view = new DataView(
+          bytes.buffer,
+          bytes.byteOffset,
+          bytes.byteLength,
+        );
+        const surfaceId = view.getUint16(1, true);
+        const visible = bytes[3] === 1;
+        if (bytes[3] > 1) return;
+        this.surfaceStore.handleRemotePointer(
+          surfaceId,
+          visible,
+          visible ? view.getUint16(4, true) : 0,
+          visible ? view.getUint16(6, true) : 0,
+        );
         return;
       }
       case S2C_SURFACE_ENCODER: {

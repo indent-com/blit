@@ -21,6 +21,8 @@ export type {
   SurfaceEventCallback,
   SurfaceFrameSample,
   ServerClockSample,
+  RemoteSurfacePointer,
+  SurfaceCursorImage,
 } from "./SurfaceStore";
 export {
   estimateSourceToReceiveMs,
