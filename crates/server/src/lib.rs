@@ -49,6 +49,8 @@ use tokio::sync::{Mutex, Notify, mpsc};
 mod audio;
 #[cfg(target_os = "linux")]
 mod audio_pw;
+#[cfg(target_os = "linux")]
+mod desktop_bus;
 mod gpu_libs;
 mod ipc;
 mod kv;
@@ -886,6 +888,11 @@ struct SharedCompositor {
     /// `None` when PipeWire is not available or `BLIT_AUDIO=0`.
     #[cfg(target_os = "linux")]
     audio_pipeline: Option<audio::AudioPipeline>,
+    /// Private session bus whose activation environment points at this
+    /// compositor. Desktop portals spawned through it map inside blit rather
+    /// than escaping to the host compositor.
+    #[cfg(target_os = "linux")]
+    desktop_bus: Option<desktop_bus::DesktopBus>,
     /// Shared fan-out state for audio — subscribers, catch-up ring,
     /// listener flag.  Persistent across pipeline restarts so clients
     /// stay subscribed even when the pipeline is restarted.  Always present on Linux;
@@ -4202,6 +4209,16 @@ impl Session {
             let created_at = Instant::now();
             let handle = blit_compositor::spawn_compositor(verbose, event_notify, gpu_device);
             #[cfg(target_os = "linux")]
+            let desktop_bus = match desktop_bus::DesktopBus::spawn(&handle.socket_name, verbose) {
+                Ok(bus) => Some(bus),
+                Err(e) => {
+                    if verbose {
+                        eprintln!("[desktop-bus] {e}");
+                    }
+                    None
+                }
+            };
+            #[cfg(target_os = "linux")]
             let audio_broadcast = audio::AudioBroadcast::new();
             #[cfg(target_os = "linux")]
             let audio_pipeline = {
@@ -4291,6 +4308,8 @@ impl Session {
                 #[cfg(target_os = "linux")]
                 audio_pipeline,
                 #[cfg(target_os = "linux")]
+                desktop_bus,
+                #[cfg(target_os = "linux")]
                 audio_broadcast,
                 #[cfg(target_os = "linux")]
                 audio_session_id: session_id,
@@ -4336,6 +4355,20 @@ impl Session {
             .as_ref()
             .and_then(|cs| cs.audio_pipeline.as_ref())
             .map(|ap| ap.pipewire_remote_path())
+    }
+
+    /// Returns the compositor-scoped private session bus address.
+    #[cfg(target_os = "linux")]
+    fn desktop_bus_address(&self) -> Option<String> {
+        self.compositor
+            .as_ref()
+            .and_then(|cs| cs.desktop_bus.as_ref())
+            .map(|bus| bus.address().to_string())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn desktop_bus_address(&self) -> Option<String> {
+        None
     }
 
     fn live_ptys(&self) -> usize {
@@ -5916,6 +5949,12 @@ async fn supervise(state: &AppState) {
             && let Some(ap) = cs.audio_pipeline.as_mut()
         {
             ap.reap_children();
+        }
+        if let Some(cs) = sess.compositor.as_mut()
+            && cs.desktop_bus.as_mut().is_some_and(|bus| !bus.is_alive())
+        {
+            eprintln!("[desktop-bus] private session bus exited");
+            cs.desktop_bus = None;
         }
     }
     evict_exited(state).await;
@@ -13569,6 +13608,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
+                    sess.desktop_bus_address().as_deref(),
                     pulse_server.as_deref(),
                     pipewire_remote.as_deref(),
                 ) {
@@ -13673,6 +13713,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
+                    sess.desktop_bus_address().as_deref(),
                     pulse_server.as_deref(),
                     pipewire_remote.as_deref(),
                 ) {
@@ -13769,6 +13810,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
+                    sess.desktop_bus_address().as_deref(),
                     pulse_server.as_deref(),
                     pipewire_remote.as_deref(),
                 ) {
@@ -13955,6 +13997,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
+                    sess.desktop_bus_address().as_deref(),
                     pulse_server.as_deref(),
                     pipewire_remote.as_deref(),
                 ) {
@@ -14909,6 +14952,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         cwd.as_deref(),
                         state.clone(),
                         wayland_display.as_deref(),
+                        sess.desktop_bus_address().as_deref(),
                         pulse_server.as_deref(),
                         pipewire_remote.as_deref(),
                     ) {

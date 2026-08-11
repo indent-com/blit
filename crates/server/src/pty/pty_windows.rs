@@ -351,6 +351,7 @@ pub fn spawn_pty(
     scrollback: usize,
     state: AppState,
     _wayland_display: Option<&str>,
+    _desktop_bus: Option<&str>,
     _pulse_server: Option<&str>,
     _pipewire_remote: Option<&str>,
 ) -> Option<crate::Pty> {
@@ -521,6 +522,7 @@ pub fn respawn_child(
     dir: Option<&str>,
     state: AppState,
     _wayland_display: Option<&str>,
+    _desktop_bus: Option<&str>,
     _pulse_server: Option<&str>,
     _pipewire_remote: Option<&str>,
 ) -> Option<(

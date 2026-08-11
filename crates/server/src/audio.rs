@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 /// `PR_SET_PDEATHSIG(SIGTERM)` so the child is killed when the parent (blit
 /// server) dies — even via SIGKILL where Rust destructors can't run.
 ///
-fn pdeathsig_hook() -> impl FnMut() -> std::io::Result<()> {
+pub(crate) fn pdeathsig_hook() -> impl FnMut() -> std::io::Result<()> {
     // SAFETY: `prctl(PR_SET_PDEATHSIG, …)` is async-signal-safe and runs in
     // the child between fork and exec.
     || unsafe {
