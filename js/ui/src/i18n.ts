@@ -313,6 +313,7 @@ const en: Messages = {
   "terminalDrop.hoverCwd": "Drop to upload to {cwd}",
   "terminalDrop.uploading": "Uploading {name} — {pct}%",
   "terminalDrop.failed": "Upload failed",
+  "terminalDrop.terminalClosed": "This terminal is no longer running",
   "terminalDrop.unsupported": "This server can't accept file uploads",
   "terminalDrop.noDirs": "Folders can't be uploaded — drop files instead",
 

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { BlitSession } from "@blit-sh/core";
-import { currentSessionForPty } from "../ide/followTerminal";
+import {
+  currentSessionForPty,
+  currentSourceSessionForPty,
+  isSourceTerminalUnavailableError,
+  sourceSessionCanResolveCwd,
+} from "../ide/followTerminal";
 
 /**
  * A dock session anchored on a terminal opens fs/git/lsp FROM_PTY: the server
@@ -60,12 +65,50 @@ describe("follow-terminal source resolution", () => {
       session("local:2", 7, "closed"),
     ];
     expect(currentSessionForPty(closed, "local", 7, "local:1")).toBe("local:2");
+    const source = currentSourceSessionForPty(closed, "local", 7);
+    expect(sourceSessionCanResolveCwd(source, false)).toBe(true);
+    // Once the replacement LIST/READY completed, a still-closed session was
+    // not restored by the server and can no longer anchor an open.
+    expect(sourceSessionCanResolveCwd(source, true)).toBe(false);
   });
 
   it("falls back when the pty is gone", () => {
     // The terminal itself exited: nothing to follow, so the caller keeps its
-    // own id and the open fails loudly instead of silently rebasing onto the
-    // server's cwd.
+    // own id. The server refuses that safely instead of silently rebasing onto
+    // its cwd; the UI classifies the refusal as a lifecycle race below.
     expect(currentSessionForPty([], "local", 7, "local:1")).toBe("local:1");
+    expect(
+      currentSessionForPty(
+        [session("local:1", 7, "exited")],
+        "local",
+        7,
+        "fallback",
+      ),
+    ).toBe("fallback");
+    expect(
+      currentSourceSessionForPty(
+        [
+          session("local:1", 7, "closed"),
+          session("local:2", 7, "exited"),
+        ],
+        "local",
+        7,
+      ),
+    ).toBeNull();
+  });
+
+  it("recognizes the source-cwd race without hiding other sync errors", () => {
+    expect(
+      isSourceTerminalUnavailableError(
+        new Error(
+          "Sync failed: not found: source terminal has no working directory",
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      isSourceTerminalUnavailableError(
+        new Error("Sync failed: not found: project directory was removed"),
+      ),
+    ).toBe(false);
   });
 });

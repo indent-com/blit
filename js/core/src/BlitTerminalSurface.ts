@@ -656,6 +656,11 @@ export class BlitTerminalSurface {
     if (!text) return null;
     try {
       await navigator.clipboard.writeText(text);
+      // Programmatic writes do not emit a DOM `copy` event.  Tell the
+      // connection explicitly so a later paste into a Wayland surface does
+      // not preserve the client-owned selection that predates this terminal
+      // drag selection.
+      this._blitConn?.noteBrowserClipboardMayHaveChanged();
     } catch {
       // Clipboard write rejected (e.g. no permission). Surface the text
       // so callers can fall back to a manual copy affordance.

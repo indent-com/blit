@@ -156,6 +156,10 @@ import {
   reorderServerRoots,
 } from "./ide/rootsStore";
 import { useIdeSession, type IdeSessionDescriptor } from "./ide/session";
+import {
+  currentSourceSessionForPty,
+  sourceSessionCanResolveCwd,
+} from "./ide/followTerminal";
 import { localFileIndex, searchFileIndex } from "./ide/fileIndex";
 import { editorRecencySnapshot } from "./ide/editorPositions";
 import { SwitcherOverlay } from "./SwitcherOverlay";
@@ -729,8 +733,15 @@ function WorkspaceScreen(props: {
   const [focusedTerm, setFocusedTerm] = createSignal<{
     sessionId: SessionId;
     conn: string;
+    ptyId: number;
     cwd: string;
   } | null>(null);
+  // Unlike `focusedTerm`, this survives focusless reconnect windows. It is
+  // only a fallback for a sticky terminal anchor after that PTY is confirmed
+  // gone, and is bounded by the terminals seen during this workspace mount.
+  const lastTerminalCwds = new Map<string, string>();
+  const terminalCwdKey = (connectionId: string, ptyId: number): string =>
+    `${connectionId}\u0000${ptyId}`;
   // A `cd` OUTSIDE the current session root re-roots the dock there (Files and
   // Log follow the terminal, not just the label). Inside the root, the poll
   // only expands the tree — re-rooting on every subdirectory cd would narrow
@@ -843,6 +854,37 @@ function WorkspaceScreen(props: {
           key: `f ${ov.connectionId} ${ov.cwd}`,
           connectionId: ov.connectionId,
           path: ov.cwd,
+        };
+      }
+      // The terminal may exit after becoming the sticky last anchor. Keep the
+      // useful root, but stop issuing PTY-relative opens that can only return
+      // the server's internal "source terminal has no working directory"
+      // diagnostic. The cwd poll gives us the same root as an absolute path;
+      // without even one successful poll there is no root to retain.
+      const source = currentSourceSessionForPty(
+        wsState().sessions,
+        a.session.connectionId,
+        a.session.ptyId,
+      );
+      const sourceConnectionReady =
+        wsState().connections.find(
+          (connection) => connection.id === a.session.connectionId,
+        )?.ready ?? false;
+      if (!sourceSessionCanResolveCwd(source, sourceConnectionReady)) {
+        const last = focusedTerm();
+        const lastCwd =
+          last &&
+          last.conn === a.session.connectionId &&
+          last.ptyId === a.session.ptyId
+            ? last.cwd
+            : lastTerminalCwds.get(
+                terminalCwdKey(a.session.connectionId, a.session.ptyId),
+              );
+        if (!lastCwd) return null;
+        return {
+          key: `f ${a.session.connectionId} ${lastCwd}`,
+          connectionId: a.session.connectionId,
+          path: lastCwd,
         };
       }
       return {
@@ -3429,11 +3471,12 @@ function WorkspaceScreen(props: {
       setFocusedTerm(null);
       return;
     }
-    const connId = wsState().sessions.find((x) => x.id === fid)?.connectionId;
-    if (!connId) {
+    const focused = wsState().sessions.find((x) => x.id === fid);
+    if (!focused) {
       setFocusedTerm(null);
       return;
     }
+    const connId = focused.connectionId;
     workspace
       .sessionCwd(connId, fid)
       .then((cwd) => {
@@ -3446,7 +3489,13 @@ function WorkspaceScreen(props: {
           );
           return;
         }
-        setFocusedTerm({ sessionId: fid, conn: connId, cwd });
+        lastTerminalCwds.set(terminalCwdKey(connId, focused.ptyId), cwd);
+        setFocusedTerm({
+          sessionId: fid,
+          conn: connId,
+          ptyId: focused.ptyId,
+          cwd,
+        });
         // A stale override for another terminal never outlives its focus.
         const ov = termCwdOverride();
         if (ov && ov.sessionId !== fid) setTermCwdOverride(null);

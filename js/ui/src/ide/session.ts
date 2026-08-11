@@ -56,7 +56,10 @@ import {
 } from "@blit-sh/core/bsp";
 import { createBlitWorkspaceState } from "@blit-sh/solid";
 import { isConnReady, connGeneration, isTransientConnError } from "./reactive";
-import { currentSessionForPty } from "./followTerminal";
+import {
+  currentSessionForPty,
+  isSourceTerminalUnavailableError,
+} from "./followTerminal";
 import { settledWithoutRepo } from "./gitPresence";
 
 /** Ceiling on consecutive transient open-retries — see the per-session
@@ -427,7 +430,7 @@ function buildSession(
       return;
     }
     let localDisposed = false;
-    let limitTimer: ReturnType<typeof setTimeout> | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
     workspace
       .syncFs(connectionId, rootAt, {
         ...rootOpts,
@@ -456,14 +459,24 @@ function buildSession(
           // free as idle warm sessions expire and dock cards close. Show
           // the error but keep re-attempting instead of bricking the tree.
           setFsError(e instanceof Error ? e.message : String(e));
-          limitTimer = setTimeout(() => setFsRetry((n) => n + 1), 3000);
+          retryTimer = setTimeout(() => setFsRetry((n) => n + 1), 3000);
+        } else if (isSourceTerminalUnavailableError(e)) {
+          // The focused terminal exited between choosing the dock root and
+          // the server resolving it. Workspace replaces this descriptor with
+          // its last absolute cwd (or no root); never flash the wire detail.
+          // A just-created terminal can hit the same race briefly, so retry
+          // without turning it into a permanent empty tree.
+          setFsError(null);
+          setPhase("opening");
+          if (fsRetries++ < MAX_OPEN_RETRIES)
+            retryTimer = setTimeout(() => setFsRetry((n) => n + 1), 250);
         } else {
           setFsError(e instanceof Error ? e.message : String(e));
         }
       });
     onCleanup(() => {
       localDisposed = true;
-      if (limitTimer) clearTimeout(limitTimer);
+      if (retryTimer) clearTimeout(retryTimer);
       rootFs()?.stop();
       stopChildren();
       setRootFs(null);
@@ -793,6 +806,7 @@ function buildSession(
     gitRetry(); // re-attempt after a transient (reset-clobbered) open
     if (!gitReady()) return; // wait; a reset closes the old handle below
     let localDisposed = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
     workspace
       .openRepo(connectionId, desc.path, {
         watch: true,
@@ -842,9 +856,16 @@ function buildSession(
         // or too many transient retries, settles — letting the fs tree fall
         // back to the descriptor path, and telling the git panels why they
         // have no repo instead of leaving them to look like they are loading.
-        if (isTransientConnError(e) && gitRetries++ < MAX_OPEN_RETRIES)
+        if (isTransientConnError(e) && gitRetries++ < MAX_OPEN_RETRIES) {
           setGitRetry((n) => n + 1);
-        else {
+        } else if (isSourceTerminalUnavailableError(e)) {
+          // Same terminal-start/exit race as fs. Stay unsettled and silent;
+          // Workspace will replace a dead anchor, while a new shell gets a
+          // brief chance to acquire its cwd.
+          setGitError(null);
+          if (gitRetries++ < MAX_OPEN_RETRIES)
+            retryTimer = setTimeout(() => setGitRetry((n) => n + 1), 250);
+        } else {
           setGitError(e instanceof Error ? e.message : String(e));
           // This root has no repo, whatever an earlier generation opened here
           // (a follow-terminal dock re-resolves its root at every open, so the
@@ -855,6 +876,7 @@ function buildSession(
       });
     onCleanup(() => {
       localDisposed = true;
+      if (retryTimer) clearTimeout(retryTimer);
       gitHandle()?.close();
       setGitHandle(null);
     });

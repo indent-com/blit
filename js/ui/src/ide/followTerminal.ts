@@ -17,10 +17,55 @@
 
 import type { BlitSession, ConnectionId, SessionId } from "@blit-sh/core";
 
+/** The server's diagnostic when a PTY-relative open loses its anchor between
+ *  the UI choosing it and the request being handled. This is an expected
+ *  terminal-lifecycle race, not text that belongs in the UI. */
+const SOURCE_TERMINAL_UNAVAILABLE =
+  "source terminal has no working directory";
+
+/** True for the fs/git/lsp open failure produced by that lifecycle race. */
+export function isSourceTerminalUnavailableError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message
+    .toLowerCase()
+    .includes(SOURCE_TERMINAL_UNAVAILABLE);
+}
+
+/** The current incarnation of a PTY, or null once its newest one exited. */
+export function currentSourceSessionForPty(
+  sessions: readonly BlitSession[],
+  connectionId: ConnectionId,
+  ptyId: number,
+): BlitSession | null {
+  let newest: BlitSession | null = null;
+  for (const session of sessions) {
+    if (session.connectionId !== connectionId || session.ptyId !== ptyId)
+      continue;
+    // Later entries are newer (the connection appends); a live incarnation
+    // wins over the closed generation retained during reconnect.
+    if (!newest || newest.state === "closed" || session.state !== "closed")
+      newest = session;
+  }
+  // An exited current generation also supersedes an older closed generation;
+  // returning the stale one would resurrect a PTY that is known to be gone.
+  return newest?.state === "exited" ? null : newest;
+}
+
+/** Whether that client-side incarnation can still resolve on the server.
+ *  A closed session is provisional during reconnect, but stale once the
+ *  replacement terminal list is complete (`connectionReady`). */
+export function sourceSessionCanResolveCwd(
+  session: BlitSession | null,
+  connectionReady: boolean,
+): boolean {
+  return !!session && (session.state !== "closed" || !connectionReady);
+}
+
 /**
  * The SessionId to open against *now*: the newest session on `ptyId`, a live
  * one winning over a closed one, falling back to `fallback` when the pty is
- * unknown (the terminal exited — then the open fails loudly, as it should).
+ * unknown. Callers still send the fallback so the server remains the authority
+ * on a racing open; the UI recognizes and absorbs that lifecycle refusal.
  *
  * The closed-session case is load-bearing: between S2C_HELLO and S2C_LIST
  * every session is closed, and the newest of those is still the one the
@@ -32,12 +77,7 @@ export function currentSessionForPty(
   ptyId: number,
   fallback: SessionId,
 ): SessionId {
-  let newest: BlitSession | null = null;
-  for (const s of sessions) {
-    if (s.connectionId !== connectionId || s.ptyId !== ptyId) continue;
-    // Later entries are newer (the connection appends).
-    if (!newest || newest.state === "closed" || s.state !== "closed")
-      newest = s;
-  }
-  return newest ? newest.id : fallback;
+  return (
+    currentSourceSessionForPty(sessions, connectionId, ptyId)?.id ?? fallback
+  );
 }

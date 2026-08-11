@@ -30,6 +30,7 @@ import type {
   SessionId,
 } from "@blit-sh/core";
 import { t, tp } from "./i18n";
+import { isSourceTerminalUnavailableError } from "./ide/followTerminal";
 import { ui, z, type Theme, type UIScale } from "./theme";
 
 /** True while the drag offers OS files (as opposed to an internal pane/tile
@@ -218,7 +219,13 @@ export function TerminalDropTarget(props: {
         h.stop();
         handles.delete(sid);
       }
-      showError(err instanceof Error ? err.message : String(err));
+      showError(
+        isSourceTerminalUnavailableError(err)
+          ? t("terminalDrop.terminalClosed")
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
     } finally {
       activity.finish();
     }

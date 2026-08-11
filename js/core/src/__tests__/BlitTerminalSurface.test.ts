@@ -423,6 +423,41 @@ describe("BlitTerminalSurface mobile copy/paste API", () => {
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith("hello");
   });
 
+  it("invalidates stale Wayland clipboard ownership after copying a drag selection", async () => {
+    const s = newSurface();
+    const noteBrowserClipboardMayHaveChanged = vi.fn();
+    // @ts-expect-error — only clipboard authority is relevant to this test.
+    s["_blitConn"] = { noteBrowserClipboardMayHaveChanged };
+    // @ts-expect-error — install a fake wasm terminal stub.
+    s["terminal"] = { get_text: () => "fresh", bracketed_paste: () => false };
+    // @ts-expect-error — force a non-empty in-viewport drag selection.
+    s["selStart"] = { row: 0, col: 0, tailOffset: 0 };
+    // @ts-expect-error — force a non-empty in-viewport drag selection.
+    s["selEnd"] = { row: 0, col: 5, tailOffset: 0 };
+
+    expect(await s.copySelection()).toBe("fresh");
+    expect(noteBrowserClipboardMayHaveChanged).toHaveBeenCalledOnce();
+  });
+
+  it("keeps Wayland clipboard ownership when a drag-selection copy is rejected", async () => {
+    vi.mocked(navigator.clipboard.writeText).mockRejectedValue(
+      new Error("NotAllowedError"),
+    );
+    const s = newSurface();
+    const noteBrowserClipboardMayHaveChanged = vi.fn();
+    // @ts-expect-error — only clipboard authority is relevant to this test.
+    s["_blitConn"] = { noteBrowserClipboardMayHaveChanged };
+    // @ts-expect-error — install a fake wasm terminal stub.
+    s["terminal"] = { get_text: () => "fresh", bracketed_paste: () => false };
+    // @ts-expect-error — force a non-empty in-viewport drag selection.
+    s["selStart"] = { row: 0, col: 0, tailOffset: 0 };
+    // @ts-expect-error — force a non-empty in-viewport drag selection.
+    s["selEnd"] = { row: 0, col: 5, tailOffset: 0 };
+
+    expect(await s.copySelection()).toBe("fresh");
+    expect(noteBrowserClipboardMayHaveChanged).not.toHaveBeenCalled();
+  });
+
   it("pasteFromClipboard() returns null when read-only", async () => {
     const s = new BlitTerminalSurface({ sessionId: "s1", readOnly: true });
     const result = await s.pasteFromClipboard();
