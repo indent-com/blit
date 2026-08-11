@@ -6927,6 +6927,11 @@ impl VulkanRenderer {
     // Main render
     // ---------------------------------------------------------------
 
+    /// Returns the native size submitted by this call separately from the
+    /// frames it happened to publish. The frame list can contain only
+    /// per-client targets (and can begin with the previous submission's
+    /// results), so it is not authoritative for surface sizing.
+    #[allow(clippy::type_complexity)]
     pub fn render_tree_sized(
         &mut self,
         root_id: &ObjectId,
@@ -6935,7 +6940,10 @@ impl VulkanRenderer {
         output_scale_120: u16,
         target_phys: Option<(u32, u32)>,
         toplevel_sid: u16,
-    ) -> Vec<(u16, u32, u32, PixelData, bool)> {
+    ) -> (
+        Option<(u16, u32, u32)>,
+        Vec<(u16, u32, u32, PixelData, bool)>,
+    ) {
         // Retire the previous submission if done (non-blocking).  The
         // self-alloc readback (compositor BGRA at native) is one frame
         // delayed — staging buffer copy needs the fence to complete.
@@ -6969,7 +6977,7 @@ impl VulkanRenderer {
                 // none, but be conservative).  External targets in this
                 // submit will be returned alongside the next render.
                 self.pending_submit = Some(pending);
-                return results;
+                return (None, results);
             }
         } else {
             self.free_frame_textures();
@@ -6995,7 +7003,7 @@ impl VulkanRenderer {
                 surfaces.len(),
                 meta.len(),
             );
-            return results;
+            return (None, results);
         }
 
         // Compute output dimensions.
@@ -7019,7 +7027,7 @@ impl VulkanRenderer {
                 "[render_tree_sized] zero logical size log={log_w}x{log_h} layers={}",
                 all_layers.len(),
             );
-            return results;
+            return (None, results);
         }
 
         // Use the target size from the browser if available, otherwise
@@ -7200,7 +7208,7 @@ impl VulkanRenderer {
         self.ensure_output_images(phys_w, phys_h);
         if self.output_images.is_empty() {
             eprintln!("[render_tree_sized] output_images empty after ensure ({phys_w}x{phys_h})");
-            return results;
+            return (None, results);
         }
         let self_output_idx = self.output_idx;
         let (out_framebuffer, out_image, out_staging_buf) = {
@@ -7223,7 +7231,7 @@ impl VulkanRenderer {
                     Ok(v) => v[0],
                     Err(e) => {
                         eprintln!("[render_tree_sized] allocate_command_buffers failed: {e}");
-                        return results;
+                        return (None, results);
                     }
                 }
             }
@@ -7235,7 +7243,7 @@ impl VulkanRenderer {
             if let Err(e) = self.device.begin_command_buffer(cb, &begin_info) {
                 eprintln!("[render_tree_sized] begin_command_buffer failed: {e}");
                 self.device.free_command_buffers(self.command_pool, &[cb]);
-                return results;
+                return (None, results);
             }
         };
 
@@ -7356,7 +7364,7 @@ impl VulkanRenderer {
                 let _ = self.device.end_command_buffer(cb);
                 self.device.free_command_buffers(self.command_pool, &[cb]);
             }
-            return results;
+            return (None, results);
         }
 
         // Upload damaged SHM regions into optimal tiled images, then make all
@@ -8031,7 +8039,7 @@ impl VulkanRenderer {
             if let Err(e) = self.device.end_command_buffer(cb) {
                 eprintln!("[render_tree_sized] end_command_buffer failed: {e}");
                 self.device.free_command_buffers(self.command_pool, &[cb]);
-                return results;
+                return (None, results);
             }
         }
 
@@ -8073,7 +8081,7 @@ impl VulkanRenderer {
                     Err(e) => {
                         eprintln!("[render_tree_sized] create_fence(tracking) failed: {e}");
                         self.device.free_command_buffers(self.command_pool, &[cb]);
-                        return results;
+                        return (None, results);
                     }
                 }
             }
@@ -8168,7 +8176,7 @@ impl VulkanRenderer {
                 }
                 self.device.destroy_fence(tracking_fence, None);
                 self.device.free_command_buffers(self.command_pool, &[cb]);
-                return results;
+                return (None, results);
             }
             // Only the fence fallback needs a second submission. The
             // preferred export semaphore was signalled by `submit` above.
@@ -8596,7 +8604,7 @@ impl VulkanRenderer {
                 self.pending_submit.is_some(),
             );
         }
-        results
+        (Some((toplevel_sid, phys_w, phys_h)), results)
     }
 }
 

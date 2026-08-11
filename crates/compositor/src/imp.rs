@@ -2121,6 +2121,31 @@ fn next_surface_id_after(id: u16) -> u16 {
     if id == u16::MAX { 1 } else { id + 1 }
 }
 
+/// Resolve the native size to publish after one render attempt.
+///
+/// A browser-requested composite size is authoritative even if this attempt
+/// could not submit. Otherwise only the renderer's explicit submission
+/// metadata is usable; published frames may all be per-client downscales.
+fn native_size_after_render(
+    toplevel_sid: u16,
+    configured: Option<(u32, u32, u32, u32)>,
+    submitted: Option<(u16, u32, u32)>,
+    scale_120: u32,
+) -> Option<(u16, u32, u32, u32, u32)> {
+    if let Some((w, h, log_w, log_h)) = configured {
+        return Some((toplevel_sid, w, h, log_w, log_h));
+    }
+    submitted.map(|(sid, w, h)| {
+        (
+            sid,
+            w,
+            h,
+            (w * 120).div_ceil(scale_120),
+            (h * 120).div_ceil(scale_120),
+        )
+    })
+}
+
 impl Compositor {
     fn next_serial(&mut self) -> u32 {
         self.serial = self.serial.wrapping_add(1);
@@ -2848,8 +2873,8 @@ impl Compositor {
         let native = self.native_composite_size(toplevel_sid);
         let target_phys = native.map(|(pw, ph, _, _)| (pw, ph));
         let mut encode_giveups: Vec<(u32, u64)> = Vec::new();
-        let composited = if let Some(ref mut vk) = self.vulkan_renderer {
-            let composited = vk.render_tree_sized(
+        let (submitted_native, composited) = if let Some(ref mut vk) = self.vulkan_renderer {
+            let rendered = vk.render_tree_sized(
                 root_id,
                 &self.surfaces,
                 &self.surface_meta,
@@ -2859,9 +2884,9 @@ impl Compositor {
             );
             self.pending_encoded.extend(vk.take_encoded_frames());
             encode_giveups = vk.take_encode_giveups();
-            composited
+            rendered
         } else {
-            Vec::new()
+            (None, Vec::new())
         };
 
         // A session that has stopped producing bitstreams reports the same
@@ -2883,24 +2908,16 @@ impl Compositor {
             (self.event_notify)();
         }
 
-        // Record the compositor's native size once for this surface
-        // (used to drive SurfaceResized).  All per-target results carry
-        // the same toplevel_sid and the native composite is produced at
-        // `target_phys`; pull native dims from there when present, else
-        // fall back to the largest result's dims (multi-target frames
-        // are downscaled from one shared native composite).
+        // Record exactly what this call submitted as the native composite.
+        // Published frames are not a fallback: with only a sidebar viewer
+        // they can consist solely of its 512-ish target, and results retired
+        // at the start of this call can even belong to the prior submission.
         let s120_u32 = (s120 as u32).max(120);
-        if let Some((nw, nh, nlog_w, nlog_h)) = native {
-            self.pending_native_sizes
-                .insert(toplevel_sid, (nw, nh, nlog_w, nlog_h));
-        } else if let Some((sid, nw, nh, _, _)) = composited
-            .iter()
-            .max_by_key(|(_, w, h, _, _)| (*w as u64) * (*h as u64))
+        if let Some((sid, nw, nh, nlog_w, nlog_h)) =
+            native_size_after_render(toplevel_sid, native, submitted_native, s120_u32)
         {
-            let nlog_w = (nw * 120).div_ceil(s120_u32);
-            let nlog_h = (nh * 120).div_ceil(s120_u32);
             self.pending_native_sizes
-                .insert(*sid, (*nw, *nh, nlog_w, nlog_h));
+                .insert(sid, (nw, nh, nlog_w, nlog_h));
         }
 
         for (result_sid, w, h, pixels, encoder_skip) in composited {
@@ -4548,14 +4565,15 @@ impl Compositor {
                                 (!rgba.is_empty()).then_some((w, h, rgba))
                             })
                         };
-                        let mut captured = readable(vk.render_tree_sized(
+                        let (_, rendered) = vk.render_tree_sized(
                             root_id,
                             &self.surfaces,
                             &self.surface_meta,
                             cap_s120,
                             None,
                             surface_id,
-                        ));
+                        );
+                        let mut captured = readable(rendered);
                         // That render publishes the *previous* submit's
                         // readback, which normally satisfies capture. When
                         // there was no submit in flight — or the zero-copy
@@ -9719,7 +9737,8 @@ fn run_compositor(
 mod tests {
     use super::{
         FrameClockEntry, PendingDamage, consume_frame_clock_deadline, dir_is_chromium,
-        next_surface_id_after, scan_free_surface_id, shm_damage_rects, update_frame_clock,
+        native_size_after_render, next_surface_id_after, scan_free_surface_id, shm_damage_rects,
+        update_frame_clock,
     };
     use crate::vulkan_render::ShmDamageRect;
     use rustc_hash::FxHashMap;
@@ -9832,6 +9851,22 @@ mod tests {
     fn scan_tolerates_a_zero_seed() {
         assert_eq!(scan_free_surface_id(0, |_| false), Some(1));
         assert_eq!(scan_free_surface_id(0, |_| true), None);
+    }
+
+    #[test]
+    fn sidebar_target_is_not_promoted_to_native_size() {
+        // An unsized 1342x1118 app can publish only a 512x426 sidebar frame.
+        // Native metadata comes from the submission, never that frame list.
+        let submitted_native = Some((7, 1342, 1118));
+        let sidebar_frame = (7, 512, 426);
+
+        let native = native_size_after_render(7, None, submitted_native, 120);
+
+        assert_eq!(native, Some((7, 1342, 1118, 1342, 1118)));
+        assert_ne!(
+            native.map(|(_, w, h, _, _)| (w, h)),
+            Some((sidebar_frame.1, sidebar_frame.2))
+        );
     }
 
     #[test]
