@@ -134,9 +134,11 @@ pub(crate) fn collect_gpu_layers(
             y_invert: sm.y_invert,
             src,
         });
-    }
 
-    for child_id in &surf.children {
-        collect_gpu_layers(child_id, surfaces, meta, x, y, layers);
+        // A surface without a current buffer is unmapped.  Its descendants
+        // are unmapped with it even if they retain their own buffers.
+        for child_id in &surf.children {
+            collect_gpu_layers(child_id, surfaces, meta, x, y, layers);
+        }
     }
 }

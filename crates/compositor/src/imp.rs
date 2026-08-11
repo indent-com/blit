@@ -918,7 +918,11 @@ pub(crate) struct Surface {
     pub wl_surface: WlSurface,
 
     // pending state
-    pending_buffer: Option<WlBuffer>,
+    /// Double-buffered `wl_surface.attach` state.  The outer `Option`
+    /// distinguishes no attach in this commit from `attach(NULL)`, which
+    /// unmaps the surface; collapsing both to `None` leaves stale pixels and
+    /// pointer focus behind after clients unmap a popup or subsurface.
+    pending_buffer: Option<Option<WlBuffer>>,
     pending_buffer_scale: i32,
     pending_damage: Vec<PendingDamage>,
     pending_frame_callbacks: Vec<WlCallback>,
@@ -2600,7 +2604,7 @@ impl Compositor {
         let had_buffer = self
             .surfaces
             .get(surface_id)
-            .is_some_and(|s| s.pending_buffer.is_some());
+            .is_some_and(|s| s.pending_buffer.as_ref().is_some_and(Option::is_some));
         {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3029,9 +3033,11 @@ impl Compositor {
     }
 
     /// Walk the surface tree rooted at `root_id` and return the topmost
-    /// surface whose pixel bounds contain (`x`, `y`).  Returns
-    /// `(wl_surface, local_x, local_y)` with coordinates relative to the
-    /// hit surface.  Falls back to the root surface when nothing else matches.
+    /// mapped surface whose pixel bounds contain (`x`, `y`).  Returns
+    /// `(wl_surface, local_x, local_y)` with coordinates relative to the hit
+    /// surface.  An unmapped child suppresses its whole subtree, as the
+    /// Wayland mapping rules require; if no child accepts the point, input
+    /// retains the compositor's historical toplevel fallback.
     fn hit_test_surface_at(
         &self,
         root_id: &ObjectId,
@@ -3039,10 +3045,9 @@ impl Compositor {
         y: f64,
     ) -> Option<(WlSurface, f64, f64)> {
         self.hit_test_recursive(root_id, x, y, 0, 0).or_else(|| {
-            // Fallback: return the root surface with the original coords.
             self.surfaces
                 .get(root_id)
-                .map(|s| (s.wl_surface.clone(), x, y))
+                .map(|surface| (surface.wl_surface.clone(), x, y))
         })
     }
 
@@ -3055,6 +3060,10 @@ impl Compositor {
         offset_y: i32,
     ) -> Option<(WlSurface, f64, f64)> {
         let surf = self.surfaces.get(surface_id)?;
+        // Buffer presence is the surface's mapped state.  Children retain
+        // their own buffers across a parent unmap, but are not mapped again
+        // until every ancestor has current content.
+        let sm = self.surface_meta.get(surface_id)?;
         let sx = offset_x + surf.subsurface_position.0;
         let sy = offset_y + surf.subsurface_position.1;
 
@@ -3066,21 +3075,19 @@ impl Compositor {
         }
 
         // Check this surface's bounds (logical coordinates).
-        if let Some(sm) = self.surface_meta.get(surface_id) {
-            let (lw, lh) = super::render::surface_logical_size(surf, sm);
-            let lx = x - sx as f64;
-            let ly = y - sy as f64;
-            if lx >= 0.0 && ly >= 0.0 && lx < lw && ly < lh {
-                // A surface can decline input over part or all of itself, and
-                // then the pointer belongs to whatever is behind it. Firefox
-                // relies on this: it puts its rendering in a subsurface
-                // covering the whole window and sets that subsurface's input
-                // region empty, so input falls through to the toplevel where
-                // its widget code is listening.
-                match surf.input_region {
-                    Some(ref ops) if !input_region::contains(ops, lx, ly) => {}
-                    _ => return Some((surf.wl_surface.clone(), lx, ly)),
-                }
+        let (lw, lh) = super::render::surface_logical_size(surf, sm);
+        let lx = x - sx as f64;
+        let ly = y - sy as f64;
+        if lx >= 0.0 && ly >= 0.0 && lx < lw && ly < lh {
+            // A surface can decline input over part or all of itself, and
+            // then the pointer belongs to whatever is behind it. Firefox
+            // relies on this: it puts its rendering in a subsurface
+            // covering the whole window and sets that subsurface's input
+            // region empty, so input falls through to the toplevel where
+            // its widget code is listening.
+            match surf.input_region {
+                Some(ref ops) if !input_region::contains(ops, lx, ly) => {}
+                _ => return Some((surf.wl_surface.clone(), lx, ly)),
             }
         }
         None
@@ -3236,7 +3243,7 @@ impl Compositor {
                 surf.syncobj_surface.clone(),
             )
         };
-        let Some(buf) = buffer else {
+        let Some(buffer) = buffer else {
             // No new content, so there is nothing to stay in step with and
             // the state applies now, as the protocol says it must.  The
             // points came without a buffer, which the spec calls an error
@@ -3248,6 +3255,19 @@ impl Compositor {
                 r.signal();
             }
             drop(acquire);
+            return;
+        };
+        let Some(buf) = buffer else {
+            // `attach(NULL)` is a real buffer-state change: it unmaps the
+            // surface.  Apply the rest of the commit atomically, retire both
+            // the displayed and any acquire-waiting buffer, and leave its
+            // role/tree position intact so a subsurface can map again later.
+            self.apply_committed_state(surface_id);
+            if let Some(r) = release {
+                r.signal();
+            }
+            drop(acquire);
+            self.unmap_surface_content(surface_id);
             return;
         };
 
@@ -3638,6 +3658,70 @@ impl Compositor {
         }
     }
 
+    /// Remove a still-live surface from pointer focus before unmapping it.
+    ///
+    /// Unlike destruction, unmapping leaves the `wl_surface` resource alive,
+    /// so the client is owed a `leave`.  Clearing only our local id makes a
+    /// later remap deliver a second `enter` with no matching leave, while not
+    /// clearing it leaves axis events routed to invisible popup content.
+    fn leave_pointer_focus(&mut self, gone: &ObjectId) {
+        if self.pointer_entered_id.as_ref() != Some(gone) {
+            return;
+        }
+        let wl = self
+            .surfaces
+            .get(gone)
+            .map(|surface| surface.wl_surface.clone());
+        self.pointer_entered_id = None;
+        let Some(wl) = wl else {
+            return;
+        };
+        let serial = self.next_serial();
+        for ptr in &self.pointers {
+            if same_client(ptr, &wl) {
+                ptr.leave(serial, &wl);
+                ptr.frame();
+            }
+        }
+    }
+
+    /// Drop the current buffer and every compositor-side cache derived from
+    /// it while retaining the surface's role and tree position.  This is the
+    /// content half of a Wayland unmap; a subsurface can attach a new buffer
+    /// later and map again in the same position.
+    fn unmap_surface_content(&mut self, surface_id: &ObjectId) {
+        // Unmapping a parent also unmaps every descendant.  Pointer focus is
+        // normally on the deepest hit surface, so clear that descendant too
+        // instead of testing only the surface that received attach(NULL).
+        let focused = self.pointer_entered_id.clone().filter(|focused| {
+            let mut at = Some(focused.clone());
+            while let Some(id) = at {
+                if &id == surface_id {
+                    return true;
+                }
+                at = self
+                    .surfaces
+                    .get(&id)
+                    .and_then(|surface| surface.parent_surface_id.clone());
+            }
+            false
+        });
+        if let Some(focused) = focused {
+            self.leave_pointer_focus(&focused);
+        }
+        self.surface_meta.remove(surface_id);
+        self.cursor_rgba.remove(surface_id);
+        if let Some(ref mut vk) = self.vulkan_renderer {
+            vk.remove_surface(surface_id);
+        }
+        if let Some(held) = self.held_buffers.remove(surface_id) {
+            self.release_held(held);
+        }
+        if let Some(awaiting) = self.awaiting_acquire.remove(surface_id) {
+            self.release_held(awaiting.into_release());
+        }
+    }
+
     /// Stop drawing a dismissed popup and queue a fresh frame for its
     /// toplevel.
     ///
@@ -3672,17 +3756,7 @@ impl Compositor {
         // now as well as the tree edge, otherwise reusing this wl_surface for
         // another popup could briefly resurrect the old menu before its first
         // new buffer commit.
-        self.surface_meta.remove(popup_id);
-        if let Some(ref mut vk) = self.vulkan_renderer {
-            vk.remove_surface(popup_id);
-        }
-        if let Some(held) = self.held_buffers.remove(popup_id) {
-            self.release_held(held);
-        }
-        if let Some(awaiting) = self.awaiting_acquire.remove(popup_id) {
-            self.release_held(awaiting.into_release());
-        }
-        self.forget_pointer_focus(popup_id);
+        self.unmap_surface_content(popup_id);
 
         if let Some(toplevel_sid) = toplevel_sid {
             // `false` is important: this topology change must publish pixels,
@@ -3884,13 +3958,22 @@ impl Compositor {
     }
 
     fn handle_cursor_commit(&mut self, surface_id: &ObjectId) {
+        let unmaps = self
+            .surfaces
+            .get(surface_id)
+            .is_some_and(|surface| matches!(surface.pending_buffer.as_ref(), Some(None)));
         self.apply_pending_state(surface_id);
         let hotspot = self
             .surfaces
             .get(surface_id)
             .map(|s| s.cursor_hotspot)
             .unwrap_or((0, 0));
-        if let Some((w, h, rgba)) = self.cursor_rgba.get(surface_id)
+        if unmaps {
+            let _ = self.event_tx.send(CompositorEvent::SurfaceCursor {
+                surface_id: self.focused_surface_id,
+                cursor: CursorImage::Hidden,
+            });
+        } else if let Some((w, h, rgba)) = self.cursor_rgba.get(surface_id)
             && !rgba.is_empty()
         {
             let _ = self.event_tx.send(CompositorEvent::SurfaceCursor {
@@ -5392,7 +5475,7 @@ impl Dispatch<WlSurface, ()> for Compositor {
         match request {
             Request::Attach { buffer, x, y } => {
                 if let Some(surf) = state.surfaces.get_mut(&sid) {
-                    surf.pending_buffer = buffer;
+                    surf.pending_buffer = Some(buffer);
                     if x != 0 || y != 0 {
                         surf.pending_damage.push(PendingDamage::Full);
                     }

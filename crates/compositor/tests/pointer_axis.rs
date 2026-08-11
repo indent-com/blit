@@ -10,13 +10,18 @@
 
 #![cfg(target_os = "linux")]
 
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
-use wayland_client::protocol::{wl_compositor, wl_pointer, wl_registry, wl_seat, wl_surface};
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noop};
+use wayland_client::backend::ObjectId;
+use wayland_client::protocol::{
+    wl_buffer, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
+    wl_subcompositor, wl_subsurface, wl_surface,
+};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, delegate_noop};
 
 use blit_compositor::{CompositorCommand, CompositorEvent, CompositorHandle, spawn_compositor};
 
@@ -25,6 +30,8 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 /// A pointer event, reduced to what this test cares about.
 #[derive(Debug, PartialEq, Clone)]
 enum Ptr {
+    Enter(ObjectId),
+    Leave(ObjectId),
     Source(u32),
     Axis { axis: u32, value: f64 },
     Value120 { axis: u32, value: i32 },
@@ -36,6 +43,8 @@ enum Ptr {
 #[derive(Default)]
 struct App {
     compositor: Option<wl_compositor::WlCompositor>,
+    shm: Option<wl_shm::WlShm>,
+    subcompositor: Option<wl_subcompositor::WlSubcompositor>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     seat: Option<wl_seat::WlSeat>,
     events: Vec<Ptr>,
@@ -62,6 +71,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
             "wl_compositor" => {
                 state.compositor =
                     Some(registry.bind::<wl_compositor::WlCompositor, _, _>(name, 4, qh, ()));
+            }
+            "wl_shm" => {
+                state.shm = Some(registry.bind::<wl_shm::WlShm, _, _>(name, 1, qh, ()));
+            }
+            "wl_subcompositor" => {
+                state.subcompositor =
+                    Some(registry.bind::<wl_subcompositor::WlSubcompositor, _, _>(name, 1, qh, ()));
             }
             "xdg_wm_base" => {
                 state.wm_base =
@@ -111,6 +127,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for App {
         use wayland_client::WEnum;
         let axis_of = |a: WEnum<wl_pointer::Axis>| a.into_result().map(|a| a as u32).unwrap_or(99);
         match event {
+            wl_pointer::Event::Enter { surface, .. } => state.events.push(Ptr::Enter(surface.id())),
+            wl_pointer::Event::Leave { surface, .. } => state.events.push(Ptr::Leave(surface.id())),
             wl_pointer::Event::AxisSource { axis_source } => state.events.push(Ptr::Source(
                 axis_source.into_result().map(|s| s as u32).unwrap_or(99),
             )),
@@ -182,14 +200,24 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for App {
 }
 
 delegate_noop!(App: ignore wl_compositor::WlCompositor);
+delegate_noop!(App: ignore wl_buffer::WlBuffer);
+delegate_noop!(App: ignore wl_shm::WlShm);
+delegate_noop!(App: ignore wl_shm_pool::WlShmPool);
+delegate_noop!(App: ignore wl_subcompositor::WlSubcompositor);
+delegate_noop!(App: ignore wl_subsurface::WlSubsurface);
 delegate_noop!(App: ignore wl_surface::WlSurface);
 
 struct Fixture {
     app: App,
     queue: EventQueue<App>,
     surface_id: u16,
+    compositor: wl_compositor::WlCompositor,
+    subcompositor: wl_subcompositor::WlSubcompositor,
+    pool: wl_shm_pool::WlShmPool,
     _pointer: wl_pointer::WlPointer,
     _surface: wl_surface::WlSurface,
+    _root_buffer: wl_buffer::WlBuffer,
+    _backing: OwnedFd,
     _xdg_surface: xdg_surface::XdgSurface,
     _conn: Connection,
     handle: Option<CompositorHandle>,
@@ -222,6 +250,11 @@ impl Fixture {
         let mut app = App::default();
         queue.roundtrip(&mut app).expect("registry roundtrip");
         let compositor = app.compositor.clone().expect("wl_compositor advertised");
+        let shm = app.shm.clone().expect("wl_shm advertised");
+        let subcompositor = app
+            .subcompositor
+            .clone()
+            .expect("wl_subcompositor advertised");
         let wm_base = app.wm_base.clone().expect("xdg_wm_base advertised");
         let seat = app.seat.clone().expect("wl_seat advertised");
         let pointer = seat.get_pointer(&qh, ());
@@ -229,6 +262,31 @@ impl Fixture {
         let surface = compositor.create_surface(&qh, ());
         let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
         let _toplevel = xdg_surface.get_toplevel(&qh, ());
+        surface.commit();
+        queue.roundtrip(&mut app).expect("configure roundtrip");
+
+        const ROOT_W: i32 = 64;
+        const ROOT_H: i32 = 64;
+        const CHILD_W: i32 = 24;
+        const CHILD_H: i32 = 24;
+        let root_bytes = ROOT_W * ROOT_H * 4;
+        let pool_bytes = root_bytes + CHILD_W * CHILD_H * 4;
+        let raw_fd = unsafe { libc::memfd_create(c"pointer-axis".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw_fd >= 0, "memfd_create failed");
+        assert_eq!(unsafe { libc::ftruncate(raw_fd, pool_bytes.into()) }, 0);
+        let backing = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let pool = shm.create_pool(backing.as_fd(), pool_bytes, &qh, ());
+        let root_buffer = pool.create_buffer(
+            0,
+            ROOT_W,
+            ROOT_H,
+            ROOT_W * 4,
+            wl_shm::Format::Xrgb8888,
+            &qh,
+            (),
+        );
+        surface.attach(Some(&root_buffer), 0, 0);
+        surface.damage_buffer(0, 0, ROOT_W, ROOT_H);
         surface.commit();
         queue.roundtrip(&mut app).expect("map roundtrip");
 
@@ -248,8 +306,13 @@ impl Fixture {
             app,
             queue,
             surface_id,
+            compositor,
+            subcompositor,
+            pool,
             _pointer: pointer,
             _surface: surface,
+            _root_buffer: root_buffer,
+            _backing: backing,
             _xdg_surface: xdg_surface,
             _conn: conn,
             handle: Some(handle),
@@ -279,6 +342,40 @@ impl Fixture {
         self.send(cmd);
         self.app.events.clone()
     }
+
+    fn map_subsurface(
+        &mut self,
+    ) -> (
+        wl_surface::WlSurface,
+        wl_subsurface::WlSubsurface,
+        wl_buffer::WlBuffer,
+    ) {
+        const ROOT_BYTES: i32 = 64 * 64 * 4;
+        const CHILD_W: i32 = 24;
+        const CHILD_H: i32 = 24;
+        let qh = self.queue.handle();
+        let child = self.compositor.create_surface(&qh, ());
+        let subsurface = self
+            .subcompositor
+            .get_subsurface(&child, &self._surface, &qh, ());
+        subsurface.set_position(4, 4);
+        let buffer = self.pool.create_buffer(
+            ROOT_BYTES,
+            CHILD_W,
+            CHILD_H,
+            CHILD_W * 4,
+            wl_shm::Format::Xrgb8888,
+            &qh,
+            (),
+        );
+        child.attach(Some(&buffer), 0, 0);
+        child.damage_buffer(0, 0, CHILD_W, CHILD_H);
+        child.commit();
+        self.queue
+            .roundtrip(&mut self.app)
+            .expect("subsurface map roundtrip");
+        (child, subsurface, buffer)
+    }
 }
 
 fn finger(surface_id: u16, dx: f64, dy: f64) -> CompositorCommand {
@@ -295,6 +392,72 @@ fn finger(surface_id: u16, dx: f64, dy: f64) -> CompositorCommand {
 
 const VERTICAL: u32 = 0;
 const HORIZONTAL: u32 = 1;
+
+#[test]
+fn null_buffer_unmap_retargets_scroll_from_a_stale_subsurface() {
+    let mut f = Fixture::new();
+    let (child, _subsurface, buffer) = f.map_subsurface();
+
+    // Enter the child and make it the client's current pointer/axis target.
+    f.app.events.clear();
+    f.send(CompositorCommand::PointerMotion {
+        surface_id: f.surface_id,
+        x: 10.0,
+        y: 10.0,
+    });
+    assert!(f.app.events.contains(&Ptr::Enter(child.id())));
+
+    // Wayland clients hide reusable popups and subsurfaces this way.  The
+    // null attach must retire the old hit target even though the wl_surface
+    // object and its place in the tree both survive.
+    f.app.events.clear();
+    child.attach(None, 0, 0);
+    child.commit();
+    f.queue
+        .roundtrip(&mut f.app)
+        .expect("subsurface unmap roundtrip");
+    assert!(f.app.events.contains(&Ptr::Leave(child.id())));
+
+    // macOS momentum delivers another wheel event without a physical mouse
+    // move.  The browser re-seeds motion at the wheel coordinates; it must
+    // now enter the root, and the following continuous axis must arrive.
+    f.app.events.clear();
+    f.send(CompositorCommand::PointerMotion {
+        surface_id: f.surface_id,
+        x: 10.0,
+        y: 10.0,
+    });
+    assert!(f.app.events.contains(&Ptr::Enter(f._surface.id())));
+    let events = f.scroll(CompositorCommand::PointerAxis {
+        surface_id: f.surface_id,
+        dx: 0.0,
+        dy: 4.5,
+        v120_x: 0,
+        v120_y: 0,
+        source: Some(2),
+        stop: false,
+    });
+    assert!(events.contains(&Ptr::Axis {
+        axis: VERTICAL,
+        value: 4.5,
+    }));
+
+    // The unmap retained the role and tree position, so attaching content
+    // again maps the same child and makes it hittable without recreating it.
+    child.attach(Some(&buffer), 0, 0);
+    child.damage_buffer(0, 0, 24, 24);
+    child.commit();
+    f.queue
+        .roundtrip(&mut f.app)
+        .expect("subsurface remap roundtrip");
+    f.app.events.clear();
+    f.send(CompositorCommand::PointerMotion {
+        surface_id: f.surface_id,
+        x: 10.0,
+        y: 10.0,
+    });
+    assert!(f.app.events.contains(&Ptr::Enter(child.id())));
+}
 
 #[test]
 fn a_trackpad_stream_is_labelled_a_finger_not_a_wheel() {
