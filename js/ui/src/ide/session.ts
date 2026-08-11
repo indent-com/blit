@@ -61,6 +61,7 @@ import {
   isSourceTerminalUnavailableError,
 } from "./followTerminal";
 import { settledWithoutRepo } from "./gitPresence";
+import { selectIdeSessionForDisplay } from "./ideSessionDisplay";
 
 /** Ceiling on consecutive transient open-retries — see the per-session
  *  counters. Generous: a real reconnect needs one. */
@@ -1147,9 +1148,9 @@ function buildSession(
 
 // ---------------------------------------------------------------------------
 // Registry — ref-counted, idle-disposed sessions keyed by descriptor.key.
-// Switching terminals releases the old session (kept warm for IDLE_MS) and
-// acquires the new one; returning reuses the warm session with its tree,
-// git state, and log intact.
+// Switching terminals starts the new session while the displayed-session ref
+// keeps the old one alive through the visual handoff. Once released, a session
+// stays warm for IDLE_MS; returning reuses its tree, git state, and log.
 // ---------------------------------------------------------------------------
 
 const IDLE_MS = 30_000;
@@ -1177,12 +1178,21 @@ function acquire(
     entry = { session, dispose, refs: 0, idle: null };
     registry.set(desc.key, entry);
   }
+  retain(desc.key);
+  return entry.session;
+}
+
+/** Hold an existing registry entry independently of the descriptor consumer.
+ *  The displayed dock keeps this second reference while its replacement is
+ *  loading, so the old tree cannot hit the idle timeout underneath it. */
+function retain(key: string): void {
+  const entry = registry.get(key);
+  if (!entry) return;
   if (entry.idle !== null) {
     clearTimeout(entry.idle);
     entry.idle = null;
   }
   entry.refs++;
-  return entry.session;
 }
 
 function release(key: string): void {
@@ -1198,31 +1208,49 @@ function release(key: string): void {
 
 /**
  * Track the active Ide session for a reactive descriptor. Acquires the
- * session for the current descriptor (reusing a warm one), releases it when
- * the descriptor changes or the owner is disposed. Returns `null` while no
- * root is selected.
+ * descriptor's session (reusing a warm one), keeps the previous same-server
+ * session displayed until its replacement settles, and releases both refs
+ * when they are no longer needed. Returns `null` while no root is selected.
  */
 export function useIdeSession(
   workspace: BlitWorkspace,
   descriptor: Accessor<IdeSessionDescriptor | null>,
 ): Accessor<IdeSession | null> {
-  let heldKey: string | null = null;
+  type HeldSession = { key: string; session: IdeSession };
+  let candidateKey: string | null = null;
 
-  // A memo, not an effect: it runs eagerly (so the session exists on first
-  // read) and returns the session directly. The acquire/release ref-counting
-  // is the side effect, guarded by `heldKey` so it fires only on key change —
-  // when the key is unchanged we return the previous session untouched.
-  const session = createMemo<IdeSession | null>((prev) => {
+  // Acquire the descriptor's session immediately so its fs/git state can load
+  // in the background. This is separate from the session displayed below: a
+  // terminal focus change usually resolves to the same root, and replacing
+  // the rendered session with its initial "Opening..." state made the whole
+  // left dock blink even though its eventual contents were unchanged.
+  const candidate = createMemo<HeldSession | null>((prev) => {
     const desc = descriptor();
     const nextKey = desc?.key ?? null;
-    if (nextKey === heldKey) return prev ?? null;
-    if (heldKey !== null) release(heldKey);
-    heldKey = nextKey;
-    return desc ? acquire(workspace, desc) : null;
+    if (nextKey === candidateKey) return prev ?? null;
+    if (candidateKey !== null) release(candidateKey);
+    candidateKey = nextKey;
+    return desc ? { key: desc.key, session: acquire(workspace, desc) } : null;
+  }, null);
+
+  let displayedKey: string | null = null;
+  const session = createMemo<IdeSession | null>((previous) => {
+    const next = candidate();
+    const selected = selectIdeSessionForDisplay(
+      previous,
+      next?.session ?? null,
+    );
+    if (selected === previous) return previous;
+
+    if (displayedKey !== null) release(displayedKey);
+    displayedKey = selected ? (next?.key ?? null) : null;
+    if (displayedKey !== null) retain(displayedKey);
+    return selected;
   }, null);
 
   onCleanup(() => {
-    if (heldKey !== null) release(heldKey);
+    if (candidateKey !== null) release(candidateKey);
+    if (displayedKey !== null) release(displayedKey);
   });
 
   return session;
