@@ -1783,7 +1783,7 @@ function WorkspaceScreen(props: {
         setActiveTile(null);
         setActiveLayout(fromHash);
       } else if (!fromHash && activeLayout()) {
-        setActiveLayout(null);
+        exitBspLayout();
       }
     };
     window.addEventListener("hashchange", onHashChange);
@@ -3244,6 +3244,26 @@ function WorkspaceScreen(props: {
     );
   });
 
+  /** Leave BSP without dropping the focused surface back into the preview
+   *  panel. Terminal focus already lives in BlitWorkspace, but surface focus
+   *  is derived from the BSP assignment while the container is mounted. Move
+   *  it into the non-BSP focus slot before clearing assignments so the new
+   *  foreground view mounts, offers its full size, and survives the old BSP
+   *  view's resize withdrawal. */
+  function exitBspLayout() {
+    if (inBsp()) {
+      const surface = bspFocusedSurface();
+      if (surface) {
+        setActiveTile(null);
+        focusSurfaceById(surface.surfaceId, surface.connectionId);
+      } else {
+        focusSurfaceById(null);
+      }
+    }
+    setLayoutAssignments(null);
+    setActiveLayout(null);
+  }
+
   function switchSession(sessionId: SessionId) {
     focusSessionFromUi(sessionId);
     previousFocus = null;
@@ -4421,8 +4441,7 @@ function WorkspaceScreen(props: {
                 setRecentLayouts(loadRecentLayouts());
               }}
               onClearLayout={() => {
-                setLayoutAssignments(null);
-                setActiveLayout(null);
+                exitBspLayout();
                 saveActiveLayout(null);
                 closeOverlay();
               }}
