@@ -1062,13 +1062,14 @@ describe("BlitSurfaceCanvas size mediation", () => {
   it("drops the scaled target once it is given a display size", () => {
     const { surface, targets, maxFps, layOut, restore } = attachTargeting();
 
-    // A pane whose box is measured before the binding's own observer gets
-    // to it — the container was still 0×0 when the effect ran, so
-    // getBoundingClientRect() declined to set a display size and this
-    // observer wins the race.  The view registers a thumbnail's target.
+    // A passive view mounted before its first layout must not briefly ask
+    // for native pixels.  The first real box opens it directly at the
+    // thumbnail target; otherwise a newly-created sidebar card flips between
+    // native and ~512 px every time metadata causes its mount to be rebuilt.
+    expect(targets).toEqual([]);
     layOut(900, 500);
-    expect(targets.at(-1)).toEqual({ width: 1024, height: 512 });
-    expect(maxFps.at(-1)).toBe(15);
+    expect(targets).toEqual([{ width: 1024, height: 512 }]);
+    expect(maxFps).toEqual([15]);
 
     // Now the binding measures and hands over the pane's real size.  This
     // view is a live pane, not a thumbnail: it must give up the target, or
@@ -1145,7 +1146,10 @@ describe("BlitSurfaceCanvas visibility", () => {
       live: false,
     });
 
-    surface.attach(document.createElement("div"));
+    const container = document.createElement("div");
+    container.getBoundingClientRect = () =>
+      ({ width: 400, height: 200, left: 0, top: 0 }) as DOMRect;
+    surface.attach(container);
     expect(subscribes).toEqual([]);
 
     surface.setLive(true);
@@ -1216,7 +1220,10 @@ describe("BlitSurfaceCanvas visibility", () => {
       );
 
     try {
-      surface.attach(document.createElement("div"));
+      const container = document.createElement("div");
+      container.getBoundingClientRect = () =>
+        ({ width: 400, height: 200, left: 0, top: 0 }) as DOMRect;
+      surface.attach(container);
       expect(subscribes).toEqual([{ surfaceId: 7, viewId: "s1" }]);
 
       intersect(false);

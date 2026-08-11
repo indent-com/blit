@@ -957,6 +957,14 @@ export class BlitSurfaceCanvas {
   private _surfaceId: number;
   private _live: boolean;
   private _expectsDisplaySize: boolean;
+  /**
+   * A passive view with a working ResizeObserver must learn its box before
+   * it opens a stream. A newly-created sidebar card is mounted before its
+   * first layout and therefore measures 0x0 synchronously; subscribing at
+   * that point asks for native pixels, only to replace the request with an
+   * octave-rounded thumbnail target in the observer callback.
+   */
+  private _waitForPresentBox = false;
 
   private container: HTMLElement | null = null;
   private canvas: HTMLCanvasElement | null = null;
@@ -1338,12 +1346,19 @@ export class BlitSurfaceCanvas {
    */
   private observePresentBox(container: HTMLElement): void {
     if (typeof ResizeObserver === "undefined") return;
+    // Resizable panes deliberately keep their eager unscaled subscribe: the
+    // framework binding is about to hand them a display size.  Passive views
+    // need a box to derive their fixed encode target.  If layout has not run
+    // yet, serverSubscribe() waits for the observer below instead of briefly
+    // opening a native stream.
+    this._waitForPresentBox = !this._expectsDisplaySize;
     // ResizeObserver runs after layout, but attach() subscribes immediately.
-    // A sidebar card is already laid out by this point, so seed its box
-    // synchronously and make the first subscribe scaled.  Without this every
-    // card briefly asked for a native stream, then replaced it with a
-    // ~512 px stream in the observer callback: two encoder builds and a
-    // visible native↔thumbnail resolution flip on every fresh load.
+    // When the card is already laid out, seed its box synchronously and make
+    // the first subscribe scaled.  Newly inserted cards can still be 0x0;
+    // the guard above leaves those deferred until their first observer box.
+    // Without this every card briefly asked for a native stream, then
+    // replaced it with a ~512 px stream in the observer callback: two encoder
+    // builds and a visible native↔thumbnail resolution flip on every load.
     //
     // Do not do this for a resizable pane.  Its binding calls setDisplaySize
     // immediately after attach; keeping the initial request unscaled avoids
@@ -1359,11 +1374,19 @@ export class BlitSurfaceCanvas {
       const entry = entries[entries.length - 1];
       const box = entry && devicePixelBox(entry);
       if (!box) return;
+      const firstBox = this._presentBox === null;
       this._presentBox = box;
-      // Ask the server for a stream sized to the new box.  Quantised, so a
-      // drag re-asks only on an octave boundary — each change costs an
-      // encoder rebuild and a keyframe.
-      this.refreshScaledTarget();
+      // subscribe() has already installed the store listeners.  A passive
+      // mount whose synchronous box was 0x0 stopped at serverSubscribe();
+      // now that the request can be scaled correctly, open it exactly once.
+      if (firstBox && !this._subscribedSurface) {
+        this.serverSubscribe();
+      } else {
+        // Ask the server for a stream sized to the new box.  Quantised, so a
+        // drag re-asks only on an octave boundary — each change costs an
+        // encoder rebuild and a keyframe.
+        this.refreshScaledTarget();
+      }
       // Redraw only when the box crosses an octave.  The reduction is
       // quantised, so most of a dock-grip drag lands on the same chain and
       // there is nothing new to show.
@@ -1885,6 +1908,7 @@ export class BlitSurfaceCanvas {
       !this._isIntersecting ||
       !conn ||
       !store?.canDecodeVideo ||
+      (this._waitForPresentBox && !this._presentBox) ||
       this._subscribedSurface
     ) {
       return;
