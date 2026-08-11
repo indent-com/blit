@@ -128,6 +128,8 @@ export interface BlitConnectionSnapshot {
   supportsRestart: boolean;
   supportsCopyRange: boolean;
   supportsCompositor: boolean;
+  /** Server accepts direct touchscreen contacts for Wayland surfaces. */
+  supportsSurfaceTouch: boolean;
   supportsAudio: boolean;
   supportsFsSync: boolean;
   /** Server advertises `FEATURE_GIT` (git introspection, docs/git.md). */
@@ -352,6 +354,15 @@ export const C2S_SURFACE_DRAG_DROP = 0x38;
 /** Drag aborted before a drop (source read failed, session dangled):
  *  opcode only. */
 export const C2S_SURFACE_DRAG_CANCEL = 0x39;
+/** Direct touchscreen contacts. One message is one `wl_touch.frame`:
+ * [0x3A][surface_id:2][phase:1][count:1][id:4,x_x100:4,y_x100:4]*. */
+export const C2S_SURFACE_TOUCH = 0x3a;
+export const SURFACE_TOUCH_DOWN = 0;
+export const SURFACE_TOUCH_UP = 1;
+export const SURFACE_TOUCH_MOTION = 2;
+export const SURFACE_TOUCH_CANCEL = 3;
+export const SURFACE_TOUCH_ENABLE = 4;
+export const SURFACE_TOUCH_DISABLE = 5;
 export const S2C_SURFACE_CREATED = 0x20;
 export const S2C_SURFACE_DESTROYED = 0x21;
 export const S2C_SURFACE_FRAME = 0x22;
@@ -438,6 +449,8 @@ export const FEATURE_PTY_DEADLINE = 1 << 16;
  *  scrolled client and reports it with {@link S2C_SCROLL_OFFSET}, and
  *  accepts the relative {@link C2S_SCROLL_BY} that goes with it. */
 export const FEATURE_SCROLL_BY = 1 << 17;
+/** Direct browser touch contacts delivered through core Wayland `wl_touch`. */
+export const FEATURE_SURFACE_TOUCH = 1 << 18;
 
 // -- Common status registry (docs/protocol.md) ------------------------------
 //

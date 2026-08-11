@@ -52,6 +52,7 @@ import {
   SURFACE_MAX_FPS_KEY,
   SURFACE_ZOOM_KEY,
   SURFACE_ZOOM_MODE_KEY,
+  SURFACE_TOUCH_MODE_KEY,
   MIN_SURFACE_ZOOM,
   MAX_SURFACE_ZOOM,
   LEFT_DOCK_WIDTH_KEY,
@@ -72,6 +73,7 @@ import {
   preferredSurfaceMaxFps,
   preferredSurfaceZoom,
   preferredSurfaceZoomMode,
+  preferredSurfaceTouchMode,
   preferredLeftDockWidth,
   preferredPreviewPanelWidth,
   MIN_PREVIEW_PANEL_WIDTH,
@@ -96,6 +98,7 @@ import {
   reorderRoots,
   type Root,
   type SurfaceZoomMode,
+  type SurfaceTouchMode,
 } from "./storage";
 import type { UIScale, Theme } from "./theme";
 import {
@@ -625,6 +628,9 @@ function WorkspaceScreen(props: {
   const [surfaceZoom, setSurfaceZoom] = createSignal(preferredSurfaceZoom());
   const [surfaceZoomMode, setSurfaceZoomMode] = createSignal(
     preferredSurfaceZoomMode(),
+  );
+  const [surfaceTouchMode, setSurfaceTouchMode] = createSignal(
+    preferredSurfaceTouchMode(),
   );
   // Panel chrome in the URL hash (d= open side panels, x= expanded left-dock
   // sections) is authoritative when present; absent keys fall back to
@@ -3186,6 +3192,11 @@ function WorkspaceScreen(props: {
     writeStorage(SURFACE_ZOOM_MODE_KEY, mode);
   }
 
+  function changeSurfaceTouchMode(mode: SurfaceTouchMode) {
+    setSurfaceTouchMode(mode);
+    writeStorage(SURFACE_TOUCH_MODE_KEY, mode);
+  }
+
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
     | ((sessionId: SessionId, targetPaneId: string) => void)
@@ -4098,6 +4109,7 @@ function WorkspaceScreen(props: {
                                 resizable
                                 zoom={surfaceZoom() / 100}
                                 zoomMode={surfaceZoomMode()}
+                                touchMode={surfaceTouchMode()}
                                 style={{
                                   width: "100%",
                                   height: "100%",
@@ -4164,6 +4176,7 @@ function WorkspaceScreen(props: {
                     fontSize={fontSize()}
                     surfaceZoom={surfaceZoom() / 100}
                     surfaceZoomMode={surfaceZoomMode()}
+                    surfaceTouchMode={surfaceTouchMode()}
                     focusedSessionId={wsState().focusedSessionId}
                     lruSessionIds={lru}
                     liveSurfaceKeys={surfaces().map(
@@ -4732,6 +4745,10 @@ function WorkspaceScreen(props: {
               surfaceMaxFps={surfaceMaxFps()}
               surfaceZoom={surfaceZoom()}
               surfaceZoomMode={surfaceZoomMode()}
+              surfaceTouchMode={surfaceTouchMode()}
+              surfaceTouchAvailable={allConnections().some(
+                (connection) => connection.supportsSurfaceTouch,
+              )}
               onAudioBitrateChange={changeAudioBitrate}
               onVideoBandwidthChange={changeVideoBandwidth}
               onVideoSpeedChange={changeVideoSpeed}
@@ -4740,6 +4757,7 @@ function WorkspaceScreen(props: {
               onSurfaceMaxFpsChange={changeSurfaceMaxFps}
               onSurfaceZoomChange={changeSurfaceZoom}
               onSurfaceZoomModeChange={changeSurfaceZoomMode}
+              onSurfaceTouchModeChange={changeSurfaceTouchMode}
               onToggleAudio={toggleAudio}
               onClose={closeOverlay}
             />

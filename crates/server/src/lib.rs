@@ -1,5 +1,7 @@
 use blit_alacritty::{SearchResult as AlacrittySearchResult, TerminalDriver as AlacrittyDriver};
-use blit_compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
+use blit_compositor::{
+    CompositorCommand, CompositorEvent, CompositorHandle, TouchPhase, TouchPoint,
+};
 use blit_remote::{
     C2S_ACK, C2S_CLIENT_FEATURES, C2S_CLIENT_METRICS, C2S_CLIPBOARD_GET, C2S_CLIPBOARD_LIST,
     C2S_CLIPBOARD_SET, C2S_CLOSE, C2S_COPY_RANGE, C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N,
@@ -10,7 +12,7 @@ use blit_remote::{
     C2S_SURFACE_DRAG_LEAVE, C2S_SURFACE_DRAG_MOTION, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT,
     C2S_SURFACE_LIST, C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2,
     C2S_SURFACE_PREEDIT, C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT,
-    C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
+    C2S_SURFACE_TOUCH, C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
     CAPTURE_FORMAT_PNG, CLIENT_FEATURE_SURFACE_TIMESTAMP_SUB_US, CREATE2_HAS_COMMAND,
     CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE, CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS,
     FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE,
@@ -19,15 +21,20 @@ use blit_remote::{
     S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST,
     S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE,
     SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN,
-    build_update_msg, msg_hello, msg_s2c_clipboard_content, msg_s2c_clipboard_list,
-    msg_s2c_clipboard_owner, msg_s2c_scroll_offset, msg_s2c_surface_pointer, msg_s2c_used_rows,
-    msg_surface_activated, msg_surface_app_id, msg_surface_created, msg_surface_destroyed,
-    msg_surface_encoder, msg_surface_frame, msg_surface_frame_precise, msg_surface_resized,
-    msg_surface_title, msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
-    parse_surface_pointer_axis2,
+    SURFACE_TOUCH_CANCEL, SURFACE_TOUCH_DISABLE, SURFACE_TOUCH_DOWN, SURFACE_TOUCH_ENABLE,
+    SURFACE_TOUCH_MOTION, SURFACE_TOUCH_UP, build_update_msg, msg_hello, msg_s2c_clipboard_content,
+    msg_s2c_clipboard_list, msg_s2c_clipboard_owner, msg_s2c_scroll_offset,
+    msg_s2c_surface_pointer, msg_s2c_used_rows, msg_surface_activated, msg_surface_app_id,
+    msg_surface_created, msg_surface_destroyed, msg_surface_encoder, msg_surface_frame,
+    msg_surface_frame_precise, msg_surface_resized, msg_surface_title, msg_term_cwd_reply,
+    parse_surface_drag_drop, parse_surface_drag_enter, parse_surface_pointer_axis2,
+    parse_surface_touch,
 };
 #[cfg(target_os = "linux")]
-use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO, FEATURE_COMPOSITOR};
+use blit_remote::{
+    C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO, FEATURE_COMPOSITOR,
+    FEATURE_SURFACE_TOUCH,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1925,6 +1932,11 @@ struct ClientState {
     /// surfaces.  On disconnect we send synthetic key-up events for each
     /// so modifiers don't stay stuck and keys don't auto-repeat forever.
     pressed_surface_keys: HashSet<u32>,
+    /// This viewer requested direct-touch delivery rather than the browser's
+    /// pointer/gesture emulation.
+    direct_touch_enabled: bool,
+    /// Browser contact identifiers currently down for this connection.
+    surface_touch_ids: HashSet<i32>,
     /// Browser drag-and-drop session in flight (`C2S_SURFACE_DRAG_*`), at
     /// most one per connection: a second ENTER retargets.
     drag_session: Option<DragSession>,
@@ -4043,6 +4055,9 @@ struct Session {
     /// hidden from that browser (which has a native cursor) and mirrored to
     /// every other subscribed viewer.
     surface_pointer: Option<SharedSurfacePointer>,
+    /// Direct touch is an implicit-grab sequence. Only this connection may
+    /// extend it until all of its contacts are up or it cancels.
+    surface_touch_owner: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4167,6 +4182,7 @@ impl Session {
             last_ping: Instant::now(),
             surface_frames_sent: 0,
             surface_pointer: None,
+            surface_touch_owner: None,
         }
     }
 
@@ -4283,6 +4299,18 @@ impl Session {
                 #[cfg(target_os = "linux")]
                 last_audio_liveness_check: None,
             });
+            if self
+                .clients
+                .values()
+                .any(|client| client.direct_touch_enabled)
+                && let Some(compositor) = self.compositor.as_mut()
+            {
+                let _ = compositor
+                    .handle
+                    .command_tx
+                    .send(CompositorCommand::SetTouchEnabled { enabled: true });
+                compositor.handle.wake();
+            }
             // Clients can report their display rates before the first GUI
             // request starts the compositor.  Seed the new output from the
             // current cross-client maximum instead of its hard-coded 60 Hz
@@ -4402,6 +4430,182 @@ impl Session {
         {
             self.hide_surface_pointer(pointer.surface_id);
             self.surface_pointer = None;
+        }
+    }
+
+    fn handle_surface_touch(&mut self, client_id: u64, event: blit_remote::SurfaceTouchEvent) {
+        let Some(enabled) = self
+            .clients
+            .get(&client_id)
+            .map(|client| client.direct_touch_enabled)
+        else {
+            return;
+        };
+        let mut commands = Vec::new();
+
+        match event.phase {
+            SURFACE_TOUCH_ENABLE => {
+                if !enabled {
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.direct_touch_enabled = true;
+                    }
+                    if self
+                        .clients
+                        .values()
+                        .filter(|client| client.direct_touch_enabled)
+                        .count()
+                        == 1
+                    {
+                        commands.push(CompositorCommand::SetTouchEnabled { enabled: true });
+                    }
+                }
+            }
+            SURFACE_TOUCH_DISABLE => {
+                if enabled {
+                    if self.surface_touch_owner == Some(client_id) {
+                        self.surface_touch_owner = None;
+                        commands.push(CompositorCommand::Touch {
+                            owner_id: client_id,
+                            surface_id: event.surface_id,
+                            phase: TouchPhase::Cancel,
+                            contacts: Vec::new(),
+                        });
+                    }
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.direct_touch_enabled = false;
+                        client.surface_touch_ids.clear();
+                    }
+                    if !self
+                        .clients
+                        .values()
+                        .any(|client| client.direct_touch_enabled)
+                    {
+                        commands.push(CompositorCommand::SetTouchEnabled { enabled: false });
+                    }
+                }
+            }
+            SURFACE_TOUCH_CANCEL => {
+                if enabled && self.surface_touch_owner == Some(client_id) {
+                    self.surface_touch_owner = None;
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.surface_touch_ids.clear();
+                    }
+                    commands.push(CompositorCommand::Touch {
+                        owner_id: client_id,
+                        surface_id: event.surface_id,
+                        phase: TouchPhase::Cancel,
+                        contacts: Vec::new(),
+                    });
+                }
+            }
+            SURFACE_TOUCH_DOWN => {
+                if !enabled || event.contacts.is_empty() {
+                    return;
+                }
+                if let Some(owner) = self.surface_touch_owner {
+                    if owner != client_id {
+                        return;
+                    }
+                } else {
+                    self.surface_touch_owner = Some(client_id);
+                }
+                let contacts = self
+                    .clients
+                    .get_mut(&client_id)
+                    .map(|client| {
+                        event
+                            .contacts
+                            .into_iter()
+                            .filter(|point| client.surface_touch_ids.insert(point.identifier))
+                            .map(|point| TouchPoint {
+                                id: point.identifier,
+                                x: point.x,
+                                y: point.y,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if !contacts.is_empty() {
+                    commands.push(CompositorCommand::Touch {
+                        owner_id: client_id,
+                        surface_id: event.surface_id,
+                        phase: TouchPhase::Down,
+                        contacts,
+                    });
+                }
+            }
+            SURFACE_TOUCH_MOTION => {
+                if !enabled || self.surface_touch_owner != Some(client_id) {
+                    return;
+                }
+                let contacts = self
+                    .clients
+                    .get(&client_id)
+                    .map(|client| {
+                        event
+                            .contacts
+                            .into_iter()
+                            .filter(|point| client.surface_touch_ids.contains(&point.identifier))
+                            .map(|point| TouchPoint {
+                                id: point.identifier,
+                                x: point.x,
+                                y: point.y,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if !contacts.is_empty() {
+                    commands.push(CompositorCommand::Touch {
+                        owner_id: client_id,
+                        surface_id: event.surface_id,
+                        phase: TouchPhase::Motion,
+                        contacts,
+                    });
+                }
+            }
+            SURFACE_TOUCH_UP => {
+                if !enabled || self.surface_touch_owner != Some(client_id) {
+                    return;
+                }
+                let (contacts, empty) = self
+                    .clients
+                    .get_mut(&client_id)
+                    .map(|client| {
+                        let contacts = event
+                            .contacts
+                            .into_iter()
+                            .filter(|point| client.surface_touch_ids.remove(&point.identifier))
+                            .map(|point| TouchPoint {
+                                id: point.identifier,
+                                x: point.x,
+                                y: point.y,
+                            })
+                            .collect::<Vec<_>>();
+                        (contacts, client.surface_touch_ids.is_empty())
+                    })
+                    .unwrap_or_default();
+                if !contacts.is_empty() {
+                    commands.push(CompositorCommand::Touch {
+                        owner_id: client_id,
+                        surface_id: event.surface_id,
+                        phase: TouchPhase::Up,
+                        contacts,
+                    });
+                }
+                if empty {
+                    self.surface_touch_owner = None;
+                }
+            }
+            _ => return,
+        }
+
+        if !commands.is_empty()
+            && let Some(compositor) = self.compositor.as_mut()
+        {
+            for command in commands {
+                let _ = compositor.handle.command_tx.send(command);
+            }
+            compositor.handle.wake();
         }
     }
 
@@ -12522,6 +12726,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 surface_max_decode: (0, 0),
                 surface_timestamp_sub_us: false,
                 pressed_surface_keys: HashSet::new(),
+                direct_touch_enabled: false,
+                surface_touch_ids: HashSet::new(),
                 drag_session: None,
                 drag_staging_dir: None,
             },
@@ -12540,7 +12746,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | blit_remote::fs::FEATURE_FS
                 | blit_remote::git::FEATURE_GIT;
             #[cfg(target_os = "linux")]
-            let features = features | FEATURE_COMPOSITOR;
+            let features = features | FEATURE_COMPOSITOR | FEATURE_SURFACE_TOUCH;
             // BLIT_LSP=0 disables the family: the bit is simply not
             // advertised, matching the dispatch gate.
             let mut features = features;
@@ -14037,6 +14243,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 }
                 state.delivery_notify.notify_one();
             }
+            C2S_SURFACE_TOUCH => {
+                if let Some(event) = parse_surface_touch(&data) {
+                    sess.handle_surface_touch(client_id, event);
+                }
+                state.delivery_notify.notify_one();
+            }
             C2S_SURFACE_RESIZE if data.len() >= 9 => {
                 let surface_id = u16::from_le_bytes([data[1], data[2]]);
                 let width = u16::from_le_bytes([data[3], data[4]]);
@@ -14949,8 +15161,36 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         }
         sess.clear_surface_pointer_owner(client_id);
         let client = sess.clients.remove(&client_id);
+        let owned_touch_sequence = sess.surface_touch_owner == Some(client_id);
+        if owned_touch_sequence {
+            sess.surface_touch_owner = None;
+        }
+        let disable_touch = client.as_ref().is_some_and(|client| {
+            client.direct_touch_enabled
+                && !sess
+                    .clients
+                    .values()
+                    .any(|remaining| remaining.direct_touch_enabled)
+        });
         if let Some(cs) = sess.compositor.as_mut() {
             cs.frame_clocks_dirty = true;
+            if owned_touch_sequence {
+                let _ = cs.handle.command_tx.send(CompositorCommand::Touch {
+                    owner_id: client_id,
+                    surface_id: 0,
+                    phase: TouchPhase::Cancel,
+                    contacts: Vec::new(),
+                });
+            }
+            if disable_touch {
+                let _ = cs
+                    .handle
+                    .command_tx
+                    .send(CompositorCommand::SetTouchEnabled { enabled: false });
+            }
+            if owned_touch_sequence || disable_touch {
+                cs.handle.wake();
+            }
         }
         // The departing client may have owned the maximum refresh rate.
         // Recompute after removal so the Wayland output follows the fastest
@@ -15697,6 +15937,8 @@ mod tests {
             surface_max_decode: (0, 0),
             surface_timestamp_sub_us: false,
             pressed_surface_keys: HashSet::new(),
+            direct_touch_enabled: false,
+            surface_touch_ids: HashSet::new(),
             drag_session: None,
             drag_staging_dir: None,
         };
@@ -15706,6 +15948,57 @@ mod tests {
     fn test_client() -> ClientState {
         let (client, _rx) = test_client_with_capacity(0);
         client
+    }
+
+    fn touch_event(
+        phase: u8,
+        identifiers: impl IntoIterator<Item = i32>,
+    ) -> blit_remote::SurfaceTouchEvent {
+        blit_remote::SurfaceTouchEvent {
+            surface_id: 7,
+            phase,
+            contacts: identifiers
+                .into_iter()
+                .map(|identifier| blit_remote::SurfaceTouchPoint {
+                    identifier,
+                    x: 10.0,
+                    y: 20.0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn direct_touch_sequence_has_one_viewer_owner() {
+        let mut sess = Session::new();
+        sess.clients.insert(1, test_client());
+        sess.clients.insert(2, test_client());
+        sess.handle_surface_touch(1, touch_event(SURFACE_TOUCH_ENABLE, []));
+        sess.handle_surface_touch(2, touch_event(SURFACE_TOUCH_ENABLE, []));
+
+        sess.handle_surface_touch(1, touch_event(SURFACE_TOUCH_DOWN, [10, 11]));
+        assert_eq!(sess.surface_touch_owner, Some(1));
+        assert_eq!(
+            sess.clients.get(&1).unwrap().surface_touch_ids,
+            HashSet::from([10, 11])
+        );
+
+        // A second browser cannot splice a contact into the active seat
+        // sequence, even though it enabled direct mode too.
+        sess.handle_surface_touch(2, touch_event(SURFACE_TOUCH_DOWN, [20]));
+        assert!(sess.clients.get(&2).unwrap().surface_touch_ids.is_empty());
+        assert_eq!(sess.surface_touch_owner, Some(1));
+
+        sess.handle_surface_touch(1, touch_event(SURFACE_TOUCH_UP, [10]));
+        assert_eq!(sess.surface_touch_owner, Some(1));
+        sess.handle_surface_touch(1, touch_event(SURFACE_TOUCH_UP, [11]));
+        assert_eq!(sess.surface_touch_owner, None);
+
+        sess.handle_surface_touch(2, touch_event(SURFACE_TOUCH_DOWN, [20]));
+        assert_eq!(sess.surface_touch_owner, Some(2));
+        sess.handle_surface_touch(2, touch_event(SURFACE_TOUCH_CANCEL, []));
+        assert_eq!(sess.surface_touch_owner, None);
+        assert!(sess.clients.get(&2).unwrap().surface_touch_ids.is_empty());
     }
 
     #[test]

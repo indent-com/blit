@@ -21,6 +21,7 @@ import {
   buildClientFeaturesMessage,
   buildSurfacePreeditMessage,
   buildSurfaceDragEnterMessage,
+  buildSurfaceTouchMessage,
 } from "../protocol";
 import {
   C2S_ACK,
@@ -48,6 +49,8 @@ import {
   AXIS_FLAG_SOURCE_KNOWN,
   AXIS_FLAG_STOP,
   CREATE2_WANT_STATUS,
+  C2S_SURFACE_TOUCH,
+  SURFACE_TOUCH_MOTION,
 } from "../types";
 
 const textDecoder = new TextDecoder();
@@ -405,6 +408,27 @@ describe("buildSurfaceAxis2Message", () => {
     });
     expect(read(msg).dxX100).toBe(0);
     expect(read(msg).dyX100).toBe(0);
+  });
+});
+
+describe("buildSurfaceTouchMessage", () => {
+  it("keeps contacts from one browser event in one wire frame", () => {
+    const msg = buildSurfaceTouchMessage(0x1234, SURFACE_TOUCH_MOTION, [
+      { identifier: -7, x: 12.25, y: -3.5 },
+      { identifier: 9, x: 640, y: 480.75 },
+    ]);
+    const view = new DataView(msg.buffer, msg.byteOffset, msg.byteLength);
+    expect(msg).toHaveLength(29);
+    expect(msg[0]).toBe(C2S_SURFACE_TOUCH);
+    expect(view.getUint16(1, true)).toBe(0x1234);
+    expect(msg[3]).toBe(SURFACE_TOUCH_MOTION);
+    expect(msg[4]).toBe(2);
+    expect(view.getInt32(5, true)).toBe(-7);
+    expect(view.getInt32(9, true)).toBe(1225);
+    expect(view.getInt32(13, true)).toBe(-350);
+    expect(view.getInt32(17, true)).toBe(9);
+    expect(view.getInt32(21, true)).toBe(64000);
+    expect(view.getInt32(25, true)).toBe(48075);
   });
 });
 

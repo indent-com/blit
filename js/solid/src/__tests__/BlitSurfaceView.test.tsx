@@ -9,9 +9,10 @@ const mockAttach = vi.fn();
 const mockDispose = vi.fn();
 const mockSetDisplaySize = vi.fn();
 const mockRequestResize = vi.fn();
+const mockSetTouchMode = vi.fn();
 
 // The real canvas decodes video and probes WebCodecs; the view's contract
-// with it is just these four calls.
+// with it is just these calls.
 vi.mock("@blit-sh/core", async () => {
   const actual =
     await vi.importActual<typeof import("@blit-sh/core")>("@blit-sh/core");
@@ -27,6 +28,7 @@ vi.mock("@blit-sh/core", async () => {
       setConnectionId = vi.fn();
       setSurfaceId = vi.fn();
       setLive = vi.fn();
+      setTouchMode = mockSetTouchMode;
     },
   };
 });
@@ -52,6 +54,7 @@ const PANE_CSS_H = 600;
 function renderView(
   zoom: () => number | undefined,
   zoomMode: () => "relative" | "exact" | undefined = () => undefined,
+  touchMode: () => "pointer" | "direct" | undefined = () => undefined,
 ) {
   return render(() => (
     <BlitWorkspaceProvider workspace={workspace}>
@@ -61,6 +64,7 @@ function renderView(
         resizable
         zoom={zoom()}
         zoomMode={zoomMode()}
+        touchMode={touchMode()}
       />
     </BlitWorkspaceProvider>
   ));
@@ -89,6 +93,7 @@ describe("BlitSurfaceView zoom", () => {
     vi.restoreAllMocks();
     mockSetDisplaySize.mockClear();
     mockRequestResize.mockClear();
+    mockSetTouchMode.mockClear();
   });
 
   it("asks the compositor for DPI × zoom while keeping the pane's pixels", () => {
@@ -106,6 +111,17 @@ describe("BlitSurfaceView zoom", () => {
     expect(mockSetDisplaySize).toHaveBeenLastCalledWith(800, 600, 120, 120);
     vi.advanceTimersByTime(50);
     expect(mockRequestResize).toHaveBeenLastCalledWith(800, 600, 120);
+  });
+
+  it("updates direct touch mode without remounting the canvas", () => {
+    const [touchMode, setTouchMode] = createSignal<"pointer" | "direct">(
+      "direct",
+    );
+    renderView(() => 1, () => undefined, touchMode);
+    expect(mockSetTouchMode).toHaveBeenLastCalledWith("direct");
+
+    setTouchMode("pointer");
+    expect(mockSetTouchMode).toHaveBeenLastCalledWith("pointer");
   });
 
   it("treats an absent zoom as 100%", () => {

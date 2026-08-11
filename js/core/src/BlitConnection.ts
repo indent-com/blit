@@ -20,6 +20,7 @@ import {
   FEATURE_KILL_MODE,
   FEATURE_RESIZE_BATCH,
   FEATURE_SCROLL_BY,
+  FEATURE_SURFACE_TOUCH,
   FEATURE_RESTART,
   statusText,
   S2C_AUDIO_FRAME,
@@ -58,6 +59,8 @@ import {
   S2C_USED_ROWS,
   S2C_SCROLL_OFFSET,
   C2S_PING,
+  SURFACE_TOUCH_ENABLE,
+  SURFACE_TOUCH_DISABLE,
 } from "./types";
 import {
   buildCloseMessage,
@@ -102,6 +105,8 @@ import {
   buildClientFeaturesMessage,
   buildAudioSubscribeMessage,
   buildAudioUnsubscribeMessage,
+  buildSurfaceTouchMessage,
+  type SurfaceTouchPoint,
 } from "./protocol";
 import { AudioPlayer } from "./AudioPlayer";
 import { SurfaceStore } from "./SurfaceStore";
@@ -760,6 +765,9 @@ export class BlitConnection {
   private fsNonceCounter = 0;
   private gitLogIdCounter = 0;
   private features = 0;
+  /** Mounted direct-touch canvases sharing this transport. The server sees
+   * one virtual touchscreen capability while this count is non-zero. */
+  private surfaceTouchUsers = 0;
   private disposed = false;
   /** Per-session, per-view size registry for computing minimum resize. */
   private viewSizes = new Map<
@@ -910,6 +918,7 @@ export class BlitConnection {
       supportsRestart: false,
       supportsCopyRange: false,
       supportsCompositor: false,
+      supportsSurfaceTouch: false,
       supportsAudio: false,
       supportsFsSync: false,
       supportsGit: false,
@@ -3335,6 +3344,55 @@ export class BlitConnection {
     );
   }
 
+  get supportsSurfaceTouch(): boolean {
+    return (this.features & FEATURE_SURFACE_TOUCH) !== 0;
+  }
+
+  /** Keep the compositor's virtual touchscreen capability present while at
+   * least one mounted view is configured for direct touch. */
+  acquireSurfaceTouch(): void {
+    this.surfaceTouchUsers++;
+    if (this.surfaceTouchUsers === 1) this.syncSurfaceTouchCapability();
+  }
+
+  releaseSurfaceTouch(): void {
+    if (this.surfaceTouchUsers === 0) return;
+    this.surfaceTouchUsers--;
+    if (
+      this.surfaceTouchUsers === 0 &&
+      this.transport.status === "connected" &&
+      this.supportsSurfaceTouch
+    ) {
+      this.transport.send(
+        buildSurfaceTouchMessage(0, SURFACE_TOUCH_DISABLE),
+      );
+    }
+  }
+
+  private syncSurfaceTouchCapability(): void {
+    if (
+      this.surfaceTouchUsers === 0 ||
+      this.transport.status !== "connected" ||
+      !this.supportsSurfaceTouch
+    )
+      return;
+    this.transport.send(buildSurfaceTouchMessage(0, SURFACE_TOUCH_ENABLE));
+  }
+
+  sendSurfaceTouch(
+    surfaceId: number,
+    phase: number,
+    contacts: readonly SurfaceTouchPoint[] = [],
+  ): void {
+    if (
+      this.transport.status !== "connected" ||
+      !this.supportsSurfaceTouch ||
+      this.surfaceTouchUsers === 0
+    )
+      return;
+    this.transport.send(buildSurfaceTouchMessage(surfaceId, phase, contacts));
+  }
+
   sendSurfaceDragEnter(
     surfaceId: number,
     x: number,
@@ -4355,6 +4413,7 @@ export class BlitConnection {
           return;
         }
         this.features = features;
+        this.syncSurfaceTouchCapability();
         this.hasReceivedList = false;
         // S2C_HELLO is the first message on every new server connection.
         // Reset all surfaces and close stale sessions — the server's
@@ -4393,6 +4452,7 @@ export class BlitConnection {
           supportsRestart: (features & FEATURE_RESTART) !== 0,
           supportsCopyRange: (features & FEATURE_COPY_RANGE) !== 0,
           supportsCompositor: (features & FEATURE_COMPOSITOR) !== 0,
+          supportsSurfaceTouch: (features & FEATURE_SURFACE_TOUCH) !== 0,
           supportsAudio: (features & FEATURE_AUDIO) !== 0,
           supportsFsSync: (features & FEATURE_FS) !== 0,
           supportsGit: (features & FEATURE_GIT) !== 0,

@@ -79,6 +79,7 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 | `0x37` | `SURFACE_DRAG_LEAVE`    | `[surface_id:2]` — the drag left the surface                                                                                                                                                                                                     |
 | `0x38` | `SURFACE_DRAG_DROP`     | `[surface_id:2][x:2][y:2][item_count:2][items]` — complete the drop; item is `[mime_len:2][mime][name_len:2][name][data_len:4][data]`, see [Drag and drop](#drag-and-drop)                                                                       |
 | `0x39` | `SURFACE_DRAG_CANCEL`   | _(empty)_ — abort the drag (Escape / drag left the window)                                                                                                                                                                                       |
+| `0x3A` | `SURFACE_TOUCH`         | `[surface_id:2][phase:1][contact_count:1][contacts…]`; contact is `[identifier:4 i32][x_x100:4 i32][y_x100:4 i32]`, see [Direct touch](#direct-touch)                                                                                              |
 | `0x40` | `FS_SYNC`               | `[nonce:2][flags:2][latency_ms:2][inline_max:4][path_len:2][path:N]` + `[exclude_len:2][exclude:M]` if `EXCLUDE` + `[src_pty_id:2]` if `FROM_PTY`; `STAGING` roots the sync at the drag staging dir, see [Drag and drop](#drag-and-drop)         |
 | `0x41` | `FS_STOP`               | `[sync_id:2]`                                                                                                                                                                                                                                    |
 | `0x42` | `FS_ACK`                | `[sync_id:2][update_id:4]` — cumulative                                                                                                                                                                                                          |
@@ -238,6 +239,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 15  | `KILL_MODE`     | `KILL`/`CLOSE` reach the process group; `KILL` takes `flags`    |
 | 16  | `PTY_DEADLINE`  | `C2S_DEADLINE`, `CREATE2(HAS_DEADLINE)`, and `EXITED.reason`    |
 | 17  | `SCROLL_BY`     | Scrollback holds still: `S2C_SCROLL_OFFSET` and `C2S_SCROLL_BY` |
+| 18  | `SURFACE_TOUCH` | Server accepts direct contacts and exposes `wl_seat.touch`     |
 
 Bits 11 through 13 are held for the extension, channel, and process families
 under review in [#167](https://github.com/indent-com/blit/pull/167) and
@@ -607,6 +609,32 @@ The source matters more than it looks. `axis_source`'s zero value _is_ `wheel`, 
 The browser sends the stop after an idle gap deliberately longer than the window a toolkit will regress a fling velocity from — Chromium's is `kFlingStartTimeoutMs`, 200ms — so that macOS's momentum tail does not get a second one grafted onto it, and so that pausing mid-gesture with fingers still down does not fling at the speed you were going before you stopped. Touch drags do want kinetic scrolling and are unaffected: they end their sequence on `touchend` instead of waiting out the timer.
 
 `wl_pointer.axis` carries the distance in surface-local pixels, as the protocol specifies and as Mutter emits — with one exception. Chromium reads that value as detents, dividing by a hardcoded `kAxisValueScale = 10` and multiplying by `kWheelDelta = 120` for every source including `finger`, then handing the result to Blink as precise pixels; a pixel-valued axis scrolls a Chromium or Electron window exactly twelve times too far. The compositor recognises those clients by the runtime payload beside their executable and gives them the same distance in detent units — ten per detent, the convention Weston established and Mutter still emits for wheels. GTK, which reads the value as `GDK_SCROLL_UNIT_SURFACE` pixels, and winit, which hands it to Alacritty as a `PixelDelta`, keep pixels. `v120_*` is never rescaled: its unit is unambiguous and every toolkit agrees on it.
+
+### Direct touch
+
+`C2S_SURFACE_TOUCH` (`0x3A`) is opt-in through an `ENABLE` control message and
+requires feature bit 18. Phases are 0 down, 1 up, 2 motion, 3 cancel, 4 enable,
+and 5 disable. Enable, disable, and cancel carry zero contacts. Contact
+coordinates are signed, multiplied by 100, and use the composited-frame pixel
+space; the compositor applies the same frame-to-logical transform as pointer
+input. One contact-bearing transport message becomes one `wl_touch.frame`,
+preserving browser `TouchEvent` atomicity; cancel is terminal and needs no
+frame.
+
+Down binds a contact to the surface hit at that point. Later motion and up stay
+on that surface, matching Wayland's implicit grab even when the contact crosses
+a popup or subsurface boundary. The down serial also authorizes
+`wl_data_device.start_drag`, so a touch-started drag follows that contact until
+up. If its target unmaps, the viewer disconnects, or direct mode is disabled,
+the compositor emits `wl_touch.cancel` for the sequence.
+
+Only one connection owns a live direct-touch sequence. Another viewer's down
+is ignored until the owner raises its last contact or cancels; this prevents
+independent browsers from splicing contacts into one Wayland seat. The seat's
+touch capability is advertised while at least one connection has direct mode
+enabled. Pointer gestures remain the default, and touch input falls back to
+that mapping when the feature bit is absent. Trackpad wheel events and pen
+pointer events are unaffected.
 
 ## Connection lifecycle
 

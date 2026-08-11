@@ -1,6 +1,10 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import { BlitSurfaceCanvas } from "@blit-sh/core";
-import type { BlitSurface, ConnectionId } from "@blit-sh/core";
+import type {
+  BlitSurface,
+  ConnectionId,
+  SurfaceTouchMode,
+} from "@blit-sh/core";
 import { useRequiredBlitWorkspace } from "./BlitContext";
 
 export interface BlitSurfaceViewProps {
@@ -10,6 +14,8 @@ export interface BlitSurfaceViewProps {
   style?: React.CSSProperties;
   /** Render cached frames without owning a server stream when false. */
   live?: boolean;
+  /** How touchscreen contacts are delivered. Defaults to pointer emulation. */
+  touchMode?: SurfaceTouchMode;
 }
 
 export interface BlitSurfaceViewHandle {
@@ -21,7 +27,7 @@ export const BlitSurfaceView = forwardRef<
   BlitSurfaceViewHandle,
   BlitSurfaceViewProps
 >(function BlitSurfaceView(
-  { connectionId, surfaceId, className, style, live },
+  { connectionId, surfaceId, className, style, live, touchMode },
   ref,
 ) {
   const workspace = useRequiredBlitWorkspace();
@@ -45,6 +51,7 @@ export const BlitSurfaceView = forwardRef<
       connectionId,
       surfaceId,
       live,
+      touchMode,
     });
     surface.attach(container);
     canvasRef.current = surface;
@@ -52,7 +59,7 @@ export const BlitSurfaceView = forwardRef<
       surface.dispose();
       canvasRef.current = null;
     };
-  }, [workspace, connectionId, surfaceId, live]);
+  }, [workspace, connectionId, surfaceId, live, touchMode]);
 
   return (
     <div

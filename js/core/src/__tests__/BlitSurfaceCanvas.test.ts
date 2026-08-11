@@ -12,7 +12,7 @@ import type { BlitWorkspace } from "../BlitWorkspace";
 import { BlitActivityStore } from "../activity";
 import type { FsUploadOptions } from "../fs";
 import type { BlitSurface } from "../types";
-import type { SurfaceAxisEvent } from "../protocol";
+import type { SurfaceAxisEvent, SurfaceTouchPoint } from "../protocol";
 import {
   SURFACE_POINTER_DOWN,
   SURFACE_POINTER_MOVE,
@@ -25,6 +25,10 @@ import {
   AXIS_SOURCE_WHEEL,
   CODEC_SUPPORT_AV1,
   CODEC_SUPPORT_AV1_444,
+  SURFACE_TOUCH_CANCEL,
+  SURFACE_TOUCH_DOWN,
+  SURFACE_TOUCH_MOTION,
+  SURFACE_TOUCH_UP,
 } from "../types";
 
 /** Minimal workspace stub: no connection, so the canvas never subscribes
@@ -396,7 +400,11 @@ describe("codec support demotion", () => {
 
 /** Captures the scroll messages a canvas emits. */
 function attachScrolling(
-  opts: { frame?: [number, number]; css?: [number, number] } = {},
+  opts: {
+    frame?: [number, number];
+    css?: [number, number];
+    directTouch?: boolean;
+  } = {},
 ) {
   const [fw, fh] = opts.frame ?? [800, 600];
   const [cw, ch] = opts.css ?? [800, 600];
@@ -404,7 +412,26 @@ function attachScrolling(
   const keys: { keycode: number; pressed: boolean }[] = [];
   const pointers: { type: number; button: number; x: number; y: number }[] = [];
   const inputOrder: ("pointer" | "axis")[] = [];
+  const touches: {
+    surfaceId: number;
+    phase: number;
+    contacts: readonly SurfaceTouchPoint[];
+  }[] = [];
+  let touchAcquires = 0;
+  let touchReleases = 0;
   const conn = {
+    supportsSurfaceTouch: opts.directTouch === true,
+    acquireSurfaceTouch: () => touchAcquires++,
+    releaseSurfaceTouch: () => touchReleases++,
+    sendSurfaceTouch: (
+      surfaceId: number,
+      phase: number,
+      contacts: readonly SurfaceTouchPoint[] = [],
+    ) => touches.push({
+      surfaceId,
+      phase,
+      contacts: contacts.map((point) => ({ ...point })),
+    }),
     sendSurfaceAxis2: (_id: number, ev: SurfaceAxisEvent) => {
       inputOrder.push("axis");
       sent.push(ev);
@@ -447,6 +474,7 @@ function attachScrolling(
     workspace,
     connectionId: "conn-1" as never,
     surfaceId: 7,
+    touchMode: opts.directTouch ? "direct" : "pointer",
   });
   const container = document.createElement("div");
   surface.attach(container);
@@ -468,7 +496,22 @@ function attachScrolling(
     // inside the idle window so the gesture is still open.
     vi.advanceTimersByTime(FRAME_MS);
   };
-  return { surface, canvas, sent, keys, pointers, inputOrder, wheel };
+  return {
+    surface,
+    canvas,
+    sent,
+    keys,
+    pointers,
+    touches,
+    get touchAcquires() {
+      return touchAcquires;
+    },
+    get touchReleases() {
+      return touchReleases;
+    },
+    inputOrder,
+    wheel,
+  };
 }
 
 /** One animation frame, as the fake clock models requestAnimationFrame. */
@@ -1010,6 +1053,62 @@ describe("BlitSurfaceCanvas touch", () => {
       { type: SURFACE_POINTER_UP, button: 2, x: 40, y: 40 },
     ]);
     surface.dispose();
+  });
+
+  it("forwards simultaneous contacts in direct mode without pointer gestures", () => {
+    const harness = attachScrolling({ directTouch: true });
+    const { surface, canvas, touches, pointers, sent } = harness;
+    const second = { identifier: 8, clientX: 240, clientY: 160 };
+
+    // iPadOS may still emit pointer events first. Direct mode ignores those
+    // and takes the authoritative contact set from TouchEvent.
+    canvas.dispatchEvent(pointerEvent("pointerdown", 40, 40));
+    canvas.dispatchEvent(touchEvent("touchstart", [FINGER, second]));
+    canvas.dispatchEvent(
+      touchEvent("touchmove", [
+        { identifier: 1, clientX: 50, clientY: 70 },
+        { identifier: 8, clientX: 260, clientY: 180 },
+      ]),
+    );
+    canvas.dispatchEvent(touchEvent("touchend", [FINGER]));
+    canvas.dispatchEvent(
+      touchEvent("touchend", [second], { ongoing: false }),
+    );
+
+    expect(harness.touchAcquires).toBe(1);
+    expect(touches.map((event) => event.phase)).toEqual([
+      SURFACE_TOUCH_DOWN,
+      SURFACE_TOUCH_MOTION,
+      SURFACE_TOUCH_UP,
+      SURFACE_TOUCH_UP,
+    ]);
+    expect(touches[0].contacts).toEqual([
+      { identifier: 1, x: 40, y: 40 },
+      { identifier: 8, x: 240, y: 160 },
+    ]);
+    expect(touches[1].contacts).toEqual([
+      { identifier: 1, x: 50, y: 70 },
+      { identifier: 8, x: 260, y: 180 },
+    ]);
+    expect(pointers).toHaveLength(0);
+    expect(sent).toHaveLength(0);
+
+    surface.dispose();
+    expect(harness.touchReleases).toBe(1);
+  });
+
+  it("cancels a live direct sequence when switching back to pointer mode", () => {
+    const harness = attachScrolling({ directTouch: true });
+    harness.canvas.dispatchEvent(touchEvent("touchstart", [FINGER]));
+
+    harness.surface.setTouchMode("pointer");
+
+    expect(harness.touches.map((event) => event.phase)).toEqual([
+      SURFACE_TOUCH_DOWN,
+      SURFACE_TOUCH_CANCEL,
+    ]);
+    expect(harness.touchReleases).toBe(1);
+    harness.surface.dispose();
   });
 });
 

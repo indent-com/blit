@@ -43,6 +43,7 @@ import {
   C2S_SURFACE_DRAG_LEAVE,
   C2S_SURFACE_DRAG_DROP,
   C2S_SURFACE_DRAG_CANCEL,
+  C2S_SURFACE_TOUCH,
   C2S_AUDIO_SUBSCRIBE,
   C2S_AUDIO_UNSUBSCRIBE,
   CREATE2_HAS_SRC_PTY,
@@ -683,6 +684,38 @@ export function buildSurfaceAxis2Message(
   v.setInt32(8, clampI32(ev.dy * 100), true);
   v.setInt16(12, clampI16(ev.v120x), true);
   v.setInt16(14, clampI16(ev.v120y), true);
+  return msg;
+}
+
+export interface SurfaceTouchPoint {
+  identifier: number;
+  /** Horizontal position in the composited frame's pixel space. */
+  x: number;
+  /** Vertical position in the composited frame's pixel space. */
+  y: number;
+}
+
+/** Build one direct-touch event. Its message boundary becomes
+ * `wl_touch.frame`, preserving contacts that changed together. */
+export function buildSurfaceTouchMessage(
+  surfaceId: number,
+  phase: number,
+  contacts: readonly SurfaceTouchPoint[] = [],
+): Uint8Array {
+  const count = Math.min(255, contacts.length);
+  const msg = new Uint8Array(5 + count * 12);
+  const view = new DataView(msg.buffer);
+  msg[0] = C2S_SURFACE_TOUCH;
+  view.setUint16(1, surfaceId, true);
+  msg[3] = phase;
+  msg[4] = count;
+  for (let i = 0; i < count; i++) {
+    const point = contacts[i]!;
+    const offset = 5 + i * 12;
+    view.setInt32(offset, clampI32(point.identifier), true);
+    view.setInt32(offset + 4, clampI32(point.x * 100), true);
+    view.setInt32(offset + 8, clampI32(point.y * 100), true);
+  }
   return msg;
 }
 

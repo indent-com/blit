@@ -116,6 +116,7 @@ use wayland_server::protocol::wl_shm_pool::WlShmPool;
 use wayland_server::protocol::wl_subcompositor::WlSubcompositor;
 use wayland_server::protocol::wl_subsurface::WlSubsurface;
 use wayland_server::protocol::wl_surface::WlSurface;
+use wayland_server::protocol::wl_touch::{self, WlTouch};
 use wayland_server::backend::ObjectId;
 use wayland_server::{
     Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource,
@@ -686,6 +687,15 @@ pub enum CompositorCommand {
         source: Option<u8>,
         stop: bool,
     },
+    SetTouchEnabled {
+        enabled: bool,
+    },
+    Touch {
+        owner_id: u64,
+        surface_id: u16,
+        phase: TouchPhase,
+        contacts: Vec<TouchPoint>,
+    },
     SurfaceResize {
         surface_id: u16,
         width: u16,
@@ -906,6 +916,21 @@ pub enum CompositorCommand {
         client_id: Option<u64>,
     },
     Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchPhase {
+    Down,
+    Up,
+    Motion,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TouchPoint {
+    pub id: i32,
+    pub x: f64,
+    pub y: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1607,6 +1632,17 @@ struct ClientDragState {
     /// normally again, while the session lives on until the target's
     /// `finish` (or offer destroy) completes the source.
     dropped: bool,
+    /// The direct-touch contact whose down serial started this drag. `None`
+    /// means the existing pointer grab owns it.
+    touch_grab: Option<(u64, i32)>,
+}
+
+struct ActiveTouch {
+    wayland_id: i32,
+    target: WlSurface,
+    target_id: ObjectId,
+    surface_id: u16,
+    down_serial: u32,
 }
 
 /// The target side of a [`ClientDragState`]: one entered surface.
@@ -1928,8 +1964,13 @@ struct Compositor {
     /// devicePixelRatio sent via C2S_SURFACE_RESIZE.
     output_scale_120: u16,
     outputs: Vec<WlOutput>,
+    seats: Vec<WlSeat>,
     keyboards: Vec<WlKeyboard>,
     pointers: Vec<WlPointer>,
+    touches: Vec<WlTouch>,
+    touch_enabled: bool,
+    active_touches: HashMap<(u64, i32), ActiveTouch>,
+    next_touch_id: i32,
     keyboard_keymap_data: Vec<u8>,
     /// Currently depressed (held down) XKB modifier mask.
     mods_depressed: u32,
@@ -3709,6 +3750,25 @@ impl Compositor {
         if let Some(focused) = focused {
             self.leave_pointer_focus(&focused);
         }
+        let loses_touch_target = self.active_touches.values().any(|active| {
+            let mut at = Some(active.target_id.clone());
+            while let Some(id) = at {
+                if &id == surface_id {
+                    return true;
+                }
+                at = self
+                    .surfaces
+                    .get(&id)
+                    .and_then(|surface| surface.parent_surface_id.clone());
+            }
+            false
+        });
+        if loses_touch_target {
+            // wl_touch has one cancel event for the whole sequence. If any
+            // target disappears, retire the sequence rather than leaving a
+            // contact bound to an unmapped wl_surface.
+            self.cancel_touch_owner(None);
+        }
         self.surface_meta.remove(surface_id);
         self.cursor_rgba.remove(surface_id);
         if let Some(ref mut vk) = self.vulkan_renderer {
@@ -3811,11 +3871,27 @@ impl Compositor {
     }
 
     fn cleanup_dead_surfaces(&mut self) {
+        let dead: Vec<ObjectId> = self
+            .surfaces
+            .iter()
+            .filter(|(_, surf)| !surf.wl_surface.is_alive())
+            .map(|(id, _)| id.clone())
+            .collect();
+        if self
+            .active_touches
+            .values()
+            .any(|active| dead.contains(&active.target_id))
+        {
+            self.cancel_touch_owner(None);
+        }
+
         // Purge stale protocol objects from disconnected clients.
         self.fractional_scales.retain(|fs| fs.is_alive());
         self.outputs.retain(|o| o.is_alive());
+        self.seats.retain(|s| s.is_alive());
         self.keyboards.retain(|k| k.is_alive());
         self.pointers.retain(|p| p.is_alive());
+        self.touches.retain(|t| t.is_alive());
         self.data_devices.retain(|d| d.is_alive());
         self.primary_devices.retain(|d| d.is_alive());
         self.relative_pointers.retain(|p| p.is_alive());
@@ -3835,13 +3911,6 @@ impl Compositor {
             .filter_map(|p| p.client().map(|c| c.id()))
             .collect();
         self.axis_scale.retain(|id, _| live.contains(id));
-
-        let dead: Vec<ObjectId> = self
-            .surfaces
-            .iter()
-            .filter(|(_, surf)| !surf.wl_surface.is_alive())
-            .map(|(id, _)| id.clone())
-            .collect();
 
         for proto_id in &dead {
             self.surface_meta.remove(proto_id);
@@ -4135,7 +4204,7 @@ impl Compositor {
             CompositorCommand::PointerMotion { surface_id, x, y } => {
                 // A client-initiated drag owns the pointer: motion drives
                 // the drag session instead of wl_pointer.
-                if self.client_drag_grabbed() {
+                if self.client_pointer_drag_grabbed() {
                     self.client_drag_motion(surface_id, x, y);
                     let _ = self.display_handle.flush_clients();
                     return;
@@ -4260,7 +4329,7 @@ impl Compositor {
                 // A client-initiated drag swallows button input: presses go
                 // nowhere, and the release ends the grab — drop on the
                 // current target, or dnd_cancelled when there is none.
-                if self.client_drag_grabbed() {
+                if self.client_pointer_drag_grabbed() {
                     if !pressed {
                         self.client_drag_release();
                     }
@@ -4430,6 +4499,19 @@ impl Compositor {
                         ptr.frame();
                     }
                 }
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::SetTouchEnabled { enabled } => {
+                self.set_touch_enabled(enabled);
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::Touch {
+                owner_id,
+                surface_id,
+                phase,
+                contacts,
+            } => {
+                self.handle_touch(owner_id, surface_id, phase, &contacts);
                 let _ = self.display_handle.flush_clients();
             }
             CompositorCommand::SurfaceResize {
@@ -5059,6 +5141,216 @@ impl Compositor {
 }
 
 impl Compositor {
+    fn set_touch_enabled(&mut self, enabled: bool) {
+        if self.touch_enabled == enabled {
+            return;
+        }
+        if !enabled {
+            self.cancel_touch_owner(None);
+        }
+        self.touch_enabled = enabled;
+        let mut capabilities = wl_seat::Capability::Keyboard | wl_seat::Capability::Pointer;
+        if enabled {
+            capabilities |= wl_seat::Capability::Touch;
+        }
+        for seat in &self.seats {
+            seat.capabilities(capabilities);
+        }
+    }
+
+    fn allocate_touch_id(&mut self) -> i32 {
+        loop {
+            let id = self.next_touch_id;
+            self.next_touch_id = if id == i32::MAX { 0 } else { id + 1 };
+            if !self
+                .active_touches
+                .values()
+                .any(|active| active.wayland_id == id)
+            {
+                return id;
+            }
+        }
+    }
+
+    fn touch_frame_target(targets: &mut Vec<WlTouch>, touch: &WlTouch) {
+        if !targets.iter().any(|target| target.id() == touch.id()) {
+            targets.push(touch.clone());
+        }
+    }
+
+    fn cancel_touch_owner(&mut self, owner: Option<u64>) {
+        let targets: Vec<WlSurface> = self
+            .active_touches
+            .iter()
+            .filter(|((active_owner, _), _)| owner.map_or(true, |owner| owner == *active_owner))
+            .map(|(_, active)| active.target.clone())
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let cancel_drag = self.client_drag.as_ref().is_some_and(|drag| {
+            drag.touch_grab
+                .is_some_and(|(drag_owner, _)| owner.map_or(true, |owner| owner == drag_owner))
+        });
+        if cancel_drag {
+            self.client_drag_cancel(true);
+        }
+        self.active_touches
+            .retain(|(active_owner, _), _| owner.is_some_and(|owner| owner != *active_owner));
+        for touch in &self.touches {
+            if targets.iter().any(|target| same_client(touch, target)) {
+                touch.cancel();
+            }
+        }
+    }
+
+    fn touch_local_position(
+        &self,
+        surface_id: u16,
+        target_id: &ObjectId,
+        x: f64,
+        y: f64,
+    ) -> Option<(f64, f64)> {
+        let (root_id, x, y) = self.frame_to_surface_tree(surface_id, x, y)?;
+        let (target_root, _) = self.find_toplevel_root(target_id);
+        if root_id != target_root {
+            return None;
+        }
+        let (offset_x, offset_y) = self.surface_absolute_position(target_id);
+        Some((x - f64::from(offset_x), y - f64::from(offset_y)))
+    }
+
+    fn handle_touch(
+        &mut self,
+        owner_id: u64,
+        surface_id: u16,
+        phase: TouchPhase,
+        contacts: &[TouchPoint],
+    ) {
+        if phase == TouchPhase::Cancel {
+            self.cancel_touch_owner(Some(owner_id));
+            return;
+        }
+        if !self.touch_enabled {
+            return;
+        }
+
+        let time = elapsed_ms();
+        let mut framed = Vec::new();
+        for point in contacts {
+            let key = (owner_id, point.id);
+            match phase {
+                TouchPhase::Down => {
+                    if self.active_touches.contains_key(&key) {
+                        continue;
+                    }
+                    // A touch-started DnD installs a seat-wide touch grab.
+                    // New contacts are swallowed until its initiating
+                    // contact lifts, matching a physical compositor.
+                    if self.client_touch_drag_active() {
+                        continue;
+                    }
+                    let Some((target, lx, ly)) = self.drag_target(surface_id, point.x, point.y)
+                    else {
+                        continue;
+                    };
+                    let target_id = target.id();
+
+                    // A touch outside a grabbed popup is spent dismissing the
+                    // popup, just like the pointer press path.
+                    if !self.popup_grab_stack.is_empty()
+                        && !self.popup_grab_stack.contains(&target_id)
+                    {
+                        while let Some(grab_id) = self.popup_grab_stack.pop() {
+                            if let Some(surface) = self.surfaces.get(&grab_id)
+                                && let Some(ref popup) = surface.xdg_popup
+                            {
+                                popup.popup_done();
+                            }
+                            self.unmap_popup_surface(&grab_id);
+                            self.unfocus_popup(&grab_id);
+                        }
+                        continue;
+                    }
+
+                    let recipients: Vec<WlTouch> = self
+                        .touches
+                        .iter()
+                        .filter(|touch| same_client(*touch, &target))
+                        .cloned()
+                        .collect();
+                    if recipients.is_empty() {
+                        continue;
+                    }
+                    let serial = self.next_serial();
+                    let wayland_id = self.allocate_touch_id();
+                    for touch in &recipients {
+                        touch.down(serial, time, &target, wayland_id, lx, ly);
+                        Self::touch_frame_target(&mut framed, touch);
+                    }
+                    self.active_touches.insert(
+                        key,
+                        ActiveTouch {
+                            wayland_id,
+                            target,
+                            target_id,
+                            surface_id,
+                            down_serial: serial,
+                        },
+                    );
+                }
+                TouchPhase::Motion => {
+                    let Some(active) = self.active_touches.get(&key) else {
+                        continue;
+                    };
+                    let wayland_id = active.wayland_id;
+                    let target = active.target.clone();
+                    let target_id = active.target_id.clone();
+                    let active_surface_id = active.surface_id;
+                    if let Some(grabbed) = self.client_touch_drag_contact() {
+                        if grabbed == key {
+                            self.client_drag_motion(active_surface_id, point.x, point.y);
+                        }
+                        continue;
+                    }
+                    let Some((lx, ly)) =
+                        self.touch_local_position(active_surface_id, &target_id, point.x, point.y)
+                    else {
+                        continue;
+                    };
+                    for touch in &self.touches {
+                        if same_client(touch, &target) {
+                            touch.motion(time, wayland_id, lx, ly);
+                            Self::touch_frame_target(&mut framed, touch);
+                        }
+                    }
+                }
+                TouchPhase::Up => {
+                    let Some(active) = self.active_touches.remove(&key) else {
+                        continue;
+                    };
+                    if let Some(grabbed) = self.client_touch_drag_contact() {
+                        if grabbed == key {
+                            self.client_drag_release();
+                        }
+                        continue;
+                    }
+                    let serial = self.next_serial();
+                    for touch in &self.touches {
+                        if same_client(touch, &active.target) {
+                            touch.up(serial, time, active.wayland_id);
+                            Self::touch_frame_target(&mut framed, touch);
+                        }
+                    }
+                }
+                TouchPhase::Cancel => unreachable!(),
+            }
+        }
+        for touch in framed {
+            touch.frame();
+        }
+    }
+
     /// Collect all MIME types available on the current clipboard.
     fn collect_clipboard_mime_types(&self) -> Vec<String> {
         // If a Wayland app owns the selection, use its MIME types.
@@ -6935,7 +7227,7 @@ impl Dispatch<WlOutput, ()> for Compositor {
 // -- wl_seat --
 impl GlobalDispatch<WlSeat, ()> for Compositor {
     fn bind(
-        _: &mut Self,
+        state: &mut Self,
         _: &DisplayHandle,
         _: &Client,
         resource: New<WlSeat>,
@@ -6943,10 +7235,15 @@ impl GlobalDispatch<WlSeat, ()> for Compositor {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let seat = data_init.init(resource, ());
-        seat.capabilities(wl_seat::Capability::Keyboard | wl_seat::Capability::Pointer);
+        let mut capabilities = wl_seat::Capability::Keyboard | wl_seat::Capability::Pointer;
+        if state.touch_enabled {
+            capabilities |= wl_seat::Capability::Touch;
+        }
+        seat.capabilities(capabilities);
         if seat.version() >= 2 {
             seat.name("headless".to_string());
         }
+        state.seats.push(seat);
     }
 }
 
@@ -6954,7 +7251,7 @@ impl Dispatch<WlSeat, ()> for Compositor {
     fn request(
         state: &mut Self,
         _: &Client,
-        _: &WlSeat,
+        resource: &WlSeat,
         request: <WlSeat as Resource>::Request,
         _: &(),
         _: &DisplayHandle,
@@ -7005,9 +7302,11 @@ impl Dispatch<WlSeat, ()> for Compositor {
                 state.pointers.push(ptr);
             }
             Request::GetTouch { id } => {
-                data_init.init(id, ());
+                state.touches.push(data_init.init(id, ()));
             }
-            Request::Release => {}
+            Request::Release => {
+                state.seats.retain(|s| s.id() != resource.id());
+            }
             _ => {}
         }
     }
@@ -7070,17 +7369,20 @@ impl Dispatch<WlPointer, ()> for Compositor {
     }
 }
 
-// -- wl_touch (stub) --
-impl Dispatch<wayland_server::protocol::wl_touch::WlTouch, ()> for Compositor {
+// -- wl_touch --
+impl Dispatch<WlTouch, ()> for Compositor {
     fn request(
-        _: &mut Self,
+        state: &mut Self,
         _: &Client,
-        _: &wayland_server::protocol::wl_touch::WlTouch,
-        _: <wayland_server::protocol::wl_touch::WlTouch as Resource>::Request,
+        resource: &WlTouch,
+        request: <WlTouch as Resource>::Request,
         _: &(),
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
+        if let wl_touch::Request::Release = request {
+            state.touches.retain(|touch| touch.id() != resource.id());
+        }
     }
 }
 
@@ -7636,7 +7938,7 @@ impl Dispatch<WlDataDevice, ()> for Compositor {
                 source,
                 origin,
                 icon,
-                serial: _,
+                serial,
             } => {
                 // Icon surfaces are not mapped or positioned anywhere — a
                 // client that relies on seeing its drag icon gets none.
@@ -7691,6 +7993,13 @@ impl Dispatch<WlDataDevice, ()> for Compositor {
                         origin.id()
                     );
                 }
+                let touch_grab = state
+                    .active_touches
+                    .iter()
+                    .find(|(_, active)| {
+                        active.down_serial == serial && same_client(&active.target, &origin)
+                    })
+                    .map(|(key, _)| *key);
                 state.client_drag = Some(ClientDragState {
                     source,
                     origin,
@@ -7698,6 +8007,7 @@ impl Dispatch<WlDataDevice, ()> for Compositor {
                     target: None,
                     source_actions,
                     dropped: false,
+                    touch_grab,
                 });
             }
             Request::Release => {}
@@ -8175,7 +8485,12 @@ impl Compositor {
 
     /// Convert composited-frame physical coordinates to a hit-tested
     /// surface-local logical position, exactly as `PointerMotion` does.
-    fn drag_target(&self, surface_id: u16, x: f64, y: f64) -> Option<(WlSurface, f64, f64)> {
+    fn frame_to_surface_tree(
+        &self,
+        surface_id: u16,
+        x: f64,
+        y: f64,
+    ) -> Option<(ObjectId, f64, f64)> {
         let (mut x, mut y) =
             if let Some(&(cw, ch, lw, lh)) = self.last_reported_size.get(&surface_id) {
                 let sx = if cw > 0 { lw as f64 / cw as f64 } else { 1.0 };
@@ -8195,7 +8510,13 @@ impl Compositor {
         }
         self.toplevel_surface_ids
             .get(&surface_id)
-            .and_then(|root_id| self.hit_test_surface_at(root_id, x, y))
+            .cloned()
+            .map(|root_id| (root_id, x, y))
+    }
+
+    fn drag_target(&self, surface_id: u16, x: f64, y: f64) -> Option<(WlSurface, f64, f64)> {
+        let (root_id, x, y) = self.frame_to_surface_tree(surface_id, x, y)?;
+        self.hit_test_surface_at(&root_id, x, y)
     }
 
     /// Enter a drag session on the surface under (`x`, `y`), advertising
@@ -8359,8 +8680,21 @@ impl Compositor {
     }
 
     /// Whether pointer input currently belongs to a client drag.
-    fn client_drag_grabbed(&self) -> bool {
-        self.client_drag.as_ref().is_some_and(|drag| !drag.dropped)
+    fn client_pointer_drag_grabbed(&self) -> bool {
+        self.client_drag
+            .as_ref()
+            .is_some_and(|drag| !drag.dropped && drag.touch_grab.is_none())
+    }
+
+    fn client_touch_drag_contact(&self) -> Option<(u64, i32)> {
+        self.client_drag
+            .as_ref()
+            .filter(|drag| !drag.dropped)
+            .and_then(|drag| drag.touch_grab)
+    }
+
+    fn client_touch_drag_active(&self) -> bool {
+        self.client_touch_drag_contact().is_some()
     }
 
     /// Drive the session to the surface under (`x`, `y`): leave the old
@@ -9557,8 +9891,13 @@ fn run_compositor(
         output_refresh_mhz: 60_000,
         output_scale_120: 120,
         outputs: Vec::new(),
+        seats: Vec::new(),
         keyboards: Vec::new(),
         pointers: Vec::new(),
+        touches: Vec::new(),
+        touch_enabled: false,
+        active_touches: HashMap::new(),
+        next_touch_id: 0,
         keyboard_keymap_data: keymap_data,
         mods_depressed: 0,
         mods_locked: 0,

@@ -394,6 +394,21 @@ pub const C2S_SURFACE_DRAG_LEAVE: u8 = 0x37;
 pub const C2S_SURFACE_DRAG_DROP: u8 = 0x38;
 /// Abort the drag (Escape, or the drag left the window): [0x39].  No payload.
 pub const C2S_SURFACE_DRAG_CANCEL: u8 = 0x39;
+/// Direct touchscreen input for a Wayland surface.
+///
+/// `[0x3A][surface_id:2][phase:1][contact_count:1][contacts...]`, where a
+/// contact is `[identifier:4][x_x100:4][y_x100:4]`. Coordinates use the
+/// composited frame's physical pixel space, like [`C2S_SURFACE_POINTER`].
+/// One contact message is one browser `TouchEvent`, so its boundary becomes
+/// one `wl_touch.frame`. Enable/disable/cancel carry no contacts.
+pub const C2S_SURFACE_TOUCH: u8 = 0x3A;
+
+pub const SURFACE_TOUCH_DOWN: u8 = 0;
+pub const SURFACE_TOUCH_UP: u8 = 1;
+pub const SURFACE_TOUCH_MOTION: u8 = 2;
+pub const SURFACE_TOUCH_CANCEL: u8 = 3;
+pub const SURFACE_TOUCH_ENABLE: u8 = 4;
+pub const SURFACE_TOUCH_DISABLE: u8 = 5;
 /// Read clipboard content for a specific MIME type:
 /// [0x2E][mime_len:2][mime:N]
 /// Server responds with S2C_CLIPBOARD_CONTENT (0x25) containing the data.
@@ -765,6 +780,9 @@ pub const FEATURE_PTY_DEADLINE: u32 = 1 << 16;
 /// scrolled client and reports it with [`S2C_SCROLL_OFFSET`], and accepts
 /// the relative [`C2S_SCROLL_BY`] that goes with it.
 pub const FEATURE_SCROLL_BY: u32 = 1 << 17;
+/// Direct browser touch contacts delivered as core Wayland `wl_touch`
+/// events. Pointer-style touch emulation remains available client-side.
+pub const FEATURE_SURFACE_TOUCH: u32 = 1 << 18;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {
@@ -3368,6 +3386,70 @@ pub fn parse_surface_pointer_axis2(data: &[u8]) -> Option<PointerAxisEvent> {
     })
 }
 
+/// One browser touch contact in composited-frame coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceTouchPoint {
+    pub identifier: i32,
+    pub x: f64,
+    pub y: f64,
+}
+
+/// A complete browser `TouchEvent`. The transport message boundary is also
+/// the Wayland frame boundary, so contacts changed together stay atomic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceTouchEvent {
+    pub surface_id: u16,
+    pub phase: u8,
+    pub contacts: Vec<SurfaceTouchPoint>,
+}
+
+const SURFACE_TOUCH_HEADER_LEN: usize = 5;
+const SURFACE_TOUCH_POINT_LEN: usize = 12;
+
+pub fn msg_surface_touch(event: &SurfaceTouchEvent) -> Vec<u8> {
+    let count = event.contacts.len().min(u8::MAX as usize);
+    let mut msg = Vec::with_capacity(SURFACE_TOUCH_HEADER_LEN + count * SURFACE_TOUCH_POINT_LEN);
+    msg.push(C2S_SURFACE_TOUCH);
+    msg.extend_from_slice(&event.surface_id.to_le_bytes());
+    msg.push(event.phase);
+    msg.push(count as u8);
+    for point in event.contacts.iter().take(count) {
+        msg.extend_from_slice(&point.identifier.to_le_bytes());
+        msg.extend_from_slice(&scroll_to_x100(point.x).to_le_bytes());
+        msg.extend_from_slice(&scroll_to_x100(point.y).to_le_bytes());
+    }
+    msg
+}
+
+pub fn parse_surface_touch(data: &[u8]) -> Option<SurfaceTouchEvent> {
+    if data.len() < SURFACE_TOUCH_HEADER_LEN || data[0] != C2S_SURFACE_TOUCH {
+        return None;
+    }
+    let phase = data[3];
+    if phase > SURFACE_TOUCH_DISABLE {
+        return None;
+    }
+    let count = data[4] as usize;
+    let required =
+        SURFACE_TOUCH_HEADER_LEN.checked_add(count.checked_mul(SURFACE_TOUCH_POINT_LEN)?)?;
+    if data.len() < required {
+        return None;
+    }
+    let mut contacts = Vec::with_capacity(count);
+    for bytes in data[SURFACE_TOUCH_HEADER_LEN..required].chunks_exact(SURFACE_TOUCH_POINT_LEN) {
+        contacts.push(SurfaceTouchPoint {
+            identifier: i32::from_le_bytes(bytes[0..4].try_into().ok()?),
+            x: f64::from(i32::from_le_bytes(bytes[4..8].try_into().ok()?)) / 100.0,
+            y: f64::from(i32::from_le_bytes(bytes[8..12].try_into().ok()?)) / 100.0,
+        });
+    }
+    Some(SurfaceTouchEvent {
+        surface_id: u16::from_le_bytes([data[1], data[2]]),
+        phase,
+        contacts,
+    })
+}
+
 /// `scale_120` is the requested presentation scale in 1/120th units:
 /// 60 = 0.5×, 120 = 1×, 180 = 1.5×, 240 = 2×. A value of 0 means
 /// "unspecified" (server defaults to 1×). Values below 120 zoom out by
@@ -4496,6 +4578,51 @@ mod tests {
         assert_eq!(msg.len(), SURFACE_POINTER_AXIS2_LEN);
         assert_eq!(msg[0], C2S_SURFACE_POINTER_AXIS2);
         assert_eq!(parse_surface_pointer_axis2(&msg), Some(ev));
+    }
+
+    #[test]
+    fn surface_touch_round_trips_as_one_frame() {
+        let event = SurfaceTouchEvent {
+            surface_id: 0x1234,
+            phase: SURFACE_TOUCH_MOTION,
+            contacts: vec![
+                SurfaceTouchPoint {
+                    identifier: -7,
+                    x: 12.25,
+                    y: -3.5,
+                },
+                SurfaceTouchPoint {
+                    identifier: 9,
+                    x: 640.0,
+                    y: 480.75,
+                },
+            ],
+        };
+        let msg = msg_surface_touch(&event);
+        assert_eq!(msg[0], C2S_SURFACE_TOUCH);
+        assert_eq!(
+            msg.len(),
+            SURFACE_TOUCH_HEADER_LEN + 2 * SURFACE_TOUCH_POINT_LEN
+        );
+        assert_eq!(parse_surface_touch(&msg), Some(event));
+    }
+
+    #[test]
+    fn surface_touch_rejects_truncation_and_unknown_phases() {
+        let event = SurfaceTouchEvent {
+            surface_id: 1,
+            phase: SURFACE_TOUCH_DOWN,
+            contacts: vec![SurfaceTouchPoint {
+                identifier: 2,
+                x: 3.0,
+                y: 4.0,
+            }],
+        };
+        let msg = msg_surface_touch(&event);
+        assert!(parse_surface_touch(&msg[..msg.len() - 1]).is_none());
+        let mut bad = msg;
+        bad[3] = SURFACE_TOUCH_DISABLE + 1;
+        assert!(parse_surface_touch(&bad).is_none());
     }
 
     #[test]

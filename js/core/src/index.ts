@@ -166,7 +166,10 @@ export {
   getCodecSupport,
   getMaxDecodeSize,
 } from "./BlitSurfaceCanvas";
-export type { BlitSurfaceCanvasOptions } from "./BlitSurfaceCanvas";
+export type {
+  BlitSurfaceCanvasOptions,
+  SurfaceTouchMode,
+} from "./BlitSurfaceCanvas";
 
 export { parseDSL, serializeDSL, leafCount } from "./bsp/dsl";
 export type { BSPNode, BSPSplit, BSPChild, BSPLeaf } from "./bsp/dsl";

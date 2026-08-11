@@ -8,6 +8,10 @@ import {
   AXIS_SOURCE_CONTINUOUS,
   AXIS_SOURCE_FINGER,
   AXIS_SOURCE_WHEEL,
+  SURFACE_TOUCH_DOWN,
+  SURFACE_TOUCH_UP,
+  SURFACE_TOUCH_MOTION,
+  SURFACE_TOUCH_CANCEL,
 } from "./types";
 import type { BlitWorkspace } from "./BlitWorkspace";
 import type { BlitConnection } from "./BlitConnection";
@@ -657,7 +661,12 @@ export interface BlitSurfaceCanvasOptions {
    * SurfaceStore, but never create an encoder themselves.  Defaults to true.
    */
   live?: boolean;
+  /** `pointer` keeps Blit's single-finger click/scroll emulation. `direct`
+   * forwards every touchscreen contact to the Wayland client's `wl_touch`. */
+  touchMode?: SurfaceTouchMode;
 }
+
+export type SurfaceTouchMode = "pointer" | "direct";
 
 // -- Scroll ----------------------------------------------------------------
 //
@@ -1056,6 +1065,8 @@ export class BlitSurfaceCanvas {
   private _surfaceId: number;
   private _live: boolean;
   private _expectsDisplaySize: boolean;
+  private _touchMode: SurfaceTouchMode;
+  private touchCapabilityAcquired = false;
   /**
    * A passive view with a working ResizeObserver must learn its box before
    * it opens a stream. A newly-created sidebar card is mounted before its
@@ -1125,6 +1136,8 @@ export class BlitSurfaceCanvas {
     longPressTimer: ReturnType<typeof setTimeout> | null;
     pointerId?: number;
   } | null = null;
+  /** Browser contact identifiers currently held by direct-touch mode. */
+  private directTouchIds = new Set<number>();
 
   /**
    * When non-null the surface is in resizable mode: the framework binding's
@@ -1336,6 +1349,7 @@ export class BlitSurfaceCanvas {
     this._surfaceId = options.surfaceId;
     this._live = options.live !== false;
     this._expectsDisplaySize = options.resizable === true;
+    this._touchMode = options.touchMode ?? "pointer";
   }
 
   // -----------------------------------------------------------------------
@@ -1481,6 +1495,7 @@ export class BlitSurfaceCanvas {
     this.observeIntersection(container);
     this.subscribe();
     this.attachEvents();
+    this.syncTouchCapability();
   }
 
   /**
@@ -1595,6 +1610,8 @@ export class BlitSurfaceCanvas {
     this.releaseAllKeys();
     this.releaseAllButtons();
     this.endScrollSequence();
+    this.cancelDirectTouches();
+    this.releaseTouchCapability();
     this.setDisplaySize(null);
     this.dragStaging?.stop();
     this.dragStaging = null;
@@ -1624,14 +1641,19 @@ export class BlitSurfaceCanvas {
 
   setConnectionId(connectionId: ConnectionId): void {
     if (this._connectionId === connectionId) return;
+    this.cancelDirectTouches();
+    this.releaseTouchCapability();
     this.clearResizeConstraint();
     this._connectionId = connectionId;
+    this.syncTouchCapability();
     this.resubscribe();
     this.resendDisplaySize();
   }
 
   setSurfaceId(surfaceId: number): void {
     if (this._surfaceId === surfaceId) return;
+    this.cancelDirectTouches();
+    this.cancelPointerTouchGesture();
     this.clearResizeConstraint();
     this._surfaceId = surfaceId;
     this.resubscribe();
@@ -1651,6 +1673,22 @@ export class BlitSurfaceCanvas {
     this.resendDisplaySize();
     const store = this.getConn()?.surfaceStore ?? this._store;
     if (store) this.blitFromStore(store);
+  }
+
+  setTouchMode(mode: SurfaceTouchMode): void {
+    if (this._touchMode === mode) return;
+    if (this._touchMode === "direct") {
+      this.cancelDirectTouches();
+      this.releaseTouchCapability();
+    } else {
+      this.cancelPointerTouchGesture();
+    }
+    this._touchMode = mode;
+    this.syncTouchCapability();
+  }
+
+  get touchMode(): SurfaceTouchMode {
+    return this._touchMode;
   }
 
   /**
@@ -2735,12 +2773,15 @@ export class BlitSurfaceCanvas {
   private surfacePointFromClient(
     clientX: number,
     clientY: number,
+    rounded = true,
   ): { x: number; y: number } | null {
     const g = this.drawnGeometry();
     if (!g) return null;
+    const x = (clientX - g.rect.left - g.dx) * g.sx;
+    const y = (clientY - g.rect.top - g.dy) * g.sy;
     return {
-      x: Math.round((clientX - g.rect.left - g.dx) * g.sx),
-      y: Math.round((clientY - g.rect.top - g.dy) * g.sy),
+      x: rounded ? Math.round(x) : x,
+      y: rounded ? Math.round(y) : y,
     };
   }
 
@@ -2770,6 +2811,95 @@ export class BlitSurfaceCanvas {
       clearTimeout(this.activeTouch.longPressTimer);
     }
     this.activeTouch = null;
+  }
+
+  private directTouchActive(): boolean {
+    return this._touchMode === "direct" && !!this.getConn()?.supportsSurfaceTouch;
+  }
+
+  private syncTouchCapability(): void {
+    if (
+      this.disposed ||
+      !this.container ||
+      this._touchMode !== "direct" ||
+      this.touchCapabilityAcquired
+    )
+      return;
+    const conn = this.getConn();
+    if (!conn) return;
+    conn.acquireSurfaceTouch();
+    this.touchCapabilityAcquired = true;
+  }
+
+  private releaseTouchCapability(): void {
+    if (!this.touchCapabilityAcquired) return;
+    this.getConn()?.releaseSurfaceTouch();
+    this.touchCapabilityAcquired = false;
+  }
+
+  private cancelPointerTouchGesture(): void {
+    const active = this.activeTouch;
+    if (!active) return;
+    if (active.pointerId != null)
+      this.canvas?.releasePointerCapture?.(active.pointerId);
+    if (active.mode === "drag") {
+      this.sendPointerAt(
+        active.lastX,
+        active.lastY,
+        SURFACE_POINTER_UP,
+        0,
+      );
+    } else if (active.mode === "scroll") {
+      this.endScrollSequence();
+    }
+    this.clearActiveTouch();
+  }
+
+  private cancelDirectTouches(): void {
+    if (this.directTouchIds.size === 0) return;
+    this.getConn()?.sendSurfaceTouch(
+      this._surfaceId,
+      SURFACE_TOUCH_CANCEL,
+    );
+    this.directTouchIds.clear();
+  }
+
+  private directTouchPoints(list: TouchList): {
+    identifier: number;
+    x: number;
+    y: number;
+  }[] {
+    const points: { identifier: number; x: number; y: number }[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const touch = list.item(i);
+      if (!touch) continue;
+      const point = this.surfacePointFromClient(
+        touch.clientX,
+        touch.clientY,
+        false,
+      );
+      if (!point) continue;
+      points.push({
+        identifier: touch.identifier,
+        x: point.x,
+        y: point.y,
+      });
+    }
+    return points;
+  }
+
+  private sendDirectTouch(e: TouchEvent, phase: number): void {
+    const points = this.directTouchPoints(e.changedTouches);
+    if (points.length === 0) return;
+    if (phase === SURFACE_TOUCH_DOWN) {
+      this.focusKeyboardTarget();
+      for (const point of points) this.directTouchIds.add(point.identifier);
+    }
+    this.getConn()?.sendSurfaceTouch(this._surfaceId, phase, points);
+    if (phase === SURFACE_TOUCH_UP) {
+      for (const point of points) this.directTouchIds.delete(point.identifier);
+      if (e.touches.length === 0) this.directTouchIds.clear();
+    }
   }
 
   private findActiveTouch(list: TouchList): Touch | null {
@@ -2892,11 +3022,16 @@ export class BlitSurfaceCanvas {
     if (e.pointerType === "mouse") return;
     if (!this.canvas || !this.surface || !this._displaySize) return;
     e.preventDefault();
+    if (e.pointerType === "touch" && this.directTouchActive()) return;
     this.canvas.setPointerCapture?.(e.pointerId);
     this.startTouchGesture(e.pointerId, e.clientX, e.clientY, e.pointerId);
   }
 
   private handlePointerMove(e: PointerEvent): void {
+    if (e.pointerType === "touch" && this.directTouchActive()) {
+      e.preventDefault();
+      return;
+    }
     const active = this.activeTouch;
     if (
       e.pointerType === "mouse" ||
@@ -2909,6 +3044,10 @@ export class BlitSurfaceCanvas {
   }
 
   private handlePointerUp(e: PointerEvent): void {
+    if (e.pointerType === "touch" && this.directTouchActive()) {
+      e.preventDefault();
+      return;
+    }
     const active = this.activeTouch;
     if (
       e.pointerType === "mouse" ||
@@ -2922,6 +3061,10 @@ export class BlitSurfaceCanvas {
   }
 
   private handlePointerCancel(e: PointerEvent): void {
+    if (e.pointerType === "touch" && this.directTouchActive()) {
+      e.preventDefault();
+      return;
+    }
     const active = this.activeTouch;
     if (
       e.pointerType === "mouse" ||
@@ -2949,6 +3092,20 @@ export class BlitSurfaceCanvas {
     // `touch-action: none` and owns every gesture on it, so there is no
     // default here worth keeping.
     e.preventDefault();
+    if (
+      this._touchMode === "direct" &&
+      !this.directTouchActive() &&
+      this.directTouchIds.size > 0
+    ) {
+      // A reconnect to a server without the feature already terminated the
+      // old server-side sequence. Do not let its browser identifiers leak
+      // into the pointer fallback's next gesture.
+      this.directTouchIds.clear();
+    }
+    if (this.directTouchActive()) {
+      this.sendDirectTouch(e, SURFACE_TOUCH_DOWN);
+      return;
+    }
     if (this.activeTouch?.pointerId != null) return;
     if (e.touches.length !== 1) {
       this.handleTouchCancel(e);
@@ -2961,6 +3118,10 @@ export class BlitSurfaceCanvas {
 
   private handleTouchMove(e: TouchEvent): void {
     e.preventDefault();
+    if (this.directTouchIds.size > 0 && this.directTouchActive()) {
+      this.sendDirectTouch(e, SURFACE_TOUCH_MOTION);
+      return;
+    }
     const active = this.activeTouch;
     if (!active || active.pointerId != null) return;
     const touch = this.findActiveTouch(e.touches);
@@ -2973,6 +3134,10 @@ export class BlitSurfaceCanvas {
     // already ended the gesture and nulled activeTouch by the time this
     // runs, so cancel the default first or the guards below skip it.
     e.preventDefault();
+    if (this.directTouchIds.size > 0 && this.directTouchActive()) {
+      this.sendDirectTouch(e, SURFACE_TOUCH_UP);
+      return;
+    }
     const active = this.activeTouch;
     if (!active) return;
     const touch = this.findActiveTouch(e.changedTouches);
@@ -3002,16 +3167,15 @@ export class BlitSurfaceCanvas {
   }
 
   private handleTouchCancel(e: TouchEvent): void {
+    if (this.directTouchIds.size > 0 && this.directTouchActive()) {
+      e.preventDefault();
+      this.cancelDirectTouches();
+      return;
+    }
     const active = this.activeTouch;
     if (!active) return;
     e.preventDefault();
-    if (active.longPressTimer) clearTimeout(active.longPressTimer);
-    if (active.mode === "drag") {
-      this.sendPointerAt(active.lastX, active.lastY, SURFACE_POINTER_UP, 0);
-    } else if (active.mode === "scroll") {
-      this.endScrollSequence();
-    }
-    this.activeTouch = null;
+    this.cancelPointerTouchGesture();
   }
 
   /**

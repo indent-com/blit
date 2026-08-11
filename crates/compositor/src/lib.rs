@@ -237,6 +237,15 @@ mod stub {
             source: Option<u8>,
             stop: bool,
         },
+        SetTouchEnabled {
+            enabled: bool,
+        },
+        Touch {
+            owner_id: u64,
+            surface_id: u16,
+            phase: TouchPhase,
+            contacts: Vec<TouchPoint>,
+        },
         SurfaceResize {
             surface_id: u16,
             width: u16,
@@ -401,6 +410,21 @@ mod stub {
             client_id: Option<u64>,
         },
         Shutdown,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TouchPhase {
+        Down,
+        Up,
+        Motion,
+        Cancel,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct TouchPoint {
+        pub id: i32,
+        pub x: f64,
+        pub y: f64,
     }
 
     #[derive(Clone, Copy, Default)]
