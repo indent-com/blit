@@ -2184,6 +2184,38 @@ export class BlitTerminalSurface {
         return;
       }
 
+      // Named keys from the mobile toolbar (arrows, navigation keys, F-keys)
+      // arrive without the one-shot modifier in the synthetic KeyboardEvent.
+      // Re-encode them with the armed modifier so, for example, Ctrl+Right
+      // produces CSI 1;5C just like the same chord on a physical keyboard.
+      if (
+        (this._ctrlModifier || this._altModifier) &&
+        e.key.length > 1 &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !e.metaKey
+      ) {
+        const t = this.terminal;
+        const bytes = keyToBytes(
+          {
+            key: e.key,
+            code: e.code,
+            ctrlKey: this._ctrlModifier,
+            shiftKey: e.shiftKey,
+            altKey: this._altModifier,
+            metaKey: false,
+          } as KeyboardEvent,
+          t ? t.app_cursor() : false,
+        );
+        if (bytes) {
+          e.preventDefault();
+          this.sendInput(this._sessionId!, bytes);
+          this.setCtrlModifier(false);
+          this.setAltModifier(false);
+          return;
+        }
+      }
+
       // Ctrl+Shift+V pastes from the browser clipboard.  Ctrl+V is left as
       // the terminal's default ^V (quoted-insert) control character.
       if (

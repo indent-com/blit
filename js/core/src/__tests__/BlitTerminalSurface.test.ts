@@ -636,6 +636,70 @@ describe("BlitTerminalSurface Ctrl+Shift+V paste shortcut", () => {
   });
 });
 
+describe("BlitTerminalSurface mobile toolbar modifiers", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function attachKeyboard(sendInput: (data: Uint8Array) => void) {
+    const s = new BlitTerminalSurface({ sessionId: "s1" });
+    // @ts-expect-error — install a fake workspace stub.
+    s["_workspace"] = { sendInput };
+    // @ts-expect-error — minimal connection exposing only a connected transport.
+    s["_blitConn"] = { transport: { status: "connected" } };
+    const input = document.createElement("textarea");
+    // @ts-expect-error — install the hidden capture textarea directly.
+    s["inputEl"] = input;
+    // @ts-expect-error — wire the keydown/compositionend/input listeners.
+    s["setupKeyboard"]();
+    return { s, input };
+  }
+
+  it("applies one-shot Ctrl to an arrow key", () => {
+    const sendInput = vi.fn();
+    const { s, input } = attachKeyboard(sendInput);
+    s.setCtrlModifier(true);
+
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "ArrowRight",
+        code: "ArrowRight",
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+
+    expect(new TextDecoder().decode(sendInput.mock.calls[0][1])).toBe(
+      "\x1b[1;5C",
+    );
+    expect(s.ctrlModifier).toBe(false);
+  });
+
+  it("applies one-shot Alt to an arrow key", () => {
+    const sendInput = vi.fn();
+    const { s, input } = attachKeyboard(sendInput);
+    s.setAltModifier(true);
+
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "ArrowLeft",
+        code: "ArrowLeft",
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+
+    expect(new TextDecoder().decode(sendInput.mock.calls[0][1])).toBe(
+      "\x1b[1;3D",
+    );
+    expect(s.altModifier).toBe(false);
+  });
+});
+
 describe("BlitTerminalSurface Ctrl+V image paste", () => {
   beforeEach(() => {
     mockCanvasContext();
