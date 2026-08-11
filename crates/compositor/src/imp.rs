@@ -3638,6 +3638,60 @@ impl Compositor {
         }
     }
 
+    /// Stop drawing a dismissed popup and queue a fresh frame for its
+    /// toplevel.
+    ///
+    /// `xdg_popup.popup_done` unmaps the popup at the compositor's end of
+    /// the event; waiting for the client to destroy its role is not the same
+    /// operation.  Chromium does destroy it, but an idle page may not commit
+    /// another toplevel buffer afterwards.  Merely unlinking the popup then
+    /// leaves the last composite (menu included) on screen until the next
+    /// paced repaint, which is hundreds of milliseconds later in Brave.
+    fn unmap_popup_surface(&mut self, popup_id: &ObjectId) {
+        // Resolve the toplevel before unlinking the parent chain.  The queued
+        // recomposite reads the tree after the removal, so it reveals the
+        // parent pixels that were behind the menu.
+        let (_, toplevel_sid) = self.find_toplevel_root(popup_id);
+        let parent_id = self
+            .surfaces
+            .get(popup_id)
+            .and_then(|surface| surface.parent_surface_id.clone());
+        let mut was_mapped = false;
+        if let Some(parent_id) = parent_id
+            && let Some(parent) = self.surfaces.get_mut(&parent_id)
+        {
+            let old_len = parent.children.len();
+            parent.children.retain(|child| child != popup_id);
+            was_mapped = parent.children.len() != old_len;
+        }
+        if !was_mapped {
+            return;
+        }
+
+        // An unmapped surface has no current content.  Drop the render cache
+        // now as well as the tree edge, otherwise reusing this wl_surface for
+        // another popup could briefly resurrect the old menu before its first
+        // new buffer commit.
+        self.surface_meta.remove(popup_id);
+        if let Some(ref mut vk) = self.vulkan_renderer {
+            vk.remove_surface(popup_id);
+        }
+        if let Some(held) = self.held_buffers.remove(popup_id) {
+            self.release_held(held);
+        }
+        if let Some(awaiting) = self.awaiting_acquire.remove(popup_id) {
+            self.release_held(awaiting.into_release());
+        }
+        self.forget_pointer_focus(popup_id);
+
+        if let Some(toplevel_sid) = toplevel_sid {
+            // `false` is important: this topology change must publish pixels,
+            // not run only compositor-resident encoders.
+            self.pending_recomposite_toplevels
+                .insert(toplevel_sid, false);
+        }
+    }
+
     /// What to multiply a smooth `wl_pointer.axis` distance by before
     /// sending it to this pointer's client.
     ///
@@ -4157,6 +4211,11 @@ impl Compositor {
                             {
                                 popup.popup_done();
                             }
+                            // popup_done itself unmaps the surface.  Do not
+                            // wait for the client to destroy the role, or a
+                            // static page keeps streaming the last composite
+                            // with the menu still in it.
+                            self.unmap_popup_surface(&grab_wl_id);
                             // Pop first, then hand focus back: `unfocus_popup`
                             // reads the stack to find what is still grabbing
                             // underneath, and on the last iteration that is
@@ -6458,15 +6517,10 @@ impl Dispatch<XdgPopup, XdgPopupData> for Compositor {
                 // ends. Off the stack first, so what remains is what is
                 // still grabbing beneath it.
                 state.unfocus_popup(&data.wl_surface_id);
-                // Remove from parent's children list.
-                if let Some(parent_id) = state
-                    .surfaces
-                    .get(&data.wl_surface_id)
-                    .and_then(|s| s.parent_surface_id.clone())
-                    && let Some(parent) = state.surfaces.get_mut(&parent_id)
-                {
-                    parent.children.retain(|c| *c != data.wl_surface_id);
-                }
+                // Destroying the role also unmaps it.  This is idempotent
+                // when popup_done already performed the compositor-side
+                // unmap above.
+                state.unmap_popup_surface(&data.wl_surface_id);
                 if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
                     surf.xdg_popup = None;
                     surf.parent_surface_id = None;
