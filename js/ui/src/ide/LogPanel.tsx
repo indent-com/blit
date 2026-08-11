@@ -380,15 +380,6 @@ export function LogPanel(props: {
       >
         {absTimes().has(c.oid) ? isoTime(c.time) : relativeTime(c.time, now())}
       </span>
-      <span
-        style={{
-          color: props.theme.warning,
-          "flex-shrink": 0,
-          "font-variant-numeric": "tabular-nums",
-        }}
-      >
-        {c.short}
-      </span>
       <button
         onClick={(e) => {
           e.stopPropagation();
