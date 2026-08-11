@@ -15,10 +15,7 @@ describe("HMR state leases", () => {
       { close: vi.fn() },
     ];
     const cache = new Map(
-      channels.map((transport, index) => [
-        `remote-${index}`,
-        { transport },
-      ]),
+      channels.map((transport, index) => [`remote-${index}`, { transport }]),
     );
 
     closeTransportBundle(mux, cache);

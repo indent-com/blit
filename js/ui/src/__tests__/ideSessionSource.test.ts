@@ -87,10 +87,7 @@ describe("follow-terminal source resolution", () => {
     ).toBe("fallback");
     expect(
       currentSourceSessionForPty(
-        [
-          session("local:1", 7, "closed"),
-          session("local:2", 7, "exited"),
-        ],
+        [session("local:1", 7, "closed"), session("local:2", 7, "exited")],
         "local",
         7,
       ),

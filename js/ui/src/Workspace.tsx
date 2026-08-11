@@ -331,11 +331,7 @@ export function Workspace(props: {
 }) {
   const hmrLeaseOwner = {};
   const hmrKey = props.hmrKey ?? {};
-  const hmrData = getHmrWorkspace(
-    props.wasm,
-    hmrKey,
-    hmrLeaseOwner,
-  );
+  const hmrData = getHmrWorkspace(props.wasm, hmrKey, hmrLeaseOwner);
   const workspace = hmrData.workspace;
 
   // Normalise: accept either a static array or a reactive accessor.

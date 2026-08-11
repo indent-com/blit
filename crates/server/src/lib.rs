@@ -19559,8 +19559,10 @@ mod tests {
         assert!(request_surface_keyframe(&mut sub, start, true));
         assert!(!sub.has_keyframe, "the accepted request creates debt");
 
-        let mut sub = SurfaceSubState::default();
-        sub.has_keyframe = true;
+        let mut sub = SurfaceSubState {
+            has_keyframe: true,
+            ..Default::default()
+        };
         assert!(request_surface_keyframe(&mut sub, start, false));
         sub.has_keyframe = true; // the requested IDR reached the client
         sub.decoder_queue_depth = 7;
@@ -21781,7 +21783,7 @@ mod tests {
         );
 
         assert!(matches!(outcome, SendOutcome::Stale));
-        assert!(client.last_sent.get(&1).is_none());
+        assert!(!client.last_sent.contains_key(&1));
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)

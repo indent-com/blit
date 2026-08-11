@@ -20,15 +20,12 @@ import type { BlitSession, ConnectionId, SessionId } from "@blit-sh/core";
 /** The server's diagnostic when a PTY-relative open loses its anchor between
  *  the UI choosing it and the request being handled. This is an expected
  *  terminal-lifecycle race, not text that belongs in the UI. */
-const SOURCE_TERMINAL_UNAVAILABLE =
-  "source terminal has no working directory";
+const SOURCE_TERMINAL_UNAVAILABLE = "source terminal has no working directory";
 
 /** True for the fs/git/lsp open failure produced by that lifecycle race. */
 export function isSourceTerminalUnavailableError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return message
-    .toLowerCase()
-    .includes(SOURCE_TERMINAL_UNAVAILABLE);
+  return message.toLowerCase().includes(SOURCE_TERMINAL_UNAVAILABLE);
 }
 
 /** The current incarnation of a PTY, or null once its newest one exited. */
