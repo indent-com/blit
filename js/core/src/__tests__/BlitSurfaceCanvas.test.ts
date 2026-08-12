@@ -997,7 +997,10 @@ function pointerEvent(type: string, x: number, y: number): Event {
 }
 
 describe("BlitSurfaceCanvas cross-surface mouse grabs", () => {
-  it("routes a held move and release to the canvas under the pointer", () => {
+  it.each([
+    ["an interactive BSP surface", false],
+    ["a pointer-transparent surface preview", true],
+  ])("routes a held move and release through %s", (_label, preview) => {
     const pointers: {
       id: number;
       type: number;
@@ -1057,6 +1060,13 @@ describe("BlitSurfaceCanvas cross-surface mouse grabs", () => {
     };
     const first = mount(1, 0);
     const second = mount(2, 100);
+    let destination: Element = second.canvas;
+    if (preview) {
+      second.canvas.style.pointerEvents = "none";
+      const previewChrome = document.createElement("button");
+      second.container.appendChild(previewChrome);
+      destination = previewChrome;
+    }
 
     try {
       first.canvas.dispatchEvent(
@@ -1068,7 +1078,7 @@ describe("BlitSurfaceCanvas cross-surface mouse grabs", () => {
           clientY: 20,
         }),
       );
-      second.canvas.dispatchEvent(
+      destination.dispatchEvent(
         new MouseEvent("mousemove", {
           bubbles: true,
           button: 0,
@@ -1077,7 +1087,7 @@ describe("BlitSurfaceCanvas cross-surface mouse grabs", () => {
           clientY: 40,
         }),
       );
-      second.canvas.dispatchEvent(
+      destination.dispatchEvent(
         new MouseEvent("mouseup", {
           bubbles: true,
           button: 0,
@@ -3346,6 +3356,22 @@ describe("BlitSurfaceCanvas iOS backspace repeat", () => {
     ]);
     // Do not clear or replace the field while WebKit's repeat is active.
     expect(ta.value).toBe(NBSP.repeat(seeded - 3));
+    surface.dispose();
+  });
+
+  it("does not refill the capture field across the old repeat boundary", () => {
+    const { surface, ta, keys } = attachTyping();
+    const seeded = ta.value.length;
+    const repeats = 256;
+
+    expect(seeded).toBeGreaterThan(repeats + 4);
+    for (let i = 1; i <= repeats; i++) {
+      ta.value = NBSP.repeat(seeded - i);
+      ta.dispatchEvent(inputEvent({ inputType: "deleteContentBackward" }));
+    }
+
+    expect(keys).toHaveLength(repeats * 2);
+    expect(ta.value).toBe(NBSP.repeat(seeded - repeats));
     surface.dispose();
   });
 

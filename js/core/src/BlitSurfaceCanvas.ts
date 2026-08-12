@@ -630,7 +630,10 @@ function detectIOS(): boolean {
 }
 
 const IOS_INPUT_PAD_CODE = 0x00a0;
-const IOS_INPUT_PAD = String.fromCharCode(IOS_INPUT_PAD_CODE).repeat(64);
+// Replacing the field while Backspace is held resets WebKit's native repeat
+// cadence.  Keep enough filler that the idle repad is the only refill a human
+// hold can reach; 4096 characters lasts for minutes at iOS repeat rates.
+const IOS_INPUT_PAD = String.fromCharCode(IOS_INPUT_PAD_CODE).repeat(4096);
 
 function stripIOSInputPad(value: string): string {
   let i = 0;
@@ -2882,6 +2885,40 @@ export class BlitSurfaceCanvas {
         node = node.parentElement;
       }
     }
+
+    // Passive previews deliberately use `pointer-events: none`, so they are
+    // omitted from elementsFromPoint() even though their surrounding card is
+    // the visible element under the pointer.  Match such a mounted canvas by
+    // geometry, but only when the top hit belongs to its nearby wrapper.  The
+    // wrapper check keeps a canvas hidden under an unrelated overlay from
+    // becoming a drag target merely because their rectangles overlap.
+    const topHit = elements[0];
+    let nearest: { target: BlitSurfaceCanvas; distance: number } | null = null;
+    if (topHit) {
+      for (const [canvas, target] of mountedSurfaceCanvases) {
+        if (target.getConn() !== connection) continue;
+        const rect = canvas.getBoundingClientRect();
+        if (
+          e.clientX < rect.left ||
+          e.clientX >= rect.left + rect.width ||
+          e.clientY < rect.top ||
+          e.clientY >= rect.top + rect.height
+        ) {
+          continue;
+        }
+        let wrapper = canvas.parentElement;
+        for (let distance = 0; wrapper && distance < 4; distance++) {
+          if (wrapper.contains(topHit)) {
+            if (!nearest || distance < nearest.distance) {
+              nearest = { target, distance };
+            }
+            break;
+          }
+          wrapper = wrapper.parentElement;
+        }
+      }
+    }
+    if (nearest) return nearest.target;
     return null;
   }
 
