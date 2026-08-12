@@ -224,14 +224,14 @@ blit has no required dependencies — software H.264 and AV1 encoders are static
 
 Without any of the above, the compositor falls back to CPU rendering and software encoding. No configuration needed.
 
-**Audio (Linux)**
+**Desktop services and audio (Linux)**
 
 | Dependency             | Packages (Debian/Ubuntu)          | Used for                                          |
 | ---------------------- | --------------------------------- | ------------------------------------------------- |
 | `pipewire`             | `pipewire`                        | Audio daemon (private instance per compositor)    |
 | `pipewire-pulse`       | `pipewire-pulse`                  | PulseAudio compatibility for apps                 |
 | `libpipewire-0.3.so.0` | `pipewire` or `libpipewire-0.3-0` | Monitor capture (in-process, loaded via `dlopen`) |
-| `dbus-daemon`          | `dbus`                            | Private D-Bus session (required by PipeWire)      |
+| `dbus-daemon`          | `dbus`                            | Private desktop and PipeWire D-Bus sessions       |
 | `wireplumber`          | `wireplumber`                     | Session manager (optional, started if available)  |
 
 Audio is disabled automatically when PipeWire is not installed or `libpipewire-0.3.so.0` is not resolvable via `ld.so` (set `LD_LIBRARY_PATH` if you have it in a non-default location), or explicitly with `BLIT_AUDIO=0`.

@@ -111,13 +111,13 @@ Output images are double-buffered and allocated with `DEVICE_LOCAL` preference (
 
 The invariants: Vulkan objects must be destroyed in the correct order — images and image views before the device, descriptor sets before the pool, command buffers before the command pool, and the device before the instance (`Drop` impl handles ordering); imported DMA-BUF memory must not be accessed after the client destroys the underlying buffer (`held_buffers` in the compositor prevents early `wl_buffer.release` while the GPU texture references the fd); staging buffer mappings must be consumed by the encoder before the output image is reused for the next render; and evicted persistent textures are deferred to `pending_destroy_textures` until the in-flight GPU submission completes.
 
-## `PR_SET_PDEATHSIG` in the audio pipeline
+## `PR_SET_PDEATHSIG` on long-lived service children
 
-`AudioPipeline::shutdown` (and its `Drop` impl) kills all child processes (dbus-daemon, pipewire, wireplumber, pipewire-pulse) and waits for them. But when the blit server is killed via SIGKILL (e.g. process-compose restart after a rebuild), Rust destructors don't run and the children become orphans reparented to PID 1.
+`AudioPipeline::shutdown` and `DesktopBus::drop` kill their child processes and wait for them. But when the blit server is killed via SIGKILL (e.g. process-compose restart after a rebuild), Rust destructors don't run and the children become orphans reparented to PID 1.
 
-To prevent this, every `Command::new()…spawn()` in [`crates/server/src/audio.rs`](crates/server/src/audio.rs) uses `pre_exec(pdeathsig_hook())` to call `prctl(PR_SET_PDEATHSIG, SIGTERM)` in the child between fork and exec. This makes the kernel send SIGTERM to the child when its parent dies, regardless of how the parent exits.
+To prevent this, every long-lived service `Command::new()…spawn()` in [`crates/server/src/audio.rs`](crates/server/src/audio.rs) and [`crates/server/src/desktop_bus.rs`](crates/server/src/desktop_bus.rs) uses `pre_exec(pdeathsig_hook())` to call `prctl(PR_SET_PDEATHSIG, SIGTERM)` in the child between fork and exec. This makes the kernel send SIGTERM to the child when its parent dies, regardless of how the parent exits.
 
-`prctl(PR_SET_PDEATHSIG, …)` is async-signal-safe and is invoked inside the closure passed to `CommandExt::pre_exec`. The `unsafe` block is confined to the closure body — the outer `pdeathsig_hook()` function is safe. SIGTERM (not SIGKILL) is used so children can clean up their own resources before exiting. The entire audio module is `#[cfg(target_os = "linux")]` since PipeWire is Linux-only, so there is no cross-platform shim needed.
+`prctl(PR_SET_PDEATHSIG, …)` is async-signal-safe and is invoked inside the closure passed to `CommandExt::pre_exec`. The `unsafe` block is confined to the closure body — the outer `pdeathsig_hook()` function is safe. SIGTERM (not SIGKILL) is used so children can clean up their own resources before exiting. Both modules are `#[cfg(target_os = "linux")]`, so there is no cross-platform shim needed.
 
 ## `sd_notify` socket address in `sd-notify`
 
@@ -143,4 +143,4 @@ The invariants: we target `PW_VERSION_STREAM_EVENTS = 2` (present since PipeWire
 - **Vulkan renderer resource ordering** — `VulkanRenderer::Drop` must destroy images, image views, descriptor sets, pipelines, and command buffers before destroying the device, and the device before the instance.
 - **DMA-BUF import lifetime** — imported Vulkan memory from DMA-BUF fds must not outlive the client buffer; evicted persistent textures are deferred to `pending_destroy_textures` until the in-flight GPU submission completes.
 - **Staging pointer lifetime** — the raw `vkMapMemory` pointer in `OutputImage::staging_ptr` is valid for one frame cycle (double-buffered output images). The encoder must consume the `PixelData::Bgra` before `retire_pending` is called again for the same output image.
-- **`PR_SET_PDEATHSIG` on audio children** — every long-lived child spawned by `AudioPipeline` must use `pre_exec(pdeathsig_hook())`. Missing it means the child survives server restarts and leaks.
+- **`PR_SET_PDEATHSIG` on service children** — every long-lived child spawned by `AudioPipeline` or `DesktopBus` must use `pre_exec(pdeathsig_hook())`. Missing it means the child survives server restarts and leaks.

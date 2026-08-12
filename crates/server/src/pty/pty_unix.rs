@@ -12,6 +12,7 @@ use crate::{AppState, PTY_CHANNEL_CAPACITY, PtyInput};
 /// not async-signal-safe).
 fn build_child_env(
     wayland_display: Option<&str>,
+    desktop_bus: Option<&str>,
     pulse_server: Option<&str>,
     pipewire_remote: Option<&str>,
     blit_sock: Option<&str>,
@@ -86,21 +87,12 @@ fn build_child_env(
         set(&mut env, "XDG_SESSION_TYPE", "wayland");
         // DISPLAY was already filtered out above.
     }
-    // The inherited DBUS_SESSION_BUS_ADDRESS was filtered out above: the
-    // server's own bus, if any, is not the terminal user's session bus.
-    // But when the child's XDG_RUNTIME_DIR holds a `bus` socket, that is the
-    // standard per-user session bus, and desktop apps misbehave without it
-    // (Spotify's renderer exits before the window ever maps).  Point
-    // terminals at it; stays unset on headless servers with no socket.
-    if let Some((_, xdg)) = env.iter().find(|(k, _)| k == "XDG_RUNTIME_DIR") {
-        let bus = std::path::Path::new(xdg).join("bus");
-        if bus.exists() {
-            set(
-                &mut env,
-                "DBUS_SESSION_BUS_ADDRESS",
-                &format!("unix:path={}", bus.display()),
-            );
-        }
+    // The inherited address was filtered out above: both the server's audio
+    // bus and the host desktop bus belong to a different environment. The
+    // compositor-scoped bus activates portals on this Wayland display while
+    // still satisfying desktop apps (notably Spotify) that require a bus.
+    if let Some(address) = desktop_bus {
+        set(&mut env, "DBUS_SESSION_BUS_ADDRESS", address);
     }
     if let Some(ps) = pulse_server {
         set(&mut env, "PULSE_SERVER", ps);
@@ -599,6 +591,7 @@ pub fn spawn_pty(
     scrollback: usize,
     state: AppState,
     wayland_display: Option<&str>,
+    desktop_bus: Option<&str>,
     pulse_server: Option<&str>,
     pipewire_remote: Option<&str>,
 ) -> Option<crate::Pty> {
@@ -634,6 +627,7 @@ pub fn spawn_pty(
     let path_dir = state.config.inject_path.then(exe_dir).flatten();
     let child_env = build_child_env(
         wayland_display,
+        desktop_bus,
         pulse_server,
         pipewire_remote,
         blit_sock,
@@ -803,6 +797,7 @@ pub fn respawn_child(
     dir: Option<&str>,
     state: AppState,
     wayland_display: Option<&str>,
+    desktop_bus: Option<&str>,
     pulse_server: Option<&str>,
     pipewire_remote: Option<&str>,
 ) -> Option<(
@@ -840,6 +835,7 @@ pub fn respawn_child(
     let path_dir = state.config.inject_path.then(exe_dir).flatten();
     let child_env = build_child_env(
         wayland_display,
+        desktop_bus,
         pulse_server,
         pipewire_remote,
         blit_sock,
@@ -1270,6 +1266,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ));
 
         assert_eq!(
@@ -1289,13 +1286,10 @@ mod tests {
     }
 
     #[test]
-    fn child_env_points_dbus_at_the_runtime_dir_session_bus() {
-        // No bus socket under XDG_RUNTIME_DIR: stays unset.
-        let dir = std::env::temp_dir().join(format!("blit-env-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let wayland = dir.join("wayland-7");
+    fn child_env_uses_the_compositor_scoped_session_bus() {
         let env = child_env_map(build_child_env(
-            Some(wayland.to_str().unwrap()),
+            Some("/tmp/blit-test/wayland-7"),
+            None,
             None,
             None,
             None,
@@ -1303,10 +1297,9 @@ mod tests {
         ));
         assert!(!env.contains_key("DBUS_SESSION_BUS_ADDRESS"));
 
-        // Bus socket present: terminals get the standard session bus address.
-        std::fs::File::create(dir.join("bus")).expect("bus socket placeholder");
         let env = child_env_map(build_child_env(
-            Some(wayland.to_str().unwrap()),
+            Some("/tmp/blit-test/wayland-7"),
+            Some("unix:path=/tmp/blit-test/desktop-bus"),
             None,
             None,
             None,
@@ -1314,17 +1307,17 @@ mod tests {
         ));
         assert_eq!(
             env.get("DBUS_SESSION_BUS_ADDRESS").map(String::as_str),
-            Some(format!("unix:path={}/bus", dir.display()).as_str())
+            Some("unix:path=/tmp/blit-test/desktop-bus")
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn child_env_exports_blit_sock_only_when_requested() {
-        let env = child_env_map(build_child_env(None, None, None, None, None));
+        let env = child_env_map(build_child_env(None, None, None, None, None, None));
         assert!(!env.contains_key("BLIT_SOCK"));
 
         let env = child_env_map(build_child_env(
+            None,
             None,
             None,
             None,
@@ -1341,13 +1334,14 @@ mod tests {
     fn child_env_appends_the_binary_dir_to_path_only_when_requested() {
         let inherited = std::env::var("PATH").unwrap_or_default();
 
-        let env = child_env_map(build_child_env(None, None, None, None, None));
+        let env = child_env_map(build_child_env(None, None, None, None, None, None));
         assert_eq!(
             env.get("PATH").map(String::as_str),
             Some(inherited.as_str())
         );
 
         let env = child_env_map(build_child_env(
+            None,
             None,
             None,
             None,
@@ -1365,7 +1359,7 @@ mod tests {
         let inherited = std::env::var("PATH").unwrap_or_default();
         let already = inherited.split(':').next_back().unwrap_or_default();
 
-        let env = child_env_map(build_child_env(None, None, None, None, Some(already)));
+        let env = child_env_map(build_child_env(None, None, None, None, None, Some(already)));
         assert_eq!(
             env.get("PATH").map(String::as_str),
             Some(inherited.as_str())
