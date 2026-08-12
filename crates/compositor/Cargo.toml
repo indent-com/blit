@@ -18,4 +18,4 @@ rustc-hash = "2"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }

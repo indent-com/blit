@@ -581,6 +581,11 @@ each fresh target offer receives the source mask before `enter`, and no
 selected `action` is announced until that target replies with `set_actions`.
 This ordering matters to Chromium/Electron targets: they do not start their
 pre-drop MIME fetches from an incomplete v3 offer.
+The compositor also advertises `xdg_toplevel_drag_manager_v1`. Chromium uses
+that global to start a tab drag before the pointer leaves its source window,
+which lets the same cross-surface grab move tabs between browser panes. An
+attached toplevel remains a workspace-managed pane rather than following a
+compositor-global cursor position, and is excluded from its own drop targets.
 An empty mask intersection is announced as `action(NONE)` without leaving the
 surface, because the target may renegotiate on a later motion. Release becomes
 a drop only with both a non-NONE action and an accepted MIME; otherwise the

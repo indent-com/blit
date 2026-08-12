@@ -98,6 +98,12 @@ use wayland_protocols::xdg::shell::server::xdg_positioner::XdgPositioner;
 use wayland_protocols::xdg::shell::server::xdg_surface::{self, XdgSurface};
 use wayland_protocols::xdg::shell::server::xdg_toplevel::{self, XdgToplevel};
 use wayland_protocols::xdg::shell::server::xdg_wm_base::{self, XdgWmBase};
+use wayland_protocols::xdg::toplevel_drag::v1::server::xdg_toplevel_drag_manager_v1::{
+    self, XdgToplevelDragManagerV1,
+};
+use wayland_protocols::xdg::toplevel_drag::v1::server::xdg_toplevel_drag_v1::{
+    self, XdgToplevelDragV1,
+};
 use wayland_server::protocol::wl_buffer::WlBuffer;
 use wayland_server::protocol::wl_callback::WlCallback;
 use wayland_server::protocol::wl_compositor::WlCompositor;
@@ -1587,6 +1593,23 @@ struct DataSourceDndState {
     actions: Option<DndAction>,
     /// A wl_data_source is single-use across selection and DnD.
     used: bool,
+    /// The source was reserved by xdg_toplevel_drag_manager_v1. It may only
+    /// be used by start_drag from then on, never as a selection.
+    toplevel_drag: bool,
+    /// The source drag reached a terminal event. xdg_toplevel_drag_v1 may be
+    /// destroyed only after dnd_drop_performed or cancelled.
+    ended: bool,
+}
+
+/// The xdg-toplevel-drag object Chromium creates before starting a tab drag.
+///
+/// Blit panes own window placement, so the attach offset has no compositor-
+/// global position to update. Keeping the association is still required: it
+/// validates the protocol lifecycle and prevents the carried window from
+/// becoming its own drop target.
+struct XdgToplevelDragData {
+    source: WlDataSource,
+    attached: std::sync::Mutex<Option<ObjectId>>,
 }
 
 /// Stored state for the external (browser/CLI) clipboard selection.
@@ -2208,6 +2231,9 @@ struct Compositor {
     /// Client-initiated drag session in flight, if any.  While one is
     /// active and not yet dropped, pointer input is the drag grab.
     client_drag: Option<ClientDragState>,
+    /// Live xdg-toplevel-drag objects. Chromium uses the global's presence to
+    /// start a tab drag before the pointer crosses into another Blit pane.
+    toplevel_drags: Vec<XdgToplevelDragV1>,
 
     // -- Primary selection --
     primary_devices: Vec<ZwpPrimarySelectionDeviceV1>,
@@ -4189,6 +4215,10 @@ impl Compositor {
         if let Some(surf) = self.surfaces.get_mut(surface_id) {
             surf.map_state = MapState::Unmapped;
         }
+        // xdg-toplevel-drag detaches an attached toplevel automatically when
+        // it is unmapped, allowing the same drag object to attach a replacement
+        // window later in the session.
+        self.detach_toplevel_drag_surface(surface_id);
         self.surface_meta.remove(surface_id);
         self.cursor_rgba.remove(surface_id);
         if let Some(ref mut vk) = self.vulkan_renderer {
@@ -6677,6 +6707,7 @@ impl Dispatch<WlSurface, ()> for Compositor {
             Request::SetBufferTransform { .. } => {}
             Request::Offset { .. } => {}
             Request::Destroy => {
+                state.detach_toplevel_drag_surface(&sid);
                 state.surface_meta.remove(&sid);
                 state.cursor_rgba.remove(&sid);
                 if let Some(ref mut vk) = state.vulkan_renderer {
@@ -7539,6 +7570,7 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
             }
             Request::Destroy => {
                 let wl_surface_id = &data.wl_surface_id;
+                state.detach_toplevel_drag_surface(wl_surface_id);
                 state.surface_meta.remove(wl_surface_id);
                 state.cursor_rgba.remove(wl_surface_id);
                 if let Some(ref mut vk) = state.vulkan_renderer {
@@ -8602,6 +8634,127 @@ impl Dispatch<WpViewport, ObjectId> for Compositor {
 // NEW PROTOCOLS
 // =========================================================================
 
+// -- xdg_toplevel_drag_v1 --
+
+impl GlobalDispatch<XdgToplevelDragManagerV1, ()> for Compositor {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<XdgToplevelDragManagerV1>,
+        _: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<XdgToplevelDragManagerV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        manager: &XdgToplevelDragManagerV1,
+        request: <XdgToplevelDragManagerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use xdg_toplevel_drag_manager_v1::Request;
+        match request {
+            Request::GetXdgToplevelDrag { id, data_source } => {
+                let Some(source_data) = data_source.data::<DataSourceData>() else {
+                    manager.post_error(
+                        xdg_toplevel_drag_manager_v1::Error::InvalidSource,
+                        "unknown data source",
+                    );
+                    return;
+                };
+                let mut dnd = source_data.dnd.lock().unwrap();
+                if dnd.used || dnd.toplevel_drag {
+                    drop(dnd);
+                    manager.post_error(
+                        xdg_toplevel_drag_manager_v1::Error::InvalidSource,
+                        "data source was already used for a toplevel drag",
+                    );
+                    return;
+                }
+                dnd.toplevel_drag = true;
+                drop(dnd);
+
+                let drag = data_init.init(
+                    id,
+                    XdgToplevelDragData {
+                        source: data_source,
+                        attached: std::sync::Mutex::new(None),
+                    },
+                );
+                state.toplevel_drags.push(drag);
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<XdgToplevelDragV1, XdgToplevelDragData> for Compositor {
+    fn request(
+        _state: &mut Self,
+        _: &Client,
+        drag: &XdgToplevelDragV1,
+        request: <XdgToplevelDragV1 as Resource>::Request,
+        data: &XdgToplevelDragData,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        use xdg_toplevel_drag_v1::Request;
+        match request {
+            Request::Attach {
+                toplevel,
+                x_offset: _,
+                y_offset: _,
+            } => {
+                let Some(toplevel_data) = toplevel.data::<XdgToplevelData>() else {
+                    return;
+                };
+                let mut attached = data.attached.lock().unwrap();
+                if attached.is_some() {
+                    drop(attached);
+                    drag.post_error(
+                        xdg_toplevel_drag_v1::Error::ToplevelAttached,
+                        "a live toplevel is already attached",
+                    );
+                    return;
+                }
+                *attached = Some(toplevel_data.wl_surface_id.clone());
+            }
+            Request::Destroy => {
+                let ended = data
+                    .source
+                    .data::<DataSourceData>()
+                    .is_none_or(|source| source.dnd.lock().unwrap().ended);
+                if !ended {
+                    drag.post_error(
+                        xdg_toplevel_drag_v1::Error::OngoingDrag,
+                        "the underlying data-source drag has not ended",
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _: wayland_server::backend::ClientId,
+        resource: &XdgToplevelDragV1,
+        _: &XdgToplevelDragData,
+    ) {
+        state
+            .toplevel_drags
+            .retain(|drag| drag.id() != resource.id());
+    }
+}
+
 // -- wl_data_device_manager (clipboard) --
 
 impl GlobalDispatch<WlDataDeviceManager, ()> for Compositor {
@@ -8749,6 +8902,14 @@ impl Dispatch<WlDataDevice, ()> for Compositor {
                         );
                         return;
                     }
+                    if dnd.toplevel_drag {
+                        drop(dnd);
+                        source.post_error(
+                            wl_data_source::Error::InvalidSource,
+                            "a source reserved for xdg-toplevel-drag cannot be a selection",
+                        );
+                        return;
+                    }
                     if dnd.actions.is_some() {
                         drop(dnd);
                         source.post_error(
@@ -8842,6 +9003,7 @@ impl Dispatch<WlDataDevice, ()> for Compositor {
                     actions
                 };
                 dnd.used = true;
+                dnd.ended = false;
                 drop(dnd);
                 // Only a valid new source supersedes an existing session: a
                 // browser-driven target gets a leave and a prior client
@@ -9551,7 +9713,44 @@ impl Compositor {
                 drag.source.action(DndAction::empty());
             }
         }
+        Self::mark_data_source_drag_ended(&drag.source);
         drag.source.cancelled();
+    }
+
+    fn mark_data_source_drag_ended(source: &WlDataSource) {
+        if let Some(data) = source.data::<DataSourceData>() {
+            data.dnd.lock().unwrap().ended = true;
+        }
+    }
+
+    /// Forget an xdg-toplevel-drag attachment when its role is destroyed or
+    /// its surface is unmapped. The protocol permits another attach after it.
+    fn detach_toplevel_drag_surface(&self, surface_id: &ObjectId) {
+        for drag in &self.toplevel_drags {
+            let Some(data) = drag.data::<XdgToplevelDragData>() else {
+                continue;
+            };
+            let mut attached = data.attached.lock().unwrap();
+            if attached.as_ref() == Some(surface_id) {
+                *attached = None;
+            }
+        }
+    }
+
+    /// The window carried by xdg-toplevel-drag is visual payload, not a drop
+    /// destination. This matters if the frontend mounts the detached Brave
+    /// window as a pane before the physical drag has ended.
+    fn is_current_toplevel_drag_attachment(&self, surface: &WlSurface) -> bool {
+        let Some(source_id) = self.client_drag.as_ref().map(|drag| drag.source.id()) else {
+            return false;
+        };
+        let root_id = self.find_toplevel_root(&surface.id()).0;
+        self.toplevel_drags.iter().any(|drag| {
+            drag.data::<XdgToplevelDragData>().is_some_and(|data| {
+                data.source.id() == source_id
+                    && data.attached.lock().unwrap().as_ref() == Some(&root_id)
+            })
+        })
     }
 
     /// Whether pointer input currently belongs to a client drag.
@@ -9577,7 +9776,9 @@ impl Compositor {
     /// target on crossing, enter (with a fresh offer) on arrival, motion
     /// while inside.
     fn client_drag_motion(&mut self, surface_id: u16, x: f64, y: f64) {
-        let hit = self.drag_target(surface_id, x, y);
+        let hit = self
+            .drag_target(surface_id, x, y)
+            .filter(|(surface, _, _)| !self.is_current_toplevel_drag_attachment(surface));
         // Crossed off the current target's surface?
         let crossed = match (
             self.client_drag.as_ref().and_then(|d| d.target.as_ref()),
@@ -9710,6 +9911,7 @@ impl Compositor {
         if let Some(t) = drag.target.as_mut() {
             t.dropped = true;
             t.device.drop();
+            Self::mark_data_source_drag_ended(&drag.source);
             if drag.source.version() >= 3 {
                 drag.source.dnd_drop_performed();
             }
@@ -10803,6 +11005,7 @@ fn run_compositor(
     dh.create_global::<Compositor, WpFractionalScaleManagerV1, ()>(1, ());
     dh.create_global::<Compositor, ZxdgDecorationManagerV1, ()>(1, ());
     dh.create_global::<Compositor, WlDataDeviceManager, ()>(3, ());
+    dh.create_global::<Compositor, XdgToplevelDragManagerV1, ()>(1, ());
     dh.create_global::<Compositor, ZwpPointerConstraintsV1, ()>(1, ());
     dh.create_global::<Compositor, ZwpRelativePointerManagerV1, ()>(1, ());
     dh.create_global::<Compositor, XdgActivationV1, ()>(1, ());
@@ -10895,6 +11098,7 @@ fn run_compositor(
         external_clipboard: None,
         drag: None,
         client_drag: None,
+        toplevel_drags: Vec::new(),
         primary_devices: Vec::new(),
         primary_source: None,
         external_primary: None,

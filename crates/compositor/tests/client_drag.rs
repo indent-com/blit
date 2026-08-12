@@ -28,12 +28,16 @@ use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, deleg
 use blit_compositor::{CompositorCommand, CompositorEvent, CompositorHandle, spawn_compositor};
 
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols::xdg::toplevel_drag::v1::client::{
+    xdg_toplevel_drag_manager_v1, xdg_toplevel_drag_v1,
+};
 
 /// What the source writes when its `send` event arrives.
 const PAYLOAD: &[u8] = b"payload from the source";
 const CHROMIUM_IMAGE_MIME: &str =
     "application/octet-stream;name=\"screenshot_2026-08-07_at_8.32.34___pm.png\"";
 const CHROMIUM_CUSTOM_MIME: &str = "chromium/x-web-custom-data";
+const CHROMIUM_WINDOW_MIME: &str = "chromium/x-window";
 const PNG_PAYLOAD: &[u8] = b"\x89PNG\r\n\x1a\nimage bytes from chromium";
 const CHROMIUM_CUSTOM_PAYLOAD: &[u8] = b"chromium custom drag metadata";
 /// BTN_LEFT, as `CompositorCommand::PointerButton` expects (evdev).
@@ -62,6 +66,7 @@ enum Src {
 struct App {
     compositor: Option<wl_compositor::WlCompositor>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
+    toplevel_drag_manager: Option<xdg_toplevel_drag_manager_v1::XdgToplevelDragManagerV1>,
     ddm: Option<wl_data_device_manager::WlDataDeviceManager>,
     seat: Option<wl_seat::WlSeat>,
     events: Vec<Drag>,
@@ -98,6 +103,16 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
             "xdg_wm_base" => {
                 state.wm_base =
                     Some(registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 1, qh, ()));
+            }
+            "xdg_toplevel_drag_manager_v1" => {
+                state.toplevel_drag_manager = Some(
+                    registry.bind::<xdg_toplevel_drag_manager_v1::XdgToplevelDragManagerV1, _, _>(
+                        name,
+                        1,
+                        qh,
+                        (),
+                    ),
+                );
             }
             "wl_data_device_manager" => {
                 state.ddm = Some(
@@ -253,6 +268,8 @@ delegate_noop!(App: ignore wl_compositor::WlCompositor);
 delegate_noop!(App: ignore wl_surface::WlSurface);
 delegate_noop!(App: ignore wl_seat::WlSeat);
 delegate_noop!(App: ignore wl_data_device_manager::WlDataDeviceManager);
+delegate_noop!(App: ignore xdg_toplevel_drag_manager_v1::XdgToplevelDragManagerV1);
+delegate_noop!(App: ignore xdg_toplevel_drag_v1::XdgToplevelDragV1);
 
 struct Fixture {
     handle: Option<CompositorHandle>,
@@ -392,6 +409,33 @@ impl TestClient {
         self.device.start_drag(Some(&source), &surface, None, 0);
         self.roundtrip();
         source
+    }
+
+    /// Chromium's window/tab path creates xdg-toplevel-drag before
+    /// start_drag. Advertising this object is what makes it start DnD while
+    /// the pointer is still inside the source pane.
+    fn start_toplevel_drag(
+        &mut self,
+        mime: &str,
+    ) -> (
+        wl_data_source::WlDataSource,
+        xdg_toplevel_drag_v1::XdgToplevelDragV1,
+    ) {
+        let qh = self.queue.handle();
+        let ddm = self.app.ddm.clone().expect("ddm bound");
+        let manager = self
+            .app
+            .toplevel_drag_manager
+            .clone()
+            .expect("xdg_toplevel_drag_manager_v1 advertised");
+        let source = ddm.create_data_source(&qh, ());
+        source.offer(mime.to_string());
+        source.set_actions(wl_data_device_manager::DndAction::Move);
+        let drag = manager.get_xdg_toplevel_drag(&source, &qh, ());
+        let surface = self.toplevels[0].0.clone();
+        self.device.start_drag(Some(&source), &surface, None, 0);
+        self.roundtrip();
+        (source, drag)
     }
 }
 
@@ -874,6 +918,104 @@ fn a_drag_onto_the_same_app_still_works() {
     std::thread::sleep(Duration::from_millis(50));
     app.roundtrip(); // handles Send, writes the payload
     assert_eq!(read_all(&reader), PAYLOAD);
+}
+
+#[test]
+fn xdg_toplevel_drag_moves_a_chromium_tab_between_toplevels() {
+    use wl_data_device_manager::DndAction;
+
+    let fx = Fixture::new();
+    let mut app = TestClient::connect(&fx);
+    let _source_sid = app.new_toplevel(&fx);
+    let destination_sid = app.new_toplevel(&fx);
+
+    let (_source, drag) = app.start_toplevel_drag(CHROMIUM_WINDOW_MIME);
+    fx.send(CompositorCommand::PointerMotion {
+        surface_id: destination_sid,
+        x: 12.0,
+        y: 18.0,
+        time_ms: 0,
+    });
+    app.roundtrip();
+    assert_eq!(app.app.events, vec![Drag::Enter { x: 12.0, y: 18.0 }]);
+    assert_eq!(app.app.offered, vec![CHROMIUM_WINDOW_MIME.to_string()]);
+    assert_eq!(app.app.offer_source_actions, Some(DndAction::Move));
+
+    let offer = app
+        .app
+        .drag_offer
+        .clone()
+        .expect("destination received the Chromium window offer");
+    offer.set_actions(DndAction::Move, DndAction::Move);
+    offer.accept(0, Some(CHROMIUM_WINDOW_MIME.to_string()));
+    app.roundtrip();
+
+    fx.send(CompositorCommand::PointerButton {
+        surface_id: destination_sid,
+        button: BTN_LEFT,
+        pressed: false,
+        time_ms: 0,
+    });
+    app.roundtrip();
+    assert_eq!(app.app.events.last(), Some(&Drag::Drop));
+    assert_eq!(app.app.src_events.last(), Some(&Src::DropPerformed));
+
+    offer.finish();
+    app.roundtrip();
+    assert_eq!(app.app.src_events.last(), Some(&Src::Finished));
+
+    // The protocol permits destroying this object once the drag has ended.
+    // A compositor-side ongoing_drag error would disconnect the client here.
+    drag.destroy();
+    app.roundtrip();
+}
+
+#[test]
+fn attached_toplevel_is_not_its_own_drag_target() {
+    let fx = Fixture::new();
+    let mut app = TestClient::connect(&fx);
+    let _source_sid = app.new_toplevel(&fx);
+    let carried_sid = app.new_toplevel(&fx);
+    let destination_sid = app.new_toplevel(&fx);
+
+    let (_source, drag) = app.start_toplevel_drag(CHROMIUM_WINDOW_MIME);
+    let carried_toplevel = app.toplevels[1].2.clone();
+    drag.attach(&carried_toplevel, 0, 0);
+    app.roundtrip();
+
+    fx.send(CompositorCommand::PointerMotion {
+        surface_id: carried_sid,
+        x: 4.0,
+        y: 6.0,
+        time_ms: 0,
+    });
+    app.roundtrip();
+    assert!(
+        app.app.events.is_empty(),
+        "the attached toplevel must not participate in target selection"
+    );
+
+    fx.send(CompositorCommand::PointerMotion {
+        surface_id: destination_sid,
+        x: 7.0,
+        y: 9.0,
+        time_ms: 0,
+    });
+    app.roundtrip();
+    assert_eq!(app.app.events, vec![Drag::Enter { x: 7.0, y: 9.0 }]);
+
+    // No MIME was accepted, so release cancels cleanly and ends the
+    // xdg-toplevel-drag object's lifetime.
+    fx.send(CompositorCommand::PointerButton {
+        surface_id: destination_sid,
+        button: BTN_LEFT,
+        pressed: false,
+        time_ms: 0,
+    });
+    app.roundtrip();
+    assert_eq!(app.app.src_events.last(), Some(&Src::Cancelled));
+    drag.destroy();
+    app.roundtrip();
 }
 
 #[test]
