@@ -51,7 +51,6 @@ const NV_ENC_OPEN_ENCODE_SESSION_EX_VER: u32 = nvencapi_struct_version(1);
 const NV_ENC_INITIALIZE_PARAMS_VER: u32 = nvencapi_struct_version(6) | (1 << 31);
 const NV_ENC_PRESET_CONFIG_VER: u32 = nvencapi_struct_version(4) | (1 << 31);
 const NV_ENC_CONFIG_VER: u32 = nvencapi_struct_version(8) | (1 << 31);
-const NV_ENC_CREATE_INPUT_BUFFER_VER: u32 = nvencapi_struct_version(1);
 const NV_ENC_CREATE_BITSTREAM_BUFFER_VER: u32 = nvencapi_struct_version(1);
 const NV_ENC_PIC_PARAMS_VER: u32 = nvencapi_struct_version(6) | (1 << 31);
 const NV_ENC_LOCK_BITSTREAM_VER: u32 = nvencapi_struct_version(1) | (1 << 31);
@@ -62,7 +61,6 @@ const NV_ENC_BUFFER_FORMAT_NV12: u32 = 0x00000001;
 // YUV444 is only reached from the OPAQUE_FD import path, which is Linux-only.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const NV_ENC_BUFFER_FORMAT_YUV444: u32 = 0x00001000; // planar Y,U,V — NOT 0x10, that's YV12
-const NV_ENC_BUFFER_FORMAT_ARGB: u32 = 0x01000000; // B8G8R8A8 in memory (DRM ARGB8888)
 
 // Encoder capability query.  The values are ordinals into `NV_ENC_CAPS`
 // (nvEncodeAPI.h) — count the enum, don't guess: `SUPPORT_YUV444_ENCODE`
@@ -311,7 +309,6 @@ const NVENC_INITIALIZE_PARAMS_SIZE: usize = 1808;
 const NVENC_RECONFIGURE_PARAMS_SIZE: usize = 1824;
 const NVENC_RECONFIGURE_INIT_PARAMS_OFFSET: usize = 8;
 const NVENC_RECONFIGURE_FLAGS_OFFSET: usize = 1816;
-const NVENC_CREATE_INPUT_BUFFER_SIZE: usize = 776;
 const NVENC_CREATE_BITSTREAM_BUFFER_SIZE: usize = 776;
 const NVENC_PIC_PARAMS_SIZE: usize = 3360;
 const NVENC_LOCK_BITSTREAM_SIZE: usize = 1552;
@@ -443,9 +440,27 @@ struct Nv12Import {
     registered: *mut c_void,
 }
 
+/// CPU-readable NV12 fallback resources.
+///
+/// The normal compositor path imports device-local memory directly into
+/// CUDA, so allocating these for every encoder wastes pinned system RAM and
+/// a CUDA surface. They are created only if an encoder is actually handed a
+/// CPU NV12 frame.
+struct Nv12Upload {
+    pinned_host: *mut u8,
+    pinned_size: usize,
+    cuda_devptr: gpu_libs::CUdeviceptr,
+    registered: *mut c_void,
+    pitch: u32,
+}
+
+fn nv12_upload_size(pitch: usize, height: u32) -> Option<usize> {
+    let height = height as usize;
+    pitch.checked_mul(height.checked_add(height / 2)?)
+}
+
 pub struct NvencDirectEncoder {
     encoder: *mut c_void,
-    input_buffer: *mut c_void, // fallback NV_ENC input buffer (unused with CUDA path)
     output_buffer: *mut c_void,
     width: u32,
     height: u32,
@@ -454,16 +469,9 @@ pub struct NvencDirectEncoder {
     codec_flag: u8, // SURFACE_FRAME_CODEC_* for the wire protocol
     fns: &'static NvEncFunctionList,
     cuda_ctx: gpu_libs::CUcontext,
-    // CUDA-accelerated input path: device memory + registered NVENC
-    // resources.  All CPU input is YUV converted host-side (full-range
-    // BT.601) — NVENC's own RGB→YUV conversion is limited-range with no
-    // knob, so no RGB buffer is registered at all.
-    pinned_host: *mut u8, // page-locked staging buffer
-    pinned_size: usize,
-    // NV12 buffer — semi-planar YUV, height * 1.5 bytes, different size from RGB.
-    cuda_devptr_nv12: gpu_libs::CUdeviceptr,
-    cuda_registered_nv12: *mut c_void,
-    nv12_pitch: u32,
+    /// Lazily allocated CUDA upload surface and pinned staging memory for
+    /// CPU-readable NV12 input. Zero-copy imports do not need either.
+    nv12_upload: Option<Nv12Upload>,
     /// Session chroma: true = 4:4:4.  Zero-copy buffers must arrive in
     /// the matching layout (planar YUV444 vs NV12).  Read only by the
     /// OPAQUE_FD encode path, which is Linux-only.
@@ -510,9 +518,7 @@ unsafe impl Send for NvencDirectEncoder {}
 /// Only the session is unwound here.  The CUDA context is the shared
 /// device primary context (see [`primary_ctx`]), retained for the
 /// process lifetime and used by other encoders — destroying it on an
-/// error path would take live encoders down with it.  The device and
-/// pinned-host allocations made after the session is opened are
-/// released explicitly at their own error paths instead.
+/// error path would take live encoders down with it.
 struct NvencInitGuard<'a> {
     fns: Option<&'a NvEncFunctionList>,
     encoder: *mut c_void,
@@ -833,8 +839,6 @@ impl NvencDirectEncoder {
             fns: Some(fns),
             encoder,
         };
-        let mut status;
-
         // Get preset config — uses exact SDK struct sizes to avoid version
         // mismatch (the driver validates struct size via the version tag).
         let mut preset_buf = vec![0u8; NVENC_PRESET_CONFIG_SIZE];
@@ -932,20 +936,6 @@ impl NvencDirectEncoder {
             );
         }
 
-        // Create input buffer (BGRA)
-        let mut input_buf = vec![0u8; NVENC_CREATE_INPUT_BUFFER_SIZE];
-        w32(&mut input_buf, 0, NV_ENC_CREATE_INPUT_BUFFER_VER);
-        w32(&mut input_buf, 4, width); // width @ 4
-        w32(&mut input_buf, 8, height); // height @ 8
-        w32(&mut input_buf, 16, NV_ENC_BUFFER_FORMAT_ARGB); // bufferFmt @ 16
-
-        let nv_status =
-            unsafe { (fns.nvEncCreateInputBuffer)(encoder, input_buf.as_mut_ptr() as *mut c_void) };
-        if nv_status != NV_ENC_SUCCESS {
-            return Err(format!("nvEncCreateInputBuffer failed: {nv_status}"));
-        }
-        let input_buffer_ptr = rptr(&input_buf, 24); // inputBuffer @ 24
-
         // Create bitstream (output) buffer
         let mut output_buf = vec![0u8; NVENC_CREATE_BITSTREAM_BUFFER_SIZE];
         w32(&mut output_buf, 0, NV_ENC_CREATE_BITSTREAM_BUFFER_VER);
@@ -958,66 +948,9 @@ impl NvencDirectEncoder {
         }
         let output_buffer_ptr = rptr(&output_buf, 16); // bitstreamBuffer @ 16
 
-        // --- NV12 buffer ---
-        // Semi-planar: Y plane (width × height) + UV plane (width × height/2).
-        // Use cuMemAllocPitch for aligned NV12 pitch (1 byte per Y sample).
-        let mut cuda_devptr_nv12: gpu_libs::CUdeviceptr = 0;
-        let mut nv12_pitch_bytes: usize = 0;
-        // Allocate for 1.5× height (Y + UV) so the whole NV12 frame fits.
-        // The pitch is determined by the Y plane width.
-        let nv12_alloc_h = height + height / 2;
-        status = unsafe {
-            (cuda.cuMemAllocPitch_v2)(
-                &mut cuda_devptr_nv12,
-                &mut nv12_pitch_bytes,
-                width as usize, // 1 byte per Y sample
-                nv12_alloc_h as usize,
-                16,
-            )
-        };
-        if status != 0 {
-            return Err(format!("cuMemAllocPitch (NV12) failed: {status}"));
-        }
-        let nv12_pitch = nv12_pitch_bytes as u32;
-        let mut reg_nv12 = vec![0u8; NVENC_REGISTER_RESOURCE_SIZE];
-        w32(&mut reg_nv12, 0, NV_ENC_REGISTER_RESOURCE_VER);
-        w32(&mut reg_nv12, 4, NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR);
-        w32(&mut reg_nv12, 8, width);
-        w32(&mut reg_nv12, 12, height);
-        w32(&mut reg_nv12, 16, nv12_pitch);
-        wptr(&mut reg_nv12, 24, cuda_devptr_nv12 as *mut c_void);
-        w32(&mut reg_nv12, 40, NV_ENC_BUFFER_FORMAT_NV12);
-        let nv_status =
-            unsafe { (fns.nvEncRegisterResource)(encoder, reg_nv12.as_mut_ptr() as *mut c_void) };
-        if nv_status != NV_ENC_SUCCESS {
-            unsafe { (cuda.cuMemFree_v2)(cuda_devptr_nv12) };
-            return Err(format!("nvEncRegisterResource (NV12) failed: {nv_status}"));
-        }
-        let cuda_registered_nv12 = rptr(&reg_nv12, 32);
-
-        // Allocate page-locked (pinned) host memory for staging planar
-        // uploads.  cuMemcpyHtoD from pinned memory uses DMA at full PCIe
-        // bandwidth; from pageable memory the driver must pin pages on
-        // every call (~60ms overhead at 1920×1080).  Sized generously —
-        // 4 bytes/pixel at the planar pitch covers NV12 (1.5) and
-        // YUV444 (3) with room to spare.
-        let pinned_size = nv12_pitch_bytes * height as usize * 4;
-        let mut pinned_host: *mut c_void = ptr::null_mut();
-        status = unsafe { (cuda.cuMemAllocHost_v2)(&mut pinned_host, pinned_size) };
-        if status != 0 {
-            // The shared context outlives this failure, so what init
-            // already allocated has to be unwound explicitly — destroying
-            // the context is no longer there to do it.
-            unsafe {
-                (fns.nvEncUnregisterResource)(encoder, cuda_registered_nv12);
-                (cuda.cuMemFree_v2)(cuda_devptr_nv12);
-            }
-            return Err(format!("cuMemAllocHost failed: {status}"));
-        }
-
         if verbose {
             eprintln!(
-                "[nvenc-direct] initialized {codec} encoder for {width}x{height} nv12_pitch={nv12_pitch} (CUDA upload)"
+                "[nvenc-direct] initialized {codec} encoder for {width}x{height} (zero-copy; CPU upload lazy)"
             );
         }
 
@@ -1028,7 +961,6 @@ impl NvencDirectEncoder {
 
         Ok(Self {
             encoder,
-            input_buffer: input_buffer_ptr,
             output_buffer: output_buffer_ptr,
             width,
             height,
@@ -1037,11 +969,7 @@ impl NvencDirectEncoder {
             codec_flag,
             fns,
             cuda_ctx: ctx,
-            pinned_host: pinned_host as *mut u8,
-            pinned_size,
-            cuda_devptr_nv12,
-            cuda_registered_nv12,
-            nv12_pitch,
+            nv12_upload: None,
             session_is_444: chroma.is_444(),
             verbose,
             h264_sps_pps: Vec::new(),
@@ -1530,6 +1458,112 @@ impl NvencDirectEncoder {
     // NV12 path — avoids NV12→RGBA→BGRA CPU conversion
     // -----------------------------------------------------------------------
 
+    /// Allocate the CPU-upload path on first use.
+    ///
+    /// A zero-copy encoder imports compositor buffers directly and never
+    /// reaches this method. Keeping the allocation here avoids pinning host
+    /// pages and reserving a CUDA surface for every live subscription.
+    fn ensure_nv12_upload(&mut self) -> Result<(), String> {
+        if self.nv12_upload.is_some() {
+            return Ok(());
+        }
+
+        let cuda = gpu_libs::cuda().map_err(|e| format!("CUDA: {e}"))?;
+        let status = unsafe { (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx) };
+        if status != 0 {
+            return Err(format!("cuCtxPushCurrent failed: {status}"));
+        }
+
+        let result = (|| {
+            // Semi-planar NV12 is one full-height Y plane plus one
+            // half-height interleaved UV plane, both at the same pitch.
+            let alloc_height = self.height as usize + self.height as usize / 2;
+            let mut cuda_devptr: gpu_libs::CUdeviceptr = 0;
+            let mut pitch_bytes = 0usize;
+            let status = unsafe {
+                (cuda.cuMemAllocPitch_v2)(
+                    &mut cuda_devptr,
+                    &mut pitch_bytes,
+                    self.width as usize,
+                    alloc_height,
+                    16,
+                )
+            };
+            if status != 0 {
+                return Err(format!("cuMemAllocPitch (NV12) failed: {status}"));
+            }
+
+            let pitch = match u32::try_from(pitch_bytes) {
+                Ok(pitch) => pitch,
+                Err(_) => {
+                    unsafe { (cuda.cuMemFree_v2)(cuda_devptr) };
+                    return Err(format!(
+                        "CUDA returned an NV12 pitch too large: {pitch_bytes}"
+                    ));
+                }
+            };
+            let pinned_size = match nv12_upload_size(pitch_bytes, self.height) {
+                Some(size) => size,
+                None => {
+                    unsafe { (cuda.cuMemFree_v2)(cuda_devptr) };
+                    return Err("NV12 upload size overflow".to_string());
+                }
+            };
+
+            let mut register = vec![0u8; NVENC_REGISTER_RESOURCE_SIZE];
+            w32(&mut register, 0, NV_ENC_REGISTER_RESOURCE_VER);
+            w32(&mut register, 4, NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR);
+            w32(&mut register, 8, self.width);
+            w32(&mut register, 12, self.height);
+            w32(&mut register, 16, pitch);
+            wptr(&mut register, 24, cuda_devptr as *mut c_void);
+            w32(&mut register, 40, NV_ENC_BUFFER_FORMAT_NV12);
+            let status = unsafe {
+                (self.fns.nvEncRegisterResource)(self.encoder, register.as_mut_ptr() as *mut c_void)
+            };
+            if status != NV_ENC_SUCCESS {
+                unsafe { (cuda.cuMemFree_v2)(cuda_devptr) };
+                return Err(format!("nvEncRegisterResource (NV12) failed: {status}"));
+            }
+            let registered = rptr(&register, 32);
+
+            // Pageable input makes the driver pin pages afresh on every
+            // transfer. A persistent page-locked staging area is still the
+            // right choice for CPU frames, but it is exactly NV12-sized
+            // instead of the old four-bytes-per-pixel over-allocation.
+            let mut pinned_host: *mut c_void = ptr::null_mut();
+            let status = unsafe { (cuda.cuMemAllocHost_v2)(&mut pinned_host, pinned_size) };
+            if status != 0 {
+                unsafe {
+                    (self.fns.nvEncUnregisterResource)(self.encoder, registered);
+                    (cuda.cuMemFree_v2)(cuda_devptr);
+                }
+                return Err(format!("cuMemAllocHost failed: {status}"));
+            }
+
+            Ok(Nv12Upload {
+                pinned_host: pinned_host as *mut u8,
+                pinned_size,
+                cuda_devptr,
+                registered,
+                pitch,
+            })
+        })();
+
+        let mut previous: gpu_libs::CUcontext = ptr::null_mut();
+        unsafe { (cuda.cuCtxPopCurrent_v2)(&mut previous) };
+
+        let upload = result?;
+        if self.verbose {
+            eprintln!(
+                "[nvenc-direct] allocated CPU NV12 fallback: {} bytes pinned, pitch={}",
+                upload.pinned_size, upload.pitch
+            );
+        }
+        self.nv12_upload = Some(upload);
+        Ok(())
+    }
+
     /// Encode from NV12 data directly.  Uploads Y+UV to the NV12-registered
     /// CUDA buffer so NVENC reads it natively — no colorspace conversion.
     ///
@@ -1543,16 +1577,21 @@ impl NvencDirectEncoder {
         uv_stride: usize,
         src_h: usize,
     ) -> Option<(Vec<u8>, bool)> {
+        if let Err(e) = self.ensure_nv12_upload() {
+            eprintln!("[nvenc-direct] cannot allocate CPU NV12 fallback: {e}");
+            return None;
+        }
+        let upload = self.nv12_upload.as_ref().expect("NV12 upload was ensured");
         let enc_w = self.width as usize;
         let enc_h = self.height as usize;
-        let nv12_pitch = self.nv12_pitch as usize;
+        let nv12_pitch = upload.pitch as usize;
         let y_plane_size = nv12_pitch * enc_h;
         let uv_h = enc_h / 2;
         let nv12_total = y_plane_size + nv12_pitch * uv_h;
 
         // Pack into pinned host memory with encoder pitch (strip source padding).
-        assert!(nv12_total <= self.pinned_size);
-        let dst = self.pinned_host;
+        assert!(nv12_total <= upload.pinned_size);
+        let dst = upload.pinned_host;
 
         // Y plane — copy row by row to strip source stride padding.
         for row in 0..enc_h {
@@ -1597,38 +1636,35 @@ impl NvencDirectEncoder {
             }
         }
 
-        self.upload_and_encode_nv12(nv12_total)
-    }
-
-    /// NV12-specific upload+encode.  Uses nv12_pitch for the encode params
-    /// since NV12 has a different pitch from the RGBA buffers.
-    fn upload_and_encode_nv12(&mut self, upload_bytes: usize) -> Option<(Vec<u8>, bool)> {
+        let devptr = upload.cuda_devptr;
+        let registered = upload.registered;
+        let pitch = upload.pitch;
         self.upload_and_encode_planar(
-            upload_bytes,
-            self.cuda_devptr_nv12,
-            self.cuda_registered_nv12,
+            nv12_total,
+            dst as *const c_void,
+            devptr,
+            registered,
+            pitch,
             NV_ENC_BUFFER_FORMAT_NV12,
         )
     }
 
     /// Upload `upload_bytes` of pinned staging into `devptr` and encode it
-    /// through `registered` with `fmt`.  All planar YUV inputs share
-    /// `nv12_pitch` (1 byte per sample at the same width and alignment).
+    /// through `registered` with `fmt`.
     fn upload_and_encode_planar(
         &mut self,
         upload_bytes: usize,
+        pinned_host: *const c_void,
         devptr: gpu_libs::CUdeviceptr,
         registered: *mut c_void,
+        pitch: u32,
         fmt: u32,
     ) -> Option<(Vec<u8>, bool)> {
-        let pitch = self.nv12_pitch;
         let cuda = crate::gpu_libs::cuda().expect("CUDA loaded during init");
 
         unsafe { (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx) };
 
-        let status = unsafe {
-            (cuda.cuMemcpyHtoD_v2)(devptr, self.pinned_host as *const c_void, upload_bytes)
-        };
+        let status = unsafe { (cuda.cuMemcpyHtoD_v2)(devptr, pinned_host, upload_bytes) };
         if status != 0 {
             eprintln!("[nvenc-direct] cuMemcpyHtoD (fmt={fmt:#x}) failed: {status}");
             let mut dummy: gpu_libs::CUcontext = ptr::null_mut();
@@ -1786,37 +1822,38 @@ fn for_each_annex_b_nal(data: &[u8], mut f: impl FnMut(u8, usize)) {
 impl Drop for NvencDirectEncoder {
     fn drop(&mut self) {
         unsafe {
+            let upload = self.nv12_upload.take();
             // Push the CUDA context — Drop may run on any thread.
-            if let Ok(cuda) = gpu_libs::cuda() {
-                (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx);
-            }
-            if !self.cuda_registered_nv12.is_null() {
-                (self.fns.nvEncUnregisterResource)(self.encoder, self.cuda_registered_nv12);
+            let cuda = gpu_libs::cuda().ok();
+            let pushed = cuda.is_some_and(|cuda| (cuda.cuCtxPushCurrent_v2)(self.cuda_ctx) == 0);
+            if let Some(upload) = &upload {
+                (self.fns.nvEncUnregisterResource)(self.encoder, upload.registered);
             }
             // Zero-copy imports: unregister before the encoder goes, and
             // release the CUDA side (which also closes the dup'd fd it took
             // ownership of at import).
             for (_, imp) in self.nv12_imports.drain() {
                 (self.fns.nvEncUnregisterResource)(self.encoder, imp.registered);
-                if let Ok(cuda) = gpu_libs::cuda()
+                if let Some(cuda) = cuda
                     && let Some(destroy) = cuda.cuDestroyExternalMemory
                 {
                     destroy(imp.ext_mem);
                 }
             }
-            (self.fns.nvEncDestroyInputBuffer)(self.encoder, self.input_buffer);
             (self.fns.nvEncDestroyBitstreamBuffer)(self.encoder, self.output_buffer);
             (self.fns.nvEncDestroyEncoder)(self.encoder);
-            if let Ok(cuda) = gpu_libs::cuda() {
-                if !self.pinned_host.is_null() {
-                    (cuda.cuMemFreeHost)(self.pinned_host as *mut c_void);
-                }
-                if self.cuda_devptr_nv12 != 0 {
-                    (cuda.cuMemFree_v2)(self.cuda_devptr_nv12);
+            if let Some(cuda) = cuda {
+                if let Some(upload) = upload {
+                    (cuda.cuMemFreeHost)(upload.pinned_host as *mut c_void);
+                    (cuda.cuMemFree_v2)(upload.cuda_devptr);
                 }
                 // The context is the shared device primary context — other
                 // encoders are using it, so it is never destroyed here (the
                 // retain in `primary_ctx` is process-lifetime).
+                if pushed {
+                    let mut previous: gpu_libs::CUcontext = ptr::null_mut();
+                    (cuda.cuCtxPopCurrent_v2)(&mut previous);
+                }
             }
         }
     }
@@ -1844,6 +1881,13 @@ mod tests {
         write_stream_gop(&mut config);
         assert_eq!(r32(&config, 20), NVENC_INFINITE_GOPLENGTH);
         assert_eq!(r32(&config, 24), 1, "infinite GOP requires IPP");
+    }
+
+    #[test]
+    fn cpu_nv12_staging_is_exactly_one_and_a_half_planes() {
+        assert_eq!(nv12_upload_size(1024, 708), Some(1_087_488));
+        assert_eq!(nv12_upload_size(2048, 1080), Some(3_317_760));
+        assert_eq!(nv12_upload_size(usize::MAX, 2), None);
     }
 
     #[test]

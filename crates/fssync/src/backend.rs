@@ -12,10 +12,27 @@ use std::sync::{Arc, Mutex};
 
 /// Keeps the native watch alive; dropping it unwatches.
 pub struct WatchBackend {
-    /// Shared with the reconciler, which registers and retires
-    /// directories through it for the root's whole lifetime.
+    /// Owned by the shared-root handle. The reconciler only receives a
+    /// weak registration handle: the watcher callback owns a channel
+    /// sender, so giving the receiver thread a strong clone would make the
+    /// root keep itself alive after its last client disappeared.
     pub watches: Arc<Watches>,
 }
+
+impl WatchBackend {
+    /// A non-owning registration handle for the reconciler.
+    ///
+    /// `RecommendedWatcher` owns the event callback, and that callback owns
+    /// a sender for the reconciler's inbox. The reconciler owns the matching
+    /// receiver. A strong `Arc<Watches>` here therefore forms
+    /// receiver -> watcher -> sender -> receiver and prevents both the
+    /// watcher and its worker threads from ever being released.
+    pub fn registrar(&self) -> Box<dyn BackendHandle> {
+        Box::new(WeakWatches(Arc::downgrade(&self.watches)))
+    }
+}
+
+struct WeakWatches(std::sync::Weak<Watches>);
 
 /// Whether per-directory arming is worth it for a filtered root.
 ///
@@ -160,18 +177,24 @@ impl Watches {
     }
 }
 
-impl BackendHandle for Arc<Watches> {
+impl BackendHandle for WeakWatches {
     fn add_dir(&self, dir: &Path) -> bool {
-        Watches::add_dir(self, dir)
+        self.0.upgrade().is_some_and(|watches| watches.add_dir(dir))
     }
     fn watch_outside(&self, dir: &Path) {
-        Watches::watch_outside(self, dir);
+        if let Some(watches) = self.0.upgrade() {
+            watches.watch_outside(dir);
+        }
     }
     fn remove_dir(&self, dir: &Path) {
-        Watches::remove_dir(self, dir);
+        if let Some(watches) = self.0.upgrade() {
+            watches.remove_dir(dir);
+        }
     }
     fn retain_dirs(&self, keep: &dyn Fn(&Path) -> bool) {
-        Watches::retain_dirs(self, keep);
+        if let Some(watches) = self.0.upgrade() {
+            watches.retain_dirs(keep);
+        }
     }
 }
 

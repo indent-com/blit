@@ -360,6 +360,18 @@ pub struct SharedRootHandle {
     learned: Mutex<std::collections::HashMap<String, NodeMeta>>,
     /// Keeps the native watch alive for the root's lifetime.
     _backend: Mutex<Option<backend::WatchBackend>>,
+    #[cfg(test)]
+    worker_done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+struct MarkDone(Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(test)]
+impl Drop for MarkDone {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl SharedRootHandle {
@@ -521,10 +533,12 @@ fn open_root_inner(
     } else {
         None
     };
-    // Cloned before the handle takes ownership: the reconciler registers
-    // and retires directories through it for the root's whole lifetime.
+    // The reconciler must not own the watcher: the watch callback owns a
+    // sender for `rx`, so a strong registration handle would make the root
+    // self-retaining. The weak handle becomes inert as the shared handle
+    // drops, at which point the inbox disconnects and the worker exits.
     let registrar: Box<dyn BackendHandle> = match &backend {
-        Some(backend) => Box::new(backend.watches.clone()),
+        Some(backend) => backend.registrar(),
         None => Box::new(NoopBackend),
     };
     let mut map = registry().lock().unwrap();
@@ -539,6 +553,8 @@ fn open_root_inner(
         return Ok(existing);
     }
     let closed: Arc<OnceLock<u8>> = Arc::new(OnceLock::new());
+    #[cfg(test)]
+    let worker_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = Arc::new(SharedRootHandle {
         key: key.clone(),
         single,
@@ -546,10 +562,16 @@ fn open_root_inner(
         closed: closed.clone(),
         learned: Mutex::new(Default::default()),
         _backend: Mutex::new(backend),
+        #[cfg(test)]
+        worker_done: worker_done.clone(),
     });
     std::thread::Builder::new()
         .name("blit-fsroot".into())
-        .spawn(move || Reconciler::new(key, single, rx, registrar, closed).run())
+        .spawn(move || {
+            #[cfg(test)]
+            let _done = MarkDone(worker_done);
+            Reconciler::new(key, single, rx, registrar, closed).run()
+        })
         .expect("spawn fssync reconciler");
     map.insert(reg_key, Arc::downgrade(&handle));
     Ok(handle)
@@ -7181,6 +7203,30 @@ mod tests {
 
         handle.command(Command::Stop);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A watched root must not keep itself alive through
+    /// reconciler -> watcher -> callback sender -> reconciler. This used to
+    /// strand one `blit-fsroot` plus notify's worker threads for every root
+    /// ever opened by a connection.
+    #[test]
+    fn watched_root_worker_exits_when_last_handle_drops() {
+        let root = temp_dir().canonicalize().unwrap();
+        fs::write(root.join("seed.txt"), b"seed").unwrap();
+
+        let shared = open_root(test_key(&root)).expect("arm native watch");
+        let done = shared.worker_done.clone();
+        drop(shared);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !done.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            done.load(Ordering::Acquire),
+            "reconciler still owns its native watcher after the root handle dropped"
+        );
     }
 
     /// Full path: real notify backend → hints → engine → mirror.

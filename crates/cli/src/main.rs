@@ -26,7 +26,31 @@ use cli::{
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Bound arenas used by native libraries that bypass Rust's allocator.
+///
+/// NVENC/CUDA, notify, and other C dependencies still call glibc malloc.
+/// Its default permits up to eight arenas per CPU, and a heavily threaded
+/// server can leave hundreds of 64 MiB arena mappings resident after bursts.
+/// Rust allocations use mimalloc, so four native arenas provide concurrency
+/// without multiplying retained memory by the server's thread count. An
+/// explicit `MALLOC_ARENA_MAX` remains authoritative.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn limit_native_malloc_arenas() {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        // SAFETY: `mallopt` is process-global and this is the first action in
+        // main, before blit creates any worker threads.
+        unsafe {
+            libc::mallopt(libc::M_ARENA_MAX, 4);
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn limit_native_malloc_arenas() {}
+
 fn main() {
+    limit_native_malloc_arenas();
+
     // ProxyDaemon must run synchronously — blit_proxy::run() builds its own
     // tokio runtime, which panics if called from within an existing one.
     // Detect this subcommand before entering the async runtime. Use `any()`
