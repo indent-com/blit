@@ -1465,9 +1465,11 @@ impl VulkanVideoEncoder {
         // 5. Session parameters (AV1 sequence header)
         // ---------------------------------------------------------------
         let color_config = StdVideoAV1ColorConfig {
-            // Bit 1 = color_range (bit 0 is mono_chrome): full swing.
-            // blit's pixels are full-range BT.601 end to end.
-            flags: 1 << 1,
+            // The sequence header must describe the same conversion as
+            // NVENC.  Leaving these values unspecified lets decoders choose
+            // a matrix (commonly BT.709 for HD), even though blit's shaders
+            // produced full-range BT.601 YUV.
+            flags: (1 << 1) | (1 << 3), // color_range | description_present
             bit_depth: 8,
             // 0/0 is 4:4:4, 1/1 is 4:2:0.  These are not free choices: the
             // profile above fixes them (High implies 0/0, Main implies
@@ -1476,10 +1478,10 @@ impl VulkanVideoEncoder {
             subsampling_x: (!is_444) as u8,
             subsampling_y: (!is_444) as u8,
             _reserved1: 0,
-            color_primaries: 2,          // CP_UNSPECIFIED
-            transfer_characteristics: 2, // TC_UNSPECIFIED
-            matrix_coefficients: 2,      // MC_UNSPECIFIED
-            chroma_sample_position: 0,   // Unknown
+            color_primaries: AV1_COLOR_PRIMARIES_BT709,
+            transfer_characteristics: AV1_TRANSFER_CHARACTERISTICS_SRGB,
+            matrix_coefficients: AV1_MATRIX_COEFFICIENTS_SMPTE170M,
+            chroma_sample_position: 0, // Unknown
         };
 
         let mut seq_flags = StdVideoAV1SequenceHeaderFlags::new();
@@ -2295,10 +2297,9 @@ fn av1_sequence_header_obu(
     w.put(1, 0); // enable_superres
     w.put(1, 1); // enable_cdef — the hardware codes cdef_idx symbols
     w.put(1, 0); // enable_restoration
-    // color_config(): 8-bit, no colour description (the std struct's
-    // primaries/transfer/matrix are all 2 = unspecified, so nothing is lost
-    // by omitting them).  Two fields are conditional on the profile, and
-    // writing them anyway would shift every bit after them:
+    // color_config(): 8-bit, with the same explicit colour description as
+    // NVENC. Two fields are conditional on the profile, and writing them
+    // anyway would shift every bit after them:
     //  - `mono_chrome` is only coded for profiles other than High, which
     //    fixes it at 0.
     //  - `chroma_sample_position` is only coded when both subsampling flags
@@ -2309,7 +2310,10 @@ fn av1_sequence_header_obu(
     if !is_444 {
         w.put(1, 0); // mono_chrome
     }
-    w.put(1, 0); // color_description_present_flag
+    w.put(1, 1); // color_description_present_flag
+    w.put(8, AV1_COLOR_PRIMARIES_BT709);
+    w.put(8, AV1_TRANSFER_CHARACTERISTICS_SRGB);
+    w.put(8, AV1_MATRIX_COEFFICIENTS_SMPTE170M);
     w.put(1, 1); // color_range: full swing (blit is full-range end to end)
     if !is_444 {
         w.put(2, 0); // chroma_sample_position: unknown
@@ -2792,6 +2796,13 @@ struct StdVideoAV1ColorConfig {
     matrix_coefficients: u32,
     chroma_sample_position: u32,
 }
+
+// Blit's BGRA inputs are sRGB (BT.709 primaries and sRGB transfer), while
+// the AV1 Vulkan and NVENC conversion paths use the full-range BT.601 matrix.
+// Keep these numeric AV1 enum values in sync with the NVENC configuration.
+const AV1_COLOR_PRIMARIES_BT709: u32 = 1;
+const AV1_TRANSFER_CHARACTERISTICS_SRGB: u32 = 13;
+const AV1_MATRIX_COEFFICIENTS_SMPTE170M: u32 = 6;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -3417,7 +3428,18 @@ mod tests {
             if !is_444 {
                 assert_eq!(r.f(1), 0, "mono_chrome, not coded for High");
             }
-            assert_eq!(r.f(1), 0, "color_description_present_flag");
+            assert_eq!(r.f(1), 1, "color_description_present_flag");
+            assert_eq!(r.f(8), AV1_COLOR_PRIMARIES_BT709, "color_primaries");
+            assert_eq!(
+                r.f(8),
+                AV1_TRANSFER_CHARACTERISTICS_SRGB,
+                "transfer_characteristics"
+            );
+            assert_eq!(
+                r.f(8),
+                AV1_MATRIX_COEFFICIENTS_SMPTE170M,
+                "matrix_coefficients"
+            );
             assert_eq!(r.f(1), 1, "color_range: full swing");
             if !is_444 {
                 assert_eq!(r.f(2), 0, "chroma_sample_position, 4:2:0 only");
@@ -3478,11 +3500,14 @@ mod tests {
         0, 0, 0, 1, 103, 100, 0, 40, 172, 180, 3, 192, 17, 61, 77, 54, 2, // SPS
         0, 0, 0, 1, 104, 238, 6, 112, 192, // PPS
     ];
-    const GOLDEN_AV1_SEQ_1080P: &[u8] = &[10, 11, 0, 0, 0, 66, 171, 191, 195, 112, 9, 228, 33];
+    const GOLDEN_AV1_SEQ_1080P: &[u8] = &[
+        10, 14, 0, 0, 0, 66, 171, 191, 195, 112, 9, 228, 64, 67, 65, 161,
+    ];
     /// The same header at 4:4:4.  Verified by handing it to ffmpeg's AV1
     /// parser, which reads it as profile High; the variant that keeps the
-    /// 4:2:0 field layout under a High profile — same length, differing
-    /// only in this last byte — is rejected there with `trailing_one_bit
-    /// out of range`.
-    const GOLDEN_AV1_SEQ_1080P_444: &[u8] = &[10, 11, 32, 0, 0, 66, 171, 191, 195, 112, 9, 228, 72];
+    /// 4:2:0 field layout under a High profile is rejected there with
+    /// `trailing_one_bit out of range`.
+    const GOLDEN_AV1_SEQ_1080P_444: &[u8] = &[
+        10, 14, 32, 0, 0, 66, 171, 191, 195, 112, 9, 228, 128, 134, 131, 72,
+    ];
 }

@@ -19,6 +19,25 @@ layout(push_constant) uniform Params {
     uint enc_height;
 };
 
+// Keep this byte-for-byte identical to the NVENC buffer shader and
+// surface_encoder.rs's CPU fallback. Vulkan Video and NVENC may consume
+// different target layouts, but must receive identical YUV values.
+ivec3 rgb8(vec4 bgra) {
+    return ivec3(round(bgra.zyx * 255.0));
+}
+
+int rgb_to_y8(ivec3 rgb) {
+    return clamp((77 * rgb.r + 150 * rgb.g + 29 * rgb.b + 128) >> 8, 0, 255);
+}
+
+int rgb_to_u8(ivec3 rgb) {
+    return clamp(((-43 * rgb.r - 85 * rgb.g + 128 * rgb.b + 128) >> 8) + 128, 0, 255);
+}
+
+int rgb_to_v8(ivec3 rgb) {
+    return clamp(((128 * rgb.r - 107 * rgb.g - 21 * rgb.b + 128) >> 8) + 128, 0, 255);
+}
+
 void main() {
     uvec2 pos = gl_GlobalInvocationID.xy;
     if (pos.x >= enc_width || pos.y >= enc_height) return;
@@ -26,13 +45,10 @@ void main() {
     // Clamp to source dimensions for edge-extension into padding.
     ivec2 src = ivec2(min(pos.x, src_width - 1u), min(pos.y, src_height - 1u));
     vec4 bgra = imageLoad(bgra_in, src);
-    float r = bgra.z;  // BGRA: z=R
-    float g = bgra.y;  // BGRA: y=G
-    float b = bgra.x;  // BGRA: x=B
 
     // BT.601 full-range RGB→Y
-    float y_val = 0.299 * r + 0.587 * g + 0.114 * b;
-    imageStore(y_out, ivec2(pos), vec4(y_val, 0, 0, 0));
+    int y_byte = rgb_to_y8(rgb8(bgra));
+    imageStore(y_out, ivec2(pos), vec4(float(y_byte) / 255.0, 0, 0, 0));
 
     // Write UV at half resolution (every 2x2 block).
     if ((pos.x & 1u) == 0u && (pos.y & 1u) == 0u) {
@@ -44,11 +60,12 @@ void main() {
         vec4 s01 = imageLoad(bgra_in, s01_pos);
         vec4 s11 = imageLoad(bgra_in, s11_pos);
 
-        float ar = (s00.z + s10.z + s01.z + s11.z) * 0.25;
-        float ag = (s00.y + s10.y + s01.y + s11.y) * 0.25;
-        float ab = (s00.x + s10.x + s01.x + s11.x) * 0.25;
-        float u_val = -0.169 * ar - 0.331 * ag + 0.500 * ab + 0.5;
-        float v_val =  0.500 * ar - 0.419 * ag - 0.081 * ab + 0.5;
+        int u_sum = rgb_to_u8(rgb8(s00)) + rgb_to_u8(rgb8(s10))
+                  + rgb_to_u8(rgb8(s01)) + rgb_to_u8(rgb8(s11));
+        int v_sum = rgb_to_v8(rgb8(s00)) + rgb_to_v8(rgb8(s10))
+                  + rgb_to_v8(rgb8(s01)) + rgb_to_v8(rgb8(s11));
+        float u_val = float(u_sum / 4) / 255.0;
+        float v_val = float(v_sum / 4) / 255.0;
 
         imageStore(uv_out, ivec2(pos >> 1u), vec4(u_val, v_val, 0, 0));
     }
