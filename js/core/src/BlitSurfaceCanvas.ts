@@ -711,8 +711,9 @@ export interface BlitSurfaceCanvasOptions {
    * SurfaceStore, but never create an encoder themselves.  Defaults to true.
    */
   live?: boolean;
-  /** `pointer` keeps Blit's single-finger click/scroll emulation. `direct`
-   * forwards every touchscreen contact to the Wayland client's `wl_touch`. */
+  /** `direct` (the default) forwards every touchscreen contact to the Wayland
+   * client's `wl_touch`. `pointer` opts into Blit's single-finger
+   * click/scroll emulation. */
   touchMode?: SurfaceTouchMode;
 }
 
@@ -1473,7 +1474,7 @@ export class BlitSurfaceCanvas {
     this._surfaceId = options.surfaceId;
     this._live = options.live !== false;
     this._expectsDisplaySize = options.resizable === true;
-    this._touchMode = options.touchMode ?? "pointer";
+    this._touchMode = options.touchMode ?? "direct";
   }
 
   // -----------------------------------------------------------------------
@@ -3140,7 +3141,10 @@ export class BlitSurfaceCanvas {
     )
       return;
     const conn = this.getConn();
-    if (!conn) return;
+    // Embedders may provide a connection-like workspace compiled against a
+    // core version predating direct touch. Defaulting to direct must remain
+    // harmless for those connections, just as an unsupported server is.
+    if (!conn || typeof conn.acquireSurfaceTouch !== "function") return;
     conn.acquireSurfaceTouch();
     this.touchCapabilityAcquired = true;
   }

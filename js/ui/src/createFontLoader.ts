@@ -25,6 +25,23 @@ function splitFontFamilies(value: string): string[] {
     .filter(Boolean);
 }
 
+/**
+ * The one family a font stack is *about*, for naming it to the user.
+ *
+ * Everything after the first entry is a fallback, and the generics at the tail
+ * are there so text renders at all — "JetBrains Mono, ui-monospace, monospace"
+ * is the JetBrains Mono choice. A stack of nothing but generics (the default)
+ * has no choice behind it, so its own first entry is the honest answer.
+ */
+export function primaryFontFamily(stack: string): string {
+  const families = splitFontFamilies(stack);
+  return (
+    families.find((family) => !CSS_GENERIC.has(family.toLowerCase())) ??
+    families[0] ??
+    ""
+  );
+}
+
 function fontStyleId(family: string): string {
   return `blit-font-${family.replace(/\s+/g, "-").toLowerCase()}`;
 }

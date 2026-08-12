@@ -33,8 +33,10 @@ export interface KeyboardShortcutHandlers {
   focusedSurfaceConnId: () => ConnectionId | null;
   /** Close / request-close the focused surface */
   closeSurface: (connectionId: ConnectionId, surfaceId: number) => void;
-  /** Unfocus the surface and return to the terminal view */
+  /** Background the standalone surface and leave the main view empty. */
   unfocusSurface: () => void;
+  /** Background the standalone terminal and leave the main view empty. */
+  backgroundFocusedSession: () => void;
 
   toggleOverlay: (target: Overlay) => void;
   /** Send Ctrl-K to the terminal or Wayland surface in the focused pane. */
@@ -365,7 +367,9 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
           e.preventDefault();
           return;
         }
-        // Non-BSP surface focus: unfocus the surface (return to terminal view).
+        // Non-BSP surface focus: background it and empty the main view. The
+        // terminal still focused by the core was already behind the surface;
+        // it must not become an extra foreground step here.
         if (h.focusedSurfaceId() != null) {
           e.preventDefault();
           h.unfocusSurface();
@@ -376,12 +380,12 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
           h.clearFocusedPaneAssignment();
           return;
         }
-        // Single-terminal mode: unfocus the current session so the main
-        // area shows the EmptyState and the terminal lives only in the
-        // sidebar.
+        // Single-terminal mode: park the current session at the UI layer so
+        // the main area shows the EmptyState and the terminal lives only in
+        // the sidebar. Core focus cannot represent a durable null selection.
         if (h.focusedSessionId() != null) {
           e.preventDefault();
-          h.workspace.focusSession(null);
+          h.backgroundFocusedSession();
           return;
         }
         return;

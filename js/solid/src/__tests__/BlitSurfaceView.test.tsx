@@ -128,6 +128,11 @@ describe("BlitSurfaceView zoom", () => {
     expect(mockSetTouchMode).toHaveBeenLastCalledWith("pointer");
   });
 
+  it("uses direct touch when touchMode is absent", () => {
+    renderView(() => 1);
+    expect(mockSetTouchMode).toHaveBeenLastCalledWith("direct");
+  });
+
   it("treats an absent zoom as 100%", () => {
     renderView(() => undefined);
     expect(mockSetDisplaySize).toHaveBeenLastCalledWith(800, 600, 120, 120);

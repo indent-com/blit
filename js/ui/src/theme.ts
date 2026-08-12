@@ -201,6 +201,9 @@ export const sidebarWidth = "20em";
 /** Centralized z-index scale (increments of 10 for easy insertion). */
 export const z = {
   exitedBanner: 10,
+  // The status bar's overflow menu: above the workspace it covers, below the
+  // overlays it opens.
+  statusMenu: 15,
   overlay: 20,
   disconnected: 30,
   debugPanel: 40,

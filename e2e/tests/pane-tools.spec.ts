@@ -130,6 +130,9 @@ test.describe("Pane multitool on a main-view terminal", () => {
       page.getByRole("button", { name: "New terminal" }).first(),
     ).toBeVisible({ timeout: 10_000 });
     await expect(
+      page.locator('input[name^="blit-pane-cmd-"]').first(),
+    ).toHaveAttribute("autocapitalize", "off");
+    await expect(
       page.locator('[data-blit-preview-panel] [draggable="true"]').first(),
     ).toBeVisible();
 
@@ -141,6 +144,22 @@ test.describe("Pane multitool on a main-view terminal", () => {
     await expect(page.locator("canvas").first()).toBeVisible({
       timeout: 10_000,
     });
+  });
+
+  test("the background shortcut leaves the standalone view empty", async ({
+    page,
+  }) => {
+    await authenticate(page);
+    await newTerminal(page);
+
+    await page.keyboard.press("Control+Shift+Q");
+
+    await expect(
+      page.getByRole("button", { name: "New terminal" }).first(),
+    ).toBeVisible({ timeout: 10_000 });
+    await expect(
+      page.locator('[data-blit-preview-panel] [draggable="true"]').first(),
+    ).toBeVisible();
   });
 
   test("no pinned close button anywhere: every ✕ rides the multitool", async ({

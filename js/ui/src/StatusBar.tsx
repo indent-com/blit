@@ -1,6 +1,6 @@
 import { WebPaneNav } from "./WebPaneNav";
 import type { WebPaneHandle } from "./WebPane";
-import { Show, For, createMemo, type JSX } from "solid-js";
+import { Show, For, createMemo, createSignal, type JSX } from "solid-js";
 import { onMount, onCleanup } from "solid-js";
 import type {
   BlitSession,
@@ -14,6 +14,7 @@ import type {
   BlitActivity,
 } from "@blit-sh/core";
 import { formatBw } from "./createMetrics";
+import { primaryFontFamily } from "./createFontLoader";
 import type { Metrics, RenderSampleRing, NetSampleRing } from "./createMetrics";
 import {
   sessionName,
@@ -37,6 +38,19 @@ import {
 import { lineWrap, toggleLineWrap } from "./ide/editorPrefs";
 import { FileViewSwitcher } from "./ide/FileViewSwitcher";
 import { activityDescription, activityPercent } from "./activityStatus";
+import { nextCompact } from "./statusBarFit";
+
+/** One of the status bar's right-end toggles, in either of its two homes: a
+ *  bare glyph in the bar, or a labelled row in the overflow menu. */
+type StatusTool = {
+  key: string;
+  glyph: () => JSX.Element;
+  /** Menu wording; doubles as the glyph's tooltip. */
+  label: () => string;
+  /** The toggle is off — drawn faint in both homes. */
+  dim: () => boolean;
+  activate: () => void;
+};
 
 type SurfaceDebugInfo = {
   surfaceId: number;
@@ -150,6 +164,135 @@ export function StatusBar(props: {
   });
   const dotSize = () => (touch() ? 14 : 7);
 
+  // ── Right-end toggles: bar glyphs when they fit, a menu when they don't ──
+  const tools = createMemo<StatusTool[]>(() => {
+    const list: StatusTool[] = [
+      {
+        key: "debug",
+        glyph: () => "◆",
+        label: () => t("statusbar.debugStats"),
+        dim: () => !props.debug,
+        activate: () => props.toggleDebug(),
+      },
+    ];
+    if (props.audioAvailable || props.hasSurfaces)
+      list.push({
+        key: "media",
+        glyph: () => "♪",
+        label: () => t("statusbar.media"),
+        dim: () => !props.audioAvailable || props.audioMuted,
+        activate: () => props.onMedia(),
+      });
+    list.push(
+      {
+        key: "dock",
+        glyph: () => "◧",
+        label: () => t("statusbar.leftDock"),
+        dim: () => !props.leftDockOpen,
+        activate: () => props.onToggleLeftDock(),
+      },
+      {
+        key: "preview",
+        glyph: () => "◨",
+        label: () => t("statusbar.previewPanel"),
+        dim: () => !props.previewPanelOpen,
+        activate: () => props.onPreviewPanel(),
+      },
+      {
+        key: "palette",
+        glyph: () => (props.palette.dark ? "◑" : "◐"),
+        label: () => tp("statusbar.paletteTitle", { name: props.palette.name }),
+        dim: () => false,
+        activate: () => props.onPalette(),
+      },
+      {
+        key: "font",
+        // The font button carries its own loading state, which is why the
+        // glyph is a thunk returning JSX rather than a character.
+        glyph: () => (
+          <Show
+            when={!props.fontLoading}
+            fallback={
+              <span style={{ opacity: 0.5, "font-size": `${scale().xs}px` }}>
+                {t("statusbar.loadingFont")}
+              </span>
+            }
+          >
+            Aa
+          </Show>
+        ),
+        // Named the way the palette is: a settings entry should say what it
+        // is currently set to, not just which setting it opens.
+        label: () =>
+          tp("statusbar.fontTitleNamed", {
+            name: primaryFontFamily(props.fontFamily),
+            size: props.fontSize,
+          }),
+        dim: () => false,
+        activate: () => props.onFont(),
+      },
+    );
+    return list;
+  });
+
+  const [compact, setCompact] = createSignal(false);
+  const [menuOpen, setMenuOpen] = createSignal(false);
+  let identityEl: HTMLSpanElement | undefined;
+  let clusterEl: HTMLSpanElement | undefined;
+  // Last width the cluster had while expanded — what unfolding would cost.
+  let expandedIcons: number | null = null;
+  // Roughly a dozen characters of title: below that the identity is an
+  // ellipsis with a prefix, and the icons are better off in a menu.
+  const minIdentity = () => scale().md * 12;
+
+  const measure = () => {
+    if (!identityEl || !clusterEl) return;
+    const icons = clusterEl.getBoundingClientRect().width;
+    if (!compact()) expandedIcons = icons;
+    const next = nextCompact(compact(), {
+      identity: identityEl.getBoundingClientRect().width,
+      icons,
+      expandedIcons,
+      minIdentity: minIdentity(),
+    });
+    if (next === compact()) return;
+    setCompact(next);
+    // The menu only exists while collapsed; leaving it open through the
+    // transition would strand a popup over a bar that already shows the icons.
+    if (!next) setMenuOpen(false);
+  };
+
+  onMount(() => {
+    measure();
+    if (typeof ResizeObserver !== "undefined") {
+      // Both ends move on their own: the identity with the window, the cluster
+      // with what the bar carries (an editor brings Save/Def/Refs with it).
+      const ro = new ResizeObserver(() => measure());
+      if (identityEl) ro.observe(identityEl);
+      if (clusterEl) ro.observe(clusterEl);
+      onCleanup(() => ro.disconnect());
+    }
+    const onPointerDown = (e: PointerEvent) => {
+      if (!menuOpen()) return;
+      if (clusterEl && !clusterEl.contains(e.target as Node))
+        setMenuOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!menuOpen() || e.key !== "Escape") return;
+      // Swallowed: Escape belongs to the menu while it is up, not to the
+      // terminal underneath (which would receive it as an ESC byte).
+      e.preventDefault();
+      e.stopPropagation();
+      setMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    onCleanup(() => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+    });
+  });
+
   // Count connections by bucket: ok / busy / bad
   const connCounts = () => {
     let ok = 0,
@@ -200,6 +343,7 @@ export function StatusBar(props: {
         </Show>
       </button>
       <span
+        ref={identityEl}
         style={{
           flex: 1,
           "min-width": 0,
@@ -367,73 +511,109 @@ export function StatusBar(props: {
           )
         }
       </Show>
-      <button
-        onClick={props.toggleDebug}
-        style={{ ...iconButtonStyle(), opacity: props.debug ? 1 : 0.3 }}
-        title={t("statusbar.debugStats")}
-      >
-        {"\u25C6"}
-      </button>
-      <Show when={props.audioAvailable || props.hasSurfaces}>
-        <button
-          onClick={props.onMedia}
-          style={{
-            ...iconButtonStyle(),
-            opacity: !props.audioAvailable || props.audioMuted ? 0.5 : 1,
-          }}
-          title="Media settings"
-        >
-          {"\u266A"}
-        </button>
-      </Show>
-      <button
-        onClick={props.onToggleLeftDock}
+      {/* The toggles keep their own width: whatever the bar runs out of comes
+          out of the identity, which is what `measure` watches. */}
+      <span
+        ref={clusterEl}
         style={{
-          ...iconButtonStyle(),
-          opacity: props.leftDockOpen ? 1 : 0.3,
+          display: "flex",
+          "align-items": "center",
+          "flex-shrink": 0,
+          position: "relative",
         }}
-        title="Toggle IDE dock (Ctrl+Shift+E)"
-      >
-        {"\u25E7"}
-      </button>
-      <button
-        onClick={props.onPreviewPanel}
-        style={{
-          ...iconButtonStyle(),
-          opacity: props.previewPanelOpen ? 1 : 0.3,
-        }}
-        title={t("statusbar.previewPanel")}
-      >
-        {"\u25E8"}
-      </button>
-      <button
-        onClick={props.onPalette}
-        style={iconButtonStyle()}
-        title={tp("statusbar.paletteTitle", { name: props.palette.name })}
-      >
-        {props.palette.dark ? "\u25D1" : "\u25D0"}
-      </button>
-      <button
-        onClick={props.onFont}
-        style={iconButtonStyle()}
-        title={t("statusbar.fontTitle")}
       >
         <Show
-          when={!props.fontLoading}
+          when={compact()}
           fallback={
-            <span
-              style={{
-                opacity: 0.5,
-                "font-size": `${scale().xs}px`,
-              }}
-            >
-              {t("statusbar.loadingFont")}
-            </span>
+            <For each={tools()}>
+              {(tool) => (
+                <button
+                  data-status-tool={tool.key}
+                  onClick={tool.activate}
+                  style={{
+                    ...iconButtonStyle(),
+                    opacity: tool.dim() ? 0.3 : 1,
+                  }}
+                  title={tool.label()}
+                >
+                  {tool.glyph()}
+                </button>
+              )}
+            </For>
           }
         >
-          Aa
+          <button
+            onClick={() => setMenuOpen((open) => !open)}
+            style={{ ...iconButtonStyle(), opacity: menuOpen() ? 1 : 0.7 }}
+            title={t("statusbar.more")}
+            aria-label={t("statusbar.more")}
+            aria-haspopup="menu"
+            aria-expanded={menuOpen()}
+          >
+            {"\u22EF"}
+          </button>
+          <Show when={menuOpen()}>
+            <div
+              role="menu"
+              style={{
+                position: "absolute",
+                bottom: "100%",
+                right: 0,
+                "margin-bottom": `${scale().tightGap}px`,
+                display: "flex",
+                "flex-direction": "column",
+                "min-width": "12em",
+                "background-color": theme().solidPanelBg,
+                border: `1px solid ${theme().border}`,
+                "box-shadow": props.palette.dark
+                  ? "0 8px 24px rgba(0,0,0,0.45)"
+                  : "0 8px 24px rgba(0,0,0,0.15)",
+                "z-index": z.statusMenu,
+              }}
+            >
+              <For each={tools()}>
+                {(tool) => (
+                  <button
+                    role="menuitem"
+                    data-status-tool={tool.key}
+                    onClick={() => {
+                      tool.activate();
+                      setMenuOpen(false);
+                    }}
+                    style={{
+                      ...ui.btn,
+                      display: "flex",
+                      "align-items": "center",
+                      gap: `${scale().gap}px`,
+                      padding: `${scale().controlY}px ${scale().controlX}px`,
+                      "font-size": `${scale().md}px`,
+                      "white-space": "nowrap",
+                      "text-align": "left",
+                      opacity: 1,
+                    }}
+                  >
+                    <span
+                      style={{
+                        "flex-shrink": 0,
+                        "min-width": `${iconSize()}px`,
+                        "font-size": `${iconSize()}px`,
+                        "line-height": 1,
+                        "text-align": "center",
+                        opacity: tool.dim() ? 0.3 : 1,
+                      }}
+                    >
+                      {tool.glyph()}
+                    </span>
+                    <span style={{ opacity: tool.dim() ? 0.7 : 1 }}>
+                      {tool.label()}
+                    </span>
+                  </button>
+                )}
+              </For>
+            </div>
+          </Show>
         </Show>
-      </button>
+      </span>
 
       {/* Keyboard toggle — mobile only */}
       <Show when={props.isMobileTouch}>

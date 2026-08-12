@@ -66,7 +66,7 @@ export const BlitSurfaceView = forwardRef<
   }, [workspace, connectionId, surfaceId, live]);
 
   useEffect(() => {
-    canvasRef.current?.setTouchMode(touchMode ?? "pointer");
+    canvasRef.current?.setTouchMode(touchMode ?? "direct");
   }, [touchMode]);
 
   return (

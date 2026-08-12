@@ -605,8 +605,8 @@ Pointer marks come from `C2S_SURFACE_POINTER` and from `C2S_SURFACE_DRAG_MOTION`
 — a browser fires no mouse events while a drag is in flight, so without the
 latter the marks would sit frozen for the whole drag. Touch marks come from
 `C2S_SURFACE_TOUCH`, so they appear only for a viewer in direct-touch mode. In
-the default pointer mode a touchscreen is already emulating a pointer, and it is
-that pointer which gets mirrored.
+pointer compatibility mode a touchscreen is already emulating a pointer, and it
+is that pointer which gets mirrored.
 
 Marks are retired when their owner moves to another surface, sends
 `C2S_SURFACE_POINTER` with `type = 3` (the pointer left the drawn area), ends a
@@ -664,6 +664,9 @@ reconnects. `content_hint` and `content_purpose` retain their Wayland enum
 values and let the viewer choose an appropriate HTML input mode. Opening a
 platform virtual keyboard remains best-effort because browsers may require a
 recent user activation.
+The Blit UI honors fresh requests by default; its device-local **Media →
+On-screen keyboard** preference can opt out without changing the forwarded
+Wayland state or the manual keyboard control.
 
 ### Direct touch
 

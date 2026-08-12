@@ -137,7 +137,7 @@ export function BSPContainer(props: {
   surfaceZoom?: number;
   /** Whether surface zoom is relative to display DPI or an exact scale. */
   surfaceZoomMode?: SurfaceZoomMode;
-  /** Pointer gestures or native Wayland multitouch contacts. */
+  /** Native Wayland multitouch contacts or pointer-gesture compatibility. */
   surfaceTouchMode?: SurfaceTouchMode;
 
   focusedSessionId: SessionId | null;
@@ -991,7 +991,7 @@ export function BSPContainer(props: {
       return props.surfaceZoomMode ?? "relative";
     },
     get surfaceTouchMode() {
-      return props.surfaceTouchMode ?? "pointer";
+      return props.surfaceTouchMode ?? "direct";
     },
     tabMemory,
     get onRender() {
@@ -1858,6 +1858,10 @@ export function EmptyPane(props: {
             ref={inputRef}
             name={`blit-pane-cmd-${props.paneId}`}
             type="text"
+            autocomplete="off"
+            autocorrect="off"
+            autocapitalize="off"
+            spellcheck={false}
             value={cmd()}
             onInput={(e) => setCmd(e.currentTarget.value)}
             onKeyDown={(e) => {

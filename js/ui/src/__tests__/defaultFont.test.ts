@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { DEFAULT_FONT } from "@blit-sh/core";
 import { defaultFont, preferredFont, setDefaultFont } from "../storage";
+import { primaryFontFamily } from "../createFontLoader";
 
 /**
  * The host's font default. An embedder that self-hosts a face (blit.sh ships
@@ -45,5 +46,21 @@ describe("setDefaultFont", () => {
   it("ignores an empty host default rather than blanking the stack", () => {
     setDefaultFont("   ");
     expect(defaultFont()).toBe(DEFAULT_FONT);
+  });
+});
+
+/** How that stack is named back to the user — the status bar's font entry. */
+describe("primaryFontFamily", () => {
+  it("names the chosen face, not the fallbacks it carries", () => {
+    expect(primaryFontFamily(HOST)).toBe("Some Host Face");
+    expect(primaryFontFamily('"JetBrains Mono", ui-monospace, monospace')).toBe(
+      "JetBrains Mono",
+    );
+    expect(primaryFontFamily("Iosevka")).toBe("Iosevka");
+  });
+
+  it("falls back to the generic when there is no choice behind it", () => {
+    expect(primaryFontFamily(DEFAULT_FONT)).toBe("ui-monospace");
+    expect(primaryFontFamily("")).toBe("");
   });
 });

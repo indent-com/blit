@@ -91,7 +91,7 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
   createEffect(() => mounted()?.setConnectionId(props.connectionId));
   createEffect(() => mounted()?.setSurfaceId(props.surfaceId));
   createEffect(() => mounted()?.setLive(props.live !== false));
-  createEffect(() => mounted()?.setTouchMode(props.touchMode ?? "pointer"));
+  createEffect(() => mounted()?.setTouchMode(props.touchMode ?? "direct"));
 
   // Focus the canvas when props.focus is true AND the surface is mounted.
   createEffect(() => {

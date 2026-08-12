@@ -239,6 +239,8 @@ export type SurfaceZoomMode = "relative" | "exact";
 /** How browser touch contacts are presented to Wayland surface apps. */
 export const SURFACE_TOUCH_MODE_KEY = "blit.surfaceTouchMode";
 export type SurfaceTouchMode = "pointer" | "direct";
+/** Whether fresh Wayland text-input enables may open the device keyboard. */
+export const WAYLAND_KEYBOARD_REQUESTS_KEY = "blit.waylandKeyboardRequests";
 // Panel widths are UI-local for the same reason, being chrome geometry.
 export const LEFT_DOCK_WIDTH_KEY = "blit.leftDockWidth";
 export const PREVIEW_PANEL_WIDTH_KEY = "blit.previewPanelWidth";
@@ -494,45 +496,95 @@ export function wsUrl(): string {
   return proto + "//" + gatewayHost + location.pathname;
 }
 
+// ---------------------------------------------------------------------------
+// Appearance preferences: `?param=` for this document, else the synced key,
+// else the default. One parser per setting, shared by both sources — the
+// query and the stored value are the same value from different places, and
+// `urlPinnedKeys` has to agree with them about what counts as a value.
+// ---------------------------------------------------------------------------
+
+function urlParam(param: string): string | null {
+  return new URLSearchParams(location.search).get(param);
+}
+
+function parsePaletteId(raw: string | null): TerminalPalette | null {
+  return (raw && PALETTES.find((x) => x.id === raw)) || null;
+}
+
+function parseFontSize(raw: string | null): number | null {
+  if (!raw) return null;
+  const n = parseInt(raw, 10);
+  return n > 0 ? n : null;
+}
+
+function parseFontFamily(raw: string | null): string | null {
+  return raw?.trim() || null;
+}
+
+function parseTextGamma(raw: string | null): number | null {
+  if (!raw) return null;
+  const n = Number(raw);
+  // Past ~2.5 the thinning eats stems outright, so refuse to render
+  // unreadably; below 1 it fattens, which is a legitimate light-theme want.
+  return Number.isFinite(n) && n >= 0.5 && n <= 2.5 ? n : null;
+}
+
+/** Each appearance query parameter, the synced key it overrides, and the
+ *  parser that decides whether it said anything. */
+const URL_PINNABLE: readonly {
+  param: string;
+  key: string;
+  parse: (raw: string | null) => unknown;
+}[] = [
+  { param: "palette", key: PALETTE_KEY, parse: parsePaletteId },
+  { param: "font", key: FONT_KEY, parse: parseFontFamily },
+  { param: "fontSize", key: FONT_SIZE_KEY, parse: parseFontSize },
+  { param: "textGamma", key: TEXT_GAMMA_KEY, parse: parseTextGamma },
+];
+
+/**
+ * Which appearance keys this document's URL speaks for.
+ *
+ * A `?font=`/`?fontSize=`/`?palette=`/`?textGamma=` link is an instruction
+ * from whoever opened it — a share, an embed, a screenshot rig — and it has
+ * to outlast the synced preference, which arrives over the config socket a
+ * beat later and would otherwise answer it. So the caller that follows the
+ * synced value asks here first and stays out of the way for those keys.
+ *
+ * Only a value the matching parser accepts pins anything: `?fontSize=huge`
+ * is not a size, and must not leave the setting stranded on its default.
+ */
+export function urlPinnedKeys(): Set<string> {
+  const pinned = new Set<string>();
+  for (const { param, key, parse } of URL_PINNABLE) {
+    if (parse(urlParam(param)) !== null) pinned.add(key);
+  }
+  return pinned;
+}
+
 export function preferredPalette(): TerminalPalette {
-  const q = new URLSearchParams(location.search).get("palette");
-  if (q) {
-    const p = PALETTES.find((x) => x.id === q);
-    if (p) return p;
-  }
-  const s = readStorage(PALETTE_KEY);
-  if (s) {
-    const p = PALETTES.find((x) => x.id === s);
-    if (p) return p;
-  }
-  return PALETTES[0];
+  return (
+    parsePaletteId(urlParam("palette")) ??
+    parsePaletteId(readStorage(PALETTE_KEY)) ??
+    PALETTES[0]
+  );
 }
 
 export function preferredFontSize(): number {
-  const q = new URLSearchParams(location.search).get("fontSize");
-  if (q) {
-    const n = parseInt(q, 10);
-    if (n > 0) return n;
-  }
-  const s = readStorage(FONT_SIZE_KEY);
-  if (s) {
-    const n = parseInt(s, 10);
-    if (n > 0) return n;
-  }
-  return 13;
+  return (
+    parseFontSize(urlParam("fontSize")) ??
+    parseFontSize(readStorage(FONT_SIZE_KEY)) ??
+    13
+  );
 }
 
 /** Preferred glyph coverage gamma. See DEFAULT_TEXT_GAMMA. */
 export function preferredTextGamma(): number {
-  const q = new URLSearchParams(location.search).get("textGamma");
-  const raw = q ?? readStorage(TEXT_GAMMA_KEY);
-  if (raw) {
-    const n = Number(raw);
-    // Past ~2.5 the thinning eats stems outright, so refuse to render
-    // unreadably; below 1 it fattens, which is a legitimate light-theme want.
-    if (Number.isFinite(n) && n >= 0.5 && n <= 2.5) return n;
-  }
-  return DEFAULT_TEXT_GAMMA;
+  return (
+    parseTextGamma(urlParam("textGamma")) ??
+    parseTextGamma(readStorage(TEXT_GAMMA_KEY)) ??
+    DEFAULT_TEXT_GAMMA
+  );
 }
 
 /**
@@ -562,11 +614,11 @@ export function defaultFont(): string {
 }
 
 export function preferredFont(): string {
-  const q = new URLSearchParams(location.search).get("font");
-  if (q?.trim()) return q.trim();
-  const s = readStorage(FONT_KEY);
-  if (s?.trim()) return s.trim();
-  return pageDefaultFont;
+  return (
+    parseFontFamily(urlParam("font")) ??
+    parseFontFamily(readStorage(FONT_KEY)) ??
+    pageDefaultFont
+  );
 }
 
 /** Preferred audio muted state. Defaults to true (browser autoplay policy). */
@@ -686,11 +738,18 @@ export function preferredSurfaceZoomMode(): SurfaceZoomMode {
   return readStorage(SURFACE_ZOOM_MODE_KEY) === "exact" ? "exact" : "relative";
 }
 
-/** Pointer gestures preserve the historical tap/scroll/long-press mapping. */
+/** Direct contacts are the default; pointer gestures are the compatibility
+ *  opt-out for apps which do not handle native touch as desired. */
 export function preferredSurfaceTouchMode(): SurfaceTouchMode {
-  return readStorage(SURFACE_TOUCH_MODE_KEY) === "direct"
-    ? "direct"
-    : "pointer";
+  return readStorage(SURFACE_TOUCH_MODE_KEY) === "pointer"
+    ? "pointer"
+    : "direct";
+}
+
+/** Honor fresh Wayland text-input keyboard requests unless explicitly
+ *  disabled on this device. */
+export function preferredWaylandKeyboardRequests(): boolean {
+  return readStorage(WAYLAND_KEYBOARD_REQUESTS_KEY) !== "0";
 }
 
 /** The narrowest the right dock can be dragged. Wide enough for a card's

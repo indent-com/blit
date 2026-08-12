@@ -60,6 +60,7 @@ import {
   SURFACE_ZOOM_KEY,
   SURFACE_ZOOM_MODE_KEY,
   SURFACE_TOUCH_MODE_KEY,
+  WAYLAND_KEYBOARD_REQUESTS_KEY,
   MIN_SURFACE_ZOOM,
   MAX_SURFACE_ZOOM,
   LEFT_DOCK_WIDTH_KEY,
@@ -70,6 +71,7 @@ import {
   defaultFont,
   preferredFont,
   preferredFontSize,
+  urlPinnedKeys,
   preferredTextGamma,
   preferredAudioBitrate,
   preferredAudioMuted,
@@ -81,6 +83,7 @@ import {
   preferredSurfaceZoom,
   preferredSurfaceZoomMode,
   preferredSurfaceTouchMode,
+  preferredWaylandKeyboardRequests,
   preferredLeftDockWidth,
   preferredPreviewPanelWidth,
   MIN_PREVIEW_PANEL_WIDTH,
@@ -639,6 +642,9 @@ function WorkspaceScreen(props: {
   const [surfaceTouchMode, setSurfaceTouchMode] = createSignal(
     preferredSurfaceTouchMode(),
   );
+  const [waylandKeyboardRequests, setWaylandKeyboardRequests] = createSignal(
+    preferredWaylandKeyboardRequests(),
+  );
   // Panel chrome in the URL hash (d= open side panels, x= expanded left-dock
   // sections) is authoritative when present; absent keys fall back to
   // localStorage/defaults. Parsed once up front — the focus params (s=/t=)
@@ -1166,6 +1172,7 @@ function WorkspaceScreen(props: {
       const input = event.target;
       if (!(input instanceof HTMLTextAreaElement)) return;
       if (!input.matches(surfaceInputSelector) || !isMobileTouch()) return;
+      if (!waylandKeyboardRequests()) return;
 
       const state = event.detail;
       if (!state.enabled) {
@@ -2616,16 +2623,27 @@ function WorkspaceScreen(props: {
     return mainViewSessionId() ?? null;
   };
 
+  /** Keep the core's focused session in the dock when the standalone view's
+   * foreground assignment is removed. Surface and tile focus sit in UI-only
+   * slots above that session, so merely clearing either slot would otherwise
+   * expose the terminal as an unwanted second backgrounding step. */
+  function parkMainViewSession() {
+    const fid = wsState().focusedSessionId;
+    if (fid != null) setParkedSessionId(fid);
+  }
+
   /** A grip drag landed on the dock: park the content by taking it off
    *  screen — the dock lists exactly what is open but not displayed. */
   function parkDraggedAssignment(assignment: string, source: string) {
     if (source === MAIN_PANE_SOURCE) {
       if (assignment === activeTile()) {
+        parkMainViewSession();
         setActiveTile(null);
         return;
       }
       const surface = parseSurfaceAssignment(assignment);
       if (surface && surface.surfaceId === focusedSurfaceId()) {
+        parkMainViewSession();
         focusSurfaceById(null);
         return;
       }
@@ -2648,6 +2666,7 @@ function WorkspaceScreen(props: {
   // the tab stays registered, and the derived dock picks it up.
   function backgroundFocusedTile(): boolean {
     if (activeTile()) {
+      parkMainViewSession();
       setActiveTile(null);
       return true;
     }
@@ -2767,28 +2786,41 @@ function WorkspaceScreen(props: {
   // are read from localStorage once at startup and never taken from another
   // device.
 
-  createEffect(() => {
-    const id = remotePaletteId();
-    if (!id) return;
+  // `preferred*()` already read the URL when these signals were created, so a
+  // pinned key must not be followed here: the synced value lands a beat later
+  // (the cached read fires this effect on mount, the socket again on connect)
+  // and would silently overwrite what the link asked for. Skipping the whole
+  // effect, rather than the first run, is what makes `?fontSize=` survive
+  // another device changing the size mid-session.
+  const pinnedByUrl = urlPinnedKeys();
+  /** Track a preference synced from the account, unless this URL owns it. */
+  const followConfig = (
+    key: string,
+    remote: () => string | null,
+    apply: (raw: string) => void,
+  ) => {
+    if (pinnedByUrl.has(key)) return;
+    createEffect(() => {
+      const raw = remote();
+      if (raw) apply(raw);
+    });
+  };
+
+  followConfig(PALETTE_KEY, remotePaletteId, (id) => {
     const p = PALETTES.find((x) => x.id === id);
     if (p) setPalette(p);
   });
 
-  createEffect(() => {
-    const f = remoteFont();
-    if (f?.trim()) setFont(f.trim());
+  followConfig(FONT_KEY, remoteFont, (f) => {
+    if (f.trim()) setFont(f.trim());
   });
 
-  createEffect(() => {
-    const s = remoteFontSize();
-    if (!s) return;
+  followConfig(FONT_SIZE_KEY, remoteFontSize, (s) => {
     const n = parseInt(s, 10);
     if (n > 0) setFontSize(n);
   });
 
-  createEffect(() => {
-    const s = remoteTextGamma();
-    if (!s) return;
+  followConfig(TEXT_GAMMA_KEY, remoteTextGamma, (s) => {
     const n = Number(s);
     if (Number.isFinite(n) && n >= 0.5 && n <= 2.5) setTextGamma(n);
   });
@@ -3018,7 +3050,9 @@ function WorkspaceScreen(props: {
         const assignment = layoutAssignments()?.assignments[pid] ?? null;
         return assignment != null && !isSurfaceAssignment(assignment);
       })();
-    const sessionFocused = al ? bspHasSession : focusedSurfaceId() == null;
+    const sessionFocused = al
+      ? bspHasSession
+      : focusedSurfaceId() == null && !mainTerminalParked();
     const fs = sessionFocused ? focusedSession() : null;
     if (fs) {
       if (fs.title) parts.push(truncateDocumentEntityTitle(fs.title));
@@ -3058,7 +3092,7 @@ function WorkspaceScreen(props: {
   createEffect(() => {
     if (overlay()) return; // overlay is open, skip
     if (activeLayout()) return; // BSP manages its own focus
-    const sid = wsState().focusedSessionId;
+    const sid = mainViewSessionId();
     const surfId = focusedSurfaceId();
     if (!sid && surfId == null) return; // nothing to focus
     // Defer until Solid commits the DOM update.
@@ -3284,6 +3318,17 @@ function WorkspaceScreen(props: {
   function changeSurfaceTouchMode(mode: SurfaceTouchMode) {
     setSurfaceTouchMode(mode);
     writeStorage(SURFACE_TOUCH_MODE_KEY, mode);
+  }
+
+  function changeWaylandKeyboardRequests(enabled: boolean) {
+    setWaylandKeyboardRequests(enabled);
+    writeStorage(WAYLAND_KEYBOARD_REQUESTS_KEY, enabled ? "1" : "0");
+    if (enabled || keyboardManualOverride) return;
+    const input = automaticKeyboardInput;
+    automaticKeyboardInput = null;
+    if (!input) return;
+    setKeyboardWanted(false);
+    if (document.activeElement === input) input.blur();
   }
 
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
@@ -3516,8 +3561,10 @@ function WorkspaceScreen(props: {
       workspace.closeSurface(connectionId, surfaceId);
     },
     unfocusSurface: () => {
+      parkMainViewSession();
       focusSurfaceById(null);
     },
+    backgroundFocusedSession: parkMainViewSession,
     toggleOverlay,
     forwardCtrlK: forwardCtrlKToFocusedPane,
     cancelOverlay,
@@ -4480,7 +4527,9 @@ function WorkspaceScreen(props: {
             <SwitcherOverlay
               sessions={sessions()}
               focusedSessionId={
-                focusedSurfaceId() != null ? null : wsState().focusedSessionId
+                focusedSurfaceId() != null || mainTerminalParked()
+                  ? null
+                  : wsState().focusedSessionId
               }
               lru={lru}
               palette={palette()}
@@ -4840,6 +4889,7 @@ function WorkspaceScreen(props: {
               surfaceTouchAvailable={allConnections().some(
                 (connection) => connection.supportsSurfaceTouch,
               )}
+              waylandKeyboardRequests={waylandKeyboardRequests()}
               onAudioBitrateChange={changeAudioBitrate}
               onVideoBandwidthChange={changeVideoBandwidth}
               onVideoSpeedChange={changeVideoSpeed}
@@ -4849,6 +4899,7 @@ function WorkspaceScreen(props: {
               onSurfaceZoomChange={changeSurfaceZoom}
               onSurfaceZoomModeChange={changeSurfaceZoomMode}
               onSurfaceTouchModeChange={changeSurfaceTouchMode}
+              onWaylandKeyboardRequestsChange={changeWaylandKeyboardRequests}
               onToggleAudio={toggleAudio}
               onClose={closeOverlay}
             />
@@ -4887,7 +4938,9 @@ function WorkspaceScreen(props: {
             }
             hoveredLink={hoveredLink()}
             focusedSession={
-              focusedSurfaceId() != null || bspFocusedSurface() != null
+              focusedSurfaceId() != null ||
+              bspFocusedSurface() != null ||
+              mainTerminalParked()
                 ? null
                 : focusedSession()
             }

@@ -174,18 +174,18 @@ function AppWindow({
 ```
 
 `touchMode` chooses how touchscreen contacts reach the app. The default,
-`"pointer"`, maps touch to Blit's own gestures: tap to click, one-finger drag to
-scroll, long-press for right-click. `"direct"` forwards every contact to the
-app's own `wl_touch`, so pinch, rotate, and multi-finger gestures belong to the
-app. It is safe to set unconditionally — a server without multitouch support
-keeps the pointer mapping — and safe to change at runtime, which does not
-restart the video stream. Trackpads and pens are unaffected either way.
+`"direct"`, forwards every contact to the app's own `wl_touch`, so pinch,
+rotate, and multi-finger gestures belong to the app. Set `"pointer"` to opt out
+and use Blit's compatibility gestures: tap to click, one-finger drag to scroll,
+and long-press for right-click. A server without multitouch support
+automatically keeps the pointer mapping. The mode is safe to change at runtime
+and does not restart the video stream. Trackpads and pens are unaffected.
 
 ```tsx
 <BlitSurfaceView
   connectionId={connectionId}
   surfaceId={surfaceId}
-  touchMode="direct"
+  touchMode="pointer"
 />
 ```
 

@@ -71,6 +71,7 @@ export function MediaOverlay(props: {
   surfaceZoomMode: SurfaceZoomMode;
   surfaceTouchMode: SurfaceTouchMode;
   surfaceTouchAvailable: boolean;
+  waylandKeyboardRequests: boolean;
   onAudioBitrateChange: (kbps: number) => void;
   onVideoBandwidthChange: (bandwidth: number) => void;
   onVideoSpeedChange: (speed: number) => void;
@@ -80,6 +81,7 @@ export function MediaOverlay(props: {
   onSurfaceZoomChange: (percent: number) => void;
   onSurfaceZoomModeChange: (mode: SurfaceZoomMode) => void;
   onSurfaceTouchModeChange: (mode: SurfaceTouchMode) => void;
+  onWaylandKeyboardRequestsChange: (enabled: boolean) => void;
   onToggleAudio: () => void;
   onClose: () => void;
 }) {
@@ -757,6 +759,41 @@ export function MediaOverlay(props: {
                       ? "Apps receive native contacts; tap, scroll, pinch, and drag behavior belongs to the app. Trackpads and pens are unchanged."
                       : "Touch keeps Blit's tap, scroll, long-press, and drag gestures."
                     : "Direct touch needs a server with multitouch support."}
+                </span>
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  "flex-direction": "column",
+                  gap: `${scale().tightGap}px`,
+                }}
+              >
+                <span style={labelStyle()}>On-screen keyboard</span>
+                <div
+                  style={{
+                    display: "flex",
+                    "flex-wrap": "wrap",
+                    gap: `${scale().tightGap}px`,
+                  }}
+                >
+                  <button
+                    onClick={() => props.onWaylandKeyboardRequestsChange(true)}
+                    style={chipStyle(props.waylandKeyboardRequests)}
+                  >
+                    App requests
+                  </button>
+                  <button
+                    onClick={() => props.onWaylandKeyboardRequestsChange(false)}
+                    style={chipStyle(!props.waylandKeyboardRequests)}
+                  >
+                    Manual only
+                  </button>
+                </div>
+                <span style={sliderHintStyle()}>
+                  {props.waylandKeyboardRequests
+                    ? "Focused Wayland apps may open and close the device keyboard."
+                    : "Wayland keyboard requests are ignored; use the status-bar keyboard control."}
                 </span>
               </div>
             </div>

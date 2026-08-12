@@ -67,19 +67,21 @@ export function PaneTools(props: {
         return { top: gap, left: gap };
     }
   };
+  const touchScale = () => (props.alwaysVisible ? 1.5 : 1);
   const segment = (): JSX.CSSProperties => ({
     display: "flex",
     "align-items": "center",
     "justify-content": "center",
-    "min-width": `${props.scale.md * 2}px`,
-    height: `${props.scale.md * 2}px`,
+    "min-width": `${props.scale.md * 2 * touchScale()}px`,
+    height: `${props.scale.md * 2 * touchScale()}px`,
     padding: 0,
     "background-color": props.theme.solidPanelBg,
     border: `1px solid ${props.theme.subtleBorder}`,
     "border-radius": "0",
     color: props.theme.fg,
     "font-family": "inherit",
-    "font-size": `${props.scale.sm}px`,
+    // On touch, enlarge both the glyph and its tap target.
+    "font-size": `${props.scale.sm * touchScale()}px`,
     "line-height": 1,
     opacity: 0.75,
     "touch-action": "manipulation",

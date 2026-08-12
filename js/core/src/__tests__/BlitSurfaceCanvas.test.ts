@@ -75,6 +75,15 @@ function setSurfaceInfo(
 }
 
 describe("BlitSurfaceCanvas layout", () => {
+  it("uses direct touch by default", () => {
+    const surface = new BlitSurfaceCanvas({
+      workspace: makeWorkspace(),
+      connectionId: "conn-1" as never,
+      surfaceId: 7,
+    });
+    expect(surface.touchMode).toBe("direct");
+  });
+
   it("draws another client's pointer over the shared surface", () => {
     const { surface, canvas, container } = attachCanvas();
     setSurfaceInfo(surface, { width: 640, height: 480, lw: 640, lh: 480 });
