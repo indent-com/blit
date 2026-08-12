@@ -334,7 +334,12 @@ export const C2S_SURFACE_SUBSCRIBE = 0x28;
 export const C2S_SURFACE_UNSUBSCRIBE = 0x29;
 export const C2S_SURFACE_ACK = 0x2a;
 export const C2S_SURFACE_CLOSE = 0x2b;
+/** Request the MIME types on the compositor clipboard. */
+export const C2S_CLIPBOARD_LIST = 0x2c;
 export const C2S_CLIENT_FEATURES = 0x2d;
+/** Read one MIME type from the compositor clipboard:
+ * [0x2E][mime_len:2][mime:N]. */
+export const C2S_CLIPBOARD_GET = 0x2e;
 /** Composed text input for a Wayland surface (UTF-8): [0x2F][surface_id:2][text:N] */
 export const C2S_SURFACE_TEXT = 0x2f;
 /** Composition in progress (UTF-8): [0x34][surface_id:2][cursor:2][text:N].
@@ -371,6 +376,9 @@ export const S2C_SURFACE_FRAME = 0x22;
 export const S2C_SURFACE_TITLE = 0x23;
 export const S2C_SURFACE_RESIZED = 0x24;
 export const S2C_CLIPBOARD_CONTENT = 0x25;
+/** MIME types on the compositor clipboard:
+ * [0x2C][count:2] repeated{ [mime_len:2][mime:N] }. */
+export const S2C_CLIPBOARD_LIST = 0x2c;
 /** Clipboard authority: [0x2E][wayland:1].  When true, Ctrl/Cmd+V must
  *  preserve the compositor's client-owned selection instead of importing
  *  the browser clipboard over it. */

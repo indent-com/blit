@@ -453,6 +453,14 @@ DOM copy/cut occurs; its next paste then reads the browser clipboard, sends
 `CLIPBOARD_SET`, and becomes the external owner. Merely moving focus between
 streamed surfaces does not invalidate the Wayland owner.
 
+Pasting that selection into a browser-rendered terminal uses its text
+representation directly. The web client keeps the unsolicited
+`CLIPBOARD_CONTENT` emitted with a Wayland text selection in memory; a client
+that connected after the copy, or missed the eager content, obtains the MIME
+list with `CLIPBOARD_LIST` and reads the preferred plain-text type with
+`CLIPBOARD_GET`. This path does not depend on permission for a background
+`navigator.clipboard.writeText`.
+
 ### Primary selection
 
 Middle-click paste reads PRIMARY, which has two possible owners.

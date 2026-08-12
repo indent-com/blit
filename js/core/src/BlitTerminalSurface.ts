@@ -669,18 +669,34 @@ export class BlitTerminalSurface {
   }
 
   /**
-   * Read text from the system clipboard and send it to the focused
-   * session, wrapped in bracketed-paste markers when the terminal is in
-   * bracketed-paste mode. Must be invoked from a user gesture for
-   * `navigator.clipboard.readText` to succeed in most browsers. Returns
-   * the pasted text, or null when nothing is available. An image-only
-   * clipboard (e.g. a fresh phone screenshot) is forwarded to the server
-   * clipboard instead, followed by a ^V so the app reads it — the same
-   * convention as the Ctrl+V paste-event path.
+   * Read text from the active clipboard and send it to the focused session,
+   * wrapped in bracketed-paste markers when the terminal is in
+   * bracketed-paste mode. A Wayland-owned selection is read directly through
+   * the connection; otherwise `navigator.clipboard.readText` must be invoked
+   * from a user gesture in browsers that gate it. Returns the pasted text, or
+   * null when nothing is available. An image-only browser clipboard (e.g. a
+   * fresh phone screenshot) is forwarded to the server clipboard instead,
+   * followed by a ^V so the app reads it — the same convention as the Ctrl+V
+   * paste-event path.
    */
   async pasteFromClipboard(): Promise<string | null> {
     if (this._readOnly) return null;
     if (this._sessionId === null || this.status !== "connected") return null;
+    const sid = this._sessionId;
+    const conn = this._blitConn;
+    if (conn?.usesWaylandClipboard?.()) {
+      const text = await conn.readWaylandClipboardText();
+      if (this._sessionId !== sid || this.status !== "connected") return null;
+      if (text) {
+        this.pasteText(text);
+        return text;
+      }
+      // Do not replace a live app-owned selection with stale host clipboard
+      // contents merely because it has no text representation or could not
+      // be read.  If ownership changed while the request was in flight, the
+      // browser path below is authoritative again.
+      if (conn.usesWaylandClipboard()) return null;
+    }
     let text = "";
     try {
       text = await navigator.clipboard.readText();
@@ -2507,6 +2523,18 @@ export class BlitTerminalSurface {
     if (this._ctrlVFallbackTimer !== null) {
       clearTimeout(this._ctrlVFallbackTimer);
       this._ctrlVFallbackTimer = null;
+    }
+
+    const conn = this._blitConn;
+    if (!wasCtrlV && conn?.usesWaylandClipboard?.()) {
+      // Cmd+V/context-menu paste normally supplies the host clipboard on this
+      // event.  While a Wayland client owns the selection that value can be
+      // stale (and the background host mirror may have been permission
+      // denied), so consume the compositor selection instead.
+      e.preventDefault();
+      this.resetCaptureField();
+      void this.pasteFromClipboard();
+      return;
     }
 
     const imageItem = wasCtrlV

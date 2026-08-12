@@ -25,6 +25,8 @@ import {
   C2S_FOCUS,
   C2S_CLOSE,
   C2S_COPY_RANGE,
+  C2S_CLIPBOARD_GET,
+  C2S_CLIPBOARD_LIST,
   C2S_CREATE2,
   CREATE2_HAS_COMMAND,
   CREATE2_HAS_CWD,
@@ -37,6 +39,7 @@ import {
   FRAGMENT_FLAG_LAST,
   S2C_FRAGMENT,
   S2C_CLIPBOARD_CONTENT,
+  S2C_CLIPBOARD_LIST,
   S2C_CLIPBOARD_OWNER,
   S2C_SURFACE_CURSOR,
   S2C_SURFACE_TEXT_INPUT,
@@ -110,8 +113,11 @@ function installClipboard(clipboard: FakeClipboard): () => void {
   };
 }
 
-function clipboardContent(text: string): Uint8Array {
-  const mime = new TextEncoder().encode("text/plain;charset=utf-8");
+function clipboardContent(
+  text: string,
+  mimeType = "text/plain;charset=utf-8",
+): Uint8Array {
+  const mime = new TextEncoder().encode(mimeType);
   const data = new TextEncoder().encode(text);
   const message = new Uint8Array(7 + mime.length + data.length);
   const view = new DataView(message.buffer);
@@ -120,6 +126,23 @@ function clipboardContent(text: string): Uint8Array {
   message.set(mime, 3);
   view.setUint32(3 + mime.length, data.length, true);
   message.set(data, 7 + mime.length);
+  return message;
+}
+
+function clipboardList(mimeTypes: string[]): Uint8Array {
+  const encoded = mimeTypes.map((mime) => new TextEncoder().encode(mime));
+  const length = 3 + encoded.reduce((sum, mime) => sum + 2 + mime.length, 0);
+  const message = new Uint8Array(length);
+  const view = new DataView(message.buffer);
+  message[0] = S2C_CLIPBOARD_LIST;
+  view.setUint16(1, encoded.length, true);
+  let offset = 3;
+  for (const mime of encoded) {
+    view.setUint16(offset, mime.length, true);
+    offset += 2;
+    message.set(mime, offset);
+    offset += mime.length;
+  }
   return message;
 }
 
@@ -438,6 +461,45 @@ describe("BlitConnection", () => {
       clipboardConn.dispose();
       restoreClipboard();
     }
+  });
+
+  it("retains Wayland text when the host clipboard mirror is denied", async () => {
+    const clipboard = new FakeClipboard();
+    clipboard.writeText.mockRejectedValue(new Error("NotAllowedError"));
+    const restoreClipboard = installClipboard(clipboard);
+    const { conn: clipboardConn, transport: clipboardTransport } =
+      createConnection();
+    try {
+      clipboardTransport.push(new Uint8Array([S2C_CLIPBOARD_OWNER, 1]));
+      clipboardTransport.push(clipboardContent("copied in Wayland"));
+
+      await expect(clipboardConn.readWaylandClipboardText()).resolves.toBe(
+        "copied in Wayland",
+      );
+      expect(clipboardTransport.sent).not.toContainEqual(
+        new Uint8Array([C2S_CLIPBOARD_LIST]),
+      );
+    } finally {
+      clipboardConn.dispose();
+      restoreClipboard();
+    }
+  });
+
+  it("fetches Wayland text when this client missed the eager mirror", async () => {
+    transport.push(new Uint8Array([S2C_CLIPBOARD_OWNER, 1]));
+    const read = conn.readWaylandClipboardText();
+    expect(transport.sent.at(-1)).toEqual(
+      new Uint8Array([C2S_CLIPBOARD_LIST]),
+    );
+
+    transport.push(clipboardList(["image/png", "text/plain"]));
+    await Promise.resolve();
+    const get = transport.sent.at(-1)!;
+    expect(get[0]).toBe(C2S_CLIPBOARD_GET);
+    expect(new TextDecoder().decode(get.subarray(3))).toBe("text/plain");
+
+    transport.push(clipboardContent("late copy", "text/plain"));
+    await expect(read).resolves.toBe("late copy");
   });
 
   it("removes the clipboardchange listener when disposed", () => {

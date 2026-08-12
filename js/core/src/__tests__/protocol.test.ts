@@ -19,6 +19,8 @@ import {
   buildSurfaceAckMessage,
   buildSurfaceSubscribeMessage,
   buildClientFeaturesMessage,
+  buildClipboardGetMessage,
+  buildClipboardListMessage,
   buildSurfacePreeditMessage,
   buildSurfaceDragEnterMessage,
   buildSurfaceTouchMessage,
@@ -43,6 +45,8 @@ import {
   C2S_SURFACE_ACK,
   C2S_SURFACE_SUBSCRIBE,
   C2S_CLIENT_FEATURES,
+  C2S_CLIPBOARD_GET,
+  C2S_CLIPBOARD_LIST,
   C2S_SURFACE_PREEDIT,
   AXIS_SOURCE_FINGER,
   AXIS_SOURCE_WHEEL,
@@ -83,6 +87,20 @@ describe("protocol message builders", () => {
     expect(msg[0]).toBe(C2S_INPUT);
     expect(msg[1] | (msg[2] << 8)).toBe(5);
     expect(Array.from(msg.subarray(3))).toEqual([0x68, 0x69]);
+  });
+
+  it("buildClipboardListMessage", () => {
+    expect(buildClipboardListMessage()).toEqual(
+      new Uint8Array([C2S_CLIPBOARD_LIST]),
+    );
+  });
+
+  it("buildClipboardGetMessage", () => {
+    const msg = buildClipboardGetMessage("text/plain");
+    const view = new DataView(msg.buffer);
+    expect(msg[0]).toBe(C2S_CLIPBOARD_GET);
+    expect(view.getUint16(1, true)).toBe(10);
+    expect(textDecoder.decode(msg.subarray(3))).toBe("text/plain");
   });
 
   it("buildInputMessage with high ptyId", () => {

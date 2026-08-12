@@ -27,6 +27,7 @@ import {
   S2C_AUDIO_FRAME,
   PROTOCOL_VERSION,
   S2C_CLIPBOARD_CONTENT,
+  S2C_CLIPBOARD_LIST,
   S2C_CLIPBOARD_OWNER,
   S2C_CLOSED,
   S2C_CREATED,
@@ -106,6 +107,8 @@ import {
   buildSurfaceSubscribeMessage,
   buildSurfaceUnsubscribeMessage,
   buildSurfaceAckMessage,
+  buildClipboardGetMessage,
+  buildClipboardListMessage,
   buildClipboardMessage,
   buildPrimaryMessage,
   buildClientFeaturesMessage,
@@ -474,6 +477,13 @@ type PendingFsSync = {
   }>;
 };
 
+type PendingClipboardRequest<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+
 /** Synthesize the upsert a joiner would have received for a mirrored node. */
 function fsNodeUpsert(path: string, node: FsNode): FsRecord {
   return {
@@ -504,6 +514,8 @@ const FS_UPLOAD_MAX_IN_FLIGHT = 512 * 1024;
  *  cap above holds only a couple of chunks, and still far under the 16 MiB
  *  transport frame cap after compression. */
 const FS_UPLOAD_DEFAULT_CHUNK = 256 * 1024;
+/** The server's compositor read itself is bounded to two seconds. */
+const CLIPBOARD_REQUEST_TIMEOUT_MS = 2_500;
 
 function isLiveSession(session: InternalSession): boolean {
   return (
@@ -789,6 +801,16 @@ export class BlitConnection {
    *  browser may have acquired a newer clipboard while this page was not
    *  authoritative, so the next paste must import it before pressing V. */
   private waylandClipboardOwned: boolean | null = null;
+  /** Text mirrored from the current Wayland owner.  Unlike the host
+   *  clipboard mirror, this remains usable when browser clipboard writes are
+   *  permission-gated.  Null means it has not arrived or is not text. */
+  private waylandClipboardText: string | null = null;
+  private pendingClipboardList: PendingClipboardRequest<string[]> | null =
+    null;
+  private pendingClipboardGets = new Map<
+    string,
+    PendingClipboardRequest<Uint8Array>
+  >();
   private clipboardChangeTarget: EventTarget | null = null;
   private clipboardChangeHandler: EventListener | null = null;
   private clipboardMirrorToken = 0;
@@ -1046,6 +1068,9 @@ export class BlitConnection {
       this.clipboardChangeHandler = null;
     }
     this.clearPendingClipboardMirrors();
+    this.rejectPendingClipboardRequests(
+      connectionError("Connection disposed"),
+    );
     this.rejectPendingCreates(
       connectionError("Connection disposed before PTY creation completed"),
     );
@@ -4078,6 +4103,10 @@ export class BlitConnection {
   sendClipboard(mimeType: string, data: Uint8Array): void {
     if (this.transport.status !== "connected") return;
     this.waylandClipboardOwned = false;
+    this.waylandClipboardText = null;
+    this.rejectPendingClipboardRequests(
+      connectionError("Wayland clipboard ownership changed"),
+    );
     this.transport.send(buildClipboardMessage(mimeType, data));
   }
 
@@ -4088,11 +4117,118 @@ export class BlitConnection {
     return this.waylandClipboardOwned === true;
   }
 
+  /** Read text from the compositor's live Wayland selection.
+   *
+   * A Wayland copy is mirrored to `navigator.clipboard` as a convenience,
+   * but browsers can reject that background write.  Terminal paste therefore
+   * consumes the in-connection mirror directly and asks the compositor when
+   * this client connected after the copy or the eager mirror did not arrive.
+   */
+  async readWaylandClipboardText(): Promise<string | null> {
+    if (
+      this.waylandClipboardOwned !== true ||
+      this.transport.status !== "connected"
+    ) {
+      return null;
+    }
+    if (this.waylandClipboardText !== null) {
+      return this.waylandClipboardText || null;
+    }
+
+    try {
+      const mimes = await this.requestClipboardMimes();
+      if (this.waylandClipboardOwned !== true) return null;
+      const preferred = [
+        "text/plain;charset=utf-8",
+        "text/plain",
+        "UTF8_STRING",
+      ];
+      const mime =
+        preferred.find((candidate) => mimes.includes(candidate)) ??
+        mimes.find((candidate) =>
+          candidate.toLowerCase().startsWith("text/plain"),
+        );
+      if (!mime) return null;
+      const data = await this.requestClipboardContent(mime);
+      if (this.waylandClipboardOwned !== true || data.length === 0) return null;
+      const text = textDecoder.decode(data);
+      this.waylandClipboardText = text;
+      return text || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private requestClipboardMimes(): Promise<string[]> {
+    if (this.pendingClipboardList) return this.pendingClipboardList.promise;
+    if (this.transport.status !== "connected") {
+      return Promise.reject(connectionError("Clipboard is disconnected"));
+    }
+    let resolve!: (value: string[]) => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<string[]>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    let pending!: PendingClipboardRequest<string[]>;
+    const timer = setTimeout(() => {
+      if (this.pendingClipboardList !== pending) return;
+      this.pendingClipboardList = null;
+      reject(connectionError("Clipboard MIME request timed out"));
+    }, CLIPBOARD_REQUEST_TIMEOUT_MS);
+    pending = { promise, resolve, reject, timer };
+    this.pendingClipboardList = pending;
+    this.transport.send(buildClipboardListMessage());
+    return promise;
+  }
+
+  private requestClipboardContent(mime: string): Promise<Uint8Array> {
+    const existing = this.pendingClipboardGets.get(mime);
+    if (existing) return existing.promise;
+    if (this.transport.status !== "connected") {
+      return Promise.reject(connectionError("Clipboard is disconnected"));
+    }
+    let resolve!: (value: Uint8Array) => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<Uint8Array>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    let pending!: PendingClipboardRequest<Uint8Array>;
+    const timer = setTimeout(() => {
+      if (this.pendingClipboardGets.get(mime) !== pending) return;
+      this.pendingClipboardGets.delete(mime);
+      reject(connectionError("Clipboard content request timed out"));
+    }, CLIPBOARD_REQUEST_TIMEOUT_MS);
+    pending = { promise, resolve, reject, timer };
+    this.pendingClipboardGets.set(mime, pending);
+    this.transport.send(buildClipboardGetMessage(mime));
+    return promise;
+  }
+
+  private rejectPendingClipboardRequests(error: Error): void {
+    const list = this.pendingClipboardList;
+    if (list) {
+      this.pendingClipboardList = null;
+      clearTimeout(list.timer);
+      list.reject(error);
+    }
+    for (const pending of this.pendingClipboardGets.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pendingClipboardGets.clear();
+  }
+
   /** The host clipboard may be newer (clipboardchange, window/tab loss, or a
    *  real DOM copy/cut).  The next paste probes the browser clipboard and
    *  publishes it to the compositor before forwarding V. */
   noteBrowserClipboardMayHaveChanged(): void {
     this.waylandClipboardOwned = null;
+    this.waylandClipboardText = null;
+    this.rejectPendingClipboardRequests(
+      connectionError("Browser clipboard may be newer"),
+    );
   }
 
   /** Expect the text-only clipboardchange caused by mirroring a Wayland
@@ -4863,10 +4999,20 @@ export class BlitConnection {
           const dataLen = view.getUint32(3 + mimeLen, true);
           const dataStart = 7 + mimeLen;
           if (bytes.length < dataStart + dataLen) return;
+          const data = bytes.subarray(dataStart, dataStart + dataLen);
+          const pending = this.pendingClipboardGets.get(mimeType);
+          if (pending) {
+            this.pendingClipboardGets.delete(mimeType);
+            clearTimeout(pending.timer);
+            // Transport adapters may hand us a borrowed/reused receive view;
+            // the awaiting paste resumes on a later microtask.
+            pending.resolve(data.slice());
+          }
           if (mimeType.startsWith("text/") || mimeType === "UTF8_STRING") {
-            const text = textDecoder.decode(
-              bytes.subarray(dataStart, dataStart + dataLen),
-            );
+            const text = textDecoder.decode(data);
+            if (this.waylandClipboardOwned === true) {
+              this.waylandClipboardText = text;
+            }
             const mirrorToken = this.expectMirroredClipboardChange();
             try {
               navigator.clipboard
@@ -4879,9 +5025,45 @@ export class BlitConnection {
         } catch {}
         return;
       }
+      case S2C_CLIPBOARD_LIST: {
+        try {
+          if (bytes.length < 3) return;
+          const view = new DataView(
+            bytes.buffer,
+            bytes.byteOffset,
+            bytes.byteLength,
+          );
+          const count = view.getUint16(1, true);
+          const mimes: string[] = [];
+          let offset = 3;
+          for (let i = 0; i < count; i++) {
+            if (offset + 2 > bytes.length) return;
+            const len = view.getUint16(offset, true);
+            offset += 2;
+            if (offset + len > bytes.length) return;
+            mimes.push(textDecoder.decode(bytes.subarray(offset, offset + len)));
+            offset += len;
+          }
+          const pending = this.pendingClipboardList;
+          if (pending) {
+            this.pendingClipboardList = null;
+            clearTimeout(pending.timer);
+            pending.resolve(mimes);
+          }
+        } catch {}
+        return;
+      }
       case S2C_CLIPBOARD_OWNER: {
         if (bytes.length !== 2 || bytes[1] > 1) return;
-        this.waylandClipboardOwned = bytes[1] !== 0;
+        const wayland = bytes[1] !== 0;
+        this.rejectPendingClipboardRequests(
+          connectionError("Wayland clipboard ownership changed"),
+        );
+        this.waylandClipboardOwned = wayland;
+        // Every true announcement corresponds to a fresh SetSelection, even
+        // when the previous owner was also a Wayland client.  Do not let its
+        // cached text leak into the new selection while the content follows.
+        this.waylandClipboardText = null;
         return;
       }
       case S2C_TEXT: {
@@ -5579,6 +5761,10 @@ export class BlitConnection {
       status === "error"
     ) {
       this.waylandClipboardOwned = null;
+      this.waylandClipboardText = null;
+      this.rejectPendingClipboardRequests(
+        connectionError(`Transport ${status}`),
+      );
       if (this.pingTimer !== null) {
         clearInterval(this.pingTimer);
         this.pingTimer = null;

@@ -472,6 +472,38 @@ describe("BlitTerminalSurface mobile copy/paste API", () => {
     expect(result).toBeNull();
   });
 
+  it("pasteFromClipboard() reads a Wayland-owned selection directly", async () => {
+    const { s, sendInput } = newConnectedSurface();
+    const readWaylandClipboardText = vi.fn().mockResolvedValue("from surface");
+    // @ts-expect-error — add the clipboard authority methods to the fake.
+    Object.assign(s["_blitConn"], {
+      usesWaylandClipboard: () => true,
+      readWaylandClipboardText,
+    });
+
+    const result = await s.pasteFromClipboard();
+
+    expect(result).toBe("from surface");
+    expect(readWaylandClipboardText).toHaveBeenCalledOnce();
+    expect(navigator.clipboard.readText).not.toHaveBeenCalled();
+    expect(new TextDecoder().decode(sendInput.mock.calls[0][1])).toBe(
+      "from surface",
+    );
+  });
+
+  it("does not paste stale host text for a non-text Wayland selection", async () => {
+    const { s, sendInput } = newConnectedSurface();
+    // @ts-expect-error — add the clipboard authority methods to the fake.
+    Object.assign(s["_blitConn"], {
+      usesWaylandClipboard: () => true,
+      readWaylandClipboardText: () => Promise.resolve(null),
+    });
+
+    await expect(s.pasteFromClipboard()).resolves.toBeNull();
+    expect(navigator.clipboard.readText).not.toHaveBeenCalled();
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
   it("pasteFromClipboard() forwards an image-only clipboard then sends ^V", async () => {
     const { s, sendInput, sendClipboard } = newConnectedSurface();
     const bytes = new Uint8Array([137, 80, 78, 71]); // "\x89PNG"
@@ -785,6 +817,36 @@ describe("BlitTerminalSurface Ctrl+V image paste", () => {
     expect(sendInput).toHaveBeenCalledTimes(1);
     expect(new TextDecoder().decode(sendInput.mock.calls[0][1])).toBe(
       "\x1b[200~pasted-text\x1b[201~",
+    );
+  });
+
+  it("uses Wayland text instead of stale Cmd+V clipboardData", async () => {
+    const sendInput = vi.fn();
+    const { s, input } = attach(sendInput);
+    const readWaylandClipboardText = vi.fn().mockResolvedValue("from surface");
+    // @ts-expect-error — add clipboard authority to the focused connection.
+    Object.assign(s["_blitConn"], {
+      usesWaylandClipboard: () => true,
+      readWaylandClipboardText,
+    });
+
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "v",
+        code: "KeyV",
+        metaKey: true,
+        bubbles: true,
+      }),
+    );
+    const ev = fireTextPaste(input, "stale host text");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(ev.defaultPrevented).toBe(true);
+    expect(readWaylandClipboardText).toHaveBeenCalledOnce();
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    expect(new TextDecoder().decode(sendInput.mock.calls[0][1])).toBe(
+      "from surface",
     );
   });
 

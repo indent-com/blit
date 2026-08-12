@@ -1,6 +1,8 @@
 import {
   C2S_ACK,
   C2S_CLIENT_METRICS,
+  C2S_CLIPBOARD_GET,
+  C2S_CLIPBOARD_LIST,
   C2S_CLIPBOARD_SET,
   C2S_PRIMARY_SET,
   C2S_DISPLAY_RATE,
@@ -881,6 +883,22 @@ export function buildClipboardMessage(
   data: Uint8Array,
 ): Uint8Array {
   return buildSelectionMessage(C2S_CLIPBOARD_SET, mimeType, data);
+}
+
+/** Request the MIME types currently offered by the compositor clipboard. */
+export function buildClipboardListMessage(): Uint8Array {
+  return new Uint8Array([C2S_CLIPBOARD_LIST]);
+}
+
+/** Read one MIME type from the compositor clipboard. */
+export function buildClipboardGetMessage(mimeType: string): Uint8Array {
+  const mimeBytes = textEncoder.encode(mimeType);
+  const msg = new Uint8Array(3 + mimeBytes.length);
+  msg[0] = C2S_CLIPBOARD_GET;
+  msg[1] = mimeBytes.length & 0xff;
+  msg[2] = (mimeBytes.length >> 8) & 0xff;
+  msg.set(mimeBytes, 3);
+  return msg;
 }
 
 /**
