@@ -805,8 +805,7 @@ export class BlitConnection {
    *  clipboard mirror, this remains usable when browser clipboard writes are
    *  permission-gated.  Null means it has not arrived or is not text. */
   private waylandClipboardText: string | null = null;
-  private pendingClipboardList: PendingClipboardRequest<string[]> | null =
-    null;
+  private pendingClipboardList: PendingClipboardRequest<string[]> | null = null;
   private pendingClipboardGets = new Map<
     string,
     PendingClipboardRequest<Uint8Array>
@@ -1068,9 +1067,7 @@ export class BlitConnection {
       this.clipboardChangeHandler = null;
     }
     this.clearPendingClipboardMirrors();
-    this.rejectPendingClipboardRequests(
-      connectionError("Connection disposed"),
-    );
+    this.rejectPendingClipboardRequests(connectionError("Connection disposed"));
     this.rejectPendingCreates(
       connectionError("Connection disposed before PTY creation completed"),
     );
@@ -5041,7 +5038,9 @@ export class BlitConnection {
             const len = view.getUint16(offset, true);
             offset += 2;
             if (offset + len > bytes.length) return;
-            mimes.push(textDecoder.decode(bytes.subarray(offset, offset + len)));
+            mimes.push(
+              textDecoder.decode(bytes.subarray(offset, offset + len)),
+            );
             offset += len;
           }
           const pending = this.pendingClipboardList;

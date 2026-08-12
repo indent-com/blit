@@ -154,12 +154,12 @@ document-level capture listener that catches what the canvas misses) runs the
 same handler, so the first to see an event marks it; without that a screenshot
 would go out once per listener.
 
-Terminal paste observes the same clipboard authority.  While a Wayland client
+Terminal paste observes the same clipboard authority. While a Wayland client
 owns the selection, `BlitTerminalSurface` takes text from the connection's
 in-memory mirror instead of `navigator.clipboard`; if the eager content did not
 reach this web client, it uses `CLIPBOARD_LIST`/`CLIPBOARD_GET` to fetch it from
-the compositor.  This keeps surface-to-terminal copy working when the browser
-rejects the unsolicited host-clipboard write.  A live Wayland selection with
+the compositor. This keeps surface-to-terminal copy working when the browser
+rejects the unsolicited host-clipboard write. A live Wayland selection with
 no text representation does not fall through to stale host clipboard text.
 
 ### Hyperlinks

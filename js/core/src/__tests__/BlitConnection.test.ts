@@ -488,9 +488,7 @@ describe("BlitConnection", () => {
   it("fetches Wayland text when this client missed the eager mirror", async () => {
     transport.push(new Uint8Array([S2C_CLIPBOARD_OWNER, 1]));
     const read = conn.readWaylandClipboardText();
-    expect(transport.sent.at(-1)).toEqual(
-      new Uint8Array([C2S_CLIPBOARD_LIST]),
-    );
+    expect(transport.sent.at(-1)).toEqual(new Uint8Array([C2S_CLIPBOARD_LIST]));
 
     transport.push(clipboardList(["image/png", "text/plain"]));
     await Promise.resolve();

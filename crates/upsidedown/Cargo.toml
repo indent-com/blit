@@ -1,6 +1,6 @@
 [package]
 name = "blit-upsidedown"
-version = "0.50.0"
+version = "0.50.1"
 edition.workspace = true
 description = "upsidedown: hosted relay service for blit uplink"
 license.workspace = true
