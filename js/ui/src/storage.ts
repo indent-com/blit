@@ -236,6 +236,9 @@ export const SURFACE_ZOOM_KEY = "blit.surfaceZoom";
 /** "relative" multiplies display DPI; "exact" names an absolute scale. */
 export const SURFACE_ZOOM_MODE_KEY = "blit.surfaceZoomMode";
 export type SurfaceZoomMode = "relative" | "exact";
+/** How browser touch contacts are presented to Wayland surface apps. */
+export const SURFACE_TOUCH_MODE_KEY = "blit.surfaceTouchMode";
+export type SurfaceTouchMode = "pointer" | "direct";
 // Panel widths are UI-local for the same reason, being chrome geometry.
 export const LEFT_DOCK_WIDTH_KEY = "blit.leftDockWidth";
 export const PREVIEW_PANEL_WIDTH_KEY = "blit.previewPanelWidth";
@@ -681,6 +684,13 @@ export function preferredSurfaceZoom(): number {
  *  relative so upgrading does not change their rendered size. */
 export function preferredSurfaceZoomMode(): SurfaceZoomMode {
   return readStorage(SURFACE_ZOOM_MODE_KEY) === "exact" ? "exact" : "relative";
+}
+
+/** Pointer gestures preserve the historical tap/scroll/long-press mapping. */
+export function preferredSurfaceTouchMode(): SurfaceTouchMode {
+  return readStorage(SURFACE_TOUCH_MODE_KEY) === "direct"
+    ? "direct"
+    : "pointer";
 }
 
 /** The narrowest the right dock can be dragged. Wide enough for a card's

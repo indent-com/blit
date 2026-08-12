@@ -21,6 +21,11 @@ export type {
   SurfaceEventCallback,
   SurfaceFrameSample,
   ServerClockSample,
+  RemoteSurfaceInput,
+  RemoteSurfacePointer,
+  SurfaceCursorImage,
+  SurfaceTextInputEvent,
+  SurfaceTextInputState,
 } from "./SurfaceStore";
 export {
   estimateSourceToReceiveMs,
@@ -158,13 +163,18 @@ export type {
 } from "./BlitTerminalSurface";
 
 export {
+  BLIT_SURFACE_TEXT_INPUT_EVENT,
   BlitSurfaceCanvas,
   surfaceCanvasForInput,
   detectCodecSupport,
   getCodecSupport,
   getMaxDecodeSize,
 } from "./BlitSurfaceCanvas";
-export type { BlitSurfaceCanvasOptions } from "./BlitSurfaceCanvas";
+export type {
+  BlitSurfaceTextInputEvent,
+  BlitSurfaceCanvasOptions,
+  SurfaceTouchMode,
+} from "./BlitSurfaceCanvas";
 
 export { parseDSL, serializeDSL, leafCount } from "./bsp/dsl";
 export type { BSPNode, BSPSplit, BSPChild, BSPLeaf } from "./bsp/dsl";

@@ -20,6 +20,8 @@ import {
   FEATURE_KILL_MODE,
   FEATURE_RESIZE_BATCH,
   FEATURE_SCROLL_BY,
+  FEATURE_SURFACE_TOUCH,
+  FEATURE_SURFACE_TEXT_INPUT,
   FEATURE_RESTART,
   statusText,
   S2C_AUDIO_FRAME,
@@ -37,7 +39,11 @@ import {
   S2C_SEARCH_RESULTS,
   S2C_SURFACE_APP_ID,
   S2C_SURFACE_ACTIVATED,
+  S2C_SURFACE_TEXT_INPUT,
   S2C_SURFACE_CURSOR,
+  S2C_SURFACE_REMOTE_INPUT,
+  REMOTE_INPUT_POINTER,
+  REMOTE_INPUT_TOUCH,
   S2C_SURFACE_CREATED,
   S2C_SURFACE_DESTROYED,
   S2C_SURFACE_ENCODER,
@@ -45,6 +51,8 @@ import {
   SURFACE_FRAME_FLAG_TIMESTAMP_SUB_US,
   S2C_SURFACE_RESIZED,
   S2C_SURFACE_TITLE,
+  SURFACE_TEXT_INPUT_ENABLED,
+  SURFACE_TEXT_INPUT_REQUESTED,
   S2C_FRAGMENT,
   FRAGMENT_FLAG_LAST,
   S2C_PING,
@@ -57,6 +65,8 @@ import {
   S2C_USED_ROWS,
   S2C_SCROLL_OFFSET,
   C2S_PING,
+  SURFACE_TOUCH_ENABLE,
+  SURFACE_TOUCH_DISABLE,
 } from "./types";
 import {
   buildCloseMessage,
@@ -101,6 +111,8 @@ import {
   buildClientFeaturesMessage,
   buildAudioSubscribeMessage,
   buildAudioUnsubscribeMessage,
+  buildSurfaceTouchMessage,
+  type SurfaceTouchPoint,
 } from "./protocol";
 import { AudioPlayer } from "./AudioPlayer";
 import { SurfaceStore } from "./SurfaceStore";
@@ -759,6 +771,9 @@ export class BlitConnection {
   private fsNonceCounter = 0;
   private gitLogIdCounter = 0;
   private features = 0;
+  /** Mounted direct-touch canvases sharing this transport. The server sees
+   * one virtual touchscreen capability while this count is non-zero. */
+  private surfaceTouchUsers = 0;
   private disposed = false;
   /** Per-session, per-view size registry for computing minimum resize. */
   private viewSizes = new Map<
@@ -909,6 +924,8 @@ export class BlitConnection {
       supportsRestart: false,
       supportsCopyRange: false,
       supportsCompositor: false,
+      supportsSurfaceTouch: false,
+      supportsSurfaceTextInput: false,
       supportsAudio: false,
       supportsFsSync: false,
       supportsGit: false,
@@ -3299,9 +3316,16 @@ export class BlitConnection {
     this.store.setPalette(p);
   }
 
-  sendSurfaceInput(surfaceId: number, keycode: number, pressed: boolean): void {
+  sendSurfaceInput(
+    surfaceId: number,
+    keycode: number,
+    pressed: boolean,
+    timeMs = 0,
+  ): void {
     if (this.transport.status !== "connected") return;
-    this.transport.send(buildSurfaceInputMessage(surfaceId, keycode, pressed));
+    this.transport.send(
+      buildSurfaceInputMessage(surfaceId, keycode, pressed, timeMs),
+    );
   }
 
   sendSurfaceText(surfaceId: number, text: string): void {
@@ -3327,10 +3351,65 @@ export class BlitConnection {
     button: number,
     x: number,
     y: number,
+    timeMs = 0,
   ): void {
     if (this.transport.status !== "connected") return;
     this.transport.send(
-      buildSurfacePointerMessage(surfaceId, type, button, x, y),
+      buildSurfacePointerMessage(surfaceId, type, button, x, y, timeMs),
+    );
+  }
+
+  get supportsSurfaceTouch(): boolean {
+    return (this.features & FEATURE_SURFACE_TOUCH) !== 0;
+  }
+
+  get supportsSurfaceTextInput(): boolean {
+    return (this.features & FEATURE_SURFACE_TEXT_INPUT) !== 0;
+  }
+
+  /** Keep the compositor's virtual touchscreen capability present while at
+   * least one mounted view is configured for direct touch. */
+  acquireSurfaceTouch(): void {
+    this.surfaceTouchUsers++;
+    if (this.surfaceTouchUsers === 1) this.syncSurfaceTouchCapability();
+  }
+
+  releaseSurfaceTouch(): void {
+    if (this.surfaceTouchUsers === 0) return;
+    this.surfaceTouchUsers--;
+    if (
+      this.surfaceTouchUsers === 0 &&
+      this.transport.status === "connected" &&
+      this.supportsSurfaceTouch
+    ) {
+      this.transport.send(buildSurfaceTouchMessage(0, SURFACE_TOUCH_DISABLE));
+    }
+  }
+
+  private syncSurfaceTouchCapability(): void {
+    if (
+      this.surfaceTouchUsers === 0 ||
+      this.transport.status !== "connected" ||
+      !this.supportsSurfaceTouch
+    )
+      return;
+    this.transport.send(buildSurfaceTouchMessage(0, SURFACE_TOUCH_ENABLE));
+  }
+
+  sendSurfaceTouch(
+    surfaceId: number,
+    phase: number,
+    contacts: readonly SurfaceTouchPoint[] = [],
+    timeMs = 0,
+  ): void {
+    if (
+      this.transport.status !== "connected" ||
+      !this.supportsSurfaceTouch ||
+      this.surfaceTouchUsers === 0
+    )
+      return;
+    this.transport.send(
+      buildSurfaceTouchMessage(surfaceId, phase, contacts, timeMs),
     );
   }
 
@@ -3409,12 +3488,13 @@ export class BlitConnection {
   // kept it from ever re-offering, so the surface stayed unsized until
   // its box happened to change.  Mediate here instead, exactly like
   // {@link effectiveSurfaceTarget} does for subscribe targets: views
-  // offer and withdraw their sizes, the most recent offer wins, and the
-  // unset only goes out when no sized view remains.
+  // offer and withdraw their sizes, {@link effectiveSurfaceViewSize}
+  // folds them into the one the wire can carry, and the unset only goes
+  // out when no sized view remains.
   private surfaceViewSizes = new Map<
     number,
     {
-      /** Insertion-ordered; the most recent offer is the effective size. */
+      /** Every live view's own offer, keyed by view id. */
       views: Map<string, { width: number; height: number; scale120: number }>;
       /** Last size actually sent on the wire, null when nothing (or the
        *  unset) is what the server currently knows. */
@@ -3437,15 +3517,13 @@ export class BlitConnection {
       entry = { views: new Map(), lastSent: null };
       this.surfaceViewSizes.set(surfaceId, entry);
     }
-    // Re-insert so a repeat offer moves to the end: latest writer wins.
-    entry.views.delete(viewId);
     entry.views.set(viewId, { width, height, scale120 });
     return this.flushSurfaceViewSize(surfaceId, entry);
   }
 
-  /** Withdraw one view's size.  Re-sends the surviving latest offer if the
-   *  withdrawn view's was the one on the wire, or the unset when it was the
-   *  last sized view. */
+  /** Withdraw one view's size.  Re-derives the request across the surviving
+   *  views — the departing one may have been the constraint — or sends the
+   *  unset when it was the last sized view. */
   withdrawSurfaceViewSize(surfaceId: number, viewId: string): void {
     const entry = this.surfaceViewSizes.get(surfaceId);
     if (!entry || !entry.views.delete(viewId)) return;
@@ -3464,13 +3542,98 @@ export class BlitConnection {
     this.flushSurfaceViewSize(surfaceId, entry);
   }
 
+  /** Forget the size the server was told for this surface.
+   *
+   *  A wire UNSUBSCRIBE makes the server drop this client's view size
+   *  (`C2S_SURFACE_UNSUBSCRIBE` clears `surface_view_sizes`), so what we
+   *  last sent is no longer what it knows. Without this the offer that
+   *  follows the next subscribe dedups against a size only the previous
+   *  subscription ever carried, and the client silently drops out of the
+   *  server's size mediation: it is subscribed, it has a pane, and it has
+   *  no say in how big the surface is. With another viewer watching, the
+   *  surface then sits at *their* size forever — the pane's box never
+   *  changes again, so no new offer is ever made. Hiding the tab and
+   *  coming back is enough to trigger it.
+   *
+   *  Mirrors what {@link resetSurfaceSubsForReconnect} does for a new
+   *  server session. */
+  private forgetSentSurfaceViewSize(surfaceId: number): void {
+    const entry = this.surfaceViewSizes.get(surfaceId);
+    if (entry) entry.lastSent = null;
+  }
+
+  /** Re-offer the effective view size after a subscribe goes on the wire.
+   *  No-op unless {@link forgetSentSurfaceViewSize} (or a reconnect) cleared
+   *  `lastSent`, so a steady-state resubscribe costs nothing. */
+  private resendSurfaceViewSize(surfaceId: number): void {
+    const entry = this.surfaceViewSizes.get(surfaceId);
+    if (entry && entry.views.size > 0) {
+      this.flushSurfaceViewSize(surfaceId, entry);
+    }
+  }
+
+  /**
+   * The one size this connection can ask for on behalf of every live view
+   * of a surface.
+   *
+   * The wire carries one size per (client, surface), so several views have
+   * to be reconciled into a single request — and the answer is the same
+   * one the server computes across clients: the largest logical box that
+   * fits in every view, at the highest density any of them will display.
+   * Taking the most recent offer instead made the surface follow whichever
+   * pane was measured last, so the other one was left with a surface too
+   * big for it — the same defect the server's mediation exists to prevent,
+   * reintroduced one layer up.
+   *
+   * The constraining view's own physical extent is returned verbatim when
+   * it is already at the winning scale: the logical round trip does not
+   * return what it was given (at 2× an odd extent comes back a pixel
+   * *larger*, 1001 → 501 → 1002), and a surface a pixel bigger than the
+   * pane that asked for it shows up as a letterbox bar. `Session::
+   * mediated_size_for_surface` takes the same escape hatch for the same
+   * reason.
+   */
+  private effectiveSurfaceViewSize(
+    views: Iterable<{ width: number; height: number; scale120: number }>,
+  ): { width: number; height: number; scale120: number } | null {
+    // Wayland's output scale floor is 1×; an unset (0) scale means the
+    // view never named one, which is the same thing.
+    const eff = (s: number) => (s >= 120 ? s : 120);
+    // Round half up so a 1× and a 2× view reporting the same logical box
+    // land on the same logical integer.
+    const logical = (px: number, s: number) =>
+      Math.floor((px * 120 + eff(s) / 2) / eff(s));
+    let minW: { logical: number; px: number; scale120: number } | null = null;
+    let minH: { logical: number; px: number; scale120: number } | null = null;
+    let scale120 = 0;
+    for (const v of views) {
+      if (v.width <= 0 || v.height <= 0) continue;
+      const lw = logical(v.width, v.scale120);
+      const lh = logical(v.height, v.scale120);
+      if (!minW || lw < minW.logical) {
+        minW = { logical: lw, px: v.width, scale120: v.scale120 };
+      }
+      if (!minH || lh < minH.logical) {
+        minH = { logical: lh, px: v.height, scale120: v.scale120 };
+      }
+      scale120 = Math.max(scale120, v.scale120);
+    }
+    if (!minW || !minH) return null;
+    const exact = (m: { logical: number; px: number; scale120: number }) =>
+      eff(m.scale120) === eff(scale120)
+        ? m.px
+        : Math.max(
+            1,
+            Math.floor((Math.max(1, m.logical) * eff(scale120)) / 120),
+          );
+    return { width: exact(minW), height: exact(minH), scale120 };
+  }
+
   private flushSurfaceViewSize(
     surfaceId: number,
     entry: NonNullable<ReturnType<BlitConnection["surfaceViewSizes"]["get"]>>,
   ): boolean {
-    let effective: { width: number; height: number; scale120: number } | null =
-      null;
-    for (const size of entry.views.values()) effective = size;
+    const effective = this.effectiveSurfaceViewSize(entry.views.values());
     if (!effective) return true;
     if (
       entry.lastSent !== null &&
@@ -3645,6 +3808,10 @@ export class BlitConnection {
         maxFps,
       ),
     );
+    // A subscribe that follows an unsubscribe reaches a server that no
+    // longer knows this client's view size.  Re-offer it here rather than
+    // at each of the paths that resubscribe, so none of them can forget.
+    this.resendSurfaceViewSize(sub.surfaceId);
   }
 
   /**
@@ -3805,6 +3972,7 @@ export class BlitConnection {
       if (this.transport.status === "connected") {
         this._logger.info(`surface unsub ${this.id}:${surfaceId}`);
         this.transport.send(buildSurfaceUnsubscribeMessage(surfaceId));
+        this.forgetSentSurfaceViewSize(surfaceId);
       }
       this.surfaceSubs.delete(surfaceId);
     }, BlitConnection.SUB_UNSUB_GRACE_MS);
@@ -3857,6 +4025,7 @@ export class BlitConnection {
       for (const sub of this.surfaceSubs.values()) {
         this.transport.send(buildSurfaceUnsubscribeMessage(sub.surfaceId));
         sub.lastSent = null;
+        this.forgetSentSurfaceViewSize(sub.surfaceId);
       }
     }
   }
@@ -3882,6 +4051,7 @@ export class BlitConnection {
       for (const sub of this.surfaceSubs.values()) {
         if (sub.views.size > 0) {
           this.transport.send(buildSurfaceUnsubscribeMessage(sub.surfaceId));
+          this.forgetSentSurfaceViewSize(sub.surfaceId);
         }
         sub.lastSent = null;
       }
@@ -4354,6 +4524,7 @@ export class BlitConnection {
           return;
         }
         this.features = features;
+        this.syncSurfaceTouchCapability();
         this.hasReceivedList = false;
         // S2C_HELLO is the first message on every new server connection.
         // Reset all surfaces and close stale sessions — the server's
@@ -4392,6 +4563,9 @@ export class BlitConnection {
           supportsRestart: (features & FEATURE_RESTART) !== 0,
           supportsCopyRange: (features & FEATURE_COPY_RANGE) !== 0,
           supportsCompositor: (features & FEATURE_COMPOSITOR) !== 0,
+          supportsSurfaceTouch: (features & FEATURE_SURFACE_TOUCH) !== 0,
+          supportsSurfaceTextInput:
+            (features & FEATURE_SURFACE_TEXT_INPUT) !== 0,
           supportsAudio: (features & FEATURE_AUDIO) !== 0,
           supportsFsSync: (features & FEATURE_FS) !== 0,
           supportsGit: (features & FEATURE_GIT) !== 0,
@@ -4511,10 +4685,15 @@ export class BlitConnection {
             const nameLen = bytes[4];
             if (bytes.length < 5 + nameLen) return;
             const shape = textDecoder.decode(bytes.subarray(5, 5 + nameLen));
-            this.surfaceStore.handleSurfaceCursor(surfaceId, shape);
+            this.surfaceStore.handleSurfaceCursor(surfaceId, shape, {
+              kind: "named",
+              name: shape,
+            });
           } else if (cursorType === 1) {
             // Hidden
-            this.surfaceStore.handleSurfaceCursor(surfaceId, "none");
+            this.surfaceStore.handleSurfaceCursor(surfaceId, "none", {
+              kind: "hidden",
+            });
           } else if (cursorType === 2) {
             // Custom image: hotx(2) + hoty(2) + w(2) + h(2) + png
             if (bytes.length < 12) return;
@@ -4525,6 +4704,9 @@ export class BlitConnection {
             );
             const hotX = view.getUint16(4, true);
             const hotY = view.getUint16(6, true);
+            const width = view.getUint16(8, true);
+            const height = view.getUint16(10, true);
+            if (width === 0 || height === 0) return;
             const pngData = bytes.subarray(12);
             const blob = new Blob([new Uint8Array(pngData)], {
               type: "image/png",
@@ -4533,9 +4715,50 @@ export class BlitConnection {
             this.surfaceStore.handleSurfaceCursor(
               surfaceId,
               `url(${url}) ${hotX} ${hotY}, auto`,
+              {
+                kind: "custom",
+                url,
+                hotspotX: hotX,
+                hotspotY: hotY,
+                width,
+                height,
+              },
             );
           }
         } catch {}
+        return;
+      }
+      case S2C_SURFACE_REMOTE_INPUT: {
+        // Layout: [type][sid:2][kind:1][count:1][x:2,y:2]*.
+        if (bytes.length < 5) return;
+        const view = new DataView(
+          bytes.buffer,
+          bytes.byteOffset,
+          bytes.byteLength,
+        );
+        const surfaceId = view.getUint16(1, true);
+        const kindByte = bytes[3]!;
+        const count = bytes[4]!;
+        if (bytes.length !== 5 + count * 4) return;
+        // `kind` matters even at count 0: a retire withdraws only its own kind,
+        // so a lifted finger must not erase that viewer's live cursor.
+        if (
+          kindByte !== REMOTE_INPUT_POINTER &&
+          kindByte !== REMOTE_INPUT_TOUCH
+        )
+          return;
+        const points: { x: number; y: number }[] = [];
+        for (let i = 0; i < count; i++) {
+          points.push({
+            x: view.getUint16(5 + i * 4, true),
+            y: view.getUint16(7 + i * 4, true),
+          });
+        }
+        this.surfaceStore.handleRemoteInput(
+          surfaceId,
+          kindByte === REMOTE_INPUT_TOUCH ? "touch" : "pointer",
+          points,
+        );
         return;
       }
       case S2C_SURFACE_ENCODER: {
@@ -4568,6 +4791,23 @@ export class BlitConnection {
           const surfaceId = bytes[1] | (bytes[2] << 8);
           this.surfaceStore.handleSurfaceActivated(surfaceId);
         } catch {}
+        return;
+      }
+      case S2C_SURFACE_TEXT_INPUT: {
+        if (bytes.length < 12) return;
+        const view = new DataView(
+          bytes.buffer,
+          bytes.byteOffset,
+          bytes.byteLength,
+        );
+        const surfaceId = view.getUint16(1, true);
+        const flags = bytes[3]!;
+        this.surfaceStore.handleSurfaceTextInput(surfaceId, {
+          enabled: (flags & SURFACE_TEXT_INPUT_ENABLED) !== 0,
+          requested: (flags & SURFACE_TEXT_INPUT_REQUESTED) !== 0,
+          hint: view.getUint32(4, true),
+          purpose: view.getUint32(8, true),
+        });
         return;
       }
       case S2C_SURFACE_RESIZED: {

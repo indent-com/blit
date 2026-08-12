@@ -43,6 +43,7 @@ import {
   C2S_SURFACE_DRAG_LEAVE,
   C2S_SURFACE_DRAG_DROP,
   C2S_SURFACE_DRAG_CANCEL,
+  C2S_SURFACE_TOUCH,
   C2S_AUDIO_SUBSCRIBE,
   C2S_AUDIO_UNSUBSCRIBE,
   CREATE2_HAS_SRC_PTY,
@@ -416,14 +417,18 @@ export function buildSurfaceInputMessage(
   surfaceId: number,
   keycode: number,
   pressed: boolean,
+  timeMs = 0,
 ): Uint8Array {
-  const msg = new Uint8Array(8);
+  const msg = new Uint8Array(12);
   msg[0] = C2S_SURFACE_INPUT;
   msg[1] = surfaceId & 0xff;
   msg[2] = (surfaceId >> 8) & 0xff;
   const v = new DataView(msg.buffer);
   v.setUint32(3, keycode, true);
   msg[7] = pressed ? 1 : 0;
+  // The browser event's own time, so every input path is paced by one clock
+  // rather than by whenever the compositor drained its queue.
+  v.setUint32(8, Math.max(0, Math.round(timeMs)) >>> 0, true);
   return msg;
 }
 
@@ -469,6 +474,10 @@ export function buildSurfacePreeditMessage(
 export const SURFACE_POINTER_DOWN = 0;
 export const SURFACE_POINTER_UP = 1;
 export const SURFACE_POINTER_MOVE = 2;
+/** The pointer left the surface's drawn area. Carries no position, and older
+ *  servers ignore the type, so it needs no feature bit: they simply keep the
+ *  pre-existing behaviour of never retiring the shared-pointer overlay. */
+export const SURFACE_POINTER_LEAVE = 3;
 
 export function buildSurfacePointerMessage(
   surfaceId: number,
@@ -476,8 +485,9 @@ export function buildSurfacePointerMessage(
   button: number,
   x: number,
   y: number,
+  timeMs = 0,
 ): Uint8Array {
-  const msg = new Uint8Array(9);
+  const msg = new Uint8Array(13);
   msg[0] = C2S_SURFACE_POINTER;
   msg[1] = surfaceId & 0xff;
   msg[2] = (surfaceId >> 8) & 0xff;
@@ -487,6 +497,14 @@ export function buildSurfacePointerMessage(
   msg[6] = (x >> 8) & 0xff;
   msg[7] = y & 0xff;
   msg[8] = (y >> 8) & 0xff;
+  // The browser event's own time. Anything that differentiates pointer motion
+  // — a gesture recogniser, a stroke width, a drag-throw — needs the browser's
+  // spacing, not the instant the compositor drained its command queue.
+  new DataView(msg.buffer).setUint32(
+    9,
+    Math.max(0, Math.round(timeMs)) >>> 0,
+    true,
+  );
   return msg;
 }
 
@@ -653,6 +671,10 @@ export interface SurfaceAxisEvent {
   source: number | null;
   /** True when this ends the scroll sequence; deltas are ignored. */
   stop: boolean;
+  /** The browser wheel event's own `timeStamp`, in ms. Toolkits integrate axis
+   *  deltas against these timestamps for kinetic scrolling, so the spacing must
+   *  be the browser's and not the server's arrival time. */
+  timeMs?: number;
 }
 
 /** Clamp to the wire's signed range so a runaway delta cannot wrap into a
@@ -671,7 +693,7 @@ export function buildSurfaceAxis2Message(
   surfaceId: number,
   ev: SurfaceAxisEvent,
 ): Uint8Array {
-  const msg = new Uint8Array(16);
+  const msg = new Uint8Array(20);
   msg[0] = C2S_SURFACE_POINTER_AXIS2;
   msg[1] = surfaceId & 0xff;
   msg[2] = (surfaceId >> 8) & 0xff;
@@ -683,6 +705,48 @@ export function buildSurfaceAxis2Message(
   v.setInt32(8, clampI32(ev.dy * 100), true);
   v.setInt16(12, clampI16(ev.v120x), true);
   v.setInt16(14, clampI16(ev.v120y), true);
+  // The browser wheel event's own time: toolkits integrate axis deltas against
+  // these timestamps for kinetic scrolling, so a burst that all shares one
+  // instant reads as infinite velocity and flings nothing.
+  v.setUint32(16, Math.max(0, Math.round(ev.timeMs ?? 0)) >>> 0, true);
+  return msg;
+}
+
+export interface SurfaceTouchPoint {
+  identifier: number;
+  /** Horizontal position in the composited frame's pixel space. */
+  x: number;
+  /** Vertical position in the composited frame's pixel space. */
+  y: number;
+}
+
+/** Build one direct-touch event. Its message boundary becomes
+ * `wl_touch.frame`, preserving contacts that changed together. */
+export function buildSurfaceTouchMessage(
+  surfaceId: number,
+  phase: number,
+  contacts: readonly SurfaceTouchPoint[] = [],
+  timeMs = 0,
+): Uint8Array {
+  const count = Math.min(255, contacts.length);
+  const msg = new Uint8Array(9 + count * 12);
+  const view = new DataView(msg.buffer);
+  msg[0] = C2S_SURFACE_TOUCH;
+  view.setUint16(1, surfaceId, true);
+  msg[3] = phase;
+  msg[4] = count;
+  // The browser's own event time. Apps derive fling velocity from the spacing
+  // between motion events, and stamping on arrival instead collapses a burst of
+  // coalesced moves onto one instant — which reads as infinite velocity and
+  // kills inertial scrolling outright.
+  view.setUint32(5, Math.max(0, Math.round(timeMs)) >>> 0, true);
+  for (let i = 0; i < count; i++) {
+    const point = contacts[i]!;
+    const offset = 9 + i * 12;
+    view.setInt32(offset, clampI32(point.identifier), true);
+    view.setInt32(offset + 4, clampI32(point.x * 100), true);
+    view.setInt32(offset + 8, clampI32(point.y * 100), true);
+  }
   return msg;
 }
 

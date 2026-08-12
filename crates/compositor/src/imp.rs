@@ -10,6 +10,7 @@ use crate::pointer_focus::{
     ButtonRouting, button_routing, focus_transition, keyboard_focus_after_popup_close,
 };
 use crate::positioner::PositionerGeometry;
+use crate::touch_pacer::TouchPacer;
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
@@ -116,7 +117,9 @@ use wayland_server::protocol::wl_shm_pool::WlShmPool;
 use wayland_server::protocol::wl_subcompositor::WlSubcompositor;
 use wayland_server::protocol::wl_subsurface::WlSubsurface;
 use wayland_server::protocol::wl_surface::WlSurface;
+use wayland_server::protocol::wl_touch::{self, WlTouch};
 use wayland_server::backend::ObjectId;
+use wayland_server::backend::{ClientId, GlobalId};
 use wayland_server::{
     Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource,
 };
@@ -546,10 +549,18 @@ impl PixelData {
 pub enum CursorImage {
     Named(String),
     Custom {
+        /// Surface-local (logical) hotspot, straight from
+        /// `wl_pointer.set_cursor`.
         hotspot_x: u16,
         hotspot_y: u16,
+        /// Dimensions of `rgba`, in buffer pixels.
         width: u16,
         height: u16,
+        /// The cursor surface's `buffer_scale`.  `width / scale` is the cursor's
+        /// logical size — the same space the hotspot is in.  A consumer must
+        /// scale artwork and hotspot by one factor or the hotspot drifts off the
+        /// artwork on every HiDPI surface.
+        scale: u16,
         rgba: Vec<u8>,
     },
     Hidden,
@@ -571,6 +582,17 @@ pub enum CompositorEvent {
     /// xdg_activation_v1; forwarded so the frontend can raise the pane.
     SurfaceActivated {
         surface_id: u16,
+    },
+    /// The focused Wayland client committed `zwp_text_input_v3` state for
+    /// one toplevel. `requested` is true only for a freshly committed
+    /// `enable`; metadata-only commits must not reopen a keyboard the user
+    /// dismissed.
+    SurfaceTextInput {
+        surface_id: u16,
+        enabled: bool,
+        requested: bool,
+        hint: u32,
+        purpose: u32,
     },
     SurfaceCommit {
         surface_id: u16,
@@ -647,6 +669,13 @@ pub enum CompositorEvent {
         surface_id: u16,
         cursor: CursorImage,
     },
+    /// The compositor retired a direct-touch sequence on its own — the
+    /// contact's target unmapped, or touch was disabled.  Without this the
+    /// server would keep believing `owner_id` holds a live sequence and go on
+    /// refusing every other viewer's contacts.  `None` means every owner.
+    TouchCancelled {
+        owner_id: Option<u64>,
+    },
 }
 
 pub enum CompositorCommand {
@@ -654,16 +683,21 @@ pub enum CompositorCommand {
         surface_id: u16,
         keycode: u32,
         pressed: bool,
+        /// Browser key event `timeStamp` in whole ms; `0` for unknown.
+        time_ms: u32,
     },
     PointerMotion {
         surface_id: u16,
         x: f64,
         y: f64,
+        /// Browser event `timeStamp` in whole ms; `0` for unknown.
+        time_ms: u32,
     },
     PointerButton {
         surface_id: u16,
         button: u32,
         pressed: bool,
+        time_ms: u32,
     },
     /// A scroll event.
     ///
@@ -685,6 +719,20 @@ pub enum CompositorCommand {
         v120_y: i16,
         source: Option<u8>,
         stop: bool,
+        /// Browser wheel event `timeStamp` in whole ms; `0` for unknown.
+        time_ms: u32,
+    },
+    SetTouchEnabled {
+        enabled: bool,
+    },
+    Touch {
+        owner_id: u64,
+        surface_id: u16,
+        phase: TouchPhase,
+        /// The originating browser's `TouchEvent.timeStamp` in whole ms, in its
+        /// own epoch.  Used only for the spacing between events.
+        time_ms: u32,
+        contacts: Vec<TouchPoint>,
     },
     SurfaceResize {
         surface_id: u16,
@@ -908,9 +956,40 @@ pub enum CompositorCommand {
     Shutdown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchPhase {
+    Down,
+    Up,
+    Motion,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TouchPoint {
+    pub id: i32,
+    pub x: f64,
+    pub y: f64,
+}
+
 // ---------------------------------------------------------------------------
 // Internal state
 // ---------------------------------------------------------------------------
+
+/// A surface's mapped state, which is not a boolean: "never had content" and
+/// "had content and lost it" differ in what the client is owed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MapState {
+    /// No buffer has ever been committed.  Nothing is drawn, but the input
+    /// fallback still routes to it — a toplevel that has not painted yet is
+    /// the ordinary startup state, not an error.
+    Never,
+    /// Current content attached.
+    Mapped,
+    /// Had content and lost it to `attach(NULL)`.  It has already been sent a
+    /// `wl_pointer.leave`, so it must not be entered again before it maps: an
+    /// `enter` with no intervening map is what clients assert on.
+    Unmapped,
+}
 
 /// Per-wl_surface state.  `pub(crate)` so render.rs can access fields.
 pub(crate) struct Surface {
@@ -918,7 +997,11 @@ pub(crate) struct Surface {
     pub wl_surface: WlSurface,
 
     // pending state
-    pending_buffer: Option<WlBuffer>,
+    /// Double-buffered `wl_surface.attach` state.  The outer `Option`
+    /// distinguishes no attach in this commit from `attach(NULL)`, which
+    /// unmaps the surface; collapsing both to `None` leaves stale pixels and
+    /// pointer focus behind after clients unmap a popup or subsurface.
+    pending_buffer: Option<Option<WlBuffer>>,
     pending_buffer_scale: i32,
     pending_damage: Vec<PendingDamage>,
     pending_frame_callbacks: Vec<WlCallback>,
@@ -929,6 +1012,12 @@ pub(crate) struct Surface {
     pending_input_region: Option<Option<Vec<RegionOp>>>,
 
     // committed state
+    /// Whether the client has current content attached.  Tracked separately
+    /// from `surface_meta`, which is only populated when an upload *succeeds*:
+    /// a rejected buffer (unsupported dma-buf fourcc, failed SHM read) leaves
+    /// a mapped surface with no meta, and treating that as an unmap would
+    /// silently disinherit every descendant that does have usable content.
+    pub map_state: MapState,
     pub buffer_scale: i32,
     pub is_opaque: bool,
     /// Where this surface accepts pointer input, in surface-local
@@ -1603,6 +1692,31 @@ struct ClientDragState {
     /// normally again, while the session lives on until the target's
     /// `finish` (or offer destroy) completes the source.
     dropped: bool,
+    /// The direct-touch contact this drag follows. `None` means the existing
+    /// pointer grab owns it.
+    touch_grab: Option<TouchDragGrab>,
+}
+
+/// The contact a touch-started drag follows.
+///
+/// Self-contained on purpose. `start_drag` cancels the whole `wl_touch`
+/// sequence — the client is told to forget every contact, because something
+/// else took the seat over — so `active_touches` is emptied and can no longer
+/// be the routing table for the one contact that still drives the drag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TouchDragGrab {
+    owner_id: u64,
+    /// Browser contact identifier, as it arrives from the transport.
+    browser_id: i32,
+    /// Transport surface the contact went down on, for `client_drag_motion`.
+    surface_id: u16,
+}
+
+struct ActiveTouch {
+    wayland_id: i32,
+    target: WlSurface,
+    surface_id: u16,
+    down_serial: u32,
 }
 
 /// The target side of a [`ClientDragState`]: one entered surface.
@@ -1850,6 +1964,10 @@ fn keycode_to_mod(keycode: u32) -> u32 {
 /// Per-object state for a `zwp_text_input_v3` resource.
 struct TextInputState {
     resource: ZwpTextInputV3,
+    /// Surface most recently named by `enter`. Requests after `leave` are
+    /// ignored, as required by text-input-v3, and an enabled object may only
+    /// receive browser text while this is the actual keyboard focus.
+    entered_surface: Option<WlSurface>,
     /// Whether text input is active, i.e. the client has sent `enable` *and*
     /// the `commit` that applies it.
     enabled: bool,
@@ -1857,6 +1975,19 @@ struct TextInputState {
     /// Both requests are double-buffered, so acting on one before its commit
     /// would hand text to an input the client has not turned on.
     pending_enabled: bool,
+    /// Whether the pending enable value was explicitly changed since the
+    /// last commit. A repeated enable is a fresh request even when the
+    /// resulting boolean is unchanged.
+    pending_enabled_changed: bool,
+    /// A committed enable is the app asking for an input panel. Kept apart
+    /// from `pending_enabled_changed` because disable is state, not a show
+    /// request.
+    pending_show_requested: bool,
+    content_hint: u32,
+    content_purpose: u32,
+    pending_content_hint: u32,
+    pending_content_purpose: u32,
+    pending_content_type_changed: bool,
     /// Whether the app is currently drawing a preedit we put there.  Every
     /// `done` resets the preedit, so this tracks who owes a clearing one:
     /// a composition committed as synthesised keys sends no `done` of its
@@ -1914,18 +2045,61 @@ struct Compositor {
     surface_meta: FxHashMap<ObjectId, super::render::SurfaceMeta>,
     dmabuf_params: FxHashMap<ObjectId, DmaBufParamsPending>,
     vulkan_renderer: Option<super::vulkan_render::VulkanRenderer>,
+    /// Size handed to a toplevel that has never been sized by a viewer.
     output_width: i32,
     output_height: i32,
     /// Advertised refresh rate in millihertz.  Derived from the highest
     /// `display_fps` among connected browser clients.
     output_refresh_mhz: u32,
-    /// Output scale in 1/120th units (wp_fractional_scale_v1 convention).
-    /// 120 = 1×, 180 = 1.5×, 240 = 2×.  Derived from the browser's
-    /// devicePixelRatio sent via C2S_SURFACE_RESIZE.
-    output_scale_120: u16,
-    outputs: Vec<WlOutput>,
+    /// Per-surface scale in 1/120th units (wp_fractional_scale_v1
+    /// convention).  120 = 1×, 180 = 1.5×, 240 = 2×.  Derived from the
+    /// devicePixelRatio of the viewers watching *that* surface.
+    ///
+    /// Density is a property of who is looking at a window, and in blit two
+    /// windows are routinely looked at by different people on different
+    /// screens.  One scale shared by every surface meant a viewer opening a
+    /// pane on a HiDPI laptop resized every unrelated app in the session,
+    /// twice per focus change, and composited them all at a density nobody
+    /// was going to display.
+    surface_scales: FxHashMap<u16, u16>,
+    /// Every bound output, with the screen it belongs to.
+    outputs: Vec<SurfaceOutput>,
+    /// Every published `wl_output` global, keyed by slot.  A slot is a
+    /// screen offered to one client; it holds a toplevel once the client
+    /// puts a window on it.
+    output_slots: FxHashMap<u32, OutputSlot>,
+    /// Output globals withdrawn while their owner is still connected.
+    ///
+    /// `wl_registry.global_remove` and a client's already-queued `bind` travel
+    /// in opposite directions, so immediately freeing the global can turn an
+    /// ordinary hot-unplug race into a fatal protocol error.  Disabled globals
+    /// still accept those stale binds and are freed once their owner is gone.
+    retired_output_globals: Vec<RetiredOutputGlobal>,
+    /// Source of slot ids.  Never reused, so a stale `SurfaceOutput` can
+    /// never be mistaken for a live screen.
+    next_output_slot: u32,
+    seats: Vec<WlSeat>,
     keyboards: Vec<WlKeyboard>,
     pointers: Vec<WlPointer>,
+    touches: Vec<WlTouch>,
+    touch_enabled: bool,
+    /// Bounded wall-clock playout for direct touch. Chromium ignores the
+    /// protocol timestamp, so actual delivery cadence carries velocity.
+    touch_pacer: TouchPacer,
+    /// `(our clock, the client's)` at the first event of the live sequence, so
+    /// later events keep the browser's spacing in our millisecond domain.
+    input_time_anchor: Option<(u32, u32)>,
+    /// Direct touch has its own per-owner anchor. Several browser viewers share
+    /// this seat but their DOM timestamps have unrelated page epochs; letting a
+    /// desktop viewer's pointer event anchor an iPad sequence collapses every
+    /// touch move to compositor drain time.
+    touch_time_anchor: Option<(u64, u32, u32)>,
+    /// Local arrival time of the last timestamped direct-touch event, used to
+    /// re-anchor after a pause without consulting another viewer's input.
+    touch_time_last_arrival: Option<u32>,
+    /// Last input timestamp emitted, to keep the seat monotonic.
+    last_input_time: Option<u32>,
+    active_touches: HashMap<(u64, i32), ActiveTouch>,
     keyboard_keymap_data: Vec<u8>,
     /// Currently depressed (held down) XKB modifier mask.
     mods_depressed: u32,
@@ -1988,6 +2162,16 @@ struct Compositor {
     /// Where the cursor last was inside `pointer_entered_id`, in surface-local
     /// coordinates, so a pointer created later can be entered there.
     pointer_entered_local: (f64, f64),
+    /// The surface the client last passed to `wl_pointer.set_cursor`.  A
+    /// toolkit may keep a pool of cursor surfaces and retire one it is not
+    /// showing, so `is_cursor` alone (which is set once and never cleared) does
+    /// not identify the cursor whose content is actually on screen.
+    current_cursor_surface: Option<ObjectId>,
+    /// Last browser-frame position seen for each toplevel. Axis messages name
+    /// their destination but carry no coordinates, so this lets a scroll
+    /// re-establish the named target after another surface stole the shared
+    /// pointer focus.
+    pointer_frame_positions: FxHashMap<u16, (f64, f64)>,
     /// Set after output scale change; triggers keyboard leave/re-enter
     /// on the next surface commit so clients have time to process the
     /// reconfigure before receiving new input events.
@@ -2006,9 +2190,10 @@ struct Compositor {
     surface_sizes: FxHashMap<u16, (i32, i32)>,
     /// Pending positioner geometry, keyed by XdgPositioner protocol id.
     positioners: FxHashMap<ObjectId, PositionerState>,
-    /// Active wp_fractional_scale_v1 objects.  When `output_scale_120`
-    /// changes we send `preferred_scale` to every entry.
-    fractional_scales: Vec<WpFractionalScaleV1>,
+    /// Active wp_fractional_scale_v1 objects, each with the surface it was
+    /// created for.  The protocol is per-surface and always was; keeping the
+    /// association is what lets two windows be told two different scales.
+    fractional_scales: Vec<SurfaceFractionalScale>,
 
     // -- Clipboard --
     /// Active wl_data_device objects (one per seat binding).
@@ -2186,6 +2371,32 @@ impl Compositor {
         }
     }
 
+    fn emit_surface_text_input(
+        &self,
+        surface_id: u16,
+        enabled: bool,
+        requested: bool,
+        hint: u32,
+        purpose: u32,
+    ) {
+        let _ = self.event_tx.send(CompositorEvent::SurfaceTextInput {
+            surface_id,
+            enabled,
+            requested,
+            hint,
+            purpose,
+        });
+        (self.event_notify)();
+    }
+
+    fn text_input_has_focus(ti: &TextInputState, focused_wl: &WlSurface) -> bool {
+        ti.enabled
+            && ti
+                .entered_surface
+                .as_ref()
+                .is_some_and(|entered| entered.id() == focused_wl.id())
+    }
+
     /// Hand `composed` to the focused client's input method and clear it.
     ///
     /// Only the characters the keymap cannot express come through here, so a
@@ -2198,7 +2409,7 @@ impl Compositor {
         }
         let text = std::mem::take(composed);
         for ti in &mut self.text_inputs {
-            if !ti.enabled || !same_client(&ti.resource, focused_wl) {
+            if !Self::text_input_has_focus(ti, focused_wl) {
                 continue;
             }
             ti.resource.commit_string(Some(text.clone()));
@@ -2218,7 +2429,7 @@ impl Compositor {
     fn send_preedit(&mut self, focused_wl: &WlSurface, text: &str, cursor: u16) {
         let cursor = i32::from(cursor.min(text.len().min(i32::MAX as usize) as u16));
         for ti in &mut self.text_inputs {
-            if !ti.enabled || !same_client(&ti.resource, focused_wl) {
+            if !Self::text_input_has_focus(ti, focused_wl) {
                 continue;
             }
             // Withdrawing a preedit nobody is showing is a `done` that only
@@ -2270,6 +2481,8 @@ impl Compositor {
     /// `wl_keyboard.leave` (and the text-input equivalent) for `wl`.
     fn send_keyboard_leave(&mut self, wl: &WlSurface) {
         let serial = self.next_serial();
+        let text_input_surface_id = self.find_toplevel_root(&wl.id()).1;
+        let mut text_input_was_enabled = false;
         for kb in &self.keyboards {
             if same_client(kb, wl) {
                 kb.leave(serial, wl);
@@ -2278,10 +2491,28 @@ impl Compositor {
         for ti in &mut self.text_inputs {
             if same_client(&ti.resource, wl) {
                 ti.resource.leave(wl);
+                text_input_was_enabled |= ti.enabled
+                    && ti
+                        .entered_surface
+                        .as_ref()
+                        .is_some_and(|entered| entered.id() == wl.id());
+                ti.entered_surface = None;
+                ti.enabled = false;
+                ti.pending_enabled = false;
+                ti.pending_enabled_changed = false;
+                ti.pending_show_requested = false;
+                ti.content_hint = 0;
+                ti.content_purpose = 0;
+                ti.pending_content_hint = 0;
+                ti.pending_content_purpose = 0;
+                ti.pending_content_type_changed = false;
                 // "The client should reset any preedit string previously
                 // set" — so whatever we last drew is already gone.
                 ti.preedit_shown = false;
             }
+        }
+        if text_input_was_enabled && let Some(surface_id) = text_input_surface_id {
+            self.emit_surface_text_input(surface_id, false, false, 0, 0);
         }
     }
 
@@ -2293,8 +2524,21 @@ impl Compositor {
                 kb.enter(serial, wl, vec![]);
             }
         }
-        for ti in &self.text_inputs {
+        for ti in &mut self.text_inputs {
             if same_client(&ti.resource, wl) {
+                // An enable belongs to the surface named by the preceding
+                // enter. Never carry an old surface's text field across a
+                // focus transition, even when both surfaces share a client.
+                ti.entered_surface = Some(wl.clone());
+                ti.enabled = false;
+                ti.pending_enabled = false;
+                ti.pending_enabled_changed = false;
+                ti.pending_show_requested = false;
+                ti.content_hint = 0;
+                ti.content_purpose = 0;
+                ti.pending_content_hint = 0;
+                ti.pending_content_purpose = 0;
+                ti.pending_content_type_changed = false;
                 ti.resource.enter(wl);
             }
         }
@@ -2600,8 +2844,8 @@ impl Compositor {
         let had_buffer = self
             .surfaces
             .get(surface_id)
-            .is_some_and(|s| s.pending_buffer.is_some());
-        {
+            .is_some_and(|s| s.pending_buffer.as_ref().is_some_and(Option::is_some));
+        if super::render::gpu_layer_debug() {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 40 || n.is_multiple_of(200) {
@@ -2700,16 +2944,19 @@ impl Compositor {
                     .or_default()
                     .insert(surface_id.clone());
             }
-            // Log sparsely: this fires whenever a commit lands in the fence
-            // window, which on a busy surface is often.  Every one of these
-            // used to be a discarded tree.
-            static DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 5 || n.is_multiple_of(500) {
-                eprintln!(
-                    "[commit-defer #{n}] sid={toplevel_sid}: submit in flight, \
-                     queued for recomposite instead of dropping the tree",
-                );
+            // Log sparsely, and only under `BLIT_DEBUG_GPU_LAYERS`: this fires
+            // whenever a commit lands in the fence window, which on a busy
+            // surface is often.  Every one of these used to be a discarded tree.
+            if super::render::gpu_layer_debug() {
+                static DEFERRED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 5 || n.is_multiple_of(500) {
+                    eprintln!(
+                        "[commit-defer #{n}] sid={toplevel_sid}: submit in flight, \
+                         queued for recomposite instead of dropping the tree",
+                    );
+                }
             }
         } else {
             self.composite_toplevel_into_pending(&root_id, toplevel_sid, false);
@@ -2835,6 +3082,193 @@ impl Compositor {
     /// window.  Compositing at the size it really drew hands the viewer an
     /// oversized frame instead, which the browser already scales down to fit
     /// its pane.  Whole window, smaller, rather than part of one.
+    /// The density this surface is watched at, 1× until a viewer says
+    /// otherwise.
+    fn surface_scale_120(&self, surface_id: u16) -> u16 {
+        self.surface_scales
+            .get(&surface_id)
+            .copied()
+            .unwrap_or(120)
+            .max(120)
+    }
+
+    /// This surface's own logical size, or the default for one no viewer has
+    /// sized yet.
+    fn surface_logical_size(&self, surface_id: u16) -> (i32, i32) {
+        self.surface_sizes
+            .get(&surface_id)
+            .copied()
+            .unwrap_or((self.output_width, self.output_height))
+    }
+
+    /// Send an output's mode and scale.  `wl_output.scale` is integer-only,
+    /// so a client that does not bind `wp_fractional_scale_v1` sees the
+    /// ceiling of the real scale and draws slightly large rather than
+    /// slightly small — the same trade every compositor makes.
+    fn send_output_properties(&self, output: &WlOutput, surface_id: Option<u16>) {
+        let s120 = surface_id.map_or(120, |sid| self.surface_scale_120(sid)) as i32;
+        let (lw, lh) = surface_id.map_or((self.output_width, self.output_height), |sid| {
+            self.surface_logical_size(sid)
+        });
+        output.mode(
+            wl_output::Mode::Current | wl_output::Mode::Preferred,
+            lw * s120 / 120,
+            lh * s120 / 120,
+            self.output_refresh_mhz as i32,
+        );
+        if output.version() >= 2 {
+            output.scale((s120 + 119) / 120);
+            output.done();
+        }
+    }
+
+    /// The toplevel currently on a screen, if any.
+    fn output_slot_surface(&self, slot: u32) -> Option<u16> {
+        self.output_slots.get(&slot).and_then(|s| s.surface_id)
+    }
+
+    /// Publish a screen for `owner`, optionally with a toplevel already on
+    /// it.
+    fn create_output_slot(&mut self, owner: ClientId, surface_id: Option<u16>) -> u32 {
+        let slot = self.next_output_slot;
+        self.next_output_slot = self.next_output_slot.wrapping_add(1);
+        let global = self
+            .display_handle
+            .create_global::<Compositor, WlOutput, OutputGlobal>(
+                4,
+                OutputGlobal {
+                    slot,
+                    owner: owner.clone(),
+                },
+            );
+        self.output_slots.insert(
+            slot,
+            OutputSlot {
+                owner,
+                global,
+                surface_id,
+            },
+        );
+        slot
+    }
+
+    /// Guarantee a connected client can always see a screen, even before it
+    /// has opened a window on one.
+    ///
+    /// This is not a nicety.  A toolkit decides whether it *can* open a
+    /// window by looking at the outputs in the registry, so a compositor
+    /// that only publishes a screen once a window exists never gets one:
+    /// mpv exits with "No outputs found", and Chromium and anything else
+    /// GPU-accelerated simply never maps.  Only the simplest clients
+    /// (alacritty) are indifferent.  So every client is offered one empty
+    /// screen up front, which its first toplevel then claims.
+    fn ensure_client_output(&mut self, owner: ClientId) {
+        if self.output_slots.values().any(|s| s.owner == owner) {
+            return;
+        }
+        self.create_output_slot(owner, None);
+    }
+
+    /// Put a toplevel on a screen: the empty one the client is already
+    /// looking at when there is one, a freshly published screen otherwise.
+    ///
+    /// Reusing the empty screen is what makes the first window work.  The
+    /// client bound that output during startup and sized itself against it;
+    /// handing it a *second* screen at map time would leave the first — the
+    /// one it is still reasoning about — describing nothing.
+    fn claim_output_for_surface(&mut self, surface_id: u16, owner: ClientId) {
+        if self
+            .output_slots
+            .values()
+            .any(|s| s.surface_id == Some(surface_id))
+        {
+            return;
+        }
+        let spare = self
+            .output_slots
+            .iter()
+            .find(|(_, s)| s.owner == owner && s.surface_id.is_none())
+            .map(|(&slot, _)| slot);
+        let slot = match spare {
+            Some(slot) => {
+                if let Some(s) = self.output_slots.get_mut(&slot) {
+                    s.surface_id = Some(surface_id);
+                }
+                slot
+            }
+            None => self.create_output_slot(owner, Some(surface_id)),
+        };
+        // The screen now describes a window, so its mode and density
+        // changed: ordinary hotplug from the client's side.
+        self.announce_slot(slot);
+    }
+
+    /// Take a toplevel off its screen, and withdraw the screen — unless it
+    /// is the client's last one, which is emptied and kept.
+    ///
+    /// An app that closes its only window is still running and may open
+    /// another; dropping to zero outputs would strand it exactly as a cold
+    /// start with no screen does.
+    fn release_output_for_surface(&mut self, surface_id: u16) {
+        self.surface_scales.remove(&surface_id);
+        let Some(slot) = self
+            .output_slots
+            .iter()
+            .find(|(_, s)| s.surface_id == Some(surface_id))
+            .map(|(&slot, _)| slot)
+        else {
+            return;
+        };
+        let owner = self.output_slots[&slot].owner.clone();
+        let others = self
+            .output_slots
+            .iter()
+            .filter(|&(&k, s)| k != slot && s.owner == owner)
+            .count();
+        if others == 0 {
+            if let Some(s) = self.output_slots.get_mut(&slot) {
+                s.surface_id = None;
+            }
+            self.announce_slot(slot);
+            return;
+        }
+        if let Some(s) = self.output_slots.remove(&slot) {
+            self.display_handle
+                .disable_global::<Compositor>(s.global.clone());
+            self.retired_output_globals.push(RetiredOutputGlobal {
+                owner: s.owner,
+                global: s.global,
+                slot,
+            });
+        }
+        self.outputs.retain(|o| o.slot != slot);
+    }
+
+    /// Re-send a screen's properties to everyone who bound it.
+    fn announce_slot(&self, slot: u32) {
+        let sid = self.output_slot_surface(slot);
+        for out in self.outputs.iter().filter(|o| o.slot == slot) {
+            self.send_output_properties(&out.resource, sid);
+        }
+    }
+
+    /// Re-announce a surface's output after its scale or size changed.
+    fn refresh_output_for_surface(&self, surface_id: u16) {
+        let s120 = self.surface_scale_120(surface_id) as u32;
+        for out in self
+            .outputs
+            .iter()
+            .filter(|o| self.output_slot_surface(o.slot) == Some(surface_id))
+        {
+            self.send_output_properties(&out.resource, Some(surface_id));
+        }
+        for fs in self.fractional_scales.iter() {
+            if self.find_toplevel_root(&fs.surface).1 == Some(surface_id) {
+                fs.resource.preferred_scale(s120);
+            }
+        }
+    }
+
     fn native_composite_size(&self, toplevel_sid: u16) -> Option<(u32, u32, u32, u32)> {
         let &(lw, lh) = self.surface_sizes.get(&toplevel_sid)?;
         let (lw, lh) = match self
@@ -2845,7 +3279,7 @@ impl Compositor {
             Some(surf) => constrain_to_hints(surf, lw, lh),
             None => (lw, lh),
         };
-        let s120 = (self.output_scale_120 as u32).max(120);
+        let s120 = self.surface_scale_120(toplevel_sid) as u32;
         let pw = super::render::to_physical(lw as u32, s120);
         let ph = super::render::to_physical(lh as u32, s120);
         Some((pw, ph, (pw * 120).div_ceil(s120), (ph * 120).div_ceil(s120)))
@@ -2869,7 +3303,7 @@ impl Compositor {
         // Composite at the output scale so HiDPI clients are rendered
         // at full resolution.  Use the browser's requested size as the
         // target so the frame fits the canvas without letterboxing.
-        let s120 = self.output_scale_120;
+        let s120 = self.surface_scale_120(toplevel_sid);
         let native = self.native_composite_size(toplevel_sid);
         let target_phys = native.map(|(pw, ph, _, _)| (pw, ph));
         let mut encode_giveups: Vec<(u32, u64)> = Vec::new();
@@ -3029,9 +3463,15 @@ impl Compositor {
     }
 
     /// Walk the surface tree rooted at `root_id` and return the topmost
-    /// surface whose pixel bounds contain (`x`, `y`).  Returns
-    /// `(wl_surface, local_x, local_y)` with coordinates relative to the
-    /// hit surface.  Falls back to the root surface when nothing else matches.
+    /// mapped surface whose pixel bounds contain (`x`, `y`).  Returns
+    /// `(wl_surface, local_x, local_y)` with coordinates relative to the hit
+    /// surface.  An unmapped child suppresses its whole subtree, as the
+    /// Wayland mapping rules require; if no child accepts the point, input
+    /// retains the compositor's historical toplevel fallback — but only while
+    /// the toplevel is itself mapped.  Entering an unmapped surface is a
+    /// protocol violation, and it is reachable: `unmap_surface_content` sends
+    /// that surface a `leave`, and without this guard the next motion event
+    /// hands it a fresh `enter` with nothing on screen.
     fn hit_test_surface_at(
         &self,
         root_id: &ObjectId,
@@ -3039,10 +3479,10 @@ impl Compositor {
         y: f64,
     ) -> Option<(WlSurface, f64, f64)> {
         self.hit_test_recursive(root_id, x, y, 0, 0).or_else(|| {
-            // Fallback: return the root surface with the original coords.
             self.surfaces
                 .get(root_id)
-                .map(|s| (s.wl_surface.clone(), x, y))
+                .filter(|surface| surface.map_state != MapState::Unmapped)
+                .map(|surface| (surface.wl_surface.clone(), x, y))
         })
     }
 
@@ -3055,6 +3495,12 @@ impl Compositor {
         offset_y: i32,
     ) -> Option<(WlSurface, f64, f64)> {
         let surf = self.surfaces.get(surface_id)?;
+        // Content presence is the surface's mapped state.  Children retain
+        // their own buffers across a parent unmap, but are not mapped again
+        // until every ancestor has current content.
+        if surf.map_state != MapState::Mapped {
+            return None;
+        }
         let sx = offset_x + surf.subsurface_position.0;
         let sy = offset_y + surf.subsurface_position.1;
 
@@ -3065,22 +3511,23 @@ impl Compositor {
             }
         }
 
-        // Check this surface's bounds (logical coordinates).
-        if let Some(sm) = self.surface_meta.get(surface_id) {
-            let (lw, lh) = super::render::surface_logical_size(surf, sm);
-            let lx = x - sx as f64;
-            let ly = y - sy as f64;
-            if lx >= 0.0 && ly >= 0.0 && lx < lw && ly < lh {
-                // A surface can decline input over part or all of itself, and
-                // then the pointer belongs to whatever is behind it. Firefox
-                // relies on this: it puts its rendering in a subsurface
-                // covering the whole window and sets that subsurface's input
-                // region empty, so input falls through to the toplevel where
-                // its widget code is listening.
-                match surf.input_region {
-                    Some(ref ops) if !input_region::contains(ops, lx, ly) => {}
-                    _ => return Some((surf.wl_surface.clone(), lx, ly)),
-                }
+        // Check this surface's bounds (logical coordinates).  A mapped surface
+        // whose buffer we could not read has no meta and therefore no bounds
+        // of its own, but its descendants above were still considered.
+        let sm = self.surface_meta.get(surface_id)?;
+        let (lw, lh) = super::render::surface_logical_size(surf, sm);
+        let lx = x - sx as f64;
+        let ly = y - sy as f64;
+        if lx >= 0.0 && ly >= 0.0 && lx < lw && ly < lh {
+            // A surface can decline input over part or all of itself, and
+            // then the pointer belongs to whatever is behind it. Firefox
+            // relies on this: it puts its rendering in a subsurface
+            // covering the whole window and sets that subsurface's input
+            // region empty, so input falls through to the toplevel where
+            // its widget code is listening.
+            match surf.input_region {
+                Some(ref ops) if !input_region::contains(ops, lx, ly) => {}
+                _ => return Some((surf.wl_surface.clone(), lx, ly)),
             }
         }
         None
@@ -3236,7 +3683,7 @@ impl Compositor {
                 surf.syncobj_surface.clone(),
             )
         };
-        let Some(buf) = buffer else {
+        let Some(buffer) = buffer else {
             // No new content, so there is nothing to stay in step with and
             // the state applies now, as the protocol says it must.  The
             // points came without a buffer, which the spec calls an error
@@ -3250,6 +3697,24 @@ impl Compositor {
             drop(acquire);
             return;
         };
+        let Some(buf) = buffer else {
+            // `attach(NULL)` is a real buffer-state change: it unmaps the
+            // surface.  Apply the rest of the commit atomically, retire both
+            // the displayed and any acquire-waiting buffer, and leave its
+            // role/tree position intact so a subsurface can map again later.
+            self.apply_committed_state(surface_id);
+            if let Some(r) = release {
+                r.signal();
+            }
+            drop(acquire);
+            self.unmap_surface_content(surface_id);
+            return;
+        };
+        // Mapped from here on: the client attached content.  Whether the
+        // upload below succeeds decides only whether we can *draw* it.
+        if let Some(surf) = self.surfaces.get_mut(surface_id) {
+            surf.map_state = MapState::Mapped;
+        }
 
         // The spec makes an unfenced buffer commit on an explicit-sync
         // surface a fatal protocol error — but Chromium-family browsers
@@ -3592,9 +4057,9 @@ impl Compositor {
             let (presented_sec, presented_nsec) = monotonic_timespec();
             // Send sync_output for each feedback, then presented().
             for fb in feedbacks {
-                for output in &self.outputs {
-                    if same_client(&fb, output) {
-                        fb.sync_output(output);
+                for out in &self.outputs {
+                    if same_client(&fb, &out.resource) {
+                        fb.sync_output(&out.resource);
                     }
                 }
                 // refresh in nanoseconds (millihertz → ns: 1e12 / mhz)
@@ -3635,6 +4100,189 @@ impl Compositor {
     fn forget_pointer_focus(&mut self, gone: &ObjectId) {
         if self.pointer_entered_id.as_ref() == Some(gone) {
             self.pointer_entered_id = None;
+        }
+    }
+
+    /// Remove a still-live surface from pointer focus before unmapping it.
+    ///
+    /// Unlike destruction, unmapping leaves the `wl_surface` resource alive,
+    /// so the client is owed a `leave`.  Clearing only our local id makes a
+    /// later remap deliver a second `enter` with no matching leave, while not
+    /// clearing it leaves axis events routed to invisible popup content.
+    fn leave_pointer_focus(&mut self, gone: &ObjectId) {
+        if self.pointer_entered_id.as_ref() != Some(gone) {
+            return;
+        }
+        let wl = self
+            .surfaces
+            .get(gone)
+            .map(|surface| surface.wl_surface.clone());
+        self.pointer_entered_id = None;
+        let Some(wl) = wl else {
+            return;
+        };
+        let serial = self.next_serial();
+        for ptr in &self.pointers {
+            if same_client(ptr, &wl) {
+                ptr.leave(serial, &wl);
+                ptr.frame();
+            }
+        }
+    }
+
+    /// Drop the current buffer and every compositor-side cache derived from
+    /// it while retaining the surface's role and tree position.  This is the
+    /// content half of a Wayland unmap; a subsurface can attach a new buffer
+    /// later and map again in the same position.
+    ///
+    /// Deliberately does *not* queue a recomposite. Every caller but
+    /// `unmap_popup_surface` is a commit, and `handle_surface_commit` composites
+    /// and publishes the (already updated) tree inline further down — queueing
+    /// here would encode the same frame a second time on every unmap commit.
+    fn unmap_surface_content(&mut self, surface_id: &ObjectId) {
+        // Resolve the toplevel before anything else: the caller may already
+        // Unmapping a parent also unmaps every descendant.  Pointer focus is
+        // normally on the deepest hit surface, so clear that descendant too
+        // instead of testing only the surface that received attach(NULL).
+        let focused = self
+            .pointer_entered_id
+            .clone()
+            .filter(|focused| self.is_in_subtree(focused, surface_id));
+        if let Some(focused) = focused {
+            self.leave_pointer_focus(&focused);
+        }
+        let loses_touch_target = self
+            .active_touches
+            .values()
+            .any(|active| self.is_in_subtree(&active.target.id(), surface_id))
+            // A touch drag has no `active_touches` entry — `start_drag`
+            // cancelled the sequence — so its origin is checked separately, or
+            // an unmap during a touch drag would leave the drag running against
+            // a surface that is gone.  A dropped drag is excluded: it is waiting
+            // on the target's `finish`, and cancelling that tail fails a
+            // transfer that already succeeded.
+            || (self.client_touch_drag_contact().is_some()
+                && self
+                    .client_drag
+                    .as_ref()
+                    .is_some_and(|drag| self.is_in_subtree(&drag.origin.id(), surface_id)));
+        if loses_touch_target {
+            // wl_touch has one cancel event for the whole sequence. If any
+            // target disappears, retire the sequence rather than leaving a
+            // contact bound to an unmapped wl_surface.
+            self.cancel_touch_owner(None);
+        }
+        // A popup can be unmapped without its role being destroyed — GTK hides
+        // a menu with `attach(NULL); commit` and reuses it later.  Retiring the
+        // pixels but not the grab leaves keyboard focus on an invisible surface
+        // and makes the dismiss loop swallow the user's next click.
+        let grabbed: Vec<ObjectId> = self
+            .popup_grab_stack
+            .iter()
+            .filter(|id| self.is_in_subtree(id, surface_id))
+            .cloned()
+            .collect();
+        for grab_id in grabbed {
+            self.popup_grab_stack.retain(|id| *id != grab_id);
+            self.unfocus_popup(&grab_id);
+        }
+        if let Some(surf) = self.surfaces.get_mut(surface_id) {
+            surf.map_state = MapState::Unmapped;
+        }
+        self.surface_meta.remove(surface_id);
+        self.cursor_rgba.remove(surface_id);
+        if let Some(ref mut vk) = self.vulkan_renderer {
+            vk.remove_surface(surface_id);
+        }
+        if let Some(held) = self.held_buffers.remove(surface_id) {
+            self.release_held(held);
+        }
+        if let Some(awaiting) = self.awaiting_acquire.remove(surface_id) {
+            self.release_held(awaiting.into_release());
+        }
+    }
+
+    /// Tear down the whole popup grab stack, topmost first.
+    ///
+    /// Shared by the pointer-press and touch-down dismissal paths so a menu
+    /// closed by tap and one closed by click leave identical focus state.
+    fn dismiss_popup_grabs(&mut self) {
+        while let Some(grab_id) = self.popup_grab_stack.pop() {
+            if let Some(surface) = self.surfaces.get(&grab_id)
+                && let Some(ref popup) = surface.xdg_popup
+            {
+                popup.popup_done();
+            }
+            // `popup_done` itself unmaps the surface.  Do not wait for the
+            // client to destroy the role, or a static page keeps streaming the
+            // last composite with the menu still in it.
+            self.unmap_popup_surface(&grab_id);
+            // Pop first, then hand focus back: `unfocus_popup` reads the stack
+            // to find what is still grabbing underneath, and on the last
+            // iteration that is nothing, so focus lands on the toplevel.
+            self.unfocus_popup(&grab_id);
+        }
+    }
+
+    /// Whether `id` is `ancestor` or one of its descendants, walking the
+    /// `parent_surface_id` chain.
+    fn is_in_subtree(&self, id: &ObjectId, ancestor: &ObjectId) -> bool {
+        let mut at = Some(id.clone());
+        while let Some(current) = at {
+            if &current == ancestor {
+                return true;
+            }
+            at = self
+                .surfaces
+                .get(&current)
+                .and_then(|surface| surface.parent_surface_id.clone());
+        }
+        false
+    }
+
+    /// Stop drawing a dismissed popup and queue a fresh frame for its
+    /// toplevel.
+    ///
+    /// `xdg_popup.popup_done` unmaps the popup at the compositor's end of
+    /// the event; waiting for the client to destroy its role is not the same
+    /// operation.  Chromium does destroy it, but an idle page may not commit
+    /// another toplevel buffer afterwards.  Merely unlinking the popup then
+    /// leaves the last composite (menu included) on screen until the next
+    /// paced repaint, which is hundreds of milliseconds later in Brave.
+    fn unmap_popup_surface(&mut self, popup_id: &ObjectId) {
+        // Resolve the toplevel before unlinking the parent chain.  The queued
+        // recomposite reads the tree after the removal, so it reveals the parent
+        // pixels that were behind the menu.
+        let (_, toplevel_sid) = self.find_toplevel_root(popup_id);
+        let parent_id = self
+            .surfaces
+            .get(popup_id)
+            .and_then(|surface| surface.parent_surface_id.clone());
+        let mut was_mapped = false;
+        if let Some(parent_id) = parent_id
+            && let Some(parent) = self.surfaces.get_mut(&parent_id)
+        {
+            let old_len = parent.children.len();
+            parent.children.retain(|child| child != popup_id);
+            was_mapped = parent.children.len() != old_len;
+        }
+        if !was_mapped {
+            return;
+        }
+
+        // An unmapped surface has no current content.  Drop the render cache
+        // now as well as the tree edge, otherwise reusing this wl_surface for
+        // another popup could briefly resurrect the old menu before its first
+        // new buffer commit.
+        self.unmap_surface_content(popup_id);
+
+        // Unlike every other unmap, this one is not driven by a commit, so no
+        // inline composite follows it and an idle page would keep streaming the
+        // menu.  `false` is important: this must publish pixels, not run only
+        // compositor-resident encoders.
+        if let Some(toplevel_sid) = toplevel_sid {
+            self.pending_recomposite_toplevels
+                .insert(toplevel_sid, false);
         }
     }
 
@@ -3683,11 +4331,59 @@ impl Compositor {
     }
 
     fn cleanup_dead_surfaces(&mut self) {
+        let dead: Vec<ObjectId> = self
+            .surfaces
+            .iter()
+            .filter(|(_, surf)| !surf.wl_surface.is_alive())
+            .map(|(id, _)| id.clone())
+            .collect();
+        if self
+            .active_touches
+            .values()
+            .any(|active| dead.contains(&active.target.id()))
+        {
+            self.cancel_touch_owner(None);
+        }
+
         // Purge stale protocol objects from disconnected clients.
-        self.fractional_scales.retain(|fs| fs.is_alive());
-        self.outputs.retain(|o| o.is_alive());
+        self.fractional_scales.retain(|fs| fs.resource.is_alive());
+        self.outputs.retain(|o| o.resource.is_alive());
+        // A screen outlives the window on it, but not the client it was
+        // offered to — an empty slot is kept for the next window, so
+        // nothing else would ever reclaim one belonging to a client that
+        // has gone.
+        let backend = self.display_handle.backend_handle();
+        let dead_slots: Vec<u32> = self
+            .output_slots
+            .iter()
+            .filter(|(_, s)| backend.get_client_data(s.owner.clone()).is_err())
+            .map(|(&slot, _)| slot)
+            .collect();
+        for slot in dead_slots {
+            if let Some(s) = self.output_slots.remove(&slot) {
+                self.display_handle.remove_global::<Compositor>(s.global);
+            }
+            self.outputs.retain(|o| o.slot != slot);
+        }
+        // Disabled globals remain bindable specifically so a client cannot
+        // lose a race with `global_remove`.  Once that client is dead there
+        // can be no in-flight bind, and no other client was ever allowed to
+        // see the owner-filtered global, so it is finally safe to free it.
+        let mut live_retired = Vec::with_capacity(self.retired_output_globals.len());
+        for retired in self.retired_output_globals.drain(..) {
+            if backend.get_client_data(retired.owner.clone()).is_err() {
+                self.display_handle
+                    .remove_global::<Compositor>(retired.global);
+                self.outputs.retain(|o| o.slot != retired.slot);
+            } else {
+                live_retired.push(retired);
+            }
+        }
+        self.retired_output_globals = live_retired;
+        self.seats.retain(|s| s.is_alive());
         self.keyboards.retain(|k| k.is_alive());
         self.pointers.retain(|p| p.is_alive());
+        self.touches.retain(|t| t.is_alive());
         self.data_devices.retain(|d| d.is_alive());
         self.primary_devices.retain(|d| d.is_alive());
         self.relative_pointers.retain(|p| p.is_alive());
@@ -3708,15 +4404,15 @@ impl Compositor {
             .collect();
         self.axis_scale.retain(|id, _| live.contains(id));
 
-        let dead: Vec<ObjectId> = self
-            .surfaces
-            .iter()
-            .filter(|(_, surf)| !surf.wl_surface.is_alive())
-            .map(|(id, _)| id.clone())
-            .collect();
-
         for proto_id in &dead {
             self.surface_meta.remove(proto_id);
+            // A client that crashes with a live cursor surface never sends
+            // `wl_surface.destroy`, which is the only other place this is
+            // reclaimed, so the RGBA would be leaked for the session's life.
+            self.cursor_rgba.remove(proto_id);
+            if self.current_cursor_surface.as_ref() == Some(proto_id) {
+                self.current_cursor_surface = None;
+            }
             if let Some(ref mut vk) = self.vulkan_renderer {
                 vk.remove_surface(proto_id);
             }
@@ -3728,15 +4424,26 @@ impl Compositor {
                 self.release_held(a);
             }
             self.forget_pointer_focus(proto_id);
+            // Unconditionally: a dead popup that was *not* the focus holder was
+            // left on the grab stack forever, so the dismiss loop kept swallowing
+            // clicks for a surface that no longer exists.
+            let was_grabbing = self.popup_grab_stack.contains(proto_id);
+            self.popup_grab_stack.retain(|id| id != proto_id);
             // A crashed client's popup takes the keyboard with it otherwise:
             // the override would name a surface that no longer exists, and
             // `keyboard_focus_wl` would answer None for every later event.
             if self.kb_focus_popup.as_ref() == Some(proto_id) {
-                self.popup_grab_stack.retain(|id| id != proto_id);
                 self.kb_focus_popup = self.popup_grab_stack.last().cloned();
                 if let Some(next) = self.keyboard_focus_wl() {
                     self.send_keyboard_enter(&next);
                 }
+            } else if was_grabbing {
+                // The stack shrank under the current holder; keep it pointing at
+                // whatever still grabs.
+                self.kb_focus_popup = self
+                    .kb_focus_popup
+                    .take()
+                    .filter(|id| self.popup_grab_stack.contains(id));
             }
             if let Some(surf) = self.surfaces.remove(proto_id) {
                 // Discard any pending presentation feedbacks — the surface
@@ -3751,6 +4458,7 @@ impl Compositor {
                     parent.children.retain(|c| c != proto_id);
                 }
                 if surf.surface_id > 0 {
+                    self.release_output_for_surface(surf.surface_id);
                     self.toplevel_surface_ids.remove(&surf.surface_id);
                     // Clear keyboard focus if it pointed at the dead surface,
                     // so a reused surface id is treated as a fresh focus
@@ -3763,6 +4471,7 @@ impl Compositor {
                     self.pending_request_frames.remove(&surf.surface_id);
                     self.frame_callback_toplevels.remove(&surf.surface_id);
                     self.last_reported_size.remove(&surf.surface_id);
+                    self.pointer_frame_positions.remove(&surf.surface_id);
                     self.surface_sizes.remove(&surf.surface_id);
                     if let Some(ref mut vk) = self.vulkan_renderer {
                         vk.destroy_external_outputs_for_surface(surf.surface_id as u32);
@@ -3829,23 +4538,64 @@ impl Compositor {
         fired
     }
 
+    /// Which surface a cursor change belongs to.
+    ///
+    /// The cursor follows the pointer, not the keyboard, so the surface being
+    /// hovered is the one whose viewers should see the shape change.  Keying
+    /// this off `focused_surface_id` files an I-beam set by an unfocused pane
+    /// under the focused one, which the shared-pointer overlay then draws on
+    /// the wrong surface.  Keyboard focus is the fallback for the case where
+    /// nothing is hovered.
+    fn cursor_target_sid(&self) -> u16 {
+        self.pointer_entered_id
+            .as_ref()
+            .and_then(|id| self.find_toplevel_root(id).1)
+            .unwrap_or(self.focused_surface_id)
+    }
+
     fn handle_cursor_commit(&mut self, surface_id: &ObjectId) {
+        // Only the surface currently set on the pointer speaks for the cursor.
+        // `is_cursor` is latched by the first `set_cursor` and never cleared, so
+        // a toolkit retiring a pooled cursor frame it is not showing would
+        // otherwise blank the live cursor.
+        let is_current = self.current_cursor_surface.as_ref() == Some(surface_id);
+        let unmaps = is_current
+            && self
+                .surfaces
+                .get(surface_id)
+                .is_some_and(|surface| matches!(surface.pending_buffer.as_ref(), Some(None)));
         self.apply_pending_state(surface_id);
         let hotspot = self
             .surfaces
             .get(surface_id)
             .map(|s| s.cursor_hotspot)
             .unwrap_or((0, 0));
-        if let Some((w, h, rgba)) = self.cursor_rgba.get(surface_id)
+        let target_sid = self.cursor_target_sid();
+        if unmaps {
+            let _ = self.event_tx.send(CompositorEvent::SurfaceCursor {
+                surface_id: target_sid,
+                cursor: CursorImage::Hidden,
+            });
+        } else if is_current
+            && let Some((w, h, rgba)) = self.cursor_rgba.get(surface_id)
             && !rgba.is_empty()
         {
+            // `hotspot` is surface-local (logical) per `wl_pointer.set_cursor`,
+            // while `w`/`h` are raw buffer pixels.  Carry the cursor's own
+            // buffer scale so a consumer can put them in one space instead of
+            // guessing from the pane's scale.
+            let scale = self
+                .surfaces
+                .get(surface_id)
+                .map_or(1, |s| s.buffer_scale.clamp(1, i32::from(u16::MAX)) as u16);
             let _ = self.event_tx.send(CompositorEvent::SurfaceCursor {
-                surface_id: self.focused_surface_id,
+                surface_id: target_sid,
                 cursor: CursorImage::Custom {
                     hotspot_x: hotspot.0 as u16,
                     hotspot_y: hotspot.1 as u16,
                     width: *w as u16,
                     height: *h as u16,
+                    scale,
                     rgba: rgba.clone(),
                 },
             });
@@ -3854,15 +4604,150 @@ impl Compositor {
         let _ = self.display_handle.flush_clients();
     }
 
+    fn pointer_focus_matches_surface(&self, surface_id: u16) -> bool {
+        let Some(root_id) = self.toplevel_surface_ids.get(&surface_id) else {
+            return false;
+        };
+        self.surface_meta.contains_key(root_id)
+            && self.pointer_entered_id.as_ref().is_some_and(|entered| {
+                self.surface_meta.contains_key(entered)
+                    && self.find_toplevel_root(entered).0 == *root_id
+            })
+    }
+
+    /// Every lookup `pointer_focus_matches_surface` consults, for a
+    /// `--verbose` log.
+    ///
+    /// A dropped scroll is invisible from both ends: the browser sent it, the
+    /// client never saw it, and the five `return`s that can swallow it are
+    /// distinguishable only from in here. Scroll dying in one pane while its
+    /// neighbours work is the shape this state produces, so print the state
+    /// rather than the conclusion.
+    fn axis_target_state(&self, surface_id: u16) -> String {
+        let root = self.toplevel_surface_ids.get(&surface_id);
+        let entered = self.pointer_entered_id.as_ref();
+        format!(
+            "sid={surface_id} root={root:?} root_meta={} entered={entered:?} \
+             entered_meta={} entered_root={:?} lrs={:?} last_point={:?}",
+            root.is_some_and(|r| self.surface_meta.contains_key(r)),
+            entered.is_some_and(|e| self.surface_meta.contains_key(e)),
+            entered.map(|e| self.find_toplevel_root(e).0),
+            self.last_reported_size.get(&surface_id),
+            self.pointer_frame_positions.get(&surface_id),
+        )
+    }
+
+    /// Hit-test and dispatch one pointer motion in composited-frame
+    /// coordinates. The browser motion path and scroll retargeting share this
+    /// so they cannot disagree about scale, crop, popup, or subsurface rules.
+    fn dispatch_pointer_motion(&mut self, surface_id: u16, x: f64, y: f64, time_ms: u32) {
+        let time = self.input_event_time(time_ms);
+        // The browser sends coordinates in the composited frame's physical
+        // pixel space. Convert to logical (surface-local) coordinates using
+        // the actual composited-to-logical ratio for this surface.
+        let (mut x, mut y) =
+            if let Some(&(cw, ch, lw, lh)) = self.last_reported_size.get(&surface_id) {
+                let sx = if cw > 0 { lw as f64 / cw as f64 } else { 1.0 };
+                let sy = if ch > 0 { lh as f64 / ch as f64 } else { 1.0 };
+                (x * sx, y * sy)
+            } else {
+                (x, y)
+            };
+        // The composited frame is cropped to xdg_geometry (if set), so the
+        // browser's (0,0) corresponds to (geo_x, geo_y) in the surface tree.
+        if let Some((gx, gy, _, _)) = self
+            .toplevel_surface_ids
+            .get(&surface_id)
+            .and_then(|rid| self.surfaces.get(rid))
+            .and_then(|s| s.xdg_geometry)
+        {
+            x += gx as f64;
+            y += gy as f64;
+        }
+        // Hit-test the surface tree to find the actual target (which may be a
+        // subsurface or popup rather than the root).
+        let target_wl = self
+            .toplevel_surface_ids
+            .get(&surface_id)
+            .and_then(|root_id| self.hit_test_surface_at(root_id, x, y))
+            .map(|(wl_surface, lx, ly)| (wl_surface.id(), wl_surface, lx, ly));
+
+        static PTR_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let pn = PTR_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if pn < 5 || pn.is_multiple_of(500) {
+            let root = self.toplevel_surface_ids.get(&surface_id).cloned();
+            let lrs = self.last_reported_size.get(&surface_id).copied();
+            eprintln!(
+                "[pointer #{pn}] sid={surface_id} logical=({x:.1},{y:.1}) lrs={lrs:?} root={root:?} hit={:?}",
+                target_wl
+                    .as_ref()
+                    .map(|(pid, _, lx, ly)| format!("proto={pid:?} local=({lx:.1},{ly:.1})"))
+            );
+        }
+        if let Some((proto_id, wl_surface, lx, ly)) = target_wl {
+            // Remember where we are inside the surface, so a pointer created
+            // after this can be entered at the right spot.
+            self.pointer_entered_local = (lx, ly);
+            let matching_ptrs = self
+                .pointers
+                .iter()
+                .filter(|p| same_client(*p, &wl_surface))
+                .count();
+            if let Some(change) = focus_transition(
+                self.pointer_entered_id.as_ref(),
+                &proto_id,
+                matching_ptrs > 0,
+            ) {
+                let serial = self.next_serial();
+                if matching_ptrs == 0 {
+                    eprintln!(
+                        "[pointer-enter] proto={proto_id:?} has no pointer yet (total_ptrs={}); deferring",
+                        self.pointers.len()
+                    );
+                }
+                if let Some(ref leaving) = change.leave {
+                    let old_wl = self
+                        .surfaces
+                        .values()
+                        .find(|s| s.wl_surface.id() == *leaving)
+                        .map(|s| s.wl_surface.clone());
+                    if let Some(old_wl) = old_wl {
+                        for ptr in &self.pointers {
+                            if same_client(ptr, &old_wl) {
+                                ptr.leave(serial, &old_wl);
+                                ptr.frame();
+                            }
+                        }
+                    }
+                }
+                for ptr in &self.pointers {
+                    if same_client(ptr, &wl_surface) {
+                        ptr.enter(serial, &wl_surface, lx, ly);
+                    }
+                }
+                // An enter nobody received is not focus. The next motion
+                // retries instead of silently dispatching into a void.
+                self.pointer_entered_id = change.entered;
+            }
+            for ptr in &self.pointers {
+                if same_client(ptr, &wl_surface) {
+                    ptr.motion(time, lx, ly);
+                    ptr.frame();
+                }
+            }
+        }
+    }
+
     fn handle_command(&mut self, cmd: CompositorCommand) {
         match cmd {
             CompositorCommand::KeyInput {
                 surface_id: _,
                 keycode,
                 pressed,
+                time_ms,
             } => {
                 let serial = self.next_serial();
-                let time = elapsed_ms();
+                let time = self.input_event_time(time_ms);
                 let state = if pressed {
                     wl_keyboard::KeyState::Pressed
                 } else {
@@ -3886,6 +4771,8 @@ impl Compositor {
                 self.update_and_send_modifiers(keycode, pressed);
                 let _ = self.display_handle.flush_clients();
             }
+            // Synthesised keys for an IME commit: no browser key event stands
+            // behind them, so `0` takes the compositor's own clock.
             CompositorCommand::TextInput { text } => {
                 // Whoever holds `wl_keyboard.enter` — a grabbing popup, else
                 // the focused toplevel — is also who was sent the text-input
@@ -3928,7 +4815,7 @@ impl Compositor {
                 for ch in text.chars() {
                     if let Some((kc, need_shift)) = char_to_keycode(ch) {
                         self.flush_composed(&focused_wl, &mut composed);
-                        let time = elapsed_ms();
+                        let time = self.input_event_time(0);
                         if need_shift {
                             let serial = self.next_serial();
                             for kb in &self.keyboards {
@@ -3995,135 +4882,33 @@ impl Compositor {
                 self.send_preedit(&focused_wl, &text, cursor);
                 let _ = self.display_handle.flush_clients();
             }
-            CompositorCommand::PointerMotion { surface_id, x, y } => {
+            CompositorCommand::PointerMotion {
+                surface_id,
+                x,
+                y,
+                time_ms,
+            } => {
                 // A client-initiated drag owns the pointer: motion drives
                 // the drag session instead of wl_pointer.
-                if self.client_drag_grabbed() {
+                if self.client_pointer_drag_grabbed() {
                     self.client_drag_motion(surface_id, x, y);
                     let _ = self.display_handle.flush_clients();
                     return;
                 }
-                let time = elapsed_ms();
-                // The browser sends coordinates in the composited frame's
-                // physical pixel space.  Convert to logical (surface-local)
-                // coordinates using the actual composited-to-logical ratio
-                // for this surface.
-                let (mut x, mut y) =
-                    if let Some(&(cw, ch, lw, lh)) = self.last_reported_size.get(&surface_id) {
-                        let sx = if cw > 0 { lw as f64 / cw as f64 } else { 1.0 };
-                        let sy = if ch > 0 { lh as f64 / ch as f64 } else { 1.0 };
-                        (x * sx, y * sy)
-                    } else {
-                        (x, y)
-                    };
-                // The composited frame is cropped to xdg_geometry (if set),
-                // so the browser's (0,0) corresponds to (geo_x, geo_y) in the
-                // surface tree.  Offset accordingly.
-                if let Some((gx, gy, _, _)) = self
-                    .toplevel_surface_ids
-                    .get(&surface_id)
-                    .and_then(|rid| self.surfaces.get(rid))
-                    .and_then(|s| s.xdg_geometry)
-                {
-                    x += gx as f64;
-                    y += gy as f64;
-                }
-                // Hit-test the surface tree to find the actual target
-                // (may be a subsurface or popup rather than the root).
-                let target_wl = self
-                    .toplevel_surface_ids
-                    .get(&surface_id)
-                    .and_then(|root_id| self.hit_test_surface_at(root_id, x, y))
-                    .map(|(wl_surface, lx, ly)| (wl_surface.id(), wl_surface, lx, ly));
-
-                static PTR_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let pn = PTR_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if pn < 5 || pn.is_multiple_of(500) {
-                    let root = self.toplevel_surface_ids.get(&surface_id).cloned();
-                    let lrs = self.last_reported_size.get(&surface_id).copied();
-                    eprintln!(
-                        "[pointer #{pn}] sid={surface_id} logical=({x:.1},{y:.1}) lrs={lrs:?} root={root:?} hit={:?}",
-                        target_wl.as_ref().map(|(pid, _, lx, ly)| format!(
-                            "proto={pid:?} local=({lx:.1},{ly:.1})"
-                        ))
-                    );
-                }
-                if let Some((proto_id, wl_surface, lx, ly)) = target_wl {
-                    // Remember where we are inside the surface, so a pointer
-                    // created *after* this can be entered at the right spot
-                    // rather than waiting for the next motion (`GetPointer`).
-                    self.pointer_entered_local = (lx, ly);
-                    let matching_ptrs = self
-                        .pointers
-                        .iter()
-                        .filter(|p| same_client(*p, &wl_surface))
-                        .count();
-                    if let Some(change) = focus_transition(
-                        self.pointer_entered_id.as_ref(),
-                        &proto_id,
-                        matching_ptrs > 0,
-                    ) {
-                        let serial = self.next_serial();
-                        if matching_ptrs == 0 {
-                            // The client has mapped a surface but has not
-                            // asked for a pointer yet — Firefox routinely
-                            // takes long enough to start that the cursor is
-                            // already over its pane. Say so, and (below)
-                            // decline to latch: an enter nobody received must
-                            // not count as having entered.
-                            eprintln!(
-                                "[pointer-enter] proto={proto_id:?} has no pointer yet (total_ptrs={}); deferring",
-                                self.pointers.len()
-                            );
-                        }
-                        // Leave old surface.
-                        if let Some(ref leaving) = change.leave {
-                            let old_wl = self
-                                .surfaces
-                                .values()
-                                .find(|s| s.wl_surface.id() == *leaving)
-                                .map(|s| s.wl_surface.clone());
-                            if let Some(old_wl) = old_wl {
-                                for ptr in &self.pointers {
-                                    if same_client(ptr, &old_wl) {
-                                        ptr.leave(serial, &old_wl);
-                                        ptr.frame();
-                                    }
-                                }
-                            }
-                        }
-                        for ptr in &self.pointers {
-                            if same_client(ptr, &wl_surface) {
-                                ptr.enter(serial, &wl_surface, lx, ly);
-                            }
-                        }
-                        // Whatever `focus_transition` decided — including
-                        // recording nothing when no pointer received the
-                        // enter, so the next motion retries rather than the
-                        // state machine believing the job is done. Its tests
-                        // enumerate the cases; see pointer_focus.rs.
-                        self.pointer_entered_id = change.entered;
-                    }
-                    for ptr in &self.pointers {
-                        if same_client(ptr, &wl_surface) {
-                            ptr.motion(time, lx, ly);
-                            ptr.frame();
-                        }
-                    }
-                }
-                // When no surface is hit, don't send motion events —
-                // there is no valid surface-local coordinate to report.
+                self.pointer_frame_positions.insert(surface_id, (x, y));
+                self.dispatch_pointer_motion(surface_id, x, y, time_ms);
                 let _ = self.display_handle.flush_clients();
             }
             CompositorCommand::PointerButton {
                 surface_id: _,
                 button,
                 pressed,
+                time_ms,
             } => {
                 // A client-initiated drag swallows button input: presses go
                 // nowhere, and the release ends the grab — drop on the
                 // current target, or dnd_cancelled when there is none.
-                if self.client_drag_grabbed() {
+                if self.client_pointer_drag_grabbed() {
                     if !pressed {
                         self.client_drag_release();
                     }
@@ -4131,7 +4916,7 @@ impl Compositor {
                     return;
                 }
                 let serial = self.next_serial();
-                let time = elapsed_ms();
+                let time = self.input_event_time(time_ms);
                 let state = if pressed {
                     wl_pointer::ButtonState::Pressed
                 } else {
@@ -4150,19 +4935,7 @@ impl Compositor {
                         })
                     });
                     if !click_on_grabbed {
-                        // Dismiss from the topmost popup down.
-                        while let Some(grab_wl_id) = self.popup_grab_stack.pop() {
-                            if let Some(surf) = self.surfaces.get(&grab_wl_id)
-                                && let Some(ref popup) = surf.xdg_popup
-                            {
-                                popup.popup_done();
-                            }
-                            // Pop first, then hand focus back: `unfocus_popup`
-                            // reads the stack to find what is still grabbing
-                            // underneath, and on the last iteration that is
-                            // nothing, so focus lands on the toplevel.
-                            self.unfocus_popup(&grab_wl_id);
-                        }
+                        self.dismiss_popup_grabs();
                         let _ = self.display_handle.flush_clients();
                         dismissed = true;
                     }
@@ -4195,12 +4968,61 @@ impl Compositor {
                 surface_id,
                 dx,
                 dy,
+                time_ms,
                 v120_x,
                 v120_y,
                 source,
                 stop,
             } => {
-                let time = elapsed_ms();
+                if !self.pointer_focus_matches_surface(surface_id) {
+                    // One Wayland seat is shared by every browser viewer. A
+                    // motion from another pane can therefore steal focus
+                    // between this viewer's wheel motion and axis message.
+                    // Re-hit-test the last point on the surface the axis
+                    // explicitly named before dispatching the delta.
+                    let point = self
+                        .pointer_frame_positions
+                        .get(&surface_id)
+                        .copied()
+                        .or_else(|| {
+                            self.last_reported_size.get(&surface_id).map(
+                                |&(width, height, _, _)| {
+                                    (f64::from(width) / 2.0, f64::from(height) / 2.0)
+                                },
+                            )
+                        })
+                        .or_else(|| {
+                            let root_id = self.toplevel_surface_ids.get(&surface_id)?;
+                            let surface = self.surfaces.get(root_id)?;
+                            let meta = self.surface_meta.get(root_id)?;
+                            let (width, height) = surface.xdg_geometry.map_or_else(
+                                || super::render::surface_logical_size(surface, meta),
+                                |(_, _, width, height)| (f64::from(width), f64::from(height)),
+                            );
+                            Some((width / 2.0, height / 2.0))
+                        });
+                    if let Some((x, y)) = point {
+                        self.dispatch_pointer_motion(surface_id, x, y, time_ms);
+                    } else if self.verbose {
+                        eprintln!(
+                            "[axis-drop] no point to re-seed the hit test: {}",
+                            self.axis_target_state(surface_id)
+                        );
+                    }
+                    if !self.pointer_focus_matches_surface(surface_id) {
+                        // An invalid, unmapped, or pointerless destination is
+                        // not permission to scroll whichever surface happened
+                        // to hold the shared seat before this message.
+                        if self.verbose {
+                            eprintln!(
+                                "[axis-drop] target still not entered after re-hit-test: {}",
+                                self.axis_target_state(surface_id)
+                            );
+                        }
+                        return;
+                    }
+                }
+                let time = self.input_event_time(time_ms);
                 // Scroll distance arrives in the composited frame's pixel
                 // space, like pointer motion; wl_pointer.axis wants
                 // surface-logical pixels. Same conversion PointerMotion
@@ -4233,6 +5055,12 @@ impl Compositor {
                     .find(|s| Some(s.wl_surface.id()) == self.pointer_entered_id)
                     .map(|s| s.wl_surface.clone());
                 let Some(wl) = focused_wl else {
+                    if self.verbose {
+                        eprintln!(
+                            "[axis-drop] entered surface is no longer live: {}",
+                            self.axis_target_state(surface_id)
+                        );
+                    }
                     return;
                 };
                 use wl_pointer::Axis;
@@ -4290,6 +5118,19 @@ impl Compositor {
                 }
                 let _ = self.display_handle.flush_clients();
             }
+            CompositorCommand::SetTouchEnabled { enabled } => {
+                self.set_touch_enabled(enabled);
+                let _ = self.display_handle.flush_clients();
+            }
+            CompositorCommand::Touch {
+                owner_id,
+                surface_id,
+                phase,
+                time_ms,
+                contacts,
+            } => {
+                self.schedule_touch(owner_id, surface_id, phase, time_ms, contacts);
+            }
             CompositorCommand::SurfaceResize {
                 surface_id,
                 width,
@@ -4303,127 +5144,47 @@ impl Compositor {
                 let h = (height as i32) * 120 / s_in;
                 self.surface_sizes.insert(surface_id, (w, h));
 
-                // Track whether output properties changed so we can batch
-                // all events before a single output.done().
-                let mut output_changed = false;
-
-                // Update output scale (in 1/120th units) from the browser DPR.
-                if scale_120 > 0 && scale_120 != self.output_scale_120 {
-                    self.output_scale_120 = scale_120;
-                    output_changed = true;
+                // Density belongs to this surface alone.  It used to be one
+                // number for the whole session, so a viewer changing its DPR
+                // — or merely switching which pane it was looking at —
+                // reconfigured every other app in the session and made them
+                // all repaint.
+                let scale_changed =
+                    scale_120 > 0 && scale_120 != self.surface_scale_120(surface_id);
+                if scale_changed {
+                    self.surface_scales.insert(surface_id, scale_120.max(120));
                 }
+                // The output this surface is on is its own display: its mode
+                // follows the pane, its scale follows the viewer.  Re-announce
+                // scale + mode before the configure, so the client sees the
+                // display change first and picks a buffer scale to match.
+                self.refresh_output_for_surface(surface_id);
 
-                let s120 = self.output_scale_120 as i32;
-
-                // Recompute output dimensions from scratch (start from 0,0)
-                // so the output can shrink when surfaces get smaller or are
-                // destroyed.  The previous fold started from (output_width,
-                // output_height) which meant dimensions could only grow.
-                let (max_w, max_h) = self
-                    .surface_sizes
-                    .values()
-                    .fold((0i32, 0i32), |(mw, mh), &(sw, sh)| (mw.max(sw), mh.max(sh)));
-                // Clamp to a sensible minimum so the output is never 0×0.
-                let max_w = max_w.max(1);
-                let max_h = max_h.max(1);
-                if max_w != self.output_width || max_h != self.output_height {
-                    self.output_width = max_w;
-                    self.output_height = max_h;
-                    output_changed = true;
-                }
-
-                // When any output property changed, re-send the full
-                // sequence so clients see it as a display configuration
-                // change: geometry → mode → scale → fractional_scale → done.
-                if output_changed {
-                    let int_scale = ((s120) + 119) / 120;
-                    for output in &self.outputs {
-                        output.geometry(
-                            0,
-                            0,
-                            0,
-                            0,
-                            wl_output::Subpixel::None,
-                            "blit".to_string(),
-                            "virtual".to_string(),
-                            wl_output::Transform::Normal,
-                        );
-                        // mode() takes physical pixels: logical × scale.
-                        let mode_w = self.output_width * s120 / 120;
-                        let mode_h = self.output_height * s120 / 120;
-                        output.mode(
-                            wl_output::Mode::Current | wl_output::Mode::Preferred,
-                            mode_w,
-                            mode_h,
-                            self.output_refresh_mhz as i32,
-                        );
-                        if output.version() >= 2 {
-                            output.scale(int_scale);
-                        }
+                if let Some(root_id) = self.toplevel_surface_ids.get(&surface_id)
+                    && let Some(surf) = self.surfaces.get(root_id)
+                {
+                    let (cw, ch) = constrain_to_hints(surf, w, h);
+                    if let Some(ref tl) = surf.xdg_toplevel {
+                        tl.configure(cw, ch, pane_states(surf.xdg_fullscreen));
                     }
-                    for fs in &self.fractional_scales {
-                        fs.preferred_scale(s120 as u32);
+                    if let Some(ref xs) = surf.xdg_surface {
+                        let serial = self.serial.wrapping_add(1);
+                        self.serial = serial;
+                        xs.configure(serial);
                     }
                 }
+                self.fire_frame_callbacks_for_toplevel(surface_id, None);
 
-                // Single output.done() after all property changes, so the
-                // client sees scale + mode atomically before the configure.
-                if output_changed {
-                    for output in &self.outputs {
-                        if output.version() >= 2 {
-                            output.done();
-                        }
-                    }
-                }
-
-                if output_changed {
-                    // When output scale or dimensions changed, every
-                    // toplevel needs a new configure so it re-renders at
-                    // the correct density / size.
-                    for (&sid, root_id) in &self.toplevel_surface_ids {
-                        let (lw, lh) = self.surface_sizes.get(&sid).copied().unwrap_or((w, h));
-                        if let Some(surf) = self.surfaces.get(root_id) {
-                            let (lw, lh) = constrain_to_hints(surf, lw, lh);
-                            if let Some(ref tl) = surf.xdg_toplevel {
-                                tl.configure(lw, lh, pane_states(surf.xdg_fullscreen));
-                            }
-                            if let Some(ref xs) = surf.xdg_surface {
-                                let serial = self.serial.wrapping_add(1);
-                                self.serial = serial;
-                                xs.configure(serial);
-                            }
-                        }
-                    }
-                    // Fire frame callbacks so all clients repaint at new
-                    // scale.
-                    let all_sids: Vec<u16> = self.toplevel_surface_ids.keys().copied().collect();
-                    for sid in all_sids {
-                        self.fire_frame_callbacks_for_toplevel(sid, None);
-                    }
-
-                    // Reset pointer/keyboard state — scale change
-                    // invalidates coordinate mappings.
-                    self.pointer_entered_id = None;
-                    self.pending_kb_reenter = true;
-                } else {
-                    // Only the target surface changed size — configure just
-                    // that one.  This avoids disturbing other surfaces'
-                    // frame callback / render cycle, which would race with
-                    // the server's RequestFrame mechanism and stall them.
-                    if let Some(root_id) = self.toplevel_surface_ids.get(&surface_id)
-                        && let Some(surf) = self.surfaces.get(root_id)
+                if scale_changed {
+                    // Pointer coordinates are expressed in this surface's
+                    // scale, so the enter has to be reissued — but only for
+                    // the surface whose scale moved.
+                    if self.pointer_entered_id.as_ref()
+                        == self.toplevel_surface_ids.get(&surface_id)
                     {
-                        let (cw, ch) = constrain_to_hints(surf, w, h);
-                        if let Some(ref tl) = surf.xdg_toplevel {
-                            tl.configure(cw, ch, pane_states(surf.xdg_fullscreen));
-                        }
-                        if let Some(ref xs) = surf.xdg_surface {
-                            let serial = self.serial.wrapping_add(1);
-                            self.serial = serial;
-                            xs.configure(serial);
-                        }
+                        self.pointer_entered_id = None;
                     }
-                    self.fire_frame_callbacks_for_toplevel(surface_id, None);
+                    self.pending_kb_reenter = true;
                 }
 
                 // The composite target moved the moment `surface_sizes`
@@ -4438,17 +5199,10 @@ impl Compositor {
                 // — one wasted rebuild, one wasted keyframe, and a visibly
                 // squashed picture in between.
                 //
-                // An output-scale change rescales every toplevel's
-                // composite, not just this one, so re-report them all.
-                let affected: Vec<u16> = if output_changed {
-                    self.surface_sizes.keys().copied().collect()
-                } else {
-                    vec![surface_id]
-                };
-                for sid in affected {
-                    if let Some(dims) = self.native_composite_size(sid) {
-                        self.pending_native_sizes.insert(sid, dims);
-                    }
+                // Only this surface's composite moved: scale is per-surface,
+                // so a density change no longer rescales the session.
+                if let Some(dims) = self.native_composite_size(surface_id) {
+                    self.pending_native_sizes.insert(surface_id, dims);
                 }
                 self.flush_pending_commits();
 
@@ -4539,7 +5293,7 @@ impl Compositor {
                 let cap_s120 = if scale_120 > 0 {
                     scale_120
                 } else {
-                    self.output_scale_120
+                    self.surface_scale_120(surface_id)
                 };
                 let result = if let Some(root_id) = self.toplevel_surface_ids.get(&surface_id) {
                     if let Some(ref mut vk) = self.vulkan_renderer {
@@ -4620,8 +5374,10 @@ impl Compositor {
                         .insert(surface_id, presentation_at);
                 }
             }
+            // Server-side cleanup on disconnect, not a browser event: `0` takes
+            // the compositor's own clock.
             CompositorCommand::ReleaseKeys { keycodes } => {
-                let time = elapsed_ms();
+                let time = self.input_event_time(0);
                 let focused_wl = self
                     .toplevel_surface_ids
                     .get(&self.focused_surface_id)
@@ -4751,19 +5507,14 @@ impl Compositor {
                 let diff = (mhz as i64 - self.output_refresh_mhz as i64).unsigned_abs();
                 if diff >= 2000 && mhz > 0 {
                     self.output_refresh_mhz = mhz;
-                    let s120 = self.output_scale_120 as i32;
-                    let mode_w = self.output_width * s120 / 120;
-                    let mode_h = self.output_height * s120 / 120;
-                    for output in &self.outputs {
-                        output.mode(
-                            wl_output::Mode::Current | wl_output::Mode::Preferred,
-                            mode_w,
-                            mode_h,
-                            mhz as i32,
+                    // Refresh is the one output property that really is
+                    // shared: it comes from the fastest connected display,
+                    // and every surface's mode carries it.
+                    for out in &self.outputs {
+                        self.send_output_properties(
+                            &out.resource,
+                            self.output_slot_surface(out.slot),
                         );
-                        if output.version() >= 2 {
-                            output.done();
-                        }
                     }
                     let _ = self.display_handle.flush_clients();
                 }
@@ -4917,6 +5668,464 @@ impl Compositor {
 }
 
 impl Compositor {
+    /// Queue one transport touch frame at the wall-clock cadence of the
+    /// browser events that produced it.
+    ///
+    /// `due = max(previous_due + browser_delta, arrival)` has two useful
+    /// properties. A live stream is never delayed just to match a prediction,
+    /// while a burst that arrived late is replayed from its first event at the
+    /// original spacing instead of being flattened into one compositor pass.
+    fn schedule_touch(
+        &mut self,
+        owner_id: u64,
+        surface_id: u16,
+        phase: TouchPhase,
+        time_ms: u32,
+        contacts: Vec<TouchPoint>,
+    ) {
+        self.touch_pacer.push(
+            std::time::Instant::now(),
+            owner_id,
+            surface_id,
+            phase,
+            time_ms,
+            contacts,
+        );
+    }
+
+    fn dispatch_due_touches(&mut self) {
+        let Some(touch) = self.touch_pacer.pop_due(std::time::Instant::now()) else {
+            return;
+        };
+        self.handle_touch(
+            touch.owner_id,
+            touch.surface_id,
+            touch.phase,
+            touch.time_ms,
+            &touch.contacts,
+        );
+        let _ = self.display_handle.flush_clients();
+    }
+
+    fn next_touch_deadline(&self) -> Option<std::time::Instant> {
+        self.touch_pacer.next_deadline()
+    }
+
+    /// The seat's advertised device set.  One definition for both the initial
+    /// `bind` and every later update: a client that binds `wl_seat` before the
+    /// first direct-touch viewer connects must not see a different device set
+    /// from one that binds after.
+    fn seat_capabilities(&self) -> wl_seat::Capability {
+        let mut capabilities = wl_seat::Capability::Keyboard | wl_seat::Capability::Pointer;
+        if self.touch_enabled {
+            capabilities |= wl_seat::Capability::Touch;
+        }
+        capabilities
+    }
+
+    fn set_touch_enabled(&mut self, enabled: bool) {
+        if self.touch_enabled == enabled {
+            return;
+        }
+        if !enabled {
+            self.cancel_touch_owner(None);
+        }
+        self.touch_enabled = enabled;
+        let capabilities = self.seat_capabilities();
+        for seat in &self.seats {
+            seat.capabilities(capabilities);
+        }
+    }
+
+    fn allocate_touch_id(&self) -> i32 {
+        // Wayland only requires ids to stay unique while their contacts are
+        // live. Reuse the lowest free slot, as a physical touchscreen does.
+        // Chromium's gesture stack accepts at most 32 pointer ids; handing it
+        // a fresh seat-global id forever makes every app lose fling recognition
+        // after the compositor's 32nd gesture even though dragging still works.
+        (0..i32::MAX)
+            .find(|id| {
+                !self
+                    .active_touches
+                    .values()
+                    .any(|active| active.wayland_id == *id)
+            })
+            .expect("all Wayland touch ids are live")
+    }
+
+    fn touch_frame_target(targets: &mut Vec<WlTouch>, touch: &WlTouch) {
+        if !targets.iter().any(|target| target.id() == touch.id()) {
+            targets.push(touch.clone());
+        }
+    }
+
+    /// Retire an owner's touch sequence (`None` = every owner).
+    ///
+    /// Also ends a touch-started drag belonging to that owner, and tells the
+    /// server so it stops treating the owner as holding a live sequence.
+    fn cancel_touch_owner(&mut self, owner: Option<u64>) {
+        // A down may still be waiting for its paced delivery. It has not
+        // reached `active_touches` yet, but the server has already granted its
+        // browser owner the sequence lock and must be told if we discard it.
+        let had_pending = self.touch_pacer.has_contacts(owner);
+        self.touch_pacer.clear(owner);
+        // The drag is checked independently of `active_touches`: `start_drag`
+        // cancels the sequence and empties that map, so during a touch drag the
+        // grab is the only remaining trace of the contact.
+        //
+        // Only a *live* drag, though. After a valid drop the session stays alive
+        // waiting for the target's `finish`, and cancelling there would send
+        // `wl_data_source.cancelled` after `dnd_drop_performed` — the source app
+        // reads its completed drop as failed and a Move never deletes the
+        // original.
+        let cancel_drag = self
+            .client_touch_drag_contact()
+            .is_some_and(|grab| owner.is_none_or(|owner| owner == grab.owner_id));
+        let had_contacts = self
+            .active_touches
+            .keys()
+            .any(|(active_owner, _)| owner.is_none_or(|owner| owner == *active_owner));
+        if !cancel_drag && !had_contacts && !had_pending {
+            self.reset_touch_clock(owner);
+            return;
+        }
+        if cancel_drag {
+            self.client_drag_cancel(true);
+        }
+        if had_contacts {
+            self.retire_touch_contacts(owner);
+        }
+        self.reset_touch_clock(owner);
+        // Tell the server, or it keeps this owner registered as holding a live
+        // sequence and refuses every other viewer's contacts until that
+        // browser's fingers happen to lift.
+        let _ = self
+            .event_tx
+            .send(CompositorEvent::TouchCancelled { owner_id: owner });
+        (self.event_notify)();
+    }
+
+    /// Send `wl_touch.cancel` for an owner's contacts and forget them.
+    ///
+    /// `cancel` is defined over the whole sequence, so this is all-or-nothing
+    /// per client — which is exactly what a seat hand-off means. It does not
+    /// touch `client_drag`: `start_drag` calls it to hand the seat to a drag it
+    /// is in the middle of establishing.
+    fn retire_touch_contacts(&mut self, owner: Option<u64>) {
+        let targets: Vec<WlSurface> = self
+            .active_touches
+            .iter()
+            .filter(|((active_owner, _), _)| owner.is_none_or(|owner| owner == *active_owner))
+            .map(|(_, active)| active.target.clone())
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        self.active_touches
+            .retain(|(active_owner, _), _| owner.is_some_and(|owner| owner != *active_owner));
+        for touch in &self.touches {
+            if targets.iter().any(|target| same_client(touch, target)) {
+                touch.cancel();
+            }
+        }
+    }
+
+    fn touch_local_position(
+        &self,
+        surface_id: u16,
+        target_id: &ObjectId,
+        x: f64,
+        y: f64,
+    ) -> Option<(f64, f64)> {
+        let (root_id, x, y) = self.frame_to_surface_tree(surface_id, x, y)?;
+        let (target_root, _) = self.find_toplevel_root(target_id);
+        if root_id != target_root {
+            return None;
+        }
+        let (offset_x, offset_y) = self.surface_absolute_position(target_id);
+        Some((x - f64::from(offset_x), y - f64::from(offset_y)))
+    }
+
+    /// Turn a browser event's `timeStamp` into a seat input timestamp.
+    ///
+    /// Apps differentiate position against `wl_pointer.motion` / `wl_touch.time`
+    /// / `wl_pointer.axis` to get a velocity — a fling, a stroke width, a swipe.
+    /// So the *spacing* between events has to be the browser's. It cannot be the
+    /// browser's clock outright, because these timestamps share one millisecond
+    /// domain across the whole seat, so the client's epoch is anchored to ours and
+    /// its deltas ride on top.
+    ///
+    /// Reading our own clock per event instead is what broke inertial scrolling:
+    /// the command queue is drained in one pass, so a burst of coalesced moves all
+    /// landed on the same instant and every velocity came out as a division by
+    /// zero.
+    fn input_event_time(&mut self, client_time_ms: u32) -> u32 {
+        let now = elapsed_ms();
+        // No browser event behind this one — the legacy axis opcode, an IME commit's
+        // synthesised keys, disconnect cleanup. Take our own clock, but leave the
+        // anchor alone: these interleave with real gestures (a chord synthesised
+        // around a real keypress, a modifier during a drag), and dropping the
+        // anchor there would restart the pacing of the gesture around them.
+        if client_time_ms == 0 {
+            let time = now.max(self.last_input_time.unwrap_or(now));
+            self.last_input_time = Some(time);
+            return time;
+        }
+        // Re-anchor after an idle gap. Within a gesture the browser's spacing is
+        // exact; across gestures a stale anchor would accumulate the drift
+        // between the two clocks, and nothing needs continuity across a pause.
+        const REANCHOR_IDLE_MS: u32 = 200;
+        const MAX_DRIFT_MS: u32 = 60_000;
+        if let Some((anchor_local, _)) = self.input_time_anchor
+            && now > anchor_local
+            && now - anchor_local > MAX_DRIFT_MS
+        {
+            self.input_time_anchor = None;
+        }
+        // `>` first: a batched event can legitimately sit slightly ahead of `now`,
+        // and a wrapping subtraction there would look like a huge idle gap and
+        // re-anchor on every event of the burst.
+        if let Some(last) = self.last_input_time
+            && now > last
+            && now - last > REANCHOR_IDLE_MS
+        {
+            self.input_time_anchor = None;
+        }
+        let (anchor_local, anchor_client) =
+            *self.input_time_anchor.get_or_insert((now, client_time_ms));
+        // The client's epoch is its own and is not trusted: a wrap, a clock step,
+        // or a bad actor must not send time backwards (which clients may assert
+        // on) or into the future (which would starve a fling of samples).
+        let elapsed = client_time_ms.wrapping_sub(anchor_client);
+        let time = if elapsed <= MAX_DRIFT_MS {
+            anchor_local.wrapping_add(elapsed)
+        } else {
+            now
+        };
+        // Not clamped to `now`: a batch of events that were generated before they
+        // arrived is legitimately spread across the instant we drain it, and
+        // clamping each to `now` would flatten the very spacing this exists to
+        // keep. Unbounded futureness is the real hazard, so a client whose clock
+        // runs fast simply re-anchors once it gets too far ahead.
+        const MAX_AHEAD_MS: u32 = 1_000;
+        let time = if time.wrapping_sub(now) > MAX_AHEAD_MS && time > now {
+            self.input_time_anchor = Some((now, client_time_ms));
+            now
+        } else {
+            time
+        };
+        // Monotonic: clients may assert on time going backwards.
+        let time = time.max(self.last_input_time.unwrap_or(time));
+        self.last_input_time = Some(time);
+        time
+    }
+
+    /// Map one direct-touch owner's browser clock into the shared seat domain.
+    ///
+    /// Pointer, key, and axis commands may come from a different connected
+    /// browser. Their DOM `timeStamp` epochs are unrelated, so direct touch
+    /// cannot reuse the generic input anchor. The one-viewer touch lock ensures
+    /// there is at most one live touch owner; the owner id still matters across
+    /// back-to-back sequences from different viewers.
+    fn touch_event_time(&mut self, owner_id: u64, client_time_ms: u32) -> u32 {
+        if client_time_ms == 0 {
+            return self.input_event_time(0);
+        }
+
+        let now = elapsed_ms();
+        const REANCHOR_IDLE_MS: u32 = 200;
+        const MAX_DRIFT_MS: u32 = 60_000;
+        const MAX_AHEAD_MS: u32 = 1_000;
+
+        if self
+            .touch_time_anchor
+            .is_some_and(|(owner, _, _)| owner != owner_id)
+        {
+            self.touch_time_anchor = None;
+            self.touch_time_last_arrival = None;
+        }
+        if let Some((_, anchor_local, _)) = self.touch_time_anchor
+            && now > anchor_local
+            && now - anchor_local > MAX_DRIFT_MS
+        {
+            self.touch_time_anchor = None;
+        }
+        if let Some(last_arrival) = self.touch_time_last_arrival
+            && now > last_arrival
+            && now - last_arrival > REANCHOR_IDLE_MS
+        {
+            self.touch_time_anchor = None;
+        }
+        self.touch_time_last_arrival = Some(now);
+
+        // Start at the seat's last emitted time when another input batch is
+        // slightly ahead of our clock. That keeps the seat monotonic without
+        // flattening this sequence's following browser-time deltas.
+        let local_base = now.max(self.last_input_time.unwrap_or(now));
+        let (_, anchor_local, anchor_client) =
+            *self
+                .touch_time_anchor
+                .get_or_insert((owner_id, local_base, client_time_ms));
+        let elapsed = client_time_ms.wrapping_sub(anchor_client);
+        let mut time = if elapsed <= MAX_DRIFT_MS {
+            anchor_local.wrapping_add(elapsed)
+        } else {
+            self.touch_time_anchor = Some((owner_id, local_base, client_time_ms));
+            local_base
+        };
+        if time > now && time.wrapping_sub(now) > MAX_AHEAD_MS {
+            self.touch_time_anchor = Some((owner_id, local_base, client_time_ms));
+            time = local_base;
+        }
+        time = time.max(self.last_input_time.unwrap_or(time));
+        self.last_input_time = Some(time);
+        time
+    }
+
+    fn reset_touch_clock(&mut self, owner: Option<u64>) {
+        if owner.is_none_or(|owner| {
+            self.touch_time_anchor
+                .is_some_and(|(active_owner, _, _)| active_owner == owner)
+        }) {
+            self.touch_time_anchor = None;
+            self.touch_time_last_arrival = None;
+        }
+    }
+
+    fn handle_touch(
+        &mut self,
+        owner_id: u64,
+        surface_id: u16,
+        phase: TouchPhase,
+        client_time_ms: u32,
+        contacts: &[TouchPoint],
+    ) {
+        if phase == TouchPhase::Cancel {
+            self.cancel_touch_owner(Some(owner_id));
+            return;
+        }
+        if !self.touch_enabled {
+            return;
+        }
+
+        let time = self.touch_event_time(owner_id, client_time_ms);
+        let mut framed = Vec::new();
+        for point in contacts {
+            let key = (owner_id, point.id);
+            match phase {
+                TouchPhase::Down => {
+                    if self.active_touches.contains_key(&key) {
+                        continue;
+                    }
+                    // A touch-started DnD installs a seat-wide touch grab.
+                    // New contacts are swallowed until its initiating
+                    // contact lifts, matching a physical compositor.
+                    if self.client_touch_drag_active() {
+                        continue;
+                    }
+                    let Some((target, lx, ly)) = self.drag_target(surface_id, point.x, point.y)
+                    else {
+                        continue;
+                    };
+                    let target_id = target.id();
+
+                    // A touch outside a grabbed popup is spent dismissing the
+                    // popup, just like the pointer press path.
+                    if !self.popup_grab_stack.is_empty()
+                        && !self.popup_grab_stack.contains(&target_id)
+                    {
+                        self.dismiss_popup_grabs();
+                        continue;
+                    }
+
+                    let recipients: Vec<WlTouch> = self
+                        .touches
+                        .iter()
+                        .filter(|touch| same_client(*touch, &target))
+                        .cloned()
+                        .collect();
+                    if recipients.is_empty() {
+                        continue;
+                    }
+                    let serial = self.next_serial();
+                    let wayland_id = self.allocate_touch_id();
+                    for touch in &recipients {
+                        touch.down(serial, time, &target, wayland_id, lx, ly);
+                        Self::touch_frame_target(&mut framed, touch);
+                    }
+                    self.active_touches.insert(
+                        key,
+                        ActiveTouch {
+                            wayland_id,
+                            target,
+                            surface_id,
+                            down_serial: serial,
+                        },
+                    );
+                }
+                TouchPhase::Motion => {
+                    // Checked before `active_touches`, which `start_drag`
+                    // emptied when it cancelled the sequence: the grab is the
+                    // only remaining record of the contact driving the drag.
+                    // Everything else was cancelled and is owed nothing.
+                    if let Some(grab) = self.client_touch_drag_contact() {
+                        if (grab.owner_id, grab.browser_id) == key {
+                            self.client_drag_motion(grab.surface_id, point.x, point.y);
+                        }
+                        continue;
+                    }
+                    let Some(active) = self.active_touches.get(&key) else {
+                        continue;
+                    };
+                    let wayland_id = active.wayland_id;
+                    let target = active.target.clone();
+                    let target_id = target.id();
+                    let active_surface_id = active.surface_id;
+                    let Some((lx, ly)) =
+                        self.touch_local_position(active_surface_id, &target_id, point.x, point.y)
+                    else {
+                        continue;
+                    };
+                    for touch in &self.touches {
+                        if same_client(touch, &target) {
+                            touch.motion(time, wayland_id, lx, ly);
+                            Self::touch_frame_target(&mut framed, touch);
+                        }
+                    }
+                }
+                TouchPhase::Up => {
+                    // As in Motion: the grab outlives `active_touches`. Lifting
+                    // the drag's contact completes the drop, and the client
+                    // needs no `up` — it was told to forget the sequence when
+                    // the drag took the seat.
+                    if let Some(grab) = self.client_touch_drag_contact() {
+                        if (grab.owner_id, grab.browser_id) == key {
+                            self.client_drag_release();
+                        }
+                        continue;
+                    }
+                    let Some(active) = self.active_touches.remove(&key) else {
+                        continue;
+                    };
+                    let serial = self.next_serial();
+                    for touch in &self.touches {
+                        if same_client(touch, &active.target) {
+                            touch.up(serial, time, active.wayland_id);
+                            Self::touch_frame_target(&mut framed, touch);
+                        }
+                    }
+                }
+                TouchPhase::Cancel => unreachable!(),
+            }
+        }
+        for touch in framed {
+            touch.frame();
+        }
+        if self.active_touches.is_empty() && self.client_touch_drag_contact().is_none() {
+            self.reset_touch_clock(Some(owner_id));
+        }
+    }
+
     /// Collect all MIME types available on the current clipboard.
     fn collect_clipboard_mime_types(&self) -> Vec<String> {
         // If a Wayland app owns the selection, use its MIME types.
@@ -5121,6 +6330,58 @@ fn dir_is_chromium(dir: &std::path::Path) -> bool {
 }
 
 /// Returns true when two Wayland resources belong to the same still-connected client.
+/// What a `wl_output` global stands for: one screen, offered to one client,
+/// holding at most one of that client's toplevels.
+///
+/// Wayland's own answer to "what density should I draw at" is the set of
+/// outputs a surface has entered, so giving each toplevel its own output is
+/// what lets two windows of the same application render at two different
+/// densities — one watched on a laptop, the other on a phone. It also stops
+/// `wl_output.mode` being a fold over every surface in the session, which
+/// used to send a maximising app to the size of the *largest* other window.
+///
+/// `owner` keeps the global out of every other client's registry: an app
+/// must not discover a monitor for a window it does not have.
+///
+/// The slot is indirect on purpose.  A global's data is immutable once
+/// published, but a screen outlives the window on it: it is offered empty,
+/// claimed at map, and emptied again at unmap.  The mutable half lives in
+/// `Compositor::output_slots`, which the slot indexes.
+#[derive(Clone)]
+struct OutputGlobal {
+    slot: u32,
+    owner: ClientId,
+}
+
+/// A published screen: who may see it, the global to withdraw it with, and
+/// the toplevel currently on it — `None` for one nobody has claimed.
+struct OutputSlot {
+    owner: ClientId,
+    global: GlobalId,
+    surface_id: Option<u16>,
+}
+
+/// A withdrawn output kept bindable until its owner disconnects.
+struct RetiredOutputGlobal {
+    owner: ClientId,
+    global: GlobalId,
+    slot: u32,
+}
+
+/// A bound `wl_output`, and the screen it speaks for.
+struct SurfaceOutput {
+    resource: WlOutput,
+    slot: u32,
+}
+
+/// A `wp_fractional_scale_v1` and the `wl_surface` it was created for.  The
+/// toplevel is resolved lazily: the object is usually created before the
+/// surface has a role, and a subsurface answers with its root's scale.
+struct SurfaceFractionalScale {
+    resource: WpFractionalScaleV1,
+    surface: ObjectId,
+}
+
 fn same_client<R1: Resource, R2: Resource>(a: &R1, b: &R2) -> bool {
     match (a.client(), b.client()) {
         (Some(ca), Some(cb)) => ca.id() == cb.id(),
@@ -5279,6 +6540,7 @@ impl Dispatch<WlCompositor, ()> for Compositor {
                         pending_opaque: false,
                         pending_input_region: None,
                         input_region: None,
+                        map_state: MapState::Never,
                         buffer_scale: 1,
                         is_opaque: false,
                         pending_acquire_point: None,
@@ -5333,7 +6595,7 @@ impl Dispatch<WlSurface, ()> for Compositor {
         match request {
             Request::Attach { buffer, x, y } => {
                 if let Some(surf) = state.surfaces.get_mut(&sid) {
-                    surf.pending_buffer = buffer;
+                    surf.pending_buffer = Some(buffer);
                     if x != 0 || y != 0 {
                         surf.pending_damage.push(PendingDamage::Full);
                     }
@@ -5455,11 +6717,13 @@ impl Dispatch<WlSurface, ()> for Compositor {
                     }
                     state.last_topless_frame_ms.remove(&sid);
                     if surf.surface_id > 0 {
+                        state.release_output_for_surface(surf.surface_id);
                         state.toplevel_surface_ids.remove(&surf.surface_id);
                         state.last_request_frame_ms.remove(&surf.surface_id);
                         state.pending_request_frames.remove(&surf.surface_id);
                         state.frame_callback_toplevels.remove(&surf.surface_id);
                         state.last_reported_size.remove(&surf.surface_id);
+                        state.pointer_frame_positions.remove(&surf.surface_id);
                         state.surface_sizes.remove(&surf.surface_id);
                         if let Some(ref mut vk) = state.vulkan_renderer {
                             vk.destroy_external_outputs_for_surface(surf.surface_id as u32);
@@ -6061,12 +7325,21 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for Compositor {
                 // Keyboard focus — sends leave to the previously focused
                 // surface's client before entering the new one.
                 state.set_keyboard_focus(surface_id);
-                // Tell the client which output its surface is on so it can
-                // determine scale and start rendering.
+                // Give this toplevel its own display, visible to nobody
+                // else, and tell it which output it is on so it can pick a
+                // scale and start rendering.  The client binds the global
+                // asynchronously, so the bind handler sends the `enter` too:
+                // whichever happens second is the one that lands.
+                if let Some(owner) = resource.client().map(|c| c.id()) {
+                    state.claim_output_for_surface(surface_id, owner);
+                }
                 if let Some(surf) = state.surfaces.get(&data.wl_surface_id) {
-                    for output in &state.outputs {
-                        if same_client(output, &surf.wl_surface) {
-                            surf.wl_surface.enter(output);
+                    let wl = surf.wl_surface.clone();
+                    for out in &state.outputs {
+                        if state.output_slot_surface(out.slot) == Some(surface_id)
+                            && same_client(&out.resource, &wl)
+                        {
+                            wl.enter(&out.resource);
                         }
                     }
                 }
@@ -6278,6 +7551,7 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                     let a = a.into_release();
                     state.release_held(a);
                 }
+                let mut unmapped_sid = None;
                 if let Some(surf) = state.surfaces.get_mut(wl_surface_id) {
                     let sid = surf.surface_id;
                     surf.xdg_toplevel = None;
@@ -6285,11 +7559,13 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                     // new one; that one starts out not fullscreen.
                     surf.xdg_fullscreen = false;
                     if sid > 0 {
+                        unmapped_sid = Some(sid);
                         state.toplevel_surface_ids.remove(&sid);
                         state.last_request_frame_ms.remove(&sid);
                         state.pending_request_frames.remove(&sid);
                         state.frame_callback_toplevels.remove(&sid);
                         state.last_reported_size.remove(&sid);
+                        state.pointer_frame_positions.remove(&sid);
                         state.surface_sizes.remove(&sid);
                         if let Some(ref mut vk) = state.vulkan_renderer {
                             vk.destroy_external_outputs_for_surface(sid as u32);
@@ -6300,6 +7576,10 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                         (state.event_notify)();
                         surf.surface_id = 0;
                     }
+                }
+                // Withdraw the window's display outside the surface borrow.
+                if let Some(sid) = unmapped_sid {
+                    state.release_output_for_surface(sid);
                 }
             }
             Request::SetMinimized => {
@@ -6458,15 +7738,10 @@ impl Dispatch<XdgPopup, XdgPopupData> for Compositor {
                 // ends. Off the stack first, so what remains is what is
                 // still grabbing beneath it.
                 state.unfocus_popup(&data.wl_surface_id);
-                // Remove from parent's children list.
-                if let Some(parent_id) = state
-                    .surfaces
-                    .get(&data.wl_surface_id)
-                    .and_then(|s| s.parent_surface_id.clone())
-                    && let Some(parent) = state.surfaces.get_mut(&parent_id)
-                {
-                    parent.children.retain(|c| *c != data.wl_surface_id);
-                }
+                // Destroying the role also unmaps it.  This is idempotent
+                // when popup_done already performed the compositor-side
+                // unmap above.
+                state.unmap_popup_surface(&data.wl_surface_id);
                 if let Some(surf) = state.surfaces.get_mut(&data.wl_surface_id) {
                     surf.xdg_popup = None;
                     surf.parent_surface_id = None;
@@ -6739,15 +8014,22 @@ impl Dispatch<WlBuffer, DmaBufBufferData> for Compositor {
 }
 
 // -- wl_output --
-impl GlobalDispatch<WlOutput, ()> for Compositor {
+impl GlobalDispatch<WlOutput, OutputGlobal> for Compositor {
+    /// Keep each toplevel's output out of every other client's registry.
+    fn can_view(client: Client, global: &OutputGlobal) -> bool {
+        client.id() == global.owner
+    }
+
     fn bind(
         state: &mut Self,
         _: &DisplayHandle,
         _: &Client,
         resource: New<WlOutput>,
-        _: &(),
+        global: &OutputGlobal,
         data_init: &mut DataInit<'_, Self>,
     ) {
+        let slot = global.slot;
+        let sid = state.output_slot_surface(slot);
         let output = data_init.init(resource, ());
         output.geometry(
             0,
@@ -6759,22 +8041,26 @@ impl GlobalDispatch<WlOutput, ()> for Compositor {
             "Headless".to_string(),
             wl_output::Transform::Normal,
         );
-        let s120 = state.output_scale_120 as i32;
-        let mode_w = state.output_width * s120 / 120;
-        let mode_h = state.output_height * s120 / 120;
-        output.mode(
-            wl_output::Mode::Current | wl_output::Mode::Preferred,
-            mode_w,
-            mode_h,
-            state.output_refresh_mhz as i32,
-        );
-        if output.version() >= 2 {
-            output.scale(((state.output_scale_120 as i32) + 119) / 120);
+        state.send_output_properties(&output, sid);
+        state.outputs.push(SurfaceOutput {
+            resource: output,
+            slot,
+        });
+        // A screen already holding a toplevel was claimed before the client
+        // got round to binding it, so the enter has to be sent from here
+        // too, or that surface never learns which output it is on and
+        // renders at 1×.  An empty screen has nothing to enter yet; its
+        // future toplevel sends its own enter at map.
+        if let Some(root_id) = sid
+            .and_then(|sid| state.toplevel_surface_ids.get(&sid))
+            .cloned()
+            && let Some(surf) = state.surfaces.get(&root_id)
+        {
+            let wl = surf.wl_surface.clone();
+            if let Some(out) = state.outputs.last() {
+                wl.enter(&out.resource);
+            }
         }
-        if output.version() >= 2 {
-            output.done();
-        }
-        state.outputs.push(output);
     }
 }
 
@@ -6790,7 +8076,7 @@ impl Dispatch<WlOutput, ()> for Compositor {
     ) {
         use wayland_server::protocol::wl_output::Request;
         if let Request::Release = request {
-            state.outputs.retain(|o| o.id() != resource.id());
+            state.outputs.retain(|o| o.resource.id() != resource.id());
         }
     }
 }
@@ -6798,7 +8084,7 @@ impl Dispatch<WlOutput, ()> for Compositor {
 // -- wl_seat --
 impl GlobalDispatch<WlSeat, ()> for Compositor {
     fn bind(
-        _: &mut Self,
+        state: &mut Self,
         _: &DisplayHandle,
         _: &Client,
         resource: New<WlSeat>,
@@ -6806,10 +8092,11 @@ impl GlobalDispatch<WlSeat, ()> for Compositor {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let seat = data_init.init(resource, ());
-        seat.capabilities(wl_seat::Capability::Keyboard | wl_seat::Capability::Pointer);
+        seat.capabilities(state.seat_capabilities());
         if seat.version() >= 2 {
             seat.name("headless".to_string());
         }
+        state.seats.push(seat);
     }
 }
 
@@ -6817,7 +8104,7 @@ impl Dispatch<WlSeat, ()> for Compositor {
     fn request(
         state: &mut Self,
         _: &Client,
-        _: &WlSeat,
+        resource: &WlSeat,
         request: <WlSeat as Resource>::Request,
         _: &(),
         _: &DisplayHandle,
@@ -6868,9 +8155,11 @@ impl Dispatch<WlSeat, ()> for Compositor {
                 state.pointers.push(ptr);
             }
             Request::GetTouch { id } => {
-                data_init.init(id, ());
+                state.touches.push(data_init.init(id, ()));
             }
-            Request::Release => {}
+            Request::Release => {
+                state.seats.retain(|s| s.id() != resource.id());
+            }
             _ => {}
         }
     }
@@ -6918,9 +8207,12 @@ impl Dispatch<WlPointer, ()> for Compositor {
                         surf.is_cursor = true;
                         surf.cursor_hotspot = (hotspot_x, hotspot_y);
                     }
+                    state.current_cursor_surface = Some(sid);
                 } else {
+                    state.current_cursor_surface = None;
+                    let surface_id = state.cursor_target_sid();
                     let _ = state.event_tx.send(CompositorEvent::SurfaceCursor {
-                        surface_id: state.focused_surface_id,
+                        surface_id,
                         cursor: CursorImage::Hidden,
                     });
                 }
@@ -6933,17 +8225,20 @@ impl Dispatch<WlPointer, ()> for Compositor {
     }
 }
 
-// -- wl_touch (stub) --
-impl Dispatch<wayland_server::protocol::wl_touch::WlTouch, ()> for Compositor {
+// -- wl_touch --
+impl Dispatch<WlTouch, ()> for Compositor {
     fn request(
-        _: &mut Self,
+        state: &mut Self,
         _: &Client,
-        _: &wayland_server::protocol::wl_touch::WlTouch,
-        _: <wayland_server::protocol::wl_touch::WlTouch as Resource>::Request,
+        resource: &WlTouch,
+        request: <WlTouch as Resource>::Request,
         _: &(),
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
+        if let wl_touch::Request::Release = request {
+            state.touches.retain(|touch| touch.id() != resource.id());
+        }
     }
 }
 
@@ -7167,11 +8462,16 @@ impl Dispatch<WpFractionalScaleManagerV1, ()> for Compositor {
     ) {
         use wp_fractional_scale_manager_v1::Request;
         match request {
-            Request::GetFractionalScale { id, surface: _ } => {
+            Request::GetFractionalScale { id, surface } => {
                 let fs = data_init.init(id, ());
-                // Send the current preferred scale immediately.
-                fs.preferred_scale(state.output_scale_120 as u32);
-                state.fractional_scales.push(fs);
+                let surface = surface.id();
+                // Send this surface's own preferred scale immediately.
+                let sid = state.find_toplevel_root(&surface).1;
+                fs.preferred_scale(sid.map_or(120, |sid| state.surface_scale_120(sid)) as u32);
+                state.fractional_scales.push(SurfaceFractionalScale {
+                    resource: fs,
+                    surface,
+                });
             }
             Request::Destroy => {}
             _ => {}
@@ -7193,7 +8493,7 @@ impl Dispatch<WpFractionalScaleV1, ()> for Compositor {
         // Only request is Destroy.
         state
             .fractional_scales
-            .retain(|fs| fs.id() != resource.id());
+            .retain(|fs| fs.resource.id() != resource.id());
     }
 }
 
@@ -7499,7 +8799,7 @@ impl Dispatch<WlDataDevice, ()> for Compositor {
                 source,
                 origin,
                 icon,
-                serial: _,
+                serial,
             } => {
                 // Icon surfaces are not mapped or positioned anywhere — a
                 // client that relies on seeing its drag icon gets none.
@@ -7554,6 +8854,27 @@ impl Dispatch<WlDataDevice, ()> for Compositor {
                         origin.id()
                     );
                 }
+                let touch_grab = state
+                    .active_touches
+                    .iter()
+                    .find(|(_, active)| {
+                        active.down_serial == serial && same_client(&active.target, &origin)
+                    })
+                    .map(|(&(owner_id, browser_id), active)| TouchDragGrab {
+                        owner_id,
+                        browser_id,
+                        surface_id: active.surface_id,
+                    });
+                if let Some(grab) = touch_grab {
+                    // The drag takes the seat over, which is what
+                    // `wl_touch.cancel` means. Sending it is what a physical
+                    // compositor does, and it is the only way to leave the
+                    // client's contact set consistent: `cancel` covers the whole
+                    // sequence, so contacts the drag swallows cannot be reported
+                    // individually afterwards. The grab above is captured first
+                    // precisely because this empties `active_touches`.
+                    state.retire_touch_contacts(Some(grab.owner_id));
+                }
                 state.client_drag = Some(ClientDragState {
                     source,
                     origin,
@@ -7561,6 +8882,7 @@ impl Dispatch<WlDataDevice, ()> for Compositor {
                     target: None,
                     source_actions,
                     dropped: false,
+                    touch_grab,
                 });
             }
             Request::Release => {}
@@ -8038,7 +9360,12 @@ impl Compositor {
 
     /// Convert composited-frame physical coordinates to a hit-tested
     /// surface-local logical position, exactly as `PointerMotion` does.
-    fn drag_target(&self, surface_id: u16, x: f64, y: f64) -> Option<(WlSurface, f64, f64)> {
+    fn frame_to_surface_tree(
+        &self,
+        surface_id: u16,
+        x: f64,
+        y: f64,
+    ) -> Option<(ObjectId, f64, f64)> {
         let (mut x, mut y) =
             if let Some(&(cw, ch, lw, lh)) = self.last_reported_size.get(&surface_id) {
                 let sx = if cw > 0 { lw as f64 / cw as f64 } else { 1.0 };
@@ -8058,7 +9385,13 @@ impl Compositor {
         }
         self.toplevel_surface_ids
             .get(&surface_id)
-            .and_then(|root_id| self.hit_test_surface_at(root_id, x, y))
+            .cloned()
+            .map(|root_id| (root_id, x, y))
+    }
+
+    fn drag_target(&self, surface_id: u16, x: f64, y: f64) -> Option<(WlSurface, f64, f64)> {
+        let (root_id, x, y) = self.frame_to_surface_tree(surface_id, x, y)?;
+        self.hit_test_surface_at(&root_id, x, y)
     }
 
     /// Enter a drag session on the surface under (`x`, `y`), advertising
@@ -8222,8 +9555,22 @@ impl Compositor {
     }
 
     /// Whether pointer input currently belongs to a client drag.
-    fn client_drag_grabbed(&self) -> bool {
-        self.client_drag.as_ref().is_some_and(|drag| !drag.dropped)
+    fn client_pointer_drag_grabbed(&self) -> bool {
+        self.client_drag
+            .as_ref()
+            .is_some_and(|drag| !drag.dropped && drag.touch_grab.is_none())
+    }
+
+    /// The contact a live touch drag follows, if there is one.
+    fn client_touch_drag_contact(&self) -> Option<TouchDragGrab> {
+        self.client_drag
+            .as_ref()
+            .filter(|drag| !drag.dropped)
+            .and_then(|drag| drag.touch_grab)
+    }
+
+    fn client_touch_drag_active(&self) -> bool {
+        self.client_touch_drag_contact().is_some()
     }
 
     /// Drive the session to the surface under (`x`, `y`): leave the old
@@ -8771,10 +10118,24 @@ impl Dispatch<ZwpTextInputManagerV3, ()> for Compositor {
         match request {
             Request::GetTextInput { id, seat: _ } => {
                 let ti = data_init.init(id, ());
+                let entered_surface = state
+                    .keyboard_focus_wl()
+                    .filter(|focused| same_client(&ti, focused));
+                if let Some(ref focused) = entered_surface {
+                    ti.enter(focused);
+                }
                 state.text_inputs.push(TextInputState {
                     resource: ti,
+                    entered_surface,
                     enabled: false,
                     pending_enabled: false,
+                    pending_enabled_changed: false,
+                    pending_show_requested: false,
+                    content_hint: 0,
+                    content_purpose: 0,
+                    pending_content_hint: 0,
+                    pending_content_purpose: 0,
+                    pending_content_type_changed: false,
                     preedit_shown: false,
                     commits: 0,
                 });
@@ -8797,36 +10158,105 @@ impl Dispatch<ZwpTextInputV3, ()> for Compositor {
     ) {
         use zwp_text_input_v3::Request;
         if matches!(request, Request::Destroy) {
+            let removed = state
+                .text_inputs
+                .iter()
+                .find(|t| t.resource.id() == resource.id())
+                .and_then(|ti| ti.enabled.then(|| ti.entered_surface.clone()).flatten());
             state
                 .text_inputs
                 .retain(|t| t.resource.id() != resource.id());
+            if let Some(entered) = removed
+                && let Some(surface_id) = state.find_toplevel_root(&entered.id()).1
+            {
+                state.emit_surface_text_input(surface_id, false, false, 0, 0);
+            }
             return;
         }
-        let Some(ti) = state
+        let Some(index) = state
             .text_inputs
-            .iter_mut()
-            .find(|t| t.resource.id() == resource.id())
+            .iter()
+            .position(|t| t.resource.id() == resource.id())
         else {
             return;
         };
+        let mut committed = None;
         match request {
             // enable/disable are double-buffered: they name the pending
             // state, and only the commit below promotes it.
             Request::Enable => {
+                let ti = &mut state.text_inputs[index];
                 ti.pending_enabled = true;
+                ti.pending_enabled_changed = true;
+                ti.pending_show_requested = true;
+                // Enable resets all text-input state. SetContentType may
+                // follow in the same pending batch and replace these.
+                ti.pending_content_hint = 0;
+                ti.pending_content_purpose = 0;
+                ti.pending_content_type_changed = true;
                 // enable "resets all state associated with ... preedit_string",
                 // so the client is about to be showing nothing.
                 ti.preedit_shown = false;
             }
-            Request::Disable => ti.pending_enabled = false,
-            Request::Commit => {
-                ti.enabled = ti.pending_enabled;
-                // This count *is* the serial we owe back on `done`.
-                ti.commits = ti.commits.wrapping_add(1);
+            Request::Disable => {
+                let ti = &mut state.text_inputs[index];
+                ti.pending_enabled = false;
+                ti.pending_enabled_changed = true;
+                ti.pending_show_requested = false;
+                ti.pending_content_hint = 0;
+                ti.pending_content_purpose = 0;
+                ti.pending_content_type_changed = true;
             }
-            // SetSurroundingText, SetTextChangeCause, SetContentType,
-            // SetCursorRectangle — informational; ignored for now.
+            Request::SetContentType { hint, purpose } => {
+                use wayland_server::WEnum;
+                let hint = match hint {
+                    WEnum::Value(hint) => hint.bits(),
+                    WEnum::Unknown(raw) => raw,
+                };
+                let purpose = match purpose {
+                    WEnum::Value(purpose) => purpose as u32,
+                    WEnum::Unknown(raw) => raw,
+                };
+                let ti = &mut state.text_inputs[index];
+                ti.pending_content_hint = hint;
+                ti.pending_content_purpose = purpose;
+                ti.pending_content_type_changed = true;
+            }
+            Request::Commit => {
+                let ti = &mut state.text_inputs[index];
+                // The commit count advances even while no surface is entered;
+                // it is the serial required by any later `done` event.
+                ti.commits = ti.commits.wrapping_add(1);
+                let changed = ti.pending_enabled_changed || ti.pending_content_type_changed;
+                let requested = ti.pending_show_requested;
+                ti.pending_enabled_changed = false;
+                ti.pending_show_requested = false;
+                ti.pending_content_type_changed = false;
+
+                // Requests after leave are ignored until the next enter.
+                if let Some(entered) = ti.entered_surface.clone() {
+                    ti.enabled = ti.pending_enabled;
+                    ti.content_hint = ti.pending_content_hint;
+                    ti.content_purpose = ti.pending_content_purpose;
+                    if changed {
+                        committed = Some((
+                            entered,
+                            ti.enabled,
+                            requested && ti.enabled,
+                            ti.content_hint,
+                            ti.content_purpose,
+                        ));
+                    }
+                }
+            }
+            // SetSurroundingText, SetTextChangeCause, SetCursorRectangle —
+            // informational to the browser keyboard path; ignored for now.
             _ => {}
+        }
+        if let Some((entered, enabled, requested, hint, purpose)) = committed
+            && let Some(surface_id) = state.find_toplevel_root(&entered.id()).1
+        {
+            state.emit_surface_text_input(surface_id, enabled, requested, hint, purpose);
         }
     }
 }
@@ -9008,7 +10438,7 @@ impl Dispatch<WpCursorShapeDeviceV1, ()> for Compositor {
                     _ => "default",
                 };
                 let _ = state.event_tx.send(CompositorEvent::SurfaceCursor {
-                    surface_id: state.focused_surface_id,
+                    surface_id: state.cursor_target_sid(),
                     cursor: CursorImage::Named(name.to_string()),
                 });
                 (state.event_notify)();
@@ -9346,7 +10776,8 @@ fn run_compositor(
     dh.create_global::<Compositor, WlSubcompositor, ()>(1, ());
     dh.create_global::<Compositor, XdgWmBase, ()>(6, ());
     dh.create_global::<Compositor, WlShm, ()>(1, ());
-    dh.create_global::<Compositor, WlOutput, ()>(4, ());
+    // No session-wide output: a screen is published per client on connect
+    // and per toplevel thereafter, each visible only to its owner.
     dh.create_global::<Compositor, WlSeat, ()>(9, ());
     // Only advertise zwp_linux_dmabuf_v1 when the Vulkan device can
     // actually import DMA-BUFs.  Advertising the global with zero
@@ -9418,10 +10849,22 @@ fn run_compositor(
         output_width: 1920,
         output_height: 1080,
         output_refresh_mhz: 60_000,
-        output_scale_120: 120,
+        surface_scales: FxHashMap::default(),
+        output_slots: FxHashMap::default(),
+        retired_output_globals: Vec::new(),
+        next_output_slot: 0,
         outputs: Vec::new(),
+        seats: Vec::new(),
         keyboards: Vec::new(),
         pointers: Vec::new(),
+        touches: Vec::new(),
+        touch_enabled: false,
+        touch_pacer: TouchPacer::default(),
+        input_time_anchor: None,
+        touch_time_anchor: None,
+        touch_time_last_arrival: None,
+        last_input_time: None,
+        active_touches: HashMap::new(),
         keyboard_keymap_data: keymap_data,
         mods_depressed: 0,
         mods_locked: 0,
@@ -9437,6 +10880,8 @@ fn run_compositor(
         focused_surface_id: 0,
         pointer_entered_id: None,
         pointer_entered_local: (0.0, 0.0),
+        pointer_frame_positions: FxHashMap::default(),
+        current_cursor_surface: None,
         pending_kb_reenter: false,
         gpu_device,
         verbose,
@@ -9520,6 +10965,10 @@ fn run_compositor(
                     }),
                 ) {
                     Ok(client) => {
+                        // Offer the screen before the client reads its
+                        // registry: a toolkit that finds no output there
+                        // never opens a window at all.
+                        state.ensure_client_output(client.id());
                         if let Some(watched_stream) = watched_stream {
                             monitor_client_disconnect(
                                 watched_stream,
@@ -9574,10 +11023,11 @@ fn run_compositor(
                 other => compositor.handle_command(other),
             }
         }
+        compositor.dispatch_due_touches();
 
         // Shorten the dispatch timeout when the Vulkan renderer has
         // in-flight GPU work so we poll for completion promptly.
-        let poll_timeout = if compositor
+        let mut poll_timeout = if compositor
             .vulkan_renderer
             .as_ref()
             .is_some_and(|vk| vk.has_pending())
@@ -9587,11 +11037,18 @@ fn run_compositor(
         } else {
             std::time::Duration::from_secs(1)
         };
+        if let Some(deadline) = compositor.next_touch_deadline() {
+            poll_timeout =
+                poll_timeout.min(deadline.saturating_duration_since(std::time::Instant::now()));
+        }
         if let Err(e) = event_loop.dispatch(Some(poll_timeout), &mut compositor)
             && verbose
         {
             eprintln!("[compositor] event loop error: {e}");
         }
+        // A touch deadline may be what ended the dispatch wait. Deliver it
+        // before render/cleanup work can add jitter to Chromium's receipt time.
+        compositor.dispatch_due_touches();
         // Explicit destroy handlers remove their own state. The full
         // liveness scan exists for clients that disappear without them.
         compositor.cleanup_disconnected_clients();
@@ -9618,7 +11075,8 @@ fn run_compositor(
             vk.drain_deferred_submits();
             let (native, retired) = vk.try_retire_pending();
             if !retired.is_empty() {
-                let s120_u32 = (compositor.output_scale_120 as u32).max(120);
+                // Each retired result carries its surface, and scale is a
+                // property of that surface.
                 // Drive SurfaceResized off the size this submission actually
                 // composited at, when no fresh handle_surface_commit has
                 // populated pending_native_sizes.  Not off the largest
@@ -9636,6 +11094,7 @@ fn run_compositor(
                 if let Some((sid, nw, nh)) = native
                     && compositor.native_composite_size(sid).is_none()
                 {
+                    let s120_u32 = compositor.surface_scale_120(sid) as u32;
                     let log_w = (nw * 120).div_ceil(s120_u32);
                     let log_h = (nh * 120).div_ceil(s120_u32);
                     compositor
@@ -9644,6 +11103,7 @@ fn run_compositor(
                         .or_insert((nw, nh, log_w, log_h));
                 }
                 for (sid, w, h, pixels, encoder_skip) in retired {
+                    let s120_u32 = compositor.surface_scale_120(sid) as u32;
                     let log_w = (w * 120).div_ceil(s120_u32);
                     let log_h = (h * 120).div_ceil(s120_u32);
                     compositor

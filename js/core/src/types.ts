@@ -128,6 +128,10 @@ export interface BlitConnectionSnapshot {
   supportsRestart: boolean;
   supportsCopyRange: boolean;
   supportsCompositor: boolean;
+  /** Server accepts direct touchscreen contacts for Wayland surfaces. */
+  supportsSurfaceTouch: boolean;
+  /** Server forwards Wayland text-input requests to surface viewers. */
+  supportsSurfaceTextInput: boolean;
   supportsAudio: boolean;
   supportsFsSync: boolean;
   /** Server advertises `FEATURE_GIT` (git introspection, docs/git.md). */
@@ -352,6 +356,15 @@ export const C2S_SURFACE_DRAG_DROP = 0x38;
 /** Drag aborted before a drop (source read failed, session dangled):
  *  opcode only. */
 export const C2S_SURFACE_DRAG_CANCEL = 0x39;
+/** Direct touchscreen contacts. One message is one `wl_touch.frame`:
+ * [0x3A][surface_id:2][phase:1][count:1][id:4,x_x100:4,y_x100:4]*. */
+export const C2S_SURFACE_TOUCH = 0x3a;
+export const SURFACE_TOUCH_DOWN = 0;
+export const SURFACE_TOUCH_UP = 1;
+export const SURFACE_TOUCH_MOTION = 2;
+export const SURFACE_TOUCH_CANCEL = 3;
+export const SURFACE_TOUCH_ENABLE = 4;
+export const SURFACE_TOUCH_DISABLE = 5;
 export const S2C_SURFACE_CREATED = 0x20;
 export const S2C_SURFACE_DESTROYED = 0x21;
 export const S2C_SURFACE_FRAME = 0x22;
@@ -362,6 +375,12 @@ export const S2C_CLIPBOARD_CONTENT = 0x25;
  *  preserve the compositor's client-owned selection instead of importing
  *  the browser clipboard over it. */
 export const S2C_CLIPBOARD_OWNER = 0x2e;
+/** Committed Wayland text-input state:
+ * [0x2F][surface_id:2][flags:1][content_hint:4][content_purpose:4]. */
+export const S2C_SURFACE_TEXT_INPUT = 0x2f;
+export const SURFACE_TEXT_INPUT_ENABLED = 1 << 0;
+/** A fresh committed enable, rather than metadata/reconnect state. */
+export const SURFACE_TEXT_INPUT_REQUESTED = 1 << 1;
 export const S2C_SURFACE_APP_ID = 0x28;
 /** The Wayland client asked for its toplevel to be activated
  *  (xdg_activation_v1): [0x2D][surface_id:2] — raise and focus the pane. */
@@ -369,6 +388,14 @@ export const S2C_SURFACE_ACTIVATED = 0x2d;
 export const S2C_SURFACE_CURSOR = 0x29;
 /** Encoder backend info for a surface: [0x2A][surface_id:2][name:N] */
 export const S2C_SURFACE_ENCODER = 0x2a;
+/** Where another viewer is touching or pointing at a surface:
+ *  [0x31][surface_id:2][kind:1][count:1][x:2,y:2]*.
+ *  `count = 0` retires the marks and is what the driving viewer receives. */
+export const S2C_SURFACE_REMOTE_INPUT = 0x31;
+/** One mouse/trackpad position. */
+export const REMOTE_INPUT_POINTER = 0;
+/** Live touchscreen contacts (one point per finger on the glass). */
+export const REMOTE_INPUT_TOUCH = 1;
 /**
  * Fragment of a larger S2C message: [0x2B][flags:1][chunk:N].
  * Bulk messages above the server's chunk threshold are split into
@@ -435,6 +462,10 @@ export const FEATURE_PTY_DEADLINE = 1 << 16;
  *  scrolled client and reports it with {@link S2C_SCROLL_OFFSET}, and
  *  accepts the relative {@link C2S_SCROLL_BY} that goes with it. */
 export const FEATURE_SCROLL_BY = 1 << 17;
+/** Direct browser touch contacts delivered through core Wayland `wl_touch`. */
+export const FEATURE_SURFACE_TOUCH = 1 << 18;
+/** Wayland text-input enable/disable and content purpose forwarding. */
+export const FEATURE_SURFACE_TEXT_INPUT = 1 << 19;
 
 // -- Common status registry (docs/protocol.md) ------------------------------
 //

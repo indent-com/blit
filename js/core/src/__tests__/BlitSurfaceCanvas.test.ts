@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  BLIT_SURFACE_TEXT_INPUT_EVENT,
   BlitSurfaceCanvas,
   demoteCodecSupport,
   detectCodecSupport,
@@ -8,14 +9,16 @@ import {
   restoreCodecSupport,
   surfaceCanvasForInput,
 } from "../BlitSurfaceCanvas";
+import type { SurfaceTextInputEvent } from "../SurfaceStore";
 import type { BlitWorkspace } from "../BlitWorkspace";
 import { BlitActivityStore } from "../activity";
 import type { FsUploadOptions } from "../fs";
 import type { BlitSurface } from "../types";
-import type { SurfaceAxisEvent } from "../protocol";
+import type { SurfaceAxisEvent, SurfaceTouchPoint } from "../protocol";
 import {
   SURFACE_POINTER_DOWN,
   SURFACE_POINTER_MOVE,
+  SURFACE_POINTER_LEAVE,
   SURFACE_POINTER_UP,
   buildSurfaceDragDropMessage,
 } from "../protocol";
@@ -25,6 +28,10 @@ import {
   AXIS_SOURCE_WHEEL,
   CODEC_SUPPORT_AV1,
   CODEC_SUPPORT_AV1_444,
+  SURFACE_TOUCH_CANCEL,
+  SURFACE_TOUCH_DOWN,
+  SURFACE_TOUCH_MOTION,
+  SURFACE_TOUCH_UP,
 } from "../types";
 
 /** Minimal workspace stub: no connection, so the canvas never subscribes
@@ -46,7 +53,7 @@ function attachCanvas() {
   surface.attach(container);
   const canvas = surface.canvasElement;
   if (!canvas) throw new Error("Expected surface canvas");
-  return { surface, canvas };
+  return { surface, canvas, container };
 }
 
 /** The store feeds this in; the stub workspace has no connection to do it. */
@@ -68,6 +75,215 @@ function setSurfaceInfo(
 }
 
 describe("BlitSurfaceCanvas layout", () => {
+  it("draws another client's pointer over the shared surface", () => {
+    const { surface, canvas, container } = attachCanvas();
+    setSurfaceInfo(surface, { width: 640, height: 480, lw: 640, lh: 480 });
+    surface.setDisplaySize(640, 480, 120);
+
+    const internal = surface as unknown as {
+      remoteInput: {
+        pointer: { x: number; y: number }[];
+        touch: { x: number; y: number }[];
+      } | null;
+      remoteCursor:
+        | { kind: "named"; name: string }
+        | { kind: "hidden" }
+        | {
+            kind: "custom";
+            url: string;
+            hotspotX: number;
+            hotspotY: number;
+            width: number;
+            height: number;
+          };
+      updateRemotePointerOverlay(): void;
+    };
+    internal.remoteInput = { pointer: [{ x: 123, y: 234 }], touch: [] };
+    internal.updateRemotePointerOverlay();
+
+    const overlay = container.querySelector<SVGSVGElement>(
+      "[data-blit-remote-pointer]",
+    );
+    const glyph = overlay?.querySelector("path");
+    expect(overlay?.style.visibility).toBe("visible");
+    expect(overlay?.getAttribute("viewBox")).toBe("0 0 640 480");
+    expect(glyph?.getAttribute("transform")).toBe(
+      "translate(123 234) scale(1)",
+    );
+    expect(overlay?.style.left).toBe(canvas.style.left);
+    expect(overlay?.style.top).toBe(canvas.style.top);
+    expect(overlay?.style.width).toBe(canvas.style.width);
+    expect(overlay?.style.height).toBe(canvas.style.height);
+
+    const arrowPath = glyph?.getAttribute("d");
+    internal.remoteCursor = { kind: "named", name: "vertical-text" };
+    internal.updateRemotePointerOverlay();
+    expect(glyph?.getAttribute("d")).not.toBe(arrowPath);
+    expect(glyph?.getAttribute("transform")).toBe(
+      "translate(123 234) scale(1) rotate(90)",
+    );
+
+    internal.remoteCursor = {
+      kind: "custom",
+      url: "blob:cursor",
+      hotspotX: 4,
+      hotspotY: 5,
+      width: 32,
+      height: 24,
+    };
+    internal.updateRemotePointerOverlay();
+    const image = overlay?.querySelector("image");
+    expect(glyph?.style.display).toBe("none");
+    expect(image?.getAttribute("href")).toBe("blob:cursor");
+    expect(image?.getAttribute("x")).toBe("119");
+    expect(image?.getAttribute("y")).toBe("229");
+    expect(image?.getAttribute("width")).toBe("32");
+    expect(image?.getAttribute("height")).toBe("24");
+
+    internal.remoteCursor = { kind: "hidden" };
+    internal.updateRemotePointerOverlay();
+    expect(overlay?.style.visibility).toBe("hidden");
+
+    internal.remoteInput = null;
+    internal.updateRemotePointerOverlay();
+    expect(overlay?.style.visibility).toBe("hidden");
+    surface.dispose();
+  });
+
+  // Hotspot and extent arrive in the same (logical) units, so one factor has to
+  // place both. Scaling only the offset put the hotspot a full cursor-width off
+  // the artwork on every HiDPI surface.
+  it("scales a custom remote cursor's hotspot and extent together", () => {
+    const { surface, container } = attachCanvas();
+    setSurfaceInfo(surface, { width: 1280, height: 960, lw: 640, lh: 480 });
+    surface.setDisplaySize(1280, 960, 240);
+
+    const internal = surface as unknown as {
+      remoteInput: {
+        pointer: { x: number; y: number }[];
+        touch: { x: number; y: number }[];
+      } | null;
+      remoteCursor: unknown;
+      updateRemotePointerOverlay(): void;
+    };
+    internal.remoteInput = { pointer: [{ x: 100, y: 200 }], touch: [] };
+    internal.remoteCursor = {
+      kind: "custom",
+      url: "blob:cursor",
+      hotspotX: 4,
+      hotspotY: 5,
+      width: 32,
+      height: 24,
+    };
+    internal.updateRemotePointerOverlay();
+
+    const image = container.querySelector("image");
+    // cursorScale = 1280 / 640 = 2.
+    expect(image?.getAttribute("x")).toBe("92");
+    expect(image?.getAttribute("y")).toBe("190");
+    expect(image?.getAttribute("width")).toBe("64");
+    expect(image?.getAttribute("height")).toBe("48");
+    surface.dispose();
+  });
+
+  it("draws one ring per remote finger and drops them as they lift", () => {
+    const { surface, container } = attachCanvas();
+    setSurfaceInfo(surface, { width: 640, height: 480, lw: 640, lh: 480 });
+    surface.setDisplaySize(640, 480, 120);
+
+    const internal = surface as unknown as {
+      remoteInput: {
+        pointer: { x: number; y: number }[];
+        touch: { x: number; y: number }[];
+      } | null;
+      remoteCursor: unknown;
+      updateRemotePointerOverlay(): void;
+    };
+    const rings = () => [...container.querySelectorAll("circle")];
+
+    internal.remoteInput = {
+      pointer: [],
+      touch: [
+        { x: 10, y: 20 },
+        { x: 30, y: 40 },
+        { x: 50, y: 60 },
+      ],
+    };
+    internal.updateRemotePointerOverlay();
+    const overlay = container.querySelector<SVGSVGElement>(
+      "[data-blit-remote-pointer]",
+    );
+    expect(overlay?.style.visibility).toBe("visible");
+    expect(
+      rings().map((c) => [c.getAttribute("cx"), c.getAttribute("cy")]),
+    ).toEqual([
+      ["10", "20"],
+      ["30", "40"],
+      ["50", "60"],
+    ]);
+    // The cursor glyph belongs to a pointer, not to fingers.
+    expect(container.querySelector<SVGPathElement>("path")?.style.display).toBe(
+      "none",
+    );
+
+    // Two fingers lift: the pool shrinks rather than leaving stale rings.
+    internal.remoteInput = { pointer: [], touch: [{ x: 11, y: 21 }] };
+    internal.updateRemotePointerOverlay();
+    expect(rings().map((c) => c.getAttribute("cx"))).toEqual(["11"]);
+
+    // An app hiding its cursor must not hide someone else's fingers.
+    internal.remoteCursor = { kind: "hidden" };
+    internal.updateRemotePointerOverlay();
+    expect(overlay?.style.visibility).toBe("visible");
+
+    internal.remoteInput = null;
+    internal.updateRemotePointerOverlay();
+    expect(overlay?.style.visibility).toBe("hidden");
+    expect(rings()).toHaveLength(0);
+    surface.dispose();
+  });
+
+  // One viewer can drive a mouse and a touchscreen at once, so the marks are two
+  // independent sets: lifting a finger must not erase the cursor, and a pointer
+  // leave must not erase the fingers.
+  it("draws a remote cursor and remote fingers at the same time", () => {
+    const { surface, container } = attachCanvas();
+    setSurfaceInfo(surface, { width: 640, height: 480, lw: 640, lh: 480 });
+    surface.setDisplaySize(640, 480, 120);
+
+    const internal = surface as unknown as {
+      remoteInput: {
+        pointer: { x: number; y: number }[];
+        touch: { x: number; y: number }[];
+      } | null;
+      updateRemotePointerOverlay(): void;
+    };
+    const glyph = () => container.querySelector<SVGPathElement>("path");
+    const rings = () => [...container.querySelectorAll("circle")];
+
+    internal.remoteInput = {
+      pointer: [{ x: 5, y: 6 }],
+      touch: [{ x: 10, y: 20 }],
+    };
+    internal.updateRemotePointerOverlay();
+    expect(glyph()?.style.display).toBe("");
+    expect(glyph()?.getAttribute("transform")).toBe("translate(5 6) scale(1)");
+    expect(rings().map((c) => c.getAttribute("cx"))).toEqual(["10"]);
+
+    // The finger lifts; the cursor stays.
+    internal.remoteInput = { pointer: [{ x: 5, y: 6 }], touch: [] };
+    internal.updateRemotePointerOverlay();
+    expect(glyph()?.style.display).toBe("");
+    expect(rings()).toHaveLength(0);
+
+    // The pointer leaves; the finger would stay.
+    internal.remoteInput = { pointer: [], touch: [{ x: 10, y: 20 }] };
+    internal.updateRemotePointerOverlay();
+    expect(glyph()?.style.display).toBe("none");
+    expect(rings().map((c) => c.getAttribute("cx"))).toEqual(["10"]);
+    surface.dispose();
+  });
+
   it("fills the container until a display size is known", () => {
     const { surface, canvas } = attachCanvas();
     expect(canvas.style.width).toBe("100%");
@@ -324,7 +540,11 @@ describe("codec support demotion", () => {
 
 /** Captures the scroll messages a canvas emits. */
 function attachScrolling(
-  opts: { frame?: [number, number]; css?: [number, number] } = {},
+  opts: {
+    frame?: [number, number];
+    css?: [number, number];
+    directTouch?: boolean;
+  } = {},
 ) {
   const [fw, fh] = opts.frame ?? [800, 600];
   const [cw, ch] = opts.css ?? [800, 600];
@@ -332,7 +552,30 @@ function attachScrolling(
   const keys: { keycode: number; pressed: boolean }[] = [];
   const pointers: { type: number; button: number; x: number; y: number }[] = [];
   const inputOrder: ("pointer" | "axis")[] = [];
+  const touches: {
+    surfaceId: number;
+    phase: number;
+    contacts: readonly SurfaceTouchPoint[];
+    timeMs: number;
+  }[] = [];
+  let touchAcquires = 0;
+  let touchReleases = 0;
   const conn = {
+    supportsSurfaceTouch: opts.directTouch === true,
+    acquireSurfaceTouch: () => touchAcquires++,
+    releaseSurfaceTouch: () => touchReleases++,
+    sendSurfaceTouch: (
+      surfaceId: number,
+      phase: number,
+      contacts: readonly SurfaceTouchPoint[] = [],
+      timeMs = 0,
+    ) =>
+      touches.push({
+        surfaceId,
+        phase,
+        contacts: contacts.map((point) => ({ ...point })),
+        timeMs,
+      }),
     sendSurfaceAxis2: (_id: number, ev: SurfaceAxisEvent) => {
       inputOrder.push("axis");
       sent.push(ev);
@@ -375,6 +618,7 @@ function attachScrolling(
     workspace,
     connectionId: "conn-1" as never,
     surfaceId: 7,
+    touchMode: opts.directTouch ? "direct" : "pointer",
   });
   const container = document.createElement("div");
   surface.attach(container);
@@ -396,7 +640,22 @@ function attachScrolling(
     // inside the idle window so the gesture is still open.
     vi.advanceTimersByTime(FRAME_MS);
   };
-  return { surface, canvas, sent, keys, pointers, inputOrder, wheel };
+  return {
+    surface,
+    canvas,
+    sent,
+    keys,
+    pointers,
+    touches,
+    get touchAcquires() {
+      return touchAcquires;
+    },
+    get touchReleases() {
+      return touchReleases;
+    },
+    inputOrder,
+    wheel,
+  };
 }
 
 /** One animation frame, as the fake clock models requestAnimationFrame. */
@@ -429,6 +688,43 @@ describe("BlitSurfaceCanvas scroll", () => {
     surface.dispose();
   });
 
+  /**
+   * Every gate in `handleWheel` is per-pane state, so any of them going
+   * wrong kills scrolling in one pane while its neighbours keep working --
+   * which looks exactly like the compositor dropping the delta, and used to
+   * be indistinguishable from it because both ends were silent. The pane
+   * has to say which of its own gates swallowed the event.
+   */
+  it("names the gate that swallowed a wheel, once per reason", () => {
+    const { surface, sent, wheel } = attachScrolling();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // A pane whose measured box went away takes no input at all -- the
+    // wheel half of that was the silent half.
+    surface.setDisplaySize(null);
+    wheel({ deltaY: 12.5, deltaMode: 0 });
+    expect(sent).toHaveLength(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain("surface 7");
+    expect(warn.mock.calls[0][0]).toContain("no display size");
+
+    // A stuck gate is re-hit at the wheel's event rate, so it is reported
+    // once rather than per event.
+    wheel({ deltaY: 12.5, deltaMode: 0 });
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    // ...but a recurrence after a recovery is news again.
+    surface.setDisplaySize(64, 48, 120);
+    wheel({ deltaY: 12.5, deltaMode: 0 });
+    expect(sent).toHaveLength(1);
+    surface.setDisplaySize(null);
+    wheel({ deltaY: 12.5, deltaMode: 0 });
+    expect(warn).toHaveBeenCalledTimes(2);
+
+    warn.mockRestore();
+    surface.dispose();
+  });
+
   it("forwards smooth trackpad input without waiting for a display frame", () => {
     const { surface, canvas, sent } = attachScrolling();
     canvas.dispatchEvent(
@@ -454,6 +750,50 @@ describe("BlitSurfaceCanvas scroll", () => {
     expect(pointers).toEqual([
       { type: SURFACE_POINTER_MOVE, button: 0, x: 30, y: 40 },
       { type: SURFACE_POINTER_MOVE, button: 0, x: 31, y: 41 },
+    ]);
+    surface.dispose();
+  });
+
+  /**
+   * The wire fields are unsigned 16-bit. A letterboxed canvas puts real cursor
+   * positions outside the drawn frame, and sending those raw made the server
+   * read ~65533 and mirror it to peers, whose overlay clamped it to the
+   * opposite edge — the ghost cursor teleported across the window.
+   */
+  it("clamps pointer positions outside the drawn frame into the surface", () => {
+    // 800x600 frame in an 800x800 box: 100 CSS px of letterbox top and bottom.
+    const { surface, canvas, pointers } = attachScrolling({
+      frame: [800, 600],
+      css: [800, 800],
+    });
+
+    const move = (clientX: number, clientY: number) =>
+      canvas.dispatchEvent(
+        new MouseEvent("mousemove", {
+          bubbles: true,
+          cancelable: true,
+          clientX,
+          clientY,
+        }),
+      );
+    move(400, 50); // above the frame
+    move(-20, 300); // left of it
+    move(400, 750); // below it
+
+    expect(pointers).toEqual([
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 400, y: 0 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 0, y: 200 },
+      { type: SURFACE_POINTER_MOVE, button: 0, x: 400, y: 599 },
+    ]);
+    expect(pointers.every((p) => p.x >= 0 && p.y >= 0)).toBe(true);
+    surface.dispose();
+  });
+
+  it("retires the shared-pointer overlay when the cursor leaves the canvas", () => {
+    const { surface, canvas, pointers } = attachScrolling();
+    canvas.dispatchEvent(new MouseEvent("mouseleave", { bubbles: true }));
+    expect(pointers).toEqual([
+      { type: SURFACE_POINTER_LEAVE, button: 0, x: 0, y: 0 },
     ]);
     surface.dispose();
   });
@@ -614,7 +954,7 @@ describe("BlitSurfaceCanvas scroll", () => {
 function touchEvent(
   type: string,
   points: { identifier: number; clientX: number; clientY: number }[],
-  opts: { ongoing?: boolean } = {},
+  opts: { ongoing?: boolean; timeStamp?: number } = {},
 ): Event {
   const list = {
     length: points.length,
@@ -628,6 +968,9 @@ function touchEvent(
     value: opts.ongoing === false ? empty : list,
   });
   Object.defineProperty(ev, "changedTouches", { value: list });
+  if (opts.timeStamp !== undefined) {
+    Object.defineProperty(ev, "timeStamp", { value: opts.timeStamp });
+  }
   return ev;
 }
 
@@ -938,6 +1281,79 @@ describe("BlitSurfaceCanvas touch", () => {
       { type: SURFACE_POINTER_UP, button: 2, x: 40, y: 40 },
     ]);
     surface.dispose();
+  });
+
+  it("forwards simultaneous contacts in direct mode without pointer gestures", () => {
+    const harness = attachScrolling({ directTouch: true });
+    const { surface, canvas, touches, pointers, sent } = harness;
+    const second = { identifier: 8, clientX: 240, clientY: 160 };
+
+    // iPadOS may still emit pointer events first. Direct mode ignores those
+    // and takes the authoritative contact set from TouchEvent.
+    canvas.dispatchEvent(pointerEvent("pointerdown", 40, 40));
+    canvas.dispatchEvent(
+      touchEvent("touchstart", [FINGER, second], { timeStamp: 1_000 }),
+    );
+    canvas.dispatchEvent(
+      touchEvent(
+        "touchmove",
+        [
+          { identifier: 1, clientX: 50, clientY: 70 },
+          { identifier: 8, clientX: 260, clientY: 180 },
+        ],
+        { timeStamp: 1_008 },
+      ),
+    );
+    canvas.dispatchEvent(
+      touchEvent("touchend", [FINGER], { timeStamp: 1_016 }),
+    );
+    canvas.dispatchEvent(
+      touchEvent("touchend", [second], {
+        ongoing: false,
+        timeStamp: 1_024,
+      }),
+    );
+
+    expect(harness.touchAcquires).toBe(1);
+    expect(touches.map((event) => event.phase)).toEqual([
+      SURFACE_TOUCH_DOWN,
+      SURFACE_TOUCH_MOTION,
+      SURFACE_TOUCH_UP,
+      SURFACE_TOUCH_UP,
+    ]);
+    expect(touches[0].contacts).toEqual([
+      { identifier: 1, x: 40, y: 40 },
+      { identifier: 8, x: 240, y: 160 },
+    ]);
+    expect(touches[1].contacts).toEqual([
+      { identifier: 1, x: 50, y: 70 },
+      { identifier: 8, x: 260, y: 180 },
+    ]);
+    // WebKit may deliver several moves in one network/compositor batch. The
+    // browser cadence must survive that trip or the Wayland app sees zero-time
+    // motion and refuses to start an inertial scroll on finger-up.
+    expect(touches.map((event) => event.timeMs)).toEqual([
+      1_000, 1_008, 1_016, 1_024,
+    ]);
+    expect(pointers).toHaveLength(0);
+    expect(sent).toHaveLength(0);
+
+    surface.dispose();
+    expect(harness.touchReleases).toBe(1);
+  });
+
+  it("cancels a live direct sequence when switching back to pointer mode", () => {
+    const harness = attachScrolling({ directTouch: true });
+    harness.canvas.dispatchEvent(touchEvent("touchstart", [FINGER]));
+
+    harness.surface.setTouchMode("pointer");
+
+    expect(harness.touches.map((event) => event.phase)).toEqual([
+      SURFACE_TOUCH_DOWN,
+      SURFACE_TOUCH_CANCEL,
+    ]);
+    expect(harness.touchReleases).toBe(1);
+    harness.surface.dispose();
   });
 });
 
@@ -2344,12 +2760,12 @@ describe("BlitSurfaceCanvas drag-and-drop", () => {
     const { sends, fireDrag, dispose, uploads } = attachDragging();
     try {
       // WebKit's hover-time DataTransfer can carry only the Files marker.
-      // A provisional file lets Chromium deliver remote dragenter without
-      // pretending to know which representation DROP will materialize.
+      // A provisional PNG lets Chromium deliver a useful remote dragenter;
+      // iPad screenshots that materialize as HEIC are converted to match it.
       fireDrag("dragenter", { x: 1, y: 2, types: ["Files"], items: [] });
       const enter = sends[0];
       if (enter.kind !== "enter") throw new Error("Expected an ENTER");
-      expect(enter.items).toEqual(["application/octet-stream"]);
+      expect(enter.items).toEqual(["image/png"]);
 
       // The real promised representation has no name or MIME. Its signature
       // is JPEG, not the PNG the hover-only implementation used to assume.
@@ -2386,6 +2802,87 @@ describe("BlitSurfaceCanvas drag-and-drop", () => {
       );
     } finally {
       dispose();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("converts an iPad HEIC screenshot to PNG before the remote drop", async () => {
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      platform: "MacIntel",
+      maxTouchPoints: 5,
+    });
+    const { sends, fireDrag, dispose, uploads } = attachDragging();
+    const drawImage = vi.fn();
+    const close = vi.fn();
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockReturnValue({ drawImage } as unknown as CanvasRenderingContext2D);
+    const png = new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], {
+      type: "image/png",
+    });
+    const toBlob = vi
+      .spyOn(HTMLCanvasElement.prototype, "toBlob")
+      .mockImplementation((callback, type) => {
+        expect(type).toBe("image/png");
+        callback(png);
+      });
+    const createImageBitmap = vi.fn().mockResolvedValue({
+      width: 1170,
+      height: 2532,
+      close,
+    });
+    vi.stubGlobal("createImageBitmap", createImageBitmap);
+
+    try {
+      fireDrag("dragenter", { x: 1, y: 2, types: ["Files"], items: [] });
+      const file = new File(
+        [
+          new Uint8Array([
+            0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69,
+            0x63,
+          ]),
+        ],
+        "",
+      );
+      fireDrag("drop", {
+        x: 1,
+        y: 2,
+        types: [],
+        items: [],
+        files: [file],
+      });
+      await settle();
+      await settle();
+
+      expect(createImageBitmap).toHaveBeenCalledWith(file);
+      expect(drawImage).toHaveBeenCalledWith(
+        expect.objectContaining({ width: 1170, height: 2532 }),
+        0,
+        0,
+      );
+      expect(close).toHaveBeenCalledOnce();
+      await vi.waitFor(() =>
+        expect(sends.some((send) => send.kind === "drop")).toBe(true),
+      );
+      expect(uploads.map((upload) => upload.path)).toEqual(["0.png"]);
+      expect(uploads[0].file.type).toBe("image/png");
+      const enters = sends.filter((send) => send.kind === "enter");
+      expect(enters).toHaveLength(1);
+      expect(enters[0]).toEqual(
+        expect.objectContaining({ items: ["image/png"] }),
+      );
+      expect(sends.find((send) => send.kind === "drop")).toEqual(
+        expect.objectContaining({
+          items: [
+            expect.objectContaining({ mime: "image/png", name: "0.png" }),
+          ],
+        }),
+      );
+    } finally {
+      dispose();
+      getContext.mockRestore();
+      toBlob.mockRestore();
       vi.unstubAllGlobals();
     }
   });
@@ -2568,6 +3065,9 @@ function attachTyping() {
   const keys: { keycode: number; pressed: boolean }[] = [];
   const preedits: { text: string; cursor: number }[] = [];
   const pointers: { type: number; button: number }[] = [];
+  const textInputListeners = new Set<
+    (surfaceId: number, state: SurfaceTextInputEvent) => void
+  >();
   const conn = {
     sendSurfaceText: (_id: number, text: string) => texts.push(text),
     sendSurfaceInput: (_id: number, keycode: number, pressed: boolean) =>
@@ -2583,6 +3083,13 @@ function attachTyping() {
         getCanvas: () => null,
         canDecodeVideo: false,
         generation: 0,
+        getTextInput: () => null,
+        onTextInput: (
+          listener: (surfaceId: number, state: SurfaceTextInputEvent) => void,
+        ) => {
+          textInputListeners.add(listener);
+          return () => textInputListeners.delete(listener);
+        },
       } as Record<string, unknown>,
       {
         get: (target, prop) =>
@@ -2611,7 +3118,19 @@ function attachTyping() {
   if (!ta) throw new Error("Expected surface input textarea");
   // Only live views take input.
   surface.setDisplaySize(800, 600, 120);
-  return { surface, canvas, ta, texts, keys, preedits, pointers };
+  const requestTextInput = (state: SurfaceTextInputEvent) => {
+    for (const listener of textInputListeners) listener(7, state);
+  };
+  return {
+    surface,
+    canvas,
+    ta,
+    texts,
+    keys,
+    preedits,
+    pointers,
+    requestTextInput,
+  };
 }
 
 function inputEvent(init: InputEventInit): InputEvent {
@@ -2628,6 +3147,42 @@ describe("BlitSurfaceCanvas soft-keyboard input", () => {
     expect(surfaceCanvasForInput(ta)).toBe(surface);
     surface.dispose();
     expect(surfaceCanvasForInput(ta)).toBeNull();
+  });
+
+  it("maps Wayland content purpose and hints onto the keyboard target", () => {
+    const { surface, ta, requestTextInput } = attachTyping();
+    const events: SurfaceTextInputEvent[] = [];
+    ta.addEventListener(BLIT_SURFACE_TEXT_INPUT_EVENT, (event) => {
+      events.push((event as CustomEvent<SurfaceTextInputEvent>).detail);
+    });
+
+    requestTextInput({
+      enabled: true,
+      requested: true,
+      hint: 0x2 | 0x4,
+      purpose: 6, // email
+    });
+
+    expect(ta.dataset.blitInputmode).toBe("email");
+    expect(ta.getAttribute("inputmode")).toBe("email");
+    expect(ta.spellcheck).toBe(true);
+    expect(ta.getAttribute("autocorrect")).toBe("on");
+    expect(ta.getAttribute("autocapitalize")).toBe("sentences");
+    expect(events).toEqual([
+      {
+        enabled: true,
+        requested: true,
+        hint: 0x6,
+        purpose: 6,
+      },
+    ]);
+
+    requestTextInput({ enabled: false, requested: false, hint: 0, purpose: 0 });
+    expect(ta.dataset.blitInputmode).toBeUndefined();
+    expect(ta.getAttribute("inputmode")).toBeNull();
+    expect(ta.spellcheck).toBe(false);
+    expect(events.at(-1)?.enabled).toBe(false);
+    surface.dispose();
   });
 
   it("applies a one-shot toolbar modifier to a named keydown", () => {
@@ -2734,6 +3289,72 @@ describe("BlitSurfaceCanvas soft-keyboard input", () => {
     });
     ta.dispatchEvent(arrow);
     expect(arrow.defaultPrevented).toBe(true);
+    surface.dispose();
+  });
+});
+
+describe("BlitSurfaceCanvas iOS backspace repeat", () => {
+  const NBSP = String.fromCharCode(0xa0);
+
+  beforeEach(() => {
+    vi.stubGlobal("navigator", {
+      userAgent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+      platform: "MacIntel",
+      maxTouchPoints: 5,
+      clipboard: navigator.clipboard,
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("keeps the capture textarea seeded with deletable filler", () => {
+    const { surface, ta } = attachTyping();
+    expect(ta.value.length).toBeGreaterThan(0);
+    expect(ta.value).toBe(NBSP.repeat(ta.value.length));
+    surface.dispose();
+  });
+
+  it("forwards every deleteContentBackward in a held Backspace burst", () => {
+    const { surface, ta, keys } = attachTyping();
+    const seeded = ta.value.length;
+
+    for (let i = 1; i <= 3; i++) {
+      ta.value = NBSP.repeat(seeded - i);
+      ta.dispatchEvent(inputEvent({ inputType: "deleteContentBackward" }));
+    }
+
+    expect(keys).toEqual([
+      { keycode: 14, pressed: true },
+      { keycode: 14, pressed: false },
+      { keycode: 14, pressed: true },
+      { keycode: 14, pressed: false },
+      { keycode: 14, pressed: true },
+      { keycode: 14, pressed: false },
+    ]);
+    // Do not clear or replace the field while WebKit's repeat is active.
+    expect(ta.value).toBe(NBSP.repeat(seeded - 3));
+    surface.dispose();
+  });
+
+  it("never exposes the filler as typed text or an IME preedit", () => {
+    const { surface, ta, texts, preedits } = attachTyping();
+    const seeded = ta.value;
+
+    ta.value = seeded + "a";
+    ta.dispatchEvent(inputEvent({ inputType: "insertText", data: "a" }));
+    expect(texts).toEqual(["a"]);
+    expect(ta.value).toBe(seeded);
+
+    ta.value = seeded + "あ";
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+    ta.dispatchEvent(
+      inputEvent({ inputType: "insertCompositionText", isComposing: true }),
+    );
+    expect(preedits).toEqual([{ text: "あ", cursor: 1 }]);
     surface.dispose();
   });
 });

@@ -316,6 +316,25 @@ impl Fixture {
         std::mem::take(&mut self.app.log)
     }
 
+    fn text_input_event(&self, timeout: Duration) -> Option<(u16, bool, bool, u32, u32)> {
+        let handle = self.handle.as_ref().expect("compositor running");
+        let deadline = std::time::Instant::now() + timeout;
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match handle.event_rx.recv_timeout(left) {
+                Ok(CompositorEvent::SurfaceTextInput {
+                    surface_id,
+                    enabled,
+                    requested,
+                    hint,
+                    purpose,
+                }) => return Some((surface_id, enabled, requested, hint, purpose)),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
     /// The surface id the compositor gave our toplevel.
     fn surface_id(&mut self) -> u16 {
         let handle = self.handle.as_ref().expect("compositor running");
@@ -435,6 +454,55 @@ fn enable_only_counts_once_the_client_commits_it() {
         fx.app.committed().is_empty(),
         "an enable with no commit behind it should not enable anything"
     );
+}
+
+#[test]
+fn committed_enable_and_content_type_are_forwarded_to_viewers() {
+    let mut fx = Fixture::new(true);
+    let ti = fx.text_input.as_ref().expect("text input");
+    ti.enable();
+    ti.set_content_type(
+        ti::ContentHint::Spellcheck | ti::ContentHint::AutoCapitalization,
+        ti::ContentPurpose::Email,
+    );
+    fx.settle();
+    assert_eq!(
+        fx.text_input_event(Duration::from_millis(25)),
+        None,
+        "pending state must not escape before commit"
+    );
+
+    fx.text_input.as_ref().expect("text input").commit();
+    fx.settle();
+    let (_, enabled, requested, hint, purpose) = fx
+        .text_input_event(Duration::from_secs(1))
+        .expect("committed enable event");
+    assert!(enabled);
+    assert!(requested);
+    assert_eq!(
+        hint,
+        (ti::ContentHint::Spellcheck | ti::ContentHint::AutoCapitalization).bits()
+    );
+    assert_eq!(purpose, ti::ContentPurpose::Email as u32);
+
+    // Metadata-only commits preserve state but are not new requests to show
+    // a keyboard the user may have dismissed.
+    let ti = fx.text_input.as_ref().expect("text input");
+    ti.set_cursor_rectangle(1, 2, 3, 4);
+    ti.commit();
+    fx.settle();
+    assert_eq!(fx.text_input_event(Duration::from_millis(25)), None);
+
+    let ti = fx.text_input.as_ref().expect("text input");
+    ti.disable();
+    ti.commit();
+    fx.settle();
+    let (_, enabled, requested, hint, purpose) = fx
+        .text_input_event(Duration::from_secs(1))
+        .expect("committed disable event");
+    assert!(!enabled);
+    assert!(!requested);
+    assert_eq!((hint, purpose), (0, 0));
 }
 
 #[test]

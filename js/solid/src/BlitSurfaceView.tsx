@@ -9,7 +9,7 @@ import {
   type JSX,
 } from "solid-js";
 import { BlitSurfaceCanvas, detectCodecSupport } from "@blit-sh/core";
-import type { ConnectionId } from "@blit-sh/core";
+import type { ConnectionId, SurfaceTouchMode } from "@blit-sh/core";
 import { useRequiredBlitWorkspace } from "./BlitContext";
 
 export interface BlitSurfaceViewProps {
@@ -26,6 +26,8 @@ export interface BlitSurfaceViewProps {
    * do not create a server-side video subscription. Defaults to true.
    */
   live?: boolean;
+  /** How touchscreen contacts are delivered. Defaults to pointer emulation. */
+  touchMode?: SurfaceTouchMode;
   /**
    * Surface zoom factor, e.g. 1.25 for 125% or an exact 1.25x scale.
    *
@@ -67,6 +69,7 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
       surfaceId: props.surfaceId,
       live: props.live,
       resizable: props.resizable,
+      touchMode: props.touchMode,
     });
     surface.attach(containerRef);
     setMounted(surface);
@@ -88,6 +91,7 @@ export function BlitSurfaceView(props: BlitSurfaceViewProps) {
   createEffect(() => mounted()?.setConnectionId(props.connectionId));
   createEffect(() => mounted()?.setSurfaceId(props.surfaceId));
   createEffect(() => mounted()?.setLive(props.live !== false));
+  createEffect(() => mounted()?.setTouchMode(props.touchMode ?? "pointer"));
 
   // Focus the canvas when props.focus is true AND the surface is mounted.
   createEffect(() => {

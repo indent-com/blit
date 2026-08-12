@@ -38,6 +38,74 @@ export type SurfaceEventCallback = (
   surfaces: ReadonlyMap<number, BlitSurface>,
 ) => void;
 
+/** A position in the composited frame's pixel space. */
+export interface RemoteSurfacePointer {
+  x: number;
+  y: number;
+}
+
+/**
+ * What another viewer is currently doing to a surface.
+ *
+ * Both kinds at once, because a touchscreen laptop drives a mouse and a
+ * touchscreen together and each is its own mark set — a retire of one must not
+ * erase the other. `pointer` holds at most one point.
+ */
+export interface RemoteSurfaceInput {
+  pointer: readonly RemoteSurfacePointer[];
+  touch: readonly RemoteSurfacePointer[];
+}
+
+export type RemoteInputKind = "pointer" | "touch";
+
+/** Effective text-input state for one Wayland toplevel. */
+export interface SurfaceTextInputState {
+  enabled: boolean;
+  /** `zwp_text_input_v3.content_hint` bitmask. */
+  hint: number;
+  /** Numeric `zwp_text_input_v3.content_purpose`. */
+  purpose: number;
+}
+
+/** One state delivery. `requested` is true only for a fresh committed enable. */
+export interface SurfaceTextInputEvent extends SurfaceTextInputState {
+  requested: boolean;
+}
+
+const NO_REMOTE_INPUT: RemoteSurfaceInput = { pointer: [], touch: [] };
+
+function samePoints(
+  a: readonly RemoteSurfacePointer[],
+  b: readonly RemoteSurfacePointer[],
+): boolean {
+  return (
+    a.length === b.length &&
+    a.every((point, i) => point.x === b[i]!.x && point.y === b[i]!.y)
+  );
+}
+
+/** True when two mark sets would draw identically. */
+function sameRemoteInput(
+  a: RemoteSurfaceInput | null,
+  b: RemoteSurfaceInput | null,
+): boolean {
+  if (!a || !b) return a === b;
+  return samePoints(a.pointer, b.pointer) && samePoints(a.touch, b.touch);
+}
+
+/** Cursor artwork announced by the Wayland client for a surface. */
+export type SurfaceCursorImage =
+  | { kind: "named"; name: string }
+  | { kind: "hidden" }
+  | {
+      kind: "custom";
+      url: string;
+      hotspotX: number;
+      hotspotY: number;
+      width: number;
+      height: number;
+    };
+
 /** Timestamped record of an incoming surface video frame. */
 export interface SurfaceFrameSample {
   /** `performance.now()` when the frame arrived. */
@@ -757,6 +825,9 @@ export class SurfaceStore {
   private canvases = new Map<number, CanvasEntry>();
   private frameListeners = new Set<SurfaceFrameCallback>();
   private cursorShapes = new Map<number, string>();
+  private cursorImages = new Map<number, SurfaceCursorImage>();
+  private remoteInputs = new Map<number, RemoteSurfaceInput>();
+  private textInputs = new Map<number, SurfaceTextInputState>();
   private encoderNames = new Map<number, string>();
   private codecStrings = new Map<number, string>();
   /** Most recent *AV1* codec string announced per surface.  The plain
@@ -767,7 +838,13 @@ export class SurfaceStore {
   private cursorListeners = new Set<
     (surfaceId: number, shape: string) => void
   >();
+  private remoteInputListeners = new Set<
+    (surfaceId: number, input: RemoteSurfaceInput | null) => void
+  >();
   private activationListeners = new Set<(surfaceId: number) => void>();
+  private textInputListeners = new Set<
+    (surfaceId: number, state: SurfaceTextInputEvent) => void
+  >();
   private eventListeners = new Set<SurfaceEventCallback>();
   private _diag = {
     received: 0,
@@ -1327,6 +1404,9 @@ export class SurfaceStore {
 
   handleSurfaceDestroyed(surfaceId: number): void {
     this.surfaces.delete(surfaceId);
+    this.clearTextInput(surfaceId);
+    this.clearCursor(surfaceId);
+    this.clearRemoteInput(surfaceId);
     this.encoderNames.delete(surfaceId);
     this.codecStrings.delete(surfaceId);
     this.av1CodecStrings.delete(surfaceId);
@@ -1651,8 +1731,16 @@ export class SurfaceStore {
     }
   }
 
-  handleSurfaceCursor(surfaceId: number, shape: string): void {
+  handleSurfaceCursor(
+    surfaceId: number,
+    shape: string,
+    image: SurfaceCursorImage = shape === "none"
+      ? { kind: "hidden" }
+      : { kind: "named", name: shape },
+  ): void {
+    this.releaseCursorImage(this.cursorImages.get(surfaceId), image);
     this.cursorShapes.set(surfaceId, shape);
+    this.cursorImages.set(surfaceId, image);
     // Notify cursor listeners without triggering a full change cycle.
     for (const listener of this.cursorListeners) {
       try {
@@ -1666,11 +1754,60 @@ export class SurfaceStore {
     return this.cursorShapes.get(surfaceId) ?? "default";
   }
 
+  /** Get the cursor artwork used for another viewer's pointer overlay. */
+  getCursorImage(surfaceId: number): SurfaceCursorImage {
+    return (
+      this.cursorImages.get(surfaceId) ?? { kind: "named", name: "default" }
+    );
+  }
+
   /** Register a callback for cursor shape changes. Returns unsubscribe fn. */
   onCursor(listener: (surfaceId: number, shape: string) => void): () => void {
     this.cursorListeners.add(listener);
     return () => {
       this.cursorListeners.delete(listener);
+    };
+  }
+  /**
+   * Replace one kind of mark for a surface. An empty `points` retires that kind
+   * and leaves the other alone.
+   */
+  handleRemoteInput(
+    surfaceId: number,
+    kind: RemoteInputKind,
+    points: readonly RemoteSurfacePointer[],
+  ): void {
+    const previous = this.remoteInputs.get(surfaceId) ?? null;
+    const merged: RemoteSurfaceInput = {
+      pointer: kind === "pointer" ? points : (previous?.pointer ?? []),
+      touch: kind === "touch" ? points : (previous?.touch ?? []),
+    };
+    const next =
+      merged.pointer.length === 0 && merged.touch.length === 0 ? null : merged;
+    // Idempotent. A repeated retire, or marks that did not move, must not wake
+    // the overlay: each notification rewrites SVG attributes, and this arrives
+    // at the remote user's full mouse or touch rate across every mounted view
+    // of the surface.
+    if (sameRemoteInput(previous, next)) return;
+    if (next) this.remoteInputs.set(surfaceId, next);
+    else this.remoteInputs.delete(surfaceId);
+    for (const listener of this.remoteInputListeners) {
+      try {
+        listener(surfaceId, next);
+      } catch {}
+    }
+  }
+
+  getRemoteInput(surfaceId: number): RemoteSurfaceInput | null {
+    return this.remoteInputs.get(surfaceId) ?? null;
+  }
+
+  onRemoteInput(
+    listener: (surfaceId: number, input: RemoteSurfaceInput | null) => void,
+  ): () => void {
+    this.remoteInputListeners.add(listener);
+    return () => {
+      this.remoteInputListeners.delete(listener);
     };
   }
 
@@ -1692,6 +1829,37 @@ export class SurfaceStore {
     return () => {
       this.activationListeners.delete(listener);
     };
+  }
+
+  handleSurfaceTextInput(
+    surfaceId: number,
+    event: SurfaceTextInputEvent,
+  ): void {
+    const state: SurfaceTextInputState = {
+      enabled: event.enabled,
+      hint: event.hint >>> 0,
+      purpose: event.purpose >>> 0,
+    };
+    if (state.enabled) this.textInputs.set(surfaceId, state);
+    else this.textInputs.delete(surfaceId);
+    // Deliberately notify repeated enables. They identify a new focused text
+    // field even when its content type happens to match the previous one.
+    for (const listener of this.textInputListeners) {
+      try {
+        listener(surfaceId, { ...state, requested: event.requested });
+      } catch {}
+    }
+  }
+
+  getTextInput(surfaceId: number): SurfaceTextInputState | null {
+    return this.textInputs.get(surfaceId) ?? null;
+  }
+
+  onTextInput(
+    listener: (surfaceId: number, state: SurfaceTextInputEvent) => void,
+  ): () => void {
+    this.textInputListeners.add(listener);
+    return () => this.textInputListeners.delete(listener);
   }
 
   handleSurfaceEncoder(surfaceId: number, rawPayload: string): void {
@@ -1840,6 +2008,9 @@ export class SurfaceStore {
    * re-subscribe for video frames.
    */
   handleDisconnect(): void {
+    this.clearCursors();
+    this.clearRemoteInputs();
+    this.clearTextInputs();
     this.discardAllPresenters();
     for (const entry of this.decoders.values()) {
       safeClose(entry.decoder);
@@ -1870,6 +2041,9 @@ export class SurfaceStore {
    * individual S2C_SURFACE_CREATED messages.
    */
   reset(): void {
+    this.clearCursors();
+    this.clearRemoteInputs();
+    this.clearTextInputs();
     this.discardAllPresenters();
     for (const entry of this.decoders.values()) {
       safeClose(entry.decoder);
@@ -1906,6 +2080,78 @@ export class SurfaceStore {
       this._visibilityHandler = null;
     }
     this.reset();
+  }
+
+  private clearRemoteInput(surfaceId: number): void {
+    if (!this.remoteInputs.delete(surfaceId)) return;
+    for (const listener of this.remoteInputListeners) {
+      try {
+        listener(surfaceId, null);
+      } catch {}
+    }
+  }
+
+  private releaseCursorImage(
+    previous: SurfaceCursorImage | undefined,
+    next?: SurfaceCursorImage,
+  ): void {
+    if (
+      previous?.kind !== "custom" ||
+      (next?.kind === "custom" && next.url === previous.url)
+    ) {
+      return;
+    }
+    try {
+      URL.revokeObjectURL(previous.url);
+    } catch {}
+  }
+
+  private clearCursor(surfaceId: number): void {
+    this.releaseCursorImage(this.cursorImages.get(surfaceId));
+    this.cursorImages.delete(surfaceId);
+    this.cursorShapes.delete(surfaceId);
+  }
+
+  private clearCursors(): void {
+    for (const image of this.cursorImages.values()) {
+      this.releaseCursorImage(image);
+    }
+    this.cursorImages.clear();
+    this.cursorShapes.clear();
+  }
+
+  private clearRemoteInputs(): void {
+    const surfaceIds = [...this.remoteInputs.keys()];
+    this.remoteInputs.clear();
+    for (const surfaceId of surfaceIds) {
+      for (const listener of this.remoteInputListeners) {
+        try {
+          listener(surfaceId, null);
+        } catch {}
+      }
+    }
+  }
+
+  private clearTextInput(surfaceId: number): void {
+    const previous = this.textInputs.get(surfaceId);
+    if (!previous) return;
+    this.textInputs.delete(surfaceId);
+    for (const listener of this.textInputListeners) {
+      try {
+        listener(surfaceId, {
+          enabled: false,
+          requested: false,
+          hint: 0,
+          purpose: 0,
+        });
+      } catch {}
+    }
+  }
+
+  private clearTextInputs(): void {
+    for (const surfaceId of [...this.textInputs.keys()]) {
+      this.clearTextInput(surfaceId);
+    }
   }
 
   // -----------------------------------------------------------------------

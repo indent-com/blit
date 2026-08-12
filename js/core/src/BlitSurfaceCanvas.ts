@@ -8,13 +8,23 @@ import {
   AXIS_SOURCE_CONTINUOUS,
   AXIS_SOURCE_FINGER,
   AXIS_SOURCE_WHEEL,
+  SURFACE_TOUCH_DOWN,
+  SURFACE_TOUCH_UP,
+  SURFACE_TOUCH_MOTION,
+  SURFACE_TOUCH_CANCEL,
 } from "./types";
 import type { BlitWorkspace } from "./BlitWorkspace";
 import type { BlitConnection } from "./BlitConnection";
+import type {
+  RemoteSurfaceInput,
+  SurfaceCursorImage,
+  SurfaceTextInputEvent,
+} from "./SurfaceStore";
 import {
   SURFACE_POINTER_DOWN,
   SURFACE_POINTER_UP,
   SURFACE_POINTER_MOVE,
+  SURFACE_POINTER_LEAVE,
 } from "./protocol";
 import {
   SCROLL_STOP_MS,
@@ -39,6 +49,104 @@ let _codecSupport: number | null = null;
  *  demoted codec may only ever re-offer bits this browser did probe as
  *  working — never invent support the probe never saw. */
 let _probedCodecSupport = 0;
+
+/** Radius of a mirrored touch contact, in logical pixels — about a fingertip. */
+const REMOTE_CONTACT_RADIUS = 14;
+
+const REMOTE_CURSOR_ARROW =
+  "M 0.75 0.75 L 0.75 20 L 6 14.75 L 10.5 23 L 14 21 L 9.5 13 L 17 13 Z";
+const REMOTE_CURSOR_HAND =
+  "M 0 0 C -1 -3 1 -5 3 -5 C 5 -5 6 -3 6 -1 L 6 8 L 8 8 L 8 3 C 8 1 11 1 11 3 L 11 8 L 13 8 L 13 4 C 13 2 16 2 16 4 L 16 9 L 18 9 L 18 6 C 18 4 21 4 21 6 L 21 14 C 21 21 17 25 10 25 C 6 25 3 22 1 19 L -3 13 C -4 11 -3 9 -1 8 C 1 8 3 11 3 11 L 3 0 Z";
+const REMOTE_CURSOR_GRAB =
+  "M -10 -2 C -10 -5 -6 -6 -5 -3 L -5 -8 C -5 -11 -1 -11 0 -8 C 1 -12 5 -11 5 -8 C 7 -10 10 -8 10 -5 L 10 5 C 10 11 6 14 0 14 C -5 14 -9 10 -11 6 L -14 1 C -15 -2 -12 -4 -10 -2 Z";
+const REMOTE_CURSOR_TEXT =
+  "M -7 -12 H 7 V -9 H 2 V 9 H 7 V 12 H -7 V 9 H -2 V -9 H -7 Z";
+const REMOTE_CURSOR_CROSSHAIR =
+  "M -1 -12 H 1 V -2 H 12 V 2 H 1 V 12 H -1 V 2 H -12 V -2 H -1 Z";
+const REMOTE_CURSOR_EW =
+  "M -12 0 L -6 -6 V -2 H 6 V -6 L 12 0 L 6 6 V 2 H -6 V 6 Z";
+const REMOTE_CURSOR_NS =
+  "M 0 -12 L 6 -6 H 2 V 6 H 6 L 0 12 L -6 6 H -2 V -6 H -6 Z";
+const REMOTE_CURSOR_MOVE =
+  "M 0 -13 L 5 -8 H 2 V -2 H 8 V -5 L 13 0 L 8 5 V 2 H 2 V 8 H 5 L 0 13 L -5 8 H -2 V 2 H -8 V 5 L -13 0 L -8 -5 V -2 H -2 V -8 H -5 Z";
+const REMOTE_CURSOR_PROHIBITED =
+  "M 0 -12 A 12 12 0 1 1 0 12 A 12 12 0 0 1 0 -12 Z M -6 -8 L 8 6 L 6 8 L -8 -6 Z";
+const REMOTE_CURSOR_WAIT =
+  "M 0 -12 A 12 12 0 1 1 -12 0 H -8 A 8 8 0 1 0 0 -8 Z";
+const REMOTE_CURSOR_ZOOM =
+  "M -3 -11 A 8 8 0 1 1 -3 5 A 8 8 0 0 1 -3 -11 Z M -3 -7 A 4 4 0 1 0 -3 1 A 4 4 0 0 0 -3 -7 Z M 3 3 L 12 12 L 9 15 L 0 6 Z";
+const REMOTE_CURSOR_CONTEXT_MENU = `${REMOTE_CURSOR_ARROW} M 12 16 H 22 V 18 H 12 Z M 12 20 H 22 V 22 H 12 Z`;
+const REMOTE_CURSOR_HELP = `${REMOTE_CURSOR_ARROW} M 13 15 C 13 11 21 11 21 16 C 21 19 18 19 18 21 H 15 C 15 17 18 17 18 15 C 18 13 16 13 16 15 Z M 15 23 H 18 V 26 H 15 Z`;
+const REMOTE_CURSOR_COPY = `${REMOTE_CURSOR_ARROW} M 13 16 H 17 V 12 H 20 V 16 H 24 V 19 H 20 V 23 H 17 V 19 H 13 Z`;
+const REMOTE_CURSOR_ALIAS = `${REMOTE_CURSOR_ARROW} M 13 19 H 18 V 16 L 24 21 L 18 26 V 23 H 13 Z`;
+const REMOTE_CURSOR_PROGRESS = `${REMOTE_CURSOR_ARROW} M 18 12 A 6 6 0 1 1 12 18 H 15 A 3 3 0 1 0 18 15 Z`;
+const REMOTE_CURSOR_ZOOM_IN = `${REMOTE_CURSOR_ZOOM} M -6 -4 H -4 V -6 H -2 V -4 H 0 V -2 H -2 V 0 H -4 V -2 H -6 Z`;
+const REMOTE_CURSOR_ZOOM_OUT = `${REMOTE_CURSOR_ZOOM} M -6 -4 H 0 V -2 H -6 Z`;
+
+interface RemoteCursorGlyph {
+  path: string;
+  rotation?: number;
+}
+
+/** A compact, high-contrast approximation of the platform cursor shape. */
+function remoteCursorGlyph(name: string): RemoteCursorGlyph {
+  switch (name) {
+    case "context-menu":
+      return { path: REMOTE_CURSOR_CONTEXT_MENU };
+    case "help":
+      return { path: REMOTE_CURSOR_HELP };
+    case "pointer":
+      return { path: REMOTE_CURSOR_HAND };
+    case "alias":
+      return { path: REMOTE_CURSOR_ALIAS };
+    case "copy":
+      return { path: REMOTE_CURSOR_COPY };
+    case "grab":
+    case "grabbing":
+      return { path: REMOTE_CURSOR_GRAB };
+    case "text":
+      return { path: REMOTE_CURSOR_TEXT };
+    case "vertical-text":
+      return { path: REMOTE_CURSOR_TEXT, rotation: 90 };
+    case "cell":
+    case "crosshair":
+      return { path: REMOTE_CURSOR_CROSSHAIR };
+    case "e-resize":
+    case "w-resize":
+    case "ew-resize":
+    case "col-resize":
+      return { path: REMOTE_CURSOR_EW };
+    case "n-resize":
+    case "s-resize":
+    case "ns-resize":
+    case "row-resize":
+      return { path: REMOTE_CURSOR_NS };
+    case "ne-resize":
+    case "sw-resize":
+    case "nesw-resize":
+      return { path: REMOTE_CURSOR_EW, rotation: -45 };
+    case "nw-resize":
+    case "se-resize":
+    case "nwse-resize":
+      return { path: REMOTE_CURSOR_EW, rotation: 45 };
+    case "move":
+    case "all-scroll":
+      return { path: REMOTE_CURSOR_MOVE };
+    case "no-drop":
+    case "not-allowed":
+      return { path: REMOTE_CURSOR_PROHIBITED };
+    case "wait":
+      return { path: REMOTE_CURSOR_WAIT };
+    case "progress":
+      return { path: REMOTE_CURSOR_PROGRESS };
+    case "zoom-in":
+      return { path: REMOTE_CURSOR_ZOOM_IN };
+    case "zoom-out":
+      return { path: REMOTE_CURSOR_ZOOM_OUT };
+    default:
+      return { path: REMOTE_CURSOR_ARROW };
+  }
+}
 
 /**
  * Largest frame any supported codec decoded in the probe, as [w, h].
@@ -511,6 +619,25 @@ function detectMacOptionChars(): boolean {
   return /mac|ipad|iphone/.test((nav.userAgent ?? "").toLowerCase());
 }
 
+/** iOS/iPadOS only auto-repeats a soft-keyboard Backspace while the focused
+ * editable element still contains text it can delete. */
+function detectIOS(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return (
+    /iPad|iPhone|iPod/.test(navigator.platform) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+  );
+}
+
+const IOS_INPUT_PAD_CODE = 0x00a0;
+const IOS_INPUT_PAD = String.fromCharCode(IOS_INPUT_PAD_CODE).repeat(64);
+
+function stripIOSInputPad(value: string): string {
+  let i = 0;
+  while (i < value.length && value.charCodeAt(i) === IOS_INPUT_PAD_CODE) i++;
+  return value.slice(i);
+}
+
 // ---------------------------------------------------------------------------
 // BlitSurfaceCanvas
 // ---------------------------------------------------------------------------
@@ -525,6 +652,32 @@ const surfaceCanvasByInput = new WeakMap<
   HTMLTextAreaElement,
   BlitSurfaceCanvas
 >();
+
+/** Bubbling DOM event emitted by a mounted surface when its Wayland client
+ * commits text-input state. The app shell uses fresh `requested` events to
+ * raise a mobile virtual keyboard; embedders can provide their own policy. */
+export const BLIT_SURFACE_TEXT_INPUT_EVENT = "blit-surface-text-input";
+
+export type BlitSurfaceTextInputEvent = CustomEvent<SurfaceTextInputEvent>;
+
+function inputModeForContentPurpose(purpose: number): string {
+  switch (purpose) {
+    case 2: // digits
+      return "numeric";
+    case 3: // number
+      return "decimal";
+    case 4: // phone
+      return "tel";
+    case 5: // url
+      return "url";
+    case 6: // email
+      return "email";
+    case 9: // pin
+      return "numeric";
+    default:
+      return "text";
+  }
+}
 
 /** Resolve the live Wayland surface view owning a hidden IME textarea. */
 export function surfaceCanvasForInput(
@@ -558,7 +711,12 @@ export interface BlitSurfaceCanvasOptions {
    * SurfaceStore, but never create an encoder themselves.  Defaults to true.
    */
   live?: boolean;
+  /** `pointer` keeps Blit's single-finger click/scroll emulation. `direct`
+   * forwards every touchscreen contact to the Wayland client's `wl_touch`. */
+  touchMode?: SurfaceTouchMode;
 }
+
+export type SurfaceTouchMode = "pointer" | "direct";
 
 // -- Scroll ----------------------------------------------------------------
 //
@@ -684,9 +842,10 @@ const DROP_CLAIMED = Symbol("blit-surface-drop-claimed");
  *  iPad screenshots are the exception: WebKit exposes only the `Files`
  *  marker during hover, then materializes the real representation at DROP.
  *  Without an item plan the compositor must park Chromium's eager URI read,
- *  so the remote page does not receive dragenter until after release.  Use a
- *  provisional single-file plan for hover; DROP replaces it with a second
- *  ENTER carrying the materialized MIME before uploading the file. */
+ *  so the remote page does not receive dragenter until after release.  Plan
+ *  that screenshot as PNG: HEIC/HEIF is converted at DROP, and announcing
+ *  the final path during hover gives Chromium time to deliver a file-shaped
+ *  drag to the remote page before the release arrives. */
 function dragFileItemMimes(dt: DataTransfer | null): string[] | undefined {
   if (!dt) return undefined;
   const items = Array.from(dt.items ?? []).filter(
@@ -696,15 +855,13 @@ function dragFileItemMimes(dt: DataTransfer | null): string[] | undefined {
   for (const item of items) {
     const mime = normalizedMime(item.type);
     if (!plannedDropExtension(mime)) {
-      return isIPadOS() && items.length === 1
-        ? ["application/octet-stream"]
-        : undefined;
+      return isIPadOS() && items.length === 1 ? ["image/png"] : undefined;
     }
     mimes.push(mime);
   }
   if (mimes.length > 0) return mimes;
   return isIPadOS() && Array.from(dt.types ?? []).includes("Files")
-    ? ["application/octet-stream"]
+    ? ["image/png"]
     : undefined;
 }
 
@@ -908,6 +1065,64 @@ async function materializedDropMime(file: File): Promise<string> {
   return declared || "application/octet-stream";
 }
 
+/** Convert the HEIC/HEIF representation iPadOS supplies for a screenshot to
+ *  PNG before it crosses the Wayland boundary.  Chromium-backed destinations
+ *  commonly leave those image types unclaimed and navigate to the staged file
+ *  instead of treating it as an upload.  The source browser can decode the
+ *  representation, so make the compatibility conversion there.  A failed
+ *  conversion is non-fatal: preserving the original file is preferable to
+ *  cancelling the drop. */
+async function compatibleIPadDropFile(
+  file: File,
+  mime: string,
+): Promise<{ file: File; mime: string }> {
+  if (
+    !isIPadOS() ||
+    (normalizedMime(mime) !== "image/heic" &&
+      normalizedMime(mime) !== "image/heif")
+  )
+    return { file, mime };
+
+  try {
+    const bitmap = await createImageBitmap(file);
+    try {
+      if (bitmap.width < 1 || bitmap.height < 1)
+        throw new Error("decoded image has no pixels");
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("2D canvas is unavailable");
+      context.drawImage(bitmap, 0, 0);
+      const png = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob(
+          (blob) =>
+            blob
+              ? resolve(blob)
+              : reject(new Error("canvas returned no PNG data")),
+          "image/png",
+        );
+      });
+      const stem = file.name.replace(/\.(?:heic|heif)$/i, "") || "screenshot";
+      return {
+        file: new File([png], `${stem}.png`, {
+          type: "image/png",
+          lastModified: file.lastModified,
+        }),
+        mime: "image/png",
+      };
+    } finally {
+      bitmap.close();
+    }
+  } catch (err) {
+    console.warn(
+      "blit: could not convert an iPad HEIC/HEIF drop to PNG; dropping the original",
+      err,
+    );
+    return { file, mime };
+  }
+}
+
 /** The staging path for a hover plan, derived identically on the server. */
 function plannedDropName(mime: string, index: number): string {
   const ext = plannedDropExtension(mime) ?? "bin";
@@ -957,6 +1172,8 @@ export class BlitSurfaceCanvas {
   private _surfaceId: number;
   private _live: boolean;
   private _expectsDisplaySize: boolean;
+  private _touchMode: SurfaceTouchMode;
+  private touchCapabilityAcquired = false;
   /**
    * A passive view with a working ResizeObserver must learn its box before
    * it opens a stream. A newly-created sidebar card is mounted before its
@@ -969,6 +1186,18 @@ export class BlitSurfaceCanvas {
   private container: HTMLElement | null = null;
   private canvas: HTMLCanvasElement | null = null;
   private ctx: CanvasRenderingContext2D | null = null;
+  /** Pointer overlay for the client currently driving this shared surface.
+   *  The originating client is told to hide it and keeps its native cursor. */
+  private remotePointerSvg: SVGSVGElement | null = null;
+  private remotePointerGlyph: SVGPathElement | null = null;
+  private remotePointerImage: SVGImageElement | null = null;
+  private remoteInput: RemoteSurfaceInput | null = null;
+  /** Reused rings for mirrored touch contacts. */
+  private remoteContacts: SVGCircleElement[] = [];
+  private remoteCursor: SurfaceCursorImage = {
+    kind: "named",
+    name: "default",
+  };
 
   private surface: BlitSurface | undefined;
   private disposed = false;
@@ -1016,6 +1245,8 @@ export class BlitSurfaceCanvas {
     longPressTimer: ReturnType<typeof setTimeout> | null;
     pointerId?: number;
   } | null = null;
+  /** Browser contact identifiers currently held by direct-touch mode. */
+  private directTouchIds = new Set<number>();
 
   /**
    * When non-null the surface is in resizable mode: the framework binding's
@@ -1085,6 +1316,8 @@ export class BlitSurfaceCanvas {
   // subscriptions
   private unsubFrame: (() => void) | null = null;
   private unsubCursor: (() => void) | null = null;
+  private unsubRemotePointer: (() => void) | null = null;
+  private unsubTextInput: (() => void) | null = null;
   private unsubChange: (() => void) | null = null;
 
   /** True after the first frame has been blitted.  Kept as a tripwire so
@@ -1110,6 +1343,12 @@ export class BlitSurfaceCanvas {
    *  the canvas for normal typing; the textarea only receives focus when
    *  an IME composition session is active. */
   private textInput: HTMLTextAreaElement | null = null;
+  /** Keep the iOS capture field non-empty so a held soft-keyboard Backspace
+   *  continues producing deleteContentBackward events. */
+  private _iosInputPad = detectIOS();
+  /** Refill the iOS pad only after a repeat burst goes idle; changing the
+   *  textarea value during the burst can stop WebKit's native repeat. */
+  private _iosInputRepadTimer: ReturnType<typeof setTimeout> | null = null;
   /** Non-zero when a Meta→Ctrl translation is in flight (stores the Meta
    *  evdev keycode that was swapped so the release can be translated back). */
   private _metaToCtrl = 0;
@@ -1154,6 +1393,10 @@ export class BlitSurfaceCanvas {
     dy: number;
     v120x: number;
     v120y: number;
+    /** `timeStamp` of the newest event folded in. Deltas are rAF-batched, so the
+     *  flush reports when the travel actually happened rather than when it was
+     *  sent — kinetic scrolling integrates against this. */
+    timeMs: number;
   } | null = null;
   private scrollFlushHandle: number | null = null;
   private scrollStopTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1163,6 +1406,9 @@ export class BlitSurfaceCanvas {
   private scrollSource: number | null = null;
   /** Whether a stop still owes the client. */
   private scrollSequenceOpen = false;
+  /** Reasons this pane has already reported for swallowing a wheel event.
+   *  See {@link reportWheelIgnored}. */
+  private wheelIgnoredReported = new Set<string>();
 
   // bound event handlers
   private boundMouseDown: ((e: MouseEvent) => void) | null = null;
@@ -1179,6 +1425,7 @@ export class BlitSurfaceCanvas {
   private boundPointerMove: ((e: PointerEvent) => void) | null = null;
   private boundPointerUp: ((e: PointerEvent) => void) | null = null;
   private boundPointerCancel: ((e: PointerEvent) => void) | null = null;
+  private boundMouseLeave: (() => void) | null = null;
   private boundKeyDown: ((e: KeyboardEvent) => void) | null = null;
   private boundKeyUp: ((e: KeyboardEvent) => void) | null = null;
   private boundFocus: ((e: FocusEvent) => void) | null = null;
@@ -1226,6 +1473,7 @@ export class BlitSurfaceCanvas {
     this._surfaceId = options.surfaceId;
     this._live = options.live !== false;
     this._expectsDisplaySize = options.resizable === true;
+    this._touchMode = options.touchMode ?? "pointer";
   }
 
   // -----------------------------------------------------------------------
@@ -1330,6 +1578,39 @@ export class BlitSurfaceCanvas {
 
     container.appendChild(canvas);
 
+    const svgNs = "http://www.w3.org/2000/svg";
+    const remotePointerSvg = document.createElementNS(svgNs, "svg");
+    remotePointerSvg.setAttribute("aria-hidden", "true");
+    remotePointerSvg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+    remotePointerSvg.setAttribute("data-blit-remote-pointer", "");
+    Object.assign(remotePointerSvg.style, {
+      position: "absolute",
+      left: "0",
+      top: "0",
+      width: "100%",
+      height: "100%",
+      overflow: "visible",
+      pointerEvents: "none",
+      visibility: "hidden",
+      zIndex: "1",
+    });
+    const remotePointerGlyph = document.createElementNS(svgNs, "path");
+    remotePointerGlyph.setAttribute("d", REMOTE_CURSOR_ARROW);
+    remotePointerGlyph.setAttribute("fill", "#38bdf8");
+    remotePointerGlyph.setAttribute("stroke", "#0b1020");
+    remotePointerGlyph.setAttribute("stroke-width", "1.5");
+    remotePointerGlyph.setAttribute("stroke-linejoin", "round");
+    remotePointerGlyph.setAttribute("fill-rule", "evenodd");
+    remotePointerGlyph.setAttribute("vector-effect", "non-scaling-stroke");
+    remotePointerSvg.appendChild(remotePointerGlyph);
+    const remotePointerImage = document.createElementNS(svgNs, "image");
+    remotePointerImage.style.display = "none";
+    remotePointerSvg.appendChild(remotePointerImage);
+    container.appendChild(remotePointerSvg);
+    this.remotePointerSvg = remotePointerSvg;
+    this.remotePointerGlyph = remotePointerGlyph;
+    this.remotePointerImage = remotePointerImage;
+
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
     mountedSurfaceCanvases.set(canvas, this);
@@ -1338,6 +1619,7 @@ export class BlitSurfaceCanvas {
     this.observeIntersection(container);
     this.subscribe();
     this.attachEvents();
+    this.syncTouchCapability();
   }
 
   /**
@@ -1452,6 +1734,8 @@ export class BlitSurfaceCanvas {
     this.releaseAllKeys();
     this.releaseAllButtons();
     this.endScrollSequence();
+    this.cancelDirectTouches();
+    this.releaseTouchCapability();
     this.setDisplaySize(null);
     this.dragStaging?.stop();
     this.dragStaging = null;
@@ -1467,21 +1751,34 @@ export class BlitSurfaceCanvas {
     if (this.canvas && this.container) {
       this.container.removeChild(this.canvas);
     }
+    if (this.remotePointerSvg && this.container) {
+      this.container.removeChild(this.remotePointerSvg);
+    }
     this.canvas = null;
     this.ctx = null;
+    this.remotePointerSvg = null;
+    this.remotePointerGlyph = null;
+    this.remotePointerImage = null;
+    this.remoteInput = null;
+    this.remoteContacts.length = 0;
     this.container = null;
   }
 
   setConnectionId(connectionId: ConnectionId): void {
     if (this._connectionId === connectionId) return;
+    this.cancelDirectTouches();
+    this.releaseTouchCapability();
     this.clearResizeConstraint();
     this._connectionId = connectionId;
+    this.syncTouchCapability();
     this.resubscribe();
     this.resendDisplaySize();
   }
 
   setSurfaceId(surfaceId: number): void {
     if (this._surfaceId === surfaceId) return;
+    this.cancelDirectTouches();
+    this.cancelPointerTouchGesture();
     this.clearResizeConstraint();
     this._surfaceId = surfaceId;
     this.resubscribe();
@@ -1501,6 +1798,22 @@ export class BlitSurfaceCanvas {
     this.resendDisplaySize();
     const store = this.getConn()?.surfaceStore ?? this._store;
     if (store) this.blitFromStore(store);
+  }
+
+  setTouchMode(mode: SurfaceTouchMode): void {
+    if (this._touchMode === mode) return;
+    if (this._touchMode === "direct") {
+      this.cancelDirectTouches();
+      this.releaseTouchCapability();
+    } else {
+      this.cancelPointerTouchGesture();
+    }
+    this._touchMode = mode;
+    this.syncTouchCapability();
+  }
+
+  get touchMode(): SurfaceTouchMode {
+    return this._touchMode;
   }
 
   /**
@@ -1696,6 +2009,7 @@ export class BlitSurfaceCanvas {
   private applyLayout(): void {
     const canvas = this.canvas;
     if (!canvas) return;
+    const remotePointerSvg = this.remotePointerSvg;
     const ds = this._displaySize;
     if (!ds || !ds.scale120) {
       if (this._lastLayout) {
@@ -1704,6 +2018,15 @@ export class BlitSurfaceCanvas {
           position: "",
           left: "",
           top: "",
+          width: "100%",
+          height: "100%",
+        });
+      }
+      if (remotePointerSvg) {
+        Object.assign(remotePointerSvg.style, {
+          position: "absolute",
+          left: "0",
+          top: "0",
           width: "100%",
           height: "100%",
         });
@@ -1749,6 +2072,15 @@ export class BlitSurfaceCanvas {
       width: `${w / scale}px`,
       height: `${h / scale}px`,
     });
+    if (remotePointerSvg) {
+      Object.assign(remotePointerSvg.style, {
+        position: "absolute",
+        left: `${left / scale}px`,
+        top: `${top / scale}px`,
+        width: `${w / scale}px`,
+        height: `${h / scale}px`,
+      });
+    }
   }
 
   /**
@@ -1831,6 +2163,7 @@ export class BlitSurfaceCanvas {
     this.unsubChange = store.onChange(() => {
       const prev = this.surface;
       this.surface = store.getSurface(this._surfaceId);
+      this.updateRemotePointerOverlay();
       // Re-subscribe when the store generation changed (reconnect — the
       // server dropped all subscriptions but the surface reappeared with
       // the same IDs).  We no longer need to handle the "surface info
@@ -1880,10 +2213,50 @@ export class BlitSurfaceCanvas {
     this.unsubCursor = store.onCursor((sid, shape) => {
       if (sid !== this._surfaceId || !this.canvas) return;
       this.canvas.style.cursor = shape;
+      this.remoteCursor =
+        store.getCursorImage?.(sid) ??
+        (shape === "none"
+          ? { kind: "hidden" }
+          : { kind: "named", name: shape });
+      this.updateRemotePointerOverlay();
     });
     // Apply initial cursor.
     if (this.canvas) {
       this.canvas.style.cursor = store.getCursor(this._surfaceId);
+    }
+    this.remoteCursor = store.getCursorImage?.(this._surfaceId) ?? {
+      kind: "named",
+      name: "default",
+    };
+
+    // Some embedders provide a narrow SurfaceStore-shaped test/cache facade;
+    // keep the new overlay optional for those older facades.
+    this.unsubRemotePointer = store.onRemoteInput?.((sid, input) => {
+      if (sid !== this._surfaceId) return;
+      this.remoteInput = input;
+      this.updateRemotePointerOverlay();
+    });
+    // Narrow facades answer unknown members with a stub, so validate the shape
+    // rather than trusting that this is a RemoteSurfaceInput at all.
+    const initial = store.getRemoteInput?.(this._surfaceId) ?? null;
+    this.remoteInput =
+      initial &&
+      Array.isArray(initial.pointer) &&
+      Array.isArray(initial.touch) &&
+      [...initial.pointer, ...initial.touch].every(
+        (point) => Number.isFinite(point?.x) && Number.isFinite(point?.y),
+      )
+        ? initial
+        : null;
+    this.updateRemotePointerOverlay();
+
+    this.unsubTextInput = store.onTextInput?.((sid, state) => {
+      if (sid !== this._surfaceId) return;
+      this.applyTextInputState(state);
+    });
+    const textInput = store.getTextInput?.(this._surfaceId) ?? null;
+    if (textInput) {
+      this.applyTextInputState({ ...textInput, requested: false });
     }
 
     this.unsubFrame = store.onFrame((sid) => {
@@ -1931,9 +2304,128 @@ export class BlitSurfaceCanvas {
     this.unsubFrame?.();
     this.unsubChange?.();
     this.unsubCursor?.();
+    this.unsubRemotePointer?.();
+    this.unsubTextInput?.();
     this.unsubFrame = null;
     this.unsubChange = null;
     this.unsubCursor = null;
+    this.unsubRemotePointer = null;
+    this.unsubTextInput = null;
+  }
+
+  private updateRemotePointerOverlay(): void {
+    const svg = this.remotePointerSvg;
+    const glyph = this.remotePointerGlyph;
+    const image = this.remotePointerImage;
+    const input = this.remoteInput;
+    const surface = this.surface;
+    const cursor = this.remoteCursor;
+    // A hidden cursor only hides the *pointer* mark. Fingers are the remote
+    // user's, not the app's, so an app that hides the cursor cannot hide them.
+    const showPointer =
+      !!input && input.pointer.length > 0 && cursor.kind !== "hidden";
+    const showTouch = !!input && input.touch.length > 0;
+    if (!svg || !glyph || !image || !surface || (!showPointer && !showTouch)) {
+      if (svg) svg.style.visibility = "hidden";
+      this.layoutRemoteContacts(0, 1);
+      return;
+    }
+    const width = Math.max(1, surface.width);
+    const height = Math.max(1, surface.height);
+    // Pointer artwork is sized in logical pixels. Scale it into the physical
+    // composite so it remains a normal cursor size on high-DPI surfaces.
+    const cursorScale =
+      surface.logicalWidth > 0 ? width / surface.logicalWidth : 1;
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    const clampX = (v: number) => Math.max(0, Math.min(width, v));
+    const clampY = (v: number) => Math.max(0, Math.min(height, v));
+
+    // Fingers have no cursor artwork: one ring per contact, sized like a
+    // fingertip. Drawn alongside the cursor, since one viewer can be doing both.
+    const circles = this.layoutRemoteContacts(
+      showTouch ? input.touch.length : 0,
+      cursorScale,
+    );
+    if (showTouch) {
+      input.touch.forEach((point, i) => {
+        const circle = circles[i]!;
+        circle.setAttribute("cx", String(clampX(point.x)));
+        circle.setAttribute("cy", String(clampY(point.y)));
+      });
+    }
+
+    if (!showPointer) {
+      glyph.style.display = "none";
+      image.style.display = "none";
+      svg.style.visibility = "visible";
+      return;
+    }
+    const x = clampX(input.pointer[0]!.x);
+    const y = clampY(input.pointer[0]!.y);
+    if (cursor.kind === "custom") {
+      glyph.style.display = "none";
+      image.style.display = "";
+      image.setAttribute("href", cursor.url);
+      // Hotspot and extent are both logical (the server divides the buffer's
+      // pixel size by the cursor's own `buffer_scale`), so one factor takes
+      // both into the physical-pixel viewBox. Scaling only the offset put the
+      // hotspot a full cursor-width off the artwork on any HiDPI surface.
+      image.setAttribute("x", String(x - cursor.hotspotX * cursorScale));
+      image.setAttribute("y", String(y - cursor.hotspotY * cursorScale));
+      image.setAttribute("width", String(cursor.width * cursorScale));
+      image.setAttribute("height", String(cursor.height * cursorScale));
+    } else {
+      image.style.display = "none";
+      glyph.style.display = "";
+      // `hidden` was excluded by `showPointer`; TS cannot see that, so name the
+      // fallback rather than assert.
+      const artwork = remoteCursorGlyph(
+        cursor.kind === "named" ? cursor.name : "default",
+      );
+      glyph.setAttribute("d", artwork.path);
+      const rotation = artwork.rotation ? ` rotate(${artwork.rotation})` : "";
+      glyph.setAttribute(
+        "transform",
+        `translate(${x} ${y}) scale(${cursorScale})${rotation}`,
+      );
+    }
+    svg.style.visibility = "visible";
+  }
+
+  /**
+   * Grow/shrink the contact-ring pool to `count` and return it.
+   *
+   * Elements are reused rather than recreated: this runs at the remote user's
+   * touch-move rate, and churning DOM nodes per frame is exactly the cost the
+   * store's dedup exists to avoid.
+   */
+  private layoutRemoteContacts(
+    count: number,
+    cursorScale: number,
+  ): SVGCircleElement[] {
+    const svg = this.remotePointerSvg;
+    if (!svg) return [];
+    while (this.remoteContacts.length < count) {
+      const circle = document.createElementNS(
+        "http://www.w3.org/2000/svg",
+        "circle",
+      );
+      circle.setAttribute("fill", "rgba(56, 189, 248, 0.35)");
+      circle.setAttribute("stroke", "#0b1020");
+      circle.setAttribute("stroke-width", "1.5");
+      circle.setAttribute("vector-effect", "non-scaling-stroke");
+      svg.appendChild(circle);
+      this.remoteContacts.push(circle);
+    }
+    for (let i = this.remoteContacts.length - 1; i >= count; i--) {
+      this.remoteContacts[i]!.remove();
+      this.remoteContacts.length = i;
+    }
+    // A fingertip is about this wide in logical pixels; scale like the cursor so
+    // it stays the same physical size on a HiDPI surface.
+    const r = String(REMOTE_CONTACT_RADIUS * cursorScale);
+    for (const circle of this.remoteContacts) circle.setAttribute("r", r);
+    return this.remoteContacts;
   }
 
   /** Copy the shared backing canvas onto our visible canvas. */
@@ -1977,6 +2469,9 @@ export class BlitSurfaceCanvas {
   private resubscribe(): void {
     this.serverUnsubscribe();
     this.unsubscribeAll();
+    this.remoteInput = null;
+    this.remoteCursor = { kind: "named", name: "default" };
+    this.updateRemotePointerOverlay();
     this._hasBlitFirstFrame = false;
     if (!this.disposed) this.subscribe();
   }
@@ -2080,6 +2575,12 @@ export class BlitSurfaceCanvas {
     this.boundPointerMove = (e) => this.handlePointerMove(e);
     this.boundPointerUp = (e) => this.handlePointerUp(e);
     this.boundPointerCancel = (e) => this.handlePointerCancel(e);
+    // Nothing else tells the server the pointer stopped being over this
+    // surface, and without it every peer keeps drawing our ghost cursor frozen
+    // where we left it. `mouseleave` rather than `pointerleave`: a touch
+    // contact's implicit capture fires `pointerleave` on lift, which is a
+    // sequence end, not the pointer leaving the pane.
+    this.boundMouseLeave = () => this.sendPointerLeave();
     this.boundKeyDown = (e) => this.handleKey(e, true);
     this.boundKeyUp = (e) => this.handleKey(e, false);
     this.boundFocus = (e) => this.handleFocus(e);
@@ -2111,6 +2612,7 @@ export class BlitSurfaceCanvas {
     canvas.addEventListener("pointermove", this.boundPointerMove);
     canvas.addEventListener("pointerup", this.boundPointerUp);
     canvas.addEventListener("pointercancel", this.boundPointerCancel);
+    canvas.addEventListener("mouseleave", this.boundMouseLeave);
     canvas.addEventListener("touchstart", this.boundTouchStart, {
       passive: false,
     });
@@ -2203,6 +2705,7 @@ export class BlitSurfaceCanvas {
       if (this.textInput) this.textInput.focus({ preventScroll: true });
     };
     canvas.addEventListener("compositionstart", this.boundCompositionStart);
+    this.seedIOSInputPad();
   }
 
   private detachEvents(): void {
@@ -2228,6 +2731,8 @@ export class BlitSurfaceCanvas {
       canvas.removeEventListener("pointerup", this.boundPointerUp);
     if (this.boundPointerCancel)
       canvas.removeEventListener("pointercancel", this.boundPointerCancel);
+    if (this.boundMouseLeave)
+      canvas.removeEventListener("mouseleave", this.boundMouseLeave);
     if (this.boundTouchStart)
       canvas.removeEventListener("touchstart", this.boundTouchStart);
     if (this.boundTouchMove)
@@ -2295,6 +2800,10 @@ export class BlitSurfaceCanvas {
     this._pendingPaste = null;
     this._pendingPasteFlush = null;
     this._pendingPasteAbandon = null;
+    if (this._iosInputRepadTimer !== null) {
+      clearTimeout(this._iosInputRepadTimer);
+      this._iosInputRepadTimer = null;
+    }
 
     const ta = this.textInput;
     if (ta) {
@@ -2338,7 +2847,7 @@ export class BlitSurfaceCanvas {
     // messages ride the same connection, and the compositor advertises the
     // offer before it delivers the button.
     if (primary) this.getConn()?.sendPrimary(primary.mime, primary.data);
-    this.sendPointerAt(e.clientX, e.clientY, type, e.button);
+    this.sendPointerAt(e.clientX, e.clientY, type, e.button, e.timeStamp);
     if (
       type === SURFACE_POINTER_DOWN &&
       e.button === 0 &&
@@ -2388,7 +2897,7 @@ export class BlitSurfaceCanvas {
     if (type === SURFACE_POINTER_MOVE && !target) return;
     const receiver = target ?? this;
     routedGrabMouseEvents.add(e);
-    receiver.sendPointerAt(e.clientX, e.clientY, type, e.button);
+    receiver.sendPointerAt(e.clientX, e.clientY, type, e.button, e.timeStamp);
     if (type === SURFACE_POINTER_UP) {
       // The release may have been sent by another canvas, but the button was
       // recorded by the origin.  Clear both views of the physical grab.
@@ -2406,11 +2915,60 @@ export class BlitSurfaceCanvas {
     target?.focus({ preventScroll: true });
   }
 
+  private applyTextInputState(state: SurfaceTextInputEvent): void {
+    const ta = this.textInput;
+    if (!ta) return;
+
+    if (state.enabled) {
+      const inputMode = inputModeForContentPurpose(state.purpose);
+      ta.dataset.blitInputmode = inputMode;
+      // The app shell parks mobile inputs at `none` until it chooses to show
+      // the keyboard. Do not defeat that policy, but keep an already-enabled
+      // target in sync when content type changes without another enable.
+      if (ta.getAttribute("inputmode") !== "none") {
+        ta.setAttribute("inputmode", inputMode);
+      }
+      // ContentHint values from text-input-v3. These are advisory: mapping
+      // them onto the editable capture target lets the host keyboard match
+      // the remote field without pretending the textarea owns its contents.
+      const completion = (state.hint & 0x1) !== 0;
+      const spellcheck = (state.hint & 0x2) !== 0;
+      ta.setAttribute("autocorrect", completion || spellcheck ? "on" : "off");
+      ta.spellcheck = spellcheck;
+      if ((state.hint & 0x10) !== 0) {
+        ta.setAttribute("autocapitalize", "characters");
+      } else if ((state.hint & 0x20) !== 0) {
+        ta.setAttribute("autocapitalize", "words");
+      } else if ((state.hint & 0x4) !== 0) {
+        ta.setAttribute("autocapitalize", "sentences");
+      } else {
+        ta.setAttribute("autocapitalize", "none");
+      }
+    } else {
+      delete ta.dataset.blitInputmode;
+      if (ta.getAttribute("inputmode") !== "none") {
+        ta.removeAttribute("inputmode");
+      }
+      ta.setAttribute("autocorrect", "off");
+      ta.setAttribute("autocapitalize", "off");
+      ta.spellcheck = false;
+    }
+
+    ta.dispatchEvent(
+      new CustomEvent<SurfaceTextInputEvent>(BLIT_SURFACE_TEXT_INPUT_EVENT, {
+        bubbles: true,
+        composed: true,
+        detail: state,
+      }),
+    );
+  }
+
   private sendPointerAt(
     clientX: number,
     clientY: number,
     type: number,
     button: number,
+    timeMs = 0,
   ): void {
     const conn = this.getConn();
     if (!conn || !this.canvas || !this.surface || !this._displaySize) return;
@@ -2423,9 +2981,51 @@ export class BlitSurfaceCanvas {
     } else if (type === SURFACE_POINTER_UP) {
       this.pressedButtons.delete(button);
     }
-    const point = this.surfacePointFromClient(clientX, clientY);
+    const point = this.surfaceWirePoint(clientX, clientY);
     if (!point) return;
-    conn.sendSurfacePointer(this._surfaceId, type, button, point.x, point.y);
+    conn.sendSurfacePointer(
+      this._surfaceId,
+      type,
+      button,
+      point.x,
+      point.y,
+      timeMs,
+    );
+  }
+
+  /**
+   * A surface position ready for the wire.
+   *
+   * Every one of these coordinates is encoded into an unsigned 16-bit field, so
+   * a position outside the drawn frame — the letterbox margin of an
+   * `object-fit: contain` canvas, or a fractional `rect.left` against an integer
+   * `clientX` — would be sent as its two's-complement wrap. The server reads
+   * ~65535, and since it now mirrors these positions to other viewers, their
+   * overlay clamps the bogus value to the opposite edge. Use this for anything
+   * that reaches `C2S_SURFACE_POINTER` or `C2S_SURFACE_DRAG_*`.
+   */
+  private surfaceWirePoint(
+    clientX: number,
+    clientY: number,
+  ): { x: number; y: number } | null {
+    const point = this.surfacePointFromClient(clientX, clientY);
+    if (!point || !this.surface) return null;
+    return {
+      x: Math.min(Math.max(point.x, 0), Math.max(0, this.surface.width - 1)),
+      y: Math.min(Math.max(point.y, 0), Math.max(0, this.surface.height - 1)),
+    };
+  }
+
+  /** Retire this view's shared-pointer overlay on its peers. */
+  private sendPointerLeave(): void {
+    if (!this.surface) return;
+    this.getConn()?.sendSurfacePointer(
+      this._surfaceId,
+      SURFACE_POINTER_LEAVE,
+      0,
+      0,
+      0,
+    );
   }
 
   /**
@@ -2485,12 +3085,15 @@ export class BlitSurfaceCanvas {
   private surfacePointFromClient(
     clientX: number,
     clientY: number,
+    rounded = true,
   ): { x: number; y: number } | null {
     const g = this.drawnGeometry();
     if (!g) return null;
+    const x = (clientX - g.rect.left - g.dx) * g.sx;
+    const y = (clientY - g.rect.top - g.dy) * g.sy;
     return {
-      x: Math.round((clientX - g.rect.left - g.dx) * g.sx),
-      y: Math.round((clientY - g.rect.top - g.dy) * g.sy),
+      x: rounded ? Math.round(x) : x,
+      y: rounded ? Math.round(y) : y,
     };
   }
 
@@ -2520,6 +3123,106 @@ export class BlitSurfaceCanvas {
       clearTimeout(this.activeTouch.longPressTimer);
     }
     this.activeTouch = null;
+  }
+
+  private directTouchActive(): boolean {
+    return (
+      this._touchMode === "direct" && !!this.getConn()?.supportsSurfaceTouch
+    );
+  }
+
+  private syncTouchCapability(): void {
+    if (
+      this.disposed ||
+      !this.container ||
+      this._touchMode !== "direct" ||
+      this.touchCapabilityAcquired
+    )
+      return;
+    const conn = this.getConn();
+    if (!conn) return;
+    conn.acquireSurfaceTouch();
+    this.touchCapabilityAcquired = true;
+  }
+
+  private releaseTouchCapability(): void {
+    if (!this.touchCapabilityAcquired) return;
+    this.getConn()?.releaseSurfaceTouch();
+    this.touchCapabilityAcquired = false;
+  }
+
+  private cancelPointerTouchGesture(): void {
+    const active = this.activeTouch;
+    if (!active) return;
+    if (active.pointerId != null)
+      this.canvas?.releasePointerCapture?.(active.pointerId);
+    if (active.mode === "drag") {
+      this.sendPointerAt(active.lastX, active.lastY, SURFACE_POINTER_UP, 0);
+    } else if (active.mode === "scroll") {
+      this.endScrollSequence();
+    }
+    this.clearActiveTouch();
+  }
+
+  private cancelDirectTouches(): void {
+    if (this.directTouchIds.size === 0) return;
+    this.getConn()?.sendSurfaceTouch(this._surfaceId, SURFACE_TOUCH_CANCEL);
+    this.directTouchIds.clear();
+  }
+
+  private directTouchPoints(list: TouchList): {
+    identifier: number;
+    x: number;
+    y: number;
+  }[] {
+    const points: { identifier: number; x: number; y: number }[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const touch = list.item(i);
+      if (!touch) continue;
+      const point = this.surfacePointFromClient(
+        touch.clientX,
+        touch.clientY,
+        false,
+      );
+      if (!point) continue;
+      points.push({
+        identifier: touch.identifier,
+        x: point.x,
+        y: point.y,
+      });
+    }
+    return points;
+  }
+
+  private sendDirectTouch(e: TouchEvent, phase: number): void {
+    const points = this.directTouchPoints(e.changedTouches);
+    if (points.length === 0) return;
+    if (phase === SURFACE_TOUCH_DOWN) {
+      this.focusKeyboardTarget();
+      // A first contact starts a fresh sequence, so anything left in the set is
+      // a `touchend` the browser never delivered — it drops them when a contact
+      // leaves the element. Cancel rather than clearing locally: the server keeps
+      // its own live set, which is what peers' overlays draw and what pins the
+      // one-viewer touch lock. A purely local clear left a phantom ring on every
+      // peer and no other viewer able to touch at all.
+      if (
+        this.directTouchIds.size > 0 &&
+        e.touches.length === e.changedTouches.length
+      ) {
+        this.cancelDirectTouches();
+      }
+      for (const point of points) this.directTouchIds.add(point.identifier);
+    }
+    this.getConn()?.sendSurfaceTouch(
+      this._surfaceId,
+      phase,
+      points,
+      e.timeStamp,
+    );
+    if (phase === SURFACE_TOUCH_UP) {
+      for (const point of points) this.directTouchIds.delete(point.identifier);
+      if (e.touches.length === 0) this.directTouchIds.clear();
+    }
   }
 
   private findActiveTouch(list: TouchList): Touch | null {
@@ -2561,7 +3264,7 @@ export class BlitSurfaceCanvas {
     };
   }
 
-  private moveTouchGesture(clientX: number, clientY: number): void {
+  private moveTouchGesture(clientX: number, clientY: number, timeMs = 0): void {
     const active = this.activeTouch;
     if (!active) return;
 
@@ -2596,7 +3299,7 @@ export class BlitSurfaceCanvas {
     active.lastY = clientY;
 
     if (active.mode === "drag") {
-      this.sendPointerAt(clientX, clientY, SURFACE_POINTER_MOVE, 0);
+      this.sendPointerAt(clientX, clientY, SURFACE_POINTER_MOVE, 0, timeMs);
     } else if (active.mode === "scroll") {
       const g = this.drawnGeometry();
       if (!g) return;
@@ -2609,6 +3312,7 @@ export class BlitSurfaceCanvas {
           v120x: 0,
           v120y: 0,
           source: AXIS_SOURCE_FINGER,
+          timeMs,
         });
       }
     }
@@ -2642,11 +3346,16 @@ export class BlitSurfaceCanvas {
     if (e.pointerType === "mouse") return;
     if (!this.canvas || !this.surface || !this._displaySize) return;
     e.preventDefault();
+    if (e.pointerType === "touch" && this.directTouchActive()) return;
     this.canvas.setPointerCapture?.(e.pointerId);
     this.startTouchGesture(e.pointerId, e.clientX, e.clientY, e.pointerId);
   }
 
   private handlePointerMove(e: PointerEvent): void {
+    if (e.pointerType === "touch" && this.directTouchActive()) {
+      e.preventDefault();
+      return;
+    }
     const active = this.activeTouch;
     if (
       e.pointerType === "mouse" ||
@@ -2655,10 +3364,14 @@ export class BlitSurfaceCanvas {
     )
       return;
     e.preventDefault();
-    this.moveTouchGesture(e.clientX, e.clientY);
+    this.moveTouchGesture(e.clientX, e.clientY, e.timeStamp);
   }
 
   private handlePointerUp(e: PointerEvent): void {
+    if (e.pointerType === "touch" && this.directTouchActive()) {
+      e.preventDefault();
+      return;
+    }
     const active = this.activeTouch;
     if (
       e.pointerType === "mouse" ||
@@ -2672,6 +3385,10 @@ export class BlitSurfaceCanvas {
   }
 
   private handlePointerCancel(e: PointerEvent): void {
+    if (e.pointerType === "touch" && this.directTouchActive()) {
+      e.preventDefault();
+      return;
+    }
     const active = this.activeTouch;
     if (
       e.pointerType === "mouse" ||
@@ -2699,6 +3416,20 @@ export class BlitSurfaceCanvas {
     // `touch-action: none` and owns every gesture on it, so there is no
     // default here worth keeping.
     e.preventDefault();
+    if (
+      this._touchMode === "direct" &&
+      !this.directTouchActive() &&
+      this.directTouchIds.size > 0
+    ) {
+      // A reconnect to a server without the feature already terminated the
+      // old server-side sequence. Do not let its browser identifiers leak
+      // into the pointer fallback's next gesture.
+      this.directTouchIds.clear();
+    }
+    if (this.directTouchActive()) {
+      this.sendDirectTouch(e, SURFACE_TOUCH_DOWN);
+      return;
+    }
     if (this.activeTouch?.pointerId != null) return;
     if (e.touches.length !== 1) {
       this.handleTouchCancel(e);
@@ -2711,11 +3442,15 @@ export class BlitSurfaceCanvas {
 
   private handleTouchMove(e: TouchEvent): void {
     e.preventDefault();
+    if (this.directTouchIds.size > 0 && this.directTouchActive()) {
+      this.sendDirectTouch(e, SURFACE_TOUCH_MOTION);
+      return;
+    }
     const active = this.activeTouch;
     if (!active || active.pointerId != null) return;
     const touch = this.findActiveTouch(e.touches);
     if (!touch) return;
-    this.moveTouchGesture(touch.clientX, touch.clientY);
+    this.moveTouchGesture(touch.clientX, touch.clientY, e.timeStamp);
   }
 
   private handleTouchEnd(e: TouchEvent): void {
@@ -2723,6 +3458,10 @@ export class BlitSurfaceCanvas {
     // already ended the gesture and nulled activeTouch by the time this
     // runs, so cancel the default first or the guards below skip it.
     e.preventDefault();
+    if (this.directTouchIds.size > 0 && this.directTouchActive()) {
+      this.sendDirectTouch(e, SURFACE_TOUCH_UP);
+      return;
+    }
     const active = this.activeTouch;
     if (!active) return;
     const touch = this.findActiveTouch(e.changedTouches);
@@ -2752,16 +3491,15 @@ export class BlitSurfaceCanvas {
   }
 
   private handleTouchCancel(e: TouchEvent): void {
+    if (this.directTouchIds.size > 0 && this.directTouchActive()) {
+      e.preventDefault();
+      this.cancelDirectTouches();
+      return;
+    }
     const active = this.activeTouch;
     if (!active) return;
     e.preventDefault();
-    if (active.longPressTimer) clearTimeout(active.longPressTimer);
-    if (active.mode === "drag") {
-      this.sendPointerAt(active.lastX, active.lastY, SURFACE_POINTER_UP, 0);
-    } else if (active.mode === "scroll") {
-      this.endScrollSequence();
-    }
-    this.activeTouch = null;
+    this.cancelPointerTouchGesture();
   }
 
   /**
@@ -2819,19 +3557,49 @@ export class BlitSurfaceCanvas {
     return open;
   }
 
+  /**
+   * Report a swallowed wheel event once per reason.
+   *
+   * Every gate below is per-pane state, so any of them can silence one
+   * pane's wheel while its neighbours scroll normally — and all of them
+   * used to do it silently, which is unfalsifiable from the outside. Once
+   * per reason, because a stuck gate is re-hit at the wheel's event rate,
+   * and the set is cleared by the next wheel that gets through so a
+   * recurrence is reported again.
+   */
+  private reportWheelIgnored(reason: string): void {
+    if (this.wheelIgnoredReported.has(reason)) return;
+    this.wheelIgnoredReported.add(reason);
+    console.warn(
+      `blit: surface ${this._surfaceId} ignored a wheel (${reason})`,
+    );
+  }
+
   private handleWheel(e: WheelEvent): void {
     // No display size means a thumbnail rather than a live view, and
     // those take no other input either. Claiming the wheel there would
     // scroll an app the user is only previewing, and the preventDefault
     // below would stop the page scrolling under the cursor.
     const conn = this.getConn();
-    if (!conn || !this.surface || !this._displaySize) return;
+    if (!conn) return this.reportWheelIgnored("no connection");
+    if (!this.surface) {
+      return this.reportWheelIgnored("no surface entry in the store");
+    }
+    if (!this._displaySize) {
+      return this.reportWheelIgnored(
+        "no display size (preview, or an unmeasured pane)",
+      );
+    }
     // Ctrl+wheel is how browsers report a pinch-zoom gesture, including
     // macOS trackpad pinches. It is a zoom request, not a scroll; sending
-    // it on would scroll the surface while the user pinches.
+    // it on would scroll the surface while the user pinches. Deliberate,
+    // so it is not reported.
     if (e.ctrlKey) return;
     const g = this.drawnGeometry();
-    if (!g) return;
+    if (!g) {
+      return this.reportWheelIgnored("canvas or CSS box measures zero");
+    }
+    this.wheelIgnoredReported.clear();
     e.preventDefault();
     // Alt+scroll is a real chord (horizontal scroll, zoom in some apps):
     // a held-back Alt press belongs ahead of the axis events.  No-op when
@@ -2880,6 +3648,7 @@ export class BlitSurfaceCanvas {
       v120x,
       v120y,
       source,
+      timeMs: e.timeStamp,
     });
   }
 
@@ -2898,14 +3667,22 @@ export class BlitSurfaceCanvas {
     v120x: number;
     v120y: number;
     source: number;
+    timeMs?: number;
   }): void {
     const source = this.latchScrollSource(part.source);
     this.scrollSequenceOpen = true;
-    const a = (this.scrollAccum ??= { dx: 0, dy: 0, v120x: 0, v120y: 0 });
+    const a = (this.scrollAccum ??= {
+      dx: 0,
+      dy: 0,
+      v120x: 0,
+      v120y: 0,
+      timeMs: 0,
+    });
     a.dx += part.dx;
     a.dy += part.dy;
     a.v120x += part.v120x;
     a.v120y += part.v120y;
+    a.timeMs = Math.max(a.timeMs, part.timeMs ?? 0);
 
     if (source === AXIS_SOURCE_CONTINUOUS) {
       if (this.scrollFlushHandle !== null) {
@@ -2931,8 +3708,17 @@ export class BlitSurfaceCanvas {
     this.scrollAccum = null;
     if (!a) return;
     const conn = this.getConn();
-    if (!conn || !this.surface) return;
-    if (a.dx === 0 && a.dy === 0 && a.v120x === 0 && a.v120y === 0) return;
+    if (!conn || !this.surface) {
+      return this.reportWheelIgnored(
+        "connection or surface lost before the flush",
+      );
+    }
+    if (a.dx === 0 && a.dy === 0 && a.v120x === 0 && a.v120y === 0) {
+      // `drawnGeometry`'s sx/sy come from the surface's own dimensions, so a
+      // surface reported as zero-sized scales every delta to nothing and the
+      // pane looks dead rather than slow.
+      return this.reportWheelIgnored("accumulated delta scaled to zero");
+    }
     conn.sendSurfaceAxis2(this._surfaceId, {
       dx: a.dx,
       dy: a.dy,
@@ -2940,6 +3726,7 @@ export class BlitSurfaceCanvas {
       v120y: a.v120y,
       source: this.scrollSource ?? AXIS_SOURCE_CONTINUOUS,
       stop: false,
+      timeMs: a.timeMs,
     });
   }
 
@@ -2993,7 +3780,7 @@ export class BlitSurfaceCanvas {
     if (!mimes) return;
     const conn = this.getConn();
     if (!conn || !this.surface || !this._displaySize) return;
-    const point = this.surfacePointFromClient(e.clientX, e.clientY);
+    const point = this.surfaceWirePoint(e.clientX, e.clientY);
     if (!point) return;
     // WebKit's target contract asks both ENTER and OVER to prevent default.
     // In particular, accepting only OVER is not enough for every iPad drag
@@ -3034,7 +3821,7 @@ export class BlitSurfaceCanvas {
     if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
     const conn = this.getConn();
     if (!conn || !this.surface || !this._displaySize) return;
-    const point = this.surfacePointFromClient(e.clientX, e.clientY);
+    const point = this.surfaceWirePoint(e.clientX, e.clientY);
     if (!point) return;
     this.dragLastPoint = point;
     // Unthrottled, like pointer motion — the events fire continuously.
@@ -3105,7 +3892,7 @@ export class BlitSurfaceCanvas {
       conn.sendSurfaceDragCancel();
       return;
     }
-    const eventPoint = this.surfacePointFromClient(e.clientX, e.clientY);
+    const eventPoint = this.surfaceWirePoint(e.clientX, e.clientY);
     const point =
       lastPoint && e.clientX === 0 && e.clientY === 0
         ? lastPoint
@@ -3180,7 +3967,7 @@ export class BlitSurfaceCanvas {
     files: File[],
     plannedNames: readonly string[] | null,
   ): Promise<void> {
-    const totalBytes = files.reduce((total, file) => total + file.size, 0);
+    let totalBytes = files.reduce((total, file) => total + file.size, 0);
     const firstName =
       files[0]?.name ||
       (files[0]
@@ -3199,7 +3986,7 @@ export class BlitSurfaceCanvas {
     let completedBytes = 0;
     try {
       const knownMimes = files.map(materializedDropMimeFromMetadata);
-      const materializedMimes = knownMimes.every(
+      let materializedMimes = knownMimes.every(
         (mime): mime is string => mime !== null,
       )
         ? knownMimes
@@ -3208,6 +3995,29 @@ export class BlitSurfaceCanvas {
               (file, index) => knownMimes[index] ?? materializedDropMime(file),
             ),
           );
+      if (
+        isIPadOS() &&
+        materializedMimes.some(
+          (mime) => mime === "image/heic" || mime === "image/heif",
+        )
+      ) {
+        const compatible = await Promise.all(
+          files.map((file, index) =>
+            compatibleIPadDropFile(file, materializedMimes[index]),
+          ),
+        );
+        files = compatible.map((item) => item.file);
+        materializedMimes = compatible.map((item) => item.mime);
+        totalBytes = files.reduce((total, file) => total + file.size, 0);
+        activity?.update({
+          label:
+            files.length === 1
+              ? files[0].name || plannedDropName(materializedMimes[0], 0)
+              : `${files.length} files`,
+          completed: 0,
+          total: totalBytes,
+        });
+      }
       const materializedNames = materializedMimes.map((mime, index) =>
         plannedDropName(mime, index),
       );
@@ -3806,7 +4616,10 @@ export class BlitSurfaceCanvas {
         if (!this.pressedKeys.has(keycode)) return;
         this.pressedKeys.delete(keycode);
       }
-      conn.sendSurfaceInput(this._surfaceId, keycode, pressed);
+      // The one real browser key event in this handler. The chord and modifier
+      // keys synthesised around it carry no time, which the compositor takes as
+      // "use your own clock" without disturbing the anchor.
+      conn.sendSurfaceInput(this._surfaceId, keycode, pressed, e.timeStamp);
       // If this was the paste-chord key being released, flush any
       // deferred Ctrl release that was held back while V was still down.
       if (!pressed && keycode === this._metaToCtrlKey) {
@@ -3863,6 +4676,38 @@ export class BlitSurfaceCanvas {
     return true;
   }
 
+  /** Seed the hidden textarea with deletable filler and park its caret at the
+   *  end. The filler is never forwarded to the Wayland client. */
+  private seedIOSInputPad(): void {
+    if (!this._iosInputPad || !this.textInput) return;
+    if (this._iosInputRepadTimer !== null) {
+      clearTimeout(this._iosInputRepadTimer);
+      this._iosInputRepadTimer = null;
+    }
+    this.textInput.value = IOS_INPUT_PAD;
+    const end = IOS_INPUT_PAD.length;
+    try {
+      this.textInput.setSelectionRange(end, end);
+    } catch {
+      // Detached/hidden fields can reject selection changes in some engines.
+    }
+  }
+
+  private scheduleIOSInputRepad(): void {
+    if (!this._iosInputPad) return;
+    if (this._iosInputRepadTimer !== null)
+      clearTimeout(this._iosInputRepadTimer);
+    this._iosInputRepadTimer = setTimeout(() => {
+      this._iosInputRepadTimer = null;
+      this.seedIOSInputPad();
+    }, 400);
+  }
+
+  private resetTextInput(): void {
+    if (this._iosInputPad) this.seedIOSInputPad();
+    else if (this.textInput) this.textInput.value = "";
+  }
+
   /** Handle text input from the hidden textarea. */
   private handleTextInput(e: InputEvent): void {
     const ta = this.textInput;
@@ -3875,7 +4720,13 @@ export class BlitSurfaceCanvas {
     if (e.isComposing) {
       const conn = this.getConn();
       if (conn && this.surface && this._displaySize && ta) {
-        conn.sendSurfacePreedit(this._surfaceId, ta.value, ta.selectionStart);
+        const text = this._iosInputPad ? stripIOSInputPad(ta.value) : ta.value;
+        const padLength = ta.value.length - text.length;
+        conn.sendSurfacePreedit(
+          this._surfaceId,
+          text,
+          Math.max(0, ta.selectionStart - padLength),
+        );
       }
       return;
     }
@@ -3890,9 +4741,22 @@ export class BlitSurfaceCanvas {
               ? this.sendOneShotModifiedKey("Backspace", "Backspace", false)
               : false;
       if (modified) {
-        if (ta) ta.value = "";
+        this.resetTextInput();
         return;
       }
+    }
+    // iOS consumes one filler character per native Backspace repeat. Leave
+    // the shortened value in place during the burst: clearing or re-seeding
+    // it here makes WebKit stop after the first deletion.
+    if (this._iosInputPad && e.inputType === "deleteContentBackward") {
+      const conn = this.getConn();
+      if (conn && this.surface && this._displaySize) {
+        conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Backspace, true);
+        conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Backspace, false);
+      }
+      if (ta && ta.value.length <= 4) this.seedIOSInputPad();
+      else this.scheduleIOSInputRepad();
+      return;
     }
     // Any keydown handleKey processed was preventDefault'ed, which cancels
     // its input event — so what reaches here is text the keyboard delivered
@@ -3913,7 +4777,7 @@ export class BlitSurfaceCanvas {
         conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Backspace, false);
       }
     }
-    if (ta) ta.value = "";
+    this.resetTextInput();
   }
 
   /** Handle IME composition end — send the composed text. */
@@ -3930,7 +4794,7 @@ export class BlitSurfaceCanvas {
       // preedit still on screen.
       conn.sendSurfacePreedit(this._surfaceId, "", 0);
     }
-    ta.value = "";
+    this.resetTextInput();
     // Focus stays here.  Handing it back to the canvas would end the next
     // composition before it started, and the keydown/keyup handlers the
     // canvas would take back are already attached to this element.
@@ -4071,6 +4935,7 @@ export class BlitSurfaceCanvas {
       // Its own focus event sends the surface focus — one message, not two.
       return;
     }
+    if (e.target === this.textInput) this.seedIOSInputPad();
     const conn = this.getConn();
     if (!conn || !this.surface || !this._displaySize) return;
     conn.sendSurfaceFocus(this._surfaceId);

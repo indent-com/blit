@@ -235,10 +235,24 @@ pub const C2S_SCROLL_BY: u8 = 0x1E;
 /// data contains evdev keycodes encoded as [keycode:4][pressed:1] sequences.
 pub const C2S_SURFACE_INPUT: u8 = 0x20;
 /// Pointer motion/button for a Wayland surface: [0x21][surface_id:2][type:1][button:1][x:2][y:2]
-/// type: 0=down, 1=up, 2=move
+/// Followed by `[time_ms:4]` — the browser event's own `timeStamp` in whole ms,
+/// `0` for unknown.  Anything differentiating pointer motion (a gesture
+/// recogniser, a stroke width, a drag-throw) needs the browser's spacing, not the
+/// instant our command queue happened to be drained.
+/// type: 0=down, 1=up, 2=move, 3=leave
 /// button: DOM numbering — 0=left, 1=middle, 2=right, 3=back, 4=forward
-/// x,y: pixel coordinates relative to the surface origin
+/// x,y: unsigned pixel coordinates relative to the surface origin, clamped
+/// into it by the sender — the field cannot express a negative position
 pub const C2S_SURFACE_POINTER: u8 = 0x21;
+/// The `type` byte of [`C2S_SURFACE_POINTER`].
+pub const SURFACE_POINTER_DOWN: u8 = 0;
+pub const SURFACE_POINTER_UP: u8 = 1;
+pub const SURFACE_POINTER_MOVE: u8 = 2;
+/// The pointer left the surface's drawn area.  `x`/`y` are meaningless; it
+/// exists so the shared-pointer overlay can be retired on the peers drawing
+/// it, instead of freezing at the last in-surface position forever.  Servers
+/// predating it ignore unknown types, so it needs no feature bit.
+pub const SURFACE_POINTER_LEAVE: u8 = 3;
 /// Pointer axis/scroll for a Wayland surface: [0x22][surface_id:2][axis:1][value_x100:4_signed]
 /// axis: 0=vertical, 1=horizontal
 /// value_x100: scroll amount * 100 (signed, positive = down/right)
@@ -394,6 +408,21 @@ pub const C2S_SURFACE_DRAG_LEAVE: u8 = 0x37;
 pub const C2S_SURFACE_DRAG_DROP: u8 = 0x38;
 /// Abort the drag (Escape, or the drag left the window): [0x39].  No payload.
 pub const C2S_SURFACE_DRAG_CANCEL: u8 = 0x39;
+/// Direct touchscreen input for a Wayland surface.
+///
+/// `[0x3A][surface_id:2][phase:1][contact_count:1][contacts...]`, where a
+/// contact is `[identifier:4][x_x100:4][y_x100:4]`. Coordinates use the
+/// composited frame's physical pixel space, like [`C2S_SURFACE_POINTER`].
+/// One contact message is one browser `TouchEvent`, so its boundary becomes
+/// one `wl_touch.frame`. Enable/disable/cancel carry no contacts.
+pub const C2S_SURFACE_TOUCH: u8 = 0x3A;
+
+pub const SURFACE_TOUCH_DOWN: u8 = 0;
+pub const SURFACE_TOUCH_UP: u8 = 1;
+pub const SURFACE_TOUCH_MOTION: u8 = 2;
+pub const SURFACE_TOUCH_CANCEL: u8 = 3;
+pub const SURFACE_TOUCH_ENABLE: u8 = 4;
+pub const SURFACE_TOUCH_DISABLE: u8 = 5;
 /// Read clipboard content for a specific MIME type:
 /// [0x2E][mime_len:2][mime:N]
 /// Server responds with S2C_CLIPBOARD_CONTENT (0x25) containing the data.
@@ -592,6 +621,39 @@ pub const S2C_CLIPBOARD_LIST: u8 = 0x2C;
 /// must not replace it; `0` means the selection is empty or externally owned.
 pub const S2C_CLIPBOARD_OWNER: u8 = 0x2E;
 
+/// Committed `zwp_text_input_v3` state for a Wayland toplevel:
+/// [0x2F][surface_id:2][flags:1][content_hint:4][content_purpose:4].
+///
+/// `SURFACE_TEXT_INPUT_ENABLED` says the currently entered surface accepts
+/// text input. `SURFACE_TEXT_INPUT_REQUESTED` is set only on a freshly
+/// committed `enable`, so metadata updates and reconnect replay do not reopen
+/// a virtual keyboard the user dismissed.
+pub const S2C_SURFACE_TEXT_INPUT: u8 = 0x2F;
+pub const SURFACE_TEXT_INPUT_ENABLED: u8 = 1 << 0;
+pub const SURFACE_TEXT_INPUT_REQUESTED: u8 = 1 << 1;
+
+/// Where another viewer is currently touching or pointing at a surface:
+/// [0x31][surface_id:2][kind:1][count:1][x:2,y:2]*.
+///
+/// Marks are held per `(surface, kind)`: per surface because one user's fingers
+/// can span two panes, and per kind because a touchscreen laptop drives a mouse
+/// and a touchscreen at once. `count = 0` means "draw nothing of this kind" and
+/// is what the driving viewer itself always receives — its own cursor and its own
+/// fingers are already on its screen — as well as what everyone receives when
+/// that kind of input is retired.
+///
+/// `kind` therefore matters even when `count = 0`: a retire withdraws only its
+/// own kind, so lifting a finger does not erase the same viewer's live cursor.
+///
+/// Coordinates are in the composited frame's pixel space, clamped into the
+/// surface by the sender because the fields are unsigned.
+pub const S2C_SURFACE_REMOTE_INPUT: u8 = 0x31;
+
+/// `kind` of [`S2C_SURFACE_REMOTE_INPUT`]: one mouse/trackpad position.
+pub const REMOTE_INPUT_POINTER: u8 = 0;
+/// `kind` of [`S2C_SURFACE_REMOTE_INPUT`]: live touchscreen contacts.
+pub const REMOTE_INPUT_TOUCH: u8 = 1;
+
 // -- Audio forwarding ---------------------------------------------------
 
 /// Subscribe to audio: [0x30][bitrate_kbps:2]
@@ -757,6 +819,12 @@ pub const FEATURE_PTY_DEADLINE: u32 = 1 << 16;
 /// scrolled client and reports it with [`S2C_SCROLL_OFFSET`], and accepts
 /// the relative [`C2S_SCROLL_BY`] that goes with it.
 pub const FEATURE_SCROLL_BY: u32 = 1 << 17;
+/// Direct browser touch contacts delivered as core Wayland `wl_touch`
+/// events. Pointer-style touch emulation remains available client-side.
+pub const FEATURE_SURFACE_TOUCH: u32 = 1 << 18;
+/// Wayland `zwp_text_input_v3` enable/disable and content type are forwarded
+/// to surface viewers so they can present an appropriate virtual keyboard.
+pub const FEATURE_SURFACE_TEXT_INPUT: u32 = 1 << 19;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {
@@ -2165,6 +2233,13 @@ pub enum ServerMsg<'a> {
     SurfaceActivated {
         surface_id: u16,
     },
+    SurfaceTextInput {
+        surface_id: u16,
+        enabled: bool,
+        requested: bool,
+        hint: u32,
+        purpose: u32,
+    },
     SurfaceResized {
         surface_id: u16,
         width: u16,
@@ -2521,6 +2596,19 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             }
             Some(ServerMsg::SurfaceActivated {
                 surface_id: u16::from_le_bytes([data[1], data[2]]),
+            })
+        }
+        S2C_SURFACE_TEXT_INPUT => {
+            if data.len() < 12 {
+                return None;
+            }
+            let flags = data[3];
+            Some(ServerMsg::SurfaceTextInput {
+                surface_id: u16::from_le_bytes([data[1], data[2]]),
+                enabled: flags & SURFACE_TEXT_INPUT_ENABLED != 0,
+                requested: flags & SURFACE_TEXT_INPUT_REQUESTED != 0,
+                hint: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
+                purpose: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
             })
         }
         S2C_SURFACE_RESIZED => {
@@ -3198,6 +3286,25 @@ pub fn msg_surface_activated(surface_id: u16) -> Vec<u8> {
     msg
 }
 
+pub fn msg_surface_text_input(
+    surface_id: u16,
+    enabled: bool,
+    requested: bool,
+    hint: u32,
+    purpose: u32,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(12);
+    msg.push(S2C_SURFACE_TEXT_INPUT);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.push(
+        (u8::from(enabled) * SURFACE_TEXT_INPUT_ENABLED)
+            | (u8::from(requested && enabled) * SURFACE_TEXT_INPUT_REQUESTED),
+    );
+    msg.extend_from_slice(&hint.to_le_bytes());
+    msg.extend_from_slice(&purpose.to_le_bytes());
+    msg
+}
+
 /// Build S2C_SURFACE_ENCODER: `[0x2A][surface_id:2][name\0codec_string]`.
 /// The codec_string is the WebCodecs codec string (e.g. "av01.2.05M.08")
 /// appended after a NUL separator.  Old clients that don't split on NUL
@@ -3251,11 +3358,30 @@ pub fn msg_s2c_clipboard_owner(wayland: bool) -> Vec<u8> {
     vec![S2C_CLIPBOARD_OWNER, u8::from(wayland)]
 }
 
-pub fn msg_surface_input(surface_id: u16, data: &[u8]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(3 + data.len());
+/// Mirror another viewer's live input marks, or retire them with an empty
+/// `points`.
+pub fn msg_s2c_surface_remote_input(surface_id: u16, kind: u8, points: &[(u16, u16)]) -> Vec<u8> {
+    let count = points.len().min(u8::MAX as usize);
+    let mut msg = Vec::with_capacity(5 + count * 4);
+    msg.push(S2C_SURFACE_REMOTE_INPUT);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.push(kind);
+    msg.push(count as u8);
+    for &(x, y) in points.iter().take(count) {
+        msg.extend_from_slice(&x.to_le_bytes());
+        msg.extend_from_slice(&y.to_le_bytes());
+    }
+    msg
+}
+
+/// `data` is `[keycode:4][pressed:1]`; `time_ms` is the browser key event's own
+/// `timeStamp`, or `0` when the caller synthesised the key itself.
+pub fn msg_surface_input(surface_id: u16, data: &[u8], time_ms: u32) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(7 + data.len());
     msg.push(C2S_SURFACE_INPUT);
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(data);
+    msg.extend_from_slice(&time_ms.to_le_bytes());
     msg
 }
 
@@ -3295,10 +3421,15 @@ pub struct PointerAxisEvent {
     pub v120_y: i16,
     pub source: Option<u8>,
     pub stop: bool,
+    /// The browser wheel event's own `timeStamp`, in whole ms. Toolkits integrate
+    /// axis deltas against `wl_pointer.axis` timestamps for kinetic scrolling, so
+    /// the spacing has to be the browser's rather than our command-drain clock.
+    /// `0` means "unknown", and the compositor falls back to its own clock.
+    pub time_ms: u32,
 }
 
 /// Wire size of a [`C2S_SURFACE_POINTER_AXIS2`] message.
-pub const SURFACE_POINTER_AXIS2_LEN: usize = 16;
+pub const SURFACE_POINTER_AXIS2_LEN: usize = 20;
 
 pub fn msg_surface_pointer_axis2(ev: &PointerAxisEvent) -> Vec<u8> {
     let mut flags = match ev.source {
@@ -3316,6 +3447,7 @@ pub fn msg_surface_pointer_axis2(ev: &PointerAxisEvent) -> Vec<u8> {
     msg.extend_from_slice(&scroll_to_x100(ev.dy).to_le_bytes());
     msg.extend_from_slice(&ev.v120_x.to_le_bytes());
     msg.extend_from_slice(&ev.v120_y.to_le_bytes());
+    msg.extend_from_slice(&ev.time_ms.to_le_bytes());
     msg
 }
 
@@ -3346,6 +3478,81 @@ pub fn parse_surface_pointer_axis2(data: &[u8]) -> Option<PointerAxisEvent> {
         v120_y: i16::from_le_bytes([data[14], data[15]]),
         source: (flags & AXIS_FLAG_SOURCE_KNOWN != 0).then_some(flags & 0b11),
         stop: flags & AXIS_FLAG_STOP != 0,
+        time_ms: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
+    })
+}
+
+/// One browser touch contact in composited-frame coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceTouchPoint {
+    pub identifier: i32,
+    pub x: f64,
+    pub y: f64,
+}
+
+/// A complete browser `TouchEvent`. The transport message boundary is also
+/// the Wayland frame boundary, so contacts changed together stay atomic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceTouchEvent {
+    pub surface_id: u16,
+    pub phase: u8,
+    /// The browser's own `TouchEvent.timeStamp`, in whole milliseconds.
+    ///
+    /// Apps derive fling velocity from the spacing between motion events, so the
+    /// spacing has to be the browser's. Stamping on arrival collapses a burst of
+    /// coalesced moves to one instant (the compositor drains its command queue in
+    /// one pass), and over a network it substitutes jitter for real cadence.
+    /// The epoch is the client's, so it is only ever used as a delta.
+    pub time_ms: u32,
+    pub contacts: Vec<SurfaceTouchPoint>,
+}
+
+const SURFACE_TOUCH_HEADER_LEN: usize = 9;
+const SURFACE_TOUCH_POINT_LEN: usize = 12;
+
+pub fn msg_surface_touch(event: &SurfaceTouchEvent) -> Vec<u8> {
+    let count = event.contacts.len().min(u8::MAX as usize);
+    let mut msg = Vec::with_capacity(SURFACE_TOUCH_HEADER_LEN + count * SURFACE_TOUCH_POINT_LEN);
+    msg.push(C2S_SURFACE_TOUCH);
+    msg.extend_from_slice(&event.surface_id.to_le_bytes());
+    msg.push(event.phase);
+    msg.push(count as u8);
+    msg.extend_from_slice(&event.time_ms.to_le_bytes());
+    for point in event.contacts.iter().take(count) {
+        msg.extend_from_slice(&point.identifier.to_le_bytes());
+        msg.extend_from_slice(&scroll_to_x100(point.x).to_le_bytes());
+        msg.extend_from_slice(&scroll_to_x100(point.y).to_le_bytes());
+    }
+    msg
+}
+
+pub fn parse_surface_touch(data: &[u8]) -> Option<SurfaceTouchEvent> {
+    if data.len() < SURFACE_TOUCH_HEADER_LEN || data[0] != C2S_SURFACE_TOUCH {
+        return None;
+    }
+    let phase = data[3];
+    if phase > SURFACE_TOUCH_DISABLE {
+        return None;
+    }
+    let count = data[4] as usize;
+    let required =
+        SURFACE_TOUCH_HEADER_LEN.checked_add(count.checked_mul(SURFACE_TOUCH_POINT_LEN)?)?;
+    if data.len() < required {
+        return None;
+    }
+    let mut contacts = Vec::with_capacity(count);
+    for bytes in data[SURFACE_TOUCH_HEADER_LEN..required].chunks_exact(SURFACE_TOUCH_POINT_LEN) {
+        contacts.push(SurfaceTouchPoint {
+            identifier: i32::from_le_bytes(bytes[0..4].try_into().ok()?),
+            x: f64::from(i32::from_le_bytes(bytes[4..8].try_into().ok()?)) / 100.0,
+            y: f64::from(i32::from_le_bytes(bytes[8..12].try_into().ok()?)) / 100.0,
+        });
+    }
+    Some(SurfaceTouchEvent {
+        surface_id: u16::from_le_bytes([data[1], data[2]]),
+        phase,
+        time_ms: u32::from_le_bytes([data[5], data[6], data[7], data[8]]),
+        contacts,
     })
 }
 
@@ -4472,11 +4679,112 @@ mod tests {
             v120_y: -240,
             source: Some(AXIS_SOURCE_WHEEL),
             stop: false,
+            time_ms: 0,
         };
         let msg = msg_surface_pointer_axis2(&ev);
         assert_eq!(msg.len(), SURFACE_POINTER_AXIS2_LEN);
         assert_eq!(msg[0], C2S_SURFACE_POINTER_AXIS2);
         assert_eq!(parse_surface_pointer_axis2(&msg), Some(ev));
+    }
+
+    #[test]
+    fn surface_touch_round_trips_as_one_frame() {
+        let event = SurfaceTouchEvent {
+            surface_id: 0x1234,
+            phase: SURFACE_TOUCH_MOTION,
+            time_ms: 0x0102_0304,
+            contacts: vec![
+                SurfaceTouchPoint {
+                    identifier: -7,
+                    x: 12.25,
+                    y: -3.5,
+                },
+                SurfaceTouchPoint {
+                    identifier: 9,
+                    x: 640.0,
+                    y: 480.75,
+                },
+            ],
+        };
+        let msg = msg_surface_touch(&event);
+        assert_eq!(msg[0], C2S_SURFACE_TOUCH);
+        assert_eq!(
+            msg.len(),
+            SURFACE_TOUCH_HEADER_LEN + 2 * SURFACE_TOUCH_POINT_LEN
+        );
+        // The browser's own event time rides in the header: apps derive fling
+        // velocity from the spacing between motions, so it cannot be stamped on
+        // arrival.
+        assert_eq!(&msg[5..9], &[0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(parse_surface_touch(&msg), Some(event));
+    }
+
+    #[test]
+    fn surface_touch_rejects_truncation_and_unknown_phases() {
+        let event = SurfaceTouchEvent {
+            surface_id: 1,
+            phase: SURFACE_TOUCH_DOWN,
+            time_ms: 7,
+            contacts: vec![SurfaceTouchPoint {
+                identifier: 2,
+                x: 3.0,
+                y: 4.0,
+            }],
+        };
+        let msg = msg_surface_touch(&event);
+        assert!(parse_surface_touch(&msg[..msg.len() - 1]).is_none());
+        let mut bad = msg;
+        bad[3] = SURFACE_TOUCH_DISABLE + 1;
+        assert!(parse_surface_touch(&bad).is_none());
+    }
+
+    #[test]
+    fn remote_input_marks_have_a_fixed_layout() {
+        assert_eq!(
+            msg_s2c_surface_remote_input(0x1234, REMOTE_INPUT_POINTER, &[(0x5678, 0x9abc)]),
+            [
+                S2C_SURFACE_REMOTE_INPUT,
+                0x34,
+                0x12,
+                REMOTE_INPUT_POINTER,
+                1,
+                0x78,
+                0x56,
+                0xbc,
+                0x9a
+            ]
+        );
+        // Several contacts of one touchscreen ride in one message: they are
+        // simultaneous, so a viewer must not draw them a frame apart.
+        assert_eq!(
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_TOUCH, &[(1, 2), (0x102, 0x304)]),
+            [
+                S2C_SURFACE_REMOTE_INPUT,
+                7,
+                0,
+                REMOTE_INPUT_TOUCH,
+                2,
+                1,
+                0,
+                2,
+                0,
+                0x02,
+                0x01,
+                0x04,
+                0x03
+            ]
+        );
+        // Retirement carries no points but still names its kind, so it withdraws
+        // only those marks and leaves the same viewer's other kind alone — a
+        // pointer retire must not erase live fingers.
+        assert_eq!(
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_POINTER, &[]),
+            [S2C_SURFACE_REMOTE_INPUT, 7, 0, REMOTE_INPUT_POINTER, 0]
+        );
+        assert_eq!(
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_TOUCH, &[]),
+            [S2C_SURFACE_REMOTE_INPUT, 7, 0, REMOTE_INPUT_TOUCH, 0]
+        );
     }
 
     // Drag-and-drop codecs are pinned byte-for-byte: js/core builds these
@@ -4680,6 +4988,7 @@ mod tests {
             v120_y: 0,
             source,
             stop: false,
+            time_ms: 0,
         };
         let wheel =
             parse_surface_pointer_axis2(&msg_surface_pointer_axis2(&mk(Some(AXIS_SOURCE_WHEEL))))
@@ -4699,6 +5008,7 @@ mod tests {
             v120_y: 0,
             source: Some(AXIS_SOURCE_FINGER),
             stop: true,
+            time_ms: 0,
         };
         let parsed = parse_surface_pointer_axis2(&msg_surface_pointer_axis2(&ev)).unwrap();
         assert!(parsed.stop);
@@ -4715,6 +5025,7 @@ mod tests {
             v120_y: 0,
             source: None,
             stop: false,
+            time_ms: 0,
         });
         assert!(parse_surface_pointer_axis2(&msg[..msg.len() - 1]).is_none());
     }
@@ -4731,6 +5042,7 @@ mod tests {
             v120_y: 0,
             source: None,
             stop: false,
+            time_ms: 0,
         };
         let huge = parse_surface_pointer_axis2(&msg_surface_pointer_axis2(&mk(1e18))).unwrap();
         assert!(huge.dy > 0.0, "positive delta stayed positive");
@@ -4744,13 +5056,16 @@ mod tests {
     fn surface_input_puts_the_surface_id_first() {
         let mut payload = 30u32.to_le_bytes().to_vec(); // KEY_A
         payload.push(1); // pressed
-        let msg = msg_surface_input(7, &payload);
+        let msg = msg_surface_input(7, &payload, 0x0102_0304);
 
-        assert_eq!(msg.len(), 8);
+        assert_eq!(msg.len(), 12);
         assert_eq!(msg[0], C2S_SURFACE_INPUT);
         assert_eq!(u16::from_le_bytes([msg[1], msg[2]]), 7);
         assert_eq!(u32::from_le_bytes([msg[3], msg[4], msg[5], msg[6]]), 30);
         assert_eq!(msg[7], 1);
+        // The browser key event's own time, so every input path is paced by one
+        // clock rather than by whenever the compositor drained its queue.
+        assert_eq!(&msg[8..12], &[0x04, 0x03, 0x02, 0x01]);
     }
 
     #[test]
@@ -6291,6 +6606,40 @@ mod tests {
         let text = t.get_all_text();
         assert!(text.contains("AB"));
         assert!(text.contains("CD"));
+    }
+
+    #[test]
+    fn surface_text_input_carries_request_and_content_type() {
+        let msg = msg_surface_text_input(7, true, true, 0x204, 6);
+        assert_eq!(msg.len(), 12);
+        match parse_server_msg(&msg) {
+            Some(ServerMsg::SurfaceTextInput {
+                surface_id,
+                enabled,
+                requested,
+                hint,
+                purpose,
+            }) => {
+                assert_eq!(surface_id, 7);
+                assert!(enabled);
+                assert!(requested);
+                assert_eq!(hint, 0x204);
+                assert_eq!(purpose, 6);
+            }
+            other => panic!("expected SurfaceTextInput, got {}", other.is_some()),
+        }
+
+        // A show request has no meaning while disabled and is masked out by
+        // the builder rather than putting a contradictory packet on the wire.
+        match parse_server_msg(&msg_surface_text_input(7, false, true, 9, 3)) {
+            Some(ServerMsg::SurfaceTextInput {
+                enabled, requested, ..
+            }) => {
+                assert!(!enabled);
+                assert!(!requested);
+            }
+            other => panic!("expected SurfaceTextInput, got {}", other.is_some()),
+        }
     }
 
     /// The physical/logical split is the whole point of the message: a 1x

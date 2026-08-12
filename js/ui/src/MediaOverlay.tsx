@@ -6,6 +6,7 @@ import {
   MAX_SURFACE_ZOOM,
   MIN_SURFACE_MAX_FPS,
   MIN_SURFACE_ZOOM,
+  type SurfaceTouchMode,
   type SurfaceZoomMode,
 } from "./storage";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
@@ -68,6 +69,8 @@ export function MediaOverlay(props: {
   /** Surface zoom value in percent. */
   surfaceZoom: number;
   surfaceZoomMode: SurfaceZoomMode;
+  surfaceTouchMode: SurfaceTouchMode;
+  surfaceTouchAvailable: boolean;
   onAudioBitrateChange: (kbps: number) => void;
   onVideoBandwidthChange: (bandwidth: number) => void;
   onVideoSpeedChange: (speed: number) => void;
@@ -76,6 +79,7 @@ export function MediaOverlay(props: {
   onSurfaceMaxFpsChange: (maxFps: number) => void;
   onSurfaceZoomChange: (percent: number) => void;
   onSurfaceZoomModeChange: (mode: SurfaceZoomMode) => void;
+  onSurfaceTouchModeChange: (mode: SurfaceTouchMode) => void;
   onToggleAudio: () => void;
   onClose: () => void;
 }) {
@@ -140,14 +144,14 @@ export function MediaOverlay(props: {
     "letter-spacing": "0.05em",
   });
 
-  const chipStyle = (active: boolean): JSX.CSSProperties => ({
+  const chipStyle = (active: boolean, disabled = false): JSX.CSSProperties => ({
     ...ui.btn,
     padding: `${scale().controlY}px ${scale().controlX + 2}px`,
     border: `1px solid ${active ? theme().border : "transparent"}`,
     "background-color": active ? theme().selectedBg : "transparent",
-    opacity: active ? 1 : 0.7,
+    opacity: disabled ? 0.35 : active ? 1 : 0.7,
     "font-size": `${scale().sm}px`,
-    cursor: "pointer",
+    cursor: disabled ? "not-allowed" : "pointer",
   });
 
   const sliderRowStyle = (): JSX.CSSProperties => ({
@@ -712,6 +716,47 @@ export function MediaOverlay(props: {
                     .toFixed(2)
                     .replace(/\.?0+$/, "")}
                   ×. Values below 1× zoom out and fit more in the pane.
+                </span>
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  "flex-direction": "column",
+                  gap: `${scale().tightGap}px`,
+                }}
+              >
+                <span style={labelStyle()}>Touch input</span>
+                <div
+                  style={{
+                    display: "flex",
+                    "flex-wrap": "wrap",
+                    gap: `${scale().tightGap}px`,
+                  }}
+                >
+                  <button
+                    onClick={() => props.onSurfaceTouchModeChange("pointer")}
+                    style={chipStyle(props.surfaceTouchMode === "pointer")}
+                  >
+                    Pointer gestures
+                  </button>
+                  <button
+                    disabled={!props.surfaceTouchAvailable}
+                    onClick={() => props.onSurfaceTouchModeChange("direct")}
+                    style={chipStyle(
+                      props.surfaceTouchMode === "direct",
+                      !props.surfaceTouchAvailable,
+                    )}
+                  >
+                    Direct multitouch
+                  </button>
+                </div>
+                <span style={sliderHintStyle()}>
+                  {props.surfaceTouchAvailable
+                    ? props.surfaceTouchMode === "direct"
+                      ? "Apps receive native contacts; tap, scroll, pinch, and drag behavior belongs to the app. Trackpads and pens are unchanged."
+                      : "Touch keeps Blit's tap, scroll, long-press, and drag gestures."
+                    : "Direct touch needs a server with multitouch support."}
                 </span>
               </div>
             </div>

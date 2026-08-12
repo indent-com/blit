@@ -1382,6 +1382,8 @@ pub async fn cmd_scroll(
         // A wheel has no "finger lifted" moment, and the protocol tells
         // clients not to expect a stop from one.
         stop: false,
+        // Synthesised, not a browser event: the compositor times it itself.
+        time_ms: 0,
     }))
     .await?;
     conn.finish().await;
@@ -1441,7 +1443,7 @@ async fn send_key_event(
 ) -> Result<(), String> {
     let mut payload = keycode.to_le_bytes().to_vec();
     payload.push(if pressed { 1 } else { 0 });
-    conn.send(&msg_surface_input(surface_id, &payload)).await
+    conn.send(&msg_surface_input(surface_id, &payload, 0)).await
 }
 
 fn parse_key_combo(key: &str) -> Result<Vec<(u32, bool)>, String> {

@@ -59,7 +59,7 @@ import type { Theme } from "../theme";
 import { themeFor, ui, uiScale, z } from "../theme";
 import { t, tp } from "../i18n";
 import { shellCapabilities } from "../shellCapabilities";
-import type { SurfaceZoomMode } from "../storage";
+import type { SurfaceTouchMode, SurfaceZoomMode } from "../storage";
 
 // The tree context lives in ./treeContext so its identity survives hot
 // reloads of this module (see that file).
@@ -137,6 +137,8 @@ export function BSPContainer(props: {
   surfaceZoom?: number;
   /** Whether surface zoom is relative to display DPI or an exact scale. */
   surfaceZoomMode?: SurfaceZoomMode;
+  /** Pointer gestures or native Wayland multitouch contacts. */
+  surfaceTouchMode?: SurfaceTouchMode;
 
   focusedSessionId: SessionId | null;
   lruSessionIds: readonly SessionId[];
@@ -988,6 +990,9 @@ export function BSPContainer(props: {
     get surfaceZoomMode() {
       return props.surfaceZoomMode ?? "relative";
     },
+    get surfaceTouchMode() {
+      return props.surfaceTouchMode ?? "pointer";
+    },
     tabMemory,
     get onRender() {
       return props.onRender;
@@ -1627,6 +1632,7 @@ function LeafPane(props: {
                 resizable
                 zoom={ctx.surfaceZoom}
                 zoomMode={ctx.surfaceZoomMode}
+                touchMode={ctx.surfaceTouchMode}
                 style={{ width: "100%", height: "100%" }}
               />
             </div>

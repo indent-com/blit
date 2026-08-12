@@ -1,5 +1,5 @@
 import type { WebPaneHostRegistrar } from "../WebPaneHost";
-import type { SurfaceZoomMode } from "../storage";
+import type { SurfaceTouchMode, SurfaceZoomMode } from "../storage";
 /**
  * The BSP tree's shared context, deliberately in its own module.
  *
@@ -47,6 +47,7 @@ export interface BSPTreeCtx {
   /** Surface zoom value and whether it is relative to DPI or absolute. */
   surfaceZoom: number;
   surfaceZoomMode: SurfaceZoomMode;
+  surfaceTouchMode: SurfaceTouchMode;
   tabMemory: Record<string, number>;
   onRender?: (renderMs?: number) => void;
   /** Called with each terminal pane's surface as it mounts (and null as it

@@ -6998,11 +6998,18 @@ impl VulkanRenderer {
         collect_gpu_layers(root_id, surfaces, meta, 0, 0, &mut all_layers);
 
         if all_layers.is_empty() {
-            eprintln!(
-                "[render_tree_sized] all_layers empty (sid={toplevel_sid} surfaces={} meta={})",
-                surfaces.len(),
-                meta.len(),
-            );
+            // Reachable whenever a client unmaps its toplevel with
+            // `attach(NULL)` and keeps the role, so this is an ordinary state,
+            // not an anomaly: log it only when layer tracing is on, or a hidden
+            // window spams stderr once per composite for as long as it is
+            // hidden.
+            if crate::render::gpu_layer_debug() {
+                eprintln!(
+                    "[render_tree_sized] all_layers empty (sid={toplevel_sid} surfaces={} meta={})",
+                    surfaces.len(),
+                    meta.len(),
+                );
+            }
             return (None, results);
         }
 

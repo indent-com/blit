@@ -21,6 +21,7 @@ import {
   buildClientFeaturesMessage,
   buildSurfacePreeditMessage,
   buildSurfaceDragEnterMessage,
+  buildSurfaceTouchMessage,
 } from "../protocol";
 import {
   C2S_ACK,
@@ -48,6 +49,8 @@ import {
   AXIS_FLAG_SOURCE_KNOWN,
   AXIS_FLAG_STOP,
   CREATE2_WANT_STATUS,
+  C2S_SURFACE_TOUCH,
+  SURFACE_TOUCH_MOTION,
 } from "../types";
 
 const textDecoder = new TextDecoder();
@@ -318,6 +321,7 @@ describe("buildSurfaceAxis2Message", () => {
       dyX100: v.getInt32(8, true),
       v120x: v.getInt16(12, true),
       v120y: v.getInt16(14, true),
+      timeMs: v.getUint32(16, true),
     };
   };
 
@@ -329,8 +333,9 @@ describe("buildSurfaceAxis2Message", () => {
       v120y: -240,
       source: AXIS_SOURCE_FINGER,
       stop: false,
+      timeMs: 9_876.4,
     });
-    expect(msg).toHaveLength(16);
+    expect(msg).toHaveLength(20);
     expect(read(msg)).toEqual({
       opcode: C2S_SURFACE_POINTER_AXIS2,
       surfaceId: 0x1234,
@@ -339,6 +344,9 @@ describe("buildSurfaceAxis2Message", () => {
       dyX100: 225,
       v120x: 0,
       v120y: -240,
+      // Kinetic scrolling integrates deltas against these timestamps, so the
+      // browser's own event time has to reach the compositor.
+      timeMs: 9_876,
     });
   });
 
@@ -405,6 +413,36 @@ describe("buildSurfaceAxis2Message", () => {
     });
     expect(read(msg).dxX100).toBe(0);
     expect(read(msg).dyX100).toBe(0);
+  });
+});
+
+describe("buildSurfaceTouchMessage", () => {
+  it("keeps contacts from one browser event in one wire frame", () => {
+    const msg = buildSurfaceTouchMessage(
+      0x1234,
+      SURFACE_TOUCH_MOTION,
+      [
+        { identifier: -7, x: 12.25, y: -3.5 },
+        { identifier: 9, x: 640, y: 480.75 },
+      ],
+      1234.6,
+    );
+    const view = new DataView(msg.buffer, msg.byteOffset, msg.byteLength);
+    expect(msg).toHaveLength(33);
+    expect(msg[0]).toBe(C2S_SURFACE_TOUCH);
+    expect(view.getUint16(1, true)).toBe(0x1234);
+    expect(msg[3]).toBe(SURFACE_TOUCH_MOTION);
+    expect(msg[4]).toBe(2);
+    // The browser's own event time, to whole ms. Apps differentiate position
+    // against it for a fling velocity, so it cannot be stamped on arrival: a
+    // burst of coalesced moves would then share one instant.
+    expect(view.getUint32(5, true)).toBe(1235);
+    expect(view.getInt32(9, true)).toBe(-7);
+    expect(view.getInt32(13, true)).toBe(1225);
+    expect(view.getInt32(17, true)).toBe(-350);
+    expect(view.getInt32(21, true)).toBe(9);
+    expect(view.getInt32(25, true)).toBe(64000);
+    expect(view.getInt32(29, true)).toBe(48075);
   });
 });
 

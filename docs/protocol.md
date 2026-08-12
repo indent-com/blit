@@ -53,7 +53,7 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 | `0x1C` | `TERM_CWD`              | `[nonce:2][pty_id:2]` — request a PTY's live working directory (see [Working directory tracking](#working-directory-tracking))                                                                                                                   |
 | `0x1D` | `DEADLINE`              | `[pty_id:2][ms:4]` — arm or refresh a server-enforced deadline; `ms = 0` clears it                                                                                                                                                               |
 | `0x1E` | `SCROLL_BY`             | `[pty_id:2][delta:4 i32]` — move a scrolled view relative to where the server holds it (see [Scrollback](#scrollback))                                                                                                                           |
-| `0x20` | `SURFACE_INPUT`         | `[surface_id:2][keycode:4][pressed:1]`                                                                                                                                                                                                           |
+| `0x20` | `SURFACE_INPUT`         | `[surface_id:2][keycode:4][pressed:1][time_ms:4]` — `time_ms` is the browser `KeyboardEvent.timeStamp`, `0` when the sender synthesised the key                                                                                                  |
 | `0x21` | `SURFACE_POINTER`       | `[surface_id:2][type:1][button:1][x:2][y:2]`                                                                                                                                                                                                     |
 | `0x22` | `SURFACE_POINTER_AXIS`  | `[surface_id:2][axis:1][value:4]` — legacy scroll, superseded by `0x32`                                                                                                                                                                          |
 | `0x23` | `SURFACE_RESIZE`        | `[surface_id:2][width:2][height:2][scale_120:2]`                                                                                                                                                                                                 |
@@ -79,6 +79,7 @@ Every message begins with a **1-byte opcode**. All multi-byte fields are little-
 | `0x37` | `SURFACE_DRAG_LEAVE`    | `[surface_id:2]` — the drag left the surface                                                                                                                                                                                                     |
 | `0x38` | `SURFACE_DRAG_DROP`     | `[surface_id:2][x:2][y:2][item_count:2][items]` — complete the drop; item is `[mime_len:2][mime][name_len:2][name][data_len:4][data]`, see [Drag and drop](#drag-and-drop)                                                                       |
 | `0x39` | `SURFACE_DRAG_CANCEL`   | _(empty)_ — abort the drag (Escape / drag left the window)                                                                                                                                                                                       |
+| `0x3A` | `SURFACE_TOUCH`         | `[surface_id:2][phase:1][contact_count:1][time_ms:4][contacts…]`; contact is `[identifier:4 i32][x_x100:4 i32][y_x100:4 i32]`; `time_ms` is the browser `TouchEvent.timeStamp`, see [Direct touch](#direct-touch)                                |
 | `0x40` | `FS_SYNC`               | `[nonce:2][flags:2][latency_ms:2][inline_max:4][path_len:2][path:N]` + `[exclude_len:2][exclude:M]` if `EXCLUDE` + `[src_pty_id:2]` if `FROM_PTY`; `STAGING` roots the sync at the drag staging dir, see [Drag and drop](#drag-and-drop)         |
 | `0x41` | `FS_STOP`               | `[sync_id:2]`                                                                                                                                                                                                                                    |
 | `0x42` | `FS_ACK`                | `[sync_id:2][update_id:4]` — cumulative                                                                                                                                                                                                          |
@@ -169,74 +170,78 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 
 ## Server → Client (S2C)
 
-| Opcode | Name                | Layout                                                                                                                                          |
-| ------ | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `0x00` | `UPDATE`            | `[pty_id:2][lz4-compressed-frame]`                                                                                                              |
-| `0x01` | `CREATED`           | `[pty_id:2][tag:N]`                                                                                                                             |
-| `0x02` | `CLOSED`            | `[pty_id:2]`                                                                                                                                    |
-| `0x03` | `LIST`              | `[count:2][entries…]`                                                                                                                           |
-| `0x04` | `TITLE`             | `[pty_id:2][title:N]`                                                                                                                           |
-| `0x05` | `SEARCH_RESULTS`    | `[request_id:2][results…]`                                                                                                                      |
-| `0x06` | `CREATED_N`         | `[nonce:2][pty_id:2][tag:N]`                                                                                                                    |
-| `0x07` | `HELLO`             | `[version:2][features:4][boot_generation:8][server_version_len:2][server_version:N]`                                                            |
-| `0x08` | `EXITED`            | `[pty_id:2][exit_status:4][reason:1]` — `reason` appended; older servers omit it                                                                |
-| `0x09` | `READY`             | (no payload)                                                                                                                                    |
-| `0x0A` | `TEXT`              | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]`                                                                                          |
-| `0x0B` | `PING`              | _(empty)_ — server keepalive                                                                                                                    |
-| `0x0C` | `QUIT`              | _(empty)_ — server shutting down                                                                                                                |
-| `0x0D` | `USED_ROWS`         | `[pty_id:2][used_rows:2]`                                                                                                                       |
-| `0x0E` | `TERM_CWD`          | `[nonce:2][cwd_len:2][cwd:N]` — reply to `C2S_TERM_CWD`; empty = unknown                                                                        |
-| `0x0F` | `TERM_CWD_EVENT`    | `[pty_id:2][cwd:N]` — unsolicited push when the OSC 7-reported cwd changes                                                                      |
-| `0x10` | `CREATE_FAILED`     | `[nonce:2][status:1][detail:N]` — refusal of a `CREATE2(WANT_STATUS)`                                                                           |
-| `0x11` | `SCROLL_OFFSET`     | `[pty_id:2][offset:4]` — this client's scrolled-back view was re-anchored (see Scrollback)                                                      |
-| `0x20` | `SURFACE_CREATED`   | `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`                                                           |
-| `0x21` | `SURFACE_DESTROYED` | `[surface_id:2]`                                                                                                                                |
-| `0x22` | `SURFACE_FRAME`     | `[surface_id:2][timestamp:4][flags:1][w:2][h:2][data:N]`                                                                                        |
-| `0x23` | `SURFACE_TITLE`     | `[surface_id:2][title:N]`                                                                                                                       |
-| `0x24` | `SURFACE_RESIZED`   | `[surface_id:2][w:2][h:2]`                                                                                                                      |
-| `0x25` | `CLIPBOARD_CONTENT` | `[mime_len:2][mime:N][data_len:4][data:M]`                                                                                                      |
-| `0x26` | `SURFACE_LIST`      | `[count:2]` repeated `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`                                      |
-| `0x27` | `SURFACE_CAPTURE`   | `[surface_id:2][width:4][height:4][image_data:N]` — PNG or AVIF                                                                                 |
-| `0x28` | `SURFACE_APP_ID`    | `[surface_id:2][app_id:N]`                                                                                                                      |
-| `0x29` | `SURFACE_CURSOR`    | `[surface_id:2][shape_len:1][shape:N]` — CSS cursor keyword                                                                                     |
-| `0x2A` | `SURFACE_ENCODER`   | `[surface_id:2][name][0x00][codec_string]` — encoder display name + WebCodecs codec string, NUL-separated                                       |
-| `0x2B` | `FRAGMENT`          | `[flags:1][chunk:N]` — see [Fragmentation](#fragmentation)                                                                                      |
-| `0x2C` | `CLIPBOARD_LIST`    | `[count:2] repeated{ [mime_len:2][mime:N] }`                                                                                                    |
-| `0x2D` | `SURFACE_ACTIVATED` | `[surface_id:2]` — the Wayland client asked for its toplevel to be activated (xdg_activation_v1); raise and focus the pane                      |
-| `0x2E` | `CLIPBOARD_OWNER`   | `[wayland:1]` — `1` while a Wayland client owns the selection; `0` when empty or externally owned                                               |
-| `0x30` | `AUDIO_FRAME`       | `[timestamp:4][flags:1][data:N]`                                                                                                                |
-| `0x40` | `FS_SYNCED`         | `[nonce:2][sync_id:2][status:1][detail_len:2][detail:N]`                                                                                        |
-| `0x41` | `FS_UPDATE`         | `[sync_id:2][update_id:4][flags:1][records:LZ4]`                                                                                                |
-| `0x42` | `FS_FILE`           | `[nonce:2][status:1][data:LZ4]`                                                                                                                 |
-| `0x43` | `FS_CLOSED`         | `[sync_id:2][reason:1]`                                                                                                                         |
-| `0x44` | `FS_DONE`           | `[nonce:2][status:1][hash:16][mtime_ns:8]` — one per `FS_WRITE`/`FS_OP` ([design/fs-write.md](design/fs-write.md))                              |
-| `0x45` | `FS_SEARCH`         | `[nonce:2][status:1][count:2] repeated{ [path_len:2][path:N] }` ([design/fs-search.md](design/fs-search.md))                                    |
-| `0x46` | `FS_INDEX`          | `[nonce:2][status:1][flags:1][count:4][paths:LZ4]` ([design/fs-search.md](design/fs-search.md))                                                 |
-| `0x49` | `FS_UPLOAD_BEGIN`   | `[nonce:2][status:1][upload_id:2][hash:16][mtime_ns:8]` — `upload_id` meaningful only on `OK`; `hash` is the current on-disk hash on `CONFLICT` |
-| `0x4A` | `FS_UPLOAD_CHUNK`   | `[upload_id:2][status:1][received:8]` — per-chunk ack/progress; `received` is the resume point on `OFFSET_MISMATCH`                             |
-| `0x4B` | `FS_UPLOAD_FINISH`  | `[nonce:2][status:1][hash:16][mtime_ns:8]` — the `FS_DONE` payload on success (zeroes otherwise)                                                |
+| Opcode | Name                   | Layout                                                                                                                                                                                                                                                                                                                                      |
+| ------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0x00` | `UPDATE`               | `[pty_id:2][lz4-compressed-frame]`                                                                                                                                                                                                                                                                                                          |
+| `0x01` | `CREATED`              | `[pty_id:2][tag:N]`                                                                                                                                                                                                                                                                                                                         |
+| `0x02` | `CLOSED`               | `[pty_id:2]`                                                                                                                                                                                                                                                                                                                                |
+| `0x03` | `LIST`                 | `[count:2][entries…]`                                                                                                                                                                                                                                                                                                                       |
+| `0x04` | `TITLE`                | `[pty_id:2][title:N]`                                                                                                                                                                                                                                                                                                                       |
+| `0x05` | `SEARCH_RESULTS`       | `[request_id:2][results…]`                                                                                                                                                                                                                                                                                                                  |
+| `0x06` | `CREATED_N`            | `[nonce:2][pty_id:2][tag:N]`                                                                                                                                                                                                                                                                                                                |
+| `0x07` | `HELLO`                | `[version:2][features:4][boot_generation:8][server_version_len:2][server_version:N]`                                                                                                                                                                                                                                                        |
+| `0x08` | `EXITED`               | `[pty_id:2][exit_status:4][reason:1]` — `reason` appended; older servers omit it                                                                                                                                                                                                                                                            |
+| `0x09` | `READY`                | (no payload)                                                                                                                                                                                                                                                                                                                                |
+| `0x0A` | `TEXT`                 | `[nonce:2][pty_id:2][total_lines:4][offset:4][text:N]`                                                                                                                                                                                                                                                                                      |
+| `0x0B` | `PING`                 | _(empty)_ — server keepalive                                                                                                                                                                                                                                                                                                                |
+| `0x0C` | `QUIT`                 | _(empty)_ — server shutting down                                                                                                                                                                                                                                                                                                            |
+| `0x0D` | `USED_ROWS`            | `[pty_id:2][used_rows:2]`                                                                                                                                                                                                                                                                                                                   |
+| `0x0E` | `TERM_CWD`             | `[nonce:2][cwd_len:2][cwd:N]` — reply to `C2S_TERM_CWD`; empty = unknown                                                                                                                                                                                                                                                                    |
+| `0x0F` | `TERM_CWD_EVENT`       | `[pty_id:2][cwd:N]` — unsolicited push when the OSC 7-reported cwd changes                                                                                                                                                                                                                                                                  |
+| `0x10` | `CREATE_FAILED`        | `[nonce:2][status:1][detail:N]` — refusal of a `CREATE2(WANT_STATUS)`                                                                                                                                                                                                                                                                       |
+| `0x11` | `SCROLL_OFFSET`        | `[pty_id:2][offset:4]` — this client's scrolled-back view was re-anchored (see Scrollback)                                                                                                                                                                                                                                                  |
+| `0x20` | `SURFACE_CREATED`      | `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`                                                                                                                                                                                                                                                       |
+| `0x21` | `SURFACE_DESTROYED`    | `[surface_id:2]`                                                                                                                                                                                                                                                                                                                            |
+| `0x22` | `SURFACE_FRAME`        | `[surface_id:2][timestamp:4][flags:1][w:2][h:2][data:N]`                                                                                                                                                                                                                                                                                    |
+| `0x23` | `SURFACE_TITLE`        | `[surface_id:2][title:N]`                                                                                                                                                                                                                                                                                                                   |
+| `0x24` | `SURFACE_RESIZED`      | `[surface_id:2][w:2][h:2]`                                                                                                                                                                                                                                                                                                                  |
+| `0x25` | `CLIPBOARD_CONTENT`    | `[mime_len:2][mime:N][data_len:4][data:M]`                                                                                                                                                                                                                                                                                                  |
+| `0x26` | `SURFACE_LIST`         | `[count:2]` repeated `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`                                                                                                                                                                                                                                  |
+| `0x27` | `SURFACE_CAPTURE`      | `[surface_id:2][width:4][height:4][image_data:N]` — PNG or AVIF                                                                                                                                                                                                                                                                             |
+| `0x28` | `SURFACE_APP_ID`       | `[surface_id:2][app_id:N]`                                                                                                                                                                                                                                                                                                                  |
+| `0x29` | `SURFACE_CURSOR`       | `[surface_id:2][type:1]` + `[name_len:1][name:N]` if named, nothing if hidden, `[hotx:2][hoty:2][w:2][h:2][png:N]` if custom; `w`/`h` and the hotspot are both **logical** pixels while the PNG keeps the cursor buffer's own resolution, so one scale factor places both. `surface_id` is the surface being _hovered_, not the focused one |
+| `0x2A` | `SURFACE_ENCODER`      | `[surface_id:2][name][0x00][codec_string]` — encoder display name + WebCodecs codec string, NUL-separated                                                                                                                                                                                                                                   |
+| `0x2B` | `FRAGMENT`             | `[flags:1][chunk:N]` — see [Fragmentation](#fragmentation)                                                                                                                                                                                                                                                                                  |
+| `0x2C` | `CLIPBOARD_LIST`       | `[count:2] repeated{ [mime_len:2][mime:N] }`                                                                                                                                                                                                                                                                                                |
+| `0x2D` | `SURFACE_ACTIVATED`    | `[surface_id:2]` — the Wayland client asked for its toplevel to be activated (xdg_activation_v1); raise and focus the pane                                                                                                                                                                                                                  |
+| `0x2E` | `CLIPBOARD_OWNER`      | `[wayland:1]` — `1` while a Wayland client owns the selection; `0` when empty or externally owned                                                                                                                                                                                                                                           |
+| `0x2F` | `SURFACE_TEXT_INPUT`   | `[surface_id:2][flags:1][content_hint:4][content_purpose:4]` — committed `zwp_text_input_v3` state; flags bit 0 is enabled and bit 1 marks a fresh enable request                                                                                                                                                                           |
+| `0x30` | `AUDIO_FRAME`          | `[timestamp:4][flags:1][data:N]`                                                                                                                                                                                                                                                                                                            |
+| `0x31` | `SURFACE_REMOTE_INPUT` | `[surface_id:2][kind:1][count:1][x:2,y:2]*` — where another viewer is pointing (`kind` 0, one point) or touching (`kind` 1, one per finger); `count = 0` retires the marks and is what the driving viewer receives                                                                                                                          |
+| `0x40` | `FS_SYNCED`            | `[nonce:2][sync_id:2][status:1][detail_len:2][detail:N]`                                                                                                                                                                                                                                                                                    |
+| `0x41` | `FS_UPDATE`            | `[sync_id:2][update_id:4][flags:1][records:LZ4]`                                                                                                                                                                                                                                                                                            |
+| `0x42` | `FS_FILE`              | `[nonce:2][status:1][data:LZ4]`                                                                                                                                                                                                                                                                                                             |
+| `0x43` | `FS_CLOSED`            | `[sync_id:2][reason:1]`                                                                                                                                                                                                                                                                                                                     |
+| `0x44` | `FS_DONE`              | `[nonce:2][status:1][hash:16][mtime_ns:8]` — one per `FS_WRITE`/`FS_OP` ([design/fs-write.md](design/fs-write.md))                                                                                                                                                                                                                          |
+| `0x45` | `FS_SEARCH`            | `[nonce:2][status:1][count:2] repeated{ [path_len:2][path:N] }` ([design/fs-search.md](design/fs-search.md))                                                                                                                                                                                                                                |
+| `0x46` | `FS_INDEX`             | `[nonce:2][status:1][flags:1][count:4][paths:LZ4]` ([design/fs-search.md](design/fs-search.md))                                                                                                                                                                                                                                             |
+| `0x49` | `FS_UPLOAD_BEGIN`      | `[nonce:2][status:1][upload_id:2][hash:16][mtime_ns:8]` — `upload_id` meaningful only on `OK`; `hash` is the current on-disk hash on `CONFLICT`                                                                                                                                                                                             |
+| `0x4A` | `FS_UPLOAD_CHUNK`      | `[upload_id:2][status:1][received:8]` — per-chunk ack/progress; `received` is the resume point on `OFFSET_MISMATCH`                                                                                                                                                                                                                         |
+| `0x4B` | `FS_UPLOAD_FINISH`     | `[nonce:2][status:1][hash:16][mtime_ns:8]` — the `FS_DONE` payload on success (zeroes otherwise)                                                                                                                                                                                                                                            |
 
 **Notes:**
 
 `S2C_HELLO` is the first message sent on every new connection. `version` is the server's protocol version. `boot_generation` is an opaque little-endian identifier generated once per server process; clients can compare it across reconnects to detect a server restart. `server_version` is the server's release string (its crate version, e.g. `0.40.1`) — informational only: feature negotiation always goes through the feature bits, never a version comparison. Both trailing fields were appended without a protocol bump, so legacy servers omit them and clients must treat a short `HELLO` as valid. `features` is a 4-byte bitmask:
 
-| Bit | Name            | Meaning                                                         |
-| --- | --------------- | --------------------------------------------------------------- |
-| 0   | `CREATE_NONCE`  | Server supports `CREATE2` / `CREATED_N` with nonce correlation  |
-| 1   | `RESTART`       | Server supports `C2S_RESTART` to respawn exited PTYs            |
-| 2   | `RESIZE_BATCH`  | Server accepts batched resize entries in a single `C2S_RESIZE`  |
-| 3   | `COPY_RANGE`    | Server supports range-based text copy                           |
-| 4   | `COMPOSITOR`    | Server supports headless Wayland compositor                     |
-| 5   | `AUDIO`         | Server supports audio forwarding (PipeWire capture + Opus)      |
-| 6   | `FS`            | Server supports the `FS_*` filesystem sync family               |
-| 7   | `GIT`           | Server supports the `GIT_*` git introspection family            |
-| 8   | `LSP`           | Server supports the `LSP_*` language intelligence family        |
-| 9   | `KV`            | Server supports the `KV_*` key-value family                     |
-| 10  | `NET`           | Server supports the `NET_*` network-relay family                |
-| 14  | `CREATE_STATUS` | `CREATE2(WANT_STATUS)` receives an explicit failure             |
-| 15  | `KILL_MODE`     | `KILL`/`CLOSE` reach the process group; `KILL` takes `flags`    |
-| 16  | `PTY_DEADLINE`  | `C2S_DEADLINE`, `CREATE2(HAS_DEADLINE)`, and `EXITED.reason`    |
-| 17  | `SCROLL_BY`     | Scrollback holds still: `S2C_SCROLL_OFFSET` and `C2S_SCROLL_BY` |
+| Bit | Name                 | Meaning                                                         |
+| --- | -------------------- | --------------------------------------------------------------- |
+| 0   | `CREATE_NONCE`       | Server supports `CREATE2` / `CREATED_N` with nonce correlation  |
+| 1   | `RESTART`            | Server supports `C2S_RESTART` to respawn exited PTYs            |
+| 2   | `RESIZE_BATCH`       | Server accepts batched resize entries in a single `C2S_RESIZE`  |
+| 3   | `COPY_RANGE`         | Server supports range-based text copy                           |
+| 4   | `COMPOSITOR`         | Server supports headless Wayland compositor                     |
+| 5   | `AUDIO`              | Server supports audio forwarding (PipeWire capture + Opus)      |
+| 6   | `FS`                 | Server supports the `FS_*` filesystem sync family               |
+| 7   | `GIT`                | Server supports the `GIT_*` git introspection family            |
+| 8   | `LSP`                | Server supports the `LSP_*` language intelligence family        |
+| 9   | `KV`                 | Server supports the `KV_*` key-value family                     |
+| 10  | `NET`                | Server supports the `NET_*` network-relay family                |
+| 14  | `CREATE_STATUS`      | `CREATE2(WANT_STATUS)` receives an explicit failure             |
+| 15  | `KILL_MODE`          | `KILL`/`CLOSE` reach the process group; `KILL` takes `flags`    |
+| 16  | `PTY_DEADLINE`       | `C2S_DEADLINE`, `CREATE2(HAS_DEADLINE)`, and `EXITED.reason`    |
+| 17  | `SCROLL_BY`          | Scrollback holds still: `S2C_SCROLL_OFFSET` and `C2S_SCROLL_BY` |
+| 18  | `SURFACE_TOUCH`      | Server accepts direct contacts and exposes `wl_seat.touch`      |
+| 19  | `SURFACE_TEXT_INPUT` | Server forwards committed `zwp_text_input_v3` state             |
 
 Bits 11 through 13 are held for the extension, channel, and process families
 under review in [#167](https://github.com/indent-com/blit/pull/167) and
@@ -493,12 +498,16 @@ browser sends a plan only when every item exposes a MIME with a useful
 extension; WebKit items that are typeless during hover omit it rather than
 committing the eventual file to `.bin`. iPad screenshots are the deliberate
 exception: WebKit exposes only the `Files` marker until DROP, so the client
-sends a provisional one-file octet-stream plan to let the remote app receive
-`dragenter` during hover. Once DROP exposes the representation, the client
-sniffs an absent/unknown MIME and sends a replacement ENTER with its actual
-image type and derived name before uploading. The provisional `.bin` is never
-dropped. The trailer is optional and append-only, so an ENTER without it is
-byte-identical to the original format.
+sends a one-file PNG plan. That makes the final `0.png` URI available during
+hover, giving Chromium time to deliver a file-shaped `dragenter` to the remote
+page before release. Once DROP exposes the representation, iPad HEIC/HEIF is
+decoded and re-encoded as PNG in the browser to match that plan. Chromium-backed
+destinations that do not claim those Apple formats can otherwise navigate to
+the staged URI instead of accepting the image drop. If another representation
+materializes, or conversion is unavailable, the client sends a replacement
+ENTER with the truthful type and name rather than losing the file. The trailer
+is optional and append-only, so an ENTER without it is byte-identical to the
+original format.
 The server derives a staging name for every planned item
 (`0.png`, `1.jpg`, `.webp`/`.gif`, HEIF-family formats, TIFF, or BMP; unknown
 types use `.bin`), creates the empty files, and can therefore answer
@@ -574,6 +583,45 @@ the source mask declared before `start_drag` is retained on the data source,
 as required by the Wayland request order. Releasing over no surface cancels
 the source.
 
+### Shared input marks
+
+`S2C_SURFACE_REMOTE_INPUT` mirrors what one viewer is doing to a surface onto the
+others watching it, so a shared session shows where the other person is. The
+compositor has one seat, so at most one viewer drives it at a time.
+
+`kind = 0` carries a single pointer position, drawn with that surface's current
+cursor artwork (see [Cursors](#cursors)). `kind = 1` carries the live touchscreen
+contacts, one point per finger on the glass — the whole set every time, not just
+the contacts that changed, so a viewer draws what is actually down and a viewer
+that subscribed mid-gesture is not left guessing. `count = 0` retires the marks:
+that is what the driving viewer itself receives, since its own cursor and its own
+fingers are already on its screen, and what everyone receives when input ends.
+
+Coordinates are the same composited-frame pixel space as `C2S_SURFACE_POINTER`.
+All these fields are unsigned, so a sender clamps into the surface rather than
+letting a position in the letterbox margin wrap to ~65535.
+
+Pointer marks come from `C2S_SURFACE_POINTER` and from `C2S_SURFACE_DRAG_MOTION`
+— a browser fires no mouse events while a drag is in flight, so without the
+latter the marks would sit frozen for the whole drag. Touch marks come from
+`C2S_SURFACE_TOUCH`, so they appear only for a viewer in direct-touch mode. In
+the default pointer mode a touchscreen is already emulating a pointer, and it is
+that pointer which gets mirrored.
+
+Marks are retired when their owner moves to another surface, sends
+`C2S_SURFACE_POINTER` with `type = 3` (the pointer left the drawn area), ends a
+drag with `SURFACE_DRAG_LEAVE` or `SURFACE_DRAG_CANCEL` (again, no mouse event
+will arrive to do it), lifts its last contact, cancels or disables touch,
+unsubscribes from the surface, disconnects, or the surface is destroyed.
+`SURFACE_DRAG_DROP` is not in that list: it lands inside the surface at a known
+position, and ordinary mouse events resume after it.
+
+Only transitions go on the wire: an unchanged mark set, and a `count = 0` repeat
+to a client that is already the owner, are both suppressed. Every one of these
+messages counts against the same outbox frame budget that gates surface video and
+paced terminal output, and the browser sends pointer and touch motion
+unthrottled.
+
 ### Pointer buttons
 
 The `button` byte in `C2S_SURFACE_POINTER` is DOM `MouseEvent.button`
@@ -588,6 +636,12 @@ vestigial and largely unhandled. Unknown button numbers fall back to
 
 `C2S_SURFACE_POINTER_AXIS2` (`0x32`) carries everything `wl_pointer` needs to describe a scroll, because the pieces are not interchangeable:
 
+The message's `surface_id` is its dispatch target, not merely a scale hint. If
+the shared Wayland seat has since entered another toplevel, the compositor
+re-hit-tests the last pointer position recorded for the named surface before
+delivering the axis frame. An unknown, unmapped, or pointerless target drops
+the scroll instead of falling through to whichever window held focus.
+
 - `dx`/`dy` — smooth distance ×100, positive = right/down, in the composited frame's pixel space. The server converts to surface-logical pixels using the same ratio it applies to `SURFACE_POINTER`, so a wheel and a drag move content by equal amounts on a scaled surface. Sending both axes in one message keeps a diagonal gesture in a single `wl_pointer.frame`.
 - `v120_x`/`v120_y` — discrete travel in 120ths of a detent (`axis_value120`'s convention: 120 = one notch). Zero for devices without detents. Clients bound below `wl_pointer` v8 get the equivalent `axis_discrete`; sub-detent travel reaches them as smooth motion only.
 - `flags` bits 0–1 — the device source, matching `wl_pointer.axis_source` (0 wheel, 1 finger, 2 continuous, 3 wheel tilt). Bit 2 marks the source as known; when clear no `axis_source` is emitted, which is what the legacy `0x22` opcode does.
@@ -598,6 +652,114 @@ The source matters more than it looks. `axis_source`'s zero value _is_ `wheel`, 
 The browser sends the stop after an idle gap deliberately longer than the window a toolkit will regress a fling velocity from — Chromium's is `kFlingStartTimeoutMs`, 200ms — so that macOS's momentum tail does not get a second one grafted onto it, and so that pausing mid-gesture with fingers still down does not fling at the speed you were going before you stopped. Touch drags do want kinetic scrolling and are unaffected: they end their sequence on `touchend` instead of waiting out the timer.
 
 `wl_pointer.axis` carries the distance in surface-local pixels, as the protocol specifies and as Mutter emits — with one exception. Chromium reads that value as detents, dividing by a hardcoded `kAxisValueScale = 10` and multiplying by `kWheelDelta = 120` for every source including `finger`, then handing the result to Blink as precise pixels; a pixel-valued axis scrolls a Chromium or Electron window exactly twelve times too far. The compositor recognises those clients by the runtime payload beside their executable and gives them the same distance in detent units — ten per detent, the convention Weston established and Mutter still emits for wheels. GTK, which reads the value as `GDK_SCROLL_UNIT_SURFACE` pixels, and winit, which hands it to Alacritty as a `PixelDelta`, keep pixels. `v120_*` is never rescaled: its unit is unambiguous and every toolkit agrees on it.
+
+### Surface text input
+
+`S2C_SURFACE_TEXT_INPUT` forwards state committed through
+`zwp_text_input_v3.commit`. `enabled` tells the viewer whether the focused
+surface currently accepts text input. `requested` is set only for a new
+`enable` commit, so a browser may open its virtual keyboard without reopening
+one the user already dismissed when cursor metadata changes or a viewer
+reconnects. `content_hint` and `content_purpose` retain their Wayland enum
+values and let the viewer choose an appropriate HTML input mode. Opening a
+platform virtual keyboard remains best-effort because browsers may require a
+recent user activation.
+
+### Direct touch
+
+`C2S_SURFACE_TOUCH` (`0x3A`) is opt-in through an `ENABLE` control message and
+requires feature bit 18. Phases are 0 down, 1 up, 2 motion, 3 cancel, 4 enable,
+and 5 disable. Enable, disable, and cancel carry zero contacts. Contact
+coordinates are signed, multiplied by 100, and use the composited-frame pixel
+space; the compositor applies the same frame-to-logical transform as pointer
+input. One contact-bearing transport message becomes one `wl_touch.frame`,
+preserving browser `TouchEvent` atomicity; cancel is terminal and needs no
+frame.
+
+Wayland contact ids are compositor-local slots and are reused after `up`; they
+are not the browser's `Touch.identifier`. Keeping the slot set bounded also
+matters to Chromium: an ever-increasing id works for dragging but stops
+producing touchscreen flings once it reaches 32.
+
+`time_ms` is the browser's own `TouchEvent.timeStamp`. `C2S_SURFACE_POINTER` and
+`C2S_SURFACE_POINTER_AXIS2` carry one for the same reason, and it is not
+decoration: clients may derive velocity by differentiating position against
+`wl_touch.time`, `wl_pointer.motion` or `wl_pointer.axis` — a fling, a stroke
+width, a swipe — so the _spacing_ between events has to be the browser's. Over a
+network, arrival times would substitute jitter for real cadence.
+`C2S_SURFACE_INPUT` carries one too, so every path that has a browser event uses
+it. `0` means "unknown" — the legacy axis opcode, an IME commit's synthesised
+keys, the chord and modifier keys built around a real keypress, disconnect
+cleanup — and takes the compositor's own clock _without_ disturbing the anchor,
+since those interleave with real gestures and restarting the pacing around them
+would be worse than not having their own time.
+
+Direct touch also preserves that cadence in wall-clock delivery. Chromium's
+Wayland backend currently discards the protocol's millisecond value and stamps
+each `wl_touch` event when it is received. If a coalesced iPad burst is merely
+given correct `wl_touch.time` values but drained in one pass, Chromium still sees
+zero-time motion and suppresses the fling. The compositor therefore schedules
+the frames at the browser's inter-event deltas through a small per-sequence
+jitter buffer, never earlier than their arrival; steps over 100 ms start
+immediately rather than turning a hold or clock jump into input latency. If
+render or encode work misses several deadlines, the compositor rebases the
+undispatched tail instead of catching every overdue frame up in one flush, so
+each frame still reaches Chromium separately. The buffer keeps at most eight
+pending motion frames and sheds its oldest motion history when playout would
+trail arrival by more than 80 ms. Any contact update absent from the following
+frame is merged forward, so current positions are never lost. The retained
+motion tail is resampled from the last played contact positions to the newest
+source positions; this avoids a discontinuity after sustained compaction that
+Chromium treats as scroll motion but excludes from fling velocity. At least two
+motion frames survive for velocity. Cancel remains urgent and drops that owner's
+undispatched tail.
+
+The client's epoch is its own, so only the deltas are used: the compositor anchors
+to its own clock and adds the browser's deltas on top, keeping these timestamps in
+one millisecond domain across the seat. It re-anchors after an idle gap, since
+nothing needs continuity across a pause and a stale anchor would accumulate the
+drift between the two clocks. The result is monotonic, because clients may assert
+on time going backwards — but deliberately _not_ clamped to the current instant: a
+batch generated before it arrived legitimately spreads across the moment it is
+drained, and clamping each event to "now" would flatten the very spacing this
+exists to preserve. A client whose clock runs fast re-anchors once its timestamps
+get more than a second ahead.
+
+Direct touch keeps that anchor per live browser owner rather than borrowing the
+seat's pointer/key anchor. Multiple viewers can share a dev session, and every
+page has an unrelated DOM timestamp epoch; using one viewer's pointer clock for
+another viewer's touch sequence makes every touch timestamp look invalid and
+collapses a queued iPad motion burst back onto compositor drain time.
+
+Down binds a contact to the surface hit at that point. Later motion and up stay
+on that surface, matching Wayland's implicit grab even when the contact crosses
+a popup or subsurface boundary. The down serial also authorizes
+`wl_data_device.start_drag`, so a touch-started drag follows that contact until
+up. Starting that drag takes the seat over, so the compositor emits
+`wl_touch.cancel` at `start_drag`: the client is told to forget the whole
+sequence and receives no further `wl_touch` event for any of its contacts —
+including the one still driving the drag, which now speaks through
+`wl_data_device`. That is the only consistent option, because `cancel` has no
+per-contact form, so a contact the drag swallows cannot be retired on its own;
+withholding its `up` instead would leave the client holding it pressed forever.
+New downs during the drag are ignored.
+
+A contact's target unmapping, the viewer disconnecting, or direct mode being
+disabled cancels the sequence the same way, and also tells the server, which
+releases the ownership below rather than waiting for that browser's fingers to
+lift.
+
+Only one connection owns a live direct-touch sequence. Another viewer's down
+is ignored until the owner raises its last contact or cancels; this prevents
+independent browsers from splicing contacts into one Wayland seat. The seat's
+touch capability is advertised while at least one connection has direct mode
+enabled. Pointer gestures remain the default, and touch input falls back to
+that mapping when the feature bit is absent. Trackpad wheel events and pen
+pointer events are unaffected.
+
+Contacts are mirrored to the surface's other viewers as
+`S2C_SURFACE_REMOTE_INPUT` with `kind = 1`, the same way a pointer position is;
+see [Shared input marks](#shared-input-marks).
 
 ## Connection lifecycle
 

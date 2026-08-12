@@ -199,6 +199,7 @@ GUI app surfaces (see [server.md § Headless Wayland compositor](server.md#headl
 - `optimizeForLatency: true` is set on the decoder to minimize decode delay.
 - Decoded `VideoFrame`s are rendered to a canvas by `BlitSurfaceView` (React/Solid component).
 - Mouse and keyboard events from the surface canvas are forwarded as `C2S_SURFACE_INPUT` / `C2S_SURFACE_POINTER` messages.
+- Surface views accept `touchMode="pointer" | "direct"`. Pointer mode is the default and maps touch to tap, finger scroll, long-press right-click, and hold-drag. Direct mode forwards each event's contact changes as `C2S_SURFACE_TOUCH` for native Wayland multitouch; unsupported servers automatically retain the pointer mapping. The UI exposes this as **Media → Touch input**.
 
 ### Presentation scheduling
 

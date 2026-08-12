@@ -38,6 +38,13 @@ import {
   S2C_FRAGMENT,
   S2C_CLIPBOARD_CONTENT,
   S2C_CLIPBOARD_OWNER,
+  S2C_SURFACE_CURSOR,
+  S2C_SURFACE_TEXT_INPUT,
+  SURFACE_TEXT_INPUT_ENABLED,
+  SURFACE_TEXT_INPUT_REQUESTED,
+  S2C_SURFACE_REMOTE_INPUT,
+  REMOTE_INPUT_POINTER,
+  REMOTE_INPUT_TOUCH,
   S2C_PING,
   C2S_PING,
   C2S_SURFACE_SUBSCRIBE,
@@ -153,6 +160,242 @@ describe("BlitConnection", () => {
     // Invalid states cannot accidentally suppress browser clipboard import.
     transport.push(new Uint8Array([S2C_CLIPBOARD_OWNER, 2]));
     expect(conn.usesWaylandClipboard()).toBe(false);
+  });
+
+  it("tracks another client's pointer and fingers on a shared surface", () => {
+    const updates: Array<{ id: number; input: unknown }> = [];
+    const unsubscribe = conn.surfaceStore.onRemoteInput((id, input) =>
+      updates.push({ id, input }),
+    );
+    try {
+      transport.push(
+        new Uint8Array([
+          S2C_SURFACE_REMOTE_INPUT,
+          7,
+          0,
+          REMOTE_INPUT_POINTER,
+          1,
+          0x34,
+          0x12,
+          0x78,
+          0x56,
+        ]),
+      );
+      expect(conn.surfaceStore.getRemoteInput(7)).toEqual({
+        pointer: [{ x: 0x1234, y: 0x5678 }],
+        touch: [],
+      });
+
+      // Several fingers ride in one message: they are simultaneous.
+      transport.push(
+        new Uint8Array([
+          S2C_SURFACE_REMOTE_INPUT,
+          7,
+          0,
+          REMOTE_INPUT_TOUCH,
+          2,
+          10,
+          0,
+          20,
+          0,
+          30,
+          0,
+          40,
+          0,
+        ]),
+      );
+      // Both kinds coexist: a touch update leaves the pointer mark alone,
+      // because one viewer can drive a mouse and a touchscreen at once.
+      expect(conn.surfaceStore.getRemoteInput(7)).toEqual({
+        pointer: [{ x: 0x1234, y: 0x5678 }],
+        touch: [
+          { x: 10, y: 20 },
+          { x: 30, y: 40 },
+        ],
+      });
+
+      // A retire names its kind and withdraws only that one.
+      transport.push(
+        new Uint8Array([
+          S2C_SURFACE_REMOTE_INPUT,
+          7,
+          0,
+          REMOTE_INPUT_POINTER,
+          0,
+        ]),
+      );
+      expect(conn.surfaceStore.getRemoteInput(7)).toEqual({
+        pointer: [],
+        touch: [
+          { x: 10, y: 20 },
+          { x: 30, y: 40 },
+        ],
+      });
+      transport.push(
+        new Uint8Array([S2C_SURFACE_REMOTE_INPUT, 7, 0, REMOTE_INPUT_TOUCH, 0]),
+      );
+      expect(conn.surfaceStore.getRemoteInput(7)).toBeNull();
+
+      // A truncated point list is dropped rather than half-decoded.
+      transport.push(
+        new Uint8Array([
+          S2C_SURFACE_REMOTE_INPUT,
+          7,
+          0,
+          REMOTE_INPUT_TOUCH,
+          2,
+          1,
+          0,
+        ]),
+      );
+      expect(conn.surfaceStore.getRemoteInput(7)).toBeNull();
+
+      const fingers = [
+        { x: 10, y: 20 },
+        { x: 30, y: 40 },
+      ];
+      expect(updates.map((u) => u.input)).toEqual([
+        { pointer: [{ x: 0x1234, y: 0x5678 }], touch: [] },
+        { pointer: [{ x: 0x1234, y: 0x5678 }], touch: fingers },
+        { pointer: [], touch: fingers },
+        null,
+      ]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("tracks Wayland text-input requests and content purpose", () => {
+    const events: unknown[] = [];
+    const unsubscribe = conn.surfaceStore.onTextInput((surfaceId, state) =>
+      events.push({ surfaceId, state }),
+    );
+    try {
+      const enabled = new Uint8Array(12);
+      const view = new DataView(enabled.buffer);
+      enabled[0] = S2C_SURFACE_TEXT_INPUT;
+      view.setUint16(1, 7, true);
+      enabled[3] = SURFACE_TEXT_INPUT_ENABLED | SURFACE_TEXT_INPUT_REQUESTED;
+      view.setUint32(4, 0x204, true);
+      view.setUint32(8, 6, true); // email
+      transport.push(enabled);
+
+      expect(conn.surfaceStore.getTextInput(7)).toEqual({
+        enabled: true,
+        hint: 0x204,
+        purpose: 6,
+      });
+      expect(events).toEqual([
+        {
+          surfaceId: 7,
+          state: {
+            enabled: true,
+            requested: true,
+            hint: 0x204,
+            purpose: 6,
+          },
+        },
+      ]);
+
+      transport.push(
+        new Uint8Array([
+          S2C_SURFACE_TEXT_INPUT,
+          7,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+        ]),
+      );
+      expect(conn.surfaceStore.getTextInput(7)).toBeNull();
+      expect(events.at(-1)).toEqual({
+        surfaceId: 7,
+        state: { enabled: false, requested: false, hint: 0, purpose: 0 },
+      });
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("preserves surface cursor artwork for remote pointer overlays", () => {
+    const name = new TextEncoder().encode("vertical-text");
+    transport.push(
+      new Uint8Array([S2C_SURFACE_CURSOR, 7, 0, 0, name.length, ...name]),
+    );
+    expect(conn.surfaceStore.getCursorImage(7)).toEqual({
+      kind: "named",
+      name: "vertical-text",
+    });
+
+    const createDescriptor = Object.getOwnPropertyDescriptor(
+      URL,
+      "createObjectURL",
+    );
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(
+      URL,
+      "revokeObjectURL",
+    );
+    const createObjectURL = vi.fn(() => "blob:cursor");
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: createObjectURL,
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: revokeObjectURL,
+    });
+    try {
+      transport.push(
+        new Uint8Array([
+          S2C_SURFACE_CURSOR,
+          7,
+          0,
+          2,
+          4,
+          0,
+          5,
+          0,
+          32,
+          0,
+          24,
+          0,
+          0x89,
+        ]),
+      );
+      expect(createObjectURL).toHaveBeenCalledOnce();
+      expect(conn.surfaceStore.getCursorImage(7)).toEqual({
+        kind: "custom",
+        url: "blob:cursor",
+        hotspotX: 4,
+        hotspotY: 5,
+        width: 32,
+        height: 24,
+      });
+
+      transport.push(new Uint8Array([S2C_SURFACE_CURSOR, 7, 0, 1]));
+      expect(conn.surfaceStore.getCursorImage(7)).toEqual({ kind: "hidden" });
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:cursor");
+    } finally {
+      if (createDescriptor) {
+        Object.defineProperty(URL, "createObjectURL", createDescriptor);
+      } else {
+        delete (URL as unknown as { createObjectURL?: unknown })
+          .createObjectURL;
+      }
+      if (revokeDescriptor) {
+        Object.defineProperty(URL, "revokeObjectURL", revokeDescriptor);
+      } else {
+        delete (URL as unknown as { revokeObjectURL?: unknown })
+          .revokeObjectURL;
+      }
+    }
   });
 
   it("invalidates Wayland clipboard authority on clipboardchange", () => {
@@ -1471,6 +1714,61 @@ describe("BlitConnection surface subscriptions", () => {
       value: original,
     });
   });
+
+  /** The server drops a client's view size when it unsubscribes, so a
+   *  client returning from hidden must say its size again.  It used to
+   *  dedup the re-offer against the size the *previous* subscription had
+   *  carried and stay silent, which left it subscribed but absent from
+   *  the server's size mediation — with another viewer watching, the
+   *  surface then sat at that viewer's size forever, because this pane's
+   *  box never changes again and so never produces a fresh offer. */
+  it("re-offers its view size after a hidden page resubscribes", () => {
+    const original = document.visibilityState;
+    conn.dispose();
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
+    ({ conn, transport } = createConnection());
+    const view = conn.allocSurfaceViewId();
+    conn.sendSurfaceSubscribe(1, view, null);
+    conn.offerSurfaceViewSize(1, view, 1000, 700, 120);
+
+    const resizesAfter = (from: number) =>
+      transport.sent.slice(from).filter((m) => m[0] === C2S_SURFACE_RESIZE);
+
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "hidden",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+
+    const mark = transport.sent.length;
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+
+    const resent = resizesAfter(mark);
+    expect(resent).toHaveLength(1);
+    const v = new DataView(
+      resent[0].buffer,
+      resent[0].byteOffset,
+      resent[0].byteLength,
+    );
+    expect([
+      v.getUint16(3, true),
+      v.getUint16(5, true),
+      v.getUint16(7, true),
+    ]).toEqual([1000, 700, 120]);
+
+    conn.dispose();
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: original,
+    });
+  });
 });
 
 describe("BlitConnection surface view sizes", () => {
@@ -1519,15 +1817,59 @@ describe("BlitConnection surface view sizes", () => {
     expect(resizes()).toEqual([{ w: 800, h: 600, s: 120 }]);
   });
 
-  it("re-sends the surviving offer when the winner withdraws", () => {
+  /** One wire slot, two live views: the request has to be the largest box
+   *  that fits in both, not whichever was measured last — otherwise the
+   *  other pane is handed a surface too big for it.  Same rule the server
+   *  applies across clients, applied here across views. */
+  it("asks for the largest size that fits every live view", () => {
     conn.offerSurfaceViewSize(1, "a", 800, 600, 120);
     conn.offerSurfaceViewSize(1, "b", 1024, 768, 120);
-    conn.withdrawSurfaceViewSize(1, "b");
+    expect(resizes()).toEqual([{ w: 800, h: 600, s: 120 }]);
+  });
+
+  /** Per axis, so a view that is wider but shorter constrains only its
+   *  own axis. */
+  it("constrains each axis independently", () => {
+    conn.offerSurfaceViewSize(1, "wide", 1600, 400, 120);
+    conn.offerSurfaceViewSize(1, "tall", 800, 1200, 120);
+    expect(resizes().at(-1)).toEqual({ w: 800, h: 400, s: 120 });
+  });
+
+  /** Density is the other half of the fold: the surface renders at the
+   *  highest scale any view will display it at, and the logical box is
+   *  what has to fit everywhere.  Both views want 800×600 logical, so
+   *  that is what is asked for — expressed at 2×. */
+  it("takes the highest density and keeps the logical box", () => {
+    conn.offerSurfaceViewSize(1, "1x", 800, 600, 120);
+    conn.offerSurfaceViewSize(1, "2x", 1600, 1200, 240);
+    expect(resizes().at(-1)).toEqual({ w: 1600, h: 1200, s: 240 });
+  });
+
+  /** A high-density view with a physically smaller pane is the tighter
+   *  constraint, and its own pixel extent is used verbatim rather than
+   *  round-tripped through logical space — 1001 → 501 → 1002 would hand
+   *  it a surface one pixel wider than the pane that asked for it. */
+  it("gives the constraining view its exact extent at the winning scale", () => {
+    conn.offerSurfaceViewSize(1, "1x", 4000, 3000, 120);
+    conn.offerSurfaceViewSize(1, "2x", 1001, 601, 240);
+    expect(resizes().at(-1)).toEqual({ w: 1001, h: 601, s: 240 });
+  });
+
+  it("re-derives the request when the constraining view withdraws", () => {
+    conn.offerSurfaceViewSize(1, "a", 800, 600, 120);
+    conn.offerSurfaceViewSize(1, "b", 1024, 768, 120);
+    conn.withdrawSurfaceViewSize(1, "a");
     expect(resizes()).toEqual([
       { w: 800, h: 600, s: 120 },
       { w: 1024, h: 768, s: 120 },
-      { w: 800, h: 600, s: 120 },
     ]);
+  });
+
+  it("leaves the request alone when a non-constraining view withdraws", () => {
+    conn.offerSurfaceViewSize(1, "a", 800, 600, 120);
+    conn.offerSurfaceViewSize(1, "b", 1024, 768, 120);
+    conn.withdrawSurfaceViewSize(1, "b");
+    expect(resizes()).toEqual([{ w: 800, h: 600, s: 120 }]);
   });
 
   it("unsets only when the last sized view withdraws", () => {

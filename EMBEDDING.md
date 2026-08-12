@@ -173,6 +173,22 @@ function AppWindow({
 }
 ```
 
+`touchMode` chooses how touchscreen contacts reach the app. The default,
+`"pointer"`, maps touch to Blit's own gestures: tap to click, one-finger drag to
+scroll, long-press for right-click. `"direct"` forwards every contact to the
+app's own `wl_touch`, so pinch, rotate, and multi-finger gestures belong to the
+app. It is safe to set unconditionally — a server without multitouch support
+keeps the pointer mapping — and safe to change at runtime, which does not
+restart the video stream. Trackpads and pens are unaffected either way.
+
+```tsx
+<BlitSurfaceView
+  connectionId={connectionId}
+  surfaceId={surfaceId}
+  touchMode="direct"
+/>
+```
+
 Every terminal has an experimental Wayland compositor available. Any command — shell, TUI, or GUI — can open Wayland surfaces:
 
 ```tsx

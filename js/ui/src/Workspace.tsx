@@ -19,7 +19,13 @@ import {
   createBlitWorkspaceState,
   createBlitWorkspaceConnection,
 } from "@blit-sh/solid";
-import { BlitWorkspace, PALETTES, LSP_STATUS_OK, isIOS } from "@blit-sh/core";
+import {
+  BLIT_SURFACE_TEXT_INPUT_EVENT,
+  BlitWorkspace,
+  PALETTES,
+  LSP_STATUS_OK,
+  isIOS,
+} from "@blit-sh/core";
 import type {
   BlitTransport,
   BlitSession,
@@ -32,6 +38,7 @@ import type {
   LinkHover,
   UrlAssessment,
   BlitActivity,
+  BlitSurfaceTextInputEvent,
 } from "@blit-sh/core";
 import type { ConnectionSpec } from "./App";
 import { createMetrics } from "./createMetrics";
@@ -52,6 +59,7 @@ import {
   SURFACE_MAX_FPS_KEY,
   SURFACE_ZOOM_KEY,
   SURFACE_ZOOM_MODE_KEY,
+  SURFACE_TOUCH_MODE_KEY,
   MIN_SURFACE_ZOOM,
   MAX_SURFACE_ZOOM,
   LEFT_DOCK_WIDTH_KEY,
@@ -72,6 +80,7 @@ import {
   preferredSurfaceMaxFps,
   preferredSurfaceZoom,
   preferredSurfaceZoomMode,
+  preferredSurfaceTouchMode,
   preferredLeftDockWidth,
   preferredPreviewPanelWidth,
   MIN_PREVIEW_PANEL_WIDTH,
@@ -96,6 +105,7 @@ import {
   reorderRoots,
   type Root,
   type SurfaceZoomMode,
+  type SurfaceTouchMode,
 } from "./storage";
 import type { UIScale, Theme } from "./theme";
 import {
@@ -626,6 +636,9 @@ function WorkspaceScreen(props: {
   const [surfaceZoomMode, setSurfaceZoomMode] = createSignal(
     preferredSurfaceZoomMode(),
   );
+  const [surfaceTouchMode, setSurfaceTouchMode] = createSignal(
+    preferredSurfaceTouchMode(),
+  );
   // Panel chrome in the URL hash (d= open side panels, x= expanded left-dock
   // sections) is authoritative when present; absent keys fall back to
   // localStorage/defaults. Parsed once up front — the focus params (s=/t=)
@@ -1033,6 +1046,11 @@ function WorkspaceScreen(props: {
   // Sticky virtual keyboard: track explicit user intent so the keyboard
   // isn't dismissed when tapping elsewhere on the page.
   const [keyboardWanted, setKeyboardWanted] = createSignal(false);
+  // A remote Wayland enable may raise the keyboard automatically. An
+  // explicit status-bar toggle outranks its later disable until the user
+  // dismisses or toggles the keyboard again.
+  let keyboardManualOverride = false;
+  let automaticKeyboardInput: HTMLTextAreaElement | null = null;
   const terminalInputSelector =
     'textarea[aria-label="Terminal input"][tabindex]:not([readonly])';
   // A surface pane's IME textarea (BlitSurfaceCanvas creates it next to the
@@ -1057,7 +1075,11 @@ function WorkspaceScreen(props: {
     const suppress = isMobileTouch() && !keyboardWanted();
     const stampOne = (el: Element) => {
       if (suppress) el.setAttribute("inputmode", "none");
-      else el.removeAttribute("inputmode");
+      else {
+        const desired = (el as HTMLElement).dataset.blitInputmode;
+        if (desired) el.setAttribute("inputmode", desired);
+        else el.removeAttribute("inputmode");
+      }
     };
     const stamp = (root: ParentNode) => {
       for (const el of root.querySelectorAll(stampSelector)) stampOne(el);
@@ -1128,6 +1150,69 @@ function WorkspaceScreen(props: {
     );
   }
 
+  function enableKeyboardInput(el: HTMLElement): void {
+    const desired = el.dataset.blitInputmode;
+    if (desired) el.setAttribute("inputmode", desired);
+    else el.removeAttribute("inputmode");
+  }
+
+  // A committed Wayland text-input enable is the remote field asking for an
+  // input panel. Only honor it for the surface this viewer already focused;
+  // another viewer shares the same Wayland seat and must not pop keyboards on
+  // every connected phone. Browser policy still makes showing best-effort.
+  onMount(() => {
+    const handler = (raw: Event) => {
+      const event = raw as BlitSurfaceTextInputEvent;
+      const input = event.target;
+      if (!(input instanceof HTMLTextAreaElement)) return;
+      if (!input.matches(surfaceInputSelector) || !isMobileTouch()) return;
+
+      const state = event.detail;
+      if (!state.enabled) {
+        if (automaticKeyboardInput !== input || keyboardManualOverride) return;
+        queueMicrotask(() => {
+          // An old surface's disable can be immediately followed by the new
+          // focused field's enable. Let that handoff replace the owner before
+          // deciding whether the keyboard should go away.
+          if (automaticKeyboardInput !== input || keyboardManualOverride)
+            return;
+          automaticKeyboardInput = null;
+          setKeyboardWanted(false);
+          if (document.activeElement === input) input.blur();
+        });
+        return;
+      }
+      if (!state.requested) return;
+      const locallyFocused =
+        document.activeElement === input ||
+        !!input.closest('[data-blit-bsp-focused="true"]');
+      if (!locallyFocused) return;
+
+      if (!keyboardWanted()) {
+        keyboardManualOverride = false;
+        automaticKeyboardInput = input;
+        setKeyboardWanted(true);
+      } else if (!keyboardManualOverride) {
+        automaticKeyboardInput = input;
+      }
+      enableKeyboardInput(input);
+      input.focus({ preventScroll: true });
+      try {
+        (
+          navigator as { virtualKeyboard?: { show?: () => void } }
+        ).virtualKeyboard?.show?.();
+      } catch {
+        // Safari/Chromium may reject programmatic show without a sufficiently
+        // recent user activation; focusing the editable target is the
+        // portable best effort.
+      }
+    };
+    document.addEventListener(BLIT_SURFACE_TEXT_INPUT_EVENT, handler);
+    onCleanup(() =>
+      document.removeEventListener(BLIT_SURFACE_TEXT_INPUT_EVENT, handler),
+    );
+  });
+
   function focusSettledElsewhere(): boolean {
     const active = document.activeElement;
     if (!(active instanceof HTMLElement)) return false;
@@ -1166,12 +1251,18 @@ function WorkspaceScreen(props: {
         document.activeElement instanceof HTMLElement &&
         document.activeElement.matches(keyboardInputSelector)
       ) {
+        keyboardManualOverride = true;
+        automaticKeyboardInput = null;
         setKeyboardWanted(true);
       }
       return;
     }
     if (viewportOccluded()) keyboardSeen = true;
-    else if (keyboardSeen) setKeyboardWanted(false);
+    else if (keyboardSeen) {
+      keyboardManualOverride = false;
+      automaticKeyboardInput = null;
+      setKeyboardWanted(false);
+    }
   });
 
   // While the keyboard is wanted, focus landing on a surface canvas would
@@ -1284,6 +1375,8 @@ function WorkspaceScreen(props: {
     // draining — the tap is the user asking for the keyboard again, and
     // taking the hide branch is exactly backwards.
     if (keyboardWanted() && occlusion() > 150) {
+      keyboardManualOverride = false;
+      automaticKeyboardInput = null;
       setKeyboardWanted(false);
       // Blur whatever actually holds the keyboard.  Matching only the terminal
       // selector missed a focused editor, and the fallback then blurred a
@@ -1298,12 +1391,14 @@ function WorkspaceScreen(props: {
     } else {
       const el = focusedKeyboardInput();
       if (!el) return;
+      keyboardManualOverride = true;
+      automaticKeyboardInput = null;
       setKeyboardWanted(true);
       // The stamping effect above has cleared inputmode="none" by now (Solid
       // runs it synchronously on the write), but the IME decision happens on
       // this very element in this very gesture — clear it directly rather
       // than trust effect ordering.
-      el.removeAttribute("inputmode");
+      enableKeyboardInput(el);
       if (el === preTapFocus) {
         // A keyboard already up for this very element was only missing the
         // intent — adopt it without any focus churn, which would just
@@ -1783,7 +1878,7 @@ function WorkspaceScreen(props: {
         setActiveTile(null);
         setActiveLayout(fromHash);
       } else if (!fromHash && activeLayout()) {
-        setActiveLayout(null);
+        exitBspLayout();
       }
     };
     window.addEventListener("hashchange", onHashChange);
@@ -2213,7 +2308,7 @@ function WorkspaceScreen(props: {
   const placeTile = (assignment: string, paneId: string | null) => {
     if (navKeyFor(paneId) === NAV_NONBSP) {
       if (activeLayout()) {
-        setActiveLayout(null);
+        exitBspLayout();
         saveActiveLayout(null); // persist, or a remount resurrects it
       }
       setActiveTile(assignment);
@@ -2371,7 +2466,7 @@ function WorkspaceScreen(props: {
     }
     recordNav(NAV_NONBSP, assignment);
     if (activeLayout()) {
-      setActiveLayout(null);
+      exitBspLayout();
       saveActiveLayout(null); // persist, or a remount resurrects it
     }
     setActiveTile(assignment);
@@ -3186,6 +3281,11 @@ function WorkspaceScreen(props: {
     writeStorage(SURFACE_ZOOM_MODE_KEY, mode);
   }
 
+  function changeSurfaceTouchMode(mode: SurfaceTouchMode) {
+    setSurfaceTouchMode(mode);
+    writeStorage(SURFACE_TOUCH_MODE_KEY, mode);
+  }
+
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
     | ((sessionId: SessionId, targetPaneId: string) => void)
@@ -3243,6 +3343,28 @@ function WorkspaceScreen(props: {
       ) ?? null
     );
   });
+
+  /** Leave BSP without dropping the focused surface back into the preview
+   *  panel. Terminal focus already lives in BlitWorkspace, but surface focus
+   *  is derived from the BSP assignment while the container is mounted. Move
+   *  it into the non-BSP focus slot before clearing assignments so the new
+   *  foreground view mounts, offers its full size, and survives the old BSP
+   *  view's resize withdrawal. */
+  function exitBspLayout() {
+    if (inBsp()) {
+      const surface = bspFocusedSurface();
+      // Only when the focused pane actually holds a surface. Clearing the slot
+      // in the `else` would discard whatever surface the user had focused
+      // *before* entering BSP — so leaving a layout of terminals demoted that
+      // surface to the preview panel, the opposite of the point of this.
+      if (surface) {
+        setActiveTile(null);
+        focusSurfaceById(surface.surfaceId, surface.connectionId);
+      }
+    }
+    setLayoutAssignments(null);
+    setActiveLayout(null);
+  }
 
   function switchSession(sessionId: SessionId) {
     focusSessionFromUi(sessionId);
@@ -4078,6 +4200,7 @@ function WorkspaceScreen(props: {
                                 resizable
                                 zoom={surfaceZoom() / 100}
                                 zoomMode={surfaceZoomMode()}
+                                touchMode={surfaceTouchMode()}
                                 style={{
                                   width: "100%",
                                   height: "100%",
@@ -4144,6 +4267,7 @@ function WorkspaceScreen(props: {
                     fontSize={fontSize()}
                     surfaceZoom={surfaceZoom() / 100}
                     surfaceZoomMode={surfaceZoomMode()}
+                    surfaceTouchMode={surfaceTouchMode()}
                     focusedSessionId={wsState().focusedSessionId}
                     lruSessionIds={lru}
                     liveSurfaceKeys={surfaces().map(
@@ -4421,8 +4545,7 @@ function WorkspaceScreen(props: {
                 setRecentLayouts(loadRecentLayouts());
               }}
               onClearLayout={() => {
-                setLayoutAssignments(null);
-                setActiveLayout(null);
+                exitBspLayout();
                 saveActiveLayout(null);
                 closeOverlay();
               }}
@@ -4713,6 +4836,10 @@ function WorkspaceScreen(props: {
               surfaceMaxFps={surfaceMaxFps()}
               surfaceZoom={surfaceZoom()}
               surfaceZoomMode={surfaceZoomMode()}
+              surfaceTouchMode={surfaceTouchMode()}
+              surfaceTouchAvailable={allConnections().some(
+                (connection) => connection.supportsSurfaceTouch,
+              )}
               onAudioBitrateChange={changeAudioBitrate}
               onVideoBandwidthChange={changeVideoBandwidth}
               onVideoSpeedChange={changeVideoSpeed}
@@ -4721,6 +4848,7 @@ function WorkspaceScreen(props: {
               onSurfaceMaxFpsChange={changeSurfaceMaxFps}
               onSurfaceZoomChange={changeSurfaceZoom}
               onSurfaceZoomModeChange={changeSurfaceZoomMode}
+              onSurfaceTouchModeChange={changeSurfaceTouchMode}
               onToggleAudio={toggleAudio}
               onClose={closeOverlay}
             />

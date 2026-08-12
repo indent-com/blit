@@ -5,7 +5,7 @@
 use rustc_hash::FxHashMap;
 use wayland_server::backend::ObjectId;
 
-use super::imp::Surface;
+use super::imp::{MapState, Surface};
 
 /// Scale a logical dimension to physical pixels using scale_120
 /// (ceil so we never lose a pixel).
@@ -83,6 +83,15 @@ pub(crate) fn collect_gpu_layers(
     let Some(surf) = surfaces.get(surface_id) else {
         return;
     };
+    // An unmapped surface is not drawn, and neither is its subtree: children
+    // keep their own buffers across a parent unmap but are not mapped again
+    // until every ancestor has current content.  This is `mapped`, not
+    // `meta.contains_key`, because a mapped surface whose buffer we failed to
+    // upload has no meta — it just cannot be drawn, and disinheriting its
+    // descendants would blank content the client did commit successfully.
+    if surf.map_state != MapState::Mapped {
+        return;
+    }
     let (x, y) = (
         parent_x + surf.subsurface_position.0,
         parent_y + surf.subsurface_position.1,
@@ -111,19 +120,21 @@ pub(crate) fn collect_gpu_layers(
             // A crop that covers the whole buffer is the same as no crop,
             // and saying so keeps the renderer on its ordinary path.
             .filter(|&(u, v, w, h)| (u, v, w, h) != (0.0, 0.0, 1.0, 1.0));
-        static DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 20 || n.is_multiple_of(1000) {
-            eprintln!(
-                "[gpu-layer #{n}] sid={surface_id:?} pos=({x},{y}) pixel={}x{} scale={} viewport={:?} source={:?} logical={}x{}",
-                sm.width,
-                sm.height,
-                sm.scale,
-                surf.viewport_destination,
-                surf.viewport_source,
-                lw,
-                lh,
-            );
+        if gpu_layer_debug() {
+            static DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 20 || n.is_multiple_of(1000) {
+                eprintln!(
+                    "[gpu-layer #{n}] sid={surface_id:?} pos=({x},{y}) pixel={}x{} scale={} viewport={:?} source={:?} logical={}x{}",
+                    sm.width,
+                    sm.height,
+                    sm.scale,
+                    surf.viewport_destination,
+                    surf.viewport_source,
+                    lw,
+                    lh,
+                );
+            }
         }
         layers.push(GpuLayer {
             x,
@@ -136,7 +147,20 @@ pub(crate) fn collect_gpu_layers(
         });
     }
 
+    // Outside the meta block: the parent is mapped either way, and a child
+    // that uploaded successfully still belongs on screen when its parent's own
+    // buffer was rejected.
     for child_id in &surf.children {
         collect_gpu_layers(child_id, surfaces, meta, x, y, layers);
     }
+}
+
+/// `BLIT_DEBUG_GPU_LAYERS=1` traces every composited layer.  Off by default:
+/// this runs once per surface per composite, which is a per-frame cost on the
+/// hot path and unbounded stderr on a busy session.
+pub(crate) fn gpu_layer_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("BLIT_DEBUG_GPU_LAYERS").is_ok_and(|v| v != "0" && !v.is_empty())
+    })
 }

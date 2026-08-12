@@ -15,6 +15,8 @@ mod positioner;
 #[cfg(target_os = "linux")]
 mod render;
 #[cfg(target_os = "linux")]
+mod touch_pacer;
+#[cfg(target_os = "linux")]
 mod vulkan_encode;
 #[cfg(target_os = "linux")]
 mod vulkan_render;
@@ -134,10 +136,16 @@ mod stub {
     pub enum CursorImage {
         Named(String),
         Custom {
+            /// Surface-local (logical) hotspot, straight from
+            /// `wl_pointer.set_cursor`.
             hotspot_x: u16,
             hotspot_y: u16,
+            /// Dimensions of `rgba`, in buffer pixels.
             width: u16,
             height: u16,
+            /// The cursor surface's `buffer_scale`.  `width / scale` is the
+            /// cursor's logical size — the same space the hotspot is in.
+            scale: u16,
             rgba: Vec<u8>,
         },
         Hidden,
@@ -192,6 +200,13 @@ mod stub {
         SurfaceActivated {
             surface_id: u16,
         },
+        SurfaceTextInput {
+            surface_id: u16,
+            enabled: bool,
+            requested: bool,
+            hint: u32,
+            purpose: u32,
+        },
         SurfaceResized {
             surface_id: u16,
             width: u16,
@@ -210,6 +225,13 @@ mod stub {
             surface_id: u16,
             cursor: CursorImage,
         },
+        /// The compositor retired a direct-touch sequence on its own — the
+        /// contact's target unmapped, or touch was disabled.  Without this the
+        /// server would keep believing `owner_id` holds a live sequence and go
+        /// on refusing every other viewer's contacts.
+        TouchCancelled {
+            owner_id: Option<u64>,
+        },
     }
 
     pub enum CompositorCommand {
@@ -217,16 +239,21 @@ mod stub {
             surface_id: u16,
             keycode: u32,
             pressed: bool,
+            /// Browser key event `timeStamp` in whole ms; `0` for unknown.
+            time_ms: u32,
         },
         PointerMotion {
             surface_id: u16,
             x: f64,
             y: f64,
+            /// Browser event `timeStamp` in whole ms; `0` for unknown.
+            time_ms: u32,
         },
         PointerButton {
             surface_id: u16,
             button: u32,
             pressed: bool,
+            time_ms: u32,
         },
         PointerAxis {
             surface_id: u16,
@@ -236,6 +263,19 @@ mod stub {
             v120_y: i16,
             source: Option<u8>,
             stop: bool,
+            time_ms: u32,
+        },
+        SetTouchEnabled {
+            enabled: bool,
+        },
+        Touch {
+            owner_id: u64,
+            surface_id: u16,
+            phase: TouchPhase,
+            /// The originating browser's `TouchEvent.timeStamp` in whole ms, in
+            /// its own epoch.  Used only for the spacing between events.
+            time_ms: u32,
+            contacts: Vec<TouchPoint>,
         },
         SurfaceResize {
             surface_id: u16,
@@ -401,6 +441,21 @@ mod stub {
             client_id: Option<u64>,
         },
         Shutdown,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TouchPhase {
+        Down,
+        Up,
+        Motion,
+        Cancel,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct TouchPoint {
+        pub id: i32,
+        pub x: f64,
+        pub y: f64,
     }
 
     #[derive(Clone, Copy, Default)]

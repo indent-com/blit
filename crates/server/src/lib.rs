@@ -1,5 +1,7 @@
 use blit_alacritty::{SearchResult as AlacrittySearchResult, TerminalDriver as AlacrittyDriver};
-use blit_compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
+use blit_compositor::{
+    CompositorCommand, CompositorEvent, CompositorHandle, TouchPhase, TouchPoint,
+};
 use blit_remote::{
     C2S_ACK, C2S_CLIENT_FEATURES, C2S_CLIENT_METRICS, C2S_CLIPBOARD_GET, C2S_CLIPBOARD_LIST,
     C2S_CLIPBOARD_SET, C2S_CLOSE, C2S_COPY_RANGE, C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N,
@@ -10,24 +12,30 @@ use blit_remote::{
     C2S_SURFACE_DRAG_LEAVE, C2S_SURFACE_DRAG_MOTION, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT,
     C2S_SURFACE_LIST, C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2,
     C2S_SURFACE_PREEDIT, C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT,
-    C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
+    C2S_SURFACE_TOUCH, C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
     CAPTURE_FORMAT_PNG, CLIENT_FEATURE_SURFACE_TIMESTAMP_SUB_US, CREATE2_HAS_COMMAND,
     CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE, CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS,
     FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE,
     FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState,
-    KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST,
-    S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST,
-    S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID, STATUS_OTHER, STATUS_TOO_LARGE,
-    SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN,
-    build_update_msg, msg_hello, msg_s2c_clipboard_content, msg_s2c_clipboard_list,
-    msg_s2c_clipboard_owner, msg_s2c_scroll_offset, msg_s2c_used_rows, msg_surface_activated,
+    KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, REMOTE_INPUT_POINTER, REMOTE_INPUT_TOUCH, S2C_CLOSED,
+    S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS,
+    S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID,
+    STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME,
+    SURFACE_POINTER_AXIS2_LEN, SURFACE_POINTER_DOWN, SURFACE_POINTER_LEAVE, SURFACE_POINTER_MOVE,
+    SURFACE_POINTER_UP, SURFACE_TOUCH_CANCEL, SURFACE_TOUCH_DISABLE, SURFACE_TOUCH_DOWN,
+    SURFACE_TOUCH_ENABLE, SURFACE_TOUCH_MOTION, SURFACE_TOUCH_UP, build_update_msg, msg_hello,
+    msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_clipboard_owner,
+    msg_s2c_scroll_offset, msg_s2c_surface_remote_input, msg_s2c_used_rows, msg_surface_activated,
     msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
-    msg_surface_frame, msg_surface_frame_precise, msg_surface_resized, msg_surface_title,
-    msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
-    parse_surface_pointer_axis2,
+    msg_surface_frame, msg_surface_frame_precise, msg_surface_resized, msg_surface_text_input,
+    msg_surface_title, msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
+    parse_surface_pointer_axis2, parse_surface_touch,
 };
 #[cfg(target_os = "linux")]
-use blit_remote::{C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO, FEATURE_COMPOSITOR};
+use blit_remote::{
+    C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, FEATURE_AUDIO, FEATURE_COMPOSITOR,
+    FEATURE_SURFACE_TEXT_INPUT, FEATURE_SURFACE_TOUCH,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -650,6 +658,12 @@ struct CachedSurfaceInfo {
     app_id: String,
 }
 
+#[derive(Clone, Copy)]
+struct CachedSurfaceTextInput {
+    hint: u32,
+    purpose: u32,
+}
+
 /// Last committed pixel buffer for a surface, kept so we can re-encode a
 /// keyframe for late-joining clients without going back to the compositor.
 struct LastPixels {
@@ -781,6 +795,10 @@ struct SharedCompositor {
     /// client before READY so its first paste takes the correct path.
     wayland_clipboard_owned: bool,
     surfaces: FxHashMap<u16, CachedSurfaceInfo>,
+    /// Enabled text-input state by toplevel. Disabled entries are removed;
+    /// the remaining state is replayed after `SURFACE_CREATED` to viewers
+    /// joining an existing compositor session.
+    surface_text_inputs: FxHashMap<u16, CachedSurfaceTextInput>,
     /// Latest pixel snapshot per `(surface_id, width, height)`.  The
     /// compositor renders one surface into multiple per-target buffers
     /// (one per registered per-client encoder size) plus a native BGRA
@@ -915,6 +933,27 @@ struct SharedCompositor {
 /// viewer resizes still have to be coalesced, and non-browser clients reach
 /// `C2S_SURFACE_RESIZE` with no debounce at all.
 const SURFACE_RESIZE_SETTLE: Duration = Duration::from_millis(100);
+
+/// How long a viewer's size claim outlives its subscription.
+///
+/// Only long enough to ride out churn, not absence. A view being remounted —
+/// a pane handed between two places in the UI, a page briefly hidden — drops
+/// its subscription and takes it straight back, and letting the claim die in
+/// that gap resizes the window for every other viewer twice for nothing. The
+/// client's own deferred unsubscribe is 250ms, so this covers a remount
+/// several times over.
+///
+/// Anything longer is absence, and absence has to be believed quickly:
+/// closing an iPad unsubscribes without ever dropping the socket, and until
+/// the claim expires a pane on the other side of the world is still the width
+/// of a tablet nobody is looking at.
+///
+/// This used to be seconds, to protect against a viewer hiding its tab and
+/// dragging every *other* surface with it. That was the global output scale
+/// doing the dragging; with density per surface, a viewer leaving now only
+/// touches the surfaces it was actually watching, so the window can be as
+/// short as the churn it exists to absorb.
+const SURFACE_CLAIM_GRACE: Duration = Duration::from_millis(750);
 
 /// How long a subscriber holds out for the `OPAQUE_FD` publish it asked for
 /// before re-registering the shared target.
@@ -1906,6 +1945,10 @@ struct ClientState {
     /// 60 = 0.5×, 120 = 1×, 240 = 2×. It may be the viewer's DPR or
     /// an exact scale selected independently of DPR.
     surface_view_sizes: FxHashMap<u16, (u16, u16, u16)>,
+    /// When each unsubscribed claim in `surface_view_sizes` stops counting.
+    /// Absent means the claim is live — the viewer is watching, or is within
+    /// `SURFACE_CLAIM_GRACE` of having stopped.
+    surface_claim_lapses: FxHashMap<u16, Instant>,
     /// Intersection of codec support across all surfaces for this client.
     /// Used to pick an encoder the client can decode.  0 = accept anything.
     surface_codec_support: u8,
@@ -1925,6 +1968,14 @@ struct ClientState {
     /// surfaces.  On disconnect we send synthetic key-up events for each
     /// so modifiers don't stay stuck and keys don't auto-repeat forever.
     pressed_surface_keys: HashSet<u32>,
+    /// This viewer requested direct-touch delivery rather than the browser's
+    /// pointer/gesture emulation.
+    direct_touch_enabled: bool,
+    /// Browser contact identifiers currently down for this connection, each with
+    /// its latest position in composited-frame pixels.  The positions are what
+    /// the shared-input mirror draws on the other viewers, so they have to be the
+    /// whole live set and not just the contacts a message changed.
+    surface_touch_ids: HashMap<i32, TouchMark>,
     /// Browser drag-and-drop session in flight (`C2S_SURFACE_DRAG_*`), at
     /// most one per connection: a second ENTER retargets.
     drag_session: Option<DragSession>,
@@ -3310,6 +3361,16 @@ fn send_outbox_tracked(
     Ok(())
 }
 
+/// A composited-frame position as the unsigned wire fields carry it.
+///
+/// Touch contacts arrive as signed sub-pixel floats — the transport encodes them
+/// ×100 as `i32` — but the shared-input mirror is `u16`, so a contact in the
+/// letterbox margin has to be clamped rather than wrapped.
+fn frame_point(x: f64, y: f64) -> (u16, u16) {
+    let clamp = |v: f64| v.round().clamp(0.0, f64::from(u16::MAX)) as u16;
+    (clamp(x), clamp(y))
+}
+
 fn send_outbox(client: &ClientState, msg: Vec<u8>) -> Result<(), mpsc::error::SendError<Vec<u8>>> {
     send_outbox_tracked(
         &client.tx,
@@ -3760,6 +3821,43 @@ fn is_unset_view_size(rows: u16, cols: u16) -> bool {
     rows == 0 && cols == 0
 }
 
+/// This client's say in the size of `surface_id`, if it still has one.
+///
+/// A size claim is made by `C2S_SURFACE_RESIZE`. It is released by its 0×0
+/// unset, by the client going away, or by `SURFACE_CLAIM_GRACE` elapsing
+/// after the viewer stopped watching — but *not* by the unsubscribe itself.
+/// A viewer that stops streaming for a moment still has the pane it sized: a
+/// hidden page unsubscribes from every surface at once and resubscribes on
+/// the way back, and taking its say away for that window resized the Wayland
+/// window for every *other* viewer, then again when it returned.
+///
+/// A scaled subscriber asked to be served a downscale of whatever the
+/// surface happens to be, so it gets no say in how big that is. Counting it
+/// would defeat the isolation: a fixed encode box is a transport request,
+/// not a request to reconfigure the Wayland window the mediated viewers
+/// watch.
+fn surface_mediation_size(
+    client: &ClientState,
+    surface_id: u16,
+    now: Instant,
+) -> Option<(u16, u16, u16)> {
+    if client
+        .surface_subs
+        .get(&surface_id)
+        .is_some_and(|s| s.scaled_target.is_some())
+    {
+        return None;
+    }
+    if client
+        .surface_claim_lapses
+        .get(&surface_id)
+        .is_some_and(|&lapses_at| lapses_at <= now)
+    {
+        return None;
+    }
+    client.surface_view_sizes.get(&surface_id).copied()
+}
+
 /// A zero view scale is the legacy "unspecified" value and means 1×. Every
 /// non-zero value is literal, including sub-1× presentation scales.
 fn effective_view_scale_120(scale_120: u16) -> u32 {
@@ -4039,6 +4137,37 @@ struct Session {
     pixel_snapshot_len: usize,
     last_ping: Instant,
     clients: HashMap<u64, ClientState>,
+    /// The compositor has one seat, so one browser drives it at a time. That
+    /// browser's marks are hidden from itself — its own cursor and fingers are
+    /// already on its screen — and mirrored to every other subscribed viewer.
+    surface_inputs: HashMap<(u16, u8), SharedSurfaceInput>,
+    /// Direct touch is an implicit-grab sequence. Only this connection may
+    /// extend it until all of its contacts are up or it cancels.
+    surface_touch_owner: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SharedSurfaceInput {
+    owner: u64,
+    /// `REMOTE_INPUT_POINTER` or `REMOTE_INPUT_TOUCH`.  Also the map key, kept
+    /// here so a held entry can be compared and mirrored without it.
+    kind: u8,
+    /// One entry for a pointer, one per live contact for a touchscreen. Inline
+    /// capacity covers a five-finger gesture without allocating on the input
+    /// path.
+    points: SmallVec<[(u16, u16); 5]>,
+}
+
+/// A live browser contact: where it is, and which surface it landed on.
+///
+/// The surface matters because Wayland binds a contact to the surface it went
+/// down on, so one viewer's fingers can be spread across two panes — and marks
+/// have to be grouped by the surface they are actually on, or one pane's ring
+/// gets drawn in another pane's coordinate space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TouchMark {
+    surface_id: u16,
+    at: (u16, u16),
 }
 
 struct SearchResultRow {
@@ -4154,6 +4283,8 @@ impl Session {
             pixel_snapshot_len: 0,
             last_ping: Instant::now(),
             surface_frames_sent: 0,
+            surface_inputs: HashMap::new(),
+            surface_touch_owner: None,
         }
     }
 
@@ -4241,6 +4372,7 @@ impl Session {
                 handle,
                 wayland_clipboard_owned: false,
                 surfaces: FxHashMap::default(),
+                surface_text_inputs: FxHashMap::default(),
                 last_pixels: HashMap::new(),
                 last_opaque_pixels: HashMap::new(),
                 pixel_snapshot: Arc::new(Vec::new()),
@@ -4270,6 +4402,11 @@ impl Session {
                 #[cfg(target_os = "linux")]
                 last_audio_liveness_check: None,
             });
+            // A compositor started for this new client comes up with touch off,
+            // so re-assert whatever the existing viewers asked for.
+            if self.wants_direct_touch() {
+                self.sync_touch_capability();
+            }
             // Clients can report their display rates before the first GUI
             // request starts the compositor.  Seed the new output from the
             // current cross-client maximum instead of its hard-coded 60 Hz
@@ -4330,6 +4467,445 @@ impl Session {
     fn send_to_all(&self, msg: &[u8]) {
         for c in self.clients.values() {
             let _ = send_outbox(c, msg.to_vec());
+        }
+    }
+
+    /// Make `owner` the latest driver of `surface_id`'s pointer mark.
+    fn update_surface_pointer(&mut self, owner: u64, surface_id: u16, x: u16, y: u16) {
+        self.update_surface_input(
+            owner,
+            surface_id,
+            REMOTE_INPUT_POINTER,
+            std::iter::once((x, y)).collect(),
+        );
+    }
+
+    /// Mirror `owner`'s live marks of one kind on one surface to its peers.
+    ///
+    /// The owner is told to draw nothing: its own cursor and its own fingers are
+    /// already on its screen.
+    ///
+    /// Marks are held per `(surface, kind)`. Per surface because one user's
+    /// fingers can span two panes, and a single slot made each pane's motion
+    /// retire the other's — flicker at touch-move rate. Per kind because a
+    /// touchscreen laptop drives both at once, and a single slot made lifting a
+    /// finger erase that same viewer's live cursor.
+    fn update_surface_input(
+        &mut self,
+        owner: u64,
+        surface_id: u16,
+        kind: u8,
+        points: SmallVec<[(u16, u16); 5]>,
+    ) {
+        if points.is_empty() {
+            self.retire_surface_input(owner, surface_id, kind);
+            return;
+        }
+        let next = SharedSurfaceInput {
+            owner,
+            kind,
+            points,
+        };
+        let key = (surface_id, kind);
+        if self.surface_inputs.get(&key) == Some(&next) {
+            return;
+        }
+
+        // This runs on every forwarded input event — an unthrottled `mousemove`
+        // or `touchmove` rate — and each `send_outbox` counts against the frame
+        // budget that gates surface video and paced terminal output, so send only
+        // what actually changed.  The owner's own message is constant (draw
+        // nothing), so it needs sending once per hand-off, not once per motion.
+        let owner_changed = self.surface_inputs.get(&key).map(|held| held.owner) != Some(owner);
+        let mut mirrored: Option<Vec<u8>> = None;
+        for (&client_id, client) in &self.clients {
+            if !client.surface_subscriptions.contains(&surface_id) {
+                continue;
+            }
+            if client_id == owner {
+                if owner_changed {
+                    let _ =
+                        send_outbox(client, msg_s2c_surface_remote_input(surface_id, kind, &[]));
+                }
+                continue;
+            }
+            let msg = mirrored
+                .get_or_insert_with(|| msg_s2c_surface_remote_input(surface_id, kind, &next.points))
+                .clone();
+            let _ = send_outbox(client, msg);
+        }
+        self.surface_inputs.insert(key, next);
+    }
+
+    /// Withdraw one kind of mark from one surface, if `owner` still holds it.
+    fn retire_surface_input(&mut self, owner: u64, surface_id: u16, kind: u8) {
+        let key = (surface_id, kind);
+        if self.surface_inputs.get(&key).map(|held| held.owner) != Some(owner) {
+            return;
+        }
+        self.surface_inputs.remove(&key);
+        self.hide_surface_input(surface_id, kind);
+    }
+
+    /// A retire message names its kind, so it withdraws only those marks and
+    /// leaves the same viewer's other kind alone.
+    fn hide_surface_input(&self, surface_id: u16, kind: u8) {
+        let msg = msg_s2c_surface_remote_input(surface_id, kind, &[]);
+        for client in self.clients.values() {
+            if client.surface_subscriptions.contains(&surface_id) {
+                let _ = send_outbox(client, msg.clone());
+            }
+        }
+    }
+
+    /// Every mark on a surface is gone — it was destroyed.
+    fn clear_surface_pointer(&mut self, surface_id: u16) {
+        for kind in [REMOTE_INPUT_POINTER, REMOTE_INPUT_TOUCH] {
+            if self.surface_inputs.remove(&(surface_id, kind)).is_some() {
+                self.hide_surface_input(surface_id, kind);
+            }
+        }
+    }
+
+    /// Every mark this owner holds anywhere — it disconnected, or its pointer
+    /// left for somewhere this view cannot speak for.
+    fn clear_surface_pointer_owner(&mut self, owner: u64) {
+        let held: Vec<(u16, u8)> = self
+            .surface_inputs
+            .iter()
+            .filter(|(_, input)| input.owner == owner)
+            .map(|(&key, _)| key)
+            .collect();
+        for (surface_id, kind) in held {
+            self.surface_inputs.remove(&(surface_id, kind));
+            self.hide_surface_input(surface_id, kind);
+        }
+    }
+
+    /// Same, but only on one surface — for unsubscribe, which says nothing about
+    /// the other surfaces the client still watches.
+    fn clear_surface_pointer_owner_on(&mut self, owner: u64, surface_id: u16) {
+        for kind in [REMOTE_INPUT_POINTER, REMOTE_INPUT_TOUCH] {
+            self.retire_surface_input(owner, surface_id, kind);
+        }
+    }
+
+    /// Re-mirror every surface this viewer has contacts on, and retire the ones
+    /// it no longer does.
+    ///
+    /// Derived from the live contact set rather than from the event's surface: a
+    /// finger can lift on one pane while another stays down on a second, and
+    /// keying the retire off the incoming event left the first pane's rings on
+    /// screen with nothing on the glass.
+    ///
+    /// The whole live set per surface is sent every time, not just the contacts a
+    /// message changed: peers draw what is currently down, and a viewer that
+    /// joined mid-gesture has never seen the others.
+    fn mirror_owner_touch(&mut self, owner: u64) {
+        let mut per_surface: HashMap<u16, SmallVec<[(u16, u16); 5]>> = HashMap::new();
+        if let Some(client) = self.clients.get(&owner) {
+            for mark in client.surface_touch_ids.values() {
+                per_surface
+                    .entry(mark.surface_id)
+                    .or_default()
+                    .push(mark.at);
+            }
+        }
+        // A HashMap has no order, and an unstable one would make every motion
+        // event look like a change and defeat the dedup in `update_surface_input`.
+        for points in per_surface.values_mut() {
+            points.sort_unstable();
+        }
+        // Surfaces this owner still holds touch marks on but has no contacts on.
+        let stale: Vec<u16> = self
+            .surface_inputs
+            .iter()
+            .filter(|((surface_id, kind), held)| {
+                *kind == REMOTE_INPUT_TOUCH
+                    && held.owner == owner
+                    && !per_surface.contains_key(surface_id)
+            })
+            .map(|((surface_id, _), _)| *surface_id)
+            .collect();
+        for surface_id in stale {
+            self.retire_surface_input(owner, surface_id, REMOTE_INPUT_TOUCH);
+        }
+        for (surface_id, points) in per_surface {
+            self.update_surface_input(owner, surface_id, REMOTE_INPUT_TOUCH, points);
+        }
+    }
+
+    /// Whether any viewer still wants the seat's touch capability.
+    fn wants_direct_touch(&self) -> bool {
+        self.clients
+            .values()
+            .any(|client| client.direct_touch_enabled)
+    }
+
+    /// Push the seat capability that the current viewer set implies.
+    ///
+    /// One predicate instead of a hand-rolled refcount per call site: the
+    /// compositor's `set_touch_enabled` already early-returns on an unchanged
+    /// value, so this is safe to call unconditionally.
+    fn sync_touch_capability(&mut self) {
+        let enabled = self.wants_direct_touch();
+        if let Some(compositor) = self.compositor.as_mut() {
+            let _ = compositor
+                .handle
+                .command_tx
+                .send(CompositorCommand::SetTouchEnabled { enabled });
+            compositor.handle.wake();
+        }
+    }
+
+    /// The compositor retired a direct-touch sequence by itself (target
+    /// unmapped, touch disabled).  Drop the matching server-side ownership so
+    /// another viewer is not locked out until the old owner's fingers lift.
+    fn forget_touch_sequence(&mut self, owner_id: Option<u64>) {
+        let owners: Vec<u64> = match owner_id {
+            Some(owner) => vec![owner],
+            None => self.clients.keys().copied().collect(),
+        };
+        for owner in owners {
+            if self.surface_touch_owner == Some(owner) {
+                self.surface_touch_owner = None;
+            }
+            if let Some(client) = self.clients.get_mut(&owner) {
+                client.surface_touch_ids.clear();
+            }
+            // The fingers are gone as far as the compositor is concerned, so the
+            // peers must stop drawing them.
+            self.clear_surface_pointer_owner(owner);
+        }
+    }
+
+    fn handle_surface_touch(&mut self, client_id: u64, event: blit_remote::SurfaceTouchEvent) {
+        let Some(enabled) = self
+            .clients
+            .get(&client_id)
+            .map(|client| client.direct_touch_enabled)
+        else {
+            return;
+        };
+        let mut commands = Vec::new();
+
+        match event.phase {
+            SURFACE_TOUCH_ENABLE => {
+                if !enabled {
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.direct_touch_enabled = true;
+                    }
+                    self.sync_touch_capability();
+                }
+            }
+            SURFACE_TOUCH_DISABLE => {
+                if enabled {
+                    if self.surface_touch_owner == Some(client_id) {
+                        self.surface_touch_owner = None;
+                        commands.push(CompositorCommand::Touch {
+                            owner_id: client_id,
+                            surface_id: event.surface_id,
+                            phase: TouchPhase::Cancel,
+                            time_ms: event.time_ms,
+                            contacts: Vec::new(),
+                        });
+                    }
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.direct_touch_enabled = false;
+                        client.surface_touch_ids.clear();
+                    }
+                    self.clear_surface_pointer_owner(client_id);
+                    // Ordering matters: the cancel below must reach the
+                    // compositor before the capability withdrawal, so queue the
+                    // sync after `commands` is flushed.
+                }
+            }
+            SURFACE_TOUCH_CANCEL => {
+                if enabled && self.surface_touch_owner == Some(client_id) {
+                    self.surface_touch_owner = None;
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.surface_touch_ids.clear();
+                    }
+                    self.clear_surface_pointer_owner(client_id);
+                    commands.push(CompositorCommand::Touch {
+                        owner_id: client_id,
+                        surface_id: event.surface_id,
+                        phase: TouchPhase::Cancel,
+                        time_ms: event.time_ms,
+                        contacts: Vec::new(),
+                    });
+                }
+            }
+            SURFACE_TOUCH_DOWN => {
+                if !enabled || event.contacts.is_empty() {
+                    return;
+                }
+                if let Some(owner) = self.surface_touch_owner {
+                    if owner != client_id {
+                        return;
+                    }
+                } else {
+                    self.surface_touch_owner = Some(client_id);
+                }
+                let contacts = self
+                    .clients
+                    .get_mut(&client_id)
+                    .map(|client| {
+                        event
+                            .contacts
+                            .into_iter()
+                            .filter(|point| {
+                                client
+                                    .surface_touch_ids
+                                    .insert(
+                                        point.identifier,
+                                        TouchMark {
+                                            surface_id: event.surface_id,
+                                            at: frame_point(point.x, point.y),
+                                        },
+                                    )
+                                    .is_none()
+                            })
+                            .map(|point| TouchPoint {
+                                id: point.identifier,
+                                x: point.x,
+                                y: point.y,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if !contacts.is_empty() {
+                    commands.push(CompositorCommand::Touch {
+                        owner_id: client_id,
+                        surface_id: event.surface_id,
+                        phase: TouchPhase::Down,
+                        time_ms: event.time_ms,
+                        contacts,
+                    });
+                }
+                self.mirror_owner_touch(client_id);
+            }
+            SURFACE_TOUCH_MOTION => {
+                if !enabled || self.surface_touch_owner != Some(client_id) {
+                    return;
+                }
+                let contacts = self
+                    .clients
+                    .get_mut(&client_id)
+                    .map(|client| {
+                        event
+                            .contacts
+                            .into_iter()
+                            .filter(|point| {
+                                // Only contacts already down, and record the new
+                                // position for the mirror while we are here.
+                                let live = client.surface_touch_ids.contains_key(&point.identifier);
+                                if live {
+                                    client.surface_touch_ids.insert(
+                                        point.identifier,
+                                        TouchMark {
+                                            surface_id: event.surface_id,
+                                            at: frame_point(point.x, point.y),
+                                        },
+                                    );
+                                }
+                                live
+                            })
+                            .map(|point| TouchPoint {
+                                id: point.identifier,
+                                x: point.x,
+                                y: point.y,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if !contacts.is_empty() {
+                    commands.push(CompositorCommand::Touch {
+                        owner_id: client_id,
+                        surface_id: event.surface_id,
+                        phase: TouchPhase::Motion,
+                        time_ms: event.time_ms,
+                        contacts,
+                    });
+                }
+                self.mirror_owner_touch(client_id);
+            }
+            SURFACE_TOUCH_UP => {
+                if !enabled || self.surface_touch_owner != Some(client_id) {
+                    return;
+                }
+                let (contacts, empty) = self
+                    .clients
+                    .get_mut(&client_id)
+                    .map(|client| {
+                        let contacts = event
+                            .contacts
+                            .into_iter()
+                            .filter(|point| {
+                                client.surface_touch_ids.remove(&point.identifier).is_some()
+                            })
+                            .map(|point| TouchPoint {
+                                id: point.identifier,
+                                x: point.x,
+                                y: point.y,
+                            })
+                            .collect::<Vec<_>>();
+                        (contacts, client.surface_touch_ids.is_empty())
+                    })
+                    .unwrap_or_default();
+                if !contacts.is_empty() {
+                    commands.push(CompositorCommand::Touch {
+                        owner_id: client_id,
+                        surface_id: event.surface_id,
+                        phase: TouchPhase::Up,
+                        time_ms: event.time_ms,
+                        contacts,
+                    });
+                }
+                if empty {
+                    self.surface_touch_owner = None;
+                }
+                // Also when the set emptied: that call retires the marks.
+                self.mirror_owner_touch(client_id);
+            }
+            _ => return,
+        }
+
+        if !commands.is_empty()
+            && let Some(compositor) = self.compositor.as_mut()
+        {
+            for command in commands {
+                let _ = compositor.handle.command_tx.send(command);
+            }
+            compositor.handle.wake();
+        }
+        if event.phase == SURFACE_TOUCH_DISABLE {
+            self.sync_touch_capability();
+        }
+    }
+
+    /// Seed a newly subscribed view with the marks already on this surface,
+    /// instead of waiting for the remote user to move again — which for a touch
+    /// gesture already in progress could be never.
+    fn send_surface_pointer_to(&self, client_id: u64, surface_id: u16) {
+        let Some(client) = self.clients.get(&client_id) else {
+            return;
+        };
+        // Both kinds: a viewer can be pointing with a mouse and touching at the
+        // same time, and each is a separate mark set.
+        for kind in [REMOTE_INPUT_POINTER, REMOTE_INPUT_TOUCH] {
+            let Some(input) = self.surface_inputs.get(&(surface_id, kind)) else {
+                continue;
+            };
+            // The driver draws nothing: its own cursor and fingers are already
+            // on its own screen.
+            if input.owner == client_id {
+                continue;
+            }
+            let _ = send_outbox(
+                client,
+                msg_s2c_surface_remote_input(surface_id, kind, &input.points),
+            );
         }
     }
 
@@ -4567,7 +5143,7 @@ impl Session {
     }
 
     /// The size the compositor should render this surface at, given every
-    /// client watching it.
+    /// client holding a claim on it.
     ///
     /// `prefs` is the configured encoder chain. Each viewer's encode ceiling
     /// is translated from its requested presentation scale to the
@@ -4583,30 +5159,13 @@ impl Session {
     ) -> Option<(u16, u16, u16)> {
         // Per axis: the tightest logical bound, plus the exact
         // physical extent and scale of the client that asked for it.
-        let compositor_scale = u32::from(self.compositor_scale_120());
+        let now = Instant::now();
+        let compositor_scale = u32::from(self.surface_scale_120(surface_id));
         let mut min_w: Option<(u32, u32, u16)> = None;
         let mut min_h: Option<(u32, u32, u16)> = None;
         let mut source_max: Option<(u16, u16)> = None;
         for c in self.clients.values() {
-            // Only count clients that are actually subscribed.  A
-            // stale view_size left behind by a client that unsubscribed but
-            // didn't clear the size (or that resized before its first
-            // subscribe) must not shrink everyone else's surface.
-            if !c.surface_subscriptions.contains(&surface_id) {
-                continue;
-            }
-            // A scaled subscriber asked to be served a downscale of whatever
-            // the surface happens to be, so it gets no say in how big that
-            // is.  Counting it would defeat the isolation: a fixed encode box
-            // is a transport request, not a request to reconfigure the
-            // Wayland window watched by the mediated viewers.
-            if c.surface_subs
-                .get(&surface_id)
-                .is_some_and(|s| s.scaled_target.is_some())
-            {
-                continue;
-            }
-            let Some(&(pw, ph, s)) = c.surface_view_sizes.get(&surface_id) else {
+            let Some((pw, ph, s)) = surface_mediation_size(c, surface_id, now) else {
                 continue;
             };
             let s_eff = effective_view_scale_120(s);
@@ -4690,24 +5249,60 @@ impl Session {
         Some((pw, ph, s as u16))
     }
 
-    /// The Wayland output has one scale shared by every surface.  Derive it
-    /// from every active mediated view, rather than whichever surface happened
-    /// to resize last.  Fixed-size scaled subscriptions are transport-only
-    /// downscales and deliberately have no say in compositor geometry.
-    fn compositor_scale_120(&self) -> u16 {
+    /// Drop claims whose grace has run out, and hand the surfaces they were
+    /// constraining back to the viewers still watching.  Returns when the
+    /// next claim comes due, so the delivery loop parks until then instead of
+    /// waiting for unrelated traffic to notice.
+    fn expire_surface_claims(
+        &mut self,
+        now: Instant,
+        prefs: &[SurfaceEncoderPreference],
+        verbose: bool,
+    ) -> Option<Instant> {
+        let mut next: Option<Instant> = None;
+        let mut expired: Vec<u16> = Vec::new();
+        for c in self.clients.values_mut() {
+            c.surface_claim_lapses.retain(|&sid, &mut lapses_at| {
+                if lapses_at > now {
+                    next = Some(next.map_or(lapses_at, |n: Instant| n.min(lapses_at)));
+                    return true;
+                }
+                c.surface_view_sizes.remove(&sid);
+                expired.push(sid);
+                false
+            });
+        }
+        if !expired.is_empty() {
+            expired.sort_unstable();
+            expired.dedup();
+            // A surface whose last claim just lapsed has no mediated size at
+            // all, so ask about every surface still being mediated too — the
+            // one that lapsed may have been holding down a scale others share
+            // nothing with, but the viewers left behind still need their own
+            // sizes applied.
+            expired.extend(self.mediated_surface_ids());
+            self.resize_surfaces_to_mediated_sizes(expired, prefs, verbose);
+        }
+        next
+    }
+
+    /// The density to composite one surface at: the highest any of *its*
+    /// viewers will actually display.
+    ///
+    /// Each toplevel is alone on its own `wl_output`, so this is a per-surface
+    /// question. Folding it across the session made every window follow the
+    /// densest viewer of any *other* window — and because the answer fed the
+    /// physical size of every surface, one viewer switching panes moved them
+    /// all, twice.
+    ///
+    /// Fixed-size scaled subscriptions are transport-only downscales and have
+    /// no say here, same as in `mediated_size_for_surface`.
+    fn surface_scale_120(&self, surface_id: u16) -> u16 {
+        let now = Instant::now();
         self.clients
             .values()
-            .flat_map(|c| {
-                c.surface_view_sizes
-                    .iter()
-                    .filter(move |(sid, _)| c.surface_subscriptions.contains(sid))
-                    .filter(move |(sid, _)| {
-                        !c.surface_subs
-                            .get(sid)
-                            .is_some_and(|sub| sub.scaled_target.is_some())
-                    })
-                    .map(|(_, &(_, _, scale_120))| scale_120)
-            })
+            .filter_map(|c| surface_mediation_size(c, surface_id, now))
+            .map(|(_, _, scale_120)| scale_120)
             .max()
             .unwrap_or(120)
             .max(120)
@@ -4744,16 +5339,14 @@ impl Session {
     /// output-density change requires all of these to be reconfigured at the
     /// new physical size, even when the triggering client watches only one.
     fn mediated_surface_ids(&self) -> Vec<u16> {
+        let now = Instant::now();
         self.clients
             .values()
             .flat_map(|c| {
-                c.surface_view_sizes.keys().copied().filter(|sid| {
-                    c.surface_subscriptions.contains(sid)
-                        && !c
-                            .surface_subs
-                            .get(sid)
-                            .is_some_and(|sub| sub.scaled_target.is_some())
-                })
+                c.surface_view_sizes
+                    .keys()
+                    .copied()
+                    .filter(move |&sid| surface_mediation_size(c, sid, now).is_some())
             })
             .collect()
     }
@@ -6006,6 +6599,12 @@ async fn tick(state: &AppState) -> TickOutcome {
     // subscribed to each sid so the first post-resize frame bypasses
     // the per-surface time gate.
     let mut resized_surface_ids: Vec<u16> = Vec::new();
+    // Destroyed surfaces also retire any shared-pointer overlay after the
+    // compositor borrow below is released.
+    let mut destroyed_surface_ids: Vec<u16> = Vec::new();
+    // Touch sequences the compositor retired by itself, applied to the
+    // server-side ownership after that same borrow ends.
+    let mut cancelled_touch_owners: Vec<Option<u64>> = Vec::new();
 
     let mut surface_commit_count = 0u32;
     if let Some(cs) = sess.compositor.as_mut() {
@@ -6049,6 +6648,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                 }
                 CompositorEvent::SurfaceDestroyed { surface_id } => {
                     cs.surfaces.remove(&surface_id);
+                    cs.surface_text_inputs.remove(&surface_id);
                     last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
                     last_pixels_remove_for_sid(&mut cs.last_opaque_pixels, surface_id);
                     cs.mark_pixel_snapshot_dirty();
@@ -6062,6 +6662,7 @@ async fn tick(state: &AppState) -> TickOutcome {
                     cs.frame_clocks_dirty = true;
                     cs.handle.set_frame_interval(surface_id, None);
                     invalidate_client_encoders.push(surface_id);
+                    destroyed_surface_ids.push(surface_id);
                     broadcast.push(msg_surface_destroyed(surface_id));
                 }
                 CompositorEvent::SurfaceCommit {
@@ -6173,6 +6774,23 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // focus the pane, which it answers with C2S_SURFACE_FOCUS.
                     broadcast.push(msg_surface_activated(surface_id));
                 }
+                CompositorEvent::SurfaceTextInput {
+                    surface_id,
+                    enabled,
+                    requested,
+                    hint,
+                    purpose,
+                } => {
+                    if enabled {
+                        cs.surface_text_inputs
+                            .insert(surface_id, CachedSurfaceTextInput { hint, purpose });
+                    } else {
+                        cs.surface_text_inputs.remove(&surface_id);
+                    }
+                    broadcast.push(msg_surface_text_input(
+                        surface_id, enabled, requested, hint, purpose,
+                    ));
+                }
                 CompositorEvent::SurfaceResized {
                     surface_id,
                     width,
@@ -6267,9 +6885,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                             hotspot_y,
                             width,
                             height,
+                            scale,
                             rgba,
                         } => {
-                            // Encode as PNG to keep message small.
+                            // Encode as PNG to keep message small.  The PNG
+                            // stays at the buffer's own resolution so a HiDPI
+                            // cursor is delivered sharp.
                             let mut png_buf = Vec::new();
                             {
                                 let mut encoder =
@@ -6280,15 +6901,22 @@ async fn tick(state: &AppState) -> TickOutcome {
                                     let _ = writer.write_image_data(rgba);
                                 }
                             }
+                            // The wire carries the *logical* extent, matching
+                            // the units the hotspot is already in, so a viewer
+                            // scales both by one factor.
+                            let scale = (*scale).max(1);
                             msg.push(2); // type = custom
                             msg.extend_from_slice(&hotspot_x.to_le_bytes());
                             msg.extend_from_slice(&hotspot_y.to_le_bytes());
-                            msg.extend_from_slice(&width.to_le_bytes());
-                            msg.extend_from_slice(&height.to_le_bytes());
+                            msg.extend_from_slice(&(width / scale).max(1).to_le_bytes());
+                            msg.extend_from_slice(&(height / scale).max(1).to_le_bytes());
                             msg.extend_from_slice(&png_buf);
                         }
                     }
                     broadcast.push(msg);
+                }
+                CompositorEvent::TouchCancelled { owner_id } => {
+                    cancelled_touch_owners.push(owner_id);
                 }
             }
         }
@@ -6297,6 +6925,14 @@ async fn tick(state: &AppState) -> TickOutcome {
         }
     }
     sess.surface_commits += surface_commit_count;
+
+    for surface_id in destroyed_surface_ids {
+        sess.clear_surface_pointer(surface_id);
+    }
+
+    for owner_id in cancelled_touch_owners {
+        sess.forget_touch_sequence(owner_id);
+    }
 
     // Apply deferred per-client encoder invalidation (couldn't mutate
     // sess.clients while sess.compositor was borrowed above).  Any
@@ -9445,6 +10081,16 @@ async fn tick(state: &AppState) -> TickOutcome {
         }
     }
 
+    // Retire size claims whose grace ran out, and re-mediate what they were
+    // holding.  Nothing else would notice: the viewer that left is silent by
+    // definition, and the ones still watching have no reason to re-offer a
+    // size their own pane never changed.
+    if let Some(due) =
+        sess.expire_surface_claims(now, &state.config.surface_encoders, state.config.verbose)
+    {
+        next_deadline = Some(next_deadline.map_or(due, |d: Instant| d.min(due)));
+    }
+
     // Dispatch resizes whose settle window closed, and park until the next
     // one comes due.  Done last so sizes armed earlier in this same tick —
     // `receilinged_surfaces` after an encoder is created — are accounted for.
@@ -12417,10 +13063,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 surface_inflight_frames: VecDeque::new(),
                 vulkan_video_surfaces: FxHashMap::default(),
                 surface_view_sizes: FxHashMap::default(),
+                surface_claim_lapses: FxHashMap::default(),
                 surface_codec_support: 0,
                 surface_max_decode: (0, 0),
                 surface_timestamp_sub_us: false,
                 pressed_surface_keys: HashSet::new(),
+                direct_touch_enabled: false,
+                surface_touch_ids: HashMap::new(),
                 drag_session: None,
                 drag_staging_dir: None,
             },
@@ -12439,7 +13088,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | blit_remote::fs::FEATURE_FS
                 | blit_remote::git::FEATURE_GIT;
             #[cfg(target_os = "linux")]
-            let features = features | FEATURE_COMPOSITOR;
+            let features =
+                features | FEATURE_COMPOSITOR | FEATURE_SURFACE_TOUCH | FEATURE_SURFACE_TEXT_INPUT;
             // BLIT_LSP=0 disables the family: the bit is simply not
             // advertised, matching the dispatch gate.
             let mut features = features;
@@ -12533,6 +13183,17 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         h,
                         logical(w, info.width, info.logical_width),
                         logical(h, info.height, info.logical_height),
+                    ));
+                }
+                if let Some(text_input) = cs.surface_text_inputs.get(&info.surface_id) {
+                    // Replay state, not a fresh show request. A reconnect must
+                    // not resurrect a keyboard the user explicitly dismissed.
+                    initial_msgs.push(msg_surface_text_input(
+                        info.surface_id,
+                        true,
+                        false,
+                        text_input.hint,
+                        text_input.purpose,
                     ));
                 }
             }
@@ -13702,6 +14363,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 let surface_id = u16::from_le_bytes([data[1], data[2]]);
                 let keycode = u32::from_le_bytes([data[3], data[4], data[5], data[6]]);
                 let pressed = data[7] != 0;
+                // The browser key event's own time, when the sender had one.
+                let time_ms = if data.len() >= 12 {
+                    u32::from_le_bytes([data[8], data[9], data[10], data[11]])
+                } else {
+                    0
+                };
                 if let Some(client) = sess.clients.get_mut(&client_id) {
                     if pressed {
                         client.pressed_surface_keys.insert(keycode);
@@ -13714,6 +14381,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         surface_id,
                         keycode,
                         pressed,
+                        time_ms,
                     });
                     cs.handle.wake();
                     state.delivery_notify.notify_one();
@@ -13782,13 +14450,22 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             }
             C2S_SURFACE_DRAG_MOTION if data.len() >= 7 => {
                 let surface_id = u16::from_le_bytes([data[1], data[2]]);
-                let x = f64::from(u16::from_le_bytes([data[3], data[4]]));
-                let y = f64::from(u16::from_le_bytes([data[5], data[6]]));
+                let pointer_x = u16::from_le_bytes([data[3], data[4]]);
+                let pointer_y = u16::from_le_bytes([data[5], data[6]]);
+                let x = f64::from(pointer_x);
+                let y = f64::from(pointer_y);
                 let active = sess
                     .clients
                     .get(&client_id)
                     .and_then(|c| c.drag_session.as_ref())
                     .is_some_and(|s| s.surface_id == surface_id);
+                // A drag moves the pointer like any other motion, and the
+                // browser sends no `C2S_SURFACE_POINTER` while one is in
+                // flight — so without this, peers watch the overlay sit frozen
+                // for the whole drag.
+                if active {
+                    sess.update_surface_pointer(client_id, surface_id, pointer_x, pointer_y);
+                }
                 if active && let Some(cs) = sess.compositor.as_mut() {
                     let _ = cs.handle.command_tx.send(CompositorCommand::DragMotion {
                         surface_id,
@@ -13813,6 +14490,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     let _ = cs.handle.command_tx.send(CompositorCommand::DragLeave);
                     cs.handle.wake();
                 }
+                // The drag mirrored this client's position while it was over the
+                // surface, and a browser fires no mouse events during a drag —
+                // so `mouseleave` will not arrive to retire the overlay. Without
+                // this, peers keep the ghost cursor frozen at the exit point for
+                // good.
+                sess.clear_surface_pointer_owner_on(client_id, surface_id);
                 state.delivery_notify.notify_one();
             }
             C2S_SURFACE_DRAG_DROP => {
@@ -13852,14 +14535,41 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     let _ = cs.handle.command_tx.send(CompositorCommand::DragCancel);
                     cs.handle.wake();
                 }
+                // Escape, or the drag left the window: the cursor is somewhere
+                // this view can no longer speak for, so retire the overlay
+                // rather than leave peers a ghost frozen where the drag died.
+                sess.clear_surface_pointer_owner(client_id);
                 state.delivery_notify.notify_one();
             }
             C2S_SURFACE_POINTER if data.len() >= 9 => {
                 let surface_id = u16::from_le_bytes([data[1], data[2]]);
                 let ptype = data[3];
                 let button = data[4];
-                let x = u16::from_le_bytes([data[5], data[6]]) as f64;
-                let y = u16::from_le_bytes([data[7], data[8]]) as f64;
+                let pointer_x = u16::from_le_bytes([data[5], data[6]]);
+                let pointer_y = u16::from_le_bytes([data[7], data[8]]);
+                // The browser event's own time, when it sent one. Anything that
+                // differentiates pointer motion needs the browser's spacing.
+                let time_ms = if data.len() >= 13 {
+                    u32::from_le_bytes([data[9], data[10], data[11], data[12]])
+                } else {
+                    0
+                };
+                let x = f64::from(pointer_x);
+                let y = f64::from(pointer_y);
+                match ptype {
+                    SURFACE_POINTER_DOWN | SURFACE_POINTER_UP | SURFACE_POINTER_MOVE => {
+                        sess.update_surface_pointer(client_id, surface_id, pointer_x, pointer_y);
+                    }
+                    // The pointer left the drawn area.  Withdraw this client's
+                    // overlay instead of leaving peers with a frozen ghost
+                    // cursor at the last in-surface position.
+                    SURFACE_POINTER_LEAVE => {
+                        sess.clear_surface_pointer_owner(client_id);
+                        state.delivery_notify.notify_one();
+                        continue;
+                    }
+                    _ => {}
+                }
                 if let Some(cs) = sess.compositor.as_mut() {
                     match ptype {
                         0 | 1 => {
@@ -13867,11 +14577,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 surface_id,
                                 x,
                                 y,
+                                time_ms,
                             });
                             let _ = cs.handle.command_tx.send(CompositorCommand::PointerButton {
                                 surface_id,
                                 button: evdev_button(button),
                                 pressed: ptype == 0,
+                                time_ms,
                             });
                         }
                         2 => {
@@ -13879,6 +14591,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 surface_id,
                                 x,
                                 y,
+                                time_ms,
                             });
                         }
                         _ => {}
@@ -13909,6 +14622,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         v120_y: 0,
                         source: None,
                         stop: false,
+                        // The legacy axis opcode carries no time; the compositor
+                        // falls back to its own clock.
+                        time_ms: 0,
                     });
                     cs.handle.wake();
                 }
@@ -13926,8 +14642,15 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         v120_y: ev.v120_y,
                         source: ev.source,
                         stop: ev.stop,
+                        time_ms: ev.time_ms,
                     });
                     cs.handle.wake();
+                }
+                state.delivery_notify.notify_one();
+            }
+            C2S_SURFACE_TOUCH => {
+                if let Some(event) = parse_surface_touch(&data) {
+                    sess.handle_surface_touch(client_id, event);
                 }
                 state.delivery_notify.notify_one();
             }
@@ -13947,9 +14670,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     let previous = c.surface_view_sizes.get(&surface_id).copied();
                     if is_unset_view_size(width, height) {
                         c.surface_view_sizes.remove(&surface_id);
+                        c.surface_claim_lapses.remove(&surface_id);
                     } else if width > 0 && height > 0 {
                         c.surface_view_sizes
                             .insert(surface_id, (width, height, scale_120));
+                        // A viewer that names a size is watching: whatever
+                        // countdown an earlier unsubscribe started is void.
+                        c.surface_claim_lapses.remove(&surface_id);
                     }
                     // A repeat of the size this client already asked for is
                     // not a resize.  Viewers re-offer a size whenever their
@@ -14185,6 +14912,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     );
                     cs.handle.wake();
                 }
+                // Watching again cancels the countdown started by the
+                // unsubscribe, so a viewer that comes back inside the grace
+                // window never lost its say and nothing moves.
+                if let Some(c) = sess.clients.get_mut(&client_id) {
+                    c.surface_claim_lapses.remove(&surface_id);
+                }
                 if first_subscribe || mediation_membership_changed {
                     let affected_surfaces = sess.mediated_surface_ids();
                     sess.resize_surfaces_to_mediated_sizes(
@@ -14192,6 +14925,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         &state.config.surface_encoders,
                         state.config.verbose,
                     );
+                }
+                if first_subscribe {
+                    sess.send_surface_pointer_to(client_id, surface_id);
                 }
                 // A first subscriber with an empty pixel cache would wait
                 // forever: the delivery loop can't build an encoder without
@@ -14229,8 +14965,18 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     c.surface_subs.remove(&surface_id);
                     forget_surface_inflight(c, surface_id);
                     removed_vulkan = c.vulkan_video_surfaces.remove(&surface_id).is_some();
-                    c.surface_view_sizes.remove(&surface_id);
+                    // `surface_view_sizes` deliberately survives, on a clock:
+                    // see `surface_mediation_size`.  Dropping the claim here
+                    // moved the surface for every other viewer on every tab
+                    // switch; keeping it forever left a pane the width of a
+                    // tablet whose lid was shut.
+                    c.surface_claim_lapses
+                        .insert(surface_id, Instant::now() + SURFACE_CLAIM_GRACE);
                 }
+                // A viewer that stopped watching this surface can no longer be
+                // driving the shared pointer on it, and its peers would keep
+                // drawing the ghost cursor forever otherwise.
+                sess.clear_surface_pointer_owner_on(client_id, surface_id);
                 if let Some(cs) = sess.compositor.as_mut() {
                     cs.frame_clocks_dirty = true;
                 }
@@ -14838,9 +15584,34 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         if let Some(cs) = sess.compositor.as_ref() {
             cs.audio_broadcast.unsubscribe(client_id);
         }
+        sess.clear_surface_pointer_owner(client_id);
         let client = sess.clients.remove(&client_id);
+        let owned_touch_sequence = sess.surface_touch_owner == Some(client_id);
+        if owned_touch_sequence {
+            sess.surface_touch_owner = None;
+        }
+        let had_direct_touch = client
+            .as_ref()
+            .is_some_and(|client| client.direct_touch_enabled);
         if let Some(cs) = sess.compositor.as_mut() {
             cs.frame_clocks_dirty = true;
+            if owned_touch_sequence {
+                let _ = cs.handle.command_tx.send(CompositorCommand::Touch {
+                    owner_id: client_id,
+                    surface_id: 0,
+                    phase: TouchPhase::Cancel,
+                    // No browser event behind this one; cancel carries no
+                    // position and ends the sequence, so it needs no pacing.
+                    time_ms: 0,
+                    contacts: Vec::new(),
+                });
+                cs.handle.wake();
+            }
+        }
+        // After the cancel above, so the sequence is retired before the seat
+        // loses the capability it was delivered through.
+        if had_direct_touch {
+            sess.sync_touch_capability();
         }
         // The departing client may have owned the maximum refresh rate.
         // Recompute after removal so the Wayland output follows the fastest
@@ -15583,10 +16354,13 @@ mod tests {
             surface_inflight_frames: VecDeque::new(),
             vulkan_video_surfaces: FxHashMap::default(),
             surface_view_sizes: FxHashMap::default(),
+            surface_claim_lapses: FxHashMap::default(),
             surface_codec_support: 0,
             surface_max_decode: (0, 0),
             surface_timestamp_sub_us: false,
             pressed_surface_keys: HashSet::new(),
+            direct_touch_enabled: false,
+            surface_touch_ids: HashMap::new(),
             drag_session: None,
             drag_staging_dir: None,
         };
@@ -15596,6 +16370,413 @@ mod tests {
     fn test_client() -> ClientState {
         let (client, _rx) = test_client_with_capacity(0);
         client
+    }
+
+    fn touch_event(
+        phase: u8,
+        identifiers: impl IntoIterator<Item = i32>,
+    ) -> blit_remote::SurfaceTouchEvent {
+        blit_remote::SurfaceTouchEvent {
+            surface_id: 7,
+            phase,
+            time_ms: 0,
+            contacts: identifiers
+                .into_iter()
+                .map(|identifier| blit_remote::SurfaceTouchPoint {
+                    identifier,
+                    x: 10.0,
+                    y: 20.0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn direct_touch_sequence_has_one_viewer_owner() {
+        let mut sess = Session::new();
+        sess.clients.insert(1, test_client());
+        sess.clients.insert(2, test_client());
+        sess.handle_surface_touch(1, touch_event(SURFACE_TOUCH_ENABLE, []));
+        sess.handle_surface_touch(2, touch_event(SURFACE_TOUCH_ENABLE, []));
+
+        sess.handle_surface_touch(1, touch_event(SURFACE_TOUCH_DOWN, [10, 11]));
+        assert_eq!(sess.surface_touch_owner, Some(1));
+        assert_eq!(
+            sess.clients.get(&1).unwrap().surface_touch_ids,
+            HashMap::from([
+                (
+                    10,
+                    TouchMark {
+                        surface_id: 7,
+                        at: (10, 20)
+                    }
+                ),
+                (
+                    11,
+                    TouchMark {
+                        surface_id: 7,
+                        at: (10, 20)
+                    }
+                ),
+            ])
+        );
+
+        // A second browser cannot splice a contact into the active seat
+        // sequence, even though it enabled direct mode too.
+        sess.handle_surface_touch(2, touch_event(SURFACE_TOUCH_DOWN, [20]));
+        assert!(sess.clients.get(&2).unwrap().surface_touch_ids.is_empty());
+        assert_eq!(sess.surface_touch_owner, Some(1));
+
+        sess.handle_surface_touch(1, touch_event(SURFACE_TOUCH_UP, [10]));
+        assert_eq!(sess.surface_touch_owner, Some(1));
+        sess.handle_surface_touch(1, touch_event(SURFACE_TOUCH_UP, [11]));
+        assert_eq!(sess.surface_touch_owner, None);
+
+        sess.handle_surface_touch(2, touch_event(SURFACE_TOUCH_DOWN, [20]));
+        assert_eq!(sess.surface_touch_owner, Some(2));
+        sess.handle_surface_touch(2, touch_event(SURFACE_TOUCH_CANCEL, []));
+        assert_eq!(sess.surface_touch_owner, None);
+        assert!(sess.clients.get(&2).unwrap().surface_touch_ids.is_empty());
+    }
+
+    #[test]
+    fn shared_surface_pointer_is_hidden_from_its_owner_and_sent_to_peers() {
+        let mut sess = Session::new();
+        let (mut first, mut first_rx) = test_client_with_capacity(0);
+        let (mut second, mut second_rx) = test_client_with_capacity(0);
+        first.surface_subscriptions.insert(7);
+        second.surface_subscriptions.insert(7);
+        sess.clients.insert(1, first);
+        sess.clients.insert(2, second);
+
+        sess.update_surface_pointer(1, 7, 123, 456);
+        assert_eq!(
+            first_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_POINTER, &[])
+        );
+        assert_eq!(
+            second_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_POINTER, &[(123, 456)])
+        );
+
+        // Ownership follows the latest input. The old owner now sees the
+        // shared cursor; the new owner falls back to its native one.
+        sess.update_surface_pointer(2, 7, 321, 654);
+        assert_eq!(
+            first_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_POINTER, &[(321, 654)])
+        );
+        assert_eq!(
+            second_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_POINTER, &[])
+        );
+
+        sess.clear_surface_pointer_owner(2);
+        assert_eq!(
+            first_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_POINTER, &[])
+        );
+        assert_eq!(
+            second_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_POINTER, &[])
+        );
+        assert!(sess.surface_inputs.is_empty());
+    }
+
+    /// The browser sends pointer motion unthrottled and every one of these
+    /// messages counts against the outbox frame budget that gates surface video,
+    /// so only transitions may go on the wire.
+    #[test]
+    fn shared_surface_pointer_sends_only_transitions() {
+        let mut sess = Session::new();
+        let (mut owner, mut owner_rx) = test_client_with_capacity(0);
+        let (mut peer, mut peer_rx) = test_client_with_capacity(0);
+        owner.surface_subscriptions.insert(7);
+        peer.surface_subscriptions.insert(7);
+        sess.clients.insert(1, owner);
+        sess.clients.insert(2, peer);
+
+        sess.update_surface_pointer(1, 7, 10, 20);
+        assert_eq!(
+            owner_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_POINTER, &[])
+        );
+        assert_eq!(
+            peer_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_POINTER, &[(10, 20)])
+        );
+
+        // Same owner, same position: a button press at rest, or a mouse that
+        // reports without moving.  Nothing changed for anyone.
+        sess.update_surface_pointer(1, 7, 10, 20);
+        assert!(owner_rx.try_recv().is_err());
+        assert!(peer_rx.try_recv().is_err());
+
+        // Moving updates the peer's overlay, but the owner's `visible = 0` is
+        // already true and must not be repeated per motion event.
+        sess.update_surface_pointer(1, 7, 11, 20);
+        assert!(owner_rx.try_recv().is_err());
+        assert_eq!(
+            peer_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_POINTER, &[(11, 20)])
+        );
+
+        // A hand-off is a transition for both sides.
+        sess.update_surface_pointer(2, 7, 11, 20);
+        assert_eq!(
+            owner_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_POINTER, &[(11, 20)])
+        );
+        assert_eq!(
+            peer_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_POINTER, &[])
+        );
+    }
+
+    /// Unsubscribing is one of the two ways an owner stops pointing at a surface
+    /// without disconnecting; the other is `SURFACE_POINTER_LEAVE`.  Neither
+    /// retired the overlay, so peers kept a frozen ghost cursor forever.
+    #[test]
+    fn unsubscribing_the_pointer_owner_retires_the_overlay() {
+        let mut sess = Session::new();
+        let (mut owner, _owner_rx) = test_client_with_capacity(0);
+        let (mut peer, mut peer_rx) = test_client_with_capacity(0);
+        owner.surface_subscriptions.insert(7);
+        owner.surface_subscriptions.insert(8);
+        peer.surface_subscriptions.insert(7);
+        sess.clients.insert(1, owner);
+        sess.clients.insert(2, peer);
+
+        sess.update_surface_pointer(1, 7, 10, 20);
+        assert_eq!(
+            peer_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_POINTER, &[(10, 20)])
+        );
+
+        // A surface the owner is not driving says nothing about surface 7.
+        sess.clear_surface_pointer_owner_on(1, 8);
+        assert!(peer_rx.try_recv().is_err());
+        assert!(!sess.surface_inputs.is_empty());
+
+        sess.clear_surface_pointer_owner_on(1, 7);
+        assert_eq!(
+            peer_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_POINTER, &[])
+        );
+        assert!(sess.surface_inputs.is_empty());
+    }
+
+    /// One user's fingers can be in two panes at once. Marks are held per
+    /// surface, so each pane shows only its own contacts — mirroring the whole
+    /// set into one of them drew the other pane's fingers in this pane's
+    /// coordinate space, and a single slot made each pane's motion retire the
+    /// other's, flickering at touch-move rate.
+    #[test]
+    fn contacts_in_two_panes_are_mirrored_per_surface() {
+        let mut sess = Session::new();
+        let (mut owner, _owner_rx) = test_client_with_capacity(0);
+        let (mut peer, mut peer_rx) = test_client_with_capacity(0);
+        owner.direct_touch_enabled = true;
+        for sid in [7, 8] {
+            owner.surface_subscriptions.insert(sid);
+            peer.surface_subscriptions.insert(sid);
+        }
+        sess.clients.insert(1, owner);
+        sess.clients.insert(2, peer);
+
+        let down =
+            |surface_id: u16, identifier: i32, x: f64, y: f64| blit_remote::SurfaceTouchEvent {
+                surface_id,
+                time_ms: 0,
+                phase: SURFACE_TOUCH_DOWN,
+                contacts: vec![blit_remote::SurfaceTouchPoint { identifier, x, y }],
+            };
+        sess.handle_surface_touch(1, down(7, 10, 1900.0, 1000.0));
+        assert_eq!(
+            peer_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_TOUCH, &[(1900, 1000)])
+        );
+
+        // Pane 8's mark must not carry pane 7's finger, and pane 7's must not be
+        // retired just because another pane saw a contact.
+        sess.handle_surface_touch(1, down(8, 11, 5.0, 6.0));
+        assert_eq!(
+            peer_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(8, REMOTE_INPUT_TOUCH, &[(5, 6)])
+        );
+        assert!(peer_rx.try_recv().is_err(), "surface 7 was disturbed");
+
+        // Lifting pane 7's finger retires only pane 7 — even though the event
+        // that ends the gesture names a different surface than the one whose
+        // marks are going away.
+        sess.handle_surface_touch(
+            1,
+            blit_remote::SurfaceTouchEvent {
+                surface_id: 7,
+                phase: SURFACE_TOUCH_UP,
+                time_ms: 0,
+                contacts: vec![blit_remote::SurfaceTouchPoint {
+                    identifier: 10,
+                    x: 1900.0,
+                    y: 1000.0,
+                }],
+            },
+        );
+        assert_eq!(
+            peer_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_TOUCH, &[])
+        );
+        assert!(peer_rx.try_recv().is_err(), "surface 8 was disturbed");
+        assert!(sess.surface_inputs.contains_key(&(8, REMOTE_INPUT_TOUCH)));
+    }
+
+    /// A pointer and fingers from the same viewer are separate mark sets, so
+    /// lifting a finger must not erase that viewer's live cursor and a pointer
+    /// leave must not erase its fingers.
+    #[test]
+    fn pointer_and_touch_marks_do_not_retire_each_other() {
+        let mut sess = Session::new();
+        let (mut owner, _owner_rx) = test_client_with_capacity(0);
+        let (mut peer, mut peer_rx) = test_client_with_capacity(0);
+        owner.direct_touch_enabled = true;
+        owner.surface_subscriptions.insert(7);
+        peer.surface_subscriptions.insert(7);
+        sess.clients.insert(1, owner);
+        sess.clients.insert(2, peer);
+
+        sess.handle_surface_touch(1, touch_event(SURFACE_TOUCH_DOWN, [10]));
+        sess.update_surface_pointer(1, 7, 50, 60);
+        while peer_rx.try_recv().is_ok() {}
+
+        // The finger lifts: the cursor mark survives.
+        sess.handle_surface_touch(1, touch_event(SURFACE_TOUCH_UP, [10]));
+        assert_eq!(
+            peer_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_TOUCH, &[])
+        );
+        assert_eq!(
+            sess.surface_inputs
+                .get(&(7, REMOTE_INPUT_POINTER))
+                .map(|held| held.points.as_slice()),
+            Some(&[(50u16, 60u16)][..]),
+            "lifting a finger erased the same viewer's cursor"
+        );
+    }
+
+    /// Fingers are mirrored like a pointer is, so a viewer watching the same
+    /// surface can see what the person on the tablet is doing.
+    #[test]
+    fn direct_touch_contacts_are_mirrored_to_peers() {
+        let mut sess = Session::new();
+        let (mut owner, mut owner_rx) = test_client_with_capacity(0);
+        let (mut peer, mut peer_rx) = test_client_with_capacity(0);
+        owner.direct_touch_enabled = true;
+        owner.surface_subscriptions.insert(7);
+        peer.surface_subscriptions.insert(7);
+        sess.clients.insert(1, owner);
+        sess.clients.insert(2, peer);
+
+        let down = blit_remote::SurfaceTouchEvent {
+            surface_id: 7,
+            phase: SURFACE_TOUCH_DOWN,
+            time_ms: 0,
+            contacts: vec![
+                blit_remote::SurfaceTouchPoint {
+                    identifier: 10,
+                    x: 30.0,
+                    y: 40.0,
+                },
+                blit_remote::SurfaceTouchPoint {
+                    identifier: 11,
+                    x: 10.0,
+                    y: 20.0,
+                },
+            ],
+        };
+        sess.handle_surface_touch(1, down);
+        // Both contacts in one message, in a stable order — an unstable one
+        // would make every motion event look like a change.
+        assert_eq!(
+            peer_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_TOUCH, &[(10, 20), (30, 40)])
+        );
+        // The toucher draws nothing: its own fingers are on its own glass.
+        assert_eq!(
+            owner_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_TOUCH, &[])
+        );
+
+        // Moving one finger re-sends the whole live set, so a peer draws what is
+        // actually on the glass rather than only what changed.
+        sess.handle_surface_touch(
+            1,
+            blit_remote::SurfaceTouchEvent {
+                surface_id: 7,
+                phase: SURFACE_TOUCH_MOTION,
+                time_ms: 0,
+                contacts: vec![blit_remote::SurfaceTouchPoint {
+                    identifier: 11,
+                    x: 12.0,
+                    y: 22.0,
+                }],
+            },
+        );
+        assert_eq!(
+            peer_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_TOUCH, &[(12, 22), (30, 40)])
+        );
+        // Unchanged: no repeat, because these count against the video budget.
+        sess.handle_surface_touch(
+            1,
+            blit_remote::SurfaceTouchEvent {
+                surface_id: 7,
+                phase: SURFACE_TOUCH_MOTION,
+                time_ms: 0,
+                contacts: vec![blit_remote::SurfaceTouchPoint {
+                    identifier: 11,
+                    x: 12.0,
+                    y: 22.0,
+                }],
+            },
+        );
+        assert!(peer_rx.try_recv().is_err());
+        assert!(owner_rx.try_recv().is_err());
+
+        // Lifting the last finger retires the marks.
+        sess.handle_surface_touch(1, touch_event(SURFACE_TOUCH_UP, [10]));
+        assert_eq!(
+            peer_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_TOUCH, &[(12, 22)])
+        );
+        sess.handle_surface_touch(1, touch_event(SURFACE_TOUCH_UP, [11]));
+        assert_eq!(
+            peer_rx.try_recv().unwrap(),
+            msg_s2c_surface_remote_input(7, REMOTE_INPUT_TOUCH, &[])
+        );
+        assert!(sess.surface_inputs.is_empty());
+    }
+
+    /// The compositor cancels a sequence on its own when a contact's target
+    /// unmaps.  Without the event that says so, the server keeps the old owner
+    /// registered and refuses every other viewer's contacts.
+    #[test]
+    fn a_compositor_side_touch_cancel_releases_the_owner() {
+        let mut sess = Session::new();
+        sess.clients.insert(1, test_client());
+        sess.clients.insert(2, test_client());
+        sess.handle_surface_touch(1, touch_event(SURFACE_TOUCH_ENABLE, []));
+        sess.handle_surface_touch(2, touch_event(SURFACE_TOUCH_ENABLE, []));
+        sess.handle_surface_touch(1, touch_event(SURFACE_TOUCH_DOWN, [10]));
+        assert_eq!(sess.surface_touch_owner, Some(1));
+
+        sess.forget_touch_sequence(Some(1));
+        assert_eq!(sess.surface_touch_owner, None);
+        assert!(sess.clients.get(&1).unwrap().surface_touch_ids.is_empty());
+
+        // The other browser can start a sequence immediately, rather than
+        // waiting for viewer 1's fingers to happen to lift.
+        sess.handle_surface_touch(2, touch_event(SURFACE_TOUCH_DOWN, [20]));
+        assert_eq!(sess.surface_touch_owner, Some(2));
     }
 
     fn force_decoder_pressure(client: &mut ClientState, surface_id: u16, depth: u8) {
@@ -17553,31 +18734,55 @@ mod tests {
         );
     }
 
+    /// Density belongs to the surface, not the session.  A window watched
+    /// only at 1× is composited at 1× however many HiDPI viewers are looking
+    /// at *other* windows — each toplevel has its own `wl_output`, so there
+    /// is no shared number left to drag it around.
     #[test]
-    fn mediated_surface_size_uses_global_density_across_surfaces() {
+    fn mediated_surface_size_keeps_density_per_surface() {
         let mut session = Session::new();
-        let mut c1 = test_client();
-        let mut c2 = test_client();
-        c1.surface_view_sizes.insert(1, (1920, 1080, 240));
-        c1.surface_subscriptions.insert(1);
-        c2.surface_view_sizes.insert(2, (640, 480, 120));
-        c2.surface_subscriptions.insert(2);
-        session.clients.insert(1, c1);
-        session.clients.insert(2, c2);
+        let mut hidpi = test_client();
+        let mut lodpi = test_client();
+        hidpi.surface_view_sizes.insert(1, (1920, 1080, 240));
+        hidpi.surface_subscriptions.insert(1);
+        lodpi.surface_view_sizes.insert(2, (640, 480, 120));
+        lodpi.surface_subscriptions.insert(2);
+        session.clients.insert(1, hidpi);
+        session.clients.insert(2, lodpi);
         assert_eq!(
             session.mediated_size_for_surface(1, &[]),
             Some((1920, 1080, 240))
         );
         assert_eq!(
             session.mediated_size_for_surface(2, &[]),
-            Some((1280, 960, 240))
+            Some((640, 480, 120)),
+            "the 2x viewer of surface 1 has no say in surface 2's density"
         );
+        // …and the 1× surface does not change when the HiDPI client leaves,
+        // which is what used to move every window in the session.
         session.clients.remove(&1);
         assert_eq!(
             session.mediated_size_for_surface(2, &[]),
             Some((640, 480, 120))
         );
         assert_eq!(session.mediated_size_for_surface(3, &[]), None);
+    }
+
+    /// Two viewers of the *same* surface still negotiate: the densest one
+    /// wins, because that is the density this window will be displayed at.
+    #[test]
+    fn surface_density_is_the_highest_among_its_own_viewers() {
+        let mut session = Session::new();
+        let mut hidpi = test_client();
+        let mut lodpi = test_client();
+        hidpi.surface_view_sizes.insert(1, (1920, 1080, 240));
+        hidpi.surface_subscriptions.insert(1);
+        lodpi.surface_view_sizes.insert(1, (1280, 720, 120));
+        lodpi.surface_subscriptions.insert(1);
+        session.clients.insert(1, hidpi);
+        session.clients.insert(2, lodpi);
+        assert_eq!(session.surface_scale_120(1), 240);
+        assert_eq!(session.surface_scale_120(2), 120, "no viewers, no density");
     }
 
     #[test]
@@ -17850,23 +19055,123 @@ mod tests {
         );
     }
 
+    /// Hiding a tab unsubscribes from every surface and resubscribes on the
+    /// way back.  The pane it sized is still there, so its say has to survive
+    /// the gap: releasing it resized the window for every *other* viewer, and
+    /// again a moment later when the tab returned.
     #[test]
-    fn mediated_surface_size_ignores_unsubscribed_client() {
-        // Stale view_size from a client that hasn't (re)subscribed
-        // shouldn't drag the mediated size down for everyone.
+    fn mediated_surface_size_survives_an_unsubscribe() {
         let mut session = Session::new();
-        let mut c1 = test_client();
-        let mut c2 = test_client();
-        c1.surface_view_sizes.insert(1, (1920, 1080, 120));
-        c1.surface_subscriptions.insert(1);
-        // c2 has a tiny view_size but no subscription — should be skipped.
-        c2.surface_view_sizes.insert(1, (100, 100, 120));
-        session.clients.insert(1, c1);
-        session.clients.insert(2, c2);
+        let mut watching = test_client();
+        let mut hidden = test_client();
+        watching.surface_view_sizes.insert(1, (1920, 1080, 120));
+        watching.surface_subscriptions.insert(1);
+        // Subscription gone, claim kept on a countdown — exactly what the
+        // unsubscribe handler leaves behind.
+        hidden.surface_view_sizes.insert(1, (1000, 700, 240));
+        hidden
+            .surface_claim_lapses
+            .insert(1, Instant::now() + SURFACE_CLAIM_GRACE);
+        session.clients.insert(1, watching);
+        session.clients.insert(2, hidden);
         assert_eq!(
             session.mediated_size_for_surface(1, &[]),
-            Some((1920, 1080, 120))
+            Some((1000, 700, 240)),
+            "a hidden viewer keeps the surface at the size its pane needs"
         );
+        // The global output scale is what made this move *every* surface.
+        assert_eq!(session.surface_scale_120(1), 240);
+    }
+
+    /// A viewer that stays away is not coming back on this pane: an iPad
+    /// whose lid is shut unsubscribes and then goes silent forever, holding
+    /// the surface at a tablet's width for everyone still watching.  Once the
+    /// grace elapses the claim stops counting, and expiring it hands the
+    /// surface to whoever is left.
+    #[test]
+    fn a_lapsed_claim_stops_constraining_the_surface() {
+        let mut session = Session::new();
+        let mut watching = test_client();
+        let mut gone = test_client();
+        watching.surface_view_sizes.insert(1, (1920, 1080, 120));
+        watching.surface_subscriptions.insert(1);
+        gone.surface_view_sizes.insert(1, (1000, 700, 240));
+        // Unsubscribed longer ago than the grace allows.
+        let lapsed_at = Instant::now() - Duration::from_millis(1);
+        gone.surface_claim_lapses.insert(1, lapsed_at);
+        session.clients.insert(1, watching);
+        session.clients.insert(2, gone);
+
+        assert_eq!(
+            session.mediated_size_for_surface(1, &[]),
+            Some((1920, 1080, 120)),
+            "the viewer still watching gets its own size back"
+        );
+        assert_eq!(session.surface_scale_120(1), 120);
+
+        // Expiry is what actually retires the claim, and reports that there
+        // is nothing further to wait for.
+        assert_eq!(
+            session.expire_surface_claims(Instant::now(), &[], false),
+            None
+        );
+        let gone = session.clients.get(&2).unwrap();
+        assert!(gone.surface_view_sizes.is_empty());
+        assert!(gone.surface_claim_lapses.is_empty());
+    }
+
+    /// A claim still inside its grace is left alone, and the deadline comes
+    /// back so the delivery loop parks until it comes due rather than
+    /// discovering it by accident.
+    #[test]
+    fn a_claim_inside_its_grace_is_kept_and_scheduled() {
+        let mut session = Session::new();
+        let mut hidden = test_client();
+        hidden.surface_view_sizes.insert(1, (1000, 700, 240));
+        let due = Instant::now() + SURFACE_CLAIM_GRACE;
+        hidden.surface_claim_lapses.insert(1, due);
+        session.clients.insert(1, hidden);
+
+        assert_eq!(
+            session.expire_surface_claims(Instant::now(), &[], false),
+            Some(due)
+        );
+        assert_eq!(
+            session.mediated_size_for_surface(1, &[]),
+            Some((1000, 700, 240)),
+            "a viewer mid-tab-switch keeps its say"
+        );
+    }
+
+    /// …and closing the pane releases it without waiting.  That is the 0×0
+    /// unset in `C2S_SURFACE_RESIZE`, which removes the entry outright.
+    #[test]
+    fn mediated_surface_size_is_released_by_the_unset() {
+        let mut session = Session::new();
+        let mut watching = test_client();
+        let mut leaving = test_client();
+        watching.surface_view_sizes.insert(1, (1920, 1080, 120));
+        watching.surface_subscriptions.insert(1);
+        leaving.surface_view_sizes.insert(1, (1000, 700, 240));
+        session.clients.insert(1, watching);
+        session.clients.insert(2, leaving);
+        assert_eq!(
+            session.mediated_size_for_surface(1, &[]),
+            Some((1000, 700, 240))
+        );
+
+        session
+            .clients
+            .get_mut(&2)
+            .unwrap()
+            .surface_view_sizes
+            .remove(&1);
+        assert_eq!(
+            session.mediated_size_for_surface(1, &[]),
+            Some((1920, 1080, 120)),
+            "the viewer that closed its pane stops constraining the surface"
+        );
+        assert_eq!(session.surface_scale_120(1), 120);
     }
 
     /// The whole point of a scaled subscription: a card-sized thumbnail must

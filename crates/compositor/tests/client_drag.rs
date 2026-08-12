@@ -434,6 +434,7 @@ fn a_client_drag_delivers_enter_motion_drop_and_the_sources_bytes() {
         surface_id: tgt_sid,
         x: 10.0,
         y: 20.0,
+        time_ms: 0,
     });
     tgt.roundtrip();
     assert_eq!(tgt.app.events, vec![Drag::Enter { x: 10.0, y: 20.0 }]);
@@ -477,6 +478,7 @@ fn a_client_drag_delivers_enter_motion_drop_and_the_sources_bytes() {
         surface_id: tgt_sid,
         x: 30.0,
         y: 40.0,
+        time_ms: 0,
     });
     tgt.roundtrip();
     assert_eq!(
@@ -490,6 +492,7 @@ fn a_client_drag_delivers_enter_motion_drop_and_the_sources_bytes() {
         surface_id: tgt_sid,
         button: BTN_LEFT,
         pressed: false,
+        time_ms: 0,
     });
     tgt.roundtrip();
     assert_eq!(tgt.app.events.last(), Some(&Drag::Drop));
@@ -548,6 +551,7 @@ fn source_actions_declared_before_start_drag_are_preserved() {
         surface_id: tgt_sid,
         x: 10.0,
         y: 20.0,
+        time_ms: 0,
     });
     tgt.roundtrip();
     src.roundtrip();
@@ -577,6 +581,7 @@ fn unsupported_destination_preference_falls_back_to_a_common_action() {
         surface_id: tgt_sid,
         x: 10.0,
         y: 20.0,
+        time_ms: 0,
     });
     tgt.roundtrip();
 
@@ -607,6 +612,7 @@ fn explicit_source_action_none_is_not_rewritten_to_copy() {
         surface_id: tgt_sid,
         x: 10.0,
         y: 20.0,
+        time_ms: 0,
     });
     tgt.roundtrip();
     assert_eq!(tgt.app.offer_source_actions, Some(DndAction::empty()));
@@ -623,6 +629,7 @@ fn explicit_source_action_none_is_not_rewritten_to_copy() {
         surface_id: tgt_sid,
         button: BTN_LEFT,
         pressed: false,
+        time_ms: 0,
     });
     tgt.roundtrip();
     src.roundtrip();
@@ -654,6 +661,7 @@ fn chromium_image_drag_can_fetch_custom_metadata_and_the_named_image_stream() {
         surface_id: tgt_sid,
         x: 12.0,
         y: 34.0,
+        time_ms: 0,
     });
     tgt.roundtrip();
     assert_eq!(tgt.app.events, vec![Drag::Enter { x: 12.0, y: 34.0 }]);
@@ -700,6 +708,7 @@ fn chromium_image_drag_can_fetch_custom_metadata_and_the_named_image_stream() {
         surface_id: tgt_sid,
         button: BTN_LEFT,
         pressed: false,
+        time_ms: 0,
     });
     tgt.roundtrip();
     assert_eq!(tgt.app.events.last(), Some(&Drag::Drop));
@@ -730,11 +739,13 @@ fn a_drop_nowhere_cancels_at_the_source() {
         surface_id: 65000,
         x: 5.0,
         y: 5.0,
+        time_ms: 0,
     });
     fx.send(CompositorCommand::PointerButton {
         surface_id: 65000,
         button: BTN_LEFT,
         pressed: false,
+        time_ms: 0,
     });
     src.roundtrip();
     tgt.roundtrip();
@@ -762,6 +773,7 @@ fn crossing_between_surfaces_leaves_the_first_and_enters_the_second() {
         surface_id: first_sid,
         x: 1.0,
         y: 1.0,
+        time_ms: 0,
     });
     tgt.roundtrip();
     assert_eq!(tgt.app.events, vec![Drag::Enter { x: 1.0, y: 1.0 }]);
@@ -770,6 +782,7 @@ fn crossing_between_surfaces_leaves_the_first_and_enters_the_second() {
         surface_id: second_sid,
         x: 2.0,
         y: 2.0,
+        time_ms: 0,
     });
     tgt.roundtrip();
     assert_eq!(
@@ -799,6 +812,7 @@ fn crossing_between_surfaces_leaves_the_first_and_enters_the_second() {
         surface_id: second_sid,
         button: BTN_LEFT,
         pressed: false,
+        time_ms: 0,
     });
     tgt.roundtrip();
     assert_eq!(tgt.app.events.last(), Some(&Drag::Drop));
@@ -827,6 +841,7 @@ fn a_drag_onto_the_same_app_still_works() {
         surface_id: sid,
         x: 8.0,
         y: 8.0,
+        time_ms: 0,
     });
     app.roundtrip();
     assert_eq!(app.app.events, vec![Drag::Enter { x: 8.0, y: 8.0 }]);
@@ -840,6 +855,7 @@ fn a_drag_onto_the_same_app_still_works() {
         surface_id: sid,
         button: BTN_LEFT,
         pressed: false,
+        time_ms: 0,
     });
     app.roundtrip();
     assert_eq!(
@@ -875,6 +891,7 @@ fn release_without_an_accepted_mime_cancels_instead_of_dropping() {
         surface_id: tgt_sid,
         x: 3.0,
         y: 5.0,
+        time_ms: 0,
     });
     tgt.roundtrip();
     let offer = tgt.app.drag_offer.clone().expect("enter carried an offer");
@@ -887,6 +904,7 @@ fn release_without_an_accepted_mime_cancels_instead_of_dropping() {
         surface_id: tgt_sid,
         button: BTN_LEFT,
         pressed: false,
+        time_ms: 0,
     });
     tgt.roundtrip();
     src.roundtrip();
@@ -917,6 +935,7 @@ fn release_with_none_action_cancels_instead_of_dropping() {
         surface_id: tgt_sid,
         x: 7.0,
         y: 9.0,
+        time_ms: 0,
     });
     tgt.roundtrip();
     let offer = tgt.app.drag_offer.clone().expect("enter carried an offer");
@@ -933,6 +952,7 @@ fn release_with_none_action_cancels_instead_of_dropping() {
         surface_id: tgt_sid,
         button: BTN_LEFT,
         pressed: false,
+        time_ms: 0,
     });
     tgt.roundtrip();
     src.roundtrip();
@@ -967,6 +987,7 @@ fn none_action_can_be_renegotiated_on_the_same_entered_offer() {
         surface_id: tgt_sid,
         x: 11.0,
         y: 13.0,
+        time_ms: 0,
     });
     tgt.roundtrip();
     let offer = tgt.app.drag_offer.clone().expect("enter carried an offer");
@@ -997,6 +1018,7 @@ fn none_action_can_be_renegotiated_on_the_same_entered_offer() {
         surface_id: tgt_sid,
         button: BTN_LEFT,
         pressed: false,
+        time_ms: 0,
     });
     tgt.roundtrip();
     src.roundtrip();
@@ -1017,6 +1039,7 @@ fn destroying_the_active_offer_leaves_and_cancels_the_drag() {
         surface_id: tgt_sid,
         x: 2.0,
         y: 3.0,
+        time_ms: 0,
     });
     tgt.roundtrip();
     let offer = tgt.app.drag_offer.clone().expect("enter carried an offer");
@@ -1046,6 +1069,7 @@ fn destroying_the_target_surface_cannot_drop_on_stale_acceptance() {
         surface_id: tgt_sid,
         x: 4.0,
         y: 6.0,
+        time_ms: 0,
     });
     tgt.roundtrip();
     let offer = tgt.app.drag_offer.clone().expect("enter carried an offer");
@@ -1069,6 +1093,7 @@ fn destroying_the_target_surface_cannot_drop_on_stale_acceptance() {
         surface_id: tgt_sid,
         button: BTN_LEFT,
         pressed: false,
+        time_ms: 0,
     });
     tgt.roundtrip();
     src.roundtrip();
@@ -1090,6 +1115,7 @@ fn destroying_the_source_mid_drag_leaves_the_target_and_ends_the_session() {
         surface_id: tgt_sid,
         x: 4.0,
         y: 4.0,
+        time_ms: 0,
     });
     tgt.roundtrip();
     assert_eq!(tgt.app.events, vec![Drag::Enter { x: 4.0, y: 4.0 }]);
@@ -1114,6 +1140,7 @@ fn destroying_the_source_mid_drag_leaves_the_target_and_ends_the_session() {
         surface_id: tgt_sid,
         button: BTN_LEFT,
         pressed: false,
+        time_ms: 0,
     });
     tgt.roundtrip();
     src.roundtrip();
