@@ -1,6 +1,15 @@
 import { createSignal, createEffect, onCleanup } from "solid-js";
 import { basePath } from "./storage";
 import { shellCapabilities } from "./shellCapabilities";
+import {
+  forgetFontCss,
+  forgetFontMetrics,
+  isStale,
+  loadFontCss,
+  loadFontMetrics,
+  saveFontCss,
+  saveFontMetrics,
+} from "./fontStore";
 
 const CSS_GENERIC = new Set([
   "serif",
@@ -46,6 +55,89 @@ function fontStyleId(family: string): string {
   return `blit-font-${family.replace(/\s+/g, "-").toLowerCase()}`;
 }
 
+/** Both cache keys carry the base path: one browser origin can face several
+ *  servers under different prefixes, each with its own fonts installed. */
+function fontUrl(family: string): string {
+  return `${basePath}font/${encodeURIComponent(family)}`;
+}
+
+function metricsKey(family: string): string {
+  return `${basePath}${family}`;
+}
+
+function applyFontCss(id: string, css: string): void {
+  const existing = document.getElementById(id);
+  if (existing) {
+    if (existing.textContent !== css) existing.textContent = css;
+    return;
+  }
+  const style = document.createElement("style");
+  style.id = id;
+  style.textContent = css;
+  document.head.appendChild(style);
+}
+
+/** The face CSS, or null when the request failed. `false` for "the server
+ *  answered, and it does not have this family". */
+async function fetchFontCss(url: string): Promise<string | null> {
+  try {
+    const response = await fetch(url);
+    if (response.ok) return await response.text();
+  } catch {}
+  return null;
+}
+
+/** Ask again for a face we already hold, and keep whatever came back.
+ *
+ * Off the render path by construction: the stored copy is already applied, so
+ * this only matters for the next load — either the face changed on the server
+ * (a font upgrade) or the family is gone, and holding a copy of a face nobody
+ * can name any more is worse than nothing. */
+async function refreshFontCss(
+  family: string,
+  id: string,
+  had: string,
+): Promise<void> {
+  const url = fontUrl(family);
+  let response: Response;
+  try {
+    response = await fetch(url);
+  } catch {
+    return; // Offline is not a reason to forget the font.
+  }
+  if (response.status === 404) {
+    void forgetFontCss(url);
+    forgetFontMetrics(metricsKey(family));
+    return;
+  }
+  if (!response.ok) return;
+  const css = await response.text();
+  if (css === had) {
+    void saveFontCss(url, css); // Same face, fresh timestamp.
+    return;
+  }
+  applyFontCss(id, css);
+  void saveFontCss(url, css);
+}
+
+async function fetchFontMetrics(family: string): Promise<number | null> {
+  try {
+    const response = await fetch(
+      `${basePath}font-metrics/${encodeURIComponent(family)}`,
+    );
+    if (!response.ok) return null;
+    const json: unknown = await response.json();
+    const ratio = (json as { advanceRatio?: unknown }).advanceRatio;
+    if (typeof ratio === "number") return ratio;
+  } catch {}
+  return null;
+}
+
+async function refreshFontMetrics(family: string): Promise<void> {
+  const ratio = await fetchFontMetrics(family);
+  if (ratio != null) saveFontMetrics(metricsKey(family), ratio);
+}
+
 /**
  * Reactive font loader. Given a font accessor, resolves server-hosted fonts,
  * loads @font-face CSS, measures advance ratio, and waits for font readiness.
@@ -88,6 +180,13 @@ export function createFontLoader(
     }
 
     setFontLoading(true);
+    // Cell width comes from the advance ratio, so a remembered one is worth
+    // publishing before anything is awaited: the grid gets sized once instead
+    // of laid out on a guess and reflowed when storage answers.
+    const remembered = families
+      .map((family) => loadFontMetrics(metricsKey(family)))
+      .find((m) => m != null);
+    if (remembered) setAdvanceRatio(remembered.advanceRatio);
 
     const load = async () => {
       let ratio: number | undefined;
@@ -102,34 +201,38 @@ export function createFontLoader(
         const loadSpec = `16px "${family}"`;
         const id = fontStyleId(family);
         if (served && !document.getElementById(id)) {
-          try {
-            const response = await fetch(
-              `${basePath}font/${encodeURIComponent(family)}`,
-            );
-            if (response.ok) {
-              const css = await response.text();
-              if (cancelled || version !== requestVersion) return;
-              if (!document.getElementById(id)) {
-                const style = document.createElement("style");
-                style.id = id;
-                style.textContent = css;
-                document.head.appendChild(style);
-              }
+          const url = fontUrl(family);
+          const stored = await loadFontCss(url);
+          if (cancelled || version !== requestVersion) return;
+          if (stored) {
+            applyFontCss(id, stored.css);
+            // A day-old copy still draws this frame; the server gets asked
+            // again off the critical path, and next load holds the answer.
+            if (isStale(stored)) void refreshFontCss(family, id, stored.css);
+          } else {
+            const css = await fetchFontCss(url);
+            if (cancelled || version !== requestVersion) return;
+            if (css != null) {
+              applyFontCss(id, css);
+              void saveFontCss(url, css);
             }
-          } catch {}
+          }
         }
 
         if (served && ratio == null) {
-          try {
-            const metricsResp = await fetch(
-              `${basePath}font-metrics/${encodeURIComponent(family)}`,
-            );
-            if (metricsResp.ok) {
-              const json = await metricsResp.json();
-              if (typeof json.advanceRatio === "number")
-                ratio = json.advanceRatio;
+          const key = metricsKey(family);
+          const remembered = loadFontMetrics(key);
+          if (remembered) {
+            ratio = remembered.advanceRatio;
+            if (remembered.stale) void refreshFontMetrics(family);
+          } else {
+            const fetched = await fetchFontMetrics(family);
+            if (cancelled || version !== requestVersion) return;
+            if (fetched != null) {
+              ratio = fetched;
+              saveFontMetrics(key, fetched);
             }
-          } catch {}
+          }
         }
 
         try {

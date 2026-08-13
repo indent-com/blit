@@ -43,6 +43,7 @@ import type {
 import type { ConnectionSpec } from "./App";
 import { createMetrics } from "./createMetrics";
 import { createFontLoader } from "./createFontLoader";
+import { loadFontList, saveFontList } from "./fontStore";
 import { createKeyboardShortcuts } from "./createKeyboardShortcuts";
 import { truncateDocumentEntityTitle } from "./documentTitle";
 import {
@@ -1557,6 +1558,18 @@ function WorkspaceScreen(props: {
     if (!shellCapabilities().serverRoutes) return;
     if (serverFontsLoaded || serverFontsRequest) return;
 
+    // A remembered listing fills the picker without a round trip. It is only
+    // refetched once a day, which is how long the route says it is good for —
+    // a font installed on the server shows up in the picker by then.
+    const remembered = loadFontList(basePath);
+    if (remembered) {
+      setServerFonts(remembered.fonts);
+      if (!remembered.stale) {
+        serverFontsLoaded = true;
+        return;
+      }
+    }
+
     serverFontsRequest = fetch(`${basePath}fonts`)
       .then(async (r): Promise<string[]> => {
         if (!r.ok) throw new Error(`font list ${r.status}`);
@@ -1571,6 +1584,7 @@ function WorkspaceScreen(props: {
       })
       .then((fonts) => {
         setServerFonts(fonts);
+        saveFontList(basePath, fonts);
         serverFontsLoaded = true;
       })
       .catch(() => {
