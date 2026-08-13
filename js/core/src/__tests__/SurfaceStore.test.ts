@@ -990,6 +990,51 @@ describe("SurfaceStore surface dimensions", () => {
     expect(surface.height).toBe(540);
     store.destroy();
   });
+
+  it("applies a resize that overtook its create", () => {
+    // The server snapshots a joining client's replay under the session
+    // lock but broadcasts outside it, so a live resize can be enqueued
+    // ahead of the replayed create.  Dropping it is permanent: the
+    // compositor only emits a resize when the size changes, and nothing
+    // re-announces the current one — the surface would keep the stale
+    // dimensions, and pointer coordinates are scaled by them.
+    const store = new SurfaceStore();
+    store.handleSurfaceResized(1, 1409, 941, 838, 560);
+    store.handleSurfaceCreated(1, 0, 838, 708, "t", "a");
+    const surface = store.getSurfaces().get(1)!;
+    expect(surface.width).toBe(1409);
+    expect(surface.height).toBe(941);
+    expect(surface.logicalWidth).toBe(838);
+    expect(surface.logicalHeight).toBe(560);
+    store.destroy();
+  });
+
+  it("ignores a resize that trails its own destroy", () => {
+    // The compositor queues native sizes during render and flushes them
+    // after the toplevel is gone, so a resize outliving its surface is
+    // normal.  Ids are recycled, so replaying it onto the next surface to
+    // claim the id would be worse than dropping it.
+    const store = new SurfaceStore();
+    store.handleSurfaceCreated(1, 0, 800, 600, "t", "a");
+    store.handleSurfaceDestroyed(1);
+    store.handleSurfaceResized(1, 1409, 941, 838, 560);
+    store.handleSurfaceCreated(1, 0, 1024, 768, "other", "b");
+    const surface = store.getSurfaces().get(1)!;
+    expect(surface.width).toBe(1024);
+    expect(surface.height).toBe(768);
+    store.destroy();
+  });
+
+  it("drops a stashed resize when the connection resets", () => {
+    const store = new SurfaceStore();
+    store.handleSurfaceResized(1, 1409, 941, 838, 560);
+    store.reset();
+    store.handleSurfaceCreated(1, 0, 838, 708, "t", "a");
+    const surface = store.getSurfaces().get(1)!;
+    expect(surface.width).toBe(838);
+    expect(surface.height).toBe(708);
+    store.destroy();
+  });
 });
 
 describe("SurfaceStore decoder recovery", () => {

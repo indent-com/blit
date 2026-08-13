@@ -13301,21 +13301,28 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             }
         }
         initial_msgs.push(vec![S2C_READY]);
-        let tx = sess.clients.get(&client_id).map(|c| {
-            (
-                c.tx.clone(),
-                c.outbox_queued_frames.clone(),
-                c.outbox_queued_bytes.clone(),
-            )
-        });
-        drop(sess);
-        if let Some((tx, queued_frames, queued_bytes)) = tx {
+        // Enqueue while still holding the session lock.  The client is
+        // already in `sess.clients`, so `send_to_all` reaches it, and the
+        // connect path above has already woken `tick` — which is parked on
+        // this very mutex.  Releasing first therefore hands `tick` the lock
+        // and lets it broadcast into this client's outbox *ahead* of the
+        // replay it has not received yet: a live S2C_SURFACE_RESIZED lands
+        // before the replayed S2C_SURFACE_CREATED, and a resize for a
+        // surface the client has never seen is dropped on the floor.  The
+        // compositor only emits SurfaceResized when the size actually
+        // changes and nothing re-announces it, so that client stays wrong
+        // about the surface's dimensions — which is also the denominator
+        // its pointer coordinates are scaled by — until it reconnects.
+        // Holding the lock across this cannot block: `send_outbox` only
+        // pushes onto an unbounded channel.
+        if let Some(client) = sess.clients.get(&client_id) {
             for msg in initial_msgs {
-                if send_outbox_tracked(&tx, &queued_frames, &queued_bytes, msg).is_err() {
+                if send_outbox(client, msg).is_err() {
                     break;
                 }
             }
         }
+        drop(sess);
     }
 
     if state.config.verbose {

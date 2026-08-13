@@ -821,6 +821,33 @@ function buildAvccDescription(sps: Uint8Array, pps: Uint8Array): ArrayBuffer {
 
 export class SurfaceStore {
   private surfaces = new Map<number, BlitSurface>();
+  /**
+   * Sizes from an S2C_SURFACE_RESIZED that arrived before the matching
+   * S2C_SURFACE_CREATED, replayed by `handleSurfaceCreated`.  The server
+   * builds a joining client's replay under the session lock but broadcasts
+   * concurrently, so a live resize can overtake the create.  Dropping it
+   * would be permanent: the compositor only emits a resize when the size
+   * changes and nothing re-announces the current one, so the surface would
+   * keep the stale dimensions — and hence a wrong pointer scale — until
+   * the next genuine resize, which for an idle app may be never.
+   */
+  private _pendingResizes = new Map<
+    number,
+    {
+      width: number;
+      height: number;
+      logicalWidth: number;
+      logicalHeight: number;
+    }
+  >();
+  /**
+   * Surface ids destroyed but not yet re-created.  A resize can also trail
+   * its own destroy (the compositor queues native sizes during render and
+   * flushes them after the toplevel is gone), and that straggler must not
+   * be stashed — ids are recycled, so it would be replayed onto whatever
+   * surface claims the id next.
+   */
+  private _destroyedSurfaceIds = new Set<number>();
   private connectionId: ConnectionId = "";
   private decoders = new Map<number, DecoderEntry>();
   private canvases = new Map<number, CanvasEntry>();
@@ -1398,6 +1425,21 @@ export class SurfaceStore {
       logicalWidth: 0,
       logicalHeight: 0,
     });
+    this._destroyedSurfaceIds.delete(surfaceId);
+    // Apply a resize that overtook this create, so the surface starts at
+    // the size the compositor actually last reported rather than the one
+    // this (older) create carried.
+    const pending = this._pendingResizes.get(surfaceId);
+    if (pending) {
+      this._pendingResizes.delete(surfaceId);
+      this.handleSurfaceResized(
+        surfaceId,
+        pending.width,
+        pending.height,
+        pending.logicalWidth,
+        pending.logicalHeight,
+      );
+    }
     // Don't create a canvas yet — canvases are per-subscription now,
     // keyed by sub_id, and we don't have one until a view subscribes.
     this.emitChange();
@@ -1405,6 +1447,8 @@ export class SurfaceStore {
 
   handleSurfaceDestroyed(surfaceId: number): void {
     this.surfaces.delete(surfaceId);
+    this._pendingResizes.delete(surfaceId);
+    this._destroyedSurfaceIds.add(surfaceId);
     this.clearTextInput(surfaceId);
     this.clearCursor(surfaceId);
     this.clearRemoteInput(surfaceId);
@@ -1933,19 +1977,33 @@ export class SurfaceStore {
     logicalHeight = 0,
   ): void {
     const surface = this.surfaces.get(surfaceId);
+    if (!surface) {
+      // Unknown id: either this resize overtook its create (stash it — see
+      // `_pendingResizes`) or it trails a destroy (ignore it, or it would
+      // be replayed onto the next surface to reuse the id).
+      if (!this._destroyedSurfaceIds.has(surfaceId)) {
+        this._pendingResizes.set(surfaceId, {
+          width,
+          height,
+          logicalWidth,
+          logicalHeight,
+        });
+      }
+      return;
+    }
     // The logical size can move while the physical size holds still — a
     // high-DPI viewer joining or leaving rescales the window without
     // changing how many pixels it composites to — and that alone changes
     // how large every viewer should draw it, so it gates the update too.
     const logicalChanged =
-      !!surface &&
       logicalWidth > 0 &&
       logicalHeight > 0 &&
       (surface.logicalWidth !== logicalWidth ||
         surface.logicalHeight !== logicalHeight);
     if (
-      surface &&
-      (surface.width !== width || surface.height !== height || logicalChanged)
+      surface.width !== width ||
+      surface.height !== height ||
+      logicalChanged
     ) {
       // Only emit a change for significant resizes (> 1px) to avoid
       // triggering a BSP re-render → ResizeObserver → resize feedback loop
@@ -2019,6 +2077,8 @@ export class SurfaceStore {
     this.decoders.clear();
     this.canvases.clear();
     this.surfaces.clear();
+    this._pendingResizes.clear();
+    this._destroyedSurfaceIds.clear();
     this.encoderNames.clear();
     this.codecStrings.clear();
     this.av1CodecStrings.clear();
@@ -2052,6 +2112,8 @@ export class SurfaceStore {
     this.decoders.clear();
     this.canvases.clear();
     this.surfaces.clear();
+    this._pendingResizes.clear();
+    this._destroyedSurfaceIds.clear();
     this.encoderNames.clear();
     this.codecStrings.clear();
     this.av1CodecStrings.clear();
