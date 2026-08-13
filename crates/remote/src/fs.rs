@@ -73,13 +73,13 @@ pub const S2C_FS_DONE: u8 = 0x44;
 pub const S2C_FS_SEARCH: u8 = 0x45;
 /// Index result: [0x46][nonce:2][status:1][flags:1][count:4][paths:LZ4]
 /// where the decompressed payload is repeated{ [path_len:2][path:N] },
-/// root-relative, sorted. Status is the unified table (`FS_DONE_*`).
+/// root-relative, sorted. Status uses the common registry (`FS_DONE_*`).
 pub const S2C_FS_INDEX: u8 = 0x46;
 
 /// Grep result: [0x47][nonce:2][status:1][flags:1][detail_len:2][detail:N][records:LZ4]
 /// where the decompressed payload is a `[record_len:4][kind:1][..]` stream of
-/// `FILE`/`MATCH` records (docs/design/fs-grep.md). Status is the unified
-/// table (`FS_DONE_*`); `detail` carries a regex compile error on `INVALID`.
+/// `FILE`/`MATCH` records (docs/design/fs-grep.md). Status uses the common
+/// registry (`FS_DONE_*`); `detail` carries a regex compile error on `INVALID`.
 pub const S2C_FS_GREP: u8 = 0x47;
 
 /// Upload begin result:
@@ -216,8 +216,8 @@ pub const FS_FILE_NOT_FOUND: u8 = 1;
 pub const FS_FILE_UNREADABLE: u8 = 2;
 pub const FS_FILE_OTHER: u8 = 3;
 
-// FS_DONE status — the unified git/lsp status table (docs/git.md
-// "Statuses"), NOT FS_SYNCED's grandfathered 0-4, plus one fs addition.
+// FS_DONE status — the common registry (docs/protocol.md "Common status
+// registry"), NOT FS_SYNCED's grandfathered 0-4.
 // Same numeric values as `GIT_STATUS_*` where they overlap.
 pub const FS_DONE_OK: u8 = 0;
 pub const FS_DONE_NOT_FOUND: u8 = 2;
@@ -295,11 +295,12 @@ pub fn fs_done_status_text(status: u8) -> &'static str {
         FS_DONE_TOO_LARGE => "too large",
         FS_DONE_BUDGET => "budget exhausted",
         FS_DONE_INVALID => "invalid request",
+        FS_DONE_OTHER => "backend error",
         FS_DONE_CONFLICT => "conflict",
         FS_DONE_OFFSET_MISMATCH => "offset mismatch",
         FS_DONE_SIZE_MISMATCH => "size mismatch",
         FS_DONE_UNKNOWN_UPLOAD => "unknown upload",
-        _ => "error",
+        _ => "unknown status",
     }
 }
 
@@ -1893,6 +1894,12 @@ mod tests {
         let (nonce, status, out) = parse_fs_search_result(&m).expect("still parses");
         assert_eq!((nonce, status), (7, FS_STATUS_OK));
         assert_eq!(out.len(), declared, "emitted entries match the count");
+    }
+
+    #[test]
+    fn done_status_text_distinguishes_other_from_unknown() {
+        assert_eq!(fs_done_status_text(FS_DONE_OTHER), "backend error");
+        assert_eq!(fs_done_status_text(200), "unknown status");
     }
 
     #[test]

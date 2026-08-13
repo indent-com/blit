@@ -82,7 +82,7 @@ export function kvClosedText(reason: number): string {
     : `closed (reason ${reason})`;
 }
 
-// KV status — the unified git/lsp table plus fs-write's CONFLICT. Same
+// KV status — the common protocol registry. Same
 // numeric values as `FS_DONE_*` where they overlap.
 export const KV_STATUS_OK = 0;
 export const KV_STATUS_NOT_FOUND = 2;
@@ -109,10 +109,12 @@ export function kvStatusText(status: number): string {
       return "budget exhausted";
     case KV_STATUS_INVALID:
       return "invalid request";
+    case KV_STATUS_OTHER:
+      return "backend error";
     case KV_STATUS_CONFLICT:
       return "conflict";
     default:
-      return "error";
+      return `unknown status ${status}`;
   }
 }
 

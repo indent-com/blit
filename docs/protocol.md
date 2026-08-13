@@ -24,6 +24,12 @@ Maximum frame size: **16 MiB**.
 
 Every message begins with a **1-byte opcode**. All multi-byte fields are little-endian. Fields are tightly packed with no padding or alignment. PTY identifiers are 2-byte unsigned integers.
 
+Any per-request reply guarantee is conditional on the logical connection
+remaining live through that reply. A transport failure or a documented fatal
+framing, protocol, or endpoint-resource violation closes the connection and
+cancels its outstanding requests without synthesizing replies. Clients resolve
+every pending operation as a connection error in that case.
+
 ## Client → Server (C2S)
 
 | Opcode | Name                    | Layout                                                                                                                                                                                                                                           |
@@ -236,6 +242,9 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 8   | `LSP`                | Server supports the `LSP_*` language intelligence family        |
 | 9   | `KV`                 | Server supports the `KV_*` key-value family                     |
 | 10  | `NET`                | Server supports the `NET_*` network-relay family                |
+| 11  | `EXTENSION`          | Proposed: Wasmi extension lifecycle, events, and commands       |
+| 12  | `CHANNEL`            | Proposed: server supports bidirectional named channels          |
+| 13  | `RESERVED`           | Unallocated; servers leave this bit clear                       |
 | 14  | `CREATE_STATUS`      | `CREATE2(WANT_STATUS)` receives an explicit failure             |
 | 15  | `KILL_MODE`          | `KILL`/`CLOSE` reach the process group; `KILL` takes `flags`    |
 | 16  | `PTY_DEADLINE`       | `C2S_DEADLINE`, `CREATE2(HAS_DEADLINE)`, and `EXITED.reason`    |
@@ -243,10 +252,16 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 18  | `SURFACE_TOUCH`      | Server accepts direct contacts and exposes `wl_seat.touch`      |
 | 19  | `SURFACE_TEXT_INPUT` | Server forwards committed `zwp_text_input_v3` state             |
 
-Bits 11 through 13 are held for the extension, channel, and process families
-under review in [#167](https://github.com/indent-com/blit/pull/167) and
-[#173](https://github.com/indent-com/blit/pull/173); nothing advertises them
-today. Bit 14 is always advertised.
+Bits 11 and 12 are proposed for the extension and channel families under review
+in [#167](https://github.com/indent-com/blit/pull/167); nothing advertises them
+today. Bit 13 is reserved, and bit 14 is always advertised.
+
+The proposed bits 11 and 12 are independently omitted when `BLIT_EXT=0` or
+`BLIT_CHANNEL=0`; disabled-family requests are refused as specified in
+[design/extensions.md](design/extensions.md#security-posture-and-deployment-controls).
+Bit 14 is not extension-specific and is not controlled by those gates. It is
+advertised only after the server implements the negotiated creation outcome
+below; the implementation plan updates both shipped clients before enabling it.
 
 ### Common status registry
 
@@ -399,6 +414,13 @@ Two complementary paths report a PTY's working directory:
 - **Poll** (`C2S_TERM_CWD` `0x1C` → `S2C_TERM_CWD` `0x0E`): request/reply correlated by nonce. The reply prefers the PTY's stored OSC 7 value — it is fresher (the interactive shell's prompt-time cwd, not whichever pid the kernel happens to track) and costs no syscall. When the shell has never reported (no OSC 7 integration), the server falls back to asking the kernel about the PTY child (`/proc/<pid>/cwd` on Linux, `proc_pidinfo` on macOS). The poll therefore remains the fallback for shells without OSC 7; clients with OSC 7-integrated shells see pushes arrive ahead of any poll.
 
 Clients that predate `TERM_CWD_EVENT` are unaffected: consistent with the version-stability rule above (new message types are added under new opcodes), both reference clients drop unrecognized S2C opcodes — `js/core`'s `BlitConnection.handleMessage` dispatch falls through to a no-op `default`, and the CLI's message matches end in a catch-all `_ => {}`.
+
+An opcode which multiplexes a one-byte inner kind also needs a family-defined
+skip rule. The proposed extension-command and native-channel families specify
+that clients ignore unknown S2C kinds, servers ignore unknown C2S kinds without
+changing handle state, and any new request kind which requires a reply is
+separately feature-negotiated; see
+[design/extensions.md](design/extensions.md#protocol-compatibility).
 
 `S2C_SURFACE_FRAME` flags byte: bit 0 is the keyframe flag; bits 1–2 encode the codec — H.264 (0), AV1 (1), PNG (2). Bit 3 means a `[timestamp_sub_us:2]` field appears between the base header and encoded data. The base `timestamp` is a wrapping monotonic millisecond counter captured at compositor-commit time (not wire-send time); `timestamp_sub_us` is its 0–999 µs fractional part. The server only sends the extended layout when `C2S_CLIENT_FEATURES.client_features` bit 0 is set. Bits 4–7 remain reserved.
 
@@ -861,21 +883,47 @@ Mode bits are tracked by `ModeTracker` in `blit-alacritty`, which intercepts CSI
 ## Fragmentation
 
 `S2C_FRAGMENT` (`0x2B`) splits any bulk server message into chunks so small
-frames (audio, keepalives) never sit behind a multi-megabyte write:
+frames such as audio need not sit behind a multi-megabyte write:
 
 ```
 [0x2B][flags:1][chunk:N]
 ```
 
 Flag bit 0 (`FRAGMENT_FLAG_LAST`) marks the final chunk. Chunks carry the
-original message's bytes verbatim (its opcode arrives in the first chunk);
-the receiver concatenates chunks into one logical message and dispatches it
-normally. Fragments of different messages never interleave — one pending
-reassembly buffer suffices — and only `S2C_AUDIO_FRAME` may appear between
-fragments. The server chunks any payload over 4 KiB; logical messages may
+original message's bytes verbatim; its opcode arrives in the first chunk. The
+receiver concatenates chunks into one logical message and dispatches it
+normally. Fragments of different messages do not interleave, and the protocol
+permits only `S2C_AUDIO_FRAME` between fragments. Chunk size is transport
+policy: the network writer currently fragments payloads over 4 KiB to protect
+audio latency, while a proposed in-process writer may use larger chunks.
+Receivers must not depend on a particular chunk size. Logical messages may
 exceed the 16 MiB frame limit. What they may not exceed is `MAX_DECOMPRESSED`
 (64 MiB): a receiver aborts a reassembly that grows past it, so that is the real
 ceiling on a logical message, and the one `S2C_LIST` is bounded against.
+
+### Proposed bounded reassembly
+
+The extension RFC tightens fragmentation as follows. These rules are **not yet
+enforced by every shipped Rust and TypeScript client**; implementing them in
+both reference clients and the shared writer is a prerequisite to advertising
+the proposed feature bits 11 and 12, and belongs to phase 2 of
+[design/extensions.md](design/extensions.md#implementation-plan):
+
+- flag bits 1 through 7 are zero and every chunk is non-empty; a reserved flag
+  or empty chunk aborts the connection;
+- each fragment remains an ordinary frame, so `chunk` is at most 16 MiB minus
+  the two-byte fragment opcode and flags;
+- while reassembly is pending, any non-fragment frame other than
+  `S2C_AUDIO_FRAME` aborts the connection without dispatching that frame;
+- the maximum reconstructed logical message is 64 MiB and one message uses at
+  most 16,384 fragments.
+
+The updated sender must not emit a larger logical message or more fragments.
+The updated receiver must check cumulative length and count before extending
+its buffer, abort an over-bound sequence without dispatching it, and release
+pending storage on every connection exit. The proposed logical-message ceiling
+is numerically the same as `MAX_DECOMPRESSED` below, but bounds fragment
+reassembly rather than the allocation declared inside an LZ4 payload.
 
 ## Compressed payloads
 
@@ -951,7 +999,7 @@ the `GitStateMirror` reference reducer: `crates/remote/src/git.rs` and
 `BlitConnection`/`BlitWorkspace`). Bounded responses carry a `CURSOR`
 record naming where they stopped, so every enumeration is resumable;
 discovery, blame, reflog and fetch occupy a second opcode block at
-`0x90`.
+`0xB1` through `0xB4` (`GIT_BASE` begins that block at `0xB0`).
 
 ## Language intelligence
 

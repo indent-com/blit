@@ -234,9 +234,9 @@ impl RepoHandle {
             match crate::unescape_wire(req.ref_name) {
                 Some(bytes) => match String::from_utf8(bytes) {
                     Ok(name) => name,
-                    Err(_) => return fail(GIT_STATUS_OTHER),
+                    Err(_) => return fail(GIT_STATUS_INVALID),
                 },
-                None => return fail(GIT_STATUS_OTHER),
+                None => return fail(GIT_STATUS_INVALID),
             }
         };
         let Ok(full): Result<&gix::refs::FullNameRef, _> = name.as_str().try_into() else {

@@ -18,6 +18,15 @@ use crate::discovery::{MarkerGroup, RootPolicy, ServerSpec};
 use crate::rpc;
 use crate::{Budgets, Sink, testutil};
 
+#[test]
+fn prepare_rejects_malformed_paths_as_invalid() {
+    assert_eq!(crate::prepare("").err().unwrap().0, LSP_STATUS_INVALID);
+    assert_eq!(
+        crate::prepare("bad\0path").err().unwrap().0,
+        LSP_STATUS_INVALID
+    );
+}
+
 fn test_spec() -> ServerSpec {
     ServerSpec {
         id: "fake".into(),

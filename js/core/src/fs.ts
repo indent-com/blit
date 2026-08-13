@@ -607,7 +607,7 @@ export const C2S_FS_WRITE = 0x44;
 export const C2S_FS_OP = 0x45;
 export const S2C_FS_DONE = 0x44;
 
-// FS_DONE status — the unified git/lsp table plus CONFLICT.
+// FS_DONE status — the common protocol registry.
 export const FS_DONE_OK = 0;
 export const FS_DONE_NOT_FOUND = 2;
 export const FS_DONE_WRONG_TYPE = 3;
@@ -647,6 +647,8 @@ export function fsDoneStatusText(status: number): string {
       return "budget exhausted";
     case FS_DONE_INVALID:
       return "invalid request";
+    case FS_DONE_OTHER:
+      return "backend error";
     case FS_DONE_CONFLICT:
       return "conflict";
     case FS_DONE_OFFSET_MISMATCH:
@@ -656,7 +658,7 @@ export function fsDoneStatusText(status: number): string {
     case FS_DONE_UNKNOWN_UPLOAD:
       return "unknown upload";
     default:
-      return "error";
+      return `unknown status ${status}`;
   }
 }
 

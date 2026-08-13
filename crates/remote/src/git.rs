@@ -116,8 +116,9 @@ pub const S2C_GIT_REFLOG: u8 = 0xB3;
 /// Fetch response: [0xB4][nonce:2][status:1][flags:1][records:LZ4]
 pub const S2C_GIT_FETCH: u8 = 0xB4;
 
-// Unified status table: every `status` byte in the family (docs/git.md
-// "Statuses"). Codes 0-4 coincide with `FS_SYNCED`'s where semantics overlap.
+// Common status registry: every `status` byte in the family
+// (docs/protocol.md "Common status registry"). `FS_SYNCED` has a distinct,
+// grandfathered message-local table and must not be decoded with these values.
 pub const GIT_STATUS_OK: u8 = 0;
 /// `repo_id` unknown or already closed.
 pub const GIT_STATUS_UNKNOWN_ID: u8 = 1;
@@ -439,7 +440,7 @@ pub const GIT_PATCH_FILE_FILTERED: u8 = 1 << 1;
 // Record kind inside the GIT_INDEX response.
 pub const GIT_INDEX_RECORD_ENTRY: u8 = 0x04;
 
-// Record kinds inside the 0x90-block responses.
+// Record kinds inside the 0xB1-0xB4 responses.
 pub const GIT_DISCOVER_RECORD_REPO: u8 = 0x01;
 pub const GIT_BLAME_RECORD_RANGE: u8 = 0x01;
 pub const GIT_REFLOG_RECORD_ENTRY: u8 = 0x01;
@@ -2648,7 +2649,7 @@ impl<'a> Iterator for GitIndexRecordIter<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// 0x90 block: discover, blame, reflog, fetch
+// 0xB1-0xB4 block: discover, blame, reflog, fetch
 // ---------------------------------------------------------------------------
 
 macro_rules! records_resp {
@@ -2933,7 +2934,7 @@ impl<'a> Iterator for GitReflogRecordIter<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitFetchRecord<'a> {
     /// FETCH_REF 0x01: [kind:1][flags:1][status:1][old:32][new:32][name_len:2][name:N][detail_len:2][detail:N]
-    /// One per ref the remote answered for. `status` is the unified table,
+    /// One per ref the remote answered for. `status` uses the common registry,
     /// so "did I actually get these commits" is answerable from the reply
     /// rather than needing a `resolve` per commit afterwards — a remote can
     /// refuse one refspec of several and still exit zero.
@@ -3960,7 +3961,7 @@ mod tests {
         assert_eq!(decoded, records);
     }
 
-    /// The 0x90 block round-trips, and `CURSOR` decodes in every family
+    /// The 0xB1-0xB4 block round-trips, and `CURSOR` decodes in every family
     /// that can be truncated — the whole point of the record is that one
     /// branch works everywhere.
     #[test]
