@@ -3261,13 +3261,69 @@ describe("BlitSurfaceCanvas soft-keyboard input", () => {
   it("maps input-event line breaks and deletes onto Enter and Backspace", () => {
     const { surface, ta, keys } = attachTyping();
     ta.dispatchEvent(inputEvent({ inputType: "insertLineBreak" }));
+    ta.dispatchEvent(inputEvent({ inputType: "insertParagraph" }));
+    ta.dispatchEvent(inputEvent({ inputType: "insertText", data: "\n" }));
+    ta.value = "\n";
+    ta.dispatchEvent(inputEvent({}));
     ta.dispatchEvent(inputEvent({ inputType: "deleteContentBackward" }));
     expect(keys).toEqual([
+      { keycode: 28, pressed: true },
+      { keycode: 28, pressed: false },
+      { keycode: 28, pressed: true },
+      { keycode: 28, pressed: false },
+      { keycode: 28, pressed: true },
+      { keycode: 28, pressed: false },
       { keycode: 28, pressed: true },
       { keycode: 28, pressed: false },
       { keycode: 14, pressed: true },
       { keycode: 14, pressed: false },
     ]);
+    surface.dispose();
+  });
+
+  it("submits Android virtual Enter events without a physical code", () => {
+    const { surface, ta, keys } = attachTyping();
+    const down = new KeyboardEvent("keydown", {
+      key: "Enter",
+      code: "",
+      cancelable: true,
+    });
+    const up = new KeyboardEvent("keyup", {
+      key: "Enter",
+      code: "",
+      cancelable: true,
+    });
+
+    ta.dispatchEvent(down);
+    ta.dispatchEvent(up);
+
+    expect(down.defaultPrevented).toBe(true);
+    expect(keys).toEqual([
+      { keycode: 28, pressed: true },
+      { keycode: 28, pressed: false },
+    ]);
+    surface.dispose();
+  });
+
+  it("applies a toolbar modifier to Android virtual Enter", () => {
+    const { surface, ta, keys } = attachTyping();
+    surface.setCtrlModifier(true);
+
+    ta.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Enter",
+        code: "",
+        cancelable: true,
+      }),
+    );
+
+    expect(keys).toEqual([
+      { keycode: 29, pressed: true },
+      { keycode: 28, pressed: true },
+      { keycode: 28, pressed: false },
+      { keycode: 29, pressed: false },
+    ]);
+    expect(surface.ctrlModifier).toBe(false);
     surface.dispose();
   });
 
