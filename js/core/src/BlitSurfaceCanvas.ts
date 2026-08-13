@@ -544,6 +544,28 @@ function domKeyToEvdev(code: string): number {
   return EVDEV_MAP[code] ?? 0;
 }
 
+/** Android soft keyboards can identify Return without supplying a physical
+ *  `code`.  It is an action key in that case, so its logical `key` is enough. */
+function isEnterKeyEvent(e: KeyboardEvent): boolean {
+  return (
+    e.key === "Enter" ||
+    e.key === "Return" ||
+    e.code === "Enter" ||
+    e.code === "NumpadEnter" ||
+    e.keyCode === 13
+  );
+}
+
+/** Chromium-family keyboards use several equivalent shapes for Return. */
+function isEnterInputEvent(e: InputEvent): boolean {
+  return (
+    e.inputType === "insertLineBreak" ||
+    e.inputType === "insertParagraph" ||
+    e.data === "\n" ||
+    e.data === "\r"
+  );
+}
+
 /** Recover a physical DOM code when a soft keyboard supplied only text. */
 function domCodeForCharacter(key: string): string {
   if (/^[a-z]$/i.test(key)) return `Key${key.toUpperCase()}`;
@@ -587,6 +609,14 @@ function domCodeForCharacter(key: string): string {
       } as Record<string, string>
     )[key] ?? ""
   );
+}
+
+/** Recover a DOM code from the logical key when a virtual key has no physical
+ *  code. Named action keys share their names with EVDEV_MAP entries. */
+function domCodeForLogicalKey(key: string): string {
+  if (key === "Return") return "Enter";
+  if (domKeyToEvdev(key) !== 0) return key;
+  return domCodeForCharacter(key);
 }
 
 function characterNeedsShift(key: string): boolean {
@@ -4306,7 +4336,8 @@ export class BlitSurfaceCanvas {
     // its preventDefault can cancel that input event, so step aside.
     if (
       (e.key === "Unidentified" || e.key === "Process") &&
-      domKeyToEvdev(e.code) === 0
+      domKeyToEvdev(e.code) === 0 &&
+      !isEnterKeyEvent(e)
     )
       return;
 
@@ -4341,6 +4372,19 @@ export class BlitSurfaceCanvas {
     const preserveWaylandClipboard =
       isPasteShortcut && conn.usesWaylandClipboard();
     if (preserveWaylandClipboard) e.preventDefault();
+
+    // Android Chromium/Brave can report the virtual Return key as
+    // key="Enter", code="".  The code-only evdev path below used to drop it
+    // after preventDefault had also cancelled the textarea's line-break input
+    // event.  A soft key has no reliable key-up sequence, so complete the
+    // press atomically; a late key-up remains an ignored orphan.
+    if (domKeyToEvdev(e.code) === 0 && isEnterKeyEvent(e)) {
+      if (pressed) {
+        conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Enter, true);
+        conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Enter, false);
+      }
+      return;
+    }
 
     // macOS Option as a character modifier, no dead key involved: the
     // browser resolves Option+F to "ƒ", Option+G to "©", and reports a
@@ -4692,7 +4736,7 @@ export class BlitSurfaceCanvas {
     shiftKey: boolean,
   ): boolean {
     if (!this._ctrlModifier && !this._altModifier) return false;
-    const keycode = domKeyToEvdev(code || domCodeForCharacter(key));
+    const keycode = domKeyToEvdev(code || domCodeForLogicalKey(key));
     if (keycode === 0) return false;
 
     const conn = this.getConn();
@@ -4772,12 +4816,16 @@ export class BlitSurfaceCanvas {
       return;
     }
 
+    const textareaEnterFallback =
+      !e.inputType &&
+      !!ta &&
+      (ta.value.includes("\n") || ta.value.includes("\r"));
     if (this._ctrlModifier || this._altModifier) {
       const modified =
-        e.inputType === "insertText" && e.data
-          ? this.sendOneShotModifiedKey(e.data[0], "", false)
-          : e.inputType === "insertLineBreak"
-            ? this.sendOneShotModifiedKey("Enter", "Enter", false)
+        isEnterInputEvent(e) || textareaEnterFallback
+          ? this.sendOneShotModifiedKey("Enter", "Enter", false)
+          : e.inputType === "insertText" && e.data
+            ? this.sendOneShotModifiedKey(e.data[0], "", false)
             : e.inputType === "deleteContentBackward"
               ? this.sendOneShotModifiedKey("Backspace", "Backspace", false)
               : false;
@@ -4808,14 +4856,20 @@ export class BlitSurfaceCanvas {
     // already sent) stays ignored.
     const conn = this.getConn();
     if (conn && this.surface && this._displaySize) {
-      if (e.inputType === "insertText" && e.data) {
-        conn.sendSurfaceText(this._surfaceId, e.data);
-      } else if (e.inputType === "insertLineBreak") {
+      if (isEnterInputEvent(e)) {
         conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Enter, true);
         conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Enter, false);
+      } else if (e.inputType === "insertText" && e.data) {
+        conn.sendSurfaceText(this._surfaceId, e.data);
       } else if (e.inputType === "deleteContentBackward") {
         conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Backspace, true);
         conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Backspace, false);
+      } else if (textareaEnterFallback) {
+        // Last-resort shape: no useful input metadata, but the textarea
+        // itself proves Return inserted a line break. Typed text and delete
+        // events above remain authoritative when they do carry metadata.
+        conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Enter, true);
+        conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Enter, false);
       }
     }
     this.resetTextInput();
