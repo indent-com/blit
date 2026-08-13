@@ -41,6 +41,24 @@ def write_frame(sock, payload):
     sock.sendall(struct.pack("<I", len(payload)) + payload)
 
 
+def read_until(sock, opcode, name):
+    """Read frames until one carries `opcode`, skipping the rest.
+
+    The pre-READY burst is extensible: a server with a compositor also sends
+    clipboard-owner and surface state before the PTY list, and new families
+    may add more. Dispatch on the opcode rather than on position, the same way
+    a client must ignore opcodes it does not know.
+    """
+    while True:
+        frame = read_frame(sock)
+        if not frame:
+            raise ConnectionError(f"empty frame while waiting for {name}")
+        if frame[0] == opcode:
+            return frame
+        if frame[0] == S2C_READY:
+            raise AssertionError(f"reached READY without seeing {name}")
+
+
 def main():
     channel_theirs, channel_ours = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
 
@@ -66,20 +84,17 @@ def main():
         proto_version = struct.unpack_from("<H", hello, 1)[0]
         print(f"HELLO: protocol version {proto_version}")
 
-        lst = read_frame(client_ours)
-        assert lst[0] == S2C_LIST, f"expected LIST (0x03), got 0x{lst[0]:02x}"
+        lst = read_until(client_ours, S2C_LIST, "LIST (0x03)")
         pty_count = struct.unpack_from("<H", lst, 1)[0]
         print(f"LIST: {pty_count} existing PTYs")
 
-        ready = read_frame(client_ours)
-        assert ready[0] == S2C_READY, f"expected READY (0x09), got 0x{ready[0]:02x}"
+        read_until(client_ours, S2C_READY, "READY (0x09)")
         print("READY")
 
         create_msg = struct.pack("<BHHH", C2S_CREATE, 24, 80, 0)
         write_frame(client_ours, create_msg)
 
-        created = read_frame(client_ours)
-        assert created[0] == S2C_CREATED, f"expected CREATED (0x01), got 0x{created[0]:02x}"
+        created = read_until(client_ours, S2C_CREATED, "CREATED (0x01)")
         pty_id = struct.unpack_from("<H", created, 1)[0]
         print(f"CREATED: pty_id={pty_id}")
 

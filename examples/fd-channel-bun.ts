@@ -150,6 +150,19 @@ function assert(cond: boolean, msg: string) {
   }
 }
 
+// The pre-READY burst is extensible: a server with a compositor also sends
+// clipboard-owner and surface state before the PTY list, and new families may
+// add more. Dispatch on the opcode rather than on position, the same way a
+// client must ignore opcodes it does not know.
+function readUntil(fd: number, opcode: number, name: string): Uint8Array {
+  for (;;) {
+    const frame = readFrame(fd);
+    assert(frame.length > 0, `empty frame while waiting for ${name}`);
+    if (frame[0] === opcode) return frame;
+    assert(frame[0] !== S2C_READY, `reached READY without seeing ${name}`);
+  }
+}
+
 const [channelTheirs, channelOurs] = socketpair();
 
 // Bun's spawn() closes non-stdio fds. Passing Bun.file(fd) at stdio[3]
@@ -175,19 +188,11 @@ try {
   const protoVersion = new DataView(hello.buffer).getUint16(1, true);
   console.log(`HELLO: protocol version ${protoVersion}`);
 
-  const list = readFrame(clientOurs);
-  assert(
-    list[0] === S2C_LIST,
-    `expected LIST (0x03), got 0x${list[0].toString(16)}`,
-  );
+  const list = readUntil(clientOurs, S2C_LIST, "LIST (0x03)");
   const ptyCount = new DataView(list.buffer).getUint16(1, true);
   console.log(`LIST: ${ptyCount} existing PTYs`);
 
-  const ready = readFrame(clientOurs);
-  assert(
-    ready[0] === S2C_READY,
-    `expected READY (0x09), got 0x${ready[0].toString(16)}`,
-  );
+  readUntil(clientOurs, S2C_READY, "READY (0x09)");
   console.log("READY");
 
   const createMsg = new Uint8Array(7);
@@ -198,11 +203,7 @@ try {
   cv.setUint16(5, 0, true);
   writeFrame(clientOurs, createMsg);
 
-  const created = readFrame(clientOurs);
-  assert(
-    created[0] === S2C_CREATED,
-    `expected CREATED (0x01), got 0x${created[0].toString(16)}`,
-  );
+  const created = readUntil(clientOurs, S2C_CREATED, "CREATED (0x01)");
   const ptyId = new DataView(created.buffer).getUint16(1, true);
   console.log(`CREATED: pty_id=${ptyId}`);
 
