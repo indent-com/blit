@@ -6,7 +6,28 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-if ! swift_bin="$(/usr/bin/xcrun --find swift 2>/dev/null)" || [[ ! -x "$swift_bin" ]]; then
+apple_environment=(
+  /usr/bin/env -i
+  "HOME=$HOME"
+  "LANG=${LANG:-en_US.UTF-8}"
+  "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
+)
+
+# Keep an explicitly selected Xcode (including Xcode-beta), but do not inherit
+# Nix's SDKROOT, compiler include paths, or linker flags. Apple's Swift compiler
+# and macOS SDK must come from the same Xcode toolchain.
+if [[ -n "${DEVELOPER_DIR:-}" ]]; then
+  apple_environment+=("DEVELOPER_DIR=$DEVELOPER_DIR")
+fi
+if [[ -n "${TOOLCHAINS:-}" ]]; then
+  apple_environment+=("TOOLCHAINS=$TOOLCHAINS")
+fi
+if [[ -n "${TMPDIR:-}" ]]; then
+  apple_environment+=("TMPDIR=$TMPDIR")
+fi
+
+if ! swift_bin="$("${apple_environment[@]}" /usr/bin/xcrun --find swift 2>/dev/null)" \
+  || [[ ! -x "$swift_bin" ]]; then
   printf '%s\n' \
     "Talk Viewer needs Apple's Swift compiler, but the active developer toolchain does not provide it." \
     "" \
@@ -21,15 +42,32 @@ if ! swift_bin="$(/usr/bin/xcrun --find swift 2>/dev/null)" || [[ ! -x "$swift_b
   exit 1
 fi
 
+if ! apple_sdk="$("${apple_environment[@]}" /usr/bin/xcrun --sdk macosx --show-sdk-path 2>/dev/null)" \
+  || [[ ! -d "$apple_sdk" ]]; then
+  echo "The active Xcode toolchain does not provide a macOS SDK." >&2
+  echo "Run: sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer" >&2
+  exit 1
+fi
+
+swift_environment=("${apple_environment[@]}" "SDKROOT=$apple_sdk")
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ "${1:-}" == "--test" ]]; then
+  "${swift_environment[@]}" "$swift_bin" test --package-path "$script_dir"
+  exit 0
+fi
+
 output_dir="${1:-"$script_dir/dist"}"
 
 mkdir -p "$output_dir"
 output_dir="$(cd "$output_dir" && pwd)"
 app_path="$output_dir/Talk Viewer.app"
 
-"$swift_bin" build --package-path "$script_dir" -c release --product TalkViewer
-binary_dir="$("$swift_bin" build --package-path "$script_dir" -c release --show-bin-path)"
+"${swift_environment[@]}" "$swift_bin" build \
+  --package-path "$script_dir" -c release --product TalkViewer
+binary_dir="$("${swift_environment[@]}" "$swift_bin" build \
+  --package-path "$script_dir" -c release --show-bin-path)"
 
 rm -rf -- "$app_path"
 mkdir -p "$app_path/Contents/MacOS"
@@ -37,6 +75,6 @@ mkdir -p "$app_path/Contents/Resources"
 install -m 755 "$binary_dir/TalkViewer" "$app_path/Contents/MacOS/TalkViewer"
 install -m 644 "$script_dir/Info.plist" "$app_path/Contents/Info.plist"
 
-codesign --force --sign - "$app_path"
+/usr/bin/codesign --force --sign - "$app_path"
 
 echo "$app_path"
