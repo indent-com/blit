@@ -58,9 +58,11 @@ After a macOS upgrade, Software Update may need to install a matching Command
 Line Tools release before `xcrun` can find Swift again.
 
 The build script deliberately removes Nix compiler and SDK variables before it
-runs Swift. This keeps an active Xcode or Xcode-beta compiler paired with the
-SDK shipped in that same Xcode installation; mixing it with the Nix-provided
-macOS SDK produces `no such module 'SwiftShims'` and SDK-version errors.
+runs Swift, then derives `MacOSX.sdk` directly from the selected Swift binary's
+Xcode or CommandLineTools directory. This keeps an active Xcode or Xcode-beta
+compiler paired with the SDK shipped in that same installation; mixing it with
+the Nix-provided macOS SDK produces `no such module 'SwiftShims'` and
+SDK-version errors.
 
 The browser opens `http://127.0.0.1:10000` by default, which is the standard
 blit development UI address. Start at another page by passing arguments through
