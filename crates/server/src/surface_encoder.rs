@@ -1270,11 +1270,10 @@ impl SurfaceEncoder {
     }
 
     pub fn encode(&mut self, rgba: &[u8]) -> Option<(Vec<u8>, bool)> {
-        // NVENC encodes GPU-converted frames only.  Raw RGB would go
-        // through its internal limited-range conversion (wrong for blit's
-        // full-range streams), and converting host-side puts the whole
-        // pipeline on the CPU — neither is acceptable, so CPU pixels are
-        // refused and the stream waits for the zero-copy frame.
+        // NVENC encodes GPU-converted frames only.  An implicit packed-RGB
+        // conversion can use backend-specific coefficients, while converting
+        // host-side puts the whole pipeline on the CPU.  Refuse both and wait
+        // for the compositor's explicit zero-copy YUV target.
         if let SurfaceEncoderKind::NvencH264(_) | SurfaceEncoderKind::NvencAV1(_) = &self.kind {
             nvenc_refuse_cpu_pixels();
             return None;
@@ -1544,10 +1543,9 @@ impl SurfaceEncoder {
     ///
     /// There is deliberately no NVENC arm here. NVENC's only zero-copy import
     /// is `OPAQUE_FD` (`PixelData::Nv12OpaqueFd`), which carries YUV the
-    /// compositor already converted full-range. Handing it a `dma_buf` meant
-    /// handing it packed RGB, and NVENC's internal RGB→YUV is limited-range
-    /// with no knob — those frames would decode with lifted blacks against a
-    /// stream header that claims full swing. VA-API encode uses the
+    /// compositor converted with blit's explicit BT.601 coefficients.
+    /// Handing it a `dma_buf` meant handing it packed RGB and silently using
+    /// NVENC's internal conversion instead. VA-API encode uses the
     /// `Nv12DmaBuf` path instead (compute shader writes NV12 into
     /// VA-API-exported surfaces, no PRIME import).
     #[cfg(target_os = "linux")]
@@ -1974,21 +1972,22 @@ fn expected_rgba_len(width: u32, height: u32) -> Option<usize> {
 
 #[inline(always)]
 fn rgb_to_y(r: i32, g: i32, b: i32) -> u8 {
-    // BT.601 full-range (black = 0), matching the compositor's compute
-    // shaders so CPU- and GPU-converted frames of one stream agree.
-    ((77 * r + 150 * g + 29 * b + 128) >> 8).clamp(0, 255) as u8
+    // BT.601 limited-range (black = 16), matching the compositor's compute
+    // shaders so CPU- and GPU-converted frames of one stream agree. Studio
+    // swing also survives decoders that drop full-range metadata.
+    (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8
 }
 
 #[inline(always)]
 fn rgb_to_u(r: i32, g: i32, b: i32) -> u8 {
-    ((-43 * r - 85 * g + 128 * b + 128) >> 8)
+    ((-38 * r - 74 * g + 112 * b + 128) >> 8)
         .wrapping_add(128)
         .clamp(0, 255) as u8
 }
 
 #[inline(always)]
 fn rgb_to_v(r: i32, g: i32, b: i32) -> u8 {
-    ((128 * r - 107 * g - 21 * b + 128) >> 8)
+    ((112 * r - 94 * g - 18 * b + 128) >> 8)
         .wrapping_add(128)
         .clamp(0, 255) as u8
 }
@@ -2582,9 +2581,9 @@ impl X264Encoder {
             if x264_param_apply_profile(&mut par, profile.as_ptr()) < 0 {
                 return Err("x264_param_apply_profile failed".into());
             }
-            // blit's YUV is full-range BT.601 end to end; without the VUI
-            // flag decoders assume studio swing and lift blacks.
-            par.vui.b_fullrange = 1;
+            // Blit uses BT.601 studio swing end to end. Keep the VUI explicit
+            // so decoders do not have to guess when dimensions change.
+            par.vui.b_fullrange = 0;
             let enc = x264_encoder_open(&mut par);
             if enc.is_null() {
                 return Err(format!("x264_encoder_open failed for {width}x{height}"));
@@ -2767,9 +2766,9 @@ impl SoftwareAV1Encoder {
             height: height as usize,
             chroma_sampling,
             chroma_sample_position: ChromaSamplePosition::Unknown,
-            // blit's YUV is full-range BT.601 end to end; the sequence
-            // header must say so or decoders assume studio swing.
-            pixel_range: PixelRange::Full,
+            // Blit uses BT.601 studio swing end to end. Limited range is also
+            // the interoperable WebCodecs default when metadata is lost.
+            pixel_range: PixelRange::Limited,
             speed_settings: speed,
             low_latency: true,
             min_key_frame_interval: 0,

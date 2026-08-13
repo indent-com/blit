@@ -34,15 +34,15 @@ ivec3 rgb8(vec4 bgra) {
 }
 
 int rgb_to_y8(ivec3 rgb) {
-    return clamp((77 * rgb.r + 150 * rgb.g + 29 * rgb.b + 128) >> 8, 0, 255);
+    return clamp(((66 * rgb.r + 129 * rgb.g + 25 * rgb.b + 128) >> 8) + 16, 0, 255);
 }
 
 int rgb_to_u8(ivec3 rgb) {
-    return clamp(((-43 * rgb.r - 85 * rgb.g + 128 * rgb.b + 128) >> 8) + 128, 0, 255);
+    return clamp(((-38 * rgb.r - 74 * rgb.g + 112 * rgb.b + 128) >> 8) + 128, 0, 255);
 }
 
 int rgb_to_v8(ivec3 rgb) {
-    return clamp(((128 * rgb.r - 107 * rgb.g - 21 * rgb.b + 128) >> 8) + 128, 0, 255);
+    return clamp(((112 * rgb.r - 94 * rgb.g - 18 * rgb.b + 128) >> 8) + 128, 0, 255);
 }
 
 void main() {
@@ -54,7 +54,7 @@ void main() {
     vec4 bgra = imageLoad(bgra_in, src);
     ivec3 rgb = rgb8(bgra);
 
-    // BT.601 full-range RGB→Y, matching the 4:2:0 path.
+    // BT.601 limited-range RGB→Y, matching the 4:2:0 path.
     float y_val = float(rgb_to_y8(rgb)) / 255.0;
     imageStore(y_out, ivec2(pos), vec4(y_val, 0, 0, 0));
 

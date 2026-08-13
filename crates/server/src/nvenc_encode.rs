@@ -5,11 +5,10 @@
 //! `dlopen("libcuda.so")` — a private context per encoder costs tens of MB
 //! of driver host memory plus driver threads each.
 //!
-//! The encoder is fed YUV that is already full-range BT.601 — normally the
-//! compositor's compute shaders, via a zero-copy `OPAQUE_FD` import.  It is
-//! never handed packed RGB: NVENC's internal RGB→YUV is limited-range with
-//! no knob, so those frames would decode with lifted blacks against a
-//! stream header that claims full swing.
+//! The encoder is fed YUV that is already limited-range BT.601 — normally
+//! the compositor's compute shaders, via a zero-copy `OPAQUE_FD` import.  It
+//! is never handed packed RGB so the matrix and rounding remain identical
+//! across paths instead of depending on NVENC's implicit conversion.
 
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
@@ -392,7 +391,7 @@ fn write_stream_gop(config_buf: &mut [u8]) {
 /// WebCodecs configuration describe the same conversion across decoder
 /// creation and reset.
 fn write_av1_color_description(config_buf: &mut [u8]) {
-    w32(config_buf, NVENC_AV1_COLOR_RANGE_OFFSET, 1);
+    w32(config_buf, NVENC_AV1_COLOR_RANGE_OFFSET, 0);
     w32(
         config_buf,
         NVENC_AV1_COLOR_PRIMARIES_OFFSET,
@@ -889,9 +888,9 @@ impl NvencDirectEncoder {
             w32(&mut config_buf, NVENC_H264_CHROMA_FORMAT_IDC_OFFSET, 3);
         }
 
-        // Signal full range: every frame blit feeds NVENC is full-range
-        // BT.601 (CPU-converted or the compositor's shaders), and a decoder
-        // told nothing assumes limited — lifting every black to gray.
+        // Signal the same BT.601 studio swing used by the compositor shader.
+        // Limited range is deliberate: Firefox's WebCodecs output path can
+        // lose a full-range flag before converting decoded YUV to RGB.
         if codec == "h264" {
             let vui = NVENC_H264_VUI_OFFSET;
             w32(
@@ -900,7 +899,7 @@ impl NvencDirectEncoder {
                 1,
             );
             w32(&mut config_buf, vui + NVENC_VUI_VIDEO_FORMAT, 5); // unspecified
-            w32(&mut config_buf, vui + NVENC_VUI_VIDEO_FULL_RANGE, 1);
+            w32(&mut config_buf, vui + NVENC_VUI_VIDEO_FULL_RANGE, 0);
         } else {
             write_av1_color_description(&mut config_buf);
         }
@@ -1891,10 +1890,10 @@ mod tests {
     }
 
     #[test]
-    fn av1_color_description_matches_the_full_range_bt601_pipeline() {
+    fn av1_color_description_matches_the_limited_range_bt601_pipeline() {
         let mut config = vec![0u8; NVENC_CONFIG_SIZE];
         write_av1_color_description(&mut config);
-        assert_eq!(r32(&config, NVENC_AV1_COLOR_RANGE_OFFSET), 1);
+        assert_eq!(r32(&config, NVENC_AV1_COLOR_RANGE_OFFSET), 0);
         assert_eq!(
             r32(&config, NVENC_AV1_COLOR_PRIMARIES_OFFSET),
             NVENC_VUI_COLOR_PRIMARIES_BT709,

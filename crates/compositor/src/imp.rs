@@ -6446,14 +6446,14 @@ fn negotiate_dnd_action(
 }
 
 fn yuv420_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
-    // BT.601 full-range inverse, matching the full-range forward
-    // conversion everywhere in blit (shaders and CPU paths).
-    let y = y as i32;
+    // BT.601 limited-range inverse, matching the forward conversion
+    // everywhere in blit (shaders and CPU paths).
+    let y = (y as i32 - 16).max(0);
     let u = u as i32 - 128;
     let v = v as i32 - 128;
-    let r = ((256 * y + 359 * v + 128) >> 8).clamp(0, 255) as u8;
-    let g = ((256 * y - 88 * u - 183 * v + 128) >> 8).clamp(0, 255) as u8;
-    let b = ((256 * y + 454 * u + 128) >> 8).clamp(0, 255) as u8;
+    let r = ((298 * y + 409 * v + 128) >> 8).clamp(0, 255) as u8;
+    let g = ((298 * y - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8;
+    let b = ((298 * y + 516 * u + 128) >> 8).clamp(0, 255) as u8;
     [r, g, b]
 }
 

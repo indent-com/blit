@@ -595,13 +595,11 @@ impl VulkanVideoEncoder {
         if needs_crop {
             sps_flags.set_frame_cropping_flag(1);
         }
-        // VUI with video_full_range_flag=1: blit's pixels are full-range
-        // BT.601 end to end, and a decoder told nothing assumes limited —
-        // which would display every black lifted to gray.
+        // VUI explicitly identifies blit's BT.601 studio-swing pixels.
         sps_flags.set_vui_parameters_present_flag(1);
         let mut vui_flags: StdVideoH264SpsVuiFlags = unsafe { std::mem::zeroed() };
         vui_flags.set_video_signal_type_present_flag(1);
-        vui_flags.set_video_full_range_flag(1);
+        vui_flags.set_video_full_range_flag(0);
         let mut vui: StdVideoH264SequenceParameterSetVui = unsafe { std::mem::zeroed() };
         vui.flags = vui_flags;
         vui.video_format = 5; // unspecified
@@ -1468,8 +1466,8 @@ impl VulkanVideoEncoder {
             // The sequence header must describe the same conversion as
             // NVENC.  Leaving these values unspecified lets decoders choose
             // a matrix (commonly BT.709 for HD), even though blit's shaders
-            // produced full-range BT.601 YUV.
-            flags: (1 << 1) | (1 << 3), // color_range | description_present
+            // produced limited-range BT.601 YUV.
+            flags: 1 << 3, // description_present; color_range stays studio swing
             bit_depth: 8,
             // 0/0 is 4:4:4, 1/1 is 4:2:0.  These are not free choices: the
             // profile above fixes them (High implies 0/0, Main implies
@@ -2314,7 +2312,7 @@ fn av1_sequence_header_obu(
     w.put(8, AV1_COLOR_PRIMARIES_BT709);
     w.put(8, AV1_TRANSFER_CHARACTERISTICS_SRGB);
     w.put(8, AV1_MATRIX_COEFFICIENTS_SMPTE170M);
-    w.put(1, 1); // color_range: full swing (blit is full-range end to end)
+    w.put(1, 0); // color_range: studio swing
     if !is_444 {
         w.put(2, 0); // chroma_sample_position: unknown
     }
@@ -2798,7 +2796,7 @@ struct StdVideoAV1ColorConfig {
 }
 
 // Blit's BGRA inputs are sRGB (BT.709 primaries and sRGB transfer), while
-// the AV1 Vulkan and NVENC conversion paths use the full-range BT.601 matrix.
+// the AV1 Vulkan and NVENC conversion paths use the limited-range BT.601 matrix.
 // Keep these numeric AV1 enum values in sync with the NVENC configuration.
 const AV1_COLOR_PRIMARIES_BT709: u32 = 1;
 const AV1_TRANSFER_CHARACTERISTICS_SRGB: u32 = 13;
@@ -3226,7 +3224,7 @@ mod tests {
         sps_flags.set_vui_parameters_present_flag(1);
         let mut vui_flags: StdVideoH264SpsVuiFlags = unsafe { std::mem::zeroed() };
         vui_flags.set_video_signal_type_present_flag(1);
-        vui_flags.set_video_full_range_flag(1);
+        vui_flags.set_video_full_range_flag(0);
         let mut vui: Box<StdVideoH264SequenceParameterSetVui> =
             Box::new(unsafe { std::mem::zeroed() });
         vui.flags = vui_flags;
@@ -3440,7 +3438,7 @@ mod tests {
                 AV1_MATRIX_COEFFICIENTS_SMPTE170M,
                 "matrix_coefficients"
             );
-            assert_eq!(r.f(1), 1, "color_range: full swing");
+            assert_eq!(r.f(1), 0, "color_range: studio swing");
             if !is_444 {
                 assert_eq!(r.f(2), 0, "chroma_sample_position, 4:2:0 only");
             }
@@ -3493,21 +3491,21 @@ mod tests {
     }
 
     const GOLDEN_SPS_PPS_720P: &[u8] = &[
-        0, 0, 0, 1, 103, 100, 0, 40, 172, 180, 2, 128, 45, 211, 96, 32, // SPS
+        0, 0, 0, 1, 103, 100, 0, 40, 172, 180, 2, 128, 45, 211, 64, 32, // SPS
         0, 0, 0, 1, 104, 238, 60, 48, // PPS
     ];
     const GOLDEN_SPS_PPS_1918X1078: &[u8] = &[
-        0, 0, 0, 1, 103, 100, 0, 40, 172, 180, 3, 192, 17, 61, 77, 54, 2, // SPS
+        0, 0, 0, 1, 103, 100, 0, 40, 172, 180, 3, 192, 17, 61, 77, 52, 2, // SPS
         0, 0, 0, 1, 104, 238, 6, 112, 192, // PPS
     ];
     const GOLDEN_AV1_SEQ_1080P: &[u8] = &[
-        10, 14, 0, 0, 0, 66, 171, 191, 195, 112, 9, 228, 64, 67, 65, 161,
+        10, 14, 0, 0, 0, 66, 171, 191, 195, 112, 9, 228, 64, 67, 65, 129,
     ];
     /// The same header at 4:4:4.  Verified by handing it to ffmpeg's AV1
     /// parser, which reads it as profile High; the variant that keeps the
     /// 4:2:0 field layout under a High profile is rejected there with
     /// `trailing_one_bit out of range`.
     const GOLDEN_AV1_SEQ_1080P_444: &[u8] = &[
-        10, 14, 32, 0, 0, 66, 171, 191, 195, 112, 9, 228, 128, 134, 131, 72,
+        10, 14, 32, 0, 0, 66, 171, 191, 195, 112, 9, 228, 128, 134, 131, 8,
     ];
 }

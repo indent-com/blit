@@ -1003,6 +1003,7 @@ describe("SurfaceStore decoder recovery", () => {
     static failDecodeAsync = false;
     state = "unconfigured";
     configured: string[] = [];
+    colorSpaces: Array<VideoColorSpaceInit | undefined> = [];
     decoded = 0;
     decodeQueueSize = 0;
     private readonly onError: (error: DOMException) => void;
@@ -1015,12 +1016,16 @@ describe("SurfaceStore decoder recovery", () => {
       this.onOutput = init.output;
       FakeDecoder.instances.push(this);
     }
-    configure(config: { codec: string }) {
+    configure(config: {
+      codec: string;
+      colorSpace?: VideoColorSpaceInit;
+    }) {
       if (FakeDecoder.failConfigure) {
         throw new DOMException("unsupported codec", "NotSupportedError");
       }
       this.state = "configured";
       this.configured.push(config.codec);
+      this.colorSpaces.push(config.colorSpace);
     }
     decode() {
       if (FakeDecoder.failDecode) {
@@ -1089,6 +1094,18 @@ describe("SurfaceStore decoder recovery", () => {
     const decoder = FakeDecoder.instances[0];
     expect(decoder.configured[0]).toMatch(/^av01\./);
     expect(decoder.decoded).toBe(1);
+    store.destroy();
+  });
+
+  it("configures decoded surfaces as limited-range BT.601", () => {
+    const store = newStore();
+    store.handleSurfaceFrame(1, 0, KEY_AV1, 1280, 720, frame);
+    expect(FakeDecoder.instances[0].colorSpaces[0]).toEqual({
+      primaries: "bt709",
+      transfer: "iec61966-2-1",
+      matrix: "smpte170m",
+      fullRange: false,
+    });
     store.destroy();
   });
 

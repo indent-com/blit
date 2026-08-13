@@ -14,17 +14,18 @@ import {
 import { av1LevelString } from "./BlitSurfaceCanvas";
 
 /**
- * Every Blit encoder produces full-range BT.601 (sRGB primaries/transfer).
- * Most streams also say so in-band (H.264 VUI, AV1 color_config); this
- * config hint covers the ones whose encoder cannot write it (openh264)
- * and matches the rest.  Without it a decoder assumes limited range and
- * lifts every black to gray.
+ * Every Blit encoder produces limited-range BT.601 (sRGB
+ * primaries/transfer). Most streams also say so in-band (H.264 VUI, AV1
+ * color_config); this hint covers encoders that cannot write it and keeps
+ * decoder resets identical. Studio swing is intentional: Firefox can lose a
+ * full-range flag before decoded YUV becomes RGB, progressively crushing dark
+ * UI colors in a recursively captured surface.
  */
-const FULL_RANGE_BT601: VideoColorSpaceInit = {
+const LIMITED_RANGE_BT601: VideoColorSpaceInit = {
   primaries: "bt709",
   transfer: "iec61966-2-1",
   matrix: "smpte170m",
-  fullRange: true,
+  fullRange: false,
 };
 
 /**
@@ -1051,7 +1052,7 @@ export class SurfaceStore {
       entry.decoder.configure({
         codec: cs,
         optimizeForLatency: true,
-        colorSpace: FULL_RANGE_BT601,
+        colorSpace: LIMITED_RANGE_BT601,
       });
       entry.lastCodecString = cs;
       entry.lastConfiguredWidth = width;
@@ -1621,7 +1622,7 @@ export class SurfaceStore {
                 codec: cs,
                 optimizeForLatency: true,
                 description,
-                colorSpace: FULL_RANGE_BT601,
+                colorSpace: LIMITED_RANGE_BT601,
               });
             }
           }

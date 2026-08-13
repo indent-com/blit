@@ -29,15 +29,15 @@ ivec3 rgb8(vec4 bgra) {
 }
 
 int rgb_to_y8(ivec3 rgb) {
-    return clamp((77 * rgb.r + 150 * rgb.g + 29 * rgb.b + 128) >> 8, 0, 255);
+    return clamp(((66 * rgb.r + 129 * rgb.g + 25 * rgb.b + 128) >> 8) + 16, 0, 255);
 }
 
 int rgb_to_u8(ivec3 rgb) {
-    return clamp(((-43 * rgb.r - 85 * rgb.g + 128 * rgb.b + 128) >> 8) + 128, 0, 255);
+    return clamp(((-38 * rgb.r - 74 * rgb.g + 112 * rgb.b + 128) >> 8) + 128, 0, 255);
 }
 
 int rgb_to_v8(ivec3 rgb) {
-    return clamp(((128 * rgb.r - 107 * rgb.g - 21 * rgb.b + 128) >> 8) + 128, 0, 255);
+    return clamp(((112 * rgb.r - 94 * rgb.g - 18 * rgb.b + 128) >> 8) + 128, 0, 255);
 }
 
 void main() {
@@ -48,7 +48,8 @@ void main() {
     ivec2 src = ivec2(min(pos.x, src_width - 1u), min(pos.y, src_height - 1u));
     vec4 bgra = imageLoad(bgra_in, src);
 
-    // BT.601 full-range RGB→Y
+    // BT.601 limited-range RGB→Y. Studio swing is deliberate: Firefox's
+    // WebCodecs output path can lose a full-range flag before YUV→RGB.
     uint y_byte = uint(rgb_to_y8(rgb8(bgra)));
 
     // Write Y byte via packed uint.

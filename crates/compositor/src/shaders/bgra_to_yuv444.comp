@@ -22,6 +22,22 @@ layout(push_constant) uniform Params {
     uint enc_height;
 };
 
+ivec3 rgb8(vec4 bgra) {
+    return ivec3(round(bgra.zyx * 255.0));
+}
+
+int rgb_to_y8(ivec3 rgb) {
+    return clamp(((66 * rgb.r + 129 * rgb.g + 25 * rgb.b + 128) >> 8) + 16, 0, 255);
+}
+
+int rgb_to_u8(ivec3 rgb) {
+    return clamp(((-38 * rgb.r - 74 * rgb.g + 112 * rgb.b + 128) >> 8) + 128, 0, 255);
+}
+
+int rgb_to_v8(ivec3 rgb) {
+    return clamp(((112 * rgb.r - 94 * rgb.g - 18 * rgb.b + 128) >> 8) + 128, 0, 255);
+}
+
 void main() {
     uvec2 pos = gl_GlobalInvocationID.xy;
     if (pos.x >= enc_width || pos.y >= enc_height) return;
@@ -29,18 +45,12 @@ void main() {
     // Clamp to source dimensions for edge-extension into padding.
     ivec2 src = ivec2(min(pos.x, src_width - 1u), min(pos.y, src_height - 1u));
     vec4 bgra = imageLoad(bgra_in, src);
-    float r = bgra.z;  // BGRA: z=R
-    float g = bgra.y;  // BGRA: y=G
-    float b = bgra.x;  // BGRA: x=B
+    ivec3 rgb = rgb8(bgra);
 
-    // BT.601 full-range RGB→YUV
-    float y_val = 0.299 * r + 0.587 * g + 0.114 * b;
-    float u_val = -0.169 * r - 0.331 * g + 0.500 * b + 0.5;
-    float v_val =  0.500 * r - 0.419 * g - 0.081 * b + 0.5;
-
-    uint y_byte = uint(clamp(y_val * 255.0, 0.0, 255.0));
-    uint u_byte = uint(clamp(u_val * 255.0, 0.0, 255.0));
-    uint v_byte = uint(clamp(v_val * 255.0, 0.0, 255.0));
+    // BT.601 limited-range RGB→YUV.
+    uint y_byte = uint(rgb_to_y8(rgb));
+    uint u_byte = uint(rgb_to_u8(rgb));
+    uint v_byte = uint(rgb_to_v8(rgb));
 
     uint idx = pos.y * y_stride + pos.x;
 
