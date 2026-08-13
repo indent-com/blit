@@ -4816,12 +4816,16 @@ export class BlitSurfaceCanvas {
       return;
     }
 
+    const textareaEnterFallback =
+      !e.inputType &&
+      !!ta &&
+      (ta.value.includes("\n") || ta.value.includes("\r"));
     if (this._ctrlModifier || this._altModifier) {
       const modified =
-        e.inputType === "insertText" && e.data
-          ? this.sendOneShotModifiedKey(e.data[0], "", false)
-          : isEnterInputEvent(e)
-            ? this.sendOneShotModifiedKey("Enter", "Enter", false)
+        isEnterInputEvent(e) || textareaEnterFallback
+          ? this.sendOneShotModifiedKey("Enter", "Enter", false)
+          : e.inputType === "insertText" && e.data
+            ? this.sendOneShotModifiedKey(e.data[0], "", false)
             : e.inputType === "deleteContentBackward"
               ? this.sendOneShotModifiedKey("Backspace", "Backspace", false)
               : false;
@@ -4852,10 +4856,7 @@ export class BlitSurfaceCanvas {
     // already sent) stays ignored.
     const conn = this.getConn();
     if (conn && this.surface && this._displaySize) {
-      if (
-        isEnterInputEvent(e) ||
-        (!!ta && (ta.value.includes("\n") || ta.value.includes("\r")))
-      ) {
+      if (isEnterInputEvent(e)) {
         conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Enter, true);
         conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Enter, false);
       } else if (e.inputType === "insertText" && e.data) {
@@ -4863,6 +4864,12 @@ export class BlitSurfaceCanvas {
       } else if (e.inputType === "deleteContentBackward") {
         conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Backspace, true);
         conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Backspace, false);
+      } else if (textareaEnterFallback) {
+        // Last-resort shape: no useful input metadata, but the textarea
+        // itself proves Return inserted a line break. Typed text and delete
+        // events above remain authoritative when they do carry metadata.
+        conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Enter, true);
+        conn.sendSurfaceInput(this._surfaceId, EVDEV_MAP.Enter, false);
       }
     }
     this.resetTextInput();
