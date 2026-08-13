@@ -1,5 +1,7 @@
 import AVFoundation
 import Combine
+import CoreGraphics
+import CoreMediaIO
 import Foundation
 
 struct CaptureDeviceChoice: Identifiable, Hashable {
@@ -22,9 +24,15 @@ final class CaptureModel: ObservableObject {
     private var currentInput: AVCaptureDeviceInput?
     private var observerTokens: [NSObjectProtocol] = []
     private var started = false
+    private var requestedScreenCaptureAccess = false
 
     init(preferredDevice: String?) {
         self.preferredDevice = preferredDevice
+
+        // Wired iPhone and iPad displays are Core Media I/O screen-capture
+        // devices. Opt in before AVFoundation creates its discovery session or
+        // the device can remain hidden for the lifetime of this process.
+        Self.enableWiredScreenCaptureDevices()
         discoverySession = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.externalUnknown],
             mediaType: .muxed,
@@ -80,6 +88,17 @@ final class CaptureModel: ObservableObject {
         ]
 
         requestPermissionAndDiscover()
+
+        // Core Media I/O publishes a newly enabled iOS display
+        // asynchronously. Connection notifications normally cover this, and
+        // these retries close the race where the first notification arrives
+        // while the app is still installing its observers.
+        for delay in [1.0, 3.0, 8.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.devices.isEmpty else { return }
+                self.refreshDevices()
+            }
+        }
     }
 
     func stop() {
@@ -146,6 +165,15 @@ final class CaptureModel: ObservableObject {
     }
 
     private func requestPermissionAndDiscover() {
+        guard CGPreflightScreenCaptureAccess() else {
+            if !requestedScreenCaptureAccess {
+                requestedScreenCaptureAccess = true
+                _ = CGRequestScreenCaptureAccess()
+            }
+            status = "Allow screen recording access, then quit and reopen Talk Viewer."
+            return
+        }
+
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             refreshDevices()
@@ -166,6 +194,23 @@ final class CaptureModel: ObservableObject {
         @unknown default:
             status = "Camera permission is unavailable."
         }
+    }
+
+    private static func enableWiredScreenCaptureDevices() {
+        var address = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyAllowScreenCaptureDevices),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain)
+        )
+        var allow: UInt32 = 1
+        _ = CMIOObjectSetPropertyData(
+            CMIOObjectID(kCMIOObjectSystemObject),
+            &address,
+            0,
+            nil,
+            UInt32(MemoryLayout<UInt32>.size),
+            &allow
+        )
     }
 
     private func discoveredDevices() -> [AVCaptureDevice] {

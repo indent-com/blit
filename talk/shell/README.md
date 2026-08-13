@@ -78,12 +78,14 @@ The first non-option argument can also be the URL. `TALK_VIEWER_URL` and
 `TALK_VIEWER_DEVICE` provide environment-variable equivalents when launching
 the executable directly.
 
-On first launch, allow camera access. macOS places the iPad's display feed under
-that privacy category. If no display appears:
+On first launch, allow camera and screen recording access. macOS places the
+iPad's display feed behind both privacy categories. Quit and reopen Talk Viewer
+after granting screen recording access. If no display appears:
 
 1. Unlock the iPad, reconnect it, and accept **Trust This Computer**.
 2. Quit QuickTime Player, OBS, or another app that may already own the feed.
-3. Check **System Settings → Privacy & Security → Camera → Talk Viewer**.
+3. Check **System Settings → Privacy & Security → Camera → Talk Viewer** and
+   **Screen & System Audio Recording → Talk Viewer**.
 4. Press the refresh button beside the device picker.
 
 The USB feed is video-only: Talk Viewer neither records nor forwards the iPad's
