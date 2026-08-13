@@ -220,6 +220,7 @@ Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is spli
 | `js/hub/`                    | Signaling relay server (Bun, deployed to Fly.io). See [js/hub/README.md](js/hub/README.md)                                      |
 | `e2e/`                       | Playwright tests against the full stack (6 spec files)                                                                          |
 | `examples/`                  | fd-channel examples in Python and Bun                                                                                           |
+| `talk/shell/`                | macOS WebKit + USB iPad display presentation app; see its README for build and trust requirements                               |
 | `nix/`                       | Nix packaging: `common.nix` (toolchain), `packages.nix` (build defs), `tasks.nix` (CI tasks), NixOS/Darwin modules              |
 | `systemd/`                   | Socket-activated unit files (user-level and system-level templates) and service units                                           |
 | `crates/cli/src/generate.rs` | Man pages and shell completions generated from clap definitions via `blit generate <dir>`                                       |
