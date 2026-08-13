@@ -1,10 +1,11 @@
 import { expect, test, type Page } from "@playwright/test";
 
 const PASSPHRASE = process.env.BLIT_PASSPHRASE ?? "test-secret";
+const FONT_BUTTON = 'button[title^="Font:"]';
 
 async function fontButtonSize(page: Page): Promise<string> {
   return page
-    .locator('button[title="Font"]')
+    .locator(FONT_BUTTON)
     .evaluate((el) => getComputedStyle(el).fontSize);
 }
 
@@ -25,8 +26,8 @@ test("font size stays local while previewing and reaches peers on Apply", async 
       second.goto(`${baseURL}/#psk=${encodeURIComponent(PASSPHRASE)}`),
     ]);
 
-    const firstFontButton = first.locator('button[title="Font"]');
-    const secondFontButton = second.locator('button[title="Font"]');
+    const firstFontButton = first.locator(FONT_BUTTON);
+    const secondFontButton = second.locator(FONT_BUTTON);
     await expect(firstFontButton).toBeVisible();
     await expect(secondFontButton).toBeVisible();
 
@@ -50,7 +51,7 @@ test("font size stays local while previewing and reaches peers on Apply", async 
       try {
         const sizeInput = first.locator('input[name="blit-font-size"]');
         if (!(await sizeInput.isVisible())) {
-          await first.locator('button[title="Font"]').click();
+          await first.locator(FONT_BUTTON).click();
         }
         await sizeInput.fill(originalValue);
         await first.getByRole("button", { name: "Apply", exact: true }).click();
