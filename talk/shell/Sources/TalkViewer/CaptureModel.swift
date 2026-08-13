@@ -223,11 +223,6 @@ final class CaptureModel: ObservableObject {
 
                 self.session.addInput(newInput)
                 self.preferLargestFormat(on: device)
-                if self.session.canSetSessionPreset(.inputPriority) {
-                    self.session.sessionPreset = .inputPriority
-                } else {
-                    self.session.sessionPreset = .high
-                }
                 self.currentInput = newInput
                 self.session.commitConfiguration()
                 self.session.startRunning()
