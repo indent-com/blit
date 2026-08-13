@@ -327,6 +327,120 @@ pub fn outranking_encoder_pending(
     false
 }
 
+/// Grow a coded extent, aspect preserved, to the smallest one an encoder that
+/// outranks the Vulkan Video tier will accept.  Returns the extent unchanged
+/// when nothing would be unlocked by growing it.
+///
+/// NVENC's engine has minimum dimensions — 192x128 for AV1 and 145x49 for
+/// H.264 on an RTX 4090, queried rather than assumed — and a sidebar preview
+/// target (132x128 for a 2318x2235 surface) is under them.  The preference
+/// walk then skips every hardware entry on extent alone and the surface falls
+/// to the compositor-resident tier: one scarce Vulkan Video session per
+/// preview, each encoding a thumbnail, on the driver path least exercised by
+/// anything else.  Two hundred extra rows of picture at 15fps costs less than
+/// that, so clear the floor instead and keep previews on the encoder the pane
+/// already uses.
+///
+/// `native` bounds the growth: the compositor downscales its composite into
+/// this target and there is no upscaling past the source.  A surface that is
+/// itself under the floor therefore keeps its extent — nothing here can help
+/// it, and the tier below is where it belongs.
+pub fn grown_to_hardware_floor(
+    preferences: &[SurfaceEncoderPreference],
+    codec_support: u8,
+    width: u32,
+    height: u32,
+    native_w: u32,
+    native_h: u32,
+) -> (u32, u32) {
+    if width == 0 || height == 0 {
+        return (width, height);
+    }
+    let mut best: Option<(u32, u32)> = None;
+    for &pref in preferences {
+        // Ranked below the tier: past this point nothing outranks Vulkan
+        // Video, so there is no floor left worth clearing.
+        if pref.is_vulkan_video() {
+            break;
+        }
+        if !pref.supported_by_client(codec_support) || !pref.fits(width, height) {
+            continue;
+        }
+        if known_unavailable(pref, ChromaSubsampling::Cs420) {
+            continue;
+        }
+        let codec = match pref {
+            SurfaceEncoderPreference::NvencAV1 => "av1",
+            SurfaceEncoderPreference::NvencH264 => "h264",
+            // No queryable minimum, and every one of these takes a thumbnail:
+            // this candidate already accepts the extent, so the chain never
+            // reaches the tier and growing would buy nothing.
+            _ => return (width, height),
+        };
+        let Ok(caps) = crate::nvenc_encode::caps(codec, false) else {
+            continue;
+        };
+        if caps.refuse(width, height).is_none() {
+            // Hardware already takes it as-is.
+            return (width, height);
+        }
+        if width > caps.max_width || height > caps.max_height {
+            // Refused for being too large; growing makes that worse.
+            continue;
+        }
+        let Some(candidate) = grown_to_floor(
+            width,
+            height,
+            caps.min_width,
+            caps.min_height,
+            native_w,
+            native_h,
+        ) else {
+            continue;
+        };
+        // Cheapest by area, so H.264's 145x49 floor wins over AV1's 192x128
+        // rather than whichever happens to be listed first.
+        if best.is_none_or(|(bw, bh)| {
+            (candidate.0 as u64) * (candidate.1 as u64) < (bw as u64) * (bh as u64)
+        }) {
+            best = Some(candidate);
+        }
+    }
+    best.unwrap_or((width, height))
+}
+
+/// Smallest extent that has (near enough) the aspect of `width`x`height`, is
+/// no smaller than it, clears `(min_w, min_h)` on both axes, and still fits
+/// inside the source.
+///
+/// Widen until the proportional height reaches `min_h`, then let whichever
+/// axis binds set the other.  `None` when the result would be larger than
+/// the composite it is downscaled from — growing past the source is not a
+/// thing the compositor can do, and a surface that small belongs to the tier
+/// below anyway.
+fn grown_to_floor(
+    width: u32,
+    height: u32,
+    min_w: u32,
+    min_h: u32,
+    native_w: u32,
+    native_h: u32,
+) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let w = width
+        .max(min_w)
+        .max((u64::from(min_h) * u64::from(width)).div_ceil(u64::from(height)) as u32);
+    let h = height
+        .max(min_h)
+        .max((u64::from(w) * u64::from(height)).div_ceil(u64::from(width)) as u32);
+    // Even, like every other coded extent the server hands out: NV12
+    // sampling grids and the encoder APIs both want it.
+    let (w, h) = ((w + 1) & !1, (h + 1) & !1);
+    (w <= native_w && h <= native_h).then_some((w, h))
+}
+
 /// Chroma subsampling mode.
 ///
 /// - **Cs420** (default): 4:2:0 — U/V at half horizontal and half vertical
@@ -2908,6 +3022,91 @@ mod tests {
                 P::H264Software,
                 P::AV1Software,
             ]
+        );
+    }
+
+    /// The geometry of clearing an engine's minimum extent, which is where
+    /// a preview target either keeps its aspect or starts letterboxing.
+    #[test]
+    fn growing_to_an_engine_floor_keeps_the_aspect() {
+        // A 2318x2235 surface previewed in a 256x128 sidebar card inscribes
+        // to 132x128, under AV1's 192x128 floor.  Both axes clear it and the
+        // aspect survives to within a percent.
+        let (w, h) = grown_to_floor(132, 128, 192, 128, 2318, 2235).expect("fits in native");
+        assert_eq!((w, h), (192, 188));
+        assert!((w as f32 / h as f32 - 132.0 / 128.0).abs() < 0.02);
+
+        // The dock's wide strip is under AV1's floor on height alone, so
+        // width has to grow far more than height to keep the shape — 7x the
+        // pixels.  It already clears H.264's, which is why the caller picks
+        // the cheapest floor by area rather than the first one listed.
+        assert_eq!(
+            grown_to_floor(256, 68, 192, 128, 2318, 2235),
+            Some((482, 130))
+        );
+        assert_eq!(
+            grown_to_floor(256, 68, 145, 49, 2318, 2235),
+            Some((256, 68))
+        );
+
+        // Already clear of the floor: nothing moves but the even rounding.
+        assert_eq!(
+            grown_to_floor(800, 600, 192, 128, 1600, 1200),
+            Some((800, 600))
+        );
+
+        // No upscaling past the composite: a surface smaller than the floor
+        // keeps the extent it had and lands on the tier below.
+        assert_eq!(grown_to_floor(100, 80, 192, 128, 100, 80), None);
+        assert_eq!(grown_to_floor(0, 128, 192, 128, 2318, 2235), None);
+    }
+
+    /// The floor walk stops where the tier does, and only NVENC has a floor
+    /// worth clearing — every other backend takes a thumbnail as it is.
+    #[test]
+    fn nothing_grows_for_a_chain_that_already_takes_the_extent() {
+        use SurfaceEncoderPreference as P;
+        let h264 = CODEC_SUPPORT_H264;
+        // Software sits above the tier here and accepts 132x128, so the
+        // chain never reaches Vulkan Video and there is nothing to unlock.
+        assert_eq!(
+            grown_to_hardware_floor(
+                &[P::H264Software, P::VulkanVideoH264],
+                h264,
+                132,
+                128,
+                2318,
+                2235
+            ),
+            (132, 128)
+        );
+        // Below the tier, an encoder's floor is not the tier's problem.
+        assert_eq!(
+            grown_to_hardware_floor(
+                &[P::VulkanVideoH264, P::NvencH264],
+                h264,
+                132,
+                128,
+                2318,
+                2235
+            ),
+            (132, 128)
+        );
+        assert_eq!(
+            grown_to_hardware_floor(&[], h264, 132, 128, 2318, 2235),
+            (132, 128)
+        );
+        // A candidate this client cannot decode is not serving it.
+        assert_eq!(
+            grown_to_hardware_floor(
+                &[P::NvencAV1, P::VulkanVideoH264],
+                h264,
+                132,
+                128,
+                2318,
+                2235
+            ),
+            (132, 128)
         );
     }
 
