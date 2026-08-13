@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 // fd-channel example: spawn blit server, pass a client fd via SCM_RIGHTS,
-// and verify the protocol handshake (HELLO, LIST, READY, CREATE/CREATED).
+// and verify the protocol handshake and initial state burst.
 
 import { spawn } from "bun";
 import { dlopen, FFIType, ptr } from "bun:ffi";
@@ -143,6 +143,21 @@ function writeFrame(fd: number, payload: Uint8Array) {
   writeAll(fd, frame);
 }
 
+function readInitialState(fd: number): Uint8Array {
+  let list: Uint8Array | undefined;
+  while (true) {
+    const msg = readFrame(fd);
+    assert(msg.length > 0, "unexpected empty frame in initial state");
+    if (msg[0] === S2C_LIST) {
+      assert(list === undefined, "received duplicate LIST");
+      list = msg;
+    } else if (msg[0] === S2C_READY) {
+      assert(list !== undefined, "received READY before LIST");
+      return list!;
+    }
+  }
+}
+
 function assert(cond: boolean, msg: string) {
   if (!cond) {
     console.error(`FAIL: ${msg}`);
@@ -175,19 +190,12 @@ try {
   const protoVersion = new DataView(hello.buffer).getUint16(1, true);
   console.log(`HELLO: protocol version ${protoVersion}`);
 
-  const list = readFrame(clientOurs);
-  assert(
-    list[0] === S2C_LIST,
-    `expected LIST (0x03), got 0x${list[0].toString(16)}`,
-  );
+  // The initial burst can include compositor and terminal state around
+  // LIST. READY marks its end.
+  const list = readInitialState(clientOurs);
   const ptyCount = new DataView(list.buffer).getUint16(1, true);
   console.log(`LIST: ${ptyCount} existing PTYs`);
 
-  const ready = readFrame(clientOurs);
-  assert(
-    ready[0] === S2C_READY,
-    `expected READY (0x09), got 0x${ready[0].toString(16)}`,
-  );
   console.log("READY");
 
   const createMsg = new Uint8Array(7);

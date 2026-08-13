@@ -244,7 +244,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 10  | `NET`                | Server supports the `NET_*` network-relay family                |
 | 11  | `EXTENSION`          | Proposed: Wasmi extension lifecycle, events, and commands       |
 | 12  | `CHANNEL`            | Proposed: server supports bidirectional named channels          |
-| 13  | `RESERVED`           | Unallocated; servers leave this bit clear                       |
+| 13  | `PROCESS`            | Proposed: server supports non-PTY child processes               |
 | 14  | `CREATE_STATUS`      | `CREATE2(WANT_STATUS)` receives an explicit failure             |
 | 15  | `KILL_MODE`          | `KILL`/`CLOSE` reach the process group; `KILL` takes `flags`    |
 | 16  | `PTY_DEADLINE`       | `C2S_DEADLINE`, `CREATE2(HAS_DEADLINE)`, and `EXITED.reason`    |
@@ -252,13 +252,15 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 18  | `SURFACE_TOUCH`      | Server accepts direct contacts and exposes `wl_seat.touch`      |
 | 19  | `SURFACE_TEXT_INPUT` | Server forwards committed `zwp_text_input_v3` state             |
 
-Bits 11 and 12 are proposed for the extension and channel families under review
-in [#167](https://github.com/indent-com/blit/pull/167); nothing advertises them
-today. Bit 13 is reserved, and bit 14 is always advertised.
+Bits 11 through 13 are proposed for the extension, channel, and process families
+under review in [#167](https://github.com/indent-com/blit/pull/167) and
+[#173](https://github.com/indent-com/blit/pull/173); nothing advertises them
+today. Bit 14 is always advertised.
 
-The proposed bits 11 and 12 are independently omitted when `BLIT_EXT=0` or
-`BLIT_CHANNEL=0`; disabled-family requests are refused as specified in
-[design/extensions.md](design/extensions.md#security-posture-and-deployment-controls).
+The proposed bits 11 through 13 are independently omitted when `BLIT_EXT=0`,
+`BLIT_CHANNEL=0`, or `BLIT_PROCESS=0`; disabled-family requests are refused as
+specified in [design/extensions.md](design/extensions.md#security-posture-and-deployment-controls)
+and [design/processes.md](design/processes.md#security-and-deployment).
 Bit 14 is not extension-specific and is not controlled by those gates. It is
 advertised only after the server implements the negotiated creation outcome
 below; the implementation plan updates both shipped clients before enabling it.

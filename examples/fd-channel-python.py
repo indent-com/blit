@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """fd-channel example: spawn blit server, pass a client fd via SCM_RIGHTS,
-and verify the protocol handshake (HELLO, LIST, READY, CREATE/CREATED)."""
+and verify the protocol handshake and initial state burst."""
 
 import os
 import signal
@@ -41,6 +41,20 @@ def write_frame(sock, payload):
     sock.sendall(struct.pack("<I", len(payload)) + payload)
 
 
+def read_initial_state(sock):
+    """Consume state messages through READY and return the required LIST."""
+    lst = None
+    while True:
+        msg = read_frame(sock)
+        assert msg, "unexpected empty frame in initial state"
+        if msg[0] == S2C_LIST:
+            assert lst is None, "received duplicate LIST"
+            lst = msg
+        elif msg[0] == S2C_READY:
+            assert lst is not None, "received READY before LIST"
+            return lst
+
+
 def main():
     channel_theirs, channel_ours = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
 
@@ -66,13 +80,12 @@ def main():
         proto_version = struct.unpack_from("<H", hello, 1)[0]
         print(f"HELLO: protocol version {proto_version}")
 
-        lst = read_frame(client_ours)
-        assert lst[0] == S2C_LIST, f"expected LIST (0x03), got 0x{lst[0]:02x}"
+        # The initial burst can include compositor and terminal state around
+        # LIST. READY marks its end.
+        lst = read_initial_state(client_ours)
         pty_count = struct.unpack_from("<H", lst, 1)[0]
         print(f"LIST: {pty_count} existing PTYs")
 
-        ready = read_frame(client_ours)
-        assert ready[0] == S2C_READY, f"expected READY (0x09), got 0x{ready[0]:02x}"
         print("READY")
 
         create_msg = struct.pack("<BHHH", C2S_CREATE, 24, 80, 0)

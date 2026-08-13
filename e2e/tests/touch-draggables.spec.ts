@@ -213,7 +213,7 @@ test.describe("Touch drag on list rows", () => {
     // Moving straight away, with no hold: the gesture belongs to the card,
     // not to the drag bridge. Past SWIPE_THRESHOLD and horizontal, so it is
     // unambiguously a dismiss.
-    await swipe(page, selector, cardAt, -160);
+    await swipe(page, selector, cardAt, 160);
     await page.waitForTimeout(800);
 
     // Gone from the dock *and* closed. The second half is what makes this a
