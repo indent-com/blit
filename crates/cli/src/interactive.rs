@@ -351,7 +351,14 @@ async fn browser_root_handler(
 ) -> Response {
     let path = request.uri().path().to_string();
 
-    if let Some(resp) = blit_webserver::try_font_route(&path, None) {
+    if let Some(resp) = blit_webserver::try_font_route(
+        &path,
+        None,
+        request
+            .headers()
+            .get(axum::http::header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+    ) {
         return resp;
     }
 

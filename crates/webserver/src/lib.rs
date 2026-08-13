@@ -27,23 +27,100 @@ pub fn fonts_list_response(cors_origin: Option<&str>) -> Response {
     resp
 }
 
+/// Whether a client said it can take brotli.
+///
+/// `br;q=0` is a refusal, not an offer — the same header syntax says both.
+fn accepts_br(accept_encoding: Option<&str>) -> bool {
+    let Some(header) = accept_encoding else {
+        return false;
+    };
+    header.split(',').any(|part| {
+        let mut params = part.split(';').map(str::trim);
+        if params.next() != Some("br") {
+            return false;
+        }
+        // Any q but zero is an offer: `q=0.1` is "if you must", `q=0` is "no".
+        !params.any(|p| {
+            p.strip_prefix("q=")
+                .and_then(|q| q.trim().parse::<f32>().ok())
+                .is_some_and(|q| q <= 0.0)
+        })
+    })
+}
+
+/// Compression settings for face CSS, measured on a real 25.4 MB PragmataPro
+/// Mono stylesheet (four faces, base64 inside the CSS):
+///
+/// | quality | window | result                    |
+/// |---------|--------|---------------------------|
+/// | 4       | 22     | 10.6 MB in 429 ms         |
+/// | 4       | 24     |  8.7 MB in 401 ms         |
+/// | 5       | 24     | 10.3 MB in 870 ms         |
+/// | 9       | 24     |  7.4 MB in 5.1 s          |
+///
+/// So quality 4 with the largest standard window: everything above it costs
+/// multiples of the CPU, and 5 and 6 are *worse* on both counts here — at
+/// quality 5 the encoder switches strategy and stops using the whole window,
+/// which is where the wins on a payload this repetitive come from.
+///
+/// 24 is the ceiling for plain `Content-Encoding: br`; a larger one needs the
+/// large-window extension, which a browser will not decode.
+const FONT_CSS_BROTLI_QUALITY: i32 = 4;
+const FONT_CSS_BROTLI_WINDOW: i32 = 24;
+
 /// Serve a font's @font-face CSS by family name, or 404.
-pub fn font_response(name: &str, cors_origin: Option<&str>) -> Response {
-    match blit_fonts::font_face_css(name) {
-        Some(css) => {
-            let mut resp = (
-                [
-                    (header::CONTENT_TYPE, "text/css"),
-                    (header::CACHE_CONTROL, "public, max-age=86400, immutable"),
-                ],
-                css,
-            )
-                .into_response();
-            add_cors(&mut resp, cors_origin);
+///
+/// Compressed when the client can take it, because the face arrives inlined as
+/// base64 — a real family is tens of megabytes of it, a third of which is the
+/// encoding rather than the font, and what is left is repetitive enough that
+/// the whole thing goes out at roughly a third of its size.
+pub fn font_response(
+    name: &str,
+    cors_origin: Option<&str>,
+    accept_encoding: Option<&str>,
+) -> Response {
+    let Some(css) = blit_fonts::font_face_css(name) else {
+        return (axum::http::StatusCode::NOT_FOUND, "font not found").into_response();
+    };
+    let headers = [
+        (header::CONTENT_TYPE, "text/css"),
+        (header::CACHE_CONTROL, "public, max-age=86400, immutable"),
+    ];
+    let mut resp = match compress_br(css.as_bytes(), accept_encoding) {
+        Some(compressed) => {
+            let mut resp = (headers, compressed).into_response();
+            resp.headers_mut().insert(
+                header::CONTENT_ENCODING,
+                header::HeaderValue::from_static("br"),
+            );
             resp
         }
-        None => (axum::http::StatusCode::NOT_FOUND, "font not found").into_response(),
+        None => (headers, css).into_response(),
+    };
+    add_cors(&mut resp, cors_origin);
+    resp
+}
+
+/// Brotli-compress a body, or `None` when the client did not offer `br` —
+/// spending the CPU on bytes the client would then have to reject is worse
+/// than sending it raw.
+fn compress_br(body: &[u8], accept_encoding: Option<&str>) -> Option<Vec<u8>> {
+    if !accepts_br(accept_encoding) {
+        return None;
     }
+    let mut out = Vec::new();
+    brotli::BrotliCompress(
+        &mut std::io::Cursor::new(body),
+        &mut out,
+        &brotli::enc::BrotliEncoderParams {
+            quality: FONT_CSS_BROTLI_QUALITY,
+            lgwin: FONT_CSS_BROTLI_WINDOW,
+            size_hint: body.len(),
+            ..Default::default()
+        },
+    )
+    .ok()?;
+    Some(out)
 }
 
 /// Serve font metrics (advance ratio) as JSON.
@@ -93,10 +170,7 @@ pub fn html_response(
         )
             .into_response();
     }
-    let accepts_br = accept_encoding
-        .map(|ae| ae.split(',').any(|p| p.trim().starts_with("br")))
-        .unwrap_or(false);
-    if accepts_br {
+    if accepts_br(accept_encoding) {
         (
             [
                 (header::ETAG, etag.to_owned()),
@@ -154,9 +228,6 @@ pub fn service_worker_response(
         )
             .into_response();
     }
-    let accepts_br = accept_encoding
-        .map(|ae| ae.split(',').any(|p| p.trim().starts_with("br")))
-        .unwrap_or(false);
     let common = [
         (header::ETAG, etag.to_owned()),
         (
@@ -166,7 +237,7 @@ pub fn service_worker_response(
         (header::CACHE_CONTROL, "no-cache".to_owned()),
         (SERVICE_WORKER_ALLOWED, "/".to_owned()),
     ];
-    if accepts_br {
+    if accepts_br(accept_encoding) {
         let mut resp = (common, js_br).into_response();
         resp.headers_mut().insert(
             header::CONTENT_ENCODING,
@@ -238,7 +309,11 @@ pub fn preview_unavailable_response() -> Response {
 /// Try to match a font route from a raw request path (any prefix).
 /// Handles `/fonts`, `/vt/fonts`, `/font/Name`, `/vt/font/Name%20With%20Spaces`.
 /// Returns `Some(response)` if the path matched a font route, `None` otherwise.
-pub fn try_font_route(path: &str, cors_origin: Option<&str>) -> Option<Response> {
+pub fn try_font_route(
+    path: &str,
+    cors_origin: Option<&str>,
+    accept_encoding: Option<&str>,
+) -> Option<Response> {
     if path == "/fonts" || path.ends_with("/fonts") {
         return Some(fonts_list_response(cors_origin));
     }
@@ -254,7 +329,7 @@ pub fn try_font_route(path: &str, cors_origin: Option<&str>) -> Option<Response>
         && !raw.is_empty()
     {
         let name = percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
-        return Some(font_response(&name, cors_origin));
+        return Some(font_response(&name, cors_origin, accept_encoding));
     }
     None
 }
@@ -326,23 +401,120 @@ mod tests {
 
     #[test]
     fn font_route_fonts_bare() {
-        assert!(try_font_route("/fonts", None).is_some());
+        assert!(try_font_route("/fonts", None, None).is_some());
     }
 
     #[test]
     fn font_route_fonts_prefixed() {
-        assert!(try_font_route("/vt/fonts", None).is_some());
+        assert!(try_font_route("/vt/fonts", None, None).is_some());
     }
 
     #[test]
     fn font_route_font_name() {
-        let resp = try_font_route("/font/Menlo", None);
+        let resp = try_font_route("/font/Menlo", None, None);
         assert!(resp.is_some());
+    }
+
+    // ── face CSS compression ──
+    //
+    // The face arrives as base64 inside the stylesheet, so a real family is
+    // tens of megabytes on the wire — measured, 25.4 MB for PragmataPro Mono,
+    // a quarter of which is the encoding rather than the font.
+
+    #[test]
+    fn accept_encoding_reading() {
+        assert!(accepts_br(Some("br")));
+        assert!(accepts_br(Some("gzip, deflate, br")));
+        assert!(accepts_br(Some("br;q=0.1")), "a low q is still an offer");
+        assert!(!accepts_br(None), "a client that said nothing gets bytes");
+        assert!(!accepts_br(Some("gzip, deflate")));
+        assert!(
+            !accepts_br(Some("br;q=0")),
+            "q=0 is a refusal, not an offer"
+        );
+        assert!(
+            !accepts_br(Some("brotli")),
+            "the token is `br` — a prefix match would take anything"
+        );
+    }
+
+    #[test]
+    fn compression_round_trips_and_is_skipped_when_unwanted() {
+        // Shaped like what the route actually serves: base64 of font bytes.
+        let body = "@font-face { src: url('data:font/ttf;base64,".to_owned()
+            + &"AAEAAAALAIAAAwAwT1MvMg8SBPsAAAC8AAAAYGNtYXAX".repeat(20_000)
+            + "'); }";
+        assert!(compress_br(body.as_bytes(), None).is_none());
+        let compressed = compress_br(body.as_bytes(), Some("gzip, br")).expect("br was on offer");
+        assert!(
+            compressed.len() < body.len() / 2,
+            "{} bytes from {} is not worth the CPU",
+            compressed.len(),
+            body.len()
+        );
+        let mut back = Vec::new();
+        brotli::BrotliDecompress(&mut std::io::Cursor::new(&compressed), &mut back).unwrap();
+        assert_eq!(
+            back,
+            body.as_bytes(),
+            "a stylesheet that lost bytes is a broken font"
+        );
+    }
+
+    /// Only runs where a monospace family is installed — the payload has to be
+    /// a real face for the response to be one.
+    #[tokio::test]
+    async fn font_route_compresses_a_real_face() {
+        let Some(family) = blit_fonts::list_monospace_font_families()
+            .into_iter()
+            .next()
+        else {
+            eprintln!("no monospace font installed; skipping");
+            return;
+        };
+        let Some(css) = blit_fonts::font_face_css(&family) else {
+            eprintln!("{family} is listed but serves no face; skipping");
+            return;
+        };
+        let path = format!(
+            "/font/{}",
+            percent_encoding::utf8_percent_encode(&family, percent_encoding::NON_ALPHANUMERIC)
+        );
+        let plain = try_font_route(&path, None, None).expect("a font route");
+        assert_eq!(plain.status(), StatusCode::OK);
+        assert!(plain.headers().get(header::CONTENT_ENCODING).is_none());
+
+        let compressed =
+            try_font_route(&path, None, Some("gzip, deflate, br")).expect("a font route");
+        assert_eq!(compressed.status(), StatusCode::OK);
+        assert_eq!(
+            compressed.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "br"
+        );
+        assert_eq!(
+            compressed.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/css",
+            "the encoding changes, the type does not"
+        );
+        let body = axum::body::to_bytes(compressed.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        let mut back = Vec::new();
+        brotli::BrotliDecompress(&mut std::io::Cursor::new(body.as_ref()), &mut back).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&back),
+            css,
+            "the browser has to end up with the stylesheet the server generated"
+        );
+        assert!(
+            back.len() > body.len(),
+            "compression that grows the face is a regression"
+        );
     }
 
     #[test]
     fn font_route_font_metrics() {
-        let resp = try_font_route("/font-metrics/Menlo", None);
+        let resp = try_font_route("/font-metrics/Menlo", None, None);
         assert!(resp.is_some());
     }
 
@@ -452,18 +624,18 @@ mod tests {
 
     #[test]
     fn font_route_no_match() {
-        assert!(try_font_route("/api/sessions", None).is_none());
-        assert!(try_font_route("/", None).is_none());
+        assert!(try_font_route("/api/sessions", None, None).is_none());
+        assert!(try_font_route("/", None, None).is_none());
     }
 
     #[test]
     fn font_route_rejects_empty_name() {
-        assert!(try_font_route("/font/", None).is_none());
-        assert!(try_font_route("/font-metrics/", None).is_none());
+        assert!(try_font_route("/font/", None, None).is_none());
+        assert!(try_font_route("/font-metrics/", None, None).is_none());
     }
 
     #[test]
     fn font_route_rejects_nested_path() {
-        assert!(try_font_route("/font/a/b", None).is_none());
+        assert!(try_font_route("/font/a/b", None, None).is_none());
     }
 }

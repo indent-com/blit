@@ -849,7 +849,14 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
         .unwrap_or_else(|| "unknown".to_string());
     let path = request.uri().path().to_string();
 
-    if let Some(resp) = blit_webserver::try_font_route(&path, state.cors_origin.as_deref()) {
+    if let Some(resp) = blit_webserver::try_font_route(
+        &path,
+        state.cors_origin.as_deref(),
+        request
+            .headers()
+            .get(axum::http::header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+    ) {
         return resp;
     }
 
