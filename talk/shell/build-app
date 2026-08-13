@@ -6,6 +6,21 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
+if ! swift_bin="$(/usr/bin/xcrun --find swift 2>/dev/null)" || [[ ! -x "$swift_bin" ]]; then
+  printf '%s\n' \
+    "Talk Viewer needs Apple's Swift compiler, but the active developer toolchain does not provide it." \
+    "" \
+    "Install the Command Line Tools:" \
+    "  xcode-select --install" \
+    "" \
+    "Or, if Xcode is already installed, select it:" \
+    "  sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer" \
+    "  sudo xcodebuild -runFirstLaunch" \
+    "" \
+    "Then verify with: xcrun --find swift" >&2
+  exit 1
+fi
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 output_dir="${1:-"$script_dir/dist"}"
 
@@ -13,8 +28,8 @@ mkdir -p "$output_dir"
 output_dir="$(cd "$output_dir" && pwd)"
 app_path="$output_dir/Talk Viewer.app"
 
-swift build --package-path "$script_dir" -c release --product TalkViewer
-binary_dir="$(swift build --package-path "$script_dir" -c release --show-bin-path)"
+"$swift_bin" build --package-path "$script_dir" -c release --product TalkViewer
+binary_dir="$("$swift_bin" build --package-path "$script_dir" -c release --show-bin-path)"
 
 rm -rf -- "$app_path"
 mkdir -p "$app_path/Contents/MacOS"

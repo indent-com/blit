@@ -13,7 +13,7 @@ and Command-Option-Plus.
 ## Requirements
 
 - macOS 13 or newer
-- Xcode Command Line Tools (`xcode-select --install`)
+- Xcode or the current Xcode Command Line Tools (`xcode-select --install`)
 - An unlocked iPad that has trusted the Mac
 - A data-capable USB cable
 
@@ -33,8 +33,29 @@ open "talk/shell/dist/Talk Viewer.app"
 Run the Swift unit tests with:
 
 ```bash
-swift test --package-path talk/shell
+xcrun swift test --package-path talk/shell
 ```
+
+### Swift toolchain setup
+
+If the build reports `tool 'swift' not found`, install Apple's command-line
+toolchain:
+
+```bash
+xcode-select --install
+xcrun --find swift
+```
+
+If Xcode is already installed, make it the active developer directory instead:
+
+```bash
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+sudo xcodebuild -runFirstLaunch
+xcrun swift --version
+```
+
+After a macOS upgrade, Software Update may need to install a matching Command
+Line Tools release before `xcrun` can find Swift again.
 
 The browser opens `http://127.0.0.1:10000` by default, which is the standard
 blit development UI address. Start at another page by passing arguments through
