@@ -151,13 +151,13 @@ reused during the server process. Each visible state change increments a
 
 The server maps browser input to the item as follows:
 
-| Browser input | D-Bus behavior |
-| --- | --- |
-| Primary click | `Activate(0, 0)`, unless `ItemIsMenu`, in which case open the menu |
-| Secondary click | `SecondaryActivate(0, 0)` |
-| Context click | Open `Menu` through DBusMenu, or fall back to `ContextMenu(0, 0)` |
-| Wheel/trackpad | `Scroll(delta, "vertical" | "horizontal")` |
-| Menu item | `Event(id, "clicked", empty variant, monotonic_timestamp)` |
+| Browser input   | D-Bus behavior                                                     |
+| --------------- | ------------------------------------------------------------------ | -------------- |
+| Primary click   | `Activate(0, 0)`, unless `ItemIsMenu`, in which case open the menu |
+| Secondary click | `SecondaryActivate(0, 0)`                                          |
+| Context click   | Open `Menu` through DBusMenu, or fall back to `ContextMenu(0, 0)`  |
+| Wheel/trackpad  | `Scroll(delta, "vertical"                                          | "horizontal")` |
+| Menu item       | `Event(id, "clicked", empty variant, monotonic_timestamp)`         |
 
 The StatusNotifier coordinates are screen-position hints. A tray icon rendered
 in browser chrome has no meaningful coordinate in the headless Wayland output,
@@ -289,21 +289,21 @@ WebRTC transports forward them unchanged.
 
 ### Client to server
 
-| Opcode | Name | Layout |
-| --- | --- | --- |
-| `0x3B` | `DESKTOP_SUBSCRIBE` | `[flags:1]`; bit 0 tray, bit 1 notifications, `0` unsubscribes |
-| `0x3C` | `TRAY_EVENT` | `[tray_id:4][kind:1][menu_revision:4][value:4 i32][flags:1]` |
-| `0x3D` | `NOTIFICATION_EVENT` | `[notification_id:4][revision:4][kind:1][key_len:2][key:N]` |
+| Opcode | Name                 | Layout                                                         |
+| ------ | -------------------- | -------------------------------------------------------------- |
+| `0x3B` | `DESKTOP_SUBSCRIBE`  | `[flags:1]`; bit 0 tray, bit 1 notifications, `0` unsubscribes |
+| `0x3C` | `TRAY_EVENT`         | `[tray_id:4][kind:1][menu_revision:4][value:4 i32][flags:1]`   |
+| `0x3D` | `NOTIFICATION_EVENT` | `[notification_id:4][revision:4][kind:1][key_len:2][key:N]`    |
 
 `TRAY_EVENT.kind` is:
 
-| Kind | Meaning | Extra fields |
-| --- | --- | --- |
-| `0` | activate | remaining fields ignored |
-| `1` | secondary activate | remaining fields ignored |
-| `2` | open menu/context menu | `menu_revision` is the client's known revision; `value` is parent ID (`0` root) |
-| `3` | scroll | `value` is signed delta; `flags & 1` means horizontal |
-| `4` | click menu item | `menu_revision` must match; `value` is item ID |
+| Kind | Meaning                | Extra fields                                                                    |
+| ---- | ---------------------- | ------------------------------------------------------------------------------- |
+| `0`  | activate               | remaining fields ignored                                                        |
+| `1`  | secondary activate     | remaining fields ignored                                                        |
+| `2`  | open menu/context menu | `menu_revision` is the client's known revision; `value` is parent ID (`0` root) |
+| `3`  | scroll                 | `value` is signed delta; `flags & 1` means horizontal                           |
+| `4`  | click menu item        | `menu_revision` must match; `value` is item ID                                  |
 
 `NOTIFICATION_EVENT.kind` is `0` default action, `1` named action, or `2`
 dismiss. `key` is present only for kind `1`. The server validates the ID,
@@ -311,11 +311,11 @@ revision, action key, and client permission before touching D-Bus.
 
 ### Server to client
 
-| Opcode | Name | Layout |
-| --- | --- | --- |
-| `0x32` | `TRAY_UPDATE` | `[flags:1][records:LZ4]` |
-| `0x33` | `TRAY_MENU` | `[tray_id:4][tray_revision:4][menu_revision:4][status:1][nodes:LZ4]` |
-| `0x34` | `NOTIFICATION_UPDATE` | `[flags:1][records:LZ4]` |
+| Opcode | Name                  | Layout                                                               |
+| ------ | --------------------- | -------------------------------------------------------------------- |
+| `0x32` | `TRAY_UPDATE`         | `[flags:1][records:LZ4]`                                             |
+| `0x33` | `TRAY_MENU`           | `[tray_id:4][tray_revision:4][menu_revision:4][status:1][nodes:LZ4]` |
+| `0x34` | `NOTIFICATION_UPDATE` | `[flags:1][records:LZ4]`                                             |
 
 Update flags are bit 0 `RESET`, bit 1 `SYNC`, and bit 2 `REPLAY`. Records are
 `[count:2]` followed by length-framed entries:
@@ -486,18 +486,18 @@ which suppresses the services and feature bit entirely.
 D-Bus peers are applications, not trusted parsers. The following defaults are
 hard limits, configurable downward but not silently expanded by a client:
 
-| Resource | Limit | Behavior at limit |
-| --- | ---: | --- |
-| Registered tray items | 128 per compositor | Reject further registration |
-| Active notifications | 256 per compositor | Close oldest non-critical item with reason 4; reject only if all are critical |
-| Actions per notification | 32 | Ignore extras |
-| Menu nodes / depth | 2,048 / 16 | Return menu status 2 |
-| D-Bus string before sanitation | 64 KiB | Clip at a UTF-8 boundary; body keeps up to 64 KiB, labels/titles less |
-| Source image | 512 x 512 and 4 MiB decoded | Drop image |
-| Final tray icon | 64 x 64 | Re-encode PNG |
-| Final notification image | 512 x 512, 1 MiB PNG | Downscale or drop |
-| One desktop update after decompression | 16 MiB | Chunk snapshot; reject a live record which cannot fit |
-| D-Bus property/menu call | 2 seconds | Keep prior state; remove after repeated identity failures |
+| Resource                               |                       Limit | Behavior at limit                                                             |
+| -------------------------------------- | --------------------------: | ----------------------------------------------------------------------------- |
+| Registered tray items                  |          128 per compositor | Reject further registration                                                   |
+| Active notifications                   |          256 per compositor | Close oldest non-critical item with reason 4; reject only if all are critical |
+| Actions per notification               |                          32 | Ignore extras                                                                 |
+| Menu nodes / depth                     |                  2,048 / 16 | Return menu status 2                                                          |
+| D-Bus string before sanitation         |                      64 KiB | Clip at a UTF-8 boundary; body keeps up to 64 KiB, labels/titles less         |
+| Source image                           | 512 x 512 and 4 MiB decoded | Drop image                                                                    |
+| Final tray icon                        |                     64 x 64 | Re-encode PNG                                                                 |
+| Final notification image               |        512 x 512, 1 MiB PNG | Downscale or drop                                                             |
+| One desktop update after decompression |                      16 MiB | Chunk snapshot; reject a live record which cannot fit                         |
+| D-Bus property/menu call               |                   2 seconds | Keep prior state; remove after repeated identity failures                     |
 
 Notification rate is token-bucketed per unique D-Bus owner (20 immediate, 2
 per second refill). Replacement of an existing ID costs less than creation so
@@ -519,13 +519,13 @@ Image and text input is data, not browser content:
 
 ## Configuration
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `BLIT_DESKTOP` | `1` when the Linux compositor is enabled | Set `0` to disable watcher, tray, and notifications |
-| `BLIT_ICON_THEME` | `hicolor` | Remote icon theme before required hicolor fallback |
-| `BLIT_NOTIFICATION_TIMEOUT_MS` | `10000` | Default timeout for low/normal notifications requesting `-1` |
-| `BLIT_NOTIFICATION_TIMEOUT_MIN_MS` | `1000` | Lower clamp for positive application timeouts |
-| `BLIT_NOTIFICATION_TIMEOUT_MAX_MS` | `86400000` | Upper clamp for positive application timeouts |
+| Variable                           | Default                                  | Meaning                                                      |
+| ---------------------------------- | ---------------------------------------- | ------------------------------------------------------------ |
+| `BLIT_DESKTOP`                     | `1` when the Linux compositor is enabled | Set `0` to disable watcher, tray, and notifications          |
+| `BLIT_ICON_THEME`                  | `hicolor`                                | Remote icon theme before required hicolor fallback           |
+| `BLIT_NOTIFICATION_TIMEOUT_MS`     | `10000`                                  | Default timeout for low/normal notifications requesting `-1` |
+| `BLIT_NOTIFICATION_TIMEOUT_MIN_MS` | `1000`                                   | Lower clamp for positive application timeouts                |
+| `BLIT_NOTIFICATION_TIMEOUT_MAX_MS` | `86400000`                               | Upper clamp for positive application timeouts                |
 
 Browser permission and presentation preferences are device-local and remain in
 `localStorage`; they do not belong in server `blit.conf` and must not roam to

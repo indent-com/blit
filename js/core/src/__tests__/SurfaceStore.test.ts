@@ -1016,10 +1016,7 @@ describe("SurfaceStore decoder recovery", () => {
       this.onOutput = init.output;
       FakeDecoder.instances.push(this);
     }
-    configure(config: {
-      codec: string;
-      colorSpace?: VideoColorSpaceInit;
-    }) {
+    configure(config: { codec: string; colorSpace?: VideoColorSpaceInit }) {
       if (FakeDecoder.failConfigure) {
         throw new DOMException("unsupported codec", "NotSupportedError");
       }
