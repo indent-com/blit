@@ -7520,6 +7520,19 @@ async fn tick(state: &AppState) -> TickOutcome {
                     },
                     surface_encode_cap(&state.config.surface_encoders, client, sid),
                 );
+                // A target under a hardware encoder's minimum extent would
+                // fall through the whole chain to the compositor-resident
+                // tier.  Grow it to the floor instead: a sidebar preview is
+                // then encoded by the same engine as the pane, and the
+                // Vulkan Video sessions stay for the extents that need them.
+                let (target_w, target_h) = surface_encoder::grown_to_hardware_floor(
+                    &state.config.surface_encoders,
+                    surface_codec_support(client, sid),
+                    target_w,
+                    target_h,
+                    native_w,
+                    native_h,
+                );
                 let (enc_w, enc_h) = (target_w, target_h);
 
                 // A Vulkan Video session is per client and per encoded size,
@@ -8071,23 +8084,49 @@ async fn tick(state: &AppState) -> TickOutcome {
                 // else: a configure that leaves this client's target where
                 // it is (another viewer nudging the mediated size, a
                 // one-pixel move) is no reason to withhold a frame.
-                if needs_new_encoder
-                    && let Some((cw, ch, cs120)) = resize_destination
-                    && Session::per_client_encode_target(
-                        view,
-                        cw as u32,
-                        ch as u32,
-                        // The destination carries the scale it will be
-                        // configured at, so its logical size is exact —
-                        // no need to wait for the compositor to report it.
-                        if scaled.is_some() {
-                            None
-                        } else {
-                            let s = (cs120 as u32).max(120);
-                            Some(((cw as u32 * 120).div_ceil(s), (ch as u32 * 120).div_ceil(s)))
-                        },
-                        surface_encode_cap(&state.config.surface_encoders, client, sid),
-                    ) != (target_w, target_h)
+                // Only for a build that is actually pending: this is two
+                // target derivations, and the tick loop runs it per client
+                // per surface.
+                let destination_target =
+                    resize_destination
+                        .filter(|_| needs_new_encoder)
+                        .map(|(cw, ch, cs120)| {
+                            let (w, h) = Session::per_client_encode_target(
+                                view,
+                                cw as u32,
+                                ch as u32,
+                                // The destination carries the scale it will be
+                                // configured at, so its logical size is exact
+                                // — no need to wait for the compositor to
+                                // report it.
+                                if scaled.is_some() {
+                                    None
+                                } else {
+                                    let s = (cs120 as u32).max(120);
+                                    Some((
+                                        (cw as u32 * 120).div_ceil(s),
+                                        (ch as u32 * 120).div_ceil(s),
+                                    ))
+                                },
+                                surface_encode_cap(&state.config.surface_encoders, client, sid),
+                            );
+                            // Grown against the native the configure is
+                            // heading for, exactly as the live target above
+                            // was grown against the current one.  Comparing a
+                            // grown target with an ungrown projection would
+                            // read every thumbnail as "the configure will move
+                            // this" and withhold its frames.
+                            surface_encoder::grown_to_hardware_floor(
+                                &state.config.surface_encoders,
+                                surface_codec_support(client, sid),
+                                w,
+                                h,
+                                cw as u32,
+                                ch as u32,
+                            )
+                        });
+                if let Some(destination) = destination_target
+                    && destination != (target_w, target_h)
                 {
                     client.skip_last_pixels_mismatch_count =
                         client.skip_last_pixels_mismatch_count.saturating_add(1);
