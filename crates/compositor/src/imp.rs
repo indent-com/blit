@@ -5337,6 +5337,17 @@ impl Compositor {
                         // for the native BGRA, which the NVENC zero-copy
                         // path otherwise leaves unpublished.
                         vk.request_native_bgra();
+                        // Capture failing for every surface at once is the
+                        // clearest symptom of a dead renderer, and "not found
+                        // or has no buffer" sends whoever sees it looking at
+                        // the app instead.  Name the real reason here.
+                        if vk.gpu_unrecoverable() {
+                            eprintln!(
+                                "[capture] surface {surface_id}: the GPU renderer stopped after \
+                                 repeated submit failures, so there is nothing to composite — \
+                                 restart the server.",
+                            );
+                        }
                         let readable = |v: Vec<(u16, u32, u32, PixelData, bool)>| {
                             // Take the first result we can actually read. A
                             // zero-copy NV12 handle may be in here too, and

@@ -359,6 +359,23 @@ pub(crate) struct VulkanRenderer {
     // once the fence signals.
     pending_submit: Option<PendingSubmit>,
 
+    /// Submissions whose fence never signalled, kept alive forever.
+    ///
+    /// A GPU fault (an NVRM Xid on the channel this queue submits to) leaves
+    /// a fence that will not signal.  The submission's command buffer,
+    /// textures and semaphores may still be referenced by the faulted
+    /// context, so destroying them is undefined — but the renderer has to
+    /// move on or the compositor never composites again.  Parking the whole
+    /// `PendingSubmit` here leaks it deliberately: nothing in it is reused,
+    /// and the count is bounded by `ABANDON_LIMIT`.
+    abandoned_submits: Vec<PendingSubmit>,
+    /// Whether the stall past `SUBMIT_STALL_WARN` has been reported for
+    /// the submission currently in flight.
+    submit_stall_warned: bool,
+    /// Set once the renderer has stopped submitting: every attempt to let
+    /// the GPU recover has been spent, so the process needs a restart.
+    gpu_unrecoverable: bool,
+
     /// Tracking fences and primary command buffers retired from completed
     /// submissions. Both objects are reset before entering these pools, so
     /// steady-state rendering does not allocate and destroy driver objects
@@ -756,6 +773,9 @@ struct PendingSubmit {
     fence: vk::Fence,
     cb: vk::CommandBuffer,
     textures: Vec<TempTexture>,
+    /// When this submission entered the queue, so a fence that never
+    /// signals can be told from one that is merely a frame behind.
+    submitted_at: std::time::Instant,
     /// Self-allocated output image index used for the native composite
     /// (and the staging readback).
     self_output_idx: usize,
@@ -830,6 +850,38 @@ fn native_readback_plan(
         NativeReadback::Readback {
             encoder_skip: false,
         }
+    }
+}
+
+/// What to do about a submission whose fence has not signalled yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StalledSubmit {
+    /// Still plausibly rendering — keep waiting, quietly.
+    Wait,
+    /// Long enough to be worth saying so, then keep waiting.
+    Warn,
+    /// Never completing: let the next composite through.
+    Abandon,
+}
+
+/// How long a fence may go unsignalled before it is a fault rather than a
+/// frame.  The compositor polls every 500us and even a 4K composite retires
+/// in single-digit milliseconds, so these are three orders of magnitude
+/// clear of legitimate work — the cost of being wrong in the other direction
+/// (abandoning a submission whose pixels were still coming) is a dropped
+/// frame, while the cost of waiting forever is every surface black until the
+/// server is restarted.
+fn stalled_submit_action(waited: std::time::Duration, device_lost: bool) -> StalledSubmit {
+    const SUBMIT_STALL_WARN: std::time::Duration = std::time::Duration::from_secs(2);
+    const SUBMIT_ABANDON: std::time::Duration = std::time::Duration::from_secs(5);
+    // A lost device is a verdict, not a delay: no fence of this device will
+    // ever signal, so there is nothing to wait out.
+    if device_lost || waited >= SUBMIT_ABANDON {
+        StalledSubmit::Abandon
+    } else if waited >= SUBMIT_STALL_WARN {
+        StalledSubmit::Warn
+    } else {
+        StalledSubmit::Wait
     }
 }
 
@@ -1797,6 +1849,9 @@ impl VulkanRenderer {
             output_image_cache_hits: 0,
             frame_textures: Vec::new(),
             pending_submit: None,
+            abandoned_submits: Vec::new(),
+            submit_stall_warned: false,
+            gpu_unrecoverable: false,
             recycled_tracking_fences: Vec::new(),
             recycled_export_fences: Vec::new(),
             recycled_command_buffers: Vec::new(),
@@ -6640,6 +6695,102 @@ impl VulkanRenderer {
         raw != vk::Result::SUCCESS
     }
 
+    /// True once every recovery attempt has been spent: the renderer no
+    /// longer submits work and the process has to be restarted.
+    pub fn gpu_unrecoverable(&self) -> bool {
+        self.gpu_unrecoverable
+    }
+
+    /// What to do about a submission whose fence has not signalled.
+    ///
+    /// A zero-timeout `wait_for_fences` says `NOT_READY` both for the frame
+    /// that is simply still rendering and for one whose channel took a GPU
+    /// fault and will never complete.  Treating them alike is what turned a
+    /// single NVRM Xid into a permanently black desktop: nothing retires, so
+    /// `render_tree_sized` early-returns before submitting, so no surface is
+    /// ever composited again — silently, at 0% CPU.  Time tells them apart.
+    ///
+    /// Returns `true` when the submission was abandoned, which means
+    /// `pending_submit` is now free and the caller may submit again.
+    fn resolve_unsignalled_submit(&mut self, pending: PendingSubmit, raw: vk::Result) -> bool {
+        // Each abandon leaks one submission's objects, so this is also the
+        // bound on that leak.  A device that faults this many times in a row
+        // is not coming back, and saying so beats bleeding.
+        const ABANDON_LIMIT: usize = 4;
+
+        let waited = pending.submitted_at.elapsed();
+        let lost = raw == vk::Result::ERROR_DEVICE_LOST;
+        match stalled_submit_action(waited, lost) {
+            StalledSubmit::Wait => {
+                self.pending_submit = Some(pending);
+                return false;
+            }
+            StalledSubmit::Warn => {
+                if !self.submit_stall_warned {
+                    self.submit_stall_warned = true;
+                    eprintln!(
+                        "[vulkan-render] GPU submit for surface {} ({}x{}) has not completed in \
+                         {:.1}s — no surface is being composited. Check `dmesg` for an NVRM Xid \
+                         or other GPU fault.",
+                        pending.toplevel_sid,
+                        pending.phys_w,
+                        pending.phys_h,
+                        waited.as_secs_f32(),
+                    );
+                }
+                self.pending_submit = Some(pending);
+                return false;
+            }
+            StalledSubmit::Abandon => {}
+        }
+
+        eprintln!(
+            "[vulkan-render] abandoning the GPU submit for surface {} ({}x{}) after {:.1}s \
+             (fence: {raw:?}); its objects are leaked deliberately and a fresh composite will \
+             be submitted.",
+            pending.toplevel_sid,
+            pending.phys_w,
+            pending.phys_h,
+            waited.as_secs_f32(),
+        );
+
+        // The client's buffers are the compositor's to give back.  Nothing
+        // will ever read them now, and a Wayland client that never gets a
+        // release (or an explicit-sync release point that never signals)
+        // stops drawing entirely — so the app would be frozen even after the
+        // GPU recovered.  Publish nothing: whatever the faulted submit left
+        // in its staging buffers is not a frame.
+        for (buf, point) in &pending.release_buffers {
+            buf.release();
+            if let Some(p) = point {
+                p.signal();
+            }
+        }
+        // A compositor-resident encoder cannot produce a bitstream from a
+        // queue that just faulted, and its subscribers are parked on
+        // `vulkan_await` waiting for one.  Report every session the same way
+        // a session that stopped encoding reports itself, so the server
+        // latches the refusal and builds server-side encoders instead.
+        let sessions: Vec<(u32, u64)> = self.vulkan_encoders.keys().copied().collect();
+        for key in sessions {
+            if !self.vulkan_encode_giveups.contains(&key) {
+                self.vulkan_encode_giveups.push(key);
+            }
+        }
+        self.abandoned_submits.push(pending);
+        self.submit_stall_warned = false;
+        self.last_pending_poll = None;
+        if self.abandoned_submits.len() >= ABANDON_LIMIT {
+            self.gpu_unrecoverable = true;
+            eprintln!(
+                "[vulkan-render] {} GPU submits in a row never completed: this device is not \
+                 recovering. The compositor has stopped submitting work — restart the server.",
+                self.abandoned_submits.len(),
+            );
+        }
+        true
+    }
+
     /// Non-blocking check: if the previous GPU submission has completed,
     /// read back its results and return them.  Called from the compositor's
     /// main event loop so completed frames are flushed to the server
@@ -6690,10 +6841,14 @@ impl VulkanRenderer {
             )
         };
         if raw != vk::Result::SUCCESS {
-            self.pending_submit = Some(pending);
+            // Abandoning publishes nothing, so the answer is the same either
+            // way; what differs is that `pending_submit` is now clear and the
+            // next composite can reach the queue.
+            self.resolve_unsignalled_submit(pending, raw);
             return (None, Vec::new());
         }
         self.last_pending_poll = None;
+        self.submit_stall_warned = false;
         let toplevel_sid = pending.toplevel_sid;
         let native = (toplevel_sid, pending.phys_w, pending.phys_h);
         let results = self.retire_pending(pending);
@@ -6952,6 +7107,12 @@ impl VulkanRenderer {
         // GPU via implicit DMA-BUF fencing or an exported sync_fd).
         static ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let entry_n = ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Every recovery attempt is spent.  Recording more work would build
+        // command buffers for a queue that swallows them; the loud message
+        // was printed when the last submit was abandoned.
+        if self.gpu_unrecoverable {
+            return (None, Vec::new());
+        }
         let had_pending = self.pending_submit.is_some();
         let mut results: Vec<(u16, u32, u32, PixelData, bool)> = Vec::new();
         if let Some(pending) = self.pending_submit.take() {
@@ -6966,18 +7127,26 @@ impl VulkanRenderer {
                 )
             };
             if raw == vk::Result::SUCCESS {
+                self.submit_stall_warned = false;
                 let r = self.retire_pending(pending);
                 self.free_frame_textures();
                 for (w, h, p, encoder_skip) in r {
                     results.push((prev_sid, w, h, p, encoder_skip));
                 }
-            } else {
+            } else if !self.resolve_unsignalled_submit(pending, raw) {
                 // Self-alloc readback: must wait for fence — re-stash
                 // and return any results already collected (probably
                 // none, but be conservative).  External targets in this
                 // submit will be returned alongside the next render.
-                self.pending_submit = Some(pending);
                 return (None, results);
+            } else if self.gpu_unrecoverable {
+                return (None, results);
+            } else {
+                // The stalled submission was abandoned, so this call may
+                // record and submit a fresh composite — which is the only
+                // way a channel that faulted but left the device usable
+                // ever produces a frame again.
+                self.free_frame_textures();
             }
         } else {
             self.free_frame_textures();
@@ -8355,6 +8524,7 @@ impl VulkanRenderer {
             fence,
             cb,
             textures: std::mem::take(&mut self.frame_textures),
+            submitted_at: std::time::Instant::now(),
             self_output_idx,
             phys_w,
             phys_h,
@@ -8767,8 +8937,9 @@ impl Drop for VulkanRenderer {
 mod tests {
     use super::{
         NativeReadback, ShmDamageFrame, ShmDamageRect, ShmHostImportMode, ShmTextureKey,
-        clamped_scissor, coalesce_shm_damage, is_full_shm_damage, native_readback_plan,
-        page_rounded_len, shm_damage_since, shm_host_import_mode,
+        StalledSubmit, clamped_scissor, coalesce_shm_damage, is_full_shm_damage,
+        native_readback_plan, page_rounded_len, shm_damage_since, shm_host_import_mode,
+        stalled_submit_action,
     };
     use ash::vk;
     use std::collections::VecDeque;
@@ -8991,6 +9162,39 @@ mod tests {
     fn host_import_may_use_the_remainder_of_the_files_last_page() {
         assert_eq!(page_rounded_len(160_000, 4096), Some(163_840));
         assert_eq!(page_rounded_len(163_840, 4096), Some(163_840));
+    }
+
+    /// The watchdog that keeps one GPU fault from being permanent.  A frame
+    /// in flight must never trip it, and a fence that will never signal must
+    /// not be waited on forever — that was the whole failure.
+    #[test]
+    fn a_stalled_submit_is_abandoned_but_a_live_one_is_not() {
+        use std::time::Duration;
+        // Ordinary in-flight frames, including a very slow one.
+        assert_eq!(
+            stalled_submit_action(Duration::from_micros(500), false),
+            StalledSubmit::Wait,
+        );
+        assert_eq!(
+            stalled_submit_action(Duration::from_millis(1900), false),
+            StalledSubmit::Wait,
+        );
+        // Past the warn threshold something is wrong, but a resubmit is not
+        // yet worth the leak it costs.
+        assert_eq!(
+            stalled_submit_action(Duration::from_secs(2), false),
+            StalledSubmit::Warn,
+        );
+        assert_eq!(
+            stalled_submit_action(Duration::from_secs(5), false),
+            StalledSubmit::Abandon,
+        );
+        // A lost device short-circuits the wait entirely: no fence of it will
+        // ever signal, whatever the elapsed time says.
+        assert_eq!(
+            stalled_submit_action(Duration::ZERO, true),
+            StalledSubmit::Abandon,
+        );
     }
 
     #[test]
