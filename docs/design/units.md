@@ -1,6 +1,8 @@
 # RFC: Units — supervised sessions with lifecycle policy
 
-- **Status:** Draft. Nothing implemented.
+- **Status:** Draft. The three primitives shipped in
+  [#204](https://github.com/indent-com/blit/pull/204); the unit layer
+  itself is unimplemented.
 - **Date:** 2026-08-01
 - **Companion to:** [../protocol.md](../protocol.md),
   [../server.md](../server.md), [net.md](net.md), [kv.md](kv.md)
@@ -24,65 +26,71 @@ failed-to-load, or `RemainAfterExit=yes` past its process — none of
 which have a PTY. The registry points at the current PTY rather than
 duplicating it.
 
-Units sit on three primitives that fix existing bugs and ship first:
+Units sit on three primitives that fix existing bugs and ship first.
+All three landed in [#204](https://github.com/indent-com/blit/pull/204),
+so this RFC is now only the unit layer:
 
-- **Deadlines.** Every timeout is client-side, so a hung command
-  outlives a disconnected orchestrator forever.
-- **Group kill.** `C2S_KILL` signals the leader pid only; `C2S_CLOSE`'s
-  SIGHUP misses anything that changed process group.
-- **GC.** Nothing frees an exited PTY slot and `max_ptys` is hardcoded
-  unlimited, so one session per tool call leaks without an explicit
+- **Deadlines.** Every timeout was client-side, so a hung command
+  outlived a disconnected orchestrator forever.
+- **Group kill.** `C2S_KILL` signalled the leader pid only; `C2S_CLOSE`'s
+  SIGHUP missed anything that changed process group.
+- **GC.** Nothing freed an exited PTY slot and `max_ptys` was hardcoded
+  unlimited, so one session per tool call leaked without an explicit
   `C2S_CLOSE`.
 
 ## What exists today
 
-Verified against `dc6a265`.
+Verified against `1919717`, i.e. after
+[#204](https://github.com/indent-com/blit/pull/204) shipped the
+primitives. Rows marked **#204** were false when this RFC was written
+and are the parts of it that already landed.
 
-| Fact                                                                                                                                               | Evidence                                     |
-| -------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
-| PTY sessions are one flat `HashMap<u16, Pty>` on a single global `Session` — in blit, "session" means the whole server                             | `crates/server/src/lib.rs:1593`              |
-| `Pty` carries no owner client, creation time, attached-client count, TTL, or deadline                                                              | `lib.rs:357-390`                             |
-| Children are `setsid()` + `TIOCSCTTY` leaders, so `child_pid == pgid == sid`                                                                       | `pty/pty_unix.rs:483-484`                    |
-| `C2S_KILL` → `libc::kill(child_pid, sig)`, positive pid                                                                                            | `lib.rs:9177`, `pty_unix.rs:264-268`         |
-| `C2S_CLOSE` → `kill(child_pid, SIGHUP)` then `close(master_fd)`                                                                                    | `pty_unix.rs:270-275`                        |
-| The code pgrp-signals already, but only for SIGWINCH                                                                                               | `pty_unix.rs:255-261`                        |
-| Exit is inferred from EOF on the pty master, not SIGCHLD; `reap_zombies` is a 5 s backstop that drains `waitpid(-1)` and discards non-PTY statuses | `pty_unix.rs:401`, `:266-284`, `lib.rs:2620` |
-| `cleanup_pty_internal` sets `exited: true` and keeps the entry                                                                                     | `lib.rs:2483-2497`                           |
-| The only `ptys.remove` in the server is in the `C2S_CLOSE` arm                                                                                     | `lib.rs:9188`                                |
-| `max_ptys: 0` (unlimited), hardcoded, no flag, no env var                                                                                          | `crates/cli/src/main.rs:870`                 |
-| Hitting the cap is a bare `continue` — no reply, and there is no error opcode in the protocol at all, so a nonce-bearing create hangs forever      | `lib.rs:8120-8122` + 3 sites                 |
-| Tags are client-chosen, optional, and not checked for uniqueness at creation                                                                       | `lib.rs:8082-8122`                           |
-| The tick loop's `next_deadline` is `None` with no clients; it then sleeps purely on `delivery_notify`                                              | `lib.rs:2737`, `:4903-4911`                  |
-| `C2S_RESTART` respawns in place, reusing pty id and driver                                                                                         | `lib.rs:8988`, `pty_unix.rs:608`             |
+| Fact                                                                                                                                                                     | Evidence                                                                                                     |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| PTY sessions are one flat `FxHashMap<u16, Pty>` on a single global `Session` — in blit, "session" means the whole server                                                 | `crates/server/src/lib.rs:4118-4119`                                                                         |
+| `Pty` carries no owner client, no creation time and no attached-client count; **#204** added `deadline`, `stop_deadline`, `exit_reason`, `exited_at`, `generation`       | `lib.rs:543-601`                                                                                             |
+| Children are `setsid()` + `TIOCSCTTY` leaders, so `child_pid == pgid == sid`                                                                                             | `pty/pty_unix.rs:657-658`                                                                                    |
+| **#204** `C2S_KILL` signals the process group by default (`TIOCGPGRP` pgid, else `-child_pid`); leader-only is the opt-in `KILL_LEADER_ONLY` flag                        | `lib.rs:15603-15617`, `pty_unix.rs:285-298`                                                                  |
+| **#204** `C2S_CLOSE` → group SIGHUP, then `close(master_fd)`, then the pid is abandoned with a SIGKILL deadline                                                          | `pty_unix.rs:306-311`, `lib.rs:15638`                                                                        |
+| **#204** Exit is detected by a SIGCHLD-woken supervisor calling `poll_child_exited`, with pty-master EOF only as a deferred secondary path                               | `lib.rs:6214-6224`, `:6458-6473`, `pty_unix.rs:340`, `:572-576`                                              |
+| **#204** `reap_zombies` waits only pids it owns; it drains `waitpid(-1)` only when running as PID 1                                                                      | `pty_unix.rs:430-478`, `:456-458`, sweep at `lib.rs:6237`                                                    |
+| `cleanup_pty_internal` still sets `exited: true` and keeps the entry; **#204** `evict_exited` removes it later under the retention bounds                                | `lib.rs:6269-6289`, `:6142-6166`                                                                             |
+| `ptys.remove` now has two sites: the `C2S_CLOSE` arm and retention eviction                                                                                              | `lib.rs:15620`, `:6152`                                                                                      |
+| `max_ptys` still defaults to 0 (unlimited); **#204** made it settable by `--max-ptys` / `BLIT_MAX_PTYS`                                                                  | `crates/cli/src/main.rs:960`, `crates/cli/src/cli.rs:277-282`                                                |
+| **The remaining refusal gap:** only `C2S_CREATE2` gets `S2C_CREATE_FAILED` on a cap hit. `C2S_CREATE`, `C2S_CREATE_AT` and `C2S_CREATE_N` are still a bare `continue`    | cap `lib.rs:4474-4485`, `refuse_create` `:5925`, silent sites `:13973-13975`, `:14078-14080`, `:14175-14177` |
+| Tags are client-chosen, optional, and not checked for uniqueness at creation                                                                                             | `lib.rs:13935-13944`                                                                                         |
+| The delivery loop's `next_deadline` is `None` with no clients; it then sleeps purely on `delivery_notify`. **#204** put lifecycle timers in a separate `supervisor_loop` | `lib.rs:10186-10189`, `:6425-6446`, supervisor `:6072-6093`                                                  |
+| `C2S_RESTART` respawns in place, reusing pty id and driver; **#204** made it bump `Pty::generation`                                                                      | `lib.rs:15386`, `pty_unix.rs:790`                                                                            |
 
-Machinery to reuse: the `audio.rs:608-690` heal loop (rate limit +
+Machinery to reuse: the `audio.rs:753-834` heal loop (rate limit +
 burst limiter + give-up) is already a restart policy;
-`uplink.rs:54-104` is backoff with jitter; `crates/sd-notify/` is a
+`crates/cli/src/uplink.rs:60-104` is backoff with jitter; `crates/sd-notify/` is a
 pure-libc `sd_notify(3)` **client**, so blit speaks the readiness
 protocol without listening for it; `regex` is already a `blit-server`
-dependency (`crates/server/Cargo.toml:35`); `crates/webserver/src/config.rs:701` is the
+dependency (`crates/server/Cargo.toml:46`); `crates/webserver/src/config.rs:779` is the
 live-reload watcher behind `blit.remotes`.
 
 ## Constraints
 
 - **The wire is version-stable.** `PROTOCOL_VERSION = 1` is frozen —
   the JS client hard-closes on `version > 1`
-  (`js/core/src/BlitConnection.ts:3303`). Compatibility rides on new
+  (`js/core/src/BlitConnection.ts:4631-4659`). Compatibility rides on new
   opcodes plus a `FEATURE_*` bit, or append-only trailing fields
   length-gated on parse — `S2C_HELLO` has taken that route twice, for
   the boot generation and then the server version
-  (`crates/remote/src/lib.rs:1601-1613`).
-- **Unknown opcodes are silently dropped both ways** (`lib.rs:9202`,
-  `BlitConnection.ts:4093`), so a new client cannot tell "old server"
+  (`crates/remote/src/lib.rs:2753-2769`).
+- **Unknown opcodes are silently dropped both ways** (`lib.rs:15649`,
+  `BlitConnection.ts:5687-5688`), so a new client cannot tell "old server"
   from "processed". Everything is feature-gated, and nonce-bearing
   requests need a refusal path (`refuse_lsp_message`,
-  `lib.rs:7736-7746`, defined at `:7216`).
+  `lib.rs:13538-13542`, defined at `:12833`).
 - **Flat crate layout:** one new `crates/server/src/units.rs`.
 - **The server is the stateful half** and nothing above the socket is
   alive at boot, so units live in the server.
 - **New families take a free `0x?0` block** — 0x40 fs, 0x60 lsp, 0x70
-  kv, 0x80 net, 0xA0-0xB4 git, so 0x90 here. In the core range C2S
-  `0x1D`-`0x1F` and S2C `0x10`-`0x1F` are unallocated.
+  kv, 0x80 net, 0x90-0x95 extensions and channels, 0xA0-0xBF git,
+  0xC0-0xC6 processes, so 0xD0 here. In the core range C2S `0x1F` and
+  S2C `0x12`-`0x1F` are unallocated.
 - **No `serde`, `toml`, or `ini` crate exists in the workspace.**
 
 ## Primitives
@@ -90,13 +98,15 @@ live-reload watcher behind `blit.remotes`.
 ### Group kill and escalation
 
 Every blit child is a `setsid()` leader, so `kill(-pid, sig)` is
-already valid with no new bookkeeping.
+already valid with no new bookkeeping. **Shipped in #204**, so the
+table below is now the server's behavior rather than a proposal, minus
+`control-group`.
 
 | `KillMode=`               | Behavior                                                                             |
 | ------------------------- | ------------------------------------------------------------------------------------ |
-| `process`                 | `kill(pid, sig)` — today's behavior                                                  |
+| `process`                 | `kill(pid, sig)` — the pre-#204 behavior, now opt-in                                 |
 | `process-group` (default) | `kill(-pid, sig)`, plus `TIOCGPGRP` → `kill(-fg_pgid, sig)` when the fg pgrp differs |
-| `control-group`           | Linux only, opt-in: delegated cgroup v2 + `cgroup.kill`                              |
+| `control-group`           | Linux only, opt-in, **not implemented**: delegated cgroup v2 + `cgroup.kill`         |
 
 `process-group` catches everything except a process that deliberately
 `setsid`'d into a new session. Only a cgroup (or
@@ -104,28 +114,29 @@ already valid with no new bookkeeping.
 Linux-only, so `control-group` stays opt-in — blit is an unprivileged
 userspace multiplexer that also runs on macOS and Windows.
 
-**On Windows `process-group` is a Job Object.** Windows has no process
-groups, but `CreateProcessW` (`pty_windows.rs:287`) can create the
-child suspended, `AssignProcessToJobObject` it, and resume; then
-`TerminateJobObject` is the group kill and
+**On Windows `process-group` is a Job Object**, also shipped in #204.
+Windows has no process groups, but `CreateProcessW`
+(`pty_windows.rs:422`) creates the child suspended,
+`AssignProcessToJobObject`s it, and resumes; `TerminateJobObject`
+(`pty_windows.rs:95`) is the group kill and
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` gives `close_pty` the same
-containment the Unix side gets from SIGHUP-to-the-group. That is
-strictly better than today's bare `TerminateProcess`
-(`pty_windows.rs:70-77`), which orphans every grandchild, and it makes
-the default portable — which matters, because a load error on an
-unsupported capability would otherwise reject every unit that simply
-omits `KillMode=`. The general rule: **defaults are resolved per
+containment the Unix side gets from SIGHUP-to-the-group. Bare
+`TerminateProcess` (`pty_windows.rs:97`), which orphans every
+grandchild, is now only the leader-only and no-job fallback. That is
+what makes the default portable — which matters, because a load error
+on an unsupported capability would otherwise reject every unit that
+simply omits `KillMode=`. The general rule: **defaults are resolved per
 platform before the capability check, so a portable unit never fails
 on a key it did not write.** Only keys present in the file can produce
 a load error.
 
-Making `process-group` the default changes behavior for existing
-clients, intentionally. `C2S_CLOSE` gains the same escalation: SIGHUP
-to the group, wait `TimeoutStopSec`, SIGKILL to the group. Today it
-closes the master fd immediately and leans on the kernel hangup, so a
-runaway grandchild holding the slave open yields no EOF and no
-`exited` transition. The timed half needs the supervisor loop, so it
-lands with it.
+Making `process-group` the default changed behavior for existing
+clients, intentionally. `C2S_CLOSE` gained the same escalation: SIGHUP
+to the group, wait `TimeoutStopSec`, SIGKILL to the group. Before that
+it closed the master fd immediately and leaned on the kernel hangup, so
+a runaway grandchild holding the slave open yielded no EOF and no
+`exited` transition. See [Delivery](#delivery) for how the timed half
+actually landed.
 
 **Wire:** append an optional `[flags:1]` to `C2S_KILL`. The arm is
 `data.len() >= 8` — 7 is the existing message length, so arming there
@@ -135,54 +146,62 @@ new default unaffected. **Shipped in #204** as `KILL_LEADER_ONLY`
 
 ### The supervisor loop
 
+**Shipped in #204** as `supervisor_loop` (`lib.rs:6072-6093`).
+
 A hung command outliving a disconnected orchestrator is exactly where
 the delivery loop stops scheduling: `blanket_frame_interval` returns
-`None` with no clients (`lib.rs:2737`), so `next_deadline` is `None`
+`None` with no clients (`lib.rs:10186-10189`), so `next_deadline` is `None`
 and it sleeps on `delivery_notify`. A silent runaway produces no
 output and is never visited.
 
-That argues for a second loop, not for polling. The supervisor is
+That argued for a second loop, not for polling. The supervisor is
 **fully reactive**, shaped like the delivery loop at
-`lib.rs:2603-2618`: `select!` between `supervisor_notify` and
+`lib.rs:6425-6446`: `select!` between `supervisor_notify` and
 `sleep_until(next_deadline)`, `next_deadline` the minimum over armed
-timers, `None` meaning sleep indefinitely. Every timer here is a
-computable instant — deadline expiry, lease grace, restart backoff,
-`TimeoutStartSec`, `TimeoutStopSec`, next health probe, watchdog,
-`exited-linger` — so arming or disarming notifies the loop to
-recompute, and an idle server wakes zero times.
+timers (`earliest_armed_deadline`, `lib.rs:6097`), `None` meaning sleep
+indefinitely. Every timer here is a computable instant — deadline
+expiry, lease grace, restart backoff, `TimeoutStartSec`,
+`TimeoutStopSec`, next health probe, watchdog, `exited-linger` — so
+arming or disarming notifies the loop to recompute, and an idle server
+wakes zero times. The unit-layer timers above are the ones still to be
+added; the loop itself exists.
 
 #### Child death
 
-The one unreactive thing in the server: no SIGCHLD handler exists, and
-exit is inferred from EOF plus the 5 s poll. The supervisor adds a
-`SignalKind::child()` handler, same shape as the SIGTERM/SIGINT
-handler at `lib.rs:2659-2668` (`tokio` is already
-`features = ["full"]`).
+The one unreactive thing in the server used to be exit detection: no
+SIGCHLD handler existed, and exit was inferred from EOF plus the 5 s
+poll. The supervisor added a `SignalKind::child()` handler
+(`lib.rs:6458-6473`), same shape as the SIGTERM/SIGINT handler at
+`lib.rs:6508-6517` (`tokio` is already `features = ["full"]`).
 
-**It must not call today's `reap_zombies` more often.** That function
-drains `waitpid(-1, WNOHANG)` and _discards_ the status of any pid
-outside `pty_pids()` (`pty_unix.rs:297-315`). The discard is
+**It must not call `reap_zombies` more often.** That function used to
+drain `waitpid(-1, WNOHANG)` and _discard_ the status of any pid
+outside `pty_pids()` (`pty_unix.rs:469-476`). The discard was
 deliberate — a foreign child like an LSP backend is reaped by its own
-engine — but it steals statuses from anything the server spawns via
-`Command` and waits on itself. The audio pipeline lives with that race
-at 5 s; per-SIGCHLD would widen it sharply, and this RFC adds periodic
-`ExecHealthCheck=` children into its path.
+engine — but it stole statuses from anything the server spawns via
+`Command` and waits on itself. The audio pipeline lived with that race
+at 5 s; per-SIGCHLD would have widened it sharply, and this RFC adds
+periodic `ExecHealthCheck=` children into its path.
 
 So the handler only **wakes the supervisor**, which reaps by targeted
 `waitpid(pid, WNOHANG)` over pids it owns — PTY children plus the
 helpers of `ExecStartPre=`, `ExecStop=`, `ExecHealthCheck=` — all
 registered through `register_pty_pid`/`pty_pids()`
-(`pty_unix.rs:327-335`) generalized to owned children. **The
-global `waitpid(-1)` drain is deleted, not rescheduled.**
+(`pty_unix.rs:499-507`), which the unit layer generalizes to owned
+children. **The global `waitpid(-1)` drain is gone**, kept only for
+the PID-1 case where nobody else can reap
+(`adopts_orphans`, `pty_unix.rs:456-458`).
 `Command`-owned children keep being reaped by their owners, and no
 status is collected by a party that did not spawn it.
 
 Windows keeps a poll: no SIGCHLD, and `reap_zombies` is already a
-no-op (`pty/pty_windows.rs:101`).
+no-op (`pty/pty_windows.rs:177`).
 
 ### Deadlines and leases
 
-Four independent causes, with an enforced minimum:
+Four independent causes, with an enforced minimum. **The explicit,
+`runtime_max` and `stop_escalation` causes shipped in #204**
+(`enforce_deadlines`, `lib.rs:6188-6205`); leases did not.
 
 ```text
 effective = min(explicit, lease[current_epoch], runtime_max, stop_escalation)
@@ -212,10 +231,11 @@ holds one are tagged with it, and on disconnect each live leased
 session gets a `grace_ms` deadline **in the lease cause only**. A
 reclaim clears that cause and nothing else.
 
-`C2S_LEASE [0x1E][op:1][grace_ms:4][lease_id:8]` →
-`S2C_LEASE [0x11][status:1][lease_id:8][epoch:4]`. S2C `0x10` was free
-when this was written and is not any more — #204 shipped
-`S2C_CREATE_FAILED` there — so the reply moves to `0x11`. One byte of
+`C2S_LEASE [0x1F][op:1][grace_ms:4][lease_id:8]` →
+`S2C_LEASE [0x12][status:1][lease_id:8][epoch:4]`. Both moved twice
+since this was written: #204 took S2C `0x10` for `S2C_CREATE_FAILED`,
+and #260 took C2S `0x1E` / S2C `0x11` for `C2S_SCROLL_BY` /
+`S2C_SCROLL_OFFSET`. `0x1F` is the last free core C2S opcode. One byte of
 operation, not a flag set, because the three are mutually exclusive:
 
 | `op` | Name      | `lease_id` in | Effect                                                                                                                   |
@@ -244,14 +264,19 @@ there is no nonce because the reply carries the `lease_id`.
 
 On expiry: SIGTERM to the group, wait `TimeoutStopSec` (default 5 s;
 systemd's 90 s is wrong for agent workloads), SIGKILL to the group.
+**Shipped in #204** (`enforce_deadlines`, `lib.rs:6188-6205`).
 
-Append `[reason:1]` to `S2C_EXITED`
+`[reason:1]` is appended to `S2C_EXITED`
 (`0=normal, 1=deadline, 2=lease, 3=gc, 4=unit-stop`) — a deadline kill
-currently arrives as `-9`, indistinguishable from a user kill. When
-causes expire together the reason is the one that produced the
-minimum, ties broken in table order, so attribution is deterministic
-rather than whichever timer the loop saw first. Append-only and
-length-gated, like the boot generation in `S2C_HELLO`.
+otherwise arrives as `-9`, indistinguishable from a user kill. Also
+shipped in #204, with only `0` and `1` ever sent: `2` and `4` are the
+reservations this RFC still has to fill, and `3` turned out to be dead
+because retention eviction only touches a terminal that has already
+sent its `EXITED`, and signals itself with `CLOSED`. When causes expire
+together the reason is the one that produced the minimum, ties broken
+in table order, so attribution is deterministic rather than whichever
+timer the loop saw first. Append-only and length-gated, like the boot
+generation in `S2C_HELLO`.
 
 ### GC and `max_ptys`
 
@@ -272,8 +297,9 @@ the opt-in tools.
 **`max_ptys`** counts live sessions only, and the silent `continue`
 goes. Standalone bug, worth fixing regardless.
 
-**Shipped in #204**, with two changes from what this section proposed.
-The refusal is `S2C_CREATE_FAILED [0x10][nonce:2][status:1][detail:N]` —
+**Shipped in #204**, with two changes from what this section proposed
+and one gap left open. The refusal is
+`S2C_CREATE_FAILED [0x10][nonce:2][status:1][detail:N]` —
 `0x10` rather than `0x11`, and the common status registry rather than a
 message-local `reason` byte, both to match what #167's `protocol.md` had
 already allocated. And it is opt-in per request: a client sets
@@ -281,7 +307,11 @@ already allocated. And it is opt-in per request: a client sets
 (HELLO bit 14), so a legacy client cannot mistake a refusal for PTY
 zero. `max_ptys` kept its `0` default, since #188 had landed the env var
 in the meantime and argued that unlimited is right — a client that can
-open a terminal can already spend the machine from inside it.
+open a terminal can already spend the machine from inside it. The gap:
+`C2S_CREATE`, `C2S_CREATE_AT` and `C2S_CREATE_N` still hit a bare
+`continue` (`lib.rs:13973-13975`, `:14078-14080`, `:14175-14177`), so
+the silent drop survives on the three legacy opcodes. It is invisible
+to a `CREATE2` client and does not block units, but it is the same bug.
 
 **Unit sessions do not count against `max_ptys`.** The cap bounds
 client-driven creation, which is where the leak is; unit sessions are
@@ -309,7 +339,7 @@ current one and never duplicates the terminal, scrollback, or driver.
 This is orchestration state, not a second process model.
 
 `Pty.tag` is not identity — tags are client-chosen and unchecked for
-uniqueness (`lib.rs:8082-8122`), so any client could create a session
+uniqueness (`lib.rs:13935-13944`), so any client could create a session
 tagged `api`. Unit names are validated and unique in the registry, and
 a unit-owned PTY carries `unit: Option<UnitName>` set only by the
 supervisor, never settable over the wire. A client PTY whose tag
@@ -327,7 +357,9 @@ silent shadow.
 
 Every unit-owned PTY carries a `Generation` incremented on each
 restart, and **every asynchronous event carries
-`(pty_id, generation)`**.
+`(pty_id, generation)`**. #204 added the `Pty::generation` field
+(`lib.rs:588`) and bumps it on `C2S_RESTART`, so the counter exists;
+what is missing is carrying it on events and dropping stale ones.
 
 In-place respawn is safe today only because it happens after the PTY
 reached the EOF/exited path, so there is no live reader and no open
@@ -495,8 +527,8 @@ function (see [Testability](#testability)).
 on a non-zero or signalled exit and on any `failed` entry, `always` on
 every exit. Backoff is `RestartSec` doubling with jitter to
 `RestartMaxSec`; `StartLimitBurst` over `StartLimitIntervalSec`
-exhausts the limiter. That is `audio.rs:650`'s burst limiter and
-`uplink.rs:60-104`'s backoff, generalized. Restarts respawn in place
+exhausts the limiter. That is `audio.rs:791-807`'s burst limiter and
+`crates/cli/src/uplink.rs:60-104`'s backoff, generalized. Restarts respawn in place
 under the generation discipline above — a restarting unit is not a new
 session.
 
@@ -603,7 +635,7 @@ passes its health check" reads like a continuous guarantee.
 server spawns that are **not** sessions. They go through the `Command`
 
 - `Stdio::piped` path the audio pipeline already uses
-  (`audio.rs:345` onward), not the PTY spawner, each with
+  (`audio.rs:461-472` onward), not the PTY spawner, each with
   `setpgid(0, 0)` so its own timeout can group-kill it — a probe that
   shells out must not orphan the shell's children — and are tracked in a
   `helpers` map separate from `ptys`.
@@ -655,24 +687,34 @@ tools correctly detect they are not on a terminal.
 A pipe child is not a session leader, so `KillMode=process-group`
 requires the forked child to `setpgid(0, 0)` explicitly.
 
+[#173](https://github.com/indent-com/blit/pull/173) has since merged a
+fuller non-PTY process family (`PROCESS_*`, `0xC0`-`0xC6`) with byte
+offsets, flow-control windows, `MERGE_STDERR`, and raw bytes that never
+touch a terminal driver. `Backing=pipe` here is deliberately the
+narrower thing — a unit whose output is still a scrollback a client can
+render — but if the process family lands first, this key should be
+built on it rather than on a second pipe spawner.
+
 ### Wire and CLI
 
-New family in the `0x90` block, gated on `FEATURE_UNITS`, bit 17.
-Bits 0-10 were already taken when this was written; since then 11-13
-have been reserved for the extension, channel, and process families
-(#167, #173) and 14-16 shipped with #204 — `CREATE_STATUS`,
-`KILL_MODE`, `PTY_DEADLINE`. 17-31 are free.
+New family in the `0xD0` block, gated on `FEATURE_UNITS`, bit 20.
+Both moved: `0x90`-`0x94` and bit 11 went to #167's extensions, `0x95`
+and bit 12 to its channels, `0xC0`-`0xC6` and bit 13 to #173's
+processes. Bits 14-16 shipped with #204 (`CREATE_STATUS`, `KILL_MODE`,
+`PTY_DEADLINE`), 17-19 with `SCROLL_BY`, `SURFACE_TOUCH` and
+`SURFACE_TEXT_INPUT`. 20-31 are free; git holds `0xA0`-`0xBF`, so
+`0xD0` is the first free block.
 
 | Dir | Opcode | Name           | Layout                                              |
 | --- | ------ | -------------- | --------------------------------------------------- |
-| C2S | `0x90` | `UNIT_LIST`    | `[nonce:2]`                                         |
-| C2S | `0x91` | `UNIT_START`   | `[nonce:2][name:N]`                                 |
-| C2S | `0x92` | `UNIT_STOP`    | `[nonce:2][name:N]`                                 |
-| C2S | `0x93` | `UNIT_RESTART` | `[nonce:2][name:N]`                                 |
-| C2S | `0x94` | `UNIT_RELOAD`  | `[nonce:2]`                                         |
-| S2C | `0x90` | `UNIT_LIST`    | `[nonce:2][count:2]`, then `count` **unit records** |
-| S2C | `0x91` | `UNIT_STATE`   | one **unit record**, pushed on every transition     |
-| S2C | `0x92` | `UNIT_DONE`    | `[nonce:2][status:1][detail_len:2][detail:N]`       |
+| C2S | `0xD0` | `UNIT_LIST`    | `[nonce:2]`                                         |
+| C2S | `0xD1` | `UNIT_START`   | `[nonce:2][name:N]`                                 |
+| C2S | `0xD2` | `UNIT_STOP`    | `[nonce:2][name:N]`                                 |
+| C2S | `0xD3` | `UNIT_RESTART` | `[nonce:2][name:N]`                                 |
+| C2S | `0xD4` | `UNIT_RELOAD`  | `[nonce:2]`                                         |
+| S2C | `0xD0` | `UNIT_LIST`    | `[nonce:2][count:2]`, then `count` **unit records** |
+| S2C | `0xD1` | `UNIT_STATE`   | one **unit record**, pushed on every transition     |
+| S2C | `0xD2` | `UNIT_DONE`    | `[nonce:2][status:1][detail_len:2][detail:N]`       |
 
 `name` runs to end of frame, so `UNIT_START|STOP|RESTART` need no
 length prefix. The wire is version-stable, so the record is pinned
@@ -752,13 +794,13 @@ intent, which is worse than the property being fixed. Worth reserving
 regardless, as the namespace for any future server-owned state.
 
 The supervisor reaches the store **in process**, through the
-`OnceLock<Mutex<Store>>` at `crates/server/src/kv.rs:556`, not over
+`OnceLock<Mutex<Store>>` at `crates/server/src/kv.rs:557-560`, not over
 the wire. `BLIT_KV=0` withholds the feature bit and refuses every
-`KV_*` message at dispatch (`lib.rs:7287`, `:7772`); it is a control
+`KV_*` message at dispatch (`lib.rs:13581-13586`); it is a control
 on the client-facing surface and does not disable units, which have no
 client-facing KV surface to withhold. What does defeat persistence is
 having no resolvable state dir, where the store is memory-only
-(`kv.rs:324-326`); then operator intent is lost across a restart, and
+(`kv.rs:531`); then operator intent is lost across a restart, and
 that is logged once at load rather than discovered when a stopped unit
 comes back.
 
@@ -1014,21 +1056,25 @@ held up, and the unit layer below is unchanged by how they landed.
    `C2S_KILL`; `C2S_CLOSE`'s SIGHUP to the group; the Windows Job
    Object so the new default is honorable everywhere. Pure semantics,
    no new state.
-2. **Supervisor loop, deadlines, leases.** Partly #204: the reactive
+2. **Supervisor loop, deadlines, leases.** Mostly #204: the reactive
    loop, the SIGCHLD handler replacing the `waitpid(-1)` drain,
-   `C2S_DEADLINE`, `CREATE2_HAS_DEADLINE` (bit 4), and the
-   `S2C_EXITED` reason byte all shipped. **Still open:**
-   `C2S_LEASE`/`S2C_LEASE`, and the timed half of the `C2S_CLOSE`
-   escalation — that one needs `CLOSE` to hold the entry in a
-   "closing" state, which tangles with the retention path below and
-   was out of scope for #181.
+   `C2S_DEADLINE`, `CREATE2_HAS_DEADLINE` (bit 4), the `S2C_EXITED`
+   reason byte, and the timed half of the `C2S_CLOSE` escalation all
+   shipped. That last one landed differently from what this RFC
+   proposed: rather than holding the entry in a "closing" state, the
+   pid is handed to `abandon_pty_pid` with a SIGKILL deadline and the
+   slot is removed immediately, so `CLOSED` still means gone and
+   `--max-ptys` and `evict_exited` do not have to reason about a third
+   kind of entry. **Still open:** `C2S_LEASE`/`S2C_LEASE`.
 3. **GC.** ✅ #204. `exited_at`, count and time bounds
    (`BLIT_MAX_EXITED`, default 1024; `BLIT_EXITED_LINGER`, off),
-   `max_ptys` counting live sessions only, `S2C_CREATE_FAILED`.
+   `max_ptys` counting live sessions only, `S2C_CREATE_FAILED`. **Still
+   open:** the refusal only reaches `C2S_CREATE2`; the three legacy
+   create opcodes still drop a capped create on the floor.
 4. **Unit core.** Registry and generations, the strict parser, the
    state machine, autostart, restart policy, `Requires=`/`After=`,
    `Type=simple`/`oneshot`/`notify`, start and stop timeouts, helper
-   children, the `0x90` family, the CLI, and — with autostart, not
+   children, the `0xD0` family, the CLI, and — with autostart, not
    after it — operator-intent persistence plus the reserved `blit/`
    KV prefix. PTY backing only.
 5. **Unit policy.** Health checks with thresholds and
