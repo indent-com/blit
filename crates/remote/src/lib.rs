@@ -23,6 +23,9 @@ pub mod kv;
 /// message builders both ends share.
 pub mod net;
 
+/// Native pipe-oriented child processes (docs/design/processes.md).
+pub mod process;
+
 /// Tray icons and desktop notifications (docs/design/tray-notifications.md).
 pub mod desktop;
 

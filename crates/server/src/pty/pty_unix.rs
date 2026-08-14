@@ -501,9 +501,66 @@ fn pty_pids() -> &'static Mutex<std::collections::HashSet<libc::pid_t>> {
     PIDS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
+/// Serialize every raw fork with `std::process::Command` spawning.
+///
+/// `Command::spawn` waits for EOF on a private exec-error pipe. A concurrent
+/// raw fork can inherit that pipe and keep it open indefinitely (PTY children
+/// do substantial setup before exec, and test children may never exec), which
+/// makes the spawning thread hang. All server fork sites use this lock.
+fn child_spawn_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Fork while excluding `Command::spawn` error-pipe creation.
+///
+/// The child deliberately leaks its copied guard: unlocking a pthread mutex
+/// after fork is not async-signal-safe, and exec/_exit will discard it.
+pub(crate) fn fork_child() -> libc::pid_t {
+    let guard = child_spawn_lock().lock().unwrap();
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        std::mem::forget(guard);
+    }
+    pid
+}
+
 /// Register a pid as a live PTY child (backstop-parkable).
 pub(crate) fn register_pty_pid(pid: libc::pid_t) {
     pty_pids().lock().unwrap().insert(pid);
+}
+
+/// Spawn and register a non-PTY child while excluding the server backstop.
+///
+/// The PID-1 orphan sweep uses `waitpid(-1)`. Holding the registry locks over
+/// OS child creation and insertion prevents it from observing a freshly
+/// spawned child before that child has an owner and discarding its status.
+pub(crate) fn spawn_registered_child<T, E>(
+    spawn: impl FnOnce() -> Result<(libc::pid_t, T), E>,
+) -> Result<T, E> {
+    let _spawn = child_spawn_lock().lock().unwrap();
+    let _reaped = reaped_statuses().lock().unwrap();
+    let mut owned = pty_pids().lock().unwrap();
+    let (pid, child) = spawn()?;
+    owned.insert(pid);
+    Ok(child)
+}
+
+/// Forget a registered child after its owner collected the status itself.
+pub(crate) fn deregister_child_pid(pid: libc::pid_t) {
+    let mut reaped = reaped_statuses().lock().unwrap();
+    pty_pids().lock().unwrap().remove(&pid);
+    reaped.remove(&pid);
+}
+
+/// Recover a status parked by the server backstop, deregistering the child.
+///
+/// Returns the same convention as PTYs: non-negative exit code, negative
+/// signal, or `None` when the backstop did not collect this child.
+pub(crate) fn take_reaped_child_status(pid: libc::pid_t) -> Option<i32> {
+    let mut reaped = reaped_statuses().lock().unwrap();
+    pty_pids().lock().unwrap().remove(&pid);
+    reaped.remove(&pid)
 }
 
 /// WEXITSTATUS on normal exit, negated signal if signalled, else UNKNOWN.
@@ -641,7 +698,7 @@ pub fn spawn_pty(
     // Resolve the shell path before fork (execve doesn't search PATH).
     let shell_path = resolve_in_path(shell);
 
-    let pid = unsafe { libc::fork() };
+    let pid = fork_child();
     if pid < 0 {
         eprintln!("fork failed for pty {id}");
         unsafe {
@@ -848,7 +905,7 @@ pub fn respawn_child(
         .collect();
     let shell_path = resolve_in_path(shell);
 
-    let pid = unsafe { libc::fork() };
+    let pid = fork_child();
     if pid < 0 {
         unsafe {
             libc::close(master);
@@ -972,7 +1029,7 @@ mod tests {
     /// not UNKNOWN (which the client renders as a bogus exit 1).
     #[test]
     fn collect_exit_status_survives_backstop_reap() {
-        let pid = unsafe { libc::fork() };
+        let pid = super::fork_child();
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             unsafe { libc::_exit(42) };
@@ -1004,7 +1061,7 @@ mod tests {
     fn fork_leader_with_child_ignoring(signals: &[libc::c_int]) -> (libc::pid_t, libc::pid_t) {
         let mut fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
-        let leader = unsafe { libc::fork() };
+        let leader = super::fork_child();
         assert!(leader >= 0, "fork failed");
         if leader == 0 {
             unsafe {
@@ -1115,7 +1172,7 @@ mod tests {
     /// running forever.  `poll_child_exited` answers from the child itself.
     #[test]
     fn poll_child_exited_reports_a_dead_child() {
-        let pid = unsafe { libc::fork() };
+        let pid = super::fork_child();
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             unsafe { libc::_exit(7) };
@@ -1157,7 +1214,7 @@ mod tests {
     /// server and a terminal-cycling client marches to RLIMIT_NPROC.
     #[test]
     fn abandoned_children_are_still_reaped() {
-        let pid = unsafe { libc::fork() };
+        let pid = super::fork_child();
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             unsafe { libc::_exit(0) };

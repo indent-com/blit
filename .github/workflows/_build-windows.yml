@@ -38,6 +38,10 @@ jobs:
           pnpm --filter @blit-sh/ui run build
       - name: Build release binaries
         run: cargo build --release -p blit-cli
+      - name: Test native process protocol and Windows job lifecycle
+        run: |
+          cargo test -p blit-remote --lib process
+          cargo test -p blit-server --lib process
       - name: Package zips
         if: ${{ inputs.upload }}
         shell: bash
