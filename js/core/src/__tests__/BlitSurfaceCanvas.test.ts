@@ -3734,6 +3734,50 @@ describe("BlitSurfaceCanvas macOS dead keys", () => {
     surface.dispose();
   });
 
+  it("uses composition lifecycle when event isComposing flags are false", () => {
+    // WebKit can leave isComposing false on the completing keydown and input.
+    // Since focus really rests on the textarea, exercise that actual target.
+    const { surface, ta, texts, keys, preedits } = attachMac();
+
+    ta.dispatchEvent(
+      key("keydown", { key: "Alt", code: "AltLeft", altKey: true }),
+    );
+    ta.dispatchEvent(
+      key("keydown", { key: "Dead", code: "KeyE", altKey: true }),
+    );
+    ta.dispatchEvent(new CompositionEvent("compositionstart"));
+    ta.value = "´";
+    ta.dispatchEvent(
+      new InputEvent("input", {
+        data: "´",
+        inputType: "insertCompositionText",
+        isComposing: false,
+      }),
+    );
+    ta.dispatchEvent(key("keyup", { key: "Alt", code: "AltLeft" }));
+    ta.dispatchEvent(
+      key("keydown", {
+        key: "e",
+        code: "KeyE",
+        isComposing: false,
+      }),
+    );
+    ta.dispatchEvent(new CompositionEvent("compositionend", { data: "é" }));
+    ta.value = "é";
+    ta.dispatchEvent(
+      new InputEvent("input", {
+        data: "é",
+        inputType: "insertCompositionText",
+        isComposing: false,
+      }),
+    );
+
+    expect(texts).toEqual(["é"]);
+    expect(keys).toEqual([]);
+    expect(preedits.map((preedit) => preedit.text)).toEqual(["´"]);
+    surface.dispose();
+  });
+
   it("forwards a real Alt chord with the press ahead of the key", () => {
     // Linux-style Alt+E (no dead key involved): the held-back press goes
     // out the moment the chord's key arrives, so the app sees the same

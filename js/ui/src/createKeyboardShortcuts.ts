@@ -114,6 +114,175 @@ export function isSwitcherShortcut(
   );
 }
 
+type TextControl = HTMLInputElement | HTMLTextAreaElement;
+
+const MAC_DEAD_KEYS: Readonly<
+  Record<string, { combining: string; spacing: string }>
+> = {
+  Backquote: { combining: "\u0300", spacing: "`" },
+  KeyE: { combining: "\u0301", spacing: "´" },
+  KeyI: { combining: "\u0302", spacing: "ˆ" },
+  KeyN: { combining: "\u0303", spacing: "˜" },
+  KeyU: { combining: "\u0308", spacing: "¨" },
+};
+
+function macOptionChars(): boolean {
+  const nav = navigator as Navigator & {
+    userAgentData?: { platform?: string };
+  };
+  const platform = (
+    nav.userAgentData?.platform ??
+    nav.platform ??
+    ""
+  ).toLowerCase();
+  if (platform) return platform.startsWith("mac") || platform.startsWith("ip");
+  return /mac|ipad|iphone/.test((nav.userAgent ?? "").toLowerCase());
+}
+
+function textControlFor(event: KeyboardEvent): TextControl | null {
+  const target = event.target;
+  if (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement
+  ) {
+    return target;
+  }
+  const active = document.activeElement;
+  return active instanceof HTMLInputElement ||
+    active instanceof HTMLTextAreaElement
+    ? active
+    : null;
+}
+
+/**
+ * Chromium on macOS can drop a Latin dead-key composition while Blit's page
+ * owns the keyboard: Option+E followed by E then arrives as a plain `e`, with
+ * no usable composition commit.  Recreate the five US-layout Option dead keys
+ * through the focused text control's normal composition/input path.  The same
+ * path feeds ordinary inputs and the hidden terminal/surface textareas.
+ */
+export function createMacDeadKeyHandler(
+  enabled = macOptionChars(),
+): (event: KeyboardEvent) => boolean {
+  let pending: {
+    target: TextControl;
+    combining: string;
+    spacing: string;
+    start: number;
+    end: number;
+  } | null = null;
+
+  const finish = (target: TextControl, data: string) => {
+    target.dispatchEvent(
+      new CompositionEvent("compositionend", { bubbles: true, data }),
+    );
+  };
+
+  const update = (
+    target: TextControl,
+    start: number,
+    end: number,
+    data: string,
+  ): boolean => {
+    target.dispatchEvent(
+      new CompositionEvent("compositionupdate", { bubbles: true, data }),
+    );
+    const beforeInput = new InputEvent("beforeinput", {
+      bubbles: true,
+      cancelable: true,
+      data,
+      inputType: "insertCompositionText",
+      isComposing: true,
+    });
+    if (!target.dispatchEvent(beforeInput)) return false;
+    target.setRangeText(data, start, end, "end");
+    target.dispatchEvent(
+      new InputEvent("input", {
+        bubbles: true,
+        data,
+        inputType: "insertCompositionText",
+        isComposing: true,
+      }),
+    );
+    return true;
+  };
+
+  const cancel = (active: NonNullable<typeof pending>) => {
+    update(active.target, active.start, active.end, "");
+    finish(active.target, "");
+  };
+
+  return (event: KeyboardEvent): boolean => {
+    if (!enabled) return false;
+    const target = textControlFor(event);
+
+    if (!pending) {
+      const dead = MAC_DEAD_KEYS[event.code];
+      if (
+        !dead ||
+        event.key !== "Dead" ||
+        !event.altKey ||
+        event.ctrlKey ||
+        event.metaKey ||
+        !target
+      ) {
+        return false;
+      }
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      target.dispatchEvent(
+        new CompositionEvent("compositionstart", { bubbles: true, data: "" }),
+      );
+      const start = target.selectionStart ?? target.value.length;
+      const end = target.selectionEnd ?? start;
+      if (!update(target, start, end, dead.spacing)) {
+        finish(target, "");
+        return true;
+      }
+      pending = {
+        target,
+        ...dead,
+        start,
+        end: start + dead.spacing.length,
+      };
+      return true;
+    }
+
+    const active = pending;
+    pending = null;
+    if (!target || target !== active.target) {
+      cancel(active);
+      return false;
+    }
+    if (event.key === "Escape" || event.key === "Backspace") {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      cancel(active);
+      return true;
+    }
+
+    const text =
+      event.key === " "
+        ? active.spacing
+        : event.key.length === 1
+          ? `${event.key}${active.combining}`.normalize("NFC")
+          : null;
+    if (text == null) {
+      cancel(active);
+      return false;
+    }
+
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (update(target, active.start, active.end, text)) {
+      finish(target, text);
+    } else {
+      cancel(active);
+    }
+    return true;
+  };
+}
+
 /**
  * The next thing Alt+Shift+[ / ] should show in the focused slot, or null when
  * there is nothing to move to.
@@ -151,6 +320,7 @@ export function nextCycleTarget(
  */
 export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
   onMount(() => {
+    const handleMacDeadKey = createMacDeadKeyHandler();
     const eventElement = (target: EventTarget | null): Element | null => {
       if (target instanceof Element) return target;
       return document.activeElement instanceof Element
@@ -225,6 +395,8 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
       return true;
     };
     const handler = (e: KeyboardEvent) => {
+      if (handleMacDeadKey(e)) return;
+      if (e.key === "Dead" || e.isComposing || e.keyCode === 229) return;
       const mod = e.metaKey || e.ctrlKey;
       // Wayland applications own their Ctrl+Shift chords (Zed's command
       // palette is Ctrl+Shift+P): while a surface has keyboard focus, blit's

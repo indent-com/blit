@@ -914,6 +914,87 @@ describe("BlitTerminalSurface Ctrl+V image paste", () => {
   });
 });
 
+describe("BlitTerminalSurface desktop composition", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function attach(sendInput: (data: Uint8Array) => void) {
+    const s = new BlitTerminalSurface({ sessionId: "s1" });
+    // @ts-expect-error — install a fake workspace stub.
+    s["_workspace"] = { sendInput };
+    // @ts-expect-error — minimal connection exposing only a connected transport.
+    s["_blitConn"] = { transport: { status: "connected" } };
+    const input = document.createElement("textarea");
+    // @ts-expect-error — install the hidden capture textarea directly.
+    s["inputEl"] = input;
+    // @ts-expect-error — wire the keyboard and composition listeners.
+    s["setupKeyboard"]();
+    return input;
+  }
+
+  it("commits a dead key when key and input events misreport isComposing", () => {
+    // Safari/WebKit can report false on the completing keydown and input.
+    // The composition lifecycle must keep those events away from the normal
+    // key/input path or preventDefault cancels the Option+E, E commit.
+    const sendInput = vi.fn();
+    const input = attach(sendInput);
+
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Alt",
+        code: "AltLeft",
+        altKey: true,
+        cancelable: true,
+      }),
+    );
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Dead",
+        code: "KeyE",
+        altKey: true,
+        cancelable: true,
+      }),
+    );
+    input.dispatchEvent(new CompositionEvent("compositionstart"));
+    input.value = "´";
+    input.dispatchEvent(
+      new InputEvent("input", {
+        data: "´",
+        inputType: "insertCompositionText",
+        isComposing: false,
+      }),
+    );
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "e",
+        code: "KeyE",
+        cancelable: true,
+        isComposing: false,
+      }),
+    );
+    input.dispatchEvent(new CompositionEvent("compositionend", { data: "é" }));
+    input.value = "é";
+    input.dispatchEvent(
+      new InputEvent("input", {
+        data: "é",
+        inputType: "insertCompositionText",
+        isComposing: false,
+      }),
+    );
+
+    expect(
+      sendInput.mock.calls.map((call) =>
+        new TextDecoder().decode(call[1] as Uint8Array),
+      ),
+    ).toEqual(["é"]);
+  });
+});
+
 describe("BlitTerminalSurface Android composition", () => {
   beforeEach(() => {
     mockCanvasContext();

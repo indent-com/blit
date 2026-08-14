@@ -1124,6 +1124,11 @@ export class MuxChannel implements BlitTransport {
 
   /** @internal */
   _deliverMessage(data: BlitTransportMessage): void {
+    // A listener may suspend the channel after a terminal protocol message
+    // such as S2C_KICKED.  The gateway can already have queued the upstream
+    // EOF's synthetic S2C_QUIT behind it; delivering that would make
+    // BlitConnection reconnect immediately and undo the suspension.
+    if (this._suspended) return;
     for (const l of this.messageListeners) l(data);
   }
 }

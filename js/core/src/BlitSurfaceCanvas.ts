@@ -1268,6 +1268,12 @@ export class BlitSurfaceCanvas {
    *  Alt-hold semantics for apps that react to them. */
   private macOptionChars = detectMacOptionChars();
 
+  /** True from compositionstart through compositionend. Some engines report
+   *  `KeyboardEvent.isComposing=false` on the keystroke that completes a
+   *  dead-key composition; the explicit lifecycle keeps that key on the IME
+   *  path instead of forwarding it as ordinary input and cancelling commit. */
+  private compositionActive = false;
+
   /** Active single-finger gesture used to emulate mouse input on iPadOS. */
   private activeTouch: {
     identifier: number;
@@ -1373,9 +1379,7 @@ export class BlitSurfaceCanvas {
     surfaceId: number;
   } | null = null;
 
-  /** Hidden textarea used to capture IME composition.  Focus stays on
-   *  the canvas for normal typing; the textarea only receives focus when
-   *  an IME composition session is active. */
+  /** Hidden textarea used as the editable keyboard and IME target. */
   private textInput: HTMLTextAreaElement | null = null;
   /** Keep the iOS capture field non-empty so a held soft-keyboard Backspace
    *  continues producing deleteContentBackward events. */
@@ -2707,15 +2711,22 @@ export class BlitSurfaceCanvas {
     };
     window.addEventListener("dragend", this.boundDragEnd);
 
-    // Hidden textarea is only used for IME composition.  Focus stays on
-    // the canvas during normal typing; we redirect to the textarea when
-    // a composition session starts (detected via compositionstart on the
-    // canvas) and return focus to the canvas when it ends.
+    this.boundCompositionStart = () => {
+      this.compositionActive = true;
+      for (const kc of this.pendingAlt) this.swallowedAlt.add(kc);
+      this.pendingAlt.clear();
+      if (this.textInput) this.textInput.focus({ preventScroll: true });
+    };
+
+    // The textarea is the normal keyboard target and owns the composition
+    // lifecycle. Keep the canvas listener below as a fallback for embedders
+    // that move focus there themselves.
     if (ta) {
       this.boundTextInput = (e) => this.handleTextInput(e as InputEvent);
       this.boundCompositionEnd = (e) => this.handleCompositionEnd(e);
 
       ta.addEventListener("input", this.boundTextInput);
+      ta.addEventListener("compositionstart", this.boundCompositionStart);
       ta.addEventListener("compositionend", this.boundCompositionEnd);
       // Also listen for keydown on textarea so keys during IME composition
       // (e.g. Enter to confirm, Escape to cancel) still get routed.
@@ -2735,9 +2746,6 @@ export class BlitSurfaceCanvas {
     // anyway.  Chromium does not — it fires nothing at all while a canvas
     // holds focus, which is why the handoff cannot wait for this event and
     // happens on focus instead.
-    this.boundCompositionStart = () => {
-      if (this.textInput) this.textInput.focus({ preventScroll: true });
-    };
     canvas.addEventListener("compositionstart", this.boundCompositionStart);
     this.seedIOSInputPad();
   }
@@ -2843,6 +2851,8 @@ export class BlitSurfaceCanvas {
     if (ta) {
       if (this.boundTextInput)
         ta.removeEventListener("input", this.boundTextInput);
+      if (this.boundCompositionStart)
+        ta.removeEventListener("compositionstart", this.boundCompositionStart);
       if (this.boundCompositionEnd)
         ta.removeEventListener("compositionend", this.boundCompositionEnd);
       if (this.boundKeyDown)
@@ -2852,6 +2862,7 @@ export class BlitSurfaceCanvas {
       if (this.boundBlur) ta.removeEventListener("blur", this.boundBlur);
       if (this.boundPaste) ta.removeEventListener("paste", this.boundPaste);
     }
+    this.compositionActive = false;
   }
 
   private handleMouse(e: MouseEvent, type: number): void {
@@ -4315,10 +4326,16 @@ export class BlitSurfaceCanvas {
     // Sidebar previews should not intercept keyboard or send events.
     if (!this._displaySize) return;
 
-    // Dead keys / ongoing IME composition: redirect focus to the hidden
-    // textarea so the browser's composition UI can work.  The textarea's
-    // compositionend handler sends the result and returns focus here.
-    if (pressed && (e.key === "Dead" || e.isComposing)) {
+    // Dead keys / ongoing IME composition stay with the hidden textarea so
+    // the browser can finish the composition. Its compositionend handler
+    // sends the result; focus remains on this editable target.
+    if (
+      pressed &&
+      (e.key === "Dead" ||
+        e.isComposing ||
+        this.compositionActive ||
+        e.keyCode === 229)
+    ) {
       // A macOS dead key (Option+E → ´) means the Alt press held back below
       // is part of a character composition, not a modifier chord — drop it
       // so the app never sees it (and ignore its key-up later).
@@ -4802,7 +4819,7 @@ export class BlitSurfaceCanvas {
     // rather than `compositionupdate` because that one fires *before* the
     // DOM is updated — the caret read there is the previous one, which put
     // the app's cursor at 0 for every composition.
-    if (e.isComposing) {
+    if (this.compositionActive || e.isComposing) {
       const conn = this.getConn();
       if (conn && this.surface && this._displaySize && ta) {
         const text = this._iosInputPad ? stripIOSInputPad(ta.value) : ta.value;
@@ -4879,6 +4896,7 @@ export class BlitSurfaceCanvas {
   private handleCompositionEnd(e: CompositionEvent): void {
     const ta = this.textInput;
     if (!ta) return;
+    this.compositionActive = false;
     const conn = this.getConn();
     if (e.data) {
       if (conn && this.surface) {
@@ -4925,6 +4943,7 @@ export class BlitSurfaceCanvas {
     // physically down.
     const to = e.relatedTarget;
     if (to && (to === this.canvas || to === this.textInput)) return;
+    this.compositionActive = false;
     // Focus genuinely leaving mid-paste-chord is the one thing no
     // clipboard read or paste event will ever settle: stand the chord
     // down (its V was never pressed) before releasing what is held.

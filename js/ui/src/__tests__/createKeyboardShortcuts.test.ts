@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { BSPAssignments } from "@blit-sh/core";
 import { surfaceAssignment } from "../bsp/layout";
 import {
+  createMacDeadKeyHandler,
   hasFocusedWaylandSurface,
   isSwitcherShortcut,
   nextCycleTarget,
@@ -92,6 +93,125 @@ describe("Ctrl-K switcher toggle", () => {
         metaKey: true,
       }),
     ).toBe(false);
+  });
+});
+
+describe("macOS dead-key fallback", () => {
+  const key = (init: KeyboardEventInit) =>
+    new KeyboardEvent("keydown", {
+      bubbles: true,
+      cancelable: true,
+      ...init,
+    });
+
+  it.each([
+    ["KeyE", "e", "é", "´"],
+    ["KeyE", "E", "É", "´"],
+    ["Backquote", "a", "à", "`"],
+    ["KeyI", "o", "ô", "ˆ"],
+    ["KeyN", "n", "ñ", "˜"],
+    ["KeyU", "u", "ü", "¨"],
+    ["KeyE", " ", "´", "´"],
+  ])("composes %s then %s as %s", (code, next, expected, preedit) => {
+    const input = document.createElement("input");
+    document.body.append(input);
+    input.focus();
+    const events: string[] = [];
+    input.addEventListener("compositionstart", () => events.push("start"));
+    input.addEventListener("compositionupdate", () => events.push("update"));
+    input.addEventListener("input", () => events.push("input"));
+    input.addEventListener("compositionend", () => events.push("end"));
+    const handle = createMacDeadKeyHandler(true);
+    window.addEventListener("keydown", handle, true);
+
+    try {
+      const dead = key({ key: "Dead", code, altKey: true });
+      input.dispatchEvent(dead);
+      expect(input.value).toBe(preedit);
+      const completing = key({
+        key: next,
+        code: next === " " ? "Space" : "KeyE",
+      });
+      input.dispatchEvent(completing);
+
+      expect(dead.defaultPrevented).toBe(true);
+      expect(completing.defaultPrevented).toBe(true);
+      expect(input.value).toBe(expected);
+      expect(events).toEqual([
+        "start",
+        "update",
+        "input",
+        "update",
+        "input",
+        "end",
+      ]);
+    } finally {
+      window.removeEventListener("keydown", handle, true);
+      input.remove();
+    }
+  });
+
+  it("cancels a pending accent with Backspace", () => {
+    const input = document.createElement("textarea");
+    document.body.append(input);
+    input.focus();
+    const commits: string[] = [];
+    input.addEventListener("compositionend", (event) =>
+      commits.push(event.data),
+    );
+    const handle = createMacDeadKeyHandler(true);
+    window.addEventListener("keydown", handle, true);
+
+    try {
+      input.dispatchEvent(key({ key: "Dead", code: "KeyE", altKey: true }));
+      input.dispatchEvent(key({ key: "Backspace", code: "Backspace" }));
+      expect(input.value).toBe("");
+      expect(commits).toEqual([""]);
+    } finally {
+      window.removeEventListener("keydown", handle, true);
+      input.remove();
+    }
+  });
+
+  it("streams a marked preedit before committing to a surface-style target", () => {
+    const input = document.createElement("textarea");
+    document.body.append(input);
+    input.focus();
+    const preedits: string[] = [];
+    const commits: string[] = [];
+    input.addEventListener("input", (event) => {
+      if (event.isComposing) preedits.push(input.value);
+    });
+    input.addEventListener("compositionend", (event) =>
+      commits.push(event.data),
+    );
+    const handle = createMacDeadKeyHandler(true);
+    window.addEventListener("keydown", handle, true);
+
+    try {
+      input.dispatchEvent(key({ key: "Dead", code: "KeyE", altKey: true }));
+      expect(preedits).toEqual(["´"]);
+      expect(commits).toEqual([]);
+
+      input.dispatchEvent(key({ key: "e", code: "KeyE" }));
+      expect(preedits).toEqual(["´", "é"]);
+      expect(commits).toEqual(["é"]);
+    } finally {
+      window.removeEventListener("keydown", handle, true);
+      input.remove();
+    }
+  });
+
+  it("does nothing off macOS or for ordinary Option characters", () => {
+    const disabled = createMacDeadKeyHandler(false);
+    const dead = key({ key: "Dead", code: "KeyE", altKey: true });
+    expect(disabled(dead)).toBe(false);
+    expect(dead.defaultPrevented).toBe(false);
+
+    const enabled = createMacDeadKeyHandler(true);
+    const ellipsis = key({ key: "…", code: "Semicolon", altKey: true });
+    expect(enabled(ellipsis)).toBe(false);
+    expect(ellipsis.defaultPrevented).toBe(false);
   });
 });
 

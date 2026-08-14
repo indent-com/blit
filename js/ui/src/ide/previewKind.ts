@@ -54,11 +54,17 @@ export function previewMime(path: string): string {
 export function resolveRelative(fromPath: string, href: string): string | null {
   if (!href || /^[a-z][a-z0-9+.-]*:/i.test(href)) return null;
   if (href.startsWith("//") || href.startsWith("#")) return null;
-  const base = href.startsWith("/")
-    ? ""
-    : fromPath.slice(0, fromPath.lastIndexOf("/"));
+  const slash = fromPath.lastIndexOf("/");
+  const base =
+    href.startsWith("/") || slash === -1 ? "" : fromPath.slice(0, slash);
   // Drop any query/fragment before treating it as a path.
-  const clean = href.replace(/[?#].*$/, "");
+  const encoded = href.replace(/[?#].*$/, "");
+  let clean = encoded;
+  try {
+    clean = decodeURIComponent(encoded);
+  } catch {
+    // A literal or malformed `%` is still a valid filesystem character.
+  }
   const parts = `${base}/${clean}`.split("/");
   const out: string[] = [];
   for (const part of parts) {
@@ -70,4 +76,50 @@ export function resolveRelative(fromPath: string, href: string): string | null {
     out.push(part);
   }
   return `/${out.join("/")}`;
+}
+
+export type WorkspaceLinkTarget = {
+  path: string;
+  fragment: string | null;
+  view: "preview" | "editor";
+};
+
+/** Resolve any non-network markdown link to an in-app workspace destination.
+ * Previewable files stay rendered; every other file opens in the editor.
+ * A fragment-only link addresses the current document. */
+export function workspaceLinkTarget(
+  fromPath: string,
+  href: string,
+): WorkspaceLinkTarget | null {
+  if (!href || /^[a-z][a-z0-9+.-]*:/i.test(href)) return null;
+  if (href.startsWith("//")) return null;
+
+  const hash = href.indexOf("#");
+  let fragment: string | null = hash === -1 ? null : href.slice(hash + 1);
+  if (fragment !== null) {
+    try {
+      fragment = decodeURIComponent(fragment);
+    } catch {
+      // Keep a malformed fragment usable as a literal heading id.
+    }
+  }
+
+  const pathHref = href.slice(0, hash === -1 ? href.length : hash);
+  const pathPart = pathHref.replace(/\?.*$/, "");
+  const path = pathPart ? resolveRelative(fromPath, pathPart) : fromPath;
+  if (!path) return null;
+  return {
+    path,
+    fragment,
+    view: previewKindFor(path) ? "preview" : "editor",
+  };
+}
+
+/** GitHub-style heading id used by markdown fragment links. */
+export function markdownHeadingSlug(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s_-]/gu, "")
+    .replace(/\s/g, "-");
 }
