@@ -772,10 +772,11 @@ in
       export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
       export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
-      # Rust tests only need the include_bytes! inputs to exist. Building the
-      # production UI here realizes the browser WASM and pnpm closures before
-      # Cargo can even start, despite no Rust or fd-channel test serving it.
-      # Preserve real development assets and remove only our placeholders.
+      # Rust tests exercise the UI routes, so their include_bytes! inputs must
+      # be valid Brotli streams with representative content. Building the
+      # production UI here would realize the browser WASM and pnpm closures
+      # before Cargo can start. Preserve real development assets and remove
+      # only the small test fixtures created here.
       echo "=== Setting up UI dist inputs ==="
       mkdir -p js/ui/dist
       placeholder_assets=()
@@ -787,7 +788,19 @@ in
       trap cleanup_ui_dist EXIT
       for asset in js/ui/dist/index.html.br js/ui/dist/sw.js.br; do
         if [ ! -e "$asset" ]; then
-          : > "$asset"
+          case "$asset" in
+            */index.html.br)
+              fixture='<!doctype html><html><head><meta charset="utf-8"><title>blit test fixture</title></head><body><main id="root">blit</main></body></html>'
+              ;;
+            */sw.js.br)
+              fixture='/* blit test fixture */ self.addEventListener("fetch", () => {});'
+              ;;
+          esac
+          node -e '
+            const fs = require("node:fs");
+            const zlib = require("node:zlib");
+            fs.writeFileSync(process.argv[1], zlib.brotliCompressSync(Buffer.from(process.argv[2])));
+          ' "$asset" "$fixture"
           placeholder_assets+=("$asset")
         fi
       done
