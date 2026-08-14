@@ -1,6 +1,6 @@
 # RFC: Server KV Store (CAS)
 
-- **Status:** Draft
+- **Status:** Implemented (`FEATURE_KV`, protocol feature bit 9)
 - **Date:** 2026-07-25
 - **Companion to:** [fs-write.md](fs-write.md), [fs-watch.md](fs-watch.md),
   [../protocol.md](../protocol.md), [../ide.md](../ide.md)

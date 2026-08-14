@@ -23,7 +23,9 @@ use wayland_client::protocol::{
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, delegate_noop};
 
-use blit_compositor::{CompositorCommand, CompositorEvent, CompositorHandle, spawn_compositor};
+use blit_compositor::{
+    CompositorCommand, CompositorEvent, CompositorHandle, spawn_compositor_without_renderer,
+};
 
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
@@ -244,7 +246,7 @@ impl Fixture {
 
     fn with_seat_version(version: u32) -> Self {
         SEAT_VERSION.with(|v| *v.borrow_mut() = version);
-        let handle = spawn_compositor(false, Arc::new(|| {}), "");
+        let handle = spawn_compositor_without_renderer(false, Arc::new(|| {}));
 
         let stream =
             UnixStream::connect(&handle.socket_name).expect("connect to compositor socket");

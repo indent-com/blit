@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "blit-alacritty"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "blit-alacritty-terminal",
  "blit-remote",
@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "blit-browser"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "blit-remote",
  "js-sys",
@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "blit-cli"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "axum",
  "blit-gateway",
@@ -813,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "blit-compositor"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "ash",
  "calloop",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "blit-desktop"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "blit-remote",
  "futures-util",
@@ -840,11 +840,11 @@ dependencies = [
 
 [[package]]
 name = "blit-fonts"
-version = "0.51.1"
+version = "0.52.0"
 
 [[package]]
 name = "blit-fssync"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "blake3",
  "blit-remote",
@@ -854,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "blit-gateway"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "axum",
  "blit-proxy",
@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "blit-git"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "blit-fssync",
  "blit-remote",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "blit-lsp"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "blake3",
  "blit-fssync",
@@ -905,7 +905,7 @@ dependencies = [
 
 [[package]]
 name = "blit-proxy"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "blit-ssh",
  "blit-webrtc-forwarder",
@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "blit-remote"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "lz4_flex",
  "unicode-width",
@@ -931,14 +931,14 @@ dependencies = [
 
 [[package]]
 name = "blit-sd-notify"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "blit-server"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "blit-alacritty",
  "blit-compositor",
@@ -972,7 +972,7 @@ dependencies = [
 
 [[package]]
 name = "blit-ssh"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "log",
  "russh",
@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "blit-upsidedown"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1007,7 +1007,7 @@ dependencies = [
 
 [[package]]
 name = "blit-webrtc-forwarder"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "base64",
  "blit-remote",
@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "blit-webserver"
-version = "0.51.1"
+version = "0.52.0"
 dependencies = [
  "argon2 0.5.3",
  "axum",

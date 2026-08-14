@@ -750,6 +750,8 @@ in
       rustToolchain
       pkgs.nodejs
       pkgs.pnpm
+      pkgs.wasm-pack
+      pkgs.wasm-bindgen-cli
       pkgs.python3
       pkgs.bun
       # The hub's tests drive a real redis: the outage they pin (registration
@@ -770,10 +772,25 @@ in
       export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
       export LIBRARY_PATH="${pkgs.libopus}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
-      echo "=== Setting up UI dist ==="
+      # Rust tests only need the include_bytes! inputs to exist. Building the
+      # production UI here realizes the browser WASM and pnpm closures before
+      # Cargo can even start, despite no Rust or fd-channel test serving it.
+      # Preserve real development assets and remove only our placeholders.
+      echo "=== Setting up UI dist inputs ==="
       mkdir -p js/ui/dist
-      cp ${webAppDist}/index.html ${webAppDist}/index.html.br \
-        ${webAppDist}/sw.js ${webAppDist}/sw.js.br js/ui/dist/
+      placeholder_assets=()
+      cleanup_ui_dist() {
+        if (( ''${#placeholder_assets[@]} )); then
+          rm -f "''${placeholder_assets[@]}"
+        fi
+      }
+      trap cleanup_ui_dist EXIT
+      for asset in js/ui/dist/index.html.br js/ui/dist/sw.js.br; do
+        if [ ! -e "$asset" ]; then
+          : > "$asset"
+          placeholder_assets+=("$asset")
+        fi
+      done
 
       echo "=== Rust tests ==="
       cargo test --workspace
@@ -790,20 +807,44 @@ in
     ''
     + ''
 
+      # JS tests need the browser module's generated declarations, but not an
+      # optimized publish artifact. A local dev build is substantially faster
+      # and reuses Cargo's target directory on subsequent runs.
       echo "=== Setting up browser WASM package ==="
-      ${setupBrowserPkg}
+      (cd crates/browser && wasm-pack build --target web --dev --out-dir pkg)
+      node -e '
+        const fs = require("fs");
+        const path = "crates/browser/pkg/package.json";
+        const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
+        pkg.name = "@blit-sh/browser";
+        fs.writeFileSync(path, JSON.stringify(pkg));
+      '
 
       echo "=== JS typecheck ==="
       (cd js && { pnpm install --frozen-lockfile 2>/dev/null || pnpm install; } && pnpm run typecheck)
       echo ""
       echo "=== JS workspace tests ==="
-      (cd js && pnpm --filter @blit-sh/core run test && pnpm --filter @blit-sh/react run test && pnpm --filter @blit-sh/solid run test && pnpm --filter @blit-sh/ui run test)
+      (cd js && pnpm --parallel \
+        --filter @blit-sh/core \
+        --filter @blit-sh/react \
+        --filter @blit-sh/solid \
+        --filter @blit-sh/ui \
+        run test)
 
       echo ""
       echo "=== Hub tests (real redis) ==="
       (cd js/hub && bun install --frozen-lockfile && bun run typecheck && bun test)
 
-      export BLIT_SERVER="${blit}/bin/blit"
+      # Reuse the dependency graph Cargo just compiled instead of making Nix
+      # build a separate optimized blit package before this runner can start.
+      echo ""
+      echo "=== Building fd-channel test server ==="
+      cargo build -p blit-cli --bin blit
+      cargo_target_dir="''${CARGO_TARGET_DIR:-target}"
+      if [[ "$cargo_target_dir" != /* ]]; then
+        cargo_target_dir="$PWD/$cargo_target_dir"
+      fi
+      export BLIT_SERVER="$cargo_target_dir/debug/blit"
       echo ""
       echo "=== Python fd-channel test ==="
       python3 examples/fd-channel-python.py

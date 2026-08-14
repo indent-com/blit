@@ -533,6 +533,14 @@ mod stub {
             vulkan_video_encode_av1: false,
         }
     }
+
+    #[doc(hidden)]
+    pub fn spawn_compositor_without_renderer(
+        verbose: bool,
+        event_notify: Arc<dyn Fn() + Send + Sync>,
+    ) -> CompositorHandle {
+        spawn_compositor(verbose, event_notify, "")
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

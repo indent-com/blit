@@ -32,7 +32,9 @@ use wayland_protocols::wp::text_input::zv3::client::{
 };
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
-use blit_compositor::{CompositorCommand, CompositorEvent, CompositorHandle, spawn_compositor};
+use blit_compositor::{
+    CompositorCommand, CompositorEvent, CompositorHandle, spawn_compositor_without_renderer,
+};
 
 /// Japanese, i.e. the whole reason an input method is in the loop.
 const COMPOSED: &str = "日本語";
@@ -226,7 +228,7 @@ impl Fixture {
     /// whether this client negotiates an input method at all -- the two
     /// halves of the contract under test.
     fn new(text_input: bool) -> Self {
-        let handle = spawn_compositor(false, Arc::new(|| {}), "");
+        let handle = spawn_compositor_without_renderer(false, Arc::new(|| {}));
         let stream =
             UnixStream::connect(&handle.socket_name).expect("connect to compositor socket");
         let conn = Connection::from_socket(stream).expect("wayland connection");

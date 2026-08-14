@@ -59,7 +59,7 @@ SolidJS tree rooted at `WorkspaceScreen` (`js/ui/src/Workspace.tsx`,
 | **Right panel**   | `Workspace.tsx` `PreviewPanel` (~L2018)     | A resizable right dock of off-screen session/surface thumbnails, toggled by `previewPanelOpen()`. There is **no left panel**.                                               | Template for any dockable side panel; or generalize its resize-handle shell into a reusable `Dock`.                                                     |
 | **Status bar**    | `js/ui/src/StatusBar.tsx` (~30 flat props)  | Footer segments + action buttons; already buckets connections by status via a `ConnectionDot` pattern.                                                                      | A new segment is a new prop wired at the `Workspace.tsx` call site (~L1946) + an inline block.                                                          |
 | **Keyboard**      | `js/ui/src/createKeyboardShortcuts.ts`      | Global **capture-phase** keydown handlers routing to Workspace actions (`toggleOverlay`, `createInPane`, …).                                                                | A which-key leader chord state machine slots in here; every binding must also register in `HelpOverlay` + `i18n.ts`.                                    |
-| **Theme**         | `js/ui/src/theme.ts` `themeFromPalette`     | Every chrome token (bg/fg/accent/error/success/warning) is derived from `palette.bg/fg/ansi[]`.                                                                             | New chrome reads `theme()` and is palette-tinted automatically; a Monaco/CM theme must be _generated_ from it.                                          |
+| **Theme**         | `js/ui/src/theme.ts` `themeFromPalette`     | Every chrome token (bg/fg/accent/error/success/warning) is derived from `palette.bg/fg/ansi[]`.                                                                             | New chrome reads `theme()` and is palette-tinted automatically; the CM6 theme is generated from it.                                                     |
 | **Multi-host**    | `BlitWorkspace` holds many `BlitConnection` | Session ids are minted `${conn}:${n}`, so every pane is host-prefixed; panes from several hosts coexist.                                                                    | Any repo/LSP handle is per-connection; a pane looks one up by its `connectionId` and prefixes results by host.                                          |
 
 Two subtleties that will bite anyone who skips them:
@@ -216,10 +216,10 @@ A first, adopt B's tile plumbing when the editor lands.
 
 **Thesis.** Reshape the chrome into a familiar VS Code silhouette — left
 explorer, center editor group, bottom problems — and let Monaco own
-editing, diffing, and decoration. This is also the write side's stated
-target: [fs-write.md](design/fs-write.md) names "a Monaco editor and a
-file explorer." Be honest that it buys familiarity by importing a second
-app into blit.
+editing, diffing, and decoration. This was the write side's original
+target; [fs-write.md](design/fs-write.md) now reflects the shipped CM6
+editor. Be honest that this alternative buys familiarity by importing a
+second app into blit.
 
 **What it adds.** Generalize `PreviewPanel` into a reusable `Dock`
 (left/right/bottom, min-size, hash-persisted width) and instantiate an
@@ -266,7 +266,7 @@ seam so the engine can be swapped without touching plumbing.
 | Editor-authoring effort        | Lowest                       | Medium                                   | Highest (own tokenizer/undo/selection/wrap) |
 
 **Recommendation: CodeMirror 6 for the first real editor; the native
-cell-grid editor as the aesthetic end-state.** Monaco is the RFC's stated
+cell-grid editor as the aesthetic end-state.** Monaco was the RFC's original
 target but the worst house-style fit — its bundle and worker model fight
 `viteSingleFile` directly, and its LSP client is dead weight. The native
 editor is the truest to blit (the `gl-renderer.ts` `render()` seam is

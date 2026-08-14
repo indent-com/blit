@@ -10854,6 +10854,29 @@ pub fn spawn_compositor(
     event_notify: Arc<dyn Fn() + Send + Sync>,
     gpu_device: &str,
 ) -> CompositorHandle {
+    spawn_compositor_inner(verbose, event_notify, gpu_device, true)
+}
+
+/// Start a compositor without probing or initializing a renderer.
+///
+/// This is intended for protocol tests whose assertions only depend on
+/// Wayland state and events. Keeping those tests off Vulkan avoids creating a
+/// GPU device per test, which is both expensive and prone to driver contention
+/// when the Rust test harness runs them concurrently.
+#[doc(hidden)]
+pub fn spawn_compositor_without_renderer(
+    verbose: bool,
+    event_notify: Arc<dyn Fn() + Send + Sync>,
+) -> CompositorHandle {
+    spawn_compositor_inner(verbose, event_notify, "", false)
+}
+
+fn spawn_compositor_inner(
+    verbose: bool,
+    event_notify: Arc<dyn Fn() + Send + Sync>,
+    gpu_device: &str,
+    enable_renderer: bool,
+) -> CompositorHandle {
     let _gpu_device = gpu_device.to_string();
     let (event_tx, event_rx) = mpsc::channel();
     let (command_tx, command_rx) = mpsc::channel();
@@ -10892,6 +10915,7 @@ pub fn spawn_compositor(
                     shutdown_clone,
                     verbose,
                     _gpu_device,
+                    enable_renderer,
                 );
             }));
             if let Err(e) = result {
@@ -10957,6 +10981,7 @@ fn run_compositor(
     shutdown: Arc<AtomicBool>,
     verbose: bool,
     gpu_device: String,
+    enable_renderer: bool,
 ) {
     let mut event_loop: EventLoop<Compositor> =
         EventLoop::try_new().expect("failed to create event loop");
@@ -10967,15 +10992,19 @@ fn run_compositor(
 
     // Probe Vulkan early so we know whether DMA-BUF is available
     // before registering Wayland globals.
-    eprintln!("[compositor] trying Vulkan renderer for {gpu_device}");
-    let vulkan_renderer = super::vulkan_render::VulkanRenderer::try_new(&gpu_device);
+    if enable_renderer {
+        eprintln!("[compositor] trying Vulkan renderer for {gpu_device}");
+    }
+    let vulkan_renderer = enable_renderer
+        .then(|| super::vulkan_render::VulkanRenderer::try_new(&gpu_device))
+        .flatten();
     let has_dmabuf = vulkan_renderer.as_ref().is_some_and(|vk| vk.has_dmabuf());
     eprintln!(
         "[compositor] Vulkan renderer: {} (dmabuf={})",
         vulkan_renderer.is_some(),
         has_dmabuf,
     );
-    if vulkan_renderer.is_none() {
+    if enable_renderer && vulkan_renderer.is_none() {
         eprintln!(
             "[compositor] WARNING: no Vulkan renderer — clients can connect but NO frames will be composited (windows will never appear)."
         );

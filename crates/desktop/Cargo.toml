@@ -1,6 +1,6 @@
 [package]
 name = "blit-desktop"
-version = "0.51.1"
+version = "0.52.0"
 edition.workspace = true
 description = "Private D-Bus tray and desktop notification services for blit"
 license.workspace = true

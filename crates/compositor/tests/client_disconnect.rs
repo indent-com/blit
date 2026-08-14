@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
-use blit_compositor::{CompositorEvent, spawn_compositor};
+use blit_compositor::{CompositorEvent, spawn_compositor_without_renderer};
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
 };
@@ -98,7 +98,7 @@ delegate_noop!(App: ignore xdg_toplevel::XdgToplevel);
 
 #[test]
 fn handed_off_connection_outlives_the_original_process() {
-    let handle = spawn_compositor(false, Arc::new(|| {}), "");
+    let handle = spawn_compositor_without_renderer(false, Arc::new(|| {}));
 
     let status = Command::new(std::env::current_exe().expect("current test executable"))
         .args([
@@ -140,7 +140,7 @@ fn handed_off_connection_outlives_the_original_process() {
 
 #[test]
 fn closed_client_drops_queued_commits_before_destroying_surface() {
-    let handle = spawn_compositor(false, Arc::new(|| {}), "");
+    let handle = spawn_compositor_without_renderer(false, Arc::new(|| {}));
 
     let stream = UnixStream::connect(&handle.socket_name).expect("connect to compositor socket");
     let disconnect = stream.try_clone().expect("clone Wayland socket");

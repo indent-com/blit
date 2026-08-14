@@ -8,7 +8,7 @@
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
-use blit_compositor::spawn_compositor;
+use blit_compositor::spawn_compositor_without_renderer;
 use wayland_client::protocol::{wl_compositor, wl_output, wl_registry, wl_surface};
 use wayland_client::{Connection, Dispatch, QueueHandle, delegate_noop};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
@@ -90,7 +90,7 @@ delegate_noop!(App: ignore xdg_toplevel::XdgToplevel);
 
 #[test]
 fn output_removal_does_not_reject_an_in_flight_bind() {
-    let handle = spawn_compositor(false, Arc::new(|| {}), "");
+    let handle = spawn_compositor_without_renderer(false, Arc::new(|| {}));
     let stream = UnixStream::connect(&handle.socket_name).expect("connect to compositor socket");
     let conn = Connection::from_socket(stream).expect("wayland connection");
     let mut queue = conn.new_event_queue();

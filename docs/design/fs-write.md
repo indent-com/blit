@@ -1,8 +1,7 @@
 # RFC: Filesystem Writes
 
 - **Status:** Implemented (rides `FEATURE_FS`, protocol feature bit 6;
-  no new bit) — the disk-write side; the Monaco pane (§ Rollout step 6) is
-  separate `js/ui` work.
+  no new bit), including the CodeMirror 6 browser editor.
 - **Date:** 2026-07-23
 - **Companion to:** [fs-watch.md](fs-watch.md), [git.md](git.md), [lsp.md](lsp.md)
 
@@ -12,7 +11,7 @@ This is the RFC [fs-watch.md](fs-watch.md) defers ("Bidirectional sync
 (client writes) … is a separate RFC") and [lsp.md](lsp.md) gates its
 write-shaped features on ("all write-shaped features wait for the
 mutation/buffer RFC"). It supersedes both lines. Its goal is a
-credible browser IDE: enough to build a Monaco editor and a file
+credible browser IDE: enough to build a CodeMirror 6 editor and a file
 explorer on top of blit — content writes with conflict detection, plus
 the directory operations a file tree needs.
 
@@ -253,8 +252,8 @@ the echo `UPSERT` arrives:
 
 - `record.hash == lastWrittenHash` → my own echo: do not re-apply to the
   editor model.
-- `!=` and the model is clean → a genuine external change: apply a
-  computed diff via Monaco's `applyEdits`, **never `setValue`** (which
+- `!=` and the model is clean → a genuine external change: apply it through
+  a CodeMirror transaction, **never recreate the editor state** (which
   destroys the undo stack and cursor).
 - `!=` and the model is dirty → surface a conflict (Reload / Overwrite /
   Compare).
@@ -367,7 +366,7 @@ The link methods default to create-exclusive (the common "New Link"
 case); `ifHash` retargets under CAS, `force` replaces unconditionally —
 inverted from `writeFile`, whose default matches a shell `>` redirect.
 
-**Monaco save flow, end to end:**
+**CodeMirror 6 save flow, end to end:**
 
 1. `node = live.get(path)` — the mirror already holds `node.hash`.
 2. `writeFile(path, bytes, { ifHash: node.hash })`.
@@ -375,8 +374,8 @@ inverted from `writeFile`, whose default matches a shell `>` redirect.
    `UPSERT` is recognized and _not_ re-applied to the model.
 4. On `CONFLICT` → `FS_DONE.hash` is the current disk hash; `fetch()`
    the current bytes and present Overwrite (retry `NO_CAS`) / Compare
-   (3-way) / Revert (`applyEdits` the disk version), no extra round
-   trip.
+   (3-way) / Revert (dispatch the disk version as a CM6 transaction),
+   no extra round trip.
 
 The client never hashes. CLI: `blit fs write PATH [--if-hash H |
 --create | --force] [--durable]` from stdin, plus `blit fs mkdir | rm |
@@ -430,9 +429,8 @@ its wire — the three contracts that keep that seam open:
 4. `crates/server`: `Command::Write` / `Command::Op` inline dispatch,
    e2e; `blit fs write|mkdir|rm|mv|ln`.
 5. `js/core`: handle methods and `lastWrittenHash` echo suppression.
-6. Monaco pane (separate `js/ui` work — a new BSP assignment kind and
-   component). Ship write + CAS first, mkdir/remove/rename second,
-   defer copy.
+6. CodeMirror 6 pane in `js/ui`, using the BSP `editor:` assignment kind
+   and the write/CAS path. Shipped; copy remains deferred.
 
 ## Top risks
 

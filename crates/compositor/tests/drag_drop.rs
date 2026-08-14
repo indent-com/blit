@@ -24,7 +24,9 @@ use wayland_client::protocol::{
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, delegate_noop};
 
-use blit_compositor::{CompositorCommand, CompositorEvent, CompositorHandle, spawn_compositor};
+use blit_compositor::{
+    CompositorCommand, CompositorEvent, CompositorHandle, spawn_compositor_without_renderer,
+};
 
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
@@ -228,7 +230,7 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let handle = spawn_compositor(false, Arc::new(|| {}), "");
+        let handle = spawn_compositor_without_renderer(false, Arc::new(|| {}));
         let stream =
             UnixStream::connect(&handle.socket_name).expect("connect to compositor socket");
         let conn = Connection::from_socket(stream).expect("wayland connection");
