@@ -127,7 +127,10 @@ function replaceNodeAtPath(
 
 export function BSPContainer(props: {
   layout: BSPLayout;
-  onLayoutChange: (layout: BSPLayout | null) => void;
+  onLayoutChange: (
+    layout: BSPLayout | null,
+    options?: { debounceHistory?: boolean },
+  ) => void;
   connectionId: string;
   connectionLabels?: Map<string, string>;
   palette: TerminalPalette;
@@ -879,14 +882,17 @@ export function BSPContainer(props: {
     }
   });
 
-  function updateRoot(next: BSPNode) {
+  function updateRoot(next: BSPNode, debounceHistory = false) {
     setRoot(next);
     const dsl = serializeDSL(next);
     const updated: BSPLayout = { ...props.layout, root: next, dsl };
     lastLayout = updated;
     lastDsl = dsl;
     saveActiveLayout(updated);
-    props.onLayoutChange(updated);
+    props.onLayoutChange(
+      updated,
+      debounceHistory ? { debounceHistory: true } : undefined,
+    );
   }
 
   function handleResize(
@@ -907,7 +913,7 @@ export function BSPContainer(props: {
         })),
       };
     };
-    updateRoot(replaceNode(root()));
+    updateRoot(replaceNode(root()), true);
   }
 
   createEffect(() => {

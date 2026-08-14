@@ -265,6 +265,7 @@ type HmrWorkspaceData = HmrLeaseState & {
 };
 
 const hmrWorkspaceOwner = {};
+const BSP_RESIZE_HISTORY_DEBOUNCE_MS = 250;
 
 /**
  * Reset terminal view leases on both current and pre-fix preserved workspaces.
@@ -1606,9 +1607,43 @@ function WorkspaceScreen(props: {
     font,
     defaultFont(),
   );
-  const [activeLayout, setActiveLayout] = createSignal<BSPLayout | null>(
+  const [activeLayout, setActiveLayoutSignal] = createSignal<BSPLayout | null>(
     loadActiveLayout(),
   );
+  // BSP resize pointermoves update the layout continuously for live feedback.
+  // Defer the shareable URL until the drag settles so history.replaceState is
+  // not called at pointer-event frequency. The flush signal makes the URL
+  // effect rebuild from current state instead of committing a stale hash.
+  const [historyReplaceFlush, setHistoryReplaceFlush] = createSignal(0);
+  let bspResizeHistoryPending = false;
+  let bspResizeHistoryTimer: ReturnType<typeof setTimeout> | undefined;
+  function setActiveLayout(layout: BSPLayout | null) {
+    const flushPendingHistory = bspResizeHistoryPending;
+    bspResizeHistoryPending = false;
+    clearTimeout(bspResizeHistoryTimer);
+    bspResizeHistoryTimer = undefined;
+    setActiveLayoutSignal(layout);
+    if (flushPendingHistory) setHistoryReplaceFlush((n) => n + 1);
+  }
+  function setBspLayout(
+    layout: BSPLayout | null,
+    options?: { debounceHistory?: boolean },
+  ) {
+    if (options?.debounceHistory) {
+      bspResizeHistoryPending = true;
+      clearTimeout(bspResizeHistoryTimer);
+      bspResizeHistoryTimer = setTimeout(() => {
+        bspResizeHistoryTimer = undefined;
+        bspResizeHistoryPending = false;
+        setHistoryReplaceFlush((n) => n + 1);
+      }, BSP_RESIZE_HISTORY_DEBOUNCE_MS);
+    } else {
+      setActiveLayout(layout);
+      return;
+    }
+    setActiveLayoutSignal(layout);
+  }
+  onCleanup(() => clearTimeout(bspResizeHistoryTimer));
   const [recentLayouts, setRecentLayouts] = createSignal(loadRecentLayouts());
   const [layoutAssignments, setLayoutAssignments] =
     createSignal<BSPAssignments | null>(null);
@@ -3762,6 +3797,7 @@ function WorkspaceScreen(props: {
 
   // Sync layout + focus to URL hash.
   createEffect(() => {
+    historyReplaceFlush();
     // Debug visibility is local UI state, so keep it shareable even while the
     // transport is disconnected and the connection-gated state below cannot
     // yet be refreshed.
@@ -3888,7 +3924,7 @@ function WorkspaceScreen(props: {
     );
     const merged = [...kept, ...parts];
     const newHash = withDebugPanelState(merged.join("&"), debugOpen);
-    if (newHash !== existing) {
+    if (newHash !== existing && !bspResizeHistoryPending) {
       history.replaceState(
         null,
         "",
@@ -4324,7 +4360,7 @@ function WorkspaceScreen(props: {
                 {(al) => (
                   <BSPContainer
                     layout={al()}
-                    onLayoutChange={setActiveLayout}
+                    onLayoutChange={setBspLayout}
                     connectionId={activeConnectionId()}
                     isSessionReadOnly={isSessionReadOnly}
                     connectionLabels={connectionLabels()}
