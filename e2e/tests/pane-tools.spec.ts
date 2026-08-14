@@ -41,6 +41,18 @@ async function newTerminal(page: Page) {
   await page.waitForTimeout(300);
 }
 
+/** Switch to two side-by-side BSP panes. */
+async function twoPanes(page: Page) {
+  await page.evaluate(() => {
+    const h = window.location.hash.replace(/^#/, "");
+    window.location.hash = `${h}${h ? "&" : ""}l=line(a,b)`;
+  });
+  const panes = page.locator("[data-blit-bsp-pane-id]");
+  await expect(panes).toHaveCount(2, { timeout: 10_000 });
+  await page.waitForTimeout(500);
+  return panes;
+}
+
 /** Close every session, leaving the empty pane. Bounded so a stuck close
  *  fails the test rather than spinning. */
 async function closeAllTerminals(page: Page) {
@@ -101,21 +113,127 @@ async function revealGrip(page: Page) {
 }
 
 test.describe("Pane multitool on a main-view terminal", () => {
-  test("a bare terminal has the grip, and clicking it relocates the toolbar", async ({
+  test("clicking relocates the toolbar and reverses it on the left", async ({
     page,
   }) => {
     await authenticate(page);
     await newTerminal(page);
 
     const grip = await revealGrip(page);
+    const close = page
+      .getByRole("button", { name: "Close", exact: true })
+      .first();
     const before = await grip.boundingBox();
+    const closeBefore = await close.boundingBox();
     expect(before).not.toBeNull();
+    expect(closeBefore).not.toBeNull();
+    expect(closeBefore!.x).toBeGreaterThan(before!.x);
 
     // Click (not drag) sends the toolbar to the next corner.
     await grip.click();
     const after = await grip.boundingBox();
     expect(after).not.toBeNull();
     expect(after!.x !== before!.x || after!.y !== before!.y).toBe(true);
+
+    // The next click reaches bottom-left. The whole control reverses so the
+    // close remains against the window edge and the grip faces the content.
+    await grip.click();
+    const leftGrip = await grip.boundingBox();
+    const leftClose = await close.boundingBox();
+    expect(leftGrip).not.toBeNull();
+    expect(leftClose).not.toBeNull();
+    expect(leftGrip!.x).toBeGreaterThan(leftClose!.x);
+  });
+
+  test("a pane quarter previews and relocates the toolbar", async ({
+    page,
+  }) => {
+    await authenticate(page);
+    await newTerminal(page);
+
+    const grip = await revealGrip(page);
+    const close = page
+      .getByRole("button", { name: "Close", exact: true })
+      .first();
+    const before = (await grip.boundingBox())!;
+    const pane = await grip.evaluate((el) => {
+      const rect = (
+        el.parentElement!.offsetParent as HTMLElement
+      ).getBoundingClientRect();
+      return {
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        bottom: rect.bottom,
+      };
+    });
+    const target = {
+      x: pane.left + (pane.right - pane.left) * 0.25,
+      y: pane.top + (pane.bottom - pane.top) * 0.75,
+    };
+    const dt = await page.evaluateHandle(() => new DataTransfer());
+    await grip.dispatchEvent("dragstart", { dataTransfer: dt });
+    await page.locator("body").dispatchEvent("dragover", {
+      dataTransfer: dt,
+      clientX: target.x,
+      clientY: target.y,
+    });
+    // Before release, the tools themselves preview their final corner and
+    // the left-side order. This is not a separate quadrant overlay.
+    const previewGrip = (await grip.boundingBox())!;
+    const previewClose = (await close.boundingBox())!;
+    expect(previewGrip.x).toBeLessThan(before.x);
+    expect(previewGrip.y).toBeGreaterThan(before.y);
+    expect(previewClose.x).toBeLessThan(previewGrip.x);
+
+    await grip.dispatchEvent("dragend", {
+      dataTransfer: dt,
+      clientX: target.x,
+      clientY: target.y,
+    });
+
+    const after = (await grip.boundingBox())!;
+    const closeAfter = (await close.boundingBox())!;
+    expect(after.x).toBe(previewGrip.x);
+    expect(after.y).toBe(previewGrip.y);
+    expect(closeAfter.x).toBeLessThan(after.x);
+  });
+
+  test("the chosen corner follows content to another pane", async ({
+    page,
+  }) => {
+    await authenticate(page);
+    await newTerminal(page);
+    await newTerminal(page);
+    const panes = await twoPanes(page);
+    const source = panes.nth(0);
+    const target = panes.nth(1);
+
+    await source.hover({ force: true });
+    const sourceGrip = source.getByRole("button", { name: GRIP });
+    await expect(sourceGrip).toBeVisible();
+    // top-right → bottom-right → bottom-left
+    await sourceGrip.click();
+    await sourceGrip.click();
+
+    const dt = await page.evaluateHandle(() => new DataTransfer());
+    await sourceGrip.dispatchEvent("dragstart", { dataTransfer: dt });
+    await target.dispatchEvent("dragover", { dataTransfer: dt });
+    await target.dispatchEvent("drop", { dataTransfer: dt });
+    await page.waitForTimeout(300);
+
+    await target.hover({ force: true });
+    const movedGrip = target.getByRole("button", { name: GRIP });
+    const movedClose = target.getByRole("button", {
+      name: "Close",
+      exact: true,
+    });
+    await expect(movedGrip).toBeVisible();
+    const paneBox = (await target.boundingBox())!;
+    const gripBox = (await movedGrip.boundingBox())!;
+    const closeBox = (await movedClose.boundingBox())!;
+    expect(gripBox.y).toBeGreaterThan(paneBox.y + paneBox.height / 2);
+    expect(closeBox.x).toBeLessThan(gripBox.x);
   });
 
   test("dragging the grip to the dock parks the terminal", async ({ page }) => {
