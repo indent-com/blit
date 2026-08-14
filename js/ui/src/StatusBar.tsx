@@ -17,6 +17,7 @@ import { formatBw } from "./createMetrics";
 import { primaryFontFamily } from "./createFontLoader";
 import type { Metrics, RenderSampleRing, NetSampleRing } from "./createMetrics";
 import {
+  mergeStyle,
   sessionName,
   sessionPrefix,
   surfaceName,
@@ -142,6 +143,8 @@ export function StatusBar(props: {
   onToggleKeyboard?: () => void;
   /** Workspace-wide slow operations, newest last. */
   activities: readonly BlitActivity[];
+  /** Compositor tray/notification controls, rendered by the full shell. */
+  desktopChrome?: (compact: boolean) => JSX.Element;
 }) {
   const theme = () => themeFor(props.palette);
   const scale = () => uiScale(props.fontSize);
@@ -522,6 +525,7 @@ export function StatusBar(props: {
           position: "relative",
         }}
       >
+        {props.desktopChrome?.(compact())}
         <Show
           when={compact()}
           fallback={
@@ -580,8 +584,7 @@ export function StatusBar(props: {
                       tool.activate();
                       setMenuOpen(false);
                     }}
-                    style={{
-                      ...ui.btn,
+                    style={mergeStyle(ui.btn, {
                       display: "flex",
                       "align-items": "center",
                       gap: `${scale().gap}px`,
@@ -590,7 +593,7 @@ export function StatusBar(props: {
                       "white-space": "nowrap",
                       "text-align": "left",
                       opacity: 1,
-                    }}
+                    })}
                   >
                     <span
                       style={{

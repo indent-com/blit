@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use crate::fs::handshake;
-use crate::transport::{Transport, read_message, write_frame};
+use crate::transport::{FragmentReassembly, Transport, read_message, write_frame};
 use blit_remote::S2C_QUIT;
 use blit_remote::lsp::{
     FEATURE_LSP, LSP_CLOSED_CLIENT_REQUEST, LSP_DIAG_FULL, LSP_OPEN_DIAGS, LSP_OPEN_WATCH,
@@ -133,7 +133,7 @@ fn severity_text(severity: u8) -> &'static str {
 struct Session<R, W> {
     reader: R,
     writer: W,
-    fragment_buf: Vec<u8>,
+    fragment_buf: FragmentReassembly,
     lsp_id: u16,
 }
 
@@ -144,7 +144,7 @@ async fn open_lsp<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     path: &str,
     flags: u8,
 ) -> Result<(Session<R, W>, String), String> {
-    let mut fragment_buf: Vec<u8> = Vec::new();
+    let mut fragment_buf = FragmentReassembly::default();
     let features = handshake(&mut reader, &mut fragment_buf).await?;
     if features & FEATURE_LSP == 0 {
         return Err(
@@ -974,7 +974,7 @@ pub async fn cmd_wait(
 /// `blit lsp list` — every live backend, daemon-wide.
 pub async fn cmd_list(transport: Transport, json: bool) -> Result<i32, String> {
     let (mut reader, mut writer) = transport.split();
-    let mut fragment_buf: Vec<u8> = Vec::new();
+    let mut fragment_buf = FragmentReassembly::default();
     let features = handshake(&mut reader, &mut fragment_buf).await?;
     if features & FEATURE_LSP == 0 {
         return Err(
@@ -1055,7 +1055,7 @@ pub async fn cmd_list(transport: Transport, json: bool) -> Result<i32, String> {
 /// `blit lsp stop` — shut one backend down by ref.
 pub async fn cmd_stop(transport: Transport, server_ref: u16) -> Result<i32, String> {
     let (mut reader, mut writer) = transport.split();
-    let mut fragment_buf: Vec<u8> = Vec::new();
+    let mut fragment_buf = FragmentReassembly::default();
     let features = handshake(&mut reader, &mut fragment_buf).await?;
     if features & FEATURE_LSP == 0 {
         return Err(

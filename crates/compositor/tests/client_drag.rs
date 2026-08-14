@@ -25,7 +25,9 @@ use wayland_client::protocol::{
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, delegate_noop};
 
-use blit_compositor::{CompositorCommand, CompositorEvent, CompositorHandle, spawn_compositor};
+use blit_compositor::{
+    CompositorCommand, CompositorEvent, CompositorHandle, spawn_compositor_without_renderer,
+};
 
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use wayland_protocols::xdg::toplevel_drag::v1::client::{
@@ -285,7 +287,7 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let handle = spawn_compositor(false, Arc::new(|| {}), "");
+        let handle = spawn_compositor_without_renderer(false, Arc::new(|| {}));
         Self {
             handle: Some(handle),
         }

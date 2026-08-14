@@ -1,5 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 
+use crate::extension::{ExtensionCommand, RunArgs};
+
 /// Text for `blit --license`.  Mentions exactly the third-party components
 /// whose licenses affect distribution of *this* binary — nothing more.
 pub fn license_text() -> String {
@@ -47,6 +49,13 @@ pub struct Cli {
     #[command(flatten)]
     pub connect: ConnectOpts,
 
+    /// Emit NDJSON for an extension-provided `@name` command
+    ///
+    /// This root option must precede `@name`. A `--json` after the namespace
+    /// is passed verbatim to the extension command.
+    #[arg(long = "json")]
+    pub advertised_command_json: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -63,6 +72,240 @@ pub struct ConnectOpts {
     pub hub: String,
 }
 
+/// Startup-only extension and native-channel deployment policy.
+#[derive(Args, Clone, Debug, Default)]
+pub struct ServerDeploymentOpts {
+    /// Disable Wasmi extensions (equivalent to BLIT_EXT=0)
+    #[arg(long)]
+    no_extensions: bool,
+
+    /// Disable native channels (equivalent to BLIT_CHANNEL=0)
+    #[arg(long)]
+    no_channels: bool,
+
+    /// Maximum concurrent running extension attempts
+    #[arg(long, value_name = "N")]
+    ext_max_running: Option<u64>,
+
+    /// Maximum persistent extension definitions
+    #[arg(long, value_name = "N")]
+    ext_max_persistent: Option<u64>,
+
+    /// Maximum active transient extension supervisors
+    #[arg(long, value_name = "N")]
+    ext_max_transient: Option<u64>,
+
+    /// Maximum followed extensions per client
+    #[arg(long, value_name = "N")]
+    ext_follow_max_per_client: Option<u64>,
+
+    /// Maximum extension follower cursors server-wide
+    #[arg(long, value_name = "N")]
+    ext_follow_max: Option<u64>,
+
+    /// Maximum retained extension argument bytes
+    #[arg(long, value_name = "BYTES")]
+    ext_argument_store_max: Option<u64>,
+
+    /// Maximum raw Wasm module bytes (hard ceiling: 64 MiB)
+    #[arg(long, value_name = "BYTES")]
+    ext_module_max: Option<u64>,
+
+    /// Maximum extension object-cache bytes
+    #[arg(long, value_name = "BYTES")]
+    ext_object_cache_max: Option<u64>,
+
+    /// Maximum extension object-cache entries
+    #[arg(long, value_name = "N")]
+    ext_object_cache_max_entries: Option<u64>,
+
+    /// Maximum active uploads per client
+    #[arg(long, value_name = "N")]
+    ext_upload_max_per_client: Option<u64>,
+
+    /// Maximum active extension uploads server-wide
+    #[arg(long, value_name = "N")]
+    ext_upload_max_active: Option<u64>,
+
+    /// Active-upload idle timeout in seconds
+    #[arg(long, value_name = "SECONDS")]
+    ext_upload_timeout: Option<u64>,
+
+    /// Pending extension-creation timeout in seconds
+    #[arg(long, value_name = "SECONDS")]
+    ext_pending_timeout: Option<u64>,
+
+    /// Maximum concurrent module validations
+    #[arg(long, value_name = "N")]
+    ext_max_validating: Option<u64>,
+
+    /// Maximum Wasm linear-memory bytes per attempt
+    #[arg(long, value_name = "BYTES")]
+    ext_memory_max: Option<u64>,
+
+    /// Queued extension egress byte ceiling
+    #[arg(long, value_name = "BYTES")]
+    ext_outbox_max: Option<u64>,
+
+    /// Maximum queued messages per extension endpoint
+    #[arg(long, value_name = "N")]
+    ext_outbox_messages_max: Option<u64>,
+
+    /// Full extension-output no-progress timeout in seconds
+    #[arg(long, value_name = "SECONDS")]
+    ext_outbox_timeout: Option<u64>,
+
+    /// Maximum active tracked jobs per extension endpoint
+    #[arg(long, value_name = "N")]
+    ext_job_max_per_client: Option<u64>,
+
+    /// Maximum active tracked extension jobs server-wide
+    #[arg(long, value_name = "N")]
+    ext_job_max: Option<u64>,
+
+    /// Maximum pending tracked jobs per extension endpoint
+    #[arg(long, value_name = "N")]
+    ext_job_pending_max_per_client: Option<u64>,
+
+    /// Maximum pending tracked extension jobs server-wide
+    #[arg(long, value_name = "N")]
+    ext_job_pending_max: Option<u64>,
+
+    /// Maximum tracked-job request bytes per extension endpoint
+    #[arg(long, value_name = "BYTES")]
+    ext_job_bytes_max_per_client: Option<u64>,
+
+    /// Maximum tracked-job request bytes server-wide
+    #[arg(long, value_name = "BYTES")]
+    ext_job_bytes_max: Option<u64>,
+
+    /// Maximum retained extension output bytes server-wide
+    #[arg(long, value_name = "BYTES")]
+    ext_output_retain_max: Option<u64>,
+
+    /// Terminal replay lease for transient extensions, in seconds
+    #[arg(long, value_name = "SECONDS")]
+    ext_terminal_retain: Option<u64>,
+
+    /// Maximum command-record and discovery-snapshot bytes
+    #[arg(long, value_name = "BYTES")]
+    ext_command_store_max: Option<u64>,
+
+    /// Maximum active command-discovery snapshots
+    #[arg(long, value_name = "N")]
+    ext_command_snapshot_max: Option<u64>,
+
+    /// Maximum aggregate Wasm table elements per attempt
+    #[arg(long, value_name = "N")]
+    ext_table_elements_max: Option<u64>,
+
+    /// Maximum Wasmi value-stack bytes per attempt
+    #[arg(long, value_name = "BYTES")]
+    ext_value_stack_max: Option<u64>,
+
+    /// Maximum Wasmi call depth per attempt
+    #[arg(long, value_name = "N")]
+    ext_call_depth_max: Option<u64>,
+
+    /// Native stack bytes per extension thread
+    #[arg(long, value_name = "BYTES")]
+    ext_stack_size: Option<u64>,
+
+    /// Fuel replenished per extension driver slice
+    #[arg(long, value_name = "N")]
+    ext_fuel_slice: Option<u64>,
+
+    /// Maximum channel listeners per client
+    #[arg(long, value_name = "N")]
+    channel_max_listen_per_client: Option<u64>,
+
+    /// Maximum channel listeners server-wide
+    #[arg(long, value_name = "N")]
+    channel_max_listeners: Option<u64>,
+
+    /// Maximum connected channel handles per client
+    #[arg(long, value_name = "N")]
+    channel_max_per_client: Option<u64>,
+
+    /// Maximum connected channel pairs server-wide
+    #[arg(long, value_name = "N")]
+    channel_max_connected: Option<u64>,
+
+    /// Maximum reserved channel-window bytes server-wide
+    #[arg(long, value_name = "BYTES")]
+    channel_buffer_max: Option<u64>,
+}
+
+impl ServerDeploymentOpts {
+    pub fn into_overrides(self) -> Result<blit_server::DeploymentOverrides, String> {
+        let mut overrides = blit_server::DeploymentOverrides::default();
+        if self.no_extensions {
+            overrides.disable_extensions();
+        }
+        if self.no_channels {
+            overrides.disable_channels();
+        }
+        macro_rules! setting {
+            ($field:ident, $name:literal) => {
+                if let Some(value) = self.$field {
+                    overrides.set($name, value)?;
+                }
+            };
+        }
+        setting!(ext_max_running, "BLIT_EXT_MAX_RUNNING");
+        setting!(ext_max_persistent, "BLIT_EXT_MAX_PERSISTENT");
+        setting!(ext_max_transient, "BLIT_EXT_MAX_TRANSIENT");
+        setting!(ext_follow_max_per_client, "BLIT_EXT_FOLLOW_MAX_PER_CLIENT");
+        setting!(ext_follow_max, "BLIT_EXT_FOLLOW_MAX");
+        setting!(ext_argument_store_max, "BLIT_EXT_ARGUMENT_STORE_MAX");
+        setting!(ext_module_max, "BLIT_EXT_MODULE_MAX");
+        setting!(ext_object_cache_max, "BLIT_EXT_OBJECT_CACHE_MAX");
+        setting!(
+            ext_object_cache_max_entries,
+            "BLIT_EXT_OBJECT_CACHE_MAX_ENTRIES"
+        );
+        setting!(ext_upload_max_per_client, "BLIT_EXT_UPLOAD_MAX_PER_CLIENT");
+        setting!(ext_upload_max_active, "BLIT_EXT_UPLOAD_MAX_ACTIVE");
+        setting!(ext_upload_timeout, "BLIT_EXT_UPLOAD_TIMEOUT");
+        setting!(ext_pending_timeout, "BLIT_EXT_PENDING_TIMEOUT");
+        setting!(ext_max_validating, "BLIT_EXT_MAX_VALIDATING");
+        setting!(ext_memory_max, "BLIT_EXT_MEMORY_MAX");
+        setting!(ext_outbox_max, "BLIT_EXT_OUTBOX_MAX");
+        setting!(ext_outbox_messages_max, "BLIT_EXT_OUTBOX_MESSAGES_MAX");
+        setting!(ext_outbox_timeout, "BLIT_EXT_OUTBOX_TIMEOUT");
+        setting!(ext_job_max_per_client, "BLIT_EXT_JOB_MAX_PER_CLIENT");
+        setting!(ext_job_max, "BLIT_EXT_JOB_MAX");
+        setting!(
+            ext_job_pending_max_per_client,
+            "BLIT_EXT_JOB_PENDING_MAX_PER_CLIENT"
+        );
+        setting!(ext_job_pending_max, "BLIT_EXT_JOB_PENDING_MAX");
+        setting!(
+            ext_job_bytes_max_per_client,
+            "BLIT_EXT_JOB_BYTES_MAX_PER_CLIENT"
+        );
+        setting!(ext_job_bytes_max, "BLIT_EXT_JOB_BYTES_MAX");
+        setting!(ext_output_retain_max, "BLIT_EXT_OUTPUT_RETAIN_MAX");
+        setting!(ext_terminal_retain, "BLIT_EXT_TERMINAL_RETAIN");
+        setting!(ext_command_store_max, "BLIT_EXT_COMMAND_STORE_MAX");
+        setting!(ext_command_snapshot_max, "BLIT_EXT_COMMAND_SNAPSHOT_MAX");
+        setting!(ext_table_elements_max, "BLIT_EXT_TABLE_ELEMENTS_MAX");
+        setting!(ext_value_stack_max, "BLIT_EXT_VALUE_STACK_MAX");
+        setting!(ext_call_depth_max, "BLIT_EXT_CALL_DEPTH_MAX");
+        setting!(ext_stack_size, "BLIT_EXT_STACK_SIZE");
+        setting!(ext_fuel_slice, "BLIT_EXT_FUEL_SLICE");
+        setting!(
+            channel_max_listen_per_client,
+            "BLIT_CHANNEL_MAX_LISTEN_PER_CLIENT"
+        );
+        setting!(channel_max_listeners, "BLIT_CHANNEL_MAX_LISTENERS");
+        setting!(channel_max_per_client, "BLIT_CHANNEL_MAX_PER_CLIENT");
+        setting!(channel_max_connected, "BLIT_CHANNEL_MAX_CONNECTED");
+        setting!(channel_buffer_max, "BLIT_CHANNEL_BUFFER_MAX");
+        Ok(overrides)
+    }
+}
+
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 pub enum Command {
@@ -71,6 +314,12 @@ pub enum Command {
     Terminal {
         #[command(subcommand)]
         command: Option<TerminalCommand>,
+    },
+
+    /// List and disconnect clients connected to the server
+    Client {
+        #[command(subcommand)]
+        command: Option<ClientCommand>,
     },
 
     /// Manage compositor surfaces
@@ -119,6 +368,16 @@ pub enum Command {
         #[command(subcommand)]
         command: LspCommand,
     },
+
+    /// Run and manage Wasmi extensions
+    #[command(name = "ext", alias = "extension")]
+    Extension {
+        #[command(subcommand)]
+        command: ExtensionCommand,
+    },
+
+    /// Execute a Wasmi extension (`blit ext run` alias)
+    Run(RunArgs),
 
     /// Manage named remotes in blit.remotes
     ///
@@ -295,9 +554,21 @@ pub enum Command {
         #[arg(long)]
         allow_forward_insecure: bool,
 
+        /// Permit durable Wasmi extensions and restore desired definitions
+        /// (or set BLIT_ALLOW_EXT_PERSIST=1)
+        #[arg(long)]
+        allow_persistent_extensions: bool,
+
+        #[command(flatten)]
+        deployment: ServerDeploymentOpts,
+
         /// Enable verbose logging
         #[arg(long, short)]
         verbose: bool,
+
+        /// Disable native non-PTY child processes (or set BLIT_PROCESS=0)
+        #[arg(long)]
+        no_processes: bool,
     },
 
     /// Shut down the blit server
@@ -357,6 +628,14 @@ pub enum Command {
     /// Run the connection-pool proxy daemon (internal; not for direct use)
     #[command(hide = true)]
     ProxyDaemon,
+
+    /// Invoke a live extension-provided command namespace
+    ///
+    /// Generated shell completions supplement Blit's static grammar through a
+    /// hidden, read-only command-directory query. This tested external-
+    /// subcommand boundary still captures every token after `@name` verbatim.
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 // ── Terminal subcommands ─────────────────────────────────────────────────
@@ -843,6 +1122,25 @@ pub enum TerminalCommand {
         /// Maximum duration in seconds (0 = unlimited)
         #[arg(short, long, default_value_t = 0.0)]
         duration: f64,
+    },
+}
+
+// ── Client subcommands ───────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum ClientCommand {
+    /// List other connected clients and subscriptions as TSV
+    #[command(alias = "ls")]
+    List,
+
+    /// Disconnect another client
+    Kick {
+        /// Client ID from `blit client list`
+        id: u64,
+
+        /// Reason shown to the disconnected client
+        #[arg(short, long)]
+        reason: Option<String>,
     },
 }
 
@@ -1947,4 +2245,86 @@ pub enum RemoteCommand {
         /// Pass an empty string or "local" to reset to local.
         target: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn server_help_advertises_every_extension_and_channel_setting() {
+        let mut server = Cli::command()
+            .find_subcommand("server")
+            .expect("server subcommand")
+            .clone();
+        let help = server.render_long_help().to_string();
+        for flag in [
+            "--no-extensions",
+            "--no-channels",
+            "--ext-max-running",
+            "--ext-max-persistent",
+            "--ext-max-transient",
+            "--ext-follow-max-per-client",
+            "--ext-follow-max",
+            "--ext-argument-store-max",
+            "--ext-module-max",
+            "--ext-object-cache-max",
+            "--ext-object-cache-max-entries",
+            "--ext-upload-max-per-client",
+            "--ext-upload-max-active",
+            "--ext-upload-timeout",
+            "--ext-pending-timeout",
+            "--ext-max-validating",
+            "--ext-memory-max",
+            "--ext-outbox-max",
+            "--ext-outbox-messages-max",
+            "--ext-outbox-timeout",
+            "--ext-job-max-per-client",
+            "--ext-job-max",
+            "--ext-job-pending-max-per-client",
+            "--ext-job-pending-max",
+            "--ext-job-bytes-max-per-client",
+            "--ext-job-bytes-max",
+            "--ext-output-retain-max",
+            "--ext-terminal-retain",
+            "--ext-command-store-max",
+            "--ext-command-snapshot-max",
+            "--ext-table-elements-max",
+            "--ext-value-stack-max",
+            "--ext-call-depth-max",
+            "--ext-stack-size",
+            "--ext-fuel-slice",
+            "--channel-max-listen-per-client",
+            "--channel-max-listeners",
+            "--channel-max-per-client",
+            "--channel-max-connected",
+            "--channel-buffer-max",
+        ] {
+            assert!(help.contains(flag), "server help is missing {flag}");
+        }
+    }
+
+    #[test]
+    fn server_accepts_both_family_flags_and_capacity_flags() {
+        let cli = Cli::try_parse_from([
+            "blit",
+            "server",
+            "--no-extensions",
+            "--no-channels",
+            "--ext-max-running",
+            "4",
+            "--ext-object-cache-max",
+            "2147483648",
+            "--channel-max-connected",
+            "64",
+            "--channel-buffer-max",
+            "134217728",
+        ])
+        .unwrap();
+        let Command::Server { deployment, .. } = cli.command else {
+            panic!("expected server command");
+        };
+        deployment.into_overrides().unwrap();
+    }
 }

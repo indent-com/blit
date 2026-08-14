@@ -206,8 +206,7 @@ pub async fn run_fd_channel(channel_fd: RawFd, state: crate::AppState) {
                 let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(client_fd) };
                 std_stream.set_nonblocking(true).unwrap();
                 let stream = tokio::net::UnixStream::from_std(std_stream).unwrap();
-                let state = state.clone();
-                tokio::spawn(crate::handle_client(stream, state));
+                crate::spawn_network_client(stream, state.clone());
                 guard.retain_ready();
             }
             RecvFdResult::WouldBlock => {

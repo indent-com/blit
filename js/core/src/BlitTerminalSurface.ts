@@ -361,6 +361,11 @@ export class BlitTerminalSurface {
    *  so insertCompositionText updates can be streamed letter-by-letter instead
    *  of waiting for compositionend and dumping the whole word at once. */
   private _androidCompositionValue = "";
+  /** True from compositionstart through compositionend. KeyboardEvent and
+   *  InputEvent `isComposing` are not reliable on every browser (notably for
+   *  the key that completes a macOS dead-key composition), so the DOM
+   *  lifecycle is the authority. */
+  private _compositionActive = false;
   /** True when the hidden textarea is kept seeded with filler so iOS soft
    *  keyboards auto-repeat a held Backspace (see IOS_PAD). */
   private _iosPad = false;
@@ -2128,7 +2133,7 @@ export class BlitTerminalSurface {
     this.boundKeyDown = (e: KeyboardEvent) => {
       if (e.defaultPrevented) return;
       if (this._sessionId === null || this.status !== "connected") return;
-      if (e.isComposing) return;
+      if (this._compositionActive || e.isComposing || e.keyCode === 229) return;
       if (e.key === "Dead") return;
 
       // Scroll-key shortcuts run in all modes, including read-only.
@@ -2301,10 +2306,12 @@ export class BlitTerminalSurface {
     }
 
     this.boundCompositionStart = () => {
+      this._compositionActive = true;
       this._androidCompositionValue = "";
     };
 
     this.boundCompositionEnd = (e: CompositionEvent) => {
+      this._compositionActive = false;
       if (isAndroid()) {
         // On Android we stream insertCompositionText updates letter-by-letter
         // while the composition is active, so the final word has already been
@@ -2324,7 +2331,7 @@ export class BlitTerminalSurface {
 
     this.boundInput = (e: Event) => {
       const inputEvent = e as InputEvent;
-      if (inputEvent.isComposing) {
+      if (this._compositionActive || inputEvent.isComposing) {
         if (isAndroid()) {
           this.handleAndroidCompositionInput(inputEvent);
           return;
@@ -2351,6 +2358,13 @@ export class BlitTerminalSurface {
         }
         if (input.value.length <= 4) this.seedIosPad();
         else this.scheduleIosRepad();
+        return;
+      }
+      // Some engines emit one last non-composing insertCompositionText after
+      // compositionend. The compositionend handler already committed the
+      // text; forwarding the textarea value here would type it twice.
+      if (inputEvent.inputType === "insertCompositionText") {
+        this.resetCaptureField();
         return;
       }
       // iPadOS (and desktop spellcheck) ignore autocorrect="off" on this
@@ -2453,6 +2467,7 @@ export class BlitTerminalSurface {
       this._ctrlVFallbackTimer = null;
     }
     this._ctrlVPastePending = false;
+    this._compositionActive = false;
     if (this._iosRepadTimer !== null) {
       clearTimeout(this._iosRepadTimer);
       this._iosRepadTimer = null;

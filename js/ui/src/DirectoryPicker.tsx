@@ -13,7 +13,7 @@ import {
   FS_ENTRY_SYMLINK,
 } from "@blit-sh/core";
 import type { Theme, UIScale } from "./theme";
-import { scrollbarStyle, ui } from "./theme";
+import { mergeStyle, scrollbarStyle, ui } from "./theme";
 
 function parentOf(path: string): string {
   const s = path.replace(/\/+$/, "");
@@ -239,12 +239,11 @@ export function DirectoryPicker(props: {
           Cancel
         </button>
         <button
-          style={{
-            ...ui.btn,
+          style={mergeStyle(ui.btn, {
             border: `1px solid ${props.theme.accent}`,
             "background-color": props.theme.accent,
             color: "#fff",
-          }}
+          })}
           onClick={() => props.onPick(cwd())}
         >
           Use this directory

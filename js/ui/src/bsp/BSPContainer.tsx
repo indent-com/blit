@@ -56,7 +56,7 @@ import { resolveTab, isPtyRef } from "../ide/tabRegistry";
 import { ResizeHandle } from "./ResizeHandle";
 import { BSPTreeContext, useBSPTree, type BSPTreeCtx } from "./treeContext";
 import type { Theme } from "../theme";
-import { themeFor, ui, uiScale, z } from "../theme";
+import { mergeStyle, themeFor, ui, uiScale, z } from "../theme";
 import { t, tp } from "../i18n";
 import { shellCapabilities } from "../shellCapabilities";
 import type { SurfaceTouchMode, SurfaceZoomMode } from "../storage";
@@ -127,7 +127,10 @@ function replaceNodeAtPath(
 
 export function BSPContainer(props: {
   layout: BSPLayout;
-  onLayoutChange: (layout: BSPLayout | null) => void;
+  onLayoutChange: (
+    layout: BSPLayout | null,
+    options?: { debounceHistory?: boolean },
+  ) => void;
   connectionId: string;
   connectionLabels?: Map<string, string>;
   palette: TerminalPalette;
@@ -879,14 +882,17 @@ export function BSPContainer(props: {
     }
   });
 
-  function updateRoot(next: BSPNode) {
+  function updateRoot(next: BSPNode, debounceHistory = false) {
     setRoot(next);
     const dsl = serializeDSL(next);
     const updated: BSPLayout = { ...props.layout, root: next, dsl };
     lastLayout = updated;
     lastDsl = dsl;
     saveActiveLayout(updated);
-    props.onLayoutChange(updated);
+    props.onLayoutChange(
+      updated,
+      debounceHistory ? { debounceHistory: true } : undefined,
+    );
   }
 
   function handleResize(
@@ -907,7 +913,7 @@ export function BSPContainer(props: {
         })),
       };
     };
-    updateRoot(replaceNode(root()));
+    updateRoot(replaceNode(root()), true);
   }
 
   createEffect(() => {
@@ -1593,11 +1599,10 @@ function LeafPane(props: {
                     onClick={() =>
                       void workspace.closeSession(props.sessionId!)
                     }
-                    style={{
-                      ...ui.btn,
+                    style={mergeStyle(ui.btn, {
                       "font-size": `${scale().sm}px`,
                       opacity: 0.5,
-                    }}
+                    })}
                   >
                     {t("bsp.close")} <kbd style={ui.kbd}>Esc</kbd>
                   </button>
@@ -1830,8 +1835,7 @@ export function EmptyPane(props: {
               <For each={acSuggestions()}>
                 {(item, i) => (
                   <button
-                    style={{
-                      ...ui.btn,
+                    style={mergeStyle(ui.btn, {
                       padding: `${scale().controlY}px ${scale().controlX}px`,
                       "text-align": "left",
                       "font-size": `${scale().sm}px`,
@@ -1840,7 +1844,7 @@ export function EmptyPane(props: {
                       color: props.theme.fg,
                       cursor: "pointer",
                       opacity: 1,
-                    }}
+                    })}
                     onMouseEnter={() => setAcIdx(i())}
                     onMouseLeave={() => setAcIdx(-1)}
                     onClick={(e) => {
@@ -1910,8 +1914,7 @@ export function EmptyPane(props: {
                 ? "bsp.commandPlaceholder"
                 : "bsp.commandPlaceholderNoRemotes",
             )}
-            style={{
-              ...ui.input,
+            style={mergeStyle(ui.input, {
               display: "block",
               background: "transparent",
               border: "none",
@@ -1921,7 +1924,7 @@ export function EmptyPane(props: {
               "font-family": "inherit",
               width: "100%",
               "box-sizing": "border-box",
-            }}
+            })}
           />
         </div>
       </Show>

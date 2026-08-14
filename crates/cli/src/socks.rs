@@ -559,7 +559,7 @@ mod tests {
     struct Harness {
         proxy: std::net::SocketAddr,
         server: tokio::io::DuplexStream,
-        pending: Vec<u8>,
+        pending: crate::transport::FragmentReassembly,
     }
 
     impl Harness {
@@ -581,7 +581,7 @@ mod tests {
             Harness {
                 proxy,
                 server,
-                pending: Vec::new(),
+                pending: crate::transport::FragmentReassembly::default(),
             }
         }
 

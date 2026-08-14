@@ -257,7 +257,27 @@ export const layout: Record<string, JSX.CSSProperties> = {
 };
 
 // Reusable component styles.
-export const ui: Record<string, JSX.CSSProperties> = {
+/** Merges style objects in plain JS, before they reach a JSX `style` prop.
+ *
+ *  Solid's compiler splits a static style object into per-property assignments
+ *  and applies a spread in the same object *after* them, so
+ *  `style={{ ...ui.btn, padding: 0 }}` silently keeps ui.btn's padding. Only
+ *  dynamic values -- a template literal, a ternary -- survive, because those
+ *  compile to effects that run later, which makes whether an override lands
+ *  depend on whether it happens to be written as a literal. Merging here keeps
+ *  ordinary JS semantics: later arguments win, literal or not.
+ *
+ *  Falsy arguments are skipped, so a conditional base can be passed inline. */
+export function mergeStyle(
+  ...styles: (JSX.CSSProperties | false | null | undefined)[]
+): JSX.CSSProperties {
+  return Object.assign({}, ...styles.filter(Boolean));
+}
+
+/** `satisfies` rather than an annotation, so the keys stay exact: an index
+ *  signature would make a typo like `ui.btnn` resolve to undefined, which
+ *  mergeStyle then skips as falsy and drops the base without a word. */
+export const ui = {
   btn: {
     background: "none",
     border: "none",
@@ -297,7 +317,7 @@ export const ui: Record<string, JSX.CSSProperties> = {
     border: "1px solid rgba(128,128,128,0.4)",
     "white-space": "nowrap",
   },
-};
+} satisfies Record<string, JSX.CSSProperties>;
 
 export interface OverlayChromeStyles {
   overlay: JSX.CSSProperties;

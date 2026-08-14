@@ -1,6 +1,6 @@
 [package]
 name = "blit-cli"
-version = "0.51.1"
+version = "0.52.0"
 edition.workspace = true
 description = "blit terminal client"
 license.workspace = true
@@ -45,6 +45,7 @@ url = "2"
 rustls-native-certs = "0.8"
 ring = "0.17"
 mimalloc = "0.1"
+blake3 = { version = "1", default-features = false, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -363,6 +363,10 @@ mod stub {
             surface_id: u16,
             presentation_at: std::time::Instant,
         },
+        SetScreenCastActive {
+            surface_id: u16,
+            active: bool,
+        },
         /// Re-composite a toplevel from its current committed state and
         /// republish the pixels, without waiting for the client to commit.
         /// An idle Wayland app volunteers nothing, so when the server's
@@ -491,6 +495,7 @@ mod stub {
         pub vulkan_video_encode: bool,
         /// Whether the compositor's Vulkan renderer supports Vulkan Video AV1 encode.
         pub vulkan_video_encode_av1: bool,
+        foreign_exports: Arc<std::sync::RwLock<std::collections::HashMap<String, u16>>>,
         thread: std::thread::JoinHandle<()>,
         #[allow(dead_code)]
         shutdown: Arc<AtomicBool>,
@@ -505,6 +510,11 @@ mod stub {
 
         pub fn take_frame_clock_requests(&self) -> u32 {
             0
+        }
+
+        pub fn resolve_foreign_parent(&self, parent: &str) -> Option<u16> {
+            let handle = parent.strip_prefix("wayland:")?;
+            self.foreign_exports.read().ok()?.get(handle).copied()
         }
 
         /// Stop the compositor and wait for it to finish tearing down.
@@ -531,7 +541,16 @@ mod stub {
             shutdown,
             vulkan_video_encode: false,
             vulkan_video_encode_av1: false,
+            foreign_exports: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn spawn_compositor_without_renderer(
+        verbose: bool,
+        event_notify: Arc<dyn Fn() + Send + Sync>,
+    ) -> CompositorHandle {
+        spawn_compositor(verbose, event_notify, "")
     }
 }
 

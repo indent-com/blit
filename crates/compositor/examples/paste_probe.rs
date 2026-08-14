@@ -162,10 +162,9 @@ impl Dispatch<wl_seat::WlSeat, ()> for App {
         if let wl_seat::Event::Capabilities {
             capabilities: wayland_client::WEnum::Value(caps),
         } = event
+            && caps.contains(wl_seat::Capability::Keyboard)
         {
-            if caps.contains(wl_seat::Capability::Keyboard) {
-                seat.get_keyboard(qh, ());
-            }
+            seat.get_keyboard(qh, ());
         }
     }
 }
@@ -455,37 +454,34 @@ fn main() {
         }
 
         let _ = conn.flush();
-        match queue.prepare_read() {
-            Some(guard) => {
-                let fd = guard.connection_fd();
-                let mut pfds = [
-                    libc::pollfd {
-                        fd: fd.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                    libc::pollfd {
-                        fd: pipe_r,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                ];
-                let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
-                if n < 0 {
-                    drop(guard);
-                    continue;
-                }
-                if pfds[0].revents & libc::POLLIN != 0 {
-                    let _ = guard.read();
-                } else {
-                    drop(guard);
-                }
-                if pfds[1].revents & libc::POLLIN != 0 {
-                    let mut buf = [0u8; 64];
-                    unsafe { libc::read(pipe_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-                }
+        if let Some(guard) = queue.prepare_read() {
+            let fd = guard.connection_fd();
+            let mut pfds = [
+                libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: pipe_r,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+            if n < 0 {
+                drop(guard);
+                continue;
             }
-            None => {}
+            if pfds[0].revents & libc::POLLIN != 0 {
+                let _ = guard.read();
+            } else {
+                drop(guard);
+            }
+            if pfds[1].revents & libc::POLLIN != 0 {
+                let mut buf = [0u8; 64];
+                unsafe { libc::read(pipe_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            }
         }
         queue.dispatch_pending(&mut app).expect("dispatch");
     }

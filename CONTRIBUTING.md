@@ -177,36 +177,41 @@ DEV_INSTANCE=1 ./bin/dev   # second stack on 10005-10007
 
 Most Rust crates are one or two source files. The CLI crate (`blit-cli`) is split into several files and `blit-webrtc-forwarder` uses a multi-file module tree.
 
-| File                                     | Role                                                                                                                  |
-| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `crates/server/src/lib.rs`               | PTY host: fork/exec, frame scheduling, protocol handlers, congestion control, compositor integration                  |
-| `crates/server/src/surface_encoder.rs`   | Surface video encoding: AV1 (rav1e), H.264 (openh264/x264, VA-API, NVENC)                                             |
-| `crates/server/src/vaapi_encode.rs`      | Direct VA-API H.264 and AV1 encoding (dlopen, no FFmpeg)                                                              |
-| `crates/server/src/nvenc_encode.rs`      | Direct NVENC H.264 and AV1 encoding via CUDA + NVENC SDK (dlopen, no FFmpeg)                                          |
-| `crates/server/src/gpu_libs.rs`          | Runtime dlopen loaders for libva, NVENC, GBM shared across encoders                                                   |
-| `crates/server/src/audio.rs`             | Audio capture pipeline: PipeWire daemon spawn, in-process capture via `audio_pw`, Opus encoding                       |
-| `crates/server/src/desktop_bus.rs`       | Compositor-scoped D-Bus session for desktop services and portals                                                      |
-| `crates/server/src/audio_pw.rs`          | In-process libpipewire-0.3 capture client (runtime `dlopen`), replaces the former pw-cat subprocess                   |
-| `crates/remote/src/lib.rs`               | Wire protocol: constants, message builders/parsers, `FrameState`/`TerminalState`, cell encoding, text extraction      |
-| `crates/compositor/src/imp.rs`           | Experimental headless Wayland compositor (wayland-server): surface tracking, input forwarding, protocol delegates     |
-| `crates/compositor/src/render.rs`        | Surface compositing: `SurfaceMeta` and layer collection (`collect_gpu_layers`) for the GPU renderer                   |
-| `crates/compositor/src/vulkan_render.rs` | Vulkan GPU compositor: dlopen libvulkan.so via ash, DMA-BUF import, multi-layer compositing                           |
-| `crates/webrtc-forwarder/src/`           | WebRTC forwarder (6 files: signaling, ICE, TURN, peer management)                                                     |
-| `crates/cli/src/agent.rs`                | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close`, `surfaces`, `capture`, `click`, `key`, `type` |
-| `crates/cli/src/main.rs`                 | Dispatch, embedded server/gateway                                                                                     |
-| `crates/cli/src/cli.rs`                  | Clap struct definitions                                                                                               |
-| `crates/cli/src/interactive.rs`          | Browser mode                                                                                                          |
-| `crates/cli/src/transport.rs`            | Transport abstraction (Unix/TCP/SSH/WebRTC)                                                                           |
-| `crates/cli/src/relay.rs`                | Client half of the `NET_*` relay: stream ids, demultiplexing, the byte pump shared by `forward` and `socks`           |
-| `crates/cli/src/forward.rs`              | `blit forward`: spec grammar, TCP/UDP/TLS listeners, `blit.forwards`                                                  |
-| `crates/cli/src/socks.rs`                | `blit socks`: SOCKS5 CONNECT proxy over the relay                                                                     |
-| `crates/cli/src/learn.md`                | CLI reference text printed by `blit learn`                                                                            |
-| `crates/browser/src/lib.rs`              | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas                                                    |
-| `crates/alacritty-driver/src/lib.rs`     | Terminal parsing wrapper around `alacritty_terminal`                                                                  |
-| `crates/gateway/src/lib.rs`              | WebSocket/WebTransport proxy, multi-destination routing                                                               |
-| `crates/fonts/src/lib.rs`                | Font discovery and TTF/OTF parsing                                                                                    |
-| `crates/webserver/src/lib.rs`            | Shared axum HTTP helpers                                                                                              |
-| `crates/webserver/src/config.rs`         | Server configuration types                                                                                            |
+| File                                       | Role                                                                                                                  |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| `crates/server/src/lib.rs`                 | PTY host: fork/exec, frame scheduling, protocol handlers, congestion control, compositor integration                  |
+| `crates/server/src/surface_encoder.rs`     | Surface video encoding: AV1 (rav1e), H.264 (openh264/x264, VA-API, NVENC)                                             |
+| `crates/server/src/vaapi_encode.rs`        | Direct VA-API H.264 and AV1 encoding (dlopen, no FFmpeg)                                                              |
+| `crates/server/src/nvenc_encode.rs`        | Direct NVENC H.264 and AV1 encoding via CUDA + NVENC SDK (dlopen, no FFmpeg)                                          |
+| `crates/server/src/video_decode.rs`        | Camera decode policy, exact-profile validation, keyframe recovery, and backend fallback                               |
+| `crates/server/src/nvdec_decode.rs`        | Direct NVDEC H.264 and AV1 decoding via CUDA + NVCUVID (dlopen, no FFmpeg)                                            |
+| `crates/server/src/vaapi_decode.rs`        | Direct stateless VA-API H.264 and AV1 decoding (dlopen, no FFmpeg)                                                    |
+| `crates/server/src/video_decode_vulkan.rs` | Direct Vulkan Video H.264 and AV1 decoding                                                                            |
+| `crates/server/src/software_decode.rs`     | Pure-Rust H.264 and AV1 camera fallback                                                                               |
+| `crates/server/src/gpu_libs.rs`            | Runtime dlopen loaders for CUDA, NVCUVID, libva, NVENC, and GBM shared across codecs                                  |
+| `crates/server/src/audio.rs`               | Audio capture pipeline: PipeWire daemon spawn, in-process capture via `audio_pw`, Opus encoding                       |
+| `crates/server/src/desktop_bus.rs`         | Compositor-scoped D-Bus session for desktop services and portals                                                      |
+| `crates/server/src/audio_pw.rs`            | In-process libpipewire-0.3 capture client (runtime `dlopen`), replaces the former pw-cat subprocess                   |
+| `crates/remote/src/lib.rs`                 | Wire protocol: constants, message builders/parsers, `FrameState`/`TerminalState`, cell encoding, text extraction      |
+| `crates/compositor/src/imp.rs`             | Experimental headless Wayland compositor (wayland-server): surface tracking, input forwarding, protocol delegates     |
+| `crates/compositor/src/render.rs`          | Surface compositing: `SurfaceMeta` and layer collection (`collect_gpu_layers`) for the GPU renderer                   |
+| `crates/compositor/src/vulkan_render.rs`   | Vulkan GPU compositor: dlopen libvulkan.so via ash, DMA-BUF import, multi-layer compositing                           |
+| `crates/webrtc-forwarder/src/`             | WebRTC forwarder (6 files: signaling, ICE, TURN, peer management)                                                     |
+| `crates/cli/src/agent.rs`                  | Agent subcommands: `list`, `start`, `show`, `history`, `send`, `close`, `surfaces`, `capture`, `click`, `key`, `type` |
+| `crates/cli/src/main.rs`                   | Dispatch, embedded server/gateway                                                                                     |
+| `crates/cli/src/cli.rs`                    | Clap struct definitions                                                                                               |
+| `crates/cli/src/interactive.rs`            | Browser mode                                                                                                          |
+| `crates/cli/src/transport.rs`              | Transport abstraction (Unix/TCP/SSH/WebRTC)                                                                           |
+| `crates/cli/src/relay.rs`                  | Client half of the `NET_*` relay: stream ids, demultiplexing, the byte pump shared by `forward` and `socks`           |
+| `crates/cli/src/forward.rs`                | `blit forward`: spec grammar, TCP/UDP/TLS listeners, `blit.forwards`                                                  |
+| `crates/cli/src/socks.rs`                  | `blit socks`: SOCKS5 CONNECT proxy over the relay                                                                     |
+| `crates/cli/src/learn.md`                  | CLI reference text printed by `blit learn`                                                                            |
+| `crates/browser/src/lib.rs`                | WASM: applies frame diffs, produces WebGL vertex data, glyph atlas                                                    |
+| `crates/alacritty-driver/src/lib.rs`       | Terminal parsing wrapper around `alacritty_terminal`                                                                  |
+| `crates/gateway/src/lib.rs`                | WebSocket/WebTransport proxy, multi-destination routing                                                               |
+| `crates/fonts/src/lib.rs`                  | Font discovery and TTF/OTF parsing                                                                                    |
+| `crates/webserver/src/lib.rs`              | Shared axum HTTP helpers                                                                                              |
+| `crates/webserver/src/config.rs`           | Server configuration types                                                                                            |
 
 ### Non-Rust code
 

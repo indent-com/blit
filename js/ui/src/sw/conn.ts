@@ -7,9 +7,16 @@ import {
   type NetStream,
 } from "@blit-sh/core";
 // Imported, never redeclared: a hand-copied opcode is a bug that presents as a connection that hangs until it times out, with nothing on the wire to blame.
-import { S2C_FRAGMENT, S2C_HELLO, S2C_READY } from "@blit-sh/core/types";
-
-const FRAGMENT_FLAG_LAST = 1 << 0;
+import {
+  FRAGMENT_FLAG_LAST,
+  MAX_FRAGMENT_CHUNK,
+  MAX_FRAGMENT_COUNT,
+  MAX_LOGICAL_MESSAGE,
+  S2C_AUDIO_FRAME,
+  S2C_FRAGMENT,
+  S2C_HELLO,
+  S2C_READY,
+} from "@blit-sh/core/types";
 
 const AUTH_TIMEOUT_MS = 10_000;
 
@@ -28,6 +35,7 @@ class DestConnection {
   readonly streams: NetStreams;
   private readonly socket: WebSocket;
   private pending = new Uint8Array(0);
+  private pendingFragments = 0;
   private failed = false;
   private watchdog: ReturnType<typeof setTimeout> | null = null;
   private watchdogDueAt = 0;
@@ -55,18 +63,38 @@ class DestConnection {
     this.armWatchdog(RELAY_INACTIVITY_TIMEOUT_MS);
     if (typeof event.data === "string") return;
     const bytes = new Uint8Array(event.data as ArrayBuffer);
-    if (bytes.length === 0) return;
+    if (bytes.length === 0) {
+      if (this.pendingFragments !== 0) {
+        this.fail(new Error("malformed fragmented server message"));
+      }
+      return;
+    }
     if (bytes[0] === S2C_FRAGMENT) {
-      if (bytes.length < 2) return;
+      if (
+        bytes.length < 3 ||
+        (bytes[1] & ~FRAGMENT_FLAG_LAST) !== 0 ||
+        bytes.length - 2 > MAX_FRAGMENT_CHUNK ||
+        this.pendingFragments >= MAX_FRAGMENT_COUNT ||
+        this.pending.length > MAX_LOGICAL_MESSAGE - (bytes.length - 2)
+      ) {
+        this.fail(new Error("malformed fragmented server message"));
+        return;
+      }
       const merged = new Uint8Array(this.pending.length + bytes.length - 2);
       merged.set(this.pending, 0);
       merged.set(bytes.subarray(2), this.pending.length);
       this.pending = merged;
+      this.pendingFragments++;
       if (bytes[1] & FRAGMENT_FLAG_LAST) {
         const message = this.pending;
         this.pending = new Uint8Array(0);
+        this.pendingFragments = 0;
         this.streams.handleMessage(message);
       }
+      return;
+    }
+    if (this.pendingFragments !== 0 && bytes[0] !== S2C_AUDIO_FRAME) {
+      this.fail(new Error("interleaved fragmented server message"));
       return;
     }
     this.streams.handleMessage(bytes);
@@ -94,6 +122,8 @@ class DestConnection {
   private fail(err: Error): void {
     if (this.failed) return;
     this.failed = true;
+    this.pending = new Uint8Array(0);
+    this.pendingFragments = 0;
     if (this.watchdog !== null) {
       clearTimeout(this.watchdog);
       this.watchdog = null;

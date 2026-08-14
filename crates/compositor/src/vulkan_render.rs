@@ -188,6 +188,15 @@ unsafe impl Sync for ExternalHostBuffer {}
 
 impl Drop for ExternalHostBuffer {
     fn drop(&mut self) {
+        // Reached by the renderer's own field drop glue, which runs after
+        // `VulkanRenderer::drop` has returned and released its guard -- so
+        // this needs its own.  The mapping goes with the driver objects: the
+        // memory it backs stays imported when they are left alone, and
+        // unmapping it under the driver would be worse than leaking it.
+        let teardown = DriverTeardown::begin();
+        if teardown.process_exiting {
+            return;
+        }
         unsafe {
             self.device.destroy_buffer(self.buffer, None);
             self.device.free_memory(self.memory, None);
@@ -1804,6 +1813,10 @@ impl VulkanRenderer {
         } else {
             Vec::new()
         };
+
+        // The renderer now owns driver state that must not be destroyed while
+        // the driver is running its own exit handler.
+        arm_exit_barrier();
 
         Some(Self {
             entry: ManuallyDrop::new(entry),
@@ -8789,8 +8802,98 @@ fn bytemuck_cast_slice(data: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
 }
 
+// ===================================================================
+// Process-exit barrier
+// ===================================================================
+
+/// Renderer teardowns currently inside the Vulkan driver.
+static DRIVER_TEARDOWNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether the process has begun running its `exit()` handlers.
+static PROCESS_EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How long `exit()` waits for an in-flight teardown before giving up.
+///
+/// Destroying a device takes tens of milliseconds, so this is only ever
+/// reached by a teardown that is already wedged -- and a process that exits a
+/// few seconds late beats one that hangs.
+const TEARDOWN_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A renderer teardown, in flight for as long as this is held.
+struct DriverTeardown {
+    /// Whether `exit()` beat this teardown to the driver.
+    process_exiting: bool,
+}
+
+impl DriverTeardown {
+    fn begin() -> Self {
+        // Publish the count before reading the flag; `drain_driver_teardowns`
+        // publishes the flag before reading the count.  A teardown that
+        // misses the flag therefore cannot also be missed by the barrier.
+        DRIVER_TEARDOWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            process_exiting: PROCESS_EXITING.load(std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+}
+
+impl Drop for DriverTeardown {
+    fn drop(&mut self) {
+        DRIVER_TEARDOWNS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Hold `exit()` until no renderer teardown is inside the driver.
+///
+/// The NVIDIA driver registers an `atexit` handler of its own that frees the
+/// driver-global state `vkDestroyDevice` walks.  A `stop()` the caller walked
+/// away from leaves teardown running on the compositor thread while the main
+/// thread exits, and the two then race inside the driver: the exiting thread
+/// faults in `_int_free_chunk` under the driver's handler, or the compositor
+/// thread faults in `libnvidia-eglcore` under `vkDestroyDevice`.
+extern "C" fn drain_driver_teardowns() {
+    PROCESS_EXITING.store(true, std::sync::atomic::Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + TEARDOWN_EXIT_WAIT;
+    while DRIVER_TEARDOWNS.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        if std::time::Instant::now() >= deadline {
+            // Not `eprintln!`: it takes a lock the wedged teardown may be
+            // holding, and hanging here is what the deadline is for.
+            const WEDGED: &[u8] =
+                b"[vulkan-render] renderer teardown still running at exit; continuing without it\n";
+            unsafe { libc::write(2, WEDGED.as_ptr().cast(), WEDGED.len()) };
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Arm the barrier, once per process.
+///
+/// Exit handlers run last-registered-first, so ours has to be registered
+/// after the driver's to run before it.  Calling this from renderer
+/// construction guarantees that: the driver's handler is in place by the time
+/// it has given us an instance and a device.
+fn arm_exit_barrier() {
+    static ARMED: std::sync::Once = std::sync::Once::new();
+    ARMED.call_once(|| {
+        let rc = unsafe { libc::atexit(drain_driver_teardowns) };
+        if rc != 0 {
+            eprintln!("[vulkan-render] atexit registration failed: {rc}");
+        }
+    });
+}
+
 impl Drop for VulkanRenderer {
     fn drop(&mut self) {
+        // Everything below calls into the driver, whose exit handler frees
+        // the state those calls walk.  Count this teardown so `exit()` waits
+        // for it, and skip it altogether if `exit()` got here first -- the
+        // GPU resources it would free are about to go with the process
+        // anyway.
+        let teardown = DriverTeardown::begin();
+        if teardown.process_exiting {
+            return;
+        }
         unsafe {
             let _ = self.device.device_wait_idle();
             // Retire any pending / deferred submissions.
@@ -8912,7 +9015,10 @@ impl Drop for VulkanRenderer {
             self.device.destroy_sampler(self.sampler, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
-            // Everything above frees GPU resources and is safe at any time.
+            // Everything above frees GPU resources, and unmaps nothing --
+            // but it does enter the driver, so it is only safe while the
+            // process is not exiting.  That is what `DriverTeardown` above
+            // and the `atexit` barrier are for.
             //
             // `destroy_instance` is not, and is deliberately skipped: the
             // loader `dlclose()`s its layer and ICD libraries inside it, and

@@ -22,7 +22,8 @@ use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noo
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 use blit_compositor::{
-    CompositorCommand, CompositorEvent, CompositorHandle, TouchPhase, TouchPoint, spawn_compositor,
+    CompositorCommand, CompositorEvent, CompositorHandle, TouchPhase, TouchPoint,
+    spawn_compositor_without_renderer,
 };
 
 /// A `wl_touch` event, reduced to what these tests pin.
@@ -182,7 +183,7 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let handle = spawn_compositor(false, Arc::new(|| {}), "");
+        let handle = spawn_compositor_without_renderer(false, Arc::new(|| {}));
         let stream =
             UnixStream::connect(&handle.socket_name).expect("connect to compositor socket");
         let conn = Connection::from_socket(stream).expect("wayland connection");

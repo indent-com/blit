@@ -407,9 +407,9 @@ enum TcpWrite {
 #[derive(Default)]
 pub struct NetSockets {
     map: FxHashMap<u16, Entry>,
+    jobs: Option<crate::extension_jobs::EndpointTracker>,
     /// Outbox byte counter shared with the sender loop, for the advisory congestion check that paces relayed datagrams.
     outbox_bytes: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    outbox_frames: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Bytes sent to the client and not yet acked, summed over every TCP
     /// stream here. The per-stream window bounds one stream; this bounds the
     /// connection (docs/design/net.md § Pacing), which per-stream shares
@@ -427,21 +427,29 @@ pub struct NetSockets {
 }
 
 impl NetSockets {
-    pub fn with_outbox(
-        frames: Arc<std::sync::atomic::AtomicUsize>,
-        bytes: Arc<std::sync::atomic::AtomicUsize>,
-    ) -> Self {
+    pub fn ids(&self) -> impl Iterator<Item = u16> + '_ {
+        self.map.keys().copied()
+    }
+
+    pub fn with_outbox(bytes: Arc<std::sync::atomic::AtomicUsize>) -> Self {
         Self {
             map: FxHashMap::default(),
             outbox_bytes: Some(bytes),
-            outbox_frames: Some(frames),
             ..Self::default()
         }
     }
 
+    pub fn with_outbox_and_jobs(
+        bytes: Arc<std::sync::atomic::AtomicUsize>,
+        jobs: Option<crate::extension_jobs::EndpointTracker>,
+    ) -> Self {
+        let mut sockets = Self::with_outbox(bytes);
+        sockets.jobs = jobs;
+        sockets
+    }
+
     fn counters(&self) -> Option<OutboxCounters> {
         Some(OutboxCounters {
-            frames: self.outbox_frames.clone()?,
             bytes: self.outbox_bytes.clone()?,
         })
     }
@@ -450,7 +458,6 @@ impl NetSockets {
 /// The pair of shared outbox counters, cloned into socket tasks so their sends are accounted the same way session sends are.
 #[derive(Clone)]
 struct OutboxCounters {
-    frames: Arc<std::sync::atomic::AtomicUsize>,
     bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -458,21 +465,11 @@ impl OutboxCounters {
     fn queued_bytes(&self) -> usize {
         self.bytes.load(Ordering::Relaxed)
     }
-
-    fn on_send(&self, len: usize) {
-        self.frames.fetch_add(1, Ordering::Relaxed);
-        self.bytes.fetch_add(len, Ordering::Relaxed);
-    }
 }
 
-/// Send one message to the client, accounting it in the shared outbox counters so the congestion check has something honest to read.
-fn emit(out: &mpsc::UnboundedSender<Vec<u8>>, counters: &Option<OutboxCounters>, msg: Vec<u8>) {
-    let len = msg.len();
-    if out.send(msg).is_ok()
-        && let Some(c) = counters
-    {
-        c.on_send(len);
-    }
+/// Send one message through the connection's origin-aware tracked outbox.
+fn emit(out: &crate::TrackedOutboxSender, _counters: &Option<OutboxCounters>, msg: Vec<u8>) {
+    let _ = out.send(msg);
 }
 
 // --------------------------------------------------------------------------- Dispatch ---------------------------------------------------------------------------
@@ -481,7 +478,7 @@ fn emit(out: &mpsc::UnboundedSender<Vec<u8>>, counters: &Option<OutboxCounters>,
 pub async fn handle_net_message(
     data: &[u8],
     sockets: &mut NetSockets,
-    out: &mpsc::UnboundedSender<Vec<u8>>,
+    out: &crate::TrackedOutboxSender,
     policy: &Policy,
     verbose: bool,
 ) {
@@ -548,7 +545,7 @@ pub async fn handle_net_message(
                 );
                 return;
             }
-            open_socket(open, sockets, out, policy, verbose);
+            open_socket(open, data.len(), sockets, out, policy, verbose);
         }
         C2S_NET_DATA => {
             let Some((id, payload)) = parse_net_data_c2s(data) else {
@@ -689,7 +686,7 @@ const NET_CLOSED_POLICY_INVALID: u8 = blit_remote::net::NET_CLOSED_POLICY;
 
 fn close_with(
     sockets: &mut NetSockets,
-    out: &mpsc::UnboundedSender<Vec<u8>>,
+    out: &crate::TrackedOutboxSender,
     id: u16,
     reason: u8,
     detail: &str,
@@ -701,7 +698,7 @@ fn close_with(
 }
 
 /// Refuse every `NET_OPEN` when the family is disabled, so a client that ignores feature bits still gets its one reply rather than waiting forever.
-pub fn refuse_net_message(data: &[u8], out: &mpsc::UnboundedSender<Vec<u8>>) {
+pub fn refuse_net_message(data: &[u8], out: &crate::TrackedOutboxSender) {
     if data[0] == C2S_NET_OPEN && data.len() >= 3 {
         let id = u16::from_le_bytes([data[1], data[2]]);
         let _ = out.send(msg_net_opened(
@@ -727,7 +724,7 @@ pub fn shutdown(sockets: &mut NetSockets) {
 
 /// What every socket task needs from the connection it belongs to.
 struct StreamCtx {
-    out: mpsc::UnboundedSender<Vec<u8>>,
+    out: crate::TrackedOutboxSender,
     counters: Option<OutboxCounters>,
     /// Set as the task exits: the connection task owns the map, so a
     /// finished socket cannot remove its own entry.
@@ -764,8 +761,9 @@ struct TcpCtx {
 /// entry and was dropped.
 fn open_socket(
     open: NetOpen,
+    request_bytes: usize,
     sockets: &mut NetSockets,
-    out: &mpsc::UnboundedSender<Vec<u8>>,
+    out: &crate::TrackedOutboxSender,
     policy: &Policy,
     verbose: bool,
 ) {
@@ -809,7 +807,14 @@ fn open_socket(
                 abort: Some(abort_tx),
             },
         );
-        tokio::spawn(run_udp(open, ctx, policy, queue));
+        let work = run_udp(open, ctx, policy, queue);
+        if let Some(jobs) = &sockets.jobs {
+            if jobs.spawn_async(request_bytes, work).is_err() {
+                sockets.map.remove(&id);
+            }
+        } else {
+            tokio::spawn(work);
+        }
     } else {
         let (write_tx, write_rx) = mpsc::unbounded_channel::<TcpWrite>();
         let (ack_tx, ack_rx) = watch::channel(0u64);
@@ -840,7 +845,14 @@ fn open_socket(
                 abort: Some(abort_tx),
             },
         );
-        tokio::spawn(run_tcp(open, ctx, policy, tcp));
+        let work = run_tcp(open, ctx, policy, tcp);
+        if let Some(jobs) = &sockets.jobs {
+            if jobs.spawn_async(request_bytes, work).is_err() {
+                sockets.map.remove(&id);
+            }
+        } else {
+            tokio::spawn(work);
+        }
     }
 }
 
@@ -1089,6 +1101,7 @@ async fn run_tcp(open: NetOpen, ctx: StreamCtx, policy: Policy, tcp: TcpCtx) {
             }
         };
         writer_task.abort();
+        let _ = writer_task.await;
         emit(&out, &counters, msg_net_closed(id, reason, &detail));
         done.store(true, Ordering::Relaxed);
     }
@@ -1504,6 +1517,11 @@ mod tests {
     use super::*;
     use blit_remote::net::NET_OPEN_TLS;
 
+    fn test_outbox() -> (crate::TrackedOutboxSender, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (crate::TrackedOutboxSender::untracked(tx), rx)
+    }
+
     fn policy(patterns: &[&str]) -> Policy {
         unsafe {
             std::env::remove_var("BLIT_ALLOW_FORWARD_INSECURE");
@@ -1625,7 +1643,7 @@ mod tests {
 
     #[tokio::test]
     async fn insecure_is_refused_unless_the_operator_allowed_it() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbox();
         let mut sockets = NetSockets::default();
         let open = NetOpen {
             flags: NET_OPEN_TLS | blit_remote::net::NET_OPEN_INSECURE,
@@ -1690,7 +1708,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_rejects_invalid_flag_combination() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbox();
         let mut sockets = NetSockets::default();
         let open = NetOpen {
             flags: blit_remote::net::NET_OPEN_UDP | NET_OPEN_TLS,
@@ -1722,7 +1740,7 @@ mod tests {
             // Closing here gives the relay an EOF to report.
         });
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbox();
         let mut sockets = NetSockets::default();
         let p = policy(&[]);
         let open = NetOpen::tcp(1, "127.0.0.1", addr.port());
@@ -1780,7 +1798,7 @@ mod tests {
             target.send_to(b"answer", from).await.unwrap();
         });
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbox();
         let mut sockets = NetSockets::default();
         let p = policy(&[]);
         let open = NetOpen::udp(4, "127.0.0.1", addr.port());
@@ -1818,7 +1836,7 @@ mod tests {
     async fn stream_write_on_udp_flow_closes_it() {
         let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = target.local_addr().unwrap();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbox();
         let mut sockets = NetSockets::default();
         let p = policy(&[]);
         handle_net_message(
@@ -1852,7 +1870,7 @@ mod tests {
     /// connect timeout.
     #[tokio::test]
     async fn open_does_not_wait_for_the_target() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbox();
         let mut sockets = NetSockets::default();
         let p = policy(&[]);
         // Reserved for documentation (RFC 5737): routes nowhere, so the
@@ -1879,7 +1897,7 @@ mod tests {
     /// stream id is right there at a fixed offset.
     #[tokio::test]
     async fn tls_open_without_a_tls_block_is_refused_by_id() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbox();
         let mut sockets = NetSockets::default();
         let p = policy(&[]);
         // A well-formed TCP open, then the TLS flag set without appending the
@@ -1911,7 +1929,7 @@ mod tests {
                 drop(sock);
             }
         });
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbox();
         let mut sockets = NetSockets::default();
         let p = policy(&[]);
         let open = blit_remote::net::msg_net_open(&NetOpen::tcp(4, "127.0.0.1", addr.port()));
@@ -2056,7 +2074,7 @@ mod tests {
             }
         });
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbox();
         let mut sockets = NetSockets::default();
         let p = policy(&[]);
         let open = blit_remote::net::msg_net_open(&NetOpen::tcp(5, "127.0.0.1", addr.port()));
@@ -2134,7 +2152,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbox();
         let mut sockets = NetSockets::default();
         let p = policy(&[]);
         let open = blit_remote::net::msg_net_open(&NetOpen::tcp(1, "127.0.0.1", addr.port()));
@@ -2184,7 +2202,7 @@ mod tests {
                 }
             }
         });
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbox();
         let mut sockets = NetSockets::default();
         let p = policy(&[]);
         let open = blit_remote::net::msg_net_open(&NetOpen::tcp(9, "127.0.0.1", addr.port()));
@@ -2204,7 +2222,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuse_answers_open_when_family_is_disabled() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbox();
         refuse_net_message(
             &blit_remote::net::msg_net_open(&NetOpen::tcp(1, "127.0.0.1", 80)),
             &tx,
@@ -2260,7 +2278,7 @@ mod tests {
             }
         });
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbox();
         let mut sockets = NetSockets::default();
         let p = policy(&[]);
         // Five streams: the fifth is the first whose share is below the 1 MiB

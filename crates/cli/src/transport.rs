@@ -1,6 +1,26 @@
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+const MAX_FRAME_SIZE: usize = blit_remote::MAX_FRAME_SIZE;
+
+/// Connection-local bounded state for one fragmented logical S2C message.
+#[derive(Debug, Default)]
+pub struct FragmentReassembly {
+    bytes: Vec<u8>,
+    fragments: usize,
+}
+
+impl FragmentReassembly {
+    fn pending(&self) -> bool {
+        self.fragments != 0
+    }
+
+    fn abort(&mut self) {
+        // Release hostile or incomplete storage immediately rather than
+        // retaining its capacity for a connection which is about to close.
+        self.bytes = Vec::new();
+        self.fragments = 0;
+    }
+}
 
 pub enum Transport {
     #[cfg(unix)]
@@ -64,36 +84,50 @@ pub async fn read_frame(r: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
 /// chunked bulk message (video keyframe, large terminal snapshot) is
 /// delivered as a single contiguous buffer matching its original type.
 ///
-/// `pending` is the caller-owned reassembly buffer — pass the same
-/// `&mut Vec<u8>` across successive calls on the same stream.  Fragments
+/// `pending` is caller-owned reassembly state — pass the same value across
+/// successive calls on the same stream. Fragments
 /// of a single message do not interleave with fragments of another
 /// (TCP order + single-message-at-a-time sender), so one buffer is
 /// enough.  Audio frames and other non-fragment messages pass through
 /// untouched.
 pub async fn read_message(
     r: &mut (impl AsyncRead + Unpin),
-    pending: &mut Vec<u8>,
+    pending: &mut FragmentReassembly,
 ) -> Option<Vec<u8>> {
     loop {
-        let frame = read_frame(r).await?;
+        let Some(frame) = read_frame(r).await else {
+            pending.abort();
+            return None;
+        };
         if frame.is_empty() || frame[0] != blit_remote::S2C_FRAGMENT {
+            if pending.pending() && frame.first() != Some(&blit_remote::S2C_AUDIO_FRAME) {
+                pending.abort();
+                return None;
+            }
             return Some(frame);
         }
-        if frame.len() < 2 {
-            // Malformed fragment header — drop, keep reading.
-            continue;
-        }
-        let flags = frame[1];
-        // A complete message can never exceed the protocol-wide decompressed
-        // ceiling, so a fragment stream that grows past it is a buggy or
-        // hostile peer — abort rather than reassemble without bound.
-        if pending.len().saturating_add(frame.len() - 2) > blit_remote::MAX_DECOMPRESSED {
-            pending.clear();
+        if frame.len() < 3 || frame[1] & !blit_remote::FRAGMENT_FLAG_LAST != 0 {
+            pending.abort();
             return None;
         }
-        pending.extend_from_slice(&frame[2..]);
+        let flags = frame[1];
+        let chunk = &frame[2..];
+        let Some(total) = pending.bytes.len().checked_add(chunk.len()) else {
+            pending.abort();
+            return None;
+        };
+        if pending.fragments >= blit_remote::MAX_FRAGMENT_COUNT
+            || chunk.len() > blit_remote::MAX_FRAGMENT_CHUNK
+            || total > blit_remote::MAX_LOGICAL_MESSAGE
+        {
+            pending.abort();
+            return None;
+        }
+        pending.fragments += 1;
+        pending.bytes.extend_from_slice(chunk);
         if flags & blit_remote::FRAGMENT_FLAG_LAST != 0 {
-            return Some(std::mem::take(pending));
+            pending.fragments = 0;
+            return Some(std::mem::take(&mut pending.bytes));
         }
     }
 }
@@ -561,6 +595,17 @@ pub async fn connect(on: &Option<String>, hub: &str) -> Result<Transport, String
     connect_ipc(&path).await
 }
 
+/// Connect for an explicit shell-completion query without starting a local
+/// server merely because the user pressed Tab. Remote transports retain their
+/// normal resolution and pooling behavior, bounded by the caller's timeout.
+pub async fn connect_for_completion(on: &Option<String>, hub: &str) -> Result<Transport, String> {
+    let effective_target = on.clone().or_else(default_target);
+    match effective_target.as_deref() {
+        None | Some("local") => connect_ipc(&default_local_socket()).await,
+        Some(uri) => connect_uri(uri, hub).await,
+    }
+}
+
 /// Connect to the local server, spawning it as a **detached process**
 /// if absent. In-process hosting (the old behavior) breaks every
 /// daemon-resident feature for one-shot commands: warm LSP backends
@@ -727,6 +772,76 @@ mod tests {
         let f2 = read_frame(&mut cursor).await.unwrap();
         assert_eq!(f1, b"first");
         assert_eq!(f2, b"second");
+    }
+
+    fn fragment(flags: u8, chunk: &[u8]) -> Vec<u8> {
+        let mut payload = vec![blit_remote::S2C_FRAGMENT, flags];
+        payload.extend_from_slice(chunk);
+        make_frame(&payload)
+    }
+
+    #[tokio::test]
+    async fn read_message_reassembles_a_bounded_sequence() {
+        let mut wire = fragment(0, &[blit_remote::S2C_PING]);
+        wire.extend_from_slice(&fragment(blit_remote::FRAGMENT_FLAG_LAST, &[7, 8]));
+        let mut cursor = std::io::Cursor::new(wire);
+        let mut pending = FragmentReassembly::default();
+        assert_eq!(
+            read_message(&mut cursor, &mut pending).await,
+            Some(vec![blit_remote::S2C_PING, 7, 8])
+        );
+        assert!(!pending.pending());
+    }
+
+    #[tokio::test]
+    async fn audio_may_interleave_with_a_fragment_sequence() {
+        let mut wire = fragment(0, &[blit_remote::S2C_PING]);
+        wire.extend_from_slice(&make_frame(&[blit_remote::S2C_AUDIO_FRAME, 1]));
+        wire.extend_from_slice(&fragment(blit_remote::FRAGMENT_FLAG_LAST, &[9]));
+        let mut cursor = std::io::Cursor::new(wire);
+        let mut pending = FragmentReassembly::default();
+        assert_eq!(
+            read_message(&mut cursor, &mut pending).await,
+            Some(vec![blit_remote::S2C_AUDIO_FRAME, 1])
+        );
+        assert!(pending.pending());
+        assert_eq!(
+            read_message(&mut cursor, &mut pending).await,
+            Some(vec![blit_remote::S2C_PING, 9])
+        );
+    }
+
+    #[tokio::test]
+    async fn non_audio_interleaving_aborts_reassembly() {
+        let mut wire = fragment(0, &[blit_remote::S2C_PING]);
+        wire.extend_from_slice(&make_frame(&[blit_remote::S2C_READY]));
+        let mut cursor = std::io::Cursor::new(wire);
+        let mut pending = FragmentReassembly::default();
+        assert!(read_message(&mut cursor, &mut pending).await.is_none());
+        assert!(!pending.pending());
+        assert_eq!(pending.bytes.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_fragment_flags_and_empty_chunks_abort() {
+        for wire in [fragment(2, &[1]), fragment(0, &[])] {
+            let mut cursor = std::io::Cursor::new(wire);
+            let mut pending = FragmentReassembly::default();
+            assert!(read_message(&mut cursor, &mut pending).await.is_none());
+            assert!(!pending.pending());
+        }
+    }
+
+    #[tokio::test]
+    async fn fragment_count_is_checked_before_extending() {
+        let mut pending = FragmentReassembly {
+            bytes: vec![blit_remote::S2C_PING],
+            fragments: blit_remote::MAX_FRAGMENT_COUNT,
+        };
+        let mut cursor = std::io::Cursor::new(fragment(0, &[1]));
+        assert!(read_message(&mut cursor, &mut pending).await.is_none());
+        assert_eq!(pending.bytes.capacity(), 0);
+        assert_eq!(pending.fragments, 0);
     }
 
     #[tokio::test]

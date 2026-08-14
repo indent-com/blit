@@ -4,25 +4,49 @@
 
 ## Configuration
 
-| Variable                            | Default                                            | Purpose                                                                                |
-| ----------------------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `BLIT_SOCK`                         | see path cascade in [transports.md](transports.md) | Unix socket listen path                                                                |
-| `SHELL`                             | `$SHELL` or `/bin/sh`                              | Shell spawned for new PTYs                                                             |
-| `BLIT_SHELL_FLAGS`                  | `li` (Unix) / `` (Windows)                         | Shell invocation flags                                                                 |
-| `BLIT_SCROLLBACK`                   | `10000`                                            | Scrollback buffer rows per PTY                                                         |
-| `BLIT_VAAPI_DEVICE`                 | `/dev/dri/renderD128`                              | VA-API render node for encoding                                                        |
-| `BLIT_CUDA_DEVICE`                  | `0`                                                | CUDA device ordinal (NVENC)                                                            |
-| `BLIT_FD_CHANNEL`                   | unset                                              | fd-channel file descriptor                                                             |
-| `BLIT_EXPORT_SOCK`                  | unset                                              | `1` exports the socket path as `BLIT_SOCK` in spawned terminals (also `--export-sock`) |
-| `BLIT_INJECT_PATH`                  | unset                                              | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)     |
-| `BLIT_SURFACE_ENCODERS`             | see encoder table                                  | Comma-separated encoder priority                                                       |
-| `BLIT_SURFACE_BANDWIDTH`            | `ultra`                                            | Ceiling on video bandwidth (adaptation only goes cheaper)                              |
-| `BLIT_SURFACE_SPEED`                | `realtime`                                         | Encoder speed preset                                                                   |
-| `BLIT_MAX_CONNECTIONS`              | `0` (unlimited)                                    | Reject client connections past this count                                              |
-| `BLIT_MAX_PTYS`                     | `0` (unlimited)                                    | Refuse `CREATE` past this many PTYs across all clients                                 |
-| `BLIT_ENCODE_FENCE_TIMEOUT_MS`      | `10000`                                            | Give up on a Vulkan encode submission after this long (`0` = wait forever)             |
-| `BLIT_ENABLE_EXTERNAL_MEMORY_HOST`  | unset                                              | Force experimental direct `wl_shm` host import when Vulkan supports it                 |
-| `BLIT_DISABLE_EXTERNAL_MEMORY_HOST` | unset                                              | Disable automatic direct `wl_shm` host import                                          |
+| Variable                              | Default                                            | Purpose                                                                                |
+| ------------------------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `BLIT_SOCK`                           | see path cascade in [transports.md](transports.md) | Unix socket listen path                                                                |
+| `SHELL`                               | `$SHELL` or `/bin/sh`                              | Shell spawned for new PTYs                                                             |
+| `BLIT_SHELL_FLAGS`                    | `li` (Unix) / `` (Windows)                         | Shell invocation flags                                                                 |
+| `BLIT_SCROLLBACK`                     | `10000`                                            | Scrollback buffer rows per PTY                                                         |
+| `BLIT_VAAPI_DEVICE`                   | `/dev/dri/renderD128`                              | VA-API render node for surface encoding and camera decoding                            |
+| `BLIT_CUDA_DEVICE`                    | `0`                                                | CUDA device ordinal for NVENC and NVDEC                                                |
+| `BLIT_FD_CHANNEL`                     | unset                                              | fd-channel file descriptor                                                             |
+| `BLIT_EXPORT_SOCK`                    | unset                                              | `1` exports the socket path as `BLIT_SOCK` in spawned terminals (also `--export-sock`) |
+| `BLIT_INJECT_PATH`                    | unset                                              | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)     |
+| `BLIT_SURFACE_ENCODERS`               | see encoder table                                  | Comma-separated encoder priority                                                       |
+| `BLIT_SURFACE_BANDWIDTH`              | `ultra`                                            | Ceiling on video bandwidth (adaptation only goes cheaper)                              |
+| `BLIT_SURFACE_SPEED`                  | `realtime`                                         | Encoder speed preset                                                                   |
+| `BLIT_MEDIA_CAMERA_DECODERS`          | `nvdec,vaapi,vulkan,software`                      | Camera hardware priority with implicit software fallback                               |
+| `BLIT_MEDIA_CAMERA_VULKAN_DEVICE`     | unset                                              | Optional Vulkan device index or name substring for camera decoding                     |
+| `BLIT_MAX_CONNECTIONS`                | `0` (unlimited)                                    | Reject client connections past this count                                              |
+| `BLIT_MAX_PTYS`                       | `0` (unlimited)                                    | Refuse `CREATE` past this many PTYs across all clients                                 |
+| `BLIT_PROCESS`                        | `1`                                                | `0` disables native non-PTY processes and their feature bit                            |
+| `BLIT_PROCESS_MAX_PER_CLIENT`         | `16`                                               | Pending spawns, live watches, and unwatched owned processes per endpoint               |
+| `BLIT_PROCESS_MAX`                    | `64`                                               | Process generations server-wide                                                        |
+| `BLIT_PROCESS_MAX_SPAWNING`           | `8`                                                | Concurrent native spawn calls server-wide                                              |
+| `BLIT_PROCESS_MAX_WATCHERS`           | `1024` at default process limits                   | Pending and live process watches server-wide                                           |
+| `BLIT_PROCESS_MAX_WATCHERS_PER_CHILD` | `64`                                               | Concurrent watches on one live process                                                 |
+| `BLIT_PROCESS_REQUEST_MAX_PER_CLIENT` | `16777216` (16 MiB)                                | Retained process-spawn request bytes per endpoint                                      |
+| `BLIT_PROCESS_REQUEST_MAX`            | `67108864` (64 MiB)                                | Retained process-spawn request bytes server-wide                                       |
+| `BLIT_PROCESS_BUFFER_MAX`             | `201326592` (192 MiB)                              | Reserved process stream-window bytes server-wide                                       |
+| `BLIT_PROCESS_OUTBOX_MAX_FRAMES`      | `65536` at default process limits                  | Queued process-family frames per endpoint before disconnect                            |
+| `BLIT_PROCESS_OUTBOX_MAX_BYTES`       | `67108864` (64 MiB) at default process limits      | Queued process-family bytes per endpoint before disconnect                             |
+| `BLIT_PROCESS_KILL_GRACE`             | `2` seconds                                        | Grace between terminating and force-killing a process group/job                        |
+| `BLIT_PROCESS_DETACHED_RESULT_TTL`    | `300` seconds                                      | Retention time for compact detachable exit results                                     |
+| `BLIT_ENCODE_FENCE_TIMEOUT_MS`        | `10000`                                            | Give up on a Vulkan encode submission after this long (`0` = wait forever)             |
+| `BLIT_ENABLE_EXTERNAL_MEMORY_HOST`    | unset                                              | Force experimental direct `wl_shm` host import when Vulkan supports it                 |
+| `BLIT_DISABLE_EXTERNAL_MEMORY_HOST`   | unset                                              | Disable automatic direct `wl_shm` host import                                          |
+| `BLIT_DESKTOP`                        | `1` on Linux                                       | `0` disables the private-bus tray/notification services and feature bit                |
+| `BLIT_NOTIFICATION_TIMEOUT_MS`        | `10000`                                            | Default low/normal notification timeout when the application requests `-1`             |
+| `BLIT_NOTIFICATION_TIMEOUT_MIN_MS`    | `1000`                                             | Lower clamp for positive application notification timeouts                             |
+| `BLIT_NOTIFICATION_TIMEOUT_MAX_MS`    | `86400000`                                         | Upper clamp for positive application notification timeouts                             |
+
+The global process-watcher default scales with the product of the per-endpoint
+and server-wide process limits. The process-outbox defaults scale with the
+smaller of those limits. Explicit watcher or outbox settings replace their
+derived capacities.
 
 `BLIT_MAX_CONNECTIONS` and `BLIT_MAX_PTYS` are an operator sanity bound against
 runaway automation, not a security control — a client that can open one PTY can
@@ -33,6 +57,42 @@ A `CREATE` refused by `BLIT_MAX_PTYS` gets no reply, because the protocol has
 no "create refused" message; the client sees a timeout and the server logs the
 refusal. Setting a cap you actually reach is therefore not a graceful
 experience yet.
+
+## Native non-PTY processes
+
+Feature bit 13 exposes the binary-safe process family described in
+[design/processes.md](design/processes.md). Children execute their argument
+vector directly, without a shell. Every started child has a public,
+server-boot-scoped `process_ref`; any process-capable client can list children,
+concurrently watch their future output, and control them. Each watch has
+independent output flow control. A lagging watch closes its endpoint, removing
+all of that endpoint's watches, rather than stalling the child or peers on other
+endpoints. Total watches and watches on any one child are also hard-capped;
+admission returns `BUDGET` when either limit is full. Exactly one watch writes
+stdin: the creator starts as writer, and
+after it unwatches or disconnects the next `PROCESS_WATCH` explicitly
+requesting `STDIN` atomically acquires the role. Ordinary watches remain
+read-only for stdin.
+
+Ordinary children still belong to their creating endpoint and die when it
+closes, even if peers are watching. Explicitly detachable children survive with
+zero or more watchers and retain a compact, publicly watchable final result for
+the configured TTL. There is no per-client process confidentiality or control
+boundary. The server uses process groups on Unix and kill-on-close jobs on
+Windows. Lifecycle frames carrying cleanup guards have a fixed 10-second write
+deadline; a connection which cannot drain one is closed so it cannot pin a
+process generation indefinitely.
+
+Process execution has the same authority as creating a PTY command: the child
+runs as the server's OS identity and is not sandboxed. Disable it with
+`BLIT_PROCESS=0` or `blit server --no-processes` where that authority is not
+appropriate. All process capacity settings are sampled once at server startup.
+
+Process children inherit the complete server process environment.
+Client-supplied environment entries add to it and replace inherited entries
+with the same key. Clients cannot clear the inherited environment. Unix PTY
+creation separately rewrites terminal and compositor integration variables;
+those PTY-only rewrites do not apply to native pipe children.
 
 ## PTY lifecycle
 
@@ -158,7 +218,7 @@ The compositor is optionally enabled for terminals that need GUI app support. It
 
 All PTYs forked after the compositor starts inherit `WAYLAND_DISPLAY` pointing at the shared compositor socket. Any program — shell, TUI, or GUI app — can open Wayland surfaces from any PTY.
 
-Each compositor starts a private D-Bus session whose activation environment points at its Wayland socket, and PTYs receive that bus through `DBUS_SESSION_BUS_ADDRESS`. Desktop apps such as Spotify require a session bus, while out-of-process services such as `xdg-desktop-portal-gtk` must inherit the compositor's `WAYLAND_DISPLAY` so file choosers map as blit surfaces rather than escaping to the host desktop. This bus is separate from the audio pipeline's private D-Bus session. If `dbus-daemon` is unavailable, the variable stays unset; blit never sends compositor applications to the host session bus.
+Each compositor starts a private D-Bus session whose activation environment points at its Wayland socket, and PTYs receive that bus through `DBUS_SESSION_BUS_ADDRESS`. Desktop apps such as Spotify require a session bus, while out-of-process portal services must inherit the compositor's `WAYLAND_DISPLAY` so their windows map as blit surfaces rather than escaping to the host desktop. The private PipeWire runtime, MPRIS bridge, and compositor-specific portal frontend/backend share this bus; blit never exposes the host session bus. If `dbus-daemon` is unavailable, the variable stays unset and those optional services stay unavailable.
 
 ### Surface lifecycle
 
@@ -299,6 +359,62 @@ software H.264 encode is now cheaper and slightly softer than before.
 - **Screenshots**: `blit surface capture <surface_id>` uses the Vulkan renderer to composite the surface tree and reads back RGBA pixels. Output format: PNG or AVIF, inferred from file extension.
 
 Chrome/Electron work with `--ozone-platform=wayland`. mpv works with `--vo=gpu-next` (Vulkan WSI submits DMA-BUFs via `zwp_linux_dmabuf`).
+
+## Camera media input
+
+Compressed viewer camera frames are decoded by codec-specific in-process
+backends; FFmpeg is not used. H.264 and AV1 software decoders are compiled into
+the server. NVDEC, VA-API, and Vulkan Video use their native APIs directly and
+are loaded or initialized only when selected. No camera decoder executable,
+subprocess, or general multimedia shared-library closure is required by normal,
+GPL, NixOS, or portable builds.
+
+`BLIT_MEDIA_CAMERA_DECODERS` is a comma-separated, case-insensitive priority
+list (a colon is also accepted as a delimiter). The default is:
+
+```text
+nvdec,vaapi,vulkan,software
+```
+
+The server initializes entries in order and uses the first one which opens and
+successfully decodes the negotiated stream. Canonical entries are `nvdec`,
+`vaapi`, `vulkan`, and `software`; `cuda` and `sw` are accepted aliases.
+Unknown and duplicate entries are ignored.
+Hardware support is a device and driver property, not a normal-versus-GPL
+package distinction. NVDEC uses the CUDA ordinal from `BLIT_CUDA_DEVICE`;
+VA-API uses the render node from `BLIT_VAAPI_DEVICE`; the optional
+`BLIT_MEDIA_CAMERA_VULKAN_DEVICE` value selects a physical device by enumeration
+index or case-insensitive name substring. Software remains the implicit final
+fallback if it is omitted or no listed hardware entry is usable. Set the list
+to `software` to disable camera hardware decode. Consequently, codec
+advertisement is based on the compiled software decoders and never waits for or
+depends on probing a GPU during client HELLO.
+
+Hardware decode is opportunistic and remains in-process. NVDEC uses NVIDIA's
+native parser/decoder, VA-API receives stateless H.264/AV1 picture parameters,
+and Vulkan Video receives matching StdVideo parameter/reference structures.
+The finished hardware surface is copied or mapped back, checked for exact
+dimensions, 8-bit depth, and 4:2:0 or 4:4:4 layout, converted to RGBA, and
+published through the existing PipeWire source. This saves codec work but is
+not a zero-copy path. A backend which cannot decode 4:4:4 falls through to
+another 4:4:4 decoder—it never changes the negotiated camera format.
+
+Initialization failures advance through the list. A hardware failure on a
+validated keyframe retries the same self-contained key on the next backend. A
+delta cannot be retried after switching contexts because its reference frames
+belong to the failed decoder; the worker drops the pending dependency chain,
+returns its credit, and requests a new keyframe before continuing. Backend
+failures are remembered for the rest of that lease, but are never blacklisted
+process-wide from peer-controlled input. The decoder worker and pending-frame
+queue retain their existing process and per-lease bounds regardless of backend.
+
+The server account needs permission to open the selected GPU devices. VA-API
+and Vulkan commonly require the relevant `/dev/dri/renderD*` node (and the
+distro's `render` or `video` group); NVDEC requires the NVIDIA device nodes.
+Containers must expose those nodes as well as the driver libraries. The NixOS
+service runs as its configured user and does not bypass kernel device
+permissions. If a device is absent or inaccessible, the chain falls through to
+the next backend and ultimately software by default.
 
 ## Audio
 

@@ -1,7 +1,7 @@
 import { createSignal, Index, Show } from "solid-js";
 import type { ConnectionStatus, TerminalPalette } from "@blit-sh/core";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
-import { scrollbarStyle, themeFor, ui, uiScale } from "./theme";
+import { mergeStyle, scrollbarStyle, themeFor, ui, uiScale } from "./theme";
 import { createDragReorder, reorderTo } from "./dragReorder";
 import { t } from "./i18n";
 import type { Remote } from "./storage";
@@ -564,8 +564,7 @@ export function RemotesOverlay(props: {
             <button
               type="submit"
               disabled={!name().trim() || !uri().trim()}
-              style={{
-                ...ui.btn,
+              style={mergeStyle(ui.btn, {
                 "font-size": `${scale().sm}px`,
                 "border-radius": "0",
                 border: `1px solid ${theme().accent}`,
@@ -576,7 +575,7 @@ export function RemotesOverlay(props: {
                 cursor: "pointer",
                 "white-space": "nowrap",
                 opacity: name().trim() && uri().trim() ? 1 : 0.4,
-              }}
+              })}
             >
               {t("remotes.add")}
             </button>

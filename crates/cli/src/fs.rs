@@ -3,7 +3,7 @@
 //! The complete client obligation: apply updates to a map, ack. Everything
 //! here beyond that is presentation.
 
-use crate::transport::{Transport, read_message, write_frame};
+use crate::transport::{FragmentReassembly, Transport, read_message, write_frame};
 use blit_remote::fs::{
     FEATURE_FS, FS_CLOSED_BACKEND_FAILED, FS_CLOSED_CLIENT_REQUEST, FS_CLOSED_PERMISSION_LOST,
     FS_CLOSED_RESOURCE_LIMIT, FS_CLOSED_ROOT_GONE, FS_DONE_CONFLICT, FS_DONE_OK, FS_ENTRY_DIR,
@@ -56,7 +56,7 @@ pub async fn cmd_sync(transport: Transport, path: String, args: SyncArgs) -> Res
         json,
     } = args;
     let (mut reader, mut writer) = transport.split();
-    let mut fragment_buf: Vec<u8> = Vec::new();
+    let mut fragment_buf = FragmentReassembly::default();
 
     let features = handshake(&mut reader, &mut fragment_buf).await?;
     if features & FEATURE_FS == 0 {
@@ -204,7 +204,7 @@ pub async fn cmd_sync(transport: Transport, path: String, args: SyncArgs) -> Res
 
 pub(crate) async fn handshake(
     reader: &mut (impl AsyncRead + Unpin),
-    fragment_buf: &mut Vec<u8>,
+    fragment_buf: &mut FragmentReassembly,
 ) -> Result<u32, String> {
     let mut features = 0u32;
     loop {
@@ -392,7 +392,7 @@ fn parse_mode(mode: Option<&str>) -> Result<u32, String> {
 async fn open_write_root(
     reader: &mut (impl AsyncRead + Unpin),
     writer: &mut (impl AsyncWrite + Unpin),
-    fragment_buf: &mut Vec<u8>,
+    fragment_buf: &mut FragmentReassembly,
     root: &str,
 ) -> Result<u16, String> {
     let features = handshake(reader, fragment_buf).await?;
@@ -433,7 +433,7 @@ async fn open_write_root(
 
 async fn await_fs_done(
     reader: &mut (impl AsyncRead + Unpin),
-    fragment_buf: &mut Vec<u8>,
+    fragment_buf: &mut FragmentReassembly,
     nonce: u16,
 ) -> Result<(u8, u128, u64), String> {
     loop {
@@ -530,7 +530,7 @@ pub async fn cmd_write(
     }
 
     let (mut reader, mut writer) = transport.split();
-    let mut fb = Vec::new();
+    let mut fb = FragmentReassembly::default();
     let sync_id = open_write_root(&mut reader, &mut writer, &mut fb, &client_abs(&root)).await?;
     let req = FsWrite {
         nonce: REQ_NONCE,
@@ -564,7 +564,7 @@ async fn run_op(
     json: bool,
 ) -> Result<i32, String> {
     let (mut reader, mut writer) = transport.split();
-    let mut fb = Vec::new();
+    let mut fb = FragmentReassembly::default();
     let sync_id = open_write_root(&mut reader, &mut writer, &mut fb, &client_abs(&root)).await?;
     let req = FsOp {
         nonce: REQ_NONCE,
@@ -710,7 +710,7 @@ pub async fn cmd_ln(
 /// request would simply never be answered.
 async fn require_fs(
     reader: &mut (impl AsyncRead + Unpin),
-    fragment_buf: &mut Vec<u8>,
+    fragment_buf: &mut FragmentReassembly,
 ) -> Result<(), String> {
     let features = handshake(reader, fragment_buf).await?;
     if features & FEATURE_FS == 0 {
@@ -724,7 +724,7 @@ async fn require_fs(
 /// Await the response whose first byte is `opcode` and whose nonce matches.
 async fn await_reply(
     reader: &mut (impl AsyncRead + Unpin),
-    fragment_buf: &mut Vec<u8>,
+    fragment_buf: &mut FragmentReassembly,
     opcode: u8,
     nonce: u16,
 ) -> Result<Vec<u8>, String> {
@@ -775,7 +775,7 @@ pub async fn cmd_grep(
     }
 
     let (mut reader, mut writer) = transport.split();
-    let mut fb = Vec::new();
+    let mut fb = FragmentReassembly::default();
     require_fs(&mut reader, &mut fb).await?;
     let msg = msg_fs_grep(
         REQ_NONCE,
@@ -862,7 +862,7 @@ pub async fn cmd_grep(
 pub async fn cmd_cat(transport: Transport, path: String, root: String) -> Result<i32, String> {
     use std::io::Write as _;
     let (mut reader, mut writer) = transport.split();
-    let mut fb = Vec::new();
+    let mut fb = FragmentReassembly::default();
     let sync_id = open_write_root(&mut reader, &mut writer, &mut fb, &client_abs(&root)).await?;
     let msg = msg_fs_fetch(REQ_NONCE, sync_id, &escape_wire(&path));
     if !write_frame(&mut writer, &msg).await {
@@ -895,7 +895,7 @@ pub async fn cmd_find(
     json: bool,
 ) -> Result<i32, String> {
     let (mut reader, mut writer) = transport.split();
-    let mut fb = Vec::new();
+    let mut fb = FragmentReassembly::default();
     require_fs(&mut reader, &mut fb).await?;
     let msg = msg_fs_search(REQ_NONCE, limit, &client_abs(&root), &query);
     if !write_frame(&mut writer, &msg).await {

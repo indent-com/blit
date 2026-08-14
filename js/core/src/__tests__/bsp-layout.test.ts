@@ -174,6 +174,32 @@ describe("assignmentsAfterDrop", () => {
     expect(next).toEqual({ "0": null, "1": "surface:c1:7" });
   });
 
+  it("recovers a surface source when the drop loses its source marker", () => {
+    const next = assignmentsAfterDrop(
+      { "0": "surface:c1:7", "1": "s2" },
+      "surface:c1:7",
+      "1",
+      undefined,
+      PANES,
+    );
+    expect(next).toEqual({ "0": "s2", "1": "surface:c1:7" });
+  });
+
+  it("recovers a surface source when the marked pane is stale", () => {
+    const next = assignmentsAfterDrop(
+      { "0": "surface:c1:7", "1": "s2", "2": "s3" },
+      "surface:c1:7",
+      "1",
+      "2",
+      PANES,
+    );
+    expect(next).toEqual({
+      "0": "s2",
+      "1": "surface:c1:7",
+      "2": "s3",
+    });
+  });
+
   it("is a no-op when dropped back on its own pane", () => {
     expect(
       assignmentsAfterDrop({ "0": "s1" }, "s1", "0", "0", PANES),

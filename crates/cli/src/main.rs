@@ -1,6 +1,8 @@
 mod agent;
 mod attach;
 mod cli;
+mod completion;
+mod extension;
 mod forward;
 mod fs;
 mod generate;
@@ -16,8 +18,8 @@ mod uplink;
 
 use clap::Parser;
 use cli::{
-    Cli, ClipboardCommand, Command, FsCommand, GitCommand, KvCommand, LspCommand, RemoteCommand,
-    SurfaceCommand, TerminalCommand,
+    Cli, ClientCommand, ClipboardCommand, Command, FsCommand, GitCommand, KvCommand, LspCommand,
+    RemoteCommand, SurfaceCommand, TerminalCommand,
 };
 
 // glibc malloc retains freed memory in per-thread arenas (up to 8 per core);
@@ -53,10 +55,10 @@ fn main() {
 
     // ProxyDaemon must run synchronously — blit_proxy::run() builds its own
     // tokio runtime, which panics if called from within an existing one.
-    // Detect this subcommand before entering the async runtime. Use `any()`
-    // rather than `nth(1)` so that global flags placed before the subcommand
-    // (e.g. `blit --on foo proxy-daemon`) are handled correctly.
-    if std::env::args().any(|a| a == "proxy-daemon") {
+    // Detect this subcommand before entering the async runtime. Account for
+    // global option values, but stop at the actual subcommand: a verbatim
+    // argument after `@name` must never launch the daemon.
+    if proxy_daemon_requested(std::env::args().skip(1)) {
         blit_proxy::run(false);
         return;
     }
@@ -75,12 +77,46 @@ fn main() {
         .block_on(async_main());
 }
 
+fn proxy_daemon_requested<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        let argument = argument.as_ref();
+        if matches!(argument, "--on" | "--hub") {
+            let _ = args.next();
+            continue;
+        }
+        if argument.starts_with("--on=") || argument.starts_with("--hub=") {
+            continue;
+        }
+        if argument == "proxy-daemon" {
+            return true;
+        }
+        if !argument.starts_with('-') {
+            return false;
+        }
+    }
+    false
+}
+
 async fn async_main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
+    if completion::run_if_requested(std::env::args().skip(1)).await {
+        return;
+    }
+
     let cli = Cli::parse();
+
+    if cli.advertised_command_json && !matches!(&cli.command, Command::External(_)) {
+        eprintln!("blit: root --json is only valid before an extension command namespace (@name)");
+        std::process::exit(2);
+    }
 
     match cli.command {
         Command::Terminal { command } => {
@@ -334,6 +370,27 @@ async fn async_main() {
                         None,
                     )
                     .await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("blit: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Client { command } => {
+            let cmd = command.unwrap_or(ClientCommand::List);
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let result = match cmd {
+                ClientCommand::List => agent::cmd_clients(transport).await,
+                ClientCommand::Kick { id, reason } => {
+                    agent::cmd_kick_client(transport, id, reason.as_deref().unwrap_or("")).await
                 }
             };
             if let Err(e) = result {
@@ -865,6 +922,65 @@ async fn async_main() {
                 }
             }
         }
+        Command::Extension { command } => {
+            let conn = &cli.connect;
+            let result = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(transport) => extension::dispatch(transport, command).await,
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Run(args) => {
+            let conn = &cli.connect;
+            let result = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(transport) => {
+                    extension::dispatch(transport, extension::ExtensionCommand::Run(args)).await
+                }
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::External(tokens) => {
+            // Reject unknown commands and oversized argument vectors before a
+            // bad invocation can cause a remote connection.
+            let result = match extension::parse_advertised_command(tokens) {
+                Ok((name, args)) => {
+                    let conn = &cli.connect;
+                    match transport::connect(&conn.on, &conn.hub).await {
+                        Ok(transport) => {
+                            extension::dispatch_advertised_command(
+                                transport,
+                                name,
+                                args,
+                                cli.advertised_command_json,
+                            )
+                            .await
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Command::Remote { command } => {
             let cmd = command.unwrap_or(RemoteCommand::List { reveal: false });
             cmd_remote(cmd);
@@ -894,8 +1010,22 @@ async fn async_main() {
             max_ptys,
             allow_forward,
             allow_forward_insecure,
+            allow_persistent_extensions,
+            deployment,
             verbose,
+            no_processes,
         } => {
+            let deployment = match deployment.into_overrides() {
+                Ok(deployment) => deployment,
+                Err(error) => {
+                    eprintln!("blit server: {error}");
+                    std::process::exit(2);
+                }
+            };
+            if let Err(error) = blit_server::configure_deployment(deployment) {
+                eprintln!("blit server: {error}");
+                std::process::exit(2);
+            }
             let ipc_path = socket
                 .or_else(|| std::env::var("BLIT_SOCK").ok())
                 .unwrap_or_else(blit_server::default_ipc_path);
@@ -948,6 +1078,8 @@ async fn async_main() {
                         .ok()
                         .map(|v| v == "1")
                         .unwrap_or(false),
+                processes: !no_processes
+                    && !std::env::var("BLIT_PROCESS").is_ok_and(|value| value == "0"),
                 // Both default to 0 (unlimited), which is the right default:
                 // a client that can open a PTY can already spend the machine's
                 // resources from inside it, so these are an operator sanity
@@ -975,6 +1107,8 @@ async fn async_main() {
                         .unwrap_or(false),
                 allow_forward,
                 allow_forward_insecure,
+                allow_persistent_extensions: allow_persistent_extensions
+                    || std::env::var("BLIT_ALLOW_EXT_PERSIST").is_ok_and(|value| value == "1"),
             };
             blit_server::run(config).await;
         }
@@ -1440,7 +1574,7 @@ async fn cmd_upgrade() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::mask_share_passphrase;
+    use super::{mask_share_passphrase, proxy_daemon_requested};
 
     #[test]
     fn test_mask_share_passphrase() {
@@ -1455,5 +1589,25 @@ mod tests {
         );
         assert_eq!(mask_share_passphrase("local"), "local");
         assert_eq!(mask_share_passphrase("share:"), "share:****");
+    }
+
+    #[test]
+    fn proxy_daemon_detection_stops_at_extension_command_arguments() {
+        assert!(proxy_daemon_requested(["--on", "prod", "proxy-daemon"]));
+        assert!(proxy_daemon_requested([
+            "--hub=https://hub",
+            "proxy-daemon"
+        ]));
+        assert!(!proxy_daemon_requested([
+            "--on",
+            "prod",
+            "@builder",
+            "proxy-daemon"
+        ]));
+        assert!(!proxy_daemon_requested([
+            "--on",
+            "proxy-daemon",
+            "@builder"
+        ]));
     }
 }

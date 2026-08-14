@@ -187,6 +187,7 @@ pub async fn cmd_attach(transport: Transport, id: u16) -> Result<i32, String> {
     let mut state = TerminalState::new(rows, cols);
     let mut exit = 0i32;
     let mut detached = false;
+    let mut connection_error = None;
 
     while !detached {
         if RESIZED.swap(false, Ordering::Relaxed) {
@@ -209,9 +210,15 @@ pub async fn cmd_attach(transport: Transport, id: u16) -> Result<i32, String> {
             msg = conn.recv() => {
                 let data = match msg {
                     Ok(d) => d,
-                    // The far end going away is a normal end to a session,
-                    // not a failure worth a stack of errors.
-                    Err(_) => break,
+                    // Being kicked is a failure the user needs to see; the far
+                    // end merely going away is a normal end to a session, not
+                    // a failure worth a stack of errors.
+                    Err(e) => {
+                        if conn.kicked_reason().is_some() {
+                            connection_error = Some(e);
+                        }
+                        break;
+                    }
                 };
                 if data.is_empty() {
                     continue;
@@ -253,7 +260,7 @@ pub async fn cmd_attach(transport: Transport, id: u16) -> Result<i32, String> {
     if detached {
         eprintln!("blit: detached from {id} (still running)");
     }
-    Ok(exit)
+    connection_error.map_or(Ok(exit), Err)
 }
 
 #[cfg(not(unix))]

@@ -71,6 +71,8 @@ export interface BlitTransport {
   send(data: Uint8Array): void;
   /** Close the transport connection. */
   close(): void;
+  /** Stop the active connection and automatic retries without disposing it. */
+  suspend?(): void;
   /** Tear down the current connection and reconnect from scratch. */
   reconnect?(): void;
   /** Current connection status. */
@@ -121,6 +123,52 @@ export type BlitSession = {
   exitStatus: number | null;
 };
 
+/** An active terminal subscription held by another server connection. */
+export interface BlitClientTerminalSubscription {
+  ptyId: number;
+  /** Null when the client subscribed before advertising a view size. */
+  rows: number | null;
+  /** Null when the client subscribed before advertising a view size. */
+  cols: number | null;
+}
+
+/** An active Wayland surface subscription held by another connection. */
+export interface BlitClientSurfaceSubscription {
+  surfaceId: number;
+  /** Encoded pixel dimensions requested by the client, if reported. */
+  width: number | null;
+  height: number | null;
+  /** Fractional scale in 120ths (120 = 1x), if reported. */
+  scale120: number | null;
+}
+
+/** A non-terminal, non-surface subscription held by a connection. */
+export interface BlitClientAuxSubscription {
+  /** One of the `CLIENT_SUBSCRIPTION_*` constants; unknown values are retained. */
+  kind: number;
+  /** Resource identifier within that protocol family. Audio uses zero. */
+  id: number;
+}
+
+export interface BlitClientInfo {
+  id: bigint;
+  /** Whole seconds since the server accepted the connection. */
+  ageSeconds: number;
+  /** Actual framed bytes written by the server to this client per second. */
+  outboundBytesPerSecond: number;
+  /** Audio, filesystem, Git, LSP, KV and network subscriptions. */
+  subscriptions: readonly BlitClientAuxSubscription[];
+  terminals: readonly BlitClientTerminalSubscription[];
+  surfaces: readonly BlitClientSurfaceSubscription[];
+}
+
+/** Snapshot returned by listClients or a live subscribeClients callback. */
+export interface BlitClientList {
+  selfId: bigint;
+  /** Every currently connected client, including the requester. */
+  clients: readonly BlitClientInfo[];
+}
+
 export interface BlitConnectionSnapshot {
   id: ConnectionId;
   status: ConnectionStatus;
@@ -133,6 +181,8 @@ export interface BlitConnectionSnapshot {
   /** Server forwards Wayland text-input requests to surface viewers. */
   supportsSurfaceTextInput: boolean;
   supportsAudio: boolean;
+  /** Server supports enumerating and kicking other connections. */
+  supportsClientControl: boolean;
   supportsFsSync: boolean;
   /** Server advertises `FEATURE_GIT` (git introspection, docs/git.md). */
   supportsGit: boolean;
@@ -140,6 +190,12 @@ export interface BlitConnectionSnapshot {
   supportsLsp: boolean;
   /** Server advertises the KV store family (docs/design/kv.md). */
   supportsKv: boolean;
+  /** Server bridges tray items and desktop notifications. */
+  supportsDesktop: boolean;
+  /** Server supports process-global named bidirectional channels. */
+  supportsChannels: boolean;
+  /** Server understands viewer media, portals, and MPRIS runtime state. */
+  supportsDesktopMedia: boolean;
   retryCount: number;
   /** Opaque 64-bit identifier for the current server process, or `null` for
    *  servers predating the extended HELLO. */
@@ -232,6 +288,14 @@ export const C2S_DISPLAY_RATE = 0x04;
 export const C2S_CLIENT_METRICS = 0x05;
 export const C2S_MOUSE = 0x06;
 export const C2S_RESTART = 0x07;
+/** Enumerate server connections: [nonce:2]. */
+export const C2S_CLIENT_LIST = 0x09;
+/** Kick another connection: [nonce:2][client_id:8][reason:N]. */
+export const C2S_KICK = 0x0a;
+/** Start streaming connection-catalog snapshots under this nonce. */
+export const C2S_CLIENT_WATCH = 0x0b;
+/** Stop the connection-catalog stream under this nonce. */
+export const C2S_CLIENT_UNWATCH = 0x0c;
 export const C2S_CREATE = 0x10;
 export const C2S_FOCUS = 0x11;
 export const C2S_CLOSE = 0x12;
@@ -300,6 +364,21 @@ export const S2C_CREATE_FAILED = 0x10;
  *  reports the result here, so both ends keep naming the same rows.  Sent
  *  only while scrolled back, and only when the offset actually moved. */
 export const S2C_SCROLL_OFFSET = 0x11;
+/** Client catalog. Each client record carries its active terminal and surface
+ * subscriptions and their most recently advertised view sizes. */
+export const S2C_CLIENT_LIST = 0x12;
+/** Correlated kick outcome: [nonce:2][status:1][detail:N]. */
+export const S2C_KICK_RESULT = 0x13;
+/** This connection was kicked: [reason:N]. The server closes it next. */
+export const S2C_KICKED = 0x14;
+
+/** Auxiliary subscription kinds in client-catalog records. */
+export const CLIENT_SUBSCRIPTION_AUDIO = 1;
+export const CLIENT_SUBSCRIPTION_FS = 2;
+export const CLIENT_SUBSCRIPTION_GIT = 3;
+export const CLIENT_SUBSCRIPTION_LSP = 4;
+export const CLIENT_SUBSCRIPTION_KV = 5;
+export const CLIENT_SUBSCRIPTION_NET = 6;
 export const C2S_PING = 0x08;
 export const C2S_QUIT = 0x0f;
 
@@ -414,6 +493,14 @@ export const REMOTE_INPUT_TOUCH = 1;
  */
 export const S2C_FRAGMENT = 0x2b;
 export const FRAGMENT_FLAG_LAST = 1 << 0;
+/** Maximum encoded transport frame, shared with the Rust protocol reader. */
+export const MAX_FRAME_SIZE = 16 * 1024 * 1024;
+/** Fragment payload capacity after the opcode and flags bytes. */
+export const MAX_FRAGMENT_CHUNK = MAX_FRAME_SIZE - 2;
+/** Maximum fragments in one logical message. */
+export const MAX_FRAGMENT_COUNT = 16_384;
+/** Maximum reassembled logical message. */
+export const MAX_LOGICAL_MESSAGE = 64 * 1024 * 1024;
 export const SURFACE_FRAME_FLAG_KEYFRAME = 1 << 0;
 export const SURFACE_FRAME_CODEC_MASK = 0b110;
 export const SURFACE_FRAME_CODEC_H264 = 0 << 1;
@@ -474,6 +561,8 @@ export const FEATURE_SCROLL_BY = 1 << 17;
 export const FEATURE_SURFACE_TOUCH = 1 << 18;
 /** Wayland text-input enable/disable and content purpose forwarding. */
 export const FEATURE_SURFACE_TEXT_INPUT = 1 << 19;
+/** Server connections can be enumerated and another connection kicked. */
+export const FEATURE_CLIENT_CONTROL = 1 << 20;
 
 // -- Common status registry (docs/protocol.md) ------------------------------
 //

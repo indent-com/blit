@@ -2166,7 +2166,7 @@ The default count caps additionally bound stored channel metadata to about
 80 MiB (64 MiB of listener metadata, 16 MiB across connected pairs, and under
 64 KiB of bounded peer labels). Channel window reservations add at most 256 MiB
 of server buffers. Together with the four-running-attempt extension example
-below, the server-visible buffer and metadata plan is about 1.90 GiB at
+below, the server-visible buffer and metadata plan is about 1.96 GiB at
 simultaneous full admission, before the explicitly unaccounted engine,
 allocator, and kernel costs. A smaller host-derived running default produces a
 smaller number.
@@ -2179,9 +2179,10 @@ configured maxima account for approximately 776 MiB of linear memory, duplex
 buffers, adapter handoffs, and native stacks. Their exact queued-egress maximum
 is another 256 MiB, the server-global retained-output store is 64 MiB, the
 terminal-record reserve is about 1.1 MiB at the default transient cap, two concurrent 64 MiB
-validation/translation inputs add 128 MiB, retained argument vectors add 256
-MiB, the command directory plus discovery snapshots add 64 MiB, and retained
-tracked-job request storage adds 64 MiB, for about 1,609 MiB of explicitly
+validation/translation inputs add 128 MiB, the separately bounded network
+validation-request lane adds 64 MiB, retained argument vectors add 256 MiB,
+the command directory plus discovery snapshots add 64 MiB, and retained
+tracked-job request storage adds 64 MiB, for about 1,673 MiB of explicitly
 accounted major buffers.
 
 That figure is a configuration-derived planning number, not an exact RSS
@@ -2196,7 +2197,7 @@ Wasmi exposes no exact aggregate-RSS limiter. Startup diagnostics
 must compute and report the extension subtotal, channel
 reservation-and-metadata subtotal, combined plan, and unaccounted-runtime
 caveat from the host's actual sampled defaults and configured overrides. The
-1,609 MiB, 336 MiB, and roughly 1.90 GiB figures are the four-attempt/default-
+1,673 MiB, 336 MiB, and roughly 1.96 GiB figures are the four-attempt/default-
 other-settings example, not constants. Changing the transient cap also
 recomputes and reports the compact terminal-record reserve. Diagnostics must
 not present only per-attempt numbers or claim a hard resident-memory envelope.

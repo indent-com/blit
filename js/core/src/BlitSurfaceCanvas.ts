@@ -20,6 +20,7 @@ import type {
   SurfaceCursorImage,
   SurfaceTextInputEvent,
 } from "./SurfaceStore";
+import { av1LevelString } from "./videoCodec";
 import {
   SURFACE_POINTER_DOWN,
   SURFACE_POINTER_UP,
@@ -41,6 +42,8 @@ import {
   halvings,
   octaveCeil,
 } from "./downscale";
+
+export { av1LevelString } from "./videoCodec";
 
 /** Cached codec support bitmask.  Computed once, reused for all resize messages. */
 let _codecSupport: number | null = null;
@@ -168,41 +171,6 @@ const DECODE_PROBE_SIZES: [number, number][] = [
   [5120, 2880],
   [3840, 2160],
 ];
-
-/**
- * AV1 `seq_level_idx` for a frame of this size at 60 fps, as the two-digit
- * string a codec parameter wants.  Mirrors `av1_level_for()` on the server,
- * which decides what the bitstream actually declares — probing at a level
- * below what we would be sent would pass here and fail later, and probing
- * above it under-reports on decoders that gate on level.
- */
-export function av1LevelString(width: number, height: number): string {
-  const pic = width * height;
-  const rate = pic * 60;
-  // [seq_level_idx, maxPicSize, maxHSize, maxVSize, maxDisplayRate] —
-  // spec Table A.3.  Levels whose limits duplicate the previous row for
-  // these fields (5.3, 6.3) can never be picked and are folded into the
-  // fallthrough, exactly like the server table.
-  const specs: [number, number, number, number, number][] = [
-    [0, 147456, 2048, 1152, 4423680],
-    [1, 278784, 2816, 1584, 8363520],
-    [4, 665856, 4352, 2448, 19975680],
-    [5, 1065024, 5504, 3096, 31950720],
-    [8, 2359296, 6144, 3456, 70778880],
-    [9, 2359296, 6144, 3456, 141557760],
-    [12, 8912896, 8192, 4352, 267386880],
-    [13, 8912896, 8192, 4352, 534773760],
-    [14, 8912896, 8192, 4352, 1069547520],
-    [16, 35651584, 16384, 8704, 1069547520],
-    [17, 35651584, 16384, 8704, 2139095040],
-    [18, 35651584, 16384, 8704, 4278190080],
-  ];
-  for (const [idx, maxPic, maxW, maxH, maxRate] of specs) {
-    if (pic <= maxPic && width <= maxW && height <= maxH && rate <= maxRate)
-      return String(idx).padStart(2, "0");
-  }
-  return "19";
-}
 
 // Minimal 64×64 4:4:4 test frames for real-decode probing.
 // isConfigSupported() is unreliable for 4:4:4 — e.g. Chromium reports AV1
@@ -1268,6 +1236,12 @@ export class BlitSurfaceCanvas {
    *  Alt-hold semantics for apps that react to them. */
   private macOptionChars = detectMacOptionChars();
 
+  /** True from compositionstart through compositionend. Some engines report
+   *  `KeyboardEvent.isComposing=false` on the keystroke that completes a
+   *  dead-key composition; the explicit lifecycle keeps that key on the IME
+   *  path instead of forwarding it as ordinary input and cancelling commit. */
+  private compositionActive = false;
+
   /** Active single-finger gesture used to emulate mouse input on iPadOS. */
   private activeTouch: {
     identifier: number;
@@ -1373,9 +1347,7 @@ export class BlitSurfaceCanvas {
     surfaceId: number;
   } | null = null;
 
-  /** Hidden textarea used to capture IME composition.  Focus stays on
-   *  the canvas for normal typing; the textarea only receives focus when
-   *  an IME composition session is active. */
+  /** Hidden textarea used as the editable keyboard and IME target. */
   private textInput: HTMLTextAreaElement | null = null;
   /** Keep the iOS capture field non-empty so a held soft-keyboard Backspace
    *  continues producing deleteContentBackward events. */
@@ -2198,6 +2170,26 @@ export class BlitSurfaceCanvas {
       const prev = this.surface;
       this.surface = store.getSurface(this._surfaceId);
       this.updateRemotePointerOverlay();
+      // S2C_SURFACE_DESTROYED retires the connection's subscription map
+      // before SurfaceStore publishes the removal.  A BSP leaf can stay
+      // mounted across a destroy/recreate of the same numeric id (notably
+      // while a page reload resettles every surface), so forget this view's
+      // matching local claim as well.  Otherwise the later CREATED change
+      // sees `_subscribedSurface` and wrongly assumes the view is still in
+      // the connection map, leaving the recreated surface unsubscribed.
+      //
+      // A reconnect also removes store entries, but increments generation
+      // and deliberately preserves connection-side view tokens.  Keep that
+      // path on refreshSurfaceSubscribe rather than turning it into a fresh
+      // attachment.
+      if (
+        prev &&
+        !this.surface &&
+        this._subscribedGeneration === store.generation
+      ) {
+        this._subscribedSurface = null;
+        this._subscribedGeneration = -1;
+      }
       // Re-subscribe when the store generation changed (reconnect — the
       // server dropped all subscriptions but the surface reappeared with
       // the same IDs).  We no longer need to handle the "surface info
@@ -2631,8 +2623,17 @@ export class BlitSurfaceCanvas {
     // A Wayland selection stays authoritative while focus moves between
     // streamed surfaces.  Only leaving the browser context, or a genuine
     // DOM copy/cut, means the host clipboard may now be newer.
-    this.boundWindowBlur = () =>
+    //
+    // The focused textarea can remain document.activeElement while the
+    // browser window itself loses focus, so its blur handler is not a
+    // reliable key-state boundary.  Release here as well: app/tab switching
+    // commonly consumes the modifier key-up that completed the switch.
+    this.boundWindowBlur = () => {
       this.getConn()?.noteBrowserClipboardMayHaveChanged();
+      this.compositionActive = false;
+      this._pendingPasteAbandon?.();
+      this.releaseAllKeys();
+    };
     this.boundBrowserClipboardChange = () =>
       this.getConn()?.noteBrowserClipboardMayHaveChanged();
 
@@ -2707,15 +2708,22 @@ export class BlitSurfaceCanvas {
     };
     window.addEventListener("dragend", this.boundDragEnd);
 
-    // Hidden textarea is only used for IME composition.  Focus stays on
-    // the canvas during normal typing; we redirect to the textarea when
-    // a composition session starts (detected via compositionstart on the
-    // canvas) and return focus to the canvas when it ends.
+    this.boundCompositionStart = () => {
+      this.compositionActive = true;
+      for (const kc of this.pendingAlt) this.swallowedAlt.add(kc);
+      this.pendingAlt.clear();
+      if (this.textInput) this.textInput.focus({ preventScroll: true });
+    };
+
+    // The textarea is the normal keyboard target and owns the composition
+    // lifecycle. Keep the canvas listener below as a fallback for embedders
+    // that move focus there themselves.
     if (ta) {
       this.boundTextInput = (e) => this.handleTextInput(e as InputEvent);
       this.boundCompositionEnd = (e) => this.handleCompositionEnd(e);
 
       ta.addEventListener("input", this.boundTextInput);
+      ta.addEventListener("compositionstart", this.boundCompositionStart);
       ta.addEventListener("compositionend", this.boundCompositionEnd);
       // Also listen for keydown on textarea so keys during IME composition
       // (e.g. Enter to confirm, Escape to cancel) still get routed.
@@ -2735,9 +2743,6 @@ export class BlitSurfaceCanvas {
     // anyway.  Chromium does not — it fires nothing at all while a canvas
     // holds focus, which is why the handoff cannot wait for this event and
     // happens on focus instead.
-    this.boundCompositionStart = () => {
-      if (this.textInput) this.textInput.focus({ preventScroll: true });
-    };
     canvas.addEventListener("compositionstart", this.boundCompositionStart);
     this.seedIOSInputPad();
   }
@@ -2843,6 +2848,8 @@ export class BlitSurfaceCanvas {
     if (ta) {
       if (this.boundTextInput)
         ta.removeEventListener("input", this.boundTextInput);
+      if (this.boundCompositionStart)
+        ta.removeEventListener("compositionstart", this.boundCompositionStart);
       if (this.boundCompositionEnd)
         ta.removeEventListener("compositionend", this.boundCompositionEnd);
       if (this.boundKeyDown)
@@ -2852,6 +2859,7 @@ export class BlitSurfaceCanvas {
       if (this.boundBlur) ta.removeEventListener("blur", this.boundBlur);
       if (this.boundPaste) ta.removeEventListener("paste", this.boundPaste);
     }
+    this.compositionActive = false;
   }
 
   private handleMouse(e: MouseEvent, type: number): void {
@@ -4315,10 +4323,16 @@ export class BlitSurfaceCanvas {
     // Sidebar previews should not intercept keyboard or send events.
     if (!this._displaySize) return;
 
-    // Dead keys / ongoing IME composition: redirect focus to the hidden
-    // textarea so the browser's composition UI can work.  The textarea's
-    // compositionend handler sends the result and returns focus here.
-    if (pressed && (e.key === "Dead" || e.isComposing)) {
+    // Dead keys / ongoing IME composition stay with the hidden textarea so
+    // the browser can finish the composition. Its compositionend handler
+    // sends the result; focus remains on this editable target.
+    if (
+      pressed &&
+      (e.key === "Dead" ||
+        e.isComposing ||
+        this.compositionActive ||
+        e.keyCode === 229)
+    ) {
       // A macOS dead key (Option+E → ´) means the Alt press held back below
       // is part of a character composition, not a modifier chord — drop it
       // so the app never sees it (and ignore its key-up later).
@@ -4802,7 +4816,7 @@ export class BlitSurfaceCanvas {
     // rather than `compositionupdate` because that one fires *before* the
     // DOM is updated — the caret read there is the previous one, which put
     // the app's cursor at 0 for every composition.
-    if (e.isComposing) {
+    if (this.compositionActive || e.isComposing) {
       const conn = this.getConn();
       if (conn && this.surface && this._displaySize && ta) {
         const text = this._iosInputPad ? stripIOSInputPad(ta.value) : ta.value;
@@ -4879,6 +4893,7 @@ export class BlitSurfaceCanvas {
   private handleCompositionEnd(e: CompositionEvent): void {
     const ta = this.textInput;
     if (!ta) return;
+    this.compositionActive = false;
     const conn = this.getConn();
     if (e.data) {
       if (conn && this.surface) {
@@ -4907,14 +4922,25 @@ export class BlitSurfaceCanvas {
     // they need no release — only forgetting.
     this.pendingAlt.clear();
     this.swallowedAlt.clear();
-    if (this.pressedKeys.size === 0) return;
-    const conn = this.getConn();
-    if (!conn || !this.surface) return;
-    for (const kc of this.pressedKeys) {
-      conn.sendSurfaceInput(this._surfaceId, kc, false);
-    }
+    // Clear local state even when the connection is currently unavailable.
+    // Its server-side disconnect cleanup releases the old presses; retaining
+    // them here would make a reconnected canvas treat the next real keydown as
+    // a repeat of a key the new connection has never seen.
+    const held = [...this.pressedKeys];
+    const keycodes = [
+      ...held.filter((kc) => !EVDEV_MODIFIERS.has(kc)),
+      ...held.filter((kc) => EVDEV_MODIFIERS.has(kc)),
+    ];
     this.pressedKeys.clear();
     this._metaToCtrl = 0;
+    if (keycodes.length === 0) return;
+    const conn = this.getConn();
+    if (!conn || !this.surface) return;
+    // Unwind chord keys before their modifiers so an application never sees
+    // a still-repeating ordinary key become unmodified during cleanup.
+    for (const kc of keycodes) {
+      conn.sendSurfaceInput(this._surfaceId, kc, false);
+    }
   }
 
   private handleBlur(e: FocusEvent): void {
@@ -4925,6 +4951,7 @@ export class BlitSurfaceCanvas {
     // physically down.
     const to = e.relatedTarget;
     if (to && (to === this.canvas || to === this.textInput)) return;
+    this.compositionActive = false;
     // Focus genuinely leaving mid-paste-chord is the one thing no
     // clipboard read or paste event will ever settle: stand the chord
     // down (its V was never pressed) before releasing what is held.

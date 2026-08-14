@@ -1,5 +1,6 @@
 import type {
   BlitConnectionSnapshot,
+  BlitClientList,
   BlitSearchResult,
   BlitSession,
   BlitTransport,
@@ -15,6 +16,7 @@ import {
   FEATURE_AUDIO,
   FEATURE_COMPOSITOR,
   FEATURE_COPY_RANGE,
+  FEATURE_CLIENT_CONTROL,
   FEATURE_CREATE_NONCE,
   FEATURE_CREATE_STATUS,
   FEATURE_KILL_MODE,
@@ -35,6 +37,9 @@ import {
   S2C_CREATE_FAILED,
   S2C_EXITED,
   S2C_HELLO,
+  S2C_KICKED,
+  S2C_CLIENT_LIST,
+  S2C_KICK_RESULT,
   S2C_LIST,
   S2C_READY,
   S2C_SEARCH_RESULTS,
@@ -56,6 +61,9 @@ import {
   SURFACE_TEXT_INPUT_REQUESTED,
   S2C_FRAGMENT,
   FRAGMENT_FLAG_LAST,
+  MAX_FRAGMENT_CHUNK,
+  MAX_FRAGMENT_COUNT,
+  MAX_LOGICAL_MESSAGE,
   S2C_PING,
   S2C_QUIT,
   S2C_TEXT,
@@ -66,6 +74,7 @@ import {
   S2C_USED_ROWS,
   S2C_SCROLL_OFFSET,
   C2S_PING,
+  STATUS_OK,
   SURFACE_TOUCH_ENABLE,
   SURFACE_TOUCH_DISABLE,
 } from "./types";
@@ -112,12 +121,19 @@ import {
   buildClipboardMessage,
   buildPrimaryMessage,
   buildClientFeaturesMessage,
+  buildClientListMessage,
+  buildClientWatchMessage,
+  buildClientUnwatchMessage,
+  buildKickClientMessage,
+  kickReasonByteLength,
+  KICK_REASON_MAX,
   buildAudioSubscribeMessage,
   buildAudioUnsubscribeMessage,
   buildSurfaceTouchMessage,
   type SurfaceTouchPoint,
 } from "./protocol";
 import { AudioPlayer } from "./AudioPlayer";
+import { FEATURE_CHANNEL } from "./channel";
 import { SurfaceStore } from "./SurfaceStore";
 import { TerminalStore, type BlitWasmModule } from "./TerminalStore";
 import {
@@ -199,7 +215,6 @@ import {
   parseFsUploadChunkAck,
   parseFsUploadFinishReply,
   encodeFsDelta,
-  FS_MAX_DECOMPRESSED,
   FsConflictError,
   FsOpenError,
   type FsFileIndex,
@@ -373,6 +388,20 @@ import {
   type KvWatchOptions,
 } from "./kv";
 import { Notifier } from "./reactive";
+import {
+  DesktopStore,
+  FEATURE_DESKTOP,
+  S2C_NOTIFICATION_UPDATE,
+  S2C_TRAY_MENU,
+  S2C_TRAY_UPDATE,
+} from "./desktop";
+import {
+  FEATURE_DESKTOP_MEDIA,
+  MediaStore,
+  MprisStore,
+  S2C_MEDIA_CONTROL,
+  parseMediaControl,
+} from "./media";
 
 const textDecoder = new TextDecoder();
 
@@ -589,6 +618,9 @@ export class BlitConnection {
   private readonly store: TerminalStore;
   readonly surfaceStore = new SurfaceStore();
   readonly audioPlayer = new AudioPlayer();
+  readonly desktopStore = new DesktopStore();
+  readonly mediaStore = new MediaStore();
+  readonly mprisStore = new MprisStore();
 
   private readonly listeners = new Set<() => void>();
   private readonly scrollAnchorListeners = new Set<{
@@ -607,6 +639,28 @@ export class BlitConnection {
       reject: (error: Error) => void;
     }
   >();
+  private readonly pendingClientLists = new Map<
+    number,
+    {
+      resolve: (result: BlitClientList) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  private readonly pendingClientKicks = new Map<
+    number,
+    { resolve: () => void; reject: (error: Error) => void }
+  >();
+  private readonly clientCatalogSubscribers = new Set<{
+    listener: (catalog: BlitClientList) => void;
+    onError?: (error: Error) => void;
+  }>();
+  private clientCatalogWatchNonce: number | null = null;
+  /** Nonce of the most recent `CLIENT_UNWATCH`. A successful unwatch draws no
+   *  reply, so without holding the nonce back it is free for reuse while a
+   *  refusal of that unwatch is still in flight — and the refusal would then
+   *  settle whichever request had since taken the nonce. */
+  private retiredWatchNonce: number | null = null;
+  private lastClientCatalog: BlitClientList | null = null;
   /** Unanswered `C2S_FS_SYNC`s by nonce; `pendingFsSyncsByKey` indexes the
    *  same entries so wire-identical opens coalesce while in flight. */
   private readonly pendingFsSyncs = new Map<number, PendingFsSync>();
@@ -779,6 +833,7 @@ export class BlitConnection {
 
   private sessionCounter = 0;
   private nonceCounter = 0;
+  private clientControlNonceCounter = 0;
   private searchCounter = 0;
   private fsNonceCounter = 0;
   private gitLogIdCounter = 0;
@@ -850,6 +905,7 @@ export class BlitConnection {
    */
   private fragmentBuffer = new Uint8Array(0);
   private fragmentBytes = 0;
+  private fragmentCount = 0;
   private readonly surfaceAckMessages = new Map<number, Uint8Array>();
 
   private snapshot: BlitConnectionSnapshot;
@@ -857,6 +913,15 @@ export class BlitConnection {
   private _publicSessions: BlitSession[] = [];
   private _publicSessionsDirty = false;
   private _logger: import("./BlitWorkspace").BlitLogger;
+  private readonly sendDesktopMedia = (message: Uint8Array): void => {
+    this.transport.send(message);
+  };
+
+  private setDesktopMediaTransportStatus(status: ConnectionStatus): void {
+    const sender = status === "connected" ? this.sendDesktopMedia : null;
+    this.mediaStore.setSender(sender);
+    this.mprisStore.setSender(sender);
+  }
 
   constructor({
     id,
@@ -873,6 +938,10 @@ export class BlitConnection {
       warn: (m, ...a) => console.warn(`[blit] ${m}`, ...a),
     };
     this.surfaceStore.setConnectionId(id);
+    this.desktopStore.setSender((message) => {
+      if (this.transport.status === "connected") this.transport.send(message);
+    });
+    this.setDesktopMediaTransportStatus(this.transport.status);
     this.surfaceStore.setAckSender((surfaceId, decoderQueueDepth) => {
       if (this.transport.status === "connected") {
         let message = this.surfaceAckMessages.get(surfaceId);
@@ -948,10 +1017,14 @@ export class BlitConnection {
       supportsSurfaceTouch: false,
       supportsSurfaceTextInput: false,
       supportsAudio: false,
+      supportsClientControl: false,
       supportsFsSync: false,
       supportsGit: false,
       supportsLsp: false,
       supportsKv: false,
+      supportsDesktop: false,
+      supportsChannels: false,
+      supportsDesktopMedia: false,
       retryCount: 0,
       bootGeneration: null,
       serverVersion: null,
@@ -997,6 +1070,9 @@ export class BlitConnection {
     // to false but nothing in the SolidJS reactive graph notices, so the
     // Workspace audio effect never re-runs to re-subscribe.
     this.audioPlayer.onChange(() => this.emit());
+    this.desktopStore.subscribe(() => this.emit());
+    this.mediaStore.subscribe(() => this.emit());
+    this.mprisStore.subscribe(() => this.emit());
 
     if (autoConnect) {
       this.connect();
@@ -1030,6 +1106,11 @@ export class BlitConnection {
   }
 
   reconnect(): void {
+    if (this.lastError !== null) {
+      this.lastError = null;
+      this.snapshot = { ...this.snapshot, error: null };
+      this.emit();
+    }
     if (this.transport.reconnect) {
       this.transport.reconnect();
     } else {
@@ -1073,6 +1154,8 @@ export class BlitConnection {
     );
     this.rejectPendingSearches(connectionError("Connection disposed"));
     this.rejectPendingReads(connectionError("Connection disposed"));
+    this.resetClientControl(connectionError("Connection disposed"));
+    this.clientCatalogSubscribers.clear();
     this.resetFsSyncs(connectionError("Connection disposed"));
     this.resetGitRepos(connectionError("Connection disposed"));
     this.resetLspAttachments(connectionError("Connection disposed"));
@@ -1088,6 +1171,12 @@ export class BlitConnection {
     this.store.destroy();
     this.surfaceStore.destroy();
     this.audioPlayer.destroy();
+    this.desktopStore.reset();
+    this.desktopStore.setSender(null);
+    this.mediaStore.reset();
+    this.mediaStore.setSender(null);
+    this.mprisStore.reset(connectionError("Connection disposed"));
+    this.mprisStore.setSender(null);
   }
 
   setVisibleSessionIds(sessionIds: Iterable<SessionId>): void {
@@ -1195,6 +1284,144 @@ export class BlitConnection {
 
   supportsCopyRange(): boolean {
     return (this.features & FEATURE_COPY_RANGE) !== 0;
+  }
+
+  /** List other connections to this server and their active subscriptions. */
+  listClients(): Promise<BlitClientList> {
+    const error = this.clientControlAvailabilityError("list clients");
+    if (error) return Promise.reject(error);
+    return new Promise<BlitClientList>((resolve, reject) => {
+      const nonce = this.nextClientControlNonce();
+      this.pendingClientLists.set(nonce, { resolve, reject });
+      this.transport.send(buildClientListMessage(nonce));
+    });
+  }
+
+  /**
+   * Subscribe to the live catalog of other server connections. Multiple
+   * consumers share one wire subscription. The returned function disposes
+   * this consumer and unwatches the server after the final consumer leaves.
+   */
+  subscribeClients(
+    listener: (catalog: BlitClientList) => void,
+    onError?: (error: Error) => void,
+  ): () => void {
+    const subscriber = { listener, onError };
+    this.clientCatalogSubscribers.add(subscriber);
+    if (this.lastClientCatalog) listener(this.lastClientCatalog);
+    this.startClientCatalogWatch();
+    return () => {
+      if (!this.clientCatalogSubscribers.delete(subscriber)) return;
+      if (this.clientCatalogSubscribers.size === 0) {
+        this.stopClientCatalogWatch();
+      }
+    };
+  }
+
+  /** Disconnect another connection to this server. */
+  kickClient(clientId: bigint, reason = ""): Promise<void> {
+    const error = this.clientControlAvailabilityError("kick a client");
+    if (error) return Promise.reject(error);
+    if (clientId < 0n || clientId > 0xffff_ffff_ffff_ffffn) {
+      return Promise.reject(
+        connectionError("Client ID is outside the u64 range"),
+      );
+    }
+    // Refuse rather than send a silently shortened reason: the point of a
+    // reason is that the kicked peer reads what you wrote.
+    const reasonBytes = kickReasonByteLength(reason);
+    if (reasonBytes > KICK_REASON_MAX) {
+      return Promise.reject(
+        connectionError(
+          `Kick reason is ${reasonBytes} bytes; maximum is ${KICK_REASON_MAX}`,
+        ),
+      );
+    }
+    return new Promise<void>((resolve, reject) => {
+      const nonce = this.nextClientControlNonce();
+      this.pendingClientKicks.set(nonce, { resolve, reject });
+      this.transport.send(buildKickClientMessage(nonce, clientId, reason));
+    });
+  }
+
+  private clientControlAvailabilityError(action: string): Error | null {
+    if (this.transport.status !== "connected") {
+      return connectionError(
+        `Cannot ${action} while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_CLIENT_CONTROL) === 0) {
+      return connectionError("Server does not support client control");
+    }
+    return null;
+  }
+
+  private nextClientControlNonce(): number {
+    let nonce = 0;
+    do {
+      nonce = this.clientControlNonceCounter =
+        (this.clientControlNonceCounter + 1) & 0xffff;
+    } while (
+      this.pendingClientLists.has(nonce) ||
+      this.pendingClientKicks.has(nonce) ||
+      this.clientCatalogWatchNonce === nonce ||
+      this.retiredWatchNonce === nonce
+    );
+    return nonce;
+  }
+
+  private startClientCatalogWatch(): void {
+    if (
+      this.clientCatalogSubscribers.size === 0 ||
+      this.clientCatalogWatchNonce !== null
+    ) {
+      return;
+    }
+    const error = this.clientControlAvailabilityError(
+      "subscribe to the client catalog",
+    );
+    if (error) {
+      for (const subscriber of this.clientCatalogSubscribers) {
+        subscriber.onError?.(error);
+      }
+      return;
+    }
+    const nonce = this.nextClientControlNonce();
+    this.clientCatalogWatchNonce = nonce;
+    this.transport.send(buildClientWatchMessage(nonce));
+  }
+
+  private stopClientCatalogWatch(): void {
+    const nonce = this.clientCatalogWatchNonce;
+    this.clientCatalogWatchNonce = null;
+    this.lastClientCatalog = null;
+    if (nonce !== null && this.transport.status === "connected") {
+      this.retiredWatchNonce = nonce;
+      this.transport.send(buildClientUnwatchMessage(nonce));
+    }
+  }
+
+  private resetClientControl(error: Error, notifySubscribers = true): void {
+    for (const pending of this.pendingClientLists.values()) {
+      pending.reject(error);
+    }
+    this.pendingClientLists.clear();
+    for (const pending of this.pendingClientKicks.values()) {
+      pending.reject(error);
+    }
+    this.pendingClientKicks.clear();
+    const hadWatch =
+      this.clientCatalogWatchNonce !== null || this.lastClientCatalog !== null;
+    this.clientCatalogWatchNonce = null;
+    // Nothing is in flight across a reset, so the held-back unwatch nonce is
+    // free again; keeping it would retire one nonce per reconnect.
+    this.retiredWatchNonce = null;
+    this.lastClientCatalog = null;
+    if (notifySubscribers && hadWatch) {
+      for (const subscriber of this.clientCatalogSubscribers) {
+        subscriber.onError?.(error);
+      }
+    }
   }
 
   async closeSession(sessionId: SessionId): Promise<void> {
@@ -3795,6 +4022,18 @@ export class BlitConnection {
     this.surfaceViewSizes.clear();
   }
 
+  /** Retire all connection-owned state for an id the server destroyed.
+   *  Do not send UNSUBSCRIBE: destruction is already authoritative, and a
+   *  delayed unsubscribe could otherwise hit a new surface reusing the id. */
+  private retireDestroyedSurface(surfaceId: number): void {
+    const sub = this.surfaceSubs.get(surfaceId);
+    if (sub && sub.pendingUnsub !== null) {
+      clearTimeout(sub.pendingUnsub);
+    }
+    this.surfaceSubs.delete(surfaceId);
+    this.surfaceViewSizes.delete(surfaceId);
+  }
+
   private maybeSendSurfaceSubscribe(sub: SurfaceSub): void {
     if (this.transport.status !== "connected") return;
     if (!this.surfaceStreamingEnabled || !this.pageVisible) return;
@@ -4342,6 +4581,14 @@ export class BlitConnection {
     // successful messages only reset fragmentBytes and retain capacity.
     this.fragmentBuffer = new Uint8Array(0);
     this.fragmentBytes = 0;
+    this.fragmentCount = 0;
+  }
+
+  /** A malformed sequence desynchronizes the stream, so discard both the
+   * allocation and the transport instead of attempting to continue. */
+  private abortFragmentReassembly(): void {
+    this.resetFragmentReassembly();
+    this.transport.close();
   }
 
   /** Grow the fragment accumulator geometrically. In steady state the first
@@ -4350,7 +4597,7 @@ export class BlitConnection {
     if (required <= this.fragmentBuffer.length) return;
     let capacity = Math.max(4 * 1024, this.fragmentBuffer.length);
     while (capacity < required) {
-      capacity = Math.min(capacity * 2, FS_MAX_DECOMPRESSED);
+      capacity = Math.min(capacity * 2, MAX_LOGICAL_MESSAGE);
     }
     const grown = new Uint8Array(capacity);
     grown.set(this.fragmentBuffer.subarray(0, this.fragmentBytes));
@@ -4359,22 +4606,29 @@ export class BlitConnection {
 
   private handleMessage = (data: BlitTransportMessage): void => {
     const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-    if (bytes.length === 0) return;
+    if (bytes.length === 0) {
+      if (this.fragmentCount !== 0) this.abortFragmentReassembly();
+      return;
+    }
 
     const type = bytes[0];
     // Fragment reassembly is handled before the normal dispatch so the
     // reconstituted buffer flows through the same switch as any other
     // message — callers don't need to know their message was chunked.
     if (type === S2C_FRAGMENT) {
-      if (bytes.length < 2) return;
+      if (bytes.length < 3) {
+        this.abortFragmentReassembly();
+        return;
+      }
       const flags = bytes[1];
       const chunk = bytes.subarray(2);
-      // A complete message can never exceed the protocol-wide decompressed
-      // ceiling, so a fragment stream that grows past it is a buggy or
-      // hostile peer — drop the partial rather than reassemble without
-      // bound. The Rust reader has always had this guard; the browser did not.
-      if (this.fragmentBytes + chunk.length > FS_MAX_DECOMPRESSED) {
-        this.resetFragmentReassembly();
+      if (
+        (flags & ~FRAGMENT_FLAG_LAST) !== 0 ||
+        chunk.length > MAX_FRAGMENT_CHUNK ||
+        this.fragmentCount >= MAX_FRAGMENT_COUNT ||
+        this.fragmentBytes > MAX_LOGICAL_MESSAGE - chunk.length
+      ) {
+        this.abortFragmentReassembly();
         return;
       }
       // Transport callbacks may expose a borrowed view into a reusable BYOB
@@ -4384,14 +4638,23 @@ export class BlitConnection {
       this.ensureFragmentCapacity(nextBytes);
       this.fragmentBuffer.set(chunk, this.fragmentBytes);
       this.fragmentBytes = nextBytes;
+      this.fragmentCount++;
       if (flags & FRAGMENT_FLAG_LAST) {
         // handleMessage and all synchronous parsers honor the transport's
         // borrowed-view contract. Promise results that escape it take their
         // own copy at the resolve site below.
         const reassembled = this.fragmentBuffer.subarray(0, this.fragmentBytes);
         this.fragmentBytes = 0;
+        this.fragmentCount = 0;
         this.handleMessage(reassembled);
       }
+      return;
+    }
+
+    // Only audio frames may bypass an in-progress bulk message. Any other
+    // opcode makes the logical stream ambiguous and therefore fatal.
+    if (this.fragmentCount !== 0 && type !== S2C_AUDIO_FRAME) {
+      this.abortFragmentReassembly();
       return;
     }
 
@@ -4420,6 +4683,184 @@ export class BlitConnection {
           }
         }
         return;
+      case S2C_CLIENT_LIST: {
+        if (bytes.length < 3) return;
+        const view = new DataView(
+          bytes.buffer,
+          bytes.byteOffset,
+          bytes.byteLength,
+        );
+        const nonce = view.getUint16(1, true);
+        const pending = this.pendingClientLists.get(nonce);
+        const watched = this.clientCatalogWatchNonce === nonce;
+        if (!pending && !watched) return;
+        const malformed = (): void => {
+          const error = connectionError("Malformed client catalog response");
+          if (pending) {
+            this.pendingClientLists.delete(nonce);
+            pending.reject(error);
+          }
+          if (watched) {
+            for (const subscriber of this.clientCatalogSubscribers) {
+              subscriber.onError?.(error);
+            }
+          }
+        };
+        if (bytes.length < 15) {
+          malformed();
+          return;
+        }
+        const count = view.getUint32(11, true);
+        let offset = 15;
+        // Every record needs a 30-byte header, before subscriptions.
+        if (count > Math.floor((bytes.length - offset) / 30)) {
+          malformed();
+          return;
+        }
+        const clients: BlitClientList["clients"][number][] = [];
+        for (let i = 0; i < count; i++) {
+          if (offset + 30 > bytes.length) {
+            malformed();
+            return;
+          }
+          const id = view.getBigUint64(offset, true);
+          const ageSeconds = Number(view.getBigUint64(offset + 8, true));
+          const outboundBytesPerSecond = Number(
+            view.getBigUint64(offset + 16, true),
+          );
+          const terminalCount = view.getUint16(offset + 24, true);
+          const surfaceCount = view.getUint16(offset + 26, true);
+          const subscriptionCount = view.getUint16(offset + 28, true);
+          offset += 30;
+          if (
+            offset +
+              terminalCount * 6 +
+              surfaceCount * 8 +
+              subscriptionCount * 3 >
+            bytes.length
+          ) {
+            malformed();
+            return;
+          }
+          const terminals = [];
+          for (let j = 0; j < terminalCount; j++) {
+            const ptyId = view.getUint16(offset, true);
+            const rows = view.getUint16(offset + 2, true);
+            const cols = view.getUint16(offset + 4, true);
+            terminals.push({
+              ptyId,
+              rows: rows === 0 ? null : rows,
+              cols: cols === 0 ? null : cols,
+            });
+            offset += 6;
+          }
+          const surfaces = [];
+          for (let j = 0; j < surfaceCount; j++) {
+            const surfaceId = view.getUint16(offset, true);
+            const width = view.getUint16(offset + 2, true);
+            const height = view.getUint16(offset + 4, true);
+            const scale120 = view.getUint16(offset + 6, true);
+            surfaces.push({
+              surfaceId,
+              width: width === 0 ? null : width,
+              height: height === 0 ? null : height,
+              scale120: scale120 === 0 ? null : scale120,
+            });
+            offset += 8;
+          }
+          const subscriptions = [];
+          for (let j = 0; j < subscriptionCount; j++) {
+            subscriptions.push({
+              kind: bytes[offset],
+              id: view.getUint16(offset + 1, true),
+            });
+            offset += 3;
+          }
+          clients.push({
+            id,
+            ageSeconds,
+            outboundBytesPerSecond,
+            subscriptions,
+            terminals,
+            surfaces,
+          });
+        }
+        if (offset !== bytes.length) {
+          malformed();
+          return;
+        }
+        const catalog = { selfId: view.getBigUint64(3, true), clients };
+        if (pending) {
+          this.pendingClientLists.delete(nonce);
+          pending.resolve(catalog);
+        }
+        if (watched) {
+          this.lastClientCatalog = catalog;
+          for (const subscriber of this.clientCatalogSubscribers) {
+            subscriber.listener(catalog);
+          }
+        }
+        return;
+      }
+      case S2C_KICK_RESULT: {
+        if (bytes.length < 3) return;
+        const nonce = bytes[1] | (bytes[2] << 8);
+        // This is the whole family's status reply, not just the kick's: the
+        // server answers a malformed LIST/WATCH/UNWATCH with it too, under the
+        // sender's nonce. Nonces are unique across all three pending maps, so
+        // one lookup order settles whichever request it belongs to — without
+        // this, a refused list request would hang until its caller gave up.
+        // A refused unwatch is the one member of the family with nothing left
+        // to settle — release its nonce and stop.
+        if (this.retiredWatchNonce === nonce) {
+          this.retiredWatchNonce = null;
+          return;
+        }
+        const pendingKick = this.pendingClientKicks.get(nonce);
+        const pendingList = this.pendingClientLists.get(nonce);
+        const watched = this.clientCatalogWatchNonce === nonce;
+        if (!pendingKick && !pendingList && !watched) return;
+        this.pendingClientKicks.delete(nonce);
+        this.pendingClientLists.delete(nonce);
+        const status = bytes.length < 4 ? null : bytes[3];
+        const detail =
+          bytes.length < 4 ? "" : textDecoder.decode(bytes.subarray(4)).trim();
+        // Only a kick has an "OK" form. An OK under a list or watch nonce is
+        // the server contradicting itself, and silently keeping a watch the
+        // server just refused would leave the catalog frozen with no error.
+        const error =
+          status === STATUS_OK
+            ? connectionError("Client control replied OK to a catalog request")
+            : connectionError(
+                status === null
+                  ? "Malformed kick result"
+                  : detail || `Client control failed: ${statusText(status)}`,
+              );
+        if (status === STATUS_OK) {
+          pendingKick?.resolve();
+        } else {
+          pendingKick?.reject(error);
+        }
+        pendingList?.reject(error);
+        if (watched) {
+          this.clientCatalogWatchNonce = null;
+          this.lastClientCatalog = null;
+          for (const subscriber of this.clientCatalogSubscribers) {
+            subscriber.onError?.(error);
+          }
+        }
+        return;
+      }
+      case S2C_KICKED: {
+        const reason = textDecoder.decode(bytes.subarray(1)).trim();
+        this.lastError = `kicked: ${reason || "kicked by another client"}`;
+        // A kick suppresses automatic retry so two duplicate clients do not
+        // fight forever, but it must not dispose the transport: Reconnect is
+        // an explicit user choice and remains available.
+        if (this.transport.suspend) this.transport.suspend();
+        else this.transport.close();
+        return;
+      }
       case S2C_QUIT:
         // Server is shutting down.  Immediately dismiss all sessions and
         // surfaces so the UI doesn't show stale windows while reconnecting.
@@ -4455,6 +4896,7 @@ export class BlitConnection {
         this.audioPlayer.reset();
         this.resetSurfaceSubsForReconnect();
         this.resetFsSyncs(connectionError("Server is shutting down"));
+        this.resetClientControl(connectionError("Server is shutting down"));
         this.resetGitRepos(connectionError("Server is shutting down"));
         this.resetLspAttachments(connectionError("Server is shutting down"));
         this.resetKv(connectionError("Server is shutting down"));
@@ -4628,6 +5070,33 @@ export class BlitConnection {
         this.handleSearchResults(bytes);
         return;
       }
+      case S2C_TRAY_UPDATE: {
+        if (!this.desktopStore.handleTrayUpdate(bytes)) {
+          this._logger.warn(`${this.id}: malformed TRAY_UPDATE`);
+        }
+        return;
+      }
+      case S2C_TRAY_MENU: {
+        if (!this.desktopStore.handleTrayMenu(bytes)) {
+          this._logger.warn(`${this.id}: malformed TRAY_MENU`);
+        }
+        return;
+      }
+      case S2C_NOTIFICATION_UPDATE: {
+        if (!this.desktopStore.handleNotificationUpdate(bytes)) {
+          this._logger.warn(`${this.id}: malformed NOTIFICATION_UPDATE`);
+        }
+        return;
+      }
+      case S2C_MEDIA_CONTROL: {
+        const control = parseMediaControl(bytes);
+        if (!control) {
+          this._logger.warn(`${this.id}: malformed MEDIA_CONTROL`);
+          return;
+        }
+        if (!this.mprisStore.handle(control)) this.mediaStore.handle(control);
+        return;
+      }
       case S2C_HELLO: {
         if (bytes.length < 7) return;
         const version = bytes[1] | (bytes[2] << 8);
@@ -4700,26 +5169,44 @@ export class BlitConnection {
           supportsSurfaceTextInput:
             (features & FEATURE_SURFACE_TEXT_INPUT) !== 0,
           supportsAudio: (features & FEATURE_AUDIO) !== 0,
+          supportsClientControl: (features & FEATURE_CLIENT_CONTROL) !== 0,
           supportsFsSync: (features & FEATURE_FS) !== 0,
           supportsGit: (features & FEATURE_GIT) !== 0,
           supportsLsp: (features & FEATURE_LSP) !== 0,
           supportsKv: (features & FEATURE_KV) !== 0,
+          supportsDesktop: (features & FEATURE_DESKTOP) !== 0,
+          supportsChannels: (features & FEATURE_CHANNEL) !== 0,
+          supportsDesktopMedia: (features & FEATURE_DESKTOP_MEDIA) !== 0,
           bootGeneration,
           serverVersion,
         };
         this.emit();
         this.surfaceStore.reset();
         this.audioPlayer.reset();
+        this.desktopStore.reset();
+        this.mediaStore.reset();
+        this.mprisStore.reset(connectionError("Connection re-established"));
         this.resetSurfaceSubsForReconnect();
         // Fs syncs do not survive a server session change: old sync_ids
         // are meaningless on the new session.
         this.resetFsSyncs(connectionError("Connection re-established"));
+        this.resetClientControl(
+          connectionError("Connection re-established"),
+          false,
+        );
+        this.startClientCatalogWatch();
         this.resetGitRepos(connectionError("Connection re-established"));
         this.resetLspAttachments(connectionError("Connection re-established"));
         this.resetKv(connectionError("Connection re-established"));
         this.resetFragmentReassembly();
         // Pushed cwds belong to the old server session's ptys.
         this.termCwds.clear();
+        if (features & FEATURE_DESKTOP) {
+          this.desktopStore.subscribeDesktop();
+        }
+        if (features & FEATURE_DESKTOP_MEDIA) {
+          this.mprisStore.reconnect();
+        }
         return;
       }
       case S2C_SURFACE_CREATED: {
@@ -4761,6 +5248,7 @@ export class BlitConnection {
         try {
           if (bytes.length < 3) return;
           const surfaceId = bytes[1] | (bytes[2] << 8);
+          this.retireDestroyedSurface(surfaceId);
           this.surfaceStore.handleSurfaceDestroyed(surfaceId);
         } catch {}
         return;
@@ -5690,6 +6178,11 @@ export class BlitConnection {
   };
 
   private handleStatusChange = (status: ConnectionStatus): void => {
+    // Media capture and MPRIS actions use the sender's presence as their
+    // connection guard. Detach it before resetting state so a stale UI click
+    // after transport loss rejects immediately and stops its authorized track
+    // instead of starting a lease timer around a silently dropped message.
+    this.setDesktopMediaTransportStatus(status);
     this.store.handleStatusChange(status);
 
     const lastError =
@@ -5775,6 +6268,7 @@ export class BlitConnection {
       );
       this.rejectPendingSearches(connectionError(`Transport ${status}`));
       this.rejectPendingReads(connectionError(`Transport ${status}`));
+      this.resetClientControl(connectionError(`Transport ${status}`));
       // Fs syncs and git repos do not survive a transport drop; reject
       // their pending promises promptly rather than leaving them hung.
       this.resetFsSyncs(connectionError(`Transport ${status}`));
@@ -5809,6 +6303,9 @@ export class BlitConnection {
       this.emit();
       this.surfaceStore.handleDisconnect();
       this.audioPlayer.reset();
+      this.desktopStore.reset();
+      this.mediaStore.reset();
+      this.mprisStore.reset(connectionError("Connection lost"));
       // All server-side surface subscriptions are implicitly dropped
       // when the transport dies, but the CLIENT-SIDE ref-counts (one
       // per live mount) must be preserved: each mount is still there

@@ -4,6 +4,66 @@ use clap_complete::Shell;
 use std::fs;
 use std::path::Path;
 
+const BASH_RUNTIME_COMPLETION: &str = r#"
+
+# Advertised extension commands are discovered only during explicit completion.
+_blit_with_extension_commands() {
+    _blit "$@"
+    local _blit_current="${COMP_WORDS[COMP_CWORD]}"
+    local -a _blit_previous=()
+    local _blit_index _blit_candidate
+    for ((_blit_index = 1; _blit_index < COMP_CWORD; _blit_index++)); do
+        _blit_previous+=("${COMP_WORDS[_blit_index]}")
+    done
+    while IFS= read -r _blit_candidate; do
+        if [[ -n "$_blit_candidate" ]]; then
+            COMPREPLY+=("$_blit_candidate")
+        fi
+    done < <(command "${COMP_WORDS[0]}" __complete-extension \
+        "--current=$_blit_current" -- "${_blit_previous[@]}" 2>/dev/null)
+}
+complete -F _blit_with_extension_commands -o bashdefault -o default blit
+"#;
+
+const ZSH_RUNTIME_COMPLETION: &str = r#"
+
+# Advertised extension commands are discovered only during explicit completion.
+functions[_blit_static]=$functions[_blit]
+_blit() {
+    local -a _blit_original_words _blit_previous _blit_dynamic
+    local _blit_original_current _blit_index _blit_static_result
+    _blit_original_words=("${words[@]}")
+    _blit_original_current=$CURRENT
+    _blit_static "$@"
+    _blit_static_result=$?
+    for ((_blit_index = 2; _blit_index < _blit_original_current; _blit_index++)); do
+        _blit_previous+=("${_blit_original_words[_blit_index]}")
+    done
+    _blit_dynamic=("${(@f)$(command "${_blit_original_words[1]}" \
+        __complete-extension \
+        "--current=${_blit_original_words[_blit_original_current]}" -- \
+        "${_blit_previous[@]}" 2>/dev/null)}")
+    if (( ${#_blit_dynamic} )); then
+        compadd -- "${_blit_dynamic[@]}"
+        return 0
+    fi
+    return $_blit_static_result
+}
+"#;
+
+const FISH_RUNTIME_COMPLETION: &str = r#"
+
+# Advertised extension commands are discovered only during explicit completion.
+function __fish_blit_extension_commands
+    set -l _blit_words (commandline -opc)
+    set -l _blit_executable $_blit_words[1]
+    set -e _blit_words[1]
+    command $_blit_executable __complete-extension \
+        "--current="(commandline -ct) -- $_blit_words 2>/dev/null
+end
+complete -c blit -f -a '(__fish_blit_extension_commands)'
+"#;
+
 /// Build a clap Command for blit-gateway (mirrors its env-var config).
 fn blit_gateway_cmd() -> Command {
     Command::new("blit-gateway")
@@ -110,7 +170,18 @@ fn generate_completions(mut cmd: Command, out_dir: &Path, name: &str) {
             _ => unreachable!(),
         };
         fs::create_dir_all(&dir).unwrap();
-        clap_complete::generate_to(shell, &mut cmd, name, &dir).unwrap();
+        let path = clap_complete::generate_to(shell, &mut cmd, name, &dir).unwrap();
+        let hook = match shell {
+            Shell::Bash => BASH_RUNTIME_COMPLETION,
+            Shell::Zsh => ZSH_RUNTIME_COMPLETION,
+            Shell::Fish => FISH_RUNTIME_COMPLETION,
+            _ => unreachable!(),
+        };
+        let mut generated = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        generated.push_str(hook);
+        fs::write(&path, generated)
+            .unwrap_or_else(|error| panic!("failed to extend {}: {error}", path.display()));
     }
 }
 
@@ -127,4 +198,42 @@ pub fn run(output: &str) {
 
     // Shell completions (for the main blit CLI only)
     generate_completions(cli::Cli::command(), base, "blit");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn generated_shells_call_the_hidden_runtime_query() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let output = std::env::temp_dir().join(format!(
+            "blit-completion-test-{}-{unique}",
+            std::process::id()
+        ));
+        generate_completions(cli::Cli::command(), &output, "blit");
+
+        let bash =
+            fs::read_to_string(output.join("bash-completion/completions/blit.bash")).unwrap();
+        let zsh = fs::read_to_string(output.join("zsh/site-functions/_blit")).unwrap();
+        let fish = fs::read_to_string(output.join("fish/vendor_completions.d/blit.fish")).unwrap();
+        assert!(bash.contains("_blit_with_extension_commands"));
+        assert!(bash.contains("__complete-extension"));
+        assert!(zsh.contains("functions[_blit_static]=$functions[_blit]"));
+        assert!(zsh.contains("__complete-extension"));
+        assert!(fish.contains("__fish_blit_extension_commands"));
+        assert!(fish.contains("__complete-extension"));
+
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn hidden_query_is_absent_from_normal_root_help() {
+        let help = cli::Cli::command().render_long_help().to_string();
+        assert!(!help.contains("__complete-extension"));
+    }
 }

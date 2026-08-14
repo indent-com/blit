@@ -8,7 +8,6 @@
 use blit_remote::{AUDIO_FRAME_CODEC_OPUS, S2C_AUDIO_FRAME};
 use opus::{Application, Channels, Encoder as OpusEncoder};
 use std::collections::{HashMap, VecDeque};
-use std::io::BufRead;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -83,7 +82,7 @@ pub struct OpusFrame {
 /// is respawned.  Wrap in `Arc` at the caller.
 pub struct AudioBroadcast {
     /// Per-client audio MPSC senders, keyed by client id.
-    subscribers: std::sync::Mutex<HashMap<u64, mpsc::UnboundedSender<Vec<u8>>>>,
+    subscribers: std::sync::Mutex<HashMap<u64, crate::TrackedAudioSender>>,
     /// Recent frames for catch-up on new subscribers.  Kept in sync with
     /// delivery: every frame delivered to subscribers is first appended
     /// here, so a late-subscribing client gets the same tail.
@@ -113,7 +112,11 @@ impl AudioBroadcast {
     /// subscribers map — and the fan-out task takes ring-then-subs in
     /// that order.  Callers can therefore rely on strict ordering of
     /// the client's mpsc queue: catch-up frames first, then live frames.
-    pub fn subscribe(&self, id: u64, tx: mpsc::UnboundedSender<Vec<u8>>) {
+    pub fn subscribe<S>(&self, id: u64, tx: S)
+    where
+        S: Into<crate::TrackedAudioSender>,
+    {
+        let tx = tx.into();
         let ring_guard = self.ring.lock().unwrap();
         // Push catch-up into the client's queue while the fan-out task
         // is blocked on ring lock.  Any frame the fan-out task is about
@@ -172,7 +175,6 @@ async fn fanout_task(mut opus_rx: mpsc::Receiver<OpusFrame>, broadcast: Arc<Audi
 
 /// Manages the PipeWire child processes and produces Opus frames.
 pub struct AudioPipeline {
-    dbus_child: Child,
     pipewire_child: Child,
     wireplumber_child: Option<Child>,
     pipewire_pulse_child: Child,
@@ -312,7 +314,7 @@ pub fn pipewire_available() -> bool {
 /// found on `$PATH`.  Empty list means audio can run (provided
 /// libpipewire is also loadable at runtime; see `pipewire_available`).
 pub fn missing_pipewire_binaries() -> Vec<&'static str> {
-    ["pipewire", "pipewire-pulse", "dbus-daemon"]
+    ["pipewire", "pipewire-pulse"]
         .into_iter()
         .filter(|name| find_program(name).is_none())
         .collect()
@@ -404,6 +406,7 @@ impl AudioPipeline {
     pub fn spawn(
         runtime_dir: &Path,
         instance_id: u16,
+        dbus_address: &str,
         bitrate: i32,
         verbose: bool,
         epoch: Instant,
@@ -453,43 +456,8 @@ impl AudioPipeline {
         std::fs::write(&conf_path, PIPEWIRE_CONF_TEMPLATE)
             .map_err(|e| format!("failed to write PipeWire config: {e}"))?;
 
-        // 0. Start a private D-Bus session bus.
-        //    PipeWire modules (rt, portal, jackdbus-detect, fallback-sink)
-        //    need a session bus.  Without one the daemon fails to initialise
-        //    in headless environments that have no $DISPLAY.
-        let mut dbus_child = unsafe {
-            Command::new("dbus-daemon")
-                .args(["--session", "--print-address=1", "--nofork"])
-                .env("XDG_RUNTIME_DIR", &audio_dir)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(if verbose {
-                    Stdio::inherit()
-                } else {
-                    Stdio::null()
-                })
-                .pre_exec(pdeathsig_hook())
-                .spawn()
-                .map_err(|e| format!("failed to start dbus-daemon: {e}"))?
-        };
-
-        let dbus_stdout = dbus_child
-            .stdout
-            .take()
-            .ok_or("dbus-daemon stdout missing")?;
-        let mut dbus_reader = std::io::BufReader::new(dbus_stdout);
-        let mut dbus_address = String::new();
-        dbus_reader
-            .read_line(&mut dbus_address)
-            .map_err(|e| format!("failed to read dbus-daemon address: {e}"))?;
-        let dbus_address = dbus_address.trim();
         if dbus_address.is_empty() {
-            let _ = dbus_child.kill();
-            // Every other bail-out below waits what it kills; this one did
-            // not, so a dbus-daemon that started and then said nothing was
-            // left a zombie for the life of the server.
-            let _ = dbus_child.wait();
-            return Err("dbus-daemon exited without printing an address".into());
+            return Err("desktop D-Bus address is empty".into());
         }
 
         // 1. Start pipewire.
@@ -512,11 +480,7 @@ impl AudioPipeline {
                 .spawn()
         } {
             Ok(c) => c,
-            Err(e) => {
-                let _ = dbus_child.kill();
-                let _ = dbus_child.wait();
-                return Err(format!("failed to start pipewire: {e}"));
-            }
+            Err(e) => return Err(format!("failed to start pipewire: {e}")),
         };
 
         // Wait for PipeWire to create its socket before spawning dependents.
@@ -526,8 +490,6 @@ impl AudioPipeline {
         if !wait_for_socket(&pw_socket, std::time::Duration::from_secs(2)) {
             // Check that PipeWire hasn't already exited.
             if matches!(pipewire_child.try_wait(), Ok(Some(_))) {
-                let _ = dbus_child.kill();
-                let _ = dbus_child.wait();
                 return Err("pipewire exited before creating its socket".into());
             }
             // Socket still missing but process alive — proceed anyway
@@ -602,12 +564,10 @@ impl AudioPipeline {
                     let _ = wp.kill();
                 }
                 let _ = pipewire_child.kill();
-                let _ = dbus_child.kill();
                 if let Some(ref mut wp) = wireplumber_child {
                     let _ = wp.wait();
                 }
                 let _ = pipewire_child.wait();
-                let _ = dbus_child.wait();
                 return Err(format!("failed to start pipewire-pulse: {e}"));
             }
         };
@@ -621,12 +581,10 @@ impl AudioPipeline {
                 let _ = wp.kill();
             }
             let _ = pipewire_child.kill();
-            let _ = dbus_child.kill();
             if let Some(ref mut wp) = wireplumber_child {
                 let _ = wp.wait();
             }
             let _ = pipewire_child.wait();
-            let _ = dbus_child.wait();
             return Err("pipewire-pulse exited before creating its socket".into());
         }
 
@@ -642,21 +600,18 @@ impl AudioPipeline {
                     let _ = wp.kill();
                 }
                 let _ = pipewire_child.kill();
-                let _ = dbus_child.kill();
                 let _ = pipewire_pulse_child.wait();
                 if let Some(ref mut wp) = wireplumber_child {
                     let _ = wp.wait();
                 }
                 let _ = pipewire_child.wait();
-                let _ = dbus_child.wait();
                 return Err(format!("failed to start PipeWire capture: {e}"));
             }
         };
 
         if verbose {
             eprintln!(
-                "[audio] spawned dbus={} pipewire={} pipewire-pulse={} capture=in-process dir={}",
-                dbus_child.id(),
+                "[audio] spawned pipewire={} pipewire-pulse={} capture=in-process dir={}",
                 pipewire_child.id(),
                 pipewire_pulse_child.id(),
                 audio_dir.display(),
@@ -705,7 +660,6 @@ impl AudioPipeline {
         });
 
         Ok(Self {
-            dbus_child,
             pipewire_child,
             wireplumber_child,
             pipewire_pulse_child,
@@ -735,7 +689,6 @@ impl AudioPipeline {
     /// So the supervisor calls this instead: same `try_wait`, no restart, no
     /// state change beyond releasing a zombie.
     pub fn reap_children(&mut self) {
-        let _ = self.dbus_child.try_wait();
         let _ = self.pipewire_child.try_wait();
         let _ = self.pipewire_pulse_child.try_wait();
         if let Some(ref mut wp) = self.wireplumber_child {
@@ -748,17 +701,16 @@ impl AudioPipeline {
     ///
     /// Automatically restarts dead sub-processes (WirePlumber,
     /// pipewire-pulse, pw-cat/encoder) without tearing down the entire
-    /// pipeline.  Only returns false when core processes (PipeWire,
-    /// dbus-daemon) die or when sub-process restarts keep failing.
+    /// pipeline. Only returns false when PipeWire dies or sub-process
+    /// restarts keep failing. The compositor service bundle supervises its
+    /// shared desktop D-Bus separately.
     pub fn is_alive(&mut self) -> bool {
         if !self.alive {
             return false;
         }
 
         // Core processes: if dead, the whole pipeline must be rebuilt.
-        if matches!(self.pipewire_child.try_wait(), Ok(Some(_)))
-            || matches!(self.dbus_child.try_wait(), Ok(Some(_)))
-        {
+        if matches!(self.pipewire_child.try_wait(), Ok(Some(_))) {
             self.alive = false;
             return false;
         }
@@ -844,13 +796,11 @@ impl AudioPipeline {
             let _ = wp.kill();
         }
         let _ = self.pipewire_child.kill();
-        let _ = self.dbus_child.kill();
         let _ = self.pipewire_pulse_child.wait();
         if let Some(ref mut wp) = self.wireplumber_child {
             let _ = wp.wait();
         }
         let _ = self.pipewire_child.wait();
-        let _ = self.dbus_child.wait();
         // Remove the private runtime directory and everything in it
         // (config file, PipeWire socket, pulse/native socket, etc.).
         let _ = std::fs::remove_dir_all(&self.runtime_dir);

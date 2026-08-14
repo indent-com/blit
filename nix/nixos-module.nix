@@ -14,9 +14,10 @@ let
     mkIf
     ;
 
-  # blit server loads GPU encoder libraries via dlopen at runtime:
+  # blit server loads GPU codec libraries via dlopen at runtime:
   #   VA-API:  libva.so.2, libva-drm.so.2  (from pkgs.libva)
-  #   NVENC:   libcuda.so.1, libnvidia-encode.so.1  (from the GPU driver)
+  #   NVDEC:   libcuda.so.1, libnvcuvid.so.1         (from the GPU driver)
+  #   NVENC:   libcuda.so.1, libnvidia-encode.so.1   (from the GPU driver)
   # On NixOS these live under /nix/store and are not in the default
   # ld.so search path.  addDriverRunpath.driverLink is the NixOS-managed
   # symlink farm (/run/opengl-driver) for the active GPU driver (NVIDIA,
@@ -28,9 +29,8 @@ let
   # library dir to the loader path so the dlopen resolves.
   audioLibSearchPath = lib.makeLibraryPath [ pkgs.pipewire ];
 
-  # Combined LD_LIBRARY_PATH for the server unit — empty when neither
-  # GPU nor audio contributes a path, which keeps the Environment line
-  # absent (systemd chokes on bare `LD_LIBRARY_PATH=`).
+  # Combined LD_LIBRARY_PATH for the server unit. GPU and audio paths remain
+  # conditional; software camera decoders are compiled into blit.
   serverLibSearchPath = lib.concatStringsSep ":" (
     lib.optional (gpuLibSearchPath != "") gpuLibSearchPath
     ++ lib.optional cfg.audio.enable audioLibSearchPath
@@ -110,7 +110,7 @@ in
       defaultText = "[ pkgs.libva pkgs.libgbm pkgs.vulkan-loader ] (Linux only)";
       description = ''
         Libraries to make available to blit server via LD_LIBRARY_PATH
-        for hardware-accelerated video encoding and GPU compositing.
+        for hardware-accelerated video decoding/encoding and GPU compositing.
         blit server loads VA-API, Vulkan, and GBM via dlopen at
         runtime; on NixOS these shared objects are not in the default
         search path.

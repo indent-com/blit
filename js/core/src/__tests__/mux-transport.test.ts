@@ -529,4 +529,69 @@ describe("MuxTransport", () => {
 
     mux.close();
   });
+
+  it("suspends one channel until an explicit reconnect", async () => {
+    const mux = new MuxTransport("ws://host/mux", "secret", {
+      reconnectDelay: 20,
+    });
+    const ch = mux.createChannel("remote");
+
+    mux.connect();
+    latestSocket().simulateOpen();
+    latestSocket().simulateMessage("mux");
+    ch.connect();
+    latestSocket().simulateMessage(controlFrame(0x81, 0));
+    expect(ch.status).toBe("connected");
+
+    ch.suspend();
+    expect(ch.status).toBe("disconnected");
+    expect(sentControlFrames().at(-1)).toEqual({
+      opcode: 0x02,
+      channelId: 0,
+    });
+    const sentWhileSuspended = latestSocket().sentData.length;
+    latestSocket().simulateMessage(controlFrame(0x82, 0));
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(latestSocket().sentData).toHaveLength(sentWhileSuspended);
+
+    ch.reconnect();
+    expect(ch.status).toBe("connecting");
+    expect(sentControlFrames().at(-1)).toEqual({
+      opcode: 0x01,
+      channelId: 0,
+    });
+
+    mux.close();
+  });
+
+  it("drops payloads queued behind the message that suspended a channel", () => {
+    const mux = new MuxTransport("ws://host/mux", "secret");
+    const ch = mux.createChannel("remote");
+    const received: number[][] = [];
+    ch.addEventListener("message", (data) => {
+      const payload = Array.from(new Uint8Array(data));
+      received.push(payload);
+      // BlitConnection suspends synchronously when it receives S2C_KICKED.
+      if (payload[0] === 0x14) ch.suspend();
+    });
+
+    mux.connect();
+    latestSocket().simulateOpen();
+    latestSocket().simulateMessage("mux");
+    ch.connect();
+    latestSocket().simulateMessage(controlFrame(0x81, 0));
+
+    // On upstream EOF the gateway queues a synthetic S2C_QUIT immediately
+    // after S2C_KICKED.  QUIT must not reach BlitConnection: it explicitly
+    // reconnects and would otherwise negate the kick.
+    latestSocket().simulateMessage(
+      new Uint8Array([0, 0, 0x14, 100, 117, 112]).buffer,
+    );
+    latestSocket().simulateMessage(new Uint8Array([0, 0, 0x0c]).buffer);
+
+    expect(ch.status).toBe("disconnected");
+    expect(received).toEqual([[0x14, 100, 117, 112]]);
+
+    mux.close();
+  });
 });

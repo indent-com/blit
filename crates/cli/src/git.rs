@@ -4,7 +4,7 @@
 //! print. No git logic lives here.
 
 use crate::fs::handshake;
-use crate::transport::{Transport, read_message, write_frame};
+use crate::transport::{FragmentReassembly, Transport, read_message, write_frame};
 use blit_remote::S2C_QUIT;
 use blit_remote::git::{
     FEATURE_GIT, GIT_BLAME_FOLLOW_RENAMES, GIT_BLAME_TRUNCATED, GIT_BLOB_WHOLE,
@@ -58,7 +58,7 @@ fn escape_filter(path: &str) -> String {
 struct Session<R, W> {
     reader: R,
     writer: W,
-    fragment_buf: Vec<u8>,
+    fragment_buf: FragmentReassembly,
     repo_id: u16,
 }
 
@@ -69,7 +69,7 @@ async fn open_repo<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     path: &str,
     flags: u16,
 ) -> Result<(Session<R, W>, String), String> {
-    let mut fragment_buf: Vec<u8> = Vec::new();
+    let mut fragment_buf = FragmentReassembly::default();
     let features = handshake(&mut reader, &mut fragment_buf).await?;
     if features & FEATURE_GIT == 0 {
         return Err(
@@ -1289,7 +1289,7 @@ pub async fn cmd_discover(
 ) -> Result<(), String> {
     // No repo to open: discovery names repositories rather than using one.
     let (mut reader, mut writer) = transport.split();
-    let mut fragment_buf: Vec<u8> = Vec::new();
+    let mut fragment_buf = FragmentReassembly::default();
     let features = handshake(&mut reader, &mut fragment_buf).await?;
     if features & FEATURE_GIT == 0 {
         return Err(

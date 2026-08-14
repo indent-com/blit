@@ -27,16 +27,25 @@ import {
   C2S_COPY_RANGE,
   C2S_CLIPBOARD_GET,
   C2S_CLIPBOARD_LIST,
+  C2S_CLIENT_LIST,
+  S2C_CLIENT_LIST,
+  C2S_CLIENT_WATCH,
+  C2S_CLIENT_UNWATCH,
+  C2S_KICK,
   C2S_CREATE2,
   CREATE2_HAS_COMMAND,
   CREATE2_HAS_CWD,
   CREATE2_WANT_STATUS,
   FEATURE_CREATE_NONCE,
   FEATURE_CREATE_STATUS,
+  FEATURE_CLIENT_CONTROL,
   FEATURE_RESIZE_BATCH,
   FEATURE_RESTART,
   FEATURE_SCROLL_BY,
   FRAGMENT_FLAG_LAST,
+  MAX_FRAGMENT_COUNT,
+  MAX_LOGICAL_MESSAGE,
+  S2C_AUDIO_FRAME,
   S2C_FRAGMENT,
   S2C_CLIPBOARD_CONTENT,
   S2C_CLIPBOARD_LIST,
@@ -53,10 +62,13 @@ import {
   C2S_SURFACE_SUBSCRIBE,
   C2S_SURFACE_UNSUBSCRIBE,
   C2S_SURFACE_RESIZE,
+  S2C_SURFACE_DESTROYED,
   STATUS_BUDGET,
   STATUS_OTHER,
+  STATUS_INVALID,
+  STATUS_NOT_FOUND,
+  STATUS_OK,
 } from "../types";
-import { FS_MAX_DECOMPRESSED } from "../fs";
 
 class FakeTerminal {
   constructor(_r: number, _c: number, _pw: number, _ph: number) {}
@@ -165,6 +177,43 @@ describe("BlitConnection", () => {
   it("tracks status changes", () => {
     transport.setStatus("disconnected");
     expect(conn.getSnapshot().status).toBe("disconnected");
+  });
+
+  it("rejects stale media and MPRIS actions immediately after disconnect", async () => {
+    transport.setStatus("disconnected");
+    const sent = transport.sent.length;
+    const track = { stop: vi.fn() } as unknown as MediaStreamTrack;
+
+    await expect(conn.mediaStore.startMicrophone(track)).rejects.toThrow(
+      "connection unavailable",
+    );
+    await expect(conn.mprisStore.act(1, { kind: "play" })).rejects.toThrow(
+      "connection unavailable",
+    );
+
+    expect(track.stop).toHaveBeenCalledOnce();
+    expect(transport.sent).toHaveLength(sent);
+  });
+
+  it("starts detached while offline and restores media sends on reconnect", async () => {
+    const offline = new MockTransport("disconnected");
+    const { conn: offlineConnection } = createConnection(offline);
+    const track = { stop: vi.fn() } as unknown as MediaStreamTrack;
+
+    await expect(
+      offlineConnection.mediaStore.startMicrophone(track),
+    ).rejects.toThrow("connection unavailable");
+    await expect(
+      offlineConnection.mprisStore.act(1, { kind: "play" }),
+    ).rejects.toThrow("connection unavailable");
+    expect(track.stop).toHaveBeenCalledOnce();
+    expect(offline.sent).toHaveLength(0);
+
+    offline.setStatus("connected");
+    const sent = offline.sent.length;
+    offlineConnection.mprisStore.subscribe(true);
+    expect(offline.sent).toHaveLength(sent + 1);
+    offlineConnection.dispose();
   });
 
   it("tracks compositor clipboard authority independently of browser invalidation", () => {
@@ -1002,6 +1051,328 @@ describe("BlitConnection", () => {
     }
   });
 
+  // --- S2C_KICKED ---
+
+  it("suspends automatic retry after S2C_KICKED but permits reconnect", () => {
+    transport.pushCreated(1, "shell");
+    transport.pushKicked("duplicate tab");
+
+    const snap = conn.getSnapshot();
+    expect(snap.status).toBe("disconnected");
+    expect(snap.ready).toBe(false);
+    expect(snap.error).toBe("kicked: duplicate tab");
+    expect(snap.sessions[0].state).toBe("closed");
+    expect(transport.suspendCount).toBe(1);
+    expect(transport.reconnectCount).toBe(0);
+
+    conn.reconnect();
+    expect(transport.reconnectCount).toBe(1);
+    expect(conn.getSnapshot().error).toBeNull();
+  });
+
+  it("supplies a default reason for an empty S2C_KICKED", () => {
+    transport.pushKicked();
+    expect(conn.getSnapshot().error).toBe("kicked: kicked by another client");
+  });
+
+  // --- Client control ---
+
+  it("lists peer subscriptions with terminal and surface view sizes", async () => {
+    transport.pushHello(1, FEATURE_CLIENT_CONTROL);
+    expect(conn.getSnapshot().supportsClientControl).toBe(true);
+
+    const result = conn.listClients();
+    const request = transport.sent.find(
+      (message) => message[0] === C2S_CLIENT_LIST,
+    )!;
+    const nonce = request[1] | (request[2] << 8);
+    transport.pushClientList(nonce, 9n, [
+      {
+        id: 42n,
+        ageSeconds: 125,
+        outboundBytesPerSecond: 1_500_000,
+        subscriptions: [
+          { kind: 1, id: 0 },
+          { kind: 2, id: 11 },
+          { kind: 3, id: 12 },
+          { kind: 4, id: 13 },
+          { kind: 5, id: 14 },
+          { kind: 6, id: 15 },
+        ],
+        terminals: [
+          { ptyId: 3, rows: 24, cols: 80 },
+          { ptyId: 5, rows: null, cols: null },
+        ],
+        surfaces: [{ surfaceId: 7, width: 1280, height: 720, scale120: 180 }],
+      },
+    ]);
+
+    await expect(result).resolves.toEqual({
+      selfId: 9n,
+      clients: [
+        {
+          id: 42n,
+          ageSeconds: 125,
+          outboundBytesPerSecond: 1_500_000,
+          subscriptions: [
+            { kind: 1, id: 0 },
+            { kind: 2, id: 11 },
+            { kind: 3, id: 12 },
+            { kind: 4, id: 13 },
+            { kind: 5, id: 14 },
+            { kind: 6, id: 15 },
+          ],
+          terminals: [
+            { ptyId: 3, rows: 24, cols: 80 },
+            { ptyId: 5, rows: null, cols: null },
+          ],
+          surfaces: [{ surfaceId: 7, width: 1280, height: 720, scale120: 180 }],
+        },
+      ],
+    });
+  });
+
+  it("kicks a peer and reports server refusals", async () => {
+    transport.pushHello(1, FEATURE_CLIENT_CONTROL);
+
+    const kicked = conn.kickClient(42n, "duplicate tab");
+    const request = transport.sent.find((message) => message[0] === C2S_KICK)!;
+    const nonce = request[1] | (request[2] << 8);
+    expect(new DataView(request.buffer).getBigUint64(3, true)).toBe(42n);
+    expect(new TextDecoder().decode(request.subarray(11))).toBe(
+      "duplicate tab",
+    );
+    transport.pushKickResult(nonce, STATUS_OK);
+    await expect(kicked).resolves.toBeUndefined();
+
+    const refused = conn.kickClient(99n);
+    const second = transport.sent.filter(
+      (message) => message[0] === C2S_KICK,
+    )[1];
+    const secondNonce = second[1] | (second[2] << 8);
+    transport.pushKickResult(secondNonce, STATUS_NOT_FOUND, "client is gone");
+    await expect(refused).rejects.toThrow("client is gone");
+  });
+
+  it("rejects pending client-control requests on disconnect", async () => {
+    transport.pushHello(1, FEATURE_CLIENT_CONTROL);
+    const list = conn.listClients();
+    transport.setStatus("disconnected");
+    await expect(list).rejects.toThrow("Transport disconnected");
+  });
+
+  it("settles a pending list when the server refuses it via KICK_RESULT", async () => {
+    // KICK_RESULT is the client-control family's status reply. Looking it up
+    // only in the pending-kick map left a refused list request hanging.
+    transport.pushHello(1, FEATURE_CLIENT_CONTROL);
+    const result = conn.listClients();
+    const request = transport.sent.find(
+      (message) => message[0] === C2S_CLIENT_LIST,
+    )!;
+    const nonce = request[1] | (request[2] << 8);
+    transport.pushKickResult(
+      nonce,
+      STATUS_INVALID,
+      "request has trailing bytes",
+    );
+    await expect(result).rejects.toThrow("request has trailing bytes");
+  });
+
+  // Broadening S2C_KICK_RESULT to settle list and watch requests must not make
+  // it disturb unrelated ones. (The nonce counter is monotonic, so this cannot
+  // reproduce actual nonce *reuse* — that needs a full 65536 wrap. The
+  // retiredWatchNonce guard covers the wrap case and is not pinned here.)
+  it("ignores a stale unwatch refusal instead of settling another request", () => {
+    transport.pushHello(1, FEATURE_CLIENT_CONTROL);
+    const stop = conn.subscribeClients(vi.fn());
+    stop();
+    const unwatch = transport.sent.find(
+      (message) => message[0] === C2S_CLIENT_UNWATCH,
+    )!;
+    const unwatchNonce = unwatch[1] | (unwatch[2] << 8);
+
+    const list = conn.listClients();
+    const request = transport.sent.find(
+      (message) => message[0] === C2S_CLIENT_LIST,
+    )!;
+    const listNonce = request[1] | (request[2] << 8);
+    expect(listNonce).not.toBe(unwatchNonce);
+
+    // The late refusal of the unwatch must not touch the list request.
+    transport.pushKickResult(unwatchNonce, STATUS_INVALID, "unwatch was junk");
+    transport.pushClientList(listNonce, 9n, []);
+    return expect(list).resolves.toEqual({ selfId: 9n, clients: [] });
+  });
+
+  it("reports a refused catalog watch to its subscribers", () => {
+    transport.pushHello(1, FEATURE_CLIENT_CONTROL);
+    const onError = vi.fn();
+    conn.subscribeClients(vi.fn(), onError);
+    const watch = transport.sent.find(
+      (message) => message[0] === C2S_CLIENT_WATCH,
+    )!;
+    const nonce = watch[1] | (watch[2] << 8);
+    transport.pushKickResult(nonce, STATUS_INVALID, "watch is malformed");
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "watch is malformed" }),
+    );
+  });
+
+  it("refuses a kick reason over the server's byte cap", async () => {
+    transport.pushHello(1, FEATURE_CLIENT_CONTROL);
+    const before = transport.sent.filter(
+      (message) => message[0] === C2S_KICK,
+    ).length;
+    // 1024 multi-byte scalars is well over the 1024-byte cap. Sending a
+    // silently shortened reason would defeat the point of having one.
+    await expect(conn.kickClient(42n, "é".repeat(1024))).rejects.toThrow(
+      "2048 bytes",
+    );
+    expect(
+      transport.sent.filter((message) => message[0] === C2S_KICK),
+    ).toHaveLength(before);
+  });
+
+  // Every early return in the S2C_CLIENT_LIST decoder: a truncated frame must
+  // settle the pending request rather than leave it hanging or throw a
+  // RangeError out of the message pump.
+  it.each([
+    ["shorter than the fixed header", (m: Uint8Array) => m.subarray(0, 14)],
+    ["truncated mid-client-record", (m: Uint8Array) => m.subarray(0, 30)],
+    ["missing its subscription records", (m: Uint8Array) => m.slice(0, -3)],
+    [
+      "carrying trailing bytes",
+      (m: Uint8Array) => {
+        const grown = new Uint8Array(m.length + 1);
+        grown.set(m);
+        return grown;
+      },
+    ],
+  ])("rejects a client list %s", async (_label, mangle) => {
+    transport.pushHello(1, FEATURE_CLIENT_CONTROL);
+    const result = conn.listClients();
+    const request = transport.sent.find(
+      (message) => message[0] === C2S_CLIENT_LIST,
+    )!;
+    const nonce = request[1] | (request[2] << 8);
+    transport.pushClientList(
+      nonce,
+      9n,
+      [
+        {
+          id: 42n,
+          ageSeconds: 1,
+          outboundBytesPerSecond: 2,
+          subscriptions: [{ kind: 5, id: 14 }],
+          terminals: [{ ptyId: 3, rows: 24, cols: 80 }],
+          surfaces: [],
+        },
+      ],
+      mangle,
+    );
+    await expect(result).rejects.toThrow("Malformed client catalog response");
+  });
+
+  it("declares an oversized client count malformed instead of allocating", async () => {
+    transport.pushHello(1, FEATURE_CLIENT_CONTROL);
+    const result = conn.listClients();
+    const request = transport.sent.find(
+      (message) => message[0] === C2S_CLIENT_LIST,
+    )!;
+    const nonce = request[1] | (request[2] << 8);
+    const msg = new Uint8Array(15);
+    const view = new DataView(msg.buffer);
+    msg[0] = S2C_CLIENT_LIST;
+    view.setUint16(1, nonce, true);
+    view.setBigUint64(3, 9n, true);
+    view.setUint32(11, 0xffff_ffff, true);
+    transport.push(msg);
+    await expect(result).rejects.toThrow("Malformed client catalog response");
+  });
+
+  it("maps zero sizes to null rather than reporting a 0x0 view", async () => {
+    transport.pushHello(1, FEATURE_CLIENT_CONTROL);
+    const result = conn.listClients();
+    const request = transport.sent.find(
+      (message) => message[0] === C2S_CLIENT_LIST,
+    )!;
+    const nonce = request[1] | (request[2] << 8);
+    transport.pushClientList(nonce, 9n, [
+      {
+        id: 42n,
+        ageSeconds: 0,
+        outboundBytesPerSecond: 0,
+        subscriptions: [],
+        terminals: [{ ptyId: 3, rows: null, cols: null }],
+        surfaces: [{ surfaceId: 7, width: null, height: null, scale120: null }],
+      },
+    ]);
+    const catalog = await result;
+    expect(catalog.clients[0].terminals[0]).toEqual({
+      ptyId: 3,
+      rows: null,
+      cols: null,
+    });
+    expect(catalog.clients[0].surfaces[0]).toEqual({
+      surfaceId: 7,
+      width: null,
+      height: null,
+      scale120: null,
+    });
+  });
+
+  it("shares a live client catalog watch and unwatches after its last subscriber", () => {
+    transport.pushHello(1, FEATURE_CLIENT_CONTROL);
+    const first = vi.fn();
+    const second = vi.fn();
+    const stopFirst = conn.subscribeClients(first);
+    const watch = transport.sent.find(
+      (message) => message[0] === C2S_CLIENT_WATCH,
+    )!;
+    const nonce = watch[1] | (watch[2] << 8);
+
+    const stopSecond = conn.subscribeClients(second);
+    expect(
+      transport.sent.filter((message) => message[0] === C2S_CLIENT_WATCH),
+    ).toHaveLength(1);
+    transport.pushClientList(nonce, 9n, []);
+    expect(first).toHaveBeenLastCalledWith({ selfId: 9n, clients: [] });
+    expect(second).toHaveBeenLastCalledWith({ selfId: 9n, clients: [] });
+
+    stopFirst();
+    expect(
+      transport.sent.filter((message) => message[0] === C2S_CLIENT_UNWATCH),
+    ).toHaveLength(0);
+    stopSecond();
+    const unwatch = transport.sent.find(
+      (message) => message[0] === C2S_CLIENT_UNWATCH,
+    )!;
+    expect([...unwatch]).toEqual([
+      C2S_CLIENT_UNWATCH,
+      nonce & 0xff,
+      nonce >> 8,
+    ]);
+  });
+
+  it("re-establishes a live client catalog watch after hello", () => {
+    transport.pushHello(1, FEATURE_CLIENT_CONTROL);
+    const listener = vi.fn();
+    const onError = vi.fn();
+    conn.subscribeClients(listener, onError);
+    const firstWatch = transport.sent.find(
+      (message) => message[0] === C2S_CLIENT_WATCH,
+    )!;
+    const firstNonce = firstWatch[1] | (firstWatch[2] << 8);
+    transport.pushClientList(firstNonce, 1n, []);
+
+    transport.pushHello(1, FEATURE_CLIENT_CONTROL);
+    const watches = transport.sent.filter(
+      (message) => message[0] === C2S_CLIENT_WATCH,
+    );
+    expect(watches).toHaveLength(2);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
   // --- S2C_HELLO ---
 
   it("closes transport on hello with version > PROTOCOL_VERSION", () => {
@@ -1523,13 +1894,15 @@ describe("BlitConnection git", () => {
 });
 
 describe("BlitConnection fragment reassembly", () => {
-  const fragment = (last: boolean, payload: Uint8Array) => {
+  const fragmentWithFlags = (flags: number, payload: Uint8Array) => {
     const m = new Uint8Array(2 + payload.length);
     m[0] = S2C_FRAGMENT;
-    m[1] = last ? FRAGMENT_FLAG_LAST : 0;
+    m[1] = flags;
     m.set(payload, 2);
     return m;
   };
+  const fragment = (last: boolean, payload: Uint8Array) =>
+    fragmentWithFlags(last ? FRAGMENT_FLAG_LAST : 0, payload);
 
   it("reassembles a fragmented message and clears the buffer", () => {
     const { conn, transport } = createConnection();
@@ -1578,23 +1951,62 @@ describe("BlitConnection fragment reassembly", () => {
     expect(state.fragmentBuffer.buffer).toBe(allocation);
   });
 
-  // Without a ceiling, a peer that never sets FRAGMENT_FLAG_LAST grows the
-  // buffer until the tab dies. The Rust reader has always refused past this
-  // same bound.
-  it("drops an unterminated fragment stream at the decompression ceiling", () => {
+  it("aborts and releases an unterminated stream past the logical ceiling", () => {
     const { conn, transport } = createConnection();
-    const bytes = () =>
-      (conn as unknown as { fragmentBytes: number }).fragmentBytes;
-
-    const chunk = new Uint8Array(8 * 1024 * 1024);
-    const parts = FS_MAX_DECOMPRESSED / chunk.length;
-    for (let i = 0; i < parts; i++) transport.push(fragment(false, chunk));
-    expect(bytes()).toBe(FS_MAX_DECOMPRESSED);
-
-    // One byte more than the ceiling can hold: drop the partial rather than
-    // keep growing.
+    const state = conn as unknown as {
+      fragmentBuffer: Uint8Array;
+      fragmentBytes: number;
+      fragmentCount: number;
+    };
+    state.fragmentBuffer = new Uint8Array(1);
+    state.fragmentBytes = MAX_LOGICAL_MESSAGE;
+    state.fragmentCount = 1;
     transport.push(fragment(false, new Uint8Array([0x00])));
-    expect(bytes()).toBe(0);
+    expect(transport.status).toBe("closed");
+    expect(state.fragmentBuffer.byteLength).toBe(0);
+    expect(state.fragmentBytes).toBe(0);
+    expect(state.fragmentCount).toBe(0);
+  });
+
+  it("aborts on reserved flags, empty chunks, and excessive fragment count", () => {
+    for (const malformed of [
+      fragmentWithFlags(2, new Uint8Array([S2C_PING])),
+      fragmentWithFlags(0, new Uint8Array(0)),
+    ]) {
+      const { transport } = createConnection();
+      transport.push(malformed);
+      expect(transport.status).toBe("closed");
+    }
+
+    const { conn, transport } = createConnection();
+    (conn as unknown as { fragmentCount: number }).fragmentCount =
+      MAX_FRAGMENT_COUNT;
+    transport.push(fragment(false, new Uint8Array([S2C_PING])));
+    expect(transport.status).toBe("closed");
+  });
+
+  it("allows audio but aborts other messages between fragments", () => {
+    const allowed = createConnection();
+    allowed.transport.push(fragment(false, new Uint8Array([S2C_PING])));
+    allowed.transport.push(new Uint8Array([S2C_AUDIO_FRAME]));
+    expect(allowed.transport.status).toBe("connected");
+    expect(
+      (allowed.conn as unknown as { fragmentCount: number }).fragmentCount,
+    ).toBe(1);
+    allowed.transport.push(fragment(true, new Uint8Array([0x00])));
+    expect(allowed.transport.status).toBe("connected");
+
+    const rejected = createConnection();
+    rejected.transport.push(fragment(false, new Uint8Array([S2C_PING])));
+    rejected.transport.push(new Uint8Array([S2C_PING]));
+    expect(rejected.transport.status).toBe("closed");
+  });
+
+  it("aborts on an empty transport frame during reassembly", () => {
+    const { transport } = createConnection();
+    transport.push(fragment(false, new Uint8Array([S2C_PING])));
+    transport.push(new Uint8Array(0));
+    expect(transport.status).toBe("closed");
   });
 });
 
@@ -1696,6 +2108,33 @@ describe("BlitConnection surface subscriptions", () => {
       height: 180,
     });
     expect(lastTarget()).toEqual({ width: 320, height: 180 });
+  });
+
+  it("retires subscription and view-size state for a destroyed surface", () => {
+    const deadView = conn.allocSurfaceViewId();
+    const liveView = conn.allocSurfaceViewId();
+    conn.sendSurfaceSubscribe(7, deadView, null);
+    conn.offerSurfaceViewSize(7, deadView, 800, 600, 120);
+    conn.sendSurfaceSubscribe(8, liveView, null);
+    conn.offerSurfaceViewSize(8, liveView, 1024, 768, 120);
+
+    const before = transport.sent.length;
+    transport.push(new Uint8Array([S2C_SURFACE_DESTROYED, 7, 0]));
+
+    const state = conn as unknown as {
+      surfaceSubs: Map<number, unknown>;
+      surfaceViewSizes: Map<number, unknown>;
+    };
+    expect(state.surfaceSubs.has(7)).toBe(false);
+    expect(state.surfaceViewSizes.has(7)).toBe(false);
+    expect(state.surfaceSubs.has(8)).toBe(true);
+    expect(state.surfaceViewSizes.has(8)).toBe(true);
+    expect(transport.sent.slice(before)).toHaveLength(0);
+
+    // The destroyed view's later cleanup is a no-op, so it cannot emit a
+    // delayed UNSUBSCRIBE after Wayland has reused the id.
+    conn.sendSurfaceUnsubscribe(7, deadView);
+    expect(transport.sent.slice(before)).toHaveLength(0);
   });
 
   it("uses the highest requested cadence and lets an uncapped view win", () => {

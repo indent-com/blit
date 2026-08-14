@@ -1,8 +1,8 @@
 /**
  * PaneTools — the multitool in a pane's corner: a grip that drags the pane's
  * content out (drop on another pane to move it there, or on the dock to park
- * it), clicks to send the toolbar itself to another corner, and the ✕ that
- * closes the content.
+ * it), drops or clicks to send the toolbar itself to another corner, and the
+ * ✕ that closes the content.
  *
  * One component for both render paths (BSP leaf panes in BSPContainer and the
  * non-BSP focused view in Workspace) so the two can't drift, the same reason
@@ -20,18 +20,100 @@
  * from the pane at all.
  */
 
-import { createSignal, Show, type JSX } from "solid-js";
+import {
+  createEffect,
+  createSignal,
+  onCleanup,
+  Show,
+  type JSX,
+} from "solid-js";
 import type { Theme, UIScale } from "./theme";
 import { t } from "./i18n";
 import { startPaneTileDrag, startPaneTouchDrag } from "./ide/tileDrag";
+import {
+  PANE_TOOL_CORNERS,
+  paneToolCornerAtPoint,
+  type PaneToolCorner,
+} from "./paneToolCorner";
 
-/** Toolbar corners, in click-to-cycle order from the default. */
-const CORNERS = [
-  "top-right",
-  "bottom-right",
-  "bottom-left",
-  "top-left",
-] as const;
+// Page-lifetime UI state keyed by the content being moved. A PaneTools
+// component belongs to a pane, so its local state alone would leave a chosen
+// corner behind when an assignment moves to another pane.
+const cornerByAssignment = new Map<string, PaneToolCorner>();
+
+// The workspace inherits its terminal font. Keep toolbar symbols out of that
+// font so missing or unusual Windows glyphs cannot change their shape.
+function GripIcon(props: { size: number }) {
+  return (
+    <svg
+      width={props.size}
+      height={props.size}
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      style={{ display: "block", "pointer-events": "none" }}
+    >
+      <circle cx="5" cy="4" r="1.35" fill="currentColor" />
+      <circle cx="11" cy="4" r="1.35" fill="currentColor" />
+      <circle cx="5" cy="8" r="1.35" fill="currentColor" />
+      <circle cx="11" cy="8" r="1.35" fill="currentColor" />
+      <circle cx="5" cy="12" r="1.35" fill="currentColor" />
+      <circle cx="11" cy="12" r="1.35" fill="currentColor" />
+    </svg>
+  );
+}
+
+function SoloIcon(props: { active: boolean; size: number }) {
+  return (
+    <svg
+      width={props.size}
+      height={props.size}
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      style={{ display: "block", "pointer-events": "none" }}
+    >
+      <rect
+        x="2.5"
+        y="2.5"
+        width="11"
+        height="11"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+      />
+      <Show
+        when={props.active}
+        fallback={<rect x="5" y="5" width="6" height="6" fill="currentColor" />}
+      >
+        <path
+          d="M8 3v10M3 8h10"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.5"
+        />
+      </Show>
+    </svg>
+  );
+}
+
+function CloseIcon(props: { size: number }) {
+  return (
+    <svg
+      width={props.size}
+      height={props.size}
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      style={{ display: "block", "pointer-events": "none" }}
+    >
+      <path
+        d="M4 4l8 8M12 4l-8 8"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.75"
+        stroke-linecap="round"
+      />
+    </svg>
+  );
+}
 
 export function PaneTools(props: {
   theme: Theme;
@@ -51,12 +133,32 @@ export function PaneTools(props: {
   // Which corner the toolbar sits in. It floats over the pane's content, and
   // a surface is a real app that may have its own controls exactly under the
   // default top-right — clicking the grip cycles the toolbar to the next
-  // corner, out of the way of whatever it is covering. Per pane, not
-  // persisted: outliving the hover is what matters, surviving a reload isn't.
-  const [corner, setCorner] = createSignal(0);
+  // corner, out of the way of whatever it is covering. It follows the pane
+  // assignment for the page lifetime, but is not persisted across reloads.
+  const [corner, setCorner] = createSignal<PaneToolCorner>("top-right");
+  const [dropPreview, setDropPreview] = createSignal<PaneToolCorner | null>(
+    null,
+  );
+  let previewPane: HTMLElement | null = null;
+  createEffect(() => {
+    const assignment = props.drag?.assignment;
+    setCorner(
+      assignment
+        ? (cornerByAssignment.get(assignment) ?? "top-right")
+        : "top-right",
+    );
+  });
+  const rememberCorner = (next: PaneToolCorner) => {
+    setCorner(next);
+    const assignment = props.drag?.assignment;
+    if (assignment) cornerByAssignment.set(assignment, next);
+  };
+  const activeCorner = corner;
+  const displayedCorner = () => dropPreview() ?? activeCorner();
+  const onLeft = () => displayedCorner().endsWith("-left");
   const cornerStyle = (): JSX.CSSProperties => {
     const gap = `${props.scale.tightGap}px`;
-    switch (CORNERS[corner() % CORNERS.length]) {
+    switch (displayedCorner()) {
       case "top-right":
         return { top: gap, right: gap };
       case "bottom-right":
@@ -68,6 +170,48 @@ export function PaneTools(props: {
     }
   };
   const touchScale = () => (props.alwaysVisible ? 1.5 : 1);
+  const iconSize = () => props.scale.sm * touchScale();
+  const updateDropPreview = (e: DragEvent) => {
+    setDropPreview(
+      previewPane
+        ? paneToolCornerAtPoint(
+            previewPane.getBoundingClientRect(),
+            e.clientX,
+            e.clientY,
+          )
+        : null,
+    );
+  };
+  const stopDropPreview = () => {
+    window.removeEventListener("dragover", updateDropPreview);
+    window.removeEventListener("dragend", stopDropPreview);
+    previewPane = null;
+    setDropPreview(null);
+  };
+  const startDropPreview = (e: DragEvent) => {
+    stopDropPreview();
+    const toolbar = (e.currentTarget as HTMLElement).parentElement;
+    const pane = toolbar?.offsetParent;
+    if (!(pane instanceof HTMLElement)) return;
+    previewPane = pane;
+    window.addEventListener("dragover", updateDropPreview);
+    window.addEventListener("dragend", stopDropPreview);
+    updateDropPreview(e);
+  };
+  const moveToolbarOnCornerDrop = (e: DragEvent) => {
+    if (previewPane) {
+      const target = paneToolCornerAtPoint(
+        previewPane.getBoundingClientRect(),
+        e.clientX,
+        e.clientY,
+      );
+      if (target) {
+        rememberCorner(target);
+      }
+    }
+    stopDropPreview();
+  };
+  onCleanup(stopDropPreview);
   const segment = (): JSX.CSSProperties => ({
     display: "flex",
     "align-items": "center",
@@ -79,10 +223,6 @@ export function PaneTools(props: {
     border: `1px solid ${props.theme.subtleBorder}`,
     "border-radius": "0",
     color: props.theme.fg,
-    "font-family": "inherit",
-    // On touch, enlarge both the glyph and its tap target.
-    "font-size": `${props.scale.sm * touchScale()}px`,
-    "line-height": 1,
     opacity: 0.75,
     "touch-action": "manipulation",
   });
@@ -96,6 +236,9 @@ export function PaneTools(props: {
           // sits at 5 and is pointer-events:none.
           "z-index": 6,
           display: "flex",
+          // Keep the close button against the outside edge and the grip
+          // toward the pane's content on both sides.
+          "flex-direction": onLeft() ? "row-reverse" : "row",
         }}
       >
         <Show when={props.drag}>
@@ -105,9 +248,11 @@ export function PaneTools(props: {
               title={t("bsp.move")}
               aria-label={t("bsp.move")}
               draggable={true}
-              onDragStart={(e) =>
-                startPaneTileDrag(e, drag().assignment, drag().paneId)
-              }
+              onDragStart={(e) => {
+                startPaneTileDrag(e, drag().assignment, drag().paneId);
+                startDropPreview(e);
+              }}
+              onDragEnd={moveToolbarOnCornerDrop}
               // Touch never reaches `onDragStart`, so a finger could tap this
               // (cycling the corner) but never move the pane.
               onPointerDown={(e) =>
@@ -118,19 +263,22 @@ export function PaneTools(props: {
               // ✕'s: the content underneath must not also see it as input.
               onClick={(e) => {
                 e.stopPropagation();
-                setCorner((c) => (c + 1) % CORNERS.length);
+                const current = PANE_TOOL_CORNERS.indexOf(activeCorner());
+                rememberCorner(
+                  PANE_TOOL_CORNERS[(current + 1) % PANE_TOOL_CORNERS.length],
+                );
               }}
               style={{
                 ...segment(),
                 cursor: "grab",
                 // The ✕ brings the shared edge; doubling it reads as a gap.
-                "border-right": "none",
+                [onLeft() ? "border-left" : "border-right"]: "none",
                 // Required by the touch path: without it the browser pans the
                 // page and never reports the move (see startPaneTouchDrag).
                 "touch-action": "none",
               }}
             >
-              {"⠿"}
+              <GripIcon size={iconSize()} />
             </button>
           )}
         </Show>
@@ -148,12 +296,12 @@ export function PaneTools(props: {
                 ...segment(),
                 cursor: "pointer",
                 // The ✕ brings the shared edge, as with the grip.
-                "border-right": "none",
+                [onLeft() ? "border-left" : "border-right"]: "none",
               }}
             >
               {/* One filled cell versus a grid of them: what you get, not
                   what you are leaving. */}
-              {solo().active ? "⊞" : "▣"}
+              <SoloIcon active={solo().active} size={iconSize()} />
             </button>
           )}
         </Show>
@@ -170,7 +318,7 @@ export function PaneTools(props: {
           }}
           style={{ ...segment(), cursor: "pointer" }}
         >
-          {"✕"}
+          <CloseIcon size={iconSize()} />
         </button>
       </div>
     </Show>

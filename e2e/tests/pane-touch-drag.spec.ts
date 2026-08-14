@@ -175,4 +175,51 @@ test.describe("Grip drag with a finger", () => {
     // And the tap must not have parked anything.
     await expect(page.locator("canvas").first()).toBeVisible();
   });
+
+  test("dragging within a quarter previews and relocates the toolbar", async ({
+    page,
+  }) => {
+    await authenticate(page);
+    await newTerminal(page);
+
+    const grip = page
+      .getByRole("button", { name: "Drag to move · click for another corner" })
+      .first();
+    const close = page
+      .getByRole("button", { name: "Close", exact: true })
+      .first();
+    await expect(grip).toBeVisible();
+    const before = (await grip.boundingBox())!;
+    const gripAt = await centerOf(page, "button[title^='Drag to move']");
+    const target = await grip.evaluate((el) => {
+      const rect = (
+        el.parentElement!.offsetParent as HTMLElement
+      ).getBoundingClientRect();
+      return {
+        x: rect.left + rect.width * 0.25,
+        y: rect.top + rect.height * 0.75,
+      };
+    });
+
+    await touch(page, "pointerdown", gripAt);
+    await touch(page, "pointermove", {
+      x: gripAt.x - 40,
+      y: gripAt.y + 40,
+    });
+    await touch(page, "pointermove", target);
+    const previewGrip = (await grip.boundingBox())!;
+    const previewClose = (await close.boundingBox())!;
+    expect(previewGrip.x).toBeLessThan(before.x);
+    expect(previewGrip.y).toBeGreaterThan(before.y);
+    expect(previewClose.x).toBeLessThan(previewGrip.x);
+    await touch(page, "pointerup", target);
+    await page.waitForTimeout(400);
+
+    const after = (await grip.boundingBox())!;
+    const closeAfter = (await close.boundingBox())!;
+    expect(after.x).toBe(previewGrip.x);
+    expect(after.y).toBe(previewGrip.y);
+    expect(closeAfter.x).toBeLessThan(after.x);
+    await expect(page.locator("canvas").first()).toBeVisible();
+  });
 });

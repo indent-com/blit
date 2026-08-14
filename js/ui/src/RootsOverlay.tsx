@@ -16,7 +16,7 @@ import type {
   ConnectionId,
 } from "@blit-sh/core";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
-import { scrollbarStyle, themeFor, ui, uiScale } from "./theme";
+import { mergeStyle, scrollbarStyle, themeFor, ui, uiScale } from "./theme";
 import { createDragReorder, reorderTo } from "./dragReorder";
 import { DirectoryPicker } from "./DirectoryPicker";
 import type { Root, Remote } from "./storage";
@@ -383,14 +383,13 @@ export function RootsOverlay(props: {
               value={remote()}
               onChange={(e) => setRemote(e.currentTarget.value)}
               title="Remote (blank = default target)"
-              style={{
-                ...ui.input,
+              style={mergeStyle(ui.input, {
                 "background-color": theme().inputBg,
                 color: "inherit",
                 "font-size": `${scale().md}px`,
                 "border-radius": "0",
                 flex: "0 0 auto",
-              }}
+              })}
             >
               <option value="">(default)</option>
               <For each={enabledRemotes()}>
@@ -425,8 +424,7 @@ export function RootsOverlay(props: {
             <button
               type="submit"
               disabled={!name().trim() || !path().trim()}
-              style={{
-                ...ui.btn,
+              style={mergeStyle(ui.btn, {
                 "font-size": `${scale().sm}px`,
                 "border-radius": "0",
                 border: `1px solid ${theme().accent}`,
@@ -437,7 +435,7 @@ export function RootsOverlay(props: {
                 cursor: "pointer",
                 "white-space": "nowrap",
                 opacity: name().trim() && path().trim() ? 1 : 0.4,
-              }}
+              })}
             >
               {editing() ? "Save" : "Add"}
             </button>

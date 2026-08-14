@@ -28,6 +28,7 @@ import {
   Show,
 } from "solid-js";
 import type { BlitWorkspace, ConnectionId, FsSyncHandle } from "@blit-sh/core";
+import { editorAssignment, previewAssignment } from "@blit-sh/core/bsp";
 import { Marked } from "marked";
 import { createBlitWorkspaceState } from "@blit-sh/solid";
 import type { Theme, UIScale } from "../theme";
@@ -41,8 +42,11 @@ import {
 import {
   previewKindFor,
   previewMime,
+  markdownHeadingSlug,
   resolveRelative,
+  workspaceLinkTarget,
   type PreviewKind,
+  type WorkspaceLinkTarget,
 } from "./previewKind";
 import "./commitMarkdown.css";
 
@@ -69,6 +73,8 @@ export function BlitPreview(props: {
   const [error, setError] = createSignal<string | null>(null);
   const [html, setHtml] = createSignal("");
   const [imageUrl, setImageUrl] = createSignal<string | null>(null);
+  let previewScroller: HTMLDivElement | undefined;
+  let markdownRoot: HTMLDivElement | undefined;
 
   // Every blob URL this tile minted, revoked together on teardown or on the
   // next render — an un-revoked blob pins its bytes for the page's life.
@@ -219,9 +225,25 @@ export function BlitPreview(props: {
       gfm: true,
       breaks: false,
     });
+    const headingCounts = new Map<string, number>();
+    const plainText = (tokens: unknown[]): string =>
+      tokens
+        .map((token) => {
+          const t = token as { text?: string; tokens?: unknown[] };
+          return t.tokens ? plainText(t.tokens) : (t.text ?? "");
+        })
+        .join("");
     marked.use({
       renderer: {
         html: () => "",
+        heading({ tokens, depth }) {
+          const label = this.parser.parseInline(tokens);
+          const base = markdownHeadingSlug(plainText(tokens)) || "section";
+          const count = headingCounts.get(base) ?? 0;
+          headingCounts.set(base, count + 1);
+          const id = count === 0 ? base : `${base}-${count}`;
+          return `<h${depth} id="${escapeAttr(id)}">${label}</h${depth}>`;
+        },
         image({ href, title, text: alt }) {
           const url = assets.get(href ?? "");
           if (!url) {
@@ -232,10 +254,21 @@ export function BlitPreview(props: {
           const t = title ? ` title="${escapeAttr(title)}"` : "";
           return `<img src="${escapeAttr(url)}" alt="${escapeAttr(alt ?? "")}"${t} loading="lazy" decoding="async">`;
         },
-        link({ href, text: label }) {
-          // Links open nothing: a preview is a viewer, and a relative link
-          // would resolve against the app's own origin.
-          return `<span class="blit-md-link" title="${escapeAttr(href ?? "")}">${escapeHtml(label ?? "")}</span>`;
+        link({ href, title, tokens }) {
+          const label = this.parser.parseInline(tokens);
+          const target = workspaceLinkTarget(props.path, href ?? "");
+          const tooltip = title ?? href ?? "";
+          if (!target) {
+            return `<span class="blit-md-link" title="${escapeAttr(tooltip)}">${label}</span>`;
+          }
+          // No href: the browser must never resolve a workspace path against
+          // the app origin. The container below handles mouse and keyboard
+          // activation and opens the destination through normal tile routing.
+          const fragment =
+            target.fragment === null
+              ? ""
+              : ` data-blit-link-fragment="${escapeAttr(target.fragment)}"`;
+          return `<a class="blit-md-link blit-md-link--local" data-blit-link-path="${escapeAttr(target.path)}" data-blit-link-view="${target.view}"${fragment} role="link" tabindex="0" title="${escapeAttr(tooltip)}">${label}</a>`;
         },
       },
     });
@@ -277,8 +310,52 @@ export function BlitPreview(props: {
     return doc.documentElement.outerHTML;
   }
 
+  const linkedWorkspaceTarget = (
+    target: EventTarget | null,
+  ): WorkspaceLinkTarget | null => {
+    if (!(target instanceof Element)) return null;
+    const link = target.closest<HTMLElement>("[data-blit-link-path]");
+    const path = link?.dataset.blitLinkPath;
+    const view = link?.dataset.blitLinkView;
+    if (!link || !path || (view !== "preview" && view !== "editor"))
+      return null;
+    const fragment = link.hasAttribute("data-blit-link-fragment")
+      ? (link.dataset.blitLinkFragment ?? "")
+      : null;
+    return { path, fragment, view };
+  };
+
+  const scrollToFragment = (fragment: string): void => {
+    if (!fragment) {
+      previewScroller?.scrollTo({ top: 0 });
+      return;
+    }
+    const destination = Array.from(
+      markdownRoot?.querySelectorAll<HTMLElement>("[id]") ?? [],
+    ).find((element) => element.id === fragment);
+    destination?.scrollIntoView({ block: "start" });
+  };
+
+  const followWorkspaceLink = (target: EventTarget | null): boolean => {
+    const destination = linkedWorkspaceTarget(target);
+    if (!destination) return false;
+    if (destination.path === props.path) {
+      if (destination.fragment !== null) {
+        scrollToFragment(destination.fragment);
+      }
+      return true;
+    }
+    const assignment =
+      destination.view === "preview"
+        ? previewAssignment(props.connectionId, destination.path)
+        : editorAssignment(props.connectionId, destination.path);
+    props.onOpenTile(assignment);
+    return true;
+  };
+
   return (
     <div
+      ref={previewScroller}
       style={{
         width: "100%",
         height: "100%",
@@ -342,6 +419,7 @@ export function BlitPreview(props: {
       </Show>
       <Show when={kind() === "markdown" && html()}>
         <div
+          ref={markdownRoot}
           // The body variant carries the prose styling; the base class
           // alone only sets margins.
           class="blit-commit-markdown blit-commit-markdown--body"
@@ -349,6 +427,14 @@ export function BlitPreview(props: {
             padding: `${props.scale.panelPadding}px`,
             "font-size": `${props.scale.md}px`,
             "line-height": 1.5,
+          }}
+          onClick={(event) => {
+            if (followWorkspaceLink(event.target)) event.preventDefault();
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && followWorkspaceLink(event.target)) {
+              event.preventDefault();
+            }
           }}
           innerHTML={html()}
         />

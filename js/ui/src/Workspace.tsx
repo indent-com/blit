@@ -113,6 +113,7 @@ import {
 } from "./storage";
 import type { UIScale, Theme } from "./theme";
 import {
+  mergeStyle,
   sessionName,
   sessionPrefix,
   scrollbarStyle,
@@ -125,8 +126,10 @@ import {
 import { t } from "./i18n";
 import { TerminalDropTarget } from "./terminalDrop";
 import { StatusBar } from "./StatusBar";
+import { DesktopChrome } from "./DesktopChrome";
 import { LeftDock, LEFT_PANELS, type LeftPanel } from "./LeftDock";
 import { foldedSections, liveOverrides, toggleSection } from "./dockSections";
+import { popActivation, pushActivation } from "./activationStack";
 import {
   formatExpandedHash,
   formatPanelsHash,
@@ -182,6 +185,7 @@ import { FontOverlay } from "./FontOverlay";
 import { HelpOverlay } from "./HelpOverlay";
 import { LinkOverlay } from "./LinkOverlay";
 import { RemotesOverlay } from "./RemotesOverlay";
+import { ClientsOverlay } from "./ClientsOverlay";
 import { shellCapabilities } from "./shellCapabilities";
 import { RootsOverlay } from "./RootsOverlay";
 import { MediaOverlay } from "./MediaOverlay";
@@ -247,6 +251,7 @@ export type Overlay =
   | "font"
   | "help"
   | "remotes"
+  | "clients"
   | "roots"
   | "media"
   | "web"
@@ -262,6 +267,7 @@ type HmrWorkspaceData = HmrLeaseState & {
 };
 
 const hmrWorkspaceOwner = {};
+const BSP_RESIZE_HISTORY_DEBOUNCE_MS = 250;
 
 /**
  * Reset terminal view leases on both current and pre-fix preserved workspaces.
@@ -574,6 +580,14 @@ function WorkspaceScreen(props: {
       const conn = workspace.getConnection(spec.id);
       if (!conn) continue;
       cleanups.push(conn.surfaceStore.onChange(syncAll));
+      // A client asking to be activated (xdg_activation_v1 — e.g. an Electron
+      // app reacting to a notification click) gets the same treatment as
+      // picking its surface in the switcher.
+      cleanups.push(
+        conn.surfaceStore.onActivated((surfaceId) =>
+          activateSurface(surfaceId, spec.id),
+        ),
+      );
     }
     // Also refresh on workspace state changes (connection status
     // transitions) so the surface list stays in sync after reconnects
@@ -1039,8 +1053,10 @@ function WorkspaceScreen(props: {
   // attached, and the floating keyboard.  Only a full keyboard clears 150px,
   // and gating the viewport pin on that number left <main> at its full 100dvh
   // for the smaller two — with the footer, and the keyboard toggle in it,
-  // sitting underneath and untappable.  The deadband keeps momentum-scroll
-  // jitter from thrashing the layout.
+  // sitting underneath and untappable.  Anything beyond the deadband is also
+  // keyboard-open state: the shortcut bar is still an input panel the toggle
+  // must be able to dismiss.  The deadband keeps momentum-scroll jitter from
+  // thrashing the layout.
   const occlusion = createMemo(() => {
     if (!isMobileTouch()) return 0;
     const h = vpHeight();
@@ -1247,15 +1263,15 @@ function WorkspaceScreen(props: {
     if (!keyboardWanted()) {
       keyboardSeen = false;
       // inputmode="none" means taps no longer raise the IME, but the OS still
-      // can (a keyboard-show gesture, stylus handwriting input).  If a full
-      // keyboard is genuinely up over a focused terminal, latch intent from
-      // reality so the icon and toolbar match what's on screen.  Gated on
-      // focus still being in a terminal so the drain after an explicit hide
-      // (the toggle blurred, occlusion not yet gone) cannot re-latch, and on
-      // >150px so the iPadOS shortcut bar and the floating keyboard don't
-      // count — only a real keyboard does.
+      // can (a keyboard-show gesture, stylus handwriting input).  If an input
+      // panel is genuinely up over a focused terminal, latch intent from
+      // reality so the icon and toolbar match what's on screen.  This includes
+      // iPadOS's shortcut bar: although it is not a full software keyboard, it
+      // must take the same hide path.  Focus gating keeps the drain after an
+      // explicit hide (the toggle blurred, occlusion not yet gone) from
+      // re-latching.
       if (
-        occlusion() > 150 &&
+        viewportOccluded() &&
         document.activeElement instanceof HTMLElement &&
         document.activeElement.matches(keyboardInputSelector)
       ) {
@@ -1323,12 +1339,12 @@ function WorkspaceScreen(props: {
   // viewport — the only signal that WebKit accepted the host's assist.
   let pendingHopLand: (() => void) | null = null;
   createEffect(() => {
-    // Read occlusion() unconditionally: short-circuiting it behind
+    // Read viewportOccluded() unconditionally: short-circuiting it behind
     // pendingHopLand would subscribe to nothing on the first run, and the
     // effect would never fire.
-    const occ = occlusion();
+    const covered = viewportOccluded();
     const land = pendingHopLand;
-    if (land && occ > 32) {
+    if (land && covered) {
       pendingHopLand = null;
       land();
     }
@@ -1377,12 +1393,12 @@ function WorkspaceScreen(props: {
   );
 
   function toggleMobileKeyboard() {
-    // A tap means "put it away" only when a full keyboard is genuinely up.
-    // While intent is lit but no keyboard rose — the IME refused the focus
-    // transition, or the tap landed while the last keyboard was still
-    // draining — the tap is the user asking for the keyboard again, and
-    // taking the hide branch is exactly backwards.
-    if (keyboardWanted() && occlusion() > 150) {
+    // A tap means "put it away" when any keyboard input panel is genuinely
+    // up, including iPadOS's shortcut bar.  While intent is lit but no panel
+    // rose — the IME refused the focus transition, or the tap landed while the
+    // last keyboard was still draining — the tap asks for the keyboard again,
+    // and taking the hide branch is exactly backwards.
+    if (keyboardWanted() && viewportOccluded()) {
       keyboardManualOverride = false;
       automaticKeyboardInput = null;
       setKeyboardWanted(false);
@@ -1411,7 +1427,7 @@ function WorkspaceScreen(props: {
         // A keyboard already up for this very element was only missing the
         // intent — adopt it without any focus churn, which would just
         // flicker the keyboard.
-        if (occlusion() > 150) return;
+        if (viewportOccluded()) return;
         if (isIOS()) {
           // iPadOS only answers a focus CHANGE: focus() on the element that
           // already holds focus is a no-op, and blur+focus within one tap
@@ -1490,6 +1506,16 @@ function WorkspaceScreen(props: {
   // it reactively (which causes thrashing when surface list changes).
   const [focusedSurfaceConnId, setFocusedSurfaceConnId] =
     createSignal<ConnectionId | null>(null);
+
+  // What xdg_activation_v1 covered up, newest last (./activationStack.ts).
+  // Plain `let`: nothing renders it, it only survives between an activation
+  // and the moment that surface goes away.
+  let activationStack: string[] = [];
+  // The main view's occupant, when an activation is what put it there. Only
+  // its death lowers the stack — a surface the *user* chose replaces the
+  // covering relationship rather than extending it, so its death clears the
+  // stack instead of restoring something the user left long ago.
+  let activatedAssignment: string | null = null;
 
   /** Set or clear the focused surface, always keeping the connectionId
    *  in sync so the BSP view uses the correct connection.
@@ -1601,9 +1627,43 @@ function WorkspaceScreen(props: {
     font,
     defaultFont(),
   );
-  const [activeLayout, setActiveLayout] = createSignal<BSPLayout | null>(
+  const [activeLayout, setActiveLayoutSignal] = createSignal<BSPLayout | null>(
     loadActiveLayout(),
   );
+  // BSP resize pointermoves update the layout continuously for live feedback.
+  // Defer the shareable URL until the drag settles so history.replaceState is
+  // not called at pointer-event frequency. The flush signal makes the URL
+  // effect rebuild from current state instead of committing a stale hash.
+  const [historyReplaceFlush, setHistoryReplaceFlush] = createSignal(0);
+  let bspResizeHistoryPending = false;
+  let bspResizeHistoryTimer: ReturnType<typeof setTimeout> | undefined;
+  function setActiveLayout(layout: BSPLayout | null) {
+    const flushPendingHistory = bspResizeHistoryPending;
+    bspResizeHistoryPending = false;
+    clearTimeout(bspResizeHistoryTimer);
+    bspResizeHistoryTimer = undefined;
+    setActiveLayoutSignal(layout);
+    if (flushPendingHistory) setHistoryReplaceFlush((n) => n + 1);
+  }
+  function setBspLayout(
+    layout: BSPLayout | null,
+    options?: { debounceHistory?: boolean },
+  ) {
+    if (options?.debounceHistory) {
+      bspResizeHistoryPending = true;
+      clearTimeout(bspResizeHistoryTimer);
+      bspResizeHistoryTimer = setTimeout(() => {
+        bspResizeHistoryTimer = undefined;
+        bspResizeHistoryPending = false;
+        setHistoryReplaceFlush((n) => n + 1);
+      }, BSP_RESIZE_HISTORY_DEBOUNCE_MS);
+    } else {
+      setActiveLayout(layout);
+      return;
+    }
+    setActiveLayoutSignal(layout);
+  }
+  onCleanup(() => clearTimeout(bspResizeHistoryTimer));
   const [recentLayouts, setRecentLayouts] = createSignal(loadRecentLayouts());
   const [layoutAssignments, setLayoutAssignments] =
     createSignal<BSPAssignments | null>(null);
@@ -1937,7 +1997,7 @@ function WorkspaceScreen(props: {
         clearTimeout(clearFocusedTimer);
         clearFocusedTimer = null;
       }
-      focusSurfaceById(null);
+      lowerFocusedSurface(fid, fConnId);
     } else if (!exists) {
       if (!clearFocusedTimer) {
         clearFocusedTimer = setTimeout(() => {
@@ -1948,7 +2008,7 @@ function WorkspaceScreen(props: {
               s.surfaceId === fid &&
               (fConnId == null || s.connectionId === fConnId),
           );
-          if (stillGone) focusSurfaceById(null);
+          if (stillGone) lowerFocusedSurface(fid, fConnId);
         }, 2000);
       }
     } else if (clearFocusedTimer) {
@@ -2257,13 +2317,12 @@ function WorkspaceScreen(props: {
         <button
           onClick={() => toggleOverlay("roots")}
           title="Manage workspace roots"
-          style={{
-            ...ui.btn,
+          style={mergeStyle(ui.btn, {
             "flex-shrink": 0,
             "font-size": `${chromeScale().sm}px`,
             padding: `0 ${chromeScale().tightGap}px`,
             opacity: 0.7,
-          }}
+          })}
         >
           {"⚙"}
         </button>
@@ -3464,6 +3523,94 @@ function WorkspaceScreen(props: {
     closeOverlay();
   }
 
+  /**
+   * A Wayland client asked for its own toplevel (xdg_activation_v1 — an
+   * Electron app reacting to a notification click). It gets the same treatment
+   * as picking the surface in the switcher, plus a record of what it covered.
+   *
+   * BSP pushes nothing: `focusSurface` hands the surface a pane, and the pane
+   * it displaces keeps its occupant in the dock where the user can see it. The
+   * non-BSP main view is one slot, so without the stack the previous occupant
+   * is simply gone once the activated surface closes.
+   */
+  function activateSurface(surfaceId: number, connectionId: ConnectionId) {
+    const target = surfaceAssignment(connectionId, surfaceId);
+    // Already on top: nothing to raise, and nothing to remember. Clients
+    // repeat the request (a token is cheap and its delivery unacknowledged),
+    // so without this a talkative app would re-run focusSurface — closing an
+    // overlay the user just opened — several times a second.
+    if (
+      focusedSurfaceId() === surfaceId &&
+      focusedSurfaceConnId() === connectionId
+    ) {
+      return;
+    }
+    if (inBsp()) {
+      activationStack = [];
+      activatedAssignment = null;
+    } else {
+      activationStack = pushActivation(
+        activationStack,
+        focusedAssignment(),
+        target,
+      );
+      activatedAssignment = target;
+    }
+    focusSurface(surfaceId, connectionId);
+  }
+
+  /** Show a stacked entry again. Deliberately not `focusAssignment`: this runs
+   *  because a window closed, not because the user asked for anything, so it
+   *  must not close an overlay they have open. */
+  function restoreMainView(assignment: string) {
+    const surface = parseSurfaceAssignment(assignment);
+    if (surface) {
+      setActiveTile(null);
+      focusSurfaceById(surface.surfaceId, surface.connectionId as ConnectionId);
+      return;
+    }
+    if (isTileAssignment(assignment) || isWebAssignment(assignment)) {
+      focusSurfaceById(null);
+      setActiveTile(assignment);
+      return;
+    }
+    focusSessionFromUi(assignment as SessionId);
+  }
+
+  /**
+   * The focused surface is gone. If an activation is what put it on screen,
+   * reveal what it covered; otherwise clear the slot exactly as before, and
+   * drop the stack — the user moved on from that chain, so its entries would
+   * only resurface somewhere they no longer belong.
+   */
+  function lowerFocusedSurface(
+    surfaceId: number,
+    connectionId: ConnectionId | null,
+  ) {
+    const dying =
+      connectionId != null ? surfaceAssignment(connectionId, surfaceId) : null;
+    if (dying != null && dying === activatedAssignment) {
+      // cycleRing is every open terminal, surface and tab, so one lookup
+      // covers all four things a stack entry can name.
+      const open = new Set(cycleRing());
+      const { restore, stack } = popActivation(activationStack, (a) =>
+        open.has(a),
+      );
+      activationStack = stack;
+      if (restore != null) {
+        // A restored entry is still part of the activation chain: it only sits
+        // there because an activation covered it, so its own death lowers the
+        // stack again.
+        activatedAssignment = restore;
+        restoreMainView(restore);
+        return;
+      }
+    }
+    activationStack = [];
+    activatedAssignment = null;
+    focusSurfaceById(null);
+  }
+
   let termHandle: { rows: number; cols: number; focus: () => void } | null =
     null;
 
@@ -3757,6 +3904,7 @@ function WorkspaceScreen(props: {
 
   // Sync layout + focus to URL hash.
   createEffect(() => {
+    historyReplaceFlush();
     // Debug visibility is local UI state, so keep it shareable even while the
     // transport is disconnected and the connection-gated state below cannot
     // yet be refreshed.
@@ -3883,7 +4031,7 @@ function WorkspaceScreen(props: {
     );
     const merged = [...kept, ...parts];
     const newHash = withDebugPanelState(merged.join("&"), debugOpen);
-    if (newHash !== existing) {
+    if (newHash !== existing && !bspResizeHistoryPending) {
       history.replaceState(
         null,
         "",
@@ -4235,11 +4383,10 @@ function WorkspaceScreen(props: {
                                                 fs.id,
                                               );
                                           }}
-                                          style={{
-                                            ...ui.btn,
+                                          style={mergeStyle(ui.btn, {
                                             "font-size": `${chromeScale().md}px`,
                                             opacity: 0.5,
-                                          }}
+                                          })}
                                         >
                                           {t("workspace.close")}{" "}
                                           <kbd style={ui.kbd}>Esc</kbd>
@@ -4319,7 +4466,7 @@ function WorkspaceScreen(props: {
                 {(al) => (
                   <BSPContainer
                     layout={al()}
-                    onLayoutChange={setActiveLayout}
+                    onLayoutChange={setBspLayout}
                     connectionId={activeConnectionId()}
                     isSessionReadOnly={isSessionReadOnly}
                     connectionLabels={connectionLabels()}
@@ -4621,6 +4768,15 @@ function WorkspaceScreen(props: {
                   ? () => toggleOverlay("remotes")
                   : undefined
               }
+              onManageClients={
+                allConnections().some(
+                  (candidate) =>
+                    candidate.supportsClientControl &&
+                    !readOnlyConnections().has(candidate.id),
+                )
+                  ? () => toggleOverlay("clients")
+                  : undefined
+              }
               onChangeRoots={() => toggleOverlay("roots")}
               onOpenWeb={() => toggleOverlay("web")}
               onOpenSearch={() => {
@@ -4797,6 +4953,19 @@ function WorkspaceScreen(props: {
               onClose={closeOverlay}
             />
           )}
+        </Show>
+        <Show when={overlay() === "clients"}>
+          <ClientsOverlay
+            workspace={workspace}
+            connections={allConnections()}
+            sessions={wsState().sessions}
+            surfaces={surfaces()}
+            connectionLabels={connectionLabels()}
+            readOnlyConnections={readOnlyConnections()}
+            palette={palette()}
+            fontSize={fontSize()}
+            onClose={closeOverlay}
+          />
         </Show>
         <Show when={overlay() === "web"}>
           <WebOverlay
@@ -5018,11 +5187,25 @@ function WorkspaceScreen(props: {
             audioAvailable={allConnections().some((c) => c.supportsAudio)}
             hasSurfaces={surfaces().length > 0}
             isMobileTouch={isMobileTouch()}
-            // The icon and the toggle agree: lit means a full keyboard is
-            // genuinely up, so a dim icon's tap always asks for one.
-            keyboardOpen={keyboardWanted() && occlusion() > 150}
+            // The icon and the toggle agree: lit means a keyboard input panel
+            // is genuinely up, including the iPadOS shortcut bar.
+            keyboardOpen={keyboardWanted() && viewportOccluded()}
             onToggleKeyboard={toggleMobileKeyboard}
             onMedia={() => toggleOverlay("media")}
+            desktopChrome={(compact) => (
+              <DesktopChrome
+                workspace={workspace}
+                connections={allConnections()}
+                connectionLabels={connectionLabels()}
+                readOnlyConnections={readOnlyConnections()}
+                theme={theme()}
+                scale={chromeScale()}
+                compact={compact}
+                focusedConnectionId={
+                  focusedSurfaceConnId() ?? activeConnectionId()
+                }
+              />
+            )}
           />
         </footer>
         <Show when={showMobileToolbar()}>
@@ -5229,12 +5412,11 @@ function PreviewPanel(props: {
           <button
             onClick={props.onClose}
             title="Close panel (Ctrl+Shift+B)"
-            style={{
-              ...ui.btn,
+            style={mergeStyle(ui.btn, {
               "font-size": `${props.scale.xs}px`,
               padding: `0 ${props.scale.tightGap}px`,
               opacity: 0.5,
-            }}
+            })}
           >
             {"\u00D7"}
           </button>
@@ -5416,8 +5598,7 @@ function Thumbnail(props: {
     >
       <button
         onClick={props.onFocus}
-        style={{
-          ...ui.btn,
+        style={mergeStyle(ui.btn, {
           display: "flex",
           "align-items": "center",
           gap: `${props.scale.tightGap}px`,
@@ -5428,7 +5609,7 @@ function Thumbnail(props: {
           opacity: 1,
           "flex-shrink": 0,
           "background-color": props.headerBg ?? "transparent",
-        }}
+        })}
       >
         {props.header()}
         <Show when={!props.isMobileTouch && hover()}>
@@ -5438,13 +5619,12 @@ function Thumbnail(props: {
               props.onClose();
             }}
             title={props.closeTitle}
-            style={{
-              ...ui.btn,
+            style={mergeStyle(ui.btn, {
               "font-size": `${props.scale.sm}px`,
               padding: `0 ${props.scale.tightGap}px`,
               opacity: 0.6,
               "flex-shrink": 0,
-            }}
+            })}
           >
             {"\u00D7"}
           </button>
@@ -5571,21 +5751,19 @@ function SurfaceThumbnail(props: {
               "white-space": "nowrap",
             }}
           >
-            <Show when={props.connectionLabel}>
-              <span style={{ opacity: 0.5 }}>{props.connectionLabel}</span>
-              {" \u203A "}
-            </Show>
+            {/* `dev:S3 \u203A Slack`. The id is the only thing that names a
+                window unambiguously \u2014 titles repeat across an app's windows
+                and change under you \u2014 and it is what `blit surface` takes,
+                so the card doubles as the lookup for driving that window
+                from a terminal. */}
+            <span style={{ opacity: 0.5 }}>
+              {props.connectionLabel ? `${props.connectionLabel}:` : ""}
+              {`S${props.surface.surfaceId}`}
+            </span>
+            {" \u203A "}
             {props.surface.title ||
               props.surface.appId ||
               `Surface ${props.surface.surfaceId}`}
-          </span>
-          <span
-            style={{
-              "font-size": `${props.scale.xs}px`,
-              color: props.theme.dimFg,
-            }}
-          >
-            {props.surface.width}x{props.surface.height}
           </span>
         </>
       )}

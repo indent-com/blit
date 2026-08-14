@@ -1,6 +1,6 @@
 [package]
 name = "blit-server"
-version = "0.51.1"
+version = "0.52.0"
 edition.workspace = true
 description = "blit terminal multiplexer server"
 license.workspace = true
@@ -46,19 +46,35 @@ ignore = "0.4"
 regex = "1"
 memchr = "2"
 getrandom = "0.3"
+blake3 = { version = "1", default-features = false, features = ["std"] }
+wasmi = { version = "1.1", default-features = false, features = ["std"] }
+wasmparser = { version = "0.239", default-features = false, features = ["std"] }
 redb = "2"
 rav1e = { version = "0.8", default-features = false }
 ravif = { version = "0.13", default-features = false }
 rgb = "0.8"
 png = "0.18"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 smallvec = "1"
 rustc-hash = "2"
+os_pipe = "1"
 
 [target.'cfg(unix)'.dependencies]
+close_fds = "0.3"
 libc = "0.2"
 opus = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+blit-desktop = { workspace = true }
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
+anyhow = "1"
+cros-codecs = { path = "../../vendor/cros-codecs", features = ["backend"] }
+# Codec-specific software camera decoders.  These are the last-resort path
+# when no native NVDEC, VA-API, or Vulkan Video device accepts the exact
+# H.264/AV1 profile and chroma format.  Neither dependency uses FFmpeg.
+oxideav-core = "0.1.34"
+oxideav-h264 = "=0.1.7"
+rav1d = { version = "=1.1.0", default-features = false, features = ["bitdepth_8"] }
 # Software H.264 encoders, enabled by the features of the same names.
 # Linux-only: the compositor that feeds the software H.264 surface encoder
 # only exists on Linux (see surface_encoder.rs). x264-sys links the system
@@ -76,4 +92,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
+    "Win32_Globalization",
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
+
+[dev-dependencies]
+wat = "1"

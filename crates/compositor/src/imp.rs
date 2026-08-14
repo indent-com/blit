@@ -12,8 +12,11 @@ use crate::pointer_focus::{
 use crate::positioner::PositionerGeometry;
 use crate::touch_pacer::TouchPacer;
 use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 
@@ -93,24 +96,32 @@ use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1:
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::{
     self, ZxdgToplevelDecorationV1,
 };
+use wayland_protocols::xdg::foreign::zv2::server::zxdg_exported_v2::{
+    self, ZxdgExportedV2,
+};
+use wayland_protocols::xdg::foreign::zv2::server::zxdg_exporter_v2::{
+    self, ZxdgExporterV2,
+};
 use wayland_protocols::xdg::shell::server::xdg_popup::{self, XdgPopup};
 use wayland_protocols::xdg::shell::server::xdg_positioner::XdgPositioner;
 use wayland_protocols::xdg::shell::server::xdg_surface::{self, XdgSurface};
 use wayland_protocols::xdg::shell::server::xdg_toplevel::{self, XdgToplevel};
 use wayland_protocols::xdg::shell::server::xdg_wm_base::{self, XdgWmBase};
+
+const MAX_FOREIGN_EXPORTS: usize = 4096;
 use wayland_protocols::xdg::toplevel_drag::v1::server::xdg_toplevel_drag_manager_v1::{
     self, XdgToplevelDragManagerV1,
 };
 use wayland_protocols::xdg::toplevel_drag::v1::server::xdg_toplevel_drag_v1::{
     self, XdgToplevelDragV1,
 };
+use wayland_server::backend::ObjectId;
+use wayland_server::backend::{ClientId, GlobalId};
 use wayland_server::protocol::wl_buffer::WlBuffer;
 use wayland_server::protocol::wl_callback::WlCallback;
 use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_data_device::{self, WlDataDevice};
-use wayland_server::protocol::wl_data_device_manager::{
-    self, DndAction, WlDataDeviceManager,
-};
+use wayland_server::protocol::wl_data_device_manager::{self, DndAction, WlDataDeviceManager};
 use wayland_server::protocol::wl_data_offer::{self, WlDataOffer};
 use wayland_server::protocol::wl_data_source::{self, WlDataSource};
 use wayland_server::protocol::wl_keyboard::{self, WlKeyboard};
@@ -124,8 +135,6 @@ use wayland_server::protocol::wl_subcompositor::WlSubcompositor;
 use wayland_server::protocol::wl_subsurface::WlSubsurface;
 use wayland_server::protocol::wl_surface::WlSurface;
 use wayland_server::protocol::wl_touch::{self, WlTouch};
-use wayland_server::backend::ObjectId;
-use wayland_server::backend::{ClientId, GlobalId};
 use wayland_server::{
     Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource,
 };
@@ -804,6 +813,12 @@ pub enum CompositorCommand {
         surface_id: u16,
         /// Absolute point on the server's fixed-rate refresh timeline.
         presentation_at: std::time::Instant,
+    },
+    /// Keep a native CPU-readable composite available for an internal
+    /// PipeWire window ScreenCast. This is independent of browser encoders.
+    SetScreenCastActive {
+        surface_id: u16,
+        active: bool,
     },
     /// Re-composite a toplevel from its current committed state and
     /// republish the pixels, without waiting for the client to commit.
@@ -2035,6 +2050,11 @@ struct Compositor {
     /// reclaimed in `cleanup_dead_surfaces`.
     regions: FxHashMap<ObjectId, (WlRegion, Vec<RegionOp>)>,
     toplevel_surface_ids: FxHashMap<u16, ObjectId>,
+    /// xdg-foreign-v2 export handles shared read-only with the server. The
+    /// D-Bus bridge never interprets these opaque random strings.
+    foreign_exports: Arc<RwLock<HashMap<String, u16>>>,
+    foreign_export_objects: FxHashMap<ObjectId, (String, u16)>,
+    screencast_surfaces: FxHashSet<u16>,
     /// Per-toplevel timestamp (`elapsed_ms`) of the last server-driven
     /// `RequestFrame`. Lets `handle_surface_commit` tell whether the server
     /// is actively pacing this surface (a viewer is connected): while it is,
@@ -3333,7 +3353,11 @@ impl Compositor {
         let native = self.native_composite_size(toplevel_sid);
         let target_phys = native.map(|(pw, ph, _, _)| (pw, ph));
         let mut encode_giveups: Vec<(u32, u64)> = Vec::new();
+        let screen_cast = self.screencast_surfaces.contains(&toplevel_sid);
         let (submitted_native, composited) = if let Some(ref mut vk) = self.vulkan_renderer {
+            if screen_cast {
+                vk.request_native_bgra();
+            }
             let rendered = vk.render_tree_sized(
                 root_id,
                 &self.surfaces,
@@ -4360,6 +4384,32 @@ impl Compositor {
         }
     }
 
+    fn remove_foreign_export(&mut self, object_id: &ObjectId) {
+        let Some((handle, _)) = self.foreign_export_objects.remove(object_id) else {
+            return;
+        };
+        if let Ok(mut exports) = self.foreign_exports.write() {
+            exports.remove(&handle);
+        }
+    }
+
+    fn remove_foreign_exports_for_surface(&mut self, surface_id: u16) {
+        let handles = self
+            .foreign_export_objects
+            .iter()
+            .filter(|(_, (_, exported_surface))| *exported_surface == surface_id)
+            .map(|(object_id, (handle, _))| (object_id.clone(), handle.clone()))
+            .collect::<Vec<_>>();
+        if let Ok(mut exports) = self.foreign_exports.write() {
+            for (_, handle) in &handles {
+                exports.remove(handle);
+            }
+        }
+        for (object_id, _) in handles {
+            self.foreign_export_objects.remove(&object_id);
+        }
+    }
+
     fn cleanup_dead_surfaces(&mut self) {
         let dead: Vec<ObjectId> = self
             .surfaces
@@ -4488,6 +4538,8 @@ impl Compositor {
                     parent.children.retain(|c| c != proto_id);
                 }
                 if surf.surface_id > 0 {
+                    self.remove_foreign_exports_for_surface(surf.surface_id);
+                    self.screencast_surfaces.remove(&surf.surface_id);
                     self.release_output_for_surface(surf.surface_id);
                     self.toplevel_surface_ids.remove(&surf.surface_id);
                     // Clear keyboard focus if it pointed at the dead surface,
@@ -5413,6 +5465,16 @@ impl Compositor {
                     // consume it instead of losing a complete refresh.
                     self.pending_request_frames
                         .insert(surface_id, presentation_at);
+                }
+            }
+            CompositorCommand::SetScreenCastActive { surface_id, active } => {
+                if active {
+                    self.screencast_surfaces.insert(surface_id);
+                    if let Some(root_id) = self.toplevel_surface_ids.get(&surface_id).cloned() {
+                        self.composite_toplevel_into_pending(&root_id, surface_id, false);
+                    }
+                } else {
+                    self.screencast_surfaces.remove(&surface_id);
                 }
             }
             // Server-side cleanup on disconnect, not a browser event: `0` takes
@@ -6759,6 +6821,8 @@ impl Dispatch<WlSurface, ()> for Compositor {
                     }
                     state.last_topless_frame_ms.remove(&sid);
                     if surf.surface_id > 0 {
+                        state.remove_foreign_exports_for_surface(surf.surface_id);
+                        state.screencast_surfaces.remove(&surf.surface_id);
                         state.release_output_for_surface(surf.surface_id);
                         state.toplevel_surface_ids.remove(&surf.surface_id);
                         state.last_request_frame_ms.remove(&surf.surface_id);
@@ -6780,6 +6844,128 @@ impl Dispatch<WlSurface, ()> for Compositor {
             _ => {}
         }
     }
+}
+
+// -- xdg-foreign v2 exporter (portal parent handles) --
+
+impl GlobalDispatch<ZxdgExporterV2, ()> for Compositor {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<ZxdgExporterV2>,
+        _data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<ZxdgExporterV2, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        exporter: &ZxdgExporterV2,
+        request: <ZxdgExporterV2 as Resource>::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        use zxdg_exporter_v2::Request;
+        match request {
+            Request::ExportToplevel { id, surface } => {
+                let surface_id = state.surfaces.get(&surface.id()).and_then(|known| {
+                    (same_client(exporter, &surface)
+                        && known.surface_id != 0
+                        && known.xdg_toplevel.is_some())
+                    .then_some(known.surface_id)
+                });
+                let Some(surface_id) = surface_id else {
+                    exporter.post_error(
+                        zxdg_exporter_v2::Error::InvalidSurface,
+                        "surface is not this client's xdg_toplevel",
+                    );
+                    return;
+                };
+                if state
+                    .foreign_exports
+                    .read()
+                    .map_or(true, |exports| exports.len() >= MAX_FOREIGN_EXPORTS)
+                {
+                    exporter.post_error(
+                        zxdg_exporter_v2::Error::InvalidSurface,
+                        "xdg-foreign export budget exhausted",
+                    );
+                    return;
+                }
+                let Some(handle) = new_foreign_handle(&state.foreign_exports) else {
+                    exporter.post_error(
+                        zxdg_exporter_v2::Error::InvalidSurface,
+                        "could not allocate an export handle",
+                    );
+                    return;
+                };
+                let exported = data_init.init(id, handle.clone());
+                state
+                    .foreign_export_objects
+                    .insert(exported.id(), (handle.clone(), surface_id));
+                if let Ok(mut exports) = state.foreign_exports.write() {
+                    exports.insert(handle.clone(), surface_id);
+                }
+                exported.handle(handle);
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZxdgExportedV2, String> for Compositor {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        exported: &ZxdgExportedV2,
+        request: <ZxdgExportedV2 as Resource>::Request,
+        _data: &String,
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        use zxdg_exported_v2::Request;
+        if let Request::Destroy = request {
+            state.remove_foreign_export(&exported.id());
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client_id: ClientId,
+        exported: &ZxdgExportedV2,
+        _data: &String,
+    ) {
+        state.remove_foreign_export(&exported.id());
+    }
+}
+
+fn new_foreign_handle(exports: &Arc<RwLock<HashMap<String, u16>>>) -> Option<String> {
+    for _ in 0..8 {
+        let mut random = [0u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .ok()?
+            .read_exact(&mut random)
+            .ok()?;
+        let mut handle = String::with_capacity(32);
+        for byte in random {
+            let _ = write!(handle, "{byte:02x}");
+        }
+        if exports
+            .read()
+            .ok()
+            .is_some_and(|known| !known.contains_key(&handle))
+        {
+            return Some(handle);
+        }
+    }
+    None
 }
 
 // -- wl_callback --
@@ -7603,6 +7789,7 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                     surf.xdg_fullscreen = false;
                     if sid > 0 {
                         unmapped_sid = Some(sid);
+                        state.screencast_surfaces.remove(&sid);
                         state.toplevel_surface_ids.remove(&sid);
                         state.last_request_frame_ms.remove(&sid);
                         state.pending_request_frames.remove(&sid);
@@ -7622,6 +7809,7 @@ impl Dispatch<XdgToplevel, XdgToplevelData> for Compositor {
                 }
                 // Withdraw the window's display outside the surface borrow.
                 if let Some(sid) = unmapped_sid {
+                    state.remove_foreign_exports_for_surface(sid);
                     state.release_output_for_surface(sid);
                 }
             }
@@ -10686,6 +10874,7 @@ pub struct CompositorHandle {
     pub vulkan_video_encode: bool,
     /// Whether the compositor's Vulkan renderer supports Vulkan Video AV1 encode.
     pub vulkan_video_encode_av1: bool,
+    foreign_exports: Arc<RwLock<HashMap<String, u16>>>,
     thread: std::thread::JoinHandle<()>,
     frame_clock_thread: std::thread::JoinHandle<()>,
     frame_clock_tx: mpsc::Sender<FrameClockCommand>,
@@ -10711,6 +10900,17 @@ impl CompositorHandle {
     /// Number of fixed-clock frame requests emitted since the last call.
     pub fn take_frame_clock_requests(&self) -> u32 {
         self.frame_clock_requests.swap(0, Ordering::Relaxed)
+    }
+
+    /// Resolve a portal `wayland:<xdg-foreign-v2 handle>` to a live semantic
+    /// toplevel ID. Empty, malformed, expired, and non-Wayland parents fail
+    /// closed to the portal authority fallback.
+    pub fn resolve_foreign_parent(&self, parent: &str) -> Option<u16> {
+        let handle = parent.strip_prefix("wayland:")?;
+        if handle.len() != 32 || !handle.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        self.foreign_exports.read().ok()?.get(handle).copied()
     }
 
     /// Stop the compositor and wait for it to finish tearing down.
@@ -10854,12 +11054,37 @@ pub fn spawn_compositor(
     event_notify: Arc<dyn Fn() + Send + Sync>,
     gpu_device: &str,
 ) -> CompositorHandle {
+    spawn_compositor_inner(verbose, event_notify, gpu_device, true)
+}
+
+/// Start a compositor without probing or initializing a renderer.
+///
+/// This is intended for protocol tests whose assertions only depend on
+/// Wayland state and events. Keeping those tests off Vulkan avoids creating a
+/// GPU device per test, which is both expensive and prone to driver contention
+/// when the Rust test harness runs them concurrently.
+#[doc(hidden)]
+pub fn spawn_compositor_without_renderer(
+    verbose: bool,
+    event_notify: Arc<dyn Fn() + Send + Sync>,
+) -> CompositorHandle {
+    spawn_compositor_inner(verbose, event_notify, "", false)
+}
+
+fn spawn_compositor_inner(
+    verbose: bool,
+    event_notify: Arc<dyn Fn() + Send + Sync>,
+    gpu_device: &str,
+    enable_renderer: bool,
+) -> CompositorHandle {
     let _gpu_device = gpu_device.to_string();
     let (event_tx, event_rx) = mpsc::channel();
     let (command_tx, command_rx) = mpsc::channel();
     let (socket_tx, socket_rx) = mpsc::sync_channel(1);
     let (signal_tx, signal_rx) = mpsc::sync_channel::<LoopSignal>(1);
     let (caps_tx, caps_rx) = mpsc::sync_channel::<(bool, bool)>(1);
+    let foreign_exports = Arc::new(RwLock::new(HashMap::new()));
+    let compositor_foreign_exports = foreign_exports.clone();
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
 
@@ -10892,6 +11117,8 @@ pub fn spawn_compositor(
                     shutdown_clone,
                     verbose,
                     _gpu_device,
+                    enable_renderer,
+                    compositor_foreign_exports,
                 );
             }));
             if let Err(e) = result {
@@ -10942,6 +11169,7 @@ pub fn spawn_compositor(
         shutdown,
         vulkan_video_encode,
         vulkan_video_encode_av1,
+        foreign_exports,
         loop_signal,
     }
 }
@@ -10957,6 +11185,8 @@ fn run_compositor(
     shutdown: Arc<AtomicBool>,
     verbose: bool,
     gpu_device: String,
+    enable_renderer: bool,
+    foreign_exports: Arc<RwLock<HashMap<String, u16>>>,
 ) {
     let mut event_loop: EventLoop<Compositor> =
         EventLoop::try_new().expect("failed to create event loop");
@@ -10967,15 +11197,19 @@ fn run_compositor(
 
     // Probe Vulkan early so we know whether DMA-BUF is available
     // before registering Wayland globals.
-    eprintln!("[compositor] trying Vulkan renderer for {gpu_device}");
-    let vulkan_renderer = super::vulkan_render::VulkanRenderer::try_new(&gpu_device);
+    if enable_renderer {
+        eprintln!("[compositor] trying Vulkan renderer for {gpu_device}");
+    }
+    let vulkan_renderer = enable_renderer
+        .then(|| super::vulkan_render::VulkanRenderer::try_new(&gpu_device))
+        .flatten();
     let has_dmabuf = vulkan_renderer.as_ref().is_some_and(|vk| vk.has_dmabuf());
     eprintln!(
         "[compositor] Vulkan renderer: {} (dmabuf={})",
         vulkan_renderer.is_some(),
         has_dmabuf,
     );
-    if vulkan_renderer.is_none() {
+    if enable_renderer && vulkan_renderer.is_none() {
         eprintln!(
             "[compositor] WARNING: no Vulkan renderer — clients can connect but NO frames will be composited (windows will never appear)."
         );
@@ -10988,6 +11222,7 @@ fn run_compositor(
     dh.create_global::<Compositor, WlCompositor, ()>(6, ());
     dh.create_global::<Compositor, WlSubcompositor, ()>(1, ());
     dh.create_global::<Compositor, XdgWmBase, ()>(6, ());
+    dh.create_global::<Compositor, ZxdgExporterV2, ()>(1, ());
     dh.create_global::<Compositor, WlShm, ()>(1, ());
     // No session-wide output: a screen is published per client on connect
     // and per toplevel thereafter, each visible only to its owner.
@@ -11051,6 +11286,9 @@ fn run_compositor(
         surfaces: FxHashMap::default(),
         regions: FxHashMap::default(),
         toplevel_surface_ids: FxHashMap::default(),
+        foreign_exports,
+        foreign_export_objects: FxHashMap::default(),
+        screencast_surfaces: FxHashSet::default(),
         last_request_frame_ms: FxHashMap::default(),
         last_topless_frame_ms: FxHashMap::default(),
         pending_request_frames: FxHashMap::default(),

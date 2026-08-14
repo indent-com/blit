@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
-use crate::transport::{read_message, write_frame};
+use crate::transport::{FragmentReassembly, read_message, write_frame};
 use blit_remote::net::{
     FEATURE_NET, NET_CLOSE_WRITE, NET_CLOSED_EOF, NET_MAX_CHUNK, NET_MAX_SOCKETS, NET_STATUS_OK,
     NET_WINDOW_BYTES, NET_WINDOW_MIN, NetOpen, S2C_NET_ACK, S2C_NET_CLOSED, S2C_NET_DATA,
@@ -165,7 +165,7 @@ pub async fn establish(
     transport: crate::transport::Transport,
 ) -> Result<(Arc<Conn>, impl std::future::Future<Output = ()>), String> {
     let (mut reader, mut writer) = transport.split();
-    let mut pending = Vec::new();
+    let mut pending = FragmentReassembly::default();
     require_net(&mut reader, &mut pending).await?;
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -189,7 +189,7 @@ pub async fn establish(
 /// Fan S2C messages out to the socket that owns each id.
 async fn reader_task(
     mut reader: Box<dyn AsyncRead + Unpin + Send>,
-    mut pending: Vec<u8>,
+    mut pending: FragmentReassembly,
     conn: Arc<Conn>,
 ) {
     while let Some(msg) = read_message(&mut reader, &mut pending).await {
@@ -242,7 +242,7 @@ async fn reader_task(
 /// Handshake and refuse early if the server has no relay — an old server drops the opcode silently and every forward would hang on connect.
 async fn require_net(
     reader: &mut (impl AsyncRead + Unpin),
-    pending: &mut Vec<u8>,
+    pending: &mut FragmentReassembly,
 ) -> Result<(), String> {
     let mut features = 0u32;
     loop {
@@ -545,7 +545,11 @@ mod tests {
                 next_id: Mutex::new(1),
             });
             let (server_side, our_side) = tokio::io::duplex(1024);
-            let reader = Box::pin(reader_task(Box::new(our_side), Vec::new(), conn.clone()));
+            let reader = Box::pin(reader_task(
+                Box::new(our_side),
+                FragmentReassembly::default(),
+                conn.clone(),
+            ));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let client = tokio::net::TcpStream::connect(addr).await.unwrap();

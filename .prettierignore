@@ -1,6 +1,7 @@
 target/
 dist/
 node_modules/
+vendor/
 crates/browser/pkg/
 */browser/pkg/
 *.wasm

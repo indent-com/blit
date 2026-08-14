@@ -7,7 +7,7 @@
 /.direnv/
 /.moo/
 /crates/alacritty_terminal/
-/crates/browser/pkg/
+/crates/browser/pkg
 /e2e/playwright-report/
 /e2e/test-results/
 /result

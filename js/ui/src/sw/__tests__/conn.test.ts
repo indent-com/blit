@@ -1,6 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FEATURE_NET } from "@blit-sh/core";
-import { S2C_HELLO, S2C_PING, S2C_READY } from "@blit-sh/core/types";
+import {
+  FRAGMENT_FLAG_LAST,
+  S2C_AUDIO_FRAME,
+  S2C_FRAGMENT,
+  S2C_HELLO,
+  S2C_PING,
+  S2C_READY,
+} from "@blit-sh/core/types";
 import { RELAY_INACTIVITY_TIMEOUT_MS, RelayPool } from "../conn";
 
 class FakeWebSocket {
@@ -61,6 +68,14 @@ function authenticate(socket: FakeWebSocket): void {
     ]).buffer,
   );
   socket.message(new Uint8Array([S2C_READY]).buffer);
+}
+
+function fragment(flags: number, payload: Uint8Array): ArrayBuffer {
+  const message = new Uint8Array(2 + payload.length);
+  message[0] = S2C_FRAGMENT;
+  message[1] = flags;
+  message.set(payload, 2);
+  return message.buffer;
 }
 
 describe("RelayPool connection liveness", () => {
@@ -142,5 +157,48 @@ describe("RelayPool connection liveness", () => {
 
     await vi.advanceTimersByTimeAsync(5_000);
     expect(socket.closeCalls).toBe(1);
+  });
+
+  it("aborts when a non-audio message interleaves fragments", async () => {
+    const pool = new RelayPool();
+    pool.setPassphrase("secret");
+    const opening = pool.open("local", "127.0.0.1", 8080);
+    const socket = FakeWebSocket.instances[0]!;
+    authenticate(socket);
+    await opening;
+
+    socket.message(fragment(0, new Uint8Array([S2C_PING])));
+    socket.message(new Uint8Array([S2C_PING]).buffer);
+    expect(socket.closeCalls).toBe(1);
+  });
+
+  it("allows audio frames to interleave fragments", async () => {
+    const pool = new RelayPool();
+    pool.setPassphrase("secret");
+    const opening = pool.open("local", "127.0.0.1", 8080);
+    const socket = FakeWebSocket.instances[0]!;
+    authenticate(socket);
+    await opening;
+
+    socket.message(fragment(0, new Uint8Array([S2C_PING])));
+    socket.message(new Uint8Array([S2C_AUDIO_FRAME]).buffer);
+    socket.message(fragment(FRAGMENT_FLAG_LAST, new Uint8Array([0])));
+    expect(socket.closeCalls).toBe(0);
+  });
+
+  it("aborts malformed fragment headers", async () => {
+    for (const malformed of [
+      fragment(2, new Uint8Array([S2C_PING])),
+      fragment(0, new Uint8Array(0)),
+    ]) {
+      const pool = new RelayPool();
+      pool.setPassphrase("secret");
+      const opening = pool.open("local", "127.0.0.1", 8080);
+      const socket = FakeWebSocket.instances.at(-1)!;
+      authenticate(socket);
+      await opening;
+      socket.message(malformed);
+      expect(socket.closeCalls).toBe(1);
+    }
   });
 });

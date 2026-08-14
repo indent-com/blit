@@ -76,6 +76,17 @@ export abstract class AbstractUnixSocketTransport implements BlitTransport {
     this.setStatus("closed");
   }
 
+  suspend(): void {
+    if (this.disposed) return;
+    this.clearReconnectTimer();
+    this.clearConnectTimer();
+    this.currentAttempt = null;
+    this.destroyRawSocket();
+    this.recvBuf = new Uint8Array(0);
+    this.currentDelay = this.initialDelay;
+    this.setStatus("disconnected");
+  }
+
   reconnect(): void {
     if (this.disposed) return;
     this.clearReconnectTimer();

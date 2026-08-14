@@ -48,6 +48,8 @@ Both accept `--cols`/`--rows` to resize before reading, and `--ansi` to preserve
 
 ```bash
 blit terminal list            # show all terminals
+blit client list              # show peers, subscriptions, and view sizes
+blit client kick 3 --reason "duplicate tab"
 blit terminal close "$ID"     # tear down a terminal
 blit terminal kill "$ID" TERM # signal the process, keep the terminal
 blit terminal restart "$ID"   # re-run an exited terminal
@@ -195,6 +197,25 @@ blit kv rm build/status            # delete
 Writes are compare-and-swap when you ask: `--if-hash H` writes only if the
 current value still hashes to H, exiting 1 on conflict. Without it a put is
 an unconditional overwrite. `--durable` waits for disk.
+
+## Wasmi extensions
+
+```bash
+blit ext run worker.wasm arg1 --guest-flag
+blit ext list
+blit ext status NAME
+blit ext attach NAME
+blit ext commands --on prod
+blit --on prod @builder --help
+blit --on prod @builder build --release app
+```
+
+`blit ext commands` lists live command namespaces advertised by named,
+persistent extensions. Connection options must precede `@name`; every later
+token is sent to the extension verbatim, including `--json`, `--on`, and other
+tokens beginning with `-`. A final `--help` immediately after an advertised
+command path is rendered locally from its descriptor. Redirected stdin is
+streamed to the command, while terminal stdin starts closed.
 
 ## Web panes
 

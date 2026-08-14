@@ -25,6 +25,7 @@ use blit_remote::kv::{
 };
 use redb::ReadableTable;
 use rustc_hash::FxHashMap;
+#[cfg(test)]
 use tokio::sync::mpsc;
 
 const TABLE: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("kv");
@@ -107,7 +108,7 @@ struct Entry {
 /// is sent only once the fsynced commit confirms. Dropping it releases
 /// the put's in-flight slot (docs/design/kv.md § Budgets).
 struct DurableReply {
-    out: mpsc::UnboundedSender<Vec<u8>>,
+    out: crate::TrackedOutboxSender,
     nonce: u16,
     hash: u128,
     mtime_ns: u64,
@@ -172,7 +173,7 @@ struct SubEntry {
     /// Queued-unacked byte budget, captured from `BLIT_KV_UNACKED_MAX` at
     /// open (docs/design/kv.md § Budgets).
     unacked_max: u64,
-    out: mpsc::UnboundedSender<Vec<u8>>,
+    out: crate::TrackedOutboxSender,
     update_id: AtomicU32,
     state: Mutex<SubState>,
 }
@@ -288,6 +289,10 @@ pub struct KvSubs {
 }
 
 impl KvSubs {
+    pub fn ids(&self) -> impl Iterator<Item = u16> + '_ {
+        self.map.keys().copied()
+    }
+
     fn alloc_id(&mut self) -> Option<u16> {
         // Monotonic with wrap, skipping live ids and the 0xFFFF sentinel.
         for _ in 0..=u16::MAX {
@@ -578,7 +583,7 @@ pub fn warm() {
 pub fn handle_kv_message(
     data: &[u8],
     subs: &mut KvSubs,
-    out: &mpsc::UnboundedSender<Vec<u8>>,
+    out: &crate::TrackedOutboxSender,
     verbose: bool,
 ) {
     match data[0] {
@@ -877,7 +882,7 @@ pub fn handle_kv_message(
 /// Refuse a `KV_*` message at dispatch (`BLIT_KV=0`): every nonce-bearing
 /// request gets its one `PERMISSION` reply, subscriptions and acks are
 /// dropped (docs/design/kv.md § Security posture).
-pub fn refuse_kv_message(data: &[u8], out: &mpsc::UnboundedSender<Vec<u8>>) {
+pub fn refuse_kv_message(data: &[u8], out: &crate::TrackedOutboxSender) {
     use blit_remote::kv::KV_STATUS_PERMISSION;
     let nonce = data
         .get(1..3)
@@ -905,6 +910,11 @@ pub fn refuse_kv_message(data: &[u8], out: &mpsc::UnboundedSender<Vec<u8>>) {
 #[cfg(test)]
 mod tests {
 
+    fn test_outbox() -> (crate::TrackedOutboxSender, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (crate::TrackedOutboxSender::untracked(tx), rx)
+    }
+
     /// An oversized value is refused from its LZ4 header, not after being
     /// inflated. `decompress_size_prepended` allocates the declared size, so
     /// rejecting a 4 MiB-limit violation used to cost a 64 MiB allocation
@@ -925,7 +935,7 @@ mod tests {
             "the declared size must be readable without inflating"
         );
 
-        let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out, mut rx) = test_outbox();
         let mut subs = KvSubs::default();
         handle_kv_message(&put, &mut subs, &out, false);
         let (nonce, status, ..) = parse_kv_done(&rx.try_recv().expect("a reply")).unwrap();
@@ -985,7 +995,7 @@ mod tests {
         // owner — also owns the LazyLock's first read.
         unsafe { std::env::set_var("BLIT_KV_UNACKED_MAX", "4096") };
 
-        let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out, mut rx) = test_outbox();
         let mut subs = KvSubs::default();
         let mut recv = move || rx.try_recv();
 
@@ -1079,7 +1089,7 @@ mod tests {
 
         // --- DURABLE flow rides the writer thread ------------------------
         // Re-subscribe so the echo path is observable again.
-        let (out2, mut rx2) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out2, mut rx2) = test_outbox();
         handle_kv_message(
             &msg_kv_open(11, 0, 1024, "editor/"),
             &mut subs,
@@ -1166,7 +1176,7 @@ mod tests {
         // A sub that never acks past the budget is dropped: the breaching
         // frame is withheld, KV_CLOSED{RESOURCE_LIMIT} rides the same
         // outbox, and later mutations no longer queue to it.
-        let (out3, mut rx3) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out3, mut rx3) = test_outbox();
         handle_kv_message(&msg_kv_open(20, 0, 0, "ret/"), &mut subs, &out3, false);
         let (_, ret_id, status, _) = parse_kv_opened(&rx3.try_recv().unwrap()).unwrap();
         assert_eq!(status, KV_STATUS_OK);
@@ -1229,7 +1239,7 @@ mod tests {
 
         // An acking sub survives indefinitely: the floor advances, the
         // window drains, and updates keep flowing well past the budget.
-        let (out4, mut rx4) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out4, mut rx4) = test_outbox();
         handle_kv_message(&msg_kv_open(27, 0, 0, "ack/"), &mut subs, &out4, false);
         let (_, ack_id, status, _) = parse_kv_opened(&rx4.try_recv().unwrap()).unwrap();
         assert_eq!(status, KV_STATUS_OK);
@@ -1274,7 +1284,7 @@ mod tests {
             let (_, status, _, _) = parse_kv_done(&rx3.try_recv().unwrap()).unwrap();
             assert_eq!(status, KV_STATUS_OK);
         }
-        let (out5, mut rx5) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out5, mut rx5) = test_outbox();
         handle_kv_message(&msg_kv_open(44, 0, 0, "snap/"), &mut subs, &out5, false);
         let (_, snap_id, status, _) = parse_kv_opened(&rx5.try_recv().unwrap()).unwrap();
         assert_eq!(status, KV_STATUS_OK);
@@ -1298,7 +1308,7 @@ mod tests {
     /// Direct `SubEntry` with an explicit unacked budget — the env-backed
     /// `unacked_max()` is deliberately untouched so these tests cannot
     /// race the end-to-end test's env setup.
-    fn test_sub(kv_id: u16, unacked_max: u64, out: mpsc::UnboundedSender<Vec<u8>>) -> SubEntry {
+    fn test_sub(kv_id: u16, unacked_max: u64, out: crate::TrackedOutboxSender) -> SubEntry {
         SubEntry {
             kv_id,
             prefix: String::new(),
@@ -1315,7 +1325,7 @@ mod tests {
     /// the wire-order guarantee the off-lock snapshot encoding relies on.
     #[test]
     fn sub_snapshot_buffering_orders_updates() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, mut rx) = test_outbox();
         let sub = test_sub(7, u64::MAX, tx);
         // A "broadcast" lands while the snapshot is still encoding: it
         // must buffer, not send.
@@ -1338,7 +1348,7 @@ mod tests {
     /// (docs/design/kv.md § Watch).
     #[test]
     fn sub_budget_breach_closes_and_silences() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, mut rx) = test_outbox();
         let frame = msg_kv_update(7, 0, 0, b"records");
         // Budget = exactly two frames: the third breaches.
         let sub = test_sub(7, 2 * frame.len() as u64, tx);
@@ -1363,7 +1373,7 @@ mod tests {
     /// subscriber sends unbounded traffic through a bounded window.
     #[test]
     fn sub_ack_floor_releases_budget() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, mut rx) = test_outbox();
         let frame = msg_kv_update(7, 0, 0, b"records");
         // Budget = one frame in flight: only the ack keeps this alive.
         let sub = test_sub(7, frame.len() as u64, tx);

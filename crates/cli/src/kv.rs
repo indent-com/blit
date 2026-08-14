@@ -9,7 +9,7 @@
 //! stops — the same shape as `blit fs sync --once`. With `--watch` it stays
 //! and streams changes instead.
 
-use crate::transport::{Transport, read_message, write_frame};
+use crate::transport::{FragmentReassembly, Transport, read_message, write_frame};
 use blit_remote::kv::{
     FEATURE_KV, KV_PUT_DELETE, KV_PUT_DURABLE, KV_PUT_NO_CAS, KV_STATUS_CONFLICT,
     KV_STATUS_NOT_FOUND, KV_STATUS_OK, KvMirror, KvPut, S2C_KV_CLOSED, S2C_KV_DONE, S2C_KV_OPENED,
@@ -25,7 +25,7 @@ const REQ_NONCE: u16 = 1;
 /// server drops the opcode silently and the request would never answer.
 async fn require_kv(
     reader: &mut (impl AsyncRead + Unpin),
-    fragment_buf: &mut Vec<u8>,
+    fragment_buf: &mut FragmentReassembly,
 ) -> Result<(), String> {
     let mut features = 0u32;
     loop {
@@ -66,7 +66,7 @@ fn parse_hash(text: &str) -> Result<u128, String> {
 pub async fn cmd_get(transport: Transport, key: String) -> Result<i32, String> {
     use std::io::Write as _;
     let (mut reader, mut writer) = transport.split();
-    let mut fb = Vec::new();
+    let mut fb = FragmentReassembly::default();
     require_kv(&mut reader, &mut fb).await?;
     if !write_frame(&mut writer, &msg_kv_fetch(REQ_NONCE, &key)).await {
         return Err("connection closed".into());
@@ -145,7 +145,7 @@ pub async fn cmd_put(
     }
 
     let (mut reader, mut writer) = transport.split();
-    let mut fb = Vec::new();
+    let mut fb = FragmentReassembly::default();
     require_kv(&mut reader, &mut fb).await?;
     let req = KvPut {
         nonce: REQ_NONCE,
@@ -207,7 +207,7 @@ pub async fn cmd_ls(
     json: bool,
 ) -> Result<i32, String> {
     let (mut reader, mut writer) = transport.split();
-    let mut fb = Vec::new();
+    let mut fb = FragmentReassembly::default();
     require_kv(&mut reader, &mut fb).await?;
     // `inline_max` carries values, and **0 means no limit** (the server
     // reads it that way — crates/server/src/kv.rs). So --values asks for 0,

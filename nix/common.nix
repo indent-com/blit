@@ -5,7 +5,7 @@ let
     overlays = [ inputs.rust-overlay.overlays.default ];
   };
 
-  version = "0.51.1";
+  version = "0.52.0";
 
   cargoLockConfig = {
     lockFile = ../Cargo.lock;
@@ -30,7 +30,8 @@ let
 
   craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-  # Shared source filtering — only include Rust/Cargo files + assets crane needs.
+  # Shared source filtering — only include Rust/Cargo files and assets crane
+  # needs.
   src =
     let
       # Keep Cargo manifests, Rust source, build scripts, and non-Rust assets
@@ -41,7 +42,9 @@ let
         || pkgs.lib.hasSuffix ".html" path
         || pkgs.lib.hasSuffix ".html.br" path
         || baseNameOf path == "learn.md"
+        || baseNameOf path == "LICENSE"
         || pkgs.lib.hasInfix "/js/ui/dist/" path
+        || pkgs.lib.hasSuffix ".h264" path
         || pkgs.lib.hasSuffix ".xkb" path
         || pkgs.lib.hasSuffix ".spv" path;
     in
@@ -170,8 +173,9 @@ let
     postUnpack =
       let
         compilerRt = pkgsStaticLLVM.llvmPackages.compiler-rt;
-        role = builtins.replaceStrings [ "-" ] [ "_" ]
-          pkgsStaticLLVM.stdenv.hostPlatform.rust.rustcTargetSpec;
+        role =
+          builtins.replaceStrings [ "-" ] [ "_" ]
+            pkgsStaticLLVM.stdenv.hostPlatform.rust.rustcTargetSpec;
       in
       ''
         export NIX_CFLAGS_LINK=""
@@ -205,9 +209,10 @@ let
   minGlibcVersion = "2.31";
 
   rustTargetGnu =
-    if pkgs.stdenv.hostPlatform.isAarch64
-    then "aarch64-unknown-linux-gnu"
-    else "x86_64-unknown-linux-gnu";
+    if pkgs.stdenv.hostPlatform.isAarch64 then
+      "aarch64-unknown-linux-gnu"
+    else
+      "x86_64-unknown-linux-gnu";
 
   # Static libopus for the glibc release build so the binary is
   # fully self-contained (only glibc itself is dynamic).
@@ -225,16 +230,16 @@ let
   # _GNU_SOURCE, which doesn't exist at the 2.31 floor and breaks the
   # final link.  Compile with zig cc targeting the same floor instead.
   zigTargetGnu =
-    if pkgs.stdenv.hostPlatform.isAarch64
-    then "aarch64-linux-gnu.${minGlibcVersion}"
-    else "x86_64-linux-gnu.${minGlibcVersion}";
+    if pkgs.stdenv.hostPlatform.isAarch64 then
+      "aarch64-linux-gnu.${minGlibcVersion}"
+    else
+      "x86_64-linux-gnu.${minGlibcVersion}";
 
   # pkgs.zig is referenced by path, not via nativeBuildInputs: its
   # setup hooks would take over the configure/build phases.
   gnuStaticX264 = pkgs.x264.overrideAttrs (old: {
     configureFlags =
-      map (f: if f == "--enable-shared" then "--enable-static" else f)
-        (old.configureFlags or [ ])
+      map (f: if f == "--enable-shared" then "--enable-static" else f) (old.configureFlags or [ ])
       ++ [
         "--disable-shared"
         # zig cc promotes -Wdate-time to an error; the x264 CLI's

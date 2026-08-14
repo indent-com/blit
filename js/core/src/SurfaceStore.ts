@@ -11,7 +11,7 @@ import {
 // Shared with the codec probe rather than duplicated: the probe answers
 // for what this browser accepts at a given level, and a decoder configured
 // here at a different one would be asking a question nobody answered.
-import { av1LevelString } from "./BlitSurfaceCanvas";
+import { av1LevelString } from "./videoCodec";
 
 /**
  * Every Blit encoder produces limited-range BT.601 (sRGB

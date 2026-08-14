@@ -1,0 +1,156 @@
+package {
+    default_applicable_licenses: ["system_cros-codecs_license"],
+    // TODO(b/374841646): This is a temporary assignment.
+    default_team: "trendy_team_arc_next",
+}
+
+license {
+    name: "system_cros-codecs_license",
+    visibility: [":__subpackages__"],
+    license_kinds: ["SPDX-license-identifier-BSD-3-Clause"],
+    license_text: ["LICENSE"],
+}
+
+rust_defaults {
+    name: "libcros_codecs_defaults",
+    crate_name: "cros_codecs",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.0.5",
+    crate_root: "src/lib.rs",
+    edition: "2021",
+    rustlibs: [
+        "libanyhow",
+        "libcrc32fast",
+        "libbyteorder",
+        "libthiserror",
+        "liblog_rust",
+        "libgbm_rust",
+        "libdrm_rust",
+        "libdrm_fourcc",
+        "libgbm_sys",
+        "libnix",
+        "libzerocopy",
+    ],
+    aliases: ["cros_libva:libva"],
+    apex_available: [
+        "//apex_available:platform",
+        "//apex_available:anyapex",
+    ],
+    // TODO(b/382119688): Remove this.
+    lints: "none",
+
+    product_available: true,
+    vendor_available: true,
+}
+
+rust_library {
+    name: "libcros_codecs",
+    defaults: ["libcros_codecs_defaults"],
+    enabled: false,
+    arch: {
+        x86_64: {
+            enabled: true,
+            features: [
+                "vaapi",
+                "backend",
+            ],
+            rustlibs: ["libcros_libva"],
+        },
+        arm64: {
+            enabled: true,
+            features: [
+                "v4l2",
+                "backend",
+            ],
+            rustlibs: ["libv4l2r"],
+        },
+    },
+}
+
+rust_test_host {
+    name: "libcros_codecs_test",
+    defaults: ["libcros_codecs_defaults"],
+    rustlibs: ["libenv_logger"],
+}
+
+rust_test {
+    name: "ccdec_test",
+    srcs: ["test/ccdec_test.rs"],
+    test_suites: ["general-tests"],
+    test_config: "test/AndroidTest.xml",
+    rustlibs: [
+        "libargh",
+        "libcros_codecs",
+        "libenv_logger",
+        "liblog_rust",
+        "libserde_json",
+    ],
+    data: [
+        ":test_data",
+    ],
+    data_bins: ["ccdec"],
+    // TODO(b/394365384): Group shared dependencies with rust_defaults
+    enabled: false,
+    arch: {
+        x86_64: {
+            enabled: true,
+            features: [
+                "vaapi",
+                "backend",
+            ],
+        },
+        arm64: {
+            enabled: true,
+            features: [
+                "v4l2",
+                "backend",
+            ],
+        },
+    },
+}
+
+rust_test {
+    name: "ccdec",
+    srcs: ["examples/ccdec/main.rs"],
+    test_suites: ["general-tests"],
+    rustlibs: [
+        "libenv_logger",
+        "libcros_codecs",
+        "libargh",
+        "libserde_json",
+    ],
+    // TODO(b/394365384): Group shared dependencies with rust_defaults
+    enabled: false,
+    arch: {
+        x86_64: {
+            enabled: true,
+            features: [
+                "vaapi",
+                "backend",
+            ],
+        },
+        arm64: {
+            enabled: true,
+            features: [
+                "v4l2",
+                "backend",
+            ],
+        },
+    },
+    test_harness: false,
+}
+
+filegroup {
+    name: "test_data",
+    srcs: [
+        "src/codec/av1/test_data/*",
+        "src/codec/h264/test_data/*",
+        "src/codec/h265/test_data/*",
+        "src/codec/vp8/test_data/*",
+        "src/codec/vp9/test_data/*",
+    ],
+    exclude_srcs: [
+        "src/codec/**/gen_crcs.sh",
+        "src/codec/**/README.md",
+    ],
+}

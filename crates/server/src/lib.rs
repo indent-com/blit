@@ -2,33 +2,54 @@ use blit_alacritty::{SearchResult as AlacrittySearchResult, TerminalDriver as Al
 use blit_compositor::{
     CompositorCommand, CompositorEvent, CompositorHandle, TouchPhase, TouchPoint,
 };
+#[cfg(target_os = "linux")]
+use blit_remote::desktop::{
+    C2S_DESKTOP_SUBSCRIBE, C2S_NOTIFICATION_EVENT, C2S_TRAY_EVENT, DESKTOP_SUBSCRIBE_NOTIFICATIONS,
+    DESKTOP_SUBSCRIBE_TRAY, DESKTOP_UPDATE_REPLAY, DESKTOP_UPDATE_RESET, DESKTOP_UPDATE_SYNC,
+    DesktopMirror, FEATURE_DESKTOP, NotificationRecord, TrayRecord, msg_notification_snapshot,
+    msg_notification_update, msg_tray_menu, msg_tray_snapshot, msg_tray_update,
+    parse_desktop_subscribe, parse_notification_event, parse_tray_event,
+};
+#[cfg(target_os = "linux")]
+use blit_remote::media::{
+    ACTIVE_CAMERA, ACTIVE_MICROPHONE, ACTIVE_SCREENCAST, C2S_MEDIA_CONTROL, C2S_MEDIA_DATA,
+    CAPTURE_PORTAL_UI, ClientControl, FEATURE_DESKTOP_MEDIA, MPRIS_UPDATE_REPLAY,
+    MPRIS_UPDATE_RESET, MPRIS_UPDATE_SYNC, MediaCapabilities, MediaKind, MediaState,
+    MprisActionResult, MprisMirror, MprisRecord, PortalRequest, RUNTIME_CAMERA, RUNTIME_MICROPHONE,
+    RUNTIME_MPRIS, RUNTIME_PIPEWIRE, RUNTIME_PORTAL_ACCESS, RUNTIME_PORTAL_FRONTEND,
+    RUNTIME_PORTAL_SCREENCAST, RevokeReason, ScreenCastCandidate, ScreenCastState, ServerControl,
+    ServerMediaCapabilities, msg_server_control, parse_client_control, parse_media_data,
+};
 use blit_remote::{
-    C2S_ACK, C2S_CLIENT_FEATURES, C2S_CLIENT_METRICS, C2S_CLIPBOARD_GET, C2S_CLIPBOARD_LIST,
-    C2S_CLIPBOARD_SET, C2S_CLOSE, C2S_COPY_RANGE, C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N,
-    C2S_CREATE2, C2S_DEADLINE, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_KILL, C2S_MOUSE,
-    C2S_PING, C2S_PRIMARY_SET, C2S_QUIT, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL,
-    C2S_SCROLL_BY, C2S_SEARCH, C2S_SUBSCRIBE, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE,
-    C2S_SURFACE_CLOSE, C2S_SURFACE_DRAG_CANCEL, C2S_SURFACE_DRAG_DROP, C2S_SURFACE_DRAG_ENTER,
-    C2S_SURFACE_DRAG_LEAVE, C2S_SURFACE_DRAG_MOTION, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT,
-    C2S_SURFACE_LIST, C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2,
-    C2S_SURFACE_PREEDIT, C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT,
-    C2S_SURFACE_TOUCH, C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
+    C2S_ACK, C2S_CLIENT_FEATURES, C2S_CLIENT_LIST, C2S_CLIENT_METRICS, C2S_CLIENT_UNWATCH,
+    C2S_CLIENT_WATCH, C2S_CLIPBOARD_GET, C2S_CLIPBOARD_LIST, C2S_CLIPBOARD_SET, C2S_CLOSE,
+    C2S_COPY_RANGE, C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N, C2S_CREATE2, C2S_DEADLINE,
+    C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_KICK, C2S_KILL, C2S_MOUSE, C2S_PING,
+    C2S_PRIMARY_SET, C2S_QUIT, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SCROLL_BY,
+    C2S_SEARCH, C2S_SUBSCRIBE, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE,
+    C2S_SURFACE_DRAG_CANCEL, C2S_SURFACE_DRAG_DROP, C2S_SURFACE_DRAG_ENTER, C2S_SURFACE_DRAG_LEAVE,
+    C2S_SURFACE_DRAG_MOTION, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT, C2S_SURFACE_LIST,
+    C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2, C2S_SURFACE_PREEDIT,
+    C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_TOUCH,
+    C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
     CAPTURE_FORMAT_PNG, CLIENT_FEATURE_SURFACE_TIMESTAMP_SUB_US, CREATE2_HAS_COMMAND,
     CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE, CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS,
-    FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE,
-    FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState,
-    KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, REMOTE_INPUT_POINTER, REMOTE_INPUT_TOUCH, S2C_CLOSED,
-    S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS,
-    S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID,
-    STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME,
+    FEATURE_CLIENT_CONTROL, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS,
+    FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH, FEATURE_RESTART,
+    FEATURE_SCROLL_BY, FrameState, KICK_REASON_MAX, KILL_LEADER_ONLY, READ_ANSI, READ_TAIL,
+    REMOTE_INPUT_POINTER, REMOTE_INPUT_TOUCH, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST,
+    S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST,
+    S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID, STATUS_NOT_FOUND, STATUS_OK, STATUS_OTHER,
+    STATUS_PERMISSION, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME,
     SURFACE_POINTER_AXIS2_LEN, SURFACE_POINTER_DOWN, SURFACE_POINTER_LEAVE, SURFACE_POINTER_MOVE,
     SURFACE_POINTER_UP, SURFACE_TOUCH_CANCEL, SURFACE_TOUCH_DISABLE, SURFACE_TOUCH_DOWN,
     SURFACE_TOUCH_ENABLE, SURFACE_TOUCH_MOTION, SURFACE_TOUCH_UP, build_update_msg, msg_hello,
-    msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_clipboard_owner,
-    msg_s2c_scroll_offset, msg_s2c_surface_remote_input, msg_s2c_used_rows, msg_surface_activated,
-    msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
-    msg_surface_frame, msg_surface_frame_precise, msg_surface_resized, msg_surface_text_input,
-    msg_surface_title, msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
+    msg_kick_result, msg_kicked, msg_s2c_client_list, msg_s2c_clipboard_content,
+    msg_s2c_clipboard_list, msg_s2c_clipboard_owner, msg_s2c_scroll_offset,
+    msg_s2c_surface_remote_input, msg_s2c_used_rows, msg_surface_activated, msg_surface_app_id,
+    msg_surface_created, msg_surface_destroyed, msg_surface_encoder, msg_surface_frame,
+    msg_surface_frame_precise, msg_surface_resized, msg_surface_text_input, msg_surface_title,
+    msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
     parse_surface_pointer_axis2, parse_surface_touch,
 };
 #[cfg(target_os = "linux")]
@@ -41,26 +62,47 @@ use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 
 #[cfg(target_os = "linux")]
 mod audio;
 #[cfg(target_os = "linux")]
 mod audio_pw;
+mod capacity_diagnostics;
+mod channel;
 #[cfg(target_os = "linux")]
 mod desktop_bus;
+mod extension;
+pub mod extension_catalog;
+mod extension_jobs;
+pub mod extension_store;
 mod gpu_libs;
 mod ipc;
 mod kv;
+#[cfg(target_os = "linux")]
+mod media_input;
 mod net;
+#[cfg(target_os = "linux")]
+mod nvdec_decode;
 mod nvenc_encode;
+#[cfg(any(unix, windows))]
+mod process;
 mod pty;
+#[cfg(target_os = "linux")]
+mod software_decode;
 mod surface_encoder;
+pub mod thread_name;
+#[cfg(target_os = "linux")]
+mod vaapi_decode;
 #[cfg(target_os = "linux")]
 mod vaapi_encode;
+#[cfg(target_os = "linux")]
+mod video_decode;
+#[cfg(target_os = "linux")]
+mod video_decode_vulkan;
 
 pub use ipc::{IpcListener, default_ipc_path};
 use pty::{PtyHandle, PtyWriteTarget};
@@ -71,6 +113,242 @@ pub use surface_encoder::SurfaceH264EncoderPreference;
 pub use surface_encoder::{SurfaceBandwidth, SurfaceEncoding, SurfaceSpeed};
 
 type PtyFds = Arc<std::sync::RwLock<FxHashMap<u16, PtyWriteTarget>>>;
+
+/// Command-line overrides for extension and channel deployment policy.
+///
+/// The CLI fills this without mutating the process environment. Calling
+/// [`configure_deployment`] merges it over the corresponding environment
+/// variables and freezes the result for the lifetime of the server process.
+#[derive(Clone, Debug, Default)]
+pub struct DeploymentOverrides {
+    extensions_disabled: bool,
+    channels_disabled: bool,
+    values: HashMap<&'static str, u64>,
+}
+
+impl DeploymentOverrides {
+    pub fn disable_extensions(&mut self) {
+        self.extensions_disabled = true;
+    }
+
+    pub fn disable_channels(&mut self) {
+        self.channels_disabled = true;
+    }
+
+    /// Override one documented extension/channel server setting.
+    pub fn set(&mut self, name: &'static str, value: u64) -> Result<(), String> {
+        if !DEPLOYMENT_SETTING_NAMES.contains(&name) {
+            return Err(format!("unknown deployment setting {name}"));
+        }
+        self.values.insert(name, value);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DeploymentSettings {
+    extensions_enabled: bool,
+    channels_enabled: bool,
+    values: HashMap<&'static str, u64>,
+}
+
+const DEPLOYMENT_SETTING_NAMES: &[&str] = &[
+    "BLIT_EXT_MAX_RUNNING",
+    "BLIT_EXT_MAX_PERSISTENT",
+    "BLIT_EXT_MAX_TRANSIENT",
+    "BLIT_EXT_FOLLOW_MAX_PER_CLIENT",
+    "BLIT_EXT_FOLLOW_MAX",
+    "BLIT_EXT_ARGUMENT_STORE_MAX",
+    "BLIT_EXT_MODULE_MAX",
+    "BLIT_EXT_OBJECT_CACHE_MAX",
+    "BLIT_EXT_OBJECT_CACHE_MAX_ENTRIES",
+    "BLIT_EXT_UPLOAD_MAX_PER_CLIENT",
+    "BLIT_EXT_UPLOAD_MAX_ACTIVE",
+    "BLIT_EXT_UPLOAD_TIMEOUT",
+    "BLIT_EXT_PENDING_TIMEOUT",
+    "BLIT_EXT_MAX_VALIDATING",
+    "BLIT_EXT_MEMORY_MAX",
+    "BLIT_EXT_OUTBOX_MAX",
+    "BLIT_EXT_OUTBOX_MESSAGES_MAX",
+    "BLIT_EXT_OUTBOX_TIMEOUT",
+    "BLIT_EXT_JOB_MAX_PER_CLIENT",
+    "BLIT_EXT_JOB_MAX",
+    "BLIT_EXT_JOB_PENDING_MAX_PER_CLIENT",
+    "BLIT_EXT_JOB_PENDING_MAX",
+    "BLIT_EXT_JOB_BYTES_MAX_PER_CLIENT",
+    "BLIT_EXT_JOB_BYTES_MAX",
+    "BLIT_EXT_OUTPUT_RETAIN_MAX",
+    "BLIT_EXT_TERMINAL_RETAIN",
+    "BLIT_EXT_COMMAND_STORE_MAX",
+    "BLIT_EXT_COMMAND_SNAPSHOT_MAX",
+    "BLIT_EXT_TABLE_ELEMENTS_MAX",
+    "BLIT_EXT_VALUE_STACK_MAX",
+    "BLIT_EXT_CALL_DEPTH_MAX",
+    "BLIT_EXT_STACK_SIZE",
+    "BLIT_EXT_FUEL_SLICE",
+    "BLIT_CHANNEL_MAX_LISTEN_PER_CLIENT",
+    "BLIT_CHANNEL_MAX_LISTENERS",
+    "BLIT_CHANNEL_MAX_PER_CLIENT",
+    "BLIT_CHANNEL_MAX_CONNECTED",
+    "BLIT_CHANNEL_BUFFER_MAX",
+];
+
+const U64_DEPLOYMENT_SETTINGS: &[&str] = &[
+    "BLIT_EXT_MODULE_MAX",
+    "BLIT_EXT_OBJECT_CACHE_MAX",
+    "BLIT_EXT_UPLOAD_TIMEOUT",
+    "BLIT_EXT_PENDING_TIMEOUT",
+    "BLIT_EXT_OUTBOX_TIMEOUT",
+    "BLIT_EXT_TERMINAL_RETAIN",
+    "BLIT_EXT_FUEL_SLICE",
+    "BLIT_CHANNEL_BUFFER_MAX",
+];
+
+static DEPLOYMENT_SETTINGS: std::sync::OnceLock<DeploymentSettings> = std::sync::OnceLock::new();
+
+impl DeploymentSettings {
+    fn resolve(overrides: DeploymentOverrides) -> Result<Self, String> {
+        Self::resolve_with(overrides, |name| {
+            let Some(value) = std::env::var_os(name) else {
+                return Ok(None);
+            };
+            value
+                .into_string()
+                .map(Some)
+                .map_err(|_| format!("{name} must be valid UTF-8"))
+        })
+    }
+
+    fn resolve_with<F>(overrides: DeploymentOverrides, read_env: F) -> Result<Self, String>
+    where
+        F: Fn(&str) -> Result<Option<String>, String>,
+    {
+        let mut values = HashMap::with_capacity(DEPLOYMENT_SETTING_NAMES.len());
+        for &name in DEPLOYMENT_SETTING_NAMES {
+            let value = if let Some(value) = overrides.values.get(name) {
+                Some(*value)
+            } else {
+                read_env(name)?
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| format!("{name} must be a non-negative integer"))
+                    })
+                    .transpose()?
+            };
+            let Some(value) = value else {
+                continue;
+            };
+            if !U64_DEPLOYMENT_SETTINGS.contains(&name) && usize::try_from(value).is_err() {
+                return Err(format!("{name} exceeds this platform's usize range"));
+            }
+            values.insert(name, value);
+        }
+
+        if let Some(max_running) = values.get("BLIT_EXT_MAX_RUNNING")
+            && !(1..=4).contains(max_running)
+        {
+            return Err("BLIT_EXT_MAX_RUNNING must be in 1..=4".to_owned());
+        }
+        if let Some(module_max) = values.get("BLIT_EXT_MODULE_MAX")
+            && !(1..=64 * 1024 * 1024).contains(module_max)
+        {
+            return Err("BLIT_EXT_MODULE_MAX must be in 1..=64 MiB".to_owned());
+        }
+        if let Some(outbox_max) = values.get("BLIT_EXT_OUTBOX_MAX")
+            && *outbox_max != blit_remote::MAX_LOGICAL_MESSAGE as u64
+        {
+            return Err(format!(
+                "BLIT_EXT_OUTBOX_MAX must equal the {}-byte logical-message ceiling",
+                blit_remote::MAX_LOGICAL_MESSAGE
+            ));
+        }
+        for name in [
+            "BLIT_EXT_OUTBOX_MESSAGES_MAX",
+            "BLIT_EXT_OUTBOX_TIMEOUT",
+            "BLIT_EXT_MAX_VALIDATING",
+            "BLIT_EXT_MEMORY_MAX",
+            "BLIT_EXT_TABLE_ELEMENTS_MAX",
+            "BLIT_EXT_VALUE_STACK_MAX",
+            "BLIT_EXT_CALL_DEPTH_MAX",
+            "BLIT_EXT_STACK_SIZE",
+            "BLIT_EXT_FUEL_SLICE",
+        ] {
+            if values.get(name) == Some(&0) {
+                return Err(format!("{name} must be positive"));
+            }
+        }
+
+        let extensions_enabled = !overrides.extensions_disabled
+            && !read_env("BLIT_EXT")?.is_some_and(|value| value == "0");
+        let channels_enabled = !overrides.channels_disabled
+            && !read_env("BLIT_CHANNEL")?.is_some_and(|value| value == "0");
+        Ok(Self {
+            extensions_enabled,
+            channels_enabled,
+            values,
+        })
+    }
+}
+
+/// Resolve deployment settings once, with command-line values taking
+/// precedence over their environment equivalents.
+pub fn configure_deployment(overrides: DeploymentOverrides) -> Result<(), String> {
+    let settings = DeploymentSettings::resolve(overrides)?;
+    DEPLOYMENT_SETTINGS
+        .set(settings)
+        .map_err(|_| "server deployment settings were already configured".to_owned())
+}
+
+fn ensure_deployment_settings() -> &'static DeploymentSettings {
+    if let Some(settings) = DEPLOYMENT_SETTINGS.get() {
+        return settings;
+    }
+    let settings = DeploymentSettings::resolve(DeploymentOverrides::default())
+        .unwrap_or_else(|error| panic!("invalid server deployment configuration: {error}"));
+    let _ = DEPLOYMENT_SETTINGS.set(settings);
+    DEPLOYMENT_SETTINGS
+        .get()
+        .expect("deployment settings were just initialized")
+}
+
+pub(crate) fn extensions_enabled() -> bool {
+    DEPLOYMENT_SETTINGS
+        .get()
+        .map(|settings| settings.extensions_enabled)
+        .unwrap_or_else(|| !std::env::var("BLIT_EXT").is_ok_and(|value| value == "0"))
+}
+
+pub(crate) fn channels_enabled() -> bool {
+    DEPLOYMENT_SETTINGS
+        .get()
+        .map(|settings| settings.channels_enabled)
+        .unwrap_or_else(|| !std::env::var("BLIT_CHANNEL").is_ok_and(|value| value == "0"))
+}
+
+pub(crate) fn deployment_usize(name: &str, default: usize) -> usize {
+    if let Some(settings) = DEPLOYMENT_SETTINGS.get() {
+        return settings
+            .values
+            .get(name)
+            .and_then(|value| usize::try_from(*value).ok())
+            .unwrap_or(default);
+    }
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+pub(crate) fn deployment_u64(name: &str, default: u64) -> u64 {
+    if let Some(settings) = DEPLOYMENT_SETTINGS.get() {
+        return settings.values.get(name).copied().unwrap_or(default);
+    }
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
 
 /// How many exited-but-retained terminals to keep, oldest evicted first.
 /// `BLIT_MAX_EXITED` overrides; 0 disables the bound.
@@ -124,6 +402,8 @@ pub struct Config {
     #[cfg(unix)]
     pub fd_channel: Option<std::os::unix::io::RawFd>,
     pub verbose: bool,
+    /// Advertise and accept the native non-PTY process family.
+    pub processes: bool,
     /// Maximum number of concurrent client connections (0 = unlimited).
     pub max_connections: usize,
     /// Maximum number of PTYs across all clients (0 = unlimited).  Counts
@@ -153,6 +433,9 @@ pub struct Config {
     /// policy). Empty = unrestricted, the default.
     pub allow_forward: Vec<String>,
     pub allow_forward_insecure: bool,
+    /// Permit durable extension create/update/control and startup restore.
+    /// Transient extensions remain available when this gate is false.
+    pub allow_persistent_extensions: bool,
 }
 
 trait PtyDriver: Send {
@@ -371,7 +654,775 @@ enum PtyInput {
     Eof,
 }
 
-const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+const MAX_FRAME_SIZE: usize = blit_remote::MAX_FRAME_SIZE;
+
+/// Shared, level-triggered cancellation for one logical connection.
+#[derive(Clone, Debug)]
+struct ConnectionCancellation {
+    state: watch::Sender<bool>,
+    failure: Arc<AtomicU8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectionFailure {
+    SlowConsumer,
+    ResourceLimit,
+}
+
+const CONNECTION_FAILURE_NONE: u8 = 0;
+const CONNECTION_FAILURE_SLOW_CONSUMER: u8 = 1;
+const CONNECTION_FAILURE_RESOURCE_LIMIT: u8 = 2;
+
+impl Default for ConnectionCancellation {
+    fn default() -> Self {
+        let (state, _) = watch::channel(false);
+        Self {
+            state,
+            failure: Arc::new(AtomicU8::new(CONNECTION_FAILURE_NONE)),
+        }
+    }
+}
+
+impl ConnectionCancellation {
+    fn cancel(&self) {
+        self.state.send_replace(true);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.state.borrow()
+    }
+
+    fn cancel_slow_consumer(&self) {
+        let _ = self.failure.compare_exchange(
+            CONNECTION_FAILURE_NONE,
+            CONNECTION_FAILURE_SLOW_CONSUMER,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.cancel();
+    }
+
+    fn cancel_resource_limit(&self) {
+        let _ = self.failure.compare_exchange(
+            CONNECTION_FAILURE_NONE,
+            CONNECTION_FAILURE_RESOURCE_LIMIT,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.cancel();
+    }
+
+    pub(crate) fn failure(&self) -> Option<ConnectionFailure> {
+        match self.failure.load(Ordering::Relaxed) {
+            CONNECTION_FAILURE_SLOW_CONSUMER => Some(ConnectionFailure::SlowConsumer),
+            CONNECTION_FAILURE_RESOURCE_LIMIT => Some(ConnectionFailure::ResourceLimit),
+            _ => None,
+        }
+    }
+
+    async fn cancelled(&self) {
+        let mut state = self.state.subscribe();
+        if *state.borrow() {
+            return;
+        }
+        while state.changed().await.is_ok() {
+            if *state.borrow() {
+                return;
+            }
+        }
+    }
+}
+
+/// Process-wide registry for logical connections during orderly shutdown.
+///
+/// Network sockets and in-process extension endpoints use the same
+/// cancellation path. The shutdown latch is set before the accept loop is
+/// woken, so a connection racing with shutdown is either registered and
+/// cancelled by the snapshot or refused by `register`.
+struct ConnectionRegistry {
+    shutting_down: AtomicBool,
+    next_registration: AtomicU64,
+    cancellations: std::sync::Mutex<HashMap<u64, ConnectionCancellation>>,
+    drained: Notify,
+}
+
+impl Default for ConnectionRegistry {
+    fn default() -> Self {
+        Self {
+            shutting_down: AtomicBool::new(false),
+            next_registration: AtomicU64::new(1),
+            cancellations: std::sync::Mutex::new(HashMap::new()),
+            drained: Notify::new(),
+        }
+    }
+}
+
+impl ConnectionRegistry {
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
+    }
+
+    fn register(
+        self: &Arc<Self>,
+        cancellation: ConnectionCancellation,
+    ) -> Option<ConnectionRegistration> {
+        let mut connections = self.cancellations.lock().unwrap();
+        if self.is_shutting_down() {
+            cancellation.cancel();
+            return None;
+        }
+        let registration = self.next_registration.fetch_add(1, Ordering::Relaxed);
+        let previous = connections.insert(registration, cancellation);
+        assert!(previous.is_none(), "connection registration id wrapped");
+        Some(ConnectionRegistration {
+            registration,
+            registry: Arc::clone(self),
+        })
+    }
+
+    /// Seal admission. Returns true only for the caller which performed the
+    /// transition; that caller owns the broadcast/cancellation sequence.
+    fn seal_shutdown(&self) -> bool {
+        self.shutting_down
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn cancel_all(&self) {
+        let cancellations = self
+            .cancellations
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for cancellation in cancellations {
+            cancellation.cancel();
+        }
+    }
+
+    async fn wait_empty(&self) {
+        loop {
+            let drained = self.drained.notified();
+            if self.cancellations.lock().unwrap().is_empty() {
+                return;
+            }
+            drained.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.cancellations.lock().unwrap().len()
+    }
+}
+
+struct ConnectionRegistration {
+    registration: u64,
+    registry: Arc<ConnectionRegistry>,
+}
+
+impl Drop for ConnectionRegistration {
+    fn drop(&mut self) {
+        self.registry
+            .cancellations
+            .lock()
+            .unwrap()
+            .remove(&self.registration);
+        // Unlike `notify_waiters`, this retains a permit if teardown races
+        // just ahead of `wait_empty` polling its `Notified` future.
+        self.registry.drained.notify_one();
+    }
+}
+
+const EXTENSION_OUTBOX_MAX_BYTES: usize = blit_remote::MAX_LOGICAL_MESSAGE;
+const EXTENSION_OUTBOX_MAX_MESSAGES: usize = 4_096;
+const EXTENSION_OUTBOX_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExtensionOutboxConfig {
+    max_bytes: usize,
+    max_messages: usize,
+    no_progress_timeout: Duration,
+}
+
+impl Default for ExtensionOutboxConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: EXTENSION_OUTBOX_MAX_BYTES,
+            max_messages: EXTENSION_OUTBOX_MAX_MESSAGES,
+            no_progress_timeout: EXTENSION_OUTBOX_NO_PROGRESS_TIMEOUT,
+        }
+    }
+}
+
+impl ExtensionOutboxConfig {
+    fn from_env() -> Result<Self, String> {
+        let defaults = Self::default();
+        let max_bytes = env_positive_usize("BLIT_EXT_OUTBOX_MAX", defaults.max_bytes)?;
+        let max_messages =
+            env_positive_usize("BLIT_EXT_OUTBOX_MESSAGES_MAX", defaults.max_messages)?;
+        let timeout_secs = env_positive_u64(
+            "BLIT_EXT_OUTBOX_TIMEOUT",
+            defaults.no_progress_timeout.as_secs(),
+        )?;
+        Self::validated(max_bytes, max_messages, timeout_secs)
+    }
+
+    fn validated(max_bytes: usize, max_messages: usize, timeout_secs: u64) -> Result<Self, String> {
+        if max_bytes != blit_remote::MAX_LOGICAL_MESSAGE {
+            return Err(format!(
+                "BLIT_EXT_OUTBOX_MAX must equal the {}-byte logical-message ceiling",
+                blit_remote::MAX_LOGICAL_MESSAGE
+            ));
+        }
+        if max_messages == 0 {
+            return Err("BLIT_EXT_OUTBOX_MESSAGES_MAX must be positive".to_owned());
+        }
+        if timeout_secs == 0 {
+            return Err("BLIT_EXT_OUTBOX_TIMEOUT must be positive".to_owned());
+        }
+        Ok(Self {
+            max_bytes,
+            max_messages,
+            no_progress_timeout: Duration::from_secs(timeout_secs),
+        })
+    }
+}
+
+fn extension_outbox_config() -> ExtensionOutboxConfig {
+    static CONFIG: std::sync::OnceLock<ExtensionOutboxConfig> = std::sync::OnceLock::new();
+    *CONFIG.get_or_init(|| {
+        ExtensionOutboxConfig::from_env()
+            .unwrap_or_else(|error| panic!("invalid extension outbox configuration: {error}"))
+    })
+}
+
+fn env_positive_usize(name: &str, default: usize) -> Result<usize, String> {
+    if let Some(settings) = DEPLOYMENT_SETTINGS.get() {
+        let value = settings
+            .values
+            .get(name)
+            .and_then(|value| usize::try_from(*value).ok())
+            .unwrap_or(default);
+        return (value != 0)
+            .then_some(value)
+            .ok_or_else(|| format!("{name} must be positive"));
+    }
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(default);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| format!("{name} must be valid UTF-8"))?;
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("{name} must be a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("{name} must be positive"));
+    }
+    Ok(parsed)
+}
+
+fn env_positive_u64(name: &str, default: u64) -> Result<u64, String> {
+    if let Some(settings) = DEPLOYMENT_SETTINGS.get() {
+        let value = settings.values.get(name).copied().unwrap_or(default);
+        return (value != 0)
+            .then_some(value)
+            .ok_or_else(|| format!("{name} must be positive"));
+    }
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(default);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| format!("{name} must be valid UTF-8"))?;
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("{name} must be a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("{name} must be positive"));
+    }
+    Ok(parsed)
+}
+
+#[derive(Debug, Default)]
+struct ExtensionOutboxUsage {
+    bytes: usize,
+    messages: usize,
+    closed: bool,
+}
+
+#[derive(Debug)]
+struct ExtensionOutboxLimit {
+    usage: std::sync::Mutex<ExtensionOutboxUsage>,
+    cancellation: ConnectionCancellation,
+    max_bytes: usize,
+    max_messages: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExtensionOutboxReservation {
+    Reserved,
+    Full,
+    Closed,
+    TooLarge,
+}
+
+impl ExtensionOutboxLimit {
+    fn new(cancellation: ConnectionCancellation, config: ExtensionOutboxConfig) -> Self {
+        Self {
+            usage: std::sync::Mutex::new(ExtensionOutboxUsage::default()),
+            cancellation,
+            max_bytes: config.max_bytes,
+            max_messages: config.max_messages,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limits(
+        cancellation: ConnectionCancellation,
+        max_bytes: usize,
+        max_messages: usize,
+    ) -> Self {
+        Self {
+            usage: std::sync::Mutex::new(ExtensionOutboxUsage::default()),
+            cancellation,
+            max_bytes,
+            max_messages,
+        }
+    }
+
+    /// Reserve both hard budgets under one lock, so concurrent producers can
+    /// never each observe the same remaining capacity.
+    fn try_reserve(&self, bytes: usize, close_if_full: bool) -> ExtensionOutboxReservation {
+        let mut usage = self.usage.lock().unwrap();
+        if usage.closed {
+            return ExtensionOutboxReservation::Closed;
+        }
+        if bytes > self.max_bytes {
+            usage.closed |= close_if_full;
+            return ExtensionOutboxReservation::TooLarge;
+        }
+        let Some(next_bytes) = usage.bytes.checked_add(bytes) else {
+            return ExtensionOutboxReservation::Full;
+        };
+        let Some(next_messages) = usage.messages.checked_add(1) else {
+            return ExtensionOutboxReservation::Full;
+        };
+        if next_bytes > self.max_bytes || next_messages > self.max_messages {
+            usage.closed |= close_if_full;
+            return ExtensionOutboxReservation::Full;
+        }
+        usage.bytes = next_bytes;
+        usage.messages = next_messages;
+        ExtensionOutboxReservation::Reserved
+    }
+
+    fn release(&self, bytes: usize) {
+        let mut usage = self.usage.lock().unwrap();
+        usage.bytes = usage.bytes.saturating_sub(bytes);
+        usage.messages = usage.messages.saturating_sub(1);
+    }
+
+    fn shrink_reserved_bytes(&self, bytes: usize) {
+        let mut usage = self.usage.lock().unwrap();
+        usage.bytes = usage.bytes.saturating_sub(bytes);
+    }
+
+    fn close(&self) {
+        self.usage.lock().unwrap().closed = true;
+    }
+
+    fn signal_slow_consumer(&self) {
+        self.cancellation.cancel_slow_consumer();
+    }
+
+    #[cfg(test)]
+    fn usage(&self) -> (usize, usize) {
+        let usage = self.usage.lock().unwrap();
+        (usage.bytes, usage.messages)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct OutboxTracking {
+    queued_frames: Arc<AtomicUsize>,
+    queued_bytes: Arc<AtomicUsize>,
+    extension_limit: Option<Arc<ExtensionOutboxLimit>>,
+    drain_notify: std::sync::Mutex<Option<std::sync::Weak<Notify>>>,
+}
+
+impl OutboxTracking {
+    fn record_reserved(&self, bytes: usize) {
+        self.queued_frames.fetch_add(1, Ordering::Relaxed);
+        self.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn reserve(&self, bytes: usize, cancel_if_full: bool) -> bool {
+        if let Some(limit) = &self.extension_limit {
+            match limit.try_reserve(bytes, cancel_if_full) {
+                ExtensionOutboxReservation::Reserved => {}
+                ExtensionOutboxReservation::Full | ExtensionOutboxReservation::TooLarge => {
+                    if cancel_if_full {
+                        limit.signal_slow_consumer();
+                    }
+                    return false;
+                }
+                ExtensionOutboxReservation::Closed => return false,
+            }
+        }
+        self.record_reserved(bytes);
+        true
+    }
+
+    fn release(&self, bytes: usize) {
+        mark_outbox_drained(&self.queued_frames, &self.queued_bytes, bytes);
+        if let Some(limit) = &self.extension_limit {
+            limit.release(bytes);
+        }
+        if let Some(notify) = self
+            .drain_notify
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            notify.notify_one();
+        }
+    }
+
+    fn shrink_reserved(&self, old_bytes: usize, new_bytes: usize) {
+        debug_assert!(new_bytes <= old_bytes);
+        let released = old_bytes.saturating_sub(new_bytes);
+        if released == 0 {
+            return;
+        }
+        let _ = self
+            .queued_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(released))
+            });
+        if let Some(limit) = &self.extension_limit {
+            limit.shrink_reserved_bytes(released);
+        }
+    }
+
+    fn close(&self) {
+        if let Some(limit) = &self.extension_limit {
+            limit.close();
+        }
+    }
+
+    fn set_drain_notify(&self, notify: &Arc<Notify>) {
+        *self
+            .drain_notify
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(notify));
+    }
+}
+
+struct OutboxWriteCharge {
+    tracking: Arc<OutboxTracking>,
+    bytes: usize,
+}
+
+impl Drop for OutboxWriteCharge {
+    fn drop(&mut self) {
+        self.tracking.release(self.bytes);
+    }
+}
+
+/// Cloneable origin-aware producer used by every ordinary connection family.
+/// Network mode preserves the existing tracked unbounded enqueue. Extension
+/// mode additionally makes the byte/message reservation before the Tokio send.
+#[derive(Clone, Debug)]
+pub(crate) struct TrackedOutboxSender {
+    tx: OutboxTransport,
+    tracking: Option<Arc<OutboxTracking>>,
+}
+
+#[derive(Clone, Debug)]
+enum OutboxTransport {
+    #[cfg(test)]
+    Legacy(mpsc::UnboundedSender<Vec<u8>>),
+    Ordered(mpsc::UnboundedSender<OutboxPacket>),
+}
+
+#[derive(Debug)]
+enum OutboxPacket {
+    Owned(Vec<u8>),
+    Retained(Arc<extension::RetainedPacket>),
+}
+
+impl OutboxPacket {
+    fn packet(&self) -> &[u8] {
+        match self {
+            Self::Owned(packet) => packet,
+            Self::Retained(packet) => packet,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.packet().len()
+    }
+}
+
+impl TrackedOutboxSender {
+    #[cfg(test)]
+    fn new(tx: mpsc::UnboundedSender<Vec<u8>>, tracking: Arc<OutboxTracking>) -> Self {
+        Self {
+            tx: OutboxTransport::Legacy(tx),
+            tracking: Some(tracking),
+        }
+    }
+
+    fn ordered(tx: mpsc::UnboundedSender<OutboxPacket>, tracking: Arc<OutboxTracking>) -> Self {
+        Self {
+            tx: OutboxTransport::Ordered(tx),
+            tracking: Some(tracking),
+        }
+    }
+
+    #[cfg(test)]
+    fn untracked(tx: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+        Self {
+            tx: OutboxTransport::Legacy(tx),
+            tracking: None,
+        }
+    }
+
+    pub(crate) fn send(&self, msg: Vec<u8>) -> Result<(), mpsc::error::SendError<Vec<u8>>> {
+        let bytes = msg.len();
+        if let Some(tracking) = &self.tracking
+            && !tracking.reserve(bytes, true)
+        {
+            return Err(mpsc::error::SendError(msg));
+        }
+        let result = match &self.tx {
+            #[cfg(test)]
+            OutboxTransport::Legacy(tx) => tx.send(msg),
+            OutboxTransport::Ordered(tx) => {
+                tx.send(OutboxPacket::Owned(msg))
+                    .map_err(|error| match error.0 {
+                        OutboxPacket::Owned(msg) => mpsc::error::SendError(msg),
+                        OutboxPacket::Retained(_) => unreachable!("sent an owned outbox packet"),
+                    })
+            }
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if let Some(tracking) = &self.tracking {
+                    tracking.release(bytes);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn send_retained(&self, packet: &Arc<extension::RetainedPacket>) -> bool {
+        let bytes = packet.len();
+        if let Some(tracking) = &self.tracking
+            && !tracking.reserve(bytes, true)
+        {
+            return false;
+        }
+        let sent = match &self.tx {
+            // Test-only extension service endpoints still use the legacy
+            // transport. Production retained output always uses Ordered.
+            #[cfg(test)]
+            OutboxTransport::Legacy(tx) => tx.send(packet.to_vec()).is_ok(),
+            OutboxTransport::Ordered(tx) => {
+                tx.send(OutboxPacket::Retained(Arc::clone(packet))).is_ok()
+            }
+        };
+        if !sent && let Some(tracking) = &self.tracking {
+            tracking.release(bytes);
+        }
+        sent
+    }
+
+    pub(crate) fn install_drain_notify(&self, notify: &Arc<Notify>) {
+        if let Some(tracking) = &self.tracking {
+            tracking.set_drain_notify(notify);
+        }
+    }
+
+    pub(crate) fn requires_soft_gate(&self) -> bool {
+        self.tracking
+            .as_ref()
+            .is_some_and(|tracking| tracking.extension_limit.is_none())
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        match &self.tx {
+            #[cfg(test)]
+            OutboxTransport::Legacy(tx) => tx.is_closed(),
+            OutboxTransport::Ordered(tx) => tx.is_closed(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<mpsc::UnboundedSender<Vec<u8>>> for TrackedOutboxSender {
+    fn from(tx: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+        Self {
+            tx: OutboxTransport::Legacy(tx),
+            tracking: None,
+        }
+    }
+}
+
+trait OutboxSend: Clone + Send + Sync + 'static {
+    fn send(&self, msg: Vec<u8>) -> Result<(), mpsc::error::SendError<Vec<u8>>>;
+}
+
+impl OutboxSend for TrackedOutboxSender {
+    fn send(&self, msg: Vec<u8>) -> Result<(), mpsc::error::SendError<Vec<u8>>> {
+        TrackedOutboxSender::send(self, msg)
+    }
+}
+
+#[cfg(test)]
+impl OutboxSend for mpsc::UnboundedSender<Vec<u8>> {
+    fn send(&self, msg: Vec<u8>) -> Result<(), mpsc::error::SendError<Vec<u8>>> {
+        mpsc::UnboundedSender::send(self, msg)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConnectionOrigin {
+    Network,
+    Extension {
+        extension_id: u64,
+        definition_revision: u64,
+        attempt: u64,
+        task_id: u32,
+    },
+}
+
+impl ConnectionOrigin {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Network => "network client",
+            Self::Extension { .. } => "extension client",
+        }
+    }
+
+    fn channel_peer_name(&self, endpoint: u64) -> String {
+        match self {
+            Self::Network => format!("client:{endpoint:016x}"),
+            Self::Extension {
+                extension_id,
+                attempt,
+                ..
+            } => format!("ext:{extension_id:016x}:{attempt}"),
+        }
+    }
+
+    fn append_ready(&self, messages: &mut Vec<Vec<u8>>) {
+        messages.push(vec![S2C_READY]);
+    }
+}
+
+/// Transport policy is independent of connection dispatch. Network clients
+/// retain adaptive 4 KiB fragmentation after measured backpressure; the
+/// in-process profile always uses the largest cap-compliant frame/chunk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConnectionProfile {
+    direct_frame_bytes: usize,
+    fragment_chunk_bytes: usize,
+    adaptive_fragmentation: bool,
+}
+
+impl ConnectionProfile {
+    const NETWORK: Self = Self {
+        direct_frame_bytes: blit_remote::MAX_FRAME_SIZE,
+        fragment_chunk_bytes: blit_remote::MAX_FRAGMENT_CHUNK,
+        adaptive_fragmentation: true,
+    };
+    const IN_PROCESS: Self = Self {
+        direct_frame_bytes: blit_remote::MAX_FRAME_SIZE,
+        fragment_chunk_bytes: blit_remote::MAX_FRAGMENT_CHUNK,
+        adaptive_fragmentation: false,
+    };
+
+    fn write_policy(self, adaptive_chunk_bytes: Option<usize>) -> FrameWritePolicy {
+        let adaptive = self
+            .adaptive_fragmentation
+            .then_some(adaptive_chunk_bytes)
+            .flatten();
+        FrameWritePolicy {
+            direct_frame_bytes: adaptive.unwrap_or(self.direct_frame_bytes),
+            fragment_chunk_bytes: adaptive.unwrap_or(self.fragment_chunk_bytes),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionOptions {
+    origin: ConnectionOrigin,
+    profile: ConnectionProfile,
+    cancellation: ConnectionCancellation,
+    extension_init: Option<Vec<u8>>,
+    bootstrap_barrier: Option<ExtensionBootstrapBarrier>,
+}
+
+#[derive(Debug)]
+struct ExtensionBootstrapBarrier {
+    init_reserved: oneshot::Sender<()>,
+    commit_init: oneshot::Receiver<()>,
+}
+
+struct ExtensionBootstrap {
+    messages: Vec<Vec<u8>>,
+    init: Vec<u8>,
+    barrier: Option<ExtensionBootstrapBarrier>,
+}
+
+impl ConnectionOptions {
+    fn network() -> Self {
+        Self {
+            origin: ConnectionOrigin::Network,
+            profile: ConnectionProfile::NETWORK,
+            cancellation: ConnectionCancellation::default(),
+            extension_init: None,
+            bootstrap_barrier: None,
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "phase-2 constructor used when the Wasmi duplex adapter lands"
+    )]
+    fn extension(
+        init: &blit_remote::extension::ExtensionInit<'_>,
+        cancellation: ConnectionCancellation,
+    ) -> Option<Self> {
+        Self::extension_with_barrier(init, cancellation, None)
+    }
+
+    fn extension_with_barrier(
+        init: &blit_remote::extension::ExtensionInit<'_>,
+        cancellation: ConnectionCancellation,
+        bootstrap_barrier: Option<ExtensionBootstrapBarrier>,
+    ) -> Option<Self> {
+        let extension_init = blit_remote::extension::msg_extension_init(init)?;
+        Some(Self {
+            origin: ConnectionOrigin::Extension {
+                extension_id: init.extension_id,
+                definition_revision: init.definition_revision,
+                attempt: init.attempt,
+                task_id: init.task_id,
+            },
+            profile: ConnectionProfile::IN_PROCESS,
+            cancellation,
+            extension_init: Some(extension_init),
+            bootstrap_barrier,
+        })
+    }
+}
 
 async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
     let mut len_buf = [0u8; 4];
@@ -388,15 +1439,109 @@ async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameWriteError {
+    Closed,
+    NoProgress,
+}
+
+async fn write_all_with_progress_timeout(
+    writer: &mut (impl AsyncWrite + Unpin),
+    mut bytes: &[u8],
+    no_progress_timeout: Option<Duration>,
+) -> Result<(), FrameWriteError> {
+    let Some(timeout) = no_progress_timeout else {
+        return writer
+            .write_all(bytes)
+            .await
+            .map_err(|_| FrameWriteError::Closed);
+    };
+    while !bytes.is_empty() {
+        let written = tokio::time::timeout(timeout, writer.write(bytes))
+            .await
+            .map_err(|_| FrameWriteError::NoProgress)?
+            .map_err(|_| FrameWriteError::Closed)?;
+        if written == 0 {
+            return Err(FrameWriteError::Closed);
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
+async fn write_frame_with_timeout(
+    writer: &mut (impl AsyncWrite + Unpin),
+    payload: &[u8],
+    no_progress_timeout: Option<Duration>,
+) -> Result<(), FrameWriteError> {
     if payload.len() > u32::MAX as usize {
-        return false;
+        return Err(FrameWriteError::Closed);
     }
     let len = payload.len() as u32;
     let mut buf = Vec::with_capacity(4 + payload.len());
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(payload);
-    writer.write_all(&buf).await.is_ok()
+    write_all_with_progress_timeout(writer, &buf, no_progress_timeout).await
+}
+
+#[cfg(test)]
+async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> bool {
+    write_frame_with_timeout(writer, payload, None)
+        .await
+        .is_ok()
+}
+
+#[cfg(test)]
+async fn write_frame_counted(
+    writer: &mut (impl AsyncWrite + Unpin),
+    payload: &[u8],
+    outbound_bytes: &AtomicU64,
+) -> bool {
+    let written = write_frame_with_timeout(writer, payload, None).await;
+    if written.is_ok() {
+        outbound_bytes.fetch_add((payload.len() as u64).saturating_add(4), Ordering::Relaxed);
+    }
+    written.is_ok()
+}
+
+async fn write_frame_counted_with_timeout(
+    writer: &mut (impl AsyncWrite + Unpin),
+    payload: &[u8],
+    outbound_bytes: &AtomicU64,
+    no_progress_timeout: Option<Duration>,
+) -> Result<(), FrameWriteError> {
+    write_frame_with_timeout(writer, payload, no_progress_timeout).await?;
+    outbound_bytes.fetch_add((payload.len() as u64).saturating_add(4), Ordering::Relaxed);
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrameWritePolicy {
+    direct_frame_bytes: usize,
+    fragment_chunk_bytes: usize,
+}
+
+impl FrameWritePolicy {
+    fn direct_limit(self) -> usize {
+        self.direct_frame_bytes.clamp(1, MAX_FRAME_SIZE)
+    }
+
+    fn chunk_bytes(self) -> usize {
+        self.fragment_chunk_bytes
+            .clamp(1, blit_remote::MAX_FRAGMENT_CHUNK)
+    }
+
+    /// Zero means a direct frame; a positive result is the fragment count.
+    fn fragment_count(self, payload_bytes: usize) -> Option<usize> {
+        if payload_bytes > blit_remote::MAX_LOGICAL_MESSAGE {
+            return None;
+        }
+        if payload_bytes <= self.direct_limit() {
+            return Some(0);
+        }
+        let count = payload_bytes.div_ceil(self.chunk_bytes());
+        (count <= blit_remote::MAX_FRAGMENT_COUNT).then_some(count)
+    }
 }
 
 /// Chunk size used only after the connection writer has demonstrated real
@@ -473,14 +1618,28 @@ const AUDIO_QUEUE_MAX_FRAMES: usize = 25;
 ///
 /// Drops from the front deliberately: the client's jitter buffer wants
 /// the *newest* audio, and its own skip path reclaims what slips past.
+#[cfg(test)]
 fn drop_stale_audio(audio_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> usize {
+    drop_stale_audio_tracked(audio_rx, None)
+}
+
+fn drop_stale_audio_tracked(
+    audio_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    tracking: Option<&Arc<OutboxTracking>>,
+) -> usize {
     let queued = audio_rx.len();
     if queued <= AUDIO_QUEUE_MAX_FRAMES {
         return 0;
     }
     let excess = queued - AUDIO_QUEUE_MAX_FRAMES;
     let mut dropped = 0;
-    while dropped < excess && audio_rx.try_recv().is_ok() {
+    while dropped < excess {
+        let Ok(packet) = audio_rx.try_recv() else {
+            break;
+        };
+        if let Some(tracking) = tracking {
+            tracking.release(packet.len());
+        }
         dropped += 1;
     }
     dropped
@@ -488,27 +1647,47 @@ fn drop_stale_audio(audio_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> usize {
 
 /// Write a bulk message, draining pending audio frames between chunks.
 ///
-/// With `chunk_bytes=None`, write one length-prefixed frame after pre-draining
-/// audio. An actually backpressured writer supplies a chunk size; only then
-/// are larger payloads split into `S2C_FRAGMENT` messages so audio can be
-/// inserted as valid complete messages between them.
+/// With `chunk_bytes=None`, messages through the frame ceiling are written
+/// directly. Larger logical messages are always fragmented; an actually
+/// backpressured writer may request smaller fragments to protect audio.
 async fn write_frame_interleaved(
     writer: &mut (impl AsyncWrite + Unpin),
     payload: &[u8],
     audio_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
-    chunk_bytes: Option<usize>,
-) -> bool {
-    let chunk_bytes = chunk_bytes.unwrap_or(usize::MAX);
+    policy: FrameWritePolicy,
+    outbound_bytes: &AtomicU64,
+    no_progress_timeout: Option<Duration>,
+    audio_tracking: Option<&Arc<OutboxTracking>>,
+) -> Result<(), FrameWriteError> {
+    let Some(fragment_count) = policy.fragment_count(payload.len()) else {
+        return Err(FrameWriteError::Closed);
+    };
     // Small or uncongested message: drain queued audio, then write as-is.
-    if payload.len() <= chunk_bytes {
-        drop_stale_audio(audio_rx);
+    if fragment_count == 0 {
+        drop_stale_audio_tracked(audio_rx, audio_tracking);
         while let Ok(audio_msg) = audio_rx.try_recv() {
-            if !write_frame(writer, &audio_msg).await {
-                return false;
-            }
+            let _charge = audio_tracking.map(|tracking| OutboxWriteCharge {
+                tracking: tracking.clone(),
+                bytes: audio_msg.len(),
+            });
+            write_frame_counted_with_timeout(
+                writer,
+                &audio_msg,
+                outbound_bytes,
+                no_progress_timeout,
+            )
+            .await?;
         }
-        return write_frame(writer, payload).await;
+        return write_frame_counted_with_timeout(
+            writer,
+            payload,
+            outbound_bytes,
+            no_progress_timeout,
+        )
+        .await;
     }
+
+    let chunk_bytes = policy.chunk_bytes();
 
     // Large message: split into S2C_FRAGMENT messages, draining audio
     // between each chunk.  The chunks carry the original payload bytes
@@ -516,11 +1695,19 @@ async fn write_frame_interleaved(
     // receiver concatenates them and dispatches the reassembled buffer.
     let mut offset = 0;
     while offset < payload.len() {
-        drop_stale_audio(audio_rx);
+        drop_stale_audio_tracked(audio_rx, audio_tracking);
         while let Ok(audio_msg) = audio_rx.try_recv() {
-            if !write_frame(writer, &audio_msg).await {
-                return false;
-            }
+            let _charge = audio_tracking.map(|tracking| OutboxWriteCharge {
+                tracking: tracking.clone(),
+                bytes: audio_msg.len(),
+            });
+            write_frame_counted_with_timeout(
+                writer,
+                &audio_msg,
+                outbound_bytes,
+                no_progress_timeout,
+            )
+            .await?;
         }
         let end = offset.saturating_add(chunk_bytes).min(payload.len());
         let is_last = end == payload.len();
@@ -532,12 +1719,181 @@ async fn write_frame_interleaved(
             0
         });
         frag.extend_from_slice(&payload[offset..end]);
-        if !write_frame(writer, &frag).await {
-            return false;
-        }
+        write_frame_counted_with_timeout(writer, &frag, outbound_bytes, no_progress_timeout)
+            .await?;
         offset = end;
     }
+    Ok(())
+}
+
+/// Write one logical message without observing any live-output lane. The
+/// extension bootstrap uses this path so HELLO/snapshot/READY/INIT cannot be
+/// overtaken by audio or ordinary traffic admitted after the snapshot lock is
+/// released.
+async fn write_frame_exclusive(
+    writer: &mut (impl AsyncWrite + Unpin),
+    payload: &[u8],
+    policy: FrameWritePolicy,
+    outbound_bytes: &AtomicU64,
+    no_progress_timeout: Option<Duration>,
+) -> Result<(), FrameWriteError> {
+    let Some(fragment_count) = policy.fragment_count(payload.len()) else {
+        return Err(FrameWriteError::Closed);
+    };
+    if fragment_count == 0 {
+        return write_frame_counted_with_timeout(
+            writer,
+            payload,
+            outbound_bytes,
+            no_progress_timeout,
+        )
+        .await;
+    }
+
+    let chunk_bytes = policy.chunk_bytes();
+    let mut offset = 0;
+    while offset < payload.len() {
+        let end = offset.saturating_add(chunk_bytes).min(payload.len());
+        let mut fragment = Vec::with_capacity(2 + end - offset);
+        fragment.push(blit_remote::S2C_FRAGMENT);
+        fragment.push(if end == payload.len() {
+            blit_remote::FRAGMENT_FLAG_LAST
+        } else {
+            0
+        });
+        fragment.extend_from_slice(&payload[offset..end]);
+        write_frame_counted_with_timeout(writer, &fragment, outbound_bytes, no_progress_timeout)
+            .await?;
+        offset = end;
+    }
+    Ok(())
+}
+
+async fn write_extension_bootstrap(
+    writer: &mut (impl AsyncWrite + Unpin),
+    bootstrap: ExtensionBootstrap,
+    tracking: &Arc<OutboxTracking>,
+    policy: FrameWritePolicy,
+    outbound_bytes: &AtomicU64,
+    no_progress_timeout: Option<Duration>,
+    cancellation: &ConnectionCancellation,
+) -> bool {
+    let ExtensionBootstrap {
+        messages,
+        init,
+        barrier,
+    } = bootstrap;
+    for message in messages {
+        let bytes = message.len();
+        if !tracking.reserve(bytes, true) {
+            return false;
+        }
+        let _charge = OutboxWriteCharge {
+            tracking: tracking.clone(),
+            bytes,
+        };
+        if let Err(error) = write_frame_exclusive(
+            writer,
+            &message,
+            policy,
+            outbound_bytes,
+            no_progress_timeout,
+        )
+        .await
+        {
+            if error == FrameWriteError::NoProgress {
+                cancellation.cancel_slow_consumer();
+            }
+            return false;
+        }
+    }
+
+    // INIT is the publication boundary. Keep its hard reservation charged
+    // while the supervisor atomically publishes RUNNING, and do not expose
+    // the packet to the guest until that publication commits.
+    let bytes = init.len();
+    if !tracking.reserve(bytes, true) {
+        return false;
+    }
+    let _charge = OutboxWriteCharge {
+        tracking: tracking.clone(),
+        bytes,
+    };
+    if let Some(barrier) = barrier
+        && (barrier.init_reserved.send(()).is_err() || barrier.commit_init.await.is_err())
+    {
+        return false;
+    }
+    if let Err(error) =
+        write_frame_exclusive(writer, &init, policy, outbound_bytes, no_progress_timeout).await
+    {
+        if error == FrameWriteError::NoProgress {
+            cancellation.cancel_slow_consumer();
+        }
+        return false;
+    }
     true
+}
+
+enum ConnectionBulk {
+    Ordinary(OutboxPacket),
+    #[cfg(any(unix, windows))]
+    Process(process::Outbound),
+}
+
+impl ConnectionBulk {
+    fn packet(&self) -> &[u8] {
+        match self {
+            Self::Ordinary(packet) => packet.packet(),
+            #[cfg(any(unix, windows))]
+            Self::Process(packet) => packet.packet(),
+        }
+    }
+}
+
+/// Select fairly between process and ordinary bulk traffic. Terminal notices
+/// and audio retain their outer priority, but a process which continuously
+/// refills its bounded queue must not starve UI, filesystem, or other replies.
+#[cfg(any(unix, windows))]
+async fn next_connection_bulk(
+    process_rx: &mut mpsc::Receiver<process::Outbound>,
+    ordinary_rx: &mut mpsc::UnboundedReceiver<OutboxPacket>,
+    prefer_process: bool,
+) -> Option<ConnectionBulk> {
+    if prefer_process {
+        if let Ok(message) = process_rx.try_recv() {
+            return Some(ConnectionBulk::Process(message));
+        }
+        if let Ok(message) = ordinary_rx.try_recv() {
+            return Some(ConnectionBulk::Ordinary(message));
+        }
+    } else {
+        if let Ok(message) = ordinary_rx.try_recv() {
+            return Some(ConnectionBulk::Ordinary(message));
+        }
+        if let Ok(message) = process_rx.try_recv() {
+            return Some(ConnectionBulk::Process(message));
+        }
+    }
+    if process_rx.is_closed() {
+        return ordinary_rx.recv().await.map(ConnectionBulk::Ordinary);
+    }
+    if ordinary_rx.is_closed() {
+        return process_rx.recv().await.map(ConnectionBulk::Process);
+    }
+    tokio::select! {
+        message = process_rx.recv() => message.map(ConnectionBulk::Process),
+        message = ordinary_rx.recv() => message.map(ConnectionBulk::Ordinary),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn next_connection_bulk(
+    _process_rx: &mut mpsc::UnboundedReceiver<()>,
+    ordinary_rx: &mut mpsc::UnboundedReceiver<OutboxPacket>,
+    _prefer_process: bool,
+) -> Option<ConnectionBulk> {
+    ordinary_rx.recv().await.map(ConnectionBulk::Ordinary)
 }
 
 struct Pty {
@@ -904,6 +2260,24 @@ struct SharedCompositor {
     /// than escaping to the host compositor.
     #[cfg(target_os = "linux")]
     desktop_bus: Option<desktop_bus::DesktopBus>,
+    /// Canonical tray/notification state replayed to late subscribers.
+    #[cfg(target_os = "linux")]
+    desktop_mirror: DesktopMirror,
+    /// Canonical normalized MPRIS state replayed to per-connection subscribers.
+    #[cfg(target_os = "linux")]
+    mpris_mirror: MprisMirror,
+    /// When each cached MPRIS position was observed by the server. Wire
+    /// records carry a position but no anchor, so late-subscriber replay must
+    /// retain this separately to advance playing tracks from monotonic time.
+    #[cfg(target_os = "linux")]
+    mpris_position_observed_at: HashMap<u32, Instant>,
+    /// Connection-bound viewer microphone/camera leases and their ephemeral
+    /// PipeWire source nodes.
+    #[cfg(target_os = "linux")]
+    media_input: media_input::MediaInput,
+    /// Granted portal window streams and their short-lived PipeWire nodes.
+    #[cfg(target_os = "linux")]
+    screencasts: HashMap<u32, ScreenCastSession>,
     /// Shared fan-out state for audio — subscribers, catch-up ring,
     /// listener flag.  Persistent across pipeline restarts so clients
     /// stay subscribed even when the pipeline is restarted.  Always present on Linux;
@@ -919,6 +2293,13 @@ struct SharedCompositor {
     /// cooldown so we don't spin on persistent failures.
     #[cfg(target_os = "linux")]
     last_audio_restart: Option<Instant>,
+    /// A live runtime died and should be retried after the cooldown. Separate
+    /// from `audio_pipeline == None`, which also represents operator-disabled
+    /// or unavailable-at-start configurations.
+    #[cfg(target_os = "linux")]
+    audio_restart_needed: bool,
+    #[cfg(target_os = "linux")]
+    audio_restart_inflight: bool,
     /// When the pipeline was last checked for liveness.  `AudioPipeline::is_alive`
     /// costs up to four `waitpid` syscalls, and `tick` runs on every PTY output
     /// chunk, so polling it per tick charged terminal throughput for audio
@@ -1059,6 +2440,80 @@ fn resize_action(
 }
 
 impl SharedCompositor {
+    #[cfg(target_os = "linux")]
+    fn mpris_runtime_live(&self) -> bool {
+        self.desktop_bus
+            .as_ref()
+            .is_some_and(|bus| bus.services_live())
+            && std::env::var("BLIT_MPRIS").map_or(true, |value| value != "0")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn media_state(&self) -> MediaState {
+        let mpris = self.mpris_runtime_live();
+        let microphone = self.audio_pipeline.is_some()
+            && std::env::var("BLIT_MEDIA_INPUT").map_or(true, |value| value != "0")
+            && std::env::var("BLIT_MEDIA_MICROPHONE").map_or(true, |value| value != "0");
+        let camera = self.audio_pipeline.is_some()
+            && std::env::var("BLIT_MEDIA_INPUT").map_or(true, |value| value != "0")
+            && std::env::var("BLIT_MEDIA_CAMERA").map_or(true, |value| value != "0");
+        let mut runtime_flags = 0;
+        if self.audio_pipeline.is_some() {
+            runtime_flags |= RUNTIME_PIPEWIRE;
+        }
+        if microphone {
+            runtime_flags |= RUNTIME_MICROPHONE;
+        }
+        if camera {
+            runtime_flags |= RUNTIME_CAMERA;
+        }
+        if mpris {
+            runtime_flags |= RUNTIME_MPRIS;
+        }
+        if self
+            .desktop_bus
+            .as_ref()
+            .is_some_and(desktop_bus::DesktopBus::portals_configured)
+        {
+            runtime_flags |= RUNTIME_PORTAL_FRONTEND | RUNTIME_PORTAL_ACCESS;
+            if self.audio_pipeline.is_some() {
+                runtime_flags |= RUNTIME_PORTAL_SCREENCAST;
+            }
+        }
+        let microphone_owner = self.media_input.microphone_owner();
+        let camera_owner = self.media_input.camera_owner();
+        let mut screencasts = self
+            .screencasts
+            .values()
+            .map(|session| ScreenCastState {
+                session_id: session.session_id,
+                app_id: session.app_id.clone(),
+                surface_ids: session
+                    .streams
+                    .iter()
+                    .map(|stream| stream.surface_id)
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        screencasts.sort_unstable_by_key(|session| session.session_id);
+        MediaState {
+            runtime_flags,
+            active_flags: (if microphone_owner == 0 {
+                0
+            } else {
+                ACTIVE_MICROPHONE
+            }) | (if camera_owner == 0 { 0 } else { ACTIVE_CAMERA })
+                | (if screencasts.is_empty() {
+                    0
+                } else {
+                    ACTIVE_SCREENCAST
+                }),
+            microphone_owner,
+            camera_owner,
+            screencasts,
+        }
+    }
+
     fn mark_pixel_snapshot_dirty(&mut self) {
         self.pixel_snapshot_dirty = true;
     }
@@ -1227,6 +2682,145 @@ fn encode_rgba_to_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
         }
     }
     buf
+}
+
+#[cfg(target_os = "linux")]
+fn screencast_thumbnail(frame: &LastPixels) -> Vec<u8> {
+    let rgba = frame.pixels.to_rgba(frame.width, frame.height);
+    let Some(image) = image::RgbaImage::from_raw(frame.width, frame.height, rgba) else {
+        return Vec::new();
+    };
+    for &(max_width, max_height) in &[(256, 144), (192, 108), (128, 72), (96, 54), (64, 36)] {
+        let resized = image::imageops::thumbnail(&image, max_width, max_height);
+        let png = encode_rgba_to_png(&resized, resized.width(), resized.height());
+        if png.len() <= blit_remote::media::SCREENCAST_THUMBNAIL_MAX {
+            return png;
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn max_screencast_streams() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("BLIT_SCREENCAST_MAX_STREAMS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+            .min(4)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_portal_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().min(blit_remote::media::MPRIS_STRING_MAX));
+    for ch in value.chars().filter(|ch| !ch.is_control()) {
+        if out.len() + ch.len_utf8() > blit_remote::media::MPRIS_STRING_MAX {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn screencast_candidates(compositor: &SharedCompositor) -> Vec<ScreenCastCandidate> {
+    const THUMBNAIL_SOURCE_PIXELS_MAX: u64 = 1920 * 1080;
+    const THUMBNAIL_COUNT_MAX: usize = 8;
+    let mut surfaces = compositor.surfaces.values().collect::<Vec<_>>();
+    surfaces.sort_unstable_by_key(|surface| surface.surface_id);
+    // Leave one MiB for candidate identities, dimensions, length fields, and
+    // common prompt data so the complete wire message remains below 4 MiB.
+    let mut thumbnail_budget = blit_remote::media::PORTAL_MESSAGE_MAX - 1024 * 1024;
+    let mut thumbnail_count = 0usize;
+    surfaces
+        .into_iter()
+        .filter(|surface| compositor.native_sizes.contains_key(&surface.surface_id))
+        .take(blit_remote::media::SCREENCAST_CANDIDATE_MAX)
+        .filter_map(|surface| {
+            // SurfaceCreated precedes the first mapped buffer and carries a
+            // 0x0 placeholder. Only a native-size event proves this is a
+            // mapped toplevel eligible for the portal chooser.
+            let (width, height) = compositor.native_sizes.get(&surface.surface_id).copied()?;
+            let width = u16::try_from(width).ok()?.max(1);
+            let height = u16::try_from(height).ok()?.max(1);
+            // Thumbnail conversion and PNG encoding happen while the shared
+            // compositor snapshot is borrowed. Bound both source work and
+            // count so a chooser containing many huge windows cannot stall
+            // every viewer. Candidates without thumbnails remain selectable.
+            let frame = (thumbnail_count < THUMBNAIL_COUNT_MAX
+                && u64::from(width) * u64::from(height) <= THUMBNAIL_SOURCE_PIXELS_MAX)
+                .then(|| {
+                    compositor.last_pixels.get(&(
+                        surface.surface_id,
+                        u32::from(width),
+                        u32::from(height),
+                    ))
+                })
+                .flatten();
+            let thumbnail_png = frame
+                .map(|frame| {
+                    thumbnail_count += 1;
+                    screencast_thumbnail(frame)
+                })
+                .filter(|png| png.len() <= thumbnail_budget)
+                .unwrap_or_default();
+            thumbnail_budget = thumbnail_budget.saturating_sub(thumbnail_png.len());
+            Some(ScreenCastCandidate {
+                surface_id: surface.surface_id,
+                width,
+                height,
+                title: bounded_portal_text(&surface.title),
+                app_id: bounded_portal_text(&surface.app_id),
+                thumbnail_png,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+struct ScreenCastRetirement {
+    closed_sessions: Vec<u32>,
+    state_changed: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn retire_screencast_surface(
+    compositor: &mut SharedCompositor,
+    surface_id: u16,
+) -> ScreenCastRetirement {
+    let mut removed_stream = false;
+    for session in compositor.screencasts.values_mut() {
+        let before = session.streams.len();
+        session
+            .streams
+            .retain(|stream| stream.surface_id != surface_id);
+        removed_stream |= session.streams.len() != before;
+    }
+    let closed = compositor
+        .screencasts
+        .iter()
+        .filter_map(|(&session_id, session)| session.streams.is_empty().then_some(session_id))
+        .collect::<Vec<_>>();
+    for session_id in &closed {
+        compositor.screencasts.remove(session_id);
+    }
+    if removed_stream {
+        let _ = compositor
+            .handle
+            .command_tx
+            .send(CompositorCommand::SetScreenCastActive {
+                surface_id,
+                active: false,
+            });
+        compositor.handle.wake();
+        compositor.frame_clocks_dirty = true;
+    }
+    ScreenCastRetirement {
+        closed_sessions: closed,
+        state_changed: removed_stream,
+    }
 }
 
 /// Encode RGBA pixels to AVIF.  `quality` 0 = lossless, 1–100 = lossy.
@@ -1824,8 +3418,99 @@ struct VulkanVideoSurfaceState {
     is_444: bool,
 }
 
-struct ClientState {
+enum QueuedMessage {
+    Bulk(ConnectionBulk),
+    Channel(channel::Delivery),
+}
+
+impl QueuedMessage {
+    fn packet(&self) -> &[u8] {
+        match self {
+            Self::Bulk(packet) => packet.packet(),
+            Self::Channel(delivery) => &delivery.packet,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TrackedChannelSender {
+    tx: mpsc::UnboundedSender<channel::Delivery>,
+    tracking: Arc<OutboxTracking>,
+}
+
+impl TrackedChannelSender {
+    fn reserve(&self, bytes: usize) -> Option<channel::OutboxReservation> {
+        if self.tx.is_closed() || !self.tracking.reserve(bytes, true) {
+            return None;
+        }
+        Some(channel::OutboxReservation::new(
+            self.tracking.clone(),
+            bytes,
+        ))
+    }
+
+    fn send(
+        &self,
+        mut delivery: channel::Delivery,
+    ) -> Result<(), mpsc::error::SendError<channel::Delivery>> {
+        if delivery.outbox_reservation.is_none() {
+            let Some(reservation) = self.reserve(delivery.packet.len()) else {
+                return Err(mpsc::error::SendError(delivery));
+            };
+            delivery.outbox_reservation = Some(reservation);
+        }
+        self.tx.send(delivery)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub(crate) struct TrackedAudioSender {
     tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// `None` for network clients preserves the dedicated audio queue's
+    /// existing accounting. Extension audio shares the hard aggregate budget.
+    tracking: Option<Arc<OutboxTracking>>,
+}
+
+#[cfg(target_os = "linux")]
+impl TrackedAudioSender {
+    pub(crate) fn send(&self, packet: Vec<u8>) -> Result<(), mpsc::error::SendError<Vec<u8>>> {
+        let bytes = packet.len();
+        if let Some(tracking) = &self.tracking
+            && !tracking.reserve(bytes, true)
+        {
+            return Err(mpsc::error::SendError(packet));
+        }
+        match self.tx.send(packet) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if let Some(tracking) = &self.tracking {
+                    tracking.release(bytes);
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl From<mpsc::UnboundedSender<Vec<u8>>> for TrackedAudioSender {
+    fn from(tx: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+        Self { tx, tracking: None }
+    }
+}
+
+struct ClientState {
+    tx: TrackedOutboxSender,
+    /// Native-channel frames retain their pair admission reservation while
+    /// queued. The writer drops the complete `Delivery` only after the frame
+    /// is written or abandoned, which makes channel capacity drain-safe.
+    channel_tx: TrackedChannelSender,
+    /// Wakes this connection's read loop when another client kicks it.
+    kick_tx: mpsc::UnboundedSender<String>,
+    /// Priority writer lane for tiny connection-ending notices. The sender
+    /// acknowledges only after the complete frame reaches the stream.
+    terminal_tx: TerminalNoticeSender,
     outbox_queued_frames: Arc<AtomicUsize>,
     outbox_queued_bytes: Arc<AtomicUsize>,
     /// Microseconds the writer task has spent blocked inside a socket
@@ -1836,11 +3521,26 @@ struct ClientState {
     /// `write_blocked_us` as of the controller's last step, so it can read a
     /// delta out of a monotonically growing counter.
     write_blocked_us_seen: u64,
+    /// Total length-prefixed bytes successfully written to this connection.
+    outbound_bytes: Arc<AtomicU64>,
+    /// Counter/timestamp pair used to derive actual recent server→client
+    /// bandwidth for the live client catalog.
+    outbound_bytes_seen: u64,
+    outbound_sampled_at: Instant,
+    outbound_bytes_per_sec: u64,
+    /// Live catalog nonce → last encoded snapshot sent under that nonce.
+    /// Comparing the deterministic encoding avoids pushing unchanged lists on
+    /// every delivery tick.
+    client_catalog_watches: FxHashMap<u16, Vec<u8>>,
+    connected_at: Instant,
+    /// Connection-scoped live resources outside terminal/surface state.
+    /// Rebuilt after each family message from the authoritative registries.
+    aux_subscriptions: Vec<blit_remote::ClientAuxSubscription>,
     /// Dedicated channel for audio frames.  The writer task selects on this
     /// with higher priority than the main outbox so audio is never starved
     /// by large video/terminal messages.
     #[cfg(target_os = "linux")]
-    audio_tx: mpsc::UnboundedSender<Vec<u8>>,
+    audio_tx: TrackedAudioSender,
     lead: Option<u16>,
     subscriptions: FxHashSet<u16>,
     /// Active surface subscriptions for this client.
@@ -1848,6 +3548,27 @@ struct ClientState {
     /// Whether this client is subscribed to audio frames.
     #[cfg(target_os = "linux")]
     audio_subscribed: bool,
+    /// Bits from `DESKTOP_SUBSCRIBE`; state is shared, presentation is per viewer.
+    #[cfg(target_os = "linux")]
+    desktop_subscriptions: u8,
+    /// Whether this connection receives the compositor-wide MPRIS stream.
+    #[cfg(target_os = "linux")]
+    mpris_subscribed: bool,
+    /// Last accepted fresh MPRIS replay request (one per second maximum).
+    #[cfg(target_os = "linux")]
+    last_mpris_snapshot: Option<Instant>,
+    /// Per-connection semantic action budget: burst 20, refill 10/s.
+    #[cfg(target_os = "linux")]
+    mpris_action_tokens: f64,
+    #[cfg(target_os = "linux")]
+    mpris_action_refilled_at: Instant,
+    /// Last accepted browser media capability update (one per second maximum).
+    #[cfg(target_os = "linux")]
+    last_media_capabilities: Option<Instant>,
+    /// Browser capture and portal presentation capabilities. Advertising
+    /// these never acquires a device or grants a prompt.
+    #[cfg(target_os = "linux")]
+    media_capabilities: MediaCapabilities,
     /// Per-client audio bitrate preference in kbps from C2S_AUDIO_SUBSCRIBE.
     /// 0 means use the server/env default.
     #[cfg(target_os = "linux")]
@@ -1991,6 +3712,58 @@ struct ClientState {
     /// files must outlive the drop itself — the `file://` URIs the app
     /// receives point at them.
     drag_staging_dir: Option<std::path::PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+fn consume_mpris_action_token(client: &mut ClientState, now: Instant) -> bool {
+    const BURST: f64 = 20.0;
+    const REFILL_PER_SECOND: f64 = 10.0;
+    let elapsed = now
+        .saturating_duration_since(client.mpris_action_refilled_at)
+        .as_secs_f64();
+    client.mpris_action_tokens =
+        (client.mpris_action_tokens + elapsed * REFILL_PER_SECOND).min(BURST);
+    client.mpris_action_refilled_at = now;
+    if client.mpris_action_tokens < 1.0 {
+        return false;
+    }
+    client.mpris_action_tokens -= 1.0;
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn mpris_player_at(
+    player: &blit_remote::media::MprisPlayer,
+    position_observed_at: Instant,
+    now: Instant,
+) -> blit_remote::media::MprisPlayer {
+    let mut replay = player.clone();
+    if replay.playback_status == blit_remote::media::PlaybackStatus::Playing {
+        let elapsed_us = now
+            .saturating_duration_since(position_observed_at)
+            .as_micros()
+            .min(i64::MAX as u128) as i128;
+        let delta = elapsed_us.saturating_mul(i128::from(replay.rate_ppm)) / 1_000_000;
+        replay.position_us =
+            (i128::from(replay.position_us) + delta).clamp(0, i128::from(i64::MAX)) as i64;
+    } else {
+        replay.position_us = replay.position_us.max(0);
+    }
+    if replay.length_us >= 0 {
+        replay.position_us = replay.position_us.min(replay.length_us);
+    }
+    replay
+}
+
+#[cfg(target_os = "linux")]
+fn mpris_action_queue_status(services_live: bool, queued: bool) -> Option<u8> {
+    if !services_live {
+        Some(STATUS_OTHER)
+    } else if !queued {
+        Some(STATUS_BUDGET)
+    } else {
+        None
+    }
 }
 
 /// An in-flight browser drag session (docs/protocol.md "Drag and drop").
@@ -3355,19 +5128,6 @@ fn mark_outbox_drained(
     });
 }
 
-fn send_outbox_tracked(
-    tx: &mpsc::UnboundedSender<Vec<u8>>,
-    queued_frames: &Arc<AtomicUsize>,
-    queued_bytes: &Arc<AtomicUsize>,
-    msg: Vec<u8>,
-) -> Result<(), mpsc::error::SendError<Vec<u8>>> {
-    let bytes = msg.len();
-    tx.send(msg)?;
-    queued_frames.fetch_add(1, Ordering::Relaxed);
-    queued_bytes.fetch_add(bytes, Ordering::Relaxed);
-    Ok(())
-}
-
 /// A composited-frame position as the unsigned wire fields carry it.
 ///
 /// Touch contacts arrive as signed sub-pixel floats — the transport encodes them
@@ -3379,12 +5139,15 @@ fn frame_point(x: f64, y: f64) -> (u16, u16) {
 }
 
 fn send_outbox(client: &ClientState, msg: Vec<u8>) -> Result<(), mpsc::error::SendError<Vec<u8>>> {
-    send_outbox_tracked(
-        &client.tx,
-        &client.outbox_queued_frames,
-        &client.outbox_queued_bytes,
-        msg,
-    )
+    client.tx.send(msg)
+}
+
+fn send_channel_deliveries(sess: &Session, deliveries: Vec<channel::Delivery>) {
+    for delivery in deliveries {
+        if let Some(client) = sess.clients.get(&delivery.endpoint) {
+            let _ = client.channel_tx.send(delivery);
+        }
+    }
 }
 
 fn can_send_preview(client: &ClientState, pid: u16, now: Instant) -> bool {
@@ -3684,6 +5447,33 @@ fn forget_surface_inflight(client: &mut ClientState, surface_id: u16) {
     client
         .surface_inflight_frames
         .retain(|f| f.surface_id != surface_id);
+}
+
+/// Invalidate one client's encoder state after a compositor surface event.
+///
+/// Resizes keep the logical subscription and its requested encode target so
+/// delivery can rebuild against the new composite.  Destruction is
+/// authoritative: Wayland can reuse the id, so every client-side claim keyed
+/// by the old id must be retired rather than recreated as an empty encoder
+/// state for a surface that no longer exists.
+fn invalidate_client_surface(client: &mut ClientState, surface_id: u16, destroyed: bool) -> bool {
+    if destroyed {
+        client.surface_subscriptions.remove(&surface_id);
+        client.surface_view_sizes.remove(&surface_id);
+        client.surface_claim_lapses.remove(&surface_id);
+    }
+
+    let still_subscribed = client.surface_subscriptions.contains(&surface_id);
+    let previous = client.surface_subs.remove(&surface_id);
+    if still_subscribed && let Some(previous) = previous {
+        let state = client.surface_subs.entry(surface_id).or_default();
+        state.scaled_target = previous.scaled_target;
+        state.max_fps = previous.max_fps;
+    }
+
+    let had_vulkan = client.vulkan_video_surfaces.remove(&surface_id).is_some();
+    forget_surface_inflight(client, surface_id);
+    had_vulkan
 }
 
 /// Let a replaced encoder go without paying its teardown here.
@@ -4118,9 +5908,15 @@ fn reanchor_client(
 struct Session {
     ptys: FxHashMap<u16, Pty>,
     compositor: Option<SharedCompositor>,
+    /// When the live client catalog last sampled age and bandwidth. Session
+    /// scoped, not per client: staggered per-client deadlines would rebuild
+    /// every watcher's snapshot once per client per second instead of once.
+    catalog_sampled_at: Instant,
     next_client_id: u64,
     next_compositor_id: u16,
     next_pty_id: u16,
+    #[cfg(target_os = "linux")]
+    next_screencast_id: u32,
     tick_fires: u32,
     tick_snaps: u32,
     frame_requests: u32,
@@ -4144,6 +5940,8 @@ struct Session {
     pixel_snapshot_len: usize,
     last_ping: Instant,
     clients: HashMap<u64, ClientState>,
+    /// Process-global native listener registry and connected channel pairs.
+    channels: channel::ChannelFabric,
     /// The compositor has one seat, so one browser drives it at a time. That
     /// browser's marks are hidden from itself — its own cursor and fingers are
     /// already on its screen — and mirrored to every other subscribed viewer.
@@ -4151,6 +5949,31 @@ struct Session {
     /// Direct touch is an implicit-grab sequence. Only this connection may
     /// extend it until all of its contacts are up or it cancels.
     surface_touch_owner: Option<u64>,
+    #[cfg(target_os = "linux")]
+    recent_surface_focus: HashMap<u64, (u16, Instant)>,
+    #[cfg(target_os = "linux")]
+    pending_portals: HashMap<u32, PendingPortal>,
+}
+
+#[cfg(target_os = "linux")]
+struct PendingPortal {
+    request: PortalRequest,
+    authority: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+struct ScreenCastSession {
+    session_id: u32,
+    app_id: String,
+    streams: Vec<ScreenCastStream>,
+}
+
+#[cfg(target_os = "linux")]
+struct ScreenCastStream {
+    surface_id: u16,
+    width: u16,
+    height: u16,
+    source: audio_pw::RawVideoSource,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4265,14 +6088,23 @@ impl Session {
         cs.handle.wake();
     }
 
+    #[cfg(test)]
     fn new() -> Self {
+        Self::new_with_boot_generation(0)
+    }
+
+    fn new_with_boot_generation(boot_generation: u64) -> Self {
         Self {
             ptys: FxHashMap::default(),
             compositor: None,
+            catalog_sampled_at: Instant::now(),
             next_client_id: 1,
             next_compositor_id: 1,
             next_pty_id: 1,
+            #[cfg(target_os = "linux")]
+            next_screencast_id: 1,
             clients: HashMap::new(),
+            channels: channel::ChannelFabric::new(boot_generation),
             tick_fires: 0,
             tick_snaps: 0,
             frame_requests: 0,
@@ -4292,6 +6124,10 @@ impl Session {
             surface_frames_sent: 0,
             surface_inputs: HashMap::new(),
             surface_touch_owner: None,
+            #[cfg(target_os = "linux")]
+            recent_surface_focus: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            pending_portals: HashMap::new(),
         }
     }
 
@@ -4309,9 +6145,17 @@ impl Session {
             // share the same time origin for A/V sync.
             #[cfg(target_os = "linux")]
             let created_at = Instant::now();
+            #[cfg(target_os = "linux")]
+            let media_notify = event_notify.clone();
+            #[cfg(target_os = "linux")]
+            let desktop_notify = event_notify.clone();
             let handle = blit_compositor::spawn_compositor(verbose, event_notify, gpu_device);
             #[cfg(target_os = "linux")]
-            let desktop_bus = match desktop_bus::DesktopBus::spawn(&handle.socket_name, verbose) {
+            let desktop_bus = match desktop_bus::DesktopBus::spawn(
+                &handle.socket_name,
+                verbose,
+                desktop_notify,
+            ) {
                 Ok(bus) => Some(bus),
                 Err(e) => {
                     if verbose {
@@ -4324,10 +6168,20 @@ impl Session {
             let audio_broadcast = audio::AudioBroadcast::new();
             #[cfg(target_os = "linux")]
             let audio_pipeline = {
+                let desktop_bus_address = desktop_bus.as_ref().map(|bus| bus.address().to_owned());
                 let audio_disabled = std::env::var("BLIT_AUDIO")
                     .map(|v| v == "0")
                     .unwrap_or(false);
-                if !audio_disabled && audio::pipewire_available() {
+                let media_input_enabled = std::env::var("BLIT_MEDIA_INPUT")
+                    .map_or(true, |value| value != "0")
+                    && (std::env::var("BLIT_MEDIA_MICROPHONE").map_or(true, |value| value != "0")
+                        || std::env::var("BLIT_MEDIA_CAMERA").map_or(true, |value| value != "0"));
+                let screencast_enabled =
+                    std::env::var("BLIT_PORTALS").map_or(true, |value| value != "0");
+                if (!audio_disabled || media_input_enabled || screencast_enabled)
+                    && audio::pipewire_available()
+                    && desktop_bus_address.is_some()
+                {
                     let runtime_dir = std::path::Path::new(&handle.socket_name)
                         .parent()
                         .unwrap_or(std::path::Path::new("/tmp"));
@@ -4342,6 +6196,7 @@ impl Session {
                         match audio::AudioPipeline::spawn(
                             runtime_dir,
                             session_id,
+                            desktop_bus_address.as_deref().unwrap(),
                             bitrate,
                             verbose,
                             created_at,
@@ -4363,7 +6218,7 @@ impl Session {
                         }
                     })
                 } else {
-                    if verbose && !audio_disabled {
+                    if verbose && (!audio_disabled || media_input_enabled || screencast_enabled) {
                         let missing = audio::missing_pipewire_binaries();
                         let load_err = audio_pw::load_error();
                         if !missing.is_empty() {
@@ -4413,11 +6268,25 @@ impl Session {
                 #[cfg(target_os = "linux")]
                 desktop_bus,
                 #[cfg(target_os = "linux")]
+                desktop_mirror: DesktopMirror::default(),
+                #[cfg(target_os = "linux")]
+                mpris_mirror: MprisMirror::default(),
+                #[cfg(target_os = "linux")]
+                mpris_position_observed_at: HashMap::new(),
+                #[cfg(target_os = "linux")]
+                media_input: media_input::MediaInput::with_notify(media_notify),
+                #[cfg(target_os = "linux")]
+                screencasts: HashMap::new(),
+                #[cfg(target_os = "linux")]
                 audio_broadcast,
                 #[cfg(target_os = "linux")]
                 audio_session_id: session_id,
                 #[cfg(target_os = "linux")]
                 last_audio_restart: None,
+                #[cfg(target_os = "linux")]
+                audio_restart_needed: false,
+                #[cfg(target_os = "linux")]
+                audio_restart_inflight: false,
                 #[cfg(target_os = "linux")]
                 last_audio_liveness_check: None,
             });
@@ -4500,6 +6369,354 @@ impl Session {
     fn send_to_all(&self, msg: &[u8]) {
         for c in self.clients.values() {
             let _ = send_outbox(c, msg.to_vec());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assign_pending_portals(&mut self) {
+        let clients = &self.clients;
+        let recent_surface_focus = &self.recent_surface_focus;
+        let surface_inputs = &self.surface_inputs;
+        let assignments = self
+            .pending_portals
+            .values_mut()
+            .filter(|pending| pending.authority.is_none())
+            .filter_map(|pending| {
+                let parent_surface_id = match &pending.request {
+                    PortalRequest::Access(request) => request.parent_surface_id,
+                    PortalRequest::ScreenCast(request) => request.parent_surface_id,
+                };
+                let eligible = |client_id: u64| {
+                    clients.get(&client_id).is_some_and(|client| {
+                        client.media_capabilities.flags & CAPTURE_PORTAL_UI != 0
+                    })
+                };
+                let authority = parent_surface_id
+                    .and_then(|surface_id| {
+                        surface_inputs
+                            .iter()
+                            .find_map(|(&(focused_surface, _), input)| {
+                                (focused_surface == surface_id && eligible(input.owner))
+                                    .then_some(input.owner)
+                            })
+                            .or_else(|| {
+                                recent_surface_focus
+                                    .iter()
+                                    .filter(|(client_id, (focused_surface, _))| {
+                                        *focused_surface == surface_id && eligible(**client_id)
+                                    })
+                                    .max_by_key(|(_, (_, focused_at))| *focused_at)
+                                    .map(|(client_id, _)| *client_id)
+                            })
+                    })
+                    .or_else(|| {
+                        recent_surface_focus
+                            .iter()
+                            .filter(|(client_id, _)| eligible(**client_id))
+                            .max_by_key(|(_, (_, focused_at))| *focused_at)
+                            .map(|(client_id, _)| *client_id)
+                    })?;
+                pending.authority = Some(authority);
+                Some((authority, pending.request.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (authority, request) in assignments {
+            if let Some(client) = self.clients.get(&authority) {
+                let _ = send_outbox(
+                    client,
+                    msg_server_control(&ServerControl::PortalRequest(request)),
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_screencast(
+        &mut self,
+        request: &blit_remote::media::PortalScreenCastRequest,
+        selected: &[u16],
+    ) -> Result<(u32, Vec<blit_desktop::PortalStream>), String> {
+        let allowed = request
+            .candidates
+            .iter()
+            .map(|candidate| candidate.surface_id)
+            .collect::<HashSet<_>>();
+        if selected.is_empty()
+            || selected.len() > if request.multiple { 4 } else { 1 }
+            || selected.iter().copied().collect::<HashSet<_>>().len() != selected.len()
+            || selected
+                .iter()
+                .any(|surface_id| !allowed.contains(surface_id))
+        {
+            return Err("invalid ScreenCast surface selection".into());
+        }
+        let current_streams = self
+            .compositor
+            .as_ref()
+            .map(|compositor| {
+                compositor
+                    .screencasts
+                    .values()
+                    .map(|session| session.streams.len())
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        if current_streams.saturating_add(selected.len()) > max_screencast_streams() {
+            return Err("ScreenCast stream budget exhausted".into());
+        }
+        let start_id = self.next_screencast_id.max(1);
+        let mut session_id = start_id;
+        loop {
+            if !self
+                .compositor
+                .as_ref()
+                .is_some_and(|compositor| compositor.screencasts.contains_key(&session_id))
+            {
+                self.next_screencast_id = session_id.wrapping_add(1).max(1);
+                break;
+            }
+            session_id = session_id.wrapping_add(1).max(1);
+            if session_id == start_id {
+                return Err("ScreenCast session IDs exhausted".into());
+            }
+        }
+        let compositor = self
+            .compositor
+            .as_mut()
+            .ok_or_else(|| "compositor unavailable".to_string())?;
+        let runtime_dir = compositor
+            .audio_pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.runtime_dir.clone())
+            .ok_or_else(|| "PipeWire runtime unavailable".to_string())?;
+        let mut streams = Vec::with_capacity(selected.len());
+        for &surface_id in selected {
+            let candidate = request
+                .candidates
+                .iter()
+                .find(|candidate| candidate.surface_id == surface_id)
+                .ok_or_else(|| "ScreenCast surface disappeared".to_string())?;
+            let current = compositor
+                .surfaces
+                .get(&surface_id)
+                .ok_or_else(|| "ScreenCast surface disappeared".to_string())?;
+            let current_dimensions = compositor
+                .native_sizes
+                .get(&surface_id)
+                .copied()
+                .unwrap_or((u32::from(current.width), u32::from(current.height)));
+            if current_dimensions != (u32::from(candidate.width), u32::from(candidate.height)) {
+                return Err("ScreenCast surface changed after selection".into());
+            }
+            let source = tokio::task::block_in_place(|| {
+                audio_pw::RawVideoSource::start(
+                    &runtime_dir,
+                    session_id,
+                    surface_id,
+                    candidate.width,
+                    candidate.height,
+                    30,
+                )
+            })?;
+            streams.push(ScreenCastStream {
+                surface_id,
+                width: candidate.width,
+                height: candidate.height,
+                source,
+            });
+        }
+        let portal_streams = streams
+            .iter()
+            .map(|stream| blit_desktop::PortalStream {
+                surface_id: stream.surface_id,
+                node_id: stream.source.node_id(),
+                pipewire_serial: stream.source.serial(),
+                width: stream.width,
+                height: stream.height,
+            })
+            .collect::<Vec<_>>();
+        let newly_active = streams
+            .iter()
+            .filter(|stream| {
+                !compositor.screencasts.values().any(|session| {
+                    session
+                        .streams
+                        .iter()
+                        .any(|known| known.surface_id == stream.surface_id)
+                })
+            })
+            .map(|stream| stream.surface_id)
+            .collect::<Vec<_>>();
+        compositor.screencasts.insert(
+            session_id,
+            ScreenCastSession {
+                session_id,
+                app_id: request.app_id.clone(),
+                streams,
+            },
+        );
+        for surface_id in newly_active {
+            let _ = compositor
+                .handle
+                .command_tx
+                .send(CompositorCommand::SetScreenCastActive {
+                    surface_id,
+                    active: true,
+                });
+        }
+        compositor.handle.wake();
+        compositor.frame_clocks_dirty = true;
+        Ok((session_id, portal_streams))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn stop_screencast(&mut self, session_id: u32) -> bool {
+        let Some(compositor) = self.compositor.as_mut() else {
+            return false;
+        };
+        let Some(session) = compositor.screencasts.remove(&session_id) else {
+            return false;
+        };
+        let removed_surfaces = session
+            .streams
+            .iter()
+            .map(|stream| stream.surface_id)
+            .collect::<HashSet<_>>();
+        for surface_id in removed_surfaces {
+            let still_active = compositor.screencasts.values().any(|known| {
+                known
+                    .streams
+                    .iter()
+                    .any(|stream| stream.surface_id == surface_id)
+            });
+            if !still_active {
+                let _ = compositor
+                    .handle
+                    .command_tx
+                    .send(CompositorCommand::SetScreenCastActive {
+                        surface_id,
+                        active: false,
+                    });
+            }
+        }
+        compositor.handle.wake();
+        compositor.frame_clocks_dirty = true;
+        true
+    }
+
+    fn client_list_msg(&self, requester: u64, nonce: u16) -> Vec<u8> {
+        let mut clients: Vec<blit_remote::ClientListEntry> = self
+            .clients
+            .iter()
+            .map(|(&client_id, client)| {
+                let mut terminals: Vec<_> = client
+                    .subscriptions
+                    .iter()
+                    .copied()
+                    .map(|pty_id| {
+                        let (rows, cols) =
+                            client.view_sizes.get(&pty_id).copied().unwrap_or((0, 0));
+                        blit_remote::ClientTerminalSubscription { pty_id, rows, cols }
+                    })
+                    .collect();
+                terminals.sort_unstable_by_key(|entry| entry.pty_id);
+                let mut surfaces: Vec<_> = client
+                    .surface_subscriptions
+                    .iter()
+                    .copied()
+                    .map(|surface_id| {
+                        let (width, height, scale_120) = client
+                            .surface_view_sizes
+                            .get(&surface_id)
+                            .copied()
+                            .unwrap_or((0, 0, 0));
+                        blit_remote::ClientSurfaceSubscription {
+                            surface_id,
+                            width,
+                            height,
+                            scale_120,
+                        }
+                    })
+                    .collect();
+                surfaces.sort_unstable_by_key(|entry| entry.surface_id);
+                let mut subscriptions = client.aux_subscriptions.clone();
+                #[cfg(target_os = "linux")]
+                if client.audio_subscribed {
+                    subscriptions.push(blit_remote::ClientAuxSubscription {
+                        kind: blit_remote::CLIENT_SUBSCRIPTION_AUDIO,
+                        id: 0,
+                    });
+                }
+                subscriptions
+                    .sort_unstable_by_key(|subscription| (subscription.kind, subscription.id));
+                blit_remote::ClientListEntry {
+                    client_id,
+                    age_secs: client.connected_at.elapsed().as_secs(),
+                    outbound_bytes_per_sec: client.outbound_bytes_per_sec,
+                    terminals,
+                    surfaces,
+                    subscriptions,
+                }
+            })
+            .collect();
+        clients.sort_unstable_by_key(|entry| entry.client_id);
+        msg_s2c_client_list(nonce, requester, &clients)
+    }
+
+    fn watch_client_list(&mut self, requester: u64, nonce: u16) {
+        let msg = self.client_list_msg(requester, nonce);
+        if let Some(client) = self.clients.get_mut(&requester) {
+            client.client_catalog_watches.insert(nonce, msg.clone());
+            let _ = send_outbox(client, msg);
+        }
+    }
+
+    fn unwatch_client_list(&mut self, requester: u64, nonce: u16) {
+        if let Some(client) = self.clients.get_mut(&requester) {
+            client.client_catalog_watches.remove(&nonce);
+        }
+    }
+
+    fn publish_client_catalogs(&mut self) {
+        let watches: Vec<(u64, u16)> = self
+            .clients
+            .iter()
+            .flat_map(|(&client_id, client)| {
+                client
+                    .client_catalog_watches
+                    .keys()
+                    .copied()
+                    .map(move |nonce| (client_id, nonce))
+            })
+            .collect();
+        for (client_id, nonce) in watches {
+            let msg = self.client_list_msg(client_id, nonce);
+            let Some(client) = self.clients.get_mut(&client_id) else {
+                continue;
+            };
+            if client.client_catalog_watches.get(&nonce) == Some(&msg) {
+                continue;
+            }
+            client.client_catalog_watches.insert(nonce, msg.clone());
+            let _ = send_outbox(client, msg);
+        }
+    }
+
+    /// Ask `target`'s read loop to shut down with `reason`.
+    ///
+    /// `STATUS_OK` means the request reached that connection's channel, not
+    /// that the reason was delivered: a target already tearing down for its
+    /// own reasons still reports `OK`.
+    ///
+    /// This is the only place the self-kick rule is enforced — the message
+    /// handler used to repeat it, which left the real guard looking optional.
+    fn kick_client(&self, requester: u64, target: u64, reason: &str) -> (u8, &'static str) {
+        if target == requester {
+            return (STATUS_INVALID, "a client cannot kick itself");
+        }
+        match self.clients.get(&target) {
+            Some(client) if client.kick_tx.send(reason.to_owned()).is_ok() => (STATUS_OK, ""),
+            _ => (STATUS_NOT_FOUND, "client is not connected"),
         }
     }
 
@@ -5547,6 +7764,8 @@ impl Session {
 
 struct AppStateInner {
     config: Config,
+    #[cfg(any(unix, windows))]
+    process_server: process::Server,
     /// Opaque identifier shared by every connection to this server process.
     boot_generation: u64,
     session: Mutex<Session>,
@@ -5554,6 +7773,9 @@ struct AppStateInner {
     delivery_notify: Arc<Notify>,
     /// Signalled when a client sends C2S_QUIT to initiate server shutdown.
     shutdown_notify: Arc<Notify>,
+    /// Seals logical endpoint admission, cancels every live connection, and
+    /// provides the cleanup barrier used by ordinary server teardown.
+    connections: Arc<ConnectionRegistry>,
     /// Wakes the supervisor loop.  Separate from `delivery_notify` because
     /// the two have opposite duty cycles: delivery only runs while a client
     /// is attached, and lifecycle work is exactly what has to keep running
@@ -5562,9 +7784,51 @@ struct AppStateInner {
     /// Tracks the number of currently connected clients for enforcing
     /// `config.max_connections`.
     active_connections: std::sync::atomic::AtomicUsize,
+    extension_jobs: extension_jobs::GlobalTracker,
+    extensions: Arc<extension::ExtensionService>,
 }
 
 type AppState = Arc<AppStateInner>;
+
+/// Enter the common shutdown path used by signals, C2S_QUIT, fd-channel EOF,
+/// and ordinary listener teardown. Admission is sealed before any await.
+async fn begin_server_shutdown(state: &AppState) {
+    if !state.connections.seal_shutdown() {
+        return;
+    }
+    // Attribute every attempt cancellation to shutdown before cancelling any
+    // logical connection. This also seals extension restart admission.
+    state.extensions.begin_shutdown().await;
+    let notices = {
+        let mut sess = state.session.lock().await;
+        sess.channels.begin_shutdown();
+        sess.clients
+            .values()
+            .filter_map(|client| {
+                let (sent_tx, sent_rx) = oneshot::channel();
+                client
+                    .terminal_tx
+                    .send((vec![S2C_QUIT], sent_tx))
+                    .ok()
+                    .map(|()| sent_rx)
+            })
+            .collect::<Vec<_>>()
+    };
+    // All notices were admitted before this await, so awaiting the receivers
+    // sequentially still lets every writer progress concurrently. One global
+    // timeout bounds slow or already-closed peers.
+    let _ = tokio::time::timeout(TERMINAL_NOTICE_TIMEOUT, async {
+        for notice in notices {
+            let _ = notice.await;
+        }
+    })
+    .await;
+    state.connections.cancel_all();
+    // `notify_one` retains a permit if the accept loop has not entered its
+    // select yet; `notify_waiters` would lose that edge. It comes last so an
+    // awakened main task observes the complete broadcast/cancellation step.
+    state.shutdown_notify.notify_one();
+}
 
 fn new_boot_generation() -> u64 {
     let mut bytes = [0; 8];
@@ -5585,7 +7849,7 @@ fn spawn_compositor_child(
     dir: Option<&str>,
 ) -> libc::pid_t {
     use std::ffi::CString;
-    let pid = unsafe { libc::fork() };
+    let pid = pty::fork_child();
     if pid == 0 {
         if let Some(d) = dir {
             let c_dir = CString::new(d).unwrap();
@@ -6241,16 +8505,148 @@ async fn supervise(state: &AppState) {
     #[cfg(target_os = "linux")]
     {
         let mut sess = state.session.lock().await;
+        let mut stopped_audio = None;
+        let mut stopped_media = Vec::new();
         if let Some(cs) = sess.compositor.as_mut()
             && let Some(ap) = cs.audio_pipeline.as_mut()
         {
             ap.reap_children();
         }
-        if let Some(cs) = sess.compositor.as_mut()
-            && cs.desktop_bus.as_mut().is_some_and(|bus| !bus.is_alive())
+        let expired_media = sess
+            .compositor
+            .as_mut()
+            .map(|cs| cs.media_input.expire(Instant::now()))
+            .unwrap_or_default();
+        for (owner, revoked) in &expired_media {
+            if let Some(client) = sess.clients.get(owner) {
+                let _ = send_outbox(
+                    client,
+                    msg_server_control(&ServerControl::Revoked(*revoked)),
+                );
+            }
+        }
+        if !expired_media.is_empty()
+            && let Some(media_state) = sess.compositor.as_ref().map(SharedCompositor::media_state)
         {
+            sess.send_to_all(&msg_server_control(&ServerControl::State(media_state)));
+        }
+        let portal_frontend_exited = sess
+            .compositor
+            .as_mut()
+            .and_then(|cs| cs.desktop_bus.as_mut())
+            .is_some_and(desktop_bus::DesktopBus::take_portal_frontend_exit);
+        if portal_frontend_exited {
+            eprintln!("[portal] xdg-desktop-portal exited");
+            let pending = std::mem::take(&mut sess.pending_portals);
+            for (request_id, request) in pending {
+                if let Some(authority) = request.authority
+                    && let Some(client) = sess.clients.get(&authority)
+                {
+                    let _ = send_outbox(
+                        client,
+                        msg_server_control(&ServerControl::PortalCancel(
+                            blit_remote::media::PortalCancel {
+                                request_id,
+                                reason: 1,
+                            },
+                        )),
+                    );
+                }
+                if let Some(bus) = sess
+                    .compositor
+                    .as_ref()
+                    .and_then(|cs| cs.desktop_bus.as_ref())
+                {
+                    let _ = bus.try_command(blit_desktop::Command::PortalReply(
+                        blit_remote::media::PortalReply {
+                            request_id,
+                            decision: blit_remote::media::PortalDecision::Cancelled,
+                            surface_ids: Vec::new(),
+                            choices: Vec::new(),
+                        },
+                    ));
+                }
+            }
+            let screencast_ids = sess
+                .compositor
+                .as_ref()
+                .map(|compositor| compositor.screencasts.keys().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            for session_id in screencast_ids {
+                sess.stop_screencast(session_id);
+                if let Some(bus) = sess
+                    .compositor
+                    .as_ref()
+                    .and_then(|cs| cs.desktop_bus.as_ref())
+                {
+                    let _ = bus.try_command(blit_desktop::Command::PortalSessionClosed(session_id));
+                }
+            }
+            if let Some(media_state) = sess.compositor.as_ref().map(SharedCompositor::media_state) {
+                sess.send_to_all(&msg_server_control(&ServerControl::State(media_state)));
+            }
+        }
+        let desktop_bus_exited = sess
+            .compositor
+            .as_mut()
+            .and_then(|cs| cs.desktop_bus.as_mut())
+            .is_some_and(|bus| !bus.is_alive());
+        if desktop_bus_exited {
             eprintln!("[desktop-bus] private session bus exited");
-            cs.desktop_bus = None;
+            let screencast_ids = sess
+                .compositor
+                .as_ref()
+                .map(|compositor| compositor.screencasts.keys().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            for session_id in screencast_ids {
+                sess.stop_screencast(session_id);
+            }
+            if let Some(cs) = sess.compositor.as_mut() {
+                cs.desktop_bus = None;
+                cs.desktop_mirror.reset();
+                cs.mpris_mirror.reset();
+                cs.mpris_position_observed_at.clear();
+                // PipeWire, WirePlumber, pulse, portals, and the desktop
+                // bridge are one compositor service bundle. The old private
+                // bus address cannot be repaired for already-running apps.
+                stopped_audio = cs.audio_pipeline.take();
+                cs.audio_restart_needed = false;
+                cs.audio_restart_inflight = false;
+                stopped_media = cs.media_input.revoke_all(RevokeReason::PipeWireFailed);
+            }
+            let tray = msg_tray_update(DESKTOP_UPDATE_RESET | DESKTOP_UPDATE_SYNC, &[]);
+            let notifications =
+                msg_notification_update(DESKTOP_UPDATE_RESET | DESKTOP_UPDATE_SYNC, &[]);
+            let mpris = msg_server_control(&ServerControl::MprisUpdate {
+                flags: MPRIS_UPDATE_RESET | MPRIS_UPDATE_SYNC,
+                records: Vec::new(),
+            });
+            for client in sess.clients.values() {
+                if client.desktop_subscriptions & DESKTOP_SUBSCRIBE_TRAY != 0 {
+                    let _ = send_outbox(client, tray.clone());
+                }
+                if client.desktop_subscriptions & DESKTOP_SUBSCRIBE_NOTIFICATIONS != 0 {
+                    let _ = send_outbox(client, notifications.clone());
+                }
+                if client.mpris_subscribed {
+                    let _ = send_outbox(client, mpris.clone());
+                }
+            }
+            for (owner, revoked) in &stopped_media {
+                if let Some(client) = sess.clients.get(owner) {
+                    let _ = send_outbox(
+                        client,
+                        msg_server_control(&ServerControl::Revoked(*revoked)),
+                    );
+                }
+            }
+            if let Some(media_state) = sess.compositor.as_ref().map(SharedCompositor::media_state) {
+                sess.send_to_all(&msg_server_control(&ServerControl::State(media_state)));
+            }
+        }
+        drop(sess);
+        if let Some(audio) = stopped_audio {
+            tokio::task::spawn_blocking(move || drop(audio));
         }
     }
     evict_exited(state).await;
@@ -6387,16 +8783,44 @@ fn try_send_update(
 }
 
 pub async fn run(config: Config) {
+    // Embedders may not call `configure_deployment`; in that case freeze the
+    // environment now, before any feature mask or service is constructed.
+    let _ = ensure_deployment_settings();
+    #[cfg(any(unix, windows))]
+    let process_server = process::Server::new(config.verbose, config.processes);
+    let boot_generation = new_boot_generation();
+    // Validate and freeze extension transport policy before any service or
+    // endpoint is published.
+    let _ = extension_outbox_config();
+    let logical_cpus = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    eprintln!(
+        "{}",
+        capacity_diagnostics::sampled_diagnostic(
+            extensions_enabled(),
+            channels_enabled(),
+            logical_cpus,
+            deployment_u64,
+        )
+    );
+    let extensions = extension::ExtensionService::from_env(config.allow_persistent_extensions);
     let state: AppState = Arc::new(AppStateInner {
         config,
-        boot_generation: new_boot_generation(),
-        session: Mutex::new(Session::new()),
+        #[cfg(any(unix, windows))]
+        process_server,
+        boot_generation,
+        session: Mutex::new(Session::new_with_boot_generation(boot_generation)),
         pty_fds: Arc::new(std::sync::RwLock::new(FxHashMap::default())),
         delivery_notify: Arc::new(Notify::new()),
         shutdown_notify: Arc::new(Notify::new()),
+        connections: Arc::new(ConnectionRegistry::default()),
         supervisor_notify: Arc::new(Notify::new()),
         active_connections: std::sync::atomic::AtomicUsize::new(0),
+        extension_jobs: extension_jobs::GlobalTracker::from_env(),
+        extensions: extensions.clone(),
     });
+    extensions.restore(state.clone()).await;
 
     // Start the compositor eagerly so it is ready before any client
     // connects or any terminal is created.
@@ -6480,26 +8904,6 @@ pub async fn run(config: Config) {
         kv::warm();
     }
 
-    #[cfg(unix)]
-    if let Some(channel_fd) = state.config.fd_channel {
-        blit_sd_notify::notify_ready(state.config.verbose);
-        ipc::run_fd_channel(channel_fd, state).await;
-        return;
-    }
-
-    #[cfg(unix)]
-    let listener = {
-        if let Some(l) = IpcListener::from_systemd_fd(state.config.verbose) {
-            l
-        } else {
-            IpcListener::bind(&state.config.ipc_path, state.config.verbose)
-        }
-    };
-    #[cfg(not(unix))]
-    let mut listener = IpcListener::bind(&state.config.ipc_path, state.config.verbose);
-
-    blit_sd_notify::notify_ready(state.config.verbose);
-
     // Broadcast S2C_QUIT on SIGTERM / SIGINT so clients can reconnect promptly
     // instead of waiting for a transport-level timeout.
     {
@@ -6519,12 +8923,37 @@ pub async fn run(config: Config) {
             {
                 let _ = tokio::signal::ctrl_c().await;
             }
-            let sess = state.session.lock().await;
-            sess.send_to_all(&[S2C_QUIT]);
-            drop(sess);
-            state.shutdown_notify.notify_one();
+            begin_server_shutdown(&state).await;
         });
     }
+
+    #[cfg(unix)]
+    if let Some(channel_fd) = state.config.fd_channel {
+        blit_sd_notify::notify_ready(state.config.verbose);
+        let shutdown = state.shutdown_notify.clone();
+        tokio::select! {
+            _ = ipc::run_fd_channel(channel_fd, state.clone()) => {}
+            _ = shutdown.notified() => {}
+        }
+        begin_server_shutdown(&state).await;
+        state.extensions.shutdown().await;
+        state.process_server.shutdown().await;
+        state.connections.wait_empty().await;
+        return;
+    }
+
+    #[cfg(unix)]
+    let listener = {
+        if let Some(l) = IpcListener::from_systemd_fd(state.config.verbose) {
+            l
+        } else {
+            IpcListener::bind(&state.config.ipc_path, state.config.verbose)
+        }
+    };
+    #[cfg(not(unix))]
+    let mut listener = IpcListener::bind(&state.config.ipc_path, state.config.verbose);
+
+    blit_sd_notify::notify_ready(state.config.verbose);
 
     let shutdown = state.shutdown_notify.clone();
     loop {
@@ -6539,30 +8968,13 @@ pub async fn run(config: Config) {
             },
             _ = shutdown.notified() => break,
         };
-        let max = state.config.max_connections;
-        if max > 0 {
-            let current = state
-                .active_connections
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if current >= max {
-                eprintln!("max connections ({max}) reached, rejecting");
-                drop(stream);
-                continue;
-            }
-        }
-        state
-            .active_connections
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let state = state.clone();
-        tokio::spawn(async move {
-            handle_client(stream, state.clone()).await;
-            state
-                .active_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        });
+        spawn_network_client(stream, state.clone());
     }
-    // Brief grace period for S2C_QUIT to reach clients before the process exits.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    begin_server_shutdown(&state).await;
+    #[cfg(any(unix, windows))]
+    state.process_server.shutdown().await;
+    state.extensions.shutdown().await;
+    state.connections.wait_empty().await;
 }
 
 /// Minimum interval between blanket RequestFrame rounds.  Keeps video
@@ -6612,6 +9024,31 @@ async fn tick(state: &AppState) -> TickOutcome {
         }
     }
 
+    // Live client-catalog bandwidth is actual framed bytes written by the
+    // connection writer, sampled at a human-scale cadence. Only a crossed
+    // sample boundary can move age or bandwidth, so publishing is bound to
+    // one — the tick loop has no floor, and rebuilding every watcher's
+    // snapshot per tick would bill that at the PTY producer's rate. Topology
+    // changes publish from their own handlers instead.
+    const CLIENT_CATALOG_BANDWIDTH_INTERVAL: Duration = Duration::from_secs(1);
+    if now.duration_since(sess.catalog_sampled_at) >= CLIENT_CATALOG_BANDWIDTH_INTERVAL {
+        sess.catalog_sampled_at = now;
+        for client in sess.clients.values_mut() {
+            // Each client still measures over its own window: one that
+            // connected mid-interval has less elapsed than the session epoch.
+            let elapsed = now.duration_since(client.outbound_sampled_at);
+            if elapsed.is_zero() {
+                continue;
+            }
+            let total = client.outbound_bytes.load(Ordering::Relaxed);
+            let bytes = total.saturating_sub(client.outbound_bytes_seen);
+            client.outbound_bytes_per_sec = (bytes as f64 / elapsed.as_secs_f64()) as u64;
+            client.outbound_bytes_seen = total;
+            client.outbound_sampled_at = now;
+        }
+        sess.publish_client_catalogs();
+    }
+
     // Application-level keepalive. Only scheduled when a client is
     // connected — otherwise there's no one to ping and the timer would
     // be pure polling cost.
@@ -6646,6 +9083,18 @@ async fn tick(state: &AppState) -> TickOutcome {
     let mut cancelled_touch_owners: Vec<Option<u64>> = Vec::new();
 
     let mut surface_commit_count = 0u32;
+    #[cfg(target_os = "linux")]
+    let mut desktop_broadcast: Vec<(u8, Vec<u8>)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    let mut mpris_broadcast: Vec<Vec<u8>> = Vec::new();
+    #[cfg(target_os = "linux")]
+    let mut mpris_results: Vec<(u64, Vec<u8>)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    let mut portal_events: Vec<blit_desktop::Event> = Vec::new();
+    #[cfg(target_os = "linux")]
+    let mut closed_screencast_sessions = Vec::new();
+    #[cfg(target_os = "linux")]
+    let mut screencast_state_changed = false;
     if let Some(cs) = sess.compositor.as_mut() {
         let mut events = Vec::new();
         while let Ok(event) = cs.handle.event_rx.try_recv() {
@@ -6686,6 +9135,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                     invalidate_client_encoders.push(surface_id);
                 }
                 CompositorEvent::SurfaceDestroyed { surface_id } => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let retired = retire_screencast_surface(cs, surface_id);
+                        closed_screencast_sessions.extend(retired.closed_sessions);
+                        screencast_state_changed |= retired.state_changed;
+                    }
                     cs.surfaces.remove(&surface_id);
                     cs.surface_text_inputs.remove(&surface_id);
                     last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
@@ -6714,6 +9169,19 @@ async fn tick(state: &AppState) -> TickOutcome {
                     encoder_skip,
                 } => {
                     surface_commit_count += 1;
+                    #[cfg(target_os = "linux")]
+                    let screencast_frame = {
+                        let wanted = cs.screencasts.values().any(|session| {
+                            session.streams.iter().any(|stream| {
+                                stream.surface_id == surface_id
+                                    && u32::from(stream.width) == width
+                                    && u32::from(stream.height) == height
+                            })
+                        });
+                        wanted
+                            .then(|| pixels.to_rgba(width, height))
+                            .filter(|rgba| rgba.len() == width as usize * height as usize * 4)
+                    };
                     // A commit is for one `(surface, target size)`, not
                     // necessarily the native composite.  In particular,
                     // multiple subscribers make native and per-client
@@ -6747,6 +9215,25 @@ async fn tick(state: &AppState) -> TickOutcome {
                         );
                     }
                     cs.mark_pixel_snapshot_dirty();
+                    #[cfg(target_os = "linux")]
+                    if let Some(rgba) = screencast_frame {
+                        for stream in cs
+                            .screencasts
+                            .values()
+                            .flat_map(|session| session.streams.iter())
+                            .filter(|stream| {
+                                stream.surface_id == surface_id
+                                    && u32::from(stream.width) == width
+                                    && u32::from(stream.height) == height
+                            })
+                        {
+                            let _ = stream.source.push_timed(
+                                rgba.clone(),
+                                timestamp_ms,
+                                timestamp_sub_us,
+                            );
+                        }
+                    }
                 }
                 CompositorEvent::SurfaceEncoded {
                     frame,
@@ -6865,6 +9352,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                     // whole grace window.
                     cs.resize_inflight.remove(&surface_id);
                     if resolution_changed {
+                        #[cfg(target_os = "linux")]
+                        {
+                            let retired = retire_screencast_surface(cs, surface_id);
+                            closed_screencast_sessions.extend(retired.closed_sessions);
+                            screencast_state_changed |= retired.state_changed;
+                        }
                         last_pixels_remove_for_sid(&mut cs.last_pixels, surface_id);
                         last_pixels_remove_for_sid(&mut cs.last_opaque_pixels, surface_id);
                         cs.mark_pixel_snapshot_dirty();
@@ -6959,13 +9452,206 @@ async fn tick(state: &AppState) -> TickOutcome {
                 }
             }
         }
+        #[cfg(target_os = "linux")]
+        if let Some(bus) = cs.desktop_bus.as_mut() {
+            while let Some(event) = bus.try_recv() {
+                match event {
+                    blit_desktop::Event::Tray(record) => {
+                        match &record {
+                            TrayRecord::Upsert(item) => {
+                                cs.desktop_mirror.tray.insert(item.tray_id, item.clone());
+                            }
+                            TrayRecord::Delete { tray_id } => {
+                                cs.desktop_mirror.tray.remove(tray_id);
+                            }
+                        }
+                        desktop_broadcast
+                            .push((DESKTOP_SUBSCRIBE_TRAY, msg_tray_update(0, &[record])));
+                    }
+                    blit_desktop::Event::TrayMenu(menu) => {
+                        desktop_broadcast.push((DESKTOP_SUBSCRIBE_TRAY, msg_tray_menu(&menu)));
+                    }
+                    blit_desktop::Event::Notification(record) => {
+                        match &record {
+                            NotificationRecord::Upsert(item) => {
+                                cs.desktop_mirror
+                                    .notifications
+                                    .insert(item.notification_id, item.clone());
+                            }
+                            NotificationRecord::Delete {
+                                notification_id, ..
+                            } => {
+                                cs.desktop_mirror.notifications.remove(notification_id);
+                            }
+                        }
+                        desktop_broadcast.push((
+                            DESKTOP_SUBSCRIBE_NOTIFICATIONS,
+                            msg_notification_update(0, &[record]),
+                        ));
+                    }
+                    blit_desktop::Event::Mpris(records) => {
+                        let observed_at = Instant::now();
+                        for record in &records {
+                            match record {
+                                MprisRecord::Upsert(player) => {
+                                    cs.mpris_mirror
+                                        .players
+                                        .insert(player.player_id, player.clone());
+                                    cs.mpris_position_observed_at
+                                        .insert(player.player_id, observed_at);
+                                }
+                                MprisRecord::Delete { player_id } => {
+                                    cs.mpris_mirror.players.remove(player_id);
+                                    cs.mpris_position_observed_at.remove(player_id);
+                                }
+                            }
+                        }
+                        mpris_broadcast.push(msg_server_control(&ServerControl::MprisUpdate {
+                            flags: 0,
+                            records,
+                        }));
+                    }
+                    blit_desktop::Event::MprisAction { requester, result } => {
+                        mpris_results.push((
+                            requester,
+                            msg_server_control(&ServerControl::MprisActionResult(result)),
+                        ));
+                    }
+                    event @ blit_desktop::Event::Portal { .. }
+                    | event @ blit_desktop::Event::PortalCancel(_)
+                    | event @ blit_desktop::Event::PortalSessionClosed(_) => {
+                        portal_events.push(event)
+                    }
+                }
+            }
+        }
         for msg in &broadcast {
             sess.send_to_all(msg);
         }
     }
+    #[cfg(target_os = "linux")]
+    if screencast_state_changed {
+        if let Some(bus) = sess
+            .compositor
+            .as_ref()
+            .and_then(|compositor| compositor.desktop_bus.as_ref())
+        {
+            for session_id in closed_screencast_sessions {
+                let _ = bus.try_command(blit_desktop::Command::PortalSessionClosed(session_id));
+            }
+        }
+        if let Some(media_state) = sess.compositor.as_ref().map(SharedCompositor::media_state) {
+            sess.send_to_all(&msg_server_control(&ServerControl::State(media_state)));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    for (subscription, msg) in desktop_broadcast {
+        for client in sess.clients.values() {
+            if client.desktop_subscriptions & subscription != 0 {
+                let _ = send_outbox(client, msg.clone());
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    for msg in mpris_broadcast {
+        for client in sess
+            .clients
+            .values()
+            .filter(|client| client.mpris_subscribed)
+        {
+            let _ = send_outbox(client, msg.clone());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    for (requester, msg) in mpris_results {
+        if let Some(client) = sess.clients.get(&requester) {
+            let _ = send_outbox(client, msg);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    for event in portal_events {
+        match event {
+            blit_desktop::Event::Portal {
+                mut request,
+                parent_window,
+            } => {
+                let parent_surface_id = sess
+                    .compositor
+                    .as_ref()
+                    .and_then(|cs| cs.handle.resolve_foreign_parent(&parent_window));
+                match &mut request {
+                    PortalRequest::Access(request) => {
+                        request.parent_surface_id = parent_surface_id;
+                    }
+                    PortalRequest::ScreenCast(request) => {
+                        request.parent_surface_id = parent_surface_id;
+                        request.candidates = sess
+                            .compositor
+                            .as_ref()
+                            .map(screencast_candidates)
+                            .unwrap_or_default();
+                    }
+                }
+                let request_id = match &request {
+                    PortalRequest::Access(request) => request.request_id,
+                    PortalRequest::ScreenCast(request) => request.request_id,
+                };
+                if sess.pending_portals.len() >= 32 {
+                    if let Some(bus) = sess
+                        .compositor
+                        .as_ref()
+                        .and_then(|cs| cs.desktop_bus.as_ref())
+                    {
+                        let _ = bus.try_command(blit_desktop::Command::PortalReply(
+                            blit_remote::media::PortalReply {
+                                request_id,
+                                decision: blit_remote::media::PortalDecision::Cancelled,
+                                surface_ids: Vec::new(),
+                                choices: Vec::new(),
+                            },
+                        ));
+                    }
+                    continue;
+                }
+                sess.pending_portals.insert(
+                    request_id,
+                    PendingPortal {
+                        request,
+                        authority: None,
+                    },
+                );
+                sess.assign_pending_portals();
+            }
+            blit_desktop::Event::PortalCancel(request_id) => {
+                if let Some(pending) = sess.pending_portals.remove(&request_id)
+                    && let Some(authority) = pending.authority
+                    && let Some(client) = sess.clients.get(&authority)
+                {
+                    let _ = send_outbox(
+                        client,
+                        msg_server_control(&ServerControl::PortalCancel(
+                            blit_remote::media::PortalCancel {
+                                request_id,
+                                reason: 0,
+                            },
+                        )),
+                    );
+                }
+            }
+            blit_desktop::Event::PortalSessionClosed(session_id) => {
+                if sess.stop_screencast(session_id)
+                    && let Some(media_state) =
+                        sess.compositor.as_ref().map(SharedCompositor::media_state)
+                {
+                    sess.send_to_all(&msg_server_control(&ServerControl::State(media_state)));
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
     sess.surface_commits += surface_commit_count;
 
-    for surface_id in destroyed_surface_ids {
+    for &surface_id in &destroyed_surface_ids {
         sess.clear_surface_pointer(surface_id);
     }
 
@@ -6980,22 +9666,7 @@ async fn tick(state: &AppState) -> TickOutcome {
     for sid in invalidate_client_encoders {
         let mut had_vulkan = false;
         for c in sess.clients.values_mut() {
-            // Everything about the encode is rebuilt against the new
-            // composite, so the entry goes.  A scaled subscriber's requested
-            // size is not part of that: it describes the client's own
-            // viewport, which this event says nothing about.  Dropping it
-            // here would silently revert a thumbnail to full-size encoding
-            // for as long as it took to resubscribe — and a surface it never
-            // interacts with may never give it a reason to.
-            let still_subscribed = c.surface_subscriptions.contains(&sid);
-            let previous = c.surface_subs.remove(&sid);
-            if still_subscribed && let Some(previous) = previous {
-                let state = c.surface_subs.entry(sid).or_default();
-                state.scaled_target = previous.scaled_target;
-                state.max_fps = previous.max_fps;
-            }
-            had_vulkan |= c.vulkan_video_surfaces.remove(&sid).is_some();
-            forget_surface_inflight(c, sid);
+            had_vulkan |= invalidate_client_surface(c, sid, destroyed_surface_ids.contains(&sid));
         }
         // The compositor's sessions are sized against the old composite,
         // so drop every client's encoder for this surface.  Selection will
@@ -9456,6 +12127,21 @@ async fn tick(state: &AppState) -> TickOutcome {
                         .or_insert(interval);
                 }
             }
+            #[cfg(target_os = "linux")]
+            if let Some(compositor) = sess.compositor.as_ref() {
+                for stream in compositor
+                    .screencasts
+                    .values()
+                    .flat_map(|session| session.streams.iter())
+                {
+                    clocks
+                        .entry(stream.surface_id)
+                        .and_modify(|current| {
+                            *current = (*current).min(Duration::from_millis(33));
+                        })
+                        .or_insert(Duration::from_millis(33));
+                }
+            }
             clocks
         });
         if let Some(clocks) = desired_clocks.as_ref() {
@@ -10077,6 +12763,46 @@ async fn tick(state: &AppState) -> TickOutcome {
         .map(|kbps| kbps as i32 * 1000)
         .unwrap_or(0);
     #[cfg(target_os = "linux")]
+    {
+        let camera_results = sess
+            .compositor
+            .as_mut()
+            .map(|cs| cs.media_input.poll())
+            .unwrap_or_default();
+        let mut state_changed = false;
+        for result in camera_results {
+            match result {
+                media_input::DataResult::Credit { owner, credit } => {
+                    if let Some(client) = sess.clients.get(&owner) {
+                        let _ =
+                            send_outbox(client, msg_server_control(&ServerControl::Credit(credit)));
+                    }
+                }
+                media_input::DataResult::Revoked { owner, revoked } => {
+                    state_changed = true;
+                    if let Some(client) = sess.clients.get(&owner) {
+                        let _ = send_outbox(
+                            client,
+                            msg_server_control(&ServerControl::Revoked(revoked)),
+                        );
+                    }
+                }
+                media_input::DataResult::Ignored => {}
+            }
+        }
+        if state_changed
+            && let Some(media_state) = sess.compositor.as_ref().map(SharedCompositor::media_state)
+        {
+            sess.send_to_all(&msg_server_control(&ServerControl::State(media_state)));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let mut audio_screencasts_closed = false;
+    #[cfg(target_os = "linux")]
+    let mut audio_media_revoked = Vec::new();
+    #[cfg(target_os = "linux")]
+    let mut audio_runtime_changed = false;
+    #[cfg(target_os = "linux")]
     if let Some(ref mut cs) = sess.compositor {
         // Poll for liveness on a timer, not per tick.  `is_alive` costs up to
         // four `waitpid` syscalls and `tick` is notify-driven, so an unguarded
@@ -10091,72 +12817,150 @@ async fn tick(state: &AppState) -> TickOutcome {
             cs.last_audio_liveness_check = Some(now);
             cs.audio_pipeline.as_mut().is_some_and(|ap| !ap.is_alive())
         };
+        let mut dead_pipeline = None;
         if pipeline_dead {
-            const RESTART_COOLDOWN: Duration = Duration::from_secs(5);
-            let can_restart = cs
-                .last_audio_restart
-                .is_none_or(|t| now.duration_since(t) >= RESTART_COOLDOWN);
-            if can_restart {
-                cs.last_audio_restart = Some(now);
-                // Take the dead pipeline out of the compositor and clear the
-                // slot synchronously so the next tick sees no pipeline and
-                // does not start a second restart while this one is in flight.
-                let dead_pipeline = cs.audio_pipeline.take();
-                let runtime_dir = std::path::Path::new(&cs.handle.socket_name)
-                    .parent()
-                    .unwrap_or(std::path::Path::new("/tmp"))
-                    .to_path_buf();
-                let session_id = cs.audio_session_id;
-                let epoch = cs.created_at;
-                let verbose = state.config.verbose;
-                // Reuse the existing broadcast so currently-subscribed
-                // clients pick up frames from the restarted pipeline
-                // without re-subscribing.
-                let broadcast = cs.audio_broadcast.clone();
-                let state = state.clone();
-                eprintln!("[audio] pipeline died, restarting...");
-                tokio::spawn(async move {
-                    // Drop the dead pipeline first; its Drop impl calls
-                    // shutdown() which waits on children and removes the
-                    // runtime dir.  Do this before spawning the replacement
-                    // so the old directory is gone before the new pipeline
-                    // tries to recreate it.
-                    drop(dead_pipeline);
-                    let pipeline = tokio::task::block_in_place(|| {
-                        audio::AudioPipeline::spawn(
-                            &runtime_dir,
-                            session_id,
-                            audio_restart_bitrate,
-                            verbose,
-                            epoch,
-                            broadcast,
-                        )
-                    });
-                    let mut sess = state.session.lock().await;
-                    let Some(cs) = sess.compositor.as_mut() else {
-                        return;
-                    };
-                    // Only install if this is still the same compositor
-                    // instance; if it was torn down while we were spawning,
-                    // dropping `pipeline` here cleans it up.
-                    if cs.audio_session_id != session_id || cs.created_at != epoch {
-                        return;
+            // Clear the slot immediately. A dead process must never keep
+            // PipeWire/device/ScreenCast runtime bits advertised during the
+            // restart cooldown.
+            dead_pipeline = cs.audio_pipeline.take();
+            audio_runtime_changed = dead_pipeline.is_some();
+            cs.audio_restart_needed = true;
+            audio_media_revoked = cs.media_input.revoke_all(RevokeReason::PipeWireFailed);
+            // The published node IDs belong to this PipeWire instance. They
+            // cannot survive its loss, so revoke every session before a new
+            // pipeline is installed rather than leaving consumers attached
+            // to stale nodes.
+            let sessions = std::mem::take(&mut cs.screencasts);
+            if !sessions.is_empty() {
+                let mut surfaces = HashSet::new();
+                for session in sessions.into_values() {
+                    surfaces.extend(session.streams.iter().map(|stream| stream.surface_id));
+                    if let Some(bus) = cs.desktop_bus.as_ref() {
+                        let _ = bus.try_command(blit_desktop::Command::PortalSessionClosed(
+                            session.session_id,
+                        ));
                     }
-                    match pipeline {
-                        Ok(p) => {
-                            eprintln!(
-                                "[audio] pipeline restarted, PULSE_SERVER={}",
-                                p.pulse_server_path(),
-                            );
-                            cs.audio_pipeline = Some(p);
-                        }
-                        Err(e) => {
-                            eprintln!("[audio] failed to restart pipeline: {e}");
-                        }
-                    }
-                });
+                }
+                for surface_id in surfaces {
+                    let _ = cs
+                        .handle
+                        .command_tx
+                        .send(CompositorCommand::SetScreenCastActive {
+                            surface_id,
+                            active: false,
+                        });
+                }
+                cs.handle.wake();
+                cs.frame_clocks_dirty = true;
+                audio_screencasts_closed = true;
             }
         }
+        const RESTART_COOLDOWN: Duration = Duration::from_secs(5);
+        let can_restart = cs.audio_restart_needed
+            && !cs.audio_restart_inflight
+            && cs.audio_pipeline.is_none()
+            && cs.desktop_bus.is_some()
+            && cs
+                .last_audio_restart
+                .is_none_or(|t| now.duration_since(t) >= RESTART_COOLDOWN);
+        if can_restart {
+            cs.last_audio_restart = Some(now);
+            cs.audio_restart_inflight = true;
+            let runtime_dir = std::path::Path::new(&cs.handle.socket_name)
+                .parent()
+                .unwrap_or(std::path::Path::new("/tmp"))
+                .to_path_buf();
+            let session_id = cs.audio_session_id;
+            let epoch = cs.created_at;
+            let dbus_address = cs
+                .desktop_bus
+                .as_ref()
+                .map(|bus| bus.address().to_owned())
+                .unwrap();
+            let verbose = state.config.verbose;
+            // Reuse the existing broadcast so currently-subscribed clients
+            // pick up frames from the restarted pipeline without re-subscribing.
+            let broadcast = cs.audio_broadcast.clone();
+            let state = state.clone();
+            eprintln!("[audio] pipeline unavailable, restarting...");
+            tokio::spawn(async move {
+                // Drop the old runtime before recreating its directory. This
+                // happens off the delivery lock because teardown waits on
+                // child processes.
+                drop(dead_pipeline);
+                let pipeline = tokio::task::block_in_place(|| {
+                    audio::AudioPipeline::spawn(
+                        &runtime_dir,
+                        session_id,
+                        &dbus_address,
+                        audio_restart_bitrate,
+                        verbose,
+                        epoch,
+                        broadcast,
+                    )
+                });
+                let mut sess = state.session.lock().await;
+                let Some(cs) = sess.compositor.as_mut() else {
+                    return;
+                };
+                // Only install if this is still the same live service bundle.
+                if cs.audio_session_id != session_id || cs.created_at != epoch {
+                    return;
+                }
+                cs.audio_restart_inflight = false;
+                if cs.desktop_bus.is_none() {
+                    cs.audio_restart_needed = false;
+                    drop(sess);
+                    drop(pipeline);
+                    return;
+                }
+                match pipeline {
+                    Ok(p) => {
+                        eprintln!(
+                            "[audio] pipeline restarted, PULSE_SERVER={}",
+                            p.pulse_server_path(),
+                        );
+                        cs.audio_pipeline = Some(p);
+                        cs.audio_restart_needed = false;
+                        let media_state = cs.media_state();
+                        sess.send_to_all(&msg_server_control(&ServerControl::State(media_state)));
+                    }
+                    Err(e) => {
+                        cs.audio_restart_needed = true;
+                        eprintln!("[audio] failed to restart pipeline: {e}");
+                    }
+                }
+                drop(sess);
+                state.delivery_notify.notify_one();
+            });
+        } else {
+            if let Some(dead_pipeline) = dead_pipeline {
+                tokio::task::spawn_blocking(move || drop(dead_pipeline));
+            }
+            if cs.audio_restart_needed && !cs.audio_restart_inflight {
+                let retry_at = cs
+                    .last_audio_restart
+                    .map_or(now, |last| last + RESTART_COOLDOWN);
+                next_deadline = Some(next_deadline.map_or(retry_at, |due| due.min(retry_at)));
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if !audio_media_revoked.is_empty() {
+        for (owner, revoked) in &audio_media_revoked {
+            if let Some(client) = sess.clients.get(owner) {
+                let _ = send_outbox(
+                    client,
+                    msg_server_control(&ServerControl::Revoked(*revoked)),
+                );
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if (audio_screencasts_closed || !audio_media_revoked.is_empty() || audio_runtime_changed)
+        && let Some(media_state) = sess.compositor.as_ref().map(SharedCompositor::media_state)
+    {
+        sess.send_to_all(&msg_server_control(&ServerControl::State(media_state)));
     }
 
     // Retire size claims whose grace ran out, and re-mediate what they were
@@ -10279,7 +13083,7 @@ fn fs_walk_inflight() -> usize {
 /// Release one fetch slot and dispatch queued fetches while slots remain.
 /// A queued fetch whose sync died answers `FS_FILE_OTHER` here, keeping
 /// one reply per nonce.
-fn fetch_finish(gate: &std::sync::Arc<FetchGate>, out: &mpsc::UnboundedSender<Vec<u8>>) {
+fn fetch_finish<O: OutboxSend>(gate: &std::sync::Arc<FetchGate>, out: &O) {
     let mut inner = gate.inner.lock().unwrap();
     inner.inflight = inner.inflight.saturating_sub(1);
     while inner.inflight < fs_fetch_inflight() {
@@ -10308,6 +13112,10 @@ fn fetch_finish(gate: &std::sync::Arc<FetchGate>, out: &mpsc::UnboundedSender<Ve
 struct FsSyncs {
     map: FxHashMap<u16, FsSyncEntry>,
     next_id: u16,
+    /// Extension-origin opens which passed family validation and native-job
+    /// admission but have not yet completed on the reader-owned completion
+    /// lane. They count against the same sync ceiling as live engines.
+    pending_opens: usize,
     /// Nonces of writes/ops in flight on this connection (write-family
     /// nonce namespace). Membership dedups a duplicate nonce; the count is
     /// the in-flight cap. Freed by the engine's `InflightGuard` on reply.
@@ -11015,11 +13823,83 @@ fn fs_readonly_refusal(msg: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-async fn handle_fs_message(
+type FsNativeOpen = Result<
+    (
+        std::path::PathBuf,
+        std::sync::Arc<blit_fssync::SharedRootHandle>,
+    ),
+    (u8, String),
+>;
+
+struct FsOpenPublication {
+    nonce: u16,
+    recursive: bool,
+    content: bool,
+    cross_filesystem: bool,
+    latency_ms: u16,
+    inline_max: u32,
+}
+
+struct FsOpenCompletion {
+    publication: FsOpenPublication,
+    outcome: Result<FsNativeOpen, extension_jobs::RunError>,
+}
+
+struct GitOpenPublication {
+    nonce: u16,
+    flags: u16,
+    refs_ms: u16,
+    status_ms: u16,
+    path: Arc<str>,
+    ref_prefixes: Vec<String>,
+}
+
+type GitNativeOpen = Result<(blit_git::RepoHandle, blit_git::RepoInfo), (u8, String)>;
+
+struct GitOpenCompletion {
+    publication: GitOpenPublication,
+    outcome: Result<GitNativeOpen, extension_jobs::RunError>,
+}
+
+struct LspOpenPublication {
+    nonce: u16,
+    flags: u8,
+    diag_latency_ms: u16,
+    path: Arc<str>,
+}
+
+type LspNativeOpen = Result<(blit_lsp::Prepared, String, String), (u8, String)>;
+
+struct LspOpenCompletion {
+    publication: LspOpenPublication,
+    outcome: Result<LspNativeOpen, extension_jobs::RunError>,
+}
+
+enum NativeOpenCompletion {
+    Fs(FsOpenCompletion),
+    Git(GitOpenCompletion),
+    Lsp(LspOpenCompletion),
+}
+
+type NativeOpenSender = mpsc::UnboundedSender<NativeOpenCompletion>;
+
+#[cfg(test)]
+async fn handle_fs_message<O: OutboxSend>(
     data: &[u8],
     syncs: &mut FsSyncs,
-    out: &mpsc::UnboundedSender<Vec<u8>>,
+    out: &O,
     verbose: bool,
+) {
+    handle_fs_message_with_jobs(data, syncs, out, verbose, None, None).await;
+}
+
+async fn handle_fs_message_with_jobs<O: OutboxSend>(
+    data: &[u8],
+    syncs: &mut FsSyncs,
+    out: &O,
+    verbose: bool,
+    jobs: Option<&extension_jobs::EndpointTracker>,
+    open_completions: Option<&NativeOpenSender>,
 ) {
     use blit_fssync::{OpReq, UploadBeginReq, WriteReq};
     use blit_remote::fs::{
@@ -11048,11 +13928,16 @@ async fn handle_fs_message(
                     return;
                 };
                 let out = out.clone();
-                std::thread::spawn(move || {
+                let work = move || {
                     let _guard = guard;
                     let paths = fs_search_walk(&root, &query, limit as usize);
                     let _ = out.send(msg_fs_search_result(nonce, FS_STATUS_OK, &paths));
-                });
+                };
+                if let Some(jobs) = jobs {
+                    let _ = jobs.spawn_blocking(data.len(), work);
+                } else {
+                    std::thread::spawn(work);
+                }
             }
         }
         C2S_FS_GREP => {
@@ -11117,7 +14002,7 @@ async fn handle_fs_message(
                     (max_per_file as usize).min(FS_GREP_MAX_PER_FILE)
                 };
                 let out = out.clone();
-                std::thread::spawn(move || {
+                let work = move || {
                     let _guard = guard;
                     let io_status = |err: &std::io::Error| match err.kind() {
                         std::io::ErrorKind::NotFound => FS_DONE_NOT_FOUND,
@@ -11154,7 +14039,12 @@ async fn handle_fs_message(
                         Err(err) => fail(io_status(&err)),
                     };
                     let _ = out.send(msg);
-                });
+                };
+                if let Some(jobs) = jobs {
+                    let _ = jobs.spawn_blocking(data.len(), work);
+                } else {
+                    std::thread::spawn(work);
+                }
             }
         }
         C2S_FS_INDEX => {
@@ -11174,7 +14064,7 @@ async fn handle_fs_message(
                     }
                 };
                 let out = out.clone();
-                std::thread::spawn(move || {
+                let work = move || {
                     let _guard = guard;
                     let io_status = |err: &std::io::Error| match err.kind() {
                         std::io::ErrorKind::NotFound => FS_DONE_NOT_FOUND,
@@ -11201,7 +14091,12 @@ async fn handle_fs_message(
                         Err(err) => msg_fs_index_result(nonce, io_status(&err), 0, &[]),
                     };
                     let _ = out.send(msg);
-                });
+                };
+                if let Some(jobs) = jobs {
+                    let _ = jobs.spawn_blocking(data.len(), work);
+                } else {
+                    std::thread::spawn(work);
+                }
             }
         }
         C2S_FS_SYNC if data.len() >= FS_SYNC_HEADER => {
@@ -11258,13 +14153,21 @@ async fn handle_fs_message(
             // otherwise leak against the budget until disconnect.
             syncs.map.retain(|_, entry| !entry.handle.is_done());
             syncs.reap_uploads(None);
-            if syncs.map.len() >= FsSyncs::max_syncs() {
+            if syncs.map.len().saturating_add(syncs.pending_opens) >= FsSyncs::max_syncs() {
                 refuse(FS_STATUS_RESOURCE_LIMIT, "sync limit reached");
                 return;
             }
             let recursive = flags & FS_SYNC_RECURSIVE != 0;
             let cross_filesystem = flags & FS_SYNC_CROSS_FILESYSTEM != 0;
             let single = flags & FS_SYNC_SINGLE != 0;
+            let publication = FsOpenPublication {
+                nonce,
+                recursive,
+                content: flags & FS_SYNC_CONTENT != 0,
+                cross_filesystem,
+                latency_ms,
+                inline_max,
+            };
             // Canonicalize and join (or create) the shared root — one
             // native watcher and one canonical index per root, shared
             // across every sync of it — off the runtime: arming a
@@ -11274,7 +14177,7 @@ async fn handle_fs_message(
             // FS_UPDATE, and no later FS_* can observe a half-open sync);
             // only the worker thread is freed for other connections.
             let path_owned = path.to_string();
-            let opened = tokio::task::spawn_blocking(move || {
+            let open = move || {
                 if single {
                     let root = blit_fssync::validate_single_root(&path_owned)?;
                     let shared = blit_fssync::open_single_root(root.clone())?;
@@ -11289,97 +14192,34 @@ async fn handle_fs_message(
                     })?;
                     Ok((root, shared))
                 }
-            })
-            .await
-            .unwrap_or_else(|_| Err((FS_STATUS_OTHER, "open task failed".to_string())));
-            let (root, shared) = match opened {
-                Ok(opened) => opened,
-                Err((status, detail)) => {
-                    refuse(status, &detail);
-                    return;
+            };
+            if let Some(jobs) = jobs {
+                let completions = open_completions
+                    .expect("extension native jobs have an open-completion lane")
+                    .clone();
+                syncs.pending_opens += 1;
+                if jobs
+                    .spawn_blocking_result(
+                        data.len(),
+                        extension_jobs::LaunchCancellation::default(),
+                        move |outcome| {
+                            let _ = completions.send(NativeOpenCompletion::Fs(FsOpenCompletion {
+                                publication,
+                                outcome,
+                            }));
+                        },
+                        open,
+                    )
+                    .is_err()
+                {
+                    syncs.pending_opens -= 1;
                 }
-            };
-            let Some(sync_id) = syncs.alloc_id() else {
-                refuse(FS_STATUS_RESOURCE_LIMIT, "no sync ids left");
-                return;
-            };
-            let mut opts = blit_fssync::SyncOptions {
-                recursive,
-                content: flags & FS_SYNC_CONTENT != 0,
-                cross_filesystem,
-                ..Default::default()
-            };
-            if latency_ms != 0 {
-                opts.latency = Duration::from_millis(u64::from(latency_ms).clamp(1, 1000));
+            } else {
+                let opened = tokio::task::spawn_blocking(open)
+                    .await
+                    .unwrap_or_else(|_| Err((FS_STATUS_OTHER, "open task failed".to_string())));
+                publish_fs_open(syncs, out, verbose, publication, opened);
             }
-            if inline_max != 0 {
-                // Never above the protocol's decompressed cap: an inlined file
-                // rides an FS_UPDATE a client refuses past FS_MAX_DECOMPRESSED.
-                opts.inline_max =
-                    u64::from(inline_max).min(blit_remote::fs::FS_MAX_DECOMPRESSED as u64);
-            }
-            if verbose {
-                eprintln!(
-                    "C2S_FS_SYNC: sync_id={sync_id} root={} recursive={recursive} content={}",
-                    root.display(),
-                    opts.content
-                );
-            }
-            // FS_SYNCED must precede the first FS_UPDATE on the wire; the
-            // outbox is FIFO, so sending before the engine spawns suffices.
-            let _ = out.send(msg_fs_synced(
-                nonce,
-                sync_id,
-                FS_STATUS_OK,
-                &blit_fssync::escape_path(&root),
-            ));
-            // The sink watches for FS_FILE replies to free fetch slots
-            // (and dispatch queued fetches): the engine is the only
-            // producer of them, so every reply pairs with one dispatched
-            // Command::Fetch. It also frees the upload id of a BEGIN the
-            // engine refused — the id was reserved at dispatch, and a
-            // refused begin never becomes an upload.
-            let engine_out = out.clone();
-            let gate = syncs.fetches.clone();
-            let gate_out = out.clone();
-            let uploads = syncs.uploads.clone();
-            let handle = blit_fssync::start_sync(
-                &shared,
-                sync_id,
-                opts,
-                Box::new(move |msg| {
-                    let first = msg.first().copied();
-                    // Extracted before the send consumes the message.
-                    let refused_begin = match first {
-                        Some(blit_remote::fs::S2C_FS_UPLOAD_BEGIN)
-                            if msg.get(3).copied() != Some(blit_remote::fs::FS_DONE_OK) =>
-                        {
-                            msg.get(4..6).map(|b| u16::from_le_bytes([b[0], b[1]]))
-                        }
-                        _ => None,
-                    };
-                    let sent = engine_out.send(msg).is_ok();
-                    match first {
-                        Some(blit_remote::fs::S2C_FS_FILE) => fetch_finish(&gate, &gate_out),
-                        Some(blit_remote::fs::S2C_FS_UPLOAD_BEGIN) => {
-                            if let Some(upload_id) = refused_begin {
-                                let routed = uploads.lock().unwrap().map.get(&upload_id).copied();
-                                if routed == Some(sync_id) {
-                                    uploads.lock().unwrap().map.remove(&upload_id);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    sent
-                }),
-            );
-            syncs.map.insert(
-                sync_id,
-                FsSyncEntry {
-                    handle: std::sync::Arc::new(handle),
-                },
-            );
         }
         C2S_FS_STOP if data.len() >= 3 => {
             let sync_id = u16::from_le_bytes([data[1], data[2]]);
@@ -11740,6 +14580,112 @@ async fn handle_fs_message(
     }
 }
 
+fn publish_fs_open<O: OutboxSend>(
+    syncs: &mut FsSyncs,
+    out: &O,
+    verbose: bool,
+    publication: FsOpenPublication,
+    opened: FsNativeOpen,
+) {
+    use blit_remote::fs::{FS_STATUS_OK, FS_STATUS_RESOURCE_LIMIT, msg_fs_synced};
+
+    let FsOpenPublication {
+        nonce,
+        recursive,
+        content,
+        cross_filesystem,
+        latency_ms,
+        inline_max,
+    } = publication;
+    let refuse = |status: u8, detail: &str| {
+        let _ = out.send(msg_fs_synced(
+            nonce,
+            blit_remote::fs::FS_SYNC_ID_INVALID,
+            status,
+            detail,
+        ));
+    };
+    let (root, shared) = match opened {
+        Ok(opened) => opened,
+        Err((status, detail)) => {
+            refuse(status, &detail);
+            return;
+        }
+    };
+    let Some(sync_id) = syncs.alloc_id() else {
+        refuse(FS_STATUS_RESOURCE_LIMIT, "no sync ids left");
+        return;
+    };
+    let mut opts = blit_fssync::SyncOptions {
+        recursive,
+        content,
+        cross_filesystem,
+        ..Default::default()
+    };
+    if latency_ms != 0 {
+        opts.latency = Duration::from_millis(u64::from(latency_ms).clamp(1, 1000));
+    }
+    if inline_max != 0 {
+        // Never above the protocol's decompressed cap: an inlined file rides
+        // an FS_UPDATE a client refuses past FS_MAX_DECOMPRESSED.
+        opts.inline_max = u64::from(inline_max).min(blit_remote::fs::FS_MAX_DECOMPRESSED as u64);
+    }
+    if verbose {
+        eprintln!(
+            "C2S_FS_SYNC: sync_id={sync_id} root={} recursive={recursive} content={content}",
+            root.display(),
+        );
+    }
+    // FS_SYNCED must precede the first FS_UPDATE on the wire; the outbox is
+    // FIFO, so publishing before the engine starts preserves that invariant.
+    let _ = out.send(msg_fs_synced(
+        nonce,
+        sync_id,
+        FS_STATUS_OK,
+        &blit_fssync::escape_path(&root),
+    ));
+    let engine_out = out.clone();
+    let gate = syncs.fetches.clone();
+    let gate_out = out.clone();
+    let uploads = syncs.uploads.clone();
+    let handle = blit_fssync::start_sync(
+        &shared,
+        sync_id,
+        opts,
+        Box::new(move |msg| {
+            let first = msg.first().copied();
+            let refused_begin = match first {
+                Some(blit_remote::fs::S2C_FS_UPLOAD_BEGIN)
+                    if msg.get(3).copied() != Some(blit_remote::fs::FS_DONE_OK) =>
+                {
+                    msg.get(4..6).map(|b| u16::from_le_bytes([b[0], b[1]]))
+                }
+                _ => None,
+            };
+            let sent = engine_out.send(msg).is_ok();
+            match first {
+                Some(blit_remote::fs::S2C_FS_FILE) => fetch_finish(&gate, &gate_out),
+                Some(blit_remote::fs::S2C_FS_UPLOAD_BEGIN) => {
+                    if let Some(upload_id) = refused_begin {
+                        let routed = uploads.lock().unwrap().map.get(&upload_id).copied();
+                        if routed == Some(sync_id) {
+                            uploads.lock().unwrap().map.remove(&upload_id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            sent
+        }),
+    );
+    syncs.map.insert(
+        sync_id,
+        FsSyncEntry {
+            handle: std::sync::Arc::new(handle),
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Git introspection (docs/git.md)
 //
@@ -11760,11 +14706,31 @@ struct GitRepoEntry {
 struct GitRepos {
     map: FxHashMap<u16, GitRepoEntry>,
     next_id: u16,
+    /// Admitted extension-origin opens awaiting reader-owned publication.
+    pending_opens: usize,
     /// In-flight request cancel flags by nonce (per-connection namespace).
     cancels: std::sync::Arc<std::sync::Mutex<FxHashMap<u16, blit_git::Cancel>>>,
+    /// Pending opens additionally need a wakeable pre-launch token: the Git
+    /// cancellation object is cooperative inside work but has no async wake.
+    pending_open_launches: FxHashMap<u16, extension_jobs::LaunchCancellation>,
+    /// Present only for extension-origin connections. Network request threads
+    /// retain their historical family-local limits and detach behavior.
+    jobs: Option<extension_jobs::EndpointTracker>,
+    open_completions: Option<NativeOpenSender>,
+    request_bytes: usize,
 }
 
 impl GitRepos {
+    fn with_jobs(
+        jobs: Option<extension_jobs::EndpointTracker>,
+        open_completions: Option<NativeOpenSender>,
+    ) -> Self {
+        let mut repos = Self::default();
+        repos.jobs = jobs;
+        repos.open_completions = open_completions;
+        repos
+    }
+
     fn alloc_id(&mut self) -> Option<u16> {
         for _ in 0..=u16::MAX {
             let id = self.next_id;
@@ -11828,6 +14794,9 @@ impl Drop for GitRepos {
         for cancel in self.cancels.lock().unwrap().values() {
             cancel.cancel();
         }
+        for cancellation in self.pending_open_launches.values() {
+            cancellation.cancel();
+        }
     }
 }
 
@@ -11835,10 +14804,10 @@ impl Drop for GitRepos {
 /// [`GitRepos::max_inflight`]); the nonce unregisters on completion.
 /// `refuse` builds the response for a rejected (duplicate/at-capacity)
 /// request from the status code.
-fn git_request(
+fn git_request<O: OutboxSend>(
     repos: &GitRepos,
     nonce: u16,
-    out: &mpsc::UnboundedSender<Vec<u8>>,
+    out: &O,
     refuse: impl FnOnce(u8) -> Vec<u8>,
     run: impl FnOnce(blit_git::Cancel) -> Vec<u8> + Send + 'static,
 ) {
@@ -11851,11 +14820,36 @@ fn git_request(
     };
     let cancels = repos.cancels.clone();
     let out = out.clone();
-    tokio::task::spawn_blocking(move || {
+    let work = move || {
         let msg = run(cancel);
         cancels.lock().unwrap().remove(&nonce);
         let _ = out.send(msg);
-    });
+    };
+    if let Some(jobs) = &repos.jobs {
+        let launch_cancel = repos
+            .cancels
+            .lock()
+            .unwrap()
+            .get(&nonce)
+            .expect("nonce registered above")
+            .clone();
+        let skipped_cancels = repos.cancels.clone();
+        if jobs
+            .spawn_blocking_checked(
+                repos.request_bytes,
+                move || !launch_cancel.is_cancelled(),
+                move || {
+                    skipped_cancels.lock().unwrap().remove(&nonce);
+                },
+                work,
+            )
+            .is_err()
+        {
+            repos.cancels.lock().unwrap().remove(&nonce);
+        }
+    } else {
+        tokio::task::spawn_blocking(work);
+    }
 }
 
 /// The nonce of a nonce-bearing git request (opcode then `[nonce:2]`).
@@ -11867,13 +14861,14 @@ fn git_nonce(data: &[u8]) -> Option<u16> {
 /// resolvable cwd — the pty is unknown, or its process has exited.
 const NO_SOURCE_CWD: &str = "source terminal has no working directory";
 
-async fn handle_git_message(
+async fn handle_git_message<O: OutboxSend>(
     data: &[u8],
     repos: &mut GitRepos,
-    out: &mpsc::UnboundedSender<Vec<u8>>,
+    out: &O,
     verbose: bool,
 ) {
     use blit_remote::git::*;
+    repos.request_bytes = data.len();
     match data[0] {
         C2S_GIT_OPEN => {
             let Some(open_req) = parse_git_open(data) else {
@@ -11940,15 +14935,16 @@ async fn handle_git_message(
                 );
                 return;
             }
-            if repos.map.len() >= GitRepos::max_repos() {
+            if repos.map.len().saturating_add(repos.pending_opens) >= GitRepos::max_repos() {
                 refuse(GIT_STATUS_BUDGET, "repo limit reached");
                 return;
             }
-            // Repository discovery + open touch the filesystem; run them
-            // off the runtime. The read loop awaits, so this connection's
-            // messages stay ordered (GIT_REPO before the first GIT_STATE,
-            // and no later GIT_* can observe a half-open repo).
-            let path_owned = path.to_string();
+            // Repository discovery + open touch the filesystem. Extension
+            // endpoints publish the result back onto the reader-owned
+            // completion lane, keeping ACK/CANCEL/shutdown dispatch live while
+            // native-job permits are saturated. Network endpoints retain the
+            // historical inline completion ordering.
+            let path_owned: Arc<str> = Arc::from(path);
             // A parent id makes `path` a submodule path: the server
             // resolves that submodule's own gitdir rather than making the
             // client guess where .gitmodules put its worktree.
@@ -11963,66 +14959,59 @@ async fn handle_git_message(
                     }
                 }
             };
-            let opened = tokio::task::spawn_blocking(move || match parent {
-                Some(parent) => blit_git::open_submodule(&parent, &path_owned),
-                None => blit_git::open(&path_owned),
-            })
-            .await
-            .unwrap_or_else(|_| Err((GIT_STATUS_OTHER, "open task failed".to_string())));
-            let (handle, info) = match opened {
-                Ok(opened) => opened,
-                Err((status, detail)) => {
-                    refuse(status, &detail);
+            let publication = GitOpenPublication {
+                nonce,
+                flags,
+                refs_ms,
+                status_ms,
+                path: path_owned.clone(),
+                ref_prefixes,
+            };
+            let path_for_open = path_owned.clone();
+            let open = move || match parent {
+                Some(parent) => blit_git::open_submodule(&parent, &path_for_open),
+                None => blit_git::open(&path_for_open),
+            };
+            if let Some(jobs) = &repos.jobs {
+                if let Err(status) = repos.begin(nonce) {
+                    refuse(status, "request limit reached");
                     return;
                 }
-            };
-            let Some(repo_id) = repos.alloc_id() else {
-                refuse(GIT_STATUS_BUDGET, "no repo ids left");
-                return;
-            };
-            if verbose {
-                eprintln!("C2S_GIT_OPEN: repo_id={repo_id} path={path} flags={flags:#x}");
+                let launch_cancellation = extension_jobs::LaunchCancellation::default();
+                repos
+                    .pending_open_launches
+                    .insert(nonce, launch_cancellation.clone());
+                let completions = repos
+                    .open_completions
+                    .as_ref()
+                    .expect("extension native jobs have an open-completion lane")
+                    .clone();
+                repos.pending_opens += 1;
+                if jobs
+                    .spawn_blocking_result(
+                        data.len(),
+                        launch_cancellation,
+                        move |outcome| {
+                            let _ =
+                                completions.send(NativeOpenCompletion::Git(GitOpenCompletion {
+                                    publication,
+                                    outcome,
+                                }));
+                        },
+                        open,
+                    )
+                    .is_err()
+                {
+                    repos.pending_opens -= 1;
+                    repos.cancels.lock().unwrap().remove(&nonce);
+                    repos.pending_open_launches.remove(&nonce);
+                }
+            } else {
+                let opened = tokio::task::spawn_blocking(open)
+                    .await
+                    .unwrap_or_else(|_| Err((GIT_STATUS_OTHER, "open task failed".to_string())));
+                publish_git_open(repos, out, verbose, publication, opened);
             }
-            // GIT_REPO must precede the first GIT_STATE; the outbox is
-            // FIFO, so sending before the engine spawns suffices.
-            let _ = out.send(msg_git_repo(
-                nonce,
-                repo_id,
-                GIT_STATUS_OK,
-                info.oid_format,
-                info.flags,
-                &info.workdir,
-                &info.gitdir,
-            ));
-            // STATUS and TRACKING imply WATCH; IGNORED implies UNTRACKED
-            // implies STATUS (docs/git.md).
-            let status = flags & (GIT_OPEN_STATUS | GIT_OPEN_UNTRACKED | GIT_OPEN_IGNORED) != 0;
-            let watch = flags & GIT_OPEN_WATCH != 0 || status || flags & GIT_OPEN_TRACKING != 0;
-            let state = watch.then(|| {
-                let mut opts = blit_git::StateOptions {
-                    status,
-                    untracked: flags & (GIT_OPEN_UNTRACKED | GIT_OPEN_IGNORED) != 0,
-                    ignored: flags & GIT_OPEN_IGNORED != 0,
-                    tracking: flags & GIT_OPEN_TRACKING != 0,
-                    remotes: flags & GIT_OPEN_REMOTES != 0,
-                    ref_prefixes,
-                    ..Default::default()
-                };
-                if refs_ms != 0 {
-                    opts.refs_latency = Duration::from_millis(u64::from(refs_ms).clamp(1, 1000));
-                }
-                if status_ms != 0 {
-                    opts.status_latency =
-                        Duration::from_millis(u64::from(status_ms).clamp(1, 10_000));
-                }
-                let engine_out = out.clone();
-                handle.start_state(
-                    repo_id,
-                    opts,
-                    Box::new(move |msg| engine_out.send(msg).is_ok()),
-                )
-            });
-            repos.map.insert(repo_id, GitRepoEntry { handle, state });
         }
         C2S_GIT_CLOSE => {
             let Some(repo_id) = parse_git_close(data) else {
@@ -12048,6 +15037,9 @@ async fn handle_git_message(
             };
             if let Some(cancel) = repos.cancels.lock().unwrap().get(&nonce) {
                 cancel.cancel();
+            }
+            if let Some(cancellation) = repos.pending_open_launches.get(&nonce) {
+                cancellation.cancel();
             }
         }
         C2S_GIT_LOG => {
@@ -12558,6 +15550,87 @@ async fn handle_git_message(
     }
 }
 
+fn publish_git_open<O: OutboxSend>(
+    repos: &mut GitRepos,
+    out: &O,
+    verbose: bool,
+    publication: GitOpenPublication,
+    opened: GitNativeOpen,
+) {
+    use blit_remote::git::*;
+
+    let GitOpenPublication {
+        nonce,
+        flags,
+        refs_ms,
+        status_ms,
+        path,
+        ref_prefixes,
+    } = publication;
+    let refuse = |status: u8, detail: &str| {
+        let _ = out.send(msg_git_repo(
+            nonce,
+            GIT_REPO_ID_INVALID,
+            status,
+            0,
+            0,
+            detail,
+            "",
+        ));
+    };
+    let (handle, info) = match opened {
+        Ok(opened) => opened,
+        Err((status, detail)) => {
+            refuse(status, &detail);
+            return;
+        }
+    };
+    let Some(repo_id) = repos.alloc_id() else {
+        refuse(GIT_STATUS_BUDGET, "no repo ids left");
+        return;
+    };
+    if verbose {
+        eprintln!("C2S_GIT_OPEN: repo_id={repo_id} path={path} flags={flags:#x}");
+    }
+    // GIT_REPO must precede the first GIT_STATE; the outbox is FIFO, so
+    // publishing before the engine starts preserves that ordering.
+    let _ = out.send(msg_git_repo(
+        nonce,
+        repo_id,
+        GIT_STATUS_OK,
+        info.oid_format,
+        info.flags,
+        &info.workdir,
+        &info.gitdir,
+    ));
+    let status = flags & (GIT_OPEN_STATUS | GIT_OPEN_UNTRACKED | GIT_OPEN_IGNORED) != 0;
+    let watch = flags & GIT_OPEN_WATCH != 0 || status || flags & GIT_OPEN_TRACKING != 0;
+    let state = watch.then(|| {
+        let mut opts = blit_git::StateOptions {
+            status,
+            untracked: flags & (GIT_OPEN_UNTRACKED | GIT_OPEN_IGNORED) != 0,
+            ignored: flags & GIT_OPEN_IGNORED != 0,
+            tracking: flags & GIT_OPEN_TRACKING != 0,
+            remotes: flags & GIT_OPEN_REMOTES != 0,
+            ref_prefixes,
+            ..Default::default()
+        };
+        if refs_ms != 0 {
+            opts.refs_latency = Duration::from_millis(u64::from(refs_ms).clamp(1, 1000));
+        }
+        if status_ms != 0 {
+            opts.status_latency = Duration::from_millis(u64::from(status_ms).clamp(1, 10_000));
+        }
+        let engine_out = out.clone();
+        handle.start_state(
+            repo_id,
+            opts,
+            Box::new(move |msg| engine_out.send(msg).is_ok()),
+        )
+    });
+    repos.map.insert(repo_id, GitRepoEntry { handle, state });
+}
+
 /// Per-connection language-intelligence attachments (docs/design/lsp.md).
 /// The `lsp_id`s are connection-scoped like `repo_id`s; the backends
 /// they attach to are daemon-owned and warm inside `blit-lsp`.
@@ -12565,13 +15638,27 @@ async fn handle_git_message(
 struct LspConns {
     map: FxHashMap<u16, blit_lsp::Attachment>,
     next_id: u16,
+    /// Pending extension-origin opens keyed by their registered family nonce.
+    pending_opens: FxHashMap<u16, extension_jobs::LaunchCancellation>,
     /// Query nonces in flight (per-connection namespace); a duplicate
     /// is answered `INVALID` without executing, and the size bounds
     /// pending queries per connection.
     inflight: std::sync::Arc<std::sync::Mutex<FxHashSet<u16>>>,
+    jobs: Option<extension_jobs::EndpointTracker>,
+    open_completions: Option<NativeOpenSender>,
 }
 
 impl LspConns {
+    fn with_jobs(
+        jobs: Option<extension_jobs::EndpointTracker>,
+        open_completions: Option<NativeOpenSender>,
+    ) -> Self {
+        let mut conns = Self::default();
+        conns.jobs = jobs;
+        conns.open_completions = open_completions;
+        conns
+    }
+
     fn alloc_id(&mut self) -> Option<u16> {
         for _ in 0..=u16::MAX {
             let id = self.next_id;
@@ -12605,17 +15692,25 @@ impl LspConns {
     }
 }
 
+impl Drop for LspConns {
+    fn drop(&mut self) {
+        for cancellation in self.pending_opens.values() {
+            cancellation.cancel();
+        }
+    }
+}
+
 /// The streaming sink for an attachment: every pushed message rides the
 /// connection outbox.
-fn lsp_stream_sink(out: &mpsc::UnboundedSender<Vec<u8>>) -> blit_lsp::Sink {
+fn lsp_stream_sink<O: OutboxSend>(out: &O) -> blit_lsp::Sink {
     let out = out.clone();
     std::sync::Arc::new(move |msg| out.send(msg).is_ok())
 }
 
 /// The reply sink for one query: retires the nonce from the in-flight
 /// set when its `S2C_LSP_QUERY` response passes through.
-fn lsp_query_sink(
-    out: &mpsc::UnboundedSender<Vec<u8>>,
+fn lsp_query_sink<O: OutboxSend>(
+    out: &O,
     inflight: &std::sync::Arc<std::sync::Mutex<FxHashSet<u16>>>,
     nonce: u16,
 ) -> blit_lsp::Sink {
@@ -12632,10 +15727,10 @@ fn lsp_query_sink(
     })
 }
 
-async fn handle_lsp_message(
+async fn handle_lsp_message<O: OutboxSend>(
     data: &[u8],
     conns: &mut LspConns,
-    out: &mpsc::UnboundedSender<Vec<u8>>,
+    out: &O,
     verbose: bool,
 ) {
     use blit_remote::lsp::*;
@@ -12672,47 +15767,63 @@ async fn handle_lsp_message(
                 refuse(LSP_STATUS_INVALID, "unknown flags");
                 return;
             }
-            if conns.map.len() >= LspConns::max_opens() {
+            if conns.map.len().saturating_add(conns.pending_opens.len()) >= LspConns::max_opens() {
                 refuse(LSP_STATUS_BUDGET, "attachment limit reached");
                 return;
             }
-            // Discovery walks and PATH scans (plus a possible backend
-            // spawn) are filesystem work; run them off the runtime. The
-            // read loop awaits, so this connection's messages stay
-            // ordered (LSP_OPENED before the first LSP_STATE, and no
-            // later LSP_* can observe a half-open attachment).
-            let path_owned = path.to_string();
-            let prepared = tokio::task::spawn_blocking(move || blit_lsp::prepare(&path_owned))
-                .await
-                .unwrap_or_else(|_| Err((LSP_STATUS_OTHER, "open task failed".to_string())));
-            let (prepared, root, absent) = match prepared {
-                Ok(prepared) => prepared,
-                Err((status, detail)) => {
-                    refuse(status, &detail);
-                    return;
-                }
-            };
-            let Some(lsp_id) = conns.alloc_id() else {
-                refuse(LSP_STATUS_BUDGET, "no attachment ids left");
-                return;
-            };
-            if verbose {
-                eprintln!("C2S_LSP_OPEN: lsp_id={lsp_id} path={path} flags={flags:#x}");
-            }
-            // LSP_OPENED must precede the first LSP_STATE; the outbox is
-            // FIFO, so sending before the pacer spawns suffices. On
-            // success `detail` names any matched-but-uninstalled servers
-            // (docs/design/lsp.md), so a client learns what to install.
-            let _ = out.send(msg_lsp_opened(
+            // Discovery walks and PATH scans (plus a possible backend spawn)
+            // are filesystem work. Extension endpoints publish completion
+            // back to the reader; network endpoints keep historical inline
+            // ordering.
+            let path_owned: Arc<str> = Arc::from(path);
+            let publication = LspOpenPublication {
                 nonce,
-                lsp_id,
-                LSP_STATUS_OK,
-                0,
-                &root,
-                &absent,
-            ));
-            let attachment = prepared.attach(lsp_id, flags, diag_latency_ms, lsp_stream_sink(out));
-            conns.map.insert(lsp_id, attachment);
+                flags,
+                diag_latency_ms,
+                path: path_owned.clone(),
+            };
+            let prepare = move || blit_lsp::prepare(&path_owned);
+            if let Some(jobs) = &conns.jobs {
+                {
+                    let mut inflight = conns.inflight.lock().unwrap();
+                    if inflight.len() >= LspConns::max_inflight() {
+                        refuse(LSP_STATUS_BUDGET, "request limit reached");
+                        return;
+                    }
+                    inflight.insert(nonce);
+                }
+                let cancellation = extension_jobs::LaunchCancellation::default();
+                let launch_cancellation = cancellation.clone();
+                conns.pending_opens.insert(nonce, cancellation);
+                let completions = conns
+                    .open_completions
+                    .as_ref()
+                    .expect("extension native jobs have an open-completion lane")
+                    .clone();
+                if jobs
+                    .spawn_blocking_result(
+                        data.len(),
+                        launch_cancellation,
+                        move |outcome| {
+                            let _ =
+                                completions.send(NativeOpenCompletion::Lsp(LspOpenCompletion {
+                                    publication,
+                                    outcome,
+                                }));
+                        },
+                        prepare,
+                    )
+                    .is_err()
+                {
+                    conns.pending_opens.remove(&nonce);
+                    conns.inflight.lock().unwrap().remove(&nonce);
+                }
+            } else {
+                let prepared = tokio::task::spawn_blocking(prepare)
+                    .await
+                    .unwrap_or_else(|_| Err((LSP_STATUS_OTHER, "open task failed".to_string())));
+                publish_lsp_open(conns, out, verbose, publication, prepared);
+            }
         }
         C2S_LSP_CLOSE => {
             let Some(lsp_id) = parse_lsp_close(data) else {
@@ -12774,8 +15885,13 @@ async fn handle_lsp_message(
             let Some(nonce) = parse_lsp_cancel(data) else {
                 return;
             };
-            // Advisory, by nonce alone: every attachment forwards; an
-            // unknown nonce is a no-op.
+            // A pending extension open has registered this nonce before it
+            // waits for admission, so cancellation bypasses saturation and
+            // prevents launch. Active attachment requests retain their
+            // existing advisory forwarding.
+            if let Some(cancellation) = conns.pending_opens.get(&nonce) {
+                cancellation.cancel();
+            }
             for attachment in conns.map.values() {
                 attachment.cancel(nonce);
             }
@@ -12821,6 +15937,117 @@ async fn handle_lsp_message(
     }
 }
 
+fn publish_lsp_open<O: OutboxSend>(
+    conns: &mut LspConns,
+    out: &O,
+    verbose: bool,
+    publication: LspOpenPublication,
+    prepared: LspNativeOpen,
+) {
+    use blit_remote::lsp::*;
+
+    let LspOpenPublication {
+        nonce,
+        flags,
+        diag_latency_ms,
+        path,
+    } = publication;
+    let refuse = |status: u8, detail: &str| {
+        let _ = out.send(msg_lsp_opened(nonce, LSP_ID_INVALID, status, 0, "", detail));
+    };
+    let (prepared, root, absent) = match prepared {
+        Ok(prepared) => prepared,
+        Err((status, detail)) => {
+            refuse(status, &detail);
+            return;
+        }
+    };
+    let Some(lsp_id) = conns.alloc_id() else {
+        refuse(LSP_STATUS_BUDGET, "no attachment ids left");
+        return;
+    };
+    if verbose {
+        eprintln!("C2S_LSP_OPEN: lsp_id={lsp_id} path={path} flags={flags:#x}");
+    }
+    // LSP_OPENED must precede the first LSP_STATE; the outbox is FIFO, so
+    // publishing before attach preserves that ordering.
+    let _ = out.send(msg_lsp_opened(
+        nonce,
+        lsp_id,
+        LSP_STATUS_OK,
+        0,
+        &root,
+        &absent,
+    ));
+    let attachment = prepared.attach(lsp_id, flags, diag_latency_ms, lsp_stream_sink(out));
+    conns.map.insert(lsp_id, attachment);
+}
+
+fn apply_native_open_completion<O: OutboxSend>(
+    completion: NativeOpenCompletion,
+    fs_syncs: &mut FsSyncs,
+    git_repos: &mut GitRepos,
+    lsp_conns: &mut LspConns,
+    out: &O,
+    verbose: bool,
+) {
+    match completion {
+        NativeOpenCompletion::Fs(completion) => {
+            fs_syncs.pending_opens = fs_syncs
+                .pending_opens
+                .checked_sub(1)
+                .expect("completed filesystem open remained pending");
+            let opened = match completion.outcome {
+                Ok(opened) => opened,
+                Err(extension_jobs::RunError::Panicked) => {
+                    Err((blit_remote::fs::FS_STATUS_OTHER, "open task failed".into()))
+                }
+                Err(extension_jobs::RunError::Cancelled) => return,
+            };
+            publish_fs_open(fs_syncs, out, verbose, completion.publication, opened);
+        }
+        NativeOpenCompletion::Git(completion) => {
+            git_repos.pending_opens = git_repos
+                .pending_opens
+                .checked_sub(1)
+                .expect("completed git open remained pending");
+            let nonce = completion.publication.nonce;
+            git_repos.cancels.lock().unwrap().remove(&nonce);
+            git_repos.pending_open_launches.remove(&nonce);
+            let opened = match completion.outcome {
+                Ok(opened) => opened,
+                Err(extension_jobs::RunError::Cancelled) => {
+                    Err((blit_remote::git::GIT_STATUS_CANCELLED, "cancelled".into()))
+                }
+                Err(extension_jobs::RunError::Panicked) => Err((
+                    blit_remote::git::GIT_STATUS_OTHER,
+                    "open task failed".into(),
+                )),
+            };
+            publish_git_open(git_repos, out, verbose, completion.publication, opened);
+        }
+        NativeOpenCompletion::Lsp(completion) => {
+            let nonce = completion.publication.nonce;
+            lsp_conns
+                .pending_opens
+                .remove(&nonce)
+                .expect("completed LSP open remained pending");
+            lsp_conns.inflight.lock().unwrap().remove(&nonce);
+            let prepared = match completion.outcome {
+                Ok(prepared) => prepared,
+                Err(extension_jobs::RunError::Cancelled) => {
+                    Err((blit_remote::lsp::LSP_STATUS_CANCELLED, "cancelled".into()))
+                }
+                Err(extension_jobs::RunError::Panicked) => Err((
+                    blit_remote::lsp::LSP_STATUS_OTHER,
+                    "open task failed".into(),
+                )),
+            };
+            publish_lsp_open(lsp_conns, out, verbose, completion.publication, prepared);
+        }
+    }
+}
+
 /// Refuse every nonce-bearing `LSP_*` with `PERMISSION`, the way KV and NET
 /// do when their families are off.
 ///
@@ -12830,7 +16057,7 @@ async fn handle_lsp_message(
 /// guaranteed reply per nonce never resolved. Fire-and-forget opcodes
 /// (`ACK`, `CANCEL`, `BUFFER`) have no reply to give and are dropped, which
 /// is what they get when the family is on and the id is unknown.
-fn refuse_lsp_message(data: &[u8], out: &mpsc::UnboundedSender<Vec<u8>>) {
+fn refuse_lsp_message<O: OutboxSend>(data: &[u8], out: &O) {
     use blit_remote::lsp::*;
     let nonce = data
         .get(1..3)
@@ -12869,9 +16096,274 @@ fn refuse_lsp_message(data: &[u8], out: &mpsc::UnboundedSender<Vec<u8>>) {
     }
 }
 
-async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+/// Process-family refusal for unsupported hosts and `BLIT_PROCESS=0`.
+///
+/// The feature bit is absent in both cases. A client which probes anyway still
+/// gets every correlated outcome promised by the RFC; fire-and-forget stream
+/// packets are dropped.
+fn refuse_process_message(data: &[u8], mut send: impl FnMut(Vec<u8>)) {
+    use blit_remote::process::*;
+
+    let nonce = data
+        .get(1..3)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .unwrap_or(0);
+    let process_id = data
+        .get(3..7)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .unwrap_or(0);
+    const DETAIL: &str = "process execution disabled";
+
+    match data[0] {
+        C2S_PROCESS_SPAWN => {
+            let status = parse_process_spawn(data)
+                .map(|_| blit_remote::STATUS_PERMISSION)
+                .unwrap_or_else(ProcessCodecError::status);
+            if let Ok(reply) = msg_process_started(ProcessStarted {
+                nonce,
+                status,
+                process_id,
+                process_ref: 0,
+                stdin_window: 0,
+                stdout_window: 0,
+                stderr_window: 0,
+                detail: DETAIL,
+            }) {
+                send(reply);
+            }
+        }
+        C2S_PROCESS_CONTROL => {
+            let status = parse_process_control(data)
+                .map(|_| blit_remote::STATUS_PERMISSION)
+                .unwrap_or_else(ProcessCodecError::status);
+            send(msg_process_controlled(ProcessControlled {
+                nonce,
+                status,
+                process_id,
+                detail: DETAIL,
+            }));
+        }
+        C2S_PROCESS_LIST => {
+            let status = parse_process_list(data)
+                .map(|_| blit_remote::STATUS_PERMISSION)
+                .unwrap_or_else(ProcessCodecError::status);
+            if let Ok(reply) = msg_process_listed(ProcessListed {
+                nonce,
+                status,
+                revision: 0,
+                entries: Vec::new(),
+                detail: DETAIL,
+            }) {
+                send(reply);
+            }
+        }
+        C2S_PROCESS_WATCH => {
+            let process_ref = data
+                .get(7..15)
+                .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+                .unwrap_or(0);
+            let status = parse_process_watch(data)
+                .map(|_| blit_remote::STATUS_PERMISSION)
+                .unwrap_or_else(ProcessCodecError::status);
+            if let Ok(reply) = msg_process_watched(ProcessWatched {
+                nonce,
+                status,
+                process_id,
+                process_ref,
+                state: 0,
+                stream_state: 0,
+                stdin_received: 0,
+                stdin_acked: 0,
+                stdout_next: 0,
+                stderr_next: 0,
+                stdin_window: 0,
+                stdout_window: 0,
+                stderr_window: 0,
+                exit_reason: 0,
+                kill_cause: 0,
+                exit_code: 0,
+                detail: DETAIL,
+            }) {
+                send(reply);
+            }
+        }
+        // PROCESS_STDIN and PROCESS_OUTPUT_ACK are fire-and-forget.
+        _ => {}
+    }
+}
+
+/// Collect one connection's auxiliary subscriptions, labelled by family.
+///
+/// Takes id iterators rather than the tables themselves so the family labelling
+/// and ordering — the only real logic here — can be tested without standing up
+/// a git repo, an LSP process or a KV store.
+fn fill_client_aux_subscriptions(
+    subscriptions: &mut Vec<blit_remote::ClientAuxSubscription>,
+    fs_ids: impl Iterator<Item = u16>,
+    git_ids: impl Iterator<Item = u16>,
+    lsp_ids: impl Iterator<Item = u16>,
+    kv_ids: impl Iterator<Item = u16>,
+    net_ids: impl Iterator<Item = u16>,
+) {
+    use blit_remote::{
+        CLIENT_SUBSCRIPTION_FS, CLIENT_SUBSCRIPTION_GIT, CLIENT_SUBSCRIPTION_KV,
+        CLIENT_SUBSCRIPTION_LSP, CLIENT_SUBSCRIPTION_NET,
+    };
+    subscriptions.clear();
+    subscriptions.extend(fs_ids.map(|id| blit_remote::ClientAuxSubscription {
+        kind: CLIENT_SUBSCRIPTION_FS,
+        id,
+    }));
+    subscriptions.extend(git_ids.map(|id| blit_remote::ClientAuxSubscription {
+        kind: CLIENT_SUBSCRIPTION_GIT,
+        id,
+    }));
+    subscriptions.extend(lsp_ids.map(|id| blit_remote::ClientAuxSubscription {
+        kind: CLIENT_SUBSCRIPTION_LSP,
+        id,
+    }));
+    subscriptions.extend(kv_ids.map(|id| blit_remote::ClientAuxSubscription {
+        kind: CLIENT_SUBSCRIPTION_KV,
+        id,
+    }));
+    subscriptions.extend(net_ids.map(|id| blit_remote::ClientAuxSubscription {
+        kind: CLIENT_SUBSCRIPTION_NET,
+        id,
+    }));
+    subscriptions.sort_unstable_by_key(|subscription| (subscription.kind, subscription.id));
+}
+
+/// How long a disconnecting connection waits for the writer to confirm a
+/// terminal notice reached the stream before giving up on it.
+const TERMINAL_NOTICE_TIMEOUT: Duration = Duration::from_secs(2);
+
+type TerminalNoticeSender = mpsc::UnboundedSender<(Vec<u8>, oneshot::Sender<()>)>;
+
+/// Hand a terminal notice (`S2C_KICKED` or shutdown `S2C_QUIT`) to the writer
+/// task and wait for it to confirm the bytes reached the stream.
+///
+/// Returns whether it was confirmed. The wait is bounded because a peer whose
+/// socket is already wedged can never acknowledge, and the caller cancels and
+/// joins the writer immediately afterwards — without the acknowledgement that
+/// cancellation would race the write and the kicked client would lose the
+/// reason.
+async fn deliver_terminal_notice(
+    terminal_tx: &TerminalNoticeSender,
+    notice: Vec<u8>,
+    timeout: Duration,
+) -> bool {
+    let (sent_tx, sent_rx) = oneshot::channel();
+    if terminal_tx.send((notice, sent_tx)).is_err() {
+        return false;
+    }
+    tokio::time::timeout(timeout, sent_rx).await.is_ok()
+}
+
+/// Connection-local mirror of this client's auxiliary subscription tables.
+///
+/// `sync` runs after *every* filesystem, git, LSP, KV and network message, so
+/// the unchanged case has to be cheap. Comparing against a connection-local
+/// copy keeps the session lock — the same one the delivery tick and compositor
+/// paths hold — out of those streams entirely, and the two buffers retain
+/// their capacity so a steady state allocates nothing.
+#[derive(Default)]
+struct AuxSubscriptionMirror {
+    known: Vec<blit_remote::ClientAuxSubscription>,
+    scratch: Vec<blit_remote::ClientAuxSubscription>,
+}
+
+impl AuxSubscriptionMirror {
+    /// Rebuild from the live tables and adopt the result, reporting whether
+    /// anything actually changed. Split out from `sync` so the decision that
+    /// keeps the session lock off the hot path is testable on its own.
+    fn adopt_if_changed(
+        &mut self,
+        fs_syncs: &FsSyncs,
+        git_repos: &GitRepos,
+        lsp_conns: &LspConns,
+        kv_subs: &kv::KvSubs,
+        net_sockets: &net::NetSockets,
+    ) -> bool {
+        fill_client_aux_subscriptions(
+            &mut self.scratch,
+            fs_syncs.map.keys().copied(),
+            git_repos.map.keys().copied(),
+            lsp_conns.map.keys().copied(),
+            kv_subs.ids(),
+            net_sockets.ids(),
+        );
+        if self.known == self.scratch {
+            return false;
+        }
+        std::mem::swap(&mut self.known, &mut self.scratch);
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn sync(
+        &mut self,
+        state: &AppState,
+        client_id: u64,
+        fs_syncs: &FsSyncs,
+        git_repos: &GitRepos,
+        lsp_conns: &LspConns,
+        kv_subs: &kv::KvSubs,
+        net_sockets: &net::NetSockets,
+    ) {
+        if !self.adopt_if_changed(fs_syncs, git_repos, lsp_conns, kv_subs, net_sockets) {
+            return;
+        }
+        let mut sess = state.session.lock().await;
+        let Some(client) = sess.clients.get_mut(&client_id) else {
+            return;
+        };
+        client.aux_subscriptions = self.known.clone();
+        sess.publish_client_catalogs();
+    }
+}
+
+pub(crate) fn spawn_network_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     state: AppState,
+) -> bool {
+    let options = ConnectionOptions::network();
+    let Some(registration) = state.connections.register(options.cancellation.clone()) else {
+        return false;
+    };
+    let max = state.config.max_connections;
+    let admitted = state
+        .active_connections
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (max == 0 || current < max).then_some(current + 1)
+        })
+        .is_ok();
+    if !admitted {
+        eprintln!("max connections ({max}) reached, rejecting");
+        return false;
+    }
+    tokio::spawn(async move {
+        handle_client_registered(stream, state.clone(), options, registration).await;
+        state.active_connections.fetch_sub(1, Ordering::AcqRel);
+    });
+    true
+}
+
+async fn handle_client_with_options<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
+    state: AppState,
+    options: ConnectionOptions,
+) {
+    let Some(registration) = state.connections.register(options.cancellation.clone()) else {
+        return;
+    };
+    handle_client_registered(stream, state, options, registration).await;
+}
+
+async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
+    state: AppState,
+    mut options: ConnectionOptions,
+    _connection_registration: ConnectionRegistration,
 ) {
     let config = &state.config;
     let notify_for_compositor = {
@@ -12879,15 +16371,72 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         Arc::new(move || n.notify_one()) as Arc<dyn Fn() + Send + Sync>
     };
     let (mut reader, mut writer) = tokio::io::split(stream);
+    let extension_origin = matches!(&options.origin, ConnectionOrigin::Extension { .. });
+    let extension_jobs =
+        extension_origin.then(|| state.extension_jobs.endpoint(options.cancellation.clone()));
+    let (native_open_tx, mut native_open_rx) = mpsc::unbounded_channel();
+    let native_open_tx = extension_origin.then_some(native_open_tx);
+    let (extension_bootstrap_tx, sender_bootstrap_rx) = if extension_origin {
+        let (tx, rx) = oneshot::channel::<ExtensionBootstrap>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
 
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (raw_out_tx, mut out_rx) = mpsc::unbounded_channel::<OutboxPacket>();
+    let (raw_channel_tx, mut channel_rx) = mpsc::unbounded_channel::<channel::Delivery>();
+    let outbox_frame_counter = Arc::new(AtomicUsize::new(0));
+    let outbox_byte_counter = Arc::new(AtomicUsize::new(0));
+    let extension_outbox_config = extension_outbox_config();
+    let extension_limit = extension_origin.then(|| {
+        Arc::new(ExtensionOutboxLimit::new(
+            options.cancellation.clone(),
+            extension_outbox_config,
+        ))
+    });
+    let outbox_tracking = Arc::new(OutboxTracking {
+        queued_frames: outbox_frame_counter.clone(),
+        queued_bytes: outbox_byte_counter.clone(),
+        extension_limit,
+        drain_notify: std::sync::Mutex::new(None),
+    });
+    let out_tx = TrackedOutboxSender::ordered(raw_out_tx, outbox_tracking.clone());
+    let extension_out = out_tx.clone();
+    let channel_tx = TrackedChannelSender {
+        tx: raw_channel_tx,
+        tracking: outbox_tracking.clone(),
+    };
+    let (kick_tx, mut kick_rx) = mpsc::unbounded_channel::<String>();
+    #[cfg(any(unix, windows))]
+    let (process_out_tx, mut process_out_rx) = {
+        let (max_frames, max_bytes) = state.process_server.outbox_limits();
+        let (tx, rx) = mpsc::channel(max_frames);
+        (
+            process::OutboundSender::new(tx, max_bytes, kick_tx.clone()),
+            rx,
+        )
+    };
+    #[cfg(not(any(unix, windows)))]
+    let (_process_out_tx, mut process_out_rx) = mpsc::unbounded_channel::<()>();
+    // Terminal connection-control notices bypass the ordinary visual outbox.
+    // A kick must not sit behind *queued* video frames — it can still wait on
+    // one already being written, which is part of what the read task's
+    // shutdown timeout absorbs — and the acknowledgement lets the read task
+    // keep the socket alive until S2C_KICKED is written.
+    let (terminal_tx, mut terminal_rx) =
+        mpsc::unbounded_channel::<(Vec<u8>, oneshot::Sender<()>)>();
     // Filesystem syncs are connection-scoped; engines write into the same
     // outbox as everything else and die with this map on disconnect.
     let fs_out = out_tx.clone();
+    #[cfg(any(unix, windows))]
+    let processes = state.process_server.endpoint(process_out_tx);
+    #[cfg(any(unix, windows))]
+    let process_enabled = state.process_server.enabled();
     let mut fs_syncs = FsSyncs::default();
-    let mut git_repos = GitRepos::default();
-    let mut lsp_conns = LspConns::default();
+    let mut git_repos = GitRepos::with_jobs(extension_jobs.clone(), native_open_tx.clone());
+    let mut lsp_conns = LspConns::with_jobs(extension_jobs.clone(), native_open_tx.clone());
     let mut kv_subs = kv::KvSubs::default();
+    let mut aux_mirror = AuxSubscriptionMirror::default();
     // BLIT_NET=0 turns the relay off: the bit is unadvertised AND every
     // NET_OPEN is refused with PERMISSION, so a client that ignores
     // feature bits still gets its one reply.
@@ -12908,7 +16457,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // separate bit to withhold.
     let fs_write_enabled = !std::env::var("BLIT_FS_WRITE").is_ok_and(|v| v == "0");
     #[cfg(target_os = "linux")]
-    let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (raw_audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    #[cfg(target_os = "linux")]
+    let audio_tx = TrackedAudioSender {
+        tx: raw_audio_tx,
+        tracking: extension_origin.then(|| outbox_tracking.clone()),
+    };
+    #[cfg(target_os = "linux")]
+    let sender_audio_tracking = audio_tx.tracking.clone();
     // On non-Linux, keep the audio sender alive for the lifetime of the
     // outer function so audio_rx.recv() never resolves to None — the
     // biased select below would otherwise hit the audio branch first and
@@ -12916,35 +16472,98 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // are written.
     #[cfg(not(target_os = "linux"))]
     let (_audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let outbox_frame_counter = Arc::new(AtomicUsize::new(0));
-    let outbox_byte_counter = Arc::new(AtomicUsize::new(0));
+    #[cfg(not(target_os = "linux"))]
+    let sender_audio_tracking: Option<Arc<OutboxTracking>> = None;
     let write_blocked_counter = Arc::new(AtomicU64::new(0));
+    let outbound_byte_counter = Arc::new(AtomicU64::new(0));
     // Relayed sockets are connection-scoped: they die with this table on
     // disconnect, which is what releases forwarded sockets on a dropped
     // client rather than leaking them. Datagrams read the outbox depth to
     // decide whether to drop rather than pile on (docs/design/net.md).
     let mut net_sockets =
-        net::NetSockets::with_outbox(outbox_frame_counter.clone(), outbox_byte_counter.clone());
-    let sender_outbox_queued_frames = outbox_frame_counter.clone();
-    let sender_outbox_queued_bytes = outbox_byte_counter.clone();
+        net::NetSockets::with_outbox_and_jobs(outbox_byte_counter.clone(), extension_jobs.clone());
+    let sender_outbox_tracking = outbox_tracking.clone();
     let sender_write_blocked_us = write_blocked_counter.clone();
+    let sender_outbound_bytes = outbound_byte_counter.clone();
+    let sender_cancellation = options.cancellation.clone();
+    let write_cancellation = sender_cancellation.clone();
+    let sender_profile = options.profile;
+    let sender_no_progress_timeout =
+        extension_origin.then_some(extension_outbox_config.no_progress_timeout);
     let sender = tokio::spawn(async move {
-        let audio_debug = std::env::var_os("BLIT_AUDIO_DEBUG").is_some();
-        let mut audio_window_start = Instant::now();
-        let mut last_audio_pick_at = Instant::now();
-        let mut audio_sends_in_window: u32 = 0;
-        let mut max_audio_pick_gap: u32 = 0;
-        let mut max_audio_write_ms: u32 = 0;
-        let mut bulk_fragmentation = BulkFragmentation::default();
-        loop {
+        tokio::select! {
+            biased;
+            _ = sender_cancellation.cancelled() => {}
+            _ = async {
+                let audio_debug = std::env::var_os("BLIT_AUDIO_DEBUG").is_some();
+                let mut audio_window_start = Instant::now();
+                let mut last_audio_pick_at = Instant::now();
+                let mut audio_sends_in_window: u32 = 0;
+                let mut max_audio_pick_gap: u32 = 0;
+                let mut max_audio_write_ms: u32 = 0;
+                let mut bulk_fragmentation = BulkFragmentation::default();
+                let mut prefer_process = true;
+                let mut channel_open = true;
+                if let Some(bootstrap_rx) = sender_bootstrap_rx {
+                    let Ok(bootstrap) = bootstrap_rx.await else {
+                        return;
+                    };
+                    if !write_extension_bootstrap(
+                        &mut writer,
+                        bootstrap,
+                        &sender_outbox_tracking,
+                        sender_profile.write_policy(None),
+                        &sender_outbound_bytes,
+                        sender_no_progress_timeout,
+                        &write_cancellation,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                }
+                loop {
+            // A terminal control notice (currently S2C_KICKED) is both tiny
+            // and connection-ending. Write it ahead of queued visual/audio
+            // traffic and acknowledge only after it reaches the stream.
+            while let Ok((notice, sent)) = terminal_rx.try_recv() {
+                let result = write_frame_counted_with_timeout(
+                    &mut writer,
+                    &notice,
+                    &sender_outbound_bytes,
+                    sender_no_progress_timeout,
+                )
+                .await;
+                if let Err(error) = result {
+                    if error == FrameWriteError::NoProgress {
+                        write_cancellation.cancel_slow_consumer();
+                    }
+                    return;
+                }
+                let _ = sent.send(());
+            }
             // Drain all pending audio before waiting for the next message.
             // Audio frames are tiny (~160 B) so this is near-instant.
-            let stale = drop_stale_audio(&mut audio_rx);
+            let stale = drop_stale_audio_tracked(&mut audio_rx, sender_audio_tracking.as_ref());
             if stale > 0 && audio_debug {
                 eprintln!("[audio] writer dropped {stale} stale queued frame(s)");
             }
             while let Ok(audio_msg) = audio_rx.try_recv() {
-                if !write_frame(&mut writer, &audio_msg).await {
+                let _charge = sender_audio_tracking.as_ref().map(|tracking| OutboxWriteCharge {
+                    tracking: tracking.clone(),
+                    bytes: audio_msg.len(),
+                });
+                let result = write_frame_counted_with_timeout(
+                    &mut writer,
+                    &audio_msg,
+                    &sender_outbound_bytes,
+                    sender_no_progress_timeout,
+                )
+                .await;
+                if let Err(error) = result {
+                    if error == FrameWriteError::NoProgress {
+                        write_cancellation.cancel_slow_consumer();
+                    }
                     return;
                 }
                 if audio_debug {
@@ -12963,12 +16582,48 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             // before the next bulk message.
             let msg = tokio::select! {
                 biased;
+                notice = terminal_rx.recv() => {
+                    match notice {
+                        Some((notice, sent)) => {
+                            let result = write_frame_counted_with_timeout(
+                                &mut writer,
+                                &notice,
+                                &sender_outbound_bytes,
+                                sender_no_progress_timeout,
+                            )
+                            .await;
+                            if let Err(error) = result {
+                                if error == FrameWriteError::NoProgress {
+                                    write_cancellation.cancel_slow_consumer();
+                                }
+                                break;
+                            }
+                            let _ = sent.send(());
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
                 msg = audio_rx.recv() => {
                     // Pure audio message — write it directly (tiny).
                     match msg {
                         Some(m) => {
+                            let _charge = sender_audio_tracking.as_ref().map(|tracking| OutboxWriteCharge {
+                                tracking: tracking.clone(),
+                                bytes: m.len(),
+                            });
                             let audio_write_start = Instant::now();
-                            if !write_frame(&mut writer, &m).await {
+                            let result = write_frame_counted_with_timeout(
+                                &mut writer,
+                                &m,
+                                &sender_outbound_bytes,
+                                sender_no_progress_timeout,
+                            )
+                            .await;
+                            if let Err(error) = result {
+                                if error == FrameWriteError::NoProgress {
+                                    write_cancellation.cancel_slow_consumer();
+                                }
                                 break;
                             }
                             if audio_debug {
@@ -13006,22 +16661,63 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         None => break,
                     }
                 }
-                msg = out_rx.recv() => msg,
+                msg = async {
+                    loop {
+                        tokio::select! {
+                            msg = next_connection_bulk(
+                                &mut process_out_rx,
+                                &mut out_rx,
+                                prefer_process,
+                            ) => break msg.map(QueuedMessage::Bulk),
+                            delivery = channel_rx.recv(), if channel_open => {
+                                match delivery {
+                                    Some(delivery) => break Some(QueuedMessage::Channel(delivery)),
+                                    None => channel_open = false,
+                                }
+                            }
+                        }
+                    }
+                } => msg,
             };
 
-            // Non-audio message: may be large (video keyframe, terminal
-            // snapshot).  Use interleaved write so audio frames that arrive
-            // while the kernel TCP buffer drains are written between write
-            // syscalls rather than piling up and being dropped.
+            // Any non-audio message may be large. Server-generated process
+            // output is capped at 32 KiB per fair writer turn, and adaptive
+            // fragmentation also lets audio interleave once congestion is
+            // observed.
             match msg {
                 Some(m) => {
-                    let bytes = m.len();
+                    let packet = m.packet();
+                    let bytes = packet.len();
+                    let ordinary = matches!(
+                        &m,
+                        QueuedMessage::Bulk(ConnectionBulk::Ordinary(_))
+                    );
+                    if matches!(&m, QueuedMessage::Bulk(_)) {
+                        // Alternate only after process/ordinary traffic;
+                        // channel deliveries preserve the prior preference.
+                        prefer_process = ordinary;
+                    }
+                    // Channel deliveries carry their reservation guard from
+                    // admission through this write; ordinary messages acquire
+                    // the equivalent writer-owned guard here.
+                    let _ordinary_charge = match &m {
+                        QueuedMessage::Bulk(ConnectionBulk::Ordinary(_)) => Some(OutboxWriteCharge {
+                            tracking: sender_outbox_tracking.clone(),
+                            bytes,
+                        }),
+                        #[cfg(any(unix, windows))]
+                        QueuedMessage::Bulk(ConnectionBulk::Process(_)) => None,
+                        QueuedMessage::Channel(_) => None,
+                    };
                     let write_start = Instant::now();
                     let wrote = write_frame_interleaved(
                         &mut writer,
-                        &m,
+                        packet,
                         &mut audio_rx,
-                        bulk_fragmentation.chunk_bytes(),
+                        sender_profile.write_policy(bulk_fragmentation.chunk_bytes()),
+                        &sender_outbound_bytes,
+                        sender_no_progress_timeout,
+                        sender_audio_tracking.as_ref(),
                     )
                     .await;
                     let write_elapsed = write_start.elapsed();
@@ -13036,27 +16732,54 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     // Opus frame cadence) show up in the log.
                     if write_elapsed.as_millis() > 30 {
                         eprintln!(
-                            "[sender] slow write: bytes={bytes} elapsed={}ms wrote={wrote}",
+                            "[sender] slow write: bytes={bytes} elapsed={}ms wrote={}",
                             write_elapsed.as_millis(),
+                            wrote.is_ok(),
                         );
                     }
-                    mark_outbox_drained(
-                        &sender_outbox_queued_frames,
-                        &sender_outbox_queued_bytes,
-                        bytes,
-                    );
-                    if !wrote {
+                    if let Err(error) = wrote {
+                        if error == FrameWriteError::NoProgress {
+                            write_cancellation.cancel_slow_consumer();
+                        }
                         break;
                     }
                 }
                 None => break,
             }
+                }
+            } => {}
         }
+        // Stop admission before dropping the receiver and release every
+        // reservation still represented by a queued packet. A charge for an
+        // in-flight packet is RAII-owned above and is released if cancellation
+        // interrupts its write future.
+        sender_outbox_tracking.close();
+        // Close each raw receiver before draining it. A producer which won a
+        // reservation just before `close()` can otherwise enqueue after the
+        // final `try_recv`, leaking that reservation when the receiver drops.
+        out_rx.close();
+        channel_rx.close();
+        audio_rx.close();
+        while let Ok(packet) = out_rx.try_recv() {
+            sender_outbox_tracking.release(packet.len());
+        }
+        while let Ok(delivery) = channel_rx.try_recv() {
+            drop(delivery);
+        }
+        while let Ok(packet) = audio_rx.try_recv() {
+            if let Some(tracking) = &sender_audio_tracking {
+                tracking.release(packet.len());
+            }
+        }
+        // A failed/closed writer is also a connection exit. Wake the reader
+        // so it cannot retain connection-scoped state behind a half-open peer.
+        sender_cancellation.cancel();
     });
-    let client_id;
-
-    {
+    let client_id = 'session_setup: {
         let mut sess = state.session.lock().await;
+        if state.connections.is_shutting_down() {
+            break 'session_setup None;
+        }
         // Preflight the catalog before this connection exists.  Every create
         // path refuses a terminal that would push `S2C_LIST` past the ceiling,
         // so this is unreachable — and load-bearing the day one of them stops:
@@ -13068,18 +16791,30 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             eprintln!(
                 "blit-server: refusing a connection, S2C_LIST is {catalog_bytes} bytes, over the {MAX_LIST_BYTES}-byte ceiling"
             );
-            return;
+            break 'session_setup None;
         }
-        client_id = sess.next_client_id;
+        let client_id = sess.next_client_id;
         sess.next_client_id += 1;
+        sess.channels
+            .register_endpoint(client_id, options.origin.channel_peer_name(client_id));
         sess.clients.insert(
             client_id,
             ClientState {
                 tx: out_tx,
+                channel_tx,
+                kick_tx,
+                terminal_tx: terminal_tx.clone(),
                 outbox_queued_frames: outbox_frame_counter,
                 outbox_queued_bytes: outbox_byte_counter,
                 write_blocked_us: write_blocked_counter,
                 write_blocked_us_seen: 0,
+                outbound_bytes: outbound_byte_counter,
+                outbound_bytes_seen: 0,
+                outbound_sampled_at: Instant::now(),
+                outbound_bytes_per_sec: 0,
+                client_catalog_watches: FxHashMap::default(),
+                connected_at: Instant::now(),
+                aux_subscriptions: Vec::new(),
                 #[cfg(target_os = "linux")]
                 audio_tx,
                 lead: None,
@@ -13087,6 +16822,20 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 surface_subscriptions: FxHashSet::default(),
                 #[cfg(target_os = "linux")]
                 audio_subscribed: false,
+                #[cfg(target_os = "linux")]
+                desktop_subscriptions: 0,
+                #[cfg(target_os = "linux")]
+                mpris_subscribed: false,
+                #[cfg(target_os = "linux")]
+                last_mpris_snapshot: None,
+                #[cfg(target_os = "linux")]
+                mpris_action_tokens: 20.0,
+                #[cfg(target_os = "linux")]
+                mpris_action_refilled_at: Instant::now(),
+                #[cfg(target_os = "linux")]
+                last_media_capabilities: None,
+                #[cfg(target_os = "linux")]
+                media_capabilities: MediaCapabilities::default(),
                 #[cfg(target_os = "linux")]
                 audio_bitrate_kbps: 0,
                 view_sizes: FxHashMap::default(),
@@ -13152,54 +16901,103 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 drag_staging_dir: None,
             },
         );
+        sess.publish_client_catalogs();
         // Wake the tick loop so the new client gets its first frame.
         state.delivery_notify.notify_one();
-        if let Some(c) = sess.clients.get(&client_id) {
-            let features = FEATURE_CREATE_NONCE
-                | FEATURE_RESTART
-                | FEATURE_RESIZE_BATCH
-                | FEATURE_COPY_RANGE
-                | FEATURE_CREATE_STATUS
-                | FEATURE_KILL_MODE
-                | FEATURE_PTY_DEADLINE
-                | FEATURE_SCROLL_BY
-                | blit_remote::fs::FEATURE_FS
-                | blit_remote::git::FEATURE_GIT;
-            #[cfg(target_os = "linux")]
-            let features =
-                features | FEATURE_COMPOSITOR | FEATURE_SURFACE_TOUCH | FEATURE_SURFACE_TEXT_INPUT;
-            // BLIT_LSP=0 disables the family: the bit is simply not
-            // advertised, matching the dispatch gate.
-            let mut features = features;
-            if lsp_enabled {
-                features |= blit_remote::lsp::FEATURE_LSP;
-            }
-            if kv_enabled {
-                features |= blit_remote::kv::FEATURE_KV;
-            }
-            if net_enabled {
-                features |= blit_remote::net::FEATURE_NET;
-            }
-            #[cfg(target_os = "linux")]
-            {
-                let audio_disabled = std::env::var("BLIT_AUDIO")
-                    .map(|v| v == "0")
-                    .unwrap_or(false);
-                if !audio_disabled && audio::pipewire_available() {
-                    features |= FEATURE_AUDIO;
-                }
-            }
-            let _ = send_outbox(
-                c,
-                msg_hello(
-                    1,
-                    features,
-                    state.boot_generation,
-                    env!("CARGO_PKG_VERSION"),
-                ),
-            );
+        let mut initial_msgs = Vec::with_capacity(3 + sess.ptys.len() * 2);
+        let features = FEATURE_CREATE_NONCE
+            | FEATURE_RESTART
+            | FEATURE_RESIZE_BATCH
+            | FEATURE_COPY_RANGE
+            | FEATURE_CREATE_STATUS
+            | FEATURE_KILL_MODE
+            | FEATURE_PTY_DEADLINE
+            | FEATURE_SCROLL_BY
+            | FEATURE_CLIENT_CONTROL
+            | blit_remote::fs::FEATURE_FS
+            | blit_remote::git::FEATURE_GIT;
+        #[cfg(target_os = "linux")]
+        let features =
+            features | FEATURE_COMPOSITOR | FEATURE_SURFACE_TOUCH | FEATURE_SURFACE_TEXT_INPUT;
+        // BLIT_LSP=0 disables the family: the bit is simply not
+        // advertised, matching the dispatch gate.
+        let mut features = features;
+        if lsp_enabled {
+            features |= blit_remote::lsp::FEATURE_LSP;
         }
-        let mut initial_msgs = Vec::with_capacity(2 + sess.ptys.len() * 2);
+        if kv_enabled {
+            features |= blit_remote::kv::FEATURE_KV;
+        }
+        if net_enabled {
+            features |= blit_remote::net::FEATURE_NET;
+        }
+        #[cfg(any(unix, windows))]
+        if process_enabled {
+            features |= blit_remote::process::FEATURE_PROCESS;
+        }
+        if sess.channels.advertised() {
+            features |= blit_remote::channel::FEATURE_CHANNEL;
+        }
+        if state.extensions.advertised() {
+            features |= blit_remote::extension::FEATURE_EXTENSION;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let audio_disabled = std::env::var("BLIT_AUDIO")
+                .map(|v| v == "0")
+                .unwrap_or(false);
+            if !audio_disabled && audio::pipewire_available() {
+                features |= FEATURE_AUDIO;
+            }
+            if sess
+                .compositor
+                .as_ref()
+                .and_then(|cs| cs.desktop_bus.as_ref())
+                .is_some_and(desktop_bus::DesktopBus::services_live)
+            {
+                features |= FEATURE_DESKTOP;
+            }
+            if sess
+                .compositor
+                .as_ref()
+                .map(SharedCompositor::media_state)
+                .is_some_and(|media_state| media_state.runtime_flags != 0)
+            {
+                features |= FEATURE_DESKTOP_MEDIA;
+            }
+        }
+        let hello = msg_hello(
+            1,
+            features,
+            state.boot_generation,
+            env!("CARGO_PKG_VERSION"),
+        );
+        if extension_origin {
+            initial_msgs.push(hello);
+        } else if let Some(client) = sess.clients.get(&client_id) {
+            let _ = send_outbox(client, hello);
+        }
+        // Media capabilities and runtime state follow HELLO on the same
+        // endpoint, so a client learns the server-side camera format mask
+        // before it advertises or starts one.
+        #[cfg(target_os = "linux")]
+        if features & FEATURE_DESKTOP_MEDIA != 0
+            && let Some(media_state) = sess.compositor.as_ref().map(SharedCompositor::media_state)
+        {
+            let capabilities = msg_server_control(&ServerControl::ServerCapabilities(
+                ServerMediaCapabilities {
+                    video_codecs: media_input::camera_codec_mask(),
+                },
+            ));
+            let state_msg = msg_server_control(&ServerControl::State(media_state));
+            if extension_origin {
+                initial_msgs.push(capabilities);
+                initial_msgs.push(state_msg);
+            } else if let Some(client) = sess.clients.get(&client_id) {
+                let _ = send_outbox(client, capabilities);
+                let _ = send_outbox(client, state_msg);
+            }
+        }
         // Send surface-created messages BEFORE the PTY list so that
         // the client's surface store is populated before `ready` is
         // set — otherwise the BSP reconciliation runs with an empty
@@ -13300,35 +17098,56 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 ));
             }
         }
-        initial_msgs.push(vec![S2C_READY]);
-        // Enqueue while still holding the session lock.  The client is
-        // already in `sess.clients`, so `send_to_all` reaches it, and the
-        // connect path above has already woken `tick` — which is parked on
-        // this very mutex.  Releasing first therefore hands `tick` the lock
-        // and lets it broadcast into this client's outbox *ahead* of the
-        // replay it has not received yet: a live S2C_SURFACE_RESIZED lands
-        // before the replayed S2C_SURFACE_CREATED, and a resize for a
-        // surface the client has never seen is dropped on the floor.  The
-        // compositor only emits SurfaceResized when the size actually
-        // changes and nothing re-announces it, so that client stays wrong
-        // about the surface's dimensions — which is also the denominator
-        // its pointer coordinates are scaled by — until it reconnects.
-        // Holding the lock across this cannot block: `send_outbox` only
-        // pushes onto an unbounded channel.
-        if let Some(client) = sess.clients.get(&client_id) {
+        options.origin.append_ready(&mut initial_msgs);
+        // Commit the complete snapshot while its session lock is still held,
+        // but never await that lock. Extension writers own a priority lane
+        // which drains this batch one hard-accounted message at a time before
+        // polling ordinary/channel/audio traffic. Any live send after this
+        // synchronous handoff is therefore ordered after snapshot/READY/INIT.
+        // Network clients keep their existing synchronous outbox enqueue.
+        if extension_origin {
+            let bootstrap = ExtensionBootstrap {
+                messages: initial_msgs,
+                init: options
+                    .extension_init
+                    .take()
+                    .expect("extension connections own one serialized INIT"),
+                barrier: options.bootstrap_barrier.take(),
+            };
+            if extension_bootstrap_tx
+                .expect("extension connections have a bootstrap lane")
+                .send(bootstrap)
+                .is_err()
+            {
+                options.cancellation.cancel();
+            }
+        } else if let Some(initial_outbox) =
+            sess.clients.get(&client_id).map(|client| client.tx.clone())
+        {
             for msg in initial_msgs {
-                if send_outbox(client, msg).is_err() {
+                if initial_outbox.send(msg).is_err() {
                     break;
                 }
             }
         }
-        drop(sess);
-    }
+        Some(client_id)
+    };
+    let Some(client_id) = client_id else {
+        options.cancellation.cancel();
+        let _ = sender.await;
+        return;
+    };
+
+    state
+        .extensions
+        .register_endpoint(state.clone(), client_id, extension_out)
+        .await;
 
     if state.config.verbose {
-        eprintln!("client connected");
+        eprintln!("{} connected", options.origin.label());
     }
 
+    let mut kicked_reason: Option<String> = None;
     loop {
         let has_surface_subscriptions = {
             let sess = state.session.lock().await;
@@ -13336,11 +17155,50 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 .get(&client_id)
                 .is_some_and(|client| !client.surface_subscriptions.is_empty())
         };
-        let next = if has_surface_subscriptions {
-            match tokio::time::timeout(STALE_SURFACE_CLIENT_TIMEOUT, read_frame(&mut reader)).await
-            {
+        let read_next = async {
+            if has_surface_subscriptions {
+                tokio::time::timeout(STALE_SURFACE_CLIENT_TIMEOUT, read_frame(&mut reader))
+                    .await
+                    .map_err(|_| ())
+            } else {
+                Ok(read_frame(&mut reader).await)
+            }
+        };
+        let next = tokio::select! {
+            biased;
+            _ = options.cancellation.cancelled() => break,
+            reason = kick_rx.recv() => {
+                kicked_reason = reason;
+                break;
+            }
+            completion = native_open_rx.recv(), if extension_origin => {
+                let Some(completion) = completion else {
+                    break;
+                };
+                apply_native_open_completion(
+                    completion,
+                    &mut fs_syncs,
+                    &mut git_repos,
+                    &mut lsp_conns,
+                    &fs_out,
+                    config.verbose,
+                );
+                aux_mirror
+                    .sync(
+                        &state,
+                        client_id,
+                        &fs_syncs,
+                        &git_repos,
+                        &lsp_conns,
+                        &kv_subs,
+                        &net_sockets,
+                    )
+                    .await;
+                continue;
+            }
+            next = read_next => match next {
                 Ok(next) => next,
-                Err(_) => {
+                Err(()) => {
                     if state.config.verbose {
                         eprintln!(
                             "client {client_id}: no ACK, ping, or input for {}s; disconnecting stale surface subscriber",
@@ -13349,15 +17207,19 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     }
                     break;
                 }
-            }
-        } else {
-            read_frame(&mut reader).await
+            },
         };
         let Some(data) = next else {
             break;
         };
         if data.is_empty() {
             continue;
+        }
+        // The process-wide latch is the admission linearization point. A
+        // packet already being applied when it flips may finish; no packet
+        // read afterward may start an extension or channel operation.
+        if state.connections.is_shutting_down() {
+            break;
         }
 
         if data[0] == C2S_ACK {
@@ -13390,6 +17252,56 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 if let Some(client) = sess.clients.get_mut(&client_id) {
                     let _ = send_outbox(client, reply);
                 }
+            }
+            continue;
+        }
+
+        if blit_remote::process::is_c2s_process(data[0]) {
+            #[cfg(any(unix, windows))]
+            if process_enabled {
+                if data[0] == blit_remote::process::C2S_PROCESS_SPAWN {
+                    let pty_cwd = match blit_remote::process::parse_process_spawn(&data) {
+                        Ok(request)
+                            if request.cwd_kind == blit_remote::process::PROCESS_CWD_FROM_PTY =>
+                        {
+                            let sess = state.session.lock().await;
+                            sess.ptys
+                                .get(&request.src_pty_id)
+                                .and_then(|pty| pty::pty_cwd(&pty.handle))
+                                .map(String::into_bytes)
+                        }
+                        _ => None,
+                    };
+                    processes.spawn(&data, pty_cwd.as_deref());
+                } else {
+                    processes.handle(&data);
+                }
+            } else {
+                refuse_process_message(&data, |reply| processes.send(reply));
+            }
+            #[cfg(not(any(unix, windows)))]
+            refuse_process_message(&data, |reply| {
+                let _ = fs_out.send(reply);
+            });
+            continue;
+        }
+
+        if (blit_remote::extension::EXT_RUN..=blit_remote::extension::EXT_COMMAND)
+            .contains(&data[0])
+        {
+            let outcome = if let Some(jobs) = extension_jobs.clone() {
+                state
+                    .extensions
+                    .dispatch_owned(state.clone(), client_id, &options.origin, data, jobs)
+                    .await
+            } else {
+                state
+                    .extensions
+                    .dispatch(state.clone(), client_id, &options.origin, &data)
+                    .await
+            };
+            if outcome == extension::DispatchOutcome::Close {
+                break;
             }
             continue;
         }
@@ -13482,8 +17394,27 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     let _ = fs_out.send(reply);
                 }
             } else {
-                handle_fs_message(&msg, &mut fs_syncs, &fs_out, config.verbose).await;
+                handle_fs_message_with_jobs(
+                    &msg,
+                    &mut fs_syncs,
+                    &fs_out,
+                    config.verbose,
+                    extension_jobs.as_ref(),
+                    native_open_tx.as_ref(),
+                )
+                .await;
             }
+            aux_mirror
+                .sync(
+                    &state,
+                    client_id,
+                    &fs_syncs,
+                    &git_repos,
+                    &lsp_conns,
+                    &kv_subs,
+                    &net_sockets,
+                )
+                .await;
             continue;
         }
 
@@ -13533,6 +17464,17 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 std::borrow::Cow::Borrowed(&data[..])
             };
             handle_git_message(&msg, &mut git_repos, &fs_out, config.verbose).await;
+            aux_mirror
+                .sync(
+                    &state,
+                    client_id,
+                    &fs_syncs,
+                    &git_repos,
+                    &lsp_conns,
+                    &kv_subs,
+                    &net_sockets,
+                )
+                .await;
             continue;
         }
 
@@ -13579,6 +17521,17 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 std::borrow::Cow::Borrowed(&data[..])
             };
             handle_lsp_message(&msg, &mut lsp_conns, &fs_out, config.verbose).await;
+            aux_mirror
+                .sync(
+                    &state,
+                    client_id,
+                    &fs_syncs,
+                    &git_repos,
+                    &lsp_conns,
+                    &kv_subs,
+                    &net_sockets,
+                )
+                .await;
             continue;
         }
 
@@ -13591,6 +17544,17 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             } else {
                 kv::refuse_kv_message(&data, &fs_out);
             }
+            aux_mirror
+                .sync(
+                    &state,
+                    client_id,
+                    &fs_syncs,
+                    &git_repos,
+                    &lsp_conns,
+                    &kv_subs,
+                    &net_sockets,
+                )
+                .await;
             continue;
         }
 
@@ -13609,6 +17573,50 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 .await;
             } else {
                 net::refuse_net_message(&data, &fs_out);
+            }
+            aux_mirror
+                .sync(
+                    &state,
+                    client_id,
+                    &fs_syncs,
+                    &git_repos,
+                    &lsp_conns,
+                    &kv_subs,
+                    &net_sockets,
+                )
+                .await;
+            continue;
+        }
+
+        // Native channels (`0x95`) are process-global routing state, so their
+        // compact state-machine transition and all resulting outbox enqueues
+        // happen under the session lock. Unknown kinds obey the family skip
+        // rule; malformed known opens receive INVALID, while malformed live
+        // data operations close only that channel pair.
+        if data[0] == blit_remote::channel::CHANNEL {
+            let mut sess = state.session.lock().await;
+            let closed_command_listener = blit_remote::channel::channel_header(&data)
+                .ok()
+                .filter(|(kind, _, _)| *kind == blit_remote::channel::CHANNEL_CLOSE)
+                .and_then(|(_, channel_id, _)| {
+                    sess.channels.listener_snapshot(client_id, channel_id)
+                });
+            let Session {
+                clients, channels, ..
+            } = &mut *sess;
+            let deliveries =
+                channels.handle_packet_reserved(client_id, &data, |endpoint, bytes| {
+                    clients
+                        .get(&endpoint)
+                        .and_then(|client| client.channel_tx.reserve(bytes))
+                });
+            send_channel_deliveries(&sess, deliveries);
+            drop(sess);
+            if let Some(listener) = closed_command_listener {
+                state
+                    .extensions
+                    .invalidate_command_listener(state.boot_generation, listener)
+                    .await;
             }
             continue;
         }
@@ -13816,13 +17824,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             let client_tx = {
                 let sess = state.session.lock().await;
                 eprintln!("[capture] client_tx lock acquired");
-                sess.clients.get(&client_id).map(|c| {
-                    (
-                        c.tx.clone(),
-                        c.outbox_queued_frames.clone(),
-                        c.outbox_queued_bytes.clone(),
-                    )
-                })
+                sess.clients.get(&client_id).map(|c| c.tx.clone())
             };
 
             if let Some((w, h, rgba_pixels)) = captured {
@@ -13835,9 +17837,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 reply_msg.extend_from_slice(&0u32.to_le_bytes());
             }
 
-            if let Some((client_tx, queued_frames, queued_bytes)) = client_tx {
+            if let Some(client_tx) = client_tx {
                 eprintln!("[capture] sending reply: {} bytes", reply_msg.len());
-                match send_outbox_tracked(&client_tx, &queued_frames, &queued_bytes, reply_msg) {
+                match client_tx.send(reply_msg) {
                     Ok(()) => eprintln!("[capture] sent OK"),
                     Err(e) => eprintln!("[capture] send failed: {e}"),
                 }
@@ -13847,11 +17849,75 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             continue;
         }
 
-        if data[0] == C2S_QUIT {
+        // Every message in this family is correlated by nonce, so a malformed
+        // one has to be answered rather than dropped: the requester would
+        // otherwise wait out its whole timeout for a reply that never comes.
+        // The nonce is only trustworthy once the length is right, so a request
+        // too short to carry one is the single case that stays silent.
+        if matches!(
+            data[0],
+            C2S_CLIENT_LIST | C2S_CLIENT_WATCH | C2S_CLIENT_UNWATCH
+        ) {
+            if data.len() != 3 {
+                if data.len() >= 3 {
+                    let nonce = u16::from_le_bytes([data[1], data[2]]);
+                    let sess = state.session.lock().await;
+                    if let Some(client) = sess.clients.get(&client_id) {
+                        let _ = send_outbox(
+                            client,
+                            msg_kick_result(
+                                nonce,
+                                STATUS_INVALID,
+                                "client-control request has trailing bytes",
+                            ),
+                        );
+                    }
+                }
+                continue;
+            }
+            let nonce = u16::from_le_bytes([data[1], data[2]]);
+            let mut sess = state.session.lock().await;
+            match data[0] {
+                C2S_CLIENT_LIST => {
+                    if let Some(client) = sess.clients.get(&client_id) {
+                        let _ = send_outbox(client, sess.client_list_msg(client_id, nonce));
+                    }
+                }
+                C2S_CLIENT_WATCH => sess.watch_client_list(client_id, nonce),
+                _ => sess.unwatch_client_list(client_id, nonce),
+            }
+            continue;
+        }
+
+        if data[0] == C2S_KICK && data.len() >= 3 {
+            let nonce = u16::from_le_bytes([data[1], data[2]]);
             let sess = state.session.lock().await;
-            sess.send_to_all(&[S2C_QUIT]);
-            drop(sess);
-            state.shutdown_notify.notify_one();
+            let (status, detail) = if data.len() < 11 {
+                (STATUS_INVALID, "kick request is truncated")
+            } else {
+                let target_id = u64::from_le_bytes(data[3..11].try_into().expect("checked length"));
+                let reason = &data[11..];
+                if reason.len() > KICK_REASON_MAX {
+                    (STATUS_TOO_LARGE, "kick reason exceeds 1024 bytes")
+                } else if let Ok(reason) = std::str::from_utf8(reason) {
+                    let reason = if reason.is_empty() {
+                        "kicked by another client"
+                    } else {
+                        reason
+                    };
+                    sess.kick_client(client_id, target_id, reason)
+                } else {
+                    (STATUS_INVALID, "kick reason is not valid UTF-8")
+                }
+            };
+            if let Some(client) = sess.clients.get(&client_id) {
+                let _ = send_outbox(client, msg_kick_result(nonce, status, detail));
+            }
+            continue;
+        }
+
+        if data[0] == C2S_QUIT {
+            begin_server_shutdown(&state).await;
             break;
         }
 
@@ -13863,6 +17929,485 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         // never compositor delivery for every client.
         let mut deferred_verbose_log: Option<String> = None;
         match data[0] {
+            #[cfg(target_os = "linux")]
+            C2S_MEDIA_CONTROL => {
+                let control = match parse_client_control(&data) {
+                    Ok(Some(control)) => control,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        if state.config.verbose {
+                            eprintln!("[media] malformed control from client {client_id}: {error}");
+                        }
+                        break;
+                    }
+                };
+                match control {
+                    ClientControl::Capabilities(capabilities) => {
+                        let now = Instant::now();
+                        let rate_limited = sess.clients.get(&client_id).is_some_and(|client| {
+                            client.last_media_capabilities.is_some_and(|last| {
+                                now.duration_since(last) < Duration::from_secs(1)
+                            })
+                        });
+                        if rate_limited {
+                            continue;
+                        }
+                        if let Some(client) = sess.clients.get_mut(&client_id) {
+                            client.media_capabilities = capabilities;
+                            client.last_media_capabilities = Some(now);
+                        }
+                        if capabilities.flags & CAPTURE_PORTAL_UI == 0 {
+                            let withdrawn = sess
+                                .pending_portals
+                                .iter_mut()
+                                .filter_map(|(request_id, pending)| {
+                                    (pending.authority == Some(client_id)).then(|| {
+                                        pending.authority = None;
+                                        *request_id
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            if let Some(client) = sess.clients.get(&client_id) {
+                                for request_id in withdrawn {
+                                    let _ = send_outbox(
+                                        client,
+                                        msg_server_control(&ServerControl::PortalCancel(
+                                            blit_remote::media::PortalCancel {
+                                                request_id,
+                                                reason: 0,
+                                            },
+                                        )),
+                                    );
+                                }
+                            }
+                        }
+                        sess.assign_pending_portals();
+                    }
+                    ClientControl::MprisSubscribe { enabled } => {
+                        let now = Instant::now();
+                        let rate_limited = enabled
+                            && sess.clients.get(&client_id).is_some_and(|client| {
+                                client.last_mpris_snapshot.is_some_and(|last| {
+                                    now.duration_since(last) < Duration::from_secs(1)
+                                })
+                            });
+                        if rate_limited {
+                            continue;
+                        }
+                        let records = if enabled {
+                            sess.compositor
+                                .as_ref()
+                                .filter(|cs| cs.mpris_runtime_live())
+                                .map(|cs| {
+                                    cs.mpris_mirror
+                                        .players
+                                        .values()
+                                        .map(|player| {
+                                            let observed_at = cs
+                                                .mpris_position_observed_at
+                                                .get(&player.player_id)
+                                                .copied()
+                                                .unwrap_or(now);
+                                            mpris_player_at(player, observed_at, now)
+                                        })
+                                        .map(MprisRecord::Upsert)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        let snapshot = msg_server_control(&ServerControl::MprisUpdate {
+                            flags: MPRIS_UPDATE_RESET | MPRIS_UPDATE_SYNC | MPRIS_UPDATE_REPLAY,
+                            records,
+                        });
+                        if let Some(client) = sess.clients.get_mut(&client_id) {
+                            client.mpris_subscribed = enabled;
+                            if enabled {
+                                client.last_mpris_snapshot = Some(now);
+                            }
+                            let _ = send_outbox(client, snapshot);
+                        }
+                    }
+                    ClientControl::MprisAction(action) => {
+                        let now = Instant::now();
+                        let mut immediate_status = match sess.clients.get_mut(&client_id) {
+                            Some(client) => {
+                                if !client.mpris_subscribed {
+                                    Some(STATUS_PERMISSION)
+                                } else if !consume_mpris_action_token(client, now) {
+                                    Some(STATUS_BUDGET)
+                                } else {
+                                    None
+                                }
+                            }
+                            None => Some(STATUS_OTHER),
+                        };
+                        if immediate_status.is_none() {
+                            let services_live = sess
+                                .compositor
+                                .as_ref()
+                                .is_some_and(SharedCompositor::mpris_runtime_live);
+                            let bus = sess
+                                .compositor
+                                .as_ref()
+                                .and_then(|cs| cs.desktop_bus.as_ref());
+                            let queued = services_live
+                                && bus.is_some_and(|bus| {
+                                    bus.try_command(blit_desktop::Command::Mpris {
+                                        requester: client_id,
+                                        action,
+                                    })
+                                });
+                            immediate_status = mpris_action_queue_status(services_live, queued);
+                        }
+                        if let Some(status) = immediate_status
+                            && let Some(client) = sess.clients.get(&client_id)
+                        {
+                            let _ = send_outbox(
+                                client,
+                                msg_server_control(&ServerControl::MprisActionResult(
+                                    MprisActionResult {
+                                        nonce: action.nonce,
+                                        status,
+                                        player_id: action.player_id,
+                                        revision: 0,
+                                    },
+                                )),
+                            );
+                        }
+                    }
+                    ClientControl::Start(request) => {
+                        let capabilities = sess
+                            .clients
+                            .get(&client_id)
+                            .map(|client| client.media_capabilities)
+                            .unwrap_or_default();
+                        let lease = if let Some(cs) = sess.compositor.as_mut() {
+                            let runtime_flags = cs.media_state().runtime_flags;
+                            let runtime_enabled = match request.kind {
+                                MediaKind::Microphone => runtime_flags & RUNTIME_MICROPHONE != 0,
+                                MediaKind::Camera => runtime_flags & RUNTIME_CAMERA != 0,
+                            };
+                            let runtime_dir = cs
+                                .audio_pipeline
+                                .as_ref()
+                                .map(|pipeline| pipeline.runtime_dir.clone());
+                            cs.media_input.start(
+                                client_id,
+                                capabilities,
+                                request,
+                                runtime_enabled,
+                                runtime_dir.as_deref(),
+                            )
+                        } else {
+                            blit_remote::media::MediaLease {
+                                nonce: request.nonce,
+                                status: STATUS_OTHER,
+                                kind: request.kind,
+                                lease_id: 0,
+                                codec: request.codec,
+                                width: request.width,
+                                height: request.height,
+                                fps: request.fps,
+                                initial_credit: 0,
+                            }
+                        };
+                        if let Some(client) = sess.clients.get(&client_id) {
+                            let _ = send_outbox(
+                                client,
+                                msg_server_control(&ServerControl::Lease(lease)),
+                            );
+                        }
+                        if lease.status == STATUS_OK {
+                            if state.config.verbose {
+                                eprintln!(
+                                    "[media] lease acquired client={client_id} kind={:?} lease={}",
+                                    lease.kind, lease.lease_id
+                                );
+                            }
+                            if let Some(media_state) =
+                                sess.compositor.as_ref().map(SharedCompositor::media_state)
+                            {
+                                sess.send_to_all(&msg_server_control(&ServerControl::State(
+                                    media_state,
+                                )));
+                            }
+                        }
+                    }
+                    ClientControl::Stop { lease_id } => {
+                        let revoked = sess.compositor.as_mut().and_then(|cs| {
+                            cs.media_input
+                                .stop(client_id, lease_id, RevokeReason::Stopped)
+                        });
+                        if let Some(revoked) = revoked {
+                            if let Some(client) = sess.clients.get(&client_id) {
+                                let _ = send_outbox(
+                                    client,
+                                    msg_server_control(&ServerControl::Revoked(revoked)),
+                                );
+                            }
+                            if let Some(media_state) =
+                                sess.compositor.as_ref().map(SharedCompositor::media_state)
+                            {
+                                sess.send_to_all(&msg_server_control(&ServerControl::State(
+                                    media_state,
+                                )));
+                            }
+                        }
+                    }
+                    ClientControl::PortalReply(reply) => {
+                        let accepted =
+                            sess.pending_portals
+                                .get(&reply.request_id)
+                                .is_some_and(|pending| {
+                                    pending.authority == Some(client_id)
+                                        && match &pending.request {
+                                            PortalRequest::Access(_) => {
+                                                reply.surface_ids.is_empty()
+                                            }
+                                            PortalRequest::ScreenCast(_) => {
+                                                reply.choices.is_empty()
+                                            }
+                                        }
+                                });
+                        let pending = accepted
+                            .then(|| sess.pending_portals.remove(&reply.request_id))
+                            .flatten();
+                        if let Some(pending) = pending {
+                            match pending.request {
+                                PortalRequest::Access(_) => {
+                                    if let Some(bus) = sess
+                                        .compositor
+                                        .as_ref()
+                                        .and_then(|cs| cs.desktop_bus.as_ref())
+                                    {
+                                        let _ = bus
+                                            .try_command(blit_desktop::Command::PortalReply(reply));
+                                    }
+                                }
+                                PortalRequest::ScreenCast(request) => {
+                                    let started = (reply.decision
+                                        == blit_remote::media::PortalDecision::Grant)
+                                        .then(|| {
+                                            sess.start_screencast(&request, &reply.surface_ids)
+                                        })
+                                        .transpose();
+                                    match started {
+                                        Ok(Some((session_id, streams))) => {
+                                            let delivered = sess
+                                                .compositor
+                                                .as_ref()
+                                                .and_then(|cs| cs.desktop_bus.as_ref())
+                                                .is_some_and(|bus| {
+                                                    bus.try_command(
+                                                    blit_desktop::Command::PortalScreenCastStarted {
+                                                        request_id: reply.request_id,
+                                                        session_id,
+                                                        streams,
+                                                    },
+                                                    )
+                                                });
+                                            if delivered {
+                                                if let Some(media_state) = sess
+                                                    .compositor
+                                                    .as_ref()
+                                                    .map(SharedCompositor::media_state)
+                                                {
+                                                    sess.send_to_all(&msg_server_control(
+                                                        &ServerControl::State(media_state),
+                                                    ));
+                                                }
+                                            } else {
+                                                // The backend never received
+                                                // the node IDs, so it cannot
+                                                // complete Start. Drop the
+                                                // corresponding sources now;
+                                                // its bounded request timeout
+                                                // supplies the D-Bus failure.
+                                                sess.stop_screencast(session_id);
+                                            }
+                                        }
+                                        Ok(None) | Err(_) => {
+                                            let mut cancelled = reply;
+                                            cancelled.decision =
+                                                blit_remote::media::PortalDecision::Cancelled;
+                                            cancelled.surface_ids.clear();
+                                            if let Some(bus) = sess
+                                                .compositor
+                                                .as_ref()
+                                                .and_then(|cs| cs.desktop_bus.as_ref())
+                                            {
+                                                let _ = bus.try_command(
+                                                    blit_desktop::Command::PortalReply(cancelled),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ClientControl::ScreenCastStop { session_id } => {
+                        if sess.stop_screencast(session_id) {
+                            if let Some(bus) = sess
+                                .compositor
+                                .as_ref()
+                                .and_then(|cs| cs.desktop_bus.as_ref())
+                            {
+                                let _ = bus.try_command(
+                                    blit_desktop::Command::PortalSessionClosed(session_id),
+                                );
+                            }
+                            if let Some(media_state) =
+                                sess.compositor.as_ref().map(SharedCompositor::media_state)
+                            {
+                                sess.send_to_all(&msg_server_control(&ServerControl::State(
+                                    media_state,
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(target_os = "linux")]
+            C2S_MEDIA_DATA => {
+                let frame = match parse_media_data(&data) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        if state.config.verbose {
+                            eprintln!(
+                                "[media] discarded malformed data from client {client_id}: {error}"
+                            );
+                        }
+                        continue;
+                    }
+                };
+                let result = sess
+                    .compositor
+                    .as_mut()
+                    .map(|cs| cs.media_input.data(client_id, frame));
+                match result {
+                    Some(media_input::DataResult::Credit { owner, credit }) => {
+                        if let Some(client) = sess.clients.get(&owner) {
+                            let _ = send_outbox(
+                                client,
+                                msg_server_control(&ServerControl::Credit(credit)),
+                            );
+                        }
+                    }
+                    Some(media_input::DataResult::Revoked { owner, revoked }) => {
+                        if state.config.verbose {
+                            eprintln!(
+                                "[media] lease revoked client={owner} lease={} reason={:?}",
+                                revoked.lease_id, revoked.reason
+                            );
+                        }
+                        if let Some(client) = sess.clients.get(&owner) {
+                            let _ = send_outbox(
+                                client,
+                                msg_server_control(&ServerControl::Revoked(revoked)),
+                            );
+                        }
+                        if let Some(media_state) =
+                            sess.compositor.as_ref().map(SharedCompositor::media_state)
+                        {
+                            sess.send_to_all(&msg_server_control(&ServerControl::State(
+                                media_state,
+                            )));
+                        }
+                    }
+                    Some(media_input::DataResult::Ignored) | None => {}
+                }
+            }
+            #[cfg(target_os = "linux")]
+            C2S_DESKTOP_SUBSCRIBE => {
+                let Some(flags) = parse_desktop_subscribe(&data) else {
+                    continue;
+                };
+                // Send both maps on every subscription change. An empty
+                // RESET/SYNC is how a client drops state for a stream it just
+                // unsubscribed from.
+                let tray_records = if flags & DESKTOP_SUBSCRIBE_TRAY != 0 {
+                    sess.compositor
+                        .as_ref()
+                        .map(|cs| {
+                            cs.desktop_mirror
+                                .tray
+                                .values()
+                                .cloned()
+                                .map(TrayRecord::Upsert)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let notification_records = if flags & DESKTOP_SUBSCRIBE_NOTIFICATIONS != 0 {
+                    sess.compositor
+                        .as_ref()
+                        .map(|cs| {
+                            cs.desktop_mirror
+                                .notifications
+                                .values()
+                                .cloned()
+                                .map(NotificationRecord::Upsert)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let tray_snapshot = msg_tray_snapshot(&tray_records).unwrap_or_else(|| {
+                    vec![msg_tray_update(
+                        DESKTOP_UPDATE_RESET | DESKTOP_UPDATE_SYNC | DESKTOP_UPDATE_REPLAY,
+                        &[],
+                    )]
+                });
+                let notification_snapshot = msg_notification_snapshot(&notification_records)
+                    .unwrap_or_else(|| {
+                        vec![msg_notification_update(
+                            DESKTOP_UPDATE_RESET | DESKTOP_UPDATE_SYNC | DESKTOP_UPDATE_REPLAY,
+                            &[],
+                        )]
+                    });
+                if let Some(client) = sess.clients.get_mut(&client_id) {
+                    client.desktop_subscriptions = flags;
+                    for message in tray_snapshot.into_iter().chain(notification_snapshot) {
+                        let _ = send_outbox(client, message);
+                    }
+                }
+            }
+            #[cfg(target_os = "linux")]
+            C2S_TRAY_EVENT => {
+                let subscribed = sess.clients.get(&client_id).is_some_and(|client| {
+                    client.desktop_subscriptions & DESKTOP_SUBSCRIBE_TRAY != 0
+                });
+                if subscribed
+                    && let Some(event) = parse_tray_event(&data)
+                    && let Some(bus) = sess
+                        .compositor
+                        .as_ref()
+                        .and_then(|cs| cs.desktop_bus.as_ref())
+                {
+                    let _ = bus.try_command(blit_desktop::Command::Tray(event));
+                }
+            }
+            #[cfg(target_os = "linux")]
+            C2S_NOTIFICATION_EVENT => {
+                let subscribed = sess.clients.get(&client_id).is_some_and(|client| {
+                    client.desktop_subscriptions & DESKTOP_SUBSCRIBE_NOTIFICATIONS != 0
+                });
+                if subscribed
+                    && let Some(event) = parse_notification_event(&data)
+                    && let Some(bus) = sess
+                        .compositor
+                        .as_ref()
+                        .and_then(|cs| cs.desktop_bus.as_ref())
+                {
+                    let _ = bus.try_command(blit_desktop::Command::Notification(event));
+                }
+            }
             C2S_SCROLL if data.len() >= 7 => {
                 let pid = u16::from_le_bytes([data[1], data[2]]);
                 let offset = u32::from_le_bytes([data[3], data[4], data[5], data[6]]) as usize;
@@ -14828,6 +19373,12 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         .command_tx
                         .send(CompositorCommand::SurfaceFocus { surface_id });
                 }
+                #[cfg(target_os = "linux")]
+                {
+                    sess.recent_surface_focus
+                        .insert(client_id, (surface_id, Instant::now()));
+                    sess.assign_pending_portals();
+                }
             }
             C2S_SURFACE_CLOSE if data.len() >= 3 => {
                 let surface_id = u16::from_le_bytes([data[1], data[2]]);
@@ -15148,6 +19699,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     };
                     ap.set_bitrate(bitrate);
                 }
+                sess.publish_client_catalogs();
                 state.delivery_notify.notify_one();
             }
             #[cfg(target_os = "linux")]
@@ -15180,6 +19732,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     };
                     ap.set_bitrate(bitrate);
                 }
+                sess.publish_client_catalogs();
             }
             C2S_SURFACE_ACK if data.len() >= 3 => {
                 // Surface ACKs feed shared RTT / delivery_bps / goodput_bps
@@ -15263,29 +19816,23 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             C2S_CLIPBOARD_LIST if !data.is_empty() => {
                 if let Some(cs) = sess.compositor.as_ref() {
                     let command_tx = cs.handle.command_tx.clone();
-                    let client_tx = sess.clients.get(&client_id).map(|c| {
-                        (
-                            c.tx.clone(),
-                            c.outbox_queued_frames.clone(),
-                            c.outbox_queued_bytes.clone(),
-                        )
-                    });
-                    if let Some((client_tx, queued_frames, queued_bytes)) = client_tx {
-                        tokio::task::spawn_blocking(move || {
+                    let client_tx = sess.clients.get(&client_id).map(|c| c.tx.clone());
+                    if let Some(client_tx) = client_tx {
+                        let work = move || {
                             let (tx, rx) = std::sync::mpsc::sync_channel(1);
                             if command_tx
                                 .send(CompositorCommand::ClipboardListMimes { reply: tx })
                                 .is_ok()
                                 && let Ok(mimes) = rx.recv_timeout(Duration::from_secs(2))
                             {
-                                let _ = send_outbox_tracked(
-                                    &client_tx,
-                                    &queued_frames,
-                                    &queued_bytes,
-                                    msg_s2c_clipboard_list(&mimes),
-                                );
+                                let _ = client_tx.send(msg_s2c_clipboard_list(&mimes));
                             }
-                        });
+                        };
+                        if let Some(jobs) = &extension_jobs {
+                            let _ = jobs.spawn_blocking(data.len(), work);
+                        } else {
+                            tokio::task::spawn_blocking(work);
+                        }
                     }
                 } else {
                     // No compositor — respond with empty list.
@@ -15302,15 +19849,9 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         .to_string();
                     if let Some(cs) = sess.compositor.as_ref() {
                         let command_tx = cs.handle.command_tx.clone();
-                        let client_tx = sess.clients.get(&client_id).map(|c| {
-                            (
-                                c.tx.clone(),
-                                c.outbox_queued_frames.clone(),
-                                c.outbox_queued_bytes.clone(),
-                            )
-                        });
-                        if let Some((client_tx, queued_frames, queued_bytes)) = client_tx {
-                            tokio::task::spawn_blocking(move || {
+                        let client_tx = sess.clients.get(&client_id).map(|c| c.tx.clone());
+                        if let Some(client_tx) = client_tx {
+                            let work = move || {
                                 let (tx, rx) = std::sync::mpsc::sync_channel(1);
                                 if command_tx
                                     .send(CompositorCommand::ClipboardGet {
@@ -15321,14 +19862,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                     && let Ok(content) = rx.recv_timeout(Duration::from_secs(2))
                                 {
                                     let data = content.unwrap_or_default();
-                                    let _ = send_outbox_tracked(
-                                        &client_tx,
-                                        &queued_frames,
-                                        &queued_bytes,
-                                        msg_s2c_clipboard_content(&mime, &data),
-                                    );
+                                    let _ = client_tx.send(msg_s2c_clipboard_content(&mime, &data));
                                 }
-                            });
+                            };
+                            if let Some(jobs) = &extension_jobs {
+                                let _ = jobs.spawn_blocking(data.len(), work);
+                            } else {
+                                tokio::task::spawn_blocking(work);
+                            }
                         }
                     } else {
                         // No compositor — respond with empty clipboard.
@@ -15674,8 +20215,35 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         if let Some(cs) = sess.compositor.as_ref() {
             cs.audio_broadcast.unsubscribe(client_id);
         }
+        let channel_deliveries = sess.channels.close_endpoint(client_id);
+        send_channel_deliveries(&sess, channel_deliveries);
+        #[cfg(target_os = "linux")]
+        let media_disconnected = sess
+            .compositor
+            .as_mut()
+            .map(|cs| cs.media_input.disconnect(client_id))
+            .unwrap_or_default();
+        #[cfg(target_os = "linux")]
+        if let Some(client) = sess.clients.get(&client_id) {
+            for revoked in &media_disconnected {
+                let _ = send_outbox(
+                    client,
+                    msg_server_control(&ServerControl::Revoked(*revoked)),
+                );
+            }
+        }
         sess.clear_surface_pointer_owner(client_id);
         let client = sess.clients.remove(&client_id);
+        #[cfg(target_os = "linux")]
+        {
+            for pending in sess.pending_portals.values_mut() {
+                if pending.authority == Some(client_id) {
+                    pending.authority = None;
+                }
+            }
+            sess.recent_surface_focus.remove(&client_id);
+            sess.assign_pending_portals();
+        }
         let owned_touch_sequence = sess.surface_touch_owner == Some(client_id);
         if owned_touch_sequence {
             sess.surface_touch_owner = None;
@@ -15793,22 +20361,262 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 let _ = std::fs::remove_dir_all(dir);
             }
         }
+        sess.publish_client_catalogs();
+        #[cfg(target_os = "linux")]
+        if !media_disconnected.is_empty()
+            && let Some(media_state) = sess.compositor.as_ref().map(SharedCompositor::media_state)
+        {
+            sess.send_to_all(&msg_server_control(&ServerControl::State(media_state)));
+        }
         drop(sess);
         if need_nudge {
             nudge_delivery(&state);
         }
     }
-    sender.abort();
-    // Relayed sockets outlive the read loop only as spawned tasks; drop the
-    // table so every forwarded socket on this connection closes with it.
+    if let Some(reason) = kicked_reason.as_deref() {
+        let delivered =
+            deliver_terminal_notice(&terminal_tx, msg_kicked(reason), TERMINAL_NOTICE_TIMEOUT)
+                .await;
+        if !delivered && config.verbose {
+            eprintln!(
+                "client {client_id}: kicked, but the reason never reached the socket before shutdown"
+            );
+        }
+    }
+    #[cfg(any(unix, windows))]
+    processes.shutdown().await;
+    // Retire connection-scoped family state before cancelling admission so
+    // cooperative native jobs see their family token first.  Pending tracked
+    // records then observe connection cancellation, while already-launched
+    // non-cancellable calls remain joined by `cancel_and_drain` below.
+    drop(fs_syncs);
+    drop(git_repos);
+    drop(lsp_conns);
+    drop(kv_subs);
     net::shutdown(&mut net_sockets);
+    options.cancellation.cancel();
+    if let Some(jobs) = &extension_jobs {
+        jobs.cancel_and_drain().await;
+    }
+    state
+        .extensions
+        .unregister_endpoint(client_id, state.boot_generation)
+        .await;
+    if let Err(error) = sender.await
+        && config.verbose
+    {
+        eprintln!(
+            "{} writer failed during cleanup: {error}",
+            options.origin.label()
+        );
+    }
     if state.config.verbose {
-        eprintln!("client disconnected");
+        eprintln!("{} disconnected", options.origin.label());
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    mod process_transport {
+        use super::super::*;
+        use blit_remote::process::{
+            FEATURE_PROCESS, PROCESS_EXIT_RETURNED, ProcessCommand, ProcessEvent, S2C_PROCESS_EXIT,
+            S2C_PROCESS_STARTED,
+        };
+        use blit_remote::{S2C_HELLO, S2C_READY, STATUS_OK};
+        use tokio::time::timeout;
+
+        fn test_state(process_server: process::Server) -> AppState {
+            Arc::new(AppStateInner {
+                config: Config {
+                    shell: "/bin/sh".into(),
+                    shell_flags: String::new(),
+                    scrollback: 100,
+                    ipc_path: String::new(),
+                    surface_encoders: Vec::new(),
+                    surface_encoding: SurfaceEncoding::default(),
+                    chroma: ChromaSubsampling::default(),
+                    vaapi_device: String::new(),
+                    fd_channel: None,
+                    verbose: false,
+                    processes: true,
+                    max_connections: 0,
+                    max_ptys: 0,
+                    ping_interval: Duration::ZERO,
+                    skip_compositor: true,
+                    export_sock: false,
+                    inject_path: false,
+                    allow_forward: Vec::new(),
+                    allow_forward_insecure: false,
+                    allow_persistent_extensions: false,
+                },
+                process_server,
+                boot_generation: 1,
+                session: Mutex::new(Session::new_with_boot_generation(1)),
+                pty_fds: Arc::new(std::sync::RwLock::new(FxHashMap::default())),
+                delivery_notify: Arc::new(Notify::new()),
+                shutdown_notify: Arc::new(Notify::new()),
+                connections: Arc::new(ConnectionRegistry::default()),
+                supervisor_notify: Arc::new(Notify::new()),
+                active_connections: std::sync::atomic::AtomicUsize::new(0),
+                extensions: extension::ExtensionService::from_env(false),
+                extension_jobs: extension_jobs::GlobalTracker::from_env(),
+            })
+        }
+
+        async fn next_frame(reader: &mut tokio::io::DuplexStream) -> Vec<u8> {
+            timeout(Duration::from_secs(5), read_frame(reader))
+                .await
+                .expect("server frame timed out")
+                .expect("server closed the connection")
+        }
+
+        #[tokio::test]
+        async fn process_family_runs_through_framed_connection() {
+            let process_server = process::Server::new(false, true);
+            let state = test_state(process_server.clone());
+            let (mut client, server_stream) = tokio::io::duplex(1024 * 1024);
+            let connection = tokio::spawn(handle_client_with_options(
+                server_stream,
+                state,
+                ConnectionOptions::network(),
+            ));
+
+            let mut advertised = false;
+            loop {
+                let frame = next_frame(&mut client).await;
+                match frame.first().copied() {
+                    Some(S2C_HELLO) => {
+                        let features = u32::from_le_bytes(frame[3..7].try_into().unwrap());
+                        advertised = features & FEATURE_PROCESS != 0;
+                    }
+                    Some(S2C_READY) => break,
+                    _ => {}
+                }
+            }
+            assert!(advertised);
+
+            let spawn = ProcessCommand::new(b"/bin/sh".to_vec())
+                .arg(b"-c".to_vec())
+                .arg(b"printf 'out\\001'; printf 'err\\002' >&2; exit 7".to_vec())
+                .spawn_packet(41, 73)
+                .unwrap();
+            assert!(write_frame(&mut client, &spawn).await);
+
+            let mut child = None;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let exit = loop {
+                let frame = next_frame(&mut client).await;
+                match frame.first().copied() {
+                    Some(S2C_PROCESS_STARTED) => {
+                        let started = blit_remote::process::parse_process_started(&frame).unwrap();
+                        assert_eq!(
+                            (started.nonce, started.process_id, started.status),
+                            (41, 73, STATUS_OK)
+                        );
+                        child = Some(
+                            blit_remote::process::ProcessChild::from_started(started).unwrap(),
+                        );
+                    }
+                    Some(S2C_PROCESS_EXIT) => {
+                        let event = child.as_mut().unwrap().decode_event(&frame).unwrap();
+                        let ProcessEvent::Exit(exit) = event else {
+                            unreachable!();
+                        };
+                        break exit;
+                    }
+                    Some(blit_remote::process::S2C_PROCESS_STDOUT)
+                    | Some(blit_remote::process::S2C_PROCESS_STDERR) => {
+                        let child = child.as_mut().expect("STARTED precedes output");
+                        let event = child.decode_event(&frame).unwrap();
+                        match &event {
+                            ProcessEvent::Stdout { data, .. } => stdout.extend_from_slice(data),
+                            ProcessEvent::Stderr { data, .. } => stderr.extend_from_slice(data),
+                            _ => unreachable!(),
+                        }
+                        let ack = child.acknowledge(&event).unwrap();
+                        assert!(write_frame(&mut client, &ack).await);
+                    }
+                    _ => {}
+                }
+            };
+
+            assert_eq!(stdout, b"out\x01");
+            assert_eq!(stderr, b"err\x02");
+            assert_eq!((exit.reason, exit.code), (PROCESS_EXIT_RETURNED, 7));
+
+            drop(client);
+            timeout(Duration::from_secs(5), connection)
+                .await
+                .expect("connection cleanup timed out")
+                .unwrap();
+            process_server.shutdown().await;
+        }
+    }
+
+    use super::{DeploymentOverrides, DeploymentSettings};
+
+    fn deployment_env<'a>(
+        entries: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> Result<Option<String>, String> + 'a {
+        move |name| {
+            Ok(entries
+                .iter()
+                .find_map(|(key, value)| (*key == name).then(|| (*value).to_owned())))
+        }
+    }
+
+    #[test]
+    fn deployment_cli_capacity_overrides_invalid_environment_value() {
+        let mut overrides = DeploymentOverrides::default();
+        overrides.set("BLIT_EXT_MAX_RUNNING", 3).unwrap();
+        let settings = DeploymentSettings::resolve_with(
+            overrides,
+            deployment_env(&[("BLIT_EXT_MAX_RUNNING", "99")]),
+        )
+        .unwrap();
+        assert_eq!(settings.values["BLIT_EXT_MAX_RUNNING"], 3);
+    }
+
+    #[test]
+    fn deployment_family_flags_and_environment_are_resolved_once() {
+        let mut overrides = DeploymentOverrides::default();
+        overrides.disable_extensions();
+        overrides.disable_channels();
+        let settings = DeploymentSettings::resolve_with(
+            overrides,
+            deployment_env(&[("BLIT_EXT", "1"), ("BLIT_CHANNEL", "1")]),
+        )
+        .unwrap();
+        assert!(!settings.extensions_enabled);
+        assert!(!settings.channels_enabled);
+
+        let settings = DeploymentSettings::resolve_with(
+            DeploymentOverrides::default(),
+            deployment_env(&[("BLIT_EXT", "0"), ("BLIT_CHANNEL", "0")]),
+        )
+        .unwrap();
+        assert!(!settings.extensions_enabled);
+        assert!(!settings.channels_enabled);
+    }
+
+    #[test]
+    fn deployment_max_running_is_strictly_validated() {
+        for invalid in [0, 5, u64::MAX] {
+            let mut overrides = DeploymentOverrides::default();
+            overrides.set("BLIT_EXT_MAX_RUNNING", invalid).unwrap();
+            let error =
+                DeploymentSettings::resolve_with(overrides, deployment_env(&[])).unwrap_err();
+            assert!(error.contains("BLIT_EXT_MAX_RUNNING must be in 1..=4"));
+        }
+        for valid in 1..=4 {
+            let mut overrides = DeploymentOverrides::default();
+            overrides.set("BLIT_EXT_MAX_RUNNING", valid).unwrap();
+            DeploymentSettings::resolve_with(overrides, deployment_env(&[])).unwrap();
+        }
+    }
 
     mod bulk_fragmentation {
         use super::super::{
@@ -15856,6 +20664,575 @@ mod tests {
             }
             state.observe(BULK, BULK_FRAGMENT_RECOVERY);
             assert_eq!(state.chunk_bytes(), None);
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    mod process_writer_scheduling {
+        use super::super::*;
+
+        #[tokio::test]
+        async fn continuously_ready_bulk_queues_alternate() {
+            let server = process::Server::new(false, true);
+            let (max_frames, max_bytes) = server.outbox_limits();
+            let (process_tx, mut process_rx) = mpsc::channel(max_frames);
+            let (kick_tx, _kick_rx) = mpsc::unbounded_channel();
+            let manager =
+                server.endpoint(process::OutboundSender::new(process_tx, max_bytes, kick_tx));
+            let (ordinary_tx, mut ordinary_rx) = mpsc::unbounded_channel();
+            for byte in 0..3 {
+                manager.send(vec![byte]);
+                ordinary_tx
+                    .send(OutboxPacket::Owned(vec![byte + 10]))
+                    .unwrap();
+            }
+
+            let mut prefer_process = true;
+            for expected_process in [true, false, true, false, true, false] {
+                let message =
+                    next_connection_bulk(&mut process_rx, &mut ordinary_rx, prefer_process)
+                        .await
+                        .expect("a queued bulk frame");
+                let was_process = match message {
+                    ConnectionBulk::Ordinary(_) => false,
+                    ConnectionBulk::Process(message) => {
+                        drop(message);
+                        true
+                    }
+                };
+                assert_eq!(was_process, expected_process);
+                prefer_process = !was_process;
+            }
+        }
+
+        #[tokio::test]
+        async fn forced_fragmentation_preserves_process_payload_and_audio() {
+            let (mut client, mut writer) = tokio::io::duplex(1024);
+            let (audio_tx, mut audio_rx) = mpsc::unbounded_channel();
+            let audio = vec![0xA0, 0xA1];
+            audio_tx.send(audio.clone()).unwrap();
+            let payload = (0u8..10).collect::<Vec<_>>();
+            let outbound_bytes = AtomicU64::new(0);
+
+            assert!(
+                write_frame_interleaved(
+                    &mut writer,
+                    &payload,
+                    &mut audio_rx,
+                    ConnectionProfile::NETWORK.write_policy(Some(4)),
+                    &outbound_bytes,
+                    None,
+                    None,
+                )
+                .await
+                .is_ok()
+            );
+            assert_eq!(read_frame(&mut client).await.unwrap(), audio);
+
+            let mut reassembled = Vec::new();
+            loop {
+                let fragment = read_frame(&mut client).await.unwrap();
+                assert_eq!(fragment[0], blit_remote::S2C_FRAGMENT);
+                reassembled.extend_from_slice(&fragment[2..]);
+                if fragment[1] & blit_remote::FRAGMENT_FLAG_LAST != 0 {
+                    break;
+                }
+            }
+            assert_eq!(reassembled, payload);
+        }
+    }
+
+    mod connection_profile {
+        use super::super::{
+            BULK_CHUNK_BYTES, ConnectionCancellation, ConnectionOptions, ConnectionProfile,
+            ConnectionRegistry, FrameWritePolicy,
+        };
+        use std::sync::Arc;
+
+        #[test]
+        fn in_process_profile_uses_five_fragments_at_the_logical_ceiling() {
+            let policy = ConnectionProfile::IN_PROCESS.write_policy(None);
+            assert_eq!(policy.fragment_count(blit_remote::MAX_FRAME_SIZE), Some(0));
+            assert_eq!(
+                policy.fragment_count(blit_remote::MAX_LOGICAL_MESSAGE),
+                Some(5)
+            );
+            assert_eq!(
+                policy.fragment_count(blit_remote::MAX_LOGICAL_MESSAGE + 1),
+                None
+            );
+        }
+
+        #[test]
+        fn network_backpressure_overrides_direct_and_fragment_sizes_together() {
+            let clean = ConnectionProfile::NETWORK.write_policy(None);
+            assert_eq!(clean.direct_frame_bytes, blit_remote::MAX_FRAME_SIZE);
+            assert_eq!(clean.fragment_chunk_bytes, blit_remote::MAX_FRAGMENT_CHUNK);
+
+            let pressured = ConnectionProfile::NETWORK.write_policy(Some(BULK_CHUNK_BYTES));
+            assert_eq!(
+                pressured,
+                FrameWritePolicy {
+                    direct_frame_bytes: BULK_CHUNK_BYTES,
+                    fragment_chunk_bytes: BULK_CHUNK_BYTES,
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn connection_cancellation_is_level_triggered_and_idempotent() {
+            let cancellation = ConnectionCancellation::default();
+            cancellation.cancel();
+            cancellation.cancel();
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                cancellation.cancelled(),
+            )
+            .await
+            .expect("a waiter registered after cancellation must still wake");
+        }
+
+        #[tokio::test]
+        async fn shutdown_registry_seals_admission_cancels_and_joins_connections() {
+            let registry = Arc::new(ConnectionRegistry::default());
+            let cancellation = ConnectionCancellation::default();
+            let registration = registry
+                .register(cancellation.clone())
+                .expect("connection is admitted before shutdown");
+            assert_eq!(registry.len(), 1);
+
+            assert!(registry.seal_shutdown());
+            assert!(!registry.seal_shutdown());
+            registry.cancel_all();
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                cancellation.cancelled(),
+            )
+            .await
+            .expect("shutdown cancels existing connections");
+
+            let late = ConnectionCancellation::default();
+            assert!(registry.register(late.clone()).is_none());
+            tokio::time::timeout(std::time::Duration::from_millis(10), late.cancelled())
+                .await
+                .expect("shutdown refuses and cancels late connections");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), registry.wait_empty())
+                    .await
+                    .is_err(),
+                "cleanup barrier must wait for the registered handler"
+            );
+
+            drop(registration);
+            tokio::time::timeout(std::time::Duration::from_millis(10), registry.wait_empty())
+                .await
+                .expect("cleanup barrier releases after handler teardown");
+        }
+
+        #[test]
+        fn extension_bootstrap_keeps_identity_and_owned_init_separate() {
+            let init = blit_remote::extension::ExtensionInit {
+                extension_id: 7,
+                definition_revision: 2,
+                attempt: 3,
+                task_id: 4,
+                flags: blit_remote::extension::EXT_FLAG_ENABLED,
+                hash: [5; 32],
+                name: "collector",
+                args: vec![b"one".as_slice()],
+            };
+            let options =
+                ConnectionOptions::extension(&init, ConnectionCancellation::default()).unwrap();
+            let mut messages = vec![vec![1]];
+            options.origin.append_ready(&mut messages);
+            assert_eq!(messages[1], vec![blit_remote::S2C_READY]);
+            assert_eq!(messages.len(), 2);
+            assert_eq!(
+                blit_remote::extension::parse_extension_init(
+                    options.extension_init.as_deref().unwrap()
+                )
+                .unwrap(),
+                init
+            );
+            assert_eq!(
+                options.origin.channel_peer_name(99),
+                "ext:0000000000000007:3"
+            );
+        }
+    }
+
+    mod extension_outbox {
+        use super::super::{
+            ConnectionCancellation, ConnectionFailure, EXTENSION_OUTBOX_MAX_BYTES,
+            EXTENSION_OUTBOX_MAX_MESSAGES, ExtensionBootstrapBarrier, ExtensionOutboxConfig,
+            ExtensionOutboxLimit, FrameWriteError, FrameWritePolicy, OutboxTracking,
+            OutboxWriteCharge, TrackedChannelSender, TrackedOutboxSender, channel, read_frame,
+            write_all_with_progress_timeout, write_extension_bootstrap,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+        use tokio::sync::{mpsc, oneshot};
+
+        type TestOutbox = (
+            TrackedOutboxSender,
+            mpsc::UnboundedReceiver<Vec<u8>>,
+            Arc<OutboxTracking>,
+            Arc<ExtensionOutboxLimit>,
+            ConnectionCancellation,
+        );
+
+        fn outbox(max_bytes: usize, max_messages: usize) -> TestOutbox {
+            let cancellation = ConnectionCancellation::default();
+            let limit = Arc::new(ExtensionOutboxLimit::with_limits(
+                cancellation.clone(),
+                max_bytes,
+                max_messages,
+            ));
+            let tracking = Arc::new(OutboxTracking {
+                queued_frames: Arc::new(AtomicUsize::new(0)),
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+                extension_limit: Some(limit.clone()),
+                drain_notify: std::sync::Mutex::new(None),
+            });
+            let (tx, rx) = mpsc::unbounded_channel();
+            (
+                TrackedOutboxSender::new(tx, tracking.clone()),
+                rx,
+                tracking,
+                limit,
+                cancellation,
+            )
+        }
+
+        #[test]
+        fn extension_outbox_configuration_enforces_transport_invariants() {
+            let config = ExtensionOutboxConfig::validated(
+                EXTENSION_OUTBOX_MAX_BYTES,
+                EXTENSION_OUTBOX_MAX_MESSAGES,
+                30,
+            )
+            .unwrap();
+            assert_eq!(config.max_bytes, blit_remote::MAX_LOGICAL_MESSAGE);
+            assert_eq!(config.max_messages, EXTENSION_OUTBOX_MAX_MESSAGES);
+            assert_eq!(config.no_progress_timeout, Duration::from_secs(30));
+
+            assert!(
+                ExtensionOutboxConfig::validated(EXTENSION_OUTBOX_MAX_BYTES - 1, 1, 1).is_err()
+            );
+            assert!(
+                ExtensionOutboxConfig::validated(EXTENSION_OUTBOX_MAX_BYTES + 1, 1, 1).is_err()
+            );
+            assert!(ExtensionOutboxConfig::validated(EXTENSION_OUTBOX_MAX_BYTES, 0, 1).is_err());
+            assert!(ExtensionOutboxConfig::validated(EXTENSION_OUTBOX_MAX_BYTES, 1, 0).is_err());
+        }
+
+        #[test]
+        fn one_maximum_logical_message_fits_an_empty_extension_outbox() {
+            let (sender, mut receiver, tracking, limit, cancellation) =
+                outbox(EXTENSION_OUTBOX_MAX_BYTES, EXTENSION_OUTBOX_MAX_MESSAGES);
+            sender
+                .send(vec![0; EXTENSION_OUTBOX_MAX_BYTES])
+                .expect("one maximum logical message must fit");
+            assert_eq!(
+                limit.usage(),
+                (EXTENSION_OUTBOX_MAX_BYTES, 1),
+                "the in-flight write remains charged"
+            );
+
+            assert!(sender.send(vec![1]).is_err());
+            assert_eq!(
+                cancellation.failure(),
+                Some(ConnectionFailure::SlowConsumer)
+            );
+            assert_eq!(limit.usage(), (EXTENSION_OUTBOX_MAX_BYTES, 1));
+
+            let packet = receiver.try_recv().unwrap();
+            let charge = OutboxWriteCharge {
+                tracking,
+                bytes: packet.len(),
+            };
+            assert_eq!(limit.usage(), (EXTENSION_OUTBOX_MAX_BYTES, 1));
+            drop(charge);
+            assert_eq!(limit.usage(), (0, 0));
+        }
+
+        #[test]
+        fn a_closed_writer_releases_a_failed_enqueue_reservation() {
+            let (sender, mut receiver, _tracking, limit, cancellation) = outbox(8, 8);
+            receiver.close();
+            assert!(sender.send(vec![0; 8]).is_err());
+            assert_eq!(limit.usage(), (0, 0));
+            assert_eq!(cancellation.failure(), None);
+        }
+
+        #[test]
+        fn concurrent_tiny_producers_cannot_cross_the_message_ceiling() {
+            let (sender, mut receiver, tracking, limit, cancellation) =
+                outbox(EXTENSION_OUTBOX_MAX_BYTES, EXTENSION_OUTBOX_MAX_MESSAGES);
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let mut producers = Vec::new();
+            for _ in 0..8 {
+                let sender = sender.clone();
+                let accepted = accepted.clone();
+                producers.push(std::thread::spawn(move || {
+                    for _ in 0..700 {
+                        if sender.send(vec![0]).is_ok() {
+                            accepted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }));
+            }
+            for producer in producers {
+                producer.join().unwrap();
+            }
+            assert_eq!(
+                accepted.load(Ordering::Relaxed),
+                EXTENSION_OUTBOX_MAX_MESSAGES
+            );
+            assert_eq!(
+                limit.usage(),
+                (EXTENSION_OUTBOX_MAX_MESSAGES, EXTENSION_OUTBOX_MAX_MESSAGES)
+            );
+            assert_eq!(
+                cancellation.failure(),
+                Some(ConnectionFailure::SlowConsumer)
+            );
+
+            while let Ok(packet) = receiver.try_recv() {
+                tracking.release(packet.len());
+            }
+            assert_eq!(limit.usage(), (0, 0));
+        }
+
+        #[test]
+        fn native_channel_and_ordinary_messages_share_both_hard_budgets() {
+            let mut fabric = channel::ChannelFabric::new(1);
+            let mut delivery = fabric
+                .malformed(7, blit_remote::channel::CHANNEL_LISTEN, 9, "invalid")
+                .pop()
+                .unwrap();
+            let delivery_bytes = delivery.packet.len();
+            let (sender, mut receiver, tracking, limit, cancellation) =
+                outbox(delivery_bytes + 1, 2);
+            let (channel_tx, mut channel_rx) = mpsc::unbounded_channel();
+            let channel = TrackedChannelSender {
+                tx: channel_tx,
+                tracking: tracking.clone(),
+            };
+
+            sender.send(vec![1]).unwrap();
+            delivery.outbox_reservation = Some(channel.reserve(delivery_bytes).unwrap());
+            // Publication-time reservations transfer into the raw queue;
+            // `send` must not charge the same channel message a second time.
+            channel.send(delivery).unwrap();
+            assert_eq!(limit.usage(), (delivery_bytes + 1, 2));
+            assert!(sender.send(Vec::new()).is_err());
+            assert_eq!(
+                cancellation.failure(),
+                Some(ConnectionFailure::SlowConsumer)
+            );
+
+            let packet = receiver.try_recv().unwrap();
+            tracking.release(packet.len());
+            let delivery = channel_rx.try_recv().unwrap();
+            drop(delivery);
+            assert_eq!(limit.usage(), (0, 0));
+        }
+
+        #[test]
+        fn network_tracking_keeps_the_existing_unbounded_enqueue() {
+            let frames = Arc::new(AtomicUsize::new(0));
+            let bytes = Arc::new(AtomicUsize::new(0));
+            let tracking = Arc::new(OutboxTracking {
+                queued_frames: frames.clone(),
+                queued_bytes: bytes.clone(),
+                extension_limit: None,
+                drain_notify: std::sync::Mutex::new(None),
+            });
+            let (tx, receiver) = mpsc::unbounded_channel();
+            let sender = TrackedOutboxSender::new(tx, tracking);
+            for _ in 0..=EXTENSION_OUTBOX_MAX_MESSAGES {
+                sender.send(vec![0]).unwrap();
+            }
+            assert_eq!(receiver.len(), EXTENSION_OUTBOX_MAX_MESSAGES + 1);
+            assert_eq!(
+                frames.load(Ordering::Relaxed),
+                EXTENSION_OUTBOX_MAX_MESSAGES + 1
+            );
+            assert_eq!(
+                bytes.load(Ordering::Relaxed),
+                EXTENSION_OUTBOX_MAX_MESSAGES + 1
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn audio_and_ordinary_messages_share_the_extension_hard_budget() {
+            use super::super::TrackedAudioSender;
+
+            let (sender, mut receiver, tracking, limit, cancellation) = outbox(2, 2);
+            let (audio_tx, mut audio_rx) = mpsc::unbounded_channel();
+            let audio = TrackedAudioSender {
+                tx: audio_tx,
+                tracking: Some(tracking.clone()),
+            };
+            sender.send(vec![1]).unwrap();
+            audio.send(vec![2]).unwrap();
+            assert_eq!(limit.usage(), (2, 2));
+            assert!(audio.send(vec![3]).is_err());
+            assert_eq!(
+                cancellation.failure(),
+                Some(ConnectionFailure::SlowConsumer)
+            );
+
+            let packet = receiver.try_recv().unwrap();
+            tracking.release(packet.len());
+            let packet = audio_rx.try_recv().unwrap();
+            tracking.release(packet.len());
+            assert_eq!(limit.usage(), (0, 0));
+        }
+
+        #[tokio::test]
+        async fn bootstrap_writes_one_maximum_message_at_a_time() {
+            let (_sender, _receiver, tracking, limit, cancellation) = outbox(8, 8);
+            let (mut writer, mut reader) = tokio::io::duplex(64);
+            let outbound = AtomicU64::new(0);
+            assert!(
+                write_extension_bootstrap(
+                    &mut writer,
+                    super::super::ExtensionBootstrap {
+                        messages: vec![vec![1; 8]],
+                        init: vec![2; 8],
+                        barrier: None,
+                    },
+                    &tracking,
+                    FrameWritePolicy {
+                        direct_frame_bytes: 8,
+                        fragment_chunk_bytes: 8,
+                    },
+                    &outbound,
+                    Some(Duration::from_secs(1)),
+                    &cancellation,
+                )
+                .await
+            );
+            assert_eq!(cancellation.failure(), None);
+            assert_eq!(limit.usage(), (0, 0));
+            assert_eq!(outbound.load(Ordering::Relaxed), 24);
+            assert_eq!(read_frame(&mut reader).await.unwrap(), vec![1; 8]);
+            assert_eq!(read_frame(&mut reader).await.unwrap(), vec![2; 8]);
+        }
+
+        #[tokio::test]
+        async fn bootstrap_holds_reserved_init_until_publication_commits() {
+            let (_sender, _receiver, tracking, limit, cancellation) = outbox(8, 8);
+            let (writer, mut reader) = tokio::io::duplex(64);
+            let (init_reserved_tx, init_reserved_rx) = oneshot::channel();
+            let (commit_init_tx, commit_init_rx) = oneshot::channel();
+            let outbound = Arc::new(AtomicU64::new(0));
+            let writing = {
+                let tracking = Arc::clone(&tracking);
+                let outbound = Arc::clone(&outbound);
+                let cancellation = cancellation.clone();
+                tokio::spawn(async move {
+                    let mut writer = writer;
+                    write_extension_bootstrap(
+                        &mut writer,
+                        super::super::ExtensionBootstrap {
+                            messages: vec![vec![1; 8]],
+                            init: vec![2; 8],
+                            barrier: Some(ExtensionBootstrapBarrier {
+                                init_reserved: init_reserved_tx,
+                                commit_init: commit_init_rx,
+                            }),
+                        },
+                        &tracking,
+                        FrameWritePolicy {
+                            direct_frame_bytes: 8,
+                            fragment_chunk_bytes: 8,
+                        },
+                        &outbound,
+                        Some(Duration::from_secs(1)),
+                        &cancellation,
+                    )
+                    .await
+                })
+            };
+
+            init_reserved_rx.await.unwrap();
+            assert_eq!(limit.usage(), (8, 1));
+            assert_eq!(read_frame(&mut reader).await.unwrap(), vec![1; 8]);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), read_frame(&mut reader))
+                    .await
+                    .is_err(),
+                "INIT must remain private until RUNNING is published"
+            );
+            commit_init_tx.send(()).unwrap();
+            assert_eq!(read_frame(&mut reader).await.unwrap(), vec![2; 8]);
+            assert!(writing.await.unwrap());
+            assert_eq!(limit.usage(), (0, 0));
+            assert_eq!(outbound.load(Ordering::Relaxed), 24);
+        }
+
+        #[tokio::test]
+        async fn dropped_publication_releases_init_without_writing_it() {
+            let (_sender, _receiver, tracking, limit, cancellation) = outbox(8, 8);
+            let (writer, mut reader) = tokio::io::duplex(64);
+            let (init_reserved_tx, init_reserved_rx) = oneshot::channel();
+            let (commit_init_tx, commit_init_rx) = oneshot::channel();
+            let outbound = Arc::new(AtomicU64::new(0));
+            let writing = {
+                let tracking = Arc::clone(&tracking);
+                let outbound = Arc::clone(&outbound);
+                let cancellation = cancellation.clone();
+                tokio::spawn(async move {
+                    let mut writer = writer;
+                    write_extension_bootstrap(
+                        &mut writer,
+                        super::super::ExtensionBootstrap {
+                            messages: vec![vec![1; 8]],
+                            init: vec![2; 8],
+                            barrier: Some(ExtensionBootstrapBarrier {
+                                init_reserved: init_reserved_tx,
+                                commit_init: commit_init_rx,
+                            }),
+                        },
+                        &tracking,
+                        FrameWritePolicy {
+                            direct_frame_bytes: 8,
+                            fragment_chunk_bytes: 8,
+                        },
+                        &outbound,
+                        Some(Duration::from_secs(1)),
+                        &cancellation,
+                    )
+                    .await
+                })
+            };
+
+            init_reserved_rx.await.unwrap();
+            assert_eq!(read_frame(&mut reader).await.unwrap(), vec![1; 8]);
+            drop(commit_init_tx);
+            assert!(!writing.await.unwrap());
+            assert_eq!(limit.usage(), (0, 0));
+            assert!(read_frame(&mut reader).await.is_none());
+            assert_eq!(outbound.load(Ordering::Relaxed), 12);
+        }
+
+        #[tokio::test]
+        async fn a_full_duplex_write_reports_no_progress() {
+            let (mut writer, _reader) = tokio::io::duplex(1);
+            let result = write_all_with_progress_timeout(
+                &mut writer,
+                &[1, 2],
+                Some(Duration::from_millis(20)),
+            )
+            .await;
+            assert_eq!(result, Err(FrameWriteError::NoProgress));
         }
     }
 
@@ -16378,15 +21755,44 @@ mod tests {
     fn test_client_with_capacity(
         _capacity: usize,
     ) -> (ClientState, mpsc::UnboundedReceiver<Vec<u8>>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (raw_tx, rx) = mpsc::unbounded_channel();
+        let (raw_channel_tx, _channel_rx) = mpsc::unbounded_channel();
+        let (kick_tx, _kick_rx) = mpsc::unbounded_channel();
+        let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         #[cfg(target_os = "linux")]
-        let (audio_tx, _audio_rx) = mpsc::unbounded_channel();
+        let (raw_audio_tx, _audio_rx) = mpsc::unbounded_channel();
+        #[cfg(target_os = "linux")]
+        let audio_tx = TrackedAudioSender {
+            tx: raw_audio_tx,
+            tracking: None,
+        };
+        let outbox_queued_frames = Arc::new(AtomicUsize::new(0));
+        let outbox_queued_bytes = Arc::new(AtomicUsize::new(0));
+        let tracking = Arc::new(OutboxTracking {
+            queued_frames: outbox_queued_frames.clone(),
+            queued_bytes: outbox_queued_bytes.clone(),
+            extension_limit: None,
+            drain_notify: std::sync::Mutex::new(None),
+        });
         let client = ClientState {
-            tx,
-            outbox_queued_frames: Arc::new(AtomicUsize::new(0)),
-            outbox_queued_bytes: Arc::new(AtomicUsize::new(0)),
+            tx: TrackedOutboxSender::new(raw_tx, tracking.clone()),
+            channel_tx: TrackedChannelSender {
+                tx: raw_channel_tx,
+                tracking,
+            },
+            kick_tx,
+            terminal_tx,
+            outbox_queued_frames,
+            outbox_queued_bytes,
             write_blocked_us: Arc::new(AtomicU64::new(0)),
             write_blocked_us_seen: 0,
+            outbound_bytes: Arc::new(AtomicU64::new(0)),
+            outbound_bytes_seen: 0,
+            outbound_sampled_at: Instant::now(),
+            outbound_bytes_per_sec: 0,
+            client_catalog_watches: FxHashMap::default(),
+            connected_at: Instant::now(),
+            aux_subscriptions: Vec::new(),
             #[cfg(target_os = "linux")]
             audio_tx,
             lead: None,
@@ -16394,6 +21800,20 @@ mod tests {
             surface_subscriptions: FxHashSet::default(),
             #[cfg(target_os = "linux")]
             audio_subscribed: false,
+            #[cfg(target_os = "linux")]
+            desktop_subscriptions: 0,
+            #[cfg(target_os = "linux")]
+            mpris_subscribed: false,
+            #[cfg(target_os = "linux")]
+            last_mpris_snapshot: None,
+            #[cfg(target_os = "linux")]
+            mpris_action_tokens: 20.0,
+            #[cfg(target_os = "linux")]
+            mpris_action_refilled_at: Instant::now(),
+            #[cfg(target_os = "linux")]
+            last_media_capabilities: None,
+            #[cfg(target_os = "linux")]
+            media_capabilities: MediaCapabilities::default(),
             #[cfg(target_os = "linux")]
             audio_bitrate_kbps: 0,
             view_sizes: FxHashMap::default(),
@@ -16460,6 +21880,414 @@ mod tests {
     fn test_client() -> ClientState {
         let (client, _rx) = test_client_with_capacity(0);
         client
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mpris_action_budget_has_twenty_token_burst_and_refills() {
+        let mut client = test_client();
+        let now = Instant::now();
+        client.mpris_action_tokens = 20.0;
+        client.mpris_action_refilled_at = now;
+        for _ in 0..20 {
+            assert!(consume_mpris_action_token(&mut client, now));
+        }
+        assert!(!consume_mpris_action_token(&mut client, now));
+        assert!(consume_mpris_action_token(
+            &mut client,
+            now + Duration::from_millis(100)
+        ));
+        assert!(!consume_mpris_action_token(
+            &mut client,
+            now + Duration::from_millis(100)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mpris_player(position_us: i64, length_us: i64) -> blit_remote::media::MprisPlayer {
+        blit_remote::media::MprisPlayer {
+            player_id: 1,
+            revision: 1,
+            track_revision: 1,
+            active: true,
+            playback_status: blit_remote::media::PlaybackStatus::Playing,
+            loop_status: blit_remote::media::LoopStatus::None,
+            shuffle: false,
+            capability_flags: 0,
+            rate_ppm: 1_000_000,
+            minimum_rate_ppm: 1_000_000,
+            maximum_rate_ppm: 1_000_000,
+            volume_ppm: 1_000_000,
+            position_us,
+            length_us,
+            identity: String::new(),
+            desktop_entry: String::new(),
+            title: String::new(),
+            album: String::new(),
+            artists: Vec::new(),
+            artwork_width: 0,
+            artwork_height: 0,
+            artwork_png: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cached_mpris_replay_advances_from_observation_and_clamps() {
+        let now = Instant::now();
+        let observed_at = now - Duration::from_secs(2);
+        let mut player = mpris_player(1_000_000, 4_000_000);
+        player.rate_ppm = 2_000_000;
+
+        let replay = mpris_player_at(&player, observed_at, now);
+        assert_eq!(replay.position_us, 4_000_000);
+        assert_eq!(player.position_us, 1_000_000);
+
+        player.rate_ppm = -1_000_000;
+        let replay = mpris_player_at(&player, observed_at, now);
+        assert_eq!(replay.position_us, 0);
+
+        player.playback_status = blit_remote::media::PlaybackStatus::Paused;
+        player.position_us = 5_000_000;
+        assert_eq!(
+            mpris_player_at(&player, observed_at, now).position_us,
+            4_000_000
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mpris_action_queue_failures_report_unavailable_vs_backpressure() {
+        assert_eq!(mpris_action_queue_status(false, false), Some(STATUS_OTHER));
+        assert_eq!(mpris_action_queue_status(true, false), Some(STATUS_BUDGET));
+        assert_eq!(mpris_action_queue_status(true, true), None);
+    }
+
+    #[tokio::test]
+    async fn counted_writer_measures_the_length_prefix_and_payload() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let bytes = AtomicU64::new(0);
+        assert!(write_frame_counted(&mut writer, b"catalog", &bytes).await);
+        assert_eq!(bytes.load(Ordering::Relaxed), 11);
+
+        let mut framed = [0u8; 11];
+        reader.read_exact(&mut framed).await.unwrap();
+        assert_eq!(&framed[..4], &7u32.to_le_bytes());
+        assert_eq!(&framed[4..], b"catalog");
+    }
+
+    #[test]
+    fn client_control_lists_all_clients_and_kicks_target() {
+        let mut sess = Session::new();
+        let mut requester = test_client();
+        requester.connected_at = Instant::now() - Duration::from_secs(3);
+        requester.outbound_bytes_per_sec = 300;
+        requester.subscriptions.insert(11);
+        requester.view_sizes.insert(11, (40, 120));
+        requester.surface_subscriptions.insert(4);
+        requester.surface_view_sizes.insert(4, (1920, 1080, 120));
+        requester.aux_subscriptions = vec![blit_remote::ClientAuxSubscription {
+            kind: blit_remote::CLIENT_SUBSCRIPTION_KV,
+            id: 8,
+        }];
+        sess.clients.insert(9, requester);
+        let mut peer = test_client();
+        peer.connected_at = Instant::now() - Duration::from_secs(5);
+        peer.outbound_bytes_per_sec = 100;
+        peer.aux_subscriptions = vec![blit_remote::ClientAuxSubscription {
+            kind: blit_remote::CLIENT_SUBSCRIPTION_FS,
+            id: 4,
+        }];
+        sess.clients.insert(2, peer);
+        let mut target = test_client();
+        target.connected_at = Instant::now() - Duration::from_secs(8);
+        target.outbound_bytes_per_sec = 200;
+        target.subscriptions.insert(7);
+        target.view_sizes.insert(7, (24, 80));
+        target.surface_subscriptions.insert(3);
+        target.surface_view_sizes.insert(3, (1280, 720, 180));
+        target.aux_subscriptions = vec![blit_remote::ClientAuxSubscription {
+            kind: blit_remote::CLIENT_SUBSCRIPTION_GIT,
+            id: 6,
+        }];
+        let (kick_tx, mut kick_rx) = mpsc::unbounded_channel();
+        target.kick_tx = kick_tx;
+        sess.clients.insert(5, target);
+
+        let msg = sess.client_list_msg(9, 17);
+        let Some(blit_remote::ServerMsg::ClientList {
+            nonce,
+            self_id,
+            clients,
+        }) = blit_remote::parse_server_msg(&msg)
+        else {
+            panic!("expected client list");
+        };
+        assert_eq!((nonce, self_id), (17, 9));
+        assert_eq!(clients.len(), 3);
+        assert_eq!(clients[0].client_id, 2);
+        assert!(clients[0].age_secs >= 5);
+        assert_eq!(clients[0].outbound_bytes_per_sec, 100);
+        assert_eq!(
+            clients[0].subscriptions,
+            [blit_remote::ClientAuxSubscription {
+                kind: blit_remote::CLIENT_SUBSCRIPTION_FS,
+                id: 4,
+            }]
+        );
+        assert_eq!(clients[1].client_id, 5);
+        assert!(clients[1].age_secs >= 8);
+        assert_eq!(clients[1].outbound_bytes_per_sec, 200);
+        assert_eq!(
+            clients[1].terminals,
+            [blit_remote::ClientTerminalSubscription {
+                pty_id: 7,
+                rows: 24,
+                cols: 80,
+            }]
+        );
+        assert_eq!(
+            clients[1].surfaces,
+            [blit_remote::ClientSurfaceSubscription {
+                surface_id: 3,
+                width: 1280,
+                height: 720,
+                scale_120: 180,
+            }]
+        );
+        assert_eq!(
+            clients[1].subscriptions,
+            [blit_remote::ClientAuxSubscription {
+                kind: blit_remote::CLIENT_SUBSCRIPTION_GIT,
+                id: 6,
+            }]
+        );
+        assert_eq!(clients[2].client_id, 9);
+        assert!(clients[2].age_secs >= 3);
+        assert_eq!(clients[2].outbound_bytes_per_sec, 300);
+        assert_eq!(
+            clients[2].terminals,
+            [blit_remote::ClientTerminalSubscription {
+                pty_id: 11,
+                rows: 40,
+                cols: 120,
+            }]
+        );
+        assert_eq!(
+            clients[2].surfaces,
+            [blit_remote::ClientSurfaceSubscription {
+                surface_id: 4,
+                width: 1920,
+                height: 1080,
+                scale_120: 120,
+            }]
+        );
+        assert_eq!(
+            clients[2].subscriptions,
+            [blit_remote::ClientAuxSubscription {
+                kind: blit_remote::CLIENT_SUBSCRIPTION_KV,
+                id: 8,
+            }]
+        );
+
+        assert_eq!(sess.kick_client(9, 5, "duplicate tab"), (STATUS_OK, ""));
+        assert_eq!(kick_rx.try_recv().unwrap(), "duplicate tab");
+        assert_eq!(
+            sess.kick_client(9, 9, "self"),
+            (STATUS_INVALID, "a client cannot kick itself")
+        );
+        assert_eq!(
+            sess.kick_client(9, 99, "gone"),
+            (STATUS_NOT_FOUND, "client is not connected")
+        );
+    }
+
+    #[test]
+    fn client_catalog_watch_pushes_only_changes_until_unwatched() {
+        let mut sess = Session::new();
+        let (watcher, mut watcher_rx) = test_client_with_capacity(0);
+        sess.clients.insert(9, watcher);
+        sess.clients.insert(2, test_client());
+
+        sess.watch_client_list(9, 31);
+        assert!(matches!(
+            blit_remote::parse_server_msg(&watcher_rx.try_recv().unwrap()),
+            Some(blit_remote::ServerMsg::ClientList {
+                nonce: 31,
+                self_id: 9,
+                ..
+            })
+        ));
+        sess.publish_client_catalogs();
+        assert!(matches!(
+            watcher_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        sess.clients.get_mut(&2).unwrap().aux_subscriptions =
+            vec![blit_remote::ClientAuxSubscription {
+                kind: blit_remote::CLIENT_SUBSCRIPTION_KV,
+                id: 7,
+            }];
+        sess.publish_client_catalogs();
+        let changed = watcher_rx.try_recv().unwrap();
+        assert!(matches!(
+            blit_remote::parse_server_msg(&changed),
+            Some(blit_remote::ServerMsg::ClientList { nonce: 31, clients, .. })
+                if clients[0].subscriptions == [blit_remote::ClientAuxSubscription {
+                    kind: blit_remote::CLIENT_SUBSCRIPTION_KV,
+                    id: 7,
+                }]
+        ));
+
+        sess.unwatch_client_list(9, 31);
+        sess.clients.get_mut(&2).unwrap().aux_subscriptions.clear();
+        sess.publish_client_catalogs();
+        assert!(matches!(
+            watcher_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    /// A kicked client must be told why before the writer task is aborted.
+    #[tokio::test]
+    async fn kick_notice_is_confirmed_before_the_writer_is_abandoned() {
+        let (terminal_tx, mut terminal_rx) =
+            mpsc::unbounded_channel::<(Vec<u8>, oneshot::Sender<()>)>();
+
+        // A live writer: take the notice, write it, then acknowledge.
+        let writer = tokio::spawn(async move {
+            let (notice, sent) = terminal_rx.recv().await.expect("notice");
+            let mut sink = Vec::new();
+            assert!(write_frame(&mut sink, &notice).await);
+            let _ = sent.send(());
+            sink
+        });
+        assert!(
+            deliver_terminal_notice(
+                &terminal_tx,
+                msg_kicked("duplicate tab"),
+                TERMINAL_NOTICE_TIMEOUT,
+            )
+            .await,
+            "a writer that acknowledges must be waited for"
+        );
+        // The reason is on the wire, framed, before the caller aborts.
+        let written = writer.await.unwrap();
+        assert_eq!(
+            u32::from_le_bytes(written[..4].try_into().unwrap()) as usize,
+            written.len() - 4
+        );
+        assert!(matches!(
+            blit_remote::parse_server_msg(&written[4..]),
+            Some(blit_remote::ServerMsg::Kicked {
+                reason: "duplicate tab"
+            })
+        ));
+
+        // A wedged peer never acknowledges: bounded, not hung.
+        let (stuck_tx, _stuck_rx) = mpsc::unbounded_channel::<(Vec<u8>, oneshot::Sender<()>)>();
+        assert!(
+            !deliver_terminal_notice(&stuck_tx, msg_kicked("wedged"), Duration::from_millis(50),)
+                .await
+        );
+
+        // A writer that already died cannot be waited for at all.
+        let (dead_tx, dead_rx) = mpsc::unbounded_channel::<(Vec<u8>, oneshot::Sender<()>)>();
+        drop(dead_rx);
+        assert!(
+            !deliver_terminal_notice(&dead_tx, msg_kicked("gone"), TERMINAL_NOTICE_TIMEOUT,).await
+        );
+    }
+
+    /// Every family gets its documented kind byte, and the result is sorted by
+    /// (kind, id) so the catalog encoding is deterministic — the watch push
+    /// suppresses unchanged snapshots by comparing encoded bytes.
+    #[test]
+    fn aux_subscriptions_are_labelled_by_family_and_sorted() {
+        use blit_remote::{
+            CLIENT_SUBSCRIPTION_FS, CLIENT_SUBSCRIPTION_GIT, CLIENT_SUBSCRIPTION_KV,
+            CLIENT_SUBSCRIPTION_LSP, CLIENT_SUBSCRIPTION_NET,
+        };
+        let mut out = Vec::new();
+        // Deliberately out of order within and across families.
+        fill_client_aux_subscriptions(
+            &mut out,
+            [7u16, 2].into_iter(),
+            [4u16].into_iter(),
+            [9u16, 1].into_iter(),
+            [3u16].into_iter(),
+            [5u16].into_iter(),
+        );
+        let pairs: Vec<(u8, u16)> = out.iter().map(|s| (s.kind, s.id)).collect();
+        assert_eq!(
+            pairs,
+            [
+                (CLIENT_SUBSCRIPTION_FS, 2),
+                (CLIENT_SUBSCRIPTION_FS, 7),
+                (CLIENT_SUBSCRIPTION_GIT, 4),
+                (CLIENT_SUBSCRIPTION_LSP, 1),
+                (CLIENT_SUBSCRIPTION_LSP, 9),
+                (CLIENT_SUBSCRIPTION_KV, 3),
+                (CLIENT_SUBSCRIPTION_NET, 5),
+            ]
+        );
+        // Kinds are the wire values docs/protocol.md publishes; drifting them
+        // silently remaps what the browser labels each subscription.
+        assert_eq!(
+            (
+                CLIENT_SUBSCRIPTION_FS,
+                CLIENT_SUBSCRIPTION_GIT,
+                CLIENT_SUBSCRIPTION_LSP,
+                CLIENT_SUBSCRIPTION_KV,
+                CLIENT_SUBSCRIPTION_NET,
+            ),
+            (2, 3, 4, 5, 6)
+        );
+    }
+
+    /// The mirror is what keeps the session lock out of the filesystem, git,
+    /// LSP, KV and network streams, which call it after every message.
+    #[test]
+    fn aux_subscription_mirror_only_reports_real_changes() {
+        let fs_syncs = FsSyncs::default();
+        let git_repos = GitRepos::default();
+        let lsp_conns = LspConns::default();
+        let kv_subs = kv::KvSubs::default();
+        let net_sockets = net::NetSockets::default();
+        let mut mirror = AuxSubscriptionMirror::default();
+        let adopt = |mirror: &mut AuxSubscriptionMirror| {
+            mirror.adopt_if_changed(&fs_syncs, &git_repos, &lsp_conns, &kv_subs, &net_sockets)
+        };
+
+        // Nothing subscribed: the first call must not claim a change, or
+        // every connection would take the lock on its very first message.
+        assert!(!adopt(&mut mirror));
+        // Repeating against unchanged tables is the common case and has to
+        // stay silent.
+        for _ in 0..3 {
+            assert!(!adopt(&mut mirror));
+        }
+
+        // A set that no longer matches the tables is adopted once, then goes
+        // quiet again. Poking `known` stands in for a closed subscription;
+        // building real engine entries here would test the engines, not this.
+        mirror.known = vec![blit_remote::ClientAuxSubscription {
+            kind: blit_remote::CLIENT_SUBSCRIPTION_KV,
+            id: 7,
+        }];
+        assert!(adopt(&mut mirror));
+        assert!(mirror.known.is_empty());
+        assert!(!adopt(&mut mirror));
+
+        // The scratch buffer is reused across calls, so a dropped clear()
+        // would let stale entries accumulate instead of being rebuilt.
+        mirror.scratch = vec![blit_remote::ClientAuxSubscription {
+            kind: blit_remote::CLIENT_SUBSCRIPTION_NET,
+            id: 3,
+        }];
+        assert!(!adopt(&mut mirror));
+        assert!(mirror.scratch.is_empty());
     }
 
     fn touch_event(
@@ -17120,6 +22948,180 @@ mod tests {
         let mut frame = FrameState::new(2, 8);
         frame.write_text(0, 0, text, blit_remote::CellStyle::default());
         frame
+    }
+
+    #[tokio::test]
+    async fn extension_native_open_controls_bypass_saturated_job_admission() {
+        use blit_remote::{fs::*, git::*, lsp::*};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let global = extension_jobs::GlobalTracker::test_single_active();
+        let endpoint = global.endpoint(ConnectionCancellation::default());
+        let blocker_started = Arc::new(AtomicBool::new(false));
+        let blocker_release = Arc::new(AtomicBool::new(false));
+        let started = blocker_started.clone();
+        let release = blocker_release.clone();
+        endpoint
+            .spawn_blocking(1, move || {
+                started.store(true, Ordering::Release);
+                while !release.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            })
+            .unwrap();
+        while !blocker_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+        let (out, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut fs_syncs = FsSyncs::default();
+        let mut git_repos =
+            GitRepos::with_jobs(Some(endpoint.clone()), Some(completion_tx.clone()));
+        let mut lsp_conns =
+            LspConns::with_jobs(Some(endpoint.clone()), Some(completion_tx.clone()));
+        let dir = std::env::temp_dir().join(format!(
+            "blit-extension-open-admission-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // All three spawn-capable opens must return after bounded pending
+        // admission, without waiting for the only active permit.
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            handle_fs_message_with_jobs(
+                &msg_fs_sync(11, FS_SYNC_RECURSIVE, 0, 0, &dir.to_string_lossy()),
+                &mut fs_syncs,
+                &out,
+                false,
+                Some(&endpoint),
+                Some(&completion_tx),
+            ),
+        )
+        .await
+        .expect("filesystem open waited for an active permit");
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            handle_git_message(
+                &msg_git_open(&GitOpenRequest::new(12, 0, "/does-not-run")),
+                &mut git_repos,
+                &out,
+                false,
+            ),
+        )
+        .await
+        .expect("git open waited for an active permit");
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            handle_lsp_message(
+                &msg_lsp_open(13, 0, 0, "/does-not-run"),
+                &mut lsp_conns,
+                &out,
+                false,
+            ),
+        )
+        .await
+        .expect("LSP open waited for an active permit");
+        assert_eq!(fs_syncs.pending_opens, 1);
+        assert_eq!(git_repos.pending_opens, 1);
+        assert_eq!(lsp_conns.pending_opens.len(), 1);
+
+        // Established-stream ACKs are silent no-ops for unknown ids and never
+        // wait behind the pending opens.
+        handle_fs_message_with_jobs(
+            &msg_fs_ack(999, 1),
+            &mut fs_syncs,
+            &out,
+            false,
+            Some(&endpoint),
+            Some(&completion_tx),
+        )
+        .await;
+        handle_git_message(&msg_git_ack(999, 1), &mut git_repos, &out, false).await;
+        handle_lsp_message(
+            &msg_lsp_ack(999, LSP_STREAM_STATE, 1),
+            &mut lsp_conns,
+            &out,
+            false,
+        )
+        .await;
+        assert!(out_rx.try_recv().is_err());
+
+        // Family nonce cancellation wakes pending admission before the active
+        // permit is released, retires each nonce, and yields one correlated
+        // CANCELLED reply without launching the native calls.
+        handle_git_message(&msg_git_cancel(12), &mut git_repos, &out, false).await;
+        handle_lsp_message(&msg_lsp_cancel(13), &mut lsp_conns, &out, false).await;
+        for _ in 0..2 {
+            let completion = tokio::time::timeout(Duration::from_secs(1), completion_rx.recv())
+                .await
+                .expect("nonce cancellation did not bypass active admission")
+                .expect("completion lane closed");
+            apply_native_open_completion(
+                completion,
+                &mut fs_syncs,
+                &mut git_repos,
+                &mut lsp_conns,
+                &out,
+                false,
+            );
+        }
+        let mut git_cancelled = false;
+        let mut lsp_cancelled = false;
+        for _ in 0..2 {
+            let msg = out_rx.recv().await.expect("cancelled open reply");
+            match msg[0] {
+                S2C_GIT_REPO => {
+                    git_cancelled = parse_git_repo(&msg).unwrap().status == GIT_STATUS_CANCELLED;
+                }
+                S2C_LSP_OPENED => {
+                    lsp_cancelled = parse_lsp_opened(&msg).unwrap().status == LSP_STATUS_CANCELLED;
+                }
+                opcode => panic!("unexpected cancelled-open reply {opcode:#x}"),
+            }
+        }
+        assert!(git_cancelled && lsp_cancelled);
+        assert_eq!(git_repos.pending_opens, 0);
+        assert!(git_repos.cancels.lock().unwrap().is_empty());
+        assert!(lsp_conns.pending_opens.is_empty());
+        assert!(lsp_conns.inflight.lock().unwrap().is_empty());
+
+        // Releasing the permit lets the uncancelled filesystem open finish;
+        // its correlated reply is published before its engine can stream.
+        blocker_release.store(true, Ordering::Release);
+        let completion = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
+            .await
+            .expect("filesystem open did not complete")
+            .expect("completion lane closed");
+        apply_native_open_completion(
+            completion,
+            &mut fs_syncs,
+            &mut git_repos,
+            &mut lsp_conns,
+            &out,
+            false,
+        );
+        let synced = loop {
+            let msg = out_rx.recv().await.expect("FS_SYNCED reply");
+            if msg[0] == S2C_FS_SYNCED {
+                break msg;
+            }
+        };
+        assert_eq!(u16::from_le_bytes([synced[1], synced[2]]), 11);
+        assert_ne!(
+            u16::from_le_bytes([synced[3], synced[4]]),
+            FS_SYNC_ID_INVALID
+        );
+        assert_eq!(synced[5], FS_STATUS_OK);
+        assert_eq!(fs_syncs.pending_opens, 0);
+
+        drop(fs_syncs);
+        drop(git_repos);
+        drop(lsp_conns);
+        endpoint.cancel_and_drain().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Full fs-sync flow through the connection-level handler: SYNC →
@@ -21093,6 +27095,60 @@ mod tests {
     }
 
     #[test]
+    fn destroyed_surface_retires_every_client_claim_for_reused_id() {
+        let (mut client, _rx) = test_client_with_capacity(64);
+        let now = Instant::now();
+        for sid in [8u16, 9] {
+            client.surface_subscriptions.insert(sid);
+            client.surface_subs.entry(sid).or_default().has_keyframe = true;
+            client.surface_view_sizes.insert(sid, (800, 600, 120));
+            client.surface_claim_lapses.insert(sid, now);
+            client
+                .surface_inflight_frames
+                .push_back(SurfaceInFlightFrame {
+                    sent_at: now,
+                    bytes: 1024,
+                    surface_id: sid,
+                });
+        }
+        client.vulkan_video_surfaces.insert(
+            8,
+            VulkanVideoSurfaceState {
+                encoder_name: "test",
+                codec_flag: 1,
+                width: 800,
+                height: 600,
+                is_444: false,
+            },
+        );
+
+        assert!(invalidate_client_surface(&mut client, 8, true));
+
+        assert!(!client.surface_subscriptions.contains(&8));
+        assert!(!client.surface_subs.contains_key(&8));
+        assert!(!client.surface_view_sizes.contains_key(&8));
+        assert!(!client.surface_claim_lapses.contains_key(&8));
+        assert!(!client.vulkan_video_surfaces.contains_key(&8));
+        assert!(
+            client
+                .surface_inflight_frames
+                .iter()
+                .all(|frame| frame.surface_id != 8)
+        );
+
+        assert!(client.surface_subscriptions.contains(&9));
+        assert!(client.surface_subs.contains_key(&9));
+        assert!(client.surface_view_sizes.contains_key(&9));
+        assert!(client.surface_claim_lapses.contains_key(&9));
+        assert!(
+            client
+                .surface_inflight_frames
+                .iter()
+                .any(|frame| frame.surface_id == 9)
+        );
+    }
+
+    #[test]
     fn a_generation_that_encoded_to_nothing_is_not_marked_sent() {
         // `unchanged` reads `last_encoded_gen` as "the client already has
         // this".  An encode that produced no bitstream sent nothing, so
@@ -23183,6 +29239,144 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn disabled_process_family_refuses_correlated_requests() {
+        use blit_remote::process::*;
+
+        let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let spawn = msg_process_spawn(&ProcessSpawnRequest {
+            nonce: 1,
+            process_id: 2,
+            flags: 0,
+            cwd_kind: PROCESS_CWD_DEFAULT,
+            src_pty_id: 0,
+            cwd: b"",
+            argv: vec![b"true"],
+            env: vec![],
+        })
+        .unwrap();
+        refuse_process_message(&spawn, |reply| {
+            let _ = out.send(reply);
+        });
+        let reply = rx.try_recv().expect("spawn reply");
+        let started = parse_process_started(&reply).unwrap();
+        assert_eq!(
+            (started.nonce, started.process_id, started.status),
+            (1, 2, blit_remote::STATUS_PERMISSION)
+        );
+        assert_eq!(started.process_ref, 0);
+        assert_eq!(
+            (
+                started.stdin_window,
+                started.stdout_window,
+                started.stderr_window
+            ),
+            (0, 0, 0)
+        );
+
+        let control = msg_process_control(ProcessControl {
+            nonce: 3,
+            process_id: 2,
+            action: PROCESS_CONTROL_KILL,
+            value: 0,
+        })
+        .unwrap();
+        refuse_process_message(&control, |reply| {
+            let _ = out.send(reply);
+        });
+        let reply = rx.try_recv().expect("control reply");
+        let controlled = parse_process_controlled(&reply).unwrap();
+        assert_eq!(
+            (controlled.nonce, controlled.process_id, controlled.status),
+            (3, 2, blit_remote::STATUS_PERMISSION)
+        );
+
+        let list = msg_process_list(ProcessList { nonce: 4 });
+        refuse_process_message(&list, |reply| {
+            let _ = out.send(reply);
+        });
+        let reply = rx.try_recv().expect("list reply");
+        let listed = parse_process_listed(&reply).unwrap();
+        assert_eq!(
+            (listed.nonce, listed.status, listed.revision),
+            (4, blit_remote::STATUS_PERMISSION, 0)
+        );
+        assert!(listed.entries.is_empty());
+
+        let watch = msg_process_watch(ProcessWatch {
+            nonce: 4,
+            process_id: 5,
+            process_ref: 9,
+            flags: 0,
+        })
+        .unwrap();
+        refuse_process_message(&watch, |reply| {
+            let _ = out.send(reply);
+        });
+        let reply = rx.try_recv().expect("watch reply");
+        let watched = parse_process_watched(&reply).unwrap();
+        assert_eq!(
+            (
+                watched.nonce,
+                watched.process_id,
+                watched.process_ref,
+                watched.status
+            ),
+            (4, 5, 9, blit_remote::STATUS_PERMISSION)
+        );
+        assert_eq!((watched.state, watched.stream_state), (0, 0));
+
+        let mut invalid_watch = vec![C2S_PROCESS_WATCH];
+        invalid_watch.extend_from_slice(&6u16.to_le_bytes());
+        invalid_watch.extend_from_slice(&7u32.to_le_bytes());
+        invalid_watch.extend_from_slice(&0u64.to_le_bytes());
+        refuse_process_message(&invalid_watch, |reply| {
+            let _ = out.send(reply);
+        });
+        let reply = rx.try_recv().expect("invalid watch reply");
+        let watched = parse_process_watched(&reply).unwrap();
+        assert_eq!(
+            (
+                watched.nonce,
+                watched.process_id,
+                watched.process_ref,
+                watched.status
+            ),
+            (6, 7, 0, STATUS_INVALID)
+        );
+
+        // A structurally invalid correlated request is INVALID, not a
+        // misleading policy refusal.
+        let mut invalid_spawn = spawn;
+        invalid_spawn[7] = 0x80;
+        refuse_process_message(&invalid_spawn, |reply| {
+            let _ = out.send(reply);
+        });
+        let reply = rx.try_recv().expect("invalid reply");
+        let started = parse_process_started(&reply).unwrap();
+        assert_eq!(started.status, STATUS_INVALID);
+
+        let stdin = msg_process_stdin(ProcessStdin {
+            process_id: 2,
+            offset: 0,
+            data: b"x",
+        })
+        .unwrap();
+        refuse_process_message(&stdin, |reply| {
+            let _ = out.send(reply);
+        });
+        let ack = msg_process_output_ack(ProcessOutputAck {
+            process_id: 2,
+            stream: PROCESS_STREAM_STDOUT,
+            bytes: 0,
+        })
+        .unwrap();
+        refuse_process_message(&ack, |reply| {
+            let _ = out.send(reply);
+        });
+        assert!(rx.try_recv().is_err(), "stream operations have no reply");
     }
 
     /// With the family disabled, every nonce-bearing LSP request still gets

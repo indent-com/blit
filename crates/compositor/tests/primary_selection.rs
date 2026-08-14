@@ -28,7 +28,7 @@ use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_offer_v1 as poffer, zwp_primary_selection_source_v1 as psrc,
 };
 
-use blit_compositor::{CompositorHandle, spawn_compositor};
+use blit_compositor::{CompositorHandle, spawn_compositor_without_renderer};
 
 const TEXT: &str = "selected in one app";
 const MIME: &str = "text/plain;charset=utf-8";
@@ -231,7 +231,7 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let handle = spawn_compositor(false, Arc::new(|| {}), "");
+        let handle = spawn_compositor_without_renderer(false, Arc::new(|| {}));
         let socket = handle.socket_name.clone();
         Self {
             handle: Some(handle),

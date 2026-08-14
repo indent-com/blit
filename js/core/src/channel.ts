@@ -1,0 +1,304 @@
+/** Native bidirectional channels (`docs/design/extensions.md`). */
+
+export const CHANNEL = 0x95;
+export const FEATURE_CHANNEL = 1 << 12;
+
+export const CHANNEL_LISTEN = 1;
+export const CHANNEL_CONNECT = 2;
+export const CHANNEL_DATA = 3;
+export const CHANNEL_ACK = 4;
+export const CHANNEL_CLOSE = 5;
+
+export const CHANNEL_OPENED = 1;
+export const CHANNEL_ACCEPTED = 2;
+export const CHANNEL_CLOSED = 5;
+
+export const CHANNEL_EXPECT_LISTENER_TOKEN = 1 << 0;
+
+export const CHANNEL_CLOSE_NORMAL = 0;
+export const CHANNEL_CLOSE_CANCELLED = 1;
+export const CHANNEL_CLOSE_PEER_GONE = 2;
+export const CHANNEL_CLOSE_PROTOCOL_VIOLATION = 3;
+export const CHANNEL_CLOSE_SERVER_SHUTDOWN = 4;
+
+export const CHANNEL_MAX_NAME = 255;
+export const CHANNEL_MAX_PEER = 255;
+export const CHANNEL_MAX_METADATA = 64 * 1024;
+export const CHANNEL_MAX_PAYLOAD = 1024 * 1024;
+export const CHANNEL_MAX_DETAIL = 4 * 1024;
+export const CHANNEL_WINDOW_BYTES = 1024n * 1024n;
+export const CHANNEL_MAX_UNCONSUMED_MESSAGES = 1024;
+
+const encoder = new TextEncoder();
+const fatalDecoder = new TextDecoder("utf-8", { fatal: true });
+
+export type ChannelMessage =
+  | {
+      kind: "opened";
+      channelId: number;
+      status: number;
+      window: bigint;
+      peer: string;
+      metadata: Uint8Array;
+      detail: string;
+    }
+  | {
+      kind: "accepted";
+      channelId: number;
+      listenerId: number;
+      window: bigint;
+      peer: string;
+      metadata: Uint8Array;
+    }
+  | { kind: "data"; channelId: number; payload: Uint8Array }
+  | { kind: "ack"; channelId: number; bytes: bigint }
+  | {
+      kind: "closed";
+      channelId: number;
+      reason: number;
+      detail: string;
+    };
+
+export interface ChannelConnectOptions {
+  metadata?: Uint8Array;
+  /** Optimistically require one exact listener generation. */
+  listenerToken?: Uint8Array;
+}
+
+function envelope(
+  kind: number,
+  channelId: number,
+  bodyLength: number,
+): Uint8Array {
+  if (!Number.isInteger(channelId) || channelId < 0 || channelId > 0xffffffff) {
+    throw new RangeError("channel id must be a u32");
+  }
+  const message = new Uint8Array(6 + bodyLength);
+  const view = new DataView(message.buffer);
+  message[0] = CHANNEL;
+  message[1] = kind;
+  view.setUint32(2, channelId, true);
+  return message;
+}
+
+function clientId(channelId: number): void {
+  if ((channelId & 1) !== 0) {
+    throw new RangeError("client-created channel id must be even");
+  }
+}
+
+function channelName(name: string): Uint8Array {
+  if ([...name].some((character) => /\p{Cc}/u.test(character))) {
+    throw new Error("channel name contains a control character");
+  }
+  const bytes = encoder.encode(name);
+  if (bytes.length === 0 || bytes.length > CHANNEL_MAX_NAME) {
+    throw new RangeError("channel name must contain 1 to 255 UTF-8 bytes");
+  }
+  return bytes;
+}
+
+function metadataBytes(metadata: Uint8Array | undefined): Uint8Array {
+  const bytes = metadata ?? new Uint8Array(0);
+  if (bytes.length > CHANNEL_MAX_METADATA) {
+    throw new RangeError("channel metadata exceeds 64 KiB");
+  }
+  return bytes;
+}
+
+function buildOpen(
+  kind: number,
+  channelId: number,
+  name: string,
+  metadata: Uint8Array,
+  listenerToken?: Uint8Array,
+): Uint8Array {
+  clientId(channelId);
+  const nameBytes = channelName(name);
+  if (metadata.length > CHANNEL_MAX_METADATA) {
+    throw new RangeError("channel metadata exceeds 64 KiB");
+  }
+  if (listenerToken !== undefined && listenerToken.length !== 16) {
+    throw new RangeError("listener token must contain 16 bytes");
+  }
+  const tokenLength = listenerToken?.length ?? 0;
+  const message = envelope(
+    kind,
+    channelId,
+    1 + 2 + nameBytes.length + 4 + metadata.length + tokenLength,
+  );
+  const view = new DataView(message.buffer);
+  let offset = 6;
+  message[offset++] = listenerToken ? CHANNEL_EXPECT_LISTENER_TOKEN : 0;
+  view.setUint16(offset, nameBytes.length, true);
+  offset += 2;
+  message.set(nameBytes, offset);
+  offset += nameBytes.length;
+  view.setUint32(offset, metadata.length, true);
+  offset += 4;
+  message.set(metadata, offset);
+  offset += metadata.length;
+  if (listenerToken) message.set(listenerToken, offset);
+  return message;
+}
+
+export function buildChannelListenMessage(
+  channelId: number,
+  name: string,
+  metadata?: Uint8Array,
+): Uint8Array {
+  return buildOpen(CHANNEL_LISTEN, channelId, name, metadataBytes(metadata));
+}
+
+export function buildChannelConnectMessage(
+  channelId: number,
+  name: string,
+  options: ChannelConnectOptions = {},
+): Uint8Array {
+  return buildOpen(
+    CHANNEL_CONNECT,
+    channelId,
+    name,
+    metadataBytes(options.metadata),
+    options.listenerToken,
+  );
+}
+
+export function buildChannelDataMessage(
+  channelId: number,
+  payload: Uint8Array,
+): Uint8Array {
+  if (payload.length === 0 || payload.length > CHANNEL_MAX_PAYLOAD) {
+    throw new RangeError("channel data must contain 1 byte to 1 MiB");
+  }
+  const message = envelope(CHANNEL_DATA, channelId, payload.length);
+  message.set(payload, 6);
+  return message;
+}
+
+export function buildChannelAckMessage(
+  channelId: number,
+  bytes: bigint,
+): Uint8Array {
+  if (bytes < 0n || bytes > 0xffffffffffffffffn) {
+    throw new RangeError("channel ACK must be a u64");
+  }
+  const message = envelope(CHANNEL_ACK, channelId, 8);
+  new DataView(message.buffer).setBigUint64(6, bytes, true);
+  return message;
+}
+
+export function buildChannelCloseMessage(
+  channelId: number,
+  reason = CHANNEL_CLOSE_NORMAL,
+): Uint8Array {
+  if (reason !== CHANNEL_CLOSE_NORMAL && reason !== CHANNEL_CLOSE_CANCELLED) {
+    throw new RangeError("client channel close reason is invalid");
+  }
+  const message = envelope(CHANNEL_CLOSE, channelId, 1);
+  message[6] = reason;
+  return message;
+}
+
+function decodeUtf8(bytes: Uint8Array): string | null {
+  try {
+    return fatalDecoder.decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+function decodePeerMetadata(
+  bytes: Uint8Array,
+  offset: number,
+): { peer: string; metadata: Uint8Array; offset: number } | null {
+  if (bytes.length < offset + 2) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const peerLength = view.getUint16(offset, true);
+  offset += 2;
+  if (peerLength > CHANNEL_MAX_PEER || bytes.length < offset + peerLength + 4) {
+    return null;
+  }
+  const peerBytes = bytes.subarray(offset, offset + peerLength);
+  if (peerBytes.some((byte) => byte < 0x20 || byte > 0x7e)) return null;
+  const peer = decodeUtf8(peerBytes);
+  if (peer === null) return null;
+  offset += peerLength;
+  const metadataLength = view.getUint32(offset, true);
+  offset += 4;
+  if (
+    metadataLength > CHANNEL_MAX_METADATA ||
+    bytes.length < offset + metadataLength
+  ) {
+    return null;
+  }
+  const metadata = bytes.subarray(offset, offset + metadataLength);
+  return { peer, metadata, offset: offset + metadataLength };
+}
+
+/** Decode one server-to-client channel packet. Unknown or malformed packets return null. */
+export function parseChannelMessage(bytes: Uint8Array): ChannelMessage | null {
+  if (bytes.length < 6 || bytes[0] !== CHANNEL) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const kind = bytes[1];
+  const channelId = view.getUint32(2, true);
+  switch (kind) {
+    case CHANNEL_OPENED: {
+      if (bytes.length < 21) return null;
+      const decoded = decodePeerMetadata(bytes, 15);
+      if (!decoded || bytes.length - decoded.offset > CHANNEL_MAX_DETAIL)
+        return null;
+      const detail = decodeUtf8(bytes.subarray(decoded.offset));
+      if (detail === null) return null;
+      return {
+        kind: "opened",
+        channelId,
+        status: bytes[6],
+        window: view.getBigUint64(7, true),
+        peer: decoded.peer,
+        metadata: decoded.metadata,
+        detail,
+      };
+    }
+    case CHANNEL_ACCEPTED: {
+      if (bytes.length < 24) return null;
+      const decoded = decodePeerMetadata(bytes, 18);
+      if (!decoded || decoded.offset !== bytes.length) return null;
+      return {
+        kind: "accepted",
+        channelId,
+        listenerId: view.getUint32(6, true),
+        window: view.getBigUint64(10, true),
+        peer: decoded.peer,
+        metadata: decoded.metadata,
+      };
+    }
+    case CHANNEL_DATA: {
+      const payload = bytes.subarray(6);
+      if (payload.length === 0 || payload.length > CHANNEL_MAX_PAYLOAD)
+        return null;
+      return { kind: "data", channelId, payload };
+    }
+    case CHANNEL_ACK:
+      if (bytes.length !== 14) return null;
+      return {
+        kind: "ack",
+        channelId,
+        bytes: view.getBigUint64(6, true),
+      };
+    case CHANNEL_CLOSED: {
+      if (bytes.length < 7 || bytes.length - 7 > CHANNEL_MAX_DETAIL)
+        return null;
+      const detail = decodeUtf8(bytes.subarray(7));
+      if (detail === null) return null;
+      return {
+        kind: "closed",
+        channelId,
+        reason: bytes[6],
+        detail,
+      };
+    }
+    default:
+      return null;
+  }
+}

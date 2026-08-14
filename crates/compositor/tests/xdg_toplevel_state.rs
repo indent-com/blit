@@ -19,7 +19,7 @@ use std::sync::Arc;
 use wayland_client::protocol::{wl_compositor, wl_registry, wl_surface};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noop};
 
-use blit_compositor::{CompositorHandle, spawn_compositor};
+use blit_compositor::{CompositorHandle, spawn_compositor_without_renderer};
 
 // xdg_shell is not among wayland-client's bundled protocols, so talk to it
 // through the generated bindings the compositor crate already pulls in.
@@ -155,7 +155,7 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let handle = spawn_compositor(false, Arc::new(|| {}), "");
+        let handle = spawn_compositor_without_renderer(false, Arc::new(|| {}));
 
         let stream =
             UnixStream::connect(&handle.socket_name).expect("connect to compositor socket");

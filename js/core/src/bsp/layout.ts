@@ -303,6 +303,11 @@ export function buildCandidateOrder({
  * and dropping on an empty pane is a plain move. Gated on the source still
  * holding the dragged value — a layout change mid-drag must not evict
  * whatever else got there since.
+ *
+ * Surface assignments are unique views, so recover their source from the
+ * current assignments if a browser omits the secondary source-pane drag MIME
+ * (or if that pane id went stale). Generic tile drops deliberately remain
+ * copies/opens when they have no valid source marker.
  */
 export function assignmentsAfterDrop(
   prev: Readonly<Record<string, string | null>>,
@@ -311,17 +316,26 @@ export function assignmentsAfterDrop(
   fromPaneId: string | undefined,
   validPaneIds: readonly string[],
 ): Record<string, string | null> | null {
-  const swap =
+  const markedSourceIsCurrent =
     fromPaneId !== undefined &&
     fromPaneId !== targetPaneId &&
     validPaneIds.includes(fromPaneId) &&
     prev[fromPaneId] === value;
+  const sourcePaneId = markedSourceIsCurrent
+    ? fromPaneId
+    : isSurfaceAssignment(value)
+      ? validPaneIds.find(
+          (paneId) => paneId !== targetPaneId && prev[paneId] === value,
+        )
+      : undefined;
+  const swap = sourcePaneId !== undefined;
   if (prev[targetPaneId] === value && !swap) return null;
   const next: Record<string, string | null> = {
     ...prev,
     [targetPaneId]: value,
   };
-  if (swap) next[fromPaneId] = prev[targetPaneId] ?? null;
+  if (sourcePaneId !== undefined)
+    next[sourcePaneId] = prev[targetPaneId] ?? null;
   return next;
 }
 

@@ -1549,6 +1549,67 @@ describe("BlitSurfaceCanvas size mediation", () => {
 });
 
 describe("BlitSurfaceCanvas visibility", () => {
+  it("reattaches a mounted BSP view when its surface id is recreated", () => {
+    let info: { width: number; height: number } | undefined = {
+      width: 1920,
+      height: 1080,
+    };
+    let change: (() => void) | undefined;
+    const subscribes: { surfaceId: number; viewId: string }[] = [];
+    const unsubscribes: { surfaceId: number; viewId: string }[] = [];
+    const store = {
+      getSurface: () => info,
+      getCanvas: () => null,
+      getCursor: () => "default",
+      canDecodeVideo: true,
+      generation: 0,
+      onChange: (cb: () => void) => {
+        change = cb;
+        return () => {};
+      },
+      onCursor: () => () => {},
+      onFrame: () => () => {},
+    };
+    const conn = {
+      surfaceStore: store,
+      allocSurfaceViewId: () => "s1",
+      sendSurfaceSubscribe: (surfaceId: number, viewId: string) =>
+        subscribes.push({ surfaceId, viewId }),
+      sendSurfaceUnsubscribe: (surfaceId: number, viewId: string) =>
+        unsubscribes.push({ surfaceId, viewId }),
+    };
+    const workspace = {
+      getConnection: () => conn,
+      subscribe: () => () => {},
+    } as unknown as BlitWorkspace;
+    const surface = new BlitSurfaceCanvas({
+      workspace,
+      connectionId: "conn-1" as never,
+      surfaceId: 7,
+      resizable: true,
+    });
+
+    const container = document.createElement("div");
+    surface.attach(container);
+    expect(subscribes).toEqual([{ surfaceId: 7, viewId: "s1" }]);
+
+    // The connection has already retired this id's subscription state when
+    // the store publishes DESTROYED.  The BSP canvas itself stays mounted.
+    info = undefined;
+    change?.();
+    info = { width: 1280, height: 720 };
+    change?.();
+
+    expect(subscribes).toEqual([
+      { surfaceId: 7, viewId: "s1" },
+      { surfaceId: 7, viewId: "s1" },
+    ]);
+    // Reattachment is fresh state, not an unsubscribe delayed from the
+    // destroyed surface that could hit the reused id.
+    expect(unsubscribes).toEqual([]);
+    surface.dispose();
+  });
+
   it("does not open a server stream for a cached-only mount", () => {
     const subscribes: { surfaceId: number; viewId: string }[] = [];
     const unsubscribes: { surfaceId: number; viewId: string }[] = [];
@@ -3096,6 +3157,7 @@ function attachTyping() {
     sendSurfacePointer: (_id: number, type: number, button: number) =>
       pointers.push({ type, button }),
     sendSurfaceFocus: () => {},
+    noteBrowserClipboardMayHaveChanged: () => {},
     surfaceStore: new Proxy(
       {
         getSurface: () => ({ width: 800, height: 600 }),
@@ -3118,8 +3180,9 @@ function attachTyping() {
     sendSurfaceSubscribe: () => {},
     sendSurfaceUnsubscribe: () => {},
   };
+  let connected = true;
   const workspace = {
-    getConnection: () => conn,
+    getConnection: () => (connected ? conn : undefined),
     subscribe: () => () => {},
   } as unknown as BlitWorkspace;
   const surface = new BlitSurfaceCanvas({
@@ -3149,6 +3212,9 @@ function attachTyping() {
     preedits,
     pointers,
     requestTextInput,
+    setConnected: (value: boolean) => {
+      connected = value;
+    },
   };
 }
 
@@ -3638,6 +3704,65 @@ describe("BlitSurfaceCanvas Command chords", () => {
   });
 });
 
+describe("BlitSurfaceCanvas key-state recovery", () => {
+  const key = (
+    type: "keydown" | "keyup",
+    init: KeyboardEventInit,
+  ): KeyboardEvent =>
+    new KeyboardEvent(type, { bubbles: true, cancelable: true, ...init });
+
+  it("releases held chord keys when the browser window loses focus", () => {
+    const { surface, canvas, keys } = attachTyping();
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "Shift", code: "ShiftLeft", shiftKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keydown", { key: "ArrowLeft", code: "ArrowLeft", shiftKey: true }),
+    );
+    window.dispatchEvent(new Event("blur"));
+
+    // Late physical releases after returning to the tab are orphaned and
+    // must not send a second release into the fresh remote state.
+    canvas.dispatchEvent(key("keyup", { key: "ArrowLeft", code: "ArrowLeft" }));
+    canvas.dispatchEvent(key("keyup", { key: "Shift", code: "ShiftLeft" }));
+
+    expect(keys).toEqual([
+      { keycode: 42, pressed: true },
+      { keycode: 105, pressed: true },
+      { keycode: 105, pressed: false },
+      { keycode: 42, pressed: false },
+    ]);
+    surface.dispose();
+  });
+
+  it("forgets held keys when blur happens while disconnected", () => {
+    const { surface, canvas, keys, texts, setConnected } = attachTyping();
+    (surface as unknown as { macOptionChars: boolean }).macOptionChars = false;
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "Meta", code: "MetaLeft", metaKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keydown", { key: "a", code: "KeyA", metaKey: true }),
+    );
+    setConnected(false);
+    window.dispatchEvent(new Event("blur"));
+    setConnected(true);
+
+    // The server releases the old connection's keys on disconnect. Locally,
+    // KeyA must no longer look held or this ordinary keydown is discarded.
+    canvas.dispatchEvent(key("keydown", { key: "a", code: "KeyA" }));
+
+    expect(keys).toEqual([
+      { keycode: 125, pressed: true },
+      { keycode: 30, pressed: true },
+    ]);
+    expect(texts).toEqual(["a"]);
+    surface.dispose();
+  });
+});
+
 describe("BlitSurfaceCanvas macOS dead keys", () => {
   const key = (
     type: "keydown" | "keyup",
@@ -3731,6 +3856,50 @@ describe("BlitSurfaceCanvas macOS dead keys", () => {
     expect(texts).toEqual(["é"]);
     expect(keys).toEqual([]);
     expect(preedits.map((p) => p.text)).toEqual(["´"]);
+    surface.dispose();
+  });
+
+  it("uses composition lifecycle when event isComposing flags are false", () => {
+    // WebKit can leave isComposing false on the completing keydown and input.
+    // Since focus really rests on the textarea, exercise that actual target.
+    const { surface, ta, texts, keys, preedits } = attachMac();
+
+    ta.dispatchEvent(
+      key("keydown", { key: "Alt", code: "AltLeft", altKey: true }),
+    );
+    ta.dispatchEvent(
+      key("keydown", { key: "Dead", code: "KeyE", altKey: true }),
+    );
+    ta.dispatchEvent(new CompositionEvent("compositionstart"));
+    ta.value = "´";
+    ta.dispatchEvent(
+      new InputEvent("input", {
+        data: "´",
+        inputType: "insertCompositionText",
+        isComposing: false,
+      }),
+    );
+    ta.dispatchEvent(key("keyup", { key: "Alt", code: "AltLeft" }));
+    ta.dispatchEvent(
+      key("keydown", {
+        key: "e",
+        code: "KeyE",
+        isComposing: false,
+      }),
+    );
+    ta.dispatchEvent(new CompositionEvent("compositionend", { data: "é" }));
+    ta.value = "é";
+    ta.dispatchEvent(
+      new InputEvent("input", {
+        data: "é",
+        inputType: "insertCompositionText",
+        isComposing: false,
+      }),
+    );
+
+    expect(texts).toEqual(["é"]);
+    expect(keys).toEqual([]);
+    expect(preedits.map((preedit) => preedit.text)).toEqual(["´"]);
     surface.dispose();
   });
 

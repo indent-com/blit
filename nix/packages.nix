@@ -25,13 +25,13 @@
         ;
       serverVaapiEnabled = pkgs.stdenv.isLinux;
       bindgenClangArgs = pkgs.lib.optionalString pkgs.stdenv.isLinux "-isystem ${pkgs.lib.getDev pkgs.stdenv.cc.libc}/include";
-
       # Runtime library search path for blit server's dlopen GPU backends.
       #   pkgs.libva           → libva.so.2, libva-drm.so.2
       #   pkgs.libgbm          → libgbm.so.1
       #   pkgs.vulkan-loader   → libvulkan.so.1 (Vulkan dispatch)
-      #   addDriverRunpath     → /run/opengl-driver  (libcuda, libnvidia-encode,
-      #                          Mesa VA-API / Vulkan drivers, etc.)
+      #   addDriverRunpath     → /run/opengl-driver  (libcuda, libnvcuvid,
+      #                          libnvidia-encode, Mesa VA-API / Vulkan drivers,
+      #                          etc.)
       gpuRuntimeLibPath = pkgs.lib.optionalString serverVaapiEnabled (
         pkgs.lib.makeLibraryPath [
           pkgs.libva
@@ -67,11 +67,17 @@
           commonArgs
           // {
             inherit pname cargoArtifacts;
+            nativeBuildInputs =
+              commonArgs.nativeBuildInputs ++ pkgs.lib.optional pkgs.stdenv.isLinux pkgs.makeWrapper;
             cargoExtraArgs = "-p blit-cli ${featureArgs}";
             doCheck = false;
             preBuild = copyWebAppDist;
             postInstall = ''
               $out/bin/blit generate $out/share
+            '';
+            postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+              wrapProgram $out/bin/blit \
+                --prefix LD_LIBRARY_PATH : "${serverRuntimeLibPath}"
             '';
             meta.mainProgram = "blit";
           }
@@ -104,15 +110,18 @@
 
       browserCargoDeps =
         let
-          rawVendorDir = pkgs.rustPlatform.importCargoLock (cargoLockConfig // {
-            extraRegistries = {
-              # crates.io's API download endpoint rejects generic fetchers
-              # without a Cargo-style User-Agent. Use the static download host
-              # for the fetch phase, then remove the extra Cargo source block
-              # below because it aliases Cargo's built-in crates-io source.
-              "https://github.com/rust-lang/crates.io-index" = "https://static.crates.io/crates";
-            };
-          });
+          rawVendorDir = pkgs.rustPlatform.importCargoLock (
+            cargoLockConfig
+            // {
+              extraRegistries = {
+                # crates.io's API download endpoint rejects generic fetchers
+                # without a Cargo-style User-Agent. Use the static download host
+                # for the fetch phase, then remove the extra Cargo source block
+                # below because it aliases Cargo's built-in crates-io source.
+                "https://github.com/rust-lang/crates.io-index" = "https://static.crates.io/crates";
+              };
+            }
+          );
         in
         pkgs.runCommand "cargo-vendor-dir" { } ''
           mkdir -p "$out"
@@ -277,19 +286,22 @@
         name: drv:
         let
           interpreter =
-            if pkgs.stdenv.hostPlatform.isAarch64
-            then "/lib/ld-linux-aarch64.so.1"
-            else "/lib64/ld-linux-x86-64.so.2";
+            if pkgs.stdenv.hostPlatform.isAarch64 then
+              "/lib/ld-linux-aarch64.so.1"
+            else
+              "/lib64/ld-linux-x86-64.so.2";
         in
-        pkgs.runCommand "${name}-${version}" {
-          nativeBuildInputs = [ pkgs.patchelf ];
-        } ''
-          mkdir -p $out/bin
-          cp ${drv}/bin/blit $out/bin/blit
-          chmod +w $out/bin/blit
-          patchelf --set-interpreter ${interpreter} $out/bin/blit
-          patchelf --remove-rpath $out/bin/blit
-        '';
+        pkgs.runCommand "${name}-${version}"
+          {
+            nativeBuildInputs = [ pkgs.patchelf ];
+          }
+          ''
+            mkdir -p $out/bin
+            cp ${drv}/bin/blit $out/bin/blit
+            chmod +w $out/bin/blit
+            patchelf --set-interpreter ${interpreter} $out/bin/blit
+            patchelf --remove-rpath $out/bin/blit
+          '';
       blit-release-gnu = mkReleaseGnu "blit-release-gnu" blit-gnu;
       blit-release-gnu-gpl = mkReleaseGnu "blit-release-gnu-gpl" blit-gnu-gpl;
 
@@ -300,14 +312,16 @@
         let
           arch = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64";
         in
-        pkgs.runCommand "${name}-${version}" {
-          nativeBuildInputs = [ pkgs.patchelf ];
-        } ''
-          mkdir -p $out/bin
-          cp ${drv}/bin/blit $out/bin/blit
-          chmod +w $out/bin/blit
-          patchelf --set-interpreter /lib/ld-musl-${arch}.so.1 $out/bin/blit
-        '';
+        pkgs.runCommand "${name}-${version}"
+          {
+            nativeBuildInputs = [ pkgs.patchelf ];
+          }
+          ''
+            mkdir -p $out/bin
+            cp ${drv}/bin/blit $out/bin/blit
+            chmod +w $out/bin/blit
+            patchelf --set-interpreter /lib/ld-musl-${arch}.so.1 $out/bin/blit
+          '';
       blit-release-musl = mkReleaseMusl "blit-release-musl" blit-musl;
       blit-release-musl-gpl = mkReleaseMusl "blit-release-musl-gpl" blit-musl-gpl;
 
@@ -346,10 +360,19 @@
             }
           );
 
-
       # ------------------------------------------------------------------
       # JS / Web assets
       # ------------------------------------------------------------------
+
+      # A `path:.` flake includes ignored working-tree files.  In particular,
+      # a developer's node_modules would otherwise reach pnpmConfigHook,
+      # which correctly tries to replace it but cannot confirm the removal in
+      # a non-interactive Nix build.  Keep untracked source files (useful for
+      # testing dirty trees) while pruning only generated dependency trees.
+      webSource = pkgs.lib.cleanSourceWith {
+        src = ../.;
+        filter = path: type: type != "directory" || baseNameOf path != "node_modules";
+      };
 
       setupBrowserPkg = ''
         mkdir -p crates/browser/pkg/snippets
@@ -400,7 +423,7 @@
       pnpmDeps = pkgs.fetchPnpmDeps {
         pname = "blit-js";
         inherit version;
-        src = ../.;
+        src = webSource;
         pnpm = pnpmSandboxed;
         fetcherVersion = 3;
         postPatch = setupBrowserPkgForDeps + ''
@@ -412,7 +435,7 @@
       webAppDist = pkgs.stdenv.mkDerivation {
         pname = "blit-ui";
         inherit version;
-        src = ../.;
+        src = webSource;
         inherit pnpmDeps;
         nativeBuildInputs = [
           pkgs.nodejs
@@ -437,7 +460,7 @@
       websiteDist = pkgs.stdenv.mkDerivation {
         pname = "blit-website";
         inherit version;
-        src = ../.;
+        src = webSource;
         inherit pnpmDeps;
         nativeBuildInputs = [
           pkgs.nodejs
@@ -637,7 +660,12 @@
         default = blit;
       }
       // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-        inherit blit-gpl blit-release-musl blit-release-gnu-gpl blit-release-musl-gpl;
+        inherit
+          blit-gpl
+          blit-release-musl
+          blit-release-gnu-gpl
+          blit-release-musl-gpl
+          ;
       }
       // tasks;
 
@@ -689,9 +717,7 @@
           fi
           export BINDGEN_EXTRA_CLANG_ARGS="${bindgenClangArgs}''${NIX_CFLAGS_COMPILE:+ $NIX_CFLAGS_COMPILE}"
           export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
-          export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig${
-            pkgs.lib.optionalString pkgs.stdenv.isLinux ":${pkgs.x264.dev}/lib/pkgconfig"
-          }''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          export PKG_CONFIG_PATH="${pkgs.libopus.dev}/lib/pkgconfig${pkgs.lib.optionalString pkgs.stdenv.isLinux ":${pkgs.x264.dev}/lib/pkgconfig"}''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
           # LIBRARY_PATH is propagated by nix-direnv while LD_LIBRARY_PATH
           # is filtered out — .envrc reconstructs LD_LIBRARY_PATH from
           # LIBRARY_PATH, so anything we need at runtime has to land
@@ -699,11 +725,9 @@
           # software surface encoder; libpipewire-0.3 is dlopened by the
           # server's in-process audio capture path (see
           # crates/server/src/audio_pw.rs).
-          export LIBRARY_PATH="${pkgs.libopus}/lib${
-            pkgs.lib.optionalString pkgs.stdenv.isLinux ":${pkgs.x264.lib}/lib:${pkgs.pipewire}/lib"
-          }''${LIBRARY_PATH:+:$LIBRARY_PATH}"
-          # Runtime dlopen: blit server loads VA-API / NVENC GPU libs
-          # and libpipewire-0.3 at runtime via dlopen.  See the
+          export LIBRARY_PATH="${pkgs.libopus}/lib${pkgs.lib.optionalString pkgs.stdenv.isLinux ":${pkgs.x264.lib}/lib:${pkgs.pipewire}/lib"}''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+          # Runtime dlopen: blit server loads VA-API / NVENC GPU libs,
+          # libpipewire-0.3, and native camera decoders at runtime. See the
           # serverRuntimeLibPath definition above.  (Direct LD_LIBRARY_PATH
           # export is effective for plain `nix develop`; under direnv,
           # the .envrc reconstruction from LIBRARY_PATH takes over.)
