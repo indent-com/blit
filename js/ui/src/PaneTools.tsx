@@ -25,6 +25,80 @@ import type { Theme, UIScale } from "./theme";
 import { t } from "./i18n";
 import { startPaneTileDrag, startPaneTouchDrag } from "./ide/tileDrag";
 
+// The workspace inherits its terminal font. Keep toolbar symbols out of that
+// font so missing or unusual Windows glyphs cannot change their shape.
+function GripIcon(props: { size: number }) {
+  return (
+    <svg
+      width={props.size}
+      height={props.size}
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      style={{ display: "block", "pointer-events": "none" }}
+    >
+      <circle cx="5" cy="4" r="1.35" fill="currentColor" />
+      <circle cx="11" cy="4" r="1.35" fill="currentColor" />
+      <circle cx="5" cy="8" r="1.35" fill="currentColor" />
+      <circle cx="11" cy="8" r="1.35" fill="currentColor" />
+      <circle cx="5" cy="12" r="1.35" fill="currentColor" />
+      <circle cx="11" cy="12" r="1.35" fill="currentColor" />
+    </svg>
+  );
+}
+
+function SoloIcon(props: { active: boolean; size: number }) {
+  return (
+    <svg
+      width={props.size}
+      height={props.size}
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      style={{ display: "block", "pointer-events": "none" }}
+    >
+      <rect
+        x="2.5"
+        y="2.5"
+        width="11"
+        height="11"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+      />
+      <Show
+        when={props.active}
+        fallback={<rect x="5" y="5" width="6" height="6" fill="currentColor" />}
+      >
+        <path
+          d="M8 3v10M3 8h10"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.5"
+        />
+      </Show>
+    </svg>
+  );
+}
+
+function CloseIcon(props: { size: number }) {
+  return (
+    <svg
+      width={props.size}
+      height={props.size}
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      style={{ display: "block", "pointer-events": "none" }}
+    >
+      <path
+        d="M4 4l8 8M12 4l-8 8"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.75"
+        stroke-linecap="round"
+      />
+    </svg>
+  );
+}
+
 /** Toolbar corners, in click-to-cycle order from the default. */
 const CORNERS = [
   "top-right",
@@ -68,6 +142,7 @@ export function PaneTools(props: {
     }
   };
   const touchScale = () => (props.alwaysVisible ? 1.5 : 1);
+  const iconSize = () => props.scale.sm * touchScale();
   const segment = (): JSX.CSSProperties => ({
     display: "flex",
     "align-items": "center",
@@ -79,10 +154,6 @@ export function PaneTools(props: {
     border: `1px solid ${props.theme.subtleBorder}`,
     "border-radius": "0",
     color: props.theme.fg,
-    "font-family": "inherit",
-    // On touch, enlarge both the glyph and its tap target.
-    "font-size": `${props.scale.sm * touchScale()}px`,
-    "line-height": 1,
     opacity: 0.75,
     "touch-action": "manipulation",
   });
@@ -130,7 +201,7 @@ export function PaneTools(props: {
                 "touch-action": "none",
               }}
             >
-              {"⠿"}
+              <GripIcon size={iconSize()} />
             </button>
           )}
         </Show>
@@ -153,7 +224,7 @@ export function PaneTools(props: {
             >
               {/* One filled cell versus a grid of them: what you get, not
                   what you are leaving. */}
-              {solo().active ? "⊞" : "▣"}
+              <SoloIcon active={solo().active} size={iconSize()} />
             </button>
           )}
         </Show>
@@ -170,7 +241,7 @@ export function PaneTools(props: {
           }}
           style={{ ...segment(), cursor: "pointer" }}
         >
-          {"✕"}
+          <CloseIcon size={iconSize()} />
         </button>
       </div>
     </Show>
