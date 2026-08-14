@@ -17,6 +17,13 @@ import { RelayPool } from "./conn";
 import { forgetBinding, loadBindings, rememberBinding } from "./bindings";
 import { bootstrapDocument } from "./bootstrap";
 import { injectIntoHtml } from "./inject";
+import {
+  desktopNotificationIdentity,
+  desktopNotificationImage,
+  desktopNotificationSourceClientId,
+  topLevelDesktopSender,
+  type DesktopNotificationIdentity,
+} from "./desktopNotifications";
 
 // The bundle runs in a worker; the app's tsconfig covers both lib sets, so name the scope explicitly rather than relying on ambient inference.
 declare const self: ServiceWorkerGlobalScope & typeof globalThis;
@@ -84,14 +91,89 @@ function senderPreview(source: Client | null): PreviewTarget | null {
   }
 }
 
+type DesktopNotificationMessage = DesktopNotificationIdentity & {
+  type: "blit-desktop-notification-show";
+  tag: string;
+  title: string;
+  body: string;
+  icon?: string;
+  image?: string;
+};
+
+function topLevelAppClient(source: Client | null): source is WindowClient {
+  return topLevelDesktopSender(
+    source as WindowClient | null,
+    senderPreview(source) !== null,
+  );
+}
+
 self.addEventListener("message", (event: ExtendableMessageEvent) => {
   const data = event.data as {
     type?: string;
     passphrase?: string;
     target?: PreviewTarget;
     value?: string;
+    tag?: string;
+    title?: string;
+    body?: string;
+    icon?: string;
+    image?: string;
   } | null;
   if (!data || typeof data.type !== "string") return;
+  if (data.type === "blit-desktop-notification-show") {
+    event.waitUntil(
+      (async () => {
+        await restored;
+        const source = event.source as Client | null;
+        if (!topLevelAppClient(source)) return;
+        const identity = desktopNotificationIdentity(data);
+        if (
+          !identity ||
+          typeof data.tag !== "string" ||
+          data.tag.length > 512 ||
+          typeof data.title !== "string" ||
+          data.title.length > 4_096 ||
+          typeof data.body !== "string" ||
+          data.body.length > 65_536
+        ) {
+          return;
+        }
+        const message = data as DesktopNotificationMessage;
+        const options: NotificationOptions & { image?: string } = {
+          body: message.body,
+          tag: message.tag,
+          icon: desktopNotificationImage(message.icon),
+          image: desktopNotificationImage(message.image),
+          data: {
+            type: "blit-desktop-notification",
+            sourceClientId: source.id,
+            ...identity,
+          },
+        };
+        await self.registration.showNotification(message.title, options);
+      })(),
+    );
+    return;
+  }
+  if (data.type === "blit-desktop-notification-close") {
+    event.waitUntil(
+      (async () => {
+        await restored;
+        if (
+          !topLevelAppClient(event.source as Client | null) ||
+          typeof data.tag !== "string" ||
+          data.tag.length > 512
+        ) {
+          return;
+        }
+        const notifications = await self.registration.getNotifications({
+          tag: data.tag,
+        });
+        notifications.forEach((item) => item.close());
+      })(),
+    );
+    return;
+  }
   if (data.type === "blit-passphrase" && typeof data.passphrase === "string") {
     // Only the app holds the credential. A previewed page is same-origin
     // with it, so without this check any preview frame could post a bogus
@@ -138,6 +220,44 @@ self.addEventListener("message", (event: ExtendableMessageEvent) => {
     }
     event.ports[0]?.postMessage({ ok: true });
   }
+});
+
+self.addEventListener("notificationclick", (event: NotificationEvent) => {
+  const identity = desktopNotificationIdentity(event.notification.data);
+  const sourceClientId = desktopNotificationSourceClientId(
+    event.notification.data,
+  );
+  if (
+    !identity ||
+    !sourceClientId ||
+    event.notification.data?.type !== "blit-desktop-notification"
+  ) {
+    return;
+  }
+  event.notification.close();
+  event.waitUntil(
+    restored.then(() =>
+      self.clients
+        .matchAll({ type: "window", includeUncontrolled: true })
+        .then(async (clients) => {
+          const client = clients.find(
+            (candidate) =>
+              candidate.id === sourceClientId && topLevelAppClient(candidate),
+          ) as WindowClient | undefined;
+          if (client) {
+            await client.focus();
+            client.postMessage({
+              type: "blit-desktop-notification-click",
+              ...identity,
+            });
+            return;
+          }
+          // Opening the UI is useful, but the new page has no proof that the
+          // clicked record is still current. It deliberately receives no action.
+          await self.clients.openWindow(self.registration.scope);
+        }),
+    ),
+  );
 });
 
 self.addEventListener("fetch", (event: FetchEvent) => {

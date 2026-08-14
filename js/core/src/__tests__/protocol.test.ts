@@ -1,6 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
   buildAckMessage,
+  buildClientListMessage,
+  buildClientWatchMessage,
+  buildClientUnwatchMessage,
+  buildKickClientMessage,
   buildClearResizeBatchMessage,
   buildClearResizeMessage,
   buildResizeBatchMessage,
@@ -27,6 +31,10 @@ import {
 } from "../protocol";
 import {
   C2S_ACK,
+  C2S_CLIENT_LIST,
+  C2S_CLIENT_WATCH,
+  C2S_CLIENT_UNWATCH,
+  C2S_KICK,
   C2S_CLIENT_METRICS,
   C2S_DISPLAY_RATE,
   C2S_INPUT,
@@ -63,6 +71,35 @@ describe("protocol message builders", () => {
   it("buildAckMessage", () => {
     const msg = buildAckMessage();
     expect(msg).toEqual(new Uint8Array([C2S_ACK]));
+  });
+
+  it("buildClientListMessage", () => {
+    expect(buildClientListMessage(0x1234)).toEqual(
+      new Uint8Array([C2S_CLIENT_LIST, 0x34, 0x12]),
+    );
+  });
+
+  it("buildClientWatchMessage and buildClientUnwatchMessage", () => {
+    expect(buildClientWatchMessage(0x1234)).toEqual(
+      new Uint8Array([C2S_CLIENT_WATCH, 0x34, 0x12]),
+    );
+    expect(buildClientUnwatchMessage(0x5678)).toEqual(
+      new Uint8Array([C2S_CLIENT_UNWATCH, 0x78, 0x56]),
+    );
+  });
+
+  it("buildKickClientMessage carries a u64 id and bounded UTF-8 reason", () => {
+    const msg = buildKickClientMessage(
+      7,
+      0x0102_0304_0506_0708n,
+      `${"x".repeat(1023)}é`,
+    );
+    const view = new DataView(msg.buffer);
+    expect(msg[0]).toBe(C2S_KICK);
+    expect(view.getUint16(1, true)).toBe(7);
+    expect(view.getBigUint64(3, true)).toBe(0x0102_0304_0506_0708n);
+    expect(msg.length).toBe(11 + 1023);
+    expect(textDecoder.decode(msg.subarray(11))).toBe("x".repeat(1023));
   });
 
   it("buildClientMetricsMessage", () => {

@@ -51,7 +51,17 @@ export * from "./http1";
 /** Preview targets and the /x/ bootstrap prefix. */
 export * from "./preview";
 
-export { DEFAULT_FONT, DEFAULT_FONT_SIZE, DEFAULT_TEXT_GAMMA } from "./types";
+export {
+  DEFAULT_FONT,
+  DEFAULT_FONT_SIZE,
+  DEFAULT_TEXT_GAMMA,
+  CLIENT_SUBSCRIPTION_AUDIO,
+  CLIENT_SUBSCRIPTION_FS,
+  CLIENT_SUBSCRIPTION_GIT,
+  CLIENT_SUBSCRIPTION_LSP,
+  CLIENT_SUBSCRIPTION_KV,
+  CLIENT_SUBSCRIPTION_NET,
+} from "./types";
 export type { BlitTransportMessage } from "./types";
 
 export {
@@ -117,11 +127,17 @@ export type {
 export * from "./git";
 export * from "./lsp";
 export * from "./kv";
+export * from "./desktop";
 export { Notifier } from "./reactive";
 export type { ReactiveStore } from "./reactive";
 
 export type {
   BlitConnectionSnapshot,
+  BlitClientInfo,
+  BlitClientList,
+  BlitClientAuxSubscription,
+  BlitClientSurfaceSubscription,
+  BlitClientTerminalSubscription,
   BlitDebug,
   BlitSearchResult,
   BlitSurface,
@@ -141,6 +157,8 @@ export {
   SURFACE_POINTER_DOWN,
   SURFACE_POINTER_UP,
   SURFACE_POINTER_MOVE,
+  KICK_REASON_MAX,
+  kickReasonByteLength,
 } from "./protocol";
 
 export { PALETTES } from "./palettes";

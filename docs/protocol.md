@@ -43,6 +43,10 @@ every pending operation as a connection error in that case.
 | `0x06` | `MOUSE`                 | `[pty_id:2][type:1][button:1][col:2][row:2]`                                                                                                                                                                                                     |
 | `0x07` | `RESTART`               | `[pty_id:2]`                                                                                                                                                                                                                                     |
 | `0x08` | `PING`                  | _(empty)_ — application-level keepalive                                                                                                                                                                                                          |
+| `0x09` | `CLIENT_LIST`           | `[nonce:2]` — enumerate connected clients                                                                                                                                                                                                        |
+| `0x0A` | `KICK`                  | `[nonce:2][client_id:8][reason:N]` — disconnect another client with a UTF-8 reason                                                                                                                                                               |
+| `0x0B` | `CLIENT_WATCH`          | `[nonce:2]` — subscribe to live client-catalog snapshots                                                                                                                                                                                         |
+| `0x0C` | `CLIENT_UNWATCH`        | `[nonce:2]` — stop the client-catalog subscription using this nonce                                                                                                                                                                              |
 | `0x0F` | `QUIT`                  | _(empty)_ — request server shutdown                                                                                                                                                                                                              |
 | `0x10` | `CREATE`                | `[rows:2][cols:2][tag_len:2][tag:N]`                                                                                                                                                                                                             |
 | `0x11` | `FOCUS`                 | `[pty_id:2]`                                                                                                                                                                                                                                     |
@@ -86,6 +90,9 @@ every pending operation as a connection error in that case.
 | `0x38` | `SURFACE_DRAG_DROP`     | `[surface_id:2][x:2][y:2][item_count:2][items]` — complete the drop; item is `[mime_len:2][mime][name_len:2][name][data_len:4][data]`, see [Drag and drop](#drag-and-drop)                                                                       |
 | `0x39` | `SURFACE_DRAG_CANCEL`   | _(empty)_ — abort the drag (Escape / drag left the window)                                                                                                                                                                                       |
 | `0x3A` | `SURFACE_TOUCH`         | `[surface_id:2][phase:1][contact_count:1][time_ms:4][contacts…]`; contact is `[identifier:4 i32][x_x100:4 i32][y_x100:4 i32]`; `time_ms` is the browser `TouchEvent.timeStamp`, see [Direct touch](#direct-touch)                                |
+| `0x3B` | `DESKTOP_SUBSCRIBE`     | `[flags:1]`; bit 0 tray, bit 1 notifications, `0` unsubscribes; see [tray/notification design](design/tray-notifications.md#wire-protocol)                                                                                                       |
+| `0x3C` | `TRAY_EVENT`            | `[tray_id:4][kind:1][menu_revision:4][value:4 i32][flags:1]`; see [tray/notification design](design/tray-notifications.md#client-to-server)                                                                                                      |
+| `0x3D` | `NOTIFICATION_EVENT`    | `[notification_id:4][revision:4][kind:1][key_len:2][key:N]`; see [tray/notification design](design/tray-notifications.md#client-to-server)                                                                                                       |
 | `0x40` | `FS_SYNC`               | `[nonce:2][flags:2][latency_ms:2][inline_max:4][path_len:2][path:N]` + `[exclude_len:2][exclude:M]` if `EXCLUDE` + `[src_pty_id:2]` if `FROM_PTY`; `STAGING` roots the sync at the drag staging dir, see [Drag and drop](#drag-and-drop)         |
 | `0x41` | `FS_STOP`               | `[sync_id:2]`                                                                                                                                                                                                                                    |
 | `0x42` | `FS_ACK`                | `[sync_id:2][update_id:4]` — cumulative                                                                                                                                                                                                          |
@@ -125,6 +132,66 @@ viewer receives a downscaled stream at its requested physical size.
 
 `RESIZE` is batched: after the opcode, the payload contains one or more `[pty_id:2][rows:2][cols:2]` triplets. Requires the `RESIZE_BATCH` feature bit in `S2C_HELLO`.
 
+Client control is gated by `FEATURE_CLIENT_CONTROL`. `C2S_CLIENT_LIST` returns
+the requester's own server-assigned `u64` ID plus every live client, including
+the requester, in ascending ID order. Each client is encoded as
+`[client_id:8][age_secs:8][outbound_bytes_per_sec:8][terminal_count:2]`
+`[surface_count:2][subscription_count:2]`, followed by terminal records
+(`[pty_id:2][rows:2][cols:2]`), surface records
+(`[surface_id:2][width:2][height:2][scale_120:2]`), and auxiliary subscription
+records (`[kind:1][id:2]`). `age_secs` is the whole-second connection age;
+`outbound_bytes_per_sec` is the latest one-second sample of successfully
+written, length-prefixed server-to-client **bytes** — not bits. Zero size
+fields mean that the client subscribed without reporting a view size.
+
+Auxiliary subscription kinds are `1` audio (ID is zero), `2` filesystem sync,
+`3` Git repo, `4` LSP attachment, `5` KV watch, and `6` network flow. IDs are
+local to each family. `C2S_CLIENT_WATCH` immediately returns the same
+`S2C_CLIENT_LIST` shape and sends changed snapshots under the same nonce until
+`C2S_CLIENT_UNWATCH`. Age and bandwidth are sampled once a second, so a watch
+can produce an update that often even when topology is unchanged; between
+samples only a real topology change publishes. Multiple watch nonces per client
+are valid.
+
+`S2C_KICK_RESULT` is the status reply for the whole client-control family, not
+only for `C2S_KICK`: a malformed `CLIENT_LIST` / `CLIENT_WATCH` /
+`CLIENT_UNWATCH` is answered with `INVALID` under the sender's nonce rather
+than dropped. Clients must therefore settle a pending list or watch on a
+`KICK_RESULT` carrying its nonce, or the request hangs until they time out.
+A request too short to carry a nonce (fewer than three bytes) is the one case
+the server drops, because the nonce would be a guess.
+
+The `blit client list` CLI filters its own short-lived connection from its
+output, while persistent clients can use `self_id` to identify their own live
+record. Client IDs are a per-process counter, not a capability or a stable
+identity: they are only meaningful for the life of the server process,
+`HELLO.boot_generation` identifies that lifetime, and a client can infer from
+its own ID how many connections preceded it.
+
+`C2S_KICK` cannot target its sender. Its correlated `S2C_KICK_RESULT` uses the
+common status registry (`OK`, `NOT_FOUND`, `INVALID`, or `TOO_LARGE`) and may
+append diagnostic text. `OK` means the target's connection was told to close,
+not that the reason was acknowledged — a target that is already disconnecting
+still reports `OK`. On `OK`, the target receives `S2C_KICKED` with the reason
+and is then forcibly disconnected. A browser suppresses automatic reconnect
+after `KICKED`, but permits a user-requested reconnect; command-line clients
+report the reason as an error.
+
+Reasons are UTF-8 and capped at `KICK_REASON_MAX` (1024) bytes. Requesters are
+expected to validate and refuse an over-long reason rather than send one: the
+CLI and the browser both do, the server answers `TOO_LARGE`, and the message
+builders truncate at a UTF-8 scalar boundary only as a last-resort backstop so
+a bug cannot put an invalid tail on the wire.
+
+**Authorization.** There is none beyond reaching the socket. `blit-server` has
+no read-only mode of its own, so any connection that completes the handshake
+can enumerate and kick any other. The read-only capability enforced for
+`blit share` consumers lives in the WebRTC forwarder's allowlist, which denies
+the entire client-control family — including `CLIENT_LIST`, because telling an
+untrusted viewer which ptys and surfaces the other viewers hold discloses
+resources that viewer was never offered. Treat "can open a connection" as
+"can kick".
+
 `SURFACE_SUBSCRIBE` has optional trailing bytes for per-surface codec, bandwidth, speed, fixed encode size, and cadence control:
 
 - `codec` (byte 3): `CODEC_SUPPORT_*` bitmask restricting which codecs the server may use for this surface. `0` = use the connection-level default (from `C2S_CLIENT_FEATURES`).
@@ -152,6 +219,10 @@ The profile is deny-by-default. It forwards only these client operations:
 
 - Connection and delivery accounting: `ACK`, `PING`, `CLIENT_FEATURES`, and
   `CLIENT_METRICS`.
+  The client-control family is blocked in full: `KICK` because it is a write,
+  and `CLIENT_LIST` / `CLIENT_WATCH` / `CLIENT_UNWATCH` because enumerating the
+  other viewers discloses pty and surface ids this consumer was never offered,
+  plus a once-a-second sample of another viewer's bandwidth.
 - Terminal viewing: `SCROLL`, `FOCUS`, `SUBSCRIBE`, `UNSUBSCRIBE`, `SEARCH`,
   `READ`, and `COPY_RANGE`.
 - Surface viewing: `SURFACE_LIST`, `SURFACE_CAPTURE`, `SURFACE_SUBSCRIBE`,
@@ -196,6 +267,9 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | `0x0F` | `TERM_CWD_EVENT`       | `[pty_id:2][cwd:N]` — unsolicited push when the OSC 7-reported cwd changes                                                                                                                                                                                                                                                                  |
 | `0x10` | `CREATE_FAILED`        | `[nonce:2][status:1][detail:N]` — refusal of a `CREATE2(WANT_STATUS)`                                                                                                                                                                                                                                                                       |
 | `0x11` | `SCROLL_OFFSET`        | `[pty_id:2][offset:4]` — this client's scrolled-back view was re-anchored (see Scrollback)                                                                                                                                                                                                                                                  |
+| `0x12` | `CLIENT_LIST`          | `[nonce:2][self_id:8][count:4][client:N]…` — sorted connection records, including the requester                                                                                                                                                                                                                                             |
+| `0x13` | `KICK_RESULT`          | `[nonce:2][status:1][detail:N]` — correlated result of `C2S_KICK`                                                                                                                                                                                                                                                                           |
+| `0x14` | `KICKED`               | `[reason:N]` — another client kicked this connection; the server closes it after delivery                                                                                                                                                                                                                                                   |
 | `0x20` | `SURFACE_CREATED`      | `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`                                                                                                                                                                                                                                                       |
 | `0x21` | `SURFACE_DESTROYED`    | `[surface_id:2]`                                                                                                                                                                                                                                                                                                                            |
 | `0x22` | `SURFACE_FRAME`        | `[surface_id:2][timestamp:4][flags:1][w:2][h:2][data:N]`                                                                                                                                                                                                                                                                                    |
@@ -214,6 +288,9 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | `0x2F` | `SURFACE_TEXT_INPUT`   | `[surface_id:2][flags:1][content_hint:4][content_purpose:4]` — committed `zwp_text_input_v3` state; flags bit 0 is enabled and bit 1 marks a fresh enable request                                                                                                                                                                           |
 | `0x30` | `AUDIO_FRAME`          | `[timestamp:4][flags:1][data:N]`                                                                                                                                                                                                                                                                                                            |
 | `0x31` | `SURFACE_REMOTE_INPUT` | `[surface_id:2][kind:1][count:1][x:2,y:2]*` — where another viewer is pointing (`kind` 0, one point) or touching (`kind` 1, one per finger); `count = 0` retires the marks and is what the driving viewer receives                                                                                                                          |
+| `0x32` | `TRAY_UPDATE`          | `[flags:1][records:LZ4]`; staged normalized tray state, see [tray/notification design](design/tray-notifications.md#server-to-client)                                                                                                                                                                                                       |
+| `0x33` | `TRAY_MENU`            | `[tray_id:4][tray_revision:4][menu_revision:4][status:1][nodes:LZ4]`; see [tray/notification design](design/tray-notifications.md#server-to-client)                                                                                                                                                                                         |
+| `0x34` | `NOTIFICATION_UPDATE`  | `[flags:1][records:LZ4]`; staged normalized active notifications, see [tray/notification design](design/tray-notifications.md#server-to-client)                                                                                                                                                                                             |
 | `0x40` | `FS_SYNCED`            | `[nonce:2][sync_id:2][status:1][detail_len:2][detail:N]`                                                                                                                                                                                                                                                                                    |
 | `0x41` | `FS_UPDATE`            | `[sync_id:2][update_id:4][flags:1][records:LZ4]`                                                                                                                                                                                                                                                                                            |
 | `0x42` | `FS_FILE`              | `[nonce:2][status:1][data:LZ4]`                                                                                                                                                                                                                                                                                                             |
@@ -251,11 +328,13 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 17  | `SCROLL_BY`          | Scrollback holds still: `S2C_SCROLL_OFFSET` and `C2S_SCROLL_BY` |
 | 18  | `SURFACE_TOUCH`      | Server accepts direct contacts and exposes `wl_seat.touch`      |
 | 19  | `SURFACE_TEXT_INPUT` | Server forwards committed `zwp_text_input_v3` state             |
+| 20  | `CLIENT_CONTROL`     | Enumerate connections and kick another client with a reason     |
+| 21  | `DESKTOP`            | Compositor tray/notification state bridge and core API are live |
 
 Bits 11 through 13 are proposed for the extension, channel, and process families
 under review in [#167](https://github.com/indent-com/blit/pull/167) and
 [#173](https://github.com/indent-com/blit/pull/173); nothing advertises them
-today. Bit 14 is always advertised.
+today. Bits 14 and 20 are always advertised.
 
 The proposed bits 11 through 13 are independently omitted when `BLIT_EXT=0`,
 `BLIT_CHANNEL=0`, or `BLIT_PROCESS=0`; disabled-family requests are refused as

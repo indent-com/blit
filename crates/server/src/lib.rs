@@ -2,33 +2,44 @@ use blit_alacritty::{SearchResult as AlacrittySearchResult, TerminalDriver as Al
 use blit_compositor::{
     CompositorCommand, CompositorEvent, CompositorHandle, TouchPhase, TouchPoint,
 };
+#[cfg(target_os = "linux")]
+use blit_remote::desktop::{
+    C2S_DESKTOP_SUBSCRIBE, C2S_NOTIFICATION_EVENT, C2S_TRAY_EVENT, DESKTOP_SUBSCRIBE_NOTIFICATIONS,
+    DESKTOP_SUBSCRIBE_TRAY, DESKTOP_UPDATE_REPLAY, DESKTOP_UPDATE_RESET, DESKTOP_UPDATE_SYNC,
+    DesktopMirror, FEATURE_DESKTOP, NotificationRecord, TrayRecord, msg_notification_snapshot,
+    msg_notification_update, msg_tray_menu, msg_tray_snapshot, msg_tray_update,
+    parse_desktop_subscribe, parse_notification_event, parse_tray_event,
+};
 use blit_remote::{
-    C2S_ACK, C2S_CLIENT_FEATURES, C2S_CLIENT_METRICS, C2S_CLIPBOARD_GET, C2S_CLIPBOARD_LIST,
-    C2S_CLIPBOARD_SET, C2S_CLOSE, C2S_COPY_RANGE, C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N,
-    C2S_CREATE2, C2S_DEADLINE, C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_KILL, C2S_MOUSE,
-    C2S_PING, C2S_PRIMARY_SET, C2S_QUIT, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL,
-    C2S_SCROLL_BY, C2S_SEARCH, C2S_SUBSCRIBE, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE,
-    C2S_SURFACE_CLOSE, C2S_SURFACE_DRAG_CANCEL, C2S_SURFACE_DRAG_DROP, C2S_SURFACE_DRAG_ENTER,
-    C2S_SURFACE_DRAG_LEAVE, C2S_SURFACE_DRAG_MOTION, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT,
-    C2S_SURFACE_LIST, C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2,
-    C2S_SURFACE_PREEDIT, C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT,
-    C2S_SURFACE_TOUCH, C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
+    C2S_ACK, C2S_CLIENT_FEATURES, C2S_CLIENT_LIST, C2S_CLIENT_METRICS, C2S_CLIENT_UNWATCH,
+    C2S_CLIENT_WATCH, C2S_CLIPBOARD_GET, C2S_CLIPBOARD_LIST, C2S_CLIPBOARD_SET, C2S_CLOSE,
+    C2S_COPY_RANGE, C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N, C2S_CREATE2, C2S_DEADLINE,
+    C2S_DISPLAY_RATE, C2S_FOCUS, C2S_INPUT, C2S_KICK, C2S_KILL, C2S_MOUSE, C2S_PING,
+    C2S_PRIMARY_SET, C2S_QUIT, C2S_READ, C2S_RESIZE, C2S_RESTART, C2S_SCROLL, C2S_SCROLL_BY,
+    C2S_SEARCH, C2S_SUBSCRIBE, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_CLOSE,
+    C2S_SURFACE_DRAG_CANCEL, C2S_SURFACE_DRAG_DROP, C2S_SURFACE_DRAG_ENTER, C2S_SURFACE_DRAG_LEAVE,
+    C2S_SURFACE_DRAG_MOTION, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT, C2S_SURFACE_LIST,
+    C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2, C2S_SURFACE_PREEDIT,
+    C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_TOUCH,
+    C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
     CAPTURE_FORMAT_PNG, CLIENT_FEATURE_SURFACE_TIMESTAMP_SUB_US, CREATE2_HAS_COMMAND,
     CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE, CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS,
-    FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE,
-    FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH, FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState,
-    KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, REMOTE_INPUT_POINTER, REMOTE_INPUT_TOUCH, S2C_CLOSED,
-    S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS,
-    S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID,
-    STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME,
+    FEATURE_CLIENT_CONTROL, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS,
+    FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH, FEATURE_RESTART,
+    FEATURE_SCROLL_BY, FrameState, KICK_REASON_MAX, KILL_LEADER_ONLY, READ_ANSI, READ_TAIL,
+    REMOTE_INPUT_POINTER, REMOTE_INPUT_TOUCH, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST,
+    S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST,
+    S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID, STATUS_NOT_FOUND, STATUS_OK, STATUS_OTHER,
+    STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME,
     SURFACE_POINTER_AXIS2_LEN, SURFACE_POINTER_DOWN, SURFACE_POINTER_LEAVE, SURFACE_POINTER_MOVE,
     SURFACE_POINTER_UP, SURFACE_TOUCH_CANCEL, SURFACE_TOUCH_DISABLE, SURFACE_TOUCH_DOWN,
     SURFACE_TOUCH_ENABLE, SURFACE_TOUCH_MOTION, SURFACE_TOUCH_UP, build_update_msg, msg_hello,
-    msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_clipboard_owner,
-    msg_s2c_scroll_offset, msg_s2c_surface_remote_input, msg_s2c_used_rows, msg_surface_activated,
-    msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
-    msg_surface_frame, msg_surface_frame_precise, msg_surface_resized, msg_surface_text_input,
-    msg_surface_title, msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
+    msg_kick_result, msg_kicked, msg_s2c_client_list, msg_s2c_clipboard_content,
+    msg_s2c_clipboard_list, msg_s2c_clipboard_owner, msg_s2c_scroll_offset,
+    msg_s2c_surface_remote_input, msg_s2c_used_rows, msg_surface_activated, msg_surface_app_id,
+    msg_surface_created, msg_surface_destroyed, msg_surface_encoder, msg_surface_frame,
+    msg_surface_frame_precise, msg_surface_resized, msg_surface_text_input, msg_surface_title,
+    msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
     parse_surface_pointer_axis2, parse_surface_touch,
 };
 #[cfg(target_os = "linux")]
@@ -44,7 +55,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
 #[cfg(target_os = "linux")]
 mod audio;
@@ -399,6 +410,18 @@ async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> 
     writer.write_all(&buf).await.is_ok()
 }
 
+async fn write_frame_counted(
+    writer: &mut (impl AsyncWrite + Unpin),
+    payload: &[u8],
+    outbound_bytes: &AtomicU64,
+) -> bool {
+    let written = write_frame(writer, payload).await;
+    if written {
+        outbound_bytes.fetch_add((payload.len() as u64).saturating_add(4), Ordering::Relaxed);
+    }
+    written
+}
+
 /// Chunk size used only after the connection writer has demonstrated real
 /// backpressure. Splitting every video frame unconditionally made a 240 Hz
 /// 40–70 KiB stream cost 2,400–4,300 WebSocket messages/s; browsers processed
@@ -497,17 +520,18 @@ async fn write_frame_interleaved(
     payload: &[u8],
     audio_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
     chunk_bytes: Option<usize>,
+    outbound_bytes: &AtomicU64,
 ) -> bool {
     let chunk_bytes = chunk_bytes.unwrap_or(usize::MAX);
     // Small or uncongested message: drain queued audio, then write as-is.
     if payload.len() <= chunk_bytes {
         drop_stale_audio(audio_rx);
         while let Ok(audio_msg) = audio_rx.try_recv() {
-            if !write_frame(writer, &audio_msg).await {
+            if !write_frame_counted(writer, &audio_msg, outbound_bytes).await {
                 return false;
             }
         }
-        return write_frame(writer, payload).await;
+        return write_frame_counted(writer, payload, outbound_bytes).await;
     }
 
     // Large message: split into S2C_FRAGMENT messages, draining audio
@@ -518,7 +542,7 @@ async fn write_frame_interleaved(
     while offset < payload.len() {
         drop_stale_audio(audio_rx);
         while let Ok(audio_msg) = audio_rx.try_recv() {
-            if !write_frame(writer, &audio_msg).await {
+            if !write_frame_counted(writer, &audio_msg, outbound_bytes).await {
                 return false;
             }
         }
@@ -532,7 +556,7 @@ async fn write_frame_interleaved(
             0
         });
         frag.extend_from_slice(&payload[offset..end]);
-        if !write_frame(writer, &frag).await {
+        if !write_frame_counted(writer, &frag, outbound_bytes).await {
             return false;
         }
         offset = end;
@@ -904,6 +928,9 @@ struct SharedCompositor {
     /// than escaping to the host compositor.
     #[cfg(target_os = "linux")]
     desktop_bus: Option<desktop_bus::DesktopBus>,
+    /// Canonical tray/notification state replayed to late subscribers.
+    #[cfg(target_os = "linux")]
+    desktop_mirror: DesktopMirror,
     /// Shared fan-out state for audio — subscribers, catch-up ring,
     /// listener flag.  Persistent across pipeline restarts so clients
     /// stay subscribed even when the pipeline is restarted.  Always present on Linux;
@@ -1826,6 +1853,8 @@ struct VulkanVideoSurfaceState {
 
 struct ClientState {
     tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Wakes this connection's read loop when another client kicks it.
+    kick_tx: mpsc::UnboundedSender<String>,
     outbox_queued_frames: Arc<AtomicUsize>,
     outbox_queued_bytes: Arc<AtomicUsize>,
     /// Microseconds the writer task has spent blocked inside a socket
@@ -1836,6 +1865,21 @@ struct ClientState {
     /// `write_blocked_us` as of the controller's last step, so it can read a
     /// delta out of a monotonically growing counter.
     write_blocked_us_seen: u64,
+    /// Total length-prefixed bytes successfully written to this connection.
+    outbound_bytes: Arc<AtomicU64>,
+    /// Counter/timestamp pair used to derive actual recent server→client
+    /// bandwidth for the live client catalog.
+    outbound_bytes_seen: u64,
+    outbound_sampled_at: Instant,
+    outbound_bytes_per_sec: u64,
+    /// Live catalog nonce → last encoded snapshot sent under that nonce.
+    /// Comparing the deterministic encoding avoids pushing unchanged lists on
+    /// every delivery tick.
+    client_catalog_watches: FxHashMap<u16, Vec<u8>>,
+    connected_at: Instant,
+    /// Connection-scoped live resources outside terminal/surface state.
+    /// Rebuilt after each family message from the authoritative registries.
+    aux_subscriptions: Vec<blit_remote::ClientAuxSubscription>,
     /// Dedicated channel for audio frames.  The writer task selects on this
     /// with higher priority than the main outbox so audio is never starved
     /// by large video/terminal messages.
@@ -1848,6 +1892,9 @@ struct ClientState {
     /// Whether this client is subscribed to audio frames.
     #[cfg(target_os = "linux")]
     audio_subscribed: bool,
+    /// Bits from `DESKTOP_SUBSCRIBE`; state is shared, presentation is per viewer.
+    #[cfg(target_os = "linux")]
+    desktop_subscriptions: u8,
     /// Per-client audio bitrate preference in kbps from C2S_AUDIO_SUBSCRIBE.
     /// 0 means use the server/env default.
     #[cfg(target_os = "linux")]
@@ -4118,6 +4165,10 @@ fn reanchor_client(
 struct Session {
     ptys: FxHashMap<u16, Pty>,
     compositor: Option<SharedCompositor>,
+    /// When the live client catalog last sampled age and bandwidth. Session
+    /// scoped, not per client: staggered per-client deadlines would rebuild
+    /// every watcher's snapshot once per client per second instead of once.
+    catalog_sampled_at: Instant,
     next_client_id: u64,
     next_compositor_id: u16,
     next_pty_id: u16,
@@ -4269,6 +4320,7 @@ impl Session {
         Self {
             ptys: FxHashMap::default(),
             compositor: None,
+            catalog_sampled_at: Instant::now(),
             next_client_id: 1,
             next_compositor_id: 1,
             next_pty_id: 1,
@@ -4309,9 +4361,15 @@ impl Session {
             // share the same time origin for A/V sync.
             #[cfg(target_os = "linux")]
             let created_at = Instant::now();
+            #[cfg(target_os = "linux")]
+            let desktop_notify = event_notify.clone();
             let handle = blit_compositor::spawn_compositor(verbose, event_notify, gpu_device);
             #[cfg(target_os = "linux")]
-            let desktop_bus = match desktop_bus::DesktopBus::spawn(&handle.socket_name, verbose) {
+            let desktop_bus = match desktop_bus::DesktopBus::spawn(
+                &handle.socket_name,
+                verbose,
+                desktop_notify,
+            ) {
                 Ok(bus) => Some(bus),
                 Err(e) => {
                     if verbose {
@@ -4413,6 +4471,8 @@ impl Session {
                 #[cfg(target_os = "linux")]
                 desktop_bus,
                 #[cfg(target_os = "linux")]
+                desktop_mirror: DesktopMirror::default(),
+                #[cfg(target_os = "linux")]
                 audio_broadcast,
                 #[cfg(target_os = "linux")]
                 audio_session_id: session_id,
@@ -4500,6 +4560,122 @@ impl Session {
     fn send_to_all(&self, msg: &[u8]) {
         for c in self.clients.values() {
             let _ = send_outbox(c, msg.to_vec());
+        }
+    }
+
+    fn client_list_msg(&self, requester: u64, nonce: u16) -> Vec<u8> {
+        let mut clients: Vec<blit_remote::ClientListEntry> = self
+            .clients
+            .iter()
+            .map(|(&client_id, client)| {
+                let mut terminals: Vec<_> = client
+                    .subscriptions
+                    .iter()
+                    .copied()
+                    .map(|pty_id| {
+                        let (rows, cols) =
+                            client.view_sizes.get(&pty_id).copied().unwrap_or((0, 0));
+                        blit_remote::ClientTerminalSubscription { pty_id, rows, cols }
+                    })
+                    .collect();
+                terminals.sort_unstable_by_key(|entry| entry.pty_id);
+                let mut surfaces: Vec<_> = client
+                    .surface_subscriptions
+                    .iter()
+                    .copied()
+                    .map(|surface_id| {
+                        let (width, height, scale_120) = client
+                            .surface_view_sizes
+                            .get(&surface_id)
+                            .copied()
+                            .unwrap_or((0, 0, 0));
+                        blit_remote::ClientSurfaceSubscription {
+                            surface_id,
+                            width,
+                            height,
+                            scale_120,
+                        }
+                    })
+                    .collect();
+                surfaces.sort_unstable_by_key(|entry| entry.surface_id);
+                let mut subscriptions = client.aux_subscriptions.clone();
+                #[cfg(target_os = "linux")]
+                if client.audio_subscribed {
+                    subscriptions.push(blit_remote::ClientAuxSubscription {
+                        kind: blit_remote::CLIENT_SUBSCRIPTION_AUDIO,
+                        id: 0,
+                    });
+                }
+                subscriptions
+                    .sort_unstable_by_key(|subscription| (subscription.kind, subscription.id));
+                blit_remote::ClientListEntry {
+                    client_id,
+                    age_secs: client.connected_at.elapsed().as_secs(),
+                    outbound_bytes_per_sec: client.outbound_bytes_per_sec,
+                    terminals,
+                    surfaces,
+                    subscriptions,
+                }
+            })
+            .collect();
+        clients.sort_unstable_by_key(|entry| entry.client_id);
+        msg_s2c_client_list(nonce, requester, &clients)
+    }
+
+    fn watch_client_list(&mut self, requester: u64, nonce: u16) {
+        let msg = self.client_list_msg(requester, nonce);
+        if let Some(client) = self.clients.get_mut(&requester) {
+            client.client_catalog_watches.insert(nonce, msg.clone());
+            let _ = send_outbox(client, msg);
+        }
+    }
+
+    fn unwatch_client_list(&mut self, requester: u64, nonce: u16) {
+        if let Some(client) = self.clients.get_mut(&requester) {
+            client.client_catalog_watches.remove(&nonce);
+        }
+    }
+
+    fn publish_client_catalogs(&mut self) {
+        let watches: Vec<(u64, u16)> = self
+            .clients
+            .iter()
+            .flat_map(|(&client_id, client)| {
+                client
+                    .client_catalog_watches
+                    .keys()
+                    .copied()
+                    .map(move |nonce| (client_id, nonce))
+            })
+            .collect();
+        for (client_id, nonce) in watches {
+            let msg = self.client_list_msg(client_id, nonce);
+            let Some(client) = self.clients.get_mut(&client_id) else {
+                continue;
+            };
+            if client.client_catalog_watches.get(&nonce) == Some(&msg) {
+                continue;
+            }
+            client.client_catalog_watches.insert(nonce, msg.clone());
+            let _ = send_outbox(client, msg);
+        }
+    }
+
+    /// Ask `target`'s read loop to shut down with `reason`.
+    ///
+    /// `STATUS_OK` means the request reached that connection's channel, not
+    /// that the reason was delivered: a target already tearing down for its
+    /// own reasons still reports `OK`.
+    ///
+    /// This is the only place the self-kick rule is enforced — the message
+    /// handler used to repeat it, which left the real guard looking optional.
+    fn kick_client(&self, requester: u64, target: u64, reason: &str) -> (u8, &'static str) {
+        if target == requester {
+            return (STATUS_INVALID, "a client cannot kick itself");
+        }
+        match self.clients.get(&target) {
+            Some(client) if client.kick_tx.send(reason.to_owned()).is_ok() => (STATUS_OK, ""),
+            _ => (STATUS_NOT_FOUND, "client is not connected"),
         }
     }
 
@@ -6246,11 +6422,28 @@ async fn supervise(state: &AppState) {
         {
             ap.reap_children();
         }
-        if let Some(cs) = sess.compositor.as_mut()
-            && cs.desktop_bus.as_mut().is_some_and(|bus| !bus.is_alive())
-        {
+        let desktop_bus_exited = sess
+            .compositor
+            .as_mut()
+            .and_then(|cs| cs.desktop_bus.as_mut())
+            .is_some_and(|bus| !bus.is_alive());
+        if desktop_bus_exited {
             eprintln!("[desktop-bus] private session bus exited");
-            cs.desktop_bus = None;
+            if let Some(cs) = sess.compositor.as_mut() {
+                cs.desktop_bus = None;
+                cs.desktop_mirror.reset();
+            }
+            let tray = msg_tray_update(DESKTOP_UPDATE_RESET | DESKTOP_UPDATE_SYNC, &[]);
+            let notifications =
+                msg_notification_update(DESKTOP_UPDATE_RESET | DESKTOP_UPDATE_SYNC, &[]);
+            for client in sess.clients.values() {
+                if client.desktop_subscriptions & DESKTOP_SUBSCRIBE_TRAY != 0 {
+                    let _ = send_outbox(client, tray.clone());
+                }
+                if client.desktop_subscriptions & DESKTOP_SUBSCRIBE_NOTIFICATIONS != 0 {
+                    let _ = send_outbox(client, notifications.clone());
+                }
+            }
         }
     }
     evict_exited(state).await;
@@ -6612,6 +6805,31 @@ async fn tick(state: &AppState) -> TickOutcome {
         }
     }
 
+    // Live client-catalog bandwidth is actual framed bytes written by the
+    // connection writer, sampled at a human-scale cadence. Only a crossed
+    // sample boundary can move age or bandwidth, so publishing is bound to
+    // one — the tick loop has no floor, and rebuilding every watcher's
+    // snapshot per tick would bill that at the PTY producer's rate. Topology
+    // changes publish from their own handlers instead.
+    const CLIENT_CATALOG_BANDWIDTH_INTERVAL: Duration = Duration::from_secs(1);
+    if now.duration_since(sess.catalog_sampled_at) >= CLIENT_CATALOG_BANDWIDTH_INTERVAL {
+        sess.catalog_sampled_at = now;
+        for client in sess.clients.values_mut() {
+            // Each client still measures over its own window: one that
+            // connected mid-interval has less elapsed than the session epoch.
+            let elapsed = now.duration_since(client.outbound_sampled_at);
+            if elapsed.is_zero() {
+                continue;
+            }
+            let total = client.outbound_bytes.load(Ordering::Relaxed);
+            let bytes = total.saturating_sub(client.outbound_bytes_seen);
+            client.outbound_bytes_per_sec = (bytes as f64 / elapsed.as_secs_f64()) as u64;
+            client.outbound_bytes_seen = total;
+            client.outbound_sampled_at = now;
+        }
+        sess.publish_client_catalogs();
+    }
+
     // Application-level keepalive. Only scheduled when a client is
     // connected — otherwise there's no one to ping and the timer would
     // be pure polling cost.
@@ -6646,6 +6864,8 @@ async fn tick(state: &AppState) -> TickOutcome {
     let mut cancelled_touch_owners: Vec<Option<u64>> = Vec::new();
 
     let mut surface_commit_count = 0u32;
+    #[cfg(target_os = "linux")]
+    let mut desktop_broadcast: Vec<(u8, Vec<u8>)> = Vec::new();
     if let Some(cs) = sess.compositor.as_mut() {
         let mut events = Vec::new();
         while let Ok(event) = cs.handle.event_rx.try_recv() {
@@ -6959,8 +7179,56 @@ async fn tick(state: &AppState) -> TickOutcome {
                 }
             }
         }
+        #[cfg(target_os = "linux")]
+        if let Some(bus) = cs.desktop_bus.as_mut() {
+            while let Some(event) = bus.try_recv() {
+                match event {
+                    blit_desktop::Event::Tray(record) => {
+                        match &record {
+                            TrayRecord::Upsert(item) => {
+                                cs.desktop_mirror.tray.insert(item.tray_id, item.clone());
+                            }
+                            TrayRecord::Delete { tray_id } => {
+                                cs.desktop_mirror.tray.remove(tray_id);
+                            }
+                        }
+                        desktop_broadcast
+                            .push((DESKTOP_SUBSCRIBE_TRAY, msg_tray_update(0, &[record])));
+                    }
+                    blit_desktop::Event::TrayMenu(menu) => {
+                        desktop_broadcast.push((DESKTOP_SUBSCRIBE_TRAY, msg_tray_menu(&menu)));
+                    }
+                    blit_desktop::Event::Notification(record) => {
+                        match &record {
+                            NotificationRecord::Upsert(item) => {
+                                cs.desktop_mirror
+                                    .notifications
+                                    .insert(item.notification_id, item.clone());
+                            }
+                            NotificationRecord::Delete {
+                                notification_id, ..
+                            } => {
+                                cs.desktop_mirror.notifications.remove(notification_id);
+                            }
+                        }
+                        desktop_broadcast.push((
+                            DESKTOP_SUBSCRIBE_NOTIFICATIONS,
+                            msg_notification_update(0, &[record]),
+                        ));
+                    }
+                }
+            }
+        }
         for msg in &broadcast {
             sess.send_to_all(msg);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    for (subscription, msg) in desktop_broadcast {
+        for client in sess.clients.values() {
+            if client.desktop_subscriptions & subscription != 0 {
+                let _ = send_outbox(client, msg.clone());
+            }
         }
     }
     sess.surface_commits += surface_commit_count;
@@ -12869,6 +13137,133 @@ fn refuse_lsp_message(data: &[u8], out: &mpsc::UnboundedSender<Vec<u8>>) {
     }
 }
 
+/// Collect one connection's auxiliary subscriptions, labelled by family.
+///
+/// Takes id iterators rather than the tables themselves so the family labelling
+/// and ordering — the only real logic here — can be tested without standing up
+/// a git repo, an LSP process or a KV store.
+fn fill_client_aux_subscriptions(
+    subscriptions: &mut Vec<blit_remote::ClientAuxSubscription>,
+    fs_ids: impl Iterator<Item = u16>,
+    git_ids: impl Iterator<Item = u16>,
+    lsp_ids: impl Iterator<Item = u16>,
+    kv_ids: impl Iterator<Item = u16>,
+    net_ids: impl Iterator<Item = u16>,
+) {
+    use blit_remote::{
+        CLIENT_SUBSCRIPTION_FS, CLIENT_SUBSCRIPTION_GIT, CLIENT_SUBSCRIPTION_KV,
+        CLIENT_SUBSCRIPTION_LSP, CLIENT_SUBSCRIPTION_NET,
+    };
+    subscriptions.clear();
+    subscriptions.extend(fs_ids.map(|id| blit_remote::ClientAuxSubscription {
+        kind: CLIENT_SUBSCRIPTION_FS,
+        id,
+    }));
+    subscriptions.extend(git_ids.map(|id| blit_remote::ClientAuxSubscription {
+        kind: CLIENT_SUBSCRIPTION_GIT,
+        id,
+    }));
+    subscriptions.extend(lsp_ids.map(|id| blit_remote::ClientAuxSubscription {
+        kind: CLIENT_SUBSCRIPTION_LSP,
+        id,
+    }));
+    subscriptions.extend(kv_ids.map(|id| blit_remote::ClientAuxSubscription {
+        kind: CLIENT_SUBSCRIPTION_KV,
+        id,
+    }));
+    subscriptions.extend(net_ids.map(|id| blit_remote::ClientAuxSubscription {
+        kind: CLIENT_SUBSCRIPTION_NET,
+        id,
+    }));
+    subscriptions.sort_unstable_by_key(|subscription| (subscription.kind, subscription.id));
+}
+
+/// How long a disconnecting connection waits for the writer to confirm a
+/// terminal notice reached the stream before giving up on it.
+const TERMINAL_NOTICE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Hand a terminal notice (currently only `S2C_KICKED`) to the writer task and
+/// wait for it to confirm the bytes reached the stream.
+///
+/// Returns whether it was confirmed. The wait is bounded because a peer whose
+/// socket is already wedged can never acknowledge, and the caller aborts the
+/// writer immediately afterwards — without the acknowledgement the abort would
+/// race the write and the kicked client would lose the reason.
+async fn deliver_terminal_notice(
+    terminal_tx: &mpsc::UnboundedSender<(Vec<u8>, oneshot::Sender<()>)>,
+    notice: Vec<u8>,
+    timeout: Duration,
+) -> bool {
+    let (sent_tx, sent_rx) = oneshot::channel();
+    if terminal_tx.send((notice, sent_tx)).is_err() {
+        return false;
+    }
+    tokio::time::timeout(timeout, sent_rx).await.is_ok()
+}
+
+/// Connection-local mirror of this client's auxiliary subscription tables.
+///
+/// `sync` runs after *every* filesystem, git, LSP, KV and network message, so
+/// the unchanged case has to be cheap. Comparing against a connection-local
+/// copy keeps the session lock — the same one the delivery tick and compositor
+/// paths hold — out of those streams entirely, and the two buffers retain
+/// their capacity so a steady state allocates nothing.
+#[derive(Default)]
+struct AuxSubscriptionMirror {
+    known: Vec<blit_remote::ClientAuxSubscription>,
+    scratch: Vec<blit_remote::ClientAuxSubscription>,
+}
+
+impl AuxSubscriptionMirror {
+    /// Rebuild from the live tables and adopt the result, reporting whether
+    /// anything actually changed. Split out from `sync` so the decision that
+    /// keeps the session lock off the hot path is testable on its own.
+    fn adopt_if_changed(
+        &mut self,
+        fs_syncs: &FsSyncs,
+        git_repos: &GitRepos,
+        lsp_conns: &LspConns,
+        kv_subs: &kv::KvSubs,
+        net_sockets: &net::NetSockets,
+    ) -> bool {
+        fill_client_aux_subscriptions(
+            &mut self.scratch,
+            fs_syncs.map.keys().copied(),
+            git_repos.map.keys().copied(),
+            lsp_conns.map.keys().copied(),
+            kv_subs.ids(),
+            net_sockets.ids(),
+        );
+        if self.known == self.scratch {
+            return false;
+        }
+        std::mem::swap(&mut self.known, &mut self.scratch);
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn sync(
+        &mut self,
+        state: &AppState,
+        client_id: u64,
+        fs_syncs: &FsSyncs,
+        git_repos: &GitRepos,
+        lsp_conns: &LspConns,
+        kv_subs: &kv::KvSubs,
+        net_sockets: &net::NetSockets,
+    ) {
+        if !self.adopt_if_changed(fs_syncs, git_repos, lsp_conns, kv_subs, net_sockets) {
+            return;
+        }
+        let mut sess = state.session.lock().await;
+        let Some(client) = sess.clients.get_mut(&client_id) else {
+            return;
+        };
+        client.aux_subscriptions = self.known.clone();
+        sess.publish_client_catalogs();
+    }
+}
+
 async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     state: AppState,
@@ -12881,6 +13276,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // Terminal connection-control notices bypass the ordinary visual outbox.
+    // A kick must not sit behind *queued* video frames — it can still wait on
+    // one already being written, which is part of what the read task's
+    // shutdown timeout absorbs — and the acknowledgement lets the read task
+    // keep the socket alive until S2C_KICKED is written.
+    let (terminal_tx, mut terminal_rx) =
+        mpsc::unbounded_channel::<(Vec<u8>, oneshot::Sender<()>)>();
+    let (kick_tx, mut kick_rx) = mpsc::unbounded_channel::<String>();
     // Filesystem syncs are connection-scoped; engines write into the same
     // outbox as everything else and die with this map on disconnect.
     let fs_out = out_tx.clone();
@@ -12888,6 +13291,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut git_repos = GitRepos::default();
     let mut lsp_conns = LspConns::default();
     let mut kv_subs = kv::KvSubs::default();
+    let mut aux_mirror = AuxSubscriptionMirror::default();
     // BLIT_NET=0 turns the relay off: the bit is unadvertised AND every
     // NET_OPEN is refused with PERMISSION, so a client that ignores
     // feature bits still gets its one reply.
@@ -12919,6 +13323,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let outbox_frame_counter = Arc::new(AtomicUsize::new(0));
     let outbox_byte_counter = Arc::new(AtomicUsize::new(0));
     let write_blocked_counter = Arc::new(AtomicU64::new(0));
+    let outbound_byte_counter = Arc::new(AtomicU64::new(0));
     // Relayed sockets are connection-scoped: they die with this table on
     // disconnect, which is what releases forwarded sockets on a dropped
     // client rather than leaking them. Datagrams read the outbox depth to
@@ -12928,6 +13333,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let sender_outbox_queued_frames = outbox_frame_counter.clone();
     let sender_outbox_queued_bytes = outbox_byte_counter.clone();
     let sender_write_blocked_us = write_blocked_counter.clone();
+    let sender_outbound_bytes = outbound_byte_counter.clone();
     let sender = tokio::spawn(async move {
         let audio_debug = std::env::var_os("BLIT_AUDIO_DEBUG").is_some();
         let mut audio_window_start = Instant::now();
@@ -12937,6 +13343,15 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         let mut max_audio_write_ms: u32 = 0;
         let mut bulk_fragmentation = BulkFragmentation::default();
         loop {
+            // A terminal control notice (currently S2C_KICKED) is both tiny
+            // and connection-ending. Write it ahead of queued visual/audio
+            // traffic and acknowledge only after it reaches the stream.
+            while let Ok((notice, sent)) = terminal_rx.try_recv() {
+                if !write_frame_counted(&mut writer, &notice, &sender_outbound_bytes).await {
+                    return;
+                }
+                let _ = sent.send(());
+            }
             // Drain all pending audio before waiting for the next message.
             // Audio frames are tiny (~160 B) so this is near-instant.
             let stale = drop_stale_audio(&mut audio_rx);
@@ -12944,7 +13359,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 eprintln!("[audio] writer dropped {stale} stale queued frame(s)");
             }
             while let Ok(audio_msg) = audio_rx.try_recv() {
-                if !write_frame(&mut writer, &audio_msg).await {
+                if !write_frame_counted(&mut writer, &audio_msg, &sender_outbound_bytes).await {
                     return;
                 }
                 if audio_debug {
@@ -12963,12 +13378,30 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             // before the next bulk message.
             let msg = tokio::select! {
                 biased;
+                notice = terminal_rx.recv() => {
+                    match notice {
+                        Some((notice, sent)) => {
+                            if !write_frame_counted(
+                                &mut writer,
+                                &notice,
+                                &sender_outbound_bytes,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                            let _ = sent.send(());
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
                 msg = audio_rx.recv() => {
                     // Pure audio message — write it directly (tiny).
                     match msg {
                         Some(m) => {
                             let audio_write_start = Instant::now();
-                            if !write_frame(&mut writer, &m).await {
+                            if !write_frame_counted(&mut writer, &m, &sender_outbound_bytes).await {
                                 break;
                             }
                             if audio_debug {
@@ -13022,6 +13455,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         &m,
                         &mut audio_rx,
                         bulk_fragmentation.chunk_bytes(),
+                        &sender_outbound_bytes,
                     )
                     .await;
                     let write_elapsed = write_start.elapsed();
@@ -13076,10 +13510,18 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             client_id,
             ClientState {
                 tx: out_tx,
+                kick_tx,
                 outbox_queued_frames: outbox_frame_counter,
                 outbox_queued_bytes: outbox_byte_counter,
                 write_blocked_us: write_blocked_counter,
                 write_blocked_us_seen: 0,
+                outbound_bytes: outbound_byte_counter,
+                outbound_bytes_seen: 0,
+                outbound_sampled_at: Instant::now(),
+                outbound_bytes_per_sec: 0,
+                client_catalog_watches: FxHashMap::default(),
+                connected_at: Instant::now(),
+                aux_subscriptions: Vec::new(),
                 #[cfg(target_os = "linux")]
                 audio_tx,
                 lead: None,
@@ -13087,6 +13529,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 surface_subscriptions: FxHashSet::default(),
                 #[cfg(target_os = "linux")]
                 audio_subscribed: false,
+                #[cfg(target_os = "linux")]
+                desktop_subscriptions: 0,
                 #[cfg(target_os = "linux")]
                 audio_bitrate_kbps: 0,
                 view_sizes: FxHashMap::default(),
@@ -13152,6 +13596,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 drag_staging_dir: None,
             },
         );
+        sess.publish_client_catalogs();
         // Wake the tick loop so the new client gets its first frame.
         state.delivery_notify.notify_one();
         if let Some(c) = sess.clients.get(&client_id) {
@@ -13163,6 +13608,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 | FEATURE_KILL_MODE
                 | FEATURE_PTY_DEADLINE
                 | FEATURE_SCROLL_BY
+                | FEATURE_CLIENT_CONTROL
                 | blit_remote::fs::FEATURE_FS
                 | blit_remote::git::FEATURE_GIT;
             #[cfg(target_os = "linux")]
@@ -13187,6 +13633,14 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     .unwrap_or(false);
                 if !audio_disabled && audio::pipewire_available() {
                     features |= FEATURE_AUDIO;
+                }
+                if sess
+                    .compositor
+                    .as_ref()
+                    .and_then(|cs| cs.desktop_bus.as_ref())
+                    .is_some_and(desktop_bus::DesktopBus::services_live)
+                {
+                    features |= FEATURE_DESKTOP;
                 }
             }
             let _ = send_outbox(
@@ -13329,6 +13783,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         eprintln!("client connected");
     }
 
+    let mut kicked_reason: Option<String> = None;
     loop {
         let has_surface_subscriptions = {
             let sess = state.session.lock().await;
@@ -13336,11 +13791,24 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 .get(&client_id)
                 .is_some_and(|client| !client.surface_subscriptions.is_empty())
         };
-        let next = if has_surface_subscriptions {
-            match tokio::time::timeout(STALE_SURFACE_CLIENT_TIMEOUT, read_frame(&mut reader)).await
-            {
+        let read_next = async {
+            if has_surface_subscriptions {
+                tokio::time::timeout(STALE_SURFACE_CLIENT_TIMEOUT, read_frame(&mut reader))
+                    .await
+                    .map_err(|_| ())
+            } else {
+                Ok(read_frame(&mut reader).await)
+            }
+        };
+        let next = tokio::select! {
+            biased;
+            reason = kick_rx.recv() => {
+                kicked_reason = reason;
+                break;
+            }
+            next = read_next => match next {
                 Ok(next) => next,
-                Err(_) => {
+                Err(()) => {
                     if state.config.verbose {
                         eprintln!(
                             "client {client_id}: no ACK, ping, or input for {}s; disconnecting stale surface subscriber",
@@ -13349,9 +13817,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     }
                     break;
                 }
-            }
-        } else {
-            read_frame(&mut reader).await
+            },
         };
         let Some(data) = next else {
             break;
@@ -13484,6 +13950,17 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             } else {
                 handle_fs_message(&msg, &mut fs_syncs, &fs_out, config.verbose).await;
             }
+            aux_mirror
+                .sync(
+                    &state,
+                    client_id,
+                    &fs_syncs,
+                    &git_repos,
+                    &lsp_conns,
+                    &kv_subs,
+                    &net_sockets,
+                )
+                .await;
             continue;
         }
 
@@ -13533,6 +14010,17 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 std::borrow::Cow::Borrowed(&data[..])
             };
             handle_git_message(&msg, &mut git_repos, &fs_out, config.verbose).await;
+            aux_mirror
+                .sync(
+                    &state,
+                    client_id,
+                    &fs_syncs,
+                    &git_repos,
+                    &lsp_conns,
+                    &kv_subs,
+                    &net_sockets,
+                )
+                .await;
             continue;
         }
 
@@ -13579,6 +14067,17 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 std::borrow::Cow::Borrowed(&data[..])
             };
             handle_lsp_message(&msg, &mut lsp_conns, &fs_out, config.verbose).await;
+            aux_mirror
+                .sync(
+                    &state,
+                    client_id,
+                    &fs_syncs,
+                    &git_repos,
+                    &lsp_conns,
+                    &kv_subs,
+                    &net_sockets,
+                )
+                .await;
             continue;
         }
 
@@ -13591,6 +14090,17 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             } else {
                 kv::refuse_kv_message(&data, &fs_out);
             }
+            aux_mirror
+                .sync(
+                    &state,
+                    client_id,
+                    &fs_syncs,
+                    &git_repos,
+                    &lsp_conns,
+                    &kv_subs,
+                    &net_sockets,
+                )
+                .await;
             continue;
         }
 
@@ -13610,6 +14120,17 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             } else {
                 net::refuse_net_message(&data, &fs_out);
             }
+            aux_mirror
+                .sync(
+                    &state,
+                    client_id,
+                    &fs_syncs,
+                    &git_repos,
+                    &lsp_conns,
+                    &kv_subs,
+                    &net_sockets,
+                )
+                .await;
             continue;
         }
 
@@ -13847,6 +14368,73 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             continue;
         }
 
+        // Every message in this family is correlated by nonce, so a malformed
+        // one has to be answered rather than dropped: the requester would
+        // otherwise wait out its whole timeout for a reply that never comes.
+        // The nonce is only trustworthy once the length is right, so a request
+        // too short to carry one is the single case that stays silent.
+        if matches!(
+            data[0],
+            C2S_CLIENT_LIST | C2S_CLIENT_WATCH | C2S_CLIENT_UNWATCH
+        ) {
+            if data.len() != 3 {
+                if data.len() >= 3 {
+                    let nonce = u16::from_le_bytes([data[1], data[2]]);
+                    let sess = state.session.lock().await;
+                    if let Some(client) = sess.clients.get(&client_id) {
+                        let _ = send_outbox(
+                            client,
+                            msg_kick_result(
+                                nonce,
+                                STATUS_INVALID,
+                                "client-control request has trailing bytes",
+                            ),
+                        );
+                    }
+                }
+                continue;
+            }
+            let nonce = u16::from_le_bytes([data[1], data[2]]);
+            let mut sess = state.session.lock().await;
+            match data[0] {
+                C2S_CLIENT_LIST => {
+                    if let Some(client) = sess.clients.get(&client_id) {
+                        let _ = send_outbox(client, sess.client_list_msg(client_id, nonce));
+                    }
+                }
+                C2S_CLIENT_WATCH => sess.watch_client_list(client_id, nonce),
+                _ => sess.unwatch_client_list(client_id, nonce),
+            }
+            continue;
+        }
+
+        if data[0] == C2S_KICK && data.len() >= 3 {
+            let nonce = u16::from_le_bytes([data[1], data[2]]);
+            let sess = state.session.lock().await;
+            let (status, detail) = if data.len() < 11 {
+                (STATUS_INVALID, "kick request is truncated")
+            } else {
+                let target_id = u64::from_le_bytes(data[3..11].try_into().expect("checked length"));
+                let reason = &data[11..];
+                if reason.len() > KICK_REASON_MAX {
+                    (STATUS_TOO_LARGE, "kick reason exceeds 1024 bytes")
+                } else if let Ok(reason) = std::str::from_utf8(reason) {
+                    let reason = if reason.is_empty() {
+                        "kicked by another client"
+                    } else {
+                        reason
+                    };
+                    sess.kick_client(client_id, target_id, reason)
+                } else {
+                    (STATUS_INVALID, "kick reason is not valid UTF-8")
+                }
+            };
+            if let Some(client) = sess.clients.get(&client_id) {
+                let _ = send_outbox(client, msg_kick_result(nonce, status, detail));
+            }
+            continue;
+        }
+
         if data[0] == C2S_QUIT {
             let sess = state.session.lock().await;
             sess.send_to_all(&[S2C_QUIT]);
@@ -13863,6 +14451,94 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         // never compositor delivery for every client.
         let mut deferred_verbose_log: Option<String> = None;
         match data[0] {
+            #[cfg(target_os = "linux")]
+            C2S_DESKTOP_SUBSCRIBE => {
+                let Some(flags) = parse_desktop_subscribe(&data) else {
+                    continue;
+                };
+                // Send both maps on every subscription change. An empty
+                // RESET/SYNC is how a client drops state for a stream it just
+                // unsubscribed from.
+                let tray_records = if flags & DESKTOP_SUBSCRIBE_TRAY != 0 {
+                    sess.compositor
+                        .as_ref()
+                        .map(|cs| {
+                            cs.desktop_mirror
+                                .tray
+                                .values()
+                                .cloned()
+                                .map(TrayRecord::Upsert)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let notification_records = if flags & DESKTOP_SUBSCRIBE_NOTIFICATIONS != 0 {
+                    sess.compositor
+                        .as_ref()
+                        .map(|cs| {
+                            cs.desktop_mirror
+                                .notifications
+                                .values()
+                                .cloned()
+                                .map(NotificationRecord::Upsert)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let tray_snapshot = msg_tray_snapshot(&tray_records).unwrap_or_else(|| {
+                    vec![msg_tray_update(
+                        DESKTOP_UPDATE_RESET | DESKTOP_UPDATE_SYNC | DESKTOP_UPDATE_REPLAY,
+                        &[],
+                    )]
+                });
+                let notification_snapshot = msg_notification_snapshot(&notification_records)
+                    .unwrap_or_else(|| {
+                        vec![msg_notification_update(
+                            DESKTOP_UPDATE_RESET | DESKTOP_UPDATE_SYNC | DESKTOP_UPDATE_REPLAY,
+                            &[],
+                        )]
+                    });
+                if let Some(client) = sess.clients.get_mut(&client_id) {
+                    client.desktop_subscriptions = flags;
+                    for message in tray_snapshot.into_iter().chain(notification_snapshot) {
+                        let _ = send_outbox(client, message);
+                    }
+                }
+            }
+            #[cfg(target_os = "linux")]
+            C2S_TRAY_EVENT => {
+                let subscribed = sess.clients.get(&client_id).is_some_and(|client| {
+                    client.desktop_subscriptions & DESKTOP_SUBSCRIBE_TRAY != 0
+                });
+                if subscribed
+                    && let Some(event) = parse_tray_event(&data)
+                    && let Some(bus) = sess
+                        .compositor
+                        .as_ref()
+                        .and_then(|cs| cs.desktop_bus.as_ref())
+                {
+                    let _ = bus.try_command(blit_desktop::Command::Tray(event));
+                }
+            }
+            #[cfg(target_os = "linux")]
+            C2S_NOTIFICATION_EVENT => {
+                let subscribed = sess.clients.get(&client_id).is_some_and(|client| {
+                    client.desktop_subscriptions & DESKTOP_SUBSCRIBE_NOTIFICATIONS != 0
+                });
+                if subscribed
+                    && let Some(event) = parse_notification_event(&data)
+                    && let Some(bus) = sess
+                        .compositor
+                        .as_ref()
+                        .and_then(|cs| cs.desktop_bus.as_ref())
+                {
+                    let _ = bus.try_command(blit_desktop::Command::Notification(event));
+                }
+            }
             C2S_SCROLL if data.len() >= 7 => {
                 let pid = u16::from_le_bytes([data[1], data[2]]);
                 let offset = u32::from_le_bytes([data[3], data[4], data[5], data[6]]) as usize;
@@ -15148,6 +15824,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     };
                     ap.set_bitrate(bitrate);
                 }
+                sess.publish_client_catalogs();
                 state.delivery_notify.notify_one();
             }
             #[cfg(target_os = "linux")]
@@ -15180,6 +15857,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     };
                     ap.set_bitrate(bitrate);
                 }
+                sess.publish_client_catalogs();
             }
             C2S_SURFACE_ACK if data.len() >= 3 => {
                 // Surface ACKs feed shared RTT / delivery_bps / goodput_bps
@@ -15793,9 +16471,20 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 let _ = std::fs::remove_dir_all(dir);
             }
         }
+        sess.publish_client_catalogs();
         drop(sess);
         if need_nudge {
             nudge_delivery(&state);
+        }
+    }
+    if let Some(reason) = kicked_reason.as_deref() {
+        let delivered =
+            deliver_terminal_notice(&terminal_tx, msg_kicked(reason), TERMINAL_NOTICE_TIMEOUT)
+                .await;
+        if !delivered && config.verbose {
+            eprintln!(
+                "client {client_id}: kicked, but the reason never reached the socket before shutdown"
+            );
         }
     }
     sender.abort();
@@ -16379,14 +17068,23 @@ mod tests {
         _capacity: usize,
     ) -> (ClientState, mpsc::UnboundedReceiver<Vec<u8>>) {
         let (tx, rx) = mpsc::unbounded_channel();
+        let (kick_tx, _kick_rx) = mpsc::unbounded_channel();
         #[cfg(target_os = "linux")]
         let (audio_tx, _audio_rx) = mpsc::unbounded_channel();
         let client = ClientState {
             tx,
+            kick_tx,
             outbox_queued_frames: Arc::new(AtomicUsize::new(0)),
             outbox_queued_bytes: Arc::new(AtomicUsize::new(0)),
             write_blocked_us: Arc::new(AtomicU64::new(0)),
             write_blocked_us_seen: 0,
+            outbound_bytes: Arc::new(AtomicU64::new(0)),
+            outbound_bytes_seen: 0,
+            outbound_sampled_at: Instant::now(),
+            outbound_bytes_per_sec: 0,
+            client_catalog_watches: FxHashMap::default(),
+            connected_at: Instant::now(),
+            aux_subscriptions: Vec::new(),
             #[cfg(target_os = "linux")]
             audio_tx,
             lead: None,
@@ -16394,6 +17092,8 @@ mod tests {
             surface_subscriptions: FxHashSet::default(),
             #[cfg(target_os = "linux")]
             audio_subscribed: false,
+            #[cfg(target_os = "linux")]
+            desktop_subscriptions: 0,
             #[cfg(target_os = "linux")]
             audio_bitrate_kbps: 0,
             view_sizes: FxHashMap::default(),
@@ -16460,6 +17160,333 @@ mod tests {
     fn test_client() -> ClientState {
         let (client, _rx) = test_client_with_capacity(0);
         client
+    }
+
+    #[tokio::test]
+    async fn counted_writer_measures_the_length_prefix_and_payload() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let bytes = AtomicU64::new(0);
+        assert!(write_frame_counted(&mut writer, b"catalog", &bytes).await);
+        assert_eq!(bytes.load(Ordering::Relaxed), 11);
+
+        let mut framed = [0u8; 11];
+        reader.read_exact(&mut framed).await.unwrap();
+        assert_eq!(&framed[..4], &7u32.to_le_bytes());
+        assert_eq!(&framed[4..], b"catalog");
+    }
+
+    #[test]
+    fn client_control_lists_all_clients_and_kicks_target() {
+        let mut sess = Session::new();
+        let mut requester = test_client();
+        requester.connected_at = Instant::now() - Duration::from_secs(3);
+        requester.outbound_bytes_per_sec = 300;
+        requester.subscriptions.insert(11);
+        requester.view_sizes.insert(11, (40, 120));
+        requester.surface_subscriptions.insert(4);
+        requester.surface_view_sizes.insert(4, (1920, 1080, 120));
+        requester.aux_subscriptions = vec![blit_remote::ClientAuxSubscription {
+            kind: blit_remote::CLIENT_SUBSCRIPTION_KV,
+            id: 8,
+        }];
+        sess.clients.insert(9, requester);
+        let mut peer = test_client();
+        peer.connected_at = Instant::now() - Duration::from_secs(5);
+        peer.outbound_bytes_per_sec = 100;
+        peer.aux_subscriptions = vec![blit_remote::ClientAuxSubscription {
+            kind: blit_remote::CLIENT_SUBSCRIPTION_FS,
+            id: 4,
+        }];
+        sess.clients.insert(2, peer);
+        let mut target = test_client();
+        target.connected_at = Instant::now() - Duration::from_secs(8);
+        target.outbound_bytes_per_sec = 200;
+        target.subscriptions.insert(7);
+        target.view_sizes.insert(7, (24, 80));
+        target.surface_subscriptions.insert(3);
+        target.surface_view_sizes.insert(3, (1280, 720, 180));
+        target.aux_subscriptions = vec![blit_remote::ClientAuxSubscription {
+            kind: blit_remote::CLIENT_SUBSCRIPTION_GIT,
+            id: 6,
+        }];
+        let (kick_tx, mut kick_rx) = mpsc::unbounded_channel();
+        target.kick_tx = kick_tx;
+        sess.clients.insert(5, target);
+
+        let msg = sess.client_list_msg(9, 17);
+        let Some(blit_remote::ServerMsg::ClientList {
+            nonce,
+            self_id,
+            clients,
+        }) = blit_remote::parse_server_msg(&msg)
+        else {
+            panic!("expected client list");
+        };
+        assert_eq!((nonce, self_id), (17, 9));
+        assert_eq!(clients.len(), 3);
+        assert_eq!(clients[0].client_id, 2);
+        assert!(clients[0].age_secs >= 5);
+        assert_eq!(clients[0].outbound_bytes_per_sec, 100);
+        assert_eq!(
+            clients[0].subscriptions,
+            [blit_remote::ClientAuxSubscription {
+                kind: blit_remote::CLIENT_SUBSCRIPTION_FS,
+                id: 4,
+            }]
+        );
+        assert_eq!(clients[1].client_id, 5);
+        assert!(clients[1].age_secs >= 8);
+        assert_eq!(clients[1].outbound_bytes_per_sec, 200);
+        assert_eq!(
+            clients[1].terminals,
+            [blit_remote::ClientTerminalSubscription {
+                pty_id: 7,
+                rows: 24,
+                cols: 80,
+            }]
+        );
+        assert_eq!(
+            clients[1].surfaces,
+            [blit_remote::ClientSurfaceSubscription {
+                surface_id: 3,
+                width: 1280,
+                height: 720,
+                scale_120: 180,
+            }]
+        );
+        assert_eq!(
+            clients[1].subscriptions,
+            [blit_remote::ClientAuxSubscription {
+                kind: blit_remote::CLIENT_SUBSCRIPTION_GIT,
+                id: 6,
+            }]
+        );
+        assert_eq!(clients[2].client_id, 9);
+        assert!(clients[2].age_secs >= 3);
+        assert_eq!(clients[2].outbound_bytes_per_sec, 300);
+        assert_eq!(
+            clients[2].terminals,
+            [blit_remote::ClientTerminalSubscription {
+                pty_id: 11,
+                rows: 40,
+                cols: 120,
+            }]
+        );
+        assert_eq!(
+            clients[2].surfaces,
+            [blit_remote::ClientSurfaceSubscription {
+                surface_id: 4,
+                width: 1920,
+                height: 1080,
+                scale_120: 120,
+            }]
+        );
+        assert_eq!(
+            clients[2].subscriptions,
+            [blit_remote::ClientAuxSubscription {
+                kind: blit_remote::CLIENT_SUBSCRIPTION_KV,
+                id: 8,
+            }]
+        );
+
+        assert_eq!(sess.kick_client(9, 5, "duplicate tab"), (STATUS_OK, ""));
+        assert_eq!(kick_rx.try_recv().unwrap(), "duplicate tab");
+        assert_eq!(
+            sess.kick_client(9, 9, "self"),
+            (STATUS_INVALID, "a client cannot kick itself")
+        );
+        assert_eq!(
+            sess.kick_client(9, 99, "gone"),
+            (STATUS_NOT_FOUND, "client is not connected")
+        );
+    }
+
+    #[test]
+    fn client_catalog_watch_pushes_only_changes_until_unwatched() {
+        let mut sess = Session::new();
+        let (watcher, mut watcher_rx) = test_client_with_capacity(0);
+        sess.clients.insert(9, watcher);
+        sess.clients.insert(2, test_client());
+
+        sess.watch_client_list(9, 31);
+        assert!(matches!(
+            blit_remote::parse_server_msg(&watcher_rx.try_recv().unwrap()),
+            Some(blit_remote::ServerMsg::ClientList {
+                nonce: 31,
+                self_id: 9,
+                ..
+            })
+        ));
+        sess.publish_client_catalogs();
+        assert!(matches!(
+            watcher_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        sess.clients.get_mut(&2).unwrap().aux_subscriptions =
+            vec![blit_remote::ClientAuxSubscription {
+                kind: blit_remote::CLIENT_SUBSCRIPTION_KV,
+                id: 7,
+            }];
+        sess.publish_client_catalogs();
+        let changed = watcher_rx.try_recv().unwrap();
+        assert!(matches!(
+            blit_remote::parse_server_msg(&changed),
+            Some(blit_remote::ServerMsg::ClientList { nonce: 31, clients, .. })
+                if clients[0].subscriptions == [blit_remote::ClientAuxSubscription {
+                    kind: blit_remote::CLIENT_SUBSCRIPTION_KV,
+                    id: 7,
+                }]
+        ));
+
+        sess.unwatch_client_list(9, 31);
+        sess.clients.get_mut(&2).unwrap().aux_subscriptions.clear();
+        sess.publish_client_catalogs();
+        assert!(matches!(
+            watcher_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    /// A kicked client must be told why before the writer task is aborted.
+    #[tokio::test]
+    async fn kick_notice_is_confirmed_before_the_writer_is_abandoned() {
+        let (terminal_tx, mut terminal_rx) =
+            mpsc::unbounded_channel::<(Vec<u8>, oneshot::Sender<()>)>();
+
+        // A live writer: take the notice, write it, then acknowledge.
+        let writer = tokio::spawn(async move {
+            let (notice, sent) = terminal_rx.recv().await.expect("notice");
+            let mut sink = Vec::new();
+            assert!(write_frame(&mut sink, &notice).await);
+            let _ = sent.send(());
+            sink
+        });
+        assert!(
+            deliver_terminal_notice(
+                &terminal_tx,
+                msg_kicked("duplicate tab"),
+                TERMINAL_NOTICE_TIMEOUT,
+            )
+            .await,
+            "a writer that acknowledges must be waited for"
+        );
+        // The reason is on the wire, framed, before the caller aborts.
+        let written = writer.await.unwrap();
+        assert_eq!(
+            u32::from_le_bytes(written[..4].try_into().unwrap()) as usize,
+            written.len() - 4
+        );
+        assert!(matches!(
+            blit_remote::parse_server_msg(&written[4..]),
+            Some(blit_remote::ServerMsg::Kicked {
+                reason: "duplicate tab"
+            })
+        ));
+
+        // A wedged peer never acknowledges: bounded, not hung.
+        let (stuck_tx, _stuck_rx) = mpsc::unbounded_channel::<(Vec<u8>, oneshot::Sender<()>)>();
+        assert!(
+            !deliver_terminal_notice(&stuck_tx, msg_kicked("wedged"), Duration::from_millis(50),)
+                .await
+        );
+
+        // A writer that already died cannot be waited for at all.
+        let (dead_tx, dead_rx) = mpsc::unbounded_channel::<(Vec<u8>, oneshot::Sender<()>)>();
+        drop(dead_rx);
+        assert!(
+            !deliver_terminal_notice(&dead_tx, msg_kicked("gone"), TERMINAL_NOTICE_TIMEOUT,).await
+        );
+    }
+
+    /// Every family gets its documented kind byte, and the result is sorted by
+    /// (kind, id) so the catalog encoding is deterministic — the watch push
+    /// suppresses unchanged snapshots by comparing encoded bytes.
+    #[test]
+    fn aux_subscriptions_are_labelled_by_family_and_sorted() {
+        use blit_remote::{
+            CLIENT_SUBSCRIPTION_FS, CLIENT_SUBSCRIPTION_GIT, CLIENT_SUBSCRIPTION_KV,
+            CLIENT_SUBSCRIPTION_LSP, CLIENT_SUBSCRIPTION_NET,
+        };
+        let mut out = Vec::new();
+        // Deliberately out of order within and across families.
+        fill_client_aux_subscriptions(
+            &mut out,
+            [7u16, 2].into_iter(),
+            [4u16].into_iter(),
+            [9u16, 1].into_iter(),
+            [3u16].into_iter(),
+            [5u16].into_iter(),
+        );
+        let pairs: Vec<(u8, u16)> = out.iter().map(|s| (s.kind, s.id)).collect();
+        assert_eq!(
+            pairs,
+            [
+                (CLIENT_SUBSCRIPTION_FS, 2),
+                (CLIENT_SUBSCRIPTION_FS, 7),
+                (CLIENT_SUBSCRIPTION_GIT, 4),
+                (CLIENT_SUBSCRIPTION_LSP, 1),
+                (CLIENT_SUBSCRIPTION_LSP, 9),
+                (CLIENT_SUBSCRIPTION_KV, 3),
+                (CLIENT_SUBSCRIPTION_NET, 5),
+            ]
+        );
+        // Kinds are the wire values docs/protocol.md publishes; drifting them
+        // silently remaps what the browser labels each subscription.
+        assert_eq!(
+            (
+                CLIENT_SUBSCRIPTION_FS,
+                CLIENT_SUBSCRIPTION_GIT,
+                CLIENT_SUBSCRIPTION_LSP,
+                CLIENT_SUBSCRIPTION_KV,
+                CLIENT_SUBSCRIPTION_NET,
+            ),
+            (2, 3, 4, 5, 6)
+        );
+    }
+
+    /// The mirror is what keeps the session lock out of the filesystem, git,
+    /// LSP, KV and network streams, which call it after every message.
+    #[test]
+    fn aux_subscription_mirror_only_reports_real_changes() {
+        let fs_syncs = FsSyncs::default();
+        let git_repos = GitRepos::default();
+        let lsp_conns = LspConns::default();
+        let kv_subs = kv::KvSubs::default();
+        let net_sockets = net::NetSockets::default();
+        let mut mirror = AuxSubscriptionMirror::default();
+        let adopt = |mirror: &mut AuxSubscriptionMirror| {
+            mirror.adopt_if_changed(&fs_syncs, &git_repos, &lsp_conns, &kv_subs, &net_sockets)
+        };
+
+        // Nothing subscribed: the first call must not claim a change, or
+        // every connection would take the lock on its very first message.
+        assert!(!adopt(&mut mirror));
+        // Repeating against unchanged tables is the common case and has to
+        // stay silent.
+        for _ in 0..3 {
+            assert!(!adopt(&mut mirror));
+        }
+
+        // A set that no longer matches the tables is adopted once, then goes
+        // quiet again. Poking `known` stands in for a closed subscription;
+        // building real engine entries here would test the engines, not this.
+        mirror.known = vec![blit_remote::ClientAuxSubscription {
+            kind: blit_remote::CLIENT_SUBSCRIPTION_KV,
+            id: 7,
+        }];
+        assert!(adopt(&mut mirror));
+        assert!(mirror.known.is_empty());
+        assert!(!adopt(&mut mirror));
+
+        // The scratch buffer is reused across calls, so a dropped clear()
+        // would let stale entries accumulate instead of being rebuilt.
+        mirror.scratch = vec![blit_remote::ClientAuxSubscription {
+            kind: blit_remote::CLIENT_SUBSCRIPTION_NET,
+            id: 3,
+        }];
+        assert!(!adopt(&mut mirror));
+        assert!(mirror.scratch.is_empty());
     }
 
     fn touch_event(

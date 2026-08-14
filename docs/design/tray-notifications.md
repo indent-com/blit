@@ -1,13 +1,15 @@
 # Tray Icons and Desktop Notifications
 
-- **Status:** Proposed
-- **Date:** 2026-08-13
+- **Status:** Implemented
+- **Date:** 2026-08-14
 
 ## Summary
 
 Applications running on blit's headless Wayland compositor already inherit a
-private D-Bus session. They can create windows and use desktop portals, but two
-ordinary desktop facilities have nobody listening on that bus:
+private D-Bus session. They can create windows and may activate installed
+desktop-portal services in the compositor environment, but blit does not yet
+provide a compositor-aware portal backend. Two ordinary desktop facilities also
+had nobody listening on that bus before this RFC:
 
 - StatusNotifierItem tray icons have no watcher or host, so they never appear.
 - `org.freedesktop.Notifications` has no owner, so notification calls fail.
@@ -24,6 +26,37 @@ current tray and active notifications; it never connects to D-Bus, reads a
 remote icon path, parses arbitrary variants, or tries to reconstruct state from
 events. This is the same server-does-more/client-does-less choice as terminal
 frames and filesystem sync.
+
+## Implementation status
+
+The RFC is implemented as of 2026-08-14:
+
+- `blit-desktop` owns the notification service, both watcher interfaces, and a
+  valid compositor-local host name on the existing private bus.
+- Notifications support bounded normalized text/actions, replacement,
+  revision-checked actions, dismissal, close reasons, and server-owned expiry.
+- KDE and freedesktop StatusNotifier items register by unique owner, disappear
+  on owner loss, refresh on item/property signals, and normalize theme, path,
+  pixmap, attention, and overlay icons to bounded PNG.
+- DBusMenu layouts and icons are normalized to revisioned bounded trees;
+  stale clicks refresh instead of activating a reused application menu ID.
+- Notification application icons and content-image hints are resolved and
+  decoded off the async task, and `icon-static` is advertised.
+- Rust and TypeScript codecs, staged snapshots, reconnect replay suppression,
+  per-client subscriptions, and the `DesktopStore` API are wired end to end.
+- The WebRTC read-only gate permits state subscription while rejecting tray and
+  notification input.
+- Per-owner rate limiting runs before image decoding. The bounded event queue
+  coalesces pending upserts by identity, preserves delete/create boundaries,
+  and applies backpressure rather than dropping a required transition.
+- The full UI presents tray items, accessible menus, active-notification cards,
+  foreground toasts, and opt-in browser notifications. Its service worker
+  accepts desktop requests only from an unbound top-level blit client.
+
+`FEATURE_DESKTOP` means the normalized service, state bridge, codecs, and
+snapshot plumbing are live. Presentation remains an embedding policy: the full
+UI renders it, while embedding packages expose the core API without prompting
+or adding chrome.
 
 This RFC implements the
 [Desktop Notifications specification](https://specifications.freedesktop.org/notification/latest-single/),
@@ -60,7 +93,8 @@ and remote icon lookup according to the
 - XEmbed/system-tray compatibility. Blit is Wayland-only and does not run
   XWayland; StatusNotifierItem is the supported tray protocol.
 - Portals, MPRIS media controls, global application menus, badges, or app-launch
-  desktop files. They may reuse the D-Bus bridge later but are separate work.
+  desktop files. Portals and MPRIS are specified separately in
+  [Viewer Media Devices, MPRIS, and Compositor Portals](media-devices-portals.md).
 - Notification history across server restarts. V1 retains active notifications
   in memory only.
 - Rendering notification HTML, hyperlinks, inline body images, sounds, or
@@ -72,7 +106,7 @@ and remote icon lookup according to the
 
 The private bus remains compositor-scoped. A new Linux-only `blit-desktop`
 crate uses `zbus` to connect to the address printed by `dbus-daemon` and runs
-three roles on one Tokio task:
+three roles in one bounded asynchronous service runtime:
 
 ```mermaid
 graph LR
@@ -114,7 +148,7 @@ the freedesktop namespace. Blit owns these well-known names when available:
 ```text
 org.kde.StatusNotifierWatcher
 org.freedesktop.StatusNotifierWatcher
-org.freedesktop.StatusNotifierHost-blit-<pid>
+org.freedesktop.StatusNotifierHost.blit.p<pid>
 ```
 
 Both watcher interfaces are exported at `/StatusNotifierWatcher` and share one
@@ -152,11 +186,11 @@ reused during the server process. Each visible state change increments a
 The server maps browser input to the item as follows:
 
 | Browser input   | D-Bus behavior                                                     |
-| --------------- | ------------------------------------------------------------------ | -------------- |
+| --------------- | ------------------------------------------------------------------ |
 | Primary click   | `Activate(0, 0)`, unless `ItemIsMenu`, in which case open the menu |
 | Secondary click | `SecondaryActivate(0, 0)`                                          |
 | Context click   | Open `Menu` through DBusMenu, or fall back to `ContextMenu(0, 0)`  |
-| Wheel/trackpad  | `Scroll(delta, "vertical"                                          | "horizontal")` |
+| Wheel/trackpad  | `Scroll(delta, "vertical")` or `Scroll(delta, "horizontal")`       |
 | Menu item       | `Event(id, "clicked", empty variant, monotonic_timestamp)`         |
 
 The StatusNotifier coordinates are screen-position hints. A tray icon rendered
@@ -219,10 +253,14 @@ the notification specification's allowed markup to plain text before it
 enters the mirror. URI-bearing markup never becomes a clickable browser link.
 
 `Notify` allocates a nonzero `notification_id: u32`. A nonzero `replaces_id`
-atomically replaces that ID and returns it, as required by the specification.
-Every creation or replacement increments a separate `revision: u32`, so an
-action from a toast built before a replacement cannot target the new action
-list by accident.
+atomically replaces that ID and returns it when it names an active notification
+created by the same D-Bus connection. An unknown, stale, or foreign ID is
+treated as a new notification and receives a new ID. The specification defines
+replacement in terms of the caller's previous notification; constraining it to
+the owning connection prevents an untrusted bus peer from guessing an ID and
+replacing or closing another application's notification. Every creation or
+replacement increments a separate `revision: u32`, so an action from a toast
+built before a replacement cannot target the new action list by accident.
 
 The server, not the browser, owns expiry. Positive application timeouts are
 clamped to the configured bounds. `-1` uses blit's default (10 seconds for low
@@ -271,16 +309,16 @@ server preserves both:
   then deprecated `icon_data`.
 
 Invalid images remove only that image, not the item or notification. Decoding
-runs off the server tick loop. Resolved results are cached by source identity,
-mtime, target size, and overlay identity; application property changes
-invalidate the relevant entry.
+runs off the server tick loop. Source results are cached by canonical path,
+mtime, and target size. Overlay composition is intentionally cheap and is
+recomputed from those normalized sources when an item property changes.
 
 ## Wire protocol
 
 Desktop integration is gated by a new `S2C_HELLO` bit:
 
 ```text
-FEATURE_DESKTOP = 1 << 20
+FEATURE_DESKTOP = 1 << 21
 ```
 
 It is advertised only when the compositor-scoped bus and desktop task are
@@ -422,8 +460,8 @@ Active and needs-attention items form a compact icon group in the right end of
 `StatusBar`. Passive items are hidden from the bar but remain available in the
 overflow menu. Needs-attention items receive the theme's warning treatment;
 there is no server-driven animation. The existing measured status-bar
-compaction folds the whole group into the overflow menu when title space is
-scarce.
+compaction folds the tray icon set into its overflow control when title space
+is scarce. The notification bell remains a separate stable target.
 
 With multiple connections, each menu row includes the connection label and
 icons are grouped by connection. Stable order is `(connection order,
@@ -486,18 +524,18 @@ which suppresses the services and feature bit entirely.
 D-Bus peers are applications, not trusted parsers. The following defaults are
 hard limits, configurable downward but not silently expanded by a client:
 
-| Resource                               |                       Limit | Behavior at limit                                                             |
-| -------------------------------------- | --------------------------: | ----------------------------------------------------------------------------- |
-| Registered tray items                  |          128 per compositor | Reject further registration                                                   |
-| Active notifications                   |          256 per compositor | Close oldest non-critical item with reason 4; reject only if all are critical |
-| Actions per notification               |                          32 | Ignore extras                                                                 |
-| Menu nodes / depth                     |                  2,048 / 16 | Return menu status 2                                                          |
-| D-Bus string before sanitation         |                      64 KiB | Clip at a UTF-8 boundary; body keeps up to 64 KiB, labels/titles less         |
-| Source image                           | 512 x 512 and 4 MiB decoded | Drop image                                                                    |
-| Final tray icon                        |                     64 x 64 | Re-encode PNG                                                                 |
-| Final notification image               |        512 x 512, 1 MiB PNG | Downscale or drop                                                             |
-| One desktop update after decompression |                      16 MiB | Chunk snapshot; reject a live record which cannot fit                         |
-| D-Bus property/menu call               |                   2 seconds | Keep prior state; remove after repeated identity failures                     |
+| Resource                               |                        Limit | Behavior at limit                                                             |
+| -------------------------------------- | ---------------------------: | ----------------------------------------------------------------------------- |
+| Registered tray items                  |           128 per compositor | Reject further registration                                                   |
+| Active notifications                   |           256 per compositor | Close oldest non-critical item with reason 4; reject only if all are critical |
+| Actions per notification               |                           32 | Ignore extras                                                                 |
+| Menu nodes / depth                     |                   2,048 / 16 | Return menu status 2                                                          |
+| D-Bus string before sanitation         |                       64 KiB | Clip at a UTF-8 boundary; body keeps up to 64 KiB, labels/titles less         |
+| Source image                           |  512 x 512 and 4 MiB decoded | Drop image                                                                    |
+| Final tray icon                        |              64 x 64 maximum | Downscale and re-encode PNG                                                   |
+| Final notification image               | 512 x 512 maximum, 1 MiB PNG | Downscale or drop                                                             |
+| One desktop update after decompression |                       16 MiB | Chunk snapshot; reject a live record which cannot fit                         |
+| D-Bus property/menu call               |                    2 seconds | Keep prior state; remove after repeated identity failures                     |
 
 Notification rate is token-bucketed per unique D-Bus owner (20 immediate, 2
 per second refill). Replacement of an existing ID costs less than creation so
@@ -505,7 +543,7 @@ progress notifications remain useful. Rate-limited calls receive a D-Bus
 limits error and allocate no ID.
 
 The desktop task catches item-specific D-Bus errors. One broken icon, menu, or
-application cannot terminate the watcher. Bounded channels coalesce tray
+application cannot terminate the watcher. The bounded event queue coalesces tray
 property invalidations by item and notification replacements by ID. Deletes
 are never coalesced past a later create.
 
@@ -527,9 +565,8 @@ Image and text input is data, not browser content:
 | `BLIT_NOTIFICATION_TIMEOUT_MIN_MS` | `1000`                                   | Lower clamp for positive application timeouts                |
 | `BLIT_NOTIFICATION_TIMEOUT_MAX_MS` | `86400000`                               | Upper clamp for positive application timeouts                |
 
-Browser permission and presentation preferences are device-local and remain in
-`localStorage`; they do not belong in server `blit.conf` and must not roam to
-other viewers.
+Browser notification permission is device-local and browser-managed; it does
+not belong in server `blit.conf` and does not roam to other viewers.
 
 ## Compatibility and rollout
 
@@ -549,9 +586,12 @@ Implementation can land in four independently testable steps:
 4. Add in-app notifications, explicit browser permission UX, and the hardened
    service-worker message/click path.
 
-The server must not advertise bit 20 until steps 1 and 2 are complete. The full
-UI may ship tray and notification presentation independently after that; an
-embedder can consume the core API immediately.
+The server advertises bit 21 only after the notification service, watcher,
+wire codecs, mirrors, and snapshot plumbing are live. Optional capabilities
+must remain absent at record level until their implementation is usable; in
+particular, the watcher does not set `HAS_MENU` before DBusMenu export exists.
+The full UI may ship tray and notification presentation independently after
+that; an embedder can consume the core API immediately.
 
 ## Testing
 

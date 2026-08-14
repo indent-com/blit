@@ -73,6 +73,12 @@ pub enum Command {
         command: Option<TerminalCommand>,
     },
 
+    /// List and disconnect clients connected to the server
+    Client {
+        #[command(subcommand)]
+        command: Option<ClientCommand>,
+    },
+
     /// Manage compositor surfaces
     #[command(alias = "s")]
     Surface {
@@ -843,6 +849,25 @@ pub enum TerminalCommand {
         /// Maximum duration in seconds (0 = unlimited)
         #[arg(short, long, default_value_t = 0.0)]
         duration: f64,
+    },
+}
+
+// ── Client subcommands ───────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum ClientCommand {
+    /// List other connected clients and subscriptions as TSV
+    #[command(alias = "ls")]
+    List,
+
+    /// Disconnect another client
+    Kick {
+        /// Client ID from `blit client list`
+        id: u64,
+
+        /// Reason shown to the disconnected client
+        #[arg(short, long)]
+        reason: Option<String>,
     },
 }
 

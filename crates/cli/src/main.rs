@@ -16,8 +16,8 @@ mod uplink;
 
 use clap::Parser;
 use cli::{
-    Cli, ClipboardCommand, Command, FsCommand, GitCommand, KvCommand, LspCommand, RemoteCommand,
-    SurfaceCommand, TerminalCommand,
+    Cli, ClientCommand, ClipboardCommand, Command, FsCommand, GitCommand, KvCommand, LspCommand,
+    RemoteCommand, SurfaceCommand, TerminalCommand,
 };
 
 // glibc malloc retains freed memory in per-thread arenas (up to 8 per core);
@@ -334,6 +334,27 @@ async fn async_main() {
                         None,
                     )
                     .await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("blit: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Client { command } => {
+            let cmd = command.unwrap_or(ClientCommand::List);
+            let conn = &cli.connect;
+            let transport = match transport::connect(&conn.on, &conn.hub).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("blit: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let result = match cmd {
+                ClientCommand::List => agent::cmd_clients(transport).await,
+                ClientCommand::Kick { id, reason } => {
+                    agent::cmd_kick_client(transport, id, reason.as_deref().unwrap_or("")).await
                 }
             };
             if let Err(e) = result {

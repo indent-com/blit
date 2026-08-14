@@ -142,6 +142,8 @@ export function StatusBar(props: {
   onToggleKeyboard?: () => void;
   /** Workspace-wide slow operations, newest last. */
   activities: readonly BlitActivity[];
+  /** Compositor tray/notification controls, rendered by the full shell. */
+  desktopChrome?: (compact: boolean) => JSX.Element;
 }) {
   const theme = () => themeFor(props.palette);
   const scale = () => uiScale(props.fontSize);
@@ -522,6 +524,7 @@ export function StatusBar(props: {
           position: "relative",
         }}
       >
+        {props.desktopChrome?.(compact())}
         <Show
           when={compact()}
           fallback={

@@ -59,6 +59,7 @@ libc = "0.2"
 opus = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+blit-desktop = { workspace = true }
 # Software H.264 encoders, enabled by the features of the same names.
 # Linux-only: the compositor that feeds the software H.264 surface encoder
 # only exists on Linux (see surface_encoder.rs). x264-sys links the system

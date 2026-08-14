@@ -67,6 +67,14 @@ export async function ensurePreviewWorker(): Promise<string | null> {
   }
 }
 
+/** The shared top-level worker registration used by desktop notifications.
+ * Embedders never call this path because they do not render desktop chrome. */
+export async function desktopWorkerRegistration(): Promise<ServiceWorkerRegistration | null> {
+  const problem = await ensurePreviewWorker();
+  if (problem) return null;
+  return navigator.serviceWorker.ready;
+}
+
 /** Post the passphrase to the active worker. */
 export function sendPassphrase(): void {
   const passphrase = readStoredPassphrase();

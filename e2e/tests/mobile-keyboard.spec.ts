@@ -136,6 +136,60 @@ test("keyboard rises only from the toggle and the key line tracks it", async ({
 });
 
 /**
+ * With a hardware keyboard attached, iPadOS can park its small shortcut bar
+ * over the visual viewport instead of raising the full software keyboard.
+ * It is still keyboard UI: the status button must report it as open and take
+ * the hide branch, or every tap just retries the unavailable full keyboard.
+ */
+test("the iPadOS shortcut bar counts as an open keyboard", async ({ page }) => {
+  // This is a viewport/focus policy test; plant the same visible textarea a
+  // terminal owns so an unrelated transport failure cannot mask the result.
+  await page.goto("/#psk=test-secret");
+  await page.reload();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTitle("Show keyboard")).toBeVisible();
+  await page.evaluate(() => {
+    const section = document.querySelector("section");
+    if (!section) throw new Error("no workspace section");
+    const input = document.createElement("textarea");
+    input.setAttribute("aria-label", "Terminal input");
+    input.tabIndex = 0;
+    Object.assign(input.style, {
+      position: "fixed",
+      top: "0",
+      left: "0",
+      width: "1px",
+      height: "1px",
+    });
+    section.append(input);
+    input.focus();
+  });
+
+  const input = page.locator('textarea[aria-label="Terminal input"]').first();
+  await expect(input).toBeFocused();
+  await expect(input).toHaveAttribute("inputmode", "none");
+
+  // Unlike a window resize, the shortcut bar changes visualViewport.height
+  // while the layout viewport stays put.  Reproduce its roughly 55px band.
+  await page.evaluate(() => {
+    const vv = window.visualViewport!;
+    const fullHeight = vv.height;
+    Object.defineProperty(vv, "height", { get: () => fullHeight - 55 });
+    vv.dispatchEvent(new Event("resize"));
+  });
+
+  // Reality latches intent even though the bar appeared outside the toggle.
+  await expect(page.getByTitle("Hide keyboard")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Esc" })).toBeVisible();
+  await expect(input).not.toHaveAttribute("inputmode", "none");
+
+  // The button now dismisses the input panel instead of retrying "show".
+  await page.getByTitle("Hide keyboard").tap();
+  await expect(page.getByTitle("Show keyboard")).toBeVisible();
+  await expect(input).toHaveAttribute("inputmode", "none");
+});
+
+/**
  * A tap on the toggle means "put the keyboard away" only when a keyboard is
  * genuinely up.  When the IME refused the focus transition — iPadOS with the
  * textarea already focused, or a tap landing while the last keyboard was

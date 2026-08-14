@@ -91,6 +91,20 @@ export class WebTransportTransport implements BlitTransport {
     this.setStatus("closed");
   }
 
+  suspend(): void {
+    if (this.disposed) return;
+    this.clearReconnectTimer();
+    this.cleanup();
+    this.currentDelay = this.initialDelay;
+    this.setStatus("disconnected");
+  }
+
+  reconnect(): void {
+    if (this.disposed) return;
+    this.suspend();
+    this.connect();
+  }
+
   addEventListener(
     type: "message",
     listener: (data: BlitTransportData) => void,

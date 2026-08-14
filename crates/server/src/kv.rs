@@ -288,6 +288,10 @@ pub struct KvSubs {
 }
 
 impl KvSubs {
+    pub fn ids(&self) -> impl Iterator<Item = u16> + '_ {
+        self.map.keys().copied()
+    }
+
     fn alloc_id(&mut self) -> Option<u16> {
         // Monotonic with wrap, skipping live ids and the 0xFFFF sentinel.
         for _ in 0..=u16::MAX {

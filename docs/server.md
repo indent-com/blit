@@ -23,6 +23,10 @@
 | `BLIT_ENCODE_FENCE_TIMEOUT_MS`      | `10000`                                            | Give up on a Vulkan encode submission after this long (`0` = wait forever)             |
 | `BLIT_ENABLE_EXTERNAL_MEMORY_HOST`  | unset                                              | Force experimental direct `wl_shm` host import when Vulkan supports it                 |
 | `BLIT_DISABLE_EXTERNAL_MEMORY_HOST` | unset                                              | Disable automatic direct `wl_shm` host import                                          |
+| `BLIT_DESKTOP`                      | `1` on Linux                                       | `0` disables the private-bus tray/notification services and feature bit                |
+| `BLIT_NOTIFICATION_TIMEOUT_MS`      | `10000`                                            | Default low/normal notification timeout when the application requests `-1`             |
+| `BLIT_NOTIFICATION_TIMEOUT_MIN_MS`  | `1000`                                             | Lower clamp for positive application notification timeouts                             |
+| `BLIT_NOTIFICATION_TIMEOUT_MAX_MS`  | `86400000`                                         | Upper clamp for positive application notification timeouts                             |
 
 `BLIT_MAX_CONNECTIONS` and `BLIT_MAX_PTYS` are an operator sanity bound against
 runaway automation, not a security control — a client that can open one PTY can

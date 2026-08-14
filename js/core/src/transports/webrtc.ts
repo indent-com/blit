@@ -30,6 +30,7 @@ export function createWebRtcDataChannelTransport(
   let _lastError: string | null = null;
   let channel: RTCDataChannel | null = null;
   let disposed = false;
+  let suspended = false;
   let syncResolve: (() => void) | null = null;
   let syncReject: ((err: Error) => void) | null = null;
   let readBuf = new Uint8Array(0);
@@ -93,7 +94,8 @@ export function createWebRtcDataChannelTransport(
   }
 
   function scheduleReconnect() {
-    if (disposed || !shouldReconnect || !isPeerConnectionAlive()) return;
+    if (disposed || suspended || !shouldReconnect || !isPeerConnectionAlive())
+      return;
     clearReconnectTimer();
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
@@ -178,19 +180,44 @@ export function createWebRtcDataChannelTransport(
   }
 
   function openChannel() {
-    if (disposed) return;
+    if (disposed || suspended) return;
     setStatus("connecting");
     wireChannel(pc.createDataChannel(label, { ordered: true }));
   }
 
   const transport: BlitTransport & { waitForSync(): Promise<void> } = {
     connect() {
+      if (disposed) return;
+      if (suspended) {
+        suspended = false;
+        openChannel();
+      }
       if (started) return;
       started = true;
       for (const msg of earlyMessages) {
         for (const l of messageListeners) l(msg);
       }
       earlyMessages = [];
+    },
+
+    suspend() {
+      if (disposed) return;
+      suspended = true;
+      clearConnectTimeout();
+      clearReconnectTimer();
+      clearReceiveTimer();
+      const current = channel;
+      channel = null;
+      current?.close();
+      currentDelay = initialDelay;
+      setStatus("disconnected");
+    },
+
+    reconnect() {
+      if (disposed) return;
+      transport.suspend?.();
+      suspended = false;
+      openChannel();
     },
 
     get status() {

@@ -427,6 +427,10 @@ pub struct NetSockets {
 }
 
 impl NetSockets {
+    pub fn ids(&self) -> impl Iterator<Item = u16> + '_ {
+        self.map.keys().copied()
+    }
+
     pub fn with_outbox(
         frames: Arc<std::sync::atomic::AtomicUsize>,
         bytes: Arc<std::sync::atomic::AtomicUsize>,

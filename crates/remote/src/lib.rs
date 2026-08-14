@@ -23,6 +23,9 @@ pub mod kv;
 /// message builders both ends share.
 pub mod net;
 
+/// Tray icons and desktop notifications (docs/design/tray-notifications.md).
+pub mod desktop;
+
 /// Cap on any single LZ4-decompressed payload, protocol-wide
 /// (docs/protocol.md "Compressed payloads"). Receivers check the prepended
 /// size against it *before* allocating, so a hostile or corrupt length
@@ -127,6 +130,21 @@ pub const C2S_CLIENT_METRICS: u8 = 0x05;
 /// Sent periodically by the client; the server treats it as a no-op
 /// (but its arrival resets any server-side receive timeout).
 pub const C2S_PING: u8 = 0x08;
+/// Enumerate every other connection to this server:
+/// [0x09][nonce:2]. The server replies with [`S2C_CLIENT_LIST`].
+pub const C2S_CLIENT_LIST: u8 = 0x09;
+/// Disconnect another connection:
+/// [0x0A][nonce:2][client_id:8][reason:N].
+///
+/// The requester receives [`S2C_KICK_RESULT`]. On success the target receives
+/// [`S2C_KICKED`] carrying the UTF-8 reason and the server closes its
+/// connection. A client may not kick itself.
+pub const C2S_KICK: u8 = 0x0A;
+/// Subscribe to live connection-catalog snapshots: [0x0B][nonce:2].
+/// Every update uses [`S2C_CLIENT_LIST`] with the same nonce.
+pub const C2S_CLIENT_WATCH: u8 = 0x0B;
+/// Stop a live connection-catalog subscription: [0x0C][nonce:2].
+pub const C2S_CLIENT_UNWATCH: u8 = 0x0C;
 /// Mouse event: [0x06][pty_id:2][type:1][button:1][col:2][row:2]
 /// type: 0=down, 1=up, 2=move
 /// button: 0=left, 1=mid, 2=right, 3=release, 64=wheel_up, 65=wheel_down
@@ -531,6 +549,38 @@ pub const CREATE_FAILED_DETAIL_MAX: usize = 1024;
 /// Sent only to a client with a non-zero offset, only when that offset
 /// actually moved.
 pub const S2C_SCROLL_OFFSET: u8 = 0x11;
+/// Correlated client enumeration reply:
+/// [0x12][nonce:2][self_id:8][count:4][client:N]...
+///
+/// Each client is
+/// `[client_id:8][age_secs:8][outbound_bytes_per_sec:8][terminal_count:2]`
+/// `[surface_count:2][subscription_count:2]`, followed by
+/// `[pty_id:2][rows:2][cols:2]` terminal records and
+/// `[surface_id:2][width:2][height:2][scale_120:2]` surface records, then
+/// `[kind:1][id:2]` auxiliary subscription records.
+///
+/// `self_id` identifies the requesting connection. The entries are sorted and
+/// include `self_id`; callers such as the short-lived `blit client list`
+/// command may filter their own record from presentation. Only active
+/// subscriptions are listed; zero size fields mean the client has not reported
+/// a view size.
+pub const S2C_CLIENT_LIST: u8 = 0x12;
+/// Correlated kick outcome:
+/// [0x13][nonce:2][status:1][detail:N].
+///
+/// `status` uses the common status registry. `detail` is diagnostic UTF-8.
+pub const S2C_KICK_RESULT: u8 = 0x13;
+/// This connection was kicked by another client: [0x14][reason:N].
+/// The server closes the connection after delivering this terminal message.
+pub const S2C_KICKED: u8 = 0x14;
+/// Maximum UTF-8 byte length accepted for a kick reason or result detail.
+pub const KICK_REASON_MAX: usize = 1024;
+pub const CLIENT_SUBSCRIPTION_AUDIO: u8 = 1;
+pub const CLIENT_SUBSCRIPTION_FS: u8 = 2;
+pub const CLIENT_SUBSCRIPTION_GIT: u8 = 3;
+pub const CLIENT_SUBSCRIPTION_LSP: u8 = 4;
+pub const CLIENT_SUBSCRIPTION_KV: u8 = 5;
+pub const CLIENT_SUBSCRIPTION_NET: u8 = 6;
 /// Text response: [0x0A][nonce:2][pty_id:2][total_lines:4][offset:4][text:N]
 /// nonce: echoed from C2S_READ request
 /// total_lines: total available lines (scrollback + viewport rows)
@@ -825,6 +875,9 @@ pub const FEATURE_SURFACE_TOUCH: u32 = 1 << 18;
 /// Wayland `zwp_text_input_v3` enable/disable and content type are forwarded
 /// to surface viewers so they can present an appropriate virtual keyboard.
 pub const FEATURE_SURFACE_TEXT_INPUT: u32 = 1 << 19;
+/// Enumerating server connections and kicking another connection, including
+/// the correlated result and terminal `S2C_KICKED` reason.
+pub const FEATURE_CLIENT_CONTROL: u32 = 1 << 20;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {
@@ -2267,6 +2320,19 @@ pub enum ServerMsg<'a> {
     ClipboardOwner {
         wayland: bool,
     },
+    ClientList {
+        nonce: u16,
+        self_id: u64,
+        clients: Vec<ClientListEntry>,
+    },
+    KickResult {
+        nonce: u16,
+        status: u8,
+        detail: &'a str,
+    },
+    Kicked {
+        reason: &'a str,
+    },
     Quit,
 }
 
@@ -2285,6 +2351,41 @@ pub struct SurfaceListEntry {
     pub height: u16,
     pub title: String,
     pub app_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientTerminalSubscription {
+    pub pty_id: u16,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientSurfaceSubscription {
+    pub surface_id: u16,
+    pub width: u16,
+    pub height: u16,
+    pub scale_120: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientListEntry {
+    pub client_id: u64,
+    /// Whole seconds since the server accepted this connection.
+    pub age_secs: u64,
+    /// Actual framed bytes written from the server to this client per second,
+    /// sampled over the latest complete interval.
+    pub outbound_bytes_per_sec: u64,
+    pub terminals: Vec<ClientTerminalSubscription>,
+    pub surfaces: Vec<ClientSurfaceSubscription>,
+    pub subscriptions: Vec<ClientAuxSubscription>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientAuxSubscription {
+    pub kind: u8,
+    /// Family-local resource ID. Audio has no resource ID and uses zero.
+    pub id: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2745,6 +2846,105 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
                 wayland: data[1] != 0,
             })
         }
+        S2C_CLIENT_LIST => {
+            if data.len() < 15 {
+                return None;
+            }
+            let nonce = u16::from_le_bytes([data[1], data[2]]);
+            let self_id = u64::from_le_bytes(data[3..11].try_into().ok()?);
+            let count = u32::from_le_bytes(data[11..15].try_into().ok()?) as usize;
+            let mut offset = 15usize;
+            if count > data.len().saturating_sub(offset) / 30 {
+                return None;
+            }
+            let mut clients = Vec::with_capacity(count);
+            for _ in 0..count {
+                let client_id = u64::from_le_bytes(data.get(offset..offset + 8)?.try_into().ok()?);
+                let age_secs =
+                    u64::from_le_bytes(data.get(offset + 8..offset + 16)?.try_into().ok()?);
+                let outbound_bytes_per_sec =
+                    u64::from_le_bytes(data.get(offset + 16..offset + 24)?.try_into().ok()?);
+                let terminal_count =
+                    u16::from_le_bytes(data.get(offset + 24..offset + 26)?.try_into().ok()?)
+                        as usize;
+                let surface_count =
+                    u16::from_le_bytes(data.get(offset + 26..offset + 28)?.try_into().ok()?)
+                        as usize;
+                let subscription_count =
+                    u16::from_le_bytes(data.get(offset + 28..offset + 30)?.try_into().ok()?)
+                        as usize;
+                offset += 30;
+                let terminal_bytes = terminal_count.checked_mul(6)?;
+                let surface_bytes = surface_count.checked_mul(8)?;
+                let subscription_bytes = subscription_count.checked_mul(3)?;
+                if offset
+                    .checked_add(terminal_bytes)?
+                    .checked_add(surface_bytes)?
+                    .checked_add(subscription_bytes)?
+                    > data.len()
+                {
+                    return None;
+                }
+                let mut terminals = Vec::with_capacity(terminal_count);
+                for _ in 0..terminal_count {
+                    terminals.push(ClientTerminalSubscription {
+                        pty_id: u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?),
+                        rows: u16::from_le_bytes(data[offset + 2..offset + 4].try_into().ok()?),
+                        cols: u16::from_le_bytes(data[offset + 4..offset + 6].try_into().ok()?),
+                    });
+                    offset += 6;
+                }
+                let mut surfaces = Vec::with_capacity(surface_count);
+                for _ in 0..surface_count {
+                    surfaces.push(ClientSurfaceSubscription {
+                        surface_id: u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?),
+                        width: u16::from_le_bytes(data[offset + 2..offset + 4].try_into().ok()?),
+                        height: u16::from_le_bytes(data[offset + 4..offset + 6].try_into().ok()?),
+                        scale_120: u16::from_le_bytes(
+                            data[offset + 6..offset + 8].try_into().ok()?,
+                        ),
+                    });
+                    offset += 8;
+                }
+                let mut subscriptions = Vec::with_capacity(subscription_count);
+                for _ in 0..subscription_count {
+                    subscriptions.push(ClientAuxSubscription {
+                        kind: data[offset],
+                        id: u16::from_le_bytes(data[offset + 1..offset + 3].try_into().ok()?),
+                    });
+                    offset += 3;
+                }
+                clients.push(ClientListEntry {
+                    client_id,
+                    age_secs,
+                    outbound_bytes_per_sec,
+                    terminals,
+                    surfaces,
+                    subscriptions,
+                });
+            }
+            if offset != data.len() {
+                return None;
+            }
+            Some(ServerMsg::ClientList {
+                nonce,
+                self_id,
+                clients,
+            })
+        }
+        S2C_KICK_RESULT => {
+            if data.len() < 4 {
+                return None;
+            }
+            Some(ServerMsg::KickResult {
+                nonce: u16::from_le_bytes([data[1], data[2]]),
+                status: data[3],
+                detail: std::str::from_utf8(&data[4..]).ok()?,
+            })
+        }
+        S2C_KICKED => Some(ServerMsg::Kicked {
+            reason: std::str::from_utf8(&data[1..]).ok()?,
+        }),
         S2C_QUIT => Some(ServerMsg::Quit),
         _ => None,
     }
@@ -3178,6 +3378,115 @@ pub fn msg_deadline(pty_id: u16, ms: u32) -> Vec<u8> {
     msg.push(C2S_DEADLINE);
     msg.extend_from_slice(&pty_id.to_le_bytes());
     msg.extend_from_slice(&ms.to_le_bytes());
+    msg
+}
+
+/// Request the current connection catalog.
+pub fn msg_client_list(nonce: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(3);
+    msg.push(C2S_CLIENT_LIST);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg
+}
+
+/// Start streaming connection-catalog snapshots under `nonce`.
+pub fn msg_client_watch(nonce: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(3);
+    msg.push(C2S_CLIENT_WATCH);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg
+}
+
+/// Stop the connection-catalog stream under `nonce`.
+pub fn msg_client_unwatch(nonce: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(3);
+    msg.push(C2S_CLIENT_UNWATCH);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg
+}
+
+/// Clamp kick reason / result detail text to `KICK_REASON_MAX`, never splitting
+/// a UTF-8 scalar.
+///
+/// This is a backstop, not the policy: requesters are expected to validate and
+/// refuse an over-long reason (the CLI and the browser both do, and the server
+/// answers `TOO_LARGE`), so silently shortening one here means a caller skipped
+/// its check. What this guarantees is only that a bug cannot put an invalid
+/// UTF-8 tail on the wire.
+fn kick_text_bytes(text: &str) -> &[u8] {
+    let mut end = text.len().min(KICK_REASON_MAX);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text.as_bytes()[..end]
+}
+
+/// Request that another connection be kicked.
+pub fn msg_kick(nonce: u16, client_id: u64, reason: &str) -> Vec<u8> {
+    let reason = kick_text_bytes(reason);
+    let mut msg = Vec::with_capacity(11 + reason.len());
+    msg.push(C2S_KICK);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.extend_from_slice(&client_id.to_le_bytes());
+    msg.extend_from_slice(reason);
+    msg
+}
+
+/// Reply to [`C2S_CLIENT_LIST`]. Active subscriptions with no size report use
+/// zeroes for their size fields.
+pub fn msg_s2c_client_list(nonce: u16, self_id: u64, clients: &[ClientListEntry]) -> Vec<u8> {
+    let count = clients.len().min(u32::MAX as usize);
+    let mut msg = Vec::new();
+    msg.push(S2C_CLIENT_LIST);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.extend_from_slice(&self_id.to_le_bytes());
+    msg.extend_from_slice(&(count as u32).to_le_bytes());
+    for client in &clients[..count] {
+        let terminal_count = client.terminals.len().min(u16::MAX as usize);
+        let surface_count = client.surfaces.len().min(u16::MAX as usize);
+        let subscription_count = client.subscriptions.len().min(u16::MAX as usize);
+        msg.extend_from_slice(&client.client_id.to_le_bytes());
+        msg.extend_from_slice(&client.age_secs.to_le_bytes());
+        msg.extend_from_slice(&client.outbound_bytes_per_sec.to_le_bytes());
+        msg.extend_from_slice(&(terminal_count as u16).to_le_bytes());
+        msg.extend_from_slice(&(surface_count as u16).to_le_bytes());
+        msg.extend_from_slice(&(subscription_count as u16).to_le_bytes());
+        for terminal in &client.terminals[..terminal_count] {
+            msg.extend_from_slice(&terminal.pty_id.to_le_bytes());
+            msg.extend_from_slice(&terminal.rows.to_le_bytes());
+            msg.extend_from_slice(&terminal.cols.to_le_bytes());
+        }
+        for surface in &client.surfaces[..surface_count] {
+            msg.extend_from_slice(&surface.surface_id.to_le_bytes());
+            msg.extend_from_slice(&surface.width.to_le_bytes());
+            msg.extend_from_slice(&surface.height.to_le_bytes());
+            msg.extend_from_slice(&surface.scale_120.to_le_bytes());
+        }
+        for subscription in &client.subscriptions[..subscription_count] {
+            msg.push(subscription.kind);
+            msg.extend_from_slice(&subscription.id.to_le_bytes());
+        }
+    }
+    msg
+}
+
+/// Report the outcome of [`C2S_KICK`] to its requester.
+pub fn msg_kick_result(nonce: u16, status: u8, detail: &str) -> Vec<u8> {
+    let detail = kick_text_bytes(detail);
+    let mut msg = Vec::with_capacity(4 + detail.len());
+    msg.push(S2C_KICK_RESULT);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.push(status);
+    msg.extend_from_slice(detail);
+    msg
+}
+
+/// Notify a target connection that it was kicked.
+pub fn msg_kicked(reason: &str) -> Vec<u8> {
+    let reason = kick_text_bytes(reason);
+    let mut msg = Vec::with_capacity(1 + reason.len());
+    msg.push(S2C_KICKED);
+    msg.extend_from_slice(reason);
     msg
 }
 
@@ -5109,6 +5418,98 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn client_control_messages_roundtrip() {
+        assert_eq!(msg_client_list(0x1234), [C2S_CLIENT_LIST, 0x34, 0x12]);
+        assert_eq!(msg_client_watch(7), [C2S_CLIENT_WATCH, 7, 0]);
+        assert_eq!(msg_client_unwatch(7), [C2S_CLIENT_UNWATCH, 7, 0]);
+
+        let kick = msg_kick(7, 0x0102_0304_0506_0708, "duplicate tab");
+        assert_eq!(kick[0], C2S_KICK);
+        assert_eq!(u16::from_le_bytes([kick[1], kick[2]]), 7);
+        assert_eq!(
+            u64::from_le_bytes(kick[3..11].try_into().unwrap()),
+            0x0102_0304_0506_0708
+        );
+        assert_eq!(&kick[11..], b"duplicate tab");
+
+        let list = msg_s2c_client_list(
+            9,
+            3,
+            &[ClientListEntry {
+                client_id: 8,
+                age_secs: 42,
+                outbound_bytes_per_sec: 123_456,
+                terminals: vec![ClientTerminalSubscription {
+                    pty_id: 4,
+                    rows: 24,
+                    cols: 80,
+                }],
+                surfaces: vec![ClientSurfaceSubscription {
+                    surface_id: 7,
+                    width: 1280,
+                    height: 720,
+                    scale_120: 180,
+                }],
+                subscriptions: vec![ClientAuxSubscription {
+                    kind: CLIENT_SUBSCRIPTION_GIT,
+                    id: 2,
+                }],
+            }],
+        );
+        assert!(matches!(
+            parse_server_msg(&list),
+            Some(ServerMsg::ClientList {
+                nonce: 9,
+                self_id: 3,
+                clients,
+            }) if clients == [ClientListEntry {
+                client_id: 8,
+                age_secs: 42,
+                outbound_bytes_per_sec: 123_456,
+                terminals: vec![ClientTerminalSubscription {
+                    pty_id: 4,
+                    rows: 24,
+                    cols: 80,
+                }],
+                surfaces: vec![ClientSurfaceSubscription {
+                    surface_id: 7,
+                    width: 1280,
+                    height: 720,
+                    scale_120: 180,
+                }],
+                subscriptions: vec![ClientAuxSubscription {
+                    kind: CLIENT_SUBSCRIPTION_GIT,
+                    id: 2,
+                }],
+            }]
+        ));
+        assert!(parse_server_msg(&list[..list.len() - 1]).is_none());
+
+        assert!(matches!(
+            parse_server_msg(&msg_kick_result(4, STATUS_NOT_FOUND, "gone")),
+            Some(ServerMsg::KickResult {
+                nonce: 4,
+                status: STATUS_NOT_FOUND,
+                detail: "gone",
+            })
+        ));
+        assert!(matches!(
+            parse_server_msg(&msg_kicked("maintenance")),
+            Some(ServerMsg::Kicked {
+                reason: "maintenance"
+            })
+        ));
+    }
+
+    #[test]
+    fn kick_text_is_utf8_safe_and_bounded() {
+        let reason = format!("{}é", "x".repeat(KICK_REASON_MAX - 1));
+        let kicked = msg_kicked(&reason);
+        assert_eq!(kicked.len(), KICK_REASON_MAX);
+        assert!(std::str::from_utf8(&kicked[1..]).is_ok());
     }
 
     #[test]

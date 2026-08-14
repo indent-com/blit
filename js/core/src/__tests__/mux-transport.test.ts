@@ -529,4 +529,38 @@ describe("MuxTransport", () => {
 
     mux.close();
   });
+
+  it("suspends one channel until an explicit reconnect", async () => {
+    const mux = new MuxTransport("ws://host/mux", "secret", {
+      reconnectDelay: 20,
+    });
+    const ch = mux.createChannel("remote");
+
+    mux.connect();
+    latestSocket().simulateOpen();
+    latestSocket().simulateMessage("mux");
+    ch.connect();
+    latestSocket().simulateMessage(controlFrame(0x81, 0));
+    expect(ch.status).toBe("connected");
+
+    ch.suspend();
+    expect(ch.status).toBe("disconnected");
+    expect(sentControlFrames().at(-1)).toEqual({
+      opcode: 0x02,
+      channelId: 0,
+    });
+    const sentWhileSuspended = latestSocket().sentData.length;
+    latestSocket().simulateMessage(controlFrame(0x82, 0));
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(latestSocket().sentData).toHaveLength(sentWhileSuspended);
+
+    ch.reconnect();
+    expect(ch.status).toBe("connecting");
+    expect(sentControlFrames().at(-1)).toEqual({
+      opcode: 0x01,
+      channelId: 0,
+    });
+
+    mux.close();
+  });
 });

@@ -3,6 +3,7 @@ import type {
   BlitTransportEventMap,
   BlitTransportMessage,
   ConnectionStatus,
+  BlitClientInfo,
 } from "../types";
 import {
   S2C_CREATED,
@@ -11,6 +12,9 @@ import {
   S2C_CLOSED,
   S2C_EXITED,
   S2C_HELLO,
+  S2C_KICKED,
+  S2C_CLIENT_LIST,
+  S2C_KICK_RESULT,
   S2C_LIST,
   S2C_QUIT,
   S2C_READY,
@@ -27,6 +31,7 @@ export class MockTransport implements BlitTransport {
   authRejected = false;
   lastError: string | null = null;
   reconnectCount = 0;
+  suspendCount = 0;
 
   constructor(initialStatus: ConnectionStatus = "connected") {
     this._status = initialStatus;
@@ -42,6 +47,11 @@ export class MockTransport implements BlitTransport {
     this.reconnectCount++;
     this.setStatus("disconnected");
     this.setStatus("connecting");
+  }
+
+  suspend() {
+    this.suspendCount++;
+    this.setStatus("disconnected");
   }
 
   send(data: Uint8Array) {
@@ -227,6 +237,85 @@ export class MockTransport implements BlitTransport {
 
   pushQuit() {
     this.push(new Uint8Array([S2C_QUIT]));
+  }
+
+  pushKicked(reason = "") {
+    const reasonBytes = new TextEncoder().encode(reason);
+    const msg = new Uint8Array(1 + reasonBytes.length);
+    msg[0] = S2C_KICKED;
+    msg.set(reasonBytes, 1);
+    this.push(msg);
+  }
+
+  /** `mangle` rewrites the encoded frame before delivery, for decoder
+   *  robustness tests: truncation, trailing bytes, and other frames a healthy
+   *  server never sends but a decoder still has to survive. */
+  pushClientList(
+    nonce: number,
+    selfId: bigint,
+    clients: readonly BlitClientInfo[],
+    mangle: (message: Uint8Array) => Uint8Array = (message) => message,
+  ) {
+    const length =
+      15 +
+      clients.reduce(
+        (sum, client) =>
+          sum +
+          30 +
+          client.terminals.length * 6 +
+          client.surfaces.length * 8 +
+          client.subscriptions.length * 3,
+        0,
+      );
+    const msg = new Uint8Array(length);
+    const view = new DataView(msg.buffer);
+    msg[0] = S2C_CLIENT_LIST;
+    view.setUint16(1, nonce, true);
+    view.setBigUint64(3, selfId, true);
+    view.setUint32(11, clients.length, true);
+    let offset = 15;
+    for (const client of clients) {
+      view.setBigUint64(offset, client.id, true);
+      view.setBigUint64(offset + 8, BigInt(client.ageSeconds), true);
+      view.setBigUint64(
+        offset + 16,
+        BigInt(client.outboundBytesPerSecond),
+        true,
+      );
+      view.setUint16(offset + 24, client.terminals.length, true);
+      view.setUint16(offset + 26, client.surfaces.length, true);
+      view.setUint16(offset + 28, client.subscriptions.length, true);
+      offset += 30;
+      for (const terminal of client.terminals) {
+        view.setUint16(offset, terminal.ptyId, true);
+        view.setUint16(offset + 2, terminal.rows ?? 0, true);
+        view.setUint16(offset + 4, terminal.cols ?? 0, true);
+        offset += 6;
+      }
+      for (const surface of client.surfaces) {
+        view.setUint16(offset, surface.surfaceId, true);
+        view.setUint16(offset + 2, surface.width ?? 0, true);
+        view.setUint16(offset + 4, surface.height ?? 0, true);
+        view.setUint16(offset + 6, surface.scale120 ?? 0, true);
+        offset += 8;
+      }
+      for (const subscription of client.subscriptions) {
+        msg[offset] = subscription.kind;
+        view.setUint16(offset + 1, subscription.id, true);
+        offset += 3;
+      }
+    }
+    this.push(mangle(msg));
+  }
+
+  pushKickResult(nonce: number, status: number, detail = "") {
+    const detailBytes = new TextEncoder().encode(detail);
+    const msg = new Uint8Array(4 + detailBytes.length);
+    msg[0] = S2C_KICK_RESULT;
+    new DataView(msg.buffer).setUint16(1, nonce, true);
+    msg[3] = status;
+    msg.set(detailBytes, 4);
+    this.push(msg);
   }
 
   pushReady() {

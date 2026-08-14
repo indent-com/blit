@@ -18,6 +18,7 @@ members = [
     "crates/proxy",
     "crates/sd-notify",
     "crates/ssh",
+    "crates/desktop",
 ]
 exclude = []
 
@@ -42,6 +43,7 @@ blit-webrtc-forwarder = { version = "0.51.1", path = "crates/webrtc-forwarder" }
 blit-compositor = { version = "0.51.1", path = "crates/compositor" }
 blit-sd-notify = { version = "0.51.1", path = "crates/sd-notify" }
 blit-ssh = { version = "0.51.1", path = "crates/ssh" }
+blit-desktop = { version = "0.51.1", path = "crates/desktop" }
 
 [profile.release]
 opt-level = 3

@@ -272,6 +272,7 @@ export function createShareTransport(
   let ws: WebSocket | null = null;
   let pc: RTCPeerConnection | null = null;
   let disposed = false;
+  let suspended = false;
   let started = false;
   let connectGeneration = 0;
   let cachedKeys: DerivedKeys | null = null;
@@ -290,7 +291,7 @@ export function createShareTransport(
   }
 
   function scheduleReconnect() {
-    if (disposed || !started) return;
+    if (disposed || suspended || !started) return;
     clearReconnectTimer();
     dbg.log("scheduling reconnect in %dms", reconnectDelay);
     reconnectTimer = setTimeout(() => {
@@ -617,6 +618,7 @@ export function createShareTransport(
   const transport: BlitTransport = {
     connect() {
       if (disposed) return;
+      suspended = false;
 
       // First call: mark as started, kick off the initial connection, and
       // flush any early messages that arrived before connect() was called.
@@ -680,6 +682,7 @@ export function createShareTransport(
 
     reconnect() {
       if (disposed) return;
+      suspended = false;
       dbg.log("reconnect() called, tearing down and retrying immediately");
       clearReconnectTimer();
       reconnectDelay = 1000;
@@ -687,6 +690,16 @@ export function createShareTransport(
       teardown();
       setStatus("connecting");
       doConnect(connectGeneration);
+    },
+
+    suspend() {
+      if (disposed) return;
+      suspended = true;
+      clearReconnectTimer();
+      reconnectDelay = 1000;
+      connectGeneration++;
+      teardown();
+      setStatus("disconnected");
     },
 
     send(data: Uint8Array) {

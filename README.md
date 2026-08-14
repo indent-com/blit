@@ -78,6 +78,25 @@ blit terminal show 1     # dump current terminal text
 blit terminal send 1 q   # send keystrokes
 ```
 
+Inspect and disconnect other clients attached to the same server:
+
+```bash
+blit client list
+blit client kick 3 --reason "duplicate browser tab"
+```
+
+In the browser, open the Ctrl/Cmd-K menu and choose **Connected clients** to
+see a live list of every client's age, measured outbound bandwidth, audio,
+filesystem, Git, LSP, KV, network, terminal, and surface subscriptions. Terminal
+and surface entries include their requested view sizes. Kicking asks for
+confirmation and lets you give the peer a reason.
+
+Client control is not privilege-separated: the server has no read-only mode, so
+any connection that completes the handshake can list and kick any other. What
+gates it is who can reach the socket. Read-only `blit share` consumers are the
+exception — the forwarder denies them the whole family, so a share link cannot
+enumerate or kick the people you are sharing with.
+
 Run GUI apps — on Linux, every terminal includes an experimental headless Wayland compositor:
 
 ```bash

@@ -2,6 +2,7 @@ use crate::ProducerKeys;
 use crate::ice::{self, IceConfig, Transport};
 use crate::signaling;
 use crate::turn::{self, TurnRelay};
+use blit_remote::desktop::C2S_DESKTOP_SUBSCRIBE;
 use blit_remote::{
     C2S_ACK, C2S_AUDIO_SUBSCRIBE, C2S_AUDIO_UNSUBSCRIBE, C2S_CLIENT_FEATURES, C2S_CLIENT_METRICS,
     C2S_CLIPBOARD_GET, C2S_CLIPBOARD_LIST, C2S_COPY_RANGE, C2S_FOCUS, C2S_PING, C2S_READ,
@@ -33,6 +34,12 @@ const GATHER_TIMEOUT: Duration = Duration::from_secs(3);
 /// carries an initial size) and `SURFACE_RESIZE` are all denied.  The size on
 /// an allowed `SURFACE_SUBSCRIBE` is a per-consumer encode box; the server
 /// explicitly excludes scaled subscriptions from surface-size mediation.
+///
+/// The whole client-control family is denied, not just `KICK`. A share link
+/// goes to people who are not otherwise trusted with the session, and
+/// `CLIENT_LIST` would hand them every other viewer's subscribed pty and
+/// surface ids — resources they were never offered — plus a once-a-second
+/// sample of someone else's outbound bandwidth.
 fn is_read_only_allowed_message(tag: u8) -> bool {
     matches!(
         tag,
@@ -56,6 +63,7 @@ fn is_read_only_allowed_message(tag: u8) -> bool {
             | C2S_CLIPBOARD_GET
             | C2S_AUDIO_SUBSCRIBE
             | C2S_AUDIO_UNSUBSCRIBE
+            | C2S_DESKTOP_SUBSCRIBE
     )
 }
 
@@ -1019,10 +1027,12 @@ pub async fn handle_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blit_remote::desktop::{C2S_NOTIFICATION_EVENT, C2S_TRAY_EVENT};
     use blit_remote::{
-        C2S_CLIPBOARD_SET, C2S_CLOSE, C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N, C2S_CREATE2,
-        C2S_DISPLAY_RATE, C2S_INPUT, C2S_KILL, C2S_MOUSE, C2S_PRIMARY_SET, C2S_QUIT, C2S_RESIZE,
-        C2S_RESTART, C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT, C2S_SURFACE_POINTER,
+        C2S_CLIENT_LIST, C2S_CLIENT_UNWATCH, C2S_CLIENT_WATCH, C2S_CLIPBOARD_SET, C2S_CLOSE,
+        C2S_CREATE, C2S_CREATE_AT, C2S_CREATE_N, C2S_CREATE2, C2S_DISPLAY_RATE, C2S_INPUT,
+        C2S_KICK, C2S_KILL, C2S_MOUSE, C2S_PRIMARY_SET, C2S_QUIT, C2S_RESIZE, C2S_RESTART,
+        C2S_SURFACE_CLOSE, C2S_SURFACE_FOCUS, C2S_SURFACE_INPUT, C2S_SURFACE_POINTER,
         C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_PREEDIT, C2S_SURFACE_RESIZE, C2S_SURFACE_TEXT,
         C2S_SURFACE_TOUCH,
     };
@@ -1050,6 +1060,7 @@ mod tests {
             C2S_CLIPBOARD_GET,
             C2S_AUDIO_SUBSCRIBE,
             C2S_AUDIO_UNSUBSCRIBE,
+            C2S_DESKTOP_SUBSCRIBE,
         ] {
             assert!(
                 is_read_only_allowed_message(tag),
@@ -1067,6 +1078,12 @@ mod tests {
             C2S_DISPLAY_RATE,
             C2S_CLIPBOARD_SET,
             C2S_PRIMARY_SET,
+            // The whole client-control family, not just the kick: enumerating
+            // other viewers is a disclosure, not a passive read.
+            C2S_KICK,
+            C2S_CLIENT_LIST,
+            C2S_CLIENT_WATCH,
+            C2S_CLIENT_UNWATCH,
             C2S_KILL,
             C2S_RESTART,
             C2S_QUIT,
@@ -1084,6 +1101,8 @@ mod tests {
             C2S_SURFACE_TEXT,
             C2S_SURFACE_PREEDIT,
             C2S_SURFACE_TOUCH,
+            C2S_TRAY_EVENT,
+            C2S_NOTIFICATION_EVENT,
             0xff,
         ] {
             assert!(

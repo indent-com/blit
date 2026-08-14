@@ -107,6 +107,7 @@ type ActionItem = {
     | "change-palette"
     | "change-layout"
     | "change-remotes"
+    | "manage-clients"
     | "change-roots"
     | "open-web"
     | "open-search";
@@ -740,6 +741,8 @@ export function SwitcherOverlay(props: {
   onChangeFont?: () => void;
   onChangePalette?: () => void;
   onChangeRemotes?: () => void;
+  /** Open the connected-client catalog and kick controls. */
+  onManageClients?: () => void;
   onChangeRoots?: () => void;
   initialNewTerminalMode?: boolean;
   remotes?: readonly import("./storage").Remote[];
@@ -1519,6 +1522,15 @@ export function SwitcherOverlay(props: {
         action: "change-remotes",
       });
     }
+    if (props.onManageClients) {
+      actions.push({
+        type: "action",
+        key: "action:manage-clients",
+        title: "Connected clients",
+        subtitle: "Live age, bandwidth, subscriptions, and kick controls",
+        action: "manage-clients",
+      });
+    }
     if (props.onChangePalette) {
       actions.push({
         type: "action",
@@ -1993,6 +2005,10 @@ export function SwitcherOverlay(props: {
     }
     if (item.action === "change-remotes") {
       props.onChangeRemotes?.();
+      return;
+    }
+    if (item.action === "manage-clients") {
+      props.onManageClients?.();
       return;
     }
     if (item.action === "change-roots") {

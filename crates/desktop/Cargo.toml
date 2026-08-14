@@ -1,0 +1,17 @@
+[package]
+name = "blit-desktop"
+version = "0.51.1"
+edition.workspace = true
+description = "Private D-Bus tray and desktop notification services for blit"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+blit-remote = { workspace = true }
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+png = "0.18"
+resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }

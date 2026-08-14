@@ -5,17 +5,18 @@ use blit_remote::{
     C2S_CLIENT_FEATURES, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_LIST,
     C2S_SURFACE_POINTER, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CODEC_SUPPORT_AV1,
     CODEC_SUPPORT_AV1_444, CODEC_SUPPORT_H264, CODEC_SUPPORT_H264_444, CREATE2_WANT_STATUS,
-    EXIT_REASON_NORMAL, EXIT_STATUS_UNKNOWN, FEATURE_CREATE_STATUS, FEATURE_PTY_DEADLINE,
-    S2C_CLIPBOARD_CONTENT, S2C_CLIPBOARD_LIST, S2C_EXITED, S2C_HELLO, S2C_LIST, S2C_PING, S2C_QUIT,
-    S2C_READY, S2C_SURFACE_CAPTURE, S2C_SURFACE_FRAME, S2C_SURFACE_LIST, S2C_TERM_CWD, S2C_TEXT,
-    S2C_TITLE, S2C_UPDATE, SURFACE_FRAME_CODEC_AV1, SURFACE_FRAME_CODEC_MASK,
-    SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState, exit_reason_text, msg_ack,
-    msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_c2s_primary_set,
-    msg_close, msg_create2_full, msg_deadline, msg_display_rate, msg_input, msg_kill, msg_mouse,
-    msg_quit, msg_read, msg_resize, msg_restart, msg_subscribe, msg_surface_close,
-    msg_surface_focus, msg_surface_input, msg_surface_pointer_axis2, msg_surface_resize,
-    msg_surface_subscribe, msg_surface_subscribe_ext, msg_surface_subscribe_scaled,
-    msg_surface_text, msg_term_cwd, parse_server_msg, parse_term_cwd_reply, status_text,
+    EXIT_REASON_NORMAL, EXIT_STATUS_UNKNOWN, FEATURE_CLIENT_CONTROL, FEATURE_CREATE_STATUS,
+    FEATURE_PTY_DEADLINE, KICK_REASON_MAX, S2C_CLIPBOARD_CONTENT, S2C_CLIPBOARD_LIST, S2C_EXITED,
+    S2C_HELLO, S2C_KICKED, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SURFACE_CAPTURE,
+    S2C_SURFACE_FRAME, S2C_SURFACE_LIST, S2C_TERM_CWD, S2C_TEXT, S2C_TITLE, S2C_UPDATE, STATUS_OK,
+    SURFACE_FRAME_CODEC_AV1, SURFACE_FRAME_CODEC_MASK, SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg,
+    TerminalState, exit_reason_text, msg_ack, msg_c2s_clipboard_get, msg_c2s_clipboard_list,
+    msg_c2s_clipboard_set, msg_c2s_primary_set, msg_client_list, msg_close, msg_create2_full,
+    msg_deadline, msg_display_rate, msg_input, msg_kick, msg_kill, msg_mouse, msg_quit, msg_read,
+    msg_resize, msg_restart, msg_subscribe, msg_surface_close, msg_surface_focus,
+    msg_surface_input, msg_surface_pointer_axis2, msg_surface_resize, msg_surface_subscribe,
+    msg_surface_subscribe_ext, msg_surface_subscribe_scaled, msg_surface_text, msg_term_cwd,
+    parse_server_msg, parse_term_cwd_reply, status_text,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -39,6 +40,24 @@ pub(crate) struct AgentConn {
     pub(crate) features: u32,
     /// Reassembly buffer for `S2C_FRAGMENT` messages from the server.
     fragment_buf: Vec<u8>,
+    /// Reason from `S2C_KICKED`, if the server kicked this connection.
+    ///
+    /// `recv` also surfaces it as an error so no caller can ignore it, but the
+    /// callers that need to *distinguish* a kick from an ordinary disconnect
+    /// read this instead of pattern-matching the error string.
+    kicked: Option<String>,
+}
+
+/// The kick reason carried by an `S2C_KICKED` frame, if that is what this is.
+fn kicked_reason(data: &[u8]) -> Option<String> {
+    if data.first().copied() != Some(S2C_KICKED) {
+        return None;
+    }
+    let reason = match parse_server_msg(data) {
+        Some(ServerMsg::Kicked { reason }) if !reason.is_empty() => reason,
+        _ => "kicked by another client",
+    };
+    Some(reason.to_string())
 }
 
 impl AgentConn {
@@ -67,6 +86,10 @@ impl AgentConn {
             match data[0] {
                 S2C_READY => break,
                 S2C_QUIT => return Err("server is shutting down".to_string()),
+                S2C_KICKED => {
+                    let reason = kicked_reason(&data).expect("checked message type");
+                    return Err(format!("kicked: {reason}"));
+                }
                 S2C_HELLO => {
                     if let Some(ServerMsg::Hello { features: f, .. }) = parse_server_msg(&data) {
                         features = f;
@@ -114,7 +137,21 @@ impl AgentConn {
             exited,
             features,
             fragment_buf,
+            kicked: None,
         })
+    }
+
+    /// The reason this connection was kicked, once `recv` has seen one.
+    pub(crate) fn kicked_reason(&self) -> Option<&str> {
+        self.kicked.as_deref()
+    }
+
+    /// Record an `S2C_KICKED` frame and render it as an error.
+    fn note_kick(&mut self, data: &[u8]) -> Option<String> {
+        let reason = kicked_reason(data)?;
+        let error = format!("kicked: {reason}");
+        self.kicked = Some(reason);
+        Some(error)
     }
 
     pub(crate) async fn send(&mut self, msg: &[u8]) -> Result<(), String> {
@@ -145,13 +182,17 @@ impl AgentConn {
     }
 
     pub(crate) async fn recv(&mut self) -> Result<Vec<u8>, String> {
-        tokio::time::timeout(
+        let data = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             read_message(&mut self.reader, &mut self.fragment_buf),
         )
         .await
         .map_err(|_| "timeout waiting for server response".to_string())?
-        .ok_or_else(|| "server closed connection".to_string())
+        .ok_or_else(|| "server closed connection".to_string())?;
+        if let Some(error) = self.note_kick(&data) {
+            return Err(error);
+        }
+        Ok(data)
     }
 
     pub(crate) fn has_pty(&self, id: u16) -> bool {
@@ -159,13 +200,17 @@ impl AgentConn {
     }
 
     async fn recv_deadline(&mut self, deadline: tokio::time::Instant) -> Result<Vec<u8>, String> {
-        tokio::time::timeout_at(
+        let data = tokio::time::timeout_at(
             deadline,
             read_message(&mut self.reader, &mut self.fragment_buf),
         )
         .await
         .map_err(|_| "timeout".to_string())?
-        .ok_or_else(|| "server closed connection".to_string())
+        .ok_or_else(|| "server closed connection".to_string())?;
+        if let Some(error) = self.note_kick(&data) {
+            return Err(error);
+        }
+        Ok(data)
     }
 
     async fn maybe_resize(&mut self, id: u16, size: Option<(u16, u16)>) -> Result<(), String> {
@@ -221,6 +266,139 @@ pub async fn cmd_list(transport: Transport) -> Result<(), String> {
     // Just drop the connection; the proxy (if any) handles cleanup.
     drop(conn);
     Ok(())
+}
+
+pub async fn cmd_clients(transport: Transport) -> Result<(), String> {
+    let mut conn = AgentConn::connect(transport).await?;
+    if conn.features & FEATURE_CLIENT_CONTROL == 0 {
+        return Err("server does not support client control".to_string());
+    }
+
+    const NONCE: u16 = 1;
+    conn.send(&msg_client_list(NONCE)).await?;
+    loop {
+        let data = conn.recv().await?;
+        // KICK_RESULT is the client-control family's status reply, so a
+        // refusal of this request arrives under our own nonce. Without that
+        // arm the loop would keep reading until the recv timeout.
+        let reply = parse_server_msg(&data);
+        if let Some(ServerMsg::KickResult {
+            nonce,
+            status,
+            detail,
+        }) = reply
+            && nonce == NONCE
+        {
+            let message = if detail.is_empty() {
+                status_text(status)
+            } else {
+                detail
+            };
+            return Err(format!("failed to list clients: {message}"));
+        }
+        if let Some(ServerMsg::ClientList {
+            nonce,
+            self_id,
+            clients,
+        }) = reply
+            && nonce == NONCE
+        {
+            println!("ID\tAGE_S\tOUT_BYTES_S\tSUBSCRIPTIONS\tTERMINALS\tSURFACES");
+            for client in clients
+                .into_iter()
+                .filter(|client| client.client_id != self_id)
+            {
+                let subscriptions = client
+                    .subscriptions
+                    .iter()
+                    .map(|entry| match entry.kind {
+                        blit_remote::CLIENT_SUBSCRIPTION_AUDIO => "audio".to_string(),
+                        blit_remote::CLIENT_SUBSCRIPTION_FS => format!("fs:{}", entry.id),
+                        blit_remote::CLIENT_SUBSCRIPTION_GIT => format!("git:{}", entry.id),
+                        blit_remote::CLIENT_SUBSCRIPTION_LSP => format!("lsp:{}", entry.id),
+                        blit_remote::CLIENT_SUBSCRIPTION_KV => format!("kv:{}", entry.id),
+                        blit_remote::CLIENT_SUBSCRIPTION_NET => format!("net:{}", entry.id),
+                        kind => format!("{kind}:{}", entry.id),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let terminals = client
+                    .terminals
+                    .iter()
+                    .map(|entry| {
+                        if entry.rows == 0 || entry.cols == 0 {
+                            format!("{}:?", entry.pty_id)
+                        } else {
+                            format!("{}:{}x{}", entry.pty_id, entry.cols, entry.rows)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let surfaces = client
+                    .surfaces
+                    .iter()
+                    .map(|entry| {
+                        if entry.width == 0 || entry.height == 0 {
+                            format!("{}:?", entry.surface_id)
+                        } else if entry.scale_120 == 0 {
+                            format!("{}:{}x{}", entry.surface_id, entry.width, entry.height)
+                        } else {
+                            format!(
+                                "{}:{}x{}@{}/120",
+                                entry.surface_id, entry.width, entry.height, entry.scale_120
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!(
+                    "{}\t{}\t{}\t{subscriptions}\t{terminals}\t{surfaces}",
+                    client.client_id, client.age_secs, client.outbound_bytes_per_sec
+                );
+            }
+            return Ok(());
+        }
+    }
+}
+
+pub async fn cmd_kick_client(
+    transport: Transport,
+    client_id: u64,
+    reason: &str,
+) -> Result<(), String> {
+    if reason.len() > KICK_REASON_MAX {
+        return Err(format!(
+            "kick reason is {} bytes; maximum is {KICK_REASON_MAX}",
+            reason.len()
+        ));
+    }
+    let mut conn = AgentConn::connect(transport).await?;
+    if conn.features & FEATURE_CLIENT_CONTROL == 0 {
+        return Err("server does not support client control".to_string());
+    }
+
+    const NONCE: u16 = 1;
+    conn.send(&msg_kick(NONCE, client_id, reason)).await?;
+    loop {
+        let data = conn.recv().await?;
+        if let Some(ServerMsg::KickResult {
+            nonce,
+            status,
+            detail,
+        }) = parse_server_msg(&data)
+            && nonce == NONCE
+        {
+            if status == STATUS_OK {
+                return Ok(());
+            }
+            let message = if detail.is_empty() {
+                status_text(status)
+            } else {
+                detail
+            };
+            return Err(format!("failed to kick client {client_id}: {message}"));
+        }
+    }
 }
 
 /// Seconds to the wire's milliseconds, saturating rather than wrapping: an
@@ -1850,9 +2028,13 @@ mod tests {
         }
 
         async fn send_initial_burst(&mut self) {
+            self.send_initial_burst_with_features(0).await;
+        }
+
+        async fn send_initial_burst_with_features(&mut self, extra_features: u32) {
             let hello = msg_hello(
                 1,
-                FEATURE_CREATE_NONCE | FEATURE_RESTART | FEATURE_RESIZE_BATCH,
+                FEATURE_CREATE_NONCE | FEATURE_RESTART | FEATURE_RESIZE_BATCH | extra_features,
                 1,
                 "0.0.0-test",
             );
@@ -1951,6 +2133,100 @@ mod tests {
     // ── Helper to capture stdout ─────────────────────────────────────────
 
     // ── Integration tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_client_list_requests_catalog() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let mock = tokio::spawn(async move {
+            let mut mock = MockServer::new(server);
+            mock.send_initial_burst_with_features(FEATURE_CLIENT_CONTROL)
+                .await;
+            assert_eq!(mock.recv().await.unwrap(), msg_client_list(1));
+            write_frame(
+                &mut mock.writer,
+                &blit_remote::msg_s2c_client_list(
+                    1,
+                    7,
+                    &[
+                        blit_remote::ClientListEntry {
+                            client_id: 2,
+                            age_secs: 45,
+                            outbound_bytes_per_sec: 1_000_000,
+                            terminals: vec![blit_remote::ClientTerminalSubscription {
+                                pty_id: 4,
+                                rows: 24,
+                                cols: 80,
+                            }],
+                            surfaces: vec![],
+                            subscriptions: vec![blit_remote::ClientAuxSubscription {
+                                kind: blit_remote::CLIENT_SUBSCRIPTION_FS,
+                                id: 3,
+                            }],
+                        },
+                        blit_remote::ClientListEntry {
+                            client_id: 7,
+                            age_secs: 0,
+                            outbound_bytes_per_sec: 0,
+                            terminals: vec![],
+                            surfaces: vec![],
+                            subscriptions: vec![],
+                        },
+                    ],
+                ),
+            )
+            .await;
+        });
+
+        cmd_clients(Transport::Unix(client)).await.unwrap();
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_client_kick_waits_for_result() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let mock = tokio::spawn(async move {
+            let mut mock = MockServer::new(server);
+            mock.send_initial_burst_with_features(FEATURE_CLIENT_CONTROL)
+                .await;
+            assert_eq!(mock.recv().await.unwrap(), msg_kick(1, 42, "duplicate"));
+            write_frame(
+                &mut mock.writer,
+                &blit_remote::msg_kick_result(1, STATUS_OK, ""),
+            )
+            .await;
+        });
+
+        cmd_kick_client(Transport::Unix(client), 42, "duplicate")
+            .await
+            .unwrap();
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_client_kick_reports_refusal() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let mock = tokio::spawn(async move {
+            let mut mock = MockServer::new(server);
+            mock.send_initial_burst_with_features(FEATURE_CLIENT_CONTROL)
+                .await;
+            let _ = mock.recv().await.unwrap();
+            write_frame(
+                &mut mock.writer,
+                &blit_remote::msg_kick_result(
+                    1,
+                    blit_remote::STATUS_NOT_FOUND,
+                    "client is not connected",
+                ),
+            )
+            .await;
+        });
+
+        let error = cmd_kick_client(Transport::Unix(client), 42, "")
+            .await
+            .unwrap_err();
+        assert!(error.contains("client is not connected"));
+        mock.await.unwrap();
+    }
 
     #[tokio::test]
     async fn test_list_empty() {

@@ -320,6 +320,20 @@ export class MuxTransport {
     }
   }
 
+  /** @internal Pause one channel without removing it, so it can be reopened manually. */
+  _suspendChannel(ch: MuxChannel): void {
+    this.pendingReopen.delete(ch);
+    this._cancelChannelReconnect(ch.channelId);
+    this.cancelChannelConnectTimer(ch.channelId);
+    if (
+      this._status === "connected" &&
+      (ch._internalStatus === "connected" ||
+        ch._internalStatus === "connecting")
+    ) {
+      this._sendClose(ch.channelId);
+    }
+  }
+
   /** @internal Cancel any pending per-channel reconnect timer. */
   _cancelChannelReconnect(channelId: number): void {
     const timer = this.channelReconnectTimers.get(channelId);
@@ -386,6 +400,7 @@ export class MuxTransport {
 
   /** Send an OPEN control message for a channel. */
   _sendOpen(ch: MuxChannel): void {
+    if (ch._suspended) return;
     if (this._status !== "connected") {
       this.pendingReopen.add(ch);
       this.connect();
@@ -755,7 +770,7 @@ export class MuxTransport {
       return;
     }
     for (const ch of this.channels.values()) {
-      if (ch._internalStatus !== "closed") {
+      if (ch._internalStatus !== "closed" && !ch._suspended) {
         this.pendingReopen.add(ch);
       }
       ch._setStatus("disconnected");
@@ -786,7 +801,7 @@ export class MuxTransport {
    */
   private scheduleChannelReconnect(ch: MuxChannel): void {
     if (this.disposed || !this._reconnect) return;
-    if (ch._internalStatus === "closed") return;
+    if (ch._internalStatus === "closed" || ch._suspended) return;
     if (this.channelReconnectTimers.has(ch.channelId)) return;
     const delay = ch._reconnectDelay;
     ch._reconnectDelay = Math.min(delay * this.backoff, this.maxDelay);
@@ -794,7 +809,8 @@ export class MuxTransport {
       ch.channelId,
       setTimeout(() => {
         this.channelReconnectTimers.delete(ch.channelId);
-        if (this.disposed || !this.channels.has(ch.channelId)) return;
+        if (this.disposed || ch._suspended || !this.channels.has(ch.channelId))
+          return;
         if (
           ch._internalStatus === "closed" ||
           ch._internalStatus === "connected" ||
@@ -819,7 +835,8 @@ export class MuxTransport {
       ch.channelId,
       setTimeout(() => {
         this.channelConnectTimers.delete(ch.channelId);
-        if (this.disposed || !this.channels.has(ch.channelId)) return;
+        if (this.disposed || ch._suspended || !this.channels.has(ch.channelId))
+          return;
         if (ch._internalStatus !== "connecting") return;
 
         ch._lastError = "connect timeout";
@@ -874,7 +891,7 @@ export class MuxTransport {
     if (!this._authRejected) return;
     this._authRejected = false;
     for (const ch of this.channels.values()) {
-      if (ch._internalStatus === "closed") continue;
+      if (ch._internalStatus === "closed" || ch._suspended) continue;
       ch._clearAuthRejected();
       this.pendingReopen.add(ch);
     }
@@ -882,6 +899,7 @@ export class MuxTransport {
 
   private reopenChannels(): void {
     for (const ch of this.pendingReopen) {
+      if (ch._suspended) continue;
       ch._setStatus("connecting");
       this._sendOpen(ch);
     }
@@ -911,7 +929,7 @@ export class MuxTransport {
 
     switch (opcode) {
       case MUX_S2C_OPENED:
-        if (ch) {
+        if (ch && !ch._suspended) {
           this.cancelChannelConnectTimer(ch.channelId);
           ch._lastError = null;
           ch._reconnectDelay = this.initialDelay;
@@ -920,7 +938,7 @@ export class MuxTransport {
         break;
 
       case MUX_S2C_CLOSED:
-        if (ch && ch._internalStatus !== "connecting") {
+        if (ch && !ch._suspended && ch._internalStatus !== "connecting") {
           this.cancelChannelConnectTimer(ch.channelId);
           ch._setStatus("disconnected");
           this.scheduleChannelReconnect(ch);
@@ -934,7 +952,7 @@ export class MuxTransport {
           bytes.length >= 7 + msgLen
             ? textDecoder.decode(bytes.subarray(7, 7 + msgLen))
             : "unknown error";
-        if (ch) {
+        if (ch && !ch._suspended) {
           this.cancelChannelConnectTimer(ch.channelId);
           ch._lastError = msg;
           ch._setStatus("error");
@@ -958,6 +976,7 @@ export class MuxChannel implements BlitTransport {
   /** @internal */ _lastError: string | null = null;
   /** @internal Per-channel backoff delay for reconnect scheduling. */
   /** @internal */ _reconnectDelay: number;
+  /** @internal */ _suspended = false;
 
   private readonly mux: MuxTransport;
   readonly channelId: number;
@@ -997,6 +1016,7 @@ export class MuxChannel implements BlitTransport {
       this._internalStatus === "closed"
     )
       return;
+    this._suspended = false;
     this.mux._cancelChannelReconnect(this.channelId);
     this._setStatus("connecting");
     this.mux._sendOpen(this);
@@ -1004,6 +1024,7 @@ export class MuxChannel implements BlitTransport {
 
   reconnect(): void {
     if (this._internalStatus === "closed") return;
+    this._suspended = false;
     this.mux._cancelChannelReconnect(this.channelId);
     this.mux.cancelChannelConnectTimer(this.channelId);
     // Ask the server to tear down the existing channel.
@@ -1028,6 +1049,13 @@ export class MuxChannel implements BlitTransport {
     if (this._internalStatus === "closed") return;
     this.mux._removeChannel(this);
     this._setStatus("closed");
+  }
+
+  suspend(): void {
+    if (this._internalStatus === "closed") return;
+    this._suspended = true;
+    this.mux._suspendChannel(this);
+    this._setStatus("disconnected");
   }
 
   addEventListener(

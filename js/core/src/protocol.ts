@@ -1,6 +1,9 @@
 import {
   C2S_ACK,
   C2S_CLIENT_METRICS,
+  C2S_CLIENT_LIST,
+  C2S_CLIENT_WATCH,
+  C2S_CLIENT_UNWATCH,
   C2S_CLIPBOARD_GET,
   C2S_CLIPBOARD_LIST,
   C2S_CLIPBOARD_SET,
@@ -8,6 +11,7 @@ import {
   C2S_DISPLAY_RATE,
   C2S_INPUT,
   C2S_KILL,
+  C2S_KICK,
   KILL_LEADER_ONLY,
   C2S_TERM_CWD,
   S2C_TERM_CWD,
@@ -66,6 +70,58 @@ const UNSET_VIEW_SIZE = 0;
 
 export function buildAckMessage(): Uint8Array {
   return new Uint8Array([C2S_ACK]);
+}
+
+/** Request the server's connection catalog. */
+export function buildClientListMessage(nonce: number): Uint8Array {
+  const msg = new Uint8Array(3);
+  msg[0] = C2S_CLIENT_LIST;
+  new DataView(msg.buffer).setUint16(1, nonce, true);
+  return msg;
+}
+
+/** Start streaming the server's connection catalog. */
+export function buildClientWatchMessage(nonce: number): Uint8Array {
+  const msg = new Uint8Array(3);
+  msg[0] = C2S_CLIENT_WATCH;
+  new DataView(msg.buffer).setUint16(1, nonce, true);
+  return msg;
+}
+
+/** Stop a connection-catalog stream. */
+export function buildClientUnwatchMessage(nonce: number): Uint8Array {
+  const msg = new Uint8Array(3);
+  msg[0] = C2S_CLIENT_UNWATCH;
+  new DataView(msg.buffer).setUint16(1, nonce, true);
+  return msg;
+}
+
+/** Longest UTF-8 kick reason the server will accept (`KICK_REASON_MAX`). */
+export const KICK_REASON_MAX = 1024;
+
+/** UTF-8 byte length of a kick reason, for validating before sending. */
+export function kickReasonByteLength(reason: string): number {
+  return textEncoder.encode(reason).length;
+}
+
+/** Request that another server connection be disconnected. */
+export function buildKickClientMessage(
+  nonce: number,
+  clientId: bigint,
+  reason = "",
+): Uint8Array {
+  // Clamping here is a backstop — callers validate with kickReasonByteLength
+  // and refuse, rather than silently sending a shortened reason. encodeInto
+  // never writes a partial UTF-8 scalar, so a clamped tail stays valid.
+  const reasonBuffer = new Uint8Array(KICK_REASON_MAX);
+  const { written } = textEncoder.encodeInto(reason, reasonBuffer);
+  const msg = new Uint8Array(11 + written);
+  msg[0] = C2S_KICK;
+  const view = new DataView(msg.buffer);
+  view.setUint16(1, nonce, true);
+  view.setBigUint64(3, clientId, true);
+  msg.set(reasonBuffer.subarray(0, written), 11);
+  return msg;
 }
 
 export function buildClientMetricsMessage(

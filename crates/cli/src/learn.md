@@ -48,6 +48,8 @@ Both accept `--cols`/`--rows` to resize before reading, and `--ansi` to preserve
 
 ```bash
 blit terminal list            # show all terminals
+blit client list              # show peers, subscriptions, and view sizes
+blit client kick 3 --reason "duplicate tab"
 blit terminal close "$ID"     # tear down a terminal
 blit terminal kill "$ID" TERM # signal the process, keep the terminal
 blit terminal restart "$ID"   # re-run an exited terminal

@@ -125,6 +125,7 @@ import {
 import { t } from "./i18n";
 import { TerminalDropTarget } from "./terminalDrop";
 import { StatusBar } from "./StatusBar";
+import { DesktopChrome } from "./DesktopChrome";
 import { LeftDock, LEFT_PANELS, type LeftPanel } from "./LeftDock";
 import { foldedSections, liveOverrides, toggleSection } from "./dockSections";
 import {
@@ -182,6 +183,7 @@ import { FontOverlay } from "./FontOverlay";
 import { HelpOverlay } from "./HelpOverlay";
 import { LinkOverlay } from "./LinkOverlay";
 import { RemotesOverlay } from "./RemotesOverlay";
+import { ClientsOverlay } from "./ClientsOverlay";
 import { shellCapabilities } from "./shellCapabilities";
 import { RootsOverlay } from "./RootsOverlay";
 import { MediaOverlay } from "./MediaOverlay";
@@ -247,6 +249,7 @@ export type Overlay =
   | "font"
   | "help"
   | "remotes"
+  | "clients"
   | "roots"
   | "media"
   | "web"
@@ -1039,8 +1042,10 @@ function WorkspaceScreen(props: {
   // attached, and the floating keyboard.  Only a full keyboard clears 150px,
   // and gating the viewport pin on that number left <main> at its full 100dvh
   // for the smaller two — with the footer, and the keyboard toggle in it,
-  // sitting underneath and untappable.  The deadband keeps momentum-scroll
-  // jitter from thrashing the layout.
+  // sitting underneath and untappable.  Anything beyond the deadband is also
+  // keyboard-open state: the shortcut bar is still an input panel the toggle
+  // must be able to dismiss.  The deadband keeps momentum-scroll jitter from
+  // thrashing the layout.
   const occlusion = createMemo(() => {
     if (!isMobileTouch()) return 0;
     const h = vpHeight();
@@ -1247,15 +1252,15 @@ function WorkspaceScreen(props: {
     if (!keyboardWanted()) {
       keyboardSeen = false;
       // inputmode="none" means taps no longer raise the IME, but the OS still
-      // can (a keyboard-show gesture, stylus handwriting input).  If a full
-      // keyboard is genuinely up over a focused terminal, latch intent from
-      // reality so the icon and toolbar match what's on screen.  Gated on
-      // focus still being in a terminal so the drain after an explicit hide
-      // (the toggle blurred, occlusion not yet gone) cannot re-latch, and on
-      // >150px so the iPadOS shortcut bar and the floating keyboard don't
-      // count — only a real keyboard does.
+      // can (a keyboard-show gesture, stylus handwriting input).  If an input
+      // panel is genuinely up over a focused terminal, latch intent from
+      // reality so the icon and toolbar match what's on screen.  This includes
+      // iPadOS's shortcut bar: although it is not a full software keyboard, it
+      // must take the same hide path.  Focus gating keeps the drain after an
+      // explicit hide (the toggle blurred, occlusion not yet gone) from
+      // re-latching.
       if (
-        occlusion() > 150 &&
+        viewportOccluded() &&
         document.activeElement instanceof HTMLElement &&
         document.activeElement.matches(keyboardInputSelector)
       ) {
@@ -1323,12 +1328,12 @@ function WorkspaceScreen(props: {
   // viewport — the only signal that WebKit accepted the host's assist.
   let pendingHopLand: (() => void) | null = null;
   createEffect(() => {
-    // Read occlusion() unconditionally: short-circuiting it behind
+    // Read viewportOccluded() unconditionally: short-circuiting it behind
     // pendingHopLand would subscribe to nothing on the first run, and the
     // effect would never fire.
-    const occ = occlusion();
+    const covered = viewportOccluded();
     const land = pendingHopLand;
-    if (land && occ > 32) {
+    if (land && covered) {
       pendingHopLand = null;
       land();
     }
@@ -1377,12 +1382,12 @@ function WorkspaceScreen(props: {
   );
 
   function toggleMobileKeyboard() {
-    // A tap means "put it away" only when a full keyboard is genuinely up.
-    // While intent is lit but no keyboard rose — the IME refused the focus
-    // transition, or the tap landed while the last keyboard was still
-    // draining — the tap is the user asking for the keyboard again, and
-    // taking the hide branch is exactly backwards.
-    if (keyboardWanted() && occlusion() > 150) {
+    // A tap means "put it away" when any keyboard input panel is genuinely
+    // up, including iPadOS's shortcut bar.  While intent is lit but no panel
+    // rose — the IME refused the focus transition, or the tap landed while the
+    // last keyboard was still draining — the tap asks for the keyboard again,
+    // and taking the hide branch is exactly backwards.
+    if (keyboardWanted() && viewportOccluded()) {
       keyboardManualOverride = false;
       automaticKeyboardInput = null;
       setKeyboardWanted(false);
@@ -1411,7 +1416,7 @@ function WorkspaceScreen(props: {
         // A keyboard already up for this very element was only missing the
         // intent — adopt it without any focus churn, which would just
         // flicker the keyboard.
-        if (occlusion() > 150) return;
+        if (viewportOccluded()) return;
         if (isIOS()) {
           // iPadOS only answers a focus CHANGE: focus() on the element that
           // already holds focus is a no-op, and blur+focus within one tap
@@ -4621,6 +4626,15 @@ function WorkspaceScreen(props: {
                   ? () => toggleOverlay("remotes")
                   : undefined
               }
+              onManageClients={
+                allConnections().some(
+                  (candidate) =>
+                    candidate.supportsClientControl &&
+                    !readOnlyConnections().has(candidate.id),
+                )
+                  ? () => toggleOverlay("clients")
+                  : undefined
+              }
               onChangeRoots={() => toggleOverlay("roots")}
               onOpenWeb={() => toggleOverlay("web")}
               onOpenSearch={() => {
@@ -4797,6 +4811,19 @@ function WorkspaceScreen(props: {
               onClose={closeOverlay}
             />
           )}
+        </Show>
+        <Show when={overlay() === "clients"}>
+          <ClientsOverlay
+            workspace={workspace}
+            connections={allConnections()}
+            sessions={wsState().sessions}
+            surfaces={surfaces()}
+            connectionLabels={connectionLabels()}
+            readOnlyConnections={readOnlyConnections()}
+            palette={palette()}
+            fontSize={fontSize()}
+            onClose={closeOverlay}
+          />
         </Show>
         <Show when={overlay() === "web"}>
           <WebOverlay
@@ -5018,11 +5045,22 @@ function WorkspaceScreen(props: {
             audioAvailable={allConnections().some((c) => c.supportsAudio)}
             hasSurfaces={surfaces().length > 0}
             isMobileTouch={isMobileTouch()}
-            // The icon and the toggle agree: lit means a full keyboard is
-            // genuinely up, so a dim icon's tap always asks for one.
-            keyboardOpen={keyboardWanted() && occlusion() > 150}
+            // The icon and the toggle agree: lit means a keyboard input panel
+            // is genuinely up, including the iPadOS shortcut bar.
+            keyboardOpen={keyboardWanted() && viewportOccluded()}
             onToggleKeyboard={toggleMobileKeyboard}
             onMedia={() => toggleOverlay("media")}
+            desktopChrome={(compact) => (
+              <DesktopChrome
+                workspace={workspace}
+                connections={allConnections()}
+                connectionLabels={connectionLabels()}
+                readOnlyConnections={readOnlyConnections()}
+                theme={theme()}
+                scale={chromeScale()}
+                compact={compact}
+              />
+            )}
           />
         </footer>
         <Show when={showMobileToolbar()}>
@@ -5578,14 +5616,6 @@ function SurfaceThumbnail(props: {
             {props.surface.title ||
               props.surface.appId ||
               `Surface ${props.surface.surfaceId}`}
-          </span>
-          <span
-            style={{
-              "font-size": `${props.scale.xs}px`,
-              color: props.theme.dimFg,
-            }}
-          >
-            {props.surface.width}x{props.surface.height}
           </span>
         </>
       )}

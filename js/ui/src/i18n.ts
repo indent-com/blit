@@ -251,6 +251,16 @@ const en: Messages = {
   "statusbar.activity.searching": "Searching",
   "statusbar.activity.working": "Working on",
 
+  "desktop.notification": "Notification",
+  "desktop.notifications": "Notifications",
+  "desktop.noNotifications": "No active notifications",
+  "desktop.dismiss": "Dismiss",
+  "desktop.enableSystemNotifications": "Enable system notifications",
+  "desktop.systemNotificationsBlocked":
+    "System notifications are blocked in this browser",
+  "desktop.trayItem": "Tray item",
+  "desktop.trayOverflow": "More tray items",
+
   "font.label": "Font",
   "font.title": "Font",
   "font.placeholder": "Search fonts or type a name",
