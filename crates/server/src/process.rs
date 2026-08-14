@@ -4659,9 +4659,11 @@ mod tests {
         }
         let mut spawned = spawned.expect("spawn descriptor probe");
         let result = spawned.child.wait().await;
-        pty::deregister_child_pid(spawned.pid as libc::pid_t);
         let success = match result {
-            Ok(status) => status.success(),
+            Ok(status) => {
+                pty::deregister_child_pid(spawned.pid as libc::pid_t);
+                status.success()
+            }
             Err(_) => pty::take_reaped_child_status(spawned.pid as libc::pid_t) == Some(0),
         };
         assert!(success, "the late-opened descriptor reached the child");
