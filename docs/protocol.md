@@ -321,7 +321,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 10  | `NET`                | Server supports the `NET_*` network-relay family                |
 | 11  | `EXTENSION`          | Proposed: Wasmi extension lifecycle, events, and commands       |
 | 12  | `CHANNEL`            | Proposed: server supports bidirectional named channels          |
-| 13  | `PROCESS`            | Proposed: server supports non-PTY child processes               |
+| 13  | `PROCESS`            | Server supports native non-PTY child processes                  |
 | 14  | `CREATE_STATUS`      | `CREATE2(WANT_STATUS)` receives an explicit failure             |
 | 15  | `KILL_MODE`          | `KILL`/`CLOSE` reach the process group; `KILL` takes `flags`    |
 | 16  | `PTY_DEADLINE`       | `C2S_DEADLINE`, `CREATE2(HAS_DEADLINE)`, and `EXITED.reason`    |
@@ -331,12 +331,12 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 20  | `CLIENT_CONTROL`     | Enumerate connections and kick another client with a reason     |
 | 21  | `DESKTOP`            | Compositor tray/notification state bridge and core API are live |
 
-Bits 11 through 13 are proposed for the extension, channel, and process families
-under review in [#167](https://github.com/indent-com/blit/pull/167) and
-[#173](https://github.com/indent-com/blit/pull/173); nothing advertises them
-today. Bits 14 and 20 are always advertised.
+Bits 11 and 12 remain proposed for the extension and channel families under
+review in [#167](https://github.com/indent-com/blit/pull/167) and
+[#173](https://github.com/indent-com/blit/pull/173). Bit 13 is advertised when
+native process execution is enabled. Bits 14 and 20 are always advertised.
 
-The proposed bits 11 through 13 are independently omitted when `BLIT_EXT=0`,
+Bits 11 through 13 are independently omitted when `BLIT_EXT=0`,
 `BLIT_CHANNEL=0`, or `BLIT_PROCESS=0`; disabled-family requests are refused as
 specified in [design/extensions.md](design/extensions.md#security-posture-and-deployment-controls)
 and [design/processes.md](design/processes.md#security-and-deployment).

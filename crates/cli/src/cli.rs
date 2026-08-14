@@ -304,6 +304,10 @@ pub enum Command {
         /// Enable verbose logging
         #[arg(long, short)]
         verbose: bool,
+
+        /// Disable native non-PTY child processes (or set BLIT_PROCESS=0)
+        #[arg(long)]
+        no_processes: bool,
     },
 
     /// Shut down the blit server

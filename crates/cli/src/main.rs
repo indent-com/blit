@@ -916,6 +916,7 @@ async fn async_main() {
             allow_forward,
             allow_forward_insecure,
             verbose,
+            no_processes,
         } => {
             let ipc_path = socket
                 .or_else(|| std::env::var("BLIT_SOCK").ok())
@@ -969,6 +970,8 @@ async fn async_main() {
                         .ok()
                         .map(|v| v == "1")
                         .unwrap_or(false),
+                processes: !no_processes
+                    && !std::env::var("BLIT_PROCESS").is_ok_and(|value| value == "0"),
                 // Both default to 0 (unlimited), which is the right default:
                 // a client that can open a PTY can already spend the machine's
                 // resources from inside it, so these are an operator sanity

@@ -68,6 +68,8 @@ mod ipc;
 mod kv;
 mod net;
 mod nvenc_encode;
+#[cfg(any(unix, windows))]
+mod process;
 mod pty;
 mod surface_encoder;
 #[cfg(target_os = "linux")]
@@ -135,6 +137,8 @@ pub struct Config {
     #[cfg(unix)]
     pub fd_channel: Option<std::os::unix::io::RawFd>,
     pub verbose: bool,
+    /// Advertise and accept the native non-PTY process family.
+    pub processes: bool,
     /// Maximum number of concurrent client connections (0 = unlimited).
     pub max_connections: usize,
     /// Maximum number of PTYs across all clients (0 = unlimited).  Counts
@@ -562,6 +566,57 @@ async fn write_frame_interleaved(
         offset = end;
     }
     true
+}
+
+enum ConnectionBulk {
+    Ordinary(Vec<u8>),
+    #[cfg(any(unix, windows))]
+    Process(process::Outbound),
+}
+
+/// Select fairly between process and ordinary bulk traffic. Terminal notices
+/// and audio retain their outer priority, but a process which continuously
+/// refills its bounded queue must not starve UI, filesystem, or other replies.
+#[cfg(any(unix, windows))]
+async fn next_connection_bulk(
+    process_rx: &mut mpsc::Receiver<process::Outbound>,
+    ordinary_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    prefer_process: bool,
+) -> Option<ConnectionBulk> {
+    if prefer_process {
+        if let Ok(message) = process_rx.try_recv() {
+            return Some(ConnectionBulk::Process(message));
+        }
+        if let Ok(message) = ordinary_rx.try_recv() {
+            return Some(ConnectionBulk::Ordinary(message));
+        }
+    } else {
+        if let Ok(message) = ordinary_rx.try_recv() {
+            return Some(ConnectionBulk::Ordinary(message));
+        }
+        if let Ok(message) = process_rx.try_recv() {
+            return Some(ConnectionBulk::Process(message));
+        }
+    }
+    if process_rx.is_closed() {
+        return ordinary_rx.recv().await.map(ConnectionBulk::Ordinary);
+    }
+    if ordinary_rx.is_closed() {
+        return process_rx.recv().await.map(ConnectionBulk::Process);
+    }
+    tokio::select! {
+        message = process_rx.recv() => message.map(ConnectionBulk::Process),
+        message = ordinary_rx.recv() => message.map(ConnectionBulk::Ordinary),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn next_connection_bulk(
+    _process_rx: &mut mpsc::UnboundedReceiver<()>,
+    ordinary_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    _prefer_process: bool,
+) -> Option<ConnectionBulk> {
+    ordinary_rx.recv().await.map(ConnectionBulk::Ordinary)
 }
 
 struct Pty {
@@ -5723,6 +5778,8 @@ impl Session {
 
 struct AppStateInner {
     config: Config,
+    #[cfg(any(unix, windows))]
+    process_server: process::Server,
     /// Opaque identifier shared by every connection to this server process.
     boot_generation: u64,
     session: Mutex<Session>,
@@ -5761,7 +5818,7 @@ fn spawn_compositor_child(
     dir: Option<&str>,
 ) -> libc::pid_t {
     use std::ffi::CString;
-    let pid = unsafe { libc::fork() };
+    let pid = pty::fork_child();
     if pid == 0 {
         if let Some(d) = dir {
             let c_dir = CString::new(d).unwrap();
@@ -6580,8 +6637,12 @@ fn try_send_update(
 }
 
 pub async fn run(config: Config) {
+    #[cfg(any(unix, windows))]
+    let process_server = process::Server::new(config.verbose, config.processes);
     let state: AppState = Arc::new(AppStateInner {
         config,
+        #[cfg(any(unix, windows))]
+        process_server,
         boot_generation: new_boot_generation(),
         session: Mutex::new(Session::new()),
         pty_fds: Arc::new(std::sync::RwLock::new(FxHashMap::default())),
@@ -6676,7 +6737,8 @@ pub async fn run(config: Config) {
     #[cfg(unix)]
     if let Some(channel_fd) = state.config.fd_channel {
         blit_sd_notify::notify_ready(state.config.verbose);
-        ipc::run_fd_channel(channel_fd, state).await;
+        ipc::run_fd_channel(channel_fd, state.clone()).await;
+        state.process_server.shutdown().await;
         return;
     }
 
@@ -6754,6 +6816,8 @@ pub async fn run(config: Config) {
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         });
     }
+    #[cfg(any(unix, windows))]
+    state.process_server.shutdown().await;
     // Brief grace period for S2C_QUIT to reach clients before the process exits.
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
@@ -13137,6 +13201,102 @@ fn refuse_lsp_message(data: &[u8], out: &mpsc::UnboundedSender<Vec<u8>>) {
     }
 }
 
+/// Process-family refusal for unsupported hosts and `BLIT_PROCESS=0`.
+///
+/// The feature bit is absent in both cases. A client which probes anyway still
+/// gets every correlated outcome promised by the RFC; fire-and-forget stream
+/// packets are dropped.
+fn refuse_process_message(data: &[u8], mut send: impl FnMut(Vec<u8>)) {
+    use blit_remote::process::*;
+
+    let nonce = data
+        .get(1..3)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .unwrap_or(0);
+    let process_id = data
+        .get(3..7)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .unwrap_or(0);
+    const DETAIL: &str = "process execution disabled";
+
+    match data[0] {
+        C2S_PROCESS_SPAWN => {
+            let status = parse_process_spawn(data)
+                .map(|_| blit_remote::STATUS_PERMISSION)
+                .unwrap_or_else(ProcessCodecError::status);
+            if let Ok(reply) = msg_process_started(ProcessStarted {
+                nonce,
+                status,
+                process_id,
+                process_ref: 0,
+                stdin_window: 0,
+                stdout_window: 0,
+                stderr_window: 0,
+                detail: DETAIL,
+            }) {
+                send(reply);
+            }
+        }
+        C2S_PROCESS_CONTROL => {
+            let status = parse_process_control(data)
+                .map(|_| blit_remote::STATUS_PERMISSION)
+                .unwrap_or_else(ProcessCodecError::status);
+            send(msg_process_controlled(ProcessControlled {
+                nonce,
+                status,
+                process_id,
+                detail: DETAIL,
+            }));
+        }
+        C2S_PROCESS_LIST => {
+            let status = parse_process_list(data)
+                .map(|_| blit_remote::STATUS_PERMISSION)
+                .unwrap_or_else(ProcessCodecError::status);
+            if let Ok(reply) = msg_process_listed(ProcessListed {
+                nonce,
+                status,
+                revision: 0,
+                entries: Vec::new(),
+                detail: DETAIL,
+            }) {
+                send(reply);
+            }
+        }
+        C2S_PROCESS_WATCH => {
+            let process_ref = data
+                .get(7..15)
+                .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+                .unwrap_or(0);
+            let status = parse_process_watch(data)
+                .map(|_| blit_remote::STATUS_PERMISSION)
+                .unwrap_or_else(ProcessCodecError::status);
+            if let Ok(reply) = msg_process_watched(ProcessWatched {
+                nonce,
+                status,
+                process_id,
+                process_ref,
+                state: 0,
+                stream_state: 0,
+                stdin_received: 0,
+                stdin_acked: 0,
+                stdout_next: 0,
+                stderr_next: 0,
+                stdin_window: 0,
+                stdout_window: 0,
+                stderr_window: 0,
+                exit_reason: 0,
+                kill_cause: 0,
+                exit_code: 0,
+                detail: DETAIL,
+            }) {
+                send(reply);
+            }
+        }
+        // PROCESS_STDIN and PROCESS_OUTPUT_ACK are fire-and-forget.
+        _ => {}
+    }
+}
+
 /// Collect one connection's auxiliary subscriptions, labelled by family.
 ///
 /// Takes id iterators rather than the tables themselves so the family labelling
@@ -13276,6 +13436,18 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (kick_tx, mut kick_rx) = mpsc::unbounded_channel::<String>();
+    #[cfg(any(unix, windows))]
+    let (process_out_tx, mut process_out_rx) = {
+        let (max_frames, max_bytes) = state.process_server.outbox_limits();
+        let (tx, rx) = mpsc::channel(max_frames);
+        (
+            process::OutboundSender::new(tx, max_bytes, kick_tx.clone()),
+            rx,
+        )
+    };
+    #[cfg(not(any(unix, windows)))]
+    let (_process_out_tx, mut process_out_rx) = mpsc::unbounded_channel::<()>();
     // Terminal connection-control notices bypass the ordinary visual outbox.
     // A kick must not sit behind *queued* video frames — it can still wait on
     // one already being written, which is part of what the read task's
@@ -13283,10 +13455,13 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // keep the socket alive until S2C_KICKED is written.
     let (terminal_tx, mut terminal_rx) =
         mpsc::unbounded_channel::<(Vec<u8>, oneshot::Sender<()>)>();
-    let (kick_tx, mut kick_rx) = mpsc::unbounded_channel::<String>();
     // Filesystem syncs are connection-scoped; engines write into the same
     // outbox as everything else and die with this map on disconnect.
     let fs_out = out_tx.clone();
+    #[cfg(any(unix, windows))]
+    let processes = state.process_server.endpoint(process_out_tx);
+    #[cfg(any(unix, windows))]
+    let process_enabled = state.process_server.enabled();
     let mut fs_syncs = FsSyncs::default();
     let mut git_repos = GitRepos::default();
     let mut lsp_conns = LspConns::default();
@@ -13342,6 +13517,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         let mut max_audio_pick_gap: u32 = 0;
         let mut max_audio_write_ms: u32 = 0;
         let mut bulk_fragmentation = BulkFragmentation::default();
+        let mut prefer_process = true;
         loop {
             // A terminal control notice (currently S2C_KICKED) is both tiny
             // and connection-ending. Write it ahead of queued visual/audio
@@ -13439,15 +13615,38 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         None => break,
                     }
                 }
-                msg = out_rx.recv() => msg,
+                msg = next_connection_bulk(
+                    &mut process_out_rx,
+                    &mut out_rx,
+                    prefer_process,
+                ) => msg,
             };
 
-            // Non-audio message: may be large (video keyframe, terminal
-            // snapshot).  Use interleaved write so audio frames that arrive
-            // while the kernel TCP buffer drains are written between write
-            // syscalls rather than piling up and being dropped.
+            // Any non-audio message may be large. Server-generated process
+            // output is capped at 32 KiB per fair writer turn, and adaptive
+            // fragmentation also lets audio interleave once congestion is
+            // observed.
             match msg {
-                Some(m) => {
+                Some(msg) => {
+                    #[cfg(any(unix, windows))]
+                    let (m, guard, ordinary): (
+                        Vec<u8>,
+                        Option<process::OutboundGuard>,
+                        bool,
+                    ) = match msg {
+                        ConnectionBulk::Ordinary(message) => (message, None, true),
+                        ConnectionBulk::Process(message) => {
+                            let (data, guard) = message.into_parts();
+                            (data, Some(guard), false)
+                        }
+                    };
+                    #[cfg(not(any(unix, windows)))]
+                    let (m, ordinary) = match msg {
+                        ConnectionBulk::Ordinary(message) => (message, true),
+                    };
+                    // Alternate the first choice whenever both bulk queues are
+                    // ready; terminal notices and audio remain higher priority.
+                    prefer_process = ordinary;
                     let bytes = m.len();
                     let write_start = Instant::now();
                     let wrote = write_frame_interleaved(
@@ -13474,11 +13673,18 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             write_elapsed.as_millis(),
                         );
                     }
-                    mark_outbox_drained(
-                        &sender_outbox_queued_frames,
-                        &sender_outbox_queued_bytes,
-                        bytes,
-                    );
+                    if ordinary {
+                        mark_outbox_drained(
+                            &sender_outbox_queued_frames,
+                            &sender_outbox_queued_bytes,
+                            bytes,
+                        );
+                    }
+                    // Process writer guards release endpoint-local IDs and
+                    // generation reservations only after every fragment is
+                    // written or the connection drops the packet.
+                    #[cfg(any(unix, windows))]
+                    drop(guard);
                     if !wrote {
                         break;
                     }
@@ -13625,6 +13831,10 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             }
             if net_enabled {
                 features |= blit_remote::net::FEATURE_NET;
+            }
+            #[cfg(any(unix, windows))]
+            if process_enabled {
+                features |= blit_remote::process::FEATURE_PROCESS;
             }
             #[cfg(target_os = "linux")]
             {
@@ -13857,6 +14067,36 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     let _ = send_outbox(client, reply);
                 }
             }
+            continue;
+        }
+
+        if blit_remote::process::is_c2s_process(data[0]) {
+            #[cfg(any(unix, windows))]
+            if process_enabled {
+                if data[0] == blit_remote::process::C2S_PROCESS_SPAWN {
+                    let pty_cwd = match blit_remote::process::parse_process_spawn(&data) {
+                        Ok(request)
+                            if request.cwd_kind == blit_remote::process::PROCESS_CWD_FROM_PTY =>
+                        {
+                            let sess = state.session.lock().await;
+                            sess.ptys
+                                .get(&request.src_pty_id)
+                                .and_then(|pty| pty::pty_cwd(&pty.handle))
+                                .map(String::into_bytes)
+                        }
+                        _ => None,
+                    };
+                    processes.spawn(&data, pty_cwd.as_deref());
+                } else {
+                    processes.handle(&data);
+                }
+            } else {
+                refuse_process_message(&data, |reply| processes.send(reply));
+            }
+            #[cfg(not(any(unix, windows)))]
+            refuse_process_message(&data, |reply| {
+                let _ = fs_out.send(reply);
+            });
             continue;
         }
 
@@ -16487,6 +16727,8 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             );
         }
     }
+    #[cfg(any(unix, windows))]
+    processes.shutdown().await;
     sender.abort();
     // Relayed sockets outlive the read loop only as spawned tasks; drop the
     // table so every forwarded socket on this connection closes with it.
@@ -16498,6 +16740,136 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    mod process_transport {
+        use super::super::*;
+        use blit_remote::process::{
+            FEATURE_PROCESS, PROCESS_EXIT_RETURNED, ProcessCommand, ProcessEvent, S2C_PROCESS_EXIT,
+            S2C_PROCESS_STARTED,
+        };
+        use blit_remote::{S2C_HELLO, S2C_READY, STATUS_OK};
+        use tokio::time::timeout;
+
+        fn test_state(process_server: process::Server) -> AppState {
+            Arc::new(AppStateInner {
+                config: Config {
+                    shell: "/bin/sh".into(),
+                    shell_flags: String::new(),
+                    scrollback: 100,
+                    ipc_path: String::new(),
+                    surface_encoders: Vec::new(),
+                    surface_encoding: SurfaceEncoding::default(),
+                    chroma: ChromaSubsampling::default(),
+                    vaapi_device: String::new(),
+                    fd_channel: None,
+                    verbose: false,
+                    processes: true,
+                    max_connections: 0,
+                    max_ptys: 0,
+                    ping_interval: Duration::ZERO,
+                    skip_compositor: true,
+                    export_sock: false,
+                    inject_path: false,
+                    allow_forward: Vec::new(),
+                    allow_forward_insecure: false,
+                },
+                process_server,
+                boot_generation: 1,
+                session: Mutex::new(Session::new()),
+                pty_fds: Arc::new(std::sync::RwLock::new(FxHashMap::default())),
+                delivery_notify: Arc::new(Notify::new()),
+                shutdown_notify: Arc::new(Notify::new()),
+                supervisor_notify: Arc::new(Notify::new()),
+                active_connections: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        async fn next_frame(reader: &mut tokio::io::DuplexStream) -> Vec<u8> {
+            timeout(Duration::from_secs(5), read_frame(reader))
+                .await
+                .expect("server frame timed out")
+                .expect("server closed the connection")
+        }
+
+        #[tokio::test]
+        async fn process_family_runs_through_framed_connection() {
+            let process_server = process::Server::new(false, true);
+            let state = test_state(process_server.clone());
+            let (mut client, server_stream) = tokio::io::duplex(1024 * 1024);
+            let connection = tokio::spawn(handle_client(server_stream, state));
+
+            let mut advertised = false;
+            loop {
+                let frame = next_frame(&mut client).await;
+                match frame.first().copied() {
+                    Some(S2C_HELLO) => {
+                        let features = u32::from_le_bytes(frame[3..7].try_into().unwrap());
+                        advertised = features & FEATURE_PROCESS != 0;
+                    }
+                    Some(S2C_READY) => break,
+                    _ => {}
+                }
+            }
+            assert!(advertised);
+
+            let spawn = ProcessCommand::new(b"/bin/sh".to_vec())
+                .arg(b"-c".to_vec())
+                .arg(b"printf 'out\\001'; printf 'err\\002' >&2; exit 7".to_vec())
+                .spawn_packet(41, 73)
+                .unwrap();
+            assert!(write_frame(&mut client, &spawn).await);
+
+            let mut child = None;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let exit = loop {
+                let frame = next_frame(&mut client).await;
+                match frame.first().copied() {
+                    Some(S2C_PROCESS_STARTED) => {
+                        let started = blit_remote::process::parse_process_started(&frame).unwrap();
+                        assert_eq!(
+                            (started.nonce, started.process_id, started.status),
+                            (41, 73, STATUS_OK)
+                        );
+                        child = Some(
+                            blit_remote::process::ProcessChild::from_started(started).unwrap(),
+                        );
+                    }
+                    Some(S2C_PROCESS_EXIT) => {
+                        let event = child.as_mut().unwrap().decode_event(&frame).unwrap();
+                        let ProcessEvent::Exit(exit) = event else {
+                            unreachable!();
+                        };
+                        break exit;
+                    }
+                    Some(blit_remote::process::S2C_PROCESS_STDOUT)
+                    | Some(blit_remote::process::S2C_PROCESS_STDERR) => {
+                        let child = child.as_mut().expect("STARTED precedes output");
+                        let event = child.decode_event(&frame).unwrap();
+                        match &event {
+                            ProcessEvent::Stdout { data, .. } => stdout.extend_from_slice(data),
+                            ProcessEvent::Stderr { data, .. } => stderr.extend_from_slice(data),
+                            _ => unreachable!(),
+                        }
+                        let ack = child.acknowledge(&event).unwrap();
+                        assert!(write_frame(&mut client, &ack).await);
+                    }
+                    _ => {}
+                }
+            };
+
+            assert_eq!(stdout, b"out\x01");
+            assert_eq!(stderr, b"err\x02");
+            assert_eq!((exit.reason, exit.code), (PROCESS_EXIT_RETURNED, 7));
+
+            drop(client);
+            timeout(Duration::from_secs(5), connection)
+                .await
+                .expect("connection cleanup timed out")
+                .unwrap();
+            process_server.shutdown().await;
+        }
+    }
 
     mod bulk_fragmentation {
         use super::super::{
@@ -16545,6 +16917,76 @@ mod tests {
             }
             state.observe(BULK, BULK_FRAGMENT_RECOVERY);
             assert_eq!(state.chunk_bytes(), None);
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    mod process_writer_scheduling {
+        use super::super::*;
+
+        #[tokio::test]
+        async fn continuously_ready_bulk_queues_alternate() {
+            let server = process::Server::new(false, true);
+            let (max_frames, max_bytes) = server.outbox_limits();
+            let (process_tx, mut process_rx) = mpsc::channel(max_frames);
+            let (kick_tx, _kick_rx) = mpsc::unbounded_channel();
+            let manager =
+                server.endpoint(process::OutboundSender::new(process_tx, max_bytes, kick_tx));
+            let (ordinary_tx, mut ordinary_rx) = mpsc::unbounded_channel();
+            for byte in 0..3 {
+                manager.send(vec![byte]);
+                ordinary_tx.send(vec![byte + 10]).unwrap();
+            }
+
+            let mut prefer_process = true;
+            for expected_process in [true, false, true, false, true, false] {
+                let message =
+                    next_connection_bulk(&mut process_rx, &mut ordinary_rx, prefer_process)
+                        .await
+                        .expect("a queued bulk frame");
+                let was_process = match message {
+                    ConnectionBulk::Ordinary(_) => false,
+                    ConnectionBulk::Process(message) => {
+                        drop(message);
+                        true
+                    }
+                };
+                assert_eq!(was_process, expected_process);
+                prefer_process = !was_process;
+            }
+        }
+
+        #[tokio::test]
+        async fn forced_fragmentation_preserves_process_payload_and_audio() {
+            let (mut client, mut writer) = tokio::io::duplex(1024);
+            let (audio_tx, mut audio_rx) = mpsc::unbounded_channel();
+            let audio = vec![0xA0, 0xA1];
+            audio_tx.send(audio.clone()).unwrap();
+            let payload = (0u8..10).collect::<Vec<_>>();
+            let outbound_bytes = AtomicU64::new(0);
+
+            assert!(
+                write_frame_interleaved(
+                    &mut writer,
+                    &payload,
+                    &mut audio_rx,
+                    Some(4),
+                    &outbound_bytes,
+                )
+                .await
+            );
+            assert_eq!(read_frame(&mut client).await.unwrap(), audio);
+
+            let mut reassembled = Vec::new();
+            loop {
+                let fragment = read_frame(&mut client).await.unwrap();
+                assert_eq!(fragment[0], blit_remote::S2C_FRAGMENT);
+                reassembled.extend_from_slice(&fragment[2..]);
+                if fragment[1] & blit_remote::FRAGMENT_FLAG_LAST != 0 {
+                    break;
+                }
+            }
+            assert_eq!(reassembled, payload);
         }
     }
 
@@ -24210,6 +24652,144 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn disabled_process_family_refuses_correlated_requests() {
+        use blit_remote::process::*;
+
+        let (out, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let spawn = msg_process_spawn(&ProcessSpawnRequest {
+            nonce: 1,
+            process_id: 2,
+            flags: 0,
+            cwd_kind: PROCESS_CWD_DEFAULT,
+            src_pty_id: 0,
+            cwd: b"",
+            argv: vec![b"true"],
+            env: vec![],
+        })
+        .unwrap();
+        refuse_process_message(&spawn, |reply| {
+            let _ = out.send(reply);
+        });
+        let reply = rx.try_recv().expect("spawn reply");
+        let started = parse_process_started(&reply).unwrap();
+        assert_eq!(
+            (started.nonce, started.process_id, started.status),
+            (1, 2, blit_remote::STATUS_PERMISSION)
+        );
+        assert_eq!(started.process_ref, 0);
+        assert_eq!(
+            (
+                started.stdin_window,
+                started.stdout_window,
+                started.stderr_window
+            ),
+            (0, 0, 0)
+        );
+
+        let control = msg_process_control(ProcessControl {
+            nonce: 3,
+            process_id: 2,
+            action: PROCESS_CONTROL_KILL,
+            value: 0,
+        })
+        .unwrap();
+        refuse_process_message(&control, |reply| {
+            let _ = out.send(reply);
+        });
+        let reply = rx.try_recv().expect("control reply");
+        let controlled = parse_process_controlled(&reply).unwrap();
+        assert_eq!(
+            (controlled.nonce, controlled.process_id, controlled.status),
+            (3, 2, blit_remote::STATUS_PERMISSION)
+        );
+
+        let list = msg_process_list(ProcessList { nonce: 4 });
+        refuse_process_message(&list, |reply| {
+            let _ = out.send(reply);
+        });
+        let reply = rx.try_recv().expect("list reply");
+        let listed = parse_process_listed(&reply).unwrap();
+        assert_eq!(
+            (listed.nonce, listed.status, listed.revision),
+            (4, blit_remote::STATUS_PERMISSION, 0)
+        );
+        assert!(listed.entries.is_empty());
+
+        let watch = msg_process_watch(ProcessWatch {
+            nonce: 4,
+            process_id: 5,
+            process_ref: 9,
+            flags: 0,
+        })
+        .unwrap();
+        refuse_process_message(&watch, |reply| {
+            let _ = out.send(reply);
+        });
+        let reply = rx.try_recv().expect("watch reply");
+        let watched = parse_process_watched(&reply).unwrap();
+        assert_eq!(
+            (
+                watched.nonce,
+                watched.process_id,
+                watched.process_ref,
+                watched.status
+            ),
+            (4, 5, 9, blit_remote::STATUS_PERMISSION)
+        );
+        assert_eq!((watched.state, watched.stream_state), (0, 0));
+
+        let mut invalid_watch = vec![C2S_PROCESS_WATCH];
+        invalid_watch.extend_from_slice(&6u16.to_le_bytes());
+        invalid_watch.extend_from_slice(&7u32.to_le_bytes());
+        invalid_watch.extend_from_slice(&0u64.to_le_bytes());
+        refuse_process_message(&invalid_watch, |reply| {
+            let _ = out.send(reply);
+        });
+        let reply = rx.try_recv().expect("invalid watch reply");
+        let watched = parse_process_watched(&reply).unwrap();
+        assert_eq!(
+            (
+                watched.nonce,
+                watched.process_id,
+                watched.process_ref,
+                watched.status
+            ),
+            (6, 7, 0, STATUS_INVALID)
+        );
+
+        // A structurally invalid correlated request is INVALID, not a
+        // misleading policy refusal.
+        let mut invalid_spawn = spawn;
+        invalid_spawn[7] = 0x80;
+        refuse_process_message(&invalid_spawn, |reply| {
+            let _ = out.send(reply);
+        });
+        let reply = rx.try_recv().expect("invalid reply");
+        let started = parse_process_started(&reply).unwrap();
+        assert_eq!(started.status, STATUS_INVALID);
+
+        let stdin = msg_process_stdin(ProcessStdin {
+            process_id: 2,
+            offset: 0,
+            data: b"x",
+        })
+        .unwrap();
+        refuse_process_message(&stdin, |reply| {
+            let _ = out.send(reply);
+        });
+        let ack = msg_process_output_ack(ProcessOutputAck {
+            process_id: 2,
+            stream: PROCESS_STREAM_STDOUT,
+            bytes: 0,
+        })
+        .unwrap();
+        refuse_process_message(&ack, |reply| {
+            let _ = out.send(reply);
+        });
+        assert!(rx.try_recv().is_err(), "stream operations have no reply");
     }
 
     /// With the family disabled, every nonce-bearing LSP request still gets
