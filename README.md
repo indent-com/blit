@@ -261,8 +261,11 @@ Without any of the above, the compositor falls back to CPU rendering and softwar
 | `libpipewire-0.3.so.0` | `pipewire` or `libpipewire-0.3-0` | Monitor capture (in-process, loaded via `dlopen`) |
 | `dbus-daemon`          | `dbus`                            | Private desktop and PipeWire D-Bus sessions       |
 | `wireplumber`          | `wireplumber`                     | Session manager (optional, started if available)  |
+| `xwayland-satellite`   | `xwayland-satellite`              | X11 applications (optional, started if available) |
 
 Audio is disabled automatically when PipeWire is not installed or `libpipewire-0.3.so.0` is not resolvable via `ld.so` (set `LD_LIBRARY_PATH` if you have it in a non-default location), or explicitly with `BLIT_AUDIO=0`.
+
+X11 applications run through `xwayland-satellite`, which blit starts once per session when the binary is on `PATH` and exports the resulting `DISPLAY` to every terminal. Wayland stays the first choice for anything that speaks it; X11 is the fallback behind it. Without the binary, sessions are Wayland-only and no `DISPLAY` is exported. Set `BLIT_XWAYLAND=0` to opt out.
 
 ## How it compares
 

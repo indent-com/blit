@@ -132,7 +132,7 @@ mod stub {
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, PartialEq, Eq)]
     pub enum CursorImage {
         Named(String),
         Custom {
@@ -405,6 +405,9 @@ mod stub {
             surface_id: u32,
             target_w: u32,
             target_h: u32,
+        },
+        SetXwaylandPid {
+            pid: u32,
         },
         /// Update the advertised output refresh rate (millihertz).
         SetRefreshRate {

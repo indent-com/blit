@@ -12,6 +12,7 @@ use crate::{AppState, PTY_CHANNEL_CAPACITY, PtyInput};
 /// not async-signal-safe).
 fn build_child_env(
     wayland_display: Option<&str>,
+    x_display: Option<&str>,
     desktop_bus: Option<&str>,
     pulse_server: Option<&str>,
     pipewire_remote: Option<&str>,
@@ -83,9 +84,15 @@ fn build_child_env(
             .map(|n| n.to_string_lossy())
             .unwrap_or_else(|| wd.into());
         set(&mut env, "WAYLAND_DISPLAY", &wd_name);
-        set(&mut env, "NIXOS_OZONE_WL", "1");
-        set(&mut env, "XDG_SESSION_TYPE", "wayland");
-        // DISPLAY was already filtered out above.
+        // The inherited DISPLAY was filtered out above: it belongs to the
+        // host's session, not this one.  A toolkit left to choose for itself
+        // picks X11 and comes up with no window at all, so a GUI app typed
+        // at this shell gets the same steer the compositor gives the ones it
+        // spawns itself — and this session's own DISPLAY when an X11 bridge
+        // is running to answer it.
+        for (key, value) in crate::app_env::toolkit_env(x_display) {
+            set(&mut env, key, &value);
+        }
     }
     // The inherited address was filtered out above: both the server's audio
     // bus and the host desktop bus belong to a different environment. The
@@ -648,6 +655,7 @@ pub fn spawn_pty(
     scrollback: usize,
     state: AppState,
     wayland_display: Option<&str>,
+    x_display: Option<&str>,
     desktop_bus: Option<&str>,
     pulse_server: Option<&str>,
     pipewire_remote: Option<&str>,
@@ -684,6 +692,7 @@ pub fn spawn_pty(
     let path_dir = state.config.inject_path.then(exe_dir).flatten();
     let child_env = build_child_env(
         wayland_display,
+        x_display,
         desktop_bus,
         pulse_server,
         pipewire_remote,
@@ -854,6 +863,7 @@ pub fn respawn_child(
     dir: Option<&str>,
     state: AppState,
     wayland_display: Option<&str>,
+    x_display: Option<&str>,
     desktop_bus: Option<&str>,
     pulse_server: Option<&str>,
     pipewire_remote: Option<&str>,
@@ -892,6 +902,7 @@ pub fn respawn_child(
     let path_dir = state.config.inject_path.then(exe_dir).flatten();
     let child_env = build_child_env(
         wayland_display,
+        x_display,
         desktop_bus,
         pulse_server,
         pipewire_remote,
@@ -1324,6 +1335,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ));
 
         assert_eq!(
@@ -1339,6 +1351,56 @@ mod tests {
             env.get("XDG_SESSION_TYPE").map(String::as_str),
             Some("wayland"),
         );
+        // No XWayland stands behind the DISPLAY we drop, so every toolkit a
+        // shell might launch has to be aimed at Wayland explicitly.
+        assert_eq!(
+            env.get("QT_QPA_PLATFORM").map(String::as_str),
+            Some("wayland"),
+        );
+        assert_eq!(env.get("GDK_BACKEND").map(String::as_str), Some("wayland"),);
+        assert_eq!(env.get("MOZ_ENABLE_WAYLAND").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.get("ELECTRON_OZONE_PLATFORM_HINT").map(String::as_str),
+            Some("wayland"),
+        );
+        assert_eq!(
+            env.get("SDL_VIDEODRIVER").map(String::as_str),
+            Some("wayland"),
+        );
+        assert!(!env.contains_key("DISPLAY"));
+    }
+
+    /// The host's DISPLAY is filtered out unconditionally; only a bridge in
+    /// this session puts one back, and an X11 app started from a shell needs
+    /// it to run at all.
+    #[test]
+    fn child_env_exports_display_only_for_a_bridged_session() {
+        let env = child_env_map(build_child_env(
+            Some("/tmp/blit-test/wayland-7"),
+            Some(":20"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(env.get("DISPLAY").map(String::as_str), Some(":20"));
+        assert_eq!(
+            env.get("GDK_BACKEND").map(String::as_str),
+            Some("wayland,x11")
+        );
+
+        // No compositor, no session to point at: DISPLAY stays gone even
+        // when the host had one.
+        let env = child_env_map(build_child_env(
+            None,
+            Some(":20"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
         assert!(!env.contains_key("DISPLAY"));
     }
 
@@ -1351,11 +1413,13 @@ mod tests {
             None,
             None,
             None,
+            None,
         ));
         assert!(!env.contains_key("DBUS_SESSION_BUS_ADDRESS"));
 
         let env = child_env_map(build_child_env(
             Some("/tmp/blit-test/wayland-7"),
+            None,
             Some("unix:path=/tmp/blit-test/desktop-bus"),
             None,
             None,
@@ -1370,10 +1434,11 @@ mod tests {
 
     #[test]
     fn child_env_exports_blit_sock_only_when_requested() {
-        let env = child_env_map(build_child_env(None, None, None, None, None, None));
+        let env = child_env_map(build_child_env(None, None, None, None, None, None, None));
         assert!(!env.contains_key("BLIT_SOCK"));
 
         let env = child_env_map(build_child_env(
+            None,
             None,
             None,
             None,
@@ -1391,13 +1456,14 @@ mod tests {
     fn child_env_appends_the_binary_dir_to_path_only_when_requested() {
         let inherited = std::env::var("PATH").unwrap_or_default();
 
-        let env = child_env_map(build_child_env(None, None, None, None, None, None));
+        let env = child_env_map(build_child_env(None, None, None, None, None, None, None));
         assert_eq!(
             env.get("PATH").map(String::as_str),
             Some(inherited.as_str())
         );
 
         let env = child_env_map(build_child_env(
+            None,
             None,
             None,
             None,
@@ -1416,7 +1482,15 @@ mod tests {
         let inherited = std::env::var("PATH").unwrap_or_default();
         let already = inherited.split(':').next_back().unwrap_or_default();
 
-        let env = child_env_map(build_child_env(None, None, None, None, None, Some(already)));
+        let env = child_env_map(build_child_env(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(already),
+        ));
         assert_eq!(
             env.get("PATH").map(String::as_str),
             Some(inherited.as_str())

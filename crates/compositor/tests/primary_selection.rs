@@ -21,14 +21,17 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
 
-use wayland_client::protocol::{wl_registry, wl_seat};
+use wayland_client::protocol::{wl_compositor, wl_registry, wl_seat, wl_surface};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noop};
 use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_manager_v1 as pdm, zwp_primary_selection_device_v1 as pdev,
     zwp_primary_selection_offer_v1 as poffer, zwp_primary_selection_source_v1 as psrc,
 };
+use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
-use blit_compositor::{CompositorHandle, spawn_compositor_without_renderer};
+use blit_compositor::{
+    CompositorCommand, CompositorEvent, CompositorHandle, spawn_compositor_without_renderer,
+};
 
 const TEXT: &str = "selected in one app";
 const MIME: &str = "text/plain;charset=utf-8";
@@ -37,6 +40,8 @@ const MIME: &str = "text/plain;charset=utf-8";
 struct App {
     mgr: Option<pdm::ZwpPrimarySelectionDeviceManagerV1>,
     seat: Option<wl_seat::WlSeat>,
+    compositor: Option<wl_compositor::WlCompositor>,
+    wm_base: Option<xdg_wm_base::XdgWmBase>,
     /// MIME types advertised on the most recent offer, in arrival order.
     offered: Vec<String>,
     /// The offer the compositor last named as the selection, and whether it
@@ -73,6 +78,14 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
             }
             "wl_seat" => {
                 state.seat = Some(registry.bind::<wl_seat::WlSeat, _, _>(name, 7, qh, ()));
+            }
+            "wl_compositor" => {
+                state.compositor =
+                    Some(registry.bind::<wl_compositor::WlCompositor, _, _>(name, 4, qh, ()));
+            }
+            "xdg_wm_base" => {
+                state.wm_base =
+                    Some(registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 1, qh, ()));
             }
             _ => {}
         }
@@ -143,7 +156,40 @@ impl Dispatch<psrc::ZwpPrimarySelectionSourceV1, ()> for App {
     }
 }
 
+impl Dispatch<xdg_wm_base::XdgWmBase, ()> for App {
+    fn event(
+        _: &mut Self,
+        wm_base: &xdg_wm_base::XdgWmBase,
+        event: xdg_wm_base::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_wm_base::Event::Ping { serial } = event {
+            wm_base.pong(serial);
+        }
+    }
+}
+
+impl Dispatch<xdg_surface::XdgSurface, ()> for App {
+    fn event(
+        _: &mut Self,
+        xdg_surface: &xdg_surface::XdgSurface,
+        event: xdg_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_surface::Event::Configure { serial } = event {
+            xdg_surface.ack_configure(serial);
+        }
+    }
+}
+
 delegate_noop!(App: ignore wl_seat::WlSeat);
+delegate_noop!(App: ignore wl_compositor::WlCompositor);
+delegate_noop!(App: ignore wl_surface::WlSurface);
+delegate_noop!(App: ignore xdg_toplevel::XdgToplevel);
 delegate_noop!(App: ignore pdm::ZwpPrimarySelectionDeviceManagerV1);
 
 /// One client: its own connection, queue and primary-selection device.
@@ -155,6 +201,12 @@ struct Client {
     mgr: pdm::ZwpPrimarySelectionDeviceManagerV1,
     seat: wl_seat::WlSeat,
     device: Option<pdev::ZwpPrimarySelectionDeviceV1>,
+    /// Kept alive so a mapped toplevel stays mapped; never read.
+    mapped: Option<(
+        wl_surface::WlSurface,
+        xdg_surface::XdgSurface,
+        xdg_toplevel::XdgToplevel,
+    )>,
 }
 
 impl Client {
@@ -182,12 +234,29 @@ impl Client {
             mgr,
             seat,
             device: None,
+            mapped: None,
         }
     }
 
     fn get_device(&mut self) {
         let device = self.mgr.get_device(&self.seat, &self.qh, ());
         self.device = Some(device);
+        self.settle();
+    }
+
+    /// Map a toplevel, so this client is something focus can be handed to.
+    fn map_toplevel(&mut self) {
+        let compositor = self
+            .app
+            .compositor
+            .clone()
+            .expect("wl_compositor advertised");
+        let wm_base = self.app.wm_base.clone().expect("xdg_wm_base advertised");
+        let surface = compositor.create_surface(&self.qh, ());
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &self.qh, ());
+        let toplevel = xdg_surface.get_toplevel(&self.qh, ());
+        surface.commit();
+        self.mapped = Some((surface, xdg_surface, toplevel));
         self.settle();
     }
 
@@ -242,6 +311,30 @@ impl Fixture {
     fn client(&self) -> Client {
         Client::connect(&self.socket)
     }
+
+    /// Map a toplevel for `client` and hand it keyboard focus -- the moment
+    /// the protocol names for delivering a selection.
+    fn focus(&self, client: &mut Client) {
+        client.map_toplevel();
+        let handle = self.handle.as_ref().expect("compositor running");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let surface_id = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the toplevel never reached the compositor"
+            );
+            match handle.event_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(CompositorEvent::SurfaceCreated { surface_id, .. }) => break surface_id,
+                _ => continue,
+            }
+        };
+        handle
+            .command_tx
+            .send(CompositorCommand::SurfaceFocus { surface_id })
+            .expect("send focus");
+        handle.wake();
+        client.settle();
+    }
 }
 
 /// Ask `paster`'s current offer for `MIME` and read what the *owner* writes.
@@ -294,20 +387,29 @@ fn a_selection_reaches_the_other_client() {
 }
 
 #[test]
-fn a_client_that_binds_late_still_gets_the_selection() {
+fn a_client_that_binds_late_gets_the_selection_when_it_takes_focus() {
     let fx = Fixture::new();
     let mut owner = fx.client();
     owner.get_device();
     owner.own_selection(TEXT);
 
-    // Nothing re-offers on focus, so a client starting after the copy would
-    // otherwise never learn a selection exists.
+    // A client starting after the copy has to learn the selection exists,
+    // but not before it can survive hearing about it: Qt binds its device
+    // from inside the platform-integration constructor and dereferences the
+    // integration pointer that constructor has not returned yet, so an
+    // answer at bind time segfaults the app before it draws (Zoom).  Focus
+    // is both the protocol's cue and the first safe one.
     let mut paster = fx.client();
     paster.get_device();
+    assert!(
+        paster.app.selection.is_none(),
+        "binding a device must not answer with a selection"
+    );
 
+    fx.focus(&mut paster);
     assert!(
         paster.app.selection.is_some(),
-        "binding a device should surface the standing selection"
+        "taking keyboard focus should surface the standing selection"
     );
     assert_eq!(paste(&mut paster, &mut owner), TEXT.as_bytes());
 }

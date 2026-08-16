@@ -90,6 +90,33 @@ in
       '';
     };
 
+    x11 = {
+      enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Run X11 applications in blit sessions, through
+          <literal>xwayland-satellite</literal>. blit's compositor speaks
+          Wayland only, so without a bridge an X11-only application does not
+          fall back — it fails to start, and a toolkit that can do both is
+          told to use Wayland.
+
+          The bridge is started per session only when its binary is on the
+          server's PATH, which is what this option arranges; the server
+          itself never requires it. Turning this off (or setting
+          <option>BLIT_XWAYLAND=0</option>) keeps Xwayland out of the
+          closure and leaves sessions Wayland-only.
+        '';
+      };
+
+      package = mkOption {
+        type = types.package;
+        default = pkgs.xwayland-satellite;
+        defaultText = "pkgs.xwayland-satellite";
+        description = "The X11 bridge to put on the server's PATH.";
+      };
+    };
+
     audio = {
       enable = mkEnableOption "audio forwarding (PipeWire capture + Opus)";
 
@@ -343,6 +370,9 @@ in
               # go on PATH directly — listing the package would add an empty
               # bin/ and the frontend would silently never start.
               ++ lib.optional pkgs.stdenv.isLinux "${pkgs.xdg-desktop-portal}/libexec"
+              # Spawned by name, once per session, and only if it is here:
+              # see crates/server/src/xwayland.rs.
+              ++ lib.optional (pkgs.stdenv.isLinux && cfg.x11.enable) cfg.x11.package
               ++ cfg.languageServers;
             serviceConfig = {
               Type = "notify";

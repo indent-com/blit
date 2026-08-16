@@ -41,6 +41,7 @@
 | `BLIT_ENABLE_EXTERNAL_MEMORY_HOST`    | unset                                              | Force experimental direct `wl_shm` host import when Vulkan supports it                 |
 | `BLIT_DISABLE_EXTERNAL_MEMORY_HOST`   | unset                                              | Disable automatic direct `wl_shm` host import                                          |
 | `BLIT_DESKTOP`                        | `1` on Linux                                       | `0` disables the private-bus tray/notification services and feature bit                |
+| `BLIT_XWAYLAND`                       | `1` on Linux                                       | `0` disables the X11 bridge even when `xwayland-satellite` is installed                |
 | `BLIT_NOTIFICATION_TIMEOUT_MS`        | `10000`                                            | Default low/normal notification timeout when the application requests `-1`             |
 | `BLIT_NOTIFICATION_TIMEOUT_MIN_MS`    | `1000`                                             | Lower clamp for positive application notification timeouts                             |
 | `BLIT_NOTIFICATION_TIMEOUT_MAX_MS`    | `86400000`                                         | Upper clamp for positive application notification timeouts                             |
@@ -361,6 +362,14 @@ software H.264 encode is now cheaper and slightly softer than before.
 - **Screenshots**: `blit surface capture <surface_id>` uses the Vulkan renderer to composite the surface tree and reads back RGBA pixels. Output format: PNG or AVIF, inferred from file extension.
 
 Chrome/Electron work with `--ozone-platform=wayland`. mpv works with `--vo=gpu-next` (Vulkan WSI submits DMA-BUFs via `zwp_linux_dmabuf`).
+
+### X11 applications
+
+The compositor speaks Wayland only. X11 clients reach it through `xwayland-satellite` (`crates/server/src/xwayland.rs`), which the server starts once per session — before the private D-Bus session and before any PTY, because both export `DISPLAY` when they spawn. It runs only when the binary is on `PATH`; without it, sessions are Wayland-only, no `DISPLAY` is exported, and nothing else changes. `BLIT_XWAYLAND=0` opts out.
+
+The display number is chosen by the server, not the bridge: `/tmp/.X11-unix` is shared with the whole machine, so a free number is claimed from `:20` upwards and the next candidate is tried if the bridge exits immediately (two blit servers on one host race for it). Apps get `DISPLAY` plus ordered toolkit preferences (`GDK_BACKEND=wayland,x11`, `QT_QPA_PLATFORM=wayland;xcb`, `SDL_VIDEODRIVER=wayland,x11`) — Wayland stays first for anything that can speak it, and X11 is the fallback behind it rather than the destination.
+
+Every X window in the session arrives on the bridge's single Wayland connection, which makes it the one client that must not get blit's usual screen-per-toplevel: the bridge turns each `wl_output` into an X monitor, and a monitor per window is not a desktop X clients can reason about. The server tells the compositor the bridge's pid (`CompositorCommand::SetXwaylandPid`), the compositor matches it against the peer credentials of each connection — walking up `/proc`, since Xwayland connects on its own behalf as a child of the bridge — and gives that client one screen, sized to its largest window and never smaller than the default. X clients clamp themselves to the screen they are on, so a screen smaller than the pane would stop an app filling it.
 
 ## Camera media input
 

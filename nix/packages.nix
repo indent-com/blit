@@ -722,6 +722,10 @@
           pkgs.dbus
           pkgs.pipewire
           pkgs.wireplumber
+          # The X11 bridge a session starts by name when it is present
+          # (crates/server/src/xwayland.rs); without it a dev server is
+          # Wayland-only, which is a different thing to be testing.
+          pkgs.xwayland-satellite
           pkgs.llvmPackages.libclang
           pkgs.x264
         ];

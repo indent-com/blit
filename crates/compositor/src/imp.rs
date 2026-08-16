@@ -560,7 +560,7 @@ impl PixelData {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CursorImage {
     Named(String),
     Custom {
@@ -913,6 +913,14 @@ pub enum CompositorCommand {
         target_h: u32,
         native_w: u32,
         native_h: u32,
+    },
+    /// The pid of the `xwayland-satellite` the server started.
+    ///
+    /// Its connection carries every X11 window in the session, so the
+    /// compositor gives it one screen for all of them instead of the usual
+    /// screen per window.
+    SetXwaylandPid {
+        pid: u32,
     },
     /// Tear down the BGRA downscale target previously registered for
     /// `(surface_id, target_w, target_h)`.  No-op when none exists.
@@ -2121,6 +2129,18 @@ struct Compositor {
     /// Source of slot ids.  Never reused, so a stale `SurfaceOutput` can
     /// never be mistaken for a live screen.
     next_output_slot: u32,
+    /// The `xwayland-satellite` the server started, when it did.
+    ///
+    /// Every X11 window in the session arrives on this one client's
+    /// connection, so it is the one client that must *not* be given a screen
+    /// per window: the bridge turns each `wl_output` into an X monitor, and
+    /// a monitor per window is not a desktop any X client can reason about.
+    xwayland_pid: Option<u32>,
+    /// Peer pid of every connected client, so a bridge that connects before
+    /// the server has told us its pid is still recognised afterwards.
+    client_pids: FxHashMap<ClientId, u32>,
+    /// Clients resolved to belong to the bridge's process tree.
+    xwayland_clients: FxHashSet<ClientId>,
     seats: Vec<WlSeat>,
     keyboards: Vec<WlKeyboard>,
     pointers: Vec<WlPointer>,
@@ -2321,6 +2341,9 @@ struct Compositor {
     /// GPU-composited — they're sent as cursor image events.  Updated
     /// at cursor surface commit time.
     cursor_rgba: FxHashMap<ObjectId, (u32, u32, Vec<u8>)>,
+    /// The last cursor announced per target surface, so artwork a viewer is
+    /// already drawing is not sent again on every cursor-surface commit.
+    last_cursor: FxHashMap<u16, CursorImage>,
 }
 
 /// Scan for a free surface id starting at `from`, wrapping past `u16::MAX`
@@ -2564,6 +2587,10 @@ impl Compositor {
 
     /// `wl_keyboard.enter` (and the text-input equivalent) for `wl`.
     fn send_keyboard_enter(&mut self, wl: &WlSurface) {
+        // Both selections are delivered "immediately before receiving
+        // keyboard focus", which is the only moment the protocol names —
+        // so they go out ahead of the `enter` below, not at bind time.
+        self.offer_selections_to_client(wl);
         let serial = self.next_serial();
         for kb in &self.keyboards {
             if same_client(kb, wl) {
@@ -3147,15 +3174,107 @@ impl Compositor {
             .unwrap_or((self.output_width, self.output_height))
     }
 
+    /// Record a client's peer pid, and whether it is the X11 bridge.
+    fn note_client_pid(&mut self, client: ClientId, pid: u32) {
+        self.client_pids.insert(client.clone(), pid);
+        if self.descends_from_xwayland(pid) {
+            self.xwayland_clients.insert(client);
+        }
+    }
+
+    /// Whether `pid` is the bridge or one of its children.
+    ///
+    /// `xwayland-satellite` connects on its own behalf, but Xwayland is its
+    /// child and connects too, so the pid the server started is not always
+    /// the pid on the other end of the socket.
+    fn descends_from_xwayland(&self, pid: u32) -> bool {
+        let Some(target) = self.xwayland_pid else {
+            return false;
+        };
+        let mut pid = pid;
+        // The bridge sits one or two levels above its connections; the bound
+        // walk is only here so a pid cycle cannot hang the event loop.
+        for _ in 0..8 {
+            if pid == target {
+                return true;
+            }
+            match parent_pid(pid) {
+                Some(parent) if parent > 1 => pid = parent,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// The client a toplevel belongs to, while it is still connected.
+    fn surface_owner(&self, surface_id: u16) -> Option<ClientId> {
+        let root = self.toplevel_surface_ids.get(&surface_id)?;
+        let surf = self.surfaces.get(root)?;
+        Some(surf.wl_surface.client()?.id())
+    }
+
+    /// Whether this client is the X11 bridge, whose screens are shared by
+    /// every X window rather than owned one apiece.
+    fn is_xwayland(&self, owner: &ClientId) -> bool {
+        self.xwayland_clients.contains(owner)
+    }
+
+    /// The single screen offered to the X11 bridge: large enough to hold
+    /// every X window blit has sized, and never smaller than the default.
+    ///
+    /// X clients clamp themselves to the screen they are on, so a screen
+    /// smaller than the pane would stop an X app filling it.  Growing the
+    /// screen to the largest window is ordinary RandR resize from the X
+    /// side, where publishing a second monitor per window is not.
+    fn xwayland_screen(&self, owner: &ClientId) -> (i32, i32, i32) {
+        let (mut w, mut h, mut s120) = (self.output_width, self.output_height, 120u16);
+        for &sid in self.toplevel_surface_ids.keys() {
+            if self.surface_owner(sid).as_ref() != Some(owner) {
+                continue;
+            }
+            let (lw, lh) = self.surface_logical_size(sid);
+            w = w.max(lw);
+            h = h.max(lh);
+            s120 = s120.max(self.surface_scale_120(sid));
+        }
+        (w, h, s120 as i32)
+    }
+
+    /// The screen a surface is on: the bridge's shared one when its client
+    /// is the bridge, otherwise the one this very toplevel claimed.
+    fn slot_for_surface(&self, surface_id: u16, owner: &ClientId) -> Option<u32> {
+        if self.is_xwayland(owner) {
+            return self
+                .output_slots
+                .iter()
+                .find(|(_, s)| s.owner == *owner)
+                .map(|(&slot, _)| slot);
+        }
+        self.output_slots
+            .iter()
+            .find(|(_, s)| s.surface_id == Some(surface_id))
+            .map(|(&slot, _)| slot)
+    }
+
     /// Send an output's mode and scale.  `wl_output.scale` is integer-only,
     /// so a client that does not bind `wp_fractional_scale_v1` sees the
     /// ceiling of the real scale and draws slightly large rather than
     /// slightly small — the same trade every compositor makes.
-    fn send_output_properties(&self, output: &WlOutput, surface_id: Option<u16>) {
-        let s120 = surface_id.map_or(120, |sid| self.surface_scale_120(sid)) as i32;
-        let (lw, lh) = surface_id.map_or((self.output_width, self.output_height), |sid| {
-            self.surface_logical_size(sid)
-        });
+    fn send_output_properties(&self, output: &WlOutput, slot: u32) {
+        let Some(s) = self.output_slots.get(&slot) else {
+            return;
+        };
+        let (lw, lh, s120) = if self.is_xwayland(&s.owner) {
+            self.xwayland_screen(&s.owner)
+        } else {
+            match s.surface_id {
+                Some(sid) => {
+                    let (lw, lh) = self.surface_logical_size(sid);
+                    (lw, lh, self.surface_scale_120(sid) as i32)
+                }
+                None => (self.output_width, self.output_height, 120),
+            }
+        };
         output.mode(
             wl_output::Mode::Current | wl_output::Mode::Preferred,
             lw * s120 / 120,
@@ -3223,6 +3342,16 @@ impl Compositor {
     /// handing it a *second* screen at map time would leave the first — the
     /// one it is still reasoning about — describing nothing.
     fn claim_output_for_surface(&mut self, surface_id: u16, owner: ClientId) {
+        // The X11 bridge keeps the one screen it was offered on connect: its
+        // windows share a desktop, so they share a screen.  Claiming one
+        // apiece would publish an X monitor per window.
+        if self.is_xwayland(&owner) {
+            self.ensure_client_output(owner.clone());
+            if let Some(slot) = self.slot_for_surface(surface_id, &owner) {
+                self.announce_slot(slot);
+            }
+            return;
+        }
         if self
             .output_slots
             .values()
@@ -3263,6 +3392,17 @@ impl Compositor {
             .find(|(_, s)| s.surface_id == Some(surface_id))
             .map(|(&slot, _)| slot)
         else {
+            // A bridge window holds no screen of its own, but the screen it
+            // shared may have been sized around it.
+            let shared: Vec<u32> = self
+                .output_slots
+                .iter()
+                .filter(|(_, s)| self.is_xwayland(&s.owner))
+                .map(|(&slot, _)| slot)
+                .collect();
+            for slot in shared {
+                self.announce_slot(slot);
+            }
             return;
         };
         let owner = self.output_slots[&slot].owner.clone();
@@ -3292,21 +3432,21 @@ impl Compositor {
 
     /// Re-send a screen's properties to everyone who bound it.
     fn announce_slot(&self, slot: u32) {
-        let sid = self.output_slot_surface(slot);
         for out in self.outputs.iter().filter(|o| o.slot == slot) {
-            self.send_output_properties(&out.resource, sid);
+            self.send_output_properties(&out.resource, slot);
         }
     }
 
     /// Re-announce a surface's output after its scale or size changed.
     fn refresh_output_for_surface(&self, surface_id: u16) {
         let s120 = self.surface_scale_120(surface_id) as u32;
-        for out in self
-            .outputs
-            .iter()
-            .filter(|o| self.output_slot_surface(o.slot) == Some(surface_id))
+        // The bridge's screen is sized from all its windows at once, so a
+        // single window growing moves it too.
+        if let Some(slot) = self
+            .surface_owner(surface_id)
+            .and_then(|owner| self.slot_for_surface(surface_id, &owner))
         {
-            self.send_output_properties(&out.resource, Some(surface_id));
+            self.announce_slot(slot);
         }
         for fs in self.fractional_scales.iter() {
             if self.find_toplevel_root(&fs.surface).1 == Some(surface_id) {
@@ -4358,11 +4498,31 @@ impl Compositor {
     /// `GDK_SCROLL_UNIT_SURFACE` pixels, and winit, which hands it to
     /// Alacritty as a `PixelDelta` — keeps pixels. `axis_value120` is
     /// unaffected: its unit is unambiguous and every toolkit agrees on it.
+    ///
+    /// Xwayland belongs with Chromium, for the same reason and by the same
+    /// factor: `dispatch_scroll_motion` divides the smooth value by ten into
+    /// a scroll valuator declared with an increment of one click, so a whole
+    /// X session scrolled twelve clicks per detent of trackpad travel. Every
+    /// X11 application inherits that, which is why it reads as X11 scrolling
+    /// being broken rather than as one toolkit misbehaving.
     fn smooth_axis_scale(&mut self, ptr: &WlPointer) -> f64 {
         let Some(client) = ptr.client() else {
             return 1.0;
         };
         let id = client.id();
+        // The X11 bridge reads the axis the same way Chromium does, and is
+        // asked before the cache because a client only becomes known as the
+        // bridge once the server names its pid — which can land after its
+        // first scroll, and a cached 1.0 would outlive the correction.
+        //
+        // `xwayland-input.c` splits on exactly the same line blit does: with
+        // `axis_value120` it takes the detents outright, and without one it
+        // divides the smooth value by ten into a scroll valuator whose
+        // increment is one click. So a wheel arrives intact and a trackpad --
+        // which sends no value120 at all -- moved twelve clicks per detent.
+        if self.is_xwayland(&id) {
+            return AXIS_UNITS_PER_DETENT / PX_PER_DETENT;
+        }
         if let Some(&scale) = self.axis_scale.get(&id) {
             return scale;
         }
@@ -4445,6 +4605,10 @@ impl Compositor {
             }
             self.outputs.retain(|o| o.slot != slot);
         }
+        self.client_pids
+            .retain(|client, _| backend.get_client_data(client.clone()).is_ok());
+        self.xwayland_clients
+            .retain(|client| backend.get_client_data(client.clone()).is_ok());
         // Disabled globals remain bindable specifically so a client cannot
         // lose a race with `global_remove`.  Once that client is dead there
         // can be no in-flight bind, and no other client was ever allowed to
@@ -4654,6 +4818,7 @@ impl Compositor {
             .unwrap_or((0, 0));
         let target_sid = self.cursor_target_sid();
         if unmaps {
+            self.last_cursor.insert(target_sid, CursorImage::Hidden);
             let _ = self.event_tx.send(CompositorEvent::SurfaceCursor {
                 surface_id: target_sid,
                 cursor: CursorImage::Hidden,
@@ -4670,16 +4835,29 @@ impl Compositor {
                 .surfaces
                 .get(surface_id)
                 .map_or(1, |s| s.buffer_scale.clamp(1, i32::from(u16::MAX)) as u16);
+            let cursor = CursorImage::Custom {
+                hotspot_x: hotspot.0 as u16,
+                hotspot_y: hotspot.1 as u16,
+                width: *w as u16,
+                height: *h as u16,
+                scale,
+                rgba: rgba.clone(),
+            };
+            // A cursor surface commits far more often than its artwork
+            // changes -- Xwayland re-attaches on enter and on every update it
+            // was throttling -- and re-announcing artwork a viewer is already
+            // drawing costs a full image on the wire for nothing. Worse, a
+            // viewer that rebuilds its object URL per announcement blinks the
+            // cursor each time, so this is not merely wasted bandwidth.
+            if self.last_cursor.get(&target_sid) == Some(&cursor) {
+                self.fire_surface_frame_callbacks(surface_id, None);
+                let _ = self.display_handle.flush_clients();
+                return;
+            }
+            self.last_cursor.insert(target_sid, cursor.clone());
             let _ = self.event_tx.send(CompositorEvent::SurfaceCursor {
                 surface_id: target_sid,
-                cursor: CursorImage::Custom {
-                    hotspot_x: hotspot.0 as u16,
-                    hotspot_y: hotspot.1 as u16,
-                    width: *w as u16,
-                    height: *h as u16,
-                    scale,
-                    rgba: rgba.clone(),
-                },
+                cursor,
             });
         }
         self.fire_surface_frame_callbacks(surface_id, None);
@@ -5580,6 +5758,22 @@ impl Compositor {
                         .insert(surface_id as u16, false);
                 }
             }
+            CompositorCommand::SetXwaylandPid { pid } => {
+                self.xwayland_pid = Some(pid);
+                // The bridge usually connects after this arrives, but it is
+                // spawned first and the two race, so re-judge whoever is
+                // already here.
+                let known: Vec<(ClientId, u32)> = self
+                    .client_pids
+                    .iter()
+                    .map(|(client, &pid)| (client.clone(), pid))
+                    .collect();
+                for (client, pid) in known {
+                    if self.descends_from_xwayland(pid) {
+                        self.xwayland_clients.insert(client);
+                    }
+                }
+            }
             CompositorCommand::RestampTarget {
                 surface_id,
                 target_w,
@@ -5614,10 +5808,7 @@ impl Compositor {
                     // shared: it comes from the fastest connected display,
                     // and every surface's mode carries it.
                     for out in &self.outputs {
-                        self.send_output_properties(
-                            &out.resource,
-                            self.output_slot_surface(out.slot),
-                        );
+                        self.send_output_properties(&out.resource, out.slot);
                     }
                     let _ = self.display_handle.flush_clients();
                 }
@@ -6436,6 +6627,18 @@ fn dir_is_chromium(dir: &std::path::Path) -> bool {
 /// What a `wl_output` global stands for: one screen, offered to one client,
 /// holding at most one of that client's toplevels.
 ///
+/// The parent of a live process, read from `/proc`.  `None` once it has
+/// exited, and on anything that is not Linux-shaped.
+fn parent_pid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Wayland's own answer to "what density should I draw at" is the set of
 /// outputs a surface has entered, so giving each toplevel its own output is
 /// what lets two windows of the same application render at two different
@@ -7558,15 +7761,19 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for Compositor {
                 // scale and start rendering.  The client binds the global
                 // asynchronously, so the bind handler sends the `enter` too:
                 // whichever happens second is the one that lands.
-                if let Some(owner) = resource.client().map(|c| c.id()) {
+                let owner = resource.client().map(|c| c.id());
+                if let Some(owner) = owner.clone() {
                     state.claim_output_for_surface(surface_id, owner);
                 }
-                if let Some(surf) = state.surfaces.get(&data.wl_surface_id) {
+                let slot = owner
+                    .as_ref()
+                    .and_then(|owner| state.slot_for_surface(surface_id, owner));
+                if let Some(slot) = slot
+                    && let Some(surf) = state.surfaces.get(&data.wl_surface_id)
+                {
                     let wl = surf.wl_surface.clone();
                     for out in &state.outputs {
-                        if state.output_slot_surface(out.slot) == Some(surface_id)
-                            && same_client(&out.resource, &wl)
-                        {
+                        if out.slot == slot && same_client(&out.resource, &wl) {
                             wl.enter(&out.resource);
                         }
                     }
@@ -8272,7 +8479,16 @@ impl GlobalDispatch<WlOutput, OutputGlobal> for Compositor {
             "Headless".to_string(),
             wl_output::Transform::Normal,
         );
-        state.send_output_properties(&output, sid);
+        // `name` and `description` are not optional at version 4: a client
+        // that binds v4 is entitled to both before the first `done`, and one
+        // that keeps a slot for them can fault when they never arrive —
+        // xwayland-satellite unwraps its missing OutputName and takes the
+        // whole X session down with it.
+        if output.version() >= 4 {
+            output.name(format!("blit-{slot}"));
+            output.description("blit virtual screen".to_string());
+        }
+        state.send_output_properties(&output, slot);
         state.outputs.push(SurfaceOutput {
             resource: output,
             slot,
@@ -8282,14 +8498,28 @@ impl GlobalDispatch<WlOutput, OutputGlobal> for Compositor {
         // too, or that surface never learns which output it is on and
         // renders at 1×.  An empty screen has nothing to enter yet; its
         // future toplevel sends its own enter at map.
-        if let Some(root_id) = sid
-            .and_then(|sid| state.toplevel_surface_ids.get(&sid))
-            .cloned()
-            && let Some(surf) = state.surfaces.get(&root_id)
-        {
-            let wl = surf.wl_surface.clone();
-            if let Some(out) = state.outputs.last() {
-                wl.enter(&out.resource);
+        //
+        // The bridge's screen holds no single toplevel, so its windows are
+        // found the other way round: every one of them is on it.
+        let owner = state.output_slots.get(&slot).map(|s| s.owner.clone());
+        let waiting: Vec<u16> = match (&owner, sid) {
+            (Some(owner), _) if state.is_xwayland(owner) => state
+                .toplevel_surface_ids
+                .keys()
+                .copied()
+                .filter(|&sid| state.surface_owner(sid).as_ref() == Some(owner))
+                .collect(),
+            (_, Some(sid)) => vec![sid],
+            _ => Vec::new(),
+        };
+        for sid in waiting {
+            if let Some(root_id) = state.toplevel_surface_ids.get(&sid).cloned()
+                && let Some(surf) = state.surfaces.get(&root_id)
+            {
+                let wl = surf.wl_surface.clone();
+                if let Some(out) = state.outputs.last() {
+                    wl.enter(&out.resource);
+                }
             }
         }
     }
@@ -8993,8 +9223,17 @@ impl Dispatch<WlDataDeviceManager, ()> for Compositor {
             Request::GetDataDevice { id, seat: _ } => {
                 let dd = data_init.init(id, ());
                 // A late-binding client must see the selection that already
-                // exists; there may be no later focus change to re-offer it.
-                state.offer_clipboard_to(&dd);
+                // exists, but answering here would land the event inside the
+                // roundtrip a client makes while still building its clipboard
+                // machinery — fatal for Qt. Focus is the protocol's cue and
+                // the safe one; only a client that already holds focus (so is
+                // long past that roundtrip) gets an answer now.
+                if state
+                    .keyboard_focus_wl()
+                    .is_some_and(|wl| same_client(&dd, &wl))
+                {
+                    state.offer_clipboard_to(&dd);
+                }
                 state.data_devices.push(dd);
             }
             _ => {}
@@ -9702,6 +9941,27 @@ impl Compositor {
         dd.selection(Some(&offer));
     }
 
+    /// Hand both selections to the devices belonging to `wl`'s client.
+    ///
+    /// Keyboard focus is the protocol's cue to deliver a selection, and it is
+    /// also the earliest cue a client can safely take one on: Qt binds its
+    /// data device from inside the platform-integration constructor and its
+    /// `selection` handler dereferences the integration pointer that
+    /// constructor has not returned yet, so a selection answered at bind time
+    /// segfaults the client before it ever draws (Zoom).
+    fn offer_selections_to_client(&self, wl: &WlSurface) {
+        for dd in &self.data_devices {
+            if same_client(dd, wl) {
+                self.offer_clipboard_to(dd);
+            }
+        }
+        for pd in &self.primary_devices {
+            if same_client(pd, wl) {
+                self.offer_primary_to(pd);
+            }
+        }
+    }
+
     /// Push the current clipboard selection to all connected data devices.
     fn offer_clipboard_selection(&mut self) {
         for dd in &self.data_devices {
@@ -10229,10 +10489,15 @@ impl Dispatch<ZwpPrimarySelectionDeviceManagerV1, ()> for Compositor {
             }
             Request::GetDevice { id, seat: _ } => {
                 let pd = data_init.init(id, ());
-                // A client that binds after the selection was made would
-                // otherwise never hear about it, and the usual prompt —
-                // keyboard focus — is not one this compositor re-offers on.
-                state.offer_primary_to(&pd);
+                // Deferred to keyboard focus for the reason `GetDataDevice`
+                // spells out; a client already holding focus is safe to
+                // answer straight away.
+                if state
+                    .keyboard_focus_wl()
+                    .is_some_and(|wl| same_client(&pd, &wl))
+                {
+                    state.offer_primary_to(&pd);
+                }
                 state.primary_devices.push(pd);
             }
             Request::Destroy => {}
@@ -11305,6 +11570,9 @@ fn run_compositor(
         output_slots: FxHashMap::default(),
         retired_output_globals: Vec::new(),
         next_output_slot: 0,
+        xwayland_pid: None,
+        client_pids: FxHashMap::default(),
+        xwayland_clients: FxHashSet::default(),
         outputs: Vec::new(),
         seats: Vec::new(),
         keyboards: Vec::new(),
@@ -11363,6 +11631,7 @@ fn run_compositor(
         syncobj_timelines: FxHashMap::default(),
         awaiting_acquire: FxHashMap::default(),
         cursor_rgba: FxHashMap::default(),
+        last_cursor: FxHashMap::default(),
     };
 
     // Report Vulkan Video encode capabilities to the server.
@@ -11418,6 +11687,13 @@ fn run_compositor(
                     }),
                 ) {
                     Ok(client) => {
+                        // The peer's pid is what tells the X11 bridge apart
+                        // from an ordinary app.
+                        if let Ok(creds) = client.get_credentials(&state.display_handle)
+                            && creds.pid > 0
+                        {
+                            state.note_client_pid(client.id(), creds.pid as u32);
+                        }
                         // Offer the screen before the client reads its
                         // registry: a toolkit that finds no output there
                         // never opens a window at all.
@@ -11650,8 +11926,8 @@ fn run_compositor(
 mod tests {
     use super::{
         FrameClockEntry, PendingDamage, consume_frame_clock_deadline, dir_is_chromium,
-        native_size_after_render, next_surface_id_after, scan_free_surface_id, shm_damage_rects,
-        update_frame_clock,
+        native_size_after_render, next_surface_id_after, parent_pid, scan_free_surface_id,
+        shm_damage_rects, update_frame_clock,
     };
     use crate::vulkan_render::ShmDamageRect;
     use rustc_hash::FxHashMap;
@@ -11675,6 +11951,23 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Recognising the X11 bridge means walking up from the pid on the other
+    /// end of a connection, because Xwayland connects on its own behalf and
+    /// is a child of the process blit actually started.
+    #[test]
+    fn parent_pid_finds_the_process_that_spawned_a_child() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        assert_eq!(parent_pid(child.id()), Some(std::process::id()));
+        let _ = child.kill();
+        let _ = child.wait();
+        // A reaped pid has no `/proc` entry, and the walk has to end rather
+        // than climb something that has been recycled.
+        assert_eq!(parent_pid(u32::MAX), None);
     }
 
     /// Chromium and Electron both need the smooth axis in detent units, and

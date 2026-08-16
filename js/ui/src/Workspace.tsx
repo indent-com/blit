@@ -907,6 +907,19 @@ function WorkspaceScreen(props: {
     // unaffected. The 30s idle cache keeps a session warm across quick
     // close/reopen and pane switches.
     if (!leftDockOpen()) return null;
+    // Nor while every section in it is collapsed. An open dock showing only
+    // its three headers reads nothing from the tree, the log or the problem
+    // list, so the fs sync and git repo behind them are as much dead weight
+    // as when the dock is shut — and collapsing the sections is how a dock
+    // gets emptied in practice, since it leaves the pane where it is.
+    //
+    // Deliberately the user's own collapse set, not the folded set the dock
+    // renders: that one counts sections auto-folded for having nothing to
+    // show, and those are derived from the session this decides whether to
+    // open.
+    if (LEFT_PANELS.every((panel) => collapsedSections().has(panel))) {
+      return null;
+    }
     const sel = rootSel();
     if (sel.kind === "declared") {
       const r = roots().find((x) => x.name === sel.name && !x.disabled);

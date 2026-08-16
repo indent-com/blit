@@ -67,6 +67,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 
+mod app_env;
 #[cfg(target_os = "linux")]
 mod audio;
 #[cfg(target_os = "linux")]
@@ -104,6 +105,8 @@ mod vaapi_encode;
 mod video_decode;
 #[cfg(target_os = "linux")]
 mod video_decode_vulkan;
+#[cfg(target_os = "linux")]
+mod xwayland;
 
 pub use ipc::{IpcListener, default_ipc_path};
 pub use media_policy::MediaCodecPolicy;
@@ -2292,6 +2295,10 @@ struct SharedCompositor {
     /// than escaping to the host compositor.
     #[cfg(target_os = "linux")]
     desktop_bus: Option<desktop_bus::DesktopBus>,
+    /// The X11 bridge, when one is installed. Owns the `DISPLAY` that PTYs
+    /// and D-Bus activation export, and dies with the session.
+    #[cfg(target_os = "linux")]
+    xwayland: Option<xwayland::Xwayland>,
     /// Canonical tray/notification state replayed to late subscribers.
     #[cfg(target_os = "linux")]
     desktop_mirror: DesktopMirror,
@@ -6191,9 +6198,23 @@ impl Session {
             #[cfg(target_os = "linux")]
             let desktop_notify = event_notify.clone();
             let handle = blit_compositor::spawn_compositor(verbose, event_notify, gpu_device);
+            // Ahead of the desktop bus and of every PTY, because both export
+            // DISPLAY at spawn and an app that starts without it has no X at
+            // all.  The compositor is told whose connection to expect, so the
+            // X session lands on one screen instead of one per window.
+            #[cfg(target_os = "linux")]
+            let xwayland = xwayland::Xwayland::spawn(&handle.socket_name, verbose);
+            #[cfg(target_os = "linux")]
+            if let Some(bridge) = xwayland.as_ref() {
+                let _ = handle
+                    .command_tx
+                    .send(blit_compositor::CompositorCommand::SetXwaylandPid { pid: bridge.pid() });
+                handle.wake();
+            }
             #[cfg(target_os = "linux")]
             let mut desktop_bus = match desktop_bus::DesktopBus::spawn(
                 &handle.socket_name,
+                xwayland.as_ref().map(xwayland::Xwayland::display),
                 verbose,
                 desktop_notify,
             ) {
@@ -6325,6 +6346,8 @@ impl Session {
                 #[cfg(target_os = "linux")]
                 desktop_bus,
                 #[cfg(target_os = "linux")]
+                xwayland,
+                #[cfg(target_os = "linux")]
                 desktop_mirror: DesktopMirror::default(),
                 #[cfg(target_os = "linux")]
                 mpris_mirror: MprisMirror::default(),
@@ -6390,6 +6413,22 @@ impl Session {
 
     #[cfg(not(target_os = "linux"))]
     fn desktop_bus_address(&self) -> Option<String> {
+        None
+    }
+
+    /// The `DISPLAY` X11 apps in this session should use, when a bridge is
+    /// running. `None` means this session has no X at all, and no app is
+    /// told otherwise.
+    #[cfg(target_os = "linux")]
+    fn x_display(&self) -> Option<String> {
+        self.compositor
+            .as_ref()
+            .and_then(|cs| cs.xwayland.as_ref())
+            .map(|bridge| bridge.display().to_string())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn x_display(&self) -> Option<String> {
         None
     }
 
@@ -8642,6 +8681,23 @@ async fn supervise(state: &AppState) {
             }
             if let Some(media_state) = sess.compositor.as_ref().map(SharedCompositor::media_state) {
                 sess.send_to_all(&msg_server_control(&ServerControl::State(media_state)));
+            }
+        }
+        // A dead bridge cannot be repaired for the X clients already on it,
+        // but it must stop being advertised: the next app to start would
+        // otherwise inherit a DISPLAY nothing is listening on, which is worse
+        // than having no X — a toolkit given a broken display can fail
+        // instead of falling back to Wayland.
+        #[cfg(target_os = "linux")]
+        {
+            let bridge_exited = sess
+                .compositor
+                .as_mut()
+                .and_then(|cs| cs.xwayland.as_mut())
+                .is_some_and(|bridge| !bridge.is_alive());
+            if bridge_exited && let Some(cs) = sess.compositor.as_mut() {
+                eprintln!("[xwayland] bridge exited; X11 applications are unavailable");
+                cs.xwayland = None;
             }
         }
         let desktop_bus_exited = sess
@@ -18636,6 +18692,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
+                    sess.x_display().as_deref(),
                     sess.desktop_bus_address().as_deref(),
                     pulse_server.as_deref(),
                     pipewire_remote.as_deref(),
@@ -18741,6 +18798,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
+                    sess.x_display().as_deref(),
                     sess.desktop_bus_address().as_deref(),
                     pulse_server.as_deref(),
                     pipewire_remote.as_deref(),
@@ -18838,6 +18896,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
+                    sess.x_display().as_deref(),
                     sess.desktop_bus_address().as_deref(),
                     pulse_server.as_deref(),
                     pipewire_remote.as_deref(),
@@ -19025,6 +19084,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
+                    sess.x_display().as_deref(),
                     sess.desktop_bus_address().as_deref(),
                     pulse_server.as_deref(),
                     pipewire_remote.as_deref(),
@@ -20047,6 +20107,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         cwd.as_deref(),
                         state.clone(),
                         wayland_display.as_deref(),
+                        sess.x_display().as_deref(),
                         sess.desktop_bus_address().as_deref(),
                         pulse_server.as_deref(),
                         pipewire_remote.as_deref(),

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use blit_remote::{AXIS_SOURCE_WHEEL, PointerAxisEvent};
+use blit_remote::{AXIS_SOURCE_FINGER, AXIS_SOURCE_WHEEL, PointerAxisEvent};
 use blit_remote::{
     C2S_CLIENT_FEATURES, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_LIST,
     C2S_SURFACE_POINTER, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CODEC_SUPPORT_AV1,
@@ -1541,11 +1541,19 @@ pub async fn cmd_scroll(
     id: u16,
     amount: f64,
     horizontal: bool,
+    smooth: bool,
 ) -> Result<(), String> {
     if !amount.is_finite() {
         return Err("scroll amount must be a number".into());
     }
-    let v120 = (amount * 120.0).round();
+    // A trackpad reports distance and no detents at all. Withholding the
+    // detent count is the whole point of `--smooth`: it is what sends a
+    // client down its continuous-scroll path instead of its wheel path.
+    let v120 = if smooth {
+        0.0
+    } else {
+        (amount * 120.0).round()
+    };
     if v120.abs() > f64::from(i16::MAX) {
         return Err("scroll amount out of range".into());
     }
@@ -1559,7 +1567,11 @@ pub async fn cmd_scroll(
         dy: if horizontal { 0.0 } else { distance },
         v120_x: if horizontal { v120 as i16 } else { 0 },
         v120_y: if horizontal { 0 } else { v120 as i16 },
-        source: Some(AXIS_SOURCE_WHEEL),
+        source: Some(if smooth {
+            AXIS_SOURCE_FINGER
+        } else {
+            AXIS_SOURCE_WHEEL
+        }),
         // A wheel has no "finger lifted" moment, and the protocol tells
         // clients not to expect a stop from one.
         stop: false,

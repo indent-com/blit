@@ -1251,6 +1251,17 @@ pub enum SurfaceCommand {
         /// Scroll horizontally instead of vertically
         #[arg(long)]
         horizontal: bool,
+
+        /// Send it the way a trackpad does: smooth surface pixels with no
+        /// detent count, and `finger` as the source.
+        ///
+        /// The default speaks as a wheel, which carries `axis_value120` and
+        /// so takes an entirely different path through every toolkit -- and
+        /// through Xwayland, which reads detents outright when they are
+        /// present and divides the smooth value when they are not. A wheel
+        /// test therefore says nothing about trackpad scrolling.
+        #[arg(long)]
+        smooth: bool,
     },
 
     /// Give a surface keyboard and pointer focus

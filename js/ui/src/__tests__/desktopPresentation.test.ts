@@ -11,6 +11,7 @@ import {
   canRaiseMpris,
   desktopNotificationHasDetail,
   matchesDesktopNotification,
+  popupViewportShift,
   portalDialogFocusTarget,
   reconcileMprisSubscriptions,
   samePortalPresentationEntry,
@@ -242,5 +243,33 @@ describe("desktop notification presentation", () => {
     expect(canRaiseMpris(false, 1 << 6)).toBe(true);
     expect(canRaiseMpris(true, 1 << 6)).toBe(false);
     expect(canRaiseMpris(false, 1 << 0)).toBe(false);
+  });
+});
+
+describe("popupViewportShift", () => {
+  it("leaves a popup that already fits alone", () => {
+    expect(popupViewportShift({ left: 100, right: 400 }, 1280)).toBe(0);
+  });
+
+  it("pushes a phone-width popup back off the left edge", () => {
+    // The chrome's right edge is not the window's — the status bar's tools
+    // sit to its right — so a popup sized to the viewport starts off screen.
+    expect(popupViewportShift({ left: -40, right: 350 }, 390)).toBe(48);
+  });
+
+  it("pulls a popup back off the right edge", () => {
+    expect(popupViewportShift({ left: 60, right: 420 }, 390)).toBe(-38);
+  });
+
+  it("pins a popup wider than the window to the left margin", () => {
+    // Both edges overflow and only one can be honoured. Content starts at the
+    // left, so losing the right is the survivable half.
+    const shift = popupViewportShift({ left: -30, right: 500 }, 390);
+    expect(shift).toBe(38);
+    expect(-30 + shift).toBe(8);
+  });
+
+  it("respects a caller's margin", () => {
+    expect(popupViewportShift({ left: 0, right: 100 }, 390, 16)).toBe(16);
   });
 });

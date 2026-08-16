@@ -22,11 +22,15 @@ pub struct DesktopBus {
     /// bus is built, rather than during `spawn`.
     runtime_dir: PathBuf,
     display: std::ffi::OsString,
+    /// The X11 bridge's display, so activated services reach the same X
+    /// session the PTYs do.
+    x_display: Option<String>,
 }
 
 impl DesktopBus {
     pub fn spawn(
         wayland_socket: &str,
+        x_display: Option<&str>,
         verbose: bool,
         notify: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Self, String> {
@@ -40,21 +44,22 @@ impl DesktopBus {
         // such as xdg-desktop-portal-gtk inherit it and consequently map their
         // windows on blit's compositor instead of the host desktop.
         let mut child = unsafe {
-            Command::new("dbus-daemon")
+            let mut command = Command::new("dbus-daemon");
+            command
                 .args(["--session", "--print-address=1", "--nofork"])
                 .env("XDG_RUNTIME_DIR", runtime_dir)
                 .env("WAYLAND_DISPLAY", display)
-                .env("XDG_SESSION_TYPE", "wayland")
                 .env("XDG_CURRENT_DESKTOP", "blit")
-                .env("NIXOS_OZONE_WL", "1")
-                .env("ELECTRON_OZONE_PLATFORM_HINT", "wayland")
-                .env("MOZ_ENABLE_WAYLAND", "1")
-                .env("GDK_BACKEND", "wayland")
-                .env("QT_QPA_PLATFORM", "wayland")
-                .env("SDL_VIDEODRIVER", "wayland")
+                // The host's DISPLAY, if any, points at a session these
+                // services must not join.  `toolkit_env` puts blit's own back
+                // when an X11 bridge is running.
                 .env_remove("DISPLAY")
                 .env_remove("DBUS_SESSION_BUS_ADDRESS")
-                .env_remove("DBUS_SYSTEM_BUS_ADDRESS")
+                .env_remove("DBUS_SYSTEM_BUS_ADDRESS");
+            for (key, value) in crate::app_env::toolkit_env(x_display) {
+                command.env(key, value);
+            }
+            command
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(if verbose {
@@ -133,6 +138,7 @@ impl DesktopBus {
             portal_root: None,
             runtime_dir: runtime_dir.to_path_buf(),
             display: display.to_os_string(),
+            x_display: x_display.map(str::to_string),
         })
     }
 
@@ -169,6 +175,7 @@ impl DesktopBus {
         match spawn_portal_frontend(
             &self.runtime_dir,
             &self.display,
+            self.x_display.as_deref(),
             &self.address,
             pipewire_remote,
             verbose,
@@ -291,6 +298,7 @@ fn take_child_exit(child: &mut Option<Child>) -> bool {
 fn spawn_portal_frontend(
     runtime_dir: &Path,
     display: &std::ffi::OsStr,
+    x_display: Option<&str>,
     address: &str,
     pipewire_remote: Option<&str>,
     verbose: bool,
@@ -303,51 +311,58 @@ fn spawn_portal_frontend(
     if root.exists() {
         std::fs::remove_dir_all(&root).map_err(|error| error.to_string())?;
     }
-    let config_home = root.join("config");
-    let data_home = root.join("data");
-    std::fs::create_dir_all(config_home.join("xdg-desktop-portal"))
+    let config_dir = root.join("config");
+    let data_dir = root.join("data");
+    std::fs::create_dir_all(config_dir.join("xdg-desktop-portal"))
         .map_err(|error| error.to_string())?;
-    std::fs::create_dir_all(data_home.join("xdg-desktop-portal/portals"))
+    std::fs::create_dir_all(data_dir.join("xdg-desktop-portal/portals"))
         .map_err(|error| error.to_string())?;
     std::fs::write(
-        data_home.join("xdg-desktop-portal/portals/blit.portal"),
+        data_dir.join("xdg-desktop-portal/portals/blit.portal"),
         "[portal]\nDBusName=org.freedesktop.impl.portal.desktop.blit\nInterfaces=org.freedesktop.impl.portal.Access;org.freedesktop.impl.portal.ScreenCast;\nUseIn=blit\n",
     )
     .map_err(|error| error.to_string())?;
     let fallback = std::env::var("BLIT_PORTAL_FALLBACK").unwrap_or_else(|_| "gtk;*".into());
     let fallback = if fallback.is_empty() { "*" } else { &fallback };
     std::fs::write(
-        config_home.join("xdg-desktop-portal/blit-portals.conf"),
+        config_dir.join("xdg-desktop-portal/blit-portals.conf"),
         format!(
             "[preferred]\ndefault={fallback}\norg.freedesktop.impl.portal.Access=blit\norg.freedesktop.impl.portal.ScreenCast=blit\norg.freedesktop.impl.portal.RemoteDesktop=none\norg.freedesktop.impl.portal.InputCapture=none\n"
         ),
     )
     .map_err(|error| error.to_string())?;
-    let config_dirs = prepend_xdg(&config_home, "XDG_CONFIG_DIRS", "/etc/xdg");
-    let data_dirs = prepend_xdg(&data_home, "XDG_DATA_DIRS", "/usr/local/share:/usr/share");
+    if verbose
+        && let Some(shadow) = user_config_dir()
+            .as_deref()
+            .and_then(shadowing_portal_config)
+    {
+        eprintln!(
+            "[portal] {} is read before blit's own preferences; Access and ScreenCast will fall to another backend",
+            shadow.display()
+        );
+    }
     // Spawn by absolute path: the gate above already resolved it, and on most
     // distributions the name alone is not on `PATH` to spawn by.
     let program =
         find_portal_frontend().ok_or_else(|| "xdg-desktop-portal not found".to_string())?;
     let child = unsafe {
         let mut command = Command::new(&program);
-        // Absolute, because XDG_RUNTIME_DIR below has to name the Wayland
-        // socket's directory and the PipeWire socket is not in it. See
-        // `start_portal` for what goes wrong without this.
+        for (key, value) in portal_env(runtime_dir, display, address, &config_dir, &data_dir) {
+            command.env(key, value);
+        }
+        // Absolute, because XDG_RUNTIME_DIR has to name the Wayland socket's
+        // directory and the PipeWire socket is not in it. See `start_portal`
+        // for what goes wrong without this.
         if let Some(remote) = pipewire_remote {
             command.env("PIPEWIRE_REMOTE", remote);
         }
+        command.env_remove("DISPLAY");
+        // After the removal above, so a bridged session still names its own
+        // display rather than losing it with the host's.
+        for (key, value) in crate::app_env::toolkit_env(x_display) {
+            command.env(key, value);
+        }
         command
-            .env("DBUS_SESSION_BUS_ADDRESS", address)
-            .env("XDG_RUNTIME_DIR", runtime_dir)
-            .env("WAYLAND_DISPLAY", display)
-            .env("XDG_SESSION_TYPE", "wayland")
-            .env("XDG_CURRENT_DESKTOP", "blit")
-            .env("XDG_CONFIG_HOME", &config_home)
-            .env("XDG_DATA_HOME", &data_home)
-            .env("XDG_CONFIG_DIRS", config_dirs)
-            .env("XDG_DATA_DIRS", data_dirs)
-            .env_remove("DISPLAY")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(if verbose {
@@ -362,9 +377,73 @@ fn spawn_portal_frontend(
     Ok((child, root))
 }
 
-fn prepend_xdg(home: &Path, name: &str, fallback: &str) -> String {
+/// The environment the portal frontend runs under.
+///
+/// Deliberately without `XDG_CONFIG_HOME` and `XDG_DATA_HOME`. The frontend
+/// hands its own environment to every application it launches, and one of the
+/// things it launches is the app a browser hands a `zoomus://` or `claude://`
+/// login callback back to. Pointed at a private config home, that app reads
+/// neither the running instance's single-instance socket
+/// (`$XDG_CONFIG_HOME/zoom/qtsingleapp-zoom-3e8`, `$XDG_CONFIG_HOME/<app>` for
+/// Electron) nor its stored credentials: instead of handing the URL over it
+/// becomes a second, logged-out window, and whatever it writes is thrown away
+/// with the directory at the next server start.
+///
+/// blit's own `blit.portal` and `blit-portals.conf` are found through the
+/// `_DIRS` search paths instead, which are additive and safe to inherit. The
+/// cost is priority: see [`shadowing_portal_config`].
+fn portal_env(
+    runtime_dir: &Path,
+    display: &std::ffi::OsStr,
+    address: &str,
+    config_dir: &Path,
+    data_dir: &Path,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    vec![
+        ("DBUS_SESSION_BUS_ADDRESS", address.into()),
+        ("XDG_RUNTIME_DIR", runtime_dir.into()),
+        ("WAYLAND_DISPLAY", display.into()),
+        ("XDG_SESSION_TYPE", "wayland".into()),
+        ("XDG_CURRENT_DESKTOP", "blit".into()),
+        (
+            "XDG_CONFIG_DIRS",
+            prepend_xdg(config_dir, "XDG_CONFIG_DIRS", "/etc/xdg").into(),
+        ),
+        (
+            "XDG_DATA_DIRS",
+            prepend_xdg(data_dir, "XDG_DATA_DIRS", "/usr/local/share:/usr/share").into(),
+        ),
+    ]
+}
+
+/// The user's own portal configuration, when it hides blit's.
+///
+/// The frontend reads exactly one configuration file: it walks
+/// `$XDG_CONFIG_HOME` (or `~/.config`) first and then `XDG_CONFIG_DIRS`,
+/// stopping at the first directory holding `<desktop>-portals.conf` or
+/// `portals.conf`. blit's copy rides on `XDG_CONFIG_DIRS`, so a user who keeps
+/// one of their own hides it — and with it the Access and ScreenCast backends
+/// that only blit can answer. Worth saying out loud, because the symptom is a
+/// screenshare that fails for no visible reason.
+fn shadowing_portal_config(user_config_dir: &Path) -> Option<PathBuf> {
+    let dir = user_config_dir.join("xdg-desktop-portal");
+    ["blit-portals.conf", "portals.conf"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.exists())
+}
+
+/// `$XDG_CONFIG_HOME`, or the `~/.config` the frontend falls back to.
+fn user_config_dir() -> Option<PathBuf> {
+    match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")),
+    }
+}
+
+fn prepend_xdg(dir: &Path, name: &str, fallback: &str) -> String {
     let suffix = std::env::var(name).unwrap_or_else(|_| fallback.into());
-    format!("{}:{suffix}", home.display())
+    format!("{}:{suffix}", dir.display())
 }
 
 #[cfg(test)]
@@ -383,5 +462,65 @@ mod tests {
         assert!(take_child_exit(&mut child));
         assert!(child.is_none());
         assert!(!take_child_exit(&mut child));
+    }
+
+    #[test]
+    fn portal_env_leaves_the_config_and_data_homes_alone() {
+        let env = portal_env(
+            Path::new("/run/user/1000"),
+            std::ffi::OsStr::new("wayland-3"),
+            "unix:path=/tmp/dbus-test",
+            Path::new("/run/user/1000/blit-portals-7-wayland-3/config"),
+            Path::new("/run/user/1000/blit-portals-7-wayland-3/data"),
+        );
+        let value = |key: &str| {
+            env.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+        };
+        // Whatever the frontend launches -- the app answering a browser's
+        // login callback among them -- inherits this environment, and an app
+        // sent to a throwaway config home cannot find the instance already
+        // running in a pane.
+        assert_eq!(value("XDG_CONFIG_HOME"), None);
+        assert_eq!(value("XDG_DATA_HOME"), None);
+        // The private directories still have to be reachable, as search paths.
+        assert!(
+            value("XDG_CONFIG_DIRS")
+                .expect("config dirs")
+                .starts_with("/run/user/1000/blit-portals-7-wayland-3/config:"),
+        );
+        assert!(
+            value("XDG_DATA_DIRS")
+                .expect("data dirs")
+                .starts_with("/run/user/1000/blit-portals-7-wayland-3/data:"),
+        );
+        assert_eq!(value("XDG_CURRENT_DESKTOP").as_deref(), Some("blit"));
+        assert_eq!(value("WAYLAND_DISPLAY").as_deref(), Some("wayland-3"));
+    }
+
+    #[test]
+    fn a_user_portal_config_is_reported_as_shadowing() {
+        let root = std::env::temp_dir().join(format!("blit-portal-shadow-{}", std::process::id()));
+        let dir = root.join("xdg-desktop-portal");
+        std::fs::create_dir_all(&dir).expect("create user config dir");
+        assert_eq!(shadowing_portal_config(&root), None);
+
+        std::fs::write(dir.join("portals.conf"), "[preferred]\ndefault=gnome\n")
+            .expect("write user portals.conf");
+        assert_eq!(
+            shadowing_portal_config(&root),
+            Some(dir.join("portals.conf"))
+        );
+
+        // A desktop-specific file is read before the generic one, so it is the
+        // one that ends up hiding blit's.
+        std::fs::write(dir.join("blit-portals.conf"), "[preferred]\ndefault=*\n")
+            .expect("write user blit-portals.conf");
+        assert_eq!(
+            shadowing_portal_config(&root),
+            Some(dir.join("blit-portals.conf")),
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

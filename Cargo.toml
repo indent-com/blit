@@ -24,7 +24,7 @@ members = [
 # A path dependency living under the workspace root would otherwise become an
 # implicit member, so `--workspace` clippy/test/fmt runs would lint, test, and
 # reformat third-party code we only consume.
-exclude = ["vendor/cros-codecs"]
+exclude = ["vendor/cros-codecs", "vendor/wayland-backend"]
 
 [workspace.package]
 edition = "2024"
@@ -62,3 +62,12 @@ debug = true
 strip = false
 lto = false
 codegen-units = 16
+
+# wayland-backend broadcasts wl_registry.global_remove to every client, without
+# consulting the global's `can_view` filter -- unlike all three paths that send
+# wl_registry.global.  blit publishes one owner-filtered wl_output per toplevel,
+# so closing any window told every *other* client to remove a global it had
+# never been shown.  xwayland-satellite unwraps that lookup and panics, taking
+# X11 down with it.  Still present in 0.3.17; see vendor/wayland-backend.
+[patch.crates-io]
+wayland-backend = { path = "vendor/wayland-backend" }

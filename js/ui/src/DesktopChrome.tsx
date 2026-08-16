@@ -47,6 +47,7 @@ import {
   desktopNotificationHasDetail,
   matchesDesktopNotification,
   mprisMediaSessionKey,
+  popupViewportShift,
   portalDialogFocusTarget,
   reconcileMprisSubscriptions,
   samePortalPresentationEntry,
@@ -137,12 +138,36 @@ function Popup(props: {
   width?: string;
   maxHeight?: string;
 }) {
+  let el: HTMLDivElement | undefined;
+  // Slid back on screen after layout rather than positioned differently: the
+  // popup belongs to the button it hangs from, and only the browser knows
+  // where that landed once the bar has finished sharing out its width.
+  const [shift, setShift] = createSignal(0);
+  const reposition = () => {
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const applied = shift();
+    setShift(
+      popupViewportShift(
+        { left: rect.left - applied, right: rect.right - applied },
+        window.innerWidth,
+      ),
+    );
+  };
+  onMount(() => {
+    reposition();
+    // Rotating a phone changes both the anchor and the width available.
+    window.addEventListener("resize", reposition);
+    onCleanup(() => window.removeEventListener("resize", reposition));
+  });
   return (
     <div
+      ref={el}
       style={{
         position: "absolute",
         bottom: "100%",
         right: 0,
+        transform: shift() === 0 ? undefined : `translateX(${shift()}px)`,
         "margin-bottom": `${props.scale.tightGap}px`,
         width: props.width ?? "min(28em, calc(100vw - 2em))",
         "max-height": props.maxHeight ?? "min(70vh, 36em)",
@@ -510,14 +535,26 @@ function MprisChrome(props: {
             aria-expanded={open()}
             style={{
               ...ui.btn,
-              "max-width": props.compact ? "8em" : "14em",
-              overflow: "hidden",
-              "text-overflow": "ellipsis",
-              "white-space": "nowrap",
-              "font-size": `${props.scale.sm}px`,
+              // Compact spends a glyph, not a title. This sits in the cluster
+              // that never shrinks, so every em it takes comes out of the
+              // window title beside it — and on a phone the title had none to
+              // spare. The track name is still one tap away, in the popup and
+              // in the tooltip, and the glyph appearing at all already says
+              // something is playing.
+              ...(props.compact
+                ? { "font-size": `${props.scale.md}px` }
+                : {
+                    "max-width": "14em",
+                    overflow: "hidden",
+                    "text-overflow": "ellipsis",
+                    "white-space": "nowrap",
+                    "font-size": `${props.scale.sm}px`,
+                  }),
             }}
           >
-            {current.player.title || current.player.identity}
+            {props.compact
+              ? "♪"
+              : current.player.title || current.player.identity}
           </button>
           <Show when={open()}>
             <Popup

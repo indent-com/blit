@@ -406,6 +406,13 @@ import {
 
 const textDecoder = new TextDecoder();
 
+/** Exact byte equality, for deciding whether artwork actually changed. */
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 export const SEARCH_SOURCE_TITLE = 0;
 export const SEARCH_SOURCE_VISIBLE = 1;
 export const SEARCH_SOURCE_SCROLLBACK = 2;
@@ -863,6 +870,12 @@ export class BlitConnection {
    *  permission-gated.  Null means it has not arrived or is not text. */
   private waylandClipboardText: string | null = null;
   private pendingClipboardList: PendingClipboardRequest<string[]> | null = null;
+  /** Last custom cursor artwork per surface, so identical repeats keep the
+   *  object URL the browser is already painting from. */
+  private lastCursorArtwork = new Map<
+    number,
+    { png: Uint8Array; hotX: number; hotY: number }
+  >();
   private pendingClipboardGets = new Map<
     string,
     PendingClipboardRequest<Uint8Array>
@@ -5400,12 +5413,16 @@ export class BlitConnection {
             const nameLen = bytes[4];
             if (bytes.length < 5 + nameLen) return;
             const shape = textDecoder.decode(bytes.subarray(5, 5 + nameLen));
+            // Leaving custom artwork: forget it, so returning to the same
+            // image is a real change again rather than a deduped no-op.
+            this.lastCursorArtwork.delete(surfaceId);
             this.surfaceStore.handleSurfaceCursor(surfaceId, shape, {
               kind: "named",
               name: shape,
             });
           } else if (cursorType === 1) {
             // Hidden
+            this.lastCursorArtwork.delete(surfaceId);
             this.surfaceStore.handleSurfaceCursor(surfaceId, "none", {
               kind: "hidden",
             });
@@ -5423,10 +5440,31 @@ export class BlitConnection {
             const height = view.getUint16(10, true);
             if (width === 0 || height === 0) return;
             const pngData = bytes.subarray(12);
+            // Artwork that has not changed must keep the URL it is already
+            // being drawn from. Minting a fresh object URL for identical
+            // bytes means the old one is revoked while the browser is still
+            // fetching the new one, so the cursor drops to its fallback and
+            // back on every repeat — a visible blink, at whatever rate the
+            // compositor happens to re-announce. Xwayland re-commits its
+            // cursor surface often enough to make that continuous.
+            const previous = this.lastCursorArtwork.get(surfaceId);
+            if (
+              previous &&
+              previous.hotX === hotX &&
+              previous.hotY === hotY &&
+              sameBytes(previous.png, pngData)
+            ) {
+              return;
+            }
             const blob = new Blob([new Uint8Array(pngData)], {
               type: "image/png",
             });
             const url = URL.createObjectURL(blob);
+            this.lastCursorArtwork.set(surfaceId, {
+              png: new Uint8Array(pngData),
+              hotX,
+              hotY,
+            });
             this.surfaceStore.handleSurfaceCursor(
               surfaceId,
               `url(${url}) ${hotX} ${hotY}, auto`,

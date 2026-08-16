@@ -8,6 +8,30 @@ import {
 
 export type DesktopDelivery = "toast" | "native" | "retain";
 
+/**
+ * How far to slide a chrome popup horizontally to keep it on screen.
+ *
+ * The popups hang off the right edge of the chrome, which is not the right
+ * edge of the window — the status bar's own tools sit to their right. That is
+ * invisible on a desktop, where a popup is far narrower than the screen, and
+ * unmissable on a phone, where one sized `calc(100vw - 2em)` starts further
+ * left than the window does and loses its first centimetre.
+ *
+ * Returns a translation in pixels: positive to push right off the left edge,
+ * negative to pull left off the right one. Never trades one overflow for the
+ * other — a popup wider than the viewport is pinned to the left margin, since
+ * that is where its content starts.
+ */
+export function popupViewportShift(
+  rect: { left: number; right: number },
+  viewportWidth: number,
+  margin = 8,
+): number {
+  if (rect.left >= margin && rect.right <= viewportWidth - margin) return 0;
+  if (rect.left < margin) return margin - rect.left;
+  return Math.max(margin - rect.left, viewportWidth - margin - rect.right);
+}
+
 /** Presentation policy for a live (never replayed) notification upsert. */
 export function desktopDelivery(
   visibility: DocumentVisibilityState,
