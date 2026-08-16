@@ -5,7 +5,7 @@ let
     overlays = [ inputs.rust-overlay.overlays.default ];
   };
 
-  version = "0.52.0";
+  version = "0.53.0";
 
   cargoLockConfig = {
     lockFile = ../Cargo.lock;
@@ -46,12 +46,38 @@ let
         || pkgs.lib.hasInfix "/js/ui/dist/" path
         || pkgs.lib.hasSuffix ".h264" path
         || pkgs.lib.hasSuffix ".xkb" path
-        || pkgs.lib.hasSuffix ".spv" path;
+        || pkgs.lib.hasSuffix ".spv" path
+        # C shims a vendored crate's build.rs compiles (wayland-backend's
+        # log_shim.c, behind its `log` feature).
+        || pkgs.lib.hasSuffix ".c" path;
     in
     pkgs.lib.cleanSourceWith {
       src = ../.;
       inherit filter;
     };
+
+  # `[patch.crates-io]` points wayland-backend at vendor/ (see Cargo.toml), and
+  # crane's deps-only build replaces every Cargo.toml it finds in the source
+  # tree with a stub crate.  Stubbing the workspace members is the whole point;
+  # stubbing this one is not.  It is a real dependency of wayland-server, which
+  # the deps-only build compiles for real, and wayland-server does not compile
+  # against an empty `wayland_backend` — 17 unresolved imports.  So restore the
+  # vendored crate on top of the dummy tree.
+  #
+  # Filtered on its own rather than reused out of `src` so that editing blit's
+  # own sources does not invalidate the dependency cache.
+  vendoredWaylandBackend = pkgs.lib.cleanSourceWith {
+    src = ../vendor/wayland-backend;
+    filter = path: type: (craneLib.filterCargoSources path type) || pkgs.lib.hasSuffix ".c" path;
+  };
+
+  restoreVendoredCrates = {
+    extraDummyScript = ''
+      rm -rf $out/vendor/wayland-backend
+      cp --recursive --no-preserve=ownership ${vendoredWaylandBackend} $out/vendor/wayland-backend
+      chmod +w -R $out/vendor/wayland-backend
+    '';
+  };
 
   # Common args shared by all crane builds.
   commonArgs = {
@@ -78,6 +104,7 @@ let
   # Build workspace deps once — reused by the workspace build.
   cargoArtifacts = craneLib.buildDepsOnly (
     commonArgs
+    // restoreVendoredCrates
     // {
       pname = "blit-workspace-deps";
       cargoExtraArgs = "--workspace --exclude blit-browser";
@@ -188,6 +215,7 @@ let
 
   cargoArtifactsStatic = craneLibStatic.buildDepsOnly (
     commonArgsStatic
+    // restoreVendoredCrates
     // {
       pname = "blit-workspace-deps-static";
       cargoExtraArgs = "--workspace --exclude blit-browser";
@@ -282,6 +310,7 @@ let
 
   cargoArtifactsGnu = craneLib.buildDepsOnly (
     commonArgsGnu
+    // restoreVendoredCrates
     // {
       pname = "blit-workspace-deps-gnu";
       cargoExtraArgs = "--workspace --exclude blit-browser";
