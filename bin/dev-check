@@ -55,6 +55,24 @@ pathlib.Path('js/ui/dist/sw.js.br').write_bytes(brotli.compress(js))
 " 2>/dev/null || cp js/ui/dist/sw.js js/ui/dist/sw.js.br
 fi
 
+# And the workers the UI spawns, which the gateway embeds by name. They cannot
+# be inlined into the single-file build, so each is its own asset; a missing
+# one fails the Rust build rather than the browser, which is the better place
+# to find out.
+for worker in mux-worker buffer-recycler-worker; do
+    if [ ! -f "js/ui/dist/$worker.js.br" ]; then
+        echo "=== Creating stub js/ui/dist/$worker.js.br ==="
+        mkdir -p js/ui/dist
+        echo '/* stub */' > "js/ui/dist/$worker.js"
+        python3 -c "
+import brotli, pathlib, sys
+js = pathlib.Path(sys.argv[1]).read_bytes()
+pathlib.Path(sys.argv[1] + '.br').write_bytes(brotli.compress(js))
+" "js/ui/dist/$worker.js" 2>/dev/null ||
+            cp "js/ui/dist/$worker.js" "js/ui/dist/$worker.js.br"
+    fi
+done
+
 echo "=== Building blit CLI ==="
 # Use the same profiling binary that bin/dev/process-compose builds, rather
 # than downloading a release via install.blit.sh — the installer's cleanup

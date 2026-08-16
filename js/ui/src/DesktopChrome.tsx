@@ -22,15 +22,6 @@ import {
   MPRIS_CAN_PAUSE,
   MPRIS_CAN_PLAY,
   MPRIS_CAN_SEEK,
-  ACTIVE_MICROPHONE,
-  ACTIVE_CAMERA,
-  AUDIO_CODEC_OPUS,
-  AUDIO_CODEC_PCM,
-  RUNTIME_MICROPHONE,
-  RUNTIME_CAMERA,
-  VIDEO_CODEC_MJPEG,
-  probeCameraCodecs,
-  probeOpusMicrophone,
   TRAY_MENU_OK,
   TRAY_STATUS_NEEDS_ATTENTION,
   TRAY_STATUS_PASSIVE,
@@ -39,6 +30,7 @@ import {
   type DesktopImage,
   type DesktopNotification,
   type MprisAction,
+  type MprisArtwork,
   type MprisPlayer,
   type PortalRequest,
   type PortalChoiceValue,
@@ -46,6 +38,7 @@ import {
   type TrayMenu,
   type TrayMenuNode,
 } from "@blit-sh/core";
+import { createRemoteCommandAnchor } from "./mediaSessionAnchor";
 import { desktopWorkerRegistration } from "./preview";
 import {
   desktopDelivery,
@@ -105,6 +98,16 @@ function imageUrl(
     );
   }
   return `data:image/png;base64,${btoa(binary)}`;
+}
+
+/**
+ * Source for a player's cover. A forwarded URL is used as-is so the browser
+ * fetches it off this thread and caches it across track changes; only art that
+ * arrived as bytes pays the base64 encode below.
+ */
+function artworkUrl(artwork: MprisArtwork | null): string | undefined {
+  if (!artwork) return undefined;
+  return artwork.kind === "url" ? artwork.url : imageUrl(artwork);
 }
 
 function mediaTime(microseconds: number): string {
@@ -275,6 +278,43 @@ function MprisChrome(props: {
     (entry.player.capabilityFlags & (MPRIS_CAN_CONTROL | flag)) ===
       (MPRIS_CAN_CONTROL | flag);
 
+  // WebKit picks Now Playing artwork out of the array by `sizes` and shows
+  // nothing when no entry declares one, so a cover without it reaches iPadOS as
+  // a blank tile. Neither artwork kind carries dimensions — a forwarded URL has
+  // none to send — so they are measured here instead: the browser has to decode
+  // the image anyway, and its intrinsic size is the truth a server guess would
+  // only approximate. `null` records a source that failed, so a broken cover is
+  // attempted once rather than on every metadata change.
+  const [artworkSizes, setArtworkSizes] = createSignal<
+    ReadonlyMap<string, string | null>
+  >(new Map());
+  const measureArtwork = (src: string) => {
+    if (artworkSizes().has(src)) return;
+    setArtworkSizes((known) => new Map(known).set(src, null));
+    const image = new Image();
+    const settle = (size: string | null) =>
+      setArtworkSizes((known) => {
+        // One entry per track, and a track change makes the old one dead
+        // weight; the cap keeps a long listening session from accumulating.
+        const next =
+          known.size >= 32 ? new Map<string, string | null>() : new Map(known);
+        return next.set(src, size);
+      });
+    image.onload = () =>
+      settle(
+        image.naturalWidth > 0
+          ? `${image.naturalWidth}x${image.naturalHeight}`
+          : null,
+      );
+    image.onerror = () => settle(null);
+    image.src = src;
+  };
+
+  // Created once and reused: the element itself is the routing target, so
+  // rebuilding it per track would drop the audio session it exists to hold.
+  const commandAnchor = createRemoteCommandAnchor();
+  onCleanup(() => commandAnchor?.dispose());
+
   createEffect(() => {
     const entry = mediaSessionActive();
     if (!("mediaSession" in navigator)) return;
@@ -306,24 +346,29 @@ function MprisChrome(props: {
       }
     };
     clear();
-    if (!entry) return;
+    if (!entry) {
+      commandAnchor?.release();
+      return;
+    }
     const player = entry.player;
-    const artwork = player.artwork ? imageUrl(player.artwork) : undefined;
-    session.metadata = new MediaMetadata({
-      title: player.title || player.identity,
-      artist: player.artists.join(", "),
-      album: player.album,
-      artwork:
-        artwork && player.artwork
-          ? [
-              {
-                src: artwork,
-                sizes: `${player.artwork.width}x${player.artwork.height}`,
-                type: "image/png",
-              },
-            ]
+    const artwork = artworkUrl(player.artwork);
+    if (artwork) measureArtwork(artwork);
+    const size = artwork ? artworkSizes().get(artwork) : undefined;
+    // Constructing metadata must not be able to cost the transport controls:
+    // a throw here would skip the playback state and every action handler
+    // below, leaving a Now Playing panel whose buttons do nothing.
+    try {
+      session.metadata = new MediaMetadata({
+        title: player.title || player.identity,
+        artist: player.artists.join(", "),
+        album: player.album,
+        artwork: artwork
+          ? [size ? { src: artwork, sizes: size } : { src: artwork }]
           : [],
-    });
+      });
+    } catch {
+      // A partial implementation may reject metadata it cannot represent.
+    }
     session.playbackState =
       player.playbackStatus === "stopped" ? "none" : player.playbackStatus;
     const handler = (
@@ -375,6 +420,19 @@ function MprisChrome(props: {
         trackRevision: player.trackRevision,
       });
     });
+    // Hold the audio session only while something is actually controllable:
+    // a player exposing no transport has no commands to route, and the session
+    // is not worth claiming for a panel that would ignore it anyway.
+    if (
+      capable(entry, MPRIS_CAN_PLAY) ||
+      capable(entry, MPRIS_CAN_PAUSE) ||
+      capable(entry, MPRIS_CAN_GO_NEXT) ||
+      capable(entry, MPRIS_CAN_GO_PREVIOUS)
+    ) {
+      commandAnchor?.engage();
+    } else {
+      commandAnchor?.release();
+    }
     if (player.lengthUs > 0 && player.rate > 0) {
       try {
         const position =
@@ -459,7 +517,7 @@ function MprisChrome(props: {
               "font-size": `${props.scale.sm}px`,
             }}
           >
-            ♪ {current.player.title || current.player.identity}
+            {current.player.title || current.player.identity}
           </button>
           <Show when={open()}>
             <Popup
@@ -469,8 +527,7 @@ function MprisChrome(props: {
             >
               <For each={players()}>
                 {(entry) => {
-                  const art = () =>
-                    entry.player.artwork && imageUrl(entry.player.artwork);
+                  const art = () => artworkUrl(entry.player.artwork);
                   return (
                     <article
                       style={{
@@ -580,385 +637,6 @@ function MprisChrome(props: {
         </span>
       )}
     </Show>
-  );
-}
-
-function MediaDeviceChrome(props: {
-  workspace: BlitWorkspace;
-  connections: readonly BlitConnectionSnapshot[];
-  connectionLabels: ReadonlyMap<string, string>;
-  readOnlyConnections: ReadonlySet<string>;
-  theme: Theme;
-  scale: UIScale;
-}) {
-  const [busy, setBusy] = createSignal(false);
-  const [error, setError] = createSignal("");
-  const [preferOpus, setPreferOpus] = createSignal(true);
-  const [opusAvailable, setOpusAvailable] = createSignal(false);
-  const [cameraCodecs, setCameraCodecs] = createSignal(0);
-  const [mediaCapabilitiesReady, setMediaCapabilitiesReady] =
-    createSignal(false);
-  const advertised = new Map<string, string>();
-  const entries = createMemo(() =>
-    props.connections
-      .map((snapshot) => ({
-        snapshot,
-        connection: props.workspace.getConnection(snapshot.id),
-        label: props.connectionLabels.get(snapshot.id) ?? snapshot.id,
-        readOnly: props.readOnlyConnections.has(snapshot.id),
-      }))
-      .filter(
-        (entry) => entry.snapshot.supportsDesktopMedia && entry.connection,
-      ),
-  );
-  const microphoneAvailable = createMemo(() =>
-    entries().find(
-      (entry) =>
-        !entry.readOnly &&
-        Boolean(
-          entry.connection!.mediaStore.state.runtimeFlags & RUNTIME_MICROPHONE,
-        ),
-    ),
-  );
-  const cameraAvailable = createMemo(() =>
-    entries().find(
-      (entry) =>
-        !entry.readOnly &&
-        Boolean(
-          cameraCodecs() & entry.connection!.mediaStore.serverVideoCodecs,
-        ) &&
-        Boolean(
-          entry.connection!.mediaStore.state.runtimeFlags & RUNTIME_CAMERA,
-        ),
-    ),
-  );
-  const localMicrophone = createMemo(() =>
-    entries().find(
-      (entry) => entry.connection!.mediaStore.microphone.status !== "inactive",
-    ),
-  );
-  const localCamera = createMemo(() =>
-    entries().find(
-      (entry) => entry.connection!.mediaStore.camera.status !== "inactive",
-    ),
-  );
-  const activeMicrophones = createMemo(() =>
-    entries().filter(
-      (entry) =>
-        entry.connection!.mediaStore.microphone.status !== "inactive" ||
-        Boolean(
-          entry.connection!.mediaStore.state.activeFlags & ACTIVE_MICROPHONE,
-        ),
-    ),
-  );
-  const activeCameras = createMemo(() =>
-    entries().filter(
-      (entry) =>
-        entry.connection!.mediaStore.camera.status !== "inactive" ||
-        Boolean(entry.connection!.mediaStore.state.activeFlags & ACTIVE_CAMERA),
-    ),
-  );
-  const activeScreenCasts = createMemo(() =>
-    entries().flatMap((entry) =>
-      entry.connection!.mediaStore.state.screencasts.map((session) => ({
-        ...entry,
-        session,
-      })),
-    ),
-  );
-
-  createEffect(() => {
-    // The server accepts at most one capability update per second. Wait for
-    // the asynchronous codec probe so the initial advertisement is final
-    // instead of racing a baseline-only update against the Opus result.
-    if (!mediaCapabilitiesReady()) return;
-    for (const entry of entries()) {
-      const videoCodecs =
-        cameraCodecs() & entry.connection!.mediaStore.serverVideoCodecs;
-      const maxFps = videoCodecs & ~VIDEO_CODEC_MJPEG ? 30 : 15;
-      const generation = `${entry.snapshot.generation}:${Number(opusAvailable())}:${videoCodecs}`;
-      if (entry.readOnly || advertised.get(entry.snapshot.id) === generation) {
-        continue;
-      }
-      entry.connection!.mediaStore.setCapabilities({
-        microphone:
-          typeof AudioContext !== "undefined" &&
-          typeof navigator.mediaDevices?.getUserMedia === "function",
-        camera:
-          Boolean(videoCodecs) &&
-          typeof document !== "undefined" &&
-          typeof navigator.mediaDevices?.getUserMedia === "function",
-        portalUi: true,
-        audioCodecs: AUDIO_CODEC_PCM | (opusAvailable() ? AUDIO_CODEC_OPUS : 0),
-        videoCodecs,
-        maxWidth: 1920,
-        maxHeight: 1080,
-        maxFps,
-      });
-      advertised.set(entry.snapshot.id, generation);
-    }
-  });
-
-  const enableMicrophone = async () => {
-    const entry = microphoneAvailable();
-    if (!entry || busy()) return;
-    setBusy(true);
-    setError("");
-    let stream: MediaStream | null = null;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: { ideal: 1 },
-          echoCancellation: { ideal: true },
-          noiseSuppression: { ideal: true },
-          autoGainControl: { ideal: true },
-        },
-        video: false,
-      });
-      const track = stream.getAudioTracks()[0];
-      if (!track) throw new Error("No microphone track was returned");
-      if (
-        !window.confirm(
-          `${t("desktop.mediaShareMicrophone")}\n\n${entry.label}`,
-        )
-      ) {
-        stream.getTracks().forEach((item) => item.stop());
-        return;
-      }
-      const useOpus = preferOpus() && (await probeOpusMicrophone());
-      if (useOpus) setOpusAvailable(true);
-      await entry.connection!.mediaStore.startMicrophone(
-        track,
-        useOpus ? {} : { codec: "pcm" },
-      );
-    } catch (reason) {
-      stream?.getTracks().forEach((track) => track.stop());
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setBusy(false);
-    }
-  };
-  const enableCamera = async () => {
-    const entry = cameraAvailable();
-    if (!entry || busy()) return;
-    const availableCodecs =
-      cameraCodecs() & entry.connection!.mediaStore.serverVideoCodecs;
-    const maxFps = availableCodecs & ~VIDEO_CODEC_MJPEG ? 30 : 15;
-    setBusy(true);
-    setError("");
-    let stream: MediaStream | null = null;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: {
-          facingMode: { ideal: "user" },
-          width: { ideal: 1280, max: 1920 },
-          height: { ideal: 720, max: 1080 },
-          frameRate: { ideal: maxFps, max: maxFps },
-        },
-      });
-      const track = stream.getVideoTracks()[0];
-      if (!track) throw new Error("No camera track was returned");
-      if (
-        !window.confirm(`${t("desktop.mediaShareCamera")}\n\n${entry.label}`)
-      ) {
-        stream.getTracks().forEach((item) => item.stop());
-        return;
-      }
-      await entry.connection!.mediaStore.startCamera(track, {
-        width: 1280,
-        height: 720,
-      });
-    } catch (reason) {
-      stream?.getTracks().forEach((track) => track.stop());
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  onMount(() => {
-    void Promise.all([probeOpusMicrophone(), probeCameraCodecs()])
-      .then(
-        ([opus, videoCodecs]) => {
-          setOpusAvailable(opus);
-          setCameraCodecs(videoCodecs);
-        },
-        () => {},
-      )
-      .finally(() => setMediaCapabilitiesReady(true));
-    try {
-      setPreferOpus(localStorage.getItem("blit.media.microphone.opus") !== "0");
-    } catch {
-      // Storage may be unavailable in embedded/privacy contexts.
-    }
-  });
-
-  return (
-    <>
-      <For each={activeScreenCasts()}>
-        {(entry) => (
-          <span
-            title={`${t("desktop.mediaScreenCastActive")} · ${[
-              entry.session.appId,
-              entry.label,
-            ]
-              .filter(Boolean)
-              .join(" · ")}`}
-            style={{
-              display: "inline-flex",
-              "align-items": "center",
-              gap: `${props.scale.tightGap}px`,
-              padding: `0 ${props.scale.tightGap}px`,
-              color: props.theme.warning,
-              "font-size": `${props.scale.sm}px`,
-            }}
-          >
-            ● 🖥 {entry.session.appId || entry.label} ·{" "}
-            {t("desktop.mediaWindows")}{" "}
-            {entry.session.surfaceIds
-              .map((surfaceId) => `#${surfaceId}`)
-              .join(", ")}
-            <Show when={!entry.readOnly}>
-              <button
-                onClick={() =>
-                  entry.connection!.mediaStore.stopScreenCast(
-                    entry.session.sessionId,
-                  )
-                }
-                style={ui.btn}
-              >
-                {t("desktop.mediaStop")}
-              </button>
-            </Show>
-          </span>
-        )}
-      </For>
-      <For each={activeMicrophones()}>
-        {(entry) => (
-          <span
-            title={`${t("desktop.mediaMicrophoneActive")} · ${entry.label}`}
-            style={{
-              display: "inline-flex",
-              "align-items": "center",
-              gap: `${props.scale.tightGap}px`,
-              padding: `0 ${props.scale.tightGap}px`,
-              color: props.theme.warning,
-              "font-size": `${props.scale.sm}px`,
-            }}
-          >
-            ● 🎙 {entry.label}
-            <Show
-              when={
-                entry.connection!.mediaStore.microphone.status !== "inactive"
-              }
-            >
-              <button
-                onClick={() => entry.connection!.mediaStore.stop("microphone")}
-                style={ui.btn}
-              >
-                {t("desktop.mediaStop")}
-              </button>
-            </Show>
-          </span>
-        )}
-      </For>
-      <For each={activeCameras()}>
-        {(entry) => (
-          <span
-            title={`${t("desktop.mediaCameraActive")} · ${entry.label}`}
-            style={{
-              display: "inline-flex",
-              "align-items": "center",
-              gap: `${props.scale.tightGap}px`,
-              padding: `0 ${props.scale.tightGap}px`,
-              color: props.theme.warning,
-              "font-size": `${props.scale.sm}px`,
-            }}
-          >
-            <Show when={entry.connection!.mediaStore.cameraTrack}>
-              {(track) => (
-                <video
-                  ref={(element) => {
-                    element.srcObject = new MediaStream([track()]);
-                    element.muted = true;
-                    void element.play();
-                  }}
-                  aria-label={t("desktop.mediaCameraPreview")}
-                  style={{
-                    width: "3em",
-                    height: "2em",
-                    "object-fit": "cover",
-                    transform: "scaleX(-1)",
-                  }}
-                />
-              )}
-            </Show>
-            ● 📷 {entry.label}
-            <Show
-              when={entry.connection!.mediaStore.camera.status !== "inactive"}
-            >
-              <button
-                onClick={() => entry.connection!.mediaStore.stop("camera")}
-                style={ui.btn}
-              >
-                {t("desktop.mediaStop")}
-              </button>
-            </Show>
-          </span>
-        )}
-      </For>
-      <Show when={activeMicrophones().length === 0 && microphoneAvailable()}>
-        <Show when={opusAvailable()}>
-          <label
-            title={t("desktop.mediaOpusHint")}
-            style={{
-              display: "inline-flex",
-              "align-items": "center",
-              gap: "0.2em",
-              "font-size": `${props.scale.sm}px`,
-              color: props.theme.dimFg,
-            }}
-          >
-            <input
-              type="checkbox"
-              checked={preferOpus()}
-              onChange={(event) => {
-                const enabled = event.currentTarget.checked;
-                setPreferOpus(enabled);
-                try {
-                  localStorage.setItem(
-                    "blit.media.microphone.opus",
-                    enabled ? "1" : "0",
-                  );
-                } catch {
-                  // The in-memory choice still applies for this page.
-                }
-              }}
-            />
-            Opus
-          </label>
-        </Show>
-        <button
-          disabled={busy() || Boolean(localMicrophone())}
-          onClick={() => void enableMicrophone()}
-          title={error() || t("desktop.mediaShareMicrophone")}
-          style={{ ...ui.btn, "font-size": `${props.scale.md}px` }}
-        >
-          🎙{busy() ? "…" : ""}
-        </button>
-      </Show>
-      <Show when={activeCameras().length === 0 && cameraAvailable()}>
-        <button
-          disabled={busy() || Boolean(localCamera())}
-          onClick={() => void enableCamera()}
-          title={error() || t("desktop.mediaShareCamera")}
-          style={{ ...ui.btn, "font-size": `${props.scale.md}px` }}
-        >
-          📷{busy() ? "…" : ""}
-        </button>
-      </Show>
-    </>
   );
 }
 
@@ -1939,14 +1617,10 @@ export function DesktopChrome(props: {
       data-blit-desktop-chrome=""
       style={{ display: "flex", "align-items": "center", position: "relative" }}
     >
-      <MediaDeviceChrome
-        workspace={props.workspace}
-        connections={props.connections}
-        connectionLabels={props.connectionLabels}
-        readOnlyConnections={props.readOnlyConnections}
-        theme={props.theme}
-        scale={props.scale}
-      />
+      {/* Camera and microphone are not here: their controls, their preview
+          and their privacy indicator all belong to the media panel, which
+          costs the bar one glyph instead of a row of chips. See
+          `mediaDevices.ts` and the `media` entry in StatusBar's tools. */}
       <PortalChrome
         workspace={props.workspace}
         connections={props.connections}

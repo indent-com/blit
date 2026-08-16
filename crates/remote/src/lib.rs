@@ -571,7 +571,8 @@ pub const S2C_SCROLL_OFFSET: u8 = 0x11;
 /// [0x12][nonce:2][self_id:8][count:4][client:N]...
 ///
 /// Each client is
-/// `[client_id:8][age_secs:8][outbound_bytes_per_sec:8][terminal_count:2]`
+/// `[client_id:8][age_secs:8][outbound_bytes_per_sec:8]`
+/// `[inbound_bytes_per_sec:8][terminal_count:2]`
 /// `[surface_count:2][subscription_count:2]`, followed by
 /// `[pty_id:2][rows:2][cols:2]` terminal records and
 /// `[surface_id:2][width:2][height:2][scale_120:2]` surface records, then
@@ -583,6 +584,10 @@ pub const S2C_SCROLL_OFFSET: u8 = 0x11;
 /// subscriptions are listed; zero size fields mean the client has not reported
 /// a view size.
 pub const S2C_CLIENT_LIST: u8 = 0x12;
+/// Fixed part of one `S2C_CLIENT_LIST` entry, before its variable-length
+/// terminal/surface/subscription records. Named because the encoder, the
+/// parser and both of the parser's bounds checks have to agree on it.
+pub const CLIENT_LIST_ENTRY_HEADER: usize = 38;
 /// Correlated kick outcome:
 /// [0x13][nonce:2][status:1][detail:N].
 ///
@@ -786,13 +791,19 @@ pub const AUDIO_FRAME_CODEC_OPUS: u8 = 0 << 1;
 /// socket for the full duration of a multi-hundred-KB write, starving
 /// audio delivery and producing audible gaps on the client.
 ///
+/// Split by whoever can see the link: the gateway for latency, since it
+/// holds the browser's socket, and the server only for the frame ceiling.
+/// A fragment may itself be re-split — the header is peeled rather than
+/// nested, so the receiver always sees one flat sequence.
+///
 /// Flags:
 ///   bit 0 (FRAGMENT_FLAG_LAST) — this is the last fragment; the receiver
 ///     should concatenate all fragments of this message (in order) and
 ///     dispatch the reassembled buffer as if it were a single message.
 ///
-/// Fragments of different messages do NOT interleave: TCP preserves
-/// order and the server only splits one message at a time, so the
+/// Fragments of different messages do NOT interleave: the stream is
+/// ordered and a sender finishes splitting one message before it starts
+/// another, so the
 /// receiver can use a single pending-reassembly buffer with no fragment
 /// id or sequence number.  S2C_AUDIO_FRAME messages may appear between
 /// fragments and are handled normally — they don't contribute to the
@@ -2394,6 +2405,11 @@ pub struct ClientListEntry {
     /// Actual framed bytes written from the server to this client per second,
     /// sampled over the latest complete interval.
     pub outbound_bytes_per_sec: u64,
+    /// The same measurement in the other direction: framed bytes read from
+    /// this client per second. Both are the server's own accounting of the
+    /// socket, which is why they are uniform across client kinds — a CLI
+    /// reports nothing about itself, and neither does a browser.
+    pub inbound_bytes_per_sec: u64,
     pub terminals: Vec<ClientTerminalSubscription>,
     pub surfaces: Vec<ClientSurfaceSubscription>,
     pub subscriptions: Vec<ClientAuxSubscription>,
@@ -2872,7 +2888,7 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             let self_id = u64::from_le_bytes(data[3..11].try_into().ok()?);
             let count = u32::from_le_bytes(data[11..15].try_into().ok()?) as usize;
             let mut offset = 15usize;
-            if count > data.len().saturating_sub(offset) / 30 {
+            if count > data.len().saturating_sub(offset) / CLIENT_LIST_ENTRY_HEADER {
                 return None;
             }
             let mut clients = Vec::with_capacity(count);
@@ -2882,16 +2898,18 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
                     u64::from_le_bytes(data.get(offset + 8..offset + 16)?.try_into().ok()?);
                 let outbound_bytes_per_sec =
                     u64::from_le_bytes(data.get(offset + 16..offset + 24)?.try_into().ok()?);
+                let inbound_bytes_per_sec =
+                    u64::from_le_bytes(data.get(offset + 24..offset + 32)?.try_into().ok()?);
                 let terminal_count =
-                    u16::from_le_bytes(data.get(offset + 24..offset + 26)?.try_into().ok()?)
+                    u16::from_le_bytes(data.get(offset + 32..offset + 34)?.try_into().ok()?)
                         as usize;
                 let surface_count =
-                    u16::from_le_bytes(data.get(offset + 26..offset + 28)?.try_into().ok()?)
+                    u16::from_le_bytes(data.get(offset + 34..offset + 36)?.try_into().ok()?)
                         as usize;
                 let subscription_count =
-                    u16::from_le_bytes(data.get(offset + 28..offset + 30)?.try_into().ok()?)
+                    u16::from_le_bytes(data.get(offset + 36..offset + 38)?.try_into().ok()?)
                         as usize;
-                offset += 30;
+                offset += CLIENT_LIST_ENTRY_HEADER;
                 let terminal_bytes = terminal_count.checked_mul(6)?;
                 let surface_bytes = surface_count.checked_mul(8)?;
                 let subscription_bytes = subscription_count.checked_mul(3)?;
@@ -2936,6 +2954,7 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
                     client_id,
                     age_secs,
                     outbound_bytes_per_sec,
+                    inbound_bytes_per_sec,
                     terminals,
                     surfaces,
                     subscriptions,
@@ -3466,6 +3485,7 @@ pub fn msg_s2c_client_list(nonce: u16, self_id: u64, clients: &[ClientListEntry]
         msg.extend_from_slice(&client.client_id.to_le_bytes());
         msg.extend_from_slice(&client.age_secs.to_le_bytes());
         msg.extend_from_slice(&client.outbound_bytes_per_sec.to_le_bytes());
+        msg.extend_from_slice(&client.inbound_bytes_per_sec.to_le_bytes());
         msg.extend_from_slice(&(terminal_count as u16).to_le_bytes());
         msg.extend_from_slice(&(surface_count as u16).to_le_bytes());
         msg.extend_from_slice(&(subscription_count as u16).to_le_bytes());
@@ -5459,7 +5479,10 @@ mod tests {
             &[ClientListEntry {
                 client_id: 8,
                 age_secs: 42,
+                // Distinct from the inbound figure: equal values would let a
+                // swapped encode/decode pair pass.
                 outbound_bytes_per_sec: 123_456,
+                inbound_bytes_per_sec: 7_890,
                 terminals: vec![ClientTerminalSubscription {
                     pty_id: 4,
                     rows: 24,
@@ -5486,7 +5509,10 @@ mod tests {
             }) if clients == [ClientListEntry {
                 client_id: 8,
                 age_secs: 42,
+                // Distinct from the inbound figure: equal values would let a
+                // swapped encode/decode pair pass.
                 outbound_bytes_per_sec: 123_456,
+                inbound_bytes_per_sec: 7_890,
                 terminals: vec![ClientTerminalSubscription {
                     pty_id: 4,
                     rows: 24,

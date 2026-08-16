@@ -74,8 +74,20 @@ const INDEX_HTML_BR: &[u8] = include_bytes!("../../../js/ui/dist/index.html.br")
 /// app bundle: it needs its own URL and a JavaScript MIME type.
 const SW_JS_BR: &[u8] = include_bytes!("../../../js/ui/dist/sw.js.br");
 
+/// Workers the UI spawns. Each is a separate asset because a worker cannot be
+/// inlined into the single-file build, and each therefore needs a route: an
+/// unserved worker fails only in production, where a dev server is not there
+/// to hand the file over.
+const MUX_WORKER_BR: &[u8] = include_bytes!("../../../js/ui/dist/mux-worker.js.br");
+const BUFFER_RECYCLER_WORKER_BR: &[u8] =
+    include_bytes!("../../../js/ui/dist/buffer-recycler-worker.js.br");
+
 static INDEX_ETAG: LazyLock<String> = LazyLock::new(|| blit_webserver::html_etag(INDEX_HTML_BR));
 static SW_ETAG: LazyLock<String> = LazyLock::new(|| blit_webserver::html_etag(SW_JS_BR));
+static MUX_WORKER_ETAG: LazyLock<String> =
+    LazyLock::new(|| blit_webserver::html_etag(MUX_WORKER_BR));
+static BUFFER_RECYCLER_ETAG: LazyLock<String> =
+    LazyLock::new(|| blit_webserver::html_etag(BUFFER_RECYCLER_WORKER_BR));
 
 type DestMap = std::collections::HashMap<String, GatewayConnector>;
 
@@ -470,6 +482,16 @@ const CONFIG_MAX_MESSAGE_SIZE: usize = 64 * 1024;
 /// reads the socket directly.
 const MUX_CLIENT_QUEUE_FRAMES: usize = 8;
 
+/// Audio frames held for one browser, across every channel.
+///
+/// Audio has its own lane because it is the one stream where arriving late is
+/// indistinguishable from not arriving: a video frame that is 40 ms behind is
+/// 40 ms of staleness, an audio frame that is 40 ms behind is a gap the
+/// listener hears. Deep enough to ride out a burst, and far shallower than
+/// the point where the frames would be stale on arrival anyway — the server
+/// already discards its own backlog past 500 ms.
+const MUX_AUDIO_QUEUE_FRAMES: usize = 64;
+
 /// Mux control frames (OPENED / CLOSED / errors) queued for one browser.
 /// Every one is a handful of bytes and they are only produced in response to
 /// client actions, so this is generous — it exists because a client can spam
@@ -790,6 +812,244 @@ const MUX_S2C_ERROR: u8 = 0x83;
 /// transport-level timeout.
 const S2C_QUIT: u8 = 0x0C;
 
+/// Blit protocol: one piece of a split logical message.
+const S2C_FRAGMENT: u8 = 0x2B;
+const FRAGMENT_FLAG_LAST: u8 = 1 << 0;
+
+/// Blit protocol: an encoded audio frame.
+const S2C_AUDIO_FRAME: u8 = 0x30;
+
+/// How the last hop we can see treats audio, under `BLIT_AUDIO_DEBUG`.
+///
+/// The server reports the same three numbers for its own writer, and they
+/// come out clean — 50 writes a second, worst gap 21 ms against a 20 ms
+/// cadence, no measurable write time. That only proves audio reaches the
+/// gateway on time. This is the socket to the browser, and it is the last
+/// place a gap can be manufactured where anyone can still watch it happen:
+/// past here the evidence is the listener.
+///
+/// `gap` is between successive audio writes, so it should track the 20 ms
+/// cadence. `write` is how long the socket took to accept the frame — a
+/// backed-up link shows up here and nowhere else.
+struct AudioTrace {
+    enabled: bool,
+    window_start: std::time::Instant,
+    last_write_at: std::time::Instant,
+    writes: u32,
+    max_gap_ms: u32,
+    max_write_ms: u32,
+    behind_bulk_ms: u32,
+}
+
+impl AudioTrace {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            enabled: std::env::var_os("BLIT_AUDIO_DEBUG").is_some(),
+            window_start: now,
+            last_write_at: now,
+            writes: 0,
+            max_gap_ms: 0,
+            max_write_ms: 0,
+            behind_bulk_ms: 0,
+        }
+    }
+
+    /// A bulk frame held the socket for `elapsed` — the delay audio would
+    /// have paid had it arrived at the wrong moment.
+    fn saw_bulk(&mut self, elapsed: std::time::Duration) {
+        if !self.enabled {
+            return;
+        }
+        self.behind_bulk_ms = self.behind_bulk_ms.max(elapsed.as_millis() as u32);
+    }
+
+    fn saw_audio(&mut self, started: std::time::Instant, finished: std::time::Instant) {
+        if !self.enabled {
+            return;
+        }
+        self.writes += 1;
+        self.max_gap_ms = self
+            .max_gap_ms
+            .max(started.duration_since(self.last_write_at).as_millis() as u32);
+        self.max_write_ms = self
+            .max_write_ms
+            .max(finished.duration_since(started).as_millis() as u32);
+        self.last_write_at = finished;
+        if finished.duration_since(self.window_start) >= std::time::Duration::from_secs(1) {
+            eprintln!(
+                "[gateway audio] writes={} max_gap={}ms max_write={}ms max_bulk_hold={}ms",
+                self.writes, self.max_gap_ms, self.max_write_ms, self.behind_bulk_ms,
+            );
+            self.window_start = finished;
+            self.writes = 0;
+            self.max_gap_ms = 0;
+            self.max_write_ms = 0;
+            self.behind_bulk_ms = 0;
+        }
+    }
+}
+
+/// Splitting bulk frames so audio is not stuck behind them.
+///
+/// This used to live in the server, sized from how long its `write` took —
+/// but the server writes to a unix socket, so it measured the kernel
+/// accepting bytes rather than the link carrying them, and on a fast local
+/// socket it never triggered. The gateway holds the socket to the browser,
+/// which is the link that actually delays audio, so the same decision is
+/// correct here and meaningless there.
+///
+/// What this buys is bounded: it caps how long audio waits *behind* bytes
+/// already queued. It does nothing for a packet lost in flight, because a
+/// reliable ordered stream will not deliver past a gap however it is framed.
+/// That case needs a delivery mode without retransmission, not smaller
+/// pieces.
+mod bulk {
+    use std::time::Duration;
+
+    /// Chunk size once the socket has shown real backpressure. 4 KiB bounds
+    /// audio head-of-line time to roughly 4 ms on a 1 MB/s link.
+    ///
+    /// Splitting every video frame unconditionally is not free: a 240 Hz
+    /// 40-70 KiB stream becomes thousands of messages a second, and browsers
+    /// process those in batches, so complete frames arrive with visible gaps
+    /// even when the byte count is exact. Hence a trigger rather than always.
+    pub const CHUNK_BYTES: usize = 4 * 1024;
+
+    /// Payload size split on sight, before any backpressure is measured.
+    ///
+    /// The first big frame arrives before there is anything to measure, and
+    /// half a megabyte is tens of milliseconds of link time with audio behind
+    /// it. Well above the 40-70 KiB of an ordinary video frame, so the steady
+    /// stream still pays no fragmentation cost.
+    pub const ALWAYS_BYTES: usize = 128 * 1024;
+
+    /// Most pieces one frame may be split into.
+    ///
+    /// The receiver aborts a reassembly past `MAX_FRAGMENT_COUNT` (16,384)
+    /// pieces, and a logical message can already reach the gateway as several
+    /// frames — the server still splits at the 16 MiB frame ceiling. Capping
+    /// per frame well under the receiver's limit keeps the total safe without
+    /// the gateway having to track logical messages.
+    pub const MAX_CHUNKS_PER_FRAME: usize = 2048;
+
+    const TRIGGER: Duration = Duration::from_millis(5);
+    const SLOW_CONFIRMATIONS: u8 = 2;
+    const RECOVERY: Duration = Duration::from_millis(2);
+    const RECOVERY_WRITES: u8 = 32;
+
+    #[derive(Default)]
+    pub struct Fragmentation {
+        active: bool,
+        slow_writes: u8,
+        fast_writes: u8,
+    }
+
+    impl Fragmentation {
+        /// Chunk size for a payload of `bytes`, or `None` to write it whole.
+        pub fn chunk_bytes(&self, bytes: usize) -> Option<usize> {
+            if !self.active && bytes < ALWAYS_BYTES {
+                return None;
+            }
+            Some(CHUNK_BYTES.max(bytes.div_ceil(MAX_CHUNKS_PER_FRAME)))
+        }
+
+        /// Feed back how long a write of `bytes` took.
+        pub fn observe(&mut self, bytes: usize, elapsed: Duration) {
+            if bytes <= CHUNK_BYTES {
+                return;
+            }
+            if self.active {
+                if elapsed <= RECOVERY {
+                    self.fast_writes = self.fast_writes.saturating_add(1);
+                    if self.fast_writes >= RECOVERY_WRITES {
+                        *self = Self::default();
+                    }
+                } else {
+                    self.fast_writes = 0;
+                }
+                return;
+            }
+            if elapsed >= TRIGGER {
+                self.slow_writes = self.slow_writes.saturating_add(1);
+                if self.slow_writes >= SLOW_CONFIRMATIONS {
+                    self.active = true;
+                    self.slow_writes = 0;
+                }
+            } else {
+                self.slow_writes = 0;
+            }
+        }
+    }
+}
+
+/// Split one channel's payload into `S2C_FRAGMENT` payloads.
+///
+/// A payload that is already a fragment is split further rather than nested:
+/// its header is peeled off and `FRAGMENT_FLAG_LAST` is carried onto the last
+/// piece only. Fragments concatenate in order, so this is transparent to the
+/// receiver — which is what lets the gateway re-split what the server already
+/// split at the frame ceiling.
+fn fragment_payload(payload: &[u8], chunk_bytes: usize) -> Vec<Vec<u8>> {
+    let (body, ends_message) = if payload.first() == Some(&S2C_FRAGMENT) && payload.len() >= 2 {
+        (&payload[2..], payload[1] & FRAGMENT_FLAG_LAST != 0)
+    } else {
+        (payload, true)
+    };
+    let mut out = Vec::with_capacity(body.len().div_ceil(chunk_bytes).max(1));
+    let mut offset = 0;
+    while offset < body.len() {
+        let end = offset.saturating_add(chunk_bytes).min(body.len());
+        let is_last = end == body.len();
+        let mut frag = Vec::with_capacity(2 + (end - offset));
+        frag.push(S2C_FRAGMENT);
+        frag.push(if is_last && ends_message {
+            FRAGMENT_FLAG_LAST
+        } else {
+            0
+        });
+        frag.extend_from_slice(&body[offset..end]);
+        out.push(frag);
+        offset = end;
+    }
+    out
+}
+
+/// Split a mux data frame into mux frames, or `None` to write it whole.
+///
+/// Takes the whole `[channel_id:2][payload]` frame and returns frames of the
+/// same shape, so the caller does not have to know where the payload starts.
+/// Control frames reach the data queue too — a channel's CLOSED rides behind
+/// its own last bytes deliberately — and those are never split.
+fn fragment_bulk_frame(frame: &[u8], state: &bulk::Fragmentation) -> Option<Vec<Vec<u8>>> {
+    if frame.len() < 3 {
+        return None;
+    }
+    let ch = u16::from_le_bytes([frame[0], frame[1]]);
+    if ch == MUX_CONTROL {
+        return None;
+    }
+    let payload = &frame[2..];
+    let chunk_bytes = state.chunk_bytes(payload.len())?;
+    let pieces = fragment_payload(payload, chunk_bytes);
+    // One piece is the frame itself with two bytes of header added, so
+    // sending it as a fragment is pure overhead.
+    if pieces.len() <= 1 {
+        return None;
+    }
+    Some(
+        pieces
+            .into_iter()
+            .map(|piece| {
+                let mut out = Vec::with_capacity(2 + piece.len());
+                out.extend_from_slice(&frame[0..2]);
+                out.extend_from_slice(&piece);
+                out
+            })
+            .collect(),
+    )
+}
+
 /// Build a mux control frame.
 fn mux_control(opcode: u8, ch: u16) -> Vec<u8> {
     let mut buf = Vec::with_capacity(5);
@@ -874,6 +1134,24 @@ async fn root_handler(State(state): State<AppState>, request: axum::extract::Req
             .get(axum::http::header::ACCEPT_ENCODING)
             .and_then(|v| v.to_str().ok());
         if let Some(resp) = blit_webserver::try_ui_route(&path, SW_JS_BR, &SW_ETAG, inm, ae) {
+            return resp;
+        }
+        // Checked here for the same reason as the service worker: reaching the
+        // SPA fallback would answer a worker request with index.html, and a
+        // worker fed HTML fails in a way that reads as nothing at all.
+        if let Some(resp) = blit_webserver::try_worker_route(
+            &path,
+            &[
+                ("/mux-worker.js", MUX_WORKER_BR, &MUX_WORKER_ETAG),
+                (
+                    "/buffer-recycler-worker.js",
+                    BUFFER_RECYCLER_WORKER_BR,
+                    &BUFFER_RECYCLER_ETAG,
+                ),
+            ],
+            inm,
+            ae,
+        ) {
             return resp;
         }
     }
@@ -1110,6 +1388,10 @@ async fn handle_mux_ws(mut ws: WebSocket, state: AppState, auth_peer: String) {
     // server's outbox always looks empty, its only congestion signal never
     // fires, and the backlog grows in this process instead.
     let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MUX_DATA_QUEUE_FRAMES);
+    // Audio, kept out of the data queue entirely: that queue is one frame
+    // deep on purpose, so a single video frame in it is enough to hold audio
+    // behind a write that can take tens of milliseconds on a real link.
+    let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MUX_AUDIO_QUEUE_FRAMES);
 
     let mut channels: HashMap<u16, MuxChannelState> = HashMap::new();
     let shutdown = state.shutdown.clone();
@@ -1131,16 +1413,57 @@ async fn handle_mux_ws(mut ws: WebSocket, state: AppState, auth_peer: String) {
         let mut ws_tx = ws_tx;
         let mut merge_rx = merge_rx;
         let mut data_rx = data_rx;
+        let mut audio_rx = audio_rx;
+        let mut fragmentation = bulk::Fragmentation::default();
+        let mut trace = AudioTrace::new();
         loop {
-            let data = tokio::select! {
+            let (frame, is_bulk, is_audio) = tokio::select! {
                 biased;
-                ctrl = merge_rx.recv() => ctrl,
-                data = data_rx.recv() => data,
+                ctrl = merge_rx.recv() => (ctrl, false, false),
+                audio = audio_rx.recv() => (audio, false, true),
+                data = data_rx.recv() => (data, true, false),
             };
-            let Some(data) = data else { break };
-            if ws_tx.send(Message::Binary(data.into())).await.is_err() {
+            let Some(frame) = frame else { break };
+            if !is_bulk {
+                let started = std::time::Instant::now();
+                if ws_tx.send(Message::Binary(frame.into())).await.is_err() {
+                    break;
+                }
+                if is_audio {
+                    trace.saw_audio(started, std::time::Instant::now());
+                }
+                continue;
+            }
+            let bytes = frame.len();
+            let started = std::time::Instant::now();
+            let mut ok = true;
+            match fragment_bulk_frame(&frame, &fragmentation) {
+                None => ok = ws_tx.send(Message::Binary(frame.into())).await.is_ok(),
+                Some(pieces) => {
+                    for piece in pieces {
+                        // Audio first, between every piece: splitting the
+                        // frame is only useful if something overtakes it.
+                        while let Ok(audio) = audio_rx.try_recv() {
+                            let at = std::time::Instant::now();
+                            if ws_tx.send(Message::Binary(audio.into())).await.is_err() {
+                                ok = false;
+                                break;
+                            }
+                            trace.saw_audio(at, std::time::Instant::now());
+                        }
+                        if !ok || ws_tx.send(Message::Binary(piece.into())).await.is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !ok {
                 break;
             }
+            let elapsed = started.elapsed();
+            trace.saw_bulk(elapsed);
+            fragmentation.observe(bytes, elapsed);
         }
     });
 
@@ -1201,9 +1524,11 @@ async fn handle_mux_ws(mut ws: WebSocket, state: AppState, auth_peer: String) {
                                     let open_state = state.clone();
                                     let open_merge_tx = merge_tx.clone();
                                     let open_data_tx = data_tx.clone();
+                                    let open_audio_tx = audio_tx.clone();
                                     let abort = open_tasks.spawn(async move {
                                         let ch = mux_open_channel(
                                             open_ch, name, open_state, open_merge_tx, open_data_tx,
+                                            open_audio_tx,
                                         ).await;
                                         (open_ch, ch)
                                     });
@@ -1290,6 +1615,7 @@ async fn mux_open_channel(
     state: AppState,
     merge_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    audio_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> Option<MuxChannelState> {
     let connector = match state.connector_for(&name) {
         Some(c) => c,
@@ -1340,14 +1666,93 @@ async fn mux_open_channel(
     // `send().await` here is the whole point: when the browser stops
     // draining, this stops reading and the upstream socket applies real
     // backpressure to the blit server.
+    let reader_name = name.to_string();
     let reader_task = tokio::spawn(async move {
         let mut r = sock_reader;
+        // Where a gap gets made on the way in, under BLIT_AUDIO_DEBUG.
+        //
+        // This task is the only reader of the upstream socket, so a video
+        // frame that blocks on the data queue also stops audio being read
+        // behind it — the priority lane downstream cannot help with a frame
+        // this task has not picked up yet. `max_gap` is between audio frames
+        // arriving off the socket; `max_block` is the worst time spent handing
+        // a bulk frame on. If the gap is large and the block is not, the delay
+        // was made upstream of this process.
+        let debug = std::env::var_os("BLIT_AUDIO_DEBUG").is_some();
+        let mut window_start = std::time::Instant::now();
+        let mut last_audio_at = window_start;
+        let (mut reads, mut max_gap_ms, mut max_block_ms) = (0u32, 0u32, 0u32);
+        // What sat between two audio frames on the socket. If a gap is bulk
+        // waiting to be read, these are large; if the gap is silence on the
+        // wire, they are zero and the delay was made before the write.
+        let (mut bulk_bytes, mut bulk_frames) = (0usize, 0u32);
+        let (mut worst_bulk_bytes, mut worst_bulk_frames) = (0usize, 0u32);
+        let mut before_read = std::time::Instant::now();
+        let mut wait_ms = 0u32;
+        let mut worst_wait_ms = 0u32;
         while let Some(data) = read_frame(&mut r).await {
+            // How much of the gap was spent with nothing to read, summed
+            // across every read in it — attributing only the last one hides
+            // time spent waiting on a bulk frame that arrived in between. If
+            // a long gap is nearly all wait, the frames were not written yet
+            // and the delay is upstream; if it is not, this process made it.
+            if debug {
+                wait_ms += before_read.elapsed().as_millis() as u32;
+            }
             let mut frame = Vec::with_capacity(2 + data.len());
             frame.extend_from_slice(&ch_id.to_le_bytes());
             frame.extend_from_slice(&data);
-            if data_tx.send(frame).await.is_err() {
+            // Audio takes the priority lane. Sent rather than try_sent so a
+            // browser that stops draining still stalls this reader and lets
+            // the upstream socket back up — the same backpressure the data
+            // queue provides, which is what stops the server's congestion
+            // signal from being hidden in this process.
+            let is_audio = data.first() == Some(&S2C_AUDIO_FRAME);
+            let at = std::time::Instant::now();
+            let queued = if is_audio {
+                audio_tx.send(frame).await
+            } else {
+                data_tx.send(frame).await
+            };
+            if queued.is_err() {
                 break;
+            }
+            if debug {
+                if is_audio {
+                    reads += 1;
+                    let gap = at.duration_since(last_audio_at).as_millis() as u32;
+                    if gap > max_gap_ms {
+                        max_gap_ms = gap;
+                        worst_bulk_bytes = bulk_bytes;
+                        worst_bulk_frames = bulk_frames;
+                        worst_wait_ms = wait_ms;
+                    }
+                    bulk_bytes = 0;
+                    bulk_frames = 0;
+                    wait_ms = 0;
+                    last_audio_at = at;
+                    if at.duration_since(window_start) >= std::time::Duration::from_secs(1) {
+                        eprintln!(
+                            "[gateway reader {reader_name}] audio={reads} \
+                             max_gap={max_gap_ms}ms wait={worst_wait_ms}ms max_block={max_block_ms}ms \
+                             in_gap={worst_bulk_frames}frames/{worst_bulk_bytes}B",
+                        );
+                        window_start = at;
+                        reads = 0;
+                        max_gap_ms = 0;
+                        max_block_ms = 0;
+                        worst_bulk_bytes = 0;
+                        worst_bulk_frames = 0;
+                        worst_wait_ms = 0;
+                    }
+                } else {
+                    bulk_bytes += data.len();
+                    bulk_frames += 1;
+                    max_block_ms = max_block_ms.max(at.elapsed().as_millis() as u32);
+                }
+            }
+            if debug {
+                before_read = std::time::Instant::now();
             }
         }
         // Upstream EOF — inject S2C_QUIT as a data frame so the browser's
@@ -1845,6 +2250,7 @@ async fn handle_mux_wt(
     // the WebSocket mux handler above.
     let (merge_tx, merge_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MUX_CONTROL_QUEUE_FRAMES);
     let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MUX_DATA_QUEUE_FRAMES);
+    let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MUX_AUDIO_QUEUE_FRAMES);
     let mut channels: HashMap<u16, MuxChannelState> = HashMap::new();
     let shutdown = state.shutdown.clone();
 
@@ -1895,19 +2301,62 @@ async fn handle_mux_wt(
         let mut send = send;
         let mut merge_rx = merge_rx;
         let mut data_rx = data_rx;
-        loop {
-            let data = tokio::select! {
-                biased;
-                ctrl = merge_rx.recv() => ctrl,
-                data = data_rx.recv() => data,
-            };
-            let Some(data) = data else { break };
+        let mut audio_rx = audio_rx;
+        let mut fragmentation = bulk::Fragmentation::default();
+        // Length-prefixed on the way out; the reassembly is the browser's.
+        async fn write_one(send: &mut wt::SendStream, data: &[u8]) -> bool {
             let mut frame = Vec::with_capacity(4 + data.len());
             frame.extend_from_slice(&(data.len() as u32).to_le_bytes());
-            frame.extend_from_slice(&data);
-            if send.write_all(&frame).await.is_err() {
+            frame.extend_from_slice(data);
+            send.write_all(&frame).await.is_ok()
+        }
+        let mut trace = AudioTrace::new();
+        loop {
+            let (frame, is_bulk, is_audio) = tokio::select! {
+                biased;
+                ctrl = merge_rx.recv() => (ctrl, false, false),
+                audio = audio_rx.recv() => (audio, false, true),
+                data = data_rx.recv() => (data, true, false),
+            };
+            let Some(frame) = frame else { break };
+            if !is_bulk {
+                let started = std::time::Instant::now();
+                if !write_one(&mut send, &frame).await {
+                    break;
+                }
+                if is_audio {
+                    trace.saw_audio(started, std::time::Instant::now());
+                }
+                continue;
+            }
+            let bytes = frame.len();
+            let started = std::time::Instant::now();
+            let mut ok = true;
+            match fragment_bulk_frame(&frame, &fragmentation) {
+                None => ok = write_one(&mut send, &frame).await,
+                Some(pieces) => {
+                    for piece in pieces {
+                        while let Ok(audio) = audio_rx.try_recv() {
+                            let at = std::time::Instant::now();
+                            if !write_one(&mut send, &audio).await {
+                                ok = false;
+                                break;
+                            }
+                            trace.saw_audio(at, std::time::Instant::now());
+                        }
+                        if !ok || !write_one(&mut send, &piece).await {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !ok {
                 break;
             }
+            let elapsed = started.elapsed();
+            trace.saw_bulk(elapsed);
+            fragmentation.observe(bytes, elapsed);
         }
     });
 
@@ -1957,9 +2406,11 @@ async fn handle_mux_wt(
                             let open_state = state.clone();
                             let open_merge_tx = merge_tx.clone();
                             let open_data_tx = data_tx.clone();
+                            let open_audio_tx = audio_tx.clone();
                             let abort = open_tasks.spawn(async move {
                                 let ch = mux_open_channel(
                                     open_ch, name, open_state, open_merge_tx, open_data_tx,
+                                    open_audio_tx,
                                 ).await;
                                 (open_ch, ch)
                             });
@@ -2015,6 +2466,134 @@ async fn handle_mux_wt(
     }
     eprintln!("mux-wt client disconnected");
     Ok(())
+}
+
+#[cfg(test)]
+mod bulk_fragmentation {
+    use super::*;
+    use std::time::Duration;
+
+    fn data_frame(ch: u16, payload: &[u8]) -> Vec<u8> {
+        let mut f = ch.to_le_bytes().to_vec();
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// Reassemble the way the browser does, so the test asserts on the bytes
+    /// the client ends up with rather than on the framing that carried them.
+    fn reassemble(pieces: &[Vec<u8>]) -> (u16, Vec<u8>, bool) {
+        let ch = u16::from_le_bytes([pieces[0][0], pieces[0][1]]);
+        let mut out = Vec::new();
+        let mut done = false;
+        for piece in pieces {
+            assert_eq!(u16::from_le_bytes([piece[0], piece[1]]), ch);
+            assert_eq!(piece[2], S2C_FRAGMENT);
+            out.extend_from_slice(&piece[4..]);
+            done = piece[3] & FRAGMENT_FLAG_LAST != 0;
+        }
+        (ch, out, done)
+    }
+
+    #[test]
+    fn an_idle_link_does_not_split_ordinary_video_frames() {
+        // The cost of splitting is real — thousands of messages a second that
+        // browsers batch — so a link that has never blocked pays nothing.
+        let state = bulk::Fragmentation::default();
+        let frame = data_frame(3, &vec![7u8; 70 * 1024]);
+        assert!(fragment_bulk_frame(&frame, &state).is_none());
+    }
+
+    #[test]
+    fn a_huge_frame_splits_before_any_backpressure_is_measured() {
+        // Nothing has been measured yet when the first one arrives, and half
+        // a megabyte is tens of milliseconds of link time on its own.
+        let state = bulk::Fragmentation::default();
+        let payload = (0..bulk::ALWAYS_BYTES).map(|i| i as u8).collect::<Vec<_>>();
+        let pieces = fragment_bulk_frame(&data_frame(3, &payload), &state).expect("split");
+        assert!(pieces.len() > 1);
+        let (ch, body, done) = reassemble(&pieces);
+        assert_eq!(ch, 3);
+        assert_eq!(body, payload);
+        assert!(done);
+    }
+
+    #[test]
+    fn splitting_starts_after_writes_are_seen_to_block() {
+        let mut state = bulk::Fragmentation::default();
+        let payload = vec![1u8; 64 * 1024];
+        let frame = data_frame(1, &payload);
+        assert!(fragment_bulk_frame(&frame, &state).is_none());
+
+        state.observe(payload.len(), Duration::from_millis(6));
+        state.observe(payload.len(), Duration::from_millis(6));
+
+        let pieces = fragment_bulk_frame(&frame, &state).expect("split once blocked");
+        assert_eq!(reassemble(&pieces).1, payload);
+    }
+
+    /// The server still splits at the 16 MiB frame ceiling, so the gateway
+    /// receives fragments as well as whole messages. Splitting one further
+    /// must not nest: only the piece that ends the logical message may carry
+    /// LAST, or the browser dispatches a half-received message.
+    #[test]
+    fn re_splitting_a_fragment_does_not_nest() {
+        let mut state = bulk::Fragmentation::default();
+        state.observe(bulk::ALWAYS_BYTES, Duration::from_millis(6));
+        state.observe(bulk::ALWAYS_BYTES, Duration::from_millis(6));
+
+        let body = vec![9u8; 32 * 1024];
+        for (flag, ends) in [(FRAGMENT_FLAG_LAST, true), (0, false)] {
+            let mut payload = vec![S2C_FRAGMENT, flag];
+            payload.extend_from_slice(&body);
+            let pieces = fragment_bulk_frame(&data_frame(2, &payload), &state).expect("split");
+            let (_, out, done) = reassemble(&pieces);
+            assert_eq!(out, body, "payload survives re-splitting");
+            assert_eq!(done, ends, "only a terminal fragment stays terminal");
+            assert!(
+                pieces[..pieces.len() - 1]
+                    .iter()
+                    .all(|p| p[3] & FRAGMENT_FLAG_LAST == 0),
+                "no interior piece claims to end the message",
+            );
+        }
+    }
+
+    #[test]
+    fn control_frames_are_never_split() {
+        // A channel's CLOSED rides the data queue behind its own last bytes;
+        // rewriting it as a fragment would make it a payload for the channel
+        // it is closing.
+        let mut state = bulk::Fragmentation::default();
+        state.observe(bulk::ALWAYS_BYTES, Duration::from_millis(6));
+        state.observe(bulk::ALWAYS_BYTES, Duration::from_millis(6));
+        let frame = data_frame(MUX_CONTROL, &vec![0u8; 256 * 1024]);
+        assert!(fragment_bulk_frame(&frame, &state).is_none());
+    }
+
+    #[test]
+    fn a_frame_is_never_split_past_what_the_receiver_will_reassemble() {
+        // The browser aborts a reassembly past MAX_FRAGMENT_COUNT pieces, and
+        // one logical message can arrive here as several frames.
+        let mut state = bulk::Fragmentation::default();
+        state.observe(bulk::ALWAYS_BYTES, Duration::from_millis(6));
+        state.observe(bulk::ALWAYS_BYTES, Duration::from_millis(6));
+        let frame = data_frame(1, &vec![0u8; 16 * 1024 * 1024]);
+        let pieces = fragment_bulk_frame(&frame, &state).expect("split");
+        assert!(pieces.len() <= bulk::MAX_CHUNKS_PER_FRAME);
+    }
+
+    #[test]
+    fn a_quiet_link_stops_splitting_again() {
+        let mut state = bulk::Fragmentation::default();
+        let payload = vec![1u8; 64 * 1024];
+        state.observe(payload.len(), Duration::from_millis(6));
+        state.observe(payload.len(), Duration::from_millis(6));
+        assert!(fragment_bulk_frame(&data_frame(1, &payload), &state).is_some());
+        for _ in 0..64 {
+            state.observe(payload.len(), Duration::from_micros(100));
+        }
+        assert!(fragment_bulk_frame(&data_frame(1, &payload), &state).is_none());
+    }
 }
 
 #[cfg(test)]

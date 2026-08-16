@@ -15,6 +15,12 @@ export interface KeyboardShortcutHandlers {
   overlay: () => Overlay;
   /** Currently active BSP layout (null = single terminal) */
   activeLayout: () => unknown | null;
+  /**
+   * Whether a genuine multi-pane layout is on screen. Not the same as
+   * `activeLayout() != null`: a single-leaf layout renders the single main
+   * view, so the BSP pane slots are not what the user is looking at.
+   */
+  inBsp: () => boolean;
   /** Currently focused BSP pane ID */
   bspFocusedPaneId: () => string | null;
   /** Current BSP pane→session assignments (null when no layout active) */
@@ -79,16 +85,30 @@ export interface KeyboardShortcutHandlers {
 
 type SurfaceFocusHandlers = Pick<
   KeyboardShortcutHandlers,
-  "focusedSurfaceId" | "bspFocusedPaneId" | "layoutAssignments"
+  "inBsp" | "focusedSurfaceId" | "bspFocusedPaneId" | "layoutAssignments"
 >;
 
-/** Whether keyboard input currently belongs to a Wayland surface. */
+/**
+ * Whether keyboard input currently belongs to a Wayland surface.
+ *
+ * The two slots are mutually exclusive, and this mirrors what Workspace
+ * actually renders: under a real BSP layout only the focused pane's assignment
+ * says what is on screen; otherwise only `focusedSurfaceId` does. Reading both
+ * at once let either one's leftovers speak for a view that is not showing —
+ * and `focusedSurfaceId` is never cleared once BSP takes over (no BSP focus
+ * path touches it, and an `s=` left in the URL hash re-arms it on every load).
+ * That stale "a surface is focused" silently killed Cmd+Enter, Cmd+Shift+Enter,
+ * every Ctrl+Shift chord and Enter-to-restart, in panes holding a terminal or
+ * nothing at all.
+ */
 export function hasFocusedWaylandSurface(h: SurfaceFocusHandlers): boolean {
-  if (h.focusedSurfaceId() != null) return true;
-  const paneId = h.bspFocusedPaneId();
-  if (!paneId) return false;
-  const assignment = h.layoutAssignments()?.assignments[paneId] ?? null;
-  return isSurfaceAssignment(assignment);
+  if (h.inBsp()) {
+    const paneId = h.bspFocusedPaneId();
+    if (!paneId) return false;
+    const assignment = h.layoutAssignments()?.assignments[paneId] ?? null;
+    return isSurfaceAssignment(assignment);
+  }
+  return h.focusedSurfaceId() != null;
 }
 
 export function shouldHandleNewTerminalShortcut(
@@ -237,7 +257,9 @@ export function createMacDeadKeyHandler(
       pending = null;
       unwatchNative();
       if (!active) return;
-      if (active.target.value.slice(active.start, active.end) === active.spacing)
+      if (
+        active.target.value.slice(active.start, active.end) === active.spacing
+      )
         update(active.target, active.start, active.end, "");
     };
     target.addEventListener("compositionstart", onNative, true);

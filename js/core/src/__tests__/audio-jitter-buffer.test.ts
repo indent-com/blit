@@ -22,6 +22,8 @@ import {
   MAX_STAGING_FRAMES,
   SAMPLES_PER_20_MS,
   GROW_FRAMES_PER_UNDERRUN,
+  MAX_LEARNED_FLOOR_SAMPLES,
+  UNDERRUN_REBUFFER_THRESHOLD,
 } from "../AudioPlayer";
 
 const RENDER_QUANTUM = 128;
@@ -231,5 +233,102 @@ describe("audio pre-worklet staging", () => {
       MAX_STAGING_FRAMES + 3,
     );
     player.destroy();
+  });
+});
+
+/**
+ * The buffer has to remember what a link needed, not just react to it.
+ *
+ * Growth is per-underrun and the fast decay is per-five-seconds-of-calm, so
+ * on its own the target returns to the floor within half a minute and meets
+ * the next jitter spike with nothing in hand — which is why occasional
+ * glitches recur indefinitely instead of the buffer settling above them.
+ */
+describe("audio worklet learned floor", () => {
+  let proc: Processor;
+
+  beforeEach(() => {
+    ({ proc } = makeProcessor());
+  });
+
+  /** Play cleanly for `seconds`, keeping the buffer fed the whole way. */
+  const playCleanly = (seconds: number): void => {
+    const blocks = Math.ceil((seconds * 48000) / RENDER_QUANTUM);
+    for (let b = 0; b < blocks; b++) {
+      if (proc.depth() < proc.bufferTarget + SAMPLES_PER_20_MS) {
+        send(proc, pcmFrame());
+      }
+      render(proc, 1);
+    }
+  };
+
+  it("holds the headroom an underrun proved necessary", () => {
+    underrunOnce(proc);
+    const learned = proc.bufferTarget;
+    expect(learned).toBeGreaterThan(MIN_BUFFER_SAMPLES);
+
+    // Long past the fast decay's 25 s unwind, which used to put the target
+    // back on the floor and leave the next spike unprotected. The floor is
+    // allowed to have faded a little by now — what must not happen is all of
+    // the headroom being gone.
+    playCleanly(60);
+    expect(proc.bufferTarget).toBeGreaterThan(MIN_BUFFER_SAMPLES);
+    expect(proc.bufferTarget).toBeLessThanOrEqual(learned);
+  });
+
+  it("gives the latency back once the link has been quiet for minutes", () => {
+    underrunOnce(proc);
+    playCleanly(600);
+    expect(proc.bufferTarget).toBe(MIN_BUFFER_SAMPLES);
+  });
+
+  it("never pins a link at the target ceiling", () => {
+    for (let i = 0; i < 12; i++) underrunOnce(proc);
+    expect(proc.bufferTarget).toBeLessThanOrEqual(MAX_BUFFER_TARGET_SAMPLES);
+    playCleanly(120);
+    // However bad the burst, the floor it settles at is bounded well under
+    // the ceiling — a bad minute must not cost 400 ms for the whole session.
+    expect(proc.bufferTarget).toBeLessThanOrEqual(MAX_LEARNED_FLOOR_SAMPLES);
+  });
+});
+
+/**
+ * Rebuffering stops playback until the buffer refills, so it turns a gap into
+ * a silence of at least the whole buffer target. Triggering it on a hiccup
+ * makes the cure louder than the disease — measured on a real connection, 33
+ * of 37 underruns escalated to one.
+ */
+describe("audio worklet rebuffer threshold", () => {
+  let proc: Processor;
+
+  beforeEach(() => {
+    ({ proc } = makeProcessor());
+  });
+
+  /** Fill, drain, then run dry for `blocks` render quanta. */
+  const starveFor = (blocks: number): void => {
+    const frames = Math.ceil(proc.bufferTarget / SAMPLES_PER_20_MS) + 1;
+    for (let i = 0; i < frames; i++) send(proc, pcmFrame());
+    render(proc, Math.ceil((frames * SAMPLES_PER_20_MS) / RENDER_QUANTUM));
+    render(proc, blocks);
+  };
+
+  it("rides through a brief gap instead of stopping to refill", () => {
+    // 8 ms — what the old threshold treated as a broken stream.
+    starveFor(3);
+    expect(proc.buffering).toBe(false);
+  });
+
+  it("still rebuffers when the stream is genuinely gone", () => {
+    starveFor(UNDERRUN_REBUFFER_THRESHOLD + 1);
+    expect(proc.buffering).toBe(true);
+  });
+
+  it("counts the gap in time, not in render blocks", () => {
+    // The threshold is derived from a duration so it survives a different
+    // render quantum; pin the duration rather than the block count.
+    expect(
+      (UNDERRUN_REBUFFER_THRESHOLD * RENDER_QUANTUM) / 48,
+    ).toBeGreaterThanOrEqual(50);
   });
 });

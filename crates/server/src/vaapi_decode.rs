@@ -2196,9 +2196,11 @@ mod tests {
 
     #[test]
     fn h264_high_444_is_not_aliased_to_va_high() {
-        let mut sps = Sps::default();
-        sps.profile_idc = 244;
-        sps.chroma_format_idc = 3;
+        let sps = Sps {
+            profile_idc: 244,
+            chroma_format_idc: 3,
+            ..Default::default()
+        };
         assert_eq!(h264_chroma(&sps).unwrap(), Chroma::Cs444);
         assert!(h264_profile(&sps).is_err());
     }

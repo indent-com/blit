@@ -137,14 +137,20 @@ viewer receives a downscaled stream at its requested physical size.
 Client control is gated by `FEATURE_CLIENT_CONTROL`. `C2S_CLIENT_LIST` returns
 the requester's own server-assigned `u64` ID plus every live client, including
 the requester, in ascending ID order. Each client is encoded as
-`[client_id:8][age_secs:8][outbound_bytes_per_sec:8][terminal_count:2]`
+`[client_id:8][age_secs:8][outbound_bytes_per_sec:8]`
+`[inbound_bytes_per_sec:8][terminal_count:2]`
 `[surface_count:2][subscription_count:2]`, followed by terminal records
 (`[pty_id:2][rows:2][cols:2]`), surface records
 (`[surface_id:2][width:2][height:2][scale_120:2]`), and auxiliary subscription
 records (`[kind:1][id:2]`). `age_secs` is the whole-second connection age;
 `outbound_bytes_per_sec` is the latest one-second sample of successfully
-written, length-prefixed server-to-client **bytes** — not bits. Zero size
-fields mean that the client subscribed without reporting a view size.
+written, length-prefixed server-to-client **bytes** — not bits — and
+`inbound_bytes_per_sec` is the same sample of length-prefixed bytes read _from_
+the client. Both are the server's own accounting of the socket, taken in one
+tick so the pair covers a single interval. No client of any kind reports its
+own bandwidth, which is what makes a command-line client's figures directly
+comparable to a browser's. Zero size fields mean that the client subscribed
+without reporting a view size.
 
 Auxiliary subscription kinds are `1` audio (ID is zero), `2` filesystem sync,
 `3` Git repo, `4` LSP attachment, `5` KV watch, and `6` network flow. IDs are
@@ -224,7 +230,9 @@ The profile is deny-by-default. It forwards only these client operations:
   The client-control family is blocked in full: `KICK` because it is a write,
   and `CLIENT_LIST` / `CLIENT_WATCH` / `CLIENT_UNWATCH` because enumerating the
   other viewers discloses pty and surface ids this consumer was never offered,
-  plus a once-a-second sample of another viewer's bandwidth.
+  plus a once-a-second sample of another viewer's bandwidth in both
+  directions — upstream especially, which tracks how fast that viewer is
+  typing or uploading.
 - Terminal viewing: `SCROLL`, `FOCUS`, `SUBSCRIBE`, `UNSUBSCRIBE`, `SEARCH`,
   `READ`, and `COPY_RANGE`.
 - Surface viewing: `SURFACE_LIST`, `SURFACE_CAPTURE`, `SURFACE_SUBSCRIBE`,
@@ -981,10 +989,28 @@ Flag bit 0 (`FRAGMENT_FLAG_LAST`) marks the final chunk. Chunks carry the
 original message's bytes verbatim; its opcode arrives in the first chunk. The
 receiver concatenates chunks into one logical message and dispatches it
 normally. Fragments of different messages do not interleave, and the protocol
-permits only `S2C_AUDIO_FRAME` between fragments. Chunk size is transport
-policy: the network writer currently fragments payloads over 4 KiB to protect
-audio latency, while a proposed in-process writer may use larger chunks.
-Receivers must not depend on a particular chunk size. Logical messages may
+permits only `S2C_AUDIO_FRAME` between fragments.
+
+Chunk size is transport policy and receivers must not depend on one. Splitting
+happens wherever the sender can see the link it is writing to:
+
+Both hops split, each measuring its own writes: payloads over 128 KiB on
+sight, dropping to 4 KiB chunks once writes are seen to block and recovering
+when they stop.
+
+- The **server** writes to a unix socket, which looks free while the gateway is
+  keeping up. It is not: the gateway reads one frame at a time into a one-deep
+  queue, so a browser that cannot keep up stops the gateway reading, the socket
+  buffer fills, and a large write here blocks for as long as the link needs.
+- The **gateway** holds the socket to the browser, so its writes measure the
+  latency the listener actually hears.
+
+Splitting at only one of the two leaves audio behind a blocking write at the
+other.
+
+A sender may re-split a fragment it received. Doing so peels the fragment
+header rather than nesting: `FRAGMENT_FLAG_LAST` is carried onto the final
+piece only, so the receiver sees one flat sequence either way. Logical messages may
 exceed the 16 MiB frame limit. What they may not exceed is `MAX_DECOMPRESSED`
 (64 MiB): a receiver aborts a reassembly that grows past it, so that is the real
 ceiling on a logical message, and the one `S2C_LIST` is bounded against.

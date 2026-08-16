@@ -1,3 +1,7 @@
+import {
+  releaseRecordingAudioSession,
+  retainRecordingAudioSession,
+} from "./audioSession";
 import { fsDecompress } from "./fs";
 import { Notifier, type ReactiveStore } from "./reactive";
 import { av1LevelString } from "./videoCodec";
@@ -73,6 +77,19 @@ const MPRIS_CAPABILITIES_ALL = (1 << 11) - 1;
 const MEDIA_FRAGMENT_MAX = 256 * 1024;
 const MICROPHONE_FRAME_MAX = 64 * 1024;
 const CAMERA_FRAME_MAX = 4 * 1024 * 1024;
+/**
+ * How much unsent camera video the transport may hold before the capture
+ * stops adding to it, as time rather than bytes.
+ *
+ * Shorter than the server's lease window on purpose: credit only returns
+ * once a frame has been decoded, so it reacts a whole round trip late, while
+ * the send queue says the link is too slow the moment it is.
+ */
+const CAMERA_QUEUE_TARGET_MS = 200;
+/** Allowance for a lease with no negotiated cadence to scale by. */
+const CAMERA_QUEUE_MIN_BYTES = 64 * 1024;
+/** How often the rate governor looks at the link. */
+const CAMERA_GOVERNOR_INTERVAL_MS = 1_000;
 const MEDIA_FRAGMENT_COUNT_MAX = 16;
 const PORTAL_MESSAGE_MAX = 4 * 1024 * 1024;
 const REVOKE_REASON_MAX = 7;
@@ -134,6 +151,25 @@ export interface CameraOptions {
   width?: number;
   height?: number;
   fps?: number;
+  /**
+   * How many bits the picture is worth. Scales the computed bitrate for the
+   * compressed codecs and the JPEG quantizer for Motion JPEG — the same
+   * intent expressed in whichever currency the codec takes.
+   */
+  quality?: CameraQuality;
+}
+
+export type CameraQuality = "low" | "balanced" | "high";
+
+/** Bitrate multiplier and JPEG quality per quality step. */
+const CAMERA_QUALITY: Record<CameraQuality, { scale: number; jpeg: number }> = {
+  low: { scale: 0.5, jpeg: 0.6 },
+  balanced: { scale: 1, jpeg: 0.8 },
+  high: { scale: 2, jpeg: 0.92 },
+};
+
+function cameraQuality(quality: CameraQuality | undefined) {
+  return CAMERA_QUALITY[quality ?? "balanced"] ?? CAMERA_QUALITY.balanced;
 }
 
 export interface PortalChoiceValue {
@@ -186,10 +222,33 @@ export type PortalRequest = PortalAccessRequest | PortalScreenCastRequest;
 export type PlaybackStatus = "stopped" | "paused" | "playing";
 export type LoopStatus = "none" | "track" | "playlist";
 
-export interface MprisArtwork {
-  width: number;
-  height: number;
-  png: Uint8Array;
+/**
+ * How a player's cover arrives.
+ *
+ * Catalogue-backed players (Spotify and friends) name their cover with an
+ * `https:` URL and keep no local copy, so the server forwards that URL and the
+ * browser loads and caches it: re-encoding it server-side would put ~150 KiB of
+ * PNG in every upsert. Art that exists only on the server's disk cannot be
+ * named to a browser, so it still arrives as bytes.
+ */
+export type MprisArtwork =
+  | { kind: "url"; url: string }
+  | { kind: "png"; png: Uint8Array };
+
+export const ARTWORK_KIND_NONE = 0;
+export const ARTWORK_KIND_URL = 1;
+export const ARTWORK_KIND_PNG = 2;
+
+/**
+ * The only schemes this client will put in an image source. Enforced here as
+ * well as on the server, because the value reaches the DOM.
+ */
+export function artworkUrlAllowed(url: string): boolean {
+  if (url.length === 0 || url.length > MPRIS_STRING_MAX) return false;
+  const separator = url.indexOf("://");
+  if (separator <= 0 || separator + 3 >= url.length) return false;
+  const scheme = url.slice(0, separator).toLowerCase();
+  return scheme === "https" || scheme === "http";
 }
 
 export interface MprisPlayer {
@@ -630,12 +689,24 @@ function parseMprisUpdate(message: Uint8Array): ParsedControl | null {
       for (let j = 0; j < artistCount; j++) {
         artists.push(reader.string16(MPRIS_STRING_MAX));
       }
-      const width = reader.u16();
-      const height = reader.u16();
-      if ((width === 0) !== (height === 0)) return null;
-      const png = reader.bytes32(MPRIS_ARTWORK_MAX);
-      if (Boolean(png.length) !== Boolean(width)) {
-        return null;
+      let artwork: MprisArtwork | null = null;
+      switch (reader.u8()) {
+        case ARTWORK_KIND_NONE:
+          break;
+        case ARTWORK_KIND_URL: {
+          const url = reader.string16(MPRIS_STRING_MAX);
+          if (!artworkUrlAllowed(url)) return null;
+          artwork = { kind: "url", url };
+          break;
+        }
+        case ARTWORK_KIND_PNG: {
+          const png = reader.bytes32(MPRIS_ARTWORK_MAX);
+          if (png.length === 0) return null;
+          artwork = { kind: "png", png };
+          break;
+        }
+        default:
+          return null;
       }
       records.push({
         kind: "upsert",
@@ -661,7 +732,7 @@ function parseMprisUpdate(message: Uint8Array): ParsedControl | null {
           title,
           album,
           artists,
-          artwork: png.length ? { width, height, png } : null,
+          artwork,
           receivedAtMs: monotonicNow(),
         },
       });
@@ -1176,6 +1247,10 @@ class PcmMicrophoneCapture {
   #cursor = 0;
   #samples: number[] = [];
   #emittedSamples = 0;
+  /** Whether this capture still owns a recording claim. `stop()` runs on
+   *  several paths — server revoke, device ended, teardown — and a claim
+   *  released twice would strand a second capture's session on playback. */
+  #recordingClaim = false;
 
   constructor(
     track: MediaStreamTrack,
@@ -1191,6 +1266,11 @@ class PcmMicrophoneCapture {
     if (this.track.kind !== "audio" || this.track.readyState !== "live") {
       throw new Error("microphone track is not live");
     }
+    // Before the context exists: iOS routes Bluetooth when a capture-carrying
+    // context is created, so the category has to be recording-capable by then
+    // rather than once samples start flowing.
+    this.#recordingClaim = true;
+    retainRecordingAudioSession();
     const context = new AudioContext({ latencyHint: "interactive" });
     this.#context = context;
     const url = URL.createObjectURL(
@@ -1227,6 +1307,10 @@ class PcmMicrophoneCapture {
   }
 
   stop(stopTrack = true): void {
+    if (this.#recordingClaim) {
+      this.#recordingClaim = false;
+      releaseRecordingAudioSession();
+    }
     this.track.removeEventListener("ended", this.#ended);
     this.#node?.disconnect();
     this.#source?.disconnect();
@@ -1464,11 +1548,108 @@ function h264CameraLevel(width: number, height: number): string {
   return width <= 1280 && height <= 720 ? "1f" : "28";
 }
 
+/** Bits each codec spends per pixel per frame, before any quality scale. */
+function cameraBitsPerPixel(codec: CameraWireCodec): number {
+  switch (codec) {
+    // Motion JPEG configures no bitrate: every picture is a whole intra
+    // frame, and this is what one costs.
+    case 0:
+      return 1.2;
+    case 1:
+      return 0.11;
+    case 2:
+      return 0.075;
+    case 3:
+      return 0.16;
+    case 4:
+      return 0.11;
+  }
+}
+
+/**
+ * Bytes per second this camera configuration is expected to produce.
+ *
+ * The server sizes the lease window from the same arithmetic, so the two
+ * agree on what a second of video costs — keep them in step.
+ */
+export function cameraBytesPerSecond(
+  codec: CameraWireCodec,
+  width: number,
+  height: number,
+  fps: number,
+  scale = 1,
+): number {
+  const bits = width * height * fps * cameraBitsPerPixel(codec) * scale;
+  return Math.max(0, bits / 8);
+}
+
+/**
+ * Chooses how hard the camera encoder should push, from whether the link is
+ * keeping up.
+ *
+ * Dropping frames keeps the picture current but spends the whole shortfall
+ * on stutter; encoding smaller frames instead spends it on detail, which is
+ * the better trade for a webcam. So congestion should lower the bitrate, not
+ * just thin the stream.
+ *
+ * The two arms are deliberately asymmetric in speed but both present: back
+ * off quickly, because the delay is already being felt, and recover slowly,
+ * because probing upward costs another round of congestion when it is wrong.
+ * An arm that can only ever degrade is the failure this is written against —
+ * a link that recovers has to be able to earn its quality back, or one bad
+ * minute quietly sets the quality for the rest of the session.
+ */
+export class CameraRateGovernor {
+  static readonly MIN_SCALE = 0.25;
+  static readonly MAX_SCALE = 1;
+  static readonly BACKOFF = 0.75;
+  static readonly RECOVER = 1.15;
+  /** Consecutive clear intervals required before probing upward again. */
+  static readonly RECOVER_AFTER = 5;
+
+  #scale = 1;
+  #clear = 0;
+
+  get scale(): number {
+    return this.#scale;
+  }
+
+  /** Fold in one observation interval; returns the scale to encode at. */
+  observe(congested: boolean): number {
+    if (congested) {
+      this.#clear = 0;
+      this.#scale = Math.max(
+        CameraRateGovernor.MIN_SCALE,
+        this.#scale * CameraRateGovernor.BACKOFF,
+      );
+      return this.#scale;
+    }
+    this.#clear += 1;
+    if (this.#clear >= CameraRateGovernor.RECOVER_AFTER) {
+      this.#clear = 0;
+      this.#scale = Math.min(
+        CameraRateGovernor.MAX_SCALE,
+        this.#scale * CameraRateGovernor.RECOVER,
+      );
+    }
+    return this.#scale;
+  }
+
+  reset(): void {
+    this.#scale = 1;
+    this.#clear = 0;
+  }
+}
+
 function cameraEncoderConfig(
   codec: Exclude<CameraWireCodec, 0>,
   width: number,
   height: number,
   fps: number,
+  /** Quality multiplier on the computed bitrate; 1 is the balanced default.
+   *  The support probe leaves it at 1 — a codec is not supported or not
+   *  supported at a different bitrate. */
+  scale = 1,
 ): VideoEncoderConfig {
   const av1 = codec === 2 || codec === 4;
   const chroma444 = codec === 3 || codec === 4;
@@ -1481,7 +1662,10 @@ function cameraEncoderConfig(
       : 0.11;
   const bitrate = Math.max(
     150_000,
-    Math.min(8_000_000, Math.round(width * height * fps * bitsPerPixel)),
+    Math.min(
+      8_000_000,
+      Math.round(width * height * fps * bitsPerPixel * scale),
+    ),
   );
   return {
     codec: av1
@@ -1671,12 +1855,30 @@ function encodedCameraProfileMatches(
   if (chunk.type !== "key" || chunk.byteLength === 0) return false;
   const data = new Uint8Array(chunk.byteLength);
   chunk.copyTo(data);
+  return cameraBitstreamMatchesCodec(codec, data);
+}
+
+/**
+ * Whether a keyframe's bitstream carries what the wire codec promises.
+ *
+ * Split out from the probe so it can be tested without a `VideoEncoder`: the
+ * rule it encodes is the whole reason a browser keeps or loses a codec.
+ */
+export function cameraBitstreamMatchesCodec(
+  codec: Exclude<CameraWireCodec, 0>,
+  data: Uint8Array,
+): boolean {
   if (codec === 1 || codec === 3) {
+    // Chroma, not profile. The wire codec distinguishes 4:2:0 from 4:4:4 and
+    // nothing else — the server maps it to `(H264, Cs420)` and hands the
+    // bitstream to a decoder that reads the profile out of the SPS like any
+    // other. Requiring the exact profile we *asked* for rejects encoders that
+    // honour the request with a superset: VideoToolbox answers a Baseline
+    // request with Main or High, so Safari on macOS failed this probe, lost
+    // H.264 and AV1, and fell back to Motion JPEG — a whole intra frame per
+    // picture — for a stream it could have encoded properly all along.
     const format = h264SpsFormat(data);
-    return (
-      format?.profile === (codec === 3 ? 0xf4 : 0x42) &&
-      format.chromaFormat === (codec === 3 ? 3 : 1)
-    );
+    return format?.chromaFormat === (codec === 3 ? 3 : 1);
   }
   return av1SequenceProfile(data) === (codec === 4 ? 1 : 0);
 }
@@ -1824,6 +2026,8 @@ interface CameraCapture {
   start(): Promise<void>;
   stop(stopTrack?: boolean): void;
   requestKeyframe(): void;
+  /** Re-aim the encoder at `scale` times its configured bitrate. */
+  setBitrateScale(scale: number): void;
 }
 
 class MjpegCameraCapture implements CameraCapture {
@@ -1834,6 +2038,8 @@ class MjpegCameraCapture implements CameraCapture {
   readonly #frame: (jpeg: Uint8Array, captureUs: number) => void;
   readonly #ended: () => void;
   readonly #canEncode: () => boolean;
+  readonly #baseQuality: number;
+  #quality: number;
   #video: HTMLVideoElement | null = null;
   #canvas: HTMLCanvasElement | null = null;
   #timer: ReturnType<typeof setInterval> | null = null;
@@ -1848,6 +2054,7 @@ class MjpegCameraCapture implements CameraCapture {
     frame: (jpeg: Uint8Array, captureUs: number) => void,
     ended: () => void,
     canEncode: () => boolean,
+    jpegQuality = 0.8,
   ) {
     this.track = track;
     this.#width = width;
@@ -1856,6 +2063,8 @@ class MjpegCameraCapture implements CameraCapture {
     this.#frame = frame;
     this.#ended = ended;
     this.#canEncode = canEncode;
+    this.#baseQuality = jpegQuality;
+    this.#quality = jpegQuality;
   }
 
   async start(): Promise<void> {
@@ -1900,6 +2109,12 @@ class MjpegCameraCapture implements CameraCapture {
     // Every Motion JPEG image is independently decodable.
   }
 
+  setBitrateScale(scale: number): void {
+    // JPEG quality is the only dial here, and it moves with the governor so
+    // a congested link sends smaller pictures rather than fewer.
+    this.#quality = Math.min(0.95, Math.max(0.3, this.#baseQuality * scale));
+  }
+
   async #encode(): Promise<void> {
     if (this.#encoding || !this.#video || !this.#canvas || !this.#canEncode()) {
       return;
@@ -1914,7 +2129,7 @@ class MjpegCameraCapture implements CameraCapture {
         return;
       context.drawImage(this.#video, 0, 0, this.#width, this.#height);
       const blob = await new Promise<Blob | null>((resolve) =>
-        this.#canvas!.toBlob(resolve, "image/jpeg", 0.8),
+        this.#canvas!.toBlob(resolve, "image/jpeg", this.#quality),
       );
       if (!blob || blob.size > 4 * 1024 * 1024) return;
       this.#frame(
@@ -1942,8 +2157,12 @@ class WebCodecsCameraCapture implements CameraCapture {
   readonly #ended: () => void;
   readonly #canEncode: () => boolean;
   readonly #failed: (error: Error) => void;
+  readonly #baseScale: number;
+  #appliedScale: number;
   readonly #encoder: VideoEncoder;
   #video: HTMLVideoElement | null = null;
+  /** Target-sized scratch the element is drawn into before encoding. */
+  #canvas: HTMLCanvasElement | null = null;
   #timer: ReturnType<typeof setInterval> | null = null;
   #startedAt = 0;
   #lastKeyframeUs = -CAMERA_KEYFRAME_INTERVAL_US;
@@ -1962,6 +2181,7 @@ class WebCodecsCameraCapture implements CameraCapture {
     ended: () => void,
     canEncode: () => boolean,
     failed: (error: Error) => void,
+    bitrateScale = 1,
   ) {
     this.track = track;
     this.#codec = codec;
@@ -1979,7 +2199,11 @@ class WebCodecsCameraCapture implements CameraCapture {
         if (!this.#stopped) this.#failed(error);
       },
     });
-    this.#encoder.configure(cameraEncoderConfig(codec, width, height, fps));
+    this.#baseScale = bitrateScale;
+    this.#appliedScale = bitrateScale;
+    this.#encoder.configure(
+      cameraEncoderConfig(codec, width, height, fps, bitrateScale),
+    );
   }
 
   async start(): Promise<void> {
@@ -2001,6 +2225,13 @@ class WebCodecsCameraCapture implements CameraCapture {
     if (this.#stopped || this.track.readyState !== "live") {
       throw new Error("camera track ended during initialization");
     }
+    const canvas = document.createElement("canvas");
+    canvas.width = this.#width;
+    canvas.height = this.#height;
+    if (!canvas.getContext("2d", { alpha: false })) {
+      throw new Error("2D canvas is unavailable");
+    }
+    this.#canvas = canvas;
     this.#startedAt = monotonicNow();
     this.#timer = setInterval(() => this.#encode(), 1_000 / this.#fps);
   }
@@ -2018,6 +2249,7 @@ class WebCodecsCameraCapture implements CameraCapture {
       this.#video.pause();
       this.#video.srcObject = null;
     }
+    this.#canvas = null;
     this.#video = null;
     try {
       this.#encoder.close();
@@ -2029,6 +2261,31 @@ class WebCodecsCameraCapture implements CameraCapture {
 
   requestKeyframe(): void {
     this.#forceKeyframe = true;
+  }
+
+  setBitrateScale(scale: number): void {
+    const next = this.#baseScale * scale;
+    // Reconfiguring costs the encoder its reference state, so ignore the
+    // noise and act on real moves only.
+    if (Math.abs(next - this.#appliedScale) < this.#appliedScale * 0.1) return;
+    this.#appliedScale = next;
+    try {
+      this.#encoder.configure(
+        cameraEncoderConfig(
+          this.#codec,
+          this.#width,
+          this.#height,
+          this.#fps,
+          next,
+        ),
+      );
+      // A reconfigured encoder starts a new sequence; the decoder on the far
+      // side needs a keyframe to follow it.
+      this.#forceKeyframe = true;
+    } catch {
+      // An encoder that refuses the new bitrate keeps the old one, which is
+      // survivable — the frame drop path still bounds the delay.
+    }
   }
 
   #encode(): void {
@@ -2053,11 +2310,18 @@ class WebCodecsCameraCapture implements CameraCapture {
       captureUs - this.#lastKeyframeUs >= CAMERA_KEYFRAME_INTERVAL_US;
     let frame: VideoFrame | null = null;
     try {
-      frame = new VideoFrame(this.#video, {
-        timestamp: captureUs,
-        displayWidth: this.#width,
-        displayHeight: this.#height,
-      });
+      // Via a canvas, not straight off the element.
+      //
+      // `new VideoFrame(video)` takes the frame as decoded and ignores the
+      // rotation the element applies when it paints, so a tablet whose camera
+      // is mounted against the way it is held encodes upside down while its
+      // own preview — and Motion JPEG, which has always gone through
+      // `drawImage` — look right. Drawing first puts both codecs on the one
+      // path that honours it, and costs a copy the JPEG path already paid.
+      const context = this.#canvas?.getContext("2d", { alpha: false });
+      if (!context || !this.#canvas) return;
+      context.drawImage(this.#video, 0, 0, this.#width, this.#height);
+      frame = new VideoFrame(this.#canvas, { timestamp: captureUs });
       this.#encoder.encode(frame, { keyFrame: keyframe });
       if (keyframe) {
         this.#forceKeyframe = false;
@@ -2125,6 +2389,13 @@ export class MediaStore implements ReactiveStore {
   readonly #requests = new Map<number, PortalRequest>();
   readonly #requestListeners = new Set<(request: PortalRequest) => void>();
   #sender: ((message: Uint8Array) => void) | null = null;
+  #backpressure: (() => number | undefined) | null = null;
+  /** The lease's whole in-flight window; 0 until one is granted. */
+  #cameraCreditWindow = 0;
+  readonly #cameraGovernor = new CameraRateGovernor();
+  #cameraGovernorTimer: ReturnType<typeof setInterval> | null = null;
+  /** Whether the link showed backpressure since the last governor tick. */
+  #cameraCongestedSinceTick = false;
   #state: DesktopMediaState = emptyState();
   #serverVideoCodecs = VIDEO_CODECS_LEGACY;
   #serverVideoCodecsAnnounced = false;
@@ -2197,6 +2468,60 @@ export class MediaStore implements ReactiveStore {
     }
     if (!sender) this.#capabilitiesSentAt = null;
     if (sender) this.#scheduleCapabilities();
+  }
+  /**
+   * Whether the link is already carrying more camera video than it should.
+   *
+   * The allowance is a time, converted through the stream's own bitrate: a
+   * byte ceiling would mean a different delay on every link, which is the
+   * mistake the old flat credit window made. Anything already queued is in
+   * front of the frame about to be captured, so past the allowance the right
+   * move is to drop at the source rather than lengthen the queue — a viewer
+   * would rather lose a frame than watch a stale one.
+   *
+   * A transport that cannot report its queue answers `undefined`; that is
+   * "unknown", not "congested", and lease credit remains the backstop.
+   */
+  #linkCongested(): boolean {
+    const queued = this.#backpressure?.();
+    if (queued === undefined || !Number.isFinite(queued)) return false;
+    // Remember it for the governor: congestion between two ticks is still
+    // congestion, and a link that stalls briefly every second would
+    // otherwise read as clear at every sample.
+    const congested = this.#queueOverAllowance(queued);
+    if (congested) this.#cameraCongestedSinceTick = true;
+    return congested;
+  }
+  #queueOverAllowance(queued: number): boolean {
+    const lease = this.#camera;
+    const perSecond = cameraBytesPerSecond(
+      lease.codec as CameraWireCodec,
+      lease.width,
+      lease.height,
+      lease.fps,
+    );
+    // An unnegotiated lease has no cadence to scale by; a small absolute
+    // allowance still beats letting the queue run away.
+    const allowance =
+      perSecond > 0
+        ? Math.max(
+            CAMERA_QUEUE_MIN_BYTES,
+            (perSecond * CAMERA_QUEUE_TARGET_MS) / 1000,
+          )
+        : CAMERA_QUEUE_MIN_BYTES;
+    return queued > allowance;
+  }
+  /**
+   * How to ask the transport what it still owes the network.
+   *
+   * Lease credit alone cannot keep the camera current: it is returned only
+   * once the server has *decoded* a frame, so a whole window's worth can be
+   * sitting in this socket before any of it is acknowledged, and every byte
+   * of it is delay in front of the picture. The queue length is the one
+   * number that says so while it is happening.
+   */
+  setBackpressureProbe(probe: (() => number | undefined) | null): void {
+    this.#backpressure = probe;
   }
   advertise(capabilities: MediaCapabilities): void {
     this.#requestedCapabilities = { ...capabilities };
@@ -2379,7 +2704,9 @@ export class MediaStore implements ReactiveStore {
               () => this.#cameraEnded(),
               () =>
                 this.#camera.status === "active" &&
-                this.#camera.credit >= this.#cameraRequiredCredit,
+                this.#camera.credit >= this.#cameraRequiredCredit &&
+                !this.#linkCongested(),
+              cameraQuality(options.quality).jpeg,
             );
           } else {
             if (!(await probeCameraCodec(codec, width, height, fps))) {
@@ -2399,8 +2726,10 @@ export class MediaStore implements ReactiveStore {
               () => this.#cameraEnded(),
               () =>
                 this.#camera.status === "active" &&
-                this.#camera.credit >= this.#cameraRequiredCredit,
+                this.#camera.credit >= this.#cameraRequiredCredit &&
+                !this.#linkCongested(),
               (error) => this.#cameraEncoderFailed(error),
+              cameraQuality(options.quality).scale,
             );
           }
           this.#cameraCapture = capture;
@@ -2595,6 +2924,10 @@ export class MediaStore implements ReactiveStore {
         this.#cameraDiscontinuity = false;
         this.#cameraNeedsKeyframe = control.codec !== 0;
         this.#cameraRequiredCredit = 1;
+        this.#cameraCreditWindow = control.initialCredit;
+        // The lease is open and the capture is running: start watching the
+        // link. Not before — there is nothing to govern until frames flow.
+        this.#startCameraGovernor();
         pending.resolve();
         this.#notifier.emit();
       } else {
@@ -2735,6 +3068,38 @@ export class MediaStore implements ReactiveStore {
       this.#cameraCapture?.requestKeyframe();
     }
   }
+  /**
+   * A frame the lease window could never carry.
+   *
+   * Distinct from ordinary congestion: this one cannot be waited out, so it
+   * counts as congestion for the governor immediately rather than at the
+   * next tick, and the encoder is aimed lower on the spot.
+   */
+  #cameraOverBudget(): void {
+    this.#cameraCongestedSinceTick = true;
+    this.#cameraCapture?.setBitrateScale(this.#cameraGovernor.observe(true));
+  }
+  /**
+   * Watch the link once a second and re-aim the encoder.
+   *
+   * A tick, not a per-frame reaction: bitrate changes cost the encoder its
+   * reference state, and reacting to single frames would chase noise.
+   */
+  #startCameraGovernor(): void {
+    this.#stopCameraGovernor();
+    this.#cameraGovernor.reset();
+    this.#cameraCongestedSinceTick = false;
+    this.#cameraGovernorTimer = setInterval(() => {
+      const congested = this.#cameraCongestedSinceTick || this.#linkCongested();
+      this.#cameraCongestedSinceTick = false;
+      const scale = this.#cameraGovernor.observe(congested);
+      this.#cameraCapture?.setBitrateScale(scale);
+    }, CAMERA_GOVERNOR_INTERVAL_MS);
+  }
+  #stopCameraGovernor(): void {
+    if (this.#cameraGovernorTimer) clearInterval(this.#cameraGovernorTimer);
+    this.#cameraGovernorTimer = null;
+  }
   #sendCameraFrame(
     data: Uint8Array,
     captureUs: number,
@@ -2748,7 +3113,18 @@ export class MediaStore implements ReactiveStore {
       return;
     }
     if (lease.credit < data.length) {
-      this.#cameraRequiredCredit = data.length;
+      // Credit is conserved: it is returned as frames are consumed and never
+      // grows past the window the lease opened with. So a frame larger than
+      // the whole window can never be sent, and waiting for room to appear
+      // is waiting forever — the next frame owed is a keyframe, and a
+      // keyframe is precisely what does not fit. Ask for the window instead
+      // and drop this one; the capture answers a drop with a fresh keyframe,
+      // and the bitrate governor below has already been told to aim lower.
+      this.#cameraRequiredCredit =
+        this.#cameraCreditWindow > 0
+          ? Math.min(data.length, this.#cameraCreditWindow)
+          : data.length;
+      if (data.length > this.#cameraCreditWindow) this.#cameraOverBudget();
       this.#cameraFrameDropped();
       return;
     }
@@ -2819,11 +3195,13 @@ export class MediaStore implements ReactiveStore {
     } else if (stopTrack && this.#cameraStartingTrack?.readyState === "live") {
       this.#cameraStartingTrack.stop();
     }
+    this.#stopCameraGovernor();
     this.#cameraCapture = null;
     this.#cameraStartingTrack = null;
     this.#cameraNeedsKeyframe = false;
     this.#cameraDiscontinuity = false;
     this.#cameraRequiredCredit = 1;
+    this.#cameraCreditWindow = 0;
     const changed = this.#camera.status !== "inactive";
     this.#camera = { ...emptyLease("camera"), error };
     if (changed || error) this.#notifier.emit();

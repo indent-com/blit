@@ -291,6 +291,36 @@ pub fn try_ui_route(
     None
 }
 
+/// Serve a bundled worker script by exact path.
+///
+/// A worker cannot be inlined into the single-file UI, so each one ships as
+/// its own asset and needs a route here. Without one it 404s and whatever it
+/// carries degrades silently — the transport worker would have kept audio off
+/// the main thread in development, where a dev server hands out every file,
+/// and quietly fallen back to the main thread in production.
+///
+/// Names are pinned rather than content-hashed for the same reason the service
+/// worker's is: a hashed name cannot be named by `include_bytes!`. Revalidation
+/// is by ETag, which is what `service_worker_response` already does.
+pub fn try_worker_route(
+    path: &str,
+    workers: &[(&'static str, &'static [u8], &'static str)],
+    if_none_match: Option<&[u8]>,
+    accept_encoding: Option<&str>,
+) -> Option<Response> {
+    for (route, body_br, etag) in workers {
+        if path == *route {
+            return Some(service_worker_response(
+                body_br,
+                etag,
+                if_none_match,
+                accept_encoding,
+            ));
+        }
+    }
+    None
+}
+
 pub fn preview_unavailable_response() -> Response {
     (
         axum::http::StatusCode::SERVICE_UNAVAILABLE,

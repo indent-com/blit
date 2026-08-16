@@ -53,6 +53,20 @@ let _codecSupport: number | null = null;
  *  working — never invent support the probe never saw. */
 let _probedCodecSupport = 0;
 
+/** Codecs the viewer has allowed, as a CODEC_SUPPORT_* mask.  `0xff` is the
+ *  default "no opinion"; the media panel narrows it. */
+let _allowedCodecSupport = 0xff;
+
+/** The mask that actually goes on the wire.
+ *
+ *  An allow-list that excludes everything the browser can decode falls back
+ *  to the browser's own answer: the protocol reads `0` as "accept anything",
+ *  so publishing an empty intersection would invert the setting instead of
+ *  enforcing it. */
+function effectiveCodecSupport(mask: number): number {
+  return mask & _allowedCodecSupport || mask;
+}
+
 /** Radius of a mirrored touch contact, in logical pixels — about a fingertip. */
 const REMOTE_CONTACT_RADIUS = 14;
 
@@ -263,7 +277,7 @@ async function tryDecode444(
  * frame, since isConfigSupported() is unreliable for subsampling modes.
  */
 export async function detectCodecSupport(): Promise<number> {
-  if (_codecSupport !== null) return _codecSupport;
+  if (_codecSupport !== null) return getCodecSupport();
   if (typeof VideoDecoder === "undefined") {
     _codecSupport = 0;
     return 0;
@@ -359,12 +373,41 @@ export async function detectCodecSupport(): Promise<number> {
       `h264-444=${!!(mask & CODEC_SUPPORT_H264_444)} av1-444=${!!(mask & CODEC_SUPPORT_AV1_444)}) ` +
       `max decode: ${_maxDecode[0]}x${_maxDecode[1]}`,
   );
-  return mask;
+  return getCodecSupport();
 }
 
 /** Return the cached codec support, or 0 if not yet probed. */
 export function getCodecSupport(): number {
-  return _codecSupport ?? 0;
+  return _codecSupport === null ? 0 : effectiveCodecSupport(_codecSupport);
+}
+
+/**
+ * Narrow which codecs this viewer will accept for surface video, on top of
+ * what the probe found.  Pass `0xff` (or `0`) to drop the restriction.
+ *
+ * Returns the new wire mask, or `null` when the wire mask is unchanged —
+ * because the preference is the same, because the probe has not answered
+ * yet (its own `sendClientFeatures` will carry the new setting), or because
+ * every allowed codec was already the only thing on offer.
+ */
+export function setAllowedCodecSupport(mask: number): number | null {
+  const next = mask & 0xff || 0xff;
+  if (next === _allowedCodecSupport) return null;
+  const before = getCodecSupport();
+  _allowedCodecSupport = next;
+  const after = getCodecSupport();
+  return after === before ? null : after;
+}
+
+/** The allow-list currently in force. */
+export function getAllowedCodecSupport(): number {
+  return _allowedCodecSupport;
+}
+
+/** Codecs the probe confirmed, ignoring demotions and the allow-list — what
+ *  the media panel may offer as selectable. */
+export function getProbedCodecSupport(): number {
+  return _probedCodecSupport;
 }
 
 /**
@@ -379,8 +422,10 @@ export function demoteCodecSupport(bits: number): number | null {
   if (_codecSupport === null) return null;
   const next = _codecSupport & ~bits;
   if (next === _codecSupport || next === 0) return null;
+  const before = getCodecSupport();
   _codecSupport = next;
-  return next;
+  const after = getCodecSupport();
+  return after === before ? null : after;
 }
 
 /**
@@ -395,8 +440,10 @@ export function restoreCodecSupport(bits: number): number | null {
   if (_codecSupport === null) return null;
   const next = _codecSupport | (bits & _probedCodecSupport);
   if (next === _codecSupport) return null;
+  const before = getCodecSupport();
   _codecSupport = next;
-  return next;
+  const after = getCodecSupport();
+  return after === before ? null : after;
 }
 
 /**

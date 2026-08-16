@@ -15,9 +15,11 @@
 | `BLIT_FD_CHANNEL`                     | unset                                              | fd-channel file descriptor                                                             |
 | `BLIT_EXPORT_SOCK`                    | unset                                              | `1` exports the socket path as `BLIT_SOCK` in spawned terminals (also `--export-sock`) |
 | `BLIT_INJECT_PATH`                    | unset                                              | `1` appends the binary's dir to `PATH` in spawned terminals (also `--inject-path`)     |
-| `BLIT_SURFACE_ENCODERS`               | see encoder table                                  | Comma-separated encoder priority                                                       |
+| `BLIT_SURFACE_ENCODERS`               | see encoder table                                  | Comma-separated encoder priority (also `--surface-encoders`)                           |
 | `BLIT_SURFACE_BANDWIDTH`              | `ultra`                                            | Ceiling on video bandwidth (adaptation only goes cheaper)                              |
 | `BLIT_SURFACE_SPEED`                  | `realtime`                                         | Encoder speed preset                                                                   |
+| `BLIT_MEDIA_CAMERA_CODECS`            | all                                                | Camera formats viewers may send (also `--camera-codecs`)                               |
+| `BLIT_MEDIA_MICROPHONE_CODECS`        | all                                                | Microphone formats viewers may send (also `--microphone-codecs`)                       |
 | `BLIT_MEDIA_CAMERA_DECODERS`          | `nvdec,vaapi,vulkan,software`                      | Camera hardware priority with implicit software fallback                               |
 | `BLIT_MEDIA_CAMERA_VULKAN_DEVICE`     | unset                                              | Optional Vulkan device index or name substring for camera decoding                     |
 | `BLIT_MAX_CONNECTIONS`                | `0` (unlimited)                                    | Reject client connections past this count                                              |
@@ -291,7 +293,7 @@ External outputs and NV12 compute buffers are **per-surface** (`HashMap<u32, Vec
 
 ### Encoder selection
 
-Controlled by `BLIT_SURFACE_ENCODERS` (comma-separated priority list). The server tries each in order and uses the first that succeeds at runtime. Default priority:
+Controlled by `--surface-encoders` or `BLIT_SURFACE_ENCODERS` (comma-separated priority list; the flag wins, and an unparseable flag value stops the server rather than falling back). The server tries each in order and uses the first that succeeds at runtime. Default priority:
 
 ```
 av1-nvenc, h264-nvenc, av1-vaapi, h264-vaapi, av1-vulkan, h264-vulkan, h264-software, av1-software
@@ -389,6 +391,22 @@ fallback if it is omitted or no listed hardware entry is usable. Set the list
 to `software` to disable camera hardware decode. Consequently, codec
 advertisement is based on the compiled software decoders and never waits for or
 depends on probing a GPU during client HELLO.
+
+### Restricting what viewers may send
+
+`--camera-codecs` / `BLIT_MEDIA_CAMERA_CODECS` names the camera formats this
+server accepts: `mjpeg`, `h264`, `av1`, `h264-444`, `av1-444`. Each name selects
+exactly one format — `h264` does not imply `h264-444`, so a list that wants both
+says both. `--microphone-codecs` / `BLIT_MEDIA_MICROPHONE_CODECS` does the same
+for `pcm` and `opus`. The flag wins over the environment, and an unparseable
+flag value stops the server; an unparseable environment value is ignored, so a
+stale export cannot make the server unbootable.
+
+Both lists only narrow. `mjpeg` and `pcm` are always accepted: the
+`ServerCapabilities` message is rejected by clients without Motion JPEG, and PCM
+is what a browser falls back to when it cannot encode Opus. The restriction is
+applied twice — once to the advertised mask, so a viewer never offers a format
+it will be refused, and again when a lease starts, before any device is opened.
 
 Hardware decode is opportunistic and remains in-process. NVDEC uses NVIDIA's
 native parser/decoder, VA-API receives stateless H.264/AV1 picture parameters,

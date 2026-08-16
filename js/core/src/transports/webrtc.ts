@@ -267,6 +267,10 @@ export function createWebRtcDataChannelTransport(
       channel.send(frame);
     },
 
+    get bufferedAmount(): number | undefined {
+      return channel?.bufferedAmount;
+    },
+
     close() {
       disposed = true;
       clearConnectTimeout();

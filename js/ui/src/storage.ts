@@ -1,5 +1,10 @@
 import { createSignal, onCleanup } from "solid-js";
-import { PALETTES, DEFAULT_FONT, DEFAULT_TEXT_GAMMA } from "@blit-sh/core";
+import {
+  PALETTES,
+  DEFAULT_FONT,
+  DEFAULT_TEXT_GAMMA,
+  type CameraQuality,
+} from "@blit-sh/core";
 import type { TerminalPalette } from "@blit-sh/core";
 import {
   readStoredPassphrase,
@@ -241,6 +246,39 @@ export const SURFACE_TOUCH_MODE_KEY = "blit.surfaceTouchMode";
 export type SurfaceTouchMode = "pointer" | "direct";
 /** Whether fresh Wayland text-input enables may open the device keyboard. */
 export const WAYLAND_KEYBOARD_REQUESTS_KEY = "blit.waylandKeyboardRequests";
+// Codec preferences belong to the same device-local family, and for the same
+// reason twice over: which codecs are on offer is a fact about this browser
+// and this GPU, and the answer is not portable to the next machine on the
+// account.  Both directions are stored, since a viewer receives surface video
+// and sends camera and microphone.
+/** Codecs accepted for surface video, as a CODEC_SUPPORT_* mask.  0 means
+ *  "no opinion" — whatever the browser's decode probe found. */
+export const SURFACE_CODECS_KEY = "blit.surfaceCodecs";
+/** Camera upload codec. "auto" walks the browser's best-first candidates. */
+export const CAMERA_CODEC_KEY = "blit.cameraCodec";
+export type CameraCodecPreference = "auto" | "mjpeg" | "h264" | "av1";
+/** Camera upload chroma sampling. Motion JPEG does not expose one. */
+export const CAMERA_CHROMA_KEY = "blit.cameraChroma";
+export type CameraChromaPreference = "auto" | "420" | "444";
+/** Microphone upload codec. "auto" prefers Opus and falls back to PCM. */
+export const MICROPHONE_CODEC_KEY = "blit.microphoneCodec";
+export type MicrophoneCodecPreference = "auto" | "opus" | "pcm";
+// Which connection a shared device goes to, and which physical devices to
+// use for it. Device ids are per-browser-per-origin, so these belong to the
+// device-local family for a third reason: they mean nothing anywhere else.
+/** Connection id a shared camera/microphone goes to. "" = first available. */
+export const MEDIA_TARGET_KEY = "blit.mediaTarget";
+/** `MediaDeviceInfo.deviceId` to capture from. "" = browser default. */
+export const MICROPHONE_DEVICE_KEY = "blit.microphoneDevice";
+export const CAMERA_DEVICE_KEY = "blit.cameraDevice";
+/** `MediaDeviceInfo.deviceId` to play remote audio on. "" = system default. */
+export const SPEAKER_DEVICE_KEY = "blit.speakerDevice";
+/** Camera capture height to ask the hardware for. 0 = let it choose. */
+export const CAMERA_RESOLUTION_KEY = "blit.cameraResolution";
+/** Camera capture cadence in fps. 0 = the codec's default. */
+export const CAMERA_FRAME_RATE_KEY = "blit.cameraFrameRate";
+/** How many bits the camera picture is worth. */
+export const CAMERA_QUALITY_KEY = "blit.cameraQuality";
 // Panel widths are UI-local for the same reason, being chrome geometry.
 export const LEFT_DOCK_WIDTH_KEY = "blit.leftDockWidth";
 export const PREVIEW_PANEL_WIDTH_KEY = "blit.previewPanelWidth";
@@ -745,6 +783,99 @@ export function preferredSurfaceTouchMode(): SurfaceTouchMode {
     ? "pointer"
     : "direct";
 }
+
+/** Codecs this device accepts for surface video, as a CODEC_SUPPORT_* mask.
+ *  0 means "no opinion": take whatever the decode probe found. */
+export function preferredSurfaceCodecs(): number {
+  return readWireByte(SURFACE_CODECS_KEY);
+}
+
+/** Camera upload codec. Unknown values read as "auto" rather than failing —
+ *  a preference written by a newer build must not wedge an older one. */
+export function preferredCameraCodec(): CameraCodecPreference {
+  const value = readStorage(CAMERA_CODEC_KEY);
+  return value === "mjpeg" || value === "h264" || value === "av1"
+    ? value
+    : "auto";
+}
+
+/** Camera upload chroma sampling. */
+export function preferredCameraChroma(): CameraChromaPreference {
+  const value = readStorage(CAMERA_CHROMA_KEY);
+  return value === "420" || value === "444" ? value : "auto";
+}
+
+/** Microphone upload codec. */
+export function preferredMicrophoneCodec(): MicrophoneCodecPreference {
+  const value = readStorage(MICROPHONE_CODEC_KEY);
+  return value === "opus" || value === "pcm" ? value : "auto";
+}
+
+/** Connection a shared camera/microphone goes to. "" = first available. */
+export function preferredMediaTarget(): string {
+  return readStorage(MEDIA_TARGET_KEY) ?? "";
+}
+
+/** Chosen capture/playback devices. "" = whatever the browser picks. */
+export function preferredMicrophoneDevice(): string {
+  return readStorage(MICROPHONE_DEVICE_KEY) ?? "";
+}
+export function preferredCameraDevice(): string {
+  return readStorage(CAMERA_DEVICE_KEY) ?? "";
+}
+export function preferredSpeakerDevice(): string {
+  return readStorage(SPEAKER_DEVICE_KEY) ?? "";
+}
+
+/** Camera capture height in pixels, or 0 for "whatever the camera offers".
+ *  Stored as a height alone: aspect ratio is the camera's to decide, and
+ *  every standard mode is named by its height anyway. */
+export function preferredCameraResolution(): number {
+  const value = parseInt(readStorage(CAMERA_RESOLUTION_KEY) ?? "", 10);
+  return value === 360 || value === 480 || value === 720 || value === 1080
+    ? value
+    : 0;
+}
+
+/** Camera capture cadence in fps, or 0 for the codec's own default. */
+export function preferredCameraFrameRate(): number {
+  const value = parseInt(readStorage(CAMERA_FRAME_RATE_KEY) ?? "", 10);
+  return value === 15 || value === 24 || value === 30 || value === 60
+    ? value
+    : 0;
+}
+
+/** Camera picture quality. */
+export function preferredCameraQuality(): CameraQuality {
+  const value = readStorage(CAMERA_QUALITY_KEY);
+  return value === "low" || value === "high" ? value : "balanced";
+}
+
+/** The key `blit.microphoneCodec` replaced. */
+const LEGACY_MICROPHONE_OPUS_KEY = "blit.media.microphone.opus";
+
+/**
+ * Carry the desktop-chrome "Opus" checkbox over to `blit.microphoneCodec`.
+ *
+ * The old key was the one media preference written straight to
+ * `localStorage`, never through `writeStorage`, and it only ever encoded the
+ * negative: "0" meant "do not use Opus". An unchecked box therefore becomes
+ * an explicit `pcm`; a checked one becomes `auto`, which is what the checkbox
+ * actually meant — prefer Opus, fall back to PCM when the browser cannot
+ * encode it.
+ */
+export function migrateLegacyMicrophoneOpus(): void {
+  const legacy = readLocal(LEGACY_MICROPHONE_OPUS_KEY);
+  if (legacy === null) return;
+  try {
+    localStorage.removeItem(LEGACY_MICROPHONE_OPUS_KEY);
+  } catch {}
+  // A value on the new key was chosen after the upgrade; it wins.
+  if (readLocal(MICROPHONE_CODEC_KEY) !== null) return;
+  if (legacy === "0") writeStorage(MICROPHONE_CODEC_KEY, "pcm");
+}
+
+migrateLegacyMicrophoneOpus();
 
 /** Honor fresh Wayland text-input keyboard requests unless explicitly
  *  disabled on this device. */

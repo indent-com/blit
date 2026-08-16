@@ -2,7 +2,12 @@ import { createSignal, createEffect, onCleanup, onMount } from "solid-js";
 import type { BlitTransport, BlitTransportMessage } from "@blit-sh/core";
 
 export interface Metrics {
-  bw: number;
+  /** Bytes received per interval. */
+  bwIn: number;
+  /** Bytes sent per interval. Counted separately because the two are wildly
+   *  asymmetric — a surface stream inbound against keystrokes outbound — and
+   *  one summed number hides an upload problem entirely. */
+  bwOut: number;
   fps: number;
   ups: number;
   renderMs: number;
@@ -119,13 +124,15 @@ export function createMetrics(
   const net = new NetSampleRing(NET_MAX);
 
   let bytes = 0;
+  let sentBytes = 0;
   let frames = 0;
   let updates = 0;
   let renderMsSum = 0;
   let renderMsMax = 0;
 
   const [metrics, setMetrics] = createSignal<Metrics>({
-    bw: 0,
+    bwIn: 0,
+    bwOut: 0,
     fps: 0,
     ups: 0,
     renderMs: 0,
@@ -153,25 +160,57 @@ export function createMetrics(
     if (sampleTimelines()) net.push(performance.now(), data.byteLength, true);
   };
 
+  // Egress has no event to listen to — a transport exposes `send`, not a
+  // "sent" signal — so it is counted by wrapping the method for exactly as
+  // long as we are watching, and unwrapping on cleanup. The map both records
+  // the original and guards against wrapping the same transport twice when
+  // the list churns.
+  const unwrapped = new WeakMap<BlitTransport, (data: Uint8Array) => void>();
+  const countSends = (transport: BlitTransport) => {
+    if (unwrapped.has(transport)) return;
+    const original = transport.send.bind(transport);
+    unwrapped.set(transport, original);
+    transport.send = (data: Uint8Array) => {
+      sentBytes += data.byteLength;
+      if (sampleTimelines())
+        net.push(performance.now(), data.byteLength, false);
+      original(data);
+    };
+  };
+  const stopCountingSends = (transport: BlitTransport) => {
+    const original = unwrapped.get(transport);
+    if (!original) return;
+    transport.send = original;
+    unwrapped.delete(transport);
+  };
+
   // Re-register transport listeners whenever the transport list changes.
   createEffect(() => {
     const current = transports();
-    for (const t of current) t.addEventListener("message", onMessage);
+    for (const t of current) {
+      t.addEventListener("message", onMessage);
+      countSends(t);
+    }
     onCleanup(() => {
-      for (const t of current) t.removeEventListener("message", onMessage);
+      for (const t of current) {
+        t.removeEventListener("message", onMessage);
+        stopCountingSends(t);
+      }
     });
   });
 
   onMount(() => {
     const timer = setInterval(() => {
       setMetrics({
-        bw: bytes,
+        bwIn: bytes,
+        bwOut: sentBytes,
         fps: frames,
         ups: updates,
         renderMs: frames > 0 ? renderMsSum / frames : 0,
         maxRenderMs: renderMsMax,
       });
       bytes = 0;
+      sentBytes = 0;
       frames = 0;
       updates = 0;
       renderMsSum = 0;

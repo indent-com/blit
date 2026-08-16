@@ -70,9 +70,13 @@ export function ProblemsPanel(props: {
   fontSize: number;
   onOpenTile?: (assignment: string) => void;
 }) {
-  // Attach a language server whenever a session is mounted here.
+  // Hold a lease on the language server while this panel is mounted. The dock
+  // unmounts a collapsed section, so letting go here is what stops a folded
+  // Problems panel from keeping a language server and its pushed diagnostics
+  // stream alive for the rest of the session.
   createEffect(() => {
-    props.session?.ensureLsp();
+    const release = props.session?.ensureLsp();
+    if (release) onCleanup(release);
   });
 
   // Resolve a diagnostic's LSP-root-relative path to absolute.

@@ -84,6 +84,7 @@ mod ipc;
 mod kv;
 #[cfg(target_os = "linux")]
 mod media_input;
+mod media_policy;
 mod net;
 #[cfg(target_os = "linux")]
 mod nvdec_decode;
@@ -105,6 +106,7 @@ mod video_decode;
 mod video_decode_vulkan;
 
 pub use ipc::{IpcListener, default_ipc_path};
+pub use media_policy::MediaCodecPolicy;
 use pty::{PtyHandle, PtyWriteTarget};
 pub use surface_encoder::ChromaSubsampling;
 use surface_encoder::SurfaceEncoder;
@@ -398,6 +400,9 @@ pub struct Config {
     pub surface_encoders: Vec<SurfaceEncoderPreference>,
     pub surface_encoding: SurfaceEncoding,
     pub chroma: ChromaSubsampling,
+    /// Which codecs viewers may send inbound (camera, microphone). Narrows
+    /// what this host can decode; never widens it.
+    pub media_codecs: MediaCodecPolicy,
     pub vaapi_device: String,
     #[cfg(unix)]
     pub fd_channel: Option<std::os::unix::io::RawFd>,
@@ -1554,6 +1559,28 @@ impl FrameWritePolicy {
 /// a 1 MB/s link. A clean connection sends one protocol/WebSocket message per
 /// video frame and pays no fragmentation latency or event-loop amplification.
 const BULK_CHUNK_BYTES: usize = 4 * 1024;
+
+/// Payload size that is fragmented on sight, whatever the writer has seen.
+///
+/// This writer faces a unix socket, which is why splitting here once looked
+/// pointless: an idle gateway swallows half a megabyte in microseconds and the
+/// trigger below never fires. That is only true while the gateway is idle. It
+/// reads one frame at a time into a one-deep queue and cannot take another
+/// until the browser's socket has taken the last, so a slow browser stops the
+/// gateway reading, the unix socket buffer fills, and a 227 KiB write here
+/// blocks for as long as the link needs. Audio queued during that write waits
+/// it out — which is the moment a scrolled window stops the sound.
+///
+/// So both hops fragment, each measuring its own write: this one because it
+/// blocks whenever the far end backs up, and the gateway's because it holds
+/// the socket whose latency the listener actually hears.
+///
+/// Well above the 40–70 KiB of an ordinary high-rate video frame, so the
+/// stream that motivated fragmenting only under backpressure is untouched:
+/// this catches the outliers that are large enough to be worth splitting
+/// whatever the link is doing.
+const BULK_FRAGMENT_ALWAYS_BYTES: usize = 128 * 1024;
+
 const BULK_FRAGMENT_TRIGGER: Duration = Duration::from_millis(5);
 const BULK_FRAGMENT_SLOW_CONFIRMATIONS: u8 = 2;
 const BULK_FRAGMENT_RECOVERY: Duration = Duration::from_millis(2);
@@ -1567,8 +1594,13 @@ struct BulkFragmentation {
 }
 
 impl BulkFragmentation {
-    fn chunk_bytes(&self) -> Option<usize> {
-        self.active.then_some(BULK_CHUNK_BYTES)
+    /// Chunk size for a payload of `bytes`, or `None` to write it whole.
+    ///
+    /// Takes the size because backpressure is not the only reason to split: a
+    /// payload can be large enough to block audio for tens of milliseconds on
+    /// a link the writer never sees struggle.
+    fn chunk_bytes(&self, bytes: usize) -> Option<usize> {
+        (self.active || bytes >= BULK_FRAGMENT_ALWAYS_BYTES).then_some(BULK_CHUNK_BYTES)
     }
 
     fn observe(&mut self, bytes: usize, elapsed: Duration) {
@@ -3528,6 +3560,15 @@ struct ClientState {
     outbound_bytes_seen: u64,
     outbound_sampled_at: Instant,
     outbound_bytes_per_sec: u64,
+    /// Total length-prefixed bytes read *from* this connection, and the same
+    /// counter/timestamp pair for the other direction of the catalog's
+    /// bandwidth pair. The read loop owns the counter, so this is the only
+    /// per-client accounting of what a client sends: a CLI reports nothing
+    /// about itself, and neither does a browser.
+    inbound_bytes: Arc<AtomicU64>,
+    inbound_bytes_seen: u64,
+    inbound_sampled_at: Instant,
+    inbound_bytes_per_sec: u64,
     /// Live catalog nonce → last encoded snapshot sent under that nonce.
     /// Comparing the deterministic encoding avoids pushing unchanged lists on
     /// every delivery tick.
@@ -6151,7 +6192,7 @@ impl Session {
             let desktop_notify = event_notify.clone();
             let handle = blit_compositor::spawn_compositor(verbose, event_notify, gpu_device);
             #[cfg(target_os = "linux")]
-            let desktop_bus = match desktop_bus::DesktopBus::spawn(
+            let mut desktop_bus = match desktop_bus::DesktopBus::spawn(
                 &handle.socket_name,
                 verbose,
                 desktop_notify,
@@ -6239,6 +6280,22 @@ impl Session {
                     None
                 }
             };
+
+            // Only now: the portal frontend gets one shot at connecting to
+            // PipeWire, and the socket it needs belongs to the pipeline above.
+            #[cfg(target_os = "linux")]
+            if let Some(bus) = desktop_bus.as_mut() {
+                let remote = audio_pipeline
+                    .as_ref()
+                    .map(audio::AudioPipeline::pipewire_remote_path);
+                if verbose {
+                    match remote.as_deref() {
+                        Some(path) => eprintln!("[portal] starting with PIPEWIRE_REMOTE={path}"),
+                        None => eprintln!("[portal] starting without PipeWire (no audio pipeline)"),
+                    }
+                }
+                bus.start_portal(remote.as_deref(), verbose);
+            }
 
             self.compositor = Some(SharedCompositor {
                 handle,
@@ -6653,6 +6710,7 @@ impl Session {
                     client_id,
                     age_secs: client.connected_at.elapsed().as_secs(),
                     outbound_bytes_per_sec: client.outbound_bytes_per_sec,
+                    inbound_bytes_per_sec: client.inbound_bytes_per_sec,
                     terminals,
                     surfaces,
                     subscriptions,
@@ -9045,6 +9103,18 @@ async fn tick(state: &AppState) -> TickOutcome {
             client.outbound_bytes_per_sec = (bytes as f64 / elapsed.as_secs_f64()) as u64;
             client.outbound_bytes_seen = total;
             client.outbound_sampled_at = now;
+
+            // Both directions share the window: they are sampled from the same
+            // tick, so the pair the catalog reports covers one interval.
+            let elapsed = now.duration_since(client.inbound_sampled_at);
+            if elapsed.is_zero() {
+                continue;
+            }
+            let total = client.inbound_bytes.load(Ordering::Relaxed);
+            let bytes = total.saturating_sub(client.inbound_bytes_seen);
+            client.inbound_bytes_per_sec = (bytes as f64 / elapsed.as_secs_f64()) as u64;
+            client.inbound_bytes_seen = total;
+            client.inbound_sampled_at = now;
         }
         sess.publish_client_catalogs();
     }
@@ -16476,6 +16546,10 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     let sender_audio_tracking: Option<Arc<OutboxTracking>> = None;
     let write_blocked_counter = Arc::new(AtomicU64::new(0));
     let outbound_byte_counter = Arc::new(AtomicU64::new(0));
+    // Counted by this function's own read loop below, which outlives the
+    // `ClientState` the other clone is moved into.
+    let inbound_byte_counter = Arc::new(AtomicU64::new(0));
+    let reader_inbound_bytes = inbound_byte_counter.clone();
     // Relayed sockets are connection-scoped: they die with this table on
     // disconnect, which is what releases forwarded sockets on a dropped
     // client rather than leaking them. Datagrams read the outbox depth to
@@ -16714,7 +16788,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         &mut writer,
                         packet,
                         &mut audio_rx,
-                        sender_profile.write_policy(bulk_fragmentation.chunk_bytes()),
+                        sender_profile.write_policy(bulk_fragmentation.chunk_bytes(bytes)),
                         &sender_outbound_bytes,
                         sender_no_progress_timeout,
                         sender_audio_tracking.as_ref(),
@@ -16812,6 +16886,10 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 outbound_bytes_seen: 0,
                 outbound_sampled_at: Instant::now(),
                 outbound_bytes_per_sec: 0,
+                inbound_bytes: inbound_byte_counter,
+                inbound_bytes_seen: 0,
+                inbound_sampled_at: Instant::now(),
+                inbound_bytes_per_sec: 0,
                 client_catalog_watches: FxHashMap::default(),
                 connected_at: Instant::now(),
                 aux_subscriptions: Vec::new(),
@@ -16986,7 +17064,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         {
             let capabilities = msg_server_control(&ServerControl::ServerCapabilities(
                 ServerMediaCapabilities {
-                    video_codecs: media_input::camera_codec_mask(),
+                    video_codecs: media_input::camera_codec_mask(state.config.media_codecs.camera),
                 },
             ));
             let state_msg = msg_server_control(&ServerControl::State(media_state));
@@ -17212,6 +17290,10 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         let Some(data) = next else {
             break;
         };
+        // Symmetric with the writer's accounting (`+4` for the length prefix),
+        // and counted before the empty-frame skip below: an empty frame still
+        // cost its prefix on the wire.
+        reader_inbound_bytes.fetch_add((data.len() as u64).saturating_add(4), Ordering::Relaxed);
         if data.is_empty() {
             continue;
         }
@@ -18097,6 +18179,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                                 client_id,
                                 capabilities,
                                 request,
+                                state.config.media_codecs,
                                 runtime_enabled,
                                 runtime_dir.as_deref(),
                             )
@@ -20437,6 +20520,7 @@ mod tests {
                     surface_encoders: Vec::new(),
                     surface_encoding: SurfaceEncoding::default(),
                     chroma: ChromaSubsampling::default(),
+                    media_codecs: MediaCodecPolicy::default(),
                     vaapi_device: String::new(),
                     fd_channel: None,
                     verbose: false,
@@ -20620,8 +20704,8 @@ mod tests {
 
     mod bulk_fragmentation {
         use super::super::{
-            BULK_CHUNK_BYTES, BULK_FRAGMENT_RECOVERY, BULK_FRAGMENT_RECOVERY_WRITES,
-            BULK_FRAGMENT_TRIGGER, BulkFragmentation,
+            BULK_CHUNK_BYTES, BULK_FRAGMENT_ALWAYS_BYTES, BULK_FRAGMENT_RECOVERY,
+            BULK_FRAGMENT_RECOVERY_WRITES, BULK_FRAGMENT_TRIGGER, BulkFragmentation,
         };
         use std::time::Duration;
 
@@ -20632,7 +20716,7 @@ mod tests {
             let mut state = BulkFragmentation::default();
             for _ in 0..1_000 {
                 state.observe(BULK, Duration::from_micros(100));
-                assert_eq!(state.chunk_bytes(), None);
+                assert_eq!(state.chunk_bytes(BULK), None);
             }
         }
 
@@ -20640,9 +20724,9 @@ mod tests {
         fn one_slow_keyframe_does_not_enable_fragmentation() {
             let mut state = BulkFragmentation::default();
             state.observe(BULK, BULK_FRAGMENT_TRIGGER);
-            assert_eq!(state.chunk_bytes(), None);
+            assert_eq!(state.chunk_bytes(BULK), None);
             state.observe(BULK, Duration::from_micros(100));
-            assert_eq!(state.chunk_bytes(), None);
+            assert_eq!(state.chunk_bytes(BULK), None);
         }
 
         #[test]
@@ -20650,7 +20734,7 @@ mod tests {
             let mut state = BulkFragmentation::default();
             state.observe(BULK, BULK_FRAGMENT_TRIGGER);
             state.observe(BULK, BULK_FRAGMENT_TRIGGER);
-            assert_eq!(state.chunk_bytes(), Some(BULK_CHUNK_BYTES));
+            assert_eq!(state.chunk_bytes(BULK), Some(BULK_CHUNK_BYTES));
         }
 
         #[test]
@@ -20660,10 +20744,44 @@ mod tests {
             state.observe(BULK, BULK_FRAGMENT_TRIGGER);
             for _ in 1..BULK_FRAGMENT_RECOVERY_WRITES {
                 state.observe(BULK, BULK_FRAGMENT_RECOVERY);
-                assert_eq!(state.chunk_bytes(), Some(BULK_CHUNK_BYTES));
+                assert_eq!(state.chunk_bytes(BULK), Some(BULK_CHUNK_BYTES));
             }
             state.observe(BULK, BULK_FRAGMENT_RECOVERY);
-            assert_eq!(state.chunk_bytes(), None);
+            assert_eq!(state.chunk_bytes(BULK), None);
+        }
+
+        /// Scrolling a window emits single frames of half a megabyte. The
+        /// socket accepts one instantly, so the writer sees no backpressure
+        /// and used to send it whole — occupying a wifi link for tens of
+        /// milliseconds with the next audio frame stuck behind it.
+        #[test]
+        fn an_oversized_frame_fragments_on_an_idle_writer() {
+            let state = BulkFragmentation::default();
+            assert!(!state.active);
+            assert_eq!(
+                state.chunk_bytes(BULK_FRAGMENT_ALWAYS_BYTES),
+                Some(BULK_CHUNK_BYTES)
+            );
+        }
+
+        #[test]
+        fn an_ordinary_frame_still_goes_whole_on_an_idle_writer() {
+            let state = BulkFragmentation::default();
+            assert_eq!(state.chunk_bytes(BULK_FRAGMENT_ALWAYS_BYTES - 1), None);
+        }
+
+        /// The size rule is per-payload, not a mode: one huge frame must not
+        /// leave the connection fragmenting every ordinary frame after it,
+        /// which is the cost the backpressure gate exists to avoid.
+        #[test]
+        fn an_oversized_frame_does_not_latch_fragmentation() {
+            let mut state = BulkFragmentation::default();
+            assert_eq!(
+                state.chunk_bytes(BULK_FRAGMENT_ALWAYS_BYTES),
+                Some(BULK_CHUNK_BYTES)
+            );
+            state.observe(BULK_FRAGMENT_ALWAYS_BYTES, Duration::from_micros(50));
+            assert_eq!(state.chunk_bytes(BULK), None);
         }
     }
 
@@ -21790,6 +21908,10 @@ mod tests {
             outbound_bytes_seen: 0,
             outbound_sampled_at: Instant::now(),
             outbound_bytes_per_sec: 0,
+            inbound_bytes: Arc::new(AtomicU64::new(0)),
+            inbound_bytes_seen: 0,
+            inbound_sampled_at: Instant::now(),
+            inbound_bytes_per_sec: 0,
             client_catalog_watches: FxHashMap::default(),
             connected_at: Instant::now(),
             aux_subscriptions: Vec::new(),
@@ -21925,9 +22047,7 @@ mod tests {
             title: String::new(),
             album: String::new(),
             artists: Vec::new(),
-            artwork_width: 0,
-            artwork_height: 0,
-            artwork_png: Vec::new(),
+            artwork: blit_remote::media::MprisArtwork::None,
         }
     }
 
@@ -21982,6 +22102,7 @@ mod tests {
         let mut requester = test_client();
         requester.connected_at = Instant::now() - Duration::from_secs(3);
         requester.outbound_bytes_per_sec = 300;
+        requester.inbound_bytes_per_sec = 33;
         requester.subscriptions.insert(11);
         requester.view_sizes.insert(11, (40, 120));
         requester.surface_subscriptions.insert(4);
@@ -21994,6 +22115,7 @@ mod tests {
         let mut peer = test_client();
         peer.connected_at = Instant::now() - Duration::from_secs(5);
         peer.outbound_bytes_per_sec = 100;
+        peer.inbound_bytes_per_sec = 11;
         peer.aux_subscriptions = vec![blit_remote::ClientAuxSubscription {
             kind: blit_remote::CLIENT_SUBSCRIPTION_FS,
             id: 4,
@@ -22002,6 +22124,7 @@ mod tests {
         let mut target = test_client();
         target.connected_at = Instant::now() - Duration::from_secs(8);
         target.outbound_bytes_per_sec = 200;
+        target.inbound_bytes_per_sec = 22;
         target.subscriptions.insert(7);
         target.view_sizes.insert(7, (24, 80));
         target.surface_subscriptions.insert(3);
@@ -22028,6 +22151,7 @@ mod tests {
         assert_eq!(clients[0].client_id, 2);
         assert!(clients[0].age_secs >= 5);
         assert_eq!(clients[0].outbound_bytes_per_sec, 100);
+        assert_eq!(clients[0].inbound_bytes_per_sec, 11);
         assert_eq!(
             clients[0].subscriptions,
             [blit_remote::ClientAuxSubscription {
@@ -22038,6 +22162,7 @@ mod tests {
         assert_eq!(clients[1].client_id, 5);
         assert!(clients[1].age_secs >= 8);
         assert_eq!(clients[1].outbound_bytes_per_sec, 200);
+        assert_eq!(clients[1].inbound_bytes_per_sec, 22);
         assert_eq!(
             clients[1].terminals,
             [blit_remote::ClientTerminalSubscription {
@@ -22065,6 +22190,7 @@ mod tests {
         assert_eq!(clients[2].client_id, 9);
         assert!(clients[2].age_secs >= 3);
         assert_eq!(clients[2].outbound_bytes_per_sec, 300);
+        assert_eq!(clients[2].inbound_bytes_per_sec, 33);
         assert_eq!(
             clients[2].terminals,
             [blit_remote::ClientTerminalSubscription {

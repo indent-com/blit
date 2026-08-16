@@ -40,6 +40,96 @@ use zbus::{Connection, Proxy, fdo, interface};
 mod mpris;
 mod portal;
 
+/// Loopback HTTP origin and image fixtures, shared by the unit tests in
+/// `mpris` and the full-bridge tests below. Lives at the crate root so both
+/// module-private test modules can reach it.
+#[cfg(test)]
+mod test_http {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Serves one canned response per connection and keeps accepting, so a
+    /// caching test can prove a second fetch never reached the wire: the hit
+    /// counter, not a closed port, is what the assertions read.
+    ///
+    /// `declared_len` overrides Content-Length so a body can overrun what it
+    /// advertised, which is the only way to exercise the streamed size cap
+    /// rather than the header precheck.
+    pub(crate) fn serve(
+        body: Vec<u8>,
+        status: &str,
+        declared_len: Option<usize>,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let status = status.to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Drain the request head so the client sees a well-formed
+                // exchange rather than a reset peer.
+                let mut request = [0u8; 1024];
+                let _ = std::io::Read::read(&mut stream, &mut request);
+                let length = declared_len.unwrap_or(body.len());
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: image/jpeg\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = std::io::Write::write_all(&mut stream, header.as_bytes());
+                let _ = std::io::Write::write_all(&mut stream, &body);
+                let _ = std::io::Write::flush(&mut stream);
+            }
+        });
+        (format!("http://127.0.0.1:{port}/cover"), hits)
+    }
+
+    /// A cover whose PNG re-encode does not fit the MPRIS artwork cap at full
+    /// size. Near-incompressible by construction, standing in for unusually
+    /// detailed art; measured at ~768 KiB once re-encoded to 512×512.
+    pub(crate) fn incompressible_cover(size: u32) -> Vec<u8> {
+        let mut buf = image::RgbImage::new(size, size);
+        let mut seed = 12_345u32;
+        for y in 0..size {
+            for x in 0..size {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                buf.put_pixel(
+                    x,
+                    y,
+                    image::Rgb([
+                        (seed >> 16) as u8,
+                        (seed >> 8) as u8,
+                        seed.rotate_left(x % 13) as u8,
+                    ]),
+                );
+            }
+        }
+        // PNG, not JPEG: a JPEG round trip would smooth away exactly the detail
+        // this fixture exists to preserve.
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(buf)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode png");
+        png.into_inner()
+    }
+
+    /// A JPEG of the requested size, matching how catalogues actually publish
+    /// covers: photographic, lossy, and larger than the icon ceiling.
+    pub(crate) fn cover_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            width,
+            height,
+            image::Rgb([12, 40, 120]),
+        ));
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .expect("encode jpeg");
+        jpeg.into_inner()
+    }
+}
+
 const NOTIFICATION_PATH: &str = "/org/freedesktop/Notifications";
 const WATCHER_PATH: &str = "/StatusNotifierWatcher";
 const EVENT_CAPACITY: usize = 512;
@@ -52,6 +142,17 @@ const MAX_MENU_NODES: usize = 2_048;
 const MAX_MENU_DEPTH: usize = 16;
 const MAX_SOURCE_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SOURCE_IMAGE_DIMENSION: u32 = 512;
+/// Source ceiling for cover art, which is photographic and arrives at whatever
+/// size a catalogue publishes: Spotify serves 640×640, and 1000–2000 px is
+/// common elsewhere. An *icon* that large means something is wrong, so icons stay
+/// at `MAX_SOURCE_IMAGE_DIMENSION`; for a cover it is ordinary, and refusing it
+/// drops the art altogether where downscaling was the whole intent.
+const MAX_ARTWORK_SOURCE_DIMENSION: u32 = 2048;
+/// Decode allowance that matches the ceiling above, so a legal cover is not
+/// rejected by an allocation limit tuned for icons. Transient: the decoded
+/// surface is downscaled to the caller's target and dropped immediately.
+const MAX_ARTWORK_DECODE_BYTES: u64 =
+    (MAX_ARTWORK_SOURCE_DIMENSION as u64) * (MAX_ARTWORK_SOURCE_DIMENSION as u64) * 4;
 const MAX_FINAL_PNG_BYTES: usize = 1024 * 1024;
 const TRAY_ICON_SIZE: u32 = 64;
 const NOTIFICATION_IMAGE_SIZE: u32 = 512;
@@ -70,6 +171,7 @@ struct ImageCacheKey {
     path: PathBuf,
     modified_ns: u128,
     target: u32,
+    source_max: u32,
 }
 
 #[derive(Clone)]
@@ -111,18 +213,19 @@ impl ImageResolver {
         source: String,
         item_theme_path: Option<PathBuf>,
         target: u32,
+        source_max: u32,
     ) -> Option<PngImage> {
         let resolver = self.clone();
         tokio::task::spawn_blocking(move || {
-            resolver.resolve_blocking(&source, item_theme_path.as_deref(), target)
+            resolver.resolve_blocking(&source, item_theme_path.as_deref(), target, source_max)
         })
         .await
         .ok()
         .flatten()
     }
 
-    async fn encoded(&self, bytes: Vec<u8>, target: u32) -> Option<PngImage> {
-        tokio::task::spawn_blocking(move || normalize_encoded_image(&bytes, target))
+    async fn encoded(&self, bytes: Vec<u8>, target: u32, source_max: u32) -> Option<PngImage> {
+        tokio::task::spawn_blocking(move || normalize_encoded_image(&bytes, target, source_max))
             .await
             .ok()
             .flatten()
@@ -154,6 +257,7 @@ impl ImageResolver {
         source: &str,
         item_theme_path: Option<&Path>,
         target: u32,
+        source_max: u32,
     ) -> Option<PngImage> {
         if source.is_empty() || target == 0 || target > MAX_SOURCE_IMAGE_DIMENSION {
             return None;
@@ -182,12 +286,13 @@ impl ImageResolver {
             path: path.clone(),
             modified_ns,
             target,
+            source_max,
         };
         if let Some(image) = self.cache.lock().ok()?.get(&key).cloned() {
             return Some(image);
         }
         let bytes = fs::read(path).ok()?;
-        let image = normalize_encoded_image(&bytes, target)?;
+        let image = normalize_encoded_image(&bytes, target, source_max)?;
         if let Ok(mut cache) = self.cache.lock() {
             if cache.len() >= 512 {
                 cache.clear();
@@ -644,7 +749,12 @@ impl NotificationService {
         let icon = self
             .common
             .images
-            .resolve(app_icon.to_string(), None, TRAY_ICON_SIZE)
+            .resolve(
+                app_icon.to_string(),
+                None,
+                TRAY_ICON_SIZE,
+                MAX_SOURCE_IMAGE_DIMENSION,
+            )
             .await
             .unwrap_or_default();
         let image = if let Some(data) = notification_image_data(&hints, "image-data") {
@@ -655,7 +765,12 @@ impl NotificationService {
         } else if let Some(path) = hint_string(&hints, "image-path") {
             self.common
                 .images
-                .resolve(path.to_string(), None, NOTIFICATION_IMAGE_SIZE)
+                .resolve(
+                    path.to_string(),
+                    None,
+                    NOTIFICATION_IMAGE_SIZE,
+                    MAX_SOURCE_IMAGE_DIMENSION,
+                )
                 .await
         } else if let Some(data) = notification_image_data(&hints, "icon_data") {
             self.common
@@ -1204,7 +1319,12 @@ async fn read_item(
         .await
         .unwrap_or_default();
     let mut icon = images
-        .resolve(icon_name, theme_path.clone(), TRAY_ICON_SIZE)
+        .resolve(
+            icon_name,
+            theme_path.clone(),
+            TRAY_ICON_SIZE,
+            MAX_SOURCE_IMAGE_DIMENSION,
+        )
         .await
         .or(images.pixmaps(pixmaps, TRAY_ICON_SIZE).await);
     if icon.is_none() && attention {
@@ -1217,7 +1337,12 @@ async fn read_item(
             .await
             .unwrap_or_default();
         icon = images
-            .resolve(normal_name, theme_path.clone(), TRAY_ICON_SIZE)
+            .resolve(
+                normal_name,
+                theme_path.clone(),
+                TRAY_ICON_SIZE,
+                MAX_SOURCE_IMAGE_DIMENSION,
+            )
             .await
             .or(images.pixmaps(normal_pixmaps, TRAY_ICON_SIZE).await);
     }
@@ -1230,7 +1355,12 @@ async fn read_item(
         .await
         .unwrap_or_default();
     let overlay = images
-        .resolve(overlay_name, theme_path, TRAY_ICON_SIZE / 2)
+        .resolve(
+            overlay_name,
+            theme_path,
+            TRAY_ICON_SIZE / 2,
+            MAX_SOURCE_IMAGE_DIMENSION,
+        )
         .await
         .or(images.pixmaps(overlay_pixmaps, TRAY_ICON_SIZE / 2).await);
     if let (Some(base), Some(overlay)) = (icon.as_ref(), overlay) {
@@ -1648,9 +1778,18 @@ async fn refresh_menu(
         let icon = if source.data.is_empty() {
             None
         } else {
-            images.encoded(source.data, TRAY_ICON_SIZE).await
+            images
+                .encoded(source.data, TRAY_ICON_SIZE, MAX_SOURCE_IMAGE_DIMENSION)
+                .await
         }
-        .or(images.resolve(source.name, None, TRAY_ICON_SIZE).await);
+        .or(images
+            .resolve(
+                source.name,
+                None,
+                TRAY_ICON_SIZE,
+                MAX_SOURCE_IMAGE_DIMENSION,
+            )
+            .await);
         if let Some(icon) = icon
             && let Some(node) = nodes.get_mut(source.node)
         {
@@ -2286,7 +2425,9 @@ fn decode_xpm(bytes: &[u8]) -> Option<DynamicImage> {
     Some(DynamicImage::ImageRgba8(image))
 }
 
-fn decode_image(bytes: &[u8], target: u32) -> Option<DynamicImage> {
+/// `source_max` bounds the incoming image's own dimensions, independently of
+/// `target`, which is only the size the result is scaled down to.
+fn decode_image(bytes: &[u8], target: u32, source_max: u32) -> Option<DynamicImage> {
     if bytes.is_empty() || bytes.len() > MAX_SOURCE_IMAGE_BYTES {
         return None;
     }
@@ -2308,9 +2449,7 @@ fn decode_image(bytes: &[u8], target: u32) -> Option<DynamicImage> {
         options.fontdb_mut().load_system_fonts();
         let tree = resvg::usvg::Tree::from_data(bytes, &options).ok()?;
         let size = tree.size();
-        if size.width() > MAX_SOURCE_IMAGE_DIMENSION as f32
-            || size.height() > MAX_SOURCE_IMAGE_DIMENSION as f32
-        {
+        if size.width() > source_max as f32 || size.height() > source_max as f32 {
             return None;
         }
         let scale = (target as f32 / size.width())
@@ -2330,13 +2469,18 @@ fn decode_image(bytes: &[u8], target: u32) -> Option<DynamicImage> {
         .with_guessed_format()
         .ok()?;
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_SOURCE_IMAGE_DIMENSION);
-    limits.max_image_height = Some(MAX_SOURCE_IMAGE_DIMENSION);
-    limits.max_alloc = Some(MAX_SOURCE_IMAGE_BYTES as u64);
+    limits.max_image_width = Some(source_max);
+    limits.max_image_height = Some(source_max);
+    // The allocation ceiling has to admit the dimensions just allowed, or the
+    // dimension check above would be dead letter for anything icon-sized.
+    limits.max_alloc = Some(if source_max > MAX_SOURCE_IMAGE_DIMENSION {
+        MAX_ARTWORK_DECODE_BYTES
+    } else {
+        MAX_SOURCE_IMAGE_BYTES as u64
+    });
     reader.limits(limits);
     let image = reader.decode().ok()?;
-    (image.width() <= MAX_SOURCE_IMAGE_DIMENSION && image.height() <= MAX_SOURCE_IMAGE_DIMENSION)
-        .then_some(image)
+    (image.width() <= source_max && image.height() <= source_max).then_some(image)
 }
 
 fn encode_png(image: DynamicImage, target: u32) -> Option<PngImage> {
@@ -2359,8 +2503,8 @@ fn encode_png(image: DynamicImage, target: u32) -> Option<PngImage> {
     })
 }
 
-fn normalize_encoded_image(bytes: &[u8], target: u32) -> Option<PngImage> {
-    encode_png(decode_image(bytes, target)?, target)
+fn normalize_encoded_image(bytes: &[u8], target: u32, source_max: u32) -> Option<PngImage> {
+    encode_png(decode_image(bytes, target, source_max)?, target)
 }
 
 fn normalize_notification_pixels(
@@ -2395,8 +2539,8 @@ fn normalize_notification_pixels(
 }
 
 fn composite_overlay(base: &PngImage, overlay: &PngImage) -> Option<PngImage> {
-    let mut base = decode_image(&base.png, TRAY_ICON_SIZE)?.to_rgba8();
-    let overlay = decode_image(&overlay.png, TRAY_ICON_SIZE)?
+    let mut base = decode_image(&base.png, TRAY_ICON_SIZE, MAX_SOURCE_IMAGE_DIMENSION)?.to_rgba8();
+    let overlay = decode_image(&overlay.png, TRAY_ICON_SIZE, MAX_SOURCE_IMAGE_DIMENSION)?
         .resize(
             (base.width() / 2).max(1),
             (base.height() / 2).max(1),
@@ -2548,8 +2692,31 @@ static char *icon[] = {
 ". c None",
 "X c #123456",
 ".X"};"##;
-        let image = normalize_encoded_image(xpm, 64).unwrap();
+        let image = normalize_encoded_image(xpm, 64, MAX_SOURCE_IMAGE_DIMENSION).unwrap();
         assert_eq!((image.width, image.height), (2, 1));
+    }
+
+    /// 640×640 is exactly what Spotify publishes, and it sits over the icon
+    /// ceiling. Held here because accepting the cover while refusing an icon of
+    /// the same size is a deliberate split, not an accident of one constant.
+    #[test]
+    fn a_cover_sized_source_normalizes_while_an_icon_that_large_is_refused() {
+        let source = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            640,
+            640,
+            image::Rgb([12, 40, 120]),
+        ));
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        source
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .expect("encode jpeg");
+        let jpeg = jpeg.into_inner();
+
+        let cover = normalize_encoded_image(&jpeg, 512, MAX_ARTWORK_SOURCE_DIMENSION)
+            .expect("a 640px cover normalizes");
+        assert_eq!((cover.width, cover.height), (512, 512));
+
+        assert!(normalize_encoded_image(&jpeg, 512, MAX_SOURCE_IMAGE_DIMENSION).is_none());
     }
 
     #[test]
@@ -2915,6 +3082,156 @@ mod dbus_tests {
         assert_eq!(player.identity, "GetAll fixture");
         assert_eq!(player.desktop_entry, "fixture");
         assert_eq!(player.position_us, 17);
+    }
+
+    /// A player that names its cover over HTTP, which is the only form Spotify
+    /// and other catalogue-backed players ever publish.
+    struct MockStreamingPlayer {
+        art_url: String,
+    }
+
+    #[interface(name = "org.mpris.MediaPlayer2.Player")]
+    impl MockStreamingPlayer {
+        #[zbus(property)]
+        fn playback_status(&self) -> &str {
+            "Playing"
+        }
+
+        #[zbus(property)]
+        fn metadata(&self) -> HashMap<String, OwnedValue> {
+            HashMap::from([
+                (
+                    "mpris:artUrl".to_string(),
+                    zbus::zvariant::Value::from(self.art_url.clone())
+                        .try_to_owned()
+                        .unwrap(),
+                ),
+                (
+                    "xesam:title".to_string(),
+                    zbus::zvariant::Value::from("Da Funk")
+                        .try_to_owned()
+                        .unwrap(),
+                ),
+            ])
+        }
+
+        #[zbus(property)]
+        fn loop_status(&self) -> &str {
+            "None"
+        }
+
+        #[zbus(property)]
+        fn rate(&self) -> f64 {
+            1.0
+        }
+
+        #[zbus(property)]
+        fn minimum_rate(&self) -> f64 {
+            1.0
+        }
+
+        #[zbus(property)]
+        fn maximum_rate(&self) -> f64 {
+            1.0
+        }
+
+        #[zbus(property)]
+        fn volume(&self) -> f64 {
+            1.0
+        }
+
+        #[zbus(property)]
+        fn position(&self) -> i64 {
+            0
+        }
+
+        #[zbus(property)]
+        fn shuffle(&self) -> bool {
+            false
+        }
+
+        #[zbus(property)]
+        fn can_control(&self) -> bool {
+            true
+        }
+
+        #[zbus(property)]
+        fn can_play(&self) -> bool {
+            true
+        }
+
+        #[zbus(property)]
+        fn can_pause(&self) -> bool {
+            true
+        }
+
+        #[zbus(property)]
+        fn can_go_next(&self) -> bool {
+            false
+        }
+
+        #[zbus(property)]
+        fn can_go_previous(&self) -> bool {
+            false
+        }
+
+        #[zbus(property)]
+        fn can_seek(&self) -> bool {
+            false
+        }
+    }
+
+    /// The whole path Spotify exercises: a cover the player only names by URL
+    /// reaches a client record as that URL, and the server never dereferences
+    /// it. The live server is a real listener precisely so the hit counter can
+    /// prove no request was made.
+    #[tokio::test]
+    async fn a_cover_named_over_http_reaches_the_client_as_a_url_unfetched() {
+        let (art_url, hits) =
+            crate::test_http::serve(crate::test_http::cover_jpeg(640, 640), "200 OK", None);
+        let (_bus, address) = TestBus::spawn();
+        let _player = zbus::connection::Builder::address(address.as_str())
+            .unwrap()
+            .name("org.mpris.MediaPlayer2.streaming_fixture")
+            .unwrap()
+            .serve_at("/org/mpris/MediaPlayer2", MockMprisBase)
+            .unwrap()
+            .serve_at(
+                "/org/mpris/MediaPlayer2",
+                MockStreamingPlayer {
+                    art_url: art_url.clone(),
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let mut bridge = Bridge::start(&address, Config::default(), Arc::new(|| {}))
+            .await
+            .unwrap();
+
+        let Event::Mpris(records) = next_event(&mut bridge).await else {
+            panic!("expected initial MPRIS snapshot")
+        };
+        let player = records
+            .into_iter()
+            .find_map(|record| match record {
+                blit_remote::media::MprisRecord::Upsert(player) => Some(player),
+                blit_remote::media::MprisRecord::Delete { .. } => None,
+            })
+            .expect("snapshot must contain an upsert");
+
+        assert_eq!(player.title, "Da Funk");
+        assert_eq!(
+            player.artwork,
+            blit_remote::media::MprisArtwork::Url(art_url),
+            "a cover named by URL must reach the viewer as that URL"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the server must not fetch a cover the viewer can load itself"
+        );
     }
 
     #[tokio::test]

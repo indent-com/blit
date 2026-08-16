@@ -153,8 +153,14 @@ impl AudioBroadcast {
 /// design, long video writes or compositor work would starve audio
 /// delivery and the bounded encoder channel would overflow and silently
 /// drop frames, starving the client's jitter buffer below real-time.
-async fn fanout_task(mut opus_rx: mpsc::Receiver<OpusFrame>, broadcast: Arc<AudioBroadcast>) {
-    while let Some(frame) = opus_rx.recv().await {
+/// Runs on its own thread for the same reason the encoder does: it carries a
+/// 20 ms frame on a deadline, and as a runtime task it waited behind whatever
+/// else the runtime was doing. A second viewer is enough to show it — measured
+/// with one scrolling while the other listened, the listener's connection sat
+/// idle for 37-75 ms with nothing on its socket at all, because the frame had
+/// not reached its queue yet.
+fn fanout_task(mut opus_rx: mpsc::Receiver<OpusFrame>, broadcast: Arc<AudioBroadcast>) {
+    while let Some(frame) = opus_rx.blocking_recv() {
         // Serialize once per frame, then clone the Vec per subscriber.
         // Opus packets are small (~100–300 B at 64 kbps), so the clone
         // cost is dwarfed by the MPSC send syscall overhead.
@@ -240,6 +246,24 @@ context.modules = [
     }
     { name = libpipewire-module-protocol-native }
     { name = libpipewire-module-access }
+    # Required for a viewer's lent camera to be visible to applications.
+    #
+    # The camera portal does not hand an application a view of the graph: it
+    # hands over a PipeWire fd with every node hidden, and expects the session
+    # manager to grant per-node access. WirePlumber's `access-portal` script is
+    # that grant, but it only ever looks at `pipewire.access.portal.*`
+    # properties — and *this* module is what sets them, by asking the portal
+    # over D-Bus who the connecting client is. Without it those properties are
+    # never set, the script never fires, and a browser enumerates zero cameras
+    # while `blit-camera` sits plainly in the graph. The measured symptom is a
+    # bare "Enumerating PipeWire camera devices complete." with no camera found.
+    #
+    # `nofail`, and no `condition`: on a host without D-Bus this is simply
+    # absent, exactly like the rest of the optional chain in
+    # WIREPLUMBER_CONF_TEMPLATE.
+    { name = libpipewire-module-portal
+        flags = [ ifexists nofail ]
+    }
     { name = libpipewire-module-client-node }
     { name = libpipewire-module-adapter }
     { name = libpipewire-module-link-factory }
@@ -251,6 +275,13 @@ context.objects = [
         args = {
             factory.name          = support.null-audio-sink
             node.name             = blit-sink
+            # What applications show in their device lists. Named for its
+            # direction, to pair with the "Input" the microphone lease
+            # publishes: an app choosing between them should see one naming
+            # scheme, not a product name on one side and an internal node
+            # name on the other.
+            node.nick             = Output
+            node.description      = Output
             media.class           = Audio/Sink
             object.linger         = true
             audio.position        = [ FL FR ]
@@ -262,23 +293,43 @@ context.objects = [
 ]
 "#;
 
-/// Minimal WirePlumber configuration: only stream linking policy.
-/// No ALSA, Bluetooth, camera, portal, MPRIS, or device reservation —
-/// those conflict with the system WirePlumber on the same D-Bus.
+/// Minimal WirePlumber configuration: stream linking policy, plus the portal
+/// access script a lent camera needs. No ALSA, Bluetooth, host camera
+/// enumeration, MPRIS, or device reservation.
 ///
 /// `hardware.audio` MUST stay enabled (the default) — it contains
 /// `policy.node`, the module that links playback streams to sinks.
 /// Without it, apps like mpv hang because their audio stream is never
 /// connected to blit-sink.  We disable only the sub-features we don't
 /// need (ALSA monitor, device reservation).
+///
+/// `support.dbus` and the two features above it MUST stay enabled for a
+/// viewer's lent camera to be visible to applications. The camera portal does
+/// not hand an application a view of the graph — it hands it a PipeWire fd
+/// with *every* node hidden (`PW_PERMISSION_INIT(PW_ID_ANY, 0)`) and leaves it
+/// to the session manager to grant visibility. `script.client.access-portal`
+/// is that grant, and it needs `support.portal-permissionstore`, which needs
+/// `support.dbus`. Disable any link in that chain and a browser enumerates
+/// zero cameras while `blit-camera` sits plainly in the graph — and Chromium
+/// does not fall back to V4L2 once its PipeWire factory is live, so the
+/// failure is a silent empty device list.
+///
+/// They are `optional` (WirePlumber's default) rather than `required`: a host
+/// without a usable D-Bus still gets audio, just no lendable camera. This does
+/// not race the system WirePlumber, which an earlier blanket
+/// `support.dbus = disabled` was guarding against — blit runs its instance
+/// against its own private bus.
 const WIREPLUMBER_CONF_TEMPLATE: &str = r#"
 wireplumber.profiles = {
   main = {
-    support.dbus = disabled
-    support.portal-permissionstore = disabled
+    support.dbus = optional
+    support.portal-permissionstore = optional
+    script.client.access-portal = optional
     support.reserve-device = disabled
     # hardware.audio stays enabled — its policy.node links streams to sinks.
     hardware.bluetooth = disabled
+    # No host camera enumeration: the only video source on this graph is the
+    # one blit publishes for a viewer's lent camera.
     hardware.video-capture = disabled
     monitor.alsa = disabled
     monitor.alsa.reserve-device = disabled
@@ -618,7 +669,7 @@ impl AudioPipeline {
             );
         }
 
-        // Spawn the async encoder task.
+        // Spawn the encoder on its own thread.
         let (opus_tx, opus_rx) = mpsc::channel::<OpusFrame>(RING_CAPACITY * 2);
         let bitrate = if bitrate > 0 {
             bitrate
@@ -631,33 +682,54 @@ impl AudioPipeline {
         let has_listener = broadcast.has_listener_flag();
         let has_listener_clone = has_listener.clone();
         let verbose_copy = verbose;
-        tokio::spawn(async move {
-            let result = encoder_task(
-                capture_rx,
-                opus_tx,
-                bitrate,
-                verbose_copy,
-                epoch,
-                bitrate_rx,
-                has_listener_clone,
-            )
-            .await;
-            encoder_alive_clone.store(false, Ordering::Release);
-            if let Err(e) = result
-                && verbose_copy
-            {
-                eprintln!("[audio] encoder task exited: {e}");
-            }
-        });
+        // Its own thread, not the shared runtime.
+        //
+        // Everything in the loop except waiting for the next capture chunk
+        // is CPU work — an f32 conversion and an Opus encode, every 20 ms,
+        // on a deadline nothing reschedules. As a `tokio::spawn` task it
+        // queued behind whatever else the runtime was doing: video encode
+        // orchestration, and one writer per connected client. Measured with
+        // seventeen of those, audio came out in bursts with 43-71 ms holes
+        // while the capture thread itself was on time, which is a gap no
+        // client-side buffer sized for a 20 ms cadence can absorb.
+        //
+        // PipeWire's graph thread is already SCHED_FIFO; this one is left at
+        // the default. It has a whole quantum of slack and would rather be
+        // preempted than compete with the thread feeding it.
+        if let Err(e) = std::thread::Builder::new()
+            .name("blit-audio-enc".into())
+            .spawn(move || {
+                let result = encoder_task(
+                    capture_rx,
+                    opus_tx,
+                    bitrate,
+                    verbose_copy,
+                    epoch,
+                    bitrate_rx,
+                    has_listener_clone,
+                );
+                encoder_alive_clone.store(false, Ordering::Release);
+                if let Err(e) = result
+                    && verbose_copy
+                {
+                    eprintln!("[audio] encoder task exited: {e}");
+                }
+            })
+        {
+            return Err(format!("failed to spawn audio encoder thread: {e}"));
+        }
 
         // Spawn the fan-out task: drains encoded frames from the encoder
         // and pushes them to every subscribed client's mpsc, independent
         // of the main server tick loop so long video writes can't starve
         // audio delivery.
         let broadcast_for_fanout = broadcast.clone();
-        tokio::spawn(async move {
-            fanout_task(opus_rx, broadcast_for_fanout).await;
-        });
+        if let Err(e) = std::thread::Builder::new()
+            .name("blit-audio-fan".into())
+            .spawn(move || fanout_task(opus_rx, broadcast_for_fanout))
+        {
+            return Err(format!("failed to spawn audio fanout thread: {e}"));
+        }
 
         Ok(Self {
             pipewire_child,
@@ -918,7 +990,7 @@ pub fn msg_audio_frame(frame: &OpusFrame) -> Vec<u8> {
 /// `epoch` is the shared time origin for A/V sync — the same `Instant`
 /// used by the video pipeline's `created_at`.  Audio timestamps are
 /// `epoch.elapsed().as_millis()`, matching the video frame timestamps.
-async fn encoder_task(
+fn encoder_task(
     mut pcm_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     tx: mpsc::Sender<OpusFrame>,
     bitrate: i32,
@@ -974,7 +1046,7 @@ async fn encoder_task(
         // PipeWire gave us (typically one quantum ≈ 21 ms at 48 kHz for
         // the latency we requested), which we accumulate until we have
         // a full 20 ms Opus frame's worth of bytes.
-        let chunk = match pcm_rx.recv().await {
+        let chunk = match pcm_rx.blocking_recv() {
             Some(c) => c,
             None => return Ok(()), // capture closed
         };

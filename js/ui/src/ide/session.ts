@@ -7,8 +7,11 @@
  * on demand), exposes reactive derived state (tree, git status, commit log,
  * diagnostics) and BSP-agnostic actions, and is ref-counted + idle-cached in
  * a registry so switching terminals reuses a warm session instead of
- * rebuilding it. Panels become pure views over a session; they own no
- * handle lifecycle.
+ * rebuilding it. Panels become pure views over a session: they never open or
+ * close a handle themselves. What a panel does own is a *lease* — the lazy
+ * resources (child directory watches, the commit-log walk, the language
+ * server) live while some panel holds one, so a section the dock has folded
+ * away stops costing the server anything. See `createLease`.
  */
 
 import {
@@ -56,6 +59,7 @@ import {
 } from "@blit-sh/core/bsp";
 import { createBlitWorkspaceState } from "@blit-sh/solid";
 import { isConnReady, connGeneration, isTransientConnError } from "./reactive";
+import { createLease } from "./lease";
 import {
   currentSessionForPty,
   isSourceTerminalUnavailableError,
@@ -189,6 +193,11 @@ export interface IdeSession {
   tree: Accessor<IdeTreeRow[] | null>;
   /** "opening" → no handle yet; "loading" → snapshot streaming; "live". */
   treePhase: Accessor<"opening" | "loading" | "live">;
+  /** Take a lease on the per-directory watches behind `tree`. Without one the
+   *  root sync stays but the child watches are dropped, so a folded Explorer
+   *  costs nothing; the expanded set survives, so re-leasing restores the same
+   *  tree. Call the returned function to let go. */
+  ensureTree(): () => void;
   toggleDir(relPath: string): void;
   isExpanded(relPath: string): boolean;
   /** Expand a directory and all its ancestors (e.g. to follow a terminal cwd). */
@@ -233,10 +242,16 @@ export interface IdeSession {
   logSpecError: Accessor<string | null>;
   /** A page for the current spec has arrived (false while loading). */
   logLoaded: Accessor<boolean>;
+  /** Take a lease on the commit-log watch, which re-walks on every ref move.
+   *  Cached rows outlive the lease, so a folded Log section shows its last
+   *  page instantly on reopen while a fresh watch refreshes it. */
+  ensureLog(): () => void;
 
   // ── Diagnostics (lsp, lazy) ──────────────────────────────────────────
-  /** Idempotently attach a language server for this root. */
-  ensureLsp(): void;
+  /** Take a lease on a language server for this root, attaching it if this is
+   *  the first one. Call the returned function to let go; the attachment is
+   *  closed once no consumer holds a lease. Idempotent per lease. */
+  ensureLsp(): () => void;
   lspHandle: Accessor<LspHandle | null>;
   /** The remote has no language intelligence, so nothing will ever attach —
    *  from the negotiated features, not from a failed attach, since the attach
@@ -411,6 +426,8 @@ function buildSession(
   let disposed = false;
   // Directories whose child sync is in flight, so concurrent opens coalesce.
   const pending = new Set<string>();
+  // Held by the Explorer panel while it is mounted (see the reconcile effect).
+  const { wanted: treeWanted, acquire: ensureTree } = createLease();
 
   function stopChildren() {
     for (const h of childHandles.values()) h.stop();
@@ -502,9 +519,14 @@ function buildSession(
       .syncFs(connectionId, `${r.root}/${relDir}`, childOpts)
       .then((h) => {
         pending.delete(relDir);
-        // Dropped while opening (collapsed, removed, disposed, or already
-        // opened by a racing reconcile): discard this handle.
-        if (disposed || !expanded().has(relDir) || childHandles.has(relDir)) {
+        // Dropped while opening (collapsed, the panel folded away, removed,
+        // disposed, or already opened by a racing reconcile): discard it.
+        if (
+          disposed ||
+          !treeWanted() ||
+          !expanded().has(relDir) ||
+          childHandles.has(relDir)
+        ) {
           h.stop();
           return;
         }
@@ -647,6 +669,17 @@ function buildSession(
   // lacks it (revealed by expanding a parent, or recreated on disk). This is
   // what actually opens/closes child syncs — toggleDir just flips `expanded`.
   createEffect(() => {
+    // Folded away: drop the per-directory watches but keep the root sync, which
+    // the tree's phase, `rootPath`, and every git/lsp path resolution hang off.
+    // `expanded` is untouched, so re-leasing rebuilds the same tree — the
+    // version bump is what makes the memo notice the handles are gone.
+    if (!treeWanted()) {
+      if (childHandles.size > 0) {
+        stopChildren();
+        setChildVersion((v) => v + 1);
+      }
+      return;
+    }
     const rows = tree();
     if (!rows) return;
     const wanted = new Set<string>();
@@ -704,6 +737,8 @@ function buildSession(
   let watchedSpec: string | null = null;
   let headTop: string | null = null;
   let loadingMore = false;
+  // Held by the Log panel while it is mounted (see the watch effect below).
+  const { wanted: logWanted, acquire: ensureLog } = createLease();
 
   const buildCommitRows = (
     records: Uint8Array,
@@ -929,6 +964,11 @@ function buildSession(
   // recycle (re-establish) keeps showing them until the fresh page lands,
   // so the panel never flashes "No commits." over a populated log.
   createEffect(() => {
+    // A log watch re-walks whenever the resolved endpoints move, so a folded
+    // Log section should not be paying for one. Cached rows survive the lease
+    // gap; re-leasing opens a fresh watch, which is also how the panel
+    // recovers a page it may have missed while closed.
+    if (!logWanted()) return;
     const h = gitHandle();
     const spec =
       logSpec().trim() || ["HEAD", opRefTips()].filter(Boolean).join(" ");
@@ -1021,13 +1061,16 @@ function buildSession(
   // than a failed attach: the attach is lazy, so a panel that folds itself away
   // on this would otherwise have to open first to learn it should not have.
   const noLsp = createMemo(() => fsReady() && !lspReady());
-  // Requested once a consumer needs it; the gated effect below opens it when
-  // the connection is ready and re-opens after a reset (a plain one-shot open
-  // would be lost forever if it fired while the transport was still connecting).
-  const [lspWanted, setLspWanted] = createSignal(false);
-  function ensureLsp() {
-    setLspWanted(true);
-  }
+  // Requested while at least one consumer holds a lease; the gated effect
+  // below opens it when the connection is ready and re-opens after a reset (a
+  // plain one-shot open would be lost forever if it fired while the transport
+  // was still connecting).
+  //
+  // Leased rather than latched: an attachment is a language server process on
+  // the far side plus a pushed diagnostics stream, so the last consumer
+  // letting go has to close it. The dock unmounts a collapsed section, which
+  // is what makes the lease expire when the Problems panel folds away.
+  const { wanted: lspWanted, acquire: ensureLsp } = createLease();
 
   createEffect(() => {
     if (!lspWanted()) return;
@@ -1088,6 +1131,7 @@ function buildSession(
     fsError,
     tree,
     treePhase: phase,
+    ensureTree,
     toggleDir,
     isExpanded: (relPath) => expanded().has(relPath),
     expandTo,
@@ -1103,6 +1147,7 @@ function buildSession(
     setLogSpec: setAndStoreLogSpec,
     logSpecError,
     logLoaded,
+    ensureLog,
     ensureLsp,
     lspHandle,
     noLsp,

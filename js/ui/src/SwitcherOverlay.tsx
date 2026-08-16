@@ -98,18 +98,17 @@ type ActionItem = {
   key: string;
   title: string;
   subtitle: string;
+  // Deliberately not here: anything the status bar or the left dock already
+  // does in one click — palette, font, workspace roots, and the remotes
+  // dialog, which now carries the connected-client lists too. The switcher is
+  // for what has no other home.
   action:
     | "new-terminal"
     | "share-url"
     | "install-app"
     | "clear-layout"
     | "clear-local-storage"
-    | "change-font"
-    | "change-palette"
     | "change-layout"
-    | "change-remotes"
-    | "manage-clients"
-    | "change-roots"
     | "open-web"
     | "open-search";
   connectionId?: string;
@@ -377,53 +376,6 @@ function ActionGlyph(props: {
             <path d="M9 9l6 6M15 9l-6 6" stroke={props.fg} />
           </svg>
         );
-      case "change-palette":
-        return (
-          <svg
-            viewBox="0 0 24 24"
-            width="24"
-            height="24"
-            fill="none"
-            aria-hidden="true"
-          >
-            <circle cx="12" cy="12" r="7.5" stroke={props.dimFg} />
-            <path
-              d="M12 4.5A7.5 7.5 0 0 1 12 19.5z"
-              fill={props.fg}
-              opacity="0.6"
-            />
-          </svg>
-        );
-      case "change-font":
-        return (
-          <svg
-            viewBox="0 0 24 24"
-            width="24"
-            height="24"
-            fill="none"
-            aria-hidden="true"
-          >
-            <text
-              x="4"
-              y="18"
-              font-size="14"
-              font-weight="bold"
-              fill={props.fg}
-              font-family="sans-serif"
-            >
-              A
-            </text>
-            <text
-              x="14"
-              y="18"
-              font-size="10"
-              fill={props.dimFg}
-              font-family="sans-serif"
-            >
-              a
-            </text>
-          </svg>
-        );
       case "clear-local-storage":
         return (
           <svg
@@ -465,38 +417,6 @@ function ActionGlyph(props: {
           >
             <circle cx="10.5" cy="10.5" r="6" stroke={props.fg} />
             <path d="M15 15l5 5" stroke={props.fg} />
-          </svg>
-        );
-      case "change-remotes":
-        return (
-          <svg
-            viewBox="0 0 24 24"
-            width="24"
-            height="24"
-            fill="none"
-            aria-hidden="true"
-          >
-            <circle cx="5" cy="12" r="2.5" stroke={props.fg} />
-            <circle cx="19" cy="6" r="2.5" stroke={props.dimFg} />
-            <circle cx="19" cy="18" r="2.5" stroke={props.dimFg} />
-            <path d="M7.5 12h4" stroke={props.dimFg} />
-            <path d="M11.5 12l5-5.5" stroke={props.dimFg} />
-            <path d="M11.5 12l5 5.5" stroke={props.dimFg} />
-          </svg>
-        );
-      // A house, matching the ⌂ the status bar used for roots.
-      case "change-roots":
-        return (
-          <svg
-            viewBox="0 0 24 24"
-            width="24"
-            height="24"
-            fill="none"
-            stroke-width="1.5"
-            aria-hidden="true"
-          >
-            <path d="M4 11l8-6 8 6" stroke={props.fg} />
-            <path d="M6.5 10v9h11v-9" stroke={props.dimFg} />
           </svg>
         );
       default:
@@ -739,12 +659,6 @@ export function SwitcherOverlay(props: {
   onMoveToPane?: (sessionId: SessionId, targetPaneId: string) => void;
   recentLayouts?: BSPLayout[];
   presetLayouts?: BSPLayout[];
-  onChangeFont?: () => void;
-  onChangePalette?: () => void;
-  onChangeRemotes?: () => void;
-  /** Open the connected-client catalog and kick controls. */
-  onManageClients?: () => void;
-  onChangeRoots?: () => void;
   initialNewTerminalMode?: boolean;
   remotes?: readonly import("./storage").Remote[];
   remoteStatuses?: ReadonlyMap<
@@ -783,8 +697,10 @@ export function SwitcherOverlay(props: {
    *  (no attachment, still warming, backend can't answer). */
   symbolSearch?: (query: string) => Promise<SwitcherSymbolHit[]>;
   /** Attach the language server without asking anything of it, so the
-   *  first "#" keystroke isn't also waiting on a spawn. */
-  symbolSearchWarm?: () => void;
+   *  first "#" keystroke isn't also waiting on a spawn. Returns a release
+   *  called when the switcher closes, so warming for one lookup does not pin
+   *  a language server for the rest of the session. */
+  symbolSearchWarm?: () => (() => void) | undefined;
   /** Open a "#" match: reveal its line in an editor tile. */
   onOpenSymbol?: (hit: SwitcherSymbolHit) => void;
   defaultRemote?: string | null;
@@ -874,7 +790,10 @@ export function SwitcherOverlay(props: {
     [],
   );
   const [symbolPending, setSymbolPending] = createSignal(false);
-  onMount(() => props.symbolSearchWarm?.());
+  onMount(() => {
+    const release = props.symbolSearchWarm?.();
+    if (release) onCleanup(release);
+  });
   createEffect(() => {
     if (!isSymbolSearch() || !props.symbolSearch) {
       setSymbolResults([]);
@@ -1514,51 +1433,6 @@ export function SwitcherOverlay(props: {
         });
       }
     }
-    if (props.onChangeRemotes) {
-      actions.push({
-        type: "action",
-        key: "action:change-remotes",
-        title: t("switcher.remotes"),
-        subtitle: t("switcher.manageRemotes"),
-        action: "change-remotes",
-      });
-    }
-    if (props.onManageClients) {
-      actions.push({
-        type: "action",
-        key: "action:manage-clients",
-        title: "Connected clients",
-        subtitle: "Live age, bandwidth, subscriptions, and kick controls",
-        action: "manage-clients",
-      });
-    }
-    if (props.onChangePalette) {
-      actions.push({
-        type: "action",
-        key: "action:change-palette",
-        title: t("switcher.palette"),
-        subtitle: t("switcher.switchColorScheme"),
-        action: "change-palette",
-      });
-    }
-    if (props.onChangeRoots) {
-      actions.push({
-        type: "action",
-        key: "action:change-roots",
-        title: t("switcher.roots"),
-        subtitle: t("switcher.manageRoots"),
-        action: "change-roots",
-      });
-    }
-    if (props.onChangeFont) {
-      actions.push({
-        type: "action",
-        key: "action:change-font",
-        title: t("switcher.font"),
-        subtitle: t("switcher.switchFont"),
-        action: "change-font",
-      });
-    }
     actions.push({
       type: "action",
       key: "action:change-layout",
@@ -1994,26 +1868,6 @@ export function SwitcherOverlay(props: {
     }
     if (item.action === "clear-layout") {
       props.onClearLayout?.();
-      return;
-    }
-    if (item.action === "change-font") {
-      props.onChangeFont?.();
-      return;
-    }
-    if (item.action === "change-palette") {
-      props.onChangePalette?.();
-      return;
-    }
-    if (item.action === "change-remotes") {
-      props.onChangeRemotes?.();
-      return;
-    }
-    if (item.action === "manage-clients") {
-      props.onManageClients?.();
-      return;
-    }
-    if (item.action === "change-roots") {
-      props.onChangeRoots?.();
       return;
     }
     if (item.action === "open-web") {

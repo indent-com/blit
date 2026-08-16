@@ -1182,7 +1182,7 @@ mod tests {
     #[test]
     fn yuv_conversions_are_opaque_rgba() {
         let nv12 = convert_nv12_to_rgba(&[16; 4], &[128, 128], 2, 2, false);
-        assert_eq!(nv12, vec![0, 0, 0, 255].repeat(4));
+        assert_eq!(nv12, [0, 0, 0, 255].repeat(4));
         let yuv444 = convert_yuv444_to_rgba(&[235], &[128], &[128], 1, 1, false);
         assert_eq!(yuv444, vec![255, 255, 255, 255]);
     }

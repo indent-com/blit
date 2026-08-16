@@ -7,6 +7,7 @@ import {
   detectCodecSupport,
   getCodecSupport,
   restoreCodecSupport,
+  setAllowedCodecSupport,
   surfaceCanvasForInput,
 } from "../BlitSurfaceCanvas";
 import type { SurfaceTextInputEvent } from "../SurfaceStore";
@@ -28,6 +29,7 @@ import {
   AXIS_SOURCE_WHEEL,
   CODEC_SUPPORT_AV1,
   CODEC_SUPPORT_AV1_444,
+  CODEC_SUPPORT_H264,
   SURFACE_TOUCH_CANCEL,
   SURFACE_TOUCH_DOWN,
   SURFACE_TOUCH_MOTION,
@@ -543,6 +545,32 @@ describe("codec support demotion", () => {
     expect(restoreCodecSupport(av1)).toBeNull();
     // 4:4:4 was never probed as working, so restoring cannot invent it.
     expect(getCodecSupport() & CODEC_SUPPORT_AV1_444).toBe(0);
+    vi.unstubAllGlobals();
+  });
+
+  it("honors the viewer's allow-list without ever publishing an empty mask", async () => {
+    vi.stubGlobal("VideoDecoder", ProbeDecoder);
+    vi.stubGlobal("EncodedVideoChunk", class {});
+    const probed = await detectCodecSupport();
+    expect(probed & CODEC_SUPPORT_H264).toBeTruthy();
+    expect(probed & CODEC_SUPPORT_AV1).toBeTruthy();
+
+    // Turning H.264 off is how a viewer forces AV1: the server picks the
+    // best encoder it has among the codecs this mask admits.
+    expect(setAllowedCodecSupport(CODEC_SUPPORT_AV1)).toBe(CODEC_SUPPORT_AV1);
+    expect(getCodecSupport()).toBe(CODEC_SUPPORT_AV1);
+    // Setting the same preference again is not a change to re-advertise.
+    expect(setAllowedCodecSupport(CODEC_SUPPORT_AV1)).toBeNull();
+
+    // An allow-list with nothing decodable in it falls back to the probe.
+    // Zero on the wire means "accept anything", so publishing the empty
+    // intersection would invert the setting rather than enforce it.
+    setAllowedCodecSupport(CODEC_SUPPORT_AV1_444);
+    expect(getCodecSupport()).toBe(probed);
+
+    // The probe is still the ceiling: an allow-list cannot add a codec.
+    setAllowedCodecSupport(0xff);
+    expect(getCodecSupport()).toBe(probed);
     vi.unstubAllGlobals();
   });
 });

@@ -6,7 +6,11 @@ import {
   onCleanup,
   Show,
 } from "solid-js";
-import { MuxTransport, createShareTransport } from "@blit-sh/core";
+import {
+  createMuxTransport,
+  type AnyMuxTransport,
+  createShareTransport,
+} from "@blit-sh/core";
 import type { BlitTransport, BlitWasmModule } from "@blit-sh/core";
 import {
   useRemotes,
@@ -241,7 +245,7 @@ function AppCrash(props: { err: unknown }) {
 
 type HmrData = HmrLeaseState & {
   version: number;
-  mux: MuxTransport;
+  mux: AnyMuxTransport;
   channelCache: Map<string, { uri: string; transport: BlitTransport }>;
   passphrase: string;
   workspaceKey: object;
@@ -312,7 +316,7 @@ function ConnectedApp(props: {
 
   // The MuxTransport is created only once the config WS has resolved.  Before
   // that, mux() returns null and no connection is attempted.
-  const [mux, setMux] = createSignal<MuxTransport | null>(
+  const [mux, setMux] = createSignal<AnyMuxTransport | null>(
     reusablePrev ? prev.mux : null,
   );
 
@@ -330,7 +334,7 @@ function ConnectedApp(props: {
       if (hash) existing.updateWtCertHash(hash, wtUrl);
       return;
     }
-    const m = new MuxTransport(muxWsUrl(), props.passphrase, {
+    const m = createMuxTransport(muxWsUrl(), props.passphrase, {
       wtUrl: hash ? wtUrl : undefined,
       wtCertHash: hash,
       debug: muxDebug,

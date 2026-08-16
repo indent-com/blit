@@ -54,6 +54,10 @@ export class WebSocketTransport implements BlitTransport {
     }
   }
 
+  get bufferedAmount(): number | undefined {
+    return this.ws?.bufferedAmount;
+  }
+
   private clearConnectTimer(): void {
     if (this.connectTimer !== null) {
       clearTimeout(this.connectTimer);

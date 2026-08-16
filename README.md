@@ -186,8 +186,9 @@ For wire protocol details, frame encoding, and transport internals, see [ARCHITE
 
 ### Surface video encoders
 
-Set `BLIT_SURFACE_ENCODERS` to a comma-separated priority list of encoders.
-The server tries each in order and uses the first that works.
+Set `blit server --surface-encoders` (or `BLIT_SURFACE_ENCODERS`) to a
+comma-separated priority list of encoders. The server tries each in order and
+uses the first that works.
 
 ```bash
 # Default priority (dedicated encode engines, compositor-resident, then software):
@@ -198,7 +199,15 @@ BLIT_SURFACE_ENCODERS=av1-software
 
 # Prefer NVENC, fall back to software:
 BLIT_SURFACE_ENCODERS=av1-nvenc,h264-nvenc,h264-software
+
+# Same, as a flag — a typo here stops the server instead of being ignored:
+blit server --surface-encoders av1-nvenc,h264-nvenc,h264-software
 ```
+
+The other direction — what viewers may send from their camera and microphone —
+is `--camera-codecs` / `--microphone-codecs` (or `BLIT_MEDIA_CAMERA_CODECS` /
+`BLIT_MEDIA_MICROPHONE_CODECS`). Viewers choose within what both ends allow,
+from the media panel. See [docs/server.md](docs/server.md).
 
 | Value           | Codec | Backend          | Max resolution | Notes                                                                                      |
 | --------------- | ----- | ---------------- | -------------- | ------------------------------------------------------------------------------------------ |

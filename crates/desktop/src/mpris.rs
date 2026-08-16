@@ -1,12 +1,15 @@
 //! Bounded MPRIS discovery and semantic action bridge.
 
-use super::{Common, DBUS_CALL_TIMEOUT, Event, ImageResolver, clip_text};
+use super::{
+    Common, DBUS_CALL_TIMEOUT, Event, ImageResolver, MAX_ARTWORK_SOURCE_DIMENSION,
+    MAX_SOURCE_IMAGE_BYTES, PngImage, clip_text,
+};
 use blit_remote::media::{
     LoopStatus, MPRIS_ARTIST_MAX, MPRIS_ARTWORK_MAX, MPRIS_CAN_CONTROL, MPRIS_CAN_GO_NEXT,
     MPRIS_CAN_GO_PREVIOUS, MPRIS_CAN_PAUSE, MPRIS_CAN_PLAY, MPRIS_CAN_RAISE, MPRIS_CAN_SEEK,
     MPRIS_CAN_SET_LOOP_STATUS, MPRIS_CAN_SET_RATE, MPRIS_CAN_SET_SHUFFLE, MPRIS_CAN_SET_VOLUME,
     MPRIS_PLAYER_MAX, MPRIS_STRING_MAX, MprisAction, MprisActionKind, MprisActionResult,
-    MprisPlayer, MprisRecord, PlaybackStatus,
+    MprisArtwork, MprisPlayer, MprisRecord, PlaybackStatus, artwork_url_allowed,
 };
 use blit_remote::{
     STATUS_BUDGET, STATUS_CONFLICT, STATUS_INVALID, STATUS_OK, STATUS_OTHER, STATUS_UNKNOWN_ID,
@@ -29,6 +32,9 @@ const BASE_INTERFACE: &str = "org.mpris.MediaPlayer2";
 const PLAYER_INTERFACE: &str = "org.mpris.MediaPlayer2.Player";
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 const ARTWORK_SIZE: u32 = 512;
+/// Descending sizes tried until the re-encoded PNG fits `MPRIS_ARTWORK_MAX`.
+/// See `fit_artwork`.
+const ARTWORK_FIT_SIZES: [u32; 3] = [ARTWORK_SIZE, 384, 256];
 const ARTWORK_BUDGET: usize = 8 * 1024 * 1024;
 const PROPERTY_CALL_LIMIT: usize = 4;
 const ACTION_CALL_LIMIT: usize = 4;
@@ -157,7 +163,7 @@ impl State {
         self.by_owner.remove(&target.owner);
         self.artwork_bytes = self
             .artwork_bytes
-            .saturating_sub(target.player.artwork_png.len());
+            .saturating_sub(target.player.artwork.png_len());
         for alias in target.aliases {
             self.by_alias.remove(&alias);
         }
@@ -548,18 +554,13 @@ async fn monitor_player(
         }
         let refresh = tokio::time::timeout(
             DBUS_CALL_TIMEOUT,
-            read_player(
-                &connection,
-                &owner,
-                player_id,
-                &common.images,
-                &property_calls,
-            ),
+            read_player(&connection, &owner, player_id, &property_calls),
         )
         .await;
         match refresh {
-            Ok(Ok(snapshot)) => {
+            Ok(Ok(mut snapshot)) => {
                 failures = 0;
+                attach_artwork(&mut snapshot, &common.images).await;
                 let records = install_snapshot(&state, snapshot).await;
                 send_records(&common, records).await;
             }
@@ -591,6 +592,8 @@ async fn monitor_player(
 
 struct Snapshot {
     player: MprisPlayer,
+    /// Carried rather than resolved in place: see `attach_artwork`.
+    art_url: String,
     track_path: Option<OwnedObjectPath>,
     position_observed_at: Instant,
 }
@@ -612,33 +615,31 @@ async fn install_snapshot(
     snapshot.player.active = old.player.active;
     let became_playing = old.player.playback_status != PlaybackStatus::Playing
         && snapshot.player.playback_status == PlaybackStatus::Playing;
+    // Only covers carried as bytes occupy the budget, so a player whose art is
+    // a URL is never a candidate for eviction and never forces one.
     state.artwork_bytes = state
         .artwork_bytes
-        .saturating_sub(old.player.artwork_png.len());
+        .saturating_sub(old.player.artwork.png_len());
     let artwork_budget = artwork_budget();
     let mut records = Vec::new();
-    while !snapshot.player.artwork_png.is_empty()
-        && state.artwork_bytes + snapshot.player.artwork_png.len() > artwork_budget
+    while snapshot.player.artwork.png_len() > 0
+        && state.artwork_bytes + snapshot.player.artwork.png_len() > artwork_budget
     {
         let Some(evict_id) = state
             .players
             .iter()
             .filter(|(id, target)| {
-                **id != snapshot.player.player_id && !target.player.artwork_png.is_empty()
+                **id != snapshot.player.player_id && target.player.artwork.png_len() > 0
             })
             .min_by_key(|(_, target)| target.last_artwork)
             .map(|(id, _)| *id)
         else {
-            snapshot.player.artwork_width = 0;
-            snapshot.player.artwork_height = 0;
-            snapshot.player.artwork_png.clear();
+            snapshot.player.artwork = MprisArtwork::None;
             break;
         };
         if let Some((bytes, record)) = state.players.get_mut(&evict_id).map(|evicted| {
-            let bytes = evicted.player.artwork_png.len();
-            evicted.player.artwork_width = 0;
-            evicted.player.artwork_height = 0;
-            evicted.player.artwork_png.clear();
+            let bytes = evicted.player.artwork.png_len();
+            evicted.player.artwork = MprisArtwork::None;
             evicted.player.revision = evicted.player.revision.wrapping_add(1).max(1);
             evicted.last_artwork = 0;
             (
@@ -650,8 +651,8 @@ async fn install_snapshot(
             records.push(record);
         }
     }
-    let artwork_activity = (!snapshot.player.artwork_png.is_empty()).then(|| state.tick_activity());
-    state.artwork_bytes += snapshot.player.artwork_png.len();
+    let artwork_activity = (snapshot.player.artwork.png_len() > 0).then(|| state.tick_activity());
+    state.artwork_bytes += snapshot.player.artwork.png_len();
     let activity = became_playing.then(|| state.tick_activity());
     let player_id = snapshot.player.player_id;
     if let Some(target) = state.players.get_mut(&player_id) {
@@ -731,19 +732,14 @@ async fn handle_action(
     };
     let mut revision = target.player.revision;
     if status == STATUS_OK
-        && let Ok(snapshot) = tokio::time::timeout(
+        && let Ok(mut snapshot) = tokio::time::timeout(
             DBUS_CALL_TIMEOUT,
-            read_player(
-                connection,
-                &target.owner,
-                action.player_id,
-                &common.images,
-                &property_calls,
-            ),
+            read_player(connection, &target.owner, action.player_id, &property_calls),
         )
         .await
         .unwrap_or(Err("timeout"))
     {
+        attach_artwork(&mut snapshot, &common.images).await;
         let mut records = install_snapshot(state, snapshot).await;
         {
             let mut state = state.lock().await;
@@ -970,7 +966,6 @@ async fn read_player(
     connection: &Connection,
     owner: &str,
     player_id: u32,
-    images: &ImageResolver,
     property_calls: &Semaphore,
 ) -> Result<Snapshot, &'static str> {
     let properties = proxy(connection, owner, PROPERTIES_INTERFACE)
@@ -1060,7 +1055,6 @@ async fn read_player(
         .and_then(|value| value.try_clone().ok())
         .and_then(|value| OwnedObjectPath::try_from(value).ok());
     let art_url = metadata_string(&metadata, "mpris:artUrl");
-    let artwork = artwork(images, &art_url).await.unwrap_or_default();
     Ok(Snapshot {
         player: MprisPlayer {
             player_id,
@@ -1085,32 +1079,92 @@ async fn read_player(
             title,
             album,
             artists,
-            artwork_width: artwork.width,
-            artwork_height: artwork.height,
-            artwork_png: artwork.png,
+            artwork: MprisArtwork::None,
         },
+        art_url,
         track_path,
         position_observed_at,
     })
 }
 
-async fn artwork(images: &ImageResolver, url: &str) -> Option<blit_remote::desktop::PngImage> {
-    let image = if url.starts_with("file:") {
-        images.resolve(url.to_string(), None, ARTWORK_SIZE).await
+/// Resolves the cover a snapshot named, outside the D-Bus refresh budget.
+///
+/// `read_player` is wrapped in `DBUS_CALL_TIMEOUT` by both of its callers, and
+/// three consecutive expiries deregister the player. A remote cover costs
+/// nothing to resolve now that it is only forwarded, but a local one still
+/// reads and decodes a file up to three times looking for a size that fits, so
+/// it stays out of a window whose overrun would cost the player its
+/// registration rather than just its art.
+async fn attach_artwork(snapshot: &mut Snapshot, images: &ImageResolver) {
+    snapshot.player.artwork = artwork(images, &snapshot.art_url).await;
+}
+
+/// Turns an `mpris:artUrl` into something a viewer can display.
+///
+/// A URL the viewer can reach is forwarded untouched, which is both cheaper and
+/// better: the browser fetches it off the UI thread, caches it by URL across
+/// track changes, and the server never spends a fetch, a decode, a resize or a
+/// re-encode on it. Art that exists only as local bytes cannot be named to a
+/// browser, so it is normalized and carried instead.
+async fn artwork(images: &ImageResolver, url: &str) -> MprisArtwork {
+    if artwork_url_allowed(url) {
+        return MprisArtwork::Url(url.to_string());
+    }
+    let png = if url.starts_with("file:") {
+        let mut fitted = None;
+        for size in ARTWORK_FIT_SIZES {
+            let Some(image) = images
+                .resolve(url.to_string(), None, size, MAX_ARTWORK_SOURCE_DIMENSION)
+                .await
+            else {
+                break;
+            };
+            if image.png.len() <= MPRIS_ARTWORK_MAX {
+                fitted = Some(image);
+                break;
+            }
+        }
+        fitted
     } else if url.starts_with("data:image/") {
-        let data = data_url::DataUrl::process(url).ok()?;
-        if !data.mime_type().type_.eq_ignore_ascii_case("image") {
-            return None;
-        }
-        let (bytes, _) = data.decode_to_vec().ok()?;
-        if bytes.len() > 4 * 1024 * 1024 {
-            return None;
-        }
-        images.encoded(bytes, ARTWORK_SIZE).await
+        data_artwork(images, url).await
     } else {
         None
-    }?;
-    (image.png.len() <= MPRIS_ARTWORK_MAX).then_some(image)
+    };
+    match png {
+        Some(image) => MprisArtwork::Png(image.png),
+        None => MprisArtwork::None,
+    }
+}
+
+async fn data_artwork(images: &ImageResolver, url: &str) -> Option<PngImage> {
+    let data = data_url::DataUrl::process(url).ok()?;
+    if !data.mime_type().type_.eq_ignore_ascii_case("image") {
+        return None;
+    }
+    let (bytes, _) = data.decode_to_vec().ok()?;
+    if bytes.len() > MAX_SOURCE_IMAGE_BYTES {
+        return None;
+    }
+    fit_artwork(images, bytes).await
+}
+
+/// Normalizes `bytes` to the largest size whose PNG fits the transport cap.
+///
+/// A 512×512 re-encode of unusually detailed art can exceed `MPRIS_ARTWORK_MAX`
+/// even though the source was perfectly legal — measured at ~768 KiB against a
+/// 512 KiB cap for near-incompressible input. The encoder omits an over-cap
+/// cover rather than truncating it, so without stepping down the viewer would
+/// see a coverless player and no sign that art had been found and discarded.
+async fn fit_artwork(images: &ImageResolver, bytes: Vec<u8>) -> Option<PngImage> {
+    for size in ARTWORK_FIT_SIZES {
+        let image = images
+            .encoded(bytes.clone(), size, MAX_ARTWORK_SOURCE_DIMENSION)
+            .await?;
+        if image.png.len() <= MPRIS_ARTWORK_MAX {
+            return Some(image);
+        }
+    }
+    None
 }
 
 async fn proxy(
@@ -1287,9 +1341,7 @@ fn empty_player(player_id: u32) -> MprisPlayer {
         title: String::new(),
         album: String::new(),
         artists: Vec::new(),
-        artwork_width: 0,
-        artwork_height: 0,
-        artwork_png: Vec::new(),
+        artwork: MprisArtwork::None,
     }
 }
 
@@ -1323,6 +1375,83 @@ async fn send_result(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The Spotify case: a cover named over HTTPS is forwarded verbatim, and the
+    /// server neither fetches nor re-encodes it.
+    #[tokio::test]
+    async fn a_cover_named_over_https_is_forwarded_as_a_url() {
+        let images = ImageResolver::new();
+        let url = "https://i.scdn.co/image/ab67616d0000b2738ac778cc7d88779f74d33311";
+
+        let resolved = artwork(&images, url).await;
+
+        assert_eq!(resolved, MprisArtwork::Url(url.into()));
+        // Costs the retained artwork budget nothing, which is the point.
+        assert_eq!(resolved.png_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_url_the_viewer_could_not_load_yields_no_artwork() {
+        let images = ImageResolver::new();
+        for hostile in [
+            "ftp://example.test/cover.png",
+            "javascript:alert(1)",
+            "/home/user/cover.png",
+            "https://",
+            "",
+        ] {
+            assert!(
+                artwork(&images, hostile).await.is_none(),
+                "{hostile} must not reach a viewer"
+            );
+        }
+    }
+
+    /// A local cover has no URL a browser could resolve, so it must still travel
+    /// as normalized bytes — and at 640×640, over the icon source ceiling.
+    #[tokio::test]
+    async fn a_local_cover_still_travels_as_normalized_bytes() {
+        let dir = std::env::temp_dir().join(format!("blit-art-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("cover.jpg");
+        std::fs::write(&path, crate::test_http::cover_jpeg(640, 640)).expect("write cover");
+        let images = ImageResolver::new();
+
+        let resolved = artwork(&images, &format!("file://{}", path.display())).await;
+
+        let MprisArtwork::Png(png) = &resolved else {
+            panic!("expected bytes for a local cover, got {resolved:?}")
+        };
+        assert!(png.starts_with(b"\x89PNG"));
+        assert!(png.len() <= MPRIS_ARTWORK_MAX);
+        // Downscaled from 640 to the artwork ceiling rather than refused for
+        // exceeding the icon-sized source limit.
+        let decoded = image::load_from_memory(png).expect("decode normalized cover");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (ARTWORK_SIZE, ARTWORK_SIZE)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Detailed local art whose 512×512 re-encode overruns the transport cap
+    /// must arrive smaller rather than not at all: the encoder omits an over-cap
+    /// cover instead of truncating it.
+    #[tokio::test]
+    async fn art_that_will_not_fit_at_full_size_steps_down_instead_of_vanishing() {
+        let images = ImageResolver::new();
+        let fitted = fit_artwork(&images, crate::test_http::incompressible_cover(640))
+            .await
+            .expect("a cover too detailed for 512px must still arrive");
+
+        assert!(fitted.png.len() <= MPRIS_ARTWORK_MAX);
+        assert!(
+            fitted.width < ARTWORK_SIZE as u16,
+            "expected a step down from {ARTWORK_SIZE}, got {}",
+            fitted.width
+        );
+        assert!(ARTWORK_FIT_SIZES.contains(&(fitted.width as u32)));
+    }
 
     fn target(player_id: u32, observed_at: Instant) -> Target {
         Target {
@@ -1361,6 +1490,7 @@ mod tests {
         player.title = "new title".into();
         let snapshot = Snapshot {
             player,
+            art_url: String::new(),
             track_path: target.track_path.clone(),
             position_observed_at: now,
         };

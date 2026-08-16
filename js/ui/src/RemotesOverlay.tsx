@@ -1,8 +1,20 @@
 import { createSignal, Index, Show } from "solid-js";
-import type { ConnectionStatus, TerminalPalette } from "@blit-sh/core";
+import type {
+  BlitConnectionSnapshot,
+  BlitSession,
+  BlitSurface,
+  BlitWorkspace,
+  ConnectionId,
+  ConnectionStatus,
+  TerminalPalette,
+} from "@blit-sh/core";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 import { mergeStyle, scrollbarStyle, themeFor, ui, uiScale } from "./theme";
 import { createDragReorder, reorderTo } from "./dragReorder";
+import {
+  ConnectionClients,
+  connectionHasClientList,
+} from "./ConnectionClients";
 import { t } from "./i18n";
 import type { Remote } from "./storage";
 
@@ -36,6 +48,13 @@ export function RemotesOverlay(props: {
   onReorder: (names: string[]) => void;
   onReconnect?: (name: string) => void;
   onClose: () => void;
+  /** Live connections, used to decide which rows can list their clients.
+   *  Omit (with `workspace`) to render the remotes list on its own. */
+  connections?: readonly BlitConnectionSnapshot[];
+  workspace?: BlitWorkspace;
+  sessions?: readonly BlitSession[];
+  surfaces?: readonly BlitSurface[];
+  readOnlyConnections?: ReadonlySet<ConnectionId>;
 }) {
   const theme = () => themeFor(props.palette);
   const scale = () => uiScale(props.fontSize);
@@ -43,6 +62,36 @@ export function RemotesOverlay(props: {
   const [name, setName] = createSignal("");
   const [uri, setUri] = createSignal("");
   const [revealed, setRevealed] = createSignal<Set<string>>(new Set());
+  // At most one remote's client list is open at a time: each open list holds a
+  // live CLIENT_WATCH pushing a catalog every second, and reading two servers'
+  // clients side by side is not a thing anyone does.
+  const [expanded, setExpanded] = createSignal<string | null>(null);
+
+  /** A remote's live connection, if it has one. Remote names *are* connection
+   *  ids (App.tsx builds one ConnectionSpec per enabled remote, `id: name`). */
+  const connectionFor = (remoteName: string) =>
+    props.connections?.find((c) => c.id === remoteName);
+
+  /** Whether this row can show a client list right now. */
+  const canListClients = (remoteName: string) => {
+    const connection = connectionFor(remoteName);
+    return (
+      !!props.workspace &&
+      !!connection &&
+      connectionHasClientList(
+        connection,
+        props.readOnlyConnections ?? new Set(),
+      )
+    );
+  };
+
+  function toggleExpanded(remoteName: string) {
+    setExpanded((prev) => (prev === remoteName ? null : remoteName));
+  }
+
+  /** Any row at all offers a client list — gates the header's explanation of
+   *  what the chevrons are, so a shell without client control says nothing. */
+  const anyClients = () => props.remotes.some((r) => canListClients(r.name));
 
   let nameRef!: HTMLInputElement;
 
@@ -113,13 +162,24 @@ export function RemotesOverlay(props: {
     },
   });
 
-  // Only include the reveal/hide column if any remote is a share URI.
-  // Columns: drag, name, uri, default, [reveal], reconnect, toggle, remove.
+  // Columns: drag, name, uri, default, [reveal], [clients], reconnect,
+  // toggle, remove. Optional columns are only present when some row can fill
+  // them — a share URI for reveal, a client-listing connection for clients.
   const cols = () => {
     if (props.readOnly) return "auto 1fr";
-    return hasShare()
-      ? "auto auto 1fr auto auto auto auto auto"
-      : "auto auto 1fr auto auto auto auto";
+    return [
+      "auto",
+      "auto",
+      "1fr",
+      "auto",
+      hasShare() ? "auto" : null,
+      anyClients() ? "auto" : null,
+      "auto",
+      "auto",
+      "auto",
+    ]
+      .filter(Boolean)
+      .join(" ");
   };
 
   return (
@@ -136,6 +196,9 @@ export function RemotesOverlay(props: {
           "flex-direction": "column",
           gap: `${scale().gap}px`,
           width: "fit-content",
+          // An expanded client list is much wider than a remotes row, and
+          // fit-content would happily follow it off the screen.
+          "max-width": "min(860px, 94vw)",
         }}
       >
         <OverlayHeader
@@ -144,6 +207,7 @@ export function RemotesOverlay(props: {
           title={
             props.readOnly ? t("remotes.connectingTitle") : t("remotes.title")
           }
+          subtitle={anyClients() ? t("remotes.clientsSubtitle") : undefined}
           onClose={props.onClose}
         />
 
@@ -276,174 +340,273 @@ export function RemotesOverlay(props: {
                   );
                 };
 
-                return (
-                  <div
-                    role="listitem"
-                    ref={drag.rowRef(index)}
-                    onPointerDown={(e) => drag.onRowPointerDown(e, index)}
-                    style={{
-                      display: "grid",
-                      "grid-template-columns": "subgrid",
-                      "grid-column": "1 / -1",
-                      "align-items": "center",
-                      "border-top": showGapBefore()
-                        ? `2px solid ${theme().accent}`
-                        : index > 0
-                          ? "none"
-                          : `1px solid ${theme().subtleBorder}`,
-                      "border-bottom": showGapAfter()
-                        ? `2px solid ${theme().accent}`
-                        : `1px solid ${theme().subtleBorder}`,
-                      "border-left": `1px solid ${theme().subtleBorder}`,
-                      "border-right": `1px solid ${theme().subtleBorder}`,
-                      "background-color": theme().solidPanelBg,
-                      opacity: rowOpacity() * (disabled() ? 0.55 : 1),
-                      transition: "opacity 0.1s",
-                    }}
-                  >
-                    {/* Drag handle */}
-                    <Show when={!props.readOnly}>
-                      <div
-                        title={t("remotes.dragHandle")}
-                        aria-label={t("remotes.dragHandle")}
-                        onPointerDown={(e) =>
-                          drag.onHandlePointerDown(e, index)
-                        }
-                        style={{
-                          display: "flex",
-                          "align-items": "center",
-                          "align-self": "stretch",
-                          "justify-content": "center",
-                          padding: `0 ${scale().controlX + 4}px`,
-                          cursor: mutationsBlocked()
-                            ? "not-allowed"
-                            : drag.sourceIndex() === index
-                              ? "grabbing"
-                              : "grab",
-                          color: theme().dimFg,
-                          "font-size": `${scale().md}px`,
-                          "user-select": "none",
-                          // Claim the gesture from the container's touch
-                          // panning, so a finger on the handle reorders.
-                          "touch-action": "none",
-                          "border-right": `1px solid ${theme().subtleBorder}`,
-                          opacity: mutationsBlocked() ? 0.4 : 1,
-                        }}
-                      >
-                        ⠿
-                      </div>
-                    </Show>
+                const clients = () => canListClients(remote().name);
+                const open = () => expanded() === remote().name;
 
-                    {/* Status dot + Name */}
+                return (
+                  <>
                     <div
+                      role="listitem"
+                      ref={drag.rowRef(index)}
+                      onPointerDown={(e) => drag.onRowPointerDown(e, index)}
                       style={{
-                        padding: `${scale().controlY}px ${scale().controlX}px`,
-                        "font-size": `${scale().md}px`,
-                        "font-weight": 600,
-                        display: "flex",
+                        display: "grid",
+                        "grid-template-columns": "subgrid",
+                        "grid-column": "1 / -1",
                         "align-items": "center",
-                        gap: `${scale().tightGap}px`,
-                        "white-space": "nowrap",
+                        "border-top": showGapBefore()
+                          ? `2px solid ${theme().accent}`
+                          : index > 0
+                            ? "none"
+                            : `1px solid ${theme().subtleBorder}`,
+                        "border-bottom": showGapAfter()
+                          ? `2px solid ${theme().accent}`
+                          : `1px solid ${theme().subtleBorder}`,
+                        "border-left": `1px solid ${theme().subtleBorder}`,
+                        "border-right": `1px solid ${theme().subtleBorder}`,
+                        "background-color": theme().solidPanelBg,
+                        opacity: rowOpacity() * (disabled() ? 0.55 : 1),
+                        transition: "opacity 0.1s",
                       }}
                     >
-                      <span
-                        title={status() ? t(`remotes.status.${status()}`) : ""}
-                        style={{
-                          display: "inline-block",
-                          width: "8px",
-                          height: "8px",
-                          "border-radius": "50%",
-                          "background-color": statusColor(),
-                          "flex-shrink": 0,
-                        }}
-                      />
-                      {remote().name}
-                    </div>
-
-                    {/* URI */}
-                    <Show when={!props.readOnly}>
-                      <div
-                        style={{
-                          padding: `${scale().controlY}px ${scale().controlX}px`,
-                          "font-size": `${scale().sm}px`,
-                          color:
-                            share() && !show() ? theme().dimFg : theme().fg,
-                          overflow: "hidden",
-                          "text-overflow": "ellipsis",
-                          "white-space": "nowrap",
-                          "font-family":
-                            share() && !show()
-                              ? "inherit"
-                              : "monospace, inherit",
-                          "letter-spacing":
-                            share() && !show() ? "0.05em" : "normal",
-                        }}
-                      >
-                        {displayUri()}
-                      </div>
-
-                      {/* Default / Set as default */}
-                      <Show
-                        when={isDefault()}
-                        fallback={
-                          <button
-                            type="button"
-                            title={t("remotes.setDefault")}
-                            disabled={mutationsBlocked()}
-                            onClick={() => props.onSetDefault(remote().name)}
-                            style={{
-                              ...btnStyle(),
-                              opacity: mutationsBlocked() ? 0.3 : 0.5,
-                              cursor: mutationsBlocked()
-                                ? "not-allowed"
-                                : "pointer",
-                              "border-left": `1px solid ${theme().subtleBorder}`,
-                            }}
-                          >
-                            {t("remotes.setDefault")}
-                          </button>
-                        }
-                      >
+                      {/* Drag handle */}
+                      <Show when={!props.readOnly}>
                         <div
-                          title={t("remotes.isDefault")}
+                          title={t("remotes.dragHandle")}
+                          aria-label={t("remotes.dragHandle")}
+                          onPointerDown={(e) =>
+                            drag.onHandlePointerDown(e, index)
+                          }
                           style={{
-                            ...btnStyle(),
-                            cursor: "default",
-                            color: theme().accent,
-                            "border-left": `1px solid ${theme().subtleBorder}`,
+                            display: "flex",
+                            "align-items": "center",
+                            "align-self": "stretch",
+                            "justify-content": "center",
+                            padding: `0 ${scale().controlX + 4}px`,
+                            cursor: mutationsBlocked()
+                              ? "not-allowed"
+                              : drag.sourceIndex() === index
+                                ? "grabbing"
+                                : "grab",
+                            color: theme().dimFg,
+                            "font-size": `${scale().md}px`,
+                            "user-select": "none",
+                            // Claim the gesture from the container's touch
+                            // panning, so a finger on the handle reorders.
+                            "touch-action": "none",
+                            "border-right": `1px solid ${theme().subtleBorder}`,
+                            opacity: mutationsBlocked() ? 0.4 : 1,
                           }}
                         >
-                          {t("remotes.isDefault")}
+                          ⠿
                         </div>
                       </Show>
 
-                      {/* Reveal/hide — only column present when any remote is share */}
-                      <Show when={hasShare()}>
-                        <Show when={share()} fallback={<div />}>
+                      {/* Status dot + Name */}
+                      <div
+                        style={{
+                          padding: `${scale().controlY}px ${scale().controlX}px`,
+                          "font-size": `${scale().md}px`,
+                          "font-weight": 600,
+                          display: "flex",
+                          "align-items": "center",
+                          gap: `${scale().tightGap}px`,
+                          "white-space": "nowrap",
+                        }}
+                      >
+                        <span
+                          title={
+                            status() ? t(`remotes.status.${status()}`) : ""
+                          }
+                          style={{
+                            display: "inline-block",
+                            width: "8px",
+                            height: "8px",
+                            "border-radius": "50%",
+                            "background-color": statusColor(),
+                            "flex-shrink": 0,
+                          }}
+                        />
+                        {remote().name}
+                      </div>
+
+                      {/* URI */}
+                      <Show when={!props.readOnly}>
+                        <div
+                          style={{
+                            padding: `${scale().controlY}px ${scale().controlX}px`,
+                            "font-size": `${scale().sm}px`,
+                            color:
+                              share() && !show() ? theme().dimFg : theme().fg,
+                            overflow: "hidden",
+                            "text-overflow": "ellipsis",
+                            "white-space": "nowrap",
+                            "font-family":
+                              share() && !show()
+                                ? "inherit"
+                                : "monospace, inherit",
+                            "letter-spacing":
+                              share() && !show() ? "0.05em" : "normal",
+                          }}
+                        >
+                          {displayUri()}
+                        </div>
+
+                        {/* Default / Set as default */}
+                        <Show
+                          when={isDefault()}
+                          fallback={
+                            <button
+                              type="button"
+                              title={t("remotes.setDefault")}
+                              disabled={mutationsBlocked()}
+                              onClick={() => props.onSetDefault(remote().name)}
+                              style={{
+                                ...btnStyle(),
+                                opacity: mutationsBlocked() ? 0.3 : 0.5,
+                                cursor: mutationsBlocked()
+                                  ? "not-allowed"
+                                  : "pointer",
+                                "border-left": `1px solid ${theme().subtleBorder}`,
+                              }}
+                            >
+                              {t("remotes.setDefault")}
+                            </button>
+                          }
+                        >
+                          <div
+                            title={t("remotes.isDefault")}
+                            style={{
+                              ...btnStyle(),
+                              cursor: "default",
+                              color: theme().accent,
+                              "border-left": `1px solid ${theme().subtleBorder}`,
+                            }}
+                          >
+                            {t("remotes.isDefault")}
+                          </div>
+                        </Show>
+
+                        {/* Reveal/hide — only column present when any remote is share */}
+                        <Show when={hasShare()}>
+                          <Show when={share()} fallback={<div />}>
+                            <button
+                              type="button"
+                              title={
+                                show()
+                                  ? t("remotes.hideUri")
+                                  : t("remotes.revealUri")
+                              }
+                              onClick={() => toggleReveal(remote().name)}
+                              style={btnStyle()}
+                            >
+                              {show()
+                                ? t("remotes.hideUri")
+                                : t("remotes.revealUri")}
+                            </button>
+                          </Show>
+                        </Show>
+
+                        {/* Clients — a named action rather than a bare
+                            chevron on the name: this replaced a top-level
+                            "Connected clients" entry in the command palette,
+                            and a 1-em glyph is not a discoverable home for
+                            something that used to have its own menu item.
+                            Only offered where the remote could actually
+                            answer; a disconnected row that expanded to "No
+                            clients connected" would be reporting the wrong
+                            thing. */}
+                        <Show when={anyClients()}>
+                          <Show
+                            when={clients()}
+                            fallback={
+                              <div
+                                title={
+                                  // Two different reasons, and they call for
+                                  // different answers: connect the remote, or
+                                  // accept that this server is too old to say.
+                                  connectionFor(remote().name)?.status ===
+                                  "connected"
+                                    ? t("remotes.clientsUnsupported")
+                                    : t("remotes.clientsDisconnected")
+                                }
+                                style={{ ...btnStyle(), opacity: 0.25 }}
+                              >
+                                {t("remotes.clients")}
+                              </div>
+                            }
+                          >
+                            <button
+                              type="button"
+                              aria-expanded={open()}
+                              title={
+                                open()
+                                  ? t("remotes.hideClients")
+                                  : t("remotes.showClients")
+                              }
+                              onClick={() => toggleExpanded(remote().name)}
+                              style={{
+                                ...btnStyle(),
+                                opacity: open() ? 1 : 0.7,
+                                color: open() ? theme().accent : "inherit",
+                              }}
+                            >
+                              {open() ? "▾ " : "▸ "}
+                              {t("remotes.clients")}
+                            </button>
+                          </Show>
+                        </Show>
+
+                        {/* Reconnect — hidden for disabled entries */}
+                        <Show when={!disabled()} fallback={<div />}>
                           <button
                             type="button"
-                            title={
-                              show()
-                                ? t("remotes.hideUri")
-                                : t("remotes.revealUri")
-                            }
-                            onClick={() => toggleReveal(remote().name)}
-                            style={btnStyle()}
+                            title={t("disconnected.reconnectNow")}
+                            disabled={mutationsBlocked()}
+                            onClick={() => props.onReconnect?.(remote().name)}
+                            style={{
+                              ...btnStyle(),
+                              opacity: mutationsBlocked() ? 0.3 : 0.7,
+                              cursor: mutationsBlocked()
+                                ? "not-allowed"
+                                : "pointer",
+                            }}
                           >
-                            {show()
-                              ? t("remotes.hideUri")
-                              : t("remotes.revealUri")}
+                            {t("disconnected.reconnectNow")}
                           </button>
                         </Show>
-                      </Show>
 
-                      {/* Reconnect — hidden for disabled entries */}
-                      <Show when={!disabled()} fallback={<div />}>
+                        {/* Disable / Enable */}
                         <button
                           type="button"
-                          title={t("disconnected.reconnectNow")}
+                          title={
+                            disabled()
+                              ? t("remotes.enable")
+                              : t("remotes.disable")
+                          }
+                          disabled={mutationsBlocked() || !props.onToggle}
+                          onClick={() => props.onToggle?.(remote().name)}
+                          style={{
+                            ...btnStyle(),
+                            opacity:
+                              mutationsBlocked() || !props.onToggle ? 0.3 : 0.7,
+                            cursor:
+                              mutationsBlocked() || !props.onToggle
+                                ? "not-allowed"
+                                : "pointer",
+                          }}
+                        >
+                          {disabled()
+                            ? t("remotes.enable")
+                            : t("remotes.disable")}
+                        </button>
+
+                        {/* Remove */}
+                        <button
+                          type="button"
+                          title={t("remotes.remove")}
                           disabled={mutationsBlocked()}
-                          onClick={() => props.onReconnect?.(remote().name)}
+                          onClick={() => props.onRemove(remote().name)}
                           style={{
                             ...btnStyle(),
                             opacity: mutationsBlocked() ? 0.3 : 0.7,
@@ -452,53 +615,38 @@ export function RemotesOverlay(props: {
                               : "pointer",
                           }}
                         >
-                          {t("disconnected.reconnectNow")}
+                          {t("remotes.remove")}
                         </button>
                       </Show>
+                    </div>
 
-                      {/* Disable / Enable */}
-                      <button
-                        type="button"
-                        title={
-                          disabled()
-                            ? t("remotes.enable")
-                            : t("remotes.disable")
-                        }
-                        disabled={mutationsBlocked() || !props.onToggle}
-                        onClick={() => props.onToggle?.(remote().name)}
+                    {/* Clients, as a full-width row of the same grid. A sibling
+                      of the remote row rather than a child of it, so the
+                      drag-reorder extents stay the height of the header the
+                      user is actually dragging. */}
+                    <Show when={clients() && open()}>
+                      <div
                         style={{
-                          ...btnStyle(),
-                          opacity:
-                            mutationsBlocked() || !props.onToggle ? 0.3 : 0.7,
-                          cursor:
-                            mutationsBlocked() || !props.onToggle
-                              ? "not-allowed"
-                              : "pointer",
+                          "grid-column": "1 / -1",
+                          // Keeps the client list from widening the grid's
+                          // columns; it wraps instead.
+                          "min-width": "0",
+                          "border-left": `1px solid ${theme().subtleBorder}`,
+                          "border-right": `1px solid ${theme().subtleBorder}`,
+                          "border-bottom": `1px solid ${theme().subtleBorder}`,
                         }}
                       >
-                        {disabled()
-                          ? t("remotes.enable")
-                          : t("remotes.disable")}
-                      </button>
-
-                      {/* Remove */}
-                      <button
-                        type="button"
-                        title={t("remotes.remove")}
-                        disabled={mutationsBlocked()}
-                        onClick={() => props.onRemove(remote().name)}
-                        style={{
-                          ...btnStyle(),
-                          opacity: mutationsBlocked() ? 0.3 : 0.7,
-                          cursor: mutationsBlocked()
-                            ? "not-allowed"
-                            : "pointer",
-                        }}
-                      >
-                        {t("remotes.remove")}
-                      </button>
+                        <ConnectionClients
+                          workspace={props.workspace!}
+                          connectionId={remote().name as ConnectionId}
+                          sessions={props.sessions ?? []}
+                          surfaces={props.surfaces ?? []}
+                          palette={props.palette}
+                          fontSize={props.fontSize}
+                        />
+                      </div>
                     </Show>
-                  </div>
+                  </>
                 );
               }}
             </Index>

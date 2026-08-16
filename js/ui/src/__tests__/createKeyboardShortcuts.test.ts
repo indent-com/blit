@@ -14,6 +14,8 @@ function focusState(options: {
   surfaceId?: number | null;
   paneId?: string | null;
   assignment?: string | null;
+  /** A genuine multi-pane layout is on screen. Defaults to "there is a pane". */
+  inBsp?: boolean;
 }) {
   const paneId = options.paneId ?? null;
   const assignments = paneId
@@ -22,6 +24,7 @@ function focusState(options: {
       } as BSPAssignments)
     : null;
   return {
+    inBsp: () => options.inBsp ?? paneId != null,
     focusedSurfaceId: () => options.surfaceId ?? null,
     bspFocusedPaneId: () => paneId,
     layoutAssignments: () => assignments,
@@ -48,6 +51,43 @@ describe("hasFocusedWaylandSurface", () => {
     const state = focusState({ paneId: "pane-1", assignment: "session-1" });
     expect(hasFocusedWaylandSurface(state)).toBe(false);
     expect(shouldHandleNewTerminalShortcut(state)).toBe(true);
+  });
+
+  // The single-view surface slot is never cleared once BSP takes over, and an
+  // `s=` in the URL hash re-arms it on every load. Under a layout it must not
+  // speak for a pane holding a terminal, or nothing at all — that is what made
+  // Cmd+Enter, Cmd+Shift+Enter and every Ctrl+Shift chord silently dead.
+  it("ignores a stale single-view surface while a BSP pane holds a terminal", () => {
+    const state = focusState({
+      surfaceId: 7,
+      paneId: "pane-1",
+      assignment: "session-1",
+    });
+    expect(hasFocusedWaylandSurface(state)).toBe(false);
+    expect(shouldHandleNewTerminalShortcut(state)).toBe(true);
+  });
+
+  it("ignores a stale single-view surface in an empty BSP pane", () => {
+    const state = focusState({
+      surfaceId: 7,
+      paneId: "pane-1",
+      assignment: null,
+    });
+    expect(hasFocusedWaylandSurface(state)).toBe(false);
+    expect(shouldHandleNewTerminalShortcut(state)).toBe(true);
+  });
+
+  // A single-leaf layout ("l=a") renders the single main view, not panes, so
+  // the surface slot is still authoritative there.
+  it("honours the single-view surface under a single-leaf layout", () => {
+    const state = focusState({
+      surfaceId: 7,
+      paneId: "pane-1",
+      assignment: null,
+      inBsp: false,
+    });
+    expect(hasFocusedWaylandSurface(state)).toBe(true);
+    expect(shouldHandleNewTerminalShortcut(state)).toBe(false);
   });
 });
 

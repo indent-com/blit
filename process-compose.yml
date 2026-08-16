@@ -91,6 +91,10 @@ processes:
     command: ./target/profiling/blit gateway
     environment:
       - BLIT_ADDR=${BLIT_DEV_GW_HOST:-127.0.0.1}:${BLIT_DEV_GW_PORT:-10001}
+      # Set BLIT_AUDIO_DEBUG=1 here and on the server to localise an audio
+      # gap to one hop: the server reports its own writer, the gateway
+      # reports both the socket to the browser and what it reads upstream.
+      # Off by default — it is a line per second per channel.
       - BLIT_CORS=*
       - BLIT_GATEWAY_WEBRTC=${BLIT_GATEWAY_WEBRTC:-0}
       - BLIT_PASSPHRASE=${BLIT_PASSPHRASE:-dev}

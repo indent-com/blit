@@ -540,6 +540,26 @@ pub enum Command {
         #[arg(long, value_name = "N")]
         max_ptys: Option<usize>,
 
+        /// Surface video encoders to try, best first: h264-nvenc, av1-nvenc,
+        /// h264-vaapi, av1-vaapi, h264-vulkan, av1-vulkan, h264-software,
+        /// av1-software (or set BLIT_SURFACE_ENCODERS). The first entry a
+        /// viewer can decode and this host can build wins.
+        #[arg(long, value_name = "LIST")]
+        surface_encoders: Option<String>,
+
+        /// Camera formats viewers may send: mjpeg, h264, av1, h264-444,
+        /// av1-444 (or set BLIT_MEDIA_CAMERA_CODECS). Each name selects one
+        /// format — h264 does not imply h264-444. mjpeg is always accepted.
+        /// Narrows what this host can decode; never widens it.
+        #[arg(long, value_name = "LIST")]
+        camera_codecs: Option<String>,
+
+        /// Microphone formats viewers may send: pcm, opus (or set
+        /// BLIT_MEDIA_MICROPHONE_CODECS). pcm is always accepted — it is the
+        /// fallback a browser reaches when it cannot encode Opus.
+        #[arg(long, value_name = "LIST")]
+        microphone_codecs: Option<String>,
+
         /// Restrict what the TCP/UDP relay may reach: host[:ports], where
         /// host is a name, a *.suffix glob, an address, a CIDR block, or *,
         /// and ports is a comma-separated list of n or n-m. Repeatable (or

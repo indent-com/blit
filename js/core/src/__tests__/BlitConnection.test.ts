@@ -1091,6 +1091,7 @@ describe("BlitConnection", () => {
         id: 42n,
         ageSeconds: 125,
         outboundBytesPerSecond: 1_500_000,
+        inboundBytesPerSecond: 4_096,
         subscriptions: [
           { kind: 1, id: 0 },
           { kind: 2, id: 11 },
@@ -1114,6 +1115,7 @@ describe("BlitConnection", () => {
           id: 42n,
           ageSeconds: 125,
           outboundBytesPerSecond: 1_500_000,
+          inboundBytesPerSecond: 4_096,
           subscriptions: [
             { kind: 1, id: 0 },
             { kind: 2, id: 11 },
@@ -1263,6 +1265,7 @@ describe("BlitConnection", () => {
           id: 42n,
           ageSeconds: 1,
           outboundBytesPerSecond: 2,
+          inboundBytesPerSecond: 1,
           subscriptions: [{ kind: 5, id: 14 }],
           terminals: [{ ptyId: 3, rows: 24, cols: 80 }],
           surfaces: [],
@@ -1302,6 +1305,7 @@ describe("BlitConnection", () => {
         id: 42n,
         ageSeconds: 0,
         outboundBytesPerSecond: 0,
+        inboundBytesPerSecond: 0,
         subscriptions: [],
         terminals: [{ ptyId: 3, rows: null, cols: null }],
         surfaces: [{ surfaceId: 7, width: null, height: null, scale120: null }],

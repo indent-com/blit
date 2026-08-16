@@ -299,8 +299,15 @@ export class MuxTransport {
    * automatically when a {@link BlitConnection} is created with
    * `autoConnect: true`).
    */
-  createChannel(destName: string): MuxChannel {
-    const id = this.nextChannelId++;
+  createChannel(destName: string, channelId?: number): MuxChannel {
+    // The id may be supplied by the caller. When this transport runs inside a
+    // worker the main thread has already handed a channel back to its own
+    // caller — `createChannel` is synchronous and the id prefixes every frame,
+    // so it cannot wait for a round trip — and both sides must agree on it.
+    const id = channelId ?? this.nextChannelId++;
+    if (channelId !== undefined && channelId >= this.nextChannelId) {
+      this.nextChannelId = channelId + 1;
+    }
     const ch = new MuxChannel(this, id, destName, this.initialDelay);
     this.channels.set(id, ch);
     return ch;

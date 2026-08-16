@@ -77,6 +77,22 @@ export interface BlitTransport {
   reconnect?(): void;
   /** Current connection status. */
   readonly status: ConnectionStatus;
+  /**
+   * Bytes handed to `send` that have not yet reached the network, when the
+   * transport can say.
+   *
+   * This is the only honest congestion signal a browser gets: the socket
+   * drains at whatever rate the uplink allows, so a queue that keeps growing
+   * *is* a link too slow for what is being sent. Realtime senders — the
+   * camera above all — should drop rather than add to it, because every
+   * queued byte is delay in front of the frame they are about to capture.
+   *
+   * `undefined` where the transport cannot report it (a worker-hosted mux
+   * that has not sampled recently, say). Callers must treat that as "no
+   * backpressure known" and fall back to their own flow control rather than
+   * stalling.
+   */
+  readonly bufferedAmount?: number;
   /** True when the server explicitly rejected authentication. */
   readonly authRejected: boolean;
   /** Last error message, if any. Cleared on successful connection. */
@@ -156,6 +172,9 @@ export interface BlitClientInfo {
   ageSeconds: number;
   /** Actual framed bytes written by the server to this client per second. */
   outboundBytesPerSecond: number;
+  /** The same, for framed bytes the server read from this client. Both are
+   *  measured by the server, so they are comparable across client kinds. */
+  inboundBytesPerSecond: number;
   /** Audio, filesystem, Git, LSP, KV and network subscriptions. */
   subscriptions: readonly BlitClientAuxSubscription[];
   terminals: readonly BlitClientTerminalSubscription[];

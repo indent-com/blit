@@ -21,6 +21,8 @@
  * from a Blob URL — no external file needed.
  */
 
+import { claimPlaybackAudioSession } from "./audioSession";
+
 /**
  * Maximum pre-worklet staging depth in decoded frames (~20 ms each).
  *
@@ -68,11 +70,14 @@ export const MAX_BUFFER_TARGET_SAMPLES = 19200; // 400 ms at 48 kHz
 
 /**
  * Samples of uninterrupted, non-buffering playback required before
- * bufferTarget shrinks by one frame.  Long enough that recurring jitter
- * never decays the buffer back toward the floor *between* events —
- * otherwise the buffer oscillates and glitches on every cycle — but
- * short enough that a link which has actually recovered gets its latency
- * back in tens of seconds rather than minutes.  At 5 s per 20 ms frame,
+ * bufferTarget shrinks by one frame.  Short enough that a link which has
+ * actually recovered gets its latency back in tens of seconds rather than
+ * minutes.  It was also meant to be long enough that recurring jitter never
+ * decayed the buffer back toward the floor *between* events, which held only
+ * for jitter more often than every ~25 s; anything rarer than that unwound
+ * completely and glitched again.  Keeping headroom across quiet gaps is now
+ * FLOOR_DECAY_STABLE_SAMPLES' job, and this constant is free to stay brisk.
+ * At 5 s per 20 ms frame,
  * one underrun's worth of growth (100 ms) unwinds in 25 s of calm, and
  * any link underrunning more often than every 5 s still ratchets up to
  * the ceiling and stays there — which is the correct answer for a link
@@ -80,6 +85,32 @@ export const MAX_BUFFER_TARGET_SAMPLES = 19200; // 400 ms at 48 kHz
  * event.
  */
 const DECAY_STABLE_SAMPLES = 240000; // 5 s at 48 kHz
+
+/**
+ * How long the buffer remembers what a link turned out to need.
+ *
+ * Growth is per-underrun and decay is per-DECAY_STABLE_SAMPLES, so on its own
+ * the target is back at MIN within half a minute of calm and meets the next
+ * jitter spike with no headroom — a link that glitches every few minutes
+ * glitches every few minutes forever, re-learning the same lesson each time.
+ * The learned floor is the memory the fast decay lacks: an underrun raises it
+ * to whatever was needed, the target may not shrink below it, and it fades on
+ * its own much slower timescale.
+ *
+ * That leaves two rates doing separate jobs. The target still falls quickly,
+ * so a burst of jitter does not cost latency for long. The floor falls slowly,
+ * so recurring jitter does not cost audio at all.
+ */
+const FLOOR_DECAY_STABLE_SAMPLES = 1_440_000; // 30 s at 48 kHz
+
+/**
+ * Ceiling on the *learned* floor, well under MAX_BUFFER_TARGET_SAMPLES.
+ *
+ * The target may still spike to the maximum to ride out something awful; the
+ * floor is what a link is held at afterwards, and a bad minute should not pin
+ * playback 400 ms behind live for the rest of the session.
+ */
+export const MAX_LEARNED_FLOOR_SAMPLES = 9600; // 200 ms at 48 kHz
 
 // -- A/V sync constants ----------------------------------------------------
 
@@ -122,12 +153,29 @@ export const SYNC_WARMUP_FRAMES = 10;
 const RATE_SMOOTHING_ALPHA = 0.15;
 
 /**
- * Consecutive render-block underruns before the worklet re-enters full
- * buffering mode.  A single underrun is usually just a scheduling hiccup
- * where the next PCM chunk is already in the port queue; three
- * consecutive underruns indicate a real gap.
+ * Continuous starvation before the worklet re-enters full buffering mode.
+ *
+ * Rebuffering is not a small correction: playback stops until the buffer has
+ * refilled to `bufferTarget`, so it converts a gap into a silence of at least
+ * MIN_BUFFER_SAMPLES and, on a link that has learned it needs headroom, up to
+ * MAX_LEARNED_FLOOR_SAMPLES. It is only worth that when continuing would
+ * produce a stutter train instead of one dip.
+ *
+ * This used to be three render blocks — 8 ms — which is a scheduling hiccup,
+ * not a broken stream. Measured on a real connection, 33 of 37 underruns
+ * escalated to a rebuffer, so almost every brief gap was answered with up to
+ * 200 ms of deliberate silence. That silence *is* the audible pause; the gap
+ * that triggered it would have been inaudible under the fade envelope.
+ *
+ * At 60 ms the short gaps ride through as their own fade-masked dip, which is
+ * strictly less silence than stopping to refill, and a genuinely broken stream
+ * still gets the full treatment.
  */
-const UNDERRUN_REBUFFER_THRESHOLD = 3;
+const UNDERRUN_REBUFFER_MS = 60;
+const RENDER_QUANTUM_SAMPLES = 128;
+export const UNDERRUN_REBUFFER_THRESHOLD = Math.ceil(
+  (UNDERRUN_REBUFFER_MS * 48) / RENDER_QUANTUM_SAMPLES,
+);
 
 /** Samples per 20 ms Opus frame at 48 kHz (per-channel). */
 export const SAMPLES_PER_20_MS = 960;
@@ -212,6 +260,8 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
     this.buffering = true;  // true while accumulating the jitter buffer
     this.bufferTarget = ${MIN_BUFFER_SAMPLES}; // adaptive: grows on underrun, shrinks on stability
     this.stableSamples = 0; // consumed samples of underrun-free playback (drives shrinking)
+    this.learnedFloor = ${MIN_BUFFER_SAMPLES}; // slow-decaying memory of the headroom this link needed
+    this.floorStableSamples = 0; // drives the floor's own, much slower decay
     this.underruns = 0;     // consecutive underruns, drives adaptive buffer growth
     this.fadeGain = 0;      // applied output gain (0..1), ramps to mask underrun clicks
     this.fadeInc = 1 / ${FADE_SAMPLES}; // per-sample ramp rate
@@ -228,6 +278,8 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
         this.underruns = 0;
         this.bufferTarget = ${MIN_BUFFER_SAMPLES};
         this.stableSamples = 0;
+        this.learnedFloor = ${MIN_BUFFER_SAMPLES};
+        this.floorStableSamples = 0;
         this.fadeGain = 0;
       } else if (e.data && e.data.type === "skip") {
         // Drop samples from the front to reduce drift without a full
@@ -418,6 +470,16 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
             buffered: this.depth(),
           });
         }
+        if (this.underruns === 1) {
+          // Remember what this link needed. The fast decay below may not go
+          // under this, so the next spike is met with the headroom the last
+          // one proved necessary.
+          this.learnedFloor = Math.min(
+            Math.max(this.learnedFloor, this.bufferTarget),
+            ${MAX_LEARNED_FLOOR_SAMPLES}
+          );
+          this.floorStableSamples = 0;
+        }
         if (this.underruns >= ${UNDERRUN_REBUFFER_THRESHOLD}) {
           this.buffering = true;
           this.port.postMessage({
@@ -437,19 +499,34 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
       // shrinking halts until the next underrun grows the target again.
       if (!this.buffering) {
         this.stableSamples += needed;
+        // The learned floor fades on its own, much slower clock, so a link
+        // that has genuinely settled does get its latency back — it just
+        // takes minutes of quiet rather than seconds.
+        this.floorStableSamples += needed;
+        if (
+          this.floorStableSamples >= ${FLOOR_DECAY_STABLE_SAMPLES} &&
+          this.learnedFloor > ${MIN_BUFFER_SAMPLES}
+        ) {
+          this.learnedFloor = Math.max(
+            this.learnedFloor - ${SAMPLES_PER_20_MS},
+            ${MIN_BUFFER_SAMPLES}
+          );
+          this.floorStableSamples = 0;
+        }
         if (
           this.stableSamples >= ${DECAY_STABLE_SAMPLES} &&
-          this.bufferTarget > ${MIN_BUFFER_SAMPLES}
+          this.bufferTarget > this.learnedFloor
         ) {
           this.bufferTarget = Math.max(
             this.bufferTarget - ${SAMPLES_PER_20_MS},
-            ${MIN_BUFFER_SAMPLES}
+            this.learnedFloor
           );
           this.stableSamples = 0;
           this.port.postMessage({
             type: "event",
             kind: "shrink",
             target: this.bufferTarget,
+            floor: this.learnedFloor,
           });
         }
       }
@@ -583,6 +660,15 @@ self.onmessage = (e) => {
       try { decoder.close(); } catch {}
       decoder = null;
     }
+  } else if (d.type === "transport-port") {
+    // A port from the transport worker, delivering encoded frames straight
+    // off the socket. Same messages as the main thread sends, so the same
+    // handler takes them — the point is only that the main thread is not
+    // involved in carrying them.
+    const incoming = e.ports && e.ports[0];
+    if (incoming) {
+      incoming.onmessage = (ev) => self.onmessage({ data: ev.data });
+    }
   } else if (d.type === "port") {
     port = d.port;
     port.onmessage = (ev) =>
@@ -663,6 +749,23 @@ export class AudioPlayer {
   private lastBufferedSamples = 0;
   /** Timestamp (ms) of the last `skip` posted to the worklet; gates SKIP_COOLDOWN_MS. */
   private lastSkipAt = 0;
+  /**
+   * What the jitter buffer has been through this session.
+   *
+   * The worklet already decides everything about buffering and says so in its
+   * events, but nothing kept the tally, so "the audio glitches occasionally"
+   * had no number attached and no way to tell an over-tight buffer from a
+   * genuinely bad link. `peakTargetSamples` is the interesting one: it is the
+   * headroom this connection actually turned out to need, which the decay
+   * gives back within half a minute of calm.
+   */
+  private stats = {
+    underruns: 0,
+    rebuffers: 0,
+    shrinks: 0,
+    skips: 0,
+    peakTargetSamples: MIN_BUFFER_SAMPLES,
+  };
 
   // -- Stall detection / auto-recovery ------------------------------------
 
@@ -697,6 +800,40 @@ export class AudioPlayer {
   /** Registered visibilitychange handler, for cleanup. */
   private visibilityHandler: (() => void) | null = null;
 
+  /**
+   * Jitter-buffer health, in milliseconds and counts.
+   *
+   * `peakMs` against `targetMs` is the diagnosis: a peak well above the
+   * current target means the link needed that headroom and the decay has
+   * since given it back, which is why rare glitches keep recurring instead
+   * of the buffer settling somewhere that survives them.
+   */
+  get bufferStats(): {
+    targetMs: number;
+    peakMs: number;
+    received: number;
+    decoded: number;
+    underruns: number;
+    rebuffers: number;
+    shrinks: number;
+    skips: number;
+  } {
+    return {
+      targetMs: Math.round(this.currentBufferTarget / 48),
+      peakMs: Math.round(this.stats.peakTargetSamples / 48),
+      // Received counts headers arriving on this thread; decoded counts what
+      // the worker actually produced. They track each other when frames reach
+      // the decoder, and diverge when they are lost on the way — which is the
+      // difference between "late" and "gone".
+      received: this.framesReceived,
+      decoded: this.framesDecoded,
+      underruns: this.stats.underruns,
+      rebuffers: this.stats.rebuffers,
+      shrinks: this.stats.shrinks,
+      skips: this.stats.skips,
+    };
+  }
+
   get muted(): boolean {
     return this._muted;
   }
@@ -708,6 +845,43 @@ export class AudioPlayer {
   /** Whether the browser supports WebCodecs AudioDecoder for Opus. */
   static get supported(): boolean {
     return typeof AudioDecoder !== "undefined";
+  }
+
+  /** Whether this browser can route playback to a chosen output device. */
+  static get outputSelectionSupported(): boolean {
+    return (
+      typeof AudioContext !== "undefined" &&
+      "setSinkId" in AudioContext.prototype
+    );
+  }
+
+  /**
+   * Route playback to a specific output device — `""` is the system default.
+   *
+   * Remembered rather than applied once: the context is torn down and rebuilt
+   * whenever the browser closes it (device removal, resource pressure), and
+   * the choice has to survive that.
+   */
+  setOutputDevice(deviceId: string): void {
+    this._outputDeviceId = deviceId;
+    void this.applyOutputDevice();
+  }
+
+  private _outputDeviceId = "";
+
+  private async applyOutputDevice(): Promise<void> {
+    const ctx = this.ctx as
+      | (AudioContext & {
+          setSinkId?: (id: string) => Promise<void>;
+        })
+      | null;
+    if (!ctx?.setSinkId) return;
+    try {
+      await ctx.setSinkId(this._outputDeviceId);
+    } catch {
+      // A device that has gone away leaves playback on the previous sink,
+      // which is better than silence; the panel still shows the selection.
+    }
   }
 
   onChange(fn: () => void): () => void {
@@ -802,6 +976,34 @@ export class AudioPlayer {
     this.emit();
   }
 
+  /**
+   * A port the transport worker can push encoded frames into.
+   *
+   * Returns null when there is no decode worker to reach — no `Worker`, or it
+   * failed to start — in which case the caller must keep feeding frames the
+   * ordinary way rather than sending them somewhere that cannot decode them.
+   *
+   * The decoder is what moves off the main thread here; the AudioContext
+   * cannot, so `handleAudioFrame` still runs for every frame, just without a
+   * payload to carry.
+   */
+  /**
+   * Called when the decode worker dies, for whoever is bypassing the main
+   * thread to reach it. Set by the owner of the transport, since only that
+   * side knows how to revoke the shortcut it asked for.
+   */
+  onDecodeWorkerLost?: () => void;
+
+  transportAudioPort(): MessagePort | null {
+    if (!this.worker && !this.workerBroken && typeof Worker !== "undefined") {
+      this.initWorker();
+    }
+    if (!this.worker || typeof MessageChannel === "undefined") return null;
+    const channel = new MessageChannel();
+    this.worker.postMessage({ type: "transport-port" }, [channel.port1]);
+    return channel.port2;
+  }
+
   /** Handle an incoming S2C_AUDIO_FRAME. */
   handleAudioFrame(timestamp: number, _flags: number, data: Uint8Array): void {
     if (this._destroyed) return;
@@ -850,6 +1052,12 @@ export class AudioPlayer {
     }
 
     this.framesReceived++;
+
+    // A header with no payload means the transport worker already delivered
+    // the encoded frame straight to the decoder. Everything above still had to
+    // run — it owns the AudioContext, which no worker can touch — but there is
+    // nothing left to decode here.
+    if (data.length === 0) return;
 
     if (this.worker) {
       // `data` is a view into the transport's message buffer — copy the
@@ -1243,10 +1451,17 @@ export class AudioPlayer {
     // handed to the worker at creation time (transfer neuters the port).
     this.initWorker();
     try {
+      // Declared before the context exists: iOS picks the Bluetooth profile
+      // when the context is created, and its default "auto" can leave a
+      // headset on the bidirectional HFP link long after any capture ended.
+      claimPlaybackAudioSession();
       this.ctx = new AudioContext({ sampleRate: 48000 });
       this.gain = this.ctx.createGain();
       this.gain.gain.value = this._muted ? 0 : 1;
       this.gain.connect(this.ctx.destination);
+      // A rebuilt context starts on the default sink, so the chosen output
+      // has to be re-applied here rather than only when it is picked.
+      void this.applyOutputDevice();
 
       // Detect AudioContext state transitions during playback.  The browser
       // can suspend or close the context at any time (audio device removal,
@@ -1374,7 +1589,19 @@ export class AudioPlayer {
     } else if (d.type === "event") {
       if (typeof d.target === "number") {
         this.currentBufferTarget = d.target;
+        this.stats.peakTargetSamples = Math.max(
+          this.stats.peakTargetSamples,
+          d.target,
+        );
       }
+      // `grow` is posted on the leading edge of an underrun and nowhere else,
+      // so it counts underrun *events* — a run of starved blocks is one, which
+      // is the unit worth counting. It arrives even when the target is already
+      // at the ceiling and cannot grow.
+      if (d.kind === "grow") this.stats.underruns += 1;
+      else if (d.kind === "rebuffer_start") this.stats.rebuffers += 1;
+      else if (d.kind === "shrink") this.stats.shrinks += 1;
+      else if (d.kind === "skip") this.stats.skips += 1;
       // The skip reply carries the post-skip depth — authoritative, and
       // it arrives before the next position report.  Adopt it so the
       // servo works from the real depth rather than our projection.
@@ -1425,6 +1652,11 @@ export class AudioPlayer {
         this.worker = null;
       }
       this.workerBroken = true;
+      // Anything routing frames straight to this worker is now feeding a
+      // corpse, and the main thread cannot make up the difference: on that
+      // route it receives headers with no payload, so there is nothing left
+      // to decode inline. Tell it to stop before rebuilding.
+      this.onDecodeWorkerLost?.();
       // If the worklet port was already transferred to the dead worker,
       // it's lost — rebuild the graph in inline mode.
       if (!this._destroyed) this.resetPipeline();

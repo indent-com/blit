@@ -5510,6 +5510,7 @@ mod tests {
                 surface_encoders: Vec::new(),
                 surface_encoding: super::super::SurfaceEncoding::default(),
                 chroma: super::super::ChromaSubsampling::default(),
+                media_codecs: super::super::MediaCodecPolicy::default(),
                 vaapi_device: String::new(),
                 #[cfg(unix)]
                 fd_channel: None,

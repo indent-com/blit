@@ -80,6 +80,17 @@ type DebugStats = {
   subscribed: number;
   pendingFrameQueues: number;
   totalPendingFrames: number;
+  audioBuffer?: {
+    targetMs: number;
+    peakMs: number;
+    underruns: number;
+    rebuffers: number;
+    shrinks: number;
+    skips: number;
+    received: number;
+    decoded: number;
+    fastPath: string;
+  };
   surfaces?: SurfaceDebugInfo[];
 } | null;
 
@@ -136,7 +147,6 @@ export function StatusBar(props: {
   onFont: () => void;
   audioMuted: boolean;
   audioAvailable: boolean;
-  hasSurfaces: boolean;
   onMedia: () => void;
   isMobileTouch?: boolean;
   keyboardOpen?: boolean;
@@ -178,14 +188,19 @@ export function StatusBar(props: {
         activate: () => props.toggleDebug(),
       },
     ];
-    if (props.audioAvailable || props.hasSurfaces)
-      list.push({
-        key: "media",
-        glyph: () => "♪",
-        label: () => t("statusbar.media"),
-        dim: () => !props.audioAvailable || props.audioMuted,
-        activate: () => props.onMedia(),
-      });
+    // Unconditional. Gating this on `audioAvailable || hasSurfaces` made the
+    // panel's own "Show app windows: Hidden" a trap door: hiding the windows
+    // empties the surface list, and on a workspace whose server offers no
+    // audio that removed the only entry point to the control that would undo
+    // it. The panel is never empty anyway — camera and microphone sharing
+    // live here too.
+    list.push({
+      key: "media",
+      glyph: () => "♪",
+      label: () => t("statusbar.media"),
+      dim: () => !props.audioAvailable || props.audioMuted,
+      activate: () => props.onMedia(),
+    });
     list.push(
       {
         key: "dock",
@@ -1417,11 +1432,26 @@ function DebugPanel(props: {
         label="Terminal renders"
         value={`${props.metrics.fps}/s (${props.metrics.ups} updates/s)`}
       />
-      <Row label="Bandwidth" value={formatBw(props.metrics.bw)} />
+      <Row
+        label="Bandwidth"
+        value={`↓ ${formatBw(props.metrics.bwIn)} · ↑ ${formatBw(props.metrics.bwOut)}`}
+      />
       <Row
         label="Render"
         value={`${props.metrics.renderMs.toFixed(1)} ms avg, ${props.metrics.maxRenderMs.toFixed(1)} ms max`}
       />
+      {/* Audio jitter buffer. `peak` above `now` is the whole diagnosis: the
+          link needed that headroom, and the decay has since handed it back —
+          which is why occasional glitches keep recurring rather than the
+          buffer settling somewhere that survives them. */}
+      <Show when={stats().audioBuffer}>
+        {(audio) => (
+          <Row
+            label="Audio buffer"
+            value={`${audio().targetMs} ms now, ${audio().peakMs} ms peak · ${audio().underruns} underruns, ${audio().rebuffers} rebuffers · ${audio().decoded}/${audio().received} decoded · via ${audio().fastPath}`}
+          />
+        )}
+      </Show>
       <Row label="Display Hz" value={stats().displayFps} />
       <Row label="Renderer" value={stats().rendererBackend} />
       <Row label="Backlog" value={stats().pendingApplied} />

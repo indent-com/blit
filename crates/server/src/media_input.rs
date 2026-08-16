@@ -11,6 +11,8 @@ use blit_remote::media::{
     RevokeReason,
 };
 use blit_remote::{STATUS_CONFLICT, STATUS_INVALID, STATUS_OK, STATUS_OTHER, STATUS_PERMISSION};
+
+use crate::media_policy::MediaCodecPolicy;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::path::Path;
@@ -22,8 +24,64 @@ use std::time::{Duration, Instant};
 const PCM_FRAME_BYTES: usize = 960 * 2;
 const INITIAL_PCM_CREDIT: u32 = (PCM_FRAME_BYTES * 10) as u32;
 const INITIAL_OPUS_CREDIT: u32 = 40_000;
-const INITIAL_CAMERA_CREDIT: u32 = 2 * 4 * 1024 * 1024;
+
+/// How much camera video the link may hold in flight, as time.
+///
+/// Credit comes back only once a frame has been *decoded*, so this window is
+/// exactly how far behind the picture is allowed to fall: the viewer keeps
+/// encoding until the window is full, and everything it sent is still in
+/// front of the frame it is about to send.  A quarter second is enough to
+/// ride out a decode hiccup without the delay becoming visible.
+const CAMERA_WINDOW: Duration = Duration::from_millis(250);
+
+/// The smallest window worth granting, whatever the cadence works out to.
+///
+/// A keyframe is an order of magnitude larger than an inter frame, and a
+/// window that cannot hold one deadlocks the stream outright: the viewer
+/// parks on `cameraRequiredCredit` waiting for room only a smaller frame
+/// could ever free, and no smaller frame is coming because the next one it
+/// owes is a keyframe.
+const CAMERA_CREDIT_FLOOR: u32 = 512 * 1024;
+
+/// The largest, for a lease whose declared cadence is implausible.
+const CAMERA_CREDIT_CEILING: u32 = 4 * 1024 * 1024;
+
+/// The in-flight byte window granted to a camera lease of this shape.
+///
+/// This used to be a flat 8 MiB, described as two maximum-size frames. Real
+/// frames are nothing like maximum size — a 720p30 H.264 frame is tens of
+/// KiB — so the window was really hundreds of frames deep, and on an uplink
+/// slower than the encoder the viewer happily filled all of it before credit
+/// ran out. Every one of those bytes sits in front of the picture the camera
+/// is showing now, so the stream ran tens of seconds behind and stayed there.
+///
+/// A window is a latency, not a quantity: the negotiated cadence says what a
+/// second of this video costs, so [`CAMERA_WINDOW`] converts straight into
+/// bytes. The floor is the part that cannot be argued down — the window has
+/// to hold one whole keyframe, or the viewer parks forever on credit that
+/// only a smaller frame could release, and the next frame it owes is a
+/// keyframe. That floor is why this alone cannot pin the delay to
+/// `CAMERA_WINDOW`; it bounds the damage, and the viewer's own transport
+/// backpressure does the fine work.
+fn camera_credit_window(codec: CameraCodec, width: u16, height: u16, fps: u8) -> u32 {
+    let pixels = f64::from(width) * f64::from(height);
+    let per_second = pixels * f64::from(fps) * codec.bits_per_pixel() / 8.0;
+    let rate_window = per_second * CAMERA_WINDOW.as_secs_f64();
+    let keyframe_room = pixels * codec.keyframe_bits_per_pixel() / 8.0;
+    let window = rate_window.max(keyframe_room);
+    // A non-finite or negative product means the lease described something
+    // nonsensical; the floor is a safe answer for it.
+    if !window.is_finite() || window <= 0.0 {
+        return CAMERA_CREDIT_FLOOR;
+    }
+    (window.min(f64::from(CAMERA_CREDIT_CEILING)) as u32)
+        .clamp(CAMERA_CREDIT_FLOOR, CAMERA_CREDIT_CEILING)
+}
 const LEASE_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Hard ceiling on inbound camera cadence, whatever the operator configures.
+/// The wire carries fps in a `u8`; past 120 a viewer is asking the decode
+/// workers for more frames per second than the compositor will composite.
+const CAMERA_FPS_CEILING: u8 = 120;
 const MAX_CAMERA_DECODE_WORKERS: usize = 2;
 
 static ACTIVE_CAMERA_DECODE_WORKERS: AtomicUsize = AtomicUsize::new(0);
@@ -144,6 +202,37 @@ impl CameraCodec {
 
     fn interframe(self) -> bool {
         self != Self::Mjpeg
+    }
+
+    /// Bits per pixel a steady frame of this codec is asked to cost.
+    ///
+    /// These mirror the viewer's own `cameraEncoderConfig`, which derives its
+    /// bitrate the same way — keep the two in step, because the whole point
+    /// of the number here is to predict what the viewer is about to send.
+    /// Motion JPEG configures no bitrate at all (every picture is a whole
+    /// intra frame), so it is given the cost of one.
+    fn bits_per_pixel(self) -> f64 {
+        match self {
+            Self::Mjpeg => 1.2,
+            Self::H264Cs420 => 0.11,
+            Self::H264Cs444 => 0.16,
+            Self::Av1Cs420 => 0.075,
+            Self::Av1Cs444 => 0.11,
+        }
+    }
+
+    /// Bits per pixel to leave room for in a single keyframe.
+    ///
+    /// An interframe codec spends an order of magnitude more on the pictures
+    /// it cannot predict, and the window has to hold one whole: see
+    /// [`camera_credit_window`] for what happens when it does not.
+    fn keyframe_bits_per_pixel(self) -> f64 {
+        match self {
+            // Every Motion JPEG frame already is one.
+            Self::Mjpeg => 1.2,
+            Self::H264Cs420 | Self::Av1Cs420 => 1.5,
+            Self::H264Cs444 | Self::Av1Cs444 => 2.5,
+        }
     }
 
     fn decoder_profile(
@@ -503,7 +592,12 @@ pub enum DataResult {
     Revoked { owner: u64, revoked: MediaRevoked },
 }
 
-pub fn camera_codec_mask() -> u8 {
+/// Camera formats this host can decode *and* is allowed to accept.
+///
+/// `allowed` is the operator's [`MediaCodecPolicy::camera`] mask. Motion JPEG
+/// is unconditional: the policy parser always keeps it, and a
+/// `ServerCapabilities` message without it is rejected by every client.
+pub fn camera_codec_mask(allowed: u8) -> u8 {
     let mut codecs = CameraCodec::Mjpeg.capability();
     for codec in [
         CameraCodec::H264Cs420,
@@ -511,7 +605,8 @@ pub fn camera_codec_mask() -> u8 {
         CameraCodec::H264Cs444,
         CameraCodec::Av1Cs444,
     ] {
-        if let Some((family, chroma)) = codec.decoder_profile()
+        if allowed & codec.capability() != 0
+            && let Some((family, chroma)) = codec.decoder_profile()
             && crate::video_decode::available(family, chroma)
         {
             codecs |= codec.capability();
@@ -541,6 +636,7 @@ impl MediaInput {
         owner: u64,
         capabilities: MediaCapabilities,
         request: MediaStart,
+        policy: MediaCodecPolicy,
         runtime_enabled: bool,
         runtime_dir: Option<&Path>,
     ) -> MediaLease {
@@ -573,8 +669,11 @@ impl MediaInput {
                 if capabilities.flags & CAPTURE_MICROPHONE == 0 {
                     return rejected(STATUS_PERMISSION);
                 }
-                if (request.codec == 0 && capabilities.audio_codecs & AUDIO_CODEC_PCM == 0)
-                    || (request.codec == 1 && capabilities.audio_codecs & AUDIO_CODEC_OPUS == 0)
+                // The client's mask says what it can produce; the policy says
+                // what this server accepts.  Both have to hold.
+                let offered = capabilities.audio_codecs & policy.microphone;
+                if (request.codec == 0 && offered & AUDIO_CODEC_PCM == 0)
+                    || (request.codec == 1 && offered & AUDIO_CODEC_OPUS == 0)
                     || request.codec > 1
                 {
                     return rejected(STATUS_INVALID);
@@ -632,7 +731,7 @@ impl MediaInput {
                     return rejected(STATUS_INVALID);
                 };
                 if capabilities.video_codecs & codec.capability() == 0
-                    || camera_codec_mask() & codec.capability() == 0
+                    || camera_codec_mask(policy.camera) & codec.capability() == 0
                 {
                     return rejected(STATUS_INVALID);
                 }
@@ -641,8 +740,19 @@ impl MediaInput {
                 }
                 let max_width = env_bound("BLIT_MEDIA_CAMERA_MAX_WIDTH", 1920).min(1920);
                 let max_height = env_bound("BLIT_MEDIA_CAMERA_MAX_HEIGHT", 1080).min(1080);
-                let codec_max_fps = if codec == CameraCodec::Mjpeg { 15 } else { 30 };
-                let max_fps = env_bound("BLIT_MEDIA_CAMERA_MAX_FPS", 30).min(codec_max_fps);
+                // Defaults, not laws — an operator raises either with
+                // BLIT_MEDIA_CAMERA_MAX_FPS, up to CAMERA_FPS_CEILING.
+                //
+                // The compressed default has to cover every cadence the panel
+                // offers. A ceiling below that is worse than no choice at all:
+                // the viewer picks 60, the request is refused as invalid, and
+                // the refusal names a number nothing in the UI mentioned.
+                // Motion JPEG stays lower because it sends a whole intra frame
+                // each time, but not so low that the panel's own options are
+                // unreachable.
+                let codec_default_fps = if codec == CameraCodec::Mjpeg { 30 } else { 60 };
+                let max_fps = env_bound("BLIT_MEDIA_CAMERA_MAX_FPS", codec_default_fps)
+                    .min(u16::from(CAMERA_FPS_CEILING));
                 let requires_even_extent =
                     matches!(codec, CameraCodec::H264Cs420 | CameraCodec::Av1Cs420);
                 if request.width == 0
@@ -678,10 +788,12 @@ impl MediaInput {
                     Ok(worker) => worker,
                     Err(_) => return rejected(STATUS_OTHER),
                 };
+                let credit_window =
+                    camera_credit_window(codec, request.width, request.height, request.fps);
                 self.camera = Some(CameraLease {
                     lease_id,
                     owner,
-                    credit: INITIAL_CAMERA_CREDIT,
+                    credit: credit_window,
                     credit_pending: 0,
                     last_data: Instant::now(),
                     last_complete: None,
@@ -700,7 +812,7 @@ impl MediaInput {
                     width: request.width,
                     height: request.height,
                     fps: request.fps,
-                    initial_credit: INITIAL_CAMERA_CREDIT,
+                    initial_credit: credit_window,
                 }
             }
         }
@@ -1228,14 +1340,16 @@ fn sequence_newer(value: u32, previous: u32) -> bool {
 mod tests {
     use super::{
         CameraCodec, CameraDecodeJob, CameraDecodeQueue, CameraEnqueueResult, CameraWorkerPermit,
-        MediaInput, Reassembly, empty_non_eos_fragment, enqueue_camera_job, push_camera_job,
-        sequence_newer,
+        MediaCodecPolicy, MediaInput, Reassembly, camera_codec_mask, empty_non_eos_fragment,
+        enqueue_camera_job, push_camera_job, sequence_newer,
     };
-    use blit_remote::STATUS_PERMISSION;
     use blit_remote::media::{
-        AUDIO_CODEC_PCM, CAMERA_FRAME_MAX, CAPTURE_MICROPHONE, MEDIA_DATA_END_OF_STREAM,
-        MediaCapabilities, MediaData, MediaKind, MediaStart,
+        AUDIO_CODEC_OPUS, AUDIO_CODEC_PCM, CAMERA_CODEC_AV1, CAMERA_FRAME_MAX, CAPTURE_CAMERA,
+        CAPTURE_MICROPHONE, MEDIA_DATA_END_OF_STREAM, MediaCapabilities, MediaData, MediaKind,
+        MediaStart, VIDEO_CODEC_MJPEG, VIDEO_CODECS_ALL,
     };
+    use blit_remote::{STATUS_INVALID, STATUS_PERMISSION};
+    use std::path::Path;
 
     #[test]
     fn modular_sequence_order_wraps() {
@@ -1302,11 +1416,96 @@ mod tests {
                 height: 0,
                 fps: 0,
             },
+            MediaCodecPolicy::default(),
             false,
             None,
         );
         assert_eq!(lease.status, STATUS_PERMISSION);
         assert_eq!(lease.lease_id, 0);
+    }
+
+    /// The operator's codec policy is checked before anything opens a device,
+    /// so a disallowed format is refused even though the client advertised it
+    /// and this host could decode it.
+    ///
+    /// Only the refusals are asserted. An accepted codec goes on to build a
+    /// PipeWire source, and that mutates this process's `XDG_RUNTIME_DIR` —
+    /// not something a unit test should do to its own environment.
+    #[test]
+    fn policy_rejects_codecs_the_operator_disabled() {
+        let mut input = MediaInput::default();
+        // Present, so the gate above the codec check passes; empty, so
+        // nothing behind it could succeed either.
+        let runtime_dir = Some(Path::new("/nonexistent/blit-media-policy-test"));
+
+        let opus = input.start(
+            7,
+            MediaCapabilities {
+                flags: CAPTURE_MICROPHONE,
+                audio_codecs: AUDIO_CODEC_PCM | AUDIO_CODEC_OPUS,
+                ..MediaCapabilities::default()
+            },
+            MediaStart {
+                nonce: 11,
+                kind: MediaKind::Microphone,
+                codec: 1,
+                width: 0,
+                height: 0,
+                fps: 0,
+            },
+            MediaCodecPolicy {
+                microphone: AUDIO_CODEC_PCM,
+                ..MediaCodecPolicy::default()
+            },
+            true,
+            runtime_dir,
+        );
+        assert_eq!(opus.status, STATUS_INVALID);
+        assert_eq!(opus.lease_id, 0);
+
+        let av1 = input.start(
+            7,
+            MediaCapabilities {
+                flags: CAPTURE_CAMERA,
+                video_codecs: VIDEO_CODECS_ALL,
+                max_width: 1280,
+                max_height: 720,
+                max_fps: 30,
+                ..MediaCapabilities::default()
+            },
+            MediaStart {
+                nonce: 12,
+                kind: MediaKind::Camera,
+                codec: CAMERA_CODEC_AV1,
+                width: 1280,
+                height: 720,
+                fps: 30,
+            },
+            MediaCodecPolicy {
+                camera: VIDEO_CODEC_MJPEG,
+                ..MediaCodecPolicy::default()
+            },
+            true,
+            runtime_dir,
+        );
+        assert_eq!(av1.status, STATUS_INVALID);
+        assert_eq!(av1.lease_id, 0);
+    }
+
+    #[test]
+    fn camera_codec_mask_intersects_policy_and_keeps_mjpeg() {
+        let mjpeg = CameraCodec::Mjpeg.capability();
+        // An empty policy still advertises Motion JPEG: clients reject a
+        // capability message without it.
+        assert_eq!(camera_codec_mask(0), mjpeg);
+        // Nothing outside the policy can appear, whatever the host decodes.
+        let h264_only = mjpeg | CameraCodec::H264Cs420.capability();
+        assert_eq!(camera_codec_mask(h264_only) & !h264_only, 0);
+        assert_eq!(camera_codec_mask(h264_only) & mjpeg, mjpeg);
+        // Narrowing the policy can only remove formats, never add them —
+        // the decoder probe still has the final say on everything but MJPEG.
+        let all = camera_codec_mask(u8::MAX);
+        assert_eq!(camera_codec_mask(h264_only) & !all, 0);
     }
 
     #[test]
@@ -1422,5 +1621,75 @@ mod tests {
         drop(first);
         let replacement = CameraWorkerPermit::acquire().expect("released worker permit");
         drop((second, replacement));
+    }
+}
+
+#[cfg(test)]
+mod credit_window_tests {
+    use super::{
+        CAMERA_CREDIT_CEILING, CAMERA_CREDIT_FLOOR, CAMERA_WINDOW, CameraCodec,
+        camera_credit_window,
+    };
+
+    /// The window has to hold a whole keyframe. A viewer that cannot fit one
+    /// sets `cameraRequiredCredit` to a frame length larger than any credit
+    /// it can ever hold — credit is conserved, so it never grows past the
+    /// window — and waits for room that only a smaller frame could free,
+    /// while the frame it owes is a keyframe. The stream stops for good.
+    #[test]
+    fn every_window_holds_a_keyframe() {
+        for codec in [
+            CameraCodec::Mjpeg,
+            CameraCodec::H264Cs420,
+            CameraCodec::Av1Cs420,
+            CameraCodec::H264Cs444,
+            CameraCodec::Av1Cs444,
+        ] {
+            for (w, h, fps) in [(320, 240, 15), (1280, 720, 30), (1920, 1080, 60)] {
+                let window = camera_credit_window(codec, w, h, fps);
+                let keyframe =
+                    (f64::from(w) * f64::from(h) * codec.keyframe_bits_per_pixel() / 8.0) as u32;
+                assert!(
+                    window >= keyframe.min(CAMERA_CREDIT_CEILING),
+                    "{codec:?} {w}x{h}@{fps}: window {window} cannot hold a {keyframe}-byte keyframe",
+                );
+            }
+        }
+    }
+
+    /// The whole point: a window is a delay. Where the cadence is rich enough
+    /// that the rate term wins, the window must be worth about
+    /// `CAMERA_WINDOW` of video and not more.
+    #[test]
+    fn a_rate_bound_window_is_worth_its_latency_target() {
+        let (w, h, fps) = (1920u16, 1080u16, 60u8);
+        let codec = CameraCodec::Mjpeg;
+        let window = camera_credit_window(codec, w, h, fps);
+        let per_second =
+            f64::from(w) * f64::from(h) * f64::from(fps) * codec.bits_per_pixel() / 8.0;
+        let seconds = f64::from(window) / per_second;
+        assert!(
+            seconds <= CAMERA_WINDOW.as_secs_f64() * 1.05,
+            "window is worth {seconds:.3}s of video, target {:.3}s",
+            CAMERA_WINDOW.as_secs_f64(),
+        );
+    }
+
+    /// The old flat window was 8 MiB. Nothing may reach that again: it is
+    /// tens of seconds of video on the links this exists to protect.
+    #[test]
+    fn no_window_approaches_the_old_flat_grant() {
+        for codec in [CameraCodec::Mjpeg, CameraCodec::H264Cs420] {
+            let window = camera_credit_window(codec, 1920, 1080, 120);
+            assert!(window <= CAMERA_CREDIT_CEILING, "{codec:?}: {window}");
+        }
+    }
+
+    #[test]
+    fn a_nonsensical_lease_still_gets_a_usable_window() {
+        assert_eq!(
+            camera_credit_window(CameraCodec::H264Cs420, 0, 0, 0),
+            CAMERA_CREDIT_FLOOR,
+        );
     }
 }

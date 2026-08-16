@@ -10,6 +10,7 @@
  */
 
 import {
+  createEffect,
   createMemo,
   createSignal,
   onCleanup,
@@ -65,6 +66,13 @@ export function LogPanel(props: {
   onOpenTile: (assignment: string) => void;
 }) {
   const commits = () => props.session?.commits() ?? [];
+
+  // Hold the commit-log watch's lease while this panel is mounted: the dock
+  // unmounts a collapsed section, and a log watch re-walks on every ref move.
+  createEffect(() => {
+    const release = props.session?.ensureLog();
+    if (release) onCleanup(release);
+  });
   const emptyText = (): string => {
     const s = props.session;
     if (!s) return "No root selected.";

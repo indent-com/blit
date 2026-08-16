@@ -261,7 +261,7 @@ export class MockTransport implements BlitTransport {
       clients.reduce(
         (sum, client) =>
           sum +
-          30 +
+          38 +
           client.terminals.length * 6 +
           client.surfaces.length * 8 +
           client.subscriptions.length * 3,
@@ -282,10 +282,15 @@ export class MockTransport implements BlitTransport {
         BigInt(client.outboundBytesPerSecond),
         true,
       );
-      view.setUint16(offset + 24, client.terminals.length, true);
-      view.setUint16(offset + 26, client.surfaces.length, true);
-      view.setUint16(offset + 28, client.subscriptions.length, true);
-      offset += 30;
+      view.setBigUint64(
+        offset + 24,
+        BigInt(client.inboundBytesPerSecond),
+        true,
+      );
+      view.setUint16(offset + 32, client.terminals.length, true);
+      view.setUint16(offset + 34, client.surfaces.length, true);
+      view.setUint16(offset + 36, client.subscriptions.length, true);
+      offset += 38;
       for (const terminal of client.terminals) {
         view.setUint16(offset, terminal.ptyId, true);
         view.setUint16(offset + 2, terminal.rows ?? 0, true);

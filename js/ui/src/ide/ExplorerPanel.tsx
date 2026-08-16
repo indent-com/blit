@@ -147,6 +147,14 @@ export function ExplorerPanel(props: {
 }) {
   const rows = () => props.session?.tree() ?? null;
 
+  // Hold the tree's lease while this panel is mounted: the dock unmounts a
+  // collapsed section, and a folded Explorer should not keep a directory watch
+  // open on the server for every expanded row.
+  createEffect(() => {
+    const release = props.session?.ensureTree();
+    if (release) onCleanup(release);
+  });
+
   // ── File operations (docs/design/fs-write.md `FS_OP` via the session):
   //    right-click menu → inline create/rename rows in the tree, two-step
   //    delete, and drag-onto-a-directory move. The watcher streams every

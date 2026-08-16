@@ -181,16 +181,24 @@ export default bin.buffer;
     !isDev && {
       name: "brotli-html",
       closeBundle() {
-        const htmlPath = resolve(__dirname, "dist/index.html");
-        if (existsSync(htmlPath)) {
-          const html = readFileSync(htmlPath);
-          const compressed = brotliCompressSync(html, {
+        // The workers alongside index.html: each is served separately by the
+        // gateway, which only ever sends brotli, so each needs its own `.br`.
+        const assets = [
+          "dist/index.html",
+          "dist/mux-worker.js",
+          "dist/buffer-recycler-worker.js",
+        ];
+        for (const asset of assets) {
+          const path = resolve(__dirname, asset);
+          if (!existsSync(path)) continue;
+          const contents = readFileSync(path);
+          const compressed = brotliCompressSync(contents, {
             params: {
               [zlibConstants.BROTLI_PARAM_QUALITY]:
                 zlibConstants.BROTLI_MAX_QUALITY,
             },
           });
-          writeFileSync(htmlPath + ".br", compressed);
+          writeFileSync(path + ".br", compressed);
         }
       },
     },
@@ -225,5 +233,19 @@ export default bin.buffer;
   build: {
     outDir: resolve(__dirname, "dist"),
     target: "es2020",
+  },
+  // Workers cannot be inlined into the single-file build, so they ship as
+  // their own assets and the gateway has to serve each one by name. A
+  // content-hashed name cannot be named by `include_bytes!`, and a worker the
+  // gateway does not serve is a worker that 404s in production while working
+  // perfectly in dev — so the names are pinned.
+  worker: {
+    format: "es",
+    rollupOptions: {
+      output: {
+        entryFileNames: "[name].js",
+        chunkFileNames: "[name].js",
+      },
+    },
   },
 });

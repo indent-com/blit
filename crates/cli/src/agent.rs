@@ -303,7 +303,7 @@ pub async fn cmd_clients(transport: Transport) -> Result<(), String> {
         }) = reply
             && nonce == NONCE
         {
-            println!("ID\tAGE_S\tOUT_BYTES_S\tSUBSCRIPTIONS\tTERMINALS\tSURFACES");
+            println!("ID\tAGE_S\tOUT_BYTES_S\tIN_BYTES_S\tSUBSCRIPTIONS\tTERMINALS\tSURFACES");
             for client in clients
                 .into_iter()
                 .filter(|client| client.client_id != self_id)
@@ -352,8 +352,11 @@ pub async fn cmd_clients(transport: Transport) -> Result<(), String> {
                     .collect::<Vec<_>>()
                     .join(",");
                 println!(
-                    "{}\t{}\t{}\t{subscriptions}\t{terminals}\t{surfaces}",
-                    client.client_id, client.age_secs, client.outbound_bytes_per_sec
+                    "{}\t{}\t{}\t{}\t{subscriptions}\t{terminals}\t{surfaces}",
+                    client.client_id,
+                    client.age_secs,
+                    client.outbound_bytes_per_sec,
+                    client.inbound_bytes_per_sec
                 );
             }
             return Ok(());
@@ -2152,6 +2155,7 @@ mod tests {
                             client_id: 2,
                             age_secs: 45,
                             outbound_bytes_per_sec: 1_000_000,
+                            inbound_bytes_per_sec: 2_048,
                             terminals: vec![blit_remote::ClientTerminalSubscription {
                                 pty_id: 4,
                                 rows: 24,
@@ -2167,6 +2171,7 @@ mod tests {
                             client_id: 7,
                             age_secs: 0,
                             outbound_bytes_per_sec: 0,
+                            inbound_bytes_per_sec: 0,
                             terminals: vec![],
                             surfaces: vec![],
                             subscriptions: vec![],

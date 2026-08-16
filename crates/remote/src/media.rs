@@ -32,6 +32,11 @@ pub const MPRIS_STRING_MAX: usize = 4 * 1024;
 pub const MPRIS_ARTWORK_MAX: usize = 512 * 1024;
 pub const MPRIS_UPDATE_MAX_DECOMPRESSED: usize = 16 * 1024 * 1024;
 
+/// Discriminator for the artwork carried by one upsert. See [`MprisArtwork`].
+pub const ARTWORK_KIND_NONE: u8 = 0;
+pub const ARTWORK_KIND_URL: u8 = 1;
+pub const ARTWORK_KIND_PNG: u8 = 2;
+
 pub const CAPTURE_MICROPHONE: u8 = 1 << 0;
 pub const CAPTURE_CAMERA: u8 = 1 << 1;
 pub const CAPTURE_PORTAL_UI: u8 = 1 << 2;
@@ -648,11 +653,62 @@ pub struct MprisPlayer {
     pub title: String,
     pub album: String,
     pub artists: Vec<String>,
-    pub artwork_width: u16,
-    pub artwork_height: u16,
-    pub artwork_png: Vec<u8>,
+    pub artwork: MprisArtwork,
 }
 
+/// How a player's cover reaches the viewer.
+///
+/// Catalogue-backed players name their cover with an `https:` URL and hold no
+/// local copy, so that URL is forwarded for the viewer to load and cache
+/// itself: re-encoding it server-side would put a ~150 KiB PNG in every upsert
+/// and buy nothing. Art that exists only on the server's disk cannot be named
+/// to a browser at all, so it still travels as normalized bytes.
+/// No dimensions travel with either kind. A forwarded URL has none to send, so
+/// a client can never depend on their presence; carrying them for the local case
+/// alone would add a field nothing could rely on. Both kinds resolve to an image
+/// whose intrinsic size the browser already knows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum MprisArtwork {
+    #[default]
+    None,
+    /// An `http:`/`https:` URL, validated on the way out and again on the way
+    /// in — it reaches the DOM as an image source.
+    Url(String),
+    /// A cover the viewer has no way to fetch, normalized to PNG by the server.
+    Png(Vec<u8>),
+}
+
+impl MprisArtwork {
+    /// Bytes this cover contributes to the retained artwork budget. A URL costs
+    /// the budget nothing, which is most of the point.
+    pub fn png_len(&self) -> usize {
+        match self {
+            Self::Png(png) => png.len(),
+            Self::None | Self::Url(_) => 0,
+        }
+    }
+
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+/// The only schemes a viewer may be asked to load. Checked at both protocol
+/// edges rather than trusted from the peer, because the value lands in an
+/// `<img>` source.
+pub fn artwork_url_allowed(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    !rest.is_empty()
+        && url.len() <= MPRIS_STRING_MAX
+        && (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
+}
+
+/// Boxing `Upsert` would trade an allocation on the common path for padding on
+/// the rare one: upserts vastly outnumber deletes, and a batch is capped at
+/// `MPRIS_PLAYER_MAX`, so the wasted space is a few KiB at worst and transient.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MprisRecord {
     Delete { player_id: u32 },
@@ -1126,16 +1182,21 @@ fn msg_mpris_update(flags: u8, records: &[MprisRecord]) -> Vec<u8> {
                 for artist in &player.artists[..artists] {
                     push_bounded_str16(&mut raw, artist, MPRIS_STRING_MAX);
                 }
-                let artwork =
-                    &player.artwork_png[..player.artwork_png.len().min(MPRIS_ARTWORK_MAX)];
-                let (width, height) = if artwork.is_empty() {
-                    (0, 0)
-                } else {
-                    (player.artwork_width, player.artwork_height)
-                };
-                raw.extend_from_slice(&width.to_le_bytes());
-                raw.extend_from_slice(&height.to_le_bytes());
-                push_bytes32(&mut raw, artwork);
+                match &player.artwork {
+                    // A URL that would not be safe to hand a viewer is dropped
+                    // rather than forwarded; the player keeps its text.
+                    MprisArtwork::Url(url) if artwork_url_allowed(url) => {
+                        raw.push(ARTWORK_KIND_URL);
+                        push_bounded_str16(&mut raw, url, MPRIS_STRING_MAX);
+                    }
+                    // Truncating a PNG would hand the viewer a corrupt image, so
+                    // an over-cap cover is omitted instead.
+                    MprisArtwork::Png(png) if !png.is_empty() && png.len() <= MPRIS_ARTWORK_MAX => {
+                        raw.push(ARTWORK_KIND_PNG);
+                        push_bytes32(&mut raw, png);
+                    }
+                    _ => raw.push(ARTWORK_KIND_NONE),
+                }
             }
         }
     }
@@ -1205,12 +1266,24 @@ fn parse_mpris_update(msg: &[u8]) -> Result<(u8, Vec<MprisRecord>), &'static str
                 for _ in 0..artist_count {
                     artists.push(take_str16(&mut input, MPRIS_STRING_MAX)?);
                 }
-                let artwork_width = take_u16(&mut input)?;
-                let artwork_height = take_u16(&mut input)?;
-                let artwork_png = take_bytes32(&mut input, MPRIS_ARTWORK_MAX)?;
-                if !artwork_fields_consistent(&artwork_png, artwork_width, artwork_height) {
-                    return Err("inconsistent artwork");
-                }
+                let artwork = match take_u8(&mut input)? {
+                    ARTWORK_KIND_NONE => MprisArtwork::None,
+                    ARTWORK_KIND_URL => {
+                        let url = take_str16(&mut input, MPRIS_STRING_MAX)?;
+                        if !artwork_url_allowed(&url) {
+                            return Err("artwork URL scheme");
+                        }
+                        MprisArtwork::Url(url)
+                    }
+                    ARTWORK_KIND_PNG => {
+                        let png = take_bytes32(&mut input, MPRIS_ARTWORK_MAX)?;
+                        if png.is_empty() {
+                            return Err("empty artwork");
+                        }
+                        MprisArtwork::Png(png)
+                    }
+                    _ => return Err("unknown artwork kind"),
+                };
                 records.push(MprisRecord::Upsert(MprisPlayer {
                     player_id,
                     revision,
@@ -1231,9 +1304,7 @@ fn parse_mpris_update(msg: &[u8]) -> Result<(u8, Vec<MprisRecord>), &'static str
                     title,
                     album,
                     artists,
-                    artwork_width,
-                    artwork_height,
-                    artwork_png,
+                    artwork,
                 }));
             }
             _ => return Err("unknown MPRIS record operation"),
@@ -1243,14 +1314,6 @@ fn parse_mpris_update(msg: &[u8]) -> Result<(u8, Vec<MprisRecord>), &'static str
         return Err("trailing MPRIS bytes");
     }
     Ok((flags, records))
-}
-
-fn artwork_fields_consistent(png: &[u8], width: u16, height: u16) -> bool {
-    if png.is_empty() {
-        width == 0 && height == 0
-    } else {
-        width != 0 && height != 0
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1527,9 +1590,7 @@ mod tests {
             title: "Track".into(),
             album: "Album".into(),
             artists: vec!["Artist".into()],
-            artwork_width: 2,
-            artwork_height: 3,
-            artwork_png: vec![1, 2, 3],
+            artwork: MprisArtwork::Png(vec![1, 2, 3]),
         }
     }
 
@@ -1885,20 +1946,122 @@ mod tests {
         assert!(parse_server_control(&msg).is_err());
     }
 
+    fn mpris_update(records: Vec<MprisRecord>) -> Vec<u8> {
+        msg_server_control(&ServerControl::MprisUpdate { flags: 0, records })
+    }
+
+    /// Rebuilds a frame from a mutated payload. Needed because the encoder
+    /// sanitizes artwork, so a malformed record cannot be produced by encoding
+    /// one — only by tampering with the bytes on the way in.
+    fn reframe(raw: &[u8]) -> Vec<u8> {
+        let mut out = vec![S2C_MEDIA_CONTROL, 6, 0];
+        out.extend_from_slice(&compress_prepend_size(raw));
+        out
+    }
+
+    fn payload_of(msg: &[u8]) -> Vec<u8> {
+        decompress_size_prepended(&msg[3..]).expect("decompress payload")
+    }
+
     #[test]
-    fn mpris_artwork_requires_two_nonzero_dimensions() {
-        assert!(artwork_fields_consistent(&[], 0, 0));
-        assert!(!artwork_fields_consistent(&[], 0, 3));
-        assert!(!artwork_fields_consistent(&[], 2, 0));
-        for (artwork_width, artwork_height) in [(0, 0), (0, 3), (2, 0)] {
-            let mut malformed = player(7);
-            malformed.artwork_width = artwork_width;
-            malformed.artwork_height = artwork_height;
-            let msg = msg_server_control(&ServerControl::MprisUpdate {
-                flags: 0,
-                records: vec![MprisRecord::Upsert(malformed)],
-            });
-            assert_eq!(parse_server_control(&msg), Err("inconsistent artwork"));
+    fn a_remote_cover_travels_as_a_url_and_survives_the_round_trip() {
+        let mut player = player(7);
+        let url = "https://i.scdn.co/image/ab67616d0000b2738ac778cc7d88779f74d33311";
+        player.artwork = MprisArtwork::Url(url.into());
+        let msg = mpris_update(vec![MprisRecord::Upsert(player)]);
+
+        // The whole point: a cover costs a URL, not ~150 KiB of PNG.
+        assert!(msg.len() < 512, "url upsert grew to {} bytes", msg.len());
+
+        let Ok(Some(ServerControl::MprisUpdate { records, .. })) = parse_server_control(&msg)
+        else {
+            panic!("expected an MPRIS update")
+        };
+        let [MprisRecord::Upsert(decoded)] = records.as_slice() else {
+            panic!("expected one upsert")
+        };
+        assert_eq!(decoded.artwork, MprisArtwork::Url(url.into()));
+        assert_eq!(decoded.artwork.png_len(), 0);
+    }
+
+    #[test]
+    fn artwork_the_viewer_could_not_safely_load_is_dropped_by_the_encoder() {
+        for hostile in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:image/png;base64,AAAA",
+            "ftp://example.test/cover.png",
+            "https://",
+            "",
+        ] {
+            let mut player = player(7);
+            player.artwork = MprisArtwork::Url(hostile.into());
+            let msg = mpris_update(vec![MprisRecord::Upsert(player)]);
+            let Ok(Some(ServerControl::MprisUpdate { records, .. })) = parse_server_control(&msg)
+            else {
+                panic!("expected an MPRIS update")
+            };
+            let [MprisRecord::Upsert(decoded)] = records.as_slice() else {
+                panic!("expected one upsert")
+            };
+            assert!(
+                decoded.artwork.is_none(),
+                "{hostile} must not reach a viewer"
+            );
         }
+    }
+
+    /// An over-cap cover is omitted rather than truncated: a clipped PNG would
+    /// reach the viewer as a broken image instead of no image.
+    #[test]
+    fn an_oversized_cover_is_omitted_rather_than_truncated() {
+        let mut player = player(7);
+        player.artwork = MprisArtwork::Png(vec![7; MPRIS_ARTWORK_MAX + 1]);
+        let msg = mpris_update(vec![MprisRecord::Upsert(player)]);
+
+        let Ok(Some(ServerControl::MprisUpdate { records, .. })) = parse_server_control(&msg)
+        else {
+            panic!("expected an MPRIS update")
+        };
+        let [MprisRecord::Upsert(decoded)] = records.as_slice() else {
+            panic!("expected one upsert")
+        };
+        assert!(decoded.artwork.is_none());
+    }
+
+    #[test]
+    fn a_tampered_artwork_kind_is_rejected_on_the_way_in() {
+        let mut player = player(7);
+        player.artwork = MprisArtwork::None;
+        let raw = payload_of(&mpris_update(vec![MprisRecord::Upsert(player)]));
+        assert_eq!(
+            raw.last(),
+            Some(&ARTWORK_KIND_NONE),
+            "artwork kind must be the final byte for this test to tamper with it"
+        );
+
+        let mut unknown = raw.clone();
+        *unknown.last_mut().unwrap() = 9;
+        assert_eq!(
+            parse_server_control(&reframe(&unknown)),
+            Err("unknown artwork kind")
+        );
+
+        let mut hostile = raw.clone();
+        hostile.pop();
+        hostile.push(ARTWORK_KIND_URL);
+        let url = b"file:///etc/shadow";
+        hostile.extend_from_slice(&(url.len() as u16).to_le_bytes());
+        hostile.extend_from_slice(url);
+        assert_eq!(
+            parse_server_control(&reframe(&hostile)),
+            Err("artwork URL scheme")
+        );
+
+        let mut empty = raw.clone();
+        empty.pop();
+        empty.push(ARTWORK_KIND_PNG);
+        empty.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(parse_server_control(&reframe(&empty)), Err("empty artwork"));
     }
 }

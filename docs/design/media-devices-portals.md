@@ -510,22 +510,58 @@ other streams in the portal session remain live.
 
 ### Explicit enablement
 
-The full UI adds microphone and camera controls to desktop chrome. The first
-click calls `getUserMedia()` with the requested kind. It sends `MEDIA_START`
-only after a live track exists and codec initialization succeeds. Permission
-denial, no device, an ended track, or encoder failure leaves no server lease.
+The full UI puts the microphone and camera controls in the media panel, beside
+the streaming quality settings they belong with. Sharing is a plain toggle:
+the click calls `getUserMedia()` and, once a live track exists and codec
+initialization succeeds, sends `MEDIA_START`. There is no confirmation step —
+the browser has already asked for the device, and the panel names the desktop
+it would go to. Permission denial, no device, an ended track, or encoder
+failure leaves no server lease.
 
-No call to `enumerateDevices()` or `getUserMedia()` is made just because the
-server advertises the feature. Client capabilities mean “this client can try
-the capture path,” not “the user has a device” or “permission was granted.”
+`getUserMedia()` is still never called just because the server advertises the
+feature. Client capabilities mean “this client can try the capture path,” not
+“the user has a device” or “permission was granted.” `enumerateDevices()` _is_
+called, to populate the device pickers; before any permission has been granted
+it returns ids without labels, so the pickers are re-read after each successful
+share, which is when the names appear.
 
-The UI shows a local preview for camera, input level for microphone, the remote
-connection name, and a Stop button before committing the lease. While active,
-non-dismissible privacy chips remain visible in desktop chrome. Every viewer,
-including read-only viewers, receives the aggregate active state so another
-viewer cannot lend a device invisibly. The controls say “share with this Blit
-desktop,” not “share with this application”: unsandboxed processes on the
-private PipeWire graph share one trust domain.
+The panel owns every choice: which microphone, camera and speakers to use,
+which connection to share with, and the codecs for each direction. All of them
+are device-local preferences, and all take effect immediately — changing one
+while a device is live tears the lease down and rebuilds it rather than waiting
+for the next share. The camera shows a mirrored local preview while shared.
+
+The status bar carries an unchanging media glyph. It does not signal capture:
+an icon that mutates as devices come and go reads as noise in a bar whose other
+glyphs are stable, and the space is the focused window's. Aggregate active
+state still reaches every viewer, including read-only ones, so another viewer
+cannot lend a device invisibly — it is shown in the panel. The controls say
+“share with this Blit desktop,” not “share with this application”: unsandboxed
+processes on the private PipeWire graph share one trust domain.
+
+### Codec selection
+
+Both directions are configurable, on both ends.
+
+Inbound, the viewer picks a camera codec and chroma sampling and a microphone
+codec in the media panel. `auto` walks the browser's best-first candidate list;
+an explicit choice is honored as given. Options the browser cannot encode, or
+that the server did not advertise, are shown disabled rather than hidden —
+which format is missing is the useful part. The operator bounds the same axis
+with `blit server --camera-codecs` and `--microphone-codecs` (or
+`BLIT_MEDIA_CAMERA_CODECS` / `BLIT_MEDIA_MICROPHONE_CODECS`), which narrow
+`camera_codec_mask()` and are re-checked when a lease starts. Motion JPEG and
+PCM are always accepted: `ServerCapabilities` is invalid without Motion JPEG,
+and PCM is the fallback a browser reaches when it cannot encode Opus.
+
+Outbound, the viewer narrows the `CODEC_SUPPORT_*` mask that rides
+`C2S_CLIENT_FEATURES`, on top of what the decode probe found; changing it
+re-advertises and re-subscribes every live surface, since the server only
+reconsiders its encoder on a resubscribe. The mask is never published empty —
+zero reads as “accept anything” on the wire, so an allow-list that excludes
+everything decodable falls back to the probe's own answer instead of silently
+inverting itself. The operator's side of that negotiation is
+`--surface-encoders` / `BLIT_SURFACE_ENCODERS`.
 
 ### Ownership and leases
 
@@ -550,8 +586,9 @@ transport reconnect, even when the server boot generation is unchanged. The
 browser stops its local tracks on disconnect and requires another user gesture.
 
 The source node exists only for the live lease. PipeWire hotplug announces it
-to applications as `Blit Microphone` or `Blit Camera`; removing the lease
-removes the node. Blit does not keep a silent microphone or black camera around,
+to applications as `Input` or `Camera` — named for what they are, pairing with
+the `Output` sink, rather than for the product publishing them; removing the
+lease removes the node. Blit does not keep a silent microphone or black camera around,
 because presence would misrepresent an active viewer privacy decision.
 
 ### Microphone path
@@ -731,7 +768,7 @@ MprisPlayer {
   can_seek, can_raise, can_set_volume, can_set_shuffle,
   can_set_loop_status, can_set_rate,
   title, artists[], album, length_us, position_us,
-  artwork_png?
+  artwork: none | url | png(width, height, bytes)
 }
 ```
 
@@ -745,13 +782,45 @@ position are clamped to nonnegative signed 64-bit microseconds; unknown length
 is represented as `-1`. Each normalized string is at most 4 KiB and one player
 record is at most 1 MiB.
 
-Artwork uses the tray/notification image pipeline and reaches the browser only
-as a decoded, resized, re-encoded PNG. V1 accepts local `file:` URLs and bounded
-`data:image/*` values. It rejects network URLs, non-image data, SVG script, and
-browser-side fetching. An encoded source over 4 MiB is rejected before decode.
-One result is at most 512×512 and 512 KiB; the retained MPRIS artwork budget is
-8 MiB per compositor. If that budget is exhausted, the least recently used
-artwork is omitted while player text and controls remain.
+Artwork reaches the viewer one of two ways, chosen by what the player named. One
+upsert carries a kind discriminator: `0` for no art, `1` for a URL, `2` for
+normalized PNG bytes.
+
+An `http:`/`https:` `mpris:artUrl` is **forwarded verbatim** and the server never
+dereferences it. A player backed by a streaming catalogue holds no local cover —
+Spotify publishes only an `https://i.scdn.co/...` URL — and forwarding is both
+cheaper and better than fetching it: the viewer's browser loads it off its UI
+thread, caches it by URL across track changes, and the server spends no fetch, no
+decode, no resize and no re-encode. It also keeps upserts small. Artwork is inline
+in every upsert, so byte-carried art costs ~150 KiB each time a player's state
+changes, against roughly 60 bytes for a URL, and the client pays a base64 encode
+per render on top.
+
+The tradeoff is deliberate: the viewer's browser contacts the cover host, so that
+host sees the viewer's address rather than the server's, and art fails where a
+viewer has no route to it. This is the opposite of what a fetching server would
+do, and it is the right default here — the alternative spends server bandwidth and
+CPU per cover to hide a request the viewer's browser makes to a CDN on any other
+page.
+
+Art that exists only as local bytes cannot be named to a browser at all, so
+`file:` and bounded `data:image/*` sources still travel as PNG through the
+tray/notification image pipeline: decoded, resized, re-encoded. Every other
+scheme, non-image data, and SVG script are rejected. A URL is validated against
+the `http`/`https` allowlist at both protocol edges — on the way out and again on
+the way in — because it lands in an `<img>` source; anything else becomes no art
+rather than a forwarded value.
+
+An encoded source over 4 MiB is rejected before decode. Local cover sources may
+be up to 2048×2048: 640×640 is what Spotify serves, and the 512×512 ceiling that
+applies to icons would reject ordinary album art outright instead of downscaling
+it. One byte-carried result is at most 512×512 and 512 KiB; where a 512×512
+re-encode would exceed that byte cap the art is retried at 384 and then 256,
+because the encoder omits an over-cap cover rather than truncating it into a
+broken image. The retained artwork budget is 8 MiB per compositor and counts only
+byte-carried art — a forwarded URL occupies none of it, and a player whose art is
+a URL is never evicted and never forces an eviction. If the budget is exhausted,
+the least recently used artwork is omitted while player text and controls remain.
 
 ### Position and active-player arbitration
 
@@ -1227,8 +1296,9 @@ selected surfaces, not persisted under `app_id`.
 | Normalized MPRIS string             | 4 KiB                                      |
 | Normalized MPRIS player record      | 1 MiB                                      |
 | MPRIS update after decompression    | 16 MiB                                     |
-| MPRIS artwork source                | 4 MiB                                      |
-| MPRIS artwork                       | 512×512 PNG, 512 KiB each                  |
+| MPRIS artwork source (local)        | 4 MiB, 2048×2048                           |
+| MPRIS artwork (local)               | 512×512 PNG, 512 KiB each                  |
+| MPRIS artwork URL                   | 4 KiB, http/https only                     |
 | Retained MPRIS artwork              | 8 MiB per compositor                       |
 | MPRIS D-Bus action deadline         | 2 seconds                                  |
 

@@ -140,6 +140,7 @@ import {
   detectCodecSupport,
   demoteCodecSupport,
   restoreCodecSupport,
+  getCodecSupport,
   getMaxDecodeSize,
 } from "./BlitSurfaceCanvas";
 import {
@@ -595,6 +596,7 @@ interface SurfaceSub {
   speedOverride: number | null;
   /** Last subscribe sent on the wire, for dedup. */
   lastSent: {
+    codecSupport: number;
     bandwidth: number;
     speed: number;
     width: number;
@@ -921,6 +923,11 @@ export class BlitConnection {
     const sender = status === "connected" ? this.sendDesktopMedia : null;
     this.mediaStore.setSender(sender);
     this.mprisStore.setSender(sender);
+    // Read through on every call rather than caching the number: the queue
+    // is only meaningful at the instant a frame is about to be added to it.
+    this.mediaStore.setBackpressureProbe(
+      sender ? () => this.transport.bufferedAmount : null,
+    );
   }
 
   constructor({
@@ -1201,11 +1208,19 @@ export class BlitConnection {
     surfaces: ReturnType<
       import("./SurfaceStore").SurfaceStore["getDebugStats"]
     >;
+    audioBuffer: AudioPlayer["bufferStats"] & { fastPath: string };
   } {
     const session = sessionId ? this.sessionsById.get(sessionId) : null;
     return {
       ...this.store.getDebugStats(session?.ptyId ?? null),
       surfaces: this.surfaceStore.getDebugStats(),
+      // Whether audio bypasses this thread is the first thing worth knowing
+      // when it stutters, and it was costing a round trip of guesswork to
+      // find out.
+      audioBuffer: {
+        ...this.audioPlayer.bufferStats,
+        fastPath: this.audioFastPath,
+      },
     };
   }
 
@@ -4044,8 +4059,16 @@ export class BlitConnection {
     const width = target?.width ?? 0;
     const height = target?.height ?? 0;
     const maxFps = this.effectiveSurfaceMaxFps(sub);
+    // The mask has to ride the subscribe, not just C2S_CLIENT_FEATURES: the
+    // features message only records what this client can decode, while the
+    // server rebuilds an encoder solely when a resubscribe's own preferences
+    // differ from the ones the surface is running on.  Sent as 0 until the
+    // probe answers, which the server reads as "accept anything" — that is
+    // what lets the first frame arrive without waiting for it.
+    const codecSupport = getCodecSupport();
     if (
       sub.lastSent !== null &&
+      sub.lastSent.codecSupport === codecSupport &&
       sub.lastSent.bandwidth === bandwidth &&
       sub.lastSent.speed === speed &&
       sub.lastSent.width === width &&
@@ -4054,14 +4077,14 @@ export class BlitConnection {
     ) {
       return;
     }
-    sub.lastSent = { bandwidth, speed, width, height, maxFps };
+    sub.lastSent = { codecSupport, bandwidth, speed, width, height, maxFps };
     this._logger.info(
-      `surface sub ${this.id}:${sub.surfaceId}${target ? ` @${width}x${height}` : ""}${maxFps ? ` ${maxFps}fps` : ""}`,
+      `surface sub ${this.id}:${sub.surfaceId}${target ? ` @${width}x${height}` : ""}${maxFps ? ` ${maxFps}fps` : ""} codecs=0x${codecSupport.toString(16)}`,
     );
     this.transport.send(
       buildSurfaceSubscribeMessage(
         sub.surfaceId,
-        0,
+        codecSupport,
         bandwidth,
         speed,
         width,
@@ -4324,10 +4347,64 @@ export class BlitConnection {
    * Can be called repeatedly to adjust bitrate without unsubscribing first.
    * `bitrateKbps`: 0 = server default, otherwise desired Opus bitrate in kbps.
    */
+  /**
+   * Ask the transport to deliver audio straight to the decoder, if it can.
+   *
+   * Feature-detected rather than typed: only the worker-backed mux channel
+   * offers this, and every other transport — WebRTC shares, unix sockets,
+   * tests — must keep working untouched. Done once, when audio is first
+   * subscribed, since before that there is nothing to carry.
+   */
+  private attachAudioFastPath(): void {
+    if (this.audioFastPath === "worker") return;
+    const transport = this.transport as {
+      attachAudioPort?: (port: MessagePort) => void;
+    };
+    if (typeof transport.attachAudioPort !== "function") {
+      // Not a worker-backed mux channel: a WebRTC share, a unix socket, or
+      // the direct transport `createMuxTransport` falls back to. When it is
+      // the fallback, say what forced it — a worker that would not start is
+      // the difference between audio being slow and audio being on the wrong
+      // side of a scroll, and it is otherwise invisible from here.
+      const why = (this.transport as { workerFallback?: string })
+        .workerFallback;
+      this.audioFastPath = why
+        ? `main thread: transport (${why})`
+        : "main thread: transport";
+      return;
+    }
+    const port = this.audioPlayer.transportAudioPort();
+    if (!port) {
+      // No decode worker to hand frames to. Only reached once, since this
+      // runs from `sendAudioSubscribe` and audio is subscribed exactly once.
+      this.audioFastPath = "main thread: decoder";
+      return;
+    }
+    // The shortcut is only sound while the decoder at the far end is alive.
+    // Losing it silently would be worse than never having taken it: the main
+    // thread receives payload-less headers on this route, so audio would stop
+    // outright instead of degrading.
+    this.audioPlayer.onDecodeWorkerLost = () => {
+      (this.transport as { detachAudioPort?: () => void }).detachAudioPort?.();
+      this.audioFastPath = "main thread: decoder";
+    };
+    transport.attachAudioPort(port);
+    this.audioFastPath = "worker";
+  }
+
+  /** Which route audio takes, and when it is the slow one, why. Reported in
+   *  the debug panel: the distinction picks the next thing to fix. */
+  private audioFastPath:
+    | "worker"
+    | `main thread: transport${string}`
+    | "main thread: decoder"
+    | "main thread: unsubscribed" = "main thread: unsubscribed";
+
   sendAudioSubscribe(bitrateKbps: number = 0): void {
     if (this.transport.status !== "connected") return;
     this.transport.send(buildAudioSubscribeMessage(bitrateKbps));
     this.audioPlayer.setSubscribed(true);
+    this.attachAudioFastPath();
   }
 
   sendAudioUnsubscribe(): void {
@@ -4543,6 +4620,19 @@ export class BlitConnection {
     this.transport.send(buildClientFeaturesMessage(codecSupport, maxW, maxH));
   }
 
+  /**
+   * Re-advertise the current codec mask and re-subscribe every surface, so a
+   * viewer's codec preference takes effect on streams that are already
+   * running.  A no-op before the probe resolves — its own advertisement
+   * carries the preference then.
+   */
+  refreshCodecSupport(): void {
+    const mask = getCodecSupport();
+    if (!mask) return;
+    this.sendClientFeatures(mask);
+    this.resubscribeWithCodecSupport();
+  }
+
   isReady(): boolean {
     return this.store.isReady();
   }
@@ -4712,14 +4802,14 @@ export class BlitConnection {
         }
         const count = view.getUint32(11, true);
         let offset = 15;
-        // Every record needs a 30-byte header, before subscriptions.
-        if (count > Math.floor((bytes.length - offset) / 30)) {
+        // Every record needs a 38-byte header, before subscriptions.
+        if (count > Math.floor((bytes.length - offset) / 38)) {
           malformed();
           return;
         }
         const clients: BlitClientList["clients"][number][] = [];
         for (let i = 0; i < count; i++) {
-          if (offset + 30 > bytes.length) {
+          if (offset + 38 > bytes.length) {
             malformed();
             return;
           }
@@ -4728,10 +4818,13 @@ export class BlitConnection {
           const outboundBytesPerSecond = Number(
             view.getBigUint64(offset + 16, true),
           );
-          const terminalCount = view.getUint16(offset + 24, true);
-          const surfaceCount = view.getUint16(offset + 26, true);
-          const subscriptionCount = view.getUint16(offset + 28, true);
-          offset += 30;
+          const inboundBytesPerSecond = Number(
+            view.getBigUint64(offset + 24, true),
+          );
+          const terminalCount = view.getUint16(offset + 32, true);
+          const surfaceCount = view.getUint16(offset + 34, true);
+          const subscriptionCount = view.getUint16(offset + 36, true);
+          offset += 38;
           if (
             offset +
               terminalCount * 6 +
@@ -4780,6 +4873,7 @@ export class BlitConnection {
             id,
             ageSeconds,
             outboundBytesPerSecond,
+            inboundBytesPerSecond,
             subscriptions,
             terminals,
             surfaces,

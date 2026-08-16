@@ -1008,6 +1008,9 @@ async fn async_main() {
             export_sock,
             inject_path,
             max_ptys,
+            surface_encoders,
+            camera_codecs,
+            microphone_codecs,
             allow_forward,
             allow_forward_insecure,
             allow_persistent_extensions,
@@ -1026,6 +1029,33 @@ async fn async_main() {
                 eprintln!("blit server: {error}");
                 std::process::exit(2);
             }
+            // A typed list that does not parse is a mistake worth stopping
+            // for; the environment fallbacks inside `defaults()` stay lenient,
+            // since a stale export should not make the server unbootable.
+            let fail = |error: String| -> ! {
+                eprintln!("blit server: {error}");
+                std::process::exit(2);
+            };
+            let surface_encoders = match surface_encoders {
+                Some(list) => blit_server::SurfaceEncoderPreference::parse_list(&list)
+                    .unwrap_or_else(|error| fail(error)),
+                None => blit_server::SurfaceEncoderPreference::defaults(),
+            };
+            let media_codecs = {
+                let defaults = blit_server::MediaCodecPolicy::defaults();
+                blit_server::MediaCodecPolicy {
+                    camera: match camera_codecs {
+                        Some(list) => blit_server::MediaCodecPolicy::parse_camera(&list)
+                            .unwrap_or_else(|error| fail(error)),
+                        None => defaults.camera,
+                    },
+                    microphone: match microphone_codecs {
+                        Some(list) => blit_server::MediaCodecPolicy::parse_microphone(&list)
+                            .unwrap_or_else(|error| fail(error)),
+                        None => defaults.microphone,
+                    },
+                }
+            };
             let ipc_path = socket
                 .or_else(|| std::env::var("BLIT_SOCK").ok())
                 .unwrap_or_else(blit_server::default_ipc_path);
@@ -1053,7 +1083,7 @@ async fn async_main() {
                     })
                     .unwrap_or(10_000),
                 ipc_path,
-                surface_encoders: blit_server::SurfaceEncoderPreference::defaults(),
+                surface_encoders,
                 surface_encoding: blit_server::SurfaceEncoding {
                     bandwidth: std::env::var("BLIT_SURFACE_BANDWIDTH")
                         .ok()
@@ -1065,6 +1095,7 @@ async fn async_main() {
                         .unwrap_or_default(),
                 },
                 chroma: blit_server::ChromaSubsampling::from_env(),
+                media_codecs,
                 vaapi_device: std::env::var("BLIT_VAAPI_DEVICE")
                     .unwrap_or_else(|_| "/dev/dri/renderD128".into()),
                 #[cfg(unix)]

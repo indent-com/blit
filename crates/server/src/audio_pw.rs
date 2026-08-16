@@ -187,6 +187,7 @@ const PW_DIRECTION_OUTPUT: i32 = 1;
 const PW_ID_ANY: u32 = u32::MAX;
 const PW_STREAM_FLAG_AUTOCONNECT: u32 = 1 << 0;
 const PW_STREAM_FLAG_MAP_BUFFERS: u32 = 1 << 2;
+const PW_STREAM_FLAG_DRIVER: u32 = 1 << 3;
 const PW_STREAM_FLAG_RT_PROCESS: u32 = 1 << 4;
 
 // ── SPA POD constants ─────────────────────────────────────────────────
@@ -250,6 +251,7 @@ type FnPwStreamConnect =
 type FnPwStreamDisconnect = unsafe extern "C" fn(*mut PwStream) -> c_int;
 type FnPwStreamDequeueBuffer = unsafe extern "C" fn(*mut PwStream) -> *mut PwBuffer;
 type FnPwStreamQueueBuffer = unsafe extern "C" fn(*mut PwStream, *mut PwBuffer) -> c_int;
+type FnPwStreamTriggerProcess = unsafe extern "C" fn(*mut PwStream) -> c_int;
 type FnPwStreamUpdateParams = unsafe extern "C" fn(*mut PwStream, *mut *const c_void, u32) -> c_int;
 type FnPwStreamGetNodeId = unsafe extern "C" fn(*mut PwStream) -> u32;
 type FnPwStreamGetProperties = unsafe extern "C" fn(*mut PwStream) -> *const PwProperties;
@@ -274,6 +276,7 @@ struct Syms {
     pw_stream_disconnect: FnPwStreamDisconnect,
     pw_stream_dequeue_buffer: FnPwStreamDequeueBuffer,
     pw_stream_queue_buffer: FnPwStreamQueueBuffer,
+    pw_stream_trigger_process: FnPwStreamTriggerProcess,
     pw_stream_update_params: FnPwStreamUpdateParams,
     pw_stream_get_node_id: FnPwStreamGetNodeId,
     pw_stream_get_properties: FnPwStreamGetProperties,
@@ -372,6 +375,10 @@ fn syms() -> Option<&'static Syms> {
                 pw_stream_disconnect: sym!("pw_stream_disconnect", FnPwStreamDisconnect),
                 pw_stream_dequeue_buffer: sym!("pw_stream_dequeue_buffer", FnPwStreamDequeueBuffer),
                 pw_stream_queue_buffer: sym!("pw_stream_queue_buffer", FnPwStreamQueueBuffer),
+                pw_stream_trigger_process: sym!(
+                    "pw_stream_trigger_process",
+                    FnPwStreamTriggerProcess
+                ),
                 pw_stream_update_params: sym!("pw_stream_update_params", FnPwStreamUpdateParams),
                 pw_stream_get_node_id: sym!("pw_stream_get_node_id", FnPwStreamGetNodeId),
                 pw_stream_get_properties: sym!("pw_stream_get_properties", FnPwStreamGetProperties),
@@ -915,6 +922,10 @@ struct SourceState {
     stream: *mut PwStream,
     queue: Mutex<SourceQueue>,
     active: AtomicBool,
+    /// Cycles the graph has actually driven. Zero while a consumer is linked
+    /// means the node was never scheduled, which is invisible from the
+    /// outside: the node still publishes, negotiates and links.
+    processed: AtomicU64,
 }
 
 // SAFETY: the PipeWire callback owns stream access. Producers only touch the
@@ -939,6 +950,7 @@ fn pcm_requested_bytes(requested_frames: u64, capacity: usize) -> usize {
 unsafe extern "C" fn on_source_process(data: *mut c_void) {
     unsafe {
         let state = &*(data as *const SourceState);
+        state.processed.fetch_add(1, Ordering::Relaxed);
         if !state.active.load(Ordering::Acquire) {
             return;
         }
@@ -1053,10 +1065,22 @@ impl PcmSource {
             set("media.role", "Communication");
             set("media.class", "Audio/Source");
             set("node.name", "blit-microphone");
-            set("node.nick", "Blit Microphone");
-            set("node.description", "Blit Microphone");
+            // Paired with the sink's "Output"; see its node.nick in audio.rs.
+            set("node.nick", "Input");
+            set("node.description", "Input");
             set("node.virtual", "true");
             set("node.latency", "960/48000");
+            // A lent microphone is the only thing on this graph that knows
+            // when its audio arrives, so it has to drive its own cycle. Both
+            // it and a recording application are followers, and a graph of
+            // nothing but followers is never scheduled: the node published,
+            // negotiated and linked correctly while `process` was never once
+            // called, which a consumer sees as a device it can open and read
+            // no bytes from. `pause-on-idle` is off for the same reason the
+            // camera turns it off — the source must keep running across the
+            // gap between a consumer linking and the first frame arriving.
+            set("node.driver", "true");
+            set("node.pause-on-idle", "false");
 
             let state = Box::into_raw(Box::new(SourceState {
                 stream: ptr::null_mut(),
@@ -1065,6 +1089,7 @@ impl PcmSource {
                     offset: 0,
                 }),
                 active: AtomicBool::new(true),
+                processed: AtomicU64::new(0),
             }));
             let stream = (s.pw_stream_new_simple)(
                 (s.pw_thread_loop_get_loop)(thread_loop),
@@ -1081,7 +1106,17 @@ impl PcmSource {
             (*state).stream = stream;
             let pod = build_audio_format_pod_for(SPA_AUDIO_FORMAT_S16_LE, 1);
             let mut params = [pod.as_ptr() as *const c_void];
-            let flags = PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS;
+            // DRIVER, because nothing else on this graph can time the cycle.
+            // A lent microphone and a recording application are both stream
+            // followers, and a component of nothing but followers is never
+            // scheduled — the node publishes, negotiates and links while
+            // `process` is never called once, which a consumer experiences as
+            // a device it can open and read no bytes from. Being the driver
+            // means the audio's own arrival is what advances the graph, which
+            // is also the correct clock: the frames come off a network, not a
+            // sound card. `push` triggers each cycle.
+            let flags =
+                PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS;
             let rc = (s.pw_stream_connect)(
                 stream,
                 PW_DIRECTION_OUTPUT,
@@ -1111,12 +1146,23 @@ impl PcmSource {
         }
     }
 
+    /// Graph cycles this source has been driven for. Zero while a consumer is
+    /// linked means the node is published but never scheduled — the failure
+    /// this counter exists to make visible, since nothing else about the node
+    /// distinguishes it from a working one.
+    #[cfg(test)]
+    pub fn processed_cycles(&self) -> u64 {
+        // SAFETY: state remains live until Drop, and this method borrows self.
+        unsafe { &*self.state }.processed.load(Ordering::Relaxed)
+    }
+
     /// Enqueue exactly one 20 ms PCM frame. The bounded jitter queue keeps
     /// newest input under congestion and marks the old audio as lost.
     pub fn push(&self, pcm: Vec<u8>) -> Result<(), &'static str> {
         if pcm.len() != PCM_FRAME_BYTES {
             return Err("PCM frame must contain 960 mono S16 samples");
         }
+        let s = syms().ok_or("libpipewire-0.3.so.0 not available")?;
         // SAFETY: state remains live until Drop, and this method borrows self.
         let state = unsafe { &*self.state };
         let mut queue = state.queue.lock().map_err(|_| "source queue poisoned")?;
@@ -1125,6 +1171,15 @@ impl PcmSource {
             queue.offset = 0;
         }
         queue.frames.push_back(pcm);
+        drop(queue);
+        // Advance the graph now that there is audio to hand over. As the
+        // driver, this stream is what decides when a cycle happens; without
+        // this the queue fills and drains to nobody.
+        // SAFETY: the stream outlives the state, which Drop tears down only
+        // after stopping the loop.
+        unsafe {
+            (s.pw_stream_trigger_process)(state.stream);
+        }
         Ok(())
     }
 }
@@ -1454,7 +1509,7 @@ impl RawVideoSource {
         Self::start_named(
             runtime_dir,
             "blit-camera",
-            "Blit Camera",
+            "Camera",
             "Camera",
             width,
             height,
@@ -1553,7 +1608,12 @@ impl RawVideoSource {
                 stream,
                 PW_DIRECTION_OUTPUT,
                 PW_ID_ANY,
-                PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS,
+                // DRIVER for the same reason as the microphone: a lent camera
+                // and the application reading it are both followers, and a
+                // component of nothing but followers is never scheduled. The
+                // frames arrive from a viewer's network, so their arrival is
+                // the only sensible clock. `enqueue` triggers each cycle.
+                PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS,
                 params.as_mut_ptr(),
                 params.len() as u32,
             );
@@ -1655,6 +1715,15 @@ impl RawVideoSource {
             pts_ns,
             sequence,
         });
+        drop(frames);
+        // Advance the graph now that there is a frame to hand over; as the
+        // driver, this stream is what decides when a cycle happens.
+        let s = syms().ok_or("libpipewire-0.3.so.0 not available")?;
+        // SAFETY: the stream outlives the state, which Drop tears down only
+        // after stopping the loop.
+        unsafe {
+            (s.pw_stream_trigger_process)(state.stream);
+        }
         Ok(())
     }
 }
@@ -1701,9 +1770,14 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Child, Command, Stdio};
+    use std::sync::Arc;
 
     struct TestPipeWire {
         child: Child,
+        /// Links are the session manager's job. A bare daemon publishes nodes
+        /// that nothing ever connects, so a delivery test against it fails
+        /// whether or not the code under test works.
+        session: Option<Child>,
         root: std::path::PathBuf,
     }
 
@@ -1738,7 +1812,11 @@ mod tests {
                 .stderr(Stdio::inherit())
                 .spawn()
                 .expect("start test PipeWire daemon");
-            let mut daemon = Self { child, root };
+            let mut daemon = Self {
+                child,
+                session: None,
+                root,
+            };
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while !daemon.root.join("pipewire-0").exists() && std::time::Instant::now() < deadline {
                 if let Some(status) = daemon.child.try_wait().expect("poll PipeWire daemon") {
@@ -1750,12 +1828,74 @@ mod tests {
                 daemon.root.join("pipewire-0").exists(),
                 "test PipeWire socket was not created"
             );
+            daemon.start_session_manager();
             Some(daemon)
+        }
+
+        /// Start WirePlumber against this daemon, with every host device
+        /// monitor off: the test needs link management, not the machine's
+        /// sound card grabbed out from under whoever is running the suite.
+        fn start_session_manager(&mut self) {
+            if Command::new("wireplumber")
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_err()
+            {
+                return;
+            }
+            let conf_dir = self
+                .root
+                .join("config")
+                .join("wireplumber")
+                .join("wireplumber.conf.d");
+            if std::fs::create_dir_all(&conf_dir).is_err() {
+                return;
+            }
+            let profile = r#"
+wireplumber.profiles = {
+  main = {
+    support.dbus = disabled
+    support.portal-permissionstore = disabled
+    support.reserve-device = disabled
+    support.logind = disabled
+    hardware.bluetooth = disabled
+    hardware.video-capture = disabled
+    monitor.alsa = disabled
+    monitor.alsa.reserve-device = disabled
+    monitor.bluez = disabled
+    monitor.libcamera = disabled
+    monitor.v4l2 = disabled
+  }
+}
+"#;
+            if std::fs::write(conf_dir.join("99-test.conf"), profile).is_err() {
+                return;
+            }
+            self.session = Command::new("wireplumber")
+                .env("XDG_RUNTIME_DIR", &self.root)
+                .env("PIPEWIRE_RUNTIME_DIR", &self.root)
+                .env("XDG_CONFIG_HOME", self.root.join("config"))
+                .env("PIPEWIRE_REMOTE", self.root.join("pipewire-0"))
+                .env_remove("DBUS_SESSION_BUS_ADDRESS")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok();
+            if self.session.is_some() {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+            }
         }
     }
 
     impl Drop for TestPipeWire {
         fn drop(&mut self) {
+            if let Some(session) = self.session.as_mut() {
+                let _ = session.kill();
+                let _ = session.wait();
+            }
             let _ = self.child.kill();
             let _ = self.child.wait();
             let _ = std::fs::remove_dir_all(&self.root);
@@ -1879,5 +2019,80 @@ mod tests {
         assert_ne!(source.node_id(), PW_ID_ANY);
         assert_ne!(source.serial(), 0);
         source.push(vec![0x80; 64 * 48 * 4]).unwrap();
+    }
+
+    /// A published node is not a working one.
+    ///
+    /// The lent microphone reached applications as a device they could see and
+    /// not read: `pw-cat --record` against it returned a WAV header and no
+    /// samples, and a browser's `getUserMedia` failed with "Could not start
+    /// audio source" — which fails the whole request when audio and video are
+    /// asked for together, so a silent microphone reads as a broken camera.
+    /// The node published and negotiated correctly the entire time, which is
+    /// why the test above did not catch it: it asserts the node exists, not
+    /// that a consumer gets bytes out of it.
+    #[test]
+    #[ignore = "requires local PipeWire daemon and pw-cat binaries"]
+    fn pcm_source_delivers_samples_to_a_consumer() {
+        let Some(daemon) = TestPipeWire::spawn() else {
+            eprintln!("skipped: PipeWire daemon could not start");
+            return;
+        };
+        if Command::new("pw-cat")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("skipped: pw-cat is unavailable");
+            return;
+        }
+        let source = PcmSource::start(&daemon.root).expect("start PCM source");
+
+        // Keep the queue fed for the whole capture: a consumer that links
+        // mid-stream must still be handed audio, and an empty queue is
+        // indistinguishable from a stream that is never driven.
+        let feeding = Arc::new(AtomicBool::new(true));
+        let stop = feeding.clone();
+        let pump = std::thread::spawn(move || {
+            while stop.load(Ordering::Acquire) {
+                // A 440 Hz-ish non-zero payload, so silence in the capture is
+                // distinguishable from delivered audio.
+                let _ = source.push(vec![0x40; PCM_FRAME_BYTES]);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            source
+        });
+
+        let wav = daemon.root.join("captured.wav");
+        let mut recorder = Command::new("pw-cat")
+            .arg("--record")
+            .arg("--target")
+            .arg("blit-microphone")
+            .arg(&wav)
+            .env("XDG_RUNTIME_DIR", &daemon.root)
+            .env("PIPEWIRE_RUNTIME_DIR", &daemon.root)
+            .env("PIPEWIRE_REMOTE", daemon.root.join("pipewire-0"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("start pw-cat");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = recorder.kill();
+        let _ = recorder.wait();
+        feeding.store(false, Ordering::Release);
+        let source = pump.join().expect("pump thread");
+        let cycles = source.processed_cycles();
+
+        let captured = std::fs::metadata(&wav).map(|m| m.len()).unwrap_or(0);
+        eprintln!("captured {captured} bytes over {cycles} driven cycles");
+        // 44 bytes is a bare WAV header: the consumer linked and received
+        // nothing at all.
+        assert!(
+            captured > 44,
+            "consumer captured {captured} bytes — a header and no samples"
+        );
     }
 }

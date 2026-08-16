@@ -3,6 +3,9 @@ import { fsCompressLiteral } from "../fs";
 import {
   ACTIVE_CAMERA,
   ACTIVE_SCREENCAST,
+  ARTWORK_KIND_NONE,
+  ARTWORK_KIND_PNG,
+  ARTWORK_KIND_URL,
   AUDIO_CODEC_OPUS,
   AUDIO_CODEC_PCM,
   CAPTURE_CAMERA,
@@ -75,8 +78,9 @@ function mprisUpdate(
   playerIds: readonly number[],
   options: {
     capabilityFlags?: number;
-    artworkWidth?: number;
-    artworkHeight?: number;
+    /** Written verbatim so a test can encode a kind the parser must reject. */
+    artworkKind?: number;
+    artworkUrl?: string;
     artworkPng?: readonly number[];
   } = {},
 ): Uint8Array {
@@ -100,9 +104,19 @@ function mprisUpdate(
     str16(raw, "Album");
     raw.push(1);
     str16(raw, "Artist");
-    u16(raw, options.artworkWidth ?? 0);
-    u16(raw, options.artworkHeight ?? 0);
-    bytes32(raw, options.artworkPng ?? []);
+    const kind =
+      options.artworkKind ??
+      (options.artworkUrl !== undefined
+        ? ARTWORK_KIND_URL
+        : options.artworkPng !== undefined
+          ? ARTWORK_KIND_PNG
+          : ARTWORK_KIND_NONE);
+    raw.push(kind);
+    if (kind === ARTWORK_KIND_URL) {
+      str16(raw, options.artworkUrl ?? "");
+    } else if (kind === ARTWORK_KIND_PNG) {
+      bytes32(raw, options.artworkPng ?? []);
+    }
   }
   const compressed = fsCompressLiteral(new Uint8Array(raw));
   const message = new Uint8Array(3 + compressed.length);
@@ -448,26 +462,41 @@ describe("desktop media wire format", () => {
       mprisUpdate(0x80, [1]),
       mprisUpdate(0, [0]),
       mprisUpdate(0, [1], { capabilityFlags: 1 << 11 }),
-      mprisUpdate(0, [1], { artworkWidth: 1 }),
-      mprisUpdate(0, [1], { artworkHeight: 1 }),
-      mprisUpdate(0, [1], { artworkWidth: 1, artworkHeight: 1 }),
-      mprisUpdate(0, [1], { artworkPng: [1] }),
+      // Byte-carried art must have a body.
+      mprisUpdate(0, [1], { artworkPng: [] }),
+      // A cover URL reaches the DOM, so only http(s) is accepted.
+      mprisUpdate(0, [1], { artworkUrl: "file:///etc/passwd" }),
+      mprisUpdate(0, [1], { artworkUrl: "javascript:alert(1)" }),
+      mprisUpdate(0, [1], { artworkUrl: "" }),
+      mprisUpdate(0, [1], { artworkUrl: "https://" }),
+      mprisUpdate(0, [1], { artworkKind: 9 }),
     ];
     for (const message of corpus) expect(parseMediaControl(message)).toBeNull();
 
     const valid = parseMediaControl(
-      mprisUpdate(0, [1], {
-        artworkWidth: 1,
-        artworkHeight: 1,
-        artworkPng: [0x89, 0x50, 0x4e, 0x47],
-      }),
+      mprisUpdate(0, [1], { artworkPng: [0x89, 0x50, 0x4e, 0x47] }),
     );
     expect(valid?.kind).toBe("mprisUpdate");
     if (valid?.kind !== "mprisUpdate") throw new Error("artwork did not parse");
     const record = valid.records[0];
     expect(record?.kind).toBe("upsert");
     if (record?.kind !== "upsert") throw new Error("player did not parse");
-    expect(record.player.artwork).toMatchObject({ width: 1, height: 1 });
+    expect(record.player.artwork).toMatchObject({ kind: "png" });
+  });
+
+  it("carries a streaming player's cover as a URL rather than bytes", () => {
+    const url =
+      "https://i.scdn.co/image/ab67616d0000b2738ac778cc7d88779f74d33311";
+    const message = mprisUpdate(0, [1], { artworkUrl: url });
+
+    // The point of forwarding: an upsert stays small enough to send freely.
+    expect(message.length).toBeLessThan(512);
+
+    const parsed = parseMediaControl(message);
+    if (parsed?.kind !== "mprisUpdate") throw new Error("did not parse");
+    const record = parsed.records[0];
+    if (record?.kind !== "upsert") throw new Error("player did not parse");
+    expect(record.player.artwork).toEqual({ kind: "url", url });
   });
 
   it("emits bounded UTF-8 portal choices without splitting code points", () => {
@@ -1430,5 +1459,108 @@ describe("MediaStore microphone capture", () => {
     );
     expect(stop).toBeDefined();
     expect(store.microphone.status).toBe("inactive");
+  });
+});
+
+describe("camera link backpressure", () => {
+  /**
+   * Lease credit alone cannot keep the picture current: it is returned only
+   * once the server has decoded a frame, so a whole window can be sitting in
+   * the socket unacknowledged, and every byte of it is delay in front of the
+   * frame the camera is about to capture. The send queue says so while it is
+   * happening.
+   */
+  it("stops encoding while the transport queue is over its allowance", async () => {
+    vi.useFakeTimers();
+    const { track } = installCameraMocks();
+    installVideoEncoderMocks();
+    const messages: Uint8Array[] = [];
+    const store = new MediaStore();
+    store.setSender((message) => messages.push(message));
+    store.handle({ kind: "serverCapabilities", videoCodecs: VIDEO_CODECS_ALL });
+
+    let queued = 0;
+    store.setBackpressureProbe(() => queued);
+
+    const started = store.startCamera(track as unknown as MediaStreamTrack, {
+      codec: "h264",
+      width: 320,
+      height: 240,
+      fps: 15,
+    });
+    const start = await waitForMediaStart(messages);
+    store.handle({
+      kind: "lease",
+      nonce: startNonce(start),
+      status: 0,
+      mediaKind: 1,
+      leaseId: 77,
+      codec: 1,
+      width: 320,
+      height: 240,
+      fps: 15,
+      initialCredit: 512 * 1024,
+    });
+    await expect(started).resolves.toBeUndefined();
+
+    // An empty queue: frames flow.
+    await vi.advanceTimersByTimeAsync(200);
+    const flowing = cameraDataMessages(messages).length;
+    expect(flowing).toBeGreaterThan(0);
+
+    // A queue far past any plausible allowance: the capture must stop adding
+    // to it rather than lengthen the delay.
+    queued = 64 * 1024 * 1024;
+    const beforeStall = cameraDataMessages(messages).length;
+    await vi.advanceTimersByTimeAsync(500);
+    expect(cameraDataMessages(messages).length).toBe(beforeStall);
+
+    // Drained: it picks up again. A one-way ratchet would be worse than the
+    // bufferbloat it replaced.
+    queued = 0;
+    await vi.advanceTimersByTimeAsync(300);
+    expect(cameraDataMessages(messages).length).toBeGreaterThan(beforeStall);
+
+    store.stop("camera");
+    vi.useRealTimers();
+  });
+
+  /** A transport that cannot report its queue must not stall the camera. */
+  it("keeps encoding when the transport reports no queue at all", async () => {
+    vi.useFakeTimers();
+    const { track } = installCameraMocks();
+    installVideoEncoderMocks();
+    const messages: Uint8Array[] = [];
+    const store = new MediaStore();
+    store.setSender((message) => messages.push(message));
+    store.handle({ kind: "serverCapabilities", videoCodecs: VIDEO_CODECS_ALL });
+    store.setBackpressureProbe(() => undefined);
+
+    const started = store.startCamera(track as unknown as MediaStreamTrack, {
+      codec: "h264",
+      width: 320,
+      height: 240,
+      fps: 15,
+    });
+    const start = await waitForMediaStart(messages);
+    store.handle({
+      kind: "lease",
+      nonce: startNonce(start),
+      status: 0,
+      mediaKind: 1,
+      leaseId: 78,
+      codec: 1,
+      width: 320,
+      height: 240,
+      fps: 15,
+      initialCredit: 512 * 1024,
+    });
+    await expect(started).resolves.toBeUndefined();
+
+    await vi.advanceTimersByTimeAsync(300);
+    expect(cameraDataMessages(messages).length).toBeGreaterThan(0);
+
+    store.stop("camera");
+    vi.useRealTimers();
   });
 });

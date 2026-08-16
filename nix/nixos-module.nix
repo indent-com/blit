@@ -98,6 +98,39 @@ in
         default = 64000;
         description = "Opus encoder bitrate in bits/sec.";
       };
+
+      realtime = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Enable RTKit, so blit's private PipeWire graph can run its data
+          loop at realtime priority.
+
+          PipeWire asks for <literal>SCHED_FIFO</literal> and carries on
+          without it, silently, so the failure looks like nothing at all
+          until the machine is busy. A desktop session normally supplies
+          the privilege through RTKit; a server started from a socket unit
+          or a development shell has no session, so the audio loop ends up
+          on <literal>SCHED_OTHER</literal> at priority 0 and competes with
+          the compositor and the video encoders it shares a machine with.
+          It then misses its cycle deadline exactly when there is most to
+          do — scrolling a window, resizing, anything that saturates a core
+          — and the gap is cut into the captured audio itself, before any
+          of it is encoded or sent. No client-side jitter buffer can
+          recover audio that was never captured.
+
+          RTKit rather than a raised <literal>rtprio</literal> limit on the
+          unit: rlimits are inherited, and the server spawns the user's
+          shells, so a limit here would hand every process started from a
+          terminal the same ceiling. RTKit grants the priority per thread,
+          to the process that asks, and polices what it hands out — and
+          being a system service it also covers a server run by hand
+          outside systemd, which an rlimit on the unit would not.
+
+          Sets <option>security.rtkit.enable</option>; turn this off if you
+          manage realtime privileges yourself.
+        '';
+      };
     };
 
     gpuLibraries = mkOption {
@@ -273,6 +306,14 @@ in
   };
 
   config = mkIf cfg.enable {
+    # PipeWire's data loop is worthless at SCHED_OTHER on a machine that also
+    # encodes video: it misses its cycle and the gap lands in the captured
+    # audio. `mkDefault` so a host that manages realtime privileges its own
+    # way keeps the last word.
+    security.rtkit.enable = lib.mkIf (cfg.audio.enable && cfg.audio.realtime) (
+      lib.mkDefault true
+    );
+
     systemd.services =
       builtins.listToAttrs (
         map (user: {
@@ -293,12 +334,34 @@ in
                 pkgs.wireplumber
                 pkgs.dbus
               ]
+              # The portal frontend is spawned by name for blit's private bus
+              # (crates/server/src/desktop_bus.rs), and it is unconditional:
+              # the camera and ScreenCast portals are how Firefox and
+              # Chromium find a viewer's camera and answer getDisplayMedia,
+              # neither of which has anything to do with audio forwarding.
+              # This package ships no bin/, so the libexec directory has to
+              # go on PATH directly — listing the package would add an empty
+              # bin/ and the frontend would silently never start.
+              ++ lib.optional pkgs.stdenv.isLinux "${pkgs.xdg-desktop-portal}/libexec"
               ++ cfg.languageServers;
             serviceConfig = {
               Type = "notify";
               User = user;
               WorkingDirectory = "~";
               ExecStart = "${cfg.package}/bin/blit server";
+              # Let PipeWire's module-rt put the graph thread on SCHED_FIFO.
+              #
+              # The audio graph runs a 21 ms cycle and shares this host with
+              # video encoding. Without an RT budget module-rt cannot raise
+              # the thread and falls back to nice — which RLIMIT_NICE of 0
+              # also refuses — so `data-loop.0` runs SCHED_OTHER at nice 0
+              # against the encoder. It then misses cycles under load and
+              # emits audio in bursts: measured 60-110 ms holes with nothing
+              # else on the wire, which no jitter buffer sized for a 20 ms
+              # cadence can absorb. RTKit is the other route and does not
+              # reach this graph, whose PipeWire runs a stripped config.
+              LimitRTPRIO = 95;
+              LimitNICE = "-11";
               Environment =
                 lib.optional (cfg.shell != null) "SHELL=${cfg.shell}"
                 ++ [

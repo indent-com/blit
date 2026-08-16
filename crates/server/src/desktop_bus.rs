@@ -18,6 +18,10 @@ pub struct DesktopBus {
     bridge: Option<blit_desktop::Bridge>,
     portal_child: Option<Child>,
     portal_root: Option<PathBuf>,
+    /// Kept so [`DesktopBus::start_portal`] can spawn the frontend after this
+    /// bus is built, rather than during `spawn`.
+    runtime_dir: PathBuf,
+    display: std::ffi::OsString,
 }
 
 impl DesktopBus {
@@ -119,30 +123,66 @@ impl DesktopBus {
             }
         };
 
-        let (portal_child, portal_root) = if bridge.is_some()
-            && std::env::var("BLIT_PORTALS").map_or(true, |value| value != "0")
-            && find_program("xdg-desktop-portal").is_some()
-        {
-            match spawn_portal_frontend(runtime_dir, display, &address, verbose) {
-                Ok(value) => (Some(value.0), Some(value.1)),
-                Err(error) => {
-                    if verbose {
-                        eprintln!("[portal] {error}");
-                    }
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
-
         Ok(Self {
             child,
             address,
             bridge,
-            portal_child,
-            portal_root,
+            // The frontend is started by `start_portal`, once the caller has
+            // a PipeWire socket to point it at.  See that method.
+            portal_child: None,
+            portal_root: None,
+            runtime_dir: runtime_dir.to_path_buf(),
+            display: display.to_os_string(),
         })
+    }
+
+    /// Start the portal frontend, pointed at `pipewire_remote`.
+    ///
+    /// Deliberately not part of `spawn`. The frontend connects to PipeWire
+    /// exactly once, at its own startup, and if that fails it reports
+    /// `IsCameraPresent = false` and never offers ScreenCast for the rest of
+    /// its life — no retry. blit's PipeWire lives in the audio pipeline, and
+    /// the pipeline can only be built *after* this bus exists because it needs
+    /// the bus address. Spawning the frontend inside `spawn` therefore raced
+    /// the socket it depends on, and won.
+    ///
+    /// The socket also isn't where the frontend would look by itself: it lives
+    /// in the audio pipeline's own directory (`blit-audio-<pid>-<instance>`),
+    /// while XDG_RUNTIME_DIR has to stay pointed at the Wayland socket's
+    /// directory. Without PIPEWIRE_REMOTE the frontend falls back to
+    /// `$XDG_RUNTIME_DIR/pipewire-0` and either finds nothing (a runtime dir
+    /// with no PipeWire of its own, which is the `/tmp` fallback case) or —
+    /// worse, because it is silent — connects to the *host* graph, where the
+    /// camera a browser is sharing into blit does not exist.
+    ///
+    /// `None` when there is no pipeline to point at: the frontend still owns
+    /// FileChooser, OpenURI, Settings and friends, so it is worth having
+    /// without a camera.
+    pub fn start_portal(&mut self, pipewire_remote: Option<&str>, verbose: bool) {
+        if self.portal_child.is_some()
+            || self.bridge.is_none()
+            || std::env::var("BLIT_PORTALS").is_ok_and(|value| value == "0")
+            || find_portal_frontend().is_none()
+        {
+            return;
+        }
+        match spawn_portal_frontend(
+            &self.runtime_dir,
+            &self.display,
+            &self.address,
+            pipewire_remote,
+            verbose,
+        ) {
+            Ok((child, root)) => {
+                self.portal_child = Some(child);
+                self.portal_root = Some(root);
+            }
+            Err(error) => {
+                if verbose {
+                    eprintln!("[portal] {error}");
+                }
+            }
+        }
     }
 
     pub fn address(&self) -> &str {
@@ -203,6 +243,41 @@ fn find_program(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+/// Directories holding the portal frontend on distributions that do not put
+/// it on `PATH` — which is all of them. It is a D-Bus activated service
+/// binary, so nobody is expected to type its name: Fedora and Debian ship it
+/// in `/usr/libexec`, Arch in `/usr/lib`, and the nixpkgs package has no
+/// `bin/` at all. A `PATH` lookup alone therefore finds it almost nowhere,
+/// and the frontend silently never starts — taking the Camera and ScreenCast
+/// portals with it, which is what makes a shared camera invisible to Firefox
+/// and Chromium and drops `getDisplayMedia` back to in-browser tab capture.
+const PORTAL_LIBEXEC_DIRS: &[&str] = &[
+    "/usr/local/libexec",
+    "/usr/libexec",
+    "/usr/local/lib/xdg-desktop-portal",
+    "/usr/lib/xdg-desktop-portal",
+    "/usr/local/lib",
+    "/usr/lib",
+];
+
+/// Locate `xdg-desktop-portal`.
+///
+/// `BLIT_PORTAL_BIN` overrides everything, for an install in an unusual
+/// prefix. Otherwise `PATH` first — a Nix devShell or a systemd unit can put
+/// the libexec directory there — then the conventional locations above.
+fn find_portal_frontend() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("BLIT_PORTAL_BIN") {
+        let path = PathBuf::from(explicit);
+        return path.is_file().then_some(path);
+    }
+    find_program("xdg-desktop-portal").or_else(|| {
+        PORTAL_LIBEXEC_DIRS
+            .iter()
+            .map(|directory| Path::new(directory).join("xdg-desktop-portal"))
+            .find(|path| path.is_file())
+    })
+}
+
 fn take_child_exit(child: &mut Option<Child>) -> bool {
     let exited = child
         .as_mut()
@@ -217,6 +292,7 @@ fn spawn_portal_frontend(
     runtime_dir: &Path,
     display: &std::ffi::OsStr,
     address: &str,
+    pipewire_remote: Option<&str>,
     verbose: bool,
 ) -> Result<(Child, PathBuf), String> {
     let root = runtime_dir.join(format!(
@@ -249,8 +325,19 @@ fn spawn_portal_frontend(
     .map_err(|error| error.to_string())?;
     let config_dirs = prepend_xdg(&config_home, "XDG_CONFIG_DIRS", "/etc/xdg");
     let data_dirs = prepend_xdg(&data_home, "XDG_DATA_DIRS", "/usr/local/share:/usr/share");
+    // Spawn by absolute path: the gate above already resolved it, and on most
+    // distributions the name alone is not on `PATH` to spawn by.
+    let program =
+        find_portal_frontend().ok_or_else(|| "xdg-desktop-portal not found".to_string())?;
     let child = unsafe {
-        Command::new("xdg-desktop-portal")
+        let mut command = Command::new(&program);
+        // Absolute, because XDG_RUNTIME_DIR below has to name the Wayland
+        // socket's directory and the PipeWire socket is not in it. See
+        // `start_portal` for what goes wrong without this.
+        if let Some(remote) = pipewire_remote {
+            command.env("PIPEWIRE_REMOTE", remote);
+        }
+        command
             .env("DBUS_SESSION_BUS_ADDRESS", address)
             .env("XDG_RUNTIME_DIR", runtime_dir)
             .env("WAYLAND_DISPLAY", display)

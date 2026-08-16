@@ -15,6 +15,10 @@ export {
 
 export type { BlitWasmModule } from "./TerminalStore";
 export { AudioPlayer } from "./AudioPlayer";
+export {
+  releaseRecordingAudioSession,
+  retainRecordingAudioSession,
+} from "./audioSession";
 export { NumberRing, SurfaceFrameHistory, SurfaceStore } from "./SurfaceStore";
 export type {
   SurfaceFrameCallback,
@@ -43,6 +47,8 @@ export { WebSocketTransport } from "./transports/websocket";
 export { WebTransportTransport } from "./transports/webtransport";
 export { createShareTransport } from "./transports/webrtc-share";
 export { MuxTransport, MuxChannel } from "./transports/mux";
+export { WorkerMuxTransport } from "./transports/mux-proxy";
+export { createMuxTransport, type AnyMuxTransport } from "./transports/mux-any";
 
 /** TCP and UDP relay (docs/design/net.md). */
 export * from "./net";
@@ -63,6 +69,10 @@ export {
   CLIENT_SUBSCRIPTION_LSP,
   CLIENT_SUBSCRIPTION_KV,
   CLIENT_SUBSCRIPTION_NET,
+  CODEC_SUPPORT_H264,
+  CODEC_SUPPORT_AV1,
+  CODEC_SUPPORT_H264_444,
+  CODEC_SUPPORT_AV1_444,
 } from "./types";
 export type { BlitTransportMessage } from "./types";
 
@@ -189,6 +199,9 @@ export {
   surfaceCanvasForInput,
   detectCodecSupport,
   getCodecSupport,
+  getAllowedCodecSupport,
+  getProbedCodecSupport,
+  setAllowedCodecSupport,
   getMaxDecodeSize,
 } from "./BlitSurfaceCanvas";
 export type {

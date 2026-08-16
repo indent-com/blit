@@ -24,6 +24,9 @@ import {
   BlitWorkspace,
   PALETTES,
   LSP_STATUS_OK,
+  detectCodecSupport,
+  getProbedCodecSupport,
+  setAllowedCodecSupport,
   isIOS,
 } from "@blit-sh/core";
 import type {
@@ -61,6 +64,7 @@ import {
   SURFACE_ZOOM_KEY,
   SURFACE_ZOOM_MODE_KEY,
   SURFACE_TOUCH_MODE_KEY,
+  SURFACE_CODECS_KEY,
   WAYLAND_KEYBOARD_REQUESTS_KEY,
   MIN_SURFACE_ZOOM,
   MAX_SURFACE_ZOOM,
@@ -84,6 +88,7 @@ import {
   preferredSurfaceZoom,
   preferredSurfaceZoomMode,
   preferredSurfaceTouchMode,
+  preferredSurfaceCodecs,
   preferredWaylandKeyboardRequests,
   preferredLeftDockWidth,
   preferredPreviewPanelWidth,
@@ -185,10 +190,10 @@ import { FontOverlay } from "./FontOverlay";
 import { HelpOverlay } from "./HelpOverlay";
 import { LinkOverlay } from "./LinkOverlay";
 import { RemotesOverlay } from "./RemotesOverlay";
-import { ClientsOverlay } from "./ClientsOverlay";
 import { shellCapabilities } from "./shellCapabilities";
 import { RootsOverlay } from "./RootsOverlay";
 import { MediaOverlay } from "./MediaOverlay";
+import { createMediaDevices } from "./mediaDevices";
 import { BSPContainer, EmptyPane } from "./bsp/BSPContainer";
 import { WebOverlay } from "./WebOverlay";
 import type { WebPaneHandle } from "./WebPane";
@@ -251,7 +256,6 @@ export type Overlay =
   | "font"
   | "help"
   | "remotes"
-  | "clients"
   | "roots"
   | "media"
   | "web"
@@ -479,6 +483,23 @@ function WorkspaceScreen(props: {
   /** All connections from snapshot. */
   const allConnections = () => wsState().connections;
 
+  // Viewer camera/microphone/screen sharing. Owned here, not by the media
+  // panel: the capability advertisement and the encoder probes have to run
+  // whether or not the panel is open, and the status bar reads the same
+  // state to decide whether to light its media glyph.
+  const mediaDevices = createMediaDevices({
+    workspace,
+    get connections() {
+      return allConnections();
+    },
+    get connectionLabels() {
+      return connectionLabels();
+    },
+    get readOnlyConnections() {
+      return readOnlyConnections();
+    },
+  });
+
   const [surfaces, setSurfaces] = createSignal<BlitSurface[]>([]);
 
   // Per-surface signature of the fields that drive the thumbnail UI
@@ -660,6 +681,27 @@ function WorkspaceScreen(props: {
   const [waylandKeyboardRequests, setWaylandKeyboardRequests] = createSignal(
     preferredWaylandKeyboardRequests(),
   );
+  // Applied to the core's cached probe result up front, so the very first
+  // C2S_CLIENT_FEATURES already carries the preference instead of advertising
+  // everything and correcting itself a moment later.
+  const [surfaceCodecs, setSurfaceCodecs] = createSignal(
+    preferredSurfaceCodecs(),
+  );
+  setAllowedCodecSupport(surfaceCodecs());
+  const [probedSurfaceCodecs, setProbedSurfaceCodecs] = createSignal(
+    getProbedCodecSupport(),
+  );
+  // The media panel can only offer codecs the decode probe confirmed, and on
+  // a terminal-only workspace nothing else ever runs it — a surface view does
+  // it on mount. Kicked when the panel opens rather than at startup, since
+  // the probe instantiates real decoders. The promise is cached, so a page
+  // that already probed answers immediately.
+  createEffect(() => {
+    if (overlay() !== "media" || probedSurfaceCodecs()) return;
+    void detectCodecSupport().then(() =>
+      setProbedSurfaceCodecs(getProbedCodecSupport()),
+    );
+  });
   // Panel chrome in the URL hash (d= open side panels, x= expanded left-dock
   // sections) is authoritative when present; absent keys fall back to
   // localStorage/defaults. Parsed once up front — the focus params (s=/t=)
@@ -1538,10 +1580,18 @@ function WorkspaceScreen(props: {
   }
 
   // Restore surface focus from hash once the surface actually exists (one-shot).
+  // Only into the single main view: under a multi-pane layout the surface is
+  // placed by `a=` instead, and filling the non-BSP slot with it would leave a
+  // focused surface nothing renders — which every shortcut gated on
+  // hasFocusedWaylandSurface would then obey for the rest of the session.
   if (pendingSurfaceFromHash != null) {
     let surfaceRestored = false;
     createEffect(() => {
       if (surfaceRestored) return;
+      if (inBsp()) {
+        surfaceRestored = true;
+        return;
+      }
       const ss = surfaces();
       if (
         ss.some(
@@ -2651,6 +2701,24 @@ function WorkspaceScreen(props: {
    *  hidden when nothing is parked, which is precisely when a drag most needs
    *  it. Depth-counted: dragenter/dragleave fire per element crossed. */
   const [paneDragActive, setPaneDragActive] = createSignal(false);
+
+  /**
+   * Whether the preview panel is on screen — and so whether its thumbnails
+   * exist to be watched.
+   *
+   * Both the panel's own `<Show>` and the parked sessions' stream
+   * subscriptions read this, because they have to agree: a parked pty whose
+   * thumbnail is not rendered would otherwise keep pushing `S2C_UPDATE`
+   * frames at a panel nobody can see. A grip drag reveals the panel even when
+   * it is empty or toggled off — it is the drop-to-park target, and "nothing
+   * parked yet" is exactly when a drag needs somewhere to park.
+   */
+  const previewPanelVisible = () =>
+    paneDragActive() ||
+    (previewPanelOpen() &&
+      (offScreenSessions().length > 0 ||
+        offScreenSurfaces().length > 0 ||
+        backgroundTiles().length > 0));
   let paneDragDepth = 0;
   const paneDragEnter = (e: DragEvent) => {
     if (!isPaneDrag(e)) return;
@@ -2990,7 +3058,10 @@ function WorkspaceScreen(props: {
     const desired = new Set<SessionId>();
     const fid = wsState().focusedSessionId;
     if (fid) desired.add(fid);
-    for (const s of offScreenSessions()) desired.add(s.id);
+    // Parked terminals are watched only while their thumbnails are rendered.
+    if (previewPanelVisible()) {
+      for (const s of offScreenSessions()) desired.add(s.id);
+    }
     if (ov === "expose") {
       for (const session of sessions()) {
         if (session.state !== "closed") desired.add(session.id);
@@ -3372,6 +3443,18 @@ function WorkspaceScreen(props: {
     writeStorage(SURFACE_MAX_FPS_KEY, String(maxFps));
   }
 
+  /** Narrow which codecs this device accepts for surface video, then make
+   *  every live stream honour it: the mask rides C2S_CLIENT_FEATURES, and the
+   *  server only reconsiders its encoder on a resubscribe. */
+  function changeSurfaceCodecs(mask: number) {
+    setSurfaceCodecs(mask);
+    writeStorage(SURFACE_CODECS_KEY, String(mask));
+    setAllowedCodecSupport(mask);
+    for (const snap of allConnections()) {
+      workspace.getConnection(snap.id)?.refreshCodecSupport();
+    }
+  }
+
   /** Every resizable surface view re-derives the scale it asks the compositor
    *  for, so there is nothing to push to the connections here. */
   function changeSurfaceZoom(percent: number) {
@@ -3483,6 +3566,15 @@ function WorkspaceScreen(props: {
     setLayoutAssignments(null);
     setActiveLayout(null);
   }
+
+  /** The mirror of exitBspLayout. Under a layout the panes own what is on
+   *  screen, so the single-view surface slot describes nothing — and entering
+   *  BSP never placed the focused surface in a pane, it simply stopped
+   *  rendering it. Leaving the slot set kept a phantom `s=` in the URL and
+   *  handed every consumer of "is a surface focused" the wrong answer. */
+  createEffect(() => {
+    if (inBsp()) focusSurfaceById(null);
+  });
 
   function switchSession(sessionId: SessionId) {
     focusSessionFromUi(sessionId);
@@ -3710,6 +3802,7 @@ function WorkspaceScreen(props: {
     workspace,
     overlay,
     activeLayout,
+    inBsp,
     bspFocusedPaneId,
     layoutAssignments,
     focusedSession,
@@ -4007,6 +4100,12 @@ function WorkspaceScreen(props: {
     const written = new Set(parts.map((p) => p.slice(0, p.indexOf("="))));
     written.add("l");
     if (paneId) written.add("p");
+    // `s=` is recomputed every write, like `l=`: claiming it unconditionally is
+    // what lets "no surface focused" actually erase the key. Deriving ownership
+    // from `parts` alone made it write-once — a surface focused a single time
+    // stayed in the URL forever, re-arming focusedSurfaceId on every load and
+    // (via loadActiveLayout) blocking the stored layout from seeding at all.
+    written.add("s");
     // Guarded on `la` as well as `resolved`, matching the push above: the
     // strip set says "this run owns these keys", so claiming `a` without
     // having written one deletes the existing assignments instead of
@@ -4482,7 +4581,11 @@ function WorkspaceScreen(props: {
                       (s) => `${s.connectionId}:${s.surfaceId}`,
                     )}
                     manageVisibility={overlay() !== "expose"}
-                    extraVisibleSessions={offScreenSessions().map((s) => s.id)}
+                    extraVisibleSessions={
+                      previewPanelVisible()
+                        ? offScreenSessions().map((s) => s.id)
+                        : []
+                    }
                     onAssignmentsChange={setLayoutAssignments}
                     onAssignmentsResolved={setAssignmentsResolved}
                     onFocusSession={(id) => workspace.focusSession(id)}
@@ -4534,18 +4637,7 @@ function WorkspaceScreen(props: {
               </Show>
             </div>
           </div>
-          <Show
-            when={
-              // A grip drag reveals the dock even when it is empty or toggled
-              // off: it is the drop-to-park target, and "nothing parked yet"
-              // is exactly when a drag needs somewhere to park.
-              paneDragActive() ||
-              (previewPanelOpen() &&
-                (offScreenSessions().length > 0 ||
-                  offScreenSurfaces().length > 0 ||
-                  backgroundTiles().length > 0))
-            }
-          >
+          <Show when={previewPanelVisible()}>
             <PreviewPanel
               parkDropActive={paneDragActive()}
               onParkDrop={parkDraggedAssignment}
@@ -4761,23 +4853,6 @@ function WorkspaceScreen(props: {
               }}
               recentLayouts={recentLayouts()}
               presetLayouts={PRESETS}
-              onChangeFont={() => toggleOverlay("font")}
-              onChangePalette={() => toggleOverlay("palette")}
-              onChangeRemotes={
-                shellCapabilities().remotes
-                  ? () => toggleOverlay("remotes")
-                  : undefined
-              }
-              onManageClients={
-                allConnections().some(
-                  (candidate) =>
-                    candidate.supportsClientControl &&
-                    !readOnlyConnections().has(candidate.id),
-                )
-                  ? () => toggleOverlay("clients")
-                  : undefined
-              }
-              onChangeRoots={() => toggleOverlay("roots")}
               onOpenWeb={() => toggleOverlay("web")}
               onOpenSearch={() => {
                 // Null first: closeOverlay restores previousFocus (the
@@ -4951,21 +5026,13 @@ function WorkspaceScreen(props: {
               onReorder={(names) => reorderRemotes(names)}
               onReconnect={(name) => workspace.reconnectConnection(name)}
               onClose={closeOverlay}
+              connections={allConnections()}
+              workspace={workspace}
+              sessions={wsState().sessions}
+              surfaces={surfaces()}
+              readOnlyConnections={readOnlyConnections()}
             />
           )}
-        </Show>
-        <Show when={overlay() === "clients"}>
-          <ClientsOverlay
-            workspace={workspace}
-            connections={allConnections()}
-            sessions={wsState().sessions}
-            surfaces={surfaces()}
-            connectionLabels={connectionLabels()}
-            readOnlyConnections={readOnlyConnections()}
-            palette={palette()}
-            fontSize={fontSize()}
-            onClose={closeOverlay}
-          />
         </Show>
         <Show when={overlay() === "web"}>
           <WebOverlay
@@ -5073,6 +5140,10 @@ function WorkspaceScreen(props: {
                 (connection) => connection.supportsSurfaceTouch,
               )}
               waylandKeyboardRequests={waylandKeyboardRequests()}
+              devices={mediaDevices}
+              surfaceCodecs={surfaceCodecs()}
+              probedSurfaceCodecs={probedSurfaceCodecs()}
+              onSurfaceCodecsChange={changeSurfaceCodecs}
               onAudioBitrateChange={changeAudioBitrate}
               onVideoBandwidthChange={changeVideoBandwidth}
               onVideoSpeedChange={changeVideoSpeed}
@@ -5185,7 +5256,6 @@ function WorkspaceScreen(props: {
             onFont={() => toggleOverlay("font")}
             audioMuted={audioMuted()}
             audioAvailable={allConnections().some((c) => c.supportsAudio)}
-            hasSurfaces={surfaces().length > 0}
             isMobileTouch={isMobileTouch()}
             // The icon and the toggle agree: lit means a keyboard input panel
             // is genuinely up, including the iPadOS shortcut bar.
@@ -5774,6 +5844,25 @@ function SurfaceThumbnail(props: {
           style={{
             display: "block",
             width: "100%",
+            // The window's own aspect, *not* the canvas's. A card whose height
+            // came from the canvas closed a loop: the height is what
+            // BlitSurfaceCanvas measures into `_presentBox` to pick an encode
+            // size, and the encode size is what sizes the canvas. So a card
+            // whose height landed on an octave boundary (≈2^k/aspect: 113,
+            // 227, 455 px wide at 16:9) asked for 256x128, got a 128-tall
+            // stream, grew to 128.6, asked for 256x256, got a 144-tall
+            // stream, shrank to 127.7, and repeated at ~16Hz. Each turn
+            // retires and rebuilds a hardware encoder; a few hundred of those
+            // segfaults the NVIDIA encode library and takes the server down.
+            //
+            // Before the first surface info both dimensions are 0; leave the
+            // ratio off rather than emit a degenerate one, and the card is
+            // laid out by the 640x480 placeholder canvas for that one frame.
+            ...(props.surface.width > 0 && props.surface.height > 0
+              ? {
+                  "aspect-ratio": `${props.surface.width} / ${props.surface.height}`,
+                }
+              : {}),
             height: "auto",
             "object-fit": "contain",
           }}
