@@ -18,8 +18,10 @@ import type { BlitConnection } from "./BlitConnection";
 import type {
   RemoteSurfaceInput,
   SurfaceCursorImage,
+  SurfaceCursorRect,
   SurfaceTextInputEvent,
 } from "./SurfaceStore";
+import { placeImeTarget } from "./imeTarget";
 import { av1LevelString } from "./videoCodec";
 import {
   SURFACE_POINTER_DOWN,
@@ -1396,6 +1398,11 @@ export class BlitSurfaceCanvas {
 
   /** Hidden textarea used as the editable keyboard and IME target. */
   private textInput: HTMLTextAreaElement | null = null;
+  /** Where the app says it is drawing the text under edit, in surface
+   *  pixels, from `zwp_text_input_v3.set_cursor_rectangle`.  The capture
+   *  textarea is parked over it so the host IME's candidate window opens at
+   *  the app's own caret. */
+  private textInputCursorRect: SurfaceCursorRect | null = null;
   /** Keep the iOS capture field non-empty so a held soft-keyboard Backspace
    *  continues producing deleteContentBackward events. */
   private _iosInputPad = detectIOS();
@@ -1592,9 +1599,11 @@ export class BlitSurfaceCanvas {
     canvas.width = this.surface?.width || 640;
     canvas.height = this.surface?.height || 480;
     // Hidden textarea for capturing IME composition and properly-shifted
-    // characters.  1px and transparent at the screen's top-left corner
-    // (z-index -1 keeps it out of hit-testing).  Receives focus and
-    // keyboard events.
+    // characters.  1px and transparent (z-index -1 keeps it out of
+    // hit-testing).  Receives focus and keyboard events, and — while
+    // focused, and while the app has told us where its caret is —
+    // `syncImeTarget` walks it onto that caret so the host IME's candidate
+    // window opens over the app's own text.
     const ta = document.createElement("textarea");
     ta.autocomplete = "off";
     ta.setAttribute("autocorrect", "off");
@@ -1605,9 +1614,10 @@ export class BlitSurfaceCanvas {
     // stay up for it) and the inputmode stamping covers it.
     ta.setAttribute("aria-label", "Surface input");
     ta.tabIndex = -1;
-    // Fixed at the top of the screen, for the same reason as the terminal's
-    // textarea (see BlitTerminalSurface): an assist target iPadOS can
-    // always keep clear of the keyboard, whatever the pane's position.
+    // Fixed to the screen, for the same reason as the terminal's textarea
+    // (see BlitTerminalSurface): the corner it rests in whenever there is no
+    // caret to point at is an assist target iPadOS can always keep clear of
+    // the keyboard, whatever the pane's position.
     ta.style.position = "fixed";
     ta.style.left = "0";
     ta.style.top = "0";
@@ -2060,6 +2070,14 @@ export class BlitSurfaceCanvas {
   }
 
   private applyLayout(): void {
+    this.layoutCanvasBox();
+    // The IME capture element is placed in client coordinates, so every box
+    // move invalidates it — and this runs on each drawn frame, which is the
+    // only notification a pane being dragged or resized gives us.
+    this.syncImeTarget();
+  }
+
+  private layoutCanvasBox(): void {
     const canvas = this.canvas;
     if (!canvas) return;
     const remotePointerSvg = this.remotePointerSvg;
@@ -3038,9 +3056,51 @@ export class BlitSurfaceCanvas {
     target?.focus({ preventScroll: true });
   }
 
+  /**
+   * Park the hidden capture textarea over the app's own caret, so the host
+   * IME's candidate window opens where the text is going instead of in the
+   * corner of the screen.
+   *
+   * Only the focused view is worth placing — no other one hosts a
+   * composition — and everything else goes back to the corner, where a
+   * software keyboard can never cover it.
+   */
+  private syncImeTarget(): void {
+    const ta = this.textInput;
+    if (!ta) return;
+    const rect = this.textInputCursorRect;
+    if (
+      !rect ||
+      typeof document === "undefined" ||
+      document.activeElement !== ta
+    ) {
+      placeImeTarget(ta, null);
+      return;
+    }
+    const g = this.drawnGeometry();
+    if (!g) {
+      placeImeTarget(ta, null);
+      return;
+    }
+    // Surface pixels to CSS pixels: the inverse of the pointer path, so the
+    // caret lands where a click on the same spot would.
+    placeImeTarget(ta, {
+      left: g.rect.left + g.dx + rect.x / g.sx,
+      top: g.rect.top + g.dy + rect.y / g.sy,
+      height: rect.height / g.sy,
+    });
+  }
+
   private applyTextInputState(state: SurfaceTextInputEvent): void {
     const ta = this.textInput;
     if (!ta) return;
+
+    // A disabled input has no caret, and an enable resets the rectangle
+    // until the app names a new one.
+    this.textInputCursorRect = state.enabled
+      ? (state.cursorRect ?? null)
+      : null;
+    this.syncImeTarget();
 
     if (state.enabled) {
       const inputMode = inputModeForContentPurpose(state.purpose);
@@ -4999,6 +5059,9 @@ export class BlitSurfaceCanvas {
     const to = e.relatedTarget;
     if (to && (to === this.canvas || to === this.textInput)) return;
     this.compositionActive = false;
+    // Nothing composes here now, and a capture element left over the app's
+    // caret is one a software keyboard can cover.
+    if (this.textInput) placeImeTarget(this.textInput, null);
     // Focus genuinely leaving mid-paste-chord is the one thing no
     // clipboard read or paste event will ever settle: stand the chord
     // down (its V was never pressed) before releasing what is held.
@@ -5104,7 +5167,12 @@ export class BlitSurfaceCanvas {
       // Its own focus event sends the surface focus — one message, not two.
       return;
     }
-    if (e.target === this.textInput) this.seedIOSInputPad();
+    if (e.target === this.textInput) {
+      this.seedIOSInputPad();
+      // Focus is what makes the placement matter, and an idle app draws no
+      // frame to carry it — place it now rather than at the next commit.
+      this.syncImeTarget();
+    }
     const conn = this.getConn();
     if (!conn || !this.surface || !this._displaySize) return;
     conn.sendSurfaceFocus(this._surfaceId);

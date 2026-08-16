@@ -356,6 +356,7 @@ describe("BlitConnection", () => {
         enabled: true,
         hint: 0x204,
         purpose: 6,
+        cursorRect: null,
       });
       expect(events).toEqual([
         {
@@ -365,9 +366,33 @@ describe("BlitConnection", () => {
             requested: true,
             hint: 0x204,
             purpose: 6,
+            cursorRect: null,
           },
         },
       ]);
+
+      // The caret rectangle is an optional tail: a server that sends one
+      // must not disturb anything else, and the view uses it to park the
+      // IME capture element on the app's own caret.
+      const withRect = new Uint8Array(20);
+      const rectView = new DataView(withRect.buffer);
+      withRect[0] = S2C_SURFACE_TEXT_INPUT;
+      rectView.setUint16(1, 7, true);
+      withRect[3] = SURFACE_TEXT_INPUT_ENABLED;
+      rectView.setUint32(4, 0x204, true);
+      rectView.setUint32(8, 6, true);
+      rectView.setInt16(12, -3, true);
+      rectView.setInt16(14, 240, true);
+      rectView.setInt16(16, 2, true);
+      rectView.setInt16(18, 19, true);
+      transport.push(withRect);
+
+      expect(conn.surfaceStore.getTextInput(7)?.cursorRect).toEqual({
+        x: -3,
+        y: 240,
+        width: 2,
+        height: 19,
+      });
 
       transport.push(
         new Uint8Array([
@@ -388,7 +413,13 @@ describe("BlitConnection", () => {
       expect(conn.surfaceStore.getTextInput(7)).toBeNull();
       expect(events.at(-1)).toEqual({
         surfaceId: 7,
-        state: { enabled: false, requested: false, hint: 0, purpose: 0 },
+        state: {
+          enabled: false,
+          requested: false,
+          hint: 0,
+          purpose: 0,
+          cursorRect: null,
+        },
       });
     } finally {
       unsubscribe();

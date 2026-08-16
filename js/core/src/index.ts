@@ -28,6 +28,7 @@ export type {
   RemoteSurfaceInput,
   RemoteSurfacePointer,
   SurfaceCursorImage,
+  SurfaceCursorRect,
   SurfaceTextInputEvent,
   SurfaceTextInputState,
 } from "./SurfaceStore";

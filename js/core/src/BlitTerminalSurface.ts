@@ -10,6 +10,8 @@ import { keyToBytes, ctrlCharToByte, encoder } from "./keyboard";
 import { MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE } from "./protocol";
 import { assessUrl, openUrlSafely, type UrlAssessment } from "./urlSecurity";
 import { devicePixelBox, drawHalved, halve, halvings } from "./downscale";
+import { gridCaretRect, placeChip, placeImeTarget } from "./imeTarget";
+import { captureDelta } from "./prediction";
 import { WheelDetents } from "./wheel";
 
 /** One screen row's slice of a hyperlink's extent, inclusive of both columns. */
@@ -148,6 +150,47 @@ function isIOS(): boolean {
 
 export { isIOS };
 
+/**
+ * True on desktop macOS, the only platform whose host text predictor we want
+ * driving a terminal.
+ *
+ * iOS/iPadOS are deliberately excluded: their keyboards deliver autocorrect
+ * substitutions through the same channel, and rewriting text already sent to
+ * a shell is exactly what `autocorrect="off"` is there to prevent.  Android
+ * has its own composition-streaming path.
+ */
+function isMacDesktop(): boolean {
+  if (typeof navigator === "undefined") return false;
+  if (isIOS() || isAndroid()) return false;
+  // `navigator.platform` alone is not enough: it is deprecated, and browsers
+  // that resist fingerprinting (Brave) may hand back something else entirely.
+  // Same three-source ladder as `detectMacOptionChars` in BlitSurfaceCanvas.
+  const nav = navigator as Navigator & {
+    userAgentData?: { platform?: string };
+  };
+  const platform = (
+    nav.userAgentData?.platform ??
+    nav.platform ??
+    ""
+  ).toLowerCase();
+  if (platform) return platform.startsWith("mac");
+  return /mac/.test((nav.userAgent ?? "").toLowerCase());
+}
+
+/** `localStorage["blit.textPrediction"]` = "on"/"off" forces the feature
+ *  either way: a kill switch for a change that sits in the typing path, and
+ *  the only way to exercise it off a Mac. */
+function predictionOverride(): boolean | null {
+  try {
+    const v = globalThis.localStorage?.getItem("blit.textPrediction");
+    if (v === "on") return true;
+    if (v === "off") return false;
+  } catch {
+    // Storage can be denied outright (private mode, third-party frame).
+  }
+  return null;
+}
+
 // iOS soft keyboards only auto-repeat Backspace while the focused field still
 // has content to delete.  The hidden capture textarea is otherwise empty, so a
 // held Backspace fires a single deleteContentBackward and stops.  We keep the
@@ -285,6 +328,10 @@ export class BlitTerminalSurface {
   private _cols = 80;
   private contentDirty = true;
   private lastOffset = 0;
+  /** Device-pixel offset of the grid inside the canvas, from `lastOffset`'s
+   *  packing — the IME capture element is placed against it. */
+  private renderOffsetX = 0;
+  private renderOffsetY = 0;
   /** Last composited device pixel size, used to detect resizes and schedule a
    *  one-frame catch-up render on the WebGPU backend (see doRender). */
   private lastRenderedPw = 0;
@@ -351,6 +398,26 @@ export class BlitTerminalSurface {
   private predicted = "";
   private predictedFromRow = 0;
   private predictedFromCol = 0;
+
+  // --- host text prediction (macOS inline predictive text) ---
+  /** Platform gate, fixed at mount: whether the capture field is allowed to
+   *  accumulate the line so the host can predict against it. */
+  private _predictionCapture = false;
+  /** The part of the capture field already forwarded to the pty.  Everything
+   *  the field holds beyond this is either untyped proposal or a delta still
+   *  to send; see `prediction.ts`. */
+  private _mirror = "";
+  /** What the chip is showing: an IME composition being built, or a tail the
+   *  host is proposing.  "" when there is nothing to show. */
+  private _chipText = "";
+  private _chipKind: "composition" | "suggestion" = "composition";
+  /** Floating chip beside the terminal cursor.
+   *
+   *  Neither kind of text can be drawn into the grid: those cells belong to
+   *  the app, which is painting its own output (and, at a fish prompt, its
+   *  own autosuggestion) into them.  A composition is not the app's text
+   *  either — it is not text at all until it is committed. */
+  private chipEl: HTMLDivElement | null = null;
 
   private disposed = false;
   private _ctrlModifier = false;
@@ -457,6 +524,11 @@ export class BlitTerminalSurface {
     this.inputEl?.focus();
     // Re-seed the iOS Backspace-repeat filler in case the field was cleared.
     this.seedIosPad();
+    // An idle pane renders nothing, and the capture element is only moved
+    // onto the cursor from the render path — without this it would sit in
+    // the corner until the first keystroke, which is one composition too
+    // late for the IME popup.
+    this.scheduleRender();
   }
 
   /** Fill the hidden textarea with the NBSP filler buffer and park the cursor
@@ -857,9 +929,22 @@ export class BlitTerminalSurface {
     this.inputEl.setAttribute("aria-label", "Terminal input");
     this.inputEl.setAttribute("autocapitalize", "off");
     this.inputEl.setAttribute("autocomplete", "off");
-    this.inputEl.setAttribute("autocorrect", "off");
     this.inputEl.setAttribute("spellcheck", "false");
     this.inputEl.setAttribute("tabindex", "0");
+    // Text prediction is gated on autocorrect being on, so the terminal's
+    // blanket "off" has to become a platform split: on macOS the field
+    // accumulates the line and the host predicts against it (the delta
+    // forwarding in `prediction.ts` is what keeps a substitution from
+    // rewriting text the pty already has), everywhere else — iPadOS above
+    // all — nothing changes.
+    this._predictionCapture =
+      !this._readOnly && (predictionOverride() ?? isMacDesktop());
+    if (this._predictionCapture) {
+      this.inputEl.setAttribute("autocorrect", "on");
+      this.inputEl.setAttribute("writingsuggestions", "true");
+    } else {
+      this.inputEl.setAttribute("autocorrect", "off");
+    }
     if (this._readOnly) this.inputEl.setAttribute("readonly", "");
     // Give each textarea a name so browsers don't flag it as an
     // anonymous form field (Chrome DevTools "Issues" warning).
@@ -868,10 +953,13 @@ export class BlitTerminalSurface {
       `blit-input-${this._sessionId ?? `anon-${++surfaceCounter}`}`,
     );
     Object.assign(this.inputEl.style, {
-      // Fixed at the top of the screen, not of the pane: an assist target
-      // iPadOS can always keep clear of the software keyboard, so no reveal
-      // pan is ever needed on focus — whatever the pane's position in a
-      // split.  When <main> is pinned and transformed (keyboard up), fixed
+      // Fixed to the screen, not to the pane: `syncImeTarget` walks it onto
+      // the terminal cursor so the host IME's candidate window opens at the
+      // cell being typed into, and client coordinates are what that costs
+      // least to express.  The corner it starts in is also where it returns
+      // whenever there is no cursor to point at: an assist target there can
+      // never end up under a software keyboard, so iPadOS needs no reveal
+      // pan.  When <main> is pinned and transformed (keyboard up), fixed
       // resolves against it, and its top is the screen's top either way.
       position: "fixed",
       opacity: "0",
@@ -884,9 +972,52 @@ export class BlitTerminalSurface {
       outline: "none",
       resize: "none",
       overflow: "hidden",
+      // It now sits over the canvas, and it is invisible: nothing about it
+      // should answer a click.  Focus is only ever given programmatically.
+      pointerEvents: "none",
+    });
+    // A pane that loses focus renders no more frames, so the element would
+    // stay parked over a cursor nobody is typing at — and under the software
+    // keyboard, on a phone.
+    this.inputEl.addEventListener("blur", () => {
+      if (this.inputEl) placeImeTarget(this.inputEl, null);
+      // The line the field was mirroring is no longer the line being typed.
+      this.resetPrediction();
     });
     container.appendChild(this.inputEl);
     terminalSurfaceByInput.set(this.inputEl, this);
+
+    // Every writable terminal gets a chip: a composition needs drawing on
+    // every platform and in every engine, whatever the host's predictor can
+    // or cannot do.
+    if (!this._readOnly) {
+      this.chipEl = document.createElement("div");
+      this.chipEl.setAttribute("aria-hidden", "true");
+      this.chipEl.setAttribute("data-blit-suggestion", "");
+      Object.assign(this.chipEl.style, {
+        // Fixed for the same reason as the capture element: it is placed
+        // against a caret expressed in client coordinates.
+        position: "fixed",
+        display: "none",
+        left: "0",
+        top: "0",
+        // Room to be read, and to wrap rather than ellipsize: a composition
+        // is the only place the text being assembled is visible at all, so
+        // cutting it off defeats the point.  It floats over the grid, so
+        // spilling onto a second line costs nothing but pixels.
+        maxWidth: "min(80ch, 90vw)",
+        boxSizing: "border-box",
+        padding: "1px 6px",
+        borderRadius: "5px",
+        whiteSpace: "pre-wrap",
+        overflowWrap: "anywhere",
+        pointerEvents: "none",
+        zIndex: "6",
+        opacity: "0.85",
+      });
+      container.appendChild(this.chipEl);
+      this.styleChip();
+    }
 
     // Native scroll surface — sits over the canvas, captures all pointer/
     // wheel/touch input, and lets the browser handle scrollback navigation
@@ -972,10 +1103,16 @@ export class BlitTerminalSurface {
         this.container.removeChild(this.inputEl);
       }
     }
+    if (this.chipEl && this.container?.contains(this.chipEl)) {
+      this.container.removeChild(this.chipEl);
+    }
     if (this.scrollEl && this.container?.contains(this.scrollEl)) {
       this.container.removeChild(this.scrollEl);
     }
     this.glCanvas = null;
+    this.chipEl = null;
+    this._mirror = "";
+    this._chipText = "";
     this.inputEl = null;
     this.scrollEl = null;
     this.scrollSpacer = null;
@@ -1014,6 +1151,8 @@ export class BlitTerminalSurface {
 
   setSessionId(id: SessionId | null): void {
     if (this._sessionId === id) return;
+    // Whatever the field was mirroring belonged to the session being left.
+    this.resetPrediction();
     this.teardownDirtyListener();
     this.teardownTerminal();
     this.teardownResizeObserver();
@@ -1803,6 +1942,8 @@ export class BlitTerminalSurface {
       const xOff = Math.max(0, Math.floor((pw - gridW) / 2));
       const yOff = Math.max(0, Math.floor((ph - gridH) / 2));
       const combined = xOff * 65536 + yOff;
+      this.renderOffsetX = xOff;
+      this.renderOffsetY = yOff;
       if (combined !== this.lastOffset) {
         this.lastOffset = combined;
         t.set_render_offset(xOff, yOff);
@@ -1856,6 +1997,8 @@ export class BlitTerminalSurface {
       this._palette?.bg ?? [0, 0, 0],
       this._showCursor,
     );
+
+    this.syncImeTarget(cell, effectiveCursorCol, effectiveCursorRow);
 
     // Copy GL to display canvas, then draw overlay content on top. This runs
     // synchronously right after render(), so each surface composites its own
@@ -1941,6 +2084,55 @@ export class BlitTerminalSurface {
     // updates to a crawl.
     conn.noteFrameRendered();
     this._onRender?.(performance.now() - t0);
+  }
+
+  /**
+   * Park the hidden capture textarea over the terminal's own cursor, so the
+   * host IME opens its candidate window at the cell being typed into rather
+   * than in the corner of the screen.
+   *
+   * Only the focused pane's element is worth placing — an unfocused one hosts
+   * no composition — and an unfocused one goes back to the corner, which is
+   * where a software keyboard can never cover it.  While the view is scrolled
+   * back the cursor is not the thing on screen, so the corner stands in until
+   * the next keystroke snaps the viewport back to it.
+   */
+  private syncImeTarget(cell: CellMetrics, col: number, row: number): void {
+    const el = this.inputEl;
+    const canvas = this.glCanvas;
+    if (!el || !canvas) return;
+    if (
+      typeof document === "undefined" ||
+      document.activeElement !== el ||
+      this.scrollOffset > 0 ||
+      cell.pw <= 0 ||
+      cell.ph <= 0
+    ) {
+      placeImeTarget(el, null);
+      if (this.chipEl && this.chipEl.style.display !== "none") {
+        this.chipEl.style.display = "none";
+      }
+      return;
+    }
+    const rect = canvas.getBoundingClientRect();
+    const caret = gridCaretRect(
+      rect,
+      cell,
+      { x: this.renderOffsetX, y: this.renderOffsetY },
+      col,
+      row,
+    );
+    placeImeTarget(el, caret);
+    // The chip goes beside the same caret, one line down — the cells to the
+    // right of the cursor are the shell's to draw in.
+    const chip = this.chipEl;
+    if (chip && this._chipText) {
+      if (chip.style.display === "none") chip.style.display = "block";
+      placeChip(chip, caret, {
+        width: chip.offsetWidth,
+        height: chip.offsetHeight,
+      });
+    }
   }
 
   // --- Overlay drawing helpers ---
@@ -2117,7 +2309,175 @@ export class BlitTerminalSurface {
       this.predictedFromCol = cc;
     } else if (advance < 0 || advance > this.predicted.length) {
       this.predicted = "";
+      // The cursor went somewhere the keys we forwarded cannot explain: the
+      // app redrew the line (history recall, a completion, a wrap).  What the
+      // capture field holds is no longer what the app is editing.
+      this.resetPrediction();
     }
+  }
+
+  // --- Host text prediction ---
+
+  /**
+   * Whether the capture field should be accumulating the line right now.
+   *
+   * The question is whether keys are *text* or *commands*, and the alternate
+   * screen is what answers it: editors, pagers and full-screen TUIs switch to
+   * it, prompts do not.
+   *
+   * `echo`/`icanon` look like the obvious test and are exactly backwards.
+   * Every interactive shell turns canonical mode off to do its own line
+   * editing, so a fish/bash/zsh prompt — the one place text prediction
+   * belongs — reports `-icanon -echo`, while `cat` reports cooked.  Gating on
+   * them meant the feature engaged nowhere a human types.
+   */
+  private predictionActive(): boolean {
+    if (!this._predictionCapture || this._readOnly) return false;
+    const t = this.terminal;
+    return !!t && !t.alt_screen();
+  }
+
+  /** Match the chip to the terminal's own font and palette. */
+  private styleChip(): void {
+    const chip = this.chipEl;
+    if (!chip) return;
+    const [fR, fG, fB] = this._palette?.fg ?? [204, 204, 204];
+    const [bR, bG, bB] = this._palette?.bg ?? [0, 0, 0];
+    chip.style.font = `${this._fontSize}px ${cssFontFamily(this._fontFamily)}`;
+    chip.style.color = `rgb(${fR},${fG},${fB})`;
+    chip.style.background = `rgba(${bR},${bG},${bB},0.92)`;
+    chip.style.border = `1px solid rgba(${fR},${fG},${fB},0.35)`;
+  }
+
+  /**
+   * Forget the line: empty the capture field, drop the mirror, hide the chip.
+   *
+   * Called wherever the field would start lying about what the app is
+   * editing — a key we forward ourselves, a paste, focus loss, a cursor jump.
+   * The cost of resetting when we needn't is one missed prediction; the cost
+   * of not resetting when we should is bytes sent twice.
+   */
+  private resetPrediction(): void {
+    this._mirror = "";
+    if (this._chipText) {
+      this._chipText = "";
+      this.updateChip();
+    }
+    if (this.inputEl && this.inputEl.value) this.resetCaptureField();
+  }
+
+  /**
+   * Reconcile the capture field against the mirror and forward the delta.
+   *
+   * Idempotent by construction — a second call with the field unchanged
+   * computes an empty append — which is what makes it safe to drive from
+   * both `compositionend` and the `input` event that follows it, in whichever
+   * order a given engine emits them.
+   */
+  private syncPredictionFromField(inputType: string): void {
+    const input = this.inputEl;
+    if (!input) return;
+    const delta = captureDelta(this._mirror, {
+      value: input.value,
+      selectionStart: input.selectionStart ?? input.value.length,
+      selectionEnd: input.selectionEnd ?? input.value.length,
+      composing: this._compositionActive,
+      inputType,
+    });
+
+    if (delta.restore) {
+      // A substitution over text the pty already has.  Put the field back and
+      // let the user's own keystrokes be the only thing that edits the line.
+      input.value = this._mirror;
+      input.setSelectionRange(this._mirror.length, this._mirror.length);
+    } else if (delta.mirror !== null) {
+      this._mirror = delta.mirror;
+      if (this._sessionId !== null && this.status === "connected") {
+        if (delta.deletes > 0) {
+          this.sendInput(
+            this._sessionId,
+            new Uint8Array(delta.deletes).fill(0x7f),
+          );
+        }
+        if (delta.send) {
+          this.sendInput(this._sessionId, encoder.encode(delta.send));
+          this.echoLocally(delta.send);
+        }
+      }
+    }
+
+    // A held composition shows what is being built; anything else shows the
+    // proposal, which is "" when there is none.
+    if (delta.mirror === null && this._compositionActive && !delta.suggestion) {
+      this.showComposition();
+    } else {
+      this.setChip(delta.suggestion, "suggestion");
+    }
+  }
+
+  /**
+   * Draw the composition being built next to the cursor.
+   *
+   * A terminal has nowhere to put a preedit: the pty protocol has no notion
+   * of one, and the cells are the app's.  So the client draws it, and until
+   * it does the only thing on screen is the system's candidate window —
+   * which shows the *candidates*, not the buffer they are being chosen for.
+   *
+   * The field holds the composition on every platform: this path does not
+   * depend on prediction mode, and the mirror is "" wherever that is off.
+   */
+  private showComposition(): void {
+    const input = this.inputEl;
+    if (!input) return;
+    let text = this._iosPad ? stripIosPad(input.value) : input.value;
+    if (this._mirror && text.startsWith(this._mirror)) {
+      text = text.slice(this._mirror.length);
+    }
+    this.setChip(text, "composition");
+  }
+
+  /** Show `text` in the chip, or hide it when empty. */
+  private setChip(text: string, kind: "composition" | "suggestion"): void {
+    if (text === this._chipText && kind === this._chipKind) return;
+    this._chipText = text;
+    this._chipKind = kind;
+    this.updateChip();
+  }
+
+  /** Add text to the dimmed local echo, which is otherwise fed from keydown. */
+  private echoLocally(text: string): void {
+    const t = this.terminal;
+    if (!t || !t.echo()) return;
+    if (!this.predicted) {
+      this.predictedFromRow = t.cursor_row;
+      this.predictedFromCol = t.cursor_col;
+    }
+    this.predicted += text;
+    this.scheduleRender();
+  }
+
+  /** Push `_chipText` into the chip.  Placement happens at render time,
+   *  against the caret `syncImeTarget` has already worked out. */
+  private updateChip(): void {
+    const chip = this.chipEl;
+    if (!chip) return;
+    if (!this._chipText) {
+      if (chip.style.display !== "none") chip.style.display = "none";
+      return;
+    }
+    chip.textContent = this._chipText;
+    // Re-styled on every show: the palette and font size can have changed
+    // under a chip that spends almost all of its life hidden.
+    this.styleChip();
+    // A composition is underlined, as every IME draws its own preedit: it is
+    // text being assembled, not text the app has.  A proposal is not the
+    // user's text at all, so it reads dimmer instead.
+    const composing = this._chipKind === "composition";
+    chip.style.textDecoration = composing ? "underline" : "none";
+    chip.style.opacity = composing ? "1" : "0.85";
+    chip.style.display = "block";
+    // Placement rides the render loop, which knows where the cursor is.
+    this.scheduleRender();
   }
 
   // --- Keyboard ---
@@ -2270,6 +2630,25 @@ export class BlitTerminalSurface {
         return;
       }
 
+      // Host text prediction: a predictor completes the text it can see, and
+      // encoding printable keys here (default prevented) is precisely what
+      // stops it seeing any.  Let the capture field take them instead — the
+      // `input` handler forwards the difference — and let Backspace edit that
+      // field for as long as it holds text we put there.
+      if (
+        this.predictionActive() &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        (e.key.length === 1 || (e.key === "Backspace" && this._mirror !== ""))
+      ) {
+        if (this.scrollOffset > 0) {
+          this.scrollOffset = 0;
+          this.sendScroll(this._sessionId!, 0);
+        }
+        return;
+      }
+
       const t = this.terminal;
       const appCursor = t ? t.app_cursor() : false;
       const bytes = keyToBytes(e, appCursor);
@@ -2296,6 +2675,9 @@ export class BlitTerminalSurface {
         } else {
           this.predicted = "";
         }
+        // Enter, Tab, an arrow, a chord: the app is about to do something to
+        // the line that the capture field cannot follow.
+        if (this._mirror || this._chipText) this.resetPrediction();
         this.sendInput(this._sessionId!, bytes);
       }
     };
@@ -2312,6 +2694,17 @@ export class BlitTerminalSurface {
 
     this.boundCompositionEnd = (e: CompositionEvent) => {
       this._compositionActive = false;
+      // The composition is over: whatever it produced is the app's text now,
+      // or was abandoned.  Either way the chip stops showing it.
+      if (this._chipKind === "composition") this.setChip("", "composition");
+      if (this.predictionActive() || this._mirror) {
+        // The field is the record of what happened, not `e.data`: a
+        // composition that ended by accepting a host proposal leaves text in
+        // it that never appeared in a composition event.  Sending both would
+        // type it twice.
+        this.syncPredictionFromField("");
+        return;
+      }
       if (isAndroid()) {
         // On Android we stream insertCompositionText updates letter-by-letter
         // while the composition is active, so the final word has already been
@@ -2331,11 +2724,34 @@ export class BlitTerminalSurface {
 
     this.boundInput = (e: Event) => {
       const inputEvent = e as InputEvent;
+      if (this.predictionActive() || this._mirror) {
+        // A paste is not typing: it has no prediction value, it can carry
+        // newlines, and it may need bracketing.  Hand the pasted tail to the
+        // normal path with the mirrored line stripped off, and start over.
+        if (inputEvent.inputType === "insertFromPaste") {
+          const v = input.value;
+          const pasted = v.startsWith(this._mirror)
+            ? v.slice(this._mirror.length)
+            : v;
+          this.resetPrediction();
+          this.sendTypedText(pasted, true);
+          this.resetCaptureField();
+          return;
+        }
+        this.syncPredictionFromField(inputEvent.inputType ?? "");
+        return;
+      }
       if (this._compositionActive || inputEvent.isComposing) {
         if (isAndroid()) {
+          // Android streams the composition to the shell as it is built, so
+          // the app is already drawing it; a chip would show it twice.
           this.handleAndroidCompositionInput(inputEvent);
           return;
         }
+        // Read the buffer from `input`, never from `compositionupdate`: that
+        // one fires *before* the DOM is updated and reports the previous
+        // state.
+        this.showComposition();
         if (
           inputEvent.inputType === "deleteContentBackward" &&
           !input.value &&
@@ -2415,32 +2831,18 @@ export class BlitTerminalSurface {
         if (this._sessionId !== null && this.status === "connected") {
           this.sendInput(this._sessionId, new Uint8Array([0x7f]));
         }
-      } else if (
-        typed &&
-        this._sessionId !== null &&
-        this.status === "connected"
-      ) {
-        const payload = encoder.encode(typed.replace(/\n/g, "\r"));
-        const isPaste = inputEvent.inputType === "insertFromPaste";
-        const t = this.terminal;
-        if (isPaste && t && t.bracketed_paste()) {
-          const open = encoder.encode("\x1b[200~");
-          const close = encoder.encode("\x1b[201~");
-          const wrapped = new Uint8Array(
-            open.length + payload.length + close.length,
-          );
-          wrapped.set(open, 0);
-          wrapped.set(payload, open.length);
-          wrapped.set(close, open.length + payload.length);
-          this.sendInput(this._sessionId, wrapped);
-        } else {
-          this.sendInput(this._sessionId, payload);
-        }
+      } else if (typed) {
+        this.sendTypedText(typed, inputEvent.inputType === "insertFromPaste");
       }
       this.resetCaptureField();
     };
 
-    this.boundPaste = (e: ClipboardEvent) => this.handlePaste(e);
+    this.boundPaste = (e: ClipboardEvent) => {
+      // The pasted text arrives on the field, which in prediction mode still
+      // holds the line: reset first so the paste can't be read as typing.
+      if (this._mirror) this.resetPrediction();
+      this.handlePaste(e);
+    };
 
     input.addEventListener("keydown", this.boundKeyDown);
     input.addEventListener("compositionstart", this.boundCompositionStart);
@@ -3445,16 +3847,130 @@ export class BlitTerminalSurface {
     let touchStartX = 0;
     let touchStartY = 0;
     let touchLastY = 0;
+    let touchLastAt = 0;
     let touchAccum = 0;
     let longPressTimer: ReturnType<typeof setTimeout> | null = null;
     let touchSelecting = false;
     let touchScrolled = false;
+
+    // --- Momentum for the mouse-mode scroll path ---
+    //
+    // Scrollback navigation rides the browser's own scroll surface, so a
+    // flick there coasts the way the platform says it should. An app in
+    // mouse-reporting mode (a TUI on the alternate screen — Claude Code,
+    // vim, htop) never sees that: its gestures are preventDefault'd and
+    // hand-translated into wheel reports, so the content stopped dead the
+    // instant the finger left the glass. Carry the flick ourselves.
+    /** Per-millisecond velocity decay — UIKit's "normal" deceleration
+     *  rate, so a coast next to a native one feels like the same gesture. */
+    const FLING_DECAY_PER_MS = 0.998;
+    /** Lift speed below which the finger was placing content, not throwing
+     *  it, in CSS px/ms (~9 px per 120 Hz frame). */
+    const FLING_MIN_PX_PER_MS = 0.15;
+    /** Speed at which the coast has nothing left to say and stops. */
+    const FLING_STOP_PX_PER_MS = 0.04;
+    /** Ceiling on a single coast, in case a synthetic flick or a stalled
+     *  clock keeps the decay from ever reaching the floor. */
+    const FLING_MAX_MS = 3000;
+    /** Reports one frame may emit, so a long frame (a backgrounded tab
+     *  waking up) can't dump a page of wheel events into the app at once. */
+    const FLING_MAX_STEPS_PER_FRAME = 8;
+    /** Weight of the newest sample in the velocity estimate. Low enough to
+     *  ride out the jitter between touchmoves, high enough to follow a
+     *  finger that changes its mind late in the drag. */
+    const FLING_VELOCITY_SMOOTHING = 0.4;
+    /** Gap after which the finger counts as having stopped, so resting
+     *  before lifting cancels the throw rather than replaying it. */
+    const FLING_SAMPLE_STALE_MS = 100;
+    /** Drag velocity, px/ms, positive when the finger travels up (which
+     *  reveals what is below — wheel-down). Also the live coast velocity. */
+    let touchVel = 0;
+    let flingRaf: number | null = null;
+    let flingLastAt = 0;
+    let flingEndsAt = 0;
+    let flingPos: { row: number; col: number } | null = null;
+
+    const stopFling = () => {
+      if (flingRaf !== null) {
+        cancelAnimationFrame(flingRaf);
+        flingRaf = null;
+      }
+      touchVel = 0;
+      flingPos = null;
+    };
 
     const cancelLongPress = () => {
       if (longPressTimer !== null) {
         clearTimeout(longPressTimer);
         longPressTimer = null;
       }
+    };
+
+    /** One wheel report at the cell the gesture started from, for the same
+     *  reason the drag pins its position: an app that moves its cursor to
+     *  the reported cell shouldn't have it walk during a coast. */
+    const sendFlingWheel = (dir: 1 | -1, pos: { row: number; col: number }) => {
+      this._workspace?.sendMouse(
+        this._sessionId!,
+        MOUSE_DOWN,
+        dir > 0 ? 65 : 64,
+        pos.col,
+        pos.row,
+      );
+    };
+
+    const flingStep = () => {
+      flingRaf = null;
+      const t = this.terminal;
+      const pos = flingPos;
+      // The app can leave mouse mode mid-coast (a TUI exiting drops back to
+      // the scrollback surface, which has its own momentum); the session can
+      // go away entirely. Either way this gesture is over.
+      if (!t || t.mouse_mode() === 0 || !pos || this._sessionId === null) {
+        stopFling();
+        return;
+      }
+      const now = performance.now();
+      // Clamp so a frame the browser skipped (a hidden tab, a long paint)
+      // resumes the coast rather than teleporting through it.
+      const dt = Math.min(64, Math.max(0, now - flingLastAt));
+      flingLastAt = now;
+      touchAccum += touchVel * dt;
+      touchVel *= Math.pow(FLING_DECAY_PER_MS, dt);
+      const lineH = this.cell.h || 20;
+      let steps = 0;
+      while (
+        Math.abs(touchAccum) >= lineH &&
+        steps < FLING_MAX_STEPS_PER_FRAME
+      ) {
+        const dir = touchAccum > 0 ? 1 : -1;
+        touchAccum -= dir * lineH;
+        sendFlingWheel(dir, pos);
+        steps++;
+      }
+      if (Math.abs(touchVel) < FLING_STOP_PX_PER_MS || now >= flingEndsAt) {
+        stopFling();
+        return;
+      }
+      flingRaf = requestAnimationFrame(flingStep);
+    };
+
+    /** Coast on from the lift velocity. False when the gesture wasn't a
+     *  throw, and the caller should just drop its leftovers. */
+    const startFling = (): boolean => {
+      const t = this.terminal;
+      if (!t || t.mouse_mode() === 0 || this._sessionId === null) return false;
+      if (Math.abs(touchVel) < FLING_MIN_PX_PER_MS) return false;
+      // A stale last sample means the finger came to rest before lifting.
+      const now = performance.now();
+      if (now - touchLastAt > FLING_SAMPLE_STALE_MS) return false;
+      flingPos = mouseToCell(
+        new MouseEvent("wheel", { clientX: touchStartX, clientY: touchStartY }),
+      );
+      flingLastAt = now;
+      flingEndsAt = now + FLING_MAX_MS;
+      flingRaf = requestAnimationFrame(flingStep);
+      return true;
     };
 
     const startTouchSelection = (clientX: number, clientY: number) => {
@@ -3486,6 +4002,10 @@ export class BlitTerminalSurface {
     };
 
     const handleTouchStart = (e: TouchEvent) => {
+      // A finger on the glass stops a coast, wherever it lands and however
+      // many are already down — the same "tap to catch it" every native
+      // scroll view offers.
+      stopFling();
       if (e.touches.length !== 1) {
         // A second finger arrived — abort any pending long-press and any
         // in-progress touch selection so the user can pinch/zoom or use
@@ -3509,6 +4029,7 @@ export class BlitTerminalSurface {
       touchStartX = touch.clientX;
       touchStartY = touch.clientY;
       touchLastY = touch.clientY;
+      touchLastAt = performance.now();
       touchAccum = 0;
       touchScrolled = false;
       cancelLongPress();
@@ -3570,6 +4091,22 @@ export class BlitTerminalSurface {
       // browser from also scrolling the surface.
       if (t && t.mouse_mode() > 0) {
         const dy = touchLastY - touch.clientY;
+        const now = performance.now();
+        const dt = now - touchLastAt;
+        // A finger that paused mid-drag is placing the content, not
+        // throwing it: forget the speed it arrived with rather than
+        // averaging a stale sample into the throw.
+        if (dt > FLING_SAMPLE_STALE_MS) {
+          touchVel = 0;
+        } else if (dt > 0) {
+          const instant = dy / dt;
+          touchVel =
+            touchVel === 0
+              ? instant
+              : touchVel * (1 - FLING_VELOCITY_SMOOTHING) +
+                instant * FLING_VELOCITY_SMOOTHING;
+        }
+        touchLastAt = now;
         touchLastY = touch.clientY;
         touchAccum += dy;
         const lineH = this.cell.h || 20;
@@ -3616,7 +4153,15 @@ export class BlitTerminalSurface {
         if (e.changedTouches[i]!.identifier === touchId) {
           cancelLongPress();
           touchId = null;
-          touchAccum = 0;
+          // A throw keeps the sub-line remainder it lifted with, so the
+          // coast picks up exactly where the finger left off. Anything else
+          // — a selection, a gesture the system took away — drops it.
+          const coasting =
+            !touchSelecting && e.type !== "touchcancel" && startFling();
+          if (!coasting) {
+            touchAccum = 0;
+            touchVel = 0;
+          }
           if (touchSelecting) {
             // Auto-copy the freshly built selection while the user gesture
             // is still live for navigator.clipboard.writeText. Synchronous
@@ -3673,6 +4218,8 @@ export class BlitTerminalSurface {
       clearHover(false);
       if (this.scrollFadeTimer) clearTimeout(this.scrollFadeTimer);
       stopAutoScroll();
+      cancelLongPress();
+      stopFling();
     };
   }
 
@@ -3696,6 +4243,28 @@ export class BlitTerminalSurface {
 
   private sendInput(sessionId: SessionId, data: Uint8Array): void {
     this._workspace?.sendInput(sessionId, data);
+  }
+
+  /** Forward text the user typed or pasted, bracketing a paste when the app
+   *  asked for it.  Newlines are carriage returns on a terminal. */
+  private sendTypedText(text: string, isPaste: boolean): void {
+    if (!text || this._sessionId === null || this.status !== "connected")
+      return;
+    const payload = encoder.encode(text.replace(/\n/g, "\r"));
+    const t = this.terminal;
+    if (isPaste && t && t.bracketed_paste()) {
+      const open = encoder.encode("\x1b[200~");
+      const close = encoder.encode("\x1b[201~");
+      const wrapped = new Uint8Array(
+        open.length + payload.length + close.length,
+      );
+      wrapped.set(open, 0);
+      wrapped.set(payload, open.length);
+      wrapped.set(close, open.length + payload.length);
+      this.sendInput(this._sessionId, wrapped);
+    } else {
+      this.sendInput(this._sessionId, payload);
+    }
   }
 
   private sendScroll(sessionId: SessionId, offset: number): void {

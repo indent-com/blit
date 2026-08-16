@@ -3274,6 +3274,7 @@ describe("BlitSurfaceCanvas soft-keyboard input", () => {
       requested: true,
       hint: 0x2 | 0x4,
       purpose: 6, // email
+      cursorRect: null,
     });
 
     expect(ta.dataset.blitInputmode).toBe("email");
@@ -3287,14 +3288,82 @@ describe("BlitSurfaceCanvas soft-keyboard input", () => {
         requested: true,
         hint: 0x6,
         purpose: 6,
+        cursorRect: null,
       },
     ]);
 
-    requestTextInput({ enabled: false, requested: false, hint: 0, purpose: 0 });
+    requestTextInput({
+      enabled: false,
+      requested: false,
+      hint: 0,
+      purpose: 0,
+      cursorRect: null,
+    });
     expect(ta.dataset.blitInputmode).toBeUndefined();
     expect(ta.getAttribute("inputmode")).toBeNull();
     expect(ta.spellcheck).toBe(false);
     expect(events.at(-1)?.enabled).toBe(false);
+    surface.dispose();
+  });
+
+  it("parks the IME capture textarea on the app's own caret", () => {
+    const { surface, canvas, ta, requestTextInput } = attachTyping();
+    // A 800x600 surface presented in a 400x300 box at (100, 50): the caret
+    // has to come back halved and offset, exactly as a click there would go
+    // out doubled.
+    canvas.width = 800;
+    canvas.height = 600;
+    canvas.getBoundingClientRect = () =>
+      ({ left: 100, top: 50, width: 400, height: 300 }) as DOMRect;
+    document.body.appendChild(canvas.parentElement!);
+    ta.focus();
+
+    requestTextInput({
+      enabled: true,
+      requested: true,
+      hint: 0,
+      purpose: 0,
+      cursorRect: { x: 200, y: 100, width: 2, height: 40 },
+    });
+
+    expect([ta.style.left, ta.style.top, ta.style.height]).toEqual([
+      "200px",
+      "100px",
+      "20px",
+    ]);
+
+    // An app that withdraws its text input has no caret to point at, and a
+    // capture element left over the pane is one a software keyboard can
+    // cover.
+    requestTextInput({
+      enabled: false,
+      requested: false,
+      hint: 0,
+      purpose: 0,
+      cursorRect: null,
+    });
+    expect([ta.style.left, ta.style.top]).toEqual(["0px", "0px"]);
+    surface.dispose();
+  });
+
+  it("leaves an unfocused view's capture textarea in the corner", () => {
+    const { surface, canvas, ta, requestTextInput } = attachTyping();
+    canvas.width = 800;
+    canvas.height = 600;
+    canvas.getBoundingClientRect = () =>
+      ({ left: 100, top: 50, width: 400, height: 300 }) as DOMRect;
+
+    // Same state, no focus: another pane owns the keyboard, so no
+    // composition can land here and there is nothing to place.
+    requestTextInput({
+      enabled: true,
+      requested: true,
+      hint: 0,
+      purpose: 0,
+      cursorRect: { x: 200, y: 100, width: 2, height: 40 },
+    });
+
+    expect([ta.style.left, ta.style.top]).toEqual(["0px", "0px"]);
     surface.dispose();
   });
 

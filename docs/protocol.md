@@ -298,7 +298,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | `0x2C` | `CLIPBOARD_LIST`       | `[count:2] repeated{ [mime_len:2][mime:N] }`                                                                                                                                                                                                                                                                                                |
 | `0x2D` | `SURFACE_ACTIVATED`    | `[surface_id:2]` — the Wayland client asked for its toplevel to be activated (xdg_activation_v1); raise and focus the pane                                                                                                                                                                                                                  |
 | `0x2E` | `CLIPBOARD_OWNER`      | `[wayland:1]` — `1` while a Wayland client owns the selection; `0` when empty or externally owned                                                                                                                                                                                                                                           |
-| `0x2F` | `SURFACE_TEXT_INPUT`   | `[surface_id:2][flags:1][content_hint:4][content_purpose:4]` — committed `zwp_text_input_v3` state; flags bit 0 is enabled and bit 1 marks a fresh enable request                                                                                                                                                                           |
+| `0x2F` | `SURFACE_TEXT_INPUT`   | `[surface_id:2][flags:1][content_hint:4][content_purpose:4]` — committed `zwp_text_input_v3` state; flags bit 0 is enabled and bit 1 marks a fresh enable request; optional `[cursor_x:2i][cursor_y:2i][cursor_w:2i][cursor_h:2i]` caret tail                                                                                               |
 | `0x30` | `AUDIO_FRAME`          | `[timestamp:4][flags:1][data:N]`                                                                                                                                                                                                                                                                                                            |
 | `0x31` | `SURFACE_REMOTE_INPUT` | `[surface_id:2][kind:1][count:1][x:2,y:2]*` — where another viewer is pointing (`kind` 0, one point) or touching (`kind` 1, one per finger); `count = 0` retires the marks and is what the driving viewer receives                                                                                                                          |
 | `0x32` | `TRAY_UPDATE`          | `[flags:1][records:LZ4]`; staged normalized tray state, see [tray/notification design](design/tray-notifications.md#server-to-client)                                                                                                                                                                                                       |
@@ -798,6 +798,17 @@ recent user activation.
 The Blit UI honors fresh requests by default; its device-local **Media →
 On-screen keyboard** preference can opt out without changing the forwarded
 Wayland state or the manual keyboard control.
+
+The optional caret tail carries `zwp_text_input_v3.set_cursor_rectangle` —
+where the app draws the text under edit — mapped from surface-local logical
+coordinates into composited surface pixels, the same space `SURFACE_POINTER`
+positions use. It is signed (xdg*geometry can put the caret left of or above
+the composited origin) and absent until the app names a rectangle. A viewer
+paints its own pixels, so the host IME would otherwise anchor its candidate
+window to whatever hidden element is capturing composition; parking that
+element over this rectangle is what makes the popup open at the app's caret.
+The compositor sends a message per \_changed* rectangle only: apps re-send the
+same one on every keystroke.
 
 ### Direct touch
 

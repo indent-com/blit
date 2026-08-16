@@ -608,6 +608,10 @@ pub enum CompositorEvent {
         requested: bool,
         hint: u32,
         purpose: u32,
+        /// Where the app draws the text under edit, in the composited
+        /// frame's physical pixels (the same space as surface pointer
+        /// positions).  `None` while the app has named no rectangle.
+        cursor_rect: Option<(i32, i32, i32, i32)>,
     },
     SurfaceCommit {
         surface_id: u16,
@@ -2034,6 +2038,14 @@ struct TextInputState {
     pending_content_hint: u32,
     pending_content_purpose: u32,
     pending_content_type_changed: bool,
+    /// Where the app draws the text being edited, in surface-local logical
+    /// coordinates: `(x, y, width, height)`.  This is what an input method
+    /// anchors its candidate window to, and the browser needs it to put the
+    /// host IME's popup over the same spot.  `None` until the app sends one.
+    cursor_rect: Option<(i32, i32, i32, i32)>,
+    /// The rectangle named since the last commit.  Double-buffered like the
+    /// rest of the object's state, and reset by `enable`/`disable`.
+    pending_cursor_rect: Option<(i32, i32, i32, i32)>,
     /// Whether the app is currently drawing a preedit we put there.  Every
     /// `done` resets the preedit, so this tracks who owes a clearing one:
     /// a composition committed as synthesised keys sends no `done` of its
@@ -2447,15 +2459,56 @@ impl Compositor {
         requested: bool,
         hint: u32,
         purpose: u32,
+        cursor_rect: Option<(i32, i32, i32, i32)>,
     ) {
+        let cursor_rect = cursor_rect.map(|rect| self.cursor_rect_to_composited(surface_id, rect));
         let _ = self.event_tx.send(CompositorEvent::SurfaceTextInput {
             surface_id,
             enabled,
             requested,
             hint,
             purpose,
+            cursor_rect,
         });
         (self.event_notify)();
+    }
+
+    /// Map a surface-local logical cursor rectangle into the composited
+    /// frame's physical pixels — the space the browser lays its canvas out
+    /// in.  This is exactly the inverse of `dispatch_pointer_motion`'s
+    /// conversion, xdg_geometry crop included.
+    ///
+    /// The rectangle is relative to the surface the text input entered,
+    /// which this takes to be the toplevel root: the toolkits we drive put
+    /// their text input on the toplevel, and being wrong about a subsurface
+    /// only misplaces the popup by that subsurface's offset.
+    fn cursor_rect_to_composited(
+        &self,
+        surface_id: u16,
+        (x, y, w, h): (i32, i32, i32, i32),
+    ) -> (i32, i32, i32, i32) {
+        let (mut x, mut y) = (x as f64, y as f64);
+        if let Some((gx, gy, _, _)) = self
+            .toplevel_surface_ids
+            .get(&surface_id)
+            .and_then(|rid| self.surfaces.get(rid))
+            .and_then(|s| s.xdg_geometry)
+        {
+            x -= gx as f64;
+            y -= gy as f64;
+        }
+        let (sx, sy) = match self.last_reported_size.get(&surface_id) {
+            Some(&(cw, ch, lw, lh)) if lw > 0 && lh > 0 => {
+                (cw as f64 / lw as f64, ch as f64 / lh as f64)
+            }
+            _ => (1.0, 1.0),
+        };
+        (
+            (x * sx).round() as i32,
+            (y * sy).round() as i32,
+            (w as f64 * sx).round() as i32,
+            (h as f64 * sy).round() as i32,
+        )
     }
 
     fn text_input_has_focus(ti: &TextInputState, focused_wl: &WlSurface) -> bool {
@@ -2575,13 +2628,15 @@ impl Compositor {
                 ti.pending_content_hint = 0;
                 ti.pending_content_purpose = 0;
                 ti.pending_content_type_changed = false;
+                ti.cursor_rect = None;
+                ti.pending_cursor_rect = None;
                 // "The client should reset any preedit string previously
                 // set" — so whatever we last drew is already gone.
                 ti.preedit_shown = false;
             }
         }
         if text_input_was_enabled && let Some(surface_id) = text_input_surface_id {
-            self.emit_surface_text_input(surface_id, false, false, 0, 0);
+            self.emit_surface_text_input(surface_id, false, false, 0, 0, None);
         }
     }
 
@@ -10802,6 +10857,8 @@ impl Dispatch<ZwpTextInputManagerV3, ()> for Compositor {
                     pending_content_hint: 0,
                     pending_content_purpose: 0,
                     pending_content_type_changed: false,
+                    cursor_rect: None,
+                    pending_cursor_rect: None,
                     preedit_shown: false,
                     commits: 0,
                 });
@@ -10835,7 +10892,7 @@ impl Dispatch<ZwpTextInputV3, ()> for Compositor {
             if let Some(entered) = removed
                 && let Some(surface_id) = state.find_toplevel_root(&entered.id()).1
             {
-                state.emit_surface_text_input(surface_id, false, false, 0, 0);
+                state.emit_surface_text_input(surface_id, false, false, 0, 0, None);
             }
             return;
         }
@@ -10860,6 +10917,7 @@ impl Dispatch<ZwpTextInputV3, ()> for Compositor {
                 ti.pending_content_hint = 0;
                 ti.pending_content_purpose = 0;
                 ti.pending_content_type_changed = true;
+                ti.pending_cursor_rect = None;
                 // enable "resets all state associated with ... preedit_string",
                 // so the client is about to be showing nothing.
                 ti.preedit_shown = false;
@@ -10872,6 +10930,7 @@ impl Dispatch<ZwpTextInputV3, ()> for Compositor {
                 ti.pending_content_hint = 0;
                 ti.pending_content_purpose = 0;
                 ti.pending_content_type_changed = true;
+                ti.pending_cursor_rect = None;
             }
             Request::SetContentType { hint, purpose } => {
                 use wayland_server::WEnum;
@@ -10888,12 +10947,32 @@ impl Dispatch<ZwpTextInputV3, ()> for Compositor {
                 ti.pending_content_purpose = purpose;
                 ti.pending_content_type_changed = true;
             }
+            // Where the app is drawing the text under edit.  The browser
+            // parks its hidden IME capture element over this rectangle, so
+            // the host's candidate window opens at the app's caret instead
+            // of the corner of the screen.
+            Request::SetCursorRectangle {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                state.text_inputs[index].pending_cursor_rect = Some((x, y, width, height));
+            }
             Request::Commit => {
                 let ti = &mut state.text_inputs[index];
                 // The commit count advances even while no surface is entered;
                 // it is the serial required by any later `done` event.
                 ti.commits = ti.commits.wrapping_add(1);
-                let changed = ti.pending_enabled_changed || ti.pending_content_type_changed;
+                // A moved caret is worth a message of its own, but only while
+                // the input is on: an off input has nowhere to draw it, and
+                // re-broadcasting "disabled" on every stray commit is noise.
+                // Compare against the committed value rather than tracking a
+                // dirty flag — apps re-send the same rectangle on every
+                // keystroke, and each one would otherwise wake every viewer.
+                let rect_changed = ti.pending_enabled && ti.pending_cursor_rect != ti.cursor_rect;
+                let changed =
+                    ti.pending_enabled_changed || ti.pending_content_type_changed || rect_changed;
                 let requested = ti.pending_show_requested;
                 ti.pending_enabled_changed = false;
                 ti.pending_show_requested = false;
@@ -10904,6 +10983,7 @@ impl Dispatch<ZwpTextInputV3, ()> for Compositor {
                     ti.enabled = ti.pending_enabled;
                     ti.content_hint = ti.pending_content_hint;
                     ti.content_purpose = ti.pending_content_purpose;
+                    ti.cursor_rect = ti.pending_cursor_rect;
                     if changed {
                         committed = Some((
                             entered,
@@ -10911,18 +10991,26 @@ impl Dispatch<ZwpTextInputV3, ()> for Compositor {
                             requested && ti.enabled,
                             ti.content_hint,
                             ti.content_purpose,
+                            ti.enabled.then_some(ti.cursor_rect).flatten(),
                         ));
                     }
                 }
             }
-            // SetSurroundingText, SetTextChangeCause, SetCursorRectangle —
-            // informational to the browser keyboard path; ignored for now.
+            // SetSurroundingText, SetTextChangeCause — informational to the
+            // browser keyboard path; ignored for now.
             _ => {}
         }
-        if let Some((entered, enabled, requested, hint, purpose)) = committed
+        if let Some((entered, enabled, requested, hint, purpose, cursor_rect)) = committed
             && let Some(surface_id) = state.find_toplevel_root(&entered.id()).1
         {
-            state.emit_surface_text_input(surface_id, enabled, requested, hint, purpose);
+            state.emit_surface_text_input(
+                surface_id,
+                enabled,
+                requested,
+                hint,
+                purpose,
+                cursor_rect,
+            );
         }
     }
 }

@@ -206,6 +206,7 @@ mod stub {
             requested: bool,
             hint: u32,
             purpose: u32,
+            cursor_rect: Option<(i32, i32, i32, i32)>,
         },
         SurfaceResized {
             surface_id: u16,

@@ -110,6 +110,7 @@ fn css_quote_font_family(family: &str) -> String {
 const BG_OP_STRIDE: usize = 4;
 const MODE_ECHO: u16 = 1 << 9;
 const MODE_ICANON: u16 = 1 << 10;
+const MODE_ALT_SCREEN: u16 = 1 << 11;
 
 const DEFAULT_ANSI_COLORS: [[u8; 3]; 16] = [
     [0, 0, 0],
@@ -739,6 +740,15 @@ impl Terminal {
     }
     pub fn icanon(&self) -> bool {
         self.inner.mode() & MODE_ICANON != 0
+    }
+    /// Whether the app has switched to the alternate screen.
+    ///
+    /// This is the honest "keys are commands, not text" signal.  `icanon` is
+    /// not: every interactive shell turns canonical mode *off* to do its own
+    /// line editing, so a prompt — the one place text prediction belongs —
+    /// reports `-icanon -echo`.
+    pub fn alt_screen(&self) -> bool {
+        self.inner.mode() & MODE_ALT_SCREEN != 0
     }
     pub fn title(&self) -> String {
         self.inner.title().to_owned()

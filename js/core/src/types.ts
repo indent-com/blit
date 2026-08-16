@@ -482,7 +482,9 @@ export const S2C_CLIPBOARD_LIST = 0x2c;
  *  the browser clipboard over it. */
 export const S2C_CLIPBOARD_OWNER = 0x2e;
 /** Committed Wayland text-input state:
- * [0x2F][surface_id:2][flags:1][content_hint:4][content_purpose:4]. */
+ * [0x2F][surface_id:2][flags:1][content_hint:4][content_purpose:4], with an
+ * optional [cursor_x:2i][cursor_y:2i][cursor_w:2i][cursor_h:2i] tail naming
+ * where the app draws the text under edit, in surface pixels. */
 export const S2C_SURFACE_TEXT_INPUT = 0x2f;
 export const SURFACE_TEXT_INPUT_ENABLED = 1 << 0;
 /** A fresh committed enable, rather than metadata/reconnect state. */

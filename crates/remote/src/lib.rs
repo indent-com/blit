@@ -695,12 +695,20 @@ pub const S2C_CLIPBOARD_LIST: u8 = 0x2C;
 pub const S2C_CLIPBOARD_OWNER: u8 = 0x2E;
 
 /// Committed `zwp_text_input_v3` state for a Wayland toplevel:
-/// [0x2F][surface_id:2][flags:1][content_hint:4][content_purpose:4].
+/// [0x2F][surface_id:2][flags:1][content_hint:4][content_purpose:4]
+/// followed, when the app named a cursor rectangle, by
+/// [cursor_x:2i][cursor_y:2i][cursor_w:2i][cursor_h:2i].
 ///
 /// `SURFACE_TEXT_INPUT_ENABLED` says the currently entered surface accepts
 /// text input. `SURFACE_TEXT_INPUT_REQUESTED` is set only on a freshly
 /// committed `enable`, so metadata updates and reconnect replay do not reopen
 /// a virtual keyboard the user dismissed.
+///
+/// The cursor rectangle is where the app draws the text under edit, in the
+/// composited frame's physical pixels — the same space surface pointer
+/// positions use.  The browser parks its hidden IME capture element there so
+/// the host's candidate window opens at the app's caret.  It is signed:
+/// xdg_geometry can put the caret left of or above the composited origin.
 pub const S2C_SURFACE_TEXT_INPUT: u8 = 0x2F;
 pub const SURFACE_TEXT_INPUT_ENABLED: u8 = 1 << 0;
 pub const SURFACE_TEXT_INPUT_REQUESTED: u8 = 1 << 1;
@@ -2321,6 +2329,9 @@ pub enum ServerMsg<'a> {
         requested: bool,
         hint: u32,
         purpose: u32,
+        /// `(x, y, width, height)` of the caret in composited surface
+        /// pixels, absent when the app named no cursor rectangle.
+        cursor_rect: Option<(i16, i16, i16, i16)>,
     },
     SurfaceResized {
         surface_id: u16,
@@ -2744,6 +2755,14 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
                 requested: flags & SURFACE_TEXT_INPUT_REQUESTED != 0,
                 hint: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
                 purpose: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
+                cursor_rect: (data.len() >= 20).then(|| {
+                    (
+                        i16::from_le_bytes([data[12], data[13]]),
+                        i16::from_le_bytes([data[14], data[15]]),
+                        i16::from_le_bytes([data[16], data[17]]),
+                        i16::from_le_bytes([data[18], data[19]]),
+                    )
+                }),
             })
         }
         S2C_SURFACE_RESIZED => {
@@ -3639,8 +3658,9 @@ pub fn msg_surface_text_input(
     requested: bool,
     hint: u32,
     purpose: u32,
+    cursor_rect: Option<(i16, i16, i16, i16)>,
 ) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(12);
+    let mut msg = Vec::with_capacity(20);
     msg.push(S2C_SURFACE_TEXT_INPUT);
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.push(
@@ -3649,7 +3669,22 @@ pub fn msg_surface_text_input(
     );
     msg.extend_from_slice(&hint.to_le_bytes());
     msg.extend_from_slice(&purpose.to_le_bytes());
+    if let Some((x, y, w, h)) = cursor_rect {
+        msg.extend_from_slice(&x.to_le_bytes());
+        msg.extend_from_slice(&y.to_le_bytes());
+        msg.extend_from_slice(&w.to_le_bytes());
+        msg.extend_from_slice(&h.to_le_bytes());
+    }
     msg
+}
+
+/// Clamp a compositor-side cursor rectangle into the wire's signed 16-bit
+/// fields.  A surface can be larger than 32767 px in principle, and an app
+/// that has not moved its caret yet reports a degenerate rectangle; neither
+/// may wrap into a position on the opposite edge.
+pub fn clamp_cursor_rect((x, y, w, h): (i32, i32, i32, i32)) -> (i16, i16, i16, i16) {
+    let clamp = |v: i32| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    (clamp(x), clamp(y), clamp(w.max(0)), clamp(h.max(0)))
 }
 
 /// Build S2C_SURFACE_ENCODER: `[0x2A][surface_id:2][name\0codec_string]`.
@@ -7055,7 +7090,7 @@ mod tests {
 
     #[test]
     fn surface_text_input_carries_request_and_content_type() {
-        let msg = msg_surface_text_input(7, true, true, 0x204, 6);
+        let msg = msg_surface_text_input(7, true, true, 0x204, 6, None);
         assert_eq!(msg.len(), 12);
         match parse_server_msg(&msg) {
             Some(ServerMsg::SurfaceTextInput {
@@ -7064,19 +7099,21 @@ mod tests {
                 requested,
                 hint,
                 purpose,
+                cursor_rect,
             }) => {
                 assert_eq!(surface_id, 7);
                 assert!(enabled);
                 assert!(requested);
                 assert_eq!(hint, 0x204);
                 assert_eq!(purpose, 6);
+                assert_eq!(cursor_rect, None);
             }
             other => panic!("expected SurfaceTextInput, got {}", other.is_some()),
         }
 
         // A show request has no meaning while disabled and is masked out by
         // the builder rather than putting a contradictory packet on the wire.
-        match parse_server_msg(&msg_surface_text_input(7, false, true, 9, 3)) {
+        match parse_server_msg(&msg_surface_text_input(7, false, true, 9, 3, None)) {
             Some(ServerMsg::SurfaceTextInput {
                 enabled, requested, ..
             }) => {
@@ -7085,6 +7122,37 @@ mod tests {
             }
             other => panic!("expected SurfaceTextInput, got {}", other.is_some()),
         }
+    }
+
+    /// The caret rectangle rides along as an optional tail, so a client built
+    /// against the 12-byte message still parses one that carries it.
+    #[test]
+    fn surface_text_input_carries_cursor_rect() {
+        let msg = msg_surface_text_input(3, true, false, 0, 0, Some((-4, 120, 2, 17)));
+        assert_eq!(msg.len(), 20);
+        match parse_server_msg(&msg) {
+            Some(ServerMsg::SurfaceTextInput { cursor_rect, .. }) => {
+                assert_eq!(cursor_rect, Some((-4, 120, 2, 17)));
+            }
+            other => panic!("expected SurfaceTextInput, got {}", other.is_some()),
+        }
+        // A truncated tail is no rectangle at all rather than a garbage one.
+        match parse_server_msg(&msg[..16]) {
+            Some(ServerMsg::SurfaceTextInput { cursor_rect, .. }) => {
+                assert_eq!(cursor_rect, None);
+            }
+            other => panic!("expected SurfaceTextInput, got {}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn cursor_rect_clamps_into_signed_16_bit() {
+        assert_eq!(
+            clamp_cursor_rect((-40_000, 40_000, 2, 20)),
+            (i16::MIN, i16::MAX, 2, 20)
+        );
+        // A negative extent is not a rectangle; it would wrap into a huge one.
+        assert_eq!(clamp_cursor_rect((1, 2, -3, -4)), (1, 2, 0, 0));
     }
 
     /// The physical/logical split is the whole point of the message: a 1x

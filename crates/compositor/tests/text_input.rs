@@ -204,6 +204,17 @@ delegate_noop!(App: ignore xdg_toplevel::XdgToplevel);
 delegate_noop!(App: ignore wl_seat::WlSeat);
 delegate_noop!(App: ignore ti_mgr::ZwpTextInputManagerV3);
 
+/// One `CompositorEvent::SurfaceTextInput`, flattened for assertions.
+#[derive(Debug, PartialEq, Eq)]
+struct TextInputEvent {
+    surface_id: u16,
+    enabled: bool,
+    requested: bool,
+    hint: u32,
+    purpose: u32,
+    cursor_rect: Option<(i32, i32, i32, i32)>,
+}
+
 struct Fixture {
     app: App,
     queue: EventQueue<App>,
@@ -318,7 +329,7 @@ impl Fixture {
         std::mem::take(&mut self.app.log)
     }
 
-    fn text_input_event(&self, timeout: Duration) -> Option<(u16, bool, bool, u32, u32)> {
+    fn text_input_event(&self, timeout: Duration) -> Option<TextInputEvent> {
         let handle = self.handle.as_ref().expect("compositor running");
         let deadline = std::time::Instant::now() + timeout;
         while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
@@ -329,7 +340,17 @@ impl Fixture {
                     requested,
                     hint,
                     purpose,
-                }) => return Some((surface_id, enabled, requested, hint, purpose)),
+                    cursor_rect,
+                }) => {
+                    return Some(TextInputEvent {
+                        surface_id,
+                        enabled,
+                        requested,
+                        hint,
+                        purpose,
+                        cursor_rect,
+                    });
+                }
                 Ok(_) => continue,
                 Err(_) => return None,
             }
@@ -476,19 +497,33 @@ fn committed_enable_and_content_type_are_forwarded_to_viewers() {
 
     fx.text_input.as_ref().expect("text input").commit();
     fx.settle();
-    let (_, enabled, requested, hint, purpose) = fx
+    let event = fx
         .text_input_event(Duration::from_secs(1))
         .expect("committed enable event");
-    assert!(enabled);
-    assert!(requested);
+    assert!(event.enabled);
+    assert!(event.requested);
     assert_eq!(
-        hint,
+        event.hint,
         (ti::ContentHint::Spellcheck | ti::ContentHint::AutoCapitalization).bits()
     );
-    assert_eq!(purpose, ti::ContentPurpose::Email as u32);
+    assert_eq!(event.purpose, ti::ContentPurpose::Email as u32);
 
-    // Metadata-only commits preserve state but are not new requests to show
-    // a keyboard the user may have dismissed.
+    // A moved caret is forwarded — the browser puts its IME popup there —
+    // but it is not a new request to show a keyboard the user may have
+    // dismissed.
+    let ti = fx.text_input.as_ref().expect("text input");
+    ti.set_cursor_rectangle(1, 2, 3, 4);
+    ti.commit();
+    fx.settle();
+    let event = fx
+        .text_input_event(Duration::from_secs(1))
+        .expect("committed cursor rectangle");
+    assert!(event.enabled);
+    assert!(!event.requested);
+    assert_eq!(event.cursor_rect, Some((1, 2, 3, 4)));
+
+    // Apps re-send the rectangle they already sent on every keystroke; each
+    // repeat would otherwise wake every viewer.
     let ti = fx.text_input.as_ref().expect("text input");
     ti.set_cursor_rectangle(1, 2, 3, 4);
     ti.commit();
@@ -499,12 +534,16 @@ fn committed_enable_and_content_type_are_forwarded_to_viewers() {
     ti.disable();
     ti.commit();
     fx.settle();
-    let (_, enabled, requested, hint, purpose) = fx
+    let event = fx
         .text_input_event(Duration::from_secs(1))
         .expect("committed disable event");
-    assert!(!enabled);
-    assert!(!requested);
-    assert_eq!((hint, purpose), (0, 0));
+    assert!(!event.enabled);
+    assert!(!event.requested);
+    assert_eq!((event.hint, event.purpose), (0, 0));
+    assert_eq!(
+        event.cursor_rect, None,
+        "a disabled input has no caret to point at"
+    );
 }
 
 #[test]

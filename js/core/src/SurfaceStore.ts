@@ -59,6 +59,14 @@ export interface RemoteSurfaceInput {
 
 export type RemoteInputKind = "pointer" | "touch";
 
+/** Where the app draws the text under edit, in surface pixels. */
+export interface SurfaceCursorRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 /** Effective text-input state for one Wayland toplevel. */
 export interface SurfaceTextInputState {
   enabled: boolean;
@@ -66,6 +74,10 @@ export interface SurfaceTextInputState {
   hint: number;
   /** Numeric `zwp_text_input_v3.content_purpose`. */
   purpose: number;
+  /** `zwp_text_input_v3.set_cursor_rectangle`, in surface pixels; null until
+   *  the app names one. The view parks its hidden IME capture element over
+   *  this, so the host's candidate window opens at the app's caret. */
+  cursorRect: SurfaceCursorRect | null;
 }
 
 /** One state delivery. `requested` is true only for a fresh committed enable. */
@@ -1884,6 +1896,7 @@ export class SurfaceStore {
       enabled: event.enabled,
       hint: event.hint >>> 0,
       purpose: event.purpose >>> 0,
+      cursorRect: event.cursorRect ?? null,
     };
     if (state.enabled) this.textInputs.set(surfaceId, state);
     else this.textInputs.delete(surfaceId);
@@ -2206,6 +2219,7 @@ export class SurfaceStore {
           requested: false,
           hint: 0,
           purpose: 0,
+          cursorRect: null,
         });
       } catch {}
     }

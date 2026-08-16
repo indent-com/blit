@@ -43,13 +43,13 @@ use blit_remote::{
     STATUS_PERMISSION, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME,
     SURFACE_POINTER_AXIS2_LEN, SURFACE_POINTER_DOWN, SURFACE_POINTER_LEAVE, SURFACE_POINTER_MOVE,
     SURFACE_POINTER_UP, SURFACE_TOUCH_CANCEL, SURFACE_TOUCH_DISABLE, SURFACE_TOUCH_DOWN,
-    SURFACE_TOUCH_ENABLE, SURFACE_TOUCH_MOTION, SURFACE_TOUCH_UP, build_update_msg, msg_hello,
-    msg_kick_result, msg_kicked, msg_s2c_client_list, msg_s2c_clipboard_content,
-    msg_s2c_clipboard_list, msg_s2c_clipboard_owner, msg_s2c_scroll_offset,
-    msg_s2c_surface_remote_input, msg_s2c_used_rows, msg_surface_activated, msg_surface_app_id,
-    msg_surface_created, msg_surface_destroyed, msg_surface_encoder, msg_surface_frame,
-    msg_surface_frame_precise, msg_surface_resized, msg_surface_text_input, msg_surface_title,
-    msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
+    SURFACE_TOUCH_ENABLE, SURFACE_TOUCH_MOTION, SURFACE_TOUCH_UP, build_update_msg,
+    clamp_cursor_rect, msg_hello, msg_kick_result, msg_kicked, msg_s2c_client_list,
+    msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_clipboard_owner,
+    msg_s2c_scroll_offset, msg_s2c_surface_remote_input, msg_s2c_used_rows, msg_surface_activated,
+    msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
+    msg_surface_frame, msg_surface_frame_precise, msg_surface_resized, msg_surface_text_input,
+    msg_surface_title, msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
     parse_surface_pointer_axis2, parse_surface_touch,
 };
 #[cfg(target_os = "linux")]
@@ -2055,6 +2055,9 @@ struct CachedSurfaceInfo {
 struct CachedSurfaceTextInput {
     hint: u32,
     purpose: u32,
+    /// Last caret rectangle the app named, so a client that joins mid-edit
+    /// puts its IME popup in the same place as everyone else.
+    cursor_rect: Option<(i16, i16, i16, i16)>,
 }
 
 /// Last committed pixel buffer for a surface, kept so we can re-encode a
@@ -9432,15 +9435,28 @@ async fn tick(state: &AppState) -> TickOutcome {
                     requested,
                     hint,
                     purpose,
+                    cursor_rect,
                 } => {
+                    let cursor_rect = cursor_rect.map(clamp_cursor_rect);
                     if enabled {
-                        cs.surface_text_inputs
-                            .insert(surface_id, CachedSurfaceTextInput { hint, purpose });
+                        cs.surface_text_inputs.insert(
+                            surface_id,
+                            CachedSurfaceTextInput {
+                                hint,
+                                purpose,
+                                cursor_rect,
+                            },
+                        );
                     } else {
                         cs.surface_text_inputs.remove(&surface_id);
                     }
                     broadcast.push(msg_surface_text_input(
-                        surface_id, enabled, requested, hint, purpose,
+                        surface_id,
+                        enabled,
+                        requested,
+                        hint,
+                        purpose,
+                        cursor_rect,
                     ));
                 }
                 CompositorEvent::SurfaceResized {
@@ -17204,6 +17220,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         false,
                         text_input.hint,
                         text_input.purpose,
+                        text_input.cursor_rect,
                     ));
                 }
             }

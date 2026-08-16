@@ -1935,3 +1935,608 @@ describe("BlitTerminalSurface mouse-mode touch scrolling", () => {
     surface.dispose();
   });
 });
+
+describe("BlitTerminalSurface mouse-mode touch momentum", () => {
+  /** Fake clock the surface reads through `performance.now`, so a flick can
+   *  be dealt out at a chosen frame rate instead of in real time. */
+  let clock = 0;
+  /** Frame callbacks, in the order they were requested. Nothing runs them
+   *  by itself — `coast` picks out the ones the fling queued. */
+  let frames: FrameRequestCallback[] = [];
+
+  beforeEach(() => {
+    mockCanvasContext();
+    clock = 1000;
+    frames = [];
+    vi.spyOn(performance, "now").mockImplementation(() => clock);
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((cb: FrameRequestCallback) => frames.push(cb)),
+    );
+    // A cancelled callback stays in the queue; running it is harmless
+    // because the fling drops its state before it cancels.
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function touchEvent(
+    type: string,
+    points: { identifier: number; clientX: number; clientY: number }[],
+    opts: { ongoing?: boolean } = {},
+  ): Event {
+    const list = {
+      length: points.length,
+      item: (i: number) => points[i] ?? null,
+      [0]: points[0],
+    } as unknown as TouchList;
+    const empty = { length: 0, item: () => null } as unknown as TouchList;
+    const ev = new Event(type, { bubbles: true, cancelable: true });
+    Object.defineProperty(ev, "touches", {
+      value: opts.ongoing === false ? empty : list,
+    });
+    Object.defineProperty(ev, "changedTouches", { value: list });
+    return ev;
+  }
+
+  function attachMouseMode() {
+    const sendMouse = vi.fn();
+    const surface = new BlitTerminalSurface({ sessionId: "s1" });
+    const container = document.createElement("div");
+    surface.attach(container);
+    // @ts-expect-error — fake workspace capturing mouse-mode wheel reports.
+    surface["_workspace"] = { sendMouse };
+    let mode = 1;
+    // @ts-expect-error — fake wasm terminal in mouse-reporting mode.
+    surface["terminal"] = { mouse_mode: () => mode };
+    // Pin the metrics: jsdom would collapse the grid and take cell.h with it.
+    // @ts-expect-error — touching private state purely to drive the test.
+    surface["cell"] = { w: 10, h: 20, pw: 20, ph: 40 };
+    // @ts-expect-error — touching private state purely to drive the test.
+    surface["_rows"] = 24;
+    // @ts-expect-error — touching private state purely to drive the test.
+    surface["_cols"] = 80;
+    const scrollEl = surface["scrollEl"];
+    if (!scrollEl) throw new Error("expected a scroll surface");
+    return {
+      surface,
+      scrollEl,
+      sendMouse,
+      lineH: 20,
+      leaveMouseMode: () => {
+        mode = 0;
+      },
+    };
+  }
+
+  /**
+   * Throw the content: a drag at `pxPerFrame` for `moves` frames, then a
+   * lift with no pause before it. Returns the index the fling's own frame
+   * callbacks start at, so the coast can be run without also driving the
+   * render loop.
+   */
+  function flick(
+    scrollEl: HTMLElement,
+    { from = 300, pxPerFrame = 32, moves = 4, frameMs = 16, dir = -1 } = {},
+  ): number {
+    const finger = { identifier: 1, clientX: 45, clientY: from };
+    scrollEl.dispatchEvent(touchEvent("touchstart", [finger]));
+    let y = from;
+    for (let i = 0; i < moves; i++) {
+      clock += frameMs;
+      y += dir * pxPerFrame;
+      scrollEl.dispatchEvent(
+        touchEvent("touchmove", [{ ...finger, clientY: y }]),
+      );
+    }
+    const base = frames.length;
+    scrollEl.dispatchEvent(
+      touchEvent("touchend", [{ ...finger, clientY: y }], { ongoing: false }),
+    );
+    return base;
+  }
+
+  /** Run the coast from `base` until it stops asking for frames, or until
+   *  `maxFrames` — a fling that never converges must fail, not hang. */
+  function coast(base: number, { frameMs = 16, maxFrames = 400 } = {}): number {
+    let i = base;
+    let ran = 0;
+    while (i < frames.length && ran < maxFrames) {
+      const cb = frames[i]!;
+      i++;
+      ran++;
+      clock += frameMs;
+      cb(clock);
+    }
+    return ran;
+  }
+
+  it("keeps scrolling after the finger lifts, then coasts to a stop", () => {
+    const { surface, scrollEl, sendMouse } = attachMouseMode();
+
+    const base = flick(scrollEl);
+    const duringDrag = sendMouse.mock.calls.length;
+    // 4 frames x 32px over a 20px line.
+    expect(duringDrag).toBe(6);
+
+    const framesRun = coast(base);
+    const total = sendMouse.mock.calls.length;
+
+    // It kept going on its own...
+    expect(total).toBeGreaterThan(duringDrag);
+    // ...in the direction of the throw...
+    expect(sendMouse.mock.calls.every((c) => c[2] === 65)).toBe(true);
+    // ...at the cell the drag began (col 45/10, row 300/20)...
+    expect(sendMouse.mock.calls.every((c) => c[3] === 4 && c[4] === 15)).toBe(
+      true,
+    );
+    // ...and stopped by itself rather than running into the frame cap.
+    expect(framesRun).toBeLessThan(400);
+    // A 2 px/ms throw decaying at 0.998/ms travels ~1000px ≈ 50 lines.
+    expect(total - duringDrag).toBeGreaterThan(30);
+    expect(total - duringDrag).toBeLessThan(70);
+
+    surface.dispose();
+  });
+
+  it("coasts downward for a downward throw", () => {
+    const { surface, scrollEl, sendMouse } = attachMouseMode();
+
+    const base = flick(scrollEl, { from: 100, dir: 1 });
+    const duringDrag = sendMouse.mock.calls.length;
+    coast(base);
+
+    expect(sendMouse.mock.calls.length).toBeGreaterThan(duringDrag);
+    expect(sendMouse.mock.calls.every((c) => c[2] === 64)).toBe(true);
+
+    surface.dispose();
+  });
+
+  it("doesn't coast when the finger was placing the content, not throwing", () => {
+    const { surface, scrollEl, sendMouse } = attachMouseMode();
+
+    // Same distance, spread over frames slow enough to be a drag.
+    const base = flick(scrollEl, { pxPerFrame: 8, moves: 16, frameMs: 80 });
+    const duringDrag = sendMouse.mock.calls.length;
+    expect(duringDrag).toBeGreaterThan(0);
+
+    expect(coast(base)).toBe(0);
+    expect(sendMouse.mock.calls.length).toBe(duringDrag);
+
+    surface.dispose();
+  });
+
+  it("doesn't coast when the finger came to rest before lifting", () => {
+    const { surface, scrollEl, sendMouse } = attachMouseMode();
+    const finger = { identifier: 1, clientX: 45, clientY: 300 };
+
+    scrollEl.dispatchEvent(touchEvent("touchstart", [finger]));
+    clock += 16;
+    scrollEl.dispatchEvent(
+      touchEvent("touchmove", [{ ...finger, clientY: 300 - 64 }]),
+    );
+    const duringDrag = sendMouse.mock.calls.length;
+    // The finger stayed put for a moment before leaving the glass.
+    clock += 400;
+    const base = frames.length;
+    scrollEl.dispatchEvent(
+      touchEvent("touchend", [{ ...finger, clientY: 300 - 64 }], {
+        ongoing: false,
+      }),
+    );
+
+    expect(coast(base)).toBe(0);
+    expect(sendMouse.mock.calls.length).toBe(duringDrag);
+
+    surface.dispose();
+  });
+
+  it("a finger back on the glass catches the coast", () => {
+    const { surface, scrollEl, sendMouse } = attachMouseMode();
+
+    const base = flick(scrollEl);
+    // Let it run a few frames, then land a finger.
+    let i = base;
+    for (; i < base + 3 && i < frames.length; i++) {
+      clock += 16;
+      frames[i]!(clock);
+    }
+    const caught = sendMouse.mock.calls.length;
+    expect(caught).toBeGreaterThan(0);
+
+    scrollEl.dispatchEvent(
+      touchEvent("touchstart", [{ identifier: 2, clientX: 45, clientY: 300 }]),
+    );
+    coast(i);
+
+    expect(sendMouse.mock.calls.length).toBe(caught);
+    surface.dispose();
+  });
+
+  it("stops coasting when the app leaves mouse mode", () => {
+    const { surface, scrollEl, sendMouse, leaveMouseMode } = attachMouseMode();
+
+    const base = flick(scrollEl);
+    let i = base;
+    for (; i < base + 3 && i < frames.length; i++) {
+      clock += 16;
+      frames[i]!(clock);
+    }
+    const before = sendMouse.mock.calls.length;
+    // The TUI exited; scrollback (with its own native momentum) owns the
+    // gesture again, so nothing more should be reported to the app.
+    leaveMouseMode();
+    coast(i);
+
+    expect(sendMouse.mock.calls.length).toBe(before);
+    surface.dispose();
+  });
+
+  it("drops the coast when the surface goes away mid-flight", () => {
+    const { surface, scrollEl, sendMouse } = attachMouseMode();
+
+    const base = flick(scrollEl);
+    const duringDrag = sendMouse.mock.calls.length;
+    surface.dispose();
+    coast(base);
+
+    expect(sendMouse.mock.calls.length).toBe(duringDrag);
+  });
+});
+
+describe("BlitTerminalSurface host text prediction", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** A surface with the capture field accumulating the line, as it is on
+   *  macOS at a shell prompt.  A real prompt is `-icanon -echo` — the shell
+   *  does its own line editing — so those flags say nothing here; the
+   *  alternate screen is the gate. */
+  function attachPrediction(
+    mode: { echo?: boolean; altScreen?: boolean; capture?: boolean } = {},
+  ) {
+    const s = new BlitTerminalSurface({ sessionId: "s1" });
+    const sendInput = vi.fn();
+    // @ts-expect-error — install a fake workspace stub.
+    s["_workspace"] = { sendInput };
+    // @ts-expect-error — minimal connection exposing only a connected transport.
+    s["_blitConn"] = { transport: { status: "connected" } };
+    const input = document.createElement("textarea");
+    document.body.appendChild(input);
+    // @ts-expect-error — install the hidden capture textarea directly.
+    s["inputEl"] = input;
+    const chip = document.createElement("div");
+    // @ts-expect-error — and the chip the mount path would have made.
+    s["chipEl"] = chip;
+    // @ts-expect-error — stand in for the platform gate (macOS desktop).
+    s["_predictionCapture"] = mode.capture ?? true;
+    // @ts-expect-error — a terminal in line-editing mode.
+    s["terminal"] = {
+      echo: () => mode.echo ?? false,
+      alt_screen: () => mode.altScreen ?? false,
+      app_cursor: () => false,
+      bracketed_paste: () => false,
+      cursor_row: 0,
+      cursor_col: 0,
+    };
+    // @ts-expect-error — wire the keydown/composition/input listeners.
+    s["setupKeyboard"]();
+    return { s, input, chip, sendInput };
+  }
+
+  /** What the browser does when the field is left to take a key: put the text
+   *  in, then fire `input`. */
+  function fieldBecomes(
+    input: HTMLTextAreaElement,
+    value: string,
+    opts: { selStart?: number; selEnd?: number; inputType?: string } = {},
+  ) {
+    input.value = value;
+    input.setSelectionRange(
+      opts.selStart ?? value.length,
+      opts.selEnd ?? opts.selStart ?? value.length,
+    );
+    input.dispatchEvent(
+      new InputEvent("input", {
+        inputType: opts.inputType ?? "insertText",
+        bubbles: true,
+      }),
+    );
+  }
+
+  function text(sendInput: ReturnType<typeof vi.fn>): string {
+    return sendInput.mock.calls
+      .map((c) => new TextDecoder().decode(c[1] as Uint8Array))
+      .join("");
+  }
+
+  it("lets a printable key reach the field instead of encoding it", () => {
+    const { input, sendInput } = attachPrediction();
+    const e = new KeyboardEvent("keydown", { key: "g", cancelable: true });
+    input.dispatchEvent(e);
+
+    // Nothing forwarded yet, and the browser is free to insert the character:
+    // without that the host has no text to predict against.
+    expect(e.defaultPrevented).toBe(false);
+    expect(sendInput).not.toHaveBeenCalled();
+
+    fieldBecomes(input, "g");
+    expect(text(sendInput)).toBe("g");
+  });
+
+  it("keeps the old encode-at-keydown path in a full-screen TUI", () => {
+    const { input, sendInput } = attachPrediction({ altScreen: true });
+    const e = new KeyboardEvent("keydown", { key: "g", cancelable: true });
+    input.dispatchEvent(e);
+
+    expect(e.defaultPrevented).toBe(true);
+    expect(text(sendInput)).toBe("g");
+  });
+
+  it("shows a proposal in the chip without forwarding it", () => {
+    const { input, chip, sendInput } = attachPrediction();
+    fieldBecomes(input, "git st");
+    sendInput.mockClear();
+
+    // The host proposes "atus" as a selected tail.
+    fieldBecomes(input, "git status", { selStart: 6, selEnd: 10 });
+
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(chip.textContent).toBe("atus");
+    expect(chip.style.display).toBe("block");
+  });
+
+  it("forwards only the tail when the proposal is accepted", () => {
+    const { input, chip, sendInput } = attachPrediction();
+    fieldBecomes(input, "git st");
+    fieldBecomes(input, "git status", { selStart: 6, selEnd: 10 });
+    sendInput.mockClear();
+
+    // Accepting collapses the selection to the end of the line.
+    fieldBecomes(input, "git status");
+
+    expect(text(sendInput)).toBe("atus");
+    expect(chip.style.display).toBe("none");
+  });
+
+  it("refuses a substitution over text the pty already has", () => {
+    const { input, sendInput } = attachPrediction();
+    fieldBecomes(input, "teh");
+    sendInput.mockClear();
+
+    fieldBecomes(input, "the", { inputType: "insertReplacementText" });
+
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(input.value).toBe("teh");
+  });
+
+  it("forwards a Backspace through the field as DEL", () => {
+    const { input, sendInput } = attachPrediction();
+    fieldBecomes(input, "ab");
+    sendInput.mockClear();
+
+    const e = new KeyboardEvent("keydown", {
+      key: "Backspace",
+      cancelable: true,
+    });
+    input.dispatchEvent(e);
+    expect(e.defaultPrevented).toBe(false);
+    expect(sendInput).not.toHaveBeenCalled();
+
+    fieldBecomes(input, "a", { inputType: "deleteContentBackward" });
+    expect(Array.from(sendInput.mock.calls[0]![1] as Uint8Array)).toEqual([
+      0x7f,
+    ]);
+  });
+
+  it("still encodes Backspace itself once the field is empty", () => {
+    const { input, sendInput } = attachPrediction();
+    const e = new KeyboardEvent("keydown", {
+      key: "Backspace",
+      cancelable: true,
+    });
+    input.dispatchEvent(e);
+
+    expect(e.defaultPrevented).toBe(true);
+    expect(Array.from(sendInput.mock.calls[0]![1] as Uint8Array)).toEqual([
+      0x7f,
+    ]);
+  });
+
+  it("empties the field on Enter so the next line starts clean", () => {
+    const { input, chip, sendInput } = attachPrediction();
+    fieldBecomes(input, "git status", { selStart: 6, selEnd: 10 });
+    sendInput.mockClear();
+
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", cancelable: true }),
+    );
+
+    expect(text(sendInput)).toBe("\r");
+    expect(input.value).toBe("");
+    expect(chip.style.display).toBe("none");
+
+    // And the line that follows is forwarded whole, not as a delta against
+    // the line that was submitted.
+    sendInput.mockClear();
+    fieldBecomes(input, "ls");
+    expect(text(sendInput)).toBe("ls");
+  });
+
+  it("holds a real composition instead of streaming its intermediate states", () => {
+    const { input, sendInput } = attachPrediction();
+    input.dispatchEvent(new CompositionEvent("compositionstart"));
+    fieldBecomes(input, "にほn", { inputType: "insertCompositionText" });
+    expect(sendInput).not.toHaveBeenCalled();
+
+    input.value = "日本";
+    input.setSelectionRange(2, 2);
+    input.dispatchEvent(
+      new CompositionEvent("compositionend", { data: "日本" }),
+    );
+
+    expect(text(sendInput)).toBe("日本");
+  });
+
+  it("does not type a composition twice when input follows compositionend", () => {
+    const { input, sendInput } = attachPrediction();
+    input.dispatchEvent(new CompositionEvent("compositionstart"));
+    input.value = "日本";
+    input.setSelectionRange(2, 2);
+    input.dispatchEvent(
+      new CompositionEvent("compositionend", { data: "日本" }),
+    );
+    // Chromium emits one more input event after compositionend.
+    input.dispatchEvent(
+      new InputEvent("input", {
+        inputType: "insertCompositionText",
+        bubbles: true,
+      }),
+    );
+
+    expect(text(sendInput)).toBe("日本");
+  });
+
+  it("sends a paste once, stripped of the line the field was holding", () => {
+    const { input, sendInput } = attachPrediction();
+    fieldBecomes(input, "echo ");
+    sendInput.mockClear();
+
+    fieldBecomes(input, "echo hello", { inputType: "insertFromPaste" });
+
+    expect(text(sendInput)).toBe("hello");
+    expect(input.value).toBe("");
+  });
+});
+
+describe("BlitTerminalSurface composition chip", () => {
+  beforeEach(() => {
+    mockCanvasContext();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** A writable terminal with the chip the mount path makes for every one of
+   *  them.  `capture` is the macOS-only prediction gate; a composition has to
+   *  be drawn with it off, which is every other platform. */
+  function attach(capture: boolean) {
+    const s = new BlitTerminalSurface({ sessionId: "s1" });
+    const sendInput = vi.fn();
+    // @ts-expect-error — install a fake workspace stub.
+    s["_workspace"] = { sendInput };
+    // @ts-expect-error — minimal connection exposing only a connected transport.
+    s["_blitConn"] = { transport: { status: "connected" } };
+    const input = document.createElement("textarea");
+    document.body.appendChild(input);
+    // @ts-expect-error — install the hidden capture textarea directly.
+    s["inputEl"] = input;
+    const chip = document.createElement("div");
+    // @ts-expect-error — and the chip beside the cursor.
+    s["chipEl"] = chip;
+    // @ts-expect-error — the platform gate for prediction, not for the chip.
+    s["_predictionCapture"] = capture;
+    // @ts-expect-error — a terminal on the main screen.
+    s["terminal"] = {
+      echo: () => false,
+      alt_screen: () => false,
+      app_cursor: () => false,
+      bracketed_paste: () => false,
+      cursor_row: 0,
+      cursor_col: 0,
+    };
+    // @ts-expect-error — wire the keydown/composition/input listeners.
+    s["setupKeyboard"]();
+    return { s, input, chip, sendInput };
+  }
+
+  /** What the browser does while an IME builds a composition: the buffer goes
+   *  into the field, then `input` fires. */
+  function composing(input: HTMLTextAreaElement, value: string) {
+    input.value = value;
+    input.setSelectionRange(value.length, value.length);
+    input.dispatchEvent(
+      new InputEvent("input", {
+        inputType: "insertCompositionText",
+        bubbles: true,
+      }),
+    );
+  }
+
+  function sent(sendInput: ReturnType<typeof vi.fn>): string {
+    return sendInput.mock.calls
+      .map((c) => new TextDecoder().decode(c[1] as Uint8Array))
+      .join("");
+  }
+
+  for (const capture of [false, true]) {
+    const where = capture ? "with prediction on" : "with prediction off";
+
+    it(`draws the composition being built, ${where}`, () => {
+      const { input, chip, sendInput } = attach(capture);
+      input.dispatchEvent(new CompositionEvent("compositionstart"));
+      composing(input, "に");
+      expect(chip.textContent).toBe("に");
+      expect(chip.style.display).toBe("block");
+
+      composing(input, "にほn");
+      expect(chip.textContent).toBe("にほn");
+
+      // Nothing reaches the shell until the composition is committed: a
+      // terminal cannot take back a romaji it has already been given.
+      expect(sendInput).not.toHaveBeenCalled();
+    });
+
+    it(`underlines the composition, as an IME draws its own, ${where}`, () => {
+      const { input, chip } = attach(capture);
+      input.dispatchEvent(new CompositionEvent("compositionstart"));
+      composing(input, "にほn");
+      expect(chip.style.textDecoration).toBe("underline");
+    });
+
+    it(`clears the chip and commits on compositionend, ${where}`, () => {
+      const { input, chip, sendInput } = attach(capture);
+      input.dispatchEvent(new CompositionEvent("compositionstart"));
+      composing(input, "にほn");
+
+      input.value = "日本";
+      input.setSelectionRange(2, 2);
+      input.dispatchEvent(
+        new CompositionEvent("compositionend", { data: "日本" }),
+      );
+
+      expect(chip.style.display).toBe("none");
+      expect(sent(sendInput)).toBe("日本");
+    });
+
+    it(`clears the chip when the composition is abandoned, ${where}`, () => {
+      const { input, chip, sendInput } = attach(capture);
+      input.dispatchEvent(new CompositionEvent("compositionstart"));
+      composing(input, "にほn");
+
+      // Escape: the IME withdraws the buffer and commits nothing.
+      input.value = "";
+      input.setSelectionRange(0, 0);
+      input.dispatchEvent(new CompositionEvent("compositionend", { data: "" }));
+
+      expect(chip.style.display).toBe("none");
+      expect(sent(sendInput)).toBe("");
+    });
+  }
+});

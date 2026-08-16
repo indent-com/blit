@@ -5560,6 +5560,17 @@ export class BlitConnection {
           requested: (flags & SURFACE_TEXT_INPUT_REQUESTED) !== 0,
           hint: view.getUint32(4, true),
           purpose: view.getUint32(8, true),
+          // Optional tail: absent from an older server, and from any app
+          // that has not told us where its caret is.
+          cursorRect:
+            bytes.length >= 20
+              ? {
+                  x: view.getInt16(12, true),
+                  y: view.getInt16(14, true),
+                  width: view.getInt16(16, true),
+                  height: view.getInt16(18, true),
+                }
+              : null,
         });
         return;
       }
