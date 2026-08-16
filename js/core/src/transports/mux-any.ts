@@ -53,7 +53,8 @@ export function createMuxTransport(
     } catch (err) {
       // Falling through rather than failing: a session on the direct
       // transport works, and one that could not start does not.
-      fallback = err instanceof Error ? `${err.name}: ${err.message}` : `${err}`;
+      fallback =
+        err instanceof Error ? `${err.name}: ${err.message}` : `${err}`;
     }
   }
   const direct = new MuxTransport(

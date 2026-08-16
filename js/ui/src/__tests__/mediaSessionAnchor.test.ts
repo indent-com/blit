@@ -34,9 +34,9 @@ describe("media session anchor", () => {
 
   it("anchors only the engine that withholds the commands", () => {
     // WebKit: publishes Now Playing but routes commands to a media element.
-    expect(
-      anchorNeeded({ mediaSession: {}, audioSession: {} } as never),
-    ).toBe(true);
+    expect(anchorNeeded({ mediaSession: {}, audioSession: {} } as never)).toBe(
+      true,
+    );
     // Everyone else already delivers them; claiming an audio session would be
     // a regression on a platform that works.
     expect(anchorNeeded({ mediaSession: {} } as never)).toBe(false);

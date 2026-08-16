@@ -262,7 +262,8 @@ function DeviceRow(props: {
     opacity: disabled ? 0.35 : active ? 1 : 0.7,
     cursor: disabled ? "not-allowed" : "pointer",
   });
-  const blocked = () => Boolean(props.busy) || !(props.available || props.sharing);
+  const blocked = () =>
+    Boolean(props.busy) || !(props.available || props.sharing);
   /** The stored id only if it still names a listed device.
    *
    *  A remembered device that has gone away — unplugged, or renamed by a
@@ -297,7 +298,11 @@ function DeviceRow(props: {
             thing is, so the control only has to say which way it is set. */}
         <Show when={props.onToggle}>
           {(toggle) => (
-            <div style={{ display: "flex" }} role="group" aria-label={props.label}>
+            <div
+              style={{ display: "flex" }}
+              role="group"
+              aria-label={props.label}
+            >
               <button
                 type="button"
                 aria-pressed={!props.sharing}
@@ -448,7 +453,9 @@ export function MediaOverlay(props: {
    * that matches what this browser can decode would snap the panel back to
    * Automatic under the user's cursor.
    */
-  const [manualCodecs, setManualCodecs] = createSignal(props.surfaceCodecs !== 0);
+  const [manualCodecs, setManualCodecs] = createSignal(
+    props.surfaceCodecs !== 0,
+  );
 
   // ---- Audio custom state ----
   const initCustomAudio =
@@ -670,7 +677,9 @@ export function MediaOverlay(props: {
         {(label) => <span style={fieldLabelStyle()}>{label()}</span>}
       </Show>
       {p.children}
-      <Show when={p.hint}>{(hint) => <span style={hintStyle()}>{hint()}</span>}</Show>
+      <Show when={p.hint}>
+        {(hint) => <span style={hintStyle()}>{hint()}</span>}
+      </Show>
     </div>
   );
 
@@ -753,7 +762,9 @@ export function MediaOverlay(props: {
           {p.maxLabel}
         </span>
       </div>
-      <span style={{ ...hintStyle(), "text-align": "center" }}>{p.readout}</span>
+      <span style={{ ...hintStyle(), "text-align": "center" }}>
+        {p.readout}
+      </span>
     </div>
   );
 
@@ -853,7 +864,9 @@ export function MediaOverlay(props: {
   const trim = (value: number) => value.toFixed(2).replace(/\.?0+$/, "");
 
   const formatZoom = (percent: number): string =>
-    props.surfaceZoomMode === "exact" ? `${trim(percent / 100)}×` : `${percent}%`;
+    props.surfaceZoomMode === "exact"
+      ? `${trim(percent / 100)}×`
+      : `${percent}%`;
 
   const selectZoomMode = (mode: SurfaceZoomMode) => {
     setCustomZoom(!zoomPresets(mode).includes(props.surfaceZoom));
@@ -920,9 +933,9 @@ export function MediaOverlay(props: {
   const anythingLive = () =>
     Boolean(
       liveMicrophone() ||
-        liveCamera() ||
-        devices().activeScreenCasts().length > 0 ||
-        failure(),
+      liveCamera() ||
+      devices().activeScreenCasts().length > 0 ||
+      failure(),
     );
 
   // ---- Receive codecs ----
@@ -958,7 +971,11 @@ export function MediaOverlay(props: {
     // Refuse the toggle that would leave nothing decodable: an empty mask
     // reads as "accept anything" on the wire, so it would invert the setting.
     if (
-      !(next & props.probedSurfaceCodecs & (CODEC_SUPPORT_H264 | CODEC_SUPPORT_AV1))
+      !(
+        next &
+        props.probedSurfaceCodecs &
+        (CODEC_SUPPORT_H264 | CODEC_SUPPORT_AV1)
+      )
     ) {
       return;
     }
@@ -984,7 +1001,10 @@ export function MediaOverlay(props: {
       >
         {p.label}
       </button>
-      <span aria-hidden="true" style={{ ...sliderLabelStyle(), "align-self": "center" }}>
+      <span
+        aria-hidden="true"
+        style={{ ...sliderLabelStyle(), "align-self": "center" }}
+      >
         ↳
       </span>
       <button
@@ -1154,9 +1174,7 @@ export function MediaOverlay(props: {
             <Show when={devices().localCamera()}>
               {(entry) => (
                 <Show when={entry().connection.mediaStore.cameraTrack}>
-                  {(track) => (
-                    <CameraPreview track={track()} theme={theme()} />
-                  )}
+                  {(track) => <CameraPreview track={track()} theme={theme()} />}
                 </Show>
               )}
             </Show>
@@ -1327,8 +1345,7 @@ export function MediaOverlay(props: {
                       title: off
                         ? "This browser has no Opus encoder."
                         : undefined,
-                      onSelect: () =>
-                        devices().setMicrophoneCodec(codec.value),
+                      onSelect: () => devices().setMicrophoneCodec(codec.value),
                     };
                   })}
                 />

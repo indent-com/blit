@@ -48,8 +48,7 @@ const device = (
   kind: MediaDeviceKind,
   label = "",
   groupId = "g",
-): MediaDeviceInfo =>
-  ({ deviceId, kind, label, groupId }) as MediaDeviceInfo;
+): MediaDeviceInfo => ({ deviceId, kind, label, groupId }) as MediaDeviceInfo;
 
 describe("sameDevices", () => {
   it("treats a re-enumeration of the same devices as unchanged", () => {
@@ -84,9 +83,9 @@ describe("sameDevices", () => {
       sameDevices(one, [...one, device("back", "videoinput", "Back Camera")]),
     ).toBe(false);
     expect(sameDevices(one, [])).toBe(false);
-    expect(sameDevices(one, [device("other", "videoinput", "Front Camera")])).toBe(
-      false,
-    );
+    expect(
+      sameDevices(one, [device("other", "videoinput", "Front Camera")]),
+    ).toBe(false);
   });
 
   it("notices a reordering, because the picker renders in list order", () => {
@@ -120,7 +119,10 @@ describe("negotiatedCameraFormat with a measured frame size", () => {
     // the element painted 1280x720, so the declared portrait box was filled
     // with a landscape picture and every frame arrived squeezed.
     expect(
-      negotiatedCameraFormat(track(720, 1280), 30, { width: 1280, height: 720 }),
+      negotiatedCameraFormat(track(720, 1280), 30, {
+        width: 1280,
+        height: 720,
+      }),
     ).toEqual([1280, 720, 30]);
   });
 

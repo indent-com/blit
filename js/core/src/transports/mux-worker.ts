@@ -45,7 +45,9 @@ function relay(
     msg,
     args: args.map((arg) => {
       try {
-        return typeof arg === "string" ? arg : JSON.stringify(arg) ?? String(arg);
+        return typeof arg === "string"
+          ? arg
+          : (JSON.stringify(arg) ?? String(arg));
       } catch {
         // Cyclic, or a host object with a throwing getter.
         return String(arg);
@@ -200,4 +202,3 @@ worker.onmessage = (event: MessageEvent<MuxWorkerRequest>) => {
       return;
   }
 };
-

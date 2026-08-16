@@ -34,9 +34,7 @@ import type {
  * instead. Picking the fields by name rather than deleting the known-bad ones
  * keeps a future option from reintroducing that by accident.
  */
-function wireOptions(
-  options?: MuxWorkerOptions,
-): MuxWorkerOptions | undefined {
+function wireOptions(options?: MuxWorkerOptions): MuxWorkerOptions | undefined {
   if (!options) return undefined;
   const {
     reconnect,
@@ -112,7 +110,11 @@ class WorkerMuxChannel implements BlitTransport {
     // reuses it, and a transfer would leave it detached under them.
     const copy = data.slice();
     this.owner._send(
-      { t: "channelSend", id: this.channelId, data: copy.buffer as ArrayBuffer },
+      {
+        t: "channelSend",
+        id: this.channelId,
+        data: copy.buffer as ArrayBuffer,
+      },
       [copy.buffer as ArrayBuffer],
     );
   }
@@ -155,7 +157,10 @@ class WorkerMuxChannel implements BlitTransport {
 
   removeEventListener(type: "message", listener: MessageListener): void;
   removeEventListener(type: "statuschange", listener: StatusListener): void;
-  removeEventListener(type: string, listener: (...args: never[]) => void): void {
+  removeEventListener(
+    type: string,
+    listener: (...args: never[]) => void,
+  ): void {
     if (type === "message") {
       this.messageListeners.delete(listener as unknown as MessageListener);
     } else if (type === "statuschange") {

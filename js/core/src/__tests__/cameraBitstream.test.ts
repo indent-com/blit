@@ -37,9 +37,9 @@ describe("cameraBitstreamMatchesCodec", () => {
   });
 
   it("accepts a Baseline 4:2:0 answer", () => {
-    expect(cameraBitstreamMatchesCodec(1, stream(sps(BASELINE), pps, idr))).toBe(
-      true,
-    );
+    expect(
+      cameraBitstreamMatchesCodec(1, stream(sps(BASELINE), pps, idr)),
+    ).toBe(true);
   });
 
   it("still refuses 4:4:4 chroma for the 4:2:0 wire codec", () => {
@@ -51,10 +51,16 @@ describe("cameraBitstreamMatchesCodec", () => {
 
   it("requires 4:4:4 chroma for the 4:4:4 wire codec", () => {
     expect(
-      cameraBitstreamMatchesCodec(3, stream(sps(HIGH_444, CHROMA_444_BITS), pps, idr)),
+      cameraBitstreamMatchesCodec(
+        3,
+        stream(sps(HIGH_444, CHROMA_444_BITS), pps, idr),
+      ),
     ).toBe(true);
     expect(
-      cameraBitstreamMatchesCodec(3, stream(sps(HIGH, CHROMA_420_BITS), pps, idr)),
+      cameraBitstreamMatchesCodec(
+        3,
+        stream(sps(HIGH, CHROMA_420_BITS), pps, idr),
+      ),
     ).toBe(false);
   });
 

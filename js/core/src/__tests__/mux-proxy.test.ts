@@ -42,8 +42,11 @@ describe("WorkerMuxTransport", () => {
 
   beforeEach(() => {
     fake = new FakeWorker();
-    mux = new WorkerMuxTransport("ws://host/mux", "secret", undefined, () =>
-      fake as unknown as Worker,
+    mux = new WorkerMuxTransport(
+      "ws://host/mux",
+      "secret",
+      undefined,
+      () => fake as unknown as Worker,
     );
   });
 
@@ -204,7 +207,10 @@ describe("WorkerMuxTransport audio port", () => {
         new WorkerMuxTransport(
           "ws://host/mux",
           "secret",
-          { wtUrl: "https://host/mux", debug: { log() {}, warn() {}, error() {} } },
+          {
+            wtUrl: "https://host/mux",
+            debug: { log() {}, warn() {}, error() {} },
+          },
           () => fake as unknown as Worker,
         ),
     ).not.toThrow();

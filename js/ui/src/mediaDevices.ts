@@ -680,7 +680,9 @@ export function createMediaDevices(props: {
    *  from the "System default" option above it — picking it re-selects what was
    *  already chosen. Such a device is counted for the hint instead. */
   const devicesOfKind = (kind: MediaDeviceKind) =>
-    devices().filter((device) => device.kind === kind && device.deviceId !== "");
+    devices().filter(
+      (device) => device.kind === kind && device.deviceId !== "",
+    );
   const unnamedOfKind = (kind: MediaDeviceKind) =>
     devices().filter((device) => device.kind === kind && device.deviceId === "")
       .length;
