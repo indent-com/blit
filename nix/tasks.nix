@@ -503,7 +503,8 @@ let
         fi
       }
       trap cleanup_ui_dist EXIT
-      for asset in js/ui/dist/index.html.br js/ui/dist/sw.js.br; do
+      for asset in js/ui/dist/index.html.br js/ui/dist/sw.js.br \
+        js/ui/dist/mux-worker.js.br js/ui/dist/buffer-recycler-worker.js.br; do
         if [ ! -e "$asset" ]; then
           : > "$asset"
           placeholder_assets+=("$asset")
@@ -539,9 +540,10 @@ let
 
       echo "=== Setting up UI dist ==="
       mkdir -p js/ui/dist
-      rm -f js/ui/dist/index.html js/ui/dist/index.html.br js/ui/dist/sw.js js/ui/dist/sw.js.br
-      cp ${webAppDist}/index.html ${webAppDist}/index.html.br \
-        ${webAppDist}/sw.js ${webAppDist}/sw.js.br js/ui/dist/
+      for asset in index.html sw.js mux-worker.js buffer-recycler-worker.js; do
+        rm -f "js/ui/dist/$asset" "js/ui/dist/$asset.br"
+        cp ${webAppDist}/"$asset" ${webAppDist}/"$asset.br" js/ui/dist/
+      done
 
       outdir="''${1:-coverage-report}"
 
@@ -786,7 +788,8 @@ in
         fi
       }
       trap cleanup_ui_dist EXIT
-      for asset in js/ui/dist/index.html.br js/ui/dist/sw.js.br; do
+      for asset in js/ui/dist/index.html.br js/ui/dist/sw.js.br \
+        js/ui/dist/mux-worker.js.br js/ui/dist/buffer-recycler-worker.js.br; do
         if [ ! -e "$asset" ]; then
           case "$asset" in
             */index.html.br)
@@ -794,6 +797,9 @@ in
               ;;
             */sw.js.br)
               fixture='/* blit test fixture */ self.addEventListener("fetch", () => {});'
+              ;;
+            *-worker.js.br)
+              fixture='/* blit test fixture */ self.addEventListener("message", () => {});'
               ;;
           esac
           node -e '

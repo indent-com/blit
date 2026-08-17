@@ -2480,7 +2480,7 @@ fn mark_fd_range_cloexec(limit: libc::c_int) {
 fn apple_fd_directory_available() -> bool {
     let directory = unsafe {
         libc::open(
-            b"/dev/fd\0".as_ptr().cast(),
+            c"/dev/fd".as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };

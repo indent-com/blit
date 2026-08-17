@@ -18,24 +18,27 @@ version: "0.5"
 
 processes:
   build:
-    # Stub js/ui/dist/index.html{,.br} on fresh checkouts so cargo can
-    # compile blit-gateway / blit-cli (they embed the file via
-    # include_bytes!).  Vite only writes index.html.br on a production
-    # build (`vite build`); the `ui` process runs the dev server, so
-    # nothing in this stack produces the file otherwise.  Mirrors
-    # bin/dev-check.  Content doesn't matter — at runtime the dev UI is
-    # served from the vite dev server, not this embedded blob.
+    # Stub the js/ui/dist assets on fresh checkouts so cargo can compile
+    # blit-gateway / blit-cli (they embed each one via include_bytes!).
+    # Vite only writes the `.br` files on a production build (`vite build`);
+    # the `ui` process runs the dev server, so nothing in this stack produces
+    # them otherwise.  Every asset the Rust side embeds has to be listed here
+    # — a missing one fails the build with a bare "couldn't read" — so keep
+    # this list and bin/dev-check's in step with the include_bytes! calls in
+    # crates/gateway/src/lib.rs and crates/cli/src/interactive.rs.  Content
+    # doesn't matter: at runtime the dev UI is served from the vite dev
+    # server, not these embedded blobs.
     command: >-
-      if [ ! -f js/ui/dist/index.html.br ]; then
       mkdir -p js/ui/dist;
-      echo '<html><body>stub</body></html>' > js/ui/dist/index.html;
-      python3 -c "import brotli, pathlib; pathlib.Path('js/ui/dist/index.html.br').write_bytes(brotli.compress(pathlib.Path('js/ui/dist/index.html').read_bytes()))" 2>/dev/null || cp js/ui/dist/index.html js/ui/dist/index.html.br;
+      for asset in index.html sw.js mux-worker.js buffer-recycler-worker.js; do
+      if [ ! -f "js/ui/dist/$asset.br" ]; then
+      case "$asset" in
+      *.html) echo '<html><body>stub</body></html>' > "js/ui/dist/$asset";;
+      *) echo '/* stub */' > "js/ui/dist/$asset";;
+      esac;
+      python3 -c "import brotli, pathlib, sys; p = pathlib.Path(sys.argv[1]); pathlib.Path(str(p) + '.br').write_bytes(brotli.compress(p.read_bytes()))" "js/ui/dist/$asset" 2>/dev/null || cp "js/ui/dist/$asset" "js/ui/dist/$asset.br";
       fi;
-      if [ ! -f js/ui/dist/sw.js.br ]; then
-      mkdir -p js/ui/dist;
-      echo '/* stub */' > js/ui/dist/sw.js;
-      python3 -c "import brotli, pathlib; pathlib.Path('js/ui/dist/sw.js.br').write_bytes(brotli.compress(pathlib.Path('js/ui/dist/sw.js').read_bytes()))" 2>/dev/null || cp js/ui/dist/sw.js js/ui/dist/sw.js.br;
-      fi;
+      done;
       exec cargo build -p blit-cli --profile profiling ${BLIT_DEV_CARGO_FLAGS:-}
 
   browser-wasm:
