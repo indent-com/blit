@@ -23,7 +23,16 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      use: { browserName: "chromium" },
+      use: {
+        browserName: "chromium",
+        // Same escape hatch as playwright.dev.config.ts, so this exact suite
+        // can be reproduced outside CI: the npm-bundled browser does not start
+        // on NixOS (it cannot find libglib). Unset in CI, where the Nix
+        // playwright package brings its own working browser.
+        launchOptions: process.env.CHROMIUM_BIN
+          ? { executablePath: process.env.CHROMIUM_BIN }
+          : {},
+      },
     },
   ],
   webServer: {

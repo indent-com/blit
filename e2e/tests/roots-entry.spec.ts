@@ -1,12 +1,17 @@
 import { test, expect } from "@playwright/test";
 
 /**
- * Workspace roots is a Cmd+K entry, not a chord and not status bar chrome.
+ * Workspace roots is opened by the ⚙ beside the workspace-root selector, and
+ * by nothing else: not a chord, not status bar chrome, and not a Cmd+K entry.
  *
- * The ⚙ beside the workspace-root selector in the left dock stays: it is
- * contextual to the control it sits next to, not a second global affordance.
+ * The ⚙ is contextual to the control it sits next to, which is why it is the
+ * one that stays. The switcher deliberately carries only what has no other
+ * home, so an entry there would be a second global affordance for a dialog the
+ * left dock already opens in one click.
  */
-test("workspace roots lives in the Cmd+K menu", async ({ page }) => {
+test("workspace roots opens from the dock, and from nowhere else", async ({
+  page,
+}) => {
   await page.goto("/");
   await page.evaluate(() => localStorage.clear());
   await page.goto("/#psk=test-secret");
@@ -29,11 +34,17 @@ test("workspace roots lives in the Cmd+K menu", async ({ page }) => {
     0,
   );
 
-  // It is an entry in the switcher, and it opens the roots overlay.
+  // Neither does the switcher, which lists only what the chrome cannot reach.
   await page.keyboard.press("ControlOrMeta+k");
-  const entry = page.getByText("Workspace roots", { exact: true }).first();
-  await expect(entry).toBeVisible({ timeout: 5_000 });
-  await entry.click();
+  await page.waitForTimeout(400);
+  await expect(page.getByText("Workspace roots", { exact: true })).toHaveCount(
+    0,
+  );
+  await page.keyboard.press("Escape");
+
+  // The ⚙ next to the workspace-root selector is the affordance that remains.
+  // Located by title: its accessible name is the glyph, which names nothing.
+  await page.getByTitle("Manage workspace roots").click();
   await expect(
     page.getByText(/add a root|workspace roots/i).first(),
   ).toBeVisible({ timeout: 5_000 });

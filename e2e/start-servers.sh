@@ -10,10 +10,20 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMPDIR_E2E="${BLIT_E2E_TMPDIR:-$(mktemp -d)}"
 export BLIT_SOCK="${TMPDIR_E2E}/blit-test.sock"
 
+# Where a spec can find the server behind the gateway it is driving.  Playwright
+# starts this script as its own process tree, so an exported BLIT_SOCK reaches
+# the gateway and nothing else — a spec that shells out to the CLI would
+# otherwise resolve the *default* socket and quietly interrogate a different
+# server.  The file exists only while these servers do, so its absence
+# correctly means "somebody else's gateway, use the CLI's own resolution".
+SOCK_HANDOFF="${REPO_ROOT}/e2e/.e2e-socket"
+printf '%s' "$BLIT_SOCK" >"$SOCK_HANDOFF"
+
 cleanup() {
     # Kill child processes
     kill "$SERVER_PID" "$GATEWAY_PID" 2>/dev/null || true
     wait "$SERVER_PID" "$GATEWAY_PID" 2>/dev/null || true
+    rm -f "$SOCK_HANDOFF"
     rm -rf "$TMPDIR_E2E"
 }
 trap cleanup EXIT INT TERM

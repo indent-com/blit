@@ -8,6 +8,7 @@
 /.moo/
 /crates/alacritty_terminal/
 /crates/browser/pkg
+/e2e/.e2e-socket
 /e2e/playwright-report/
 /e2e/test-results/
 /result

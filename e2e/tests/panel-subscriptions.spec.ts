@@ -1,5 +1,6 @@
 import { test, expect, type Page } from "@playwright/test";
 import { execFileSync } from "child_process";
+import fs from "fs";
 import path from "path";
 
 /**
@@ -19,8 +20,29 @@ import path from "path";
 
 const BLIT = path.resolve(__dirname, "../../target/debug/blit");
 
+/** The env that points the CLI at the server the gateway under test proxies to.
+ *
+ *  `start-servers.sh` puts its server on a private socket and publishes the
+ *  path in `e2e/.e2e-socket`; the specs run in a different process tree, so
+ *  that file is the only way the path reaches them. Without it — a developer
+ *  reusing an already-running gateway — the CLI's own resolution is the right
+ *  answer, because that gateway fronts the default server.
+ *
+ *  Getting this wrong is silent: the CLI happily starts a second server on the
+ *  default socket, and every assertion here reads that empty one instead. */
+function serverEnv(): Record<string, string | undefined> {
+  const handoff = path.resolve(__dirname, "../.e2e-socket");
+  if (!fs.existsSync(handoff)) return process.env;
+  const sock = fs.readFileSync(handoff, "utf8").trim();
+  // A run killed hard enough to skip the script's cleanup leaves the file
+  // behind. Pointing the CLI at a socket with nothing on it is worse than not
+  // pointing it anywhere: it would start a server there and talk to that.
+  if (!sock || !fs.existsSync(sock)) return process.env;
+  return { ...process.env, BLIT_SOCK: sock };
+}
+
 function blit(...args: string[]): string {
-  return execFileSync(BLIT, args, { encoding: "utf8", env: process.env });
+  return execFileSync(BLIT, args, { encoding: "utf8", env: serverEnv() });
 }
 
 /** Terminal subscriptions per client row, e.g. ["1:80x24", "2:?"].
@@ -37,7 +59,10 @@ function subscribedTerminals(): string[] {
   return terminals.sort();
 }
 
-/** Close every terminal, so leftovers from an earlier run cannot be counted. */
+/** Close every terminal, so leftovers cannot be counted — and, afterwards, so
+ *  this spec's two `cat` sessions are not what the next spec finds focused.
+ *  A later spec that types a command into a `cat` gets its own text back and
+ *  reports the feature under test as broken. */
 function closeAllTerminals() {
   for (const row of blit("terminal", "list").trim().split("\n").slice(1)) {
     const id = row.split("\t")[0];
@@ -66,6 +91,8 @@ async function open(page: Page, panels: string) {
 }
 
 test.describe("side panel subscriptions", () => {
+  test.afterAll(closeAllTerminals);
+
   test("a parked terminal is unsubscribed while the preview panel is closed", async ({
     page,
   }) => {
