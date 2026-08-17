@@ -59,7 +59,10 @@ function subscribedTerminals(): string[] {
   return terminals.sort();
 }
 
-/** Close every terminal, so leftovers from an earlier run cannot be counted. */
+/** Close every terminal, so leftovers cannot be counted — and, afterwards, so
+ *  this spec's two `cat` sessions are not what the next spec finds focused.
+ *  A later spec that types a command into a `cat` gets its own text back and
+ *  reports the feature under test as broken. */
 function closeAllTerminals() {
   for (const row of blit("terminal", "list").trim().split("\n").slice(1)) {
     const id = row.split("\t")[0];
@@ -88,6 +91,8 @@ async function open(page: Page, panels: string) {
 }
 
 test.describe("side panel subscriptions", () => {
+  test.afterAll(closeAllTerminals);
+
   test("a parked terminal is unsubscribed while the preview panel is closed", async ({
     page,
   }) => {
