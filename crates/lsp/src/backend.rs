@@ -2003,14 +2003,25 @@ pub(crate) fn arm_root_watcher(root: PathBuf, targets: WatchTargets, slot: Watch
             // the arm fails and the root gets no disk sync at all.
             //
             // The cost is that directories created later are not watched
-            // until the next arm. Events for files *inside* an already
-            // watched directory still arrive, which covers the common
-            // edit-an-existing-file case; a new subtree needs a reattach.
+            // until the next arm — including one created during the walk
+            // below, which arms after listing rather than before. Events
+            // for files *inside* an already watched directory still
+            // arrive, which covers the common edit-an-existing-file case;
+            // a new subtree needs a reattach.
+            //
+            // The whole set is armed in one `paths_mut` batch: on FSEvents
+            // every single-path `watch` registers a fresh stream with
+            // `fseventsd` over a synchronous mach round-trip, so arming a
+            // checkout a directory at a time paid one registration per
+            // directory. The batch registers once. inotify and kqueue have
+            // no batching to do, and notify's default implementation there
+            // is the same per-path calls as before.
             let arm = |w: &mut notify::RecommendedWatcher| -> notify::Result<()> {
+                let mut dirs = Vec::new();
                 let mut queue = std::collections::VecDeque::from([root.clone()]);
                 while let Some(dir) = queue.pop_front() {
-                    w.watch(&dir, notify::RecursiveMode::NonRecursive)?;
                     let Ok(entries) = std::fs::read_dir(&dir) else {
+                        dirs.push(dir);
                         continue;
                     };
                     for entry in entries.flatten() {
@@ -2026,8 +2037,25 @@ pub(crate) fn arm_root_watcher(root: PathBuf, targets: WatchTargets, slot: Watch
                         }
                         queue.push_back(entry.path());
                     }
+                    dirs.push(dir);
                 }
-                Ok(())
+                // The first failure is what gets reported, but the batch
+                // still commits: dropping it uncommitted leaves the
+                // watcher in an unspecified state, and the directories
+                // that did arm are worth keeping.
+                let mut failed = None;
+                let mut paths = w.paths_mut();
+                for dir in &dirs {
+                    if let Err(err) = paths.add(dir, notify::RecursiveMode::NonRecursive) {
+                        failed = Some(err);
+                        break;
+                    }
+                }
+                paths.commit()?;
+                match failed {
+                    Some(err) => Err(err),
+                    None => Ok(()),
+                }
             };
 
             // Report a failed arm instead of swallowing it. Without a

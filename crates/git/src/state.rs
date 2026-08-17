@@ -398,6 +398,17 @@ struct Parts {
 /// targeted gitdir watches are dropped rather than double-watching the
 /// `.git` subtree.
 struct Arms {
+    /// Edited through `paths_mut` batches, never one path at a time: on
+    /// FSEvents every single-path `watch`/`unwatch` tears the stream down
+    /// and registers a new one with `fseventsd`, a synchronous mach
+    /// round-trip. A first arm of a small repo touches ~28 paths, so
+    /// per-path editing paid ~28 registrations before the first snapshot
+    /// (and one machine measured 0.6s each, turning that into ~18s).
+    /// `paths_mut` collapses a reconcile pass into one registration;
+    /// inotify and kqueue have no batching to do, and notify's default
+    /// implementation there is the same per-path calls as before. A batch
+    /// stops the stream when it opens, so one is only opened when the pass
+    /// really has a path to add or drop.
     watcher: notify::RecommendedWatcher,
     /// Targeted gitdir/common paths currently armed; empty while the
     /// worktree watch covers them.
@@ -428,6 +439,10 @@ struct Arms {
     worktree_stale: bool,
     /// Changed since the last debug-hook publish.
     watch_set_changed: bool,
+    /// The native stream was torn down and re-registered during this pass,
+    /// so whatever changed while it was down raised no event; cleared by
+    /// [`Engine::sync_watches`] once that window is accounted for.
+    stream_rebuilt: bool,
 }
 
 struct Engine {
@@ -851,6 +866,7 @@ impl Engine {
             worktree_pruned: false,
             worktree_stale: false,
             watch_set_changed: false,
+            stream_rebuilt: false,
         });
         // `sync_watches` picks the set: when a status subscriber's
         // recursive worktree watch already covers the gitdir, arming the
@@ -875,13 +891,15 @@ impl Engine {
         if !arms.gitdir_paths.is_empty() {
             return;
         }
+        let Arms {
+            watcher,
+            gitdir_paths,
+            ..
+        } = arms;
+        let mut paths = watcher.paths_mut();
         for dir in dirs.iter().collect::<std::collections::HashSet<_>>() {
-            if arms
-                .watcher
-                .watch(dir, notify::RecursiveMode::NonRecursive)
-                .is_ok()
-            {
-                arms.gitdir_paths.push(dir.clone());
+            if paths.add(dir, notify::RecursiveMode::NonRecursive).is_ok() {
+                gitdir_paths.push(dir.clone());
             }
             for sub in [
                 "refs",
@@ -892,16 +910,13 @@ impl Engine {
                 "info",
             ] {
                 let path = dir.join(sub);
-                if path.exists()
-                    && arms
-                        .watcher
-                        .watch(&path, notify::RecursiveMode::Recursive)
-                        .is_ok()
-                {
-                    arms.gitdir_paths.push(path);
+                if path.exists() && paths.add(&path, notify::RecursiveMode::Recursive).is_ok() {
+                    gitdir_paths.push(path);
                 }
             }
         }
+        let _ = paths.commit();
+        arms.stream_rebuilt = true;
     }
 
     fn disarm_gitdir(&mut self) {
@@ -909,9 +924,20 @@ impl Engine {
         let Some(arms) = &mut self.watch else {
             return;
         };
-        for path in arms.gitdir_paths.drain(..) {
-            let _ = arms.watcher.unwatch(&path);
+        if arms.gitdir_paths.is_empty() {
+            return;
         }
+        let Arms {
+            watcher,
+            gitdir_paths,
+            ..
+        } = arms;
+        let mut paths = watcher.paths_mut();
+        for path in gitdir_paths.drain(..) {
+            let _ = paths.remove(&path);
+        }
+        let _ = paths.commit();
+        arms.stream_rebuilt = true;
     }
 
     /// True when the worktree watch already delivers gitdir events (the
@@ -923,11 +949,43 @@ impl Engine {
             .is_some_and(|w| self.gitdir.starts_with(w) && self.common.starts_with(w))
     }
 
-    /// Reconcile the armed watches with subscriber demand: the worktree
-    /// watch exists while any subscriber wants status, and while it covers
-    /// the gitdir the targeted gitdir watches are dropped rather than
-    /// double-watching the `.git` subtree.
+    /// Reconcile the armed watches, then again if that rebuilt the native
+    /// stream.
+    ///
+    /// A rebuild is a blind window — the old registration is dropped before
+    /// the new one is live (see [`Arms::watcher`]) — and the watch set is
+    /// the one thing cut *inside* it: the walk that decides which
+    /// directories are watchable runs before the batch commits, so a
+    /// `.gitignore` write landing in the window is invisible to it and the
+    /// set would stay wrong for the engine's life. The snapshot has no such
+    /// hole: every pass computes state *after* this returns. So the second
+    /// pass re-walks against a fresh exclude stack and rebuilds only if the
+    /// set really moved; a pass that arms nothing rebuilds nothing, which
+    /// is what stops this from ringing. The bound is for the pathological
+    /// case only — leaving the set stale there is safe, the next event
+    /// reconciles it.
     fn sync_watches(&mut self) {
+        for _ in 0..4 {
+            self.sync_watches_pass();
+            let rebuilt = self
+                .watch
+                .as_mut()
+                .is_some_and(|arms| std::mem::take(&mut arms.stream_rebuilt));
+            if !rebuilt {
+                return;
+            }
+            self.excludes = None;
+            if let Some(arms) = &mut self.watch {
+                arms.worktree_stale = true;
+            }
+        }
+    }
+
+    /// One reconcile pass against subscriber demand: the worktree watch
+    /// exists while any subscriber wants status, and while it covers the
+    /// gitdir the targeted gitdir watches are dropped rather than
+    /// double-watching the `.git` subtree.
+    fn sync_watches_pass(&mut self) {
         use notify::Watcher as _;
         let armed = self.watch.as_ref().is_some_and(|a| a.worktree);
         let want = self.workdir.is_some() && self.subs.values().any(|s| s.opts.status && !s.gone);
@@ -951,6 +1009,7 @@ impl Engine {
                     arms.worktree_stale = false;
                     arms.worktree_dirs.insert(workdir);
                     arms.watch_set_changed = true;
+                    arms.stream_rebuilt = true;
                     // Arm the rest of the walkable set.
                     self.reconcile_worktree_watches();
                 }
@@ -1000,8 +1059,13 @@ impl Engine {
             && let Some(arms) = &mut self.watch
         {
             let dirs = std::mem::take(&mut arms.worktree_dirs);
-            for dir in dirs {
-                let _ = arms.watcher.unwatch(&dir);
+            if !dirs.is_empty() {
+                let mut paths = arms.watcher.paths_mut();
+                for dir in dirs {
+                    let _ = paths.remove(&dir);
+                }
+                let _ = paths.commit();
+                arms.stream_rebuilt = true;
             }
             arms.worktree = false;
             arms.watch_set_changed = true;
@@ -1016,6 +1080,7 @@ impl Engine {
     /// or vanished. Arming precedes disarming, so no window opens where a
     /// live directory is unwatched.
     fn reconcile_worktree_watches(&mut self) {
+        use notify::Watcher as _;
         let (workdir, prune) = match &self.watch {
             Some(arms) if arms.worktree => match &self.workdir {
                 Some(workdir) => (workdir.clone(), arms.worktree_pruned),
@@ -1024,14 +1089,41 @@ impl Engine {
             _ => return,
         };
         let desired = self.watchable_dirs(&workdir, prune);
-        let Some(arms) = &self.watch else { return };
+        let Some(arms) = &mut self.watch else { return };
         let missing: Vec<PathBuf> = desired.difference(&arms.worktree_dirs).cloned().collect();
         let extra: Vec<PathBuf> = arms.worktree_dirs.difference(&desired).cloned().collect();
-        for dir in missing {
-            self.arm_worktree_dir(&dir);
+        // A steady-state pass changes nothing, and opening a batch would
+        // still cost a stream registration (see `Arms::watcher`).
+        if missing.is_empty() && extra.is_empty() {
+            return;
         }
-        for dir in extra {
-            self.disarm_worktree_subtree(&dir);
+        let Arms {
+            watcher,
+            worktree_dirs,
+            watch_set_changed,
+            ..
+        } = arms;
+        let mut fatal = None;
+        let mut paths = watcher.paths_mut();
+        for dir in &missing {
+            if let Err(reason) =
+                Self::arm_worktree_dir(paths.as_mut(), worktree_dirs, watch_set_changed, dir)
+            {
+                fatal = Some(reason);
+            }
+        }
+        for dir in &extra {
+            Self::disarm_worktree_subtree(paths.as_mut(), worktree_dirs, watch_set_changed, dir);
+        }
+        let _ = paths.commit();
+        arms.stream_rebuilt = true;
+        // Closing subscribers needs the engine back, so it waits for the
+        // batch to commit and release the borrow.
+        if let Some(reason) = fatal {
+            for sub in self.subs.values_mut().filter(|s| s.opts.status && !s.gone) {
+                let _ = (sub.outbox)(msg_git_closed(sub.repo_id, reason));
+                sub.gone = true;
+            }
         }
     }
 
@@ -1074,36 +1166,30 @@ impl Engine {
         !prune || self.under_gitdir(abs) || !self.path_ignored(abs, workdir)
     }
 
-    /// Arm one worktree directory, non-recursively. Idempotent — the armed
-    /// set is the bookkeeping, and re-arming would rebuild the native
-    /// stream (see `sync_watches`). A directory that vanished mid-walk is
-    /// simply skipped; any other failure leaves a live directory
-    /// unwatched — status would silently never update — so status
-    /// subscribers are closed with the reason, the contract the root arm
-    /// in `sync_watches` keeps.
-    fn arm_worktree_dir(&mut self, dir: &Path) {
-        use notify::Watcher as _;
-        let Some(arms) = &mut self.watch else {
-            return;
-        };
-        if arms.worktree_dirs.contains(dir) {
-            return;
+    /// Arm one worktree directory, non-recursively, into the caller's
+    /// batch. Idempotent — the armed set is the bookkeeping, and re-arming
+    /// would rebuild the native stream (see `sync_watches`). A directory
+    /// that vanished mid-walk is simply skipped; any other failure leaves a
+    /// live directory unwatched — status would silently never update — so
+    /// the reason travels back for the caller to close status subscribers
+    /// with, the contract the root arm in `sync_watches` keeps.
+    fn arm_worktree_dir(
+        paths: &mut dyn notify::PathsMut,
+        armed: &mut BTreeSet<PathBuf>,
+        changed: &mut bool,
+        dir: &Path,
+    ) -> Result<(), u8> {
+        if armed.contains(dir) {
+            return Ok(());
         }
-        match arms.watcher.watch(dir, notify::RecursiveMode::NonRecursive) {
+        match paths.add(dir, notify::RecursiveMode::NonRecursive) {
             Ok(()) => {
-                arms.worktree_dirs.insert(dir.to_path_buf());
-                arms.watch_set_changed = true;
+                armed.insert(dir.to_path_buf());
+                *changed = true;
+                Ok(())
             }
-            Err(e) => {
-                if !dir.exists() {
-                    return;
-                }
-                let reason = watch_close_reason(&e);
-                for sub in self.subs.values_mut().filter(|s| s.opts.status && !s.gone) {
-                    let _ = (sub.outbox)(msg_git_closed(sub.repo_id, reason));
-                    sub.gone = true;
-                }
-            }
+            Err(e) if dir.exists() => Err(watch_close_reason(&e)),
+            Err(_) => Ok(()),
         }
     }
 
@@ -1111,13 +1197,13 @@ impl Engine {
     /// deleted, renamed-away, or newly ignored subtree. inotify retires
     /// the kernel watch on deletion by itself; this is what keeps notify's
     /// descriptor→path map (and the debug hook) from growing stale.
-    fn disarm_worktree_subtree(&mut self, dir: &Path) {
-        use notify::Watcher as _;
-        let Some(arms) = &mut self.watch else {
-            return;
-        };
-        let gone: Vec<PathBuf> = arms
-            .worktree_dirs
+    fn disarm_worktree_subtree(
+        paths: &mut dyn notify::PathsMut,
+        armed: &mut BTreeSet<PathBuf>,
+        changed: &mut bool,
+        dir: &Path,
+    ) {
+        let gone: Vec<PathBuf> = armed
             .range(dir.to_path_buf()..)
             .take_while(|p| p.starts_with(dir))
             .cloned()
@@ -1126,10 +1212,10 @@ impl Engine {
             return;
         }
         for path in gone {
-            let _ = arms.watcher.unwatch(&path);
-            arms.worktree_dirs.remove(&path);
+            let _ = paths.remove(&path);
+            armed.remove(&path);
         }
-        arms.watch_set_changed = true;
+        *changed = true;
     }
 
     /// A directory appearing or vanishing under the worktree reshapes the
@@ -1220,15 +1306,21 @@ impl Engine {
         if arms.ignore_paths == want {
             return;
         }
-        for path in arms.ignore_paths.drain(..) {
-            let _ = arms.watcher.unwatch(&path);
+        let Arms {
+            watcher,
+            ignore_paths,
+            ..
+        } = arms;
+        let mut paths = watcher.paths_mut();
+        for path in ignore_paths.drain(..) {
+            let _ = paths.remove(&path);
         }
         for dir in want {
-            let _ = arms
-                .watcher
-                .watch(&dir, notify::RecursiveMode::NonRecursive);
-            arms.ignore_paths.push(dir);
+            let _ = paths.add(&dir, notify::RecursiveMode::NonRecursive);
+            ignore_paths.push(dir);
         }
+        let _ = paths.commit();
+        arms.stream_rebuilt = true;
     }
 
     // -- event classification (ignore-filtered) -----------------------------
@@ -1240,13 +1332,18 @@ impl Engine {
     fn handle_event(&mut self, paths: &[PathBuf]) {
         let mut refs_side = false;
         let mut status_side = false;
-        // An empty path set (queue overflow, backend rescan) is
-        // unattributable: both sides. Events were lost — possibly
-        // directory creates — so the watch set itself is suspect too.
+        // An empty path set (queue overflow, backend rescan, a stream
+        // rebuild's blind window) is unattributable: both sides. Events
+        // were lost — possibly directory creates — so the watch set itself
+        // is suspect too, and so is the exclude stack: one of the lost
+        // events may have been a `.gitignore` write, and a stale stack
+        // would then misclassify both status and the watchable set for the
+        // rest of the engine's life.
         if paths.is_empty() {
             if let Some(arms) = &mut self.watch {
                 arms.worktree_stale = true;
             }
+            self.excludes = None;
             refs_side = true;
             status_side = true;
         }
