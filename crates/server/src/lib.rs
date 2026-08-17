@@ -1967,6 +1967,8 @@ struct Pty {
     /// Set once the deadline has fired and SIGTERM has gone out; when it
     /// passes, the group gets SIGKILL.
     stop_deadline: Option<Instant>,
+    /// Fallback deadline armed when the direct child exits. Reader EOF finalizes sooner.
+    exit_drain_deadline: Option<Instant>,
     /// Attributed cause, moved onto `S2C_EXITED` by `cleanup_pty_internal`.
     exit_reason: u8,
     /// The subprocess has exited but the terminal state is retained for reading.
@@ -8425,6 +8427,8 @@ fn pty_budget_detail(live: usize, max_ptys: usize) -> String {
 /// children dying together deliver one).  Windows has no SIGCHLD and this is
 /// the actual detection latency.
 const SUPERVISOR_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+/// Maximum wait for reader EOF after the direct child exits. A descendant can keep the slave open.
+const PTY_EXIT_DRAIN_GRACE: Duration = Duration::from_millis(50);
 
 /// Reactive lifecycle loop, deliberately not part of the delivery tick.
 ///
@@ -8462,7 +8466,13 @@ fn earliest_armed_deadline(sess: &Session) -> Option<Instant> {
     sess.ptys
         .values()
         .filter(|pty| !pty.exited)
-        .filter_map(|pty| pty.deadline.into_iter().chain(pty.stop_deadline).min())
+        .filter_map(|pty| {
+            pty.deadline
+                .into_iter()
+                .chain(pty.stop_deadline)
+                .chain(pty.exit_drain_deadline)
+                .min()
+        })
         .min()
 }
 
@@ -8568,23 +8578,43 @@ async fn enforce_deadlines(state: &AppState) {
     }
 }
 
-/// One supervisor pass: notice children that have exited and run the exit
-/// path for them.
+/// One supervisor pass: arm a bounded fallback when the direct child exits.
 ///
-/// Exit used to be detected only by EOF on the master fd, which reports "the
-/// last fd on the slave closed", not "the child exited".  A grandchild
-/// holding the slave open kept a dead terminal marked `running` forever, and
-/// `blit terminal wait` blocked until its own client-side timeout.
+/// Ordered reader EOF normally finalizes first. A descendant can keep the slave open, so the
+/// deadline forces one unpaced drain before cleanup instead of waiting forever.
 async fn supervise(state: &AppState) {
-    let exited: Vec<(u16, u64)> = {
+    let now = Instant::now();
+    let fallback_due = {
+        let mut sess = state.session.lock().await;
+        for pty in sess.ptys.values_mut().filter(|pty| !pty.exited) {
+            if pty.exit_drain_deadline.is_none() && pty::poll_child_exited(&pty.handle) {
+                pty.exit_drain_deadline = Some(now + PTY_EXIT_DRAIN_GRACE);
+            }
+        }
+        sess.ptys.values().any(|pty| {
+            !pty.exited
+                && pty
+                    .exit_drain_deadline
+                    .is_some_and(|deadline| now >= deadline)
+        })
+    };
+    if fallback_due {
+        tick(state).await;
+    }
+    let ready: Vec<(u16, u64)> = {
         let sess = state.session.lock().await;
         sess.ptys
             .iter()
-            .filter(|(_, pty)| !pty.exited && pty::poll_child_exited(&pty.handle))
+            .filter(|(_, pty)| {
+                !pty.exited
+                    && pty
+                        .exit_drain_deadline
+                        .is_some_and(|deadline| now >= deadline)
+            })
             .map(|(&id, pty)| (id, pty.generation))
             .collect()
     };
-    for (id, generation) in exited {
+    for (id, generation) in ready {
         cleanup_pty_internal(id, Some(generation), state).await;
     }
     // After the exit scan, never before it: `reap_zombies` waits a child
@@ -8771,14 +8801,10 @@ async fn supervise(state: &AppState) {
 
 /// Run a terminal's exit path.
 ///
-/// `generation` is the child this cleanup was decided for.  The EOF path in
-/// the delivery tick defers by 50ms, and the supervisor now reaches the same
-/// terminal within a millisecond of SIGCHLD, so a client that sees
-/// `S2C_EXITED` and immediately restarts can have a fresh child running by the
-/// time the deferred call lands.  Without the check that call would drop the
-/// new child's fd, hang it up, and broadcast a second `S2C_EXITED` with an
-/// unknown status — the one place the exactly-once contract actually breaks.
-/// `None` means "whatever is there now", for callers that just looked.
+/// `generation` is the child this cleanup was decided for. Exit detection and reader EOF race, and a
+/// client can restart the terminal as soon as it sees `S2C_EXITED`; without this check, stale cleanup
+/// would drop the new child's fd and broadcast a second exit for the replacement. `None` means
+/// "whatever is there now", for callers that just looked.
 async fn cleanup_pty_internal(pty_id: u16, generation: Option<u64>, state: &AppState) {
     let mut sess = state.session.lock().await;
     if let Some(pty) = sess.ptys.get_mut(&pty_id) {
@@ -12450,7 +12476,7 @@ async fn tick(state: &AppState) -> TickOutcome {
         .values()
         .flat_map(|c| c.subscriptions.iter().copied())
         .collect();
-    let mut eof_ptys: Vec<(u16, u64)> = Vec::with_capacity(ids.len());
+    let mut eof_ptys: Vec<(u16, u64, bool)> = Vec::with_capacity(ids.len());
     let mut cwd_msgs: Vec<Vec<u8>> = Vec::new();
     let mut parse_budget_hit = false;
     for &id in &ids {
@@ -12507,7 +12533,12 @@ async fn tick(state: &AppState) -> TickOutcome {
                     }
                 }
                 PtyInput::Eof => {
-                    eof_ptys.push((id, pty.generation));
+                    let child_exited =
+                        pty.exit_drain_deadline.is_some() || pty::poll_child_exited(&pty.handle);
+                    if child_exited && pty.exit_drain_deadline.is_none() {
+                        pty.exit_drain_deadline = Some(now + PTY_EXIT_DRAIN_GRACE);
+                    }
+                    eof_ptys.push((id, pty.generation, child_exited));
                 }
             }
         }
@@ -12526,17 +12557,19 @@ async fn tick(state: &AppState) -> TickOutcome {
         // before the next one.
         state.delivery_notify.notify_one();
     }
-    // Handle EOF outside the borrow loop.  The 50 ms grace period lets the
-    // PTY's final output drain, but doing it serially here would stall the
-    // tick for 50 ms per exited PTY.  Spawn each cleanup so the tick loop
-    // releases the session mutex and keeps processing.
+    // Data and EOF share one ordered channel, so consuming EOF means every preceding byte is already
+    // in the terminal model. If EOF beat child exit, retain the old bounded grace before cleanup.
     drop(sess);
-    for (id, generation) in eof_ptys {
-        let state = state.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            cleanup_pty_internal(id, Some(generation), &state).await;
-        });
+    for (id, generation, child_exited) in eof_ptys {
+        if child_exited {
+            cleanup_pty_internal(id, Some(generation), state).await;
+        } else {
+            let state = state.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(PTY_EXIT_DRAIN_GRACE).await;
+                cleanup_pty_internal(id, Some(generation), &state).await;
+            });
+        }
     }
     let mut sess = state.session.lock().await;
 
@@ -20148,6 +20181,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         // deadline that already fired.
                         pty.deadline = None;
                         pty.stop_deadline = None;
+                        pty.exit_drain_deadline = None;
                         pty.exit_reason = blit_remote::EXIT_REASON_NORMAL;
                         // The fresh shell hasn't reported OSC 7 yet; keeping
                         // the dead shell's cwd would shadow the kernel
@@ -20588,7 +20622,7 @@ mod tests {
         use blit_remote::{S2C_HELLO, S2C_READY, STATUS_OK};
         use tokio::time::timeout;
 
-        fn test_state(process_server: process::Server) -> AppState {
+        pub(super) fn test_state(process_server: process::Server) -> AppState {
             Arc::new(AppStateInner {
                 config: Config {
                     shell: "/bin/sh".into(),
@@ -20714,6 +20748,82 @@ mod tests {
                 .await
                 .expect("connection cleanup timed out")
                 .unwrap();
+            process_server.shutdown().await;
+        }
+    }
+
+    #[cfg(unix)]
+    mod pty_exit_ordering {
+        use super::super::*;
+        use super::process_transport::test_state;
+        use tokio::time::{sleep, timeout};
+
+        #[tokio::test]
+        async fn supervisor_drains_reader_before_exited() {
+            let process_server = process::Server::new(false, false);
+            let state = test_state(process_server.clone());
+            let pty = pty::spawn_pty(
+                "/bin/sh",
+                "",
+                24,
+                80,
+                1,
+                "exit-ordering",
+                Some("printf 'final-output\\n'"),
+                None,
+                None,
+                100,
+                state.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("failed to spawn PTY");
+            state.session.lock().await.ptys.insert(1, pty);
+
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let child_exited = {
+                        let sess = state.session.lock().await;
+                        pty::poll_child_exited(&sess.ptys.get(&1).unwrap().handle)
+                    };
+                    if child_exited {
+                        break;
+                    }
+                    sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("child did not exit");
+
+            supervise(&state).await;
+            assert!(
+                !state.session.lock().await.ptys.get(&1).unwrap().exited,
+                "supervisor emitted EXITED before the reader drain"
+            );
+
+            sleep(PTY_EXIT_DRAIN_GRACE + Duration::from_millis(10)).await;
+            supervise(&state).await;
+            assert!(
+                state.session.lock().await.ptys.get(&1).unwrap().exited,
+                "supervisor fallback did not finalize exit"
+            );
+
+            let text = state
+                .session
+                .lock()
+                .await
+                .ptys
+                .get(&1)
+                .unwrap()
+                .driver
+                .get_text_range(100, 0, 0, 0);
+            assert!(
+                text.contains("final-output"),
+                "final PTY output was lost: {text:?}"
+            );
             process_server.shutdown().await;
         }
     }
