@@ -18189,7 +18189,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         let mut immediate_status = match sess.clients.get_mut(&client_id) {
                             Some(client) => {
                                 if !client.mpris_subscribed {
-                                    Some(STATUS_PERMISSION)
+                                    Some(blit_remote::STATUS_PERMISSION)
                                 } else if !consume_mpris_action_token(client, now) {
                                     Some(STATUS_BUDGET)
                                 } else {
