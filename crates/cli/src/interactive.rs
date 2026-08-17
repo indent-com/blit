@@ -608,9 +608,32 @@ async fn browser_handle_mux_ws(mut ws: WebSocket, state: Arc<BrowserState>) {
     let mut channels: HashMap<u16, MuxChannelState> = HashMap::new();
     let shutdown = state.shutdown.clone();
 
+    // Channel-open tasks are spawned into this JoinSet so the select loop
+    // stays non-blocking while (potentially slow) destinations connect: one
+    // unreachable remote must not delay opening any of the others.  Each task
+    // returns `(ch_id, Option<MuxChannelState>)`.
+    let mut open_tasks: tokio::task::JoinSet<(u16, Option<MuxChannelState>)> =
+        tokio::task::JoinSet::new();
+    // Abort handles for pending opens — lets us cancel an in-flight connect
+    // when the browser re-opens or closes the same channel ID.
+    let mut pending_opens: HashMap<u16, tokio::task::AbortHandle> = HashMap::new();
+
     loop {
         tokio::select! {
             biased;
+
+            // Completed channel-open tasks, polled before ws_rx so the entry
+            // is in `channels` by the time the browser's first post-OPENED
+            // data frame arrives.
+            result = open_tasks.join_next(), if !open_tasks.is_empty() => {
+                if let Some(Ok((ch_id, ch_state))) = result {
+                    pending_opens.remove(&ch_id);
+                    if let Some(ch_state) = ch_state {
+                        channels.insert(ch_id, ch_state);
+                    }
+                }
+                // Err = task panicked or was aborted — already cleaned up.
+            }
 
             msg = ws_rx.next() => {
                 let msg = match msg {
@@ -632,24 +655,34 @@ async fn browser_handle_mux_ws(mut ws: WebSocket, state: Arc<BrowserState>) {
                                     let name_len = u16::from_le_bytes([payload[3], payload[4]]) as usize;
                                     if payload.len() < 5 + name_len { continue; }
                                     let name = std::str::from_utf8(&payload[5..5 + name_len])
-                                        .unwrap_or("");
+                                        .unwrap_or("")
+                                        .to_string();
 
+                                    // Cancel any in-flight open for this channel ID.
+                                    if let Some(abort) = pending_opens.remove(&open_ch) {
+                                        abort.abort();
+                                    }
                                     if let Some(prev) = channels.remove(&open_ch) {
                                         prev.shutdown();
                                     }
 
-                                    cli_mux_open_channel(
-                                        open_ch,
-                                        name,
-                                        &state,
-                                        &merge_tx,
-                                        &mut channels,
-                                    )
-                                    .await;
+                                    let open_state = state.clone();
+                                    let open_merge_tx = merge_tx.clone();
+                                    let abort = open_tasks.spawn(async move {
+                                        let ch = cli_mux_open_channel(
+                                            open_ch, name, open_state, open_merge_tx,
+                                        ).await;
+                                        (open_ch, ch)
+                                    });
+                                    pending_opens.insert(open_ch, abort);
                                 }
                                 MUX_C2S_CLOSE => {
                                     if payload.len() < 3 { continue; }
                                     let close_ch = u16::from_le_bytes([payload[1], payload[2]]);
+                                    // Cancel any in-flight open for this channel ID.
+                                    if let Some(abort) = pending_opens.remove(&close_ch) {
+                                        abort.abort();
+                                    }
                                     if let Some(ch) = channels.remove(&close_ch) {
                                         ch.shutdown();
                                     }
@@ -698,21 +731,24 @@ async fn browser_handle_mux_ws(mut ws: WebSocket, state: Arc<BrowserState>) {
     eprintln!("blit: mux client disconnected");
 }
 
+/// Connect a mux channel to its destination.  Runs off the select loop (see
+/// the `open_tasks` JoinSet) because a destination that is slow or wedged can
+/// hold the connect for the full timeout, and doing that inline would stall
+/// every other channel on the session.
 async fn cli_mux_open_channel(
     ch_id: u16,
-    name: &str,
-    state: &Arc<BrowserState>,
-    merge_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    channels: &mut HashMap<u16, MuxChannelState>,
-) {
+    name: String,
+    state: Arc<BrowserState>,
+    merge_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+) -> Option<MuxChannelState> {
     let connector = {
         let dests = state.destinations.read().unwrap();
-        match dests.get(name) {
+        match dests.get(&name) {
             Some(info) => info.connector.clone(),
             None => {
                 eprintln!("blit: mux: unknown destination '{name}'");
                 let _ = merge_tx.send(mux_error(ch_id, &format!("unknown destination '{name}'")));
-                return;
+                return None;
             }
         }
     };
@@ -725,13 +761,13 @@ async fn cli_mux_open_channel(
         Ok(Err(e)) => {
             eprintln!("blit: mux: cannot connect to '{name}': {e}");
             let _ = merge_tx.send(mux_error(ch_id, &e));
-            return;
+            return None;
         }
         Err(_) => {
             let msg = format!("connection to '{name}' timed out");
             eprintln!("blit: mux: {msg}");
             let _ = merge_tx.send(mux_error(ch_id, &msg));
-            return;
+            return None;
         }
     };
 
@@ -761,14 +797,11 @@ async fn cli_mux_open_channel(
         let _ = reader_merge_tx.send(mux_control(MUX_S2C_CLOSED, ch_id));
     });
 
-    channels.insert(
-        ch_id,
-        MuxChannelState {
-            writer_tx,
-            writer_task,
-            reader_task,
-        },
-    );
-
     eprintln!("blit: mux: channel {ch_id} opened for '{name}'");
+
+    Some(MuxChannelState {
+        writer_tx,
+        writer_task,
+        reader_task,
+    })
 }

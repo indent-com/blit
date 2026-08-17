@@ -694,15 +694,6 @@
           pkgs.pkgsStatic.stdenv.cc
           pkgs.pnpm
           pkgs.process-compose
-          # `rtkitctl`, to check that the audio graph can actually get the
-          # realtime priority it asks for. A server run from this shell has no
-          # systemd unit and no session, so RTKit is its only route to
-          # SCHED_FIFO — and PipeWire carries on silently without it, running
-          # the data loop at ordinary priority against the video encoders and
-          # cutting gaps into captured audio the moment a core saturates.
-          # `rtkitctl --start` brings the daemon up on a host that has it
-          # installed but not running.
-          pkgs.rtkit
           pkgs.samply
           pkgs.socat
           pkgs.wasm-bindgen-cli
@@ -722,6 +713,17 @@
           pkgs.dbus
           pkgs.pipewire
           pkgs.wireplumber
+          # `rtkitctl`, to check that the audio graph can actually get the
+          # realtime priority it asks for. A server run from this shell has no
+          # systemd unit and no session, so RTKit is its only route to
+          # SCHED_FIFO — and PipeWire carries on silently without it, running
+          # the data loop at ordinary priority against the video encoders and
+          # cutting gaps into captured audio the moment a core saturates.
+          # `rtkitctl --start` brings the daemon up on a host that has it
+          # installed but not running.  Linux-only: rtkit has no Darwin
+          # build, and listing it unconditionally fails the whole devShell
+          # evaluation there.
+          pkgs.rtkit
           # The X11 bridge a session starts by name when it is present
           # (crates/server/src/xwayland.rs); without it a dev server is
           # Wayland-only, which is a different thing to be testing.

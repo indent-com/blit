@@ -221,7 +221,11 @@ in
             # (docs/design/lsp.md); prepended so a user-installed server
             # does not shadow the pinned one.
             (
-              ''[ -n "$LANG" ] || export LANG="$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//' || echo en_US).UTF-8"; ''
+              # launchd does not expand `~` in WorkingDirectory — it fails the
+              # spawn with EX_CONFIG (78) before the job ever runs, so cd here
+              # instead.
+              ''cd "$HOME" || exit 1; ''
+              + ''[ -n "$LANG" ] || export LANG="$(defaults read -g AppleLocale 2>/dev/null | sed 's/@.*//' || echo en_US).UTF-8"; ''
               + lib.optionalString (
                 cfg.languageServers != [ ]
               ) ''export PATH="${lib.makeBinPath cfg.languageServers}:$PATH"; ''
@@ -237,7 +241,6 @@ in
           // lib.optionalAttrs (cfg.shell != null) {
             SHELL = cfg.shell;
           };
-          WorkingDirectory = "~";
           RunAtLoad = true;
           KeepAlive = true;
           StandardOutPath = "/tmp/blit-server.log";
