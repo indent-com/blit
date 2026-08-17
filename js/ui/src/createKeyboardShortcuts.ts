@@ -563,8 +563,9 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
         h.toggleOverlay("web");
         return;
       }
-      // Workspace roots have no shortcut of their own: they are an entry in
-      // the Cmd+K switcher, alongside remotes, palette, and font.
+      // Workspace roots have no shortcut of their own: the ⚙ beside the
+      // workspace-root selector in the left dock opens them, which is also why
+      // the switcher deliberately carries no entry for them.
       if (mod && !e.shiftKey && e.key === "Enter") {
         if (h.overlay()) {
           // Let the overlay handle it.
