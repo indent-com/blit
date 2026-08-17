@@ -841,6 +841,7 @@ pub fn spawn_pty(
         last_scrolled_lines: 0,
         deadline: None,
         stop_deadline: None,
+        exit_drain_deadline: None,
         exit_reason: blit_remote::EXIT_REASON_NORMAL,
         exited: false,
         exited_at: None,

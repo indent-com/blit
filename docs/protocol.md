@@ -920,6 +920,11 @@ S2C_READY       (end of initial burst)
 
 After `S2C_READY`, the client can start sending commands. `S2C_UPDATE` frames are not sent until the client subscribes to a PTY with `C2S_SUBSCRIBE`. Each `C2S_SUBSCRIBE`, including one repeated for an already subscribed PTY, starts a fresh diff stream: the next update is a full-state keyframe. Clients use that repeat to recover after discarding or failing to apply a delta.
 
+`S2C_EXITED` is an ingestion barrier: the server applies every PTY byte drained
+for that process generation to its terminal model before sending the exit. It
+does not imply that a paced `S2C_UPDATE` reached each subscriber. An immediate
+`C2S_COPY_RANGE` does observe the final server-side terminal model.
+
 ## Frame update encoding
 
 `S2C_UPDATE` payload (after opcode and pty_id) is LZ4-compressed (`lz4_flex::compress_prepend_size`). Decompressed:
