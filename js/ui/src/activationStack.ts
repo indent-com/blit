@@ -1,8 +1,9 @@
 /**
  * The raise stack behind xdg_activation_v1 in the non-BSP main view.
  *
- * BSP tiles: every pane keeps its occupant, so a client that asks to be
- * activated can be given a pane without anything being displaced. The non-BSP
+ * BSP tiles: a client that asks to be activated is either already in a pane --
+ * where it is simply focused -- or takes the focused pane, whose occupant stays
+ * visible in the dock. Either way nothing needs remembering. The non-BSP
  * main view is a single slot -- honouring an activation there means covering
  * whatever the user was looking at. A bare `focusSurface()` therefore loses the
  * previous occupant: the surface that ends up on screen is the one that spoke

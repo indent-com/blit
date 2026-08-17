@@ -3617,7 +3617,21 @@ function WorkspaceScreen(props: {
         connectionId ??
         surfaces().find((x) => x.surfaceId === surfaceId)?.connectionId ??
         activeConnectionId();
-      moveToPaneFn?.(surfaceAssignment(connId, surfaceId), bspFocusedPaneId()!);
+      const assignment = surfaceAssignment(connId, surfaceId);
+      // Already displayed in some pane? Focus that pane instead of moving it.
+      // moveToPane would *swap*: assignmentsAfterDrop recovers a surface's
+      // source pane from the current assignments (surfaces are unique views),
+      // so the focused pane's occupant would take the vacated one. That is
+      // right for a drag, and wrong for every caller here — none of them is a
+      // drag. xdg_activation is the loud case: dropping a link from Slack onto
+      // Brave makes Brave raise itself while Slack's pane still holds focus,
+      // and the two panes traded places. Terminals never had the bug because
+      // focusBySession checks this first; surfaces now match.
+      const shown = Object.entries(layoutAssignments()?.assignments ?? {}).find(
+        ([, value]) => value === assignment,
+      )?.[0];
+      if (shown) focusPaneFn?.(shown);
+      else moveToPaneFn?.(assignment, bspFocusedPaneId()!);
       focusSurfaceById(null);
     } else {
       focusSurfaceById(surfaceId, connectionId);
@@ -3633,10 +3647,11 @@ function WorkspaceScreen(props: {
    * Electron app reacting to a notification click). It gets the same treatment
    * as picking the surface in the switcher, plus a record of what it covered.
    *
-   * BSP pushes nothing: `focusSurface` hands the surface a pane, and the pane
-   * it displaces keeps its occupant in the dock where the user can see it. The
-   * non-BSP main view is one slot, so without the stack the previous occupant
-   * is simply gone once the activated surface closes.
+   * BSP pushes nothing: `focusSurface` either focuses the pane the surface is
+   * already in or hands it the focused pane, and a pane it displaces keeps its
+   * occupant in the dock where the user can see it. The non-BSP main view is
+   * one slot, so without the stack the previous occupant is simply gone once
+   * the activated surface closes.
    */
   function activateSurface(surfaceId: number, connectionId: ConnectionId) {
     const target = surfaceAssignment(connectionId, surfaceId);
@@ -3644,7 +3659,22 @@ function WorkspaceScreen(props: {
     // repeat the request (a token is cheap and its delivery unacknowledged),
     // so without this a talkative app would re-run focusSurface — closing an
     // overlay the user just opened — several times a second.
-    if (
+    //
+    // "On top" is a different slot in each mode: focusedSurfaceId is the
+    // non-BSP main view, which focusSurface nulls under a layout, so testing
+    // only that left this guard dead in BSP — where the repeats are worse than
+    // a closed overlay, since each one re-focuses the pane out from under the
+    // user. In BSP the equivalent question is whether the surface already
+    // occupies the focused pane.
+    if (inBsp()) {
+      const focused = bspFocusedSurface();
+      if (
+        focused?.surfaceId === surfaceId &&
+        focused?.connectionId === connectionId
+      ) {
+        return;
+      }
+    } else if (
       focusedSurfaceId() === surfaceId &&
       focusedSurfaceConnId() === connectionId
     ) {
