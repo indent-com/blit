@@ -149,6 +149,7 @@ export type { ReactiveStore } from "./reactive";
 
 export type {
   BlitConnectionSnapshot,
+  BlitClientOrigin,
   BlitClientInfo,
   BlitClientList,
   BlitClientAuxSubscription,

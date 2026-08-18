@@ -5272,6 +5272,7 @@ fn origin_identity(origin: &super::ConnectionOrigin) -> Option<(u64, u64, u64, u
         definition_revision,
         attempt,
         task_id,
+        ..
     } = origin
     else {
         return None;

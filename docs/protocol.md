@@ -43,9 +43,9 @@ every pending operation as a connection error in that case.
 | `0x06` | `MOUSE`                 | `[pty_id:2][type:1][button:1][col:2][row:2]`                                                                                                                                                                                                     |
 | `0x07` | `RESTART`               | `[pty_id:2]`                                                                                                                                                                                                                                     |
 | `0x08` | `PING`                  | _(empty)_ — application-level keepalive                                                                                                                                                                                                          |
-| `0x09` | `CLIENT_LIST`           | `[nonce:2]` — enumerate connected clients                                                                                                                                                                                                        |
+| `0x09` | `CLIENT_LIST`           | `[nonce:2]` or `[nonce:2][flags:1]` — enumerate connected clients; `flags` bit 0 (`WANT_ORIGIN`) asks for `S2C_CLIENT_LIST2`                                                                                                                     |
 | `0x0A` | `KICK`                  | `[nonce:2][client_id:8][reason:N]` — disconnect another client with a UTF-8 reason                                                                                                                                                               |
-| `0x0B` | `CLIENT_WATCH`          | `[nonce:2]` — subscribe to live client-catalog snapshots                                                                                                                                                                                         |
+| `0x0B` | `CLIENT_WATCH`          | `[nonce:2]` or `[nonce:2][flags:1]` — subscribe to live client-catalog snapshots, under the same flags as `CLIENT_LIST`                                                                                                                          |
 | `0x0C` | `CLIENT_UNWATCH`        | `[nonce:2]` — stop the client-catalog subscription using this nonce                                                                                                                                                                              |
 | `0x0F` | `QUIT`                  | _(empty)_ — request server shutdown                                                                                                                                                                                                              |
 | `0x10` | `CREATE`                | `[rows:2][cols:2][tag_len:2][tag:N]`                                                                                                                                                                                                             |
@@ -161,6 +161,30 @@ can produce an update that often even when topology is unchanged; between
 samples only a real topology change publishes. Multiple watch nonces per client
 are valid.
 
+A `CLIENT_LIST` or `CLIENT_WATCH` may carry one trailing flags byte once
+`FEATURE_CLIENT_ORIGIN` is advertised. Its bit 0 (`CLIENT_LIST_WANT_ORIGIN`)
+asks for `S2C_CLIENT_LIST2`, which is the same message with
+`[origin_kind:1][origin_len:2][origin:N]` appended to every entry.
+`origin_kind` is `0` for an ordinary client — a browser, a CLI, a forwarder,
+with an empty payload — or `1` for the connection belonging to a running
+extension attempt, whose payload is
+`[extension_id:8][definition_revision:8][attempt:8][task_id:4][name:N]`. The
+name is the durable name of a persistent definition or the label a transient
+`ext run` carried, empty when it has neither, and is captured when the
+connection opens, so it names the definition the attempt started from.
+`origin_len` is what a reader skips past a kind it does not know, which is how
+a later kind can carry a payload without a third opcode.
+
+The wider entry needs its own opcode because both shipped parsers reject a
+catalog with bytes left over — it has to be unreadable to them by construction.
+For the same reason, a flags byte is only safe once the feature bit is seen:
+every server answers a client-control request with unexpected trailing bytes
+with `INVALID`, and so does this one for a flag it does not recognise. Any
+unknown flag bit is refused rather than ignored, so a client asking for a shape
+the server cannot produce hears about it instead of misreading the reply.
+`CLIENT_UNWATCH` takes no flags: a watch keeps the shape it was opened with for
+its whole life.
+
 `S2C_KICK_RESULT` is the status reply for the whole client-control family, not
 only for `C2S_KICK`: a malformed `CLIENT_LIST` / `CLIENT_WATCH` /
 `CLIENT_UNWATCH` is answered with `INVALID` under the sender's nonce rather
@@ -170,8 +194,9 @@ A request too short to carry a nonce (fewer than three bytes) is the one case
 the server drops, because the nonce would be a guess.
 
 The `blit client list` CLI filters its own short-lived connection from its
-output, while persistent clients can use `self_id` to identify their own live
-record. Client IDs are a per-process counter, not a capability or a stable
+output, and prints an `ORIGIN` column (`network`, `ext:<name>`, `ext:id:<hex>`)
+whenever the server offers origins — `unknown` when it does not. Persistent
+clients can use `self_id` to identify their own live record. Client IDs are a per-process counter, not a capability or a stable
 identity: they are only meaningful for the life of the server process,
 `HELLO.boot_generation` identifies that lifetime, and a client can infer from
 its own ID how many connections preceded it.
@@ -283,6 +308,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | `0x12` | `CLIENT_LIST`          | `[nonce:2][self_id:8][count:4][client:N]…` — sorted connection records, including the requester                                                                                                                                                                                                                                             |
 | `0x13` | `KICK_RESULT`          | `[nonce:2][status:1][detail:N]` — correlated result of `C2S_KICK`                                                                                                                                                                                                                                                                           |
 | `0x14` | `KICKED`               | `[reason:N]` — another client kicked this connection; the server closes it after delivery                                                                                                                                                                                                                                                   |
+| `0x15` | `CLIENT_LIST2`         | `CLIENT_LIST` with `[origin_kind:1][origin_len:2][origin:N]` on every record — answer to a request carrying `WANT_ORIGIN`                                                                                                                                                                                                                   |
 | `0x20` | `SURFACE_CREATED`      | `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`                                                                                                                                                                                                                                                       |
 | `0x21` | `SURFACE_DESTROYED`    | `[surface_id:2]`                                                                                                                                                                                                                                                                                                                            |
 | `0x22` | `SURFACE_FRAME`        | `[surface_id:2][timestamp:4][flags:1][w:2][h:2][data:N]`                                                                                                                                                                                                                                                                                    |
@@ -349,6 +375,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 24  | `ENV`                 | Server answers `ENV_GET` with its own environment               |
 | 25  | `APP_SOCKET`          | `C2S_APP_SOCKET` mints per-application Wayland sockets          |
 | 26  | `CHANNEL_WATCH`       | `CHANNEL_WATCH` follows which channel names have a listener     |
+| 27  | `CLIENT_ORIGIN`       | The client catalog can say which connections are extensions     |
 
 Bit 26 is advertised with bit 12 and never alone; it is separate because a
 `WATCH` an older server does not know is dropped by the channel family's

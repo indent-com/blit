@@ -2,19 +2,20 @@ use std::collections::HashMap;
 
 use blit_remote::{AXIS_SOURCE_FINGER, AXIS_SOURCE_WHEEL, PointerAxisEvent};
 use blit_remote::{
-    C2S_CLIENT_FEATURES, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_LIST,
+    C2S_CLIENT_FEATURES, C2S_CLIENT_LIST, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_LIST,
     C2S_SURFACE_POINTER, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CODEC_SUPPORT_AV1,
     CODEC_SUPPORT_AV1_444, CODEC_SUPPORT_H264, CODEC_SUPPORT_H264_444, CREATE2_WANT_STATUS,
-    EXIT_REASON_NORMAL, EXIT_STATUS_UNKNOWN, FEATURE_CLIENT_CONTROL, FEATURE_CREATE_STATUS,
-    FEATURE_PTY_DEADLINE, KICK_REASON_MAX, S2C_CLIPBOARD_CONTENT, S2C_CLIPBOARD_LIST, S2C_EXITED,
-    S2C_HELLO, S2C_KICKED, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SURFACE_CAPTURE,
-    S2C_SURFACE_FRAME, S2C_SURFACE_LIST, S2C_TERM_CWD, S2C_TEXT, S2C_TITLE, S2C_UPDATE, STATUS_OK,
-    SURFACE_FRAME_CODEC_AV1, SURFACE_FRAME_CODEC_MASK, SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg,
-    TerminalState, exit_reason_text, msg_ack, msg_c2s_clipboard_get, msg_c2s_clipboard_list,
-    msg_c2s_clipboard_set, msg_c2s_primary_set, msg_client_list, msg_close, msg_create2_full,
-    msg_deadline, msg_display_rate, msg_input, msg_kick, msg_kill, msg_mouse, msg_quit, msg_read,
-    msg_resize, msg_restart, msg_subscribe, msg_surface_close, msg_surface_focus,
-    msg_surface_input, msg_surface_pointer_axis2, msg_surface_resize, msg_surface_subscribe,
+    EXIT_REASON_NORMAL, EXIT_STATUS_UNKNOWN, FEATURE_CLIENT_CONTROL, FEATURE_CLIENT_ORIGIN,
+    FEATURE_CREATE_STATUS, FEATURE_PTY_DEADLINE, KICK_REASON_MAX, S2C_CLIPBOARD_CONTENT,
+    S2C_CLIPBOARD_LIST, S2C_EXITED, S2C_HELLO, S2C_KICKED, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY,
+    S2C_SURFACE_CAPTURE, S2C_SURFACE_FRAME, S2C_SURFACE_LIST, S2C_TERM_CWD, S2C_TEXT, S2C_TITLE,
+    S2C_UPDATE, STATUS_OK, SURFACE_FRAME_CODEC_AV1, SURFACE_FRAME_CODEC_MASK,
+    SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState, exit_reason_text, msg_ack,
+    msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_c2s_primary_set,
+    msg_client_list, msg_client_list_with_origin, msg_close, msg_create2_full, msg_deadline,
+    msg_display_rate, msg_input, msg_kick, msg_kill, msg_mouse, msg_quit, msg_read, msg_resize,
+    msg_restart, msg_subscribe, msg_surface_close, msg_surface_focus, msg_surface_input,
+    msg_surface_pointer_axis2, msg_surface_resize, msg_surface_subscribe,
     msg_surface_subscribe_ext, msg_surface_subscribe_scaled, msg_surface_text, msg_term_cwd,
     parse_server_msg, parse_term_cwd_reply, status_text,
 };
@@ -297,7 +298,16 @@ pub async fn cmd_clients(transport: Transport) -> Result<(), String> {
     }
 
     const NONCE: u16 = 1;
-    conn.send(&msg_client_list(NONCE)).await?;
+    // An older server answers the flags byte with INVALID rather than a
+    // catalog, so the ORIGIN column is only asked for when it is on offer —
+    // and prints "unknown" for every row when it is not.
+    let want_origin = conn.features & FEATURE_CLIENT_ORIGIN != 0;
+    let request = if want_origin {
+        msg_client_list_with_origin(C2S_CLIENT_LIST, NONCE)
+    } else {
+        msg_client_list(NONCE)
+    };
+    conn.send(&request).await?;
     loop {
         let data = conn.recv().await?;
         // KICK_RESULT is the client-control family's status reply, so a
@@ -325,7 +335,9 @@ pub async fn cmd_clients(transport: Transport) -> Result<(), String> {
         }) = reply
             && nonce == NONCE
         {
-            println!("ID\tAGE_S\tOUT_BYTES_S\tIN_BYTES_S\tSUBSCRIPTIONS\tTERMINALS\tSURFACES");
+            println!(
+                "ID\tAGE_S\tOUT_BYTES_S\tIN_BYTES_S\tSUBSCRIPTIONS\tTERMINALS\tSURFACES\tORIGIN"
+            );
             for client in clients
                 .into_iter()
                 .filter(|client| client.client_id != self_id)
@@ -373,8 +385,22 @@ pub async fn cmd_clients(transport: Transport) -> Result<(), String> {
                     })
                     .collect::<Vec<_>>()
                     .join(",");
+                let origin = match &client.origin {
+                    None => "unknown".to_string(),
+                    Some(blit_remote::ClientOrigin::Network) => "network".to_string(),
+                    Some(blit_remote::ClientOrigin::Extension {
+                        extension_id, name, ..
+                    }) => {
+                        if name.is_empty() {
+                            format!("ext:id:{extension_id:016x}")
+                        } else {
+                            format!("ext:{name}")
+                        }
+                    }
+                    Some(blit_remote::ClientOrigin::Unknown { kind, .. }) => format!("kind:{kind}"),
+                };
                 println!(
-                    "{}\t{}\t{}\t{}\t{subscriptions}\t{terminals}\t{surfaces}",
+                    "{}\t{}\t{}\t{}\t{subscriptions}\t{terminals}\t{surfaces}\t{origin}",
                     client.client_id,
                     client.age_secs,
                     client.outbound_bytes_per_sec,
@@ -2210,6 +2236,7 @@ mod tests {
                                 kind: blit_remote::CLIENT_SUBSCRIPTION_FS,
                                 id: 3,
                             }],
+                            origin: None,
                         },
                         blit_remote::ClientListEntry {
                             client_id: 7,
@@ -2219,6 +2246,7 @@ mod tests {
                             terminals: vec![],
                             surfaces: vec![],
                             subscriptions: vec![],
+                            origin: None,
                         },
                     ],
                 ),

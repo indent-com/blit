@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest";
+import type { BlitClientInfo, BlitClientOrigin } from "@blit-sh/core";
 import {
   formatClientAge,
   formatClientBandwidth,
+  formatClientLabel,
+  formatClientOriginTag,
   formatClientSubscription,
+  formatExtensionAttempt,
+  formatExtensionTitle,
+  formatKickAction,
   formatSurfaceViewSize,
   formatTerminalViewSize,
 } from "../clientDisplay";
@@ -49,5 +55,70 @@ describe("client subscription sizes", () => {
     expect(formatClientSubscription(5, 6)).toBe("KV #6");
     expect(formatClientSubscription(6, 7)).toBe("Network #7");
     expect(formatClientSubscription(99, 8)).toBe("Unknown 99 #8");
+  });
+});
+
+describe("client identity", () => {
+  function client(origin: BlitClientOrigin | null): BlitClientInfo {
+    return {
+      id: 7n,
+      ageSeconds: 11,
+      outboundBytesPerSecond: 0,
+      inboundBytesPerSecond: 0,
+      subscriptions: [],
+      terminals: [],
+      surfaces: [],
+      origin,
+    };
+  }
+
+  const extension: BlitClientOrigin = {
+    kind: "extension",
+    extensionId: 0x05a3415a2dd1ef9bn,
+    definitionRevision: 2n,
+    attempt: 3n,
+    taskId: 4,
+    name: "systemd",
+  };
+
+  it("names an extension by its definition, not its connection id", () => {
+    expect(formatClientLabel(client(extension))).toBe("systemd");
+    expect(formatClientOriginTag(client(extension))).toBe("extension");
+    expect(formatExtensionAttempt(client(extension))).toBe("attempt 3");
+    // The task id is a random 32-bit handle, not an ordinal, so it stays in
+    // the tooltip where it costs no attention until someone wants it.
+    expect(formatExtensionTitle(client(extension))).toBe(
+      "Extension id:05a3415a2dd1ef9b · revision 2 · task 4",
+    );
+  });
+
+  it("falls back to the id an unnamed transient run is addressed by", () => {
+    // The same handle the extensions panel shows and `ext status` accepts.
+    expect(formatClientLabel(client({ ...extension, name: "" }))).toBe(
+      "id:05a3415a2dd1ef9b",
+    );
+  });
+
+  it("leaves an ordinary client, and an unasked one, unadorned", () => {
+    for (const origin of [{ kind: "network" } as const, null]) {
+      expect(formatClientLabel(client(origin))).toBe("Client 7");
+      expect(formatClientOriginTag(client(origin))).toBeNull();
+      expect(formatExtensionAttempt(client(origin))).toBeNull();
+      expect(formatKickAction(client(origin)).idle).toBe("Kick");
+    }
+  });
+
+  it("says a kind it cannot name is not an ordinary client", () => {
+    const unknown = client({ kind: "unknown", originKind: 200 });
+    expect(formatClientLabel(unknown)).toBe("Client 7");
+    expect(formatClientOriginTag(unknown)).toBe("unrecognized");
+  });
+
+  it("tells the viewer that kicking an extension ends its attempt", () => {
+    expect(formatKickAction(client(extension))).toEqual({
+      idle: "Stop attempt",
+      confirm: "Confirm stop",
+      busy: "Stopping…",
+    });
   });
 });

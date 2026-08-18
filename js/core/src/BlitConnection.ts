@@ -1,6 +1,7 @@
 import type {
   BlitConnectionSnapshot,
   BlitClientList,
+  BlitClientOrigin,
   BlitSearchResult,
   BlitSession,
   BlitTransport,
@@ -17,6 +18,7 @@ import {
   FEATURE_COMPOSITOR,
   FEATURE_COPY_RANGE,
   FEATURE_CLIENT_CONTROL,
+  FEATURE_CLIENT_ORIGIN,
   FEATURE_CREATE_NONCE,
   FEATURE_CREATE_STATUS,
   FEATURE_KILL_MODE,
@@ -38,7 +40,10 @@ import {
   S2C_EXITED,
   S2C_HELLO,
   S2C_KICKED,
+  CLIENT_ORIGIN_EXTENSION,
+  CLIENT_ORIGIN_NETWORK,
   S2C_CLIENT_LIST,
+  S2C_CLIENT_LIST2,
   S2C_KICK_RESULT,
   S2C_LIST,
   S2C_READY,
@@ -589,6 +594,35 @@ function fsNodeUpsert(path: string, node: FsNode): FsRecord {
 
 function connectionError(message: string): Error {
   return new Error(message);
+}
+
+/**
+ * Read one `S2C_CLIENT_LIST2` origin block, given the bounds its length prefix
+ * already established.
+ *
+ * A payload that does not fit its kind reads as `unknown` rather than failing
+ * the catalog: the caller knows where the entry ends either way, so one
+ * unreadable origin costs that origin and nothing else.
+ */
+function readClientOrigin(
+  originKind: number,
+  view: DataView,
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+): BlitClientOrigin {
+  if (originKind === CLIENT_ORIGIN_NETWORK) return { kind: "network" };
+  if (originKind === CLIENT_ORIGIN_EXTENSION && end - start >= 28) {
+    return {
+      kind: "extension",
+      extensionId: view.getBigUint64(start, true),
+      definitionRevision: view.getBigUint64(start + 8, true),
+      attempt: view.getBigUint64(start + 16, true),
+      taskId: view.getUint32(start + 24, true),
+      name: textDecoder.decode(bytes.subarray(start + 28, end)),
+    };
+  }
+  return { kind: "unknown", originKind };
 }
 
 /** Unacked upload bytes allowed on the wire at once. Kept small on purpose:
@@ -1430,7 +1464,9 @@ export class BlitConnection {
     return new Promise<BlitClientList>((resolve, reject) => {
       const nonce = this.nextClientControlNonce();
       this.pendingClientLists.set(nonce, { resolve, reject });
-      this.transport.send(buildClientListMessage(nonce));
+      this.transport.send(
+        buildClientListMessage(nonce, this.wantsClientOrigin),
+      );
     });
   }
 
@@ -1481,6 +1517,13 @@ export class BlitConnection {
     });
   }
 
+  /** Whether to ask the catalog where each connection came from. An older
+   *  server answers the flag with `INVALID` instead of a catalog, so this is
+   *  the difference between a missing column and a broken pane. */
+  private get wantsClientOrigin(): boolean {
+    return (this.features & FEATURE_CLIENT_ORIGIN) !== 0;
+  }
+
   private clientControlAvailabilityError(action: string): Error | null {
     if (this.transport.status !== "connected") {
       return connectionError(
@@ -1525,7 +1568,7 @@ export class BlitConnection {
     }
     const nonce = this.nextClientControlNonce();
     this.clientCatalogWatchNonce = nonce;
-    this.transport.send(buildClientWatchMessage(nonce));
+    this.transport.send(buildClientWatchMessage(nonce, this.wantsClientOrigin));
   }
 
   private stopClientCatalogWatch(): void {
@@ -5386,7 +5429,9 @@ export class BlitConnection {
           }
         }
         return;
-      case S2C_CLIENT_LIST: {
+      case S2C_CLIENT_LIST:
+      case S2C_CLIENT_LIST2: {
+        const withOrigin = bytes[0] === S2C_CLIENT_LIST2;
         if (bytes.length < 3) return;
         const view = new DataView(
           bytes.buffer,
@@ -5482,6 +5527,29 @@ export class BlitConnection {
             });
             offset += 3;
           }
+          let origin: BlitClientOrigin | null = null;
+          if (withOrigin) {
+            if (offset + 3 > bytes.length) {
+              malformed();
+              return;
+            }
+            const originKind = bytes[offset];
+            const originLength = view.getUint16(offset + 1, true);
+            const originStart = offset + 3;
+            const originEnd = originStart + originLength;
+            if (originEnd > bytes.length) {
+              malformed();
+              return;
+            }
+            origin = readClientOrigin(
+              originKind,
+              view,
+              bytes,
+              originStart,
+              originEnd,
+            );
+            offset = originEnd;
+          }
           clients.push({
             id,
             ageSeconds,
@@ -5490,6 +5558,7 @@ export class BlitConnection {
             subscriptions,
             terminals,
             surfaces,
+            origin,
           });
         }
         if (offset !== bytes.length) {
