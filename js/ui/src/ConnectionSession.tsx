@@ -16,20 +16,15 @@
  * channel connect fails and the section stays out of the way, which is why this
  * renders nothing at all rather than an error when it cannot attach.
  *
- * Like the clients section, the subscription lives here: it opens when the
- * remote's row is expanded and closes when it is collapsed, so a collapsed
- * remote costs no channel traffic.
+ * The channel itself is not this panel's. It belongs to {@link
+ * ./sessionCatalogs.ts}, which holds one per connected server for the life of
+ * the page so the switcher can search applications without waiting for a
+ * catalog. This panel used to open its own and close it on the way out; two
+ * mirrors of one supervisor also meant two icon caches filling with the same
+ * artwork.
  */
 
-import {
-  createEffect,
-  createMemo,
-  createSignal,
-  For,
-  onCleanup,
-  onMount,
-  Show,
-} from "solid-js";
+import { createEffect, createSignal, For, Show } from "solid-js";
 import type {
   BlitWorkspace,
   ConnectionId,
@@ -45,7 +40,13 @@ import {
   StatusPill,
   type PanelTone,
 } from "./panelKit";
-import { openSession, type SessionApp, type SessionHandle } from "./session";
+import type { SessionApp } from "./session";
+import {
+  applicationIcon,
+  requestApplicationIcons,
+  sessionHandle,
+} from "./sessionCatalogs";
+import { createLazyIcons } from "./lazyIcons";
 
 /** Phase → the tone and word the row shows. Backoff is a warning rather than
  *  an error: it is a supervisor working, not a supervisor stuck. */
@@ -71,51 +72,20 @@ export function ConnectionSession(props: {
 }) {
   const theme = () => themeFor(props.palette);
   const scale = () => uiScale(props.fontSize);
-  const [handle, setHandle] = createSignal<SessionHandle | null>(null);
-  // Bumped from the mirror's subscribe, since the handle's getters are plain
-  // properties rather than signals.
-  const [revision, setRevision] = createSignal(0);
   const [filter, setFilter] = createSignal("");
 
-  const connection = props.workspace.getConnection(props.connectionId);
-  if (connection) {
-    let live = true;
-    // Hoisted out of the `then`, which runs with no reactive owner: an
-    // `onCleanup` registered in there is never called — Solid says so, on the
-    // console — so the subscription outlived every panel that opened one.
-    let unsubscribe: (() => void) | undefined;
-    void openSession(connection, {
-      onClosed: () => {
-        setHandle(null);
-      },
-    })
-      .then((opened) => {
-        // The row can collapse while the channel is still opening.
-        if (!live) {
-          opened.close();
-          return;
-        }
-        setHandle(opened);
-        unsubscribe = opened.subscribe(() => setRevision((n) => n + 1));
-      })
-      // No supervisor on this server: the section renders nothing rather than
-      // an error, because "this server does not run one" is not a fault.
-      .catch(() => setHandle(null));
-    onCleanup(() => {
-      live = false;
-      unsubscribe?.();
-      handle()?.close();
-    });
-  }
+  // The channel belongs to the catalog store, which holds one per connected
+  // server for the whole page. This panel used to open its own and close it on
+  // the way out; sharing is not only one channel instead of two, but one icon
+  // cache instead of two holding the same artwork.
+  //
+  // Null while the server has no supervisor attached — the connect was refused,
+  // or has not answered yet — and the panel then renders nothing, because "this
+  // server does not run one" is not a fault to report.
+  const handle = () => sessionHandle(props.connectionId);
 
-  const apps = () => {
-    revision();
-    return handle()?.apps ?? [];
-  };
-  const catalog = () => {
-    revision();
-    return handle()?.catalog ?? [];
-  };
+  const apps = () => handle()?.apps ?? [];
+  const catalog = () => handle()?.catalog ?? [];
   /** Whether the supervisor's first message has landed.
    *
    *  The channel opens before the greeting arrives, and the greeting is what
@@ -123,10 +93,7 @@ export function ConnectionSession(props: {
    *  "nothing is managed yet" in that window is a lie, and a convincing one:
    *  the greeting waits behind a catalog read, which on a busy supervisor is
    *  long enough to read and believe. */
-  const ready = () => {
-    revision();
-    return handle()?.ready ?? false;
-  };
+  const ready = () => handle()?.ready ?? false;
   /** Installed applications that are not already managed, matched against the
    *  filter box. A managed app is offered by its own row, not this list. */
   const addable = () => {
@@ -141,80 +108,30 @@ export function ConnectionSession(props: {
           entry.id.toLowerCase().includes(needle),
       );
   };
-  /** Artwork for one row. Reads the revision like every other accessor here:
-   *  an icon arrives long after the row that wants it was drawn, and the
-   *  handle's getters are plain properties rather than signals, so without
-   *  this the reply lands in the mirror and nothing re-renders. */
-  const iconOf = (id: string) => {
-    revision();
-    return handle()?.icon(id);
-  };
+  /** Artwork for one row. Goes through the store rather than the handle:
+   *  the handle's getters are plain properties, so a reply landing in the
+   *  mirror would change nothing a row is watching. The store's accessor is
+   *  reactive, and an icon always arrives long after its row was drawn. */
+  const iconOf = (id: string) => applicationIcon(props.connectionId, id);
 
   // Artwork is asked for, never pushed: the catalog is names, and its icons are
   // three orders of magnitude larger. The managed set is small and always on
   // screen, so it is asked for outright.
   createEffect(() => {
-    const session = handle();
-    if (!session) return;
-    session.requestIcons(apps().map((app) => app.id));
+    if (!handle()) return;
+    requestApplicationIcons(
+      props.connectionId,
+      apps().map((app) => app.id),
+    );
   });
 
-  // The catalog is not. Every installed application is a row, which on a
-  // machine with a games library is nine hundred of them — asking for all that
-  // artwork would be tens of megabytes to draw a dozen tiles. So a row asks
-  // only once it is near the list's viewport, and the observer's own batching
-  // is what turns a scroll into one request rather than one per row.
-  const [scroller, setScroller] = createSignal<HTMLElement>();
-  const iconWatcher = createMemo<IntersectionObserver | undefined>(() => {
-    const root = scroller();
-    // Absent under jsdom, and there is nothing to observe before the list
-    // exists. Rows fall back to asking outright, so a client without it still
-    // shows artwork — it just asks for more of it.
-    if (!root || typeof IntersectionObserver === "undefined") return undefined;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const ids = entries
-          .filter((entry) => entry.isIntersecting)
-          .map((entry) => (entry.target as HTMLElement).dataset.appId)
-          .filter((id): id is string => id !== undefined);
-        // Rows stay observed after asking, rather than being released once
-        // they have. The handle drops an id it already holds, so re-entering
-        // the list costs nothing — and it is the only thing that ever asks
-        // again for a row whose answer was lost on the way back.
-        if (ids.length > 0) handle()?.requestIcons(ids);
-      },
-      // Rooted at the list, not at the page. `rootMargin` grows the *root's*
-      // rectangle and nothing else, so rooting this at the viewport made the
-      // margin dead weight: the list's own overflow still clipped every row
-      // past its bottom edge, one screen of lookahead was really none, and
-      // scrolling left a wake of monograms it never caught up with.
-      //
-      // Several screens of it, because a round trip is a child process on the
-      // far end whatever it asks for — reaching well past the fold is what
-      // lets one of them cover a whole flick of the wheel.
-      { root, rootMargin: "1500px" },
-    );
-    onCleanup(() => observer.disconnect());
-    return observer;
-  });
-  /** Attach one catalog row to the watcher, or ask outright without one.
-   *
-   *  Deferred to `onMount` because a child's `ref` runs before its parent's:
-   *  called straight from the row's ref, this would find no observer — the
-   *  scroller that roots it does not exist yet — and every row would ask
-   *  outright, which is the storm the observer is here to prevent. */
-  const watchForIcon = (element: HTMLElement, id: string) => {
-    element.dataset.appId = id;
-    onMount(() => {
-      const watcher = iconWatcher();
-      if (!watcher) {
-        handle()?.requestIcons([id]);
-        return;
-      }
-      watcher.observe(element);
-      onCleanup(() => watcher.unobserve(element));
-    });
-  };
+  // The catalog is not: every installed application is a row, and asking for
+  // all that artwork would be tens of megabytes to draw a dozen tiles. So the
+  // rows ask as they come into view — see {@link ./lazyIcons.ts} for why the
+  // observer is rooted and registered the way it is.
+  const lazyIcons = createLazyIcons((ids) =>
+    requestApplicationIcons(props.connectionId, ids),
+  );
 
   return (
     <Show when={handle()}>
@@ -463,7 +380,7 @@ export function ConnectionSession(props: {
                 lengthen the panel would scroll the search box — the one
                 control for a nine-hundred-row list — off the top. */}
             <div
-              ref={setScroller}
+              ref={lazyIcons.setRoot}
               style={{
                 "max-height": "42vh",
                 "overflow-y": "auto",
@@ -475,7 +392,7 @@ export function ConnectionSession(props: {
                 {(entry) => (
                   <PanelRow theme={theme()} scale={scale()}>
                     <div
-                      ref={(element) => watchForIcon(element, entry.id)}
+                      ref={(element) => lazyIcons.watch(element, entry.id)}
                       style={{
                         display: "flex",
                         "align-items": "center",
