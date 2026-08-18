@@ -9,8 +9,11 @@ import {
   desktopDelivery,
   desktopNativeTag,
   canRaiseMpris,
+  canSeekMpris,
   desktopNotificationHasDetail,
   matchesDesktopNotification,
+  mprisHasProgress,
+  mprisSeekTargetUs,
   popupViewportShift,
   portalDialogFocusTarget,
   reconcileMprisSubscriptions,
@@ -243,6 +246,45 @@ describe("desktop notification presentation", () => {
     expect(canRaiseMpris(false, 1 << 6)).toBe(true);
     expect(canRaiseMpris(true, 1 << 6)).toBe(false);
     expect(canRaiseMpris(false, 1 << 0)).toBe(false);
+  });
+});
+
+describe("MPRIS progress", () => {
+  const CONTROL = 1 << 0;
+  const SEEK = 1 << 5;
+
+  it("draws a bar only for a track whose length is known", () => {
+    expect(mprisHasProgress(180_000_000)).toBe(true);
+    // A live stream reports -1, and a player that has not loaded one yet 0.
+    expect(mprisHasProgress(-1)).toBe(false);
+    expect(mprisHasProgress(0)).toBe(false);
+  });
+
+  it("takes a drag only when CanSeek accompanies CanControl", () => {
+    expect(canSeekMpris(false, CONTROL | SEEK, 180_000_000)).toBe(true);
+    // CanSeek without CanControl is advertised by players that expose their
+    // position but refuse commands; the bar still draws, it just does not move.
+    expect(canSeekMpris(false, SEEK, 180_000_000)).toBe(false);
+    expect(canSeekMpris(false, CONTROL, 180_000_000)).toBe(false);
+    expect(canSeekMpris(true, CONTROL | SEEK, 180_000_000)).toBe(false);
+    expect(canSeekMpris(false, CONTROL | SEEK, -1)).toBe(false);
+  });
+
+  it("stops a scrub short of the end the bridge would reject", () => {
+    expect(mprisSeekTargetUs(90_000_000, 180_000_000)).toBe(90_000_000);
+    // Dragged to the far right: SetPosition at or past mpris:length fails, so
+    // the last reachable microsecond has to be inside the track.
+    expect(mprisSeekTargetUs(180_000_000, 180_000_000)).toBe(179_999_000);
+    expect(mprisSeekTargetUs(999_000_000, 180_000_000)).toBe(179_999_000);
+  });
+
+  it("refuses to invent a target the player could not honour", () => {
+    expect(mprisSeekTargetUs(-5, 180_000_000)).toBe(0);
+    expect(mprisSeekTargetUs(1_000, -1)).toBe(0);
+    expect(mprisSeekTargetUs(Number.NaN, 180_000_000)).toBe(0);
+    // A track shorter than the millisecond of headroom clamps to its start
+    // rather than to a negative position.
+    expect(mprisSeekTargetUs(400, 500)).toBe(0);
   });
 });
 

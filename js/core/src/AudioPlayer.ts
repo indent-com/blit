@@ -112,6 +112,28 @@ const FLOOR_DECAY_STABLE_SAMPLES = 1_440_000; // 30 s at 48 kHz
  */
 export const MAX_LEARNED_FLOOR_SAMPLES = 9600; // 200 ms at 48 kHz
 
+/**
+ * Ceiling on the floor taken from the *output device*.
+ *
+ * The learned floor above is what the link turned out to need. This is the
+ * other half: what the sink needs, which no amount of network health can
+ * reduce. A device with a deep buffer does not consume audio smoothly — it
+ * wakes rarely and asks for everything at once, and a buffer holding less
+ * than one of those bites empties on every single one. Bluetooth is the case
+ * that matters: 150–300 ms is ordinary there against 5–20 ms wired.
+ *
+ * The floor is taken from `AudioContext.outputLatency`, which is an upper
+ * bound on a bite rather than the bite itself — the safe direction to err,
+ * and the reason wired playback is untouched: every wired sink reports well
+ * under the 60 ms MIN, so its floor stays exactly where it was. Only a device
+ * whose own latency already exceeds MIN moves at all, and for that device the
+ * added latency is not really added: it was already paying it downstream.
+ *
+ * Capped so that a bogus or pathological reading cannot walk playback into
+ * seconds of latency the way an uncapped adaptive target once did.
+ */
+export const MAX_DEVICE_FLOOR_SAMPLES = 19200; // 400 ms at 48 kHz
+
 // -- A/V sync constants ----------------------------------------------------
 
 /** How often the worklet reports its consumed-sample position (in samples). */
@@ -261,6 +283,7 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
     this.bufferTarget = ${MIN_BUFFER_SAMPLES}; // adaptive: grows on underrun, shrinks on stability
     this.stableSamples = 0; // consumed samples of underrun-free playback (drives shrinking)
     this.learnedFloor = ${MIN_BUFFER_SAMPLES}; // slow-decaying memory of the headroom this link needed
+    this.deviceFloor = ${MIN_BUFFER_SAMPLES};  // headroom the *sink* needs; set from outputLatency, never decays
     this.floorStableSamples = 0; // drives the floor's own, much slower decay
     this.underruns = 0;     // consecutive underruns, drives adaptive buffer growth
     this.fadeGain = 0;      // applied output gain (0..1), ramps to mask underrun clicks
@@ -276,9 +299,11 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
         this.buffered = 0;
         this.buffering = true;
         this.underruns = 0;
-        this.bufferTarget = ${MIN_BUFFER_SAMPLES};
+        // Back to the floor, not to MIN: a flush discards audio, not the
+        // sink it was going to be played on.
+        this.bufferTarget = this.deviceFloor;
         this.stableSamples = 0;
-        this.learnedFloor = ${MIN_BUFFER_SAMPLES};
+        this.learnedFloor = this.deviceFloor;
         this.floorStableSamples = 0;
         this.fadeGain = 0;
       } else if (e.data && e.data.type === "skip") {
@@ -318,6 +343,18 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
         });
       } else if (e.data && e.data.type === "rate") {
         this.rate = e.data.value;
+      } else if (e.data && e.data.type === "device-floor") {
+        // What the sink needs. Raise immediately rather than waiting for an
+        // underrun to teach it: the first bite off a deep device arrives
+        // before any adaptation could have happened, and it is the one that
+        // would glitch.
+        this.deviceFloor = e.data.samples | 0;
+        if (this.bufferTarget < this.deviceFloor) {
+          this.bufferTarget = this.deviceFloor;
+        }
+        if (this.learnedFloor < this.deviceFloor) {
+          this.learnedFloor = this.deviceFloor;
+        }
       } else {
         this.buffer.push(e.data);
         this.buffered += e.data.length / 2; // half = per-channel sample count
@@ -337,6 +374,16 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
   // reported to the main thread — wants the exact figure.
   depth() {
     return this.buffered - this.offset;
+  }
+
+  // The adaptive ceiling exists to bound the latency this buffer *adds*, so
+  // it is measured from the floor rather than from zero. A sink that costs
+  // 300 ms on its own would otherwise be left with 100 ms of adaptive room
+  // where a wired one gets 340 — least headroom exactly where the jitter is
+  // worst.
+  ceiling() {
+    return this.deviceFloor +
+      ${MAX_BUFFER_TARGET_SAMPLES - MIN_BUFFER_SAMPLES};
   }
 
   process(_inputs, outputs) {
@@ -461,7 +508,7 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
         if (this.underruns === 1) {
           this.bufferTarget = Math.min(
             this.bufferTarget + ${SAMPLES_PER_20_MS * GROW_FRAMES_PER_UNDERRUN},
-            ${MAX_BUFFER_TARGET_SAMPLES}
+            this.ceiling()
           );
           this.port.postMessage({
             type: "event",
@@ -476,7 +523,7 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
           // one proved necessary.
           this.learnedFloor = Math.min(
             Math.max(this.learnedFloor, this.bufferTarget),
-            ${MAX_LEARNED_FLOOR_SAMPLES}
+            Math.max(${MAX_LEARNED_FLOOR_SAMPLES}, this.deviceFloor)
           );
           this.floorStableSamples = 0;
         }
@@ -505,11 +552,14 @@ class BlitAudioProcessor extends AudioWorkletProcessor {
         this.floorStableSamples += needed;
         if (
           this.floorStableSamples >= ${FLOOR_DECAY_STABLE_SAMPLES} &&
-          this.learnedFloor > ${MIN_BUFFER_SAMPLES}
+          this.learnedFloor > this.deviceFloor
         ) {
+          // Decays to the *device* floor, not to MIN. What the link needed is
+          // forgotten once it behaves; what the sink needs is not something it
+          // can stop needing.
           this.learnedFloor = Math.max(
             this.learnedFloor - ${SAMPLES_PER_20_MS},
-            ${MIN_BUFFER_SAMPLES}
+            this.deviceFloor
           );
           this.floorStableSamples = 0;
         }
@@ -745,6 +795,8 @@ export class AudioPlayer {
   private smoothedRate = 1.0;
   /** Worklet's current adaptive bufferTarget (samples), mirrored from reports. */
   private currentBufferTarget = MIN_BUFFER_SAMPLES;
+  /** Floor imposed by the output device (samples), from its reported latency. */
+  private deviceFloorSamples = MIN_BUFFER_SAMPLES;
   /** Last observed buffered depth (samples, from pos reports) — feeds the drift servo. */
   private lastBufferedSamples = 0;
   /** Timestamp (ms) of the last `skip` posted to the worklet; gates SKIP_COOLDOWN_MS. */
@@ -758,12 +810,22 @@ export class AudioPlayer {
    * genuinely bad link. `peakTargetSamples` is the interesting one: it is the
    * headroom this connection actually turned out to need, which the decay
    * gives back within half a minute of calm.
+   *
+   * Underruns are only half the story, and reporting them alone is actively
+   * misleading: a buffer that runs *dry* underruns, but a buffer that runs
+   * *deep* is cut back by `skip`, and a buffer whose pipeline is rebuilt loses
+   * everything in it. Both of those are audible gaps with no underrun
+   * attached, so a link that glitches constantly can read zero underruns
+   * forever. `skippedSamples` is the honest measure there — how much audio was
+   * thrown away, not how many times we decided to throw some.
    */
   private stats = {
     underruns: 0,
     rebuffers: 0,
     shrinks: 0,
     skips: 0,
+    skippedSamples: 0,
+    resets: 0,
     peakTargetSamples: MIN_BUFFER_SAMPLES,
   };
 
@@ -817,8 +879,26 @@ export class AudioPlayer {
     rebuffers: number;
     shrinks: number;
     skips: number;
+    skippedMs: number;
+    resets: number;
+    outputLatencyMs: number;
+    baseLatencyMs: number;
+    sampleRate: number;
+    deviceFloorMs: number;
   } {
+    // Nothing in the jitter buffer consults the output device, and on a sink
+    // that buffers deeply — Bluetooth above all — that is the difference
+    // between a working link and a broken one: the device asks for audio in
+    // large infrequent bites, so a 60 ms target cannot survive one bite and
+    // the depth *between* bites reads as runaway latency to the skip
+    // backstop. The buffer's numbers are unreadable without knowing which
+    // kind of sink produced them, so report the sink alongside them.
+    const ctx = this.ctx as (AudioContext & { outputLatency?: number }) | null;
     return {
+      outputLatencyMs: Math.round((ctx?.outputLatency ?? 0) * 1000),
+      baseLatencyMs: Math.round((ctx?.baseLatency ?? 0) * 1000),
+      sampleRate: Math.round(ctx?.sampleRate ?? 0),
+      deviceFloorMs: Math.round(this.deviceFloorSamples / 48),
       targetMs: Math.round(this.currentBufferTarget / 48),
       peakMs: Math.round(this.stats.peakTargetSamples / 48),
       // Received counts headers arriving on this thread; decoded counts what
@@ -831,6 +911,8 @@ export class AudioPlayer {
       rebuffers: this.stats.rebuffers,
       shrinks: this.stats.shrinks,
       skips: this.stats.skips,
+      skippedMs: Math.round(this.stats.skippedSamples / 48),
+      resets: this.stats.resets,
     };
   }
 
@@ -863,6 +945,22 @@ export class AudioPlayer {
    * the choice has to survive that.
    */
   setOutputDevice(deviceId: string): void {
+    // Re-applying the id the context already has is not free: `setSinkId` may
+    // rebuild the destination and fire `sinkchange`, which this class answers
+    // with a full `resetPipeline()` — a closed context, a re-added worklet, and
+    // a jitter buffer refilled from empty. That is an audible stop, and since
+    // one AudioContext plays the whole remote mix it stops every application on
+    // the far side at once, including ones nobody touched.
+    //
+    // The guard belongs here rather than in the callers, because they re-run for
+    // reasons that have nothing to do with the sink: the choice is re-applied
+    // whenever the set of connections changes, and a workspace snapshot is
+    // rebuilt for any remote change at all — a media player on the far side
+    // going from playing to paused was enough to re-run it.
+    //
+    // A rebuilt context still picks the choice up: `initAudioContext` applies
+    // `_outputDeviceId` itself rather than waiting to be told again.
+    if (deviceId === this._outputDeviceId) return;
     this._outputDeviceId = deviceId;
     void this.applyOutputDevice();
   }
@@ -1122,6 +1220,11 @@ export class AudioPlayer {
    * intact — no re-subscribe round-trip is needed.
    */
   resetPipeline(): void {
+    // A rebuild is silence for as long as the context, worklet and decoder
+    // take to come back, and then a full jitter buffer's worth on top. It is
+    // the loudest thing this player does, so it has to be on the record —
+    // a reset loop otherwise presents as clean counters and broken audio.
+    this.stats.resets += 1;
     this.worker?.postMessage({ type: "reset-decoder" });
     if (this.decoder && this.decoder.state !== "closed") {
       try {
@@ -1154,6 +1257,32 @@ export class AudioPlayer {
   }
 
   // -- Internal: rate servo -------------------------------------------------
+
+  /**
+   * Tell the worklet how much headroom this output device needs.
+   *
+   * `outputLatency` is not available until the context has actually rendered
+   * — it reads 0 immediately after construction on every engine that reports
+   * it at all — so this is called again from the health check rather than
+   * only at setup, and re-posts whenever the reading moves by more than a
+   * frame. That also covers the device being swapped underneath us.
+   *
+   * Safari reports neither `outputLatency` nor a useful `baseLatency`, so it
+   * keeps the old fixed floor: no worse than before, but not fixed either.
+   */
+  private applyDeviceFloor(): void {
+    const ctx = this.ctx as (AudioContext & { outputLatency?: number }) | null;
+    if (!ctx || !this.worklet) return;
+    const seconds = ctx.outputLatency || ctx.baseLatency || 0;
+    const floor = Math.min(
+      Math.max(Math.round(seconds * 48000), MIN_BUFFER_SAMPLES),
+      MAX_DEVICE_FLOOR_SAMPLES,
+    );
+    if (Math.abs(floor - this.deviceFloorSamples) < SAMPLES_PER_20_MS) return;
+    this.deviceFloorSamples = floor;
+    if (this.currentBufferTarget < floor) this.currentBufferTarget = floor;
+    this.postToWorklet({ type: "device-floor", samples: floor });
+  }
 
   private resetSync(): void {
     this.framesReceived = 0;
@@ -1350,6 +1479,11 @@ export class AudioPlayer {
 
     const now = Date.now();
 
+    // The sink's latency is only knowable once it has rendered, and it can
+    // change under us when a device is swapped, so it is re-read here rather
+    // than trusted from setup time.
+    this.applyDeviceFloor();
+
     // Check if the auto-reset rate limit allows a reset right now.
     const canAutoReset = now - this.lastAutoResetAt > 10_000;
 
@@ -1441,6 +1575,10 @@ export class AudioPlayer {
     }
     this.gain = null;
     this.suspendedSince = 0;
+    // The next context may land on a different device, so the old sink's
+    // floor must not be inherited — applyDeviceFloor() re-derives it once the
+    // new one has rendered.
+    this.deviceFloorSamples = MIN_BUFFER_SAMPLES;
     this.resetSync();
   }
 
@@ -1519,6 +1657,10 @@ export class AudioPlayer {
         outputChannelCount: [2],
       });
       this.worklet.connect(this.gain);
+      // Usually a no-op this early — outputLatency is 0 until the context has
+      // rendered — but a context that reports it up front should not have to
+      // wait for the first health check to get its floor.
+      this.applyDeviceFloor();
 
       // Detect worklet processor crashes.  When process() throws, the
       // worklet fires processorerror and stops processing audio
@@ -1601,7 +1743,15 @@ export class AudioPlayer {
       if (d.kind === "grow") this.stats.underruns += 1;
       else if (d.kind === "rebuffer_start") this.stats.rebuffers += 1;
       else if (d.kind === "shrink") this.stats.shrinks += 1;
-      else if (d.kind === "skip") this.stats.skips += 1;
+      else if (d.kind === "skip") {
+        this.stats.skips += 1;
+        // What the worklet actually dropped, not what we asked it to: a skip
+        // against a shallower-than-reported buffer takes less, and counting
+        // the request would overstate the damage.
+        if (typeof d.skipped === "number") {
+          this.stats.skippedSamples += d.skipped;
+        }
+      }
       // The skip reply carries the post-skip depth — authoritative, and
       // it arrives before the next position report.  Adopt it so the
       // servo works from the real depth rather than our projection.

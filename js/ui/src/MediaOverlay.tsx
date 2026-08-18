@@ -47,6 +47,7 @@ import {
   flipWire,
   isCustomWire,
 } from "./surfaceVideoPrefs";
+import { cameraCodecUnavailableReason } from "./cameraCodecStatus";
 
 /** Bitrate steps for the camera. The scale itself lives in `@blit-sh/core`,
  *  which is where the codec-specific currency (bitrate, JPEG quantizer) is. */
@@ -1287,15 +1288,20 @@ export function MediaOverlay(props: {
                 <Chips
                   label="Camera format"
                   options={CAMERA_CODECS.map((codec) => {
-                    const off =
-                      codec.value !== "auto" && !(sendCodecs() & codec.bits);
+                    const reason =
+                      codec.value === "auto"
+                        ? null
+                        : cameraCodecUnavailableReason(
+                            codec.bits,
+                            devices().cameraCodecs(),
+                            devices().serverCameraCodecs(),
+                            devices().cameraCodecOutcomes(),
+                          );
                     return {
                       label: codec.label,
                       active: devices().cameraCodec() === codec.value,
-                      disabled: off,
-                      title: off
-                        ? "Either this browser cannot encode it or no connected desktop accepts it."
-                        : undefined,
+                      disabled: Boolean(reason),
+                      title: reason ?? undefined,
                       onSelect: () => devices().setCameraCodec(codec.value),
                     };
                   })}
