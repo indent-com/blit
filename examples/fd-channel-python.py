@@ -55,6 +55,23 @@ def read_initial_state(sock):
             return lst
 
 
+def read_reply(sock, opcode, limit=64):
+    """Read frames until one carries `opcode`, skipping unsolicited state.
+
+    A reply is not the next frame. The server pushes state whenever it has
+    some — a compositor with a cursor on it sends SURFACE_CURSOR unprompted —
+    so anything that waits for a specific answer has to skip past what it did
+    not ask for. Bounded so a wrong opcode fails the example rather than
+    hanging it.
+    """
+    for _ in range(limit):
+        msg = read_frame(sock)
+        assert msg, "unexpected empty frame while waiting for a reply"
+        if msg[0] == opcode:
+            return msg
+    raise AssertionError(f"no 0x{opcode:02x} within {limit} frames")
+
+
 def main():
     channel_theirs, channel_ours = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
 
@@ -91,8 +108,7 @@ def main():
         create_msg = struct.pack("<BHHH", C2S_CREATE, 24, 80, 0)
         write_frame(client_ours, create_msg)
 
-        created = read_frame(client_ours)
-        assert created[0] == S2C_CREATED, f"expected CREATED (0x01), got 0x{created[0]:02x}"
+        created = read_reply(client_ours, S2C_CREATED)
         pty_id = struct.unpack_from("<H", created, 1)[0]
         print(f"CREATED: pty_id={pty_id}")
 
