@@ -1,4 +1,6 @@
-use blit_alacritty::{SearchResult as AlacrittySearchResult, TerminalDriver as AlacrittyDriver};
+use blit_alacritty::{
+    SearchResult as AlacrittySearchResult, SeqText, TerminalDriver as AlacrittyDriver,
+};
 use blit_compositor::{
     CompositorCommand, CompositorEvent, CompositorHandle, TouchPhase, TouchPoint,
 };
@@ -83,6 +85,7 @@ mod extension_jobs;
 pub mod extension_store;
 mod gpu_libs;
 mod ipc;
+mod journal;
 mod kv;
 #[cfg(target_os = "linux")]
 mod media_input;
@@ -481,6 +484,18 @@ trait PtyDriver: Send {
     ) -> String;
     fn total_lines(&self) -> u32;
     fn scrolled_lines(&self) -> u64;
+    /// Absolute sequence and column of the cursor
+    /// (docs/design/term-journal.md § Sequences).
+    fn cursor_seq(&self) -> (u64, u16);
+    /// Oldest sequence the scrollback still holds.
+    fn oldest_seq(&self) -> u64;
+    fn seq_text(
+        &self,
+        from_seq: u64,
+        from_col: u16,
+        end_seq: Option<u64>,
+        max_bytes: usize,
+    ) -> SeqText;
 }
 
 struct PtySearchResult {
@@ -588,6 +603,24 @@ impl PtyDriver for AlacrittyDriver {
 
     fn scrolled_lines(&self) -> u64 {
         AlacrittyDriver::scrolled_lines(self)
+    }
+
+    fn cursor_seq(&self) -> (u64, u16) {
+        AlacrittyDriver::cursor_seq(self)
+    }
+
+    fn oldest_seq(&self) -> u64 {
+        AlacrittyDriver::oldest_seq(self)
+    }
+
+    fn seq_text(
+        &self,
+        from_seq: u64,
+        from_col: u16,
+        end_seq: Option<u64>,
+        max_bytes: usize,
+    ) -> SeqText {
+        AlacrittyDriver::seq_text(self, from_seq, from_col, end_seq, max_bytes)
     }
 }
 
@@ -2016,6 +2049,15 @@ struct Pty {
     /// tracking").  Last write wins; None until shell integration first
     /// reports (then `C2S_TERM_CWD` falls back to the kernel's view).
     osc7_cwd: Option<String>,
+    /// Commands this PTY's shell announced through OSC 133
+    /// (docs/design/term-journal.md).  Empty and free for every shell
+    /// without integration.
+    journal: journal::CommandJournal,
+    /// An OSC left unterminated at the end of the last chunk, held so the
+    /// scan of the next one sees the whole sequence.  A PTY read boundary
+    /// falls wherever the kernel put it, and a marker split across one would
+    /// otherwise be lost — silently mis-attributing a command's output.
+    osc_carry: Vec<u8>,
 }
 
 impl Pty {
@@ -6051,6 +6093,10 @@ struct Session {
     /// Direct touch is an implicit-grab sequence. Only this connection may
     /// extend it until all of its contacts are up or it cancels.
     surface_touch_owner: Option<u64>,
+    /// Clients blocked in `C2S_TERM_JOURNAL_WAIT`. Session-scoped because
+    /// what they are waiting on is a PTY, which outlives any one connection
+    /// (docs/design/term-journal.md § Waiting).
+    journal_waiters: Vec<journal::Waiter>,
     #[cfg(target_os = "linux")]
     recent_surface_focus: HashMap<u64, (u16, Instant)>,
     #[cfg(target_os = "linux")]
@@ -6226,6 +6272,7 @@ impl Session {
             surface_frames_sent: 0,
             surface_inputs: HashMap::new(),
             surface_touch_owner: None,
+            journal_waiters: Vec::new(),
             #[cfg(target_os = "linux")]
             recent_surface_focus: HashMap::new(),
             #[cfg(target_os = "linux")]
@@ -8196,6 +8243,11 @@ struct TerminalScan {
     /// (docs/protocol.md, "Working directory tracking"): a percent-decoded
     /// absolute local path of at most `blit_remote::TERM_CWD_MAX` bytes.
     osc7_cwd: Option<String>,
+    /// OSC 133/633 semantic-prompt markers in the chunk, in order, each
+    /// carrying the offset it ended at (docs/design/term-journal.md). Empty
+    /// for every shell without integration, which is the common case and
+    /// costs one failed prefix comparison per OSC.
+    marks: Vec<journal::SemanticMark>,
 }
 
 /// This machine's hostname, for filtering OSC 7 host components.  Cached
@@ -8273,6 +8325,7 @@ fn parse_terminal_queries(data: &[u8], size: (u16, u16), cursor: (u16, u16)) -> 
 
     let mut results = Vec::new();
     let mut osc7_cwd = None;
+    let mut marks = Vec::new();
     let mut i = 0;
     while i < data.len() {
         if data[i] != 0x1b || i + 1 >= data.len() {
@@ -8325,6 +8378,20 @@ fn parse_terminal_queries(data: &[u8], size: (u16, u16), cursor: (u16, u16)) -> 
                     osc7_cwd = Some(cwd);
                 }
                 i = end + if data[end] == 0x07 { 1 } else { 2 };
+                // OSC 133/633 — shell integration says where each command
+                // begins and ends (docs/design/term-journal.md). The offset
+                // matters: a marker means whatever the cursor is when the
+                // bytes *before* it have been drawn, so the caller replays
+                // the chunk in segments split here.
+                if journal::enabled()
+                    && let Some((kind, dialect)) = journal::parse_mark(payload)
+                {
+                    marks.push(journal::SemanticMark {
+                        kind,
+                        dialect,
+                        at: i,
+                    });
+                }
                 continue;
             }
             i = end;
@@ -8381,7 +8448,333 @@ fn parse_terminal_queries(data: &[u8], size: (u16, u16), cursor: (u16, u16)) -> 
     TerminalScan {
         responses: results,
         osc7_cwd,
+        marks,
     }
+}
+
+/// Feed one PTY output chunk to the terminal model: answer the queries in it,
+/// note any OSC 7 report, and apply any shell-integration markers.
+///
+/// Markers are positional. `OSC 133 ; C` means "output starts *here*", and
+/// here is wherever the cursor lands once every byte before the marker has
+/// been drawn — so a chunk carrying markers is handed to the driver in
+/// segments split at each one. A chunk carrying none, which is every chunk
+/// for every shell without integration, takes the single-call path it always
+/// took; the only added cost is a failed prefix comparison per OSC.
+///
+/// Returns the `S2C_TERM_CWD_EVENT` to broadcast, if the cwd changed.
+fn feed_pty_chunk(pty: &mut Pty, id: u16, data: &[u8]) -> Option<Vec<u8>> {
+    // A sequence split across a read boundary is invisible to a scan of
+    // either half, so the unterminated tail of the last chunk goes back in
+    // front of this one. It has already been drawn, so only the scan sees
+    // it; the driver still gets `data` and nothing twice.
+    let carry_len = pty.osc_carry.len();
+    let scanned: std::borrow::Cow<[u8]> = if carry_len == 0 {
+        std::borrow::Cow::Borrowed(data)
+    } else {
+        let mut buf = std::mem::take(&mut pty.osc_carry);
+        buf.extend_from_slice(data);
+        std::borrow::Cow::Owned(buf)
+    };
+
+    let scan = pty::respond_to_queries(
+        &pty.handle,
+        &scanned,
+        pty.driver.size(),
+        pty.driver.cursor_position(),
+    );
+
+    if journal::enabled() {
+        pty.osc_carry.clear();
+        if let Some(tail) = journal::unterminated_osc_tail(&scanned) {
+            pty.osc_carry.extend_from_slice(&scanned[tail..]);
+        }
+    }
+
+    if scan.marks.is_empty() {
+        pty.driver.process(data);
+    } else {
+        let mut fed = 0usize;
+        for mark in &scan.marks {
+            let split = mark.at.saturating_sub(carry_len).min(data.len());
+            if split > fed {
+                pty.driver.process(&data[fed..split]);
+                fed = split;
+            }
+            let Pty {
+                driver, journal, ..
+            } = pty;
+            let (cursor_seq, cursor_col) = driver.cursor_seq();
+            journal.apply(
+                mark,
+                &journal::MarkContext {
+                    cursor_seq,
+                    cursor_col,
+                    read: &|seq, col, end_seq| {
+                        driver
+                            .seq_text(seq, col, Some(end_seq + 1), journal::command_max())
+                            .text
+                    },
+                },
+            );
+        }
+        if fed < data.len() {
+            pty.driver.process(&data[fed..]);
+        }
+    }
+
+    note_osc7_cwd(&mut pty.osc7_cwd, id, scan.osc7_cwd)
+}
+
+/// Ceiling on one `S2C_TERM_JOURNAL` listing, well under `MAX_FRAME_SIZE`.
+/// The ring bound already caps how many records exist; this caps how much
+/// command text a pathological set of them can add up to.
+const JOURNAL_REPLY_MAX: usize = 1 << 20;
+
+/// A client's `max_bytes`, clamped to what the server is willing to build.
+fn journal_read_budget(requested: u32) -> usize {
+    let ceiling = journal::output_max();
+    if requested == 0 {
+        ceiling
+    } else {
+        (requested as usize).min(ceiling)
+    }
+}
+
+/// `S2C_TERM_OUTPUT` flags for a completed read.
+fn output_flags(read: &SeqText, alt_screen: bool) -> u8 {
+    let mut flags = 0;
+    if read.truncated {
+        flags |= blit_remote::journal::OUTPUT_TRUNCATED;
+    }
+    if read.evicted {
+        flags |= blit_remote::journal::OUTPUT_EVICTED;
+    }
+    if alt_screen {
+        flags |= blit_remote::journal::OUTPUT_ALT_SCREEN;
+    }
+    flags
+}
+
+/// Answer `C2S_TERM_JOURNAL`: the command list, newest-relative or absolute.
+fn journal_list_reply(sess: &Session, req: &blit_remote::journal::JournalRequest) -> Vec<u8> {
+    use blit_remote::journal as j;
+    let Some(pty) = sess.ptys.get(&req.pty_id) else {
+        return j::msg_s2c_term_journal(req.nonce, req.pty_id, STATUS_NOT_FOUND, 0, 0, &[]);
+    };
+    let (cursor_seq, _) = pty.driver.cursor_seq();
+    let oldest_seq = pty.driver.oldest_seq();
+    let indices: Vec<u64> = pty.journal.iter().map(|r| r.index).collect();
+    let limit = if req.limit == 0 {
+        indices.len()
+    } else {
+        req.limit as usize
+    };
+
+    let chosen: Vec<u64> = if req.flags & j::JOURNAL_TAIL != 0 {
+        // Counting back from the newest: skip `from_index` of them, then
+        // take `limit` — so `from_index = 0` is "the last `limit`".
+        let end = indices.len().saturating_sub(req.from_index as usize);
+        let start = end.saturating_sub(limit);
+        indices[start..end].to_vec()
+    } else {
+        indices
+            .into_iter()
+            .filter(|&i| i >= req.from_index)
+            .take(limit)
+            .collect()
+    };
+
+    let mut records = Vec::with_capacity(chosen.len());
+    let mut bytes = 0usize;
+    for index in chosen {
+        let Some(record) = pty.journal.snapshot(index, cursor_seq, oldest_seq) else {
+            continue;
+        };
+        bytes += record.command.len() + 64;
+        if bytes > JOURNAL_REPLY_MAX {
+            break;
+        }
+        records.push(record);
+    }
+    j::msg_s2c_term_journal(
+        req.nonce,
+        req.pty_id,
+        STATUS_OK,
+        pty.journal.oldest_index(),
+        pty.journal.next_index(),
+        &records,
+    )
+}
+
+/// Answer `C2S_TERM_OUTPUT`: one command's output region.
+fn journal_output_reply(sess: &Session, req: &blit_remote::journal::OutputRequest) -> Vec<u8> {
+    use blit_remote::journal as j;
+    let not_found =
+        || j::msg_s2c_term_output(req.nonce, req.pty_id, STATUS_NOT_FOUND, 0, 0, 0, 0, 0, "");
+    let Some(pty) = sess.ptys.get(&req.pty_id) else {
+        return not_found();
+    };
+    let (cursor_seq, _) = pty.driver.cursor_seq();
+    let oldest_seq = pty.driver.oldest_seq();
+    let index = if req.index == j::JOURNAL_INDEX_LATEST {
+        pty.journal.latest().map(|r| r.index)
+    } else {
+        Some(req.index)
+    };
+    let Some(record) = index.and_then(|i| pty.journal.snapshot(i, cursor_seq, oldest_seq)) else {
+        return not_found();
+    };
+    // A running command has no end yet, so its output is read to wherever
+    // the terminal has got to; a finished one is frozen at its `D` marker.
+    let end = (!record.running()).then_some(record.end_seq);
+    let read = pty
+        .driver
+        .seq_text(record.start_seq, 0, end, journal_read_budget(req.max_bytes));
+    j::msg_s2c_term_output(
+        req.nonce,
+        req.pty_id,
+        STATUS_OK,
+        output_flags(&read, pty.driver.alt_screen()),
+        read.start_seq,
+        read.start_col,
+        read.next_seq,
+        read.next_col,
+        &read.text,
+    )
+}
+
+/// Answer `C2S_TERM_SINCE`: everything appended since the client's cursor.
+fn term_since_reply(sess: &Session, req: &blit_remote::journal::SinceRequest) -> Vec<u8> {
+    use blit_remote::journal as j;
+    let Some(pty) = sess.ptys.get(&req.pty_id) else {
+        return j::msg_s2c_term_output(req.nonce, req.pty_id, STATUS_NOT_FOUND, 0, 0, 0, 0, 0, "");
+    };
+    let alt_screen = pty.driver.alt_screen();
+    // A probe establishes a starting cursor without dragging back everything
+    // already on screen — which is what makes "wait for output after now"
+    // expressible at all.
+    if req.flags & j::SINCE_PROBE != 0 {
+        let (seq, col) = pty.driver.cursor_seq();
+        return j::msg_s2c_term_output(
+            req.nonce,
+            req.pty_id,
+            STATUS_OK,
+            output_flags(&SeqText::default(), alt_screen),
+            seq,
+            col,
+            seq,
+            col,
+            "",
+        );
+    }
+    let read = pty.driver.seq_text(
+        req.from_seq,
+        req.from_col,
+        None,
+        journal_read_budget(req.max_bytes),
+    );
+    j::msg_s2c_term_output(
+        req.nonce,
+        req.pty_id,
+        STATUS_OK,
+        output_flags(&read, alt_screen),
+        read.start_seq,
+        read.start_col,
+        read.next_seq,
+        read.next_col,
+        &read.text,
+    )
+}
+
+/// Register a `C2S_TERM_JOURNAL_WAIT`, answering straight away when the
+/// command it names has already finished.
+fn arm_journal_waiter(
+    sess: &mut Session,
+    client_id: u64,
+    req: &blit_remote::journal::WaitRequest,
+    now: Instant,
+) {
+    use blit_remote::journal as j;
+    let reply = |sess: &Session, status: u8, record: &blit_remote::journal::CommandRecord| {
+        if let Some(client) = sess.clients.get(&client_id) {
+            let _ = send_outbox(
+                client,
+                j::msg_s2c_term_command(req.nonce, req.pty_id, status, record),
+            );
+        }
+    };
+    let empty = blit_remote::journal::CommandRecord::default();
+    let in_flight = sess
+        .journal_waiters
+        .iter()
+        .filter(|w| w.client_id == client_id)
+        .count();
+    if in_flight >= journal::MAX_WAITERS_PER_CLIENT {
+        reply(sess, STATUS_BUDGET, &empty);
+        return;
+    }
+    let timeout = req.timeout_ms.min(journal::WAIT_TIMEOUT_MAX_MS);
+    let mut waiter = journal::Waiter {
+        client_id,
+        nonce: req.nonce,
+        pty_id: req.pty_id,
+        index: (req.index != j::JOURNAL_INDEX_LATEST).then_some(req.index),
+        deadline: now + Duration::from_millis(timeout as u64),
+    };
+    let pty = sess.ptys.get(&req.pty_id);
+    let cursor_seq = pty.map(|p| p.driver.cursor_seq().0).unwrap_or(0);
+    let oldest_seq = pty.map(|p| p.driver.oldest_seq()).unwrap_or(0);
+    match waiter.poll(pty.map(|p| &p.journal), cursor_seq, oldest_seq, now) {
+        journal::WaitOutcome::Ready(record) => reply(sess, STATUS_OK, &record),
+        journal::WaitOutcome::Gone => reply(sess, STATUS_NOT_FOUND, &empty),
+        journal::WaitOutcome::Pending => sess.journal_waiters.push(waiter),
+    }
+}
+
+/// Answer every journal waiter whose command has finished or timed out.
+///
+/// Called from the tick, which is where a `D` marker lands, and from the
+/// supervisor, which is what wakes for a timeout on an otherwise idle
+/// terminal.
+fn resolve_journal_waiters(sess: &mut Session, now: Instant) {
+    if sess.journal_waiters.is_empty() {
+        return;
+    }
+    let Session {
+        ptys,
+        clients,
+        journal_waiters,
+        ..
+    } = sess;
+    journal_waiters.retain_mut(|waiter| {
+        // A client that hung up takes its waiters with it.
+        let Some(client) = clients.get(&waiter.client_id) else {
+            return false;
+        };
+        let pty = ptys.get(&waiter.pty_id);
+        let cursor_seq = pty.map(|p| p.driver.cursor_seq().0).unwrap_or(0);
+        let oldest_seq = pty.map(|p| p.driver.oldest_seq()).unwrap_or(0);
+        let (status, record) =
+            match waiter.poll(pty.map(|p| &p.journal), cursor_seq, oldest_seq, now) {
+                journal::WaitOutcome::Pending => return true,
+                journal::WaitOutcome::Ready(record) => (STATUS_OK, record),
+                journal::WaitOutcome::Gone => (
+                    STATUS_NOT_FOUND,
+                    blit_remote::journal::CommandRecord::default(),
+                ),
+            };
+        let _ = send_outbox(
+            client,
+            blit_remote::journal::msg_s2c_term_command(
+                waiter.nonce,
+                waiter.pty_id,
+                status,
+                &record,
+            ),
+        );
+        false
+    });
 }
 
 /// Record an OSC 7 report against a PTY's stored cwd; returns the
@@ -8594,7 +8987,8 @@ async fn supervisor_loop(state: AppState) {
 /// The soonest instant the supervisor has work to do, or `None` when nothing
 /// is armed.
 fn earliest_armed_deadline(sess: &Session) -> Option<Instant> {
-    sess.ptys
+    let ptys = sess
+        .ptys
         .values()
         .filter(|pty| !pty.exited)
         .filter_map(|pty| {
@@ -8604,7 +8998,14 @@ fn earliest_armed_deadline(sess: &Session) -> Option<Instant> {
                 .chain(pty.exit_drain_deadline)
                 .min()
         })
-        .min()
+        .min();
+    // A journal wait is the other thing with a clock on it: without this the
+    // supervisor would sleep through a timeout on an idle terminal.
+    let waits = sess.journal_waiters.iter().map(|w| w.deadline).min();
+    match (ptys, waits) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Terminals to evict to stay inside the retention bounds, oldest first.
@@ -8717,6 +9118,9 @@ async fn supervise(state: &AppState) {
     let now = Instant::now();
     let fallback_due = {
         let mut sess = state.session.lock().await;
+        // The tick answers waiters whose command finished; nothing else wakes
+        // for one that simply ran out of time on a quiet terminal.
+        resolve_journal_waiters(&mut sess, now);
         for pty in sess.ptys.values_mut().filter(|pty| !pty.exited) {
             if pty.exit_drain_deadline.is_none() && pty::poll_child_exited(&pty.handle) {
                 pty.exit_drain_deadline = Some(now + PTY_EXIT_DRAIN_GRACE);
@@ -8953,8 +9357,14 @@ async fn cleanup_pty_internal(pty_id: u16, generation: Option<u64>, state: &AppS
         pty::close_pty(&pty.handle);
         pty.exit_status = pty::collect_exit_status(&pty.handle);
         pty.mark_dirty();
+        // A command still running when the shell dies never gets its `D`
+        // marker; closing it here is what stops a waiter hanging until its
+        // timeout for output that is never coming.
+        let end_seq = pty.driver.cursor_seq().0;
+        pty.journal.note_pty_exit(end_seq);
         let msg = blit_remote::msg_exited_reason(pty_id, pty.exit_status, pty.exit_reason);
         sess.send_to_all(&msg);
+        resolve_journal_waiters(&mut sess, Instant::now());
     }
 }
 
@@ -12657,31 +13067,17 @@ async fn tick(state: &AppState) -> TickOutcome {
             match input {
                 PtyInput::Data(data) => {
                     budget = budget.saturating_sub(data.len());
-                    let osc7 = pty::respond_to_queries(
-                        &pty.handle,
-                        &data,
-                        pty.driver.size(),
-                        pty.driver.cursor_position(),
-                    );
-                    if let Some(msg) = note_osc7_cwd(&mut pty.osc7_cwd, id, osc7) {
+                    if let Some(msg) = feed_pty_chunk(pty, id, &data) {
                         cwd_msgs.push(msg);
                     }
-                    pty.driver.process(&data);
                     pty.mark_output_dirty(now, output_coalesce_cap);
                 }
                 PtyInput::SyncBoundary { before } => {
                     budget = budget.saturating_sub(before.len());
                     if !before.is_empty() {
-                        let osc7 = pty::respond_to_queries(
-                            &pty.handle,
-                            &before,
-                            pty.driver.size(),
-                            pty.driver.cursor_position(),
-                        );
-                        if let Some(msg) = note_osc7_cwd(&mut pty.osc7_cwd, id, osc7) {
+                        if let Some(msg) = feed_pty_chunk(pty, id, &before) {
                             cwd_msgs.push(msg);
                         }
-                        pty.driver.process(&before);
                         pty.mark_output_dirty(now, output_coalesce_cap);
                     }
                     if !pty.driver.synced_output() {
@@ -12706,6 +13102,9 @@ async fn tick(state: &AppState) -> TickOutcome {
     for msg in cwd_msgs {
         sess.send_to_all(&msg);
     }
+    // A `D` marker in the bytes just processed is what finishes a command,
+    // so this is the first moment a waiter can be answered.
+    resolve_journal_waiters(&mut sess, now);
     if parse_budget_hit {
         // Leftover output is already queued, so re-tick right after this
         // round instead of waiting on the reader's notify — the permit for
@@ -17490,6 +17889,12 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         }
         // Advertised even when BLIT_ENV=0, so a refusal reads as policy.
         features |= blit_remote::env::FEATURE_ENV;
+        // Withheld under BLIT_TERM_JOURNAL=0, which also stops the PTY output
+        // path scanning for markers at all — the whole point of the switch is
+        // that a disabled family costs nothing (docs/design/term-journal.md).
+        if journal::enabled() {
+            features |= blit_remote::journal::FEATURE_TERM_JOURNAL;
+        }
         #[cfg(target_os = "linux")]
         {
             features |= blit_remote::process::FEATURE_APP_SOCKET;
@@ -17939,6 +18344,20 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             if outcome == extension::DispatchOutcome::Close {
                 break;
             }
+            continue;
+        }
+
+        // Terminal journal: unlike the families around it these requests are
+        // all about session state, so they are answered in the session-locked
+        // match below. Only the disabled case is handled here, and it is
+        // handled rather than dropped — a client that ignores feature bits
+        // still gets its one reply per nonce, the KV/LSP posture
+        // (docs/design/term-journal.md § Security).
+        if !journal::enabled()
+            && let Some(reply) =
+                blit_remote::journal::refusal(&data, blit_remote::STATUS_PERMISSION)
+        {
+            let _ = fs_out.send(reply);
             continue;
         }
 
@@ -20737,6 +21156,12 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         pty.reader_handle = reader;
                         pty.byte_rx = byte_rx;
                         pty.driver.reset_modes();
+                        // A new shell in the same slot: its predecessor's
+                        // commands describe a session that is over. Indices
+                        // keep climbing so a stale client index cannot alias
+                        // onto a new command.
+                        pty.journal.reset();
+                        pty.osc_carry.clear();
                         pty.exited = false;
                         pty.exited_at = None;
                         // New child in the same slot: anything queued against
@@ -20867,6 +21292,36 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     if let Some(client) = sess.clients.get(&client_id) {
                         let _ = send_outbox(client, msg);
                     }
+                }
+            }
+            blit_remote::journal::C2S_TERM_JOURNAL => {
+                if let Some(req) = blit_remote::journal::parse_term_journal(&data) {
+                    let reply = journal_list_reply(&sess, &req);
+                    if let Some(client) = sess.clients.get(&client_id) {
+                        let _ = send_outbox(client, reply);
+                    }
+                }
+            }
+            blit_remote::journal::C2S_TERM_OUTPUT => {
+                if let Some(req) = blit_remote::journal::parse_term_output(&data) {
+                    let reply = journal_output_reply(&sess, &req);
+                    if let Some(client) = sess.clients.get(&client_id) {
+                        let _ = send_outbox(client, reply);
+                    }
+                }
+            }
+            blit_remote::journal::C2S_TERM_SINCE => {
+                if let Some(req) = blit_remote::journal::parse_term_since(&data) {
+                    let reply = term_since_reply(&sess, &req);
+                    if let Some(client) = sess.clients.get(&client_id) {
+                        let _ = send_outbox(client, reply);
+                    }
+                }
+            }
+            blit_remote::journal::C2S_TERM_JOURNAL_WAIT => {
+                if let Some(req) = blit_remote::journal::parse_term_journal_wait(&data) {
+                    arm_journal_waiter(&mut sess, client_id, &req, Instant::now());
+                    need_nudge = true;
                 }
             }
             C2S_COPY_RANGE if data.len() >= 18 => {

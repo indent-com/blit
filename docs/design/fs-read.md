@@ -7,7 +7,7 @@ Read a fixed set of files, once, without a sync session.
 The fs family was built for an editor watching a tree: `FS_SYNC` establishes a
 session, updates stream, and `FS_FETCH` names a `sync_id`. Everything else it
 grew — `FS_SEARCH`, `FS_INDEX`, `FS_GREP` — asks about a root with no session,
-because *discovery* has nothing to watch. Reading did not get the same treatment,
+because _discovery_ has nothing to watch. Reading did not get the same treatment,
 so anything wanting a handful of files had two choices: sync a directory it did
 not want watched, or spawn `/bin/sh -c 'cat …'`.
 
@@ -46,13 +46,13 @@ answer about those paths rather than a failure of the request.
 Each record carries its own `FS_FILE_*`, so one unreadable path does not spoil
 the rest:
 
-| Status | Meaning |
-| --- | --- |
-| `OK` | content follows |
-| `NOT_FOUND` | no such path |
+| Status       | Meaning                                                                         |
+| ------------ | ------------------------------------------------------------------------------- |
+| `OK`         | content follows                                                                 |
+| `NOT_FOUND`  | no such path                                                                    |
 | `UNREADABLE` | permission denied, or not a regular file — a directory is `FS_INDEX`'s business |
-| `TOO_LARGE` | exists, not read: over `max_bytes`, or over what was left of the reply budget |
-| `OTHER` | anything else I/O reported |
+| `TOO_LARGE`  | exists, not read: over `max_bytes`, or over what was left of the reply budget   |
+| `OTHER`      | anything else I/O reported                                                      |
 
 A reply carries at most `FS_READ_MAX_TOTAL_BYTES` (8 MiB) of content. Files past
 that are `TOO_LARGE` rather than silently dropped, so a caller can re-ask for the
@@ -65,7 +65,7 @@ path, an empty body, one stat per candidate instead of a read. `max_bytes` still
 applies, so "exists, but too big to be what I am looking for" is still answered as
 such.
 
-This is for a caller that only needs to know *where* something is because it will
+This is for a caller that only needs to know _where_ something is because it will
 hand the path to whoever actually wants the bytes. The session supervisor resolves
 icons this way and answers the panel with a path; the panel reads it itself, which
 is the difference between artwork crossing a Wasm interpreter and not. A 30 KB
@@ -80,8 +80,8 @@ reported. There is exactly one record per group, in group order, so answers alig
 with questions by position: a group that matched nothing carries
 `FS_FILE_NOT_FOUND` and an empty path.
 
-This is the search-path question — *the first of these that exists, in my order
-of preference* — which is otherwise a round trip per candidate. The icon lookup
+This is the search-path question — _the first of these that exists, in my order
+of preference_ — which is otherwise a round trip per candidate. The icon lookup
 is exactly this: rank every directory on the icon path once, then ask for
 `dir/name.svg`, `dir/name.png`, … in that order and take the first hit. Groups
 are what make a screenful of them one message: one group per name, and the reply
@@ -97,7 +97,7 @@ reserved:
   fifty directories holding fifty thousand files.
 - `FS_INDEX_FOLLOW_LINKS` (bit 1) descends through symlinked directories. Off by
   default, because a tree's links can point anywhere. It exists because some
-  trees are *made* of links: on a Nix system every directory under
+  trees are _made_ of links: on a Nix system every directory under
   `/run/current-system/sw/share/icons` is one, and a walk that stops at them
   reports a theme's name and nothing inside it.
 
@@ -110,7 +110,7 @@ into the store.
 
 - **No byte ranges.** Every caller so far wants whole files, and a range needs an
   offset, a length, and a rule for a file that changed under it.
-- **No stat that reports a size.** `FS_READ_NO_CONTENT` answers *which* path and
+- **No stat that reports a size.** `FS_READ_NO_CONTENT` answers _which_ path and
   whether it is under a ceiling, which is what a caller choosing between
   candidates needs; the exact size has no reader yet.
 - **No directory reads.** That is `FS_INDEX`, and conflating them would make one

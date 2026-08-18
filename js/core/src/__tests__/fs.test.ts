@@ -2423,10 +2423,15 @@ describe("one-shot reads", () => {
   /** Groups are what make a screenful of icons one message: each is answered by
    *  its own first readable path, so answers align with questions by position. */
   it("carries groups and reads the answer back", () => {
-    const wire = buildFsReadMessage(7, FS_READ_FIRST | FS_READ_NO_CONTENT, 4096, [
-      ["/i/scalable/apps/a.svg", "/i/48x48/apps/a.png"],
-      ["/i/scalable/apps/b.svg"],
-    ]);
+    const wire = buildFsReadMessage(
+      7,
+      FS_READ_FIRST | FS_READ_NO_CONTENT,
+      4096,
+      [
+        ["/i/scalable/apps/a.svg", "/i/48x48/apps/a.png"],
+        ["/i/scalable/apps/b.svg"],
+      ],
+    );
     expect(wire[0]).toBe(C2S_FS_READ);
     const view = new DataView(wire.buffer, wire.byteOffset, wire.byteLength);
     expect(view.getUint16(1, true)).toBe(7);
@@ -2435,11 +2440,17 @@ describe("one-shot reads", () => {
     expect(view.getUint16(8, true)).toBe(2);
 
     const reply = buildReadResult(7, FS_DONE_OK, [
-      { status: FS_FILE_OK, path: "/i/48x48/apps/a.png", content: Uint8Array.of(1, 2) },
+      {
+        status: FS_FILE_OK,
+        path: "/i/48x48/apps/a.png",
+        content: Uint8Array.of(1, 2),
+      },
       { status: FS_FILE_NOT_FOUND, path: "", content: new Uint8Array() },
     ]);
     const parsed = parseFsReadResult(reply);
-    expect(parsed?.records.map((r) => [r.status, r.path, [...r.content]])).toEqual([
+    expect(
+      parsed?.records.map((r) => [r.status, r.path, [...r.content]]),
+    ).toEqual([
       [FS_FILE_OK, "/i/48x48/apps/a.png", [1, 2]],
       [FS_FILE_NOT_FOUND, "", []],
     ]);

@@ -39,6 +39,11 @@ pub mod extension;
 /// Viewer media input, compositor portals, and MPRIS state/control.
 pub mod media;
 
+/// Per-command terminal journal and sequence-addressed output
+/// (docs/design/term-journal.md): opcodes, the command record codec, and the
+/// cursor a client feeds back to read only what is new.
+pub mod journal;
+
 /// Cap on any single LZ4-decompressed payload, protocol-wide
 /// (docs/protocol.md "Compressed payloads"). Receivers check the prepended
 /// size against it *before* allocating, so a hostile or corrupt length
@@ -988,6 +993,7 @@ pub const FEATURE_CLIENT_CONTROL: u32 = 1 << 20;
 /// [`S2C_CLIENT_LIST2`] entries that say which connections are extension
 /// attempts. Implies [`FEATURE_CLIENT_CONTROL`].
 pub const FEATURE_CLIENT_ORIGIN: u32 = 1 << 27;
+// Bit 28 is [`journal::FEATURE_TERM_JOURNAL`], with the rest of the family.
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {

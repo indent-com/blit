@@ -76,6 +76,8 @@ Control terminals programmatically:
 blit terminal start htop # start a terminal, print its ID
 blit terminal show 1     # dump current terminal text
 blit terminal send 1 q   # send keystrokes
+blit terminal journal 1  # commands the shell has run (needs OSC 133)
+blit terminal output 1 --wait 60  # that command's output
 ```
 
 Inspect and disconnect other clients attached to the same server:

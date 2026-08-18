@@ -41,8 +41,32 @@ CR. Use `\x0a` if you need a literal LF byte.
 
 - `blit terminal show ID` — current viewport (what's on screen now)
 - `blit terminal history ID --from-end 0 --limit N` — last N lines from scrollback
+- `blit terminal history ID --since CURSOR` — only what is new since `SEQ`, `SEQ:COL`, `now`, or `start`
 
-Both accept `--cols`/`--rows` to resize before reading, and `--ansi` to preserve colors.
+Always pass `--limit` or `--since`. Bare `history` is the whole scrollback.
+
+`--since` prints a cursor to feed back in. `--json` is the structured form
+(text plus the next cursor). Default cap is 256 KiB; the reply says where to
+continue from if it truncated.
+
+Both `show` and line-based `history` accept `--cols`/`--rows` to resize before
+reading, and `--ansi` to preserve colors.
+
+## Commands in a live shell
+
+A shell that emits OSC 133 records each command (see
+`docs/shell-integration.md`). Without that, the journal is empty.
+
+```bash
+blit terminal send "$ID" "cargo test\n"
+blit terminal output "$ID" --wait 600          # that command's output; exits with its status
+blit terminal journal "$ID"                    # INDEX STATUS EXIT MS START_SEQ END_SEQ COMMAND
+blit terminal output "$ID" 3                   # command 3's output
+blit terminal journal "$ID" --json
+```
+
+`--wait` blocks server-side until the command finishes (exit 124 on timeout).
+`wait --pattern` matches only output produced after the wait began.
 
 ## Terminal lifecycle
 

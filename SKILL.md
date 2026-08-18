@@ -8,7 +8,8 @@ description: >
   language server for definitions, references, hover, completions, signature
   help, symbols, diagnostics, or a rename plan; read or write the server's
   key/value store; or run and interact with GUI applications. Covers
-  starting PTYs, sending keystrokes, reading output, checking exit status,
+  starting PTYs, sending keystrokes, reading output, listing the commands a
+  shell has run, waiting on a command's output, checking exit status,
   managing terminal lifecycle, attaching a local terminal to a remote one,
   searching file contents across a tree, and driving graphical windows through the experimental headless Wayland
   compositor (listing surfaces, capturing screenshots, clicking, typing,
@@ -32,6 +33,10 @@ filesystem, git, and language-server commands. Beyond terminals it can:
   backed by real language servers running next to the code.
 - **Key/value store** — `blit kv get|put|rm|ls`, prefix-watchable, with
   compare-and-swap writes. Handy as host-local scratch space for scripts.
+- **Command journal** — `blit terminal journal|output` and
+  `history --since`, given a shell that emits OSC 133 (see
+  `docs/shell-integration.md`). `wait --pattern` matches only output
+  produced after the wait began.
 
 ## Install
 

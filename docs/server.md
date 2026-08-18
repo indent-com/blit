@@ -10,6 +10,10 @@
 | `SHELL`                               | `$SHELL` or `/bin/sh`                              | Shell spawned for new PTYs                                                             |
 | `BLIT_SHELL_FLAGS`                    | `li` (Unix) / `` (Windows)                         | Shell invocation flags                                                                 |
 | `BLIT_SCROLLBACK`                     | `10000`                                            | Scrollback buffer rows per PTY                                                         |
+| `BLIT_TERM_JOURNAL`                   | `1`                                                | `0` disables the OSC 133 command journal and its feature bit                           |
+| `BLIT_TERM_JOURNAL_MAX`               | `256`                                              | Finished command records retained per PTY                                              |
+| `BLIT_TERM_JOURNAL_CMD_MAX`           | `4096`                                             | Bytes of command-line text retained per record                                         |
+| `BLIT_TERM_OUTPUT_MAX`                | `1048576` (1 MiB)                                  | Server ceiling on a `TERM_OUTPUT` / `TERM_SINCE` `max_bytes`                           |
 | `BLIT_VAAPI_DEVICE`                   | `/dev/dri/renderD128`                              | VA-API render node for surface encoding and camera decoding                            |
 | `BLIT_CUDA_DEVICE`                    | `0`                                                | CUDA device ordinal for NVENC and NVDEC                                                |
 | `BLIT_FD_CHANNEL`                     | unset                                              | fd-channel file descriptor                                                             |
