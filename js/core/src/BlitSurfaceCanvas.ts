@@ -2968,6 +2968,23 @@ export class BlitSurfaceCanvas {
     // messages ride the same connection, and the compositor advertises the
     // offer before it delivers the button.
     if (primary) this.getConn()?.sendPrimary(primary.mime, primary.data);
+    // Ctrl+click and Shift+click are chords too, and the app hears a modifier
+    // only from that modifier's own key press — one that never reached this
+    // canvas if the key went down before the canvas had focus.  Focus has to
+    // lead, because an unfocused client is told no modifiers at all; then the
+    // modifier; then the button.  That is the order `flushPendingAlt` already
+    // keeps for a pending Alt, and `sendPointerAt`'s own focus call below is a
+    // no-op once we are focused here.
+    const conn = this.getConn();
+    if (
+      type === SURFACE_POINTER_DOWN &&
+      conn &&
+      this.surface &&
+      this._displaySize
+    ) {
+      this.focusKeyboardTarget();
+      this.syncModifiers(e, conn);
+    }
     this.sendPointerAt(e.clientX, e.clientY, type, e.button, e.timeStamp);
     if (
       type === SURFACE_POINTER_DOWN &&
@@ -5121,16 +5138,20 @@ export class BlitSurfaceCanvas {
    * the user is actually holding, which `handleKey` redirects onto the side
    * this chose — or by the release half here on a later key-down.
    */
-  private syncModifiers(e: KeyboardEvent, conn: BlitConnection): void {
+  private syncModifiers(
+    e: KeyboardEvent | MouseEvent,
+    conn: BlitConnection,
+  ): void {
     const checks: [boolean, number, number][] = [
       [e.shiftKey, 42, 54], // ShiftLeft, ShiftRight
       [e.ctrlKey, 29, 97], // ControlLeft, ControlRight
       [e.altKey, 56, 100], // AltLeft, AltRight
       [e.metaKey, 125, 126], // MetaLeft, MetaRight
     ];
-    // The event's own key is forwarded below on the side it really came from.
-    // Replaying its twin here would both double the press and guess the side.
-    const own = domKeyToEvdev(e.code);
+    // A key event's own key is forwarded by `handleKey` on the side it really
+    // came from; replaying its twin here would both double the press and guess
+    // the side.  A pointer event names no key, so nothing is exempt.
+    const own = "code" in e ? domKeyToEvdev(e.code) : 0;
     for (const [held, left, right] of checks) {
       if (held) {
         if (own === left || own === right) continue;

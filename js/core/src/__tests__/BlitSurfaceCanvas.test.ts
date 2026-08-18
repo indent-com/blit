@@ -3187,17 +3187,23 @@ function attachTyping() {
   const keys: { keycode: number; pressed: boolean }[] = [];
   const preedits: { text: string; cursor: number }[] = [];
   const pointers: { type: number; button: number }[] = [];
+  /** Keys and buttons interleaved, for the orderings that matter on the wire. */
+  const inputOrder: ("key" | "pointer")[] = [];
   const textInputListeners = new Set<
     (surfaceId: number, state: SurfaceTextInputEvent) => void
   >();
   const conn = {
     sendSurfaceText: (_id: number, text: string) => texts.push(text),
-    sendSurfaceInput: (_id: number, keycode: number, pressed: boolean) =>
-      keys.push({ keycode, pressed }),
+    sendSurfaceInput: (_id: number, keycode: number, pressed: boolean) => {
+      inputOrder.push("key");
+      keys.push({ keycode, pressed });
+    },
     sendSurfacePreedit: (_id: number, text: string, cursor: number) =>
       preedits.push({ text, cursor }),
-    sendSurfacePointer: (_id: number, type: number, button: number) =>
-      pointers.push({ type, button }),
+    sendSurfacePointer: (_id: number, type: number, button: number) => {
+      inputOrder.push("pointer");
+      pointers.push({ type, button });
+    },
     sendSurfaceFocus: () => {},
     noteBrowserClipboardMayHaveChanged: () => {},
     surfaceStore: new Proxy(
@@ -3253,6 +3259,7 @@ function attachTyping() {
     keys,
     preedits,
     pointers,
+    inputOrder,
     requestTextInput,
     setConnected: (value: boolean) => {
       connected = value;
@@ -3917,6 +3924,36 @@ describe("BlitSurfaceCanvas key-state recovery", () => {
     );
 
     expect(keys).toEqual([{ keycode: 29, pressed: false }]);
+    surface.dispose();
+  });
+
+  it("states a held modifier before the button it qualifies", () => {
+    // Ctrl+click and Shift+click open a link in a new tab or window, and the
+    // app reads the modifier from its key press alone.  Clicking is also how a
+    // surface takes focus, so on the click that focuses it the modifier is
+    // always one the canvas never saw go down — and a replay that trailed the
+    // button would be a plain click as far as the app is concerned.
+    const { surface, canvas, keys, pointers, inputOrder } = attachTyping();
+    // jsdom lays nothing out, and a zero-size canvas has no point to send.
+    canvas.width = 800;
+    canvas.height = 600;
+    canvas.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, width: 800, height: 600 }) as DOMRect;
+
+    canvas.dispatchEvent(
+      new MouseEvent("mousedown", {
+        button: 0,
+        clientX: 40,
+        clientY: 40,
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+
+    expect(keys).toEqual([{ keycode: 29, pressed: true }]);
+    expect(pointers).toEqual([{ type: SURFACE_POINTER_DOWN, button: 0 }]);
+    expect(inputOrder).toEqual(["key", "pointer"]);
     surface.dispose();
   });
 
