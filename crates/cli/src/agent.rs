@@ -222,7 +222,10 @@ impl AgentConn {
         self.ptys.iter().any(|p| p.id == id)
     }
 
-    async fn recv_deadline(&mut self, deadline: tokio::time::Instant) -> Result<Vec<u8>, String> {
+    pub(crate) async fn recv_deadline(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<u8>, String> {
         let data = tokio::time::timeout_at(
             deadline,
             read_message(&mut self.reader, &mut self.fragment_buf),
@@ -870,6 +873,206 @@ pub(crate) fn exit_code_from_status(status: i32) -> i32 {
     }
 }
 
+/// The first line in `pending` that matches, consuming what it has ruled out.
+///
+/// The last line is kept whole or partial and re-examined on the next call,
+/// so a line still being written can match — the grid scan this replaced
+/// saw it too — without a match ever being reported twice.
+fn first_match(pending: &mut String, re: &regex::Regex, max: usize) -> Option<String> {
+    let tail_at = pending.rfind('\n').map_or(0, |i| i + 1);
+    for line in pending[..tail_at].lines() {
+        if re.is_match(line) {
+            return Some(line.to_string());
+        }
+    }
+    let tail = pending[tail_at..].to_string();
+    if !tail.is_empty() && re.is_match(&tail) {
+        return Some(tail);
+    }
+    *pending = tail;
+    // A line that never ends must not grow without bound.
+    if pending.len() > max {
+        let mut cut = pending.len() - max;
+        while cut < pending.len() && !pending.is_char_boundary(cut) {
+            cut += 1;
+        }
+        pending.drain(..cut);
+    }
+    None
+}
+
+/// Wait for `re` to match output produced *after* this call.
+///
+/// The anchor is the server's sequence cursor, taken before subscribing:
+/// every read is "what was appended since", so text already on screen cannot
+/// satisfy the wait (docs/design/term-journal.md § `wait --pattern`).
+async fn wait_for_pattern(
+    mut conn: AgentConn,
+    id: u16,
+    re: &regex::Regex,
+    deadline: tokio::time::Instant,
+) -> Result<i32, String> {
+    use blit_remote::journal::{OUTPUT_TRUNCATED, S2C_TERM_OUTPUT, msg_term_since};
+
+    const PROBE: u16 = 0xF0;
+    const READ: u16 = 0xF1;
+    const PENDING_MAX: usize = 64 * 1024;
+    let max_bytes = crate::journal::OUTPUT_MAX_BYTES;
+
+    let (mut seq, mut col) = crate::journal::probe_cursor(&mut conn, id, PROBE).await?;
+    conn.send(&msg_subscribe(id)).await?;
+    // Output racing between the probe and the subscription is already behind
+    // the cursor; reading once now is what stops it being missed if the
+    // terminal then goes quiet.
+    conn.send(&msg_term_since(READ, id, seq, col, max_bytes, 0))
+        .await?;
+    let mut in_flight = true;
+    let mut pending = String::new();
+    let mut exited: Option<(i32, u8)> = None;
+
+    loop {
+        let data = match conn.recv_deadline(deadline).await {
+            Ok(d) => d,
+            Err(e) if e == "timeout" => {
+                eprintln!("blit: timed out waiting for pty {id}");
+                return Ok(124);
+            }
+            Err(e) => return Err(e),
+        };
+        if data.is_empty() {
+            continue;
+        }
+        match data[0] {
+            S2C_UPDATE if data.len() >= 3 => {
+                if u16::from_le_bytes([data[1], data[2]]) != id {
+                    continue;
+                }
+                // The frame itself is not parsed — it is only the signal
+                // that there is something to read — but the ack is not
+                // optional: the server bounds unacked updates.
+                conn.send(&msg_ack()).await?;
+                if !in_flight {
+                    conn.send(&msg_term_since(READ, id, seq, col, max_bytes, 0))
+                        .await?;
+                    in_flight = true;
+                }
+            }
+            S2C_TERM_OUTPUT => {
+                let Some(reply) = blit_remote::journal::parse_s2c_term_output(&data) else {
+                    continue;
+                };
+                if reply.nonce != READ {
+                    continue;
+                }
+                in_flight = false;
+                if reply.status != STATUS_OK {
+                    return Err(format!("pty {id}: {}", status_text(reply.status)));
+                }
+                (seq, col) = (reply.next_seq, reply.next_col);
+                pending.push_str(&reply.text);
+                if let Some(line) = first_match(&mut pending, re, PENDING_MAX) {
+                    println!("{line}");
+                    return Ok(0);
+                }
+                if reply.flags & OUTPUT_TRUNCATED != 0 {
+                    conn.send(&msg_term_since(READ, id, seq, col, max_bytes, 0))
+                        .await?;
+                    in_flight = true;
+                    continue;
+                }
+                if let Some((status, reason)) = exited {
+                    println!("{}", format_exit(status, reason));
+                    return Ok(exit_code_from_status(status));
+                }
+            }
+            S2C_EXITED => {
+                if let Some(ServerMsg::Exited {
+                    pty_id,
+                    exit_status,
+                    reason,
+                }) = parse_server_msg(&data)
+                    && pty_id == id
+                {
+                    exited = Some((exit_status, reason));
+                    // The process's last words can still match, so drain
+                    // before reporting the exit.
+                    if !in_flight {
+                        conn.send(&msg_term_since(READ, id, seq, col, max_bytes, 0))
+                            .await?;
+                        in_flight = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The pre-journal pattern wait: re-scan the whole grid on every update.
+///
+/// Kept only for servers without `FEATURE_TERM_JOURNAL`, where there is no
+/// cursor to anchor against. It can match text that was on screen before the
+/// wait started.
+async fn wait_for_pattern_on_grid(
+    mut conn: AgentConn,
+    id: u16,
+    re: &regex::Regex,
+    deadline: tokio::time::Instant,
+) -> Result<i32, String> {
+    conn.send(&msg_subscribe(id)).await?;
+
+    let mut state = TerminalState::new(0, 0);
+
+    loop {
+        let data = match conn.recv_deadline(deadline).await {
+            Ok(d) => d,
+            Err(e) if e == "timeout" => {
+                eprintln!("blit: timed out waiting for pty {id}");
+                return Ok(124);
+            }
+            Err(e) => return Err(e),
+        };
+        if data.is_empty() {
+            continue;
+        }
+        match data[0] {
+            S2C_UPDATE if data.len() >= 3 => {
+                let pid = u16::from_le_bytes([data[1], data[2]]);
+                if pid == id {
+                    state.feed_compressed(&data[3..]);
+                    conn.send(&msg_ack()).await?;
+                    let text = state.get_all_text();
+                    for line in text.lines() {
+                        if re.is_match(line) {
+                            println!("{line}");
+                            return Ok(0);
+                        }
+                    }
+                    if let Some(&status) = conn.exited.get(&id) {
+                        let code = exit_code_from_status(status);
+                        println!("{}", format_exit_status(status));
+                        return Ok(code);
+                    }
+                }
+            }
+            S2C_EXITED => {
+                if let Some(ServerMsg::Exited {
+                    pty_id,
+                    exit_status,
+                    reason,
+                }) = parse_server_msg(&data)
+                    && pty_id == id
+                {
+                    let code = exit_code_from_status(exit_status);
+                    println!("{}", format_exit(exit_status, reason));
+                    return Ok(code);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub async fn cmd_wait(
     transport: Transport,
     id: u16,
@@ -886,59 +1089,14 @@ pub async fn cmd_wait(
 
     if let Some(ref pat) = pattern {
         let re = regex::Regex::new(pat).map_err(|e| format!("invalid pattern: {e}"))?;
-
-        conn.send(&msg_subscribe(id)).await?;
-
-        let mut state = TerminalState::new(0, 0);
-
-        loop {
-            let data = match conn.recv_deadline(deadline).await {
-                Ok(d) => d,
-                Err(e) if e == "timeout" => {
-                    eprintln!("blit: timed out waiting for pty {id}");
-                    return Ok(124);
-                }
-                Err(e) => return Err(e),
-            };
-            if data.is_empty() {
-                continue;
-            }
-            match data[0] {
-                S2C_UPDATE if data.len() >= 3 => {
-                    let pid = u16::from_le_bytes([data[1], data[2]]);
-                    if pid == id {
-                        state.feed_compressed(&data[3..]);
-                        conn.send(&msg_ack()).await?;
-                        let text = state.get_all_text();
-                        for line in text.lines() {
-                            if re.is_match(line) {
-                                println!("{line}");
-                                return Ok(0);
-                            }
-                        }
-                        if let Some(&status) = conn.exited.get(&id) {
-                            let code = exit_code_from_status(status);
-                            println!("{}", format_exit_status(status));
-                            return Ok(code);
-                        }
-                    }
-                }
-                S2C_EXITED => {
-                    if let Some(ServerMsg::Exited {
-                        pty_id,
-                        exit_status,
-                        reason,
-                    }) = parse_server_msg(&data)
-                        && pty_id == id
-                    {
-                        let code = exit_code_from_status(exit_status);
-                        println!("{}", format_exit(exit_status, reason));
-                        return Ok(code);
-                    }
-                }
-                _ => {}
-            }
+        if conn.features & blit_remote::journal::FEATURE_TERM_JOURNAL != 0 {
+            return wait_for_pattern(conn, id, &re, deadline).await;
         }
+        // Pre-journal server: no cursor to anchor against, so fall back to
+        // re-scanning the grid. That can match text that was already there
+        // when the wait began — the bug this command's cursor path fixes.
+        eprintln!("blit: server has no output cursor; --pattern may match text already on screen");
+        return wait_for_pattern_on_grid(conn, id, &re, deadline).await;
     } else {
         if let Some(&status) = conn.exited.get(&id) {
             let code = exit_code_from_status(status);
@@ -2184,6 +2342,40 @@ mod tests {
             .await;
         }
 
+        /// Read the next `C2S_TERM_SINCE`, skipping the acks a subscriber
+        /// sends along the way.
+        async fn expect_since(&mut self) -> blit_remote::journal::SinceRequest {
+            loop {
+                let data = self.recv().await.expect("client went quiet");
+                if data[0] == blit_remote::C2S_ACK {
+                    continue;
+                }
+                break blit_remote::journal::parse_term_since(&data)
+                    .unwrap_or_else(|| panic!("wanted TERM_SINCE, got {:#04x}", data[0]));
+            }
+        }
+
+        /// Answer a `C2S_TERM_SINCE` with `text` and the cursor after it.
+        async fn answer_since(
+            &mut self,
+            req: &blit_remote::journal::SinceRequest,
+            next_seq: u64,
+            text: &str,
+        ) {
+            let msg = blit_remote::journal::msg_s2c_term_output(
+                req.nonce,
+                req.pty_id,
+                STATUS_OK,
+                0,
+                req.from_seq,
+                req.from_col,
+                next_seq,
+                0,
+                text,
+            );
+            write_frame(&mut self.writer, &msg).await;
+        }
+
         async fn send_text(
             &mut self,
             nonce: u16,
@@ -2860,6 +3052,149 @@ mod tests {
         mock.await.unwrap();
     }
 
+    // ── wait --pattern, cursor path ──────────────────────────────────────
+
+    /// The bug this fixes: `--pattern` promised "produced after the wait
+    /// began", but the grid scan matched whatever was already on screen.
+    #[tokio::test]
+    async fn wait_pattern_ignores_text_that_was_already_on_screen() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let mock = tokio::spawn(async move {
+            let mut mock = MockServer::new(server);
+            // The pattern is on screen *before* the wait starts.
+            mock.add_pty(1, "build", "make", false, "BUILD SUCCESS");
+            mock.send_initial_burst_with_features(blit_remote::journal::FEATURE_TERM_JOURNAL)
+                .await;
+
+            let probe = mock.expect_since().await;
+            assert_eq!(probe.flags, blit_remote::journal::SINCE_PROBE);
+            mock.answer_since(&probe, 100, "").await;
+
+            let subscribe = mock.recv().await.unwrap();
+            assert_eq!(subscribe[0], blit_remote::C2S_SUBSCRIBE);
+
+            let first = mock.expect_since().await;
+            assert_eq!(first.from_seq, 100);
+            mock.answer_since(&first, 100, "").await;
+
+            // An update whose grid holds the pattern, but no new output.
+            mock.send_update_for(1).await;
+            let after_update = mock.expect_since().await;
+            mock.answer_since(&after_update, 100, "").await;
+
+            mock.send_exited(1, 7).await;
+            let drain = mock.expect_since().await;
+            mock.answer_since(&drain, 100, "").await;
+        });
+
+        let transport = Transport::Unix(client);
+        let result = cmd_wait(transport, 1, 5, Some("BUILD (SUCCESS|FAILURE)".to_string())).await;
+        // 7, not 0: the wait ended at the exit, not at the stale line.
+        assert_eq!(result.unwrap(), 7);
+
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_pattern_matches_output_produced_after_the_wait_began() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let mock = tokio::spawn(async move {
+            let mut mock = MockServer::new(server);
+            mock.add_pty(1, "build", "make", false, "compiling...");
+            mock.send_initial_burst_with_features(blit_remote::journal::FEATURE_TERM_JOURNAL)
+                .await;
+
+            let probe = mock.expect_since().await;
+            mock.answer_since(&probe, 40, "").await;
+            assert_eq!(mock.recv().await.unwrap()[0], blit_remote::C2S_SUBSCRIBE);
+            let first = mock.expect_since().await;
+            mock.answer_since(&first, 40, "").await;
+
+            mock.send_update_for(1).await;
+            let read = mock.expect_since().await;
+            assert_eq!(read.from_seq, 40);
+            mock.answer_since(&read, 42, "linking\nBUILD FAILURE\n")
+                .await;
+        });
+
+        let transport = Transport::Unix(client);
+        let result = cmd_wait(transport, 1, 5, Some("BUILD (SUCCESS|FAILURE)".to_string())).await;
+        assert_eq!(result.unwrap(), 0);
+
+        mock.await.unwrap();
+    }
+
+    /// A line delivered in pieces still matches once, when it is complete.
+    #[tokio::test]
+    async fn wait_pattern_matches_a_line_split_across_reads() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let mock = tokio::spawn(async move {
+            let mut mock = MockServer::new(server);
+            mock.add_pty(1, "build", "make", false, "");
+            mock.send_initial_burst_with_features(blit_remote::journal::FEATURE_TERM_JOURNAL)
+                .await;
+
+            let probe = mock.expect_since().await;
+            mock.answer_since(&probe, 10, "").await;
+            assert_eq!(mock.recv().await.unwrap()[0], blit_remote::C2S_SUBSCRIBE);
+            let first = mock.expect_since().await;
+            mock.answer_since(&first, 10, "").await;
+
+            mock.send_update_for(1).await;
+            let half = mock.expect_since().await;
+            mock.answer_since(&half, 10, "BUILD FAIL").await;
+
+            mock.send_update_for(1).await;
+            let rest = mock.expect_since().await;
+            mock.answer_since(&rest, 11, "URE\n").await;
+        });
+
+        let transport = Transport::Unix(client);
+        let result = cmd_wait(transport, 1, 5, Some("^BUILD FAILURE$".to_string())).await;
+        assert_eq!(result.unwrap(), 0);
+
+        mock.await.unwrap();
+    }
+
+    #[test]
+    fn first_match_scans_only_what_is_new() {
+        let re = regex::Regex::new("ready").unwrap();
+        let mut pending = String::from("starting\nnot yet\npartial");
+        assert_eq!(first_match(&mut pending, &re, 1024), None);
+        // Complete lines are consumed; the partial tail is kept to be
+        // re-examined when the rest of it arrives.
+        assert_eq!(pending, "partial");
+        pending.push_str(" ready\n");
+        assert_eq!(
+            first_match(&mut pending, &re, 1024).as_deref(),
+            Some("partial ready")
+        );
+    }
+
+    #[test]
+    fn first_match_matches_a_line_still_being_written() {
+        let re = regex::Regex::new("password:").unwrap();
+        let mut pending = String::from("password:");
+        assert_eq!(
+            first_match(&mut pending, &re, 1024).as_deref(),
+            Some("password:")
+        );
+    }
+
+    #[test]
+    fn first_match_bounds_a_line_that_never_ends() {
+        let re = regex::Regex::new("never").unwrap();
+        let mut pending = String::new();
+        for _ in 0..100 {
+            pending.push_str(&"x".repeat(100));
+            assert_eq!(first_match(&mut pending, &re, 256), None);
+            assert!(pending.len() <= 256, "pending grew to {}", pending.len());
+        }
+    }
+
     #[tokio::test]
     async fn test_wait_pattern_match() {
         let (client, server) = tokio::net::UnixStream::pair().unwrap();
@@ -2867,6 +3202,8 @@ mod tests {
         let mock = tokio::spawn(async move {
             let mut mock = MockServer::new(server);
             mock.add_pty(1, "build", "make", false, "BUILD SUCCESS");
+            // No journal feature bit: the legacy grid scan, which matches
+            // text that was already on screen.
             mock.send_initial_burst().await;
 
             let data = mock.recv().await.unwrap();

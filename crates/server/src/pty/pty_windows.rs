@@ -241,12 +241,12 @@ pub fn respond_to_queries(
     data: &[u8],
     size: (u16, u16),
     cursor: (u16, u16),
-) -> Option<String> {
-    let scan = crate::parse_terminal_queries(data, size, cursor);
-    for resp in scan.responses {
+) -> crate::TerminalScan {
+    let mut scan = crate::parse_terminal_queries(data, size, cursor);
+    for resp in std::mem::take(&mut scan.responses) {
         pty_write_all(PtyWriteTarget(handle.input), resp.as_bytes());
     }
-    scan.osc7_cwd
+    scan
 }
 
 pub(crate) struct SendHandle(pub(crate) HANDLE);
@@ -511,6 +511,8 @@ pub fn spawn_pty(
         command: command.map(|s| s.to_owned()),
         cwd: dir.map(|s| s.to_owned()),
         osc7_cwd: None,
+        journal: crate::journal::CommandJournal::default(),
+        osc_carry: Vec::new(),
     })
 }
 
