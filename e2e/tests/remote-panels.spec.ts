@@ -6,10 +6,10 @@ import { test, expect } from "@playwright/test";
  * systemd units and extensions used to be status-bar glyphs opening overlays
  * of their own, which put them next to the font size and the audio mute —
  * workspace chrome for things that are properties of one server. They are now
- * tabs of one remote's Control panel, alongside its applications and clients.
+ * tabs of one remote's Manage panel, alongside its applications and clients.
  * This asserts both halves: the glyphs are gone, and the tabs are there.
  */
-test("a remote's panels open from its Control button, not from status-bar glyphs", async ({
+test("a remote's panels open from its Manage button, not from status-bar glyphs", async ({
   page,
 }) => {
   await page.goto("/");
@@ -38,13 +38,13 @@ test("a remote's panels open from its Control button, not from status-bar glyphs
     timeout: 5_000,
   });
 
-  // One connected remote opens its own control overlay.
-  const control = page.getByRole("button", { name: /Control/ }).first();
+  // One connected remote opens its own management overlay.
+  const control = page.getByRole("button", { name: /Manage/ }).first();
   await expect(control).toBeVisible({ timeout: 5_000 });
   await control.click();
   // Its own dialog, on top of the remotes list rather than inside a row.
   await expect(
-    page.locator('[role="dialog"][aria-label^="Control"]'),
+    page.locator('[role="dialog"][aria-label^="Manage"]'),
   ).toHaveCount(1);
 
   // Clients is the tab every connected server can offer; the extension-backed
@@ -62,16 +62,24 @@ test("a remote's panels open from its Control button, not from status-bar glyphs
   await extensions.click();
   const registry = page.locator("[data-registry-url]");
   await expect(registry).toBeVisible({ timeout: 5_000 });
-  const port = Number(new URL(page.url()).port);
-  await expect(registry).toHaveValue(`http://127.0.0.1:${port + 3}`);
+  // Whichever registry this page can actually reach. Under `vite dev` the
+  // stack's own is proxied at /ext on the page's origin; the gateway serves a
+  // production bundle with no proxy in front of it and points at the published
+  // one. Both harnesses run this spec, so it asserts the choice, not a port.
+  const origin = new URL(page.url()).origin;
+  await expect(registry).toHaveValue(
+    new RegExp(
+      `^(${origin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}|https://install\\.blit\\.sh)/ext$`,
+    ),
+  );
 
-  // Escape closes the control panel and leaves the remotes list standing:
+  // Escape closes the management panel and leaves the remotes list standing:
   // one key, one layer.
   await page.keyboard.press("Escape");
   await expect(
-    page.locator('[role="dialog"][aria-label^="Control"]'),
+    page.locator('[role="dialog"][aria-label^="Manage"]'),
   ).toHaveCount(0);
   await expect(
-    page.getByRole("button", { name: /Control/ }).first(),
+    page.getByRole("button", { name: /Manage/ }).first(),
   ).toBeVisible();
 });

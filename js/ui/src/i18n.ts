@@ -219,12 +219,12 @@ const en: Messages = {
   "remotes.status.error": "Error",
   "remotes.status.closed": "Closed",
   "remotes.clients": "Clients",
-  "remotes.control": "Control",
-  "remotes.controlTitle": "Control {name}",
-  "remotes.openControl": "Open this remote's control panel",
-  "remotes.controlDisconnected": "Connect to this remote to control it",
+  "remotes.control": "Manage",
+  "remotes.controlTitle": "Manage {name}",
+  "remotes.openControl": "Open this remote's management panel",
+  "remotes.controlDisconnected": "Connect to this remote to manage it",
   "remotes.controlSubtitle":
-    "Control opens a remote's panels — its applications, connected clients, units, and extensions.",
+    "Manage opens a remote's panels — its applications, connected clients, units, and extensions.",
 
   "switcher.sectionRemotes": "Remotes",
   "switcher.sectionNewTerminal": "New terminal on\u2026",
