@@ -480,57 +480,67 @@ fn resolve_icons(
         }
     }
 
-    // Names: found and read in one pass over the ranked directories, so the
+    // Names: one `FS_READ_FIRST` per name over the ranked candidates, so the
     // first file that exists is also the one the ranking would have chosen.
+    // Every request goes out before any answer is collected — a batch is one
+    // wait, not one per name.
     if !lookups.is_empty() {
         refresh_icon_dirs(client, state);
-        let names: Vec<&str> = lookups.iter().map(String::as_str).collect();
-        let script = icon::fetch_script(&state.icon_dirs, &names);
-        let output =
-            script.and_then(|script| run_capturing(client, state, &["/bin/sh", "-c", &script]));
-        if let Some(output) = output {
-            for (name, body) in icon::sections(&output) {
-                // Path first, base64 second; an empty section is a name that
-                // matched nothing anywhere on the icon path.
-                let data_url = match (body.first(), body.get(1)) {
-                    (Some(path), Some(base64)) => icon::data_url(path, base64),
-                    _ => None,
-                };
-                state.cache_icon(name.to_string(), data_url.clone());
-                resolved.insert(name.to_string(), data_url);
+        let dirs = state.icon_dirs.clone();
+        let mut outstanding: Vec<(String, u16)> = Vec::new();
+        for name in &lookups {
+            let candidates = icon::candidates(&dirs, name);
+            if candidates.is_empty() {
+                state.cache_icon(name.clone(), None);
+                resolved.insert(name.clone(), None);
+                continue;
             }
-            // A name the child ran past without reporting has no artwork to be
-            // had. Caching that is what stops an icon-less row from spawning a
-            // shell on every redraw.
-            for name in &lookups {
-                resolved.entry(name.clone()).or_insert_with(|| {
-                    state.cache_icon(name.clone(), None);
-                    None
-                });
+            let paths: Vec<&str> = candidates
+                .iter()
+                .map(String::as_str)
+                .take(remote::fs::FS_READ_MAX_PATHS)
+                .collect();
+            if let Some(nonce) = fs_read_send(
+                client,
+                state,
+                remote::fs::FS_READ_FIRST,
+                icon::MAX_ICON_BYTES,
+                &paths,
+            ) {
+                outstanding.push((name.clone(), nonce));
             }
         }
-        // A child that never ran at all says nothing about these names, so they
-        // are neither answered nor cached: the panel asks again, and the next
-        // request gets a fresh attempt rather than a remembered failure.
+        for (name, nonce) in outstanding {
+            // No reply says nothing about this name, so it is neither answered
+            // nor cached: the panel asks again and the next request gets a
+            // fresh attempt rather than a remembered failure.
+            let Some(records) = fs_read_collect(client, nonce) else {
+                continue;
+            };
+            let data_url = records
+                .into_iter()
+                .find(|(status, _, _)| *status == remote::fs::FS_FILE_OK)
+                .and_then(|(_, path, body)| icon::data_url(&path, &body));
+            state.cache_icon(name.clone(), data_url.clone());
+            resolved.insert(name, data_url);
+        }
     }
 
     // Absolute `Icon=` values need no search, only the read.
     if !absolute.is_empty() {
-        let paths: Vec<&str> = absolute.iter().map(String::as_str).collect();
-        let script = icon::read_script(&paths);
-        let output =
-            script.and_then(|script| run_capturing(client, state, &["/bin/sh", "-c", &script]));
-        if let Some(output) = output {
-            for (path, body) in icon::sections(&output) {
-                let data_url = icon::data_url(path, body.first().copied().unwrap_or(""));
-                state.cache_icon(path.to_string(), data_url.clone());
-                resolved.insert(path.to_string(), data_url);
-            }
-            for path in &absolute {
-                resolved.entry(path.clone()).or_insert_with(|| {
-                    state.cache_icon(path.clone(), None);
+        for batch in absolute.chunks(remote::fs::FS_READ_MAX_PATHS) {
+            let paths: Vec<&str> = batch.iter().map(String::as_str).collect();
+            let Some(records) = fs_read(client, state, 0, icon::MAX_ICON_BYTES, &paths) else {
+                break;
+            };
+            for (status, path, body) in records {
+                let data_url = if status == remote::fs::FS_FILE_OK {
+                    icon::data_url(&path, &body)
+                } else {
                     None
-                });
+                };
+                state.cache_icon(path.clone(), data_url.clone());
+                resolved.insert(path, data_url);
             }
         }
     }
@@ -547,15 +557,27 @@ fn refresh_icon_dirs(client: &mut Client, state: &mut State) {
     if !state.icon_dirs.is_empty() {
         return;
     }
-    let Some(script) = icon::directories_script(&state.icon_theme_roots, &state.icon_flat_roots)
-    else {
-        return;
-    };
-    let Some(output) = run_capturing(client, state, &["/bin/sh", "-c", &script]) else {
-        return;
-    };
-    let dirs: Vec<&str> = output.lines().filter(|line| !line.is_empty()).collect();
-    state.icon_dirs = icon::rank_directories(&dirs);
+    let theme_roots = state.icon_theme_roots.clone();
+    let mut dirs: Vec<String> = Vec::new();
+    for root in &theme_roots {
+        // Directories only: an icon theme is a few dozen directories holding
+        // tens of thousands of files, and this wants somewhere to look.
+        // Following links is what makes a Nix system tree visible: every
+        // directory under /run/current-system/sw/share/icons is one, so a walk
+        // that stops at them reports a theme name and nothing inside it.
+        let flags = remote::fs::FS_INDEX_DIRS_ONLY | remote::fs::FS_INDEX_FOLLOW_LINKS;
+        for rel in fs_index(client, state, root, flags) {
+            if icon::is_icon_dir(&rel) {
+                dirs.push(format!("{root}/{rel}"));
+            }
+        }
+    }
+    // Pixmaps is flat — the name sits directly in it — so it is a candidate
+    // without a listing. One that does not exist costs a stat per lookup and
+    // answers nothing, which is the same as not being there.
+    dirs.extend(state.icon_flat_roots.iter().cloned());
+    let borrowed: Vec<&str> = dirs.iter().map(String::as_str).collect();
+    state.icon_dirs = icon::rank_directories(&borrowed);
 }
 
 /// Send one JSON message to one connection, respecting its credit.
@@ -1403,110 +1425,125 @@ fn refresh_installed(client: &mut Client, state: &mut State) -> Result<(), Error
     Ok(())
 }
 
-/// Sentinel separating one desktop file from the next in the reader's output.
-///
-/// Printable on purpose: a NUL cannot be carried through a POSIX `printf`
-/// format string, so a non-printing separator silently collapses and every file
-/// runs together. `@` starts neither a group header nor a comment nor a key, so
-/// this cannot occur at the start of a line in a well-formed desktop entry.
-const FILE_SEPARATOR: &str = "@@@blit-entry@@@";
+/// Largest `.desktop` file worth reading. The spec's entries are a few hundred
+/// bytes; anything at this size is not one, and reading it would only crowd out
+/// the rest of the batch.
+const MAX_DESKTOP_BYTES: u32 = 64 * 1024;
 
-/// Read every `*.desktop` under a set of directories in one shot.
+/// Read every `*.desktop` under a set of directories.
 ///
-/// This spawns a shell rather than using the fs family, which is built around
-/// established sync sessions for an editor to watch a tree — the wrong shape for
-/// reading a fixed set of files once at startup. One child, one round trip, and
-/// a missing directory is simply skipped, which matters because most of
-/// `XDG_DATA_DIRS` does not exist on any given machine.
+/// Two messages per root and no child process: `FS_INDEX` for what is there,
+/// then `FS_READ` for the entries themselves. This used to be a shell loop over
+/// a glob with `cat`, because the fs family could only read inside an established
+/// sync session — a watched tree, the wrong shape for reading a fixed set of
+/// files once at startup. A root that does not exist answers an empty listing,
+/// which matters because most of `XDG_DATA_DIRS` is absent on any given machine.
 fn read_desktop_files(
     client: &mut Client,
     state: &mut State,
     roots: &[String],
 ) -> Vec<(String, String)> {
-    if roots.is_empty() {
-        return Vec::new();
-    }
-    let mut script = String::new();
-    for root in roots {
-        // Quote for the shell by refusing anything that would need escaping:
-        // an XDG path with a quote in it is not worth supporting.
-        if root.contains('\'') {
-            continue;
-        }
-        script.push_str(&format!(
-            "for f in '{root}'/*.desktop; do [ -f \"$f\" ] || continue; \
-             printf '{FILE_SEPARATOR}%s\\n' \"$f\"; cat \"$f\"; done; "
-        ));
-    }
-    if script.is_empty() {
-        return Vec::new();
-    }
-    let Some(output) = run_capturing(client, state, &["/bin/sh", "-c", &script]) else {
-        return Vec::new();
-    };
-
     let mut out = Vec::new();
-    for chunk in output.split(FILE_SEPARATOR).skip(1) {
-        let Some((path, contents)) = chunk.split_once('\n') else {
-            continue;
-        };
-        out.push((path.to_string(), contents.to_string()));
+    for root in roots {
+        // Root-relative, so a nested `kde4/foo.desktop` keeps its subdirectory.
+        let entries: Vec<String> = fs_index(client, state, root, 0)
+            .into_iter()
+            .filter(|rel| rel.ends_with(".desktop"))
+            .map(|rel| format!("{root}/{rel}"))
+            .collect();
+        for batch in entries.chunks(remote::fs::FS_READ_MAX_PATHS) {
+            let paths: Vec<&str> = batch.iter().map(String::as_str).collect();
+            let Some(records) = fs_read(client, state, 0, MAX_DESKTOP_BYTES, &paths) else {
+                return out;
+            };
+            for (status, path, body) in records {
+                if status != remote::fs::FS_FILE_OK {
+                    continue;
+                }
+                // Lossy on purpose: one entry with a stray byte in it must not
+                // discard the file, let alone the catalog.
+                out.push((path, String::from_utf8_lossy(&body).into_owned()));
+            }
+        }
     }
     out
 }
 
-/// Spawn a child, collect its stdout, and return it once it exits.
-fn run_capturing(client: &mut Client, state: &mut State, argv: &[&str]) -> Option<String> {
-    let process_id = state.next_process_id();
-    let argv_bytes: Vec<&[u8]> = argv.iter().map(|arg| arg.as_bytes()).collect();
-    let request = remote::process::ProcessSpawnRequest {
-        nonce: state.next_nonce(),
-        process_id,
-        flags: remote::process::PROCESS_SPAWN_MERGE_STDERR,
-        cwd_kind: remote::process::PROCESS_CWD_DEFAULT,
-        src_pty_id: 0,
-        cwd: b"",
-        argv: argv_bytes,
-        env: Vec::new(),
-    };
-    let message = remote::process::msg_process_spawn(&request).ok()?;
-    client.send(&message).ok()?;
+/// Read a batch of paths in one round trip (`docs/design/fs-read.md`).
+///
+/// Every record comes back in request order with its own status, so a missing or
+/// oversized file is an answer about that path rather than a failure of the
+/// batch. `None` means the request never got a reply — the connection is going
+/// away — which is the only case a caller has to treat as "ask again later".
+fn fs_read(
+    client: &mut Client,
+    state: &mut State,
+    flags: u8,
+    max_bytes: u32,
+    paths: &[&str],
+) -> Option<Vec<(u8, String, Vec<u8>)>> {
+    let nonce = fs_read_send(client, state, flags, max_bytes, paths)?;
+    fs_read_collect(client, nonce)
+}
 
-    let mut collected = Vec::new();
-    loop {
-        // Only this child's frames: another app's exit must not be consumed
-        // here, or the supervisor would never see it.
-        let packet = client
-            .recv_matching(|packet| {
-                matches!(
-                    packet.first().copied(),
-                    Some(remote::process::S2C_PROCESS_STDOUT)
-                        | Some(remote::process::S2C_PROCESS_EXIT)
-                ) && packet.get(1..5) == Some(&process_id.to_le_bytes()[..])
-            })
-            .ok()??;
-        match packet.first().copied() {
-            Some(remote::process::S2C_PROCESS_STDOUT) => {
-                let Ok(output) = remote::process::parse_process_stdout(&packet) else {
-                    break;
-                };
-                collected.extend_from_slice(output.data);
-                // The server bounds unacknowledged output and kicks the
-                // endpoint past the window, so a catalog larger than it must
-                // be acknowledged as it arrives rather than at the end.
-                ack_output(
-                    client,
-                    process_id,
-                    remote::process::PROCESS_STREAM_STDOUT,
-                    output.offset + output.data.len() as u64,
-                );
-            }
-            _ => break,
-        }
+/// Ask for a batch and return the nonce its answer will carry.
+///
+/// Split from the collection so a caller with many independent questions can put
+/// them all on the wire before waiting for any: the icon search is one request
+/// per name, and asking them one at a time made a screenful of artwork a
+/// screenful of round trips.
+fn fs_read_send(
+    client: &mut Client,
+    state: &mut State,
+    flags: u8,
+    max_bytes: u32,
+    paths: &[&str],
+) -> Option<u16> {
+    let nonce = state.next_nonce();
+    let request = remote::fs::msg_fs_read(nonce, flags, max_bytes, paths)?;
+    client.send(&request).ok()?;
+    Some(nonce)
+}
+
+/// Collect one outstanding [`fs_read_send`]. Answers to the others wait in the
+/// client's pending queue, so they can be collected in any order.
+fn fs_read_collect(client: &mut Client, nonce: u16) -> Option<Vec<(u8, String, Vec<u8>)>> {
+    let reply = client
+        .recv_matching(|packet| {
+            remote::fs::parse_fs_read_result(packet).is_some_and(|(n, _, _)| n == nonce)
+        })
+        .ok()??;
+    let (_, status, records) = remote::fs::parse_fs_read_result(&reply)?;
+    if status != remote::fs::FS_DONE_OK {
+        return Some(Vec::new());
     }
-    // One `.desktop` file with a stray byte in it must not discard the whole
-    // catalog; the parser only ever looks at the keys it knows.
-    Some(String::from_utf8_lossy(&collected).into_owned())
+    Some(records)
+}
+
+/// Everything under `root`, root-relative: its files, or its directories.
+///
+/// The walk is the server's (`FS_INDEX`), which is what makes a directory
+/// listing a message rather than a glob. A truncated answer is used as far as it
+/// goes: for both callers here that means some applications or some themes, not
+/// a wrong answer.
+fn fs_index(client: &mut Client, state: &mut State, root: &str, flags: u8) -> Vec<String> {
+    let nonce = state.next_nonce();
+    let mut request = remote::fs::msg_fs_index(nonce, root);
+    // The flags byte sits after the opcode and nonce; the builder writes a zero
+    // there because the search-and-index callers want plain files.
+    request[3] = flags;
+    if client.send(&request).is_err() {
+        return Vec::new();
+    }
+    let Ok(Some(reply)) = client.recv_matching(|packet| {
+        remote::fs::parse_fs_index_result(packet).is_some_and(|(n, _, _, _)| n == nonce)
+    }) else {
+        return Vec::new();
+    };
+    match remote::fs::parse_fs_index_result(&reply) {
+        Some((_, status, _, paths)) if status == remote::fs::FS_DONE_OK => paths,
+        _ => Vec::new(),
+    }
 }
 
 /// Persist one application's intent.

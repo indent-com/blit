@@ -13463,6 +13463,10 @@ struct FsSyncs {
     /// cap, its own set so search and index nonce spaces stay independent.
     inflight_searches: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
     inflight_greps: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    /// Nonces of `FS_READ` batches in flight — same discipline again: the read
+    /// happens off-thread, so without a cap a client could queue as many as it
+    /// can send.
+    inflight_reads: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
     /// Live chunked uploads on this connection (upload_id → sync_id routing
     /// plus the concurrent-upload cap). Shared with the sync sinks, which
     /// free the id of a BEGIN the engine refused.
@@ -13552,6 +13556,25 @@ impl FsSyncs {
         set.insert(nonce);
         Ok(std::sync::Arc::new(blit_fssync::InflightGuard::new(
             self.inflight_indexes.clone(),
+            nonce,
+        )))
+    }
+
+    /// Reserve a nonce for an in-flight `FS_READ`, same cap and failure split
+    /// as [`FsSyncs::reserve_index`]: a read is off-thread I/O a client can
+    /// otherwise stack up.
+    fn reserve_read(&self, nonce: u16) -> Result<std::sync::Arc<blit_fssync::InflightGuard>, u8> {
+        use blit_remote::fs::{FS_DONE_BUDGET, FS_DONE_INVALID};
+        let mut set = self.inflight_reads.lock().unwrap();
+        if set.contains(&nonce) {
+            return Err(FS_DONE_INVALID);
+        }
+        if set.len() >= fs_walk_inflight() {
+            return Err(FS_DONE_BUDGET);
+        }
+        set.insert(nonce);
+        Ok(std::sync::Arc::new(blit_fssync::InflightGuard::new(
+            self.inflight_reads.clone(),
             nonce,
         )))
     }
@@ -14043,9 +14066,23 @@ const FS_INDEX_MAX_BYTES: usize = 48 * 1024 * 1024;
 /// non-repo subtree) falls back to an ignore-free walk: an empty index
 /// would otherwise read as "no files here" and never consult the server.
 fn fs_index_walk(root: &std::path::Path, max_entries: usize) -> (Vec<String>, bool) {
-    let (paths, truncated) = fs_index_walk_inner(root, max_entries, true);
-    if paths.is_empty() && !truncated {
-        return fs_index_walk_inner(root, max_entries, false);
+    fs_index_walk_kind(root, max_entries, false, false)
+}
+
+/// [`fs_index_walk`], listing directories instead of files when `dirs_only`.
+///
+/// The ignore-free retry is skipped for directories: an ignore rule that blanks
+/// every file in a tree still leaves its directories, so an empty answer there
+/// means an empty tree and the second walk would only cost time.
+fn fs_index_walk_kind(
+    root: &std::path::Path,
+    max_entries: usize,
+    dirs_only: bool,
+    follow: bool,
+) -> (Vec<String>, bool) {
+    let (paths, truncated) = fs_index_walk_inner(root, max_entries, true, dirs_only, follow);
+    if paths.is_empty() && !truncated && !dirs_only {
+        return fs_index_walk_inner(root, max_entries, false, dirs_only, follow);
     }
     (paths, truncated)
 }
@@ -14054,6 +14091,8 @@ fn fs_index_walk_inner(
     root: &std::path::Path,
     max_entries: usize,
     use_ignores: bool,
+    dirs_only: bool,
+    follow: bool,
 ) -> (Vec<String>, bool) {
     let mut paths: Vec<String> = Vec::new();
     let mut bytes = 0usize;
@@ -14067,7 +14106,7 @@ fn fs_index_walk_inner(
     let mut builder = ignore::WalkBuilder::new(root);
     builder
         .hidden(false)
-        .follow_links(false)
+        .follow_links(follow)
         .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(".git"));
     if !use_ignores {
         builder.standard_filters(false);
@@ -14078,14 +14117,27 @@ fn fs_index_walk_inner(
             truncated = true;
             break;
         }
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+        // A symlink counts as whatever it points at, which costs one stat and is
+        // the difference between seeing a Nix system directory and not: every
+        // `.desktop` file and every icon directory under
+        // `/run/current-system/sw/share` is a link into the store, and the walk
+        // does not follow links, so `file_type` calls them all symlinks.
+        let wanted = match entry.file_type() {
+            Some(kind) if kind.is_dir() => dirs_only,
+            Some(kind) if kind.is_file() => !dirs_only,
+            Some(kind) if kind.is_symlink() => {
+                std::fs::metadata(entry.path()).is_ok_and(|target| target.is_dir() == dirs_only)
+            }
+            _ => false,
+        };
+        if !wanted {
             continue;
         }
         let Ok(rel) = entry.path().strip_prefix(root) else {
             continue;
         };
         if rel.as_os_str().is_empty() {
-            continue; // the root itself, when it is a file
+            continue; // the root itself, which the caller already has
         }
         // Truncation is exact: it fires only when a file would be dropped,
         // never on a trailing directory after the last counted file.
@@ -14236,8 +14288,8 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
 ) {
     use blit_fssync::{OpReq, UploadBeginReq, WriteReq};
     use blit_remote::fs::{
-        C2S_FS_ACK, C2S_FS_FETCH, C2S_FS_GREP, C2S_FS_INDEX, C2S_FS_OP, C2S_FS_SEARCH, C2S_FS_STOP,
-        C2S_FS_SYNC, C2S_FS_UPLOAD_BEGIN, C2S_FS_UPLOAD_CANCEL, C2S_FS_UPLOAD_CHUNK,
+        C2S_FS_ACK, C2S_FS_FETCH, C2S_FS_GREP, C2S_FS_INDEX, C2S_FS_OP, C2S_FS_READ, C2S_FS_SEARCH,
+        C2S_FS_STOP, C2S_FS_SYNC, C2S_FS_UPLOAD_BEGIN, C2S_FS_UPLOAD_CANCEL, C2S_FS_UPLOAD_CHUNK,
         C2S_FS_UPLOAD_FINISH, C2S_FS_WRITE, FS_DONE_BUDGET, FS_DONE_INVALID, FS_DONE_NOT_FOUND,
         FS_DONE_OK, FS_DONE_OTHER, FS_DONE_PERMISSION, FS_DONE_UNKNOWN_UPLOAD, FS_DONE_WRONG_TYPE,
         FS_FILE_OTHER, FS_INDEX_TRUNCATED, FS_STATUS_OK, FS_STATUS_OTHER, FS_STATUS_RESOURCE_LIMIT,
@@ -14246,8 +14298,8 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
         FS_SYNC_RECURSIVE, FS_SYNC_SINGLE, fs_sync_flags_valid, msg_fs_done, msg_fs_file,
         msg_fs_index_result, msg_fs_search_result, msg_fs_synced, msg_fs_upload_begin_result,
         msg_fs_upload_chunk_result, msg_fs_upload_finish_result, parse_fs_index, parse_fs_op,
-        parse_fs_search, parse_fs_upload_begin, parse_fs_upload_chunk, parse_fs_upload_finish,
-        parse_fs_write,
+        parse_fs_read, parse_fs_search, parse_fs_upload_begin, parse_fs_upload_chunk,
+        parse_fs_upload_finish, parse_fs_write,
     };
     match data[0] {
         C2S_FS_SEARCH => {
@@ -14380,15 +14432,108 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
                 }
             }
         }
+        C2S_FS_READ => {
+            // One-shot read of a fixed set of paths (docs/design/fs-read.md) —
+            // no sync, nothing watched. Off-thread and capped by `reserve_read`
+            // like every other walk in this family.
+            if let Some((nonce, flags, max_bytes, paths)) = parse_fs_read(data) {
+                use blit_remote::fs::{
+                    FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_OTHER, FS_FILE_TOO_LARGE,
+                    FS_FILE_UNREADABLE, FS_READ_DEFAULT_BYTES, FS_READ_FIRST,
+                    FS_READ_MAX_TOTAL_BYTES, msg_fs_read_result,
+                };
+                if flags & !FS_READ_FIRST != 0 {
+                    let _ = out.send(msg_fs_read_result(nonce, FS_DONE_INVALID, &[]));
+                    return;
+                }
+                let guard = match syncs.reserve_read(nonce) {
+                    Ok(guard) => guard,
+                    Err(status) => {
+                        let _ = out.send(msg_fs_read_result(nonce, status, &[]));
+                        return;
+                    }
+                };
+                let out = out.clone();
+                let work = move || {
+                    let _guard = guard;
+                    let per_file = u64::from(if max_bytes == 0 {
+                        FS_READ_DEFAULT_BYTES
+                    } else {
+                        max_bytes
+                    });
+                    let first_only = flags & FS_READ_FIRST != 0;
+                    let mut left = FS_READ_MAX_TOTAL_BYTES;
+                    let mut records: Vec<(u8, String, Vec<u8>)> = Vec::new();
+                    for path in paths {
+                        let (status, body) = match std::fs::metadata(&path) {
+                            Err(err) => (
+                                match err.kind() {
+                                    std::io::ErrorKind::NotFound => FS_FILE_NOT_FOUND,
+                                    std::io::ErrorKind::PermissionDenied => FS_FILE_UNREADABLE,
+                                    _ => FS_FILE_OTHER,
+                                },
+                                Vec::new(),
+                            ),
+                            // A directory has no content to answer with, and
+                            // `FS_INDEX` is the message that describes one.
+                            Ok(meta) if !meta.is_file() => (FS_FILE_UNREADABLE, Vec::new()),
+                            Ok(meta) if meta.len() > per_file => (FS_FILE_TOO_LARGE, Vec::new()),
+                            Ok(meta) if meta.len() as usize > left => {
+                                (FS_FILE_TOO_LARGE, Vec::new())
+                            }
+                            Ok(_) => match std::fs::read(&path) {
+                                Ok(body) if body.len() as u64 > per_file => {
+                                    // It grew between the stat and the read.
+                                    (FS_FILE_TOO_LARGE, Vec::new())
+                                }
+                                Ok(body) => (FS_FILE_OK, body),
+                                Err(err) => (
+                                    match err.kind() {
+                                        std::io::ErrorKind::NotFound => FS_FILE_NOT_FOUND,
+                                        std::io::ErrorKind::PermissionDenied => FS_FILE_UNREADABLE,
+                                        _ => FS_FILE_OTHER,
+                                    },
+                                    Vec::new(),
+                                ),
+                            },
+                        };
+                        left = left.saturating_sub(body.len());
+                        // FIRST asks for the first path it can *have*, so a
+                        // miss, an unreadable file and an oversized one are all
+                        // stepped over rather than answered.
+                        if first_only {
+                            if status == FS_FILE_OK {
+                                records.push((status, path, body));
+                                break;
+                            }
+                            continue;
+                        }
+                        records.push((status, path, body));
+                    }
+                    let borrowed: Vec<(u8, &str, &[u8])> = records
+                        .iter()
+                        .map(|(status, path, body)| (*status, path.as_str(), body.as_slice()))
+                        .collect();
+                    let _ = out.send(msg_fs_read_result(nonce, FS_DONE_OK, &borrowed));
+                };
+                if let Some(jobs) = jobs {
+                    let _ = jobs.spawn_blocking(data.len(), work);
+                } else {
+                    std::thread::spawn(work);
+                }
+            }
+        }
         C2S_FS_INDEX => {
             // Candidate list for client-side fuzzy search
             // (docs/design/fs-search.md) — no sync. Walk off-thread, capped
             // by `reserve_index` so a client can't stack up walks.
             if let Some((nonce, flags, root)) = parse_fs_index(data) {
-                if flags != 0 {
+                if flags & !blit_remote::fs::FS_INDEX_FLAGS_KNOWN != 0 {
                     let _ = out.send(msg_fs_index_result(nonce, FS_DONE_INVALID, 0, &[]));
                     return;
                 }
+                let dirs_only = flags & blit_remote::fs::FS_INDEX_DIRS_ONLY != 0;
+                let follow = flags & blit_remote::fs::FS_INDEX_FOLLOW_LINKS != 0;
                 let guard = match syncs.reserve_index(nonce) {
                     Ok(guard) => guard,
                     Err(status) => {
@@ -14415,8 +14560,12 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
                         Ok(canon) => match std::fs::read_dir(&canon) {
                             Err(err) => msg_fs_index_result(nonce, io_status(&err), 0, &[]),
                             Ok(_) => {
-                                let (paths, truncated) =
-                                    fs_index_walk(&canon, fs_index_max_entries());
+                                let (paths, truncated) = fs_index_walk_kind(
+                                    &canon,
+                                    fs_index_max_entries(),
+                                    dirs_only,
+                                    follow,
+                                );
                                 let flags = if truncated { FS_INDEX_TRUNCATED } else { 0 };
                                 msg_fs_index_result(nonce, FS_DONE_OK, flags, &paths)
                             }
@@ -17780,6 +17929,10 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 | blit_remote::fs::C2S_FS_UPLOAD_CHUNK
                 | blit_remote::fs::C2S_FS_UPLOAD_FINISH
                 | blit_remote::fs::C2S_FS_UPLOAD_CANCEL
+                // Listed, not ranged: an fs opcode this match forgets is
+                // dropped before any handler runs, which reads as a request
+                // that never got a reply.
+                | blit_remote::fs::C2S_FS_READ
         ) {
             // A FROM_PTY sync (docs/ide.md Decision 3) names a source pty
             // whose live cwd is session state; resolve it here — the sole
