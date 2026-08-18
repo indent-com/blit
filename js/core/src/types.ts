@@ -213,6 +213,8 @@ export interface BlitConnectionSnapshot {
   supportsDesktop: boolean;
   /** Server supports process-global named bidirectional channels. */
   supportsChannels: boolean;
+  /** The server admits Wasmi extensions (docs/design/extensions.md). */
+  supportsExtensions: boolean;
   /** Server understands viewer media, portals, and MPRIS runtime state. */
   supportsDesktopMedia: boolean;
   retryCount: number;

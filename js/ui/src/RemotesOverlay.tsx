@@ -11,10 +11,8 @@ import type {
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 import { mergeStyle, scrollbarStyle, themeFor, ui, uiScale } from "./theme";
 import { createDragReorder, reorderTo } from "./dragReorder";
-import {
-  ConnectionClients,
-  connectionHasClientList,
-} from "./ConnectionClients";
+import { connectionHasClientList } from "./ConnectionClients";
+import { ConnectionControlOverlay } from "./ConnectionControl";
 import { t } from "./i18n";
 import type { Remote } from "./storage";
 
@@ -62,10 +60,11 @@ export function RemotesOverlay(props: {
   const [name, setName] = createSignal("");
   const [uri, setUri] = createSignal("");
   const [revealed, setRevealed] = createSignal<Set<string>>(new Set());
-  // At most one remote's client list is open at a time: each open list holds a
-  // live CLIENT_WATCH pushing a catalog every second, and reading two servers'
-  // clients side by side is not a thing anyone does.
-  const [expanded, setExpanded] = createSignal<string | null>(null);
+  // The remote whose control panel is open, if any. At most one: each open
+  // panel holds live subscriptions (a CLIENT_WATCH pushing a catalog every
+  // second, a unit table), and reading two servers side by side is not a
+  // thing anyone does.
+  const [controlling, setControlling] = createSignal<string | null>(null);
 
   /** A remote's live connection, if it has one. Remote names *are* connection
    *  ids (App.tsx builds one ConnectionSpec per enabled remote, `id: name`). */
@@ -85,13 +84,15 @@ export function RemotesOverlay(props: {
     );
   };
 
-  function toggleExpanded(remoteName: string) {
-    setExpanded((prev) => (prev === remoteName ? null : remoteName));
-  }
+  /** Whether this row has anything to control. Every panel needs a live
+   *  connection to say anything at all, and which of them exist is discovered
+   *  inside the panel rather than here. */
+  const canControl = (remoteName: string) =>
+    !!props.workspace && connectionFor(remoteName)?.status === "connected";
 
-  /** Any row at all offers a client list — gates the header's explanation of
-   *  what the chevrons are, so a shell without client control says nothing. */
-  const anyClients = () => props.remotes.some((r) => canListClients(r.name));
+  /** Any row at all can be controlled — gates the header's explanation of what
+   *  the button is, so a shell with nothing connected says nothing. */
+  const anyControl = () => props.remotes.some((r) => canControl(r.name));
 
   let nameRef!: HTMLInputElement;
 
@@ -173,7 +174,7 @@ export function RemotesOverlay(props: {
       "1fr",
       "auto",
       hasShare() ? "auto" : null,
-      anyClients() ? "auto" : null,
+      anyControl() ? "auto" : null,
       "auto",
       "auto",
       "auto",
@@ -207,7 +208,7 @@ export function RemotesOverlay(props: {
           title={
             props.readOnly ? t("remotes.connectingTitle") : t("remotes.title")
           }
-          subtitle={anyClients() ? t("remotes.clientsSubtitle") : undefined}
+          subtitle={anyControl() ? t("remotes.controlSubtitle") : undefined}
           onClose={props.onClose}
         />
 
@@ -341,7 +342,8 @@ export function RemotesOverlay(props: {
                 };
 
                 const clients = () => canListClients(remote().name);
-                const open = () => expanded() === remote().name;
+                const controllable = () => canControl(remote().name);
+                const open = () => controlling() === remote().name;
 
                 return (
                   <>
@@ -516,43 +518,30 @@ export function RemotesOverlay(props: {
                             answer; a disconnected row that expanded to "No
                             clients connected" would be reporting the wrong
                             thing. */}
-                        <Show when={anyClients()}>
+                        <Show when={anyControl()}>
                           <Show
-                            when={clients()}
+                            when={controllable()}
                             fallback={
                               <div
-                                title={
-                                  // Two different reasons, and they call for
-                                  // different answers: connect the remote, or
-                                  // accept that this server is too old to say.
-                                  connectionFor(remote().name)?.status ===
-                                  "connected"
-                                    ? t("remotes.clientsUnsupported")
-                                    : t("remotes.clientsDisconnected")
-                                }
+                                title={t("remotes.controlDisconnected")}
                                 style={{ ...btnStyle(), opacity: 0.25 }}
                               >
-                                {t("remotes.clients")}
+                                {t("remotes.control")}
                               </div>
                             }
                           >
                             <button
                               type="button"
-                              aria-expanded={open()}
-                              title={
-                                open()
-                                  ? t("remotes.hideClients")
-                                  : t("remotes.showClients")
-                              }
-                              onClick={() => toggleExpanded(remote().name)}
+                              aria-haspopup="dialog"
+                              title={t("remotes.openControl")}
+                              onClick={() => setControlling(remote().name)}
                               style={{
                                 ...btnStyle(),
                                 opacity: open() ? 1 : 0.7,
                                 color: open() ? theme().accent : "inherit",
                               }}
                             >
-                              {open() ? "▾ " : "▸ "}
-                              {t("remotes.clients")}
+                              {t("remotes.control")}
                             </button>
                           </Show>
                         </Show>
@@ -620,32 +609,8 @@ export function RemotesOverlay(props: {
                       </Show>
                     </div>
 
-                    {/* Clients, as a full-width row of the same grid. A sibling
-                      of the remote row rather than a child of it, so the
-                      drag-reorder extents stay the height of the header the
-                      user is actually dragging. */}
-                    <Show when={clients() && open()}>
-                      <div
-                        style={{
-                          "grid-column": "1 / -1",
-                          // Keeps the client list from widening the grid's
-                          // columns; it wraps instead.
-                          "min-width": "0",
-                          "border-left": `1px solid ${theme().subtleBorder}`,
-                          "border-right": `1px solid ${theme().subtleBorder}`,
-                          "border-bottom": `1px solid ${theme().subtleBorder}`,
-                        }}
-                      >
-                        <ConnectionClients
-                          workspace={props.workspace!}
-                          connectionId={remote().name as ConnectionId}
-                          sessions={props.sessions ?? []}
-                          surfaces={props.surfaces ?? []}
-                          palette={props.palette}
-                          fontSize={props.fontSize}
-                        />
-                      </div>
-                    </Show>
+                    {/* The panels themselves are an overlay of their own,
+                      rendered once below rather than per row. */}
                   </>
                 );
               }}
@@ -730,6 +695,28 @@ export function RemotesOverlay(props: {
           </form>
         </Show>
       </OverlayPanel>
+
+      {/* On top of this list rather than inside it: a unit table or a journal
+          page has no business being rendered into a row. Closing it comes back
+          here, which is where the viewer asked for it. */}
+      <Show when={controlling()}>
+        {(name) => (
+          <ConnectionControlOverlay
+            workspace={props.workspace!}
+            connectionId={name() as ConnectionId}
+            name={name()}
+            palette={props.palette}
+            fontSize={props.fontSize}
+            sessions={props.sessions ?? []}
+            surfaces={props.surfaces ?? []}
+            canListClients={canListClients(name())}
+            canManageExtensions={
+              connectionFor(name())?.supportsExtensions === true
+            }
+            onClose={() => setControlling(null)}
+          />
+        )}
+      </Show>
     </OverlayBackdrop>
   );
 }

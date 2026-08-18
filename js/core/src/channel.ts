@@ -302,3 +302,86 @@ export function parseChannelMessage(bytes: Uint8Array): ChannelMessage | null {
       return null;
   }
 }
+
+/**
+ * Send-credit bookkeeping for one connected channel.
+ *
+ * The peer's window is the only backpressure a channel has: the server
+ * refuses a DATA message that would put more than `window` unacknowledged
+ * bytes on the wire, and a refusal closes the channel. Track the counters
+ * here so a caller can ask before it builds a payload it cannot send.
+ */
+export class ChannelCredit {
+  #window: bigint;
+  #sent = 0n;
+  #acked = 0n;
+  #received = 0n;
+
+  constructor(window: bigint) {
+    this.#window = window;
+  }
+
+  get window(): bigint {
+    return this.#window;
+  }
+
+  /** Bytes this side may still send before the peer acknowledges more. */
+  get available(): bigint {
+    const outstanding = this.#sent - this.#acked;
+    return outstanding >= this.#window ? 0n : this.#window - outstanding;
+  }
+
+  /** Cumulative bytes received, which is what an ACK must carry. */
+  get received(): bigint {
+    return this.#received;
+  }
+
+  fits(length: number): boolean {
+    return BigInt(length) <= this.available;
+  }
+
+  /** Record an outgoing DATA payload. Returns false when credit is short and
+   *  nothing was recorded, so the caller can drop or queue instead. */
+  charge(length: number): boolean {
+    if (!this.fits(length)) return false;
+    this.#sent += BigInt(length);
+    return true;
+  }
+
+  /** Apply a peer ACK. Cumulative and monotonic; a replay is ignored. */
+  acknowledge(bytes: bigint): void {
+    if (bytes > this.#acked)
+      this.#acked = bytes > this.#sent ? this.#sent : bytes;
+  }
+
+  /** Record an incoming DATA payload and return the new cumulative total. */
+  receive(length: number): bigint {
+    this.#received += BigInt(length);
+    return this.#received;
+  }
+}
+
+/** How a caller observes one connected channel. */
+export interface ChannelOpenOptions extends ChannelConnectOptions {
+  /** One complete message from the peer. Already acknowledged. */
+  onData?(payload: Uint8Array): void;
+  /** The peer acknowledged bytes; `available` is the new send credit. */
+  onCredit?(available: bigint): void;
+  /** Final closure, from either side or from transport loss. */
+  onClosed?(reason: number, detail: string): void;
+}
+
+/** A live channel. Obtain one from `BlitConnection.connectChannel`. */
+export interface ChannelHandle {
+  readonly channelId: number;
+  readonly name: string;
+  /** Server-assigned label for the peer, e.g. `ext:<id>:<attempt>`. */
+  readonly peer: string;
+  readonly metadata: Uint8Array;
+  /** Bytes that may be sent before the peer acknowledges more. */
+  readonly availableCredit: bigint;
+  /** Send one message. Returns false when credit is short or the channel is
+   *  gone; throws only on a payload the protocol cannot carry. */
+  send(payload: Uint8Array | string): boolean;
+  close(reason?: number): void;
+}
