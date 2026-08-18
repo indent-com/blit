@@ -10,7 +10,7 @@
 Blit should execute Rust extensions compiled to WebAssembly inside the server:
 
 ```bash
-blit ext run --on prod extension.wasm arg1 arg2
+blit ext run --on prod builder extension.wasm arg1 arg2
 ```
 
 The client addresses the module by its full BLAKE3 digest. The server admits it
@@ -170,9 +170,9 @@ in KV; PTY handles do not.
 ### `testgrid`: many isolated instances from one hash
 
 ```bash
-blit ext run --on ci --restart always --persist --name test-unit testgrid.wasm unit
-blit ext run --on ci --restart always --persist --name test-integration testgrid.wasm integration
-blit ext run --on ci --restart always --persist --name test-web testgrid.wasm web
+blit ext run --on ci --restart always --persist test-unit testgrid.wasm unit
+blit ext run --on ci --restart always --persist test-integration testgrid.wasm integration
+blit ext run --on ci --restart always --persist test-web testgrid.wasm web
 ```
 
 The module uploads once, but each extension gets its own ID, arguments, thread,
@@ -529,7 +529,7 @@ transient blocked extensions a recovery path.
 `PERSIST` stores the extension definition with enabled and desired-running both
 set. It implies `DETACH` and requires a unique durable name. Persistence does
 not itself alter the restart policy: the common cross-server daemon form is
-`--restart always --persist --name NAME`. If the server shuts down while a
+`--restart always --persist NAME`. If the server shuts down while a
 persistent extension is enabled and desired-running, the shutdown ends its
 current attempt without incrementing failure counters and a fresh attempt is
 launched after the next server has initialized its registries.
@@ -1642,8 +1642,8 @@ setting. Operators create replicas as separate extensions, for example
 `worker-1`, `worker-2`, and `worker-3`, and manage them independently.
 
 ```bash
-blit ext run --on prod --restart always --persist --name worker-1 worker.wasm queue-a
-blit ext run --on prod --restart always --persist --name worker-2 worker.wasm queue-b
+blit ext run --on prod --restart always --persist worker-1 worker.wasm queue-a
+blit ext run --on prod --restart always --persist worker-2 worker.wasm queue-b
 blit ext list --on prod
 blit ext restart --on prod worker-1
 ```
@@ -2414,15 +2414,15 @@ needed.
 ```bash
 blit ext run --on prod extension.wasm arg1 arg2
 blit ext run --on prod --restart on-failure extension.wasm arg1
-blit ext run --on prod --restart always --persist --name builder extension.wasm arg1
+blit ext run --on prod --restart always --persist builder extension.wasm arg1
 ```
 
 The canonical command grammar is
-`blit ext run [RUN_OPTIONS] FILE [ARGS...]`. Every token
+`blit ext run [RUN_OPTIONS] NAME FILE [ARGS...]`. Every token
 after `FILE` is passed verbatim as an extension argument, including tokens
 beginning with `-`; no `--` separator is required. Extension-run options such as
-`--detach`, `--restart`, `--persist`, `--name`, and connection options such as
-`--on` must therefore appear before `FILE`.
+`--detach`, `--restart`, `--persist`, and connection options such as `--on`
+must therefore appear before `NAME` and `FILE`, which are both positional.
 
 The CLI:
 
@@ -2442,7 +2442,7 @@ is platform-specific; Unix shells see only the low eight bits (`0` through
 rather than the CLI process status.
 
 `--restart` accepts `never` (the default), `on-failure`, or `always`.
-`--persist` requires `--name`, implies `--detach`, and stores an enabled,
+`--persist` implies `--detach` and stores an enabled,
 desired-running definition for future blit server processes. It receives
 `PERMISSION` unless the selected
 server was started with `--allow-persistent-extensions`; the CLI reports that

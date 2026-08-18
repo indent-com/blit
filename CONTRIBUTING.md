@@ -147,20 +147,24 @@ There is no `rustfmt.toml` or `.clippy.toml` — default rustfmt, prettier, and 
 | `gateway`      | Runs `blit gateway` with WebSocket + WebTransport (pass=`dev`)             | `127.0.0.1:10001`     |
 | `ui`           | Vite dev server for `js/ui/`                                               | `127.0.0.1:10000`     |
 | `website`      | Astro dev server for `js/website/`                                         | `127.0.0.1:10002`     |
+| `extensions`   | Builds `extensions/dist`, then serves it as a CORS extension registry      | `127.0.0.1:10003`     |
 
 ### Running multiple dev stacks
 
-Every port and socket path is derived from `DEV_INSTANCE` (default `0`). Each instance gets a block of ports at `10000 + (N * 5)`:
+Every port and socket path is derived from `DEV_INSTANCE` (default `0`). Each instance gets a block of ports at `10000 + (N * 10)`:
 
-| Instance | UI    | Gateway | Website |
-| -------- | ----- | ------- | ------- |
-| 0        | 10000 | 10001   | 10002   |
-| 1        | 10005 | 10006   | 10007   |
-| 2        | 10010 | 10011   | 10012   |
+| Instance | UI    | Gateway | Website | Extensions |
+| -------- | ----- | ------- | ------- | ---------- |
+| 0        | 10000 | 10001   | 10002   | 10003      |
+| 1        | 10010 | 10011   | 10012   | 10013      |
+| 2        | 10020 | 10021   | 10022   | 10023      |
 
 ```bash
-DEV_INSTANCE=1 ./bin/dev   # second stack on 10005-10007
+DEV_INSTANCE=1 ./bin/dev   # second stack on 10010-10013
 ```
+
+The UI derives the registry port the same way, so the Extensions tab of a
+remote offers the modules _this_ stack built rather than the published ones.
 
 `bin/dev` prints the concrete addresses on startup. `DEV_INSTANCE` is intentionally unprefixed: blit strips most `BLIT_*` variables from child terminals, but passes everything else through. This means `DEV_INSTANCE` propagates into nested shells so you always know which instance you're inside and can pick a different one. You can also override individual values:
 
@@ -172,6 +176,7 @@ DEV_INSTANCE=1 ./bin/dev   # second stack on 10005-10007
 | `BLIT_DEV_GW_PORT`   | `10001`              | Gateway TCP + WebTransport UDP port                    |
 | `BLIT_DEV_WT_ADDR`   | `:10001`             | Browser-facing WebTransport `hostname:port` or `:port` |
 | `BLIT_DEV_SITE_PORT` | `10002`              | Astro website dev-server port                          |
+| `BLIT_DEV_EXT_PORT`  | `10003`              | Extension registry (`extensions/dist`) port            |
 
 ## Project structure
 

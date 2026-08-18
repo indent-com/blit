@@ -8,9 +8,9 @@ cd "$(dirname "$0")/.."
 # Set DEV_INSTANCE to run multiple dev stacks side-by-side.  Each instance
 # gets a block of ports starting at 10000 + (N * 10):
 #
-#   Instance 0 (default):  10000  10001  10002
-#   Instance 1:            10010  10011  10012
-#   Instance 2:            10020  10021  10022
+#   Instance 0 (default):  10000  10001  10002  10003
+#   Instance 1:            10010  10011  10012  10013
+#   Instance 2:            10020  10021  10022  10023
 #   ...
 #
 # The blit server Unix socket is /tmp/blit-dev.sock for instance 0,
@@ -32,9 +32,11 @@ N="${DEV_INSTANCE:-0}"
 
 if [ "$N" -eq 0 ]; then
     export BLIT_DEV_SOCK="${BLIT_DEV_SOCK:-/tmp/blit-dev.sock}"
+    export BLIT_DEV_EXT_DB="${BLIT_DEV_EXT_DB:-/tmp/blit-dev-ext/extensions.redb}"
     PC_SOCK="/tmp/blit-dev-pc.sock"
 else
     export BLIT_DEV_SOCK="${BLIT_DEV_SOCK:-/tmp/blit-dev-${N}.sock}"
+    export BLIT_DEV_EXT_DB="${BLIT_DEV_EXT_DB:-/tmp/blit-dev-${N}-ext/extensions.redb}"
     PC_SOCK="/tmp/blit-dev-pc-${N}.sock"
 fi
 
@@ -42,6 +44,11 @@ BASE=$(( 10000 + N * 10 ))
 export BLIT_DEV_UI_PORT="${BLIT_DEV_UI_PORT:-$(( BASE ))}"
 export BLIT_DEV_GW_PORT="${BLIT_DEV_GW_PORT:-$(( BASE + 1 ))}"
 export BLIT_DEV_SITE_PORT="${BLIT_DEV_SITE_PORT:-$(( BASE + 2 ))}"
+# The stack's own extension registry: extensions/dist served with CORS, which
+# is what the UI's Extensions panel installs from in dev. Its port is derived
+# from the UI port the same way the UI derives it, so a second instance's page
+# reaches that instance's modules and not the first one's.
+export BLIT_DEV_EXT_PORT="${BLIT_DEV_EXT_PORT:-$(( BASE + 3 ))}"
 # Browser-facing WebTransport authority. A leading `:port` keeps the browser
 # page hostname; `hostname:port` overrides both.
 export BLIT_DEV_WT_ADDR="${BLIT_DEV_WT_ADDR:-:${BLIT_DEV_GW_PORT}}"

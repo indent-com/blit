@@ -17,3 +17,4 @@ coverage/
 dist
 node_modules/
 node_modules
+/extensions/target/

@@ -9,6 +9,7 @@ version: "0.5"
 #   BLIT_DEV_GW_PORT    Gateway WS/WT port          (default: 10001)
 #   BLIT_DEV_GW_HOST    Gateway TCP/UDP bind host   (default: 127.0.0.1)
 #   BLIT_DEV_SITE_PORT  Astro website dev port     (default: 10002)
+#   BLIT_DEV_EXT_PORT   Extension registry port    (default: 10003)
 #   BLIT_DEV_WT_ADDR    Browser-facing WT authority (default: :10001)
 #
 # BLIT_DEV_CARGO_FLAGS adds cargo flags to the blit build — e.g. put
@@ -64,7 +65,14 @@ processes:
     # positive while the new server is still spawning its compositor
     # and audio pipeline — causing dependents (gateway, share) to
     # connect to a dead socket and enter a restart loop.
-    command: rm -f ${BLIT_DEV_SOCK:-/tmp/blit-dev.sock} && exec ./target/profiling/blit server --verbose --socket ${BLIT_DEV_SOCK:-/tmp/blit-dev.sock}
+    # --allow-persistent-extensions so `blit ext run --persist` works here.
+    # Without it an extension still runs, but nothing registers its `@name`
+    # commands, which shows up as `blit ext commands` being silently empty.
+    # The catalog path is per instance so two dev stacks cannot fight over one
+    # redb file -- the loser of that race gets no extension subsystem at all.
+    command: rm -f ${BLIT_DEV_SOCK:-/tmp/blit-dev.sock} && exec ./target/profiling/blit server --verbose --socket ${BLIT_DEV_SOCK:-/tmp/blit-dev.sock} --allow-persistent-extensions
+    environment:
+      - "BLIT_EXTENSION_PATH=${BLIT_DEV_EXT_DB:-/tmp/blit-dev-ext/extensions.redb}"
     depends_on:
       build:
         condition: process_completed_successfully
@@ -145,6 +153,29 @@ processes:
         condition: process_completed_successfully
     availability:
       restart: always
+
+  # The stack's own https://install.blit.sh/ext: build every extension to
+  # extensions/dist, then serve that directory with CORS open. The UI's
+  # Extensions panel defaults to this registry under `vite dev`, so installing
+  # what you just edited takes no URL typing and no network.
+  #
+  # Rebuilds are not watched: a wasm rebuild is a minute of wall clock, and
+  # having it fire on every keystroke in extensions/ would be worse than
+  # re-running `bin/extensions` when you mean it. The server re-reads the
+  # directory per request, so a manual rebuild is picked up without a restart.
+  extensions:
+    command: ./bin/extensions && exec ./bin/ext-registry ${BLIT_DEV_EXT_PORT:-10003}
+    availability:
+      restart: on_failure
+      backoff_seconds: 5
+      max_restarts: 3
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: ${BLIT_DEV_EXT_PORT:-10003}
+        path: /manifest.json
+      period_seconds: 2
+      failure_threshold: 300
 
   website:
     command: cd js/website && pnpm exec astro dev --host --port ${BLIT_DEV_SITE_PORT:-3267}

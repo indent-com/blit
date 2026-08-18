@@ -679,8 +679,14 @@
         buildInputs = [
           rustToolchain
           pkgs.rust-analyzer
+          # An extension's identity is its BLAKE3 digest, so checking one by
+          # hand against a manifest needs a tool that speaks it.
+          pkgs.b3sum
           pkgs.binaryen
           pkgs.bun
+          # gdbus, so the systemd extension can watch units by signal rather
+          # than by polling when it is run from a development shell.
+          pkgs.glib.bin
           pkgs.cargo-flamegraph
           pkgs.cargo-llvm-cov
           pkgs.cargo-edit
