@@ -451,6 +451,16 @@ mod stub {
             fd: OwnedFd,
             identity: AppIdentity,
         },
+        /// Stop accepting on an adopted app socket, and close it.
+        ///
+        /// Named by the same identity that added it. Without this, every
+        /// attempt at an application leaves a listening socket, a held fd and
+        /// an event source behind — fastest under a crash-looping app, which
+        /// mints a fresh instance per backoff retry.
+        RemoveAppSocket {
+            app_id: String,
+            instance_id: String,
+        },
         /// Update the advertised output refresh rate (millihertz).
         SetRefreshRate {
             mhz: u32,

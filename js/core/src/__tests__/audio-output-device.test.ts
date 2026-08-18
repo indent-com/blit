@@ -199,6 +199,80 @@ describe("re-selecting the current output device", () => {
 });
 
 /**
+ * A sink that refuses the choice.
+ *
+ * `setSinkId` rejects for a device that is no longer there — a headset that
+ * walked off between the moment the picker listed it and the moment it was
+ * chosen. Playback stays on the old sink, which is the right answer, but the
+ * choice has then been recorded without being routed. The guard above must not
+ * read that as done, or picking the device again once it is back is a no-op and
+ * audio is pinned to the wrong output for the rest of the session.
+ */
+describe("an output device that rejects the switch", () => {
+  /** A context whose `setSinkId` fails for every id in `failing`. */
+  function flakyRig(failing: Set<string>) {
+    const sinks: string[] = [];
+    const player = new AudioPlayer();
+    (player as unknown as { ctx: unknown }).ctx = {
+      state: "running",
+      close: () => Promise.resolve(),
+      setSinkId: (id: string) => {
+        sinks.push(id);
+        return failing.has(id)
+          ? Promise.reject(new Error("device not found"))
+          : Promise.resolve();
+      },
+    };
+    return { player, sinks, failing };
+  }
+
+  /** Let the in-flight `setSinkId` settle and its handler run. */
+  const settled = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("tries again when the same device is picked after a failure", async () => {
+    const failing = new Set(["headset"]);
+    const { player, sinks } = flakyRig(failing);
+    player.setOutputDevice("headset");
+    await settled();
+    expect(sinks).toEqual(["headset"]);
+
+    // The headset is back. Nothing about the player's state changed in between,
+    // so this is the only chance it gets.
+    failing.delete("headset");
+    player.setOutputDevice("headset");
+    await settled();
+    expect(sinks).toEqual(["headset", "headset"]);
+    player.destroy();
+  });
+
+  it("keeps a switch that took from being made twice", async () => {
+    const { player, sinks } = flakyRig(new Set());
+    player.setOutputDevice("headset");
+    await settled();
+    player.setOutputDevice("headset");
+    await settled();
+    expect(sinks).toEqual(["headset"]);
+    player.destroy();
+  });
+
+  it("still remembers a refused choice for the next context", async () => {
+    // The failure must not roll the choice back: the device may well be there
+    // by the time the browser hands us a new context, and that context is built
+    // on the default sink until it is told otherwise.
+    const { player, sinks, failing } = flakyRig(new Set(["headset"]));
+    player.setOutputDevice("headset");
+    await settled();
+    sinks.length = 0;
+    failing.clear();
+    await (
+      player as unknown as { applyOutputDevice(): Promise<void> }
+    ).applyOutputDevice();
+    expect(sinks).toEqual(["headset"]);
+    player.destroy();
+  });
+});
+
+/**
  * The fix: the buffer is told what the sink costs, instead of assuming every
  * sink costs 60 ms.
  *

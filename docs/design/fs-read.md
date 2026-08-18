@@ -58,6 +58,12 @@ A reply carries at most `FS_READ_MAX_TOTAL_BYTES` (8 MiB) of content. Files past
 that are `TOO_LARGE` rather than silently dropped, so a caller can re-ask for the
 remainder in smaller batches.
 
+Paths are text here, and a Unix path is bytes: one that is not UTF-8 is answered
+`OTHER` with an empty path rather than costing the frame its reply. Dropping the
+request would leave the caller waiting on a nonce nothing else will ever carry,
+which is the one outcome this family does not have. Under `FS_READ_FIRST` such a
+candidate is stepped over like any other the caller cannot have.
+
 ### `FS_READ_NO_CONTENT`
 
 With `flags` bit 1 set, records name the file without carrying it: a status and a

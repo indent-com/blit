@@ -251,6 +251,41 @@ fn a_shorter_resize_keeps_sequence_identity() {
 }
 
 #[test]
+fn an_alt_screen_round_trip_keeps_sequence_identity() {
+    // vim, less, man, htop, a git pager: each one hides the primary grid's
+    // scrollback on the way in and gets it back on the way out. Nothing the
+    // user's shell wrote rotated, so no already-captured record may move —
+    // docs/design/term-journal.md § Sequences.
+    let mut d = TerminalDriver::new(4, 40, 1000);
+    feed_lines(&mut d, 0..20);
+    let before = named_lines(&d, 20);
+    let cursor = d.cursor_seq();
+    let oldest = d.oldest_seq();
+
+    d.process(b"\x1b[?1049h");
+    assert!(d.alt_screen());
+    feed_lines(&mut d, 100..110);
+    d.process(b"\x1b[?1049l");
+    assert!(!d.alt_screen());
+
+    assert_eq!(
+        d.oldest_seq(),
+        oldest,
+        "leaving the alt screen restored the scrollback, it did not rotate it"
+    );
+    assert_eq!(
+        d.cursor_seq(),
+        cursor,
+        "the shell resumes where it left off, at the same sequence"
+    );
+    assert_eq!(
+        named_lines(&d, 20),
+        before,
+        "a sequence captured before the round trip still names its line"
+    );
+}
+
+#[test]
 fn growing_with_no_history_does_not_invent_rotation() {
     let mut d = TerminalDriver::new(10, 40, 1000);
     feed_lines(&mut d, 0..3);

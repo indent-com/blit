@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 
 use calloop::generic::Generic;
-use calloop::{EventLoop, Interest, LoopSignal, PostAction};
+use calloop::{EventLoop, Interest, LoopSignal, PostAction, RegistrationToken};
 use rustc_hash::{FxHashMap, FxHashSet};
 use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::{
     self, WpCursorShapeDeviceV1,
@@ -742,6 +742,17 @@ pub enum CompositorCommand {
     AddAppSocket {
         fd: OwnedFd,
         identity: AppIdentity,
+    },
+    /// Stop accepting on an adopted app socket, and close it.
+    ///
+    /// Named by the same identity that added it. The event source is removed and
+    /// the listener dropped, which closes the fd; the caller unlinks the path it
+    /// still owns. Without this, every attempt at an application leaves a
+    /// listening socket, a held fd and an event source behind — fastest under a
+    /// crash-looping app, which mints a fresh instance per backoff retry.
+    RemoveAppSocket {
+        app_id: String,
+        instance_id: String,
     },
     KeyInput {
         surface_id: u16,
@@ -5184,6 +5195,14 @@ impl Compositor {
                     "[compositor] BUG: AddAppSocket for {} reached handle_command; \
                      the command loop must intercept it",
                     identity.app_id
+                );
+            }
+            // Same reason: the token that names the source lives in the command
+            // loop, which is the only place that can withdraw one.
+            CompositorCommand::RemoveAppSocket { app_id, .. } => {
+                eprintln!(
+                    "[compositor] BUG: RemoveAppSocket for {app_id} reached \
+                     handle_command; the command loop must intercept it"
                 );
             }
             CompositorCommand::KeyInput {
@@ -11923,6 +11942,13 @@ fn run_compositor(
         eprintln!("[compositor] entering event loop");
     }
 
+    // Adopted app sockets, by the identity that added them. The token is what
+    // lets one be withdrawn: dropping the source closes the listener's fd, and
+    // without that an application that is restarted leaves its predecessor
+    // accepting forever.
+    let mut app_socket_tokens: std::collections::HashMap<(String, String), RegistrationToken> =
+        std::collections::HashMap::new();
+
     while !shutdown.load(Ordering::Relaxed) {
         // Process commands.
         let mut drained_wayland_before_frame = false;
@@ -11961,6 +11987,9 @@ fn run_compositor(
                     }
                     let identity = Arc::new(identity);
                     let label = identity.app_id.clone();
+                    // What a later `RemoveAppSocket` names it by: the instance
+                    // is what makes two attempts at one application distinct.
+                    let key = (identity.app_id.clone(), identity.instance_id.clone());
                     let Ok(cancel) = monitor_cancel_read.try_clone() else {
                         eprintln!("[compositor] app socket {label}: cancel fd clone failed");
                         continue;
@@ -11987,7 +12016,18 @@ fn run_compositor(
                         Ok(PostAction::Continue)
                     });
                     match inserted {
-                        Ok(_token) => {
+                        Ok(token) => {
+                            // Replacing an entry would drop its token and leak
+                            // the source it names, so retire the predecessor
+                            // first. The same identity twice is a caller bug
+                            // rather than a routine event, hence the notice.
+                            if let Some(stale) = app_socket_tokens.insert(key, token) {
+                                eprintln!(
+                                    "[compositor] app socket for {label} re-added; \
+                                     withdrawing the previous one"
+                                );
+                                handle.remove(stale);
+                            }
                             if verbose {
                                 eprintln!("[compositor] app socket registered for {label}");
                             }
@@ -11995,6 +12035,29 @@ fn run_compositor(
                         Err(e) => {
                             eprintln!("[compositor] app socket {label} not registered: {e}");
                         }
+                    }
+                }
+                CompositorCommand::RemoveAppSocket {
+                    app_id,
+                    instance_id,
+                } => {
+                    // Dropping the source closes the listener, so nothing can
+                    // connect on that name afterwards. The path is the server's
+                    // to unlink — it never left that side.
+                    match app_socket_tokens.remove(&(app_id.clone(), instance_id.clone())) {
+                        Some(token) => {
+                            handle.remove(token);
+                            if verbose {
+                                eprintln!("[compositor] app socket withdrawn for {app_id}");
+                            }
+                        }
+                        None if verbose => {
+                            eprintln!(
+                                "[compositor] app socket {app_id}-{instance_id} \
+                                 already gone"
+                            );
+                        }
+                        None => {}
                     }
                 }
                 other => compositor.handle_command(other),

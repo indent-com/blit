@@ -6052,6 +6052,16 @@ fn reanchor_client(
 struct Session {
     ptys: FxHashMap<u16, Pty>,
     compositor: Option<SharedCompositor>,
+    /// Wayland sockets minted for one application each, by app id: the instance
+    /// currently listening, and the path this side owns and must unlink.
+    ///
+    /// Keyed by application rather than by instance because that is the bound
+    /// worth holding: an application gets at most one live socket, so a
+    /// crash-looping one — which mints a fresh instance per backoff retry —
+    /// cannot walk the session toward fd exhaustion. Every entry is withdrawn
+    /// and unlinked when the session goes.
+    #[cfg(target_os = "linux")]
+    app_sockets: HashMap<String, (String, std::path::PathBuf)>,
     /// When the live client catalog last sampled age and bandwidth. Session
     /// scoped, not per client: staggered per-client deadlines would rebuild
     /// every watcher's snapshot once per client per second instead of once.
@@ -6245,6 +6255,8 @@ impl Session {
         Self {
             ptys: FxHashMap::default(),
             compositor: None,
+            #[cfg(target_os = "linux")]
+            app_sockets: HashMap::new(),
             catalog_sampled_at: Instant::now(),
             next_client_id: 1,
             next_compositor_id: 1,
@@ -6596,7 +6608,57 @@ impl Session {
             let _ = std::fs::remove_file(&path);
             return None;
         }
+        // This application's previous socket, if it had one, is now nobody's:
+        // the instance that was given it is gone or being replaced. Withdraw it
+        // before recording the new one, or the fd and the event source behind it
+        // stay for the life of the session.
+        self.release_app_socket(app_id);
+        self.app_sockets
+            .insert(app_id.to_string(), (instance_id.to_string(), path.clone()));
         Some((name, path))
+    }
+
+    /// Withdraw one application's socket: stop the compositor accepting on it,
+    /// and unlink the path this side owns.
+    ///
+    /// Quiet about an application that has none — every start calls this, and a
+    /// first start having nothing to retire is the ordinary case.
+    #[cfg(target_os = "linux")]
+    fn release_app_socket(&mut self, app_id: &str) {
+        let Some((instance_id, path)) = self.app_sockets.remove(app_id) else {
+            return;
+        };
+        if let Some(cs) = self.compositor.as_ref() {
+            let _ =
+                cs.handle
+                    .command_tx
+                    .send(blit_compositor::CompositorCommand::RemoveAppSocket {
+                        app_id: app_id.to_string(),
+                        instance_id,
+                    });
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Withdraw every app socket this session minted.
+    ///
+    /// The compositor is going with the session, so the sources go with it; what
+    /// would outlive both is the filesystem name, which nothing else will ever
+    /// clean up — the instance id in it is fresh per attempt, so a stale one is
+    /// never reused and never overwritten.
+    #[cfg(target_os = "linux")]
+    fn release_all_app_sockets(&mut self) {
+        for (app_id, (instance_id, path)) in std::mem::take(&mut self.app_sockets) {
+            if let Some(cs) = self.compositor.as_ref() {
+                let _ = cs.handle.command_tx.send(
+                    blit_compositor::CompositorCommand::RemoveAppSocket {
+                        app_id,
+                        instance_id,
+                    },
+                );
+            }
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     fn live_ptys(&self) -> usize {
@@ -8082,6 +8144,11 @@ async fn begin_server_shutdown(state: &AppState) {
     let notices = {
         let mut sess = state.session.lock().await;
         sess.channels.begin_shutdown();
+        // Names in `XDG_RUNTIME_DIR` outlive the process that bound them, and
+        // nothing else knows what they were: the instance id in each is minted
+        // per attempt, so a leftover is never reused and never overwritten.
+        #[cfg(target_os = "linux")]
+        sess.release_all_app_sockets();
         sess.clients
             .values()
             .filter_map(|client| {
@@ -14885,9 +14952,9 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
             // like every other walk in this family.
             if let Some((nonce, flags, max_bytes, groups)) = parse_fs_read(data) {
                 use blit_remote::fs::{
-                    FS_FILE_NOT_FOUND, FS_FILE_OK, FS_READ_DEFAULT_BYTES, FS_READ_FIRST,
-                    FS_READ_FLAGS_KNOWN, FS_READ_MAX_TOTAL_BYTES, FS_READ_NO_CONTENT,
-                    msg_fs_read_result,
+                    FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_OTHER, FS_READ_DEFAULT_BYTES,
+                    FS_READ_FIRST, FS_READ_FLAGS_KNOWN, FS_READ_MAX_TOTAL_BYTES,
+                    FS_READ_NO_CONTENT, msg_fs_read_result,
                 };
                 if flags & !FS_READ_FLAGS_KNOWN != 0 {
                     let _ = out.send(msg_fs_read_result(nonce, FS_DONE_INVALID, &[]));
@@ -14915,6 +14982,18 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
                     for group in groups {
                         let mut answered = false;
                         for path in group {
+                            // A path that is not UTF-8 is one this family has no
+                            // way to name back, so it is answered rather than
+                            // read — and answered rather than costing a
+                            // well-formed frame its whole reply. Under FIRST it
+                            // is stepped over like any other candidate that
+                            // cannot be had.
+                            let Some(path) = path else {
+                                if !first_only {
+                                    records.push((FS_FILE_OTHER, String::new(), Vec::new()));
+                                }
+                                continue;
+                            };
                             let (status, body) = if no_content {
                                 (stat_one_for_fs_read(&path, per_file), Vec::new())
                             } else {

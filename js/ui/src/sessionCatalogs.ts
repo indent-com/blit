@@ -74,7 +74,20 @@ export function ensureSessionCatalog(
 
   void openSession(connection, {
     onClosed: () => {
-      if (opens.get(connectionId) === state) opens.delete(connectionId);
+      // Dropping the slot is not enough: the handle owns a repeating artwork
+      // timer and one object URL per icon it drew, and only its `close()` gives
+      // those up. The other two paths out of a channel close it themselves — a
+      // reconnect above, a superseded open below — so a server-initiated close
+      // arriving here was the one that leaked a live timer polling a dead
+      // channel and every icon for the life of the page.
+      //
+      // Closing from inside the close is safe: the connection has already
+      // forgotten the channel by the time it calls this, so the handle's
+      // `close()` reaches a no-op rather than coming back round.
+      if (opens.get(connectionId) === state) {
+        dropSessionCatalog(connectionId);
+        return;
+      }
       bump();
     },
   })

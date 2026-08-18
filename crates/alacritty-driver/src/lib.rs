@@ -491,11 +491,16 @@ impl TerminalDriver {
     }
 
     pub fn process(&mut self, data: &[u8]) {
+        // Sampled before the tracker consumes the chunk: the flag afterwards
+        // only says which grid the chunk left us on, and what the history
+        // delta has to be read against is whether the chunk *crossed*.
+        let alt_screen_before = self.alt_screen();
         let used_rows_action = self.modes.process(data);
         let history_before = self.history_len();
         self.arm_scroll_probe();
         self.processor.advance(&mut self.term, data);
-        self.read_scroll_probe(history_before);
+        let crossed_alt_screen = self.alt_screen() != alt_screen_before;
+        self.read_scroll_probe(history_before, crossed_alt_screen);
         if used_rows_action == UsedRowsAction::Reset {
             self.reset_used_rows();
         }
@@ -527,14 +532,30 @@ impl TerminalDriver {
         grid.total_lines().saturating_sub(grid.screen_lines())
     }
 
-    fn read_scroll_probe(&mut self, history_before: usize) {
+    fn read_scroll_probe(&mut self, history_before: usize, crossed_alt_screen: bool) {
         let after = self.term.grid().display_offset();
         let probed = after.saturating_sub(SCROLL_PROBE) as u64;
         self.scrolled_lines += probed;
         // Whichever of the two saw more motion. Before the scrollback
         // exists only the growth sees any; once it is full only the probe
         // does; in between they agree.
-        let grown = self.history_len().saturating_sub(history_before) as u64;
+        //
+        // Unless the chunk crossed to the other grid. The alternate screen
+        // has no scrollback, so the primary's whole history vanishes on the
+        // way in and comes back on the way out: the delta measures the swap,
+        // not the application scrolling. The way in is harmless (the delta is
+        // negative and floors at zero), but the `ESC[?1049l` that ends every
+        // vim, less, man or pager would otherwise move `rotated_lines` by the
+        // full scrollback height while the records already stored keep their
+        // absolute sequences — every one of them would name text a screenful
+        // of history away, or read back evicted. The alternate screen does
+        // not advance sequences at all — see docs/design/term-journal.md
+        // § Sequences.
+        let grown = if crossed_alt_screen {
+            0
+        } else {
+            self.history_len().saturating_sub(history_before) as u64
+        };
         self.rotated_lines += probed.max(grown);
     }
 

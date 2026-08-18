@@ -55,17 +55,25 @@ Every outcome is still one reply under the caller's nonce. A client waiting on
 
 **This hands the caller every credential the server was started with.**
 
-That is the whole posture, stated plainly. If the server's environment holds
-`BLIT_PASSPHRASE` — which it does when `.env.local` is sourced — or a
+That is the whole posture, stated plainly. If the server's environment holds a
 `GITHUB_TOKEN`, an `ANTHROPIC_API_KEY`, or any other secret, then any client that
 can reach this family reads it. There is no allowlist and no redaction.
 
 Two things bound it, neither of which should be mistaken for a sandbox:
 
 - The ceiling is the one the protocol already has. A client that can call
-  `ENV_GET` can also open a PTY, and a shell prints the same environment. This
-  family does not widen who can read what; it removes the need to spawn a process
-  to do it.
+  `ENV_GET` can also open a PTY, and a shell prints nearly the same environment.
+  This family does not widen who can read what; it removes the need to spawn a
+  process to do it. The one difference is `BLIT_*`, which `pty/pty_unix.rs`
+  strips from a child (`BLIT_HUB` excepted) and this family does not: those are
+  the server's own knobs — budgets, gates, the socket a caller is already
+  talking on — and no credential of the deployment is among them.
+- **`BLIT_PASSPHRASE` is not one of them.** It belongs to whoever authenticates
+  browsers — the gateway process, or `blit share` — and no server reads it. It
+  is not in a server's environment to hand over, and it is kept that way on
+  purpose: the CLI's autostart (`transport.rs`) removes it from the child's
+  environment rather than trusting that the parent had no reason to hold it,
+  because `blit share` reads it one line before autostarting a server.
 - **`BLIT_ENV=0` refuses the family at dispatch** with `PERMISSION` and no
   entries. The feature bit stays advertised, following [kv.md](kv.md)'s
   precedent, so a refusal is legible as an operator's decision rather than as an

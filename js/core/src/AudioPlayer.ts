@@ -960,12 +960,37 @@ export class AudioPlayer {
     //
     // A rebuilt context still picks the choice up: `initAudioContext` applies
     // `_outputDeviceId` itself rather than waiting to be told again.
-    if (deviceId === this._outputDeviceId) return;
+    //
+    // What the guard compares against is the sink, not the choice. A choice
+    // that was asked for and refused is still the choice — it is what the
+    // viewer picked and what a later context must be built on — but nothing
+    // was routed, so re-picking it has to try again rather than read as
+    // "already there".
+    if (deviceId === this._sinkDeviceId) return;
     this._outputDeviceId = deviceId;
     void this.applyOutputDevice();
   }
 
+  /** The viewer's choice, whether or not it could be honoured. */
   private _outputDeviceId = "";
+
+  /**
+   * The id this context's sink has been set to, or null after an attempt that
+   * failed.
+   *
+   * Claimed before `setSinkId` is awaited rather than after, because the choice
+   * is re-applied far more often than it changes — several times a second while
+   * anything on the far side is moving — and a burst of those must collapse to
+   * one call, not one per re-apply. Dropped again if the call rejects, which is
+   * what makes the failure retryable: `setSinkId` can refuse a device that has
+   * just gone away (a headset walking off) without disturbing playback, leaving
+   * audio on the old sink, and until this was tracked apart from the choice the
+   * guard above pinned it there for good.
+   *
+   * Starts and returns to `""` because that is where a freshly constructed
+   * AudioContext plays: the system default.
+   */
+  private _sinkDeviceId: string | null = "";
 
   private async applyOutputDevice(): Promise<void> {
     const ctx = this.ctx as
@@ -974,11 +999,16 @@ export class AudioPlayer {
         })
       | null;
     if (!ctx?.setSinkId) return;
+    const requested = this._outputDeviceId;
+    this._sinkDeviceId = requested;
     try {
-      await ctx.setSinkId(this._outputDeviceId);
+      await ctx.setSinkId(requested);
     } catch {
       // A device that has gone away leaves playback on the previous sink,
       // which is better than silence; the panel still shows the selection.
+      // Only disown the claim if it is still ours — a later choice made while
+      // this one was in flight is the one that describes the sink now.
+      if (this._sinkDeviceId === requested) this._sinkDeviceId = null;
     }
   }
 
@@ -1575,6 +1605,11 @@ export class AudioPlayer {
     }
     this.gain = null;
     this.suspendedSince = 0;
+    // The next context is built on the default sink, so whatever this one was
+    // routed to is no longer true of anything. Left claimed, a choice that
+    // matches it would be skipped as already applied and the rebuilt context
+    // would keep playing on the default.
+    this._sinkDeviceId = "";
     // The next context may land on a different device, so the old sink's
     // floor must not be inherited — applyDeviceFloor() re-derives it once the
     // new one has rendered.

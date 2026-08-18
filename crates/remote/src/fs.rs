@@ -1113,8 +1113,18 @@ pub fn msg_fs_read_paths(nonce: u16, flags: u8, max_bytes: u32, paths: &[&str]) 
     msg_fs_read(nonce, flags, max_bytes, &[paths])
 }
 
+/// A parsed `C2S_FS_READ`: `(nonce, flags, max_bytes, groups)`, where a group is
+/// one question and a path that is not UTF-8 is `None`.
+pub type FsReadRequest = (u16, u8, u32, Vec<Vec<Option<String>>>);
+
 /// Parse a `C2S_FS_READ` → `(nonce, flags, max_bytes, groups)`.
-pub fn parse_fs_read(data: &[u8]) -> Option<(u16, u8, u32, Vec<Vec<String>>)> {
+///
+/// A path that is not UTF-8 is `None` rather than a parse failure. This family
+/// names paths as text, so it cannot answer about one it cannot name — but
+/// `None` for the whole frame would drop a well-formed request with no reply,
+/// leaving the caller waiting on a nonce nothing will ever carry. The caller
+/// answers such a path per-record, the way it answers one it cannot read.
+pub fn parse_fs_read(data: &[u8]) -> Option<FsReadRequest> {
     // [0x4D][nonce:2][flags:1][max_bytes:4][group_count:2]
     // then group_count × ( [path_count:2] then path_count × [len:2][path:N] )
     if data.first().copied() != Some(C2S_FS_READ) || data.len() < 10 {
@@ -1150,7 +1160,7 @@ pub fn parse_fs_read(data: &[u8]) -> Option<(u16, u8, u32, Vec<Vec<String>>)> {
             if off + len > data.len() {
                 return None;
             }
-            paths.push(String::from_utf8(data[off..off + len].to_vec()).ok()?);
+            paths.push(String::from_utf8(data[off..off + len].to_vec()).ok());
             off += len;
         }
         groups.push(paths);
@@ -3064,8 +3074,32 @@ mod tests {
                 7,
                 0,
                 4096,
-                vec![paths.iter().map(|p| (*p).to_string()).collect()]
+                vec![paths.iter().map(|p| Some((*p).to_string())).collect()]
             ))
+        );
+    }
+
+    /// A path this family cannot name must not cost the frame its reply: the
+    /// caller is waiting on that nonce, and nothing else will ever carry it.
+    #[test]
+    fn a_non_utf8_path_is_a_record_not_a_dropped_frame() {
+        // Built by hand: `msg_fs_read` takes `&str`, so the wire is the only
+        // place a path like this can come from.
+        let bad = b"/tmp/\xff\xfe.png";
+        let mut wire = vec![C2S_FS_READ, 5, 0, 0];
+        wire.extend_from_slice(&4096u32.to_le_bytes());
+        wire.extend_from_slice(&1u16.to_le_bytes()); // one group
+        wire.extend_from_slice(&2u16.to_le_bytes()); // two paths in it
+        wire.extend_from_slice(&(bad.len() as u16).to_le_bytes());
+        wire.extend_from_slice(bad);
+        wire.extend_from_slice(&(b"/etc/os-release".len() as u16).to_le_bytes());
+        wire.extend_from_slice(b"/etc/os-release");
+        let (nonce, _, _, groups) = parse_fs_read(&wire).expect("the frame is well formed");
+        assert_eq!(nonce, 5);
+        assert_eq!(
+            groups,
+            vec![vec![None, Some("/etc/os-release".to_string())]],
+            "the undecodable path is None, and the readable one beside it survives"
         );
     }
 
@@ -3080,7 +3114,7 @@ mod tests {
         assert_eq!((nonce, flags, max_bytes), (9, FS_READ_FIRST, 0));
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), 2);
-        assert_eq!(groups[1], vec!["/i/scalable/apps/b.svg".to_string()]);
+        assert_eq!(groups[1], vec![Some("/i/scalable/apps/b.svg".to_string())]);
     }
 
     #[test]

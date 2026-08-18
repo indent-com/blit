@@ -45,6 +45,28 @@ function aheadBehind(row: BranchRow): string {
   return parts.join(" ");
 }
 
+/**
+ * The keyboard half of a `role="button"` row.
+ *
+ * These rows are flex containers with their own column layout, not `<button>`s,
+ * so the button *behaviour* has to be spelled out: Enter and Space both
+ * activate, and Space is prevented from scrolling the panel out from under the
+ * row it just activated. Same shape as the unit rows in SystemdPanel.
+ *
+ * Only when the row itself holds the key. A worktree row contains a real
+ * `<button>` (open a terminal here), and keydown bubbles whether or not that
+ * button's click was stopped — without this, Enter on it would both open a
+ * terminal and navigate away from the worktree it was opening one in.
+ */
+function onActivateKey(run: () => void) {
+  return (event: KeyboardEvent) => {
+    if (event.target !== event.currentTarget) return;
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    run();
+  };
+}
+
 export function BranchesPanel(props: {
   session: IdeSession | null;
   theme: Theme;
@@ -92,7 +114,10 @@ export function BranchesPanel(props: {
         // the branch is checked out elsewhere, so matching on it cannot tell
         // a branch row from a worktree row.
         data-branch={row.ref}
+        role="button"
+        tabindex={0}
         onClick={() => props.session?.setLogSpec(row.ref)}
+        onKeyDown={onActivateKey(() => props.session?.setLogSpec(row.ref))}
         title={[
           row.ref,
           row.oid.slice(0, 12),
@@ -185,14 +210,24 @@ export function BranchesPanel(props: {
   function worktreeRow(row: WorktreeRow) {
     // A prunable worktree has no directory to open, and a bare one never had
     // a checkout: both are listed (they are real entries) but neither is a
-    // navigation target, so nothing pretends they are clickable.
+    // navigation target, so nothing pretends they are clickable — which now
+    // also means not taking the focus and not calling itself a button.
     const navigable = () => !row.prunable && !row.bare && row.path !== "";
     return (
       <div
         data-worktree={row.path}
+        role={navigable() ? "button" : undefined}
+        tabindex={navigable() ? 0 : undefined}
         onClick={() => {
           if (navigable()) props.onOpenWorktree?.(row.path);
         }}
+        // No handler at all on a non-navigable row: swallowing Space there
+        // would stop the panel scrolling for an activation that never happens.
+        onKeyDown={
+          navigable()
+            ? onActivateKey(() => props.onOpenWorktree?.(row.path))
+            : undefined
+        }
         title={[
           row.path || "(bare — no checkout)",
           row.detached
@@ -314,7 +349,13 @@ export function BranchesPanel(props: {
   ) {
     return (
       <div
+        // A disclosure, not a navigation target: aria-expanded is what says
+        // which way the ▸/▾ is pointing to anything that cannot see it.
+        role="button"
+        tabindex={0}
+        aria-expanded={open()}
         onClick={toggle}
+        onKeyDown={onActivateKey(toggle)}
         style={{
           display: "flex",
           "align-items": "center",
