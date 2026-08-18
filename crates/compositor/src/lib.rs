@@ -448,7 +448,7 @@ mod stub {
         /// not yet listening. Ownership of the path stays with the caller,
         /// which unlinks it; the compositor only accepts on the fd.
         AddAppSocket {
-            fd: std::os::fd::OwnedFd,
+            fd: OwnedFd,
             identity: AppIdentity,
         },
         /// Update the advertised output refresh rate (millihertz).
