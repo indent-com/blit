@@ -202,3 +202,61 @@ fn every_line_is_addressable_by_its_own_sequence() {
         );
     }
 }
+
+fn named_lines(d: &TerminalDriver, n: u64) -> Vec<String> {
+    (0..n)
+        .map(|i| d.seq_text(i, 0, Some(i + 1), 64 * 1024).text)
+        .collect()
+}
+
+#[test]
+fn a_taller_resize_keeps_sequence_identity() {
+    // Viewport 4, 20 lines of output → 16 lines of history. Growing to 10
+    // pulls 6 of those back into the viewport (`grow_lines`); every sequence
+    // that already named a line must still name it.
+    let mut d = TerminalDriver::new(4, 40, 1000);
+    feed_lines(&mut d, 0..20);
+    let before = named_lines(&d, 20);
+    let cursor = d.cursor_seq();
+
+    d.resize(10, 40);
+
+    assert_eq!(
+        named_lines(&d, 20),
+        before,
+        "grow must not renumber retained lines"
+    );
+    assert_eq!(
+        d.cursor_seq(),
+        cursor,
+        "cursor_seq must not jump when history is pulled into the viewport"
+    );
+}
+
+#[test]
+fn a_shorter_resize_keeps_sequence_identity() {
+    let mut d = TerminalDriver::new(10, 40, 1000);
+    feed_lines(&mut d, 0..20);
+    let before = named_lines(&d, 20);
+    let cursor = d.cursor_seq();
+
+    d.resize(4, 40);
+
+    assert_eq!(
+        named_lines(&d, 20),
+        before,
+        "shrink must not renumber retained lines"
+    );
+    assert_eq!(d.cursor_seq(), cursor);
+}
+
+#[test]
+fn growing_with_no_history_does_not_invent_rotation() {
+    let mut d = TerminalDriver::new(10, 40, 1000);
+    feed_lines(&mut d, 0..3);
+    let before = named_lines(&d, 3);
+    let cursor = d.cursor_seq();
+    d.resize(20, 40);
+    assert_eq!(named_lines(&d, 3), before);
+    assert_eq!(d.cursor_seq(), cursor);
+}

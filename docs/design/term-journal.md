@@ -80,6 +80,23 @@ The alternate screen does not advance sequences. A read taken while the PTY
 is on it comes back flagged `OUTPUT_ALT_SCREEN` and the cursor does not move;
 full-screen programs are not command output.
 
+## Resize
+
+A sequence is `rotated_lines + row`. `row` is alacritty's `cursor.point.line`
+(0 at the top of the viewport, negative in the history). A height change
+moves lines between history and viewport, and alacritty updates `line`
+accordingly: shrinking pushes viewport rows into history (`history_len`
+grows, `cursor.line` falls); growing pulls them back (`grow_lines` does
+`cursor.line += from_history`, `history_len` shrinks).
+
+`rotated_lines` follows the **signed** history-length delta so those two
+moves cancel. Shrink increments it; grow decrements it. `saturating_sub`
+would miss the grow direction, and every already-captured record plus the
+live cursor would then name text `from_history` rows away.
+
+A column change rewraps, so a sequence no longer names the same bytes. Height
+identity is the only correspondence resize preserves.
+
 ## OSC 133 state machine
 
 Four markers, and a fifth that only OSC 633 speaks:

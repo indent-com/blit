@@ -548,18 +548,28 @@ impl TerminalDriver {
             cols: cols as usize,
             rows: rows as usize,
         };
-        let history_before = self.history_len();
+        let history_before = self.history_len() as i64;
         self.term.resize(dims);
         // A resize shifts the history around on its own (rewrap, and lines
         // pushed out when the viewport shrinks).  That motion isn't the app
         // scrolling and the client re-derives its geometry from the next
         // frame anyway, so re-arm the probe without counting it.
         self.arm_scroll_probe();
-        // Sequences do have to follow it, though: rows that moved into the
-        // history are still the same text, and a cursor naming them must keep
-        // pointing at them. A column change rewraps and no such correspondence
-        // survives — see docs/design/term-journal.md § Resize.
-        self.rotated_lines += self.history_len().saturating_sub(history_before) as u64;
+        // Sequences do have to follow it, though. A shorter viewport pushes
+        // rows into the history (`history_len` grows); a taller one pulls
+        // them back out (`grow_lines` does `cursor.line += from_history` and
+        // `history_len` shrinks). `saturating_sub` would miss the grow
+        // direction, so `cursor_seq` and every already-captured record would
+        // jump by `from_history` rows. The signed delta cancels the cursor
+        // move: shrink increments `rotated_lines`, grow decrements it.
+        // A column change rewraps and no such correspondence survives —
+        // see docs/design/term-journal.md § Resize.
+        let delta = self.history_len() as i64 - history_before;
+        if delta >= 0 {
+            self.rotated_lines += delta as u64;
+        } else {
+            self.rotated_lines = self.rotated_lines.saturating_sub((-delta) as u64);
+        }
         let capped = self.used_rows.min(rows);
         if capped != self.used_rows {
             self.used_rows = capped;
