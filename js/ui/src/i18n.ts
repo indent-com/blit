@@ -229,6 +229,8 @@ const en: Messages = {
   "switcher.sectionRemotes": "Remotes",
   "switcher.sectionNewTerminal": "New terminal on\u2026",
   "switcher.newTerminalPlaceholder": "Filter remotes",
+  "switcher.sectionApps": "Applications",
+  "switcher.appOn": "on {name}",
 
   "statusbar.menuTitle": "Menu",
   "statusbar.terminals": "{count}T",

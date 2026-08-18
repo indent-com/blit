@@ -178,6 +178,7 @@ import {
   toggleServerRoot,
   reorderServerRoots,
 } from "./ide/rootsStore";
+import { ensureSessionCatalog } from "./sessionCatalogs";
 import { useIdeSession, type IdeSessionDescriptor } from "./ide/session";
 import {
   currentSourceSessionForPty,
@@ -786,6 +787,16 @@ function WorkspaceScreen(props: {
           (r) => connectionForRemote(r.remote) === connectionId,
         ),
       );
+    }
+  });
+  // Each connected server's application catalog, held open so the switcher can
+  // filter it from the first keystroke instead of fetching one when it opens.
+  // Armed like the roots watch above, and re-armed on the generation for the
+  // same reason: a channel does not survive a re-establish.
+  createEffect(() => {
+    for (const c of wsState().connections) {
+      if (c.status !== "connected") continue;
+      ensureSessionCatalog(workspace, c.id, c.generation);
     }
   });
   // The picker's list: per-server roots for kv connections, gateway entries

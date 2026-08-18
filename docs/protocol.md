@@ -347,6 +347,12 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 22  | `DESKTOP_MEDIA`       | Viewer media, portals, and MPRIS control family is understood   |
 | 23  | `PROCESS_SESSION_ENV` | `PROCESS_SPAWN` accepts the `SESSION_ENV` flag (bit 2)          |
 | 24  | `ENV`                 | Server answers `ENV_GET` with its own environment               |
+| 25  | `APP_SOCKET`          | `C2S_APP_SOCKET` mints per-application Wayland sockets           |
+| 26  | `CHANNEL_WATCH`       | `CHANNEL_WATCH` follows which channel names have a listener     |
+
+Bit 26 is advertised with bit 12 and never alone; it is separate because a
+`WATCH` an older server does not know is dropped by the channel family's
+unknown-kind skip rule, which a client cannot tell from a name nobody serves.
 
 Bits 11 and 12 remain proposed for the extension and channel families under
 review in [#167](https://github.com/indent-com/blit/pull/167) and

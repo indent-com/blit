@@ -17271,6 +17271,10 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         }
         if sess.channels.advertised() {
             features |= blit_remote::channel::FEATURE_CHANNEL;
+            // Separate bit because a WATCH this server did not understand
+            // would be dropped by the family's unknown-kind skip rule, which
+            // a client cannot tell from a name nobody serves.
+            features |= blit_remote::channel::FEATURE_CHANNEL_WATCH;
         }
         if state.extensions.advertised() {
             features |= blit_remote::extension::FEATURE_EXTENSION;
@@ -20718,7 +20722,17 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         if let Some(cs) = sess.compositor.as_ref() {
             cs.audio_broadcast.unsubscribe(client_id);
         }
-        let channel_deliveries = sess.channels.close_endpoint(client_id);
+        // A departing endpoint releases its channel names, which is news for
+        // every watcher of one — so this teardown reserves outbox room for
+        // other clients, exactly as the `0x95` request path does.
+        let Session {
+            clients, channels, ..
+        } = &mut *sess;
+        let channel_deliveries = channels.close_endpoint_reserved(client_id, |endpoint, bytes| {
+            clients
+                .get(&endpoint)
+                .and_then(|client| client.channel_tx.reserve(bytes))
+        });
         send_channel_deliveries(&sess, channel_deliveries);
         #[cfg(target_os = "linux")]
         let media_disconnected = sess

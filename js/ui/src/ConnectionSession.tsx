@@ -16,19 +16,23 @@
  * channel connect fails and the section stays out of the way, which is why this
  * renders nothing at all rather than an error when it cannot attach.
  *
- * Like the clients section, the subscription lives here: it opens when the
- * remote's row is expanded and closes when it is collapsed, so a collapsed
- * remote costs no channel traffic.
+ * The channel itself is not this panel's. It belongs to {@link
+ * ./sessionCatalogs.ts}, which holds one per connected server for the life of
+ * the page so the switcher can search applications without waiting for a
+ * catalog. This panel used to open its own and close it on the way out; two
+ * mirrors of one supervisor also meant two icon caches filling with the same
+ * artwork.
  */
 
-import { createSignal, For, onCleanup, Show } from "solid-js";
+import { createEffect, createSignal, For, Show } from "solid-js";
 import type {
   BlitWorkspace,
   ConnectionId,
   TerminalPalette,
 } from "@blit-sh/core";
-import { themeFor, ui, uiScale } from "./theme";
+import { scrollbarStyle, themeFor, ui, uiScale } from "./theme";
 import {
+  AppIcon,
   PanelEmpty,
   PanelRow,
   panelButton,
@@ -36,7 +40,13 @@ import {
   StatusPill,
   type PanelTone,
 } from "./panelKit";
-import { openSession, type SessionApp, type SessionHandle } from "./session";
+import type { SessionApp } from "./session";
+import {
+  applicationIcon,
+  requestApplicationIcons,
+  sessionHandle,
+} from "./sessionCatalogs";
+import { createLazyIcons } from "./lazyIcons";
 
 /** Phase → the tone and word the row shows. Backoff is a warning rather than
  *  an error: it is a supervisor working, not a supervisor stuck. */
@@ -62,47 +72,28 @@ export function ConnectionSession(props: {
 }) {
   const theme = () => themeFor(props.palette);
   const scale = () => uiScale(props.fontSize);
-  const [handle, setHandle] = createSignal<SessionHandle | null>(null);
-  // Bumped from the mirror's subscribe, since the handle's getters are plain
-  // properties rather than signals.
-  const [revision, setRevision] = createSignal(0);
   const [filter, setFilter] = createSignal("");
 
-  const connection = props.workspace.getConnection(props.connectionId);
-  if (connection) {
-    let live = true;
-    void openSession(connection, {
-      onClosed: () => {
-        setHandle(null);
-      },
-    })
-      .then((opened) => {
-        // The row can collapse while the channel is still opening.
-        if (!live) {
-          opened.close();
-          return;
-        }
-        setHandle(opened);
-        const stop = opened.subscribe(() => setRevision((n) => n + 1));
-        onCleanup(stop);
-      })
-      // No supervisor on this server: the section renders nothing rather than
-      // an error, because "this server does not run one" is not a fault.
-      .catch(() => setHandle(null));
-    onCleanup(() => {
-      live = false;
-      handle()?.close();
-    });
-  }
+  // The channel belongs to the catalog store, which holds one per connected
+  // server for the whole page. This panel used to open its own and close it on
+  // the way out; sharing is not only one channel instead of two, but one icon
+  // cache instead of two holding the same artwork.
+  //
+  // Null while the server has no supervisor attached — the connect was refused,
+  // or has not answered yet — and the panel then renders nothing, because "this
+  // server does not run one" is not a fault to report.
+  const handle = () => sessionHandle(props.connectionId);
 
-  const apps = () => {
-    revision();
-    return handle()?.apps ?? [];
-  };
-  const catalog = () => {
-    revision();
-    return handle()?.catalog ?? [];
-  };
+  const apps = () => handle()?.apps ?? [];
+  const catalog = () => handle()?.catalog ?? [];
+  /** Whether the supervisor's first message has landed.
+   *
+   *  The channel opens before the greeting arrives, and the greeting is what
+   *  carries both lists — so between the two, everything here is empty. Saying
+   *  "nothing is managed yet" in that window is a lie, and a convincing one:
+   *  the greeting waits behind a catalog read, which on a busy supervisor is
+   *  long enough to read and believe. */
+  const ready = () => handle()?.ready ?? false;
   /** Installed applications that are not already managed, matched against the
    *  filter box. A managed app is offered by its own row, not this list. */
   const addable = () => {
@@ -117,6 +108,30 @@ export function ConnectionSession(props: {
           entry.id.toLowerCase().includes(needle),
       );
   };
+  /** Artwork for one row. Goes through the store rather than the handle:
+   *  the handle's getters are plain properties, so a reply landing in the
+   *  mirror would change nothing a row is watching. The store's accessor is
+   *  reactive, and an icon always arrives long after its row was drawn. */
+  const iconOf = (id: string) => applicationIcon(props.connectionId, id);
+
+  // Artwork is asked for, never pushed: the catalog is names, and its icons are
+  // three orders of magnitude larger. The managed set is small and always on
+  // screen, so it is asked for outright.
+  createEffect(() => {
+    if (!handle()) return;
+    requestApplicationIcons(
+      props.connectionId,
+      apps().map((app) => app.id),
+    );
+  });
+
+  // The catalog is not: every installed application is a row, and asking for
+  // all that artwork would be tens of megabytes to draw a dozen tiles. So the
+  // rows ask as they come into view — see {@link ./lazyIcons.ts} for why the
+  // observer is rooted and registered the way it is.
+  const lazyIcons = createLazyIcons((ids) =>
+    requestApplicationIcons(props.connectionId, ids),
+  );
 
   return (
     <Show when={handle()}>
@@ -139,8 +154,10 @@ export function ConnectionSession(props: {
             when={apps().length > 0}
             fallback={
               <PanelEmpty theme={theme()} scale={scale()}>
-                Nothing is managed yet. Enable an application below and it will
-                start with this session.
+                <Show when={ready()} fallback="Asking the supervisor…">
+                  Nothing is managed yet. Enable an application below and it
+                  will start with this session.
+                </Show>
               </PanelEmpty>
             }
           >
@@ -158,30 +175,48 @@ export function ConnectionSession(props: {
                     <span
                       style={{
                         display: "flex",
-                        "align-items": "baseline",
-                        gap: `${scale().tightGap}px`,
+                        // The icon is the tallest thing in the row, so the text
+                        // centres against it rather than sitting on a baseline
+                        // the tile does not share.
+                        "align-items": "center",
+                        gap: `${scale().gap}px`,
                         "min-width": "0",
                       }}
                     >
-                      <strong
+                      <AppIcon
+                        theme={theme()}
+                        scale={scale()}
+                        name={app.name}
+                        src={iconOf(app.id)}
+                      />
+                      <span
                         style={{
-                          overflow: "hidden",
-                          "text-overflow": "ellipsis",
-                          "white-space": "nowrap",
+                          display: "flex",
+                          "align-items": "baseline",
+                          gap: `${scale().tightGap}px`,
+                          "min-width": "0",
                         }}
                       >
-                        {app.name}
-                      </strong>
-                      <Show when={app.name !== app.id}>
-                        <span
+                        <strong
                           style={{
-                            color: theme().dimFg,
-                            "font-size": `${scale().sm}px`,
+                            overflow: "hidden",
+                            "text-overflow": "ellipsis",
+                            "white-space": "nowrap",
                           }}
                         >
-                          {app.id}
-                        </span>
-                      </Show>
+                          {app.name}
+                        </strong>
+                        <Show when={app.name !== app.id}>
+                          <span
+                            style={{
+                              color: theme().dimFg,
+                              "font-size": `${scale().sm}px`,
+                            }}
+                          >
+                            {app.id}
+                          </span>
+                        </Show>
+                      </span>
                     </span>
 
                     <span
@@ -298,9 +333,10 @@ export function ConnectionSession(props: {
             </For>
           </Show>
 
-          {/* Adding. A filter plus a list rather than a <select>: the catalog
-              is every installed application, which on a machine with a games
-              library runs to hundreds of entries. */}
+          {/* Adding. The whole catalog, scrolling, with the filter narrowing it
+              rather than summoning it: this list used to be hidden behind
+              typing, which asked a viewer to name what they wanted before
+              being shown that it existed. A launcher shows its shelf. */}
           <SectionHeading
             theme={theme()}
             scale={scale()}
@@ -328,29 +364,35 @@ export function ConnectionSession(props: {
           </SectionHeading>
 
           <Show
-            when={filter().trim().length > 0}
+            when={addable().length > 0}
             fallback={
               <PanelEmpty theme={theme()} scale={scale()}>
-                {catalog().length > 0
-                  ? `${catalog().length} installed — type to search.`
-                  : "No installed applications found."}
+                {!ready()
+                  ? "Asking the supervisor…"
+                  : catalog().length === 0
+                    ? "No installed applications found."
+                    : `Nothing installed matches “${filter().trim()}”.`}
               </PanelEmpty>
             }
           >
-            <Show
-              when={addable().length > 0}
-              fallback={
-                <PanelEmpty theme={theme()} scale={scale()}>
-                  Nothing installed matches “{filter().trim()}”.
-                </PanelEmpty>
-              }
+            {/* The catalog gets a scroller of its own rather than riding the
+                overlay's: it is the only unbounded thing here, and letting it
+                lengthen the panel would scroll the search box — the one
+                control for a nine-hundred-row list — off the top. */}
+            <div
+              ref={lazyIcons.setRoot}
+              style={{
+                "max-height": "42vh",
+                "overflow-y": "auto",
+                "min-width": "0",
+                ...scrollbarStyle(theme()),
+              }}
             >
-              {/* Bounded so a one-letter search cannot render hundreds of rows
-                  into an already-expanded remote. */}
-              <For each={addable().slice(0, 12)}>
+              <For each={addable()}>
                 {(entry) => (
                   <PanelRow theme={theme()} scale={scale()}>
                     <div
+                      ref={(element) => lazyIcons.watch(element, entry.id)}
                       style={{
                         display: "flex",
                         "align-items": "center",
@@ -360,20 +402,35 @@ export function ConnectionSession(props: {
                     >
                       <span
                         style={{
+                          display: "flex",
+                          "align-items": "center",
+                          gap: `${scale().gap}px`,
                           "min-width": "0",
-                          overflow: "hidden",
-                          "text-overflow": "ellipsis",
-                          "white-space": "nowrap",
                         }}
                       >
-                        {entry.name}
+                        <AppIcon
+                          theme={theme()}
+                          scale={scale()}
+                          name={entry.name}
+                          src={iconOf(entry.id)}
+                        />
                         <span
                           style={{
-                            color: theme().dimFg,
-                            "font-size": `${scale().sm}px`,
+                            "min-width": "0",
+                            overflow: "hidden",
+                            "text-overflow": "ellipsis",
+                            "white-space": "nowrap",
                           }}
                         >
-                          {` ${entry.id}`}
+                          {entry.name}
+                          <span
+                            style={{
+                              color: theme().dimFg,
+                              "font-size": `${scale().sm}px`,
+                            }}
+                          >
+                            {` ${entry.id}`}
+                          </span>
                         </span>
                       </span>
                       <button
@@ -390,12 +447,7 @@ export function ConnectionSession(props: {
                   </PanelRow>
                 )}
               </For>
-              <Show when={addable().length > 12}>
-                <PanelEmpty theme={theme()} scale={scale()}>
-                  {addable().length - 12} more — narrow the search.
-                </PanelEmpty>
-              </Show>
-            </Show>
+            </div>
           </Show>
         </div>
       )}
