@@ -35,21 +35,32 @@ describe("panelHash panels (d=)", () => {
 
 describe("panelHash expanded sections (x=)", () => {
   it("round-trips all sections expanded", () => {
-    expect(formatExpandedHash(new Set())).toBe("explorer,log,problems");
-    expect(parseExpandedHash("explorer,log,problems")).toEqual(new Set());
+    expect(formatExpandedHash(new Set())).toBe(
+      "explorer,branches,log,problems",
+    );
+    expect(parseExpandedHash("explorer,branches,log,problems")).toEqual(
+      new Set(),
+    );
   });
 
   it("round-trips a subset", () => {
-    const collapsed = new Set(["problems"] as const);
+    const collapsed = new Set(["branches", "problems"] as const);
     expect(formatExpandedHash(collapsed)).toBe("explorer,log");
-    expect(parseExpandedHash("explorer,log")).toEqual(new Set(["problems"]));
+    expect(parseExpandedHash("explorer,log")).toEqual(
+      new Set(["branches", "problems"]),
+    );
   });
 
   it("encodes all collapsed as an empty value", () => {
-    const collapsed = new Set(["explorer", "log", "problems"] as const);
+    const collapsed = new Set([
+      "explorer",
+      "branches",
+      "log",
+      "problems",
+    ] as const);
     expect(formatExpandedHash(collapsed)).toBe("");
     expect(parseExpandedHash("")).toEqual(
-      new Set(["explorer", "log", "problems"]),
+      new Set(["explorer", "branches", "log", "problems"]),
     );
   });
 
@@ -59,7 +70,16 @@ describe("panelHash expanded sections (x=)", () => {
 
   it("drops unknown section ids", () => {
     expect(parseExpandedHash("explorer,nope")).toEqual(
-      new Set(["log", "problems"]),
+      new Set(["branches", "log", "problems"]),
+    );
+  });
+
+  /** A section id in a shared link outlives the release that coined it, so an
+   *  old `x=` must still mean what it said. A panel added later is simply not
+   *  named by it, and lands collapsed rather than corrupting the parse. */
+  it("keeps an older link's meaning when a section is added", () => {
+    expect(parseExpandedHash("explorer,log,problems")).toEqual(
+      new Set(["branches"]),
     );
   });
 });

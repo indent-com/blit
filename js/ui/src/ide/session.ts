@@ -41,6 +41,7 @@ import {
   FS_ENTRY_DIR,
   FS_ENTRY_SYMLINK,
   FS_ENTRY_LINK_DIR,
+  GitStatusError,
   gitCommitRecords,
   gitOidHex,
   GIT_LOG_TOPO,
@@ -60,6 +61,12 @@ import {
 import { createBlitWorkspaceState } from "@blit-sh/solid";
 import { isConnReady, connGeneration, isTransientConnError } from "./reactive";
 import { createLease } from "./lease";
+import {
+  collectBranches,
+  worktreeRows,
+  type BranchGroups,
+  type WorktreeRow,
+} from "./branchList";
 import {
   currentSessionForPty,
   isSourceTerminalUnavailableError,
@@ -223,6 +230,11 @@ export interface IdeSession {
    *  this to build commit tiles so clicking a commit still works while git is
    *  re-attaching. */
   repoWorkdir: Accessor<string | null>;
+  /** The repository open has resolved — a handle, or a settled failure. Unlike
+   *  the log and the tree, this owes nothing to a panel lease, which is what
+   *  makes it usable as a root-switch handoff gate (see
+   *  `ideSessionReadyForDisplay`). */
+  gitSettled: Accessor<boolean>;
 
   // ── Commit log ───────────────────────────────────────────────────────
   commits: Accessor<IdeCommitRow[]>;
@@ -246,6 +258,26 @@ export interface IdeSession {
    *  Cached rows outlive the lease, so a folded Log section shows its last
    *  page instantly on reopen while a fresh watch refreshes it. */
   ensureLog(): () => void;
+
+  // ── Branches and worktrees ───────────────────────────────────────────
+  /** Local branches, remote branches and tags, grouped and ordered, derived
+   *  from the pushed `GIT_STATE` refs. Free — no request behind it — so it
+   *  needs no lease and is live for as long as the repo is open. */
+  branches: Accessor<BranchGroups>;
+  /** The repository's worktrees, refetched whenever the state stream's
+   *  worktree generation moves. Empty until the first reply, and while no
+   *  consumer holds a lease. */
+  worktrees: Accessor<WorktreeRow[]>;
+  /** The last worktree fetch's failure, cleared on success. Distinct from an
+   *  empty list, which is a legitimate answer (a repo with only its main
+   *  worktree still reports that one). */
+  worktreesError: Accessor<string | null>;
+  /** Take a lease on the worktree list. Without one no `GIT_WORKTREES` is
+   *  issued, so a folded Branches panel costs nothing; each worktree costs
+   *  the server a repository open to resolve its HEAD. Cached rows outlive
+   *  the lease, so reopening the panel shows the last list at once while a
+   *  fresh fetch refreshes it. */
+  ensureWorktrees(): () => void;
 
   // ── Diagnostics (lsp, lazy) ──────────────────────────────────────────
   /** Take a lease on a language server for this root, attaching it if this is
@@ -1053,6 +1085,54 @@ function buildSession(
     return tips.sort().join(" ");
   });
 
+  // ── branches: free, straight off the pushed refs ───────────────────────
+  const branches = createMemo(() =>
+    collectBranches(gitState(), gitHandle()?.oidFormat),
+  );
+
+  // ── worktrees: a request, leased, refetched on the state generation ─────
+  //
+  // The generation is the whole reason this can be a request and still be
+  // live: adding, removing, moving or locking a worktree leaves every ref
+  // and status record identical, so the server folds a `WORKTREE_GEN` into
+  // each snapshot for exactly this (docs/design/git.md). Depending on the
+  // generation rather than on `gitVersion` is what stops a refetch — and a
+  // repository open per worktree on the server — on every keystroke's worth
+  // of status churn.
+  const [worktrees, setWorktrees] = createSignal<WorktreeRow[]>([]);
+  const [worktreesError, setWorktreesError] = createSignal<string | null>(null);
+  const { wanted: worktreesWanted, acquire: ensureWorktrees } = createLease();
+  const worktreeGen = createMemo(() => {
+    const gs = gitState();
+    return gs ? `${gs.worktreeGen.count} ${gs.worktreeGen.digest}` : "";
+  });
+
+  createEffect(() => {
+    if (!worktreesWanted()) return;
+    const handle = gitHandle();
+    if (!handle) return;
+    worktreeGen(); // refetch when the set changes
+    const abort = new AbortController();
+    handle
+      .worktrees({ signal: abort.signal })
+      .then((records) => {
+        if (disposed || abort.signal.aborted) return;
+        setWorktrees(worktreeRows(records));
+        setWorktreesError(null);
+      })
+      .catch((e: unknown) => {
+        if (disposed || abort.signal.aborted) return;
+        // A cancelled request is this effect being superseded, not a
+        // failure: reporting it would flash an error on every worktree
+        // change. Anything else is worth saying — a server too old for the
+        // request answers, and the panel should say so rather than sit on
+        // an empty list that looks like "no worktrees".
+        if (e instanceof GitStatusError && e.cancelled) return;
+        setWorktreesError(e instanceof Error ? e.message : String(e));
+      });
+    onCleanup(() => abort.abort());
+  });
+
   // ── lsp: attached on demand (Problems / editor squiggles) ──────────────
   const [lspHandle, setLspHandle] = createSignal<LspHandle | null>(null);
   const [lspVersion, setLspVersion] = createSignal(0);
@@ -1140,6 +1220,11 @@ function buildSession(
     gitError,
     noRepo,
     repoWorkdir: gitWorkdir,
+    gitSettled,
+    branches,
+    worktrees,
+    worktreesError,
+    ensureWorktrees,
     commits,
     hasMoreLog,
     loadMoreLog,

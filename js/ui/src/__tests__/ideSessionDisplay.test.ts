@@ -14,6 +14,8 @@ function session(
     hasRepo?: boolean;
     noRepo?: boolean;
     gitError?: string | null;
+    /** The repo open resolved — a handle, or a settled failure. */
+    gitSettled?: boolean;
     logLoaded?: boolean;
   } = {},
 ): IdeSession {
@@ -24,6 +26,7 @@ function session(
     hasRepo = false,
     noRepo = false,
     gitError = null,
+    gitSettled = false,
     logLoaded = false,
   } = over;
   return {
@@ -34,6 +37,7 @@ function session(
     gitHandle: () => (hasRepo ? ({} as never) : null),
     noRepo: () => noRepo,
     gitError: () => gitError,
+    gitSettled: () => gitSettled,
     logLoaded: () => logLoaded,
   } as unknown as IdeSession;
 }
@@ -43,7 +47,7 @@ describe("IDE session display handoff", () => {
     const current = session("pty1", {
       treePhase: "live",
       hasRepo: true,
-      logLoaded: true,
+      gitSettled: true,
     });
     const opening = session("pty2");
 
@@ -55,11 +59,12 @@ describe("IDE session display handoff", () => {
     const readyRepo = session("pty2", {
       treePhase: "live",
       hasRepo: true,
-      logLoaded: true,
+      gitSettled: true,
     });
     const readyPlainDir = session("pty3", {
       treePhase: "live",
       noRepo: true,
+      gitSettled: true,
     });
 
     expect(ideSessionReadyForDisplay(readyRepo)).toBe(true);
@@ -67,15 +72,40 @@ describe("IDE session display handoff", () => {
     expect(selectIdeSessionForDisplay(current, readyRepo)).toBe(readyRepo);
   });
 
-  it("does not reveal a half-loaded commit log", () => {
+  it("waits for the tree, but not for a commit page", () => {
+    // The gate used to also require `logLoaded()`. A log page only arrives
+    // while a panel holds the log lease, and panels are only ever handed the
+    // session already on screen — so the incoming one could never satisfy it
+    // and the switch never happened: the picker moved and the dock kept
+    // showing the old root. Waiting on the tree is still right (it is not
+    // lease-gated); waiting on a page is what deadlocked.
     const current = session("pty1");
-    const logLoading = session("pty2", {
+    const treeStillOpening = session("pty2", {
+      hasRepo: true,
+      gitSettled: true,
+    });
+    expect(ideSessionReadyForDisplay(treeStillOpening)).toBe(false);
+    expect(selectIdeSessionForDisplay(current, treeStillOpening)).toBe(current);
+
+    const repoOpenNoPageYet = session("pty3", {
       treePhase: "live",
       hasRepo: true,
+      gitSettled: true,
+      logLoaded: false,
     });
+    expect(ideSessionReadyForDisplay(repoOpenNoPageYet)).toBe(true);
+    expect(selectIdeSessionForDisplay(current, repoOpenNoPageYet)).toBe(
+      repoOpenNoPageYet,
+    );
+  });
 
-    expect(ideSessionReadyForDisplay(logLoading)).toBe(false);
-    expect(selectIdeSessionForDisplay(current, logLoading)).toBe(current);
+  it("holds the dock while the repository is still opening", () => {
+    // The other half of the gate: a repo mid-open would render as "no
+    // repository" — branches and log empty — so it waits.
+    const current = session("pty1");
+    const opening = session("pty2", { treePhase: "live", gitSettled: false });
+    expect(ideSessionReadyForDisplay(opening)).toBe(false);
+    expect(selectIdeSessionForDisplay(current, opening)).toBe(current);
   });
 
   it("shows settled errors and switches servers immediately", () => {
@@ -83,6 +113,7 @@ describe("IDE session display handoff", () => {
     const failed = session("failed", {
       fsError: "not found",
       gitError: "not a repository",
+      gitSettled: true,
     });
     const remoteOpening = session("remote", { connectionId: "remote" });
 
