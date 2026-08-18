@@ -126,19 +126,18 @@ export function SystemdPanel(props: {
     return current ? unitStates(current.scopes) : [];
   });
 
+  // The unit count is right below, and the source only matters when it is the
+  // slow one: say so then, and say nothing when signals are driving.
   const summary = createMemo(() => {
     revision();
     const current = handle();
     if (!current) return "";
-    return [...current.scopes.values()]
-      .map((scope) =>
-        tp("systemd.scopeSummary", {
-          scope: scope.scope,
-          units: String(scope.units.size),
-          source: scope.source,
-        }),
-      )
-      .join("  ");
+    // Only `poll` counts: a scope is `unknown` until its first line lands, and
+    // announcing that as polling would flash the banner on every open.
+    const polling = [...current.scopes.values()].some(
+      (scope) => scope.source === "poll",
+    );
+    return polling ? t("systemd.polling") : "";
   });
 
   // `failed` is the one state a viewer scans for, so it gets the error colour;
@@ -262,15 +261,17 @@ export function SystemdPanel(props: {
             </div>
           }
         >
-          <div
-            style={{
-              color: theme().dimFg,
-              "font-size": `${scale().sm}px`,
-              "margin-bottom": `${scale().xs}px`,
-            }}
-          >
-            {summary()}
-          </div>
+          <Show when={summary()}>
+            <div
+              style={{
+                color: theme().dimFg,
+                "font-size": `${scale().sm}px`,
+                "margin-bottom": `${scale().xs}px`,
+              }}
+            >
+              {summary()}
+            </div>
+          </Show>
           <div
             style={mergeStyle(scrollbarStyle(theme()), {
               "overflow-y": "auto",
