@@ -67,59 +67,114 @@ pub fn is_readable_path(path: &str) -> bool {
         && path.len() <= 1024
 }
 
-/// A script that lists every candidate file for a batch of icon names.
+/// A script that lists the directories icons could be in, one line each.
 ///
-/// Two globs cover both directory layouts in the wild — `theme/size/category`
-/// and `theme/category/size` — and they are expanded once into the positional
-/// parameters rather than per name, because the walk is the expensive half and
-/// the names only cost a `test -f` each against it.
-///
-/// Returns `None` when there is nothing to search or nothing to search for.
-pub fn search_script(
-    theme_roots: &[String],
-    flat_roots: &[String],
-    names: &[&str],
-) -> Option<String> {
-    let names: Vec<&str> = names
-        .iter()
-        .copied()
-        .filter(|n| is_lookup_name(n))
-        .collect();
-    if names.is_empty() {
-        return None;
-    }
-    let mut script = String::from("set --; ");
-    let mut any_root = false;
+/// Run once and cached, because it is the only part of this that depends on
+/// what is installed rather than on what is being asked for: two globs cover
+/// both layouts in the wild — `theme/size/category` and `theme/category/size` —
+/// and expanding them is the expensive half. Ranked afterwards by
+/// [`rank_directories`], which is what turns the cached list into a preference
+/// order a shell can walk without knowing anything about icon sizes.
+pub fn directories_script(theme_roots: &[String], flat_roots: &[String]) -> Option<String> {
+    let mut script = String::new();
     for root in theme_roots.iter().filter(|root| !root.contains('\'')) {
-        any_root = true;
         script.push_str(&format!(
             "for d in '{root}'/*/*/apps '{root}'/*/apps/* '{root}'/apps; do \
-             [ -d \"$d\" ] && set -- \"$@\" \"$d\"; done; "
+             [ -d \"$d\" ] && printf '%s\\n' \"$d\"; done; "
         ));
     }
     // Pixmaps is flat: the name sits directly in it, with no theme or size.
     for root in flat_roots.iter().filter(|root| !root.contains('\'')) {
-        any_root = true;
-        script.push_str(&format!("[ -d '{root}' ] && set -- \"$@\" '{root}'; "));
+        script.push_str(&format!("[ -d '{root}' ] && printf '%s\\n' '{root}'; "));
     }
-    if !any_root {
+    if script.is_empty() {
         return None;
     }
-    script.push_str("for n in");
+    script.push_str("true");
+    Some(script)
+}
+
+/// Order the candidate directories best-first, so the first hit is the answer.
+///
+/// This is [`rank`]'s judgement moved from the file to the directory, which is
+/// what lets one pass over the names do the whole job: scalable first, then the
+/// smallest size at or above [`TARGET_PIXELS`], then the largest below it, then
+/// anything whose name promises no size at all — a pixmaps directory, or a
+/// theme laying itself out some third way.
+///
+/// The sort is stable, so directories that rank alike stay in the order the
+/// icon path put them: a user's own `~/.local/share/icons` override still beats
+/// the system copy of the same size.
+pub fn rank_directories(dirs: &[&str]) -> Vec<String> {
+    let mut ranked: Vec<&str> = dirs
+        .iter()
+        .copied()
+        .filter(|dir| is_readable_path(dir))
+        .collect();
+    ranked.sort_by_key(|dir| directory_rank(dir));
+    ranked.into_iter().map(String::from).collect()
+}
+
+/// Where one candidate directory sorts. Lower is better; see [`rank_directories`].
+fn directory_rank(dir: &str) -> (u8, u32) {
+    let mut components = dir.split('/');
+    if components.clone().any(|component| component == "scalable") {
+        return (0, 0);
+    }
+    match components.find_map(directory_pixels) {
+        Some(pixels) if pixels >= TARGET_PIXELS => (1, pixels - TARGET_PIXELS),
+        Some(pixels) => (2, TARGET_PIXELS - pixels),
+        None => (3, 0),
+    }
+}
+
+/// A script that finds and reads one icon per name, in a single pass.
+///
+/// The whole resolution in one child: walking the ranked directories in order
+/// means the first file that exists is also the one the ranking would have
+/// picked, so there is no reason to report candidates back and ask again. That
+/// second round trip was most of the latency — a batch cost two spawns, and a
+/// list being scrolled needs one batch per screen.
+///
+/// A file over [`MAX_ICON_BYTES`] is skipped rather than accepted, so an
+/// application whose 512px art is a megabyte still gets its 64px tile.
+///
+/// Each section is the name, then the path, then the base64 — the path because
+/// the extension is what the format is read from, and a name that matched
+/// nothing has an empty section rather than no section at all.
+pub fn fetch_script(dirs: &[String], names: &[&str]) -> Option<String> {
+    let names: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| is_lookup_name(name))
+        .collect();
+    if names.is_empty() || dirs.is_empty() {
+        return None;
+    }
+    let mut script = String::from("set --");
+    for dir in dirs.iter().filter(|dir| !dir.contains('\'')) {
+        script.push_str(&format!(" '{dir}'"));
+    }
+    script.push_str("; for n in");
     for name in &names {
         script.push_str(&format!(" '{name}'"));
     }
-    // SVG first only as a listing order; the ranking below decides, and it
-    // prefers scalable art on its own merits.
+    // `break 2` leaves both the extension loop and the directory loop: one
+    // answer per name, and the search stops at it.
     script.push_str(&format!(
         "; do printf '{SEPARATOR}%s\\n' \"$n\"; for d in \"$@\"; do \
-         for e in svg png; do [ -f \"$d/$n.$e\" ] && printf '%s\\n' \"$d/$n.$e\"; \
-         done; done; done; true"
+         for e in svg png; do f=\"$d/$n.$e\"; \
+         if [ -f \"$f\" ] && [ \"$(wc -c < \"$f\")\" -le {MAX_ICON_BYTES} ]; then \
+         printf '%s\\n' \"$f\"; base64 \"$f\" | tr -d '\\n'; printf '\\n'; break 2; \
+         fi; done; done; done; true"
     ));
     Some(script)
 }
 
 /// A script that base64s each path, skipping anything too big to be an icon.
+///
+/// Only absolute `Icon=` values reach this; a name goes through
+/// [`fetch_script`], which does the same reading as part of the search.
 ///
 /// The section header is printed before the size check, so a file that is
 /// missing or oversized comes back as an empty body rather than as a gap the
@@ -183,42 +238,6 @@ fn directory_pixels(component: &str) -> Option<u32> {
 
 /// How good a candidate is: lower sorts first.
 ///
-/// Scalable art wins outright — it is usually the smallest file *and* the only
-/// one that stays sharp at any zoom. Among raster files, the smallest that is
-/// still at least [`TARGET_PIXELS`] beats the largest that is not, because
-/// downscaling looks like the icon and upscaling looks like a mistake.
-fn rank(path: &str) -> (u8, u32) {
-    if path.ends_with(".svg") {
-        return (0, 0);
-    }
-    let pixels = path
-        .rsplit('/')
-        .nth(1)
-        .and_then(directory_pixels)
-        // KDE's layout puts the size one level further out.
-        .or_else(|| path.rsplit('/').nth(2).and_then(directory_pixels));
-    match pixels {
-        Some(pixels) if pixels >= TARGET_PIXELS => (1, pixels - TARGET_PIXELS),
-        Some(pixels) => (2, TARGET_PIXELS - pixels),
-        // A pixmap, or a theme laying its directories out some third way.
-        None => (3, 0),
-    }
-}
-
-/// Pick the file to actually read, out of everything that matched a name.
-///
-/// Ties go to the earlier candidate, which is the earlier root — the search
-/// script emits them in the icon path's own precedence order, so a user's own
-/// override in `~/.local/share/icons` beats the system copy of the same size.
-pub fn best<'a>(candidates: &[&'a str]) -> Option<&'a str> {
-    candidates
-        .iter()
-        .copied()
-        .enumerate()
-        .min_by_key(|(index, path)| (rank(path), *index))
-        .map(|(_, path)| path)
-}
-
 /// Wrap base64 bytes as a data URL, if the extension names a format a browser
 /// will draw. XPM is deliberately absent: nothing renders it, and a pixmap-only
 /// application is better served by the panel's own fallback.
@@ -266,32 +285,32 @@ mod tests {
     use alloc::string::ToString;
     use alloc::vec;
 
+    /// The whole ranking is expressed as directory order, because the script
+    /// takes the first file it finds. Scalable first; then the smallest size at
+    /// or above the target, because downscaling looks like the icon and
+    /// upscaling looks like a mistake; then the largest below it; then whatever
+    /// promises no size at all.
     #[test]
-    fn scalable_art_beats_every_raster_size() {
-        let candidates = [
-            "/usr/share/icons/hicolor/512x512/apps/x.png",
-            "/usr/share/icons/hicolor/scalable/apps/x.svg",
-            "/usr/share/icons/hicolor/128x128/apps/x.png",
+    fn directories_rank_scalable_first_then_by_how_well_the_size_fits() {
+        let dirs = [
+            "/i/hicolor/48x48/apps",
+            "/usr/share/pixmaps",
+            "/i/hicolor/512x512/apps",
+            "/i/hicolor/scalable/apps",
+            "/i/hicolor/256x256/apps",
+            "/i/hicolor/96x96/apps",
         ];
-        assert_eq!(best(&candidates), Some(candidates[1]));
-    }
-
-    /// Downscaling looks like the icon; upscaling looks like a mistake. So the
-    /// smallest file at or above the target wins, and everything below it loses
-    /// to everything above it however close it gets.
-    #[test]
-    fn the_smallest_sufficient_raster_wins() {
-        let candidates = [
-            "/i/hicolor/48x48/apps/x.png",
-            "/i/hicolor/512x512/apps/x.png",
-            "/i/hicolor/256x256/apps/x.png",
-            "/i/hicolor/96x96/apps/x.png",
-        ];
-        assert_eq!(best(&candidates), Some(candidates[2]));
-
-        // Nothing reaches the target: take the largest that exists.
-        let small = ["/i/hicolor/16x16/apps/x.png", "/i/hicolor/64x64/apps/x.png"];
-        assert_eq!(best(&small), Some(small[1]));
+        assert_eq!(
+            rank_directories(&dirs),
+            vec![
+                "/i/hicolor/scalable/apps".to_string(),
+                "/i/hicolor/256x256/apps".to_string(),
+                "/i/hicolor/512x512/apps".to_string(),
+                "/i/hicolor/96x96/apps".to_string(),
+                "/i/hicolor/48x48/apps".to_string(),
+                "/usr/share/pixmaps".to_string(),
+            ]
+        );
     }
 
     /// A `@2` directory holds the same nominal size at twice the density, so it
@@ -306,33 +325,30 @@ mod tests {
         assert_eq!(directory_pixels("48x48@x"), None);
     }
 
-    /// KDE-style themes put the category before the size, so the size is one
-    /// component further from the file than hicolor puts it.
+    /// KDE-style themes put the category before the size. Reading the size from
+    /// anywhere in the path rather than from a fixed position is what covers
+    /// both layouts with one rule.
     #[test]
     fn both_directory_layouts_are_read() {
-        let candidates = [
-            "/i/breeze/apps/32/x.png",
-            "/i/breeze/apps/128/x.png",
-            "/i/hicolor/128x128/apps/x.png",
-        ];
-        // `apps/128` is not an `NxN` name, so those two rank as unsized and the
-        // properly named one wins outright.
-        assert_eq!(best(&candidates), Some(candidates[2]));
-
-        let kde = ["/i/breeze/16x16/apps/x.png", "/i/breeze/apps/128x128/x.png"];
-        assert_eq!(best(&kde), Some(kde[1]));
+        assert_eq!(directory_rank("/i/breeze/apps/128x128"), (1, 0));
+        assert_eq!(directory_rank("/i/hicolor/128x128/apps"), (1, 0));
+        assert_eq!(directory_rank("/i/breeze/apps/scalable"), (0, 0));
+        // `apps/128` is not an `NxN` name, so it promises nothing.
+        assert_eq!(directory_rank("/i/breeze/apps/128"), (3, 0));
     }
 
-    /// The earlier root is the higher-precedence one, so a tie must not be
-    /// broken by anything else.
+    /// The earlier root is the higher-precedence one, so directories that rank
+    /// alike must stay in the order the icon path put them.
     #[test]
-    fn ties_go_to_the_earlier_root() {
-        let candidates = [
-            "/home/me/.local/share/icons/hicolor/128x128/apps/x.png",
-            "/usr/share/icons/hicolor/128x128/apps/x.png",
+    fn ties_keep_the_icon_path_order() {
+        let dirs = [
+            "/home/me/.local/share/icons/hicolor/128x128/apps",
+            "/usr/share/icons/hicolor/128x128/apps",
         ];
-        assert_eq!(best(&candidates), Some(candidates[0]));
-        assert_eq!(best(&[]), None);
+        assert_eq!(rank_directories(&dirs), vec![dirs[0], dirs[1]]);
+        assert!(rank_directories(&[]).is_empty());
+        // A path that could not be interpolated safely is not a directory.
+        assert!(rank_directories(&["relative/icons", "/it's/icons"]).is_empty());
     }
 
     #[test]
@@ -346,26 +362,54 @@ mod tests {
     }
 
     #[test]
-    fn a_search_needs_both_a_root_and_a_name() {
-        let roots = vec!["/usr/share/icons".to_string()];
-        assert!(search_script(&roots, &[], &["firefox"]).is_some());
-        assert!(search_script(&[], &[], &["firefox"]).is_none());
-        assert!(search_script(&roots, &[], &[]).is_none());
+    fn a_fetch_needs_both_a_directory_and_a_name() {
+        let dirs = vec!["/usr/share/icons/hicolor/128x128/apps".to_string()];
+        assert!(fetch_script(&dirs, &["firefox"]).is_some());
+        assert!(fetch_script(&[], &["firefox"]).is_none());
+        assert!(fetch_script(&dirs, &[]).is_none());
         // Every name refused leaves nothing to ask for.
-        assert!(search_script(&roots, &[], &["a b"]).is_none());
+        assert!(fetch_script(&dirs, &["a b"]).is_none());
     }
 
-    /// The whole point of the separator is that a name and its candidates come
-    /// back as one section even when a name matched nothing.
+    #[test]
+    fn a_directory_sweep_needs_a_root() {
+        let roots = vec!["/usr/share/icons".to_string()];
+        assert!(directories_script(&roots, &[]).is_some());
+        assert!(directories_script(&[], &[]).is_none());
+        // A root that would need escaping is refused, and refusing every root
+        // leaves nothing to sweep.
+        assert!(directories_script(&["/it's/icons".to_string()], &[]).is_none());
+    }
+
+    /// The script stops at the first file it finds, so its own loop order is
+    /// the ranking. `break 2` is what leaves both loops rather than only the
+    /// extension one, which would go on to test every remaining directory.
+    #[test]
+    fn a_fetch_stops_at_the_first_hit() {
+        let dirs = vec!["/a".to_string(), "/b".to_string()];
+        let script = fetch_script(&dirs, &["x"]).expect("builds");
+        assert!(script.contains("set -- '/a' '/b'"));
+        assert!(script.contains("break 2"));
+        // Both formats, scalable first within a directory.
+        assert!(script.contains("for e in svg png"));
+    }
+
+    /// The whole point of the separator is that a name comes back as a section
+    /// even when it matched nothing — an absent section and an empty one would
+    /// otherwise be told apart only by counting.
     #[test]
     fn sections_survive_empty_bodies_and_leading_noise() {
         let output = format!(
-            "sh: warning\n{SEPARATOR}firefox\n/i/h/128x128/apps/firefox.png\n{SEPARATOR}nope\n"
+            "sh: warning\n{SEPARATOR}firefox\n/i/h/128x128/apps/firefox.png\nAAAA\n{SEPARATOR}nope\n"
         );
         let parsed = sections(&output);
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].0, "firefox");
-        assert_eq!(parsed[0].1, vec!["/i/h/128x128/apps/firefox.png"]);
+        assert_eq!(
+            parsed[0].1,
+            vec!["/i/h/128x128/apps/firefox.png", "AAAA"],
+            "path first, then the base64 that names its format"
+        );
         assert_eq!(parsed[1].0, "nope");
         assert!(parsed[1].1.is_empty());
     }

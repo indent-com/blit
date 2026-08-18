@@ -65,8 +65,36 @@ export interface SessionCatalogEntry {
   readonly name: string;
 }
 
-/** How many ids ride one request; the extension refuses more than this. */
-const ICON_BATCH = 24;
+/**
+ * How many ids ride one request; the extension refuses more than this.
+ *
+ * Deliberately several screens' worth. A request costs one child process on the
+ * far end whatever it asks for, so the batch size is what buys throughput while
+ * a list is being scrolled — twelve rows per round trip cannot keep up with a
+ * wheel, and forty-eight can.
+ */
+const ICON_BATCH = 48;
+
+/**
+ * How long an id is considered asked before it may be asked again.
+ *
+ * Not a retry timer so much as a leak stopper: an answer can be lost — the
+ * supervisor bounds what it will queue for a panel that is not keeping up — and
+ * without this the row that lost it keeps its placeholder for the life of the
+ * channel, because the id is marked asked and nothing ever asks again.
+ */
+const ICON_RETRY_MS = 8_000;
+
+/**
+ * How long an icon request waits for company.
+ *
+ * A scrolling list reveals rows a handful at a time, and each of those bursts
+ * would otherwise be its own request — and each request is a child process on
+ * the far end. Collecting them for a moment first turns a flick of the wheel
+ * into one round trip instead of six, and is short enough that a list sitting
+ * still still fills in immediately.
+ */
+const ICON_COALESCE_MS = 120;
 
 export interface SessionOptions {
   onClosed?(reason: number, detail: string): void;
@@ -251,10 +279,31 @@ export async function openSession(
     channel?.send(line);
   };
 
-  // Ids already asked for. Separate from what the mirror holds because a
-  // request is outstanding for a round trip, and a panel re-rendering in that
-  // window would otherwise ask again for every row on screen.
-  const asked = new Set<string>();
+  // When each id was last asked about. Separate from what the mirror holds
+  // because a request is outstanding for a round trip, and a panel re-rendering
+  // in that window would otherwise ask again for every row on screen — but it
+  // expires, so an answer that never came is asked for again rather than
+  // leaving one row a placeholder forever.
+  const asked = new Map<string, number>();
+  const worthAsking = (id: string, now: number): boolean => {
+    if (id.length === 0 || id.includes("\n")) return false;
+    if (mirror.icon(id) !== undefined) return false;
+    const at = asked.get(id);
+    return at === undefined || now - at >= ICON_RETRY_MS;
+  };
+  // Ids waiting to be asked about, and the timer that will ask.
+  let queued: string[] = [];
+  let coalescing: ReturnType<typeof setTimeout> | undefined;
+  const flushIcons = () => {
+    coalescing = undefined;
+    const wanted = queued;
+    queued = [];
+    // Newline-separated, not space: a desktop-entry id is a filename, and Steam
+    // alone installs hundreds with spaces in them ("3DMark Demo.desktop").
+    for (let at = 0; at < wanted.length; at += ICON_BATCH) {
+      request(`icons ${wanted.slice(at, at + ICON_BATCH).join("\n")}`);
+    }
+  };
 
   return {
     get apps() {
@@ -271,15 +320,12 @@ export async function openSession(
     },
     icon: (id: string) => mirror.icon(id),
     requestIcons: (ids: readonly string[]) => {
-      // Newline, not space: a desktop-entry id is a filename, and Steam alone
-      // installs hundreds with spaces in them ("3DMark Demo.desktop").
-      const wanted = ids.filter(
-        (id) => id.length > 0 && !id.includes("\n") && !asked.has(id),
-      );
-      for (const id of wanted) asked.add(id);
-      for (let at = 0; at < wanted.length; at += ICON_BATCH) {
-        request(`icons ${wanted.slice(at, at + ICON_BATCH).join("\n")}`);
-      }
+      const now = Date.now();
+      const wanted = ids.filter((id) => worthAsking(id, now));
+      if (wanted.length === 0) return;
+      for (const id of wanted) asked.set(id, now);
+      queued.push(...wanted);
+      coalescing ??= setTimeout(flushIcons, ICON_COALESCE_MS);
     },
     subscribe: mirror.subscribe,
     enable: (id: string) => request(`enable ${id}`),
@@ -289,6 +335,9 @@ export async function openSession(
     forget: (id: string) => request(`forget ${id}`),
     resync: () => request("resync"),
     close: () => {
+      if (coalescing !== undefined) clearTimeout(coalescing);
+      coalescing = undefined;
+      queued = [];
       channelHandle.close();
       channel = null;
     },

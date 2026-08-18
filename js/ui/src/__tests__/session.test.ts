@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { openSession, SessionMirror } from "../session";
 
 const encode = (value: unknown): Uint8Array =>
@@ -156,20 +156,33 @@ describe("SessionMirror", () => {
 describe("openSession", () => {
   const fakeConnection = () => {
     const sent: string[] = [];
+    // Captured so a test can answer, which is the only way to reach the mirror
+    // the way the wire does.
+    const inbound: { deliver?: (payload: Uint8Array) => void } = {};
     return {
       sent,
-      connectChannel: async () => ({
-        id: 2,
-        send: (payload: string | Uint8Array) => {
-          sent.push(
-            typeof payload === "string"
-              ? payload
-              : new TextDecoder().decode(payload),
-          );
-        },
-        close: () => {},
-      }),
-    } as unknown as { sent: string[] } & Parameters<typeof openSession>[0];
+      inbound,
+      connectChannel: async (
+        _name: string,
+        options: { onData?: (payload: Uint8Array) => void } = {},
+      ) => {
+        inbound.deliver = options.onData;
+        return {
+          id: 2,
+          send: (payload: string | Uint8Array) => {
+            sent.push(
+              typeof payload === "string"
+                ? payload
+                : new TextDecoder().decode(payload),
+            );
+          },
+          close: () => {},
+        };
+      },
+    } as unknown as {
+      sent: string[];
+      inbound: { deliver?: (payload: Uint8Array) => void };
+    } & Parameters<typeof openSession>[0];
   };
 
   it("sends one line per verb, naming the application", async () => {
@@ -191,27 +204,82 @@ describe("openSession", () => {
     ]);
   });
 
-  /** The panel calls this on every render of every row, so the dedup is what
-   *  keeps a redraw from being a request storm. */
-  it("asks for each icon once, in batches the extension will accept", async () => {
-    const connection = fakeConnection();
-    const session = await openSession(connection);
-    session.requestIcons(["a", "b"]);
-    session.requestIcons(["b", "c"]);
-    expect(connection.sent).toEqual(["icons a\nb", "icons c"]);
+  /** Each request is a child process on the far end, and a scrolling list
+   *  reveals rows a few at a time. Coalescing is what makes a flick of the
+   *  wheel one round trip instead of six; the dedup is what keeps a redraw
+   *  from being a request at all. */
+  it("coalesces icon requests, asks once per id, and batches what it sends", async () => {
+    vi.useFakeTimers();
+    try {
+      const connection = fakeConnection();
+      const session = await openSession(connection);
+      session.requestIcons(["a", "b"]);
+      session.requestIcons(["b", "c"]);
+      expect(
+        connection.sent,
+        "nothing goes out before the window closes",
+      ).toEqual([]);
+      vi.advanceTimersByTime(200);
+      expect(connection.sent).toEqual(["icons a\nb\nc"]);
 
-    connection.sent.length = 0;
-    const many = Array.from({ length: 25 }, (_, at) => `app${at}`);
-    session.requestIcons(many);
-    expect(connection.sent).toHaveLength(2);
-    expect(connection.sent[0]?.split("\n")).toHaveLength(24);
-    expect(connection.sent[1]).toBe("icons app24");
+      // Over one batch: split, because the extension refuses a longer request.
+      connection.sent.length = 0;
+      session.requestIcons(Array.from({ length: 49 }, (_, at) => `app${at}`));
+      vi.advanceTimersByTime(200);
+      expect(connection.sent).toHaveLength(2);
+      expect(connection.sent[0]?.split("\n")).toHaveLength(48);
+      expect(connection.sent[1]).toBe("icons app48");
 
-    // Steam names hundreds of its entries "3DMark Demo.desktop", so a space in
-    // an id is ordinary and must survive the batching.
-    connection.sent.length = 0;
-    session.requestIcons(["3DMark Demo", ""]);
-    expect(connection.sent).toEqual(["icons 3DMark Demo"]);
+      // Steam names hundreds of its entries "3DMark Demo.desktop", so a space
+      // in an id is ordinary and must survive the batching.
+      connection.sent.length = 0;
+      session.requestIcons(["3DMark Demo", ""]);
+      vi.advanceTimersByTime(200);
+      expect(connection.sent).toEqual(["icons 3DMark Demo"]);
+
+      // A panel closed inside the window must not send after it.
+      connection.sent.length = 0;
+      session.requestIcons(["late"]);
+      session.close();
+      vi.advanceTimersByTime(200);
+      expect(connection.sent).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** The supervisor bounds what it will queue for one panel, so an answer can
+   *  be lost. Without an expiry the id stays marked asked and that row keeps
+   *  its placeholder for the life of the channel. */
+  it("asks again for an id whose answer never came, but not for one answered", async () => {
+    vi.useFakeTimers();
+    try {
+      const connection = fakeConnection();
+      const session = await openSession(connection);
+      session.requestIcons(["lost", "found"]);
+      vi.advanceTimersByTime(200);
+      expect(connection.sent).toEqual(["icons lost\nfound"]);
+
+      // One of the two is answered; the other never is.
+      connection.inbound.deliver?.(
+        encode({ type: "icon", id: "found", icon: "data:image/png;base64,AA" }),
+      );
+      expect(session.icon("found")).toBe("data:image/png;base64,AA");
+
+      // Still inside the window: neither is asked again.
+      connection.sent.length = 0;
+      session.requestIcons(["lost", "found"]);
+      vi.advanceTimersByTime(200);
+      expect(connection.sent).toEqual([]);
+
+      // Past it: only the one still without an answer.
+      vi.advanceTimersByTime(9000);
+      session.requestIcons(["lost", "found"]);
+      vi.advanceTimersByTime(200);
+      expect(connection.sent).toEqual(["icons lost"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("stops sending once closed", async () => {

@@ -64,12 +64,12 @@ const CATALOG_TTL: Duration = Duration::from_secs(60);
 
 /// Most icons a panel may ask for in one request.
 ///
-/// The panel asks for what it is about to draw — its managed rows and one page
-/// of search hits — so this is a bound on a mistake rather than on ordinary
-/// use. Each id costs a stat sweep and possibly a file read, all of it in the
-/// middle of the receive loop, so an unbounded request would be a way to stall
-/// the supervisor from the browser.
-const MAX_ICON_REQUEST: usize = 24;
+/// Generous on purpose, and matched by the panel's own batch size: a request
+/// costs one child whatever it asks for, so a bigger batch is strictly cheaper
+/// per icon, and a scrolling list needs the throughput. It is still a bound —
+/// the whole batch is resolved inside the receive loop, so an unbounded request
+/// would be a way to stall the supervisor from the browser.
+const MAX_ICON_REQUEST: usize = 48;
 
 /// Resolved artwork kept in the guest before the cache is dropped wholesale.
 ///
@@ -87,10 +87,13 @@ const MAX_CACHED_ICON_BYTES: usize = 4 * 1024 * 1024;
 
 /// Icon messages a connection may have waiting on credit.
 ///
-/// Icons are queued rather than dropped — unlike state, a dropped icon is never
-/// resent, because nothing changes to provoke a repeat — but a panel that stops
-/// acking must still not be able to grow the guest without limit.
-const MAX_QUEUED_ICONS: usize = 32;
+/// Icons are queued rather than dropped, because unlike state nothing provokes
+/// a repeat: a dropped one leaves a placeholder until the panel asks again. Two
+/// full requests' worth, so an ordinary scroll never reaches it, and a panel
+/// that has stopped acking altogether still cannot grow the guest without
+/// limit. What is dropped past here the panel re-asks for, once it stops
+/// counting the id as outstanding.
+const MAX_QUEUED_ICONS: usize = 128;
 
 /// One browser connected to [`CHANNEL_NAME`].
 struct Conn {
@@ -140,6 +143,11 @@ struct State {
     /// found the catalog. Empty until that read happens.
     icon_theme_roots: Vec<String>,
     icon_flat_roots: Vec<String>,
+    /// Every directory an icon could be in, best-first. Expanding the roots'
+    /// globs is the one part of a lookup that does not depend on what is being
+    /// looked up, so it is done once and reused; a catalog refresh clears it,
+    /// because that is when a newly installed theme would show up.
+    icon_dirs: Vec<String>,
     /// Resolved artwork, keyed by the `Icon=` value rather than by application
     /// id — a desktop and its `-nightly` twin share a key, and so do the dozens
     /// of entries that all say `application-x-executable`.
@@ -216,6 +224,7 @@ fn run(mut client: Client) -> Result<(), Error> {
         installed_at_ns: None,
         icon_theme_roots: Vec::new(),
         icon_flat_roots: Vec::new(),
+        icon_dirs: Vec::new(),
         icons: BTreeMap::new(),
         icon_bytes: 0,
         surface_apps: BTreeMap::new(),
@@ -392,16 +401,17 @@ fn icon_json(id: &str, data_url: Option<&str>) -> String {
 
 /// Answer a panel's icon request, reading whatever is not already cached.
 ///
-/// Two shell round trips for the whole batch, not per id: one stats every
-/// candidate path for every name at once, and one base64s the files the ranking
-/// chose. An absolute `Icon=` skips the first.
+/// One child for the whole batch, and it does the searching and the reading
+/// together — see [`icon::fetch_script`]. Deliberately *not* preceded by a
+/// catalog refresh: the ids came out of the catalog the panel already holds, so
+/// the only thing rereading it could add is a random half-second stall in the
+/// middle of a scroll. An id this does not recognise is answered "no artwork",
+/// which is what it will be until the panel resyncs anyway.
 fn resolve_icons(
     client: &mut Client,
     state: &mut State,
     ids: &[&str],
 ) -> Vec<(String, Option<String>)> {
-    refresh_installed_if_stale(client, state);
-
     // Ids the catalog knows nothing about, and entries with no `Icon=` at all,
     // are answered "nothing to draw" without touching the icon path.
     let keys: Vec<(String, Option<String>)> = ids
@@ -433,55 +443,50 @@ fn resolve_icons(
         }
     }
 
-    // Key → the file the ranking picked. Absolute values are their own answer;
-    // whether they exist is settled by the read that follows.
-    let mut chosen: Vec<(String, String)> = absolute
-        .iter()
-        .map(|path| (path.clone(), path.clone()))
-        .collect();
+    // Names: found and read in one pass over the ranked directories, so the
+    // first file that exists is also the one the ranking would have chosen.
     if !lookups.is_empty() {
+        refresh_icon_dirs(client, state);
         let names: Vec<&str> = lookups.iter().map(String::as_str).collect();
-        let script = icon::search_script(&state.icon_theme_roots, &state.icon_flat_roots, &names);
+        let script = icon::fetch_script(&state.icon_dirs, &names);
         let output =
             script.and_then(|script| run_capturing(client, state, &["/bin/sh", "-c", &script]));
         if let Some(output) = output {
-            for (name, candidates) in icon::sections(&output) {
-                match icon::best(&candidates) {
-                    Some(path) => chosen.push((name.to_string(), path.to_string())),
-                    // Searched and not found: cache that, or every redraw of
-                    // this row spawns a shell to fail the same way.
-                    None => state.cache_icon(name.to_string(), None),
-                }
+            for (name, body) in icon::sections(&output) {
+                // Path first, base64 second; an empty section is a name that
+                // matched nothing anywhere on the icon path.
+                let data_url = match (body.first(), body.get(1)) {
+                    (Some(path), Some(base64)) => icon::data_url(path, base64),
+                    _ => None,
+                };
+                state.cache_icon(name.to_string(), data_url);
+            }
+        }
+        // Whatever the child never reported on — it failed, or the script could
+        // not be built — is a miss. Caching that is what stops a row whose
+        // artwork cannot be had from spawning a child on every redraw.
+        for name in &lookups {
+            if !state.icons.contains_key(name) {
+                state.cache_icon(name.clone(), None);
             }
         }
     }
 
-    if !chosen.is_empty() {
-        let paths: Vec<&str> = chosen.iter().map(|(_, path)| path.as_str()).collect();
+    // Absolute `Icon=` values need no search, only the read.
+    if !absolute.is_empty() {
+        let paths: Vec<&str> = absolute.iter().map(String::as_str).collect();
         let script = icon::read_script(&paths);
         let output =
             script.and_then(|script| run_capturing(client, state, &["/bin/sh", "-c", &script]));
         if let Some(output) = output {
             for (path, body) in icon::sections(&output) {
                 let data_url = icon::data_url(path, body.first().copied().unwrap_or(""));
-                // A path can answer for more than one key only if two keys
-                // resolved to the same file, which is why this looks the key up
-                // from the path rather than trusting the order back.
-                let keys: Vec<String> = chosen
-                    .iter()
-                    .filter(|(_, chosen)| chosen == path)
-                    .map(|(key, _)| key.clone())
-                    .collect();
-                for key in keys {
-                    state.cache_icon(key, data_url.clone());
-                }
+                state.cache_icon(path.to_string(), data_url);
             }
         }
-        // Anything the read never reported on — an unreadable path, a shell
-        // that failed — is a miss, and caching it stops the retry loop.
-        for (key, _) in &chosen {
-            if !state.icons.contains_key(key) {
-                state.cache_icon(key.clone(), None);
+        for path in &absolute {
+            if !state.icons.contains_key(path) {
+                state.cache_icon(path.clone(), None);
             }
         }
     }
@@ -492,6 +497,26 @@ fn resolve_icons(
             (id, data_url)
         })
         .collect()
+}
+
+/// Expand the icon path's globs into a ranked directory list, once.
+///
+/// The list is the same whatever is being looked up, and expanding it is the
+/// expensive half of a lookup — a dozen roots, each with two globs — so a batch
+/// that had to redo it would pay for the whole icon path to answer one name.
+fn refresh_icon_dirs(client: &mut Client, state: &mut State) {
+    if !state.icon_dirs.is_empty() {
+        return;
+    }
+    let Some(script) = icon::directories_script(&state.icon_theme_roots, &state.icon_flat_roots)
+    else {
+        return;
+    };
+    let Some(output) = run_capturing(client, state, &["/bin/sh", "-c", &script]) else {
+        return;
+    };
+    let dirs: Vec<&str> = output.lines().filter(|line| !line.is_empty()).collect();
+    state.icon_dirs = icon::rank_directories(&dirs);
 }
 
 /// Send one JSON message to one connection, respecting its credit.
@@ -1279,6 +1304,9 @@ fn refresh_installed(client: &mut Client, state: &mut State) -> Result<(), Error
     let (theme_roots, flat_roots) = icon::roots(&home, &get("HOME").unwrap_or_default(), &dirs);
     state.icon_theme_roots = theme_roots;
     state.icon_flat_roots = flat_roots;
+    // A package installed mid-session can bring a theme with it, and this read
+    // is the moment that becomes visible.
+    state.icon_dirs.clear();
 
     state.installed.clear();
     let roots: Vec<String> = core::iter::once(home.as_str())

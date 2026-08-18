@@ -21,7 +21,15 @@
  * remote costs no channel traffic.
  */
 
-import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
+import {
+  createEffect,
+  createMemo,
+  createSignal,
+  For,
+  onCleanup,
+  onMount,
+  Show,
+} from "solid-js";
 import type {
   BlitWorkspace,
   ConnectionId,
@@ -72,6 +80,10 @@ export function ConnectionSession(props: {
   const connection = props.workspace.getConnection(props.connectionId);
   if (connection) {
     let live = true;
+    // Hoisted out of the `then`, which runs with no reactive owner: an
+    // `onCleanup` registered in there is never called — Solid says so, on the
+    // console — so the subscription outlived every panel that opened one.
+    let unsubscribe: (() => void) | undefined;
     void openSession(connection, {
       onClosed: () => {
         setHandle(null);
@@ -84,14 +96,14 @@ export function ConnectionSession(props: {
           return;
         }
         setHandle(opened);
-        const stop = opened.subscribe(() => setRevision((n) => n + 1));
-        onCleanup(stop);
+        unsubscribe = opened.subscribe(() => setRevision((n) => n + 1));
       })
       // No supervisor on this server: the section renders nothing rather than
       // an error, because "this server does not run one" is not a fault.
       .catch(() => setHandle(null));
     onCleanup(() => {
       live = false;
+      unsubscribe?.();
       handle()?.close();
     });
   }
@@ -103,6 +115,17 @@ export function ConnectionSession(props: {
   const catalog = () => {
     revision();
     return handle()?.catalog ?? [];
+  };
+  /** Whether the supervisor's first message has landed.
+   *
+   *  The channel opens before the greeting arrives, and the greeting is what
+   *  carries both lists — so between the two, everything here is empty. Saying
+   *  "nothing is managed yet" in that window is a lie, and a convincing one:
+   *  the greeting waits behind a catalog read, which on a busy supervisor is
+   *  long enough to read and believe. */
+  const ready = () => {
+    revision();
+    return handle()?.ready ?? false;
   };
   /** Installed applications that are not already managed, matched against the
    *  filter box. A managed app is offered by its own row, not this list. */
@@ -139,48 +162,58 @@ export function ConnectionSession(props: {
   // The catalog is not. Every installed application is a row, which on a
   // machine with a games library is nine hundred of them — asking for all that
   // artwork would be tens of megabytes to draw a dozen tiles. So a row asks
-  // only once it is near the viewport, and the observer's own batching is what
-  // turns a scroll into one request rather than one per row.
-  //
-  // Rooted at the viewport rather than at the list's own scroller, which would
-  // read better and cannot be done: a child's `ref` can run before its
-  // parent's, so the rows would find no observer and would each ask outright —
-  // the storm this exists to prevent. The viewport is the correct root anyway,
-  // because an intersection is clipped by every scrolling ancestor on the way
-  // up, this list's included.
-  const iconWatcher = (() => {
-    // Absent under jsdom. Rows fall back to asking outright, so a client
-    // without it still shows artwork — it just asks for more of it.
-    if (typeof IntersectionObserver === "undefined") return undefined;
+  // only once it is near the list's viewport, and the observer's own batching
+  // is what turns a scroll into one request rather than one per row.
+  const [scroller, setScroller] = createSignal<HTMLElement>();
+  const iconWatcher = createMemo<IntersectionObserver | undefined>(() => {
+    const root = scroller();
+    // Absent under jsdom, and there is nothing to observe before the list
+    // exists. Rows fall back to asking outright, so a client without it still
+    // shows artwork — it just asks for more of it.
+    if (!root || typeof IntersectionObserver === "undefined") return undefined;
     const observer = new IntersectionObserver(
       (entries) => {
         const ids = entries
           .filter((entry) => entry.isIntersecting)
-          .map((entry) => {
-            // Once asked, a row has nothing more to say: the answer is cached
-            // by the handle and by the mirror, either way.
-            observer.unobserve(entry.target);
-            return (entry.target as HTMLElement).dataset.appId;
-          })
+          .map((entry) => (entry.target as HTMLElement).dataset.appId)
           .filter((id): id is string => id !== undefined);
+        // Rows stay observed after asking, rather than being released once
+        // they have. The handle drops an id it already holds, so re-entering
+        // the list costs nothing — and it is the only thing that ever asks
+        // again for a row whose answer was lost on the way back.
         if (ids.length > 0) handle()?.requestIcons(ids);
       },
-      // A screen ahead, so scrolling meets artwork already there rather than a
-      // wave of monograms filling in behind it.
-      { rootMargin: "300px" },
+      // Rooted at the list, not at the page. `rootMargin` grows the *root's*
+      // rectangle and nothing else, so rooting this at the viewport made the
+      // margin dead weight: the list's own overflow still clipped every row
+      // past its bottom edge, one screen of lookahead was really none, and
+      // scrolling left a wake of monograms it never caught up with.
+      //
+      // Several screens of it, because a round trip is a child process on the
+      // far end whatever it asks for — reaching well past the fold is what
+      // lets one of them cover a whole flick of the wheel.
+      { root, rootMargin: "1500px" },
     );
     onCleanup(() => observer.disconnect());
     return observer;
-  })();
-  /** Attach one catalog row to the watcher, or ask outright without one. */
+  });
+  /** Attach one catalog row to the watcher, or ask outright without one.
+   *
+   *  Deferred to `onMount` because a child's `ref` runs before its parent's:
+   *  called straight from the row's ref, this would find no observer — the
+   *  scroller that roots it does not exist yet — and every row would ask
+   *  outright, which is the storm the observer is here to prevent. */
   const watchForIcon = (element: HTMLElement, id: string) => {
     element.dataset.appId = id;
-    if (!iconWatcher) {
-      handle()?.requestIcons([id]);
-      return;
-    }
-    iconWatcher.observe(element);
-    onCleanup(() => iconWatcher.unobserve(element));
+    onMount(() => {
+      const watcher = iconWatcher();
+      if (!watcher) {
+        handle()?.requestIcons([id]);
+        return;
+      }
+      watcher.observe(element);
+      onCleanup(() => watcher.unobserve(element));
+    });
   };
 
   return (
@@ -204,8 +237,10 @@ export function ConnectionSession(props: {
             when={apps().length > 0}
             fallback={
               <PanelEmpty theme={theme()} scale={scale()}>
-                Nothing is managed yet. Enable an application below and it will
-                start with this session.
+                <Show when={ready()} fallback="Asking the supervisor…">
+                  Nothing is managed yet. Enable an application below and it
+                  will start with this session.
+                </Show>
               </PanelEmpty>
             }
           >
@@ -415,9 +450,11 @@ export function ConnectionSession(props: {
             when={addable().length > 0}
             fallback={
               <PanelEmpty theme={theme()} scale={scale()}>
-                {catalog().length === 0
-                  ? "No installed applications found."
-                  : `Nothing installed matches “${filter().trim()}”.`}
+                {!ready()
+                  ? "Asking the supervisor…"
+                  : catalog().length === 0
+                    ? "No installed applications found."
+                    : `Nothing installed matches “${filter().trim()}”.`}
               </PanelEmpty>
             }
           >
@@ -426,6 +463,7 @@ export function ConnectionSession(props: {
                 lengthen the panel would scroll the search box — the one
                 control for a nine-hundred-row list — off the top. */}
             <div
+              ref={setScroller}
               style={{
                 "max-height": "42vh",
                 "overflow-y": "auto",
