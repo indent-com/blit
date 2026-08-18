@@ -353,7 +353,10 @@ export function SystemdLogs(props: {
           by scrolling and the tail runs by itself, so there is nothing here a
           reader would have to press. No line count either — the only number
           this side could offer is how many rows happen to be buffered, which
-          answers a question nobody asked. */}
+          answers a question nobody asked.
+          And nothing at all while it is tailing: that is what a journal pane is
+          for, so saying "Live" told a reader only that the ordinary thing was
+          happening. The news is when it stops. */}
       <div
         style={{
           display: "flex",
@@ -363,12 +366,14 @@ export function SystemdLogs(props: {
           "font-size": `${scale().sm}px`,
         }}
       >
+        {/* The attribute stays either way: it is how a test tells a tailing
+            pane from a stopped one now that the pane itself is quiet. */}
         <span data-journal-live={tailing() ? "on" : "off"}>
-          {tailing()
-            ? t("systemd.logsLive")
-            : canFollow()
+          <Show when={!tailing()}>
+            {canFollow()
               ? t("systemd.logsPaused")
               : t("systemd.logsLiveBoot")}
+          </Show>
         </span>
         <Show when={busy()}>
           <span>{t("systemd.logsLoading")}</span>
