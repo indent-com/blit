@@ -88,19 +88,32 @@ describe("SessionMirror", () => {
   });
 
   /** Three states, not two: a row has to be able to tell "no artwork exists"
-   *  from "the answer has not arrived", or it re-asks forever. */
-  it("records an icon, and records its absence too", () => {
+   *  from "the answer has not arrived", or it re-asks forever. The supervisor
+   *  answers where the artwork is; the bytes are the panel's own errand. */
+  it("records where an icon is, and records its absence too", () => {
     const mirror = new SessionMirror();
     expect(mirror.icon("gimp")).toBeUndefined();
+    expect(mirror.path("gimp")).toBeUndefined();
 
     mirror.apply(
-      encode({ type: "icon", id: "gimp", icon: "data:image/png;base64,AAA" }),
+      encode({ type: "icon", id: "gimp", path: "/i/128x128/apps/gimp.png" }),
     );
-    expect(mirror.icon("gimp")).toBe("data:image/png;base64,AAA");
+    expect(mirror.path("gimp")).toBe("/i/128x128/apps/gimp.png");
+    // Located, not yet read: the row still has no URL to draw.
+    expect(mirror.icon("gimp")).toBeUndefined();
+    expect(mirror.unread()).toEqual([
+      { id: "gimp", path: "/i/128x128/apps/gimp.png" },
+    ]);
 
-    // No `icon` field is the answer "there is none".
+    mirror.setIcon("gimp", "blob:whatever");
+    expect(mirror.icon("gimp")).toBe("blob:whatever");
+    expect(mirror.unread()).toEqual([]);
+
+    // No `path` field is the answer "there is none", and it is final.
     mirror.apply(encode({ type: "icon", id: "bare" }));
+    expect(mirror.path("bare")).toBeNull();
     expect(mirror.icon("bare")).toBeNull();
+    expect(mirror.unread()).toEqual([]);
   });
 
   /** An icon message carries no apps, and reading it as state would empty the
@@ -113,25 +126,22 @@ describe("SessionMirror", () => {
         [{ id: "a", name: "A" }],
       ),
     );
-    mirror.apply(
-      encode({ type: "icon", id: "a", icon: "data:image/svg+xml;base64,AAA" }),
-    );
+    mirror.apply(encode({ type: "icon", id: "a", path: "/i/a.svg" }));
     expect(mirror.apps.map((app) => app.id)).toEqual(["a"]);
     expect(mirror.catalog).toHaveLength(1);
   });
 
-  /** The value lands in an `<img src>`, so anything that is not a data URL is
-   *  refused rather than passed through — a `javascript:` icon is not an icon. */
-  it("refuses an icon that is not a data URL", () => {
+  /** A path is a path: anything that is not a non-empty string is the answer
+   *  "there is nothing to draw", never something handed to a reader. */
+  it("refuses a path that is not one", () => {
     const mirror = new SessionMirror();
-    mirror.apply(
-      encode({ type: "icon", id: "a", icon: "javascript:alert(1)" }),
-    );
+    mirror.apply(encode({ type: "icon", id: "a", path: 42 }));
+    expect(mirror.path("a")).toBeNull();
     expect(mirror.icon("a")).toBeNull();
-    mirror.apply(encode({ type: "icon", id: "b", icon: 42 }));
+    mirror.apply(encode({ type: "icon", id: "b", path: "" }));
     expect(mirror.icon("b")).toBeNull();
     // An id-less message answers for nothing and is dropped whole.
-    mirror.apply(encode({ type: "icon", icon: "data:image/png;base64,AAA" }));
+    mirror.apply(encode({ type: "icon", path: "/i/x.png" }));
     expect(mirror.icon("")).toBeUndefined();
   });
 
@@ -262,9 +272,8 @@ describe("openSession", () => {
 
       // One of the two is answered; the other never is.
       connection.inbound.deliver?.(
-        encode({ type: "icon", id: "found", icon: "data:image/png;base64,AA" }),
+        encode({ type: "icon", id: "found", path: "/i/found.png" }),
       );
-      expect(session.icon("found")).toBe("data:image/png;base64,AA");
 
       // Still inside the window: neither is asked again.
       connection.sent.length = 0;

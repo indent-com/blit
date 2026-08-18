@@ -32,25 +32,26 @@ use blit_remote::{
     C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2, C2S_SURFACE_PREEDIT,
     C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_TOUCH,
     C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
-    CAPTURE_FORMAT_PNG, CLIENT_FEATURE_SURFACE_TIMESTAMP_SUB_US, CREATE2_HAS_COMMAND,
-    CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE, CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS,
-    FEATURE_CLIENT_CONTROL, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS,
-    FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH, FEATURE_RESTART,
-    FEATURE_SCROLL_BY, FrameState, KICK_REASON_MAX, KILL_LEADER_ONLY, READ_ANSI, READ_TAIL,
-    REMOTE_INPUT_POINTER, REMOTE_INPUT_TOUCH, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST,
-    S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST,
-    S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID, STATUS_NOT_FOUND, STATUS_OK, STATUS_OTHER,
-    STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME,
-    SURFACE_POINTER_AXIS2_LEN, SURFACE_POINTER_DOWN, SURFACE_POINTER_LEAVE, SURFACE_POINTER_MOVE,
-    SURFACE_POINTER_UP, SURFACE_TOUCH_CANCEL, SURFACE_TOUCH_DISABLE, SURFACE_TOUCH_DOWN,
-    SURFACE_TOUCH_ENABLE, SURFACE_TOUCH_MOTION, SURFACE_TOUCH_UP, build_update_msg,
-    clamp_cursor_rect, msg_hello, msg_kick_result, msg_kicked, msg_s2c_client_list,
-    msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_clipboard_owner,
-    msg_s2c_scroll_offset, msg_s2c_surface_remote_input, msg_s2c_used_rows, msg_surface_activated,
-    msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
-    msg_surface_frame, msg_surface_frame_precise, msg_surface_origin, msg_surface_resized,
-    msg_surface_text_input, msg_surface_title, msg_term_cwd_reply, parse_surface_drag_drop,
-    parse_surface_drag_enter, parse_surface_pointer_axis2, parse_surface_touch,
+    CAPTURE_FORMAT_PNG, CLIENT_FEATURE_SURFACE_TIMESTAMP_SUB_US, CLIENT_LIST_WANT_ORIGIN,
+    CREATE2_HAS_COMMAND, CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE, CREATE2_HAS_SRC_PTY,
+    CREATE2_WANT_STATUS, FEATURE_CLIENT_CONTROL, FEATURE_CLIENT_ORIGIN, FEATURE_COPY_RANGE,
+    FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE,
+    FEATURE_RESIZE_BATCH, FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState, KICK_REASON_MAX,
+    KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, REMOTE_INPUT_POINTER, REMOTE_INPUT_TOUCH, S2C_CLOSED,
+    S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS,
+    S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID,
+    STATUS_NOT_FOUND, STATUS_OK, STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264,
+    SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN, SURFACE_POINTER_DOWN,
+    SURFACE_POINTER_LEAVE, SURFACE_POINTER_MOVE, SURFACE_POINTER_UP, SURFACE_TOUCH_CANCEL,
+    SURFACE_TOUCH_DISABLE, SURFACE_TOUCH_DOWN, SURFACE_TOUCH_ENABLE, SURFACE_TOUCH_MOTION,
+    SURFACE_TOUCH_UP, build_update_msg, clamp_cursor_rect, msg_hello, msg_kick_result, msg_kicked,
+    msg_s2c_client_list, msg_s2c_client_list2, msg_s2c_clipboard_content, msg_s2c_clipboard_list,
+    msg_s2c_clipboard_owner, msg_s2c_scroll_offset, msg_s2c_surface_remote_input,
+    msg_s2c_used_rows, msg_surface_activated, msg_surface_app_id, msg_surface_created,
+    msg_surface_destroyed, msg_surface_encoder, msg_surface_frame, msg_surface_frame_precise,
+    msg_surface_origin, msg_surface_resized, msg_surface_text_input, msg_surface_title,
+    msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
+    parse_surface_pointer_axis2, parse_surface_touch,
 };
 #[cfg(target_os = "linux")]
 use blit_remote::{
@@ -1307,6 +1308,9 @@ enum ConnectionOrigin {
         definition_revision: u64,
         attempt: u64,
         task_id: u32,
+        /// The durable name of a persistent definition, the label a transient
+        /// `ext run` carried, or empty when it had neither.
+        name: String,
     },
 }
 
@@ -1315,6 +1319,26 @@ impl ConnectionOrigin {
         match self {
             Self::Network => "network client",
             Self::Extension { .. } => "extension client",
+        }
+    }
+
+    /// The same fact in the shape `S2C_CLIENT_LIST2` carries.
+    fn wire_origin(&self) -> blit_remote::ClientOrigin {
+        match self {
+            Self::Network => blit_remote::ClientOrigin::Network,
+            Self::Extension {
+                extension_id,
+                definition_revision,
+                attempt,
+                task_id,
+                name,
+            } => blit_remote::ClientOrigin::Extension {
+                extension_id: *extension_id,
+                definition_revision: *definition_revision,
+                attempt: *attempt,
+                task_id: *task_id,
+                name: name.clone(),
+            },
         }
     }
 
@@ -1423,6 +1447,7 @@ impl ConnectionOptions {
                 definition_revision: init.definition_revision,
                 attempt: init.attempt,
                 task_id: init.task_id,
+                name: init.name.to_owned(),
             },
             profile: ConnectionProfile::IN_PROCESS,
             cancellation,
@@ -3555,6 +3580,15 @@ impl From<mpsc::UnboundedSender<Vec<u8>>> for TrackedAudioSender {
     }
 }
 
+/// One live `C2S_CLIENT_WATCH`.
+struct ClientCatalogWatch {
+    /// Set when the watch was opened with `CLIENT_LIST_WANT_ORIGIN`. A watch
+    /// keeps the shape it was opened with for its whole life, so a client that
+    /// asked for origins never has to re-detect which reply it is reading.
+    want_origin: bool,
+    last: Vec<u8>,
+}
+
 struct ClientState {
     tx: TrackedOutboxSender,
     /// Native-channel frames retain their pair admission reservation while
@@ -3592,11 +3626,15 @@ struct ClientState {
     inbound_bytes_seen: u64,
     inbound_sampled_at: Instant,
     inbound_bytes_per_sec: u64,
-    /// Live catalog nonce → last encoded snapshot sent under that nonce.
-    /// Comparing the deterministic encoding avoids pushing unchanged lists on
-    /// every delivery tick.
-    client_catalog_watches: FxHashMap<u16, Vec<u8>>,
+    /// Live catalog nonce → the shape that watch was opened with and the last
+    /// encoded snapshot sent under it. Comparing the deterministic encoding
+    /// avoids pushing unchanged lists on every delivery tick.
+    client_catalog_watches: FxHashMap<u16, ClientCatalogWatch>,
     connected_at: Instant,
+    /// What opened this connection, kept so the catalog can say so. Captured
+    /// at accept time: an attempt is named by the definition it started from,
+    /// not by whatever that definition says a minute later.
+    origin: ConnectionOrigin,
     /// Connection-scoped live resources outside terminal/surface state.
     /// Rebuilt after each family message from the authoritative registries.
     aux_subscriptions: Vec<blit_remote::ClientAuxSubscription>,
@@ -6782,7 +6820,7 @@ impl Session {
         true
     }
 
-    fn client_list_msg(&self, requester: u64, nonce: u16) -> Vec<u8> {
+    fn client_list_msg(&self, requester: u64, nonce: u16, want_origin: bool) -> Vec<u8> {
         let mut clients: Vec<blit_remote::ClientListEntry> = self
             .clients
             .iter()
@@ -6835,17 +6873,31 @@ impl Session {
                     terminals,
                     surfaces,
                     subscriptions,
+                    // Built only when asked for: the plain encoder drops it,
+                    // and cloning an origin per client per catalog tick is
+                    // work a watcher that never asked should not pay.
+                    origin: want_origin.then(|| client.origin.wire_origin()),
                 }
             })
             .collect();
         clients.sort_unstable_by_key(|entry| entry.client_id);
-        msg_s2c_client_list(nonce, requester, &clients)
+        if want_origin {
+            msg_s2c_client_list2(nonce, requester, &clients)
+        } else {
+            msg_s2c_client_list(nonce, requester, &clients)
+        }
     }
 
-    fn watch_client_list(&mut self, requester: u64, nonce: u16) {
-        let msg = self.client_list_msg(requester, nonce);
+    fn watch_client_list(&mut self, requester: u64, nonce: u16, want_origin: bool) {
+        let msg = self.client_list_msg(requester, nonce, want_origin);
         if let Some(client) = self.clients.get_mut(&requester) {
-            client.client_catalog_watches.insert(nonce, msg.clone());
+            client.client_catalog_watches.insert(
+                nonce,
+                ClientCatalogWatch {
+                    want_origin,
+                    last: msg.clone(),
+                },
+            );
             let _ = send_outbox(client, msg);
         }
     }
@@ -6857,26 +6909,28 @@ impl Session {
     }
 
     fn publish_client_catalogs(&mut self) {
-        let watches: Vec<(u64, u16)> = self
+        let watches: Vec<(u64, u16, bool)> = self
             .clients
             .iter()
             .flat_map(|(&client_id, client)| {
                 client
                     .client_catalog_watches
-                    .keys()
-                    .copied()
-                    .map(move |nonce| (client_id, nonce))
+                    .iter()
+                    .map(move |(&nonce, watch)| (client_id, nonce, watch.want_origin))
             })
             .collect();
-        for (client_id, nonce) in watches {
-            let msg = self.client_list_msg(client_id, nonce);
+        for (client_id, nonce, want_origin) in watches {
+            let msg = self.client_list_msg(client_id, nonce, want_origin);
             let Some(client) = self.clients.get_mut(&client_id) else {
                 continue;
             };
-            if client.client_catalog_watches.get(&nonce) == Some(&msg) {
+            let Some(watch) = client.client_catalog_watches.get_mut(&nonce) else {
+                continue;
+            };
+            if watch.last == msg {
                 continue;
             }
-            client.client_catalog_watches.insert(nonce, msg.clone());
+            watch.last = msg.clone();
             let _ = send_outbox(client, msg);
         }
     }
@@ -13409,6 +13463,10 @@ struct FsSyncs {
     /// cap, its own set so search and index nonce spaces stay independent.
     inflight_searches: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
     inflight_greps: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    /// Nonces of `FS_READ` batches in flight — same discipline again: the read
+    /// happens off-thread, so without a cap a client could queue as many as it
+    /// can send.
+    inflight_reads: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
     /// Live chunked uploads on this connection (upload_id → sync_id routing
     /// plus the concurrent-upload cap). Shared with the sync sinks, which
     /// free the id of a BEGIN the engine refused.
@@ -13498,6 +13556,25 @@ impl FsSyncs {
         set.insert(nonce);
         Ok(std::sync::Arc::new(blit_fssync::InflightGuard::new(
             self.inflight_indexes.clone(),
+            nonce,
+        )))
+    }
+
+    /// Reserve a nonce for an in-flight `FS_READ`, same cap and failure split
+    /// as [`FsSyncs::reserve_index`]: a read is off-thread I/O a client can
+    /// otherwise stack up.
+    fn reserve_read(&self, nonce: u16) -> Result<std::sync::Arc<blit_fssync::InflightGuard>, u8> {
+        use blit_remote::fs::{FS_DONE_BUDGET, FS_DONE_INVALID};
+        let mut set = self.inflight_reads.lock().unwrap();
+        if set.contains(&nonce) {
+            return Err(FS_DONE_INVALID);
+        }
+        if set.len() >= fs_walk_inflight() {
+            return Err(FS_DONE_BUDGET);
+        }
+        set.insert(nonce);
+        Ok(std::sync::Arc::new(blit_fssync::InflightGuard::new(
+            self.inflight_reads.clone(),
             nonce,
         )))
     }
@@ -13988,10 +14065,72 @@ const FS_INDEX_MAX_BYTES: usize = 48 * 1024 * 1024;
 /// with a bare `*` — the dotfiles-repo-at-$HOME pattern — blanks every
 /// non-repo subtree) falls back to an ignore-free walk: an empty index
 /// would otherwise read as "no files here" and never consult the server.
+/// Classify one path for `FS_READ` without reading it.
+fn stat_one_for_fs_read(path: &str, per_file: u64) -> u8 {
+    use blit_remote::fs::{
+        FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_OTHER, FS_FILE_TOO_LARGE, FS_FILE_UNREADABLE,
+    };
+    match std::fs::metadata(path) {
+        Err(error) => match error.kind() {
+            std::io::ErrorKind::NotFound => FS_FILE_NOT_FOUND,
+            std::io::ErrorKind::PermissionDenied => FS_FILE_UNREADABLE,
+            _ => FS_FILE_OTHER,
+        },
+        Ok(meta) if !meta.is_file() => FS_FILE_UNREADABLE,
+        Ok(meta) if meta.len() > per_file => FS_FILE_TOO_LARGE,
+        Ok(_) => FS_FILE_OK,
+    }
+}
+
+/// Read one path for `FS_READ`: its record status and content.
+///
+/// `left` is what remains of the reply budget, so a file that would not fit is
+/// reported the same way one over the caller's own ceiling is — the caller is not
+/// getting it either way, and the distinction is not worth a status.
+fn read_one_for_fs_read(path: &str, per_file: u64, left: usize) -> (u8, Vec<u8>) {
+    use blit_remote::fs::{
+        FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_OTHER, FS_FILE_TOO_LARGE, FS_FILE_UNREADABLE,
+    };
+    let kind = |error: &std::io::Error| match error.kind() {
+        std::io::ErrorKind::NotFound => FS_FILE_NOT_FOUND,
+        std::io::ErrorKind::PermissionDenied => FS_FILE_UNREADABLE,
+        _ => FS_FILE_OTHER,
+    };
+    match std::fs::metadata(path) {
+        Err(error) => (kind(&error), Vec::new()),
+        // A directory has no content to answer with, and `FS_INDEX` is the
+        // message that describes one.
+        Ok(meta) if !meta.is_file() => (FS_FILE_UNREADABLE, Vec::new()),
+        Ok(meta) if meta.len() > per_file || meta.len() as usize > left => {
+            (FS_FILE_TOO_LARGE, Vec::new())
+        }
+        Ok(_) => match std::fs::read(path) {
+            // It grew between the stat and the read.
+            Ok(body) if body.len() as u64 > per_file => (FS_FILE_TOO_LARGE, Vec::new()),
+            Ok(body) => (FS_FILE_OK, body),
+            Err(error) => (kind(&error), Vec::new()),
+        },
+    }
+}
+
 fn fs_index_walk(root: &std::path::Path, max_entries: usize) -> (Vec<String>, bool) {
-    let (paths, truncated) = fs_index_walk_inner(root, max_entries, true);
-    if paths.is_empty() && !truncated {
-        return fs_index_walk_inner(root, max_entries, false);
+    fs_index_walk_kind(root, max_entries, false, false)
+}
+
+/// [`fs_index_walk`], listing directories instead of files when `dirs_only`.
+///
+/// The ignore-free retry is skipped for directories: an ignore rule that blanks
+/// every file in a tree still leaves its directories, so an empty answer there
+/// means an empty tree and the second walk would only cost time.
+fn fs_index_walk_kind(
+    root: &std::path::Path,
+    max_entries: usize,
+    dirs_only: bool,
+    follow: bool,
+) -> (Vec<String>, bool) {
+    let (paths, truncated) = fs_index_walk_inner(root, max_entries, true, dirs_only, follow);
+    if paths.is_empty() && !truncated && !dirs_only {
+        return fs_index_walk_inner(root, max_entries, false, dirs_only, follow);
     }
     (paths, truncated)
 }
@@ -14000,6 +14139,8 @@ fn fs_index_walk_inner(
     root: &std::path::Path,
     max_entries: usize,
     use_ignores: bool,
+    dirs_only: bool,
+    follow: bool,
 ) -> (Vec<String>, bool) {
     let mut paths: Vec<String> = Vec::new();
     let mut bytes = 0usize;
@@ -14013,7 +14154,7 @@ fn fs_index_walk_inner(
     let mut builder = ignore::WalkBuilder::new(root);
     builder
         .hidden(false)
-        .follow_links(false)
+        .follow_links(follow)
         .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(".git"));
     if !use_ignores {
         builder.standard_filters(false);
@@ -14024,14 +14165,27 @@ fn fs_index_walk_inner(
             truncated = true;
             break;
         }
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+        // A symlink counts as whatever it points at, which costs one stat and is
+        // the difference between seeing a Nix system directory and not: every
+        // `.desktop` file and every icon directory under
+        // `/run/current-system/sw/share` is a link into the store, and the walk
+        // does not follow links, so `file_type` calls them all symlinks.
+        let wanted = match entry.file_type() {
+            Some(kind) if kind.is_dir() => dirs_only,
+            Some(kind) if kind.is_file() => !dirs_only,
+            Some(kind) if kind.is_symlink() => {
+                std::fs::metadata(entry.path()).is_ok_and(|target| target.is_dir() == dirs_only)
+            }
+            _ => false,
+        };
+        if !wanted {
             continue;
         }
         let Ok(rel) = entry.path().strip_prefix(root) else {
             continue;
         };
         if rel.as_os_str().is_empty() {
-            continue; // the root itself, when it is a file
+            continue; // the root itself, which the caller already has
         }
         // Truncation is exact: it fires only when a file would be dropped,
         // never on a trailing directory after the last counted file.
@@ -14182,8 +14336,8 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
 ) {
     use blit_fssync::{OpReq, UploadBeginReq, WriteReq};
     use blit_remote::fs::{
-        C2S_FS_ACK, C2S_FS_FETCH, C2S_FS_GREP, C2S_FS_INDEX, C2S_FS_OP, C2S_FS_SEARCH, C2S_FS_STOP,
-        C2S_FS_SYNC, C2S_FS_UPLOAD_BEGIN, C2S_FS_UPLOAD_CANCEL, C2S_FS_UPLOAD_CHUNK,
+        C2S_FS_ACK, C2S_FS_FETCH, C2S_FS_GREP, C2S_FS_INDEX, C2S_FS_OP, C2S_FS_READ, C2S_FS_SEARCH,
+        C2S_FS_STOP, C2S_FS_SYNC, C2S_FS_UPLOAD_BEGIN, C2S_FS_UPLOAD_CANCEL, C2S_FS_UPLOAD_CHUNK,
         C2S_FS_UPLOAD_FINISH, C2S_FS_WRITE, FS_DONE_BUDGET, FS_DONE_INVALID, FS_DONE_NOT_FOUND,
         FS_DONE_OK, FS_DONE_OTHER, FS_DONE_PERMISSION, FS_DONE_UNKNOWN_UPLOAD, FS_DONE_WRONG_TYPE,
         FS_FILE_OTHER, FS_INDEX_TRUNCATED, FS_STATUS_OK, FS_STATUS_OTHER, FS_STATUS_RESOURCE_LIMIT,
@@ -14192,8 +14346,8 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
         FS_SYNC_RECURSIVE, FS_SYNC_SINGLE, fs_sync_flags_valid, msg_fs_done, msg_fs_file,
         msg_fs_index_result, msg_fs_search_result, msg_fs_synced, msg_fs_upload_begin_result,
         msg_fs_upload_chunk_result, msg_fs_upload_finish_result, parse_fs_index, parse_fs_op,
-        parse_fs_search, parse_fs_upload_begin, parse_fs_upload_chunk, parse_fs_upload_finish,
-        parse_fs_write,
+        parse_fs_read, parse_fs_search, parse_fs_upload_begin, parse_fs_upload_chunk,
+        parse_fs_upload_finish, parse_fs_write,
     };
     match data[0] {
         C2S_FS_SEARCH => {
@@ -14326,15 +14480,91 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
                 }
             }
         }
+        C2S_FS_READ => {
+            // One-shot read of a fixed set of paths (docs/design/fs-read.md) —
+            // no sync, nothing watched. Off-thread and capped by `reserve_read`
+            // like every other walk in this family.
+            if let Some((nonce, flags, max_bytes, groups)) = parse_fs_read(data) {
+                use blit_remote::fs::{
+                    FS_FILE_NOT_FOUND, FS_FILE_OK, FS_READ_DEFAULT_BYTES, FS_READ_FIRST,
+                    FS_READ_FLAGS_KNOWN, FS_READ_MAX_TOTAL_BYTES, FS_READ_NO_CONTENT,
+                    msg_fs_read_result,
+                };
+                if flags & !FS_READ_FLAGS_KNOWN != 0 {
+                    let _ = out.send(msg_fs_read_result(nonce, FS_DONE_INVALID, &[]));
+                    return;
+                }
+                let guard = match syncs.reserve_read(nonce) {
+                    Ok(guard) => guard,
+                    Err(status) => {
+                        let _ = out.send(msg_fs_read_result(nonce, status, &[]));
+                        return;
+                    }
+                };
+                let out = out.clone();
+                let work = move || {
+                    let _guard = guard;
+                    let per_file = u64::from(if max_bytes == 0 {
+                        FS_READ_DEFAULT_BYTES
+                    } else {
+                        max_bytes
+                    });
+                    let first_only = flags & FS_READ_FIRST != 0;
+                    let no_content = flags & FS_READ_NO_CONTENT != 0;
+                    let mut left = FS_READ_MAX_TOTAL_BYTES;
+                    let mut records: Vec<(u8, String, Vec<u8>)> = Vec::new();
+                    for group in groups {
+                        let mut answered = false;
+                        for path in group {
+                            let (status, body) = if no_content {
+                                (stat_one_for_fs_read(&path, per_file), Vec::new())
+                            } else {
+                                read_one_for_fs_read(&path, per_file, left)
+                            };
+                            left = left.saturating_sub(body.len());
+                            // FIRST asks for the first path it can *have*, so a
+                            // miss, an unreadable file and an oversized one are
+                            // all stepped over rather than answered.
+                            if first_only {
+                                if status == FS_FILE_OK {
+                                    records.push((status, path, body));
+                                    answered = true;
+                                    break;
+                                }
+                                continue;
+                            }
+                            records.push((status, path, body));
+                        }
+                        // One record per group either way, so a caller can align
+                        // answers with questions by position.
+                        if first_only && !answered {
+                            records.push((FS_FILE_NOT_FOUND, String::new(), Vec::new()));
+                        }
+                    }
+                    let borrowed: Vec<(u8, &str, &[u8])> = records
+                        .iter()
+                        .map(|(status, path, body)| (*status, path.as_str(), body.as_slice()))
+                        .collect();
+                    let _ = out.send(msg_fs_read_result(nonce, FS_DONE_OK, &borrowed));
+                };
+                if let Some(jobs) = jobs {
+                    let _ = jobs.spawn_blocking(data.len(), work);
+                } else {
+                    std::thread::spawn(work);
+                }
+            }
+        }
         C2S_FS_INDEX => {
             // Candidate list for client-side fuzzy search
             // (docs/design/fs-search.md) — no sync. Walk off-thread, capped
             // by `reserve_index` so a client can't stack up walks.
             if let Some((nonce, flags, root)) = parse_fs_index(data) {
-                if flags != 0 {
+                if flags & !blit_remote::fs::FS_INDEX_FLAGS_KNOWN != 0 {
                     let _ = out.send(msg_fs_index_result(nonce, FS_DONE_INVALID, 0, &[]));
                     return;
                 }
+                let dirs_only = flags & blit_remote::fs::FS_INDEX_DIRS_ONLY != 0;
+                let follow = flags & blit_remote::fs::FS_INDEX_FOLLOW_LINKS != 0;
                 let guard = match syncs.reserve_index(nonce) {
                     Ok(guard) => guard,
                     Err(status) => {
@@ -14361,8 +14591,12 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
                         Ok(canon) => match std::fs::read_dir(&canon) {
                             Err(err) => msg_fs_index_result(nonce, io_status(&err), 0, &[]),
                             Ok(_) => {
-                                let (paths, truncated) =
-                                    fs_index_walk(&canon, fs_index_max_entries());
+                                let (paths, truncated) = fs_index_walk_kind(
+                                    &canon,
+                                    fs_index_max_entries(),
+                                    dirs_only,
+                                    follow,
+                                );
                                 let flags = if truncated { FS_INDEX_TRUNCATED } else { 0 };
                                 msg_fs_index_result(nonce, FS_DONE_OK, flags, &paths)
                             }
@@ -17138,6 +17372,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 inbound_bytes_per_sec: 0,
                 client_catalog_watches: FxHashMap::default(),
                 connected_at: Instant::now(),
+                origin: options.origin.clone(),
                 aux_subscriptions: Vec::new(),
                 #[cfg(target_os = "linux")]
                 audio_tx,
@@ -17238,6 +17473,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             | FEATURE_PTY_DEADLINE
             | FEATURE_SCROLL_BY
             | FEATURE_CLIENT_CONTROL
+            | FEATURE_CLIENT_ORIGIN
             | blit_remote::fs::FEATURE_FS
             | blit_remote::git::FEATURE_GIT;
         #[cfg(target_os = "linux")]
@@ -17724,6 +17960,10 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 | blit_remote::fs::C2S_FS_UPLOAD_CHUNK
                 | blit_remote::fs::C2S_FS_UPLOAD_FINISH
                 | blit_remote::fs::C2S_FS_UPLOAD_CANCEL
+                // Listed, not ranged: an fs opcode this match forgets is
+                // dropped before any handler runs, which reads as a request
+                // that never got a reply.
+                | blit_remote::fs::C2S_FS_READ
         ) {
             // A FROM_PTY sync (docs/ide.md Decision 3) names a source pty
             // whose live cwd is session state; resolve it here — the sole
@@ -18358,7 +18598,20 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             data[0],
             C2S_CLIENT_LIST | C2S_CLIENT_WATCH | C2S_CLIENT_UNWATCH
         ) {
-            if data.len() != 3 {
+            // LIST and WATCH take an optional flags byte; UNWATCH names a
+            // nonce whose shape was settled when the watch opened, so a flags
+            // byte there would be a request to change something that cannot
+            // change, and stays an error.
+            //
+            // An unknown flag bit is refused rather than ignored: a client
+            // that asks for a shape this server cannot produce must hear so,
+            // not receive a reply it will misread.
+            let shaped = matches!(data[0], C2S_CLIENT_LIST | C2S_CLIENT_WATCH);
+            let flags = (shaped && data.len() == 4).then(|| data[3]);
+            let want_origin = flags.is_some_and(|flags| flags & CLIENT_LIST_WANT_ORIGIN != 0);
+            let accepted =
+                data.len() == 3 || flags.is_some_and(|flags| flags & !CLIENT_LIST_WANT_ORIGIN == 0);
+            if !accepted {
                 if data.len() >= 3 {
                     let nonce = u16::from_le_bytes([data[1], data[2]]);
                     let sess = state.session.lock().await;
@@ -18380,10 +18633,13 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             match data[0] {
                 C2S_CLIENT_LIST => {
                     if let Some(client) = sess.clients.get(&client_id) {
-                        let _ = send_outbox(client, sess.client_list_msg(client_id, nonce));
+                        let _ = send_outbox(
+                            client,
+                            sess.client_list_msg(client_id, nonce, want_origin),
+                        );
                     }
                 }
-                C2S_CLIENT_WATCH => sess.watch_client_list(client_id, nonce),
+                C2S_CLIENT_WATCH => sess.watch_client_list(client_id, nonce, want_origin),
                 _ => sess.unwatch_client_list(client_id, nonce),
             }
             continue;
@@ -22424,6 +22680,7 @@ mod tests {
             inbound_bytes_per_sec: 0,
             client_catalog_watches: FxHashMap::default(),
             connected_at: Instant::now(),
+            origin: ConnectionOrigin::Network,
             aux_subscriptions: Vec::new(),
             #[cfg(target_os = "linux")]
             audio_tx,
@@ -22647,7 +22904,7 @@ mod tests {
         target.kick_tx = kick_tx;
         sess.clients.insert(5, target);
 
-        let msg = sess.client_list_msg(9, 17);
+        let msg = sess.client_list_msg(9, 17, false);
         let Some(blit_remote::ServerMsg::ClientList {
             nonce,
             self_id,
@@ -22738,6 +22995,96 @@ mod tests {
         );
     }
 
+    /// The catalog says which connections are extension attempts — and only
+    /// when asked, since a client reading the older shape must keep getting a
+    /// message it can parse.
+    #[test]
+    fn client_list_reports_extension_origins_on_request() {
+        let mut sess = Session::new();
+        sess.clients.insert(9, test_client());
+        let mut extension = test_client();
+        extension.origin = ConnectionOrigin::Extension {
+            extension_id: 0x05a3_415a_2dd1_ef9b,
+            definition_revision: 2,
+            attempt: 3,
+            task_id: 4,
+            name: "systemd".to_string(),
+        };
+        sess.clients.insert(2, extension);
+
+        let plain = sess.client_list_msg(9, 17, false);
+        assert_eq!(plain[0], blit_remote::S2C_CLIENT_LIST);
+        let Some(blit_remote::ServerMsg::ClientList { clients, .. }) =
+            blit_remote::parse_server_msg(&plain)
+        else {
+            panic!("expected a client list");
+        };
+        assert!(clients.iter().all(|entry| entry.origin.is_none()));
+
+        let asked = sess.client_list_msg(9, 17, true);
+        assert_eq!(asked[0], blit_remote::S2C_CLIENT_LIST2);
+        let Some(blit_remote::ServerMsg::ClientList { clients, .. }) =
+            blit_remote::parse_server_msg(&asked)
+        else {
+            panic!("expected a client list with origins");
+        };
+        assert_eq!(
+            clients[0].origin,
+            Some(blit_remote::ClientOrigin::Extension {
+                extension_id: 0x05a3_415a_2dd1_ef9b,
+                definition_revision: 2,
+                attempt: 3,
+                task_id: 4,
+                name: "systemd".to_string(),
+            })
+        );
+        assert_eq!(clients[1].origin, Some(blit_remote::ClientOrigin::Network));
+    }
+
+    /// A watch keeps the shape it was opened with, including across the
+    /// republish that a topology change triggers.
+    #[test]
+    fn client_catalog_watch_keeps_its_origin_shape() {
+        let mut sess = Session::new();
+        let (watcher, mut watcher_rx) = test_client_with_capacity(0);
+        sess.clients.insert(9, watcher);
+
+        sess.watch_client_list(9, 31, true);
+        assert_eq!(
+            watcher_rx.try_recv().unwrap()[0],
+            blit_remote::S2C_CLIENT_LIST2
+        );
+
+        let mut extension = test_client();
+        extension.origin = ConnectionOrigin::Extension {
+            extension_id: 7,
+            definition_revision: 1,
+            attempt: 1,
+            task_id: 0,
+            name: String::new(),
+        };
+        sess.clients.insert(2, extension);
+        sess.publish_client_catalogs();
+
+        let update = watcher_rx.try_recv().unwrap();
+        assert_eq!(update[0], blit_remote::S2C_CLIENT_LIST2);
+        let Some(blit_remote::ServerMsg::ClientList { clients, .. }) =
+            blit_remote::parse_server_msg(&update)
+        else {
+            panic!("expected a client list with origins");
+        };
+        assert_eq!(
+            clients[0].origin,
+            Some(blit_remote::ClientOrigin::Extension {
+                extension_id: 7,
+                definition_revision: 1,
+                attempt: 1,
+                task_id: 0,
+                name: String::new(),
+            })
+        );
+    }
+
     #[test]
     fn client_catalog_watch_pushes_only_changes_until_unwatched() {
         let mut sess = Session::new();
@@ -22745,7 +23092,7 @@ mod tests {
         sess.clients.insert(9, watcher);
         sess.clients.insert(2, test_client());
 
-        sess.watch_client_list(9, 31);
+        sess.watch_client_list(9, 31, false);
         assert!(matches!(
             blit_remote::parse_server_msg(&watcher_rx.try_recv().unwrap()),
             Some(blit_remote::ServerMsg::ClientList {

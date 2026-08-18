@@ -1,13 +1,14 @@
 /**
  * What this server is running, and what it could run.
  *
- * Two lists over the same identity: an extension is its BLAKE3 digest, so the
- * installed table shows the digest a definition is pinned to and the registry
- * shows the digest it offers. Comparing the two is what "up to date" means
- * here — there is no version to trust.
+ * One list over one identity: an extension is its BLAKE3 digest, so a row that
+ * is both installed and offered shows the digest the definition is pinned to
+ * next to the one the registry offers, and "outdated" is that comparison. There
+ * is no version to trust. Installed and offered used to be two tables, which
+ * named the same extension twice and made an update look like a fresh install.
  */
 
-import { createSignal, For, onMount, Show } from "solid-js";
+import { createMemo, createSignal, For, onMount, Show } from "solid-js";
 import type {
   BlitExtensionRecord,
   BlitWorkspace,
@@ -28,8 +29,10 @@ import {
   defaultRegistry,
   fetchRegistry,
   installFromRegistry,
+  isOutdated,
+  mergeExtensions,
+  type ExtensionRow,
   type Registry,
-  type RegistryEntry,
 } from "./extensionRegistry";
 import { mergeStyle, scrollbarStyle, themeFor, ui, uiScale } from "./theme";
 import { t, tp } from "./i18n";
@@ -81,6 +84,10 @@ export function ExtensionsPanel(props: {
     void loadRegistry();
   });
 
+  const rows = createMemo<ExtensionRow[]>(() =>
+    mergeExtensions(installed(), registry()?.extensions ?? []),
+  );
+
   const act = async (label: string, action: () => Promise<unknown>) => {
     setBusy(label);
     setNote(null);
@@ -95,14 +102,24 @@ export function ExtensionsPanel(props: {
     }
   };
 
-  const install = (entry: RegistryEntry) => {
+  /**
+   * Install, or replace the definition of the same name in place.
+   *
+   * The installed record is what makes the second case an update rather than a
+   * second definition: it carries the CAS token of what is being replaced.
+   */
+  const install = (row: ExtensionRow) => {
     const connection = host();
     const source = registry();
-    if (!connection || !source) return;
-    const existing = installed().find((record) => record.name === entry.name);
-    void act(entry.name, async () => {
-      await installFromRegistry(connection, source, entry, existing);
-      setNote(tp("extensions.installed", { name: entry.name }));
+    if (!connection || !source || !row.offered) return;
+    void act(row.label, async () => {
+      await installFromRegistry(
+        connection,
+        source,
+        row.offered!,
+        row.installed,
+      );
+      setNote(tp("extensions.installed", { name: row.label }));
     });
   };
 
@@ -121,11 +138,6 @@ export function ExtensionsPanel(props: {
   };
 
   const short = (digest: string) => digest.slice(0, 12);
-
-  const upToDate = (entry: RegistryEntry): BlitExtensionRecord | undefined =>
-    installed().find(
-      (record) => record.name === entry.name && record.hash === entry.blake3,
-    );
 
   return (
     <>
@@ -151,99 +163,6 @@ export function ExtensionsPanel(props: {
           {note()}
         </div>
       </Show>
-
-      <div
-        style={{
-          color: theme().dimFg,
-          "font-size": `${scale().sm}px`,
-          "margin-bottom": `${scale().xs}px`,
-        }}
-      >
-        {t("extensions.installedTitle")}
-      </div>
-      <div
-        style={mergeStyle(scrollbarStyle(theme()), {
-          "overflow-y": "auto",
-          "max-height": "30vh",
-          "font-size": `${scale().sm}px`,
-          "margin-bottom": `${scale().sm}px`,
-        })}
-      >
-        <For
-          each={installed()}
-          fallback={
-            <div style={{ color: theme().dimFg }}>{t("extensions.none")}</div>
-          }
-        >
-          {(record) => (
-            <div
-              style={{
-                display: "grid",
-                "grid-template-columns":
-                  "minmax(0, 1fr) 7em 9em 8em minmax(0, 12em)",
-                gap: `${scale().sm}px`,
-                "align-items": "center",
-                padding: `${scale().xs}px 0`,
-                "border-bottom": `1px solid ${theme().border}`,
-              }}
-            >
-              <span title={`id:${formatExtensionId(record.extensionId)}`}>
-                {record.name || `id:${formatExtensionId(record.extensionId)}`}
-              </span>
-              <span
-                style={{
-                  color:
-                    record.phase === EXT_PHASE_RUNNING
-                      ? theme().success
-                      : theme().dimFg,
-                }}
-              >
-                {EXT_PHASE_NAMES[record.phase] ?? record.phase}
-              </span>
-              <span style={{ color: theme().dimFg }} title={record.hash}>
-                {short(record.hash)}
-              </span>
-              <span style={{ color: theme().dimFg }}>
-                {record.flags & EXT_FLAG_PERSIST
-                  ? t("extensions.persistent")
-                  : t("extensions.transient")}
-                {record.flags & EXT_FLAG_ENABLED
-                  ? ""
-                  : ` ${t("extensions.disabled")}`}
-              </span>
-              <span style={{ display: "flex", gap: `${scale().xs}px` }}>
-                <button
-                  type="button"
-                  disabled={busy() !== null}
-                  style={mergeStyle(ui.btn, {
-                    "font-size": `${scale().sm}px`,
-                  })}
-                  onClick={() =>
-                    void act(record.name, () =>
-                      host()!.controlExtension(
-                        record.extensionId,
-                        EXT_CONTROL_RESTART,
-                      ),
-                    )
-                  }
-                >
-                  {t("extensions.restart")}
-                </button>
-                <button
-                  type="button"
-                  disabled={busy() !== null}
-                  style={mergeStyle(ui.btn, {
-                    "font-size": `${scale().sm}px`,
-                  })}
-                  onClick={() => remove(record)}
-                >
-                  {t("extensions.remove")}
-                </button>
-              </span>
-            </div>
-          )}
-        </For>
-      </div>
 
       <div
         style={{
@@ -279,52 +198,178 @@ export function ExtensionsPanel(props: {
       <div
         style={mergeStyle(scrollbarStyle(theme()), {
           "overflow-y": "auto",
-          "max-height": "30vh",
+          "max-height": "55vh",
           "font-size": `${scale().sm}px`,
         })}
       >
         <For
-          each={registry()?.extensions ?? []}
+          each={rows()}
           fallback={
             <div style={{ color: theme().dimFg }}>
               {busy() === "registry"
                 ? t("extensions.loading")
-                : t("extensions.registryEmpty")}
+                : t("extensions.none")}
             </div>
           }
         >
-          {(entry) => (
+          {(row) => (
             <div
+              data-extension={row.label}
               style={{
                 display: "grid",
-                "grid-template-columns": "minmax(0, 1fr) 9em 7em 8em",
+                // Every row is its own grid, so the tracks have to be fixed for
+                // the columns to line up — a `max-content` action track makes
+                // each row as wide as its own button count. Wide enough for
+                // all three (Update, Restart, Remove), right-aligned so the
+                // rows that carry fewer still end at the same edge.
+                "grid-template-columns": "minmax(0, 1fr) 6em 13em 7em 14.5em",
                 gap: `${scale().sm}px`,
                 "align-items": "center",
                 padding: `${scale().xs}px 0`,
                 "border-bottom": `1px solid ${theme().border}`,
               }}
             >
-              <span>{entry.name}</span>
-              <span style={{ color: theme().dimFg }} title={entry.blake3}>
-                {short(entry.blake3)}
+              <span style={{ "min-width": 0 }}>
+                <span
+                  title={
+                    row.installed
+                      ? `id:${formatExtensionId(row.installed.extensionId)}`
+                      : undefined
+                  }
+                >
+                  {row.label}
+                </span>
+                <Show when={row.description}>
+                  <div
+                    style={{
+                      color: theme().dimFg,
+                      "font-size": `${scale().xs}px`,
+                    }}
+                  >
+                    {row.description}
+                  </div>
+                </Show>
               </span>
-              <span style={{ color: theme().dimFg }}>
-                {entry.brotliBytes
-                  ? `${Math.round(entry.brotliBytes / 1024)} KiB`
-                  : ""}
-              </span>
-              <button
-                type="button"
-                disabled={busy() !== null || upToDate(entry) !== undefined}
-                style={mergeStyle(ui.btn, { "font-size": `${scale().sm}px` })}
-                onClick={() => install(entry)}
+
+              <span
+                style={{
+                  color: !row.installed
+                    ? theme().dimFg
+                    : row.installed.phase === EXT_PHASE_RUNNING
+                      ? theme().success
+                      : theme().dimFg,
+                }}
               >
-                {upToDate(entry)
-                  ? t("extensions.current")
-                  : installed().some((record) => record.name === entry.name)
-                    ? t("extensions.update")
-                    : t("extensions.install")}
-              </button>
+                {row.installed
+                  ? (EXT_PHASE_NAMES[row.installed.phase] ??
+                    row.installed.phase)
+                  : t("extensions.available")}
+              </span>
+
+              {/* The digest is the identity, so an update is shown as one. */}
+              <span
+                style={{
+                  color: isOutdated(row) ? theme().warning : theme().dimFg,
+                }}
+                title={
+                  row.installed && row.offered
+                    ? `${row.installed.hash}\n${row.offered.blake3}`
+                    : (row.installed?.hash ?? row.offered?.blake3)
+                }
+              >
+                {short(row.installed?.hash ?? row.offered?.blake3 ?? "")}
+                <Show when={isOutdated(row)}>
+                  {" → "}
+                  {short(row.offered!.blake3)}
+                </Show>
+              </span>
+
+              <span style={{ color: theme().dimFg }}>
+                <Show
+                  when={row.installed}
+                  fallback={
+                    row.offered?.brotliBytes
+                      ? `${Math.round(row.offered.brotliBytes / 1024)} KiB`
+                      : ""
+                  }
+                >
+                  {row.installed!.flags & EXT_FLAG_PERSIST
+                    ? t("extensions.persistent")
+                    : t("extensions.transient")}
+                  {row.installed!.flags & EXT_FLAG_ENABLED
+                    ? ""
+                    : ` ${t("extensions.disabled")}`}
+                </Show>
+              </span>
+
+              <span
+                style={{
+                  display: "flex",
+                  gap: `${scale().xs}px`,
+                  "align-items": "center",
+                  "justify-content": "flex-end",
+                }}
+              >
+                <Show when={row.offered && !row.installed}>
+                  <button
+                    type="button"
+                    disabled={busy() !== null}
+                    style={mergeStyle(ui.btn, {
+                      "font-size": `${scale().sm}px`,
+                    })}
+                    onClick={() => install(row)}
+                  >
+                    {t("extensions.install")}
+                  </button>
+                </Show>
+                <Show when={isOutdated(row)}>
+                  <button
+                    type="button"
+                    data-extension-update
+                    disabled={busy() !== null}
+                    style={mergeStyle(ui.btn, {
+                      "font-size": `${scale().sm}px`,
+                    })}
+                    onClick={() => install(row)}
+                  >
+                    {t("extensions.update")}
+                  </button>
+                </Show>
+                <Show when={row.installed && row.offered && !isOutdated(row)}>
+                  <span style={{ color: theme().dimFg }}>
+                    {t("extensions.current")}
+                  </span>
+                </Show>
+                <Show when={row.installed}>
+                  <button
+                    type="button"
+                    disabled={busy() !== null}
+                    style={mergeStyle(ui.btn, {
+                      "font-size": `${scale().sm}px`,
+                    })}
+                    onClick={() =>
+                      void act(row.label, () =>
+                        host()!.controlExtension(
+                          row.installed!.extensionId,
+                          EXT_CONTROL_RESTART,
+                        ),
+                      )
+                    }
+                  >
+                    {t("extensions.restart")}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy() !== null}
+                    style={mergeStyle(ui.btn, {
+                      "font-size": `${scale().sm}px`,
+                    })}
+                    onClick={() => remove(row.installed!)}
+                  >
+                    {t("extensions.remove")}
+                  </button>
+                </Show>
+              </span>
             </div>
           )}
         </For>

@@ -158,6 +158,24 @@ function readInitialState(fd: number): Uint8Array {
   }
 }
 
+/**
+ * Read frames until one carries `opcode`, skipping unsolicited state.
+ *
+ * A reply is not the next frame. The server pushes state whenever it has some
+ * — a compositor with a cursor on it sends SURFACE_CURSOR unprompted — so
+ * anything waiting for a specific answer has to skip past what it did not ask
+ * for. Bounded so a wrong opcode fails the example rather than hanging it.
+ */
+function readReply(fd: number, opcode: number, limit = 64): Uint8Array {
+  for (let i = 0; i < limit; i++) {
+    const msg = readFrame(fd);
+    assert(msg.length > 0, "unexpected empty frame while waiting for a reply");
+    if (msg[0] === opcode) return msg;
+  }
+  assert(false, `no 0x${opcode.toString(16)} within ${limit} frames`);
+  throw new Error("unreachable");
+}
+
 function assert(cond: boolean, msg: string) {
   if (!cond) {
     console.error(`FAIL: ${msg}`);
@@ -206,11 +224,7 @@ try {
   cv.setUint16(5, 0, true);
   writeFrame(clientOurs, createMsg);
 
-  const created = readFrame(clientOurs);
-  assert(
-    created[0] === S2C_CREATED,
-    `expected CREATED (0x01), got 0x${created[0].toString(16)}`,
-  );
+  const created = readReply(clientOurs, S2C_CREATED);
   const ptyId = new DataView(created.buffer).getUint16(1, true);
   console.log(`CREATED: pty_id=${ptyId}`);
 

@@ -1,6 +1,7 @@
 import type {
   BlitConnectionSnapshot,
   BlitClientList,
+  BlitClientOrigin,
   BlitSearchResult,
   BlitSession,
   BlitTransport,
@@ -17,6 +18,7 @@ import {
   FEATURE_COMPOSITOR,
   FEATURE_COPY_RANGE,
   FEATURE_CLIENT_CONTROL,
+  FEATURE_CLIENT_ORIGIN,
   FEATURE_CREATE_NONCE,
   FEATURE_CREATE_STATUS,
   FEATURE_KILL_MODE,
@@ -38,7 +40,10 @@ import {
   S2C_EXITED,
   S2C_HELLO,
   S2C_KICKED,
+  CLIENT_ORIGIN_EXTENSION,
+  CLIENT_ORIGIN_NETWORK,
   S2C_CLIENT_LIST,
+  S2C_CLIENT_LIST2,
   S2C_KICK_RESULT,
   S2C_LIST,
   S2C_READY,
@@ -228,6 +233,7 @@ import {
   S2C_FS_CLOSED,
   S2C_FS_FILE,
   S2C_FS_INDEX,
+  S2C_FS_READ,
   S2C_FS_SEARCH,
   S2C_FS_SYNCED,
   S2C_FS_UPDATE,
@@ -238,6 +244,7 @@ import {
   buildFsAckMessage,
   buildFsFetchMessage,
   buildFsIndexMessage,
+  buildFsReadMessage,
   buildFsSearchMessage,
   buildFsOpMessage,
   buildFsStopMessage,
@@ -248,6 +255,7 @@ import {
   buildFsUploadFinishMessage,
   buildFsWriteMessage,
   parseFsIndexResult,
+  parseFsReadResult,
   buildFsGrepMessage,
   parseFsGrepResult,
   S2C_FS_GREP,
@@ -264,6 +272,7 @@ import {
   FsConflictError,
   FsOpenError,
   type FsFileIndex,
+  type FsReadRecord,
   type FsGrepResult,
   type FsGrepOptions,
   type FsNode,
@@ -591,6 +600,35 @@ function connectionError(message: string): Error {
   return new Error(message);
 }
 
+/**
+ * Read one `S2C_CLIENT_LIST2` origin block, given the bounds its length prefix
+ * already established.
+ *
+ * A payload that does not fit its kind reads as `unknown` rather than failing
+ * the catalog: the caller knows where the entry ends either way, so one
+ * unreadable origin costs that origin and nothing else.
+ */
+function readClientOrigin(
+  originKind: number,
+  view: DataView,
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+): BlitClientOrigin {
+  if (originKind === CLIENT_ORIGIN_NETWORK) return { kind: "network" };
+  if (originKind === CLIENT_ORIGIN_EXTENSION && end - start >= 28) {
+    return {
+      kind: "extension",
+      extensionId: view.getBigUint64(start, true),
+      definitionRevision: view.getBigUint64(start + 8, true),
+      attempt: view.getBigUint64(start + 16, true),
+      taskId: view.getUint32(start + 24, true),
+      name: textDecoder.decode(bytes.subarray(start + 28, end)),
+    };
+  }
+  return { kind: "unknown", originKind };
+}
+
 /** Unacked upload bytes allowed on the wire at once. Kept small on purpose:
  *  C2S has no flow control, so every queued upload byte sits ahead of
  *  interactive input (keyboard/mouse) sharing this connection — a multi-MiB
@@ -738,6 +776,13 @@ export class BlitConnection {
   private readonly pendingFsIndexes = new Map<
     number,
     { resolve: (index: FsFileIndex) => void; reject: (error: Error) => void }
+  >();
+  private readonly pendingFsReads = new Map<
+    number,
+    {
+      resolve: (records: FsReadRecord[]) => void;
+      reject: (error: Error) => void;
+    }
   >();
   private readonly pendingFsGreps = new Map<
     number,
@@ -1430,7 +1475,9 @@ export class BlitConnection {
     return new Promise<BlitClientList>((resolve, reject) => {
       const nonce = this.nextClientControlNonce();
       this.pendingClientLists.set(nonce, { resolve, reject });
-      this.transport.send(buildClientListMessage(nonce));
+      this.transport.send(
+        buildClientListMessage(nonce, this.wantsClientOrigin),
+      );
     });
   }
 
@@ -1481,6 +1528,13 @@ export class BlitConnection {
     });
   }
 
+  /** Whether to ask the catalog where each connection came from. An older
+   *  server answers the flag with `INVALID` instead of a catalog, so this is
+   *  the difference between a missing column and a broken pane. */
+  private get wantsClientOrigin(): boolean {
+    return (this.features & FEATURE_CLIENT_ORIGIN) !== 0;
+  }
+
   private clientControlAvailabilityError(action: string): Error | null {
     if (this.transport.status !== "connected") {
       return connectionError(
@@ -1525,7 +1579,7 @@ export class BlitConnection {
     }
     const nonce = this.nextClientControlNonce();
     this.clientCatalogWatchNonce = nonce;
-    this.transport.send(buildClientWatchMessage(nonce));
+    this.transport.send(buildClientWatchMessage(nonce, this.wantsClientOrigin));
   }
 
   private stopClientCatalogWatch(): void {
@@ -2236,6 +2290,55 @@ export class BlitConnection {
       const nonce = this.nextFsNonce(this.pendingFsIndexes);
       this.pendingFsIndexes.set(nonce, { resolve, reject });
       this.transport.send(buildFsIndexMessage(nonce, root));
+    });
+  }
+
+  /**
+   * Read whole files, or resolve which of several paths exists
+   * (docs/design/fs-read.md). No sync session and nothing watched.
+   *
+   * Paths come in groups, and a group is one question: with `FS_READ_FIRST`
+   * each group is answered by its own first readable path, one record per group
+   * in group order. With `FS_READ_NO_CONTENT` the records name the file without
+   * carrying it, which is how a caller that only wants to know *where* something
+   * is pays a stat rather than a read.
+   *
+   * Every record carries its own `FS_FILE_*`, so a missing or oversized path is
+   * an answer about that path rather than a failure of the batch.
+   */
+  readFiles(
+    groups: readonly (readonly string[])[],
+    options: { flags?: number; maxBytes?: number } = {},
+  ): Promise<FsReadRecord[]> {
+    if (this.transport.status !== "connected") {
+      return Promise.reject(
+        connectionError(`Cannot read files while transport is ${this.transport.status}`),
+      );
+    }
+    if ((this.features & FEATURE_FS) === 0) {
+      return Promise.reject(
+        connectionError("Server does not support file reads"),
+      );
+    }
+    // A server predating FS_READ drops the opcode and never answers, so the
+    // in-flight cap is what keeps a repeating caller bounded — the same reason
+    // `indexFiles` has one.
+    if (this.pendingFsReads.size >= 16) {
+      return Promise.reject(
+        connectionError("Too many file read requests in flight"),
+      );
+    }
+    return new Promise<FsReadRecord[]>((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingFsReads);
+      this.pendingFsReads.set(nonce, { resolve, reject });
+      this.transport.send(
+        buildFsReadMessage(
+          nonce,
+          options.flags ?? 0,
+          options.maxBytes ?? 0,
+          groups,
+        ),
+      );
     });
   }
 
@@ -3951,6 +4054,10 @@ export class BlitConnection {
       pending.reject(error);
     }
     this.pendingFsGreps.clear();
+    for (const pending of this.pendingFsReads.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsReads.clear();
     for (const pending of this.pendingFsIndexes.values()) {
       pending.reject(error);
     }
@@ -5386,7 +5493,9 @@ export class BlitConnection {
           }
         }
         return;
-      case S2C_CLIENT_LIST: {
+      case S2C_CLIENT_LIST:
+      case S2C_CLIENT_LIST2: {
+        const withOrigin = bytes[0] === S2C_CLIENT_LIST2;
         if (bytes.length < 3) return;
         const view = new DataView(
           bytes.buffer,
@@ -5482,6 +5591,29 @@ export class BlitConnection {
             });
             offset += 3;
           }
+          let origin: BlitClientOrigin | null = null;
+          if (withOrigin) {
+            if (offset + 3 > bytes.length) {
+              malformed();
+              return;
+            }
+            const originKind = bytes[offset];
+            const originLength = view.getUint16(offset + 1, true);
+            const originStart = offset + 3;
+            const originEnd = originStart + originLength;
+            if (originEnd > bytes.length) {
+              malformed();
+              return;
+            }
+            origin = readClientOrigin(
+              originKind,
+              view,
+              bytes,
+              originStart,
+              originEnd,
+            );
+            offset = originEnd;
+          }
           clients.push({
             id,
             ageSeconds,
@@ -5490,6 +5622,7 @@ export class BlitConnection {
             subscriptions,
             terminals,
             surfaces,
+            origin,
           });
         }
         if (offset !== bytes.length) {
@@ -6488,6 +6621,23 @@ export class BlitConnection {
             connectionError(
               parsed.detail ||
                 `Content search failed: ${fsDoneStatusText(parsed.status)}`,
+            ),
+          );
+        }
+        return;
+      }
+      case S2C_FS_READ: {
+        const parsed = parseFsReadResult(bytes);
+        if (!parsed) return;
+        const pending = this.pendingFsReads.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingFsReads.delete(parsed.nonce);
+        if (parsed.status === FS_DONE_OK) {
+          pending.resolve(parsed.records);
+        } else {
+          pending.reject(
+            connectionError(
+              `File read failed: ${fsDoneStatusText(parsed.status)}`,
             ),
           );
         }

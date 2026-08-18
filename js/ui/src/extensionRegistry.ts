@@ -12,6 +12,7 @@
 
 import {
   EXT_RESTART_ALWAYS,
+  formatExtensionId,
   parseModuleDigest,
   type BlitExtensionRecord,
   type BlitExtensionStatus,
@@ -43,6 +44,8 @@ export function defaultRegistry(): string {
 
 export interface RegistryEntry {
   readonly name: string;
+  /** What the extension is for, from the crate's `package.description`. */
+  readonly description: string;
   readonly file: string;
   readonly blake3: string;
   readonly bytes: number;
@@ -73,6 +76,65 @@ export interface ExtensionHost {
   ): Promise<BlitExtensionStatus>;
 }
 
+/** One extension: installed, offered by the registry, or both. */
+export interface ExtensionRow {
+  /** Stable across a refresh, and distinct for two unnamed definitions. */
+  readonly key: string;
+  readonly label: string;
+  readonly description: string;
+  readonly installed?: BlitExtensionRecord;
+  readonly offered?: RegistryEntry;
+}
+
+/**
+ * The one list the panel shows: installed first, then what only the registry
+ * has.
+ *
+ * Matched by name, which is the only handle the two sides share — the digest
+ * cannot be it, since an update is precisely the case where the digests differ.
+ * An unnamed definition (a transient `ext run` with no name) matches nothing
+ * and keeps a row of its own rather than collapsing with the others.
+ */
+export function mergeExtensions(
+  installed: readonly BlitExtensionRecord[],
+  offered: readonly RegistryEntry[],
+): ExtensionRow[] {
+  const byName = new Map(offered.map((entry) => [entry.name, entry]));
+  const claimed = new Set(
+    installed.map((record) => record.name).filter((name) => name !== ""),
+  );
+  return [
+    ...installed.map((record) => {
+      const id = formatExtensionId(record.extensionId);
+      const match = record.name ? byName.get(record.name) : undefined;
+      return {
+        key: `installed:${id}`,
+        label: record.name || `id:${id}`,
+        description: match?.description ?? "",
+        installed: record,
+        offered: match,
+      };
+    }),
+    ...offered
+      .filter((entry) => !claimed.has(entry.name))
+      .map((entry) => ({
+        key: `offered:${entry.name}`,
+        label: entry.name,
+        description: entry.description,
+        offered: entry,
+      })),
+  ];
+}
+
+/** Installed, and the registry offers different bytes under the same name. */
+export function isOutdated(row: ExtensionRow): boolean {
+  return (
+    row.installed !== undefined &&
+    row.offered !== undefined &&
+    row.installed.hash !== row.offered.blake3
+  );
+}
+
 function entryOf(value: unknown): RegistryEntry | null {
   if (typeof value !== "object" || value === null) return null;
   const record = value as Record<string, unknown>;
@@ -81,6 +143,9 @@ function entryOf(value: unknown): RegistryEntry | null {
   if (!name || !parseModuleDigest(blake3)) return null;
   return {
     name,
+    // Older registries have none; a missing sentence is not a broken entry.
+    description:
+      typeof record.description === "string" ? record.description : "",
     file: typeof record.file === "string" ? record.file : `${name}.wasm`,
     blake3: blake3.toLowerCase(),
     bytes: typeof record.bytes === "number" ? record.bytes : 0,

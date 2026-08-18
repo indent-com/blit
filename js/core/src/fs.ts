@@ -387,6 +387,110 @@ export function parseFsIndexResult(
   return { nonce, status, flags, paths };
 }
 
+// -- One-shot reads (no sync, docs/design/fs-read.md) -----------------------
+
+export const C2S_FS_READ = 0x4d;
+export const S2C_FS_READ = 0x48;
+
+/** Answer each group with the first path in it that can be read. */
+export const FS_READ_FIRST = 1 << 0;
+/** Answer which path, not what is in it. */
+export const FS_READ_NO_CONTENT = 1 << 1;
+
+export const FS_READ_MAX_PATHS = 512;
+
+/** One answered path. `content` is empty unless `status` is `FS_FILE_OK`, and
+ *  always empty when the request asked for no content. */
+export type FsReadRecord = {
+  status: number;
+  path: string;
+  content: Uint8Array;
+};
+
+/**
+ * [0x4D][nonce:2][flags:1][max_bytes:4][group_count:2] then group_count ×
+ * ( [path_count:2] then path_count × [path_len:2][path:N] ).
+ *
+ * A group is one question: with `FS_READ_FIRST` each is answered by its own
+ * first readable path, which is how one message resolves a search path per name.
+ */
+export function buildFsReadMessage(
+  nonce: number,
+  flags: number,
+  maxBytes: number,
+  groups: readonly (readonly string[])[],
+): Uint8Array {
+  const encoded = groups.map((group) =>
+    group.map((path) => textEncoder.encode(path)),
+  );
+  const total = encoded.reduce((sum, group) => sum + group.length, 0);
+  if (groups.length === 0 || total === 0 || total > FS_READ_MAX_PATHS) {
+    throw new RangeError(`fs read takes 1 to ${FS_READ_MAX_PATHS} paths`);
+  }
+  const bytes = encoded.reduce(
+    (sum, group) =>
+      sum + 2 + group.reduce((inner, path) => inner + 2 + path.length, 0),
+    0,
+  );
+  const msg = new Uint8Array(10 + bytes);
+  const v = new DataView(msg.buffer);
+  msg[0] = C2S_FS_READ;
+  v.setUint16(1, nonce, true);
+  msg[3] = flags;
+  v.setUint32(4, maxBytes, true);
+  v.setUint16(8, groups.length, true);
+  let off = 10;
+  for (const group of encoded) {
+    v.setUint16(off, group.length, true);
+    off += 2;
+    for (const path of group) {
+      v.setUint16(off, path.length, true);
+      off += 2;
+      msg.set(path, off);
+      off += path.length;
+    }
+  }
+  return msg;
+}
+
+/** [0x48][nonce:2][status:1][count:2][records:LZ4] where the decompressed
+ *  payload is repeated{ [status:1][path_len:2][path:N][size:4][data:size] }.
+ *  Applies the standard decompression guard; null = malformed. */
+export function parseFsReadResult(
+  data: Uint8Array,
+): { nonce: number; status: number; records: FsReadRecord[] } | null {
+  if (data.length < 6 || data[0] !== S2C_FS_READ) return null;
+  const v = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const nonce = v.getUint16(1, true);
+  const status = data[3];
+  const count = v.getUint16(4, true);
+  if (count > FS_READ_MAX_PATHS) return null;
+  const raw = fsDecompress(data.subarray(6));
+  if (!raw) return null;
+  const rv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+  const records: FsReadRecord[] = [];
+  let off = 0;
+  while (off < raw.length) {
+    if (off + 3 > raw.length) return null;
+    const recordStatus = raw[off]!;
+    const pathLength = rv.getUint16(off + 1, true);
+    off += 3;
+    if (off + pathLength + 4 > raw.length) return null;
+    const path = textDecoder.decode(raw.subarray(off, off + pathLength));
+    off += pathLength;
+    const size = rv.getUint32(off, true);
+    off += 4;
+    if (off + size > raw.length) return null;
+    records.push({
+      status: recordStatus,
+      path,
+      content: raw.slice(off, off + size),
+    });
+    off += size;
+  }
+  return records.length === count ? { nonce, status, records } : null;
+}
+
 // -- Content search (no sync, docs/design/fs-grep.md) -----------------------
 
 export const C2S_FS_GREP = 0x48;

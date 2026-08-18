@@ -1019,7 +1019,11 @@ impl Watcher {
                     }
                 }
             }
-            ChannelMessage::Opened { .. } => Ok(()),
+            // Both answer something a *client* asked. This extension only
+            // serves channels — it opens none and watches no names — so the
+            // arms are here to say so, rather than a wildcard that would
+            // swallow a future server-side message too.
+            ChannelMessage::Opened { .. } | ChannelMessage::Names { .. } => Ok(()),
         }
     }
 

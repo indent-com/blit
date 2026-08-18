@@ -10,25 +10,21 @@
 //! parsing every `index.theme` would be a directory walk and a read per theme
 //! before the first icon appears.
 //!
-//! So the shape is two shell round trips: one that stats candidate paths for a
-//! batch of names, and one that base64s the files the ranking picked. Shell,
-//! rather than the fs family, for the same reason [`super::main`] reads desktop
-//! files that way — one child and one round trip beats a sync session per file.
+//! So the shape is: rank every directory an icon could be in, once, and then ask
+//! for the first candidate that exists — one `FS_READ` per name carrying
+//! `dir/name.ext` in preference order with `FS_READ_FIRST` set, which is one
+//! message and no child process. This used to build shell scripts, because the
+//! fs family had no one-shot read and a sync session per file is the wrong
+//! shape; `FS_READ` (docs/design/fs-read.md) is that read.
 //!
-//! Everything here is pure string work so it can be tested natively; the host
-//! only ever runs the scripts these build and hands back what they printed.
+//! Everything here is pure string and byte work so it can be tested natively;
+//! the host only ever answers the paths these produce.
 
 extern crate alloc;
 
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-
-/// Separates one section of a script's output from the next.
-///
-/// Printable for the same reason the desktop reader's is: a NUL cannot survive
-/// a POSIX `printf` format string. No icon name or path can begin with it.
-pub const SEPARATOR: &str = "@@@blit-icon@@@";
 
 /// The pixel size a raster icon is ranked against.
 ///
@@ -38,15 +34,25 @@ pub const SEPARATOR: &str = "@@@blit-icon@@@";
 /// that get thrown away on the way to the element.
 const TARGET_PIXELS: u32 = 128;
 
-/// Largest file worth carrying. A handful of themes ship megabyte SVGs with
-/// every gradient the artist owned; that is not a panel icon.
-pub const MAX_ICON_BYTES: u64 = 128 * 1024;
+/// Largest file this will point the panel at.
+///
+/// A ceiling rather than a budget now: nothing here carries the bytes, so the
+/// only cost of a big file is the transfer the panel chooses to make. It used to
+/// be 128 KiB because every icon was base64`d into a JSON string inside this
+/// interpreter and had to fit one channel message — which is why Steam, whose
+/// habit is to write one full-size PNG into *every* size bucket (a 604 KB
+/// `16x16/apps/steam_icon_327030.png`), left three rows in two hundred with a
+/// letter tile and no bug behind it. Those rows have their artwork now.
+///
+/// A megabyte is still a limit: a theme that ships a five-megabyte SVG of every
+/// gradient the artist owned is not offering a panel icon.
+pub const MAX_ICON_BYTES: u32 = 1024 * 1024;
 
 /// Whether an `Icon=` value is a plain name this can look up.
 ///
-/// The scripts interpolate the name into single quotes, so the rule is not
-/// "escape it" but "refuse anything that would need escaping". An icon name
-/// with a quote or a slash in it is not a thing that exists.
+/// A name is joined onto every directory on the icon path, so the rule is that
+/// it must be one path component and nothing else: an `Icon=` with a slash, a
+/// quote or a control character in it is not a thing that exists.
 pub fn is_lookup_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
@@ -55,43 +61,43 @@ pub fn is_lookup_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
 }
 
-/// Whether a path can be interpolated into a script and read.
+/// Whether a path is one this will read.
 ///
-/// Absolute `Icon=` values are legal and common in third-party packages, and
-/// the second script also reads paths this module's own glob produced.
+/// Absolute `Icon=` values are legal and common in third-party packages. The
+/// bound is the protocol's, not a shell's: a path is a length-prefixed field
+/// now, so the only rule left is that it be absolute and of a sane size.
 pub fn is_readable_path(path: &str) -> bool {
-    path.starts_with('/')
-        && !path.contains('\'')
-        && !path.contains('\n')
-        && !path.contains('\r')
-        && path.len() <= 1024
+    path.starts_with('/') && !path.contains('\n') && path.len() <= 1024
 }
 
-/// A script that lists the directories icons could be in, one line each.
+/// Whether a directory found under an icon root is one icons live in.
 ///
-/// Run once and cached, because it is the only part of this that depends on
-/// what is installed rather than on what is being asked for: two globs cover
-/// both layouts in the wild — `theme/size/category` and `theme/category/size` —
-/// and expanding them is the expensive half. Ranked afterwards by
-/// [`rank_directories`], which is what turns the cached list into a preference
-/// order a shell can walk without knowing anything about icon sizes.
-pub fn directories_script(theme_roots: &[String], flat_roots: &[String]) -> Option<String> {
-    let mut script = String::new();
-    for root in theme_roots.iter().filter(|root| !root.contains('\'')) {
-        script.push_str(&format!(
-            "for d in '{root}'/*/*/apps '{root}'/*/apps/* '{root}'/apps; do \
-             [ -d \"$d\" ] && printf '%s\\n' \"$d\"; done; "
-        ));
+/// `rel` is root-relative, as `FS_INDEX` reports it. Both layouts in the wild
+/// put the category last or second — `theme/size/apps`, `theme/apps/size` — and
+/// the flat roots have no category at all, so the test is simply that some
+/// component says `apps`. A directory called that under an icon root, holding
+/// something other than application icons, is not a thing that happens.
+pub fn is_icon_dir(rel: &str) -> bool {
+    rel.split('/').any(|component| component == "apps")
+}
+
+/// Every file that could hold `name`'s artwork, best directory first.
+///
+/// One `FS_READ` with `FS_READ_FIRST` over this list is the whole search: the
+/// server stops at the first path that exists and is small enough, which — the
+/// directories being ranked — is also the one the ranking would have chosen.
+/// SVG before PNG within a directory, because a vector is the smaller file at
+/// any size that matters here.
+pub fn candidates(dirs: &[String], name: &str) -> Vec<String> {
+    if !is_lookup_name(name) {
+        return Vec::new();
     }
-    // Pixmaps is flat: the name sits directly in it, with no theme or size.
-    for root in flat_roots.iter().filter(|root| !root.contains('\'')) {
-        script.push_str(&format!("[ -d '{root}' ] && printf '%s\\n' '{root}'; "));
+    let mut out = Vec::with_capacity(dirs.len() * 2);
+    for dir in dirs {
+        out.push(format!("{dir}/{name}.svg"));
+        out.push(format!("{dir}/{name}.png"));
     }
-    if script.is_empty() {
-        return None;
-    }
-    script.push_str("true");
-    Some(script)
+    out
 }
 
 /// Order the candidate directories best-first, so the first hit is the answer.
@@ -128,96 +134,6 @@ fn directory_rank(dir: &str) -> (u8, u32) {
     }
 }
 
-/// A script that finds and reads one icon per name, in a single pass.
-///
-/// The whole resolution in one child: walking the ranked directories in order
-/// means the first file that exists is also the one the ranking would have
-/// picked, so there is no reason to report candidates back and ask again. That
-/// second round trip was most of the latency — a batch cost two spawns, and a
-/// list being scrolled needs one batch per screen.
-///
-/// A file over [`MAX_ICON_BYTES`] is skipped rather than accepted, so an
-/// application whose 512px art is a megabyte still gets its 64px tile.
-///
-/// Each section is the name, then the path, then the base64 — the path because
-/// the extension is what the format is read from, and a name that matched
-/// nothing has an empty section rather than no section at all.
-pub fn fetch_script(dirs: &[String], names: &[&str]) -> Option<String> {
-    let names: Vec<&str> = names
-        .iter()
-        .copied()
-        .filter(|name| is_lookup_name(name))
-        .collect();
-    if names.is_empty() || dirs.is_empty() {
-        return None;
-    }
-    let mut script = String::from("set --");
-    for dir in dirs.iter().filter(|dir| !dir.contains('\'')) {
-        script.push_str(&format!(" '{dir}'"));
-    }
-    script.push_str("; for n in");
-    for name in &names {
-        script.push_str(&format!(" '{name}'"));
-    }
-    // `break 2` leaves both the extension loop and the directory loop: one
-    // answer per name, and the search stops at it.
-    script.push_str(&format!(
-        "; do printf '{SEPARATOR}%s\\n' \"$n\"; for d in \"$@\"; do \
-         for e in svg png; do f=\"$d/$n.$e\"; \
-         if [ -f \"$f\" ] && [ \"$(wc -c < \"$f\")\" -le {MAX_ICON_BYTES} ]; then \
-         printf '%s\\n' \"$f\"; base64 \"$f\" | tr -d '\\n'; printf '\\n'; break 2; \
-         fi; done; done; done; true"
-    ));
-    Some(script)
-}
-
-/// A script that base64s each path, skipping anything too big to be an icon.
-///
-/// Only absolute `Icon=` values reach this; a name goes through
-/// [`fetch_script`], which does the same reading as part of the search.
-///
-/// The section header is printed before the size check, so a file that is
-/// missing or oversized comes back as an empty body rather than as a gap the
-/// caller would have to align by position.
-pub fn read_script(paths: &[&str]) -> Option<String> {
-    let paths: Vec<&str> = paths
-        .iter()
-        .copied()
-        .filter(|path| is_readable_path(path))
-        .collect();
-    if paths.is_empty() {
-        return None;
-    }
-    let mut script = String::from("for p in");
-    for path in &paths {
-        script.push_str(&format!(" '{path}'"));
-    }
-    script.push_str(&format!(
-        "; do printf '{SEPARATOR}%s\\n' \"$p\"; \
-         if [ -f \"$p\" ] && [ \"$(wc -c < \"$p\")\" -le {MAX_ICON_BYTES} ]; then \
-         base64 \"$p\" | tr -d '\\n'; fi; printf '\\n'; done"
-    ));
-    Some(script)
-}
-
-/// Split a script's output into `(header, body lines)` sections.
-///
-/// Output before the first separator is dropped: a shell that printed a warning
-/// to the merged stderr must not have it read as an icon path.
-pub fn sections(output: &str) -> Vec<(&str, Vec<&str>)> {
-    let mut out = Vec::new();
-    for chunk in output.split(SEPARATOR).skip(1) {
-        let Some((header, body)) = chunk.split_once('\n') else {
-            continue;
-        };
-        out.push((
-            header,
-            body.lines().filter(|line| !line.is_empty()).collect(),
-        ));
-    }
-    out
-}
-
 /// The pixel size a themed icon directory promises, if its name says one.
 ///
 /// `48x48` is 48, and `48x48@2` is 96 — a scale suffix means the same nominal
@@ -238,21 +154,12 @@ fn directory_pixels(component: &str) -> Option<u32> {
 
 /// How good a candidate is: lower sorts first.
 ///
-/// Wrap base64 bytes as a data URL, if the extension names a format a browser
-/// will draw. XPM is deliberately absent: nothing renders it, and a pixmap-only
-/// application is better served by the panel's own fallback.
-pub fn data_url(path: &str, base64: &str) -> Option<String> {
-    if base64.is_empty() {
-        return None;
-    }
-    let mime = if path.ends_with(".svg") {
-        "image/svg+xml"
-    } else if path.ends_with(".png") {
-        "image/png"
-    } else {
-        return None;
-    };
-    Some(format!("data:{mime};base64,{base64}"))
+/// Whether a file a browser is being pointed at is one it will draw.
+///
+/// XPM is deliberately absent: nothing renders it, and a pixmap-only application
+/// is better served by the panel's own letter tile than by a broken image.
+pub fn is_drawable_path(path: &str) -> bool {
+    path.ends_with(".svg") || path.ends_with(".png")
 }
 
 /// The icon path, from the same environment the catalog was read with.
@@ -348,7 +255,7 @@ mod tests {
         assert_eq!(rank_directories(&dirs), vec![dirs[0], dirs[1]]);
         assert!(rank_directories(&[]).is_empty());
         // A path that could not be interpolated safely is not a directory.
-        assert!(rank_directories(&["relative/icons", "/it's/icons"]).is_empty());
+        assert!(rank_directories(&["relative/icons"]).is_empty());
     }
 
     #[test]
@@ -357,85 +264,56 @@ mod tests {
         assert!(is_lookup_name("gimp-2.10"));
         assert!(!is_lookup_name(""));
         assert!(!is_lookup_name("../../etc/passwd"));
-        assert!(!is_lookup_name("x'; rm -rf /; '"));
+        assert!(!is_lookup_name("x/../y"));
         assert!(!is_lookup_name("with space"));
     }
 
+    /// The directories are already ranked, so a `FIRST` read over this list is
+    /// the whole search — the first hit is the one the ranking would have picked.
     #[test]
-    fn a_fetch_needs_both_a_directory_and_a_name() {
-        let dirs = vec!["/usr/share/icons/hicolor/128x128/apps".to_string()];
-        assert!(fetch_script(&dirs, &["firefox"]).is_some());
-        assert!(fetch_script(&[], &["firefox"]).is_none());
-        assert!(fetch_script(&dirs, &[]).is_none());
-        // Every name refused leaves nothing to ask for.
-        assert!(fetch_script(&dirs, &["a b"]).is_none());
-    }
-
-    #[test]
-    fn a_directory_sweep_needs_a_root() {
-        let roots = vec!["/usr/share/icons".to_string()];
-        assert!(directories_script(&roots, &[]).is_some());
-        assert!(directories_script(&[], &[]).is_none());
-        // A root that would need escaping is refused, and refusing every root
-        // leaves nothing to sweep.
-        assert!(directories_script(&["/it's/icons".to_string()], &[]).is_none());
-    }
-
-    /// The script stops at the first file it finds, so its own loop order is
-    /// the ranking. `break 2` is what leaves both loops rather than only the
-    /// extension one, which would go on to test every remaining directory.
-    #[test]
-    fn a_fetch_stops_at_the_first_hit() {
+    fn candidates_are_every_directory_in_order_and_both_formats() {
         let dirs = vec!["/a".to_string(), "/b".to_string()];
-        let script = fetch_script(&dirs, &["x"]).expect("builds");
-        assert!(script.contains("set -- '/a' '/b'"));
-        assert!(script.contains("break 2"));
-        // Both formats, scalable first within a directory.
-        assert!(script.contains("for e in svg png"));
+        assert_eq!(
+            candidates(&dirs, "x"),
+            vec![
+                "/a/x.svg".to_string(),
+                "/a/x.png".to_string(),
+                "/b/x.svg".to_string(),
+                "/b/x.png".to_string(),
+            ]
+        );
+        // A name that is not one path component asks for nothing at all.
+        assert!(candidates(&dirs, "a b").is_empty());
+        assert!(candidates(&dirs, "../../etc/passwd").is_empty());
+        assert!(candidates(&[], "x").is_empty());
     }
 
-    /// The whole point of the separator is that a name comes back as a section
-    /// even when it matched nothing — an absent section and an empty one would
-    /// otherwise be told apart only by counting.
+    /// Both layouts in the wild, plus the flat roots that have no category.
     #[test]
-    fn sections_survive_empty_bodies_and_leading_noise() {
-        let output = format!(
-            "sh: warning\n{SEPARATOR}firefox\n/i/h/128x128/apps/firefox.png\nAAAA\n{SEPARATOR}nope\n"
-        );
-        let parsed = sections(&output);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].0, "firefox");
-        assert_eq!(
-            parsed[0].1,
-            vec!["/i/h/128x128/apps/firefox.png", "AAAA"],
-            "path first, then the base64 that names its format"
-        );
-        assert_eq!(parsed[1].0, "nope");
-        assert!(parsed[1].1.is_empty());
+    fn an_icon_directory_is_one_with_an_apps_component() {
+        assert!(is_icon_dir("hicolor/128x128/apps"));
+        assert!(is_icon_dir("Adwaita/apps/48x48"));
+        assert!(is_icon_dir("apps"));
+        assert!(!is_icon_dir("hicolor/128x128/mimetypes"));
+        assert!(!is_icon_dir("hicolor"));
     }
 
+    /// Nothing else renders, and a broken image is worse than a letter tile.
     #[test]
-    fn a_data_url_needs_a_format_a_browser_draws() {
-        assert_eq!(
-            data_url("/i/x.png", "AAAA").as_deref(),
-            Some("data:image/png;base64,AAAA")
-        );
-        assert_eq!(
-            data_url("/i/x.svg", "AAAA").as_deref(),
-            Some("data:image/svg+xml;base64,AAAA")
-        );
-        assert!(data_url("/i/x.xpm", "AAAA").is_none());
-        // An empty body is what an oversized or missing file leaves behind.
-        assert!(data_url("/i/x.png", "").is_none());
+    fn only_formats_a_browser_draws_are_offered() {
+        assert!(is_drawable_path("/i/x.png"));
+        assert!(is_drawable_path("/i/x.svg"));
+        assert!(!is_drawable_path("/i/x.xpm"));
+        assert!(!is_drawable_path("/i/x"));
     }
 
     #[test]
     fn absolute_icon_paths_are_readable_and_relative_ones_are_not() {
         assert!(is_readable_path("/opt/app/icon.png"));
         assert!(!is_readable_path("icon.png"));
-        assert!(!is_readable_path("/opt/it's/icon.png"));
-        assert!(read_script(&["relative.png"]).is_none());
-        assert!(read_script(&["/opt/a.png"]).is_some());
+        // A quote is now just a character: nothing interpolates a path.
+        assert!(is_readable_path("/opt/it's/icon.png"));
+        assert!(!is_readable_path("/opt/two\nlines.png"));
     }
 
     #[test]

@@ -71,7 +71,7 @@ const CATALOG_TTL: Duration = Duration::from_secs(60);
 /// would be a way to stall the supervisor from the browser.
 const MAX_ICON_REQUEST: usize = 48;
 
-/// Resolved artwork kept in the guest before the cache is dropped wholesale.
+/// Resolved icon paths kept in the guest before the cache is dropped wholesale.
 ///
 /// Measured in bytes rather than entries because the entries are not
 /// comparable: a themed SVG is 3 KB and a 128px PNG can be [`icon::MAX_ICON_BYTES`],
@@ -83,7 +83,12 @@ const MAX_ICON_REQUEST: usize = 48;
 /// Clearing rather than evicting the oldest entry keeps the bookkeeping to a
 /// comparison: a miss costs one shell round trip, and the panel has its own
 /// cache, so nothing already on screen pays for it.
-const MAX_CACHED_ICON_BYTES: usize = 4 * 1024 * 1024;
+///
+/// Large enough to hold one whole request — [`MAX_ICON_REQUEST`] files of
+/// [`icon::MAX_ICON_BYTES`] come to about 8 MiB once base64 has grown them by a
+/// third. Below that a single scroll of big artwork is guaranteed to clear the
+/// cache it is still filling, which costs a re-read of everything it just did.
+const MAX_CACHED_ICON_BYTES: usize = 12 * 1024 * 1024;
 
 /// Icon messages a connection may have waiting on credit.
 ///
@@ -298,19 +303,26 @@ fn run(mut client: Client) -> Result<(), Error> {
 /// the C0 range — an application name is arbitrary text from a `.desktop` file.
 fn push_json_string(out: &mut String, value: &str) {
     out.push('"');
-    for c in value.chars() {
-        match c {
+    // Copied in runs rather than character by character. This is the hot loop of
+    // the whole extension: an icon is a 30 KB data URL of base64, none of which
+    // needs escaping, and pushing that a `char` at a time cost seconds per
+    // screenful in an interpreter.
+    let mut rest = value;
+    while let Some(at) = rest.find(|c: char| c == '"' || c == '\\' || (c as u32) < 0x20) {
+        out.push_str(&rest[..at]);
+        let mut chars = rest[at..].chars();
+        let escaped = chars.next().unwrap_or(' ');
+        match escaped {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
+            other => out.push_str(&format!("\\u{:04x}", other as u32)),
         }
+        rest = chars.as_str();
     }
+    out.push_str(rest);
     out.push('"');
 }
 
@@ -388,15 +400,37 @@ fn state_json(state: &State, with_catalog: bool) -> String {
 /// panel records it so it stops asking. That is why this is a message per id
 /// rather than a map of the ones that were found: a silent omission would be
 /// indistinguishable from a reply still in flight.
-fn icon_json(id: &str, data_url: Option<&str>) -> String {
+fn icon_json(id: &str, path: Option<&str>) -> String {
     let mut out = String::from("{\"type\":\"icon\",\"id\":");
     push_json_string(&mut out, id);
-    if let Some(data_url) = data_url {
-        out.push_str(",\"icon\":");
-        push_json_string(&mut out, data_url);
+    if let Some(path) = path {
+        out.push_str(",\"path\":");
+        push_json_string(&mut out, path);
     }
     out.push('}');
     out
+}
+
+/// Pair each requested id with what this batch resolved for its `Icon=` key.
+///
+/// An id whose key is absent from `resolved` is **omitted** rather than answered
+/// "no artwork". The two are not interchangeable: the panel records "no artwork"
+/// as final and never asks again, while an id it hears nothing about goes back
+/// on the queue once it stops counting it as outstanding. So absence here means
+/// "ask me later", and only a key that was genuinely looked for and not found
+/// answers `None`.
+fn batch_answers(
+    keys: Vec<(String, Option<String>)>,
+    resolved: &BTreeMap<String, Option<String>>,
+) -> Vec<(String, Option<String>)> {
+    keys.into_iter()
+        .filter_map(|(id, key)| match key {
+            // No usable `Icon=` at all: there is nothing to look for, and
+            // nothing a later request could find either.
+            None => Some((id, None)),
+            Some(key) => resolved.get(&key).map(|found| (id, found.clone())),
+        })
+        .collect()
 }
 
 /// Answer a panel's icon request, reading whatever is not already cached.
@@ -407,6 +441,14 @@ fn icon_json(id: &str, data_url: Option<&str>) -> String {
 /// the only thing rereading it could add is a random half-second stall in the
 /// middle of a scroll. An id this does not recognise is answered "no artwork",
 /// which is what it will be until the panel resyncs anyway.
+///
+/// What this batch resolved is held here and answered from here, never read back
+/// out of [`State::icons`]: that cache is dropped wholesale when it grows past
+/// [`MAX_CACHED_ICON_BYTES`], and at [`icon::MAX_ICON_BYTES`] per file it can
+/// hit that limit *part way through one batch*. Answering from it afterwards
+/// reported every icon cached before the drop as "no artwork" — which the panel
+/// believes forever, so a scrolled list grew a permanent gap exactly one
+/// cache-worth long, and the row after it was fine.
 fn resolve_icons(
     client: &mut Client,
     state: &mut State,
@@ -427,10 +469,12 @@ fn resolve_icons(
         .collect();
 
     // A name is looked up once however many applications name it.
+    let mut resolved: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut lookups: Vec<String> = Vec::new();
     let mut absolute: Vec<String> = Vec::new();
     for key in keys.iter().filter_map(|(_, key)| key.as_ref()) {
-        if state.icons.contains_key(key) {
+        if let Some(cached) = state.icons.get(key) {
+            resolved.insert(key.clone(), cached.clone());
             continue;
         }
         let bucket = if key.starts_with('/') {
@@ -443,60 +487,85 @@ fn resolve_icons(
         }
     }
 
-    // Names: found and read in one pass over the ranked directories, so the
-    // first file that exists is also the one the ranking would have chosen.
+    // Names: one message for the whole batch. Each name is a group of ranked
+    // candidates and `FS_READ_FIRST` answers each group with its own first hit,
+    // so the batch costs one round trip rather than one per name — which is what
+    // it cost when every name was its own request, and that was most of the time
+    // a screenful of artwork took.
     if !lookups.is_empty() {
         refresh_icon_dirs(client, state);
-        let names: Vec<&str> = lookups.iter().map(String::as_str).collect();
-        let script = icon::fetch_script(&state.icon_dirs, &names);
-        let output =
-            script.and_then(|script| run_capturing(client, state, &["/bin/sh", "-c", &script]));
-        if let Some(output) = output {
-            for (name, body) in icon::sections(&output) {
-                // Path first, base64 second; an empty section is a name that
-                // matched nothing anywhere on the icon path.
-                let data_url = match (body.first(), body.get(1)) {
-                    (Some(path), Some(base64)) => icon::data_url(path, base64),
-                    _ => None,
-                };
-                state.cache_icon(name.to_string(), data_url);
-            }
-        }
-        // Whatever the child never reported on — it failed, or the script could
-        // not be built — is a miss. Caching that is what stops a row whose
-        // artwork cannot be had from spawning a child on every redraw.
+        let dirs = state.icon_dirs.clone();
+        let mut asked: Vec<&String> = Vec::new();
+        let mut candidates: Vec<Vec<String>> = Vec::new();
         for name in &lookups {
-            if !state.icons.contains_key(name) {
+            let paths = icon::candidates(&dirs, name);
+            if paths.is_empty() {
                 state.cache_icon(name.clone(), None);
+                resolved.insert(name.clone(), None);
+                continue;
             }
+            asked.push(name);
+            candidates.push(paths);
+        }
+        // The protocol bounds the paths one message may carry, so a long icon
+        // path means fewer names per message rather than a refused request.
+        let per_message = (remote::fs::FS_READ_MAX_PATHS / (dirs.len() * 2).max(1)).max(1);
+        let mut at = 0;
+        while at < candidates.len() {
+            let end = (at + per_message).min(candidates.len());
+            let groups: Vec<Vec<&str>> = candidates[at..end]
+                .iter()
+                .map(|paths| paths.iter().map(String::as_str).collect())
+                .collect();
+            let borrowed: Vec<&[&str]> = groups.iter().map(Vec::as_slice).collect();
+            // No reply says nothing about these names, so they are neither
+            // answered nor cached: the panel asks again and the next request
+            // gets a fresh attempt rather than a remembered failure.
+            // Which file, not what is in it: the panel reads the bytes itself,
+            // so this asks for a stat per candidate and carries none of them.
+            let Some(records) = fs_read(
+                client,
+                state,
+                remote::fs::FS_READ_FIRST | remote::fs::FS_READ_NO_CONTENT,
+                icon::MAX_ICON_BYTES,
+                &borrowed,
+            ) else {
+                break;
+            };
+            // One record per group, in group order.
+            for (name, (status, path, _)) in asked[at..end].iter().zip(records) {
+                let found = (status == remote::fs::FS_FILE_OK && icon::is_drawable_path(&path))
+                    .then_some(path);
+                state.cache_icon((*name).clone(), found.clone());
+                resolved.insert((*name).clone(), found);
+            }
+            at = end;
         }
     }
 
     // Absolute `Icon=` values need no search, only the read.
     if !absolute.is_empty() {
-        let paths: Vec<&str> = absolute.iter().map(String::as_str).collect();
-        let script = icon::read_script(&paths);
-        let output =
-            script.and_then(|script| run_capturing(client, state, &["/bin/sh", "-c", &script]));
-        if let Some(output) = output {
-            for (path, body) in icon::sections(&output) {
-                let data_url = icon::data_url(path, body.first().copied().unwrap_or(""));
-                state.cache_icon(path.to_string(), data_url);
-            }
-        }
-        for path in &absolute {
-            if !state.icons.contains_key(path) {
-                state.cache_icon(path.clone(), None);
+        for batch in absolute.chunks(remote::fs::FS_READ_MAX_PATHS) {
+            let paths: Vec<&str> = batch.iter().map(String::as_str).collect();
+            let Some(records) = fs_read(
+                client,
+                state,
+                remote::fs::FS_READ_NO_CONTENT,
+                icon::MAX_ICON_BYTES,
+                &[paths.as_slice()],
+            ) else {
+                break;
+            };
+            for (status, path, _) in records {
+                let found = (status == remote::fs::FS_FILE_OK && icon::is_drawable_path(&path))
+                    .then(|| path.clone());
+                state.cache_icon(path.clone(), found.clone());
+                resolved.insert(path, found);
             }
         }
     }
 
-    keys.into_iter()
-        .map(|(id, key)| {
-            let data_url = key.and_then(|key| state.icons.get(&key).cloned().flatten());
-            (id, data_url)
-        })
-        .collect()
+    batch_answers(keys, &resolved)
 }
 
 /// Expand the icon path's globs into a ranked directory list, once.
@@ -508,15 +577,27 @@ fn refresh_icon_dirs(client: &mut Client, state: &mut State) {
     if !state.icon_dirs.is_empty() {
         return;
     }
-    let Some(script) = icon::directories_script(&state.icon_theme_roots, &state.icon_flat_roots)
-    else {
-        return;
-    };
-    let Some(output) = run_capturing(client, state, &["/bin/sh", "-c", &script]) else {
-        return;
-    };
-    let dirs: Vec<&str> = output.lines().filter(|line| !line.is_empty()).collect();
-    state.icon_dirs = icon::rank_directories(&dirs);
+    let theme_roots = state.icon_theme_roots.clone();
+    let mut dirs: Vec<String> = Vec::new();
+    for root in &theme_roots {
+        // Directories only: an icon theme is a few dozen directories holding
+        // tens of thousands of files, and this wants somewhere to look.
+        // Following links is what makes a Nix system tree visible: every
+        // directory under /run/current-system/sw/share/icons is one, so a walk
+        // that stops at them reports a theme name and nothing inside it.
+        let flags = remote::fs::FS_INDEX_DIRS_ONLY | remote::fs::FS_INDEX_FOLLOW_LINKS;
+        for rel in fs_index(client, state, root, flags) {
+            if icon::is_icon_dir(&rel) {
+                dirs.push(format!("{root}/{rel}"));
+            }
+        }
+    }
+    // Pixmaps is flat — the name sits directly in it — so it is a candidate
+    // without a listing. One that does not exist costs a stat per lookup and
+    // answers nothing, which is the same as not being there.
+    dirs.extend(state.icon_flat_roots.iter().cloned());
+    let borrowed: Vec<&str> = dirs.iter().map(String::as_str).collect();
+    state.icon_dirs = icon::rank_directories(&borrowed);
 }
 
 /// Send one JSON message to one connection, respecting its credit.
@@ -565,11 +646,20 @@ fn send_json(client: &mut Client, conn: &mut Conn, payload: &str) -> bool {
 /// icons to rows by id, but a viewer watching them appear should see them in
 /// the order they were asked for.
 fn flush_queued(client: &mut Client, conn: &mut Conn) {
-    while let Some(payload) = conn.queued.first().cloned() {
+    // Taken rather than cloned, and drained once at the end: a queued icon is
+    // 30 KB, so copying each one to send it — and memmoving the rest of the
+    // queue after every send — was pure overhead on the path that matters.
+    let mut sent = 0;
+    while sent < conn.queued.len() {
+        let payload = core::mem::take(&mut conn.queued[sent]);
         if !send_json(client, conn, &payload) {
-            return;
+            conn.queued[sent] = payload;
+            break;
         }
-        conn.queued.remove(0);
+        sent += 1;
+    }
+    if sent > 0 {
+        conn.queued.drain(..sent);
     }
 }
 
@@ -706,6 +796,10 @@ fn on_channel(client: &mut Client, state: &mut State, packet: &[u8]) {
                         app.failures = 0;
                         app.next_attempt_ns = None;
                         if app.phase != Phase::Running {
+                            // Transient, not enabled: the supervisor only
+                            // launches what it has been told to want, and
+                            // this is how a one-off run says so.
+                            app.transient = true;
                             app.phase = Phase::Idle;
                         }
                     }
@@ -775,6 +869,9 @@ fn halt_app(client: &mut Client, state: &mut State, id: &str) {
         return;
     };
     app.phase = Phase::Stopped;
+    // Calling off a run that was never adopted: the request goes with it, or
+    // the next reconcile would start what was just stopped.
+    app.transient = false;
     app.next_attempt_ns = None;
     app.wayland_display = None;
     app.started_at_ns = None;
@@ -883,8 +980,28 @@ fn route(client: &mut Client, state: &mut State, packet: &[u8]) -> bool {
             let Ok(started) = remote::process::parse_process_started(packet) else {
                 return false;
             };
+            // A refused spawn is the only word this will ever get: there is no
+            // child, so no exit is coming either. Dropping it left the
+            // application in `Running` with nothing running — for the rest of
+            // the session, since `attempt_due` does not reconsider a phase it
+            // believes. An entry whose `Exec` names a binary that is not there
+            // is the ordinary way to reach this.
+            //
+            // Counted as a failed run, exactly as `reconcile` treats a launch
+            // that could not even be sent: an enabled application backs off and
+            // tries again, a one-off run stops.
             if started.status != remote::STATUS_OK {
-                return false;
+                let now = client.monotonic_now().raw_nanos();
+                let mut random = [0u8; 8];
+                let _ = client.random(&mut random);
+                if let Some(app) = state
+                    .apps
+                    .values_mut()
+                    .find(|app| app.process_id == Some(started.process_id))
+                {
+                    app.note_exit(-1, now, u64::from_le_bytes(random));
+                }
+                return true;
             }
             let Some(app) = state
                 .apps
@@ -1337,110 +1454,136 @@ fn refresh_installed(client: &mut Client, state: &mut State) -> Result<(), Error
     Ok(())
 }
 
-/// Sentinel separating one desktop file from the next in the reader's output.
-///
-/// Printable on purpose: a NUL cannot be carried through a POSIX `printf`
-/// format string, so a non-printing separator silently collapses and every file
-/// runs together. `@` starts neither a group header nor a comment nor a key, so
-/// this cannot occur at the start of a line in a well-formed desktop entry.
-const FILE_SEPARATOR: &str = "@@@blit-entry@@@";
+/// Largest `.desktop` file worth reading. The spec's entries are a few hundred
+/// bytes; anything at this size is not one, and reading it would only crowd out
+/// the rest of the batch.
+const MAX_DESKTOP_BYTES: u32 = 64 * 1024;
 
-/// Read every `*.desktop` under a set of directories in one shot.
+/// Read every `*.desktop` under a set of directories.
 ///
-/// This spawns a shell rather than using the fs family, which is built around
-/// established sync sessions for an editor to watch a tree — the wrong shape for
-/// reading a fixed set of files once at startup. One child, one round trip, and
-/// a missing directory is simply skipped, which matters because most of
-/// `XDG_DATA_DIRS` does not exist on any given machine.
+/// Two messages per root and no child process: `FS_INDEX` for what is there,
+/// then `FS_READ` for the entries themselves. This used to be a shell loop over
+/// a glob with `cat`, because the fs family could only read inside an established
+/// sync session — a watched tree, the wrong shape for reading a fixed set of
+/// files once at startup. A root that does not exist answers an empty listing,
+/// which matters because most of `XDG_DATA_DIRS` is absent on any given machine.
 fn read_desktop_files(
     client: &mut Client,
     state: &mut State,
     roots: &[String],
 ) -> Vec<(String, String)> {
-    if roots.is_empty() {
-        return Vec::new();
-    }
-    let mut script = String::new();
-    for root in roots {
-        // Quote for the shell by refusing anything that would need escaping:
-        // an XDG path with a quote in it is not worth supporting.
-        if root.contains('\'') {
-            continue;
-        }
-        script.push_str(&format!(
-            "for f in '{root}'/*.desktop; do [ -f \"$f\" ] || continue; \
-             printf '{FILE_SEPARATOR}%s\\n' \"$f\"; cat \"$f\"; done; "
-        ));
-    }
-    if script.is_empty() {
-        return Vec::new();
-    }
-    let Some(output) = run_capturing(client, state, &["/bin/sh", "-c", &script]) else {
-        return Vec::new();
-    };
-
     let mut out = Vec::new();
-    for chunk in output.split(FILE_SEPARATOR).skip(1) {
-        let Some((path, contents)) = chunk.split_once('\n') else {
-            continue;
-        };
-        out.push((path.to_string(), contents.to_string()));
+    for root in roots {
+        // Root-relative, so a nested `kde4/foo.desktop` keeps its subdirectory.
+        let entries: Vec<String> = fs_index(client, state, root, 0)
+            .into_iter()
+            .filter(|rel| rel.ends_with(".desktop"))
+            .map(|rel| format!("{root}/{rel}"))
+            .collect();
+        for batch in entries.chunks(remote::fs::FS_READ_MAX_PATHS) {
+            let paths: Vec<&str> = batch.iter().map(String::as_str).collect();
+            let Some(records) = fs_read(client, state, 0, MAX_DESKTOP_BYTES, &[paths.as_slice()])
+            else {
+                return out;
+            };
+            for (status, path, body) in records {
+                if status != remote::fs::FS_FILE_OK {
+                    continue;
+                }
+                // Lossy on purpose: one entry with a stray byte in it must not
+                // discard the file, let alone the catalog.
+                out.push((path, String::from_utf8_lossy(&body).into_owned()));
+            }
+        }
     }
     out
 }
 
-/// Spawn a child, collect its stdout, and return it once it exits.
-fn run_capturing(client: &mut Client, state: &mut State, argv: &[&str]) -> Option<String> {
-    let process_id = state.next_process_id();
-    let argv_bytes: Vec<&[u8]> = argv.iter().map(|arg| arg.as_bytes()).collect();
-    let request = remote::process::ProcessSpawnRequest {
-        nonce: state.next_nonce(),
-        process_id,
-        flags: remote::process::PROCESS_SPAWN_MERGE_STDERR,
-        cwd_kind: remote::process::PROCESS_CWD_DEFAULT,
-        src_pty_id: 0,
-        cwd: b"",
-        argv: argv_bytes,
-        env: Vec::new(),
-    };
-    let message = remote::process::msg_process_spawn(&request).ok()?;
-    client.send(&message).ok()?;
+/// Read a batch of paths in one round trip (`docs/design/fs-read.md`).
+///
+/// Every record comes back in request order with its own status, so a missing or
+/// oversized file is an answer about that path rather than a failure of the
+/// batch. `None` means the request never got a reply — the connection is going
+/// away — which is the only case a caller has to treat as "ask again later".
+fn fs_read(
+    client: &mut Client,
+    state: &mut State,
+    flags: u8,
+    max_bytes: u32,
+    groups: &[&[&str]],
+) -> Option<Vec<(u8, String, Vec<u8>)>> {
+    let nonce = fs_read_send(client, state, flags, max_bytes, groups)?;
+    fs_read_collect(client, nonce)
+}
 
-    let mut collected = Vec::new();
-    loop {
-        // Only this child's frames: another app's exit must not be consumed
-        // here, or the supervisor would never see it.
-        let packet = client
-            .recv_matching(|packet| {
-                matches!(
-                    packet.first().copied(),
-                    Some(remote::process::S2C_PROCESS_STDOUT)
-                        | Some(remote::process::S2C_PROCESS_EXIT)
-                ) && packet.get(1..5) == Some(&process_id.to_le_bytes()[..])
-            })
-            .ok()??;
-        match packet.first().copied() {
-            Some(remote::process::S2C_PROCESS_STDOUT) => {
-                let Ok(output) = remote::process::parse_process_stdout(&packet) else {
-                    break;
-                };
-                collected.extend_from_slice(output.data);
-                // The server bounds unacknowledged output and kicks the
-                // endpoint past the window, so a catalog larger than it must
-                // be acknowledged as it arrives rather than at the end.
-                ack_output(
-                    client,
-                    process_id,
-                    remote::process::PROCESS_STREAM_STDOUT,
-                    output.offset + output.data.len() as u64,
-                );
-            }
-            _ => break,
-        }
+/// Ask for a batch and return the nonce its answer will carry.
+///
+/// Split from the collection so a caller with many independent questions can put
+/// them all on the wire before waiting for any: the icon search is one request
+/// per name, and asking them one at a time made a screenful of artwork a
+/// screenful of round trips.
+fn fs_read_send(
+    client: &mut Client,
+    state: &mut State,
+    flags: u8,
+    max_bytes: u32,
+    groups: &[&[&str]],
+) -> Option<u16> {
+    let nonce = state.next_nonce();
+    let request = remote::fs::msg_fs_read(nonce, flags, max_bytes, groups)?;
+    client.send(&request).ok()?;
+    Some(nonce)
+}
+
+/// Collect one outstanding [`fs_read_send`]. Answers to the others wait in the
+/// client's pending queue, so they can be collected in any order.
+fn fs_read_collect(client: &mut Client, nonce: u16) -> Option<Vec<(u8, String, Vec<u8>)>> {
+    // The predicate reads the nonce out of the header instead of parsing the
+    // packet. `recv_matching` runs it over every reply already queued, and
+    // parsing decompresses a whole batch of file content to look at two bytes:
+    // with one request per name and a screenful in flight, that alone made a
+    // batch quadratic — 48 icons spent 8.8s decompressing answers that had
+    // already arrived.
+    let wanted = nonce.to_le_bytes();
+    let reply = client
+        .recv_matching(|packet| {
+            packet.first().copied() == Some(remote::fs::S2C_FS_READ)
+                && packet.get(1..3) == Some(&wanted[..])
+        })
+        .ok()??;
+    let (_, status, records) = remote::fs::parse_fs_read_result(&reply)?;
+    if status != remote::fs::FS_DONE_OK {
+        return Some(Vec::new());
     }
-    // One `.desktop` file with a stray byte in it must not discard the whole
-    // catalog; the parser only ever looks at the keys it knows.
-    Some(String::from_utf8_lossy(&collected).into_owned())
+    Some(records)
+}
+
+/// Everything under `root`, root-relative: its files, or its directories.
+///
+/// The walk is the server's (`FS_INDEX`), which is what makes a directory
+/// listing a message rather than a glob. A truncated answer is used as far as it
+/// goes: for both callers here that means some applications or some themes, not
+/// a wrong answer.
+fn fs_index(client: &mut Client, state: &mut State, root: &str, flags: u8) -> Vec<String> {
+    let nonce = state.next_nonce();
+    let mut request = remote::fs::msg_fs_index(nonce, root);
+    // The flags byte sits after the opcode and nonce; the builder writes a zero
+    // there because the search-and-index callers want plain files.
+    request[3] = flags;
+    if client.send(&request).is_err() {
+        return Vec::new();
+    }
+    let wanted = nonce.to_le_bytes();
+    let Ok(Some(reply)) = client.recv_matching(|packet| {
+        packet.first().copied() == Some(remote::fs::S2C_FS_INDEX)
+            && packet.get(1..3) == Some(&wanted[..])
+    }) else {
+        return Vec::new();
+    };
+    match remote::fs::parse_fs_index_result(&reply) {
+        Some((_, status, _, paths)) if status == remote::fs::FS_DONE_OK => paths,
+        _ => Vec::new(),
+    }
 }
 
 /// Persist one application's intent.
@@ -1586,6 +1729,9 @@ fn serve(
                     app.failures = 0;
                     app.next_attempt_ns = None;
                     if app.phase != Phase::Running {
+                        // See the channel's `start`: without this the
+                        // supervisor has been told nothing it acts on.
+                        app.transient = true;
                         app.phase = Phase::Idle;
                     }
                     out.push_str(&format!("starting {id}\n"));
@@ -1713,6 +1859,71 @@ mod tests {
         assert_eq!(intent.process_ref, None);
         let intent = parse_intent(b"1 7 many").expect("parses");
         assert_eq!(intent.process_ref, None);
+    }
+
+    /// The bug that put a permanent gap in a scrolled list: the icon cache is
+    /// dropped wholesale, and it can happen part way through the batch that is
+    /// filling it. Whatever the batch resolved before the drop must still be
+    /// answered, because "no artwork" is a final answer to the panel.
+    #[test]
+    fn a_batch_answers_what_it_resolved_even_if_the_cache_was_dropped() {
+        // What the batch resolved, held apart from the cache the drop emptied.
+        let resolved = BTreeMap::from([
+            (
+                "early".to_string(),
+                Some("data:image/png;base64,AA".to_string()),
+            ),
+            (
+                "late".to_string(),
+                Some("data:image/png;base64,BB".to_string()),
+            ),
+        ]);
+        let keys = vec![
+            ("Portal 2.desktop".to_string(), Some("early".to_string())),
+            ("Shatter.desktop".to_string(), Some("late".to_string())),
+        ];
+        assert_eq!(
+            batch_answers(keys, &resolved),
+            vec![
+                (
+                    "Portal 2.desktop".to_string(),
+                    Some("data:image/png;base64,AA".to_string())
+                ),
+                (
+                    "Shatter.desktop".to_string(),
+                    Some("data:image/png;base64,BB".to_string())
+                ),
+            ]
+        );
+    }
+
+    /// "No artwork" and "ask me later" are different answers, and only one of
+    /// them is safe to give for a read that never happened: the panel treats a
+    /// null as final, so a failed child must leave the id unanswered.
+    #[test]
+    fn an_unresolved_key_is_omitted_but_a_missing_icon_field_is_answered() {
+        let resolved = BTreeMap::from([("found".to_string(), None)]);
+        let answers = batch_answers(
+            vec![
+                ("no-icon-key.desktop".to_string(), None),
+                ("looked-for.desktop".to_string(), Some("found".to_string())),
+                (
+                    "child-failed.desktop".to_string(),
+                    Some("never".to_string()),
+                ),
+            ],
+            &resolved,
+        );
+        assert_eq!(
+            answers,
+            vec![
+                // Nothing to look for: final.
+                ("no-icon-key.desktop".to_string(), None),
+                // Looked for and not found: also final.
+                ("looked-for.desktop".to_string(), None),
+            ],
+            "the id whose lookup never ran is left for the panel to re-ask"
+        );
     }
 
     /// A disabled application can still have a live child -- `disable` stops

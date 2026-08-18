@@ -1766,7 +1766,7 @@ Client-to-server kinds:
 | 3    | `DATA`    | `[payload:N]`                                                            |
 | 4    | `ACK`     | `[bytes:8]` cumulative consumed payload bytes                            |
 | 5    | `CLOSE`   | `[reason:1]`                                                             |
-| 6    | `WATCH`   | `[flags:1][count:2]` then `count` × `[name_len:2][name:N]`                |
+| 6    | `WATCH`   | `[flags:1][count:2]` then `count` × `[name_len:2][name:N]`               |
 | 7    | `UNWATCH` | empty                                                                    |
 
 `LISTEN.flags` has no version-1 bits and must be zero. `CONNECT.flags` bit 0 is
@@ -1797,7 +1797,7 @@ Server-to-client kinds:
 | 3    | `DATA`     | `[payload:N]`                                                                |
 | 4    | `ACK`      | `[bytes:8]` cumulative consumed payload bytes                                |
 | 5    | `CLOSED`   | `[reason:1][detail:N]`                                                       |
-| 6    | `NAMES`    | `[flags:1][count:2]` then `count` × `[name_len:2][name:N]`                    |
+| 6    | `NAMES`    | `[flags:1][count:2]` then `count` × `[name_len:2][name:N]`                   |
 
 Channel close reasons are:
 

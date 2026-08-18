@@ -38,7 +38,9 @@ import {
   CREATE2_WANT_STATUS,
   FEATURE_CREATE_NONCE,
   FEATURE_CREATE_STATUS,
+  CLIENT_LIST_WANT_ORIGIN,
   FEATURE_CLIENT_CONTROL,
+  FEATURE_CLIENT_ORIGIN,
   FEATURE_RESIZE_BATCH,
   FEATURE_RESTART,
   FEATURE_SCROLL_BY,
@@ -1160,9 +1162,74 @@ describe("BlitConnection", () => {
             { ptyId: 5, rows: null, cols: null },
           ],
           surfaces: [{ surfaceId: 7, width: 1280, height: 720, scale120: 180 }],
+          // This server never offered origins, so the catalog reports not
+          // knowing rather than calling every connection an ordinary client.
+          origin: null,
         },
       ],
     });
+  });
+
+  it("asks for origins and names the extension behind a connection", async () => {
+    transport.pushHello(1, FEATURE_CLIENT_CONTROL | FEATURE_CLIENT_ORIGIN);
+
+    const result = conn.listClients();
+    const request = transport.sent.find(
+      (message) => message[0] === C2S_CLIENT_LIST,
+    )!;
+    expect(Array.from(request.subarray(3))).toEqual([CLIENT_LIST_WANT_ORIGIN]);
+    const nonce = request[1] | (request[2] << 8);
+    const bare = {
+      ageSeconds: 1,
+      outboundBytesPerSecond: 0,
+      inboundBytesPerSecond: 0,
+      subscriptions: [],
+      terminals: [],
+      surfaces: [],
+    };
+    transport.pushClientList(nonce, 9n, [
+      { ...bare, id: 6n, origin: { kind: "network" } },
+      {
+        ...bare,
+        id: 7n,
+        origin: {
+          kind: "extension",
+          extensionId: 0x05a3415a2dd1ef9bn,
+          definitionRevision: 2n,
+          attempt: 3n,
+          taskId: 4,
+          name: "systemd",
+        },
+      },
+      // A kind from a later server: the entry after it still arrives, which is
+      // what the length prefix is for.
+      { ...bare, id: 8n, origin: { kind: "unknown", originKind: 200 } },
+    ]);
+
+    const catalog = await result;
+    expect(catalog.clients.map((client) => client.origin)).toEqual([
+      { kind: "network" },
+      {
+        kind: "extension",
+        extensionId: 0x05a3415a2dd1ef9bn,
+        definitionRevision: 2n,
+        attempt: 3n,
+        taskId: 4,
+        name: "systemd",
+      },
+      { kind: "unknown", originKind: 200 },
+    ]);
+  });
+
+  it("does not ask a server that cannot answer for origins", () => {
+    transport.pushHello(1, FEATURE_CLIENT_CONTROL);
+    void conn.listClients().catch(() => {});
+    const request = transport.sent.find(
+      (message) => message[0] === C2S_CLIENT_LIST,
+    )!;
+    // To such a server a flags byte is trailing bytes, and it answers those
+    // with INVALID instead of a catalog.
+    expect(request.length).toBe(3);
   });
 
   it("kicks a peer and reports server refusals", async () => {

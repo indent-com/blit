@@ -32,7 +32,7 @@ pub const C2S_FS_OP: u8 = 0x45;
 pub const C2S_FS_SEARCH: u8 = 0x46;
 /// Fetch the candidate file list under a root (no sync), for client-side
 /// fuzzy search (docs/design/fs-search.md): [0x47][nonce:2][flags:1][root_len:2][root:N].
-/// `flags` is reserved; nonzero answers `INVALID`.
+/// `flags` is `FS_INDEX_DIRS_ONLY`; unknown bits answer `INVALID`.
 pub const C2S_FS_INDEX: u8 = 0x47;
 
 /// Content search under a root (no sync), docs/design/fs-grep.md:
@@ -57,6 +57,25 @@ pub const C2S_FS_UPLOAD_CHUNK: u8 = 0x4A;
 pub const C2S_FS_UPLOAD_FINISH: u8 = 0x4B;
 /// Abort the upload: [0x4C][upload_id:2]. No reply.
 pub const C2S_FS_UPLOAD_CANCEL: u8 = 0x4C;
+
+/// Read whole files without a sync (docs/design/fs-read.md):
+/// [0x4D][nonce:2][flags:1][max_bytes:4][group_count:2] then group_count ×
+/// ( [path_count:2] then path_count × [path_len:2][path:N] ).
+///
+/// The family's one-shot read. `FS_FETCH` needs an established sync — a watched
+/// tree, which is the wrong shape for reading a fixed set of files once — so
+/// everything that wanted a handful of files had to sync a directory it did not
+/// want watched, or shell out to `cat`. Paths are absolute and independent;
+/// nothing is watched and no state is kept.
+///
+/// `max_bytes` is the per-file ceiling, zero meaning [`FS_READ_DEFAULT_BYTES`];
+/// a larger file is reported rather than read, so a caller drawing 2em tiles
+/// does not have a theme's megabyte SVG pushed at it. `flags` is `FS_READ_FIRST`.
+///
+/// Paths are grouped, and a group is one question: with `FS_READ_FIRST` each
+/// group is answered by its own first readable path, so one message can resolve
+/// a whole screenful of icons rather than one message per icon.
+pub const C2S_FS_READ: u8 = 0x4D;
 
 /// Sync accepted or rejected: [0x40][nonce:2][sync_id:2][status:1][detail_len:2][detail:N]
 /// On success detail is the canonical root (UTF-8); on failure a diagnostic.
@@ -96,6 +115,13 @@ pub const S2C_FS_UPLOAD_CHUNK: u8 = 0x4A;
 /// `FS_DONE` payload on success (zeroes otherwise), or the current on-disk
 /// hash on `CONFLICT` (the precondition re-verified at FINISH failed).
 pub const S2C_FS_UPLOAD_FINISH: u8 = 0x4B;
+
+/// Read result: [0x48][nonce:2][status:1][count:2][records:LZ4] where the
+/// decompressed payload is repeated{ [status:1][path_len:2][path:N][size:4][data:size] },
+/// in the order the request asked for. Request status uses the common registry
+/// (`FS_DONE_*`); each record carries its own `FS_FILE_*`, so one unreadable
+/// path does not spoil the answer for the rest.
+pub const S2C_FS_READ: u8 = 0x48;
 
 /// `S2C_HELLO` feature bit: server supports the `FS_*` message family,
 /// reads and writes alike (docs/design/fs-watch.md, docs/design/fs-write.md).
@@ -210,11 +236,71 @@ pub const FS_INDEX_TRUNCATED: u8 = 1 << 0;
 /// small frame (the decompression guard bounds bytes, not record counts).
 pub const FS_INDEX_MAX_COUNT: usize = 1_000_000;
 
-// S2C_FS_FILE status.
+// S2C_FS_FILE status, shared by each `S2C_FS_READ` record.
 pub const FS_FILE_OK: u8 = 0;
 pub const FS_FILE_NOT_FOUND: u8 = 1;
 pub const FS_FILE_UNREADABLE: u8 = 2;
 pub const FS_FILE_OTHER: u8 = 3;
+/// The file exists and was not read: it is over the request's `max_bytes`, or
+/// over what was left of the response budget. Either way the caller has the
+/// answer it needs — this path is not going to arrive — and can look elsewhere.
+pub const FS_FILE_TOO_LARGE: u8 = 4;
+
+// C2S_FS_READ flags (docs/design/fs-read.md).
+
+/// Answer each group with the first path in it that can be read.
+///
+/// This is the search-path question — the first of these that exists, in my
+/// order of preference — which is otherwise a round trip per candidate. A path
+/// that is missing, unreadable or too large is stepped over rather than
+/// answered. There is exactly one record per group, in group order: a group that
+/// matched nothing carries `FS_FILE_NOT_FOUND` and an empty path, so a caller
+/// can align answers with questions by position.
+pub const FS_READ_FIRST: u8 = 1 << 0;
+
+/// Answer which path, not what is in it.
+///
+/// The resolution without the transfer: a caller that only needs to know *where*
+/// something is — because it will hand the path to whoever actually wants the
+/// bytes — pays a stat instead of a read. Records carry their status and path
+/// with an empty body, and `max_bytes` still applies, so "exists but too big to
+/// be what I am looking for" is still answered as such.
+pub const FS_READ_NO_CONTENT: u8 = 1 << 1;
+
+/// The flags `FS_READ` understands; anything else answers `INVALID`.
+pub const FS_READ_FLAGS_KNOWN: u8 = FS_READ_FIRST | FS_READ_NO_CONTENT;
+
+/// Paths one `FS_READ` may name. Generous because the shape it replaces is a
+/// batch: a panel asking for a screenful of artwork, a supervisor reading every
+/// `.desktop` file in a directory.
+pub const FS_READ_MAX_PATHS: usize = 512;
+/// Per-file ceiling when the request asks for none.
+pub const FS_READ_DEFAULT_BYTES: u32 = 1024 * 1024;
+/// Bytes of file content one reply carries. Whatever does not fit is reported
+/// `FS_FILE_TOO_LARGE` rather than silently dropped, so a caller can re-ask for
+/// the remainder in smaller batches.
+pub const FS_READ_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+// C2S_FS_INDEX flags.
+
+/// List directories instead of files.
+///
+/// The shape of a tree without its contents, which is what a search path is:
+/// an icon theme is fifty directories holding fifty thousand files, and a
+/// caller that wants somewhere to look should not be handed all of them.
+pub const FS_INDEX_DIRS_ONLY: u8 = 1 << 0;
+
+/// Descend through symbolic links to directories.
+///
+/// Off by default, because a source tree's links can point anywhere and a walk
+/// that follows them is a walk with no bound the caller chose. It exists because
+/// some trees are *made* of links: on a Nix system every directory under
+/// `/run/current-system/sw/share/icons` is one, so a walk that stops at them
+/// reports a theme's name and nothing inside it.
+pub const FS_INDEX_FOLLOW_LINKS: u8 = 1 << 1;
+
+/// The flags `FS_INDEX` understands; anything else answers `INVALID`.
+pub const FS_INDEX_FLAGS_KNOWN: u8 = FS_INDEX_DIRS_ONLY | FS_INDEX_FOLLOW_LINKS;
 
 // FS_DONE status — the common registry (docs/protocol.md "Common status
 // registry"), NOT FS_SYNCED's grandfathered 0-4.
@@ -989,6 +1075,171 @@ pub fn parse_fs_index_result(data: &[u8]) -> Option<(u16, u8, u8, Vec<String>)> 
         return None;
     }
     Some((nonce, status, flags, paths))
+}
+
+/// Build a `C2S_FS_READ`. `max_bytes` of zero asks for the server default.
+///
+/// Paths come in groups, and a group is one question. Without `FS_READ_FIRST`
+/// the groups are read straight through and the distinction does not matter; with
+/// it each group is answered by its own first readable path, which is what lets
+/// one message resolve a screenful of icons instead of one message per icon.
+pub fn msg_fs_read(nonce: u16, flags: u8, max_bytes: u32, groups: &[&[&str]]) -> Option<Vec<u8>> {
+    let total: usize = groups.iter().map(|group| group.len()).sum();
+    if groups.is_empty() || total == 0 || total > FS_READ_MAX_PATHS {
+        return None;
+    }
+    let group_count = u16::try_from(groups.len()).ok()?;
+    let mut m = Vec::with_capacity(10 + total * 32);
+    m.push(C2S_FS_READ);
+    m.extend_from_slice(&nonce.to_le_bytes());
+    m.push(flags);
+    m.extend_from_slice(&max_bytes.to_le_bytes());
+    m.extend_from_slice(&group_count.to_le_bytes());
+    for group in groups {
+        let count = u16::try_from(group.len()).ok()?;
+        m.extend_from_slice(&count.to_le_bytes());
+        for path in *group {
+            if u16::try_from(path.len()).is_err() {
+                return None;
+            }
+            push_str(&mut m, path);
+        }
+    }
+    Some(m)
+}
+
+/// Build a one-group `C2S_FS_READ`, the plain "read these files" case.
+pub fn msg_fs_read_paths(nonce: u16, flags: u8, max_bytes: u32, paths: &[&str]) -> Option<Vec<u8>> {
+    msg_fs_read(nonce, flags, max_bytes, &[paths])
+}
+
+/// Parse a `C2S_FS_READ` → `(nonce, flags, max_bytes, groups)`.
+pub fn parse_fs_read(data: &[u8]) -> Option<(u16, u8, u32, Vec<Vec<String>>)> {
+    // [0x4D][nonce:2][flags:1][max_bytes:4][group_count:2]
+    // then group_count × ( [path_count:2] then path_count × [len:2][path:N] )
+    if data.first().copied() != Some(C2S_FS_READ) || data.len() < 10 {
+        return None;
+    }
+    let nonce = u16::from_le_bytes([data[1], data[2]]);
+    let flags = data[3];
+    let max_bytes = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    let group_count = u16::from_le_bytes([data[8], data[9]]) as usize;
+    if group_count == 0 || group_count > FS_READ_MAX_PATHS {
+        return None;
+    }
+    let mut groups = Vec::with_capacity(group_count);
+    let mut total = 0usize;
+    let mut off = 10;
+    for _ in 0..group_count {
+        if off + 2 > data.len() {
+            return None;
+        }
+        let count = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
+        off += 2;
+        total = total.checked_add(count)?;
+        if total > FS_READ_MAX_PATHS {
+            return None;
+        }
+        let mut paths = Vec::with_capacity(count);
+        for _ in 0..count {
+            if off + 2 > data.len() {
+                return None;
+            }
+            let len = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
+            off += 2;
+            if off + len > data.len() {
+                return None;
+            }
+            paths.push(String::from_utf8(data[off..off + len].to_vec()).ok()?);
+            off += len;
+        }
+        groups.push(paths);
+    }
+    if off != data.len() || total == 0 {
+        return None;
+    }
+    Some((nonce, flags, max_bytes, groups))
+}
+
+/// Build an `S2C_FS_READ` from `(status, path, content)` records, in request
+/// order. A record whose status is not `FS_FILE_OK` carries no content.
+pub fn msg_fs_read_result(nonce: u16, status: u8, records: &[(u8, &str, &[u8])]) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(
+        records
+            .iter()
+            .map(|(_, path, data)| 7 + path.len() + data.len())
+            .sum::<usize>(),
+    );
+    for (record_status, path, content) in records {
+        raw.push(*record_status);
+        push_str(&mut raw, path);
+        let content: &[u8] = if *record_status == FS_FILE_OK {
+            content
+        } else {
+            &[]
+        };
+        raw.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        raw.extend_from_slice(content);
+    }
+    let compressed = lz4_flex::compress_prepend_size(&raw);
+    let mut m = Vec::with_capacity(6 + compressed.len());
+    m.push(S2C_FS_READ);
+    m.extend_from_slice(&nonce.to_le_bytes());
+    m.push(status);
+    m.extend_from_slice(&(records.len() as u16).to_le_bytes());
+    m.extend_from_slice(&compressed);
+    m
+}
+
+/// One answered path: its `FS_FILE_*` status, the path as it was asked for, and
+/// its content — empty unless the status is `FS_FILE_OK`.
+pub type FsReadRecord = (u8, String, Vec<u8>);
+
+/// Parse an `S2C_FS_READ` → `(nonce, status, records)`. Applies the standard
+/// decompression guard; `None` = malformed or a payload disagreeing with `count`.
+pub fn parse_fs_read_result(data: &[u8]) -> Option<(u16, u8, Vec<FsReadRecord>)> {
+    // [0x48][nonce:2][status:1][count:2][records:LZ4]
+    if data.first().copied() != Some(S2C_FS_READ) || data.len() < 6 {
+        return None;
+    }
+    let nonce = u16::from_le_bytes([data[1], data[2]]);
+    let status = data[3];
+    let count = u16::from_le_bytes([data[4], data[5]]) as usize;
+    if count > FS_READ_MAX_PATHS {
+        return None;
+    }
+    let raw = decompress_guarded(&data[6..])?;
+    // Each record is at least seven bytes, which bounds the preallocation.
+    if count > raw.len() / 7 + 1 {
+        return None;
+    }
+    let mut records = Vec::with_capacity(count);
+    let mut off = 0;
+    while off < raw.len() {
+        if off + 3 > raw.len() {
+            return None;
+        }
+        let record_status = raw[off];
+        let path_len = u16::from_le_bytes([raw[off + 1], raw[off + 2]]) as usize;
+        off += 3;
+        if off + path_len + 4 > raw.len() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&raw[off..off + path_len]).into_owned();
+        off += path_len;
+        let size =
+            u32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]) as usize;
+        off += 4;
+        if off + size > raw.len() {
+            return None;
+        }
+        records.push((record_status, path, raw[off..off + size].to_vec()));
+        off += size;
+    }
+    if records.len() != count {
+        return None;
+    }
+    Some((nonce, status, records))
 }
 
 pub fn msg_fs_synced(nonce: u16, sync_id: u16, status: u8, detail: &str) -> Vec<u8> {
@@ -2801,5 +3052,88 @@ mod tests {
         remove_subtree(&mut map, "a");
         let left: Vec<_> = map.keys().cloned().collect();
         assert_eq!(left, vec!["ab".to_string(), "z".to_string()]);
+    }
+
+    #[test]
+    fn read_request_round_trips() {
+        let paths = ["/usr/share/applications/vlc.desktop", "/etc/os-release"];
+        let wire = msg_fs_read_paths(7, 0, 4096, &paths).expect("builds");
+        assert_eq!(
+            parse_fs_read(&wire),
+            Some((
+                7,
+                0,
+                4096,
+                vec![paths.iter().map(|p| (*p).to_string()).collect()]
+            ))
+        );
+    }
+
+    /// One group per question, which is what makes a screenful of icons one
+    /// message: each group is answered by its own first readable path.
+    #[test]
+    fn a_grouped_request_keeps_its_groups() {
+        let first: &[&str] = &["/i/scalable/apps/a.svg", "/i/48x48/apps/a.png"];
+        let second: &[&str] = &["/i/scalable/apps/b.svg"];
+        let wire = msg_fs_read(9, FS_READ_FIRST, 0, &[first, second]).expect("builds");
+        let (nonce, flags, max_bytes, groups) = parse_fs_read(&wire).expect("parses");
+        assert_eq!((nonce, flags, max_bytes), (9, FS_READ_FIRST, 0));
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[1], vec!["/i/scalable/apps/b.svg".to_string()]);
+    }
+
+    #[test]
+    fn read_result_carries_a_status_per_path() {
+        let wire = msg_fs_read_result(
+            7,
+            FS_DONE_OK,
+            &[
+                (FS_FILE_OK, "/etc/os-release", b"NAME=NixOS\n"),
+                (FS_FILE_NOT_FOUND, "/nope", b""),
+                // Oversized paths carry no body even if one is passed.
+                (FS_FILE_TOO_LARGE, "/huge.png", b"ignored"),
+            ],
+        );
+        let (nonce, status, records) = parse_fs_read_result(&wire).expect("parses");
+        assert_eq!((nonce, status), (7, FS_DONE_OK));
+        assert_eq!(
+            records,
+            vec![
+                (
+                    FS_FILE_OK,
+                    "/etc/os-release".to_string(),
+                    b"NAME=NixOS\n".to_vec()
+                ),
+                (FS_FILE_NOT_FOUND, "/nope".to_string(), Vec::new()),
+                (FS_FILE_TOO_LARGE, "/huge.png".to_string(), Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_rejects_what_it_cannot_answer() {
+        assert!(msg_fs_read(1, 0, 0, &[]).is_none());
+        assert!(msg_fs_read_paths(1, 0, 0, &[]).is_none());
+        // The cap is on paths in total, however they are grouped.
+        let too_many: Vec<&str> = vec!["/x"; FS_READ_MAX_PATHS + 1];
+        assert!(msg_fs_read_paths(1, 0, 0, &too_many).is_none());
+        // A count that outruns the body, and trailing bytes past the last path.
+        assert!(parse_fs_read(&[C2S_FS_READ, 1, 0, 0, 0, 0, 0, 0, 2, 0]).is_none());
+        let mut trailing = msg_fs_read_paths(1, 0, 0, &["/x"]).expect("builds");
+        trailing.push(0);
+        assert!(parse_fs_read(&trailing).is_none());
+        // Zero paths is not a request the server should have to interpret.
+        assert!(parse_fs_read(&[C2S_FS_READ, 1, 0, 0, 0, 0, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn an_empty_read_result_is_a_valid_answer() {
+        // What FIRST reports when nothing matched: no records, status OK.
+        let wire = msg_fs_read_result(9, FS_DONE_OK, &[]);
+        assert_eq!(
+            parse_fs_read_result(&wire),
+            Some((9, FS_DONE_OK, Vec::new()))
+        );
     }
 }

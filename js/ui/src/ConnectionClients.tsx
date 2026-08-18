@@ -28,7 +28,12 @@ import { themeFor, ui, uiScale } from "./theme";
 import {
   formatClientAge,
   formatClientBandwidth,
+  formatClientLabel,
+  formatClientOriginTag,
   formatClientSubscription,
+  formatExtensionAttempt,
+  formatExtensionTitle,
+  formatKickAction,
   formatSurfaceViewSize,
   formatTerminalViewSize,
 } from "./clientDisplay";
@@ -235,11 +240,24 @@ export function ConnectionClients(props: {
                         gap: `${scale().tightGap}px`,
                       }}
                     >
+                      {/* An extension is named by its definition rather than
+                          by its connection id: the id says nothing, and this
+                          is the one row a viewer did not open themselves. */}
                       <strong
                         style={{ "font-variant-numeric": "tabular-nums" }}
                       >
-                        Client {client().id.toString()}
+                        {formatClientLabel(client())}
                       </strong>
+                      <Show when={formatClientOriginTag(client())}>
+                        {(label) => (
+                          <StatusPill
+                            theme={theme()}
+                            scale={scale()}
+                            tone="idle"
+                            label={label()}
+                          />
+                        )}
+                      </Show>
                       {/* The one row the viewer must not mistake for someone
                           else's — it is the only one whose Kick is absent. */}
                       <Show when={client().id === list().selfId}>
@@ -257,13 +275,25 @@ export function ConnectionClients(props: {
                         are the server's measurement of the socket — a client
                         of any kind reports nothing about itself. */}
                     <span
-                      title="↓ server → client · ↑ client → server"
+                      title={[
+                        formatExtensionTitle(client()),
+                        "↓ server → client · ↑ client → server",
+                      ]
+                        .filter(Boolean)
+                        .join("\n")}
                       style={{
                         color: theme().dimFg,
                         "font-size": `${scale().sm}px`,
                         "font-variant-numeric": "tabular-nums",
                       }}
                     >
+                      {/* Attempt and age together are what says "crash loop":
+                          a climbing attempt number on a row whose age keeps
+                          resetting. Either figure alone reads as a new
+                          connection. */}
+                      <Show when={formatExtensionAttempt(client())}>
+                        {(attempt) => <>{attempt()} · </>}
+                      </Show>
                       Age {formatClientAge(client().ageSeconds)} · ↓{" "}
                       {formatClientBandwidth(client().outboundBytesPerSecond)} ·
                       ↑ {formatClientBandwidth(client().inboundBytesPerSecond)}
@@ -292,10 +322,10 @@ export function ConnectionClients(props: {
                           onClick={() => void kick(client())}
                         >
                           {kicking() === client().id
-                            ? "Kicking…"
+                            ? formatKickAction(client()).busy
                             : confirming() === client().id
-                              ? "Confirm kick"
-                              : "Kick"}
+                              ? formatKickAction(client()).confirm
+                              : formatKickAction(client()).idle}
                         </button>
                         <Show when={confirming() === client().id}>
                           <button

@@ -635,8 +635,22 @@ in
 
       cargo build --release --target "$target"
 
-      version=$(cargo metadata --no-deps --format-version 1 |
-        jq -r '.packages[0].version')
+      metadata=$(cargo metadata --no-deps --format-version 1)
+      version=$(jq -r '.packages[0].version' <<<"$metadata")
+
+      # What each module is for, keyed by the name it is published under.
+      # `package.description` is the one place that sentence already lives, and
+      # the browser has nothing else to go on: the registry lists names and
+      # digests, so without this an installable extension is an opaque word.
+      # Keyed by the *bin* target's name because that is what the object is
+      # called -- the crate is `blit-ext-systemd`, the module is `systemd.wasm`.
+      descriptions=$(jq -c '
+        [ .packages[]
+          | . as $package
+          | .targets[]
+          | select(.kind | index("bin"))
+          | { key: .name, value: ($package.description // "") }
+        ] | from_entries' <<<"$metadata")
       entries=()
 
       for wasm in "target/$target/release"/*.wasm; do
@@ -665,13 +679,15 @@ in
         digest=$(b3sum --no-names "$out")
         bytes=$(wc -c <"$out")
         compressed=$(wc -c <"$out.br")
+        description=$(jq -r --arg name "$name" '.[$name] // ""' <<<"$descriptions")
         entries+=("$(jq -n \
           --arg name "$name" \
+          --arg description "$description" \
           --arg file "$name.wasm" \
           --arg digest "$digest" \
           --argjson bytes "$bytes" \
           --argjson compressed "$compressed" \
-          '{name: $name, file: $file, blake3: $digest, bytes: $bytes, brotli_bytes: $compressed}')")
+          '{name: $name, description: $description, file: $file, blake3: $digest, bytes: $bytes, brotli_bytes: $compressed}')")
         printf '%-12s %8s bytes  %8s brotli  %s\n' "$name" "$bytes" "$compressed" "$digest"
       done
 

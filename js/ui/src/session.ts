@@ -26,12 +26,17 @@ import type {
 } from "@blit-sh/core";
 import { Notifier } from "@blit-sh/core";
 
-/** The part of a connection this mirror needs: one named channel. */
+/** The part of a connection this mirror needs: one named channel, and the
+ *  one-shot read that turns a resolved icon path into bytes. */
 export interface ChannelOpener {
   connectChannel(
     name: string,
     options?: ChannelOpenOptions,
   ): Promise<ChannelHandle>;
+  readFiles?(
+    groups: readonly (readonly string[])[],
+    options?: { flags?: number; maxBytes?: number },
+  ): Promise<{ status: number; path: string; content: Uint8Array }[]>;
 }
 
 export const SESSION_CHANNEL = "blit.session.v1";
@@ -95,6 +100,16 @@ const ICON_RETRY_MS = 8_000;
  * still still fills in immediately.
  */
 const ICON_COALESCE_MS = 120;
+
+/**
+ * Largest icon file the panel will read.
+ *
+ * Generous where the extension could not be: nothing base64s this or squeezes it
+ * through a JSON string any more, so the only cost of a big file is the transfer
+ * — which is why Steam's habit of writing 600 KB artwork into every size bucket
+ * is no longer a row with no icon.
+ */
+const MAX_ARTWORK_BYTES = 1024 * 1024;
 
 export interface SessionOptions {
   onClosed?(reason: number, detail: string): void;
@@ -186,6 +201,9 @@ export class SessionMirror implements ReactiveStore {
   #apps: SessionApp[] = [];
   #catalog: SessionCatalogEntry[] = [];
   #icons = new Map<string, string | null>();
+  /** Where each icon lives, as the supervisor resolved it: `null` once it has
+   *  said there is nothing to draw. */
+  #paths = new Map<string, string | null>();
   #ready = false;
 
   get revision(): number {
@@ -213,6 +231,28 @@ export class SessionMirror implements ReactiveStore {
     return this.#icons.get(id);
   }
 
+  /** The path resolved for `id`, if artwork has been located and not yet read. */
+  path(id: string): string | null | undefined {
+    return this.#paths.get(id);
+  }
+
+  /** Ids with a path whose bytes nobody has read yet. */
+  unread(): { id: string; path: string }[] {
+    const out: { id: string; path: string }[] = [];
+    for (const [id, path] of this.#paths) {
+      if (path !== null && this.#icons.get(id) === undefined) {
+        out.push({ id, path });
+      }
+    }
+    return out;
+  }
+
+  /** Record what a path turned out to hold. */
+  setIcon(id: string, url: string | null): void {
+    this.#icons.set(id, url);
+    this.#notifier.emit();
+  }
+
   /** Apply one channel payload. Malformed messages are dropped, not thrown:
    *  a panel is not the place to surface a parser disagreement. */
   apply(payload: Uint8Array): void {
@@ -227,13 +267,20 @@ export class SessionMirror implements ReactiveStore {
 
     // One id per message, and a missing `icon` is the answer "there is none" —
     // which has to be recorded, or the panel asks again on the next render.
+    // The supervisor answers with a *path*, not the artwork: a 30 KB data URL
+    // per row had to be base64‑encoded and JSON‑escaped inside a Wasm
+    // interpreter, which cost more than everything else the panel does put
+    // together. The bytes are fetched here instead, natively, over `FS_READ`.
     if (record.type === "icon") {
       if (typeof record.id !== "string" || record.id.length === 0) return;
-      const icon = record.icon;
-      this.#icons.set(
-        record.id,
-        typeof icon === "string" && icon.startsWith("data:") ? icon : null,
-      );
+      const path = record.path;
+      if (typeof path === "string" && path.length > 0) {
+        this.#paths.set(record.id, path);
+      } else {
+        // No artwork to be had, which is a final answer.
+        this.#paths.set(record.id, null);
+        this.#icons.set(record.id, null);
+      }
       this.#notifier.emit();
       return;
     }
@@ -287,7 +334,10 @@ export async function openSession(
   const asked = new Map<string, number>();
   const worthAsking = (id: string, now: number): boolean => {
     if (id.length === 0 || id.includes("\n")) return false;
-    if (mirror.icon(id) !== undefined) return false;
+    // A located icon counts as answered even before its bytes arrive: the read
+    // is the panel's own job now, and asking the supervisor again would only
+    // repeat an answer it already gave.
+    if (mirror.path(id) !== undefined) return false;
     const at = asked.get(id);
     return at === undefined || now - at >= ICON_RETRY_MS;
   };
@@ -304,6 +354,49 @@ export async function openSession(
       request(`icons ${wanted.slice(at, at + ICON_BATCH).join("\n")}`);
     }
   };
+
+  // Artwork the panel reads for itself. Object URLs rather than data URLs: the
+  // bytes arrive as bytes, and turning them into base64 to hand to an <img> is
+  // the work this whole arrangement exists to avoid.
+  const revoke: string[] = [];
+  let loading = false;
+  const loadArtwork = async () => {
+    if (loading || !connection.readFiles) return;
+    loading = true;
+    try {
+      // Two dozen at a time: a batch is one message, and the panel wants the
+      // rows it is drawing to arrive before the ones it is not.
+      for (let guard = 0; guard < 64; guard += 1) {
+        const wanted = mirror.unread().slice(0, ICON_BATCH);
+        if (wanted.length === 0) return;
+        const records = await connection.readFiles(
+          [wanted.map((entry) => entry.path)],
+          { maxBytes: MAX_ARTWORK_BYTES },
+        );
+        for (const [index, record] of records.entries()) {
+          const entry = wanted[index];
+          if (!entry) continue;
+          if (record.status !== 0 || record.content.length === 0) {
+            mirror.setIcon(entry.id, null);
+            continue;
+          }
+          const url = URL.createObjectURL(
+            new Blob([record.content as BlobPart], {
+              type: entry.path.endsWith(".svg") ? "image/svg+xml" : "image/png",
+            }),
+          );
+          revoke.push(url);
+          mirror.setIcon(entry.id, url);
+        }
+      }
+    } catch {
+      // A refused or unanswered read leaves the ids unread, so the next batch
+      // picks them up rather than the rows keeping a placeholder forever.
+    } finally {
+      loading = false;
+    }
+  };
+  const artworkTick = setInterval(() => void loadArtwork(), ICON_COALESCE_MS);
 
   return {
     get apps() {
@@ -338,6 +431,11 @@ export async function openSession(
       if (coalescing !== undefined) clearTimeout(coalescing);
       coalescing = undefined;
       queued = [];
+      clearInterval(artworkTick);
+      // An object URL is a document-lifetime reference: without this every
+      // panel that was opened keeps every icon it ever drew.
+      for (const url of revoke) URL.revokeObjectURL(url);
+      revoke.length = 0;
       channelHandle.close();
       channel = null;
     },

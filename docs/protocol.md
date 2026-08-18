@@ -43,9 +43,9 @@ every pending operation as a connection error in that case.
 | `0x06` | `MOUSE`                 | `[pty_id:2][type:1][button:1][col:2][row:2]`                                                                                                                                                                                                     |
 | `0x07` | `RESTART`               | `[pty_id:2]`                                                                                                                                                                                                                                     |
 | `0x08` | `PING`                  | _(empty)_ — application-level keepalive                                                                                                                                                                                                          |
-| `0x09` | `CLIENT_LIST`           | `[nonce:2]` — enumerate connected clients                                                                                                                                                                                                        |
+| `0x09` | `CLIENT_LIST`           | `[nonce:2]` or `[nonce:2][flags:1]` — enumerate connected clients; `flags` bit 0 (`WANT_ORIGIN`) asks for `S2C_CLIENT_LIST2`                                                                                                                     |
 | `0x0A` | `KICK`                  | `[nonce:2][client_id:8][reason:N]` — disconnect another client with a UTF-8 reason                                                                                                                                                               |
-| `0x0B` | `CLIENT_WATCH`          | `[nonce:2]` — subscribe to live client-catalog snapshots                                                                                                                                                                                         |
+| `0x0B` | `CLIENT_WATCH`          | `[nonce:2]` or `[nonce:2][flags:1]` — subscribe to live client-catalog snapshots, under the same flags as `CLIENT_LIST`                                                                                                                          |
 | `0x0C` | `CLIENT_UNWATCH`        | `[nonce:2]` — stop the client-catalog subscription using this nonce                                                                                                                                                                              |
 | `0x0F` | `QUIT`                  | _(empty)_ — request server shutdown                                                                                                                                                                                                              |
 | `0x10` | `CREATE`                | `[rows:2][cols:2][tag_len:2][tag:N]`                                                                                                                                                                                                             |
@@ -102,11 +102,12 @@ every pending operation as a connection error in that case.
 | `0x44` | `FS_WRITE`              | `[nonce:2][sync_id:2][flags:1][base:16][mode:4][content_kind:1][path_len:2][path:N][content:LZ4]` — CAS content upsert ([design/fs-write.md](design/fs-write.md))                                                                                |
 | `0x45` | `FS_OP`                 | `[nonce:2][sync_id:2][op:1][flags:1][base:16][mode:4][a_len:2][a:N][b_len:2][b:N]` — mkdir/remove/rename/symlink/hardlink ([design/fs-write.md](design/fs-write.md))                                                                             |
 | `0x46` | `FS_SEARCH`             | `[nonce:2][limit:2][root_len:2][root:N][query_len:2][query:M]` — server-side fuzzy file search ([design/fs-search.md](design/fs-search.md))                                                                                                      |
-| `0x47` | `FS_INDEX`              | `[nonce:2][flags:1][root_len:2][root:N]` — candidate list for client-side search ([design/fs-search.md](design/fs-search.md))                                                                                                                    |
+| `0x47` | `FS_INDEX`              | `[nonce:2][flags:1][root_len:2][root:N]` — candidate list for client-side search; `flags` is `DIRS_ONLY`/`FOLLOW_LINKS` ([design/fs-search.md](design/fs-search.md), [design/fs-read.md](design/fs-read.md))                                      |
 | `0x49` | `FS_UPLOAD_BEGIN`       | `[nonce:2][sync_id:2][flags:1][base:16][mode:4][size:8][path_len:2][path:N]` — begin a chunked upload; `base` is the `FS_WRITE` CAS precondition                                                                                                 |
 | `0x4A` | `FS_UPLOAD_CHUNK`       | `[upload_id:2][offset:8][data:LZ4]` — sequential append; `offset` must equal the bytes accepted so far                                                                                                                                           |
 | `0x4B` | `FS_UPLOAD_FINISH`      | `[nonce:2][upload_id:2]` — land the upload (terminates it either way)                                                                                                                                                                            |
 | `0x4C` | `FS_UPLOAD_CANCEL`      | `[upload_id:2]` — abort the upload; no reply                                                                                                                                                                                                     |
+| `0x4D` | `FS_READ`               | `[nonce:2][flags:1][max_bytes:4][group_count:2] repeated{ [path_count:2] repeated{ [path_len:2][path:N] } }` — one-shot read, no sync; a group is one question, and `NO_CONTENT` names files instead of carrying them ([design/fs-read.md](design/fs-read.md))                                                                             |
 
 **Notes:**
 
@@ -161,6 +162,30 @@ can produce an update that often even when topology is unchanged; between
 samples only a real topology change publishes. Multiple watch nonces per client
 are valid.
 
+A `CLIENT_LIST` or `CLIENT_WATCH` may carry one trailing flags byte once
+`FEATURE_CLIENT_ORIGIN` is advertised. Its bit 0 (`CLIENT_LIST_WANT_ORIGIN`)
+asks for `S2C_CLIENT_LIST2`, which is the same message with
+`[origin_kind:1][origin_len:2][origin:N]` appended to every entry.
+`origin_kind` is `0` for an ordinary client — a browser, a CLI, a forwarder,
+with an empty payload — or `1` for the connection belonging to a running
+extension attempt, whose payload is
+`[extension_id:8][definition_revision:8][attempt:8][task_id:4][name:N]`. The
+name is the durable name of a persistent definition or the label a transient
+`ext run` carried, empty when it has neither, and is captured when the
+connection opens, so it names the definition the attempt started from.
+`origin_len` is what a reader skips past a kind it does not know, which is how
+a later kind can carry a payload without a third opcode.
+
+The wider entry needs its own opcode because both shipped parsers reject a
+catalog with bytes left over — it has to be unreadable to them by construction.
+For the same reason, a flags byte is only safe once the feature bit is seen:
+every server answers a client-control request with unexpected trailing bytes
+with `INVALID`, and so does this one for a flag it does not recognise. Any
+unknown flag bit is refused rather than ignored, so a client asking for a shape
+the server cannot produce hears about it instead of misreading the reply.
+`CLIENT_UNWATCH` takes no flags: a watch keeps the shape it was opened with for
+its whole life.
+
 `S2C_KICK_RESULT` is the status reply for the whole client-control family, not
 only for `C2S_KICK`: a malformed `CLIENT_LIST` / `CLIENT_WATCH` /
 `CLIENT_UNWATCH` is answered with `INVALID` under the sender's nonce rather
@@ -170,8 +195,9 @@ A request too short to carry a nonce (fewer than three bytes) is the one case
 the server drops, because the nonce would be a guess.
 
 The `blit client list` CLI filters its own short-lived connection from its
-output, while persistent clients can use `self_id` to identify their own live
-record. Client IDs are a per-process counter, not a capability or a stable
+output, and prints an `ORIGIN` column (`network`, `ext:<name>`, `ext:id:<hex>`)
+whenever the server offers origins — `unknown` when it does not. Persistent
+clients can use `self_id` to identify their own live record. Client IDs are a per-process counter, not a capability or a stable
 identity: they are only meaningful for the life of the server process,
 `HELLO.boot_generation` identifies that lifetime, and a client can infer from
 its own ID how many connections preceded it.
@@ -283,6 +309,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | `0x12` | `CLIENT_LIST`          | `[nonce:2][self_id:8][count:4][client:N]…` — sorted connection records, including the requester                                                                                                                                                                                                                                             |
 | `0x13` | `KICK_RESULT`          | `[nonce:2][status:1][detail:N]` — correlated result of `C2S_KICK`                                                                                                                                                                                                                                                                           |
 | `0x14` | `KICKED`               | `[reason:N]` — another client kicked this connection; the server closes it after delivery                                                                                                                                                                                                                                                   |
+| `0x15` | `CLIENT_LIST2`         | `CLIENT_LIST` with `[origin_kind:1][origin_len:2][origin:N]` on every record — answer to a request carrying `WANT_ORIGIN`                                                                                                                                                                                                                   |
 | `0x20` | `SURFACE_CREATED`      | `[surface_id:2][parent_id:2][w:2][h:2][title_len:2][title:N][app_id_len:2][app_id:M]`                                                                                                                                                                                                                                                       |
 | `0x21` | `SURFACE_DESTROYED`    | `[surface_id:2]`                                                                                                                                                                                                                                                                                                                            |
 | `0x22` | `SURFACE_FRAME`        | `[surface_id:2][timestamp:4][flags:1][w:2][h:2][data:N]`                                                                                                                                                                                                                                                                                    |
@@ -312,6 +339,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | `0x44` | `FS_DONE`              | `[nonce:2][status:1][hash:16][mtime_ns:8]` — one per `FS_WRITE`/`FS_OP` ([design/fs-write.md](design/fs-write.md))                                                                                                                                                                                                                          |
 | `0x45` | `FS_SEARCH`            | `[nonce:2][status:1][count:2] repeated{ [path_len:2][path:N] }` ([design/fs-search.md](design/fs-search.md))                                                                                                                                                                                                                                |
 | `0x46` | `FS_INDEX`             | `[nonce:2][status:1][flags:1][count:4][paths:LZ4]` ([design/fs-search.md](design/fs-search.md))                                                                                                                                                                                                                                             |
+| `0x48` | `FS_READ`              | `[nonce:2][status:1][count:2][records:LZ4]` — a status and content per requested path ([design/fs-read.md](design/fs-read.md))                                                                                                                                                                                                              |
 | `0x49` | `FS_UPLOAD_BEGIN`      | `[nonce:2][status:1][upload_id:2][hash:16][mtime_ns:8]` — `upload_id` meaningful only on `OK`; `hash` is the current on-disk hash on `CONFLICT`                                                                                                                                                                                             |
 | `0x4A` | `FS_UPLOAD_CHUNK`      | `[upload_id:2][status:1][received:8]` — per-chunk ack/progress; `received` is the resume point on `OFFSET_MISMATCH`                                                                                                                                                                                                                         |
 | `0x4B` | `FS_UPLOAD_FINISH`     | `[nonce:2][status:1][hash:16][mtime_ns:8]` — the `FS_DONE` payload on success (zeroes otherwise)                                                                                                                                                                                                                                            |
@@ -347,8 +375,9 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 22  | `DESKTOP_MEDIA`       | Viewer media, portals, and MPRIS control family is understood   |
 | 23  | `PROCESS_SESSION_ENV` | `PROCESS_SPAWN` accepts the `SESSION_ENV` flag (bit 2)          |
 | 24  | `ENV`                 | Server answers `ENV_GET` with its own environment               |
-| 25  | `APP_SOCKET`          | `C2S_APP_SOCKET` mints per-application Wayland sockets           |
+| 25  | `APP_SOCKET`          | `C2S_APP_SOCKET` mints per-application Wayland sockets          |
 | 26  | `CHANNEL_WATCH`       | `CHANNEL_WATCH` follows which channel names have a listener     |
+| 27  | `CLIENT_ORIGIN`       | The client catalog can say which connections are extensions     |
 
 Bit 26 is advertised with bit 12 and never alone; it is separate because a
 `WATCH` an older server does not know is dropped by the channel family's
