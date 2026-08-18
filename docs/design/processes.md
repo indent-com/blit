@@ -153,16 +153,36 @@ they are compared with the native environment's case-insensitive key semantics
 after UTF-8 conversion, so spellings such as `Path` and `PATH` are duplicates.
 Duplicate keys are `INVALID`.
 
-Spawn flags are bit 0 `MERGE_STDERR` and bit 1 `DETACHABLE`; any other bit is
-`INVALID`. Process replies reuse the common status values, including
-`PERMISSION`. Process-count or stream-window reservation failure returns
-`PROCESS_STARTED(status = BUDGET)` before creating a child.
+Spawn flags are bit 0 `MERGE_STDERR`, bit 1 `DETACHABLE`, and bit 2
+`SESSION_ENV`; any other bit is `INVALID`. Process replies reuse the common
+status values, including `PERMISSION`. Process-count or stream-window
+reservation failure returns `PROCESS_STARTED(status = BUDGET)` before creating a
+child.
+
+`SESSION_ENV` is advertised separately from `FEATURE_PROCESS`, as
+`FEATURE_PROCESS_SESSION_ENV`, because a server which does not understand the
+flag answers with the same `INVALID` it uses for a corrupt frame — a client
+cannot tell those apart by probing, so it must gate on the feature bit.
 
 The child inherits the complete server process environment. Explicit entries
-add to it and replace inherited entries with the same key. There is no flag
-which clears or filters that environment. Unix PTY creation additionally
-rewrites terminal, compositor, desktop-bus, and audio variables; those
-terminal-specific rewrites do not apply to native pipe children.
+add to it and replace inherited entries with the same key.
+
+`SESSION_ENV` additionally applies the session environment: the compositor
+socket (`WAYLAND_DISPLAY` as a basename, with `XDG_RUNTIME_DIR` naming its
+directory), the toolkit steering every GUI application needs, the private
+desktop bus, and this session's audio sockets. It is applied _before_ explicit
+entries, so a request's own environment still wins. It also _removes_ the host
+session's counterparts — `DISPLAY` when no X bridge is running to answer it, and
+the bus and PipeWire addresses when the session has none — because a child that
+inherits those reaches a different session, or picks X11 and maps no window at
+all. Without the flag a GUI child gets whatever the server itself was started
+with, which on a desktop host is the operator's own session rather than blit's.
+
+Requesting `SESSION_ENV` starts the compositor if it is not already running: a
+supervised application can be the first thing in a session, and there would
+otherwise be no socket to name. `PROCESS_LIST` never echoes the flag — the
+catalog reports only `MERGE_STDERR` and `DETACHABLE`, because an older client
+rejects an entire `PROCESS_LISTED` message carrying a flag bit it does not know.
 
 `PROCESS_LIST` returns one point-in-time catalog snapshot. It does not allocate
 an endpoint process slot or subscribe the caller. Entries are sorted by

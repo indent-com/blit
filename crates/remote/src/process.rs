@@ -9,6 +9,13 @@ use crate::{STATUS_INVALID, STATUS_OK, STATUS_TOO_LARGE};
 
 /// `S2C_HELLO` feature bit: native non-PTY child processes.
 pub const FEATURE_PROCESS: u32 = 1 << 13;
+/// `S2C_HELLO` feature bit: `PROCESS_SPAWN_SESSION_ENV` is understood. Separate
+/// from `FEATURE_PROCESS` because the flag rejection an older server produces is
+/// indistinguishable from a malformed frame, so it cannot be probed.
+pub const FEATURE_PROCESS_SESSION_ENV: u32 = 1 << 23;
+/// `S2C_HELLO` feature bit: `C2S_APP_SOCKET` mints per-application Wayland
+/// sockets, so a surface's identity can be stamped rather than self-asserted.
+pub const FEATURE_APP_SOCKET: u32 = 1 << 25;
 
 // Direction-local process-family opcodes.
 pub const C2S_PROCESS_SPAWN: u8 = 0xC0;
@@ -29,7 +36,20 @@ pub const S2C_PROCESS_WATCHED: u8 = 0xC7;
 
 pub const PROCESS_SPAWN_MERGE_STDERR: u8 = 1 << 0;
 pub const PROCESS_SPAWN_DETACHABLE: u8 = 1 << 1;
-pub const PROCESS_SPAWN_FLAGS: u8 = PROCESS_SPAWN_MERGE_STDERR | PROCESS_SPAWN_DETACHABLE;
+/// Give the child the session environment a PTY child would get — the
+/// compositor socket, the desktop bus, and the audio sockets. Without it a GUI
+/// child inherits the *server's* environment, which on a desktop host means the
+/// host's display or none at all. Gated on `FEATURE_PROCESS_SESSION_ENV`
+/// because an older server answers an unknown flag bit with the same
+/// `STATUS_INVALID` it uses for a corrupt frame.
+pub const PROCESS_SPAWN_SESSION_ENV: u8 = 1 << 2;
+pub const PROCESS_SPAWN_FLAGS: u8 =
+    PROCESS_SPAWN_MERGE_STDERR | PROCESS_SPAWN_DETACHABLE | PROCESS_SPAWN_SESSION_ENV;
+/// Flags a catalog entry may carry, deliberately narrower than
+/// `PROCESS_SPAWN_FLAGS`: `validate_list_entry` rejects the *entire*
+/// `S2C_PROCESS_LISTED` message on an unknown bit, so echoing a newer spawn
+/// flag into the catalog would make every list read fail for older clients.
+pub const PROCESS_CATALOG_FLAGS: u8 = PROCESS_SPAWN_MERGE_STDERR | PROCESS_SPAWN_DETACHABLE;
 
 /// Request the process's single vacant stdin-writer role while watching.
 pub const PROCESS_WATCH_STDIN: u8 = 1 << 0;
@@ -878,7 +898,7 @@ pub fn parse_process_controlled(msg: &[u8]) -> Result<ProcessControlled<'_>, Pro
 fn validate_list_entry(entry: ProcessListEntry<'_>) -> Result<(), ProcessCodecError> {
     if entry.process_ref == 0
         || !matches!(entry.state, PROCESS_STATE_RUNNING | PROCESS_STATE_EXITED)
-        || entry.flags & !PROCESS_SPAWN_FLAGS != 0
+        || entry.flags & !PROCESS_CATALOG_FLAGS != 0
         || (entry.state == PROCESS_STATE_EXITED && entry.flags & PROCESS_SPAWN_DETACHABLE == 0)
         || has_nul(entry.argv0)
     {
@@ -1655,6 +1675,45 @@ mod tests {
         }
     }
 
+    /// The catalog mask must stay a strict subset of the spawn mask. Widening
+    /// it to match would make `validate_list_entry` echo a newer spawn flag into
+    /// `S2C_PROCESS_LISTED`, and an older client rejects the whole message on an
+    /// unknown bit — so every catalog read would fail, not just the new entry.
+    #[test]
+    fn the_catalog_flag_mask_stays_narrower_than_the_spawn_mask() {
+        assert_eq!(PROCESS_SPAWN_SESSION_ENV, 1 << 2);
+        assert_eq!(FEATURE_PROCESS_SESSION_ENV, 1 << 23);
+        assert_eq!(PROCESS_CATALOG_FLAGS & PROCESS_SPAWN_SESSION_ENV, 0);
+        assert_eq!(
+            PROCESS_CATALOG_FLAGS & !PROCESS_SPAWN_FLAGS,
+            0,
+            "catalog flags must be a subset of spawn flags"
+        );
+
+        // A spawn request may carry it... (the shared fixture deliberately holds
+        // a NUL in argv, so give this one a clean one).
+        let mut request = spawn_request();
+        request.argv[1] = b"ab";
+        request.flags = PROCESS_SPAWN_SESSION_ENV;
+        let encoded = msg_process_spawn(&request).expect("session-env spawn encodes");
+        assert_eq!(
+            parse_process_spawn(&encoded).expect("round-trips").flags,
+            PROCESS_SPAWN_SESSION_ENV
+        );
+
+        // ...but a catalog entry may not.
+        assert!(matches!(
+            validate_list_entry(ProcessListEntry {
+                process_ref: 1,
+                state: PROCESS_STATE_RUNNING,
+                flags: PROCESS_SPAWN_SESSION_ENV,
+                pid: 42,
+                argv0: b"legcord",
+            }),
+            Err(ProcessCodecError::Invalid)
+        ));
+    }
+
     #[test]
     fn allocation_is_locked() {
         assert_eq!(FEATURE_PROCESS, 1 << 13);
@@ -1793,7 +1852,10 @@ mod tests {
         req.env.push((b"LANG", b"other"));
         assert_eq!(msg_process_spawn(&req), Err(ProcessCodecError::Invalid));
         req.env.pop();
-        req.flags = 1 << 2;
+        // The lowest bit no flag has claimed yet — move this up, don't delete
+        // it, when a flag takes it. The point is that unknown bits are refused
+        // rather than ignored.
+        req.flags = 1 << 3;
         assert_eq!(msg_process_spawn(&req), Err(ProcessCodecError::Invalid));
         req.flags = PROCESS_SPAWN_DETACHABLE;
         req.cwd_kind = PROCESS_CWD_FROM_PTY;

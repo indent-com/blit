@@ -65,60 +65,20 @@ fn build_child_env(
             set(&mut env, "PATH", &next);
         }
     }
-    if let Some(wd) = wayland_display {
-        let wd_path = std::path::Path::new(wd);
-        if let Some(dir) = wd_path.parent() {
-            let xdg = std::env::var_os("XDG_RUNTIME_DIR");
-            let needs_update = match &xdg {
-                Some(x) => std::path::Path::new(x) != dir,
-                None => true,
-            };
-            if needs_update {
-                set(&mut env, "XDG_RUNTIME_DIR", &dir.to_string_lossy());
-            }
-        }
-        // WAYLAND_DISPLAY must be just the socket filename (e.g. "wayland-2"),
-        // not a full path.  Clients resolve it under XDG_RUNTIME_DIR.
-        let wd_name = wd_path
-            .file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_else(|| wd.into());
-        set(&mut env, "WAYLAND_DISPLAY", &wd_name);
-        // The inherited DISPLAY was filtered out above: it belongs to the
-        // host's session, not this one.  A toolkit left to choose for itself
-        // picks X11 and comes up with no window at all, so a GUI app typed
-        // at this shell gets the same steer the compositor gives the ones it
-        // spawns itself — and this session's own DISPLAY when an X11 bridge
-        // is running to answer it.
-        for (key, value) in crate::app_env::toolkit_env(x_display) {
-            set(&mut env, key, &value);
-        }
-    }
-    // The inherited address was filtered out above: both the server's audio
-    // bus and the host desktop bus belong to a different environment. The
-    // compositor-scoped bus activates portals on this Wayland display while
-    // still satisfying desktop apps (notably Spotify) that require a bus.
-    if let Some(address) = desktop_bus {
-        set(&mut env, "DBUS_SESSION_BUS_ADDRESS", address);
-    }
-    if let Some(ps) = pulse_server {
-        set(&mut env, "PULSE_SERVER", ps);
-    } else {
-        // No audio pipeline — point PULSE_SERVER at a path that will make
-        // libpulse fail immediately.  Without this, libpulse falls back to
-        // autospawn (`pulseaudio --start`) which hangs in headless /
-        // container environments.  Setting PULSE_SERVER explicitly also
-        // prevents inheriting a host PulseAudio server that would bypass
-        // blit's audio pipeline.
-        set(&mut env, "PULSE_SERVER", "/dev/null");
-    }
-    // Set PIPEWIRE_REMOTE so native PipeWire clients (mpv, Firefox, etc.)
-    // can connect to our private PipeWire instance.  WirePlumber is running
-    // as the session manager and handles linking streams to blit-sink.
-    // The path is absolute so it works regardless of the child's
-    // XDG_RUNTIME_DIR (which points at the Wayland socket directory).
-    if let Some(pr) = pipewire_remote {
-        set(&mut env, "PIPEWIRE_REMOTE", pr);
+    // The session half — compositor socket, toolkit steering, desktop bus, and
+    // audio sockets — is shared with native `PROCESS_SPAWN_SESSION_ENV` children
+    // so both routes reach the same display. Its `remove` list is already
+    // covered by the filter above, which drops the same host-session variables
+    // before they ever enter `env`.
+    let session = crate::app_env::session_env(
+        wayland_display,
+        x_display,
+        desktop_bus,
+        pulse_server,
+        pipewire_remote,
+    );
+    for (key, value) in &session.set {
+        set(&mut env, key, value);
     }
     env.into_iter()
         .filter_map(|(k, v)| CString::new(format!("{k}={v}")).ok())
