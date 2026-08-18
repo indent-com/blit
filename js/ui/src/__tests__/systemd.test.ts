@@ -288,6 +288,145 @@ describe("journal queries", () => {
   });
 });
 
+describe("journal follow", () => {
+  it("resumes from a cursor and leaves paging vocabulary out of it", async () => {
+    const peer = fakeChannel();
+    const handle = await openSystemdUnits(peer.connection as never);
+    handle.followLogs(
+      {
+        scope: "system",
+        unit: "sshd.service",
+        boot: "abc",
+        limit: 200,
+        direction: "backward",
+        cursor: "s=1",
+      },
+      { onEntries: () => {}, onEnd: () => {} },
+    );
+    const request = JSON.parse(peer.sent.at(-1)!);
+    expect(request).toMatchObject({
+      type: "follow",
+      unit: "sshd.service",
+      cursor: "s=1",
+    });
+    // A tail runs in the boot doing the writing, and has no page to bound.
+    expect(request.boot).toBeUndefined();
+    expect(request.limit).toBeUndefined();
+    expect(request.direction).toBeUndefined();
+  });
+
+  it("routes live batches to the sink, not the page router", async () => {
+    const peer = fakeChannel();
+    const handle = await openSystemdUnits(peer.connection as never);
+    const seen: string[] = [];
+    handle.followLogs(
+      {},
+      {
+        onEntries: (page) => seen.push(...page.map((e) => e.message)),
+        onEnd: () => {},
+      },
+    );
+    const { id } = JSON.parse(peer.sent.at(-1)!);
+
+    // A page query in flight alongside the tail must be settled by its own
+    // reply — every follow batch carries `last`, so this is the trap.
+    const page = handle.logs({ limit: 1 });
+    const query = JSON.parse(peer.sent.at(-1)!);
+    peer.reply({
+      type: "logs",
+      follow: true,
+      id,
+      entries: [entry("a", "tick")],
+      last: true,
+    });
+    peer.reply({
+      type: "logs",
+      follow: true,
+      id,
+      entries: [entry("b", "tock")],
+      last: true,
+    });
+    expect(seen).toEqual(["tick", "tock"]);
+
+    peer.reply({
+      type: "logs",
+      id: query.id,
+      entries: [entry("c", "page")],
+      last: true,
+    });
+    expect((await page).entries.map((e) => e.message)).toEqual(["page"]);
+  });
+
+  it("stops feeding a tail the watcher already replaced", async () => {
+    const peer = fakeChannel();
+    const handle = await openSystemdUnits(peer.connection as never);
+    const first: string[] = [];
+    const second: string[] = [];
+    handle.followLogs(
+      {},
+      {
+        onEntries: (page) => first.push(...page.map((e) => e.message)),
+        onEnd: () => {},
+      },
+    );
+    const stale = JSON.parse(peer.sent.at(-1)!).id;
+    handle.followLogs(
+      { unit: "other.service" },
+      {
+        onEntries: (page) => second.push(...page.map((e) => e.message)),
+        onEnd: () => {},
+      },
+    );
+    const fresh = JSON.parse(peer.sent.at(-1)!).id;
+
+    peer.reply({
+      type: "logs",
+      follow: true,
+      id: stale,
+      entries: [entry("a", "old")],
+      last: true,
+    });
+    peer.reply({
+      type: "logs",
+      follow: true,
+      id: fresh,
+      entries: [entry("b", "new")],
+      last: true,
+    });
+    expect(first).toEqual([]);
+    expect(second).toEqual(["new"]);
+  });
+
+  it("says when a tail ended, and stops the stream when closed", async () => {
+    const peer = fakeChannel();
+    const handle = await openSystemdUnits(peer.connection as never);
+    const ends: string[] = [];
+    const tail = handle.followLogs(
+      {},
+      { onEntries: () => {}, onEnd: (message) => ends.push(message) },
+    );
+    const { id } = JSON.parse(peer.sent.at(-1)!);
+    peer.reply({ type: "followEnd", id, message: "journal follow ended" });
+    expect(ends).toEqual(["journal follow ended"]);
+
+    // The tail is gone, so closing it must not tell the watcher to cancel a
+    // follow that a later reader may have started in the meantime.
+    tail.close();
+    expect(peer.sent.at(-1)).not.toContain("unfollow");
+  });
+
+  it("cancels the watcher's stream when the reader closes it", async () => {
+    const peer = fakeChannel();
+    const handle = await openSystemdUnits(peer.connection as never);
+    const tail = handle.followLogs(
+      {},
+      { onEntries: () => {}, onEnd: () => {} },
+    );
+    tail.close();
+    expect(JSON.parse(peer.sent.at(-1)!)).toMatchObject({ type: "unfollow" });
+  });
+});
+
 describe("unit filters", () => {
   const mirror = () => {
     const state = new SystemdUnitsMirror();

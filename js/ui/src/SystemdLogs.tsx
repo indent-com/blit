@@ -1,19 +1,22 @@
 /**
- * The journal half of the systemd panel: one page at a time, anchored by
- * cursor.
+ * The journal half of the systemd panel: a live tail over a page that grows as
+ * it is scrolled, both anchored by cursor.
  *
  * A journal is far too large to mirror, so unlike the unit table nothing here
- * is live state — every view is a query, and paging is the journal's own
- * cursors rather than an offset that would drift as entries arrive. Filtering
- * and search run in `journalctl`, so a search covers the whole boot instead of
- * whatever happened to be fetched.
+ * is a snapshot of everything — history is paged in from the journal's own
+ * cursors rather than an offset that would drift as entries arrive, and the
+ * present is a `journalctl --follow` resumed from the cursor the loaded page
+ * ends on, which is what makes the join seamless. Filtering and search run in
+ * `journalctl`, so a search covers the whole boot instead of whatever happened
+ * to be fetched.
  */
 
-import { createSignal, For, onMount, Show } from "solid-js";
+import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import type { TerminalPalette } from "@blit-sh/core";
 import type {
   SystemdBoot,
   SystemdLogEntry,
+  SystemdLogFollow,
   SystemdLogQuery,
   SystemdUnitsHandle,
 } from "./systemd";
@@ -21,6 +24,18 @@ import { mergeStyle, scrollbarStyle, themeFor, ui, uiScale } from "./theme";
 import { t, tp } from "./i18n";
 
 const PAGE = 200;
+
+/**
+ * Entries a running tail will hold.
+ *
+ * Only a tail trims, and only while the reader is at the bottom: scrolled-back
+ * history is what the reader asked for and must not evaporate under them,
+ * whereas a pane left tailing a busy unit overnight is a leak nobody asked for.
+ */
+const MAX_ENTRIES = 5000;
+
+/** Distance from an edge that counts as being at it. */
+const EDGE = 64;
 
 /** syslog severities, for the priority filter and the colour of a row. */
 const SEVERITY = [
@@ -67,8 +82,11 @@ export function SystemdLogs(props: {
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [olderLeft, setOlderLeft] = createSignal(true);
+  const [newerLeft, setNewerLeft] = createSignal(true);
+  const [live, setLive] = createSignal(true);
 
   let list: HTMLDivElement | undefined;
+  let tail: SystemdLogFollow | null = null;
 
   const filters = (): SystemdLogQuery => ({
     scope: scope() as SystemdLogQuery["scope"],
@@ -82,9 +100,9 @@ export function SystemdLogs(props: {
   const run = async (
     query: SystemdLogQuery,
     merge: (page: readonly SystemdLogEntry[]) => readonly SystemdLogEntry[],
-  ) => {
+  ): Promise<readonly SystemdLogEntry[] | null> => {
     const handle = props.handle;
-    if (!handle || busy()) return;
+    if (!handle || busy()) return null;
     setBusy(true);
     setError(null);
     try {
@@ -95,24 +113,86 @@ export function SystemdLogs(props: {
       } else if (!query.cursor) {
         setOlderLeft(page.more);
       }
+      return page.entries;
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
+      return null;
     } finally {
       setBusy(false);
     }
   };
 
-  /** Newest page, scrolled to the bottom the way a log is read. */
-  const reload = async () => {
-    await run({ ...filters() }, (page) => page);
+  /** Whether the reader is parked at the newest row rather than reading back. */
+  const atBottom = () =>
+    !list || list.scrollHeight - list.scrollTop - list.clientHeight <= EDGE;
+
+  const toBottom = () =>
     queueMicrotask(() => {
       if (list) list.scrollTop = list.scrollHeight;
     });
+
+  /**
+   * A tail is the boot doing the writing, so a past boot cannot have one — and
+   * a filter narrow enough to be worth reading is still worth tailing.
+   */
+  const canFollow = () => {
+    const chosen = boot();
+    if (!chosen) return true;
+    return boots().find((entry) => entry.boot === chosen)?.index === "0";
+  };
+
+  /** Whether entries are arriving on their own right now. */
+  const tailing = () => live() && canFollow();
+
+  const stopTail = () => {
+    tail?.close();
+    tail = null;
+  };
+
+  /** Resume the live tail from the newest entry held, so the join has no gap. */
+  const startTail = () => {
+    stopTail();
+    const handle = props.handle;
+    if (!handle || !live() || !canFollow()) return;
+    tail = handle.followLogs(
+      { ...filters(), cursor: entries().at(-1)?.cursor },
+      {
+        onEntries: (page) => {
+          if (!page.length) return;
+          const pinned = atBottom();
+          setEntries((current) => {
+            const merged = [...current, ...page];
+            return pinned && merged.length > MAX_ENTRIES
+              ? merged.slice(merged.length - MAX_ENTRIES)
+              : merged;
+          });
+          setNewerLeft(true);
+          if (pinned) toBottom();
+        },
+        onEnd: (message) => {
+          // Whatever ended it, the pane is no longer live, and a pane that
+          // looks live while standing still is worse than one that says so.
+          tail = null;
+          setLive(false);
+          if (message) setError(message);
+        },
+      },
+    );
+  };
+
+  /** Newest page, scrolled to the bottom the way a log is read. */
+  const reload = async () => {
+    stopTail();
+    setNewerLeft(true);
+    await run({ ...filters() }, (page) => page);
+    toBottom();
+    startTail();
   };
 
   const older = async () => {
     const first = entries()[0];
     if (!first) return reload();
+    if (!olderLeft() || busy()) return;
     const anchored = list?.scrollHeight ?? 0;
     await run(
       { ...filters(), cursor: first.cursor, direction: "backward" },
@@ -127,10 +207,32 @@ export function SystemdLogs(props: {
   const newer = async () => {
     const last = entries().at(-1);
     if (!last) return reload();
-    await run(
+    if (busy()) return;
+    const page = await run(
       { ...filters(), cursor: last.cursor, direction: "forward" },
-      (page) => [...entries(), ...page],
+      (rows) => [...entries(), ...rows],
     );
+    // Nothing newer to read: stop asking until something moves the end again.
+    if (page && page.length === 0) setNewerLeft(false);
+  };
+
+  /**
+   * Paging as scrolling, in the direction the reader is heading.
+   *
+   * Reaching the top always loads history. Reaching the bottom only pages
+   * forward when nothing is tailing — a live tail already owns that edge, and
+   * asking for a page it is about to deliver would double every entry.
+   */
+  const onScroll = () => {
+    if (!list || busy()) return;
+    if (list.scrollTop <= EDGE) {
+      void older();
+      return;
+    }
+    if (tailing() || !newerLeft()) return;
+    if (list.scrollHeight - list.scrollTop - list.clientHeight <= EDGE) {
+      void newer();
+    }
   };
 
   onMount(() => {
@@ -140,6 +242,8 @@ export function SystemdLogs(props: {
       .then(setBoots)
       .catch(() => setBoots([]));
   });
+
+  onCleanup(stopTail);
 
   const severityColor = (priorityValue: string): string => {
     const level = Number(priorityValue);
@@ -172,6 +276,7 @@ export function SystemdLogs(props: {
       >
         <select
           value={scope()}
+          data-journal-scope={scope()}
           onChange={(event) => {
             setScope(event.currentTarget.value);
             void reload();
@@ -244,38 +349,36 @@ export function SystemdLogs(props: {
         </div>
       </Show>
 
+      {/* What the pane is doing, not buttons to make it do it: history comes in
+          by scrolling and the tail runs by itself, so there is nothing here a
+          reader would have to press. No line count either — the only number
+          this side could offer is how many rows happen to be buffered, which
+          answers a question nobody asked. */}
       <div
         style={{
           display: "flex",
           gap: `${scale().sm}px`,
           "align-items": "center",
+          color: theme().dimFg,
+          "font-size": `${scale().sm}px`,
         }}
       >
-        <button
-          type="button"
-          disabled={busy() || !olderLeft()}
-          style={mergeStyle(ui.btn, control())}
-          onClick={() => void older()}
-        >
-          {t("systemd.logsOlder")}
-        </button>
-        <button
-          type="button"
-          disabled={busy()}
-          style={mergeStyle(ui.btn, control())}
-          onClick={() => void newer()}
-        >
-          {t("systemd.logsNewer")}
-        </button>
-        <span style={{ color: theme().dimFg, "font-size": `${scale().sm}px` }}>
-          {busy()
-            ? t("systemd.logsLoading")
-            : tp("systemd.logsCount", { count: String(entries().length) })}
+        <span data-journal-live={tailing() ? "on" : "off"}>
+          {tailing()
+            ? t("systemd.logsLive")
+            : canFollow()
+              ? t("systemd.logsPaused")
+              : t("systemd.logsLiveBoot")}
         </span>
+        <Show when={busy()}>
+          <span>{t("systemd.logsLoading")}</span>
+        </Show>
       </div>
 
       <div
         ref={list}
+        data-journal-list
+        onScroll={onScroll}
         style={mergeStyle(scrollbarStyle(theme()), {
           "overflow-y": "auto",
           "max-height": "56vh",
@@ -293,6 +396,7 @@ export function SystemdLogs(props: {
         >
           {(entry) => (
             <div
+              data-journal-row
               style={{
                 display: "grid",
                 "grid-template-columns": "12em 16em minmax(0, 1fr)",

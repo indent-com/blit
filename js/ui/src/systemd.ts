@@ -116,6 +116,21 @@ export interface SystemdLogPage {
   readonly more: boolean;
 }
 
+/** Where a live tail delivers, until it ends or is closed. */
+export interface SystemdLogSink {
+  onEntries(entries: readonly SystemdLogEntry[]): void;
+  /**
+   * The tail stopped by itself — `journalctl` exited, or the channel closed.
+   * A tail replaced by another, or closed by the reader, does not report this.
+   */
+  onEnd(message: string): void;
+}
+
+/** A running tail. Closing it stops the `journalctl` behind it. */
+export interface SystemdLogFollow {
+  close(): void;
+}
+
 export interface SystemdUnitsHandle extends ReactiveStore {
   readonly scopes: ReadonlyMap<string, SystemdScopeState>;
   /** Look one unit up, optionally in one scope. */
@@ -128,6 +143,14 @@ export interface SystemdUnitsHandle extends ReactiveStore {
   setScopes(scopes: readonly string[]): void;
   /** One page of the journal. Rejects with journalctl's own words. */
   logs(query?: SystemdLogQuery): Promise<SystemdLogPage>;
+  /**
+   * Tail the journal live, resuming after `query.cursor` so the join with an
+   * already-loaded page has neither a gap nor a repeat.
+   *
+   * One tail per handle: the watcher cancels the channel's previous follow
+   * when a new one starts, so opening a second silently ends the first.
+   */
+  followLogs(query: SystemdLogQuery, sink: SystemdLogSink): SystemdLogFollow;
   /** Boots the journal still holds, oldest first. */
   boots(): Promise<readonly SystemdBoot[]>;
   close(): void;
@@ -478,7 +501,33 @@ export async function openSystemdUnits(
     timer: ReturnType<typeof setTimeout>;
   }
   const pending = new Map<string, Pending>();
+  const follows = new Map<string, SystemdLogSink>();
   let nextRequestId = 1;
+
+  /**
+   * Take the live tail's messages before the page router sees them.
+   *
+   * A follow batch is shaped like a page — same `logs` type, same id field,
+   * and `last` set on every batch — so without this it would settle a query
+   * that never asked anything. `follow: true` is the only thing telling them
+   * apart, and a batch for a tail already replaced belongs to nobody.
+   */
+  const routeFollow = (message: Record<string, unknown>): boolean => {
+    const id = typeof message.id === "string" ? message.id : "";
+    if (!id) return false;
+    if (message.type === "followEnd") {
+      const sink = follows.get(id);
+      follows.delete(id);
+      sink?.onEnd(typeof message.message === "string" ? message.message : "");
+      return true;
+    }
+    if (message.type !== "logs" || message.follow !== true) return false;
+    const sink = follows.get(id);
+    if (sink && Array.isArray(message.entries)) {
+      sink.onEntries(message.entries.filter(isLogEntry));
+    }
+    return true;
+  };
 
   const settle = (message: Record<string, unknown>): boolean => {
     const id = typeof message.id === "string" ? message.id : "";
@@ -518,12 +567,9 @@ export async function openSystemdUnits(
       } catch {
         return;
       }
-      if (
-        typeof message === "object" &&
-        message !== null &&
-        settle(message as Record<string, unknown>)
-      ) {
-        return;
+      if (typeof message === "object" && message !== null) {
+        const record = message as Record<string, unknown>;
+        if (routeFollow(record) || settle(record)) return;
       }
       mirror.apply(payload);
     },
@@ -533,6 +579,13 @@ export async function openSystemdUnits(
         clearTimeout(waiting.timer);
         waiting.reject(new Error(detail || `channel closed (${reason})`));
         pending.delete(id);
+      }
+      // A tail whose channel went away has stopped, and saying so is what
+      // keeps a viewer from trusting a pane that will never update again.
+      const tails = [...follows.values()];
+      follows.clear();
+      for (const sink of tails) {
+        sink.onEnd(detail || `channel closed (${reason})`);
       }
       options.onClosed?.(reason, detail);
     },
@@ -590,6 +643,37 @@ export async function openSystemdUnits(
       return {
         entries: page.entries.filter(isLogEntry),
         more: page.more,
+      };
+    },
+    followLogs: (request: SystemdLogQuery, sink: SystemdLogSink) => {
+      const id = String(nextRequestId++);
+      // The watcher keeps one follow per channel and cancels the previous one
+      // as this starts, so the sink it was feeding has to stop hearing batches
+      // at the same moment rather than interleave with the new tail's.
+      follows.clear();
+      follows.set(id, sink);
+      // `boot`, `limit` and `direction` are a page's vocabulary: a tail runs
+      // from a cursor to whatever arrives next, in the boot doing the writing.
+      const started = channel?.send(
+        JSON.stringify({
+          type: "follow",
+          id,
+          scope: request.scope,
+          unit: request.unit,
+          priority: request.priority,
+          grep: request.grep,
+          cursor: request.cursor,
+        }),
+      );
+      if (!started) {
+        follows.delete(id);
+        sink.onEnd("channel is closed");
+      }
+      return {
+        close: () => {
+          if (!follows.delete(id)) return;
+          channel?.send(JSON.stringify({ type: "unfollow" }));
+        },
       };
     },
     boots: async () => {
