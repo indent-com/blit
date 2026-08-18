@@ -21,20 +21,13 @@
  * remote costs no channel traffic.
  */
 
-import {
-  createEffect,
-  createMemo,
-  createSignal,
-  For,
-  onCleanup,
-  Show,
-} from "solid-js";
+import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
 import type {
   BlitWorkspace,
   ConnectionId,
   TerminalPalette,
 } from "@blit-sh/core";
-import { themeFor, ui, uiScale } from "./theme";
+import { scrollbarStyle, themeFor, ui, uiScale } from "./theme";
 import {
   AppIcon,
   PanelEmpty,
@@ -125,9 +118,6 @@ export function ConnectionSession(props: {
           entry.id.toLowerCase().includes(needle),
       );
   };
-  /** Bounded so a one-letter search cannot render hundreds of rows into an
-   *  already-expanded remote — nor ask the supervisor for hundreds of icons. */
-  const shown = createMemo(() => addable().slice(0, 12));
   /** Artwork for one row. Reads the revision like every other accessor here:
    *  an icon arrives long after the row that wants it was drawn, and the
    *  handle's getters are plain properties rather than signals, so without
@@ -138,19 +128,60 @@ export function ConnectionSession(props: {
   };
 
   // Artwork is asked for, never pushed: the catalog is names, and its icons are
-  // three orders of magnitude larger. So the panel asks for exactly the rows it
-  // draws, and the handle drops the ids it has already asked about — which is
-  // most of them, on most renders.
+  // three orders of magnitude larger. The managed set is small and always on
+  // screen, so it is asked for outright.
   createEffect(() => {
     const session = handle();
     if (!session) return;
     session.requestIcons(apps().map((app) => app.id));
   });
-  createEffect(() => {
-    const session = handle();
-    if (!session) return;
-    session.requestIcons(shown().map((entry) => entry.id));
-  });
+
+  // The catalog is not. Every installed application is a row, which on a
+  // machine with a games library is nine hundred of them — asking for all that
+  // artwork would be tens of megabytes to draw a dozen tiles. So a row asks
+  // only once it is near the viewport, and the observer's own batching is what
+  // turns a scroll into one request rather than one per row.
+  //
+  // Rooted at the viewport rather than at the list's own scroller, which would
+  // read better and cannot be done: a child's `ref` can run before its
+  // parent's, so the rows would find no observer and would each ask outright —
+  // the storm this exists to prevent. The viewport is the correct root anyway,
+  // because an intersection is clipped by every scrolling ancestor on the way
+  // up, this list's included.
+  const iconWatcher = (() => {
+    // Absent under jsdom. Rows fall back to asking outright, so a client
+    // without it still shows artwork — it just asks for more of it.
+    if (typeof IntersectionObserver === "undefined") return undefined;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const ids = entries
+          .filter((entry) => entry.isIntersecting)
+          .map((entry) => {
+            // Once asked, a row has nothing more to say: the answer is cached
+            // by the handle and by the mirror, either way.
+            observer.unobserve(entry.target);
+            return (entry.target as HTMLElement).dataset.appId;
+          })
+          .filter((id): id is string => id !== undefined);
+        if (ids.length > 0) handle()?.requestIcons(ids);
+      },
+      // A screen ahead, so scrolling meets artwork already there rather than a
+      // wave of monograms filling in behind it.
+      { rootMargin: "300px" },
+    );
+    onCleanup(() => observer.disconnect());
+    return observer;
+  })();
+  /** Attach one catalog row to the watcher, or ask outright without one. */
+  const watchForIcon = (element: HTMLElement, id: string) => {
+    element.dataset.appId = id;
+    if (!iconWatcher) {
+      handle()?.requestIcons([id]);
+      return;
+    }
+    iconWatcher.observe(element);
+    onCleanup(() => iconWatcher.unobserve(element));
+  };
 
   return (
     <Show when={handle()}>
@@ -350,9 +381,10 @@ export function ConnectionSession(props: {
             </For>
           </Show>
 
-          {/* Adding. A filter plus a list rather than a <select>: the catalog
-              is every installed application, which on a machine with a games
-              library runs to hundreds of entries. */}
+          {/* Adding. The whole catalog, scrolling, with the filter narrowing it
+              rather than summoning it: this list used to be hidden behind
+              typing, which asked a viewer to name what they wanted before
+              being shown that it existed. A launcher shows its shelf. */}
           <SectionHeading
             theme={theme()}
             scale={scale()}
@@ -380,27 +412,32 @@ export function ConnectionSession(props: {
           </SectionHeading>
 
           <Show
-            when={filter().trim().length > 0}
+            when={addable().length > 0}
             fallback={
               <PanelEmpty theme={theme()} scale={scale()}>
-                {catalog().length > 0
-                  ? `${catalog().length} installed — type to search.`
-                  : "No installed applications found."}
+                {catalog().length === 0
+                  ? "No installed applications found."
+                  : `Nothing installed matches “${filter().trim()}”.`}
               </PanelEmpty>
             }
           >
-            <Show
-              when={addable().length > 0}
-              fallback={
-                <PanelEmpty theme={theme()} scale={scale()}>
-                  Nothing installed matches “{filter().trim()}”.
-                </PanelEmpty>
-              }
+            {/* The catalog gets a scroller of its own rather than riding the
+                overlay's: it is the only unbounded thing here, and letting it
+                lengthen the panel would scroll the search box — the one
+                control for a nine-hundred-row list — off the top. */}
+            <div
+              style={{
+                "max-height": "42vh",
+                "overflow-y": "auto",
+                "min-width": "0",
+                ...scrollbarStyle(theme()),
+              }}
             >
-              <For each={shown()}>
+              <For each={addable()}>
                 {(entry) => (
                   <PanelRow theme={theme()} scale={scale()}>
                     <div
+                      ref={(element) => watchForIcon(element, entry.id)}
                       style={{
                         display: "flex",
                         "align-items": "center",
@@ -455,12 +492,7 @@ export function ConnectionSession(props: {
                   </PanelRow>
                 )}
               </For>
-              <Show when={addable().length > 12}>
-                <PanelEmpty theme={theme()} scale={scale()}>
-                  {addable().length - 12} more — narrow the search.
-                </PanelEmpty>
-              </Show>
-            </Show>
+            </div>
           </Show>
         </div>
       )}
