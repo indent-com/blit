@@ -14,7 +14,7 @@
  */
 
 import type { JSX } from "solid-js";
-import { Show } from "solid-js";
+import { createSignal, Show } from "solid-js";
 import type { Theme, UIScale } from "./theme";
 import { ui } from "./theme";
 
@@ -119,6 +119,70 @@ export function StatusPill(props: {
         }}
       />
       {props.label}
+    </span>
+  );
+}
+
+/**
+ * An application's artwork, with a monogram standing in for it.
+ *
+ * The monogram is not a fallback in the "something went wrong" sense — it is
+ * what the tile looks like until an icon arrives, and what it keeps looking
+ * like for the many entries that ship no `Icon=` or name one no installed theme
+ * has. Drawing it from the first render means the row's geometry is settled
+ * before the artwork lands, so a list of twenty applications does not reflow
+ * twenty times as the icons trickle in.
+ *
+ * `src` is three-valued on purpose: `undefined` while nobody has answered,
+ * `null` for "there is none". They look the same, which is the point — a
+ * placeholder that announced itself as temporary would be wrong half the time.
+ */
+export function AppIcon(props: {
+  theme: Theme;
+  scale: UIScale;
+  name: string;
+  src?: string | null;
+}): JSX.Element {
+  // A data URL the browser cannot decode is indistinguishable from no icon at
+  // all as far as the row is concerned, so it becomes one.
+  const [broken, setBroken] = createSignal(false);
+  const size = () => Math.round(props.scale.md * 1.9);
+  const monogram = () =>
+    (props.name.match(/\p{L}|\p{N}/u)?.[0] ?? "?").toUpperCase();
+
+  return (
+    <span
+      aria-hidden="true"
+      style={{
+        display: "inline-flex",
+        "align-items": "center",
+        "justify-content": "center",
+        width: `${size()}px`,
+        height: `${size()}px`,
+        "flex-shrink": "0",
+        "border-radius": `${Math.max(2, Math.round(size() * 0.18))}px`,
+        overflow: "hidden",
+        "background-color": props.theme.hoverBg,
+        color: props.theme.dimFg,
+        "font-size": `${props.scale.sm}px`,
+        "line-height": "1",
+        "user-select": "none",
+      }}
+    >
+      <Show when={props.src && !broken()} fallback={monogram()}>
+        <img
+          src={props.src ?? undefined}
+          alt=""
+          onError={() => setBroken(true)}
+          style={{
+            width: "100%",
+            height: "100%",
+            // Icons are square by convention and rectangular in practice;
+            // `contain` keeps a wide logo whole rather than cropping it.
+            "object-fit": "contain",
+          }}
+        />
+      </Show>
     </span>
   );
 }

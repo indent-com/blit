@@ -23,6 +23,10 @@ pub struct DesktopEntry {
     pub name: String,
     /// `Exec` with field codes removed and quoting resolved.
     pub argv: Vec<String>,
+    /// `Icon`, when set: either a bare name to look up on the icon path or an
+    /// absolute path to a file. Kept exactly as written, because deciding which
+    /// of the two it is belongs to [`super::icon`] rather than to the parser.
+    pub icon: Option<String>,
     /// `StartupWMClass`, when set. Not used for identity — a stamped socket is
     /// the source of truth — but useful to show next to it when they disagree.
     pub startup_wm_class: Option<String>,
@@ -46,6 +50,7 @@ pub fn parse(id: &str, contents: &str) -> Option<DesktopEntry> {
     let mut name = None;
     let mut exec = None;
     let mut try_exec = None;
+    let mut icon = None;
     let mut startup_wm_class = None;
     let mut terminal = false;
     let mut hidden = false;
@@ -73,6 +78,7 @@ pub fn parse(id: &str, contents: &str) -> Option<DesktopEntry> {
             "Name" => name = Some(value.to_string()),
             "Exec" => exec = Some(value.to_string()),
             "TryExec" => try_exec = Some(value.to_string()),
+            "Icon" if !value.is_empty() => icon = Some(value.to_string()),
             "StartupWMClass" => startup_wm_class = Some(value.to_string()),
             "Terminal" => terminal = value == "true",
             "NoDisplay" | "Hidden" => hidden |= value == "true",
@@ -88,6 +94,7 @@ pub fn parse(id: &str, contents: &str) -> Option<DesktopEntry> {
         id: id.to_string(),
         name: name.unwrap_or_else(|| id.to_string()),
         argv,
+        icon,
         startup_wm_class,
         try_exec,
         terminal,
@@ -278,6 +285,32 @@ mod tests {
         assert!(entry.terminal);
         assert_eq!(entry.try_exec.as_deref(), Some("/usr/bin/htop"));
         assert_eq!(entry.startup_wm_class.as_deref(), Some("htop"));
+    }
+
+    /// An empty `Icon=` is a key that says nothing, and treating it as a name
+    /// would send the lookup after a file called `.png`.
+    #[test]
+    fn an_icon_is_read_but_an_empty_one_is_not() {
+        let entry =
+            parse("q", "[Desktop Entry]\nExec=x\nIcon=org.gnome.Nautilus\n").expect("parses");
+        assert_eq!(entry.icon.as_deref(), Some("org.gnome.Nautilus"));
+
+        let entry =
+            parse("r", "[Desktop Entry]\nExec=x\nIcon=/opt/app/logo.png\n").expect("parses");
+        assert_eq!(entry.icon.as_deref(), Some("/opt/app/logo.png"));
+
+        assert!(
+            parse("s", "[Desktop Entry]\nExec=x\nIcon=\n")
+                .expect("parses")
+                .icon
+                .is_none()
+        );
+        assert!(
+            parse("t", "[Desktop Entry]\nExec=x\n")
+                .expect("parses")
+                .icon
+                .is_none()
+        );
     }
 
     #[test]

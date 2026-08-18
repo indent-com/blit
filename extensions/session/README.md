@@ -68,6 +68,24 @@ bare text line back: `enable`, `disable`, `start`, `stop`, `forget`,
 `resync`, each followed by a desktop-entry id. `js/ui/src/session.ts` mirrors it, and the
 **Applications** tab of an expanded remote is what a viewer sees.
 
+### Icons
+
+Artwork is the one thing the panel asks for rather than being told. `icons`
+takes newline-separated ids — newline because a desktop-entry id is a filename,
+and Steam alone installs hundreds with spaces in them — and is answered with one
+`{"type":"icon","id":…,"icon":"data:…"}` per id, with `icon` omitted when there
+is none. It is a request because the asymmetry is enormous: a thousand-entry
+catalog is tens of kilobytes of names and tens of megabytes of icons, so the
+panel asks for the dozen rows it is drawing and nothing else.
+
+`icon.rs` resolves an `Icon=` value the cheap way — the best-sized file of that
+name anywhere on the icon path, rather than the spec's theme-inheritance search
+— in two shell round trips per batch: one that stats candidates, one that
+base64s the files the ranking picked. Scalable art wins, then the smallest
+raster at or above 128px. Results are cached in the guest by icon name, because
+a desktop and its `-nightly` twin share one, and so do the dozens of entries
+that all say `application-x-executable`.
+
 ## Restarting, and not restarting
 
 Backoff mirrors the server's own extension supervisor — 250 ms base, 30 s cap,

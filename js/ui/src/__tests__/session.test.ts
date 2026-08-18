@@ -87,6 +87,54 @@ describe("SessionMirror", () => {
     expect(mirror.revision).toBe(revision);
   });
 
+  /** Three states, not two: a row has to be able to tell "no artwork exists"
+   *  from "the answer has not arrived", or it re-asks forever. */
+  it("records an icon, and records its absence too", () => {
+    const mirror = new SessionMirror();
+    expect(mirror.icon("gimp")).toBeUndefined();
+
+    mirror.apply(
+      encode({ type: "icon", id: "gimp", icon: "data:image/png;base64,AAA" }),
+    );
+    expect(mirror.icon("gimp")).toBe("data:image/png;base64,AAA");
+
+    // No `icon` field is the answer "there is none".
+    mirror.apply(encode({ type: "icon", id: "bare" }));
+    expect(mirror.icon("bare")).toBeNull();
+  });
+
+  /** An icon message carries no apps, and reading it as state would empty the
+   *  list every time a row's artwork arrived. */
+  it("an icon message leaves the application list alone", () => {
+    const mirror = new SessionMirror();
+    mirror.apply(
+      state(
+        [{ id: "a", name: "A", phase: "running" }],
+        [{ id: "a", name: "A" }],
+      ),
+    );
+    mirror.apply(
+      encode({ type: "icon", id: "a", icon: "data:image/svg+xml;base64,AAA" }),
+    );
+    expect(mirror.apps.map((app) => app.id)).toEqual(["a"]);
+    expect(mirror.catalog).toHaveLength(1);
+  });
+
+  /** The value lands in an `<img src>`, so anything that is not a data URL is
+   *  refused rather than passed through — a `javascript:` icon is not an icon. */
+  it("refuses an icon that is not a data URL", () => {
+    const mirror = new SessionMirror();
+    mirror.apply(
+      encode({ type: "icon", id: "a", icon: "javascript:alert(1)" }),
+    );
+    expect(mirror.icon("a")).toBeNull();
+    mirror.apply(encode({ type: "icon", id: "b", icon: 42 }));
+    expect(mirror.icon("b")).toBeNull();
+    // An id-less message answers for nothing and is dropped whole.
+    mirror.apply(encode({ type: "icon", icon: "data:image/png;base64,AAA" }));
+    expect(mirror.icon("")).toBeUndefined();
+  });
+
   it("notifies subscribers once per applied message", () => {
     const mirror = new SessionMirror();
     let calls = 0;
@@ -141,6 +189,29 @@ describe("openSession", () => {
       "forget org.gnome.Nautilus",
       "resync",
     ]);
+  });
+
+  /** The panel calls this on every render of every row, so the dedup is what
+   *  keeps a redraw from being a request storm. */
+  it("asks for each icon once, in batches the extension will accept", async () => {
+    const connection = fakeConnection();
+    const session = await openSession(connection);
+    session.requestIcons(["a", "b"]);
+    session.requestIcons(["b", "c"]);
+    expect(connection.sent).toEqual(["icons a\nb", "icons c"]);
+
+    connection.sent.length = 0;
+    const many = Array.from({ length: 25 }, (_, at) => `app${at}`);
+    session.requestIcons(many);
+    expect(connection.sent).toHaveLength(2);
+    expect(connection.sent[0]?.split("\n")).toHaveLength(24);
+    expect(connection.sent[1]).toBe("icons app24");
+
+    // Steam names hundreds of its entries "3DMark Demo.desktop", so a space in
+    // an id is ordinary and must survive the batching.
+    connection.sent.length = 0;
+    session.requestIcons(["3DMark Demo", ""]);
+    expect(connection.sent).toEqual(["icons 3DMark Demo"]);
   });
 
   it("stops sending once closed", async () => {

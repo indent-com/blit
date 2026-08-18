@@ -21,7 +21,14 @@
  * remote costs no channel traffic.
  */
 
-import { createSignal, For, onCleanup, Show } from "solid-js";
+import {
+  createEffect,
+  createMemo,
+  createSignal,
+  For,
+  onCleanup,
+  Show,
+} from "solid-js";
 import type {
   BlitWorkspace,
   ConnectionId,
@@ -29,6 +36,7 @@ import type {
 } from "@blit-sh/core";
 import { themeFor, ui, uiScale } from "./theme";
 import {
+  AppIcon,
   PanelEmpty,
   PanelRow,
   panelButton,
@@ -117,6 +125,32 @@ export function ConnectionSession(props: {
           entry.id.toLowerCase().includes(needle),
       );
   };
+  /** Bounded so a one-letter search cannot render hundreds of rows into an
+   *  already-expanded remote — nor ask the supervisor for hundreds of icons. */
+  const shown = createMemo(() => addable().slice(0, 12));
+  /** Artwork for one row. Reads the revision like every other accessor here:
+   *  an icon arrives long after the row that wants it was drawn, and the
+   *  handle's getters are plain properties rather than signals, so without
+   *  this the reply lands in the mirror and nothing re-renders. */
+  const iconOf = (id: string) => {
+    revision();
+    return handle()?.icon(id);
+  };
+
+  // Artwork is asked for, never pushed: the catalog is names, and its icons are
+  // three orders of magnitude larger. So the panel asks for exactly the rows it
+  // draws, and the handle drops the ids it has already asked about — which is
+  // most of them, on most renders.
+  createEffect(() => {
+    const session = handle();
+    if (!session) return;
+    session.requestIcons(apps().map((app) => app.id));
+  });
+  createEffect(() => {
+    const session = handle();
+    if (!session) return;
+    session.requestIcons(shown().map((entry) => entry.id));
+  });
 
   return (
     <Show when={handle()}>
@@ -158,30 +192,48 @@ export function ConnectionSession(props: {
                     <span
                       style={{
                         display: "flex",
-                        "align-items": "baseline",
-                        gap: `${scale().tightGap}px`,
+                        // The icon is the tallest thing in the row, so the text
+                        // centres against it rather than sitting on a baseline
+                        // the tile does not share.
+                        "align-items": "center",
+                        gap: `${scale().gap}px`,
                         "min-width": "0",
                       }}
                     >
-                      <strong
+                      <AppIcon
+                        theme={theme()}
+                        scale={scale()}
+                        name={app.name}
+                        src={iconOf(app.id)}
+                      />
+                      <span
                         style={{
-                          overflow: "hidden",
-                          "text-overflow": "ellipsis",
-                          "white-space": "nowrap",
+                          display: "flex",
+                          "align-items": "baseline",
+                          gap: `${scale().tightGap}px`,
+                          "min-width": "0",
                         }}
                       >
-                        {app.name}
-                      </strong>
-                      <Show when={app.name !== app.id}>
-                        <span
+                        <strong
                           style={{
-                            color: theme().dimFg,
-                            "font-size": `${scale().sm}px`,
+                            overflow: "hidden",
+                            "text-overflow": "ellipsis",
+                            "white-space": "nowrap",
                           }}
                         >
-                          {app.id}
-                        </span>
-                      </Show>
+                          {app.name}
+                        </strong>
+                        <Show when={app.name !== app.id}>
+                          <span
+                            style={{
+                              color: theme().dimFg,
+                              "font-size": `${scale().sm}px`,
+                            }}
+                          >
+                            {app.id}
+                          </span>
+                        </Show>
+                      </span>
                     </span>
 
                     <span
@@ -345,9 +397,7 @@ export function ConnectionSession(props: {
                 </PanelEmpty>
               }
             >
-              {/* Bounded so a one-letter search cannot render hundreds of rows
-                  into an already-expanded remote. */}
-              <For each={addable().slice(0, 12)}>
+              <For each={shown()}>
                 {(entry) => (
                   <PanelRow theme={theme()} scale={scale()}>
                     <div
@@ -360,20 +410,35 @@ export function ConnectionSession(props: {
                     >
                       <span
                         style={{
+                          display: "flex",
+                          "align-items": "center",
+                          gap: `${scale().gap}px`,
                           "min-width": "0",
-                          overflow: "hidden",
-                          "text-overflow": "ellipsis",
-                          "white-space": "nowrap",
                         }}
                       >
-                        {entry.name}
+                        <AppIcon
+                          theme={theme()}
+                          scale={scale()}
+                          name={entry.name}
+                          src={iconOf(entry.id)}
+                        />
                         <span
                           style={{
-                            color: theme().dimFg,
-                            "font-size": `${scale().sm}px`,
+                            "min-width": "0",
+                            overflow: "hidden",
+                            "text-overflow": "ellipsis",
+                            "white-space": "nowrap",
                           }}
                         >
-                          {` ${entry.id}`}
+                          {entry.name}
+                          <span
+                            style={{
+                              color: theme().dimFg,
+                              "font-size": `${scale().sm}px`,
+                            }}
+                          >
+                            {` ${entry.id}`}
+                          </span>
                         </span>
                       </span>
                       <button

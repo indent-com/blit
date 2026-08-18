@@ -8,6 +8,7 @@
 //! uses the SDK's non-blocking `offer` to hand channel packets over.
 
 use blit_ext_session::desktop_entry::{self, DesktopEntry};
+use blit_ext_session::icon;
 use blit_ext_session::supervisor::{App, Phase, next_deadline_ns};
 use blit_guest::command::{CommandProvider, Error, ProviderEvent};
 use blit_guest::remote;
@@ -61,6 +62,36 @@ blit_guest::entry!(run);
 /// and long enough that the read never lands on a hot path.
 const CATALOG_TTL: Duration = Duration::from_secs(60);
 
+/// Most icons a panel may ask for in one request.
+///
+/// The panel asks for what it is about to draw — its managed rows and one page
+/// of search hits — so this is a bound on a mistake rather than on ordinary
+/// use. Each id costs a stat sweep and possibly a file read, all of it in the
+/// middle of the receive loop, so an unbounded request would be a way to stall
+/// the supervisor from the browser.
+const MAX_ICON_REQUEST: usize = 24;
+
+/// Resolved artwork kept in the guest before the cache is dropped wholesale.
+///
+/// Measured in bytes rather than entries because the entries are not
+/// comparable: a themed SVG is 3 KB and a 128px PNG can be [`icon::MAX_ICON_BYTES`],
+/// so any count that is safe for the second is uselessly small for the first.
+/// Base64 art is by far the largest thing this extension holds, and a session
+/// whose operator scrolls a thousand-entry catalog would otherwise accumulate
+/// all of it.
+///
+/// Clearing rather than evicting the oldest entry keeps the bookkeeping to a
+/// comparison: a miss costs one shell round trip, and the panel has its own
+/// cache, so nothing already on screen pays for it.
+const MAX_CACHED_ICON_BYTES: usize = 4 * 1024 * 1024;
+
+/// Icon messages a connection may have waiting on credit.
+///
+/// Icons are queued rather than dropped — unlike state, a dropped icon is never
+/// resent, because nothing changes to provoke a repeat — but a panel that stops
+/// acking must still not be able to grow the guest without limit.
+const MAX_QUEUED_ICONS: usize = 32;
+
 /// One browser connected to [`CHANNEL_NAME`].
 struct Conn {
     id: u32,
@@ -80,6 +111,13 @@ struct Conn {
     /// repeat of it suppressed as a duplicate — it stayed stale until some
     /// unrelated change came along.
     last_sent: String,
+    /// Icon messages waiting for credit, oldest first.
+    ///
+    /// State can be dropped when a panel is out of credit because the next
+    /// publish carries it again. An icon reply cannot: it answers a request
+    /// that will not be repeated, so dropping one leaves a row with a
+    /// placeholder for the rest of the session.
+    queued: Vec<String>,
 }
 
 /// One application's persisted intent.
@@ -98,6 +136,20 @@ struct State {
     installed: BTreeMap<String, DesktopEntry>,
     /// When the catalog was last read, for [`CATALOG_TTL`].
     installed_at_ns: Option<i64>,
+    /// Themed and flat icon directories, from the same environment read that
+    /// found the catalog. Empty until that read happens.
+    icon_theme_roots: Vec<String>,
+    icon_flat_roots: Vec<String>,
+    /// Resolved artwork, keyed by the `Icon=` value rather than by application
+    /// id — a desktop and its `-nightly` twin share a key, and so do the dozens
+    /// of entries that all say `application-x-executable`.
+    ///
+    /// `None` records "looked, found nothing", which is worth caching for the
+    /// same reason the artwork is: it stops a panel that keeps redrawing an
+    /// icon-less row from spawning a shell every time.
+    icons: BTreeMap<String, Option<String>>,
+    /// What [`State::icons`] holds, for [`MAX_CACHED_ICON_BYTES`].
+    icon_bytes: usize,
     /// Stamped identity per surface, so `status` reports windows rather than
     /// guessing from a self-asserted app_id.
     surface_apps: BTreeMap<u16, String>,
@@ -125,6 +177,20 @@ impl State {
         self.next_process_id = self.next_process_id.wrapping_add(1).max(1);
         self.next_process_id
     }
+
+    /// Remember one lookup's answer, dropping the whole cache first if it has
+    /// grown past [`MAX_CACHED_ICON_BYTES`].
+    fn cache_icon(&mut self, key: String, data_url: Option<String>) {
+        if self.icons.contains_key(&key) {
+            return;
+        }
+        if self.icon_bytes >= MAX_CACHED_ICON_BYTES {
+            self.icons.clear();
+            self.icon_bytes = 0;
+        }
+        self.icon_bytes += key.len() + data_url.as_ref().map_or(0, String::len);
+        self.icons.insert(key, data_url);
+    }
 }
 
 fn run(mut client: Client) -> Result<(), Error> {
@@ -148,6 +214,10 @@ fn run(mut client: Client) -> Result<(), Error> {
         apps: BTreeMap::new(),
         installed: BTreeMap::new(),
         installed_at_ns: None,
+        icon_theme_roots: Vec::new(),
+        icon_flat_roots: Vec::new(),
+        icons: BTreeMap::new(),
+        icon_bytes: 0,
         surface_apps: BTreeMap::new(),
         // Known before the first packet: the bootstrap HELLO carries it, and
         // re-adoption below cannot wait for a second one that never comes.
@@ -303,6 +373,127 @@ fn state_json(state: &State, with_catalog: bool) -> String {
     out
 }
 
+/// One application's artwork, or the fact that it has none.
+///
+/// A missing `icon` field is the answer "there is nothing to draw", and the
+/// panel records it so it stops asking. That is why this is a message per id
+/// rather than a map of the ones that were found: a silent omission would be
+/// indistinguishable from a reply still in flight.
+fn icon_json(id: &str, data_url: Option<&str>) -> String {
+    let mut out = String::from("{\"type\":\"icon\",\"id\":");
+    push_json_string(&mut out, id);
+    if let Some(data_url) = data_url {
+        out.push_str(",\"icon\":");
+        push_json_string(&mut out, data_url);
+    }
+    out.push('}');
+    out
+}
+
+/// Answer a panel's icon request, reading whatever is not already cached.
+///
+/// Two shell round trips for the whole batch, not per id: one stats every
+/// candidate path for every name at once, and one base64s the files the ranking
+/// chose. An absolute `Icon=` skips the first.
+fn resolve_icons(
+    client: &mut Client,
+    state: &mut State,
+    ids: &[&str],
+) -> Vec<(String, Option<String>)> {
+    refresh_installed_if_stale(client, state);
+
+    // Ids the catalog knows nothing about, and entries with no `Icon=` at all,
+    // are answered "nothing to draw" without touching the icon path.
+    let keys: Vec<(String, Option<String>)> = ids
+        .iter()
+        .map(|id| {
+            let key = state
+                .installed
+                .get(*id)
+                .and_then(|entry| entry.icon.clone())
+                .filter(|icon| icon.starts_with('/') || icon::is_lookup_name(icon));
+            ((*id).to_string(), key)
+        })
+        .collect();
+
+    // A name is looked up once however many applications name it.
+    let mut lookups: Vec<String> = Vec::new();
+    let mut absolute: Vec<String> = Vec::new();
+    for key in keys.iter().filter_map(|(_, key)| key.as_ref()) {
+        if state.icons.contains_key(key) {
+            continue;
+        }
+        let bucket = if key.starts_with('/') {
+            &mut absolute
+        } else {
+            &mut lookups
+        };
+        if !bucket.contains(key) {
+            bucket.push(key.clone());
+        }
+    }
+
+    // Key → the file the ranking picked. Absolute values are their own answer;
+    // whether they exist is settled by the read that follows.
+    let mut chosen: Vec<(String, String)> = absolute
+        .iter()
+        .map(|path| (path.clone(), path.clone()))
+        .collect();
+    if !lookups.is_empty() {
+        let names: Vec<&str> = lookups.iter().map(String::as_str).collect();
+        let script = icon::search_script(&state.icon_theme_roots, &state.icon_flat_roots, &names);
+        let output =
+            script.and_then(|script| run_capturing(client, state, &["/bin/sh", "-c", &script]));
+        if let Some(output) = output {
+            for (name, candidates) in icon::sections(&output) {
+                match icon::best(&candidates) {
+                    Some(path) => chosen.push((name.to_string(), path.to_string())),
+                    // Searched and not found: cache that, or every redraw of
+                    // this row spawns a shell to fail the same way.
+                    None => state.cache_icon(name.to_string(), None),
+                }
+            }
+        }
+    }
+
+    if !chosen.is_empty() {
+        let paths: Vec<&str> = chosen.iter().map(|(_, path)| path.as_str()).collect();
+        let script = icon::read_script(&paths);
+        let output =
+            script.and_then(|script| run_capturing(client, state, &["/bin/sh", "-c", &script]));
+        if let Some(output) = output {
+            for (path, body) in icon::sections(&output) {
+                let data_url = icon::data_url(path, body.first().copied().unwrap_or(""));
+                // A path can answer for more than one key only if two keys
+                // resolved to the same file, which is why this looks the key up
+                // from the path rather than trusting the order back.
+                let keys: Vec<String> = chosen
+                    .iter()
+                    .filter(|(_, chosen)| chosen == path)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in keys {
+                    state.cache_icon(key, data_url.clone());
+                }
+            }
+        }
+        // Anything the read never reported on — an unreadable path, a shell
+        // that failed — is a miss, and caching it stops the retry loop.
+        for (key, _) in &chosen {
+            if !state.icons.contains_key(key) {
+                state.cache_icon(key.clone(), None);
+            }
+        }
+    }
+
+    keys.into_iter()
+        .map(|(id, key)| {
+            let data_url = key.and_then(|key| state.icons.get(&key).cloned().flatten());
+            (id, data_url)
+        })
+        .collect()
+}
+
 /// Send one JSON message to one connection, respecting its credit.
 ///
 /// Reports whether the bytes actually went out, because the caller's idea of
@@ -343,10 +534,33 @@ fn send_json(client: &mut Client, conn: &mut Conn, payload: &str) -> bool {
 /// The comparison is per connection and is only updated once the send
 /// succeeds, so a panel that was out of credit is caught up by the next
 /// publish instead of having the message it missed suppressed as a duplicate.
+/// Send what a connection has queued, oldest first, while its credit lasts.
+///
+/// Stops at the first refusal rather than skipping past it: the panel matches
+/// icons to rows by id, but a viewer watching them appear should see them in
+/// the order they were asked for.
+fn flush_queued(client: &mut Client, conn: &mut Conn) {
+    while let Some(payload) = conn.queued.first().cloned() {
+        if !send_json(client, conn, &payload) {
+            return;
+        }
+        conn.queued.remove(0);
+    }
+}
+
 fn publish(client: &mut Client, state: &mut State) {
     if state.conns.is_empty() {
         return;
     }
+    // Credit freed by an ack is why this runs on every routed packet, so it is
+    // also the moment anything held back gets another try.
+    let mut conns = core::mem::take(&mut state.conns);
+    for conn in &mut conns {
+        flush_queued(client, conn);
+    }
+    conns.retain(|conn| !conn.closed);
+    state.conns = conns;
+
     let payload = state_json(state, false);
     // Nothing to say if every panel already holds this exact state.
     if state.conns.iter().all(|conn| conn.last_sent == payload) {
@@ -394,6 +608,7 @@ fn on_channel(client: &mut Client, state: &mut State, packet: &[u8]) {
                 received: 0,
                 closed: false,
                 last_sent: String::new(),
+                queued: Vec::new(),
             };
             // A panel needs the catalog once to offer anything to enable; the
             // updates that follow carry only the managed set.
@@ -471,6 +686,33 @@ fn on_channel(client: &mut Client, state: &mut State, packet: &[u8]) {
                     }
                 }
                 "stop" if !id.is_empty() => halt_app(client, state, id),
+                // Artwork for the rows a panel is about to draw. Requested
+                // rather than pushed with the state: the managed set is a few
+                // hundred bytes and the catalog a few thousand, but their icons
+                // are megabytes, and a panel showing twelve search hits wants
+                // twelve of them and not the other nine hundred.
+                "icons" if !id.is_empty() => {
+                    // Newline-separated, because a desktop-entry id is a
+                    // filename: Steam alone installs hundreds with spaces in
+                    // them, and splitting on whitespace would ask for six
+                    // applications that do not exist instead of one that does.
+                    let requested: Vec<&str> = id
+                        .split('\n')
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .take(MAX_ICON_REQUEST)
+                        .collect();
+                    let resolved = resolve_icons(client, state, &requested);
+                    let Some(conn) = state.conns.get_mut(index) else {
+                        return;
+                    };
+                    for (id, data_url) in resolved {
+                        if conn.queued.len() >= MAX_QUEUED_ICONS {
+                            break;
+                        }
+                        conn.queued.push(icon_json(&id, data_url.as_deref()));
+                    }
+                }
                 "forget" if !id.is_empty() => forget_app(client, state, id),
                 // A panel that reconnects mid-session asks for the catalog it
                 // missed rather than reopening the channel.
@@ -1032,6 +1274,11 @@ fn refresh_installed(client: &mut Client, state: &mut State) -> Result<(), Error
         format!("{base}/.local/share")
     });
     let dirs = get("XDG_DATA_DIRS").unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+    // The icon path is the data path, so it is settled by the read that already
+    // happened rather than by one of its own.
+    let (theme_roots, flat_roots) = icon::roots(&home, &get("HOME").unwrap_or_default(), &dirs);
+    state.icon_theme_roots = theme_roots;
+    state.icon_flat_roots = flat_roots;
 
     state.installed.clear();
     let roots: Vec<String> = core::iter::once(home.as_str())
