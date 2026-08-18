@@ -4,7 +4,10 @@ import {
   defaultRegistry,
   fetchRegistry,
   installFromRegistry,
+  isOutdated,
+  mergeExtensions,
   type Registry,
+  type RegistryEntry,
 } from "../extensionRegistry";
 
 const DIGEST =
@@ -15,6 +18,7 @@ const manifest = {
   extensions: [
     {
       name: "systemd",
+      description: "Live systemd system and user unit state",
       file: "systemd.wasm",
       blake3: DIGEST,
       bytes: 94263,
@@ -22,6 +26,8 @@ const manifest = {
     },
     // No digest: an entry nobody could install is not shown at all.
     { name: "broken", file: "broken.wasm" },
+    // No description: a registry that predates the field still installs.
+    { name: "session", file: "session.wasm", blake3: DIGEST },
   ],
 };
 
@@ -36,8 +42,16 @@ describe("extension registry", () => {
       "https://install.blit.sh/ext/manifest.json",
       { mode: "cors" },
     );
-    expect(registry.extensions.map((entry) => entry.name)).toEqual(["systemd"]);
+    expect(registry.extensions.map((entry) => entry.name)).toEqual([
+      "systemd",
+      "session",
+    ]);
     expect(registry.extensions[0]!.brotliBytes).toBe(36950);
+    // The sentence the panel shows under the name, and its absence.
+    expect(registry.extensions[0]!.description).toBe(
+      "Live systemd system and user unit state",
+    );
+    expect(registry.extensions[1]!.description).toBe("");
   });
 
   // A dev page is often reached over a tunnel (https://host/, no port) and
@@ -71,6 +85,7 @@ describe("extension registry", () => {
       extensions: [
         {
           name: "systemd",
+          description: "",
           file: "systemd.wasm",
           blake3: DIGEST,
           bytes: 1,
@@ -129,6 +144,7 @@ describe("extension registry", () => {
       extensions: [
         {
           name: "systemd",
+          description: "",
           file: "systemd.wasm",
           blake3: DIGEST,
           bytes: 1,
@@ -152,5 +168,77 @@ describe("extension registry", () => {
       expectedExtensionId: 7n,
       expectedDefinitionRevision: 3n,
     });
+  });
+});
+
+const OTHER_DIGEST =
+  "aa11c852e69a2931610d10221bb4855f93333aa1d64eef8bc07e0d3b9e2c804f";
+
+const offer = (name: string, blake3: string): RegistryEntry => ({
+  name,
+  description: `what ${name} does`,
+  file: `${name}.wasm`,
+  blake3,
+  bytes: 1,
+  brotliBytes: 1,
+});
+
+const record = (name: string, hash: string, extensionId: bigint) =>
+  ({ name, hash, extensionId, phase: 4, flags: 3 }) as never;
+
+describe("merging installed with the registry", () => {
+  // The panel used to show installed and offered as two tables, so an
+  // installed extension the registry also offers was named twice and its
+  // update read as a fresh install.
+  it("names an extension once, whichever side has it", () => {
+    const rows = mergeExtensions(
+      [record("systemd", DIGEST, 7n), record("local", OTHER_DIGEST, 8n)],
+      [offer("systemd", DIGEST), offer("session", DIGEST)],
+    );
+    expect(rows.map((row) => row.label)).toEqual([
+      "systemd",
+      "local",
+      "session",
+    ]);
+    // Installed and offered are one row; the description comes from the offer.
+    expect(rows[0]!.installed?.extensionId).toBe(7n);
+    expect(rows[0]!.offered?.blake3).toBe(DIGEST);
+    expect(rows[0]!.description).toBe("what systemd does");
+    // Installed with nothing offering it: no description, nothing to update to.
+    expect(rows[1]!.offered).toBeUndefined();
+    expect(rows[2]!.installed).toBeUndefined();
+    expect(new Set(rows.map((row) => row.key)).size).toBe(3);
+  });
+
+  // Two anonymous `ext run` definitions share the empty name; keying on it
+  // would fold them into one row and let one claim a registry entry.
+  it("keeps unnamed definitions apart and lets them claim nothing", () => {
+    const rows = mergeExtensions(
+      [record("", DIGEST, 9n), record("", DIGEST, 10n)],
+      [offer("systemd", DIGEST)],
+    );
+    expect(rows).toHaveLength(3);
+    expect(new Set(rows.map((row) => row.key)).size).toBe(3);
+    expect(rows[0]!.label).toBe("id:0000000000000009");
+    expect(rows[0]!.offered).toBeUndefined();
+    expect(rows[2]!.label).toBe("systemd");
+  });
+
+  // The digest is the identity: same name, different bytes is the update.
+  it("calls a row outdated only when the digests differ", () => {
+    const [current] = mergeExtensions(
+      [record("systemd", DIGEST, 7n)],
+      [offer("systemd", DIGEST)],
+    );
+    const [stale] = mergeExtensions(
+      [record("systemd", OTHER_DIGEST, 7n)],
+      [offer("systemd", DIGEST)],
+    );
+    const [uninstalled] = mergeExtensions([], [offer("systemd", DIGEST)]);
+    const [unoffered] = mergeExtensions([record("x", DIGEST, 7n)], []);
+    expect(isOutdated(current!)).toBe(false);
+    expect(isOutdated(stale!)).toBe(true);
+    expect(isOutdated(uninstalled!)).toBe(false);
+    expect(isOutdated(unoffered!)).toBe(false);
   });
 });

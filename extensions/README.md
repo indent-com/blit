@@ -31,6 +31,7 @@ That builds every member for wasm, runs `wasm-opt -Oz`, and writes
   "extensions": [
     {
       "name": "systemd",
+      "description": "Live systemd system and user unit state, on a Blit native channel",
       "file": "systemd.wasm",
       "blake3": "2672…",
       "bytes": 91370,
@@ -43,6 +44,12 @@ That builds every member for wasm, runs `wasm-opt -Oz`, and writes
 The digest is not decoration. A module's identity in the protocol _is_ its
 BLAKE3 digest, so a published URL is only pinnable if the digest is published
 next to it.
+
+The description is the crate's `package.description`, copied in so the browser
+has something to show under the name — a registry is otherwise a list of words
+and hashes, and neither says what installing one would do. It is keyed by the
+bin target's name, because that is what the published object is called: the
+crate is `blit-ext-systemd`, the module is `systemd.wasm`.
 
 ## Where releases put them
 
@@ -78,6 +85,11 @@ The Extensions tab of an expanded remote installs from a registry — a
 `https://install.blit.sh/ext`, except under `vite dev`, where it defaults to
 the dev stack's own registry: `bin/dev` builds `extensions/dist` and serves it
 on the UI's port plus three, so what you install is what you just compiled.
+
+Installed and offered are one list, named once. An extension the server already
+runs shows _Update_ when the registry offers a different digest under the same
+name — which replaces the definition in place, keeping its identity — and
+_Current_ when the digests match.
 
 ## Installing one locally
 
