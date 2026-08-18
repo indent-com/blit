@@ -2745,9 +2745,18 @@ impl Compositor {
         // so they go out ahead of the `enter` below, not at bind time.
         self.offer_selections_to_client(wl);
         let serial = self.next_serial();
+        // A client's modifier state starts empty and only ever moves on a
+        // `modifiers` event, which `update_and_send_modifiers` sends solely as
+        // a side effect of a modifier key transition — and it sends it to
+        // whoever held focus at the time.  So focus landing here while Ctrl is
+        // held leaves this client believing nothing is down, and it reads the
+        // next keystroke unmodified.  State the seat-wide fact it has no other
+        // way to learn, the way the pointer's bind-time `enter` replay does.
+        let mods_serial = self.next_serial();
         for kb in &self.keyboards {
             if same_client(kb, wl) {
                 kb.enter(serial, wl, vec![]);
+                kb.modifiers(mods_serial, self.mods_depressed, 0, self.mods_locked, 0);
             }
         }
         for ti in &mut self.text_inputs {
