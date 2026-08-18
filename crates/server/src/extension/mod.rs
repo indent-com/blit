@@ -6136,7 +6136,16 @@ mod tests {
                             saw_put,
                             "upload acknowledgement must precede automatic start"
                         );
-                        assert_eq!(exit.reason, EXT_EXIT_RETURNED);
+                        // The detail is the whole diagnosis and the bare
+                        // comparison threw it away: this has failed in CI as
+                        // `left: 5, right: 0` — a protocol violation — which
+                        // says nothing about which of the two ways to reach
+                        // one it took, and it does not reproduce locally.
+                        assert_eq!(
+                            exit.reason, EXT_EXIT_RETURNED,
+                            "guest exited {} instead of returning: {}",
+                            exit.reason, exit.detail
+                        );
                         saw_exit = true;
                     }
                     _ => {}
