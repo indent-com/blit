@@ -74,6 +74,11 @@ pub struct Budgets {
     /// real UI — the cap only stops a client exhausting memory with distinct
     /// ids.
     pub max_log_subs: usize,
+    /// Worktrees one `GIT_WORKTREES` response describes before it truncates
+    /// with a `CURSOR`. Its own budget, well below `entries_max`, because
+    /// each record costs a repository open to resolve that worktree's HEAD
+    /// — this bounds opens, not bytes.
+    pub worktrees_max: usize,
 }
 
 impl Default for Budgets {
@@ -89,6 +94,7 @@ impl Default for Budgets {
             rename_limit: env_u64("BLIT_GIT_RENAME_LIMIT", 1_000) as usize,
             blame_lines_max: env_u64("BLIT_GIT_BLAME_LINES_MAX", 50_000).max(1) as u32,
             max_log_subs: env_u64("BLIT_GIT_MAX_LOG_SUBS", 64) as usize,
+            worktrees_max: env_u64("BLIT_GIT_WORKTREES_MAX", 256).max(1) as usize,
         }
     }
 }
@@ -304,7 +310,7 @@ pub fn open(path: &str) -> Result<(RepoHandle, RepoInfo), (u8, String)> {
     Ok((handle, info))
 }
 
-fn canonical(path: &Path) -> std::path::PathBuf {
+pub(crate) fn canonical(path: &Path) -> std::path::PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 

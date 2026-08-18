@@ -24,7 +24,7 @@ members = [
 # A path dependency living under the workspace root would otherwise become an
 # implicit member, so `--workspace` clippy/test/fmt runs would lint, test, and
 # reformat third-party code we only consume.
-exclude = ["vendor/cros-codecs", "vendor/wayland-backend"]
+exclude = ["vendor/cros-codecs", "vendor/wayland-backend", "extensions"]
 
 [workspace.package]
 edition = "2024"

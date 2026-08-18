@@ -52,6 +52,16 @@ and updates for unknown PTYs are safely discarded, unrelated packets stay in
 the client's bounded pending queue, and dropping an update token sends no ACK.
 See `examples/terminal_subscription.rs`.
 
+A guest reaches the host only through Blit packets, so an extension that must
+observe the machine spawns a native child with the process family
+(`blit_guest::remote::process`) and reads its stdout. The `systemd` extension
+(`extensions/systemd`) does this end to end: it keeps the unit tables live from
+`systemctl`, poked by D-Bus unit signals, and publishes snapshots and deltas as
+JSON on the `blit.systemd.v1` channel while serving
+`@systemd list|get|watch|status`. It also shows a single-threaded loop that
+multiplexes process output, channel subscribers, and command invocations over
+one endpoint, which the blocking typed helpers cannot do on their own.
+
 `EventLoop` combines packet dispatch with one-shot monotonic timers. It keeps
 callbacks in a guest-side min-heap, passes only the nearest deadline to the host
 wait call, gives a ready packet priority over simultaneous timers, and runs all

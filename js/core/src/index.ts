@@ -55,6 +55,8 @@ export { createMuxTransport, type AnyMuxTransport } from "./transports/mux-any";
 export * from "./net";
 /** Native bidirectional channels (docs/design/extensions.md). */
 export * from "./channel";
+/** Wasmi extensions (docs/design/extensions.md). */
+export * from "./extension";
 /** HTTP/1.1 over a relayed stream, for the preview service worker. */
 export * from "./http1";
 /** Preview targets and the /x/ bootstrap prefix. */

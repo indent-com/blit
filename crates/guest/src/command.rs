@@ -192,6 +192,34 @@ impl CommandProvider {
         }
     }
 
+    /// Interpret a packet the caller already read, without waiting for one.
+    ///
+    /// `Ok(None)` means the packet was not for this provider's listener, so the
+    /// caller should route it elsewhere. This is what an extension needs when it
+    /// must also service timers or other families: [`accept`](Self::accept)
+    /// blocks until an invocation arrives, so a backoff deadline never comes due
+    /// and a `PROCESS_EXIT` sits unread in the client's pending queue.
+    ///
+    /// One caveat, deliberate: once the listener yields a channel this still
+    /// blocks for that channel's `INVOKE`, because an `Invocation` is not a
+    /// meaningful value without one. That wait is bounded by a single round trip
+    /// from a peer which has already opened the channel and, per `blit.cli.v1`,
+    /// sends `INVOKE` as its first message — unlike `accept`, which waits on a
+    /// peer that may never appear at all.
+    pub fn offer(
+        &mut self,
+        client: &mut Client,
+        packet: &[u8],
+    ) -> Result<Option<ProviderEvent>, Error> {
+        match self.listener.offer(packet)? {
+            Some(ListenerEvent::Accepted(channel)) => Invocation::begin(client, channel)
+                .map(ProviderEvent::Invocation)
+                .map(Some),
+            Some(ListenerEvent::Closed(closed)) => Ok(Some(ProviderEvent::Closed(closed))),
+            None => Ok(None),
+        }
+    }
+
     /// Unregister and close the listener. The close still runs if unregister
     /// fails, so a stale advertisement cannot keep accepting invocations.
     pub fn close(&mut self, client: &mut Client) -> Result<(), Error> {

@@ -223,9 +223,18 @@ export default bin.buffer;
     proxy: isDev
       ? (() => {
           const gw = `http://${process.env.VITE_BLIT_GATEWAY || `localhost:${process.env.BLIT_DEV_GW_PORT || "3266"}`}`;
+          // The stack's extension registry (bin/ext-registry), served under
+          // the page's own origin. It listens on loopback and nothing
+          // publishes it, so a page reached over a tunnel or a reverse proxy
+          // can only get at it through here — see defaultRegistry().
+          const ext = `http://localhost:${process.env.BLIT_DEV_EXT_PORT || "3268"}`;
           return {
             "/fonts": { target: gw },
             "/font": { target: gw },
+            "/ext": {
+              target: ext,
+              rewrite: (path: string) => path.replace(/^\/ext/, ""),
+            },
           };
         })()
       : undefined,

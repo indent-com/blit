@@ -193,6 +193,14 @@ mod stub {
             surface_id: u16,
             app_id: String,
         },
+        /// The stamped identity of a toplevel's application, sent once at
+        /// creation for surfaces that arrived on a per-app socket.
+        SurfaceOrigin {
+            surface_id: u16,
+            sandbox_engine: String,
+            app_id: String,
+            instance_id: String,
+        },
         /// The client asked for one of its toplevels to be activated
         /// (xdg_activation_v1) — e.g. an Electron app reacting to a
         /// notification click.  Pane focus belongs to the frontend, so the
@@ -233,6 +241,28 @@ mod stub {
         TouchCancelled {
             owner_id: Option<u64>,
         },
+    }
+
+    /// Who a Wayland connection belongs to.
+    ///
+    /// Stamped by whoever created the socket the client arrived on, never
+    /// asserted by the client itself — which is the whole point. `app_id` from
+    /// `xdg_toplevel.set_app_id` is a free-form string an application says about
+    /// itself, unverified and often wrong; `SO_PEERCRED` gives a pid that a
+    /// zygote-forking or re-execing application immediately invalidates, and a
+    /// passed connection fd means one socket need not mean one process at all.
+    ///
+    /// The fields mirror `wp_security_context_v1` so that protocol can be wired
+    /// to this later, letting a third-party sandbox engine stamp its own
+    /// sockets. Nothing here depends on that protocol existing.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AppIdentity {
+        /// What created the socket, e.g. `blit` for the session supervisor.
+        pub sandbox_engine: String,
+        /// Stable across restarts of the same application.
+        pub app_id: String,
+        /// Distinguishes two concurrent runs of one application.
+        pub instance_id: String,
     }
 
     pub enum CompositorCommand {
@@ -409,6 +439,17 @@ mod stub {
         },
         SetXwaylandPid {
             pid: u32,
+        },
+        /// Adopt an already-bound listening socket whose clients are known to
+        /// belong to `identity`.
+        ///
+        /// The caller binds the socket so the app can be spawned the instant
+        /// this is sent — there is no window in which the socket is named but
+        /// not yet listening. Ownership of the path stays with the caller,
+        /// which unlinks it; the compositor only accepts on the fd.
+        AddAppSocket {
+            fd: std::os::fd::OwnedFd,
+            identity: AppIdentity,
         },
         /// Update the advertised output refresh rate (millihertz).
         SetRefreshRate {

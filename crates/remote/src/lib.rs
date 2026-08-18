@@ -19,6 +19,10 @@ pub mod lsp;
 /// client-side mirror reducer.
 pub mod kv;
 
+/// The server's own environment (docs/design/env.md): the only way a client
+/// learns anything about the session it is attached to.
+pub mod env;
+
 /// TCP and UDP relay (docs/design/net.md): opcodes, flags, and the
 /// message builders both ends share.
 pub mod net;
@@ -158,6 +162,20 @@ pub const C2S_CLIENT_LIST: u8 = 0x09;
 /// [`S2C_KICKED`] carrying the UTF-8 reason and the server closes its
 /// connection. A client may not kick itself.
 pub const C2S_KICK: u8 = 0x0A;
+/// Ask for a Wayland socket dedicated to one application:
+/// [0x0D][nonce:2][app_len:2][app_id][inst_len:2][instance_id].
+///
+/// The server binds a fresh socket, tells the compositor that every client
+/// arriving on it belongs to `(app_id, instance_id)`, and replies with
+/// [`S2C_APP_SOCKET`] carrying the basename to put in `WAYLAND_DISPLAY`.
+/// Because the socket is bound before the reply is sent, the caller may spawn
+/// the application the moment it arrives.
+///
+/// This is how identity becomes trustworthy: the application never gets to say
+/// who it is, so nothing it does can change the answer. Pair it with
+/// `PROCESS_SPAWN_SESSION_ENV` for the rest of the session environment and an
+/// explicit `WAYLAND_DISPLAY` entry, which wins over the session's own.
+pub const C2S_APP_SOCKET: u8 = 0x0D;
 /// Subscribe to live connection-catalog snapshots: [0x0B][nonce:2].
 /// Every update uses [`S2C_CLIENT_LIST`] with the same nonce.
 pub const C2S_CLIENT_WATCH: u8 = 0x0B;
@@ -662,6 +680,14 @@ pub const S2C_SURFACE_TITLE: u8 = 0x23;
 pub const S2C_SURFACE_RESIZED: u8 = 0x24;
 /// A Wayland surface's app_id changed: [0x28][surface_id:2][app_id:N]
 pub const S2C_SURFACE_APP_ID: u8 = 0x28;
+/// Stamped application identity for a surface, as opposed to the
+/// self-asserted `S2C_SURFACE_APP_ID`:
+/// [0x32][surface_id:2][engine_len:2][engine][app_len:2][app][inst_len:2][inst]
+pub const S2C_SURFACE_ORIGIN: u8 = 0x32;
+/// Answer to [`C2S_APP_SOCKET`]: [0x33][nonce:2][status:1][name_len:2][name].
+/// `name` is the `WAYLAND_DISPLAY` basename, empty unless `status` is
+/// [`STATUS_OK`].
+pub const S2C_APP_SOCKET: u8 = 0x33;
 /// A Wayland client asked for its toplevel to be activated
 /// (xdg_activation_v1) — raise and focus the matching pane:
 /// [0x2D][surface_id:2]
@@ -2320,6 +2346,13 @@ pub enum ServerMsg<'a> {
         surface_id: u16,
         app_id: &'a str,
     },
+    /// Stamped identity, as opposed to `SurfaceAppId`'s self-assertion.
+    SurfaceOrigin {
+        surface_id: u16,
+        sandbox_engine: &'a str,
+        app_id: &'a str,
+        instance_id: &'a str,
+    },
     SurfaceActivated {
         surface_id: u16,
     },
@@ -2441,6 +2474,18 @@ pub struct SearchResultEntry<'a> {
     pub matched_sources: u8,
     pub scroll_offset: Option<u32>,
     pub context: &'a [u8],
+}
+
+/// Take one `[len:2][utf8:len]` field, advancing `input` past it.
+///
+/// Returns `None` on truncation or invalid UTF-8, so a malformed field fails the
+/// whole parse rather than silently reading as empty.
+fn take_len_prefixed_str<'a>(input: &mut &'a [u8]) -> Option<&'a str> {
+    let (len, tail) = input.split_at_checked(2)?;
+    let len = u16::from_le_bytes([len[0], len[1]]) as usize;
+    let (value, tail) = tail.split_at_checked(len)?;
+    *input = tail;
+    std::str::from_utf8(value).ok()
 }
 
 pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
@@ -2734,6 +2779,21 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
             Some(ServerMsg::SurfaceAppId {
                 surface_id: u16::from_le_bytes([data[1], data[2]]),
                 app_id,
+            })
+        }
+        S2C_SURFACE_ORIGIN => {
+            let mut rest = data.get(3..)?;
+            let sandbox_engine = take_len_prefixed_str(&mut rest)?;
+            let app_id = take_len_prefixed_str(&mut rest)?;
+            let instance_id = take_len_prefixed_str(&mut rest)?;
+            if !rest.is_empty() {
+                return None;
+            }
+            Some(ServerMsg::SurfaceOrigin {
+                surface_id: u16::from_le_bytes([data[1], data[2]]),
+                sandbox_engine,
+                app_id,
+                instance_id,
             })
         }
         S2C_SURFACE_ACTIVATED => {
@@ -3643,6 +3703,89 @@ pub fn msg_surface_app_id(surface_id: u16, app_id: &str) -> Vec<u8> {
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(app_id_bytes);
     msg
+}
+
+/// `S2C_SURFACE_ORIGIN`: who a surface's application actually is.
+///
+/// Unlike `S2C_SURFACE_APP_ID`, which forwards a string the application chose
+/// for itself, every field here was stamped by whoever created the Wayland
+/// socket the client connected on. Sent only for surfaces on a per-app socket,
+/// and only once — identity is fixed for the life of a connection.
+pub fn msg_surface_origin(
+    surface_id: u16,
+    sandbox_engine: &str,
+    app_id: &str,
+    instance_id: &str,
+) -> Vec<u8> {
+    let engine = sandbox_engine.as_bytes();
+    let app = app_id.as_bytes();
+    let instance = instance_id.as_bytes();
+    let mut msg = Vec::with_capacity(9 + engine.len() + app.len() + instance.len());
+    msg.push(S2C_SURFACE_ORIGIN);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(&(engine.len() as u16).to_le_bytes());
+    msg.extend_from_slice(engine);
+    msg.extend_from_slice(&(app.len() as u16).to_le_bytes());
+    msg.extend_from_slice(app);
+    msg.extend_from_slice(&(instance.len() as u16).to_le_bytes());
+    msg.extend_from_slice(instance);
+    msg
+}
+
+/// Encode `C2S_APP_SOCKET`.
+pub fn msg_app_socket_request(nonce: u16, app_id: &str, instance_id: &str) -> Vec<u8> {
+    let app = app_id.as_bytes();
+    let instance = instance_id.as_bytes();
+    let mut msg = Vec::with_capacity(7 + app.len() + instance.len());
+    msg.push(C2S_APP_SOCKET);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.extend_from_slice(&(app.len() as u16).to_le_bytes());
+    msg.extend_from_slice(app);
+    msg.extend_from_slice(&(instance.len() as u16).to_le_bytes());
+    msg.extend_from_slice(instance);
+    msg
+}
+
+/// Decode `C2S_APP_SOCKET` into `(nonce, app_id, instance_id)`.
+pub fn parse_app_socket_request(data: &[u8]) -> Option<(u16, &str, &str)> {
+    if data.first() != Some(&C2S_APP_SOCKET) {
+        return None;
+    }
+    let nonce = u16::from_le_bytes([*data.get(1)?, *data.get(2)?]);
+    let mut rest = data.get(3..)?;
+    let app_id = take_len_prefixed_str(&mut rest)?;
+    let instance_id = take_len_prefixed_str(&mut rest)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some((nonce, app_id, instance_id))
+}
+
+/// Encode `S2C_APP_SOCKET`.
+pub fn msg_app_socket_reply(nonce: u16, status: u8, wayland_display: &str) -> Vec<u8> {
+    let name = wayland_display.as_bytes();
+    let mut msg = Vec::with_capacity(6 + name.len());
+    msg.push(S2C_APP_SOCKET);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.push(status);
+    msg.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    msg.extend_from_slice(name);
+    msg
+}
+
+/// Decode `S2C_APP_SOCKET` into `(nonce, status, wayland_display)`.
+pub fn parse_app_socket_reply(data: &[u8]) -> Option<(u16, u8, &str)> {
+    if data.first() != Some(&S2C_APP_SOCKET) {
+        return None;
+    }
+    let nonce = u16::from_le_bytes([*data.get(1)?, *data.get(2)?]);
+    let status = *data.get(3)?;
+    let mut rest = data.get(4..)?;
+    let name = take_len_prefixed_str(&mut rest)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some((nonce, status, name))
 }
 
 pub fn msg_surface_activated(surface_id: u16) -> Vec<u8> {

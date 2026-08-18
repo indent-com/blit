@@ -455,15 +455,27 @@ let
         esac
       done
 
+      # extensions/ is a cargo workspace of its own -- it only ever builds for
+      # wasm -- so every root-workspace command has to be pointed at it too.
+      #
+      # From that directory, not with --manifest-path: extensions/Cargo.toml is
+      # a virtual manifest, and cargo-fmt pointed at one has no "current crate"
+      # to format -- it fails with "Failed to find targets" and prints its
+      # usage, which reads like a broken invocation rather than an unformatted
+      # tree. `--all` would answer that, but from here it also drags in path
+      # dependencies outside the workspace (vendor/), so it formats files this
+      # command has no business touching.
       if [ "$check" = true ]; then
         echo "=== cargo fmt --check ==="
         cargo fmt -- --check
+        (cd extensions && cargo fmt -- --check)
         echo ""
         echo "=== prettier --check ==="
         prettier --check .
       else
         echo "=== cargo fmt ==="
         cargo fmt
+        (cd extensions && cargo fmt)
         echo ""
         echo "=== prettier --write ==="
         prettier --write .
@@ -513,6 +525,12 @@ let
 
       echo "=== Clippy ==="
       cargo clippy --workspace -- -D warnings
+
+      # The extensions workspace is excluded from the root one, so it needs its
+      # own pass -- and only wasm32 is a meaningful target for it.
+      echo "=== Clippy: extensions (wasm32) ==="
+      cargo clippy --manifest-path extensions/Cargo.toml \
+        --target wasm32-unknown-unknown --release -- -D warnings
     ''
     + pkgs.lib.optionalString pkgs.stdenv.isLinux ''
       # The software H.264 encoders are cargo features (default openh264,
@@ -583,6 +601,86 @@ in
       mkdir -p "$outdir"
       cp ${blit-deb}/*.deb "$outdir"/
       ls -lh "$outdir"
+    '';
+  };
+
+  # Build every publishable Wasm extension and describe the result.
+  #
+  # The manifest is the point: an extension is named by its BLAKE3 digest, so a
+  # published URL is only pinnable (`ext run <url>#<digest>`) if the digest is
+  # published with it.
+  extensions = pkgs.writeShellApplication {
+    name = "blit-extensions";
+    runtimeInputs = [
+      rustToolchain
+      pkgs.binaryen
+      pkgs.b3sum
+      pkgs.brotli
+      pkgs.jq
+    ];
+    text = ''
+      cd extensions
+
+      target=wasm32-unknown-unknown
+      dist="''${1:-dist}"
+      mkdir -p "$dist"
+
+      # The digest is the module's identity, so it must not depend on where
+      # the tree happens to sit: rustc bakes absolute paths into panic
+      # locations, and a checkout at a different path hashes differently for
+      # no reason a reader could ever see.
+      cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
+      repo_root=$(cd .. && pwd)
+      export RUSTFLAGS="--remap-path-prefix=$repo_root=/blit --remap-path-prefix=$cargo_home=/cargo''${RUSTFLAGS:+ $RUSTFLAGS}"
+
+      cargo build --release --target "$target"
+
+      version=$(cargo metadata --no-deps --format-version 1 |
+        jq -r '.packages[0].version')
+      entries=()
+
+      for wasm in "target/$target/release"/*.wasm; do
+        name=$(basename "$wasm" .wasm)
+        out="$dist/$name.wasm"
+        # -Oz over a module that is downloaded once and then cached by digest:
+        # the only cost that matters here is bytes on the wire. -all because
+        # rustc emits post-MVP features binaryen will not validate without it.
+        #
+        # Reference types are disabled back off again because -all also lets
+        # binaryen *introduce* them, and the server's Wasmi validator rejects a
+        # module that uses them: "function references required for index
+        # reference types". That failure depends on what the optimizer finds to
+        # do, so it appears when an extension grows an indirect call rather than
+        # when the flags change — the module runs fine before wasm-opt and is
+        # refused after it. The published artifact has to satisfy the loader,
+        # not binaryen.
+        #
+        # Skipped when the input has not moved: cargo is already incremental,
+        # and -Oz plus brotli -q 11 is the slow half of this script.
+        if [ ! -s "$out" ] || [ "$wasm" -nt "$out" ]; then
+          wasm-opt -Oz -all --disable-reference-types --disable-gc \
+            --strip-debug --strip-producers "$wasm" -o "$out"
+          brotli -f -q 11 -c "$out" >"$out.br"
+        fi
+        digest=$(b3sum --no-names "$out")
+        bytes=$(wc -c <"$out")
+        compressed=$(wc -c <"$out.br")
+        entries+=("$(jq -n \
+          --arg name "$name" \
+          --arg file "$name.wasm" \
+          --arg digest "$digest" \
+          --argjson bytes "$bytes" \
+          --argjson compressed "$compressed" \
+          '{name: $name, file: $file, blake3: $digest, bytes: $bytes, brotli_bytes: $compressed}')")
+        printf '%-12s %8s bytes  %8s brotli  %s\n' "$name" "$bytes" "$compressed" "$digest"
+      done
+
+      printf '%s\n' "''${entries[@]}" | jq -s \
+        --arg version "$version" \
+        '{version: $version, extensions: .}' >"$dist/manifest.json"
+
+      echo ""
+      echo "wrote $PWD/$dist/manifest.json"
     '';
   };
 
@@ -813,6 +911,14 @@ in
 
       echo "=== Rust tests ==="
       cargo test --workspace
+      echo ""
+
+      # extensions/ is a workspace of its own, so the root run does not reach
+      # it. An extension's pure logic — parsing, backoff — is host-testable and
+      # is where its bugs live, so run it for the host rather than only linting
+      # it for wasm.
+      echo "=== Rust tests: extensions ==="
+      cargo test --manifest-path extensions/Cargo.toml
       echo ""
     ''
     + pkgs.lib.optionalString pkgs.stdenv.isLinux ''

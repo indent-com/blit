@@ -34,7 +34,7 @@ in
 
     scrollback = mkOption {
       type = types.int;
-      default = 1000000;
+      default = 10000;
       description = "Scrollback buffer size in rows per PTY.";
     };
 

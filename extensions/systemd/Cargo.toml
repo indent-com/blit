@@ -1,0 +1,16 @@
+[package]
+name = "blit-ext-systemd"
+description = "Live systemd system and user unit state, on a Blit native channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# The published object is `systemd.wasm`; the crate name only matters to cargo.
+[[bin]]
+name = "systemd"
+path = "src/main.rs"
+
+[dependencies]
+blit-guest.workspace = true

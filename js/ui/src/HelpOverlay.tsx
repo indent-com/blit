@@ -37,6 +37,7 @@ export function HelpOverlay(props: {
         ["Ctrl+Shift+V", t("help.paste")],
         ["Ctrl+Shift+E", t("help.dockExplorer")],
         ["Ctrl+Shift+F", t("help.projectSearch")],
+        ["Ctrl+Shift+Y", t("help.dockBranches")],
         ["Ctrl+Shift+L", t("help.dockLog")],
         ["Ctrl+Shift+P", t("help.dockProblems")],
         ["Ctrl+Shift+B", t("help.previewPanel")],

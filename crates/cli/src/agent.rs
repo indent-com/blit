@@ -36,6 +36,9 @@ pub(crate) struct AgentConn {
     pub(crate) ptys: Vec<PtyInfo>,
     pub(crate) titles: HashMap<u16, String>,
     pub(crate) exited: HashMap<u16, i32>,
+    /// Stamped identity per surface, as `engine:app:instance`, collected from
+    /// the pre-READY replay. Absent for surfaces on the shared Wayland socket.
+    pub(crate) surface_origins: HashMap<u16, String>,
     /// HELLO feature bits — gates requests older servers don't answer.
     pub(crate) features: u32,
     /// Reassembly buffer for `S2C_FRAGMENT` messages from the server.
@@ -67,6 +70,7 @@ impl AgentConn {
         let mut ptys = Vec::new();
         let mut titles = HashMap::new();
         let mut exited = HashMap::new();
+        let mut surface_origins = HashMap::new();
         let mut features = 0u32;
         let mut fragment_buf = FragmentReassembly::default();
 
@@ -93,6 +97,23 @@ impl AgentConn {
                 S2C_HELLO => {
                     if let Some(ServerMsg::Hello { features: f, .. }) = parse_server_msg(&data) {
                         features = f;
+                    }
+                }
+                // Stamped identity arrives in the pre-READY replay, right after
+                // each SURFACE_CREATED, so it is here rather than in the
+                // SURFACE_LIST reply — whose record layout is fixed.
+                blit_remote::S2C_SURFACE_ORIGIN => {
+                    if let Some(ServerMsg::SurfaceOrigin {
+                        surface_id,
+                        sandbox_engine,
+                        app_id,
+                        instance_id,
+                    }) = parse_server_msg(&data)
+                    {
+                        surface_origins.insert(
+                            surface_id,
+                            format!("{sandbox_engine}:{app_id}:{instance_id}"),
+                        );
                     }
                 }
                 S2C_PING => {}
@@ -135,6 +156,7 @@ impl AgentConn {
             ptys,
             titles,
             exited,
+            surface_origins,
             features,
             fragment_buf,
             kicked: None,
@@ -1075,11 +1097,21 @@ pub async fn cmd_surfaces(transport: Transport) -> Result<(), String> {
         }
         if data[0] == S2C_SURFACE_LIST {
             if let Some(ServerMsg::SurfaceList { entries }) = parse_server_msg(&data) {
-                println!("ID\tTITLE\tSIZE\tAPP_ID");
+                // ORIGIN is what the socket said; APP_ID is what the app said
+                // about itself. Keeping both columns makes the difference
+                // visible, which is the point of having stamped identity at
+                // all — a blank ORIGIN means the surface came in on the shared
+                // socket and nothing is known.
+                println!("ID\tTITLE\tSIZE\tAPP_ID\tORIGIN");
                 for e in &entries {
+                    let origin = conn
+                        .surface_origins
+                        .get(&e.surface_id)
+                        .map(String::as_str)
+                        .unwrap_or("-");
                     println!(
-                        "{}\t{}\t{}x{}\t{}",
-                        e.surface_id, e.title, e.width, e.height, e.app_id
+                        "{}\t{}\t{}x{}\t{}\t{}",
+                        e.surface_id, e.title, e.width, e.height, e.app_id, origin
                     );
                 }
             }

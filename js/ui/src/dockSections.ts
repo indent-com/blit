@@ -10,12 +10,20 @@
  * it rather than record a collapse it already looks like it has.
  */
 
-export type LeftPanel = "explorer" | "log" | "problems";
+export type LeftPanel = "explorer" | "branches" | "log" | "problems";
 
 /** Fixed section order in the accordion. Defined here (not in LeftDock.tsx)
  *  so non-JSX modules like panelHash can read it without pulling in a
- *  component file. */
-export const LEFT_PANELS: LeftPanel[] = ["explorer", "log", "problems"];
+ *  component file.
+ *
+ *  Branches sits above the log because it is what retargets the log: the
+ *  cause reads above its effect. */
+export const LEFT_PANELS: LeftPanel[] = [
+  "explorer",
+  "branches",
+  "log",
+  "problems",
+];
 
 /**
  * The set LeftDock renders as collapsed: everything the user collapsed, plus

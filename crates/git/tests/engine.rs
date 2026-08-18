@@ -5057,3 +5057,309 @@ fn submodule_reads_its_checked_out_head() {
         vec![("deps/mod".to_string(), b' ', b'M')]
     );
 }
+
+// ---------------------------------------------------------------------------
+// GIT_WORKTREES
+// ---------------------------------------------------------------------------
+
+/// One decoded `WORKTREE` record, owned so it outlives the response buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Wt {
+    flags: u8,
+    oid: GitOid,
+    path: String,
+    branch: String,
+    lock: String,
+}
+
+/// Decode a `GIT_WORKTREES` response, asserting the reply is well formed.
+fn worktrees_of(handle: &RepoHandle, after_pos: u64) -> (u8, Vec<Wt>) {
+    let resp = handle.worktrees(
+        &GitWorktreesRequest {
+            nonce: 7,
+            repo_id: 0,
+            flags: 0,
+            after_pos,
+        },
+        &Cancel::default(),
+    );
+    let (nonce, status, flags, records) = parse_git_worktrees_resp(&resp).unwrap();
+    assert_eq!((nonce, status), (7, GIT_STATUS_OK));
+    let trees = git_worktree_records(&records)
+        .filter_map(|r| match r {
+            GitWorktreeRecord::Tree {
+                flags,
+                oid,
+                path,
+                branch,
+                lock_reason,
+            } => Some(Wt {
+                flags,
+                oid,
+                path: path.to_string(),
+                branch: branch.to_string(),
+                lock: lock_reason.to_string(),
+            }),
+            GitWorktreeRecord::Cursor { .. } => None,
+        })
+        .collect();
+    (flags, trees)
+}
+
+/// A fixture with a main worktree and three linked ones: on a new branch,
+/// detached, and locked with a reason.
+fn worktree_fixture() -> (PathBuf, PathBuf) {
+    let dir = temp_dir();
+    git(&dir, &["init", "-b", "main"]);
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "first"]);
+    let trees = temp_dir();
+    let feature = trees.join("feature");
+    git(
+        &dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature",
+            feature.to_str().unwrap(),
+        ],
+    );
+    let detached = trees.join("detached");
+    git(
+        &dir,
+        &["worktree", "add", "--detach", detached.to_str().unwrap()],
+    );
+    let pinned = trees.join("pinned");
+    git(
+        &dir,
+        &["worktree", "add", "-b", "pinned", pinned.to_str().unwrap()],
+    );
+    git(
+        &dir,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "on usb",
+            pinned.to_str().unwrap(),
+        ],
+    );
+    (dir, trees)
+}
+
+/// The main worktree is reported first and exactly once, and every linked
+/// worktree lands with the branch, detachment and lock state git itself
+/// reports.
+#[test]
+fn worktrees_lists_main_and_linked() {
+    let (dir, trees) = worktree_fixture();
+    let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+    let (flags, got) = worktrees_of(&handle, 0);
+    assert_eq!(flags, 0, "four worktrees is nowhere near the budget");
+
+    // Oracle: git's own count.
+    let listed = git_out(&dir, &["worktree", "list", "--porcelain"]);
+    let expected = listed
+        .split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .count();
+    assert_eq!(got.len(), expected, "same count as `git worktree list`");
+    assert_eq!(got.len(), 4);
+
+    // Main first, and it is the one we opened.
+    let main = &got[0];
+    let (mflags, mpath, mbranch) = (main.flags, &main.path, &main.branch);
+    assert_ne!(mflags & GIT_WORKTREE_MAIN, 0, "main reported first");
+    assert_ne!(
+        mflags & GIT_WORKTREE_CURRENT,
+        0,
+        "opened at the main worktree"
+    );
+    assert_eq!(mpath, dir.to_str().unwrap());
+    assert_eq!(mbranch, "refs/heads/main");
+    assert_eq!(
+        got.iter()
+            .filter(|t| t.flags & GIT_WORKTREE_MAIN != 0)
+            .count(),
+        1,
+        "exactly one main"
+    );
+
+    let by_path = |p: &Path| {
+        got.iter()
+            .find(|t| t.path == p.to_str().unwrap())
+            .unwrap_or_else(|| panic!("no record for {}", p.display()))
+            .clone()
+    };
+    let feature = by_path(&trees.join("feature"));
+    let (fflags, foid, fbranch) = (feature.flags, feature.oid, &feature.branch);
+    assert_eq!(fflags, 0, "a plain linked worktree carries no flags");
+    assert_eq!(fbranch, "refs/heads/feature");
+    assert_eq!(foid, rev(&dir, "HEAD"), "its HEAD commit");
+
+    let det = by_path(&trees.join("detached"));
+    let (dflags, doid, dbranch) = (det.flags, det.oid, &det.branch);
+    assert_ne!(dflags & GIT_WORKTREE_DETACHED, 0, "DETACHED");
+    assert_eq!(dbranch, "", "a detached HEAD names no branch");
+    assert_eq!(doid, rev(&dir, "HEAD"), "detached still resolves an oid");
+
+    let pin = by_path(&trees.join("pinned"));
+    let (pflags, plock) = (pin.flags, &pin.lock);
+    assert_ne!(pflags & GIT_WORKTREE_LOCKED, 0, "LOCKED");
+    assert_eq!(plock, "on usb", "the reason git recorded");
+}
+
+/// Opened *through a linked worktree* — the case that motivates the
+/// request. gix lists only linked worktrees relative to wherever it was
+/// opened, so without resolving the main repo separately a client inside a
+/// linked worktree could not name the checkout it forked from.
+#[test]
+fn worktrees_from_a_linked_worktree_still_names_main() {
+    let (dir, trees) = worktree_fixture();
+    let feature = trees.join("feature");
+    let (handle, info) = open(feature.to_str().unwrap()).unwrap();
+    assert_ne!(info.flags & GIT_REPO_LINKED, 0, "opened a linked worktree");
+    let (_flags, got) = worktrees_of(&handle, 0);
+    assert_eq!(got.len(), 4, "the whole set, from anywhere in it");
+
+    let main = &got[0];
+    let (mflags, mpath) = (main.flags, &main.path);
+    assert_ne!(mflags & GIT_WORKTREE_MAIN, 0);
+    assert_eq!(mpath, dir.to_str().unwrap(), "the main worktree's path");
+    assert_eq!(mflags & GIT_WORKTREE_CURRENT, 0, "we are not in main");
+
+    let current: Vec<_> = got
+        .iter()
+        .filter(|t| t.flags & GIT_WORKTREE_CURRENT != 0)
+        .collect();
+    assert_eq!(current.len(), 1, "exactly one CURRENT");
+    assert_eq!(
+        current[0].path,
+        feature.to_str().unwrap(),
+        "the one we opened"
+    );
+}
+
+/// A worktree whose checkout was deleted behind git's back is still an
+/// administrative entry. It is reported as `PRUNABLE` rather than dropped:
+/// a row a client cannot navigate to is the thing it most needs told.
+#[test]
+fn worktrees_reports_a_deleted_checkout_as_prunable() {
+    let (dir, trees) = worktree_fixture();
+    std::fs::remove_dir_all(trees.join("feature")).unwrap();
+    let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+    let (_flags, got) = worktrees_of(&handle, 0);
+    assert_eq!(got.len(), 4, "still listed, not silently dropped");
+    let gone = got
+        .iter()
+        .find(|t| t.path == trees.join("feature").to_str().unwrap())
+        .expect("the removed worktree is still an entry");
+    assert_ne!(gone.flags & GIT_WORKTREE_PRUNABLE, 0, "PRUNABLE");
+    // git agrees it is prunable.
+    assert!(
+        git_out(&dir, &["worktree", "list", "--porcelain"]).contains("prunable"),
+        "git also calls it prunable"
+    );
+}
+
+/// `after_pos` skips what a previous page delivered, in the same order.
+/// Does not exercise the budget itself: `worktrees_max` comes from
+/// process-global env (256 by default) and no fixture here approaches it,
+/// so `TRUNCATED` and its trailing `CURSOR` are covered by inspection only.
+#[test]
+fn worktrees_resumes_from_a_cursor() {
+    let (dir, trees) = worktree_fixture();
+    let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+    let (_flags, all) = worktrees_of(&handle, 0);
+    assert_eq!(all.len(), 4);
+    // Resume past the main record: the rest of the set, in the same order.
+    let (_flags, rest) = worktrees_of(&handle, 1);
+    assert_eq!(rest.len(), 3, "the main record was skipped");
+    assert_eq!(rest, all[1..].to_vec(), "same records, same order");
+    assert!(
+        rest.iter().all(|t| t.flags & GIT_WORKTREE_MAIN == 0),
+        "and none of them is main"
+    );
+    let _ = trees;
+}
+
+/// Unknown request flags are refused rather than ignored, so a future bit
+/// cannot be silently dropped by an old server.
+#[test]
+fn worktrees_refuses_unknown_flags() {
+    let dir = fixture();
+    let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+    let resp = handle.worktrees(
+        &GitWorktreesRequest {
+            nonce: 3,
+            repo_id: 0,
+            flags: 0x80,
+            after_pos: 0,
+        },
+        &Cancel::default(),
+    );
+    let (nonce, status, _flags, _records) = parse_git_worktrees_resp(&resp).unwrap();
+    assert_eq!((nonce, status), (3, GIT_STATUS_INVALID));
+}
+
+/// The `WORKTREE_GEN` state record is what makes the list live: adding,
+/// removing or locking a worktree leaves every ref and status record
+/// identical, so without a generation in the snapshot the engine's
+/// identical-snapshot suppression would swallow the push.
+#[test]
+fn worktree_gen_moves_on_add_remove_and_lock() {
+    let gen_of = |dir: &Path| {
+        let (handle, _info) = open(dir.to_str().unwrap()).unwrap();
+        let msg = wait_first_state(&handle, StateOptions::default());
+        let (_id, _sid, _flags, records) = parse_git_state(&msg).unwrap();
+        let found: Vec<_> = git_state_records(&records)
+            .filter_map(|r| match r {
+                GitStateRecord::WorktreeGen { count, digest } => Some((count, digest)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "exactly one WORKTREE_GEN per snapshot");
+        found[0]
+    };
+
+    let dir = temp_dir();
+    git(&dir, &["init", "-b", "main"]);
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "first"]);
+    // A repository with no linked worktrees still has the main one.
+    let bare_of_worktrees = gen_of(&dir);
+    assert_eq!(bare_of_worktrees.0, 1, "the main worktree counts");
+
+    let trees = temp_dir();
+    let one = trees.join("one");
+    git(
+        &dir,
+        &["worktree", "add", "-b", "one", one.to_str().unwrap()],
+    );
+    let added = gen_of(&dir);
+    assert_eq!(added.0, 2, "count follows the set");
+    assert_ne!(added.1, bare_of_worktrees.1, "digest moves on add");
+
+    // Locking changes no ref and no file git tracks — the case a
+    // refetch-on-ref-move client would miss entirely.
+    git(&dir, &["worktree", "lock", one.to_str().unwrap()]);
+    let locked = gen_of(&dir);
+    assert_eq!(locked.0, added.0, "still two worktrees");
+    assert_ne!(locked.1, added.1, "digest moves on lock");
+    git(&dir, &["worktree", "unlock", one.to_str().unwrap()]);
+    assert_eq!(gen_of(&dir).1, added.1, "and back on unlock");
+
+    // Removing it takes no ref with it: the branch survives.
+    git(&dir, &["worktree", "remove", one.to_str().unwrap()]);
+    let removed = gen_of(&dir);
+    assert_eq!(removed, bare_of_worktrees, "back to the original set");
+    assert_eq!(
+        git_out(&dir, &["rev-parse", "--verify", "refs/heads/one"]).len(),
+        40,
+        "while the branch it created is untouched — which is why a \
+         ref-move refetch cannot see the removal"
+    );
+}

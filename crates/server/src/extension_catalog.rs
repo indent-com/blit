@@ -86,9 +86,17 @@ impl ExtensionCatalog {
             });
         };
         if let Some(parent) = path.parent() {
+            // Narrow permissions belong to directories we bring into being.
+            // A path the operator chose may sit in one we do not own -- point
+            // BLIT_EXTENSION_PATH at /tmp/x.redb and chmod'ing the parent
+            // fails with EPERM, which used to disable the whole extension
+            // subsystem over a directory nobody asked us to secure.
+            let existed = parent.is_dir();
             std::fs::create_dir_all(parent)
                 .map_err(|error| CatalogError::Storage(error.to_string()))?;
-            set_owner_directory(parent)?;
+            if !existed {
+                set_owner_directory(parent)?;
+            }
         }
         let db = redb::Database::create(&path)
             .map_err(|error| CatalogError::Storage(error.to_string()))?;

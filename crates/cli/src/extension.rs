@@ -69,12 +69,8 @@ pub struct RunArgs {
     pub detach: bool,
 
     /// Store an enabled, desired-running definition (implies --detach)
-    #[arg(long, requires = "name")]
-    pub persist: bool,
-
-    /// Descriptive name, or the unique durable name with --persist
     #[arg(long)]
-    pub name: Option<String>,
+    pub persist: bool,
 
     /// Attempt restart policy
     #[arg(long, value_enum, default_value_t)]
@@ -84,9 +80,18 @@ pub struct RunArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// WebAssembly module followed by UTF-8 arguments passed verbatim
+    // Positional, in the same place `update` takes it, so the two commands read
+    // alike. It was an optional `--name` flag, which meant `--persist` had to
+    // declare `requires = "name"` and the help had to explain when a name
+    // mattered; every extension has one worth printing, so requiring it is
+    // simpler than describing the exception.
+    /// A label, or the unique durable name under --persist
+    pub name: String,
+
+    /// WebAssembly module (a path or an https:// URL) followed by UTF-8
+    /// arguments passed verbatim
     #[arg(
-        value_names = ["FILE", "ARGS"],
+        value_names = ["MODULE", "ARGS"],
         num_args = 1..,
         trailing_var_arg = true,
         allow_hyphen_values = true
@@ -107,9 +112,10 @@ pub struct UpdateArgs {
     /// Exact persistent extension name
     pub name: String,
 
-    /// Replacement WebAssembly module followed by UTF-8 arguments passed verbatim
+    /// Replacement WebAssembly module (a path or an https:// URL) followed
+    /// by UTF-8 arguments passed verbatim
     #[arg(
-        value_names = ["FILE", "ARGS"],
+        value_names = ["MODULE", "ARGS"],
         num_args = 1..,
         trailing_var_arg = true,
         allow_hyphen_values = true
@@ -251,23 +257,24 @@ pub(crate) async fn complete_advertised_commands(
 }
 
 async fn run(client: &mut Client, args: RunArgs) -> Result<i32, String> {
-    validate_name(args.name.as_deref().unwrap_or(""))?;
+    validate_name(&args.name)?;
     let (file, extension_args) = split_invocation(args.invocation)?;
     validate_args(&extension_args)?;
-    let module = ModuleObject::read(&file)?;
+    let mut module = ModuleCache::new(file);
+    let hash = module.hash().await?;
     let detached = args.detach || args.persist;
     let mut flags = u8::from(detached) * EXT_RUN_DETACH;
     if args.persist {
         flags |= EXT_RUN_PERSIST;
     }
-    let name = args.name.as_deref().unwrap_or("");
+    let name = args.name.as_str();
     let status = client
         .run_request(RunRequest {
             flags,
             restart: args.restart.wire(),
             expected_id: 0,
             expected_revision: 0,
-            hash: module.hash,
+            hash,
             name,
             args: &extension_args,
         })
@@ -279,7 +286,7 @@ async fn run(client: &mut Client, args: RunArgs) -> Result<i32, String> {
         return Err("server returned a successful run without an extension ID".into());
     }
     if status.phase == PHASE_NEED_OBJECT {
-        let _ = client.upload(&module).await?;
+        let _ = client.upload(module.get().await?).await?;
     }
     if args.json {
         render_status(&status, true, "status");
@@ -289,7 +296,7 @@ async fn run(client: &mut Client, args: RunArgs) -> Result<i32, String> {
     } else {
         FollowMode::Owned
     };
-    follow(client, id, status, args.json, mode, Some(&module)).await
+    follow(client, id, status, args.json, mode, Some(&mut module)).await
 }
 
 async fn update(client: &mut Client, args: UpdateArgs) -> Result<i32, String> {
@@ -297,7 +304,8 @@ async fn update(client: &mut Client, args: UpdateArgs) -> Result<i32, String> {
     validate_name(name)?;
     let (file, extension_args) = split_invocation(args.invocation)?;
     validate_args(&extension_args)?;
-    let module = ModuleObject::read(&file)?;
+    let mut module = ModuleCache::new(file);
+    let hash = module.hash().await?;
     let records = client.list().await?;
     let record = find_named(&records, name)?;
     if record.flags & EXT_FLAG_PERSIST == 0 {
@@ -314,7 +322,7 @@ async fn update(client: &mut Client, args: UpdateArgs) -> Result<i32, String> {
                 restart,
                 expected_id,
                 expected_revision,
-                hash: module.hash,
+                hash,
                 name,
                 args: &extension_args,
             })
@@ -325,7 +333,7 @@ async fn update(client: &mut Client, args: UpdateArgs) -> Result<i32, String> {
             return Ok(0);
         }
 
-        match client.upload(&module).await? {
+        match client.upload(module.get().await?).await? {
             UploadOutcome::Available => {
                 // Uploading an update only primes the CAS.  Recheck the exact
                 // tuple before retrying; never adopt a concurrent revision.
@@ -377,7 +385,7 @@ async fn follow(
     mut lifecycle: StatusRecord,
     json: bool,
     mode: FollowMode,
-    module: Option<&ModuleObject>,
+    mut module: Option<&mut ModuleCache>,
 ) -> Result<i32, String> {
     let mut last_exit: Option<ExitRecord> = None;
     let replay_snapshot_through = match mode {
@@ -465,9 +473,9 @@ async fn follow(
                                 render_status(&lifecycle, true, "status");
                             }
                             if lifecycle.phase == PHASE_NEED_OBJECT
-                                && let Some(module) = module
+                                && let Some(module) = module.as_deref_mut()
                             {
-                                let _ = client.upload(module).await?;
+                                let _ = client.upload(module.get().await?).await?;
                             }
                         }
                     }
@@ -478,9 +486,9 @@ async fn follow(
                             render_status(&lifecycle, true, "status");
                         }
                         if lifecycle.phase == PHASE_NEED_OBJECT
-                            && let Some(module) = module
+                            && let Some(module) = module.as_deref_mut()
                         {
-                            let _ = client.upload(module).await?;
+                            let _ = client.upload(module.get().await?).await?;
                         }
                     }
                     wire::Message::InfoStatus(status) if status.extension_id == extension_id => {
@@ -493,9 +501,9 @@ async fn follow(
                         if is_current {
                             lifecycle = status;
                             if lifecycle.phase == PHASE_NEED_OBJECT
-                                && let Some(module) = module
+                                && let Some(module) = module.as_deref_mut()
                             {
-                                let _ = client.upload(module).await?;
+                                let _ = client.upload(module.get().await?).await?;
                             }
                         }
                     }
@@ -780,12 +788,12 @@ fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn split_invocation(invocation: Vec<OsString>) -> Result<(PathBuf, Vec<String>), String> {
+fn split_invocation(invocation: Vec<OsString>) -> Result<(ModuleSource, Vec<String>), String> {
     let mut invocation = invocation.into_iter();
     let file = invocation
         .next()
-        .map(PathBuf::from)
-        .ok_or_else(|| "missing WebAssembly module FILE".to_string())?;
+        .ok_or_else(|| "missing WebAssembly module MODULE".to_string())
+        .and_then(ModuleSource::parse)?;
     let args = invocation
         .map(|arg| {
             arg.into_string()
@@ -849,10 +857,12 @@ fn forced_name(text: &str) -> Result<&str, String> {
 async fn resolve_selector(client: &mut Client, text: &str) -> Result<u64, String> {
     match selector(text)? {
         Selector::Id(id) => Ok(id),
-        Selector::Name(name) => Ok(find_named(&client.list().await?, name)?.extension_id),
+        Selector::Name(name) => Ok(find_selectable(&client.list().await?, name)?.extension_id),
     }
 }
 
+/// The durable definition called `name`. Only a persistent extension has one:
+/// there, the name is the identity that `update` and `remove` act on.
 fn find_named<'a>(
     records: &'a [ExtensionRecord],
     name: &str,
@@ -863,12 +873,234 @@ fn find_named<'a>(
         .ok_or_else(|| format!("extension name not found: {name}"))
 }
 
+/// Anything a selector may point at: the durable definition when there is one,
+/// otherwise a transient attempt whose descriptive name is unambiguous.
+///
+/// A transient `--name` is a label rather than an identity, so it resolves
+/// only while it happens to be unique. Refusing it outright reads as "no such
+/// extension" for a name `ext list` is displaying right there.
+fn find_selectable<'a>(
+    records: &'a [ExtensionRecord],
+    name: &str,
+) -> Result<&'a ExtensionRecord, String> {
+    if let Ok(persistent) = find_named(records, name) {
+        return Ok(persistent);
+    }
+    let mut matches = records.iter().filter(|record| record.name == name);
+    match (matches.next(), matches.next()) {
+        (Some(only), None) => Ok(only),
+        (Some(_), Some(_)) => Err(format!(
+            "{name} is the descriptive name of more than one extension; select it by id:"
+        )),
+        _ => Err(format!("extension name not found: {name}")),
+    }
+}
+
+/// Where the module bytes come from. The server never learns either form:
+/// `EXT_RUN` carries the BLAKE3 digest, so a locator is purely a client-side
+/// convenience that ends in the same content-addressed admission path.
+///
+/// A URL may pin that digest in its fragment —
+/// `https://install.blit.sh/systemd#<64-hex>` — which names one exact object
+/// in one argument. The fragment never reaches the origin server: it is a
+/// client-side assertion about the bytes, not part of the request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ModuleSource {
+    File(PathBuf),
+    Url { url: String, pin: Option<[u8; 32]> },
+}
+
+/// How long a module download may take before the command gives up.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn parse_digest(text: &str) -> Result<[u8; 32], String> {
+    if text.len() != 64 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "expected a 64-hex-digit BLAKE3 digest, got {text:?}"
+        ));
+    }
+    let mut digest = [0u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
+            .map_err(|error| format!("invalid BLAKE3 digest: {error}"))?;
+    }
+    Ok(digest)
+}
+
+fn format_digest(digest: &[u8; 32]) -> String {
+    digest.iter().fold(String::new(), |mut text, byte| {
+        use fmt::Write as _;
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
+}
+
+impl ModuleSource {
+    fn parse(token: OsString) -> Result<Self, String> {
+        let text = token.to_string_lossy();
+        if !text.starts_with("https://") && !text.starts_with("http://") {
+            return Ok(Self::File(PathBuf::from(token)));
+        }
+        let mut url =
+            reqwest::Url::parse(&text).map_err(|error| format!("cannot parse {text}: {error}"))?;
+        let pin = match url.fragment() {
+            Some(fragment) => Some(
+                parse_digest(fragment)
+                    .map_err(|error| format!("{text}: pinned digest is invalid: {error}"))?,
+            ),
+            None => None,
+        };
+        url.set_fragment(None);
+        Ok(Self::Url {
+            url: url.into(),
+            pin,
+        })
+    }
+
+    /// The digest this source is already known to have, if any.
+    ///
+    /// A pinned URL can be admitted before a single byte is fetched: the
+    /// server answers `EXT_RUN` from its object cache, and the download only
+    /// happens if it asks for one.
+    fn pinned(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Url { pin, .. } => *pin,
+            Self::File(_) => None,
+        }
+    }
+
+    async fn load(&self) -> Result<ModuleObject, String> {
+        let module = match self {
+            Self::File(path) => ModuleObject::read(path)?,
+            Self::Url { url, .. } => ModuleObject::fetch(url).await?,
+        };
+        if let Some(pin) = self.pinned()
+            && module.hash != pin
+        {
+            return Err(format!(
+                "digest mismatch: pinned {} but the bytes hash to {}",
+                format_digest(&pin),
+                format_digest(&module.hash)
+            ));
+        }
+        Ok(module)
+    }
+}
+
+/// One module, fetched at most once however many times it is needed.
+///
+/// The server can ask for the bytes again mid-run — an upload can expire, and
+/// an unpinned object can be evicted — so a run that started from a pinned URL
+/// still has to be able to produce them later.
+struct ModuleCache {
+    source: ModuleSource,
+    loaded: Option<ModuleObject>,
+}
+
+impl ModuleCache {
+    fn new(source: ModuleSource) -> Self {
+        Self {
+            source,
+            loaded: None,
+        }
+    }
+
+    fn pinned(&self) -> Option<[u8; 32]> {
+        self.source.pinned()
+    }
+
+    async fn get(&mut self) -> Result<&ModuleObject, String> {
+        if self.loaded.is_none() {
+            self.loaded = Some(self.source.load().await?);
+        }
+        Ok(self.loaded.as_ref().expect("just loaded"))
+    }
+
+    /// The digest to put in `EXT_RUN`: the pin when there is one, otherwise
+    /// whatever the bytes turn out to hash to.
+    async fn hash(&mut self) -> Result<[u8; 32], String> {
+        match self.pinned() {
+            Some(pin) => Ok(pin),
+            None => Ok(self.get().await?.hash),
+        }
+    }
+}
+
+/// Cleartext carries no integrity, and the digest this client computes comes
+/// from the very bytes an attacker would have substituted, so plain HTTP is
+/// only honest when it cannot leave the machine.
+fn loopback_url(url: &reqwest::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(name)) => name == "localhost",
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
 struct ModuleObject {
     bytes: Vec<u8>,
     hash: [u8; 32],
 }
 
 impl ModuleObject {
+    async fn fetch(url: &str) -> Result<Self, String> {
+        let parsed =
+            reqwest::Url::parse(url).map_err(|error| format!("cannot parse {url}: {error}"))?;
+        if parsed.scheme() == "http" && !loopback_url(&parsed) {
+            return Err(format!(
+                "{url}: refusing plain HTTP to a non-loopback host; use https://"
+            ));
+        }
+        let client = reqwest::Client::builder()
+            .timeout(FETCH_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .user_agent(concat!("blit/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|error| format!("cannot build an HTTP client: {error}"))?;
+        let mut response = client
+            .get(parsed)
+            .send()
+            .await
+            .map_err(|error| format!("cannot fetch {url}: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("cannot fetch {url}: {error}"))?;
+        // A redirect chain must not walk out of TLS on the way to the bytes.
+        if response.url().scheme() == "http" && !loopback_url(response.url()) {
+            return Err(format!(
+                "{url}: redirected to plain HTTP ({}); refusing",
+                response.url()
+            ));
+        }
+        if let Some(length) = response.content_length()
+            && length > EXT_MAX_MODULE
+        {
+            return Err(format!(
+                "{url} declares {length} bytes, over the {EXT_MAX_MODULE}-byte extension limit"
+            ));
+        }
+        // Stream with the cap enforced per chunk: a declared length is a hint,
+        // not a promise, and this runs against whatever the URL names.
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| format!("cannot read {url}: {error}"))?
+        {
+            if bytes.len() as u64 + chunk.len() as u64 > EXT_MAX_MODULE {
+                return Err(format!(
+                    "{url} exceeds the {EXT_MAX_MODULE}-byte extension limit"
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.is_empty() {
+            return Err(format!("{url} returned no bytes"));
+        }
+        let hash = *blake3::hash(&bytes).as_bytes();
+        Ok(Self { bytes, hash })
+    }
+
     fn read(path: &Path) -> Result<Self, String> {
         let metadata = std::fs::metadata(path)
             .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
@@ -1612,6 +1844,7 @@ mod tests {
             "--detach",
             "--restart",
             "on-failure",
+            "labelled",
             "module.wasm",
             "--on",
             "guest-target",
@@ -1632,6 +1865,7 @@ mod tests {
             "--detach",
             "--restart",
             "on-failure",
+            "labelled",
             "module.wasm",
             "--on",
             "guest-target",
@@ -1664,7 +1898,7 @@ mod tests {
         let first = split_invocation(first.invocation).unwrap();
         let second = split_invocation(second.invocation).unwrap();
         assert_eq!(second, first);
-        assert_eq!(first.0, PathBuf::from("module.wasm"));
+        assert_eq!(first.0, ModuleSource::File(PathBuf::from("module.wasm")));
         assert_eq!(
             first.1,
             [
@@ -1712,7 +1946,7 @@ mod tests {
         assert!(args.json);
         assert_eq!(args.restart, Some(RestartPolicy::OnFailure));
         let (file, args) = split_invocation(args.invocation).unwrap();
-        assert_eq!(file, PathBuf::from("module.wasm"));
+        assert_eq!(file, ModuleSource::File(PathBuf::from("module.wasm")));
         assert_eq!(
             args,
             [
@@ -1724,6 +1958,125 @@ mod tests {
                 "--restart",
                 "always"
             ]
+        );
+    }
+
+    #[test]
+    fn module_sources_split_urls_from_paths() {
+        assert_eq!(
+            ModuleSource::parse(OsString::from("https://install.blit.sh/systemd")).unwrap(),
+            ModuleSource::Url {
+                url: "https://install.blit.sh/systemd".into(),
+                pin: None
+            }
+        );
+        // Only these two schemes are locators; everything else is a path, so a
+        // Windows drive letter and a relative name keep working.
+        for path in ["module.wasm", "./module.wasm", "C:\\modules\\a.wasm"] {
+            assert_eq!(
+                ModuleSource::parse(OsString::from(path)).unwrap(),
+                ModuleSource::File(PathBuf::from(path))
+            );
+        }
+    }
+
+    #[test]
+    fn url_fragments_pin_one_exact_object() {
+        let digest = "1a3baedf416f2b0f9b6cd683a01d8408a1c6928ba698c0533fdd81aca8fc7e2c";
+        let source = ModuleSource::parse(OsString::from(format!(
+            "https://install.blit.sh/systemd#{digest}"
+        )))
+        .unwrap();
+        // The fragment is a client-side assertion, so it must not survive into
+        // the request the origin server sees.
+        assert_eq!(
+            source,
+            ModuleSource::Url {
+                url: "https://install.blit.sh/systemd".into(),
+                pin: Some(parse_digest(digest).unwrap()),
+            }
+        );
+        assert_eq!(format_digest(&source.pinned().unwrap()), digest);
+        assert_eq!(
+            ModuleSource::parse(OsString::from("https://install.blit.sh/systemd"))
+                .unwrap()
+                .pinned(),
+            None
+        );
+        for bad in [
+            "#",
+            "#deadbeef",
+            "#zz",
+            "#1a3baedf416f2b0f9b6cd683a01d8408a1c6928ba6",
+        ] {
+            assert!(
+                ModuleSource::parse(OsString::from(format!("https://install.blit.sh/x{bad}")))
+                    .is_err()
+            );
+        }
+        // A path is never reinterpreted: '#' is a legal filename byte.
+        assert_eq!(
+            ModuleSource::parse(OsString::from("./mod#1.wasm")).unwrap(),
+            ModuleSource::File(PathBuf::from("./mod#1.wasm"))
+        );
+    }
+
+    #[test]
+    fn plain_http_is_only_trusted_on_loopback() {
+        let loopback = ["http://localhost:8080/a.wasm", "http://127.0.0.1/a.wasm"];
+        for url in loopback {
+            assert!(loopback_url(&reqwest::Url::parse(url).unwrap()));
+        }
+        for url in ["http://install.blit.sh/a.wasm", "http://10.0.0.1/a.wasm"] {
+            assert!(!loopback_url(&reqwest::Url::parse(url).unwrap()));
+        }
+    }
+
+    #[test]
+    fn selectors_reach_transient_attempts_by_their_label() {
+        let record = |extension_id: u64, name: &str, flags: u8| ExtensionRecord {
+            extension_id,
+            definition_revision: 1,
+            phase: PHASE_RUNNING,
+            flags,
+            restart: EXT_RESTART_NEVER,
+            attempt: 1,
+            last_running_attempt: 1,
+            task_id: 0,
+            output_sequence: 0,
+            next_start_unix_ms: 0,
+            hash: [0; 32],
+            name: String::from(name),
+        };
+        // A durable definition owns its name even while it is stopped.
+        let mixed = [
+            record(1, "systemd", EXT_FLAG_DETACH),
+            record(2, "systemd", EXT_FLAG_PERSIST),
+        ];
+        assert_eq!(find_selectable(&mixed, "systemd").unwrap().extension_id, 2);
+
+        // With no definition, an unambiguous label still resolves: `ext list`
+        // prints that name, so refusing it reads as "no such extension".
+        let transient = [record(7, "systemd", EXT_FLAG_DETACH)];
+        assert_eq!(
+            find_selectable(&transient, "systemd").unwrap().extension_id,
+            7
+        );
+        assert!(find_named(&transient, "systemd").is_err());
+
+        let twins = [
+            record(7, "systemd", EXT_FLAG_DETACH),
+            record(8, "systemd", EXT_FLAG_DETACH),
+        ];
+        assert!(
+            find_selectable(&twins, "systemd")
+                .unwrap_err()
+                .contains("more than one")
+        );
+        assert!(
+            find_selectable(&twins, "other")
+                .unwrap_err()
+                .contains("not found")
         );
     }
 

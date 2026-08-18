@@ -32,6 +32,13 @@ import {
   formatSurfaceViewSize,
   formatTerminalViewSize,
 } from "./clientDisplay";
+import {
+  PanelEmpty,
+  PanelRow,
+  panelButton,
+  SectionHeading,
+  StatusPill,
+} from "./panelKit";
 
 /**
  * Whether this connection can answer a client-catalog watch at all.
@@ -150,16 +157,7 @@ export function ConnectionClients(props: {
     );
   }
 
-  const buttonStyle = () => ({
-    ...ui.btn,
-    color: "inherit",
-    "background-color": "transparent",
-    border: `1px solid ${theme().border}`,
-    "border-radius": "0",
-    "font-size": `${scale().sm}px`,
-    padding: `${scale().controlY}px ${scale().controlX}px`,
-    cursor: "pointer",
-  });
+  const buttonStyle = () => panelButton(theme(), scale());
 
   const groupLabel = () => ({
     color: theme().dimFg,
@@ -189,13 +187,20 @@ export function ConnectionClients(props: {
         )}
       </Show>
 
+      <SectionHeading
+        theme={theme()}
+        scale={scale()}
+        label="Clients"
+        count={catalog()?.clients.length}
+      />
+
       <Show
         when={catalog()}
         fallback={
           <Show when={!error()}>
-            <p style={{ margin: "0", padding: `${scale().controlX}px` }}>
+            <PanelEmpty theme={theme()} scale={scale()}>
               Loading clients…
-            </p>
+            </PanelEmpty>
           </Show>
         }
       >
@@ -203,15 +208,9 @@ export function ConnectionClients(props: {
           <Show
             when={list().clients.length > 0}
             fallback={
-              <p
-                style={{
-                  margin: "0",
-                  padding: `${scale().controlX}px`,
-                  color: theme().dimFg,
-                }}
-              >
+              <PanelEmpty theme={theme()} scale={scale()}>
                 No clients connected.
-              </p>
+              </PanelEmpty>
             }
           >
             {/* Index, not For: every catalog push allocates fresh objects, so a
@@ -220,14 +219,7 @@ export function ConnectionClients(props: {
                 by client id, so position is stable. */}
             <Index each={list().clients}>
               {(client) => (
-                <article
-                  style={{
-                    padding: `${scale().controlX}px`,
-                    "border-top": `1px solid ${theme().subtleBorder}`,
-                    display: "grid",
-                    gap: `${scale().gap}px`,
-                  }}
-                >
+                <PanelRow theme={theme()} scale={scale()}>
                   <div
                     style={{
                       display: "flex",
@@ -236,12 +228,29 @@ export function ConnectionClients(props: {
                       gap: `${scale().gap}px`,
                     }}
                   >
-                    <strong style={{ "font-variant-numeric": "tabular-nums" }}>
-                      Client {client().id.toString()}
+                    <span
+                      style={{
+                        display: "flex",
+                        "align-items": "center",
+                        gap: `${scale().tightGap}px`,
+                      }}
+                    >
+                      <strong
+                        style={{ "font-variant-numeric": "tabular-nums" }}
+                      >
+                        Client {client().id.toString()}
+                      </strong>
+                      {/* The one row the viewer must not mistake for someone
+                          else's — it is the only one whose Kick is absent. */}
                       <Show when={client().id === list().selfId}>
-                        <> (this client)</>
+                        <StatusPill
+                          theme={theme()}
+                          scale={scale()}
+                          tone="ok"
+                          label="this client"
+                        />
                       </Show>
-                    </strong>
+                    </span>
                     {/* Arrows are from the listed client's point of view, the
                         same convention as the status bar's own transport row,
                         so a CLI's ↑ is what that CLI is sending. Both figures
@@ -453,7 +462,7 @@ export function ConnectionClients(props: {
                       </Index>
                     </Show>
                   </div>
-                </article>
+                </PanelRow>
               )}
             </Index>
           </Show>

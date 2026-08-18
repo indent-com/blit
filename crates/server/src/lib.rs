@@ -48,9 +48,9 @@ use blit_remote::{
     msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_clipboard_owner,
     msg_s2c_scroll_offset, msg_s2c_surface_remote_input, msg_s2c_used_rows, msg_surface_activated,
     msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
-    msg_surface_frame, msg_surface_frame_precise, msg_surface_resized, msg_surface_text_input,
-    msg_surface_title, msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
-    parse_surface_pointer_axis2, parse_surface_touch,
+    msg_surface_frame, msg_surface_frame_precise, msg_surface_origin, msg_surface_resized,
+    msg_surface_text_input, msg_surface_title, msg_term_cwd_reply, parse_surface_drag_drop,
+    parse_surface_drag_enter, parse_surface_pointer_axis2, parse_surface_touch,
 };
 #[cfg(target_os = "linux")]
 use blit_remote::{
@@ -2035,9 +2035,20 @@ fn arm_pty_output_coalesce(
     *snapshot_not_before = Some((now + PTY_OUTPUT_QUIET).min(hard_deadline));
 }
 
+/// A surface's stamped application identity, mirroring the compositor's
+/// `AppIdentity`. Absent for anything on the shared Wayland socket.
+#[derive(Debug, Clone)]
+struct SurfaceOrigin {
+    sandbox_engine: String,
+    app_id: String,
+    instance_id: String,
+}
+
 struct CachedSurfaceInfo {
     surface_id: u16,
     parent_id: u16,
+    /// Stamped identity, as opposed to the self-asserted `app_id` below.
+    origin: Option<SurfaceOrigin>,
     width: u16,
     height: u16,
     /// The composited size in surface-logical pixels, as last reported by
@@ -6437,6 +6448,72 @@ impl Session {
         None
     }
 
+    /// Bind a Wayland socket that only one application will be given, and hand
+    /// it to the compositor stamped with that application's identity.
+    ///
+    /// Returns the socket's basename, which is what belongs in
+    /// `WAYLAND_DISPLAY` — a client resolves it under `XDG_RUNTIME_DIR`, so the
+    /// name sits beside the shared socket rather than in a directory of its own.
+    ///
+    /// The socket is bound *here*, before the command is sent and before the
+    /// application is spawned, so there is no window in which the name exists
+    /// but nothing is listening on it. The compositor only ever accepts on the
+    /// fd; the path stays this side, to be unlinked with the instance.
+    #[cfg(target_os = "linux")]
+    fn bind_app_socket(
+        &mut self,
+        verbose: bool,
+        event_notify: Arc<dyn Fn() + Send + Sync>,
+        gpu_device: &str,
+        app_id: &str,
+        instance_id: &str,
+    ) -> Option<(String, std::path::PathBuf)> {
+        use std::os::unix::net::UnixListener;
+
+        // The shared socket's directory is the session's runtime dir, and it is
+        // also where a client will look for this one.
+        let shared = self
+            .ensure_compositor(verbose, event_notify, gpu_device)
+            .to_string();
+        let runtime_dir = std::path::Path::new(&shared).parent()?.to_path_buf();
+        // Not "wayland-N": that namespace belongs to bind_auto, and colliding
+        // with it would be a race against the compositor's own naming.
+        let name = format!("blit-app-{app_id}-{instance_id}");
+        let path = runtime_dir.join(&name);
+        // A leftover from a crashed instance would make bind fail; the name
+        // carries a fresh instance id, so anything here is stale by definition.
+        let _ = std::fs::remove_file(&path);
+        let listener = match UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!(
+                    "blit-server: cannot bind app socket {}: {e}",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        let cs = self.compositor.as_ref()?;
+        let identity = blit_compositor::AppIdentity {
+            sandbox_engine: "blit".to_string(),
+            app_id: app_id.to_string(),
+            instance_id: instance_id.to_string(),
+        };
+        if cs
+            .handle
+            .command_tx
+            .send(blit_compositor::CompositorCommand::AddAppSocket {
+                fd: std::os::fd::OwnedFd::from(listener),
+                identity,
+            })
+            .is_err()
+        {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        Some((name, path))
+    }
+
     fn live_ptys(&self) -> usize {
         self.ptys.values().filter(|pty| !pty.exited).count()
     }
@@ -9274,6 +9351,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                         CachedSurfaceInfo {
                             surface_id,
                             parent_id,
+                            // Filled by the SurfaceOrigin that follows
+                            // immediately when the client is on a per-app
+                            // socket; stays None for the shared one.
+                            origin: None,
                             width,
                             height,
                             logical_width: 0,
@@ -9449,6 +9530,29 @@ async fn tick(state: &AppState) -> TickOutcome {
                         info.app_id = app_id.clone();
                     }
                     broadcast.push(msg_surface_app_id(surface_id, &app_id));
+                }
+                CompositorEvent::SurfaceOrigin {
+                    surface_id,
+                    sandbox_engine,
+                    app_id,
+                    instance_id,
+                } => {
+                    // Cached so a client attaching later learns it too: the
+                    // compositor sends this once, at creation, and identity
+                    // cannot change while the connection lives.
+                    if let Some(info) = cs.surfaces.get_mut(&surface_id) {
+                        info.origin = Some(SurfaceOrigin {
+                            sandbox_engine: sandbox_engine.clone(),
+                            app_id: app_id.clone(),
+                            instance_id: instance_id.clone(),
+                        });
+                    }
+                    broadcast.push(msg_surface_origin(
+                        surface_id,
+                        &sandbox_engine,
+                        &app_id,
+                        &instance_id,
+                    ));
                 }
                 CompositorEvent::SurfaceActivated { surface_id } => {
                     // Nothing to cache — the client is asked to raise and
@@ -15721,6 +15825,38 @@ async fn handle_git_message<O: OutboxSend>(
                 },
             );
         }
+        C2S_GIT_WORKTREES => {
+            let Some(req) = parse_git_worktrees(data) else {
+                if let Some(n) = git_nonce(data) {
+                    let _ = out.send(msg_git_worktrees_resp(n, GIT_STATUS_INVALID, 0, &[]));
+                }
+                return;
+            };
+            let nonce = req.nonce;
+            let Some(entry) = repos.map.get(&req.repo_id) else {
+                let _ = out.send(msg_git_worktrees_resp(nonce, GIT_STATUS_UNKNOWN_ID, 0, &[]));
+                return;
+            };
+            let handle = entry.handle.clone();
+            let owned = (req.flags, req.after_pos);
+            git_request(
+                repos,
+                nonce,
+                out,
+                move |status| msg_git_worktrees_resp(nonce, status, 0, &[]),
+                move |cancel| {
+                    handle.worktrees(
+                        &GitWorktreesRequest {
+                            nonce,
+                            repo_id: 0,
+                            flags: owned.0,
+                            after_pos: owned.1,
+                        },
+                        &cancel,
+                    )
+                },
+            );
+        }
         _ => {}
     }
 }
@@ -16626,6 +16762,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     // client that ignores feature bits still gets its one reply
     // (docs/design/kv.md "Security posture").
     let kv_enabled = !std::env::var("BLIT_KV").is_ok_and(|v| v == "0");
+    // BLIT_ENV=0 withholds the server's environment. Same posture as KV: the
+    // family stays advertised so the refusal is legible as a policy decision
+    // rather than an old server, and the caller still gets one reply per nonce
+    // (docs/design/env.md "Security").
+    let env_enabled = !std::env::var("BLIT_ENV").is_ok_and(|v| v == "0");
     // BLIT_FS_WRITE=0 offers read-only sync: FS_WRITE/FS_OP answer
     // FS_DONE_PERMISSION instead of dispatching (docs/design/fs-write.md
     // "Security"). The family shares FEATURE_FS, so there is no
@@ -17111,12 +17252,22 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         if kv_enabled {
             features |= blit_remote::kv::FEATURE_KV;
         }
+        // Advertised even when BLIT_ENV=0, so a refusal reads as policy.
+        features |= blit_remote::env::FEATURE_ENV;
+        #[cfg(target_os = "linux")]
+        {
+            features |= blit_remote::process::FEATURE_APP_SOCKET;
+        }
         if net_enabled {
             features |= blit_remote::net::FEATURE_NET;
         }
         #[cfg(any(unix, windows))]
         if process_enabled {
             features |= blit_remote::process::FEATURE_PROCESS;
+            // Separate bit because an older server rejects the flag with the
+            // same status it uses for a corrupt frame, leaving a client no way
+            // to tell "not supported" from "malformed" by probing.
+            features |= blit_remote::process::FEATURE_PROCESS_SESSION_ENV;
         }
         if sess.channels.advertised() {
             features |= blit_remote::channel::FEATURE_CHANNEL;
@@ -17217,6 +17368,17 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     &info.title,
                     &info.app_id,
                 ));
+                // Right after creation, in the same order the live path sends
+                // them, so a client never observes the surface without its
+                // identity.
+                if let Some(origin) = &info.origin {
+                    initial_msgs.push(msg_surface_origin(
+                        info.surface_id,
+                        &origin.sandbox_engine,
+                        &origin.app_id,
+                        &origin.instance_id,
+                    ));
+                }
                 // Also send a resize message so the client gets the
                 // correct dimensions even if surface_created carried 0x0.
                 // The logical size rides along so a viewer attaching to a
@@ -17448,19 +17610,65 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             #[cfg(any(unix, windows))]
             if process_enabled {
                 if data[0] == blit_remote::process::C2S_PROCESS_SPAWN {
-                    let pty_cwd = match blit_remote::process::parse_process_spawn(&data) {
-                        Ok(request)
-                            if request.cwd_kind == blit_remote::process::PROCESS_CWD_FROM_PTY =>
-                        {
-                            let sess = state.session.lock().await;
-                            sess.ptys
-                                .get(&request.src_pty_id)
-                                .and_then(|pty| pty::pty_cwd(&pty.handle))
-                                .map(String::into_bytes)
-                        }
-                        _ => None,
-                    };
-                    processes.spawn(&data, pty_cwd.as_deref());
+                    // Both the source terminal's cwd and the session
+                    // environment live behind the session lock, which the
+                    // process family itself never holds — so resolve them
+                    // here, as owned data, and take the lock at most once.
+                    let (pty_cwd, session_env) =
+                        match blit_remote::process::parse_process_spawn(&data) {
+                            Ok(request) => {
+                                let from_pty =
+                                    request.cwd_kind == blit_remote::process::PROCESS_CWD_FROM_PTY;
+                                let wants_session_env = request.flags
+                                    & blit_remote::process::PROCESS_SPAWN_SESSION_ENV
+                                    != 0;
+                                if from_pty || wants_session_env {
+                                    let mut sess = state.session.lock().await;
+                                    let cwd = from_pty
+                                        .then(|| {
+                                            sess.ptys
+                                                .get(&request.src_pty_id)
+                                                .and_then(|pty| pty::pty_cwd(&pty.handle))
+                                                .map(String::into_bytes)
+                                        })
+                                        .flatten();
+                                    let env = wants_session_env.then(|| {
+                                        // A supervised app can be the first
+                                        // thing in the session, so the
+                                        // compositor may not exist yet. Asking
+                                        // for the session environment is what
+                                        // brings it up.
+                                        let socket_name = sess
+                                            .ensure_compositor(
+                                                config.verbose,
+                                                notify_for_compositor.clone(),
+                                                &config.vaapi_device,
+                                            )
+                                            .to_string();
+                                        #[cfg(target_os = "linux")]
+                                        let pulse_server = sess.pulse_server_path();
+                                        #[cfg(not(target_os = "linux"))]
+                                        let pulse_server: Option<String> = None;
+                                        #[cfg(target_os = "linux")]
+                                        let pipewire_remote = sess.pipewire_remote_path();
+                                        #[cfg(not(target_os = "linux"))]
+                                        let pipewire_remote: Option<String> = None;
+                                        app_env::session_env(
+                                            Some(&socket_name),
+                                            sess.x_display().as_deref(),
+                                            sess.desktop_bus_address().as_deref(),
+                                            pulse_server.as_deref(),
+                                            pipewire_remote.as_deref(),
+                                        )
+                                    });
+                                    (cwd, env)
+                                } else {
+                                    (None, None)
+                                }
+                            }
+                            Err(_) => (None, None),
+                        };
+                    processes.spawn(&data, pty_cwd.as_deref(), session_env);
                 } else {
                     processes.handle(&data);
                 }
@@ -17608,7 +17816,12 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
 
         // Git introspection: same discipline as fs — connection-scoped,
         // request threads and state engines, never the session mutex.
-        if (blit_remote::git::C2S_GIT_OPEN..=blit_remote::git::C2S_GIT_FETCH).contains(&data[0]) {
+        // The upper bound is the family's LAST opcode, so adding one means
+        // moving this too — a new opcode that lands outside the range is
+        // dropped here silently, before any handler sees it, and shows up as
+        // a request that never gets a reply rather than as an error.
+        if (blit_remote::git::C2S_GIT_OPEN..=blit_remote::git::C2S_GIT_WORKTREES).contains(&data[0])
+        {
             // A pty-relative open (docs/ide.md Decision 3): resolve the
             // source pty's live cwd (session state) and rebase to a plain
             // path-based open.
@@ -17720,6 +17933,101 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     &net_sockets,
                 )
                 .await;
+            continue;
+        }
+
+        // Mint a Wayland socket dedicated to one application, so the identity
+        // of everything that connects on it is known rather than asserted.
+        if data[0] == blit_remote::C2S_APP_SOCKET {
+            if let Some((nonce, app_id, instance_id)) = blit_remote::parse_app_socket_request(&data)
+            {
+                #[cfg(target_os = "linux")]
+                let reply = {
+                    // Names go into a filesystem path and an environment
+                    // variable, so anything that could escape either is
+                    // refused rather than sanitised into something the caller
+                    // did not ask for.
+                    let sane = |value: &str| {
+                        !value.is_empty()
+                            && value.len() <= 64
+                            && value
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    };
+                    if !sane(app_id) || !sane(instance_id) {
+                        blit_remote::msg_app_socket_reply(nonce, blit_remote::STATUS_INVALID, "")
+                    } else {
+                        let mut sess = state.session.lock().await;
+                        match sess.bind_app_socket(
+                            config.verbose,
+                            notify_for_compositor.clone(),
+                            &config.vaapi_device,
+                            app_id,
+                            instance_id,
+                        ) {
+                            Some((name, _path)) => blit_remote::msg_app_socket_reply(
+                                nonce,
+                                blit_remote::STATUS_OK,
+                                &name,
+                            ),
+                            None => blit_remote::msg_app_socket_reply(
+                                nonce,
+                                blit_remote::STATUS_OTHER,
+                                "",
+                            ),
+                        }
+                    }
+                };
+                #[cfg(not(target_os = "linux"))]
+                let reply =
+                    blit_remote::msg_app_socket_reply(nonce, blit_remote::STATUS_WRONG_TYPE, "");
+                let _ = fs_out.send(reply);
+            }
+            continue;
+        }
+
+        // The server's own environment (docs/design/env.md). One request, one
+        // reply, no state — but it hands over every credential the server was
+        // started with, so BLIT_ENV=0 refuses it with PERMISSION.
+        if blit_remote::env::is_c2s_env(data[0]) {
+            if let Ok(nonce) = blit_remote::env::parse_env_get(&data) {
+                let reply = if env_enabled {
+                    let entries = std::env::vars_os()
+                        .map(|(key, value)| {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::ffi::OsStringExt;
+                                (key.into_vec(), value.into_vec())
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                (
+                                    key.to_string_lossy().into_owned().into_bytes(),
+                                    value.to_string_lossy().into_owned().into_bytes(),
+                                )
+                            }
+                        })
+                        .collect();
+                    blit_remote::env::msg_env(nonce, STATUS_OK, &entries)
+                } else {
+                    blit_remote::env::msg_env(
+                        nonce,
+                        blit_remote::STATUS_PERMISSION,
+                        &std::collections::BTreeMap::new(),
+                    )
+                };
+                // An environment big enough to refuse still owes the caller an
+                // answer under its nonce, or it waits forever.
+                let reply = reply.unwrap_or_else(|error| {
+                    blit_remote::env::msg_env(
+                        nonce,
+                        error.status(),
+                        &std::collections::BTreeMap::new(),
+                    )
+                    .expect("an empty reply always encodes")
+                });
+                let _ = fs_out.send(reply);
+            }
             continue;
         }
 
@@ -25885,6 +26193,7 @@ mod tests {
         let info = CachedSurfaceInfo {
             surface_id: 1,
             parent_id: 0,
+            origin: None,
             width: 1919,
             height: 942,
             logical_width: 1515,

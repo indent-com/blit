@@ -320,31 +320,33 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 
 `S2C_HELLO` is the first message sent on every new connection. `version` is the server's protocol version. `boot_generation` is an opaque little-endian identifier generated once per server process; clients can compare it across reconnects to detect a server restart. `server_version` is the server's release string (its crate version, e.g. `0.40.1`) — informational only: feature negotiation always goes through the feature bits, never a version comparison. Both trailing fields were appended without a protocol bump, so legacy servers omit them and clients must treat a short `HELLO` as valid. `features` is a 4-byte bitmask:
 
-| Bit | Name                 | Meaning                                                         |
-| --- | -------------------- | --------------------------------------------------------------- |
-| 0   | `CREATE_NONCE`       | Server supports `CREATE2` / `CREATED_N` with nonce correlation  |
-| 1   | `RESTART`            | Server supports `C2S_RESTART` to respawn exited PTYs            |
-| 2   | `RESIZE_BATCH`       | Server accepts batched resize entries in a single `C2S_RESIZE`  |
-| 3   | `COPY_RANGE`         | Server supports range-based text copy                           |
-| 4   | `COMPOSITOR`         | Server supports headless Wayland compositor                     |
-| 5   | `AUDIO`              | Server supports audio forwarding (PipeWire capture + Opus)      |
-| 6   | `FS`                 | Server supports the `FS_*` filesystem sync family               |
-| 7   | `GIT`                | Server supports the `GIT_*` git introspection family            |
-| 8   | `LSP`                | Server supports the `LSP_*` language intelligence family        |
-| 9   | `KV`                 | Server supports the `KV_*` key-value family                     |
-| 10  | `NET`                | Server supports the `NET_*` network-relay family                |
-| 11  | `EXTENSION`          | Proposed: Wasmi extension lifecycle, events, and commands       |
-| 12  | `CHANNEL`            | Proposed: server supports bidirectional named channels          |
-| 13  | `PROCESS`            | Server supports native non-PTY child processes                  |
-| 14  | `CREATE_STATUS`      | `CREATE2(WANT_STATUS)` receives an explicit failure             |
-| 15  | `KILL_MODE`          | `KILL`/`CLOSE` reach the process group; `KILL` takes `flags`    |
-| 16  | `PTY_DEADLINE`       | `C2S_DEADLINE`, `CREATE2(HAS_DEADLINE)`, and `EXITED.reason`    |
-| 17  | `SCROLL_BY`          | Scrollback holds still: `S2C_SCROLL_OFFSET` and `C2S_SCROLL_BY` |
-| 18  | `SURFACE_TOUCH`      | Server accepts direct contacts and exposes `wl_seat.touch`      |
-| 19  | `SURFACE_TEXT_INPUT` | Server forwards committed `zwp_text_input_v3` state             |
-| 20  | `CLIENT_CONTROL`     | Enumerate connections and kick another client with a reason     |
-| 21  | `DESKTOP`            | Compositor tray/notification state bridge and core API are live |
-| 22  | `DESKTOP_MEDIA`      | Viewer media, portals, and MPRIS control family is understood   |
+| Bit | Name                  | Meaning                                                         |
+| --- | --------------------- | --------------------------------------------------------------- |
+| 0   | `CREATE_NONCE`        | Server supports `CREATE2` / `CREATED_N` with nonce correlation  |
+| 1   | `RESTART`             | Server supports `C2S_RESTART` to respawn exited PTYs            |
+| 2   | `RESIZE_BATCH`        | Server accepts batched resize entries in a single `C2S_RESIZE`  |
+| 3   | `COPY_RANGE`          | Server supports range-based text copy                           |
+| 4   | `COMPOSITOR`          | Server supports headless Wayland compositor                     |
+| 5   | `AUDIO`               | Server supports audio forwarding (PipeWire capture + Opus)      |
+| 6   | `FS`                  | Server supports the `FS_*` filesystem sync family               |
+| 7   | `GIT`                 | Server supports the `GIT_*` git introspection family            |
+| 8   | `LSP`                 | Server supports the `LSP_*` language intelligence family        |
+| 9   | `KV`                  | Server supports the `KV_*` key-value family                     |
+| 10  | `NET`                 | Server supports the `NET_*` network-relay family                |
+| 11  | `EXTENSION`           | Proposed: Wasmi extension lifecycle, events, and commands       |
+| 12  | `CHANNEL`             | Proposed: server supports bidirectional named channels          |
+| 13  | `PROCESS`             | Server supports native non-PTY child processes                  |
+| 14  | `CREATE_STATUS`       | `CREATE2(WANT_STATUS)` receives an explicit failure             |
+| 15  | `KILL_MODE`           | `KILL`/`CLOSE` reach the process group; `KILL` takes `flags`    |
+| 16  | `PTY_DEADLINE`        | `C2S_DEADLINE`, `CREATE2(HAS_DEADLINE)`, and `EXITED.reason`    |
+| 17  | `SCROLL_BY`           | Scrollback holds still: `S2C_SCROLL_OFFSET` and `C2S_SCROLL_BY` |
+| 18  | `SURFACE_TOUCH`       | Server accepts direct contacts and exposes `wl_seat.touch`      |
+| 19  | `SURFACE_TEXT_INPUT`  | Server forwards committed `zwp_text_input_v3` state             |
+| 20  | `CLIENT_CONTROL`      | Enumerate connections and kick another client with a reason     |
+| 21  | `DESKTOP`             | Compositor tray/notification state bridge and core API are live |
+| 22  | `DESKTOP_MEDIA`       | Viewer media, portals, and MPRIS control family is understood   |
+| 23  | `PROCESS_SESSION_ENV` | `PROCESS_SPAWN` accepts the `SESSION_ENV` flag (bit 2)          |
+| 24  | `ENV`                 | Server answers `ENV_GET` with its own environment               |
 
 Bits 11 and 12 remain proposed for the extension and channel families under
 review in [#167](https://github.com/indent-com/blit/pull/167) and
