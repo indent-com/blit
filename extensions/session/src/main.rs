@@ -83,7 +83,12 @@ const MAX_ICON_REQUEST: usize = 48;
 /// Clearing rather than evicting the oldest entry keeps the bookkeeping to a
 /// comparison: a miss costs one shell round trip, and the panel has its own
 /// cache, so nothing already on screen pays for it.
-const MAX_CACHED_ICON_BYTES: usize = 4 * 1024 * 1024;
+///
+/// Large enough to hold one whole request — [`MAX_ICON_REQUEST`] files of
+/// [`icon::MAX_ICON_BYTES`] come to about 8 MiB once base64 has grown them by a
+/// third. Below that a single scroll of big artwork is guaranteed to clear the
+/// cache it is still filling, which costs a re-read of everything it just did.
+const MAX_CACHED_ICON_BYTES: usize = 12 * 1024 * 1024;
 
 /// Icon messages a connection may have waiting on credit.
 ///
@@ -399,6 +404,28 @@ fn icon_json(id: &str, data_url: Option<&str>) -> String {
     out
 }
 
+/// Pair each requested id with what this batch resolved for its `Icon=` key.
+///
+/// An id whose key is absent from `resolved` is **omitted** rather than answered
+/// "no artwork". The two are not interchangeable: the panel records "no artwork"
+/// as final and never asks again, while an id it hears nothing about goes back
+/// on the queue once it stops counting it as outstanding. So absence here means
+/// "ask me later", and only a key that was genuinely looked for and not found
+/// answers `None`.
+fn batch_answers(
+    keys: Vec<(String, Option<String>)>,
+    resolved: &BTreeMap<String, Option<String>>,
+) -> Vec<(String, Option<String>)> {
+    keys.into_iter()
+        .filter_map(|(id, key)| match key {
+            // No usable `Icon=` at all: there is nothing to look for, and
+            // nothing a later request could find either.
+            None => Some((id, None)),
+            Some(key) => resolved.get(&key).map(|found| (id, found.clone())),
+        })
+        .collect()
+}
+
 /// Answer a panel's icon request, reading whatever is not already cached.
 ///
 /// One child for the whole batch, and it does the searching and the reading
@@ -407,6 +434,14 @@ fn icon_json(id: &str, data_url: Option<&str>) -> String {
 /// the only thing rereading it could add is a random half-second stall in the
 /// middle of a scroll. An id this does not recognise is answered "no artwork",
 /// which is what it will be until the panel resyncs anyway.
+///
+/// What this batch resolved is held here and answered from here, never read back
+/// out of [`State::icons`]: that cache is dropped wholesale when it grows past
+/// [`MAX_CACHED_ICON_BYTES`], and at [`icon::MAX_ICON_BYTES`] per file it can
+/// hit that limit *part way through one batch*. Answering from it afterwards
+/// reported every icon cached before the drop as "no artwork" — which the panel
+/// believes forever, so a scrolled list grew a permanent gap exactly one
+/// cache-worth long, and the row after it was fine.
 fn resolve_icons(
     client: &mut Client,
     state: &mut State,
@@ -427,10 +462,12 @@ fn resolve_icons(
         .collect();
 
     // A name is looked up once however many applications name it.
+    let mut resolved: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut lookups: Vec<String> = Vec::new();
     let mut absolute: Vec<String> = Vec::new();
     for key in keys.iter().filter_map(|(_, key)| key.as_ref()) {
-        if state.icons.contains_key(key) {
+        if let Some(cached) = state.icons.get(key) {
+            resolved.insert(key.clone(), cached.clone());
             continue;
         }
         let bucket = if key.starts_with('/') {
@@ -459,17 +496,22 @@ fn resolve_icons(
                     (Some(path), Some(base64)) => icon::data_url(path, base64),
                     _ => None,
                 };
-                state.cache_icon(name.to_string(), data_url);
+                state.cache_icon(name.to_string(), data_url.clone());
+                resolved.insert(name.to_string(), data_url);
+            }
+            // A name the child ran past without reporting has no artwork to be
+            // had. Caching that is what stops an icon-less row from spawning a
+            // shell on every redraw.
+            for name in &lookups {
+                resolved.entry(name.clone()).or_insert_with(|| {
+                    state.cache_icon(name.clone(), None);
+                    None
+                });
             }
         }
-        // Whatever the child never reported on — it failed, or the script could
-        // not be built — is a miss. Caching that is what stops a row whose
-        // artwork cannot be had from spawning a child on every redraw.
-        for name in &lookups {
-            if !state.icons.contains_key(name) {
-                state.cache_icon(name.clone(), None);
-            }
-        }
+        // A child that never ran at all says nothing about these names, so they
+        // are neither answered nor cached: the panel asks again, and the next
+        // request gets a fresh attempt rather than a remembered failure.
     }
 
     // Absolute `Icon=` values need no search, only the read.
@@ -481,22 +523,19 @@ fn resolve_icons(
         if let Some(output) = output {
             for (path, body) in icon::sections(&output) {
                 let data_url = icon::data_url(path, body.first().copied().unwrap_or(""));
-                state.cache_icon(path.to_string(), data_url);
+                state.cache_icon(path.to_string(), data_url.clone());
+                resolved.insert(path.to_string(), data_url);
             }
-        }
-        for path in &absolute {
-            if !state.icons.contains_key(path) {
-                state.cache_icon(path.clone(), None);
+            for path in &absolute {
+                resolved.entry(path.clone()).or_insert_with(|| {
+                    state.cache_icon(path.clone(), None);
+                    None
+                });
             }
         }
     }
 
-    keys.into_iter()
-        .map(|(id, key)| {
-            let data_url = key.and_then(|key| state.icons.get(&key).cloned().flatten());
-            (id, data_url)
-        })
-        .collect()
+    batch_answers(keys, &resolved)
 }
 
 /// Expand the icon path's globs into a ranked directory list, once.
@@ -1713,6 +1752,71 @@ mod tests {
         assert_eq!(intent.process_ref, None);
         let intent = parse_intent(b"1 7 many").expect("parses");
         assert_eq!(intent.process_ref, None);
+    }
+
+    /// The bug that put a permanent gap in a scrolled list: the icon cache is
+    /// dropped wholesale, and it can happen part way through the batch that is
+    /// filling it. Whatever the batch resolved before the drop must still be
+    /// answered, because "no artwork" is a final answer to the panel.
+    #[test]
+    fn a_batch_answers_what_it_resolved_even_if_the_cache_was_dropped() {
+        // What the batch resolved, held apart from the cache the drop emptied.
+        let resolved = BTreeMap::from([
+            (
+                "early".to_string(),
+                Some("data:image/png;base64,AA".to_string()),
+            ),
+            (
+                "late".to_string(),
+                Some("data:image/png;base64,BB".to_string()),
+            ),
+        ]);
+        let keys = vec![
+            ("Portal 2.desktop".to_string(), Some("early".to_string())),
+            ("Shatter.desktop".to_string(), Some("late".to_string())),
+        ];
+        assert_eq!(
+            batch_answers(keys, &resolved),
+            vec![
+                (
+                    "Portal 2.desktop".to_string(),
+                    Some("data:image/png;base64,AA".to_string())
+                ),
+                (
+                    "Shatter.desktop".to_string(),
+                    Some("data:image/png;base64,BB".to_string())
+                ),
+            ]
+        );
+    }
+
+    /// "No artwork" and "ask me later" are different answers, and only one of
+    /// them is safe to give for a read that never happened: the panel treats a
+    /// null as final, so a failed child must leave the id unanswered.
+    #[test]
+    fn an_unresolved_key_is_omitted_but_a_missing_icon_field_is_answered() {
+        let resolved = BTreeMap::from([("found".to_string(), None)]);
+        let answers = batch_answers(
+            vec![
+                ("no-icon-key.desktop".to_string(), None),
+                ("looked-for.desktop".to_string(), Some("found".to_string())),
+                (
+                    "child-failed.desktop".to_string(),
+                    Some("never".to_string()),
+                ),
+            ],
+            &resolved,
+        );
+        assert_eq!(
+            answers,
+            vec![
+                // Nothing to look for: final.
+                ("no-icon-key.desktop".to_string(), None),
+                // Looked for and not found: also final.
+                ("looked-for.desktop".to_string(), None),
+            ],
+            "the id whose lookup never ran is left for the panel to re-ask"
+        );
     }
 
     /// A disabled application can still have a live child -- `disable` stops
