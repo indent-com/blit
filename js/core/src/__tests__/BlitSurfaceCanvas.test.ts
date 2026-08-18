@@ -1829,6 +1829,9 @@ function attachPasting(initialWaylandOwner = false) {
   // Only a live view takes input.
   surface.setDisplaySize(800, 600, 120);
 
+  // Ctrl's own key-down is left to the tests that care about it.  Without one
+  // the canvas replays the Ctrl it can see is held, so `keys` opens with a
+  // {29, true} that a browser would have delivered itself.
   const pressCtrlV = () =>
     canvas.dispatchEvent(
       new KeyboardEvent("keydown", {
@@ -1919,8 +1922,13 @@ describe("BlitSurfaceCanvas paste", () => {
     expect(clipboard).toHaveLength(1);
     expect(clipboard[0].mime).toBe("image/png");
     expect(Array.from(clipboard[0].data)).toEqual(Array.from(bytes));
-    // The selection has to be in place before the app sees the chord.
-    expect(keys).toEqual([{ keycode: EVDEV_V, pressed: true }]);
+    // The selection has to be in place before the app sees the chord.  The
+    // Ctrl leading it is the replay standing in for the physical key-down
+    // `pressCtrlV` leaves out.
+    expect(keys).toEqual([
+      { keycode: 29, pressed: true },
+      { keycode: EVDEV_V, pressed: true },
+    ]);
     dispose();
   });
 
@@ -2003,7 +2011,8 @@ describe("BlitSurfaceCanvas paste", () => {
     // server, not truncated — and no V either.  Pressing it would paste
     // whatever the selection held before, which is not what was copied.
     expect(clipboard).toHaveLength(0);
-    expect(keys).toEqual([]);
+    // Only the replayed Ctrl, which stays held because the user still is.
+    expect(keys).toEqual([{ keycode: 29, pressed: true }]);
     expect(warn).toHaveBeenCalled();
     dispose();
   });
@@ -2022,7 +2031,8 @@ describe("BlitSurfaceCanvas paste", () => {
     await settle();
 
     expect(clipboard).toHaveLength(0);
-    expect(keys).toEqual([]);
+    // Only the replayed Ctrl; no V, so nothing is pasted.
+    expect(keys).toEqual([{ keycode: 29, pressed: true }]);
     dispose();
   });
 
@@ -2149,7 +2159,10 @@ describe("BlitSurfaceCanvas paste", () => {
     expect(clipboard).toHaveLength(1);
     expect(clipboard[0].mime).toBe("image/png");
     expect(Array.from(clipboard[0].data)).toEqual(Array.from(bytes));
-    expect(keys).toEqual([{ keycode: EVDEV_V, pressed: true }]);
+    expect(keys).toEqual([
+      { keycode: 29, pressed: true }, // the replayed Ctrl
+      { keycode: EVDEV_V, pressed: true },
+    ]);
 
     // Ctrl+V keeps its key-up: only Cmd chords release with the press.
     canvas.dispatchEvent(
@@ -2161,6 +2174,7 @@ describe("BlitSurfaceCanvas paste", () => {
       }),
     );
     expect(keys).toEqual([
+      { keycode: 29, pressed: true },
       { keycode: EVDEV_V, pressed: true },
       { keycode: EVDEV_V, pressed: false },
     ]);
@@ -3830,6 +3844,93 @@ describe("BlitSurfaceCanvas key-state recovery", () => {
       { keycode: 105, pressed: false },
       { keycode: 42, pressed: false },
     ]);
+    surface.dispose();
+  });
+
+  it("replays a modifier that was already down before this surface had focus", () => {
+    // Ctrl goes down while a terminal pane has focus, so its key-down never
+    // reaches this canvas at all: the browser routed it elsewhere.  The app
+    // learns a modifier is held from that key-down and from nothing else, so
+    // without a replay Ctrl+K arrives as a bare K.
+    const { surface, canvas, keys, texts } = attachTyping();
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "k", code: "KeyK", ctrlKey: true }),
+    );
+
+    expect(keys).toEqual([
+      { keycode: 29, pressed: true },
+      { keycode: 37, pressed: true },
+    ]);
+    // A chord is keys, never text — the text path would strip the modifier.
+    expect(texts).toEqual([]);
+    surface.dispose();
+  });
+
+  it("presses a replayed modifier once, not per keystroke", () => {
+    const { surface, canvas, keys } = attachTyping();
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "k", code: "KeyK", ctrlKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keyup", { key: "k", code: "KeyK", ctrlKey: true }),
+    );
+    canvas.dispatchEvent(
+      key("keydown", { key: "j", code: "KeyJ", ctrlKey: true }),
+    );
+
+    expect(keys).toEqual([
+      { keycode: 29, pressed: true },
+      { keycode: 37, pressed: true },
+      { keycode: 37, pressed: false },
+      { keycode: 36, pressed: true },
+    ]);
+    surface.dispose();
+  });
+
+  it("does not replay the modifier the key-down itself is", () => {
+    // The real key-down is about to be forwarded on the side it came from.  A
+    // replay here would double the press and guess the wrong side.
+    const { surface, canvas, keys } = attachTyping();
+
+    canvas.dispatchEvent(
+      key("keydown", { key: "Control", code: "ControlRight", ctrlKey: true }),
+    );
+
+    expect(keys).toEqual([{ keycode: 97, pressed: true }]);
+    surface.dispose();
+  });
+
+  it("releases a replayed modifier when the other side is the key let go", () => {
+    // The replay had to pick a side and picked left; the user was holding
+    // right.  Dropping that key-up as an orphan leaves the app holding Ctrl
+    // for good, and every later click and keystroke wearing it.
+    const { surface, canvas, keys } = attachTyping();
+    canvas.dispatchEvent(
+      key("keydown", { key: "k", code: "KeyK", ctrlKey: true }),
+    );
+    keys.length = 0;
+
+    canvas.dispatchEvent(
+      key("keyup", { key: "Control", code: "ControlRight", ctrlKey: false }),
+    );
+
+    expect(keys).toEqual([{ keycode: 29, pressed: false }]);
+    surface.dispose();
+  });
+
+  it("still drops a release for a key that was typed as text", () => {
+    // The guard the redirect above must not undo: a text-path key-down had its
+    // press and release synthesised by the compositor already, and a second
+    // release is the double-toggle bug this returns for.
+    const { surface, canvas, keys, texts } = attachTyping();
+    canvas.dispatchEvent(key("keydown", { key: "a", code: "KeyA" }));
+
+    canvas.dispatchEvent(key("keyup", { key: "a", code: "KeyA" }));
+
+    expect(texts).toEqual(["a"]);
+    expect(keys).toEqual([]);
     surface.dispose();
   });
 
