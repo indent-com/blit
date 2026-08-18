@@ -40,6 +40,20 @@ const TARGET_PIXELS: u32 = 128;
 
 /// Largest file worth carrying. A handful of themes ship megabyte SVGs with
 /// every gradient the artist owned; that is not a panel icon.
+///
+/// Some applications have nothing under this, and then the row keeps its letter
+/// tile: Steam writes one full-size PNG into *every* size bucket, so
+/// `hicolor/16x16/apps/steam_icon_327030.png` is 604 KB and the 96x96 copy is
+/// 617 KB — the search finds five candidates and skips all of them. Around
+/// three entries in two hundred on a games machine.
+///
+/// Raising this is not the fix it looks like. The ceiling is 640 KiB, because
+/// base64 grows a file by a third and the result has to fit one channel message
+/// (`CHANNEL_MAX_PAYLOAD`, 1 MiB) — so the cap could just cover Steam's files
+/// and no more, at nearly 900 KB on the wire per row that used one. The fix is
+/// to stop carrying full-size artwork at all: decode and scale to
+/// [`TARGET_PIXELS`] before it crosses, which needs a decoder in the guest,
+/// there being no image tool in a shipped server's PATH to shell out to.
 pub const MAX_ICON_BYTES: u64 = 128 * 1024;
 
 /// Whether an `Icon=` value is a plain name this can look up.
