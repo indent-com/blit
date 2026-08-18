@@ -34,23 +34,19 @@ use alloc::vec::Vec;
 /// that get thrown away on the way to the element.
 const TARGET_PIXELS: u32 = 128;
 
-/// Largest file worth carrying. A handful of themes ship megabyte SVGs with
-/// every gradient the artist owned; that is not a panel icon.
+/// Largest file this will point the panel at.
 ///
-/// Some applications have nothing under this, and then the row keeps its letter
-/// tile: Steam writes one full-size PNG into *every* size bucket, so
-/// `hicolor/16x16/apps/steam_icon_327030.png` is 604 KB and the 96x96 copy is
-/// 617 KB — the search finds five candidates and skips all of them. Around
-/// three entries in two hundred on a games machine.
+/// A ceiling rather than a budget now: nothing here carries the bytes, so the
+/// only cost of a big file is the transfer the panel chooses to make. It used to
+/// be 128 KiB because every icon was base64`d into a JSON string inside this
+/// interpreter and had to fit one channel message — which is why Steam, whose
+/// habit is to write one full-size PNG into *every* size bucket (a 604 KB
+/// `16x16/apps/steam_icon_327030.png`), left three rows in two hundred with a
+/// letter tile and no bug behind it. Those rows have their artwork now.
 ///
-/// Raising this is not the fix it looks like. The ceiling is 640 KiB, because
-/// base64 grows a file by a third and the result has to fit one channel message
-/// (`CHANNEL_MAX_PAYLOAD`, 1 MiB) — so the cap could just cover Steam's files
-/// and no more, at nearly 900 KB on the wire per row that used one. The fix is
-/// to stop carrying full-size artwork at all: decode and scale to
-/// [`TARGET_PIXELS`] before it crosses, which needs a decoder in the guest,
-/// there being no image tool in a shipped server's PATH to shell out to.
-pub const MAX_ICON_BYTES: u32 = 128 * 1024;
+/// A megabyte is still a limit: a theme that ships a five-megabyte SVG of every
+/// gradient the artist owned is not offering a panel icon.
+pub const MAX_ICON_BYTES: u32 = 1024 * 1024;
 
 /// Whether an `Icon=` value is a plain name this can look up.
 ///
@@ -138,42 +134,6 @@ fn directory_rank(dir: &str) -> (u8, u32) {
     }
 }
 
-/// Base64, because a data URL is what an `<img>` can be handed.
-///
-/// Written out rather than pulled in: it is the only encoder the extension needs
-/// and it has no dependency of its own. Written over bytes rather than `char`s
-/// because this runs in an interpreter — wasmi, not a JIT — where a
-/// `String::push` per output character was the single most expensive thing the
-/// extension did. A screenful of artwork is a megabyte of input, and the
-/// character-at-a-time version spent seconds on it while the shell it replaced
-/// had `base64(1)` doing the same work natively.
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = alloc::vec![0u8; bytes.len().div_ceil(3) * 4];
-    let mut at = 0;
-    for chunk in bytes.chunks(3) {
-        let b0 = u32::from(chunk[0]);
-        let b1 = chunk.get(1).map_or(0, |b| u32::from(*b));
-        let b2 = chunk.get(2).map_or(0, |b| u32::from(*b));
-        let word = (b0 << 16) | (b1 << 8) | b2;
-        out[at] = ALPHABET[(word >> 18) as usize & 63];
-        out[at + 1] = ALPHABET[(word >> 12) as usize & 63];
-        out[at + 2] = if chunk.len() > 1 {
-            ALPHABET[(word >> 6) as usize & 63]
-        } else {
-            b'='
-        };
-        out[at + 3] = if chunk.len() > 2 {
-            ALPHABET[word as usize & 63]
-        } else {
-            b'='
-        };
-        at += 4;
-    }
-    // Every byte written came from the ASCII alphabet above.
-    String::from_utf8(out).unwrap_or_default()
-}
-
 /// The pixel size a themed icon directory promises, if its name says one.
 ///
 /// `48x48` is 48, and `48x48@2` is 96 — a scale suffix means the same nominal
@@ -194,22 +154,12 @@ fn directory_pixels(component: &str) -> Option<u32> {
 
 /// How good a candidate is: lower sorts first.
 ///
-/// Wrap a file's bytes as a data URL, if the extension names a format a browser
-/// will draw. XPM is deliberately absent: nothing renders it, and a pixmap-only
-/// application is better served by the panel's own fallback.
-pub fn data_url(path: &str, content: &[u8]) -> Option<String> {
-    if content.is_empty() {
-        return None;
-    }
-    let base64 = base64(content);
-    let mime = if path.ends_with(".svg") {
-        "image/svg+xml"
-    } else if path.ends_with(".png") {
-        "image/png"
-    } else {
-        return None;
-    };
-    Some(format!("data:{mime};base64,{base64}"))
+/// Whether a file a browser is being pointed at is one it will draw.
+///
+/// XPM is deliberately absent: nothing renders it, and a pixmap-only application
+/// is better served by the panel's own letter tile than by a broken image.
+pub fn is_drawable_path(path: &str) -> bool {
+    path.ends_with(".svg") || path.ends_with(".png")
 }
 
 /// The icon path, from the same environment the catalog was read with.
@@ -348,32 +298,13 @@ mod tests {
         assert!(!is_icon_dir("hicolor"));
     }
 
-    /// The three padding cases are where a hand-rolled encoder goes wrong: a
-    /// full group, one spare byte, two spare bytes.
+    /// Nothing else renders, and a broken image is worse than a letter tile.
     #[test]
-    fn base64_pads_every_tail_length() {
-        assert_eq!(base64(b"abc"), "YWJj");
-        assert_eq!(base64(b"a"), "YQ==");
-        assert_eq!(base64(b"ab"), "YWI=");
-        assert_eq!(base64(&[0xff, 0xfe, 0xfd]), "//79");
-        assert_eq!(base64(b""), "");
-        // A PNG signature, which is the first thing any of this will encode.
-        assert_eq!(base64(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a]), "iVBORw0K");
-    }
-
-    #[test]
-    fn a_data_url_needs_a_format_a_browser_draws() {
-        assert_eq!(
-            data_url("/i/x.png", b"abc").as_deref(),
-            Some("data:image/png;base64,YWJj")
-        );
-        assert_eq!(
-            data_url("/i/x.svg", b"abc").as_deref(),
-            Some("data:image/svg+xml;base64,YWJj")
-        );
-        assert!(data_url("/i/x.xpm", b"abc").is_none());
-        // An empty body is what an oversized or missing file leaves behind.
-        assert!(data_url("/i/x.png", b"").is_none());
+    fn only_formats_a_browser_draws_are_offered() {
+        assert!(is_drawable_path("/i/x.png"));
+        assert!(is_drawable_path("/i/x.svg"));
+        assert!(!is_drawable_path("/i/x.xpm"));
+        assert!(!is_drawable_path("/i/x"));
     }
 
     #[test]

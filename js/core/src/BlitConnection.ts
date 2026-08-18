@@ -233,6 +233,7 @@ import {
   S2C_FS_CLOSED,
   S2C_FS_FILE,
   S2C_FS_INDEX,
+  S2C_FS_READ,
   S2C_FS_SEARCH,
   S2C_FS_SYNCED,
   S2C_FS_UPDATE,
@@ -243,6 +244,7 @@ import {
   buildFsAckMessage,
   buildFsFetchMessage,
   buildFsIndexMessage,
+  buildFsReadMessage,
   buildFsSearchMessage,
   buildFsOpMessage,
   buildFsStopMessage,
@@ -253,6 +255,7 @@ import {
   buildFsUploadFinishMessage,
   buildFsWriteMessage,
   parseFsIndexResult,
+  parseFsReadResult,
   buildFsGrepMessage,
   parseFsGrepResult,
   S2C_FS_GREP,
@@ -269,6 +272,7 @@ import {
   FsConflictError,
   FsOpenError,
   type FsFileIndex,
+  type FsReadRecord,
   type FsGrepResult,
   type FsGrepOptions,
   type FsNode,
@@ -772,6 +776,13 @@ export class BlitConnection {
   private readonly pendingFsIndexes = new Map<
     number,
     { resolve: (index: FsFileIndex) => void; reject: (error: Error) => void }
+  >();
+  private readonly pendingFsReads = new Map<
+    number,
+    {
+      resolve: (records: FsReadRecord[]) => void;
+      reject: (error: Error) => void;
+    }
   >();
   private readonly pendingFsGreps = new Map<
     number,
@@ -2279,6 +2290,55 @@ export class BlitConnection {
       const nonce = this.nextFsNonce(this.pendingFsIndexes);
       this.pendingFsIndexes.set(nonce, { resolve, reject });
       this.transport.send(buildFsIndexMessage(nonce, root));
+    });
+  }
+
+  /**
+   * Read whole files, or resolve which of several paths exists
+   * (docs/design/fs-read.md). No sync session and nothing watched.
+   *
+   * Paths come in groups, and a group is one question: with `FS_READ_FIRST`
+   * each group is answered by its own first readable path, one record per group
+   * in group order. With `FS_READ_NO_CONTENT` the records name the file without
+   * carrying it, which is how a caller that only wants to know *where* something
+   * is pays a stat rather than a read.
+   *
+   * Every record carries its own `FS_FILE_*`, so a missing or oversized path is
+   * an answer about that path rather than a failure of the batch.
+   */
+  readFiles(
+    groups: readonly (readonly string[])[],
+    options: { flags?: number; maxBytes?: number } = {},
+  ): Promise<FsReadRecord[]> {
+    if (this.transport.status !== "connected") {
+      return Promise.reject(
+        connectionError(`Cannot read files while transport is ${this.transport.status}`),
+      );
+    }
+    if ((this.features & FEATURE_FS) === 0) {
+      return Promise.reject(
+        connectionError("Server does not support file reads"),
+      );
+    }
+    // A server predating FS_READ drops the opcode and never answers, so the
+    // in-flight cap is what keeps a repeating caller bounded — the same reason
+    // `indexFiles` has one.
+    if (this.pendingFsReads.size >= 16) {
+      return Promise.reject(
+        connectionError("Too many file read requests in flight"),
+      );
+    }
+    return new Promise<FsReadRecord[]>((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingFsReads);
+      this.pendingFsReads.set(nonce, { resolve, reject });
+      this.transport.send(
+        buildFsReadMessage(
+          nonce,
+          options.flags ?? 0,
+          options.maxBytes ?? 0,
+          groups,
+        ),
+      );
     });
   }
 
@@ -3994,6 +4054,10 @@ export class BlitConnection {
       pending.reject(error);
     }
     this.pendingFsGreps.clear();
+    for (const pending of this.pendingFsReads.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsReads.clear();
     for (const pending of this.pendingFsIndexes.values()) {
       pending.reject(error);
     }
@@ -6557,6 +6621,23 @@ export class BlitConnection {
             connectionError(
               parsed.detail ||
                 `Content search failed: ${fsDoneStatusText(parsed.status)}`,
+            ),
+          );
+        }
+        return;
+      }
+      case S2C_FS_READ: {
+        const parsed = parseFsReadResult(bytes);
+        if (!parsed) return;
+        const pending = this.pendingFsReads.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingFsReads.delete(parsed.nonce);
+        if (parsed.status === FS_DONE_OK) {
+          pending.resolve(parsed.records);
+        } else {
+          pending.reject(
+            connectionError(
+              `File read failed: ${fsDoneStatusText(parsed.status)}`,
             ),
           );
         }

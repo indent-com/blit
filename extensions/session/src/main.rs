@@ -71,7 +71,7 @@ const CATALOG_TTL: Duration = Duration::from_secs(60);
 /// would be a way to stall the supervisor from the browser.
 const MAX_ICON_REQUEST: usize = 48;
 
-/// Resolved artwork kept in the guest before the cache is dropped wholesale.
+/// Resolved icon paths kept in the guest before the cache is dropped wholesale.
 ///
 /// Measured in bytes rather than entries because the entries are not
 /// comparable: a themed SVG is 3 KB and a 128px PNG can be [`icon::MAX_ICON_BYTES`],
@@ -400,12 +400,12 @@ fn state_json(state: &State, with_catalog: bool) -> String {
 /// panel records it so it stops asking. That is why this is a message per id
 /// rather than a map of the ones that were found: a silent omission would be
 /// indistinguishable from a reply still in flight.
-fn icon_json(id: &str, data_url: Option<&str>) -> String {
+fn icon_json(id: &str, path: Option<&str>) -> String {
     let mut out = String::from("{\"type\":\"icon\",\"id\":");
     push_json_string(&mut out, id);
-    if let Some(data_url) = data_url {
-        out.push_str(",\"icon\":");
-        push_json_string(&mut out, data_url);
+    if let Some(path) = path {
+        out.push_str(",\"path\":");
+        push_json_string(&mut out, path);
     }
     out.push('}');
     out
@@ -521,24 +521,23 @@ fn resolve_icons(
             // No reply says nothing about these names, so they are neither
             // answered nor cached: the panel asks again and the next request
             // gets a fresh attempt rather than a remembered failure.
+            // Which file, not what is in it: the panel reads the bytes itself,
+            // so this asks for a stat per candidate and carries none of them.
             let Some(records) = fs_read(
                 client,
                 state,
-                remote::fs::FS_READ_FIRST,
+                remote::fs::FS_READ_FIRST | remote::fs::FS_READ_NO_CONTENT,
                 icon::MAX_ICON_BYTES,
                 &borrowed,
             ) else {
                 break;
             };
             // One record per group, in group order.
-            for (name, (status, path, body)) in asked[at..end].iter().zip(records) {
-                let data_url = if status == remote::fs::FS_FILE_OK {
-                    icon::data_url(&path, &body)
-                } else {
-                    None
-                };
-                state.cache_icon((*name).clone(), data_url.clone());
-                resolved.insert((*name).clone(), data_url);
+            for (name, (status, path, _)) in asked[at..end].iter().zip(records) {
+                let found = (status == remote::fs::FS_FILE_OK && icon::is_drawable_path(&path))
+                    .then_some(path);
+                state.cache_icon((*name).clone(), found.clone());
+                resolved.insert((*name).clone(), found);
             }
             at = end;
         }
@@ -548,19 +547,20 @@ fn resolve_icons(
     if !absolute.is_empty() {
         for batch in absolute.chunks(remote::fs::FS_READ_MAX_PATHS) {
             let paths: Vec<&str> = batch.iter().map(String::as_str).collect();
-            let Some(records) =
-                fs_read(client, state, 0, icon::MAX_ICON_BYTES, &[paths.as_slice()])
-            else {
+            let Some(records) = fs_read(
+                client,
+                state,
+                remote::fs::FS_READ_NO_CONTENT,
+                icon::MAX_ICON_BYTES,
+                &[paths.as_slice()],
+            ) else {
                 break;
             };
-            for (status, path, body) in records {
-                let data_url = if status == remote::fs::FS_FILE_OK {
-                    icon::data_url(&path, &body)
-                } else {
-                    None
-                };
-                state.cache_icon(path.clone(), data_url.clone());
-                resolved.insert(path, data_url);
+            for (status, path, _) in records {
+                let found = (status == remote::fs::FS_FILE_OK && icon::is_drawable_path(&path))
+                    .then(|| path.clone());
+                state.cache_icon(path.clone(), found.clone());
+                resolved.insert(path, found);
             }
         }
     }

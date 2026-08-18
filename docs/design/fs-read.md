@@ -58,6 +58,20 @@ A reply carries at most `FS_READ_MAX_TOTAL_BYTES` (8 MiB) of content. Files past
 that are `TOO_LARGE` rather than silently dropped, so a caller can re-ask for the
 remainder in smaller batches.
 
+### `FS_READ_NO_CONTENT`
+
+With `flags` bit 1 set, records name the file without carrying it: a status and a
+path, an empty body, one stat per candidate instead of a read. `max_bytes` still
+applies, so "exists, but too big to be what I am looking for" is still answered as
+such.
+
+This is for a caller that only needs to know *where* something is because it will
+hand the path to whoever actually wants the bytes. The session supervisor resolves
+icons this way and answers the panel with a path; the panel reads it itself, which
+is the difference between artwork crossing a Wasm interpreter and not. A 30 KB
+icon had to be base64`d into a JSON string in there, and that cost more than
+everything else the panel did.
+
 ### `FS_READ_FIRST`
 
 With `flags` bit 0 set, each group is answered by the first path in it that can
@@ -96,7 +110,8 @@ into the store.
 
 - **No byte ranges.** Every caller so far wants whole files, and a range needs an
   offset, a length, and a rule for a file that changed under it.
-- **No metadata-only mode.** `TOO_LARGE` already answers "how big is it" for the
-  only question anyone asked, which is whether it is worth carrying.
+- **No stat that reports a size.** `FS_READ_NO_CONTENT` answers *which* path and
+  whether it is under a ceiling, which is what a caller choosing between
+  candidates needs; the exact size has no reader yet.
 - **No directory reads.** That is `FS_INDEX`, and conflating them would make one
   message answer two shapes.

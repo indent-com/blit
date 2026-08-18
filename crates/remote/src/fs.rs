@@ -258,6 +258,18 @@ pub const FS_FILE_TOO_LARGE: u8 = 4;
 /// can align answers with questions by position.
 pub const FS_READ_FIRST: u8 = 1 << 0;
 
+/// Answer which path, not what is in it.
+///
+/// The resolution without the transfer: a caller that only needs to know *where*
+/// something is — because it will hand the path to whoever actually wants the
+/// bytes — pays a stat instead of a read. Records carry their status and path
+/// with an empty body, and `max_bytes` still applies, so "exists but too big to
+/// be what I am looking for" is still answered as such.
+pub const FS_READ_NO_CONTENT: u8 = 1 << 1;
+
+/// The flags `FS_READ` understands; anything else answers `INVALID`.
+pub const FS_READ_FLAGS_KNOWN: u8 = FS_READ_FIRST | FS_READ_NO_CONTENT;
+
 /// Paths one `FS_READ` may name. Generous because the shape it replaces is a
 /// batch: a panel asking for a screenful of artwork, a supervisor reading every
 /// `.desktop` file in a directory.

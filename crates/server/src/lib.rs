@@ -14065,6 +14065,23 @@ const FS_INDEX_MAX_BYTES: usize = 48 * 1024 * 1024;
 /// with a bare `*` — the dotfiles-repo-at-$HOME pattern — blanks every
 /// non-repo subtree) falls back to an ignore-free walk: an empty index
 /// would otherwise read as "no files here" and never consult the server.
+/// Classify one path for `FS_READ` without reading it.
+fn stat_one_for_fs_read(path: &str, per_file: u64) -> u8 {
+    use blit_remote::fs::{
+        FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_OTHER, FS_FILE_TOO_LARGE, FS_FILE_UNREADABLE,
+    };
+    match std::fs::metadata(path) {
+        Err(error) => match error.kind() {
+            std::io::ErrorKind::NotFound => FS_FILE_NOT_FOUND,
+            std::io::ErrorKind::PermissionDenied => FS_FILE_UNREADABLE,
+            _ => FS_FILE_OTHER,
+        },
+        Ok(meta) if !meta.is_file() => FS_FILE_UNREADABLE,
+        Ok(meta) if meta.len() > per_file => FS_FILE_TOO_LARGE,
+        Ok(_) => FS_FILE_OK,
+    }
+}
+
 /// Read one path for `FS_READ`: its record status and content.
 ///
 /// `left` is what remains of the reply budget, so a file that would not fit is
@@ -14470,9 +14487,10 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
             if let Some((nonce, flags, max_bytes, groups)) = parse_fs_read(data) {
                 use blit_remote::fs::{
                     FS_FILE_NOT_FOUND, FS_FILE_OK, FS_READ_DEFAULT_BYTES, FS_READ_FIRST,
-                    FS_READ_MAX_TOTAL_BYTES, msg_fs_read_result,
+                    FS_READ_FLAGS_KNOWN, FS_READ_MAX_TOTAL_BYTES, FS_READ_NO_CONTENT,
+                    msg_fs_read_result,
                 };
-                if flags & !FS_READ_FIRST != 0 {
+                if flags & !FS_READ_FLAGS_KNOWN != 0 {
                     let _ = out.send(msg_fs_read_result(nonce, FS_DONE_INVALID, &[]));
                     return;
                 }
@@ -14492,12 +14510,17 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
                         max_bytes
                     });
                     let first_only = flags & FS_READ_FIRST != 0;
+                    let no_content = flags & FS_READ_NO_CONTENT != 0;
                     let mut left = FS_READ_MAX_TOTAL_BYTES;
                     let mut records: Vec<(u8, String, Vec<u8>)> = Vec::new();
                     for group in groups {
                         let mut answered = false;
                         for path in group {
-                            let (status, body) = read_one_for_fs_read(&path, per_file, left);
+                            let (status, body) = if no_content {
+                                (stat_one_for_fs_read(&path, per_file), Vec::new())
+                            } else {
+                                read_one_for_fs_read(&path, per_file, left)
+                            };
                             left = left.saturating_sub(body.len());
                             // FIRST asks for the first path it can *have*, so a
                             // miss, an unreadable file and an oversized one are
