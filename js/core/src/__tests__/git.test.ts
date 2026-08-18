@@ -27,6 +27,12 @@ import {
   isGitPseudoRef,
   gitDiscoverRecords,
   gitReflogRecords,
+  gitWorktreeRecords,
+  msgGitWorktrees,
+  GIT_WORKTREE_MAIN,
+  GIT_WORKTREE_CURRENT,
+  GIT_WORKTREE_LOCKED,
+  GIT_WORKTREE_DETACHED,
   GIT_ENDPOINT_COMMIT,
   GIT_ENDPOINT_WORKTREE,
   GIT_INDEX_INTENT_TO_ADD,
@@ -1089,5 +1095,104 @@ describe("pseudo-refs in the ref stream", () => {
     mirror.applyState(msgGitState(1, 1, 0, new Uint8Array(buf)));
     const branches = [...mirror.refs.keys()].filter((n) => !isGitPseudoRef(n));
     expect(branches).toEqual(["refs/heads/main"]);
+  });
+});
+
+/**
+ * `GIT_WORKTREES` (0xB5) and the `WORKTREE_GEN` state record. The record
+ * hex is pinned identically in `worktree_wire_tests` in
+ * `crates/remote/src/git.rs`, so codec drift on either side fails here or
+ * there.
+ */
+describe("git worktrees", () => {
+  const PINNED_WORKTREES =
+    // TREE: len 62, kind 01, flags 03 (MAIN|CURRENT), oid 0x11×20
+    // zero-padded to 32, "/w/main", "refs/heads/main", empty lock.
+    "3e000000" +
+    "0103" +
+    "1111111111111111111111111111111111111111" +
+    "000000000000000000000000" +
+    "07002f772f6d61696e" +
+    "0f00726566732f68656164732f6d61696e" +
+    "0000" +
+    // TREE: len 51, flags 14 (LOCKED|DETACHED), oid 0x22×20, "/w/wt",
+    // empty branch (detached), lock reason "on usb".
+    "33000000" +
+    "0114" +
+    "2222222222222222222222222222222222222222" +
+    "000000000000000000000000" +
+    "05002f772f7774" +
+    "0000" +
+    "06006f6e20757362";
+
+  it("builds the request byte-identically", () => {
+    expect(
+      hex(msgGitWorktrees({ nonce: 0x0102, repoId: 7, afterPos: 3 })),
+    ).toBe(
+      "b5" + // opcode
+        "0201" + // nonce, LE
+        "0700" + // repo_id
+        "00" + // flags
+        "0300000000000000", // after_pos, u64 LE
+    );
+  });
+
+  it("decodes the pinned worktree records", () => {
+    const records = [...gitWorktreeRecords(fromHex(PINNED_WORKTREES))];
+    expect(records).toHaveLength(2);
+    expect(records[0]).toMatchObject({
+      kind: "tree",
+      flags: GIT_WORKTREE_MAIN | GIT_WORKTREE_CURRENT,
+      path: "/w/main",
+      branch: "refs/heads/main",
+      lockReason: "",
+    });
+    if (records[0].kind !== "tree") throw new Error("expected tree");
+    expect(gitOidHex(records[0].oid)).toBe("11".repeat(20));
+    // Detached: the flag and the empty branch have to agree, or a client
+    // renders a branch pill for a worktree that is on no branch.
+    expect(records[1]).toMatchObject({
+      kind: "tree",
+      flags: GIT_WORKTREE_LOCKED | GIT_WORKTREE_DETACHED,
+      path: "/w/wt",
+      branch: "",
+      lockReason: "on usb",
+    });
+  });
+
+  it("ends a truncated page with the family-wide cursor", () => {
+    const buf: number[] = [];
+    // A CURSOR record: [len:4][kind:1][after_len:2][after:N][pos:8].
+    const start = buf.length;
+    buf.push(0, 0, 0, 0);
+    buf.push(GIT_RECORD_CURSOR);
+    buf.push(0, 0); // empty `after` — worktrees resume by position
+    for (let i = 0; i < 8; i++) buf.push(i === 0 ? 0x100 - 0x100 + 4 : 0);
+    const len = buf.length - start - 4;
+    buf[0] = len & 0xff;
+    buf[1] = (len >> 8) & 0xff;
+    const records = [...gitWorktreeRecords(new Uint8Array(buf))];
+    expect(records).toEqual([{ kind: "cursor", after: "", pos: 4n }]);
+  });
+
+  it("mirrors the worktree generation, and resets it per snapshot", () => {
+    const mirror = new GitStateMirror();
+    const buf: number[] = [];
+    appendGitStateRecord(buf, {
+      kind: "worktreeGen",
+      count: 4,
+      digest: 0xdeadbeef00000001n,
+    });
+    mirror.applyState(msgGitState(1, 1, 0, new Uint8Array(buf)));
+    expect(mirror.worktreeGen).toEqual({
+      count: 4,
+      digest: 0xdeadbeef00000001n,
+    });
+
+    // A snapshot that carries no WORKTREE_GEN leaves (0, 0n) rather than
+    // the previous value: each snapshot replaces the whole state, and a
+    // stale generation would stop the panel ever refetching again.
+    mirror.applyState(msgGitState(1, 2, 0, new Uint8Array()));
+    expect(mirror.worktreeGen).toEqual({ count: 0, digest: 0n });
   });
 });

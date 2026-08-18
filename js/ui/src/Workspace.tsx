@@ -143,6 +143,7 @@ import {
 } from "./panelHash";
 import { fontCatalog } from "./fontCatalog";
 import { ExplorerPanel } from "./ide/ExplorerPanel";
+import { BranchesPanel } from "./ide/BranchesPanel";
 import { LogPanel } from "./ide/LogPanel";
 import { SearchPanel } from "./ide/SearchPanel";
 import { ResizeHandle } from "./bsp/ResizeHandle";
@@ -177,6 +178,7 @@ import {
   toggleServerRoot,
   reorderServerRoots,
 } from "./ide/rootsStore";
+import { ensureSessionCatalog } from "./sessionCatalogs";
 import { useIdeSession, type IdeSessionDescriptor } from "./ide/session";
 import {
   currentSourceSessionForPty,
@@ -649,6 +651,9 @@ function WorkspaceScreen(props: {
   const [fontSize, setFontSize] = createSignal(preferredFontSize());
   const [textGamma, setTextGamma] = createSignal(preferredTextGamma());
   const [overlay, setOverlay] = createSignal<Overlay>(null);
+  // Whether the active connection serves the systemd watcher. Probed rather
+  // than assumed: it is an extension somebody installed, not a server family,
+  // and the status bar should not offer a panel with nothing behind it.
   const [openInNewTerminalMode, setOpenInNewTerminalMode] = createSignal(false);
   const [newTerminalTargetPaneId, setNewTerminalTargetPaneId] = createSignal<
     string | null
@@ -761,7 +766,7 @@ function WorkspaceScreen(props: {
   >(new Set());
   const [sectionWeights, setSectionWeights] = createSignal<
     Record<LeftPanel, number>
-  >({ explorer: 1, log: 1, problems: 1 });
+  >({ explorer: 1, branches: 1, log: 1, problems: 1 });
   const [leftDockWidth, setLeftDockWidth] = createSignal(
     preferredLeftDockWidth(),
   );
@@ -784,6 +789,16 @@ function WorkspaceScreen(props: {
       );
     }
   });
+  // Each connected server's application catalog, held open so the switcher can
+  // filter it from the first keystroke instead of fetching one when it opens.
+  // Armed like the roots watch above, and re-armed on the generation for the
+  // same reason: a channel does not survive a re-establish.
+  createEffect(() => {
+    for (const c of wsState().connections) {
+      if (c.status !== "connected") continue;
+      ensureSessionCatalog(workspace, c.id, c.generation);
+    }
+  });
   // The picker's list: per-server roots for kv connections, gateway entries
   // only for targets that don't have server-side roots (avoids doubling
   // seeded entries).
@@ -793,7 +808,19 @@ function WorkspaceScreen(props: {
       (r) => !hasServerRoots(connectionForRemote(r.remote)),
     ),
   ]);
-  type RootSelection = { kind: "focused" } | { kind: "declared"; name: string };
+  // A worktree selection is deliberately not a declared root: it is a
+  // navigation, not a configured place. It carries its own connection so it
+  // survives the focus moving, and a label so the picker can name it without
+  // re-deriving a basename.
+  type RootSelection =
+    | { kind: "focused" }
+    | { kind: "declared"; name: string }
+    | {
+        kind: "worktree";
+        connectionId: ConnectionId;
+        path: string;
+        label: string;
+      };
   const [rootSel, setRootSel] = createSignal<RootSelection>({
     kind: "focused",
   });
@@ -927,6 +954,17 @@ function WorkspaceScreen(props: {
       const connectionId = connectionForRemote(r.remote);
       return { key: `d ${connectionId} ${r.path}`, connectionId, path: r.path };
     }
+    if (sel.kind === "worktree") {
+      // No `preferRepoRoot`: a linked worktree IS the repo root the server
+      // resolves for it, and asking to be re-rooted at "the enclosing repo"
+      // is exactly how a click on a worktree would snap back to whichever
+      // one we came from.
+      return {
+        key: `w ${sel.connectionId} ${sel.path}`,
+        connectionId: sel.connectionId,
+        path: sel.path,
+      };
+    }
     const a = lastAnchor();
     if (!a) return null;
     if (a.kind === "terminal") {
@@ -1007,6 +1045,9 @@ function WorkspaceScreen(props: {
     // Now that the log's fold comes from here rather than from a seeded
     // preference, this case has to be named or the log sits open on nothing.
     if (!s || s.noRepo()) set.add("log");
+    // Branches folds on exactly the same condition as the log: both are
+    // views of a repository, and neither has anything to say without one.
+    if (!s || s.noRepo()) set.add("branches");
     if (s?.noLsp()) set.add("problems");
     return set;
   });
@@ -2301,7 +2342,25 @@ function WorkspaceScreen(props: {
     onOpenTile: openTile,
   };
 
+  // Re-root the dock at a worktree. The connection comes from the session
+  // the list was read through, so navigating cannot silently land on another
+  // server's path of the same name.
+  function openWorktree(path: string) {
+    const connectionId = activeSession()?.connectionId;
+    if (!connectionId) return;
+    const label = path.split("/").filter(Boolean).pop() ?? path;
+    setRootSel({ kind: "worktree", connectionId, path, label });
+  }
+
   function panelBody(panel: LeftPanel): JSX.Element {
+    if (panel === "branches")
+      return (
+        <BranchesPanel
+          {...leftPanelProps}
+          onOpenWorktree={openWorktree}
+          onOpenTerminalIn={(path) => void openTerminalIn(path)}
+        />
+      );
     if (panel === "log") return <LogPanel {...leftPanelProps} />;
     if (panel === "problems") return <ProblemsPanel {...leftPanelProps} />;
     return <ExplorerPanel {...leftPanelProps} />;
@@ -2335,9 +2394,15 @@ function WorkspaceScreen(props: {
       );
       return match ? match.name : `${connectionId}:${path}`;
     };
+    const worktreeSel = () => {
+      const s = rootSel();
+      return s.kind === "worktree" ? s : null;
+    };
     const value = () => {
       const s = rootSel();
-      return s.kind === "declared" ? s.name : "__focused__";
+      if (s.kind === "declared") return s.name;
+      if (s.kind === "worktree") return "__worktree__";
+      return "__focused__";
     };
     return (
       <div
@@ -2350,14 +2415,29 @@ function WorkspaceScreen(props: {
         }}
       >
         <select
-          value={value()}
+          // NOT `value={value()}`: Solid compiles that to a render effect
+          // tracking only `value()`, which runs *before* the `<Show>` below
+          // has added the `__worktree__` option. The browser drops an
+          // assignment naming an option that does not exist yet, and the
+          // select silently falls back to the first one — so navigating to a
+          // worktree changed the root but left the picker reading "Focused
+          // pane". Re-assigning from an effect that reads the option set
+          // explicitly runs after the children exist.
+          ref={(el) => {
+            createEffect(() => {
+              worktreeSel();
+              declared();
+              el.value = value();
+            });
+          }}
           onChange={(e) => {
             const v = e.currentTarget.value;
-            setRootSel(
-              v === "__focused__"
-                ? { kind: "focused" }
-                : { kind: "declared", name: v },
-            );
+            if (v === "__focused__") setRootSel({ kind: "focused" });
+            // Re-picking the worktree we are already on is a no-op; without
+            // this it would fall through and mint a declared root named
+            // "__worktree__" that resolves to nothing.
+            else if (v !== "__worktree__")
+              setRootSel({ kind: "declared", name: v });
           }}
           title="Workspace root"
           style={{
@@ -2373,6 +2453,12 @@ function WorkspaceScreen(props: {
           }}
         >
           <option value="__focused__">◐ {focusedLabel()}</option>
+          {/* The worktree navigated to from the Branches panel. Only present
+              while one is selected: it is a place you went, not a place you
+              configured, so it does not accumulate in the list. */}
+          <Show when={worktreeSel()}>
+            {(sel) => <option value="__worktree__">⌥ {sel().label}</option>}
+          </Show>
           <For each={declared()}>
             {(r) => <option value={r.name}>{r.name}</option>}
           </For>
@@ -3772,6 +3858,27 @@ function WorkspaceScreen(props: {
       workspace.focusSession(session.id);
       previousFocus = null;
       closeOverlay();
+    } catch {}
+  }
+
+  /** Open a terminal in an absolute directory on the session's own
+   *  connection — the Branches panel's secondary action on a worktree. Takes
+   *  the focused pane like any other new terminal, so it lands where you are
+   *  looking rather than somewhere you have to go find. */
+  async function openTerminalIn(path: string) {
+    const connectionId = activeSession()?.connectionId;
+    if (!connectionId) return;
+    try {
+      const session = await workspace.createSession({
+        connectionId,
+        rows: termHandle?.rows ?? 24,
+        cols: termHandle?.cols ?? 80,
+        cwd: path,
+      });
+      focusSurfaceById(null);
+      setActiveTile(null);
+      moveSessionToPaneFn?.(session.id, preferredTilePane());
+      workspace.focusSession(session.id);
     } catch {}
   }
 

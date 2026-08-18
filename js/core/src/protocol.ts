@@ -2,6 +2,7 @@ import {
   C2S_ACK,
   C2S_CLIENT_METRICS,
   C2S_CLIENT_LIST,
+  CLIENT_LIST_WANT_ORIGIN,
   C2S_CLIENT_WATCH,
   C2S_CLIENT_UNWATCH,
   C2S_CLIPBOARD_GET,
@@ -72,19 +73,39 @@ export function buildAckMessage(): Uint8Array {
   return new Uint8Array([C2S_ACK]);
 }
 
-/** Request the server's connection catalog. */
-export function buildClientListMessage(nonce: number): Uint8Array {
-  const msg = new Uint8Array(3);
-  msg[0] = C2S_CLIENT_LIST;
-  new DataView(msg.buffer).setUint16(1, nonce, true);
-  return msg;
+/**
+ * Request the server's connection catalog.
+ *
+ * `wantOrigin` adds the flags byte that asks for `S2C_CLIENT_LIST2`, whose
+ * entries say where each connection came from. Only send it to a server
+ * advertising `FEATURE_CLIENT_ORIGIN`: every server answers a client-control
+ * request with unexpected trailing bytes with `INVALID`, so asking blindly
+ * costs the catalog rather than the extra field.
+ */
+export function buildClientListMessage(
+  nonce: number,
+  wantOrigin = false,
+): Uint8Array {
+  return buildClientCatalogRequest(C2S_CLIENT_LIST, nonce, wantOrigin);
 }
 
 /** Start streaming the server's connection catalog. */
-export function buildClientWatchMessage(nonce: number): Uint8Array {
-  const msg = new Uint8Array(3);
-  msg[0] = C2S_CLIENT_WATCH;
+export function buildClientWatchMessage(
+  nonce: number,
+  wantOrigin = false,
+): Uint8Array {
+  return buildClientCatalogRequest(C2S_CLIENT_WATCH, nonce, wantOrigin);
+}
+
+function buildClientCatalogRequest(
+  opcode: number,
+  nonce: number,
+  wantOrigin: boolean,
+): Uint8Array {
+  const msg = new Uint8Array(wantOrigin ? 4 : 3);
+  msg[0] = opcode;
   new DataView(msg.buffer).setUint16(1, nonce, true);
+  if (wantOrigin) msg[3] = CLIENT_LIST_WANT_ORIGIN;
   return msg;
 }
 

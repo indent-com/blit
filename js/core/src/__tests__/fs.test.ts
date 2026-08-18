@@ -19,6 +19,7 @@ import {
   FS_ENTRY_FILE,
   FS_ENTRY_NO_CONTENT,
   FS_FILE_OK,
+  FS_FILE_NOT_FOUND,
   FS_STATUS_NOT_FOUND,
   FS_SYNC_CONTENT,
   FS_SYNC_RECURSIVE,
@@ -97,6 +98,12 @@ import {
   S2C_FS_FILE,
   S2C_FS_SYNCED,
   S2C_FS_UPDATE,
+  C2S_FS_READ,
+  S2C_FS_READ,
+  FS_READ_FIRST,
+  FS_READ_NO_CONTENT,
+  buildFsReadMessage,
+  parseFsReadResult,
 } from "../fs";
 
 function fromHex(hex: string): Uint8Array {
@@ -2411,3 +2418,103 @@ describe("BlitConnection.grep", () => {
     conn.dispose();
   });
 });
+
+describe("one-shot reads", () => {
+  /** Groups are what make a screenful of icons one message: each is answered by
+   *  its own first readable path, so answers align with questions by position. */
+  it("carries groups and reads the answer back", () => {
+    const wire = buildFsReadMessage(
+      7,
+      FS_READ_FIRST | FS_READ_NO_CONTENT,
+      4096,
+      [
+        ["/i/scalable/apps/a.svg", "/i/48x48/apps/a.png"],
+        ["/i/scalable/apps/b.svg"],
+      ],
+    );
+    expect(wire[0]).toBe(C2S_FS_READ);
+    const view = new DataView(wire.buffer, wire.byteOffset, wire.byteLength);
+    expect(view.getUint16(1, true)).toBe(7);
+    expect(wire[3]).toBe(FS_READ_FIRST | FS_READ_NO_CONTENT);
+    expect(view.getUint32(4, true)).toBe(4096);
+    expect(view.getUint16(8, true)).toBe(2);
+
+    const reply = buildReadResult(7, FS_DONE_OK, [
+      {
+        status: FS_FILE_OK,
+        path: "/i/48x48/apps/a.png",
+        content: Uint8Array.of(1, 2),
+      },
+      { status: FS_FILE_NOT_FOUND, path: "", content: new Uint8Array() },
+    ]);
+    const parsed = parseFsReadResult(reply);
+    expect(
+      parsed?.records.map((r) => [r.status, r.path, [...r.content]]),
+    ).toEqual([
+      [FS_FILE_OK, "/i/48x48/apps/a.png", [1, 2]],
+      [FS_FILE_NOT_FOUND, "", []],
+    ]);
+  });
+
+  it("refuses a request the protocol cannot carry", () => {
+    expect(() => buildFsReadMessage(1, 0, 0, [])).toThrow(/1 to 512/);
+    expect(() => buildFsReadMessage(1, 0, 0, [[]])).toThrow(/1 to 512/);
+    const tooMany = Array.from({ length: 513 }, () => "/x");
+    expect(() => buildFsReadMessage(1, 0, 0, [tooMany])).toThrow(/1 to 512/);
+  });
+
+  it("resolves a read with one record per requested group", async () => {
+    const { conn, transport } = fsReadyConnection();
+    const promise = conn.readFiles([["/a.png"], ["/b.png"]], {
+      flags: FS_READ_FIRST,
+    });
+    const request = transport.sent.find((x) => x[0] === C2S_FS_READ)!;
+    const nonce = request[1] | (request[2] << 8);
+    transport.push(
+      buildReadResult(nonce, FS_DONE_OK, [
+        { status: FS_FILE_OK, path: "/a.png", content: Uint8Array.of(9) },
+        { status: FS_FILE_NOT_FOUND, path: "", content: new Uint8Array() },
+      ]),
+    );
+    const records = await promise;
+    expect(records.map((record) => record.path)).toEqual(["/a.png", ""]);
+    expect([...records[0]!.content]).toEqual([9]);
+    conn.dispose();
+  });
+});
+
+/** An `S2C_FS_READ` frame: the records blob is LZ4, and lz4_flex accepts an
+ *  uncompressed literal block, which is what the other fs fixtures here use. */
+function buildReadResult(
+  nonce: number,
+  status: number,
+  records: { status: number; path: string; content: Uint8Array }[],
+): Uint8Array {
+  const encoder = new TextEncoder();
+  const parts = records.map((record) => {
+    const path = encoder.encode(record.path);
+    const body = new Uint8Array(3 + path.length + 4 + record.content.length);
+    const view = new DataView(body.buffer);
+    body[0] = record.status;
+    view.setUint16(1, path.length, true);
+    body.set(path, 3);
+    view.setUint32(3 + path.length, record.content.length, true);
+    body.set(record.content, 7 + path.length);
+    return body;
+  });
+  const raw = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let at = 0;
+  for (const part of parts) {
+    raw.set(part, at);
+    at += part.length;
+  }
+  const compressed = fsCompressLiteral(raw);
+  const msg = new Uint8Array(6 + compressed.length);
+  const view = new DataView(msg.buffer);
+  msg[0] = S2C_FS_READ;
+  view.setUint16(1, nonce, true);
+  msg[3] = status;
+  view.setUint16(4, records.length, true);
+  msg.set(compressed, 6);
+  return msg;
+}

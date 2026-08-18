@@ -2,16 +2,22 @@
 
 export const CHANNEL = 0x95;
 export const FEATURE_CHANNEL = 1 << 12;
+/** Its own bit: a `WATCH` an older server does not know is skipped in silence,
+ *  which reads exactly like a name nobody serves. */
+export const FEATURE_CHANNEL_WATCH = 1 << 26;
 
 export const CHANNEL_LISTEN = 1;
 export const CHANNEL_CONNECT = 2;
 export const CHANNEL_DATA = 3;
 export const CHANNEL_ACK = 4;
 export const CHANNEL_CLOSE = 5;
+export const CHANNEL_WATCH = 6;
+export const CHANNEL_UNWATCH = 7;
 
 export const CHANNEL_OPENED = 1;
 export const CHANNEL_ACCEPTED = 2;
 export const CHANNEL_CLOSED = 5;
+export const CHANNEL_NAMES = 6;
 
 export const CHANNEL_EXPECT_LISTENER_TOKEN = 1 << 0;
 
@@ -28,6 +34,9 @@ export const CHANNEL_MAX_PAYLOAD = 1024 * 1024;
 export const CHANNEL_MAX_DETAIL = 4 * 1024;
 export const CHANNEL_WINDOW_BYTES = 1024n * 1024n;
 export const CHANNEL_MAX_UNCONSUMED_MESSAGES = 1024;
+/** Names one watch may declare. A watch names what it cares about so its
+ *  traffic cannot scale with churn it has no interest in. */
+export const CHANNEL_MAX_WATCH_NAMES = 32;
 
 const encoder = new TextEncoder();
 const fatalDecoder = new TextDecoder("utf-8", { fatal: true });
@@ -57,6 +66,14 @@ export type ChannelMessage =
       channelId: number;
       reason: number;
       detail: string;
+    }
+  | {
+      /** Which of a watch's declared names have a listener right now. A name
+       *  that was asked about and is missing here has none, so an empty list
+       *  is an answer rather than nothing to say. */
+      kind: "names";
+      channelId: number;
+      names: string[];
     };
 
 export interface ChannelConnectOptions {
@@ -200,6 +217,78 @@ export function buildChannelCloseMessage(
   return message;
 }
 
+/**
+ * Follow which of `names` currently have a listener.
+ *
+ * The ID is a client-created channel ID that carries no stream: it shares the
+ * channel ID space so a watch and a channel can never be confused for one
+ * another, and it is released by `buildChannelUnwatchMessage`.
+ */
+export function buildChannelWatchMessage(
+  channelId: number,
+  names: readonly string[],
+): Uint8Array {
+  clientId(channelId);
+  if (names.length === 0) {
+    throw new RangeError("a channel watch must declare at least one name");
+  }
+  if (names.length > CHANNEL_MAX_WATCH_NAMES) {
+    throw new RangeError(`a channel watch declares at most 32 names`);
+  }
+  if (new Set(names).size !== names.length) {
+    throw new RangeError("channel watch names must be distinct");
+  }
+  return buildNameList(CHANNEL_WATCH, channelId, names);
+}
+
+export function buildChannelUnwatchMessage(channelId: number): Uint8Array {
+  clientId(channelId);
+  return envelope(CHANNEL_UNWATCH, channelId, 0);
+}
+
+function buildNameList(
+  kind: number,
+  channelId: number,
+  names: readonly string[],
+): Uint8Array {
+  const encoded = names.map(channelName);
+  const body = encoded.reduce((total, name) => total + 2 + name.length, 3);
+  const message = envelope(kind, channelId, body);
+  const view = new DataView(message.buffer);
+  let offset = 6;
+  message[offset++] = 0;
+  view.setUint16(offset, encoded.length, true);
+  offset += 2;
+  for (const name of encoded) {
+    view.setUint16(offset, name.length, true);
+    offset += 2;
+    message.set(name, offset);
+    offset += name.length;
+  }
+  return message;
+}
+
+function decodeNameList(bytes: Uint8Array): string[] | null {
+  if (bytes.length < 9 || bytes[6] !== 0) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const count = view.getUint16(7, true);
+  if (count > CHANNEL_MAX_WATCH_NAMES) return null;
+  const names: string[] = [];
+  let offset = 9;
+  for (let index = 0; index < count; index += 1) {
+    if (bytes.length < offset + 2) return null;
+    const length = view.getUint16(offset, true);
+    offset += 2;
+    if (length === 0 || length > CHANNEL_MAX_NAME) return null;
+    if (bytes.length < offset + length) return null;
+    const name = decodeUtf8(bytes.subarray(offset, offset + length));
+    if (name === null || /\p{Cc}/u.test(name)) return null;
+    names.push(name);
+    offset += length;
+  }
+  return offset === bytes.length ? names : null;
+}
+
 function decodeUtf8(bytes: Uint8Array): string | null {
   try {
     return fatalDecoder.decode(bytes);
@@ -298,7 +387,108 @@ export function parseChannelMessage(bytes: Uint8Array): ChannelMessage | null {
         detail,
       };
     }
+    case CHANNEL_NAMES: {
+      const names = decodeNameList(bytes);
+      return names === null ? null : { kind: "names", channelId, names };
+    }
     default:
       return null;
   }
+}
+
+/**
+ * Send-credit bookkeeping for one connected channel.
+ *
+ * The peer's window is the only backpressure a channel has: the server
+ * refuses a DATA message that would put more than `window` unacknowledged
+ * bytes on the wire, and a refusal closes the channel. Track the counters
+ * here so a caller can ask before it builds a payload it cannot send.
+ */
+export class ChannelCredit {
+  #window: bigint;
+  #sent = 0n;
+  #acked = 0n;
+  #received = 0n;
+
+  constructor(window: bigint) {
+    this.#window = window;
+  }
+
+  get window(): bigint {
+    return this.#window;
+  }
+
+  /** Bytes this side may still send before the peer acknowledges more. */
+  get available(): bigint {
+    const outstanding = this.#sent - this.#acked;
+    return outstanding >= this.#window ? 0n : this.#window - outstanding;
+  }
+
+  /** Cumulative bytes received, which is what an ACK must carry. */
+  get received(): bigint {
+    return this.#received;
+  }
+
+  fits(length: number): boolean {
+    return BigInt(length) <= this.available;
+  }
+
+  /** Record an outgoing DATA payload. Returns false when credit is short and
+   *  nothing was recorded, so the caller can drop or queue instead. */
+  charge(length: number): boolean {
+    if (!this.fits(length)) return false;
+    this.#sent += BigInt(length);
+    return true;
+  }
+
+  /** Apply a peer ACK. Cumulative and monotonic; a replay is ignored. */
+  acknowledge(bytes: bigint): void {
+    if (bytes > this.#acked)
+      this.#acked = bytes > this.#sent ? this.#sent : bytes;
+  }
+
+  /** Record an incoming DATA payload and return the new cumulative total. */
+  receive(length: number): bigint {
+    this.#received += BigInt(length);
+    return this.#received;
+  }
+}
+
+/** How a caller observes one connected channel. */
+export interface ChannelOpenOptions extends ChannelConnectOptions {
+  /** One complete message from the peer. Already acknowledged. */
+  onData?(payload: Uint8Array): void;
+  /** The peer acknowledged bytes; `available` is the new send credit. */
+  onCredit?(available: bigint): void;
+  /** Final closure, from either side or from transport loss. */
+  onClosed?(reason: number, detail: string): void;
+}
+
+/**
+ * A live watch over a set of channel names.
+ *
+ * Obtain one from `BlitConnection.watchChannelNames`. It resolves once the
+ * server has answered with the state the registry is in, so a caller never has
+ * to decide what an unanswered watch means.
+ */
+export interface ChannelNamesWatch {
+  /** The declared names that have a listener, as of the last answer. */
+  readonly present: ReadonlySet<string>;
+  /** Stop watching. Idempotent, and safe after the transport is gone. */
+  stop(): void;
+}
+
+/** A live channel. Obtain one from `BlitConnection.connectChannel`. */
+export interface ChannelHandle {
+  readonly channelId: number;
+  readonly name: string;
+  /** Server-assigned label for the peer, e.g. `ext:<id>:<attempt>`. */
+  readonly peer: string;
+  readonly metadata: Uint8Array;
+  /** Bytes that may be sent before the peer acknowledges more. */
+  readonly availableCredit: bigint;
+  /** Send one message. Returns false when credit is short or the channel is
+   *  gone; throws only on a payload the protocol cannot carry. */
+  send(payload: Uint8Array | string): boolean;
+  close(reason?: number): void;
 }

@@ -723,24 +723,42 @@ pub enum TerminalCommand {
     ///
     /// Without position flags, prints everything. Use --from-beginning or
     /// --from-end to set a starting offset, and --limit to cap the output.
+    ///
+    /// --since CURSOR instead reads only what was appended since a cursor
+    /// and prints the next cursor on stderr, so a loop pulls each byte once:
+    ///   c=$(blit terminal history 3 --since now 2>&1 >/dev/null | cut -d' ' -f2)
+    ///   blit terminal history 3 --since "$c"
+    /// CURSOR is SEQ, SEQ:COL, `now` (no text, current cursor) or `start`.
     History {
         /// Terminal ID
         id: u16,
 
         /// Start N lines from the top (oldest = 0)
-        #[arg(long, conflicts_with = "from_end")]
+        #[arg(long, conflicts_with_all = ["from_end", "since"])]
         from_start: Option<u32>,
 
         /// Start N lines from the bottom (newest = 0)
-        #[arg(long, conflicts_with = "from_start")]
+        #[arg(long, conflicts_with_all = ["from_start", "since"])]
         from_end: Option<u32>,
 
         /// Maximum number of lines to return
-        #[arg(long)]
+        #[arg(long, conflicts_with = "since")]
         limit: Option<u32>,
 
+        /// Read only what is new since this cursor (SEQ[:COL], now, start)
+        #[arg(long, value_name = "CURSOR")]
+        since: Option<String>,
+
+        /// Cap a --since read; the reply says where to continue from
+        #[arg(long, value_name = "BYTES", requires = "since")]
+        max_bytes: Option<u32>,
+
+        /// JSON output (with --since: text plus the next cursor)
+        #[arg(long, requires = "since")]
+        json: bool,
+
         /// Include ANSI color/style escape sequences in output
-        #[arg(long)]
+        #[arg(long, conflicts_with = "since")]
         ansi: bool,
 
         /// Resize to this many rows before capturing
@@ -750,6 +768,59 @@ pub enum TerminalCommand {
         /// Resize to this many columns before capturing
         #[arg(long)]
         cols: Option<u16>,
+    },
+
+    /// List the commands a terminal has run (needs OSC 133 shell integration).
+    ///
+    /// TSV: INDEX, STATUS, EXIT, MS, START_SEQ, END_SEQ, COMMAND. Prints the
+    /// most recent commands by default. Indices are stable and never reused,
+    /// so one can be fed back to `blit terminal output`.
+    ///
+    /// Nothing is recorded unless the shell emits OSC 133 semantic prompts —
+    /// see docs/shell-integration.md for the one-line hook.
+    Journal {
+        /// Terminal ID
+        id: u16,
+
+        /// Start at this command index instead of the newest ones
+        #[arg(long, value_name = "INDEX")]
+        from: Option<u64>,
+
+        /// Maximum number of records
+        #[arg(long, default_value_t = crate::journal::JOURNAL_LIMIT)]
+        limit: u16,
+
+        /// One JSON object per record
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print one command's output (needs OSC 133 shell integration).
+    ///
+    /// Defaults to the newest command. With --wait, blocks server-side until
+    /// the command finishes and exits with its status (124 if the wait timed
+    /// out), which is how to run something in a live shell and collect the
+    /// result:
+    ///   blit terminal send 3 'cargo test\n'
+    ///   blit terminal output 3 --wait 600
+    Output {
+        /// Terminal ID
+        id: u16,
+
+        /// Command index from `blit terminal journal` (default: newest)
+        index: Option<u64>,
+
+        /// Block up to SECONDS for the command to finish first
+        #[arg(long, value_name = "SECONDS")]
+        wait: Option<u64>,
+
+        /// Cap the output; the reply says where to continue from
+        #[arg(long, value_name = "BYTES", default_value_t = crate::journal::OUTPUT_MAX_BYTES)]
+        max_bytes: u32,
+
+        /// JSON: the record plus its output text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Ripgrep-compatible search over terminals' backlog + viewport.

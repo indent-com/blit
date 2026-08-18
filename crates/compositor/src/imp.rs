@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 
 use calloop::generic::Generic;
-use calloop::{EventLoop, Interest, LoopSignal, PostAction};
+use calloop::{EventLoop, Interest, LoopSignal, PostAction, RegistrationToken};
 use rustc_hash::{FxHashMap, FxHashSet};
 use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::{
     self, WpCursorShapeDeviceV1,
@@ -661,6 +661,18 @@ pub enum CompositorEvent {
         surface_id: u16,
         app_id: String,
     },
+    /// The stamped identity of a toplevel's application, sent once at creation
+    /// for surfaces that arrived on a per-app socket.
+    ///
+    /// A separate event rather than a field on `SurfaceCreated` because it
+    /// applies to a minority of surfaces and because `SurfaceAppId` already
+    /// established that shape for per-surface metadata.
+    SurfaceOrigin {
+        surface_id: u16,
+        sandbox_engine: String,
+        app_id: String,
+        instance_id: String,
+    },
     SurfaceResized {
         surface_id: u16,
         width: u16,
@@ -697,7 +709,51 @@ pub enum CompositorEvent {
     },
 }
 
+/// Who a Wayland connection belongs to.
+///
+/// Stamped by whoever created the socket the client arrived on, never asserted
+/// by the client itself — which is the whole point. `app_id` from
+/// `xdg_toplevel.set_app_id` is a free-form string an application says about
+/// itself, unverified and often wrong; `SO_PEERCRED` gives a pid that a
+/// zygote-forking or re-execing application immediately invalidates, and a
+/// passed connection fd means one socket need not mean one process at all.
+///
+/// The fields mirror `wp_security_context_v1` so that protocol can be wired to
+/// this later, letting a third-party sandbox engine stamp its own sockets.
+/// Nothing here depends on that protocol existing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppIdentity {
+    /// What created the socket, e.g. `blit` for the session supervisor.
+    pub sandbox_engine: String,
+    /// Stable across restarts of the same application.
+    pub app_id: String,
+    /// Distinguishes two concurrent runs of one application.
+    pub instance_id: String,
+}
+
 pub enum CompositorCommand {
+    /// Adopt an already-bound listening socket whose clients are known to
+    /// belong to `identity`.
+    ///
+    /// The caller binds the socket so the app can be spawned the instant this is
+    /// sent — there is no window in which the socket is named but not yet
+    /// listening. Ownership of the path stays with the caller, which unlinks it;
+    /// the compositor only accepts on the fd.
+    AddAppSocket {
+        fd: OwnedFd,
+        identity: AppIdentity,
+    },
+    /// Stop accepting on an adopted app socket, and close it.
+    ///
+    /// Named by the same identity that added it. The event source is removed and
+    /// the listener dropped, which closes the fd; the caller unlinks the path it
+    /// still owns. Without this, every attempt at an application leaves a
+    /// listening socket, a held fd and an event source behind — fastest under a
+    /// crash-looping app, which mints a fresh instance per backoff retry.
+    RemoveAppSocket {
+        app_id: String,
+        instance_id: String,
+    },
     KeyInput {
         surface_id: u16,
         keycode: u32,
@@ -1478,6 +1534,56 @@ struct ClientState {
     cleanup_needed: Arc<AtomicBool>,
 }
 
+/// Accept one connection and register it, optionally stamped with the identity
+/// of the socket it arrived on.
+///
+/// Shared by the session's own socket and every per-app socket so the two cannot
+/// drift: a stamped client differs only in carrying an identity.
+fn accept_client(
+    state: &mut Compositor,
+    client_stream: std::os::unix::net::UnixStream,
+    identity: Option<Arc<AppIdentity>>,
+    monitor_cancel: &std::os::unix::net::UnixStream,
+) {
+    let watched_stream = client_stream.try_clone().ok();
+    match state.display_handle.insert_client(
+        client_stream,
+        Arc::new(ClientState {
+            cleanup_needed: Arc::clone(&state.cleanup_needed),
+        }),
+    ) {
+        Ok(client) => {
+            // The peer's pid is what tells the X11 bridge apart
+            // from an ordinary app.
+            if let Ok(creds) = client.get_credentials(&state.display_handle)
+                && creds.pid > 0
+            {
+                state.note_client_pid(client.id(), creds.pid as u32);
+            }
+            if let Some(identity) = identity {
+                state.client_identity.insert(client.id(), identity);
+            }
+            // Offer the screen before the client reads its
+            // registry: a toolkit that finds no output there
+            // never opens a window at all.
+            state.ensure_client_output(client.id());
+            if let Some(watched_stream) = watched_stream {
+                monitor_client_disconnect(
+                    watched_stream,
+                    monitor_cancel,
+                    state.display_handle.backend_handle(),
+                    client.id(),
+                    state.verbose,
+                );
+            }
+        }
+        Err(e) if state.verbose => {
+            eprintln!("[compositor] insert_client error: {e}");
+        }
+        Err(_) => {}
+    }
+}
+
 /// Stop dispatching a client's stale request backlog once its socket closes.
 ///
 /// wayland-backend drains every already-readable request before it reads EOF.
@@ -2153,6 +2259,9 @@ struct Compositor {
     client_pids: FxHashMap<ClientId, u32>,
     /// Clients resolved to belong to the bridge's process tree.
     xwayland_clients: FxHashSet<ClientId>,
+    /// Identity of clients that arrived on a stamped per-app socket. Absent for
+    /// the shared socket, where nothing can be said about who connected.
+    client_identity: FxHashMap<ClientId, Arc<AppIdentity>>,
     seats: Vec<WlSeat>,
     keyboards: Vec<WlKeyboard>,
     pointers: Vec<WlPointer>,
@@ -2647,9 +2756,18 @@ impl Compositor {
         // so they go out ahead of the `enter` below, not at bind time.
         self.offer_selections_to_client(wl);
         let serial = self.next_serial();
+        // A client's modifier state starts empty and only ever moves on a
+        // `modifiers` event, which `update_and_send_modifiers` sends solely as
+        // a side effect of a modifier key transition — and it sends it to
+        // whoever held focus at the time.  So focus landing here while Ctrl is
+        // held leaves this client believing nothing is down, and it reads the
+        // next keystroke unmodified.  State the seat-wide fact it has no other
+        // way to learn, the way the pointer's bind-time `enter` replay does.
+        let mods_serial = self.next_serial();
         for kb in &self.keyboards {
             if same_client(kb, wl) {
                 kb.enter(serial, wl, vec![]);
+                kb.modifiers(mods_serial, self.mods_depressed, 0, self.mods_locked, 0);
             }
         }
         for ti in &mut self.text_inputs {
@@ -3266,6 +3384,15 @@ impl Compositor {
         let root = self.toplevel_surface_ids.get(&surface_id)?;
         let surf = self.surfaces.get(root)?;
         Some(surf.wl_surface.client()?.id())
+    }
+
+    /// The stamped identity of the application a toplevel belongs to.
+    ///
+    /// `None` for anything on the shared socket, which is most windows: nothing
+    /// is known about who connected there, and guessing from a self-asserted
+    /// `app_id` would be worse than admitting it.
+    fn surface_identity(&self, surface_id: u16) -> Option<&Arc<AppIdentity>> {
+        self.client_identity.get(&self.surface_owner(surface_id)?)
     }
 
     /// Whether this client is the X11 bridge, whose screens are shared by
@@ -4664,6 +4791,8 @@ impl Compositor {
             .retain(|client, _| backend.get_client_data(client.clone()).is_ok());
         self.xwayland_clients
             .retain(|client| backend.get_client_data(client.clone()).is_ok());
+        self.client_identity
+            .retain(|client, _| backend.get_client_data(client.clone()).is_ok());
         // Disabled globals remain bindable specifically so a client cannot
         // lose a race with `global_remove`.  Once that client is dead there
         // can be no in-flight bind, and no other client was ever allowed to
@@ -5055,6 +5184,27 @@ impl Compositor {
 
     fn handle_command(&mut self, cmd: CompositorCommand) {
         match cmd {
+            // Registering a socket needs the event loop's handle, which this
+            // method does not have, so the command loop intercepts it before
+            // dispatching here — same reason `Shutdown` is handled there.
+            // Reaching this arm would mean that interception was lost, and
+            // silently dropping the fd would strand an app with a socket
+            // nothing ever accepts on.
+            CompositorCommand::AddAppSocket { identity, .. } => {
+                eprintln!(
+                    "[compositor] BUG: AddAppSocket for {} reached handle_command; \
+                     the command loop must intercept it",
+                    identity.app_id
+                );
+            }
+            // Same reason: the token that names the source lives in the command
+            // loop, which is the only place that can withdraw one.
+            CompositorCommand::RemoveAppSocket { app_id, .. } => {
+                eprintln!(
+                    "[compositor] BUG: RemoveAppSocket for {app_id} reached \
+                     handle_command; the command loop must intercept it"
+                );
+            }
             CompositorCommand::KeyInput {
                 surface_id: _,
                 keycode,
@@ -7843,6 +7993,18 @@ impl Dispatch<XdgSurface, XdgSurfaceData> for Compositor {
                     width: 0,
                     height: 0,
                 });
+                // Sent right after creation so a subscriber never sees the
+                // surface without knowing whose it is. Identity is fixed for
+                // the life of the connection, so this is the only time it can
+                // change.
+                if let Some(identity) = state.surface_identity(surface_id) {
+                    let _ = state.event_tx.send(CompositorEvent::SurfaceOrigin {
+                        surface_id,
+                        sandbox_engine: identity.sandbox_engine.clone(),
+                        app_id: identity.app_id.clone(),
+                        instance_id: identity.instance_id.clone(),
+                    });
+                }
                 (state.event_notify)();
                 if state.verbose {
                     eprintln!("[compositor] new_toplevel sid={surface_id}");
@@ -11646,6 +11808,7 @@ fn run_compositor(
         last_topless_frame_ms: FxHashMap::default(),
         pending_request_frames: FxHashMap::default(),
         frame_callback_toplevels: FxHashSet::default(),
+        client_identity: FxHashMap::default(),
         next_surface_id: 1,
         shm_pools: FxHashMap::default(),
         surface_meta: FxHashMap::default(),
@@ -11767,40 +11930,9 @@ fn run_compositor(
         .insert_source(socket_source, move |_, socket, state| {
             let ls = unsafe { socket.get_mut() };
             if let Some(client_stream) = ls.accept().ok().flatten() {
-                let watched_stream = client_stream.try_clone().ok();
-                match state.display_handle.insert_client(
-                    client_stream,
-                    Arc::new(ClientState {
-                        cleanup_needed: Arc::clone(&state.cleanup_needed),
-                    }),
-                ) {
-                    Ok(client) => {
-                        // The peer's pid is what tells the X11 bridge apart
-                        // from an ordinary app.
-                        if let Ok(creds) = client.get_credentials(&state.display_handle)
-                            && creds.pid > 0
-                        {
-                            state.note_client_pid(client.id(), creds.pid as u32);
-                        }
-                        // Offer the screen before the client reads its
-                        // registry: a toolkit that finds no output there
-                        // never opens a window at all.
-                        state.ensure_client_output(client.id());
-                        if let Some(watched_stream) = watched_stream {
-                            monitor_client_disconnect(
-                                watched_stream,
-                                &monitor_cancel,
-                                state.display_handle.backend_handle(),
-                                client.id(),
-                                state.verbose,
-                            );
-                        }
-                    }
-                    Err(e) if state.verbose => {
-                        eprintln!("[compositor] insert_client error: {e}");
-                    }
-                    Err(_) => {}
-                }
+                // The shared socket says nothing about who connected: anything
+                // that inherited WAYLAND_DISPLAY can reach it.
+                accept_client(state, client_stream, None, &monitor_cancel);
             }
             Ok(PostAction::Continue)
         })
@@ -11809,6 +11941,13 @@ fn run_compositor(
     if verbose {
         eprintln!("[compositor] entering event loop");
     }
+
+    // Adopted app sockets, by the identity that added them. The token is what
+    // lets one be withdrawn: dropping the source closes the listener's fd, and
+    // without that an application that is restarted leaves its predecessor
+    // accepting forever.
+    let mut app_socket_tokens: std::collections::HashMap<(String, String), RegistrationToken> =
+        std::collections::HashMap::new();
 
     while !shutdown.load(Ordering::Relaxed) {
         // Process commands.
@@ -11836,6 +11975,90 @@ fn run_compositor(
                 CompositorCommand::Shutdown => {
                     shutdown.store(true, Ordering::Relaxed);
                     return;
+                }
+                // Handled here rather than in `handle_command` because it needs
+                // the event loop's handle to register a new source, which a
+                // `&mut Compositor` method has no access to.
+                CompositorCommand::AddAppSocket { fd, identity } => {
+                    let listener = std::os::unix::net::UnixListener::from(fd);
+                    if let Err(e) = listener.set_nonblocking(true) {
+                        eprintln!("[compositor] app socket set_nonblocking failed: {e}");
+                        continue;
+                    }
+                    let identity = Arc::new(identity);
+                    let label = identity.app_id.clone();
+                    // What a later `RemoveAppSocket` names it by: the instance
+                    // is what makes two attempts at one application distinct.
+                    let key = (identity.app_id.clone(), identity.instance_id.clone());
+                    let Ok(cancel) = monitor_cancel_read.try_clone() else {
+                        eprintln!("[compositor] app socket {label}: cancel fd clone failed");
+                        continue;
+                    };
+                    let source = Generic::new(listener, Interest::READ, calloop::Mode::Level);
+                    let inserted = handle.insert_source(source, move |_, listener, state| {
+                        // Level-triggered, so one accept per readiness is
+                        // enough; a second pending connection wakes us again.
+                        match unsafe { listener.get_mut() }.accept() {
+                            Ok((client_stream, _)) => {
+                                accept_client(
+                                    state,
+                                    client_stream,
+                                    Some(Arc::clone(&identity)),
+                                    &cancel,
+                                );
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(e) if state.verbose => {
+                                eprintln!("[compositor] app socket accept error: {e}");
+                            }
+                            Err(_) => {}
+                        }
+                        Ok(PostAction::Continue)
+                    });
+                    match inserted {
+                        Ok(token) => {
+                            // Replacing an entry would drop its token and leak
+                            // the source it names, so retire the predecessor
+                            // first. The same identity twice is a caller bug
+                            // rather than a routine event, hence the notice.
+                            if let Some(stale) = app_socket_tokens.insert(key, token) {
+                                eprintln!(
+                                    "[compositor] app socket for {label} re-added; \
+                                     withdrawing the previous one"
+                                );
+                                handle.remove(stale);
+                            }
+                            if verbose {
+                                eprintln!("[compositor] app socket registered for {label}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[compositor] app socket {label} not registered: {e}");
+                        }
+                    }
+                }
+                CompositorCommand::RemoveAppSocket {
+                    app_id,
+                    instance_id,
+                } => {
+                    // Dropping the source closes the listener, so nothing can
+                    // connect on that name afterwards. The path is the server's
+                    // to unlink — it never left that side.
+                    match app_socket_tokens.remove(&(app_id.clone(), instance_id.clone())) {
+                        Some(token) => {
+                            handle.remove(token);
+                            if verbose {
+                                eprintln!("[compositor] app socket withdrawn for {app_id}");
+                            }
+                        }
+                        None if verbose => {
+                            eprintln!(
+                                "[compositor] app socket {app_id}-{instance_id} \
+                                 already gone"
+                            );
+                        }
+                        None => {}
+                    }
                 }
                 other => compositor.handle_command(other),
             }

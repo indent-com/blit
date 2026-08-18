@@ -65,3 +65,72 @@ PROMPT_COMMAND="_blit_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 
 Both snippets are also what other OSC 7 consumers (kitty, foot, WezTerm,
 Terminal.app) expect, so they are safe to keep in dotfiles used outside blit.
+
+## OSC 133 — command journal
+
+blit also consumes **OSC 133** semantic-prompt markers (and VS Code's OSC 633
+superset) to record each command a shell runs: the command line, when it
+started and finished, its exit status, and the region of output that belongs
+to it. Agents then ask `blit terminal journal` / `output` / `history --since`
+instead of scraping scrollback. Contract:
+[design/term-journal.md](design/term-journal.md).
+
+blit does not inject these hooks itself. Starship, kitty, WezTerm, VS Code,
+and oh-my-zsh already emit them when their own integration is on; if any of
+those is in the PTY, there is nothing to add. Otherwise:
+
+### fish
+
+```fish
+function __blit_preexec --on-event fish_preexec
+    printf '\e]133;C\a'
+end
+function __blit_postexec --on-event fish_postexec
+    printf '\e]133;D;%s\a' $status
+end
+function __blit_prompt --on-event fish_prompt
+    printf '\e]133;A\a'
+    printf '\e]133;B\a'
+end
+```
+
+### zsh
+
+Add to `~/.zshrc`:
+
+```zsh
+_blit_precmd() {
+  printf '\e]133;D;%s\a' $?
+  printf '\e]133;A\a'
+}
+_blit_preexec() {
+  printf '\e]133;C\a'
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd _blit_precmd
+add-zsh-hook preexec _blit_preexec
+PS1=$'%{\e]133;B\a%}'$PS1
+```
+
+### bash
+
+Add to `~/.bashrc`:
+
+```bash
+_blit_prompt() {
+  local s=$?
+  printf '\e]133;D;%s\a' "$s"
+  printf '\e]133;A\a'
+}
+_blit_preexec() {
+  [ -n "${COMP_LINE-}" ] && return
+  [[ "$BASH_COMMAND" == "$PROMPT_COMMAND" ]] && return
+  printf '\e]133;C\a'
+}
+PROMPT_COMMAND="_blit_prompt${PROMPT_COMMAND:+;}$PROMPT_COMMAND"
+PS1='\[\e]133;B\a\]'$PS1
+trap '_blit_preexec' DEBUG
+```
+
+The first prompt's `D` is dropped (nothing is running yet). A terminal whose
+shell emits nothing keeps an empty journal; `blit terminal journal` says so.

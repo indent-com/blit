@@ -644,6 +644,20 @@ function characterNeedsShift(key: string): boolean {
  *  be released with its press on macOS, where the browser may eat its keyup. */
 const EVDEV_MODIFIERS = new Set([29, 42, 54, 56, 97, 100, 125, 126]);
 
+/** The other physical key for the same modifier.  A modifier replayed by
+ *  `syncModifiers` has to pick a side, and the browser's flags never say which
+ *  one is down; the release then arrives on whichever it really was. */
+const EVDEV_MODIFIER_TWIN: Record<number, number> = {
+  42: 54,
+  54: 42,
+  29: 97,
+  97: 29,
+  56: 100,
+  100: 56,
+  125: 126,
+  126: 125,
+};
+
 /**
  * True when the browser is on macOS/iPadOS, where the Alt key doubles as
  * the Option character modifier: Option+E is a dead key, Option+F types
@@ -2954,6 +2968,23 @@ export class BlitSurfaceCanvas {
     // messages ride the same connection, and the compositor advertises the
     // offer before it delivers the button.
     if (primary) this.getConn()?.sendPrimary(primary.mime, primary.data);
+    // Ctrl+click and Shift+click are chords too, and the app hears a modifier
+    // only from that modifier's own key press — one that never reached this
+    // canvas if the key went down before the canvas had focus.  Focus has to
+    // lead, because an unfocused client is told no modifiers at all; then the
+    // modifier; then the button.  That is the order `flushPendingAlt` already
+    // keeps for a pending Alt, and `sendPointerAt`'s own focus call below is a
+    // no-op once we are focused here.
+    const conn = this.getConn();
+    if (
+      type === SURFACE_POINTER_DOWN &&
+      conn &&
+      this.surface &&
+      this._displaySize
+    ) {
+      this.focusKeyboardTarget();
+      this.syncModifiers(e, conn);
+    }
     this.sendPointerAt(e.clientX, e.clientY, type, e.button, e.timeStamp);
     if (
       type === SURFACE_POINTER_DOWN &&
@@ -4563,11 +4594,10 @@ export class BlitSurfaceCanvas {
       this.swallowedAlt.clear();
     }
 
-    // On keydown, reconcile modifier state with the browser before
-    // forwarding the key.  Window managers may intercept modifier keys
-    // (especially Super/Meta) without delivering the key-up to the
-    // browser, leaving pressedKeys and the compositor's mods_depressed
-    // out of sync.
+    // Reconcile modifier state with the browser before forwarding the key, so
+    // the chord the app sees is the one the user is holding — including a
+    // modifier pressed before this surface took focus, which nothing else
+    // would ever tell it about.
     if (pressed) {
       this.syncModifiers(e, conn);
       this.syncCapsLock(e, conn);
@@ -4819,7 +4849,24 @@ export class BlitSurfaceCanvas {
         // Sending another release here would be an orphaned event that
         // confuses Chromium-based clients (e.g. Space in YouTube toggling
         // play/pause twice).
-        if (!this.pressedKeys.has(keycode)) return;
+        if (!this.pressedKeys.has(keycode)) {
+          // One release is not orphaned: a modifier whose press `syncModifiers`
+          // replayed had to guess a side, and this is the real key coming up.
+          // Dropping it leaves the app holding that modifier for good.  Not
+          // during a paste, whose Ctrl release is deliberately deferred above.
+          const twin = EVDEV_MODIFIER_TWIN[keycode];
+          if (
+            twin === undefined ||
+            !this.pressedKeys.has(twin) ||
+            this._pendingPaste ||
+            this._metaToCtrl ||
+            this._ctrlReleaseDeferred
+          )
+            return;
+          this.pressedKeys.delete(twin);
+          conn.sendSurfaceInput(this._surfaceId, twin, false, e.timeStamp);
+          return;
+        }
         this.pressedKeys.delete(keycode);
       }
       // The one real browser key event in this handler. The chord and modifier
@@ -5070,25 +5117,59 @@ export class BlitSurfaceCanvas {
   }
 
   /**
-   * Release any modifier keys that the browser says are no longer held.
+   * Reconcile the modifiers the app believes are held with the ones the
+   * browser says are, in both directions.
    *
-   * Window managers (especially on Linux) may grab modifier keys like
-   * Super/Meta without forwarding the key-up event to the browser.  When
-   * that happens our `pressedKeys` set and the compositor's modifier
-   * state drift from reality.  On every key-down we compare the browser's
-   * authoritative modifier flags against `pressedKeys` and inject
-   * synthetic releases for anything that should no longer be held.
+   * A modifier reaches the app only as its own key press: nothing else in the
+   * protocol carries the state, and a surface taking focus is not told it.
+   * So a modifier already down before this surface had focus was never
+   * forwarded here and stays invisible — Ctrl held while a terminal pane had
+   * focus, then Ctrl+K aimed at the app, arrives as a bare k.  Drift the other
+   * way is just as real: window managers (especially on Linux) grab Super/Meta
+   * without ever delivering the key-up to the browser, leaving `pressedKeys`
+   * holding a key the user let go of.
+   *
+   * The browser's modifier flags are authoritative for both, so press what
+   * should be held and is not, and release what is held and should not be.
+   * Nothing here says which physical side is down, so a replayed press takes
+   * the left key — the convention the synthesised chords already use.
+   *
+   * A replayed press is undone the ordinary way — by the release of the key
+   * the user is actually holding, which `handleKey` redirects onto the side
+   * this chose — or by the release half here on a later key-down.
    */
-  private syncModifiers(e: KeyboardEvent, conn: BlitConnection): void {
-    const checks: [boolean, number[]][] = [
-      [e.shiftKey, [42, 54]], // ShiftLeft, ShiftRight
-      [e.ctrlKey, [29, 97]], // ControlLeft, ControlRight
-      [e.altKey, [56, 100]], // AltLeft, AltRight
-      [e.metaKey, [125, 126]], // MetaLeft, MetaRight
+  private syncModifiers(
+    e: KeyboardEvent | MouseEvent,
+    conn: BlitConnection,
+  ): void {
+    const checks: [boolean, number, number][] = [
+      [e.shiftKey, 42, 54], // ShiftLeft, ShiftRight
+      [e.ctrlKey, 29, 97], // ControlLeft, ControlRight
+      [e.altKey, 56, 100], // AltLeft, AltRight
+      [e.metaKey, 125, 126], // MetaLeft, MetaRight
     ];
-    for (const [held, keycodes] of checks) {
-      if (held) continue;
-      for (const kc of keycodes) {
+    // A key event's own key is forwarded by `handleKey` on the side it really
+    // came from; replaying its twin here would both double the press and guess
+    // the side.  A pointer event names no key, so nothing is exempt.
+    const own = "code" in e ? domKeyToEvdev(e.code) : 0;
+    for (const [held, left, right] of checks) {
+      if (held) {
+        if (own === left || own === right) continue;
+        if (this.pressedKeys.has(left) || this.pressedKeys.has(right)) continue;
+        // Meta→Ctrl paste translation deliberately leaves Meta released and
+        // Ctrl held while Cmd is physically down; re-pressing Meta here would
+        // hand the app back the very chord it was translated out of.
+        if (left === 125 && this._metaToCtrl) continue;
+        // An Alt press held back for dead-key detection, or dropped because a
+        // composition claimed it, is a verdict already reached: `pendingAlt`
+        // and `swallowedAlt` own those keys until they resolve.
+        if (left === 56 && (this.pendingAlt.size || this.swallowedAlt.size))
+          continue;
+        this.pressedKeys.add(left);
+        conn.sendSurfaceInput(this._surfaceId, left, true);
+        continue;
+      }
+      for (const kc of [left, right]) {
         if (!this.pressedKeys.has(kc)) continue;
         // Don't release the synthetic Ctrl from Meta→Ctrl paste
         // translation — either while the original Cmd is still held

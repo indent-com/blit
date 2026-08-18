@@ -31,6 +31,7 @@ import {
   buildMprisActionMessage,
   buildPortalReplyMessage,
   buildScreenCastStopMessage,
+  cameraCodecProbeOutcomes,
   parseMediaControl,
   probeCameraCodecs,
   type PortalAccessRequest,
@@ -988,6 +989,33 @@ describe("MediaStore camera capture", () => {
     installCameraMocks();
     installVideoEncoderMocks();
     await expect(probeCameraCodecs()).resolves.toBe(VIDEO_CODECS_ALL);
+  });
+
+  it("probes past an OffscreenCanvas that cannot back a VideoFrame", async () => {
+    // The bug this guards, measured in Chromium 151: a canvas only has a bitmap
+    // once it has a rendering context, so `new VideoFrame(new OffscreenCanvas())`
+    // throws `InvalidStateError: Invalid source state`. The probe used to hand
+    // exactly that to every codec, so all four threw, all four were recorded as
+    // unsupported, and the camera fell back to Motion JPEG in every browser
+    // that has OffscreenCanvas — which is all of them.
+    installCameraMocks();
+    installVideoEncoderMocks();
+    class ContextlessOffscreenCanvas {
+      constructor(
+        readonly width: number,
+        readonly height: number,
+      ) {}
+      getContext() {
+        return null;
+      }
+    }
+    vi.stubGlobal("OffscreenCanvas", ContextlessOffscreenCanvas);
+    await expect(probeCameraCodecs()).resolves.toBe(VIDEO_CODECS_ALL);
+    // And the fallback is a real source, not a codec verdict: nothing may be
+    // recorded as unsupported because blit could not build a frame.
+    expect([...cameraCodecProbeOutcomes().values()]).not.toContain(
+      "no-test-frame",
+    );
   });
 
   it("does not advertise profiles an encoder claims but does not emit", async () => {

@@ -880,7 +880,16 @@ impl Manager {
         }
     }
 
-    pub(crate) fn spawn(&self, data: &[u8], pty_cwd: Option<&[u8]>) {
+    /// `session_env` is `Some` only when the request carried
+    /// `PROCESS_SPAWN_SESSION_ENV` and the session had an environment to give.
+    /// It is resolved by the caller because the session lives behind an async
+    /// mutex this family never holds.
+    pub(crate) fn spawn(
+        &self,
+        data: &[u8],
+        pty_cwd: Option<&[u8]>,
+        session_env: Option<crate::app_env::SessionEnv>,
+    ) {
         let nonce = read_u16(data, 1);
         let process_id = read_u32(data, 3);
         let req = match parse_process_spawn(data) {
@@ -987,11 +996,19 @@ impl Manager {
         let pty_cwd = pty_cwd.map(ToOwned::to_owned);
         let manager = self.clone();
         tokio::spawn(async move {
-            manager.run_spawn(pending, request, pty_cwd).await;
+            manager
+                .run_spawn(pending, request, pty_cwd, session_env)
+                .await;
         });
     }
 
-    async fn run_spawn(&self, pending: Arc<Pending>, request: Vec<u8>, pty_cwd: Option<Vec<u8>>) {
+    async fn run_spawn(
+        &self,
+        pending: Arc<Pending>,
+        request: Vec<u8>,
+        pty_cwd: Option<Vec<u8>>,
+        session_env: Option<crate::app_env::SessionEnv>,
+    ) {
         let permit = tokio::select! {
             permit = self.server.0.spawn_slots.acquire() => permit.ok(),
             _ = pending.cancel.notified() => None,
@@ -1026,7 +1043,7 @@ impl Manager {
             );
             return;
         }
-        let mut command = command_for(&req, pty_cwd.as_deref());
+        let mut command = command_for(&req, pty_cwd.as_deref(), session_env.as_ref());
         let merged_reader = if merged {
             match configure_merged_output(&mut command) {
                 Ok(reader) => Some(reader),
@@ -2298,9 +2315,23 @@ fn watched_error(
 }
 
 #[cfg(unix)]
-fn command_for(req: &ProcessSpawnRequest<'_>, pty_cwd: Option<&[u8]>) -> Command {
+fn command_for(
+    req: &ProcessSpawnRequest<'_>,
+    pty_cwd: Option<&[u8]>,
+    session_env: Option<&crate::app_env::SessionEnv>,
+) -> Command {
     let mut command = Command::new(OsStr::from_bytes(req.argv[0]));
     command.args(req.argv[1..].iter().map(|arg| OsStr::from_bytes(arg)));
+    // The session environment goes on first so the client's own entries still
+    // win, matching the documented "explicit entries replace inherited ones".
+    if let Some(session) = session_env {
+        for key in &session.remove {
+            command.env_remove(key);
+        }
+        for (key, value) in &session.set {
+            command.env(key, value);
+        }
+    }
     for (key, value) in &req.env {
         command.env(
             OsString::from_vec(key.to_vec()),
@@ -2381,7 +2412,11 @@ fn command_for(req: &ProcessSpawnRequest<'_>, pty_cwd: Option<&[u8]>) -> Command
 }
 
 #[cfg(windows)]
-fn command_for(req: &ProcessSpawnRequest<'_>, pty_cwd: Option<&[u8]>) -> Command {
+fn command_for(
+    req: &ProcessSpawnRequest<'_>,
+    pty_cwd: Option<&[u8]>,
+    session_env: Option<&crate::app_env::SessionEnv>,
+) -> Command {
     let argv = req
         .argv
         .iter()
@@ -2389,6 +2424,16 @@ fn command_for(req: &ProcessSpawnRequest<'_>, pty_cwd: Option<&[u8]>) -> Command
         .collect::<Vec<_>>();
     let mut command = Command::new(argv[0]);
     command.args(&argv[1..]);
+    // There is no Wayland session to join on Windows, so the resolver hands back
+    // nothing; the parameter exists to keep one signature across platforms.
+    if let Some(session) = session_env {
+        for key in &session.remove {
+            command.env_remove(key);
+        }
+        for (key, value) in &session.set {
+            command.env(key, value);
+        }
+    }
     for (key, value) in &req.env {
         command.env(
             std::str::from_utf8(key).expect("Windows env key validated UTF-8"),
@@ -3471,6 +3516,7 @@ mod tests {
                 vec![b"/bin/sh", b"-c", b"printf 'a\\000b'; printf err >&2"],
             ),
             None,
+            None,
         );
         assert_eq!(await_started(&mut rx).await.status, STATUS_OK);
         let mut stdout = Vec::new();
@@ -3526,6 +3572,7 @@ mod tests {
                 ],
             ),
             None,
+            None,
         );
         assert_eq!(await_started(&mut rx).await.status, STATUS_OK);
         let mut received = 0u64;
@@ -3561,8 +3608,8 @@ mod tests {
         let (out, mut rx) = outbox(&server);
         let manager = server.endpoint(out);
         let msg = spawn_message(9, 0, vec![b"true"]);
-        manager.spawn(&msg, None);
-        manager.spawn(&msg, None);
+        manager.spawn(&msg, None, None);
+        manager.spawn(&msg, None, None);
         let reply_msg = recv(&mut rx).await;
         let reply = parse_process_started(&reply_msg).unwrap();
         assert_eq!(reply.status, STATUS_CONFLICT);
@@ -3577,7 +3624,7 @@ mod tests {
         let permits = u32::try_from(server.0.spawn_slots.available_permits()).unwrap();
         let held = server.0.spawn_slots.acquire_many(permits).await.unwrap();
         let endpoint = Arc::downgrade(&manager.endpoint);
-        manager.spawn(&spawn_message(10, 0, vec![b"sleep", b"30"]), None);
+        manager.spawn(&spawn_message(10, 0, vec![b"sleep", b"30"]), None, None);
 
         tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
             .await
@@ -3654,7 +3701,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_generation_is_held_until_exit_writer_guard_drops() {
         let (server, manager, mut rx) = manager();
-        manager.spawn(&spawn_message(44, 0, vec![b"true"]), None);
+        manager.spawn(&spawn_message(44, 0, vec![b"true"]), None, None);
         let started = await_started(&mut rx).await;
         let (data, guard) = loop {
             let outbound = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -3692,6 +3739,7 @@ mod tests {
                 PROCESS_SPAWN_DETACHABLE,
                 vec![b"/bin/sh", b"-c", b"sleep .1; printf shared; sleep .1"],
             ),
+            None,
             None,
         );
         let started = await_started(&mut first_rx).await;
@@ -3802,7 +3850,7 @@ mod tests {
         let owner = server.endpoint(owner_out);
         let (peer_out, mut peer_rx) = outbox(&server);
         let peer = server.endpoint(peer_out);
-        owner.spawn(&spawn_message(60, 0, vec![b"sleep", b"30"]), None);
+        owner.spawn(&spawn_message(60, 0, vec![b"sleep", b"30"]), None, None);
         let started = await_started(&mut owner_rx).await;
 
         let watch = msg_process_watch(ProcessWatch {
@@ -3850,10 +3898,10 @@ mod tests {
         let first = server.endpoint(first_out);
         let (second_out, mut second_rx) = outbox(&server);
         let second = server.endpoint(second_out);
-        first.spawn(&spawn_message(62, 0, vec![b"sleep", b"30"]), None);
+        first.spawn(&spawn_message(62, 0, vec![b"sleep", b"30"]), None, None);
         assert_eq!(await_started(&mut first_rx).await.status, STATUS_OK);
 
-        second.spawn(&spawn_message(63, 0, vec![b"sleep", b"30"]), None);
+        second.spawn(&spawn_message(63, 0, vec![b"sleep", b"30"]), None, None);
         assert_eq!(await_started(&mut second_rx).await.status, STATUS_BUDGET);
 
         first.handle(
@@ -3866,7 +3914,7 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(recv(&mut first_rx).await[0], S2C_PROCESS_CONTROLLED);
-        second.spawn(&spawn_message(63, 0, vec![b"sleep", b"30"]), None);
+        second.spawn(&spawn_message(63, 0, vec![b"sleep", b"30"]), None, None);
         assert_eq!(await_started(&mut second_rx).await.status, STATUS_OK);
 
         second.shutdown().await;
@@ -3877,7 +3925,7 @@ mod tests {
     #[tokio::test]
     async fn unwatch_is_local_and_a_peer_watcher_can_control_the_child() {
         let (server, owner, mut owner_rx) = manager();
-        owner.spawn(&spawn_message(17, 0, vec![b"sleep", b"30"]), None);
+        owner.spawn(&spawn_message(17, 0, vec![b"sleep", b"30"]), None, None);
         let started = await_started(&mut owner_rx).await;
         let (out, mut peer_rx) = outbox(&server);
         let peer = server.endpoint(out);
@@ -3957,6 +4005,7 @@ mod tests {
                 ],
             ),
             None,
+            None,
         );
         let started = await_started(&mut owner_rx).await;
         let (max_frames, max_bytes) = server.outbox_limits();
@@ -4011,6 +4060,7 @@ mod tests {
         let (server, owner, mut owner_rx) = manager();
         owner.spawn(
             &spawn_message(19, 0, vec![b"/bin/sh", b"-c", b"cat >/dev/null"]),
+            None,
             None,
         );
         let started = await_started(&mut owner_rx).await;
@@ -4122,7 +4172,7 @@ mod tests {
     #[tokio::test]
     async fn failed_watch_snapshot_does_not_publish_or_take_stdin() {
         let (server, owner, mut owner_rx) = manager();
-        owner.spawn(&spawn_message(22, 0, vec![b"sleep", b"30"]), None);
+        owner.spawn(&spawn_message(22, 0, vec![b"sleep", b"30"]), None, None);
         let started = await_started(&mut owner_rx).await;
         let record = owner.get(22).unwrap();
         owner.handle(
@@ -4180,6 +4230,7 @@ mod tests {
         owner.spawn(
             &spawn_message(13, PROCESS_SPAWN_DETACHABLE, vec![b"true"]),
             None,
+            None,
         );
         let started = await_started(&mut owner_rx).await;
         while recv(&mut owner_rx).await[0] != S2C_PROCESS_EXIT {}
@@ -4213,6 +4264,7 @@ mod tests {
         manager.spawn(
             &spawn_message(46, PROCESS_SPAWN_DETACHABLE, vec![b"sleep", b"30"]),
             None,
+            None,
         );
         let started = await_started(&mut rx).await;
         manager.handle(
@@ -4236,7 +4288,7 @@ mod tests {
     #[tokio::test]
     async fn endpoint_shutdown_reaps_owned_process() {
         let (_server, manager, mut rx) = manager();
-        manager.spawn(&spawn_message(43, 0, vec![b"sleep", b"30"]), None);
+        manager.spawn(&spawn_message(43, 0, vec![b"sleep", b"30"]), None, None);
         assert_eq!(await_started(&mut rx).await.status, STATUS_OK);
         tokio::time::timeout(Duration::from_secs(5), manager.shutdown())
             .await
@@ -4247,7 +4299,7 @@ mod tests {
     #[tokio::test]
     async fn owner_shutdown_publishes_owner_lost_exit_to_peer_watchers() {
         let (server, owner, mut owner_rx) = manager();
-        owner.spawn(&spawn_message(48, 0, vec![b"sleep", b"30"]), None);
+        owner.spawn(&spawn_message(48, 0, vec![b"sleep", b"30"]), None, None);
         let started = await_started(&mut owner_rx).await;
 
         let (out, mut peer_rx) = outbox(&server);
@@ -4311,6 +4363,7 @@ mod tests {
                 ],
             ),
             None,
+            None,
         );
         assert_eq!(await_started(&mut rx).await.status, STATUS_OK);
         let mut pid_bytes = Vec::new();
@@ -4369,6 +4422,7 @@ mod tests {
         manager.spawn(
             &spawn_message(61, 0, vec![b"/definitely/not/a/blit-test-program"]),
             None,
+            None,
         );
         assert_eq!(await_started(&mut rx).await.status, STATUS_NOT_FOUND);
         assert!(manager.endpoint.state.lock().unwrap().slots.is_empty());
@@ -4380,7 +4434,7 @@ mod tests {
             );
         }
 
-        manager.spawn(&spawn_message(61, 0, vec![b"true"]), None);
+        manager.spawn(&spawn_message(61, 0, vec![b"true"]), None, None);
         assert_eq!(await_started(&mut rx).await.status, STATUS_OK);
         while recv(&mut rx).await[0] != S2C_PROCESS_EXIT {}
         manager.shutdown().await;
@@ -4396,6 +4450,7 @@ mod tests {
                 PROCESS_SPAWN_MERGE_STDERR,
                 vec![b"/bin/sh", b"-c", b"cat; printf err >&2"],
             ),
+            None,
             None,
         );
         let started = await_started(&mut rx).await;
@@ -4472,6 +4527,7 @@ mod tests {
                 PROCESS_SPAWN_DETACHABLE,
                 vec![b"/bin/sh", b"-c", b"sleep .1; printf x; sleep 30"],
             ),
+            None,
             None,
         );
         let started = await_started(&mut owner_rx).await;
@@ -4556,6 +4612,7 @@ mod tests {
         manager.spawn(
             &spawn_message(65, PROCESS_SPAWN_DETACHABLE, vec![b"true"]),
             None,
+            None,
         );
         let started = await_started(&mut rx).await;
         assert_eq!(started.status, STATUS_OK);
@@ -4623,14 +4680,97 @@ mod tests {
             env: vec![],
         };
 
-        let inherited = command_for(&request, None).output().await.unwrap();
+        let inherited = command_for(&request, None, None).output().await.unwrap();
         assert!(inherited.status.success());
         assert_eq!(inherited.stdout, inherited_home.as_bytes());
 
         request.env = vec![(b"HOME", b"/explicit")];
-        let overridden = command_for(&request, None).output().await.unwrap();
+        let overridden = command_for(&request, None, None).output().await.unwrap();
         assert!(overridden.status.success());
         assert_eq!(overridden.stdout, b"/explicit");
+    }
+
+    /// A GUI child has to reach *this* session's compositor, and the request's
+    /// own entries still have to win over the session's — the documented
+    /// contract is that explicit entries replace inherited ones.
+    #[tokio::test]
+    async fn session_env_reaches_the_child_and_yields_to_explicit_entries() {
+        let session = crate::app_env::session_env(
+            Some("/run/user/1000/wayland-7"),
+            None,
+            Some("unix:path=/run/user/1000/blit-bus"),
+            None,
+            None,
+        );
+        let mut request = ProcessSpawnRequest {
+            nonce: 1,
+            process_id: 1,
+            flags: PROCESS_SPAWN_SESSION_ENV,
+            cwd_kind: PROCESS_CWD_DEFAULT,
+            src_pty_id: 0,
+            cwd: b"",
+            argv: vec![b"/bin/sh", b"-c", b"printf %s \"$WAYLAND_DISPLAY\""],
+            env: vec![],
+        };
+
+        let applied = command_for(&request, None, Some(&session))
+            .output()
+            .await
+            .unwrap();
+        assert!(applied.status.success());
+        // The basename, never the path a client would fail to resolve.
+        assert_eq!(applied.stdout, b"wayland-7");
+
+        request.env = vec![(b"WAYLAND_DISPLAY", b"wayland-99")];
+        let overridden = command_for(&request, None, Some(&session))
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(overridden.stdout, b"wayland-99");
+    }
+
+    /// The host session's variables are as harmful as the session's own are
+    /// helpful: a child that inherits a `DISPLAY` blit cannot answer picks X11
+    /// and maps no window at all. Nominating `DISPLAY` is `session_env`'s job;
+    /// actually stripping an *inherited* value is `command_for`'s, so prove that
+    /// half against a variable the test process is guaranteed to have.
+    #[tokio::test]
+    async fn a_removal_strips_a_variable_the_child_would_otherwise_inherit() {
+        let bridgeless =
+            crate::app_env::session_env(Some("/run/user/1000/wayland-7"), None, None, None, None);
+        assert!(bridgeless.remove.contains(&"DISPLAY"));
+        // With a bridge listening there is a display worth naming, so it must
+        // survive instead.
+        let bridged = crate::app_env::session_env(
+            Some("/run/user/1000/wayland-7"),
+            Some(":20"),
+            None,
+            None,
+            None,
+        );
+        assert!(!bridged.remove.contains(&"DISPLAY"));
+
+        std::env::var_os("HOME").expect("test process has HOME");
+        let strips_home = crate::app_env::SessionEnv {
+            set: Vec::new(),
+            remove: vec!["HOME"],
+        };
+        let request = ProcessSpawnRequest {
+            nonce: 1,
+            process_id: 1,
+            flags: PROCESS_SPAWN_SESSION_ENV,
+            cwd_kind: PROCESS_CWD_DEFAULT,
+            src_pty_id: 0,
+            cwd: b"",
+            argv: vec![b"/bin/sh", b"-c", b"printf %s \"${HOME-unset}\""],
+            env: vec![],
+        };
+        let output = command_for(&request, None, Some(&strips_home))
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"unset");
     }
 
     #[tokio::test]
@@ -4650,7 +4790,7 @@ mod tests {
             ],
             env: vec![],
         };
-        let mut command = command_for(&request, None);
+        let mut command = command_for(&request, None, None);
 
         // F_DUPFD deliberately creates a descriptor without FD_CLOEXEC after
         // command_for captured its pre-exec closure. A parent-side descriptor
@@ -4737,6 +4877,7 @@ mod windows_tests {
         manager.spawn(
             &spawn_message(1, argv.iter().map(Vec::as_slice).collect()),
             None,
+            None,
         );
 
         let mut stdout = Vec::new();
@@ -4787,6 +4928,7 @@ mod windows_tests {
         manager.spawn(
             &spawn_message(2, argv.iter().map(Vec::as_slice).collect()),
             None,
+            None,
         );
         loop {
             let message = recv(&mut rx).await;
@@ -4830,6 +4972,7 @@ mod windows_tests {
                 argv.iter().map(Vec::as_slice).collect(),
                 vec![(b"BLIT_PROCESS_TEST_DESCENDANT_PID", marker_text)],
             ),
+            None,
             None,
         );
         loop {

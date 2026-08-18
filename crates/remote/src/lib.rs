@@ -19,6 +19,10 @@ pub mod lsp;
 /// client-side mirror reducer.
 pub mod kv;
 
+/// The server's own environment (docs/design/env.md): the only way a client
+/// learns anything about the session it is attached to.
+pub mod env;
+
 /// TCP and UDP relay (docs/design/net.md): opcodes, flags, and the
 /// message builders both ends share.
 pub mod net;
@@ -34,6 +38,11 @@ pub mod extension;
 
 /// Viewer media input, compositor portals, and MPRIS state/control.
 pub mod media;
+
+/// Per-command terminal journal and sequence-addressed output
+/// (docs/design/term-journal.md): opcodes, the command record codec, and the
+/// cursor a client feeds back to read only what is new.
+pub mod journal;
 
 /// Cap on any single LZ4-decompressed payload, protocol-wide
 /// (docs/protocol.md "Compressed payloads"). Receivers check the prepended
@@ -149,7 +158,14 @@ pub const C2S_CLIENT_METRICS: u8 = 0x05;
 /// (but its arrival resets any server-side receive timeout).
 pub const C2S_PING: u8 = 0x08;
 /// Enumerate every other connection to this server:
-/// [0x09][nonce:2]. The server replies with [`S2C_CLIENT_LIST`].
+/// [0x09][nonce:2], or [0x09][nonce:2][flags:1]. The server replies with
+/// [`S2C_CLIENT_LIST`], or with [`S2C_CLIENT_LIST2`] when the flags byte
+/// carries [`CLIENT_LIST_WANT_ORIGIN`].
+///
+/// The flags byte is only safe to send once [`FEATURE_CLIENT_ORIGIN`] is
+/// advertised: every server answers a client-control request with unexpected
+/// trailing bytes with `INVALID`, so an unconditional flag would make the
+/// catalog unreadable on an older server rather than degrade.
 pub const C2S_CLIENT_LIST: u8 = 0x09;
 /// Disconnect another connection:
 /// [0x0A][nonce:2][client_id:8][reason:N].
@@ -158,9 +174,30 @@ pub const C2S_CLIENT_LIST: u8 = 0x09;
 /// [`S2C_KICKED`] carrying the UTF-8 reason and the server closes its
 /// connection. A client may not kick itself.
 pub const C2S_KICK: u8 = 0x0A;
-/// Subscribe to live connection-catalog snapshots: [0x0B][nonce:2].
-/// Every update uses [`S2C_CLIENT_LIST`] with the same nonce.
+/// Ask for a Wayland socket dedicated to one application:
+/// [0x0D][nonce:2][app_len:2][app_id][inst_len:2][instance_id].
+///
+/// The server binds a fresh socket, tells the compositor that every client
+/// arriving on it belongs to `(app_id, instance_id)`, and replies with
+/// [`S2C_APP_SOCKET`] carrying the basename to put in `WAYLAND_DISPLAY`.
+/// Because the socket is bound before the reply is sent, the caller may spawn
+/// the application the moment it arrives.
+///
+/// This is how identity becomes trustworthy: the application never gets to say
+/// who it is, so nothing it does can change the answer. Pair it with
+/// `PROCESS_SPAWN_SESSION_ENV` for the rest of the session environment and an
+/// explicit `WAYLAND_DISPLAY` entry, which wins over the session's own.
+pub const C2S_APP_SOCKET: u8 = 0x0D;
+/// Subscribe to live connection-catalog snapshots: [0x0B][nonce:2], or
+/// [0x0B][nonce:2][flags:1] under the same rule as [`C2S_CLIENT_LIST`].
+/// Every update uses [`S2C_CLIENT_LIST`] — or [`S2C_CLIENT_LIST2`] when the
+/// watch asked for origins — with the same nonce. The shape a watch is opened
+/// with is the shape all of its updates keep.
 pub const C2S_CLIENT_WATCH: u8 = 0x0B;
+/// Bit 0 of the optional flags byte on [`C2S_CLIENT_LIST`] and
+/// [`C2S_CLIENT_WATCH`]: answer with [`S2C_CLIENT_LIST2`], whose entries say
+/// where each connection came from.
+pub const CLIENT_LIST_WANT_ORIGIN: u8 = 1 << 0;
 /// Stop a live connection-catalog subscription: [0x0C][nonce:2].
 pub const C2S_CLIENT_UNWATCH: u8 = 0x0C;
 /// Mouse event: [0x06][pty_id:2][type:1][button:1][col:2][row:2]
@@ -588,6 +625,34 @@ pub const S2C_CLIENT_LIST: u8 = 0x12;
 /// terminal/surface/subscription records. Named because the encoder, the
 /// parser and both of the parser's bounds checks have to agree on it.
 pub const CLIENT_LIST_ENTRY_HEADER: usize = 38;
+/// [`S2C_CLIENT_LIST`] with an origin block appended to every entry:
+/// [0x15][nonce:2][self_id:8][count:4][client:N]...
+///
+/// Each entry is byte-for-byte the [`S2C_CLIENT_LIST`] entry followed by
+/// `[origin_kind:1][origin_len:2][origin:origin_len]`. `origin_kind` is one of
+/// the `CLIENT_ORIGIN_*` values and `origin_len` is what a reader skips when
+/// the kind means nothing to it — which is what lets a later kind carry a
+/// payload of its own without a third opcode.
+///
+/// A separate opcode rather than a flag inside `S2C_CLIENT_LIST`, because the
+/// shipped parsers on both sides reject a catalog with bytes left over: the
+/// wider entry has to be unreadable to them by construction, not by
+/// convention. Sent only in answer to a request that set
+/// [`CLIENT_LIST_WANT_ORIGIN`].
+pub const S2C_CLIENT_LIST2: u8 = 0x15;
+/// The connection is an ordinary client of the server: a browser, a CLI, a
+/// forwarder. `origin_len` is zero — nothing further is known about it, and
+/// nothing further is claimed.
+pub const CLIENT_ORIGIN_NETWORK: u8 = 0;
+/// The connection belongs to a running extension attempt, and its origin
+/// payload is
+/// `[extension_id:8][definition_revision:8][attempt:8][task_id:4][name:N]`.
+///
+/// `name` is the durable name of a persistent definition, or the label a
+/// transient `ext run` was started under, and is empty when the attempt has
+/// neither. It is captured when the connection is opened, so it names the
+/// definition this attempt actually started from.
+pub const CLIENT_ORIGIN_EXTENSION: u8 = 1;
 /// Correlated kick outcome:
 /// [0x13][nonce:2][status:1][detail:N].
 ///
@@ -662,6 +727,14 @@ pub const S2C_SURFACE_TITLE: u8 = 0x23;
 pub const S2C_SURFACE_RESIZED: u8 = 0x24;
 /// A Wayland surface's app_id changed: [0x28][surface_id:2][app_id:N]
 pub const S2C_SURFACE_APP_ID: u8 = 0x28;
+/// Stamped application identity for a surface, as opposed to the
+/// self-asserted `S2C_SURFACE_APP_ID`:
+/// [0x32][surface_id:2][engine_len:2][engine][app_len:2][app][inst_len:2][inst]
+pub const S2C_SURFACE_ORIGIN: u8 = 0x32;
+/// Answer to [`C2S_APP_SOCKET`]: [0x33][nonce:2][status:1][name_len:2][name].
+/// `name` is the `WAYLAND_DISPLAY` basename, empty unless `status` is
+/// [`STATUS_OK`].
+pub const S2C_APP_SOCKET: u8 = 0x33;
 /// A Wayland client asked for its toplevel to be activated
 /// (xdg_activation_v1) — raise and focus the matching pane:
 /// [0x2D][surface_id:2]
@@ -915,6 +988,12 @@ pub const FEATURE_SURFACE_TEXT_INPUT: u32 = 1 << 19;
 /// Enumerating server connections and kicking another connection, including
 /// the correlated result and terminal `S2C_KICKED` reason.
 pub const FEATURE_CLIENT_CONTROL: u32 = 1 << 20;
+/// `C2S_CLIENT_LIST` and `C2S_CLIENT_WATCH` accept the optional
+/// [`CLIENT_LIST_WANT_ORIGIN`] flags byte, and answer it with
+/// [`S2C_CLIENT_LIST2`] entries that say which connections are extension
+/// attempts. Implies [`FEATURE_CLIENT_CONTROL`].
+pub const FEATURE_CLIENT_ORIGIN: u32 = 1 << 27;
+// Bit 28 is [`journal::FEATURE_TERM_JOURNAL`], with the rest of the family.
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {
@@ -2320,6 +2399,13 @@ pub enum ServerMsg<'a> {
         surface_id: u16,
         app_id: &'a str,
     },
+    /// Stamped identity, as opposed to `SurfaceAppId`'s self-assertion.
+    SurfaceOrigin {
+        surface_id: u16,
+        sandbox_engine: &'a str,
+        app_id: &'a str,
+        instance_id: &'a str,
+    },
     SurfaceActivated {
         surface_id: u16,
     },
@@ -2424,6 +2510,56 @@ pub struct ClientListEntry {
     pub terminals: Vec<ClientTerminalSubscription>,
     pub surfaces: Vec<ClientSurfaceSubscription>,
     pub subscriptions: Vec<ClientAuxSubscription>,
+    /// Where the connection came from, or `None` when the catalog was the
+    /// plain [`S2C_CLIENT_LIST`] — which is not the same as "an ordinary
+    /// client", and is why this is an `Option` rather than a defaulted
+    /// [`ClientOrigin::Network`].
+    pub origin: Option<ClientOrigin>,
+}
+
+/// The server's own account of what opened a connection, as carried by
+/// [`S2C_CLIENT_LIST2`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientOrigin {
+    Network,
+    Extension {
+        extension_id: u64,
+        definition_revision: u64,
+        attempt: u64,
+        task_id: u32,
+        name: String,
+    },
+    /// A kind this build has no name for, kept whole so a reader can still say
+    /// "not an ordinary client" without pretending to know more.
+    Unknown {
+        kind: u8,
+        payload: Vec<u8>,
+    },
+}
+
+/// Interpret one `S2C_CLIENT_LIST2` origin block.
+///
+/// A payload that does not fit its kind is [`ClientOrigin::Unknown`] rather
+/// than a parse failure: the length prefix already told us where the entry
+/// ends, so one origin this build cannot read costs that origin and nothing
+/// else in the catalog.
+fn parse_client_origin(kind: u8, payload: &[u8]) -> ClientOrigin {
+    match kind {
+        CLIENT_ORIGIN_NETWORK => ClientOrigin::Network,
+        CLIENT_ORIGIN_EXTENSION if payload.len() >= 28 => ClientOrigin::Extension {
+            extension_id: u64::from_le_bytes(payload[0..8].try_into().expect("checked length")),
+            definition_revision: u64::from_le_bytes(
+                payload[8..16].try_into().expect("checked length"),
+            ),
+            attempt: u64::from_le_bytes(payload[16..24].try_into().expect("checked length")),
+            task_id: u32::from_le_bytes(payload[24..28].try_into().expect("checked length")),
+            name: String::from_utf8_lossy(&payload[28..]).into_owned(),
+        },
+        _ => ClientOrigin::Unknown {
+            kind,
+            payload: payload.to_vec(),
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2441,6 +2577,18 @@ pub struct SearchResultEntry<'a> {
     pub matched_sources: u8,
     pub scroll_offset: Option<u32>,
     pub context: &'a [u8],
+}
+
+/// Take one `[len:2][utf8:len]` field, advancing `input` past it.
+///
+/// Returns `None` on truncation or invalid UTF-8, so a malformed field fails the
+/// whole parse rather than silently reading as empty.
+fn take_len_prefixed_str<'a>(input: &mut &'a [u8]) -> Option<&'a str> {
+    let (len, tail) = input.split_at_checked(2)?;
+    let len = u16::from_le_bytes([len[0], len[1]]) as usize;
+    let (value, tail) = tail.split_at_checked(len)?;
+    *input = tail;
+    std::str::from_utf8(value).ok()
 }
 
 pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
@@ -2736,6 +2884,21 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
                 app_id,
             })
         }
+        S2C_SURFACE_ORIGIN => {
+            let mut rest = data.get(3..)?;
+            let sandbox_engine = take_len_prefixed_str(&mut rest)?;
+            let app_id = take_len_prefixed_str(&mut rest)?;
+            let instance_id = take_len_prefixed_str(&mut rest)?;
+            if !rest.is_empty() {
+                return None;
+            }
+            Some(ServerMsg::SurfaceOrigin {
+                surface_id: u16::from_le_bytes([data[1], data[2]]),
+                sandbox_engine,
+                app_id,
+                instance_id,
+            })
+        }
         S2C_SURFACE_ACTIVATED => {
             if data.len() < 3 {
                 return None;
@@ -2899,7 +3062,8 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
                 wayland: data[1] != 0,
             })
         }
-        S2C_CLIENT_LIST => {
+        S2C_CLIENT_LIST | S2C_CLIENT_LIST2 => {
+            let with_origin = data[0] == S2C_CLIENT_LIST2;
             if data.len() < 15 {
                 return None;
             }
@@ -2969,6 +3133,18 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
                     });
                     offset += 3;
                 }
+                let origin = if with_origin {
+                    let kind = *data.get(offset)?;
+                    let length =
+                        u16::from_le_bytes(data.get(offset + 1..offset + 3)?.try_into().ok()?)
+                            as usize;
+                    let end = offset.checked_add(3)?.checked_add(length)?;
+                    let payload = data.get(offset + 3..end)?;
+                    offset = end;
+                    Some(parse_client_origin(kind, payload))
+                } else {
+                    None
+                };
                 clients.push(ClientListEntry {
                     client_id,
                     age_secs,
@@ -2977,6 +3153,7 @@ pub fn parse_server_msg(data: &[u8]) -> Option<ServerMsg<'_>> {
                     terminals,
                     surfaces,
                     subscriptions,
+                    origin,
                 });
             }
             if offset != data.len() {
@@ -3453,6 +3630,19 @@ pub fn msg_client_watch(nonce: u16) -> Vec<u8> {
     msg
 }
 
+/// Ask for the catalog, or start a watch, with every entry's origin — only
+/// valid against a server advertising [`FEATURE_CLIENT_ORIGIN`].
+///
+/// `opcode` is [`C2S_CLIENT_LIST`] or [`C2S_CLIENT_WATCH`]. Unwatching needs no
+/// flag: it names a nonce, and the shape was settled when the watch opened.
+pub fn msg_client_list_with_origin(opcode: u8, nonce: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(4);
+    msg.push(opcode);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.push(CLIENT_LIST_WANT_ORIGIN);
+    msg
+}
+
 /// Stop the connection-catalog stream under `nonce`.
 pub fn msg_client_unwatch(nonce: u16) -> Vec<u8> {
     let mut msg = Vec::with_capacity(3);
@@ -3490,10 +3680,30 @@ pub fn msg_kick(nonce: u16, client_id: u64, reason: &str) -> Vec<u8> {
 
 /// Reply to [`C2S_CLIENT_LIST`]. Active subscriptions with no size report use
 /// zeroes for their size fields.
+///
+/// Any [`ClientListEntry::origin`] is dropped: this shape has nowhere to put
+/// it, which is exactly what makes it readable by a client that never asked.
 pub fn msg_s2c_client_list(nonce: u16, self_id: u64, clients: &[ClientListEntry]) -> Vec<u8> {
+    encode_client_list(S2C_CLIENT_LIST, nonce, self_id, clients)
+}
+
+/// Reply to a [`C2S_CLIENT_LIST`] or [`C2S_CLIENT_WATCH`] that set
+/// [`CLIENT_LIST_WANT_ORIGIN`]. An entry whose `origin` is `None` is encoded
+/// as [`CLIENT_ORIGIN_NETWORK`]: the requester asked, so every entry answers.
+pub fn msg_s2c_client_list2(nonce: u16, self_id: u64, clients: &[ClientListEntry]) -> Vec<u8> {
+    encode_client_list(S2C_CLIENT_LIST2, nonce, self_id, clients)
+}
+
+fn encode_client_list(
+    opcode: u8,
+    nonce: u16,
+    self_id: u64,
+    clients: &[ClientListEntry],
+) -> Vec<u8> {
+    let with_origin = opcode == S2C_CLIENT_LIST2;
     let count = clients.len().min(u32::MAX as usize);
     let mut msg = Vec::new();
-    msg.push(S2C_CLIENT_LIST);
+    msg.push(opcode);
     msg.extend_from_slice(&nonce.to_le_bytes());
     msg.extend_from_slice(&self_id.to_le_bytes());
     msg.extend_from_slice(&(count as u32).to_le_bytes());
@@ -3523,8 +3733,45 @@ pub fn msg_s2c_client_list(nonce: u16, self_id: u64, clients: &[ClientListEntry]
             msg.push(subscription.kind);
             msg.extend_from_slice(&subscription.id.to_le_bytes());
         }
+        if with_origin {
+            encode_client_origin(&mut msg, client.origin.as_ref());
+        }
     }
     msg
+}
+
+fn encode_client_origin(msg: &mut Vec<u8>, origin: Option<&ClientOrigin>) {
+    let (kind, payload) = match origin {
+        None | Some(ClientOrigin::Network) => (CLIENT_ORIGIN_NETWORK, Vec::new()),
+        Some(ClientOrigin::Extension {
+            extension_id,
+            definition_revision,
+            attempt,
+            task_id,
+            name,
+        }) => {
+            let name = name.as_bytes();
+            let mut payload = Vec::with_capacity(28 + name.len());
+            payload.extend_from_slice(&extension_id.to_le_bytes());
+            payload.extend_from_slice(&definition_revision.to_le_bytes());
+            payload.extend_from_slice(&attempt.to_le_bytes());
+            payload.extend_from_slice(&task_id.to_le_bytes());
+            payload.extend_from_slice(name);
+            (CLIENT_ORIGIN_EXTENSION, payload)
+        }
+        Some(ClientOrigin::Unknown { kind, payload }) => (*kind, payload.clone()),
+    };
+    // An origin too long for the length prefix would desynchronise every later
+    // entry, so it degrades to "ordinary client" rather than corrupt the
+    // catalog. Only a 64 KiB extension name gets here.
+    let Ok(length) = u16::try_from(payload.len()) else {
+        msg.push(CLIENT_ORIGIN_NETWORK);
+        msg.extend_from_slice(&0u16.to_le_bytes());
+        return;
+    };
+    msg.push(kind);
+    msg.extend_from_slice(&length.to_le_bytes());
+    msg.extend_from_slice(&payload);
 }
 
 /// Report the outcome of [`C2S_KICK`] to its requester.
@@ -3643,6 +3890,89 @@ pub fn msg_surface_app_id(surface_id: u16, app_id: &str) -> Vec<u8> {
     msg.extend_from_slice(&surface_id.to_le_bytes());
     msg.extend_from_slice(app_id_bytes);
     msg
+}
+
+/// `S2C_SURFACE_ORIGIN`: who a surface's application actually is.
+///
+/// Unlike `S2C_SURFACE_APP_ID`, which forwards a string the application chose
+/// for itself, every field here was stamped by whoever created the Wayland
+/// socket the client connected on. Sent only for surfaces on a per-app socket,
+/// and only once — identity is fixed for the life of a connection.
+pub fn msg_surface_origin(
+    surface_id: u16,
+    sandbox_engine: &str,
+    app_id: &str,
+    instance_id: &str,
+) -> Vec<u8> {
+    let engine = sandbox_engine.as_bytes();
+    let app = app_id.as_bytes();
+    let instance = instance_id.as_bytes();
+    let mut msg = Vec::with_capacity(9 + engine.len() + app.len() + instance.len());
+    msg.push(S2C_SURFACE_ORIGIN);
+    msg.extend_from_slice(&surface_id.to_le_bytes());
+    msg.extend_from_slice(&(engine.len() as u16).to_le_bytes());
+    msg.extend_from_slice(engine);
+    msg.extend_from_slice(&(app.len() as u16).to_le_bytes());
+    msg.extend_from_slice(app);
+    msg.extend_from_slice(&(instance.len() as u16).to_le_bytes());
+    msg.extend_from_slice(instance);
+    msg
+}
+
+/// Encode `C2S_APP_SOCKET`.
+pub fn msg_app_socket_request(nonce: u16, app_id: &str, instance_id: &str) -> Vec<u8> {
+    let app = app_id.as_bytes();
+    let instance = instance_id.as_bytes();
+    let mut msg = Vec::with_capacity(7 + app.len() + instance.len());
+    msg.push(C2S_APP_SOCKET);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.extend_from_slice(&(app.len() as u16).to_le_bytes());
+    msg.extend_from_slice(app);
+    msg.extend_from_slice(&(instance.len() as u16).to_le_bytes());
+    msg.extend_from_slice(instance);
+    msg
+}
+
+/// Decode `C2S_APP_SOCKET` into `(nonce, app_id, instance_id)`.
+pub fn parse_app_socket_request(data: &[u8]) -> Option<(u16, &str, &str)> {
+    if data.first() != Some(&C2S_APP_SOCKET) {
+        return None;
+    }
+    let nonce = u16::from_le_bytes([*data.get(1)?, *data.get(2)?]);
+    let mut rest = data.get(3..)?;
+    let app_id = take_len_prefixed_str(&mut rest)?;
+    let instance_id = take_len_prefixed_str(&mut rest)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some((nonce, app_id, instance_id))
+}
+
+/// Encode `S2C_APP_SOCKET`.
+pub fn msg_app_socket_reply(nonce: u16, status: u8, wayland_display: &str) -> Vec<u8> {
+    let name = wayland_display.as_bytes();
+    let mut msg = Vec::with_capacity(6 + name.len());
+    msg.push(S2C_APP_SOCKET);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.push(status);
+    msg.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    msg.extend_from_slice(name);
+    msg
+}
+
+/// Decode `S2C_APP_SOCKET` into `(nonce, status, wayland_display)`.
+pub fn parse_app_socket_reply(data: &[u8]) -> Option<(u16, u8, &str)> {
+    if data.first() != Some(&S2C_APP_SOCKET) {
+        return None;
+    }
+    let nonce = u16::from_le_bytes([*data.get(1)?, *data.get(2)?]);
+    let status = *data.get(3)?;
+    let mut rest = data.get(4..)?;
+    let name = take_len_prefixed_str(&mut rest)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some((nonce, status, name))
 }
 
 pub fn msg_surface_activated(surface_id: u16) -> Vec<u8> {
@@ -5533,6 +5863,16 @@ mod tests {
                     kind: CLIENT_SUBSCRIPTION_GIT,
                     id: 2,
                 }],
+                // Offered to the shape that cannot carry it, to pin that it is
+                // dropped rather than smuggled onto the end of the entry where
+                // a shipped parser would call the whole catalog malformed.
+                origin: Some(ClientOrigin::Extension {
+                    extension_id: 0x0102_0304_0506_0708,
+                    definition_revision: 2,
+                    attempt: 3,
+                    task_id: 4,
+                    name: "systemd".to_string(),
+                }),
             }],
         );
         assert!(matches!(
@@ -5563,6 +5903,7 @@ mod tests {
                     kind: CLIENT_SUBSCRIPTION_GIT,
                     id: 2,
                 }],
+                origin: None,
             }]
         ));
         assert!(parse_server_msg(&list[..list.len() - 1]).is_none());
@@ -5581,6 +5922,84 @@ mod tests {
                 reason: "maintenance"
             })
         ));
+    }
+
+    /// One entry per origin kind in a single catalog, because the risk the
+    /// origin block carries is not reading one entry — it is reading the
+    /// *next* one after a variable-length tail.
+    #[test]
+    fn client_list2_carries_origins() {
+        fn entry(client_id: u64, origin: Option<ClientOrigin>) -> ClientListEntry {
+            ClientListEntry {
+                client_id,
+                age_secs: 1,
+                outbound_bytes_per_sec: 2,
+                inbound_bytes_per_sec: 3,
+                terminals: vec![ClientTerminalSubscription {
+                    pty_id: 4,
+                    rows: 24,
+                    cols: 80,
+                }],
+                surfaces: Vec::new(),
+                subscriptions: Vec::new(),
+                origin,
+            }
+        }
+
+        let extension = ClientOrigin::Extension {
+            extension_id: 0x05a3_415a_2dd1_ef9b,
+            definition_revision: 2,
+            attempt: 3,
+            task_id: 4,
+            name: "systemd".to_string(),
+        };
+        let unknown = ClientOrigin::Unknown {
+            kind: 200,
+            payload: vec![9, 9, 9],
+        };
+        let clients = [
+            entry(1, Some(ClientOrigin::Network)),
+            entry(2, Some(extension.clone())),
+            // A kind from a later server: skipped by its length prefix, and
+            // the entries after it still parse.
+            entry(3, Some(unknown.clone())),
+            // Never asked about, so answered as an ordinary client rather than
+            // left for the reader to guess.
+            entry(4, None),
+        ];
+
+        let msg = msg_s2c_client_list2(9, 3, &clients);
+        assert_eq!(msg[0], S2C_CLIENT_LIST2);
+        let Some(ServerMsg::ClientList {
+            nonce: 9,
+            self_id: 3,
+            clients: parsed,
+        }) = parse_server_msg(&msg)
+        else {
+            panic!("a catalog with origins did not parse");
+        };
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|entry| entry.origin.clone())
+                .collect::<Vec<_>>(),
+            [
+                Some(ClientOrigin::Network),
+                Some(extension),
+                Some(unknown),
+                Some(ClientOrigin::Network),
+            ]
+        );
+        assert_eq!(parsed[3].client_id, 4);
+        assert!(parse_server_msg(&msg[..msg.len() - 1]).is_none());
+
+        // The two shapes differ only in the opcode and the tails, so a reader
+        // that asked for one must not be handed the other.
+        assert_ne!(msg_s2c_client_list(9, 3, &clients), msg);
+        assert_eq!(
+            msg_client_list_with_origin(C2S_CLIENT_LIST, 7),
+            [C2S_CLIENT_LIST, 7, 0, CLIENT_LIST_WANT_ORIGIN]
+        );
     }
 
     #[test]

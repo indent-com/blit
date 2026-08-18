@@ -178,7 +178,30 @@ impl Listener {
         let packet = client
             .recv_matching(|packet| listener_packet(packet, self.id))?
             .ok_or(ClientError::EndpointClosed)?;
-        match wire::parse_channel_message(&packet)? {
+        self.interpret(&packet)
+    }
+
+    /// Interpret a packet the caller already read, without blocking.
+    ///
+    /// `Ok(None)` means the packet is not this listener's, so the caller should
+    /// route it elsewhere. An extension that also has to watch timers or other
+    /// families cannot use [`accept`](Self::accept): it blocks until *its*
+    /// packet arrives while everything else queues behind it, so a backoff timer
+    /// never fires and a process exit is never seen. Such a caller owns the
+    /// receive loop (`Client::wait_until` then `Client::recv`) and routes each
+    /// packet here.
+    pub fn offer(&mut self, packet: &[u8]) -> Result<Option<ListenerEvent>, Error> {
+        if self.closed {
+            return Err(Error::Closed);
+        }
+        if !listener_packet(packet, self.id) {
+            return Ok(None);
+        }
+        self.interpret(packet).map(Some)
+    }
+
+    fn interpret(&mut self, packet: &[u8]) -> Result<ListenerEvent, Error> {
+        match wire::parse_channel_message(packet)? {
             Some(wire::ChannelMessage::Accepted {
                 channel_id,
                 listener_id,
@@ -330,7 +353,29 @@ impl Channel {
         let packet = client
             .recv_matching(|packet| connected_packet(packet, self.id))?
             .ok_or(ClientError::EndpointClosed)?;
-        match wire::parse_channel_message(&packet)? {
+        self.interpret(&packet)
+    }
+
+    /// Interpret a packet the caller already read, without blocking.
+    ///
+    /// `Ok(None)` means the packet is not this channel's. See
+    /// [`Listener::offer`] for why a supervising extension needs this rather
+    /// than [`receive`](Self::receive).
+    pub fn offer(&mut self, packet: &[u8]) -> Result<Option<Event>, Error> {
+        if self.closed {
+            return Err(Error::Closed);
+        }
+        if self.pending_delivery.is_some() {
+            return Err(Error::DeliveryPending);
+        }
+        if !connected_packet(packet, self.id) {
+            return Ok(None);
+        }
+        self.interpret(packet).map(Some)
+    }
+
+    fn interpret(&mut self, packet: &[u8]) -> Result<Event, Error> {
+        match wire::parse_channel_message(packet)? {
             Some(wire::ChannelMessage::Data {
                 channel_id,
                 payload,

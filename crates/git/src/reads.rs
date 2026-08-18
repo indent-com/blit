@@ -9,10 +9,13 @@ use blit_remote::git::{
     GIT_FETCH_REF_TAG_UPDATE, GIT_FOUND_BARE, GIT_FOUND_LINKED, GIT_OID_NONE,
     GIT_REFLOG_OLDEST_FIRST, GIT_REFLOG_TRUNCATED, GIT_STATUS_CANCELLED, GIT_STATUS_INVALID,
     GIT_STATUS_NOT_FOUND, GIT_STATUS_OK, GIT_STATUS_OTHER, GIT_STATUS_PERMISSION,
-    GIT_STATUS_WRONG_TYPE, GitBlameRecord, GitBlameRequest, GitDiscoverRecord, GitDiscoverRequest,
-    GitFetchRecord, GitFetchRequest, GitReflogRecord, GitReflogRequest, append_git_blame_record,
-    append_git_discover_record, append_git_fetch_record, append_git_reflog_record,
-    msg_git_blame_resp, msg_git_discover_resp, msg_git_fetch_resp, msg_git_reflog_resp,
+    GIT_STATUS_WRONG_TYPE, GIT_WORKTREE_BARE, GIT_WORKTREE_CURRENT, GIT_WORKTREE_DETACHED,
+    GIT_WORKTREE_LOCKED, GIT_WORKTREE_MAIN, GIT_WORKTREE_PRUNABLE, GIT_WORKTREES_TRUNCATED,
+    GitBlameRecord, GitBlameRequest, GitDiscoverRecord, GitDiscoverRequest, GitFetchRecord,
+    GitFetchRequest, GitReflogRecord, GitReflogRequest, GitWorktreeRecord, GitWorktreesRequest,
+    append_git_blame_record, append_git_discover_record, append_git_fetch_record,
+    append_git_reflog_record, append_git_worktree_record, msg_git_blame_resp,
+    msg_git_discover_resp, msg_git_fetch_resp, msg_git_reflog_resp, msg_git_worktrees_resp,
 };
 
 use crate::{Cancel, RepoHandle, oid_bytes};
@@ -347,6 +350,188 @@ impl RepoHandle {
             );
         }
         msg_git_reflog_resp(nonce, GIT_STATUS_OK, flags, &records)
+    }
+
+    /// `GIT_WORKTREES`: the main worktree plus every linked one.
+    ///
+    /// gix lists only the *linked* worktrees, and from whichever worktree
+    /// the repo was opened through, so the main one is resolved separately
+    /// and always reported first — otherwise a client opened inside a
+    /// linked worktree could not name the checkout it forked from, which is
+    /// the one it most wants to get back to.
+    ///
+    /// Each record costs opening that worktree's gitdir, because a
+    /// worktree's HEAD is per-worktree state that the shared ref store
+    /// cannot answer for. That is what `worktrees_max` bounds.
+    pub fn worktrees(&self, req: &GitWorktreesRequest, cancel: &Cancel) -> Vec<u8> {
+        let nonce = req.nonce;
+        let fail = |status: u8| msg_git_worktrees_resp(nonce, status, 0, &[]);
+        if req.flags != 0 {
+            return fail(GIT_STATUS_INVALID);
+        }
+        let repo = self.local();
+        // The worktree this repo_id was opened at, so `CURRENT` is decided
+        // by identity rather than by the client comparing paths it may have
+        // canonicalized differently than the server did.
+        let current = repo.workdir().map(crate::canonical);
+        // Already the main repo when our gitdir *is* the common dir; a
+        // linked worktree's gitdir is `<common>/worktrees/<id>`. Checking
+        // saves reopening the repository we are holding.
+        let main_owned = if repo.git_dir() == repo.common_dir() {
+            None
+        } else {
+            // `ok()`: the common dir being unreadable means the repository is
+            // coming apart under us. Every linked worktree still resolves, so
+            // report those rather than failing the whole enumeration.
+            repo.main_repo().ok()
+        };
+        let main = main_owned.as_ref().unwrap_or(&repo);
+
+        let skip = usize::try_from(req.after_pos).unwrap_or(usize::MAX);
+        let limit = self.budgets.worktrees_max;
+        let mut records = Vec::new();
+        let mut emitted = 0usize;
+        let mut seen = 0usize;
+        let mut truncated = false;
+
+        // `main_owned.is_none()` is not enough for CURRENT: the repo may
+        // have been opened at the main worktree through a path that made
+        // `main_repo()` run anyway, so compare the resolved workdirs.
+        let mut push = |flags: u8, oid, path: &str, branch: &str, lock: &str| {
+            append_git_worktree_record(
+                &mut records,
+                &GitWorktreeRecord::Tree {
+                    flags,
+                    oid,
+                    path,
+                    branch,
+                    lock_reason: lock,
+                },
+            );
+        };
+
+        // ── the main worktree ────────────────────────────────────────────
+        seen += 1;
+        if seen > skip {
+            let mut flags = GIT_WORKTREE_MAIN;
+            let path = match main.workdir() {
+                Some(dir) => {
+                    let dir = crate::canonical(dir);
+                    if current.as_deref() == Some(dir.as_path()) {
+                        flags |= GIT_WORKTREE_CURRENT;
+                    }
+                    blit_fssync::escape_path(&dir)
+                }
+                None => {
+                    // Bare: no checkout to navigate to, but naming it is
+                    // how a client explains where the linked worktrees hang
+                    // off.
+                    flags |= GIT_WORKTREE_BARE;
+                    String::new()
+                }
+            };
+            let (oid, branch, detached) = worktree_head(main);
+            if detached {
+                flags |= GIT_WORKTREE_DETACHED;
+            }
+            push(flags, oid, &path, &branch, "");
+            emitted += 1;
+        }
+
+        // ── the linked worktrees, in gix's gitdir order ──────────────────
+        for proxy in repo.worktrees().unwrap_or_default() {
+            if cancel.is_cancelled() {
+                return fail(GIT_STATUS_CANCELLED);
+            }
+            seen += 1;
+            if seen <= skip {
+                continue;
+            }
+            if emitted >= limit {
+                truncated = true;
+                break;
+            }
+            let mut flags = 0u8;
+            // Read the administrative state before `into_repo…` consumes
+            // the proxy.
+            let lock = if proxy.is_locked() {
+                flags |= GIT_WORKTREE_LOCKED;
+                proxy
+                    .lock_reason()
+                    .map(|r| crate::escape_bstr(r.as_ref()))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let base = proxy.base().ok();
+            // `git worktree prune` drops an entry whose checkout is gone.
+            // That is the case a client has to be told about — a row it
+            // cannot navigate to — so it is reported rather than hidden.
+            // Narrower than git's own prunability test, which also covers
+            // an unparsable `gitdir` file; those fail `base()` and land
+            // here too.
+            if !base.as_deref().is_some_and(|p| p.is_dir()) {
+                flags |= GIT_WORKTREE_PRUNABLE;
+            }
+            let base = base.map(|p| crate::canonical(&p));
+            if base.is_some() && base.as_deref() == current.as_deref() {
+                flags |= GIT_WORKTREE_CURRENT;
+            }
+            let path = base
+                .map(|p| blit_fssync::escape_path(&p))
+                .unwrap_or_default();
+            let (oid, branch, detached) =
+                match proxy.into_repo_with_possibly_inaccessible_worktree() {
+                    Ok(wt) => worktree_head(&wt),
+                    // A worktree whose gitdir will not open still exists as an
+                    // entry; report it with an unknown HEAD rather than
+                    // dropping it from the list.
+                    Err(_) => (GIT_OID_NONE, String::new(), false),
+                };
+            if detached {
+                flags |= GIT_WORKTREE_DETACHED;
+            }
+            push(flags, oid, &path, &branch, &lock);
+            emitted += 1;
+        }
+
+        let mut flags = 0u8;
+        if truncated {
+            flags |= GIT_WORKTREES_TRUNCATED;
+            append_git_worktree_record(
+                &mut records,
+                &GitWorktreeRecord::Cursor {
+                    after: "",
+                    pos: (skip + emitted) as u64,
+                },
+            );
+        }
+        msg_git_worktrees_resp(nonce, GIT_STATUS_OK, flags, &records)
+    }
+}
+
+/// `(oid, branch, detached)` for one worktree's HEAD, in the shape the
+/// `TREE` record wants: an escaped full ref name, empty when detached, and
+/// a zero oid when unborn or unreadable.
+fn worktree_head(repo: &gix::Repository) -> (blit_remote::git::GitOid, String, bool) {
+    let Ok(head) = repo.head() else {
+        return (GIT_OID_NONE, String::new(), false);
+    };
+    match head.kind {
+        gix::head::Kind::Symbolic(reference) => (
+            repo.head_id()
+                .map(|id| oid_bytes(id.as_ref()))
+                .unwrap_or(GIT_OID_NONE),
+            crate::escape_bstr(reference.name.as_bstr()),
+            false,
+        ),
+        gix::head::Kind::Detached { target, .. } => {
+            (oid_bytes(target.as_ref()), String::new(), true)
+        }
+        // Unborn is not detached: the branch is named and simply has no
+        // commit yet, which is exactly what a fresh `git worktree add -b`
+        // looks like before its first commit.
+        gix::head::Kind::Unborn(name) => (GIT_OID_NONE, crate::escape_bstr(name.as_bstr()), false),
     }
 }
 

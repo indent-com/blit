@@ -9,6 +9,7 @@ mod generate;
 mod git;
 mod grep;
 mod interactive;
+mod journal;
 mod kv;
 mod lsp;
 mod relay;
@@ -179,13 +180,58 @@ async fn async_main() {
                     from_start,
                     from_end,
                     limit,
+                    since,
+                    max_bytes,
+                    json,
                     ansi,
                     rows,
                     cols,
                 } => {
+                    if let Some(since) = since {
+                        let cursor = match journal::parse_cursor(&since) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("blit: {e}");
+                                std::process::exit(2);
+                            }
+                        };
+                        let max_bytes = max_bytes.unwrap_or(journal::OUTPUT_MAX_BYTES);
+                        match journal::cmd_since(transport, id, cursor, max_bytes, json).await {
+                            Ok(code) => std::process::exit(code),
+                            Err(e) => {
+                                eprintln!("blit: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
                     let size = agent::capture_size(rows, cols);
                     agent::cmd_history(transport, id, from_start, from_end, limit, ansi, size).await
                 }
+                TerminalCommand::Journal {
+                    id,
+                    from,
+                    limit,
+                    json,
+                } => match journal::cmd_journal(transport, id, from, limit, json).await {
+                    Ok(code) => std::process::exit(code),
+                    Err(e) => {
+                        eprintln!("blit: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                TerminalCommand::Output {
+                    id,
+                    index,
+                    wait,
+                    max_bytes,
+                    json,
+                } => match journal::cmd_output(transport, id, index, wait, max_bytes, json).await {
+                    Ok(code) => std::process::exit(code),
+                    Err(e) => {
+                        eprintln!("blit: {e}");
+                        std::process::exit(1);
+                    }
+                },
                 TerminalCommand::Send { id, text } => {
                     let text = if text == "-" {
                         use std::io::Read;

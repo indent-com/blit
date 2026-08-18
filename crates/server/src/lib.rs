@@ -1,4 +1,6 @@
-use blit_alacritty::{SearchResult as AlacrittySearchResult, TerminalDriver as AlacrittyDriver};
+use blit_alacritty::{
+    SearchResult as AlacrittySearchResult, SeqText, TerminalDriver as AlacrittyDriver,
+};
 use blit_compositor::{
     CompositorCommand, CompositorEvent, CompositorHandle, TouchPhase, TouchPoint,
 };
@@ -32,24 +34,25 @@ use blit_remote::{
     C2S_SURFACE_POINTER, C2S_SURFACE_POINTER_AXIS, C2S_SURFACE_POINTER_AXIS2, C2S_SURFACE_PREEDIT,
     C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_TOUCH,
     C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
-    CAPTURE_FORMAT_PNG, CLIENT_FEATURE_SURFACE_TIMESTAMP_SUB_US, CREATE2_HAS_COMMAND,
-    CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE, CREATE2_HAS_SRC_PTY, CREATE2_WANT_STATUS,
-    FEATURE_CLIENT_CONTROL, FEATURE_COPY_RANGE, FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS,
-    FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE, FEATURE_RESIZE_BATCH, FEATURE_RESTART,
-    FEATURE_SCROLL_BY, FrameState, KICK_REASON_MAX, KILL_LEADER_ONLY, READ_ANSI, READ_TAIL,
-    REMOTE_INPUT_POINTER, REMOTE_INPUT_TOUCH, S2C_CLOSED, S2C_CREATED, S2C_CREATED_N, S2C_LIST,
-    S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS, S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST,
-    S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID, STATUS_NOT_FOUND, STATUS_OK, STATUS_OTHER,
-    STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264, SURFACE_FRAME_FLAG_KEYFRAME,
-    SURFACE_POINTER_AXIS2_LEN, SURFACE_POINTER_DOWN, SURFACE_POINTER_LEAVE, SURFACE_POINTER_MOVE,
-    SURFACE_POINTER_UP, SURFACE_TOUCH_CANCEL, SURFACE_TOUCH_DISABLE, SURFACE_TOUCH_DOWN,
-    SURFACE_TOUCH_ENABLE, SURFACE_TOUCH_MOTION, SURFACE_TOUCH_UP, build_update_msg,
-    clamp_cursor_rect, msg_hello, msg_kick_result, msg_kicked, msg_s2c_client_list,
-    msg_s2c_clipboard_content, msg_s2c_clipboard_list, msg_s2c_clipboard_owner,
-    msg_s2c_scroll_offset, msg_s2c_surface_remote_input, msg_s2c_used_rows, msg_surface_activated,
-    msg_surface_app_id, msg_surface_created, msg_surface_destroyed, msg_surface_encoder,
-    msg_surface_frame, msg_surface_frame_precise, msg_surface_resized, msg_surface_text_input,
-    msg_surface_title, msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
+    CAPTURE_FORMAT_PNG, CLIENT_FEATURE_SURFACE_TIMESTAMP_SUB_US, CLIENT_LIST_WANT_ORIGIN,
+    CREATE2_HAS_COMMAND, CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE, CREATE2_HAS_SRC_PTY,
+    CREATE2_WANT_STATUS, FEATURE_CLIENT_CONTROL, FEATURE_CLIENT_ORIGIN, FEATURE_COPY_RANGE,
+    FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE,
+    FEATURE_RESIZE_BATCH, FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState, KICK_REASON_MAX,
+    KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, REMOTE_INPUT_POINTER, REMOTE_INPUT_TOUCH, S2C_CLOSED,
+    S2C_CREATED, S2C_CREATED_N, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY, S2C_SEARCH_RESULTS,
+    S2C_SURFACE_CAPTURE, S2C_SURFACE_LIST, S2C_TEXT, S2C_TITLE, STATUS_BUDGET, STATUS_INVALID,
+    STATUS_NOT_FOUND, STATUS_OK, STATUS_OTHER, STATUS_TOO_LARGE, SURFACE_FRAME_CODEC_H264,
+    SURFACE_FRAME_FLAG_KEYFRAME, SURFACE_POINTER_AXIS2_LEN, SURFACE_POINTER_DOWN,
+    SURFACE_POINTER_LEAVE, SURFACE_POINTER_MOVE, SURFACE_POINTER_UP, SURFACE_TOUCH_CANCEL,
+    SURFACE_TOUCH_DISABLE, SURFACE_TOUCH_DOWN, SURFACE_TOUCH_ENABLE, SURFACE_TOUCH_MOTION,
+    SURFACE_TOUCH_UP, build_update_msg, clamp_cursor_rect, msg_hello, msg_kick_result, msg_kicked,
+    msg_s2c_client_list, msg_s2c_client_list2, msg_s2c_clipboard_content, msg_s2c_clipboard_list,
+    msg_s2c_clipboard_owner, msg_s2c_scroll_offset, msg_s2c_surface_remote_input,
+    msg_s2c_used_rows, msg_surface_activated, msg_surface_app_id, msg_surface_created,
+    msg_surface_destroyed, msg_surface_encoder, msg_surface_frame, msg_surface_frame_precise,
+    msg_surface_origin, msg_surface_resized, msg_surface_text_input, msg_surface_title,
+    msg_term_cwd_reply, parse_surface_drag_drop, parse_surface_drag_enter,
     parse_surface_pointer_axis2, parse_surface_touch,
 };
 #[cfg(target_os = "linux")]
@@ -82,6 +85,7 @@ mod extension_jobs;
 pub mod extension_store;
 mod gpu_libs;
 mod ipc;
+mod journal;
 mod kv;
 #[cfg(target_os = "linux")]
 mod media_input;
@@ -480,6 +484,18 @@ trait PtyDriver: Send {
     ) -> String;
     fn total_lines(&self) -> u32;
     fn scrolled_lines(&self) -> u64;
+    /// Absolute sequence and column of the cursor
+    /// (docs/design/term-journal.md § Sequences).
+    fn cursor_seq(&self) -> (u64, u16);
+    /// Oldest sequence the scrollback still holds.
+    fn oldest_seq(&self) -> u64;
+    fn seq_text(
+        &self,
+        from_seq: u64,
+        from_col: u16,
+        end_seq: Option<u64>,
+        max_bytes: usize,
+    ) -> SeqText;
 }
 
 struct PtySearchResult {
@@ -587,6 +603,24 @@ impl PtyDriver for AlacrittyDriver {
 
     fn scrolled_lines(&self) -> u64 {
         AlacrittyDriver::scrolled_lines(self)
+    }
+
+    fn cursor_seq(&self) -> (u64, u16) {
+        AlacrittyDriver::cursor_seq(self)
+    }
+
+    fn oldest_seq(&self) -> u64 {
+        AlacrittyDriver::oldest_seq(self)
+    }
+
+    fn seq_text(
+        &self,
+        from_seq: u64,
+        from_col: u16,
+        end_seq: Option<u64>,
+        max_bytes: usize,
+    ) -> SeqText {
+        AlacrittyDriver::seq_text(self, from_seq, from_col, end_seq, max_bytes)
     }
 }
 
@@ -1307,6 +1341,9 @@ enum ConnectionOrigin {
         definition_revision: u64,
         attempt: u64,
         task_id: u32,
+        /// The durable name of a persistent definition, the label a transient
+        /// `ext run` carried, or empty when it had neither.
+        name: String,
     },
 }
 
@@ -1315,6 +1352,26 @@ impl ConnectionOrigin {
         match self {
             Self::Network => "network client",
             Self::Extension { .. } => "extension client",
+        }
+    }
+
+    /// The same fact in the shape `S2C_CLIENT_LIST2` carries.
+    fn wire_origin(&self) -> blit_remote::ClientOrigin {
+        match self {
+            Self::Network => blit_remote::ClientOrigin::Network,
+            Self::Extension {
+                extension_id,
+                definition_revision,
+                attempt,
+                task_id,
+                name,
+            } => blit_remote::ClientOrigin::Extension {
+                extension_id: *extension_id,
+                definition_revision: *definition_revision,
+                attempt: *attempt,
+                task_id: *task_id,
+                name: name.clone(),
+            },
         }
     }
 
@@ -1423,6 +1480,7 @@ impl ConnectionOptions {
                 definition_revision: init.definition_revision,
                 attempt: init.attempt,
                 task_id: init.task_id,
+                name: init.name.to_owned(),
             },
             profile: ConnectionProfile::IN_PROCESS,
             cancellation,
@@ -1991,6 +2049,15 @@ struct Pty {
     /// tracking").  Last write wins; None until shell integration first
     /// reports (then `C2S_TERM_CWD` falls back to the kernel's view).
     osc7_cwd: Option<String>,
+    /// Commands this PTY's shell announced through OSC 133
+    /// (docs/design/term-journal.md).  Empty and free for every shell
+    /// without integration.
+    journal: journal::CommandJournal,
+    /// An OSC left unterminated at the end of the last chunk, held so the
+    /// scan of the next one sees the whole sequence.  A PTY read boundary
+    /// falls wherever the kernel put it, and a marker split across one would
+    /// otherwise be lost — silently mis-attributing a command's output.
+    osc_carry: Vec<u8>,
 }
 
 impl Pty {
@@ -2035,9 +2102,20 @@ fn arm_pty_output_coalesce(
     *snapshot_not_before = Some((now + PTY_OUTPUT_QUIET).min(hard_deadline));
 }
 
+/// A surface's stamped application identity, mirroring the compositor's
+/// `AppIdentity`. Absent for anything on the shared Wayland socket.
+#[derive(Debug, Clone)]
+struct SurfaceOrigin {
+    sandbox_engine: String,
+    app_id: String,
+    instance_id: String,
+}
+
 struct CachedSurfaceInfo {
     surface_id: u16,
     parent_id: u16,
+    /// Stamped identity, as opposed to the self-asserted `app_id` below.
+    origin: Option<SurfaceOrigin>,
     width: u16,
     height: u16,
     /// The composited size in surface-logical pixels, as last reported by
@@ -3544,6 +3622,15 @@ impl From<mpsc::UnboundedSender<Vec<u8>>> for TrackedAudioSender {
     }
 }
 
+/// One live `C2S_CLIENT_WATCH`.
+struct ClientCatalogWatch {
+    /// Set when the watch was opened with `CLIENT_LIST_WANT_ORIGIN`. A watch
+    /// keeps the shape it was opened with for its whole life, so a client that
+    /// asked for origins never has to re-detect which reply it is reading.
+    want_origin: bool,
+    last: Vec<u8>,
+}
+
 struct ClientState {
     tx: TrackedOutboxSender,
     /// Native-channel frames retain their pair admission reservation while
@@ -3581,11 +3668,15 @@ struct ClientState {
     inbound_bytes_seen: u64,
     inbound_sampled_at: Instant,
     inbound_bytes_per_sec: u64,
-    /// Live catalog nonce → last encoded snapshot sent under that nonce.
-    /// Comparing the deterministic encoding avoids pushing unchanged lists on
-    /// every delivery tick.
-    client_catalog_watches: FxHashMap<u16, Vec<u8>>,
+    /// Live catalog nonce → the shape that watch was opened with and the last
+    /// encoded snapshot sent under it. Comparing the deterministic encoding
+    /// avoids pushing unchanged lists on every delivery tick.
+    client_catalog_watches: FxHashMap<u16, ClientCatalogWatch>,
     connected_at: Instant,
+    /// What opened this connection, kept so the catalog can say so. Captured
+    /// at accept time: an attempt is named by the definition it started from,
+    /// not by whatever that definition says a minute later.
+    origin: ConnectionOrigin,
     /// Connection-scoped live resources outside terminal/surface state.
     /// Rebuilt after each family message from the authoritative registries.
     aux_subscriptions: Vec<blit_remote::ClientAuxSubscription>,
@@ -5961,6 +6052,16 @@ fn reanchor_client(
 struct Session {
     ptys: FxHashMap<u16, Pty>,
     compositor: Option<SharedCompositor>,
+    /// Wayland sockets minted for one application each, by app id: the instance
+    /// currently listening, and the path this side owns and must unlink.
+    ///
+    /// Keyed by application rather than by instance because that is the bound
+    /// worth holding: an application gets at most one live socket, so a
+    /// crash-looping one — which mints a fresh instance per backoff retry —
+    /// cannot walk the session toward fd exhaustion. Every entry is withdrawn
+    /// and unlinked when the session goes.
+    #[cfg(target_os = "linux")]
+    app_sockets: HashMap<String, (String, std::path::PathBuf)>,
     /// When the live client catalog last sampled age and bandwidth. Session
     /// scoped, not per client: staggered per-client deadlines would rebuild
     /// every watcher's snapshot once per client per second instead of once.
@@ -6002,6 +6103,10 @@ struct Session {
     /// Direct touch is an implicit-grab sequence. Only this connection may
     /// extend it until all of its contacts are up or it cancels.
     surface_touch_owner: Option<u64>,
+    /// Clients blocked in `C2S_TERM_JOURNAL_WAIT`. Session-scoped because
+    /// what they are waiting on is a PTY, which outlives any one connection
+    /// (docs/design/term-journal.md § Waiting).
+    journal_waiters: Vec<journal::Waiter>,
     #[cfg(target_os = "linux")]
     recent_surface_focus: HashMap<u64, (u16, Instant)>,
     #[cfg(target_os = "linux")]
@@ -6150,6 +6255,8 @@ impl Session {
         Self {
             ptys: FxHashMap::default(),
             compositor: None,
+            #[cfg(target_os = "linux")]
+            app_sockets: HashMap::new(),
             catalog_sampled_at: Instant::now(),
             next_client_id: 1,
             next_compositor_id: 1,
@@ -6177,6 +6284,7 @@ impl Session {
             surface_frames_sent: 0,
             surface_inputs: HashMap::new(),
             surface_touch_owner: None,
+            journal_waiters: Vec::new(),
             #[cfg(target_os = "linux")]
             recent_surface_focus: HashMap::new(),
             #[cfg(target_os = "linux")]
@@ -6435,6 +6543,122 @@ impl Session {
     #[cfg(not(target_os = "linux"))]
     fn x_display(&self) -> Option<String> {
         None
+    }
+
+    /// Bind a Wayland socket that only one application will be given, and hand
+    /// it to the compositor stamped with that application's identity.
+    ///
+    /// Returns the socket's basename, which is what belongs in
+    /// `WAYLAND_DISPLAY` — a client resolves it under `XDG_RUNTIME_DIR`, so the
+    /// name sits beside the shared socket rather than in a directory of its own.
+    ///
+    /// The socket is bound *here*, before the command is sent and before the
+    /// application is spawned, so there is no window in which the name exists
+    /// but nothing is listening on it. The compositor only ever accepts on the
+    /// fd; the path stays this side, to be unlinked with the instance.
+    #[cfg(target_os = "linux")]
+    fn bind_app_socket(
+        &mut self,
+        verbose: bool,
+        event_notify: Arc<dyn Fn() + Send + Sync>,
+        gpu_device: &str,
+        app_id: &str,
+        instance_id: &str,
+    ) -> Option<(String, std::path::PathBuf)> {
+        use std::os::unix::net::UnixListener;
+
+        // The shared socket's directory is the session's runtime dir, and it is
+        // also where a client will look for this one.
+        let shared = self
+            .ensure_compositor(verbose, event_notify, gpu_device)
+            .to_string();
+        let runtime_dir = std::path::Path::new(&shared).parent()?.to_path_buf();
+        // Not "wayland-N": that namespace belongs to bind_auto, and colliding
+        // with it would be a race against the compositor's own naming.
+        let name = format!("blit-app-{app_id}-{instance_id}");
+        let path = runtime_dir.join(&name);
+        // A leftover from a crashed instance would make bind fail; the name
+        // carries a fresh instance id, so anything here is stale by definition.
+        let _ = std::fs::remove_file(&path);
+        let listener = match UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!(
+                    "blit-server: cannot bind app socket {}: {e}",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        let cs = self.compositor.as_ref()?;
+        let identity = blit_compositor::AppIdentity {
+            sandbox_engine: "blit".to_string(),
+            app_id: app_id.to_string(),
+            instance_id: instance_id.to_string(),
+        };
+        if cs
+            .handle
+            .command_tx
+            .send(blit_compositor::CompositorCommand::AddAppSocket {
+                fd: std::os::fd::OwnedFd::from(listener),
+                identity,
+            })
+            .is_err()
+        {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        // This application's previous socket, if it had one, is now nobody's:
+        // the instance that was given it is gone or being replaced. Withdraw it
+        // before recording the new one, or the fd and the event source behind it
+        // stay for the life of the session.
+        self.release_app_socket(app_id);
+        self.app_sockets
+            .insert(app_id.to_string(), (instance_id.to_string(), path.clone()));
+        Some((name, path))
+    }
+
+    /// Withdraw one application's socket: stop the compositor accepting on it,
+    /// and unlink the path this side owns.
+    ///
+    /// Quiet about an application that has none — every start calls this, and a
+    /// first start having nothing to retire is the ordinary case.
+    #[cfg(target_os = "linux")]
+    fn release_app_socket(&mut self, app_id: &str) {
+        let Some((instance_id, path)) = self.app_sockets.remove(app_id) else {
+            return;
+        };
+        if let Some(cs) = self.compositor.as_ref() {
+            let _ =
+                cs.handle
+                    .command_tx
+                    .send(blit_compositor::CompositorCommand::RemoveAppSocket {
+                        app_id: app_id.to_string(),
+                        instance_id,
+                    });
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Withdraw every app socket this session minted.
+    ///
+    /// The compositor is going with the session, so the sources go with it; what
+    /// would outlive both is the filesystem name, which nothing else will ever
+    /// clean up — the instance id in it is fresh per attempt, so a stale one is
+    /// never reused and never overwritten.
+    #[cfg(target_os = "linux")]
+    fn release_all_app_sockets(&mut self) {
+        for (app_id, (instance_id, path)) in std::mem::take(&mut self.app_sockets) {
+            if let Some(cs) = self.compositor.as_ref() {
+                let _ = cs.handle.command_tx.send(
+                    blit_compositor::CompositorCommand::RemoveAppSocket {
+                        app_id,
+                        instance_id,
+                    },
+                );
+            }
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     fn live_ptys(&self) -> usize {
@@ -6705,7 +6929,7 @@ impl Session {
         true
     }
 
-    fn client_list_msg(&self, requester: u64, nonce: u16) -> Vec<u8> {
+    fn client_list_msg(&self, requester: u64, nonce: u16, want_origin: bool) -> Vec<u8> {
         let mut clients: Vec<blit_remote::ClientListEntry> = self
             .clients
             .iter()
@@ -6758,17 +6982,31 @@ impl Session {
                     terminals,
                     surfaces,
                     subscriptions,
+                    // Built only when asked for: the plain encoder drops it,
+                    // and cloning an origin per client per catalog tick is
+                    // work a watcher that never asked should not pay.
+                    origin: want_origin.then(|| client.origin.wire_origin()),
                 }
             })
             .collect();
         clients.sort_unstable_by_key(|entry| entry.client_id);
-        msg_s2c_client_list(nonce, requester, &clients)
+        if want_origin {
+            msg_s2c_client_list2(nonce, requester, &clients)
+        } else {
+            msg_s2c_client_list(nonce, requester, &clients)
+        }
     }
 
-    fn watch_client_list(&mut self, requester: u64, nonce: u16) {
-        let msg = self.client_list_msg(requester, nonce);
+    fn watch_client_list(&mut self, requester: u64, nonce: u16, want_origin: bool) {
+        let msg = self.client_list_msg(requester, nonce, want_origin);
         if let Some(client) = self.clients.get_mut(&requester) {
-            client.client_catalog_watches.insert(nonce, msg.clone());
+            client.client_catalog_watches.insert(
+                nonce,
+                ClientCatalogWatch {
+                    want_origin,
+                    last: msg.clone(),
+                },
+            );
             let _ = send_outbox(client, msg);
         }
     }
@@ -6780,26 +7018,28 @@ impl Session {
     }
 
     fn publish_client_catalogs(&mut self) {
-        let watches: Vec<(u64, u16)> = self
+        let watches: Vec<(u64, u16, bool)> = self
             .clients
             .iter()
             .flat_map(|(&client_id, client)| {
                 client
                     .client_catalog_watches
-                    .keys()
-                    .copied()
-                    .map(move |nonce| (client_id, nonce))
+                    .iter()
+                    .map(move |(&nonce, watch)| (client_id, nonce, watch.want_origin))
             })
             .collect();
-        for (client_id, nonce) in watches {
-            let msg = self.client_list_msg(client_id, nonce);
+        for (client_id, nonce, want_origin) in watches {
+            let msg = self.client_list_msg(client_id, nonce, want_origin);
             let Some(client) = self.clients.get_mut(&client_id) else {
                 continue;
             };
-            if client.client_catalog_watches.get(&nonce) == Some(&msg) {
+            let Some(watch) = client.client_catalog_watches.get_mut(&nonce) else {
+                continue;
+            };
+            if watch.last == msg {
                 continue;
             }
-            client.client_catalog_watches.insert(nonce, msg.clone());
+            watch.last = msg.clone();
             let _ = send_outbox(client, msg);
         }
     }
@@ -7904,6 +8144,11 @@ async fn begin_server_shutdown(state: &AppState) {
     let notices = {
         let mut sess = state.session.lock().await;
         sess.channels.begin_shutdown();
+        // Names in `XDG_RUNTIME_DIR` outlive the process that bound them, and
+        // nothing else knows what they were: the instance id in each is minted
+        // per attempt, so a leftover is never reused and never overwritten.
+        #[cfg(target_os = "linux")]
+        sess.release_all_app_sockets();
         sess.clients
             .values()
             .filter_map(|client| {
@@ -8065,6 +8310,11 @@ struct TerminalScan {
     /// (docs/protocol.md, "Working directory tracking"): a percent-decoded
     /// absolute local path of at most `blit_remote::TERM_CWD_MAX` bytes.
     osc7_cwd: Option<String>,
+    /// OSC 133/633 semantic-prompt markers in the chunk, in order, each
+    /// carrying the offset it ended at (docs/design/term-journal.md). Empty
+    /// for every shell without integration, which is the common case and
+    /// costs one failed prefix comparison per OSC.
+    marks: Vec<journal::SemanticMark>,
 }
 
 /// This machine's hostname, for filtering OSC 7 host components.  Cached
@@ -8142,6 +8392,7 @@ fn parse_terminal_queries(data: &[u8], size: (u16, u16), cursor: (u16, u16)) -> 
 
     let mut results = Vec::new();
     let mut osc7_cwd = None;
+    let mut marks = Vec::new();
     let mut i = 0;
     while i < data.len() {
         if data[i] != 0x1b || i + 1 >= data.len() {
@@ -8194,6 +8445,20 @@ fn parse_terminal_queries(data: &[u8], size: (u16, u16), cursor: (u16, u16)) -> 
                     osc7_cwd = Some(cwd);
                 }
                 i = end + if data[end] == 0x07 { 1 } else { 2 };
+                // OSC 133/633 — shell integration says where each command
+                // begins and ends (docs/design/term-journal.md). The offset
+                // matters: a marker means whatever the cursor is when the
+                // bytes *before* it have been drawn, so the caller replays
+                // the chunk in segments split here.
+                if journal::enabled()
+                    && let Some((kind, dialect)) = journal::parse_mark(payload)
+                {
+                    marks.push(journal::SemanticMark {
+                        kind,
+                        dialect,
+                        at: i,
+                    });
+                }
                 continue;
             }
             i = end;
@@ -8250,7 +8515,333 @@ fn parse_terminal_queries(data: &[u8], size: (u16, u16), cursor: (u16, u16)) -> 
     TerminalScan {
         responses: results,
         osc7_cwd,
+        marks,
     }
+}
+
+/// Feed one PTY output chunk to the terminal model: answer the queries in it,
+/// note any OSC 7 report, and apply any shell-integration markers.
+///
+/// Markers are positional. `OSC 133 ; C` means "output starts *here*", and
+/// here is wherever the cursor lands once every byte before the marker has
+/// been drawn — so a chunk carrying markers is handed to the driver in
+/// segments split at each one. A chunk carrying none, which is every chunk
+/// for every shell without integration, takes the single-call path it always
+/// took; the only added cost is a failed prefix comparison per OSC.
+///
+/// Returns the `S2C_TERM_CWD_EVENT` to broadcast, if the cwd changed.
+fn feed_pty_chunk(pty: &mut Pty, id: u16, data: &[u8]) -> Option<Vec<u8>> {
+    // A sequence split across a read boundary is invisible to a scan of
+    // either half, so the unterminated tail of the last chunk goes back in
+    // front of this one. It has already been drawn, so only the scan sees
+    // it; the driver still gets `data` and nothing twice.
+    let carry_len = pty.osc_carry.len();
+    let scanned: std::borrow::Cow<[u8]> = if carry_len == 0 {
+        std::borrow::Cow::Borrowed(data)
+    } else {
+        let mut buf = std::mem::take(&mut pty.osc_carry);
+        buf.extend_from_slice(data);
+        std::borrow::Cow::Owned(buf)
+    };
+
+    let scan = pty::respond_to_queries(
+        &pty.handle,
+        &scanned,
+        pty.driver.size(),
+        pty.driver.cursor_position(),
+    );
+
+    if journal::enabled() {
+        pty.osc_carry.clear();
+        if let Some(tail) = journal::unterminated_osc_tail(&scanned) {
+            pty.osc_carry.extend_from_slice(&scanned[tail..]);
+        }
+    }
+
+    if scan.marks.is_empty() {
+        pty.driver.process(data);
+    } else {
+        let mut fed = 0usize;
+        for mark in &scan.marks {
+            let split = mark.at.saturating_sub(carry_len).min(data.len());
+            if split > fed {
+                pty.driver.process(&data[fed..split]);
+                fed = split;
+            }
+            let Pty {
+                driver, journal, ..
+            } = pty;
+            let (cursor_seq, cursor_col) = driver.cursor_seq();
+            journal.apply(
+                mark,
+                &journal::MarkContext {
+                    cursor_seq,
+                    cursor_col,
+                    read: &|seq, col, end_seq| {
+                        driver
+                            .seq_text(seq, col, Some(end_seq + 1), journal::command_max())
+                            .text
+                    },
+                },
+            );
+        }
+        if fed < data.len() {
+            pty.driver.process(&data[fed..]);
+        }
+    }
+
+    note_osc7_cwd(&mut pty.osc7_cwd, id, scan.osc7_cwd)
+}
+
+/// Ceiling on one `S2C_TERM_JOURNAL` listing, well under `MAX_FRAME_SIZE`.
+/// The ring bound already caps how many records exist; this caps how much
+/// command text a pathological set of them can add up to.
+const JOURNAL_REPLY_MAX: usize = 1 << 20;
+
+/// A client's `max_bytes`, clamped to what the server is willing to build.
+fn journal_read_budget(requested: u32) -> usize {
+    let ceiling = journal::output_max();
+    if requested == 0 {
+        ceiling
+    } else {
+        (requested as usize).min(ceiling)
+    }
+}
+
+/// `S2C_TERM_OUTPUT` flags for a completed read.
+fn output_flags(read: &SeqText, alt_screen: bool) -> u8 {
+    let mut flags = 0;
+    if read.truncated {
+        flags |= blit_remote::journal::OUTPUT_TRUNCATED;
+    }
+    if read.evicted {
+        flags |= blit_remote::journal::OUTPUT_EVICTED;
+    }
+    if alt_screen {
+        flags |= blit_remote::journal::OUTPUT_ALT_SCREEN;
+    }
+    flags
+}
+
+/// Answer `C2S_TERM_JOURNAL`: the command list, newest-relative or absolute.
+fn journal_list_reply(sess: &Session, req: &blit_remote::journal::JournalRequest) -> Vec<u8> {
+    use blit_remote::journal as j;
+    let Some(pty) = sess.ptys.get(&req.pty_id) else {
+        return j::msg_s2c_term_journal(req.nonce, req.pty_id, STATUS_NOT_FOUND, 0, 0, &[]);
+    };
+    let (cursor_seq, _) = pty.driver.cursor_seq();
+    let oldest_seq = pty.driver.oldest_seq();
+    let indices: Vec<u64> = pty.journal.iter().map(|r| r.index).collect();
+    let limit = if req.limit == 0 {
+        indices.len()
+    } else {
+        req.limit as usize
+    };
+
+    let chosen: Vec<u64> = if req.flags & j::JOURNAL_TAIL != 0 {
+        // Counting back from the newest: skip `from_index` of them, then
+        // take `limit` — so `from_index = 0` is "the last `limit`".
+        let end = indices.len().saturating_sub(req.from_index as usize);
+        let start = end.saturating_sub(limit);
+        indices[start..end].to_vec()
+    } else {
+        indices
+            .into_iter()
+            .filter(|&i| i >= req.from_index)
+            .take(limit)
+            .collect()
+    };
+
+    let mut records = Vec::with_capacity(chosen.len());
+    let mut bytes = 0usize;
+    for index in chosen {
+        let Some(record) = pty.journal.snapshot(index, cursor_seq, oldest_seq) else {
+            continue;
+        };
+        bytes += record.command.len() + 64;
+        if bytes > JOURNAL_REPLY_MAX {
+            break;
+        }
+        records.push(record);
+    }
+    j::msg_s2c_term_journal(
+        req.nonce,
+        req.pty_id,
+        STATUS_OK,
+        pty.journal.oldest_index(),
+        pty.journal.next_index(),
+        &records,
+    )
+}
+
+/// Answer `C2S_TERM_OUTPUT`: one command's output region.
+fn journal_output_reply(sess: &Session, req: &blit_remote::journal::OutputRequest) -> Vec<u8> {
+    use blit_remote::journal as j;
+    let not_found =
+        || j::msg_s2c_term_output(req.nonce, req.pty_id, STATUS_NOT_FOUND, 0, 0, 0, 0, 0, "");
+    let Some(pty) = sess.ptys.get(&req.pty_id) else {
+        return not_found();
+    };
+    let (cursor_seq, _) = pty.driver.cursor_seq();
+    let oldest_seq = pty.driver.oldest_seq();
+    let index = if req.index == j::JOURNAL_INDEX_LATEST {
+        pty.journal.latest().map(|r| r.index)
+    } else {
+        Some(req.index)
+    };
+    let Some(record) = index.and_then(|i| pty.journal.snapshot(i, cursor_seq, oldest_seq)) else {
+        return not_found();
+    };
+    // A running command has no end yet, so its output is read to wherever
+    // the terminal has got to; a finished one is frozen at its `D` marker.
+    let end = (!record.running()).then_some(record.end_seq);
+    let read = pty
+        .driver
+        .seq_text(record.start_seq, 0, end, journal_read_budget(req.max_bytes));
+    j::msg_s2c_term_output(
+        req.nonce,
+        req.pty_id,
+        STATUS_OK,
+        output_flags(&read, pty.driver.alt_screen()),
+        read.start_seq,
+        read.start_col,
+        read.next_seq,
+        read.next_col,
+        &read.text,
+    )
+}
+
+/// Answer `C2S_TERM_SINCE`: everything appended since the client's cursor.
+fn term_since_reply(sess: &Session, req: &blit_remote::journal::SinceRequest) -> Vec<u8> {
+    use blit_remote::journal as j;
+    let Some(pty) = sess.ptys.get(&req.pty_id) else {
+        return j::msg_s2c_term_output(req.nonce, req.pty_id, STATUS_NOT_FOUND, 0, 0, 0, 0, 0, "");
+    };
+    let alt_screen = pty.driver.alt_screen();
+    // A probe establishes a starting cursor without dragging back everything
+    // already on screen — which is what makes "wait for output after now"
+    // expressible at all.
+    if req.flags & j::SINCE_PROBE != 0 {
+        let (seq, col) = pty.driver.cursor_seq();
+        return j::msg_s2c_term_output(
+            req.nonce,
+            req.pty_id,
+            STATUS_OK,
+            output_flags(&SeqText::default(), alt_screen),
+            seq,
+            col,
+            seq,
+            col,
+            "",
+        );
+    }
+    let read = pty.driver.seq_text(
+        req.from_seq,
+        req.from_col,
+        None,
+        journal_read_budget(req.max_bytes),
+    );
+    j::msg_s2c_term_output(
+        req.nonce,
+        req.pty_id,
+        STATUS_OK,
+        output_flags(&read, alt_screen),
+        read.start_seq,
+        read.start_col,
+        read.next_seq,
+        read.next_col,
+        &read.text,
+    )
+}
+
+/// Register a `C2S_TERM_JOURNAL_WAIT`, answering straight away when the
+/// command it names has already finished.
+fn arm_journal_waiter(
+    sess: &mut Session,
+    client_id: u64,
+    req: &blit_remote::journal::WaitRequest,
+    now: Instant,
+) {
+    use blit_remote::journal as j;
+    let reply = |sess: &Session, status: u8, record: &blit_remote::journal::CommandRecord| {
+        if let Some(client) = sess.clients.get(&client_id) {
+            let _ = send_outbox(
+                client,
+                j::msg_s2c_term_command(req.nonce, req.pty_id, status, record),
+            );
+        }
+    };
+    let empty = blit_remote::journal::CommandRecord::default();
+    let in_flight = sess
+        .journal_waiters
+        .iter()
+        .filter(|w| w.client_id == client_id)
+        .count();
+    if in_flight >= journal::MAX_WAITERS_PER_CLIENT {
+        reply(sess, STATUS_BUDGET, &empty);
+        return;
+    }
+    let timeout = req.timeout_ms.min(journal::WAIT_TIMEOUT_MAX_MS);
+    let mut waiter = journal::Waiter {
+        client_id,
+        nonce: req.nonce,
+        pty_id: req.pty_id,
+        index: (req.index != j::JOURNAL_INDEX_LATEST).then_some(req.index),
+        deadline: now + Duration::from_millis(timeout as u64),
+    };
+    let pty = sess.ptys.get(&req.pty_id);
+    let cursor_seq = pty.map(|p| p.driver.cursor_seq().0).unwrap_or(0);
+    let oldest_seq = pty.map(|p| p.driver.oldest_seq()).unwrap_or(0);
+    match waiter.poll(pty.map(|p| &p.journal), cursor_seq, oldest_seq, now) {
+        journal::WaitOutcome::Ready(record) => reply(sess, STATUS_OK, &record),
+        journal::WaitOutcome::Gone => reply(sess, STATUS_NOT_FOUND, &empty),
+        journal::WaitOutcome::Pending => sess.journal_waiters.push(waiter),
+    }
+}
+
+/// Answer every journal waiter whose command has finished or timed out.
+///
+/// Called from the tick, which is where a `D` marker lands, and from the
+/// supervisor, which is what wakes for a timeout on an otherwise idle
+/// terminal.
+fn resolve_journal_waiters(sess: &mut Session, now: Instant) {
+    if sess.journal_waiters.is_empty() {
+        return;
+    }
+    let Session {
+        ptys,
+        clients,
+        journal_waiters,
+        ..
+    } = sess;
+    journal_waiters.retain_mut(|waiter| {
+        // A client that hung up takes its waiters with it.
+        let Some(client) = clients.get(&waiter.client_id) else {
+            return false;
+        };
+        let pty = ptys.get(&waiter.pty_id);
+        let cursor_seq = pty.map(|p| p.driver.cursor_seq().0).unwrap_or(0);
+        let oldest_seq = pty.map(|p| p.driver.oldest_seq()).unwrap_or(0);
+        let (status, record) =
+            match waiter.poll(pty.map(|p| &p.journal), cursor_seq, oldest_seq, now) {
+                journal::WaitOutcome::Pending => return true,
+                journal::WaitOutcome::Ready(record) => (STATUS_OK, record),
+                journal::WaitOutcome::Gone => (
+                    STATUS_NOT_FOUND,
+                    blit_remote::journal::CommandRecord::default(),
+                ),
+            };
+        let _ = send_outbox(
+            client,
+            blit_remote::journal::msg_s2c_term_command(
+                waiter.nonce,
+                waiter.pty_id,
+                status,
+                &record,
+            ),
+        );
+        false
+    });
 }
 
 /// Record an OSC 7 report against a PTY's stored cwd; returns the
@@ -8463,7 +9054,8 @@ async fn supervisor_loop(state: AppState) {
 /// The soonest instant the supervisor has work to do, or `None` when nothing
 /// is armed.
 fn earliest_armed_deadline(sess: &Session) -> Option<Instant> {
-    sess.ptys
+    let ptys = sess
+        .ptys
         .values()
         .filter(|pty| !pty.exited)
         .filter_map(|pty| {
@@ -8473,7 +9065,14 @@ fn earliest_armed_deadline(sess: &Session) -> Option<Instant> {
                 .chain(pty.exit_drain_deadline)
                 .min()
         })
-        .min()
+        .min();
+    // A journal wait is the other thing with a clock on it: without this the
+    // supervisor would sleep through a timeout on an idle terminal.
+    let waits = sess.journal_waiters.iter().map(|w| w.deadline).min();
+    match (ptys, waits) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Terminals to evict to stay inside the retention bounds, oldest first.
@@ -8586,6 +9185,9 @@ async fn supervise(state: &AppState) {
     let now = Instant::now();
     let fallback_due = {
         let mut sess = state.session.lock().await;
+        // The tick answers waiters whose command finished; nothing else wakes
+        // for one that simply ran out of time on a quiet terminal.
+        resolve_journal_waiters(&mut sess, now);
         for pty in sess.ptys.values_mut().filter(|pty| !pty.exited) {
             if pty.exit_drain_deadline.is_none() && pty::poll_child_exited(&pty.handle) {
                 pty.exit_drain_deadline = Some(now + PTY_EXIT_DRAIN_GRACE);
@@ -8822,8 +9424,14 @@ async fn cleanup_pty_internal(pty_id: u16, generation: Option<u64>, state: &AppS
         pty::close_pty(&pty.handle);
         pty.exit_status = pty::collect_exit_status(&pty.handle);
         pty.mark_dirty();
+        // A command still running when the shell dies never gets its `D`
+        // marker; closing it here is what stops a waiter hanging until its
+        // timeout for output that is never coming.
+        let end_seq = pty.driver.cursor_seq().0;
+        pty.journal.note_pty_exit(end_seq);
         let msg = blit_remote::msg_exited_reason(pty_id, pty.exit_status, pty.exit_reason);
         sess.send_to_all(&msg);
+        resolve_journal_waiters(&mut sess, Instant::now());
     }
 }
 
@@ -9274,6 +9882,10 @@ async fn tick(state: &AppState) -> TickOutcome {
                         CachedSurfaceInfo {
                             surface_id,
                             parent_id,
+                            // Filled by the SurfaceOrigin that follows
+                            // immediately when the client is on a per-app
+                            // socket; stays None for the shared one.
+                            origin: None,
                             width,
                             height,
                             logical_width: 0,
@@ -9449,6 +10061,29 @@ async fn tick(state: &AppState) -> TickOutcome {
                         info.app_id = app_id.clone();
                     }
                     broadcast.push(msg_surface_app_id(surface_id, &app_id));
+                }
+                CompositorEvent::SurfaceOrigin {
+                    surface_id,
+                    sandbox_engine,
+                    app_id,
+                    instance_id,
+                } => {
+                    // Cached so a client attaching later learns it too: the
+                    // compositor sends this once, at creation, and identity
+                    // cannot change while the connection lives.
+                    if let Some(info) = cs.surfaces.get_mut(&surface_id) {
+                        info.origin = Some(SurfaceOrigin {
+                            sandbox_engine: sandbox_engine.clone(),
+                            app_id: app_id.clone(),
+                            instance_id: instance_id.clone(),
+                        });
+                    }
+                    broadcast.push(msg_surface_origin(
+                        surface_id,
+                        &sandbox_engine,
+                        &app_id,
+                        &instance_id,
+                    ));
                 }
                 CompositorEvent::SurfaceActivated { surface_id } => {
                     // Nothing to cache — the client is asked to raise and
@@ -12499,31 +13134,17 @@ async fn tick(state: &AppState) -> TickOutcome {
             match input {
                 PtyInput::Data(data) => {
                     budget = budget.saturating_sub(data.len());
-                    let osc7 = pty::respond_to_queries(
-                        &pty.handle,
-                        &data,
-                        pty.driver.size(),
-                        pty.driver.cursor_position(),
-                    );
-                    if let Some(msg) = note_osc7_cwd(&mut pty.osc7_cwd, id, osc7) {
+                    if let Some(msg) = feed_pty_chunk(pty, id, &data) {
                         cwd_msgs.push(msg);
                     }
-                    pty.driver.process(&data);
                     pty.mark_output_dirty(now, output_coalesce_cap);
                 }
                 PtyInput::SyncBoundary { before } => {
                     budget = budget.saturating_sub(before.len());
                     if !before.is_empty() {
-                        let osc7 = pty::respond_to_queries(
-                            &pty.handle,
-                            &before,
-                            pty.driver.size(),
-                            pty.driver.cursor_position(),
-                        );
-                        if let Some(msg) = note_osc7_cwd(&mut pty.osc7_cwd, id, osc7) {
+                        if let Some(msg) = feed_pty_chunk(pty, id, &before) {
                             cwd_msgs.push(msg);
                         }
-                        pty.driver.process(&before);
                         pty.mark_output_dirty(now, output_coalesce_cap);
                     }
                     if !pty.driver.synced_output() {
@@ -12548,6 +13169,9 @@ async fn tick(state: &AppState) -> TickOutcome {
     for msg in cwd_msgs {
         sess.send_to_all(&msg);
     }
+    // A `D` marker in the bytes just processed is what finishes a command,
+    // so this is the first moment a waiter can be answered.
+    resolve_journal_waiters(&mut sess, now);
     if parse_budget_hit {
         // Leftover output is already queued, so re-tick right after this
         // round instead of waiting on the reader's notify — the permit for
@@ -13305,6 +13929,10 @@ struct FsSyncs {
     /// cap, its own set so search and index nonce spaces stay independent.
     inflight_searches: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
     inflight_greps: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    /// Nonces of `FS_READ` batches in flight — same discipline again: the read
+    /// happens off-thread, so without a cap a client could queue as many as it
+    /// can send.
+    inflight_reads: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
     /// Live chunked uploads on this connection (upload_id → sync_id routing
     /// plus the concurrent-upload cap). Shared with the sync sinks, which
     /// free the id of a BEGIN the engine refused.
@@ -13394,6 +14022,25 @@ impl FsSyncs {
         set.insert(nonce);
         Ok(std::sync::Arc::new(blit_fssync::InflightGuard::new(
             self.inflight_indexes.clone(),
+            nonce,
+        )))
+    }
+
+    /// Reserve a nonce for an in-flight `FS_READ`, same cap and failure split
+    /// as [`FsSyncs::reserve_index`]: a read is off-thread I/O a client can
+    /// otherwise stack up.
+    fn reserve_read(&self, nonce: u16) -> Result<std::sync::Arc<blit_fssync::InflightGuard>, u8> {
+        use blit_remote::fs::{FS_DONE_BUDGET, FS_DONE_INVALID};
+        let mut set = self.inflight_reads.lock().unwrap();
+        if set.contains(&nonce) {
+            return Err(FS_DONE_INVALID);
+        }
+        if set.len() >= fs_walk_inflight() {
+            return Err(FS_DONE_BUDGET);
+        }
+        set.insert(nonce);
+        Ok(std::sync::Arc::new(blit_fssync::InflightGuard::new(
+            self.inflight_reads.clone(),
             nonce,
         )))
     }
@@ -13884,10 +14531,72 @@ const FS_INDEX_MAX_BYTES: usize = 48 * 1024 * 1024;
 /// with a bare `*` — the dotfiles-repo-at-$HOME pattern — blanks every
 /// non-repo subtree) falls back to an ignore-free walk: an empty index
 /// would otherwise read as "no files here" and never consult the server.
+/// Classify one path for `FS_READ` without reading it.
+fn stat_one_for_fs_read(path: &str, per_file: u64) -> u8 {
+    use blit_remote::fs::{
+        FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_OTHER, FS_FILE_TOO_LARGE, FS_FILE_UNREADABLE,
+    };
+    match std::fs::metadata(path) {
+        Err(error) => match error.kind() {
+            std::io::ErrorKind::NotFound => FS_FILE_NOT_FOUND,
+            std::io::ErrorKind::PermissionDenied => FS_FILE_UNREADABLE,
+            _ => FS_FILE_OTHER,
+        },
+        Ok(meta) if !meta.is_file() => FS_FILE_UNREADABLE,
+        Ok(meta) if meta.len() > per_file => FS_FILE_TOO_LARGE,
+        Ok(_) => FS_FILE_OK,
+    }
+}
+
+/// Read one path for `FS_READ`: its record status and content.
+///
+/// `left` is what remains of the reply budget, so a file that would not fit is
+/// reported the same way one over the caller's own ceiling is — the caller is not
+/// getting it either way, and the distinction is not worth a status.
+fn read_one_for_fs_read(path: &str, per_file: u64, left: usize) -> (u8, Vec<u8>) {
+    use blit_remote::fs::{
+        FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_OTHER, FS_FILE_TOO_LARGE, FS_FILE_UNREADABLE,
+    };
+    let kind = |error: &std::io::Error| match error.kind() {
+        std::io::ErrorKind::NotFound => FS_FILE_NOT_FOUND,
+        std::io::ErrorKind::PermissionDenied => FS_FILE_UNREADABLE,
+        _ => FS_FILE_OTHER,
+    };
+    match std::fs::metadata(path) {
+        Err(error) => (kind(&error), Vec::new()),
+        // A directory has no content to answer with, and `FS_INDEX` is the
+        // message that describes one.
+        Ok(meta) if !meta.is_file() => (FS_FILE_UNREADABLE, Vec::new()),
+        Ok(meta) if meta.len() > per_file || meta.len() as usize > left => {
+            (FS_FILE_TOO_LARGE, Vec::new())
+        }
+        Ok(_) => match std::fs::read(path) {
+            // It grew between the stat and the read.
+            Ok(body) if body.len() as u64 > per_file => (FS_FILE_TOO_LARGE, Vec::new()),
+            Ok(body) => (FS_FILE_OK, body),
+            Err(error) => (kind(&error), Vec::new()),
+        },
+    }
+}
+
 fn fs_index_walk(root: &std::path::Path, max_entries: usize) -> (Vec<String>, bool) {
-    let (paths, truncated) = fs_index_walk_inner(root, max_entries, true);
-    if paths.is_empty() && !truncated {
-        return fs_index_walk_inner(root, max_entries, false);
+    fs_index_walk_kind(root, max_entries, false, false)
+}
+
+/// [`fs_index_walk`], listing directories instead of files when `dirs_only`.
+///
+/// The ignore-free retry is skipped for directories: an ignore rule that blanks
+/// every file in a tree still leaves its directories, so an empty answer there
+/// means an empty tree and the second walk would only cost time.
+fn fs_index_walk_kind(
+    root: &std::path::Path,
+    max_entries: usize,
+    dirs_only: bool,
+    follow: bool,
+) -> (Vec<String>, bool) {
+    let (paths, truncated) = fs_index_walk_inner(root, max_entries, true, dirs_only, follow);
+    if paths.is_empty() && !truncated && !dirs_only {
+        return fs_index_walk_inner(root, max_entries, false, dirs_only, follow);
     }
     (paths, truncated)
 }
@@ -13896,6 +14605,8 @@ fn fs_index_walk_inner(
     root: &std::path::Path,
     max_entries: usize,
     use_ignores: bool,
+    dirs_only: bool,
+    follow: bool,
 ) -> (Vec<String>, bool) {
     let mut paths: Vec<String> = Vec::new();
     let mut bytes = 0usize;
@@ -13909,7 +14620,7 @@ fn fs_index_walk_inner(
     let mut builder = ignore::WalkBuilder::new(root);
     builder
         .hidden(false)
-        .follow_links(false)
+        .follow_links(follow)
         .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(".git"));
     if !use_ignores {
         builder.standard_filters(false);
@@ -13920,14 +14631,27 @@ fn fs_index_walk_inner(
             truncated = true;
             break;
         }
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+        // A symlink counts as whatever it points at, which costs one stat and is
+        // the difference between seeing a Nix system directory and not: every
+        // `.desktop` file and every icon directory under
+        // `/run/current-system/sw/share` is a link into the store, and the walk
+        // does not follow links, so `file_type` calls them all symlinks.
+        let wanted = match entry.file_type() {
+            Some(kind) if kind.is_dir() => dirs_only,
+            Some(kind) if kind.is_file() => !dirs_only,
+            Some(kind) if kind.is_symlink() => {
+                std::fs::metadata(entry.path()).is_ok_and(|target| target.is_dir() == dirs_only)
+            }
+            _ => false,
+        };
+        if !wanted {
             continue;
         }
         let Ok(rel) = entry.path().strip_prefix(root) else {
             continue;
         };
         if rel.as_os_str().is_empty() {
-            continue; // the root itself, when it is a file
+            continue; // the root itself, which the caller already has
         }
         // Truncation is exact: it fires only when a file would be dropped,
         // never on a trailing directory after the last counted file.
@@ -14078,8 +14802,8 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
 ) {
     use blit_fssync::{OpReq, UploadBeginReq, WriteReq};
     use blit_remote::fs::{
-        C2S_FS_ACK, C2S_FS_FETCH, C2S_FS_GREP, C2S_FS_INDEX, C2S_FS_OP, C2S_FS_SEARCH, C2S_FS_STOP,
-        C2S_FS_SYNC, C2S_FS_UPLOAD_BEGIN, C2S_FS_UPLOAD_CANCEL, C2S_FS_UPLOAD_CHUNK,
+        C2S_FS_ACK, C2S_FS_FETCH, C2S_FS_GREP, C2S_FS_INDEX, C2S_FS_OP, C2S_FS_READ, C2S_FS_SEARCH,
+        C2S_FS_STOP, C2S_FS_SYNC, C2S_FS_UPLOAD_BEGIN, C2S_FS_UPLOAD_CANCEL, C2S_FS_UPLOAD_CHUNK,
         C2S_FS_UPLOAD_FINISH, C2S_FS_WRITE, FS_DONE_BUDGET, FS_DONE_INVALID, FS_DONE_NOT_FOUND,
         FS_DONE_OK, FS_DONE_OTHER, FS_DONE_PERMISSION, FS_DONE_UNKNOWN_UPLOAD, FS_DONE_WRONG_TYPE,
         FS_FILE_OTHER, FS_INDEX_TRUNCATED, FS_STATUS_OK, FS_STATUS_OTHER, FS_STATUS_RESOURCE_LIMIT,
@@ -14088,8 +14812,8 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
         FS_SYNC_RECURSIVE, FS_SYNC_SINGLE, fs_sync_flags_valid, msg_fs_done, msg_fs_file,
         msg_fs_index_result, msg_fs_search_result, msg_fs_synced, msg_fs_upload_begin_result,
         msg_fs_upload_chunk_result, msg_fs_upload_finish_result, parse_fs_index, parse_fs_op,
-        parse_fs_search, parse_fs_upload_begin, parse_fs_upload_chunk, parse_fs_upload_finish,
-        parse_fs_write,
+        parse_fs_read, parse_fs_search, parse_fs_upload_begin, parse_fs_upload_chunk,
+        parse_fs_upload_finish, parse_fs_write,
     };
     match data[0] {
         C2S_FS_SEARCH => {
@@ -14222,15 +14946,103 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
                 }
             }
         }
+        C2S_FS_READ => {
+            // One-shot read of a fixed set of paths (docs/design/fs-read.md) —
+            // no sync, nothing watched. Off-thread and capped by `reserve_read`
+            // like every other walk in this family.
+            if let Some((nonce, flags, max_bytes, groups)) = parse_fs_read(data) {
+                use blit_remote::fs::{
+                    FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_OTHER, FS_READ_DEFAULT_BYTES,
+                    FS_READ_FIRST, FS_READ_FLAGS_KNOWN, FS_READ_MAX_TOTAL_BYTES,
+                    FS_READ_NO_CONTENT, msg_fs_read_result,
+                };
+                if flags & !FS_READ_FLAGS_KNOWN != 0 {
+                    let _ = out.send(msg_fs_read_result(nonce, FS_DONE_INVALID, &[]));
+                    return;
+                }
+                let guard = match syncs.reserve_read(nonce) {
+                    Ok(guard) => guard,
+                    Err(status) => {
+                        let _ = out.send(msg_fs_read_result(nonce, status, &[]));
+                        return;
+                    }
+                };
+                let out = out.clone();
+                let work = move || {
+                    let _guard = guard;
+                    let per_file = u64::from(if max_bytes == 0 {
+                        FS_READ_DEFAULT_BYTES
+                    } else {
+                        max_bytes
+                    });
+                    let first_only = flags & FS_READ_FIRST != 0;
+                    let no_content = flags & FS_READ_NO_CONTENT != 0;
+                    let mut left = FS_READ_MAX_TOTAL_BYTES;
+                    let mut records: Vec<(u8, String, Vec<u8>)> = Vec::new();
+                    for group in groups {
+                        let mut answered = false;
+                        for path in group {
+                            // A path that is not UTF-8 is one this family has no
+                            // way to name back, so it is answered rather than
+                            // read — and answered rather than costing a
+                            // well-formed frame its whole reply. Under FIRST it
+                            // is stepped over like any other candidate that
+                            // cannot be had.
+                            let Some(path) = path else {
+                                if !first_only {
+                                    records.push((FS_FILE_OTHER, String::new(), Vec::new()));
+                                }
+                                continue;
+                            };
+                            let (status, body) = if no_content {
+                                (stat_one_for_fs_read(&path, per_file), Vec::new())
+                            } else {
+                                read_one_for_fs_read(&path, per_file, left)
+                            };
+                            left = left.saturating_sub(body.len());
+                            // FIRST asks for the first path it can *have*, so a
+                            // miss, an unreadable file and an oversized one are
+                            // all stepped over rather than answered.
+                            if first_only {
+                                if status == FS_FILE_OK {
+                                    records.push((status, path, body));
+                                    answered = true;
+                                    break;
+                                }
+                                continue;
+                            }
+                            records.push((status, path, body));
+                        }
+                        // One record per group either way, so a caller can align
+                        // answers with questions by position.
+                        if first_only && !answered {
+                            records.push((FS_FILE_NOT_FOUND, String::new(), Vec::new()));
+                        }
+                    }
+                    let borrowed: Vec<(u8, &str, &[u8])> = records
+                        .iter()
+                        .map(|(status, path, body)| (*status, path.as_str(), body.as_slice()))
+                        .collect();
+                    let _ = out.send(msg_fs_read_result(nonce, FS_DONE_OK, &borrowed));
+                };
+                if let Some(jobs) = jobs {
+                    let _ = jobs.spawn_blocking(data.len(), work);
+                } else {
+                    std::thread::spawn(work);
+                }
+            }
+        }
         C2S_FS_INDEX => {
             // Candidate list for client-side fuzzy search
             // (docs/design/fs-search.md) — no sync. Walk off-thread, capped
             // by `reserve_index` so a client can't stack up walks.
             if let Some((nonce, flags, root)) = parse_fs_index(data) {
-                if flags != 0 {
+                if flags & !blit_remote::fs::FS_INDEX_FLAGS_KNOWN != 0 {
                     let _ = out.send(msg_fs_index_result(nonce, FS_DONE_INVALID, 0, &[]));
                     return;
                 }
+                let dirs_only = flags & blit_remote::fs::FS_INDEX_DIRS_ONLY != 0;
+                let follow = flags & blit_remote::fs::FS_INDEX_FOLLOW_LINKS != 0;
                 let guard = match syncs.reserve_index(nonce) {
                     Ok(guard) => guard,
                     Err(status) => {
@@ -14257,8 +15069,12 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
                         Ok(canon) => match std::fs::read_dir(&canon) {
                             Err(err) => msg_fs_index_result(nonce, io_status(&err), 0, &[]),
                             Ok(_) => {
-                                let (paths, truncated) =
-                                    fs_index_walk(&canon, fs_index_max_entries());
+                                let (paths, truncated) = fs_index_walk_kind(
+                                    &canon,
+                                    fs_index_max_entries(),
+                                    dirs_only,
+                                    follow,
+                                );
                                 let flags = if truncated { FS_INDEX_TRUNCATED } else { 0 };
                                 msg_fs_index_result(nonce, FS_DONE_OK, flags, &paths)
                             }
@@ -15721,6 +16537,38 @@ async fn handle_git_message<O: OutboxSend>(
                 },
             );
         }
+        C2S_GIT_WORKTREES => {
+            let Some(req) = parse_git_worktrees(data) else {
+                if let Some(n) = git_nonce(data) {
+                    let _ = out.send(msg_git_worktrees_resp(n, GIT_STATUS_INVALID, 0, &[]));
+                }
+                return;
+            };
+            let nonce = req.nonce;
+            let Some(entry) = repos.map.get(&req.repo_id) else {
+                let _ = out.send(msg_git_worktrees_resp(nonce, GIT_STATUS_UNKNOWN_ID, 0, &[]));
+                return;
+            };
+            let handle = entry.handle.clone();
+            let owned = (req.flags, req.after_pos);
+            git_request(
+                repos,
+                nonce,
+                out,
+                move |status| msg_git_worktrees_resp(nonce, status, 0, &[]),
+                move |cancel| {
+                    handle.worktrees(
+                        &GitWorktreesRequest {
+                            nonce,
+                            repo_id: 0,
+                            flags: owned.0,
+                            after_pos: owned.1,
+                        },
+                        &cancel,
+                    )
+                },
+            );
+        }
         _ => {}
     }
 }
@@ -16626,6 +17474,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     // client that ignores feature bits still gets its one reply
     // (docs/design/kv.md "Security posture").
     let kv_enabled = !std::env::var("BLIT_KV").is_ok_and(|v| v == "0");
+    // BLIT_ENV=0 withholds the server's environment. Same posture as KV: the
+    // family stays advertised so the refusal is legible as a policy decision
+    // rather than an old server, and the caller still gets one reply per nonce
+    // (docs/design/env.md "Security").
+    let env_enabled = !std::env::var("BLIT_ENV").is_ok_and(|v| v == "0");
     // BLIT_FS_WRITE=0 offers read-only sync: FS_WRITE/FS_OP answer
     // FS_DONE_PERMISSION instead of dispatching (docs/design/fs-write.md
     // "Security"). The family shares FEATURE_FS, so there is no
@@ -16997,6 +17850,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 inbound_bytes_per_sec: 0,
                 client_catalog_watches: FxHashMap::default(),
                 connected_at: Instant::now(),
+                origin: options.origin.clone(),
                 aux_subscriptions: Vec::new(),
                 #[cfg(target_os = "linux")]
                 audio_tx,
@@ -17097,6 +17951,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             | FEATURE_PTY_DEADLINE
             | FEATURE_SCROLL_BY
             | FEATURE_CLIENT_CONTROL
+            | FEATURE_CLIENT_ORIGIN
             | blit_remote::fs::FEATURE_FS
             | blit_remote::git::FEATURE_GIT;
         #[cfg(target_os = "linux")]
@@ -17111,15 +17966,35 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         if kv_enabled {
             features |= blit_remote::kv::FEATURE_KV;
         }
+        // Advertised even when BLIT_ENV=0, so a refusal reads as policy.
+        features |= blit_remote::env::FEATURE_ENV;
+        // Withheld under BLIT_TERM_JOURNAL=0, which also stops the PTY output
+        // path scanning for markers at all — the whole point of the switch is
+        // that a disabled family costs nothing (docs/design/term-journal.md).
+        if journal::enabled() {
+            features |= blit_remote::journal::FEATURE_TERM_JOURNAL;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            features |= blit_remote::process::FEATURE_APP_SOCKET;
+        }
         if net_enabled {
             features |= blit_remote::net::FEATURE_NET;
         }
         #[cfg(any(unix, windows))]
         if process_enabled {
             features |= blit_remote::process::FEATURE_PROCESS;
+            // Separate bit because an older server rejects the flag with the
+            // same status it uses for a corrupt frame, leaving a client no way
+            // to tell "not supported" from "malformed" by probing.
+            features |= blit_remote::process::FEATURE_PROCESS_SESSION_ENV;
         }
         if sess.channels.advertised() {
             features |= blit_remote::channel::FEATURE_CHANNEL;
+            // Separate bit because a WATCH this server did not understand
+            // would be dropped by the family's unknown-kind skip rule, which
+            // a client cannot tell from a name nobody serves.
+            features |= blit_remote::channel::FEATURE_CHANNEL_WATCH;
         }
         if state.extensions.advertised() {
             features |= blit_remote::extension::FEATURE_EXTENSION;
@@ -17217,6 +18092,17 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     &info.title,
                     &info.app_id,
                 ));
+                // Right after creation, in the same order the live path sends
+                // them, so a client never observes the surface without its
+                // identity.
+                if let Some(origin) = &info.origin {
+                    initial_msgs.push(msg_surface_origin(
+                        info.surface_id,
+                        &origin.sandbox_engine,
+                        &origin.app_id,
+                        &origin.instance_id,
+                    ));
+                }
                 // Also send a resize message so the client gets the
                 // correct dimensions even if surface_created carried 0x0.
                 // The logical size rides along so a viewer attaching to a
@@ -17448,19 +18334,65 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             #[cfg(any(unix, windows))]
             if process_enabled {
                 if data[0] == blit_remote::process::C2S_PROCESS_SPAWN {
-                    let pty_cwd = match blit_remote::process::parse_process_spawn(&data) {
-                        Ok(request)
-                            if request.cwd_kind == blit_remote::process::PROCESS_CWD_FROM_PTY =>
-                        {
-                            let sess = state.session.lock().await;
-                            sess.ptys
-                                .get(&request.src_pty_id)
-                                .and_then(|pty| pty::pty_cwd(&pty.handle))
-                                .map(String::into_bytes)
-                        }
-                        _ => None,
-                    };
-                    processes.spawn(&data, pty_cwd.as_deref());
+                    // Both the source terminal's cwd and the session
+                    // environment live behind the session lock, which the
+                    // process family itself never holds — so resolve them
+                    // here, as owned data, and take the lock at most once.
+                    let (pty_cwd, session_env) =
+                        match blit_remote::process::parse_process_spawn(&data) {
+                            Ok(request) => {
+                                let from_pty =
+                                    request.cwd_kind == blit_remote::process::PROCESS_CWD_FROM_PTY;
+                                let wants_session_env = request.flags
+                                    & blit_remote::process::PROCESS_SPAWN_SESSION_ENV
+                                    != 0;
+                                if from_pty || wants_session_env {
+                                    let mut sess = state.session.lock().await;
+                                    let cwd = from_pty
+                                        .then(|| {
+                                            sess.ptys
+                                                .get(&request.src_pty_id)
+                                                .and_then(|pty| pty::pty_cwd(&pty.handle))
+                                                .map(String::into_bytes)
+                                        })
+                                        .flatten();
+                                    let env = wants_session_env.then(|| {
+                                        // A supervised app can be the first
+                                        // thing in the session, so the
+                                        // compositor may not exist yet. Asking
+                                        // for the session environment is what
+                                        // brings it up.
+                                        let socket_name = sess
+                                            .ensure_compositor(
+                                                config.verbose,
+                                                notify_for_compositor.clone(),
+                                                &config.vaapi_device,
+                                            )
+                                            .to_string();
+                                        #[cfg(target_os = "linux")]
+                                        let pulse_server = sess.pulse_server_path();
+                                        #[cfg(not(target_os = "linux"))]
+                                        let pulse_server: Option<String> = None;
+                                        #[cfg(target_os = "linux")]
+                                        let pipewire_remote = sess.pipewire_remote_path();
+                                        #[cfg(not(target_os = "linux"))]
+                                        let pipewire_remote: Option<String> = None;
+                                        app_env::session_env(
+                                            Some(&socket_name),
+                                            sess.x_display().as_deref(),
+                                            sess.desktop_bus_address().as_deref(),
+                                            pulse_server.as_deref(),
+                                            pipewire_remote.as_deref(),
+                                        )
+                                    });
+                                    (cwd, env)
+                                } else {
+                                    (None, None)
+                                }
+                            }
+                            Err(_) => (None, None),
+                        };
+                    processes.spawn(&data, pty_cwd.as_deref(), session_env);
                 } else {
                     processes.handle(&data);
                 }
@@ -17494,6 +18426,20 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             continue;
         }
 
+        // Terminal journal: unlike the families around it these requests are
+        // all about session state, so they are answered in the session-locked
+        // match below. Only the disabled case is handled here, and it is
+        // handled rather than dropped — a client that ignores feature bits
+        // still gets its one reply per nonce, the KV/LSP posture
+        // (docs/design/term-journal.md § Security).
+        if !journal::enabled()
+            && let Some(reply) =
+                blit_remote::journal::refusal(&data, blit_remote::STATUS_PERMISSION)
+        {
+            let _ = fs_out.send(reply);
+            continue;
+        }
+
         // Filesystem sync: connection-scoped, engine-threaded, and
         // deliberately handled before the session mutex — no fs message
         // ever needs session state.
@@ -17512,6 +18458,10 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 | blit_remote::fs::C2S_FS_UPLOAD_CHUNK
                 | blit_remote::fs::C2S_FS_UPLOAD_FINISH
                 | blit_remote::fs::C2S_FS_UPLOAD_CANCEL
+                // Listed, not ranged: an fs opcode this match forgets is
+                // dropped before any handler runs, which reads as a request
+                // that never got a reply.
+                | blit_remote::fs::C2S_FS_READ
         ) {
             // A FROM_PTY sync (docs/ide.md Decision 3) names a source pty
             // whose live cwd is session state; resolve it here — the sole
@@ -17608,7 +18558,12 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
 
         // Git introspection: same discipline as fs — connection-scoped,
         // request threads and state engines, never the session mutex.
-        if (blit_remote::git::C2S_GIT_OPEN..=blit_remote::git::C2S_GIT_FETCH).contains(&data[0]) {
+        // The upper bound is the family's LAST opcode, so adding one means
+        // moving this too — a new opcode that lands outside the range is
+        // dropped here silently, before any handler sees it, and shows up as
+        // a request that never gets a reply rather than as an error.
+        if (blit_remote::git::C2S_GIT_OPEN..=blit_remote::git::C2S_GIT_WORKTREES).contains(&data[0])
+        {
             // A pty-relative open (docs/ide.md Decision 3): resolve the
             // source pty's live cwd (session state) and rebase to a plain
             // path-based open.
@@ -17720,6 +18675,101 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     &net_sockets,
                 )
                 .await;
+            continue;
+        }
+
+        // Mint a Wayland socket dedicated to one application, so the identity
+        // of everything that connects on it is known rather than asserted.
+        if data[0] == blit_remote::C2S_APP_SOCKET {
+            if let Some((nonce, app_id, instance_id)) = blit_remote::parse_app_socket_request(&data)
+            {
+                #[cfg(target_os = "linux")]
+                let reply = {
+                    // Names go into a filesystem path and an environment
+                    // variable, so anything that could escape either is
+                    // refused rather than sanitised into something the caller
+                    // did not ask for.
+                    let sane = |value: &str| {
+                        !value.is_empty()
+                            && value.len() <= 64
+                            && value
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    };
+                    if !sane(app_id) || !sane(instance_id) {
+                        blit_remote::msg_app_socket_reply(nonce, blit_remote::STATUS_INVALID, "")
+                    } else {
+                        let mut sess = state.session.lock().await;
+                        match sess.bind_app_socket(
+                            config.verbose,
+                            notify_for_compositor.clone(),
+                            &config.vaapi_device,
+                            app_id,
+                            instance_id,
+                        ) {
+                            Some((name, _path)) => blit_remote::msg_app_socket_reply(
+                                nonce,
+                                blit_remote::STATUS_OK,
+                                &name,
+                            ),
+                            None => blit_remote::msg_app_socket_reply(
+                                nonce,
+                                blit_remote::STATUS_OTHER,
+                                "",
+                            ),
+                        }
+                    }
+                };
+                #[cfg(not(target_os = "linux"))]
+                let reply =
+                    blit_remote::msg_app_socket_reply(nonce, blit_remote::STATUS_WRONG_TYPE, "");
+                let _ = fs_out.send(reply);
+            }
+            continue;
+        }
+
+        // The server's own environment (docs/design/env.md). One request, one
+        // reply, no state — but it hands over every credential the server was
+        // started with, so BLIT_ENV=0 refuses it with PERMISSION.
+        if blit_remote::env::is_c2s_env(data[0]) {
+            if let Ok(nonce) = blit_remote::env::parse_env_get(&data) {
+                let reply = if env_enabled {
+                    let entries = std::env::vars_os()
+                        .map(|(key, value)| {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::ffi::OsStringExt;
+                                (key.into_vec(), value.into_vec())
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                (
+                                    key.to_string_lossy().into_owned().into_bytes(),
+                                    value.to_string_lossy().into_owned().into_bytes(),
+                                )
+                            }
+                        })
+                        .collect();
+                    blit_remote::env::msg_env(nonce, STATUS_OK, &entries)
+                } else {
+                    blit_remote::env::msg_env(
+                        nonce,
+                        blit_remote::STATUS_PERMISSION,
+                        &std::collections::BTreeMap::new(),
+                    )
+                };
+                // An environment big enough to refuse still owes the caller an
+                // answer under its nonce, or it waits forever.
+                let reply = reply.unwrap_or_else(|error| {
+                    blit_remote::env::msg_env(
+                        nonce,
+                        error.status(),
+                        &std::collections::BTreeMap::new(),
+                    )
+                    .expect("an empty reply always encodes")
+                });
+                let _ = fs_out.send(reply);
+            }
             continue;
         }
 
@@ -18046,7 +19096,20 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             data[0],
             C2S_CLIENT_LIST | C2S_CLIENT_WATCH | C2S_CLIENT_UNWATCH
         ) {
-            if data.len() != 3 {
+            // LIST and WATCH take an optional flags byte; UNWATCH names a
+            // nonce whose shape was settled when the watch opened, so a flags
+            // byte there would be a request to change something that cannot
+            // change, and stays an error.
+            //
+            // An unknown flag bit is refused rather than ignored: a client
+            // that asks for a shape this server cannot produce must hear so,
+            // not receive a reply it will misread.
+            let shaped = matches!(data[0], C2S_CLIENT_LIST | C2S_CLIENT_WATCH);
+            let flags = (shaped && data.len() == 4).then(|| data[3]);
+            let want_origin = flags.is_some_and(|flags| flags & CLIENT_LIST_WANT_ORIGIN != 0);
+            let accepted =
+                data.len() == 3 || flags.is_some_and(|flags| flags & !CLIENT_LIST_WANT_ORIGIN == 0);
+            if !accepted {
                 if data.len() >= 3 {
                     let nonce = u16::from_le_bytes([data[1], data[2]]);
                     let sess = state.session.lock().await;
@@ -18068,10 +19131,13 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             match data[0] {
                 C2S_CLIENT_LIST => {
                     if let Some(client) = sess.clients.get(&client_id) {
-                        let _ = send_outbox(client, sess.client_list_msg(client_id, nonce));
+                        let _ = send_outbox(
+                            client,
+                            sess.client_list_msg(client_id, nonce, want_origin),
+                        );
                     }
                 }
-                C2S_CLIENT_WATCH => sess.watch_client_list(client_id, nonce),
+                C2S_CLIENT_WATCH => sess.watch_client_list(client_id, nonce, want_origin),
                 _ => sess.unwatch_client_list(client_id, nonce),
             }
             continue;
@@ -20169,6 +21235,12 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         pty.reader_handle = reader;
                         pty.byte_rx = byte_rx;
                         pty.driver.reset_modes();
+                        // A new shell in the same slot: its predecessor's
+                        // commands describe a session that is over. Indices
+                        // keep climbing so a stale client index cannot alias
+                        // onto a new command.
+                        pty.journal.reset();
+                        pty.osc_carry.clear();
                         pty.exited = false;
                         pty.exited_at = None;
                         // New child in the same slot: anything queued against
@@ -20301,6 +21373,36 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     }
                 }
             }
+            blit_remote::journal::C2S_TERM_JOURNAL => {
+                if let Some(req) = blit_remote::journal::parse_term_journal(&data) {
+                    let reply = journal_list_reply(&sess, &req);
+                    if let Some(client) = sess.clients.get(&client_id) {
+                        let _ = send_outbox(client, reply);
+                    }
+                }
+            }
+            blit_remote::journal::C2S_TERM_OUTPUT => {
+                if let Some(req) = blit_remote::journal::parse_term_output(&data) {
+                    let reply = journal_output_reply(&sess, &req);
+                    if let Some(client) = sess.clients.get(&client_id) {
+                        let _ = send_outbox(client, reply);
+                    }
+                }
+            }
+            blit_remote::journal::C2S_TERM_SINCE => {
+                if let Some(req) = blit_remote::journal::parse_term_since(&data) {
+                    let reply = term_since_reply(&sess, &req);
+                    if let Some(client) = sess.clients.get(&client_id) {
+                        let _ = send_outbox(client, reply);
+                    }
+                }
+            }
+            blit_remote::journal::C2S_TERM_JOURNAL_WAIT => {
+                if let Some(req) = blit_remote::journal::parse_term_journal_wait(&data) {
+                    arm_journal_waiter(&mut sess, client_id, &req, Instant::now());
+                    need_nudge = true;
+                }
+            }
             C2S_COPY_RANGE if data.len() >= 18 => {
                 let nonce = u16::from_le_bytes([data[1], data[2]]);
                 let pid = u16::from_le_bytes([data[3], data[4]]);
@@ -20410,7 +21512,17 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         if let Some(cs) = sess.compositor.as_ref() {
             cs.audio_broadcast.unsubscribe(client_id);
         }
-        let channel_deliveries = sess.channels.close_endpoint(client_id);
+        // A departing endpoint releases its channel names, which is news for
+        // every watcher of one — so this teardown reserves outbox room for
+        // other clients, exactly as the `0x95` request path does.
+        let Session {
+            clients, channels, ..
+        } = &mut *sess;
+        let channel_deliveries = channels.close_endpoint_reserved(client_id, |endpoint, bytes| {
+            clients
+                .get(&endpoint)
+                .and_then(|client| client.channel_tx.reserve(bytes))
+        });
         send_channel_deliveries(&sess, channel_deliveries);
         #[cfg(target_os = "linux")]
         let media_disconnected = sess
@@ -22102,6 +23214,7 @@ mod tests {
             inbound_bytes_per_sec: 0,
             client_catalog_watches: FxHashMap::default(),
             connected_at: Instant::now(),
+            origin: ConnectionOrigin::Network,
             aux_subscriptions: Vec::new(),
             #[cfg(target_os = "linux")]
             audio_tx,
@@ -22325,7 +23438,7 @@ mod tests {
         target.kick_tx = kick_tx;
         sess.clients.insert(5, target);
 
-        let msg = sess.client_list_msg(9, 17);
+        let msg = sess.client_list_msg(9, 17, false);
         let Some(blit_remote::ServerMsg::ClientList {
             nonce,
             self_id,
@@ -22416,6 +23529,96 @@ mod tests {
         );
     }
 
+    /// The catalog says which connections are extension attempts — and only
+    /// when asked, since a client reading the older shape must keep getting a
+    /// message it can parse.
+    #[test]
+    fn client_list_reports_extension_origins_on_request() {
+        let mut sess = Session::new();
+        sess.clients.insert(9, test_client());
+        let mut extension = test_client();
+        extension.origin = ConnectionOrigin::Extension {
+            extension_id: 0x05a3_415a_2dd1_ef9b,
+            definition_revision: 2,
+            attempt: 3,
+            task_id: 4,
+            name: "systemd".to_string(),
+        };
+        sess.clients.insert(2, extension);
+
+        let plain = sess.client_list_msg(9, 17, false);
+        assert_eq!(plain[0], blit_remote::S2C_CLIENT_LIST);
+        let Some(blit_remote::ServerMsg::ClientList { clients, .. }) =
+            blit_remote::parse_server_msg(&plain)
+        else {
+            panic!("expected a client list");
+        };
+        assert!(clients.iter().all(|entry| entry.origin.is_none()));
+
+        let asked = sess.client_list_msg(9, 17, true);
+        assert_eq!(asked[0], blit_remote::S2C_CLIENT_LIST2);
+        let Some(blit_remote::ServerMsg::ClientList { clients, .. }) =
+            blit_remote::parse_server_msg(&asked)
+        else {
+            panic!("expected a client list with origins");
+        };
+        assert_eq!(
+            clients[0].origin,
+            Some(blit_remote::ClientOrigin::Extension {
+                extension_id: 0x05a3_415a_2dd1_ef9b,
+                definition_revision: 2,
+                attempt: 3,
+                task_id: 4,
+                name: "systemd".to_string(),
+            })
+        );
+        assert_eq!(clients[1].origin, Some(blit_remote::ClientOrigin::Network));
+    }
+
+    /// A watch keeps the shape it was opened with, including across the
+    /// republish that a topology change triggers.
+    #[test]
+    fn client_catalog_watch_keeps_its_origin_shape() {
+        let mut sess = Session::new();
+        let (watcher, mut watcher_rx) = test_client_with_capacity(0);
+        sess.clients.insert(9, watcher);
+
+        sess.watch_client_list(9, 31, true);
+        assert_eq!(
+            watcher_rx.try_recv().unwrap()[0],
+            blit_remote::S2C_CLIENT_LIST2
+        );
+
+        let mut extension = test_client();
+        extension.origin = ConnectionOrigin::Extension {
+            extension_id: 7,
+            definition_revision: 1,
+            attempt: 1,
+            task_id: 0,
+            name: String::new(),
+        };
+        sess.clients.insert(2, extension);
+        sess.publish_client_catalogs();
+
+        let update = watcher_rx.try_recv().unwrap();
+        assert_eq!(update[0], blit_remote::S2C_CLIENT_LIST2);
+        let Some(blit_remote::ServerMsg::ClientList { clients, .. }) =
+            blit_remote::parse_server_msg(&update)
+        else {
+            panic!("expected a client list with origins");
+        };
+        assert_eq!(
+            clients[0].origin,
+            Some(blit_remote::ClientOrigin::Extension {
+                extension_id: 7,
+                definition_revision: 1,
+                attempt: 1,
+                task_id: 0,
+                name: String::new(),
+            })
+        );
+    }
+
     #[test]
     fn client_catalog_watch_pushes_only_changes_until_unwatched() {
         let mut sess = Session::new();
@@ -22423,7 +23626,7 @@ mod tests {
         sess.clients.insert(9, watcher);
         sess.clients.insert(2, test_client());
 
-        sess.watch_client_list(9, 31);
+        sess.watch_client_list(9, 31, false);
         assert!(matches!(
             blit_remote::parse_server_msg(&watcher_rx.try_recv().unwrap()),
             Some(blit_remote::ServerMsg::ClientList {
@@ -25885,6 +27088,7 @@ mod tests {
         let info = CachedSurfaceInfo {
             surface_id: 1,
             parent_id: 0,
+            origin: None,
             width: 1919,
             height: 942,
             logical_width: 1515,

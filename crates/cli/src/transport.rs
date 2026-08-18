@@ -650,7 +650,8 @@ pub async fn ensure_local_server(pipe_path: &str) -> Result<(), String> {
 
 /// Spawn `blit server --socket <path>` detached from this process's
 /// session, stdio to the void. Configuration flows through inherited
-/// `BLIT_*`/`SHELL` env vars, which the server command reads itself.
+/// `BLIT_*`/`SHELL` env vars, which the server command reads itself —
+/// `BLIT_PASSPHRASE` excepted, which is not the server's to hold.
 fn spawn_detached_server(socket_path: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate blit executable: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
@@ -660,6 +661,14 @@ fn spawn_detached_server(socket_path: &str) -> Result<(), String> {
         // One-shot fs/git/lsp use never touches a surface; skip the
         // compositor/VAAPI bring-up the daemon would otherwise pay for.
         .env("BLIT_SKIP_COMPOSITOR", "1")
+        // The passphrase belongs to whoever authenticates browsers: the gateway,
+        // or `blit share`, which reads it immediately before autostarting this
+        // child. No server reads it. And `ENV_GET` (docs/design/env.md) hands a
+        // server's whole environment to any client that can reach the family, so
+        // inheriting it would publish the credential of the process that spawned
+        // it — a `blit share` link's passphrase, to everyone already through the
+        // link.
+        .env_remove("BLIT_PASSPHRASE")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

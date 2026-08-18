@@ -193,3 +193,79 @@ describe("audio latency backstop", () => {
     expect(skips(posted)).toHaveLength(0);
   });
 });
+
+/**
+ * What the debug panel is allowed to claim.
+ *
+ * The row used to report underruns and rebuffers and nothing else, which
+ * made a whole class of glitch unreportable: a link that arrives late in
+ * bursts never starves the buffer, so it reads zero underruns forever
+ * while the backstop quietly discards a second of audio at a time. The
+ * counters below are the ones that move in that case.
+ */
+describe("audio buffer stats", () => {
+  let player: AudioPlayer;
+  let posted: Posted[];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    ({ player, posted } = makePlayer());
+  });
+
+  afterEach(() => {
+    player.destroy();
+    vi.useRealTimers();
+  });
+
+  const event = (d: Record<string, unknown>) =>
+    (
+      player as unknown as { handleWorkletMessage(d: unknown): void }
+    ).handleWorkletMessage({ type: "event", ...d });
+
+  it("starts clean", () => {
+    expect(player.bufferStats.skips).toBe(0);
+    expect(player.bufferStats.skippedMs).toBe(0);
+    expect(player.bufferStats.resets).toBe(0);
+  });
+
+  it("reports discarded audio on a link that never underruns", () => {
+    // Three one-second backlogs, each trimmed back to target. The buffer
+    // is deep throughout, so nothing starves and no underrun is posted.
+    const deep = MIN_BUFFER_SAMPLES + 1000 * SAMPLES_PER_MS;
+    for (let i = 0; i < 3; i++) {
+      report(player, deep, MIN_BUFFER_SAMPLES);
+      event({
+        kind: "skip",
+        requested: 1000 * SAMPLES_PER_MS,
+        skipped: 1000 * SAMPLES_PER_MS,
+        buffered: MIN_BUFFER_SAMPLES,
+      });
+      vi.advanceTimersByTime(SKIP_COOLDOWN_MS);
+    }
+
+    expect(skips(posted)).toHaveLength(3);
+    expect(player.bufferStats.underruns).toBe(0);
+    expect(player.bufferStats.rebuffers).toBe(0);
+    // The old row would have shown a clean bill of health for 3 s of
+    // audio dropped on the floor.
+    expect(player.bufferStats.skips).toBe(3);
+    expect(player.bufferStats.skippedMs).toBe(3000);
+  });
+
+  it("counts what was dropped, not what was asked for", () => {
+    event({
+      kind: "skip",
+      requested: 1000 * SAMPLES_PER_MS,
+      skipped: 120 * SAMPLES_PER_MS,
+      buffered: MIN_BUFFER_SAMPLES,
+    });
+    expect(player.bufferStats.skippedMs).toBe(120);
+  });
+
+  it("puts a pipeline rebuild on the record", () => {
+    player.resetPipeline();
+    player.resetPipeline();
+    expect(player.bufferStats.resets).toBe(2);
+  });
+});

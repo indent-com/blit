@@ -69,7 +69,7 @@ in
 
     scrollback = mkOption {
       type = types.int;
-      default = 1000000;
+      default = 10000;
       description = "Scrollback buffer size in rows per PTY.";
     };
 
@@ -88,6 +88,43 @@ in
         <option>BLIT_LSP=0</option> via the environment to disable the
         family entirely.
       '';
+    };
+
+    extensions = {
+      persistent = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Permit durable Wasmi extensions (<literal>blit ext run
+          --persist</literal>) and start the ones that should be running again
+          after a restart. This is also what makes an extension's
+          <literal>@name</literal> command namespace exist. Equivalent to
+          <option>BLIT_ALLOW_EXT_PERSIST=1</option>; transient extensions run
+          without it.
+
+          Definitions live in
+          <filename>~/.local/state/blit/extensions.redb</filename> and module
+          bytes in <filename>~/.cache/blit/wasm</filename>, so clearing the
+          cache blocks every persistent extension until one is uploaded again.
+        '';
+      };
+
+      path = mkOption {
+        type = types.listOf types.package;
+        default = [ ];
+        example = lib.literalExpression "[ pkgs.glib.bin ]";
+        description = ''
+          Extra packages on the blit server's PATH, for the processes
+          extensions spawn. A Wasm guest reaches the machine only by starting
+          a child process, and a server started from this unit has little more
+          than coreutils and systemd on its PATH — so whatever an extension
+          shells out to belongs here.
+
+          <literal>pkgs.glib.bin</literal> supplies <literal>gdbus</literal>,
+          which lets the systemd extension react to unit changes as they
+          happen instead of polling for them.
+        '';
+      };
     };
 
     x11 = {
@@ -373,7 +410,9 @@ in
               # Spawned by name, once per session, and only if it is here:
               # see crates/server/src/xwayland.rs.
               ++ lib.optional (pkgs.stdenv.isLinux && cfg.x11.enable) cfg.x11.package
-              ++ cfg.languageServers;
+              ++ cfg.languageServers
+              # Whatever the extensions on this server shell out to.
+              ++ cfg.extensions.path;
             serviceConfig = {
               Type = "notify";
               User = user;
@@ -402,7 +441,8 @@ in
                   "BLIT_AUDIO=1"
                   "BLIT_AUDIO_BITRATE=${toString cfg.audio.bitrate}"
                 ]
-                ++ lib.optional (!cfg.audio.enable) "BLIT_AUDIO=0";
+                ++ lib.optional (!cfg.audio.enable) "BLIT_AUDIO=0"
+                ++ lib.optional cfg.extensions.persistent "BLIT_ALLOW_EXT_PERSIST=1";
             };
           };
         }) cfg.users

@@ -3,7 +3,7 @@
 use blit_remote::channel::{
     CHANNEL_CLOSE_PEER_GONE, CHANNEL_CLOSE_PROTOCOL_VIOLATION, CHANNEL_MAX_UNCONSUMED_MESSAGES,
     CHANNEL_WINDOW_BYTES, ChannelRequest, msg_channel_accepted, msg_channel_ack,
-    msg_channel_closed, msg_channel_data, msg_channel_opened,
+    msg_channel_closed, msg_channel_data, msg_channel_names, msg_channel_opened,
 };
 use blit_remote::{
     STATUS_BUDGET, STATUS_CANCELLED, STATUS_CONFLICT, STATUS_INVALID, STATUS_NOT_FOUND, STATUS_OK,
@@ -16,6 +16,7 @@ use std::sync::{
 };
 
 const DEFAULT_MAX_LISTEN_PER_CLIENT: usize = 64;
+const DEFAULT_MAX_WATCH_PER_CLIENT: usize = 16;
 const DEFAULT_MAX_LISTENERS: usize = 1024;
 const DEFAULT_MAX_PER_CLIENT: usize = 64;
 const DEFAULT_MAX_CONNECTED: usize = 128;
@@ -32,6 +33,18 @@ struct Listener {
     name: String,
     metadata: Vec<u8>,
     token: [u8; 16],
+}
+
+/// One endpoint following a fixed set of names.
+///
+/// `published` is the exact last packet this watch was sent, which is what
+/// makes a watch quiet: the registry changes for reasons a watcher never asked
+/// about — every extension attempt mints and drops a command listener — and a
+/// change that leaves this watch's answer byte-identical publishes nothing.
+#[derive(Clone, Debug)]
+struct Watch {
+    names: Vec<String>,
+    published: Vec<u8>,
 }
 
 /// Immutable listener identity used to fence extension command publication.
@@ -175,6 +188,7 @@ impl Drop for DrainReservation {
 #[derive(Clone, Copy, Debug)]
 struct Limits {
     listen_per_client: usize,
+    watch_per_client: usize,
     listeners: usize,
     handles_per_client: usize,
     connected_pairs: usize,
@@ -185,6 +199,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             listen_per_client: DEFAULT_MAX_LISTEN_PER_CLIENT,
+            watch_per_client: DEFAULT_MAX_WATCH_PER_CLIENT,
             listeners: DEFAULT_MAX_LISTENERS,
             handles_per_client: DEFAULT_MAX_PER_CLIENT,
             connected_pairs: DEFAULT_MAX_CONNECTED,
@@ -200,6 +215,10 @@ impl Limits {
             listen_per_client: crate::deployment_usize(
                 "BLIT_CHANNEL_MAX_LISTEN_PER_CLIENT",
                 defaults.listen_per_client,
+            ),
+            watch_per_client: crate::deployment_usize(
+                "BLIT_CHANNEL_MAX_WATCH_PER_CLIENT",
+                defaults.watch_per_client,
             ),
             listeners: crate::deployment_usize("BLIT_CHANNEL_MAX_LISTENERS", defaults.listeners),
             handles_per_client: crate::deployment_usize(
@@ -260,6 +279,13 @@ pub(crate) struct ChannelFabric {
     listener_names: HashMap<String, ChannelKey>,
     listeners: HashMap<ChannelKey, Listener>,
     handles: HashMap<ChannelKey, Handle>,
+    watches: HashMap<ChannelKey, Watch>,
+    /// Bumped by every change to `listener_names`. Watches are answered from
+    /// the registry, and the registry only moves when a name is claimed or
+    /// released — comparing this against `published_revision` keeps a busy
+    /// channel's DATA and ACK traffic from rebuilding every watcher's answer.
+    names_revision: u64,
+    published_revision: u64,
     /// Connected-handle slots include live handles and terminal handles whose
     /// already-emitted frames have not drained from their endpoint writer.
     endpoint_slots: Arc<Mutex<HashMap<u64, usize>>>,
@@ -282,6 +308,9 @@ impl ChannelFabric {
             listener_names: HashMap::new(),
             listeners: HashMap::new(),
             handles: HashMap::new(),
+            watches: HashMap::new(),
+            names_revision: 0,
+            published_revision: 0,
             endpoint_slots: Arc::new(Mutex::new(HashMap::new())),
             draining: Arc::new(Mutex::new(HashSet::new())),
             active_pairs: Arc::new(AtomicUsize::new(0)),
@@ -357,6 +386,20 @@ impl ChannelFabric {
         request: ChannelRequest<'_>,
         reserve_outbox: &mut impl FnMut(u64, usize) -> Option<OutboxReservation>,
     ) -> Vec<Delivery> {
+        let mut deliveries = self.apply(endpoint, request, reserve_outbox);
+        // Every request that claims or releases a name passes through here, so
+        // this is the one place watches are answered from — including watches
+        // held by endpoints the requester has never heard of.
+        deliveries.extend(self.publish_names(reserve_outbox));
+        deliveries
+    }
+
+    fn apply(
+        &mut self,
+        endpoint: u64,
+        request: ChannelRequest<'_>,
+        reserve_outbox: &mut impl FnMut(u64, usize) -> Option<OutboxReservation>,
+    ) -> Vec<Delivery> {
         match request {
             ChannelRequest::Listen {
                 channel_id,
@@ -384,6 +427,16 @@ impl ChannelFabric {
             ChannelRequest::Close { channel_id, reason } => {
                 self.close(endpoint, channel_id, reason)
             }
+            ChannelRequest::Watch { channel_id, names } => {
+                self.watch(endpoint, channel_id, &names, reserve_outbox)
+            }
+            ChannelRequest::Unwatch { channel_id } => {
+                self.watches.remove(&ChannelKey {
+                    endpoint,
+                    channel_id,
+                });
+                Vec::new()
+            }
         }
     }
 
@@ -404,7 +457,9 @@ impl ChannelFabric {
     pub(crate) fn refuse(&self, endpoint: u64, kind: u8, channel_id: u32) -> Vec<Delivery> {
         if matches!(
             kind,
-            blit_remote::channel::CHANNEL_LISTEN | blit_remote::channel::CHANNEL_CONNECT
+            blit_remote::channel::CHANNEL_LISTEN
+                | blit_remote::channel::CHANNEL_CONNECT
+                | blit_remote::channel::CHANNEL_WATCH
         ) {
             vec![self.failed_open(
                 endpoint,
@@ -430,7 +485,9 @@ impl ChannelFabric {
     ) -> Vec<Delivery> {
         if matches!(
             kind,
-            blit_remote::channel::CHANNEL_LISTEN | blit_remote::channel::CHANNEL_CONNECT
+            blit_remote::channel::CHANNEL_LISTEN
+                | blit_remote::channel::CHANNEL_CONNECT
+                | blit_remote::channel::CHANNEL_WATCH
         ) {
             vec![self.failed_open(endpoint, channel_id, STATUS_INVALID, detail)]
         } else {
@@ -497,6 +554,7 @@ impl ChannelFabric {
         delivery.outbox_reservation = Some(outbox_reservation);
 
         self.next_listener_generation = generation;
+        self.names_revision = self.names_revision.wrapping_add(1);
         self.listener_names.insert(name.to_owned(), key);
         self.listeners.insert(
             key,
@@ -507,6 +565,117 @@ impl ChannelFabric {
             },
         );
         vec![delivery]
+    }
+
+    /// Start following a name set, answering with the state it has right now.
+    ///
+    /// The immediate answer is the whole reason a watch needs no separate
+    /// acknowledgement: a client that receives it knows both that the watch
+    /// exists and what the registry holds, which is exactly what a
+    /// connect-and-close probe used to tell it once.
+    fn watch(
+        &mut self,
+        endpoint: u64,
+        channel_id: u32,
+        names: &[&str],
+        reserve_outbox: &mut impl FnMut(u64, usize) -> Option<OutboxReservation>,
+    ) -> Vec<Delivery> {
+        let key = ChannelKey {
+            endpoint,
+            channel_id,
+        };
+        if self.key_is_live(key) {
+            return vec![self.failed_open(
+                endpoint,
+                channel_id,
+                STATUS_CONFLICT,
+                "channel id is already live",
+            )];
+        }
+        if self.watch_count(endpoint) >= self.limits.watch_per_client {
+            return vec![self.failed_open(
+                endpoint,
+                channel_id,
+                STATUS_BUDGET,
+                "channel watch budget exhausted",
+            )];
+        }
+        let present: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| self.listener_names.contains_key(*name))
+            .collect();
+        let packet = msg_channel_names(channel_id, &present)
+            .expect("validated watch names obey fixed limits");
+        let Some(outbox_reservation) = reserve_outbox(endpoint, packet.len()) else {
+            // Hard outbox admission cancelled the endpoint; nothing was
+            // published and the client-created ID stays free.
+            return Vec::new();
+        };
+        self.watches.insert(
+            key,
+            Watch {
+                names: names.iter().map(|name| (*name).to_owned()).collect(),
+                published: packet.clone(),
+            },
+        );
+        vec![Delivery {
+            endpoint,
+            packet,
+            _reservation: None,
+            _slot: None,
+            _drain: None,
+            outbox_reservation: Some(outbox_reservation),
+        }]
+    }
+
+    /// Re-answer every watch whose set of claimed names moved.
+    ///
+    /// A watch that cannot be given its packet keeps the one it last published,
+    /// so the next registry change tries again rather than leaving the watcher
+    /// permanently behind — and an endpoint whose outbox refuses a packet this
+    /// small is already being cancelled.
+    fn publish_names(
+        &mut self,
+        reserve_outbox: &mut impl FnMut(u64, usize) -> Option<OutboxReservation>,
+    ) -> Vec<Delivery> {
+        if self.names_revision == self.published_revision || self.watches.is_empty() {
+            self.published_revision = self.names_revision;
+            return Vec::new();
+        }
+        self.published_revision = self.names_revision;
+        let keys: Vec<ChannelKey> = self.watches.keys().copied().collect();
+        let mut deliveries = Vec::new();
+        for key in keys {
+            let watch = self.watches.get(&key).expect("key came from the map");
+            let present: Vec<&str> = watch
+                .names
+                .iter()
+                .filter(|name| self.listener_names.contains_key(name.as_str()))
+                .map(String::as_str)
+                .collect();
+            let packet = msg_channel_names(key.channel_id, &present)
+                .expect("validated watch names obey fixed limits");
+            if watch.published == packet {
+                continue;
+            }
+            let Some(outbox_reservation) = reserve_outbox(key.endpoint, packet.len()) else {
+                continue;
+            };
+            self.watches
+                .get_mut(&key)
+                .expect("key came from the map")
+                .published = packet.clone();
+            deliveries.push(Delivery {
+                endpoint: key.endpoint,
+                packet,
+                _reservation: None,
+                _slot: None,
+                _drain: None,
+                outbox_reservation: Some(outbox_reservation),
+            });
+        }
+        deliveries
     }
 
     fn connect(
@@ -816,9 +985,20 @@ impl ChannelFabric {
     }
 
     /// Remove every object owned by a departing endpoint and notify surviving
-    /// channel peers. Already accepted pairs are independent of listeners.
-    pub(crate) fn close_endpoint(&mut self, endpoint: u64) -> Vec<Delivery> {
+    /// channel peers and watchers. Already accepted pairs are independent of
+    /// listeners.
+    ///
+    /// This is where an extension's names are actually released: disabling or
+    /// removing a definition cancels its attempt, and the attempt's endpoint
+    /// closes here a beat later. A watcher therefore learns that a name is
+    /// gone from the teardown, never from the control call that started it.
+    pub(crate) fn close_endpoint_reserved(
+        &mut self,
+        endpoint: u64,
+        mut reserve_outbox: impl FnMut(u64, usize) -> Option<OutboxReservation>,
+    ) -> Vec<Delivery> {
         self.peer_names.remove(&endpoint);
+        self.watches.retain(|key, _| key.endpoint != endpoint);
         let listener_keys: Vec<_> = self
             .listeners
             .keys()
@@ -859,7 +1039,15 @@ impl ChannelFabric {
                 }
             }
         }
+        deliveries.extend(self.publish_names(&mut reserve_outbox));
         deliveries
+    }
+
+    #[cfg(test)]
+    fn close_endpoint(&mut self, endpoint: u64) -> Vec<Delivery> {
+        self.close_endpoint_reserved(endpoint, |_, bytes| {
+            Some(OutboxReservation::untracked(bytes))
+        })
     }
 
     fn close_pair(
@@ -911,6 +1099,7 @@ impl ChannelFabric {
     fn remove_listener(&mut self, key: ChannelKey) {
         if let Some(listener) = self.listeners.remove(&key) {
             self.listener_names.remove(&listener.name);
+            self.names_revision = self.names_revision.wrapping_add(1);
         }
     }
 
@@ -922,6 +1111,13 @@ impl ChannelFabric {
 
     fn listener_count(&self, endpoint: u64) -> usize {
         self.listeners
+            .keys()
+            .filter(|key| key.endpoint == endpoint)
+            .count()
+    }
+
+    fn watch_count(&self, endpoint: u64) -> usize {
+        self.watches
             .keys()
             .filter(|key| key.endpoint == endpoint)
             .count()
@@ -1029,6 +1225,7 @@ impl ChannelFabric {
     fn key_is_live(&self, key: ChannelKey) -> bool {
         self.listeners.contains_key(&key)
             || self.handles.contains_key(&key)
+            || self.watches.contains_key(&key)
             || self
                 .draining
                 .lock()
@@ -1131,7 +1328,7 @@ mod tests {
     use super::*;
     use blit_remote::channel::{
         CHANNEL_CLOSE_CANCELLED, ChannelMessage, msg_channel_connect, msg_channel_listen,
-        parse_channel_message,
+        msg_channel_unwatch, msg_channel_watch, parse_channel_message,
     };
 
     fn fabric() -> ChannelFabric {
@@ -1767,5 +1964,122 @@ mod tests {
 
         assert!(fabric.close_endpoint(1).is_empty());
         assert!(fabric.listeners.is_empty());
+    }
+
+    /// Every name state a watcher can be told about, in one life: what is
+    /// already claimed when it asks, a claim by a stranger, and a release the
+    /// watcher never sees a request for.
+    #[test]
+    fn watch_answers_now_and_on_every_later_change() {
+        let mut fabric = fabric();
+        listen(&mut fabric, 1, 2, "blit.session.v1");
+
+        let opened = fabric.handle_packet(
+            9,
+            &msg_channel_watch(2, &["blit.session.v1", "blit.systemd.v1"]).unwrap(),
+        );
+        assert_eq!(watched_names(&opened[0]), vec!["blit.session.v1"]);
+
+        let appeared =
+            fabric.handle_packet(3, &msg_channel_listen(2, "blit.systemd.v1", b"").unwrap());
+        assert_eq!(appeared.len(), 2, "the listener's OPENED and the watch");
+        assert_eq!(appeared[1].endpoint, 9);
+        assert_eq!(
+            watched_names(&appeared[1]),
+            vec!["blit.session.v1", "blit.systemd.v1"]
+        );
+
+        // The extension goes away the only way one does: its endpoint closes.
+        let departed = fabric.close_endpoint(3);
+        assert_eq!(departed.len(), 1);
+        assert_eq!(watched_names(&departed[0]), vec!["blit.session.v1"]);
+    }
+
+    #[test]
+    fn watch_is_silent_about_names_it_did_not_declare() {
+        let mut fabric = fabric();
+        let opened = fabric.handle_packet(9, &msg_channel_watch(2, &["blit.session.v1"]).unwrap());
+        assert_eq!(watched_names(&opened[0]), Vec::<&str>::new());
+
+        // The command listeners every extension attempt mints look exactly
+        // like this, and a watcher must not hear a packet for each one.
+        let unrelated =
+            fabric.handle_packet(3, &msg_channel_listen(2, "blit.cli.7.1", b"").unwrap());
+        assert_eq!(unrelated.len(), 1, "only the listener's own OPENED");
+        assert_eq!(unrelated[0].endpoint, 3);
+
+        let declared =
+            fabric.handle_packet(4, &msg_channel_listen(2, "blit.session.v1", b"").unwrap());
+        assert_eq!(declared.len(), 2);
+        assert_eq!(watched_names(&declared[1]), vec!["blit.session.v1"]);
+
+        // And the unrelated listener leaving is just as quiet as its arrival.
+        assert!(fabric.close_endpoint(3).is_empty());
+    }
+
+    #[test]
+    fn unwatch_stops_the_publishing_and_frees_the_id() {
+        let mut fabric = fabric();
+        fabric.handle_packet(9, &msg_channel_watch(2, &["blit.session.v1"]).unwrap());
+        assert!(fabric.key_is_live(ChannelKey {
+            endpoint: 9,
+            channel_id: 2,
+        }));
+
+        assert!(
+            fabric
+                .handle_packet(9, &msg_channel_unwatch(2).unwrap())
+                .is_empty(),
+            "an unwatch draws no reply"
+        );
+        assert!(!fabric.key_is_live(ChannelKey {
+            endpoint: 9,
+            channel_id: 2,
+        }));
+
+        let claimed =
+            fabric.handle_packet(1, &msg_channel_listen(2, "blit.session.v1", b"").unwrap());
+        assert_eq!(claimed.len(), 1, "nothing is watching that name");
+
+        // The freed ID is usable as an ordinary channel, which is why a watch
+        // has to occupy the same ID space as one.
+        listen(&mut fabric, 9, 2, "watcher.turned.listener");
+    }
+
+    #[test]
+    fn a_watch_cannot_take_a_live_id_or_outgrow_its_budget() {
+        let mut fabric = fabric();
+        listen(&mut fabric, 9, 2, "already.here");
+        let conflict =
+            fabric.handle_packet(9, &msg_channel_watch(2, &["blit.session.v1"]).unwrap());
+        assert!(matches!(
+            parse_channel_message(&conflict[0].packet).unwrap(),
+            Some(ChannelMessage::Opened {
+                status: STATUS_CONFLICT,
+                ..
+            })
+        ));
+
+        fabric.limits.watch_per_client = 1;
+        fabric.handle_packet(8, &msg_channel_watch(2, &["blit.session.v1"]).unwrap());
+        let exhausted =
+            fabric.handle_packet(8, &msg_channel_watch(4, &["blit.systemd.v1"]).unwrap());
+        assert!(matches!(
+            parse_channel_message(&exhausted[0].packet).unwrap(),
+            Some(ChannelMessage::Opened {
+                status: STATUS_BUDGET,
+                ..
+            })
+        ));
+        assert_eq!(fabric.watch_count(8), 1);
+    }
+
+    fn watched_names(delivery: &Delivery) -> Vec<&str> {
+        let Some(ChannelMessage::Names { names, .. }) =
+            parse_channel_message(&delivery.packet).unwrap()
+        else {
+            panic!("delivery is not a NAMES packet")
+        };
+        names
     }
 }

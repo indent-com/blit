@@ -1,8 +1,98 @@
 //! The environment every GUI application in a session inherits.
 //!
-//! Shared by the PTYs (where a user types the app's name) and the private
-//! D-Bus session (where an activated service is launched on their behalf), so
-//! an app reaches the same display either way.
+//! Shared by the PTYs (where a user types the app's name), the private D-Bus
+//! session (where an activated service is launched on their behalf), and native
+//! children spawned with `PROCESS_SPAWN_SESSION_ENV`, so an app reaches the same
+//! display however it was started.
+
+/// The session-scoped environment a GUI child needs.
+///
+/// Two halves, because the variables that must be *absent* matter as much as the
+/// ones that must be present: a child that inherits the host session's `DISPLAY`
+/// will happily pick X11 and come up with no window at all. `build_child_env`
+/// applies `remove` by filtering as it assembles a fresh envp; `Command`-based
+/// spawns apply it with `env_remove`.
+#[derive(Debug, Default, Clone)]
+pub struct SessionEnv {
+    /// Variables to set, last-write-wins against anything inherited.
+    pub set: Vec<(String, String)>,
+    /// Variables belonging to the host session, which must not leak through.
+    pub remove: Vec<&'static str>,
+}
+
+/// Resolve the session environment from the handles a live session holds.
+///
+/// `TERM`/`COLORTERM` are deliberately *not* here: they describe a terminal, and
+/// a native pipe child does not have one.
+pub fn session_env(
+    wayland_display: Option<&str>,
+    x_display: Option<&str>,
+    desktop_bus: Option<&str>,
+    pulse_server: Option<&str>,
+    pipewire_remote: Option<&str>,
+) -> SessionEnv {
+    let mut env = SessionEnv::default();
+    let mut set = |key: &str, value: String| env.set.push((key.to_string(), value));
+
+    if let Some(wd) = wayland_display {
+        let wd_path = std::path::Path::new(wd);
+        if let Some(dir) = wd_path.parent() {
+            let inherited = std::env::var_os("XDG_RUNTIME_DIR");
+            let differs = match &inherited {
+                Some(current) => std::path::Path::new(current) != dir,
+                None => true,
+            };
+            if differs {
+                set("XDG_RUNTIME_DIR", dir.to_string_lossy().into_owned());
+            }
+        }
+        // WAYLAND_DISPLAY must be just the socket filename (e.g. "wayland-2"),
+        // not a full path.  Clients resolve it under XDG_RUNTIME_DIR.
+        let name = wd_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| wd.to_string());
+        set("WAYLAND_DISPLAY", name);
+        for (key, value) in toolkit_env(x_display) {
+            set(key, value);
+        }
+    }
+    // The host's display belongs to a different session. `toolkit_env` names
+    // this one when a bridge is listening; with no bridge the variable has to
+    // go, or a toolkit offered "wayland,x11" reaches for an X server that has
+    // nothing to do with blit.
+    if x_display.is_none() {
+        env.remove.push("DISPLAY");
+    }
+    // Likewise both buses: the server's own and the host desktop's each belong
+    // elsewhere. The compositor-scoped bus activates portals on this Wayland
+    // display while still satisfying apps (notably Spotify) that require a bus.
+    env.remove.push("DBUS_SYSTEM_BUS_ADDRESS");
+    if let Some(address) = desktop_bus {
+        set("DBUS_SESSION_BUS_ADDRESS", address.to_string());
+    } else {
+        env.remove.push("DBUS_SESSION_BUS_ADDRESS");
+    }
+    if let Some(server) = pulse_server {
+        set("PULSE_SERVER", server.to_string());
+    } else {
+        // No audio pipeline — point PULSE_SERVER at a path that will make
+        // libpulse fail immediately.  Without this, libpulse falls back to
+        // autospawn (`pulseaudio --start`) which hangs in headless /
+        // container environments.  Setting PULSE_SERVER explicitly also
+        // prevents inheriting a host PulseAudio server that would bypass
+        // blit's audio pipeline.
+        set("PULSE_SERVER", "/dev/null".to_string());
+    }
+    // Absolute, so it works regardless of the child's XDG_RUNTIME_DIR (which
+    // points at the Wayland socket directory).
+    if let Some(remote) = pipewire_remote {
+        set("PIPEWIRE_REMOTE", remote.to_string());
+    } else {
+        env.remove.push("PIPEWIRE_REMOTE");
+    }
+    env
+}
 
 /// Toolkit steering for apps on blit's compositor.
 ///

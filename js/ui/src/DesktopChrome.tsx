@@ -44,9 +44,12 @@ import {
   desktopDelivery,
   desktopNativeTag,
   canRaiseMpris,
+  canSeekMpris,
   desktopNotificationHasDetail,
   matchesDesktopNotification,
+  mprisHasProgress,
   mprisMediaSessionKey,
+  mprisSeekTargetUs,
   popupViewportShift,
   portalDialogFocusTarget,
   reconcileMprisSubscriptions,
@@ -284,13 +287,15 @@ function MprisChrome(props: {
   });
   onCleanup(() => reconcileMprisSubscriptions(mprisSubscriptions, []));
 
-  const act = (entry: MprisEntry, action: MprisAction) => {
-    if (entry.readOnly) return;
+  /** Resolves once the server has answered, however it answered: a caller that
+   *  showed the action as already taken needs to know when to stop. */
+  const act = (entry: MprisEntry, action: MprisAction): Promise<void> => {
+    if (entry.readOnly) return Promise.resolve();
     const pending = props.workspace
       .getConnection(entry.connectionId)
       ?.mprisStore.act(entry.player.playerId, action);
-    if (!pending) return;
-    void pending
+    if (!pending) return Promise.resolve();
+    return pending
       .then(() => {
         if (action.kind === "select") {
           setManualMediaSessionKey(mprisMediaSessionKey(entry));
@@ -302,6 +307,21 @@ function MprisChrome(props: {
     !entry.readOnly &&
     (entry.player.capabilityFlags & (MPRIS_CAN_CONTROL | flag)) ===
       (MPRIS_CAN_CONTROL | flag);
+
+  // Elapsed time has to be redrawn on a clock of our own. Position is the one
+  // MPRIS property players do not announce -- the spec excludes it from
+  // PropertiesChanged -- so the store's extrapolation is correct but nothing
+  // ever asks it for a new answer. Ticking only while the list is open and
+  // something is actually running keeps a paused, or unwatched, popup at rest.
+  const [tick, setTick] = createSignal(0);
+  const anyPlaying = createMemo(() =>
+    players().some((entry) => entry.player.playbackStatus === "playing"),
+  );
+  createEffect(() => {
+    if (!open() || !anyPlaying()) return;
+    const timer = setInterval(() => setTick((value) => value + 1), 250);
+    onCleanup(() => clearInterval(timer));
+  });
 
   // WebKit picks Now Playing artwork out of the array by `sizes` and shows
   // nothing when no entry declares one, so a cover without it reaches iPadOS as
@@ -565,6 +585,47 @@ function MprisChrome(props: {
               <For each={players()}>
                 {(entry) => {
                   const art = () => artworkUrl(entry.player.artwork);
+                  // A drag owns the bar for exactly as long as this row lives.
+                  // An upsert rebuilds the row and so discards the scrub, which
+                  // is the outcome to want: whatever the server just reported
+                  // is newer than a position nobody is still holding, and it
+                  // leaves no way for an abandoned drag to freeze the readout.
+                  const [scrubUs, setScrubUs] = createSignal<number>();
+                  const positionUs = () => {
+                    const held = scrubUs();
+                    if (held !== undefined) return held;
+                    tick();
+                    return (
+                      props.workspace
+                        .getConnection(entry.connectionId)
+                        ?.mprisStore.positionUs(entry.player.playerId) ??
+                      entry.player.positionUs
+                    );
+                  };
+                  const seekable = () =>
+                    canSeekMpris(
+                      entry.readOnly,
+                      entry.player.capabilityFlags,
+                      entry.player.lengthUs,
+                    );
+                  // The scrub stays shown until the server answers, so the
+                  // handle does not flick back to where the track was while
+                  // the seek is in flight. The bridge re-reads and pushes the
+                  // new position before it replies, so by the time this
+                  // releases there is a truthful position to fall back to.
+                  const seek = async (value: number) => {
+                    const target = mprisSeekTargetUs(
+                      value,
+                      entry.player.lengthUs,
+                    );
+                    setScrubUs(target);
+                    await act(entry, {
+                      kind: "setPosition",
+                      positionUs: target,
+                      trackRevision: entry.player.trackRevision,
+                    });
+                    setScrubUs(undefined);
+                  };
                   return (
                     <article
                       style={{
@@ -625,23 +686,6 @@ function MprisChrome(props: {
                             .filter(Boolean)
                             .join(" · ")}
                         </small>
-                        <Show when={entry.player.lengthUs >= 0}>
-                          <small
-                            style={{
-                              display: "block",
-                              color: props.theme.dimFg,
-                            }}
-                          >
-                            {mediaTime(
-                              props.workspace
-                                .getConnection(entry.connectionId)
-                                ?.mprisStore.positionUs(
-                                  entry.player.playerId,
-                                ) ?? entry.player.positionUs,
-                            )}{" "}
-                            / {mediaTime(entry.player.lengthUs)}
-                          </small>
-                        </Show>
                       </button>
                       <span
                         style={{
@@ -665,6 +709,56 @@ function MprisChrome(props: {
                           </button>
                         </Show>
                       </span>
+                      <Show when={mprisHasProgress(entry.player.lengthUs)}>
+                        {/* Its own row under the text, not beside it: a bar
+                            squeezed into the title column would be too short
+                            to aim with on the phone this popup also serves. */}
+                        <div
+                          style={{
+                            "grid-column": "2 / -1",
+                            display: "flex",
+                            "align-items": "center",
+                            gap: `${props.scale.tightGap}px`,
+                            color: props.theme.dimFg,
+                            "font-size": `${props.scale.sm}px`,
+                          }}
+                        >
+                          <span
+                            style={{ "font-variant-numeric": "tabular-nums" }}
+                          >
+                            {mediaTime(positionUs())}
+                          </span>
+                          <input
+                            type="range"
+                            min={0}
+                            max={entry.player.lengthUs}
+                            step={1_000}
+                            value={positionUs()}
+                            disabled={!seekable()}
+                            title={t("desktop.mediaSeek")}
+                            aria-label={t("desktop.mediaSeek")}
+                            aria-valuetext={`${mediaTime(positionUs())} / ${mediaTime(entry.player.lengthUs)}`}
+                            onInput={(event) =>
+                              setScrubUs(Number(event.currentTarget.value))
+                            }
+                            onChange={(event) =>
+                              void seek(Number(event.currentTarget.value))
+                            }
+                            style={{
+                              flex: 1,
+                              "min-width": 0,
+                              margin: 0,
+                              "accent-color": props.theme.fg,
+                              cursor: seekable() ? "pointer" : "default",
+                            }}
+                          />
+                          <span
+                            style={{ "font-variant-numeric": "tabular-nums" }}
+                          >
+                            {mediaTime(entry.player.lengthUs)}
+                          </span>
+                        </div>
+                      </Show>
                     </article>
                   );
                 }}

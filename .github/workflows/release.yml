@@ -40,8 +40,25 @@ jobs:
     with:
       upload: true
 
+  # Wasm is architecture-independent, so one leg builds the extension modules
+  # every platform's release points at.
+  build-extensions:
+    needs: [verify-tag]
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: ./bin/extensions
+      - uses: actions/upload-artifact@v7
+        with:
+          name: extensions
+          path: |
+            extensions/dist/*.wasm
+            extensions/dist/manifest.json
+
   release:
-    needs: [build-packages, build-windows]
+    needs: [build-packages, build-windows, build-extensions]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/download-artifact@v8
@@ -61,12 +78,21 @@ jobs:
           name: windows-x86_64
           path: windows
 
+      - uses: actions/download-artifact@v8
+        with:
+          name: extensions
+          path: extensions
+
       - name: List artifacts
         run: |
           ls -lh debs/
           ls -lh tarballs/
           ls -lh windows/
+          ls -lh extensions/
 
+      # Release assets are the durable home for a module: Pages only ever
+      # serves the current release, so a `#digest` pin outlives its version
+      # here and nowhere else.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -74,6 +100,8 @@ jobs:
             debs/*.deb
             tarballs/*.tar.gz
             windows/*.zip
+            extensions/*.wasm
+            extensions/manifest.json
           generate_release_notes: true
 
   publish-crates:
@@ -144,7 +172,7 @@ jobs:
           client-payload: '{"version": "${{ github.ref_name }}"}'
 
   apt-repo:
-    needs: [build-packages, build-windows]
+    needs: [build-packages, build-windows, build-extensions]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
@@ -165,6 +193,11 @@ jobs:
         with:
           name: windows-x86_64
           path: windows
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: extensions
+          path: extensions
 
       - name: Import GPG key
         run: echo "$GPG_PRIVATE_KEY" | gpg --batch --import
@@ -188,6 +221,15 @@ jobs:
           for f in windows/*.zip; do
             cp "$f" repo/bin/
           done
+
+          # Extension modules, for `blit ext run https://install.blit.sh/ext/…`.
+          # Like repo/bin, this is the current release only: Pages publishes
+          # the tree wholesale, so an older module's URL stops resolving. The
+          # manifest carries each module's BLAKE3, which is what a `#digest`
+          # pin needs and what the GitHub Release keeps forever.
+          mkdir -p repo/ext
+          cp extensions/*.wasm repo/ext/
+          cp extensions/manifest.json repo/ext/manifest.json
 
           # Write version to /latest
           echo "${GITHUB_REF_NAME#v}" > repo/latest

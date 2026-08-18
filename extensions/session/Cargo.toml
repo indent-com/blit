@@ -1,0 +1,23 @@
+[package]
+name = "blit-ext-session"
+description = "Autostart and supervise GUI applications in a Blit session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# The published object is `session.wasm`; the crate name only matters to cargo.
+[[bin]]
+name = "session"
+path = "src/main.rs"
+
+# Desktop-entry parsing and the supervisor's bookkeeping are a library so they
+# can be tested on the host — the field-code, quoting, and backoff rules are
+# where the bugs live, and none of them need a running session to exercise.
+[lib]
+name = "blit_ext_session"
+path = "src/lib.rs"
+
+[dependencies]
+blit-guest.workspace = true

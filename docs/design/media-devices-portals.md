@@ -1201,6 +1201,9 @@ The full UI:
   title, app ID, size, and thumbnail;
 - shows a compact active-player row plus an expanded bounded list of all MPRIS
   players, with controls disabled exactly when their capabilities are absent;
+- draws a progress bar for every player of known length, advancing it from the
+  extrapolated position on a clock of its own while the list is open, and
+  accepts a scrub as `SetPosition` only where CanSeek accompanies CanControl;
 - coordinates the selected writable player with browser Media Session and
   revokes every old action handler when selection changes;
 - keeps device labels local to the browser and never sends them to the server;

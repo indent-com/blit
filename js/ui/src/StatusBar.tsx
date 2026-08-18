@@ -87,6 +87,12 @@ type DebugStats = {
     rebuffers: number;
     shrinks: number;
     skips: number;
+    skippedMs: number;
+    resets: number;
+    outputLatencyMs: number;
+    baseLatencyMs: number;
+    sampleRate: number;
+    deviceFloorMs: number;
     received: number;
     decoded: number;
     fastPath: string;
@@ -1443,13 +1449,40 @@ function DebugPanel(props: {
       {/* Audio jitter buffer. `peak` above `now` is the whole diagnosis: the
           link needed that headroom, and the decay has since handed it back —
           which is why occasional glitches keep recurring rather than the
-          buffer settling somewhere that survives them. */}
+          buffer settling somewhere that survives them.
+
+          The second row is the audio that was thrown away rather than run out
+          of, and it exists because the first cannot explain a glitch on its
+          own: a buffer that runs deep gets cut back by a skip, and a rebuilt
+          pipeline restarts from empty — both audible, both invisible to the
+          underrun count. Constant dropouts against zero underruns is the
+          normal reading for a link that arrives late in bursts rather than
+          one that is starved, and this is where that shows up. */}
       <Show when={stats().audioBuffer}>
         {(audio) => (
-          <Row
-            label="Audio buffer"
-            value={`${audio().targetMs} ms now, ${audio().peakMs} ms peak · ${audio().underruns} underruns, ${audio().rebuffers} rebuffers · ${audio().decoded}/${audio().received} decoded · via ${audio().fastPath}`}
-          />
+          <>
+            <Row
+              label="Audio buffer"
+              value={`${audio().targetMs} ms now, ${audio().peakMs} ms peak · ${audio().underruns} underruns, ${audio().rebuffers} rebuffers · ${audio().decoded}/${audio().received} decoded · via ${audio().fastPath}`}
+            />
+            <Row
+              label="Audio dropped"
+              value={`${audio().skips} skips (${audio().skippedMs} ms) · ${audio().resets} pipeline resets`}
+            />
+            {/* Which sink produced the numbers above. A wired device reports
+                single-digit output latency; Bluetooth reports hundreds of ms
+                and asks for audio in bites that large, which a 60 ms target
+                cannot survive. Without this the two cases are indistinguishable
+                in the rows above. */}
+            <Row
+              label="Audio output"
+              value={
+                audio().sampleRate === 0
+                  ? "no context"
+                  : `${audio().outputLatencyMs} ms out, ${audio().baseLatencyMs} ms base · ${audio().sampleRate} Hz · floor ${audio().deviceFloorMs} ms`
+              }
+            />
+          </>
         )}
       </Show>
       <Row label="Display Hz" value={stats().displayFps} />

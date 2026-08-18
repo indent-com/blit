@@ -1,0 +1,65 @@
+#!/usr/bin/env node
+/**
+ * Serve `extensions/dist` as an extension registry, the way
+ * https://install.blit.sh/ext serves one: `manifest.json` plus the modules it
+ * names, with CORS open so a page on the vite dev port can install from it.
+ *
+ * Node rather than a static-file package because the dev shell has node and
+ * nothing else guaranteed — no python3 — and this is thirty lines.
+ *
+ *   bin/ext-registry [port] [directory]
+ */
+
+import { createReadStream, statSync } from "node:fs";
+import { createServer } from "node:http";
+import { extname, join, normalize, resolve } from "node:path";
+
+const port = Number(process.argv[2] ?? process.env.BLIT_DEV_EXT_PORT ?? 10003);
+const root = resolve(process.argv[3] ?? "extensions/dist");
+
+const TYPES = {
+  ".wasm": "application/wasm",
+  ".json": "application/json",
+  ".br": "application/octet-stream",
+};
+
+createServer((request, response) => {
+  const cors = {
+    "access-control-allow-origin": "*",
+    "access-control-allow-headers": "*",
+  };
+  if (request.method === "OPTIONS") {
+    response.writeHead(204, cors).end();
+    return;
+  }
+  // Everything under the root, and nothing above it: a leading `..` in the
+  // request path must not be able to name the rest of the checkout.
+  const requested = decodeURIComponent(
+    new URL(request.url ?? "/", "http://localhost").pathname,
+  );
+  const path = join(root, normalize(requested).replace(/^(\.\.[/\\])+/, ""));
+  if (!path.startsWith(root)) {
+    response.writeHead(403, cors).end("forbidden\n");
+    return;
+  }
+  let size;
+  try {
+    const stat = statSync(path);
+    if (!stat.isFile()) throw new Error("not a file");
+    size = stat.size;
+  } catch {
+    response.writeHead(404, cors).end("not found\n");
+    return;
+  }
+  response.writeHead(200, {
+    ...cors,
+    "content-type": TYPES[extname(path)] ?? "application/octet-stream",
+    "content-length": String(size),
+    // The digest is the identity, so a stale copy is a wrong install rather
+    // than an old one. In a dev stack the modules are rebuilt constantly.
+    "cache-control": "no-store",
+  });
+  createReadStream(path).pipe(response);
+}).listen(port, () => {
+  console.log(`extension registry: http://127.0.0.1:${port} -> ${root}`);
+});

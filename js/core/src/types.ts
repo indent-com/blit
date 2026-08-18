@@ -166,6 +166,24 @@ export interface BlitClientAuxSubscription {
   id: number;
 }
 
+/** What opened a connection, as the server accounts for it. */
+export type BlitClientOrigin =
+  | { kind: "network" }
+  | {
+      kind: "extension";
+      extensionId: bigint;
+      definitionRevision: bigint;
+      attempt: bigint;
+      taskId: number;
+      /** The durable name of a persistent definition, the label a transient
+       *  `ext run` carried, or empty when it had neither. */
+      name: string;
+    }
+  /** A kind this build has no name for. Still worth showing as "not an
+   *  ordinary client" — it is one thing to not know what a connection is, and
+   *  another to call it a browser. */
+  | { kind: "unknown"; originKind: number };
+
 export interface BlitClientInfo {
   id: bigint;
   /** Whole seconds since the server accepted the connection. */
@@ -179,6 +197,9 @@ export interface BlitClientInfo {
   subscriptions: readonly BlitClientAuxSubscription[];
   terminals: readonly BlitClientTerminalSubscription[];
   surfaces: readonly BlitClientSurfaceSubscription[];
+  /** Null when the server predates `FEATURE_CLIENT_ORIGIN`, which is not the
+   *  same as an ordinary client: nothing was asked, so nothing is claimed. */
+  origin: BlitClientOrigin | null;
 }
 
 /** Snapshot returned by listClients or a live subscribeClients callback. */
@@ -213,6 +234,11 @@ export interface BlitConnectionSnapshot {
   supportsDesktop: boolean;
   /** Server supports process-global named bidirectional channels. */
   supportsChannels: boolean;
+  /** Server pushes which channel names have a listener, so a client can watch
+   *  an extension appear and go away rather than probe for it once. */
+  supportsChannelWatch: boolean;
+  /** The server admits Wasmi extensions (docs/design/extensions.md). */
+  supportsExtensions: boolean;
   /** Server understands viewer media, portals, and MPRIS runtime state. */
   supportsDesktopMedia: boolean;
   retryCount: number;
@@ -386,6 +412,18 @@ export const S2C_SCROLL_OFFSET = 0x11;
 /** Client catalog. Each client record carries its active terminal and surface
  * subscriptions and their most recently advertised view sizes. */
 export const S2C_CLIENT_LIST = 0x12;
+/** The same catalog with an `[origin_kind:1][origin_len:2][origin:N]` block on
+ *  every record, sent only in answer to a request carrying
+ *  {@link CLIENT_LIST_WANT_ORIGIN}. A distinct opcode because the shipped
+ *  parsers on both sides reject a catalog with bytes left over. */
+export const S2C_CLIENT_LIST2 = 0x15;
+/** Bit 0 of the optional flags byte on `C2S_CLIENT_LIST` / `C2S_CLIENT_WATCH`:
+ *  answer with {@link S2C_CLIENT_LIST2}. */
+export const CLIENT_LIST_WANT_ORIGIN = 1 << 0;
+/** An ordinary client of the server: a browser, a CLI, a forwarder. */
+export const CLIENT_ORIGIN_NETWORK = 0;
+/** A running extension attempt's own connection. */
+export const CLIENT_ORIGIN_EXTENSION = 1;
 /** Correlated kick outcome: [nonce:2][status:1][detail:N]. */
 export const S2C_KICK_RESULT = 0x13;
 /** This connection was kicked: [reason:N]. The server closes it next. */
@@ -584,6 +622,11 @@ export const FEATURE_SURFACE_TOUCH = 1 << 18;
 export const FEATURE_SURFACE_TEXT_INPUT = 1 << 19;
 /** Server connections can be enumerated and another connection kicked. */
 export const FEATURE_CLIENT_CONTROL = 1 << 20;
+/** The client catalog can say which connections are extension attempts:
+ *  `C2S_CLIENT_LIST` / `C2S_CLIENT_WATCH` accept {@link CLIENT_LIST_WANT_ORIGIN}
+ *  and answer it with {@link S2C_CLIENT_LIST2}. Implies
+ *  {@link FEATURE_CLIENT_CONTROL}. */
+export const FEATURE_CLIENT_ORIGIN = 1 << 27;
 
 // -- Common status registry (docs/protocol.md) ------------------------------
 //

@@ -416,6 +416,26 @@ struct SearchCandidate {
 // scrollback — which is also the first moment a client can be parked in it.
 const SCROLL_PROBE: usize = 1;
 
+/// A sequence-addressed read of the grid, and the cursor to resume from.
+///
+/// `next_seq`/`next_col` fed back into the next [`TerminalDriver::seq_text`]
+/// return exactly what was appended in between — including the rest of a
+/// line that was still being written when the first read happened.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SeqText {
+    pub text: String,
+    /// Where the returned text actually starts, after clamping to what the
+    /// scrollback still holds.
+    pub start_seq: u64,
+    pub start_col: u16,
+    pub next_seq: u64,
+    pub next_col: u16,
+    /// `max_bytes` cut the read short; `next_seq` names the first row left out.
+    pub truncated: bool,
+    /// The requested start had already been evicted from the scrollback.
+    pub evicted: bool,
+}
+
 pub struct TerminalDriver {
     term: Term<BlitEventProxy>,
     processor: alacritty_terminal::vte::ansi::Processor<NoSyncTimeout>,
@@ -429,6 +449,17 @@ pub struct TerminalDriver {
     /// Lines rotated out of the viewport since this terminal was created.
     /// Monotonic; consumers track their own last-seen value and use deltas.
     scrolled_lines: u64,
+    /// The same motion counted absolutely, for content identity rather than
+    /// for re-anchoring a view.
+    ///
+    /// `scrolled_lines` cannot serve: its probe can only be armed once a line
+    /// has reached the scrollback, so however many lines rotate out before
+    /// the scrollback exists go uncounted. That is harmless for a delta, and
+    /// fatal for an absolute address — a line would change its number the
+    /// first time the terminal scrolled. This counter closes the gap with the
+    /// growth of the history, which measures exactly the motion the probe
+    /// cannot see.
+    rotated_lines: u64,
 }
 
 impl TerminalDriver {
@@ -455,14 +486,21 @@ impl TerminalDriver {
             used_rows: 0,
             used_rows_dirty: true,
             scrolled_lines: 0,
+            rotated_lines: 0,
         }
     }
 
     pub fn process(&mut self, data: &[u8]) {
+        // Sampled before the tracker consumes the chunk: the flag afterwards
+        // only says which grid the chunk left us on, and what the history
+        // delta has to be read against is whether the chunk *crossed*.
+        let alt_screen_before = self.alt_screen();
         let used_rows_action = self.modes.process(data);
+        let history_before = self.history_len();
         self.arm_scroll_probe();
         self.processor.advance(&mut self.term, data);
-        self.read_scroll_probe();
+        let crossed_alt_screen = self.alt_screen() != alt_screen_before;
+        self.read_scroll_probe(history_before, crossed_alt_screen);
         if used_rows_action == UsedRowsAction::Reset {
             self.reset_used_rows();
         }
@@ -489,9 +527,36 @@ impl TerminalDriver {
         self.term.grid_mut().scroll_display(Scroll::Delta(delta));
     }
 
-    fn read_scroll_probe(&mut self) {
+    fn history_len(&self) -> usize {
+        let grid = self.term.grid();
+        grid.total_lines().saturating_sub(grid.screen_lines())
+    }
+
+    fn read_scroll_probe(&mut self, history_before: usize, crossed_alt_screen: bool) {
         let after = self.term.grid().display_offset();
-        self.scrolled_lines += after.saturating_sub(SCROLL_PROBE) as u64;
+        let probed = after.saturating_sub(SCROLL_PROBE) as u64;
+        self.scrolled_lines += probed;
+        // Whichever of the two saw more motion. Before the scrollback
+        // exists only the growth sees any; once it is full only the probe
+        // does; in between they agree.
+        //
+        // Unless the chunk crossed to the other grid. The alternate screen
+        // has no scrollback, so the primary's whole history vanishes on the
+        // way in and comes back on the way out: the delta measures the swap,
+        // not the application scrolling. The way in is harmless (the delta is
+        // negative and floors at zero), but the `ESC[?1049l` that ends every
+        // vim, less, man or pager would otherwise move `rotated_lines` by the
+        // full scrollback height while the records already stored keep their
+        // absolute sequences — every one of them would name text a screenful
+        // of history away, or read back evicted. The alternate screen does
+        // not advance sequences at all — see docs/design/term-journal.md
+        // § Sequences.
+        let grown = if crossed_alt_screen {
+            0
+        } else {
+            self.history_len().saturating_sub(history_before) as u64
+        };
+        self.rotated_lines += probed.max(grown);
     }
 
     pub fn size(&self) -> (u16, u16) {
@@ -504,12 +569,28 @@ impl TerminalDriver {
             cols: cols as usize,
             rows: rows as usize,
         };
+        let history_before = self.history_len() as i64;
         self.term.resize(dims);
         // A resize shifts the history around on its own (rewrap, and lines
         // pushed out when the viewport shrinks).  That motion isn't the app
         // scrolling and the client re-derives its geometry from the next
         // frame anyway, so re-arm the probe without counting it.
         self.arm_scroll_probe();
+        // Sequences do have to follow it, though. A shorter viewport pushes
+        // rows into the history (`history_len` grows); a taller one pulls
+        // them back out (`grow_lines` does `cursor.line += from_history` and
+        // `history_len` shrinks). `saturating_sub` would miss the grow
+        // direction, so `cursor_seq` and every already-captured record would
+        // jump by `from_history` rows. The signed delta cancels the cursor
+        // move: shrink increments `rotated_lines`, grow decrements it.
+        // A column change rewraps and no such correspondence survives —
+        // see docs/design/term-journal.md § Resize.
+        let delta = self.history_len() as i64 - history_before;
+        if delta >= 0 {
+            self.rotated_lines += delta as u64;
+        } else {
+            self.rotated_lines = self.rotated_lines.saturating_sub((-delta) as u64);
+        }
         let capped = self.used_rows.min(rows);
         if capped != self.used_rows {
             self.used_rows = capped;
@@ -687,6 +768,34 @@ impl TerminalDriver {
         frame
     }
 
+    /// One grid row rendered to text, with whether it soft-wraps into the
+    /// next. `c0`/`c1` are inclusive column bounds, already clamped.
+    ///
+    /// A soft-wrapped row keeps its trailing space: it's the gap between
+    /// words ("for all", not "forall").
+    fn row_text(&self, line: Line, c0: usize, c1: usize) -> (String, bool) {
+        let grid_row = &self.term.grid()[line];
+        let mut text = String::new();
+        for col_idx in c0..=c1 {
+            let cell = &grid_row[Column(col_idx)];
+            if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let c = if cell.c == '\0' { ' ' } else { cell.c };
+            text.push(c);
+            for &zw in cell.zerowidth().into_iter().flatten() {
+                text.push(zw);
+            }
+        }
+        let wrapped = grid_row
+            .last()
+            .is_some_and(|c| c.flags.contains(CellFlags::WRAPLINE));
+        if !wrapped {
+            text.truncate(text.trim_end().len());
+        }
+        (text, wrapped)
+    }
+
     pub fn get_text_range(
         &self,
         start_tail: u32,
@@ -713,8 +822,6 @@ impl TerminalDriver {
         let end_i = end_line.0.min(last_line.0);
 
         while line_i <= end_i {
-            let line_idx = Line(line_i);
-            let grid_row = &grid[line_idx];
             let c0 = if line_i == start_line.0 {
                 (start_col as usize).min(cols.saturating_sub(1))
             } else {
@@ -726,27 +833,8 @@ impl TerminalDriver {
                 cols.saturating_sub(1)
             };
 
-            let mut line_text = String::new();
-            for col_idx in c0..=c1 {
-                let cell = &grid_row[Column(col_idx)];
-                if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
-                    continue;
-                }
-                let c = if cell.c == '\0' { ' ' } else { cell.c };
-                line_text.push(c);
-                for &zw in cell.zerowidth().into_iter().flatten() {
-                    line_text.push(zw);
-                }
-            }
-            let is_wrapped = grid_row
-                .last()
-                .is_some_and(|c| c.flags.contains(CellFlags::WRAPLINE));
-            // Keep a soft-wrapped row's trailing space: it's the gap between words ("for all", not "forall").
-            if is_wrapped {
-                result.push_str(&line_text);
-            } else {
-                result.push_str(line_text.trim_end());
-            }
+            let (line_text, is_wrapped) = self.row_text(Line(line_i), c0, c1);
+            result.push_str(&line_text);
             if line_i < end_i && !is_wrapped {
                 result.push('\n');
             }
@@ -754,6 +842,112 @@ impl TerminalDriver {
             line_i += 1;
         }
         result
+    }
+
+    /// Absolute sequence and column of the cursor: where the next byte the
+    /// application writes will land.
+    ///
+    /// A sequence is `scrolled_lines + row`, so it names the same text for as
+    /// long as that text is retained — the property grid coordinates lack,
+    /// since every scroll renumbers them.
+    pub fn cursor_seq(&self) -> (u64, u16) {
+        let cursor = self.term.grid().cursor.point;
+        let row = cursor.line.0.max(0) as u64;
+        (self.rotated_lines + row, cursor.column.0 as u16)
+    }
+
+    /// The oldest sequence still in the scrollback. Anything below it has
+    /// been evicted and can no longer be read.
+    pub fn oldest_seq(&self) -> u64 {
+        self.rotated_lines.saturating_sub(self.history_len() as u64)
+    }
+
+    /// Text from `(from_seq, from_col)` up to `end_seq` exclusive, or up to
+    /// and including the cursor's line when `end_seq` is `None`.
+    ///
+    /// `max_bytes` is a soft cap: a row is never split, so the result can
+    /// overshoot by at most one row. That keeps paging monotonic — a client
+    /// re-asking from `next_seq` always makes progress and never skips a
+    /// line, which a hard byte cut could not promise.
+    pub fn seq_text(
+        &self,
+        from_seq: u64,
+        from_col: u16,
+        end_seq: Option<u64>,
+        max_bytes: usize,
+    ) -> SeqText {
+        let grid = self.term.grid();
+        let screen = grid.screen_lines();
+        let cols = grid.columns();
+        let (cursor_seq, cursor_col) = self.cursor_seq();
+        let oldest = self.oldest_seq();
+
+        let mut out = SeqText {
+            start_seq: from_seq,
+            start_col: from_col,
+            next_seq: cursor_seq,
+            next_col: cursor_col,
+            ..SeqText::default()
+        };
+        if screen == 0 || cols == 0 {
+            return out;
+        }
+
+        // The bottom of the grid bounds every read; beyond it there is no
+        // text yet, only cells nothing has written to.
+        let last_seq = self.rotated_lines + screen as u64 - 1;
+        let end_inclusive = match end_seq {
+            Some(end) => end.saturating_sub(1).min(last_seq),
+            None => cursor_seq.min(last_seq),
+        };
+        // A bounded range that is already history answers from history; only
+        // an open-ended read resumes at the live cursor.
+        let (done_seq, done_col) = match end_seq {
+            Some(end) => (end.min(last_seq + 1), 0),
+            None => (cursor_seq, cursor_col),
+        };
+        out.next_seq = done_seq;
+        out.next_col = done_col;
+
+        let mut seq = from_seq;
+        if seq < oldest {
+            seq = oldest;
+            out.start_col = 0;
+            out.evicted = true;
+        }
+        out.start_seq = seq;
+        if seq > end_inclusive {
+            return out;
+        }
+
+        let mut prev_wrapped = false;
+        let mut first = true;
+        while seq <= end_inclusive {
+            let line = Line((seq as i64 - self.rotated_lines as i64) as i32);
+            let c0 = if seq == out.start_seq {
+                (out.start_col as usize).min(cols - 1)
+            } else {
+                0
+            };
+            let (row, wrapped) = self.row_text(line, c0, cols - 1);
+            let sep = usize::from(!first && !prev_wrapped);
+            // The first row always goes in, budget or not, so that a client
+            // paging through output cannot stall on an over-long line.
+            if !first && out.text.len() + sep + row.len() > max_bytes {
+                out.truncated = true;
+                out.next_seq = seq;
+                out.next_col = 0;
+                return out;
+            }
+            if sep == 1 {
+                out.text.push('\n');
+            }
+            out.text.push_str(&row);
+            prev_wrapped = wrapped;
+            first = false;
+            seq += 1;
+        }
+        out
     }
 
     pub fn search_result(&self, query: &str) -> Option<SearchResult> {

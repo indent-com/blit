@@ -4,6 +4,7 @@ import type {
   BlitTransportMessage,
   ConnectionStatus,
   BlitClientInfo,
+  BlitClientOrigin,
 } from "../types";
 import {
   S2C_CREATED,
@@ -13,7 +14,10 @@ import {
   S2C_EXITED,
   S2C_HELLO,
   S2C_KICKED,
+  CLIENT_ORIGIN_EXTENSION,
+  CLIENT_ORIGIN_NETWORK,
   S2C_CLIENT_LIST,
+  S2C_CLIENT_LIST2,
   S2C_KICK_RESULT,
   S2C_LIST,
   S2C_QUIT,
@@ -22,6 +26,34 @@ import {
   S2C_TITLE,
   S2C_UPDATE,
 } from "../types";
+
+/** A catalog entry to encode. Omitting `origin` asks for the older shape,
+ *  which is the shape a server without `FEATURE_CLIENT_ORIGIN` sends. */
+type ClientListFixture = Omit<BlitClientInfo, "origin"> & {
+  origin?: BlitClientOrigin | null;
+};
+
+/** The `S2C_CLIENT_LIST2` origin block for one catalog entry. */
+function encodeClientOrigin(origin: BlitClientOrigin): {
+  kind: number;
+  payload: Uint8Array;
+} {
+  if (origin.kind === "extension") {
+    const name = new TextEncoder().encode(origin.name);
+    const payload = new Uint8Array(28 + name.length);
+    const view = new DataView(payload.buffer);
+    view.setBigUint64(0, origin.extensionId, true);
+    view.setBigUint64(8, origin.definitionRevision, true);
+    view.setBigUint64(16, origin.attempt, true);
+    view.setUint32(24, origin.taskId, true);
+    payload.set(name, 28);
+    return { kind: CLIENT_ORIGIN_EXTENSION, payload };
+  }
+  if (origin.kind === "unknown") {
+    return { kind: origin.originKind, payload: new Uint8Array([1, 2, 3]) };
+  }
+  return { kind: CLIENT_ORIGIN_NETWORK, payload: new Uint8Array(0) };
+}
 
 export class MockTransport implements BlitTransport {
   private _status: ConnectionStatus;
@@ -253,28 +285,36 @@ export class MockTransport implements BlitTransport {
   pushClientList(
     nonce: number,
     selfId: bigint,
-    clients: readonly BlitClientInfo[],
+    clients: readonly ClientListFixture[],
     mangle: (message: Uint8Array) => Uint8Array = (message) => message,
   ) {
+    // An entry that carries an origin is only encodable in the wider shape, so
+    // the caller picks the opcode by what it puts in the catalog — the same
+    // way the server picks it by what the requester asked for.
+    const origins = clients.map((client) =>
+      client.origin ? encodeClientOrigin(client.origin) : null,
+    );
+    const withOrigin = origins.some((origin) => origin !== null);
     const length =
       15 +
       clients.reduce(
-        (sum, client) =>
+        (sum, client, index) =>
           sum +
           38 +
           client.terminals.length * 6 +
           client.surfaces.length * 8 +
-          client.subscriptions.length * 3,
+          client.subscriptions.length * 3 +
+          (withOrigin ? 3 + (origins[index]?.payload.length ?? 0) : 0),
         0,
       );
     const msg = new Uint8Array(length);
     const view = new DataView(msg.buffer);
-    msg[0] = S2C_CLIENT_LIST;
+    msg[0] = withOrigin ? S2C_CLIENT_LIST2 : S2C_CLIENT_LIST;
     view.setUint16(1, nonce, true);
     view.setBigUint64(3, selfId, true);
     view.setUint32(11, clients.length, true);
     let offset = 15;
-    for (const client of clients) {
+    for (const [index, client] of clients.entries()) {
       view.setBigUint64(offset, client.id, true);
       view.setBigUint64(offset + 8, BigInt(client.ageSeconds), true);
       view.setBigUint64(
@@ -308,6 +348,16 @@ export class MockTransport implements BlitTransport {
         msg[offset] = subscription.kind;
         view.setUint16(offset + 1, subscription.id, true);
         offset += 3;
+      }
+      if (withOrigin) {
+        const origin = origins[index] ?? {
+          kind: CLIENT_ORIGIN_NETWORK,
+          payload: new Uint8Array(0),
+        };
+        msg[offset] = origin.kind;
+        view.setUint16(offset + 1, origin.payload.length, true);
+        msg.set(origin.payload, offset + 3);
+        offset += 3 + origin.payload.length;
       }
     }
     this.push(mangle(msg));

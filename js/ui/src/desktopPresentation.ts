@@ -1,5 +1,7 @@
 import {
+  MPRIS_CAN_CONTROL,
   MPRIS_CAN_RAISE,
+  MPRIS_CAN_SEEK,
   TRAY_HAS_MENU,
   TRAY_ITEM_IS_MENU,
   type DesktopNotification,
@@ -217,4 +219,46 @@ export function canRaiseMpris(
   capabilityFlags: number,
 ): boolean {
   return !readOnly && Boolean(capabilityFlags & MPRIS_CAN_RAISE);
+}
+
+/**
+ * Whether a player's progress can be shown at all.
+ *
+ * A track of unknown length has no proportion to draw, and a bar that fills
+ * the whole width for a live stream would be a lie rather than a readout.
+ */
+export function mprisHasProgress(lengthUs: number): boolean {
+  return Number.isFinite(lengthUs) && lengthUs > 0;
+}
+
+/** Whether the progress bar accepts a drag rather than just reporting one. */
+export function canSeekMpris(
+  readOnly: boolean,
+  capabilityFlags: number,
+  lengthUs: number,
+): boolean {
+  return (
+    !readOnly &&
+    mprisHasProgress(lengthUs) &&
+    (capabilityFlags & (MPRIS_CAN_CONTROL | MPRIS_CAN_SEEK)) ===
+      (MPRIS_CAN_CONTROL | MPRIS_CAN_SEEK)
+  );
+}
+
+/**
+ * Clamp a scrubbed position into the range `SetPosition` will accept.
+ *
+ * A track's final microsecond is not a seekable position: the bridge rejects
+ * any target at or past `mpris:length`, so a handle dragged to the far right
+ * would fail outright rather than skip to the end. Stopping a millisecond
+ * short is inaudible, and wide enough to survive a rounded slider step — on a
+ * track shorter than that headroom, only its very start is reachable.
+ */
+export function mprisSeekTargetUs(
+  positionUs: number,
+  lengthUs: number,
+): number {
+  if (!mprisHasProgress(lengthUs) || !Number.isFinite(positionUs)) return 0;
+  const last = Math.max(0, lengthUs - 1_000);
+  return Math.min(Math.max(0, Math.round(positionUs)), last);
 }

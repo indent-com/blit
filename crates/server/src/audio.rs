@@ -268,6 +268,15 @@ context.modules = [
     { name = libpipewire-module-adapter }
     { name = libpipewire-module-link-factory }
     { name = libpipewire-module-metadata }
+    # Without this, `pw-top` and `pw-profiler` print *nothing* against a blit
+    # daemon — they need the Profiler interface this module registers, and the
+    # stripped config above supplies no other route to it. That makes xruns
+    # unobservable in production, which is the one number worth having when a
+    # listener reports dropouts: the graph either missed its deadlines or it
+    # did not, and every other explanation lives downstream of that answer.
+    # The cost is a registry object; the per-cycle profiling work only runs
+    # while a client is actually subscribed to it.
+    { name = libpipewire-module-profiler }
     { name = libpipewire-module-spa-node-factory }
 ]
 context.objects = [

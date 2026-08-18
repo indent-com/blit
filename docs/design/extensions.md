@@ -10,7 +10,7 @@
 Blit should execute Rust extensions compiled to WebAssembly inside the server:
 
 ```bash
-blit ext run --on prod extension.wasm arg1 arg2
+blit ext run --on prod builder extension.wasm arg1 arg2
 ```
 
 The client addresses the module by its full BLAKE3 digest. The server admits it
@@ -170,9 +170,9 @@ in KV; PTY handles do not.
 ### `testgrid`: many isolated instances from one hash
 
 ```bash
-blit ext run --on ci --restart always --persist --name test-unit testgrid.wasm unit
-blit ext run --on ci --restart always --persist --name test-integration testgrid.wasm integration
-blit ext run --on ci --restart always --persist --name test-web testgrid.wasm web
+blit ext run --on ci --restart always --persist test-unit testgrid.wasm unit
+blit ext run --on ci --restart always --persist test-integration testgrid.wasm integration
+blit ext run --on ci --restart always --persist test-web testgrid.wasm web
 ```
 
 The module uploads once, but each extension gets its own ID, arguments, thread,
@@ -529,7 +529,7 @@ transient blocked extensions a recovery path.
 `PERSIST` stores the extension definition with enabled and desired-running both
 set. It implies `DETACH` and requires a unique durable name. Persistence does
 not itself alter the restart policy: the common cross-server daemon form is
-`--restart always --persist --name NAME`. If the server shuts down while a
+`--restart always --persist NAME`. If the server shuts down while a
 persistent extension is enabled and desired-running, the shutdown ends its
 current attempt without incrementing failure counters and a fresh attempt is
 launched after the next server has initialized its registries.
@@ -1642,8 +1642,8 @@ setting. Operators create replicas as separate extensions, for example
 `worker-1`, `worker-2`, and `worker-3`, and manage them independently.
 
 ```bash
-blit ext run --on prod --restart always --persist --name worker-1 worker.wasm queue-a
-blit ext run --on prod --restart always --persist --name worker-2 worker.wasm queue-b
+blit ext run --on prod --restart always --persist worker-1 worker.wasm queue-a
+blit ext run --on prod --restart always --persist worker-2 worker.wasm queue-b
 blit ext list --on prod
 blit ext restart --on prod worker-1
 ```
@@ -1766,6 +1766,8 @@ Client-to-server kinds:
 | 3    | `DATA`    | `[payload:N]`                                                            |
 | 4    | `ACK`     | `[bytes:8]` cumulative consumed payload bytes                            |
 | 5    | `CLOSE`   | `[reason:1]`                                                             |
+| 6    | `WATCH`   | `[flags:1][count:2]` then `count` × `[name_len:2][name:N]`               |
+| 7    | `UNWATCH` | empty                                                                    |
 
 `LISTEN.flags` has no version-1 bits and must be zero. `CONNECT.flags` bit 0 is
 `EXPECT_LISTENER_TOKEN` and appends `[listener_token:16]` after metadata; bits 1
@@ -1795,6 +1797,7 @@ Server-to-client kinds:
 | 3    | `DATA`     | `[payload:N]`                                                                |
 | 4    | `ACK`      | `[bytes:8]` cumulative consumed payload bytes                                |
 | 5    | `CLOSED`   | `[reason:1][detail:N]`                                                       |
+| 6    | `NAMES`    | `[flags:1][count:2]` then `count` × `[name_len:2][name:N]`                   |
 
 Channel close reasons are:
 
@@ -1854,6 +1857,36 @@ publishes the name in the registry, then commits both without awaiting. If an
 extension endpoint cannot make that hard outbox reservation, it is cancelled
 as a slow consumer and no listener is published; a `CONNECT` can therefore
 never observe a listener whose initial success reply was unreserved.
+
+### Watching which names are served (`WATCH`)
+
+Feature bit **26** (`FEATURE_CHANNEL_WATCH`) advertises name watches. A `WATCH`
+declares 1 to 32 distinct names on an unused client-created channel ID and is
+answered immediately with `NAMES`: the declared names which have a listener
+right now, in the order they were declared. `NAMES` is repeated whenever that
+answer changes, and an empty list is an answer rather than silence. A watch
+therefore replaces the connect-and-close probe that could only say what was
+true once.
+
+A watch names what it follows rather than asking for the registry, so its
+traffic is bounded by its own request and cannot scale with churn it has no
+interest in — every extension attempt mints and drops a command listener.
+Republication is suppressed when a watch's answer is byte-identical, which is
+what makes an unrelated name's arrival cost a watcher nothing.
+
+`WATCH.flags` and `NAMES.flags` have no version-1 bits and must be zero. An
+empty name list, a repeated name, a count above 32, or an odd (server-created)
+ID is `OPENED(status = INVALID)`; an ID which is already live is `CONFLICT`, and
+exhausting the per-endpoint watch budget is `BUDGET`. A watch holds its ID until
+`UNWATCH`, which draws no reply and frees the ID for ordinary channel use; a
+`NAMES` already in flight for a released ID must be ignored. `CLOSE` does not
+end a watch. Watches are endpoint state: they are released with the endpoint and
+never survive a reconnect.
+
+A name is released when its listener closes it or when the owning endpoint goes
+away, and an extension's endpoint closes after the control call that disabled or
+removed it returns. A watcher therefore learns of an extension going away from
+that teardown rather than from the control call, which is a beat later.
 
 No-reply operations have explicit stale-handle behavior. `DATA`, `ACK`, or
 `CLOSE` naming an absent, already-final, or terminally draining channel ID is
@@ -2414,15 +2447,15 @@ needed.
 ```bash
 blit ext run --on prod extension.wasm arg1 arg2
 blit ext run --on prod --restart on-failure extension.wasm arg1
-blit ext run --on prod --restart always --persist --name builder extension.wasm arg1
+blit ext run --on prod --restart always --persist builder extension.wasm arg1
 ```
 
 The canonical command grammar is
-`blit ext run [RUN_OPTIONS] FILE [ARGS...]`. Every token
+`blit ext run [RUN_OPTIONS] NAME FILE [ARGS...]`. Every token
 after `FILE` is passed verbatim as an extension argument, including tokens
 beginning with `-`; no `--` separator is required. Extension-run options such as
-`--detach`, `--restart`, `--persist`, `--name`, and connection options such as
-`--on` must therefore appear before `FILE`.
+`--detach`, `--restart`, `--persist`, and connection options such as `--on`
+must therefore appear before `NAME` and `FILE`, which are both positional.
 
 The CLI:
 
@@ -2442,7 +2475,7 @@ is platform-specific; Unix shells see only the low eight bits (`0` through
 rather than the CLI process status.
 
 `--restart` accepts `never` (the default), `on-failure`, or `always`.
-`--persist` requires `--name`, implies `--detach`, and stores an enabled,
+`--persist` implies `--detach` and stores an enabled,
 desired-running definition for future blit server processes. It receives
 `PERMISSION` unless the selected
 server was started with `--allow-persistent-extensions`; the CLI reports that

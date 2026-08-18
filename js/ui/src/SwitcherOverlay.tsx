@@ -52,6 +52,14 @@ import { t, tp } from "./i18n";
 import { readStoredPassphrase } from "./passphrase-storage";
 import { getInstallPrompt, clearInstallPrompt } from "./installPrompt";
 import { stabilizeSections } from "./switcherStabilize";
+import { createLazyIcons } from "./lazyIcons";
+import { AppIcon } from "./panelKit";
+import {
+  applicationIcon,
+  requestApplicationIcons,
+  sessionCatalogs,
+  startApplication,
+} from "./sessionCatalogs";
 
 const SOURCE_LABEL: Record<number, string> = {
   [SEARCH_SOURCE_TITLE]: t("switcher.sourceTitle"),
@@ -186,6 +194,25 @@ type SymbolItem = {
   hit: SwitcherSymbolHit;
 };
 
+/**
+ * One installed application on one connected server.
+ *
+ * Deliberately carries no artwork. {@link stabilizeSections} compares items
+ * field by field, so an icon arriving *in* the item would replace the row
+ * object and remount the row. The square reads the icon from the catalog store
+ * instead, which is reactive on its own: the row stays put and the picture
+ * appears inside it.
+ */
+type AppItem = {
+  type: "app";
+  key: string;
+  title: string;
+  subtitle: string;
+  /** Desktop-entry id — the name the supervisor's `start` takes. */
+  appId: string;
+  connectionId: string;
+};
+
 type SwitcherItem =
   | LayoutItem
   | SessionItem
@@ -195,7 +222,8 @@ type SwitcherItem =
   | RemoteItem
   | TileItem
   | FileItem
-  | SymbolItem;
+  | SymbolItem
+  | AppItem;
 type SwitcherSection = {
   title: string;
   items: SwitcherItem[];
@@ -835,6 +863,34 @@ export function SwitcherOverlay(props: {
       ? query().slice(0, query().indexOf(">")).trim()
       : query().trim();
   const searching = () => !isCommand() && searchPart().length > 0;
+
+  // Application rows fetch their artwork as they scroll into view; the token
+  // has to name the server as well as the application, since two of them can
+  // have the same id.
+  const lazyIcons = createLazyIcons((tokens) => {
+    const byConnection = new Map<string, string[]>();
+    for (const token of tokens) {
+      const space = token.indexOf(" ");
+      if (space < 0) continue;
+      const connectionId = token.slice(0, space);
+      const ids = byConnection.get(connectionId) ?? [];
+      ids.push(token.slice(space + 1));
+      byConnection.set(connectionId, ids);
+    }
+    for (const [connectionId, ids] of byConnection) {
+      requestApplicationIcons(connectionId, ids);
+    }
+  });
+
+  /** Every connection the workspace holds, in its own order. The catalog store
+   *  answers only for the ones whose server runs a supervisor, so this needs no
+   *  filtering of its own. */
+  const connectionIds = (): string[] =>
+    props.remoteStatuses
+      ? [...props.remoteStatuses.keys()]
+      : props.connectionId
+        ? [props.connectionId]
+        : [];
 
   /**
    * When the query is `label> cmd` and `label` matches (as a prefix) a
@@ -1521,6 +1577,55 @@ export function SwitcherOverlay(props: {
       }
     }
 
+    // Applications section — everything installed on every connected server,
+    // startable on the spot. Last, and shown whether or not anything has been
+    // typed: it is the longest section by far, and a viewer who opens the
+    // switcher to reach a pane should not have to scroll past a games library
+    // to see one.
+    //
+    // Managed applications are skipped. The supervisor already runs those, and
+    // an entry that would restart something already up is not what "start" is
+    // being offered for here.
+    if (!layoutMode()) {
+      const q = searchPart().toLowerCase();
+      const appItems: AppItem[] = [];
+      for (const remote of sessionCatalogs(connectionIds())) {
+        const label = props.connectionLabels?.get(remote.connectionId);
+        const running = new Set(
+          remote.apps
+            .filter((app) => app.phase === "running")
+            .map((app) => app.id),
+        );
+        for (const entry of remote.catalog) {
+          if (running.has(entry.id)) continue;
+          if (
+            searching() &&
+            !entry.name.toLowerCase().includes(q) &&
+            !entry.id.toLowerCase().includes(q)
+          ) {
+            continue;
+          }
+          appItems.push({
+            type: "app" as const,
+            // The id alone is not unique: two servers both have Firefox.
+            key: `app:${remote.connectionId}:${entry.id}`,
+            title: entry.name,
+            // The server's name earns its place only when there is more than
+            // one; otherwise every row would carry the same word.
+            subtitle:
+              props.multiConnection && label
+                ? tp("switcher.appOn", { name: label })
+                : entry.id,
+            appId: entry.id,
+            connectionId: remote.connectionId,
+          });
+        }
+      }
+      if (appItems.length > 0) {
+        next.push({ title: t("switcher.sectionApps"), items: appItems });
+      }
+    }
+
     return next.filter((section) => section.items.length > 0);
   };
 
@@ -1748,6 +1853,15 @@ export function SwitcherOverlay(props: {
           />
         ) : item.type === "file" || item.type === "symbol" ? (
           <TileGlyph kind="editor" fg={theme().fg} dimFg={theme().dimFg} />
+        ) : item.type === "app" ? (
+          // Read from the store rather than from the item, so the artwork can
+          // land without the row being rebuilt around it.
+          <AppIcon
+            theme={theme()}
+            scale={scale()}
+            name={item.title}
+            src={applicationIcon(item.connectionId, item.appId)}
+          />
         ) : (
           <ActionGlyph
             action={item.action}
@@ -1823,6 +1937,14 @@ export function SwitcherOverlay(props: {
     }
     if (item.type === "symbol") {
       props.onOpenSymbol?.(item.hit);
+      props.onClose();
+      return;
+    }
+    if (item.type === "app") {
+      // Start, not enable: this is trying an application, not adopting it for
+      // every future session. The window it opens arrives as a surface on its
+      // own, so there is nothing to focus here.
+      startApplication(item.connectionId, item.appId);
       props.onClose();
       return;
     }
@@ -2133,6 +2255,7 @@ export function SwitcherOverlay(props: {
             }}
           >
             <div
+              ref={lazyIcons.setRoot}
               onMouseMove={() => {
                 pointerMovedSinceKey = true;
               }}
@@ -2202,6 +2325,15 @@ export function SwitcherOverlay(props: {
                             <div
                               ref={(el) => {
                                 itemRefs[index()] = el;
+                                // Application rows ask for their artwork as
+                                // they come into view. Everything else draws a
+                                // glyph and has nothing to fetch.
+                                if (item.type === "app") {
+                                  lazyIcons.watch(
+                                    el,
+                                    `${item.connectionId} ${item.appId}`,
+                                  );
+                                }
                               }}
                               onClick={() => activateItem(item)}
                               onMouseEnter={() => {

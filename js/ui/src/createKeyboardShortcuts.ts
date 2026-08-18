@@ -8,6 +8,7 @@ import type {
 } from "@blit-sh/core";
 import { isSurfaceAssignment, parseSurfaceAssignment } from "./bsp/layout";
 import type { Overlay } from "./Workspace";
+import { dismissTopClaim } from "./overlayStack";
 
 export interface KeyboardShortcutHandlers {
   workspace: BlitWorkspace;
@@ -50,7 +51,9 @@ export interface KeyboardShortcutHandlers {
   cancelOverlay: () => void;
   toggleDebug: () => void;
   togglePreviewPanel: () => void;
-  toggleLeftPanel: (panel: "explorer" | "log" | "problems") => void;
+  toggleLeftPanel: (
+    panel: "explorer" | "branches" | "log" | "problems",
+  ) => void;
   /** Show/hide the project-search top pane. */
   toggleSearch: () => void;
   createAndFocus: () => Promise<void>;
@@ -533,6 +536,13 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
         h.toggleLeftPanel("log");
         return;
       }
+      // Y for Branches: B is the preview panel and every letter in the word
+      // is taken, so this is an arbitrary free key rather than a mnemonic.
+      if (!surfaceOwnsCtrlShift && e.ctrlKey && e.shiftKey && e.key === "Y") {
+        e.preventDefault();
+        h.toggleLeftPanel("branches");
+        return;
+      }
       if (!surfaceOwnsCtrlShift && e.ctrlKey && e.shiftKey && e.key === "P") {
         e.preventDefault();
         h.toggleLeftPanel("problems");
@@ -714,6 +724,12 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
         return;
       }
       if (e.key === "Escape") {
+        // An overlay stacked on top of another owns the key first, or closing
+        // the one underneath would take it down with it.
+        if (dismissTopClaim()) {
+          e.preventDefault();
+          return;
+        }
         if (h.overlay()) {
           e.preventDefault();
           h.cancelOverlay();

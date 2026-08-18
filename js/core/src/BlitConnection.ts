@@ -1,6 +1,7 @@
 import type {
   BlitConnectionSnapshot,
   BlitClientList,
+  BlitClientOrigin,
   BlitSearchResult,
   BlitSession,
   BlitTransport,
@@ -17,6 +18,7 @@ import {
   FEATURE_COMPOSITOR,
   FEATURE_COPY_RANGE,
   FEATURE_CLIENT_CONTROL,
+  FEATURE_CLIENT_ORIGIN,
   FEATURE_CREATE_NONCE,
   FEATURE_CREATE_STATUS,
   FEATURE_KILL_MODE,
@@ -38,7 +40,10 @@ import {
   S2C_EXITED,
   S2C_HELLO,
   S2C_KICKED,
+  CLIENT_ORIGIN_EXTENSION,
+  CLIENT_ORIGIN_NETWORK,
   S2C_CLIENT_LIST,
+  S2C_CLIENT_LIST2,
   S2C_KICK_RESULT,
   S2C_LIST,
   S2C_READY,
@@ -133,7 +138,52 @@ import {
   type SurfaceTouchPoint,
 } from "./protocol";
 import { AudioPlayer } from "./AudioPlayer";
-import { FEATURE_CHANNEL } from "./channel";
+import {
+  EXT_CONTROL_LIST,
+  EXT_MAX_MODULE,
+  EXT_PHASE_NEED_OBJECT,
+  EXT_PUT_BEGIN,
+  EXT_PUT_FINAL,
+  EXT_PUT_STATUS_ALREADY_HAVE,
+  EXT_RESTART_ALWAYS,
+  EXT_RUN_DETACH,
+  EXT_RUN_PERSIST,
+  EXT_RUN_UPDATE,
+  EXT_UPLOAD_CHUNK,
+  FEATURE_EXTENSION,
+  S2C_EXT_INFO,
+  S2C_EXT_PUT_STATUS,
+  S2C_EXT_STATUS,
+  buildExtensionControlMessage,
+  buildExtensionPutMessage,
+  buildExtensionRunMessage,
+  parseExtensionMessage,
+  type BlitExtensionPutStatus,
+  type BlitExtensionRecord,
+  type BlitExtensionStatus,
+  type ExtensionRunRequest,
+} from "./extension";
+import {
+  CHANNEL,
+  CHANNEL_CLOSE_NORMAL,
+  CHANNEL_CLOSE_PEER_GONE,
+  CHANNEL_MAX_NAME,
+  CHANNEL_MAX_PAYLOAD,
+  ChannelCredit,
+  FEATURE_CHANNEL,
+  FEATURE_CHANNEL_WATCH,
+  buildChannelAckMessage,
+  buildChannelCloseMessage,
+  buildChannelConnectMessage,
+  buildChannelDataMessage,
+  buildChannelUnwatchMessage,
+  buildChannelWatchMessage,
+  parseChannelMessage,
+  type ChannelConnectOptions,
+  type ChannelHandle,
+  type ChannelNamesWatch,
+  type ChannelOpenOptions,
+} from "./channel";
 import { SurfaceStore } from "./SurfaceStore";
 import { TerminalStore, type BlitWasmModule } from "./TerminalStore";
 import {
@@ -183,6 +233,7 @@ import {
   S2C_FS_CLOSED,
   S2C_FS_FILE,
   S2C_FS_INDEX,
+  S2C_FS_READ,
   S2C_FS_SEARCH,
   S2C_FS_SYNCED,
   S2C_FS_UPDATE,
@@ -193,6 +244,7 @@ import {
   buildFsAckMessage,
   buildFsFetchMessage,
   buildFsIndexMessage,
+  buildFsReadMessage,
   buildFsSearchMessage,
   buildFsOpMessage,
   buildFsStopMessage,
@@ -203,6 +255,7 @@ import {
   buildFsUploadFinishMessage,
   buildFsWriteMessage,
   parseFsIndexResult,
+  parseFsReadResult,
   buildFsGrepMessage,
   parseFsGrepResult,
   S2C_FS_GREP,
@@ -219,6 +272,7 @@ import {
   FsConflictError,
   FsOpenError,
   type FsFileIndex,
+  type FsReadRecord,
   type FsGrepResult,
   type FsGrepOptions,
   type FsNode,
@@ -244,6 +298,7 @@ import {
   msgGitDiscover,
   msgGitFetch,
   msgGitReflog,
+  msgGitWorktrees,
   parseGitDiscoverResp,
   gitDiscoverRecords,
   GIT_DISCOVER_BARE,
@@ -277,6 +332,7 @@ import {
   S2C_GIT_FETCH,
   S2C_GIT_PATCH,
   S2C_GIT_REFLOG,
+  S2C_GIT_WORKTREES,
   S2C_GIT_REPO,
   S2C_GIT_RESOLVE,
   S2C_GIT_STATE,
@@ -288,6 +344,7 @@ import {
   gitBlameRecords,
   gitFetchRecords,
   gitReflogRecords,
+  gitWorktreeRecords,
   gitTreeRecords,
   msgGitAck,
   msgGitBase,
@@ -314,6 +371,7 @@ import {
   parseGitFetchResp,
   parseGitPatchResp,
   parseGitReflogResp,
+  parseGitWorktreesResp,
   parseGitRepo,
   parseGitResolveResp,
   parseGitTreeResp,
@@ -542,6 +600,35 @@ function connectionError(message: string): Error {
   return new Error(message);
 }
 
+/**
+ * Read one `S2C_CLIENT_LIST2` origin block, given the bounds its length prefix
+ * already established.
+ *
+ * A payload that does not fit its kind reads as `unknown` rather than failing
+ * the catalog: the caller knows where the entry ends either way, so one
+ * unreadable origin costs that origin and nothing else.
+ */
+function readClientOrigin(
+  originKind: number,
+  view: DataView,
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+): BlitClientOrigin {
+  if (originKind === CLIENT_ORIGIN_NETWORK) return { kind: "network" };
+  if (originKind === CLIENT_ORIGIN_EXTENSION && end - start >= 28) {
+    return {
+      kind: "extension",
+      extensionId: view.getBigUint64(start, true),
+      definitionRevision: view.getBigUint64(start + 8, true),
+      attempt: view.getBigUint64(start + 16, true),
+      taskId: view.getUint32(start + 24, true),
+      name: textDecoder.decode(bytes.subarray(start + 28, end)),
+    };
+  }
+  return { kind: "unknown", originKind };
+}
+
 /** Unacked upload bytes allowed on the wire at once. Kept small on purpose:
  *  C2S has no flow control, so every queued upload byte sits ahead of
  *  interactive input (keyboard/mouse) sharing this connection — a multi-MiB
@@ -690,6 +777,13 @@ export class BlitConnection {
     number,
     { resolve: (index: FsFileIndex) => void; reject: (error: Error) => void }
   >();
+  private readonly pendingFsReads = new Map<
+    number,
+    {
+      resolve: (records: FsReadRecord[]) => void;
+      reject: (error: Error) => void;
+    }
+  >();
   private readonly pendingFsGreps = new Map<
     number,
     { resolve: (result: FsGrepResult) => void; reject: (error: Error) => void }
@@ -830,6 +924,62 @@ export class BlitConnection {
       diags: LspDiagMirror;
       options: LspOpenOptions;
       notifier: Notifier;
+    }
+  >();
+  private readonly pendingChannelOpens = new Map<
+    number,
+    {
+      resolve: (handle: ChannelHandle) => void;
+      reject: (error: Error) => void;
+      name: string;
+      options: ChannelOpenOptions;
+    }
+  >();
+  private readonly channels = new Map<
+    number,
+    {
+      name: string;
+      credit: ChannelCredit;
+      options: ChannelOpenOptions;
+      closed: boolean;
+    }
+  >();
+  /** Live channel-name watches, by the id that carries them. A NAMES packet
+   *  for an id that is not here belongs to a watch already stopped — the
+   *  server's answer and the client's UNWATCH can cross. */
+  private readonly channelNameWatches = new Map<
+    number,
+    {
+      names: readonly string[];
+      present: Set<string>;
+      onNames: (present: ReadonlySet<string>) => void;
+      settle?: {
+        resolve: (watch: ChannelNamesWatch) => void;
+        reject: (error: Error) => void;
+      };
+    }
+  >();
+  /** Client-created channel ids must be even; the server owns the odd ones. */
+  private nextChannelId = 2;
+  private readonly pendingExtensionLists = new Map<
+    number,
+    {
+      resolve: (records: BlitExtensionRecord[]) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  private readonly pendingExtensionStatuses = new Map<
+    number,
+    {
+      resolve: (status: BlitExtensionStatus) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  private readonly pendingExtensionPuts = new Map<
+    number,
+    {
+      resolve: (status: BlitExtensionPutStatus) => void;
+      reject: (error: Error) => void;
     }
   >();
   private readonly pendingLspRequests = new Map<
@@ -1044,6 +1194,8 @@ export class BlitConnection {
       supportsKv: false,
       supportsDesktop: false,
       supportsChannels: false,
+      supportsChannelWatch: false,
+      supportsExtensions: false,
       supportsDesktopMedia: false,
       retryCount: 0,
       bootGeneration: null,
@@ -1179,6 +1331,8 @@ export class BlitConnection {
     this.resetFsSyncs(connectionError("Connection disposed"));
     this.resetGitRepos(connectionError("Connection disposed"));
     this.resetLspAttachments(connectionError("Connection disposed"));
+    this.resetChannels(connectionError("Connection disposed"));
+    this.resetExtensions(connectionError("Connection disposed"));
     this.resetKv(connectionError("Connection disposed"));
     this.resetFragmentReassembly();
     for (const p of this.codecProbation.values()) {
@@ -1321,7 +1475,9 @@ export class BlitConnection {
     return new Promise<BlitClientList>((resolve, reject) => {
       const nonce = this.nextClientControlNonce();
       this.pendingClientLists.set(nonce, { resolve, reject });
-      this.transport.send(buildClientListMessage(nonce));
+      this.transport.send(
+        buildClientListMessage(nonce, this.wantsClientOrigin),
+      );
     });
   }
 
@@ -1372,6 +1528,13 @@ export class BlitConnection {
     });
   }
 
+  /** Whether to ask the catalog where each connection came from. An older
+   *  server answers the flag with `INVALID` instead of a catalog, so this is
+   *  the difference between a missing column and a broken pane. */
+  private get wantsClientOrigin(): boolean {
+    return (this.features & FEATURE_CLIENT_ORIGIN) !== 0;
+  }
+
   private clientControlAvailabilityError(action: string): Error | null {
     if (this.transport.status !== "connected") {
       return connectionError(
@@ -1416,7 +1579,7 @@ export class BlitConnection {
     }
     const nonce = this.nextClientControlNonce();
     this.clientCatalogWatchNonce = nonce;
-    this.transport.send(buildClientWatchMessage(nonce));
+    this.transport.send(buildClientWatchMessage(nonce, this.wantsClientOrigin));
   }
 
   private stopClientCatalogWatch(): void {
@@ -2127,6 +2290,57 @@ export class BlitConnection {
       const nonce = this.nextFsNonce(this.pendingFsIndexes);
       this.pendingFsIndexes.set(nonce, { resolve, reject });
       this.transport.send(buildFsIndexMessage(nonce, root));
+    });
+  }
+
+  /**
+   * Read whole files, or resolve which of several paths exists
+   * (docs/design/fs-read.md). No sync session and nothing watched.
+   *
+   * Paths come in groups, and a group is one question: with `FS_READ_FIRST`
+   * each group is answered by its own first readable path, one record per group
+   * in group order. With `FS_READ_NO_CONTENT` the records name the file without
+   * carrying it, which is how a caller that only wants to know *where* something
+   * is pays a stat rather than a read.
+   *
+   * Every record carries its own `FS_FILE_*`, so a missing or oversized path is
+   * an answer about that path rather than a failure of the batch.
+   */
+  readFiles(
+    groups: readonly (readonly string[])[],
+    options: { flags?: number; maxBytes?: number } = {},
+  ): Promise<FsReadRecord[]> {
+    if (this.transport.status !== "connected") {
+      return Promise.reject(
+        connectionError(
+          `Cannot read files while transport is ${this.transport.status}`,
+        ),
+      );
+    }
+    if ((this.features & FEATURE_FS) === 0) {
+      return Promise.reject(
+        connectionError("Server does not support file reads"),
+      );
+    }
+    // A server predating FS_READ drops the opcode and never answers, so the
+    // in-flight cap is what keeps a repeating caller bounded — the same reason
+    // `indexFiles` has one.
+    if (this.pendingFsReads.size >= 16) {
+      return Promise.reject(
+        connectionError("Too many file read requests in flight"),
+      );
+    }
+    return new Promise<FsReadRecord[]>((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingFsReads);
+      this.pendingFsReads.set(nonce, { resolve, reject });
+      this.transport.send(
+        buildFsReadMessage(
+          nonce,
+          options.flags ?? 0,
+          options.maxBytes ?? 0,
+          groups,
+        ),
+      );
     });
   }
 
@@ -3084,6 +3298,21 @@ export class BlitConnection {
         expectOk(parsed[1], "Reflog");
         return [...gitReflogRecords(parsed[3])];
       },
+      worktrees: async (opts = {}) => {
+        const msg = await this.gitRequest(
+          repoId,
+          S2C_GIT_WORKTREES,
+          (nonce) =>
+            msgGitWorktrees({ nonce, repoId, afterPos: opts.afterPos }),
+          opts.signal,
+          "Worktrees",
+        );
+        const parsed = parseGitWorktreesResp(msg);
+        if (!parsed)
+          throw connectionError("Malformed worktree list from server");
+        expectOk(parsed[1], "Worktrees");
+        return [...gitWorktreeRecords(parsed[3])];
+      },
       fetch: async (opts = {}) => {
         const msg = await this.gitRequest(
           repoId,
@@ -3332,6 +3561,482 @@ export class BlitConnection {
     }
   }
 
+  /**
+   * Connect to a named native channel served by an extension or another
+   * client (`docs/design/extensions.md`).
+   *
+   * The promise settles on the server's `OPENED`: it resolves with a handle
+   * whose `send` is credit-checked, or rejects with the refusal detail.
+   * Incoming DATA is acknowledged for the caller — a channel that is never
+   * acknowledged stops receiving once its window fills.
+   */
+  async connectChannel(
+    name: string,
+    options: ChannelOpenOptions = {},
+  ): Promise<ChannelHandle> {
+    if (this.transport.status !== "connected") {
+      throw connectionError(
+        `Cannot open a channel while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_CHANNEL) === 0) {
+      throw connectionError(
+        "Server does not support native channels (upgrade blit on the remote)",
+      );
+    }
+    const encoded = new TextEncoder().encode(name);
+    if (encoded.length === 0 || encoded.length > CHANNEL_MAX_NAME) {
+      throw connectionError("Channel name must be 1 to 255 bytes");
+    }
+    const channelId = this.nextChannelId;
+    this.nextChannelId = this.nextChannelId >= 0xfffffffe ? 2 : channelId + 2;
+    return new Promise<ChannelHandle>((resolve, reject) => {
+      this.pendingChannelOpens.set(channelId, {
+        resolve,
+        reject,
+        name,
+        options,
+      });
+      const connect: ChannelConnectOptions = {
+        metadata: options.metadata,
+        listenerToken: options.listenerToken,
+      };
+      this.transport.send(buildChannelConnectMessage(channelId, name, connect));
+    });
+  }
+
+  /**
+   * Follow which of `names` currently have a listener.
+   *
+   * This is how a client asks "is this extension serving right now" without
+   * connecting: the promise settles on the server's first answer, and `onNames`
+   * is called every time that answer changes afterwards — an extension being
+   * installed, restarted, disabled or removed all reach the watcher, because
+   * all of them end with a listener claimed or released.
+   *
+   * A connect-and-close probe answers the same question once. It cannot say
+   * when the answer stops being true, so anything holding a probe's result
+   * over time is showing the viewer a stale server.
+   */
+  async watchChannelNames(
+    names: readonly string[],
+    onNames: (present: ReadonlySet<string>) => void,
+  ): Promise<ChannelNamesWatch> {
+    if (this.transport.status !== "connected") {
+      throw connectionError(
+        `Cannot watch channel names while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_CHANNEL_WATCH) === 0) {
+      throw connectionError(
+        "Server does not support channel-name watches (upgrade blit on the remote)",
+      );
+    }
+    // Built before the id is spent, so a name this protocol cannot carry
+    // throws without leaving a hole in the id space.
+    const channelId = this.nextChannelId;
+    const request = buildChannelWatchMessage(channelId, names);
+    this.nextChannelId = this.nextChannelId >= 0xfffffffe ? 2 : channelId + 2;
+    return new Promise<ChannelNamesWatch>((resolve, reject) => {
+      this.channelNameWatches.set(channelId, {
+        names,
+        present: new Set(),
+        onNames,
+        settle: { resolve, reject },
+      });
+      this.transport.send(request);
+    });
+  }
+
+  /** The handle for a watch already registered. `present` is the live set the
+   *  message handler keeps up to date, so it still reads correctly after the
+   *  watch is stopped or the transport is lost. */
+  private makeChannelNamesWatch(
+    channelId: number,
+    present: ReadonlySet<string>,
+  ): ChannelNamesWatch {
+    return {
+      present,
+      stop: (): void => {
+        if (!this.channelNameWatches.delete(channelId)) return;
+        if (this.transport.status === "connected") {
+          this.transport.send(buildChannelUnwatchMessage(channelId));
+        }
+      },
+    };
+  }
+
+  private makeChannelHandle(
+    channelId: number,
+    name: string,
+    peer: string,
+    metadata: Uint8Array,
+    credit: ChannelCredit,
+  ): ChannelHandle {
+    const encoder = new TextEncoder();
+    return {
+      channelId,
+      name,
+      peer,
+      metadata,
+      get availableCredit() {
+        return credit.available;
+      },
+      send: (payload: Uint8Array | string): boolean => {
+        const entry = this.channels.get(channelId);
+        if (!entry || entry.closed || this.transport.status !== "connected") {
+          return false;
+        }
+        const bytes =
+          typeof payload === "string" ? encoder.encode(payload) : payload;
+        if (bytes.length === 0 || bytes.length > CHANNEL_MAX_PAYLOAD) {
+          throw connectionError("Channel data must be 1 byte to 1 MiB");
+        }
+        // Overshooting the window is a protocol violation the server answers
+        // by closing the channel, so refuse locally and let the caller retry.
+        if (!entry.credit.charge(bytes.length)) return false;
+        this.transport.send(buildChannelDataMessage(channelId, bytes));
+        return true;
+      },
+      close: (reason = CHANNEL_CLOSE_NORMAL): void => {
+        const entry = this.channels.get(channelId);
+        if (!entry || entry.closed) return;
+        entry.closed = true;
+        if (this.transport.status === "connected") {
+          this.transport.send(buildChannelCloseMessage(channelId, reason));
+        }
+      },
+    };
+  }
+
+  /** Route one `CHANNEL` packet to its pending open or connected channel. */
+  private handleChannelMessage(bytes: Uint8Array): void {
+    const message = parseChannelMessage(bytes);
+    if (!message) return;
+    switch (message.kind) {
+      case "names": {
+        const watch = this.channelNameWatches.get(message.channelId);
+        if (!watch) return;
+        watch.present.clear();
+        for (const name of message.names) watch.present.add(name);
+        const settle = watch.settle;
+        watch.settle = undefined;
+        if (settle) {
+          settle.resolve(
+            this.makeChannelNamesWatch(message.channelId, watch.present),
+          );
+          return;
+        }
+        watch.onNames(watch.present);
+        return;
+      }
+      case "opened": {
+        // A watch is refused the way any client-created id is: with an OPENED
+        // carrying the status. Nothing was registered server-side, so the
+        // watch is dropped here rather than left half-live.
+        const watch = this.channelNameWatches.get(message.channelId);
+        if (watch) {
+          this.channelNameWatches.delete(message.channelId);
+          watch.settle?.reject(
+            connectionError(
+              `Channel watch refused${message.detail ? `: ${message.detail}` : ""}`,
+            ),
+          );
+          return;
+        }
+        const pending = this.pendingChannelOpens.get(message.channelId);
+        if (!pending) return;
+        this.pendingChannelOpens.delete(message.channelId);
+        if (message.status !== STATUS_OK || message.window === 0n) {
+          pending.reject(
+            connectionError(
+              `Channel ${pending.name} refused${message.detail ? `: ${message.detail}` : ""}`,
+            ),
+          );
+          return;
+        }
+        const credit = new ChannelCredit(message.window);
+        this.channels.set(message.channelId, {
+          name: pending.name,
+          credit,
+          options: pending.options,
+          closed: false,
+        });
+        pending.resolve(
+          this.makeChannelHandle(
+            message.channelId,
+            pending.name,
+            message.peer,
+            message.metadata.slice(),
+            credit,
+          ),
+        );
+        return;
+      }
+      case "data": {
+        const entry = this.channels.get(message.channelId);
+        if (!entry || entry.closed) return;
+        // The payload may be a borrowed transport view; hand out a copy.
+        const payload = message.payload.slice();
+        const through = entry.credit.receive(payload.length);
+        if (this.transport.status === "connected") {
+          this.transport.send(
+            buildChannelAckMessage(message.channelId, through),
+          );
+        }
+        entry.options.onData?.(payload);
+        return;
+      }
+      case "ack": {
+        const entry = this.channels.get(message.channelId);
+        if (!entry) return;
+        entry.credit.acknowledge(message.bytes);
+        entry.options.onCredit?.(entry.credit.available);
+        return;
+      }
+      case "closed": {
+        const entry = this.channels.get(message.channelId);
+        if (entry) {
+          this.channels.delete(message.channelId);
+          if (!entry.closed) {
+            entry.closed = true;
+            entry.options.onClosed?.(message.reason, message.detail);
+          }
+          return;
+        }
+        // A refusal that arrives as CLOSED rather than OPENED still has to
+        // settle the open, or the caller's promise hangs forever.
+        const pending = this.pendingChannelOpens.get(message.channelId);
+        if (!pending) return;
+        this.pendingChannelOpens.delete(message.channelId);
+        pending.reject(
+          connectionError(
+            `Channel ${pending.name} closed${message.detail ? `: ${message.detail}` : ""}`,
+          ),
+        );
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  // --- extensions ------------------------------------------------------
+
+  private extensionGuard(): Error | null {
+    if (this.transport.status !== "connected") {
+      return connectionError(
+        `Cannot manage extensions while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_EXTENSION) === 0) {
+      return connectionError(
+        "Server does not support extensions (enable them on the remote)",
+      );
+    }
+    return null;
+  }
+
+  /** What this server has installed, running or not. */
+  listExtensions(): Promise<BlitExtensionRecord[]> {
+    const guard = this.extensionGuard();
+    if (guard) return Promise.reject(guard);
+    return new Promise((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingExtensionLists);
+      this.pendingExtensionLists.set(nonce, { resolve, reject });
+      this.transport.send(
+        buildExtensionControlMessage(nonce, 0n, EXT_CONTROL_LIST),
+      );
+    });
+  }
+
+  /** Cancel, restart, enable, disable, or remove one extension. */
+  controlExtension(
+    extensionId: bigint,
+    action: number,
+  ): Promise<BlitExtensionStatus> {
+    const guard = this.extensionGuard();
+    if (guard) return Promise.reject(guard);
+    return new Promise((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingExtensionStatuses);
+      this.pendingExtensionStatuses.set(nonce, { resolve, reject });
+      this.transport.send(
+        buildExtensionControlMessage(nonce, extensionId, action),
+      );
+    });
+  }
+
+  /**
+   * Install or replace an extension from module bytes.
+   *
+   * The digest is the module's identity, so it goes first and the bytes only
+   * if the server answers that it lacks that object — a server that already
+   * has it transfers nothing. The server re-hashes what it receives and
+   * refuses a mismatch, which is what lets this client name a digest it has
+   * no way to compute.
+   */
+  async installExtension(request: {
+    hash: Uint8Array;
+    name: string;
+    module: () => Promise<Uint8Array>;
+    args?: readonly string[];
+    restart?: number;
+    /** Replace this definition rather than create one (CAS-checked). */
+    expectedExtensionId?: bigint;
+    expectedDefinitionRevision?: bigint;
+  }): Promise<BlitExtensionStatus> {
+    const guard = this.extensionGuard();
+    if (guard) throw guard;
+    const update = request.expectedExtensionId !== undefined;
+    const flags =
+      EXT_RUN_DETACH | EXT_RUN_PERSIST | (update ? EXT_RUN_UPDATE : 0);
+    let bytes: Uint8Array | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const status = await this.extensionRun({
+        nonce: 0,
+        flags,
+        restart: request.restart ?? EXT_RESTART_ALWAYS,
+        expectedExtensionId: request.expectedExtensionId ?? 0n,
+        expectedDefinitionRevision: request.expectedDefinitionRevision ?? 0n,
+        hash: request.hash,
+        name: request.name,
+        args: request.args,
+      });
+      if (status.status !== STATUS_OK) {
+        throw connectionError(
+          status.detail || `extension run refused (status ${status.status})`,
+        );
+      }
+      if (status.phase !== EXT_PHASE_NEED_OBJECT) return status;
+      bytes ??= await request.module();
+      await this.uploadExtensionModule(request.hash, bytes);
+    }
+    throw connectionError("server kept asking for the module after upload");
+  }
+
+  private extensionRun(
+    request: ExtensionRunRequest,
+  ): Promise<BlitExtensionStatus> {
+    return new Promise((resolve, reject) => {
+      const nonce = this.nextFsNonce(this.pendingExtensionStatuses);
+      this.pendingExtensionStatuses.set(nonce, { resolve, reject });
+      this.transport.send(buildExtensionRunMessage({ ...request, nonce }));
+    });
+  }
+
+  /** Upload one module, lock-step: one chunk, one reply, repeat. */
+  private async uploadExtensionModule(
+    hash: Uint8Array,
+    bytes: Uint8Array,
+  ): Promise<void> {
+    if (bytes.length === 0 || bytes.length > EXT_MAX_MODULE) {
+      throw connectionError("module must be 1 byte to 64 MiB");
+    }
+    const total = BigInt(bytes.length);
+    for (let offset = 0; offset < bytes.length; offset += EXT_UPLOAD_CHUNK) {
+      const end = Math.min(offset + EXT_UPLOAD_CHUNK, bytes.length);
+      const flags =
+        (offset === 0 ? EXT_PUT_BEGIN : 0) |
+        (end === bytes.length ? EXT_PUT_FINAL : 0);
+      const status = await new Promise<BlitExtensionPutStatus>(
+        (resolve, reject) => {
+          const nonce = this.nextFsNonce(this.pendingExtensionPuts);
+          this.pendingExtensionPuts.set(nonce, { resolve, reject });
+          this.transport.send(
+            buildExtensionPutMessage(
+              nonce,
+              flags,
+              hash,
+              BigInt(offset),
+              total,
+              bytes.subarray(offset, end),
+            ),
+          );
+        },
+      );
+      if (status.status === EXT_PUT_STATUS_ALREADY_HAVE) return;
+      if (status.status !== STATUS_OK) {
+        throw connectionError(
+          status.detail || `upload refused (status ${status.status})`,
+        );
+      }
+    }
+  }
+
+  /** Route one extension packet to whoever is waiting on its nonce. */
+  private handleExtensionMessage(bytes: Uint8Array): void {
+    const message = parseExtensionMessage(bytes);
+    if (!message) return;
+    if (message.kind === "list") {
+      const waiting = this.pendingExtensionLists.get(message.nonce);
+      if (!waiting) return;
+      this.pendingExtensionLists.delete(message.nonce);
+      if (message.status !== STATUS_OK) {
+        waiting.reject(
+          connectionError(
+            `Listing extensions failed (status ${message.status})`,
+          ),
+        );
+        return;
+      }
+      waiting.resolve(message.records);
+      return;
+    }
+    if (message.kind === "put-status") {
+      const waiting = this.pendingExtensionPuts.get(message.status.nonce);
+      if (!waiting) return;
+      this.pendingExtensionPuts.delete(message.status.nonce);
+      waiting.resolve(message.status);
+      return;
+    }
+    // A status carries its own refusal, so it resolves either way and the
+    // caller reads `status`; only a lost connection rejects.
+    const waiting = this.pendingExtensionStatuses.get(message.status.nonce);
+    if (!waiting) return;
+    this.pendingExtensionStatuses.delete(message.status.nonce);
+    waiting.resolve(message.status);
+  }
+
+  /** Tear down all extension bookkeeping (reconnect or dispose). */
+  private resetExtensions(error: Error): void {
+    for (const map of [
+      this.pendingExtensionLists,
+      this.pendingExtensionStatuses,
+      this.pendingExtensionPuts,
+    ]) {
+      for (const pending of map.values()) pending.reject(error);
+      map.clear();
+    }
+  }
+
+  /** Tear down all native-channel state (reconnect or dispose). */
+  private resetChannels(error: Error): void {
+    for (const pending of this.pendingChannelOpens.values()) {
+      pending.reject(error);
+    }
+    this.pendingChannelOpens.clear();
+    // A watch lives in the server's fabric, which forgets it with the
+    // endpoint. Nothing survives the transport, so the caller is told the set
+    // is empty rather than left holding whatever was last true.
+    const watches = [...this.channelNameWatches.values()];
+    this.channelNameWatches.clear();
+    for (const watch of watches) {
+      if (watch.settle) {
+        watch.settle.reject(error);
+        continue;
+      }
+      watch.present.clear();
+      watch.onNames(watch.present);
+    }
+    const entries = [...this.channels.values()];
+    this.channels.clear();
+    for (const entry of entries) {
+      if (entry.closed) continue;
+      entry.closed = true;
+      entry.options.onClosed?.(CHANNEL_CLOSE_PEER_GONE, error.message);
+    }
+  }
+
   /** Tear down all fs sync state (reconnect or dispose). */
   private resetFsSyncs(error: Error): void {
     for (const pending of this.pendingFsSyncs.values()) {
@@ -3351,6 +4056,10 @@ export class BlitConnection {
       pending.reject(error);
     }
     this.pendingFsGreps.clear();
+    for (const pending of this.pendingFsReads.values()) {
+      pending.reject(error);
+    }
+    this.pendingFsReads.clear();
     for (const pending of this.pendingFsIndexes.values()) {
       pending.reject(error);
     }
@@ -4786,7 +5495,9 @@ export class BlitConnection {
           }
         }
         return;
-      case S2C_CLIENT_LIST: {
+      case S2C_CLIENT_LIST:
+      case S2C_CLIENT_LIST2: {
+        const withOrigin = bytes[0] === S2C_CLIENT_LIST2;
         if (bytes.length < 3) return;
         const view = new DataView(
           bytes.buffer,
@@ -4882,6 +5593,29 @@ export class BlitConnection {
             });
             offset += 3;
           }
+          let origin: BlitClientOrigin | null = null;
+          if (withOrigin) {
+            if (offset + 3 > bytes.length) {
+              malformed();
+              return;
+            }
+            const originKind = bytes[offset];
+            const originLength = view.getUint16(offset + 1, true);
+            const originStart = offset + 3;
+            const originEnd = originStart + originLength;
+            if (originEnd > bytes.length) {
+              malformed();
+              return;
+            }
+            origin = readClientOrigin(
+              originKind,
+              view,
+              bytes,
+              originStart,
+              originEnd,
+            );
+            offset = originEnd;
+          }
           clients.push({
             id,
             ageSeconds,
@@ -4890,6 +5624,7 @@ export class BlitConnection {
             subscriptions,
             terminals,
             surfaces,
+            origin,
           });
         }
         if (offset !== bytes.length) {
@@ -5006,6 +5741,8 @@ export class BlitConnection {
         this.resetClientControl(connectionError("Server is shutting down"));
         this.resetGitRepos(connectionError("Server is shutting down"));
         this.resetLspAttachments(connectionError("Server is shutting down"));
+        this.resetChannels(connectionError("Server is shutting down"));
+        this.resetExtensions(connectionError("Server is shutting down"));
         this.resetKv(connectionError("Server is shutting down"));
         this.resetFragmentReassembly();
         this.termCwds.clear();
@@ -5283,6 +6020,8 @@ export class BlitConnection {
           supportsKv: (features & FEATURE_KV) !== 0,
           supportsDesktop: (features & FEATURE_DESKTOP) !== 0,
           supportsChannels: (features & FEATURE_CHANNEL) !== 0,
+          supportsChannelWatch: (features & FEATURE_CHANNEL_WATCH) !== 0,
+          supportsExtensions: (features & FEATURE_EXTENSION) !== 0,
           supportsDesktopMedia: (features & FEATURE_DESKTOP_MEDIA) !== 0,
           bootGeneration,
           serverVersion,
@@ -5304,6 +6043,8 @@ export class BlitConnection {
         this.startClientCatalogWatch();
         this.resetGitRepos(connectionError("Connection re-established"));
         this.resetLspAttachments(connectionError("Connection re-established"));
+        this.resetChannels(connectionError("Connection re-established"));
+        this.resetExtensions(connectionError("Connection re-established"));
         this.resetKv(connectionError("Connection re-established"));
         this.resetFragmentReassembly();
         // Pushed cwds belong to the old server session's ptys.
@@ -5887,6 +6628,23 @@ export class BlitConnection {
         }
         return;
       }
+      case S2C_FS_READ: {
+        const parsed = parseFsReadResult(bytes);
+        if (!parsed) return;
+        const pending = this.pendingFsReads.get(parsed.nonce);
+        if (!pending) return;
+        this.pendingFsReads.delete(parsed.nonce);
+        if (parsed.status === FS_DONE_OK) {
+          pending.resolve(parsed.records);
+        } else {
+          pending.reject(
+            connectionError(
+              `File read failed: ${fsDoneStatusText(parsed.status)}`,
+            ),
+          );
+        }
+        return;
+      }
       case S2C_FS_INDEX: {
         const parsed = parseFsIndexResult(bytes);
         if (!parsed) return;
@@ -6219,6 +6977,7 @@ export class BlitConnection {
       case S2C_GIT_BLAME:
       case S2C_GIT_REFLOG:
       case S2C_GIT_FETCH:
+      case S2C_GIT_WORKTREES:
       case S2C_GIT_RESOLVE: {
         if (bytes.length < 3) return;
         const nonce = bytes[1] | (bytes[2] << 8);
@@ -6228,6 +6987,16 @@ export class BlitConnection {
         // An abandoned request has already rejected; the reply only
         // releases its nonce.
         if (!pending.abandoned) pending.resolve(bytes.slice());
+        return;
+      }
+      case CHANNEL: {
+        this.handleChannelMessage(bytes);
+        return;
+      }
+      case S2C_EXT_STATUS:
+      case S2C_EXT_PUT_STATUS:
+      case S2C_EXT_INFO: {
+        this.handleExtensionMessage(bytes);
         return;
       }
       case S2C_LSP_OPENED: {
@@ -6417,6 +7186,8 @@ export class BlitConnection {
       this.resetFsSyncs(connectionError(`Transport ${status}`));
       this.resetGitRepos(connectionError(`Transport ${status}`));
       this.resetLspAttachments(connectionError(`Transport ${status}`));
+      this.resetChannels(connectionError(`Transport ${status}`));
+      this.resetExtensions(connectionError(`Transport ${status}`));
       this.resetKv(connectionError(`Transport ${status}`));
       this.resetFragmentReassembly();
       this.termCwds.clear();
