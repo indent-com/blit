@@ -745,6 +745,10 @@ fn on_channel(client: &mut Client, state: &mut State, packet: &[u8]) {
                         app.failures = 0;
                         app.next_attempt_ns = None;
                         if app.phase != Phase::Running {
+                            // Transient, not enabled: the supervisor only
+                            // launches what it has been told to want, and
+                            // this is how a one-off run says so.
+                            app.transient = true;
                             app.phase = Phase::Idle;
                         }
                     }
@@ -814,6 +818,9 @@ fn halt_app(client: &mut Client, state: &mut State, id: &str) {
         return;
     };
     app.phase = Phase::Stopped;
+    // Calling off a run that was never adopted: the request goes with it, or
+    // the next reconcile would start what was just stopped.
+    app.transient = false;
     app.next_attempt_ns = None;
     app.wayland_display = None;
     app.started_at_ns = None;
@@ -1625,6 +1632,9 @@ fn serve(
                     app.failures = 0;
                     app.next_attempt_ns = None;
                     if app.phase != Phase::Running {
+                        // See the channel's `start`: without this the
+                        // supervisor has been told nothing it acts on.
+                        app.transient = true;
                         app.phase = Phase::Idle;
                     }
                     out.push_str(&format!("starting {id}\n"));

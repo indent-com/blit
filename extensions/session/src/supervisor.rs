@@ -40,6 +40,19 @@ pub struct App {
     pub argv: Vec<String>,
     /// Operator intent, which survives a restart of anything.
     pub enabled: bool,
+    /// A run asked for without adopting it — `start` rather than `enable`.
+    ///
+    /// The two verbs differ only here. `enabled` is the answer to "should this
+    /// be running in every session from now on", and it is persisted; this is
+    /// the answer to "run it once, now", and it lasts until the process exits.
+    /// Without it there was no way to express the second: `start` set the phase
+    /// and [`App::attempt_due`] then refused to launch anything not enabled, so
+    /// the application sat in [`Phase::Idle`] — which a panel renders as
+    /// "starting" — for the rest of the session.
+    ///
+    /// Cleared by the exit, so a one-off run is not retried the way an enabled
+    /// one is. Trying an application is not asking for it to be kept alive.
+    pub transient: bool,
     pub phase: Phase,
     /// Endpoint-local handle for the live child, `None` when nothing runs.
     /// This is the id spawn/control/exit messages are addressed by, and it is
@@ -72,6 +85,7 @@ impl App {
             id,
             argv,
             enabled: false,
+            transient: false,
             phase: Phase::Stopped,
             process_id: None,
             process_ref: None,
@@ -133,6 +147,9 @@ impl App {
         }
         self.started_at_ns = None;
         self.next_attempt_ns = None;
+        // The one-off run is over, however it ended. Retrying it would turn
+        // "try this" into "keep this alive", which is what `enable` is for.
+        self.transient = false;
         if !self.enabled {
             self.phase = Phase::Stopped;
             return;
@@ -208,7 +225,10 @@ impl App {
 
     /// Whether an attempt is due at `now_ns`.
     pub fn attempt_due(&self, now_ns: i64) -> bool {
-        if !self.enabled {
+        // Enabled is the standing answer; transient is the one-off. Checking
+        // only the first is what made `start` a no-op on anything not already
+        // enabled.
+        if !self.enabled && !self.transient {
             return false;
         }
         match self.phase {
@@ -338,6 +358,50 @@ mod tests {
         assert_eq!(app.phase, Phase::Stopped);
         assert!(app.next_attempt_ns.is_none());
         assert!(!app.attempt_due(i64::MAX), "a disabled app is never due");
+    }
+
+    /// `start` is the whole point of the transient flag: without it the phase
+    /// said "starting" and nothing ever launched, because the supervisor only
+    /// acts on what it has been told to want.
+    #[test]
+    fn a_transient_start_is_due_even_though_nothing_is_enabled() {
+        let mut app = app();
+        app.enabled = false;
+        app.phase = Phase::Idle;
+        assert!(!app.attempt_due(0), "intent alone is not enough to launch");
+
+        app.transient = true;
+        assert!(app.attempt_due(0), "a one-off run is due at once");
+    }
+
+    /// Trying an application is not asking for it to be kept alive: the run
+    /// ends when the process does, however it ended.
+    #[test]
+    fn a_transient_run_is_not_retried_and_leaves_no_intent() {
+        let mut app = app();
+        app.enabled = false;
+        app.transient = true;
+        app.note_started(1, "d".to_string(), 0);
+        assert!(!app.attempt_due(i64::MAX), "a running app is not due");
+
+        // A crash, which for an enabled app would schedule a retry.
+        app.note_exit(1, 1_000, 0);
+        assert_eq!(app.phase, Phase::Stopped);
+        assert!(!app.transient, "the request went with the process");
+        assert!(!app.attempt_due(i64::MAX), "and nothing is due again");
+        assert!(!app.enabled, "a one-off run never became intent");
+    }
+
+    /// The two flags are independent: a transient start on something already
+    /// enabled must not disarm the restart loop when the process exits.
+    #[test]
+    fn a_transient_start_does_not_disturb_an_enabled_application() {
+        let mut app = app();
+        app.transient = true;
+        app.note_started(1, "d".to_string(), 0);
+        app.note_exit(1, 1_000, u64::MAX);
+        assert_eq!(app.phase, Phase::Backoff, "still enabled, so still retried");
+        assert!(!app.transient);
     }
 
     #[test]
