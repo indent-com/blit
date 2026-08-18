@@ -71,6 +71,7 @@ export function SystemdPanel(props: {
     const connectionId = props.connectionId;
     let live = true;
     let opened: SystemdUnitsHandle | null = null;
+    let unsubscribe: (() => void) | undefined;
     setHandle(null);
     setError(null);
     const connection = props.workspace.getConnection(connectionId);
@@ -90,14 +91,18 @@ export function SystemdPanel(props: {
         }
         opened = next;
         setHandle(next);
-        const unsubscribe = next.subscribe(() => setRevision((n) => n + 1));
-        onCleanup(unsubscribe);
+        // Not `onCleanup` here: a `then` runs with no reactive owner, so one
+        // registered inside it is never called — Solid says as much on the
+        // console — and every panel that opened a watcher leaked its
+        // subscription for the life of the page.
+        unsubscribe = next.subscribe(() => setRevision((n) => n + 1));
       })
       .catch(() => {
         if (live) setError(t("systemd.unavailable"));
       });
     onCleanup(() => {
       live = false;
+      unsubscribe?.();
       opened?.close();
     });
   });
