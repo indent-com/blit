@@ -279,7 +279,6 @@ const en: Messages = {
   "systemd.logsUnit": "Unit",
   "systemd.logsSearch": "Search messages",
   "systemd.logsRefresh": "Refresh",
-  "systemd.logsLive": "Live",
   "systemd.logsPaused": "Paused",
   "systemd.logsLiveBoot": "Only the running boot can be followed",
   "systemd.logsLoading": "Reading the journal...",
