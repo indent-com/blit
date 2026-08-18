@@ -14065,6 +14065,37 @@ const FS_INDEX_MAX_BYTES: usize = 48 * 1024 * 1024;
 /// with a bare `*` — the dotfiles-repo-at-$HOME pattern — blanks every
 /// non-repo subtree) falls back to an ignore-free walk: an empty index
 /// would otherwise read as "no files here" and never consult the server.
+/// Read one path for `FS_READ`: its record status and content.
+///
+/// `left` is what remains of the reply budget, so a file that would not fit is
+/// reported the same way one over the caller's own ceiling is — the caller is not
+/// getting it either way, and the distinction is not worth a status.
+fn read_one_for_fs_read(path: &str, per_file: u64, left: usize) -> (u8, Vec<u8>) {
+    use blit_remote::fs::{
+        FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_OTHER, FS_FILE_TOO_LARGE, FS_FILE_UNREADABLE,
+    };
+    let kind = |error: &std::io::Error| match error.kind() {
+        std::io::ErrorKind::NotFound => FS_FILE_NOT_FOUND,
+        std::io::ErrorKind::PermissionDenied => FS_FILE_UNREADABLE,
+        _ => FS_FILE_OTHER,
+    };
+    match std::fs::metadata(path) {
+        Err(error) => (kind(&error), Vec::new()),
+        // A directory has no content to answer with, and `FS_INDEX` is the
+        // message that describes one.
+        Ok(meta) if !meta.is_file() => (FS_FILE_UNREADABLE, Vec::new()),
+        Ok(meta) if meta.len() > per_file || meta.len() as usize > left => {
+            (FS_FILE_TOO_LARGE, Vec::new())
+        }
+        Ok(_) => match std::fs::read(path) {
+            // It grew between the stat and the read.
+            Ok(body) if body.len() as u64 > per_file => (FS_FILE_TOO_LARGE, Vec::new()),
+            Ok(body) => (FS_FILE_OK, body),
+            Err(error) => (kind(&error), Vec::new()),
+        },
+    }
+}
+
 fn fs_index_walk(root: &std::path::Path, max_entries: usize) -> (Vec<String>, bool) {
     fs_index_walk_kind(root, max_entries, false, false)
 }
@@ -14436,10 +14467,9 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
             // One-shot read of a fixed set of paths (docs/design/fs-read.md) —
             // no sync, nothing watched. Off-thread and capped by `reserve_read`
             // like every other walk in this family.
-            if let Some((nonce, flags, max_bytes, paths)) = parse_fs_read(data) {
+            if let Some((nonce, flags, max_bytes, groups)) = parse_fs_read(data) {
                 use blit_remote::fs::{
-                    FS_FILE_NOT_FOUND, FS_FILE_OK, FS_FILE_OTHER, FS_FILE_TOO_LARGE,
-                    FS_FILE_UNREADABLE, FS_READ_DEFAULT_BYTES, FS_READ_FIRST,
+                    FS_FILE_NOT_FOUND, FS_FILE_OK, FS_READ_DEFAULT_BYTES, FS_READ_FIRST,
                     FS_READ_MAX_TOTAL_BYTES, msg_fs_read_result,
                 };
                 if flags & !FS_READ_FIRST != 0 {
@@ -14464,51 +14494,29 @@ async fn handle_fs_message_with_jobs<O: OutboxSend>(
                     let first_only = flags & FS_READ_FIRST != 0;
                     let mut left = FS_READ_MAX_TOTAL_BYTES;
                     let mut records: Vec<(u8, String, Vec<u8>)> = Vec::new();
-                    for path in paths {
-                        let (status, body) = match std::fs::metadata(&path) {
-                            Err(err) => (
-                                match err.kind() {
-                                    std::io::ErrorKind::NotFound => FS_FILE_NOT_FOUND,
-                                    std::io::ErrorKind::PermissionDenied => FS_FILE_UNREADABLE,
-                                    _ => FS_FILE_OTHER,
-                                },
-                                Vec::new(),
-                            ),
-                            // A directory has no content to answer with, and
-                            // `FS_INDEX` is the message that describes one.
-                            Ok(meta) if !meta.is_file() => (FS_FILE_UNREADABLE, Vec::new()),
-                            Ok(meta) if meta.len() > per_file => (FS_FILE_TOO_LARGE, Vec::new()),
-                            Ok(meta) if meta.len() as usize > left => {
-                                (FS_FILE_TOO_LARGE, Vec::new())
-                            }
-                            Ok(_) => match std::fs::read(&path) {
-                                Ok(body) if body.len() as u64 > per_file => {
-                                    // It grew between the stat and the read.
-                                    (FS_FILE_TOO_LARGE, Vec::new())
+                    for group in groups {
+                        let mut answered = false;
+                        for path in group {
+                            let (status, body) = read_one_for_fs_read(&path, per_file, left);
+                            left = left.saturating_sub(body.len());
+                            // FIRST asks for the first path it can *have*, so a
+                            // miss, an unreadable file and an oversized one are
+                            // all stepped over rather than answered.
+                            if first_only {
+                                if status == FS_FILE_OK {
+                                    records.push((status, path, body));
+                                    answered = true;
+                                    break;
                                 }
-                                Ok(body) => (FS_FILE_OK, body),
-                                Err(err) => (
-                                    match err.kind() {
-                                        std::io::ErrorKind::NotFound => FS_FILE_NOT_FOUND,
-                                        std::io::ErrorKind::PermissionDenied => FS_FILE_UNREADABLE,
-                                        _ => FS_FILE_OTHER,
-                                    },
-                                    Vec::new(),
-                                ),
-                            },
-                        };
-                        left = left.saturating_sub(body.len());
-                        // FIRST asks for the first path it can *have*, so a
-                        // miss, an unreadable file and an oversized one are all
-                        // stepped over rather than answered.
-                        if first_only {
-                            if status == FS_FILE_OK {
-                                records.push((status, path, body));
-                                break;
+                                continue;
                             }
-                            continue;
+                            records.push((status, path, body));
                         }
-                        records.push((status, path, body));
+                        // One record per group either way, so a caller can align
+                        // answers with questions by position.
+                        if first_only && !answered {
+                            records.push((FS_FILE_NOT_FOUND, String::new(), Vec::new()));
+                        }
                     }
                     let borrowed: Vec<(u8, &str, &[u8])> = records
                         .iter()

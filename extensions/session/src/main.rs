@@ -303,19 +303,26 @@ fn run(mut client: Client) -> Result<(), Error> {
 /// the C0 range — an application name is arbitrary text from a `.desktop` file.
 fn push_json_string(out: &mut String, value: &str) {
     out.push('"');
-    for c in value.chars() {
-        match c {
+    // Copied in runs rather than character by character. This is the hot loop of
+    // the whole extension: an icon is a 30 KB data URL of base64, none of which
+    // needs escaping, and pushing that a `char` at a time cost seconds per
+    // screenful in an interpreter.
+    let mut rest = value;
+    while let Some(at) = rest.find(|c: char| c == '"' || c == '\\' || (c as u32) < 0x20) {
+        out.push_str(&rest[..at]);
+        let mut chars = rest[at..].chars();
+        let escaped = chars.next().unwrap_or(' ');
+        match escaped {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
+            other => out.push_str(&format!("\\u{:04x}", other as u32)),
         }
+        rest = chars.as_str();
     }
+    out.push_str(rest);
     out.push('"');
 }
 
@@ -480,49 +487,60 @@ fn resolve_icons(
         }
     }
 
-    // Names: one `FS_READ_FIRST` per name over the ranked candidates, so the
-    // first file that exists is also the one the ranking would have chosen.
-    // Every request goes out before any answer is collected — a batch is one
-    // wait, not one per name.
+    // Names: one message for the whole batch. Each name is a group of ranked
+    // candidates and `FS_READ_FIRST` answers each group with its own first hit,
+    // so the batch costs one round trip rather than one per name — which is what
+    // it cost when every name was its own request, and that was most of the time
+    // a screenful of artwork took.
     if !lookups.is_empty() {
         refresh_icon_dirs(client, state);
         let dirs = state.icon_dirs.clone();
-        let mut outstanding: Vec<(String, u16)> = Vec::new();
+        let mut asked: Vec<&String> = Vec::new();
+        let mut candidates: Vec<Vec<String>> = Vec::new();
         for name in &lookups {
-            let candidates = icon::candidates(&dirs, name);
-            if candidates.is_empty() {
+            let paths = icon::candidates(&dirs, name);
+            if paths.is_empty() {
                 state.cache_icon(name.clone(), None);
                 resolved.insert(name.clone(), None);
                 continue;
             }
-            let paths: Vec<&str> = candidates
+            asked.push(name);
+            candidates.push(paths);
+        }
+        // The protocol bounds the paths one message may carry, so a long icon
+        // path means fewer names per message rather than a refused request.
+        let per_message = (remote::fs::FS_READ_MAX_PATHS / (dirs.len() * 2).max(1)).max(1);
+        let mut at = 0;
+        while at < candidates.len() {
+            let end = (at + per_message).min(candidates.len());
+            let groups: Vec<Vec<&str>> = candidates[at..end]
                 .iter()
-                .map(String::as_str)
-                .take(remote::fs::FS_READ_MAX_PATHS)
+                .map(|paths| paths.iter().map(String::as_str).collect())
                 .collect();
-            if let Some(nonce) = fs_read_send(
+            let borrowed: Vec<&[&str]> = groups.iter().map(Vec::as_slice).collect();
+            // No reply says nothing about these names, so they are neither
+            // answered nor cached: the panel asks again and the next request
+            // gets a fresh attempt rather than a remembered failure.
+            let Some(records) = fs_read(
                 client,
                 state,
                 remote::fs::FS_READ_FIRST,
                 icon::MAX_ICON_BYTES,
-                &paths,
-            ) {
-                outstanding.push((name.clone(), nonce));
-            }
-        }
-        for (name, nonce) in outstanding {
-            // No reply says nothing about this name, so it is neither answered
-            // nor cached: the panel asks again and the next request gets a
-            // fresh attempt rather than a remembered failure.
-            let Some(records) = fs_read_collect(client, nonce) else {
-                continue;
+                &borrowed,
+            ) else {
+                break;
             };
-            let data_url = records
-                .into_iter()
-                .find(|(status, _, _)| *status == remote::fs::FS_FILE_OK)
-                .and_then(|(_, path, body)| icon::data_url(&path, &body));
-            state.cache_icon(name.clone(), data_url.clone());
-            resolved.insert(name, data_url);
+            // One record per group, in group order.
+            for (name, (status, path, body)) in asked[at..end].iter().zip(records) {
+                let data_url = if status == remote::fs::FS_FILE_OK {
+                    icon::data_url(&path, &body)
+                } else {
+                    None
+                };
+                state.cache_icon((*name).clone(), data_url.clone());
+                resolved.insert((*name).clone(), data_url);
+            }
+            at = end;
         }
     }
 
@@ -530,7 +548,9 @@ fn resolve_icons(
     if !absolute.is_empty() {
         for batch in absolute.chunks(remote::fs::FS_READ_MAX_PATHS) {
             let paths: Vec<&str> = batch.iter().map(String::as_str).collect();
-            let Some(records) = fs_read(client, state, 0, icon::MAX_ICON_BYTES, &paths) else {
+            let Some(records) =
+                fs_read(client, state, 0, icon::MAX_ICON_BYTES, &[paths.as_slice()])
+            else {
                 break;
             };
             for (status, path, body) in records {
@@ -626,11 +646,20 @@ fn send_json(client: &mut Client, conn: &mut Conn, payload: &str) -> bool {
 /// icons to rows by id, but a viewer watching them appear should see them in
 /// the order they were asked for.
 fn flush_queued(client: &mut Client, conn: &mut Conn) {
-    while let Some(payload) = conn.queued.first().cloned() {
+    // Taken rather than cloned, and drained once at the end: a queued icon is
+    // 30 KB, so copying each one to send it — and memmoving the rest of the
+    // queue after every send — was pure overhead on the path that matters.
+    let mut sent = 0;
+    while sent < conn.queued.len() {
+        let payload = core::mem::take(&mut conn.queued[sent]);
         if !send_json(client, conn, &payload) {
-            return;
+            conn.queued[sent] = payload;
+            break;
         }
-        conn.queued.remove(0);
+        sent += 1;
+    }
+    if sent > 0 {
+        conn.queued.drain(..sent);
     }
 }
 
@@ -1453,7 +1482,8 @@ fn read_desktop_files(
             .collect();
         for batch in entries.chunks(remote::fs::FS_READ_MAX_PATHS) {
             let paths: Vec<&str> = batch.iter().map(String::as_str).collect();
-            let Some(records) = fs_read(client, state, 0, MAX_DESKTOP_BYTES, &paths) else {
+            let Some(records) = fs_read(client, state, 0, MAX_DESKTOP_BYTES, &[paths.as_slice()])
+            else {
                 return out;
             };
             for (status, path, body) in records {
@@ -1480,9 +1510,9 @@ fn fs_read(
     state: &mut State,
     flags: u8,
     max_bytes: u32,
-    paths: &[&str],
+    groups: &[&[&str]],
 ) -> Option<Vec<(u8, String, Vec<u8>)>> {
-    let nonce = fs_read_send(client, state, flags, max_bytes, paths)?;
+    let nonce = fs_read_send(client, state, flags, max_bytes, groups)?;
     fs_read_collect(client, nonce)
 }
 
@@ -1497,10 +1527,10 @@ fn fs_read_send(
     state: &mut State,
     flags: u8,
     max_bytes: u32,
-    paths: &[&str],
+    groups: &[&[&str]],
 ) -> Option<u16> {
     let nonce = state.next_nonce();
-    let request = remote::fs::msg_fs_read(nonce, flags, max_bytes, paths)?;
+    let request = remote::fs::msg_fs_read(nonce, flags, max_bytes, groups)?;
     client.send(&request).ok()?;
     Some(nonce)
 }
@@ -1508,9 +1538,17 @@ fn fs_read_send(
 /// Collect one outstanding [`fs_read_send`]. Answers to the others wait in the
 /// client's pending queue, so they can be collected in any order.
 fn fs_read_collect(client: &mut Client, nonce: u16) -> Option<Vec<(u8, String, Vec<u8>)>> {
+    // The predicate reads the nonce out of the header instead of parsing the
+    // packet. `recv_matching` runs it over every reply already queued, and
+    // parsing decompresses a whole batch of file content to look at two bytes:
+    // with one request per name and a screenful in flight, that alone made a
+    // batch quadratic — 48 icons spent 8.8s decompressing answers that had
+    // already arrived.
+    let wanted = nonce.to_le_bytes();
     let reply = client
         .recv_matching(|packet| {
-            remote::fs::parse_fs_read_result(packet).is_some_and(|(n, _, _)| n == nonce)
+            packet.first().copied() == Some(remote::fs::S2C_FS_READ)
+                && packet.get(1..3) == Some(&wanted[..])
         })
         .ok()??;
     let (_, status, records) = remote::fs::parse_fs_read_result(&reply)?;
@@ -1535,8 +1573,10 @@ fn fs_index(client: &mut Client, state: &mut State, root: &str, flags: u8) -> Ve
     if client.send(&request).is_err() {
         return Vec::new();
     }
+    let wanted = nonce.to_le_bytes();
     let Ok(Some(reply)) = client.recv_matching(|packet| {
-        remote::fs::parse_fs_index_result(packet).is_some_and(|(n, _, _, _)| n == nonce)
+        packet.first().copied() == Some(remote::fs::S2C_FS_INDEX)
+            && packet.get(1..3) == Some(&wanted[..])
     }) else {
         return Vec::new();
     };

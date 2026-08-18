@@ -140,33 +140,38 @@ fn directory_rank(dir: &str) -> (u8, u32) {
 
 /// Base64, because a data URL is what an `<img>` can be handed.
 ///
-/// Written out rather than pulled in: this is the only encoder the extension
-/// needs, it has no dependency of its own, and the alternative was letting the
-/// bytes take a detour through `base64(1)`.
+/// Written out rather than pulled in: it is the only encoder the extension needs
+/// and it has no dependency of its own. Written over bytes rather than `char`s
+/// because this runs in an interpreter — wasmi, not a JIT — where a
+/// `String::push` per output character was the single most expensive thing the
+/// extension did. A screenful of artwork is a megabyte of input, and the
+/// character-at-a-time version spent seconds on it while the shell it replaced
+/// had `base64(1)` doing the same work natively.
 fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut out = alloc::vec![0u8; bytes.len().div_ceil(3) * 4];
+    let mut at = 0;
     for chunk in bytes.chunks(3) {
-        let (b0, b1, b2) = (
-            u32::from(chunk[0]),
-            chunk.get(1).map_or(0, |b| u32::from(*b)),
-            chunk.get(2).map_or(0, |b| u32::from(*b)),
-        );
+        let b0 = u32::from(chunk[0]);
+        let b1 = chunk.get(1).map_or(0, |b| u32::from(*b));
+        let b2 = chunk.get(2).map_or(0, |b| u32::from(*b));
         let word = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[(word >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(word >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(word >> 6) as usize & 63] as char
+        out[at] = ALPHABET[(word >> 18) as usize & 63];
+        out[at + 1] = ALPHABET[(word >> 12) as usize & 63];
+        out[at + 2] = if chunk.len() > 1 {
+            ALPHABET[(word >> 6) as usize & 63]
         } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[word as usize & 63] as char
+            b'='
+        };
+        out[at + 3] = if chunk.len() > 2 {
+            ALPHABET[word as usize & 63]
         } else {
-            '='
-        });
+            b'='
+        };
+        at += 4;
     }
-    out
+    // Every byte written came from the ASCII alphabet above.
+    String::from_utf8(out).unwrap_or_default()
 }
 
 /// The pixel size a themed icon directory promises, if its name says one.

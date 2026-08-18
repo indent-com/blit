@@ -107,7 +107,7 @@ every pending operation as a connection error in that case.
 | `0x4A` | `FS_UPLOAD_CHUNK`       | `[upload_id:2][offset:8][data:LZ4]` — sequential append; `offset` must equal the bytes accepted so far                                                                                                                                           |
 | `0x4B` | `FS_UPLOAD_FINISH`      | `[nonce:2][upload_id:2]` — land the upload (terminates it either way)                                                                                                                                                                            |
 | `0x4C` | `FS_UPLOAD_CANCEL`      | `[upload_id:2]` — abort the upload; no reply                                                                                                                                                                                                     |
-| `0x4D` | `FS_READ`               | `[nonce:2][flags:1][max_bytes:4][count:2] repeated{ [path_len:2][path:N] }` — one-shot read of a fixed set of paths, no sync ([design/fs-read.md](design/fs-read.md))                                                                             |
+| `0x4D` | `FS_READ`               | `[nonce:2][flags:1][max_bytes:4][group_count:2] repeated{ [path_count:2] repeated{ [path_len:2][path:N] } }` — one-shot read, no sync; a group is one question ([design/fs-read.md](design/fs-read.md))                                                                             |
 
 **Notes:**
 

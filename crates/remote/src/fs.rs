@@ -59,7 +59,8 @@ pub const C2S_FS_UPLOAD_FINISH: u8 = 0x4B;
 pub const C2S_FS_UPLOAD_CANCEL: u8 = 0x4C;
 
 /// Read whole files without a sync (docs/design/fs-read.md):
-/// [0x4D][nonce:2][flags:1][max_bytes:4][count:2] then count × [path_len:2][path:N].
+/// [0x4D][nonce:2][flags:1][max_bytes:4][group_count:2] then group_count ×
+/// ( [path_count:2] then path_count × [path_len:2][path:N] ).
 ///
 /// The family's one-shot read. `FS_FETCH` needs an established sync — a watched
 /// tree, which is the wrong shape for reading a fixed set of files once — so
@@ -70,6 +71,10 @@ pub const C2S_FS_UPLOAD_CANCEL: u8 = 0x4C;
 /// `max_bytes` is the per-file ceiling, zero meaning [`FS_READ_DEFAULT_BYTES`];
 /// a larger file is reported rather than read, so a caller drawing 2em tiles
 /// does not have a theme's megabyte SVG pushed at it. `flags` is `FS_READ_FIRST`.
+///
+/// Paths are grouped, and a group is one question: with `FS_READ_FIRST` each
+/// group is answered by its own first readable path, so one message can resolve
+/// a whole screenful of icons rather than one message per icon.
 pub const C2S_FS_READ: u8 = 0x4D;
 
 /// Sync accepted or rejected: [0x40][nonce:2][sync_id:2][status:1][detail_len:2][detail:N]
@@ -243,12 +248,14 @@ pub const FS_FILE_TOO_LARGE: u8 = 4;
 
 // C2S_FS_READ flags (docs/design/fs-read.md).
 
-/// Answer only the first path that can be read, and read no further.
+/// Answer each group with the first path in it that can be read.
 ///
 /// This is the search-path question — the first of these that exists, in my
 /// order of preference — which is otherwise a round trip per candidate. A path
 /// that is missing, unreadable or too large is stepped over rather than
-/// answered, so `count` is one record or none.
+/// answered. There is exactly one record per group, in group order: a group that
+/// matched nothing carries `FS_FILE_NOT_FOUND` and an empty path, so a caller
+/// can align answers with questions by position.
 pub const FS_READ_FIRST: u8 = 1 << 0;
 
 /// Paths one `FS_READ` may name. Generous because the shape it replaces is a
@@ -1059,57 +1066,87 @@ pub fn parse_fs_index_result(data: &[u8]) -> Option<(u16, u8, u8, Vec<String>)> 
 }
 
 /// Build a `C2S_FS_READ`. `max_bytes` of zero asks for the server default.
-pub fn msg_fs_read(nonce: u16, flags: u8, max_bytes: u32, paths: &[&str]) -> Option<Vec<u8>> {
-    if paths.is_empty() || paths.len() > FS_READ_MAX_PATHS {
+///
+/// Paths come in groups, and a group is one question. Without `FS_READ_FIRST`
+/// the groups are read straight through and the distinction does not matter; with
+/// it each group is answered by its own first readable path, which is what lets
+/// one message resolve a screenful of icons instead of one message per icon.
+pub fn msg_fs_read(nonce: u16, flags: u8, max_bytes: u32, groups: &[&[&str]]) -> Option<Vec<u8>> {
+    let total: usize = groups.iter().map(|group| group.len()).sum();
+    if groups.is_empty() || total == 0 || total > FS_READ_MAX_PATHS {
         return None;
     }
-    let count = u16::try_from(paths.len()).ok()?;
-    let mut m = Vec::with_capacity(10 + paths.iter().map(|p| 2 + p.len()).sum::<usize>());
+    let group_count = u16::try_from(groups.len()).ok()?;
+    let mut m = Vec::with_capacity(10 + total * 32);
     m.push(C2S_FS_READ);
     m.extend_from_slice(&nonce.to_le_bytes());
     m.push(flags);
     m.extend_from_slice(&max_bytes.to_le_bytes());
-    m.extend_from_slice(&count.to_le_bytes());
-    for path in paths {
-        if u16::try_from(path.len()).is_err() {
-            return None;
+    m.extend_from_slice(&group_count.to_le_bytes());
+    for group in groups {
+        let count = u16::try_from(group.len()).ok()?;
+        m.extend_from_slice(&count.to_le_bytes());
+        for path in *group {
+            if u16::try_from(path.len()).is_err() {
+                return None;
+            }
+            push_str(&mut m, path);
         }
-        push_str(&mut m, path);
     }
     Some(m)
 }
 
-/// Parse a `C2S_FS_READ` → `(nonce, flags, max_bytes, paths)`.
-pub fn parse_fs_read(data: &[u8]) -> Option<(u16, u8, u32, Vec<String>)> {
-    // [0x4D][nonce:2][flags:1][max_bytes:4][count:2] then count × [len:2][path:N]
+/// Build a one-group `C2S_FS_READ`, the plain "read these files" case.
+pub fn msg_fs_read_paths(nonce: u16, flags: u8, max_bytes: u32, paths: &[&str]) -> Option<Vec<u8>> {
+    msg_fs_read(nonce, flags, max_bytes, &[paths])
+}
+
+/// Parse a `C2S_FS_READ` → `(nonce, flags, max_bytes, groups)`.
+pub fn parse_fs_read(data: &[u8]) -> Option<(u16, u8, u32, Vec<Vec<String>>)> {
+    // [0x4D][nonce:2][flags:1][max_bytes:4][group_count:2]
+    // then group_count × ( [path_count:2] then path_count × [len:2][path:N] )
     if data.first().copied() != Some(C2S_FS_READ) || data.len() < 10 {
         return None;
     }
     let nonce = u16::from_le_bytes([data[1], data[2]]);
     let flags = data[3];
     let max_bytes = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-    let count = u16::from_le_bytes([data[8], data[9]]) as usize;
-    if count == 0 || count > FS_READ_MAX_PATHS {
+    let group_count = u16::from_le_bytes([data[8], data[9]]) as usize;
+    if group_count == 0 || group_count > FS_READ_MAX_PATHS {
         return None;
     }
-    let mut paths = Vec::with_capacity(count);
+    let mut groups = Vec::with_capacity(group_count);
+    let mut total = 0usize;
     let mut off = 10;
-    for _ in 0..count {
+    for _ in 0..group_count {
         if off + 2 > data.len() {
             return None;
         }
-        let len = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
+        let count = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
         off += 2;
-        if off + len > data.len() {
+        total = total.checked_add(count)?;
+        if total > FS_READ_MAX_PATHS {
             return None;
         }
-        paths.push(String::from_utf8(data[off..off + len].to_vec()).ok()?);
-        off += len;
+        let mut paths = Vec::with_capacity(count);
+        for _ in 0..count {
+            if off + 2 > data.len() {
+                return None;
+            }
+            let len = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
+            off += 2;
+            if off + len > data.len() {
+                return None;
+            }
+            paths.push(String::from_utf8(data[off..off + len].to_vec()).ok()?);
+            off += len;
+        }
+        groups.push(paths);
     }
-    if off != data.len() {
+    if off != data.len() || total == 0 {
         return None;
     }
-    Some((nonce, flags, max_bytes, paths))
+    Some((nonce, flags, max_bytes, groups))
 }
 
 /// Build an `S2C_FS_READ` from `(status, path, content)` records, in request
@@ -3008,16 +3045,30 @@ mod tests {
     #[test]
     fn read_request_round_trips() {
         let paths = ["/usr/share/applications/vlc.desktop", "/etc/os-release"];
-        let wire = msg_fs_read(7, FS_READ_FIRST, 4096, &paths).expect("builds");
+        let wire = msg_fs_read_paths(7, 0, 4096, &paths).expect("builds");
         assert_eq!(
             parse_fs_read(&wire),
             Some((
                 7,
-                FS_READ_FIRST,
+                0,
                 4096,
-                paths.iter().map(|p| (*p).to_string()).collect()
+                vec![paths.iter().map(|p| (*p).to_string()).collect()]
             ))
         );
+    }
+
+    /// One group per question, which is what makes a screenful of icons one
+    /// message: each group is answered by its own first readable path.
+    #[test]
+    fn a_grouped_request_keeps_its_groups() {
+        let first: &[&str] = &["/i/scalable/apps/a.svg", "/i/48x48/apps/a.png"];
+        let second: &[&str] = &["/i/scalable/apps/b.svg"];
+        let wire = msg_fs_read(9, FS_READ_FIRST, 0, &[first, second]).expect("builds");
+        let (nonce, flags, max_bytes, groups) = parse_fs_read(&wire).expect("parses");
+        assert_eq!((nonce, flags, max_bytes), (9, FS_READ_FIRST, 0));
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[1], vec!["/i/scalable/apps/b.svg".to_string()]);
     }
 
     #[test]
@@ -3051,11 +3102,13 @@ mod tests {
     #[test]
     fn read_rejects_what_it_cannot_answer() {
         assert!(msg_fs_read(1, 0, 0, &[]).is_none());
+        assert!(msg_fs_read_paths(1, 0, 0, &[]).is_none());
+        // The cap is on paths in total, however they are grouped.
         let too_many: Vec<&str> = vec!["/x"; FS_READ_MAX_PATHS + 1];
-        assert!(msg_fs_read(1, 0, 0, &too_many).is_none());
+        assert!(msg_fs_read_paths(1, 0, 0, &too_many).is_none());
         // A count that outruns the body, and trailing bytes past the last path.
         assert!(parse_fs_read(&[C2S_FS_READ, 1, 0, 0, 0, 0, 0, 0, 2, 0]).is_none());
-        let mut trailing = msg_fs_read(1, 0, 0, &["/x"]).expect("builds");
+        let mut trailing = msg_fs_read_paths(1, 0, 0, &["/x"]).expect("builds");
         trailing.push(0);
         assert!(parse_fs_read(&trailing).is_none());
         // Zero paths is not a request the server should have to interpret.

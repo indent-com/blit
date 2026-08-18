@@ -24,16 +24,19 @@ authority in one message instead of three.
 ## Wire
 
 ```
-C2S_FS_READ  [0x4D][nonce:2][flags:1][max_bytes:4][count:2]
-             then count × [path_len:2][path:N]
+C2S_FS_READ  [0x4D][nonce:2][flags:1][max_bytes:4][group_count:2]
+             then group_count × ( [path_count:2]
+                                  then path_count × [path_len:2][path:N] )
 
 S2C_FS_READ  [0x48][nonce:2][status:1][count:2][records:LZ4]
              records = count × [status:1][path_len:2][path:N][size:4][data:size]
 ```
 
-Paths are independent and answered in request order. `count` is 1 to
-`FS_READ_MAX_PATHS` (512). `max_bytes` is the per-file ceiling, zero meaning
-`FS_READ_DEFAULT_BYTES` (1 MiB).
+Paths come in groups, and a group is one question. Without `FS_READ_FIRST` the
+groups are read straight through and the grouping does not matter; with it each
+group is answered by its own first readable path. Paths total 1 to
+`FS_READ_MAX_PATHS` (512) however they are grouped. `max_bytes` is the per-file
+ceiling, zero meaning `FS_READ_DEFAULT_BYTES` (1 MiB).
 
 `status` is the common registry (`FS_DONE_*`): `INVALID` for unknown flags,
 `BUDGET` when too many reads are already in flight for this connection, `OK`
@@ -57,16 +60,18 @@ remainder in smaller batches.
 
 ### `FS_READ_FIRST`
 
-With `flags` bit 0 set, the server answers the first path it can read and stops:
-`count` is one record, or none at all when nothing matched. Missing, unreadable
-and oversized paths are stepped over rather than reported.
+With `flags` bit 0 set, each group is answered by the first path in it that can
+be read; missing, unreadable and oversized paths are stepped over rather than
+reported. There is exactly one record per group, in group order, so answers align
+with questions by position: a group that matched nothing carries
+`FS_FILE_NOT_FOUND` and an empty path.
 
 This is the search-path question — *the first of these that exists, in my order
 of preference* — which is otherwise a round trip per candidate. The icon lookup
 is exactly this: rank every directory on the icon path once, then ask for
-`dir/name.svg`, `dir/name.png`, … in that order and take the first hit. A caller
-with many such questions should send them all before collecting any; they are
-independent and the answers may be collected in any order.
+`dir/name.svg`, `dir/name.png`, … in that order and take the first hit. Groups
+are what make a screenful of them one message: one group per name, and the reply
+carries one record per name.
 
 ## `FS_INDEX` flags
 
