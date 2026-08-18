@@ -19,26 +19,26 @@ import {
 
 export const PUBLIC_REGISTRY = "https://install.blit.sh/ext";
 
-/** Offset from the UI's port to the dev stack's registry (see `bin/dev`). */
-const DEV_REGISTRY_PORT_OFFSET = 3;
+/** Path the `vite dev` server proxies to the stack's own registry. */
+const DEV_REGISTRY_PATH = "/ext";
 
 /**
  * Where the panel looks first.
  *
- * Under `vite dev` that is the stack's own registry, three ports up from the
- * page — `bin/dev` allocates a block per instance, so a second stack's page
- * offers a second stack's modules. Anywhere else it is the published one.
- * Deciding here rather than in the panel keeps "which registry" one answer
- * instead of one per caller.
+ * Under `vite dev` that is the stack's own registry, reached through the page
+ * itself: the dev server proxies `/ext` to the port `bin/dev` allocated for
+ * this instance, so a second stack's page still offers that stack's modules.
+ * Going through the origin rather than a derived port is what makes it work
+ * behind a reverse proxy — a page served at https://host/ has no port to
+ * offset from, and the registry listens on loopback only, so the offset only
+ * ever resolved for a browser on the dev machine. Anywhere else this is the
+ * published registry. Deciding here rather than in the panel keeps "which
+ * registry" one answer instead of one per caller.
  */
 export function defaultRegistry(): string {
   const dev = import.meta.env?.DEV === true;
   if (!dev || typeof location === "undefined") return PUBLIC_REGISTRY;
-  const port = Number(location.port);
-  if (!Number.isInteger(port) || port <= 0) return PUBLIC_REGISTRY;
-  return `${location.protocol}//${location.hostname}:${
-    port + DEV_REGISTRY_PORT_OFFSET
-  }`;
+  return `${location.origin}${DEV_REGISTRY_PATH}`;
 }
 
 export interface RegistryEntry {

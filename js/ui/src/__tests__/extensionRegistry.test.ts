@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   PUBLIC_REGISTRY,
+  defaultRegistry,
   fetchRegistry,
   installFromRegistry,
   type Registry,
@@ -37,6 +38,23 @@ describe("extension registry", () => {
     );
     expect(registry.extensions.map((entry) => entry.name)).toEqual(["systemd"]);
     expect(registry.extensions[0]!.brotliBytes).toBe(36950);
+  });
+
+  // A dev page is often reached over a tunnel (https://host/, no port) and
+  // the stack's registry listens on loopback only. Deriving a port from the
+  // page sent those sessions to the public registry instead; staying on the
+  // origin lets the dev server proxy it.
+  it("defaults to the page's own origin in dev, whatever the port", () => {
+    for (const href of [
+      "https://blitdev.example.com/",
+      "http://127.0.0.1:10000/",
+      "http://127.0.0.1:10010/",
+    ]) {
+      const url = new URL(href);
+      vi.stubGlobal("location", { origin: url.origin });
+      expect(defaultRegistry()).toBe(`${url.origin}/ext`);
+    }
+    vi.unstubAllGlobals();
   });
 
   it("reports an unreachable registry rather than showing nothing", async () => {

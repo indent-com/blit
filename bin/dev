@@ -45,9 +45,10 @@ export BLIT_DEV_UI_PORT="${BLIT_DEV_UI_PORT:-$(( BASE ))}"
 export BLIT_DEV_GW_PORT="${BLIT_DEV_GW_PORT:-$(( BASE + 1 ))}"
 export BLIT_DEV_SITE_PORT="${BLIT_DEV_SITE_PORT:-$(( BASE + 2 ))}"
 # The stack's own extension registry: extensions/dist served with CORS, which
-# is what the UI's Extensions panel installs from in dev. Its port is derived
-# from the UI port the same way the UI derives it, so a second instance's page
-# reaches that instance's modules and not the first one's.
+# is what the UI's Extensions panel installs from in dev. The vite dev server
+# is told this port and proxies /ext to it, so a second instance's page reaches
+# that instance's modules and not the first one's — and a page reached through
+# a tunnel reaches them at all, which a bare loopback port cannot offer.
 export BLIT_DEV_EXT_PORT="${BLIT_DEV_EXT_PORT:-$(( BASE + 3 ))}"
 # Browser-facing WebTransport authority. A leading `:port` keeps the browser
 # page hostname; `hostname:port` overrides both.

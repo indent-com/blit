@@ -148,6 +148,9 @@ processes:
     command: cd js/ui && pnpm exec vite --host --port ${BLIT_DEV_UI_PORT:-10000}
     environment:
       - BLIT_DEV_GW_PORT=${BLIT_DEV_GW_PORT:-10001}
+      # The dev server proxies /ext here, which is how the Extensions panel
+      # reaches this instance's registry from a page served over a tunnel.
+      - BLIT_DEV_EXT_PORT=${BLIT_DEV_EXT_PORT:-10003}
     depends_on:
       js-deps:
         condition: process_completed_successfully

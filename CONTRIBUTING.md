@@ -163,8 +163,12 @@ Every port and socket path is derived from `DEV_INSTANCE` (default `0`). Each in
 DEV_INSTANCE=1 ./bin/dev   # second stack on 10010-10013
 ```
 
-The UI derives the registry port the same way, so the Extensions tab of a
-remote offers the modules _this_ stack built rather than the published ones.
+The UI dev server proxies `/ext` to its own instance's registry, so the
+Extensions tab of a remote offers the modules _this_ stack built rather than
+the published ones. It goes through the page's origin rather than straight to
+`127.0.0.1:10003` so that it also works when the dev UI is reached through a
+tunnel or reverse proxy, where there is no port to derive from and the registry
+port is not published.
 
 `bin/dev` prints the concrete addresses on startup. `DEV_INSTANCE` is intentionally unprefixed: blit strips most `BLIT_*` variables from child terminals, but passes everything else through. This means `DEV_INSTANCE` propagates into nested shells so you always know which instance you're inside and can pick a different one. You can also override individual values:
 
