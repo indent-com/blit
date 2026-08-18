@@ -370,9 +370,7 @@ export function SystemdLogs(props: {
             pane from a stopped one now that the pane itself is quiet. */}
         <span data-journal-live={tailing() ? "on" : "off"}>
           <Show when={!tailing()}>
-            {canFollow()
-              ? t("systemd.logsPaused")
-              : t("systemd.logsLiveBoot")}
+            {canFollow() ? t("systemd.logsPaused") : t("systemd.logsLiveBoot")}
           </Show>
         </span>
         <Show when={busy()}>

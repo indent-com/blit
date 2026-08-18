@@ -929,8 +929,28 @@ fn route(client: &mut Client, state: &mut State, packet: &[u8]) -> bool {
             let Ok(started) = remote::process::parse_process_started(packet) else {
                 return false;
             };
+            // A refused spawn is the only word this will ever get: there is no
+            // child, so no exit is coming either. Dropping it left the
+            // application in `Running` with nothing running — for the rest of
+            // the session, since `attempt_due` does not reconsider a phase it
+            // believes. An entry whose `Exec` names a binary that is not there
+            // is the ordinary way to reach this.
+            //
+            // Counted as a failed run, exactly as `reconcile` treats a launch
+            // that could not even be sent: an enabled application backs off and
+            // tries again, a one-off run stops.
             if started.status != remote::STATUS_OK {
-                return false;
+                let now = client.monotonic_now().raw_nanos();
+                let mut random = [0u8; 8];
+                let _ = client.random(&mut random);
+                if let Some(app) = state
+                    .apps
+                    .values_mut()
+                    .find(|app| app.process_id == Some(started.process_id))
+                {
+                    app.note_exit(-1, now, u64::from_le_bytes(random));
+                }
+                return true;
             }
             let Some(app) = state
                 .apps
