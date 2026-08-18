@@ -419,6 +419,12 @@ struct Arms {
     /// [`Engine::ignore_watch_dirs`] excludes anything under them — so
     /// these arm once and are only re-armed when the configured path moves.
     ignore_paths: Vec<PathBuf>,
+    /// `<common>/worktrees` while it is armed, `None` while it does not
+    /// exist. Its own slot rather than a `gitdir_paths` entry because it
+    /// has to be re-checked every pass: the directory is created by the
+    /// *first* `git worktree add`, long after `arm_gitdir` has run once and
+    /// latched, and without a re-arm every later add would go unseen.
+    worktrees_path: Option<PathBuf>,
     /// The worktree watch is up (a status subscriber exists).
     worktree: bool,
     /// Worktree directories armed one at a time (`NonRecursive`), the root
@@ -861,6 +867,7 @@ impl Engine {
             watcher,
             gitdir_paths: Vec::new(),
             ignore_paths: Vec::new(),
+            worktrees_path: None,
             worktree: false,
             worktree_dirs: BTreeSet::new(),
             worktree_pruned: false,
@@ -1072,6 +1079,46 @@ impl Engine {
         }
         self.publish_worktree_watches();
         self.sync_ignore_watch();
+        self.sync_worktrees_watch();
+    }
+
+    /// Arm (or drop) the watch on `<common>/worktrees`, the directory
+    /// behind `WORKTREE_GEN`.
+    ///
+    /// Recursive, because the events that matter happen one level down: a
+    /// `git worktree move` rewrites `worktrees/<id>/gitdir` in place and a
+    /// lock creates `worktrees/<id>/locked`, neither of which touches the
+    /// mtime of the directory being watched. Idempotent and re-checked
+    /// every pass, so the directory appearing (first `worktree add`) or
+    /// vanishing (`worktree prune` of the last one) is picked up — the
+    /// first add is seen by the non-recursive watch on `common` regardless,
+    /// which is what brings us back here to arm for the second.
+    fn sync_worktrees_watch(&mut self) {
+        use notify::Watcher as _;
+        let want = self.common.join("worktrees");
+        let want = want.is_dir().then_some(want);
+        let Some(arms) = &mut self.watch else {
+            return;
+        };
+        if arms.worktrees_path == want {
+            return;
+        }
+        let Arms {
+            watcher,
+            worktrees_path,
+            ..
+        } = arms;
+        let mut paths = watcher.paths_mut();
+        if let Some(old) = worktrees_path.take() {
+            let _ = paths.remove(&old);
+        }
+        if let Some(dir) = &want
+            && paths.add(dir, notify::RecursiveMode::Recursive).is_ok()
+        {
+            *worktrees_path = Some(dir.clone());
+        }
+        let _ = paths.commit();
+        arms.stream_rebuilt = true;
     }
 
     /// Reconcile the per-directory worktree watch set with the tree and
@@ -1637,6 +1684,7 @@ impl Engine {
         op_record(repo, &mut base);
         special_ref_records(repo, &mut base);
         stash_records(repo, entries_max, &mut base);
+        worktree_gen_record(repo, &mut base);
         let remotes = demand.remotes.then(|| {
             let mut records = Vec::new();
             remote_records(repo, &mut records);
@@ -2454,6 +2502,74 @@ fn stash_records(repo: &gix::Repository, entries_max: usize, records: &mut Vec<u
                 msg: &msg,
             },
         );
+    }
+}
+
+/// The worktree set's generation: how many there are, and a digest that
+/// moves whenever one is added, removed, moved, or (un)locked.
+///
+/// Deliberately never opens a repository or resolves a ref — that is what
+/// `GIT_WORKTREES` is for, and it would be far too expensive here, where
+/// this runs on every ref settle. Two stats per linked worktree:
+///
+///  - the entry **name**, which covers add and remove;
+///  - its `gitdir` file's **mtime**, which covers `git worktree move` (the
+///    move rewrites that file in place, so the containing directory's own
+///    mtime does not budge);
+///  - whether `locked` exists, which covers lock and unlock.
+///
+/// The per-entry hashes are XOR-folded, so the digest does not depend on
+/// readdir order — entry names are unique within the directory, so no two
+/// can cancel each other out. Add-then-remove returning to the previous
+/// digest is correct: the set really is the one from before.
+fn worktree_gen_record(repo: &gix::Repository, records: &mut Vec<u8>) {
+    // The main worktree is always one of them, and gix's `worktrees()`
+    // counts only the linked ones. A bare repository has no main worktree,
+    // so it contributes nothing.
+    let mut count: u32 = u32::from(!repo.is_bare());
+    let mut digest: u64 = 0;
+    if let Ok(entries) = std::fs::read_dir(repo.common_dir().join("worktrees")) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            let gitdir = dir.join("gitdir");
+            // Same test `worktrees()` uses to decide an entry is a
+            // worktree at all, so the count cannot disagree with the list.
+            if !gitdir.is_file() {
+                continue;
+            }
+            count = count.saturating_add(1);
+            let mut h = Fnv::new();
+            h.write(blit_fssync::escape_path(&dir).as_bytes());
+            if let Ok(mtime) = gitdir.metadata().and_then(|m| m.modified())
+                && let Ok(since) = mtime.duration_since(std::time::UNIX_EPOCH)
+            {
+                h.write(&since.as_nanos().to_le_bytes());
+            }
+            h.write(&[u8::from(dir.join("locked").is_file())]);
+            digest ^= h.finish();
+        }
+    }
+    append_git_state_record(records, &GitStateRecord::WorktreeGen { count, digest });
+}
+
+/// FNV-1a, so the digest is reproducible across processes and releases —
+/// `DefaultHasher`'s algorithm is explicitly not.
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
     }
 }
 

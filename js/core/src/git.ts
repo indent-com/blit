@@ -94,6 +94,10 @@ export const C2S_GIT_BLAME = 0xb2;
 export const C2S_GIT_REFLOG = 0xb3;
 /** Fetch from a remote: [0xB4][nonce:2][repo_id:2][flags:1][timeout_ms:4][remote_len:2][remote:N][n_refspecs:2][(len:2, refspec:N)·N] */
 export const C2S_GIT_FETCH = 0xb4;
+/** List the repository's worktrees: [0xB5][nonce:2][repo_id:2][flags:1][after_pos:8].
+ *  The main worktree plus every linked one, from wherever in the set the
+ *  repo was opened. Refetch when {@link GitStateMirror.worktreeGen} moves. */
+export const C2S_GIT_WORKTREES = 0xb5;
 
 /** Discovery reply: [0xB1][nonce:2][status:1][flags:1][records:LZ4] */
 export const S2C_GIT_DISCOVER = 0xb1;
@@ -103,6 +107,8 @@ export const S2C_GIT_BLAME = 0xb2;
 export const S2C_GIT_REFLOG = 0xb3;
 /** Fetch reply: [0xB4][nonce:2][status:1][flags:1][records:LZ4] */
 export const S2C_GIT_FETCH = 0xb4;
+/** Worktree list reply: [0xB5][nonce:2][status:1][flags:1][records:LZ4] */
+export const S2C_GIT_WORKTREES = 0xb5;
 
 /** `S2C_HELLO` feature bit: server supports the `GIT_*` message family. */
 export const FEATURE_GIT = 1 << 7;
@@ -232,6 +238,7 @@ export const GIT_DIFF_RENAME_LIMIT = 1 << 1;
 export const GIT_DISCOVER_TRUNCATED = 1 << 0;
 export const GIT_BLAME_TRUNCATED = 1 << 0;
 export const GIT_REFLOG_TRUNCATED = 1 << 0;
+export const GIT_WORKTREES_TRUNCATED = 1 << 0;
 
 // C2S_GIT_DISCOVER request flags.
 /** Descend into a repository once one is found (off by default). */
@@ -274,6 +281,8 @@ export const GIT_STATE_RECORD_STATUS = 0x04;
 export const GIT_STATE_RECORD_UPSTREAM = 0x05;
 export const GIT_STATE_RECORD_STASH = 0x06;
 export const GIT_STATE_RECORD_REMOTE = 0x07;
+/** The worktree set's generation: [kind:1][count:4][digest:8]. */
+export const GIT_STATE_RECORD_WORKTREE_GEN = 0x08;
 /** Reserved family-wide in every records payload: where a budget-truncated
  *  response stopped. `TRUNCATED` with no `CURSOR` means unresumable. */
 export const GIT_RECORD_CURSOR = 0x7f;
@@ -329,11 +338,29 @@ export const GIT_INDEX_RECORD_ENTRY = 0x04;
 export const GIT_INDEX_INTENT_TO_ADD = 1 << 0;
 export const GIT_INDEX_SKIP_WORKTREE = 1 << 1;
 
-// 0xB1-0xB4 record kinds and flags.
+// 0xB1-0xB5 record kinds and flags.
 export const GIT_DISCOVER_RECORD_REPO = 0x01;
 export const GIT_BLAME_RECORD_RANGE = 0x01;
 export const GIT_REFLOG_RECORD_ENTRY = 0x01;
 export const GIT_FETCH_RECORD_REF = 0x01;
+export const GIT_WORKTREES_RECORD_TREE = 0x01;
+/** The main worktree — exactly one record carries this, including when the
+ *  repo was opened through a linked worktree. */
+export const GIT_WORKTREE_MAIN = 1 << 0;
+/** The worktree this repo handle was opened at. Decided server-side by
+ *  identity, so a client need not compare paths it may have canonicalized
+ *  differently. */
+export const GIT_WORKTREE_CURRENT = 1 << 1;
+/** `git worktree lock`ed; `lockReason` says why, when a reason was given. */
+export const GIT_WORKTREE_LOCKED = 1 << 2;
+/** The checkout is gone from disk — `git worktree prune` would drop the
+ *  entry. Reported rather than hidden: a row that cannot be navigated to is
+ *  the thing a client most needs to be told about. */
+export const GIT_WORKTREE_PRUNABLE = 1 << 3;
+/** HEAD is detached, so `branch` is empty. */
+export const GIT_WORKTREE_DETACHED = 1 << 4;
+/** Bare: no checkout at all, so `path` is empty. Only ever the main record. */
+export const GIT_WORKTREE_BARE = 1 << 5;
 export const GIT_FOUND_BARE = 1 << 0;
 export const GIT_FOUND_LINKED = 1 << 1;
 export const GIT_FOUND_SUBMODULE = 1 << 2;
@@ -767,6 +794,26 @@ export function msgGitReflog(req: GitReflogRequest): Uint8Array {
   return new Uint8Array(buf);
 }
 
+export interface GitWorktreesRequest {
+  nonce: number;
+  repoId: number;
+  /** No flags are defined; a non-zero value is refused (`INVALID`) rather
+   *  than ignored, so a future bit cannot be silently dropped. */
+  flags?: number;
+  /** Worktrees already delivered, so a set larger than the server's budget
+   *  pages: re-issue with the `CURSOR`'s `pos`. */
+  afterPos?: number;
+}
+
+export function msgGitWorktrees(req: GitWorktreesRequest): Uint8Array {
+  const buf: number[] = [C2S_GIT_WORKTREES];
+  pushU16(buf, req.nonce);
+  pushU16(buf, req.repoId);
+  buf.push(req.flags ?? 0);
+  pushU64(buf, req.afterPos ?? 0);
+  return new Uint8Array(buf);
+}
+
 export interface GitFetchRequest {
   nonce: number;
   repoId: number;
@@ -967,6 +1014,12 @@ export function parseGitBlameResp(
   msg: Uint8Array,
 ): [number, number, number, Uint8Array] | null {
   return parseRecordsResp(msg, S2C_GIT_BLAME);
+}
+
+export function parseGitWorktreesResp(
+  msg: Uint8Array,
+): [number, number, number, Uint8Array] | null {
+  return parseRecordsResp(msg, S2C_GIT_WORKTREES);
 }
 
 export function parseGitReflogResp(
@@ -1186,6 +1239,13 @@ export type GitStateRecord =
       fetchUrl: string;
       /** "" when it equals {@link fetchUrl}. */
       pushUrl: string;
+    }
+  | {
+      /** Names the worktree *set* without describing it; see
+       *  {@link GitStateMirror.worktreeGen}. One per snapshot, always. */
+      kind: "worktreeGen";
+      count: number;
+      digest: bigint;
     };
 
 /** Where a budget-truncated response stopped; re-issue the same request
@@ -1315,6 +1375,23 @@ export type GitReflogRecord =
 /** What the remote answered for one ref. A remote can refuse one refspec
  *  of several and still exit zero, so `status` per ref is how "did I
  *  actually get these commits" is answered. */
+export type GitWorktreeRecord =
+  | {
+      kind: "tree";
+      /** `GIT_WORKTREE_*` bits. */
+      flags: number;
+      /** The commit that worktree's HEAD resolves to; zero when unborn, or
+       *  when it is `PRUNABLE` and its HEAD cannot be read. */
+      oid: GitOid;
+      /** Escaped worktree root; empty when `BARE`. */
+      path: string;
+      /** Full ref name HEAD points at; empty when `DETACHED`. */
+      branch: string;
+      /** Empty unless `LOCKED`, and empty even then when no reason was given. */
+      lockReason: string;
+    }
+  | GitCursorRecord;
+
 export type GitFetchRecord = {
   kind: "ref";
   flags: number;
@@ -1410,6 +1487,12 @@ export function gitStateRecords(data: Uint8Array): Generator<GitStateRecord> {
           name: c.str(),
           fetchUrl: c.str(),
           pushUrl: c.str(),
+        } as const;
+      case GIT_STATE_RECORD_WORKTREE_GEN:
+        return {
+          kind: "worktreeGen",
+          count: c.u32(),
+          digest: c.u64(),
         } as const;
       default:
         return null;
@@ -1621,6 +1704,23 @@ export function gitReflogRecords(data: Uint8Array): Generator<GitReflogRecord> {
   });
 }
 
+export function gitWorktreeRecords(
+  data: Uint8Array,
+): Generator<GitWorktreeRecord> {
+  return records(data, (kind, c) => {
+    if (kind === GIT_RECORD_CURSOR) return cursor(c);
+    if (kind !== GIT_WORKTREES_RECORD_TREE) return null;
+    return {
+      kind: "tree",
+      flags: c.u8(),
+      oid: c.oid(),
+      path: c.str(),
+      branch: c.str(),
+      lockReason: c.str(),
+    } as const;
+  });
+}
+
 export function gitFetchRecords(data: Uint8Array): Generator<GitFetchRecord> {
   return records(data, (kind, c) => {
     if (kind !== GIT_FETCH_RECORD_REF) return null;
@@ -1692,6 +1792,13 @@ export function appendGitStateRecord(
       pushStr(buf, record.name);
       pushStr(buf, record.fetchUrl);
       pushStr(buf, record.pushUrl);
+      break;
+    case "worktreeGen":
+      buf.push(GIT_STATE_RECORD_WORKTREE_GEN);
+      pushU32(buf, record.count);
+      // `pushI64` masks with `asUintN(64)`, so a digest using the top bit
+      // round-trips; `pushU64` takes a JS number and would lose it.
+      pushI64(buf, record.digest);
       break;
   }
   const len = buf.length - start - 4;
@@ -1870,6 +1977,18 @@ export interface GitRepoHandle extends ReactiveStore {
       afterPos?: number;
     },
   ): Promise<GitReflogRecord[]>;
+  /** The repository's worktrees: the main one first (wherever in the set
+   *  this handle was opened), then every linked one. `MAIN` and `CURRENT`
+   *  say which is which, and a checkout deleted behind git's back comes
+   *  back `PRUNABLE` rather than missing.
+   *
+   *  A one-shot read, but not a stale one: refetch whenever
+   *  {@link GitStateMirror.worktreeGen} moves and the list stays live. A set
+   *  larger than the server's budget ends with a `cursor` record — continue
+   *  with `afterPos` set to its `pos`. */
+  worktrees(
+    opts?: GitRequestOptions & { afterPos?: number },
+  ): Promise<GitWorktreeRecord[]>;
   /** Fetch from a remote, reporting per-ref what happened — so "did I
    *  actually get these commits" is answerable from the reply rather than
    *  from an exit code that lies. */
@@ -2074,6 +2193,24 @@ export class GitStateMirror {
   stashes: GitStashEntry[] = [];
   /** Keyed by remote name; populated with the `REMOTES` open flag. */
   remotes = new Map<string, GitRemoteState>();
+  /**
+   * The worktree set's `{count, digest}` — refetch `GIT_WORKTREES` whenever
+   * either moves.
+   *
+   * It lives in the state stream because that is the only thing that can
+   * make a worktree change *arrive*: adding, removing, moving or locking one
+   * leaves every ref and status record byte-identical, so the server's
+   * identical-snapshot suppression would drop the push, and a client
+   * refetching on ref moves would keep showing a worktree that no longer
+   * exists. Only the generation is pushed, not the list: resolving one
+   * worktree's HEAD costs opening its gitdir, which has no business running
+   * on every 50 ms ref settle.
+   *
+   * `{count: 0, digest: 0n}` is a bare repo with no linked worktrees — and
+   * also what a server too old to send the record leaves here, which is why
+   * a first sighting counts as a change.
+   */
+  worktreeGen: { count: number; digest: bigint } = { count: 0, digest: 0n };
   flags = 0;
   /** Records buffered from `PARTIAL` chunks of the snapshot in flight. */
   #pending: Uint8Array[] = [];
@@ -2123,6 +2260,7 @@ export class GitStateMirror {
     this.upstreams = new Map();
     this.stashes = [];
     this.remotes = new Map();
+    this.worktreeGen = { count: 0, digest: 0n };
     this.flags = flags;
     for (const record of gitStateRecords(recordBytes)) {
       switch (record.kind) {
@@ -2177,6 +2315,9 @@ export class GitStateMirror {
             fetchUrl: record.fetchUrl,
             pushUrl: record.pushUrl,
           });
+          break;
+        case "worktreeGen":
+          this.worktreeGen = { count: record.count, digest: record.digest };
           break;
       }
     }

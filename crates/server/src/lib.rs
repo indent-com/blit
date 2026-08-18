@@ -15721,6 +15721,38 @@ async fn handle_git_message<O: OutboxSend>(
                 },
             );
         }
+        C2S_GIT_WORKTREES => {
+            let Some(req) = parse_git_worktrees(data) else {
+                if let Some(n) = git_nonce(data) {
+                    let _ = out.send(msg_git_worktrees_resp(n, GIT_STATUS_INVALID, 0, &[]));
+                }
+                return;
+            };
+            let nonce = req.nonce;
+            let Some(entry) = repos.map.get(&req.repo_id) else {
+                let _ = out.send(msg_git_worktrees_resp(nonce, GIT_STATUS_UNKNOWN_ID, 0, &[]));
+                return;
+            };
+            let handle = entry.handle.clone();
+            let owned = (req.flags, req.after_pos);
+            git_request(
+                repos,
+                nonce,
+                out,
+                move |status| msg_git_worktrees_resp(nonce, status, 0, &[]),
+                move |cancel| {
+                    handle.worktrees(
+                        &GitWorktreesRequest {
+                            nonce,
+                            repo_id: 0,
+                            flags: owned.0,
+                            after_pos: owned.1,
+                        },
+                        &cancel,
+                    )
+                },
+            );
+        }
         _ => {}
     }
 }
@@ -17608,7 +17640,12 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
 
         // Git introspection: same discipline as fs — connection-scoped,
         // request threads and state engines, never the session mutex.
-        if (blit_remote::git::C2S_GIT_OPEN..=blit_remote::git::C2S_GIT_FETCH).contains(&data[0]) {
+        // The upper bound is the family's LAST opcode, so adding one means
+        // moving this too — a new opcode that lands outside the range is
+        // dropped here silently, before any handler sees it, and shows up as
+        // a request that never gets a reply rather than as an error.
+        if (blit_remote::git::C2S_GIT_OPEN..=blit_remote::git::C2S_GIT_WORKTREES).contains(&data[0])
+        {
             // A pty-relative open (docs/ide.md Decision 3): resolve the
             // source pty's live cwd (session state) and rebase to a plain
             // path-based open.

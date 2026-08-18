@@ -14,10 +14,15 @@ use std::collections::BTreeMap;
 /// `S2C_HELLO` feature bit: server supports the `GIT_*` message family.
 pub const FEATURE_GIT: u32 = 1 << 7;
 
-// Opcodes: one contiguous block, `0xA0`-`0xB4`, grouped by role —
+// Opcodes: one contiguous block, `0xA0`-`0xB5`, grouped by role —
 // lifecycle, pushed state, revision and log, object reads, then the
 // repository-wide operations. Request and response share a value where
-// they pair. `0xB5`-`0xBF` are reserved for the family's next additions.
+// they pair. `0xB6`-`0xBF` are reserved for the family's next additions.
+//
+// The block is contiguous because the server routes the whole family by
+// range (`C2S_GIT_OPEN..=` the last opcode). Extending it means moving that
+// bound too: an opcode outside the range is dropped before any handler runs,
+// which reads as a request that never gets a reply.
 
 // C2S opcodes.
 
@@ -71,6 +76,11 @@ pub const C2S_GIT_BLAME: u8 = 0xB2;
 pub const C2S_GIT_REFLOG: u8 = 0xB3;
 /// Fetch from a remote: [0xB4][nonce:2][repo_id:2][flags:1][timeout_ms:4][remote_len:2][remote:N][n_refspecs:2][(len:2, refspec:N)·N]
 pub const C2S_GIT_FETCH: u8 = 0xB4;
+/// List the repository's worktrees: [0xB5][nonce:2][repo_id:2][flags:1][after_pos:8]
+/// The main worktree plus every linked one, whether or not the repo was
+/// opened through a linked worktree. Allocates no repo ids: naming the
+/// other worktrees is not opening them.
+pub const C2S_GIT_WORKTREES: u8 = 0xB5;
 
 // S2C opcodes.
 
@@ -115,6 +125,8 @@ pub const S2C_GIT_BLAME: u8 = 0xB2;
 pub const S2C_GIT_REFLOG: u8 = 0xB3;
 /// Fetch response: [0xB4][nonce:2][status:1][flags:1][records:LZ4]
 pub const S2C_GIT_FETCH: u8 = 0xB4;
+/// Worktree list response: [0xB5][nonce:2][status:1][flags:1][records:LZ4]
+pub const S2C_GIT_WORKTREES: u8 = 0xB5;
 
 // Common status registry: every `status` byte in the family
 // (docs/protocol.md "Common status registry"). `FS_SYNCED` has a distinct,
@@ -317,6 +329,7 @@ pub const GIT_PATCH_TRUNCATED: u8 = 1 << 1;
 pub const GIT_DISCOVER_TRUNCATED: u8 = 1 << 0;
 pub const GIT_BLAME_TRUNCATED: u8 = 1 << 0;
 pub const GIT_REFLOG_TRUNCATED: u8 = 1 << 0;
+pub const GIT_WORKTREES_TRUNCATED: u8 = 1 << 0;
 
 // C2S_GIT_DISCOVER request flags.
 /// Descend into a repository once one is found (off by default, so a tree
@@ -365,6 +378,8 @@ pub const GIT_STATE_RECORD_STATUS: u8 = 0x04;
 pub const GIT_STATE_RECORD_UPSTREAM: u8 = 0x05;
 pub const GIT_STATE_RECORD_STASH: u8 = 0x06;
 pub const GIT_STATE_RECORD_REMOTE: u8 = 0x07;
+/// The worktree set's generation (see [`GitStateRecord::WorktreeGen`]).
+pub const GIT_STATE_RECORD_WORKTREE_GEN: u8 = 0x08;
 
 // STATE_REMOTE record flags.
 /// The remote whose `HEAD` the checkout's default branch tracks.
@@ -440,11 +455,33 @@ pub const GIT_PATCH_FILE_FILTERED: u8 = 1 << 1;
 // Record kind inside the GIT_INDEX response.
 pub const GIT_INDEX_RECORD_ENTRY: u8 = 0x04;
 
-// Record kinds inside the 0xB1-0xB4 responses.
+// Record kinds inside the 0xB1-0xB5 responses.
 pub const GIT_DISCOVER_RECORD_REPO: u8 = 0x01;
 pub const GIT_BLAME_RECORD_RANGE: u8 = 0x01;
 pub const GIT_REFLOG_RECORD_ENTRY: u8 = 0x01;
 pub const GIT_FETCH_RECORD_REF: u8 = 0x01;
+pub const GIT_WORKTREES_RECORD_TREE: u8 = 0x01;
+
+// WORKTREE record flags.
+/// The main worktree — the one whose `.git` is a directory. Exactly one
+/// record carries this, including when the repo was opened through a
+/// linked worktree.
+pub const GIT_WORKTREE_MAIN: u8 = 1 << 0;
+/// The worktree this `repo_id` was opened at, so a client can mark where
+/// it already is instead of comparing paths it may have canonicalized
+/// differently.
+pub const GIT_WORKTREE_CURRENT: u8 = 1 << 1;
+/// `git worktree lock`ed; `lock_reason` carries why, when one was given.
+pub const GIT_WORKTREE_LOCKED: u8 = 1 << 2;
+/// The worktree directory is gone from disk (`git worktree prune` would
+/// drop the administrative entry). Reported rather than hidden: a stale
+/// entry is the thing a client most needs to be told about.
+pub const GIT_WORKTREE_PRUNABLE: u8 = 1 << 3;
+/// HEAD is detached, so `branch` is empty.
+pub const GIT_WORKTREE_DETACHED: u8 = 1 << 4;
+/// Bare: no worktree directory at all, so `path` is empty. Only ever the
+/// main record.
+pub const GIT_WORKTREE_BARE: u8 = 1 << 5;
 
 // REPO_FOUND record flags.
 pub const GIT_FOUND_BARE: u8 = 1 << 0;
@@ -1365,6 +1402,46 @@ pub fn parse_git_fetch(msg: &[u8]) -> Option<GitFetchRequest<'_>> {
     })
 }
 
+/// A decoded `C2S_GIT_WORKTREES`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitWorktreesRequest {
+    pub nonce: u16,
+    pub repo_id: u16,
+    /// No flags are defined yet; a non-zero value is `INVALID` rather than
+    /// ignored, so a future bit cannot be silently dropped by an old server.
+    pub flags: u8,
+    /// Worktrees already delivered, so a repository with more of them than
+    /// the entry budget pages: re-issue with the `CURSOR`'s `pos`. Like a
+    /// reflog, the enumeration has no name to resume from — the
+    /// administrative directory is read in sorted order — so the position
+    /// is the key.
+    pub after_pos: u64,
+}
+
+pub fn msg_git_worktrees(req: &GitWorktreesRequest) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(14);
+    msg.push(C2S_GIT_WORKTREES);
+    msg.extend_from_slice(&req.nonce.to_le_bytes());
+    msg.extend_from_slice(&req.repo_id.to_le_bytes());
+    msg.push(req.flags);
+    msg.extend_from_slice(&req.after_pos.to_le_bytes());
+    msg
+}
+
+pub fn parse_git_worktrees(msg: &[u8]) -> Option<GitWorktreesRequest> {
+    let mut b = body_of(msg, C2S_GIT_WORKTREES)?;
+    let nonce = take_u16(&mut b)?;
+    let repo_id = take_u16(&mut b)?;
+    let flags = take_u8(&mut b)?;
+    let after_pos = take_u64(&mut b)?;
+    Some(GitWorktreesRequest {
+        nonce,
+        repo_id,
+        flags,
+        after_pos,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // S2C message builders and parsers
 // ---------------------------------------------------------------------------
@@ -1834,6 +1911,24 @@ pub enum GitStateRecord<'a> {
         fetch_url: &'a str,
         push_url: &'a str,
     },
+    /// WORKTREE_GEN 0x08: [kind:1][count:4][digest:8]
+    ///
+    /// Names the current worktree *set* without describing it: `count` is
+    /// how many worktrees exist (the main one included) and `digest` is
+    /// order-independent over their administrative identities and lock
+    /// state. A client refetches [`C2S_GIT_WORKTREES`] when either moves.
+    ///
+    /// It is in the state stream rather than the list being pushed there
+    /// because resolving one worktree's HEAD costs opening its gitdir —
+    /// unaffordable on every ref settle — while this is a directory read.
+    /// And it has to be in the snapshot at all, not merely watched, or
+    /// identical-snapshot suppression would swallow the push: adding or
+    /// removing a worktree leaves every ref and status record byte for
+    /// byte the same.
+    ///
+    /// Emitted once per snapshot, always, so a `0`/`0` record is "no
+    /// worktrees dir" rather than "an old server that never said".
+    WorktreeGen { count: u32, digest: u64 },
 }
 
 /// Append one record to an uncompressed `GIT_STATE` records buffer.
@@ -1921,6 +2016,11 @@ pub fn append_git_state_record(buf: &mut Vec<u8>, record: &GitStateRecord<'_>) {
             push_str(buf, name);
             push_str(buf, fetch_url);
             push_str(buf, push_url);
+        }
+        GitStateRecord::WorktreeGen { count, digest } => {
+            buf.push(GIT_STATE_RECORD_WORKTREE_GEN);
+            buf.extend_from_slice(&count.to_le_bytes());
+            buf.extend_from_slice(&digest.to_le_bytes());
         }
     }
     end_record(buf, start);
@@ -2023,6 +2123,11 @@ impl<'a> Iterator for GitStateRecordIter<'a> {
                         fetch_url,
                         push_url,
                     });
+                }
+                GIT_STATE_RECORD_WORKTREE_GEN => {
+                    let count = take_u32(&mut b)?;
+                    let digest = take_u64(&mut b)?;
+                    return Some(GitStateRecord::WorktreeGen { count, digest });
                 }
                 _ => continue, // unknown kind: skip via record_len
             }
@@ -2686,6 +2791,11 @@ records_resp!(
 records_resp!(msg_git_blame_resp, parse_git_blame_resp, S2C_GIT_BLAME);
 records_resp!(msg_git_reflog_resp, parse_git_reflog_resp, S2C_GIT_REFLOG);
 records_resp!(msg_git_fetch_resp, parse_git_fetch_resp, S2C_GIT_FETCH);
+records_resp!(
+    msg_git_worktrees_resp,
+    parse_git_worktrees_resp,
+    S2C_GIT_WORKTREES
+);
 
 /// One decoded record from a `GIT_DISCOVER` response payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3008,6 +3118,93 @@ impl<'a> Iterator for GitFetchRecordIter<'a> {
     }
 }
 
+/// One decoded record from a `GIT_WORKTREES` response payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitWorktreeRecord<'a> {
+    /// TREE 0x01: [kind:1][flags:1][oid:32][path_len:2][path:N][branch_len:2][branch:N][lock_len:2][lock_reason:N]
+    Tree {
+        flags: u8,
+        /// The commit that worktree's HEAD resolves to; zero when unborn,
+        /// or when the worktree is `PRUNABLE` and its HEAD is unreadable.
+        oid: GitOid,
+        /// Escaped canonical worktree root; empty when `BARE`. Escaped
+        /// rather than plain UTF-8 because it is a path read back off
+        /// disk, not one the client chose.
+        path: &'a str,
+        /// Full ref name HEAD points at (`refs/heads/…`); empty when
+        /// `DETACHED`.
+        branch: &'a str,
+        /// Why it is locked; empty unless `LOCKED`, and empty even then
+        /// when the lock was taken with no reason.
+        lock_reason: &'a str,
+    },
+    Cursor {
+        after: &'a str,
+        pos: u64,
+    },
+}
+
+pub fn append_git_worktree_record(buf: &mut Vec<u8>, record: &GitWorktreeRecord<'_>) {
+    match record {
+        GitWorktreeRecord::Cursor { after, pos } => push_cursor_record(buf, after, *pos),
+        GitWorktreeRecord::Tree {
+            flags,
+            oid,
+            path,
+            branch,
+            lock_reason,
+        } => {
+            let start = begin_record(buf);
+            buf.push(GIT_WORKTREES_RECORD_TREE);
+            buf.push(*flags);
+            buf.extend_from_slice(oid);
+            push_str(buf, path);
+            push_str(buf, branch);
+            push_str(buf, lock_reason);
+            end_record(buf, start);
+        }
+    }
+}
+
+pub struct GitWorktreeRecordIter<'a> {
+    data: &'a [u8],
+}
+
+pub fn git_worktree_records(data: &[u8]) -> GitWorktreeRecordIter<'_> {
+    GitWorktreeRecordIter { data }
+}
+
+impl<'a> Iterator for GitWorktreeRecordIter<'a> {
+    type Item = GitWorktreeRecord<'a>;
+
+    fn next(&mut self) -> Option<GitWorktreeRecord<'a>> {
+        loop {
+            let (kind, mut b) = next_record(&mut self.data)?;
+            match kind {
+                GIT_WORKTREES_RECORD_TREE => {
+                    let flags = take_u8(&mut b)?;
+                    let oid = take_oid(&mut b)?;
+                    let path = take_str(&mut b)?;
+                    let branch = take_str(&mut b)?;
+                    let lock_reason = take_str(&mut b)?;
+                    return Some(GitWorktreeRecord::Tree {
+                        flags,
+                        oid,
+                        path,
+                        branch,
+                        lock_reason,
+                    });
+                }
+                GIT_RECORD_CURSOR => {
+                    let (after, pos) = take_cursor(&mut b)?;
+                    return Some(GitWorktreeRecord::Cursor { after, pos });
+                }
+                _ => continue,
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Client-side state reducer
 // ---------------------------------------------------------------------------
@@ -3102,6 +3299,12 @@ pub struct GitStateMirror {
     pub stashes: Vec<GitStashEntry>,
     /// Keyed by remote name; populated with the `REMOTES` open flag.
     pub remotes: BTreeMap<String, GitRemoteState>,
+    /// The worktree set's `(count, digest)`. Refetch `GIT_WORKTREES`
+    /// whenever this changes; `(0, 0)` is a bare repository with no linked
+    /// worktrees (and also what an old server that never sends the record
+    /// leaves behind, which is why the panel treats a first sighting as a
+    /// change rather than waiting for one).
+    pub worktree_gen: (u32, u64),
     /// The last snapshot's truncation flags (`GIT_STATE_*_TRUNCATED`).
     pub flags: u8,
     /// Records accumulated from `PARTIAL` chunks of the snapshot in
@@ -3277,6 +3480,9 @@ impl GitStateMirror {
                             push_url: push_url.to_string(),
                         },
                     );
+                }
+                GitStateRecord::WorktreeGen { count, digest } => {
+                    next.worktree_gen = (count, digest);
                 }
             }
         }
@@ -4729,5 +4935,113 @@ mod tests {
         assert_eq!(git_diff_records(&diff).count(), 2);
         assert_eq!(git_patch_records(&patch).count(), 3);
         assert_eq!(git_index_records(&index).count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod worktree_wire_tests {
+    use super::*;
+
+    /// The bytes pinned in `js/core/src/__tests__/git.test.ts`. Both sides
+    /// assert against this same hex, so an encoder change on either one has
+    /// to be a deliberate edit in two languages rather than a silent skew.
+    const PINNED_WORKTREES: &str = concat!(
+        // TREE: len 62, kind 01, flags 03 (MAIN|CURRENT), oid 0x11×20
+        // zero-padded to 32, "/w/main", "refs/heads/main", empty lock.
+        "3e000000",
+        "0103",
+        "1111111111111111111111111111111111111111",
+        "000000000000000000000000",
+        "07002f772f6d61696e",
+        "0f00726566732f68656164732f6d61696e",
+        "0000",
+        // TREE: len 51, flags 14 (LOCKED|DETACHED), oid 0x22×20, "/w/wt",
+        // empty branch (detached), lock reason "on usb".
+        "33000000",
+        "0114",
+        "2222222222222222222222222222222222222222",
+        "000000000000000000000000",
+        "05002f772f7774",
+        "0000",
+        "06006f6e20757362",
+    );
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn oid_of(byte: u8) -> GitOid {
+        let mut oid = GIT_OID_NONE;
+        oid[..20].fill(byte);
+        oid
+    }
+
+    #[test]
+    fn worktree_records_match_the_pinned_bytes() {
+        let mut buf = Vec::new();
+        append_git_worktree_record(
+            &mut buf,
+            &GitWorktreeRecord::Tree {
+                flags: GIT_WORKTREE_MAIN | GIT_WORKTREE_CURRENT,
+                oid: oid_of(0x11),
+                path: "/w/main",
+                branch: "refs/heads/main",
+                lock_reason: "",
+            },
+        );
+        append_git_worktree_record(
+            &mut buf,
+            &GitWorktreeRecord::Tree {
+                flags: GIT_WORKTREE_LOCKED | GIT_WORKTREE_DETACHED,
+                oid: oid_of(0x22),
+                path: "/w/wt",
+                branch: "",
+                lock_reason: "on usb",
+            },
+        );
+        assert_eq!(hex(&buf), PINNED_WORKTREES.replace(['\n', ' '], ""));
+    }
+
+    /// Round-trip, including the family-wide `CURSOR` a truncated page ends
+    /// with.
+    #[test]
+    fn worktree_records_round_trip() {
+        let mut buf = Vec::new();
+        let tree = GitWorktreeRecord::Tree {
+            flags: GIT_WORKTREE_PRUNABLE,
+            oid: GIT_OID_NONE,
+            path: "/gone",
+            branch: "refs/heads/x",
+            lock_reason: "",
+        };
+        let cursor = GitWorktreeRecord::Cursor {
+            after: "",
+            pos: 256,
+        };
+        append_git_worktree_record(&mut buf, &tree);
+        append_git_worktree_record(&mut buf, &cursor);
+        let got: Vec<_> = git_worktree_records(&buf).collect();
+        assert_eq!(got, vec![tree, cursor]);
+    }
+
+    /// The generation record, and that an unknown record kind between two
+    /// known ones is skipped by `record_len` rather than derailing the
+    /// iterator — the forward-compatibility the family relies on.
+    #[test]
+    fn worktree_gen_survives_an_unknown_neighbour() {
+        let mut buf = Vec::new();
+        let generation = GitStateRecord::WorktreeGen {
+            count: 4,
+            digest: 0xdead_beef_0000_0001,
+        };
+        append_git_state_record(&mut buf, &generation);
+        // A record of a kind this build has never heard of.
+        let start = begin_record(&mut buf);
+        buf.push(0x7E);
+        buf.extend_from_slice(b"from the future");
+        end_record(&mut buf, start);
+        append_git_state_record(&mut buf, &generation);
+        let got: Vec<_> = git_state_records(&buf).collect();
+        assert_eq!(got, vec![generation.clone(), generation]);
     }
 }

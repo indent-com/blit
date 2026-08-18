@@ -142,6 +142,7 @@ All integers little-endian; the 16 MiB frame limit and
 | C2S       | `0xB2` | `GIT_BLAME`       | `[nonce:2][repo_id:2][flags:1][oid:32][start_line:4][line_count:4][path_len:2][path:N]`                                                                        |
 | C2S       | `0xB3` | `GIT_REFLOG`      | `[nonce:2][repo_id:2][flags:1][limit:2][after_pos:8][ref_len:2][ref:N]`                                                                                        |
 | C2S       | `0xB4` | `GIT_FETCH`       | `[nonce:2][repo_id:2][flags:1][timeout_ms:4][remote_len:2][remote:N][n_refspecs:2][(len:2, refspec:N)·N]`                                                      |
+| C2S       | `0xB5` | `GIT_WORKTREES`   | `[nonce:2][repo_id:2][flags:1][after_pos:8]`                                                                                                                   |
 | S2C       | `0xA0` | `GIT_REPO`        | `[nonce:2][repo_id:2][status:1][oid_format:1][flags:1][workdir_len:2][workdir:N][gitdir_len:2][gitdir:N]`                                                      |
 | S2C       | `0xA4` | `GIT_STATE`       | `[repo_id:2][state_id:4][flags:1][records:LZ4]`                                                                                                                |
 | S2C       | `0xA5` | `GIT_CLOSED`      | `[repo_id:2][reason:1]`                                                                                                                                        |
@@ -158,10 +159,14 @@ All integers little-endian; the 16 MiB frame limit and
 | S2C       | `0xB2` | `GIT_BLAME`       | `[nonce:2][status:1][flags:1][records:LZ4]`                                                                                                                    |
 | S2C       | `0xB3` | `GIT_REFLOG`      | `[nonce:2][status:1][flags:1][records:LZ4]`                                                                                                                    |
 | S2C       | `0xB4` | `GIT_FETCH`       | `[nonce:2][status:1][flags:1][records:LZ4]`                                                                                                                    |
+| S2C       | `0xB5` | `GIT_WORKTREES`   | `[nonce:2][status:1][flags:1][records:LZ4]`                                                                                                                    |
 
-One contiguous block, `0xA0`–`0xB4`, grouped by role — lifecycle, pushed
+One contiguous block, `0xA0`–`0xB5`, grouped by role — lifecycle, pushed
 state, revision and log, object reads, then the repository-wide
-operations — with `0xB5`–`0xBF` reserved for what comes next. The family
+operations — with `0xB6`–`0xBF` reserved for what comes next. Contiguous is
+load-bearing: the server admits the whole family by range, so an opcode
+added outside it is dropped before any handler runs and shows up as a
+request that never gets a reply. The family
 was renumbered out of `0x50` when the second pass broke the wire anyway:
 there was no reason to carry a split allocation forward, and the freed
 block is available to a future family.
@@ -446,6 +451,14 @@ STATE_REMOTE 0x07: [kind:1][flags:1][name_len:2][name:N]
              this pull request belongs to" without parsing owner/name out
              of the worktree path and hoping the clone followed a
              convention.
+WORKTREE_GEN 0x08: [kind:1][count:4][digest:8]
+             names the worktree *set* without describing it, so a client
+             knows when to refetch GIT_WORKTREES; count includes the main
+             worktree, digest is order-independent over the administrative
+             entries' names, gitdir mtimes and lock state. Emitted once per
+             snapshot, always — a 0/0 record is "no worktrees directory",
+             not "an old server that never said". See GIT_WORKTREES for
+             why the generation is pushed and the list is not.
 ```
 
 **Pseudo-refs share the `STATE_REF` stream, and that is a migration
@@ -1082,6 +1095,54 @@ parses, or transmits a secret; the fetch picks up whatever
 workaround already relied on. The difference is that the result comes back
 structured instead of scraped.
 
+### `GIT_WORKTREES`
+
+```text
+WORKTREE 0x01: [kind:1][flags:1][oid:32][path_len:2][path:N]
+               [branch_len:2][branch:N][lock_len:2][lock_reason:N]
+```
+
+Every worktree of the repository: the main one first, then the linked ones
+in administrative-directory order. `flags` bit 0 `MAIN`, bit 1 `CURRENT`,
+bit 2 `LOCKED`, bit 3 `PRUNABLE`, bit 4 `DETACHED`, bit 5 `BARE`. `branch`
+is the full ref name HEAD is on, empty when `DETACHED`; `path` is the
+escaped worktree root, empty when `BARE`; `lock_reason` is empty unless
+`LOCKED`, and empty even then when the lock carried no reason. No request
+flags are defined, and a non-zero `flags` is `INVALID` rather than ignored.
+
+The main worktree is resolved separately rather than taken from the
+enumeration, because gix lists only _linked_ worktrees and does so relative
+to whichever worktree the repo was opened through. Without that, a client
+opened inside a linked worktree could not name the checkout it forked
+from — which is the one it most wants to get back to, and the whole reason
+this request exists.
+
+`CURRENT` is decided server-side from the repo handle's own worktree, so a
+client does not have to compare paths it may have canonicalized differently
+than the server did. A worktree whose checkout has been deleted behind
+git's back is reported `PRUNABLE` rather than dropped: a row that cannot be
+navigated to is precisely what a client needs to be told about. Its own
+budget (`BLIT_GIT_WORKTREES_MAX`) rather than `entries_max`, because each
+record costs opening that worktree's gitdir to resolve its HEAD — this
+bounds repository opens, not bytes. Continuation is positional like
+`GIT_REFLOG`'s: the enumeration has no name to resume from.
+
+**Staying live.** The list is a request, but a stale one would be worse
+than none — a worktree removed an hour ago still offering to navigate
+there. Adding, removing, moving or locking a worktree leaves every ref and
+status record byte-identical, so per-subscriber identical-snapshot
+suppression drops the push and a client refetching on ref moves is blind to
+all of it (`git worktree remove` moves no ref at all). So each `GIT_STATE`
+snapshot carries a `WORKTREE_GEN` record — a count plus an order-independent
+digest over the administrative entries' names, their `gitdir` mtimes and
+their lock state — and clients refetch when it moves. Only the generation is
+pushed, never the list: the digest is a directory read and two stats per
+worktree, affordable at every ref settle, while resolving HEADs is not. The
+engine watches `<common>/worktrees` recursively for it, armed separately
+from the rest of the gitdir set because the directory only comes into
+existence with the _first_ `git worktree add`, long after the one-shot
+gitdir arm has run.
+
 ## Mutation (proposed)
 
 The one part of this document that is a proposal rather than a contract.
@@ -1127,6 +1188,7 @@ calls:
 | Open repos per connection       | 16             | `BLIT_GIT_MAX_REPOS`          |
 | Requests in flight per conn     | 16             | `BLIT_GIT_MAX_INFLIGHT`       |
 | Log subscriptions per repo      | 64             | `BLIT_GIT_MAX_LOG_SUBS`       |
+| Worktrees per `GIT_WORKTREES`   | 256            | `BLIT_GIT_WORKTREES_MAX`      |
 | Ref settle window               | 50 ms          | `BLIT_GIT_REFS_LATENCY_MS`    |
 | Status settle window            | 500 ms         | `BLIT_GIT_STATUS_LATENCY_MS`  |
 | Blob / patch size cap           | 16 MiB         | `BLIT_GIT_BLOB_MAX`           |
