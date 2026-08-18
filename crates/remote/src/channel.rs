@@ -10,16 +10,26 @@ use std::fmt;
 pub const CHANNEL: u8 = 0x95;
 /// `S2C_HELLO` feature bit for native channels.
 pub const FEATURE_CHANNEL: u32 = 1 << 12;
+/// `S2C_HELLO` feature bit for `CHANNEL_WATCH`.
+///
+/// Its own bit rather than `FEATURE_CHANNEL`, because a `WATCH` an older
+/// server does not know is an unknown sub-operation: the family's skip rule
+/// drops it without a reply, which is indistinguishable from a name nobody
+/// serves. A client that cannot see this bit has to keep probing by connect.
+pub const FEATURE_CHANNEL_WATCH: u32 = 1 << 26;
 
 pub const CHANNEL_LISTEN: u8 = 1;
 pub const CHANNEL_CONNECT: u8 = 2;
 pub const CHANNEL_DATA: u8 = 3;
 pub const CHANNEL_ACK: u8 = 4;
 pub const CHANNEL_CLOSE: u8 = 5;
+pub const CHANNEL_WATCH: u8 = 6;
+pub const CHANNEL_UNWATCH: u8 = 7;
 
 pub const CHANNEL_OPENED: u8 = 1;
 pub const CHANNEL_ACCEPTED: u8 = 2;
 pub const CHANNEL_CLOSED: u8 = 5;
+pub const CHANNEL_NAMES: u8 = 6;
 
 /// `CONNECT.flags`: require the named listener to have this exact generation.
 pub const CHANNEL_EXPECT_LISTENER_TOKEN: u8 = 1 << 0;
@@ -37,6 +47,13 @@ pub const CHANNEL_MAX_PAYLOAD: usize = 1024 * 1024;
 pub const CHANNEL_MAX_DETAIL: usize = 4 * 1024;
 pub const CHANNEL_WINDOW_BYTES: u64 = 1024 * 1024;
 pub const CHANNEL_MAX_UNCONSUMED_MESSAGES: usize = 1024;
+/// Names one `CHANNEL_WATCH` may declare.
+///
+/// A watch names what it cares about instead of asking for the whole registry:
+/// the reply is then bounded by the request, and the transient
+/// `blit.cli.<ext>.<attempt>` listeners every extension mints cannot make a
+/// watcher's traffic scale with churn it has no interest in.
+pub const CHANNEL_MAX_WATCH_NAMES: usize = 32;
 
 /// One decoded client-to-server channel operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +81,15 @@ pub enum ChannelRequest<'a> {
         channel_id: u32,
         reason: u8,
     },
+    /// Follow which of `names` currently have a listener, on a client-created
+    /// ID that carries no stream and never accepts.
+    Watch {
+        channel_id: u32,
+        names: Vec<&'a str>,
+    },
+    Unwatch {
+        channel_id: u32,
+    },
 }
 
 impl ChannelRequest<'_> {
@@ -73,7 +99,9 @@ impl ChannelRequest<'_> {
             | Self::Connect { channel_id, .. }
             | Self::Data { channel_id, .. }
             | Self::Ack { channel_id, .. }
-            | Self::Close { channel_id, .. } => *channel_id,
+            | Self::Close { channel_id, .. }
+            | Self::Watch { channel_id, .. }
+            | Self::Unwatch { channel_id } => *channel_id,
         }
     }
 }
@@ -109,6 +137,14 @@ pub enum ChannelMessage<'a> {
         reason: u8,
         detail: &'a str,
     },
+    /// Which of a watch's declared names have a listener right now, in the
+    /// order they were declared. A name the client asked about and does not
+    /// find here has no listener; absence is the whole answer, so an empty
+    /// list is meaningful rather than a no-op.
+    Names {
+        channel_id: u32,
+        names: Vec<&'a str>,
+    },
 }
 
 /// Structural or version-1 validation failure in a known channel operation.
@@ -124,6 +160,8 @@ pub enum ChannelDecodeError {
     EmptyPayload,
     TooLarge,
     InvalidCloseReason,
+    EmptyWatch,
+    DuplicateWatchName,
 }
 
 impl fmt::Display for ChannelDecodeError {
@@ -139,6 +177,8 @@ impl fmt::Display for ChannelDecodeError {
             Self::EmptyPayload => "channel data payload is empty",
             Self::TooLarge => "channel field exceeds its size limit",
             Self::InvalidCloseReason => "client channel close reason is invalid",
+            Self::EmptyWatch => "channel watch declares no names",
+            Self::DuplicateWatchName => "channel watch names must be distinct",
         })
     }
 }
@@ -285,6 +325,36 @@ pub fn parse_channel_request(
                 reason: body[0],
             }))
         }
+        CHANNEL_WATCH => {
+            if channel_id & 1 != 0 {
+                return Err(ChannelDecodeError::InvalidClientId);
+            }
+            let names = decode_name_list(body, CHANNEL_MAX_WATCH_NAMES)?;
+            if names.is_empty() {
+                return Err(ChannelDecodeError::EmptyWatch);
+            }
+            // A repeated name would appear twice in a reply whose whole
+            // meaning is which names are claimed, so the ambiguity is refused
+            // rather than carried. The list is short enough that the obvious
+            // scan is cheaper than a set.
+            if names
+                .iter()
+                .enumerate()
+                .any(|(index, name)| names[..index].contains(name))
+            {
+                return Err(ChannelDecodeError::DuplicateWatchName);
+            }
+            Ok(Some(ChannelRequest::Watch { channel_id, names }))
+        }
+        CHANNEL_UNWATCH => {
+            if channel_id & 1 != 0 {
+                return Err(ChannelDecodeError::InvalidClientId);
+            }
+            if !body.is_empty() {
+                return Err(ChannelDecodeError::TrailingBytes);
+            }
+            Ok(Some(ChannelRequest::Unwatch { channel_id }))
+        }
         _ => Ok(None),
     }
 }
@@ -372,6 +442,10 @@ pub fn parse_channel_message(
                 detail,
             }))
         }
+        CHANNEL_NAMES => Ok(Some(ChannelMessage::Names {
+            channel_id,
+            names: decode_name_list(body, CHANNEL_MAX_WATCH_NAMES)?,
+        })),
         _ => Ok(None),
     }
 }
@@ -495,6 +569,32 @@ pub fn msg_channel_accepted(
     Some(msg)
 }
 
+pub fn msg_channel_watch(channel_id: u32, names: &[&str]) -> Option<Vec<u8>> {
+    if channel_id & 1 != 0 || names.is_empty() {
+        return None;
+    }
+    if names
+        .iter()
+        .enumerate()
+        .any(|(index, name)| names[..index].contains(name))
+    {
+        return None;
+    }
+    encode_name_list(CHANNEL_WATCH, channel_id, names)
+}
+
+pub fn msg_channel_unwatch(channel_id: u32) -> Option<Vec<u8>> {
+    if channel_id & 1 != 0 {
+        return None;
+    }
+    Some(envelope(CHANNEL_UNWATCH, channel_id, 0))
+}
+
+/// The names of a watch that currently have a listener, in declared order.
+pub fn msg_channel_names(channel_id: u32, names: &[&str]) -> Option<Vec<u8>> {
+    encode_name_list(CHANNEL_NAMES, channel_id, names)
+}
+
 pub fn msg_channel_closed(channel_id: u32, reason: u8, detail: &str) -> Option<Vec<u8>> {
     if detail.len() > CHANNEL_MAX_DETAIL {
         return None;
@@ -511,6 +611,65 @@ fn envelope(kind: u8, channel_id: u32, body_capacity: usize) -> Vec<u8> {
     msg.push(kind);
     msg.extend_from_slice(&channel_id.to_le_bytes());
     msg
+}
+
+/// `[flags:1][count:2]` then `count` × `[len:2][name]`, exactly.
+///
+/// Both directions of a watch carry a name list, and both need it to be
+/// self-describing: the reply repeats the names rather than answering with a
+/// bitmap over the request, so a client reading it needs no memory of what it
+/// asked and a packet on the wire can be read on its own.
+fn encode_name_list(kind: u8, channel_id: u32, names: &[&str]) -> Option<Vec<u8>> {
+    if names.len() > CHANNEL_MAX_WATCH_NAMES {
+        return None;
+    }
+    let count = u16::try_from(names.len()).ok()?;
+    let bytes: usize = names.iter().map(|name| 2 + name.len()).sum();
+    let mut msg = envelope(kind, channel_id, 3 + bytes);
+    msg.push(0);
+    msg.extend_from_slice(&count.to_le_bytes());
+    for name in names {
+        if decode_name(name.as_bytes()).is_err() {
+            return None;
+        }
+        msg.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        msg.extend_from_slice(name.as_bytes());
+    }
+    Some(msg)
+}
+
+fn decode_name_list(body: &[u8], limit: usize) -> Result<Vec<&str>, ChannelDecodeError> {
+    if body.len() < 3 {
+        return Err(ChannelDecodeError::Truncated);
+    }
+    if body[0] != 0 {
+        return Err(ChannelDecodeError::InvalidFlags);
+    }
+    let count = u16::from_le_bytes([body[1], body[2]]) as usize;
+    if count > limit {
+        return Err(ChannelDecodeError::TooLarge);
+    }
+    let mut names = Vec::with_capacity(count);
+    let mut offset: usize = 3;
+    for _ in 0..count {
+        let length_end = offset.checked_add(2).ok_or(ChannelDecodeError::TooLarge)?;
+        if body.len() < length_end {
+            return Err(ChannelDecodeError::Truncated);
+        }
+        let length = u16::from_le_bytes([body[offset], body[offset + 1]]) as usize;
+        let name_end = length_end
+            .checked_add(length)
+            .ok_or(ChannelDecodeError::TooLarge)?;
+        if body.len() < name_end {
+            return Err(ChannelDecodeError::Truncated);
+        }
+        names.push(decode_name(&body[length_end..name_end])?);
+        offset = name_end;
+    }
+    if offset != body.len() {
+        return Err(ChannelDecodeError::TrailingBytes);
+    }
+    Ok(names)
 }
 
 fn decode_name(bytes: &[u8]) -> Result<&str, ChannelDecodeError> {
@@ -682,6 +841,95 @@ mod tests {
     }
 
     #[test]
+    fn watch_round_trip() {
+        let wire = msg_channel_watch(6, &["blit.session.v1", "blit.systemd.v1"]).unwrap();
+        assert_eq!(
+            parse_channel_request(&wire).unwrap(),
+            Some(ChannelRequest::Watch {
+                channel_id: 6,
+                names: vec!["blit.session.v1", "blit.systemd.v1"],
+            })
+        );
+        let unwatch = msg_channel_unwatch(6).unwrap();
+        assert_eq!(
+            parse_channel_request(&unwatch).unwrap(),
+            Some(ChannelRequest::Unwatch { channel_id: 6 })
+        );
+    }
+
+    #[test]
+    fn names_round_trip_including_the_empty_answer() {
+        let wire = msg_channel_names(6, &["blit.systemd.v1"]).unwrap();
+        assert_eq!(
+            parse_channel_message(&wire).unwrap(),
+            Some(ChannelMessage::Names {
+                channel_id: 6,
+                names: vec!["blit.systemd.v1"],
+            })
+        );
+        // Nothing claimed is an answer, not a packet to withhold.
+        let empty = msg_channel_names(6, &[]).unwrap();
+        assert_eq!(
+            parse_channel_message(&empty).unwrap(),
+            Some(ChannelMessage::Names {
+                channel_id: 6,
+                names: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn watch_rejects_what_it_cannot_answer() {
+        assert_eq!(msg_channel_watch(6, &[]), None);
+        assert_eq!(msg_channel_watch(7, &["a"]), None);
+        assert_eq!(msg_channel_watch(6, &["a", "a"]), None);
+        assert_eq!(
+            parse_channel_request(&[CHANNEL, CHANNEL_WATCH, 6, 0, 0, 0, 0, 0, 0]),
+            Err(ChannelDecodeError::EmptyWatch)
+        );
+        let duplicated = [
+            CHANNEL,
+            CHANNEL_WATCH,
+            6,
+            0,
+            0,
+            0,
+            0,
+            2,
+            0,
+            1,
+            0,
+            b'a',
+            1,
+            0,
+            b'a',
+        ];
+        assert_eq!(
+            parse_channel_request(&duplicated),
+            Err(ChannelDecodeError::DuplicateWatchName)
+        );
+        // An odd ID is server-created, and the server never watches.
+        assert_eq!(
+            parse_channel_request(&[CHANNEL, CHANNEL_UNWATCH, 7, 0, 0, 0]),
+            Err(ChannelDecodeError::InvalidClientId)
+        );
+        assert_eq!(
+            parse_channel_request(&[CHANNEL, CHANNEL_UNWATCH, 6, 0, 0, 0, 1]),
+            Err(ChannelDecodeError::TrailingBytes)
+        );
+        // A count that outruns the body is truncation, not an empty list.
+        assert_eq!(
+            parse_channel_request(&[CHANNEL, CHANNEL_WATCH, 6, 0, 0, 0, 0, 1, 0]),
+            Err(ChannelDecodeError::Truncated)
+        );
+        // Reserved flags stay reserved, so a future bit cannot be eaten.
+        assert_eq!(
+            parse_channel_message(&[CHANNEL, CHANNEL_NAMES, 6, 0, 0, 0, 1, 0, 0]),
+            Err(ChannelDecodeError::InvalidFlags)
+        );
+    }
+
+    #[test]
     fn unknown_kinds_are_skipped() {
         let wire = [CHANNEL, 99, 2, 0, 0, 0, 1, 2, 3];
         assert_eq!(parse_channel_request(&wire), Ok(None));
@@ -723,7 +971,14 @@ mod tests {
             | crate::FEATURE_SURFACE_TOUCH
             | crate::FEATURE_SURFACE_TEXT_INPUT
             | crate::FEATURE_CLIENT_CONTROL
-            | crate::desktop::FEATURE_DESKTOP;
+            | crate::desktop::FEATURE_DESKTOP
+            | crate::media::FEATURE_DESKTOP_MEDIA
+            | crate::process::FEATURE_PROCESS
+            | crate::process::FEATURE_PROCESS_SESSION_ENV
+            | crate::process::FEATURE_APP_SOCKET
+            | crate::env::FEATURE_ENV
+            | crate::extension::FEATURE_EXTENSION;
         assert_eq!(FEATURE_CHANNEL & taken, 0);
+        assert_eq!(FEATURE_CHANNEL_WATCH & (taken | FEATURE_CHANNEL), 0);
     }
 }

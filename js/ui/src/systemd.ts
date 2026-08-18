@@ -359,31 +359,9 @@ export class SystemdUnitsMirror implements ReactiveStore {
   }
 }
 
-/**
- * Connect to the watcher and keep a live unit table.
- *
- * The handle stays valid until `close`, the extension goes away, or the
- * transport drops; `onClosed` reports all three, and a caller that wants to
- * survive a reconnect opens a new one.
- */
-/**
- * Is a watcher serving this connection?
- *
- * Opening the channel is the only way to ask — the server has no listener
- * directory — but the watcher answers a fresh connection with `hello` alone,
- * so the question costs a round trip rather than a unit table.
- */
-export async function systemdWatcherPresent(
-  connection: ChannelOpener,
-): Promise<boolean> {
-  try {
-    const channel = await connection.connectChannel(SYSTEMD_CHANNEL);
-    channel.close();
-    return true;
-  } catch {
-    return false;
-  }
-}
+// Whether a watcher serves a connection is no longer asked here: the server
+// publishes which channel names have a listener, and `channelPresence.ts`
+// follows that for both extension channels at once.
 
 /** One row of the unit table: a unit and the manager it belongs to. */
 export interface SystemdUnitRow extends SystemdUnit {
@@ -484,6 +462,13 @@ function isBoot(value: unknown): value is SystemdBoot {
   );
 }
 
+/**
+ * Connect to the watcher and keep a live unit table.
+ *
+ * The handle stays valid until `close`, the extension goes away, or the
+ * transport drops; `onClosed` reports all three, and a caller that wants to
+ * survive a reconnect opens a new one.
+ */
 export async function openSystemdUnits(
   connection: ChannelOpener,
   options: SystemdUnitsOptions = {},

@@ -344,20 +344,7 @@ export async function openSession(
   };
 }
 
-/**
- * Whether a supervisor serves this connection.
- *
- * A connect that is refused is the answer "no supervisor here", not an error:
- * the extension is optional, and a server without it is not broken.
- */
-export async function sessionSupervisorPresent(
-  connection: ChannelOpener,
-): Promise<boolean> {
-  try {
-    const channel = await connection.connectChannel(SESSION_CHANNEL);
-    channel.close();
-    return true;
-  } catch {
-    return false;
-  }
-}
+// Whether a supervisor serves a connection is no longer asked here: the
+// question is about the server's channel registry rather than about sessions,
+// and it is followed for both extension channels at once in
+// `channelPresence.ts`.

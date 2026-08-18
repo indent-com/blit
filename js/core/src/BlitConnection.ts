@@ -166,13 +166,17 @@ import {
   CHANNEL_MAX_PAYLOAD,
   ChannelCredit,
   FEATURE_CHANNEL,
+  FEATURE_CHANNEL_WATCH,
   buildChannelAckMessage,
   buildChannelCloseMessage,
   buildChannelConnectMessage,
   buildChannelDataMessage,
+  buildChannelUnwatchMessage,
+  buildChannelWatchMessage,
   parseChannelMessage,
   type ChannelConnectOptions,
   type ChannelHandle,
+  type ChannelNamesWatch,
   type ChannelOpenOptions,
 } from "./channel";
 import { SurfaceStore } from "./SurfaceStore";
@@ -895,6 +899,21 @@ export class BlitConnection {
       closed: boolean;
     }
   >();
+  /** Live channel-name watches, by the id that carries them. A NAMES packet
+   *  for an id that is not here belongs to a watch already stopped — the
+   *  server's answer and the client's UNWATCH can cross. */
+  private readonly channelNameWatches = new Map<
+    number,
+    {
+      names: readonly string[];
+      present: Set<string>;
+      onNames: (present: ReadonlySet<string>) => void;
+      settle?: {
+        resolve: (watch: ChannelNamesWatch) => void;
+        reject: (error: Error) => void;
+      };
+    }
+  >();
   /** Client-created channel ids must be even; the server owns the odd ones. */
   private nextChannelId = 2;
   private readonly pendingExtensionLists = new Map<
@@ -1130,6 +1149,7 @@ export class BlitConnection {
       supportsKv: false,
       supportsDesktop: false,
       supportsChannels: false,
+      supportsChannelWatch: false,
       supportsExtensions: false,
       supportsDesktopMedia: false,
       retryCount: 0,
@@ -3480,6 +3500,67 @@ export class BlitConnection {
     });
   }
 
+  /**
+   * Follow which of `names` currently have a listener.
+   *
+   * This is how a client asks "is this extension serving right now" without
+   * connecting: the promise settles on the server's first answer, and `onNames`
+   * is called every time that answer changes afterwards — an extension being
+   * installed, restarted, disabled or removed all reach the watcher, because
+   * all of them end with a listener claimed or released.
+   *
+   * A connect-and-close probe answers the same question once. It cannot say
+   * when the answer stops being true, so anything holding a probe's result
+   * over time is showing the viewer a stale server.
+   */
+  async watchChannelNames(
+    names: readonly string[],
+    onNames: (present: ReadonlySet<string>) => void,
+  ): Promise<ChannelNamesWatch> {
+    if (this.transport.status !== "connected") {
+      throw connectionError(
+        `Cannot watch channel names while transport is ${this.transport.status}`,
+      );
+    }
+    if ((this.features & FEATURE_CHANNEL_WATCH) === 0) {
+      throw connectionError(
+        "Server does not support channel-name watches (upgrade blit on the remote)",
+      );
+    }
+    // Built before the id is spent, so a name this protocol cannot carry
+    // throws without leaving a hole in the id space.
+    const channelId = this.nextChannelId;
+    const request = buildChannelWatchMessage(channelId, names);
+    this.nextChannelId = this.nextChannelId >= 0xfffffffe ? 2 : channelId + 2;
+    return new Promise<ChannelNamesWatch>((resolve, reject) => {
+      this.channelNameWatches.set(channelId, {
+        names,
+        present: new Set(),
+        onNames,
+        settle: { resolve, reject },
+      });
+      this.transport.send(request);
+    });
+  }
+
+  /** The handle for a watch already registered. `present` is the live set the
+   *  message handler keeps up to date, so it still reads correctly after the
+   *  watch is stopped or the transport is lost. */
+  private makeChannelNamesWatch(
+    channelId: number,
+    present: ReadonlySet<string>,
+  ): ChannelNamesWatch {
+    return {
+      present,
+      stop: (): void => {
+        if (!this.channelNameWatches.delete(channelId)) return;
+        if (this.transport.status === "connected") {
+          this.transport.send(buildChannelUnwatchMessage(channelId));
+        }
+      },
+    };
+  }
+
   private makeChannelHandle(
     channelId: number,
     name: string,
@@ -3528,7 +3609,36 @@ export class BlitConnection {
     const message = parseChannelMessage(bytes);
     if (!message) return;
     switch (message.kind) {
+      case "names": {
+        const watch = this.channelNameWatches.get(message.channelId);
+        if (!watch) return;
+        watch.present.clear();
+        for (const name of message.names) watch.present.add(name);
+        const settle = watch.settle;
+        watch.settle = undefined;
+        if (settle) {
+          settle.resolve(
+            this.makeChannelNamesWatch(message.channelId, watch.present),
+          );
+          return;
+        }
+        watch.onNames(watch.present);
+        return;
+      }
       case "opened": {
+        // A watch is refused the way any client-created id is: with an OPENED
+        // carrying the status. Nothing was registered server-side, so the
+        // watch is dropped here rather than left half-live.
+        const watch = this.channelNameWatches.get(message.channelId);
+        if (watch) {
+          this.channelNameWatches.delete(message.channelId);
+          watch.settle?.reject(
+            connectionError(
+              `Channel watch refused${message.detail ? `: ${message.detail}` : ""}`,
+            ),
+          );
+          return;
+        }
         const pending = this.pendingChannelOpens.get(message.channelId);
         if (!pending) return;
         this.pendingChannelOpens.delete(message.channelId);
@@ -3800,6 +3910,19 @@ export class BlitConnection {
       pending.reject(error);
     }
     this.pendingChannelOpens.clear();
+    // A watch lives in the server's fabric, which forgets it with the
+    // endpoint. Nothing survives the transport, so the caller is told the set
+    // is empty rather than left holding whatever was last true.
+    const watches = [...this.channelNameWatches.values()];
+    this.channelNameWatches.clear();
+    for (const watch of watches) {
+      if (watch.settle) {
+        watch.settle.reject(error);
+        continue;
+      }
+      watch.present.clear();
+      watch.onNames(watch.present);
+    }
     const entries = [...this.channels.values()];
     this.channels.clear();
     for (const entry of entries) {
@@ -5762,6 +5885,7 @@ export class BlitConnection {
           supportsKv: (features & FEATURE_KV) !== 0,
           supportsDesktop: (features & FEATURE_DESKTOP) !== 0,
           supportsChannels: (features & FEATURE_CHANNEL) !== 0,
+          supportsChannelWatch: (features & FEATURE_CHANNEL_WATCH) !== 0,
           supportsExtensions: (features & FEATURE_EXTENSION) !== 0,
           supportsDesktopMedia: (features & FEATURE_DESKTOP_MEDIA) !== 0,
           bootGeneration,

@@ -2,14 +2,20 @@
  * ConnectionPanels — everything there is to say about ONE remote, as tabs.
  *
  * An expanded remote row used to stack its sections; it now switches between
- * them, because the set stopped being two short lists. Applications and clients
- * are still short, but a unit table is a thousand rows and a journal page is a
+ * them, because the set stopped being two short lists. Session and clients are
+ * still short, but a unit table is a thousand rows and a journal page is a
  * scroller of its own — stacked, either one buries whatever is under it.
  *
  * Which tabs exist is a property of the server, discovered rather than assumed:
- * systemd and applications are extensions, so their tabs appear only when the
- * channel they publish answers. That probe is one connect-and-close per
- * expansion, which is cheaper than the channel a tab would hold open.
+ * Session and systemd are extensions, so their tabs exist only while the
+ * channel each publishes has a listener. That is followed rather than sampled
+ * (`channelPresence.ts`), so installing an extension adds its tab and removing
+ * one takes it away while the row stays open — the panel that installs them is
+ * one tab over, which is exactly where a stale answer would be noticed.
+ *
+ * Hence the order: the two tabs every server has come first, and the two an
+ * extension provides follow, so the set grows and shrinks at the end of the
+ * row instead of shuffling what the viewer was aiming at.
  */
 
 import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
@@ -24,17 +30,18 @@ import { ConnectionClients } from "./ConnectionClients";
 import { ConnectionSession } from "./ConnectionSession";
 import { ExtensionsPanel } from "./ExtensionsPanel";
 import { SystemdPanel } from "./SystemdPanel";
-import { sessionSupervisorPresent } from "./session";
-import { systemdWatcherPresent } from "./systemd";
+import { followChannelNames } from "./channelPresence";
+import { SESSION_CHANNEL } from "./session";
+import { SYSTEMD_CHANNEL } from "./systemd";
 import { themeFor, ui, uiScale } from "./theme";
 
-type Tab = "apps" | "clients" | "systemd" | "extensions";
+type Tab = "clients" | "extensions" | "session" | "systemd";
 
 const LABELS: Record<Tab, string> = {
-  apps: "Applications",
   clients: "Clients",
-  systemd: "systemd",
   extensions: "Extensions",
+  session: "Session",
+  systemd: "systemd",
 };
 
 export function ConnectionPanels(props: {
@@ -52,45 +59,53 @@ export function ConnectionPanels(props: {
   const theme = () => themeFor(props.palette);
   const scale = () => uiScale(props.fontSize);
 
-  const [hasSession, setHasSession] = createSignal(false);
-  const [hasSystemd, setHasSystemd] = createSignal(false);
-  // What the viewer picked, which is not the same as what is shown: a probe
-  // can land after the click and a tab can vanish on reconnect, so the
-  // selection is resolved against what exists rather than corrected by an
-  // effect that would fight the viewer for it.
+  const [served, setServed] = createSignal<ReadonlySet<string>>(
+    new Set<string>(),
+  );
+  // What the viewer picked, which is not the same as what is shown: an answer
+  // can land after the click and a tab can vanish under it, so the selection is
+  // resolved against what exists rather than corrected by an effect that would
+  // fight the viewer for it.
   const [chosen, setChosen] = createSignal<Tab | null>(null);
 
-  // One probe per connection. A rejected connect means nobody serves that
-  // channel here, which is an answer rather than a failure.
+  // One watch per connection, for both extension channels at once — the answer
+  // is a property of the server's registry, not of either panel.
   createEffect(() => {
     const connection = props.workspace.getConnection(props.connectionId);
-    setHasSession(false);
-    setHasSystemd(false);
+    setServed(new Set<string>());
     if (!connection) return;
     let live = true;
-    void sessionSupervisorPresent(connection).then((present) => {
-      if (live) setHasSession(present);
-    });
-    void systemdWatcherPresent(connection).then((present) => {
-      if (live) setHasSystemd(present);
+    let stop: (() => void) | null = null;
+    void followChannelNames(
+      connection,
+      [SESSION_CHANNEL, SYSTEMD_CHANNEL],
+      (present) => {
+        // Copied, because the watch keeps one set and mutates it in place: a
+        // signal handed the same object twice never sees a change.
+        if (live) setServed(new Set(present));
+      },
+    ).then((release) => {
+      // A watch that arrives after this effect was torn down is released at
+      // once; it holds a channel ID on the server until it is.
+      if (live) stop = release;
+      else release();
     });
     onCleanup(() => {
       live = false;
+      stop?.();
     });
   });
 
   const tabs = (): Tab[] => {
     const available: Tab[] = [];
-    if (hasSession()) available.push("apps");
     if (props.canListClients) available.push("clients");
-    if (hasSystemd()) available.push("systemd");
     if (props.canManageExtensions) available.push("extensions");
+    if (served().has(SESSION_CHANNEL)) available.push("session");
+    if (served().has(SYSTEMD_CHANNEL)) available.push("systemd");
     return available;
   };
 
-  /** The tab actually shown: the pick if it still exists, else the first.
-   *  Applications leads the order, so it opens where it exists — "what does
-   *  this machine run" outlives "who is watching it". */
+  /** The tab actually shown: the pick if it still exists, else the first. */
   const tab = (): Tab | null => {
     const available = tabs();
     const pick = chosen();
@@ -146,14 +161,6 @@ export function ConnectionPanels(props: {
           </For>
         </div>
 
-        <Show when={tab() === "apps"}>
-          <ConnectionSession
-            workspace={props.workspace}
-            connectionId={props.connectionId}
-            palette={props.palette}
-            fontSize={props.fontSize}
-          />
-        </Show>
         <Show when={tab() === "clients"}>
           <ConnectionClients
             workspace={props.workspace}
@@ -164,11 +171,11 @@ export function ConnectionPanels(props: {
             fontSize={props.fontSize}
           />
         </Show>
-        {/* The two extension panels were built as their own overlays, so they
-            carry their own padding; the wrapper only bounds them. */}
-        <Show when={tab() === "systemd"}>
+        {/* The extensions panel was built as its own overlay, so it carries
+            its own padding; the wrapper only bounds it. Same for systemd. */}
+        <Show when={tab() === "extensions"}>
           <div style={{ padding: `${scale().controlX}px`, "min-width": "0" }}>
-            <SystemdPanel
+            <ExtensionsPanel
               workspace={props.workspace}
               connectionId={props.connectionId}
               palette={props.palette}
@@ -176,9 +183,17 @@ export function ConnectionPanels(props: {
             />
           </div>
         </Show>
-        <Show when={tab() === "extensions"}>
+        <Show when={tab() === "session"}>
+          <ConnectionSession
+            workspace={props.workspace}
+            connectionId={props.connectionId}
+            palette={props.palette}
+            fontSize={props.fontSize}
+          />
+        </Show>
+        <Show when={tab() === "systemd"}>
           <div style={{ padding: `${scale().controlX}px`, "min-width": "0" }}>
-            <ExtensionsPanel
+            <SystemdPanel
               workspace={props.workspace}
               connectionId={props.connectionId}
               palette={props.palette}

@@ -5,13 +5,18 @@ import {
   CHANNEL_CLOSE_CANCELLED,
   CHANNEL_DATA,
   CHANNEL_EXPECT_LISTENER_TOKEN,
+  CHANNEL_NAMES,
   CHANNEL_OPENED,
+  CHANNEL_UNWATCH,
+  CHANNEL_WATCH,
   CHANNEL_WINDOW_BYTES,
   buildChannelAckMessage,
   buildChannelCloseMessage,
   buildChannelConnectMessage,
   buildChannelDataMessage,
   buildChannelListenMessage,
+  buildChannelUnwatchMessage,
+  buildChannelWatchMessage,
   parseChannelMessage,
 } from "../channel";
 
@@ -68,6 +73,29 @@ function accepted(
   view.setUint32(offset, metadata.length, true);
   offset += 4;
   message.set(metadata, offset);
+  return message;
+}
+
+function namesMessage(
+  channelId: number,
+  present: readonly string[],
+): Uint8Array {
+  const encoded = present.map((name) => encoder.encode(name));
+  const message = new Uint8Array(
+    9 + encoded.reduce((total, name) => total + 2 + name.length, 0),
+  );
+  const view = new DataView(message.buffer);
+  message[0] = CHANNEL;
+  message[1] = CHANNEL_NAMES;
+  view.setUint32(2, channelId, true);
+  view.setUint16(7, encoded.length, true);
+  let offset = 9;
+  for (const name of encoded) {
+    view.setUint16(offset, name.length, true);
+    offset += 2;
+    message.set(name, offset);
+    offset += name.length;
+  }
   return message;
 }
 
@@ -140,6 +168,56 @@ describe("native channel wire protocol", () => {
       peer: "ext:0000000000000002:7",
       metadata: new Uint8Array([3]),
     });
+  });
+
+  it("carries a watch's names and reads the answer back", () => {
+    const watch = buildChannelWatchMessage(2, [
+      "blit.session.v1",
+      "blit.systemd.v1",
+    ]);
+    expect(watch[1]).toBe(CHANNEL_WATCH);
+    expect(new DataView(watch.buffer).getUint16(7, true)).toBe(2);
+    expect(buildChannelUnwatchMessage(2)).toEqual(
+      new Uint8Array([CHANNEL, CHANNEL_UNWATCH, 2, 0, 0, 0]),
+    );
+
+    // The reply repeats names rather than answering with a bitmap over the
+    // request, so it can be read without remembering what was asked.
+    expect(parseChannelMessage(namesMessage(2, ["blit.systemd.v1"]))).toEqual({
+      kind: "names",
+      channelId: 2,
+      names: ["blit.systemd.v1"],
+    });
+    // Nothing claimed is an answer, not an absent packet.
+    expect(parseChannelMessage(namesMessage(2, []))).toEqual({
+      kind: "names",
+      channelId: 2,
+      names: [],
+    });
+  });
+
+  it("refuses a watch it could not answer unambiguously", () => {
+    expect(() => buildChannelWatchMessage(2, [])).toThrow(/at least one/);
+    expect(() => buildChannelWatchMessage(3, ["a"])).toThrow(/even/);
+    expect(() => buildChannelWatchMessage(2, ["a", "a"])).toThrow(/distinct/);
+    expect(() =>
+      buildChannelWatchMessage(
+        2,
+        Array.from({ length: 33 }, (_unused, index) => `name.${index}`),
+      ),
+    ).toThrow(/32 names/);
+
+    // A count that outruns the body, and a reserved flag byte that is not.
+    expect(
+      parseChannelMessage(
+        new Uint8Array([CHANNEL, CHANNEL_NAMES, 2, 0, 0, 0, 0, 1, 0]),
+      ),
+    ).toBeNull();
+    expect(
+      parseChannelMessage(
+        new Uint8Array([CHANNEL, CHANNEL_NAMES, 2, 0, 0, 0, 1, 0, 0]),
+      ),
+    ).toBeNull();
   });
 
   it("rejects malformed bounds and reserved client values", () => {
