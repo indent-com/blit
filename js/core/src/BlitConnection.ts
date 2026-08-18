@@ -2312,7 +2312,9 @@ export class BlitConnection {
   ): Promise<FsReadRecord[]> {
     if (this.transport.status !== "connected") {
       return Promise.reject(
-        connectionError(`Cannot read files while transport is ${this.transport.status}`),
+        connectionError(
+          `Cannot read files while transport is ${this.transport.status}`,
+        ),
       );
     }
     if ((this.features & FEATURE_FS) === 0) {

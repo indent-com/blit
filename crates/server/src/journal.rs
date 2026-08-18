@@ -117,10 +117,8 @@ fn now_ms() -> u64 {
 pub fn parse_mark(payload: &[u8]) -> Option<(MarkKind, Dialect)> {
     let (dialect, rest) = if let Some(rest) = payload.strip_prefix(b"133;") {
         (Dialect::Osc133, rest)
-    } else if let Some(rest) = payload.strip_prefix(b"633;") {
-        (Dialect::Osc633, rest)
     } else {
-        return None;
+        (Dialect::Osc633, payload.strip_prefix(b"633;")?)
     };
     let kind = *rest.first()?;
     // A letter must stand alone or introduce `;`-separated parameters;
@@ -990,8 +988,10 @@ mod tests {
 
     #[test]
     fn an_enormous_command_line_is_bounded() {
-        let mut journal = CommandJournal::default();
-        journal.max_command = 8;
+        let mut journal = CommandJournal {
+            max_command: 8,
+            ..CommandJournal::default()
+        };
         journal.apply(&mark633(MarkKind::CommandLine("é".repeat(50))), &ctx(0, 0));
         journal.apply(&mark(MarkKind::OutputStart), &ctx(0, 0));
         let command = &journal.latest().unwrap().command;
