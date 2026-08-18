@@ -1498,7 +1498,10 @@ function cameraCodecBit(codec: CameraWireCodec): number {
   return 1 << codec;
 }
 
-function cameraCodecLabel(codec: CameraWireCodec): string {
+/** Human name for a wire codec — the negotiated answer is worth showing, not
+ *  just logging: "the camera is stuck on Motion JPEG" is unanswerable from a
+ *  panel that only reports the size and cadence it settled on. */
+export function cameraCodecLabel(codec: number): string {
   switch (codec) {
     case 0:
       return "Motion JPEG";
@@ -1510,6 +1513,10 @@ function cameraCodecLabel(codec: CameraWireCodec): string {
       return "H.264 4:4:4";
     case 4:
       return "AV1 4:4:4";
+    // A lease's codec arrives off the wire, so a caller can hold a byte this
+    // build has no name for. Naming it anyway beats an empty label.
+    default:
+      return `codec ${codec}`;
   }
 }
 
@@ -1831,14 +1838,22 @@ function av1SequenceHeader(data: Uint8Array): Av1SequenceHeader | null {
         shift += 7;
       }
     }
-    if (size <= 0 || offset + size > data.length) return null;
+    if (offset + size > data.length) return null;
     const end = offset + size;
     if (type === 1) {
+      // A sequence header must at least carry `seq_profile`.
+      if (size < 1) return null;
       return {
         profile: data[offset]! >>> 5,
         obu: data.slice(start, end),
       };
     }
+    // Zero-length OBUs are legal and routine — every AV1 encoder opens a
+    // temporal unit with a payload-less temporal delimiter. Rejecting them
+    // (this used to be `size <= 0`) meant the walk gave up on the very first
+    // OBU of every real keyframe and never saw the sequence header behind it,
+    // so blit read its own AV1 camera streams as the wrong profile and refused
+    // them, in the probe and again in the capture.
     offset = end;
   }
   return null;
@@ -1883,19 +1898,108 @@ export function cameraBitstreamMatchesCodec(
   return av1SequenceProfile(data) === (codec === 4 ? 1 : 0);
 }
 
-function cameraProbeSource(): CanvasImageSource | null {
-  try {
-    if (typeof OffscreenCanvas !== "undefined") {
-      return new OffscreenCanvas(320, 240) as unknown as CanvasImageSource;
-    }
-    if (typeof document !== "undefined") {
+/** What a keyframe leaving the encoder is worth on the wire. `header`, when
+ *  present, is the parameter-set prefix to remember for the keyframes that
+ *  arrive without one. */
+export type CameraKeyframeDecision =
+  | { action: "send"; data: Uint8Array; header: Uint8Array | null }
+  | { action: "reject" }
+  | { action: "drop" };
+
+/**
+ * Prepare an encoded keyframe for the wire, or refuse it.
+ *
+ * The server decodes from a keyframe alone, so one must arrive self-contained:
+ * an encoder that emits its parameter sets once has them prepended from
+ * `cachedHeader`, and a keyframe with neither is dropped rather than sent as a
+ * picture nothing can start from.
+ *
+ * The format check is deliberately the *same* rule the support probe uses —
+ * [`cameraBitstreamMatchesCodec`], chroma rather than the exact profile.
+ * Holding the live stream to a stricter rule than the probe is what kept macOS
+ * on Motion JPEG after the probe was relaxed: VideoToolbox answers blit's
+ * Baseline request with Main or High, the panel offered H.264 because the probe
+ * now accepts that, and then the first keyframe of every session was rejected
+ * here and took the lease down with it.
+ *
+ * Split out of the capture class so that rule can be tested without a
+ * `VideoEncoder`, exactly as the probe's is.
+ */
+export function cameraKeyframeForWire(
+  codec: Exclude<CameraWireCodec, 0>,
+  data: Uint8Array,
+  cachedHeader: Uint8Array | null,
+): CameraKeyframeDecision {
+  const header =
+    codec === 1 || codec === 3
+      ? h264ParameterSets(data)
+      : (av1SequenceHeader(data)?.obu ?? null);
+  if (header) {
+    return cameraBitstreamMatchesCodec(codec, data)
+      ? { action: "send", data, header }
+      : { action: "reject" };
+  }
+  if (!cachedHeader) return { action: "drop" };
+  const selfContained = new Uint8Array(cachedHeader.length + data.length);
+  selfContained.set(cachedHeader);
+  selfContained.set(data, cachedHeader.length);
+  return { action: "send", data: selfContained, header: null };
+}
+
+/**
+ * Sources to try for the probe's one frame, best first.
+ *
+ * A canvas is only a usable `VideoFrame` source once it *has* a bitmap, and an
+ * `OffscreenCanvas` gets one from its first rendering context — so
+ * `new VideoFrame(new OffscreenCanvas(w, h))` throws
+ * `InvalidStateError: Invalid source state` (measured in Chromium 151). This
+ * used to hand the probe exactly that, so the frame constructor threw for
+ * *every* codec, every probe read as "this browser cannot encode it", and the
+ * camera fell back to Motion JPEG in every browser that has OffscreenCanvas —
+ * which is all of them. Nothing pointed at the canvas: the only symptom was a
+ * panel offering one format.
+ *
+ * So take the context, and keep an `HTMLCanvasElement` behind it: that is what
+ * the capture path itself encodes from, and it is a valid source with or
+ * without a context. Returning candidates rather than one source means a host
+ * that denies one kind of canvas still gets a probe.
+ */
+function cameraProbeSources(): (() => CanvasImageSource)[] {
+  const candidates: (() => CanvasImageSource)[] = [];
+  if (typeof OffscreenCanvas !== "undefined") {
+    candidates.push(() => {
+      const canvas = new OffscreenCanvas(320, 240);
+      // Taking the context is what makes the bitmap exist, and is the whole
+      // point here. The fill merely makes the probe frame deterministic
+      // instead of implementation-defined, so it must not be able to fail the
+      // probe: a host that hands back a restricted context still has a bitmap.
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("offscreen 2D context unavailable");
+      context.fillRect?.(0, 0, 320, 240);
+      return canvas as unknown as CanvasImageSource;
+    });
+  }
+  if (typeof document !== "undefined") {
+    candidates.push(() => {
       const canvas = document.createElement("canvas");
       canvas.width = 320;
       canvas.height = 240;
+      canvas.getContext("2d")?.fillRect?.(0, 0, 320, 240);
       return canvas;
+    });
+  }
+  return candidates;
+}
+
+/** A frame to encode, from the first source that yields one. */
+function makeCameraProbeFrame(): VideoFrame | null {
+  for (const source of cameraProbeSources()) {
+    try {
+      return new VideoFrame(source(), { timestamp: 0 });
+    } catch {
+      // Try the next kind of canvas: a source blit cannot build says nothing
+      // about the codec, and must never be reported as if it did.
     }
-  } catch {
-    // A locked-down embedding can expose the constructors but deny canvases.
   }
   return null;
 }
@@ -1911,25 +2015,71 @@ function supportsMjpegCamera(): boolean {
 
 let cameraProbeEncoder: typeof VideoEncoder | undefined;
 let cameraProbeFrame: typeof VideoFrame | undefined;
-const cameraCodecProbes = new Map<string, Promise<boolean>>();
+const cameraCodecProbes = new Map<string, Promise<CameraCodecProbeOutcome>>();
+
+/**
+ * What a camera codec probe found, kept so a UI can say which side refused.
+ *
+ * "This browser cannot encode it or no desktop accepts it" is not a diagnosis,
+ * and a camera silently pinned to Motion JPEG is exactly the case where the
+ * difference matters: `config-unsupported` is a browser with no such encoder,
+ * `no-keyframe` is one that accepted the config and produced nothing (a slow
+ * or wedged hardware session), and `wrong-format` is one whose bitstream does
+ * not carry the chroma the wire codec promises the server.
+ */
+export type CameraCodecProbeOutcome =
+  | "supported"
+  | "no-webcodecs"
+  | "no-test-frame"
+  | "config-unsupported"
+  | "encoder-error"
+  | "no-keyframe"
+  | "wrong-format";
+
+const cameraCodecOutcomes = new Map<CameraWireCodec, CameraCodecProbeOutcome>();
+
+/** The last probe result per wire codec. Motion JPEG never appears: it needs no
+ *  encoder, and [`supportsMjpegCamera`] is the whole of its support test. */
+export function cameraCodecProbeOutcomes(): ReadonlyMap<
+  CameraWireCodec,
+  CameraCodecProbeOutcome
+> {
+  return cameraCodecOutcomes;
+}
+
+/**
+ * How long a probe waits for its keyframe.
+ *
+ * This is a *cold* encoder session on a page that is still loading, and the
+ * four formats are probed one after another, so the first one pays for
+ * spinning up the platform's video hardware. 1.5s was too tight for that:
+ * a probe that times out is cached as an unsupported codec, and losing H.264
+ * that way drops the whole camera to Motion JPEG with nothing logged. Nothing
+ * waits on this — the mask is needed when the panel opens or a lease starts —
+ * so the budget can afford to be generous.
+ */
+const CAMERA_PROBE_DEADLINE_MS = 5_000;
 
 async function emitCameraProbeFrame(
   codec: Exclude<CameraWireCodec, 0>,
-): Promise<boolean> {
+): Promise<CameraCodecProbeOutcome> {
   if (
     typeof VideoEncoder === "undefined" ||
     typeof VideoFrame === "undefined"
   ) {
-    return false;
+    return "no-webcodecs";
   }
-  const source = cameraProbeSource();
-  if (!source) return false;
+  // Built before the encoder so a source blit cannot construct is never
+  // mistaken for a codec the browser cannot encode.
+  const probeFrame = makeCameraProbeFrame();
+  if (!probeFrame) return "no-test-frame";
   const config = cameraEncoderConfig(codec, 320, 240, 15);
-  return new Promise<boolean>((resolve) => {
+  return new Promise<CameraCodecProbeOutcome>((resolve) => {
     let encoder: VideoEncoder | null = null;
     let settled = false;
     let valid = false;
-    const finish = (result: boolean) => {
+    let sawChunk = false;
+    const finish = (result: CameraCodecProbeOutcome) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -1940,42 +2090,49 @@ async function emitCameraProbeFrame(
       }
       resolve(result);
     };
-    const timer = setTimeout(() => finish(false), 1_500);
+    const timer = setTimeout(
+      () => finish("no-keyframe"),
+      CAMERA_PROBE_DEADLINE_MS,
+    );
     try {
       encoder = new VideoEncoder({
         output: (chunk) => {
+          sawChunk = true;
           valid ||= encodedCameraProfileMatches(codec, chunk);
         },
-        error: () => finish(false),
+        error: () => finish("encoder-error"),
       });
       encoder.configure(config);
-      const frame = new VideoFrame(source, { timestamp: 0 });
       try {
-        encoder.encode(frame, { keyFrame: true });
+        encoder.encode(probeFrame, { keyFrame: true });
       } finally {
-        frame.close();
+        probeFrame.close();
       }
       void encoder.flush().then(
-        () => finish(valid),
-        () => finish(false),
+        () =>
+          finish(
+            valid ? "supported" : sawChunk ? "wrong-format" : "no-keyframe",
+          ),
+        () => finish("encoder-error"),
       );
     } catch {
-      finish(false);
+      finish("encoder-error");
     }
   });
 }
 
-function probeCameraCodec(
+function probeCameraCodecOutcome(
   codec: Exclude<CameraWireCodec, 0>,
   width: number,
   height: number,
   fps: number,
-): Promise<boolean> {
+): Promise<CameraCodecProbeOutcome> {
   if (
     typeof VideoEncoder === "undefined" ||
     typeof VideoFrame === "undefined"
   ) {
-    return Promise.resolve(false);
+    cameraCodecOutcomes.set(codec, "no-webcodecs");
+    return Promise.resolve("no-webcodecs");
   }
   if (cameraProbeEncoder !== VideoEncoder || cameraProbeFrame !== VideoFrame) {
     cameraProbeEncoder = VideoEncoder;
@@ -1988,17 +2145,41 @@ function probeCameraCodec(
   const probe = VideoEncoder.isConfigSupported(
     cameraEncoderConfig(codec, width, height, fps),
   )
-    .then(
-      (support) => Boolean(support.supported) && emitCameraProbeFrame(codec),
+    .then((support) =>
+      support.supported
+        ? emitCameraProbeFrame(codec)
+        : ("config-unsupported" as CameraCodecProbeOutcome),
     )
-    .catch(() => false);
+    .catch(() => "encoder-error" as CameraCodecProbeOutcome)
+    .then((outcome) => {
+      cameraCodecOutcomes.set(codec, outcome);
+      // A codec that produced nothing in time has not answered the question,
+      // so it must not be remembered as an answer: the capture path probes at
+      // its own frame size and deserves a fresh attempt at a warm encoder.
+      if (outcome === "no-keyframe") cameraCodecProbes.delete(key);
+      return outcome;
+    });
   cameraCodecProbes.set(key, probe);
   return probe;
+}
+
+function probeCameraCodec(
+  codec: Exclude<CameraWireCodec, 0>,
+  width: number,
+  height: number,
+  fps: number,
+): Promise<boolean> {
+  return probeCameraCodecOutcome(codec, width, height, fps).then(
+    (outcome) => outcome === "supported",
+  );
 }
 
 /**
  * Probe exact camera encoder profiles. A bit is returned only after the
  * browser both accepts the requested config and emits the matching profile.
+ *
+ * Every codec's verdict is also recorded in [`cameraCodecProbeOutcomes`], so a
+ * missing bit can be explained rather than merely reported.
  */
 export async function probeCameraCodecs(
   maxWidth = 1920,
@@ -2019,6 +2200,16 @@ export async function probeCameraCodecs(
     }
   }
   return mask;
+}
+
+/** One line per camera codec, for a log or a bug report: what the browser said
+ *  when asked to encode it. */
+export function cameraCodecProbeReport(): string {
+  const outcomes = cameraCodecProbeOutcomes();
+  if (!outcomes.size) return "camera codecs: not probed yet";
+  return `camera codecs: ${[...outcomes]
+    .map(([codec, outcome]) => `${cameraCodecLabel(codec)}=${outcome}`)
+    .join(", ")}`;
 }
 
 interface CameraCapture {
@@ -2341,44 +2532,29 @@ class WebCodecsCameraCapture implements CameraCapture {
       this.#dropped();
       return;
     }
-    let data = new Uint8Array(chunk.byteLength);
+    let data: Uint8Array = new Uint8Array(chunk.byteLength);
     chunk.copyTo(data);
     if (chunk.type === "key") {
-      let header: Uint8Array | null;
-      let formatMatches: boolean;
-      if (this.#codec === 1 || this.#codec === 3) {
-        header = h264ParameterSets(data);
-        const format = h264SpsFormat(data);
-        formatMatches =
-          format?.profile === (this.#codec === 3 ? 0xf4 : 0x42) &&
-          format.chromaFormat === (this.#codec === 3 ? 3 : 1);
-      } else {
-        const sequence = av1SequenceHeader(data);
-        header = sequence?.obu ?? null;
-        formatMatches = sequence?.profile === (this.#codec === 4 ? 1 : 0);
-      }
-      if (header) {
-        if (!formatMatches) {
-          this.#failed(
-            new Error(
-              `${cameraCodecLabel(this.#codec)} encoder emitted the wrong profile`,
-            ),
-          );
-          return;
-        }
-        this.#keyframeHeader = header;
-      } else if (this.#keyframeHeader) {
-        const selfContained = new Uint8Array(
-          this.#keyframeHeader.length + data.length,
+      const decision = cameraKeyframeForWire(
+        this.#codec,
+        data,
+        this.#keyframeHeader,
+      );
+      if (decision.action === "reject") {
+        this.#failed(
+          new Error(
+            `${cameraCodecLabel(this.#codec)} encoder emitted the wrong chroma format`,
+          ),
         );
-        selfContained.set(this.#keyframeHeader);
-        selfContained.set(data, this.#keyframeHeader.length);
-        data = selfContained;
-      } else {
+        return;
+      }
+      if (decision.action === "drop") {
         this.#forceKeyframe = true;
         this.#dropped();
         return;
       }
+      data = decision.data;
+      if (decision.header) this.#keyframeHeader = decision.header;
     }
     this.#frame(data, chunk.timestamp, chunk.type === "key");
   }

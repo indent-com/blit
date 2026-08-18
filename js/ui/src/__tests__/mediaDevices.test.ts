@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { negotiatedCameraFormat, sameDevices } from "../mediaDevices";
+import {
+  negotiatedCameraFormat,
+  sameConnections,
+  sameDevices,
+} from "../mediaDevices";
 
 const track = (
   width: number,
@@ -138,5 +142,49 @@ describe("negotiatedCameraFormat with a measured frame size", () => {
       height: 1440,
     });
     expect([width, height]).toEqual([1920, 1080]);
+  });
+});
+
+/**
+ * Speaker routing re-applies whenever the set of connections changes. The list
+ * it watches is derived from a workspace snapshot, and that snapshot is rebuilt
+ * with fresh array and object identities on every remote change — so identity
+ * comparison on the list itself reports a change constantly. A remote media
+ * player moving between playing and paused produced one, and each report cost a
+ * `setSinkId` on a live context.
+ */
+describe("sameConnections", () => {
+  const connection = (id: string) =>
+    ({ id }) as unknown as Parameters<typeof sameConnections>[0][number];
+
+  it("treats a rebuilt list of the same connections as unchanged", () => {
+    const a = connection("one");
+    const b = connection("two");
+    expect(sameConnections([a, b], [a, b])).toBe(true);
+    // A fresh array, same members: this is the case that was re-routing audio.
+    expect(sameConnections([a, b], [...[a, b]])).toBe(true);
+  });
+
+  it("notices a connection joining, leaving, or being replaced", () => {
+    const a = connection("one");
+    const b = connection("two");
+    expect(sameConnections([a], [a, b])).toBe(false);
+    expect(sameConnections([a, b], [a])).toBe(false);
+    expect(sameConnections([a], [b])).toBe(false);
+    expect(sameConnections([], [a])).toBe(false);
+  });
+
+  it("notices a reconnect that replaced the object behind the same id", () => {
+    // Identity, not id: a relinked connection has a new player on the default
+    // sink, and the choice has to be re-applied to it.
+    expect(sameConnections([connection("one")], [connection("one")])).toBe(
+      false,
+    );
+  });
+
+  it("treats two empty lists as unchanged", () => {
+    // The memo's initial value is `[]`, so this is the comparison made before
+    // any connection exists; publishing there would apply a sink to nothing.
+    expect(sameConnections([], [])).toBe(true);
   });
 });

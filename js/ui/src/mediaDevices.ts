@@ -14,12 +14,16 @@ import {
   RUNTIME_CAMERA,
   RUNTIME_MICROPHONE,
   VIDEO_CODEC_MJPEG,
+  cameraCodecLabel,
+  cameraCodecProbeOutcomes,
+  cameraCodecProbeReport,
   probeCameraCodecs,
   probeOpusMicrophone,
   releaseRecordingAudioSession,
   retainRecordingAudioSession,
   type BlitConnectionSnapshot,
   type BlitWorkspace,
+  type CameraCodecProbeOutcome,
   type CameraQuality,
   type ScreenCastState,
 } from "@blit-sh/core";
@@ -183,6 +187,24 @@ export function sameDevices(
   );
 }
 
+/**
+ * Whether two lists name the same connections in the same order.
+ *
+ * Identity is the right comparison here — a `BlitConnection` lives as long as
+ * its link does — but the *lists* are rebuilt constantly, because they are
+ * derived from a workspace snapshot that is re-emitted for any remote change at
+ * all. Speaker routing only cares whether a player joined or left.
+ */
+export function sameConnections(
+  a: readonly Connection[],
+  b: readonly Connection[],
+): boolean {
+  return (
+    a.length === b.length &&
+    a.every((connection, index) => connection === b[index])
+  );
+}
+
 export type MediaDevices = ReturnType<typeof createMediaDevices>;
 
 /**
@@ -203,6 +225,11 @@ export function createMediaDevices(props: {
   const [error, setError] = createSignal("");
   const [opusAvailable, setOpusAvailable] = createSignal(false);
   const [cameraCodecs, setCameraCodecs] = createSignal(0);
+  /** Per-codec probe verdicts, so the panel can say *why* a format is absent
+   *  instead of listing the two things it might have been. */
+  const [cameraCodecOutcomes, setCameraCodecOutcomes] = createSignal<
+    ReadonlyMap<number, CameraCodecProbeOutcome>
+  >(new Map());
   const [ready, setReady] = createSignal(false);
   const [microphoneCodec, setMicrophoneCodecSignal] =
     createSignal<MicrophoneCodecPreference>(preferredMicrophoneCodec());
@@ -329,9 +356,21 @@ export function createMediaDevices(props: {
   const cameraFormat = createMemo(() => {
     const entry = localCamera();
     const lease = entry?.connection.mediaStore.camera;
-    return lease && lease.status === "active" && lease.width
-      ? `${lease.width}×${lease.height} @ ${lease.fps} fps`
-      : "";
+    if (!lease || lease.status !== "active" || !lease.width) return "";
+    // The codec belongs here as much as the size does — it is the half of the
+    // negotiation a viewer cannot otherwise see, and the half that silently
+    // falls back.
+    return `${lease.width}×${lease.height} @ ${lease.fps} fps · ${cameraCodecLabel(lease.codec)}`;
+  });
+
+  /** Camera formats the connected desktops accept, whatever this browser can
+   *  encode. Paired with `cameraCodecs` it says which side refused a format. */
+  const serverCameraCodecs = createMemo(() => {
+    let mask = 0;
+    for (const entry of entries()) {
+      mask |= entry.connection.mediaStore.serverVideoCodecs;
+    }
+    return mask;
   });
 
   /** Camera formats this browser can encode and the servers will accept. */
@@ -645,9 +684,25 @@ export function createMediaDevices(props: {
     writeStorage(SPEAKER_DEVICE_KEY, deviceId);
     applySpeakerDevice();
   };
+  /**
+   * The players the speaker choice applies to, republished only when that set
+   * actually changes.
+   *
+   * `entries()` cannot be the dependency. It is derived from
+   * `props.connections`, which the workspace rebuilds with fresh identities on
+   * every snapshot emit — and every remote change produces one, including a
+   * media player on the far side moving between playing and paused. Tracking it
+   * re-applied the sink tens of times a minute while someone used a player over
+   * there, for a set of connections that had not changed at all.
+   */
+  const speakerTargets = createMemo<Connection[]>(
+    () => entries().map((entry) => entry.connection),
+    [],
+    { equals: sameConnections },
+  );
   const applySpeakerDevice = () => {
-    for (const entry of entries()) {
-      entry.connection.audioPlayer.setOutputDevice(speakerDevice());
+    for (const connection of speakerTargets()) {
+      connection.audioPlayer.setOutputDevice(speakerDevice());
     }
   };
 
@@ -701,6 +756,11 @@ export function createMediaDevices(props: {
         ([opus, videoCodecs]) => {
           setOpusAvailable(opus);
           setCameraCodecs(videoCodecs);
+          setCameraCodecOutcomes(new Map(cameraCodecProbeOutcomes()));
+          // Logged, not just shown in a tooltip: "the camera is stuck on
+          // Motion JPEG" is reported from other people's machines, and this is
+          // the one line that says which format failed and how.
+          console.info(cameraCodecProbeReport());
         },
         () => {},
       )
@@ -717,7 +777,8 @@ export function createMediaDevices(props: {
   });
 
   // New connections start their player on the default sink, so the choice is
-  // re-applied whenever the set of connections changes.
+  // re-applied whenever the set of connections changes — and, thanks to
+  // `speakerTargets`, only then.
   createEffect(applySpeakerDevice);
 
   return {
@@ -728,6 +789,8 @@ export function createMediaDevices(props: {
     opusAvailable,
     /** Camera formats this browser's encoder probe confirmed. */
     cameraCodecs,
+    cameraCodecOutcomes,
+    serverCameraCodecs,
     availableCameraCodecs,
     microphoneTargets,
     cameraTargets,
