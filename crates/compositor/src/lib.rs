@@ -204,7 +204,9 @@ mod stub {
         /// The client asked for one of its toplevels to be activated
         /// (xdg_activation_v1) — e.g. an Electron app reacting to a
         /// notification click.  Pane focus belongs to the frontend, so the
-        /// request is forwarded, not acted on here.
+        /// request is forwarded, not acted on here — and the frontend answers
+        /// it with a highlight rather than the view, since a client may repeat
+        /// the request indefinitely.
         SurfaceActivated {
             surface_id: u16,
         },

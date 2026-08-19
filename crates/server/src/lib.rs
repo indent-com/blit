@@ -35,8 +35,7 @@ use blit_remote::{
     C2S_SURFACE_RESIZE, C2S_SURFACE_SUBSCRIBE, C2S_SURFACE_TEXT, C2S_SURFACE_TOUCH,
     C2S_SURFACE_UNSUBSCRIBE, C2S_TERM_CWD, C2S_UNSUBSCRIBE, CAPTURE_FORMAT_AVIF,
     CAPTURE_FORMAT_PNG, CLIENT_FEATURE_SURFACE_TIMESTAMP_SUB_US, CLIENT_LIST_WANT_ORIGIN,
-    CREATE2_HAS_COMMAND, CREATE2_HAS_CWD, CREATE2_HAS_DEADLINE, CREATE2_HAS_SRC_PTY,
-    CREATE2_WANT_STATUS, FEATURE_CLIENT_CONTROL, FEATURE_CLIENT_ORIGIN, FEATURE_COPY_RANGE,
+    FEATURE_CLIENT_CONTROL, FEATURE_CLIENT_ORIGIN, FEATURE_COPY_RANGE, FEATURE_CREATE_EXEC,
     FEATURE_CREATE_NONCE, FEATURE_CREATE_STATUS, FEATURE_KILL_MODE, FEATURE_PTY_DEADLINE,
     FEATURE_RESIZE_BATCH, FEATURE_RESTART, FEATURE_SCROLL_BY, FrameState, KICK_REASON_MAX,
     KILL_LEADER_ONLY, READ_ANSI, READ_TAIL, REMOTE_INPUT_POINTER, REMOTE_INPUT_TOUCH, S2C_CLOSED,
@@ -2040,10 +2039,17 @@ struct Pty {
     /// Exit status: WEXITSTATUS if normal exit, negative signal number if signalled,
     /// EXIT_STATUS_UNKNOWN if not yet collected.
     exit_status: i32,
-    /// Command used to create this PTY (None = default shell).
+    /// The COMMAND column of `S2C_LIST`: what this terminal is running, as a
+    /// human reads it.  `None` for a plain shell.  For an argv terminal this
+    /// is a *rendering*, not something to run — restart reads `spec`.  It is
+    /// computed by the create path rather than derived here, because the same
+    /// string has to clear `list_refusal`'s size guard before the terminal
+    /// exists, and a second rendering would be a second answer.
     command: Option<String>,
-    /// Explicit working directory used to create this PTY.
-    cwd: Option<String>,
+    /// What was actually started, replayed verbatim by `C2S_RESTART`.  Without
+    /// this a terminal created with an argv, an environment, or both came back
+    /// from a restart as a bare login shell.
+    spec: pty::OwnedChildSpec,
     /// Working directory last reported by the shell via OSC 7, already
     /// validated by `parse_osc7_url` (docs/protocol.md, "Working directory
     /// tracking").  Last write wins; None until shell integration first
@@ -6012,7 +6018,23 @@ fn reanchor_scrolled_clients(sess: &mut Session) {
 /// offset we hold for it right now — which is what makes the request immune
 /// to a re-anchor that crossed it on the wire.  Unlike a re-anchor this may
 /// start a live client scrolling, since a wheel notch on a live view is how
-/// scrolling back begins.  Returns the new offset when it changed.
+/// scrolling back begins.
+///
+/// Returns the new offset only when the client has to be *told* it, which is
+/// not the same as "when it changed".  A relative request the client can
+/// predict the outcome of needs no answer: it applied the same delta to the
+/// same offset before it sent one.  Answering anyway is actively wrong, and
+/// wrong in a way that compounds — the answer is absolute, it arrives a round
+/// trip late, and a wheel notch is several requests long, so by the time the
+/// first lands the client has already moved past it.  Adopting it drags the
+/// view back, and the next delta, measured from the position it was dragged
+/// back to, comes out too big.  A twelve-row notch went out as 2, 2, 4, 4, 2
+/// and landed fourteen rows down; three notches landed forty rows instead of
+/// thirty-six, with the view lurching the whole way.
+///
+/// Clamping is the one outcome the client cannot predict — its own idea of the
+/// scrollback's depth is a frame old and never counts the rows the same way —
+/// so that is exactly when the answer is worth its round trip.
 fn scroll_client_by(
     client: &mut ClientState,
     pid: u16,
@@ -6020,8 +6042,10 @@ fn scroll_client_by(
     max_offset: usize,
 ) -> Option<usize> {
     let current = client.scroll_offsets.get(&pid).copied().unwrap_or(0) as i64;
-    let next = current.saturating_add(delta).clamp(0, max_offset as i64) as usize;
-    update_client_scroll_state(client, pid, next).then_some(next)
+    let requested = current.saturating_add(delta);
+    let next = requested.clamp(0, max_offset as i64);
+    let changed = update_client_scroll_state(client, pid, next as usize);
+    (changed && requested != next).then_some(next as usize)
 }
 
 /// Move one client's parked view down by `delta` lines, bounded by the
@@ -8895,22 +8919,86 @@ fn refuse_create(
     }
 }
 
-/// Read a `CREATE2` tag out of `data`, or name why it is unusable.
+/// Split a legacy create opcode's trailing payload into a shell command or an
+/// argv, by the presence of a NUL.  `C2S_CREATE` and `C2S_CREATE_N` predate
+/// `CREATE2`'s explicit `HAS_ARGV`, and this is the only spelling they have.
+fn legacy_create_payload(bytes: Option<&[u8]>) -> (Option<&str>, Option<Vec<&str>>) {
+    let payload = bytes.and_then(|bytes| std::str::from_utf8(bytes).ok());
+    let argv = payload
+        .filter(|payload| payload.contains('\0'))
+        .map(|payload| {
+            payload
+                .split('\0')
+                .filter(|arg| !arg.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|args| !args.is_empty());
+    if argv.is_some() {
+        return (None, argv);
+    }
+    let command = payload
+        .filter(|payload| !payload.contains('\0'))
+        .map(str::trim)
+        .filter(|payload| !payload.is_empty());
+    (command, None)
+}
+
+/// Longest rendering the COMMAND column will carry.
 ///
-/// `data` is the whole message; the tag is `[tag_len:2]` at offset 8 followed
-/// by that many bytes.  Both failures used to fall back to an empty tag and
-/// let the create proceed, which breaks the one-outcome contract in two
-/// different ways.  A client correlating terminals by tag gets one it can
-/// never match.  Worse, an overrunning `tag_len` leaves the read cursor past
-/// the end of the message, so a `CREATE2` carrying a command but no cwd or
-/// deadline — nothing else left to bounds-check it — finds no command bytes
-/// and spawns the default shell instead of what was asked for.
-fn create2_tag(data: &[u8]) -> Result<&str, &'static str> {
-    let tag_len = u16::from_le_bytes([data[8], data[9]]) as usize;
-    let bytes = data
-        .get(10..10 + tag_len)
-        .ok_or("tag length past end of message")?;
-    std::str::from_utf8(bytes).map_err(|_| "tag is not valid UTF-8")
+/// `S2C_LIST` length-prefixes the field with a `u16`, and shell quoting can
+/// quadruple a string, so a protocol-legal argv (up to a megabyte) has to be
+/// bounded here or `list_refusal` starts rejecting creates for a reason no
+/// client can predict from the advertised caps.  Well past any real command
+/// line, and far below the `u16` the encoder has to fit.
+const MAX_LIST_COMMAND: usize = 4 * 1024;
+
+/// What `S2C_LIST` should show for a terminal, given how it was created.
+///
+/// A shell command is shown as written.  An argv is rendered the way a person
+/// would type it, quoting only what has to be quoted, and elided if it runs
+/// long.  The result is display-only: `C2S_RESTART` replays `Pty::spec`, never
+/// this, because feeding a rendering back through `sh -c` would silently swap
+/// a direct exec for a login shell and drop the environment with it.
+fn list_command(command: Option<&str>, argv: Option<&[&str]>) -> Option<String> {
+    if let Some(command) = command {
+        return Some(command.to_owned());
+    }
+    let argv = argv?;
+    let mut out = String::new();
+    for arg in argv {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        if shell_safe(arg) {
+            out.push_str(arg);
+        } else {
+            out.push('\'');
+            out.push_str(&arg.replace('\'', r"'\''"));
+            out.push('\'');
+        }
+        if out.len() > MAX_LIST_COMMAND {
+            out.truncate(
+                // Never split a character in half; the field is UTF-8.
+                (0..=MAX_LIST_COMMAND)
+                    .rev()
+                    .find(|n| out.is_char_boundary(*n))
+                    .unwrap_or(0),
+            );
+            out.push('…');
+            break;
+        }
+    }
+    Some(out)
+}
+
+/// Whether an argument survives a round trip through a shell unquoted.
+/// Deliberately conservative — the cost of quoting something that did not need
+/// it is cosmetic, the cost of the reverse is a misleading catalog.
+fn shell_safe(arg: &str) -> bool {
+    !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@%_-+=:,./".contains(c))
 }
 
 /// Name the field that would not survive `S2C_LIST`'s `u16` length prefixes,
@@ -17957,6 +18045,12 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         #[cfg(target_os = "linux")]
         let features =
             features | FEATURE_COMPOSITOR | FEATURE_SURFACE_TOUCH | FEATURE_SURFACE_TEXT_INPUT;
+        // The pseudoconsole path takes a command *line*, not an argv, and has
+        // nowhere to put an environment override — so on Windows the two flags
+        // are parsed (a cursor that skipped them would misread the command) and
+        // then refused, rather than advertised and quietly ignored.
+        #[cfg(unix)]
+        let features = features | FEATURE_CREATE_EXEC;
         // BLIT_LSP=0 disables the family: the bit is simply not
         // advertised, matching the dispatch gate.
         let mut features = features;
@@ -19751,29 +19845,17 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 };
                 let cmd_start = 7 + tag_len;
                 let dir: Option<String> = None;
-                let create_payload = data
-                    .get(cmd_start..)
-                    .and_then(|bytes| std::str::from_utf8(bytes).ok());
-                let command = create_payload
-                    .filter(|payload| !payload.contains('\0'))
-                    .map(str::trim)
-                    .filter(|payload| !payload.is_empty());
-                let argv: Option<Vec<&str>> = create_payload
-                    .filter(|payload| payload.contains('\0'))
-                    .map(|payload| {
-                        payload
-                            .split('\0')
-                            .filter(|arg| !arg.is_empty())
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|args| !args.is_empty());
+                let (command, argv) = legacy_create_payload(data.get(cmd_start..));
+                let list_command = list_command(command, argv.as_deref());
                 // The legacy create opcodes carry no failure reply, so the
                 // log is the only place a refusal can be said — as
                 // `allocate_pty_id` already does for the cap.  Refusing is
                 // still necessary: `command` has no length prefix and runs to
                 // the end of the frame, so #204's guard never covered it and an
                 // oversize one truncates into a catalog every client misparses.
-                if let Some((_, detail)) = list_refusal(sess.pty_list_bytes(), tag, command) {
+                if let Some((_, detail)) =
+                    list_refusal(sess.pty_list_bytes(), tag, list_command.as_deref())
+                {
                     eprintln!("blit-server: refusing CREATE, {detail}");
                     continue;
                 }
@@ -19802,9 +19884,13 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     cols,
                     id,
                     tag,
-                    command,
-                    argv.as_deref(),
-                    dir.as_deref(),
+                    pty::ChildSpec {
+                        command,
+                        argv: argv.as_deref(),
+                        dir: dir.as_deref(),
+                        env: &[],
+                    },
+                    list_command.as_deref(),
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
@@ -19857,29 +19943,17 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 };
                 let cmd_start = 9 + tag_len;
                 let dir: Option<String> = None;
-                let create_payload = data
-                    .get(cmd_start..)
-                    .and_then(|bytes| std::str::from_utf8(bytes).ok());
-                let command = create_payload
-                    .filter(|payload| !payload.contains('\0'))
-                    .map(str::trim)
-                    .filter(|payload| !payload.is_empty());
-                let argv: Option<Vec<&str>> = create_payload
-                    .filter(|payload| payload.contains('\0'))
-                    .map(|payload| {
-                        payload
-                            .split('\0')
-                            .filter(|arg| !arg.is_empty())
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|args| !args.is_empty());
+                let (command, argv) = legacy_create_payload(data.get(cmd_start..));
+                let list_command = list_command(command, argv.as_deref());
                 // The legacy create opcodes carry no failure reply, so the
                 // log is the only place a refusal can be said — as
                 // `allocate_pty_id` already does for the cap.  Refusing is
                 // still necessary: `command` has no length prefix and runs to
                 // the end of the frame, so #204's guard never covered it and an
                 // oversize one truncates into a catalog every client misparses.
-                if let Some((_, detail)) = list_refusal(sess.pty_list_bytes(), tag, command) {
+                if let Some((_, detail)) =
+                    list_refusal(sess.pty_list_bytes(), tag, list_command.as_deref())
+                {
                     eprintln!("blit-server: refusing CREATE, {detail}");
                     continue;
                 }
@@ -19908,9 +19982,13 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     cols,
                     id,
                     tag,
-                    command,
-                    argv.as_deref(),
-                    dir.as_deref(),
+                    pty::ChildSpec {
+                        command,
+                        argv: argv.as_deref(),
+                        dir: dir.as_deref(),
+                        env: &[],
+                    },
+                    list_command.as_deref(),
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
@@ -20006,9 +20084,11 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     cols,
                     id,
                     tag,
+                    pty::ChildSpec {
+                        dir: dir.as_deref(),
+                        ..Default::default()
+                    },
                     None,
-                    None,
-                    dir.as_deref(),
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
@@ -20037,122 +20117,60 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 // feature byte are decodable (docs/protocol.md, "Common status
                 // registry").  A frame shorter than that cannot be correlated
                 // to anything, so it stays a silent drop.
-                if data.len() < 8 {
-                    continue;
-                }
-                let nonce = u16::from_le_bytes([data[1], data[2]]);
+                let req = match blit_remote::parse_create2(&data) {
+                    Ok(req) => req,
+                    Err(err) => {
+                        if let Some(nonce) = err.nonce {
+                            refuse_create(
+                                &sess,
+                                client_id,
+                                err.want_status,
+                                nonce,
+                                err.status,
+                                err.detail,
+                            );
+                        }
+                        continue;
+                    }
+                };
+                let nonce = req.nonce;
+                let want_status = req.want_status;
+                let tag = req.tag;
                 // Straight off the wire and straight into the grid allocation.
-                let (rows, cols) = clamp_view_size(
-                    u16::from_le_bytes([data[3], data[4]]),
-                    u16::from_le_bytes([data[5], data[6]]),
-                );
-                let features = data[7];
-                let want_status = features & CREATE2_WANT_STATUS != 0;
-                if data.len() < 10 {
+                let (rows, cols) = clamp_view_size(req.rows, req.cols);
+                // The exec block is only honored where it can be honored; a
+                // host that would quietly run a login shell instead has to say
+                // no (docs/protocol.md, `FEATURE_CREATE_EXEC`).
+                if !cfg!(unix) && (!req.env.is_empty() || req.argv.is_some()) {
                     refuse_create(
                         &sess,
                         client_id,
                         want_status,
                         nonce,
                         STATUS_INVALID,
-                        "truncated tag length",
+                        "this host cannot exec an argv or override the environment",
                     );
                     continue;
                 }
-                let tag_len = u16::from_le_bytes([data[8], data[9]]) as usize;
-                let tag = match create2_tag(&data) {
-                    Ok(tag) => tag,
-                    Err(detail) => {
-                        refuse_create(&sess, client_id, want_status, nonce, STATUS_INVALID, detail);
-                        continue;
-                    }
-                };
-                let mut cursor = 10 + tag_len;
-                let src_dir = if features & CREATE2_HAS_SRC_PTY != 0 && data.len() >= cursor + 2 {
-                    let src_id = u16::from_le_bytes([data[cursor], data[cursor + 1]]);
-                    cursor += 2;
-                    sess.ptys.get(&src_id).and_then(|p| pty::pty_cwd(&p.handle))
-                } else {
-                    None
-                };
-                let explicit_dir = if features & CREATE2_HAS_CWD != 0 {
-                    if data.len() < cursor + 2 {
-                        refuse_create(
-                            &sess,
-                            client_id,
-                            want_status,
-                            nonce,
-                            STATUS_INVALID,
-                            "truncated cwd length",
-                        );
-                        continue;
-                    }
-                    let cwd_len = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
-                    cursor += 2;
-                    if data.len() < cursor + cwd_len {
-                        refuse_create(
-                            &sess,
-                            client_id,
-                            want_status,
-                            nonce,
-                            STATUS_INVALID,
-                            "truncated cwd",
-                        );
-                        continue;
-                    }
-                    let cwd = std::str::from_utf8(&data[cursor..cursor + cwd_len]).ok();
-                    cursor += cwd_len;
-                    cwd.filter(|p| !p.contains('\0'))
-                        .map(str::trim)
-                        .filter(|p| !p.is_empty())
-                        .map(str::to_string)
-                } else {
-                    None
-                };
-                let dir = explicit_dir.or(src_dir);
-                // Before the command, which has no length prefix and runs to
-                // the end of the message.
-                let deadline_ms = if features & CREATE2_HAS_DEADLINE != 0 {
-                    if data.len() < cursor + 4 {
-                        refuse_create(
-                            &sess,
-                            client_id,
-                            want_status,
-                            nonce,
-                            STATUS_INVALID,
-                            "truncated deadline",
-                        );
-                        continue;
-                    }
-                    let ms = u32::from_le_bytes([
-                        data[cursor],
-                        data[cursor + 1],
-                        data[cursor + 2],
-                        data[cursor + 3],
-                    ]);
-                    cursor += 4;
-                    (ms > 0).then_some(ms)
-                } else {
-                    None
-                };
-                let create_payload = if features & CREATE2_HAS_COMMAND != 0 {
-                    data.get(cursor..).and_then(|b| std::str::from_utf8(b).ok())
-                } else {
-                    None
-                };
-                let command = create_payload
-                    .filter(|p| !p.contains('\0'))
-                    .map(str::trim)
-                    .filter(|p| !p.is_empty());
-                let argv: Option<Vec<&str>> = create_payload
-                    .filter(|p| p.contains('\0'))
-                    .map(|p| p.split('\0').filter(|a| !a.is_empty()).collect::<Vec<_>>())
-                    .filter(|a| !a.is_empty());
+                let src_dir = req
+                    .src_pty_id
+                    .and_then(|id| sess.ptys.get(&id))
+                    .and_then(|p| pty::pty_cwd(&p.handle));
+                let dir = req.cwd.map(str::to_owned).or(src_dir);
+                let deadline_ms = req.deadline_ms;
+                let command = req.command;
+                let argv = req.argv.clone();
+                // Rendered once, here: `list_refusal` has to weigh exactly the
+                // string that will land in the catalog, or the guard passes on
+                // one length and `push_list_entry` truncates a different one.
+                let list_command = list_command(command, argv.as_deref());
                 // A record that cannot round-trip S2C_LIST's u16 length
                 // fields, or a catalog that would outgrow what a client will
                 // reassemble, means a corrupt or undeliverable frame for
                 // everyone.  Refuse the mutation instead.
-                if let Some((status, detail)) = list_refusal(sess.pty_list_bytes(), tag, command) {
+                if let Some((status, detail)) =
+                    list_refusal(sess.pty_list_bytes(), tag, list_command.as_deref())
+                {
                     refuse_create(&sess, client_id, want_status, nonce, status, &detail);
                     continue;
                 }
@@ -20194,9 +20212,17 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     cols,
                     id,
                     tag,
-                    command,
-                    argv.as_deref(),
-                    dir.as_deref(),
+                    pty::ChildSpec {
+                        command,
+                        argv: argv.as_deref(),
+                        dir: dir.as_deref(),
+                        env: &req
+                            .env
+                            .iter()
+                            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                            .collect::<Vec<_>>(),
+                    },
+                    list_command.as_deref(),
                     config.scrollback,
                     state.clone(),
                     Some(&socket_name),
@@ -21192,15 +21218,17 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             }
             C2S_RESTART if data.len() >= 3 => {
                 let pid = u16::from_le_bytes([data[1], data[2]]);
-                let restart_info = sess.ptys.get(&pid).filter(|p| p.exited).map(|p| {
-                    (
-                        p.driver.size(),
-                        p.command.clone(),
-                        p.cwd.clone(),
-                        p.tag.clone(),
-                    )
-                });
-                if let Some(((rows, cols), command, cwd, tag)) = restart_info {
+                // The whole spec, not just the command: a terminal started with
+                // an argv or an environment used to come back as a bare login
+                // shell, because those were the only two things restart could
+                // not see.
+                let restart_info = sess
+                    .ptys
+                    .get(&pid)
+                    .filter(|p| p.exited)
+                    .map(|p| (p.driver.size(), p.spec.clone(), p.tag.clone()));
+                if let Some(((rows, cols), spec, tag)) = restart_info {
+                    let argv = spec.argv_refs();
                     let wayland_display = sess
                         .compositor
                         .as_ref()
@@ -21219,8 +21247,7 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         rows,
                         cols,
                         pid,
-                        command.as_deref(),
-                        cwd.as_deref(),
+                        spec.borrowed(&argv),
                         state.clone(),
                         wayland_display.as_deref(),
                         sess.x_display().as_deref(),
@@ -21881,8 +21908,10 @@ mod tests {
                 80,
                 1,
                 "exit-ordering",
-                Some("printf 'final-output\\n'"),
-                None,
+                pty::ChildSpec {
+                    command: Some("printf 'final-output\\n'"),
+                    ..Default::default()
+                },
                 None,
                 100,
                 state.clone(),
@@ -27330,8 +27359,10 @@ mod tests {
         // In flight: three lines scroll away and we hold the view still.
         assert_eq!(reanchor_client(&mut client, 7, 3, 500), Some(15));
         // The request was computed against offset 12 and still means "three
-        // more lines back", not "offset 15".
-        assert_eq!(scroll_client_by(&mut client, 7, 3, 500), Some(18));
+        // more lines back", not "offset 15".  Nothing to answer: the client
+        // took the re-anchor to 15 and applied the same 3 to it.
+        assert_eq!(scroll_client_by(&mut client, 7, 3, 500), None);
+        assert_eq!(client.scroll_offsets.get(&7), Some(&18));
     }
 
     #[test]
@@ -27339,7 +27370,11 @@ mod tests {
         let mut client = test_client();
         client.subscriptions.insert(7);
 
-        assert_eq!(scroll_client_by(&mut client, 7, 3, 500), Some(3));
+        // Going back needs no answer — the client predicted 3 itself — but
+        // coming home overshot the live tail, and a clamp it cannot predict
+        // is exactly what an answer is for.
+        assert_eq!(scroll_client_by(&mut client, 7, 3, 500), None);
+        assert_eq!(client.scroll_offsets.get(&7), Some(&3));
         assert_eq!(scroll_client_by(&mut client, 7, -9, 500), Some(0));
         assert_eq!(client.scroll_offsets.get(&7), None);
     }
@@ -27352,6 +27387,21 @@ mod tests {
 
         assert_eq!(scroll_client_by(&mut client, 7, i64::MAX, 100), Some(100));
         assert_eq!(scroll_client_by(&mut client, 7, 5, 100), None);
+    }
+
+    #[test]
+    fn a_wheel_notch_is_never_answered_back() {
+        // A notch is several requests long and the answer is absolute, so an
+        // answer to any of them is stale before it lands.  The client that
+        // adopts one gets dragged back and then over-sends the next delta:
+        // twelve rows of wheel went out as 2, 2, 4, 4, 2 and landed on 14.
+        let mut client = test_client();
+        client.subscriptions.insert(7);
+
+        for _ in 0..6 {
+            assert_eq!(scroll_client_by(&mut client, 7, 2, 500), None);
+        }
+        assert_eq!(client.scroll_offsets.get(&7), Some(&12));
     }
 
     #[test]
@@ -30481,9 +30531,16 @@ mod tests {
     /// then `[tag_len:2]` at offset 8 and the tag bytes at 10.
     fn create2_with_tag(tag_len: u16, tag: &[u8]) -> Vec<u8> {
         let mut msg = vec![0u8; 8];
+        msg[0] = blit_remote::C2S_CREATE2;
         msg.extend_from_slice(&tag_len.to_le_bytes());
         msg.extend_from_slice(tag);
         msg
+    }
+
+    fn create2_tag(msg: &[u8]) -> Result<&str, &'static str> {
+        blit_remote::parse_create2(msg)
+            .map(|req| req.tag)
+            .map_err(|err| err.detail)
     }
 
     #[test]
@@ -30534,6 +30591,64 @@ mod tests {
         // The length prefix holds this exactly; only one more byte truncates.
         let exact = "x".repeat(u16::MAX as usize);
         assert_eq!(oversize_list_field(&exact, Some(&exact)), None);
+    }
+
+    // ── the COMMAND column ──
+
+    #[test]
+    fn list_command_shows_a_shell_command_as_written() {
+        assert_eq!(
+            list_command(Some("ls | wc -l"), None).as_deref(),
+            Some("ls | wc -l")
+        );
+        assert_eq!(list_command(None, None), None);
+    }
+
+    #[test]
+    fn list_command_renders_an_argv_the_way_it_would_be_typed() {
+        assert_eq!(
+            list_command(None, Some(&["ls", "-la", "/tmp"])).as_deref(),
+            Some("ls -la /tmp")
+        );
+        // Anything a shell would eat gets quoted, including the empty argument
+        // the legacy NUL spelling could not carry at all.
+        assert_eq!(
+            list_command(None, Some(&["sh", "-c", "echo hi", ""])).as_deref(),
+            Some("sh -c 'echo hi' ''")
+        );
+        assert_eq!(
+            list_command(None, Some(&["echo", "it's"])).as_deref(),
+            Some(r"echo 'it'\''s'")
+        );
+    }
+
+    /// The catalog's size guard runs against the string the create path renders
+    /// and `push_list_entry` writes the one a `Pty` stored. If a long argv could
+    /// slip past the guard and be stored anyway, `cmd.len() as u16` would
+    /// truncate the length prefix and desynchronize every client's catalog —
+    /// and `pty_list_bytes` would agree with the encoder the whole time, so the
+    /// `debug_assert` in `pty_list_msg` would never see it.
+    #[test]
+    fn list_command_stays_inside_what_the_catalog_can_encode() {
+        let huge = "x".repeat(blit_remote::CREATE2_MAX_ARG_LEN);
+        let argv: Vec<&str> = std::iter::repeat_n(huge.as_str(), 64).collect();
+        let rendered = list_command(None, Some(&argv)).expect("argv renders");
+        assert!(
+            rendered.len() <= MAX_LIST_COMMAND + 4,
+            "rendered {} bytes",
+            rendered.len()
+        );
+        assert_eq!(oversize_list_field("tag", Some(&rendered)), None);
+        assert!(rendered.ends_with('…'));
+    }
+
+    /// Quoting can multiply a string, so the elision has to be measured after
+    /// it, not before.
+    #[test]
+    fn list_command_elides_after_quoting_not_before() {
+        let quoted = "'".repeat(MAX_LIST_COMMAND);
+        let rendered = list_command(None, Some(&["echo", &quoted])).expect("argv renders");
+        assert!(rendered.len() <= MAX_LIST_COMMAND + 4);
     }
 
     // ── retention ──

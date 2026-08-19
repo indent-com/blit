@@ -21,6 +21,7 @@ export {
   isSurfaceAssignment,
   parseSurfaceAssignment,
   editorAssignment,
+  manageAssignment,
   diffAssignment,
   parseDiffArg,
   isTileAssignment,

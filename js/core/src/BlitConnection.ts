@@ -21,6 +21,8 @@ import {
   FEATURE_CLIENT_ORIGIN,
   FEATURE_CREATE_NONCE,
   FEATURE_CREATE_STATUS,
+  FEATURE_CREATE_EXEC,
+  FEATURE_PTY_DEADLINE,
   FEATURE_KILL_MODE,
   FEATURE_RESIZE_BATCH,
   FEATURE_SCROLL_BY,
@@ -490,10 +492,24 @@ export interface CreateSessionOptions {
   rows: number;
   cols: number;
   tag?: string;
+  /** Run this through the server's login shell. Mutually exclusive with
+   *  {@link argv}. */
   command?: string;
+  /** Exec this argv directly — no login shell, so no rc files and no shell
+   *  syntax. Rejected unless the server advertised `FEATURE_CREATE_EXEC`,
+   *  because an older one would quietly start a plain shell instead. */
+  argv?: readonly string[];
   cwdFromSessionId?: SessionId;
   /** Working directory for the new session. Interpreted on the target server. */
   cwd?: string;
+  /** Environment overrides for the child, applied on top of everything the
+   *  server derives. Rejected unless the server advertised
+   *  `FEATURE_CREATE_EXEC`, because an older one would drop them silently. */
+  env?: Readonly<Record<string, string>>;
+  /** Stop the terminal server-side after this many milliseconds, armed at
+   *  creation so it survives this client dying. Rejected unless the server
+   *  advertised `FEATURE_PTY_DEADLINE`. */
+  deadlineMs?: number;
 }
 
 type ResizeSessionOptions = {
@@ -1196,6 +1212,7 @@ export class BlitConnection {
       supportsChannels: false,
       supportsChannelWatch: false,
       supportsExtensions: false,
+      supportsCreateExec: false,
       supportsDesktopMedia: false,
       retryCount: 0,
       bootGeneration: null,
@@ -1397,6 +1414,19 @@ export class BlitConnection {
         `Cannot create PTY while transport is ${this.transport.status}`,
       );
     }
+    // Refuse rather than send a field this server would misread. An unknown
+    // CREATE2 flag is not rejected by the server — it is ignored, and the
+    // bytes behind it are read as something else — so the only safe check is
+    // this one, here, before anything goes out.
+    const hasEnv = Object.keys(options.env ?? {}).length > 0;
+    if ((options.argv || hasEnv) && !(this.features & FEATURE_CREATE_EXEC)) {
+      throw connectionError(
+        "Server does not support starting a terminal with an explicit argv or environment",
+      );
+    }
+    if (options.deadlineMs != null && !(this.features & FEATURE_PTY_DEADLINE)) {
+      throw connectionError("Server does not support terminal deadlines");
+    }
 
     return new Promise<BlitSession>((resolve, reject) => {
       let nonce = 0;
@@ -1413,14 +1443,17 @@ export class BlitConnection {
       this.pendingCreates.set(nonce, {
         resolve,
         reject,
-        command: options.command,
+        command: options.command ?? options.argv?.join(" "),
       });
       this.transport.send(
         buildCreate2Message(nonce, options.rows, options.cols, {
           tag: options.tag,
           command: options.command,
+          argv: options.argv,
           srcPtyId,
           cwd: options.cwd,
+          env: options.env,
+          deadlineMs: options.deadlineMs,
           wantStatus: (this.features & FEATURE_CREATE_STATUS) !== 0,
         }),
       );
@@ -4673,9 +4706,26 @@ export class BlitConnection {
   private surfaceViewIdCounter = 0;
 
   /** Allocate a token identifying one view's subscription to a surface.
-   *  Mirrors {@link allocViewId} for PTYs. */
+   *  Mirrors {@link allocViewId} for PTYs.
+   *
+   *  Prefixed with the connection id, because a view mints its token once and
+   *  keeps it for the life of its mount — including across
+   *  `BlitSurfaceCanvas.setConnectionId`, which re-points a canvas at another
+   *  server without re-minting.  A bare per-connection counter is only unique
+   *  within the connection that issued it, so a canvas carrying `s3` from
+   *  connection A onto connection B collided with B's own `s3`: two views
+   *  sharing one `SurfaceSub.views` entry, where the last writer decides the
+   *  encode size and cadence for both.  A live pane then inherited a dock
+   *  card's `{512x256, 15fps}` request and could not take it back
+   *  (`serverSubscribe` early-returns once `_subscribedSurface` is set), and
+   *  the card's unsubscribe deleted the pane's registration outright, taking
+   *  the pane's stream with it.
+   *
+   *  The token never reaches the wire — it only keys {@link surfaceSubs}'
+   *  `views` and {@link surfaceViewSizes}' `views` — so the prefix costs
+   *  nothing but the string.  Session ids are built the same way. */
   allocSurfaceViewId(): string {
-    return `s${++this.surfaceViewIdCounter}`;
+    return `${this.id}:s${++this.surfaceViewIdCounter}`;
   }
 
   /**
@@ -6023,6 +6073,7 @@ export class BlitConnection {
           supportsChannelWatch: (features & FEATURE_CHANNEL_WATCH) !== 0,
           supportsExtensions: (features & FEATURE_EXTENSION) !== 0,
           supportsDesktopMedia: (features & FEATURE_DESKTOP_MEDIA) !== 0,
+          supportsCreateExec: (features & FEATURE_CREATE_EXEC) !== 0,
           bootGeneration,
           serverVersion,
         };

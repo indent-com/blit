@@ -593,8 +593,10 @@ pub enum CompositorEvent {
     SurfaceDestroyed {
         surface_id: u16,
     },
-    /// A client asked to activate (raise/focus) a surface via
-    /// xdg_activation_v1; forwarded so the frontend can raise the pane.
+    /// A client asked to activate a surface via xdg_activation_v1; forwarded so
+    /// the frontend can point the viewer at it.  Not a raise: the frontend
+    /// answers with a highlight, because clients repeat this request and each
+    /// repeat would otherwise land on top of whatever the viewer just chose.
     SurfaceActivated {
         surface_id: u16,
     },
@@ -11213,10 +11215,17 @@ impl Dispatch<XdgActivationV1, ()> for Compositor {
                 // Tokens are issued unvalidated, so there is nothing to
                 // check here.  Pane focus is managed externally by the
                 // browser/CLI, but "always granted" must not mean "silently
-                // dropped": forward the request so the frontend can raise
-                // and focus the matching pane.  An ignored activation is
-                // what strands an Electron app that asks to come back
-                // (Slack on a notification click) behind everything else.
+                // dropped": forward the request so the frontend can point the
+                // viewer at the surface.  An ignored activation is what
+                // strands an Electron app that asks to come back (Slack on a
+                // notification click) behind everything else.
+                //
+                // Forwarding every repeat is safe *because* the frontend
+                // answers with a highlight and not the view — when it raised
+                // instead, a client asking several times a second could not be
+                // clicked away from.  A compositor that wanted to grant this
+                // literally would first have to validate the token against a
+                // recent input serial belonging to the requesting client.
                 if let Some(surf) = state.surfaces.get(&surface.id())
                     && surf.surface_id > 0
                 {

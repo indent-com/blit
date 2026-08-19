@@ -717,6 +717,67 @@ const surfaceCanvasByInput = new WeakMap<
   BlitSurfaceCanvas
 >();
 
+/** Where the canvas is on screen and how its pixels map to surface pixels.
+ *  Obtained from a `getBoundingClientRect`, so treat it as a measurement. */
+interface DrawnGeometry {
+  dx: number;
+  dy: number;
+  dw: number;
+  dh: number;
+  sx: number;
+  sy: number;
+  rect: DOMRect;
+}
+
+/**
+ * Bumped whenever anything might have moved a canvas on screen without
+ * changing its own box: a window resize, a scroll in any ancestor, a
+ * visual-viewport change (mobile keyboard).
+ *
+ * This exists so {@link BlitSurfaceCanvas.syncImeTarget} can skip its
+ * `getBoundingClientRect` on the overwhelming majority of frames.  It used to
+ * measure on *every presented frame* — the only notification a pane being
+ * dragged gives us — which put a forced layout, four visual-viewport reads and
+ * a `position: fixed` style write inside the decoder's present path at up to
+ * the display's refresh rate, for the one pane the user has focused.  Those
+ * writes then invalidated layout for the wheel handler's own reads, which is
+ * the read/write thrash that made scrolling a focused pane expensive.
+ *
+ * One shared counter and one shared set of listeners, refcounted across
+ * mounts: a per-view listener would put the cost back, multiplied by the number
+ * of dock cards on the page.
+ */
+let layoutEpoch = 0;
+let layoutEpochRefs = 0;
+let layoutEpochListener: (() => void) | null = null;
+
+function retainLayoutEpoch(): void {
+  layoutEpochRefs++;
+  if (layoutEpochListener || typeof window === "undefined") return;
+  layoutEpochListener = () => {
+    layoutEpoch++;
+  };
+  // Capture, so a scroll in any ancestor of any surface pane counts — scroll
+  // does not bubble.  Passive: these never call preventDefault.
+  window.addEventListener("scroll", layoutEpochListener, {
+    capture: true,
+    passive: true,
+  });
+  window.addEventListener("resize", layoutEpochListener, { passive: true });
+  window.visualViewport?.addEventListener("resize", layoutEpochListener);
+  window.visualViewport?.addEventListener("scroll", layoutEpochListener);
+}
+
+function releaseLayoutEpoch(): void {
+  layoutEpochRefs = Math.max(0, layoutEpochRefs - 1);
+  if (layoutEpochRefs > 0 || !layoutEpochListener) return;
+  window.removeEventListener("scroll", layoutEpochListener, { capture: true });
+  window.removeEventListener("resize", layoutEpochListener);
+  window.visualViewport?.removeEventListener("resize", layoutEpochListener);
+  window.visualViewport?.removeEventListener("scroll", layoutEpochListener);
+  layoutEpochListener = null;
+}
+
 /** Bubbling DOM event emitted by a mounted surface when its Wayland client
  * commits text-input state. The app shell uses fresh `requested` events to
  * raise a mobile virtual keyboard; embedders can provide their own policy. */
@@ -1380,6 +1441,15 @@ export class BlitSurfaceCanvas {
     w: number;
     h: number;
   } | null = null;
+  /** {@link layoutEpoch} the IME capture element was last placed against, or
+   *  -1 to force the next {@link syncImeTarget} to measure. */
+  private _imeSyncedEpoch = -1;
+  /** Whether the pointer overlay already carries the fill-the-box style the
+   *  no-display-size branch of {@link layoutCanvasBox} writes. */
+  private _overlayFilled = false;
+  /** Whether this mount holds a reference on the shared {@link layoutEpoch}
+   *  listeners. */
+  private _layoutEpochHeld = false;
   /** True after this view has sent a nonzero surface resize that must be
    *  cleared when the view stops owning foreground/BSP sizing. */
   private _resizeConstraintActive = false;
@@ -1693,6 +1763,12 @@ export class BlitSurfaceCanvas {
     mountedSurfaceCanvases.set(canvas, this);
 
     this.observePresentBox(container);
+    // Flagged rather than counted per call: attach() has no re-entrancy guard,
+    // and a double retain would strand the shared listeners for the page's life.
+    if (!this._layoutEpochHeld) {
+      this._layoutEpochHeld = true;
+      retainLayoutEpoch();
+    }
     this.observeIntersection(container);
     this.subscribe();
     this.attachEvents();
@@ -1800,6 +1876,10 @@ export class BlitSurfaceCanvas {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (this._layoutEpochHeld) {
+      this._layoutEpochHeld = false;
+      releaseLayoutEpoch();
+    }
     if (this._retryUnsub) {
       this._retryUnsub();
       this._retryUnsub = undefined;
@@ -2107,7 +2187,12 @@ export class BlitSurfaceCanvas {
           height: "100%",
         });
       }
-      if (remotePointerSvg) {
+      // Guarded like the canvas write above it.  This branch is every passive
+      // view — a dock full of cards — and it runs per presented frame, so five
+      // unconditional CSSOM setters here were parsing the same strings
+      // thousands of times a second for a box that never moves.
+      if (remotePointerSvg && !this._overlayFilled) {
+        this._overlayFilled = true;
         Object.assign(remotePointerSvg.style, {
           position: "absolute",
           left: "0",
@@ -2118,6 +2203,7 @@ export class BlitSurfaceCanvas {
       }
       return;
     }
+    this._overlayFilled = false;
     const fw = canvas.width;
     const fh = canvas.height;
     if (fw === 0 || fh === 0) return;
@@ -2144,6 +2230,8 @@ export class BlitSurfaceCanvas {
       return;
     }
     this._lastLayout = { left, top, w, h };
+    // This view's own box moved, which the shared epoch cannot see.
+    this._imeSyncedEpoch = -1;
     // All values are integer device pixels converted to CSS pixels, so the
     // canvas lands on the device grid — a stream served at the size that
     // was asked for is then blitted 1:1.  The container's own ratio, not the
@@ -2307,9 +2395,17 @@ export class BlitSurfaceCanvas {
       }
       // Flush any pending resize now that we have the surface info.
       this.flushPendingResize();
-      // Repaint on any surface change (e.g. resize, new frame decoded
-      // while listener was briefly detached).
-      this.blitFromStore(store);
+      // Repaint on a change to *this* view's surface (a resize, or its first
+      // metadata), not on every change the connection publishes.
+      //
+      // `onChange` is connection-wide and carries no surface id, and the store
+      // fires it for a title or app-id change on any surface. Repainting
+      // unconditionally meant one chatty app renaming its window drove a full
+      // halving chain plus a layout pass through every mounted view on the page
+      // — a dock of fifteen cards and three panes is eighteen of them per
+      // title. The store replaces only the changed surface's object, so
+      // identity is exactly the "did mine change" test.
+      if (prev !== this.surface) this.blitFromStore(store);
     });
 
     // Frame listener — must always be registered so decoded frames are
@@ -3096,6 +3192,17 @@ export class BlitSurfaceCanvas {
    * composition — and everything else goes back to the corner, where a
    * software keyboard can never cover it.
    */
+  /**
+   * Park the IME capture element on the caret.
+   *
+   * Called from {@link applyLayout}, i.e. once per presented frame, so the
+   * measuring path is gated on something plausibly having moved since the last
+   * time it ran: this view's own caret rectangle or box (both of which
+   * invalidate {@link _imeSyncedEpoch} directly) or the shared
+   * {@link layoutEpoch}.  Guest apps that report a caret at all report it on
+   * every caret move (GTK/Qt) or throughout a composition (Chromium), so the
+   * placement stays fresh exactly when the candidate window is on screen.
+   */
   private syncImeTarget(): void {
     const ta = this.textInput;
     if (!ta) return;
@@ -3105,12 +3212,18 @@ export class BlitSurfaceCanvas {
       typeof document === "undefined" ||
       document.activeElement !== ta
     ) {
+      // Both writes inside placeImeTarget are deduped, so the unfocused case —
+      // every view but one — costs an identity compare and nothing else.
       placeImeTarget(ta, null);
+      this._imeSyncedEpoch = -1;
       return;
     }
+    if (this._imeSyncedEpoch === layoutEpoch) return;
+    this._imeSyncedEpoch = layoutEpoch;
     const g = this.drawnGeometry();
     if (!g) {
       placeImeTarget(ta, null);
+      this._imeSyncedEpoch = -1;
       return;
     }
     // Surface pixels to CSS pixels: the inverse of the pointer path, so the
@@ -3131,6 +3244,10 @@ export class BlitSurfaceCanvas {
     this.textInputCursorRect = state.enabled
       ? (state.cursorRect ?? null)
       : null;
+    // A fresh caret is the main reason to re-place, and the app reports one on
+    // every caret move — so this, not the frame loop, is what keeps the
+    // candidate window on the cursor.
+    this._imeSyncedEpoch = -1;
     this.syncImeTarget();
 
     if (state.enabled) {
@@ -3177,12 +3294,17 @@ export class BlitSurfaceCanvas {
     );
   }
 
+  /** `geometry` lets a caller that has already measured this frame pass its
+   *  reading in.  `drawnGeometry` calls `getBoundingClientRect`, and the wheel
+   *  path used to take two of those per event: one for its own scaling and one
+   *  in here, either side of a style write. */
   private sendPointerAt(
     clientX: number,
     clientY: number,
     type: number,
     button: number,
     timeMs = 0,
+    geometry?: DrawnGeometry | null,
   ): void {
     const conn = this.getConn();
     if (!conn || !this.canvas || !this.surface || !this._displaySize) return;
@@ -3195,7 +3317,7 @@ export class BlitSurfaceCanvas {
     } else if (type === SURFACE_POINTER_UP) {
       this.pressedButtons.delete(button);
     }
-    const point = this.surfaceWirePoint(clientX, clientY);
+    const point = this.surfaceWirePoint(clientX, clientY, geometry);
     if (!point) return;
     conn.sendSurfacePointer(
       this._surfaceId,
@@ -3221,8 +3343,9 @@ export class BlitSurfaceCanvas {
   private surfaceWirePoint(
     clientX: number,
     clientY: number,
+    geometry?: DrawnGeometry | null,
   ): { x: number; y: number } | null {
-    const point = this.surfacePointFromClient(clientX, clientY);
+    const point = this.surfacePointFromClient(clientX, clientY, true, geometry);
     if (!point || !this.surface) return null;
     return {
       x: Math.min(Math.max(point.x, 0), Math.max(0, this.surface.width - 1)),
@@ -3255,15 +3378,7 @@ export class BlitSurfaceCanvas {
    * wheel and a drag move content by the same amount on a letterboxed or
    * downscaled surface.
    */
-  private drawnGeometry(): {
-    dx: number;
-    dy: number;
-    dw: number;
-    dh: number;
-    sx: number;
-    sy: number;
-    rect: DOMRect;
-  } | null {
+  private drawnGeometry(): DrawnGeometry | null {
     if (!this.canvas || !this.surface) return null;
     const rect = this.canvas.getBoundingClientRect();
     const cw = this.canvas.width;
@@ -3300,8 +3415,9 @@ export class BlitSurfaceCanvas {
     clientX: number,
     clientY: number,
     rounded = true,
+    geometry?: DrawnGeometry | null,
   ): { x: number; y: number } | null {
-    const g = this.drawnGeometry();
+    const g = geometry ?? this.drawnGeometry();
     if (!g) return null;
     const x = (clientX - g.rect.left - g.dx) * g.sx;
     const y = (clientY - g.rect.top - g.dy) * g.sy;
@@ -3828,7 +3944,10 @@ export class BlitSurfaceCanvas {
     // under a stationary cursor (including halfway through momentum), which
     // otherwise leaves no live surface to receive this or any later scroll.
     // Touch scrolling does the same when the drag first becomes a scroll.
-    this.sendPointerAt(e.clientX, e.clientY, SURFACE_POINTER_MOVE, 0);
+    // Reuse the reading taken above rather than measuring again: this runs at
+    // the trackpad's event rate, and a second getBoundingClientRect here landed
+    // after applyLayout's style writes had already dirtied layout.
+    this.sendPointerAt(e.clientX, e.clientY, SURFACE_POINTER_MOVE, 0, 0, g);
 
     // The latch has to win before the detent maths below, not just when
     // labelling the source, or a smooth event ends up carrying notches.

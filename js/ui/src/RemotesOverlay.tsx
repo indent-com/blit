@@ -1,18 +1,12 @@
 import { createSignal, Index, Show } from "solid-js";
 import type {
   BlitConnectionSnapshot,
-  BlitSession,
-  BlitSurface,
-  BlitWorkspace,
-  ConnectionId,
   ConnectionStatus,
   TerminalPalette,
 } from "@blit-sh/core";
 import { OverlayBackdrop, OverlayHeader, OverlayPanel } from "./Overlay";
 import { mergeStyle, scrollbarStyle, themeFor, ui, uiScale } from "./theme";
 import { createDragReorder, reorderTo } from "./dragReorder";
-import { connectionHasClientList } from "./ConnectionClients";
-import { ConnectionControlOverlay } from "./ConnectionControl";
 import { t } from "./i18n";
 import type { Remote } from "./storage";
 
@@ -46,13 +40,13 @@ export function RemotesOverlay(props: {
   onReorder: (names: string[]) => void;
   onReconnect?: (name: string) => void;
   onClose: () => void;
-  /** Live connections, used to decide which rows can list their clients.
-   *  Omit (with `workspace`) to render the remotes list on its own. */
+  /** Live connections, used to decide which rows have anything to manage.
+   *  Omit to render the remotes list on its own. */
   connections?: readonly BlitConnectionSnapshot[];
-  workspace?: BlitWorkspace;
-  sessions?: readonly BlitSession[];
-  surfaces?: readonly BlitSurface[];
-  readOnlyConnections?: ReadonlySet<ConnectionId>;
+  /** Open this remote's panels as a pane, and dismiss this dialog. Omit and
+   *  the Manage button stays out of the list — a shell that has nowhere to put
+   *  a tile has nothing to offer here. */
+  onManage?: (name: string) => void;
 }) {
   const theme = () => themeFor(props.palette);
   const scale = () => uiScale(props.fontSize);
@@ -60,35 +54,17 @@ export function RemotesOverlay(props: {
   const [name, setName] = createSignal("");
   const [uri, setUri] = createSignal("");
   const [revealed, setRevealed] = createSignal<Set<string>>(new Set());
-  // The remote whose control panel is open, if any. At most one: each open
-  // panel holds live subscriptions (a CLIENT_WATCH pushing a catalog every
-  // second, a unit table), and reading two servers side by side is not a
-  // thing anyone does.
-  const [controlling, setControlling] = createSignal<string | null>(null);
 
   /** A remote's live connection, if it has one. Remote names *are* connection
    *  ids (App.tsx builds one ConnectionSpec per enabled remote, `id: name`). */
   const connectionFor = (remoteName: string) =>
     props.connections?.find((c) => c.id === remoteName);
 
-  /** Whether this row can show a client list right now. */
-  const canListClients = (remoteName: string) => {
-    const connection = connectionFor(remoteName);
-    return (
-      !!props.workspace &&
-      !!connection &&
-      connectionHasClientList(
-        connection,
-        props.readOnlyConnections ?? new Set(),
-      )
-    );
-  };
-
-  /** Whether this row has anything to control. Every panel needs a live
+  /** Whether this row has anything to manage. Every panel needs a live
    *  connection to say anything at all, and which of them exist is discovered
-   *  inside the panel rather than here. */
+   *  inside the pane rather than here. */
   const canControl = (remoteName: string) =>
-    !!props.workspace && connectionFor(remoteName)?.status === "connected";
+    !!props.onManage && connectionFor(remoteName)?.status === "connected";
 
   /** Any row at all can be controlled — gates the header's explanation of what
    *  the button is, so a shell with nothing connected says nothing. */
@@ -341,9 +317,7 @@ export function RemotesOverlay(props: {
                   );
                 };
 
-                const clients = () => canListClients(remote().name);
                 const controllable = () => canControl(remote().name);
-                const open = () => controlling() === remote().name;
 
                 return (
                   <>
@@ -509,15 +483,16 @@ export function RemotesOverlay(props: {
                           </Show>
                         </Show>
 
-                        {/* Clients — a named action rather than a bare
-                            chevron on the name: this replaced a top-level
-                            "Connected clients" entry in the command palette,
-                            and a 1-em glyph is not a discoverable home for
-                            something that used to have its own menu item.
-                            Only offered where the remote could actually
-                            answer; a disconnected row that expanded to "No
-                            clients connected" would be reporting the wrong
-                            thing. */}
+                        {/* Manage — this remote's panels (its applications,
+                            clients, units, extensions) as a pane. A named
+                            action rather than a bare chevron on the name: it
+                            replaced a top-level "Connected clients" entry in
+                            the command palette, and a 1-em glyph is not a
+                            discoverable home for something that used to have
+                            its own menu item. Only offered where the remote
+                            could actually answer; a disconnected row that
+                            opened to "No clients connected" would be
+                            reporting the wrong thing. */}
                         <Show when={anyControl()}>
                           <Show
                             when={controllable()}
@@ -532,14 +507,9 @@ export function RemotesOverlay(props: {
                           >
                             <button
                               type="button"
-                              aria-haspopup="dialog"
                               title={t("remotes.openControl")}
-                              onClick={() => setControlling(remote().name)}
-                              style={{
-                                ...btnStyle(),
-                                opacity: open() ? 1 : 0.7,
-                                color: open() ? theme().accent : "inherit",
-                              }}
+                              onClick={() => props.onManage?.(remote().name)}
+                              style={{ ...btnStyle(), opacity: 0.7 }}
                             >
                               {t("remotes.control")}
                             </button>
@@ -695,28 +665,6 @@ export function RemotesOverlay(props: {
           </form>
         </Show>
       </OverlayPanel>
-
-      {/* On top of this list rather than inside it: a unit table or a journal
-          page has no business being rendered into a row. Closing it comes back
-          here, which is where the viewer asked for it. */}
-      <Show when={controlling()}>
-        {(name) => (
-          <ConnectionControlOverlay
-            workspace={props.workspace!}
-            connectionId={name() as ConnectionId}
-            name={name()}
-            palette={props.palette}
-            fontSize={props.fontSize}
-            sessions={props.sessions ?? []}
-            surfaces={props.surfaces ?? []}
-            canListClients={canListClients(name())}
-            canManageExtensions={
-              connectionFor(name())?.supportsExtensions === true
-            }
-            onClose={() => setControlling(null)}
-          />
-        )}
-      </Show>
     </OverlayBackdrop>
   );
 }

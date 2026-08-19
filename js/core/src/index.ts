@@ -38,6 +38,9 @@ export {
   wrappingTimestampDelta,
 } from "./SurfaceStore";
 
+export { clampZoom, driveSurfaceResize } from "./surfaceResize";
+export type { SurfaceResizeTarget, SurfaceZoom } from "./surfaceResize";
+
 export { measureCell, cssFontFamily } from "./measure";
 export type { CellMetrics } from "./measure";
 

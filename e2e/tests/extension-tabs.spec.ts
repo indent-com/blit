@@ -4,6 +4,27 @@ import fs from "fs";
 import path from "path";
 
 /**
+ * A manage tile is registered in the *host's* open-tab list (docs/design/kv.md),
+ * so leaving one open outlives this page: it is the first parked card in every
+ * spec that runs after this one, and their own `localStorage.clear()` cannot
+ * reach it — a card whose body is a title rather than a preview, which is not
+ * what a dock full of terminals is expected to start with. Closing the focused
+ * tile is the only thing that unregisters it.
+ */
+test.afterEach(async ({ page }) => {
+  const panels = page.locator("[data-connection-tab]");
+  if (
+    !(await panels
+      .first()
+      .isVisible()
+      .catch(() => false))
+  )
+    return;
+  await page.keyboard.press("Control+Alt+Shift+q");
+  await expect(panels).toHaveCount(0);
+});
+
+/**
  * A remote's extension tabs appear and disappear with the extension.
  *
  * Session and systemd are tabs of one server's Manage panel, and each exists
@@ -95,7 +116,7 @@ test("installing an extension adds its tab, removing it takes it away", async ({
   ).toBeVisible({ timeout: 10_000 });
 
   await page.getByRole("status").click();
-  const manage = page.getByRole("button", { name: /Manage/ }).first();
+  const manage = page.getByRole("button", { name: /^Manage$/ }).first();
   await expect(manage).toBeVisible({ timeout: 5_000 });
   await manage.click();
   await expect(page.locator("[data-connection-tab]").first()).toBeVisible({

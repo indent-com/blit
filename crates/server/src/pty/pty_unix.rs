@@ -6,10 +6,77 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::{AppState, PTY_CHANNEL_CAPACITY, PtyInput};
 
+/// What to run in a terminal, and where.
+///
+/// `command` and `argv` are mutually exclusive: a command is handed to the
+/// login shell, an argv is exec'd directly. Both are absent for a plain shell.
+/// The owned counterpart, [`OwnedChildSpec`], is what a `Pty` keeps so a
+/// restart can replay the same child rather than degrading to a bare shell.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChildSpec<'a> {
+    /// Run through `$SHELL -<flags>c`.
+    pub command: Option<&'a str>,
+    /// Exec directly, no shell.
+    pub argv: Option<&'a [&'a str]>,
+    pub dir: Option<&'a str>,
+    /// Environment overrides, applied after everything the server derives.
+    pub env: &'a [(String, String)],
+}
+
+/// [`ChildSpec`] with owned strings, held by a `Pty` for the lifetime of the
+/// terminal so `C2S_RESTART` re-runs what was actually started.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnedChildSpec {
+    pub command: Option<String>,
+    pub argv: Option<Vec<String>>,
+    pub dir: Option<String>,
+    pub env: Vec<(String, String)>,
+}
+
+impl OwnedChildSpec {
+    pub fn borrowed<'a>(&'a self, argv: &'a [&'a str]) -> ChildSpec<'a> {
+        ChildSpec {
+            command: self.command.as_deref(),
+            argv: self.argv.is_some().then_some(argv),
+            dir: self.dir.as_deref(),
+            env: &self.env,
+        }
+    }
+
+    /// The `&[&str]` backing store `borrowed` needs, since `Vec<String>` and
+    /// `&[&str]` have no shared layout.
+    pub fn argv_refs(&self) -> Vec<&str> {
+        self.argv
+            .as_deref()
+            .map(|args| args.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+}
+
+impl ChildSpec<'_> {
+    pub fn to_owned_spec(self) -> OwnedChildSpec {
+        OwnedChildSpec {
+            command: self.command.map(str::to_owned),
+            argv: self
+                .argv
+                .map(|args| args.iter().map(|a| (*a).to_owned()).collect()),
+            dir: self.dir.map(str::to_owned),
+            env: self.env.to_vec(),
+        }
+    }
+}
+
 /// Build the environment array for a child process before fork().
 /// This avoids calling std::env::set_var/remove_var after fork() in a
 /// multi-threaded process (which is UB per POSIX — those functions are
 /// not async-signal-safe).
+///
+/// `overrides` are applied **dead last**, after the inherit filter, after the
+/// terminal and `BLIT_*` rewrites, and after the session environment — so a
+/// client entry always wins, whichever layer would otherwise have set the key.
+/// This is the precedence the process family already documents for
+/// `PROCESS_SPAWN` (`command_for` in `process.rs`).
+#[allow(clippy::too_many_arguments)]
 fn build_child_env(
     wayland_display: Option<&str>,
     x_display: Option<&str>,
@@ -18,6 +85,7 @@ fn build_child_env(
     pipewire_remote: Option<&str>,
     blit_sock: Option<&str>,
     path_dir: Option<&str>,
+    overrides: &[(String, String)],
 ) -> Vec<CString> {
     let mut env: Vec<(String, String)> = std::env::vars()
         .filter(|(k, _)| {
@@ -80,9 +148,120 @@ fn build_child_env(
     for (key, value) in &session.set {
         set(&mut env, key, value);
     }
+    // Last word to the client, over every layer above — including the `BLIT_*`
+    // filter and the exported socket, which a caller may legitimately want to
+    // point somewhere else.
+    for (key, value) in overrides {
+        set(&mut env, key, value);
+    }
     env.into_iter()
         .filter_map(|(k, v)| CString::new(format!("{k}={v}")).ok())
         .collect()
+}
+
+/// Everything the child needs to `execve`, built entirely before `fork()`.
+///
+/// Nothing here may be deferred to the child: after fork in a multi-threaded
+/// process only async-signal-safe calls are legal, and every allocation risks
+/// an allocator mutex some dead thread still holds. That includes the
+/// `CString`s — a NUL in a client-supplied argument must fail *here*, not as a
+/// panic on the wrong side of the fork.
+struct ExecPlan {
+    /// Kept alive because `ptrs` borrows their interiors.
+    _argv: Vec<CString>,
+    program: CString,
+    ptrs: Vec<*const libc::c_char>,
+}
+
+impl ExecPlan {
+    /// `program` is what runs; `args` is the child's whole argv, argv[0]
+    /// included. The two are allowed to disagree, and both callers make them:
+    /// `program` is resolved against the child's own `PATH`, while argv[0]
+    /// stays as it was written — the client's word for it, or the shell's
+    /// name — so `ps` and busybox-style dispatch see the request rather than
+    /// the path it resolved to.
+    fn new(program: &std::path::Path, args: &[&str]) -> Option<Self> {
+        let program = CString::new(program.as_os_str().as_encoded_bytes()).ok()?;
+        let argv: Vec<CString> = args
+            .iter()
+            .map(|arg| CString::new(*arg).ok())
+            .collect::<Option<_>>()?;
+        let ptrs = argv
+            .iter()
+            .map(|arg| arg.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        Some(Self {
+            _argv: argv,
+            program,
+            ptrs,
+        })
+    }
+
+    /// Only `execve` and `_exit` run after this; both are async-signal-safe.
+    unsafe fn exec(&self, envp: &[*const libc::c_char]) -> ! {
+        unsafe {
+            libc::execve(self.program.as_ptr(), self.ptrs.as_ptr(), envp.as_ptr());
+            libc::_exit(1);
+        }
+    }
+}
+
+/// Resolve and lay out the child's `execve` arguments before forking.
+///
+/// `env` is the child's own environment, so `PATH` lookup honors an override
+/// the caller asked for rather than silently using the server's.
+fn plan_exec(
+    spec: &ChildSpec<'_>,
+    shell: &str,
+    shell_flags: &str,
+    env: &[CString],
+) -> Option<ExecPlan> {
+    if let Some(argv) = spec.argv.filter(|argv| !argv.is_empty()) {
+        let program = resolve_in_path(argv[0], child_path(env).as_deref())?;
+        return ExecPlan::new(&program, argv);
+    }
+    let program = resolve_in_path(shell, child_path(env).as_deref())
+        .unwrap_or_else(|| std::path::PathBuf::from(shell));
+    let flag = match (spec.command, shell_flags) {
+        (Some(_), "") => Some("-c".to_owned()),
+        (Some(_), flags) => Some(format!("-{flags}c")),
+        (None, "") => None,
+        (None, flags) => Some(format!("-{flags}")),
+    };
+    let mut args: Vec<&str> = vec![shell];
+    if let Some(flag) = &flag {
+        args.push(flag);
+    }
+    if let Some(command) = spec.command {
+        args.push(command);
+    }
+    ExecPlan::new(&program, &args)
+}
+
+/// The `PATH` the child will actually run with, read back out of its own
+/// prepared environment.
+fn child_path(env: &[CString]) -> Option<String> {
+    env.iter().find_map(|entry| {
+        entry
+            .to_str()
+            .ok()
+            .and_then(|entry| entry.strip_prefix("PATH="))
+            .map(str::to_owned)
+    })
+}
+
+/// Write a diagnostic to the terminal and terminate the child.
+///
+/// Runs after fork, so it is restricted to `write` and `_exit`. The message
+/// reaches the pty, which is the only place a person is looking.
+unsafe fn child_fail(what: &[u8], detail: &[u8]) -> ! {
+    unsafe {
+        for part in [b"blit: " as &[u8], what, detail, b"\r\n"] {
+            libc::write(2, part.as_ptr().cast(), part.len());
+        }
+        libc::_exit(1);
+    }
 }
 
 /// Directory holding the running server binary, resolved once.  `None` when the
@@ -96,13 +275,25 @@ fn exe_dir() -> Option<&'static str> {
     .as_deref()
 }
 
-/// Resolve a program name to an absolute path by searching $PATH.
+/// Resolve a program name to an absolute path by searching `$PATH`.
 /// Called before fork() so the child can use execve (which doesn't search PATH).
-fn resolve_in_path(program: &str) -> Option<std::path::PathBuf> {
+///
+/// `path` is the child's own `PATH` when the caller has one — an override that
+/// changes where a program comes from has to change where we look for it, or
+/// the terminal runs a different binary than the same command would in a shell.
+/// Falls back to the server's.
+fn resolve_in_path(program: &str, path: Option<&str>) -> Option<std::path::PathBuf> {
     if program.contains('/') {
         return Some(std::path::PathBuf::from(program));
     }
-    let path_var = std::env::var("PATH").unwrap_or_default();
+    let owned;
+    let path_var = match path {
+        Some(path) => path,
+        None => {
+            owned = std::env::var("PATH").unwrap_or_default();
+            &owned
+        }
+    };
     for dir in path_var.split(':') {
         let candidate = std::path::Path::new(dir).join(program);
         if candidate.is_file() {
@@ -601,6 +792,11 @@ pub fn pty_reader(fd: PtyWriteTarget, tx: mpsc::Sender<PtyInput>, notify: Arc<No
     }
 }
 
+/// Spawn a terminal.
+///
+/// `list_command` is what `S2C_LIST` will show for this terminal; the caller
+/// renders it, because the same string has to clear the catalog's size guard
+/// before the id is allocated.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_pty(
     shell: &str,
@@ -609,9 +805,8 @@ pub fn spawn_pty(
     cols: u16,
     id: u16,
     tag: &str,
-    command: Option<&str>,
-    argv: Option<&[&str]>,
-    dir: Option<&str>,
+    spec: ChildSpec<'_>,
+    list_command: Option<&str>,
     scrollback: usize,
     state: AppState,
     wayland_display: Option<&str>,
@@ -658,14 +853,36 @@ pub fn spawn_pty(
         pipewire_remote,
         blit_sock,
         path_dir,
+        spec.env,
     );
     let child_envp: Vec<*const libc::c_char> = child_env
         .iter()
         .map(|c| c.as_ptr())
         .chain(std::iter::once(std::ptr::null()))
         .collect();
-    // Resolve the shell path before fork (execve doesn't search PATH).
-    let shell_path = resolve_in_path(shell);
+    // Resolve the program and lay out its argv before fork: execve does not
+    // search PATH, and neither the allocation nor a NUL-check may happen on
+    // the child's side of the fork.
+    let Some(plan) = plan_exec(&spec, shell, shell_flags, &child_env) else {
+        eprintln!("cannot resolve a program to run for pty {id}");
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        return None;
+    };
+    let dir_c = match spec.dir.map(CString::new) {
+        Some(Ok(dir)) => Some(dir),
+        None => None,
+        Some(Err(_)) => {
+            eprintln!("working directory for pty {id} contains a NUL");
+            unsafe {
+                libc::close(master);
+                libc::close(slave);
+            }
+            return None;
+        }
+    };
 
     let pid = fork_child();
     if pid < 0 {
@@ -698,67 +915,15 @@ pub fn spawn_pty(
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
         set_qos_user_interactive();
-        let effective_dir = dir.map(String::from);
-        if let Some(d) = effective_dir
-            && let Ok(dir_c) = CString::new(d)
+        // A working directory that cannot be entered used to be ignored, which
+        // left the child running somewhere the client never asked for and had
+        // no way to notice. Say so on the terminal and stop.
+        if let Some(dir_c) = &dir_c
+            && unsafe { libc::chdir(dir_c.as_ptr()) } != 0
         {
-            unsafe {
-                libc::chdir(dir_c.as_ptr());
-            }
+            unsafe { child_fail(b"cannot enter working directory: ", dir_c.as_bytes()) };
         }
-        if let Some(command) = command {
-            let shell_c = match &shell_path {
-                Some(p) => CString::new(p.to_string_lossy().as_ref()).unwrap(),
-                None => CString::new(shell).unwrap(),
-            };
-            let command_c = CString::new(command).unwrap();
-            let flag = CString::new(if shell_flags.is_empty() {
-                "-c".to_owned()
-            } else {
-                format!("-{}c", shell_flags)
-            })
-            .unwrap();
-            unsafe {
-                let p = shell_c.as_ptr();
-                let f = flag.as_ptr();
-                let c = command_c.as_ptr();
-                libc::execve(p, [p, f, c, std::ptr::null()].as_ptr(), child_envp.as_ptr());
-                libc::_exit(1);
-            }
-        }
-        if let Some(args) = argv
-            && !args.is_empty()
-        {
-            let cargs: Vec<CString> = args.iter().map(|s| CString::new(*s).unwrap()).collect();
-            // Resolve the first arg (program) via PATH.
-            let prog = resolve_in_path(args[0])
-                .map(|p| CString::new(p.to_string_lossy().as_ref()).unwrap())
-                .unwrap_or_else(|| cargs[0].clone());
-            let ptrs: Vec<*const libc::c_char> = std::iter::once(prog.as_ptr())
-                .chain(cargs[1..].iter().map(|c| c.as_ptr()))
-                .chain(std::iter::once(std::ptr::null()))
-                .collect();
-            unsafe {
-                libc::execve(prog.as_ptr(), ptrs.as_ptr(), child_envp.as_ptr());
-                libc::_exit(1);
-            }
-        }
-        let shell_c = match &shell_path {
-            Some(p) => CString::new(p.to_string_lossy().as_ref()).unwrap(),
-            None => CString::new(shell).unwrap(),
-        };
-        unsafe {
-            if shell_flags.is_empty() {
-                let p = shell_c.as_ptr();
-                libc::execve(p, [p, std::ptr::null()].as_ptr(), child_envp.as_ptr());
-            } else {
-                let flag = CString::new(format!("-{}", shell_flags)).unwrap();
-                let p = shell_c.as_ptr();
-                let f = flag.as_ptr();
-                libc::execve(p, [p, f, std::ptr::null()].as_ptr(), child_envp.as_ptr());
-            }
-            libc::_exit(1);
-        }
+        unsafe { plan.exec(&child_envp) }
     }
 
     unsafe {
@@ -807,8 +972,8 @@ pub fn spawn_pty(
         exited_at: None,
         generation: 0,
         exit_status: blit_remote::EXIT_STATUS_UNKNOWN,
-        command: command.map(|s| s.to_owned()),
-        cwd: dir.map(|s| s.to_owned()),
+        command: list_command.map(str::to_owned),
+        spec: spec.to_owned_spec(),
         osc7_cwd: None,
         journal: crate::journal::CommandJournal::default(),
         osc_carry: Vec::new(),
@@ -822,8 +987,7 @@ pub fn respawn_child(
     rows: u16,
     cols: u16,
     pty_id: u16,
-    command: Option<&str>,
-    dir: Option<&str>,
+    spec: ChildSpec<'_>,
     state: AppState,
     wayland_display: Option<&str>,
     x_display: Option<&str>,
@@ -871,13 +1035,19 @@ pub fn respawn_child(
         pipewire_remote,
         blit_sock,
         path_dir,
+        spec.env,
     );
     let child_envp: Vec<*const libc::c_char> = child_env
         .iter()
         .map(|c| c.as_ptr())
         .chain(std::iter::once(std::ptr::null()))
         .collect();
-    let shell_path = resolve_in_path(shell);
+    let plan = plan_exec(&spec, shell, shell_flags, &child_env)?;
+    let dir_c = match spec.dir.map(CString::new) {
+        Some(Ok(dir)) => Some(dir),
+        None => None,
+        Some(Err(_)) => return None,
+    };
 
     let pid = fork_child();
     if pid < 0 {
@@ -902,56 +1072,12 @@ pub fn respawn_child(
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
         set_qos_user_interactive();
-        if let Some(d) = dir
-            && let Ok(dir_c) = CString::new(d)
+        if let Some(dir_c) = &dir_c
+            && unsafe { libc::chdir(dir_c.as_ptr()) } != 0
         {
-            unsafe {
-                libc::chdir(dir_c.as_ptr());
-            }
+            unsafe { child_fail(b"cannot enter working directory: ", dir_c.as_bytes()) };
         }
-        if let Some(cmd) = command {
-            let shell_c = match &shell_path {
-                Some(p) => CString::new(p.to_string_lossy().as_ref()).unwrap(),
-                None => CString::new(shell).unwrap(),
-            };
-            let flag = CString::new(if shell_flags.is_empty() {
-                "-c".to_owned()
-            } else {
-                format!("-{}c", shell_flags)
-            })
-            .unwrap();
-            let cmd_c = CString::new(cmd).unwrap();
-            unsafe {
-                libc::execve(
-                    shell_c.as_ptr(),
-                    [
-                        shell_c.as_ptr(),
-                        flag.as_ptr(),
-                        cmd_c.as_ptr(),
-                        std::ptr::null(),
-                    ]
-                    .as_ptr(),
-                    child_envp.as_ptr(),
-                );
-                libc::_exit(1);
-            }
-        }
-        let shell_c = match &shell_path {
-            Some(p) => CString::new(p.to_string_lossy().as_ref()).unwrap(),
-            None => CString::new(shell).unwrap(),
-        };
-        unsafe {
-            if shell_flags.is_empty() {
-                let p = shell_c.as_ptr();
-                libc::execve(p, [p, std::ptr::null()].as_ptr(), child_envp.as_ptr());
-            } else {
-                let flag = CString::new(format!("-{}", shell_flags)).unwrap();
-                let p = shell_c.as_ptr();
-                let f = flag.as_ptr();
-                libc::execve(p, [p, f, std::ptr::null()].as_ptr(), child_envp.as_ptr());
-            }
-            libc::_exit(1);
-        }
+        unsafe { plan.exec(&child_envp) }
     }
 
     unsafe {
@@ -979,9 +1105,37 @@ pub fn respawn_child(
 
 #[cfg(test)]
 mod tests {
-    use super::{PtyHandle, build_child_env, collect_exit_status, reap_zombies};
+    use super::{
+        ChildSpec, PtyHandle, build_child_env, child_path, collect_exit_status, plan_exec,
+        reap_zombies, resolve_in_path,
+    };
     use std::collections::HashMap;
+    use std::ffi::CString;
     use std::time::{Duration, Instant};
+
+    /// `build_child_env` with no client overrides — the shape every test that
+    /// predates them expects.
+    #[allow(clippy::too_many_arguments)]
+    fn session_child_env(
+        wayland_display: Option<&str>,
+        x_display: Option<&str>,
+        desktop_bus: Option<&str>,
+        pulse_server: Option<&str>,
+        pipewire_remote: Option<&str>,
+        blit_sock: Option<&str>,
+        path_dir: Option<&str>,
+    ) -> Vec<CString> {
+        build_child_env(
+            wayland_display,
+            x_display,
+            desktop_bus,
+            pulse_server,
+            pipewire_remote,
+            blit_sock,
+            path_dir,
+            &[],
+        )
+    }
 
     /// Block until `pid` exits but leave it unreaped (`WNOWAIT`), so the reaper
     /// under test still finds a zombie to consume.
@@ -1289,9 +1443,123 @@ mod tests {
             .collect()
     }
 
+    fn overrides(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// The client's entries are applied after every layer the server derives —
+    /// the inherit filter, the terminal rewrites, the exported socket, and the
+    /// session environment — so "explicit beats inherited" holds no matter
+    /// which layer would otherwise have owned the key.
+    #[test]
+    fn child_env_overrides_beat_every_layer_the_server_derives() {
+        let env = child_env_map(build_child_env(
+            Some("/tmp/blit-test/wayland-7"),
+            None,
+            None,
+            None,
+            None,
+            Some("/tmp/blit-test/ipc.sock"),
+            None,
+            &overrides(&[
+                // A plain addition.
+                ("BLIT_PROBE", "hello"),
+                // Beats the unconditional terminal rewrite.
+                ("TERM", "dumb"),
+                // Beats the exported socket.
+                ("BLIT_SOCK", "/somewhere/else.sock"),
+                // Beats `session_env`'s compositor socket.
+                ("WAYLAND_DISPLAY", "wayland-99"),
+            ]),
+        ));
+        assert_eq!(env.get("BLIT_PROBE").map(String::as_str), Some("hello"));
+        assert_eq!(env.get("TERM").map(String::as_str), Some("dumb"));
+        assert_eq!(
+            env.get("BLIT_SOCK").map(String::as_str),
+            Some("/somewhere/else.sock")
+        );
+        assert_eq!(
+            env.get("WAYLAND_DISPLAY").map(String::as_str),
+            Some("wayland-99")
+        );
+    }
+
+    /// An override that changes where programs come from has to change where
+    /// we look for them, or the terminal runs a different binary than the same
+    /// command would in a shell.
+    #[test]
+    fn path_lookup_follows_the_child_environment() {
+        let dir = std::env::temp_dir().join(format!("blit-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("blit-test-probe");
+        std::fs::write(&program, b"#!/bin/sh\n").unwrap();
+
+        let env = build_child_env(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &overrides(&[("PATH", dir.to_str().unwrap())]),
+        );
+        assert_eq!(child_path(&env).as_deref(), dir.to_str());
+        assert_eq!(
+            resolve_in_path("blit-test-probe", child_path(&env).as_deref()),
+            Some(program.clone())
+        );
+        // Without it the server's own PATH answers, and this is not on it.
+        assert_eq!(resolve_in_path("blit-test-probe", None), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A NUL cannot survive `execve`. It used to reach a `CString::new().unwrap()`
+    /// on the child's side of a `fork` in a multi-threaded process, where a
+    /// panic is neither async-signal-safe nor recoverable.
+    #[test]
+    fn a_nul_in_an_argument_fails_before_the_fork() {
+        let argv = ["echo", "a\0b"];
+        assert!(
+            plan_exec(
+                &ChildSpec {
+                    argv: Some(&argv),
+                    ..Default::default()
+                },
+                "/bin/sh",
+                "",
+                &[],
+            )
+            .is_none()
+        );
+    }
+
+    /// A program that does not exist is a failure to plan, not a fork that
+    /// exits 1 with nothing said.
+    #[test]
+    fn an_unresolvable_program_fails_before_the_fork() {
+        let argv = ["blit-definitely-not-a-program"];
+        assert!(
+            plan_exec(
+                &ChildSpec {
+                    argv: Some(&argv),
+                    ..Default::default()
+                },
+                "/bin/sh",
+                "",
+                &[],
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn child_env_enables_electron_wayland_when_compositor_is_available() {
-        let env = child_env_map(build_child_env(
+        let env = child_env_map(session_child_env(
             Some("/tmp/blit-test/wayland-7"),
             None,
             None,
@@ -1338,7 +1606,7 @@ mod tests {
     /// it to run at all.
     #[test]
     fn child_env_exports_display_only_for_a_bridged_session() {
-        let env = child_env_map(build_child_env(
+        let env = child_env_map(session_child_env(
             Some("/tmp/blit-test/wayland-7"),
             Some(":20"),
             None,
@@ -1355,7 +1623,7 @@ mod tests {
 
         // No compositor, no session to point at: DISPLAY stays gone even
         // when the host had one.
-        let env = child_env_map(build_child_env(
+        let env = child_env_map(session_child_env(
             None,
             Some(":20"),
             None,
@@ -1369,7 +1637,7 @@ mod tests {
 
     #[test]
     fn child_env_uses_the_compositor_scoped_session_bus() {
-        let env = child_env_map(build_child_env(
+        let env = child_env_map(session_child_env(
             Some("/tmp/blit-test/wayland-7"),
             None,
             None,
@@ -1380,7 +1648,7 @@ mod tests {
         ));
         assert!(!env.contains_key("DBUS_SESSION_BUS_ADDRESS"));
 
-        let env = child_env_map(build_child_env(
+        let env = child_env_map(session_child_env(
             Some("/tmp/blit-test/wayland-7"),
             None,
             Some("unix:path=/tmp/blit-test/desktop-bus"),
@@ -1397,10 +1665,10 @@ mod tests {
 
     #[test]
     fn child_env_exports_blit_sock_only_when_requested() {
-        let env = child_env_map(build_child_env(None, None, None, None, None, None, None));
+        let env = child_env_map(session_child_env(None, None, None, None, None, None, None));
         assert!(!env.contains_key("BLIT_SOCK"));
 
-        let env = child_env_map(build_child_env(
+        let env = child_env_map(session_child_env(
             None,
             None,
             None,
@@ -1419,13 +1687,13 @@ mod tests {
     fn child_env_appends_the_binary_dir_to_path_only_when_requested() {
         let inherited = std::env::var("PATH").unwrap_or_default();
 
-        let env = child_env_map(build_child_env(None, None, None, None, None, None, None));
+        let env = child_env_map(session_child_env(None, None, None, None, None, None, None));
         assert_eq!(
             env.get("PATH").map(String::as_str),
             Some(inherited.as_str())
         );
 
-        let env = child_env_map(build_child_env(
+        let env = child_env_map(session_child_env(
             None,
             None,
             None,
@@ -1445,7 +1713,7 @@ mod tests {
         let inherited = std::env::var("PATH").unwrap_or_default();
         let already = inherited.split(':').next_back().unwrap_or_default();
 
-        let env = child_env_map(build_child_env(
+        let env = child_env_map(session_child_env(
             None,
             None,
             None,

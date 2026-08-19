@@ -24,6 +24,9 @@ export interface BSPTreeCtx {
   multiPane: boolean;
   /** Coarse pointer: the pane's ✕ has no hover to reveal it, so it stays up. */
   isMobileTouch?: boolean;
+  /** Did this pane's occupant ask to come forward (xdg_activation_v1)?  It is
+   *  answered with a ring around the pane, never by taking focus. */
+  hasAttention?: (assignment: string) => boolean;
   onFocusPane: (paneId: string) => void;
   /** Close whatever the pane holds — terminal, surface, IDE tile or web pane.
    *  Same targets, and the same order, as Ctrl+Alt+Shift+Q. */
@@ -59,6 +62,9 @@ export interface BSPTreeCtx {
    *  terminals render without input affordances instead of silently
    *  swallowing keystrokes the server will refuse. */
   isSessionReadOnly?: (sessionId: string) => boolean;
+  /** The same question about a whole connection, which is what a manage tile
+   *  asks: its clients panel talks a family a read-only share drops. */
+  isConnectionReadOnly?: (connectionId: string) => boolean;
   /** Open an IDE tile from within a tile (commit view → editor). */
   onOpenTile?: (assignment: string) => void;
   /** Drop a dragged IDE tile assignment into a specific pane. */

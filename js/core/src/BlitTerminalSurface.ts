@@ -12,7 +12,7 @@ import { assessUrl, openUrlSafely, type UrlAssessment } from "./urlSecurity";
 import { devicePixelBox, drawHalved, halve, halvings } from "./downscale";
 import { gridCaretRect, placeChip, placeImeTarget } from "./imeTarget";
 import { captureDelta } from "./prediction";
-import { WheelDetents } from "./wheel";
+import { WheelDetents, notchedRows } from "./wheel";
 
 /** One screen row's slice of a hyperlink's extent, inclusive of both columns. */
 interface LinkSegment {
@@ -298,10 +298,19 @@ export class BlitTerminalSurface {
   /** Inner spacer that gives `scrollEl` enough scrollable content height
    *  for the current scrollback range. */
   private scrollSpacer: HTMLDivElement | null = null;
-  /** True while we're updating `scrollEl.scrollTop` from inside our own
-   *  scrollOffset → scrollTop sync, so the scroll listener doesn't feed
-   *  the change back. */
+  /** True while a resize is re-clamping `scrollEl.scrollTop` under us, so the
+   *  scroll listener doesn't read the browser's reflow as the user scrolling.
+   *  A span of time, because a reflow's scroll events cannot be named. */
   private suppressScrollSync = false;
+  /** The exact `scrollTop` the sync last asked for, waiting for its own echo.
+   *
+   *  Named rather than timed, because a span of time swallows whatever else
+   *  lands inside it. A wheel notch is one scroll event now that its travel
+   *  is quantised — it used to be a burst of six from the browser's scroll
+   *  animation, of which losing one went unnoticed — so a notch that arrived
+   *  during the window lost the whole gesture: the surface moved and nothing
+   *  else did, leaving the reader at the bottom having plainly scrolled up. */
+  private pendingScrollTopWrite: number | null = null;
   /** scrollEl's client height, refreshed from the ResizeObserver and the
    *  scroll listener — both of which run after layout, so the measurement
    *  costs nothing. Never read inside the render loop (see
@@ -3111,6 +3120,13 @@ export class BlitTerminalSurface {
     if (!el) return;
     this.boundScrollListener = () => {
       if (this.suppressScrollSync) return;
+      const pending = this.pendingScrollTopWrite;
+      if (pending !== null) {
+        this.pendingScrollTopWrite = null;
+        // Our own write coming back. Anything else reached the element
+        // first and is the user's, however close behind the write it was.
+        if (Math.abs(el.scrollTop - pending) < 0.5) return;
+      }
       const t = this.terminal;
       if (!t) return;
       const maxLines = t.scrollback_lines();
@@ -3220,38 +3236,45 @@ export class BlitTerminalSurface {
       this.lastScrollTop = targetTop;
       return;
     }
-    if (drift > 0.5 && !this.gestureOwnsScrollTop(drift, cellH)) {
+    if (drift > 0.5 && !this.subRowDrift(drift, cellH)) {
       this.lastScrollTop = targetTop;
-      this.suppressScrollSync = true;
+      this.pendingScrollTopWrite = targetTop;
       el.scrollTop = targetTop;
-      // The scroll event is async; clear the flag in the next frame.
+      // A write the browser clamps produces no echo at all, so give the
+      // claim a frame to live rather than leaving it to match some later
+      // scroll that happens to land on the same pixel.
       requestAnimationFrame(() => {
-        this.suppressScrollSync = false;
+        this.pendingScrollTopWrite = null;
       });
     }
   }
 
   /**
-   * True when a scroll gesture is still in flight and the only disagreement
-   * is where inside a row it stopped.
+   * True when the only disagreement is where inside a row the surface sits.
    *
    * `scrollOffset` is whole lines, so the position it maps back to is the
-   * nearest row boundary — never more than half a row from wherever the
-   * user actually is. Writing that back mid-gesture cancels the browser's
-   * momentum animation and restarts it from a snapped position, once per
-   * frame, which is what made a flick stutter. The offset the scroll
-   * listener derived is already correct either way; the write is only a
-   * cosmetic re-alignment, so it can wait for the gesture to end.
+   * nearest row boundary — never more than half a row from wherever the user
+   * actually is. Writing that back is not worth doing at any time, because
+   * nothing renders from `scrollTop`: the canvas draws rows from
+   * `scrollOffset`, the scrollbar beside it is ours and drawn from
+   * `scrollOffset` too, and the surface's own scrollbar is hidden. The
+   * difference is invisible until the write makes it visible, by taking the
+   * scroll away from the browser mid-flight and putting it somewhere else.
+   *
+   * This used to hold only for the length of a gesture, which cured a flick
+   * and left the wheel alone: a notch settles in well under
+   * `SCROLL_SETTLE_MS`, so every one of them ended with up to half a row of
+   * correction, in whichever direction its remainder fell. It rides the
+   * render loop, and an idle shell only renders on the cursor blink, so it
+   * arrived as much as half a second late — long after the wheel had stopped,
+   * which is what made it read as the terminal moving on its own.
    *
    * A jump from somewhere else — Shift+PageUp, a paste, the server
-   * re-anchoring a scrolled view — moves by rows, not by a fraction of
-   * one, and still lands immediately.
+   * re-anchoring a scrolled view — moves by rows, not by a fraction of one,
+   * and still lands immediately.
    */
-  private gestureOwnsScrollTop(drift: number, cellH: number): boolean {
-    return (
-      drift < cellH &&
-      performance.now() - this.lastUserScrollAt < SCROLL_SETTLE_MS
-    );
+  private subRowDrift(drift: number, cellH: number): boolean {
+    return drift < cellH;
   }
 
   // --- Mouse input ---
@@ -3678,10 +3701,21 @@ export class BlitTerminalSurface {
     const wheelDetents = new WheelDetents();
     const handleCanvasWheel = (e: WheelEvent) => {
       const t = this.terminal;
-      if (!t || t.mouse_mode() === 0 || e.shiftKey) return;
+      if (!t) return;
       // Ctrl+wheel is how browsers report a pinch-zoom, including macOS
       // trackpad pinches. It is a zoom request, not a scroll.
       if (e.ctrlKey) return;
+      if (t.mouse_mode() === 0 || e.shiftKey) {
+        // Scrollback navigation. Native scroll does the work; a notched
+        // wheel only has its travel put back on the row grid first, so the
+        // sync has no rounding left to write back afterwards.
+        const rows = notchedRows(e, this.cell.h);
+        const el = this.scrollEl;
+        if (rows === 0 || !el) return;
+        e.preventDefault();
+        el.scrollTop += rows * this.cell.h;
+        return;
+      }
       // Claim the gesture even when it hasn't completed a step yet, or the
       // leftover travel scrolls our own scrollback at the same time.
       e.preventDefault();

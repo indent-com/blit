@@ -2,7 +2,9 @@ import { describe, it, expect } from "vitest";
 import {
   editorAssignment,
   diffAssignment,
+  manageAssignment,
   parseDiffArg,
+  isContentAssignment,
   isTileAssignment,
   parseTileAssignment,
 } from "../bsp/layout";
@@ -41,6 +43,24 @@ describe("tile assignments (docs/ide-plan.md PR-6)", () => {
         path: p,
       });
     }
+  });
+
+  // A manage tile's address is its connection and nothing else. The trailing
+  // colon is load-bearing: parseTileAssignment splits on the first ":" after
+  // the prefix, so "manage:hound" (no colon left to split on) parses as
+  // nothing at all — and a tile that fails to parse renders an empty pane.
+  it("round-trips a manage assignment, arg and all", () => {
+    const m = manageAssignment("hound");
+    expect(isTileAssignment(m)).toBe(true);
+    expect(isContentAssignment(m)).toBe(true);
+    expect(parseTileAssignment(m)).toEqual({
+      kind: "manage",
+      connectionId: "hound",
+      arg: "",
+    });
+    // What the tab registry does to it and back (stripConn/withConn).
+    expect(parseTileAssignment(`manage:hound:`)).not.toBeNull();
+    expect(parseTileAssignment("manage:hound")).toBeNull();
   });
 
   it("does not treat sessions or surfaces as tiles", () => {

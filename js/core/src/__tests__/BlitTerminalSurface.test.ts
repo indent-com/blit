@@ -1631,6 +1631,370 @@ describe("BlitTerminalSurface native scroll surface", () => {
   });
 });
 
+describe("BlitTerminalSurface scrollback against a server that answers", () => {
+  // One gesture is many scroll events — a wheel notch Chromium animates over
+  // several frames, a momentum flick on an iPad, dozens.  Each is reported as
+  // a relative move, and each report the server answers comes back absolute
+  // and a round trip late.  Adopting a late answer drags the view back to
+  // where the gesture used to be, and the next delta — measured from there —
+  // comes out too big, so the view lurches past where the finger asked.
+  beforeEach(() => {
+    mockCanvasContext();
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((cb: FrameRequestCallback) => {
+        cb(0);
+        return 1;
+      }),
+    );
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const LINES = 1000;
+  const CELL_H = 10;
+  /** jsdom reports no scrollHeight, so the code falls back to the model. */
+  const MAX_TOP = LINES * CELL_H;
+
+  /**
+   * A surface wired to a server that holds its own offset, applies each
+   * relative move to it, and answers `answerEverything` moves later.
+   */
+  function rig(lagFrames: number, answerEverything: boolean) {
+    const s = new BlitTerminalSurface({ sessionId: null });
+    const el = document.createElement("div");
+    const spacer = document.createElement("div");
+    el.appendChild(spacer);
+    Object.defineProperty(el, "clientHeight", {
+      configurable: true,
+      value: 80,
+    });
+
+    // @ts-expect-error — install DOM/terminal stubs for the private sync.
+    s.scrollEl = el;
+    // @ts-expect-error — install DOM/terminal stubs for the private sync.
+    s.scrollSpacer = spacer;
+    // @ts-expect-error — only scrollback_lines is read here.
+    s.terminal = { scrollback_lines: () => LINES };
+    // @ts-expect-error — only cell.h is read by the scroll surface methods.
+    s.cell = { h: CELL_H };
+
+    let anchor: ((offset: number) => void) | null = null;
+    // @ts-expect-error — minimal connection: status gate plus the anchor hook.
+    s["_blitConn"] = {
+      transport: { status: "connected" },
+      addScrollAnchorListener: (_id: string, cb: (o: number) => void) => {
+        anchor = cb;
+        return () => {};
+      },
+    };
+    // @ts-expect-error — the listener is per-session.
+    s["_sessionId"] = "s1";
+
+    let serverOffset = 0;
+    let frame = 0;
+    const inFlight: { at: number; offset: number }[] = [];
+    const sent: number[] = [];
+
+    // @ts-expect-error — minimal workspace: only the scroll verbs are used.
+    s["_workspace"] = {
+      scrollSessionBy: (_id: string, _abs: number, lines: number) => {
+        sent.push(lines);
+        const requested = serverOffset + lines;
+        serverOffset = Math.max(0, Math.min(LINES, requested));
+        if (answerEverything || requested !== serverOffset) {
+          inFlight.push({ at: frame + lagFrames, offset: serverOffset });
+        }
+      },
+      scrollSession: () => {},
+    };
+
+    // @ts-expect-error — wire the private listeners.
+    s["setupScrollAnchorListener"]();
+    // @ts-expect-error — wire the private listeners.
+    s["setupScrollSurface"]();
+
+    /** One frame: the browser moves scrollTop, then any answer that has
+     *  finished its round trip lands. */
+    const step = (scrollTop: number) => {
+      el.scrollTop = scrollTop;
+      // @ts-expect-error — the rAF stub already cleared the listener handle.
+      s.boundScrollListener();
+      frame++;
+      while (inFlight.length && inFlight[0].at <= frame) {
+        anchor!(inFlight.shift()!.offset);
+      }
+    };
+
+    /** Drain the wire once the gesture has stopped. */
+    const settle = () => {
+      while (inFlight.length) {
+        frame++;
+        anchor!(inFlight.shift()!.offset);
+      }
+    };
+
+    return { step, settle, sent, server: () => serverOffset };
+  }
+
+  /** Twelve rows of travel, two rows a frame, the way one notch arrives. */
+  const oneNotch = (step: (top: number) => void) => {
+    for (let i = 1; i <= 6; i++) step(MAX_TOP - i * 20);
+  };
+
+  it("lands a notch where it pointed when nothing answers back", () => {
+    const { step, settle, sent, server } = rig(2, false);
+    oneNotch(step);
+    settle();
+    expect(sent).toEqual([2, 2, 2, 2, 2, 2]);
+    expect(server()).toBe(12);
+  });
+
+  it("would overshoot a notch if every move were answered", () => {
+    // The behaviour this exists to prevent, kept as the thing being ruled
+    // out: the doubled deltas are the answers landing mid-gesture.
+    const { step, settle, sent, server } = rig(2, true);
+    oneNotch(step);
+    settle();
+    expect(sent).toEqual([2, 2, 4, 4, 2]);
+    expect(server()).toBe(14);
+  });
+
+  it("lands a flick where it pointed, however long the wire is", () => {
+    for (const lag of [1, 2, 5]) {
+      const { step, settle, server } = rig(lag, false);
+      for (let i = 1; i <= 18; i++) step(MAX_TOP - i * 20);
+      settle();
+      expect({ lag, offset: server() }).toEqual({ lag, offset: 36 });
+    }
+  });
+});
+
+describe("BlitTerminalSurface wheel over the scrollback", () => {
+  let now = 0;
+  beforeEach(() => {
+    now = 1000;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    mockCanvasContext();
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((cb: FrameRequestCallback) => {
+        cb(0);
+        return 1;
+      }),
+    );
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const LINES = 1000;
+  const CELL_H = 19; // 120px is 6.3 of these — the awkward case
+
+  /** A surface at a plain prompt, where the wheel navigates scrollback. */
+  function attachScrollback() {
+    const surface = new BlitTerminalSurface({ sessionId: "s1" });
+    surface.attach(document.createElement("div"));
+    // @ts-expect-error — minimal connection exposing a connected transport.
+    surface["_blitConn"] = { transport: { status: "connected" } };
+    // @ts-expect-error — no app is reading the mouse.
+    surface["terminal"] = {
+      mouse_mode: () => 0,
+      scrollback_lines: () => LINES,
+    };
+    // @ts-expect-error — a known cell for the row maths.
+    surface["cell"] = { h: CELL_H, w: 8, pw: 8, ph: CELL_H };
+    const el = surface["scrollEl"];
+    if (!el) throw new Error("expected a scroll surface");
+    el.scrollTop = LINES * CELL_H; // parked at the live bottom
+
+    const notch = (deltaY: number, deltaMode = 0) => {
+      const e = new WheelEvent("wheel", { cancelable: true });
+      Object.defineProperties(e, {
+        deltaY: { value: deltaY },
+        deltaX: { value: 0 },
+        deltaMode: { value: deltaMode },
+      });
+      el.dispatchEvent(e);
+      // jsdom does not fire `scroll` for a programmatic scrollTop.
+      // @ts-expect-error — the listener the real event would have run.
+      surface["boundScrollListener"]?.();
+      return e;
+    };
+    /** The wheel rests, and the next render syncs — a cursor blink will do. */
+    const settle = () => {
+      now += 200;
+      const before = el.scrollTop;
+      // @ts-expect-error — the render loop's idempotent sync.
+      surface["syncScrollSurface"](true);
+      return el.scrollTop - before;
+    };
+    // @ts-expect-error — read the offset the listener derived.
+    const offset = () => surface["scrollOffset"] as number;
+    return { surface, el, notch, settle, offset };
+  }
+
+  it("moves every notch the same whole number of rows", () => {
+    const { notch, settle, offset } = attachScrollback();
+    const steps: number[] = [];
+    let prev = 0;
+    for (let n = 0; n < 12; n++) {
+      notch(-120);
+      steps.push(offset() - prev);
+      prev = offset();
+      settle();
+    }
+    // 120px over a 19px cell: six rows, twelve times, not 6/7 alternating.
+    expect(steps).toEqual(Array(12).fill(6));
+  });
+
+  it("leaves the surface nothing to snap back once the notch settles", () => {
+    // The jank: the sync used to write the rounding back up to half a row
+    // later, in whichever direction the remainder fell, as late as the next
+    // cursor blink — +6, -7, -1, +5, -8 … px at this cell height.
+    const { notch, settle, el } = attachScrollback();
+    const start = el.scrollTop;
+    const snaps: number[] = [];
+    for (let n = 0; n < 12; n++) {
+      notch(-120);
+      snaps.push(settle());
+    }
+    expect(snaps).toEqual(Array(12).fill(0));
+    // jsdom does no scrolling of its own, so assert the notches actually
+    // moved the surface — otherwise "nothing snapped back" is vacuous.
+    expect(el.scrollTop).toBe(start - 12 * 6 * CELL_H);
+  });
+
+  it("leaves a surface parked between rows exactly where it is", () => {
+    // Nothing renders from scrollTop — the canvas draws rows from the
+    // offset, our scrollbar likewise, and the surface's own is hidden — so
+    // a position inside a row is invisible until squaring it up makes it
+    // visible. A trackpad lands here on every gesture.
+    const { el, settle, surface } = attachScrollback();
+    el.scrollTop = LINES * CELL_H - 100; // 5.26 rows: not on the grid
+    // @ts-expect-error — the listener the real scroll event would have run.
+    surface["boundScrollListener"]();
+    expect(settle()).toBe(0);
+  });
+
+  it("still lands a jump that moved by whole rows", () => {
+    // Shift+PageUp, a paste, the server re-anchoring: these move the offset
+    // without touching the surface, and the surface has to follow.
+    const { el, settle, surface } = attachScrollback();
+    // @ts-expect-error — the listener the real scroll event would have run.
+    surface["boundScrollListener"]();
+    // @ts-expect-error — what the scrollback-navigation keys do.
+    surface["scrollOffset"] = 3;
+    expect(settle()).toBe(-3 * CELL_H);
+    expect(el.scrollTop).toBe((LINES - 3) * CELL_H);
+  });
+
+  it("claims the notch so the browser does not scroll it as well", () => {
+    const { notch } = attachScrollback();
+    expect(notch(-120).defaultPrevented).toBe(true);
+  });
+
+  it("leaves a trackpad to the browser's own scrolling", () => {
+    const { notch, el } = attachScrollback();
+    const before = el.scrollTop;
+    const e = notch(-53.5);
+    expect(e.defaultPrevented).toBe(false);
+    expect(el.scrollTop).toBe(before);
+  });
+
+  /** Hold rAF callbacks instead of running them, so the frame the sync uses
+   *  as a backstop stays open for the length of the test. */
+  function deferFrames() {
+    const queued: FrameRequestCallback[] = [];
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((cb: FrameRequestCallback) => {
+        queued.push(cb);
+        return 1;
+      }),
+    );
+    return () => {
+      const run = queued.splice(0);
+      for (const cb of run) cb(0);
+    };
+  }
+
+  it("keeps a notch that lands while the sync's own write is in flight", () => {
+    // The sync claims the echo of the scrollTop it wrote. It used to claim a
+    // frame instead, and once a notch became a single scroll event rather
+    // than an animated burst, a notch inside that frame was the whole
+    // gesture — the surface moved and nothing else did, so the reader stayed
+    // at the bottom having plainly scrolled up.
+    const { surface, notch, offset } = attachScrollback();
+    // @ts-expect-error — the listener the real scroll event would have run.
+    surface["boundScrollListener"]();
+    // A whole-row jump from elsewhere, which the sync does still write.
+    // @ts-expect-error — what the scrollback-navigation keys do.
+    surface["scrollOffset"] = 3;
+    now += 200;
+    const runFrames = deferFrames();
+    // @ts-expect-error — the write that claims its own echo.
+    surface["syncScrollSurface"](true);
+    // @ts-expect-error — the claim is outstanding: no echo has arrived yet.
+    expect(surface["pendingScrollTopWrite"]).not.toBeNull();
+
+    const before = offset();
+    notch(-120); // the user's wheel beats the echo to the element
+    expect(offset()).toBe(before + 6);
+    runFrames();
+  });
+
+  it("still ignores the echo of the sync's own write", () => {
+    const { surface, offset } = attachScrollback();
+    // @ts-expect-error — the listener the real scroll event would have run.
+    surface["boundScrollListener"]();
+    // A whole-row jump from elsewhere, which the sync does still write.
+    // @ts-expect-error — what the scrollback-navigation keys do.
+    surface["scrollOffset"] = 3;
+    now += 200;
+    const runFrames = deferFrames();
+    // @ts-expect-error — the write that claims its own echo.
+    surface["syncScrollSurface"](true);
+    const settled = offset();
+    // Something else moved the offset, so processing the echo would show.
+    // @ts-expect-error — a re-anchor arriving between the write and its echo.
+    surface["scrollOffset"] = settled + 3;
+
+    // The browser now reports the position the sync itself asked for.
+    // @ts-expect-error — the echo, which must change nothing.
+    surface["boundScrollListener"]();
+    expect(offset()).toBe(settled + 3);
+    // @ts-expect-error — and the claim is spent, not left to match again.
+    expect(surface["pendingScrollTopWrite"]).toBeNull();
+    runFrames();
+  });
+
+  it("still lets ctrl+wheel through as a zoom", () => {
+    const { surface, el } = attachScrollback();
+    const before = el.scrollTop;
+    const e = new WheelEvent("wheel", { cancelable: true, ctrlKey: true });
+    Object.defineProperties(e, {
+      deltaY: { value: -120 },
+      deltaMode: { value: 0 },
+    });
+    el.dispatchEvent(e);
+    expect(e.defaultPrevented).toBe(false);
+    expect(el.scrollTop).toBe(before);
+    expect(surface).toBeTruthy();
+  });
+});
+
 describe("BlitTerminalSurface wheel in mouse-reporting apps", () => {
   beforeEach(() => {
     mockCanvasContext();

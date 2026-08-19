@@ -4,6 +4,27 @@ import fs from "fs";
 import path from "path";
 
 /**
+ * A manage tile is registered in the *host's* open-tab list (docs/design/kv.md),
+ * so leaving one open outlives this page: it is the first parked card in every
+ * spec that runs after this one, and their own `localStorage.clear()` cannot
+ * reach it — a card whose body is a title rather than a preview, which is not
+ * what a dock full of terminals is expected to start with. Closing the focused
+ * tile is the only thing that unregisters it.
+ */
+test.afterEach(async ({ page }) => {
+  const panels = page.locator("[data-connection-tab]");
+  if (
+    !(await panels
+      .first()
+      .isVisible()
+      .catch(() => false))
+  )
+    return;
+  await page.keyboard.press("Control+Alt+Shift+q");
+  await expect(panels).toHaveCount(0);
+});
+
+/**
  * An extension is a client, and the clients list now says so.
  *
  * Every running extension holds a connection of its own, so the clients list
@@ -86,7 +107,7 @@ test("the clients list names the extension behind a connection", async ({
     expect(installed).toMatch(/^id:[0-9a-f]+$/);
 
     await page.getByRole("status").click();
-    const manage = page.getByRole("button", { name: /Manage/ }).first();
+    const manage = page.getByRole("button", { name: /^Manage$/ }).first();
     await expect(manage).toBeVisible({ timeout: 5_000 });
     await manage.click();
     await page.locator('[data-connection-tab="clients"]').click();

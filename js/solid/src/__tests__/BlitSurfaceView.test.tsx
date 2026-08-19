@@ -193,4 +193,30 @@ describe("BlitSurfaceView zoom", () => {
     setMode("exact");
     expect(mockSetDisplaySize).toHaveBeenLastCalledWith(1600, 1200, 120, 240);
   });
+
+  /** A view with no display size takes no input at all — every pointer, wheel,
+   *  keyboard and IME path in the canvas is gated on one — and is served a
+   *  thumbnail-grade stream. That must be opt-in, never the default. */
+  function renderBare(resizable?: boolean) {
+    return render(() => (
+      <BlitWorkspaceProvider workspace={workspace}>
+        <BlitSurfaceView
+          connectionId={"conn-1" as ConnectionId}
+          surfaceId={7}
+          resizable={resizable}
+        />
+      </BlitWorkspaceProvider>
+    ));
+  }
+
+  it("owns its surface's size when resizable is not mentioned", () => {
+    renderBare();
+    expect(mockSetDisplaySize).toHaveBeenLastCalledWith(800, 600, 120, 120);
+  });
+
+  it("stays a passive preview when resizable is false", () => {
+    renderBare(false);
+    expect(mockSetDisplaySize).not.toHaveBeenCalled();
+    expect(mockRequestResize).not.toHaveBeenCalled();
+  });
 });

@@ -2,6 +2,27 @@ import { test, expect } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 
 /**
+ * A manage tile is registered in the *host's* open-tab list (docs/design/kv.md),
+ * so leaving one open outlives this page: it is the first parked card in every
+ * spec that runs after this one, and their own `localStorage.clear()` cannot
+ * reach it — a card whose body is a title rather than a preview, which is not
+ * what a dock full of terminals is expected to start with. Closing the focused
+ * tile is the only thing that unregisters it.
+ */
+test.afterEach(async ({ page }) => {
+  const panels = page.locator("[data-connection-tab]");
+  if (
+    !(await panels
+      .first()
+      .isVisible()
+      .catch(() => false))
+  )
+    return;
+  await page.keyboard.press("Control+Alt+Shift+q");
+  await expect(panels).toHaveCount(0);
+});
+
+/**
  * The journal pane is a live tail over history that grows as it is scrolled.
  *
  * Both halves used to be missing: every view was one 200-line page, and reading
@@ -27,7 +48,7 @@ test("the journal tails live and pages history in as it scrolls", async ({
   ).toBeVisible({ timeout: 10_000 });
 
   await page.getByRole("status").click();
-  const manage = page.getByRole("button", { name: /Manage/ }).first();
+  const manage = page.getByRole("button", { name: /^Manage$/ }).first();
   await expect(manage).toBeVisible({ timeout: 5_000 });
   await manage.click();
 
