@@ -135,12 +135,7 @@ import { StatusBar } from "./StatusBar";
 import { DesktopChrome } from "./DesktopChrome";
 import { LeftDock, LEFT_PANELS, type LeftPanel } from "./LeftDock";
 import { foldedSections, liveOverrides, toggleSection } from "./dockSections";
-import {
-  ATTENTION_MS,
-  armAttention,
-  expireAttention,
-  type Attention,
-} from "./surfaceAttention";
+import { settleAttention } from "./surfaceAttention";
 import {
   formatExpandedHash,
   formatPanelsHash,
@@ -1620,42 +1615,21 @@ function WorkspaceScreen(props: {
     createSignal<ConnectionId | null>(null);
 
   // Surfaces that asked to come forward (xdg_activation_v1) and were answered
-  // with a highlight rather than the view — see ./surfaceAttention.ts for why
-  // an activation must not move anything.
-  const [attention, setAttention] = createSignal<Attention>(new Map());
-  /** True while `assignment` is lit; what the dock card and the pane read. */
-  const hasAttention = (assignment: string) => attention().has(assignment);
-  // One sweep in flight at a time, aimed at the soonest window to close and
-  // re-aimed at whatever is left. A timer per request would be a timer per
-  // *repeat*, and a chatty client sends several a second; a fixed interval
-  // would leave a later arrival lit past its window, holding off its own next
-  // pulse for as long as it was late.
-  let attentionSweep: ReturnType<typeof setTimeout> | null = null;
-  function scheduleAttentionSweep() {
-    if (attentionSweep != null) return;
-    const lit = untrack(attention);
-    if (lit.size === 0) return;
-    const soonest = Math.min(...lit.values());
-    attentionSweep = setTimeout(
-      () => {
-        attentionSweep = null;
-        const next = expireAttention(untrack(attention), Date.now());
-        setAttention(next);
-        scheduleAttentionSweep();
-      },
-      // A hair past the deadline: expireAttention drops a window only once it
-      // is strictly over, so landing exactly on it would sweep nothing and
-      // re-arm for 0ms, in a loop.
-      Math.max(16, soonest - Date.now() + 16),
-    );
-  }
-  function flashAttention(assignment: string) {
-    setAttention((prev) => armAttention(prev, assignment, Date.now()));
-    scheduleAttentionSweep();
-  }
-  onCleanup(() => {
-    if (attentionSweep != null) clearTimeout(attentionSweep);
-  });
+  // with a mark rather than the view — see ./surfaceAttention.ts. One set for
+  // every place a mark can appear (dock card, pane, surface count, switcher) and
+  // no timers anywhere: a mark waits until the window is looked at.
+  //
+  // Only the signal lives here. What settles it needs `inBsp` and
+  // `bspFocusedSurface`, both declared far below, and Solid runs a memo body
+  // eagerly at setup — so a memo reading them from here dies in their temporal
+  // dead zone before the first render finishes. The reader is down beside them
+  // instead; see `frontSurfaceAssignment`.
+  const [pendingAttention, setPendingAttention] = createSignal<
+    ReadonlySet<string>
+  >(new Set());
+  /** Is this window still asking? Read by every mark there is. */
+  const hasAttention = (assignment: string) =>
+    pendingAttention().has(assignment);
 
   /** Set or clear the focused surface, always keeping the connectionId
    *  in sync so the BSP view uses the correct connection.
@@ -3318,41 +3292,6 @@ function WorkspaceScreen(props: {
   });
   onCleanup(() => document.getElementById("blit-scrollbars")?.remove());
 
-  // The highlight an xdg_activation_v1 request buys instead of the view: red,
-  // fading out over the window. One colour and one direction — a two-colour
-  // bounce read as a state change rather than a nudge, and it had to be
-  // explained. Nothing here moves, so there is no reduced-motion variant to
-  // offer either. Global and themed like the scrollbars above, because the same
-  // fade has to land on two very different things — a dock card's header bar
-  // and a pane-sized ring — and keyframes cannot be inline styles.
-  createEffect(() => {
-    const t = theme();
-    const id = "blit-attention";
-    let el = document.getElementById(id) as HTMLStyleElement | null;
-    if (!el) {
-      el = document.createElement("style");
-      el.id = id;
-      document.head.appendChild(el);
-    }
-    el.textContent = `
-      @keyframes blit-attention-fill {
-        0%   { background-color: ${t.errorText}; }
-        100% { background-color: transparent; }
-      }
-      @keyframes blit-attention-ring {
-        0%   { border-color: ${t.errorText}; }
-        100% { border-color: transparent; }
-      }
-      [data-blit-attention="fill"] {
-        animation: blit-attention-fill ${ATTENTION_MS}ms ease-out 1;
-      }
-      [data-blit-attention="ring"] {
-        animation: blit-attention-ring ${ATTENTION_MS}ms ease-out 1;
-      }
-    `;
-  });
-  onCleanup(() => document.getElementById("blit-attention")?.remove());
-
   onMount(() => {
     document.documentElement.style.fontFamily = "system-ui, sans-serif";
   });
@@ -3733,6 +3672,38 @@ function WorkspaceScreen(props: {
     );
   });
 
+  /**
+   * Retire the badge's entries: the surface the viewer is now looking at has
+   * answered its own request, and one that has gone away can no longer make it.
+   *
+   * Lives down here rather than beside `pendingAttention` because it reads
+   * `inBsp` and `bspFocusedSurface`, and a memo declared above them runs its
+   * body inside their temporal dead zone at setup — an eager
+   * `Cannot access 'inBsp' before initialization` that takes the whole workspace
+   * down to the error screen, with nothing in tsc or the unit tests to catch it.
+   * The same hazard is called out on `parkedSessionId` above.
+   */
+  const frontSurfaceAssignment = createMemo(() => {
+    if (inBsp()) {
+      const f = bspFocusedSurface();
+      return f ? surfaceAssignment(f.connectionId, f.surfaceId) : null;
+    }
+    const sid = focusedSurfaceId();
+    const connId = focusedSurfaceConnId();
+    return sid != null && connId != null
+      ? surfaceAssignment(connId, sid)
+      : null;
+  });
+  createEffect(() => {
+    const front = frontSurfaceAssignment();
+    const live = new Set(
+      surfaces().map((s) => surfaceAssignment(s.connectionId, s.surfaceId)),
+    );
+    setPendingAttention((prev) =>
+      settleAttention(prev, front, (a) => live.has(a)),
+    );
+  });
+
   /** Leave BSP without dropping the focused surface back into the preview
    *  panel. Terminal focus already lives in BlitWorkspace, but surface focus
    *  is derived from the BSP assignment while the container is mounted. Move
@@ -3853,7 +3824,12 @@ function WorkspaceScreen(props: {
     ) {
       return;
     }
-    flashAttention(surfaceAssignment(connectionId, surfaceId));
+    // Already marked: a repeat is the same request arriving again, and adding it
+    // twice would say nothing new. Returning `prev` keeps it out of the render.
+    const target = surfaceAssignment(connectionId, surfaceId);
+    setPendingAttention((prev) =>
+      prev.has(target) ? prev : new Set(prev).add(target),
+    );
   }
 
   let termHandle: { rows: number; cols: number; focus: () => void } | null =
@@ -5075,6 +5051,7 @@ function WorkspaceScreen(props: {
               multiConnection={multiConnection()}
               focusedSurfaceId={focusedSurfaceId()}
               focusedSurfaceConnId={focusedSurfaceConnId()}
+              hasAttention={hasAttention}
               onFocusSurface={focusSurface}
               onMoveSurfaceToPane={(sid, connId, targetPaneId) => {
                 moveToPaneFn?.(surfaceAssignment(connId, sid), targetPaneId);
@@ -5383,6 +5360,7 @@ function WorkspaceScreen(props: {
             activities={activities()}
             sessions={sessions()}
             surfaceCount={surfaces().length}
+            attentionCount={pendingAttention().size}
             // Displayed panes plus docked tabs: backgroundTiles already
             // excludes whatever a pane (or the non-BSP slot) displays, so
             // the two never double count — and a parked editor still shows
@@ -5880,11 +5858,6 @@ function Thumbnail(props: {
     >
       <button
         onClick={props.onFocus}
-        // The sweep drops the attribute when the window closes, so the next
-        // activation adds it back and the animation plays again from the top.
-        // Repeats *inside* the window never reach here (surfaceAttention.ts
-        // absorbs them), which is what keeps this a pulse and not a strobe.
-        data-blit-attention={props.attention ? "fill" : undefined}
         style={mergeStyle(ui.btn, {
           display: "flex",
           "align-items": "center",
@@ -5896,6 +5869,13 @@ function Thumbnail(props: {
           opacity: 1,
           "flex-shrink": 0,
           "background-color": props.headerBg ?? "transparent",
+          // Still asking: the title goes red and stays red until the window is
+          // looked at. Ink rather than fill, matching the surface count and the
+          // switcher's mark — red is what a mark is written in here, never what
+          // it is painted on.
+          ...(props.attention
+            ? { color: props.theme.errorText, "font-weight": "bold" }
+            : {}),
         })}
       >
         {props.header()}

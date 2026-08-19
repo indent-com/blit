@@ -34,6 +34,7 @@ use zbus::fdo::DBusProxy;
 use zbus::message::Header;
 use zbus::names::{BusName, OwnedBusName, OwnedInterfaceName, OwnedUniqueName};
 use zbus::object_server::SignalEmitter;
+use zbus::proxy::{Builder as ProxyBuilder, CacheProperties};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::{Connection, Proxy, fdo, interface};
 
@@ -1249,13 +1250,20 @@ async fn item_proxy(
     interface: &str,
 ) -> zbus::Result<Proxy<'static>> {
     let interface = OwnedInterfaceName::try_from(interface.to_string())?;
-    Proxy::new(
-        connection,
-        OwnedBusName::from(BusName::from(key.owner.clone())),
-        key.path.clone(),
-        interface,
-    )
-    .await
+    // Never cache properties. zbus refreshes a property cache from
+    // `PropertiesChanged` alone, and StatusNotifierItem does not use it: an
+    // application announces a repainted icon, a new status, or a new tooltip
+    // with the interface's own `NewIcon`/`NewStatus`/`NewToolTip` signal.
+    // Chromium — so every Electron tray — emits only those, so a cached proxy
+    // answers every re-read with the snapshot taken when the item registered
+    // and the icon freezes with whatever badge it was wearing.
+    ProxyBuilder::new(connection)
+        .destination(OwnedBusName::from(BusName::from(key.owner.clone())))?
+        .path(key.path.clone())?
+        .interface(interface)?
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
 }
 
 async fn read_item(
@@ -3744,6 +3752,38 @@ mod dbus_tests {
         }
     }
 
+    /// Chromium's tray implementation — every Electron application, so Discord,
+    /// Slack, and Legcord — announces a repainted icon with the interface's own
+    /// `NewIcon` signal and never emits `PropertiesChanged`. The unread badge is
+    /// drawn into that pixmap, so the icon is the only thing that changes.
+    struct MockRepaintingItem {
+        pixel: Arc<AtomicI32>,
+    }
+
+    #[interface(name = "org.kde.StatusNotifierItem")]
+    impl MockRepaintingItem {
+        #[zbus(property)]
+        fn id(&self) -> &str {
+            "repainter"
+        }
+
+        #[zbus(property)]
+        fn status(&self) -> &str {
+            "Active"
+        }
+
+        #[zbus(property)]
+        fn category(&self) -> &str {
+            "ApplicationStatus"
+        }
+
+        #[zbus(property)]
+        fn icon_pixmap(&self) -> Vec<StatusNotifierPixmap> {
+            let pixel = self.pixel.load(Ordering::Relaxed) as u8;
+            vec![(1, 1, vec![0xff, pixel, pixel, pixel])]
+        }
+    }
+
     struct MockMenu {
         clicked: Arc<AtomicI32>,
     }
@@ -4004,6 +4044,69 @@ mod dbus_tests {
             clicked.load(Ordering::Relaxed),
             2,
             "a click on the repainted item must not reach the app"
+        );
+
+        assert!(item_connection.unique_name().is_some());
+    }
+
+    /// An application which repaints its tray icon — Legcord drawing its unread
+    /// badge, Slack its dot — signals `NewIcon` and nothing else. The pixmap the
+    /// viewer sees has to follow, so re-reading the item must reach the
+    /// application rather than a snapshot taken when it registered.
+    #[tokio::test]
+    async fn a_new_icon_signal_republishes_the_repainted_pixmap() {
+        let (_bus, address) = TestBus::spawn();
+        let mut bridge = Bridge::start(&address, Config::default(), Arc::new(|| {}))
+            .await
+            .unwrap();
+        let pixel = Arc::new(AtomicI32::new(0x10));
+        let item_connection = zbus::connection::Builder::address(address.as_str())
+            .unwrap()
+            .name("org.example.BlitRepaint")
+            .unwrap()
+            .serve_at(
+                "/StatusNotifierItem",
+                MockRepaintingItem {
+                    pixel: pixel.clone(),
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let watcher = Proxy::new(
+            &item_connection,
+            "org.kde.StatusNotifierWatcher",
+            WATCHER_PATH,
+            "org.kde.StatusNotifierWatcher",
+        )
+        .await
+        .unwrap();
+        watcher
+            .call::<_, _, ()>("RegisterStatusNotifierItem", &("org.example.BlitRepaint",))
+            .await
+            .unwrap();
+        let Event::Tray(TrayRecord::Upsert(first)) = next_event(&mut bridge).await else {
+            panic!("expected tray upsert")
+        };
+
+        pixel.store(0xf0, Ordering::Relaxed);
+        item_connection
+            .emit_signal(
+                None::<&str>,
+                "/StatusNotifierItem",
+                "org.kde.StatusNotifierItem",
+                "NewIcon",
+                &(),
+            )
+            .await
+            .unwrap();
+        let Event::Tray(TrayRecord::Upsert(second)) = next_event(&mut bridge).await else {
+            panic!("expected a tray upsert for the repainted icon")
+        };
+        assert_ne!(
+            second.icon.png, first.icon.png,
+            "NewIcon must republish the pixmap the application now draws"
         );
 
         assert!(item_connection.unique_name().is_some());

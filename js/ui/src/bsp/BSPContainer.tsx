@@ -1444,18 +1444,19 @@ function LeafPane(props: {
         />
       </Show>
       {/* This pane's occupant asked to come forward. It gets a ring and keeps
-          its place — see surfaceAttention.ts. A ring rather than the pane's own
-          1px border: that border is the focus indicator, and repainting it
-          would say "you are here" about a pane the user is not in. */}
+          its place — see surfaceAttention.ts — and the ring stays up until the
+          pane is looked at, rather than fading and leaving nothing behind.
+          A ring of its own rather than the pane's 1px border: that border is the
+          focus indicator, and repainting it would say "you are here" about a
+          pane the user is not in. */}
       <Show when={paneAttention()}>
         <div
-          data-blit-attention="ring"
           style={{
             position: "absolute",
             inset: 0,
             "z-index": 6,
             "pointer-events": "none",
-            border: "2px solid transparent",
+            border: `2px solid ${theme().errorText}`,
             "box-sizing": "border-box",
           }}
         />

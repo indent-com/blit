@@ -27,6 +27,7 @@ import type {
   SessionId,
   TerminalPalette,
 } from "@blit-sh/core";
+import { surfaceAssignment } from "@blit-sh/core/bsp";
 import { OverlayBackdrop, OverlayPanel } from "./Overlay";
 import {
   mergeStyle,
@@ -142,6 +143,8 @@ type SurfaceItem = {
   surfaceId: number;
   connectionId: string;
   focused: boolean;
+  /** Asked to come forward (xdg_activation_v1) and has not been looked at. */
+  attention: boolean;
 };
 
 type RemoteItem = {
@@ -709,6 +712,10 @@ export function SwitcherOverlay(props: {
   multiConnection?: boolean;
   focusedSurfaceId?: number | null;
   focusedSurfaceConnId?: string | null;
+  /** Has this pane assignment asked to come forward without being looked at?
+   *  An activation is answered with a mark rather than the view, and this list
+   *  is where the marks can actually be found and acted on. */
+  hasAttention?: (assignment: string) => boolean;
   onFocusSurface?: (surfaceId: number, connectionId?: string) => void;
   onMoveSurfaceToPane?: (
     surfaceId: number,
@@ -1154,6 +1161,13 @@ export function SwitcherOverlay(props: {
     return matches;
   });
 
+  /** Asked to come forward and not yet looked at. Keyed by pane assignment,
+   *  the same string the dock and the panes are keyed by, so one predicate
+   *  serves every place a surface can be marked. */
+  const asksForAttention = (s: BlitSurface) =>
+    props.hasAttention?.(surfaceAssignment(s.connectionId, s.surfaceId)) ??
+    false;
+
   const surfaceMatches = createMemo(() => {
     const surfs = props.surfaces ?? [];
     if (surfs.length === 0) return [] as SurfaceItem[];
@@ -1174,6 +1188,7 @@ export function SwitcherOverlay(props: {
             s.surfaceId === props.focusedSurfaceId &&
             (props.focusedSurfaceConnId == null ||
               s.connectionId === props.focusedSurfaceConnId),
+          attention: asksForAttention(s),
         }));
     }
 
@@ -1208,6 +1223,7 @@ export function SwitcherOverlay(props: {
           s.surfaceId === props.focusedSurfaceId &&
           (props.focusedSurfaceConnId == null ||
             s.connectionId === props.focusedSurfaceConnId),
+        attention: asksForAttention(s),
       }));
   });
 
@@ -2440,6 +2456,38 @@ export function SwitcherOverlay(props: {
                                   >
                                     <mark style={ui.badge}>
                                       {t("switcher.badgeFocused")}
+                                    </mark>
+                                  </Show>
+                                  {/* Coloured text, not a filled badge like its
+                                      neighbours: this one says "act on me",
+                                      and a block of alert in a list of them
+                                      reads as decoration. */}
+                                  <Show
+                                    when={
+                                      item.type === "surface" &&
+                                      (item as SurfaceItem).attention
+                                    }
+                                  >
+                                    {/* ui.badge's metrics written out rather
+                                        than spread-and-overridden: spreading it
+                                        and setting `background-color` after
+                                        left the badge blue anyway — the colour
+                                        override took, the background one did
+                                        not. `background: none` also has to be
+                                        explicit, or <mark> falls back to the
+                                        UA's yellow. */}
+                                    <mark
+                                      style={{
+                                        "font-size": ui.badge["font-size"],
+                                        padding: ui.badge.padding,
+                                        "flex-shrink": 0,
+                                        "line-height": 1.5,
+                                        background: "none",
+                                        color: theme().errorText,
+                                        "font-weight": "bold",
+                                      }}
+                                    >
+                                      {t("switcher.badgeAttention")}
                                     </mark>
                                   </Show>
                                   <Show

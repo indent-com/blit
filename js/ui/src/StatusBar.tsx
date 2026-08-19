@@ -108,6 +108,9 @@ function rgba([r, g, b]: [number, number, number], alpha: number): string {
 export function StatusBar(props: {
   sessions: readonly BlitSession[];
   surfaceCount: number;
+  /** Surfaces that asked to come forward and have not been looked at yet.
+   *  Always on screen, so it is the one signal that survives a closed dock. */
+  attentionCount: number;
   /** Editor/diff/commit tiles on screen. */
   tileCount: number;
   /** Web panes on screen. */
@@ -352,6 +355,28 @@ export function StatusBar(props: {
           <span>
             {"\u00B7"}
             {tp("statusbar.surfaces", { count: props.surfaceCount })}
+            {/* Windows that asked to come forward and have not been looked at:
+                part of the surface count rather than a badge of its own, since
+                that is what it is a count of. Coloured, not filled \u2014 the point
+                is which number to read, not a block of alert.
+                Nested inside the surface count on purpose: an entry is retired
+                the moment its surface goes, so there is no such thing as one
+                asking while the count is zero. */}
+            <Show when={props.attentionCount > 0}>
+              <span
+                title={tp("statusbar.attention", {
+                  count: props.attentionCount,
+                })}
+                style={{
+                  color: theme().errorText,
+                  "font-weight": "bold",
+                }}
+              >
+                {tp("statusbar.attentionCount", {
+                  count: props.attentionCount,
+                })}
+              </span>
+            </Show>
           </span>
         </Show>
         <Show when={props.tileCount > 0}>
