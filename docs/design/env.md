@@ -81,10 +81,9 @@ Two things bound it, neither of which should be mistaken for a sandbox:
 
 The asymmetry worth understanding is _who_ is reading. A PTY child prints the
 environment because a person typed a command; an extension reads it unattended,
-at session start, from code the operator installed once. Persistent extensions
-already require `--allow-persistent-extensions`, so the operator has opted in to
-running that code — but they opted in to _running_ it, not necessarily to handing
-it their credentials. An operator who wants the session-shaped values without the
+at session start, from code the operator installed once. Installing a persistent
+extension is opting in to _running_ that code across restarts, not necessarily
+to handing it their credentials. An operator who wants the session-shaped values without the
 secrets should set `BLIT_ENV=0` and rely on
 [processes.md](processes.md)'s `PROCESS_SPAWN_SESSION_ENV`, which applies the
 session environment to a child **server-side** without ever naming it on the

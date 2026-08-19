@@ -445,7 +445,9 @@ pub struct Config {
     pub allow_forward: Vec<String>,
     pub allow_forward_insecure: bool,
     /// Permit durable extension create/update/control and startup restore.
-    /// Transient extensions remain available when this gate is false.
+    /// True by default; `--no-persistent-extensions` turns it off, which is
+    /// how a bad definition gets repaired. Transient extensions remain
+    /// available when this gate is false.
     pub allow_persistent_extensions: bool,
 }
 

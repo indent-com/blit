@@ -65,12 +65,13 @@ processes:
     # positive while the new server is still spawning its compositor
     # and audio pipeline — causing dependents (gateway, share) to
     # connect to a dead socket and enter a restart loop.
-    # --allow-persistent-extensions so `blit ext run --persist` works here.
-    # Without it an extension still runs, but nothing registers its `@name`
-    # commands, which shows up as `blit ext commands` being silently empty.
+    # Persistent extensions are on by default, which is what makes `blit ext
+    # run --persist` work here; with them off an extension still runs, but
+    # nothing registers its `@name` commands, which shows up as `blit ext
+    # commands` being silently empty.
     # The catalog path is per instance so two dev stacks cannot fight over one
     # redb file -- the loser of that race gets no extension subsystem at all.
-    command: rm -f ${BLIT_DEV_SOCK:-/tmp/blit-dev.sock} && exec ./target/profiling/blit server --verbose --socket ${BLIT_DEV_SOCK:-/tmp/blit-dev.sock} --allow-persistent-extensions
+    command: rm -f ${BLIT_DEV_SOCK:-/tmp/blit-dev.sock} && exec ./target/profiling/blit server --verbose --socket ${BLIT_DEV_SOCK:-/tmp/blit-dev.sock}
     environment:
       - "BLIT_EXTENSION_PATH=${BLIT_DEV_EXT_DB:-/tmp/blit-dev-ext/extensions.redb}"
     depends_on:

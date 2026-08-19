@@ -147,9 +147,9 @@ blit @session enable blit-user-manager
 blit @session status blit-user-manager
 ```
 
-`--persist` requires the server to have been started with
-`--allow-persistent-extensions`; that is also what makes the intent survive a
-restart. `enable` is durable — it is stored under `ext/session/app/<id>` in the
+`--persist` requires a server that permits persistent extensions, which is the
+default (`--no-persistent-extensions` turns it off); that is also what makes the
+intent survive a restart. `enable` is durable — it is stored under `ext/session/app/<id>` in the
 server's KV store and replayed at startup, so the manager comes up with the
 session from then on.
 

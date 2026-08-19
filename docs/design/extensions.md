@@ -2385,10 +2385,16 @@ directories must be owner-only: mode `0700` directories and `0600` files on
 Unix, and user-only ACLs where available. This RFC deliberately adds no
 extension-specific capability system.
 
-Durable extension execution is separately opt-in. The server must start with
-`--allow-persistent-extensions` (or `BLIT_ALLOW_EXT_PERSIST=1`) to create,
+Durable extension execution is permitted by default, because persistence adds
+durability to authority an endpoint already has rather than adding privilege,
+and because an extension without it is half-installed: it runs, but its
+`@name` command namespace never exists and nothing survives a restart. A gate
+whose off position silently breaks the feature is a gate operators discover by
+being confused, so the default is on and the switch is a deliberate off:
+`--no-persistent-extensions` (or `BLIT_ALLOW_EXT_PERSIST=0`) refuses to create,
 update, enable, restart, or automatically restore a persistent extension.
-Without that switch, transient extensions still work and feature bit 11 remains
+
+With that switch, transient extensions still work and feature bit 11 remains
 advertised. Stored definitions are loaded and pin their objects, but no attempt
 is restored; `LIST`, `STATUS`, `CANCEL`, `DISABLE`, and `REMOVE` remain
 available so the catalog can be repaired. `ATTACH` and `UNFOLLOW` also remain
@@ -2396,20 +2402,20 @@ available because they change only the caller's observation cursor. Operations w
 start persistent code return `PERMISSION`, and both lifecycle bits are left
 unchanged rather than silently disabled. An enabled, desired-running definition
 which is held only by this gate reports `BLOCKED`, zero task ID, and a detail
-which names the missing operator opt-in; a disabled or stopped definition
-continues to report `STOPPED`.
+which says persistence is disabled on this server; a disabled or stopped
+definition continues to report `STOPPED`.
 
-This gate is also the recovery path for a bad persistent definition. For
-example, an extension with `--restart always` which sends `C2S_QUIT` could
+That switch is the recovery path for a bad persistent definition. For
+example, an extension with `--restart always` which sends `C2S_QUIT` would
 otherwise stop each new server process immediately:
 
 ```bash
-# Start without --allow-persistent-extensions.
-blit server
+# Start with persistence off, so the bad definition is not restored.
+blit server --no-persistent-extensions
 blit ext disable BAD_NAME
 blit ext status BAD_NAME        # wait for quiescent STOPPED/BLOCKED
 blit ext remove BAD_NAME        # optional; only after quiescence
-# Restart with --allow-persistent-extensions after repair.
+# Restart normally after repair.
 ```
 
 Deployments can hard-disable the new families at process startup, following
@@ -2477,9 +2483,8 @@ rather than the CLI process status.
 `--restart` accepts `never` (the default), `on-failure`, or `always`.
 `--persist` implies `--detach` and stores an enabled,
 desired-running definition for future blit server processes. It receives
-`PERMISSION` unless the selected
-server was started with `--allow-persistent-extensions`; the CLI reports that
-operator action directly. `--json` emits supervisor, attempt, and event records
+`PERMISSION` if the selected server was started with
+`--no-persistent-extensions`; the CLI reports that operator decision directly. `--json` emits supervisor, attempt, and event records
 as NDJSON envelopes.
 
 The CLI records `last_running_attempt` from the correlated creation reply

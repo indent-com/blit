@@ -93,14 +93,15 @@ in
     extensions = {
       persistent = mkOption {
         type = types.bool;
-        default = false;
+        default = true;
         description = ''
           Permit durable Wasmi extensions (<literal>blit ext run
           --persist</literal>) and start the ones that should be running again
           after a restart. This is also what makes an extension's
-          <literal>@name</literal> command namespace exist. Equivalent to
-          <option>BLIT_ALLOW_EXT_PERSIST=1</option>; transient extensions run
-          without it.
+          <literal>@name</literal> command namespace exist. Setting it false
+          passes <option>BLIT_ALLOW_EXT_PERSIST=0</option>, which is the
+          recovery path for a persistent definition that breaks the server it
+          starts in; transient extensions still run without it.
 
           Definitions live in
           <filename>~/.local/state/blit/extensions.redb</filename> and module
@@ -442,7 +443,7 @@ in
                   "BLIT_AUDIO_BITRATE=${toString cfg.audio.bitrate}"
                 ]
                 ++ lib.optional (!cfg.audio.enable) "BLIT_AUDIO=0"
-                ++ lib.optional cfg.extensions.persistent "BLIT_ALLOW_EXT_PERSIST=1";
+                ++ lib.optional (!cfg.extensions.persistent) "BLIT_ALLOW_EXT_PERSIST=0";
             };
           };
         }) cfg.users

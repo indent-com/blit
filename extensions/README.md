@@ -99,5 +99,6 @@ blit ext run --persist --restart always systemd extensions/dist/systemd.wasm
 blit @systemd status
 ```
 
-`--persist` needs a server started with `--allow-persistent-extensions`, and it
-is also what makes the `@systemd` command namespace available.
+`--persist` needs a server that permits persistent extensions, which is the
+default (`--no-persistent-extensions` turns it off), and it is also what makes
+the `@systemd` command namespace available.

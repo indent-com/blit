@@ -28,10 +28,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Start blit server.  --allow-persistent-extensions so a spec can install one:
-# a transient `ext run` ends with the CLI connection that started it, so it is
-# no use to a spec that wants an extension still serving when the browser looks.
-"${REPO_ROOT}/target/debug/blit" server --allow-persistent-extensions &
+# Start blit server.  Persistent extensions are on by default, which a spec
+# needs: a transient `ext run` ends with the CLI connection that started it, so
+# it is no use to a spec that wants an extension still serving when the browser
+# looks.
+"${REPO_ROOT}/target/debug/blit" server &
 SERVER_PID=$!
 
 # Wait for socket to appear

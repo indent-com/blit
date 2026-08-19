@@ -28,9 +28,9 @@ being able to look at and its failure count is the only record of that.
 `forget` drops it: the stored intent is deleted rather than written "off", and
 what is left is an installed application like any other.
 
-`--persist` requires the operator to have started the server with
-`--allow-persistent-extensions`, which is also what makes the intent outlive a
-restart.
+`--persist` requires a server that permits persistent extensions — the default,
+unless the operator passed `--no-persistent-extensions` — which is also what
+makes the intent outlive a restart.
 
 ## How it starts an application
 
