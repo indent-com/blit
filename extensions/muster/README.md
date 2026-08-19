@@ -3,7 +3,7 @@
 Supervise units that run in terminals. `muster` reads
 `~/.config/blit/muster/`, starts what it finds in dependency order, restarts
 what crashes or what you edit, and journals every decision. A supervised unit
-is an ordinary blit PTY, so *supervised* and *attachable* are the same thing.
+is an ordinary blit PTY, so _supervised_ and _attachable_ are the same thing.
 
 ```bash
 blit ext run --persist --restart always muster extensions/dist/muster.wasm
@@ -130,7 +130,7 @@ enough. The merged map travels in `CREATE2`'s environment block and reaches
 **A `command` unit runs no rc file, so `PATH` is the server's.** Under a server
 started from a systemd unit that is often coreutils, findutils, grep and sed —
 no `cargo`, no `pnpm`, no `node`. The server resolves `command[0]` against the
-child's *own* environment, so the fix is one shared env file:
+child's _own_ environment, so the fix is one shared env file:
 
 ```sh
 # ~/.config/blit/muster/path.env
@@ -169,6 +169,41 @@ Declaring a parameter `{"kind":"ports","span":4}` lets `doctor` report two
 instances whose blocks overlap — the failure mode of several dev stacks, which
 otherwise presents as `EADDRINUSE` in whichever one lost.
 
+## The panel, and the channel under it
+
+`muster` publishes `blit.muster.v1`, and the browser's Manage pane grows a
+**Muster** tab while something is listening on it (`js/ui/src/MusterPanel.tsx`,
+mirrored by `js/ui/src/muster.ts`). The tab shows the tree the CLI cannot:
+instance ▸ unit ▸ (terminal, windows). A unit's windows are there because a run
+is spawned onto its own stamped Wayland socket, so the compositor — not the
+supervisor guessing at process trees — is what says which window is whose.
+
+The wire is JSON, one object per message.
+
+| server → panel                                         | meaning                                              |
+| ------------------------------------------------------ | ---------------------------------------------------- |
+| `{"type":"hello","version":1,"dir":…}`                 | which directory is being watched                     |
+| `{"type":"state","units":[…],"gone":[…]}`              | these units, **whole**; those names no longer exist  |
+| `{"type":"state","full":true,"units":…,"instances":…}` | the entire table, and the tree it hangs under        |
+| `{"type":"events","records":[…]}`                      | journal records, as `@muster log --json` prints them |
+
+The panel sends the CLI's verbs as bare lines: `start NAME`, `stop NAME`,
+`restart NAME`, `reload`, `resync`. A name is a unit or an instance.
+
+Two properties are worth stating, because they are what the design is for:
+
+- **A unit arrives whole, never as a patch.** So a reader that missed a frame is
+  correct after the next one, and no reconciliation code exists on either side.
+- **A frame carries only what changed.** Transitions mark units dirty and a
+  flush 80 ms later sends that set; a hundred-unit directory does not ship a
+  hundred rows because one of them restarted. `full` marks the frames that
+  redefine the whole table — a new reader's first, and after `resync` — and
+  those are the only ones where an absent unit means a deleted unit.
+
+Env-file **values** never appear on the channel, as they never appear in
+`@muster status` or the journal. `@muster env --values` remains the only way to
+read them.
+
 ## Surviving its own replacement
 
 `blit ext update muster …` does not kill the stack. The supervisor keeps the
@@ -205,9 +240,16 @@ blit --on socket:/tmp/mus.sock @muster list
 Without `--on socket:…` the CLI talks to whatever server it finds, which is
 usually not the one under test.
 
+The browser half is exercised by `e2e/tests/muster-panel.spec.ts`, which brings
+its own units: `start-servers.sh` points the supervisor at an empty
+`BLIT_MUSTER_DIR` of its own and publishes the path, so the spec never reads —
+or starts — whatever you actually supervise.
+
 ## Not here yet
 
-- The `blit.muster.v1` channel, and the browser panel that would read it.
+- A panel row names a unit's terminal and windows; it does not open them.
+  Putting one in a pane means reaching the workspace's switch-and-assign from
+  inside a BSP tile, which is its own piece of plumbing.
 - The durable journal tail in kv: the ring is in memory, so `@muster log` starts
   empty after the supervisor restarts.
 - `@muster instantiate` and `remove`, which need `FS_WRITE`.

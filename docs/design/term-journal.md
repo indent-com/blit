@@ -184,7 +184,7 @@ C2S_TERM_WAIT          [0x54][nonce:2][pty_id:2][from_seq:8][from_col:2][max_byt
 ```
 
 `TERM_WAIT` is `TERM_SINCE` that blocks. `TERM_JOURNAL_WAIT` waits on a
-*command record*, so it only ever fires for a PTY whose shell emits OSC 133; a
+_command record_, so it only ever fires for a PTY whose shell emits OSC 133; a
 process exec'd directly has no records at all, and "block until this program
 says it is listening" is a question about text. A non-empty `needle` waits for
 that substring, an empty one for any output. `needle` is capped at 4 KiB: a

@@ -158,6 +158,15 @@ pub enum UnitType {
     Oneshot,
 }
 
+impl UnitType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            UnitType::Simple => "simple",
+            UnitType::Oneshot => "oneshot",
+        }
+    }
+}
+
 /// One `envFile` entry: a path, or a path that may be absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvFileRef {

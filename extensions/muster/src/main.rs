@@ -54,10 +54,6 @@ const DESCRIPTOR: &str = r#"{
   ]
 }"#;
 
-// The panel channel `blit.muster.v1` is specified in docs/design/muster.md and
-// not implemented yet: the supervisor and its CLI come first, and a panel with
-// nothing to show is not worth the flow control.
-
 /// Terminals are created at a fixed size: nothing subscribes to them here, and
 /// a client that attaches resizes to its own pane.
 const ROWS: u16 = 40;
@@ -120,6 +116,14 @@ struct Muster {
     findings: Vec<ConfigError>,
     /// `log:` readiness cursors, keyed by unit.
     log_cursor: BTreeMap<String, (u64, u16)>,
+    /// Listener id for the panel channel, zero when it could not be published.
+    panel_listener: u32,
+    panel_conns: Vec<panel::Conn>,
+    /// Units whose row a panel has not been told about yet.
+    dirty: BTreeSet<String>,
+    /// When the oldest unflushed change arrived.
+    dirty_since: Option<u64>,
+    pending_events: Vec<Record>,
     /// Surface messages from the initial burst, held until the first load
     /// builds the owner map they are attributed through.
     initial_surfaces: Vec<Vec<u8>>,
@@ -143,7 +147,7 @@ struct Muster {
     features: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Instance {
     stack: String,
     /// The port block this instance occupies, as `expand` resolved it.
@@ -189,6 +193,11 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
         findings: Vec::new(),
         log_cursor: BTreeMap::new(),
         log_waits: BTreeMap::new(),
+        panel_listener: 0,
+        panel_conns: Vec::new(),
+        dirty: BTreeSet::new(),
+        dirty_since: None,
+        pending_events: Vec::new(),
         initial_surfaces: initial
             .iter()
             .filter(|packet| is_surface_message(packet))
@@ -217,6 +226,7 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
 
     let dir = muster.dir.clone();
     muster.watch(&mut client, &dir);
+    muster.open_panel(&mut client);
 
     let listener_name = format!(
         "blit.cli.{:016x}.{}",
@@ -257,6 +267,8 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
             }
         }
         muster.reconcile(&mut client);
+        let now = muster.now_ms(&client);
+        muster.flush_panel(&mut client, now);
     }
     Ok(())
 }
@@ -448,6 +460,12 @@ impl Muster {
         for at in self.next_probe_ms.values() {
             soonest = Some(soonest.map_or(*at, |s: u64| s.min(*at)));
         }
+        // A pending flush is a deadline like any other: without it the loop
+        // would sleep through the coalescing window and a panel would see the
+        // change only when something else happened to wake it.
+        if let Some(at) = self.flush_due_ms(now) {
+            soonest = Some(soonest.map_or(at, |s: u64| s.min(at)));
+        }
         let idle = client.monotonic_now() + IDLE_TICK;
         match soonest {
             Some(at) => client.monotonic_now() + Duration::from_millis(at.saturating_sub(now)),
@@ -456,6 +474,7 @@ impl Muster {
     }
 
     fn route(&mut self, client: &mut Client, packet: &[u8]) {
+        let now = self.now_ms(client);
         match packet.first().copied() {
             // [0x40][nonce:2][sync_id:2][status:1] — the sync id is *after*
             // the nonce, and reading the nonce as the id silently rejects
@@ -504,6 +523,7 @@ impl Muster {
                     self.load(client);
                 }
             }
+            _ if self.route_panel(client, packet, now) => {}
             _ if self.note_log_wait(client, packet) => {}
             _ => match remote::parse_server_msg(packet) {
                 Some(ServerMsg::Exited {
@@ -511,7 +531,7 @@ impl Muster {
                     exit_status,
                     ..
                 }) => self.note_exit(client, pty_id, exit_status),
-                Some(other) => self.note_surface(other),
+                Some(other) => self.note_surface(other, now),
                 None => {}
             },
         }
@@ -707,7 +727,7 @@ impl Muster {
         // The burst arrived before the owner map existed, so attribute it now.
         for packet in std::mem::take(&mut self.initial_surfaces) {
             if let Some(msg) = remote::parse_server_msg(&packet) {
-                self.note_surface(msg);
+                self.note_surface(msg, now);
             }
         }
 
@@ -925,6 +945,11 @@ impl Muster {
             }
         }
 
+        // A partial frame carries units, never the tree they hang under, so an
+        // instance appearing or losing a member has to be a whole frame.
+        if self.instances != instances {
+            self.touch_all(now);
+        }
         self.instances = instances;
         for name in restart {
             self.restart(client, &name, Cause::File);
@@ -1483,8 +1508,8 @@ impl Muster {
     /// Every client sees every surface, so most of these belong to something
     /// else entirely; only a stamped origin naming an `app_id` this supervisor
     /// minted attributes one to a unit.
-    fn note_surface(&mut self, msg: ServerMsg<'_>) {
-        match msg {
+    fn note_surface(&mut self, msg: ServerMsg<'_>, now: u64) {
+        let touched = match msg {
             ServerMsg::SurfaceCreated {
                 surface_id,
                 width,
@@ -1496,6 +1521,9 @@ impl Muster {
                 entry.title = title.to_string();
                 entry.width = width;
                 entry.height = height;
+                // Creation precedes the origin, so this is not yet ours to
+                // claim; the origin below is what puts it in a panel.
+                entry.unit.clone()
             }
             // The only trustworthy surface-to-unit link: `app_id` here is
             // stamped by the compositor from the socket the surface arrived
@@ -1506,12 +1534,16 @@ impl Muster {
                 instance_id,
                 ..
             } => {
+                let owner = self.surface_owners.get(app_id).cloned();
                 let entry = self.surfaces.entry(surface_id).or_default();
-                entry.unit = self.surface_owners.get(app_id).cloned();
+                entry.unit = owner.clone();
                 entry.seq = instance_id.parse().ok();
+                owner
             }
             ServerMsg::SurfaceTitle { surface_id, title } => {
-                self.surfaces.entry(surface_id).or_default().title = title.to_string();
+                let entry = self.surfaces.entry(surface_id).or_default();
+                entry.title = title.to_string();
+                entry.unit.clone()
             }
             ServerMsg::SurfaceResized {
                 surface_id,
@@ -1522,11 +1554,15 @@ impl Muster {
                 let entry = self.surfaces.entry(surface_id).or_default();
                 entry.width = width;
                 entry.height = height;
+                entry.unit.clone()
             }
             ServerMsg::SurfaceDestroyed { surface_id } => {
-                self.surfaces.remove(&surface_id);
+                self.surfaces.remove(&surface_id).and_then(|s| s.unit)
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some(unit) = touched {
+            self.touch(&unit, now);
         }
     }
 
@@ -1876,7 +1912,38 @@ impl Muster {
     }
 
     fn record(&mut self, record: Record, now: u64) {
-        self.journal.push(record, now);
+        let stored = self.journal.push(record, now).clone();
+        self.touch(&stored.unit, now);
+        self.publish_event(&stored, now);
+    }
+
+    /// A verb a panel sent, with the same meaning the CLI gives it.
+    fn panel_command(&mut self, client: &mut Client, verb: &str, name: &str, now: u64) {
+        match verb {
+            "reload" => self.load(client),
+            "resync" => self.touch_all(now),
+            "start" | "stop" | "restart" if !name.is_empty() => {
+                for member in self.resolve_name(name) {
+                    match verb {
+                        "start" => self.want(client, &member, Cause::Command),
+                        "stop" => self.stop(client, &member, Cause::Command, true),
+                        _ => self.restart(client, &member, Cause::Command),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A name is a unit, or an instance standing for its members.
+    pub(crate) fn resolve_name(&self, name: &str) -> Vec<String> {
+        if self.units.contains_key(name) {
+            return vec![name.to_string()];
+        }
+        self.instances
+            .get(name)
+            .map(|instance| instance.members.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -1946,6 +2013,7 @@ fn signal_number(name: &str) -> i32 {
 }
 
 mod cli;
+mod panel;
 
 /// What a start resolved from `envFile` + `env`, and which files it read.
 #[derive(Default)]

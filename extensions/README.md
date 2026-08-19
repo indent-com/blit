@@ -10,11 +10,11 @@ a `wasm32-unknown-unknown` module, so keeping them out of the root workspace
 stops a plain `cargo build`/`clippy`/`test` at the root from trying to build a
 Wasm guest for the host. The root manifest lists `extensions` in its `exclude`.
 
-| extension            | what it does                                                                                                                                  |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`muster`](muster)   | supervise units that run in terminals, from `~/.config/blit/muster`: `@muster list\|status\|start\|stop\|restart\|log\|doctor`                |
-| [`session`](session) | autostart and supervise GUI applications: `@session list\|enable\|disable\|start\|stop\|forget\|status`                                       |
-| [`systemd`](systemd) | live system and user unit state on the `blit.systemd.v1` channel, plus a live/paged journal reader: `@systemd list\|get\|watch\|logs\|status` |
+| extension            | what it does                                                                                                                                                                                          |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`muster`](muster)   | supervise units that run in terminals, from `~/.config/blit/muster`, with a unit ▸ terminal ▸ windows tree on the `blit.muster.v1` channel: `@muster list\|status\|start\|stop\|restart\|log\|doctor` |
+| [`session`](session) | autostart and supervise GUI applications: `@session list\|enable\|disable\|start\|stop\|forget\|status`                                                                                               |
+| [`systemd`](systemd) | live system and user unit state on the `blit.systemd.v1` channel, plus a live/paged journal reader: `@systemd list\|get\|watch\|logs\|status`                                                         |
 
 ## Building
 

@@ -13,13 +13,13 @@
  * scroller of its own — stacked, either one buries whatever is under it.
  *
  * Which tabs exist is a property of the server, discovered rather than assumed:
- * Session and systemd are extensions, so their tabs exist only while the
- * channel each publishes has a listener. That is followed rather than sampled
- * (`channelPresence.ts`), so installing an extension adds its tab and removing
- * one takes it away while the row stays open — the panel that installs them is
- * one tab over, which is exactly where a stale answer would be noticed.
+ * Session, Muster and systemd are extensions, so their tabs exist only while
+ * the channel each publishes has a listener. That is followed rather than
+ * sampled (`channelPresence.ts`), so installing an extension adds its tab and
+ * removing one takes it away while the row stays open — the panel that installs
+ * them is one tab over, which is exactly where a stale answer would be noticed.
  *
- * Hence the order: the two tabs every server has come first, and the two an
+ * Hence the order: the two tabs every server has come first, and the ones an
  * extension provides follow, so the set grows and shrinks at the end of the
  * row instead of shuffling what the viewer was aiming at.
  */
@@ -35,6 +35,7 @@ import type {
 import { ConnectionClients } from "./ConnectionClients";
 import { ConnectionSession } from "./ConnectionSession";
 import { ExtensionsPanel } from "./ExtensionsPanel";
+import { MusterPanel } from "./MusterPanel";
 import { SystemdPanel } from "./SystemdPanel";
 import {
   pickedTab,
@@ -45,6 +46,7 @@ import {
 } from "./connectionTab";
 import { followChannelNames } from "./channelPresence";
 import { SESSION_CHANNEL } from "./session";
+import { MUSTER_CHANNEL } from "./muster";
 import { SYSTEMD_CHANNEL } from "./systemd";
 import { scrollbarStyle, themeFor, ui, uiScale } from "./theme";
 
@@ -79,7 +81,7 @@ export function ConnectionPanels(props: {
     let stop: (() => void) | null = null;
     void followChannelNames(
       connection,
-      [SESSION_CHANNEL, SYSTEMD_CHANNEL],
+      [SESSION_CHANNEL, MUSTER_CHANNEL, SYSTEMD_CHANNEL],
       (present) => {
         // Copied, because the watch keeps one set and mutates it in place: a
         // signal handed the same object twice never sees a change.
@@ -102,6 +104,7 @@ export function ConnectionPanels(props: {
     if (props.canListClients) available.push("clients");
     if (props.canManageExtensions) available.push("extensions");
     if (served().has(SESSION_CHANNEL)) available.push("session");
+    if (served().has(MUSTER_CHANNEL)) available.push("muster");
     if (served().has(SYSTEMD_CHANNEL)) available.push("systemd");
     return available;
   };
@@ -248,6 +251,25 @@ export function ConnectionPanels(props: {
               palette={props.palette}
               fontSize={props.fontSize}
             />
+          </Show>
+          <Show when={tab() === "muster"}>
+            <div
+              style={{
+                padding: `${scale().controlX}px`,
+                "min-width": "0",
+                display: "flex",
+                "flex-direction": "column",
+                flex: "1 1 auto",
+                "min-height": "0",
+              }}
+            >
+              <MusterPanel
+                workspace={props.workspace}
+                connectionId={props.connectionId}
+                palette={props.palette}
+                fontSize={props.fontSize}
+              />
+            </div>
           </Show>
           <Show when={tab() === "systemd"}>
             <div

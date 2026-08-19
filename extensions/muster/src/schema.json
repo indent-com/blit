@@ -94,7 +94,9 @@
     },
     {
       "if": { "not": { "required": ["stack"] } },
-      "then": { "anyOf": [{ "required": ["command"] }, { "required": ["shell"] }] }
+      "then": {
+        "anyOf": [{ "required": ["command"] }, { "required": ["shell"] }]
+      }
     }
   ]
 }
