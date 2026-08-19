@@ -4673,9 +4673,26 @@ export class BlitConnection {
   private surfaceViewIdCounter = 0;
 
   /** Allocate a token identifying one view's subscription to a surface.
-   *  Mirrors {@link allocViewId} for PTYs. */
+   *  Mirrors {@link allocViewId} for PTYs.
+   *
+   *  Prefixed with the connection id, because a view mints its token once and
+   *  keeps it for the life of its mount — including across
+   *  `BlitSurfaceCanvas.setConnectionId`, which re-points a canvas at another
+   *  server without re-minting.  A bare per-connection counter is only unique
+   *  within the connection that issued it, so a canvas carrying `s3` from
+   *  connection A onto connection B collided with B's own `s3`: two views
+   *  sharing one `SurfaceSub.views` entry, where the last writer decides the
+   *  encode size and cadence for both.  A live pane then inherited a dock
+   *  card's `{512x256, 15fps}` request and could not take it back
+   *  (`serverSubscribe` early-returns once `_subscribedSurface` is set), and
+   *  the card's unsubscribe deleted the pane's registration outright, taking
+   *  the pane's stream with it.
+   *
+   *  The token never reaches the wire — it only keys {@link surfaceSubs}'
+   *  `views` and {@link surfaceViewSizes}' `views` — so the prefix costs
+   *  nothing but the string.  Session ids are built the same way. */
   allocSurfaceViewId(): string {
-    return `s${++this.surfaceViewIdCounter}`;
+    return `${this.id}:s${++this.surfaceViewIdCounter}`;
   }
 
   /**

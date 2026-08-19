@@ -2252,6 +2252,60 @@ describe("BlitConnection surface subscriptions", () => {
     expect(lastMaxFps()).toBe(15);
   });
 
+  it("mints view tokens no other connection can collide with", () => {
+    const other = new BlitConnection({
+      id: "other",
+      transport: new MockTransport(),
+      wasm,
+      autoConnect: false,
+    });
+    try {
+      // Same ordinal on both, because each counter starts at zero.
+      expect(other.allocSurfaceViewId()).not.toBe(conn.allocSurfaceViewId());
+    } finally {
+      other.dispose();
+    }
+  });
+
+  it("keeps a pane's request when a view that arrived from another connection shares the surface", () => {
+    // A canvas mints its token once and keeps it across setConnectionId, so a
+    // dock card re-pointed from another server registers here under a foreign
+    // token.  It must not land on the same `views` entry as this connection's
+    // own pane.
+    const foreign = new BlitConnection({
+      id: "other",
+      transport: new MockTransport(),
+      wasm,
+      autoConnect: false,
+    });
+    const card = foreign.allocSurfaceViewId();
+    foreign.dispose();
+    const pane = conn.allocSurfaceViewId();
+
+    conn.sendSurfaceSubscribe(1, pane, null, 0);
+    conn.sendSurfaceSubscribe(1, card, { width: 512, height: 256 }, 15);
+    expect(lastMaxFps()).toBe(0);
+    expect(lastTarget()).toBeNull();
+
+    // The card's box crosses an octave — any surface resize does this, because
+    // the card's height is derived from the surface's aspect.  It re-derives
+    // its own request and must not speak for the pane.
+    conn.setSurfaceViewTarget(1, card, { width: 512, height: 256 }, 15);
+    expect(lastMaxFps()).toBe(0);
+    expect(lastTarget()).toBeNull();
+
+    // The card scrolls out of the dock.  The pane keeps the stream.
+    const before = transport.sent.length;
+    conn.sendSurfaceUnsubscribe(1, card);
+    expect(lastMaxFps()).toBe(0);
+    expect(lastTarget()).toBeNull();
+    expect(
+      transport.sent
+        .slice(before)
+        .some((m) => m[0] === C2S_SURFACE_UNSUBSCRIBE),
+    ).toBe(false);
+  });
+
   it("applies and removes a global frame-rate cap", () => {
     conn.sendSurfaceSubscribe(1, conn.allocSurfaceViewId(), null, 0);
     expect(lastMaxFps()).toBe(0);
