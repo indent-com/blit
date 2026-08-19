@@ -19,11 +19,21 @@ export BLIT_SOCK="${TMPDIR_E2E}/blit-test.sock"
 SOCK_HANDOFF="${REPO_ROOT}/e2e/.e2e-socket"
 printf '%s' "$BLIT_SOCK" >"$SOCK_HANDOFF"
 
+# Where the muster supervisor looks for units, if a spec installs it.  It is
+# resolved from the *server's* environment (the extension asks for it over the
+# env family), so it has to be set here rather than by the spec — and it has to
+# be an empty directory of our own, because the default is the developer's real
+# one and a spec that started those units would be starting their work.
+export BLIT_MUSTER_DIR="${TMPDIR_E2E}/muster"
+mkdir -p "$BLIT_MUSTER_DIR"
+MUSTER_HANDOFF="${REPO_ROOT}/e2e/.e2e-muster-dir"
+printf '%s' "$BLIT_MUSTER_DIR" >"$MUSTER_HANDOFF"
+
 cleanup() {
     # Kill child processes
     kill "$SERVER_PID" "$GATEWAY_PID" 2>/dev/null || true
     wait "$SERVER_PID" "$GATEWAY_PID" 2>/dev/null || true
-    rm -f "$SOCK_HANDOFF"
+    rm -f "$SOCK_HANDOFF" "$MUSTER_HANDOFF"
     rm -rf "$TMPDIR_E2E"
 }
 trap cleanup EXIT INT TERM

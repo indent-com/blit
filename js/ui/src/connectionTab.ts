@@ -16,12 +16,18 @@
 
 import { createSignal, type Signal } from "solid-js";
 
-export type ConnectionTab = "clients" | "extensions" | "session" | "systemd";
+export type ConnectionTab =
+  | "clients"
+  | "extensions"
+  | "session"
+  | "muster"
+  | "systemd";
 
 export const TAB_LABELS: Record<ConnectionTab, string> = {
   clients: "Clients",
   extensions: "Extensions",
   session: "Session",
+  muster: "Muster",
   systemd: "systemd",
 };
 

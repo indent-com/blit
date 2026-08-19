@@ -180,7 +180,16 @@ C2S_TERM_JOURNAL       [0x50][nonce:2][pty_id:2][from_index:8][limit:2][flags:1]
 C2S_TERM_OUTPUT        [0x51][nonce:2][pty_id:2][index:8][max_bytes:4][flags:1]
 C2S_TERM_SINCE         [0x52][nonce:2][pty_id:2][from_seq:8][from_col:2][max_bytes:4][flags:1]
 C2S_TERM_JOURNAL_WAIT  [0x53][nonce:2][pty_id:2][index:8][timeout_ms:4]
+C2S_TERM_WAIT          [0x54][nonce:2][pty_id:2][from_seq:8][from_col:2][max_bytes:4][timeout_ms:4][flags:1][needle_len:2][needle:N]
 ```
+
+`TERM_WAIT` is `TERM_SINCE` that blocks. `TERM_JOURNAL_WAIT` waits on a
+_command record_, so it only ever fires for a PTY whose shell emits OSC 133; a
+process exec'd directly has no records at all, and "block until this program
+says it is listening" is a question about text. A non-empty `needle` waits for
+that substring, an empty one for any output. `needle` is capped at 4 KiB: a
+readiness marker is a phrase, and the string is compared against every read
+until it matches.
 
 `TERM_JOURNAL` flags bit 0 (`JOURNAL_TAIL`): `from_index` counts back from
 the newest rather than up from the oldest, so `from_index = 0` means "the last
@@ -194,8 +203,10 @@ that sentinel latches onto the next command to start and never moves again.
 no text.
 
 `max_bytes` is clamped server-side to `BLIT_TERM_OUTPUT_MAX` (default 1 MiB,
-floor 4 KiB, ceiling 8 MiB). `timeout_ms` is clamped to 24 h. At most 32
-waits per connection; further ones are refused.
+floor 4 KiB, ceiling 8 MiB). `timeout_ms` is clamped to 24 h. At most 4096
+waits per connection; further ones are refused. That bound stops a client
+parking unbounded state; it is not meant to ration a client's own terminals,
+since a supervisor waits on one per unit and scales with the terminals it owns.
 
 ### S2C
 
@@ -205,9 +216,21 @@ S2C_TERM_OUTPUT   [0x51][nonce:2][pty_id:2][status:1][flags:1][start_seq:8][star
 S2C_TERM_COMMAND  [0x52][nonce:2][pty_id:2][status:1][record]
 ```
 
-`S2C_TERM_OUTPUT` answers both `TERM_OUTPUT` and `TERM_SINCE`. `start_*` is
-where the returned text actually begins after clamping; `next_*` is the cursor
-to send back. Flags: `TRUNCATED`, `EVICTED`, `ALT_SCREEN`.
+`S2C_TERM_OUTPUT` answers `TERM_OUTPUT`, `TERM_SINCE` and `TERM_WAIT`.
+`start_*` is where the returned text actually begins after clamping; `next_*`
+is the cursor to send back. Flags: `TRUNCATED`, `EVICTED`, `ALT_SCREEN`,
+`MATCHED`.
+
+`MATCHED` is set only on a `TERM_WAIT` that found its needle, and is how a
+caller tells that answer from the one a timeout produces — which is otherwise
+the same shape, carrying whatever did arrive so the cursor keeps moving. On a
+match `next_seq` names the line after the one the needle completed on, so
+re-arming from it neither repeats the match nor skips what followed. Rows join
+with a newline only when the previous one did not wrap, so the server narrows
+the read to find that line rather than counting newlines in the text.
+
+A `TERM_WAIT` on a PTY whose process has already exited answers immediately
+rather than waiting out its timeout: no more output is coming.
 
 `S2C_TERM_COMMAND` answers `TERM_JOURNAL_WAIT`. On timeout it carries the
 record as it stands, still flagged `RUNNING`. A wait for a command that never
