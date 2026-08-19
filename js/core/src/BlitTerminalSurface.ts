@@ -936,7 +936,7 @@ export class BlitTerminalSurface {
     // setupKeyboard — only the scroll-key paths run.
     this.inputEl = document.createElement("textarea");
     this.inputEl.setAttribute("aria-label", "Terminal input");
-    this.inputEl.setAttribute("autocapitalize", "off");
+    this.inputEl.setAttribute("autocapitalize", "none");
     this.inputEl.setAttribute("autocomplete", "off");
     this.inputEl.setAttribute("spellcheck", "false");
     this.inputEl.setAttribute("tabindex", "0");

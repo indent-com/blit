@@ -1521,8 +1521,7 @@ export class BlitSurfaceCanvas {
     metaChord: boolean;
   } | null = null;
   private _pendingPasteFlush:
-    | ((payload: ClipboardPayload | null) => void)
-    | null = null;
+    ((payload: ClipboardPayload | null) => void) | null = null;
   /** Stand the in-flight chord down without pressing V, releasing anything
    *  the deferral held back.  Runs when the clipboard is known to hold
    *  nothing pastable, when an image we declined is all it held, or when
@@ -1691,7 +1690,7 @@ export class BlitSurfaceCanvas {
     const ta = document.createElement("textarea");
     ta.autocomplete = "off";
     ta.setAttribute("autocorrect", "off");
-    ta.setAttribute("autocapitalize", "off");
+    ta.setAttribute("autocapitalize", "none");
     ta.setAttribute("spellcheck", "false");
     // The label is the UI's handle on this element: the mobile keyboard
     // toggle focuses it (the canvas is not editable, so an IME will not
@@ -3281,7 +3280,7 @@ export class BlitSurfaceCanvas {
         ta.removeAttribute("inputmode");
       }
       ta.setAttribute("autocorrect", "off");
-      ta.setAttribute("autocapitalize", "off");
+      ta.setAttribute("autocapitalize", "none");
       ta.spellcheck = false;
     }
 
