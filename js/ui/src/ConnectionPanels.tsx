@@ -39,7 +39,7 @@ import { SystemdPanel } from "./SystemdPanel";
 import { followChannelNames } from "./channelPresence";
 import { SESSION_CHANNEL } from "./session";
 import { SYSTEMD_CHANNEL } from "./systemd";
-import { themeFor, ui, uiScale } from "./theme";
+import { scrollbarStyle, themeFor, ui, uiScale } from "./theme";
 
 type Tab = "clients" | "extensions" | "session" | "systemd";
 
@@ -144,6 +144,12 @@ export function ConnectionPanels(props: {
           "flex-direction": "column",
           "background-color": theme().panelBg,
           "min-width": "0",
+          // Fills the tile and passes the height on. `min-height: 0` is what
+          // lets it: a flex item defaults to its content's height as a floor,
+          // so without it a thousand-row unit table makes this taller than the
+          // pane and every bound below is measured against the wrong box.
+          flex: "1 1 auto",
+          "min-height": "0",
         }}
       >
         <div
@@ -153,6 +159,9 @@ export function ConnectionPanels(props: {
             gap: `${scale().tightGap}px`,
             padding: `${scale().tightGap}px ${scale().controlX}px`,
             "border-bottom": `1px solid ${theme().subtleBorder}`,
+            // The strip is how a viewer leaves a long list; it does not scroll
+            // away with it.
+            flex: "0 0 auto",
           }}
         >
           <For each={tabs()}>
@@ -184,46 +193,82 @@ export function ConnectionPanels(props: {
           </For>
         </div>
 
-        <Show when={tab() === "clients"}>
-          <ConnectionClients
-            workspace={props.workspace}
-            connectionId={props.connectionId}
-            sessions={props.sessions ?? []}
-            surfaces={props.surfaces ?? []}
-            palette={props.palette}
-            fontSize={props.fontSize}
-          />
-        </Show>
-        {/* The extensions panel was built as its own overlay, so it carries
-            its own padding; the wrapper only bounds it. Same for systemd. */}
-        <Show when={tab() === "extensions"}>
-          <div style={{ padding: `${scale().controlX}px`, "min-width": "0" }}>
-            <ExtensionsPanel
+        {/* One bounded region for whichever panel is up, and the only scroller
+            the chrome owns. A panel with a long list of its own bounds that
+            list to this box instead (`flex: 1; min-height: 0`), so it scrolls
+            there and this never has to — which is what keeps one list to one
+            scrollbar. The clients panel has no list of its own and scrolls
+            here. */}
+        <div
+          style={{
+            display: "flex",
+            "flex-direction": "column",
+            flex: "1 1 auto",
+            "min-height": "0",
+            "min-width": "0",
+            "overflow-y": "auto",
+            ...scrollbarStyle(theme()),
+          }}
+        >
+          <Show when={tab() === "clients"}>
+            <ConnectionClients
+              workspace={props.workspace}
+              connectionId={props.connectionId}
+              sessions={props.sessions ?? []}
+              surfaces={props.surfaces ?? []}
+              palette={props.palette}
+              fontSize={props.fontSize}
+            />
+          </Show>
+          {/* The extensions panel was built as its own overlay, so it carries
+              its own padding; the wrapper only bounds it. Same for systemd. */}
+          <Show when={tab() === "extensions"}>
+            <div
+              style={{
+                padding: `${scale().controlX}px`,
+                "min-width": "0",
+                display: "flex",
+                "flex-direction": "column",
+                flex: "1 1 auto",
+                "min-height": "0",
+              }}
+            >
+              <ExtensionsPanel
+                workspace={props.workspace}
+                connectionId={props.connectionId}
+                palette={props.palette}
+                fontSize={props.fontSize}
+              />
+            </div>
+          </Show>
+          <Show when={tab() === "session"}>
+            <ConnectionSession
               workspace={props.workspace}
               connectionId={props.connectionId}
               palette={props.palette}
               fontSize={props.fontSize}
             />
-          </div>
-        </Show>
-        <Show when={tab() === "session"}>
-          <ConnectionSession
-            workspace={props.workspace}
-            connectionId={props.connectionId}
-            palette={props.palette}
-            fontSize={props.fontSize}
-          />
-        </Show>
-        <Show when={tab() === "systemd"}>
-          <div style={{ padding: `${scale().controlX}px`, "min-width": "0" }}>
-            <SystemdPanel
-              workspace={props.workspace}
-              connectionId={props.connectionId}
-              palette={props.palette}
-              fontSize={props.fontSize}
-            />
-          </div>
-        </Show>
+          </Show>
+          <Show when={tab() === "systemd"}>
+            <div
+              style={{
+                padding: `${scale().controlX}px`,
+                "min-width": "0",
+                display: "flex",
+                "flex-direction": "column",
+                flex: "1 1 auto",
+                "min-height": "0",
+              }}
+            >
+              <SystemdPanel
+                workspace={props.workspace}
+                connectionId={props.connectionId}
+                palette={props.palette}
+                fontSize={props.fontSize}
+              />
+            </div>
+          </Show>
+        </div>
       </div>
     </Show>
   );

@@ -198,7 +198,10 @@ export function ExtensionsPanel(props: {
       <div
         style={mergeStyle(scrollbarStyle(theme()), {
           "overflow-y": "auto",
-          "max-height": "55vh",
+          // Bounded by the pane rather than the viewport — see SystemdPanel's
+          // table for why a `vh` cap inside a pane scrolls twice.
+          flex: "1 1 0",
+          "min-height": "6em",
           "font-size": `${scale().sm}px`,
         })}
       >

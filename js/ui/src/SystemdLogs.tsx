@@ -264,6 +264,9 @@ export function SystemdLogs(props: {
         display: "flex",
         "flex-direction": "column",
         gap: `${scale().xs}px`,
+        // Fills the pane region so the journal below is bounded by it.
+        flex: "1 1 auto",
+        "min-height": "0",
       }}
     >
       <div
@@ -384,7 +387,11 @@ export function SystemdLogs(props: {
         onScroll={onScroll}
         style={mergeStyle(scrollbarStyle(theme()), {
           "overflow-y": "auto",
-          "max-height": "56vh",
+          // The pane bounds the page, not the viewport: a `vh` cap taller than
+          // the pane leaves the journal scrolling inside a pane that scrolls
+          // too, and this one also drives paging off its own scroll position.
+          flex: "1 1 0",
+          "min-height": "6em",
           "font-size": `${scale().sm}px`,
           "line-height": "1.45",
         })}

@@ -109,7 +109,12 @@ export function ManageTile(props: {
         display: "flex",
         "flex-direction": "column",
         "min-width": "0",
-        overflow: props.preview ? "hidden" : "auto",
+        // The tile itself never scrolls: it hands its height to the panel,
+        // which hands it to whichever list is the long one. A scroller here as
+        // well as there is two scrollbars for one list — the wheel picks
+        // whichever is under the pointer, and the header the tile is supposed
+        // to keep in view scrolls away.
+        overflow: "hidden",
         background: props.theme.bg,
         color: props.theme.fg,
         "font-size": `${props.scale.md}px`,
