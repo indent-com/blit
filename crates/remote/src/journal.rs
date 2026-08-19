@@ -34,6 +34,22 @@ pub const C2S_TERM_SINCE: u8 = 0x52;
 /// `S2C_TERM_COMMAND` comes back per nonce; on timeout it carries the record
 /// as it stands, still flagged [`RECORD_RUNNING`].
 pub const C2S_TERM_JOURNAL_WAIT: u8 = 0x53;
+/// Block until output appears after a cursor:
+/// [0x54][nonce:2][pty_id:2][from_seq:8][from_col:2][max_bytes:4][timeout_ms:4][flags:1][needle_len:2][needle:N]
+///
+/// The output counterpart of [`C2S_TERM_JOURNAL_WAIT`], which waits on a
+/// *command record* and so only ever fires for a PTY whose shell emits OSC 133.
+/// A process exec'd directly emits no markers and has no records, so "wait
+/// until this program says it is listening" needs a wait on text instead.
+///
+/// A non-empty `needle` waits for that substring; an empty one waits for any
+/// output at all. Exactly one `S2C_TERM_OUTPUT` comes back per nonce. On a
+/// match it is flagged [`OUTPUT_MATCHED`] and `next_seq` names the line after
+/// the one the needle completed on, so re-arming from it neither repeats the
+/// match nor skips what followed it. On timeout the flag is absent and the
+/// reply carries whatever did arrive, so a caller keeps its cursor moving
+/// rather than re-reading from the start.
+pub const C2S_TERM_WAIT: u8 = 0x54;
 
 /// Journal listing: [0x50][nonce:2][pty_id:2][status:1][oldest_index:8][next_index:8][count:2][records…]
 /// `oldest_index` is the lowest index still retained (records below it were
@@ -79,6 +95,10 @@ pub const OUTPUT_EVICTED: u8 = 1 << 1;
 /// The PTY is on the alternate screen, where sequences do not advance
 /// (docs/design/term-journal.md § Alternate screen).
 pub const OUTPUT_ALT_SCREEN: u8 = 1 << 2;
+/// A [`C2S_TERM_WAIT`] found its needle. Absent on the reply a timeout
+/// produces, which is otherwise the same shape — so this bit is how a caller
+/// tells "it said it was ready" from "it has not said so yet".
+pub const OUTPUT_MATCHED: u8 = 1 << 3;
 
 // CommandRecord flags.
 /// The command has not finished.
@@ -337,6 +357,74 @@ pub fn parse_term_since(data: &[u8]) -> Option<SinceRequest> {
         from_col: u16_at(data, 13),
         max_bytes: u32_at(data, 15),
         flags: data[19],
+    })
+}
+
+/// A decoded [`C2S_TERM_WAIT`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputWaitRequest<'a> {
+    pub nonce: u16,
+    pub pty_id: u16,
+    pub from_seq: u64,
+    pub from_col: u16,
+    pub max_bytes: u32,
+    pub timeout_ms: u32,
+    pub flags: u8,
+    /// Empty waits for any output at all.
+    pub needle: &'a str,
+}
+
+/// Header bytes before the needle.
+pub const TERM_WAIT_HEADER: usize = 26;
+
+/// Longest needle a wait may carry. A readiness marker is a phrase, not a
+/// document, and the string is compared against every read until it matches.
+pub const TERM_WAIT_NEEDLE_MAX: usize = 4096;
+
+#[allow(clippy::too_many_arguments)]
+pub fn msg_term_wait(
+    nonce: u16,
+    pty_id: u16,
+    from_seq: u64,
+    from_col: u16,
+    max_bytes: u32,
+    timeout_ms: u32,
+    flags: u8,
+    needle: &str,
+) -> Vec<u8> {
+    let needle = &needle[..needle.len().min(TERM_WAIT_NEEDLE_MAX)];
+    let mut msg = Vec::with_capacity(TERM_WAIT_HEADER + needle.len());
+    msg.push(C2S_TERM_WAIT);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.extend_from_slice(&pty_id.to_le_bytes());
+    msg.extend_from_slice(&from_seq.to_le_bytes());
+    msg.extend_from_slice(&from_col.to_le_bytes());
+    msg.extend_from_slice(&max_bytes.to_le_bytes());
+    msg.extend_from_slice(&timeout_ms.to_le_bytes());
+    msg.push(flags);
+    msg.extend_from_slice(&(needle.len() as u16).to_le_bytes());
+    msg.extend_from_slice(needle.as_bytes());
+    msg
+}
+
+pub fn parse_term_wait(data: &[u8]) -> Option<OutputWaitRequest<'_>> {
+    if data.len() < TERM_WAIT_HEADER || data[0] != C2S_TERM_WAIT {
+        return None;
+    }
+    let needle_len = u16_at(data, 24) as usize;
+    if needle_len > TERM_WAIT_NEEDLE_MAX || data.len() < TERM_WAIT_HEADER + needle_len {
+        return None;
+    }
+    Some(OutputWaitRequest {
+        nonce: u16_at(data, 1),
+        pty_id: u16_at(data, 3),
+        from_seq: u64_at(data, 5),
+        from_col: u16_at(data, 13),
+        max_bytes: u32_at(data, 15),
+        timeout_ms: u32_at(data, 19),
+        flags: data[23],
+        needle: core::str::from_utf8(&data[TERM_WAIT_HEADER..TERM_WAIT_HEADER + needle_len])
+            .ok()?,
     })
 }
 
@@ -719,5 +807,55 @@ mod tests {
             | crate::channel::FEATURE_CHANNEL_WATCH
             | crate::FEATURE_CLIENT_ORIGIN;
         assert_eq!(taken & FEATURE_TERM_JOURNAL, 0);
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+
+    #[test]
+    fn a_wait_round_trips() {
+        let msg = msg_term_wait(7, 3, 41, 5, 64, 30_000, 0, "listening on");
+        let req = parse_term_wait(&msg).expect("parses");
+        assert_eq!(
+            req,
+            OutputWaitRequest {
+                nonce: 7,
+                pty_id: 3,
+                from_seq: 41,
+                from_col: 5,
+                max_bytes: 64,
+                timeout_ms: 30_000,
+                flags: 0,
+                needle: "listening on",
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_needle_is_legal_and_means_any_output() {
+        let msg = msg_term_wait(1, 1, 0, 0, 0, 0, 0, "");
+        assert_eq!(msg.len(), TERM_WAIT_HEADER);
+        assert_eq!(parse_term_wait(&msg).expect("parses").needle, "");
+    }
+
+    #[test]
+    fn a_truncated_or_foreign_frame_is_refused() {
+        let msg = msg_term_wait(1, 1, 0, 0, 0, 0, 0, "up");
+        for cut in 0..msg.len() {
+            assert!(parse_term_wait(&msg[..cut]).is_none(), "cut at {cut}");
+        }
+        let mut foreign = msg.clone();
+        foreign[0] = C2S_TERM_SINCE;
+        assert!(parse_term_wait(&foreign).is_none());
+    }
+
+    #[test]
+    fn a_needle_longer_than_the_cap_is_clamped_not_truncated_mid_frame() {
+        let long = "x".repeat(TERM_WAIT_NEEDLE_MAX + 10);
+        let msg = msg_term_wait(1, 1, 0, 0, 0, 0, 0, &long);
+        let req = parse_term_wait(&msg).expect("parses");
+        assert_eq!(req.needle.len(), TERM_WAIT_NEEDLE_MAX);
     }
 }

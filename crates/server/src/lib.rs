@@ -6131,6 +6131,7 @@ struct Session {
     /// what they are waiting on is a PTY, which outlives any one connection
     /// (docs/design/term-journal.md § Waiting).
     journal_waiters: Vec<journal::Waiter>,
+    output_waiters: Vec<OutputWaiter>,
     #[cfg(target_os = "linux")]
     recent_surface_focus: HashMap<u64, (u16, Instant)>,
     #[cfg(target_os = "linux")]
@@ -6309,6 +6310,7 @@ impl Session {
             surface_inputs: HashMap::new(),
             surface_touch_owner: None,
             journal_waiters: Vec::new(),
+            output_waiters: Vec::new(),
             #[cfg(target_os = "linux")]
             recent_surface_focus: HashMap::new(),
             #[cfg(target_os = "linux")]
@@ -8778,6 +8780,169 @@ fn term_since_reply(sess: &Session, req: &blit_remote::journal::SinceRequest) ->
     )
 }
 
+/// A client blocked on output appearing, rather than on a command finishing.
+///
+/// `C2S_TERM_JOURNAL_WAIT` only fires for a PTY whose shell emits OSC 133; a
+/// process exec'd directly has no records at all. This is the wait that serves
+/// "block until it says it is listening".
+pub struct OutputWaiter {
+    client_id: u64,
+    nonce: u16,
+    pty_id: u16,
+    from_seq: u64,
+    from_col: u16,
+    max_bytes: u32,
+    needle: String,
+    deadline: Instant,
+}
+
+/// The answer to an output wait, or `None` while it is still pending.
+fn output_wait_reply(sess: &Session, waiter: &OutputWaiter, now: Instant) -> Option<Vec<u8>> {
+    use blit_remote::journal as j;
+    let Some(pty) = sess.ptys.get(&waiter.pty_id) else {
+        return Some(j::msg_s2c_term_output(
+            waiter.nonce,
+            waiter.pty_id,
+            STATUS_NOT_FOUND,
+            0,
+            0,
+            0,
+            0,
+            0,
+            "",
+        ));
+    };
+    let alt_screen = pty.driver.alt_screen();
+    let budget = journal_read_budget(waiter.max_bytes);
+    let hit = |text: &str| {
+        if waiter.needle.is_empty() {
+            !text.is_empty()
+        } else {
+            text.contains(waiter.needle.as_str())
+        }
+    };
+    let read = pty
+        .driver
+        .seq_text(waiter.from_seq, waiter.from_col, None, budget);
+
+    if hit(&read.text) {
+        // Rows join with a newline only when the previous one did not wrap, so
+        // where the match sits in the text does not give its sequence. Narrow
+        // the read instead: the smallest exclusive end that still contains the
+        // needle is the line it completed on, and that is where a re-arm
+        // resumes without repeating the match or skipping what followed.
+        let mut lo = waiter.from_seq;
+        let mut hi = read.next_seq;
+        while hi > lo + 1 {
+            let mid = lo + (hi - lo) / 2;
+            let probe = pty
+                .driver
+                .seq_text(waiter.from_seq, waiter.from_col, Some(mid), budget);
+            if hit(&probe.text) { hi = mid } else { lo = mid }
+        }
+        let exact = pty
+            .driver
+            .seq_text(waiter.from_seq, waiter.from_col, Some(hi), budget);
+        return Some(j::msg_s2c_term_output(
+            waiter.nonce,
+            waiter.pty_id,
+            STATUS_OK,
+            output_flags(&exact, alt_screen) | j::OUTPUT_MATCHED,
+            exact.start_seq,
+            exact.start_col,
+            exact.next_seq,
+            exact.next_col,
+            &exact.text,
+        ));
+    }
+
+    // A PTY whose process has gone produces no more output, so waiting out the
+    // rest of the timeout only delays the same answer.
+    if now < waiter.deadline && !pty.exited {
+        return None;
+    }
+    Some(j::msg_s2c_term_output(
+        waiter.nonce,
+        waiter.pty_id,
+        STATUS_OK,
+        output_flags(&read, alt_screen),
+        read.start_seq,
+        read.start_col,
+        read.next_seq,
+        read.next_col,
+        &read.text,
+    ))
+}
+
+/// Register a `C2S_TERM_WAIT`, answering straight away when the text is already
+/// there — the common case for a program that starts fast.
+fn arm_output_waiter(
+    sess: &mut Session,
+    client_id: u64,
+    req: &blit_remote::journal::OutputWaitRequest<'_>,
+    now: Instant,
+) {
+    use blit_remote::journal as j;
+    let in_flight = sess
+        .output_waiters
+        .iter()
+        .filter(|w| w.client_id == client_id)
+        .count();
+    if in_flight >= journal::MAX_WAITERS_PER_CLIENT {
+        if let Some(client) = sess.clients.get(&client_id) {
+            let _ = send_outbox(
+                client,
+                j::msg_s2c_term_output(req.nonce, req.pty_id, STATUS_BUDGET, 0, 0, 0, 0, 0, ""),
+            );
+        }
+        return;
+    }
+    let timeout = req.timeout_ms.min(journal::WAIT_TIMEOUT_MAX_MS);
+    let waiter = OutputWaiter {
+        client_id,
+        nonce: req.nonce,
+        pty_id: req.pty_id,
+        from_seq: req.from_seq,
+        from_col: req.from_col,
+        max_bytes: req.max_bytes,
+        needle: req.needle.to_owned(),
+        deadline: now + Duration::from_millis(timeout as u64),
+    };
+    match output_wait_reply(sess, &waiter, now) {
+        Some(reply) => {
+            if let Some(client) = sess.clients.get(&client_id) {
+                let _ = send_outbox(client, reply);
+            }
+        }
+        None => sess.output_waiters.push(waiter),
+    }
+}
+
+/// Answer every output waiter whose text has arrived or whose timeout is up.
+fn resolve_output_waiters(sess: &mut Session, now: Instant) {
+    if sess.output_waiters.is_empty() {
+        return;
+    }
+    let mut answers: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut pending = Vec::new();
+    for waiter in std::mem::take(&mut sess.output_waiters) {
+        // A client that hung up takes its waiters with it.
+        if !sess.clients.contains_key(&waiter.client_id) {
+            continue;
+        }
+        match output_wait_reply(sess, &waiter, now) {
+            Some(reply) => answers.push((waiter.client_id, reply)),
+            None => pending.push(waiter),
+        }
+    }
+    sess.output_waiters = pending;
+    for (client_id, reply) in answers {
+        if let Some(client) = sess.clients.get(&client_id) {
+            let _ = send_outbox(client, reply);
+        }
+    }
+}
+
 /// Register a `C2S_TERM_JOURNAL_WAIT`, answering straight away when the
 /// command it names has already finished.
 fn arm_journal_waiter(
@@ -9156,7 +9321,12 @@ fn earliest_armed_deadline(sess: &Session) -> Option<Instant> {
         .min();
     // A journal wait is the other thing with a clock on it: without this the
     // supervisor would sleep through a timeout on an idle terminal.
-    let waits = sess.journal_waiters.iter().map(|w| w.deadline).min();
+    let waits = sess
+        .journal_waiters
+        .iter()
+        .map(|w| w.deadline)
+        .chain(sess.output_waiters.iter().map(|w| w.deadline))
+        .min();
     match (ptys, waits) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -9276,6 +9446,7 @@ async fn supervise(state: &AppState) {
         // The tick answers waiters whose command finished; nothing else wakes
         // for one that simply ran out of time on a quiet terminal.
         resolve_journal_waiters(&mut sess, now);
+        resolve_output_waiters(&mut sess, now);
         for pty in sess.ptys.values_mut().filter(|pty| !pty.exited) {
             if pty.exit_drain_deadline.is_none() && pty::poll_child_exited(&pty.handle) {
                 pty.exit_drain_deadline = Some(now + PTY_EXIT_DRAIN_GRACE);
@@ -9520,6 +9691,7 @@ async fn cleanup_pty_internal(pty_id: u16, generation: Option<u64>, state: &AppS
         let msg = blit_remote::msg_exited_reason(pty_id, pty.exit_status, pty.exit_reason);
         sess.send_to_all(&msg);
         resolve_journal_waiters(&mut sess, Instant::now());
+        resolve_output_waiters(&mut sess, Instant::now());
     }
 }
 
@@ -13260,6 +13432,7 @@ async fn tick(state: &AppState) -> TickOutcome {
     // A `D` marker in the bytes just processed is what finishes a command,
     // so this is the first moment a waiter can be answered.
     resolve_journal_waiters(&mut sess, now);
+    resolve_output_waiters(&mut sess, now);
     if parse_budget_hit {
         // Leftover output is already queued, so re-tick right after this
         // round instead of waiting on the reader's notify — the permit for
@@ -21427,6 +21600,12 @@ async fn handle_client_registered<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             blit_remote::journal::C2S_TERM_JOURNAL_WAIT => {
                 if let Some(req) = blit_remote::journal::parse_term_journal_wait(&data) {
                     arm_journal_waiter(&mut sess, client_id, &req, Instant::now());
+                    need_nudge = true;
+                }
+            }
+            blit_remote::journal::C2S_TERM_WAIT => {
+                if let Some(req) = blit_remote::journal::parse_term_wait(&data) {
+                    arm_output_waiter(&mut sess, client_id, &req, Instant::now());
                     need_nudge = true;
                 }
             }

@@ -120,6 +120,8 @@ struct Muster {
     findings: Vec<ConfigError>,
     /// `log:` readiness cursors, keyed by unit.
     log_cursor: BTreeMap<String, (u64, u16)>,
+    /// Outstanding `C2S_TERM_WAIT`s, by nonce, so the reply finds its unit.
+    log_waits: BTreeMap<u16, String>,
     /// When each activating unit is next probed.
     next_probe_ms: BTreeMap<String, u64>,
     terminals: TerminalSubscriptions,
@@ -178,6 +180,7 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
         journal: Journal::new(1),
         findings: Vec::new(),
         log_cursor: BTreeMap::new(),
+        log_waits: BTreeMap::new(),
         next_probe_ms: BTreeMap::new(),
         terminals: TerminalSubscriptions::new(),
         nonce: 1,
@@ -486,6 +489,7 @@ impl Muster {
                     self.load(client);
                 }
             }
+            _ if self.note_log_wait(client, packet) => {}
             _ => {
                 if let Some(ServerMsg::Exited {
                     pty_id,
@@ -1514,10 +1518,15 @@ impl Muster {
             }
             ReadyWhen::Tcp(target) => self.tcp_connects(client, target),
             ReadyWhen::Http(url) => self.http_answers(client, url),
-            ReadyWhen::Log(needle) => match pty {
-                Some(pty) => self.log_matches(client, name, pty, needle),
-                None => false,
-            },
+            ReadyWhen::Log(needle) => {
+                // Not polled: the server holds the wait and answers through
+                // the loop. Arm it once and take no further deadline.
+                if let Some(pty) = pty {
+                    self.arm_log_wait(client, name, pty, needle, now);
+                }
+                self.next_probe_ms.remove(name);
+                return;
+            }
         };
         if satisfied {
             let how = describe_ready(&ready_when);
@@ -1629,13 +1638,24 @@ impl Muster {
             .is_some_and(|code| code < 500)
     }
 
-    /// Poll `TERM_SINCE` from a cursor taken at create, so the match is text
-    /// that arrived *after* the unit started rather than whatever was on screen.
-    fn log_matches(&mut self, client: &mut Client, name: &str, pty: u16, needle: &str) -> bool {
+    /// Arm one `C2S_TERM_WAIT` and let the answer come back through the loop.
+    ///
+    /// The server blocks; muster does not. Waiting on the reply here would park
+    /// the single receive loop for the whole of `timeoutStart` — every other
+    /// unit's exit and every CLI invocation behind it — which is worse than the
+    /// poll this replaces. So the wait is armed once, its nonce remembered, and
+    /// `route` turns the reply into a readiness decision whenever it lands.
+    ///
+    /// The cursor comes from a `SINCE_PROBE` taken now, so the match is text
+    /// that arrives *after* the unit started rather than whatever was already
+    /// on screen. That one round trip is bounded and happens once per start.
+    fn arm_log_wait(&mut self, client: &mut Client, name: &str, pty: u16, needle: &str, now: u64) {
+        if self.log_waits.values().any(|waiting| waiting == name) {
+            return;
+        }
         let (from_seq, from_col) = match self.log_cursor.get(name) {
             Some(cursor) => *cursor,
             None => {
-                // SINCE_PROBE returns the live cursor and no text.
                 let nonce = self.next_nonce();
                 let packet = remote::journal::msg_term_since(
                     nonce,
@@ -1646,32 +1666,62 @@ impl Muster {
                     remote::journal::SINCE_PROBE,
                 );
                 if client.send(&packet).is_err() {
-                    return false;
+                    return;
                 }
                 let Some(reply) = self.term_output(client, nonce) else {
-                    return false;
+                    return;
                 };
-                self.log_cursor
-                    .insert(name.to_string(), (reply.next_seq, reply.next_col));
-                return false;
+                let cursor = (reply.next_seq, reply.next_col);
+                self.log_cursor.insert(name.to_string(), cursor);
+                cursor
             }
         };
+        let remaining = self
+            .units
+            .get(name)
+            .map(|unit| unit.deadline_ms.saturating_sub(now))
+            .unwrap_or(0);
         let nonce = self.next_nonce();
-        // Zero takes the server's read budget. This is a per-poll slice, not a
-        // limit on what can match: whatever is not returned advances the cursor
-        // and arrives on the next poll.
-        let packet = remote::journal::msg_term_since(nonce, pty, from_seq, from_col, 0, 0);
-        if client.send(&packet).is_err() {
+        let packet = remote::journal::msg_term_wait(
+            nonce,
+            pty,
+            from_seq,
+            from_col,
+            0,
+            remaining as u32,
+            0,
+            needle,
+        );
+        if client.send(&packet).is_ok() {
+            self.log_waits.insert(nonce, name.to_string());
+        }
+    }
+
+    /// A `C2S_TERM_WAIT` came back. Matched means ready; anything else means
+    /// the wait timed out, and `timeoutStart` decides what that costs.
+    fn note_log_wait(&mut self, client: &mut Client, packet: &[u8]) -> bool {
+        if packet.first() != Some(&remote::journal::S2C_TERM_OUTPUT) || packet.len() < 3 {
             return false;
         }
-        let Some(reply) = self.term_output(client, nonce) else {
+        let nonce = u16::from_le_bytes([packet[1], packet[2]]);
+        let Some(name) = self.log_waits.remove(&nonce) else {
             return false;
         };
+        let Some(reply) = remote::journal::parse_s2c_term_output(packet) else {
+            return true;
+        };
         self.log_cursor
-            .insert(name.to_string(), (reply.next_seq, reply.next_col));
-        // Eviction means the unit outran the poll; the start fails on its
-        // timeout rather than hanging on a match that scrolled away.
-        reply.text.contains(needle)
+            .insert(name.clone(), (reply.next_seq, reply.next_col));
+        // A wait armed for a run that has since been replaced must not declare
+        // its successor ready: the reply describes a terminal that is gone.
+        let current = self
+            .units
+            .get(&name)
+            .is_some_and(|unit| unit.phase == Phase::Activating && unit.pty == Some(reply.pty_id));
+        if current && reply.flags & remote::journal::OUTPUT_MATCHED != 0 {
+            self.ready(client, &name, "log");
+        }
+        true
     }
 
     fn term_output(
