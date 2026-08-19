@@ -407,10 +407,17 @@ env, argv or command, `CREATE2_WANT_STATUS`. Guest SDK:
 `CreateRequest { tag, argv, env, cwd, .. }`. Caps are the process family's
 (`CREATE2_MAX_ARGC`, `_ARG_LEN`, `_ARG_BYTES`) — same `execve` at the far end.
 
-Two failures are now precise rather than buried: an unresolvable `command[0]` is
-a **refused create** (the server resolves before forking), and a `cwd` that
-cannot be entered writes `blit: cannot enter working directory: …` to the
-terminal and exits 1.
+A `cwd` that cannot be entered is no longer ignored: the child writes
+`blit: cannot enter working directory: …` to the terminal and exits 1.
+
+An unresolvable `command[0]` is **not** as precise, and an earlier draft of this
+document was wrong about it. It claimed a refused create, reasoning that the
+server resolves the program before forking. Measured, an absolute path that does
+not exist produces a terminal that exits 1 having printed nothing: the resolver
+passes an absolute path through unchecked, and the failure lands in the child.
+A missing binary therefore looks exactly like a program that started and quit.
+Only `@muster status`, which shows the run, and `doctor`, which resolves
+`command[0]` itself, tell them apart.
 
 **`FEATURE_CREATE_EXEC` is negotiated, not probeable.** A server without bit 29
 does not skip an env block it does not know — it reads those bytes as command
@@ -625,16 +632,30 @@ and `readyWhen: {path}` itself.
 
 ## Surviving its own replacement
 
-Bootstrap with `bootstrap_with_initial` and keep the `S2C_LIST` burst — plain
+Bootstrap with `bootstrap_with_initial` and keep the whole initial burst — plain
 `bootstrap()` discards it, and `S2C_LIST` arrives exactly once before `READY`
-with no request to fall back on.
+with no request to fall back on. The burst is
+`HELLO, LIST, TITLE*, EXITED*, READY`, so keep the `EXITED` records too: they
+are how a terminal that died while nobody was supervising is told apart from one
+still running, and adopting a corpse as the live run parks it in `activating`
+until `timeoutStart` and then replaces it. For the same reason adoption cannot
+hang off `S2C_READY` — bootstrap consumes it, so it never reaches the loop.
 
-Per unit, tags sort by `<seq>`: the highest not-exited is the live run (phase
-`running`, or `activating` re-running its `readyWhen`), failure count 0,
-`started_at` now so it re-earns `HEALTHY_AFTER`. The rest are history, trimmed
-to `keep`. All exited = `stopped`, and the next start takes the next seq, so a
-corpse is never mistaken for the live run. Tags naming a vanished unit or
+Per unit, tags sort by `<seq>`: the highest **not-exited** is the live run,
+failure count 0, `started_at` now so it re-earns `HEALTHY_AFTER`. The rest are
+history, trimmed to `keep`. All exited = `stopped` (or `exited`, for a `oneshot`
+that succeeded), and the next start takes the next seq, so a corpse is never
+mistaken for the live run. Tags naming a vanished unit or
 instance are closed outright.
+
+**Only a `readyWhen` that describes the present may be re-run on an adopted
+unit**: `path`, `tcp` and `http` ask the world a question and get today's
+answer. `log`, `delay` and `spawn` describe a past event, and the evidence for
+one — a line in a bounded ring, a moment that has passed — may be gone. A live
+terminal is the evidence for those, so they adopt straight to `running`.
+Re-running a `log:` probe instead stalls a healthy unit for `timeoutStart` and
+then replaces it, which is precisely the restart storm adoption exists to
+prevent.
 
 So `blit ext update muster` replaces the supervisor while every instance keeps
 running, journaling `adopted` rather than a restart storm. No KV process
@@ -653,10 +674,11 @@ Muster takes `serde_json` + `serde` derive, breaking the precedent that an
 extension depends on `blit-guest` alone. Its JSON is nested, user-authored and
 wrong often enough that the parse error is a feature: `doctor` saying *line 7,
 column 3, expected string* is the product, and a hand-rolled reader that says
-that well is a worse copy of a crate that exists. Expect the module well past
-the 45–91 KB the current extensions occupy; measure under `wasm-opt -Oz` first.
-If the number offends, the fallback is a hand-rolled parser and a worse
-`doctor`, not a worse format.
+that well is a worse copy of a crate that exists. Measured under `wasm-opt -Oz`
+it costs **303 KB, 108 KB brotli**, against `session`'s 187 KB / 68 KB and
+`systemd`'s 116 KB / 45 KB. Roughly a doubling, on an object that is downloaded
+once and pinned by digest. If that number ever stops being worth it, the
+fallback is a hand-rolled parser and a worse `doctor`, not a worse format.
 
 ## Security
 
