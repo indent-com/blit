@@ -77,9 +77,17 @@ export interface CreateWorkspaceSessionOptions {
   rows: number;
   cols: number;
   tag?: string;
+  /** Run this through the target server's login shell. */
   command?: string;
+  /** Exec this argv directly, no shell. Needs `FEATURE_CREATE_EXEC`. */
+  argv?: readonly string[];
   cwdFromSessionId?: SessionId;
   cwd?: string;
+  /** Environment overrides for the child. Needs `FEATURE_CREATE_EXEC`. */
+  env?: Readonly<Record<string, string>>;
+  /** Server-enforced lifetime, armed at creation. Needs
+   *  `FEATURE_PTY_DEADLINE`. */
+  deadlineMs?: number;
 }
 
 export interface ResizeWorkspaceSessionOptions {
@@ -226,8 +234,11 @@ export class BlitWorkspace {
       cols: options.cols,
       tag: options.tag,
       command: options.command,
+      argv: options.argv,
       cwdFromSessionId: options.cwdFromSessionId,
       cwd: options.cwd,
+      env: options.env,
+      deadlineMs: options.deadlineMs,
     });
     return session;
   }

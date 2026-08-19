@@ -10,8 +10,9 @@ use alloc::{string::String, vec::Vec};
 use core::fmt;
 
 use blit_remote::{
-    CREATE2_WANT_STATUS, FEATURE_CREATE_STATUS, FEATURE_PTY_DEADLINE, S2C_UPDATE, ServerMsg,
-    TerminalState, msg_ack, msg_create2_full, msg_subscribe, msg_unsubscribe, parse_server_msg,
+    Create2Request, FEATURE_CREATE_EXEC, FEATURE_CREATE_STATUS, FEATURE_PTY_DEADLINE, S2C_UPDATE,
+    ServerMsg, TerminalState, msg_ack, msg_create2_request, msg_subscribe, msg_unsubscribe,
+    parse_server_msg,
 };
 
 use crate::{Client, Error as ClientError};
@@ -22,12 +23,20 @@ pub struct CreateRequest<'a> {
     pub rows: u16,
     pub cols: u16,
     pub tag: &'a str,
+    /// Run this through the server's login shell. Leave empty when using
+    /// `argv`; setting both is [`Error::CreateFailed`] with `INVALID`.
     pub command: &'a str,
+    /// Exec this argv directly, no shell. Needs
+    /// [`FEATURE_CREATE_EXEC`](blit_remote::FEATURE_CREATE_EXEC).
+    pub argv: Option<&'a [&'a str]>,
     pub cwd: Option<&'a str>,
+    /// Environment overrides, applied on top of everything the server derives.
+    /// Needs [`FEATURE_CREATE_EXEC`](blit_remote::FEATURE_CREATE_EXEC).
+    pub env: &'a [(&'a str, &'a str)],
     pub deadline_ms: Option<u32>,
 }
 
-impl CreateRequest<'_> {
+impl<'a> CreateRequest<'a> {
     /// A shell using the server's default command, tag, cwd, and lifetime.
     pub const fn shell(rows: u16, cols: u16) -> Self {
         Self {
@@ -35,8 +44,18 @@ impl CreateRequest<'_> {
             cols,
             tag: "",
             command: "",
+            argv: None,
             cwd: None,
+            env: &[],
             deadline_ms: None,
+        }
+    }
+
+    /// Exec `argv` directly, the way a process is started outside a terminal.
+    pub const fn exec(rows: u16, cols: u16, argv: &'a [&'a str]) -> Self {
+        Self {
+            argv: Some(argv),
+            ..Self::shell(rows, cols)
         }
     }
 }
@@ -214,18 +233,33 @@ impl TerminalSubscriptions {
         if request.deadline_ms.is_some() && features & FEATURE_PTY_DEADLINE == 0 {
             return Err(Error::FeatureMissing("FEATURE_PTY_DEADLINE"));
         }
+        // Neither exec field is probeable: an older server ignores the flag and
+        // reads the block as command bytes, or spawns a plain shell. Refuse
+        // here rather than let it run something else.
+        if (request.argv.is_some() || !request.env.is_empty())
+            && features & FEATURE_CREATE_EXEC == 0
+        {
+            return Err(Error::FeatureMissing("FEATURE_CREATE_EXEC"));
+        }
 
         let nonce = self.allocate_create_nonce();
-        let packet = msg_create2_full(
+        let packet = msg_create2_request(&Create2Request {
             nonce,
-            request.rows,
-            request.cols,
-            request.tag,
-            request.command,
-            CREATE2_WANT_STATUS,
-            request.cwd,
-            request.deadline_ms,
-        );
+            rows: request.rows,
+            cols: request.cols,
+            want_status: true,
+            tag: request.tag,
+            cwd: request.cwd,
+            deadline_ms: request.deadline_ms,
+            env: request.env.to_vec(),
+            argv: request.argv.map(<[&str]>::to_vec),
+            command: (!request.command.is_empty()).then_some(request.command),
+            ..Default::default()
+        })
+        .map_err(|err| Error::CreateFailed {
+            status: err.status,
+            detail: String::from(err.detail),
+        })?;
         client.send(&packet)?;
         let reply = client
             .recv_matching(|packet| creation_reply(packet, nonce))?
@@ -528,13 +562,15 @@ mod tests {
         }
     }
 
-    fn hello() -> Vec<u8> {
+    const ALL_FEATURES: u32 = bootstrap::FEATURE_EXTENSION
+        | FEATURE_CREATE_STATUS
+        | FEATURE_PTY_DEADLINE
+        | FEATURE_CREATE_EXEC;
+
+    fn hello_with(features: u32) -> Vec<u8> {
         let mut packet = vec![bootstrap::S2C_HELLO];
         packet.extend_from_slice(&1u16.to_le_bytes());
-        packet.extend_from_slice(
-            &(bootstrap::FEATURE_EXTENSION | FEATURE_CREATE_STATUS | FEATURE_PTY_DEADLINE)
-                .to_le_bytes(),
-        );
+        packet.extend_from_slice(&features.to_le_bytes());
         packet
     }
 
@@ -553,11 +589,21 @@ mod tests {
     }
 
     fn boot() -> (native_host::Guard, Rc<RefCell<State>>, Client) {
+        boot_features(ALL_FEATURES)
+    }
+
+    /// Boot against a server that does not advertise `missing`.
+    fn boot_without(missing: u32) -> (native_host::Guard, Rc<RefCell<State>>, Client) {
+        boot_features(ALL_FEATURES & !missing)
+    }
+
+    fn boot_features(features: u32) -> (native_host::Guard, Rc<RefCell<State>>, Client) {
         let state = Rc::new(RefCell::new(State::default()));
-        state
-            .borrow_mut()
-            .incoming
-            .extend([hello(), vec![bootstrap::S2C_READY], init()]);
+        state.borrow_mut().incoming.extend([
+            hello_with(features),
+            vec![bootstrap::S2C_READY],
+            init(),
+        ]);
         let guard = native_host::install(MockHost(Rc::clone(&state)));
         let client = Client::bootstrap().expect("valid extension bootstrap");
         (guard, state, client)
@@ -690,12 +736,11 @@ mod tests {
             .push_back(vec![S2C_CREATED_N, 1, 0, 33, 0]);
         let mut terminals = TerminalSubscriptions::new();
         let request = CreateRequest {
-            rows: 24,
-            cols: 80,
             tag: "worker",
             command: "cargo test",
             cwd: Some("/work"),
             deadline_ms: Some(5_000),
+            ..CreateRequest::shell(24, 80)
         };
 
         assert_eq!(
@@ -706,8 +751,54 @@ mod tests {
         );
         let sent = &state.borrow().sent;
         assert_eq!(sent[0][0], C2S_CREATE2);
-        assert_ne!(sent[0][7] & CREATE2_WANT_STATUS, 0);
+        assert_ne!(sent[0][7] & blit_remote::CREATE2_WANT_STATUS, 0);
         assert_eq!(sent[1], vec![C2S_SUBSCRIBE, 33, 0]);
         assert_eq!(ack_count(&state.borrow()), 0);
+    }
+
+    #[test]
+    fn an_exec_request_carries_argv_and_environment() {
+        let (_guard, state, mut client) = boot();
+        state
+            .borrow_mut()
+            .incoming
+            .push_back(vec![S2C_CREATED_N, 1, 0, 7, 0]);
+        let mut terminals = TerminalSubscriptions::new();
+        let request = CreateRequest {
+            cwd: Some("/work"),
+            env: &[("RUST_LOG", "debug")],
+            ..CreateRequest::exec(24, 80, &["cargo", "test", "--release"])
+        };
+
+        assert_eq!(terminals.create(&mut client, request).unwrap(), 7);
+        let sent = &state.borrow().sent;
+        let parsed = blit_remote::parse_create2(&sent[0]).unwrap();
+        assert_eq!(
+            parsed.argv.as_deref(),
+            Some(&["cargo", "test", "--release"][..])
+        );
+        assert_eq!(parsed.env, vec![("RUST_LOG", "debug")]);
+        assert_eq!(parsed.cwd, Some("/work"));
+        assert_eq!(parsed.command, None);
+    }
+
+    /// An older server ignores the bit and spawns a plain shell, so asking for
+    /// an exec it cannot do has to fail rather than silently become something
+    /// else.
+    #[test]
+    fn an_exec_request_needs_the_feature_bit() {
+        let (_guard, _state, mut client) = boot_without(FEATURE_CREATE_EXEC);
+        let mut terminals = TerminalSubscriptions::new();
+        let mut missing = |request| {
+            matches!(
+                terminals.create(&mut client, request),
+                Err(Error::FeatureMissing("FEATURE_CREATE_EXEC"))
+            )
+        };
+        assert!(missing(CreateRequest::exec(24, 80, &["htop"])));
+        assert!(missing(CreateRequest {
+            env: &[("FOO", "bar")],
+            ..CreateRequest::shell(24, 80)
+        }));
     }
 }

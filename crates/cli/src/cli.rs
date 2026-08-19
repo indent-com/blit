@@ -668,9 +668,39 @@ pub enum TerminalCommand {
     List,
 
     /// Start a new terminal and print its ID
+    ///
+    /// The command is executed directly, the way a process is started anywhere
+    /// else — no login shell, so no rc files and no shell syntax. Pass --shell
+    /// to run one string through $SHELL instead. With no command at all, the
+    /// terminal gets the default interactive shell.
+    ///
+    /// Options come before the command; everything after the first bare word
+    /// belongs to it. Use -- when the command's own flags would be ambiguous.
+    ///
+    /// Examples:
+    ///   blit terminal start htop
+    ///   blit terminal start -- cargo test --release
+    ///   blit terminal start --cwd /src --env RUST_LOG=debug -- cargo run
+    ///   blit terminal start --shell 'ls | wc -l'
     Start {
         /// Command to run (defaults to $SHELL or /bin/sh)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+
+        /// Run the command through the server's login shell ($SHELL -lic)
+        /// instead of executing it directly. Needed for pipes, redirections,
+        /// globs, and anything else that is shell syntax rather than a program.
+        #[arg(long, short = 'c')]
+        shell: bool,
+
+        /// Working directory for the new terminal
+        #[arg(long, value_name = "DIR")]
+        cwd: Option<String>,
+
+        /// Set an environment variable, repeatable (--env KEY=VALUE).
+        /// Overrides whatever the server would otherwise pass down.
+        #[arg(long, value_name = "KEY=VALUE")]
+        env: Vec<String>,
 
         /// Terminal tag / label
         #[arg(long, short = 't')]

@@ -54,7 +54,7 @@ every pending operation as a connection error in that case.
 | `0x13` | `SUBSCRIBE`             | `[pty_id:2]`                                                                                                                                                                                                                                                   |
 | `0x14` | `UNSUBSCRIBE`           | `[pty_id:2]`                                                                                                                                                                                                                                                   |
 | `0x15` | `SEARCH`                | `[request_id:2][query:N]`                                                                                                                                                                                                                                      |
-| `0x16` | `CREATE_AT`             | `[rows:2][cols:2][src_pty_id:2][tag_len:2][tag:N]`                                                                                                                                                                                                             |
+| `0x16` | `CREATE_AT`             | `[rows:2][cols:2][tag_len:2][tag:N][src_pty_id:2]`                                                                                                                                                                                                             |
 | `0x17` | `CREATE_N`              | `[nonce:2][rows:2][cols:2][tag_len:2][tag:N]`                                                                                                                                                                                                                  |
 | `0x18` | `CREATE2`               | `[nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][optional…]`                                                                                                                                                                                           |
 | `0x19` | `READ`                  | `[nonce:2][pty_id:2][offset:4][limit:4][flags:1]`                                                                                                                                                                                                              |
@@ -129,6 +129,18 @@ viewer receives a downscaled stream at its requested physical size.
 - Bit 2 (`HAS_CWD`): followed by `[cwd_len:2][cwd:N]` (before any command bytes) — spawn in this working directory.
 - Bit 3 (`WANT_STATUS`): valid only when `HELLO` advertises `CREATE_STATUS`; requests one correlated `CREATED_N` or `CREATE_FAILED` outcome. It adds no trailing field.
 - Bit 4 (`HAS_DEADLINE`): followed by `[ms:4]`, after any cwd and before any command bytes — arm a deadline at creation. Valid only when `HELLO` advertises `PTY_DEADLINE`.
+- Bit 5 (`HAS_ENV`): followed by `[count:2]` then `count` records of `[key_len:2][key:N][value_len:4][value:N]` — environment overrides for the child. Valid only when `HELLO` advertises `CREATE_EXEC`.
+- Bit 6 (`HAS_ARGV`): followed by `[argc:2]` then `argc` records of `[len:4][arg:N]` — exec this argv directly, no shell. Mutually exclusive with `HAS_COMMAND`; a message setting both is `INVALID`. Valid only when `HELLO` advertises `CREATE_EXEC`.
+
+Optional fields appear in flag-bit order — `src_pty_id`, cwd, deadline, env, argv — and the command, which has no length prefix, is always last.
+
+Every field-bearing bit past `HAS_CWD` is unsafe against a server that does not advertise it. An older server does not refuse an unknown `features` bit; it ignores the bit, does not skip the field, and reads those bytes as the start of the command. `HAS_ARGV` fails differently and just as quietly: with no `HAS_COMMAND` set, the server spawns the default interactive shell. Negotiate, do not probe.
+
+Environment entries are applied last, after everything the server derives for a terminal — the inherited environment, `TERM`, an exported `BLIT_SOCK`, and the session variables — so a client entry always wins. Keys may not be empty, hold a NUL or an `=`, or repeat; values may not hold a NUL. Limits match the process family: 1024 arguments and 1 MiB of argument bytes, 256 variables and 1 MiB of key and value bytes, 64 KiB for any single argument or value, 255 bytes for a key.
+
+**Legacy argv.** Before `HAS_ARGV`, a `HAS_COMMAND` payload containing a NUL was split on NUL and exec'd directly, and every server still accepts that spelling. It is lossy — empty arguments are dropped and the payload is trimmed — so it exists only to reach a server without `CREATE_EXEC`. A one-argument command needs a trailing NUL to be distinguishable from a shell string.
+
+The COMMAND column of `S2C_LIST` shows an argv terminal a shell-quoted rendering of its argv, elided if it runs long. That rendering is for display: `RESTART` replays what the terminal was actually created with, argv and environment included.
 
 `READ` requests text from a PTY's scrollback + viewport:
 
@@ -386,6 +398,7 @@ shared sizing input without a `SURFACE_RESIZE` entry.
 | 26  | `CHANNEL_WATCH`       | `CHANNEL_WATCH` follows which channel names have a listener     |
 | 27  | `CLIENT_ORIGIN`       | The client catalog can say which connections are extensions     |
 | 28  | `TERM_JOURNAL`        | Per-command journal and sequence-addressed output               |
+| 29  | `CREATE_EXEC`         | `CREATE2(HAS_ARGV)` and `CREATE2(HAS_ENV)`; Unix hosts only     |
 
 Bit 26 is advertised with bit 12 and never alone; it is separate because a
 `WATCH` an older server does not know is dropped by the channel family's

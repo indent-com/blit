@@ -38,6 +38,9 @@ import {
   CREATE2_WANT_STATUS,
   FEATURE_CREATE_NONCE,
   FEATURE_CREATE_STATUS,
+  FEATURE_CREATE_EXEC,
+  CREATE2_HAS_ARGV,
+  CREATE2_HAS_ENV,
   CLIENT_LIST_WANT_ORIGIN,
   FEATURE_CLIENT_CONTROL,
   FEATURE_CLIENT_ORIGIN,
@@ -856,6 +859,54 @@ describe("BlitConnection", () => {
     conn.createSession({ rows: 24, cols: 80 });
     const msg = transport.sent.find((m) => m[0] === C2S_CREATE2)!;
     expect(msg[7] & CREATE2_WANT_STATUS).toBe(CREATE2_WANT_STATUS);
+  });
+
+  it("createSession with argv and env sets the exec features", () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE | FEATURE_CREATE_EXEC);
+    conn.createSession({
+      rows: 24,
+      cols: 80,
+      argv: ["cargo", "run"],
+      env: { RUST_LOG: "debug" },
+    });
+    const msg = transport.sent.find((m) => m[0] === C2S_CREATE2)!;
+    expect(msg[7] & CREATE2_HAS_ARGV).toBe(CREATE2_HAS_ARGV);
+    expect(msg[7] & CREATE2_HAS_ENV).toBe(CREATE2_HAS_ENV);
+    expect(msg[7] & CREATE2_HAS_COMMAND).toBe(0);
+  });
+
+  /** An older server does not refuse the unknown flag — it ignores it and
+   *  starts a plain shell, or reads the env block as command text. So the
+   *  check has to happen before anything goes on the wire. */
+  it("createSession refuses argv or env the server cannot honour", async () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE);
+    await expect(
+      conn.createSession({ rows: 24, cols: 80, argv: ["htop"] }),
+    ).rejects.toThrow(/argv or environment/);
+    await expect(
+      conn.createSession({ rows: 24, cols: 80, env: { A: "1" } }),
+    ).rejects.toThrow(/argv or environment/);
+    expect(transport.sent.find((m) => m[0] === C2S_CREATE2)).toBeUndefined();
+  });
+
+  it("createSession refuses a deadline the server cannot honour", async () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE);
+    await expect(
+      conn.createSession({ rows: 24, cols: 80, deadlineMs: 1000 }),
+    ).rejects.toThrow(/deadlines/);
+    expect(transport.sent.find((m) => m[0] === C2S_CREATE2)).toBeUndefined();
+  });
+
+  it("createSession reports an argv session's command", async () => {
+    transport.pushHello(1, FEATURE_CREATE_NONCE | FEATURE_CREATE_EXEC);
+    const promise = conn.createSession({
+      rows: 24,
+      cols: 80,
+      argv: ["cargo", "test"],
+    });
+    const msg = transport.sent.find((m) => m[0] === C2S_CREATE2)!;
+    transport.pushCreatedN(msg[1] | (msg[2] << 8), 9, "");
+    expect((await promise).command).toBe("cargo test");
   });
 
   it("S2C_CREATE_FAILED rejects only the matching nonce", async () => {

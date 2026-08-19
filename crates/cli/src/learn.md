@@ -11,6 +11,20 @@ ID=$(blit terminal start --cols 200)            # start a shell
 
 Always use `--cols 200` or wider to avoid line wrapping. Tag terminals with `-t`.
 
+The command is executed directly — no login shell, so no rc files and no shell
+syntax. For a pipe, a redirection, a glob, or a `&&`, ask for the shell:
+
+```bash
+blit terminal start --cols 200 --shell 'make 2>&1 | tail -40'
+```
+
+Pass a working directory and environment variables the same way you would to
+any other program. `--env` is repeatable, and options go *before* the command:
+
+```bash
+blit terminal start --cols 200 --cwd /src/blit --env RUST_LOG=debug -- cargo run
+```
+
 `start` returns immediately. Use `--wait --timeout N` to block until completion:
 
 ```bash

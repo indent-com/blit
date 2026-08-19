@@ -217,10 +217,20 @@ pub const C2S_SEARCH: u8 = 0x15;
 pub const C2S_CREATE_AT: u8 = 0x16;
 pub const C2S_CREATE_N: u8 = 0x17;
 /// Generic create: [0x18][nonce:2][rows:2][cols:2][features:1][tag_len:2][tag:N][...optional fields]
-/// Features: bit 0 = has src_pty_id (2 bytes after tag), bit 1 = has command (remaining bytes after length-prefixed cwd if present), bit 2 = has cwd ([len:2][utf8])
+///
+/// Optional fields follow the tag in flag-bit order — src_pty, cwd, deadline,
+/// env, argv — and the command, which has no length prefix, is always last.
 /// Server responds with S2C_CREATED_N using the same nonce.
 pub const C2S_CREATE2: u8 = 0x18;
 pub const CREATE2_HAS_SRC_PTY: u8 = 1 << 0;
+/// Run this string through the server's login shell (`$SHELL -lic <command>`):
+/// the remaining bytes of the message, with no length prefix.
+///
+/// **Legacy argv shape.** Before [`CREATE2_HAS_ARGV`] existed, a command
+/// containing a NUL was split on NUL and exec'd directly, and every shipped
+/// server still does that. It is lossy — empty arguments are dropped and the
+/// payload is trimmed — so prefer `HAS_ARGV`, and reach for this only to talk
+/// to a server that has not advertised [`FEATURE_CREATE_EXEC`].
 pub const CREATE2_HAS_COMMAND: u8 = 1 << 1;
 pub const CREATE2_HAS_CWD: u8 = 1 << 2;
 /// Request exactly one correlated creation outcome: `S2C_CREATED_N` on
@@ -238,6 +248,47 @@ pub const CREATE2_WANT_STATUS: u8 = 1 << 3;
 /// protecting it — a client that sends `C2S_DEADLINE` as a second message
 /// leaves the terminal unbounded if it dies in between.
 pub const CREATE2_HAS_DEADLINE: u8 = 1 << 4;
+/// Environment overrides for the child: `[count:2]` then `count` records of
+/// `[key_len:2][key:N][value_len:4][value:N]`, after any deadline and before
+/// the command bytes.  Entries are applied last, on top of everything the
+/// server derives, so a client entry always wins.
+///
+/// Only send this to a server advertising [`FEATURE_CREATE_EXEC`].  An older
+/// one does not know bit 5, will not skip the block, and reads it as the
+/// leading bytes of the command — running arbitrary garbage through the shell.
+/// Same hazard as [`CREATE2_HAS_DEADLINE`], and worse in consequence.
+pub const CREATE2_HAS_ENV: u8 = 1 << 5;
+/// Exec the child directly instead of handing a string to the login shell:
+/// `[argc:2]` then `argc` records of `[len:4][arg:N]`, after any environment
+/// block and before the command bytes.  Mutually exclusive with
+/// [`CREATE2_HAS_COMMAND`]; a message carrying both is `INVALID`.
+///
+/// Only send this to a server advertising [`FEATURE_CREATE_EXEC`].  An older
+/// one does not know bit 6 and, finding no `HAS_COMMAND`, silently spawns the
+/// default interactive shell instead of what was asked for.  The compatible
+/// spelling for such a server is the legacy shape — see [`CREATE2_HAS_COMMAND`]
+/// and `docs/protocol.md`.
+pub const CREATE2_HAS_ARGV: u8 = 1 << 6;
+
+/// Most arguments one `CREATE2` may carry.  The whole exec block deliberately
+/// reuses the process family's caps: it is the same `execve` at the other end,
+/// and a second set of numbers would drift.
+pub const CREATE2_MAX_ARGC: usize = process::PROCESS_MAX_ARGC;
+/// Longest single argument, in bytes.
+pub const CREATE2_MAX_ARG_LEN: usize = process::PROCESS_MAX_ARG_LEN;
+/// Cap on the sum of all argument bytes.
+pub const CREATE2_MAX_ARG_BYTES: usize = process::PROCESS_MAX_ARG_BYTES;
+/// Most environment overrides one `CREATE2` may carry.
+pub const CREATE2_MAX_ENVC: usize = process::PROCESS_MAX_ENVC;
+/// Longest environment key, in bytes.
+pub const CREATE2_MAX_ENV_KEY_LEN: usize = process::PROCESS_MAX_ENV_KEY_LEN;
+/// Longest environment value, in bytes.
+pub const CREATE2_MAX_ENV_VALUE_LEN: usize = process::PROCESS_MAX_ENV_VALUE_LEN;
+/// Cap on the sum of all environment key and value bytes.
+pub const CREATE2_MAX_ENV_BYTES: usize = process::PROCESS_MAX_ENV_BYTES;
+/// Longest cwd accepted, in bytes.  The field's own length prefix is a `u16`,
+/// so this is what the shape can express rather than a policy choice.
+pub const CREATE2_MAX_CWD_LEN: usize = u16::MAX as usize;
 /// Read text from a PTY's scrollback + viewport: [0x19][nonce:2][pty_id:2][offset:4][limit:4][flags:1]
 /// offset: number of lines to skip from the top (oldest = 0), or from the end if READ_TAIL is set
 /// limit: max lines to return (0 = all)
@@ -994,6 +1045,15 @@ pub const FEATURE_CLIENT_CONTROL: u32 = 1 << 20;
 /// attempts. Implies [`FEATURE_CLIENT_CONTROL`].
 pub const FEATURE_CLIENT_ORIGIN: u32 = 1 << 27;
 // Bit 28 is [`journal::FEATURE_TERM_JOURNAL`], with the rest of the family.
+/// `C2S_CREATE2` accepts [`CREATE2_HAS_ARGV`] and [`CREATE2_HAS_ENV`], so a
+/// terminal can be started the way a native process is: an exact argv exec'd
+/// without a shell, plus environment overrides.
+///
+/// Neither flag is probeable — an older server does not refuse an unknown
+/// `CREATE2` bit, it ignores the bit and misreads the trailing bytes — so this
+/// has to be advertised rather than discovered. Not advertised on Windows,
+/// where the pseudoconsole path can honor neither.
+pub const FEATURE_CREATE_EXEC: u32 = 1 << 29;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Color {
@@ -3334,6 +3394,421 @@ pub fn msg_create2_full(
         msg.extend_from_slice(cmd_bytes);
     }
     msg
+}
+
+/// Every optional field of a `C2S_CREATE2`, in one shape both ends agree on.
+///
+/// The wire order is tag, `src_pty_id`, cwd, deadline, env, argv, command —
+/// flag-bit order, with the unprefixed command last. `argv` and `command` are
+/// mutually exclusive.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Create2Request<'a> {
+    pub nonce: u16,
+    pub rows: u16,
+    pub cols: u16,
+    /// Ask for one correlated outcome ([`CREATE2_WANT_STATUS`]). Only set this
+    /// against a server advertising [`FEATURE_CREATE_STATUS`].
+    pub want_status: bool,
+    pub tag: &'a str,
+    /// Inherit the working directory of this terminal, when `cwd` is absent.
+    pub src_pty_id: Option<u16>,
+    pub cwd: Option<&'a str>,
+    pub deadline_ms: Option<u32>,
+    /// Environment overrides, applied on top of everything the server derives.
+    pub env: Vec<(&'a str, &'a str)>,
+    /// Exec this argv directly, no shell. On parse this is also where the
+    /// legacy NUL-split of a [`CREATE2_HAS_COMMAND`] payload lands.
+    pub argv: Option<Vec<&'a str>>,
+    /// Run this string through the server's login shell.
+    pub command: Option<&'a str>,
+}
+
+/// Why a `C2S_CREATE2` was refused, shaped for the one-outcome contract.
+///
+/// `nonce` is `None` only when the frame is too short to carry one; the server
+/// must drop such a frame silently rather than answer an invented nonce
+/// (docs/protocol.md, "Common status registry").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Create2Error {
+    pub nonce: Option<u16>,
+    pub want_status: bool,
+    pub status: u8,
+    pub detail: &'static str,
+}
+
+impl Create2Error {
+    fn at(nonce: u16, want_status: bool, status: u8, detail: &'static str) -> Self {
+        Self {
+            nonce: Some(nonce),
+            want_status,
+            status,
+            detail,
+        }
+    }
+}
+
+/// Encode a [`Create2Request`].
+///
+/// Only set `argv`, `env`, or `deadline_ms` against a server advertising the
+/// matching feature bit — see [`CREATE2_HAS_ARGV`], [`CREATE2_HAS_ENV`], and
+/// [`CREATE2_HAS_DEADLINE`] for what an older one does with bytes it does not
+/// know to skip.
+///
+/// `command` is deliberately *not* checked for NULs: that is the legacy argv
+/// spelling, and this encoder is how a client produces it on purpose.
+pub fn msg_create2_request(req: &Create2Request<'_>) -> Result<Vec<u8>, Create2Error> {
+    let bad = |status, detail| Err(Create2Error::at(req.nonce, req.want_status, status, detail));
+    if req.argv.is_some() && req.command.is_some() {
+        return bad(STATUS_INVALID, "argv and command are mutually exclusive");
+    }
+    if let Some(argv) = &req.argv {
+        if argv.is_empty() {
+            return bad(STATUS_INVALID, "argv is empty");
+        }
+        if argv.len() > CREATE2_MAX_ARGC {
+            return bad(STATUS_TOO_LARGE, "too many arguments");
+        }
+        let mut total = 0usize;
+        for arg in argv {
+            if arg.len() > CREATE2_MAX_ARG_LEN {
+                return bad(STATUS_TOO_LARGE, "argument too long");
+            }
+            total += arg.len();
+            if total > CREATE2_MAX_ARG_BYTES {
+                return bad(STATUS_TOO_LARGE, "arguments too long in total");
+            }
+            if arg.contains('\0') {
+                return bad(STATUS_INVALID, "argument contains a NUL");
+            }
+        }
+    }
+    if let Some(detail) = env_violation(&req.env) {
+        return bad(detail.0, detail.1);
+    }
+    if req.tag.len() > u16::MAX as usize {
+        return bad(STATUS_TOO_LARGE, "tag too long");
+    }
+    if req.cwd.is_some_and(|cwd| cwd.len() > CREATE2_MAX_CWD_LEN) {
+        return bad(STATUS_TOO_LARGE, "cwd too long");
+    }
+
+    let has_cwd = req.cwd.is_some_and(|cwd| !cwd.is_empty());
+    let mut features = 0u8;
+    if req.src_pty_id.is_some() {
+        features |= CREATE2_HAS_SRC_PTY;
+    }
+    if has_cwd {
+        features |= CREATE2_HAS_CWD;
+    }
+    if req.want_status {
+        features |= CREATE2_WANT_STATUS;
+    }
+    if req.deadline_ms.is_some() {
+        features |= CREATE2_HAS_DEADLINE;
+    }
+    if !req.env.is_empty() {
+        features |= CREATE2_HAS_ENV;
+    }
+    if req.argv.is_some() {
+        features |= CREATE2_HAS_ARGV;
+    }
+    if req.command.is_some_and(|c| !c.is_empty()) {
+        features |= CREATE2_HAS_COMMAND;
+    }
+
+    let mut msg = Vec::with_capacity(64 + req.tag.len());
+    msg.push(C2S_CREATE2);
+    msg.extend_from_slice(&req.nonce.to_le_bytes());
+    msg.extend_from_slice(&req.rows.to_le_bytes());
+    msg.extend_from_slice(&req.cols.to_le_bytes());
+    msg.push(features);
+    msg.extend_from_slice(&(req.tag.len() as u16).to_le_bytes());
+    msg.extend_from_slice(req.tag.as_bytes());
+    if let Some(src) = req.src_pty_id {
+        msg.extend_from_slice(&src.to_le_bytes());
+    }
+    if has_cwd {
+        let cwd = req.cwd.unwrap_or_default().as_bytes();
+        msg.extend_from_slice(&(cwd.len() as u16).to_le_bytes());
+        msg.extend_from_slice(cwd);
+    }
+    if let Some(ms) = req.deadline_ms {
+        msg.extend_from_slice(&ms.to_le_bytes());
+    }
+    if !req.env.is_empty() {
+        msg.extend_from_slice(&(req.env.len() as u16).to_le_bytes());
+        for (key, value) in &req.env {
+            msg.extend_from_slice(&(key.len() as u16).to_le_bytes());
+            msg.extend_from_slice(key.as_bytes());
+            msg.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            msg.extend_from_slice(value.as_bytes());
+        }
+    }
+    if let Some(argv) = &req.argv {
+        msg.extend_from_slice(&(argv.len() as u16).to_le_bytes());
+        for arg in argv {
+            msg.extend_from_slice(&(arg.len() as u32).to_le_bytes());
+            msg.extend_from_slice(arg.as_bytes());
+        }
+    }
+    if let Some(command) = req.command.filter(|c| !c.is_empty()) {
+        msg.extend_from_slice(command.as_bytes());
+    }
+    Ok(msg)
+}
+
+/// Shared by the encoder and the parser so one set of rules governs both.
+/// Mirrors `process::validate_spawn`: a key may not be empty, hold a NUL or an
+/// `=`, or repeat, and a value may not hold a NUL.
+fn env_violation(env: &[(&str, &str)]) -> Option<(u8, &'static str)> {
+    if env.len() > CREATE2_MAX_ENVC {
+        return Some((STATUS_TOO_LARGE, "too many environment entries"));
+    }
+    let mut total = 0usize;
+    for (i, (key, value)) in env.iter().enumerate() {
+        if key.len() > CREATE2_MAX_ENV_KEY_LEN {
+            return Some((STATUS_TOO_LARGE, "environment key too long"));
+        }
+        if value.len() > CREATE2_MAX_ENV_VALUE_LEN {
+            return Some((STATUS_TOO_LARGE, "environment value too long"));
+        }
+        total += key.len() + value.len();
+        if total > CREATE2_MAX_ENV_BYTES {
+            return Some((STATUS_TOO_LARGE, "environment too large in total"));
+        }
+        if key.is_empty() {
+            return Some((STATUS_INVALID, "empty environment key"));
+        }
+        if key.contains('\0') || key.contains('=') || value.contains('\0') {
+            return Some((STATUS_INVALID, "environment entry contains NUL or '='"));
+        }
+        if env[..i].iter().any(|(prior, _)| prior == key) {
+            return Some((STATUS_INVALID, "duplicate environment key"));
+        }
+    }
+    None
+}
+
+/// Decode a `C2S_CREATE2`, borrowing from `data`.
+///
+/// The legacy fields keep their historical leniency — an undecodable cwd or
+/// command is dropped rather than refused, because clients have always been
+/// able to send one and having the terminal appear is the kinder answer. The
+/// exec block is strict: it is new, so nothing depends on it being forgiving,
+/// and silently exec'ing something other than what was asked is the one
+/// outcome worth refusing outright.
+pub fn parse_create2(data: &[u8]) -> Result<Create2Request<'_>, Create2Error> {
+    // Too short to carry a nonce and a feature byte: nothing to correlate a
+    // refusal to, so the caller drops it without answering.
+    if data.len() < 8 {
+        return Err(Create2Error {
+            nonce: None,
+            want_status: false,
+            status: STATUS_INVALID,
+            detail: "truncated create",
+        });
+    }
+    let nonce = u16::from_le_bytes([data[1], data[2]]);
+    let rows = u16::from_le_bytes([data[3], data[4]]);
+    let cols = u16::from_le_bytes([data[5], data[6]]);
+    let features = data[7];
+    let want_status = features & CREATE2_WANT_STATUS != 0;
+    let bad = |status, detail| Err(Create2Error::at(nonce, want_status, status, detail));
+
+    if data.len() < 10 {
+        return bad(STATUS_INVALID, "truncated tag length");
+    }
+    let tag_len = u16::from_le_bytes([data[8], data[9]]) as usize;
+    let Some(tag_bytes) = data.get(10..10 + tag_len) else {
+        return bad(STATUS_INVALID, "tag length past end of message");
+    };
+    let Ok(tag) = std::str::from_utf8(tag_bytes) else {
+        return bad(STATUS_INVALID, "tag is not valid UTF-8");
+    };
+    let mut cursor = 10 + tag_len;
+
+    // Historically honored only when the bytes are actually there; a short
+    // frame leaves it unset rather than refusing.
+    let src_pty_id = if features & CREATE2_HAS_SRC_PTY != 0 && data.len() >= cursor + 2 {
+        let id = u16::from_le_bytes([data[cursor], data[cursor + 1]]);
+        cursor += 2;
+        Some(id)
+    } else {
+        None
+    };
+
+    let cwd = if features & CREATE2_HAS_CWD != 0 {
+        if data.len() < cursor + 2 {
+            return bad(STATUS_INVALID, "truncated cwd length");
+        }
+        let cwd_len = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
+        cursor += 2;
+        if data.len() < cursor + cwd_len {
+            return bad(STATUS_INVALID, "truncated cwd");
+        }
+        let cwd = std::str::from_utf8(&data[cursor..cursor + cwd_len]).ok();
+        cursor += cwd_len;
+        cwd.filter(|p| !p.contains('\0'))
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+    } else {
+        None
+    };
+
+    let deadline_ms = if features & CREATE2_HAS_DEADLINE != 0 {
+        if data.len() < cursor + 4 {
+            return bad(STATUS_INVALID, "truncated deadline");
+        }
+        let ms = u32::from_le_bytes([
+            data[cursor],
+            data[cursor + 1],
+            data[cursor + 2],
+            data[cursor + 3],
+        ]);
+        cursor += 4;
+        (ms > 0).then_some(ms)
+    } else {
+        None
+    };
+
+    let mut env: Vec<(&str, &str)> = Vec::new();
+    if features & CREATE2_HAS_ENV != 0 {
+        if data.len() < cursor + 2 {
+            return bad(STATUS_INVALID, "truncated environment count");
+        }
+        let count = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
+        cursor += 2;
+        if count > CREATE2_MAX_ENVC {
+            return bad(STATUS_TOO_LARGE, "too many environment entries");
+        }
+        env.reserve(count);
+        for _ in 0..count {
+            if data.len() < cursor + 2 {
+                return bad(STATUS_INVALID, "truncated environment key length");
+            }
+            let key_len = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
+            cursor += 2;
+            let Some(key) = data.get(cursor..cursor + key_len) else {
+                return bad(STATUS_INVALID, "truncated environment key");
+            };
+            cursor += key_len;
+            if data.len() < cursor + 4 {
+                return bad(STATUS_INVALID, "truncated environment value length");
+            }
+            let value_len = u32::from_le_bytes([
+                data[cursor],
+                data[cursor + 1],
+                data[cursor + 2],
+                data[cursor + 3],
+            ]) as usize;
+            cursor += 4;
+            if value_len > CREATE2_MAX_ENV_VALUE_LEN {
+                return bad(STATUS_TOO_LARGE, "environment value too long");
+            }
+            let Some(value) = data.get(cursor..cursor + value_len) else {
+                return bad(STATUS_INVALID, "truncated environment value");
+            };
+            cursor += value_len;
+            let (Ok(key), Ok(value)) = (std::str::from_utf8(key), std::str::from_utf8(value))
+            else {
+                return bad(STATUS_INVALID, "environment entry is not valid UTF-8");
+            };
+            env.push((key, value));
+        }
+        if let Some((status, detail)) = env_violation(&env) {
+            return bad(status, detail);
+        }
+    }
+
+    let mut argv: Option<Vec<&str>> = None;
+    if features & CREATE2_HAS_ARGV != 0 {
+        if features & CREATE2_HAS_COMMAND != 0 {
+            return bad(STATUS_INVALID, "argv and command are mutually exclusive");
+        }
+        if data.len() < cursor + 2 {
+            return bad(STATUS_INVALID, "truncated argv count");
+        }
+        let argc = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
+        cursor += 2;
+        if argc > CREATE2_MAX_ARGC {
+            return bad(STATUS_TOO_LARGE, "too many arguments");
+        }
+        if argc == 0 {
+            return bad(STATUS_INVALID, "argv is empty");
+        }
+        let mut args = Vec::with_capacity(argc);
+        let mut total = 0usize;
+        for _ in 0..argc {
+            if data.len() < cursor + 4 {
+                return bad(STATUS_INVALID, "truncated argument length");
+            }
+            let len = u32::from_le_bytes([
+                data[cursor],
+                data[cursor + 1],
+                data[cursor + 2],
+                data[cursor + 3],
+            ]) as usize;
+            cursor += 4;
+            if len > CREATE2_MAX_ARG_LEN {
+                return bad(STATUS_TOO_LARGE, "argument too long");
+            }
+            total += len;
+            if total > CREATE2_MAX_ARG_BYTES {
+                return bad(STATUS_TOO_LARGE, "arguments too long in total");
+            }
+            let Some(arg) = data.get(cursor..cursor + len) else {
+                return bad(STATUS_INVALID, "truncated argument");
+            };
+            cursor += len;
+            let Ok(arg) = std::str::from_utf8(arg) else {
+                return bad(STATUS_INVALID, "argument is not valid UTF-8");
+            };
+            // A NUL cannot survive execve, so accepting one would be claiming
+            // to run something this can never run.
+            if arg.contains('\0') {
+                return bad(STATUS_INVALID, "argument contains a NUL");
+            }
+            args.push(arg);
+        }
+        if args[0].is_empty() {
+            return bad(STATUS_INVALID, "argv[0] is empty");
+        }
+        argv = Some(args);
+    }
+
+    let mut command = None;
+    if features & CREATE2_HAS_COMMAND != 0 {
+        let payload = data.get(cursor..).and_then(|b| std::str::from_utf8(b).ok());
+        // Legacy argv spelling: a payload carrying a NUL is a NUL-separated
+        // argv, not a shell string. Lossy — empty arguments vanish — which is
+        // exactly why `HAS_ARGV` exists.
+        if let Some(legacy) = payload
+            .filter(|p| p.contains('\0'))
+            .map(|p| p.split('\0').filter(|a| !a.is_empty()).collect::<Vec<_>>())
+            .filter(|args| !args.is_empty())
+        {
+            argv = Some(legacy);
+        } else {
+            command = payload
+                .filter(|p| !p.contains('\0'))
+                .map(str::trim)
+                .filter(|p| !p.is_empty());
+        }
+    }
+
+    Ok(Create2Request {
+        nonce,
+        rows,
+        cols,
+        want_status,
+        tag,
+        src_pty_id,
+        cwd,
+        deadline_ms,
+        env,
+        argv,
+        command,
+    })
 }
 
 pub fn msg_create_command(rows: u16, cols: u16, command: &str) -> Vec<u8> {
@@ -6722,6 +7197,265 @@ mod tests {
         let plain = msg_create2_full(1, 24, 80, "", "sh", 0, None, None);
         assert_eq!(plain[7] & CREATE2_HAS_DEADLINE, 0);
         assert_eq!(armed.len(), plain.len() + 4);
+    }
+
+    /// The struct encoder is the authority for the layout, so for every field
+    /// the eight-argument legacy encoder can also express, the two must agree
+    /// byte for byte — otherwise the parser is validated against one shape and
+    /// the shipping clients speak another.
+    #[test]
+    fn create2_struct_encoder_matches_the_legacy_encoder() {
+        for (cwd, deadline, want_status) in [
+            (None, None, false),
+            (Some("/tmp"), None, false),
+            (None, Some(5_000), true),
+            (Some("/var/log"), Some(1), true),
+        ] {
+            let legacy = msg_create2_full(
+                7,
+                24,
+                80,
+                "tag",
+                "echo hi",
+                if want_status { CREATE2_WANT_STATUS } else { 0 },
+                cwd,
+                deadline,
+            );
+            let structured = msg_create2_request(&Create2Request {
+                nonce: 7,
+                rows: 24,
+                cols: 80,
+                want_status,
+                tag: "tag",
+                cwd,
+                deadline_ms: deadline,
+                command: Some("echo hi"),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(legacy, structured, "cwd={cwd:?} deadline={deadline:?}");
+        }
+    }
+
+    #[test]
+    fn create2_puts_argv_and_env_before_the_command() {
+        let msg = msg_create2_request(&Create2Request {
+            nonce: 1,
+            rows: 24,
+            cols: 80,
+            tag: "t",
+            cwd: Some("/tmp"),
+            deadline_ms: Some(5_000),
+            env: vec![("FOO", "bar")],
+            argv: Some(vec!["sleep", "60"]),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(msg[0], C2S_CREATE2);
+        assert_ne!(msg[7] & CREATE2_HAS_ENV, 0);
+        assert_ne!(msg[7] & CREATE2_HAS_ARGV, 0);
+        assert_eq!(msg[7] & CREATE2_HAS_COMMAND, 0);
+
+        let req = parse_create2(&msg).unwrap();
+        assert_eq!(req.nonce, 1);
+        assert_eq!(req.tag, "t");
+        assert_eq!(req.cwd, Some("/tmp"));
+        assert_eq!(req.deadline_ms, Some(5_000));
+        assert_eq!(req.env, vec![("FOO", "bar")]);
+        assert_eq!(req.argv, Some(vec!["sleep", "60"]));
+        assert_eq!(req.command, None);
+    }
+
+    #[test]
+    fn create2_argv_keeps_empty_arguments_the_legacy_shape_drops() {
+        let msg = msg_create2_request(&Create2Request {
+            argv: Some(vec!["sh", "-c", "", "x"]),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            parse_create2(&msg).unwrap().argv,
+            Some(vec!["sh", "-c", "", "x"])
+        );
+
+        // The legacy NUL spelling of the same request cannot say it.
+        let legacy = msg_create2(0, 0, 0, "", "sh\0-c\0\0x", 0);
+        assert_eq!(
+            parse_create2(&legacy).unwrap().argv,
+            Some(vec!["sh", "-c", "x"])
+        );
+    }
+
+    #[test]
+    fn create2_legacy_nul_payload_still_parses_as_argv() {
+        // Every shipped client spells argv this way; a one-word argv needs the
+        // trailing NUL to be distinguishable from a shell string.
+        let msg = msg_create2(3, 24, 80, "", "htop\0", 0);
+        let req = parse_create2(&msg).unwrap();
+        assert_eq!(req.argv, Some(vec!["htop"]));
+        assert_eq!(req.command, None);
+
+        let shell = msg_create2(3, 24, 80, "", "ls | wc -l", 0);
+        let req = parse_create2(&shell).unwrap();
+        assert_eq!(req.argv, None);
+        assert_eq!(req.command, Some("ls | wc -l"));
+    }
+
+    #[test]
+    fn create2_refuses_an_exec_request_it_cannot_honor() {
+        let reject = |req: Create2Request<'_>| {
+            msg_create2_request(&req)
+                .expect_err("encoder accepted an invalid request")
+                .status
+        };
+        assert_eq!(
+            reject(Create2Request {
+                argv: Some(vec!["sh"]),
+                command: Some("sh"),
+                ..Default::default()
+            }),
+            STATUS_INVALID
+        );
+        assert_eq!(
+            reject(Create2Request {
+                argv: Some(vec![]),
+                ..Default::default()
+            }),
+            STATUS_INVALID
+        );
+        assert_eq!(
+            reject(Create2Request {
+                env: vec![("A", "1"), ("A", "2")],
+                ..Default::default()
+            }),
+            STATUS_INVALID
+        );
+        assert_eq!(
+            reject(Create2Request {
+                env: vec![("A=B", "1")],
+                ..Default::default()
+            }),
+            STATUS_INVALID
+        );
+        assert_eq!(
+            reject(Create2Request {
+                env: vec![("A", "x\0y")],
+                ..Default::default()
+            }),
+            STATUS_INVALID
+        );
+        assert_eq!(
+            reject(Create2Request {
+                env: vec![("", "1")],
+                ..Default::default()
+            }),
+            STATUS_INVALID
+        );
+        let many: Vec<String> = (0..=CREATE2_MAX_ENVC).map(|i| format!("K{i}")).collect();
+        assert_eq!(
+            reject(Create2Request {
+                env: many.iter().map(|k| (k.as_str(), "v")).collect(),
+                ..Default::default()
+            }),
+            STATUS_TOO_LARGE
+        );
+    }
+
+    /// Both blocks are length-prefixed, so every truncation has to be caught
+    /// rather than walked past — a cursor that under-advances turns the rest of
+    /// the frame into a command and runs something nobody asked for.
+    #[test]
+    fn create2_refuses_a_truncated_exec_block() {
+        let full = msg_create2_request(&Create2Request {
+            nonce: 9,
+            want_status: true,
+            env: vec![("FOO", "bar")],
+            argv: Some(vec!["sleep", "60"]),
+            ..Default::default()
+        })
+        .unwrap();
+        for cut in 10..full.len() {
+            let err = parse_create2(&full[..cut])
+                .expect_err("a truncated exec block parsed as something runnable");
+            assert_eq!(err.nonce, Some(9));
+            assert!(err.want_status);
+        }
+        assert!(parse_create2(&full).is_ok());
+    }
+
+    /// Frames produced by `buildCreate2Message` in `@blit-sh/core`, pasted
+    /// verbatim.
+    ///
+    /// The layout has two independent encoders and one parser, and the risk is
+    /// asymmetric: this crate ships with the server, the TypeScript one ships
+    /// in every browser tab and every embedder that pinned an older release.
+    /// A change here that the JS side did not make would break them silently,
+    /// and nothing else in either test suite would notice — each one only ever
+    /// reads its own bytes back. Regenerate with the `buildCreate2Message`
+    /// tests in `js/core/src/__tests__/protocol.test.ts` if the layout moves
+    /// on purpose.
+    #[test]
+    fn frames_from_the_typescript_encoder_still_parse() {
+        fn hex(text: &str) -> Vec<u8> {
+            (0..text.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex"))
+                .collect()
+        }
+
+        let argv_only = hex(
+            "18070018005000400000030005000000636172676f0400000074657374090000\
+             002d2d72656c65617365",
+        );
+        let req = parse_create2(&argv_only).unwrap();
+        assert_eq!((req.nonce, req.rows, req.cols), (7, 24, 80));
+        assert_eq!(
+            req.argv.as_deref(),
+            Some(&["cargo", "test", "--release"][..])
+        );
+        assert_eq!(req.command, None);
+
+        let env_only = hex(
+            "1807001800500020000002000800525553545f4c4f47050000006465627567\
+             0500454d50545900000000",
+        );
+        let req = parse_create2(&env_only).unwrap();
+        assert_eq!(req.env, vec![("RUST_LOG", "debug"), ("EMPTY", "")]);
+
+        // Every optional field at once, which is the only case that proves the
+        // two encoders agree on field *order* rather than just on each block.
+        let everything = hex(
+            "180700180050007d05006275696c64030009002f7372632f626c697488130000\
+             02000800525553545f4c4f47050000006465627567040050415448080000002f\
+             6f70742f62696e0300020000007368020000002d6300000000",
+        );
+        let req = parse_create2(&everything).unwrap();
+        assert_eq!(req.tag, "build");
+        assert_eq!(req.src_pty_id, Some(3));
+        assert_eq!(req.cwd, Some("/src/blit"));
+        assert_eq!(req.deadline_ms, Some(5_000));
+        assert_eq!(req.env, vec![("RUST_LOG", "debug"), ("PATH", "/opt/bin")]);
+        // The trailing empty argument is the one the legacy NUL spelling drops.
+        assert_eq!(req.argv.as_deref(), Some(&["sh", "-c", ""][..]));
+        assert!(req.want_status);
+
+        let shell = hex("180700180050000e01007404002f746d706c73207c207763202d6c");
+        let req = parse_create2(&shell).unwrap();
+        assert_eq!((req.tag, req.cwd), ("t", Some("/tmp")));
+        assert_eq!(req.command, Some("ls | wc -l"));
+        assert_eq!(req.argv, None);
+    }
+
+    #[test]
+    fn create2_too_short_to_correlate_is_not_answerable() {
+        assert_eq!(parse_create2(&[C2S_CREATE2, 1, 0]).unwrap_err().nonce, None);
+        // Long enough for a nonce: refusals from here on can be correlated.
+        assert_eq!(
+            parse_create2(&[C2S_CREATE2, 1, 0, 24, 0, 80, 0, 0])
+                .unwrap_err()
+                .nonce,
+            Some(1)
+        );
     }
 
     #[test]

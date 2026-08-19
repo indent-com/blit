@@ -135,6 +135,9 @@ async fn async_main() {
                 TerminalCommand::List => agent::cmd_list(transport).await,
                 TerminalCommand::Start {
                     command,
+                    shell,
+                    cwd,
+                    env,
                     tag,
                     rows,
                     cols,
@@ -142,8 +145,20 @@ async fn async_main() {
                     timeout,
                     deadline,
                 } => {
-                    let start_result =
-                        agent::cmd_start(transport, tag, command, rows, cols, deadline).await;
+                    let start_result = agent::cmd_start(
+                        transport,
+                        agent::StartRequest {
+                            tag,
+                            command,
+                            shell,
+                            cwd,
+                            env,
+                            rows,
+                            cols,
+                            deadline,
+                        },
+                    )
+                    .await;
                     if wait {
                         let pty_id = match start_result {
                             Ok(id) => id,
