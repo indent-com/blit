@@ -95,19 +95,21 @@ pointer written before its target exists, which is the ordinary order of events
 when a stack lives in a worktree you are about to create. That cannot arrive by
 itself, because nothing watches a directory that is not being watched, so it is
 the only thing here that polls: retried after 5s, doubling to a minute, reset
-whenever any watch succeeds. `blit @muster reload` with no argument forces it
-now, and says what happened:
+whenever any watch succeeds. `blit @muster rewatch` forces it now, and says what
+happened:
 
 ```
 $ blit @muster doctor
 /src/blit/wt/epic/.blit/muster   cannot watch this directory (status 1)
 $ git worktree add /src/blit/wt/epic
-$ blit @muster reload
+$ blit @muster rewatch
 /src/blit/wt/epic/.blit/muster   watched
 ```
 
-With nothing broken it says so, rather than reporting a reload it did not need
-to do.
+With nothing broken it says so, rather than reporting work it did not need to
+do. It is its own verb rather than an argument-less `reload` because retrying a
+watch and reloading a unit share no subject and no effect, and one word for both
+would put the wrong one a forgotten argument away.
 
 ## What starts what
 
@@ -287,8 +289,7 @@ The wire is JSON, one object per message.
 | `{"type":"events","records":[…]}`                      | journal records, as `@muster log --json` prints them |
 
 The panel sends the CLI's verbs as bare lines: `start NAME`, `stop NAME`,
-`restart NAME`, `rewatch`, `resync`. A name is a unit or an instance. There is
-no reload: the supervisor is watching, so the panel is told.
+`restart NAME`, `rewatch`, `resync`. A name is a unit or an instance.
 
 Two properties are worth stating, because they are what the design is for:
 

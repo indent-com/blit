@@ -87,20 +87,16 @@ impl Muster {
                 Some(name) => self.mark_ready(client, name),
                 None => (2, String::from("ready needs a unit\n")),
             },
-            // `reload NAME` asks that unit to re-read its own configuration.
-            //
-            // Bare `reload` does *not* re-read the directory to find your
-            // edits — the watch already did, before you could type this. What
-            // it does is retry the directories whose watch was refused, which
-            // is the one failure the watch cannot report its way out of: there
-            // is nothing watching a directory that is not being watched. That
-            // retry also happens on its own, on a climbing timer; this is for
-            // when you have just created the directory and would rather not
-            // wait for it.
             "reload" => match target {
                 Some(name) => self.reload_unit(client, name),
-                None => self.retry_watches(client),
+                None => (2, String::from("reload needs a unit or an instance\n")),
             },
+            // Deliberately not a bare `reload`. Retrying a refused watch and
+            // telling a unit to re-read its own configuration are not the same
+            // question asked of different things — they share no subject, no
+            // effect and no failure mode, and one word for both only means the
+            // one you did not want is a forgotten argument away.
+            "rewatch" => self.retry_watches(client),
             "log" => {
                 structured = json;
                 (0, self.render_log(&args, json))
@@ -176,10 +172,10 @@ impl Muster {
 
     /// Retry the directories whose watch was refused, now.
     ///
-    /// The answer says how many there were, because "nothing was broken" and
-    /// "I retried four things" are different outcomes and the old bare `reload`
-    /// reported "reloaded" for both — which read as though it had done
-    /// something about an edit it had nothing to do with.
+    /// The answer names them, because "nothing was broken" and "I retried four
+    /// things" are different outcomes — the verb this replaced reported
+    /// "reloaded" for both, which read as though it had done something about an
+    /// edit it had nothing to do with.
     fn retry_watches(&mut self, client: &mut Client) -> (i32, String) {
         let stuck: Vec<String> = self.unwatchable.keys().cloned().collect();
         if stuck.is_empty() {
