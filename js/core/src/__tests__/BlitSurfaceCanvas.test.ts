@@ -4506,3 +4506,33 @@ describe("BlitSurfaceCanvas change fan-out", () => {
     surface.dispose();
   });
 });
+
+describe("BlitSurfaceCanvas passive layout", () => {
+  /** A card in the dock sizes itself from the surface's aspect with
+   *  `height: auto`, so its canvas has to stay *in flow* and fill the box. A
+   *  view that reports a display size gets absolutely positioned instead, which
+   *  leaves `height: auto` with nothing to measure — the sidebar thumbnails
+   *  collapsed exactly this way when `resizable` started defaulting to true. */
+  it("leaves a view with no display size filling its box, in flow", () => {
+    const { surface, canvas } = attachCanvas();
+    expect(canvas.style.width).toBe("100%");
+    expect(canvas.style.height).toBe("100%");
+    expect(canvas.style.position).toBe("");
+    surface.dispose();
+  });
+
+  it("positions a sized view absolutely, and puts it back on the way out", () => {
+    const { surface, canvas } = attachCanvas();
+    surface.setDisplaySize(800, 600, 120);
+    expect(canvas.style.position).toBe("absolute");
+    expect(canvas.style.width).toBe("800px");
+
+    // Going back to a passive preview has to restore the fill, or a card that
+    // was once a pane keeps a stale pixel height.
+    surface.setDisplaySize(null);
+    expect(canvas.style.position).toBe("");
+    expect(canvas.style.width).toBe("100%");
+    expect(canvas.style.height).toBe("100%");
+    surface.dispose();
+  });
+});

@@ -654,6 +654,8 @@ function PreviewSurface(props: {
       <BlitSurfaceView
         connectionId={props.connectionId}
         surfaceId={props.surfaceId}
+        // A preview: it takes no input and must not size the surface.
+        resizable={false}
         style={
           s()
             ? { width: `${s()!.w}px`, height: `${s()!.h}px` }
@@ -1820,6 +1822,8 @@ export function SwitcherOverlay(props: {
             connectionId={(item as SurfaceItem).connectionId}
             surfaceId={(item as SurfaceItem).surfaceId}
             live={false}
+            // An icon-sized preview: no input, and no say in the surface's size.
+            resizable={false}
             style={{
               width: `${iconSize()}px`,
               height: `${iconSize()}px`,

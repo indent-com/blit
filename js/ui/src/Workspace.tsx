@@ -6005,6 +6005,12 @@ function SurfaceThumbnail(props: {
         <BlitSurfaceView
           connectionId={props.surface.connectionId}
           surfaceId={props.surface.surfaceId}
+          // A card shares whatever stream the panes are already getting and
+          // must not size the surface: its own height is derived from the
+          // surface's aspect below, so driving a resize from it closes exactly
+          // the loop that comment warns about.  It also has to stay in flow for
+          // `height: auto` to have anything to measure.
+          resizable={false}
           style={{
             display: "block",
             width: "100%",
