@@ -335,11 +335,17 @@ delivery:
 }
 ```
 
-`ui.json` is `cwd: "${ROOT}/js/ui"`, `["pnpm","exec","vite","--host","--port","${PORTS}"]`,
-`readyWhen: {"log": "ready in"}`. `build.json` and `js-deps.json` are `oneshot`s
-— which is how one keyword covers what process-compose spells
-`process_completed_successfully` and `process_healthy`. `browser-wasm.json`
-watches with `readyWhen: {"path": "${ROOT}/crates/browser/pkg/blit_browser.js"}`.
+Eight templates in all. `ui.json` is `cwd: "${ROOT}/js/ui"`,
+`["pnpm","exec","vite","--host","--port","${PORTS}"]`,
+`readyWhen: {"log": "ready in"}`; `website.json` is the same shape on
+`${PORTS+2}` and `extensions.json` on `${PORTS+3}`. `build.json` and
+`js-deps.json` are `oneshot`s — which is how one keyword covers what
+process-compose spells `process_completed_successfully` and `process_healthy`.
+`browser-wasm.json` watches with
+`readyWhen: {"path": "${ROOT}/crates/browser/pkg/blit_browser.js"}`. With
+`server` and `gateway` above: `main` runs all eight, `epic` omits `website` and
+runs seven. process-compose's ninth process, `share`, is conditional on an
+environment variable being set at all — the shape `omit` replaces.
 
 A new worktree is one command:
 
