@@ -11,6 +11,8 @@ blit ext run --persist --restart always muster extensions/dist/muster.wasm
 blit @muster list                      # every unit and instance
 blit @muster status epic/gateway       # one unit, with its retained runs
 blit @muster start|stop|restart NAME   # a unit, or a whole instance
+blit @muster instantiate blit epic \
+     ROOT=/src/blit/wt/epic PORTS=auto  # a stack for a worktree, running
 blit @muster log -n 20                 # why something is not running
 blit @muster doctor                    # everything wrong with the directory
 blit @muster env api --values          # which .env file won
@@ -169,6 +171,37 @@ Declaring a parameter `{"kind":"ports","span":4}` lets `doctor` report two
 instances whose blocks overlap — the failure mode of several dev stacks, which
 otherwise presents as `EADDRINUSE` in whichever one lost.
 
+### One command per worktree
+
+```bash
+cd /src/blit/wt/epic
+blit @muster instantiate blit "$(basename "$PWD")" ROOT="$PWD" PORTS=auto
+```
+
+That writes the instance file and starts it, in one command, because those were
+never two decisions: an instance file with `autostart` — the default — _is_ the
+start. What comes back is the units and the phase each is actually in, not what
+they were asked to do, because the write goes into the mirror and the load and
+reconcile happen before the answer is sent.
+
+`VALUE` is typed the way a JSON file would type it: a number is a number, `true`
+is a boolean, and everything else is the text you typed, so paths need no
+quoting. `PORTS=auto` takes the lowest free block for a parameter declared
+`{"kind":"ports"}` — free against **every** instance's block, not just this
+stack's. The first instance of a stack has to say a number: nothing declares
+which range the machine has spare, and inventing one would collide with whatever
+already lives there.
+
+Nothing is written if the instance would not load — the expansion runs first,
+against the same code that will run it for real, so a forgotten parameter is an
+error on your terminal rather than a finding in `doctor` about a file you never
+typed. An existing name is refused unless `--force`; `--no-start` writes
+`"autostart": false` for someone who wants to read it before it runs.
+
+Only the configuration directory is writable, and only at its top level. A stack
+directory outside it is a repository muster was pointed at, and the rule that
+keeps discovery out of it keeps writes out of it too.
+
 ## The panel, and the channel under it
 
 `muster` publishes `blit.muster.v1`, and the browser's Manage pane grows a
@@ -252,6 +285,7 @@ or starts — whatever you actually supervise.
   inside a BSP tile, which is its own piece of plumbing.
 - The durable journal tail in kv: the ring is in memory, so `@muster log` starts
   empty after the supervisor restarts.
-- `@muster instantiate` and `remove`, which need `FS_WRITE`.
+- `@muster remove`, the other half of `instantiate`. Deleting an instance file
+  needs `FS_OP`, and unlike a write it destroys something.
 - A restart caused by a file change is journaled with cause `crash` rather than
   `file`, because the retry runs through the backoff path.

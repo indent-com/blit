@@ -35,6 +35,8 @@ const DESCRIPTOR: &str = r#"{
      "usage":"blit @muster stop <name>"},
     {"path":["restart"],"summary":"Stop and start, in a new terminal",
      "usage":"blit @muster restart <name>"},
+    {"path":["instantiate"],"summary":"Write an instance of a stack, and start it",
+     "usage":"blit @muster instantiate <stack> <name> [VAR=VALUE ...] [--no-start] [--force] [--json]"},
     {"path":["reload"],"summary":"Re-read the directory now",
      "usage":"blit @muster reload"},
     {"path":["ready"],"summary":"Declare a readyWhen:manual unit ready",
@@ -437,6 +439,113 @@ impl Muster {
             .clone()
     }
 
+    /// The configuration directory's own files, as `load` reads them.
+    ///
+    /// Nothing below the second level: a stack is a subdirectory, and anything
+    /// deeper is yours.
+    pub(crate) fn config_files(&self) -> BTreeMap<String, Vec<u8>> {
+        self.files_in(&self.dir.clone())
+            .into_iter()
+            .filter(|(path, _)| path.matches('/').count() <= 1)
+            .collect()
+    }
+
+    /// Write a file into the configuration directory.
+    ///
+    /// `exclusive` is a create-or-fail: a zero CAS base means "there must be
+    /// nothing here", which is what keeps `instantiate` from silently
+    /// replacing an instance somebody is running.
+    ///
+    /// Only the configuration directory is writable, and only at its top
+    /// level. A stack directory outside it is a repository this supervisor was
+    /// pointed at — cloning one must not let it be edited, and the same rule
+    /// that keeps discovery inside the configuration directory keeps writes
+    /// there too.
+    pub(crate) fn write_config(
+        &mut self,
+        client: &mut Client,
+        relative: &str,
+        content: &[u8],
+        exclusive: bool,
+    ) -> Result<(), String> {
+        if relative.contains('/') || relative.starts_with('.') {
+            return Err(format!("{relative:?} is not a top-level file"));
+        }
+        let dir = self.dir.clone();
+        let Some(sync_id) = self
+            .roots
+            .iter()
+            .find(|root| root.path == dir)
+            .and_then(|root| root.sync_id)
+        else {
+            return Err(format!("{dir} is not being watched yet"));
+        };
+        // The CAS base is the hash of what is there now, so a replacement has
+        // to name the thing it replaces.
+        let base = if exclusive {
+            0
+        } else {
+            self.roots
+                .iter()
+                .find(|root| root.path == dir)
+                .and_then(|root| root.mirror.live.get(relative))
+                .map_or(0, |node| node.hash)
+        };
+        let nonce = self.next_nonce();
+        let write = remote::fs::FsWrite {
+            nonce,
+            sync_id,
+            flags: remote::fs::FS_WRITE_MKPARENTS,
+            base,
+            mode: 0o600,
+            content_kind: remote::fs::FS_WRITE_CONTENT_FULL,
+            path: relative.to_string(),
+            content: content.to_vec(),
+        };
+        client
+            .send(&remote::fs::msg_fs_write(&write))
+            .map_err(|e| format!("write: {e:?}"))?;
+        let reply = self
+            .reply(client, remote::fs::S2C_FS_DONE, nonce)
+            .ok_or("the server never answered the write")?;
+        let (_, status, hash, mtime_ns) =
+            remote::fs::parse_fs_done(&reply).ok_or("malformed write reply")?;
+        match status {
+            remote::fs::FS_DONE_OK => {}
+            remote::fs::FS_DONE_CONFLICT => return Err(format!("{relative} already exists")),
+            other => {
+                return Err(format!(
+                    "{relative}: {}",
+                    remote::fs::fs_done_status_text(other)
+                ));
+            }
+        }
+
+        // Put the bytes in the mirror ourselves.
+        //
+        // The write does come back as an `FS_UPDATE`, but a *metadata-only*
+        // one: the server primes the echo by marking this client as already
+        // holding the content, so its own upsert carries no copy. `files_in`
+        // reads content, so without this the file muster just wrote is a node
+        // it can see and not a file it can parse — and since a metadata-only
+        // upsert preserves whatever content is already there, seeding here is
+        // also what makes the echo harmless when it lands.
+        if let Some(root) = self.roots.iter_mut().find(|root| root.path == dir) {
+            root.mirror.live.insert(
+                relative.to_string(),
+                remote::fs::FsNode {
+                    entry_flags: remote::fs::FS_ENTRY_FILE,
+                    size: content.len() as u64,
+                    mtime_ns,
+                    mode: 0o600,
+                    hash,
+                    content: Some(content.to_vec()),
+                },
+            );
+        }
+        Ok(())
+    }
+
     fn files_in(&self, path: &str) -> BTreeMap<String, Vec<u8>> {
         let Some(root) = self.roots.iter().find(|root| root.path == path) else {
             return BTreeMap::new();
@@ -739,6 +848,35 @@ impl Muster {
         // consumes that, so the loop never sees it.
         if !self.adoptable.is_empty() {
             self.adopt(client);
+        }
+    }
+
+    /// What a stack declares, without expanding anything.
+    ///
+    /// Split out of [`Self::expand`] because `instantiate` has to know which
+    /// parameter is the port block before it has an instance to expand.
+    pub(crate) fn declarations_of(&self, stack: &str) -> Result<StackFile, String> {
+        if !config::is_path(stack) {
+            return self
+                .stacks
+                .get(stack)
+                .cloned()
+                .ok_or_else(|| format!("no stack named {stack:?}"));
+        }
+        let dir = self.resolve_path(stack);
+        if !self.roots.iter().any(|root| root.path == dir) {
+            return Err(format!("{dir} is not being watched yet"));
+        }
+        match self.files_in(&dir).get("stack.json") {
+            // A stack directory with templates but no `stack.json` works: it
+            // simply declares no parameters.
+            None => Ok(StackFile::default()),
+            Some(bytes) => config::parse_json("stack.json", bytes)
+                .and_then(|value| {
+                    serde_json::from_value(value)
+                        .map_err(|e| ConfigError::new("stack.json", e.to_string()))
+                })
+                .map_err(|e| e.detail),
         }
     }
 

@@ -5,17 +5,32 @@
 //! RESULT straight to stdout, so sending both prints the answer twice.
 
 use super::{Muster, describe_ready};
-use blit_ext_muster::config;
+use blit_ext_muster::config::{self, InstanceFile};
 use blit_ext_muster::journal::{Cause, Record};
 use blit_ext_muster::supervisor::{self, Phase, Unit};
 use blit_guest::Client;
 use blit_guest::command::Invocation;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 /// Emitted by `@muster schema`, so an editor validates a unit file as it is
 /// typed. Kept deliberately shallow: it is a completion and typo aid, not a
 /// second implementation of the parser.
 const SCHEMA: &str = include_str!("schema.json");
+
+/// What `@muster instantiate` was asked for. A struct because it is six
+/// things, and six positional arguments is a call nobody can read.
+struct Instantiate<'a> {
+    stack: &'a str,
+    name: &'a str,
+    /// `NAME=VALUE`, as typed.
+    assignments: &'a [&'a str],
+    /// Replace an instance that already exists.
+    force: bool,
+    /// What goes in the file. False writes `"autostart": false`.
+    autostart: bool,
+    json: bool,
+}
 
 impl Muster {
     pub(crate) fn serve(&mut self, client: &mut Client, mut invocation: Invocation) {
@@ -49,6 +64,24 @@ impl Muster {
             "start" | "stop" | "restart" => match target {
                 Some(name) => self.act(client, verb, name),
                 None => (2, format!("{verb} needs a name\n")),
+            },
+            "instantiate" => match (target, positional.get(2).copied()) {
+                (Some(stack), Some(name)) => {
+                    let answered = self.instantiate(
+                        client,
+                        &Instantiate {
+                            stack,
+                            name,
+                            assignments: &positional[3..],
+                            force: args.iter().any(|a| a == "--force"),
+                            autostart: !args.iter().any(|a| a == "--no-start"),
+                            json,
+                        },
+                    );
+                    structured = json && answered.0 == 0;
+                    answered
+                }
+                _ => (2, String::from("instantiate needs a stack and a name\n")),
             },
             "ready" => match target {
                 Some(name) => self.mark_ready(client, name),
@@ -123,6 +156,148 @@ impl Muster {
             ),
             None => (1, format!("no unit named {name:?}\n")),
         }
+    }
+
+    /// Write an instance file, and let it start.
+    ///
+    /// One command, because the two it replaces were never independent: the
+    /// point of instantiating a stack for a worktree is to have it running, and
+    /// an instance file with `autostart` — the default — is what starts it.
+    /// The write lands in the mirror here, so the load and the reconcile happen
+    /// before the answer is sent and the answer names the phase each unit is
+    /// actually in, rather than the one it was asked for.
+    ///
+    /// The expansion is done here first, against the same code that will do it
+    /// for real. A file that would not expand is never written: `doctor` naming
+    /// a mistake after the fact is no help when the mistake is in a file you
+    /// did not type.
+    fn instantiate(&mut self, client: &mut Client, request: &Instantiate<'_>) -> (i32, String) {
+        let Instantiate {
+            stack,
+            name,
+            assignments,
+            force,
+            autostart,
+            json,
+        } = *request;
+        if name.is_empty() || name.contains('/') || name.starts_with('.') {
+            return (2, format!("{name:?} is not a usable instance name\n"));
+        }
+        if !force && (self.instances.contains_key(name) || self.units.contains_key(name)) {
+            return (
+                1,
+                format!("{name} already exists; pass --force to replace it\n"),
+            );
+        }
+
+        let declarations = match self.declarations_of(stack) {
+            Ok(declarations) => declarations,
+            Err(err) => return (1, format!("{err}\n")),
+        };
+
+        let mut vars: BTreeMap<String, Value> = BTreeMap::new();
+        for assignment in assignments {
+            let Some((key, value)) = assignment.split_once('=') else {
+                return (2, format!("{assignment:?} is not NAME=VALUE\n"));
+            };
+            vars.insert(key.to_string(), config::scalar(value));
+        }
+
+        // `auto` on the port parameter means "the next free block". Resolving
+        // it here rather than in the file is deliberate: the file records the
+        // number it got, so a reload does not silently move a running stack to
+        // a different port.
+        if let Some((port_var, decl)) = declarations.vars.iter().find(|(_, d)| d.is_ports())
+            && vars.get(port_var).and_then(Value::as_str) == Some("auto")
+        {
+            let taken: Vec<(i64, u32)> = self
+                .instances
+                .values()
+                .filter_map(|instance| instance.ports)
+                .collect();
+            let seed = self
+                .instances
+                .values()
+                .filter(|instance| instance.stack == stack)
+                .filter_map(|instance| instance.ports.map(|(base, _)| base))
+                .min();
+            match config::next_port_block(&taken, seed, decl.span) {
+                Some(base) => {
+                    vars.insert(port_var.clone(), json!(base));
+                }
+                None => {
+                    return (
+                        1,
+                        format!(
+                            "nothing to allocate {port_var} from: give the first \
+                             instance of {stack:?} a number\n"
+                        ),
+                    );
+                }
+            }
+        }
+
+        let instance = InstanceFile {
+            stack: stack.to_string(),
+            vars: vars.clone(),
+            omit: Vec::new(),
+            autostart,
+        };
+        let expansion = match self.expand(name, &instance, &self.config_files()) {
+            Ok(expansion) => expansion,
+            Err(err) => return (1, format!("{name} would not load: {err}\n")),
+        };
+
+        let mut body = json!({ "stack": stack, "vars": vars });
+        if !autostart && let Some(map) = body.as_object_mut() {
+            map.insert("autostart".into(), json!(false));
+        }
+        let mut text = match serde_json::to_string_pretty(&body) {
+            Ok(text) => text,
+            Err(err) => return (1, format!("{err}\n")),
+        };
+        text.push('\n');
+        let file = format!("{name}.json");
+        if let Err(err) = self.write_config(client, &file, text.as_bytes(), !force) {
+            return (1, format!("{err}\n"));
+        }
+        // The write is already in the mirror, so this is the load the watch
+        // would have done in a settle window. `load` only decides what should
+        // run; `reconcile` is what starts it, and the main loop would not get
+        // there until after this answer was sent — so a command that reported
+        // `stopped` for everything it had just started would be telling the
+        // truth about a state one line of its own making away from over.
+        self.load(client);
+        self.reconcile(client);
+
+        let phase = |unit: Option<&Unit>| {
+            unit.map_or("missing", |unit| unit.phase.as_str())
+                .to_string()
+        };
+        if json {
+            return (
+                0,
+                line(json!({
+                    "instance": name,
+                    "stack": stack,
+                    "file": file,
+                    "vars": vars,
+                    "units": expansion
+                        .members
+                        .iter()
+                        .map(|member| json!({
+                            "name": member,
+                            "phase": phase(self.units.get(member)),
+                        }))
+                        .collect::<Vec<_>>(),
+                })),
+            );
+        }
+        let mut out = format!("wrote {file}\n");
+        for member in &expansion.members {
+            out.push_str(&format!("{member}\t{}\n", phase(self.units.get(member))));
+        }
+        (0, out)
     }
 
     /// A name is a unit, or an instance, in which case the verb applies to

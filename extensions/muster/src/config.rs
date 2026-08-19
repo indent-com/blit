@@ -554,6 +554,44 @@ pub fn port_span(stack: &StackFile, vars: &BTreeMap<String, Value>) -> Option<(i
     Some((base, decl.span.max(1)))
 }
 
+/// The lowest block of `span` starting at or above `seed` that overlaps none
+/// of `taken`.
+///
+/// `seed` is where this stack's existing instances start, which is why `auto`
+/// needs one: it means "another one of these", not "some free ports". Nothing
+/// in a stack declaration says which range is the machine's to use, and
+/// inventing one would collide with whatever already lives there.
+///
+/// `taken` is every instance's block, not just this stack's — the collision
+/// that matters is with anything, and two stacks that happened to be seeded
+/// nearby are exactly the case `doctor` was written for.
+pub fn next_port_block(taken: &[(i64, u32)], seed: Option<i64>, span: u32) -> Option<i64> {
+    let span = i64::from(span.max(1));
+    let mut base = seed?;
+    while taken.iter().any(|(other, other_span)| {
+        base < other + i64::from((*other_span).max(1)) && *other < base + span
+    }) {
+        base += span;
+    }
+    Some(base)
+}
+
+/// A `NAME=VALUE` right-hand side, typed the way a JSON file would type it.
+///
+/// `PORTS=10000` has to become a number, because [`port_span`] reads an integer
+/// and a quoted one would not be a port block. Otherwise the value is the text
+/// you typed: that is what makes `ROOT=/src/blit` work unquoted, and what keeps
+/// `who=world` from being a parse error rather than a name. Nothing is
+/// unwrapped — the shell already decided what reached us — and structure on a
+/// command line is somebody escaping their way into a mistake, since a stack
+/// parameter is a scalar.
+pub fn scalar(value: &str) -> Value {
+    match serde_json::from_str::<Value>(value) {
+        Ok(parsed) if parsed.is_number() || parsed.is_boolean() => parsed,
+        _ => Value::String(value.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,6 +758,48 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn auto_ports_fill_the_first_gap_above_the_stacks_own_seed() {
+        // Two instances at 10000 and 10008 with a span of 4 leave 10004.
+        assert_eq!(
+            next_port_block(&[(10000, 4), (10008, 4)], Some(10000), 4),
+            Some(10004)
+        );
+        // Packed blocks push the next one past the end.
+        assert_eq!(
+            next_port_block(&[(10000, 4), (10004, 4)], Some(10000), 4),
+            Some(10008)
+        );
+        // Another stack's block is an obstacle like any other: what matters is
+        // that the ports are free, not whose they would have been.
+        assert_eq!(
+            next_port_block(&[(10000, 4), (10004, 16)], Some(10000), 4),
+            Some(10020)
+        );
+        // A stack with no instance yet has nothing to allocate from, and
+        // guessing a range would collide with whatever already lives there.
+        assert_eq!(next_port_block(&[(10000, 4)], None, 4), None);
+        // A declaration that forgot its span still occupies one port.
+        assert_eq!(next_port_block(&[(10000, 0)], Some(10000), 0), Some(10001));
+    }
+
+    #[test]
+    fn an_assignment_is_typed_the_way_a_json_file_would_type_it() {
+        assert_eq!(scalar("10000"), Value::from(10000));
+        assert_eq!(scalar("true"), Value::from(true));
+        // Unquoted paths and words are the common case, and both are strings.
+        assert_eq!(scalar("/src/blit"), Value::from("/src/blit"));
+        assert_eq!(scalar("auto"), Value::from("auto"));
+        // The rule is "what you typed, unless it is a number or a boolean", so
+        // a JSON string literal keeps its quotes rather than being unwrapped —
+        // the shell already decided what reached us, and a second layer of
+        // unquoting would make `ROOT="a b"` mean something else than `ROOT=a b`.
+        assert_eq!(scalar("\"10000\""), Value::from("\"10000\""));
+        // Structure on a command line is somebody escaping their way into a
+        // mistake; a parameter is a scalar.
+        assert_eq!(scalar("[1,2]"), Value::from("[1,2]"));
     }
 }
 
