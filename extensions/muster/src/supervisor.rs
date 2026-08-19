@@ -166,6 +166,16 @@ impl Unit {
             self.failures = 0;
         }
 
+        // An exit that follows a stop is the stop completing, not a crash.
+        // Running the restart policy over it resurrects a unit somebody asked
+        // to stop — the signal that killed it is a nonzero exit, and
+        // `restartOnFailure` defaults on, so `@muster stop` on a *live* unit
+        // would come back after its backoff. A unit stopped while already dead
+        // never reaches here, which is why this hid.
+        if !self.phase.is_live() {
+            return self.reap();
+        }
+
         if self.file.unit_type == crate::config::UnitType::Oneshot && exit_code == 0 {
             self.phase = Phase::Exited;
         } else if !self.wants_restart(exit_code) {
@@ -647,5 +657,57 @@ mod naming_tests {
         let tag = tag_for(&name, 3);
         assert_eq!(tag, "muster/epic/server/3");
         assert_eq!(parse_tag(&tag), Some((name.as_str(), 3)));
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    fn running(json: &str) -> Unit {
+        let file: UnitFile = serde_json::from_str(json).unwrap();
+        let mut unit = Unit::new("api".into(), None, file);
+        unit.phase = Phase::Running;
+        unit.pty = Some(7);
+        unit
+    }
+
+    #[test]
+    fn a_stopped_unit_stays_stopped_when_its_signal_lands() {
+        // `stop` sets the phase and signals; the exit arrives afterwards. The
+        // signal makes that exit nonzero, so running the restart policy over
+        // it would resurrect exactly what was asked to stop.
+        let mut unit = running(r#"{"command":["a"]}"#);
+        unit.phase = Phase::Held;
+        unit.note_exit(143, 1000, 0);
+        assert_eq!(unit.phase, Phase::Held);
+        assert_eq!(unit.failures, 0, "a deliberate stop is not a failure");
+        assert_eq!(unit.next_attempt_ms, 0, "and arms no retry");
+    }
+
+    #[test]
+    fn a_cascade_stop_also_absorbs_its_own_exit() {
+        let mut unit = running(r#"{"command":["a"],"restartOnSuccess":true}"#);
+        unit.phase = Phase::Stopped;
+        unit.note_exit(143, 1000, 0);
+        assert_eq!(unit.phase, Phase::Stopped);
+    }
+
+    #[test]
+    fn the_exit_is_still_recorded_and_reaped() {
+        let mut unit = running(r#"{"command":["a"],"keep":0}"#);
+        unit.phase = Phase::Held;
+        let closed = unit.note_exit(143, 1000, 0);
+        assert_eq!(unit.last_exit, Some(143), "status still visible in status");
+        assert!(unit.pty.is_none(), "the terminal is no longer live");
+        assert_eq!(closed.len(), 1, "keep:0 still reaps the run");
+    }
+
+    #[test]
+    fn a_crash_while_running_is_untouched_by_this() {
+        let mut unit = running(r#"{"command":["a"]}"#);
+        unit.note_exit(1, 1000, 0);
+        assert_eq!(unit.phase, Phase::Backoff);
+        assert_eq!(unit.failures, 1);
     }
 }
