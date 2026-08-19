@@ -77,7 +77,11 @@
     "startLimit": { "type": "integer", "minimum": 0, "default": 0 },
 
     "stack": {
-      "description": "Names a subdirectory to instantiate. Makes this file an instance.",
+      "description": "A subdirectory name, or a path to a directory anywhere. Makes this file an instance.",
+      "type": "string"
+    },
+    "include": {
+      "description": "Names a directory of ordinary units. Their names are not suffixed.",
       "type": "string"
     },
     "vars": { "type": "object" },

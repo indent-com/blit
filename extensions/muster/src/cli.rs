@@ -5,6 +5,7 @@
 //! RESULT straight to stdout, so sending both prints the answer twice.
 
 use super::{Muster, describe_ready};
+use blit_ext_muster::config;
 use blit_ext_muster::journal::{Cause, quote};
 use blit_ext_muster::supervisor::Phase;
 use blit_guest::Client;
@@ -306,26 +307,36 @@ impl Muster {
         out
     }
 
+    /// The file behind a name, wherever it is watched from.
+    ///
+    /// A plain unit is `<name>.json` in the configuration directory, or in an
+    /// included one. A stack member is `<template>.json` under the stack, which
+    /// may be a subdirectory or a directory anywhere.
     fn render_cat(&self, name: &str) -> (i32, String) {
-        for candidate in self.candidate_paths(name) {
-            if let Some(node) = self.mirror.live.get(&candidate)
-                && let Some(content) = &node.content
-            {
-                return (0, String::from_utf8_lossy(content).into_owned());
-            }
-        }
-        (1, format!("no file behind {name:?}\n"))
-    }
-
-    /// A unit is `<name>.json`; a stack member is `<stack>/<template>.json`.
-    fn candidate_paths(&self, name: &str) -> Vec<String> {
-        let mut paths = vec![format!("{name}.json")];
+        let mut candidates: Vec<(String, String)> =
+            vec![(self.dir.clone(), format!("{name}.json"))];
         if let Some((template, instance)) = name.rsplit_once('@')
             && let Some(instance) = self.instances.get(instance)
         {
-            paths.push(format!("{}/{template}.json", instance.stack));
+            let stack_dir = self.resolve_path(&instance.stack);
+            if config::is_path(&instance.stack) {
+                candidates.push((stack_dir, format!("{template}.json")));
+            } else {
+                candidates.push((
+                    self.dir.clone(),
+                    format!("{}/{template}.json", instance.stack),
+                ));
+            }
         }
-        paths
+        for root in &self.roots {
+            candidates.push((root.path.clone(), format!("{name}.json")));
+        }
+        for (root, relative) in candidates {
+            if let Some(content) = self.file_at(&root, &relative) {
+                return (0, String::from_utf8_lossy(&content).into_owned());
+            }
+        }
+        (1, format!("no file behind {name:?}\n"))
     }
 
     fn render_env(

@@ -42,6 +42,45 @@ A unit needs exactly one of `command` (an argv, exec'd directly) or `shell` (a
 line for the server's **login** shell — fish, where `$SHELL` is fish). Both is
 refused, and so is neither.
 
+## Definitions that live somewhere else
+
+A `stack` or an `include` may name a directory anywhere, so a stack can live in
+the repository it starts and the configuration directory holds only a pointer.
+A bare word is a subdirectory; anything with a `/` or a leading `~` is a path.
+
+```json
+// ~/.config/blit/muster/epic.json — instantiates a stack from a worktree
+{ "stack": "/src/blit/.claude/worktrees/epic/.blit/muster",
+  "vars": { "PORTS": 10010 } }
+
+// ~/.config/blit/muster/work.json — adopts a directory of ordinary units
+{ "include": "~/work/units" }
+```
+
+The two differ in naming, which is the whole reason both exist. An **instance**
+suffixes: `server@epic`, which is what you want when the same stack runs once
+per worktree. An **include** does not: its units keep their own names, as though
+the files had been dropped in the configuration directory. Two includes offering
+one name is therefore an error rather than a merge — `doctor` names both files,
+and `omit` resolves it. An included directory holds units only; its
+subdirectories are not stacks, because an instance names a stack by path.
+
+Inside a stack, `${STACK_DIR}` is the stack's own directory, and a relative
+`cwd` or `envFile` resolves against it. So a stack at `<repo>/.blit/muster/`
+reaches its checkout with `"cwd": "../.."` and needs no `ROOT` parameter at all.
+
+**Discovery never leaves the configuration directory.** Muster does not look for
+`.blit/muster` in a repository, a cwd, or any ancestor of one: cloning a
+repository and starting a server must not run its code. The pointer file is a
+deliberate act — and the same act already grants arbitrary execution, so this
+adds reach rather than privilege. What it does add is that **a branch switch can
+change what a template says**, since the file is written by `git checkout`
+rather than by you. `restartOnChange` is on by default, so that edit takes
+effect the way any other does.
+
+Each distinct external directory costs one `FS_SYNC`, shared between pointers
+that name the same one, and dropped when the last pointer goes away.
+
 ## What starts what
 
 `requires` is hard and implies ordering: the dependency must be ready first,

@@ -341,6 +341,10 @@ pub struct StackFile {
 }
 
 /// A top-level file naming a stack.
+///
+/// `stack` is a subdirectory name, or a path to a directory anywhere — see
+/// [`is_path`]. The path form is how a stack lives in the repository it starts,
+/// with only this pointer in the configuration directory.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceFile {
@@ -353,24 +357,62 @@ pub struct InstanceFile {
     pub autostart: bool,
 }
 
+/// A top-level file naming a directory of ordinary units.
+///
+/// Unlike an instance, an include adds no suffix: the units keep their own
+/// names, as though the file had been dropped in the configuration directory.
+/// That is the point — a shared directory of units is not N copies of one
+/// template — and it is also why two includes offering the same name is an
+/// error rather than a merge.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncludeFile {
+    pub include: String,
+    #[serde(default)]
+    pub omit: Vec<String>,
+    #[serde(default = "yes")]
+    pub autostart: bool,
+}
+
 /// The name a file at the top level claims, and what kind of thing it is.
 pub enum TopLevel {
     Unit(Box<UnitFile>),
     Instance(Box<InstanceFile>),
+    Include(Box<IncludeFile>),
 }
 
-/// A top-level file is a unit unless it has a `stack` field.
+/// Whether a `stack`/`include` value points outside the configuration
+/// directory.
+///
+/// A bare word is a subdirectory; anything with a separator or a `~` is a path.
+/// There is no third syntax to remember, and a subdirectory name containing a
+/// slash was never meaningful.
+pub fn is_path(value: &str) -> bool {
+    value.starts_with('~') || value.starts_with('/') || value.contains('/')
+}
+
+/// A top-level file is a unit unless it has a `stack` or an `include`.
 pub fn parse_top_level(file: &str, bytes: &[u8]) -> Result<TopLevel, ConfigError> {
     let value = parse_json(file, bytes)?;
-    if value.get("stack").is_some() {
-        serde_json::from_value(value)
+    let named = |field: &str| value.get(field).is_some();
+    match (named("stack"), named("include")) {
+        (true, true) => Err(ConfigError::new(
+            file,
+            "stack and include are mutually exclusive: one instantiates a \
+             template, the other adopts units as they are",
+        )),
+        (true, false) => serde_json::from_value(value)
             .map(|i| TopLevel::Instance(Box::new(i)))
-            .map_err(|e| ConfigError::new(file, e.to_string()))
-    } else {
-        let unit: UnitFile =
-            serde_json::from_value(value).map_err(|e| ConfigError::new(file, e.to_string()))?;
-        unit.validate(file)?;
-        Ok(TopLevel::Unit(Box::new(unit)))
+            .map_err(|e| ConfigError::new(file, e.to_string())),
+        (false, true) => serde_json::from_value(value)
+            .map(|i| TopLevel::Include(Box::new(i)))
+            .map_err(|e| ConfigError::new(file, e.to_string())),
+        (false, false) => {
+            let unit: UnitFile =
+                serde_json::from_value(value).map_err(|e| ConfigError::new(file, e.to_string()))?;
+            unit.validate(file)?;
+            Ok(TopLevel::Unit(Box::new(unit)))
+        }
     }
 }
 
@@ -470,6 +512,7 @@ fn as_integer(value: &Value) -> Option<i64> {
 pub fn bind_vars(
     instance: &str,
     stack_name: &str,
+    stack_dir: &str,
     stack: &StackFile,
     supplied: &BTreeMap<String, Value>,
 ) -> Result<BTreeMap<String, Value>, String> {
@@ -489,6 +532,9 @@ pub fn bind_vars(
     }
     bound.insert("INSTANCE".into(), Value::String(instance.to_string()));
     bound.insert("STACK".into(), Value::String(stack_name.to_string()));
+    // Absolute, so a stack that lives in the repository it starts can locate
+    // that repository without the instance restating a path it already knows.
+    bound.insert("STACK_DIR".into(), Value::String(stack_dir.to_string()));
     Ok(bound)
 }
 
@@ -646,6 +692,7 @@ mod tests {
         let ok = bind_vars(
             "epic",
             "blit",
+            "/cfg/blit",
             &stack,
             &vars(&[("ROOT", Value::from("/src")), ("PORTS", Value::from(10010))]),
         )
@@ -653,15 +700,56 @@ mod tests {
         assert_eq!(ok["INSTANCE"], Value::from("epic"));
         assert_eq!(port_span(&stack, &ok), Some((10010, 4)));
 
-        assert!(bind_vars("epic", "blit", &stack, &vars(&[])).is_err());
+        assert!(bind_vars("epic", "blit", "/cfg/blit", &stack, &vars(&[])).is_err());
         assert!(
             bind_vars(
                 "epic",
                 "blit",
+                "/cfg/blit",
                 &stack,
                 &vars(&[("ROOT", Value::from("/s")), ("NOPE", Value::from(1))])
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod outside_tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_word_is_a_subdirectory_and_anything_else_is_a_path() {
+        assert!(!is_path("blit"));
+        assert!(is_path("/src/blit/.blit/muster"));
+        assert!(is_path("~/work/stacks/web"));
+        assert!(is_path("stacks/web"));
+    }
+
+    #[test]
+    fn an_include_is_not_an_instance_and_both_at_once_is_refused() {
+        let include = parse_top_level("work.json", br#"{"include":"~/work/units"}"#).unwrap();
+        assert!(matches!(include, TopLevel::Include(_)));
+        let both = parse_top_level("x.json", br#"{"stack":"a","include":"/b"}"#);
+        assert!(both.is_err());
+    }
+
+    #[test]
+    fn an_external_stack_binds_stack_dir() {
+        let stack = StackFile::default();
+        let bound = bind_vars(
+            "epic",
+            "/src/blit/.blit/muster",
+            "/src/blit/.blit/muster",
+            &stack,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(bound["STACK_DIR"], Value::from("/src/blit/.blit/muster"));
+        // A template can therefore reach its own checkout without the instance
+        // restating a path it already named.
+        let mut value: Value = serde_json::from_str(r#"{"cwd":"${STACK_DIR}/../.."}"#).unwrap();
+        substitute(&mut value, &bound).unwrap();
+        assert_eq!(value["cwd"], Value::from("/src/blit/.blit/muster/../.."));
     }
 }
