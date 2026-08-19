@@ -251,6 +251,21 @@ impl Unit {
     }
 }
 
+/// A unit belonging to an instance is `<instance>/<template>`.
+///
+/// Reads as a path because that is what it is: the instance groups, the
+/// template names. It also sorts the way you want — every unit of one instance
+/// together — and cannot collide with a plain unit, whose name is a filename
+/// and therefore holds no separator.
+pub fn qualified(instance: &str, template: &str) -> String {
+    format!("{instance}/{template}")
+}
+
+/// The instance and template a qualified name refers to.
+pub fn unqualify(name: &str) -> Option<(&str, &str)> {
+    name.split_once('/')
+}
+
 /// The prefix every muster-owned terminal tag carries.
 pub const TAG_PREFIX: &str = "muster/";
 
@@ -587,7 +602,7 @@ mod tag_tests {
 
     #[test]
     fn a_tag_round_trips_through_the_parser() {
-        for (unit, seq) in [("api", 0u64), ("gateway@epic", 41), ("a-b_c.d", u64::MAX)] {
+        for (unit, seq) in [("api", 0u64), ("epic/gateway", 41), ("a-b_c.d", u64::MAX)] {
             let tag = tag_for(unit, seq);
             assert_eq!(parse_tag(&tag), Some((unit, seq)), "{tag}");
         }
@@ -597,8 +612,8 @@ mod tag_tests {
     fn a_unit_name_may_contain_the_separator() {
         // Only the last `/` separates the sequence, so a name is free to hold
         // one — which an instance of a stack in a nested directory can.
-        let tag = tag_for("stacks/web@epic", 7);
-        assert_eq!(parse_tag(&tag), Some(("stacks/web@epic", 7)));
+        let tag = tag_for("epic/stacks/web", 7);
+        assert_eq!(parse_tag(&tag), Some(("epic/stacks/web", 7)));
     }
 
     #[test]
@@ -606,5 +621,31 @@ mod tag_tests {
         for tag in ["", "muster/", "muster/api", "session/api/0", "muster/api/x"] {
             assert_eq!(parse_tag(tag), None, "{tag}");
         }
+    }
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::*;
+
+    #[test]
+    fn an_instance_qualifies_its_templates_as_a_path() {
+        assert_eq!(qualified("epic", "server"), "epic/server");
+        assert_eq!(unqualify("epic/server"), Some(("epic", "server")));
+    }
+
+    #[test]
+    fn a_plain_unit_is_never_mistaken_for_a_qualified_one() {
+        // A top-level unit is named by a filename, which holds no separator,
+        // so the two namespaces cannot collide.
+        assert_eq!(unqualify("postgres"), None);
+    }
+
+    #[test]
+    fn qualification_survives_the_tag_round_trip() {
+        let name = qualified("epic", "server");
+        let tag = tag_for(&name, 3);
+        assert_eq!(tag, "muster/epic/server/3");
+        assert_eq!(parse_tag(&tag), Some((name.as_str(), 3)));
     }
 }

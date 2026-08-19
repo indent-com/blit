@@ -148,6 +148,10 @@ struct Root {
     /// sync id back.
     nonce: u16,
     sync_id: Option<u16>,
+    /// Whether the initial snapshot has landed. `sync_id` only says the sync
+    /// was accepted; the contents arrive afterwards, and treating acceptance as
+    /// arrival makes an empty mirror look like an empty directory.
+    snapshot_done: bool,
     mirror: remote::fs::FsMirror,
 }
 
@@ -344,6 +348,7 @@ impl Muster {
                 path: path.to_string(),
                 nonce,
                 sync_id: None,
+                snapshot_done: false,
                 mirror: remote::fs::FsMirror::new(),
             });
         }
@@ -471,7 +476,12 @@ impl Muster {
                 else {
                     return;
                 };
+                // `FS_UPDATE_SYNC` closes the staged initial snapshot: before
+                // it, this root's mirror is a work in progress and its units do
+                // not exist yet.
+                let snapshot_done = packet[7] & remote::fs::FS_UPDATE_SYNC != 0;
                 if let Some(update_id) = root.mirror.apply_update(packet) {
+                    root.snapshot_done |= snapshot_done;
                     let _ = client.send(&remote::fs::msg_fs_ack(sync_id, update_id));
                     self.load(client);
                 }
@@ -751,14 +761,14 @@ impl Muster {
                 serde_json::from_value(value).map_err(|e| format!("{path}: {e}"))?;
             rebase_unit_paths(&mut file, &stack_dir);
             file.validate(&path).map_err(|e| e.detail)?;
-            let name = format!("{template}@{instance_name}");
+            let name = supervisor::qualified(instance_name, template);
             members.push(name.clone());
 
             // Inside a stack, dependencies name templates and always resolve
             // within the same instance.
             let qualify = |names: &mut Vec<String>| {
                 for n in names.iter_mut() {
-                    *n = format!("{n}@{instance_name}");
+                    *n = supervisor::qualified(instance_name, n);
                 }
             };
             qualify(&mut file.requires);
@@ -890,13 +900,34 @@ impl Muster {
 
     // -------------------------------------------------------------- lifecycle
 
+    /// Whether every directory a pointer named has answered, one way or the
+    /// other.
+    ///
+    /// Until then the unit table is incomplete by construction: a root added
+    /// during a load is empty until its own updates arrive.
+    fn roots_settled(&self) -> bool {
+        self.roots
+            .iter()
+            .all(|root| root.snapshot_done || self.unwatchable.contains_key(&root.path))
+    }
+
     /// Adopt the terminals a previous supervisor left running.
+    ///
+    /// Runs on every load, not just the first, because a unit whose definition
+    /// lives outside the configuration directory does not exist yet on the load
+    /// that discovers its pointer. A tag naming a unit that is not in the table
+    /// *yet* stays pending; it is only closed once every root has reported, at
+    /// which point "not in the table" really does mean gone. Closing eagerly
+    /// killed and respawned exactly the units an external stack or an include
+    /// contributed — the restart storm adoption exists to prevent, arriving by
+    /// a different door.
     fn adopt(&mut self, client: &mut Client) {
         let now = self.now_ms(client);
         let tags = std::mem::take(&mut self.adoptable);
         if tags.is_empty() {
             return;
         }
+        let settled = self.roots_settled();
         // Per unit, sort by sequence: the highest is the live run.
         let mut by_unit: BTreeMap<String, Vec<(u64, u16)>> = BTreeMap::new();
         for (pty, tag) in tags {
@@ -910,14 +941,24 @@ impl Muster {
         }
         for (name, mut runs) in by_unit {
             runs.sort_unstable();
-            let Some(unit) = self.units.get_mut(&name) else {
-                // A unit or instance that no longer exists takes its history
-                // with it.
+            if !self.units.contains_key(&name) {
+                if !settled {
+                    // Its definition may still be arriving from a root that has
+                    // not reported. Keep the tags and try again next load.
+                    self.adoptable.extend(
+                        runs.into_iter()
+                            .map(|(seq, pty)| (pty, supervisor::tag_for(&name, seq))),
+                    );
+                    continue;
+                }
+                // Every root has reported, so this really is gone. It takes its
+                // history with it.
                 for (_, pty) in runs {
                     let _ = client.send(&remote::msg_close(pty));
                 }
                 continue;
-            };
+            }
+            let unit = self.units.get_mut(&name).expect("checked");
             let highest = runs.last().expect("non-empty").0;
             unit.seq = highest + 1;
 

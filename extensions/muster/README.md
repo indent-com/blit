@@ -9,7 +9,7 @@ is an ordinary blit PTY, so *supervised* and *attachable* are the same thing.
 blit ext run --persist --restart always muster extensions/dist/muster.wasm
 
 blit @muster list                      # every unit and instance
-blit @muster status gateway@epic       # one unit, with its retained runs
+blit @muster status epic/gateway       # one unit, with its retained runs
 blit @muster start|stop|restart NAME   # a unit, or a whole instance
 blit @muster log -n 20                 # why something is not running
 blit @muster doctor                    # everything wrong with the directory
@@ -34,8 +34,8 @@ and nothing below the second level is read.
   blit/                  a stack of templates
     stack.json             its parameter declarations
     server.json
-  main.json              an instance → server@main
-  epic.json              another     → server@epic
+  main.json              an instance → main/server, main/gateway
+  epic.json              another     → epic/server, epic/gateway
 ```
 
 A unit needs exactly one of `command` (an argv, exec'd directly) or `shell` (a
@@ -58,9 +58,10 @@ A bare word is a subdirectory; anything with a `/` or a leading `~` is a path.
 ```
 
 The two differ in naming, which is the whole reason both exist. An **instance**
-suffixes: `server@epic`, which is what you want when the same stack runs once
-per worktree. An **include** does not: its units keep their own names, as though
-the files had been dropped in the configuration directory. Two includes offering
+qualifies its templates as `<instance>/<template>` — `epic/server` — which is
+what you want when the same stack runs once per worktree, and which sorts every
+unit of an instance together. An **include** does not: its units keep their own
+names, as though the files had been dropped in the configuration directory. Two includes offering
 one name is therefore an error rather than a merge — `doctor` names both files,
 and `omit` resolves it. An included directory holds units only; its
 subdirectories are not stacks, because an instance names a stack by path.

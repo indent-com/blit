@@ -7,7 +7,7 @@
 use super::{Muster, describe_ready};
 use blit_ext_muster::config;
 use blit_ext_muster::journal::{Cause, Record};
-use blit_ext_muster::supervisor::{Phase, Unit};
+use blit_ext_muster::supervisor::{self, Phase, Unit};
 use blit_guest::Client;
 use blit_guest::command::Invocation;
 use serde_json::{Value, json};
@@ -291,9 +291,11 @@ impl Muster {
         let unit_filter = value_of("-u");
         let since: Option<u64> = value_of("--since").and_then(|s| s.parse().ok());
 
+        // `-u api` is one unit; `-u epic` is every unit of that instance, which
+        // is what `epic/` prefixes read as anyway.
         let matches = |record: &&Record| {
             unit_filter.as_ref().is_none_or(|want| {
-                let want = want.trim_start_matches('@');
+                let want = want.trim_end_matches('/');
                 record.unit == *want || record.instance.as_deref() == Some(want)
             })
         };
@@ -343,8 +345,8 @@ impl Muster {
     fn render_cat(&self, name: &str) -> (i32, String) {
         let mut candidates: Vec<(String, String)> =
             vec![(self.dir.clone(), format!("{name}.json"))];
-        if let Some((template, instance)) = name.rsplit_once('@')
-            && let Some(instance) = self.instances.get(instance)
+        if let Some((instance_name, template)) = supervisor::unqualify(name)
+            && let Some(instance) = self.instances.get(instance_name)
         {
             let stack_dir = self.resolve_path(&instance.stack);
             if config::is_path(&instance.stack) {

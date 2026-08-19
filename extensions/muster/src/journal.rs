@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn a_spawn_record_counts_env_keys_and_never_carries_values() {
-        let record = Record::new("gateway@epic", Event::Spawn, "activating")
+        let record = Record::new("epic/gateway", Event::Spawn, "activating")
             .pty(7)
             .instance(Some("epic".into()))
             .detail("./target/profiling/blit gateway")
@@ -311,9 +311,9 @@ mod tests {
 
     #[test]
     fn causes_render_the_unit_that_asked() {
-        let record = Record::new("gateway@epic", Event::Start, "waiting")
-            .cause(Cause::Dependency("server@epic".into()));
-        assert_eq!(record.to_json()["cause"], json!("dependency:server@epic"));
+        let record = Record::new("epic/gateway", Event::Start, "waiting")
+            .cause(Cause::Dependency("epic/server".into()));
+        assert_eq!(record.to_json()["cause"], json!("dependency:epic/server"));
     }
 
     #[test]
