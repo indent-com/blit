@@ -146,7 +146,7 @@ exits 0 usually meant it, and disagreeing produces a loop rather than an outage.
 | `"spawn"` | `S2C_CREATED_N` — the program resolved and `execve` ran |
 | `{"delay": "2s"}` | wall clock |
 | `{"path": "/tmp/blit-dev.sock"}` | path exists (`FS_READ` + `FS_READ_NO_CONTENT`, polled 250 ms) |
-| `{"log": "listening on"}` | substring appears after start (`TERM_SINCE`, polled 100 ms) |
+| `{"log": "listening on"}` | substring appears after start (`TERM_WAIT`, a server-side block) |
 | `{"tcp": "127.0.0.1:5432"}` | `NET_OPEN` returns `NET_STATUS_OK` (polled 250 ms) |
 | `{"http": "http://127.0.0.1:10001/"}` | `GET` answers below 500 — connect + status line, no TLS, no redirects, no body |
 | `"manual"` | `blit @muster ready <unit>`, possibly from the unit itself |
@@ -780,9 +780,12 @@ fallback is a hand-rolled parser and a worse `doctor`, not a worse format.
   one restarts nothing.
 - **Retention costs scrollback.** `keep` × units × instances, each a buffer.
   Default 1 roughly doubles a stack at rest. `status` shows what is held.
-- **`log:` readiness polls a ring.** A ready line followed by a megabyte inside
-  one 100 ms window can be evicted; detectable (`OUTPUT_EVICTED`), so it fails on
-  `timeoutStart` rather than hanging. Honest fix is `TERM_JOURNAL_WAIT`.
+- **`log:` readiness is armed once, not polled.** `TERM_WAIT` blocks
+  server-side from a cursor taken at spawn, so there is no window in which a
+  ready line can be printed and evicted between polls. Muster does not block on
+  the reply — that would park its single loop for the whole of `timeoutStart` —
+  so the answer arrives through the loop, guarded on the unit still being the
+  run that armed it.
 - **Cascade stops are stronger than systemd's** — bounded to one instance, which
   is what keeps it from being worse than it sounds.
 - **Port blocks are allocated, not enforced.** `auto` picks a free base once;
@@ -800,10 +803,13 @@ fallback is a hand-rolled parser and a worse `doctor`, not a worse format.
   `${ROOT}`/`${INSTANCE}` are exactly a worktree's path and name.
 - A browser panel on `blit.muster.v1` — the reason the channel carries full
   state, an instance list and a live event stream rather than being a transport.
-- `TERM_JOURNAL_WAIT` instead of the `log:` poll, once the guest SDK wraps the
-  journal family. Writing this down is what found that the per-connection wait
-  cap was 32 — a supervisor arms one per unit, so at a hundred units it would
-  have served the first 32 and polled for the rest. Raised to 4096, which is
+- ~~`TERM_JOURNAL_WAIT` instead of the `log:` poll.~~ Done, but not with that
+  opcode: it waits on a *command record*, which only exists for a PTY whose
+  shell emits OSC 133, and a unit exec'd directly emits none. `C2S_TERM_WAIT`
+  is the wait on text that `log:` actually needed
+  ([term-journal.md](term-journal.md)). Chasing it also found the
+  per-connection wait cap at 32 — a supervisor arms one per unit, so at a
+  hundred units it would have served the first 32 — now 4096, which is
   bookkeeping the lifecycle loop already scans rather than the delivery tick.
 - Placing a unit's terminal in a pane, once a client exposes layout beyond its
   own URL hash.
