@@ -1,7 +1,3 @@
 # TODO
 
-## Unfinished RFCs
-
-- [Wasmi extensions and native channels](docs/design/extensions.md)
-- [Native non-PTY processes](docs/design/processes.md)
-- [Viewer media devices, MPRIS, and compositor portals](docs/design/media-devices-portals.md)
+In manage:dev Clients tab, I see Other subscriptions (3): KV #0, KV #1. I'd like to see the details instead of just their number(?)

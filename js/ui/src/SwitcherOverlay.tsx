@@ -726,6 +726,12 @@ export function SwitcherOverlay(props: {
   backgroundTiles?: readonly string[];
   /** Restore a backgrounded tile (re-open it in the main view / focused pane). */
   onRestoreTile?: (assignment: string) => void;
+  /**
+   * Start an application selected from the app list. The caller owns focusing
+   * the surface once it appears; the switcher itself does not know the active
+   * panel or the surface's id ahead of time.
+   */
+  onStartApplication?: (connectionId: string, appId: string) => void;
   /** Synchronous "@query" search over the locally cached file index
    *  (ide/fileIndex.ts) — per-keystroke, no round trip. Null while the
    *  index hasn't arrived (old server, still fetching) — the list just
@@ -1206,9 +1212,17 @@ export function SwitcherOverlay(props: {
     return surfs
       .filter((s) => {
         if (!searching()) return true;
-        const name = s.title || s.appId || `Surface ${s.surfaceId}`;
+        // Both the title and the application id, not the first non-empty one.
+        // A window's title is whatever it is currently showing, and for a
+        // managed application the Applications section is not the fallback —
+        // that section drops anything the supervisor already runs. So a title
+        // that happens not to contain the application's own name used to make
+        // it unreachable by name from here: Spotify plays a track and titles
+        // its window after it, and typing "spotify" matched nothing anywhere.
+        const name = s.title || `Surface ${s.surfaceId}`;
         return (
           name.toLowerCase().includes(needle) ||
+          s.appId.toLowerCase().includes(needle) ||
           labelConnIds.has(s.connectionId)
         );
       })
@@ -1973,8 +1987,12 @@ export function SwitcherOverlay(props: {
     if (item.type === "app") {
       // Start, not enable: this is trying an application, not adopting it for
       // every future session. The window it opens arrives as a surface on its
-      // own, so there is nothing to focus here.
-      startApplication(item.connectionId, item.appId);
+      // own, so let the workspace place it in the active panel once it appears.
+      if (props.onStartApplication) {
+        props.onStartApplication(item.connectionId, item.appId);
+      } else {
+        startApplication(item.connectionId, item.appId);
+      }
       props.onClose();
       return;
     }

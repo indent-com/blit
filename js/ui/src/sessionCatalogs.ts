@@ -4,9 +4,8 @@
  * The Manage panel opens a `blit.session.v1` channel when a viewer expands a
  * remote and closes it when they leave, which is right for a panel: it costs
  * nothing while nobody is looking. The switcher cannot work that way. It has to
- * filter a thousand applications from the first keystroke, and a catalog
- * fetched when Cmd-K opens arrives a second late — by which time the viewer has
- * typed the name of something the list still does not know about.
+ * filter a thousand applications from the first keystroke instead of fetching
+ * one when it opens.
  *
  * So this holds one channel per connected server for the life of the page. The
  * standing cost is small and one-sided: the catalog rides the greeting once,
@@ -15,15 +14,18 @@
  * drawing them.
  *
  * Shaped like {@link ./ide/rootsStore.ts}: a module-scope map plus a version
- * signal, armed idempotently from an effect over the connection snapshots. The
- * generation is what makes a reconnect re-arm — a channel does not survive one,
- * and without it a server that dropped and came back would stay silent.
+ * signal. It is armed from an effect over the connection snapshots, but it
+ * also follows `CHANNEL_WATCH` for `blit.session.v1` so that installing the
+ * session extension after connect (or uninstalling and reinstalling it) opens
+ * or closes the catalog without requiring a reconnect.
  */
 
 import { createSignal } from "solid-js";
 import type { BlitWorkspace, ConnectionId } from "@blit-sh/core";
+import { followChannelNames } from "./channelPresence";
 import {
   openSession,
+  SESSION_CHANNEL,
   type SessionApp,
   type SessionCatalogEntry,
   type SessionHandle,
@@ -41,6 +43,8 @@ export interface RemoteApplications {
 type OpenState = {
   handle: SessionHandle | null;
   generation: number;
+  /** Stops the `CHANNEL_WATCH` follow for this connection. */
+  stopChannelWatch: (() => void) | null;
 };
 
 const opens = new Map<ConnectionId, OpenState>();
@@ -54,9 +58,10 @@ const bump = () => setVersion((n) => n + 1);
  * Idempotently hold one server's supervisor channel open.
  *
  * Re-call freely — from an effect over the connection snapshots, passing the
- * connection generation, which re-arms after a re-establish. A server running
- * no supervisor refuses the channel, which is an answer rather than a failure:
- * the slot is dropped so a later generation can try again.
+ * connection generation, which re-arms after a re-establish. The channel itself
+ * is opened only while the server's registry reports `blit.session.v1` as
+ * present, so uninstalling the session extension closes the catalog and
+ * reinstalling it reopens it without requiring a reconnect.
  */
 export function ensureSessionCatalog(
   workspace: BlitWorkspace,
@@ -65,53 +70,77 @@ export function ensureSessionCatalog(
 ): void {
   const existing = opens.get(connectionId);
   if (existing && existing.generation === generation) return;
+  // Superseded by a new generation, or the first call for this connection.
+  existing?.stopChannelWatch?.();
   existing?.handle?.close();
 
   const connection = workspace.getConnection(connectionId);
   if (!connection) return;
-  const state: OpenState = { handle: null, generation };
+  const state: OpenState = {
+    handle: null,
+    generation,
+    stopChannelWatch: null,
+  };
   opens.set(connectionId, state);
 
-  void openSession(connection, {
-    onClosed: () => {
-      // Dropping the slot is not enough: the handle owns a repeating artwork
-      // timer and one object URL per icon it drew, and only its `close()` gives
-      // those up. The other two paths out of a channel close it themselves — a
-      // reconnect above, a superseded open below — so a server-initiated close
-      // arriving here was the one that leaked a live timer polling a dead
-      // channel and every icon for the life of the page.
-      //
-      // Closing from inside the close is safe: the connection has already
-      // forgotten the channel by the time it calls this, so the handle's
-      // `close()` reaches a no-op rather than coming back round.
-      if (opens.get(connectionId) === state) {
-        dropSessionCatalog(connectionId);
-        return;
+  let live = true;
+  let stopWatch: (() => void) | null = null;
+  state.stopChannelWatch = () => {
+    live = false;
+    stopWatch?.();
+    state.handle?.close();
+    state.handle = null;
+    if (opens.get(connectionId) === state) opens.delete(connectionId);
+  };
+
+  void followChannelNames(connection, [SESSION_CHANNEL], (present) => {
+    if (!live) return;
+    if (present.has(SESSION_CHANNEL)) {
+      if (state.handle) return;
+      void openSession(connection, {
+        onClosed: () => {
+          if (!live) return;
+          // The channel went away (extension stopped). Close the handle so the
+          // icon timer and object URLs are released, but keep the slot and the
+          // watch alive: a reinstall will make the channel present again and
+          // we'll reopen.
+          state.handle?.close();
+          state.handle = null;
+          bump();
+        },
+      })
+        .then((handle) => {
+          if (!live || opens.get(connectionId) !== state) {
+            handle.close();
+            return;
+          }
+          state.handle = handle;
+          handle.subscribe(bump);
+          bump();
+        })
+        .catch(() => {
+          // A refused open is transient while the channel is flapping; the
+          // next presence update will retry.
+        });
+    } else {
+      if (state.handle) {
+        state.handle.close();
+        state.handle = null;
+        bump();
       }
-      bump();
-    },
-  })
-    .then((handle) => {
-      // Superseded while opening — a reconnect landed, or the connection went.
-      if (opens.get(connectionId) !== state) {
-        handle.close();
-        return;
-      }
-      state.handle = handle;
-      handle.subscribe(bump);
-      bump();
-    })
-    .catch(() => {
-      if (opens.get(connectionId) === state) opens.delete(connectionId);
-    });
+    }
+  }).then((release) => {
+    if (live) stopWatch = release;
+    else release();
+  });
 }
 
-/** Close a server's channel, e.g. because the connection went away. */
+/** Close a server's channel and stop watching its presence. */
 export function dropSessionCatalog(connectionId: ConnectionId): void {
   const state = opens.get(connectionId);
   if (!state) return;
-  opens.delete(connectionId);
-  state.handle?.close();
+  state.stopChannelWatch?.();
+  // stopChannelWatch deletes the state and closes the handle.
   bump();
 }
 
@@ -128,7 +157,7 @@ const ready = (connectionId: ConnectionId): SessionHandle | null =>
  * must not close it — it belongs to the store, and outlives any one panel.
  *
  * Reactive: null until the greeting has been asked for, and again if the
- * connection drops.
+ * connection drops or the channel is not currently served.
  */
 export function sessionHandle(
   connectionId: ConnectionId,
