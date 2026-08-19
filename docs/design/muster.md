@@ -23,7 +23,7 @@ flowchart LR
   S["muster/blit/*.json (stack)"] --> M[muster]
   I["muster/{main,epic}.json (instances)"] --> M
   E[".env files"] -->|FS_READ| M
-  M -->|"CREATE2 (argv+env+cwd)"| P["PTYs, tag muster/tag muster/&lt;unit&gt;@&lt;instance&gt;/&lt;seq&gt;lt;instancetag muster/&lt;unit&gt;@&lt;instance&gt;/&lt;seq&gt;gt;/tag muster/&lt;unit&gt;@&lt;instance&gt;/&lt;seq&gt;lt;unittag muster/&lt;unit&gt;@&lt;instance&gt;/&lt;seq&gt;gt;/tag muster/&lt;unit&gt;@&lt;instance&gt;/&lt;seq&gt;lt;seqtag muster/&lt;unit&gt;@&lt;instance&gt;/&lt;seq&gt;gt;"]
+  M -->|"CREATE2 (argv+env+cwd)"| P["PTYs, tag muster/&lt;instance&gt;/&lt;unit&gt;/&lt;seq&gt;"]
   M -->|KILL / CLOSE| P
   P -->|S2C_EXITED / TERM_SINCE| M
   M --> J["journal (ring + KV tail)"]
