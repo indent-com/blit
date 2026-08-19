@@ -137,6 +137,11 @@ export function isSwitcherShortcut(
   );
 }
 
+/** True when an element is CodeMirror 6's focused contenteditable. */
+export function isCodeMirrorInputTarget(el: Element | null): boolean {
+  return el instanceof HTMLElement && el.closest(".cm-editor") != null;
+}
+
 type TextControl = HTMLInputElement | HTMLTextAreaElement;
 
 const MAC_DEAD_KEYS: Readonly<
@@ -440,7 +445,8 @@ export function createKeyboardShortcuts(h: KeyboardShortcutHandlers): void {
         tag === "TEXTAREA" ||
         tag === "SELECT" ||
         tag === "CANVAS" ||
-        tag === "BUTTON"
+        tag === "BUTTON" ||
+        isCodeMirrorInputTarget(el)
       );
     };
 

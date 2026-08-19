@@ -258,40 +258,56 @@ export function MobileToolbar(props: {
       return;
     }
     const surface = surfaceCanvasForInput(target);
-    if (!surface) return;
-    // Wayland paste is a native Ctrl+V chord. Dispatch it from this genuine
-    // click so the surface's clipboard read retains transient activation.
-    surface.setCtrlModifier(false);
-    surface.setAltModifier(false);
-    target.dispatchEvent(
-      new KeyboardEvent("keydown", {
-        key: "Control",
-        code: "ControlLeft",
-        ctrlKey: true,
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
-    for (const type of ["keydown", "keyup"] as const) {
+    if (surface) {
+      // Wayland paste is a native Ctrl+V chord. Dispatch it from this genuine
+      // click so the surface's clipboard read retains transient activation.
+      surface.setCtrlModifier(false);
+      surface.setAltModifier(false);
       target.dispatchEvent(
-        new KeyboardEvent(type, {
-          key: "v",
-          code: "KeyV",
+        new KeyboardEvent("keydown", {
+          key: "Control",
+          code: "ControlLeft",
           ctrlKey: true,
           bubbles: true,
           cancelable: true,
         }),
       );
+      for (const type of ["keydown", "keyup"] as const) {
+        target.dispatchEvent(
+          new KeyboardEvent(type, {
+            key: "v",
+            code: "KeyV",
+            ctrlKey: true,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      }
+      target.dispatchEvent(
+        new KeyboardEvent("keyup", {
+          key: "Control",
+          code: "ControlLeft",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      target.focus();
+      return;
     }
-    target.dispatchEvent(
-      new KeyboardEvent("keyup", {
-        key: "Control",
-        code: "ControlLeft",
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
-    target.focus();
+    if (target.closest(".cm-editor")) {
+      // CodeMirror editor: read the host clipboard and insert at the cursor.
+      // A real click gives us the user activation that iOS Safari requires.
+      void (async () => {
+        let text: string;
+        try {
+          text = await navigator.clipboard.readText();
+        } catch {
+          return;
+        }
+        target.focus();
+        document.execCommand("insertText", false, text);
+      })();
+    }
   };
 
   const toggleCtrl = () => {

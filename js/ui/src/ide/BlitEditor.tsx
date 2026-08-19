@@ -1421,6 +1421,28 @@ export function BlitEditor(props: {
                 return false;
               },
             },
+            {
+              // Paste from the compositor's selection when a Wayland surface
+              // owns it. The browser mirror can be denied, in which case the
+              // host clipboard would paste stale content without this path.
+              key: "Mod-v",
+              run: () => {
+                if (props.preview) return false;
+                const conn = props.workspace.getConnection(props.connectionId);
+                if (!conn?.usesWaylandClipboard()) return false;
+                void (async () => {
+                  const text = await conn.readWaylandClipboardText();
+                  if (!text || !view) return;
+                  view.dispatch({
+                    changes: {
+                      from: view.state.selection.main.head,
+                      insert: text,
+                    },
+                  });
+                })();
+                return true;
+              },
+            },
             // Tab accepts an open completion (Enter already does, via
             // the completion keymap); with no popup it falls through to
             // indentWithTab.

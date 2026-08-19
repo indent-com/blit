@@ -4,6 +4,7 @@ import { surfaceAssignment } from "../bsp/layout";
 import {
   createMacDeadKeyHandler,
   hasFocusedWaylandSurface,
+  isCodeMirrorInputTarget,
   isSwitcherShortcut,
   nextCycleTarget,
   shouldHandleNewTerminalShortcut,
@@ -381,5 +382,32 @@ describe("nextCycleTarget", () => {
   it("has nothing to move to when the ring is empty", () => {
     expect(nextCycleTarget([], null, 1)).toBeNull();
     expect(nextCycleTarget(ring, null, 1, new Set(ring))).toBeNull();
+  });
+});
+
+describe("isCodeMirrorInputTarget", () => {
+  it("recognises CodeMirror 6's contenteditable as an input target", () => {
+    const editor = document.createElement("div");
+    editor.className = "cm-editor";
+    const content = document.createElement("div");
+    content.className = "cm-content";
+    content.setAttribute("contenteditable", "true");
+    editor.append(content);
+    document.body.append(editor);
+    try {
+      expect(isCodeMirrorInputTarget(content)).toBe(true);
+    } finally {
+      editor.remove();
+    }
+  });
+
+  it("does not treat arbitrary elements as CodeMirror input targets", () => {
+    const div = document.createElement("div");
+    document.body.append(div);
+    try {
+      expect(isCodeMirrorInputTarget(div)).toBe(false);
+    } finally {
+      div.remove();
+    }
   });
 });

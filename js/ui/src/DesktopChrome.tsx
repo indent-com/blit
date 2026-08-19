@@ -1371,6 +1371,15 @@ export function DesktopChrome(props: {
   const [bellOpen, setBellOpen] = createSignal(false);
   const [trayOpen, setTrayOpen] = createSignal(false);
   const [menu, setMenu] = createSignal<MenuState | null>(null);
+  /**
+   * Tracks an explicit `openMenu` request so a menu update from the server is
+   * only shown when the user asked for it. Without this, clicking a menu item
+   * closes the menu but the application's own menu refresh (e.g. updating a
+   * checkmark) arrives a moment later and reopens it.
+   */
+  const [pendingMenuKey, setPendingMenuKey] = createSignal<string | null>(null);
+  const menuKey = (connectionId: string, trayId: number) =>
+    `${connectionId}:${trayId}`;
   const [permission, setPermission] = createSignal<NotificationPermission>(
     typeof Notification === "undefined" ? "denied" : Notification.permission,
   );
@@ -1543,10 +1552,21 @@ export function DesktopChrome(props: {
               candidate.connectionId === snapshot.id &&
               candidate.item.trayId === next.trayId,
           );
+          const key = menuKey(snapshot.id, next.trayId);
+          const expecting = pendingMenuKey();
+          const current = menu();
           if (next.status === TRAY_MENU_OK && entry) {
-            setMenu({ entry, menu: next });
+            if (
+              expecting === key ||
+              (current?.entry.connectionId === snapshot.id &&
+                current.entry.item.trayId === next.trayId)
+            ) {
+              setMenu({ entry, menu: next });
+            }
+            if (expecting === key) setPendingMenuKey(null);
           } else if (next.status !== TRAY_MENU_OK) {
             setMenu(null);
+            if (expecting === key) setPendingMenuKey(null);
           }
         }),
       );
@@ -1589,6 +1609,7 @@ export function DesktopChrome(props: {
     if (entry.readOnly) return;
     setTrayOpen(false);
     setBellOpen(false);
+    setPendingMenuKey(menuKey(entry.connectionId, entry.item.trayId));
     props.workspace
       .getConnection(entry.connectionId)
       ?.desktopStore.openMenu(
@@ -1615,6 +1636,7 @@ export function DesktopChrome(props: {
         setBellOpen(false);
         setTrayOpen(false);
         setMenu(null);
+        setPendingMenuKey(null);
       }
     };
     const key = (event: KeyboardEvent) => {
@@ -1622,6 +1644,7 @@ export function DesktopChrome(props: {
       setBellOpen(false);
       setTrayOpen(false);
       setMenu(null);
+      setPendingMenuKey(null);
     };
     const worker = (event: MessageEvent) => {
       const data = event.data as {
@@ -1786,6 +1809,7 @@ export function DesktopChrome(props: {
           setBellOpen(false);
           setTrayOpen(false);
           setMenu(null);
+          setPendingMenuKey(null);
         }}
       />
       <For each={visibleTray().slice(0, props.compact ? 0 : 4)}>
@@ -1980,6 +2004,7 @@ export function DesktopChrome(props: {
                     id,
                   );
                 setMenu(null);
+                setPendingMenuKey(null);
               }}
             />
           </Popup>

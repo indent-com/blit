@@ -179,7 +179,7 @@ import {
   toggleServerRoot,
   reorderServerRoots,
 } from "./ide/rootsStore";
-import { ensureSessionCatalog } from "./sessionCatalogs";
+import { ensureSessionCatalog, startApplication } from "./sessionCatalogs";
 import { useIdeSession, type IdeSessionDescriptor } from "./ide/session";
 import {
   currentSourceSessionForPty,
@@ -606,6 +606,28 @@ function WorkspaceScreen(props: {
       const prev = untrack(() => surfaces());
       if (!anyChanged && prev.length === all.length) return;
       setSurfaces(all);
+
+      // If the user just started an app from the switcher, place its new
+      // surface into the active panel as soon as it appears.
+      const pending = untrack(() => pendingAppStart());
+      if (pending) {
+        const prevKey = (s: BlitSurface) => `${s.connectionId}:${s.surfaceId}`;
+        const prevKeys = new Set(prev.map(prevKey));
+        const match = all.find(
+          (s) =>
+            s.connectionId === pending.connectionId &&
+            s.appId === pending.appId &&
+            !prevKeys.has(prevKey(s)),
+        );
+        if (match) {
+          if (pendingAppStartTimer) {
+            clearTimeout(pendingAppStartTimer);
+            pendingAppStartTimer = undefined;
+          }
+          setPendingAppStart(null);
+          focusSurface(match.surfaceId, match.connectionId);
+        }
+      }
     };
     for (const spec of props.connectionSpecs()) {
       const conn = workspace.getConnection(spec.id);
@@ -1188,7 +1210,11 @@ function WorkspaceScreen(props: {
   // it is what the software keyboard has to rest on — the canvas itself is
   // not editable and an IME will not stay up for it.
   const surfaceInputSelector = 'textarea[aria-label="Surface input"]';
-  const keyboardInputSelector = `${terminalInputSelector}, ${surfaceInputSelector}`;
+  // CodeMirror 6's focused contenteditable. Including it lets the mobile
+  // toolbar's paste button reach the editor and lets hide-keyboard blur the
+  // right element instead of falling back to a different pane's textarea.
+  const editorInputSelector = '.cm-content[contenteditable="true"]';
+  const keyboardInputSelector = `${terminalInputSelector}, ${surfaceInputSelector}, ${editorInputSelector}`;
 
   // The software keyboard rises only from the status-bar toggle, never from a
   // tap: while it isn't wanted, every terminal and surface textarea carries
@@ -1268,12 +1294,16 @@ function WorkspaceScreen(props: {
       focusable(
         focusedPane?.querySelector<HTMLElement>(surfaceInputSelector),
       ) ??
+      focusable(focusedPane?.querySelector<HTMLElement>(editorInputSelector)) ??
       [
         ...document.querySelectorAll<HTMLElement>(
           `section ${terminalInputSelector}`,
         ),
         ...document.querySelectorAll<HTMLElement>(
           `section ${surfaceInputSelector}`,
+        ),
+        ...document.querySelectorAll<HTMLElement>(
+          `section ${editorInputSelector}`,
         ),
       ].find((el) => focusable(el)) ??
       null
@@ -1630,6 +1660,29 @@ function WorkspaceScreen(props: {
   /** Is this window still asking? Read by every mark there is. */
   const hasAttention = (assignment: string) =>
     pendingAttention().has(assignment);
+
+  /**
+   * An application the user just started from the switcher. The surface it
+   * opens is not known until the server creates it, so we watch the surface
+   * list for the first new surface with a matching appId on this connection
+   * and place it in the active panel.
+   */
+  type PendingAppStart = { connectionId: ConnectionId; appId: string };
+  const [pendingAppStart, setPendingAppStart] =
+    createSignal<PendingAppStart | null>(null);
+  let pendingAppStartTimer: ReturnType<typeof setTimeout> | undefined;
+  function startAppFromSwitcher(connectionId: ConnectionId, appId: string) {
+    if (pendingAppStartTimer) clearTimeout(pendingAppStartTimer);
+    startApplication(connectionId, appId);
+    setPendingAppStart({ connectionId, appId });
+    // If the surface never appears, don't leave this hanging forever.
+    pendingAppStartTimer = setTimeout(() => {
+      pendingAppStartTimer = undefined;
+      setPendingAppStart((cur) =>
+        cur?.connectionId === connectionId && cur?.appId === appId ? null : cur,
+      );
+    }, 30_000);
+  }
 
   /** Set or clear the focused surface, always keeping the connectionId
    *  in sync so the BSP view uses the correct connection.
@@ -2139,7 +2192,7 @@ function WorkspaceScreen(props: {
     }
   });
 
-  const offScreenSurfaces = createMemo(() => {
+  const offScreenSurfaces = createMemo<BlitSurface[]>((prev) => {
     // A tile covers the main view (it is drawn ahead of the focused surface),
     // so the surface underneath is off-screen and belongs in the panel — the
     // same rule the sessions memo below applies to a displaced terminal.
@@ -2157,9 +2210,9 @@ function WorkspaceScreen(props: {
     const la = layoutAssignments();
     if (al) {
       // While layoutAssignments hasn't been reported yet (null during
-      // initialization or layout switch), treat all surfaces as assigned
-      // to avoid showing them in both BSP panes and the side panel.
-      if (!la) return [];
+      // initialization or layout switch), keep the previous list rather than
+      // flashing the panel empty (or showing every surface) for one frame.
+      if (!la) return prev ?? [];
     }
     const inPane = new Set<string>();
     if (la) {
@@ -2220,15 +2273,15 @@ function WorkspaceScreen(props: {
   const mainViewSessionId = () =>
     mainTerminalParked() ? null : wsState().focusedSessionId;
 
-  const offScreenSessions = createMemo(() => {
+  const offScreenSessions = createMemo<BlitSession[]>((prev) => {
     const al = activeLayout();
     const la = layoutAssignments();
     const sess = sessions();
     if (al) {
       // While layoutAssignments hasn't been reported yet (null during
-      // initialization or layout switch), treat all sessions as assigned
-      // to avoid flashing every terminal in the side panel.
-      if (!la) return [];
+      // initialization or layout switch), keep the previous list rather than
+      // flashing the panel empty (or showing every terminal) for one frame.
+      if (!la) return prev ?? [];
       const assigned = new Set<SessionId>(
         Object.values(la.assignments).filter(
           (id): id is SessionId => id != null && !isSurfaceAssignment(id),
@@ -5066,6 +5119,7 @@ function WorkspaceScreen(props: {
                 restoreTile(assignment);
                 closeOverlay();
               }}
+              onStartApplication={startAppFromSwitcher}
               fileSearchLocal={(q) => {
                 const s = activeSession();
                 const root = s?.root() ?? "";
