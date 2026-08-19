@@ -23,7 +23,7 @@ flowchart LR
   S["muster/blit/*.json (stack)"] --> M[muster]
   I["muster/{main,epic}.json (instances)"] --> M
   E[".env files"] -->|FS_READ| M
-  M -->|"CREATE2 (argv+env+cwd)"| P["PTYs, tag muster/&lt;unit&gt;@&lt;instance&gt;/&lt;seq&gt;"]
+  M -->|"CREATE2 (argv+env+cwd)"| P["PTYs, tag muster/tag muster/&lt;unit&gt;@&lt;instance&gt;/&lt;seq&gt;lt;instancetag muster/&lt;unit&gt;@&lt;instance&gt;/&lt;seq&gt;gt;/tag muster/&lt;unit&gt;@&lt;instance&gt;/&lt;seq&gt;lt;unittag muster/&lt;unit&gt;@&lt;instance&gt;/&lt;seq&gt;gt;/tag muster/&lt;unit&gt;@&lt;instance&gt;/&lt;seq&gt;lt;seqtag muster/&lt;unit&gt;@&lt;instance&gt;/&lt;seq&gt;gt;"]
   M -->|KILL / CLOSE| P
   P -->|S2C_EXITED / TERM_SINCE| M
   M --> J["journal (ring + KV tail)"]
@@ -71,8 +71,8 @@ journal that answers "why is this not running"; survive `blit ext update`.
     stack.json             parameter declarations (reserved name, not a unit)
     server.json            a template
     gateway.json
-  main.json              instance of blit → server@main, gateway@main
-  epic.json              instance of blit → server@epic, gateway@epic
+  main.json              instance of blit → main/server, main/gateway
+  epic.json              instance of blit → epic/server, epic/gateway
 ```
 
 Resolved like `blit_config_dir()` (`$XDG_CONFIG_HOME`, else `$HOME/.config`),
@@ -203,9 +203,12 @@ An instance binds them:
 | `omit` | templates to skip; anything `requires`-ing an omitted unit fails to load, by name |
 | `autostart` | default `true`; `false` holds the whole instance |
 
-Units are `<template>@<instance>`. Inside a stack, `requires`/`wants`/`after`
-name templates unqualified and always resolve within the same instance — a stack
-is self-contained, with no syntax for reaching out of one.
+Units are `<instance>/<template>`, which reads as the path it is: the instance
+groups, the template names. It sorts every unit of an instance together, and it
+cannot collide with a plain unit, whose name is a filename and so carries no
+separator. Inside a stack, `requires`/`wants`/`after` name templates
+unqualified and always resolve within the same instance — a stack is
+self-contained, with no syntax for reaching out of one.
 
 ### Definitions that live somewhere else
 
@@ -226,8 +229,8 @@ There is no third syntax, and a subdirectory name containing a slash never meant
 anything.
 
 The two pointers differ in **naming**, which is the only thing that
-distinguishes them and the reason both exist. An instance suffixes —
-`server@epic` — which is what one stack running once per worktree wants. An
+distinguishes them and the reason both exist. An instance qualifies —
+`epic/server` — which is what one stack running once per worktree wants. An
 `include` does not: its units keep their own names, as though the files sat in
 the configuration directory. Two includes offering one name is therefore
 ambiguous rather than mergeable: first writer wins, `doctor` names both files,
@@ -405,7 +408,7 @@ blit @muster start epic
 
 `auto` took 10010 because 10000–10003 were spoken for, and wrote `10010` into
 `epic.json`. Its gateway is `:10011`, its socket
-`/tmp/blit-dev-epic.sock`, its terminals `server@epic` and so on in every
+`/tmp/blit-dev-epic.sock`, its terminals `epic/server` and so on in every
 client's catalog.
 
 Not everything wants a stack: a `postgres`/`migrate`/`api`/`stripe` set at top
@@ -525,11 +528,11 @@ Supervision events, not output: output is the terminal, and `blit terminal
 journal <pty>` already reads it with exit codes and sequence cursors.
 
 ```json
-{ "seq": 42, "ts": 1755600000180, "unit": "gateway@epic", "instance": "epic",
+{ "seq": 42, "ts": 1755600000180, "unit": "epic/gateway", "instance": "epic",
   "event": "spawn", "phase": "activating", "pty": 7,
   "detail": "./target/profiling/blit gateway",
   "envFiles": ["/src/blit/.claude/worktrees/epic/.env.local"], "envKeys": 9 }
-{ "seq": 44, "ts": 1755600310114, "unit": "gateway@epic", "event": "exit",
+{ "seq": 44, "ts": 1755600310114, "unit": "epic/gateway", "event": "exit",
   "phase": "backoff", "pty": 7, "exitCode": 101, "reason": "normal",
   "detail": "retry 1 in 250ms" }
 ```
@@ -551,7 +554,7 @@ journal <pty>` already reads it with exit codes and sequence cursors.
 `cause` ∈ `autostart`, `dependency:<unit>`, `command`, `file`, `crash`,
 `policy`, `adopt`. The question the journal answers is "who asked for this", and
 free text does not answer it reliably. Records carry `instance`, so
-`@muster log -u @epic` is a filter, not a grep.
+`@muster log -u epic` is a filter, not a grep.
 
 **Environment values never appear.** `spawn` names the files and counts keys —
 enough to diagnose "it did not pick up my `.env`", not enough to leak.
@@ -577,9 +580,9 @@ and the state is small.
 { "type": "hello", "version": 1, "dir": "/home/…/.config/blit/muster" }
 { "type": "state",
   "instances": [ { "name": "epic", "stack": "blit", "ready": 0, "total": 7 } ],
-  "units": [ { "name": "gateway@epic", "instance": "epic", "phase": "running",
+  "units": [ { "name": "epic/gateway", "instance": "epic", "phase": "running",
     "pty": 7, "since": 1755600004902, "restarts": 1, "lastExit": 101,
-    "requires": ["build@epic", "server@epic"] } ] }
+    "requires": ["epic/build", "epic/server"] } ] }
 { "type": "event", "record": { … } }
 ```
 
@@ -617,12 +620,12 @@ $ blit @muster list
 NAME              PHASE     PTY  SINCE  RESTARTS  DESCRIPTION
 postgres          running   4    3h     0         Postgres for the dev stack
 main              —         -    41m    1         blit, 8/8 ready
-  server@main     running   6    40m    1         blit server (main)
-  gateway@main    running   7    40m    0         Gateway on :10001 (main)
+  main/server     running   6    40m    1         blit server (main)
+  main/gateway    running   7    40m    0         Gateway on :10001 (main)
 epic              —         -    -      0         blit, 0/7 ready, held
 
-$ blit @muster status gateway@epic
-unit         gateway@epic
+$ blit @muster status epic/gateway
+unit         epic/gateway
 phase        backoff
 pty          19       started 4s ago
 runs         18       exit 101   ran 5m12s   ended 4s ago
