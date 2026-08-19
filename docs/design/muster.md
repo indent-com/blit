@@ -198,7 +198,7 @@ An instance binds them:
 
 | field | meaning |
 | --- | --- |
-| `stack` | subdirectory to instantiate; its presence makes this file an instance |
+| `stack` | subdirectory **or path** to instantiate; its presence makes this file an instance |
 | `vars` | one per declared parameter; undeclared or missing-required fails the instance |
 | `omit` | templates to skip; anything `requires`-ing an omitted unit fails to load, by name |
 | `autostart` | default `true`; `false` holds the whole instance |
@@ -206,6 +206,54 @@ An instance binds them:
 Units are `<template>@<instance>`. Inside a stack, `requires`/`wants`/`after`
 name templates unqualified and always resolve within the same instance — a stack
 is self-contained, with no syntax for reaching out of one.
+
+### Definitions that live somewhere else
+
+A dev stack belongs in the repository it starts, not in a copy under
+`~/.config/blit` that drifts from it. So `stack` also accepts a path, and the
+configuration directory holds a six-line pointer:
+
+```json
+// epic.json — instantiates a stack from a worktree
+{ "stack": "/src/blit/.claude/worktrees/epic/.blit/muster", "vars": { "PORTS": 10010 } }
+
+// work.json — adopts a directory of ordinary units
+{ "include": "~/work/units" }
+```
+
+A bare word is a subdirectory; anything with a `/` or a leading `~` is a path.
+There is no third syntax, and a subdirectory name containing a slash never meant
+anything.
+
+The two pointers differ in **naming**, which is the only thing that
+distinguishes them and the reason both exist. An instance suffixes —
+`server@epic` — which is what one stack running once per worktree wants. An
+`include` does not: its units keep their own names, as though the files sat in
+the configuration directory. Two includes offering one name is therefore
+ambiguous rather than mergeable: first writer wins, `doctor` names both files,
+and `omit` resolves it. An included directory holds units only; naming a stack
+is what the other pointer is for.
+
+`${STACK_DIR}` is the stack's own directory, and a relative `cwd` or `envFile`
+in a template resolves against it. A stack at `<repo>/.blit/muster/` therefore
+reaches its checkout with `"cwd": "../.."` and needs no `ROOT` parameter.
+
+**Discovery never leaves the configuration directory.** Muster does not look for
+`.blit/muster` in a repository, a cwd, or any ancestor: cloning a repository and
+starting a server must not run its code. The pointer is an act someone took, and
+it is the same act that already granted arbitrary execution — so this adds
+reach, not privilege. What it does add is that **a branch switch changes what a
+template says**, since the file is written by `git checkout` rather than by you,
+and `restartOnChange` is on by default.
+
+Each distinct external directory costs one `FS_SYNC`, shared between pointers
+naming the same one and stopped when the last pointer goes away. A root added
+mid-load is empty until its own updates arrive, which triggers another load — so
+a new pointer costs one extra pass, not a missing stack.
+
+Rejected: a `BLIT_MUSTER_PATH` of search roots, and auto-discovery from a cwd.
+The first needs a cross-root naming scheme and a server restart to change; the
+second is the one shape that turns cloning a repository into running it.
 
 ### Substitution
 
@@ -687,6 +735,13 @@ fallback is a hand-rolled parser and a worse `doctor`, not a worse format.
   protocol reaches that directory (`FS_WRITE`, `FS_UPLOAD`), which is also how
   `instantiate` works. `BLIT_FS_WRITE=0` closes it, at the cost of
   `instantiate`/`remove`.
+- A pointer extends that reach to a directory outside, but not the privilege:
+  writing the pointer is the same act, and only someone who could already run
+  anything can perform it. What it does introduce is a **second writer** —
+  `git checkout` — so a branch switch changes what a template says without
+  anyone editing a file. Muster therefore never discovers a stack from a cwd or
+  a repository layout; a pointer has to exist. Treat an external stack as code
+  you have read, on the branches you run.
 - Env files are expected to hold secrets. They reach the child as `envp` and
   nowhere else: not a command line, not `/proc/<pid>/cmdline`, not written to
   disk by muster, not journaled, not in `status`, not on the channel, not in
