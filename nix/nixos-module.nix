@@ -35,6 +35,32 @@ let
     lib.optional (gpuLibSearchPath != "") gpuLibSearchPath
     ++ lib.optional cfg.audio.enable audioLibSearchPath
   );
+
+  # `XDG_DATA_DIRS` for the server unit, which is where the list of installed
+  # applications comes from: the `session` extension asks the server for its
+  # environment (`ENV_GET`) and scans `$XDG_DATA_DIRS/*/applications` for
+  # `.desktop` files (extensions/session/src/main.rs). A unit inherits none of
+  # the login environment, so without this the extension falls back to the
+  # spec's default of `/usr/local/share:/usr/share` — neither of which exists on
+  # NixOS — and the only applications anyone can launch are whatever happens to
+  # be under `~/.local/share/applications`. Everything installed through a Nix
+  # profile is invisible.
+  #
+  # `environment.profiles` is the same list `/etc/profile` turns into
+  # `XDG_DATA_DIRS` for an interactive shell, so a session sees the applications
+  # its user would see on the console, in the same precedence order, including
+  # whatever other modules (Flatpak) have added.
+  userDataDirs =
+    user:
+    let
+      home = lib.attrByPath [ user "home" ] "/home/${user}" config.users.users;
+      # systemd does no shell expansion in `Environment=`, so a profile written
+      # in terms of another variable would land as a literal and resolve to
+      # nothing. Drop those rather than ship a root that cannot exist.
+      resolvable = lib.filter (profile: !(lib.hasInfix "\${" profile)) config.environment.profiles;
+      dataDir = profile: lib.replaceStrings [ "$HOME" "$USER" ] [ home user ] profile + "/share";
+    in
+    lib.concatMapStringsSep ":" dataDir resolvable;
 in
 {
   options.services.blit = {
@@ -437,6 +463,7 @@ in
                 ++ [
                   "BLIT_SCROLLBACK=${toString cfg.scrollback}"
                 ]
+                ++ lib.optional (userDataDirs user != "") "XDG_DATA_DIRS=${userDataDirs user}"
                 ++ lib.optional (serverLibSearchPath != "") "LD_LIBRARY_PATH=${serverLibSearchPath}"
                 ++ lib.optionals cfg.audio.enable [
                   "BLIT_AUDIO=1"

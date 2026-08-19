@@ -38,6 +38,11 @@ Three server features do the work, none of which the extension could fake:
 
 - **`ENV_GET`** answers with the server's environment, which is the only way a
   Wasm guest can learn `XDG_DATA_DIRS` and so find installed applications at all.
+  A server started from a unit inherits none of the login environment, so an
+  operator has to put `XDG_DATA_DIRS` there or the roots collapse to the spec's
+  `/usr/local/share:/usr/share` — absent on NixOS — plus `~/.local/share`. The
+  catalog then looks populated while everything installed through a package
+  manager is missing (`nix/nixos-module.nix` sets it from `environment.profiles`).
 - **`APP_SOCKET`** mints a Wayland socket dedicated to one application and tells
   the compositor that everything arriving on it belongs to that application. The
   socket is bound before the reply is sent, so the application can be spawned the
