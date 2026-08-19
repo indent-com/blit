@@ -61,10 +61,11 @@ export function ManageTile(props: {
   /** The connection is an `.ro` share: the client-control family never
    *  answers through the forwarder, so the clients tab must not be offered. */
   readOnly?: boolean;
-  /** Read-only thumbnail (the background dock). It draws the heading and the
-   *  tab the tile is on, never the panel under it — a parked tile that kept its
-   *  client watch and unit table alive would cost a per-second catalog for a
-   *  picture nobody is reading. */
+  /** Read-only thumbnail. The dock draws no body at all for a manage card —
+   *  its title carries the server and the tab (`tileDisplay`) — so this is the
+   *  floor rather than the case: whatever mounts a preview gets the heading and
+   *  none of the panels, which would otherwise run a per-second client catalog
+   *  and a unit table behind a picture nobody is reading. */
   preview?: boolean;
 }) {
   const snapshot = createBlitWorkspaceState(props.workspace);
@@ -134,29 +135,26 @@ export function ManageTile(props: {
         />
       </SectionHeading>
 
-      <Show
-        when={connection()?.status === "connected"}
-        fallback={
-          // The thumbnail's pill already says disconnected; the invitation is
-          // for the pane, where there is somewhere to act on it.
-          <Show when={!props.preview}>
+      <Show when={!props.preview}>
+        <Show
+          when={connection()?.status === "connected"}
+          fallback={
             <PanelEmpty theme={props.theme} scale={props.scale}>
               Connect to this remote to manage it.
             </PanelEmpty>
-          </Show>
-        }
-      >
-        <ConnectionPanels
-          workspace={props.workspace}
-          connectionId={props.connectionId}
-          palette={props.palette}
-          fontSize={props.fontSize}
-          sessions={sessions()}
-          surfaces={surfaces()}
-          canListClients={canListClients()}
-          canManageExtensions={connection()?.supportsExtensions === true}
-          preview={props.preview}
-        />
+          }
+        >
+          <ConnectionPanels
+            workspace={props.workspace}
+            connectionId={props.connectionId}
+            palette={props.palette}
+            fontSize={props.fontSize}
+            sessions={sessions()}
+            surfaces={surfaces()}
+            canListClients={canListClients()}
+            canManageExtensions={connection()?.supportsExtensions === true}
+          />
+        </Show>
       </Show>
     </div>
   );

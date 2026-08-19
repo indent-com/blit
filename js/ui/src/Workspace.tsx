@@ -315,9 +315,7 @@ function getHmrWorkspace(
   leaseOwner: object,
 ): HmrWorkspaceData {
   const raw = import.meta.hot?.data?.workspace as
-    | HmrWorkspaceData
-    | BlitWorkspace
-    | undefined;
+    HmrWorkspaceData | BlitWorkspace | undefined;
   // Accept the raw BlitWorkspace stored by versions before HmrWorkspaceData.
   const prev = raw && "workspace" in raw ? raw.workspace : raw;
   const previousOwner = raw && "workspace" in raw ? raw.owner : null;
@@ -3599,8 +3597,7 @@ function WorkspaceScreen(props: {
 
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
-    | ((sessionId: SessionId, targetPaneId: string) => void)
-    | null = null;
+    ((sessionId: SessionId, targetPaneId: string) => void) | null = null;
   let moveToPaneFn:
     | ((value: string, targetPaneId: string, fromPaneId?: string) => void)
     | null = null;
@@ -4830,7 +4827,9 @@ function WorkspaceScreen(props: {
               backgroundEditors={
                 <For each={backgroundTiles()}>
                   {(assignment, index) => {
-                    const d = tileDisplay(assignment);
+                    // Re-read, not read once: a manage tile's title carries the
+                    // tab its panels are on, which changes under the card.
+                    const d = () => tileDisplay(assignment);
                     const web = parseWebAssignment(assignment);
                     return (
                       // The same card parked terminals and surfaces get:
@@ -4864,9 +4863,9 @@ function WorkspaceScreen(props: {
                                 "font-size": `${chromeScale().sm}px`,
                               }}
                             >
-                              {d.title}
+                              {d().title}
                             </span>
-                            <Show when={d.subtitle}>
+                            <Show when={d().subtitle}>
                               <span
                                 style={{
                                   "white-space": "nowrap",
@@ -4877,7 +4876,7 @@ function WorkspaceScreen(props: {
                                   opacity: 0.6,
                                 }}
                               >
-                                {d.subtitle}
+                                {d().subtitle}
                               </span>
                             </Show>
                           </span>
@@ -4889,7 +4888,19 @@ function WorkspaceScreen(props: {
                           // mounted preview editor holds an fs sync and a web
                           // preview holds an iframe, so both are budgeted
                           // (LIVE_DOCK_PREVIEWS).
-                          <Show when={index() < LIVE_DOCK_PREVIEWS}>
+                          //
+                          // A manage tile has no picture worth taking: its
+                          // panels are lists of text at a size nobody can read,
+                          // and mounting them to draw that would run a client
+                          // catalog every second behind the card. Its title
+                          // says which server and which tab, which is the whole
+                          // of what the card is picked by.
+                          <Show
+                            when={
+                              index() < LIVE_DOCK_PREVIEWS &&
+                              d().kind !== "manage"
+                            }
+                          >
                             <div
                               style={{
                                 position: "relative",

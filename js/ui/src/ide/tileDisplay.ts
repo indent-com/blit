@@ -3,6 +3,7 @@ import {
   parseDiffArg,
   parseWebAssignment,
 } from "../bsp/layout";
+import { shownTab, TAB_LABELS } from "../connectionTab";
 import { webLocationLabel } from "../preview";
 
 function baseName(p: string): string {
@@ -43,13 +44,20 @@ export function tileDisplay(assignment: string): {
       subtitle: staged ? "Diff · staged" : "Diff",
     };
   }
-  // A manage tile's whole address is its connection, and the panels inside it
-  // are named by their own tabs — so the card says which server, not which tab.
+  // A manage tile's whole address is its connection, so the title carries the
+  // whole card: "dev:manage > Session". The tab is the half a card is picked
+  // by — this server's is on Session because an application is starting, that
+  // one's is on systemd — and there is nowhere else to say it: the panels are
+  // unmounted while the tile is parked, and drawing them for a thumbnail would
+  // put a per-second client catalog behind a picture nobody can read. Absent
+  // until they have resolved a tab, which only they can do, so a tile that has
+  // never been opened says which server and stops.
   if (parsed.kind === "manage") {
+    const tab = shownTab(parsed.connectionId);
     return {
       kind: "manage",
-      title: parsed.connectionId,
-      subtitle: "Manage",
+      title: `${parsed.connectionId}:manage${tab ? ` > ${TAB_LABELS[tab]}` : ""}`,
+      subtitle: "",
     };
   }
   if (parsed.kind === "commit") {
