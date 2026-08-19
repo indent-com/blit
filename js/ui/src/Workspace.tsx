@@ -239,6 +239,7 @@ import {
   parseDiffArg,
   parseSurfaceAssignment,
   editorAssignment,
+  manageAssignment,
   layoutFromDSL,
   leafCount,
   loadFocusedTileFromHash,
@@ -463,6 +464,11 @@ function WorkspaceScreen(props: {
     const s = wsState().sessions.find((x) => x.id === sessionId);
     return !!s && readOnlyConnections().has(s.connectionId);
   };
+  /** The same answer about a whole connection, which is what a manage tile
+   *  needs: read-only shares drop the client-control family, so its clients
+   *  panel must not be offered rather than sit unanswered. */
+  const isConnectionReadOnly = (connectionId: string): boolean =>
+    readOnlyConnections().has(connectionId as ConnectionId);
 
   const focusedSession = () => {
     const snap = wsState();
@@ -874,6 +880,9 @@ function WorkspaceScreen(props: {
     if (typeof assign === "string" && isTileAssignment(assign)) {
       const t = parseTileAssignment(assign);
       if (t) {
+        // A manage tile is a server's panels, not a place in a filesystem: it
+        // has no root to anchor on, so the last one sticks.
+        if (t.kind === "manage") return null;
         if (t.kind === "commit") {
           const repoPath = t.arg.slice(t.arg.indexOf(":") + 1);
           return {
@@ -4688,6 +4697,7 @@ function WorkspaceScreen(props: {
                               fontFamily={resolvedFontWithFallback()}
                               fontSize={fontSize()}
                               onOpenTile={openTile}
+                              isConnectionReadOnly={isConnectionReadOnly}
                             />
                           </div>
                         )}
@@ -4718,6 +4728,7 @@ function WorkspaceScreen(props: {
                     onLayoutChange={setBspLayout}
                     connectionId={activeConnectionId()}
                     isSessionReadOnly={isSessionReadOnly}
+                    isConnectionReadOnly={isConnectionReadOnly}
                     connectionLabels={connectionLabels()}
                     palette={palette()}
                     fontFamily={resolvedFontWithFallback()}
@@ -4901,6 +4912,7 @@ function WorkspaceScreen(props: {
                                       Math.round(fontSize() * 0.6),
                                     )}
                                     onOpenTile={openTile}
+                                    isConnectionReadOnly={isConnectionReadOnly}
                                     preview
                                   />
                                 }
@@ -5177,10 +5189,12 @@ function WorkspaceScreen(props: {
               onReconnect={(name) => workspace.reconnectConnection(name)}
               onClose={closeOverlay}
               connections={allConnections()}
-              workspace={workspace}
-              sessions={wsState().sessions}
-              surfaces={surfaces()}
-              readOnlyConnections={readOnlyConnections()}
+              onManage={(name) => {
+                // The panels are a tile, so the dialog that asked for them is
+                // in the way once they exist.
+                closeOverlay();
+                openTile(manageAssignment(name));
+              }}
             />
           )}
         </Show>

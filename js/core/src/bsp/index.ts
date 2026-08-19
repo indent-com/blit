@@ -24,6 +24,7 @@ export {
   diffAssignment,
   parseDiffArg,
   commitAssignment,
+  manageAssignment,
   isTileAssignment,
   parseTileAssignment,
   webAssignment,

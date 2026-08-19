@@ -73,6 +73,7 @@ const EDITOR_PREFIX = "editor:";
 const DIFF_PREFIX = "diff:";
 const COMMIT_PREFIX = "commit:";
 const PREVIEW_PREFIX = "preview:";
+const MANAGE_PREFIX = "manage:";
 
 /** BSP assignment for an editor tile: "editor:<connectionId>:<path>". */
 export function editorAssignment(connectionId: string, path: string): string {
@@ -127,6 +128,21 @@ export function parseDiffArg(arg: string): {
   return { side: "unstaged", staged: false, path: arg };
 }
 
+/** BSP assignment for a server's own panels — what its session supervisor
+ *  runs, who is connected, its units, its extensions: "manage:<connectionId>:".
+ *
+ *  The trailing colon is not decoration: `parseTileAssignment` splits on the
+ *  first ":" after the prefix, and a manage tile has nothing to say after its
+ *  connection. Keeping the shape means every kind-agnostic path (the hash
+ *  writer, the tab registry, drop handling) treats it like any other tile.
+ *
+ *  There is one per connection by construction, so opening Manage twice lands
+ *  on the same tile rather than accumulating panels that each hold a live
+ *  client watch. */
+export function manageAssignment(connectionId: string): string {
+  return `${MANAGE_PREFIX}${connectionId}:`;
+}
+
 /** BSP assignment for a commit tile: "commit:<connectionId>:<oid>:<repoPath>".
  *  `oid` is hex (no ":"), so the first ":" of the arg splits oid from repo. */
 export function commitAssignment(
@@ -137,14 +153,16 @@ export function commitAssignment(
   return `${COMMIT_PREFIX}${connectionId}:${oid}:${repoPath}`;
 }
 
-/** True when the assignment is an editor/diff/commit tile (not a session). */
+/** True when the assignment is an editor/diff/commit/manage tile (not a
+ *  session). */
 export function isTileAssignment(value: string | null): boolean {
   return (
     value != null &&
     (value.startsWith(EDITOR_PREFIX) ||
       value.startsWith(DIFF_PREFIX) ||
       value.startsWith(COMMIT_PREFIX) ||
-      value.startsWith(PREVIEW_PREFIX))
+      value.startsWith(PREVIEW_PREFIX) ||
+      value.startsWith(MANAGE_PREFIX))
   );
 }
 
@@ -160,9 +178,10 @@ export function isContentAssignment(value: string | null): boolean {
 }
 
 export interface TileAssignment {
-  kind: "editor" | "diff" | "commit" | "preview";
+  kind: "editor" | "diff" | "commit" | "preview" | "manage";
   connectionId: string;
-  /** Verbatim argument (a path, or "<oid>:<repoPath>" for commit). */
+  /** Verbatim argument (a path, "<oid>:<repoPath>" for commit, empty for
+   *  manage — the connection is the whole address). */
   arg: string;
 }
 
@@ -184,6 +203,9 @@ export function parseTileAssignment(
   } else if (value != null && value.startsWith(PREVIEW_PREFIX)) {
     kind = "preview";
     prefix = PREVIEW_PREFIX;
+  } else if (value != null && value.startsWith(MANAGE_PREFIX)) {
+    kind = "manage";
+    prefix = MANAGE_PREFIX;
   } else {
     return null;
   }

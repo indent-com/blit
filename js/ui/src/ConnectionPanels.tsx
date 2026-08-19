@@ -1,6 +1,12 @@
 /**
  * ConnectionPanels — everything there is to say about ONE remote, as tabs.
  *
+ * Hosted by {@link ./ManageTile.tsx}, which is a BSP tile: these are pane
+ * content, not a dialog. They were a dialog, and the thing that finally settled
+ * it was Enable in the Session tab — the application it started raised itself,
+ * an activation closes whatever overlay is up, and the panel dismissed itself
+ * one second after being used.
+ *
  * An expanded remote row used to stack its sections; it now switches between
  * them, because the set stopped being two short lists. Session and clients are
  * still short, but a unit table is a thousand rows and a journal page is a
@@ -114,7 +120,24 @@ export function ConnectionPanels(props: {
   };
 
   return (
-    <Show when={tabs().length > 0}>
+    <Show
+      when={tabs().length > 0}
+      fallback={
+        // A pane cannot render nothing the way an overlay section could: the
+        // viewer asked for this server's panels and is owed the answer that it
+        // has none.
+        <p
+          style={{
+            margin: "0",
+            padding: `${scale().controlX}px`,
+            color: theme().dimFg,
+            "font-size": `${scale().sm}px`,
+          }}
+        >
+          This server exposes no panels.
+        </p>
+      }
+    >
       <div
         style={{
           display: "flex",
