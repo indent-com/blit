@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { WheelDetents, WHEEL_DETENT_PX } from "../wheel";
+import { WheelDetents, WHEEL_DETENT_PX, notchedRows } from "../wheel";
 
 /** A wheel event as a browser would report it; jsdom's WheelEvent drops
  *  deltaMode from the init dict on some versions, so build it by hand. */
@@ -69,5 +69,45 @@ describe("WheelDetents", () => {
     const w = new WheelDetents();
     // One page of 40 rows is 40 lines, i.e. 13 whole three-line steps.
     expect(take(w, wheel(1, 2), 0)).toBe(13);
+  });
+});
+
+describe("notchedRows", () => {
+  it("moves a whole number of rows, the same for every notch", () => {
+    // 120px over a 19px cell is 6.3 rows. Left as pixels the remainder is
+    // what the scroll sync jerks back once the gesture settles.
+    expect(notchedRows(wheel(WHEEL_DETENT_PX), 19)).toBe(6);
+    expect(notchedRows(wheel(-WHEEL_DETENT_PX), 19)).toBe(-6);
+  });
+
+  it("keeps the browser's own speed where the cell divides the notch", () => {
+    expect(notchedRows(wheel(WHEEL_DETENT_PX), 10)).toBe(12);
+    expect(notchedRows(wheel(WHEEL_DETENT_PX), 20)).toBe(6);
+  });
+
+  it("gives a coalesced spin the same rows per notch as a single one", () => {
+    expect(notchedRows(wheel(WHEEL_DETENT_PX * 3), 19)).toBe(18);
+  });
+
+  it("reads a Firefox line-mode notch the same as a Chrome one", () => {
+    expect(notchedRows(wheel(3, 1), 19)).toBe(6);
+    expect(notchedRows(wheel(-3, 1), 19)).toBe(-6);
+  });
+
+  it("leaves a trackpad to the browser", () => {
+    // Pixel-precise travel means the fraction it reports, and a continuous
+    // gesture settles once rather than once per notch.
+    expect(notchedRows(wheel(-4), 19)).toBe(0);
+    expect(notchedRows(wheel(-53.5), 19)).toBe(0);
+    expect(notchedRows(wheel(-119), 19)).toBe(0);
+  });
+
+  it("leaves a sideways swipe and a page-mode wheel alone", () => {
+    expect(notchedRows(wheel(0), 19)).toBe(0);
+    expect(notchedRows(wheel(1, 2), 19)).toBe(0);
+  });
+
+  it("never rounds a notch away, however tall the row", () => {
+    expect(notchedRows(wheel(WHEEL_DETENT_PX), 400)).toBe(1);
   });
 });
