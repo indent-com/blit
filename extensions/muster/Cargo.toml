@@ -1,0 +1,25 @@
+[package]
+name = "blit-ext-muster"
+description = "Supervise units that run in terminals, from ~/.config/blit/muster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# The published object is `muster.wasm`; the crate name only matters to cargo.
+[[bin]]
+name = "muster"
+path = "src/main.rs"
+
+[dependencies]
+blit-guest.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The parts worth testing on the host — JSON parsing, substitution, dotenv,
+# backoff and phase transitions — are a library, so `cargo test` exercises them
+# without a server or a wasm runtime.
+[lib]
+name = "blit_ext_muster"
+path = "src/lib.rs"
