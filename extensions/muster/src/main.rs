@@ -120,6 +120,14 @@ struct Muster {
     findings: Vec<ConfigError>,
     /// `log:` readiness cursors, keyed by unit.
     log_cursor: BTreeMap<String, (u64, u16)>,
+    /// Surface messages from the initial burst, held until the first load
+    /// builds the owner map they are attributed through.
+    initial_surfaces: Vec<Vec<u8>>,
+    /// Surfaces this supervisor can account for, by surface id.
+    surfaces: BTreeMap<u16, Surface>,
+    /// Stamped `app_id` back to the unit that owns it, rebuilt on every load.
+    /// A surface names its origin by `app_id`; this is the way back.
+    surface_owners: BTreeMap<String, String>,
     /// Outstanding `C2S_TERM_WAIT`s, by nonce, so the reply finds its unit.
     log_waits: BTreeMap<u16, String>,
     /// When each activating unit is next probed.
@@ -181,6 +189,13 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
         findings: Vec::new(),
         log_cursor: BTreeMap::new(),
         log_waits: BTreeMap::new(),
+        initial_surfaces: initial
+            .iter()
+            .filter(|packet| is_surface_message(packet))
+            .cloned()
+            .collect(),
+        surfaces: BTreeMap::new(),
+        surface_owners: BTreeMap::new(),
         next_probe_ms: BTreeMap::new(),
         terminals: TerminalSubscriptions::new(),
         nonce: 1,
@@ -490,16 +505,15 @@ impl Muster {
                 }
             }
             _ if self.note_log_wait(client, packet) => {}
-            _ => {
-                if let Some(ServerMsg::Exited {
+            _ => match remote::parse_server_msg(packet) {
+                Some(ServerMsg::Exited {
                     pty_id,
                     exit_status,
                     ..
-                }) = remote::parse_server_msg(packet)
-                {
-                    self.note_exit(client, pty_id, exit_status)
-                }
-            }
+                }) => self.note_exit(client, pty_id, exit_status),
+                Some(other) => self.note_surface(other),
+                None => {}
+            },
         }
     }
 
@@ -679,6 +693,21 @@ impl Muster {
                         }
                     }
                 }
+            }
+        }
+
+        // Rebuilt every load so an adopted unit re-claims the surfaces its
+        // previous run stamped: the id is derived from the name, and the
+        // initial burst replays every live surface's origin.
+        self.surface_owners = wanted
+            .keys()
+            .map(|name| (supervisor::app_id_for(name), name.clone()))
+            .collect();
+
+        // The burst arrived before the owner map existed, so attribute it now.
+        for packet in std::mem::take(&mut self.initial_surfaces) {
+            if let Some(msg) = remote::parse_server_msg(&packet) {
+                self.note_surface(msg);
             }
         }
 
@@ -1197,10 +1226,21 @@ impl Muster {
 
         let argv: Vec<String> = file.command.clone().unwrap_or_default();
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let env_refs: Vec<(&str, &str)> = env
+        // A stamped Wayland socket for this run. Set in the terminal's
+        // environment, so anything the unit launches — including a browser its
+        // dev server spawns — arrives already attributed.
+        let display = self.app_socket(client, name, seq);
+        let mut env_refs: Vec<(&str, &str)> = env
             .iter()
             .map(|(k, v, _)| (k.as_str(), v.as_str()))
             .collect();
+        if let Some(display) = &display {
+            // The unit's own `env` wins: a unit pointed at another compositor
+            // meant it.
+            if !env_refs.iter().any(|(k, _)| *k == "WAYLAND_DISPLAY") {
+                env_refs.push(("WAYLAND_DISPLAY", display));
+            }
+        }
         let shell = file.shell.clone().unwrap_or_default();
         let tag = supervisor::tag_for(name, seq);
 
@@ -1436,6 +1476,93 @@ impl Muster {
         }
     }
 
+    // ------------------------------------------------------------- surfaces
+
+    /// Fold one surface message into the table.
+    ///
+    /// Every client sees every surface, so most of these belong to something
+    /// else entirely; only a stamped origin naming an `app_id` this supervisor
+    /// minted attributes one to a unit.
+    fn note_surface(&mut self, msg: ServerMsg<'_>) {
+        match msg {
+            ServerMsg::SurfaceCreated {
+                surface_id,
+                width,
+                height,
+                title,
+                ..
+            } => {
+                let entry = self.surfaces.entry(surface_id).or_default();
+                entry.title = title.to_string();
+                entry.width = width;
+                entry.height = height;
+            }
+            // The only trustworthy surface-to-unit link: `app_id` here is
+            // stamped by the compositor from the socket the surface arrived
+            // on, not asserted by the application.
+            ServerMsg::SurfaceOrigin {
+                surface_id,
+                app_id,
+                instance_id,
+                ..
+            } => {
+                let entry = self.surfaces.entry(surface_id).or_default();
+                entry.unit = self.surface_owners.get(app_id).cloned();
+                entry.seq = instance_id.parse().ok();
+            }
+            ServerMsg::SurfaceTitle { surface_id, title } => {
+                self.surfaces.entry(surface_id).or_default().title = title.to_string();
+            }
+            ServerMsg::SurfaceResized {
+                surface_id,
+                width,
+                height,
+                ..
+            } => {
+                let entry = self.surfaces.entry(surface_id).or_default();
+                entry.width = width;
+                entry.height = height;
+            }
+            ServerMsg::SurfaceDestroyed { surface_id } => {
+                self.surfaces.remove(&surface_id);
+            }
+            _ => {}
+        }
+    }
+
+    /// The surfaces a unit's live run has open, newest id last.
+    fn surfaces_of(&self, name: &str) -> Vec<(u16, &Surface)> {
+        let seq = self.units.get(name).map(|unit| unit.seq.saturating_sub(1));
+        self.surfaces
+            .iter()
+            .filter(|(_, surface)| surface.unit.as_deref() == Some(name))
+            .filter(|(_, surface)| seq.is_none() || surface.seq.is_none() || surface.seq == seq)
+            .map(|(id, surface)| (*id, surface))
+            .collect()
+    }
+
+    /// Mint the stamped Wayland socket a run's windows will arrive on.
+    ///
+    /// Returns the basename to put in `WAYLAND_DISPLAY`. Everything the unit
+    /// launches inherits it, so a browser a dev server spawns is attributed to
+    /// the unit that spawned it — which is the whole point of doing this at the
+    /// terminal's environment rather than by guessing at process trees.
+    fn app_socket(&mut self, client: &mut Client, name: &str, seq: u64) -> Option<String> {
+        if self.features & remote::process::FEATURE_APP_SOCKET == 0 {
+            return None;
+        }
+        let app_id = supervisor::app_id_for(name);
+        let nonce = self.next_nonce();
+        let packet = remote::msg_app_socket_request(nonce, &app_id, &seq.to_string());
+        client.send(&packet).ok()?;
+        let reply = self.reply(client, remote::S2C_APP_SOCKET, nonce)?;
+        let (_, status, display) = remote::parse_app_socket_reply(&reply)?;
+        if status != 0 {
+            return None;
+        }
+        self.surface_owners.insert(app_id, name.to_string());
+        Some(display.to_string())
+    }
     // ----------------------------------------------------------- environment
 
     /// Read every `envFile` and merge it with `env`.
@@ -1859,4 +1986,36 @@ fn rebase_unit_paths(file: &mut UnitFile, base: &str) {
             entry.path = format!("{base}/{}", entry.path);
         }
     }
+}
+
+/// A Wayland surface, and the run it belongs to.
+///
+/// `unit` is `None` for a surface nothing here owns — every other client's
+/// windows arrive on the same broadcast, and attributing them would be a lie.
+#[derive(Clone, Debug, Default)]
+struct Surface {
+    unit: Option<String>,
+    /// The run's sequence, from the socket's instance id, so a window is tied
+    /// to the run that opened it rather than merely to the unit.
+    seq: Option<u64>,
+    title: String,
+    width: u16,
+    height: u16,
+}
+
+/// Whether a packet is one of the surface messages the table is built from.
+///
+/// Named rather than a numeric range: the surface opcodes are not contiguous —
+/// origin sits at 0x32, well away from the 0x2x block the rest occupy.
+fn is_surface_message(packet: &[u8]) -> bool {
+    matches!(
+        packet.first().copied(),
+        Some(
+            remote::S2C_SURFACE_CREATED
+                | remote::S2C_SURFACE_DESTROYED
+                | remote::S2C_SURFACE_TITLE
+                | remote::S2C_SURFACE_RESIZED
+                | remote::S2C_SURFACE_ORIGIN
+        )
+    )
 }

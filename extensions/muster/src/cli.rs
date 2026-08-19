@@ -222,6 +222,21 @@ impl Muster {
         if let Some(description) = &unit.file.description {
             map.insert("description".into(), json!(description));
         }
+        let surfaces: Vec<Value> = self
+            .surfaces_of(&unit.name)
+            .into_iter()
+            .map(|(id, surface)| {
+                json!({
+                    "id": id,
+                    "title": surface.title,
+                    "width": surface.width,
+                    "height": surface.height,
+                })
+            })
+            .collect();
+        if !surfaces.is_empty() {
+            map.insert("surfaces".into(), json!(surfaces));
+        }
         object
     }
 
@@ -270,6 +285,12 @@ impl Muster {
         }
         if unit.stale {
             out.push_str("stale\tthe file changed since this run started\n");
+        }
+        for (id, surface) in self.surfaces_of(name) {
+            out.push_str(&format!(
+                "surface\t{id}\t{}x{}\t{}\n",
+                surface.width, surface.height, surface.title
+            ));
         }
         for run in &unit.runs {
             out.push_str(&format!(

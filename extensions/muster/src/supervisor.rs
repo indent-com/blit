@@ -711,3 +711,52 @@ mod stop_tests {
         assert_eq!(unit.failures, 1);
     }
 }
+
+/// The `app_id` a unit's stamped Wayland socket carries.
+///
+/// Deterministic from the unit name, because that is what lets a restarted
+/// supervisor re-attribute surfaces that already exist: the initial burst
+/// replays `S2C_SURFACE_ORIGIN` for every live surface, and the stamp it
+/// carries was minted by the previous attempt.
+///
+/// Hashed rather than derived from the name for two reasons the socket path
+/// forces. A qualified name contains `/`, and the server builds the socket as
+/// `blit-app-<app_id>-<instance_id>` in the runtime directory — a slash there
+/// makes it a path into a directory that does not exist. And `AF_UNIX` paths
+/// are 108 bytes, which `epic-poitras-7826e3/browser-wasm` would eat into for
+/// no benefit, since nobody reads this name.
+pub fn app_id_for(unit: &str) -> String {
+    // FNV-1a, 64-bit. Small, dependency-free, and stable across processes —
+    // which `DefaultHasher` explicitly is not.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in unit.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("muster-{hash:016x}")
+}
+
+#[cfg(test)]
+mod app_id_tests {
+    use super::*;
+
+    #[test]
+    fn an_app_id_is_filename_safe_whatever_the_unit_is_called() {
+        for unit in ["api", "epic/server", "a b/c:d", "épée"] {
+            let id = app_id_for(unit);
+            assert!(
+                id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                "{unit} gave {id}"
+            );
+            // `blit-app-` + id + `-` + a sequence, inside a runtime directory,
+            // has to stay well under the 108-byte AF_UNIX limit.
+            assert!(id.len() <= 24, "{id} is {} bytes", id.len());
+        }
+    }
+
+    #[test]
+    fn it_is_stable_across_runs_so_adoption_can_re_attribute() {
+        assert_eq!(app_id_for("epic/server"), app_id_for("epic/server"));
+        assert_ne!(app_id_for("epic/server"), app_id_for("main/server"));
+    }
+}
