@@ -18,7 +18,6 @@ use blit_guest::command::{CommandProvider, ProviderEvent};
 use blit_guest::remote::{self, ServerMsg};
 use blit_guest::terminal::{CreateRequest, TerminalSubscriptions};
 use blit_guest::{Client, EXIT_BOOTSTRAP_FAILURE, MonotonicInstant, WaitOutcome};
-use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -100,6 +99,9 @@ pub extern "C" fn __blit_guest_main() -> i32 {
 struct Muster {
     /// Absolute, `~` already expanded: the FS family does not expand it.
     dir: String,
+    /// Derived from `dir` once, because `~` expansion happens per env file and
+    /// per probe and the answer never changes.
+    home: String,
     /// Watched directories. Root 0 is `dir`; the rest are named by pointer
     /// files in it.
     roots: Vec<Root>,
@@ -130,7 +132,8 @@ struct Muster {
 #[derive(Clone, Debug)]
 struct Instance {
     stack: String,
-    vars: BTreeMap<String, Value>,
+    /// The port block this instance occupies, as `expand` resolved it.
+    ports: Option<(i64, u32)>,
     members: Vec<String>,
 }
 
@@ -151,8 +154,14 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
 
     let adoptable = adoptable_tags(initial);
     let dir = resolve_dir(&mut client)?;
+    // The configuration directory is derived from HOME, so it carries it.
+    let home = match dir.find("/.config/") {
+        Some(at) => dir[..at].to_string(),
+        None => String::from("/"),
+    };
     let mut muster = Muster {
         dir,
+        home,
         roots: Vec::new(),
         unwatchable: BTreeMap::new(),
         units: BTreeMap::new(),
@@ -277,7 +286,7 @@ fn adoptable_tags(initial: &[Vec<u8>]) -> (Vec<(u16, String)>, BTreeMap<u16, i32
             Some(ServerMsg::List { entries }) => {
                 tags = entries
                     .iter()
-                    .filter(|e| e.tag.starts_with("muster/"))
+                    .filter(|e| e.tag.starts_with(supervisor::TAG_PREFIX))
                     .map(|e| (e.pty_id, e.tag.to_string()))
                     .collect();
             }
@@ -333,13 +342,17 @@ impl Muster {
         }
     }
 
-    /// Stop watching the roots no pointer names any more.
+    /// Stop watching the roots nothing names any more.
+    ///
+    /// `wanted` includes the configuration directory, so there is no positional
+    /// "root 0 is special" rule to remember. An earlier version exempted the
+    /// first root by index, and the exemption then had to be re-remembered
+    /// everywhere the same set was reused — `unwatchable` promptly forgot it and
+    /// discarded the configuration directory's own status on every load.
     fn prune_roots(&mut self, client: &mut Client, wanted: &BTreeSet<String>) {
         let mut kept = Vec::with_capacity(self.roots.len());
         for root in std::mem::take(&mut self.roots) {
-            // Root 0 is the configuration directory: it is what names the
-            // others, so it outlives all of them.
-            if kept.is_empty() || wanted.contains(&root.path) {
+            if wanted.contains(&root.path) {
                 kept.push(root);
                 continue;
             }
@@ -357,7 +370,7 @@ impl Muster {
     /// expand it.
     pub(crate) fn resolve_path(&self, value: &str) -> String {
         if config::is_path(value) {
-            let expanded = expand_tilde(value, &self.home());
+            let expanded = expand_tilde(value, &self.home);
             // Relative paths would resolve against the *server's* cwd, which is
             // never what a pointer file meant.
             if expanded.starts_with('/') {
@@ -495,9 +508,11 @@ impl Muster {
             .collect();
 
         // Pass one: sort the top level into units, instances and includes, and
-        // learn which directories outside the configuration one are named.
+        // learn which directories are named. The configuration directory is in
+        // the set from the start — it is a watched root like any other, and
+        // making it one removes every "except root 0" caveat downstream.
         let mut pointers: Vec<(String, TopLevel)> = Vec::new();
-        let mut external: BTreeSet<String> = BTreeSet::new();
+        let mut wanted_roots: BTreeSet<String> = BTreeSet::from([dir.clone()]);
         for (path, bytes) in &files {
             if path.contains('/') {
                 continue;
@@ -507,25 +522,37 @@ impl Muster {
                 Ok(top) => {
                     match &top {
                         TopLevel::Instance(instance) if config::is_path(&instance.stack) => {
-                            external.insert(self.resolve_path(&instance.stack));
+                            wanted_roots.insert(self.resolve_path(&instance.stack));
                         }
                         TopLevel::Include(include) => {
-                            external.insert(self.resolve_path(&include.include));
+                            wanted_roots.insert(self.resolve_path(&include.include));
                         }
                         _ => {}
                     }
                     pointers.push((name, top));
                 }
-                Err(err) => self.findings.push(err),
+                Err(err) => {
+                    // A file that does not parse never displaces the one that
+                    // did, but the failure is a decision worth recording next
+                    // to the ones it prevented.
+                    self.record(
+                        Record::new(name, Event::Invalid, "stopped")
+                            .cause(Cause::File)
+                            .detail(err.detail.clone()),
+                        now,
+                    );
+                    self.findings.push(err);
+                }
             }
         }
 
         // Adjust the watch set before reading anything from it. A root added
         // here is empty until its own updates arrive, which triggers another
         // load — so a new pointer costs one extra pass, not a missing stack.
-        self.prune_roots(client, &external);
-        self.unwatchable.retain(|path, _| external.contains(path));
-        for path in &external {
+        self.prune_roots(client, &wanted_roots);
+        self.unwatchable
+            .retain(|path, _| wanted_roots.contains(path));
+        for path in &wanted_roots {
             self.watch(client, path);
         }
 
@@ -565,8 +592,8 @@ impl Muster {
                     wanted.insert(name.clone(), Unit::new(name, None, *unit));
                 }
                 TopLevel::Instance(instance) => match self.expand(&name, &instance, &files) {
-                    Ok((members, units)) => {
-                        for unit in units {
+                    Ok(expansion) => {
+                        for unit in expansion.units {
                             provenance.insert(unit.name.clone(), file.clone());
                             wanted.insert(unit.name.clone(), unit);
                         }
@@ -574,8 +601,8 @@ impl Muster {
                             name.clone(),
                             Instance {
                                 stack: instance.stack.clone(),
-                                vars: instance.vars.clone(),
-                                members,
+                                ports: expansion.ports,
+                                members: expansion.members,
                             },
                         );
                     }
@@ -614,6 +641,12 @@ impl Muster {
                                 if !include.autostart {
                                     unit.autostart = false;
                                 }
+                                // A relative path in an included unit means the
+                                // directory it came from, exactly as it does in
+                                // a stack template. Without this an included
+                                // `"envFile": ".env"` silently resolves against
+                                // the unit's cwd instead.
+                                rebase_unit_paths(&mut unit, &root);
                                 provenance.insert(unit_name.clone(), file.clone());
                                 wanted.insert(unit_name.clone(), Unit::new(unit_name, None, *unit));
                             }
@@ -645,7 +678,7 @@ impl Muster {
         instance_name: &str,
         instance: &InstanceFile,
         files: &BTreeMap<String, Vec<u8>>,
-    ) -> Result<(Vec<String>, Vec<Unit>), String> {
+    ) -> Result<Expansion, String> {
         let stack_dir = self.resolve_path(&instance.stack);
         // A stack in the configuration directory declares itself in a
         // subdirectory; one outside declares itself beside its templates. Both
@@ -709,20 +742,7 @@ impl Muster {
             config::substitute(&mut value, &vars)?;
             let mut file: UnitFile =
                 serde_json::from_value(value).map_err(|e| format!("{path}: {e}"))?;
-            // A relative path in a template is relative to the stack, which is
-            // what lets a repository-resident stack say `"cwd": "../.."` and
-            // mean its own checkout rather than the server's cwd.
-            if let Some(cwd) = &file.cwd
-                && !cwd.starts_with('/')
-                && !cwd.starts_with('~')
-            {
-                file.cwd = Some(format!("{stack_dir}/{cwd}"));
-            }
-            for entry in &mut file.env_file {
-                if !entry.path.starts_with('/') && !entry.path.starts_with('~') {
-                    entry.path = format!("{stack_dir}/{}", entry.path);
-                }
-            }
+            rebase_unit_paths(&mut file, &stack_dir);
             file.validate(&path).map_err(|e| e.detail)?;
             let name = format!("{template}@{instance_name}");
             members.push(name.clone());
@@ -755,7 +775,11 @@ impl Muster {
                 }
             }
         }
-        Ok((members, units))
+        Ok(Expansion {
+            members,
+            units,
+            ports: config::port_span(&declarations, &vars),
+        })
     }
 
     /// Two instances whose port blocks overlap is the failure mode of running
@@ -765,14 +789,19 @@ impl Muster {
     /// inspect the *previous* generation, which is empty on the first load and
     /// stale on every one after it.
     fn check_ports(&mut self, instances: &BTreeMap<String, Instance>) {
-        let mut blocks: Vec<(String, i64, u32)> = Vec::new();
-        for (name, instance) in instances {
-            if let Some(stack) = self.stacks.get(&instance.stack)
-                && let Some((base, span)) = config::port_span(stack, &instance.vars)
-            {
-                blocks.push((name.clone(), base, span));
-            }
-        }
+        // The span is whatever `expand` resolved. Re-deriving it here from
+        // `self.stacks` looked equivalent and was not: that map is keyed by
+        // subdirectory name, so an instance naming a stack by path never
+        // matched, and overlap detection was blind to exactly the case port
+        // blocks exist for — one stack running once per worktree.
+        let blocks: Vec<(String, i64, u32)> = instances
+            .iter()
+            .filter_map(|(name, instance)| {
+                instance
+                    .ports
+                    .map(|(base, span)| (name.clone(), base, span))
+            })
+            .collect();
         for (i, (a, a_base, a_span)) in blocks.iter().enumerate() {
             for (b, b_base, b_span) in blocks.iter().skip(i + 1) {
                 let overlap =
@@ -803,7 +832,6 @@ impl Muster {
                     let instance = unit.instance.clone();
                     self.units.insert(name.clone(), unit);
                     self.record(
-                        client,
                         Record::new(name.clone(), Event::Loaded, "stopped").instance(instance),
                         now,
                     );
@@ -815,7 +843,6 @@ impl Muster {
                         let instance = existing.instance.clone();
                         let phase = existing.phase;
                         self.record(
-                            client,
                             Record::new(name.clone(), Event::Changed, phase.as_str())
                                 .instance(instance),
                             now,
@@ -842,7 +869,6 @@ impl Muster {
             self.close_all(client, &name);
             if let Some(unit) = self.units.remove(&name) {
                 self.record(
-                    client,
                     Record::new(name, Event::Unloaded, "stopped").instance(unit.instance),
                     now,
                 );
@@ -867,11 +893,7 @@ impl Muster {
         // Per unit, sort by sequence: the highest is the live run.
         let mut by_unit: BTreeMap<String, Vec<(u64, u16)>> = BTreeMap::new();
         for (pty, tag) in tags {
-            let rest = tag.trim_start_matches("muster/");
-            let Some((name, seq)) = rest.rsplit_once('/') else {
-                continue;
-            };
-            let Ok(seq) = seq.parse::<u64>() else {
+            let Some((name, seq)) = supervisor::parse_tag(&tag) else {
                 continue;
             };
             by_unit
@@ -960,7 +982,7 @@ impl Muster {
             if let Some((_, pty)) = live {
                 record = record.pty(pty);
             }
-            self.record(client, record, now);
+            self.record(record, now);
         }
     }
 
@@ -1036,7 +1058,6 @@ impl Muster {
                     }
                 }
                 self.record(
-                    client,
                     Record::new(name.to_string(), Event::Cycle, "failed").detail(ring.join(" -> ")),
                     now,
                 );
@@ -1045,6 +1066,13 @@ impl Muster {
         };
         let now = self.now_ms(client);
         for member in order {
+            // `start_order` walks `after` too, because ordering has to see it.
+            // Only the closure says what to *start*: an `after` dependency
+            // orders a unit that is already coming up and must not be brought
+            // up by it.
+            if !closure.contains(&member) {
+                continue;
+            }
             let is_root = member == name;
             let Some(unit) = self.units.get_mut(&member) else {
                 continue;
@@ -1064,7 +1092,6 @@ impl Muster {
                 Cause::Dependency(name.to_string())
             };
             self.record(
-                client,
                 Record::new(member.clone(), Event::Start, "waiting")
                     .cause(cause)
                     .instance(instance),
@@ -1084,7 +1111,6 @@ impl Muster {
             // Not probeable: an older server reads the environment block as
             // command text. Refuse rather than run something else.
             self.record(
-                client,
                 Record::new(name.to_string(), Event::Failed, "failed")
                     .detail("server does not advertise FEATURE_CREATE_EXEC"),
                 now,
@@ -1101,19 +1127,21 @@ impl Muster {
         let instance = unit.instance.clone();
         let seq = unit.seq;
 
-        let cwd = expand_tilde(file.cwd.as_deref().unwrap_or("~"), &self.home());
-        let (env, sources, failure) = self.resolve_env(client, name, &cwd);
-        if let Some(failure) = failure {
-            self.record(
-                client,
-                Record::new(name.to_string(), Event::Failed, "backoff")
-                    .detail(failure)
-                    .instance(instance.clone()),
-                now,
-            );
-            self.after_failed_spawn(client, name, now);
-            return;
-        }
+        let cwd = expand_tilde(file.cwd.as_deref().unwrap_or("~"), &self.home);
+        let resolved = self.resolve_env(client, name, &cwd);
+        let ResolvedEnv { vars: env, sources } = match resolved {
+            Ok(resolved) => resolved,
+            Err(failure) => {
+                self.record(
+                    Record::new(name.to_string(), Event::Failed, "backoff")
+                        .detail(failure)
+                        .instance(instance.clone()),
+                    now,
+                );
+                self.note_failed_start(name, now);
+                return;
+            }
+        };
 
         let argv: Vec<String> = file.command.clone().unwrap_or_default();
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -1122,7 +1150,7 @@ impl Muster {
             .map(|(k, v, _)| (k.as_str(), v.as_str()))
             .collect();
         let shell = file.shell.clone().unwrap_or_default();
-        let tag = format!("muster/{name}/{seq}");
+        let tag = supervisor::tag_for(name, seq);
 
         let request = CreateRequest {
             rows: ROWS,
@@ -1157,7 +1185,6 @@ impl Muster {
                     Event::Spawn
                 };
                 self.record(
-                    client,
                     Record::new(name.to_string(), event, "activating")
                         .pty(pty)
                         .cause(cause)
@@ -1172,22 +1199,20 @@ impl Muster {
                 // the server resolves the program before forking, so this is
                 // where "no such binary" surfaces.
                 self.record(
-                    client,
                     Record::new(name.to_string(), Event::Exit, "backoff")
                         .detail(format!("create refused: {err:?}"))
                         .instance(instance),
                     now,
                 );
-                self.after_failed_spawn(client, name, now);
+                self.note_failed_start(name, now);
             }
         }
     }
 
-    fn after_failed_spawn(&mut self, client: &mut Client, name: &str, now: u64) {
-        let random = self.random(client);
+    fn note_failed_start(&mut self, name: &str, now: u64) {
+        let random = random();
         if let Some(unit) = self.units.get_mut(name) {
-            unit.phase = Phase::Running;
-            unit.note_exit(-1, now, random);
+            unit.note_failed_start(now, random);
         }
     }
 
@@ -1198,7 +1223,6 @@ impl Muster {
             None => return,
         };
         self.record(
-            client,
             Record::new(name.to_string(), Event::Failed, "backoff")
                 .detail(why.to_string())
                 .instance(instance),
@@ -1212,7 +1236,7 @@ impl Muster {
 
     fn note_exit(&mut self, client: &mut Client, pty: u16, exit_status: i32) {
         let now = self.now_ms(client);
-        let random = self.random(client);
+        let random = random();
         let Some(name) = self
             .units
             .iter()
@@ -1229,7 +1253,6 @@ impl Muster {
         for run in &stale {
             let _ = client.send(&remote::msg_close(run.pty));
             self.record(
-                client,
                 Record::new(name.clone(), Event::Reaped, phase.as_str())
                     .pty(run.pty)
                     .exit_code(run.exit_code)
@@ -1240,7 +1263,6 @@ impl Muster {
         self.next_probe_ms.remove(&name);
         self.log_cursor.remove(&name);
         self.record(
-            client,
             Record::new(name.clone(), Event::Exit, phase.as_str())
                 .pty(pty)
                 .exit_code(exit_status)
@@ -1248,12 +1270,20 @@ impl Muster {
             now,
         );
 
-        // A dependent may not outlive what it requires.
-        for dependent in supervisor::dependents(&self.units, &name) {
-            let leaves = self.units.get(&name).is_some_and(|u| !u.phase.is_ready());
-            if leaves {
-                self.stop_one(client, &dependent, Cause::Dependency(name.clone()), false);
+        // A dependent may not outlive what it requires. Whether this unit left
+        // `running` does not change per dependent, so it is decided once.
+        if self.units.get(&name).is_some_and(|u| !u.phase.is_ready()) {
+            for dependent in supervisor::dependents(&self.units, &name) {
+                self.stop_unit(client, &dependent, Cause::Dependency(name.clone()), false);
             }
+        }
+
+        // An explicit restart asked for a new terminal once this one died.
+        if let Some(unit) = self.units.get_mut(&name)
+            && std::mem::take(&mut unit.restart_pending)
+        {
+            unit.phase = Phase::Waiting;
+            unit.next_attempt_ms = 0;
         }
     }
 
@@ -1272,20 +1302,30 @@ impl Muster {
         if let Some(pty) = pty {
             record = record.pty(pty);
         }
-        self.record(client, record, now);
+        self.record(record, now);
     }
 
-    /// Stop a unit, and everything that requires it.
-    fn stop_one(&mut self, client: &mut Client, name: &str, cause: Cause, hold: bool) {
-        let now = self.now_ms(client);
+    /// Stop a unit and everything that requires it.
+    ///
+    /// `dependents` is already the transitive set, so this sweeps it flat.
+    /// Recursing into it re-derives the same closure per member and stops a
+    /// chain of depth *k* 2^(k-1) times, with a duplicate kill and a duplicate
+    /// journal record each time.
+    fn stop(&mut self, client: &mut Client, name: &str, cause: Cause, hold: bool) {
         for dependent in supervisor::dependents(&self.units, name) {
-            self.stop_one(
+            self.stop_unit(
                 client,
                 &dependent,
                 Cause::Dependency(name.to_string()),
                 false,
             );
         }
+        self.stop_unit(client, name, cause, hold);
+    }
+
+    /// Stop exactly one unit. Cascading is [`Muster::stop`]'s job.
+    fn stop_unit(&mut self, client: &mut Client, name: &str, cause: Cause, hold: bool) {
+        let now = self.now_ms(client);
         let Some(unit) = self.units.get_mut(name) else {
             return;
         };
@@ -1303,7 +1343,6 @@ impl Muster {
         }
         self.next_probe_ms.remove(name);
         self.record(
-            client,
             Record::new(
                 name.to_string(),
                 Event::Stop,
@@ -1318,14 +1357,17 @@ impl Muster {
     /// Every restart is a new terminal: `C2S_RESTART` replays the spec the PTY
     /// was created with, so it cannot serve a restart caused by an edit.
     fn restart(&mut self, client: &mut Client, name: &str, cause: Cause) {
-        self.stop_one(client, name, cause.clone(), false);
+        self.stop(client, name, cause, false);
         if let Some(unit) = self.units.get_mut(name) {
             if unit.pty.is_none() {
                 unit.phase = Phase::Waiting;
             } else {
-                // The exit will land in `note_exit`; autostart brings it back.
-                unit.phase = Phase::Stopped;
-                unit.file.autostart = true;
+                // The terminal is still dying. `note_exit` reads this and comes
+                // back — writing `file.autostart` instead would edit parsed
+                // configuration to carry a one-off intent, and a unit that says
+                // `"autostart": false` would be permanently flipped by a single
+                // `@muster restart`.
+                unit.restart_pending = true;
             }
         }
     }
@@ -1344,31 +1386,24 @@ impl Muster {
 
     // ----------------------------------------------------------- environment
 
-    fn home(&self) -> String {
-        // The config dir is derived from HOME, so it carries it.
-        match self.dir.find("/.config/") {
-            Some(at) => self.dir[..at].to_string(),
-            None => String::from("/"),
-        }
-    }
-
-    /// Read every `envFile`, merge with `env`, and report which files were
-    /// read. `None` failure means the environment resolved.
-    #[allow(clippy::type_complexity)]
+    /// Read every `envFile` and merge it with `env`.
     fn resolve_env(
         &mut self,
         client: &mut Client,
         name: &str,
         cwd: &str,
-    ) -> (Vec<(String, String, Origin)>, Vec<String>, Option<String>) {
+    ) -> Result<ResolvedEnv, String> {
         let Some(unit) = self.units.get(name) else {
-            return (Vec::new(), Vec::new(), None);
+            return Ok(ResolvedEnv::default());
         };
-        let file = unit.file.clone();
+        // Only the two env fields are needed, and cloning the whole UnitFile
+        // per spawn is the expensive way to borrow them.
+        let entries = unit.file.env_file.clone();
+        let inline = unit.file.env.clone();
         let mut loaded: Vec<(String, EnvFile)> = Vec::new();
         let mut sources = Vec::new();
-        for entry in &file.env_file {
-            let path = absolute(&expand_tilde(&entry.path, &self.home()), cwd);
+        for entry in &entries {
+            let path = rebase(&expand_tilde(&entry.path, &self.home), cwd);
             match self.read_file(client, &path) {
                 Some(bytes) => {
                     let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -1376,16 +1411,13 @@ impl Muster {
                     sources.push(path);
                 }
                 None if entry.optional => {}
-                None => {
-                    return (
-                        Vec::new(),
-                        Vec::new(),
-                        Some(format!("envFile {path} is missing")),
-                    );
-                }
+                None => return Err(format!("envFile {path} is missing")),
             }
         }
-        (envfile::merge(&loaded, &file.env), sources, None)
+        Ok(ResolvedEnv {
+            vars: envfile::merge(&loaded, &inline),
+            sources,
+        })
     }
 
     /// One-shot read of an absolute path. `FS_READ` needs no sync.
@@ -1428,7 +1460,7 @@ impl Muster {
             ReadyWhen::Manual => false,
             ReadyWhen::Delay(d) => now.saturating_sub(started) >= d.ms(),
             ReadyWhen::Path(path) => {
-                let path = expand_tilde(path, &self.home());
+                let path = expand_tilde(path, &self.home);
                 self.path_exists(client, &path)
             }
             ReadyWhen::Tcp(target) => self.tcp_connects(client, target),
@@ -1595,28 +1627,27 @@ impl Muster {
         client: &mut Client,
         nonce: u16,
     ) -> Option<remote::journal::OutputReply> {
-        let reply = client
-            .recv_matching(|p| {
-                p.first() == Some(&remote::journal::S2C_TERM_OUTPUT)
-                    && p.len() >= 3
-                    && u16::from_le_bytes([p[1], p[2]]) == nonce
-            })
-            .ok()??;
+        let reply = self.reply(client, remote::journal::S2C_TERM_OUTPUT, nonce)?;
         remote::journal::parse_s2c_term_output(&reply)
     }
 
-    fn random(&self, client: &Client) -> u64 {
-        let mut bytes = [0u8; 8];
-        let _ = blit_guest::host::random(&mut bytes);
-        let _ = client;
-        u64::from_le_bytes(bytes)
+    /// Wait for the answer to a correlated request.
+    ///
+    /// Every family muster asks a question of answers with the correlation id
+    /// in the same two bytes, so this is the one place that offset is written
+    /// down. `recv_matching` buffers everything else for the loop.
+    fn reply(&mut self, client: &mut Client, opcode: u8, id: u16) -> Option<Vec<u8>> {
+        client
+            .recv_matching(|packet| {
+                packet.first() == Some(&opcode)
+                    && packet.len() >= 3
+                    && u16::from_le_bytes([packet[1], packet[2]]) == id
+            })
+            .ok()?
     }
 
-    fn record(&mut self, client: &mut Client, record: Record, now: u64) {
-        let stored = self.journal.push(record, now);
-        // The panel and `log -f` read the same bytes.
-        let _ = client;
-        let _ = stored;
+    fn record(&mut self, record: Record, now: u64) {
+        self.journal.push(record, now);
     }
 }
 
@@ -1638,7 +1669,9 @@ fn expand_tilde(path: &str, home: &str) -> String {
     }
 }
 
-fn absolute(path: &str, cwd: &str) -> String {
+/// Make a path absolute against a base. Used for `envFile` against `cwd` and
+/// for a template's relative paths against its stack directory.
+fn rebase(path: &str, cwd: &str) -> String {
     if path.starts_with('/') {
         path.to_string()
     } else {
@@ -1684,3 +1717,44 @@ fn signal_number(name: &str) -> i32 {
 }
 
 mod cli;
+
+/// What a start resolved from `envFile` + `env`, and which files it read.
+#[derive(Default)]
+struct ResolvedEnv {
+    vars: Vec<(String, String, Origin)>,
+    sources: Vec<String>,
+}
+
+/// One uniform `u64` from the host, for backoff jitter.
+fn random() -> u64 {
+    let mut bytes = [0u8; 8];
+    let _ = blit_guest::host::random(&mut bytes);
+    u64::from_le_bytes(bytes)
+}
+
+/// What one instance resolved to.
+struct Expansion {
+    members: Vec<String>,
+    units: Vec<Unit>,
+    ports: Option<(i64, u32)>,
+}
+
+/// Resolve a unit's relative paths against the directory its file came from.
+///
+/// This is what lets a repository-resident stack say `"cwd": "../.."` and mean
+/// its own checkout rather than the server's working directory. It applies to
+/// included units too: where a file lives is what "relative" means, and a rule
+/// that held only for templates would be a rule with an exception.
+fn rebase_unit_paths(file: &mut UnitFile, base: &str) {
+    let relative = |path: &str| !path.starts_with('/') && !path.starts_with('~');
+    if let Some(cwd) = &file.cwd
+        && relative(cwd)
+    {
+        file.cwd = Some(format!("{base}/{cwd}"));
+    }
+    for entry in &mut file.env_file {
+        if relative(&entry.path) {
+            entry.path = format!("{base}/{}", entry.path);
+        }
+    }
+}

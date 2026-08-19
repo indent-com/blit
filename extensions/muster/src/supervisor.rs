@@ -89,6 +89,8 @@ pub struct Unit {
     pub runs: Vec<Run>,
     /// The unit file changed under a running unit.
     pub stale: bool,
+    /// An explicit restart is waiting for the current terminal to die.
+    pub restart_pending: bool,
     /// A stop is in flight; SIGKILL when this comes due.
     pub kill_at_ms: u64,
 }
@@ -109,6 +111,7 @@ impl Unit {
             last_exit: None,
             runs: Vec::new(),
             stale: false,
+            restart_pending: false,
             kill_at_ms: 0,
         }
     }
@@ -116,7 +119,7 @@ impl Unit {
     /// The tag a terminal carries. `<seq>` is what makes an old run
     /// distinguishable from the live one after the supervisor restarts.
     pub fn tag(&self, seq: u64) -> String {
-        format!("muster/{}/{seq}", self.name)
+        tag_for(&self.name, seq)
     }
 
     /// Whether an exit should be retried, under this unit's declared policy.
@@ -172,19 +175,42 @@ impl Unit {
                 Phase::Failed
             };
         } else {
-            self.failures += 1;
-            if self.file.start_limit > 0 && self.failures >= self.file.start_limit {
-                self.phase = Phase::Failed;
-            } else {
-                self.phase = Phase::Backoff;
-                let delay = match self.file.restart_delay {
-                    Some(fixed) => Duration::from_millis(fixed.ms()),
-                    None => backoff(self.failures, random),
-                };
-                self.next_attempt_ms = now_ms + delay.as_millis() as u64;
-            }
+            self.arm_retry(now_ms, random);
         }
         self.reap()
+    }
+
+    /// The start never happened: the create was refused, or its environment
+    /// could not be resolved.
+    ///
+    /// Distinct from `note_exit` because there is no run and no exit code. An
+    /// earlier version faked both — phase `Running`, exit `-1` — which put a
+    /// number indistinguishable from a real 255 into `last_exit` and into
+    /// `@muster status`.
+    pub fn note_failed_start(&mut self, now_ms: u64, random: u64) {
+        self.deadline_ms = 0;
+        self.kill_at_ms = 0;
+        self.pty = None;
+        if self.file.restart_on_failure {
+            self.arm_retry(now_ms, random);
+        } else {
+            self.phase = Phase::Failed;
+        }
+    }
+
+    /// Count the failure and either back off or give up.
+    fn arm_retry(&mut self, now_ms: u64, random: u64) {
+        self.failures += 1;
+        if self.file.start_limit > 0 && self.failures >= self.file.start_limit {
+            self.phase = Phase::Failed;
+            return;
+        }
+        self.phase = Phase::Backoff;
+        let delay = match self.file.restart_delay {
+            Some(fixed) => Duration::from_millis(fixed.ms()),
+            None => backoff(self.failures, random),
+        };
+        self.next_attempt_ms = now_ms + delay.as_millis() as u64;
     }
 
     /// Retained runs beyond `keep`, oldest first, for the caller to close.
@@ -223,6 +249,28 @@ impl Unit {
         consider(self.kill_at_ms);
         soonest
     }
+}
+
+/// The prefix every muster-owned terminal tag carries.
+pub const TAG_PREFIX: &str = "muster/";
+
+/// `muster/<unit>/<seq>`.
+///
+/// Written at create and read back at adoption, where it is the only evidence
+/// linking a live PTY to a unit — so the two directions live together and are
+/// tested against each other rather than open-coded at both ends.
+pub fn tag_for(unit: &str, seq: u64) -> String {
+    format!("{TAG_PREFIX}{unit}/{seq}")
+}
+
+/// The unit and sequence a tag names, or `None` if it is not one of ours.
+pub fn parse_tag(tag: &str) -> Option<(&str, u64)> {
+    let rest = tag.strip_prefix(TAG_PREFIX)?;
+    let (unit, seq) = rest.rsplit_once('/')?;
+    if unit.is_empty() {
+        return None;
+    }
+    Some((unit, seq.parse().ok()?))
 }
 
 /// Exponential with full jitter.
@@ -530,5 +578,33 @@ mod tests {
     fn a_dangling_dependency_does_not_break_ordering() {
         let units = graph(&[("api", r#"{"command":["a"],"requires":["ghost"]}"#)]);
         assert!(start_order(&units, &["api".into()]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::*;
+
+    #[test]
+    fn a_tag_round_trips_through_the_parser() {
+        for (unit, seq) in [("api", 0u64), ("gateway@epic", 41), ("a-b_c.d", u64::MAX)] {
+            let tag = tag_for(unit, seq);
+            assert_eq!(parse_tag(&tag), Some((unit, seq)), "{tag}");
+        }
+    }
+
+    #[test]
+    fn a_unit_name_may_contain_the_separator() {
+        // Only the last `/` separates the sequence, so a name is free to hold
+        // one — which an instance of a stack in a nested directory can.
+        let tag = tag_for("stacks/web@epic", 7);
+        assert_eq!(parse_tag(&tag), Some(("stacks/web@epic", 7)));
+    }
+
+    #[test]
+    fn foreign_and_malformed_tags_are_refused() {
+        for tag in ["", "muster/", "muster/api", "session/api/0", "muster/api/x"] {
+            assert_eq!(parse_tag(tag), None, "{tag}");
+        }
     }
 }

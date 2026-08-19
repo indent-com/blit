@@ -6,10 +6,11 @@
 
 use super::{Muster, describe_ready};
 use blit_ext_muster::config;
-use blit_ext_muster::journal::{Cause, quote};
-use blit_ext_muster::supervisor::Phase;
+use blit_ext_muster::journal::{Cause, Record};
+use blit_ext_muster::supervisor::{Phase, Unit};
 use blit_guest::Client;
 use blit_guest::command::Invocation;
+use serde_json::{Value, json};
 
 /// Emitted by `@muster schema`, so an editor validates a unit file as it is
 /// typed. Kept deliberately shallow: it is a completion and typo aid, not a
@@ -29,10 +30,20 @@ impl Muster {
         let verb = positional.first().copied().unwrap_or("list");
         let target = positional.get(1).copied();
 
+        // Whether the answer is JSON is something each verb knows; sniffing the
+        // text for a leading brace gets `doctor --json` wrong, since it exits 1
+        // when it finds anything.
+        let mut structured = false;
         let (code, text) = match verb {
-            "list" => (0, self.render_list(json)),
+            "list" => {
+                structured = json;
+                (0, self.render_list(json))
+            }
             "status" => match target {
-                Some(name) => self.render_status(name, json),
+                Some(name) => {
+                    structured = json;
+                    self.render_status(name, json)
+                }
                 None => (2, String::from("status needs a name\n")),
             },
             "start" | "stop" | "restart" => match target {
@@ -47,27 +58,39 @@ impl Muster {
                 self.load(client);
                 (0, String::from("reloaded\n"))
             }
-            "log" => (0, self.render_log(&args, json)),
+            "log" => {
+                structured = json;
+                (0, self.render_log(&args, json))
+            }
             "cat" => match target {
                 Some(name) => self.render_cat(name),
                 None => (2, String::from("cat needs a name\n")),
             },
             "env" => match target {
-                Some(name) => self.render_env(client, name, values, json),
+                Some(name) => {
+                    let answered = self.render_env(client, name, values, json);
+                    structured = json && answered.0 == 0;
+                    answered
+                }
                 None => (2, String::from("env needs a unit\n")),
             },
-            "stacks" => (0, self.render_stacks(json)),
-            "doctor" => self.render_doctor(json),
+            "stacks" => {
+                structured = json;
+                (0, self.render_stacks(json))
+            }
+            "doctor" => {
+                structured = json;
+                self.render_doctor(json)
+            }
             "schema" => (0, format!("{SCHEMA}\n")),
             other => (2, format!("unknown verb {other:?}\n")),
         };
 
-        let sent = if json && code == 0 && looks_like_json(&text) {
+        let _ = if structured {
             invocation.result(client, "application/json", text.as_bytes())
         } else {
             invocation.stdout(client, text.as_bytes())
         };
-        let _ = sent;
         let _ = invocation.exit(client, code, "");
     }
 
@@ -81,7 +104,7 @@ impl Muster {
         for member in &members {
             match verb {
                 "start" => self.want(client, member, Cause::Command),
-                "stop" => self.stop_one(client, member, Cause::Command, true),
+                "stop" => self.stop(client, member, Cause::Command, true),
                 _ => self.restart(client, member, Cause::Command),
             }
         }
@@ -118,29 +141,19 @@ impl Muster {
 
     fn render_list(&self, json: bool) -> String {
         if json {
-            let units: Vec<String> = self.units.values().map(|u| self.unit_json(u)).collect();
-            let instances: Vec<String> = self
-                .instances
-                .iter()
-                .map(|(name, instance)| {
-                    let ready = instance
-                        .members
-                        .iter()
-                        .filter(|m| self.units.get(*m).is_some_and(|u| u.phase.is_ready()))
-                        .count();
-                    format!(
-                        r#"{{"name":{},"stack":{},"ready":{ready},"total":{}}}"#,
-                        quote(name),
-                        quote(&instance.stack),
-                        instance.members.len()
-                    )
-                })
-                .collect();
-            return format!(
-                "{{\"instances\":[{}],\"units\":[{}]}}\n",
-                instances.join(","),
-                units.join(",")
-            );
+            return line(json!({
+                "instances": self
+                    .instances
+                    .iter()
+                    .map(|(name, instance)| json!({
+                        "name": name,
+                        "stack": instance.stack,
+                        "ready": self.ready_count(instance),
+                        "total": instance.members.len(),
+                    }))
+                    .collect::<Vec<_>>(),
+                "units": self.units.values().map(|u| self.unit_json(u)).collect::<Vec<_>>(),
+            }));
         }
 
         let mut out = String::from("NAME\tPHASE\tPTY\tRESTARTS\tDESCRIPTION\n");
@@ -151,14 +164,10 @@ impl Muster {
             out.push_str(&self.unit_row(name, unit));
         }
         for (name, instance) in &self.instances {
-            let ready = instance
-                .members
-                .iter()
-                .filter(|m| self.units.get(*m).is_some_and(|u| u.phase.is_ready()))
-                .count();
             out.push_str(&format!(
-                "{name}\t—\t-\t-\t{}, {ready}/{} ready\n",
+                "{name}\t—\t-\t-\t{}, {}/{} ready\n",
                 instance.stack,
+                self.ready_count(instance),
                 instance.members.len()
             ));
             for member in &instance.members {
@@ -171,7 +180,19 @@ impl Muster {
         out
     }
 
-    fn unit_row(&self, name: &str, unit: &blit_ext_muster::supervisor::Unit) -> String {
+    fn ready_count(&self, instance: &super::Instance) -> usize {
+        instance
+            .members
+            .iter()
+            .filter(|member| {
+                self.units
+                    .get(*member)
+                    .is_some_and(|unit| unit.phase.is_ready())
+            })
+            .count()
+    }
+
+    fn unit_row(&self, name: &str, unit: &Unit) -> String {
         format!(
             "{name}\t{}\t{}\t{}\t{}\n",
             unit.phase.as_str(),
@@ -181,28 +202,27 @@ impl Muster {
         )
     }
 
-    fn unit_json(&self, unit: &blit_ext_muster::supervisor::Unit) -> String {
-        let mut out = format!(
-            r#"{{"name":{},"phase":"{}","restarts":{}"#,
-            quote(&unit.name),
-            unit.phase.as_str(),
-            unit.failures
-        );
+    fn unit_json(&self, unit: &Unit) -> Value {
+        let mut object = json!({
+            "name": unit.name,
+            "phase": unit.phase.as_str(),
+            "restarts": unit.failures,
+            "requires": unit.file.requires,
+        });
+        let map = object.as_object_mut().expect("built as an object");
         if let Some(instance) = &unit.instance {
-            out.push_str(&format!(r#","instance":{}"#, quote(instance)));
+            map.insert("instance".into(), json!(instance));
         }
         if let Some(pty) = unit.pty {
-            out.push_str(&format!(r#","pty":{pty}"#));
+            map.insert("pty".into(), json!(pty));
         }
         if let Some(exit) = unit.last_exit {
-            out.push_str(&format!(r#","lastExit":{exit}"#));
+            map.insert("lastExit".into(), json!(exit));
         }
         if let Some(description) = &unit.file.description {
-            out.push_str(&format!(r#","description":{}"#, quote(description)));
+            map.insert("description".into(), json!(description));
         }
-        let requires: Vec<String> = unit.file.requires.iter().map(|r| quote(r)).collect();
-        out.push_str(&format!(r#","requires":[{}]}}"#, requires.join(",")));
-        out
+        object
     }
 
     /// `status` ends with the retained runs — the reason `keep` exists.
@@ -214,19 +234,22 @@ impl Muster {
             };
         };
         if json {
-            let runs: Vec<String> = unit
-                .runs
-                .iter()
-                .map(|r| {
-                    format!(
-                        r#"{{"pty":{},"seq":{},"exitCode":{},"endedMs":{}}}"#,
-                        r.pty, r.seq, r.exit_code, r.ended_ms
-                    )
-                })
-                .collect();
-            let mut out = self.unit_json(unit);
-            out.pop();
-            return (0, format!("{out},\"runs\":[{}]}}\n", runs.join(",")));
+            let mut object = self.unit_json(unit);
+            object.as_object_mut().expect("object").insert(
+                "runs".into(),
+                json!(
+                    unit.runs
+                        .iter()
+                        .map(|run| json!({
+                            "pty": run.pty,
+                            "seq": run.seq,
+                            "exitCode": run.exit_code,
+                            "endedMs": run.ended_ms,
+                        }))
+                        .collect::<Vec<_>>()
+                ),
+            );
+            return (0, line(object));
         }
         let mut out = String::new();
         out.push_str(&format!("unit\t{name}\n"));
@@ -268,26 +291,31 @@ impl Muster {
         let unit_filter = value_of("-u");
         let since: Option<u64> = value_of("--since").and_then(|s| s.parse().ok());
 
-        let matches = |record: &blit_ext_muster::journal::Record| {
+        let matches = |record: &&Record| {
             unit_filter.as_ref().is_none_or(|want| {
                 let want = want.trim_start_matches('@');
                 record.unit == *want || record.instance.as_deref() == Some(want)
             })
         };
-        let selected: Vec<&blit_ext_muster::journal::Record> = match since {
-            Some(seq) => self.journal.since(seq).filter(|r| matches(r)).collect(),
-            None => {
-                let all: Vec<_> = self
-                    .journal
-                    .tail(usize::MAX)
-                    .filter(|r| matches(r))
-                    .collect();
-                all.into_iter().rev().take(count).rev().collect()
-            }
+        // Without a cursor this is a tail, so take from the newest end rather
+        // than collecting the whole ring in order to reverse it.
+        let mut selected: Vec<&Record> = match since {
+            Some(seq) => self.journal.since(seq).filter(matches).collect(),
+            None => self
+                .journal
+                .tail(usize::MAX)
+                .rev()
+                .filter(matches)
+                .take(count)
+                .collect(),
         };
+        if since.is_none() {
+            selected.reverse();
+        }
         if json {
-            let records: Vec<String> = selected.iter().map(|r| r.to_json()).collect();
-            return format!("[{}]\n", records.join(","));
+            return line(json!(
+                selected.iter().map(|r| r.to_json()).collect::<Vec<_>>()
+            ));
         }
         let mut out = String::new();
         for record in selected {
@@ -349,33 +377,30 @@ impl Muster {
         let Some(unit) = self.units.get(name) else {
             return (1, format!("no unit named {name:?}\n"));
         };
-        let home = self.home();
+        let home = self.home.clone();
         let cwd = super::expand_tilde(unit.file.cwd.as_deref().unwrap_or("~"), &home);
-        let (env, _, failure) = self.resolve_env(client, name, &cwd);
-        if let Some(failure) = failure {
-            return (1, format!("{failure}\n"));
-        }
+        let env = match self.resolve_env(client, name, &cwd) {
+            Ok(resolved) => resolved.vars,
+            Err(failure) => return (1, format!("{failure}\n")),
+        };
         if json {
-            let entries: Vec<String> = env
-                .iter()
-                .map(|(key, value, origin)| {
-                    if values {
-                        format!(
-                            r#"{{"key":{},"from":{},"value":{}}}"#,
-                            quote(key),
-                            quote(origin.label()),
-                            quote(value)
-                        )
-                    } else {
-                        format!(
-                            r#"{{"key":{},"from":{}}}"#,
-                            quote(key),
-                            quote(origin.label())
-                        )
-                    }
-                })
-                .collect();
-            return (0, format!("[{}]\n", entries.join(",")));
+            return (
+                0,
+                line(json!(
+                    env.iter()
+                        .map(|(key, value, origin)| {
+                            let mut entry = json!({ "key": key, "from": origin.label() });
+                            if values {
+                                entry
+                                    .as_object_mut()
+                                    .expect("object")
+                                    .insert("value".into(), json!(value));
+                            }
+                            entry
+                        })
+                        .collect::<Vec<_>>()
+                )),
+            );
         }
         let mut out = String::new();
         for (key, value, origin) in &env {
@@ -390,26 +415,23 @@ impl Muster {
 
     fn render_stacks(&self, json: bool) -> String {
         if json {
-            let stacks: Vec<String> = self
-                .stacks
-                .iter()
-                .map(|(name, stack)| {
-                    let vars: Vec<String> = stack
-                        .vars
-                        .iter()
-                        .map(|(var, decl)| {
-                            format!(
-                                r#"{{"name":{},"required":{},"kind":{}}}"#,
-                                quote(var),
-                                decl.required,
-                                decl.kind.as_deref().map_or("null".into(), quote)
-                            )
-                        })
-                        .collect();
-                    format!(r#"{{"name":{},"vars":[{}]}}"#, quote(name), vars.join(","))
-                })
-                .collect();
-            return format!("[{}]\n", stacks.join(","));
+            return line(json!(
+                self.stacks
+                    .iter()
+                    .map(|(name, stack)| json!({
+                        "name": name,
+                        "vars": stack
+                            .vars
+                            .iter()
+                            .map(|(var, decl)| json!({
+                                "name": var,
+                                "required": decl.required,
+                                "kind": decl.kind,
+                            }))
+                            .collect::<Vec<_>>(),
+                    }))
+                    .collect::<Vec<_>>()
+            ));
         }
         let mut out = String::from("STACK\tPARAMETER\tREQUIRED\tKIND\n");
         for (name, stack) in &self.stacks {
@@ -461,16 +483,16 @@ impl Muster {
             findings.push((ring.join(" -> "), String::from("dependency cycle")));
         }
 
+        let code = i32::from(!findings.is_empty());
         if json {
-            let items: Vec<String> = findings
-                .iter()
-                .map(|(where_, what)| {
-                    format!(r#"{{"where":{},"what":{}}}"#, quote(where_), quote(what))
-                })
-                .collect();
             return (
-                i32::from(!findings.is_empty()),
-                format!("[{}]\n", items.join(",")),
+                code,
+                line(json!(
+                    findings
+                        .iter()
+                        .map(|(where_, what)| json!({ "where": where_, "what": what }))
+                        .collect::<Vec<_>>()
+                )),
             );
         }
         if findings.is_empty() {
@@ -480,11 +502,11 @@ impl Muster {
         for (where_, what) in &findings {
             out.push_str(&format!("{where_}\t{what}\n"));
         }
-        (1, out)
+        (code, out)
     }
 }
 
-fn looks_like_json(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    trimmed.starts_with('{') || trimmed.starts_with('[')
+/// One JSON value as a line, which is what both the CLI and the journal emit.
+fn line(value: Value) -> String {
+    format!("{value}\n")
 }
