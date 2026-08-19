@@ -298,10 +298,19 @@ export class BlitTerminalSurface {
   /** Inner spacer that gives `scrollEl` enough scrollable content height
    *  for the current scrollback range. */
   private scrollSpacer: HTMLDivElement | null = null;
-  /** True while we're updating `scrollEl.scrollTop` from inside our own
-   *  scrollOffset → scrollTop sync, so the scroll listener doesn't feed
-   *  the change back. */
+  /** True while a resize is re-clamping `scrollEl.scrollTop` under us, so the
+   *  scroll listener doesn't read the browser's reflow as the user scrolling.
+   *  A span of time, because a reflow's scroll events cannot be named. */
   private suppressScrollSync = false;
+  /** The exact `scrollTop` the sync last asked for, waiting for its own echo.
+   *
+   *  Named rather than timed, because a span of time swallows whatever else
+   *  lands inside it. A wheel notch is one scroll event now that its travel
+   *  is quantised — it used to be a burst of six from the browser's scroll
+   *  animation, of which losing one went unnoticed — so a notch that arrived
+   *  during the window lost the whole gesture: the surface moved and nothing
+   *  else did, leaving the reader at the bottom having plainly scrolled up. */
+  private pendingScrollTopWrite: number | null = null;
   /** scrollEl's client height, refreshed from the ResizeObserver and the
    *  scroll listener — both of which run after layout, so the measurement
    *  costs nothing. Never read inside the render loop (see
@@ -3111,6 +3120,13 @@ export class BlitTerminalSurface {
     if (!el) return;
     this.boundScrollListener = () => {
       if (this.suppressScrollSync) return;
+      const pending = this.pendingScrollTopWrite;
+      if (pending !== null) {
+        this.pendingScrollTopWrite = null;
+        // Our own write coming back. Anything else reached the element
+        // first and is the user's, however close behind the write it was.
+        if (Math.abs(el.scrollTop - pending) < 0.5) return;
+      }
       const t = this.terminal;
       if (!t) return;
       const maxLines = t.scrollback_lines();
@@ -3222,11 +3238,13 @@ export class BlitTerminalSurface {
     }
     if (drift > 0.5 && !this.gestureOwnsScrollTop(drift, cellH)) {
       this.lastScrollTop = targetTop;
-      this.suppressScrollSync = true;
+      this.pendingScrollTopWrite = targetTop;
       el.scrollTop = targetTop;
-      // The scroll event is async; clear the flag in the next frame.
+      // A write the browser clamps produces no echo at all, so give the
+      // claim a frame to live rather than leaving it to match some later
+      // scroll that happens to land on the same pixel.
       requestAnimationFrame(() => {
-        this.suppressScrollSync = false;
+        this.pendingScrollTopWrite = null;
       });
     }
   }

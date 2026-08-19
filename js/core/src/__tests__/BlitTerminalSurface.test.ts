@@ -1900,6 +1900,70 @@ describe("BlitTerminalSurface wheel over the scrollback", () => {
     expect(el.scrollTop).toBe(before);
   });
 
+  /** Hold rAF callbacks instead of running them, so the frame the sync uses
+   *  as a backstop stays open for the length of the test. */
+  function deferFrames() {
+    const queued: FrameRequestCallback[] = [];
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((cb: FrameRequestCallback) => {
+        queued.push(cb);
+        return 1;
+      }),
+    );
+    return () => {
+      const run = queued.splice(0);
+      for (const cb of run) cb(0);
+    };
+  }
+
+  it("keeps a notch that lands while the sync's own write is in flight", () => {
+    // The sync claims the echo of the scrollTop it wrote. It used to claim a
+    // frame instead, and once a notch became a single scroll event rather
+    // than an animated burst, a notch inside that frame was the whole
+    // gesture — the surface moved and nothing else did, so the reader stayed
+    // at the bottom having plainly scrolled up.
+    const { surface, el, notch, offset } = attachScrollback();
+    // Park mid-row so the sync has a correction to write, and let it settle.
+    el.scrollTop = LINES * CELL_H - 100;
+    // @ts-expect-error — the listener the real scroll event would have run.
+    surface["boundScrollListener"]();
+    now += 200;
+    const runFrames = deferFrames();
+    // @ts-expect-error — the write that claims its own echo.
+    surface["syncScrollSurface"](true);
+    // @ts-expect-error — the claim is outstanding: no echo has arrived yet.
+    expect(surface["pendingScrollTopWrite"]).not.toBeNull();
+
+    const before = offset();
+    notch(-120); // the user's wheel beats the echo to the element
+    expect(offset()).toBe(before + 6);
+    runFrames();
+  });
+
+  it("still ignores the echo of the sync's own write", () => {
+    const { surface, el, offset } = attachScrollback();
+    el.scrollTop = LINES * CELL_H - 100;
+    // @ts-expect-error — the listener the real scroll event would have run.
+    surface["boundScrollListener"]();
+    now += 200;
+    const runFrames = deferFrames();
+    // @ts-expect-error — the write that claims its own echo.
+    surface["syncScrollSurface"](true);
+    const settled = offset();
+    // Something else moved the offset, so processing the echo would show.
+    // @ts-expect-error — a re-anchor arriving between the write and its echo.
+    surface["scrollOffset"] = settled + 3;
+
+    // The browser now reports the position the sync itself asked for.
+    // @ts-expect-error — the echo, which must change nothing.
+    surface["boundScrollListener"]();
+    expect(offset()).toBe(settled + 3);
+    // @ts-expect-error — and the claim is spent, not left to match again.
+    expect(surface["pendingScrollTopWrite"]).toBeNull();
+    runFrames();
+  });
+
   it("still lets ctrl+wheel through as a zoom", () => {
     const { surface, el } = attachScrollback();
     const before = el.scrollTop;
