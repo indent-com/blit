@@ -80,9 +80,10 @@ overridable with `BLIT_MUSTER_DIR`.
 
 - **An entry's name is its basename without `.json`**, unique because the
   filesystem says so. One rule for units, stacks and instances.
-- Top-level file = unit, unless it has `"stack"`, then instance. Subdirectory =
-  stack. Leading `.` ignored (editor litter: `.#api.json`). Nothing below the
-  first level is read.
+- Top-level file = unit, unless it has `"stack"` (an instance of one) or
+  `"include"` (a directory of units adopted as they are); both at once is
+  refused. Subdirectory = stack. Leading `.` ignored (editor litter:
+  `.#api.json`). Nothing below the first level is read.
 - Schema one level up, so it is not itself a unit:
   `blit @muster schema > ~/.config/blit/muster.schema.json`.
 - JSON because `"$schema"` makes every editor a validator — completion, enum
@@ -154,10 +155,12 @@ exits 0 usually meant it, and disagreeing produces a loop rather than an outage.
 `path` and `http` are v1 because four of the five probes in
 `process-compose.yml` are `test -S`, `test -f`, or an HTTP GET; `tcp` is a worse
 approximation of two of them, since a port binds before the thing behind it
-serves. `log` takes its cursor with `SINCE_PROBE` at create (no existing screen
-pulled) and advances by `next_seq`/`next_col`; `OUTPUT_EVICTED` means the unit
-outran the poll, and the start fails on `timeoutStart` rather than hanging. All
-polling stops when the unit leaves `activating`.
+serves. `log` takes its cursor with `SINCE_PROBE` at create — so the match is
+text that arrives *after* the unit started, not whatever was already on screen —
+and then arms one `TERM_WAIT`, which the server holds until the needle appears
+or `timeoutStart` runs out. Nothing about `log` polls, so there is no window in
+which a ready line can be printed and evicted between reads. `path`, `tcp` and
+`http` do poll, and stop when the unit leaves `activating`.
 
 ### `command` versus `shell`
 
@@ -267,7 +270,10 @@ Only in a stack's templates, only in string values (never keys), only these:
 | `${NAME}` | the parameter's value |
 | `${NAME+N}` / `${NAME-N}` | integer offset; `NAME` must be an integer |
 
-`${INSTANCE}` and `${STACK}` are always defined. Unknown name, unclosed `${`, or
+`${INSTANCE}`, `${STACK}` and `${STACK_DIR}` are always defined — the last is
+the stack's own directory, which is what lets a repository-resident stack reach
+its checkout without the instance restating a path it already named. Unknown
+name, unclosed `${`, or
 an offset on a non-integer fails **that instance** — naming file, JSON pointer
 and variable — leaving other instances running. No empty-string fallback: a
 parameter you forgot to bind should not silently produce `http://127.0.0.1:/`.
