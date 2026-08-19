@@ -3205,6 +3205,7 @@ function attachTyping() {
       pointers.push({ type, button });
     },
     sendSurfaceFocus: () => {},
+    sendSurfaceAxis2: () => {},
     noteBrowserClipboardMayHaveChanged: () => {},
     surfaceStore: new Proxy(
       {
@@ -4301,6 +4302,207 @@ describe("BlitSurfaceCanvas macOS dead keys", () => {
       { keycode: 30, pressed: false },
       { keycode: 56, pressed: false },
     ]);
+    surface.dispose();
+  });
+});
+
+/** These pin the per-frame cost of the present path.  `applyLayout` runs on
+ *  every presented frame, so anything that measures or writes layout in there
+ *  is paid at the stream's frame rate — and those writes then invalidate layout
+ *  for the input handlers' own reads, which is what made scrolling a focused
+ *  pane expensive. */
+describe("BlitSurfaceCanvas per-frame layout cost", () => {
+  /** Count forced layout reads on the canvas. */
+  function countRects(canvas: HTMLCanvasElement): () => number {
+    let n = 0;
+    canvas.getBoundingClientRect = () => {
+      n++;
+      return {
+        width: 800,
+        height: 600,
+        left: 0,
+        top: 0,
+        right: 800,
+        bottom: 600,
+      } as DOMRect;
+    };
+    return () => n;
+  }
+
+  /** The IME path only engages for a *focused* capture element, and jsdom only
+   *  focuses an element that is in the document. */
+  function focusedWithCaret(x = 10) {
+    const harness = attachTyping();
+    const container = harness.canvas.parentElement;
+    if (!container) throw new Error("Expected a container");
+    document.body.appendChild(container);
+    harness.ta.focus();
+    if (document.activeElement !== harness.ta) {
+      throw new Error("Expected the capture element to hold focus");
+    }
+    harness.requestTextInput({
+      enabled: true,
+      requested: false,
+      hint: 0,
+      purpose: 0,
+      cursorRect: { x, y: 20, width: 1, height: 16 },
+    });
+    return { ...harness, container };
+  }
+
+  /** Stand in for the presenter: applyLayout is what each presented frame
+   *  reaches, via blitFromStore. */
+  function presentFrames(surface: BlitSurfaceCanvas, n: number): void {
+    for (let i = 0; i < n; i++) surface.setDisplaySize(800, 600, 120);
+  }
+
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  it("does not measure per frame while the IME target is parked", () => {
+    const { surface, canvas, container } = focusedWithCaret();
+    const rects = countRects(canvas);
+    // One warm-up: the caret above invalidated the placement, so the first
+    // frame after it legitimately measures.
+    presentFrames(surface, 1);
+    const settled = rects();
+    expect(settled).toBeGreaterThan(0);
+
+    presentFrames(surface, 30);
+    // Nothing moved, so thirty more frames cost no layout at all.
+    expect(rects()).toBe(settled);
+    surface.dispose();
+    container.remove();
+  });
+
+  it("re-places the IME target when the app reports a new caret", () => {
+    const { surface, canvas, container, requestTextInput } = focusedWithCaret();
+    presentFrames(surface, 1);
+    const rects = countRects(canvas);
+
+    // A caret move is the main reason to re-place, and GTK/Qt send one on every
+    // cursor move, so this — not the frame loop — is what keeps the candidate
+    // window on the cursor.
+    requestTextInput({
+      enabled: true,
+      requested: false,
+      hint: 0,
+      purpose: 0,
+      cursorRect: { x: 40, y: 20, width: 1, height: 16 },
+    });
+    expect(rects()).toBeGreaterThan(0);
+    surface.dispose();
+    container.remove();
+  });
+
+  it("re-places the IME target after something scrolls the pane", () => {
+    const { surface, canvas, container } = focusedWithCaret();
+    presentFrames(surface, 2);
+    const rects = countRects(canvas);
+    presentFrames(surface, 1);
+    const settled = rects();
+
+    // A scroll in any ancestor moves the pane on screen with no notification of
+    // its own, which is why the frame loop used to measure unconditionally.
+    window.dispatchEvent(new Event("scroll"));
+    presentFrames(surface, 1);
+    expect(rects()).toBeGreaterThan(settled);
+    surface.dispose();
+    container.remove();
+  });
+
+  it("measures once per wheel event, not twice", () => {
+    const { surface, canvas } = attachTyping();
+    const rects = countRects(canvas);
+    canvas.dispatchEvent(
+      new WheelEvent("wheel", {
+        deltaY: 12,
+        clientX: 100,
+        clientY: 100,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    // One reading, reused for both the axis scaling and the pointer re-seed that
+    // precedes it on the wire.
+    expect(rects()).toBe(1);
+    surface.dispose();
+  });
+});
+
+describe("BlitSurfaceCanvas change fan-out", () => {
+  /** `SurfaceStore.onChange` is connection-wide and carries no surface id, and
+   *  the store fires it for a title or app-id change on *any* surface. Every
+   *  mounted view listens, so repainting unconditionally made one chatty app
+   *  renaming its window drive a full halving chain plus a layout pass through
+   *  every card and pane on the page. */
+  function mountWithStore() {
+    let info: BlitSurface | undefined = {
+      width: 1920,
+      height: 1080,
+    } as BlitSurface;
+    let change: (() => void) | undefined;
+    let canvasReads = 0;
+    const store = {
+      getSurface: () => info,
+      getCanvas: () => {
+        canvasReads++;
+        return null;
+      },
+      getCursor: () => "default",
+      canDecodeVideo: false,
+      generation: 0,
+      onChange: (cb: () => void) => {
+        change = cb;
+        return () => {};
+      },
+      onCursor: () => () => {},
+      onFrame: () => () => {},
+    };
+    const workspace = {
+      getConnection: () => ({
+        surfaceStore: store,
+        allocSurfaceViewId: () => "c1:s1",
+        sendSurfaceSubscribe: () => {},
+        sendSurfaceUnsubscribe: () => {},
+      }),
+      subscribe: () => () => {},
+    } as unknown as BlitWorkspace;
+    const surface = new BlitSurfaceCanvas({
+      workspace,
+      connectionId: "conn-1" as never,
+      surfaceId: 7,
+      resizable: true,
+    });
+    surface.attach(document.createElement("div"));
+    return {
+      surface,
+      reads: () => canvasReads,
+      fireChange: () => change?.(),
+      /** Stand in for the store replacing this surface's object, which is what
+       *  it does for a resize. */
+      replaceSurface: () => {
+        info = { ...(info as BlitSurface) };
+      },
+    };
+  }
+
+  it("ignores a change that did not touch this view's surface", () => {
+    const { surface, reads, fireChange } = mountWithStore();
+    const before = reads();
+    for (let i = 0; i < 10; i++) fireChange();
+    // Another surface's title moved; nothing here needs redrawing.
+    expect(reads()).toBe(before);
+    surface.dispose();
+  });
+
+  it("still repaints when this view's own surface changes", () => {
+    const { surface, reads, fireChange, replaceSurface } = mountWithStore();
+    const before = reads();
+    replaceSurface();
+    fireChange();
+    expect(reads()).toBeGreaterThan(before);
     surface.dispose();
   });
 });
