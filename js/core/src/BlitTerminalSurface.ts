@@ -12,7 +12,7 @@ import { assessUrl, openUrlSafely, type UrlAssessment } from "./urlSecurity";
 import { devicePixelBox, drawHalved, halve, halvings } from "./downscale";
 import { gridCaretRect, placeChip, placeImeTarget } from "./imeTarget";
 import { captureDelta } from "./prediction";
-import { WheelDetents } from "./wheel";
+import { WheelDetents, notchedRows } from "./wheel";
 
 /** One screen row's slice of a hyperlink's extent, inclusive of both columns. */
 interface LinkSegment {
@@ -3678,10 +3678,21 @@ export class BlitTerminalSurface {
     const wheelDetents = new WheelDetents();
     const handleCanvasWheel = (e: WheelEvent) => {
       const t = this.terminal;
-      if (!t || t.mouse_mode() === 0 || e.shiftKey) return;
+      if (!t) return;
       // Ctrl+wheel is how browsers report a pinch-zoom, including macOS
       // trackpad pinches. It is a zoom request, not a scroll.
       if (e.ctrlKey) return;
+      if (t.mouse_mode() === 0 || e.shiftKey) {
+        // Scrollback navigation. Native scroll does the work; a notched
+        // wheel only has its travel put back on the row grid first, so the
+        // sync has no rounding left to write back afterwards.
+        const rows = notchedRows(e, this.cell.h);
+        const el = this.scrollEl;
+        if (rows === 0 || !el) return;
+        e.preventDefault();
+        el.scrollTop += rows * this.cell.h;
+        return;
+      }
       // Claim the gesture even when it hasn't completed a step yet, or the
       // leftover travel scrolls our own scrollback at the same time.
       e.preventDefault();

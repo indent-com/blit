@@ -38,6 +38,47 @@ export const SCROLL_STOP_MS = 280;
 const MAX_DETENTS_PER_EVENT = 32;
 
 /**
+ * Whole rows a notched wheel should travel, or 0 for anything that is not a
+ * notched wheel and should keep the browser's own scrolling.
+ *
+ * A notch is 120 CSS px whatever the font is, so left to the browser it lands
+ * mid-row.  A terminal can only show whole rows, so the offset that position
+ * maps to is rounded, and the render loop writes the rounding back to
+ * `scrollTop` once the gesture settles — a jerk of up to half a row, in
+ * whichever direction the remainder fell, arriving as late as the next cursor
+ * blink.  Every notch leaves a different remainder, so the jerks alternate:
+ * at a 19px cell, twelve notches moved 6 or 7 rows apiece and snapped back by
+ * +6, -7, -1, +5, -8, -2, +4, -9, -3, +3, +9, -4 px.
+ *
+ * Rounding the *travel* instead keeps the surface on the row grid, so there is
+ * no remainder to write back and every notch moves the same distance.  The
+ * distance is still the notch's own 120px worth of rows, so the wheel keeps
+ * the speed the browser was giving it.
+ *
+ * Pixel-precise devices are deliberately left alone: a trackpad means the
+ * fraction it reports, and being continuous it settles once per gesture rather
+ * than once per notch.  macOS varies a notch's size with its own scroll
+ * acceleration, which is why a wheel there is not recognisable by size and
+ * falls here too.
+ */
+export function notchedRows(e: WheelEvent, rowHeightPx: number): number {
+  if (!(rowHeightPx > 0)) return 0;
+  const dy = e.deltaY;
+  if (!dy || !Number.isFinite(dy)) return 0;
+  const rowsPerNotch = Math.max(1, Math.round(WHEEL_DETENT_PX / rowHeightPx));
+  // Firefox reports a notched wheel in lines of its own line box; Chrome and
+  // Edge report it on a whole-detent pixel grid.  Anything else is travel.
+  const notches =
+    e.deltaMode === WHEEL_MODE_LINE
+      ? dy / WHEEL_LINES_PER_DETENT
+      : e.deltaMode === 0
+        ? dy / WHEEL_DETENT_PX
+        : 0;
+  if (!Number.isInteger(notches) || notches === 0) return 0;
+  return notches * rowsPerNotch;
+}
+
+/**
  * Accumulates wheel travel into whole detents.
  *
  * One detent is what an app reading the mouse expects per wheel report —
