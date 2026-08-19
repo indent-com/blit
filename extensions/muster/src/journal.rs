@@ -192,7 +192,14 @@ impl Record {
 }
 
 /// How many records the live tail holds.
-pub const RING: usize = 1024;
+///
+/// Sized so it is never the binding constraint: bringing up a hundred units
+/// emits on the order of five hundred records, so this holds a dozen or so cold
+/// starts. It stays bounded only because a crash-looping unit emits records
+/// forever — at a 250 ms floor that is four a second — and a supervisor is
+/// long-lived. It is a backstop against that, not a budget anyone should have
+/// to think about.
+pub const RING: usize = 16_384;
 
 #[derive(Debug, Default)]
 pub struct Journal {

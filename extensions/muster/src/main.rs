@@ -63,6 +63,10 @@ const DESCRIPTOR: &str = r#"{
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
 
+/// How long the filesystem watch coalesces changes before reporting them.
+/// Enough that saving a file is one event rather than one per write.
+const SETTLE_MS: u16 = 200;
+
 /// How often a `path`/`tcp`/`http` probe is retried while activating.
 const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 /// `log` polls faster: it is racing a ring buffer, not a listening socket.
@@ -328,8 +332,11 @@ impl Muster {
         let packet = remote::fs::msg_fs_sync(
             nonce,
             remote::fs::FS_SYNC_RECURSIVE | remote::fs::FS_SYNC_CONTENT,
-            200,
-            64 * 1024,
+            SETTLE_MS,
+            // Zero takes the server's own inline ceiling. A 64 KiB cap here
+            // only ever meant "a unit file larger than this silently becomes
+            // invalid", which is a rule nobody wants and nobody would guess.
+            0,
             path,
         );
         if client.send(&packet).is_ok() {
@@ -1423,7 +1430,8 @@ impl Muster {
     /// One-shot read of an absolute path. `FS_READ` needs no sync.
     fn read_file(&mut self, client: &mut Client, path: &str) -> Option<Vec<u8>> {
         let nonce = self.next_nonce();
-        let packet = remote::fs::msg_fs_read_paths(nonce, 0, 1024 * 1024, &[path])?;
+        // Zero takes the server's per-file ceiling rather than inventing one.
+        let packet = remote::fs::msg_fs_read_paths(nonce, 0, 0, &[path])?;
         client.send(&packet).ok()?;
         let reply = client
             .recv_matching(|p| {
@@ -1608,7 +1616,10 @@ impl Muster {
             }
         };
         let nonce = self.next_nonce();
-        let packet = remote::journal::msg_term_since(nonce, pty, from_seq, from_col, 64 * 1024, 0);
+        // Zero takes the server's read budget. This is a per-poll slice, not a
+        // limit on what can match: whatever is not returned advances the cursor
+        // and arrives on the next poll.
+        let packet = remote::journal::msg_term_since(nonce, pty, from_seq, from_col, 0, 0);
         if client.send(&packet).is_err() {
             return false;
         }
