@@ -19,7 +19,7 @@ use blit_guest::remote::{self, ServerMsg};
 use blit_guest::terminal::{CreateRequest, TerminalSubscriptions};
 use blit_guest::{Client, EXIT_BOOTSTRAP_FAILURE, MonotonicInstant, WaitOutcome};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 const DESCRIPTOR: &str = r#"{
@@ -100,8 +100,12 @@ pub extern "C" fn __blit_guest_main() -> i32 {
 struct Muster {
     /// Absolute, `~` already expanded: the FS family does not expand it.
     dir: String,
-    mirror: remote::fs::FsMirror,
-    sync_id: Option<u16>,
+    /// Watched directories. Root 0 is `dir`; the rest are named by pointer
+    /// files in it.
+    roots: Vec<Root>,
+    /// Roots the server refused, kept so `doctor` can say so on every run
+    /// rather than only in the journal at the moment it happened.
+    unwatchable: BTreeMap<String, u8>,
     units: BTreeMap<String, Unit>,
     stacks: BTreeMap<String, StackFile>,
     instances: BTreeMap<String, Instance>,
@@ -130,6 +134,16 @@ struct Instance {
     members: Vec<String>,
 }
 
+/// One watched directory and the mirror of its contents.
+struct Root {
+    path: String,
+    /// Correlates `S2C_FS_SYNCED`, which is the only thing that carries the
+    /// sync id back.
+    nonce: u16,
+    sync_id: Option<u16>,
+    mirror: remote::fs::FsMirror,
+}
+
 fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
     let features = client.context().hello.features;
     require(features, remote::fs::FEATURE_FS, "FS")?;
@@ -139,8 +153,8 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
     let dir = resolve_dir(&mut client)?;
     let mut muster = Muster {
         dir,
-        mirror: remote::fs::FsMirror::new(),
-        sync_id: None,
+        roots: Vec::new(),
+        unwatchable: BTreeMap::new(),
         units: BTreeMap::new(),
         stacks: BTreeMap::new(),
         instances: BTreeMap::new(),
@@ -166,7 +180,8 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
         );
     }
 
-    muster.start_watch(&mut client)?;
+    let dir = muster.dir.clone();
+    muster.watch(&mut client, &dir);
 
     let listener_name = format!(
         "blit.cli.{:016x}.{}",
@@ -289,21 +304,95 @@ impl Muster {
         self.nonce
     }
 
-    /// One sync over the whole directory. Not recursive would miss stacks; the
-    /// second level is dropped when the mirror is read instead.
-    fn start_watch(&mut self, client: &mut Client) -> Result<(), String> {
+    /// Start watching one directory. Recursive, because a stack is a
+    /// subdirectory; the second level is dropped when the mirror is read.
+    ///
+    /// The configuration directory is root 0 and is never dropped. Every other
+    /// root is named by a pointer file in it — an instance whose `stack` is a
+    /// path, or an include — so discovery always begins somewhere the user
+    /// deliberately wrote, never in a checkout that merely happens to be there.
+    fn watch(&mut self, client: &mut Client, path: &str) {
+        if self.roots.iter().any(|root| root.path == path) {
+            return;
+        }
         let nonce = self.next_nonce();
         let packet = remote::fs::msg_fs_sync(
             nonce,
             remote::fs::FS_SYNC_RECURSIVE | remote::fs::FS_SYNC_CONTENT,
             200,
             64 * 1024,
-            &self.dir,
+            path,
         );
-        client
-            .send(&packet)
-            .map_err(|e| format!("fs sync: {e:?}"))?;
-        Ok(())
+        if client.send(&packet).is_ok() {
+            self.roots.push(Root {
+                path: path.to_string(),
+                nonce,
+                sync_id: None,
+                mirror: remote::fs::FsMirror::new(),
+            });
+        }
+    }
+
+    /// Stop watching the roots no pointer names any more.
+    fn prune_roots(&mut self, client: &mut Client, wanted: &BTreeSet<String>) {
+        let mut kept = Vec::with_capacity(self.roots.len());
+        for root in std::mem::take(&mut self.roots) {
+            // Root 0 is the configuration directory: it is what names the
+            // others, so it outlives all of them.
+            if kept.is_empty() || wanted.contains(&root.path) {
+                kept.push(root);
+                continue;
+            }
+            if let Some(sync_id) = root.sync_id {
+                let _ = client.send(&remote::fs::msg_fs_stop(sync_id));
+            }
+        }
+        self.roots = kept;
+    }
+
+    /// A `stack`/`include` value as an absolute directory.
+    ///
+    /// A bare word is a subdirectory of the configuration directory; anything
+    /// else is a path, with `~` expanded here because the FS family does not
+    /// expand it.
+    pub(crate) fn resolve_path(&self, value: &str) -> String {
+        if config::is_path(value) {
+            let expanded = expand_tilde(value, &self.home());
+            // Relative paths would resolve against the *server's* cwd, which is
+            // never what a pointer file meant.
+            if expanded.starts_with('/') {
+                expanded
+            } else {
+                format!("{}/{expanded}", self.dir)
+            }
+        } else {
+            format!("{}/{value}", self.dir)
+        }
+    }
+
+    /// One file from one watched root, by its path relative to that root.
+    pub(crate) fn file_at(&self, root: &str, relative: &str) -> Option<Vec<u8>> {
+        self.roots
+            .iter()
+            .find(|r| r.path == root)?
+            .mirror
+            .live
+            .get(relative)?
+            .content
+            .clone()
+    }
+
+    fn files_in(&self, path: &str) -> BTreeMap<String, Vec<u8>> {
+        let Some(root) = self.roots.iter().find(|root| root.path == path) else {
+            return BTreeMap::new();
+        };
+        root.mirror
+            .live
+            .iter()
+            .filter(|(path, _)| !path.starts_with('.') && !path.contains("/."))
+            .filter(|(path, _)| path.ends_with(".json"))
+            .filter_map(|(path, node)| node.content.as_ref().map(|c| (path.clone(), c.clone())))
+            .collect()
     }
 
     fn next_deadline(&self, client: &Client, now: u64) -> MonotonicInstant {
@@ -330,26 +419,39 @@ impl Muster {
             // every update that follows.
             Some(remote::fs::S2C_FS_SYNCED) => {
                 if packet.len() >= 6 {
+                    let nonce = u16::from_le_bytes([packet[1], packet[2]]);
                     let status = packet[5];
+                    let Some(root) = self.roots.iter_mut().find(|root| root.nonce == nonce) else {
+                        return;
+                    };
                     if status == remote::fs::FS_STATUS_OK {
-                        self.sync_id = Some(u16::from_le_bytes([packet[3], packet[4]]));
+                        root.sync_id = Some(u16::from_le_bytes([packet[3], packet[4]]));
                     } else {
                         // A directory that cannot be watched is the difference
                         // between "no units" and "no configuration", and
                         // silence does not distinguish them.
+                        let path = root.path.clone();
+                        self.unwatchable.insert(path.clone(), status);
                         self.findings.push(ConfigError::new(
-                            self.dir.clone(),
+                            path,
                             format!("cannot watch this directory (status {status})"),
                         ));
                     }
                 }
             }
             Some(remote::fs::S2C_FS_UPDATE) => {
-                let Some(sync_id) = self.sync_id else { return };
-                if packet.len() < 8 || u16::from_le_bytes([packet[1], packet[2]]) != sync_id {
+                if packet.len() < 8 {
                     return;
                 }
-                if let Some(update_id) = self.mirror.apply_update(packet) {
+                let sync_id = u16::from_le_bytes([packet[1], packet[2]]);
+                let Some(root) = self
+                    .roots
+                    .iter_mut()
+                    .find(|root| root.sync_id == Some(sync_id))
+                else {
+                    return;
+                };
+                if let Some(update_id) = root.mirror.apply_update(packet) {
                     let _ = client.send(&remote::fs::msg_fs_ack(sync_id, update_id));
                     self.load(client);
                 }
@@ -376,67 +478,96 @@ impl Muster {
     fn load(&mut self, client: &mut Client) {
         let now = self.now_ms(client);
         self.findings.clear();
-
-        let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        for (path, node) in &self.mirror.live {
-            if path.starts_with('.') || path.contains("/.") {
-                continue;
-            }
-            if !path.ends_with(".json") {
-                continue;
-            }
-            // Nothing below the second level is read.
-            if path.matches('/').count() > 1 {
-                continue;
-            }
-            if let Some(content) = &node.content {
-                files.insert(path.clone(), content.clone());
-            }
+        for (path, status) in &self.unwatchable {
+            self.findings.push(ConfigError::new(
+                path.clone(),
+                format!("cannot watch this directory (status {status})"),
+            ));
         }
 
-        // Stacks first: an instance cannot resolve without its declarations.
-        self.stacks.clear();
-        for (path, bytes) in &files {
-            let Some((dir, base)) = path.rsplit_once('/') else {
-                continue;
-            };
-            if base != "stack.json" {
-                continue;
-            }
-            match config::parse_json(path, bytes).and_then(|v| {
-                serde_json::from_value(v).map_err(|e| ConfigError::new(path, e.to_string()))
-            }) {
-                Ok(stack) => {
-                    self.stacks.insert(dir.to_string(), stack);
-                }
-                Err(err) => self.findings.push(err),
-            }
-        }
-        // A stack directory with templates but no stack.json still works: it
-        // simply declares no parameters.
-        for path in files.keys() {
-            if let Some((dir, _)) = path.rsplit_once('/')
-                && !self.stacks.contains_key(dir)
-            {
-                self.stacks.insert(dir.to_string(), StackFile::default());
-            }
-        }
+        let dir = self.dir.clone();
+        let files = self.files_in(&dir);
+        // Nothing below the second level of the configuration directory is
+        // read: a stack is a subdirectory, and anything deeper is yours.
+        let files: BTreeMap<String, Vec<u8>> = files
+            .into_iter()
+            .filter(|(path, _)| path.matches('/').count() <= 1)
+            .collect();
 
-        let mut wanted: BTreeMap<String, Unit> = BTreeMap::new();
-        let mut instances: BTreeMap<String, Instance> = BTreeMap::new();
-
+        // Pass one: sort the top level into units, instances and includes, and
+        // learn which directories outside the configuration one are named.
+        let mut pointers: Vec<(String, TopLevel)> = Vec::new();
+        let mut external: BTreeSet<String> = BTreeSet::new();
         for (path, bytes) in &files {
             if path.contains('/') {
                 continue;
             }
             let name = path.trim_end_matches(".json").to_string();
             match config::parse_top_level(path, bytes) {
-                Ok(TopLevel::Unit(file)) => {
-                    wanted.insert(name.clone(), Unit::new(name, None, *file));
+                Ok(top) => {
+                    match &top {
+                        TopLevel::Instance(instance) if config::is_path(&instance.stack) => {
+                            external.insert(self.resolve_path(&instance.stack));
+                        }
+                        TopLevel::Include(include) => {
+                            external.insert(self.resolve_path(&include.include));
+                        }
+                        _ => {}
+                    }
+                    pointers.push((name, top));
                 }
-                Ok(TopLevel::Instance(instance)) => match self.expand(&name, &instance, &files) {
+                Err(err) => self.findings.push(err),
+            }
+        }
+
+        // Adjust the watch set before reading anything from it. A root added
+        // here is empty until its own updates arrive, which triggers another
+        // load — so a new pointer costs one extra pass, not a missing stack.
+        self.prune_roots(client, &external);
+        self.unwatchable.retain(|path, _| external.contains(path));
+        for path in &external {
+            self.watch(client, path);
+        }
+
+        // Stacks declared inside the configuration directory. External ones are
+        // resolved per instance, since their declarations live beside them.
+        self.stacks.clear();
+        for (path, bytes) in &files {
+            let Some((sub, base)) = path.rsplit_once('/') else {
+                continue;
+            };
+            if base == "stack.json" {
+                match config::parse_json(path, bytes).and_then(|v| {
+                    serde_json::from_value(v).map_err(|e| ConfigError::new(path, e.to_string()))
+                }) {
+                    Ok(stack) => {
+                        self.stacks.insert(sub.to_string(), stack);
+                    }
+                    Err(err) => self.findings.push(err),
+                }
+            } else {
+                // A stack directory with templates but no stack.json still
+                // works: it simply declares no parameters.
+                self.stacks.entry(sub.to_string()).or_default();
+            }
+        }
+
+        let mut wanted: BTreeMap<String, Unit> = BTreeMap::new();
+        let mut instances: BTreeMap<String, Instance> = BTreeMap::new();
+        // Which pointer contributed each name, so a collision can name both.
+        let mut provenance: BTreeMap<String, String> = BTreeMap::new();
+
+        for (name, top) in pointers {
+            let file = format!("{name}.json");
+            match top {
+                TopLevel::Unit(unit) => {
+                    provenance.insert(name.clone(), file);
+                    wanted.insert(name.clone(), Unit::new(name, None, *unit));
+                }
+                TopLevel::Instance(instance) => match self.expand(&name, &instance, &files) {
                     Ok((members, units)) => {
                         for unit in units {
+                            provenance.insert(unit.name.clone(), file.clone());
                             wanted.insert(unit.name.clone(), unit);
                         }
                         instances.insert(
@@ -444,14 +575,56 @@ impl Muster {
                             Instance {
                                 stack: instance.stack.clone(),
                                 vars: instance.vars.clone(),
-
                                 members,
                             },
                         );
                     }
-                    Err(err) => self.findings.push(ConfigError::new(path, err)),
+                    Err(err) => self.findings.push(ConfigError::new(file, err)),
                 },
-                Err(err) => self.findings.push(err),
+                TopLevel::Include(include) => {
+                    let root = self.resolve_path(&include.include);
+                    for (template, bytes) in self.files_in(&root) {
+                        // An include contributes ordinary units only. Its
+                        // subdirectories are not stacks — an instance names a
+                        // stack by path, which is a different pointer.
+                        if template.contains('/') {
+                            continue;
+                        }
+                        let unit_name = template.trim_end_matches(".json").to_string();
+                        if include.omit.contains(&unit_name) {
+                            continue;
+                        }
+                        let where_ = format!("{root}/{template}");
+                        match config::parse_top_level(&where_, &bytes) {
+                            Ok(TopLevel::Unit(mut unit)) => {
+                                // An include adds no suffix, so two of them
+                                // offering one name is ambiguous rather than
+                                // mergeable. First writer wins, and both are
+                                // named, so the fix is obvious.
+                                if let Some(first) = provenance.get(&unit_name) {
+                                    self.findings.push(ConfigError::new(
+                                        file.clone(),
+                                        format!(
+                                            "{unit_name:?} is already provided by {first}; \
+                                             omit it in one of them"
+                                        ),
+                                    ));
+                                    continue;
+                                }
+                                if !include.autostart {
+                                    unit.autostart = false;
+                                }
+                                provenance.insert(unit_name.clone(), file.clone());
+                                wanted.insert(unit_name.clone(), Unit::new(unit_name, None, *unit));
+                            }
+                            Ok(_) => self.findings.push(ConfigError::new(
+                                where_,
+                                "an included directory holds units, not stacks or instances",
+                            )),
+                            Err(err) => self.findings.push(err),
+                        }
+                    }
+                }
             }
         }
 
@@ -473,36 +646,89 @@ impl Muster {
         instance: &InstanceFile,
         files: &BTreeMap<String, Vec<u8>>,
     ) -> Result<(Vec<String>, Vec<Unit>), String> {
-        let stack = self
-            .stacks
-            .get(&instance.stack)
-            .ok_or_else(|| format!("no stack named {:?}", instance.stack))?;
-        let vars = config::bind_vars(instance_name, &instance.stack, stack, &instance.vars)?;
+        let stack_dir = self.resolve_path(&instance.stack);
+        // A stack in the configuration directory declares itself in a
+        // subdirectory; one outside declares itself beside its templates. Both
+        // reduce to a directory and a `stack.json` inside it.
+        let (declarations, templates) = if config::is_path(&instance.stack) {
+            let outside = self.files_in(&stack_dir);
+            if outside.is_empty() && !self.roots.iter().any(|r| r.path == stack_dir) {
+                return Err(format!("{stack_dir} is not being watched yet"));
+            }
+            let declared = outside
+                .get("stack.json")
+                .map(|bytes| {
+                    config::parse_json("stack.json", bytes).and_then(|v| {
+                        serde_json::from_value(v)
+                            .map_err(|e| ConfigError::new("stack.json", e.to_string()))
+                    })
+                })
+                .transpose()
+                .map_err(|e| e.detail)?
+                .unwrap_or_default();
+            let templates: BTreeMap<String, Vec<u8>> = outside
+                .into_iter()
+                .filter(|(name, _)| !name.contains('/') && name != "stack.json")
+                .collect();
+            (declared, templates)
+        } else {
+            let declared = self
+                .stacks
+                .get(&instance.stack)
+                .ok_or_else(|| format!("no stack named {:?}", instance.stack))?
+                .clone();
+            let prefix = format!("{}/", instance.stack);
+            let templates: BTreeMap<String, Vec<u8>> = files
+                .iter()
+                .filter_map(|(path, bytes)| {
+                    path.strip_prefix(&prefix)
+                        .filter(|base| *base != "stack.json" && !base.contains('/'))
+                        .map(|base| (base.to_string(), bytes.clone()))
+                })
+                .collect();
+            (declared, templates)
+        };
+
+        let vars = config::bind_vars(
+            instance_name,
+            &instance.stack,
+            &stack_dir,
+            &declarations,
+            &instance.vars,
+        )?;
 
         let mut members = Vec::new();
         let mut units = Vec::new();
-        for (path, bytes) in files {
-            let Some((dir, base)) = path.rsplit_once('/') else {
-                continue;
-            };
-            if dir != instance.stack || base == "stack.json" {
-                continue;
-            }
+        for (base, bytes) in &templates {
             let template = base.trim_end_matches(".json");
             if instance.omit.iter().any(|o| o == template) {
                 continue;
             }
-            let mut value = config::parse_json(path, bytes).map_err(|e| e.detail)?;
+            let path = format!("{stack_dir}/{base}");
+            let mut value = config::parse_json(&path, bytes).map_err(|e| e.detail)?;
             config::substitute(&mut value, &vars)?;
-            let file: UnitFile =
+            let mut file: UnitFile =
                 serde_json::from_value(value).map_err(|e| format!("{path}: {e}"))?;
-            file.validate(path).map_err(|e| e.detail)?;
+            // A relative path in a template is relative to the stack, which is
+            // what lets a repository-resident stack say `"cwd": "../.."` and
+            // mean its own checkout rather than the server's cwd.
+            if let Some(cwd) = &file.cwd
+                && !cwd.starts_with('/')
+                && !cwd.starts_with('~')
+            {
+                file.cwd = Some(format!("{stack_dir}/{cwd}"));
+            }
+            for entry in &mut file.env_file {
+                if !entry.path.starts_with('/') && !entry.path.starts_with('~') {
+                    entry.path = format!("{stack_dir}/{}", entry.path);
+                }
+            }
+            file.validate(&path).map_err(|e| e.detail)?;
             let name = format!("{template}@{instance_name}");
             members.push(name.clone());
 
             // Inside a stack, dependencies name templates and always resolve
             // within the same instance.
-            let mut file = file;
             let qualify = |names: &mut Vec<String>| {
                 for n in names.iter_mut() {
                     *n = format!("{n}@{instance_name}");
