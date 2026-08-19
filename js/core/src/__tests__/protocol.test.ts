@@ -49,6 +49,9 @@ import {
   CREATE2_HAS_SRC_PTY,
   CREATE2_HAS_COMMAND,
   CREATE2_HAS_CWD,
+  CREATE2_HAS_DEADLINE,
+  CREATE2_HAS_ENV,
+  CREATE2_HAS_ARGV,
   C2S_SURFACE_POINTER_AXIS2,
   C2S_SURFACE_ACK,
   C2S_SURFACE_SUBSCRIBE,
@@ -359,6 +362,129 @@ describe("protocol message builders", () => {
       expect(msg[7]).toBe(
         CREATE2_HAS_CWD | CREATE2_HAS_COMMAND | CREATE2_WANT_STATUS,
       );
+    });
+
+    it("with a deadline, before any command bytes", () => {
+      const msg = buildCreate2Message(0, 24, 80, {
+        cwd: "/tmp",
+        deadlineMs: 5_000,
+        command: "sleep 60",
+      });
+      expect(msg[7]).toBe(
+        CREATE2_HAS_CWD | CREATE2_HAS_DEADLINE | CREATE2_HAS_COMMAND,
+      );
+      const cwdLen = msg[10] | (msg[11] << 8);
+      expect(textDecoder.decode(msg.subarray(12, 12 + cwdLen))).toBe("/tmp");
+      let cursor = 12 + cwdLen;
+      const ms =
+        msg[cursor] |
+        (msg[cursor + 1] << 8) |
+        (msg[cursor + 2] << 16) |
+        (msg[cursor + 3] << 24);
+      expect(ms).toBe(5_000);
+      cursor += 4;
+      expect(textDecoder.decode(msg.subarray(cursor))).toBe("sleep 60");
+    });
+
+    it("with argv instead of a command", () => {
+      const msg = buildCreate2Message(0, 24, 80, {
+        argv: ["cargo", "test", "--release"],
+      });
+      expect(msg[7]).toBe(CREATE2_HAS_ARGV);
+      let cursor = 10;
+      expect(msg[cursor] | (msg[cursor + 1] << 8)).toBe(3);
+      cursor += 2;
+      const args: string[] = [];
+      for (let i = 0; i < 3; i++) {
+        const len =
+          msg[cursor] |
+          (msg[cursor + 1] << 8) |
+          (msg[cursor + 2] << 16) |
+          (msg[cursor + 3] << 24);
+        cursor += 4;
+        args.push(textDecoder.decode(msg.subarray(cursor, cursor + len)));
+        cursor += len;
+      }
+      expect(args).toEqual(["cargo", "test", "--release"]);
+      expect(msg.length).toBe(cursor);
+    });
+
+    it("with an environment, before the argv", () => {
+      const msg = buildCreate2Message(0, 24, 80, {
+        env: { RUST_LOG: "debug", EMPTY: "" },
+        argv: ["cargo", "run"],
+      });
+      expect(msg[7]).toBe(CREATE2_HAS_ENV | CREATE2_HAS_ARGV);
+      let cursor = 10;
+      expect(msg[cursor] | (msg[cursor + 1] << 8)).toBe(2);
+      cursor += 2;
+      const env: [string, string][] = [];
+      for (let i = 0; i < 2; i++) {
+        const keyLen = msg[cursor] | (msg[cursor + 1] << 8);
+        cursor += 2;
+        const key = textDecoder.decode(msg.subarray(cursor, cursor + keyLen));
+        cursor += keyLen;
+        const valueLen =
+          msg[cursor] |
+          (msg[cursor + 1] << 8) |
+          (msg[cursor + 2] << 16) |
+          (msg[cursor + 3] << 24);
+        cursor += 4;
+        env.push([
+          key,
+          textDecoder.decode(msg.subarray(cursor, cursor + valueLen)),
+        ]);
+        cursor += valueLen;
+      }
+      expect(env).toEqual([
+        ["RUST_LOG", "debug"],
+        ["EMPTY", ""],
+      ]);
+      // The argv block follows, so the env block's own length was honoured.
+      expect(msg[cursor] | (msg[cursor + 1] << 8)).toBe(2);
+    });
+
+    it("refuses what the server would refuse", () => {
+      expect(() =>
+        buildCreate2Message(0, 24, 80, { argv: ["sh"], command: "sh" }),
+      ).toThrow(/exclusive/);
+      expect(() => buildCreate2Message(0, 24, 80, { argv: [] })).toThrow(
+        /empty/,
+      );
+      expect(() =>
+        buildCreate2Message(0, 24, 80, { env: { "A=B": "1" } }),
+      ).toThrow(/environment key/);
+      expect(() =>
+        buildCreate2Message(0, 24, 80, { env: { A: "x\0y" } }),
+      ).toThrow(/NUL/);
+      expect(() =>
+        buildCreate2Message(0, 24, 80, {
+          env: [
+            ["A", "1"],
+            ["A", "2"],
+          ],
+        }),
+      ).toThrow(/duplicate/);
+    });
+
+    /** An empty argument is exactly what the legacy NUL spelling could not
+     *  carry, so it is the sharpest check that argv is length-prefixed. */
+    it("keeps an empty argument", () => {
+      const msg = buildCreate2Message(0, 24, 80, { argv: ["sh", "-c", ""] });
+      let cursor = 10;
+      expect(msg[cursor] | (msg[cursor + 1] << 8)).toBe(3);
+      cursor += 2;
+      const lengths: number[] = [];
+      for (let i = 0; i < 3; i++) {
+        const len =
+          msg[cursor] |
+          (msg[cursor + 1] << 8) |
+          (msg[cursor + 2] << 16) |
+          (msg[cursor + 3] << 24);
+        lengths.push(len);
+        cursor += 4 + len;
+      }
+      expect(lengths).toEqual([2, 2, 0]);
     });
   });
 });

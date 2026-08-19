@@ -337,6 +337,61 @@ fn build_command_line(shell: &str, shell_flags: &str, command: Option<&str>) -> 
     to_wide(&cmd)
 }
 
+/// What to run in a terminal, and where.
+///
+/// The pseudoconsole takes a command *line*, so `argv` and `env` are carried
+/// for signature parity with the Unix path and cannot be honored here — which
+/// is why `FEATURE_CREATE_EXEC` is not advertised on this platform and the
+/// create path refuses a request that sets either.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChildSpec<'a> {
+    pub command: Option<&'a str>,
+    pub argv: Option<&'a [&'a str]>,
+    pub dir: Option<&'a str>,
+    pub env: &'a [(String, String)],
+}
+
+/// [`ChildSpec`] with owned strings, held by a `Pty` so a restart can replay
+/// the same child.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnedChildSpec {
+    pub command: Option<String>,
+    pub argv: Option<Vec<String>>,
+    pub dir: Option<String>,
+    pub env: Vec<(String, String)>,
+}
+
+impl OwnedChildSpec {
+    pub fn borrowed<'a>(&'a self, argv: &'a [&'a str]) -> ChildSpec<'a> {
+        ChildSpec {
+            command: self.command.as_deref(),
+            argv: self.argv.is_some().then_some(argv),
+            dir: self.dir.as_deref(),
+            env: &self.env,
+        }
+    }
+
+    pub fn argv_refs(&self) -> Vec<&str> {
+        self.argv
+            .as_deref()
+            .map(|args| args.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+}
+
+impl ChildSpec<'_> {
+    pub fn to_owned_spec(self) -> OwnedChildSpec {
+        OwnedChildSpec {
+            command: self.command.map(str::to_owned),
+            argv: self
+                .argv
+                .map(|args| args.iter().map(|a| (*a).to_owned()).collect()),
+            dir: self.dir.map(str::to_owned),
+            env: self.env.to_vec(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_pty(
     shell: &str,
@@ -345,9 +400,8 @@ pub fn spawn_pty(
     cols: u16,
     id: u16,
     tag: &str,
-    command: Option<&str>,
-    _argv: Option<&[&str]>,
-    dir: Option<&str>,
+    spec: ChildSpec<'_>,
+    list_command: Option<&str>,
     scrollback: usize,
     state: AppState,
     _wayland_display: Option<&str>,
@@ -356,6 +410,8 @@ pub fn spawn_pty(
     _pulse_server: Option<&str>,
     _pipewire_remote: Option<&str>,
 ) -> Option<crate::Pty> {
+    let command = spec.command;
+    let dir = spec.dir;
     let (input_read, input_write) = create_pipe_pair()?;
     let (output_read, output_write) = create_pipe_pair()?;
 
@@ -508,8 +564,8 @@ pub fn spawn_pty(
         exited_at: None,
         generation: 0,
         exit_status: blit_remote::EXIT_STATUS_UNKNOWN,
-        command: command.map(|s| s.to_owned()),
-        cwd: dir.map(|s| s.to_owned()),
+        command: list_command.map(str::to_owned),
+        spec: spec.to_owned_spec(),
         osc7_cwd: None,
         journal: crate::journal::CommandJournal::default(),
         osc_carry: Vec::new(),
@@ -522,8 +578,7 @@ pub fn respawn_child(
     rows: u16,
     cols: u16,
     pty_id: u16,
-    command: Option<&str>,
-    dir: Option<&str>,
+    spec: ChildSpec<'_>,
     state: AppState,
     _wayland_display: Option<&str>,
     _x_display: Option<&str>,
@@ -535,6 +590,8 @@ pub fn respawn_child(
     std::thread::JoinHandle<()>,
     mpsc::Receiver<PtyInput>,
 )> {
+    let command = spec.command;
+    let dir = spec.dir;
     let (input_read, input_write) = create_pipe_pair()?;
     let (output_read, output_write) = create_pipe_pair()?;
 

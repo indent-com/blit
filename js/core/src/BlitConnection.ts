@@ -21,6 +21,8 @@ import {
   FEATURE_CLIENT_ORIGIN,
   FEATURE_CREATE_NONCE,
   FEATURE_CREATE_STATUS,
+  FEATURE_CREATE_EXEC,
+  FEATURE_PTY_DEADLINE,
   FEATURE_KILL_MODE,
   FEATURE_RESIZE_BATCH,
   FEATURE_SCROLL_BY,
@@ -490,10 +492,24 @@ export interface CreateSessionOptions {
   rows: number;
   cols: number;
   tag?: string;
+  /** Run this through the server's login shell. Mutually exclusive with
+   *  {@link argv}. */
   command?: string;
+  /** Exec this argv directly — no login shell, so no rc files and no shell
+   *  syntax. Rejected unless the server advertised `FEATURE_CREATE_EXEC`,
+   *  because an older one would quietly start a plain shell instead. */
+  argv?: readonly string[];
   cwdFromSessionId?: SessionId;
   /** Working directory for the new session. Interpreted on the target server. */
   cwd?: string;
+  /** Environment overrides for the child, applied on top of everything the
+   *  server derives. Rejected unless the server advertised
+   *  `FEATURE_CREATE_EXEC`, because an older one would drop them silently. */
+  env?: Readonly<Record<string, string>>;
+  /** Stop the terminal server-side after this many milliseconds, armed at
+   *  creation so it survives this client dying. Rejected unless the server
+   *  advertised `FEATURE_PTY_DEADLINE`. */
+  deadlineMs?: number;
 }
 
 type ResizeSessionOptions = {
@@ -1196,6 +1212,7 @@ export class BlitConnection {
       supportsChannels: false,
       supportsChannelWatch: false,
       supportsExtensions: false,
+      supportsCreateExec: false,
       supportsDesktopMedia: false,
       retryCount: 0,
       bootGeneration: null,
@@ -1397,6 +1414,19 @@ export class BlitConnection {
         `Cannot create PTY while transport is ${this.transport.status}`,
       );
     }
+    // Refuse rather than send a field this server would misread. An unknown
+    // CREATE2 flag is not rejected by the server — it is ignored, and the
+    // bytes behind it are read as something else — so the only safe check is
+    // this one, here, before anything goes out.
+    const hasEnv = Object.keys(options.env ?? {}).length > 0;
+    if ((options.argv || hasEnv) && !(this.features & FEATURE_CREATE_EXEC)) {
+      throw connectionError(
+        "Server does not support starting a terminal with an explicit argv or environment",
+      );
+    }
+    if (options.deadlineMs != null && !(this.features & FEATURE_PTY_DEADLINE)) {
+      throw connectionError("Server does not support terminal deadlines");
+    }
 
     return new Promise<BlitSession>((resolve, reject) => {
       let nonce = 0;
@@ -1413,14 +1443,17 @@ export class BlitConnection {
       this.pendingCreates.set(nonce, {
         resolve,
         reject,
-        command: options.command,
+        command: options.command ?? options.argv?.join(" "),
       });
       this.transport.send(
         buildCreate2Message(nonce, options.rows, options.cols, {
           tag: options.tag,
           command: options.command,
+          argv: options.argv,
           srcPtyId,
           cwd: options.cwd,
+          env: options.env,
+          deadlineMs: options.deadlineMs,
           wantStatus: (this.features & FEATURE_CREATE_STATUS) !== 0,
         }),
       );
@@ -6040,6 +6073,7 @@ export class BlitConnection {
           supportsChannelWatch: (features & FEATURE_CHANNEL_WATCH) !== 0,
           supportsExtensions: (features & FEATURE_EXTENSION) !== 0,
           supportsDesktopMedia: (features & FEATURE_DESKTOP_MEDIA) !== 0,
+          supportsCreateExec: (features & FEATURE_CREATE_EXEC) !== 0,
           bootGeneration,
           serverVersion,
         };

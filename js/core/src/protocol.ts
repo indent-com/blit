@@ -57,6 +57,9 @@ import {
   CREATE2_HAS_COMMAND,
   CREATE2_HAS_CWD,
   CREATE2_WANT_STATUS,
+  CREATE2_HAS_DEADLINE,
+  CREATE2_HAS_ENV,
+  CREATE2_HAS_ARGV,
 } from "./types";
 
 const textEncoder = new TextEncoder();
@@ -300,18 +303,43 @@ export function buildSearchMessage(
   return msg;
 }
 
+export type Create2Options = {
+  tag?: string;
+  /** Run this through the server's login shell. Mutually exclusive with
+   *  {@link argv}. */
+  command?: string;
+  /** Exec this argv directly, no shell. Only pass it when the server
+   *  advertised `FEATURE_CREATE_EXEC`; an older one ignores the flag and
+   *  spawns a plain interactive shell instead of what was asked for. */
+  argv?: readonly string[];
+  srcPtyId?: number;
+  cwd?: string;
+  /** Environment overrides, applied on top of everything the server derives.
+   *  Only pass this when the server advertised `FEATURE_CREATE_EXEC`. */
+  env?:
+    | Readonly<Record<string, string>>
+    | readonly (readonly [string, string])[];
+  /** Only pass this when the server advertised `FEATURE_PTY_DEADLINE`. */
+  deadlineMs?: number;
+  /** Only pass this when the server advertised `FEATURE_CREATE_STATUS`. */
+  wantStatus?: boolean;
+};
+
+/** Encode a `C2S_CREATE2`.
+ *
+ *  Field order is load-bearing and matches the server's parser: tag,
+ *  `src_pty_id`, cwd, deadline, env, argv, then the command — which has no
+ *  length prefix and therefore has to be last.
+ *
+ *  Every optional field past the cwd needs its feature bit negotiated first.
+ *  An older server does not reject an unknown `features` bit; it ignores the
+ *  bit, does not skip the bytes, and reads them as the start of the command.
+ *  See the constants in `types.ts` for what each one does when unsupported. */
 export function buildCreate2Message(
   nonce: number,
   rows: number,
   cols: number,
-  options?: {
-    tag?: string;
-    command?: string;
-    srcPtyId?: number;
-    cwd?: string;
-    /** Only pass this when the server advertised `FEATURE_CREATE_STATUS`. */
-    wantStatus?: boolean;
-  },
+  options?: Create2Options,
 ): Uint8Array {
   const tagBytes = options?.tag
     ? textEncoder.encode(options.tag)
@@ -324,10 +352,28 @@ export function buildCreate2Message(
     ? rawCwdBytes.subarray(0, Math.min(rawCwdBytes.length, 0xffff))
     : new Uint8Array(0);
   const hasCwd = cwdBytes.length > 0;
+  const argv = options?.argv ?? null;
+  if (argv && options?.command) {
+    throw new Error("buildCreate2Message: argv and command are exclusive");
+  }
+  if (argv && argv.length === 0) {
+    throw new Error("buildCreate2Message: argv is empty");
+  }
+  const argvBytes = argv?.map((arg) => textEncoder.encode(arg)) ?? null;
+  const env = normalizeEnv(options?.env);
+  const envBytes = env.map(
+    ([key, value]) =>
+      [textEncoder.encode(key), textEncoder.encode(value)] as const,
+  );
+  const deadlineMs = options?.deadlineMs;
+  const hasDeadline = deadlineMs != null && deadlineMs > 0;
   const cmdText = options?.command?.trim() ?? "";
   const hasCmd = cmdText.length > 0;
   if (hasSrc) features |= CREATE2_HAS_SRC_PTY;
   if (hasCwd) features |= CREATE2_HAS_CWD;
+  if (hasDeadline) features |= CREATE2_HAS_DEADLINE;
+  if (envBytes.length) features |= CREATE2_HAS_ENV;
+  if (argvBytes) features |= CREATE2_HAS_ARGV;
   if (hasCmd) features |= CREATE2_HAS_COMMAND;
   if (options?.wantStatus) features |= CREATE2_WANT_STATUS;
   const cmdBytes = hasCmd ? textEncoder.encode(cmdText) : new Uint8Array(0);
@@ -336,6 +382,13 @@ export function buildCreate2Message(
       tagBytes.length +
       (hasSrc ? 2 : 0) +
       (hasCwd ? 2 + cwdBytes.length : 0) +
+      (hasDeadline ? 4 : 0) +
+      (envBytes.length
+        ? 2 + envBytes.reduce((n, [k, v]) => n + 2 + k.length + 4 + v.length, 0)
+        : 0) +
+      (argvBytes
+        ? 2 + argvBytes.reduce((n, arg) => n + 4 + arg.length, 0)
+        : 0) +
       cmdBytes.length,
   );
   msg[0] = C2S_CREATE2;
@@ -365,8 +418,77 @@ export function buildCreate2Message(
     msg.set(cwdBytes, cursor);
     cursor += cwdBytes.length;
   }
+  if (hasDeadline) {
+    const ms = Math.min(deadlineMs!, 0xffffffff) >>> 0;
+    msg[cursor] = ms & 0xff;
+    msg[cursor + 1] = (ms >>> 8) & 0xff;
+    msg[cursor + 2] = (ms >>> 16) & 0xff;
+    msg[cursor + 3] = (ms >>> 24) & 0xff;
+    cursor += 4;
+  }
+  if (envBytes.length) {
+    msg[cursor] = envBytes.length & 0xff;
+    msg[cursor + 1] = (envBytes.length >> 8) & 0xff;
+    cursor += 2;
+    for (const [key, value] of envBytes) {
+      msg[cursor] = key.length & 0xff;
+      msg[cursor + 1] = (key.length >> 8) & 0xff;
+      cursor += 2;
+      msg.set(key, cursor);
+      cursor += key.length;
+      msg[cursor] = value.length & 0xff;
+      msg[cursor + 1] = (value.length >>> 8) & 0xff;
+      msg[cursor + 2] = (value.length >>> 16) & 0xff;
+      msg[cursor + 3] = (value.length >>> 24) & 0xff;
+      cursor += 4;
+      msg.set(value, cursor);
+      cursor += value.length;
+    }
+  }
+  if (argvBytes) {
+    msg[cursor] = argvBytes.length & 0xff;
+    msg[cursor + 1] = (argvBytes.length >> 8) & 0xff;
+    cursor += 2;
+    for (const arg of argvBytes) {
+      msg[cursor] = arg.length & 0xff;
+      msg[cursor + 1] = (arg.length >>> 8) & 0xff;
+      msg[cursor + 2] = (arg.length >>> 16) & 0xff;
+      msg[cursor + 3] = (arg.length >>> 24) & 0xff;
+      cursor += 4;
+      msg.set(arg, cursor);
+      cursor += arg.length;
+    }
+  }
   if (cmdBytes.length) msg.set(cmdBytes, cursor);
   return msg;
+}
+
+/** Accept either an object or entry pairs, and reject what the server would.
+ *  A key carrying `=` or a NUL cannot survive `execve`, and a duplicate has no
+ *  resolution that does not silently discard a value. */
+function normalizeEnv(
+  env: Create2Options["env"],
+): (readonly [string, string])[] {
+  if (!env) return [];
+  const entries = Array.isArray(env)
+    ? (env as (readonly [string, string])[])
+    : Object.entries(env as Record<string, string>);
+  const seen = new Set<string>();
+  for (const [key, value] of entries) {
+    if (!key || key.includes("=") || key.includes("\0")) {
+      throw new Error(
+        `buildCreate2Message: bad environment key ${JSON.stringify(key)}`,
+      );
+    }
+    if (value.includes("\0")) {
+      throw new Error(`buildCreate2Message: NUL in value for ${key}`);
+    }
+    if (seen.has(key)) {
+      throw new Error(`buildCreate2Message: duplicate environment key ${key}`);
+    }
+    seen.add(key);
+  }
+  return entries;
 }
 
 /** Mouse event types for C2S_MOUSE. */

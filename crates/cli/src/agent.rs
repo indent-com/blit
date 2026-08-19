@@ -4,20 +4,20 @@ use blit_remote::{AXIS_SOURCE_FINGER, AXIS_SOURCE_WHEEL, PointerAxisEvent};
 use blit_remote::{
     C2S_CLIENT_FEATURES, C2S_CLIENT_LIST, C2S_SURFACE_ACK, C2S_SURFACE_CAPTURE, C2S_SURFACE_LIST,
     C2S_SURFACE_POINTER, CAPTURE_FORMAT_AVIF, CAPTURE_FORMAT_PNG, CODEC_SUPPORT_AV1,
-    CODEC_SUPPORT_AV1_444, CODEC_SUPPORT_H264, CODEC_SUPPORT_H264_444, CREATE2_WANT_STATUS,
+    CODEC_SUPPORT_AV1_444, CODEC_SUPPORT_H264, CODEC_SUPPORT_H264_444, Create2Request,
     EXIT_REASON_NORMAL, EXIT_STATUS_UNKNOWN, FEATURE_CLIENT_CONTROL, FEATURE_CLIENT_ORIGIN,
-    FEATURE_CREATE_STATUS, FEATURE_PTY_DEADLINE, KICK_REASON_MAX, S2C_CLIPBOARD_CONTENT,
-    S2C_CLIPBOARD_LIST, S2C_EXITED, S2C_HELLO, S2C_KICKED, S2C_LIST, S2C_PING, S2C_QUIT, S2C_READY,
-    S2C_SURFACE_CAPTURE, S2C_SURFACE_FRAME, S2C_SURFACE_LIST, S2C_TERM_CWD, S2C_TEXT, S2C_TITLE,
-    S2C_UPDATE, STATUS_OK, SURFACE_FRAME_CODEC_AV1, SURFACE_FRAME_CODEC_MASK,
-    SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState, exit_reason_text, msg_ack,
-    msg_c2s_clipboard_get, msg_c2s_clipboard_list, msg_c2s_clipboard_set, msg_c2s_primary_set,
-    msg_client_list, msg_client_list_with_origin, msg_close, msg_create2_full, msg_deadline,
-    msg_display_rate, msg_input, msg_kick, msg_kill, msg_mouse, msg_quit, msg_read, msg_resize,
-    msg_restart, msg_subscribe, msg_surface_close, msg_surface_focus, msg_surface_input,
-    msg_surface_pointer_axis2, msg_surface_resize, msg_surface_subscribe,
-    msg_surface_subscribe_ext, msg_surface_subscribe_scaled, msg_surface_text, msg_term_cwd,
-    parse_server_msg, parse_term_cwd_reply, status_text,
+    FEATURE_CREATE_EXEC, FEATURE_CREATE_STATUS, FEATURE_PTY_DEADLINE, KICK_REASON_MAX,
+    S2C_CLIPBOARD_CONTENT, S2C_CLIPBOARD_LIST, S2C_EXITED, S2C_HELLO, S2C_KICKED, S2C_LIST,
+    S2C_PING, S2C_QUIT, S2C_READY, S2C_SURFACE_CAPTURE, S2C_SURFACE_FRAME, S2C_SURFACE_LIST,
+    S2C_TERM_CWD, S2C_TEXT, S2C_TITLE, S2C_UPDATE, STATUS_OK, SURFACE_FRAME_CODEC_AV1,
+    SURFACE_FRAME_CODEC_MASK, SURFACE_FRAME_FLAG_KEYFRAME, ServerMsg, TerminalState,
+    exit_reason_text, msg_ack, msg_c2s_clipboard_get, msg_c2s_clipboard_list,
+    msg_c2s_clipboard_set, msg_c2s_primary_set, msg_client_list, msg_client_list_with_origin,
+    msg_close, msg_create2_request, msg_deadline, msg_display_rate, msg_input, msg_kick, msg_kill,
+    msg_mouse, msg_quit, msg_read, msg_resize, msg_restart, msg_subscribe, msg_surface_close,
+    msg_surface_focus, msg_surface_input, msg_surface_pointer_axis2, msg_surface_resize,
+    msg_surface_subscribe, msg_surface_subscribe_ext, msg_surface_subscribe_scaled,
+    msg_surface_text, msg_term_cwd, parse_server_msg, parse_term_cwd_reply, status_text,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -475,40 +475,95 @@ pub async fn cmd_deadline(transport: Transport, id: u16, seconds: u64) -> Result
     Ok(())
 }
 
-pub async fn cmd_start(
-    transport: Transport,
-    tag: Option<String>,
-    command: Vec<String>,
-    rows: u16,
-    cols: u16,
-    deadline: Option<u64>,
-) -> Result<u16, String> {
+/// Split a `KEY=VALUE` pair the way `env(1)` does: on the first `=`.
+pub fn parse_env_assignment(entry: &str) -> Result<(&str, &str), String> {
+    match entry.split_once('=') {
+        Some(("", _)) => Err(format!("--env needs a name before the '=': {entry:?}")),
+        Some(pair) => Ok(pair),
+        None => Err(format!("--env needs KEY=VALUE, got {entry:?}")),
+    }
+}
+
+/// Characters that mean something to a shell and nothing to `execve`.
+/// A lone word carrying one of these is almost always a shell line someone
+/// expected to be interpreted, and silently exec'ing it fails with a bare
+/// `No such file or directory` naming the whole line.
+const SHELL_SYNTAX: &[char] = &['|', '&', ';', '<', '>', '(', ')', '$', '`', '*', '?', '\n'];
+
+pub struct StartRequest {
+    pub tag: Option<String>,
+    pub command: Vec<String>,
+    pub shell: bool,
+    pub cwd: Option<String>,
+    pub env: Vec<String>,
+    pub rows: u16,
+    pub cols: u16,
+    pub deadline: Option<u64>,
+}
+
+pub async fn cmd_start(transport: Transport, req: StartRequest) -> Result<u16, String> {
     let mut conn = AgentConn::connect(transport).await?;
 
-    if deadline.is_some() && conn.features & FEATURE_PTY_DEADLINE == 0 {
+    if req.deadline.is_some() && conn.features & FEATURE_PTY_DEADLINE == 0 {
         return Err("server does not support deadlines".to_string());
     }
+    let exec = conn.features & FEATURE_CREATE_EXEC != 0;
+    let env: Vec<(&str, &str)> = req
+        .env
+        .iter()
+        .map(|entry| parse_env_assignment(entry))
+        .collect::<Result<_, _>>()?;
+    if !env.is_empty() && !exec {
+        return Err(
+            "server does not support setting a terminal's environment (needs a newer blit server)"
+                .to_string(),
+        );
+    }
+    if req.shell && req.command.is_empty() {
+        return Err("--shell needs a command to run".to_string());
+    }
+    if !req.shell
+        && let [only] = req.command.as_slice()
+        && only.contains(SHELL_SYNTAX)
+    {
+        return Err(format!(
+            "{only:?} looks like shell syntax, but commands are executed directly.\n\
+             Pass --shell to run it through the server's shell."
+        ));
+    }
+
     let nonce: u16 = 1;
-    let tag_str = tag.as_deref().unwrap_or("");
-    let cmd_str = command.join("\0");
-    // Only ask for a correlated outcome from a server that advertised it —
-    // an older one would drop the flag byte's meaning and still answer
-    // nothing on refusal (docs/protocol.md, "Common status registry").
-    let features = if conn.features & FEATURE_CREATE_STATUS != 0 {
-        CREATE2_WANT_STATUS
+    // A shell command is one string; anything else is an argv. Against a
+    // server too old for HAS_ARGV, spell the argv the legacy way: NUL-joined
+    // under HAS_COMMAND, with a trailing NUL so even a one-word argv carries
+    // one and takes the server's argv branch rather than its shell branch.
+    let legacy_argv = (!req.shell && !req.command.is_empty() && !exec)
+        .then(|| format!("{}\0", req.command.join("\0")));
+    let command = if req.shell {
+        Some(req.command.join(" "))
     } else {
-        0
+        legacy_argv
     };
-    let msg = msg_create2_full(
+    let argv: Option<Vec<&str>> = (!req.shell && !req.command.is_empty() && exec)
+        .then(|| req.command.iter().map(String::as_str).collect());
+
+    let msg = msg_create2_request(&Create2Request {
         nonce,
-        rows,
-        cols,
-        tag_str,
-        &cmd_str,
-        features,
-        None,
-        deadline.map(deadline_ms),
-    );
+        rows: req.rows,
+        cols: req.cols,
+        // Only ask for a correlated outcome from a server that advertised it —
+        // an older one would drop the flag byte's meaning and still answer
+        // nothing on refusal (docs/protocol.md, "Common status registry").
+        want_status: conn.features & FEATURE_CREATE_STATUS != 0,
+        tag: req.tag.as_deref().unwrap_or(""),
+        cwd: req.cwd.as_deref(),
+        deadline_ms: req.deadline.map(deadline_ms),
+        env,
+        argv,
+        command: command.as_deref(),
+        ..Default::default()
+    })
+    .map_err(|err| format!("cannot start terminal: {}", err.detail))?;
     conn.send(&msg).await?;
 
     loop {
@@ -2635,6 +2690,127 @@ mod tests {
         }
 
         mock.await.unwrap();
+    }
+
+    fn start_request(command: &[&str]) -> StartRequest {
+        StartRequest {
+            tag: None,
+            command: command.iter().map(|c| (*c).to_string()).collect(),
+            shell: false,
+            cwd: None,
+            env: Vec::new(),
+            rows: 24,
+            cols: 80,
+            deadline: None,
+        }
+    }
+
+    /// Drive `cmd_start` and hand back the `CREATE2` it put on the wire.
+    async fn started_message(features: u32, req: StartRequest) -> Result<Vec<u8>, String> {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let mock = tokio::spawn(async move {
+            let mut mock = MockServer::new(server);
+            mock.send_initial_burst_with_features(features).await;
+            let data = mock.recv().await?;
+            let nonce = u16::from_le_bytes([data[1], data[2]]);
+            mock.send_created_n(nonce, 5, "").await;
+            Some(data)
+        });
+        let result = cmd_start(Transport::Unix(client), req).await;
+        let sent = mock.await.unwrap();
+        result.map(|_| sent.expect("server saw no create"))
+    }
+
+    /// The headline change: a bare command word is exec'd, not handed to a
+    /// login shell. It used to depend on how many words you typed.
+    #[tokio::test]
+    async fn start_sends_an_argv_to_a_server_that_can_exec() {
+        for command in [&["htop"][..], &["ls", "-la"][..]] {
+            let sent = started_message(FEATURE_CREATE_EXEC, start_request(command))
+                .await
+                .unwrap();
+            let req = blit_remote::parse_create2(&sent).unwrap();
+            assert_eq!(req.argv.as_deref(), Some(command));
+            assert_eq!(req.command, None);
+        }
+    }
+
+    /// Against a server too old for `HAS_ARGV`, the same request still has to
+    /// exec. The trailing NUL is what makes a one-word argv take the old
+    /// server's argv branch instead of its shell branch.
+    #[tokio::test]
+    async fn start_falls_back_to_the_legacy_argv_spelling() {
+        for command in [&["htop"][..], &["ls", "-la"][..]] {
+            let sent = started_message(0, start_request(command)).await.unwrap();
+            let req = blit_remote::parse_create2(&sent).unwrap();
+            assert_eq!(req.argv.as_deref(), Some(command));
+            assert_eq!(req.command, None);
+            assert_eq!(sent[7] & blit_remote::CREATE2_HAS_ARGV, 0);
+            assert_ne!(sent[7] & blit_remote::CREATE2_HAS_COMMAND, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn start_shell_flag_sends_one_command_string() {
+        let mut req = start_request(&["ls", "|", "wc", "-l"]);
+        req.shell = true;
+        let sent = started_message(FEATURE_CREATE_EXEC, req).await.unwrap();
+        let parsed = blit_remote::parse_create2(&sent).unwrap();
+        assert_eq!(parsed.command, Some("ls | wc -l"));
+        assert_eq!(parsed.argv, None);
+    }
+
+    #[tokio::test]
+    async fn start_carries_cwd_and_environment() {
+        let mut req = start_request(&["env"]);
+        req.cwd = Some("/tmp".to_string());
+        req.env = vec!["FOO=bar".to_string(), "EMPTY=".to_string()];
+        let sent = started_message(FEATURE_CREATE_EXEC, req).await.unwrap();
+        let parsed = blit_remote::parse_create2(&sent).unwrap();
+        assert_eq!(parsed.cwd, Some("/tmp"));
+        assert_eq!(parsed.env, vec![("FOO", "bar"), ("EMPTY", "")]);
+    }
+
+    /// An environment nobody will apply is worse than a refusal: the terminal
+    /// starts and the variables are simply not there.
+    #[tokio::test]
+    async fn start_refuses_an_environment_an_old_server_would_drop() {
+        let mut req = start_request(&["env"]);
+        req.env = vec!["FOO=bar".to_string()];
+        let err = started_message(0, req).await.unwrap_err();
+        assert!(err.contains("environment"), "{err}");
+    }
+
+    /// Exec-by-default turns a shell one-liner into a program name with spaces
+    /// in it, which fails as an unreadable ENOENT. Say what to do instead.
+    #[tokio::test]
+    async fn start_names_shell_syntax_rather_than_exec_ing_it() {
+        let err = started_message(FEATURE_CREATE_EXEC, start_request(&["ls | wc -l"]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("--shell"), "{err}");
+        // A word that merely looks unusual is still a program name.
+        assert!(
+            started_message(
+                FEATURE_CREATE_EXEC,
+                start_request(&["/opt/my-app/bin/run-it_2.0"])
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn env_assignments_split_on_the_first_equals() {
+        assert_eq!(parse_env_assignment("FOO=bar"), Ok(("FOO", "bar")));
+        assert_eq!(parse_env_assignment("FOO="), Ok(("FOO", "")));
+        // A value may contain '=' — only the key may not.
+        assert_eq!(
+            parse_env_assignment("URL=http://x/?a=b"),
+            Ok(("URL", "http://x/?a=b"))
+        );
+        assert!(parse_env_assignment("FOO").is_err());
+        assert!(parse_env_assignment("=bar").is_err());
     }
 
     #[tokio::test]

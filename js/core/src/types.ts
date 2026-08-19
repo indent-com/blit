@@ -241,6 +241,11 @@ export interface BlitConnectionSnapshot {
   supportsExtensions: boolean;
   /** Server understands viewer media, portals, and MPRIS runtime state. */
   supportsDesktopMedia: boolean;
+  /** A terminal can be started the way a process is: an exact argv exec'd
+   *  without a login shell, plus environment overrides. Must be checked
+   *  before asking — an older server ignores those fields rather than
+   *  refusing them, and quietly starts something else. */
+  supportsCreateExec: boolean;
   retryCount: number;
   /** Opaque 64-bit identifier for the current server process, or `null` for
    *  servers predating the extended HELLO. */
@@ -375,6 +380,21 @@ export const CREATE2_HAS_CWD = 1 << 2;
  *  ignores the bit and answers a refusal with nothing at all, leaving the
  *  create pending forever. */
 export const CREATE2_WANT_STATUS = 1 << 3;
+/** Arm a server-enforced deadline at creation: `[ms:4]`, after any cwd and
+ *  before any command bytes.  Only set it when HELLO advertised
+ *  {@link FEATURE_PTY_DEADLINE} — an older server does not know to skip the
+ *  four bytes and reads them as the start of the command. */
+export const CREATE2_HAS_DEADLINE = 1 << 4;
+/** Environment overrides for the child: `[count:2]` then `count` records of
+ *  `[key_len:2][key:N][value_len:4][value:N]`, applied on top of everything
+ *  the server derives.  Needs {@link FEATURE_CREATE_EXEC}: an older server
+ *  ignores the bit, does not skip the block, and runs it as command text. */
+export const CREATE2_HAS_ENV = 1 << 5;
+/** Exec an argv directly, no shell: `[argc:2]` then `argc` records of
+ *  `[len:4][arg:N]`.  Mutually exclusive with {@link CREATE2_HAS_COMMAND}.
+ *  Needs {@link FEATURE_CREATE_EXEC}: an older server ignores the bit, finds
+ *  no command, and spawns a plain interactive shell instead. */
+export const CREATE2_HAS_ARGV = 1 << 6;
 
 /** Wire protocol constants: server-to-client message types. */
 export const S2C_UPDATE = 0x00;
@@ -627,6 +647,15 @@ export const FEATURE_CLIENT_CONTROL = 1 << 20;
  *  and answer it with {@link S2C_CLIENT_LIST2}. Implies
  *  {@link FEATURE_CLIENT_CONTROL}. */
 export const FEATURE_CLIENT_ORIGIN = 1 << 27;
+/** `C2S_CREATE2` accepts {@link CREATE2_HAS_ARGV} and {@link CREATE2_HAS_ENV},
+ *  so a terminal can be started the way a native process is: an exact argv
+ *  exec'd without a shell, plus environment overrides.
+ *
+ *  Neither flag is probeable — an older server does not refuse an unknown
+ *  `features` bit, it ignores the bit and misreads the bytes that follow — so
+ *  this has to be negotiated rather than discovered.  Not advertised on
+ *  Windows servers, where the pseudoconsole path can honor neither. */
+export const FEATURE_CREATE_EXEC = 1 << 29;
 
 // -- Common status registry (docs/protocol.md) ------------------------------
 //
