@@ -19,6 +19,7 @@ import {
   reconcileMprisSubscriptions,
   samePortalPresentationEntry,
   selectMediaSessionEntry,
+  trayPrimaryGesture,
   trayPrimaryOpensMenu,
   type MprisSubscriptionTarget,
 } from "../desktopPresentation";
@@ -119,6 +120,17 @@ describe("desktop notification presentation", () => {
     expect(trayPrimaryOpensMenu(0, true)).toBe(false);
     expect(trayPrimaryOpensMenu(TRAY_HAS_MENU, true)).toBe(true);
     expect(trayPrimaryOpensMenu(TRAY_ITEM_IS_MENU, true)).toBe(true);
+  });
+
+  it("ignores the click a long press leaves behind", () => {
+    // The press fired `contextmenu` and the menu is already open; activating
+    // as well raises the app's window behind the menu being read.
+    expect(trayPrimaryGesture(TRAY_HAS_MENU, "touch", true)).toBe("ignore");
+    expect(trayPrimaryGesture(TRAY_HAS_MENU, "touch", false)).toBe("menu");
+    // A mouse right-click leaves no trailing click behind, so the flag is never
+    // set for one and the next real left click still activates.
+    expect(trayPrimaryGesture(TRAY_HAS_MENU, "mouse", false)).toBe("activate");
+    expect(trayPrimaryGesture(0, null, false)).toBe("activate");
   });
 
   it("does not toggle stable MPRIS subscriptions on snapshot-only updates", () => {
