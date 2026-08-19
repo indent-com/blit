@@ -157,11 +157,13 @@ type RemoteItem = {
 type TileItem = {
   type: "tile";
   key: string;
+  /** Dim address half, as a session row has (`dev:manage` before `Session`). */
+  prefix: string;
   title: string;
   subtitle: string;
-  /** The tile assignment to restore (editor:/diff:/commit:). */
+  /** The tile assignment to restore (editor:/diff:/commit:/manage:). */
   assignment: string;
-  tileKind: "editor" | "diff" | "commit" | "web";
+  tileKind: "editor" | "diff" | "commit" | "web" | "manage";
 };
 
 type FileItem = {
@@ -276,7 +278,7 @@ function PaneGlyph(props: { empty: boolean; fg: string; dimFg: string }) {
 }
 
 function TileGlyph(props: {
-  kind: "editor" | "diff" | "commit" | "preview" | "web";
+  kind: "editor" | "diff" | "commit" | "preview" | "web" | "manage";
   fg: string;
   dimFg: string;
 }) {
@@ -314,6 +316,12 @@ function TileGlyph(props: {
         {/* commit node on a branch line */}
         <path d="M12 4.5v4M12 15.5v4" stroke={props.dimFg} />
         <circle cx="12" cy="12" r="3.5" stroke={props.fg} />
+      </Show>
+      <Show when={props.kind === "manage"}>
+        {/* sliders: a server's own controls */}
+        <path d="M4.5 8h15M4.5 16h15" stroke={props.dimFg} />
+        <circle cx="9.5" cy="8" r="2" stroke={props.fg} />
+        <circle cx="15" cy="16" r="2" stroke={props.fg} />
       </Show>
       <Show when={props.kind === "preview"}>
         {/* framed picture: a rendered file rather than its source */}
@@ -1210,6 +1218,7 @@ export function SwitcherOverlay(props: {
       const d = tileDisplay(assignment);
       if (
         needle &&
+        !d.prefix.toLowerCase().includes(needle) &&
         !d.title.toLowerCase().includes(needle) &&
         !d.subtitle.toLowerCase().includes(needle)
       ) {
@@ -1218,6 +1227,7 @@ export function SwitcherOverlay(props: {
       items.push({
         type: "tile",
         key: `tile:${assignment}`,
+        prefix: d.prefix,
         title: d.title,
         subtitle: d.subtitle,
         assignment,
@@ -2391,21 +2401,32 @@ export function SwitcherOverlay(props: {
                                       "font-weight": 600,
                                     }}
                                   >
+                                    {/* A parked manage tile carries the same
+                                        dim address a session row does, so both
+                                        are asked for it the same way. */}
                                     <Show
                                       when={
-                                        item.type === "session" &&
-                                        (item as SessionItem).prefix
+                                        (item.type === "session" &&
+                                          (item as SessionItem).prefix) ||
+                                        (item.type === "tile" &&
+                                          (item as TileItem).prefix)
                                       }
                                     >
-                                      <span
-                                        style={{
-                                          opacity: 0.5,
-                                          "font-weight": 400,
-                                        }}
-                                      >
-                                        {(item as SessionItem).prefix}
-                                      </span>
-                                      {" \u203A "}
+                                      {(prefix) => (
+                                        <>
+                                          <span
+                                            style={{
+                                              opacity: 0.5,
+                                              "font-weight": 400,
+                                            }}
+                                          >
+                                            {prefix()}
+                                          </span>
+                                          <Show when={item.title}>
+                                            {" \u203A "}
+                                          </Show>
+                                        </>
+                                      )}
                                     </Show>
                                     {item.title}
                                   </span>

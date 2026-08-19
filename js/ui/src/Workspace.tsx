@@ -240,6 +240,7 @@ import {
   parseDiffArg,
   parseSurfaceAssignment,
   editorAssignment,
+  manageAssignment,
   layoutFromDSL,
   leafCount,
   loadFocusedTileFromHash,
@@ -314,9 +315,7 @@ function getHmrWorkspace(
   leaseOwner: object,
 ): HmrWorkspaceData {
   const raw = import.meta.hot?.data?.workspace as
-    | HmrWorkspaceData
-    | BlitWorkspace
-    | undefined;
+    HmrWorkspaceData | BlitWorkspace | undefined;
   // Accept the raw BlitWorkspace stored by versions before HmrWorkspaceData.
   const prev = raw && "workspace" in raw ? raw.workspace : raw;
   const previousOwner = raw && "workspace" in raw ? raw.owner : null;
@@ -464,6 +463,11 @@ function WorkspaceScreen(props: {
     const s = wsState().sessions.find((x) => x.id === sessionId);
     return !!s && readOnlyConnections().has(s.connectionId);
   };
+  /** The same answer about a whole connection, which is what a manage tile
+   *  needs: read-only shares drop the client-control family, so its clients
+   *  panel must not be offered rather than sit unanswered. */
+  const isConnectionReadOnly = (connectionId: string): boolean =>
+    readOnlyConnections().has(connectionId as ConnectionId);
 
   const focusedSession = () => {
     const snap = wsState();
@@ -876,6 +880,9 @@ function WorkspaceScreen(props: {
     if (typeof assign === "string" && isTileAssignment(assign)) {
       const t = parseTileAssignment(assign);
       if (t) {
+        // A manage tile is a server's panels, not a place in a filesystem: it
+        // has no root to anchor on, so the last one sticks.
+        if (t.kind === "manage") return null;
         if (t.kind === "commit") {
           const repoPath = t.arg.slice(t.arg.indexOf(":") + 1);
           return {
@@ -2124,8 +2131,18 @@ function WorkspaceScreen(props: {
   });
 
   const offScreenSurfaces = createMemo(() => {
-    const fid = focusedSurfaceId();
-    const fConnId = focusedSurfaceConnId();
+    // A tile covers the main view (it is drawn ahead of the focused surface),
+    // so the surface underneath is off-screen and belongs in the panel — the
+    // same rule the sessions memo below applies to a displaced terminal.
+    // Without this, tapping a tile's dock card hid the surface it covered from
+    // everywhere at once: the tile is on top of it, and this filter dropped it
+    // from the panel because focusedSurfaceId still named it. It came back
+    // only by closing the tile. The slot is deliberately still *set* — that is
+    // what brings the surface back when the tile closes — so what changes here
+    // is only whether it is also offered as a card.
+    const covered = activeTile() != null;
+    const fid = covered ? null : focusedSurfaceId();
+    const fConnId = covered ? null : focusedSurfaceConnId();
     // Collect surface keys assigned to BSP panes.
     const al = activeLayout();
     const la = layoutAssignments();
@@ -3590,8 +3607,7 @@ function WorkspaceScreen(props: {
 
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
-    | ((sessionId: SessionId, targetPaneId: string) => void)
-    | null = null;
+    ((sessionId: SessionId, targetPaneId: string) => void) | null = null;
   let moveToPaneFn:
     | ((value: string, targetPaneId: string, fromPaneId?: string) => void)
     | null = null;
@@ -4690,6 +4706,7 @@ function WorkspaceScreen(props: {
                               fontFamily={resolvedFontWithFallback()}
                               fontSize={fontSize()}
                               onOpenTile={openTile}
+                              isConnectionReadOnly={isConnectionReadOnly}
                             />
                           </div>
                         )}
@@ -4720,6 +4737,7 @@ function WorkspaceScreen(props: {
                     onLayoutChange={setBspLayout}
                     connectionId={activeConnectionId()}
                     isSessionReadOnly={isSessionReadOnly}
+                    isConnectionReadOnly={isConnectionReadOnly}
                     connectionLabels={connectionLabels()}
                     palette={palette()}
                     fontFamily={resolvedFontWithFallback()}
@@ -4819,7 +4837,9 @@ function WorkspaceScreen(props: {
               backgroundEditors={
                 <For each={backgroundTiles()}>
                   {(assignment, index) => {
-                    const d = tileDisplay(assignment);
+                    // Re-read, not read once: a manage tile's title carries the
+                    // tab its panels are on, which changes under the card.
+                    const d = () => tileDisplay(assignment);
                     const web = parseWebAssignment(assignment);
                     return (
                       // The same card parked terminals and surfaces get:
@@ -4853,9 +4873,19 @@ function WorkspaceScreen(props: {
                                 "font-size": `${chromeScale().sm}px`,
                               }}
                             >
-                              {d.title}
+                              {/* Address dim, then the name — the same shape
+                                  the terminal and surface cards below use, so
+                                  a column of parked things reads as one list
+                                  rather than three conventions. */}
+                              <Show when={d().prefix}>
+                                <span style={{ opacity: 0.5 }}>
+                                  {d().prefix}
+                                </span>
+                                <Show when={d().title}>{" \u203A "}</Show>
+                              </Show>
+                              {d().title}
                             </span>
-                            <Show when={d.subtitle}>
+                            <Show when={d().subtitle}>
                               <span
                                 style={{
                                   "white-space": "nowrap",
@@ -4866,7 +4896,7 @@ function WorkspaceScreen(props: {
                                   opacity: 0.6,
                                 }}
                               >
-                                {d.subtitle}
+                                {d().subtitle}
                               </span>
                             </Show>
                           </span>
@@ -4878,7 +4908,19 @@ function WorkspaceScreen(props: {
                           // mounted preview editor holds an fs sync and a web
                           // preview holds an iframe, so both are budgeted
                           // (LIVE_DOCK_PREVIEWS).
-                          <Show when={index() < LIVE_DOCK_PREVIEWS}>
+                          //
+                          // A manage tile has no picture worth taking: its
+                          // panels are lists of text at a size nobody can read,
+                          // and mounting them to draw that would run a client
+                          // catalog every second behind the card. Its title
+                          // says which server and which tab, which is the whole
+                          // of what the card is picked by.
+                          <Show
+                            when={
+                              index() < LIVE_DOCK_PREVIEWS &&
+                              d().kind !== "manage"
+                            }
+                          >
                             <div
                               style={{
                                 position: "relative",
@@ -4903,6 +4945,7 @@ function WorkspaceScreen(props: {
                                       Math.round(fontSize() * 0.6),
                                     )}
                                     onOpenTile={openTile}
+                                    isConnectionReadOnly={isConnectionReadOnly}
                                     preview
                                   />
                                 }
@@ -5179,10 +5222,12 @@ function WorkspaceScreen(props: {
               onReconnect={(name) => workspace.reconnectConnection(name)}
               onClose={closeOverlay}
               connections={allConnections()}
-              workspace={workspace}
-              sessions={wsState().sessions}
-              surfaces={surfaces()}
-              readOnlyConnections={readOnlyConnections()}
+              onManage={(name) => {
+                // The panels are a tile, so the dialog that asked for them is
+                // in the way once they exist.
+                closeOverlay();
+                openTile(manageAssignment(name));
+              }}
             />
           )}
         </Show>

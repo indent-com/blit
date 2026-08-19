@@ -2,9 +2,10 @@
  * BlitTile — renders an IDE tile assignment string as the appropriate view.
  *
  * A tile assignment is one of `editor:<conn>:<path>`, `diff:<conn>:<path>`
- * (optionally `diff:<conn>:staged:<path>`), or `commit:<conn>:<oid>:<repoPath>`
- * (see js/core/src/bsp/layout.ts). This component parses the assignment and
- * renders BlitEditor / BlitDiff / BlitCommit accordingly.
+ * (optionally `diff:<conn>:staged:<path>`), `commit:<conn>:<oid>:<repoPath>`, or
+ * `manage:<conn>:` (see js/core/src/bsp/layout.ts). This component parses the
+ * assignment and renders BlitEditor / BlitDiff / BlitCommit / ManageTile
+ * accordingly.
  *
  * It is the single render path shared by BSP leaf panes (BSPContainer) and the
  * non-BSP "focused tile" view (Workspace), so the two never drift.
@@ -24,7 +25,11 @@
  */
 
 import { ErrorBoundary, Show } from "solid-js";
-import type { BlitWorkspace, TerminalPalette } from "@blit-sh/core";
+import type {
+  BlitWorkspace,
+  ConnectionId,
+  TerminalPalette,
+} from "@blit-sh/core";
 import { parseTileAssignment, parseDiffArg } from "@blit-sh/core/bsp";
 import type { Theme, UIScale } from "../theme";
 import { ui } from "../theme";
@@ -32,6 +37,7 @@ import { BlitDiff } from "./BlitDiff";
 import { BlitEditor } from "./BlitEditor";
 import { BlitCommit } from "./BlitCommit";
 import { BlitPreview } from "./BlitPreview";
+import { ManageTile } from "../ManageTile";
 
 export function BlitTile(props: {
   workspace: BlitWorkspace;
@@ -44,6 +50,10 @@ export function BlitTile(props: {
   fontSize: number;
   /** Open a further tile (e.g. from a commit's file rows). */
   onOpenTile: (assignment: string) => void;
+  /** Whether a connection is an `.ro` share. Only a manage tile asks: its
+   *  clients panel talks a family the share forwarder drops, so offering it
+   *  there would sit on "Loading clients…" forever. */
+  isConnectionReadOnly?: (connectionId: string) => boolean;
   /** Read-only preview (the background dock): no editing, no LSP, no
    *  buffer parking — a zoomed-out always-on view, like a terminal
    *  thumbnail. */
@@ -85,6 +95,21 @@ export function BlitTile(props: {
           fontFamily={props.fontFamily}
           fontSize={props.fontSize}
           onOpenTile={props.onOpenTile}
+          preview={props.preview}
+          focused={props.focused}
+        />
+      );
+    }
+    if (t.kind === "manage") {
+      return (
+        <ManageTile
+          workspace={props.workspace}
+          connectionId={t.connectionId as ConnectionId}
+          theme={props.theme}
+          palette={props.palette}
+          scale={props.scale}
+          fontSize={props.fontSize}
+          readOnly={props.isConnectionReadOnly?.(t.connectionId)}
           preview={props.preview}
           focused={props.focused}
         />

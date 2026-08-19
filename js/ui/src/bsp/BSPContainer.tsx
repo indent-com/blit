@@ -194,6 +194,8 @@ export function BSPContainer(props: {
   isMobileTouch?: boolean;
   /** Whether a session's connection is read-only (see BSPTreeCtx). */
   isSessionReadOnly?: (sessionId: string) => boolean;
+  /** Whether a whole connection is read-only (see BSPTreeCtx). */
+  isConnectionReadOnly?: (connectionId: string) => boolean;
   /** Close an IDE/web tab host-wide (Workspace owns the tab registry). */
   onCloseTab?: (assignment: string) => void;
 }) {
@@ -969,6 +971,9 @@ export function BSPContainer(props: {
     get isSessionReadOnly() {
       return props.isSessionReadOnly;
     },
+    get isConnectionReadOnly() {
+      return props.isConnectionReadOnly;
+    },
     onFocusPane: focusPane,
     onClosePane: closePane,
     get onCreateInPane() {
@@ -1480,6 +1485,7 @@ function LeafPane(props: {
             fontFamily={ctx.fontFamily}
             fontSize={ctx.fontSize}
             onOpenTile={(a) => ctx.onOpenTile?.(a)}
+            isConnectionReadOnly={ctx.isConnectionReadOnly}
           />
         </div>
       </Show>

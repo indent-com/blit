@@ -141,6 +141,11 @@ export function ConnectionSession(props: {
             display: "flex",
             "flex-direction": "column",
             "background-color": theme().panelBg,
+            // Fills the pane region rather than growing past it, so the
+            // catalog below can be bounded by this box instead of by the
+            // viewport.
+            flex: "1 1 auto",
+            "min-height": "0",
           }}
         >
           <SectionHeading
@@ -161,176 +166,191 @@ export function ConnectionSession(props: {
               </PanelEmpty>
             }
           >
-            <For each={apps()}>
-              {(app) => (
-                <PanelRow theme={theme()} scale={scale()}>
-                  <div
-                    style={{
-                      display: "flex",
-                      "align-items": "center",
-                      "justify-content": "space-between",
-                      gap: `${scale().gap}px`,
-                    }}
-                  >
-                    <span
+            {/* Natural height while the managed set is small, which it almost
+                always is — `flex: 0 1 auto` only starts scrolling once the
+                rows would otherwise push the catalog's search box out of the
+                pane. Its own list, its own scroller: what must never happen is
+                two scrollbars for the *same* list. */}
+            <div
+              style={{
+                flex: "0 1 auto",
+                "min-height": "0",
+                "overflow-y": "auto",
+                ...scrollbarStyle(theme()),
+              }}
+            >
+              <For each={apps()}>
+                {(app) => (
+                  <PanelRow theme={theme()} scale={scale()}>
+                    <div
                       style={{
                         display: "flex",
-                        // The icon is the tallest thing in the row, so the text
-                        // centres against it rather than sitting on a baseline
-                        // the tile does not share.
                         "align-items": "center",
+                        "justify-content": "space-between",
                         gap: `${scale().gap}px`,
-                        "min-width": "0",
                       }}
                     >
-                      <AppIcon
-                        theme={theme()}
-                        scale={scale()}
-                        name={app.name}
-                        src={iconOf(app.id)}
-                      />
                       <span
                         style={{
                           display: "flex",
-                          "align-items": "baseline",
-                          gap: `${scale().tightGap}px`,
+                          // The icon is the tallest thing in the row, so the text
+                          // centres against it rather than sitting on a baseline
+                          // the tile does not share.
+                          "align-items": "center",
+                          gap: `${scale().gap}px`,
                           "min-width": "0",
                         }}
                       >
-                        <strong
+                        <AppIcon
+                          theme={theme()}
+                          scale={scale()}
+                          name={app.name}
+                          src={iconOf(app.id)}
+                        />
+                        <span
                           style={{
-                            overflow: "hidden",
-                            "text-overflow": "ellipsis",
-                            "white-space": "nowrap",
+                            display: "flex",
+                            "align-items": "baseline",
+                            gap: `${scale().tightGap}px`,
+                            "min-width": "0",
                           }}
                         >
-                          {app.name}
-                        </strong>
-                        <Show when={app.name !== app.id}>
-                          <span
+                          <strong
                             style={{
-                              color: theme().dimFg,
-                              "font-size": `${scale().sm}px`,
+                              overflow: "hidden",
+                              "text-overflow": "ellipsis",
+                              "white-space": "nowrap",
                             }}
                           >
-                            {app.id}
-                          </span>
-                        </Show>
+                            {app.name}
+                          </strong>
+                          <Show when={app.name !== app.id}>
+                            <span
+                              style={{
+                                color: theme().dimFg,
+                                "font-size": `${scale().sm}px`,
+                              }}
+                            >
+                              {app.id}
+                            </span>
+                          </Show>
+                        </span>
                       </span>
-                    </span>
 
-                    <span
-                      style={{
-                        display: "flex",
-                        "align-items": "center",
-                        gap: `${scale().gap}px`,
-                        "flex-shrink": "0",
-                      }}
-                    >
-                      <StatusPill
-                        theme={theme()}
-                        scale={scale()}
-                        {...phaseTone(app)}
-                        title={
-                          app.socket
-                            ? `Wayland socket ${app.socket}`
-                            : undefined
-                        }
-                      />
-                      {/* Counted from the identity the compositor stamped on
+                      <span
+                        style={{
+                          display: "flex",
+                          "align-items": "center",
+                          gap: `${scale().gap}px`,
+                          "flex-shrink": "0",
+                        }}
+                      >
+                        <StatusPill
+                          theme={theme()}
+                          scale={scale()}
+                          {...phaseTone(app)}
+                          title={
+                            app.socket
+                              ? `Wayland socket ${app.socket}`
+                              : undefined
+                          }
+                        />
+                        {/* Counted from the identity the compositor stamped on
                           the app's own socket, not from a self-asserted
                           app_id — which is what makes it worth showing. */}
-                      <span
-                        title="Windows, counted from the application's stamped Wayland socket"
+                        <span
+                          title="Windows, counted from the application's stamped Wayland socket"
+                          style={{
+                            color: theme().dimFg,
+                            "font-size": `${scale().sm}px`,
+                            "font-variant-numeric": "tabular-nums",
+                          }}
+                        >
+                          {app.windows}{" "}
+                          {app.windows === 1 ? "window" : "windows"}
+                        </span>
+                        {/* Now. Running covers backoff too: a supervisor about
+                          to retry is something a viewer wants to be able to
+                          call off. */}
+                        <button
+                          type="button"
+                          title={
+                            app.phase === "stopped"
+                              ? "Run it now, without changing what the next session start does"
+                              : "Stop it now, without changing what the next session start does"
+                          }
+                          style={panelButton(theme(), scale())}
+                          onClick={() =>
+                            app.phase === "stopped"
+                              ? session().start(app.id)
+                              : session().stop(app.id)
+                          }
+                        >
+                          {app.phase === "stopped" ? "Start" : "Stop"}
+                        </button>
+                        {/* Intent, and the way out of the list. Disabling keeps
+                          the row -- an application that just failed is worth
+                          looking at -- so there has to be something that
+                          removes it, or a one-off experiment stays forever. */}
+                        <button
+                          type="button"
+                          title={
+                            app.enabled
+                              ? "Stop it and do not start it with this session again"
+                              : "Start it now and with every session"
+                          }
+                          style={panelButton(
+                            theme(),
+                            scale(),
+                            app.enabled ? "bad" : undefined,
+                          )}
+                          onClick={() =>
+                            app.enabled
+                              ? session().disable(app.id)
+                              : session().enable(app.id)
+                          }
+                        >
+                          {app.enabled ? "Disable" : "Enable"}
+                        </button>
+                        <button
+                          type="button"
+                          title="Stop it and remove it from this list"
+                          style={panelButton(theme(), scale(), "bad")}
+                          onClick={() => session().forget(app.id)}
+                        >
+                          Discard
+                        </button>
+                      </span>
+                    </div>
+
+                    {/* Only worth a line when something went wrong: a healthy row
+                      stays one line tall. */}
+                    <Show when={app.failures > 0 || app.lastExit !== undefined}>
+                      <div
                         style={{
                           color: theme().dimFg,
                           "font-size": `${scale().sm}px`,
                           "font-variant-numeric": "tabular-nums",
                         }}
                       >
-                        {app.windows} {app.windows === 1 ? "window" : "windows"}
-                      </span>
-                      {/* Now. Running covers backoff too: a supervisor about
-                          to retry is something a viewer wants to be able to
-                          call off. */}
-                      <button
-                        type="button"
-                        title={
-                          app.phase === "stopped"
-                            ? "Run it now, without changing what the next session start does"
-                            : "Stop it now, without changing what the next session start does"
-                        }
-                        style={panelButton(theme(), scale())}
-                        onClick={() =>
-                          app.phase === "stopped"
-                            ? session().start(app.id)
-                            : session().stop(app.id)
-                        }
-                      >
-                        {app.phase === "stopped" ? "Start" : "Stop"}
-                      </button>
-                      {/* Intent, and the way out of the list. Disabling keeps
-                          the row -- an application that just failed is worth
-                          looking at -- so there has to be something that
-                          removes it, or a one-off experiment stays forever. */}
-                      <button
-                        type="button"
-                        title={
-                          app.enabled
-                            ? "Stop it and do not start it with this session again"
-                            : "Start it now and with every session"
-                        }
-                        style={panelButton(
-                          theme(),
-                          scale(),
-                          app.enabled ? "bad" : undefined,
-                        )}
-                        onClick={() =>
-                          app.enabled
-                            ? session().disable(app.id)
-                            : session().enable(app.id)
-                        }
-                      >
-                        {app.enabled ? "Disable" : "Enable"}
-                      </button>
-                      <button
-                        type="button"
-                        title="Stop it and remove it from this list"
-                        style={panelButton(theme(), scale(), "bad")}
-                        onClick={() => session().forget(app.id)}
-                      >
-                        Discard
-                      </button>
-                    </span>
-                  </div>
-
-                  {/* Only worth a line when something went wrong: a healthy row
-                      stays one line tall. */}
-                  <Show when={app.failures > 0 || app.lastExit !== undefined}>
-                    <div
-                      style={{
-                        color: theme().dimFg,
-                        "font-size": `${scale().sm}px`,
-                        "font-variant-numeric": "tabular-nums",
-                      }}
-                    >
-                      <Show when={app.failures > 0}>
-                        {app.failures} failed{" "}
-                        {app.failures === 1 ? "start" : "starts"}
-                      </Show>
-                      <Show
-                        when={app.failures > 0 && app.lastExit !== undefined}
-                      >
-                        {" · "}
-                      </Show>
-                      <Show when={app.lastExit !== undefined}>
-                        last exit {app.lastExit}
-                      </Show>
-                    </div>
-                  </Show>
-                </PanelRow>
-              )}
-            </For>
+                        <Show when={app.failures > 0}>
+                          {app.failures} failed{" "}
+                          {app.failures === 1 ? "start" : "starts"}
+                        </Show>
+                        <Show
+                          when={app.failures > 0 && app.lastExit !== undefined}
+                        >
+                          {" · "}
+                        </Show>
+                        <Show when={app.lastExit !== undefined}>
+                          last exit {app.lastExit}
+                        </Show>
+                      </div>
+                    </Show>
+                  </PanelRow>
+                )}
+              </For>
+            </div>
           </Show>
 
           {/* Adding. The whole catalog, scrolling, with the filter narrowing it
@@ -375,14 +395,26 @@ export function ConnectionSession(props: {
               </PanelEmpty>
             }
           >
-            {/* The catalog gets a scroller of its own rather than riding the
-                overlay's: it is the only unbounded thing here, and letting it
-                lengthen the panel would scroll the search box — the one
-                control for a nine-hundred-row list — off the top. */}
+            {/* The catalog is the only unbounded thing here, so it is the one
+                thing that scrolls: letting it lengthen the panel instead would
+                scroll the search box — the one control for a nine-hundred-row
+                list — off the top.
+
+                Bounded by the pane, not the viewport. It was `42vh`, which in
+                a dialog capped at 80% of the screen was about right, and in a
+                pane is a number unrelated to the box it is in: in a short pane
+                it overflows and the pane scrolls too (two scrollbars for one
+                list), in a tall one it stops short of the bottom. `flex: 1`
+                against a parent with `min-height: 0` is the same intent
+                measured against the right thing. */}
             <div
               ref={lazyIcons.setRoot}
               style={{
-                "max-height": "42vh",
+                flex: "1 1 0",
+                // Something to scroll even when the managed list above is
+                // long: a scroller collapsed to nothing cannot be scrolled
+                // back out of.
+                "min-height": "6em",
                 "overflow-y": "auto",
                 "min-width": "0",
                 ...scrollbarStyle(theme()),

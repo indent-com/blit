@@ -275,7 +275,11 @@ export function SystemdPanel(props: {
           <div
             style={mergeStyle(scrollbarStyle(theme()), {
               "overflow-y": "auto",
-              "max-height": "60vh",
+              // Bounded by the pane this panel is in, not by the viewport it
+              // was a dialog in: a `vh` cap taller than the pane makes the
+              // pane scroll as well, which is two scrollbars for one table.
+              flex: "1 1 0",
+              "min-height": "6em",
               "font-family": "inherit",
               "font-size": `${scale().sm}px`,
             })}
