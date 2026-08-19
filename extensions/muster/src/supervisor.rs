@@ -1,0 +1,534 @@
+//! Phases, backoff, retention and dependency order.
+//!
+//! Split from the protocol plumbing so the parts that are easy to get wrong are
+//! testable without a server: what a clean exit means under each restart
+//! policy, which terminals to reap, and what order a dependency graph starts
+//! and stops in.
+
+use crate::config::UnitFile;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+/// Matched to the server's own extension supervisor and to `@session`, so three
+/// layers of restart logic in one server do not each invent their own numbers.
+pub const BACKOFF_BASE: Duration = Duration::from_millis(250);
+pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// How long a run must last before its failures are forgiven.
+pub const HEALTHY_AFTER: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Stopped,
+    /// Wanted; a `requires` dependency is not ready.
+    Waiting,
+    /// PTY created, `readyWhen` not yet satisfied.
+    Activating,
+    Running,
+    /// A `oneshot` finished 0. Counts as ready until the file changes.
+    Exited,
+    Backoff,
+    Failed,
+    /// Stopped by hand: ignores `autostart` until started again.
+    Held,
+}
+
+impl Phase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Phase::Stopped => "stopped",
+            Phase::Waiting => "waiting",
+            Phase::Activating => "activating",
+            Phase::Running => "running",
+            Phase::Exited => "exited",
+            Phase::Backoff => "backoff",
+            Phase::Failed => "failed",
+            Phase::Held => "held",
+        }
+    }
+
+    /// Whether a dependent may proceed.
+    pub const fn is_ready(self) -> bool {
+        matches!(self, Phase::Running | Phase::Exited)
+    }
+
+    /// Whether a terminal is expected to be alive.
+    pub const fn is_live(self) -> bool {
+        matches!(self, Phase::Activating | Phase::Running)
+    }
+}
+
+/// One finished run, retained so the reason it finished stays addressable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Run {
+    pub pty: u16,
+    pub seq: u64,
+    pub exit_code: i32,
+    pub started_ms: u64,
+    pub ended_ms: u64,
+}
+
+/// Everything the supervisor knows about one unit.
+#[derive(Clone, Debug)]
+pub struct Unit {
+    pub name: String,
+    pub instance: Option<String>,
+    pub file: UnitFile,
+    pub phase: Phase,
+    /// The live terminal, if there is one.
+    pub pty: Option<u16>,
+    /// Monotonic per unit, and part of the tag, so a corpse is never mistaken
+    /// for the live run.
+    pub seq: u64,
+    pub started_ms: u64,
+    pub failures: u32,
+    pub next_attempt_ms: u64,
+    /// When `readyWhen` gives up.
+    pub deadline_ms: u64,
+    pub last_exit: Option<i32>,
+    /// Newest first.
+    pub runs: Vec<Run>,
+    /// The unit file changed under a running unit.
+    pub stale: bool,
+    /// A stop is in flight; SIGKILL when this comes due.
+    pub kill_at_ms: u64,
+}
+
+impl Unit {
+    pub fn new(name: String, instance: Option<String>, file: UnitFile) -> Self {
+        Self {
+            name,
+            instance,
+            file,
+            phase: Phase::Stopped,
+            pty: None,
+            seq: 0,
+            started_ms: 0,
+            failures: 0,
+            next_attempt_ms: 0,
+            deadline_ms: 0,
+            last_exit: None,
+            runs: Vec::new(),
+            stale: false,
+            kill_at_ms: 0,
+        }
+    }
+
+    /// The tag a terminal carries. `<seq>` is what makes an old run
+    /// distinguishable from the live one after the supervisor restarts.
+    pub fn tag(&self, seq: u64) -> String {
+        format!("muster/{}/{seq}", self.name)
+    }
+
+    /// Whether an exit should be retried, under this unit's declared policy.
+    ///
+    /// The policy is obeyed literally. `@session` refuses to retry exit 0 even
+    /// when told to, because a second Chromium hands its argv to the first and
+    /// exits 0; a terminal unit has no such hazard, and the blit dev server
+    /// depends on the opposite — it exits 0 on purpose when replaced, and
+    /// retrying that is an infinite loop.
+    pub fn wants_restart(&self, exit_code: i32) -> bool {
+        if exit_code == 0 {
+            self.file.restart_on_success
+        } else {
+            self.file.restart_on_failure
+        }
+    }
+
+    /// Record that the live run ended, and decide what happens next.
+    ///
+    /// Returns the retained runs that must now be closed to stay within `keep`.
+    pub fn note_exit(&mut self, exit_code: i32, now_ms: u64, random: u64) -> Vec<Run> {
+        let pty = self.pty.take();
+        self.last_exit = Some(exit_code);
+        self.deadline_ms = 0;
+        self.kill_at_ms = 0;
+
+        if let Some(pty) = pty {
+            self.runs.insert(
+                0,
+                Run {
+                    pty,
+                    seq: self.seq,
+                    exit_code,
+                    started_ms: self.started_ms,
+                    ended_ms: now_ms,
+                },
+            );
+        }
+
+        // A run that lasted, or that ended cleanly, is not evidence of a loop.
+        let healthy = exit_code == 0
+            || now_ms.saturating_sub(self.started_ms) >= HEALTHY_AFTER.as_millis() as u64;
+        if healthy {
+            self.failures = 0;
+        }
+
+        if self.file.unit_type == crate::config::UnitType::Oneshot && exit_code == 0 {
+            self.phase = Phase::Exited;
+        } else if !self.wants_restart(exit_code) {
+            self.phase = if exit_code == 0 {
+                Phase::Stopped
+            } else {
+                Phase::Failed
+            };
+        } else {
+            self.failures += 1;
+            if self.file.start_limit > 0 && self.failures >= self.file.start_limit {
+                self.phase = Phase::Failed;
+            } else {
+                self.phase = Phase::Backoff;
+                let delay = match self.file.restart_delay {
+                    Some(fixed) => Duration::from_millis(fixed.ms()),
+                    None => backoff(self.failures, random),
+                };
+                self.next_attempt_ms = now_ms + delay.as_millis() as u64;
+            }
+        }
+        self.reap()
+    }
+
+    /// Retained runs beyond `keep`, oldest first, for the caller to close.
+    pub fn reap(&mut self) -> Vec<Run> {
+        let keep = self.file.keep as usize;
+        if self.runs.len() <= keep {
+            return Vec::new();
+        }
+        // `runs` is newest-first, so the tail is what ages out.
+        self.runs.split_off(keep)
+    }
+
+    /// Whether an attempt is due now.
+    pub fn attempt_due(&self, now_ms: u64) -> bool {
+        match self.phase {
+            Phase::Waiting => true,
+            Phase::Backoff => now_ms >= self.next_attempt_ms,
+            _ => false,
+        }
+    }
+
+    /// The next moment this unit needs attention, if any.
+    pub fn next_deadline_ms(&self) -> Option<u64> {
+        let mut soonest: Option<u64> = None;
+        let mut consider = |at: u64| {
+            if at > 0 {
+                soonest = Some(soonest.map_or(at, |s: u64| s.min(at)));
+            }
+        };
+        if self.phase == Phase::Backoff {
+            consider(self.next_attempt_ms);
+        }
+        if self.phase == Phase::Activating {
+            consider(self.deadline_ms);
+        }
+        consider(self.kill_at_ms);
+        soonest
+    }
+}
+
+/// Exponential with full jitter.
+///
+/// Jitter matters more here than for one application: a stack brings several
+/// units up at once, and a shared cause — a database that is not up yet, a
+/// rebuild that has not finished — would otherwise have them all retry in
+/// lockstep forever.
+pub fn backoff(failures: u32, random: u64) -> Duration {
+    if failures == 0 {
+        return Duration::ZERO;
+    }
+    let shift = (failures - 1).min(16);
+    let scaled = BACKOFF_BASE.saturating_mul(1u32 << shift);
+    let cap = if scaled > BACKOFF_MAX {
+        BACKOFF_MAX
+    } else {
+        scaled
+    };
+    let cap_ns = cap.as_nanos() as u64;
+    if cap_ns == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_nanos(random % cap_ns)
+}
+
+/// A dependency cycle, named by its members so the file can be fixed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cycle(pub Vec<String>);
+
+/// Topological order over `requires` + `wants`, restricted to `units`.
+///
+/// `after` orders without pulling anything in, so it participates in the sort
+/// but never in the closure.
+pub fn start_order(units: &BTreeMap<String, Unit>, roots: &[String]) -> Result<Vec<String>, Cycle> {
+    let mut order = Vec::new();
+    let mut done = BTreeSet::new();
+    let mut path = Vec::new();
+    for root in roots {
+        visit(units, root, &mut order, &mut done, &mut path)?;
+    }
+    Ok(order)
+}
+
+fn visit(
+    units: &BTreeMap<String, Unit>,
+    name: &str,
+    order: &mut Vec<String>,
+    done: &mut BTreeSet<String>,
+    path: &mut Vec<String>,
+) -> Result<(), Cycle> {
+    if done.contains(name) {
+        return Ok(());
+    }
+    if let Some(at) = path.iter().position(|n| n == name) {
+        let mut ring = path[at..].to_vec();
+        ring.push(name.to_string());
+        return Err(Cycle(ring));
+    }
+    let Some(unit) = units.get(name) else {
+        // A dangling name is a `doctor` finding, not a cycle. Ordering simply
+        // has nothing to place.
+        return Ok(());
+    };
+    path.push(name.to_string());
+    for dep in unit
+        .file
+        .requires
+        .iter()
+        .chain(&unit.file.wants)
+        .chain(&unit.file.after)
+    {
+        visit(units, dep, order, done, path)?;
+    }
+    path.pop();
+    done.insert(name.to_string());
+    order.push(name.to_string());
+    Ok(())
+}
+
+/// Everything reachable through `requires` and `wants` — what starting a unit
+/// starts. `after` is ordering only and is deliberately not followed.
+pub fn start_closure(units: &BTreeMap<String, Unit>, root: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![root.to_string()];
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(unit) = units.get(&name) {
+            for dep in unit.file.requires.iter().chain(&unit.file.wants) {
+                stack.push(dep.clone());
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Units that `requires` this one, transitively — what a stop takes with it.
+pub fn dependents(units: &BTreeMap<String, Unit>, root: &str) -> Vec<String> {
+    let mut found = BTreeSet::new();
+    let mut frontier = vec![root.to_string()];
+    while let Some(name) = frontier.pop() {
+        for (other, unit) in units {
+            if unit.file.requires.contains(&name) && found.insert(other.clone()) {
+                frontier.push(other.clone());
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Duration as ConfigDuration, UnitType};
+
+    fn unit_from(json: &str) -> Unit {
+        let file: UnitFile = serde_json::from_str(json).unwrap();
+        Unit::new("api".into(), None, file)
+    }
+
+    fn plain() -> Unit {
+        unit_from(r#"{"command":["a"]}"#)
+    }
+
+    #[test]
+    fn a_crash_backs_off_and_a_clean_exit_stops() {
+        let mut unit = plain();
+        unit.phase = Phase::Running;
+        unit.pty = Some(7);
+        unit.note_exit(1, 1000, 0);
+        assert_eq!(unit.phase, Phase::Backoff);
+        assert_eq!(unit.failures, 1);
+
+        let mut unit = plain();
+        unit.phase = Phase::Running;
+        unit.note_exit(0, 1000, 0);
+        assert_eq!(unit.phase, Phase::Stopped, "exit 0 is not a failure");
+    }
+
+    #[test]
+    fn restart_on_success_is_obeyed_literally() {
+        let mut unit = unit_from(r#"{"command":["a"],"restartOnSuccess":true}"#);
+        unit.phase = Phase::Running;
+        unit.note_exit(0, 1000, 0);
+        assert_eq!(unit.phase, Phase::Backoff);
+    }
+
+    #[test]
+    fn restart_off_fails_on_a_crash_and_stops_on_a_clean_exit() {
+        let mut unit = unit_from(r#"{"command":["a"],"restartOnFailure":false}"#);
+        unit.phase = Phase::Running;
+        unit.note_exit(3, 1000, 0);
+        assert_eq!(unit.phase, Phase::Failed);
+        assert_eq!(unit.last_exit, Some(3));
+    }
+
+    #[test]
+    fn a_oneshot_that_succeeds_counts_as_ready() {
+        let mut unit = unit_from(r#"{"command":["a"],"type":"oneshot"}"#);
+        assert_eq!(unit.file.unit_type, UnitType::Oneshot);
+        unit.phase = Phase::Activating;
+        unit.note_exit(0, 1000, 0);
+        assert_eq!(unit.phase, Phase::Exited);
+        assert!(unit.phase.is_ready());
+    }
+
+    #[test]
+    fn a_long_run_forgives_earlier_failures() {
+        let mut unit = plain();
+        unit.failures = 4;
+        unit.phase = Phase::Running;
+        unit.started_ms = 0;
+        unit.note_exit(1, HEALTHY_AFTER.as_millis() as u64 + 1, 0);
+        assert_eq!(unit.failures, 1, "reset, then counted this one");
+    }
+
+    #[test]
+    fn start_limit_gives_up() {
+        let mut unit = unit_from(r#"{"command":["a"],"startLimit":2}"#);
+        unit.phase = Phase::Running;
+        unit.note_exit(1, 10, 0);
+        assert_eq!(unit.phase, Phase::Backoff);
+        unit.phase = Phase::Running;
+        unit.started_ms = 10;
+        unit.note_exit(1, 20, 0);
+        assert_eq!(unit.phase, Phase::Failed);
+    }
+
+    #[test]
+    fn a_fixed_delay_replaces_the_schedule() {
+        let mut unit = unit_from(r#"{"command":["a"],"restartDelay":"2s"}"#);
+        assert_eq!(unit.file.restart_delay, Some(ConfigDuration(2000)));
+        unit.phase = Phase::Running;
+        unit.note_exit(1, 1000, u64::MAX);
+        assert_eq!(unit.next_attempt_ms, 3000, "jitter does not apply");
+    }
+
+    #[test]
+    fn backoff_is_bounded_and_jittered() {
+        assert_eq!(backoff(0, 12345), Duration::ZERO);
+        for failures in 1..40 {
+            let delay = backoff(failures, u64::MAX);
+            assert!(delay < BACKOFF_MAX, "{failures} gave {delay:?}");
+        }
+        // Full jitter: the same failure count spans its whole window.
+        assert_eq!(backoff(4, 0), Duration::ZERO);
+        assert!(backoff(4, u64::MAX) > Duration::from_millis(1));
+    }
+
+    #[test]
+    fn retention_keeps_the_newest_and_hands_back_the_rest() {
+        let mut unit = unit_from(r#"{"command":["a"],"keep":2,"restartOnFailure":true}"#);
+        for run in 0..4u16 {
+            unit.pty = Some(run);
+            unit.seq = run as u64;
+            unit.phase = Phase::Running;
+            let closed = unit.note_exit(1, 1000 + run as u64, 0);
+            if run < 2 {
+                assert!(closed.is_empty(), "under the limit");
+            } else {
+                assert_eq!(closed.len(), 1, "one ages out per run past the limit");
+            }
+        }
+        assert_eq!(unit.runs.len(), 2);
+        assert_eq!(unit.runs[0].pty, 3, "newest first");
+        assert_eq!(unit.runs[1].pty, 2);
+    }
+
+    #[test]
+    fn keep_zero_retains_nothing() {
+        let mut unit = unit_from(r#"{"command":["a"],"keep":0}"#);
+        unit.pty = Some(7);
+        unit.phase = Phase::Running;
+        let closed = unit.note_exit(1, 1000, 0);
+        assert_eq!(closed.len(), 1);
+        assert!(unit.runs.is_empty());
+    }
+
+    fn graph(pairs: &[(&str, &str)]) -> BTreeMap<String, Unit> {
+        let mut units = BTreeMap::new();
+        for (name, json) in pairs {
+            let file: UnitFile = serde_json::from_str(json).unwrap();
+            units.insert(
+                (*name).to_string(),
+                Unit::new((*name).to_string(), None, file),
+            );
+        }
+        units
+    }
+
+    #[test]
+    fn dependencies_start_before_dependents() {
+        let units = graph(&[
+            ("db", r#"{"command":["db"]}"#),
+            ("migrate", r#"{"command":["m"],"requires":["db"]}"#),
+            ("api", r#"{"command":["a"],"requires":["db","migrate"]}"#),
+        ]);
+        let order = start_order(&units, &["api".into()]).unwrap();
+        let at = |n: &str| order.iter().position(|x| x == n).unwrap();
+        assert!(at("db") < at("migrate"));
+        assert!(at("migrate") < at("api"));
+    }
+
+    #[test]
+    fn a_cycle_is_refused_and_names_its_members() {
+        let units = graph(&[
+            ("a", r#"{"command":["a"],"requires":["b"]}"#),
+            ("b", r#"{"command":["b"],"requires":["a"]}"#),
+        ]);
+        let Cycle(ring) = start_order(&units, &["a".into()]).unwrap_err();
+        assert!(ring.contains(&"a".to_string()) && ring.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn after_orders_without_pulling_in() {
+        let units = graph(&[
+            ("api", r#"{"command":["a"]}"#),
+            ("stripe", r#"{"command":["s"],"after":["api"]}"#),
+        ]);
+        assert_eq!(start_closure(&units, "stripe"), vec!["stripe".to_string()]);
+        let order = start_order(&units, &["stripe".into()]).unwrap();
+        assert!(order.iter().position(|x| x == "api") < order.iter().position(|x| x == "stripe"));
+    }
+
+    #[test]
+    fn wants_is_pulled_in_but_requires_is_what_cascades() {
+        let units = graph(&[
+            ("db", r#"{"command":["db"]}"#),
+            ("mail", r#"{"command":["m"]}"#),
+            (
+                "api",
+                r#"{"command":["a"],"requires":["db"],"wants":["mail"]}"#,
+            ),
+        ]);
+        let closure = start_closure(&units, "api");
+        assert!(closure.contains(&"mail".to_string()), "wants starts it");
+        // Stopping the database takes the API with it; the mail catcher stays.
+        assert_eq!(dependents(&units, "db"), vec!["api".to_string()]);
+        assert!(dependents(&units, "mail").is_empty());
+    }
+
+    #[test]
+    fn a_dangling_dependency_does_not_break_ordering() {
+        let units = graph(&[("api", r#"{"command":["a"],"requires":["ghost"]}"#)]);
+        assert!(start_order(&units, &["api".into()]).is_ok());
+    }
+}

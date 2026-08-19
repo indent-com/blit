@@ -5,7 +5,7 @@
 # trying to build a Wasm guest for the host.
 [workspace]
 resolver = "3"
-members = ["session", "systemd"]
+members = ["muster", "session", "systemd"]
 
 [workspace.package]
 version = "0.53.2"

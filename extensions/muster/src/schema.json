@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Blit muster unit, stack or instance",
+  "type": "object",
+  "properties": {
+    "$schema": { "type": "string" },
+    "//": { "description": "Prose. JSON has no comments." },
+
+    "description": { "type": "string" },
+    "autostart": { "type": "boolean", "default": true },
+    "requires": { "type": "array", "items": { "type": "string" } },
+    "wants": { "type": "array", "items": { "type": "string" } },
+    "after": { "type": "array", "items": { "type": "string" } },
+
+    "command": {
+      "description": "An argv, exec'd directly. No shell, no rc files, no shell syntax.",
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "shell": {
+      "description": "A command line for the server's login shell. Excludes command.",
+      "type": "string"
+    },
+    "cwd": { "type": "string", "pattern": "^[/~]" },
+    "env": { "type": "object", "additionalProperties": { "type": "string" } },
+    "envFile": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "object",
+                "properties": {
+                  "path": { "type": "string" },
+                  "optional": { "type": "boolean" }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "type": { "enum": ["simple", "oneshot"], "default": "simple" },
+    "readyWhen": {
+      "oneOf": [
+        { "enum": ["spawn", "manual"] },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 1,
+          "properties": {
+            "delay": { "type": ["string", "integer"] },
+            "path": { "type": "string" },
+            "log": { "type": "string" },
+            "tcp": { "type": "string" },
+            "http": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+
+    "restartOnFailure": { "type": "boolean", "default": true },
+    "restartOnSuccess": { "type": "boolean", "default": false },
+    "restartOnChange": { "type": "boolean", "default": true },
+    "restartDelay": { "type": ["string", "integer"] },
+    "keep": { "type": "integer", "minimum": 0, "default": 1 },
+    "timeoutStart": { "type": ["string", "integer"], "default": "30s" },
+    "stopSignal": { "type": "string", "default": "SIGTERM" },
+    "timeoutStop": { "type": ["string", "integer"], "default": "10s" },
+    "startLimit": { "type": "integer", "minimum": 0, "default": 0 },
+
+    "stack": {
+      "description": "Names a subdirectory to instantiate. Makes this file an instance.",
+      "type": "string"
+    },
+    "vars": { "type": "object" },
+    "omit": { "type": "array", "items": { "type": "string" } }
+  },
+  "allOf": [
+    {
+      "if": { "required": ["command"] },
+      "then": { "not": { "required": ["shell"] } }
+    },
+    {
+      "if": { "not": { "required": ["stack"] } },
+      "then": { "anyOf": [{ "required": ["command"] }, { "required": ["shell"] }] }
+    }
+  ]
+}

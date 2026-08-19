@@ -12,6 +12,7 @@ Wasm guest for the host. The root manifest lists `extensions` in its `exclude`.
 
 | extension            | what it does                                                                                                                                  |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`muster`](muster)   | supervise units that run in terminals, from `~/.config/blit/muster`: `@muster list\|status\|start\|stop\|restart\|log\|doctor`                |
 | [`session`](session) | autostart and supervise GUI applications: `@session list\|enable\|disable\|start\|stop\|forget\|status`                                       |
 | [`systemd`](systemd) | live system and user unit state on the `blit.systemd.v1` channel, plus a live/paged journal reader: `@systemd list\|get\|watch\|logs\|status` |
 
