@@ -157,6 +157,8 @@ type RemoteItem = {
 type TileItem = {
   type: "tile";
   key: string;
+  /** Dim address half, as a session row has (`dev:manage` before `Session`). */
+  prefix: string;
   title: string;
   subtitle: string;
   /** The tile assignment to restore (editor:/diff:/commit:/manage:). */
@@ -1216,6 +1218,7 @@ export function SwitcherOverlay(props: {
       const d = tileDisplay(assignment);
       if (
         needle &&
+        !d.prefix.toLowerCase().includes(needle) &&
         !d.title.toLowerCase().includes(needle) &&
         !d.subtitle.toLowerCase().includes(needle)
       ) {
@@ -1224,6 +1227,7 @@ export function SwitcherOverlay(props: {
       items.push({
         type: "tile",
         key: `tile:${assignment}`,
+        prefix: d.prefix,
         title: d.title,
         subtitle: d.subtitle,
         assignment,
@@ -2397,21 +2401,32 @@ export function SwitcherOverlay(props: {
                                       "font-weight": 600,
                                     }}
                                   >
+                                    {/* A parked manage tile carries the same
+                                        dim address a session row does, so both
+                                        are asked for it the same way. */}
                                     <Show
                                       when={
-                                        item.type === "session" &&
-                                        (item as SessionItem).prefix
+                                        (item.type === "session" &&
+                                          (item as SessionItem).prefix) ||
+                                        (item.type === "tile" &&
+                                          (item as TileItem).prefix)
                                       }
                                     >
-                                      <span
-                                        style={{
-                                          opacity: 0.5,
-                                          "font-weight": 400,
-                                        }}
-                                      >
-                                        {(item as SessionItem).prefix}
-                                      </span>
-                                      {" \u203A "}
+                                      {(prefix) => (
+                                        <>
+                                          <span
+                                            style={{
+                                              opacity: 0.5,
+                                              "font-weight": 400,
+                                            }}
+                                          >
+                                            {prefix()}
+                                          </span>
+                                          <Show when={item.title}>
+                                            {" \u203A "}
+                                          </Show>
+                                        </>
+                                      )}
                                     </Show>
                                     {item.title}
                                   </span>

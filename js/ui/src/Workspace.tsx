@@ -4863,6 +4863,16 @@ function WorkspaceScreen(props: {
                                 "font-size": `${chromeScale().sm}px`,
                               }}
                             >
+                              {/* Address dim, then the name — the same shape
+                                  the terminal and surface cards below use, so
+                                  a column of parked things reads as one list
+                                  rather than three conventions. */}
+                              <Show when={d().prefix}>
+                                <span style={{ opacity: 0.5 }}>
+                                  {d().prefix}
+                                </span>
+                                <Show when={d().title}>{" \u203A "}</Show>
+                              </Show>
                               {d().title}
                             </span>
                             <Show when={d().subtitle}>
