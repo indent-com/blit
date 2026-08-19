@@ -23,7 +23,7 @@ flowchart LR
   S["muster/blit/*.json (stack)"] --> M[muster]
   I["muster/{main,epic}.json (instances)"] --> M
   E[".env files"] -->|FS_READ| M
-  M -->|"CREATE2 (argv+env+cwd)"| P["PTYs, tag muster/&lt;instance&gt;/&lt;unit&gt;/&lt;seq&gt;"]
+  M -->|"CREATE2 (argv+env+cwd)"| P["PTYs, tag muster/&lt;unit&gt;/&lt;seq&gt;"]
   M -->|KILL / CLOSE| P
   P -->|S2C_EXITED / TERM_SINCE| M
   M --> J["journal (ring + KV tail)"]
@@ -459,7 +459,9 @@ forever with no child. Muster sets `CREATE2_WANT_STATUS` and treats
 ## Running a unit
 
 **Spawn.** `FS_READ` each `envFile` (absolute, one shot, no sync), merge with
-`env`, send one `CREATE2`: `tag = muster/<unit>@<instance>/<seq>`, cwd, merged
+`env`, send one `CREATE2`: `tag = muster/<unit>/<seq>` — where `<unit>` is
+already `<instance>/<template>` for a stack member, so the tag carries the
+qualified name unchanged — cwd, merged
 env, argv or command, `CREATE2_WANT_STATUS`. Guest SDK:
 `CreateRequest { tag, argv, env, cwd, .. }`. Caps are the process family's
 (`CREATE2_MAX_ARGC`, `_ARG_LEN`, `_ARG_BYTES`) — same `execve` at the far end.
