@@ -6018,7 +6018,23 @@ fn reanchor_scrolled_clients(sess: &mut Session) {
 /// offset we hold for it right now — which is what makes the request immune
 /// to a re-anchor that crossed it on the wire.  Unlike a re-anchor this may
 /// start a live client scrolling, since a wheel notch on a live view is how
-/// scrolling back begins.  Returns the new offset when it changed.
+/// scrolling back begins.
+///
+/// Returns the new offset only when the client has to be *told* it, which is
+/// not the same as "when it changed".  A relative request the client can
+/// predict the outcome of needs no answer: it applied the same delta to the
+/// same offset before it sent one.  Answering anyway is actively wrong, and
+/// wrong in a way that compounds — the answer is absolute, it arrives a round
+/// trip late, and a wheel notch is several requests long, so by the time the
+/// first lands the client has already moved past it.  Adopting it drags the
+/// view back, and the next delta, measured from the position it was dragged
+/// back to, comes out too big.  A twelve-row notch went out as 2, 2, 4, 4, 2
+/// and landed fourteen rows down; three notches landed forty rows instead of
+/// thirty-six, with the view lurching the whole way.
+///
+/// Clamping is the one outcome the client cannot predict — its own idea of the
+/// scrollback's depth is a frame old and never counts the rows the same way —
+/// so that is exactly when the answer is worth its round trip.
 fn scroll_client_by(
     client: &mut ClientState,
     pid: u16,
@@ -6026,8 +6042,10 @@ fn scroll_client_by(
     max_offset: usize,
 ) -> Option<usize> {
     let current = client.scroll_offsets.get(&pid).copied().unwrap_or(0) as i64;
-    let next = current.saturating_add(delta).clamp(0, max_offset as i64) as usize;
-    update_client_scroll_state(client, pid, next).then_some(next)
+    let requested = current.saturating_add(delta);
+    let next = requested.clamp(0, max_offset as i64);
+    let changed = update_client_scroll_state(client, pid, next as usize);
+    (changed && requested != next).then_some(next as usize)
 }
 
 /// Move one client's parked view down by `delta` lines, bounded by the
@@ -27341,8 +27359,10 @@ mod tests {
         // In flight: three lines scroll away and we hold the view still.
         assert_eq!(reanchor_client(&mut client, 7, 3, 500), Some(15));
         // The request was computed against offset 12 and still means "three
-        // more lines back", not "offset 15".
-        assert_eq!(scroll_client_by(&mut client, 7, 3, 500), Some(18));
+        // more lines back", not "offset 15".  Nothing to answer: the client
+        // took the re-anchor to 15 and applied the same 3 to it.
+        assert_eq!(scroll_client_by(&mut client, 7, 3, 500), None);
+        assert_eq!(client.scroll_offsets.get(&7), Some(&18));
     }
 
     #[test]
@@ -27350,7 +27370,11 @@ mod tests {
         let mut client = test_client();
         client.subscriptions.insert(7);
 
-        assert_eq!(scroll_client_by(&mut client, 7, 3, 500), Some(3));
+        // Going back needs no answer — the client predicted 3 itself — but
+        // coming home overshot the live tail, and a clamp it cannot predict
+        // is exactly what an answer is for.
+        assert_eq!(scroll_client_by(&mut client, 7, 3, 500), None);
+        assert_eq!(client.scroll_offsets.get(&7), Some(&3));
         assert_eq!(scroll_client_by(&mut client, 7, -9, 500), Some(0));
         assert_eq!(client.scroll_offsets.get(&7), None);
     }
@@ -27363,6 +27387,21 @@ mod tests {
 
         assert_eq!(scroll_client_by(&mut client, 7, i64::MAX, 100), Some(100));
         assert_eq!(scroll_client_by(&mut client, 7, 5, 100), None);
+    }
+
+    #[test]
+    fn a_wheel_notch_is_never_answered_back() {
+        // A notch is several requests long and the answer is absolute, so an
+        // answer to any of them is stale before it lands.  The client that
+        // adopts one gets dragged back and then over-sends the next delta:
+        // twelve rows of wheel went out as 2, 2, 4, 4, 2 and landed on 14.
+        let mut client = test_client();
+        client.subscriptions.insert(7);
+
+        for _ in 0..6 {
+            assert_eq!(scroll_client_by(&mut client, 7, 2, 500), None);
+        }
+        assert_eq!(client.scroll_offsets.get(&7), Some(&12));
     }
 
     #[test]

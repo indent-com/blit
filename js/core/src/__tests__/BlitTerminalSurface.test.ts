@@ -1631,6 +1631,147 @@ describe("BlitTerminalSurface native scroll surface", () => {
   });
 });
 
+describe("BlitTerminalSurface scrollback against a server that answers", () => {
+  // One gesture is many scroll events — a wheel notch Chromium animates over
+  // several frames, a momentum flick on an iPad, dozens.  Each is reported as
+  // a relative move, and each report the server answers comes back absolute
+  // and a round trip late.  Adopting a late answer drags the view back to
+  // where the gesture used to be, and the next delta — measured from there —
+  // comes out too big, so the view lurches past where the finger asked.
+  beforeEach(() => {
+    mockCanvasContext();
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((cb: FrameRequestCallback) => {
+        cb(0);
+        return 1;
+      }),
+    );
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const LINES = 1000;
+  const CELL_H = 10;
+  /** jsdom reports no scrollHeight, so the code falls back to the model. */
+  const MAX_TOP = LINES * CELL_H;
+
+  /**
+   * A surface wired to a server that holds its own offset, applies each
+   * relative move to it, and answers `answerEverything` moves later.
+   */
+  function rig(lagFrames: number, answerEverything: boolean) {
+    const s = new BlitTerminalSurface({ sessionId: null });
+    const el = document.createElement("div");
+    const spacer = document.createElement("div");
+    el.appendChild(spacer);
+    Object.defineProperty(el, "clientHeight", {
+      configurable: true,
+      value: 80,
+    });
+
+    // @ts-expect-error — install DOM/terminal stubs for the private sync.
+    s.scrollEl = el;
+    // @ts-expect-error — install DOM/terminal stubs for the private sync.
+    s.scrollSpacer = spacer;
+    // @ts-expect-error — only scrollback_lines is read here.
+    s.terminal = { scrollback_lines: () => LINES };
+    // @ts-expect-error — only cell.h is read by the scroll surface methods.
+    s.cell = { h: CELL_H };
+
+    let anchor: ((offset: number) => void) | null = null;
+    // @ts-expect-error — minimal connection: status gate plus the anchor hook.
+    s["_blitConn"] = {
+      transport: { status: "connected" },
+      addScrollAnchorListener: (_id: string, cb: (o: number) => void) => {
+        anchor = cb;
+        return () => {};
+      },
+    };
+    // @ts-expect-error — the listener is per-session.
+    s["_sessionId"] = "s1";
+
+    let serverOffset = 0;
+    let frame = 0;
+    const inFlight: { at: number; offset: number }[] = [];
+    const sent: number[] = [];
+
+    // @ts-expect-error — minimal workspace: only the scroll verbs are used.
+    s["_workspace"] = {
+      scrollSessionBy: (_id: string, _abs: number, lines: number) => {
+        sent.push(lines);
+        const requested = serverOffset + lines;
+        serverOffset = Math.max(0, Math.min(LINES, requested));
+        if (answerEverything || requested !== serverOffset) {
+          inFlight.push({ at: frame + lagFrames, offset: serverOffset });
+        }
+      },
+      scrollSession: () => {},
+    };
+
+    // @ts-expect-error — wire the private listeners.
+    s["setupScrollAnchorListener"]();
+    // @ts-expect-error — wire the private listeners.
+    s["setupScrollSurface"]();
+
+    /** One frame: the browser moves scrollTop, then any answer that has
+     *  finished its round trip lands. */
+    const step = (scrollTop: number) => {
+      el.scrollTop = scrollTop;
+      // @ts-expect-error — the rAF stub already cleared the listener handle.
+      s.boundScrollListener();
+      frame++;
+      while (inFlight.length && inFlight[0].at <= frame) {
+        anchor!(inFlight.shift()!.offset);
+      }
+    };
+
+    /** Drain the wire once the gesture has stopped. */
+    const settle = () => {
+      while (inFlight.length) {
+        frame++;
+        anchor!(inFlight.shift()!.offset);
+      }
+    };
+
+    return { step, settle, sent, server: () => serverOffset };
+  }
+
+  /** Twelve rows of travel, two rows a frame, the way one notch arrives. */
+  const oneNotch = (step: (top: number) => void) => {
+    for (let i = 1; i <= 6; i++) step(MAX_TOP - i * 20);
+  };
+
+  it("lands a notch where it pointed when nothing answers back", () => {
+    const { step, settle, sent, server } = rig(2, false);
+    oneNotch(step);
+    settle();
+    expect(sent).toEqual([2, 2, 2, 2, 2, 2]);
+    expect(server()).toBe(12);
+  });
+
+  it("would overshoot a notch if every move were answered", () => {
+    // The behaviour this exists to prevent, kept as the thing being ruled
+    // out: the doubled deltas are the answers landing mid-gesture.
+    const { step, settle, sent, server } = rig(2, true);
+    oneNotch(step);
+    settle();
+    expect(sent).toEqual([2, 2, 4, 4, 2]);
+    expect(server()).toBe(14);
+  });
+
+  it("lands a flick where it pointed, however long the wire is", () => {
+    for (const lag of [1, 2, 5]) {
+      const { step, settle, server } = rig(lag, false);
+      for (let i = 1; i <= 18; i++) step(MAX_TOP - i * 20);
+      settle();
+      expect({ lag, offset: server() }).toEqual({ lag, offset: 36 });
+    }
+  });
+});
+
 describe("BlitTerminalSurface wheel in mouse-reporting apps", () => {
   beforeEach(() => {
     mockCanvasContext();
