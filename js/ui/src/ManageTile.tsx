@@ -28,6 +28,12 @@ import type {
 } from "@blit-sh/core";
 import { ConnectionPanels } from "./ConnectionPanels";
 import { connectionHasClientList } from "./ConnectionClients";
+import { shownTab, TAB_LABELS } from "./connectionTab";
+import {
+  clearActiveEditor,
+  setActiveEditorFocused,
+  type ManageController,
+} from "./ide/activeEditor";
 import {
   PanelEmpty,
   SectionHeading,
@@ -67,6 +73,9 @@ export function ManageTile(props: {
    *  none of the panels, which would otherwise run a per-second client catalog
    *  and a unit table behind a picture nobody is reading. */
   preview?: boolean;
+  /** Whether this tile owns workspace focus. BSP keeps every pane mounted, so
+   *  the status bar's identity follows this rather than mounting. */
+  focused?: boolean;
 }) {
   const snapshot = createBlitWorkspaceState(props.workspace);
   const connection = () =>
@@ -91,6 +100,25 @@ export function ManageTile(props: {
     sync();
     onCleanup(conn.surfaceStore.onChange(sync));
   });
+
+  // The bar's identity for this pane. Same contract every other tile follows:
+  // BSP keeps background panes mounted, so ownership tracks focus rather than
+  // mounting, and a thumbnail never claims it at all.
+  const controller: ManageController = {
+    kind: "manage",
+    connectionId: props.connectionId,
+    tab: () => {
+      const name = shownTab(props.connectionId);
+      return name ? TAB_LABELS[name] : null;
+    },
+  };
+  createEffect(() => {
+    setActiveEditorFocused(
+      controller,
+      !props.preview && props.focused !== false,
+    );
+  });
+  onCleanup(() => clearActiveEditor(controller));
 
   const canListClients = () => {
     const conn = connection();

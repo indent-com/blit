@@ -34,6 +34,7 @@ import {
   type CommitController,
   type DiffController,
   type EditorController,
+  type ManageController,
   type PreviewController,
 } from "./ide/activeEditor";
 import { lineWrap, toggleLineWrap } from "./ide/editorPrefs";
@@ -368,6 +369,7 @@ export function StatusBar(props: {
       </button>
       <span
         ref={identityEl}
+        data-status-identity=""
         style={{
           flex: 1,
           "min-width": 0,
@@ -477,6 +479,8 @@ export function StatusBar(props: {
                         fontFamily={props.fontFamily}
                         fontSize={props.fontSize}
                       />
+                    ) : ed.kind === "manage" ? (
+                      <ManageIdentity m={ed} label={label()} />
                     ) : (
                       <EditorIdentity
                         ed={ed}
@@ -527,8 +531,9 @@ export function StatusBar(props: {
               toggle={ed.toggleViewMode}
               scale={scale()}
             />
-          ) : ed.kind === "preview" ? (
-            // Nothing to act on: no save, no diff mode, no LSP.
+          ) : ed.kind === "preview" || ed.kind === "manage" ? (
+            // Nothing to act on: no save, no diff mode, no LSP. Everything a
+            // manage tile can do is a control inside the pane.
             <></>
           ) : (
             <EditorActions ed={ed} scale={scale()} theme={theme()} />
@@ -963,6 +968,40 @@ function PathIdentity(props: {
           <b style={{ color: props.theme.fg }}>{cut().base}</b>
         </bdi>
       </span>
+    </>
+  );
+}
+
+/** Focused manage tile's identity: `dev:manage › Session`. The same two halves
+ *  its dock card has (`tileDisplay`) and the same shape a focused terminal or
+ *  surface puts here — address dim, then the name, which for these panels is
+ *  the tab that is up. */
+function ManageIdentity(props: {
+  m: ManageController;
+  label: string | null;
+}): JSX.Element {
+  return (
+    <>
+      <span style={{ opacity: 0.5, "flex-shrink": 0 }}>
+        {`${props.label ?? props.m.connectionId}:manage`}
+      </span>
+      <Show when={props.m.tab()}>
+        {(tab) => (
+          <>
+            {" › "}
+            <span
+              style={{
+                "min-width": 0,
+                overflow: "hidden",
+                "white-space": "nowrap",
+                "text-overflow": "ellipsis",
+              }}
+            >
+              {tab()}
+            </span>
+          </>
+        )}
+      </Show>
     </>
   );
 }

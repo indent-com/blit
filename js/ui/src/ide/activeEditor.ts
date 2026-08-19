@@ -80,12 +80,23 @@ export type CommitController = {
   toggleViewMode: () => void;
 };
 
+/** A server's panels. The bar has nothing to act on — the tabs, and everything
+ *  they operate, are in the pane itself — so this is identity only: which
+ *  server, and which of its panels is up. */
+export type ManageController = {
+  kind: "manage";
+  connectionId: string;
+  /** Reactive: the tab's label, or null before the panels have resolved one. */
+  tab: () => string | null;
+};
+
 /** Any tile whose chrome the StatusBar renders. */
 export type TileChrome =
   | EditorController
   | DiffController
   | CommitController
-  | PreviewController;
+  | PreviewController
+  | ManageController;
 
 const [activeEditor, setActiveEditor] = createSignal<TileChrome | null>(null);
 

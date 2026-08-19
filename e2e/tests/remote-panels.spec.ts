@@ -63,6 +63,14 @@ test("a remote's panels open as a pane from its Manage button, not from status-b
   await expect(tabs.first()).toBeVisible({ timeout: 5_000 });
   await expect(page.locator('[data-connection-tab="clients"]')).toHaveCount(1);
 
+  // The bar says which pane is focused for every other kind of tile, and a
+  // manage tile publishes the same two halves its dock card carries: the
+  // address, then the tab that is up. Read from the bar's own region so a
+  // match on the tab strip behind it cannot pass for one here.
+  const identity = page.locator("[data-status-identity]");
+  await expect(identity).toContainText(/:manage/, { timeout: 5_000 });
+  await expect(identity).toContainText("Clients");
+
   // Extensions is a server capability rather than an installed extension, so
   // it is present here, and its registry defaults to the dev stack's own —
   // three ports up from the page, which is what bin/dev allocates.

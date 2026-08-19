@@ -111,6 +111,7 @@ export function BlitTile(props: {
           fontSize={props.fontSize}
           readOnly={props.isConnectionReadOnly?.(t.connectionId)}
           preview={props.preview}
+          focused={props.focused}
         />
       );
     }
