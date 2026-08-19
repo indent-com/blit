@@ -135,7 +135,12 @@ import { StatusBar } from "./StatusBar";
 import { DesktopChrome } from "./DesktopChrome";
 import { LeftDock, LEFT_PANELS, type LeftPanel } from "./LeftDock";
 import { foldedSections, liveOverrides, toggleSection } from "./dockSections";
-import { popActivation, pushActivation } from "./activationStack";
+import {
+  ATTENTION_MS,
+  armAttention,
+  expireAttention,
+  type Attention,
+} from "./surfaceAttention";
 import {
   formatExpandedHash,
   formatPanelsHash,
@@ -315,7 +320,9 @@ function getHmrWorkspace(
   leaseOwner: object,
 ): HmrWorkspaceData {
   const raw = import.meta.hot?.data?.workspace as
-    HmrWorkspaceData | BlitWorkspace | undefined;
+    | HmrWorkspaceData
+    | BlitWorkspace
+    | undefined;
   // Accept the raw BlitWorkspace stored by versions before HmrWorkspaceData.
   const prev = raw && "workspace" in raw ? raw.workspace : raw;
   const previousOwner = raw && "workspace" in raw ? raw.owner : null;
@@ -1612,15 +1619,43 @@ function WorkspaceScreen(props: {
   const [focusedSurfaceConnId, setFocusedSurfaceConnId] =
     createSignal<ConnectionId | null>(null);
 
-  // What xdg_activation_v1 covered up, newest last (./activationStack.ts).
-  // Plain `let`: nothing renders it, it only survives between an activation
-  // and the moment that surface goes away.
-  let activationStack: string[] = [];
-  // The main view's occupant, when an activation is what put it there. Only
-  // its death lowers the stack — a surface the *user* chose replaces the
-  // covering relationship rather than extending it, so its death clears the
-  // stack instead of restoring something the user left long ago.
-  let activatedAssignment: string | null = null;
+  // Surfaces that asked to come forward (xdg_activation_v1) and were answered
+  // with a highlight rather than the view — see ./surfaceAttention.ts for why
+  // an activation must not move anything.
+  const [attention, setAttention] = createSignal<Attention>(new Map());
+  /** True while `assignment` is lit; what the dock card and the pane read. */
+  const hasAttention = (assignment: string) => attention().has(assignment);
+  // One sweep in flight at a time, aimed at the soonest window to close and
+  // re-aimed at whatever is left. A timer per request would be a timer per
+  // *repeat*, and a chatty client sends several a second; a fixed interval
+  // would leave a later arrival lit past its window, holding off its own next
+  // pulse for as long as it was late.
+  let attentionSweep: ReturnType<typeof setTimeout> | null = null;
+  function scheduleAttentionSweep() {
+    if (attentionSweep != null) return;
+    const lit = untrack(attention);
+    if (lit.size === 0) return;
+    const soonest = Math.min(...lit.values());
+    attentionSweep = setTimeout(
+      () => {
+        attentionSweep = null;
+        const next = expireAttention(untrack(attention), Date.now());
+        setAttention(next);
+        scheduleAttentionSweep();
+      },
+      // A hair past the deadline: expireAttention drops a window only once it
+      // is strictly over, so landing exactly on it would sweep nothing and
+      // re-arm for 0ms, in a loop.
+      Math.max(16, soonest - Date.now() + 16),
+    );
+  }
+  function flashAttention(assignment: string) {
+    setAttention((prev) => armAttention(prev, assignment, Date.now()));
+    scheduleAttentionSweep();
+  }
+  onCleanup(() => {
+    if (attentionSweep != null) clearTimeout(attentionSweep);
+  });
 
   /** Set or clear the focused surface, always keeping the connectionId
    *  in sync so the BSP view uses the correct connection.
@@ -2110,7 +2145,7 @@ function WorkspaceScreen(props: {
         clearTimeout(clearFocusedTimer);
         clearFocusedTimer = null;
       }
-      lowerFocusedSurface(fid, fConnId);
+      focusSurfaceById(null);
     } else if (!exists) {
       if (!clearFocusedTimer) {
         clearFocusedTimer = setTimeout(() => {
@@ -2121,7 +2156,7 @@ function WorkspaceScreen(props: {
               s.surfaceId === fid &&
               (fConnId == null || s.connectionId === fConnId),
           );
-          if (stillGone) lowerFocusedSurface(fid, fConnId);
+          if (stillGone) focusSurfaceById(null);
         }, 2000);
       }
     } else if (clearFocusedTimer) {
@@ -3283,6 +3318,41 @@ function WorkspaceScreen(props: {
   });
   onCleanup(() => document.getElementById("blit-scrollbars")?.remove());
 
+  // The highlight an xdg_activation_v1 request buys instead of the view: red,
+  // fading out over the window. One colour and one direction — a two-colour
+  // bounce read as a state change rather than a nudge, and it had to be
+  // explained. Nothing here moves, so there is no reduced-motion variant to
+  // offer either. Global and themed like the scrollbars above, because the same
+  // fade has to land on two very different things — a dock card's header bar
+  // and a pane-sized ring — and keyframes cannot be inline styles.
+  createEffect(() => {
+    const t = theme();
+    const id = "blit-attention";
+    let el = document.getElementById(id) as HTMLStyleElement | null;
+    if (!el) {
+      el = document.createElement("style");
+      el.id = id;
+      document.head.appendChild(el);
+    }
+    el.textContent = `
+      @keyframes blit-attention-fill {
+        0%   { background-color: ${t.errorText}; }
+        100% { background-color: transparent; }
+      }
+      @keyframes blit-attention-ring {
+        0%   { border-color: ${t.errorText}; }
+        100% { border-color: transparent; }
+      }
+      [data-blit-attention="fill"] {
+        animation: blit-attention-fill ${ATTENTION_MS}ms ease-out 1;
+      }
+      [data-blit-attention="ring"] {
+        animation: blit-attention-ring ${ATTENTION_MS}ms ease-out 1;
+      }
+    `;
+  });
+  onCleanup(() => document.getElementById("blit-attention")?.remove());
+
   onMount(() => {
     document.documentElement.style.fontFamily = "system-ui, sans-serif";
   });
@@ -3607,7 +3677,8 @@ function WorkspaceScreen(props: {
 
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
-    ((sessionId: SessionId, targetPaneId: string) => void) | null = null;
+    | ((sessionId: SessionId, targetPaneId: string) => void)
+    | null = null;
   let moveToPaneFn:
     | ((value: string, targetPaneId: string, fromPaneId?: string) => void)
     | null = null;
@@ -3748,28 +3819,26 @@ function WorkspaceScreen(props: {
 
   /**
    * A Wayland client asked for its own toplevel (xdg_activation_v1 — an
-   * Electron app reacting to a notification click). It gets the same treatment
-   * as picking the surface in the switcher, plus a record of what it covered.
+   * Electron app reacting to a notification click). It is answered with a
+   * highlight where the surface already is, and nothing else: the view is the
+   * user's, and an app that wants it can only ask to be looked at.
    *
-   * BSP pushes nothing: `focusSurface` either focuses the pane the surface is
-   * already in or hands it the focused pane, and a pane it displaces keeps its
-   * occupant in the dock where the user can see it. The non-BSP main view is
-   * one slot, so without the stack the previous occupant is simply gone once
-   * the activated surface closes.
+   * Raising instead is what made the dock unusable next to a talkative client.
+   * Tokens are cheap and their delivery unacknowledged, so a client repeats the
+   * request several times a second, and each repeat landed after whatever the
+   * user had just picked — their choice appearing for an instant and being
+   * dragged back off, with repeated clicking working only when one fell in a
+   * gap. Under a layout it was worse: each repeat re-focused a pane out from
+   * under them. See ./surfaceAttention.ts.
    */
   function activateSurface(surfaceId: number, connectionId: ConnectionId) {
-    const target = surfaceAssignment(connectionId, surfaceId);
-    // Already on top: nothing to raise, and nothing to remember. Clients
-    // repeat the request (a token is cheap and its delivery unacknowledged),
-    // so without this a talkative app would re-run focusSurface — closing an
-    // overlay the user just opened — several times a second.
+    // Already on top: the user is looking straight at it, so lighting it up
+    // would be noise rather than news.
     //
     // "On top" is a different slot in each mode: focusedSurfaceId is the
-    // non-BSP main view, which focusSurface nulls under a layout, so testing
-    // only that left this guard dead in BSP — where the repeats are worse than
-    // a closed overlay, since each one re-focuses the pane out from under the
-    // user. In BSP the equivalent question is whether the surface already
-    // occupies the focused pane.
+    // non-BSP main view, which is left null under a layout, so testing only
+    // that would leave this dead in BSP. There the equivalent question is
+    // whether the surface already occupies the focused pane.
     if (inBsp()) {
       const focused = bspFocusedSurface();
       if (
@@ -3784,70 +3853,7 @@ function WorkspaceScreen(props: {
     ) {
       return;
     }
-    if (inBsp()) {
-      activationStack = [];
-      activatedAssignment = null;
-    } else {
-      activationStack = pushActivation(
-        activationStack,
-        focusedAssignment(),
-        target,
-      );
-      activatedAssignment = target;
-    }
-    focusSurface(surfaceId, connectionId);
-  }
-
-  /** Show a stacked entry again. Deliberately not `focusAssignment`: this runs
-   *  because a window closed, not because the user asked for anything, so it
-   *  must not close an overlay they have open. */
-  function restoreMainView(assignment: string) {
-    const surface = parseSurfaceAssignment(assignment);
-    if (surface) {
-      setActiveTile(null);
-      focusSurfaceById(surface.surfaceId, surface.connectionId as ConnectionId);
-      return;
-    }
-    if (isTileAssignment(assignment) || isWebAssignment(assignment)) {
-      focusSurfaceById(null);
-      setActiveTile(assignment);
-      return;
-    }
-    focusSessionFromUi(assignment as SessionId);
-  }
-
-  /**
-   * The focused surface is gone. If an activation is what put it on screen,
-   * reveal what it covered; otherwise clear the slot exactly as before, and
-   * drop the stack — the user moved on from that chain, so its entries would
-   * only resurface somewhere they no longer belong.
-   */
-  function lowerFocusedSurface(
-    surfaceId: number,
-    connectionId: ConnectionId | null,
-  ) {
-    const dying =
-      connectionId != null ? surfaceAssignment(connectionId, surfaceId) : null;
-    if (dying != null && dying === activatedAssignment) {
-      // cycleRing is every open terminal, surface and tab, so one lookup
-      // covers all four things a stack entry can name.
-      const open = new Set(cycleRing());
-      const { restore, stack } = popActivation(activationStack, (a) =>
-        open.has(a),
-      );
-      activationStack = stack;
-      if (restore != null) {
-        // A restored entry is still part of the activation chain: it only sits
-        // there because an activation covered it, so its own death lowers the
-        // stack again.
-        activatedAssignment = restore;
-        restoreMainView(restore);
-        return;
-      }
-    }
-    activationStack = [];
-    activatedAssignment = null;
-    focusSurfaceById(null);
+    flashAttention(surfaceAssignment(connectionId, surfaceId));
   }
 
   let termHandle: { rows: number; cols: number; focus: () => void } | null =
@@ -4750,6 +4756,7 @@ function WorkspaceScreen(props: {
                     liveSurfaceKeys={surfaces().map(
                       (s) => `${s.connectionId}:${s.surfaceId}`,
                     )}
+                    hasAttention={hasAttention}
                     manageVisibility={overlay() !== "expose"}
                     extraVisibleSessions={
                       previewPanelVisible()
@@ -4815,6 +4822,7 @@ function WorkspaceScreen(props: {
               surfaces={offScreenSurfaces()}
               focusedSurfaceId={focusedSurfaceId()}
               focusedSurfaceConnId={focusedSurfaceConnId()}
+              hasAttention={hasAttention}
               connectionId={activeConnectionId()}
               connectionLabels={connectionLabels()}
               theme={theme()}
@@ -5500,6 +5508,8 @@ function PreviewPanel(props: {
   surfaces: BlitSurface[];
   focusedSurfaceId: number | null;
   focusedSurfaceConnId: ConnectionId | null;
+  /** Is this pane assignment currently lit by an activation? */
+  hasAttention: (assignment: string) => boolean;
   connectionId: string;
   connectionLabels?: Map<string, string>;
   theme: Theme;
@@ -5725,6 +5735,9 @@ function PreviewPanel(props: {
                   s().surfaceId === props.focusedSurfaceId &&
                   s().connectionId === props.focusedSurfaceConnId
                 }
+                attention={props.hasAttention(
+                  surfaceAssignment(s().connectionId, s().surfaceId),
+                )}
                 isMobileTouch={props.isMobileTouch}
                 onFocus={() =>
                   props.onFocusSurface(s().connectionId, s().surfaceId)
@@ -5762,6 +5775,8 @@ function Thumbnail(props: {
   closeTitle: string;
   /** Extra header-bar background (e.g. for focused highlight). */
   headerBg?: string;
+  /** Pulse the header: this card's content asked to come forward. */
+  attention?: boolean;
   /** Inline elements rendered inside the header button. */
   header: () => any;
   /** Body content (terminal preview, surface view, etc.). */
@@ -5865,6 +5880,11 @@ function Thumbnail(props: {
     >
       <button
         onClick={props.onFocus}
+        // The sweep drops the attribute when the window closes, so the next
+        // activation adds it back and the animation plays again from the top.
+        // Repeats *inside* the window never reach here (surfaceAttention.ts
+        // absorbs them), which is what keeps this a pulse and not a strobe.
+        data-blit-attention={props.attention ? "fill" : undefined}
         style={mergeStyle(ui.btn, {
           display: "flex",
           "align-items": "center",
@@ -5991,6 +6011,7 @@ function SurfaceThumbnail(props: {
   theme: Theme;
   scale: UIScale;
   focused: boolean;
+  attention?: boolean;
   isMobileTouch: boolean;
   onFocus: () => void;
   onClose: () => void;
@@ -6008,6 +6029,7 @@ function SurfaceThumbnail(props: {
       onClose={props.onClose}
       closeTitle="Close surface"
       headerBg={props.focused ? props.theme.selectedBg : undefined}
+      attention={props.attention}
       header={() => (
         <>
           <span

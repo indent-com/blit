@@ -192,6 +192,8 @@ export function BSPContainer(props: {
   ) => void;
   /** Coarse pointer — keeps each pane's ✕ visible without a hover. */
   isMobileTouch?: boolean;
+  /** Is this pane assignment lit by an activation (see BSPTreeCtx)? */
+  hasAttention?: (assignment: string) => boolean;
   /** Whether a session's connection is read-only (see BSPTreeCtx). */
   isSessionReadOnly?: (sessionId: string) => boolean;
   /** Whether a whole connection is read-only (see BSPTreeCtx). */
@@ -968,6 +970,9 @@ export function BSPContainer(props: {
     get isMobileTouch() {
       return props.isMobileTouch;
     },
+    get hasAttention() {
+      return props.hasAttention;
+    },
     get isSessionReadOnly() {
       return props.isSessionReadOnly;
     },
@@ -1347,6 +1352,10 @@ function LeafPane(props: {
   // mutation and the focused pane re-asserts DOM focus it never lost.
   const paneSession = createMemo(() => props.sessionId);
   const paneVisible = createMemo(() => props.visible);
+  const paneAttention = createMemo(() => {
+    const assignment = props.sessionId;
+    return assignment != null && (ctx.hasAttention?.(assignment) ?? false);
+  });
   createEffect(() => {
     // Track these dependencies
     const focused = props.isFocused;
@@ -1430,6 +1439,23 @@ function LeafPane(props: {
             "pointer-events": "none",
             background: `color-mix(in srgb, ${theme().accent} 14%, transparent)`,
             border: `2px solid ${theme().accent}`,
+            "box-sizing": "border-box",
+          }}
+        />
+      </Show>
+      {/* This pane's occupant asked to come forward. It gets a ring and keeps
+          its place — see surfaceAttention.ts. A ring rather than the pane's own
+          1px border: that border is the focus indicator, and repainting it
+          would say "you are here" about a pane the user is not in. */}
+      <Show when={paneAttention()}>
+        <div
+          data-blit-attention="ring"
+          style={{
+            position: "absolute",
+            inset: 0,
+            "z-index": 6,
+            "pointer-events": "none",
+            border: "2px solid transparent",
             "box-sizing": "border-box",
           }}
         />
