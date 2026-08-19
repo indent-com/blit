@@ -61,9 +61,9 @@ export function ManageTile(props: {
   /** The connection is an `.ro` share: the client-control family never
    *  answers through the forwarder, so the clients tab must not be offered. */
   readOnly?: boolean;
-  /** Read-only thumbnail (the background dock). It draws a card, never the
-   *  panels — a parked tile that kept its client watch and unit table alive
-   *  would cost a per-second catalog for a picture nobody is reading. */
+  /** Read-only thumbnail (the background dock). It draws the heading alone,
+   *  never the panels — a parked tile that kept its client watch and unit table
+   *  alive would cost a per-second catalog for a picture nobody is reading. */
   preview?: boolean;
 }) {
   const snapshot = createBlitWorkspaceState(props.workspace);
@@ -133,14 +133,7 @@ export function ManageTile(props: {
         />
       </SectionHeading>
 
-      <Show
-        when={!props.preview}
-        fallback={
-          <PanelEmpty theme={props.theme} scale={props.scale}>
-            Server panels — applications, clients, units, extensions.
-          </PanelEmpty>
-        }
-      >
+      <Show when={!props.preview}>
         <Show
           when={connection()?.status === "connected"}
           fallback={
