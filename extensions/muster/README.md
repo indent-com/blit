@@ -99,9 +99,17 @@ exits 0, which is how one keyword covers what `process-compose` spells
 
 ## Restarting, and never in place
 
-`restartOnFailure` and `restartOnChange` default on; `restartOnSuccess` does
-not, because a process that exits 0 usually meant it — and the blit dev server
-exits 0 on purpose when it is replaced, so retrying that is an infinite loop.
+`restartOnFailure`, `restartOnAbnormal` and `restartOnChange` default on;
+`restartOnSuccess` does not, because a process that exits 0 usually meant it —
+and the blit dev server exits 0 on purpose when it is replaced, so retrying that
+is an infinite loop.
+
+`restartOnAbnormal` is separate from `restartOnFailure` because they answer
+different questions. A process that returns 1 has decided something; a process
+the OOM killer took has not. `"restartOnFailure": false` means "obey what it
+says", and it should not also mean "and stay down when it is shot" — so the two
+are independent, and either is enough. Blit's exit status negates the
+terminating signal, which is how a kill is told from a return.
 
 Every restart is a **new terminal**. `C2S_RESTART` would keep the pane, but it
 replays the spec the PTY was created with, so it cannot serve a restart caused
@@ -120,6 +128,39 @@ run        30   exit 1   seq 6
 ```
 
 `blit terminal journal 30` then reads that run with no scrollback archaeology.
+
+## Stopping and reloading with a command
+
+Some programs are a handle on something else — `docker compose up`, a tunnel, a
+device — and signalling the handle leaves the thing it opened running.
+`stopCommand` runs instead of the signal:
+
+```json
+{
+  "command": ["docker", "compose", "up"],
+  "stopCommand": ["docker", "compose", "down"],
+  "timeoutStop": "60s"
+}
+```
+
+It replaces the signal, not the deadline: `SIGKILL` still arrives at
+`timeoutStop`, because a stop command that does not stop the unit is exactly the
+case it exists to survive.
+
+`reloadCommand` is the same shape for `blit @muster reload <name>` — with no
+argument, `reload` still re-reads the directory. A unit with no `reloadCommand`
+is **restarted** instead, and the answer says which happened per unit:
+
+```
+$ blit @muster reload epic
+epic/gateway   reloaded
+epic/ui        restarted
+```
+
+Both run in a terminal of their own, tagged `muster/<unit>/stop|reload`, with
+the unit's `cwd` and resolved environment — a stop command that cannot see
+`DOCKER_HOST` talks to a different machine than the one it is stopping. Neither
+is a run of the unit: no sequence number, never adopted, not retained.
 
 ## Environment, and the `PATH` that will bite you
 

@@ -130,11 +130,19 @@ impl Unit {
     /// depends on the opposite — it exits 0 on purpose when replaced, and
     /// retrying that is an infinite loop.
     pub fn wants_restart(&self, exit_code: i32) -> bool {
-        if exit_code == 0 {
-            self.file.restart_on_success
-        } else {
-            self.file.restart_on_failure
+        // Blit's exit status negates the terminating signal, so a negative one
+        // is a process that was killed rather than one that returned. That is
+        // not a decision the program made, which is why `restartOnAbnormal`
+        // answers it separately: `"restartOnFailure": false` means "it exited 1
+        // on purpose, leave it", and it should not also mean "the OOM killer
+        // took it, leave it". Either flag is enough.
+        if exit_code < 0 {
+            return self.file.restart_on_abnormal || self.file.restart_on_failure;
         }
+        if exit_code == 0 {
+            return self.file.restart_on_success;
+        }
+        self.file.restart_on_failure
     }
 
     /// Record that the live run ended, and decide what happens next.
@@ -452,6 +460,31 @@ mod tests {
         unit.note_exit(3, 1000, 0);
         assert_eq!(unit.phase, Phase::Failed);
         assert_eq!(unit.last_exit, Some(3));
+    }
+
+    #[test]
+    fn being_killed_is_answered_by_its_own_flag_not_by_the_exit_code_one() {
+        // A signal is a negative status, and `restartOnFailure: false` is about
+        // exit codes: it must not also mean "stay down when the OOM killer
+        // takes you".
+        let mut unit = unit_from(r#"{"command":["a"],"restartOnFailure":false}"#);
+        unit.phase = Phase::Running;
+        unit.note_exit(-9, 1000, 0);
+        assert_eq!(unit.phase, Phase::Backoff);
+
+        // Turning both off is how you say "leave it alone either way".
+        let mut unit =
+            unit_from(r#"{"command":["a"],"restartOnFailure":false,"restartOnAbnormal":false}"#);
+        unit.phase = Phase::Running;
+        unit.note_exit(-9, 1000, 0);
+        assert_eq!(unit.phase, Phase::Failed);
+
+        // And it does not reach across to exit codes: an exit 3 is still the
+        // program's decision, obeyed.
+        let mut unit = unit_from(r#"{"command":["a"],"restartOnFailure":false}"#);
+        unit.phase = Phase::Running;
+        unit.note_exit(3, 1000, 0);
+        assert_eq!(unit.phase, Phase::Failed);
     }
 
     #[test]

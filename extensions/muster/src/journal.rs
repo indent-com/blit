@@ -30,6 +30,10 @@ pub enum Event {
     Stop,
     Failed,
     Adopted,
+    /// A `stopCommand` or `reloadCommand` was run. It is a decision about the
+    /// unit taken by muster, so it belongs beside the others — and it is the
+    /// only record of a terminal that is never the unit's own run.
+    Ran,
 }
 
 impl Event {
@@ -49,6 +53,7 @@ impl Event {
             Event::Stop => "stop",
             Event::Failed => "failed",
             Event::Adopted => "adopted",
+            Event::Ran => "ran",
         }
     }
 }

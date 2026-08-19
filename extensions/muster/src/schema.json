@@ -68,11 +68,28 @@
 
     "restartOnFailure": { "type": "boolean", "default": true },
     "restartOnSuccess": { "type": "boolean", "default": false },
+    "restartOnAbnormal": {
+      "description": "Restart when the process was killed by a signal, as opposed to choosing an exit code.",
+      "type": "boolean",
+      "default": true
+    },
     "restartOnChange": { "type": "boolean", "default": true },
     "restartDelay": { "type": ["string", "integer"] },
     "keep": { "type": "integer", "minimum": 0, "default": 1 },
     "timeoutStart": { "type": ["string", "integer"], "default": "30s" },
     "stopSignal": { "type": "string", "default": "SIGTERM" },
+    "stopCommand": {
+      "description": "Run this instead of signalling, for a program that is a handle on something else. The signal still comes after timeoutStop.",
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "reloadCommand": {
+      "description": "Run this for `@muster reload <name>`. Without one, reloading a unit restarts it.",
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
     "timeoutStop": { "type": ["string", "integer"], "default": "10s" },
     "startLimit": { "type": "integer", "minimum": 0, "default": 0 },
 

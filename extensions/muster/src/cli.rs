@@ -87,10 +87,18 @@ impl Muster {
                 Some(name) => self.mark_ready(client, name),
                 None => (2, String::from("ready needs a unit\n")),
             },
-            "reload" => {
-                self.load(client);
-                (0, String::from("reloaded\n"))
-            }
+            // Bare `reload` re-reads the directory; `reload NAME` asks that
+            // unit to re-read its own configuration. Two meanings of one word,
+            // but they are the same question asked of two things, and the
+            // argument says which — a separate verb would be a synonym nobody
+            // would remember the difference between.
+            "reload" => match target {
+                Some(name) => self.reload_unit(client, name),
+                None => {
+                    self.load(client);
+                    (0, String::from("reloaded\n"))
+                }
+            },
             "log" => {
                 structured = json;
                 (0, self.render_log(&args, json))
@@ -141,7 +149,13 @@ impl Muster {
                 _ => self.restart(client, member, Cause::Command),
             }
         }
-        (0, format!("{verb}ed {}\n", members.join(" ")))
+        // Not `{verb}ed`: that spells "stoped".
+        let past = match verb {
+            "start" => "started",
+            "stop" => "stopped",
+            _ => "restarted",
+        };
+        (0, format!("{past} {}\n", members.join(" ")))
     }
 
     fn mark_ready(&mut self, client: &mut Client, name: &str) -> (i32, String) {
@@ -156,6 +170,38 @@ impl Muster {
             ),
             None => (1, format!("no unit named {name:?}\n")),
         }
+    }
+
+    /// Ask units to re-read their own configuration.
+    ///
+    /// A unit with no `reloadCommand` is restarted instead. That is the honest
+    /// fallback: "reload" means the new configuration is in effect, and for a
+    /// program with no way to be told, the only way to make that true is to
+    /// start it again. Saying so per unit is what keeps an instance-wide reload
+    /// from looking like it did something it did not.
+    fn reload_unit(&mut self, client: &mut Client, name: &str) -> (i32, String) {
+        let members = self.resolve(name);
+        if members.is_empty() {
+            return (1, format!("no unit or instance named {name:?}\n"));
+        }
+        let mut out = String::new();
+        for member in &members {
+            let Some(unit) = self.units.get(member) else {
+                continue;
+            };
+            match (unit.file.reload_command.clone(), unit.phase.is_live()) {
+                (Some(argv), true) => {
+                    self.run_side_command(client, member, "reload", argv);
+                    out.push_str(&format!("{member}\treloaded\n"));
+                }
+                (Some(_), false) => out.push_str(&format!("{member}\tnot running\n")),
+                (None, _) => {
+                    self.restart(client, member, Cause::Command);
+                    out.push_str(&format!("{member}\trestarted\n"));
+                }
+            }
+        }
+        (0, out)
     }
 
     /// Write an instance file, and let it start.

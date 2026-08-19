@@ -238,10 +238,26 @@ pub struct UnitFile {
     pub unit_type: UnitType,
     #[serde(default)]
     pub ready_when: ReadyWhen,
+    /// How to ask the unit to stop, instead of a signal.
+    ///
+    /// For a program that is a handle on something else — `docker compose up`,
+    /// a tunnel, a device — where signalling the handle leaves the thing it
+    /// opened running. The signal still comes, after `timeoutStop`.
+    pub stop_command: Option<Vec<String>>,
+    /// How to make the unit re-read its own configuration, for `@muster reload
+    /// <unit>`. Without one, reloading a unit is restarting it.
+    pub reload_command: Option<Vec<String>>,
     #[serde(default = "yes")]
     pub restart_on_failure: bool,
     #[serde(default)]
     pub restart_on_success: bool,
+    /// Restart when the process was *killed* rather than when it chose an exit
+    /// code. Separate from `restartOnFailure` because they answer different
+    /// questions: a compiler that exits 1 has decided something, and a process
+    /// the OOM killer took has not. Turning `restartOnFailure` off and leaving
+    /// this on is "obey what it says, but bring it back if it was shot".
+    #[serde(default = "yes")]
+    pub restart_on_abnormal: bool,
     #[serde(default = "yes")]
     pub restart_on_change: bool,
     pub restart_delay: Option<Duration>,

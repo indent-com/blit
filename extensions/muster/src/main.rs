@@ -37,8 +37,8 @@ const DESCRIPTOR: &str = r#"{
      "usage":"blit @muster restart <name>"},
     {"path":["instantiate"],"summary":"Write an instance of a stack, and start it",
      "usage":"blit @muster instantiate <stack> <name> [VAR=VALUE ...] [--no-start] [--force] [--json]"},
-    {"path":["reload"],"summary":"Re-read the directory now",
-     "usage":"blit @muster reload"},
+    {"path":["reload"],"summary":"Re-read the directory, or one unit's own configuration",
+     "usage":"blit @muster reload [<name>]"},
     {"path":["ready"],"summary":"Declare a readyWhen:manual unit ready",
      "usage":"blit @muster ready <unit>"},
     {"path":["log"],"summary":"The supervision journal",
@@ -1586,6 +1586,7 @@ impl Muster {
         };
         let instance = unit.instance.clone();
         let pty = unit.pty;
+        let stop_command = unit.file.stop_command.clone();
         unit.phase = if hold { Phase::Held } else { Phase::Stopped };
         unit.next_attempt_ms = 0;
         unit.deadline_ms = 0;
@@ -1593,8 +1594,15 @@ impl Muster {
             unit.kill_at_ms = now + unit.file.timeout_stop.ms();
         }
         let signal = signal_number(&unit.file.stop_signal);
-        if let Some(pty) = pty {
-            let _ = client.send(&remote::msg_kill(pty, signal));
+        match (&stop_command, pty) {
+            // A `stopCommand` replaces the signal, not the deadline: the
+            // SIGKILL at `timeoutStop` still comes, because a stop command that
+            // does not stop the unit is the case it exists to survive.
+            (Some(argv), Some(_)) => self.run_side_command(client, name, "stop", argv.clone()),
+            (_, Some(pty)) => {
+                let _ = client.send(&remote::msg_kill(pty, signal));
+            }
+            (_, None) => {}
         }
         self.next_probe_ms.remove(name);
         self.record(
@@ -1625,6 +1633,77 @@ impl Muster {
                 unit.restart_pending = true;
             }
         }
+    }
+
+    /// Run a unit's `stopCommand` or `reloadCommand` in a terminal of its own.
+    ///
+    /// Not a run of the unit: it gets no sequence number, is never adopted, and
+    /// is not retained. It is tagged all the same, so a supervisor that is
+    /// replaced mid-stop can see what is still executing on its behalf — and so
+    /// the terminal is identifiable rather than anonymous in `blit client
+    /// list`.
+    ///
+    /// It inherits the unit's `cwd` and resolved environment, because a stop
+    /// command that cannot see `DOCKER_HOST` or `.env` is a stop command that
+    /// talks to a different machine than the one it is stopping.
+    pub(crate) fn run_side_command(
+        &mut self,
+        client: &mut Client,
+        name: &str,
+        kind: &str,
+        argv: Vec<String>,
+    ) {
+        let now = self.now_ms(client);
+        let Some(unit) = self.units.get(name) else {
+            return;
+        };
+        let instance = unit.instance.clone();
+        let cwd = expand_tilde(unit.file.cwd.as_deref().unwrap_or("~"), &self.home);
+        let env = match self.resolve_env(client, name, &cwd) {
+            Ok(resolved) => resolved.vars,
+            // The unit is being stopped, not started: a `.env` that has since
+            // gone missing must not keep the stop from happening, so this falls
+            // back to the bare environment and says so.
+            Err(failure) => {
+                self.record(
+                    Record::new(name.to_string(), Event::Ran, "stopped")
+                        .detail(format!("{kind}Command without its environment: {failure}"))
+                        .instance(instance.clone()),
+                    now,
+                );
+                Vec::new()
+            }
+        };
+        let env_refs: Vec<(&str, &str)> = env
+            .iter()
+            .map(|(k, v, _)| (k.as_str(), v.as_str()))
+            .collect();
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let tag = format!("{}{name}/{kind}", supervisor::TAG_PREFIX);
+        let request = CreateRequest {
+            rows: ROWS,
+            cols: COLS,
+            tag: &tag,
+            command: "",
+            argv: Some(argv_refs.as_slice()),
+            cwd: Some(&cwd),
+            env: &env_refs,
+            deadline_ms: None,
+        };
+        let phase = self
+            .units
+            .get(name)
+            .map_or("stopped", |unit| unit.phase.as_str());
+        let detail = match self.terminals.create(client, request) {
+            Ok(_) => format!("{kind}Command: {}", argv.join(" ")),
+            Err(err) => format!("{kind}Command failed to start: {err:?}"),
+        };
+        self.record(
+            Record::new(name.to_string(), Event::Ran, phase)
+                .detail(detail)
+                .instance(instance),
+            now,
+        );
     }
 
     fn close_all(&mut self, client: &mut Client, name: &str) {
