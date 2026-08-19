@@ -1876,15 +1876,28 @@ describe("BlitTerminalSurface wheel over the scrollback", () => {
     expect(el.scrollTop).toBe(start - 12 * 6 * CELL_H);
   });
 
-  it("still squares up a surface a pixel-precise device left mid-row", () => {
-    // The backstop the trackpad still depends on: an offset is whole rows,
-    // so a position between them has to be written back eventually — just
-    // not once per notch.
+  it("leaves a surface parked between rows exactly where it is", () => {
+    // Nothing renders from scrollTop — the canvas draws rows from the
+    // offset, our scrollbar likewise, and the surface's own is hidden — so
+    // a position inside a row is invisible until squaring it up makes it
+    // visible. A trackpad lands here on every gesture.
     const { el, settle, surface } = attachScrollback();
     el.scrollTop = LINES * CELL_H - 100; // 5.26 rows: not on the grid
     // @ts-expect-error — the listener the real scroll event would have run.
     surface["boundScrollListener"]();
-    expect(settle()).toBe(5); // 5.26 rows rounds to 5, i.e. back up to 95px
+    expect(settle()).toBe(0);
+  });
+
+  it("still lands a jump that moved by whole rows", () => {
+    // Shift+PageUp, a paste, the server re-anchoring: these move the offset
+    // without touching the surface, and the surface has to follow.
+    const { el, settle, surface } = attachScrollback();
+    // @ts-expect-error — the listener the real scroll event would have run.
+    surface["boundScrollListener"]();
+    // @ts-expect-error — what the scrollback-navigation keys do.
+    surface["scrollOffset"] = 3;
+    expect(settle()).toBe(-3 * CELL_H);
+    expect(el.scrollTop).toBe((LINES - 3) * CELL_H);
   });
 
   it("claims the notch so the browser does not scroll it as well", () => {
@@ -1923,11 +1936,12 @@ describe("BlitTerminalSurface wheel over the scrollback", () => {
     // than an animated burst, a notch inside that frame was the whole
     // gesture — the surface moved and nothing else did, so the reader stayed
     // at the bottom having plainly scrolled up.
-    const { surface, el, notch, offset } = attachScrollback();
-    // Park mid-row so the sync has a correction to write, and let it settle.
-    el.scrollTop = LINES * CELL_H - 100;
+    const { surface, notch, offset } = attachScrollback();
     // @ts-expect-error — the listener the real scroll event would have run.
     surface["boundScrollListener"]();
+    // A whole-row jump from elsewhere, which the sync does still write.
+    // @ts-expect-error — what the scrollback-navigation keys do.
+    surface["scrollOffset"] = 3;
     now += 200;
     const runFrames = deferFrames();
     // @ts-expect-error — the write that claims its own echo.
@@ -1942,10 +1956,12 @@ describe("BlitTerminalSurface wheel over the scrollback", () => {
   });
 
   it("still ignores the echo of the sync's own write", () => {
-    const { surface, el, offset } = attachScrollback();
-    el.scrollTop = LINES * CELL_H - 100;
+    const { surface, offset } = attachScrollback();
     // @ts-expect-error — the listener the real scroll event would have run.
     surface["boundScrollListener"]();
+    // A whole-row jump from elsewhere, which the sync does still write.
+    // @ts-expect-error — what the scrollback-navigation keys do.
+    surface["scrollOffset"] = 3;
     now += 200;
     const runFrames = deferFrames();
     // @ts-expect-error — the write that claims its own echo.

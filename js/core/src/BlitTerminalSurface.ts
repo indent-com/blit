@@ -3236,7 +3236,7 @@ export class BlitTerminalSurface {
       this.lastScrollTop = targetTop;
       return;
     }
-    if (drift > 0.5 && !this.gestureOwnsScrollTop(drift, cellH)) {
+    if (drift > 0.5 && !this.subRowDrift(drift, cellH)) {
       this.lastScrollTop = targetTop;
       this.pendingScrollTopWrite = targetTop;
       el.scrollTop = targetTop;
@@ -3250,26 +3250,31 @@ export class BlitTerminalSurface {
   }
 
   /**
-   * True when a scroll gesture is still in flight and the only disagreement
-   * is where inside a row it stopped.
+   * True when the only disagreement is where inside a row the surface sits.
    *
    * `scrollOffset` is whole lines, so the position it maps back to is the
-   * nearest row boundary — never more than half a row from wherever the
-   * user actually is. Writing that back mid-gesture cancels the browser's
-   * momentum animation and restarts it from a snapped position, once per
-   * frame, which is what made a flick stutter. The offset the scroll
-   * listener derived is already correct either way; the write is only a
-   * cosmetic re-alignment, so it can wait for the gesture to end.
+   * nearest row boundary — never more than half a row from wherever the user
+   * actually is. Writing that back is not worth doing at any time, because
+   * nothing renders from `scrollTop`: the canvas draws rows from
+   * `scrollOffset`, the scrollbar beside it is ours and drawn from
+   * `scrollOffset` too, and the surface's own scrollbar is hidden. The
+   * difference is invisible until the write makes it visible, by taking the
+   * scroll away from the browser mid-flight and putting it somewhere else.
+   *
+   * This used to hold only for the length of a gesture, which cured a flick
+   * and left the wheel alone: a notch settles in well under
+   * `SCROLL_SETTLE_MS`, so every one of them ended with up to half a row of
+   * correction, in whichever direction its remainder fell. It rides the
+   * render loop, and an idle shell only renders on the cursor blink, so it
+   * arrived as much as half a second late — long after the wheel had stopped,
+   * which is what made it read as the terminal moving on its own.
    *
    * A jump from somewhere else — Shift+PageUp, a paste, the server
-   * re-anchoring a scrolled view — moves by rows, not by a fraction of
-   * one, and still lands immediately.
+   * re-anchoring a scrolled view — moves by rows, not by a fraction of one,
+   * and still lands immediately.
    */
-  private gestureOwnsScrollTop(drift: number, cellH: number): boolean {
-    return (
-      drift < cellH &&
-      performance.now() - this.lastUserScrollAt < SCROLL_SETTLE_MS
-    );
+  private subRowDrift(drift: number, cellH: number): boolean {
+    return drift < cellH;
   }
 
   // --- Mouse input ---
