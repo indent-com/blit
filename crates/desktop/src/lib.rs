@@ -1531,13 +1531,23 @@ async fn monitor_menu(
         return;
     };
     loop {
-        let live = tokio::select! {
-            signal = layouts.next() => signal.is_some(),
-            signal = properties.next() => signal.is_some(),
+        // A layout change can renumber or repurpose every id, so nothing the
+        // client is holding can be trusted afterwards. A property change
+        // cannot: it repaints named items and leaves the rest of the menu
+        // exactly as the user is reading it. Apps repaint constantly — Zoom
+        // re-syncs its language checkmark on every AboutToShow — and voiding
+        // the whole menu for that dropped the click the user was in the middle
+        // of making, with no way to tell them why.
+        let change = tokio::select! {
+            signal = layouts.next() => match signal {
+                Some(_) => MenuChange::Layout,
+                None => return,
+            },
+            signal = properties.next() => match signal {
+                Some(signal) => repainted_menu_items(&signal),
+                None => return,
+            },
         };
-        if !live {
-            return;
-        }
         let mut watcher = state.lock().await;
         let Some(target) = watcher.items.get_mut(&key) else {
             return;
@@ -1545,9 +1555,45 @@ async fn monitor_menu(
         if target.menu_path.as_ref() != Some(&path) {
             return;
         }
-        target.menu_revision = 0;
-        target.menu_items.clear();
+        match change {
+            MenuChange::Layout => {
+                target.menu_revision = 0;
+                target.menu_items.clear();
+            }
+            // The repainted items are the ones the client's copy now
+            // misdescribes, so only those stop being clickable; the menu keeps
+            // its revision and every other item stays live.
+            MenuChange::Repainted(ids) => target.menu_items.retain(|id, _| !ids.contains(id)),
+        }
     }
+}
+
+enum MenuChange {
+    /// The menu was restructured: every id the client holds may now name a
+    /// different item, so none of them can be acted on.
+    Layout,
+    /// These items were repainted; the rest of the menu is still what the client
+    /// is showing.
+    Repainted(HashSet<i32>),
+}
+
+/// Which items an `ItemsPropertiesUpdated` signal repaints. An unreadable body
+/// has to be treated as if it changed everything.
+fn repainted_menu_items(signal: &zbus::Message) -> MenuChange {
+    type PropertiesUpdated = (
+        Vec<(i32, HashMap<String, OwnedValue>)>,
+        Vec<(i32, Vec<String>)>,
+    );
+    let Ok((updated, removed)) = signal.body().deserialize::<PropertiesUpdated>() else {
+        return MenuChange::Layout;
+    };
+    MenuChange::Repainted(
+        updated
+            .into_iter()
+            .map(|(id, _)| id)
+            .chain(removed.into_iter().map(|(id, _)| id))
+            .collect(),
+    )
 }
 
 fn menu_string<'a>(properties: &'a HashMap<String, OwnedValue>, name: &str) -> Option<&'a str> {
@@ -3837,6 +3883,129 @@ mod dbus_tests {
         assert_eq!(clicked.load(Ordering::Relaxed), 2);
 
         // Keep the connection observably live until normalization completed.
+        assert!(item_connection.unique_name().is_some());
+    }
+
+    /// Real apps repaint their tray menu while it is on screen — Zoom re-syncs
+    /// its language checkmark on every `AboutToShow`, and does so again
+    /// whenever its own state changes. The click the user is in the middle of
+    /// making has to survive that: the menu they are looking at still names the
+    /// item they are pointing at.
+    #[tokio::test]
+    async fn a_property_update_does_not_swallow_the_click_on_the_open_menu() {
+        let (_bus, address) = TestBus::spawn();
+        let mut bridge = Bridge::start(&address, Config::default(), Arc::new(|| {}))
+            .await
+            .unwrap();
+        let clicked = Arc::new(AtomicI32::new(0));
+        let item_connection = zbus::connection::Builder::address(address.as_str())
+            .unwrap()
+            .name("org.example.BlitChurn")
+            .unwrap()
+            .serve_at("/StatusNotifierItem", MockItem)
+            .unwrap()
+            .serve_at(
+                "/Menu",
+                MockMenu {
+                    clicked: clicked.clone(),
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let watcher = Proxy::new(
+            &item_connection,
+            "org.kde.StatusNotifierWatcher",
+            WATCHER_PATH,
+            "org.kde.StatusNotifierWatcher",
+        )
+        .await
+        .unwrap();
+        watcher
+            .call::<_, _, ()>("RegisterStatusNotifierItem", &("org.example.BlitChurn",))
+            .await
+            .unwrap();
+        let Event::Tray(TrayRecord::Upsert(item)) = next_event(&mut bridge).await else {
+            panic!("expected tray upsert")
+        };
+
+        assert!(bridge.try_command(Command::Tray(TrayEvent {
+            tray_id: item.tray_id,
+            kind: TRAY_EVENT_OPEN_MENU,
+            menu_revision: 0,
+            value: 0,
+            flags: 0,
+        })));
+        let Event::TrayMenu(menu) = next_event(&mut bridge).await else {
+            panic!("expected normalized tray menu")
+        };
+        assert_eq!(menu.status, TRAY_MENU_OK);
+
+        // The app repaints one item while the menu sits open in front of the
+        // user — Zoom's own signal touches its language checkmark, never the
+        // Exit the user is reaching for.
+        let repaint = async |id: i32| {
+            let updated: Vec<(i32, HashMap<String, OwnedValue>)> = vec![(
+                id,
+                HashMap::from([("toggle-state".to_string(), OwnedValue::from(0i32))]),
+            )];
+            let removed: Vec<(i32, Vec<String>)> = Vec::new();
+            item_connection
+                .emit_signal(
+                    None::<&str>,
+                    "/Menu",
+                    "com.canonical.dbusmenu",
+                    "ItemsPropertiesUpdated",
+                    &(updated, removed),
+                )
+                .await
+                .unwrap();
+            sleep(Duration::from_millis(200)).await;
+        };
+
+        repaint(4).await;
+        assert!(bridge.try_command(Command::Tray(TrayEvent {
+            tray_id: item.tray_id,
+            kind: TRAY_EVENT_MENU_ITEM,
+            menu_revision: menu.menu_revision,
+            value: 2,
+            flags: 0,
+        })));
+        let Event::TrayMenu(after) = next_event(&mut bridge).await else {
+            panic!("expected a menu event after the click")
+        };
+        assert_eq!(
+            after.status, TRAY_MENU_OK,
+            "a repaint elsewhere must not make the open menu stale"
+        );
+        assert_eq!(
+            clicked.load(Ordering::Relaxed),
+            2,
+            "the click must reach the app"
+        );
+
+        // The item that *was* repainted is the one the client now misdescribes,
+        // so a click on it is still refused and answered with a fresh menu.
+        repaint(4).await;
+        assert!(bridge.try_command(Command::Tray(TrayEvent {
+            tray_id: item.tray_id,
+            kind: TRAY_EVENT_MENU_ITEM,
+            menu_revision: after.menu_revision,
+            value: 4,
+            flags: 0,
+        })));
+        let Event::TrayMenu(reread) = next_event(&mut bridge).await else {
+            panic!("expected a menu event after the refused click")
+        };
+        assert_eq!(reread.status, TRAY_MENU_OK);
+        assert_ne!(reread.menu_revision, after.menu_revision);
+        assert_eq!(
+            clicked.load(Ordering::Relaxed),
+            2,
+            "a click on the repainted item must not reach the app"
+        );
+
         assert!(item_connection.unique_name().is_some());
     }
 }

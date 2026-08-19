@@ -85,6 +85,28 @@ export function trayPrimaryOpensMenu(flags: number, touch = false): boolean {
   );
 }
 
+export type TrayPrimaryGesture = "ignore" | "activate" | "menu";
+
+/**
+ * What a tray icon's primary click should do.
+ *
+ * A long press on a touch screen fires `contextmenu` — which has already opened
+ * the menu — and then a trailing `click` on the same press. Acting on that click
+ * activated the item as well, so the app's window came up behind the menu the
+ * user was reading, and the tray menu the app repainted in response could be
+ * voided under them.
+ */
+export function trayPrimaryGesture(
+  flags: number,
+  pointerType: string | null,
+  openedFromLongPress: boolean,
+): TrayPrimaryGesture {
+  if (openedFromLongPress) return "ignore";
+  return trayPrimaryOpensMenu(flags, pointerType === "touch")
+    ? "menu"
+    : "activate";
+}
+
 export interface MprisSubscriptionTarget {
   subscribe(enabled: boolean): void;
 }

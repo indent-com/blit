@@ -55,7 +55,9 @@ import {
   reconcileMprisSubscriptions,
   samePortalPresentationEntry,
   selectMediaSessionEntry,
+  trayPrimaryGesture,
   trayPrimaryOpensMenu,
+  type TrayPrimaryGesture,
   type MprisSubscriptionTarget,
 } from "./desktopPresentation";
 import { t, tp } from "./i18n";
@@ -1597,15 +1599,13 @@ export function DesktopChrome(props: {
         parentId,
       );
   };
-  const activateTray = (entry: TrayEntry, touch = false) => {
+  const activateTray = (entry: TrayEntry, gesture: TrayPrimaryGesture) => {
     if (entry.readOnly) return;
-    const store = props.workspace.getConnection(
-      entry.connectionId,
-    )?.desktopStore;
-    if (trayPrimaryOpensMenu(entry.item.flags, touch)) {
-      openTrayMenu(entry);
-    } else {
-      store?.activate(entry.item.trayId);
+    if (gesture === "menu") openTrayMenu(entry);
+    else if (gesture === "activate") {
+      props.workspace
+        .getConnection(entry.connectionId)
+        ?.desktopStore.activate(entry.item.trayId);
     }
   };
 
@@ -1658,6 +1658,12 @@ export function DesktopChrome(props: {
 
   const trayButton = (entry: TrayEntry): JSX.Element => {
     let primaryPointerType: string | null = null;
+    // A long press on a touch screen fires `contextmenu` and then a trailing
+    // `click` on the same press. The press has already opened the menu, so
+    // letting the click through activated the item as well: the app's window
+    // came up behind the menu the user was reading, and the repaint that
+    // followed could take the menu with it.
+    let openedFromLongPress = false;
     const icon = imageUrl(entry.item.icon);
     const title = [
       entry.item.tooltipTitle || entry.item.title || entry.item.appId,
@@ -1671,16 +1677,23 @@ export function DesktopChrome(props: {
         disabled={entry.readOnly}
         onPointerDown={(event) => {
           primaryPointerType = event.pointerType;
+          openedFromLongPress = false;
         }}
         onPointerCancel={() => {
           primaryPointerType = null;
         }}
         onClick={() => {
-          const touch = primaryPointerType === "touch";
+          const gesture = trayPrimaryGesture(
+            entry.item.flags,
+            primaryPointerType,
+            openedFromLongPress,
+          );
           primaryPointerType = null;
-          activateTray(entry, touch);
+          openedFromLongPress = false;
+          activateTray(entry, gesture);
         }}
         onContextMenu={(event) => {
+          openedFromLongPress = primaryPointerType === "touch";
           primaryPointerType = null;
           event.preventDefault();
           openTrayMenu(entry);
