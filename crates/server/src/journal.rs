@@ -465,7 +465,17 @@ pub struct Waiter {
 }
 
 /// Per connection, so a client cannot park unbounded state on the server.
-pub const MAX_WAITERS_PER_CLIENT: usize = 32;
+///
+/// Generous on purpose. A `Waiter` is forty bytes of bookkeeping, and every
+/// scan over the list — admission, [`resolve_journal_waiters`], and the
+/// min-deadline in `earliest_armed_deadline` — sits in the lifecycle loop
+/// rather than the delivery tick, so the cost is per event and not per frame.
+/// 32 was chosen when a client waiting on more than a handful of terminals was
+/// hypothetical. A supervisor waits on one terminal per unit, and a hundred
+/// units is an ordinary directory. It stays bounded because what needs
+/// preventing is a client parking unbounded state, not a client waiting on the
+/// terminals it owns.
+pub const MAX_WAITERS_PER_CLIENT: usize = 4096;
 
 /// Longest a `C2S_TERM_JOURNAL_WAIT` may block before answering with the
 /// record as it stands.

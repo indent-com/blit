@@ -194,8 +194,10 @@ that sentinel latches onto the next command to start and never moves again.
 no text.
 
 `max_bytes` is clamped server-side to `BLIT_TERM_OUTPUT_MAX` (default 1 MiB,
-floor 4 KiB, ceiling 8 MiB). `timeout_ms` is clamped to 24 h. At most 32
-waits per connection; further ones are refused.
+floor 4 KiB, ceiling 8 MiB). `timeout_ms` is clamped to 24 h. At most 4096
+waits per connection; further ones are refused. That bound stops a client
+parking unbounded state; it is not meant to ration a client's own terminals,
+since a supervisor waits on one per unit and scales with the terminals it owns.
 
 ### S2C
 
