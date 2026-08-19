@@ -153,6 +153,17 @@ function TerminalScreen() {
 
 `BlitSurfaceView` renders a single Wayland surface from a terminal's compositor. The server encodes each surface as H.264 or AV1; the component decodes via WebCodecs and draws to a canvas.
 
+By default the view owns its surface's size: it resizes the surface to fill its
+container, and is fully interactive. Pass `resizable={false}` for a passive
+preview — a dock card, a switcher thumbnail — that shares another view's stream.
+Such a view is served a fixed downscale capped at a thumbnail cadence and takes
+no input at all, so it is the wrong choice for anything the user clicks in.
+
+`zoom` scales the surface independently of the pane's pixel size: `zoomMode`
+`"relative"` (the default) multiplies the display's DPI by `zoom`, while
+`"exact"` uses `zoom` as the absolute surface scale. Only resizable views drive
+the scale.
+
 ```tsx
 import { BlitSurfaceView } from "@blit-sh/react";
 
