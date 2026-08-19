@@ -87,17 +87,19 @@ impl Muster {
                 Some(name) => self.mark_ready(client, name),
                 None => (2, String::from("ready needs a unit\n")),
             },
-            // Bare `reload` re-reads the directory; `reload NAME` asks that
-            // unit to re-read its own configuration. Two meanings of one word,
-            // but they are the same question asked of two things, and the
-            // argument says which — a separate verb would be a synonym nobody
-            // would remember the difference between.
+            // `reload NAME` asks that unit to re-read its own configuration.
+            //
+            // Bare `reload` does *not* re-read the directory to find your
+            // edits — the watch already did, before you could type this. What
+            // it does is retry the directories whose watch was refused, which
+            // is the one failure the watch cannot report its way out of: there
+            // is nothing watching a directory that is not being watched. That
+            // retry also happens on its own, on a climbing timer; this is for
+            // when you have just created the directory and would rather not
+            // wait for it.
             "reload" => match target {
                 Some(name) => self.reload_unit(client, name),
-                None => {
-                    self.load(client);
-                    (0, String::from("reloaded\n"))
-                }
+                None => self.retry_watches(client),
             },
             "log" => {
                 structured = json;
@@ -170,6 +172,34 @@ impl Muster {
             ),
             None => (1, format!("no unit named {name:?}\n")),
         }
+    }
+
+    /// Retry the directories whose watch was refused, now.
+    ///
+    /// The answer says how many there were, because "nothing was broken" and
+    /// "I retried four things" are different outcomes and the old bare `reload`
+    /// reported "reloaded" for both — which read as though it had done
+    /// something about an edit it had nothing to do with.
+    fn retry_watches(&mut self, client: &mut Client) -> (i32, String) {
+        let stuck: Vec<String> = self.unwatchable.keys().cloned().collect();
+        if stuck.is_empty() {
+            return (
+                0,
+                String::from("every directory is watched; your edits are already in\n"),
+            );
+        }
+        let now = self.now_ms(client);
+        self.retry_unwatchable(client, now, true);
+        let mut out = String::new();
+        for path in &stuck {
+            let state = if self.unwatchable.contains_key(path) {
+                "still refused"
+            } else {
+                "watched"
+            };
+            out.push_str(&format!("{path}\t{state}\n"));
+        }
+        (0, out)
     }
 
     /// Ask units to re-read their own configuration.

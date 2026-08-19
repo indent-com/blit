@@ -260,13 +260,13 @@ describe("openMuster", () => {
     handle.start("main");
     handle.stop("main/api");
     handle.restart("web");
-    handle.reload();
+    handle.rewatch();
     handle.resync();
     expect(sent).toEqual([
       "start main",
       "stop main/api",
       "restart web",
-      "reload",
+      "rewatch",
       "resync",
     ]);
   });

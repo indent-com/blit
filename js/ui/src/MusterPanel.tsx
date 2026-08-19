@@ -331,7 +331,11 @@ export function MusterPanel(props: {
                 "font-size": `${scale().md}px`,
               })}
             />
-            {control("Reload", undefined, () => handle()?.reload())}
+            {/* Not a "Reload": the supervisor watches its directory, so an
+                edit is here before a button could be pressed. A watch the
+                server refused is the one thing that cannot arrive on its own,
+                and it is also the only reason to have a button here. */}
+            {control("Retry watches", undefined, () => handle()?.rewatch())}
           </div>
 
           <div

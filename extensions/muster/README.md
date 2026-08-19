@@ -84,6 +84,31 @@ effect the way any other does.
 Each distinct external directory costs one `FS_SYNC`, shared between pointers
 that name the same one, and dropped when the last pointer goes away.
 
+### Nothing needs telling — except a watch that was refused
+
+There is no "re-read the directory" verb, because there is nothing to ask for:
+muster watches every directory it reads, and an edit is loaded before you could
+type a command about it.
+
+The one exception is a directory whose `FS_SYNC` the server refused — usually a
+pointer written before its target exists, which is the ordinary order of events
+when a stack lives in a worktree you are about to create. That cannot arrive by
+itself, because nothing watches a directory that is not being watched, so it is
+the only thing here that polls: retried after 5s, doubling to a minute, reset
+whenever any watch succeeds. `blit @muster reload` with no argument forces it
+now, and says what happened:
+
+```
+$ blit @muster doctor
+/src/blit/wt/epic/.blit/muster   cannot watch this directory (status 1)
+$ git worktree add /src/blit/wt/epic
+$ blit @muster reload
+/src/blit/wt/epic/.blit/muster   watched
+```
+
+With nothing broken it says so, rather than reporting a reload it did not need
+to do.
+
 ## What starts what
 
 `requires` is hard and implies ordering: the dependency must be ready first,
@@ -147,9 +172,9 @@ It replaces the signal, not the deadline: `SIGKILL` still arrives at
 `timeoutStop`, because a stop command that does not stop the unit is exactly the
 case it exists to survive.
 
-`reloadCommand` is the same shape for `blit @muster reload <name>` — with no
-argument, `reload` still re-reads the directory. A unit with no `reloadCommand`
-is **restarted** instead, and the answer says which happened per unit:
+`reloadCommand` is the same shape for `blit @muster reload <name>`. A unit with
+no `reloadCommand` is **restarted** instead, and the answer says which happened
+per unit:
 
 ```
 $ blit @muster reload epic
@@ -262,7 +287,8 @@ The wire is JSON, one object per message.
 | `{"type":"events","records":[…]}`                      | journal records, as `@muster log --json` prints them |
 
 The panel sends the CLI's verbs as bare lines: `start NAME`, `stop NAME`,
-`restart NAME`, `reload`, `resync`. A name is a unit or an instance.
+`restart NAME`, `rewatch`, `resync`. A name is a unit or an instance. There is
+no reload: the supervisor is watching, so the panel is told.
 
 Two properties are worth stating, because they are what the design is for:
 

@@ -37,7 +37,7 @@ const DESCRIPTOR: &str = r#"{
      "usage":"blit @muster restart <name>"},
     {"path":["instantiate"],"summary":"Write an instance of a stack, and start it",
      "usage":"blit @muster instantiate <stack> <name> [VAR=VALUE ...] [--no-start] [--force] [--json]"},
-    {"path":["reload"],"summary":"Re-read the directory, or one unit's own configuration",
+    {"path":["reload"],"summary":"Reload one unit; bare, retry any directory whose watch was refused",
      "usage":"blit @muster reload [<name>]"},
     {"path":["ready"],"summary":"Declare a readyWhen:manual unit ready",
      "usage":"blit @muster ready <unit>"},
@@ -64,6 +64,17 @@ const COLS: u16 = 120;
 /// How long the filesystem watch coalesces changes before reporting them.
 /// Enough that saving a file is one event rather than one per write.
 const SETTLE_MS: u16 = 200;
+
+/// How soon a directory that could not be watched is tried again, and the
+/// ceiling that backoff climbs to.
+///
+/// The common cause is a pointer written before its target exists — a stack in
+/// a worktree that has not been created yet — and the person who is about to
+/// create it is standing right there, so the first retry is quick. A pointer at
+/// a directory that will never exist should not cost a sync every five seconds
+/// forever, hence the climb.
+const REWATCH_MS: u64 = 5_000;
+const REWATCH_MAX_MS: u64 = 60_000;
 
 /// How often a `path`/`tcp`/`http` probe is retried while activating.
 const PROBE_INTERVAL: Duration = Duration::from_millis(250);
@@ -110,6 +121,12 @@ struct Muster {
     /// Roots the server refused, kept so `doctor` can say so on every run
     /// rather than only in the journal at the moment it happened.
     unwatchable: BTreeMap<String, u8>,
+    /// When to try the directories in `unwatchable` again, and how long to wait
+    /// after that. A watch that was refused is the one failure the watch cannot
+    /// report its way out of — nothing is watching a directory that is not
+    /// being watched — so it is the only thing here that polls.
+    rewatch_at_ms: u64,
+    rewatch_delay_ms: u64,
     units: BTreeMap<String, Unit>,
     stacks: BTreeMap<String, StackFile>,
     instances: BTreeMap<String, Instance>,
@@ -188,6 +205,8 @@ fn run(mut client: Client, initial: &[Vec<u8>]) -> Result<(), String> {
         home,
         roots: Vec::new(),
         unwatchable: BTreeMap::new(),
+        rewatch_at_ms: 0,
+        rewatch_delay_ms: REWATCH_MS,
         units: BTreeMap::new(),
         stacks: BTreeMap::new(),
         instances: BTreeMap::new(),
@@ -386,6 +405,35 @@ impl Muster {
         }
     }
 
+    /// Ask again for the directories whose `FS_SYNC` was refused.
+    ///
+    /// `watch` returns early for a path already in `roots`, and a refused sync
+    /// leaves the root there with no `sync_id` — so without dropping it first,
+    /// a directory that did not exist when its pointer was written stays
+    /// unwatched for the life of the supervisor. Nothing else can catch this:
+    /// the watch is how muster hears about the world, and there is no watch on
+    /// a directory that is not being watched.
+    ///
+    /// `now` forces the retry from `@muster reload`, which is the only thing
+    /// bare `reload` is for.
+    pub(crate) fn retry_unwatchable(&mut self, client: &mut Client, now: u64, immediate: bool) {
+        let stuck: BTreeSet<String> = self.unwatchable.keys().cloned().collect();
+        if stuck.is_empty() {
+            return;
+        }
+        self.roots.retain(|root| !stuck.contains(&root.path));
+        self.unwatchable.clear();
+        self.rewatch_delay_ms = if immediate {
+            REWATCH_MS
+        } else {
+            (self.rewatch_delay_ms * 2).min(REWATCH_MAX_MS)
+        };
+        self.rewatch_at_ms = now + self.rewatch_delay_ms;
+        // `load` is what re-issues the syncs, because it is what decides which
+        // directories are wanted in the first place.
+        self.load(client);
+    }
+
     /// Stop watching the roots nothing names any more.
     ///
     /// `wanted` includes the configuration directory, so there is no positional
@@ -575,6 +623,10 @@ impl Muster {
         if let Some(at) = self.flush_due_ms(now) {
             soonest = Some(soonest.map_or(at, |s: u64| s.min(at)));
         }
+        if !self.unwatchable.is_empty() {
+            let at = self.rewatch_at_ms;
+            soonest = Some(soonest.map_or(at, |s: u64| s.min(at)));
+        }
         let idle = client.monotonic_now() + IDLE_TICK;
         match soonest {
             Some(at) => client.monotonic_now() + Duration::from_millis(at.saturating_sub(now)),
@@ -597,6 +649,10 @@ impl Muster {
                     };
                     if status == remote::fs::FS_STATUS_OK {
                         root.sync_id = Some(u16::from_le_bytes([packet[3], packet[4]]));
+                        // Something worked, so whatever is still broken is
+                        // broken for its own reason and deserves a fresh
+                        // schedule rather than the backoff this one climbed.
+                        self.rewatch_delay_ms = REWATCH_MS;
                     } else {
                         // A directory that cannot be watched is the difference
                         // between "no units" and "no configuration", and
@@ -1234,6 +1290,10 @@ impl Muster {
     /// outstayed its stop grace.
     fn reconcile(&mut self, client: &mut Client) {
         let now = self.now_ms(client);
+
+        if !self.unwatchable.is_empty() && now >= self.rewatch_at_ms {
+            self.retry_unwatchable(client, now, false);
+        }
 
         // Autostart: a unit that has never run and says so.
         let names: Vec<String> = self.units.keys().cloned().collect();
@@ -2137,7 +2197,10 @@ impl Muster {
     /// A verb a panel sent, with the same meaning the CLI gives it.
     fn panel_command(&mut self, client: &mut Client, verb: &str, name: &str, now: u64) {
         match verb {
-            "reload" => self.load(client),
+            // Not "re-read the directory": the watch did that already. This is
+            // the retry for a directory whose watch was refused, which is the
+            // only thing a panel could ask for that it does not already have.
+            "rewatch" => self.retry_unwatchable(client, now, true),
             "resync" => self.touch_all(now),
             "start" | "stop" | "restart" if !name.is_empty() => {
                 for member in self.resolve_name(name) {

@@ -117,8 +117,15 @@ export interface MusterHandle extends ReactiveStore {
   start(name: string): void;
   stop(name: string): void;
   restart(name: string): void;
-  /** Re-read the configuration directory. */
-  reload(): void;
+  /**
+   * Retry the directories whose watch the server refused.
+   *
+   * Not "re-read the configuration": the supervisor watches it, so an edit is
+   * already here. A refused watch is the one thing that cannot arrive on its
+   * own — nothing watches a directory that is not being watched — and it also
+   * retries by itself on a climbing timer, so this is only impatience.
+   */
+  rewatch(): void;
   /** Ask for a full frame — for a viewer who suspects drift. */
   resync(): void;
   close(): void;
@@ -426,7 +433,7 @@ export async function openMuster(
     start: (name) => send(`start ${name}`),
     stop: (name) => send(`stop ${name}`),
     restart: (name) => send(`restart ${name}`),
-    reload: () => send("reload"),
+    rewatch: () => send("rewatch"),
     resync: () => send("resync"),
     close: () => {
       handle.close();
