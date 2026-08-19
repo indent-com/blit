@@ -315,9 +315,7 @@ function getHmrWorkspace(
   leaseOwner: object,
 ): HmrWorkspaceData {
   const raw = import.meta.hot?.data?.workspace as
-    | HmrWorkspaceData
-    | BlitWorkspace
-    | undefined;
+    HmrWorkspaceData | BlitWorkspace | undefined;
   // Accept the raw BlitWorkspace stored by versions before HmrWorkspaceData.
   const prev = raw && "workspace" in raw ? raw.workspace : raw;
   const previousOwner = raw && "workspace" in raw ? raw.owner : null;
@@ -3669,8 +3667,7 @@ function WorkspaceScreen(props: {
 
   let focusBySessionFn: ((sessionId: SessionId) => void) | null = null;
   let moveSessionToPaneFn:
-    | ((sessionId: SessionId, targetPaneId: string) => void)
-    | null = null;
+    ((sessionId: SessionId, targetPaneId: string) => void) | null = null;
   let moveToPaneFn:
     | ((value: string, targetPaneId: string, fromPaneId?: string) => void)
     | null = null;
@@ -5786,8 +5783,13 @@ function PreviewPanel(props: {
   );
 }
 
-/** Minimum horizontal swipe distance (px) to trigger dismiss. */
+/** Default horizontal swipe distance (px) to trigger dismiss. */
 const SWIPE_THRESHOLD = 60;
+/** Never ask for more than this fraction of a narrow card's width, so a
+ *  small side panel is still swipeable. */
+const SWIPE_THRESHOLD_CARD_FRACTION = 0.5;
+/** Floor for the dynamic threshold; below this a tap would be indistinguishable. */
+const MIN_SWIPE_THRESHOLD = 24;
 /** Minimum ratio of horizontal to vertical movement for a swipe. */
 const SWIPE_RATIO = 1.5;
 
@@ -5821,6 +5823,28 @@ function Thumbnail(props: {
   let touchStartX = 0;
   let touchStartY = 0;
   let locked = false;
+  let swipeThreshold = SWIPE_THRESHOLD;
+  let dismissTimer: ReturnType<typeof setTimeout> | null = null;
+
+  onCleanup(() => {
+    if (dismissTimer !== null) clearTimeout(dismissTimer);
+  });
+
+  // <Index> reuses this component instance when the list shifts, so stale
+  // dismiss state from the previous occupant would hide the new card and
+  // possibly close it when the old timer fires.
+  createEffect(() => {
+    props.assignment; // track
+    setDismissed(false);
+    setSwipeX(0);
+    setSwiping(false);
+    locked = false;
+    swipeThreshold = SWIPE_THRESHOLD;
+    if (dismissTimer !== null) {
+      clearTimeout(dismissTimer);
+      dismissTimer = null;
+    }
+  });
 
   function onTouchStart(e: TouchEvent) {
     const t = e.touches[0];
@@ -5829,6 +5853,14 @@ function Thumbnail(props: {
     locked = false;
     setSwiping(false);
     setSwipeX(0);
+    // Narrow cards (small side panel) need a smaller threshold so the swipe
+    // does not have to cross the whole panel width.
+    const cardWidth = (e.currentTarget as HTMLElement).getBoundingClientRect()
+      .width;
+    swipeThreshold = Math.min(
+      SWIPE_THRESHOLD,
+      Math.max(MIN_SWIPE_THRESHOLD, cardWidth * SWIPE_THRESHOLD_CARD_FRACTION),
+    );
   }
 
   function onTouchMove(e: TouchEvent) {
@@ -5857,11 +5889,18 @@ function Thumbnail(props: {
     setSwipeX(dx);
   }
 
-  function onTouchEnd() {
-    if (swiping() && swipeX() >= SWIPE_THRESHOLD) {
+  function finishSwipe(e: TouchEvent) {
+    if (swiping() && swipeX() >= swipeThreshold) {
+      // Cancel the synthetic click that follows a swipe so it cannot also
+      // trigger the card's own close/focus buttons (or another card's).
+      e.preventDefault();
       setDismissed(true);
       setSwipeX(400);
-      setTimeout(() => props.onClose(), 200);
+      if (dismissTimer !== null) clearTimeout(dismissTimer);
+      dismissTimer = setTimeout(() => {
+        dismissTimer = null;
+        props.onClose();
+      }, 200);
     } else {
       setSwipeX(0);
     }
@@ -5892,7 +5931,8 @@ function Thumbnail(props: {
       onMouseLeave={() => setHover(false)}
       onTouchStart={onTouchStart}
       onTouchMove={onTouchMove}
-      onTouchEnd={onTouchEnd}
+      onTouchEnd={finishSwipe}
+      onTouchCancel={finishSwipe}
       style={{
         "border-bottom": `1px solid ${props.theme.subtleBorder}`,
         display: dismissed() ? "none" : "flex",
