@@ -321,12 +321,35 @@ or starts — whatever you actually supervise.
 
 ## Not here yet
 
-- A panel row names a unit's terminal and windows; it does not open them.
-  Putting one in a pane means reaching the workspace's switch-and-assign from
-  inside a BSP tile, which is its own piece of plumbing.
+- A panel row names a unit's terminal and windows; it does not open them. That
+  is frontend-only work — the pty is already in the client's session list, and
+  what is missing is a way for a BSP tile to hand the workspace something to
+  place, which is `ide/activeEditor.ts`'s registry pointed the other way.
+- Instances derived from git worktrees. The set is enumerable and watchable
+  (`.git/worktrees/<name>/gitdir` holds each path; the main worktree is not in
+  there and has to be added by hand), and `${ROOT}`/`${INSTANCE}` are exactly a
+  worktree's path and name. The blocker is `PORTS: "auto"` needing to be
+  _stable_: derived from sort order it moves every time an earlier worktree is
+  removed, so it wants a kv-backed ledger — the same kv the durable journal
+  wants.
 - The durable journal tail in kv: the ring is in memory, so `@muster log` starts
   empty after the supervisor restarts.
 - `@muster remove`, the other half of `instantiate`. Deleting an instance file
   needs `FS_OP`, and unlike a write it destroys something.
+- Dependencies across stack boundaries. A self-contained stack has no ambiguity
+  about which instance a name means; a shared database between per-worktree
+  stacks wants a decision about migrations before it wants a `requires`.
 - A restart caused by a file change is journaled with cause `crash` rather than
   `file`, because the retry runs through the backoff path.
+
+## Deliberately not
+
+- **`envFile` key subsets, or a `passEnv` list forwarding named server
+  variables.** Both are ways to make what a unit sees depend on something other
+  than its own file, and the current answer — the file says everything, and
+  `@muster env --values` shows what it resolved to — is worth more than the
+  convenience.
+- **A stack fetched from a repository, pinned by digest like an extension
+  module.** Discovery never leaves the configuration directory, on purpose:
+  cloning a repository must not be able to start running its code. A stack you
+  point at by path is you naming it; a stack muster fetches is not.
