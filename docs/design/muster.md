@@ -556,11 +556,16 @@ free text does not answer it reliably. Records carry `instance`, so
 **Environment values never appear.** `spawn` names the files and counts keys —
 enough to diagnose "it did not pick up my `.env`", not enough to leak.
 
-Storage: 1024-entry in-memory ring, plus the last 256 in KV under
+Storage: an in-memory ring, plus a durable tail in KV under
 `ext/muster/log/<seq:016x>`, counter at `ext/muster/seq`. Prefix isolation is
 convention — KV is flat and server-wide, shared with `tabs/`, `roots/`,
 `ext/session/`. The durable tail is why `@muster log` still says why something
 is down after a server restart.
+
+The ring is sized so it is never the answer to "why is that not in the log":
+bringing up a hundred units emits some hundreds of records, so it holds many
+cold starts. It is bounded at all only because a unit crash-looping at the
+250 ms floor emits records for as long as the supervisor lives.
 
 ## Channel
 
@@ -649,8 +654,15 @@ blank, so a unit is identifiable in any client's catalog without asking muster.
 ## Watching
 
 One `C2S_FS_SYNC`, `FS_SYNC_RECURSIVE | FS_SYNC_CONTENT`, `latency_ms = 200`,
-`inline_max = 64 KiB`, everything below the second level dropped on arrival.
-Non-`*.json` and leading-`.` ignored; over `inline_max` is `invalid`.
+everything below the second level dropped on arrival. Non-`*.json` and
+leading-`.` are ignored.
+
+`inline_max` is left at zero, which takes the server's own ceiling. Setting one
+here would not mean "read at most this much" — it means a unit file larger than
+it arrives with no content and is therefore `invalid`, which is a rule nobody
+would guess. The same applies to the per-file cap on reading an `envFile` and to
+the per-poll slice of `TERM_SINCE`; muster names none of them, because the
+server already has an answer and a second one can only disagree.
 
 `FS_SYNC` mirrors state rather than delivering events, which fits: a save
 producing identical bytes is invisible and there is nothing to do. It also means
@@ -722,9 +734,11 @@ Muster takes `serde_json` + `serde` derive, breaking the precedent that an
 extension depends on `blit-guest` alone. Its JSON is nested, user-authored and
 wrong often enough that the parse error is a feature: `doctor` saying *line 7,
 column 3, expected string* is the product, and a hand-rolled reader that says
-that well is a worse copy of a crate that exists. Measured under `wasm-opt -Oz`
-it costs **303 KB, 108 KB brotli**, against `session`'s 187 KB / 68 KB and
-`systemd`'s 116 KB / 45 KB. Roughly a doubling, on an object that is downloaded
+that well is a worse copy of a crate that exists. The same dependency emits
+every `--json` payload and the journal, so the escaper a hand-rolled emitter
+would need is already linked in either way. Measured under `wasm-opt -Oz` the
+whole extension is **344 KB, 118 KB brotli**, against `session`'s 187 KB / 68 KB
+and `systemd`'s 116 KB / 45 KB. Roughly a doubling, on an object that is downloaded
 once and pinned by digest. If that number ever stops being worth it, the
 fallback is a hand-rolled parser and a worse `doctor`, not a worse format.
 
@@ -787,6 +801,9 @@ fallback is a hand-rolled parser and a worse `doctor`, not a worse format.
 - A browser panel on `blit.muster.v1` — the reason the channel carries full
   state, an instance list and a live event stream rather than being a transport.
 - `TERM_JOURNAL_WAIT` instead of the `log:` poll, once the guest SDK wraps the
-  journal family.
+  journal family. Writing this down is what found that the per-connection wait
+  cap was 32 — a supervisor arms one per unit, so at a hundred units it would
+  have served the first 32 and polled for the rest. Raised to 4096, which is
+  bookkeeping the lifecycle loop already scans rather than the delivery tick.
 - Placing a unit's terminal in a pane, once a client exposes layout beyond its
   own URL hash.
