@@ -2131,8 +2131,18 @@ function WorkspaceScreen(props: {
   });
 
   const offScreenSurfaces = createMemo(() => {
-    const fid = focusedSurfaceId();
-    const fConnId = focusedSurfaceConnId();
+    // A tile covers the main view (it is drawn ahead of the focused surface),
+    // so the surface underneath is off-screen and belongs in the panel — the
+    // same rule the sessions memo below applies to a displaced terminal.
+    // Without this, tapping a tile's dock card hid the surface it covered from
+    // everywhere at once: the tile is on top of it, and this filter dropped it
+    // from the panel because focusedSurfaceId still named it. It came back
+    // only by closing the tile. The slot is deliberately still *set* — that is
+    // what brings the surface back when the tile closes — so what changes here
+    // is only whether it is also offered as a card.
+    const covered = activeTile() != null;
+    const fid = covered ? null : focusedSurfaceId();
+    const fConnId = covered ? null : focusedSurfaceConnId();
     // Collect surface keys assigned to BSP panes.
     const al = activeLayout();
     const la = layoutAssignments();
