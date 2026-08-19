@@ -119,8 +119,8 @@ export const lightTheme: Theme = {
   solidInputBg: "#fff",
   border: "rgba(0,0,0,0.15)",
   subtleBorder: "rgba(0,0,0,0.1)",
-  hoverBg: "rgba(0,0,0,0.04)",
-  selectedBg: "rgba(0,0,0,0.08)",
+  hoverBg: "rgba(0,0,0,0.06)",
+  selectedBg: "rgba(0,0,0,0.16)",
   accent: "#58f",
   error: "#a44",
   errorText: "#f55",
@@ -167,8 +167,11 @@ function themeFromPalette(palette: TerminalPalette): Theme {
     solidInputBg: rgb(inputSurface),
     border: rgba(palette.fg, 0.18),
     subtleBorder: rgba(palette.fg, palette.dark ? 0.12 : 0.1),
-    hoverBg: rgba(palette.fg, palette.dark ? 0.06 : 0.05),
-    selectedBg: rgba(palette.fg, palette.dark ? 0.11 : 0.09),
+    // A tint of the foreground reads much weaker as a darkening on a light
+    // background than as a lightening on a dark one, so the light tone needs
+    // roughly twice the alpha to land as the same step.
+    hoverBg: rgba(palette.fg, palette.dark ? 0.06 : 0.08),
+    selectedBg: rgba(palette.fg, palette.dark ? 0.11 : 0.18),
     accent: rgb(accent),
     error: rgb(error),
     errorText: rgb(errorText),

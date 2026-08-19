@@ -15,7 +15,9 @@ export function PaletteOverlay(props: {
   onClose: () => void;
 }) {
   const original = props.current;
-  const theme = themeFor(props.current);
+  // Previewing repaints the panel with the highlighted palette, so the chrome
+  // has to follow it — a theme pinned to `original` renders light-on-light.
+  const theme = () => themeFor(props.current);
   const scale = uiScale(props.fontSize);
   const [tone, setTone] = createSignal<PaletteTone>(
     original.dark ? "dark" : "light",
@@ -122,7 +124,7 @@ export function PaletteOverlay(props: {
 
   const inputStyle = () => ({
     ...ui.input,
-    "background-color": theme.inputBg,
+    "background-color": theme().inputBg,
     color: "inherit",
     "font-size": `${scale.md}px`,
   });
@@ -170,9 +172,9 @@ export function PaletteOverlay(props: {
                   style={{
                     ...ui.btn,
                     padding: `${scale.controlY}px ${scale.controlX + 2}px`,
-                    border: `1px solid ${active() ? theme.border : "transparent"}`,
+                    border: `1px solid ${active() ? theme().border : "transparent"}`,
                     "background-color": active()
-                      ? theme.selectedBg
+                      ? theme().selectedBg
                       : "transparent",
                     opacity: active() ? 1 : 0.7,
                     "font-size": `${scale.sm}px`,
@@ -223,7 +225,7 @@ export function PaletteOverlay(props: {
               outline: "none",
               "max-height": "20em",
               overflow: "auto",
-              ...scrollbarStyle(theme),
+              ...scrollbarStyle(theme()),
             }}
           >
             <For each={filtered()}>
@@ -245,7 +247,7 @@ export function PaletteOverlay(props: {
                       "text-align": "left",
                       "background-color":
                         i() === selectedIdx()
-                          ? theme.selectedBg
+                          ? theme().selectedBg
                           : "transparent",
                       "font-size": `${scale.md}px`,
                     }}
@@ -255,7 +257,7 @@ export function PaletteOverlay(props: {
                         style={{
                           ...ui.swatch,
                           "background-color": `rgb(${p.bg[0]},${p.bg[1]},${p.bg[2]})`,
-                          border: `1px solid ${theme.subtleBorder}`,
+                          border: `1px solid ${theme().subtleBorder}`,
                         }}
                       />
                       <span
