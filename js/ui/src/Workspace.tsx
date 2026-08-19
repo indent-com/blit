@@ -45,6 +45,7 @@ import type {
 } from "@blit-sh/core";
 import type { ConnectionSpec } from "./App";
 import { createMetrics } from "./createMetrics";
+import { cardAspectRatio, surfaceCardSignature } from "./surfaceAspect";
 import { createFontLoader } from "./createFontLoader";
 import { loadFontList, saveFontList } from "./fontStore";
 import { createKeyboardShortcuts } from "./createKeyboardShortcuts";
@@ -511,7 +512,8 @@ function WorkspaceScreen(props: {
   const [surfaces, setSurfaces] = createSignal<BlitSurface[]>([]);
 
   // Per-surface signature of the fields that drive the thumbnail UI
-  // (title, appId, width, height).  SurfaceStore mutates width/height
+  // (title, appId, and both size pairs — see surfaceCardSignature).
+  // SurfaceStore mutates the dimensions
   // in place on each frame so ref-level diffing never sees dim changes,
   // and <For each> keys by reference so a child component reading
   // `props.surface.width` won't re-render when the underlying field is
@@ -576,7 +578,7 @@ function WorkspaceScreen(props: {
         for (const s of conn.surfaceStore.getSurfaces().values()) {
           const key = `${s.connectionId}:${s.surfaceId}`;
           seenKeys.add(key);
-          const sig = `${s.title}\0${s.appId}\0${s.width}x${s.height}`;
+          const sig = surfaceCardSignature(s);
           if (surfaceSigs.get(key) !== sig) {
             surfaceSigs.set(key, sig);
             // Shallow copy: a new ref forces <For> to rebuild this
@@ -6025,14 +6027,20 @@ function SurfaceThumbnail(props: {
             // retires and rebuilds a hardware encoder; a few hundred of those
             // segfaults the NVIDIA encode library and takes the server down.
             //
-            // Before the first surface info both dimensions are 0; leave the
+            // And the window's *logical* aspect, not the composited one. The
+            // composite is the logical size times whatever scale the
+            // highest-DPI viewer asked for, floored onto the even 4:2:0 grid,
+            // so its ratio is off by up to a pixel per axis — and it moves
+            // when another viewer's DPI does, for a window that never
+            // changed. `logicalWidth`/`logicalHeight` move only when the app
+            // resizes, which is the only thing this card should follow.
+            //
+            // Before the first surface info every dimension is 0; leave the
             // ratio off rather than emit a degenerate one, and the card is
             // laid out by the 640x480 placeholder canvas for that one frame.
-            ...(props.surface.width > 0 && props.surface.height > 0
-              ? {
-                  "aspect-ratio": `${props.surface.width} / ${props.surface.height}`,
-                }
-              : {}),
+            // A server too old to report a logical size falls back to the
+            // composite, which is what it used to use throughout.
+            ...cardAspectRatio(props.surface),
             height: "auto",
             "object-fit": "contain",
           }}
