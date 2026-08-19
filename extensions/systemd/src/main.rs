@@ -477,7 +477,7 @@ fn run(client: &mut Client) -> Result<(), String> {
         say(
             client,
             "serving blit.systemd.v1; @systemd needs `ext run --persist systemd` \
-             on a server started with --allow-persistent-extensions",
+             on a server that permits persistent extensions",
         );
         0
     };

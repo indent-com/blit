@@ -574,10 +574,12 @@ pub enum Command {
         #[arg(long)]
         allow_forward_insecure: bool,
 
-        /// Permit durable Wasmi extensions and restore desired definitions
-        /// (or set BLIT_ALLOW_EXT_PERSIST=1)
+        /// Refuse durable Wasmi extensions and do not restore desired
+        /// definitions (or set BLIT_ALLOW_EXT_PERSIST=0). Transient
+        /// extensions still run. This is the recovery path for a persistent
+        /// definition that breaks the server it starts in.
         #[arg(long)]
-        allow_persistent_extensions: bool,
+        no_persistent_extensions: bool,
 
         #[command(flatten)]
         deployment: ServerDeploymentOpts,

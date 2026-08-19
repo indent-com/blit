@@ -469,7 +469,7 @@ impl ExtensionService {
                             if !persist_allowed && definition.desired() && definition.enabled() {
                                 definition.phase = EXT_PHASE_BLOCKED;
                                 definition.detail =
-                                    "persistent extensions require operator permission".into();
+                                    "persistent extensions are disabled on this server".into();
                             }
                             if definition.phase != EXT_PHASE_BACKOFF {
                                 definition.next_start_unix_ms = 0;
@@ -1350,7 +1350,7 @@ impl ExtensionService {
                     nonce,
                     EXT_STATUS_PERMISSION,
                     hash,
-                    "persistent extensions require --allow-persistent-extensions",
+                    "persistent extensions are disabled on this server",
                 ),
             )
             .await;
@@ -2209,7 +2209,7 @@ impl ExtensionService {
                                 nonce,
                                 EXT_STATUS_PERMISSION,
                                 None,
-                                "persistent extensions require operator permission",
+                                "persistent extensions are disabled on this server",
                             ));
                         } else if current
                             .owner_endpoint

@@ -1075,7 +1075,7 @@ async fn async_main() {
             microphone_codecs,
             allow_forward,
             allow_forward_insecure,
-            allow_persistent_extensions,
+            no_persistent_extensions,
             deployment,
             verbose,
             no_processes,
@@ -1200,8 +1200,8 @@ async fn async_main() {
                         .unwrap_or(false),
                 allow_forward,
                 allow_forward_insecure,
-                allow_persistent_extensions: allow_persistent_extensions
-                    || std::env::var("BLIT_ALLOW_EXT_PERSIST").is_ok_and(|value| value == "1"),
+                allow_persistent_extensions: !no_persistent_extensions
+                    && !std::env::var("BLIT_ALLOW_EXT_PERSIST").is_ok_and(|value| value == "0"),
             };
             blit_server::run(config).await;
         }
